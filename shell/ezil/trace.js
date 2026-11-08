@@ -110,8 +110,14 @@ export function newEventId () {
 let ambientTrace = null;
 let latestTrace = null;
 /** Detached, read-only phases of the current or most recent app open. */
+export function feedbackTraceSnapshot () {
+    const trace = ambientTrace || latestTrace;
+    if (!trace) return null;
+    const apps = ['secure-browser', 'desktop', 'code', 'app-store', 'settings', 'preview'];
+    return { id: trace.id, ...(apps.includes(trace.name) ? { app: trace.name } : {}), phases: trace.snapshot() };
+}
 export function feedbackPhaseSnapshot () {
-    return (ambientTrace || latestTrace)?.snapshot() ?? [];
+    return feedbackTraceSnapshot()?.phases ?? [];
 }
 
 /**

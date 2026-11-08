@@ -40,6 +40,7 @@ export const diagnosticsSchema = z
             online: z.boolean(), visibility: z.enum(['visible', 'hidden']),
             network: z.object({ effectiveType: z.enum(['slow-2g', '2g', '3g', '4g']).optional(), saveData: z.boolean().optional() }).strict().optional(),
         }).strict(),
+        traceApp: z.enum(['secure-browser', 'desktop', 'code', 'app-store', 'settings', 'preview']),
         tracePhases: z.array(z.object({ code: z.string().regex(/^[a-z][a-z0-9_:-]{0,39}$/), tMs: int }).strict()).max(24),
         shellVersion: short(64),
         appCommit: short(64),

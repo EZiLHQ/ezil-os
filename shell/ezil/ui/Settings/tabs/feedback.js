@@ -31,12 +31,12 @@ export default {
                     EZiL OS. Nothing is sent until you press Send, and you can preview exactly what
                     will be sent.</p>
                 <button type="button" class="ezil-settings-btn" data-action="send-feedback">Send feedback</button>
-                <h3>Your reports</h3><button type="button" class="ezil-settings-btn" data-action="refresh-reports">Refresh status</button><div data-role="feedback-reports" aria-live="polite"></div><p class="ezil-settings-muted">You can delete reports under Troubleshoot → Your reports.</p>
+                <h3>Your reports</h3><button type="button" class="ezil-settings-btn" data-action="refresh-reports">Refresh status</button><div data-role="feedback-status-reports" aria-live="polite"></div><p class="ezil-settings-muted">You can delete reports under Troubleshoot → Your reports.</p>
             </div>`;
     },
 
     init ($win) {
-        const host = $win.find('[data-role="feedback-reports"]')[0];
+        const host = $win.find('[data-role="feedback-body"] [data-role="feedback-status-reports"]')[0];
         async function refreshReports() {
             if (!host) return;
             host.textContent = 'Loading your reports…';

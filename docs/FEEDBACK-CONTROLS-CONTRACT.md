@@ -226,3 +226,13 @@ and status, awaits a `status_<target>` audit record, then updates only that repo
 The audit is intent; it does not assert update success. Admin list/detail and
 Settings → Feedback show persisted status, with an explicit reporter refresh.
 Existing audit-before-content and owner-scoped reporter reads/deletes remain.
+
+
+## 2026-11-08 report bundle extension
+
+See [feedback-report-bundle.md](feedback-report-bundle.md) for rich bug fields,
+static file imports, paired completed-trace identity, consented session/event
+snapshots, audited status changes, non-evicting retry behavior and rollout checks.
+The authoritative schema includes session, tracePhases, traceApp and bounded ages.
+Validated trace/server request IDs are preserved, excluding reporter/computer IDs;
+arbitrary text fields retain credential/UUID masking. Screenshot flags remain gated.

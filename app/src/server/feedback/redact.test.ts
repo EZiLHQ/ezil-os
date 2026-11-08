@@ -106,9 +106,10 @@ describe('FEEDBACK-DIAG: recent-event failure annotations', () => {
         expect(JSON.stringify(result)).not.toContain(secret);
     });
 
-    it('keeps the uuid mask everywhere else, including on the event\'s own text fields', () => {
+    it('preserves request trace IDs while masking identifiers in event text', () => {
         const result = sanitizeDiagnostics({ traceId: corr, recentEvents: [event({ code: `x ${corr}`, correlationId: corr })] });
-        expect(result?.traceId).toBe('[redacted:uuid]');
+        expect(result?.traceId).toBe(corr);
+        expect(sanitizeDiagnostics({ traceId: corr }, { excludeIds: [corr] })?.traceId).toBeUndefined();
         expect(result?.recentEvents?.[0]).toEqual(event({ code: 'x [redacted:uuid]', correlationId: corr }));
     });
 

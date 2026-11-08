@@ -71,6 +71,8 @@ export function sanitizeDiagnostics(
 ): FeedbackDiagnostics | null {
     if (!input) return null;
     const out: FeedbackDiagnostics = {};
+    const excludeIds = new Set((options.excludeIds ?? []).filter((id): id is string => !!id).map(id => id.toLowerCase()));
+    if (input.traceApp && diagnosticsSchema.shape.traceApp.safeParse(input.traceApp).success) out.traceApp = input.traceApp;
     // Parse each new nested object independently; never spread client state.
     if (input.session) {
         const parsed = diagnosticsSchema.shape.session.safeParse(input.session);
@@ -91,11 +93,12 @@ export function sanitizeDiagnostics(
     if (input.fullscreen !== undefined) out.fullscreen = input.fullscreen;
     if (input.fullbleed !== undefined) out.fullbleed = input.fullbleed;
     if (input.computerStatus !== undefined) out.computerStatus = diagnosticString(input.computerStatus, 32);
-    if (input.traceId !== undefined) out.traceId = diagnosticString(input.traceId, 64);
+    if (input.traceId !== undefined && !excludeIds.has(input.traceId.toLowerCase())) {
+        out.traceId = isCorrelationId(input.traceId) ? input.traceId : diagnosticString(input.traceId, 64);
+    }
     if (input.phases) out.phases = input.phases.map((phase) => diagnosticString(phase, 40));
     if (input.recentEvents) {
         const events = input.recentEvents.slice(-50);
-        const excludeIds = new Set((options.excludeIds ?? []).filter((id): id is string => !!id).map((id) => id.toLowerCase()));
         // Events are oldest-first; only the newest `recentEventsAnnotatedMax`
         // annotated ones keep their annotation.
         const kept = new Map<number, Pick<RecentEvent, 'reason' | 'correlationId'>>();

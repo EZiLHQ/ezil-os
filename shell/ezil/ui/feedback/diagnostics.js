@@ -1,6 +1,6 @@
 // diagnostics.js — EZiL-authored. Feedback's small, explicit allowlist.
 // No general-purpose state dump: even telemetry's redacted detail is excluded.
-import { ambientCorrelationId, feedbackPhaseSnapshot } from '../../trace.js';
+import { feedbackTraceSnapshot } from '../../trace.js';
 import { recentEvents } from '../../telemetry.js';
 import { isCorrelationId, isFailureReason } from './failure-shapes.js';
 
@@ -62,6 +62,7 @@ function os_family () {
 /** @returns {object} Matches diagnosticsSchema; absent information is omitted. */
 export function build_diagnostics () {
     const result = {};
+    const trace = feedbackTraceSnapshot();
     const captured = Date.now();
     const expanded = globalThis.window?.__EZIL_BOOT__?.desktopState?.ui?.feedbackReportBundle === true;
     if (expanded) {
@@ -75,7 +76,8 @@ export function build_diagnostics () {
             if (typeof connection.saveData === 'boolean') network.saveData = connection.saveData;
             result.session.network = network;
         }
-        result.tracePhases = feedbackPhaseSnapshot();
+        result.tracePhases = trace?.phases ?? [];
+        if (trace?.app) result.traceApp = trace.app;
     }
     const version = globalThis.ezil?.version;
     if ( typeof version === 'string' || typeof version === 'number' ) result.shellVersion = String(version).slice(0, 64);
@@ -91,8 +93,7 @@ export function build_diagnostics () {
     }
     result.fullscreen = !! document.fullscreenElement;
     result.fullbleed = [...document.querySelectorAll('.ezil-fullbleed')].some(visible);
-    const traceId = ambientCorrelationId();
-    if ( typeof traceId === 'string' ) result.traceId = traceId.slice(0, 64);
+    if (trace) result.traceId = trace.id;
     // Expanded phase snapshots above never finish the active app-open.
     const events = recentEvents().slice(-50)
         .filter(event => ['eventClass', 'site', 'code'].every(key => typeof event[key] === 'string'

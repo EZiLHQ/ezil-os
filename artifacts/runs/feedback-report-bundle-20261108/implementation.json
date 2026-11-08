@@ -1,9 +1,9 @@
 {
   "taskId": "feedback-report-bundle",
   "runId": "feedback-report-bundle-20261108",
-  "status": "blocked",
-  "doneRung": "validated-owned-source-awaits-coordinator-commit",
-  "evidence": "220 app tests + 86 shell checks pass / 0 unit failures, 24 source/docs files; auth guard mutant -> 1 fail / 28 pass; restored -> 220 pass. Browser launch blocked; typecheck 19 missing-module errors; commit read-only.",
-  "startedAt": "2026-11-08T14:02:09.272028+00:00",
-  "updatedAt": "2026-11-08T14:11:33.490169+00:00"
+  "status": "done",
+  "doneRung": "review-ready-local-verified",
+  "evidence": "294 server tests / 0 failed / 0 skipped including 5 real local PostgreSQL checks; full app typecheck and lint pass (0 errors, 30 warnings); 32 feedback + 31 capture + 12 file import + 27 trace unit checks; 26 Chromium checks across desktop and phone. Built bundle consistency verified. Not deployed.",
+  "startedAt": "2026-11-08T14:00:40Z",
+  "updatedAt": "2026-11-08T14:32:00Z"
 }

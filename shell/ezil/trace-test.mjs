@@ -2,7 +2,7 @@
 // no jsdom — it is a pure module with zero dependencies (see its own header).
 //
 // Run:  node shell/ezil/trace-test.mjs
-import { ambientCorrelationId, ambientTraceRef, beginTrace, newEventId, feedbackPhaseSnapshot } from './trace.js';
+import { ambientCorrelationId, ambientTraceRef, beginTrace, newEventId, feedbackPhaseSnapshot, feedbackTraceSnapshot } from './trace.js';
 
 const checks = [];
 const push = (name, pass, detail = '') => {
@@ -123,6 +123,14 @@ push('no trace is ambient before beginTrace() is called', ambientCorrelationId()
     push('feedback snapshot is detached and does not end the trace', feedbackPhaseSnapshot()[0].code === 'display' && ambientTraceRef() === trace);
     trace.step('ready'); trace.end('ok');
     push('feedback retains final phases after trace end', feedbackPhaseSnapshot().length === 2 && feedbackPhaseSnapshot()[1].code === 'ready');
+}
+
+{
+    const trace = beginTrace('desktop'); trace.step('display'); trace.end('ok');
+    const snapshot = feedbackTraceSnapshot();
+    push('completed feedback trace retains the matching request ID, app and phases',
+        ambientCorrelationId() === undefined && snapshot.id === trace.id && snapshot.app === 'desktop'
+        && snapshot.phases[0].code === 'display');
 }
 
 console.log(`\n${checks.filter((c) => c.pass).length}/${checks.length} checks passed`);

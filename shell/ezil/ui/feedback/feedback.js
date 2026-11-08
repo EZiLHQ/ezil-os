@@ -4,6 +4,7 @@ import { build_diagnostics } from './diagnostics.js';
 import { scan } from './secret-scan.js';
 import { capture_shell_snapshot, tab_capture_supported, capture_tab_frame, capture_desktop_frame, desktop_capture_supported } from './capture.js';
 import { open_redact_editor } from './redact-editor.js';
+import { uploaded_image_canvas } from './image-file.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">'
@@ -80,11 +81,13 @@ function read_json (prefix) {
 
 function write_json (prefix, value) {
     const id = account_id(), s = store();
-    if ( ! id || ! s ) return;
+    if ( ! id || ! s ) return false;
     try {
-        if ( value === null ) s.removeItem(prefix + id);
-        else s.setItem(prefix + id, JSON.stringify(value));
-    } catch { /* Storage is a convenience: full, blocked or private mode only loses the draft. */ }
+        const encoded = value === null ? null : JSON.stringify(value);
+        if (encoded === null) s.removeItem(prefix + id);
+        else s.setItem(prefix + id, encoded);
+        return s.getItem(prefix + id) === encoded;
+    } catch { return false; }
 }
 
 function read_draft () {
@@ -114,8 +117,9 @@ function outbox_put (clientRequestId, body) {
     const list = read_outbox().filter(entry => entry.clientRequestId !== clientRequestId);
     const prior = read_outbox().find(entry => entry.clientRequestId === clientRequestId);
     const draft = read_draft();
+    if (list.length >= OUTBOX_MAX) return false;
     list.push({ clientRequestId, body, draft: prior?.draft ?? (draft?.clientRequestId === clientRequestId ? draft : null) });
-    write_json(OUTBOX_KEY, list.slice(-OUTBOX_MAX));
+    return write_json(OUTBOX_KEY, list);
 }
 
 function outbox_remove (clientRequestId) {
@@ -142,7 +146,7 @@ function without_event_diagnostics (body) {
         const events = sent?.diagnostics?.recentEvents;
         if (!sent?.diagnostics) return null;
         const before = JSON.stringify(sent.diagnostics);
-        delete sent.diagnostics.session; delete sent.diagnostics.tracePhases;
+        delete sent.diagnostics.session; delete sent.diagnostics.tracePhases; delete sent.diagnostics.traceApp;
         for (const event of events || []) { delete event.reason; delete event.correlationId; delete event.ageMs; }
         if (before === JSON.stringify(sent.diagnostics)) return null;
         return JSON.stringify(sent, null, 2);
@@ -380,7 +384,7 @@ export function open_feedback_dialog (_opts) {
     if ( activeDialog?.isConnected ) { activeDialog.focus(); return; }
     const opener = document.activeElement;
     const draft = read_draft();
-    const clientRequestId = draft?.clientRequestId ?? crypto.randomUUID();
+    let clientRequestId = draft?.clientRequestId ?? crypto.randomUUID();
     const waiting = read_outbox().filter(entry => entry.clientRequestId !== clientRequestId && ! inflight.has(entry.clientRequestId)).length;
     const computer = window.__EZIL_BOOT__?.computer?.id;
     const computerId = typeof computer === 'string' && UUID.test(computer) ? computer : null;
@@ -413,8 +417,9 @@ export function open_feedback_dialog (_opts) {
                 <button type="button" data-action="refresh-diagnostics" hidden>Refresh diagnostic snapshot</button>
                 ${screenshots ? `<label class="ezil-feedback-consent"><input type="checkbox" name="screenshot"> Include a screenshot</label>
                 <section class="ezil-feedback-capture" hidden aria-label="Screenshot">
-                    <p class="ezil-feedback-muted">Capture, then crop and mask private areas in the editor before attaching. The EZiL window option masks embedded apps. Tab capture asks you to choose a surface.</p>
-                    ${!tab_capture_supported() ? '<p class="ezil-feedback-muted">This browser cannot capture a tab. Use the EZiL window option; embedded app content may be unavailable.</p>' : ''}
+                    <label class="ezil-feedback-upload">Attach a screenshot <input type="file" name="screenshotFile" accept="image/png,image/jpeg,image/webp"></label>
+                    <p class="ezil-feedback-muted">Choose a PNG, JPEG or WebP image (up to 8 MiB and 4096 pixels per side), or use a capture option. Crop and cover private areas before attaching. The EZiL window option masks embedded apps. Tab capture asks you to choose a surface.</p>
+                    ${!tab_capture_supported() ? '<p class="ezil-feedback-muted">This browser cannot capture a tab. Attach a screenshot from your device to include embedded app content.</p>' : ''}
                     <div class="ezil-feedback-actions">
                         <button type="button" data-capture="shell">Capture EZiL OS window</button>
                         ${tab_capture_supported() ? '<button type="button" data-capture="tab">Capture what I see</button>' : ''}
@@ -425,10 +430,10 @@ export function open_feedback_dialog (_opts) {
                         <button type="button" data-capture="edit">Edit / crop / redact</button>
                         <button type="button" data-action="remove-screenshot">Remove screenshot</button>
                     </div>
-                </section>` : '<p class="ezil-feedback-muted">Screenshots are disabled for this deployment or account. Describe the visible error in your report.</p>'}
+                </section>` : '<p class="ezil-feedback-muted">Screenshots are not available here yet. Describe the visible error in your report.</p>'}
             </fieldset>
             <details class="ezil-feedback-preview"><summary>Preview exactly what will be sent</summary><pre></pre>
-                <p class="ezil-feedback-muted">EZiL always records server time, report ID and deployed version. If an older server rejects expanded diagnostics, only those extra diagnostic fields are removed and retried; your text is preserved.</p></details>
+                <p class="ezil-feedback-muted">Your report includes its time, reference number and the version of EZiL OS. Technical details and screenshots are included only when you choose them.</p></details>
             <p class="ezil-feedback-result" role="status" aria-live="polite"></p>
             <div class="ezil-feedback-actions">
                 <button type="button" data-action="cancel">Cancel</button>
@@ -448,6 +453,7 @@ export function open_feedback_dialog (_opts) {
     const cancel = dialog.querySelector('[data-action="cancel"]');
     let screenshot = null;
     let diagnosticSnapshot = null;
+    let attemptedBody = null;
     const bug_values = () => Object.fromEntries([...BUG_FIELDS.map(([key]) => key), 'reproducibility', 'impact'].map(key => [key, form.elements[key].value]));
     let serialized = '';
     let sending = false;
@@ -503,6 +509,7 @@ export function open_feedback_dialog (_opts) {
         restoreCapture = null;
         capturing = false;
         for ( const button of dialog.querySelectorAll('[data-capture]') ) button.disabled = false;
+        if (form.elements.screenshotFile) form.elements.screenshotFile.disabled = false;
         if ( result.textContent === 'Preparing screenshot…' ) result.textContent = '';
     }
 
@@ -526,6 +533,14 @@ export function open_feedback_dialog (_opts) {
             diagnostics: diagnostics.checked ? diagnosticSnapshot : null,
             screenshot: screenshotConsent?.checked ? screenshot : null };
         serialized = JSON.stringify(payload, null, 2);
+        const pendingBody = read_outbox().find(entry => entry.clientRequestId === clientRequestId)?.body ?? attemptedBody;
+        if (pendingBody && pendingBody !== serialized) {
+            // Edits are a new report; a later receipt for the old request must never hide them.
+            clientRequestId = crypto.randomUUID();
+            attemptedBody = null;
+            payload.clientRequestId = clientRequestId;
+            serialized = JSON.stringify(payload, null, 2);
+        }
         preview.textContent = serialized;
         const diagnosticBytes = new TextEncoder().encode(JSON.stringify({ ...payload, screenshot: null }, null, 2)).length;
         submit.disabled = capturing || ! description.value.trim() || text.length > 4000 || diagnosticBytes > 32 * 1024
@@ -614,6 +629,21 @@ export function open_feedback_dialog (_opts) {
             void finish_capture(capture, generation, signal);
         });
     }
+    form.elements.screenshotFile?.addEventListener('change', () => {
+        const input = form.elements.screenshotFile;
+        const file = input.files?.[0];
+        input.value = '';
+        if (!file || capturing || sending || sent || closed || !screenshotConsent.checked) return;
+        capturing = true;
+        const generation = ++captureGeneration;
+        captureController = new AbortController();
+        const { signal } = captureController;
+        for (const button of dialog.querySelectorAll('[data-capture]')) button.disabled = true;
+        input.disabled = true;
+        result.textContent = 'Preparing screenshot…';
+        refresh();
+        void finish_capture(uploaded_image_canvas(file, { signal }), generation, signal);
+    });
     dialog.querySelector('[data-action="remove-screenshot"]')?.addEventListener('click', () => {
         cancel_capture();
         clear_screenshot();
@@ -644,6 +674,12 @@ export function open_feedback_dialog (_opts) {
         refresh();
         if ( submit.disabled || ! form.reportValidity() ) return;
         if ( ! feedback_enabled() ) { result.textContent = error_copy(404); return; }
+        const previousBody = read_outbox().find(entry => entry.clientRequestId === clientRequestId)?.body ?? attemptedBody;
+        if (previousBody && previousBody !== serialized) {
+            clientRequestId = crypto.randomUUID();
+            refresh();
+            save_draft();
+        }
         sending = true;
         fields.disabled = true;
         submit.disabled = true;
@@ -653,8 +689,9 @@ export function open_feedback_dialog (_opts) {
         // the dialog no longer discards it, and a failure that never got an
         // answer is re-sent with this same body when the connection returns.
         const body = serialized;
-        outbox_put(clientRequestId, body);
-        write_draft(null);
+        const queued = outbox_put(clientRequestId, body);
+        attemptedBody = body;
+        if (queued) write_draft(null);
         let outcome;
         try {
             outcome = await deliver(clientRequestId, body);
@@ -667,7 +704,11 @@ export function open_feedback_dialog (_opts) {
         cancel.textContent = 'Cancel';
         save_draft();
         if ( outcome.status === -1 ) result.textContent = 'This report is already being sent.';
-        else if ( retryable(outcome.status) ) {
+        else if ( retryable(outcome.status) && !queued ) {
+            write_draft({ clientRequestId: crypto.randomUUID(), category: form.elements.category.value,
+                description: description.value, bug: bug_values() });
+            result.textContent = 'Could not save this report for automatic retry. Keep this window open and press Send again, or copy your report text before leaving.';
+        } else if ( retryable(outcome.status) ) {
             result.textContent = navigator.onLine === false
                 ? "You're offline. Your report is saved and will be sent when you're back online."
                 : error_copy(outcome.status) + " We'll also send it automatically when your connection comes back.";

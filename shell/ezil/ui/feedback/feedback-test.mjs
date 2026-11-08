@@ -418,6 +418,50 @@ try {
         close(); delete window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle;
         respond = async () => ({ status: 201, ok: true, json: async () => ({ id: reportId, screenshotAccepted: true }) });
     });
+    await check('editing an unconfirmed report forks its ID before an old receipt can discard edits', async () => {
+        open(); setDescription('Original unconfirmed report');
+        const originalId = payload().clientRequestId;
+        respond = async () => { throw new TypeError('Failed to fetch'); };
+        send(); await until(() => stored(outboxKey)?.some(entry => entry.clientRequestId === originalId) && !current().querySelector('[type="submit"]').disabled);
+        setDescription('New evidence after the first attempt');
+        assert.notEqual(payload().clientRequestId, originalId);
+        window.dispatchEvent(new window.CustomEvent('ezil:feedback-sent', { detail: { clientRequestId: originalId, id: reportId } }));
+        assert.equal(current().querySelector('.ezil-feedback-fields').hidden, false);
+        assert.equal(form().elements.description.value, 'New evidence after the first attempt');
+        close(); window.localStorage.removeItem(outboxKey); window.localStorage.removeItem(draftKey);
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true }) });
+    });
+    await check('completed app trace keeps matching ID, app and phases in the diagnostic bundle', () => {
+        const completed = beginTrace('desktop'); completed.step('display'); completed.end('ok');
+        window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle = true;
+        const snapshot = build_diagnostics();
+        assert.equal(snapshot.traceId, completed.id);
+        assert.equal(snapshot.traceApp, 'desktop');
+        assert.equal(snapshot.tracePhases[0].code, 'display');
+        diagnosticsSchema.parse(snapshot);
+        delete window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle;
+    });
+    await check('quota failure retains text and never claims an image report is saved for automatic retry', async () => {
+        open(); setDescription('Keep my report when storage fills');
+        const prototype = Object.getPrototypeOf(window.localStorage);
+        const original = prototype.setItem;
+        prototype.setItem = function (key, value) {
+            if (key === outboxKey) throw new Error('QuotaExceededError');
+            return original.call(this, key, value);
+        };
+        try {
+            respond = async () => ({ status: 503 });
+            send(); await until(() => status().includes('Could not save this report'));
+            assert.equal(stored(draftKey).description, 'Keep my report when storage fills');
+            assert.match(status(), /copy your report text/);
+            assert.equal(stored(outboxKey), null);
+        } finally {
+            prototype.setItem = original;
+            close();
+            window.localStorage.removeItem(draftKey);
+            respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true }) });
+        }
+    });
     await check('all capture tiers use the editor; tab capture starts synchronously; no upload before Submit', async () => {
         open(); setDescription('Screenshot report'); change('screenshot', true);
         const count = calls.length;
@@ -543,7 +587,7 @@ try {
         assert.equal(stored(draftKey), null, 'an emptied form leaves no draft behind');
         close();
     });
-    await check('the outbox keeps only the newest 10 unconfirmed sends, and a flush sends no more', async () => {
+    await check('a full outbox keeps all 10 pending reports and retains the unqueued draft', async () => {
         open(); setDescription('Queued report 10');
         const template = payload();
         const seeded = Array.from({ length: 10 }, (_, i) => {
@@ -553,10 +597,11 @@ try {
         window.localStorage.setItem(outboxKey, JSON.stringify(seeded));
         setOnline(false);
         respond = async () => { throw new TypeError('Failed to fetch'); };
-        send(); await until(() => /offline/.test(status()));
+        send(); await until(() => /Could not save this report/.test(status()));
         const kept = stored(outboxKey);
-        assert.deepEqual(kept.map(entry => entry.clientRequestId), [...seeded.slice(1), { clientRequestId: template.clientRequestId }]
-            .map(entry => entry.clientRequestId), 'an 11th queued send drops the oldest');
+        assert.deepEqual(kept.map(entry => entry.clientRequestId), seeded.map(entry => entry.clientRequestId),
+            'a new report never evicts an unconfirmed report');
+        assert.equal(stored(draftKey).description, 'Queued report 10', 'the unqueued report remains a text draft');
         close();
         // A stored list longer than the cap (an older build, another tab) is read capped too.
         window.localStorage.setItem(outboxKey, JSON.stringify([seeded[0], ...kept]));
@@ -819,7 +864,9 @@ try {
         globalThis.html_encode = value => { const el = document.createElement('span'); el.textContent = String(value); return el.innerHTML; };
         const { default: troubleshoot } = await import('../Settings/tabs/troubleshoot.js');
         const pane = document.createElement('div');
-        pane.innerHTML = troubleshoot.html();
+        const { default: feedbackTab } = await import('../Settings/tabs/feedback.js');
+        pane.innerHTML = feedbackTab.html() + troubleshoot.html();
+        const statusHost = pane.querySelector('[data-role="feedback-status-reports"]');
         document.body.append(pane);
         const $pane = $(pane);
         const count = calls.length;
@@ -836,6 +883,7 @@ try {
         pane.querySelector('[data-action="load-reports"]').click();
         await until(() => pane.querySelector('.ezil-feedback-reports li'));
         assert.equal(pane.querySelector('.ezil-feedback-reports img'), null);
+        assert.equal(statusHost.textContent, '', 'Troubleshoot never writes into the other Feedback pane');
         assert.match(pane.querySelector('.ezil-feedback-reports').textContent, /Idea/);
         const remove = pane.querySelector('.ezil-feedback-reports button');
         window.confirm = () => false;
@@ -883,7 +931,7 @@ try {
         assert.equal(calls.length, count + 1, 'Settings loads reports once; opening the form sends nothing');
         assert.equal(calls[count].method, 'GET');
         await tick();
-        assert.match(pane.querySelector('[data-role="feedback-reports"]').textContent, /New/);
+        assert.match(pane.querySelector('[data-role="feedback-status-reports"]').textContent, /New/);
         close(); assert.equal(document.activeElement, entry, 'closing the form returns focus to the Settings button');
         delete window.__EZIL_BOOT__.desktopState.endpoints.feedback;
         assert.equal(tab.available(), false, 'no endpoint: no Feedback tab');
