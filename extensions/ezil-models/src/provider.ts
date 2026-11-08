@@ -50,14 +50,17 @@ function canonicalPart(part: Part): unknown {
     }
 }
 /**
- * The identity of one turn's continuation, for the signed-thinking fallback: the resolved provider and model, the
- * exact history the turn answered (thinking and cache/stateful markers left out, as Copilot rebuilds them), and the
+ * The identity of one turn's continuation, for the signed-thinking fallback: the resolved connection (provider type,
+ * endpoint and credential, so a provider reconfigured to another endpoint or account under the same name never gets
+ * the old one's signed thinking) and model, the exact history the turn answered (thinking and cache/stateful markers left out, as Copilot rebuilds them), and the
  * turn's ordered tool calls with their full inputs. A hash: nothing of it is kept or logged as text.
  */
 function continuationKey(model: ResolvedModel, history: readonly Message[], calls: readonly { callId: string; name: string; input: unknown }[]): string {
     const turns = history.map(message => [message.role, message.parts
         .filter(part => part.type !== 'thinking' && !isCacheMarker(part) && !isStatefulMarker(part)).map(canonicalPart)]);
-    return createHash('sha256').update(JSON.stringify([model.providerName, model.model, turns,
+    const p = model.provider;
+    const connection = [p.type, p.baseUrl ?? '', p.resource ?? '', p.apiVersion ?? '', createHash('sha256').update(p.apiKey ?? '').digest('hex')];
+    return createHash('sha256').update(JSON.stringify([connection, model.providerName, model.model, turns,
         calls.map(call => [call.callId, call.name, stableJson(call.input)])])).digest('hex');
 }
 

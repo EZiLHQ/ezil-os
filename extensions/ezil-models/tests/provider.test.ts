@@ -659,6 +659,13 @@ describe('EZiL gateway VS Code bridge', () => {
             // The same history and call, sent to another model.
             await ask(first.provider, history, opus);
             expect(leaked(bodies.at(-1)!)).toBe(false);
+            // The same provider name and model, reconfigured to another endpoint: the old endpoint's thinking never follows.
+            const moved = { ...claude, provider: { ...claude.provider, baseUrl: 'https://other-gateway.invalid/ai/v1' } };
+            const movedHost = first.host.models;
+            first.host.models = () => [moved, opus];
+            await ask(first.provider, history, moved);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            first.host.models = movedHost;
             // The exact continuation still gets it, after all of the above.
             await ask(first.provider, history);
             expect(leaked(bodies.at(-1)!)).toBe(true);
