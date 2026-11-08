@@ -88,9 +88,12 @@ R_EMB_EXT='async fetchRemoteExtensionCache(n){return{};let o=`${await this.getBa
 # toolbar stays in the composer, under the input beside Send: the founder asked for the model picker
 # at the composer, not across the panel in the header (2026-11-08). `attach-execute` puts Add
 # Context beside Send; the appended CSS (scoped to the class the header sets, so nothing changes if
-# it did not run) lays out the header, keeps Send in view on a narrow composer (the responsive picker toolbar writes
-# its own minimum width onto the toolbar row, which pushed Add Context and Send out of a 162 px phone chat), and hides
-# the tip (`chat.tips.enabled` is application-scoped
+# it did not run) lays out the header, keeps Send in view on a narrow composer, and hides the tip. On a phone (Explorer
+# and Chat side by side: a 121 px composer row) mode, model and Configure Tools need 144 px (the responsive toolbar
+# writes that minimum inline: they never overflow) and Add Context + Send 48: they pushed Send out of the composer.
+# Below a 208 px composer only, Add Context and Send wrap to their own line, right-aligned; the pickers take the first
+# line, the mode picker compacts and the model name ellipsizes (minimum 56 px: above what is left beside an expanded
+# mode picker, so that one compacts first). Measured at 412 and 390 px: model label 60 px, Send inside the composer. (`chat.tips.enabled` is application-scoped
 # and has no effect in Machine settings, measured).
 # The welcome disclaimer stays hidden upstream (rule below, gated, left as it is): it is not where
 # the notice lives.
@@ -108,6 +111,8 @@ R_CSS_LAYOUT="$(printf '%s' \
   '.chat-viewpane.ezil-compact-chat .ezil-chat-header>.ezil-chat-help:hover{background-color:var(--vscode-toolbar-hoverBackground)}' \
   '.chat-viewpane.ezil-compact-chat .ezil-chat-header>.ezil-chat-help:focus-visible{outline:1px solid var(--vscode-focusBorder);outline-offset:-1px}' \
   '.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-toolbars{min-width:0!important}' \
+  '.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-container{container:ezil-composer/inline-size}' \
+  '@container ezil-composer (max-width:207px){.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-toolbars{flex-wrap:wrap;row-gap:4px}.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-toolbars>.chat-input-toolbar{flex:1 0 100%;min-width:0!important}.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-toolbars>.chat-input-toolbar .model-picker-item{min-width:56px!important}.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-toolbars>.chat-execute-toolbar{margin-left:auto}}' \
   '.chat-viewpane .chat-getting-started-tip-container{display:none!important}')"
 # workbench.js `chat-header`: ChatViewPane.createControls gains a call to a new method that moves the
 # input part's secondary toolbar node into the title row (see PATCHES.md for every name it relies on).
