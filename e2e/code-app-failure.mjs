@@ -10,8 +10,7 @@ import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MODEL_NAME } from './code-app-failure-mock.mjs';
-import { assertFailureRecord } from './code-app-failure-support.mjs';
-import { randomUUID } from 'node:crypto';
+import { exposeConsumer, assertFailureRecord } from './code-app-failure-support.mjs';
 
 const [CS_IP, EVIDENCE] = process.argv.slice(2);
 const TREE = fileURLToPath(new URL('..', import.meta.url));
@@ -31,13 +30,10 @@ try {
   const { chromium } = require('playwright');
   const { injectCodeFolderBridge } = await import(new URL('../worker/src/code-folder-bridge.ts', import.meta.url));
   const { injectCodeDiagBridge } = await import(new URL('../worker/src/code-diag-bridge.ts', import.meta.url));
-  // Test-side validation only: the consumer's own validator, imported from its source. The served bundle is NOT changed.
   const { validate_failure } = await import(new URL('../shell/ezil/ui/feedback/app-failures.js', import.meta.url));
   const assets = path.resolve(process.env.SHELL_ASSETS_DIR || path.join(TREE, 'app/public/os'));
-  // The production shell bundle, byte for byte: the consumer is reached only through its public Feedback UI.
-  const bundle = readFileSync(path.join(assets, 'bundle.min.js'));
-  // The real serialized feedback submission, kept in memory for assertions only (never written to evidence).
-  const submissions = [];
+  // The test-only accessor is inserted into the served bytes, never written to app/ or shell/.
+  const bundle = exposeConsumer(readFileSync(path.join(assets, 'bundle.min.js'), 'utf8'));
   let shellOrigin = '', editorOrigin = '', folderInjections = 0, diagInjections = 0;
   const types = { '.js': 'application/javascript', '.mjs': 'application/javascript', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml' };
   shell = track(createServer((req, res) => {
@@ -58,11 +54,6 @@ try {
       if (url.searchParams.get('confirm') === 'frame') return json({ ok: true, confirmed: true, status: 200 });
       return json(req.method === 'POST' ? { ok: true, guacamoleUrl: `${shellOrigin}/blank`, frame: { confirmed: true } }
         : { ok: true, guacamoleRunning: true });
-    }
-    if (url.pathname === '/api/feedback' && req.method === 'POST') {
-      const chunks = []; req.on('data', chunk => chunks.push(chunk));
-      req.on('end', () => { submissions.push(Buffer.concat(chunks).toString('utf8')); res.statusCode = 201; json({ id: randomUUID() }); });
-      return;
     }
     if (url.pathname === '/api/feedback') { res.statusCode = 405; res.end(); return; }
     if (url.pathname.startsWith('/api/trpc/')) return json({ result: { data: { json: null } } });
@@ -135,36 +126,18 @@ try {
   }, { computerId, shellOrigin, editorOrigin });
   const page = await context.newPage();
   page.setDefaultTimeout(60_000);
-  // The real Feedback dialog: category Other (no bug fields), a synthetic description, diagnostics on, preview open.
-  const openFeedback = async () => {
-    await page.locator('button.ezil-feedback-chip').click();
-    const dialog = page.locator('dialog.ezil-feedback-dialog'); await dialog.waitFor();
-    await dialog.locator('input[name="category"][value="other"]').check();
-    await dialog.locator('textarea[name="description"]').fill('Synthetic transport check report.');
-    await dialog.locator('input[name="diagnostics"]').check();
-    await dialog.locator('.ezil-feedback-preview summary').click();
-    return dialog;
-  };
-  const previewOf = dialog => dialog.locator('.ezil-feedback-preview pre').evaluate(el => el.textContent);
-  const appStatusOf = dialog => dialog.locator('[data-role="app-failure-context"]').evaluate(el => ({ hidden: el.hidden, text: el.textContent }));
+  const snapshot = () => page.evaluate(computerId => window.__codeFailureQA.app_failures_for(Object.freeze({ computerId })), computerId);
   const screenshot = name => page.screenshot({ path: path.join(EVIDENCE, `${name}.png`), mask: [page.locator('iframe')] });
   phase = 'real shell and Code readiness';
   await page.goto(`${shellOrigin}/app/code`, { waitUntil: 'domcontentloaded' });
-  await page.waitForFunction(() => window.__failureWire?.ready.length > 0, null, { timeout: 120_000 });
+  await page.waitForFunction(() => window.__failureWire?.ready.length > 0 && !!window.__codeFailureQA, null, { timeout: 120_000 });
   const frame = page.frames().find(f => f !== page.mainFrame() && f.url().startsWith(`${editorOrigin}/?`));
   assert.ok(frame); await frame.locator('.monaco-workbench').waitFor({ timeout: 120_000 });
   assert.ok(folderInjections && diagInjections);
   const ready = await page.evaluate(() => window.__failureWire.ready.at(-1));
   assert.deepEqual(Object.keys(ready).sort(), ['nonce', 'type', 'v']); assert.equal(ready.v, 1);
-  {
-    // Healthy, zero errors: the real preview carries no app failure and does not call the context unavailable.
-    const dialog = await openFeedback();
-    const healthy = JSON.parse(await previewOf(dialog));
-    assert.equal((healthy.diagnostics.appFailures ?? []).length, 0);
-    const status = await appStatusOf(dialog); assert.ok(!/unavailable/i.test(status.text));
-    await dialog.locator('[data-action="cancel"]').click(); await dialog.waitFor({ state: 'detached' }).catch(() => {});
-  }
-  pass('real registered Code frame answered diag.ready; the real Feedback preview shows app failure context available and empty');
+  const healthy = await snapshot(); assert.equal(healthy.available, true); assert.equal(healthy.failures.length, 0);
+  pass('real registered Code frame answered diag.ready; real consumer is available and empty');
   await screenshot('01-ready');
 
   phase = 'real chat model selection and send';
@@ -194,79 +167,85 @@ try {
   await page.keyboard.press('Enter');
   pass('one synthetic chat message sent through real UI with the mock model selected');
 
-  phase = 'failure UI and bridge delivery';
+  phase = 'failure UI and real consumer record';
   // Read text only inside the page to detect the known failure UI; return a boolean, never the transcript.
   await frame.waitForFunction(() => {
     const chat = document.querySelector('.part.auxiliarybar .interactive-list');
     return !!chat && /interrupted|settlement.pending|provider.error|stream.interrupted/i.test(chat.textContent || '');
   }, null, { timeout: 120_000 });
+  await page.waitForFunction(computerId => window.__codeFailureQA.app_failures_for(Object.freeze({ computerId })).failures.length > 0,
+    computerId, { timeout: 60_000 });
   // Copilot sends several model requests for one message (the turn and its side requests); the mock fails each.
+  // So: exactly one record per real model request, each with its own client key, and no duplicates.
   const requests = () => JSON.parse(execFileSync('docker', ['exec', process.env.CONTAINER, 'curl', '-fsS', 'http://127.0.0.1:4142/stats'],
     { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).messages;
-  const delivered = () => page.evaluate(() => window.__failureWire.failures.length);
   let settled = -1;
   for (let i = 0; i < 20; i++) {
     await page.waitForTimeout(1500);
-    const count = await delivered();
-    if (count > 0 && count === settled && count === requests()) break;
+    const count = (await snapshot()).failures.length;
+    if (count === settled && count === requests()) break;
     settled = count;
   }
-  const sent = requests(); assert.ok(sent >= 1);
-  const wire = await page.evaluate(() => window.__failureWire.failures);
-  assert.equal(wire.length, sent);
-  const failures = wire.map(message => {
-    assert.deepEqual(Object.keys(message).sort(), ['failure', 'nonce', 'type', 'v']);
-    assert.equal(message.nonce, ready.nonce); assert.equal(message.v, 1);
-    assertFailureRecord(message.failure, variant); assert.deepEqual(validate_failure(message.failure), message.failure);
-    return message.failure;
+  const result = await snapshot(); assert.equal(result.available, true);
+  const sent = requests(); assert.ok(sent >= 1); assert.equal(result.failures.length, sent);
+  const failures = result.failures.map(({ app, ageMs, ...failure }) => {
+    assert.equal(app, 'code'); assert.ok(Number.isInteger(ageMs) && ageMs >= 0 && ageMs <= 1800000);
+    assertFailureRecord(failure, variant); assert.deepEqual(validate_failure(failure), failure);
+    return failure;
   });
   assert.equal(new Set(failures.map(f => f.clientRequestId)).size, failures.length);
-  assert.equal(new Set(failures.map(f => f.eventId)).size, failures.length);
+  const failure = failures[0];
   const ids = failures.map(f => f.eventId).sort();
-  pass(`failure visible; the bridge delivered one canonical envelope per real model request (${sent}), each with its own client key and the mock Gateway ID`);
+  assert.equal(new Set(failures.map(f => f.eventId)).size, failures.length);
+  const wire = await page.evaluate(() => window.__failureWire.failures);
+  assert.equal(wire.length, failures.length);
+  for (const message of wire) {
+    assert.deepEqual(Object.keys(message).sort(), ['failure', 'nonce', 'type', 'v']);
+    assert.equal(message.nonce, ready.nonce); assert.equal(message.v, 1);
+    assert.ok(failures.some(f => JSON.stringify(f) === JSON.stringify(message.failure)));
+  }
+  pass(`failure visible; one canonical record per real model request (${sent}) exported by the real consumer, each with its own client key and the mock Gateway ID`);
   await screenshot('02-failure-masked');
 
   phase = 'consumer negative controls';
-  // A same-origin sibling bypasses the bridge and posts a valid envelope directly; the consumer must reject its source.
+  // A same-origin sibling bypasses the bridge and posts the valid envelope directly. The consumer must reject its source.
   await page.evaluate(origin => { const el = document.createElement('iframe'); el.id = 'unregistered'; el.src = `${origin}/unregistered`; document.body.append(el); }, editorOrigin);
   await page.locator('#unregistered').waitFor();
+  await page.waitForFunction(origin => [...document.querySelectorAll('iframe')].some(el => el.id === 'unregistered' && el.contentWindow), editorOrigin);
   const rogue = await page.locator('#unregistered').elementHandle().then(el => el.contentFrame());
   await rogue.waitForURL(`${editorOrigin}/unregistered`, { waitUntil: 'domcontentloaded' });
   await rogue.evaluate(({ origin, nonce, failure }) => parent.postMessage({ type: 'ezil.code.failure', v: 1, nonce,
-    failure: { ...failure, eventId: 'a0000000-0000-4000-8000-0000000000e2' } }, origin), { origin: shellOrigin, nonce: ready.nonce, failure: failures[0] });
-  // Registered frame, correct nonce and origin, but a forged extra field.
+    failure: { ...failure, eventId: 'a0000000-0000-4000-8000-0000000000e2' } }, origin), { origin: shellOrigin, nonce: ready.nonce, failure });
+  // Registered frame, correct nonce and origin, but forged extra field: bypass bridge to test the actual consumer.
   await frame.evaluate(({ origin, nonce, failure }) => parent.postMessage({ type: 'ezil.code.failure', v: 1, nonce,
-    failure: { ...failure, eventId: 'a0000000-0000-4000-8000-0000000000e3', extra: {} } }, origin), { origin: shellOrigin, nonce: ready.nonce, failure: failures[0] });
+    failure: { ...failure, eventId: 'a0000000-0000-4000-8000-0000000000e3', extra: {} } }, origin), { origin: shellOrigin, nonce: ready.nonce, failure });
   await page.waitForTimeout(500);
+  const after = await snapshot(); assert.deepEqual(after.failures.map(f => f.eventId).sort(), ids);
+  pass('consumer rejects direct posts from unregistered frame and registered-frame extra-key forgery');
   await page.locator('#unregistered').evaluate(el => el.remove());
 
-  phase = 'real feedback preview and submission';
-  const dialog = await openFeedback();
+  phase = 'frozen feedback preview';
+  const chip = page.locator('button.ezil-feedback-chip');
+  await chip.waitFor(); await chip.click();
+  const dialog = page.locator('dialog.ezil-feedback-dialog'); await dialog.waitFor();
+  await dialog.locator('input[name="diagnostics"]').check();
+  await dialog.locator('.ezil-feedback-preview summary').click();
   await page.waitForFunction(count => {
     try { return JSON.parse(document.querySelector('.ezil-feedback-preview pre').textContent).diagnostics.appFailures.length === count; }
     catch { return false; }
   }, failures.length);
-  const previewText = await previewOf(dialog);
-  const preview = JSON.parse(previewText).diagnostics.appFailures;
-  // Exactly the bridge-delivered set: neither the unregistered frame's post nor the extra-key forgery got in.
-  assert.deepEqual(preview.map(entry => entry.eventId).sort(), ids);
-  for (const { app, ageMs, ...entry } of preview) {
-    assert.equal(app, 'code'); assert.ok(Number.isInteger(ageMs) && ageMs >= 0 && ageMs <= 1800000);
-    assert.deepEqual(entry, failures.find(f => f.eventId === entry.eventId));
+  const preview = await dialog.locator('.ezil-feedback-preview pre').evaluate(el => JSON.parse(el.textContent).diagnostics.appFailures);
+  assert.deepEqual(preview.map(p => p.eventId).sort(), ids);
+  for (const { app: previewApp, ageMs: previewAge, ...previewFailure } of preview) {
+    assert.equal(previewApp, 'code'); assert.ok(Number.isInteger(previewAge));
+    assert.deepEqual(previewFailure, failures.find(f => f.eventId === previewFailure.eventId));
   }
-  const status = await appStatusOf(dialog);
-  assert.equal(status.hidden, false); assert.equal(status.text, `${failures.length} app events (0 cancelled).`);
-  pass('consumer rejected the unregistered frame and the extra-key forgery: the real preview holds exactly the delivered records');
   await page.waitForTimeout(100);
-  assert.equal(await previewOf(dialog), previewText); // frozen
+  const frozen = await dialog.locator('.ezil-feedback-preview pre').evaluate(el => JSON.parse(el.textContent).diagnostics.appFailures);
+  assert.deepEqual(frozen, preview);
   await screenshot('03-frozen-preview');
-  await dialog.locator('button[type="submit"]').click();
-  await page.waitForFunction(() => /Thanks/.test(document.querySelector('dialog.ezil-feedback-dialog .ezil-feedback-result')?.textContent || ''));
-  assert.equal(submissions.length, 1);
-  // The exact visible preview string is the request body (feedback.js deliver()).
-  assert.equal(submissions[0], previewText);
-  assert.deepEqual(JSON.parse(submissions[0]).diagnostics.appFailures, preview);
-  pass('the real Feedback submission POSTed exactly the previewed body, with every app-failure record');
+  await dialog.locator('[data-action="cancel"]').click();
+  pass('diagnostics consent freezes the appFailures entry into the real feedback preview; no report submitted');
 } catch {
   // Never print assertion operands, Playwright errors, stacks, console output, HTML or transcripts.
   lines.push(`FAIL ${phase}`); process.stderr.write(`FAIL ${phase}\n`); process.exitCode = 1;

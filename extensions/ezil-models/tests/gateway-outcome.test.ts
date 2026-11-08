@@ -69,7 +69,9 @@ for (const protocol of ['Messages', 'Responses'] as const) describe(`${protocol}
         expect(records).toHaveLength(2);
         expect(records[0]).toMatchObject({ outcome: 'retrying', category: 'rate_limit', code: 'rate_limited', stage: 'headers', httpStatus: 429,
             attempt: 1, clientRequestId: CLIENT_ID, gatewayRequestId: OTHER_GATEWAY_ID, retryable: true });
-        expect(records[1]).toMatchObject({ outcome: 'recovered', code: 'rate_limited', httpStatus: 429, attempt: 2, clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID });
+        expect(records[1]).toMatchObject({ outcome: 'recovered', code: 'rate_limited', attempt: 2, clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID });
+        // The 429 belongs to attempt 1; it is never paired with attempt 2's Gateway ID.
+        expect(records[1]).not.toHaveProperty('httpStatus');
         expect(records[0]!.eventId).not.toBe(records[1]!.eventId);
         valid(records);
     });
@@ -85,7 +87,8 @@ for (const protocol of ['Messages', 'Responses'] as const) describe(`${protocol}
         expect(records.map(r => [r.outcome, r.code])).toEqual([
             ['retrying', 'network_failed'], ['retrying', 'rate_limited'], ['recovered', 'rate_limited'],
         ]);
-        expect(records[2]).toMatchObject({ attempt: 3, httpStatus: 429, gatewayRequestId: GATEWAY_ID });
+        expect(records[2]).toMatchObject({ attempt: 3, gatewayRequestId: GATEWAY_ID });
+        expect(records[2]).not.toHaveProperty('httpStatus');
         valid(records);
     });
     test('per-attempt metadata never carries over: a 429 Gateway ID is gone when the next attempt fails before any response', async () => {
@@ -106,18 +109,45 @@ for (const protocol of ['Messages', 'Responses'] as const) describe(`${protocol}
         expect(records.map(r => [r.outcome, r.code, r.stage, r.attempt])).toEqual([['retrying', 'network_failed', 'request', 1], ['failed', 'provider_overloaded', 'stream', 2]]);
         valid(records);
     });
-    test('a 413 compaction resend: the new client key and its own Gateway ID; the log keeps the earlier key', async () => {
+    const large = () => ask([...Array.from({ length: 24 }, (_, i) => [msg('user', txt(`Question ${i}`)), msg('assistant', txt(`Answer ${i} ${'a'.repeat(4000)}`))]).flat(), msg('user', txt('Last question'))]);
+    const compactionTurn = (reply: (index: number) => Response) => {
         const logs: string[] = [], records: AppFailure[] = [];
-        const s = server(index => index === 0 ? refusal(413, 'input_too_large', OTHER_GATEWAY_ID) : new Response(errorEvent(), { headers: headers() }));
-        const request = ask([...Array.from({ length: 24 }, (_, i) => [msg('user', txt(`Question ${i}`)), msg('assistant', txt(`Answer ${i} ${'a'.repeat(4000)}`))]).flat(), msg('user', txt('Last question'))]);
+        const s = server(reply);
         let minted = 0;
-        await failureOf(turn(s.fetch, { newIdempotencyKey: () => minted++ === 0 ? PREVIOUS_ID : CLIENT_ID,
-            log: line => logs.push(line), onOutcome: record => records.push(record) }, request));
-        expect(s.keys).toEqual([PREVIOUS_ID, CLIENT_ID]);
-        expect(JSON.parse(logs.at(-1)!)).toMatchObject({ client_request_id: CLIENT_ID, previous_client_request_id: PREVIOUS_ID, attempts: 2 });
-        expect(records).toEqual([expect.objectContaining({ outcome: 'failed', clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID, attempt: 2 })]);
-        expect(records[0]).not.toHaveProperty('retryOfClientRequestId');
-        valid(records);
+        const run = turn(s.fetch, { newIdempotencyKey: () => minted++ === 0 ? PREVIOUS_ID : CLIENT_ID,
+            log: line => logs.push(line), onOutcome: record => records.push(record) }, large());
+        return { s, logs, records, run };
+    };
+    const retried413 = { outcome: 'retrying', code: 'unexpected_error', category: 'provider', stage: 'headers', httpStatus: 413, attempt: 1,
+        clientRequestId: PREVIOUS_ID, gatewayRequestId: OTHER_GATEWAY_ID };
+    test('413 compaction resend then a stream failure: retrying under the old key, then failed under the new key and its own Gateway ID', async () => {
+        const t = compactionTurn(index => index === 0 ? refusal(413, 'input_too_large', OTHER_GATEWAY_ID) : new Response(errorEvent(), { headers: headers() }));
+        await failureOf(t.run);
+        expect(t.s.keys).toEqual([PREVIOUS_ID, CLIENT_ID]);
+        expect(JSON.parse(t.logs.at(-1)!)).toMatchObject({ client_request_id: CLIENT_ID, previous_client_request_id: PREVIOUS_ID, attempts: 2 });
+        expect(t.records).toEqual([expect.objectContaining(retried413),
+            expect.objectContaining({ outcome: 'failed', clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID, attempt: 2 })]);
+        for (const record of t.records) expect(record).not.toHaveProperty('retryOfClientRequestId');
+        valid(t.records);
+    });
+    test('413 compaction resend then success: the key rotation keeps the chain (retrying, then recovered under the new key)', async () => {
+        const t = compactionTurn(index => index === 0 ? refusal(413, 'input_too_large', OTHER_GATEWAY_ID) : success());
+        await collect(t.run);
+        expect(t.s.keys).toEqual([PREVIOUS_ID, CLIENT_ID]);
+        expect(t.records).toEqual([expect.objectContaining(retried413),
+            expect.objectContaining({ outcome: 'recovered', code: 'unexpected_error', attempt: 2, clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID })]);
+        expect(t.records[1]).not.toHaveProperty('httpStatus');
+        for (const record of t.records) expect(record).not.toHaveProperty('retryOfClientRequestId');
+        valid(t.records);
+    });
+    test('413 compaction resend then headerless failures: nothing of the 413 attempt carries over to the new key', async () => {
+        const t = compactionTurn(index => { if (index === 0) return refusal(413, 'input_too_large', OTHER_GATEWAY_ID); throw new TypeError(SENTINEL); });
+        await failureOf(t.run);
+        expect(t.s.keys).toEqual([PREVIOUS_ID, CLIENT_ID, CLIENT_ID]);
+        expect(t.records.map(r => [r.outcome, r.code, r.clientRequestId, r.attempt])).toEqual([
+            ['retrying', 'unexpected_error', PREVIOUS_ID, 1], ['retrying', 'network_failed', CLIENT_ID, 2], ['failed', 'network_failed', CLIENT_ID, 3]]);
+        for (const record of t.records.slice(1)) { expect(record).not.toHaveProperty('gatewayRequestId'); expect(record).not.toHaveProperty('httpStatus'); }
+        valid(t.records);
     });
     test('the caller cancelling mid-stream: no throw, exactly one neutral cancellation record (caller), never a failure', async () => {
         const controller = new AbortController(), records: AppFailure[] = [], logs: string[] = [];

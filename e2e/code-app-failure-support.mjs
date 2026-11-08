@@ -1,6 +1,15 @@
 import assert from 'node:assert/strict';
 import { REQUEST_ID } from './code-app-failure-mock.mjs';
 
+// Expose the EXISTING singleton's public export in the served build-shell IIFE. No new store, listener,
+// registration, nonce or validation code. Fail closed if esbuild's one export binding changes.
+export function exposeConsumer(bundle) {
+  const binding = /\(\{register_app_frame:([\w$]+),app_failures_for:([\w$]+),clear_app_failures:([\w$]+)\}=([\w$]+)\(\)\)/g;
+  const matches = [...bundle.matchAll(binding)];
+  assert.equal(matches.length, 1, 'Expected one real consumer export binding; rebuild shell or review harness anchor');
+  return bundle.replace(binding, (all, _register, read) => `${all},globalThis.__codeFailureQA={app_failures_for:${read}}`);
+}
+
 export function assertFailureRecord(record, variant) {
   const keys = ['eventId', 'source', 'operation', 'category', 'code', 'stage', 'outcome', 'streamReason', 'cancellationSource',
     'clientRequestId', 'gatewayRequestId', 'vscodeRequestId', 'retryOfClientRequestId', 'attempt', 'retryable', 'durationMs', 'modelKey', 'httpStatus'];

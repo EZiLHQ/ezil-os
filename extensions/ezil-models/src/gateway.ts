@@ -802,6 +802,10 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                     built = retry.built;
                     compaction = retry.info;
                     options.onCompact?.(compaction);
+                    // The resend is certain now: report the 413 attempt under its own key, Gateway ID and status before the key
+                    // rotates, so the turn's recovered or failed record (under the new key) follows a retrying one. No
+                    // retryOfClientRequestId: the contract reserves it for a known manual retry; the chain is the attempt order.
+                    retrying(refusal);
                     const nextIdempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
                     previousIdempotencyKey = idempotencyKey;
                     idempotencyKey = nextIdempotencyKey;

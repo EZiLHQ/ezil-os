@@ -164,7 +164,9 @@ export function appFailure(input: AppFailureInput): AppFailure {
             && !(error instanceof GatewayResponseError && error.upstreamType === 'settlement_pending') }),
         ...(integer(durationMs, 0, 3_600_000) ? { durationMs } : durationMs > 3_600_000 ? { durationMs: 3_600_000 } : {}),
         ...(isSafeModelKey(input.model) ? { modelKey: input.model } : {}),
-        ...(status !== undefined ? { httpStatus: status } : {}),
+        // A recovered record names what was retried (its code) under the successful attempt's IDs; the retried
+        // attempt's HTTP status belongs to that earlier attempt, so it is never paired with the new Gateway ID.
+        ...(status !== undefined && input.outcome !== 'recovered' ? { httpStatus: status } : {}),
     };
 }
 

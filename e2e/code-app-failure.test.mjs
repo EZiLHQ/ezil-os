@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
 import { faultHandler, MODEL, REQUEST_ID, modelConfig } from './code-app-failure-mock.mjs';
-import { assertFailureRecord } from './code-app-failure-support.mjs';
+import { exposeConsumer, assertFailureRecord } from './code-app-failure-support.mjs';
 import { safe_model_key, validate_failure } from '../shell/ezil/ui/feedback/app-failures.js';
 
 function exchange(method, url, variant) {
@@ -41,6 +42,19 @@ for (const variant of ['missing_terminal', 'settlement_pending']) test(`metadata
 test('metadata does not echo unknown paths, query strings or methods', () => {
   assert.deepEqual(exchange('UNTRUSTED', '/ai/v1/models?private-text').logs,
     [{ method: 'OTHER', path: '/unknown', status: 404, requestId: REQUEST_ID }]);
+});
+
+test('test accessor exposes the original singleton, with one exact binding and no new store', () => {
+  const source = 'let register,read,clear;({register_app_frame:register,app_failures_for:read,clear_app_failures:clear}=factory())';
+  let calls = 0;
+  const reader = () => ({ failures: [] });
+  const context = { factory() { calls++; return { register_app_frame() {}, app_failures_for: reader, clear_app_failures() {} }; } };
+  runInNewContext(exposeConsumer(source), context);
+  assert.equal(calls, 1); assert.equal(context.__codeFailureQA.app_failures_for, reader);
+  assert.throws(() => exposeConsumer(''), /one real consumer/);
+  assert.throws(() => exposeConsumer(`${source};${source}`), /one real consumer/);
+  const realBundle = readFileSync(new URL('../app/public/os/bundle.min.js', import.meta.url), 'utf8');
+  assert.ok(exposeConsumer(realBundle).includes('globalThis.__codeFailureQA='));
 });
 
 test('scenario checks only canonical failure fields and rejects missing IDs, duplicates handled by parent assertions', () => {
