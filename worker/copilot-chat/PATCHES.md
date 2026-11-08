@@ -87,7 +87,7 @@ Where each control is now (same nodes, same listeners, same accessible names):
   left, so the model picker lost its name first and only a sparkle icon was left (image e2e, 390 and
   412 px, 2026-11-05). On a touch screen a tap opens the header's pickers and they stay open
   (`picker-touch`, `title-tap`): before, a tap on the model picker did nothing on Android and opened and
-  at once closed it on iPhone, so a phone could not change the model (image e2e with real touch taps,
+  at once closed it on iPhone, so a phone could not change the model (image e2e, Chromium touch taps with
   Android and iPhone user agents, 2026-11-08).
 - **Composer:** input, Add Context, Send (Stop while answering); attachment chips keep their own row
   above. Auto-grow is upstream's: up to 250 px of editor (`vmn`), then the editor scrolls (measured on a

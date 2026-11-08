@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createMock, validateBody, QWEN, KIMI, SLOW_DONE } from './copilot-ezil-messages-mock.mjs';
@@ -84,11 +84,21 @@ test('authenticated request handler, Qwen SSE, Kimi JSON and scripted tool seque
       body.messages.push({ role: 'assistant', content: [call] }, { role: 'user', content: [{ type: 'tool_result', tool_use_id: call.id, content: 'success' }] });
     }
     assert.match(await (await post(body)).text(), /EZIL_E2E_DONE/);
+    // Subagent script: the parent calls runSubagent with the model it names; the child's prompt gets a plain answer.
+    const parent = { ...base(), tools: [tool('runSubagent')], tool_choice: { type: 'auto' }, messages: [{ role: 'user', content: 'EZIL_E2E_SUBAGENT model=[Kimi K3 (no streaming) (ezil)]' }] };
+    const events = (await (await post(parent)).text()).split('\n').filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6)));
+    const subagent = events.find(event => event.type === 'content_block_start').content_block;
+    assert.equal(subagent.name, 'runSubagent');
+    assert.deepEqual(JSON.parse(events.find(event => event.type === 'content_block_delta').delta.partial_json), { prompt: 'Reply with exactly EZIL_E2E_CHILD', description: 'Child model check', model: 'Kimi K3 (no streaming) (ezil)' });
+    assert.match(await (await post({ ...base(), model: KIMI, stream: false, messages: [{ role: 'user', content: 'Reply with exactly EZIL_E2E_CHILD' }] })).text(), /EZIL_CHILD_OK/);
+    parent.messages.push({ role: 'assistant', content: [{ ...subagent, input: {} }] }, { role: 'user', content: [{ type: 'tool_result', tool_use_id: subagent.id, content: 'EZIL_CHILD_OK' }] });
+    assert.match(await (await post(parent)).text(), /EZIL_SUBAGENT_DONE/);
     const invalid = await post({ ...base(), messages: [{ role: 'user', content: 'x'.repeat(131072) }] });
     assert.equal(invalid.status, 413);
     const captures = JSON.parse(readFileSync(join(captureDir, 'captured.json')));
-    assert.equal(captures.length, 10);
+    assert.equal(captures.length, 13);
     assert.equal(captures.filter(record => !record.authorized).length, 2);
+    assert.deepEqual(readdirSync(captureDir).filter(name => name.endsWith('.tmp')), [], 'captured.json is replaced whole');
     assert.equal(readFileSync(join(captureDir, '0002.body.json'), 'utf8'), JSON.stringify(base()));
   } finally {
     server.close();

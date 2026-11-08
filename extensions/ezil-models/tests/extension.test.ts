@@ -199,7 +199,7 @@ test('resolveConfigPath: env wins over the setting, the setting over the default
     expect(resolveConfigPath('/x/models.json', { EZIL_MODELS_CONFIG: '/env/models.json' })).toBe('/env/models.json');
 });
 
-test('settingsSnippet maps roles to the Copilot Chat settings', () => {
+test('settingsSnippet maps roles to the Copilot Chat settings, never chat.defaultModel (it would override a picked model)', () => {
     const config = parseModelsConfig(VALID);
-    expect(settingsSnippet(config.models)).toEqual({ 'chat.allowAnonymousAccess': true, 'chat.byokUtilityModelDefault': 'mainAgent', 'chat.defaultModel': 'm', 'chat.utilityModel': 'ezil/m' });
+    expect(settingsSnippet(config.models)).toEqual({ 'chat.allowAnonymousAccess': true, 'chat.byokUtilityModelDefault': 'mainAgent', 'chat.utilityModel': 'ezil/m' });
 });
