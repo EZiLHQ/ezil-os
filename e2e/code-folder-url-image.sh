@@ -2,6 +2,8 @@
 # code-folder-url-image.sh — Code's folder in the address bar against REAL code-server from a desktop image
 # (folder-url-sync). Starts the image's own start-codeserver.sh on an internal (no-egress) Docker network, runs
 # code-folder-url.mjs (real shell bundle + the Worker's real bridge), cleans up.
+# Includes the content-free app-failure event/hello/parent delivery scenario; no model requests.
+# TODO(app-failure-extension-host): coordinator runs a new VSIX + patched-workbench image for the host-command hop.
 #   PLAYWRIGHT_REQUIRE_DIR=/path/to/node_modules [IMAGE=<desktop image>] e2e/code-folder-url-image.sh <evidence dir>
 # Needs a built shell bundle (shell/build-shell.sh) and Playwright's Chromium (PLAYWRIGHT_BROWSERS_PATH as usual).
 set -u

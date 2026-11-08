@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { runInNewContext } from 'node:vm';
+import { DIAG_BRIDGE_MARKER } from './code-diag-bridge';
 
 import { handleAwsBrowserHost, type AwsTunnelRecord, type FetchLike } from './aws-origin';
 import {
@@ -320,7 +321,9 @@ describe('Cloudflare code host (handlePreviewProxy, code target)', () => {
   };
   it('the workbench document gets the bridge', async () => {
     const res = await get('/preview/?folder=/workspace', '/', [SHELL]);
-    expect(await res.text()).toContain(BRIDGE_MARKER);
+    const body = await res.text();
+    expect(body).toContain(BRIDGE_MARKER);
+    expect(body).toContain(DIAG_BRIDGE_MARKER);
   });
   it('and the legacy-notice style, with every header (CSP included) as without the injection', async () => {
     const f: ContainerFetcher = {
@@ -348,6 +351,7 @@ describe('Cloudflare code host (handlePreviewProxy, code target)', () => {
     const body = await res.text();
     expect(body).not.toContain(BRIDGE_MARKER);
     expect(body).not.toContain(LEGACY_NOTICE_MARKER);
+    expect(body).not.toContain(DIAG_BRIDGE_MARKER);
   });
 });
 
@@ -380,6 +384,7 @@ describe('AWS code port (handleAwsBrowserHost)', () => {
     const body = await res.text();
     expect(body).toContain(BRIDGE_MARKER);
     expect(body.split(LEGACY_STYLE).length - 1).toBe(1);
+    expect(body).toContain(DIAG_BRIDGE_MARKER);
     expect(res.headers.get('content-security-policy')).toBe(SERVED_CSP);
     expect(res.headers.get('content-length')).toBeNull();
     expect(res.headers.get('etag')).toBeNull();

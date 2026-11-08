@@ -3,7 +3,7 @@
 # Chat bundled with code-server into "EZiL Chat": NO GitHub service is called
 # from the chat stack in anonymous mode, and the user-visible GitHub/Copilot
 # branding on the EZiL boot + Agent-prompt path is replaced. Strings and status
-# visibility change; command ids, setting keys, registrations and licenses stay intact.
+# visibility change; upstream command ids, setting keys and licenses stay intact.
 #
 #   patch-copilot-chat.sh [<vscode-root>]     default /usr/lib/code-server/lib/vscode
 #   patch-copilot-chat.sh --verify [<root>]   only run the post-patch gates
@@ -80,6 +80,14 @@ rows.sort((a,b)=>a[1]<b[1]?-1:a[1]>b[1]?1:0);const h=crypto.createHash("sha256")
 node -e 'const fs=require("fs");const root=process.argv[1];const j=JSON.parse(fs.readFileSync(root+"/extensions/copilot/package.json","utf8"));if(j.publisher!=="GitHub"||j.name!=="copilot-chat"||j.version!=="0.69.0"||!j.contributes?.languageModelChatProviders)throw new Error("expected bundled GitHub.copilot-chat 0.69.0 with languageModelChatProviders");if(!JSON.parse(fs.readFileSync(root+"/product.json","utf8")).defaultChatAgent)throw new Error("defaultChatAgent missing");' "$ROOT"
 
 # ── anchors / replacements (single source of truth for patch + gate) ────────
+# CommandsRegistry (`qe`) has just been initialized; the following `YLi` declaration makes the
+# anchor disappear after insertion. One renderer command, no registration in the extension host.
+A_APP_FAILURE='qe.registerCommand("noop",()=>{});var YLi='
+APP_FAILURE_VALIDATOR='const matches=(v,re)=>typeof v==="string"&&re.exec(v)?.[0]===v;const uuid=v=>matches(v,/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);const integer=(v,min,max)=>Number.isSafeInteger(v)&&v>=min&&v<=max;const codes={interrupted:["stream_interrupted"],network:["network_offline","network_failed"],timeout:["request_timeout","first_token_timeout"],auth:["auth_expired","auth_invalid","session_expired"],credits:["credits_exhausted"],entitlement:["membership_required","model_not_entitled"],rate_limit:["rate_limited"],provider:["provider_error","provider_overloaded","provider_refused","model_unavailable"],cancellation:["request_cancelled"],app_startup:["app_start_failed","app_start_timeout","chat_unavailable"]};const enums={source:["ezil_chat","code_app"],operation:["chat_request","app_start"],stage:["startup","admission","request","headers","stream"],outcome:["failed","retrying","recovered","cancelled"],streamReason:["eof","malformed_event","missing_terminal"],cancellationSource:["caller","user_stop","unknown"]};const keys=new Set(["eventId","source","operation","category","code","stage","outcome","streamReason","cancellationSource","clientRequestId","gatewayRequestId","vscodeRequestId","retryOfClientRequestId","attempt","retryable","durationMs","modelKey","httpStatus"]);const namespaces=new Set(["anthropic","openai","google","gemini","vertex","bedrock","aws-bedrock","amazon","azure","qwen","moonshot","moonshotai","kimi","zai","z-ai","glm","deepseek","mistral","meta","llama","xai","cohere","minimax","groq","cerebras","openrouter","ezil"]);const families=new Set(["claude","gemini","gpt","qwen","kimi","glm","deepseek","mistral","codestral","llama","grok","nova","ezil","minimax","command","sonar"]);const safeModelKey=value=>{if(typeof value!=="string"||!/^[a-z0-9][a-z0-9._:/-]{0,63}$/.test(value)||value!==value.trim())return false;if(value.includes("://")||value.split("/").length>2)return false;const key=value.replace(/^(?:us|eu|apac|global|au|jp)[.]/,"");const match=/^([a-z0-9-]+)[/.](.+)$/.exec(key);let model;if(match&&namespaces.has(match[1]))model=match[2];else if(families.has((/^[a-z]+/.exec(key)||[""])[0]))model=key;else return false;const segments=model.split(/[/.:]/);if(segments.some(segment=>!segment||/^(?:sk|sb|pk|rk|ghp|gho|ghs|ghu|github_pat|xox[abpr])[-_]/.test(segment)||/secret|token|passw|bearer|api[-_]?key|private|credential|session|cookie/.test(segment)||/[a-z0-9]{20,}/.test(segment)))return false;return /[0-9-]/.test(segments[0]);};const valid=r=>{if(!r||typeof r!=="object"||Array.isArray(r)||!Reflect.ownKeys(r).every(k=>keys.has(k)))return false;for(const [k,values] of Object.entries(enums))if(r[k]!==undefined&&!values.includes(r[k]))return false;if(!uuid(r.eventId)||r.source===undefined||r.operation===undefined||r.stage===undefined||r.outcome===undefined)return false;if(typeof r.category!=="string"||!Object.prototype.hasOwnProperty.call(codes,r.category)||typeof r.code!=="string")return false;if(r.code!=="unexpected_error"&&!codes[r.category].includes(r.code))return false;if(r.streamReason!==undefined&&r.stage!=="stream")return false;if((r.category==="cancellation")!==(r.cancellationSource!==undefined))return false;if((r.category==="cancellation")!==(r.outcome==="cancelled"))return false;for(const k of ["clientRequestId","gatewayRequestId","vscodeRequestId","retryOfClientRequestId"])if(r[k]!==undefined&&!uuid(r[k]))return false;if(r.attempt!==undefined&&!integer(r.attempt,1,64))return false;if(r.retryable!==undefined&&typeof r.retryable!=="boolean")return false;if(r.durationMs!==undefined&&!integer(r.durationMs,0,3600000))return false;if(r.modelKey!==undefined&&!safeModelKey(r.modelKey))return false;if(r.httpStatus!==undefined&&!integer(r.httpStatus,100,599))return false;return true;};'
+R_APP_FAILURE='qe.registerCommand("noop",()=>{});function ezilDispatchAppFailure(record){try{'"$APP_FAILURE_VALIDATOR"'if(!record||typeof record!=="object"||Array.isArray(record))return;const clean=Object.create(null);let dropped=false;for(const key of Reflect.ownKeys(record)){if(!keys.has(key)){dropped=true;continue}const desc=Object.getOwnPropertyDescriptor(record,key);if(!desc||!("value" in desc)){dropped=true;continue}const value=desc.value;const type=["attempt","durationMs","httpStatus"].includes(key)?"number":key==="retryable"?"boolean":"string";if(typeof value!==type||(type==="string"&&value.length>64)||(type==="number"&&!Number.isFinite(value))||(type==="number"&&!Number.isInteger(value))){dropped=true;continue}clean[key]=value}if(dropped||!valid(clean))return;window.dispatchEvent(new CustomEvent("ezil-app-failure",{detail:JSON.stringify(clean)}))}catch{}}qe.registerCommand("_ezil.appFailure",(accessor,record)=>{ezilDispatchAppFailure(record)});var YLi='
+# SetupAgent readiness timeout: NLS 10557/10558, once in 4.141.0. No elapsed duration is in scope.
+A_APP_START_TIMEOUT='if(M==="timedout"){let N;this.chatEntitlementService.anonymous?N=d(10558,null,RF.chatExtensionId):N=d(10557,null,RF.provider.default.name,RF.chatExtensionId);'
+R_APP_START_TIMEOUT='if(M==="timedout"){try{ezilDispatchAppFailure({eventId:crypto.randomUUID(),source:"code_app",operation:"app_start",category:"app_startup",code:"app_start_timeout",stage:"startup",outcome:"failed"})}catch{}let N;this.chatEntitlementService.anonymous?N=d(10558,null,RF.chatExtensionId):N=d(10557,null,RF.provider.default.name,RF.chatExtensionId);'
 # Part 1 — no GitHub calls (extension.js)
 A_TOKEN='this._logService.info("Allowing anonymous access with devDeviceId");let a=await this.authFromDevDeviceId(yGe.env.devDeviceId);'
 R_TOKEN='this._logService.info("EZiL Chat: anonymous mode, GitHub token minting (copilot_internal/v2/nltoken) disabled at build time");let a={kind:"failure",reason:"GitHubLoginFailed"};'
@@ -302,8 +310,13 @@ P_STATIC_BASE='let I=Be.join(l,this._productPath,IE),'
 P_STATIC_PAGE='WORKBENCH_WEB_BASE_URL:I,'
 P_STATIC_WEBVIEW='webviewEndpoint:I+"/out/vs/workbench/contrib/webview/browser/pre"'
 
+# Re-running on this patched bundle only verifies it, including the content-derived static id.
+# A partial or altered patch still fails the gates; it is never silently repaired.
+if [ "$VERIFY_ONLY" = 0 ] && [ "$(count "$WB" "$R_APP_FAILURE")" = 1 ]; then VERIFY_ONLY=1; fi
 if [ "$VERIFY_ONLY" = 0 ]; then
   patch ai-dashboard "$WB" 1 "$A_AI_DASHBOARD" "$R_AI_DASHBOARD"
+  patch app-failure "$WB" 1 "$A_APP_FAILURE" "$R_APP_FAILURE"
+  patch app-start-timeout "$WB" 1 "$A_APP_START_TIMEOUT" "$R_APP_START_TIMEOUT"
   patch ai-entry "$WB" 1 "$A_AI_ENTRY" "$R_AI_ENTRY"
   patch token          "$EXT" 1  "$A_TOKEN"  "$R_TOKEN"
   patch known-models   "$EXT" 1  "$A_KNOWN"  "$R_KNOWN"
@@ -372,6 +385,9 @@ if [ "$VERIFY_ONLY" = 0 ]; then
 fi
 
 # ── gates: anchors gone, replacements present, files still parse ────────────
+gate app-failure "$WB" 0 "$A_APP_FAILURE"; gate app-failure "$WB" 1 "$R_APP_FAILURE"
+gate app-start-timeout "$WB" 0 "$A_APP_START_TIMEOUT"; gate app-start-timeout "$WB" 1 "$R_APP_START_TIMEOUT"
+gate app-failure-command "$WB" 1 'qe.registerCommand("_ezil.appFailure",'
 gate ai-dashboard "$WB" 0 "$A_AI_DASHBOARD"; gate ai-dashboard "$WB" 1 "$R_AI_DASHBOARD"
 gate ai-entry "$WB" 0 "$A_AI_ENTRY"; gate ai-entry "$WB" 1 "$R_AI_ENTRY"
 gate token            "$EXT" 0  "$A_TOKEN";        gate token            "$EXT" 1  "$R_TOKEN"
