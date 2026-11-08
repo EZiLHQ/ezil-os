@@ -291,7 +291,7 @@ fi
 
 # ── Pass 6: a phone's narrow chat keeps the model picker's name (patch-copilot-chat.sh picker-order) ──
 if [[ "$PASSES" == *" phone "* ]]; then
-echo "[e2e] pass 6 — phone: the header's model picker keeps its name, opens and switches by touch (Android and iPhone), the pick reaches the Gateway and survives a reload; desktop by mouse"
+echo "[e2e] pass 6 — phone: the composer's model picker keeps its name, opens and switches by touch (Android and iPhone), the pick reaches the Gateway and survives a reload; desktop by mouse"
 ST7="$WORK/phone"; mkdir -p "$ST7/home/neko/project" "$ST7/etc/ezil"
 cp "$here/copilot-ezil-models.json" "$ST7/etc/ezil/models.e2e.json"
 FORWARD_PORT=$((FORWARD_PORT + 1))
