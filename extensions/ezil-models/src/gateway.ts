@@ -94,7 +94,9 @@ export type GatewayAvailability = { state: typeof AVAILABILITY_STATES[number]; r
 export type GatewayCapabilities = { tool_calling?: boolean; image_input?: boolean; streaming?: boolean };
 export type GatewayModel = { id: string; enabled: boolean; max_input_tokens: number; max_output_tokens: number; protocols?: readonly GatewayProtocol[];
     availability?: GatewayAvailability; name?: string; capabilities?: GatewayCapabilities };
-export type GatewayModels = { killswitch: boolean; pause: 'operations' | 'reconciliation' | null; data: GatewayModel[] };
+export type GatewayModels = { killswitch: boolean; pause: 'operations' | 'reconciliation' | null; data: GatewayModel[];
+    /** v1 `default_model`: the Gateway's suggested first model for this caller (contract §2 rule 8); absent when null. */
+    default_model?: string };
 export type GatewayGrant = { remaining_micro: number; live: boolean };
 export type GatewayBalance = { state?: string; available_micro: number; held_micro: number; grants: GatewayGrant[] };
 
@@ -187,7 +189,9 @@ export function parseGatewayModels(json: unknown): GatewayModels | undefined {
         if (capabilities && protocols?.length && KNOWN_PROTOCOLS.includes(protocols[0]!)) row.capabilities = capabilities;
         return row;
     });
-    return { killswitch: raw.killswitch === true, pause: raw.pause === 'operations' || raw.pause === 'reconciliation' ? raw.pause : null, data };
+    const models: GatewayModels = { killswitch: raw.killswitch === true, pause: raw.pause === 'operations' || raw.pause === 'reconciliation' ? raw.pause : null, data };
+    if (v1 && typeof raw.default_model === 'string' && CATALOG_ALIAS.test(raw.default_model)) models.default_model = raw.default_model;
+    return models;
 }
 
 /** Legacy catalogs imply Messages only. Responses requires an explicit, enabled catalog route. */
@@ -266,6 +270,24 @@ export function gatewayCatalogModels(provider: ResolvedProvider, catalog: Gatewa
         });
     }
     return models;
+}
+
+/**
+ * The Gateway's suggested first model (contract §2 rule 8, `default_model`) as the provider's declared default, in place
+ * of the configured one, only when this read of the catalog shows it usable for an Agent session: its row is enabled,
+ * `available` for this caller, over a protocol this client speaks, with tool calling, and the model is listed here
+ * (configured on that provider, or a catalog-only row). Otherwise the list is returned unchanged: the configured
+ * default stays. VS Code applies a declared default only while the user has not picked a model, so a pick still wins.
+ */
+export function withCatalogDefault(models: readonly ResolvedModel[], catalogs: ReadonlyMap<ResolvedProvider, GatewayModels | undefined>): ResolvedModel[] {
+    for (const [provider, catalog] of catalogs) {
+        const alias = catalog?.default_model;
+        const entry = alias ? catalog.data.find(row => row.id === alias) : undefined;
+        if (!entry || !selectableProtocol(entry) || entry.capabilities?.tool_calling !== true) continue;
+        const pick = models.find(model => model.provider === provider && model.model === alias && model.capabilities.toolCalling);
+        if (pick) return models.map(model => model.default === (model === pick) ? model : { ...model, default: model === pick });
+    }
+    return [...models];
 }
 
 /** `GET /v1/models`, cached for five minutes per base URL + auth context. `undefined` when it cannot be read. */

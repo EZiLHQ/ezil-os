@@ -27,6 +27,13 @@ export function escapeNonAscii(json: string): string {
 
 export const QWEN = 'qwen.qwen3-coder-next';
 export const KIMI = 'us.moonshotai.kimi-k3';
+/**
+ * Gateway aliases that refuse `temperature`/`top_p` (EZiL AI Gateway src/providers/gemini-request.ts): Google ignores
+ * sampling on gemini-3.8-flash, and gemini-4-argon's handling is unverified, so the Gateway refuses the request rather
+ * than drop or forward them. They are never sent for these aliases, whatever Copilot or the config pass.
+ */
+export const SAMPLING_REFUSED: ReadonlySet<string> = new Set(['gemini-3.8-flash', 'gemini-4-argon']);
+export function samplingRefused(alias: string): boolean { return SAMPLING_REFUSED.has(alias.trim().toLowerCase()); }
 export const GATEWAY_INPUT_TOKENS = 131_072;
 export const INPUT_FRAMING = 1056;
 export const ENVELOPE_RESERVE = 1536;
@@ -178,7 +185,9 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
     if (conversation.system.length) body.system = conversation.system;
     if (tools.length) { body.tools = tools; body.tool_choice = { type: 'auto' }; }
     if (request.toolMode === 'required') log?.('[gateway] required tool choice mapped to auto');
-    for (const [key, configured] of [['temperature', model.temperature], ['top_p', model.topP]] as const) {
+    if (samplingRefused(model.model)) {
+        if (['temperature', 'top_p'].some(key => request.modelOptions[key] !== undefined) || model.temperature !== undefined || model.topP !== undefined) log?.(`[gateway] temperature/top_p not sent: ${model.model} refuses sampling options`);
+    } else for (const [key, configured] of [['temperature', model.temperature], ['top_p', model.topP]] as const) {
         const value = request.modelOptions[key] ?? configured;
         if (typeof value === 'number' && Number.isFinite(value)) body[key] = Math.max(0, Math.min(1, value));
     }
