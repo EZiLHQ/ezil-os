@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { APP_FAILURE_CODES, appFailure, isAppFailure, type AppFailureInput } from '../src/failure';
+import { APP_FAILURE_CODES, appFailure, isAppFailure, isSafeModelKey, MODEL_KEY_NAMESPACES, type AppFailureInput } from '../src/failure';
 import { GatewayError } from '../src/gateway';
 import { GatewayResponseError } from '../src/gateway-response';
 import { CLIENT_ID, GATEWAY_ID, SENTINEL } from './fixtures/failure';
@@ -9,7 +9,7 @@ import { CLIENT_ID, GATEWAY_ID, SENTINEL } from './fixtures/failure';
 const fixtures = JSON.parse(readFileSync(`${import.meta.dir}/../../../app/src/server/feedback/app-failures.fixtures.json`, 'utf8')) as {
     valid: { name: string; failure: unknown }[]; rejected: { name: string; failure: unknown }[] };
 const EVENT_ID = 'e1e1e1e1-0000-4000-8000-000000000001';
-const base: AppFailureInput = { outcome: 'failed', stage: 'headers', model: 'us.anthropic.claude-sonnet-5-5', clientRequestId: CLIENT_ID,
+const base: AppFailureInput = { outcome: 'failed', stage: 'headers', model: 'qwen.qwen3-coder-next', clientRequestId: CLIENT_ID,
     gatewayRequestId: GATEWAY_ID, attempts: 1, durationMs: 1234, newEventId: () => EVENT_ID };
 const gatewayError = (code?: string, status?: number, origin: GatewayError['origin'] = 'gateway') => new GatewayError(SENTINEL, status, code, GATEWAY_ID, undefined, origin);
 
@@ -19,6 +19,38 @@ describe('canonical golden fixtures', () => {
 });
 
 describe('appFailure mapping', () => {
+    for (const model of ['us.anthropic.claude-sonnet-5-5', 'claude-sonnet-5-5', 'us.moonshotai.kimi-k3']) {
+        test(`unsafe model ${model} is omitted without losing the record or its IDs`, () => {
+            const record = appFailure({ ...base, model, error: gatewayError('upstream_error', 500) });
+            expect(record).not.toHaveProperty('modelKey');
+            expect(record).toMatchObject({ eventId: EVENT_ID, clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID });
+            expect(isAppFailure(record)).toBe(true);
+            expect(isAppFailure({ ...record, modelKey: model })).toBe(false);
+        });
+    }
+    for (const model of ['qwen.qwen3-coder-next', 'anthropic/claude-sonnet-4-5-20250929']) {
+        test(`safe model ${model} is preserved`, () => {
+            const record = appFailure({ ...base, model });
+            expect(record.modelKey).toBe(model);
+            expect(isAppFailure(record)).toBe(true);
+        });
+    }
+    test('namespace, token, segment and exact-match bounds mirror the contract', () => {
+        for (const namespace of MODEL_KEY_NAMESPACES) {
+            expect(isSafeModelKey(`${namespace}/model-1`)).toBe(true);
+            expect(isSafeModelKey(`${namespace}.model-1`)).toBe(true);
+        }
+        for (const segment of ['sk-123', 'sb_123', 'pk_123', 'rk_123', 'ghp_123', 'gho_123', 'ghs_123', 'ghu_123',
+            'github_pat_123', 'xoxa-123', 'xoxb-123', 'xoxp-123', 'xoxr-123', 'secret-1', 'token-1', 'passw-1', 'bearer-1',
+            'apikey-1', 'api-key-1', 'api_key-1', 'private-1', 'credential-1', 'session-1', 'cookie-1', 'a'.repeat(20)]) {
+            expect(isSafeModelKey(`qwen.model-1.${segment}`)).toBe(false);
+        }
+        for (const value of [null, 1, 'qwen/model', 'qwen/model-1/other', 'qwen/model-1..other', 'qwen/model-1:',
+            'qwen:model-1', 'qwen/model-1://other', ' qwen/model-1', 'qwen/model-1\n', 'qwen/model-1 ', `qwen/${'a-'.repeat(30)}`]) {
+            expect(isSafeModelKey(value)).toBe(false);
+        }
+        expect(isSafeModelKey(`qwen/model-${'a'.repeat(19)}`)).toBe(true);
+    });
     const table: [string, string, string][] = [
         ['first_byte_timeout', 'timeout', 'first_token_timeout'], ['stream_idle_timeout', 'timeout', 'request_timeout'],
         ['completion_timeout', 'timeout', 'request_timeout'], ['os_completion_timeout', 'timeout', 'request_timeout'], ['upstream_timeout', 'timeout', 'request_timeout'],
@@ -29,7 +61,8 @@ describe('appFailure mapping', () => {
         ['no_ezil_role', 'entitlement', 'membership_required'], ['no_entitlement', 'entitlement', 'membership_required'], ['model_not_allowed', 'entitlement', 'model_not_entitled'],
         ['rate_limited', 'rate_limit', 'rate_limited'], ['concurrency_limit', 'rate_limit', 'rate_limited'],
         ['upstream_error', 'provider', 'provider_error'], ['upstream_unavailable', 'provider', 'provider_error'], ['max_tokens', 'provider', 'provider_error'],
-        ['model_disabled', 'provider', 'model_unavailable'], ['killswitch', 'provider', 'model_unavailable'], ['pause', 'provider', 'model_unavailable'],
+        ['model_disabled', 'provider', 'model_unavailable'], ['model_unavailable', 'provider', 'model_unavailable'], ['catalog_unavailable', 'provider', 'model_unavailable'],
+        ['killswitch', 'provider', 'model_unavailable'], ['pause', 'provider', 'model_unavailable'],
         ['input_too_large', 'provider', 'unexpected_error'], ['local_build_error', 'provider', 'unexpected_error'], ['future_code', 'provider', 'unexpected_error'],
     ];
     for (const [from, category, code] of table) test(`${from} -> ${category}/${code}`, () => {
@@ -66,7 +99,7 @@ describe('appFailure mapping', () => {
         const record = appFailure({ ...base, outcome: 'cancelled', cancellationSource: 'caller', stage: 'stream', error: gatewayError('upstream_error', 500) });
         expect(record).toEqual({ eventId: EVENT_ID, source: 'ezil_chat', operation: 'chat_request', category: 'cancellation', code: 'request_cancelled',
             stage: 'stream', outcome: 'cancelled', cancellationSource: 'caller', clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID, attempt: 1,
-            durationMs: 1234, modelKey: 'us.anthropic.claude-sonnet-5-5' });
+            durationMs: 1234, modelKey: 'qwen.qwen3-coder-next' });
         expect(isAppFailure(record)).toBe(true);
         expect(appFailure({ ...base, outcome: 'cancelled' }).cancellationSource).toBe('unknown');
         for (const bad of [{ outcome: 'failed' }, { code: 'unexpected_error' }]) expect(isAppFailure({ ...record, ...bad })).toBe(false);

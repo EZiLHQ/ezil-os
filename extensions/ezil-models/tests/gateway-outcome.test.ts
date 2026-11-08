@@ -31,7 +31,10 @@ for (const protocol of ['Messages', 'Responses'] as const) describe(`${protocol}
         return gatewayChat(model(), request, { signal: new AbortController().signal, fetch, newIdempotencyKey: () => CLIENT_ID,
             sleep: async () => {}, now: () => 0, ...options });
     }
-    const valid = (records: AppFailure[]) => { for (const record of records) expect(isAppFailure(record)).toBe(true); };
+    const valid = (records: AppFailure[]) => { for (const record of records) {
+        expect(isAppFailure(record)).toBe(true);
+        expect(record).not.toHaveProperty('vscodeRequestId');
+    } };
 
     test('a Gateway error event mid-stream: one failed provider record with both IDs; log keeps the reason; no text anywhere', async () => {
         const logs: string[] = [], records: AppFailure[] = [];
@@ -66,8 +69,23 @@ for (const protocol of ['Messages', 'Responses'] as const) describe(`${protocol}
         expect(records).toHaveLength(2);
         expect(records[0]).toMatchObject({ outcome: 'retrying', category: 'rate_limit', code: 'rate_limited', stage: 'headers', httpStatus: 429,
             attempt: 1, clientRequestId: CLIENT_ID, gatewayRequestId: OTHER_GATEWAY_ID, retryable: true });
-        expect(records[1]).toMatchObject({ outcome: 'recovered', code: 'rate_limited', attempt: 2, clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID });
+        expect(records[1]).toMatchObject({ outcome: 'recovered', code: 'rate_limited', httpStatus: 429, attempt: 2, clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID });
         expect(records[0]!.eventId).not.toBe(records[1]!.eventId);
+        valid(records);
+    });
+    test('retrying precedes every automatic resend; recovery uses the last refusal and current Gateway ID', async () => {
+        const records: AppFailure[] = [];
+        const s = server(index => {
+            if (index > 0) expect(records.at(-1)).toMatchObject({ outcome: 'retrying', attempt: index });
+            if (index === 0) throw new TypeError(SENTINEL);
+            return index === 1 ? refusal(429, 'concurrency_limit', OTHER_GATEWAY_ID) : success();
+        });
+        await collect(turn(s.fetch, { onOutcome: record => records.push(record) }));
+        expect(s.keys).toEqual([CLIENT_ID, CLIENT_ID, CLIENT_ID]);
+        expect(records.map(r => [r.outcome, r.code])).toEqual([
+            ['retrying', 'network_failed'], ['retrying', 'rate_limited'], ['recovered', 'rate_limited'],
+        ]);
+        expect(records[2]).toMatchObject({ attempt: 3, httpStatus: 429, gatewayRequestId: GATEWAY_ID });
         valid(records);
     });
     test('per-attempt metadata never carries over: a 429 Gateway ID is gone when the next attempt fails before any response', async () => {

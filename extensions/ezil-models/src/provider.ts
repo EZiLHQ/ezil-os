@@ -3,7 +3,7 @@
 
 import * as vscode from 'vscode';
 import type { CompactionInfo } from './compact';
-import type { AppFailure } from './failure';
+import { appFailure, type AppFailure } from './failure';
 import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, knownGatewayModels, parseCatalogModelId, withCatalogDefault, withGatewayModelLimits, type GatewayModels } from './gateway';
 import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
@@ -153,12 +153,23 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     private lastCreditWarningAt = -Infinity;
     /** Per configured Gateway provider: the catalog the picker was last given. */
     private listedCatalogs = new Map<ResolvedProvider, string>();
+    /** Keep only identity metadata for stale picker selections, including when the config cannot be read. */
+    private modelIdentities = new Map<string, { type: ResolvedProvider['type']; model: string }>();
     readonly onDidChangeLanguageModelChatInformation = this.changed.event;
 
     constructor(private readonly host: ProviderHost) {}
 
     refresh(): void { this.changed.fire(); }
-    dispose(): void { this.changed.dispose(); }
+    dispose(): void { this.changed.dispose(); this.modelIdentities.clear(); }
+
+    private rememberModels(models: ResolvedModel[]): ResolvedModel[] {
+        for (const model of models) this.modelIdentities.set(model.id, { type: model.provider.type, model: model.model });
+        return models;
+    }
+
+    private configuredModels(): ResolvedModel[] {
+        return this.rememberModels(this.host.models());
+    }
 
     /**
      * Re-list when a catalog read since the last listing changed what the picker shows (after a request, or when the
@@ -172,7 +183,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     }
 
     private gatewayProviders(): ResolvedProvider[] {
-        return [...new Set(this.host.models().filter(model => model.provider.type === 'ezil-gateway').map(model => model.provider))];
+        return [...new Set(this.configuredModels().filter(model => model.provider.type === 'ezil-gateway').map(model => model.provider))];
     }
 
     async provideLanguageModelChatInformation(_options: vscode.PrepareLanguageModelChatModelOptions, token: vscode.CancellationToken): Promise<vscode.LanguageModelChatInformation[]> {
@@ -180,7 +191,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         const controller = new AbortController();
         const cancel = token.onCancellationRequested(() => controller.abort());
         try {
-            const models = this.host.models();
+            const models = this.configuredModels();
             const providers = this.gatewayProviders();
             const catalog = new Map(await Promise.all(providers.map(async provider => [provider, await gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), controller.signal)] as const)));
             if (token.isCancellationRequested) return [];
@@ -193,7 +204,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             // The Gateway's suggested default counts only from this read: during an outage the configured default stays.
             const offered = [...models.filter(model => gatewayModelAvailable(model, catalog.get(model.provider))), ...listed]
                 .map(model => withGatewayModelLimits(model, catalog.get(model.provider)));
-            return withCatalogDefault(offered, catalog).map(toInformation);
+            return this.rememberModels(withCatalogDefault(offered, catalog)).map(toInformation);
         } finally { cancel.dispose(); }
     }
 
@@ -205,7 +216,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
      * resolve to that one provider fails closed, never to another provider's model of the same alias.
      */
     private async resolve(model: vscode.LanguageModelChatInformation, signal?: AbortSignal, known = false): Promise<ResolvedModel> {
-        const models = this.host.models();
+        const models = this.configuredModels();
         const found = models.find(candidate => candidate.id === model.id);
         if (found) return found;
         const id = parseCatalogModelId(model.id);
@@ -254,28 +265,26 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         const controller = new AbortController();
         const cancellation = token.onCancellationRequested(() => controller.abort());
         if (token.isCancellationRequested) controller.abort();
-        let resolved: ResolvedModel;
+        const started = Date.now();
+        let resolved: ResolvedModel | undefined;
+        let chatStarted = false;
+        let terminalOutcome = false;
+        const onOutcome = (record: AppFailure) => {
+            if (record.outcome === 'failed' || record.outcome === 'cancelled') terminalOutcome = true;
+            try { this.host.appFailure?.(record); } catch { /* Optional observer. */ }
+        };
         try {
             resolved = await this.resolve(model, controller.signal);
-        } catch (error) {
-            cancellation.dispose();
-            if (controller.signal.aborted) return;
-            if (!(error instanceof GatewayError)) throw error;
-            if (error.code === 'model_unavailable') this.refresh();
-            throw new Error(`EZiL Models: ${error.message}`);
-        }
-        if (resolved.provider.type === 'ezil-gateway' && resolved.gatewayProtocol !== 'openai-responses' && isUtilityRequest(options.modelOptions ?? {})) {
-            // Qwen on the selected model's own provider (account) only; without one, the selected model serves it.
-            const selected = resolved;
-            resolved = this.host.models().find(candidate => candidate.provider.type === 'ezil-gateway' && candidate.providerName === selected.providerName
-                && candidate.gatewayProtocol !== 'openai-responses' && candidate.model === QWEN) ?? resolved;
-        }
-        const request = toNeutralRequest(messages, options);
-        const started = Date.now();
-        const Thinking = thinkingCtor();
-        let emittedText = false;
-        try {
             controller.signal.throwIfAborted();
+            if (resolved.provider.type === 'ezil-gateway' && resolved.gatewayProtocol !== 'openai-responses' && isUtilityRequest(options.modelOptions ?? {})) {
+                // Qwen on the selected model's own provider (account) only; without one, the selected model serves it.
+                const selected = resolved;
+                resolved = this.configuredModels().find(candidate => candidate.provider.type === 'ezil-gateway' && candidate.providerName === selected.providerName
+                    && candidate.gatewayProtocol !== 'openai-responses' && candidate.model === QWEN) ?? resolved;
+            }
+            const request = toNeutralRequest(messages, options);
+            const Thinking = thinkingCtor();
+            let emittedText = false;
             if (resolved.provider.type === 'ezil-gateway') {
                 // Resolve again for each turn: cached limits may have expired or been invalidated by a refusal.
                 const catalog = await gatewayModels(resolved.provider, this.host.fetch ?? fetch, Date.now(), controller.signal);
@@ -298,15 +307,16 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 fetch: this.host.fetch,
                 gateway: {
                     onCompact: info => this.host.compacted?.(sending, info, finished),
-                    onOutcome: record => { try { this.host.appFailure?.(record); } catch { /* Optional observer. */ } },
+                    onOutcome,
                 },
                 log: line => this.host.log(redact(line, this.host.secrets())),
                 onRequest: (url, body) => {
-                    if (resolved.provider.type === 'ezil-gateway') return;
-                    this.host.log(`[request] ${resolved.id} -> ${redact(url, this.host.secrets())} messages=${request.messages.length} tools=${request.tools.length} toolMode=${request.toolMode}${options.modelOptions?.requestInitiator ? ` initiator=${String(options.modelOptions.requestInitiator)}` : ''}`);
+                    if (sending.provider.type === 'ezil-gateway') return;
+                    this.host.log(`[request] ${sending.id} -> ${redact(url, this.host.secrets())} messages=${request.messages.length} tools=${request.tools.length} toolMode=${request.toolMode}${options.modelOptions?.requestInitiator ? ` initiator=${String(options.modelOptions.requestInitiator)}` : ''}`);
                     if (this.host.logRequests()) this.host.log(requestForLog(body, this.host.secrets()));
                 },
             });
+            chatStarted = true;
             for await (const event of events) {
                 if (token.isCancellationRequested) break;
                 switch (event.type) {
@@ -338,11 +348,24 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 }
             }
         } catch (error) {
+            const known = this.modelIdentities.get(model.id);
+            const catalogId = parseCatalogModelId(model.id);
+            const gateway = resolved ? resolved.provider.type === 'ezil-gateway'
+                : known ? known.type === 'ezil-gateway' : catalogId !== undefined;
+            // Before chat there are no request IDs. Once chat starts, its own terminal outcome owns the turn.
+            if (gateway && !chatStarted && !terminalOutcome) onOutcome(appFailure({
+                outcome: controller.signal.aborted ? 'cancelled' : 'failed', cancellationSource: 'caller',
+                error: error instanceof GatewayError ? error : undefined,
+                stage: 'admission', model: resolved?.model ?? known?.model ?? catalogId?.alias ?? '',
+                attempts: 0, durationMs: Date.now() - started,
+            }));
             if (controller.signal.aborted) return;
+            // Resolution errors keep their original cause chain; the public boundary clears its stacks.
+            if (!resolved && !(error instanceof GatewayError)) throw error;
             // Every message shown to the user or logged is redacted: upstream error bodies and URLs are not trusted
             // to be free of key material (a gateway may echo headers or carry the key in its path).
             const message = redact(error instanceof Error ? error.message : String(error), this.host.secrets());
-            if (resolved.provider.type !== 'ezil-gateway') this.host.log(`[error] ${resolved.id}: ${message}`);
+            if (resolved && resolved.provider.type !== 'ezil-gateway') this.host.log(`[error] ${resolved.id}: ${message}`);
             if (error instanceof GatewayError && ['insufficient_credits', 'no_live_grant'].includes(error.code ?? '') && Date.now() - this.lastCreditWarningAt >= 60_000) {
                 this.lastCreditWarningAt = Date.now();
                 const link = aiCreditsLink();
@@ -362,7 +385,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             throw new Error(message.startsWith('EZiL Models') ? message : `EZiL Models: ${message}`);
         } finally {
             cancellation.dispose();
-            this.host.requestFinished?.(resolved);
+            if (resolved) this.host.requestFinished?.(resolved);
         }
     }
 

@@ -1,9 +1,10 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
 import { ConfigError, describeConfig, parseModelsConfig, type ResolvedConfig, type ResolvedModel } from './config';
 import { forgetGatewayModels, gatewayModels } from './gateway';
-import { isAppFailure } from './failure';
+import { isAppFailure, type AppFailure } from './failure';
 import { CompactionNotice } from './compaction-notice';
 import { EZiLAIStatus } from './status';
 import { EZiLModelsProvider } from './provider';
@@ -212,6 +213,12 @@ export function sendAppFailure(record: unknown): void {
     } catch { /* Diagnostics are optional and never logged. */ }
 }
 
+/** Only a definite activation config failure calls this builder; no config or error text enters the record. */
+export function appStartFailure(): AppFailure {
+    return { eventId: randomUUID(), source: 'ezil_chat', operation: 'app_start', category: 'app_startup',
+        code: 'app_start_failed', stage: 'startup', outcome: 'failed' };
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
     const output = vscode.window.createOutputChannel('EZiL Models');
     const log = (line: string) => output.appendLine(line.startsWith('{') ? line : `${new Date().toISOString()} ${line}`);
@@ -237,7 +244,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     context.subscriptions.push(output, store, provider, aiStatus, compaction);
     context.subscriptions.push(store.onChange(() => { provider.refresh(); void aiStatus.refresh(); }));
     store.watch();
-    store.load();
+    if (!store.load()) sendAppFailure(appStartFailure());
     context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider('ezil', provider));
     // VS Code 1.141 subscribes to model changes at registration and does not enumerate models
     // then; the change fired by the load above was missed, so announce the models once more.

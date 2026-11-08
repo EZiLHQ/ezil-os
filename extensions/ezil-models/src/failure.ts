@@ -13,7 +13,7 @@ export type StreamReason = 'eof' | 'malformed_event' | 'missing_terminal';
 export type CancellationSource = 'caller' | 'user_stop' | 'unknown';
 
 export type AppFailure = {
-    eventId: string; source: 'ezil_chat'; operation: 'chat_request'; category: AppFailureCategory; code: string;
+    eventId: string; source: 'ezil_chat'; operation: 'chat_request' | 'app_start'; category: AppFailureCategory; code: string;
     stage: AppFailureStage; outcome: AppFailureOutcome; streamReason?: StreamReason; cancellationSource?: CancellationSource;
     clientRequestId?: string; gatewayRequestId?: string; attempt?: number; retryable?: boolean; durationMs?: number;
     modelKey?: string; httpStatus?: number;
@@ -67,13 +67,33 @@ const RETRYABLE = new Set(['stream_interrupted', 'network_offline', 'network_fai
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const MODEL_KEY = /^[a-z0-9][a-z0-9._:/-]{0,63}$/;
+// Exact mirror of app/src/server/feedback/types.ts: isSafeModelKey and its allowlist.
+export const MODEL_KEY_NAMESPACES = Object.freeze([
+    'anthropic', 'openai', 'google', 'gemini', 'vertex', 'bedrock', 'aws-bedrock', 'amazon', 'azure',
+    'qwen', 'moonshot', 'moonshotai', 'kimi', 'zai', 'z-ai', 'glm', 'deepseek', 'mistral', 'meta', 'llama',
+    'xai', 'cohere', 'minimax', 'groq', 'cerebras', 'openrouter', 'ezil',
+]);
+const NAMESPACES = new Set<string>(MODEL_KEY_NAMESPACES);
+const TOKEN_WORD = /secret|token|passw|bearer|api[-_]?key|private|credential|session|cookie/;
+const TOKEN_PREFIX = /^(?:sk|sb|pk|rk|ghp|gho|ghs|ghu|github_pat|xox[abpr])[-_]/;
+
+export function isSafeModelKey(value: unknown): value is string {
+    // `$` also matches before a final newline, hence the explicit exact test.
+    if (typeof value !== 'string' || !MODEL_KEY.test(value) || value !== value.trim()) return false;
+    if (value.includes('://') || value.split('/').length > 2) return false;
+    const match = /^([a-z0-9-]+)[/.](.+)$/.exec(value);
+    if (!match || !NAMESPACES.has(match[1]!)) return false;
+    const segments = match[2]!.split(/[/.:]/);
+    if (segments.some(segment => !segment || TOKEN_PREFIX.test(segment) || TOKEN_WORD.test(segment)
+        || /[a-z0-9]{20,}/.test(segment))) return false;
+    // The model name itself carries a version or a family separator.
+    return /[0-9-]/.test(segments[0]!);
+}
 
 // JavaScript's $ also matches before a final newline; metadata must match the entire string.
 function matches(value: unknown, pattern: RegExp): value is string {
     return typeof value === 'string' && pattern.exec(value)?.[0] === value;
 }
-/** A catalog model key: the contract pattern, and never a URL (its pattern alone admits `https://…`; the fixtures reject it). */
-const modelKey = (value: unknown): value is string => matches(value, MODEL_KEY) && !value.includes('://');
 /** A canonical lowercase UUID as given, else undefined: an ID is never case-folded or repaired into one. */
 export function failureId(value: unknown): string | undefined {
     return matches(value, UUID) ? value : undefined;
@@ -131,7 +151,7 @@ export function appFailure(input: AppFailureInput): AppFailure {
         ...(cancelled ? {} : { retryable: input.outcome !== 'failed' || RETRYABLE.has(code) && error?.code !== 'settlement_pending'
             && !(error instanceof GatewayResponseError && error.upstreamType === 'settlement_pending') }),
         ...(integer(durationMs, 0, 3_600_000) ? { durationMs } : durationMs > 3_600_000 ? { durationMs: 3_600_000 } : {}),
-        ...(modelKey(input.model) ? { modelKey: input.model } : {}),
+        ...(isSafeModelKey(input.model) ? { modelKey: input.model } : {}),
         ...(status !== undefined ? { httpStatus: status } : {}),
     };
 }
@@ -162,7 +182,7 @@ export function isAppFailure(value: unknown): value is AppFailure {
     if (r.attempt !== undefined && !integer(r.attempt as number, 1, 64)) return false;
     if (r.retryable !== undefined && typeof r.retryable !== 'boolean') return false;
     if (r.durationMs !== undefined && !integer(r.durationMs as number, 0, 3_600_000)) return false;
-    if (r.modelKey !== undefined && !modelKey(r.modelKey)) return false;
+    if (r.modelKey !== undefined && !isSafeModelKey(r.modelKey)) return false;
     if (r.httpStatus !== undefined && !integer(r.httpStatus as number, 100, 599)) return false;
     return true;
 }
