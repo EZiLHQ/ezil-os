@@ -1,5 +1,5 @@
 // Image e2e, pass "phone" (copilot-ezil-image.sh): on a phone, Explorer and Chat sit side by side and leave the chat
-// header about 160 px, so its pickers cannot all keep their labels. The model picker must keep its name, ellipsized
+// composer's mode/model row about 160 px, so its pickers cannot all keep their labels. The model picker must keep its name, ellipsized
 // if need be (patch-copilot-chat.sh `picker-order`), and be usable by touch (`picker-touch`, `title-tap`): real taps
 // (touch events, not mouse clicks: a mouse click in a touch context never showed that a tap did nothing) open it, it
 // stays open, and a tapped Kimi K3 is the model the Gateway receives for the turn. The pick survives a reload and a
@@ -57,7 +57,8 @@ try {
       await page.waitForTimeout(1500);
     };
     // Type only once the chat input really has focus, then wait for the Gateway request it causes.
-    const send = async (prompt) => {
+    const sendButton = page.locator('.part.auxiliarybar .chat-controls-container > .interactive-session .chat-execute-toolbar .action-item.chat-submit-button .action-label').first();
+    const send = async (prompt, viaSend = false) => {
       const before = messages().length;
       const lines = page.locator('.part.auxiliarybar .chat-input-container .monaco-editor .view-lines').first();
       for (let attempt = 0; attempt < 3; attempt++) {
@@ -68,7 +69,7 @@ try {
         await page.waitForTimeout(250);
         // A phone's composer wraps inside words: compare without whitespace.
         const text = await page.locator('.part.auxiliarybar .chat-input-container .monaco-editor').first().innerText();
-        if (text.replace(/\s+/g, '') === prompt.replace(/\s+/g, '')) { await page.keyboard.press('Enter'); break; }
+        if (text.replace(/\s+/g, '') === prompt.replace(/\s+/g, '')) { if (viaSend) await press(sendButton); else await page.keyboard.press('Enter'); break; }
         for (let i = 0; i < 2; i++) await page.keyboard.press('Escape');
       }
       for (let i = 0; i < 60 && messages().length === before; i++) await page.waitForTimeout(500);
@@ -86,6 +87,22 @@ try {
         width: b ? Math.round(b.width) : 0, compact: Boolean(item?.classList.contains('compact-picker')),
         chatWidth: Math.round(document.querySelector('.part.auxiliarybar')?.getBoundingClientRect().width ?? 0),
         mode: mode ? { aria: mode.querySelector('.action-label')?.getAttribute('aria-label') ?? '', compact: mode.classList.contains('compact-picker') } : null,
+        inComposer: Boolean(m?.closest('.interactive-input-part')), inHeader: Boolean(m?.closest('.chat-view-title-container')),
+        // Send and the model picker must sit wholly inside the composer's box (both axes) and be what a tap at their
+        // centre reaches, not pushed out or covered by the controls beside them.
+        send: (() => {
+          const part = m?.closest('.interactive-input-part')?.getBoundingClientRect();
+          const box = (el) => {
+            const r = el?.getBoundingClientRect();
+            if (!r || !part) return { found: false };
+            const top = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+            return { found: true, inside: r.width > 0 && r.height > 0 && r.left >= part.left - 1 && r.right <= part.right + 1 && r.top >= part.top - 1 && r.bottom <= part.bottom + 1,
+              hit: Boolean(top && (top === el || el.contains(top))), rect: [r.left, r.top, r.right, r.bottom].map(Math.round), part: [part.left, part.top, part.right, part.bottom].map(Math.round) };
+          };
+          const s = box(document.querySelector('.part.auxiliarybar .chat-controls-container > .interactive-session .chat-execute-toolbar .action-item.chat-submit-button .action-label'));
+          const p = box(m);
+          return { found: s.found && p.found, inside: s.inside && p.inside && s.hit && p.hit, sendBox: s, modelBox: p };
+        })(),
       };
     });
     try {
@@ -97,12 +114,32 @@ try {
       check(`${at}: a fresh profile starts on the declared default, ${MODEL_NAME}`, before.aria === `Models, ${MODEL_NAME}`, before.aria);
       check(`${at}: the model picker shows its name, not only an icon`, !before.compact && before.text === MODEL_NAME && before.labelWidth >= 40, JSON.stringify(before));
       check(`${at}: the mode picker keeps an accessible name`, Boolean(before.mode?.aria), JSON.stringify(before.mode));
+      check(`${at}: the model picker sits in the composer, not the chat header`, before.inComposer && !before.inHeader, JSON.stringify(before));
+      check(`${at}: Send and the model picker sit inside the composer (both axes) and a tap at their centre reaches them`, before.send.found && before.send.inside, JSON.stringify(before.send));
+      // The layout follows the pane: wide, back to this width, and the controls are in place again.
+      const size = page.viewportSize();
+      await page.setViewportSize({ width: 1440, height: 900 }); await page.waitForTimeout(1500);
+      await page.setViewportSize(size); await page.waitForTimeout(2000);
+      const resized = await read();
+      check(`${at}: after a wide window and back, Send and the model picker are inside the composer again`, resized.send.found && resized.send.inside, JSON.stringify(resized.send));
       if (!v.touch) check(`${at}: a desktop chat keeps every label (the mode picker is not compacted)`, before.mode && !before.mode.compact, JSON.stringify(before.mode));
 
-      // The mode picker sits in the same header: a tap opens it and it stays open.
+      // The mode picker sits in the same composer row: a tap opens it and it stays open.
       const modeLabel = page.locator('.part.auxiliarybar .chat-input-toolbar .action-item.chat-input-picker-item:not(.model-picker-item) .action-label').first();
       if (await modeLabel.count()) { await press(modeLabel); await page.waitForTimeout(1200); }
       check(`${at}: the mode picker opens and stays open`, (await modeLabel.count()) > 0 && (await page.locator(rowsSel).count()) > 0);
+      for (let i = 0; i < 2; i++) { await page.keyboard.press('Escape'); await page.waitForTimeout(200); }
+
+      // The permission picker stays in the chat header (title row): a tap opens it and the title row's own Tap
+      // handler does not close it by focusing the input (`title-tap`).
+      // On a phone it is compacted to its shield icon, so find it by its accessible name, not its label text.
+      const headerPickers = page.locator('.part.auxiliarybar .chat-view-title-container .ezil-chat-header .chat-input-picker-item .action-label');
+      const names = await headerPickers.evaluateAll(els => els.map(e => `${e.getAttribute('aria-label') ?? ''}|${e.textContent ?? ''}`));
+      const permIndex = names.findIndex(n => /permission/i.test(n));
+      const permLabel = headerPickers.nth(permIndex < 0 ? names.length - 1 : permIndex);
+      if (names.length) { await press(permLabel); await page.waitForTimeout(1200); }
+      const permRows = await page.locator(rowsSel).count();
+      check(`${at}: the header's permission picker opens and stays open`, permIndex >= 0 && permRows > 0, JSON.stringify({ names, permRows }));
       for (let i = 0; i < 2; i++) { await page.keyboard.press('Escape'); await page.waitForTimeout(200); }
 
       await press(model);
@@ -124,7 +161,8 @@ try {
       // The turn itself is the request that carries the Agent tools; a chat title is a utility request on Qwen.
       const turnModels = (sent) => sent.filter(r => Array.isArray(r.body?.tools) && r.body.tools.length).map(r => [r.body.model, r.body.stream === true]);
       if (CONTAINER) {
-        const turns = turnModels(await send(`EZIL_E2E_KIMI ${v.name} picked`));
+        const turns = turnModels(await send(`EZIL_E2E_KIMI ${v.name} picked`, true));
+        check(`${at}: Send, tapped, sends the turn`, turns.length > 0, JSON.stringify(turns));
         check(`${at}: the Gateway receives the picked model for the turn (${KIMI}, not streamed)`, turns.length > 0 && turns.every(([m, stream]) => m === KIMI && !stream), JSON.stringify(turns));
       }
       // The workbench writes the remembered model to browser storage on a short delay; then reload.
