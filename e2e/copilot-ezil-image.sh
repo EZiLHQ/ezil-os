@@ -13,8 +13,8 @@ OUT="$(mkdir -p "${EZIL_COPILOT_E2E_OUT:-./ezil-e2e-out}" && cd "${EZIL_COPILOT_
 CODE_URL=""
 FORWARD_PORT="${EZIL_COPILOT_E2E_PORT:-18443}"
 FORWARD_PID=""
-# Passes to run, in order (default all): fresh returning history sessions compaction phone
-PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions compaction phone} "
+# Passes to run, in order (default all): fresh returning history sessions compaction phone subagent
+PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions compaction phone subagent} "
 MOCK_PORT=4142
 TEST_TOKEN=lanec-e2e-only
 CAPTURE_DIR=/tmp/copilot-ezil-mock
@@ -300,6 +300,20 @@ EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER=
   EZIL_E2E_OUT="$OUT/phone" node "$here/copilot-ezil-phone.mjs" || fail=1
 collect_logs phone
 network_checks phone || fail=1
+fi
+
+# ── Pass 7: an Agent turn starts a subagent on another EZiL model (VS Code's runSubagent `model`) ──
+if [[ "$PASSES" == *" subagent "* ]]; then
+echo "[e2e] pass 7 — subagent: runSubagent with a model runs the child on it, without one inherits the parent's, an unlisted one is refused"
+ST8="$WORK/subagent"; mkdir -p "$ST8/home/neko/project" "$ST8/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST8/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$ST8"
+start_mock || fail=1
+EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" \
+  EZIL_E2E_OUT="$OUT/subagent" node "$here/copilot-ezil-subagent.mjs" || fail=1
+collect_logs subagent
+network_checks subagent || fail=1
 fi
 rm -rf "$WORK" 2>/dev/null || true
 if [[ $fail == 0 ]]; then echo "[e2e] ALL PASSED — artifacts in $OUT"; else echo "[e2e] FAILURES — see $OUT" >&2; fi
