@@ -666,6 +666,12 @@ describe('EZiL gateway VS Code bridge', () => {
             await ask(first.provider, history, moved);
             expect(leaked(bodies.at(-1)!)).toBe(false);
             first.host.models = movedHost;
+            // The same endpoint, provider name and model under another credential (account): nothing follows either.
+            const rekeyed = { ...claude, provider: { ...claude.provider, apiKey: 'synthetic-other-account-token' } };
+            first.host.models = () => [rekeyed, opus];
+            await ask(first.provider, history, rekeyed);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            first.host.models = movedHost;
             // A direct Anthropic provider (custom header auth possible) never uses the fallback: neither an exact
             // continuation nor one whose x-api-key header override changed gets any thinking back.
             const direct = { ...claude, provider: { ...claude.provider, type: 'anthropic' as const, headers: { 'x-api-key': 'account-a' } } };
