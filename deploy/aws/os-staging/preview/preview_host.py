@@ -46,8 +46,10 @@ SLOTS = {1: 3101, 2: 3102}
 DEFAULT_TTL_HOURS = 48
 STARTING_MINUTES = 30
 MAX_TTL_HOURS = 72
+# The host is a t3.medium with no swap: hard caps keep two slots from OOM-killing os-staging or
+# draining its burst credits (images are built off-host).
 MEMORY = '768m'
-CPUS = '1.0'
+CPUS = '0.5'
 TAG = re.compile(r'pr[0-9]{1,6}-[0-9a-f]{12}')
 STAGING_TAG = re.compile(r'OS_STAGING_TAG=([A-Za-z0-9_][A-Za-z0-9_.-]{0,127})')
 

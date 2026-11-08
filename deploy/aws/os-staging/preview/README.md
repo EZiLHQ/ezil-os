@@ -116,8 +116,8 @@ to be hostile (see Trust boundary).
 
 ## Cost
 
-There is no new infrastructure: the slots share the staging host (container limits
-of 768 MB and 1 CPU each, two slots). Incremental spend is:
+There is no new infrastructure: the slots share the staging host (hard limits of
+768 MB and 0.5 vCPU each, two slots; the t3.medium has about 2.8 GB free and no swap). Incremental spend is:
 - runner minutes, only for labelled app-tier PRs, once per head;
 - one S3 artifact set per head (about 200–300 MB), until the lifecycle rule below
   expires it;

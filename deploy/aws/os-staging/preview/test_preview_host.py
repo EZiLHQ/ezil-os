@@ -169,7 +169,7 @@ class Deploy(Host):
         self.assertEqual(compose['name'], 'ezil-os-preview-pv1')
         self.assertEqual(web['image'], f'ezil-os-staging:{tag(289)}')
         self.assertEqual(web['command'][-4:], ['-H', '127.0.0.1', '-p', '3101'])
-        self.assertEqual((web['mem_limit'], web['pull_policy'], web['network_mode']), ('768m', 'never', 'host'))
+        self.assertEqual((web['mem_limit'], web['cpus'], web['pull_policy'], web['network_mode']), ('768m', '0.5', 'never', 'host'))
         self.assertEqual(web['labels']['work.ezil.preview.image_id'], IMAGE)
         up = [c for c in self.compose_calls() if 'up' in c]
         self.assertEqual(up[0][:4], ['docker', 'compose', '--project-name', 'ezil-os-preview-pv1'])
