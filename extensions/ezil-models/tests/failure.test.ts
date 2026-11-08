@@ -69,6 +69,7 @@ describe('appFailure mapping', () => {
             durationMs: 1234, modelKey: 'us.anthropic.claude-sonnet-5-5' });
         expect(isAppFailure(record)).toBe(true);
         expect(appFailure({ ...base, outcome: 'cancelled' }).cancellationSource).toBe('unknown');
+        for (const bad of [{ outcome: 'failed' }, { code: 'unexpected_error' }]) expect(isAppFailure({ ...record, ...bad })).toBe(false);
     });
     test('retrying and recovered are retryable; a failed credits refusal is not', () => {
         expect(appFailure({ ...base, outcome: 'retrying', error: gatewayError('rate_limited', 429) }).retryable).toBe(true);

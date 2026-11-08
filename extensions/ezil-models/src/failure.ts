@@ -157,6 +157,7 @@ export function isAppFailure(value: unknown): value is AppFailure {
     if (r.streamReason !== undefined && r.stage !== 'stream') return false;
     if ((r.category === 'cancellation') !== (r.cancellationSource !== undefined)) return false;
     if (r.outcome === 'cancelled' && r.category !== 'cancellation') return false;
+    if (r.category === 'cancellation' && (r.code !== 'request_cancelled' || r.outcome !== 'cancelled')) return false;
     for (const key of ['clientRequestId', 'gatewayRequestId', 'vscodeRequestId', 'retryOfClientRequestId']) if (r[key] !== undefined && !failureId(r[key])) return false;
     if (r.attempt !== undefined && !integer(r.attempt as number, 1, 64)) return false;
     if (r.retryable !== undefined && typeof r.retryable !== 'boolean') return false;
