@@ -75,6 +75,7 @@ const { scan } = await import('./secret-scan.js');
 const telemetry = await import('../../telemetry.js');
 const { beginTrace, ambientTraceRef } = await import('../../trace.js');
 const { default: log } = await import('../../log.js');
+const { setCurrentComputer } = await import('../../session.js');
 const { feedbackSubmitSchema, diagnosticsSchema } = await import('../../../../app/src/server/feedback/types.ts');
 log.debug('LOG_SECRET');
 // Seed the real ring, then make any attempted read fail immediately.
@@ -570,6 +571,39 @@ try {
         assert.equal(JSON.parse(calls.at(-1).body).clientRequestId, id);
         assert.equal(current().querySelector('[type="submit"]').hidden, true);
         assert.equal(stored(outboxKey), null); assert.equal(stored(draftKey), null);
+        close();
+    });
+    await check('reports carry the switched current computer, frozen through a later switch and replay', async () => {
+        const computerB = '55555555-5555-4555-8555-555555555555';
+        const computerC = '66666666-6666-4666-8666-666666666666';
+        setCurrentComputer({ id: computerB });
+        open(); setDescription('Filed on computer B');
+        assert.equal(payload().computerId, computerB, 'preview names the current computer, not the boot one');
+        const body = current().querySelector('pre').textContent;
+        setOnline(false);
+        respond = async () => { throw new TypeError('Failed to fetch'); };
+        send(); await until(() => /offline/.test(status()));
+        assert.equal(JSON.parse(stored(outboxKey).at(-1).body).computerId, computerB);
+        // Switch away and drop the dialog (as a reload would); the queued body must not follow.
+        setCurrentComputer({ id: computerC });
+        close();
+        setOnline(true);
+        flushing = true;
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+        const count = calls.length;
+        await feedback.flush_feedback_outbox();
+        await until(() => stored(outboxKey) === null);
+        flushing = false;
+        assert.equal(calls.length, count + 1);
+        assert.equal(calls.at(-1).body, body, 'replay sends the frozen body unchanged');
+        assert.equal(JSON.parse(calls.at(-1).body).computerId, computerB);
+        open();
+        assert.equal(payload().computerId, computerC, 'a new report snapshots the computer current at open');
+        close();
+        setCurrentComputer(null);
+        window.localStorage.removeItem(draftKey);
+        open();
+        assert.equal(payload().computerId, computerId, 'cleared choice falls back to the boot computer');
         close();
     });
     await check('a definitive refusal is not retried and keeps the text for editing', async () => {
