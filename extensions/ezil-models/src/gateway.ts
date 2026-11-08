@@ -284,7 +284,7 @@ export function withCatalogDefault(models: readonly ResolvedModel[], catalogs: R
         const alias = catalog?.default_model;
         const entry = alias ? catalog.data.find(row => row.id === alias) : undefined;
         if (!entry || !selectableProtocol(entry) || entry.capabilities?.tool_calling !== true) continue;
-        const pick = models.find(model => model.provider === provider && model.model === alias && model.capabilities.toolCalling);
+        const pick = models.find(model => model.provider === provider && model.model.toLowerCase() === alias && model.capabilities.toolCalling);
         if (pick) return models.map(model => model.default === (model === pick) ? model : { ...model, default: model === pick });
     }
     return [...models];
