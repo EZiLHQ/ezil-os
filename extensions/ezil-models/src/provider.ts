@@ -53,15 +53,14 @@ function canonicalPart(part: Part): unknown {
  * The identity of one turn's continuation, for the signed-thinking fallback: the resolved connection (provider type,
  * endpoint and credential, so a provider reconfigured to another endpoint or account under the same name never gets
  * the old one's signed thinking) and model, the exact history the turn answered (thinking and cache/stateful markers left out, as Copilot rebuilds them), and the
- * turn's ordered tool calls with their full inputs. An HMAC-SHA256 under `secret`, a random key of the provider
- * instance that never leaves memory: a cache lookup key, not a stored credential. Nothing of it is kept or logged as
- * text, and the credential enters only as HMAC input.
+ * turn's ordered tool calls with their full inputs. The connection enters as `connection`, an opaque number the provider
+ * instance assigns to each distinct connection (connectionIdentity): the credential is never hashed. An HMAC-SHA256
+ * under `secret`, a random key of the provider instance that never leaves memory: a cache lookup key, nothing of it is
+ * kept or logged as text.
  */
-function continuationKey(secret: Buffer, model: ResolvedModel, history: readonly Message[], calls: readonly { callId: string; name: string; input: unknown }[]): string {
+function continuationKey(secret: Buffer, connection: number, model: ResolvedModel, history: readonly Message[], calls: readonly { callId: string; name: string; input: unknown }[]): string {
     const turns = history.map(message => [message.role, message.parts
         .filter(part => part.type !== 'thinking' && !isCacheMarker(part) && !isStatefulMarker(part)).map(canonicalPart)]);
-    const p = model.provider;
-    const connection = [p.type, p.baseUrl ?? '', p.resource ?? '', p.apiVersion ?? '', p.apiKey ?? ''];
     return createHmac('sha256', secret).update(JSON.stringify([connection, model.providerName, model.model, turns,
         calls.map(call => [call.callId, call.name, stableJson(call.input)])])).digest('hex');
 }
@@ -202,12 +201,27 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     private signedThinking = new Map<string, Part[]>();
     /** The HMAC key for continuationKey: random per provider instance, never exported, logged or persisted. */
     private readonly continuationSecret = randomBytes(32);
+    /** Opaque numbers for distinct connections (type, endpoint, credential), so no credential is ever hashed. Bounded. */
+    private connectionIds = new Map<string, number>();
+    private lastConnectionId = 0;
     readonly onDidChangeLanguageModelChatInformation = this.changed.event;
 
     constructor(private readonly host: ProviderHost) {}
 
     refresh(): void { this.changed.fire(); }
-    dispose(): void { this.changed.dispose(); this.modelIdentities.clear(); this.signedThinking.clear(); }
+    dispose(): void { this.changed.dispose(); this.modelIdentities.clear(); this.signedThinking.clear(); this.connectionIds.clear(); }
+
+    /** The same number for the same connection while it stays among the 16 most recent; another one for any change. */
+    private connectionIdentity(provider: ResolvedProvider): number {
+        const tuple = JSON.stringify([provider.type, provider.baseUrl ?? '', provider.resource ?? '', provider.apiVersion ?? '', provider.apiKey ?? '']);
+        let id = this.connectionIds.get(tuple);
+        if (id === undefined) {
+            id = ++this.lastConnectionId;
+            this.connectionIds.set(tuple, id);
+            while (this.connectionIds.size > 16) this.connectionIds.delete(this.connectionIds.keys().next().value!);
+        }
+        return id;
+    }
 
     private rememberSignedThinking(key: string, parts: readonly Part[]): void {
         this.signedThinking.delete(key);
@@ -221,7 +235,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             if (message.role !== 'assistant' || message.parts.some(part => part.type === 'thinking')) return;
             const calls = message.parts.flatMap(part => part.type === 'tool_call' ? [{ callId: part.callId, name: part.name, input: part.input }] : []);
             if (!calls.length) return;
-            const kept = this.signedThinking.get(continuationKey(this.continuationSecret, model, request.messages.slice(0, index), calls));
+            const kept = this.signedThinking.get(continuationKey(this.continuationSecret, this.connectionIdentity(model.provider), model, request.messages.slice(0, index), calls));
             if (kept) message.parts = [...kept, ...message.parts];
         });
     }
@@ -430,7 +444,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             }
             // Only a turn that completed (not cancelled or cut off) and ended in tool calls is kept for its continuation.
             if (fallback && completed && signed.length && calls.length && !token.isCancellationRequested) {
-                this.rememberSignedThinking(continuationKey(this.continuationSecret, resolved, answered, calls), signed);
+                this.rememberSignedThinking(continuationKey(this.continuationSecret, this.connectionIdentity(resolved.provider), resolved, answered, calls), signed);
             }
         } catch (error) {
             const known = this.modelIdentities.get(model.id);
