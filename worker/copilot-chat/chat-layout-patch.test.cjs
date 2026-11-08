@@ -71,10 +71,14 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       assert(!style.includes('::after{content:"AI responses may be inaccurate.'));
       const tail = style.slice(style.lastIndexOf('\n.chat-viewpane.ezil-compact-chat>.chat-view-title-container'));
       const rules = tail.trim().split('}').filter(Boolean);
-      assert(rules.length >= 10, String(rules.length));
+      assert(rules.length >= 7, String(rules.length));
       for (const r of rules) assert.match(r.trim(), /^\.chat-viewpane[.\s]/, r);
       assert.equal(style.split('.chat-viewpane .chat-getting-started-tip-container{display:none!important}').length, 2);
-      assert.equal(style.split('.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-container{display:grid;').length, 2);
+      // The composer keeps upstream's input over its mode/model + Send row (no one-row grid): the model picker sits at the input.
+      assert(!style.includes('.chat-input-container{display:grid;'));
+      assert(!style.includes('.ezil-chat-header>.chat-input-toolbars'));
+      // The picker toolbar writes its own minimum width onto the composer's toolbar row; overriding it keeps Send in view.
+      assert.equal(style.split('.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-toolbars{min-width:0!important}').length, 2);
     });
 
     await t.test('Add Context for the chat view moves to the Send toolbar; quick chat and editor entries unchanged', () => {
@@ -91,7 +95,7 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
     const cStart = code.indexOf('createControls(e){'), cEnd = code.indexOf('}_ezilChatHeader(e){');
     const createControls = new Function('e', 'P3e', code.slice(cStart + 'createControls(e){'.length, cEnd));
 
-    await t.test('header method moves the input part\'s own toolbars into the title row and puts it on top', async () => {
+    await t.test('header method moves Local/permissions into the title row, keeps mode/model in the composer, puts the row on top', async () => {
       const f = fixture();
       header.call(f.view, f.wrapper);
       assert.deepEqual(f.pane.children.map(c => c.className), ['chat-view-title-container visible', 'voice-agent-controls-wrapper']);
@@ -99,11 +103,11 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       const h = f.inner.children[1];
       assert.equal(h.className, 'interactive-session ezil-chat-header');
       assert.deepEqual(f.inner.children.map(c => c.className.split(' ').pop()), ['chat-view-title-navigation-toolbar', 'ezil-chat-header', 'chat-view-title-actions-toolbar']);
-      assert.equal(h.children[0].className, 'chat-input-toolbars');
-      assert.equal(h.children[0].children[0], f.primary);
-      assert.equal(h.children[1], f.secondary);
-      assert.deepEqual(f.toolbars.children, [f.execute], 'the composer keeps the Send toolbar only');
-      const help = h.children[2];
+      assert.equal(h.children[0], f.secondary);
+      assert.equal(h.children.length, 2);
+      assert.deepEqual(f.toolbars.children, [f.primary, f.execute], 'the composer keeps the mode/model toolbar beside Send');
+      assert.equal(f.primary.parentElement, f.toolbars);
+      const help = h.children[1];
       assert.equal(help.tagName, 'BUTTON'); assert.equal(help.type, 'button');
       assert(help.getAttribute('aria-label').includes(NOTICE)); assert.equal(help.title, NOTICE);
       assert(h.dispatch('click').stopped, 'header clicks do not reach the title row (which focuses the input)');
@@ -112,17 +116,14 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       const enter = help.dispatch('keydown', { key: 'Enter' }); assert(enter.prevented && enter.stopped);
       help.dispatch('keydown', { key: ' ' }); help.dispatch('keydown', { key: 'a' });
       assert.deepEqual(f.calls.commands, ['ezil-models.showStatus', 'ezil-models.showStatus', 'ezil-models.showStatus']);
-      assert.equal(f.observers.length, 1); assert.deepEqual(f.observers[0].observed, [f.editor, f.toolbars]);
-      // The editor gets exactly its grid cell (721 px minus 4 px padding): trailing 779 - 717 = 62, then stable.
-      f.observers[0].cb(); f.observers[0].cb(); assert.deepEqual(f.calls.trailing, [62]); assert.equal(f.monaco.offsetWidth, 717);
-      f.editor.clientWidth = 701; f.observers[0].cb(); assert.deepEqual(f.calls.trailing, [62, 82]); assert.equal(f.monaco.offsetWidth, 697);
-      f.calls.registered.forEach(d => d.dispose()); assert(f.observers[0].disconnected);
+      // The editor keeps upstream's full-width layout: no trailing-space correction, nothing observed.
+      assert.equal(f.observers.length, 0); assert.deepEqual(f.calls.trailing, []);
     });
 
     await t.test('notice falls back to a notification when EZiL AI status is unavailable', async () => {
       const f = fixture({ commandFails: true });
       header.call(f.view, f.wrapper);
-      f.inner.children[1].children[2].dispatch('click');
+      f.inner.children[1].children[1].dispatch('click');
       await new Promise(r => setTimeout(r, 0));
       assert.deepEqual(f.calls.info, [NOTICE]);
     });
@@ -260,6 +261,35 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       assert.equal(focused, 0, 'a Tap or click on a header picker does not move focus to the input');
       handler({ initialTarget: elsewhere }); handler({ target: elsewhere }); handler({ target: { nodeType: 3 } }); handler({});
       assert.equal(focused, 4, 'taps and clicks elsewhere on the title (or without an element) still focus the input');
+    });
+
+    // The bundle's own first-load migration (chat-enabled): a new browser profile keeps the built-in chat extension
+    // enabled, so an early message reaches Copilot's agent instead of timing out ("Chat took too long to get ready").
+    await t.test('a new profile keeps the built-in chat extension enabled; setup is marked completed; a completed setup still honours a disabled one (chat-enabled)', () => {
+      const i = code.indexOf('ensureChatExtensionInitialDisabledState(){'), j = code.indexOf('}get hasWorkspace(){', i);
+      assert(i > 0 && j > i);
+      const migrate = new Function('Oc', code.slice(i + 'ensureChatExtensionInitialDisabledState(){'.length, j));
+      const run = ({ completed, disabled = false, stored = false }) => {
+        const calls = { disabled: [], stored: [], settings: [], updates: [] };
+        const view = {
+          _chatExtensionId: 'github.copilot-chat', environmentService: {},
+          storageService: { getBoolean: () => stored, store: (k, v) => calls.stored.push([k, v]) },
+          logService: { debug() {}, error() {} },
+          chatEntitlementService: { context: { value: { state: { completed }, update: u => calls.updates.push(u) } } },
+          _disableExtension: e => calls.disabled.push(e.id), _isDisabledGlobally: () => disabled,
+          configurationService: { getValue: () => undefined, updateValue: (k, v) => (calls.settings.push([k, v]), Promise.resolve()) },
+        };
+        migrate.call(view, 'chat.disableAIFeatures');
+        return calls;
+      };
+      const fresh = run({ completed: false });
+      assert.deepEqual(fresh.disabled, [], 'the extension is not disabled on a new profile');
+      assert.deepEqual(fresh.updates, [{ completed: true }], 'setup is marked completed, as a successful setup run would');
+      assert.deepEqual(fresh.stored, [['builtinChatExtensionEnablementMigration', true]]);
+      const done = run({ completed: true, disabled: true });
+      assert.deepEqual(done.settings, [['chat.disableAIFeatures', true]]); assert.deepEqual(done.updates, []);
+      assert.deepEqual(run({ completed: false, stored: true }).stored, [], 'runs once per profile');
+      assert(!code.includes('Disabling builtin chat extension as chat set up is not completed'));
     });
 
     await t.test('patch rejects a moved header anchor', () => {

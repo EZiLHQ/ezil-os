@@ -1,5 +1,5 @@
 // Image e2e, pass "phone" (copilot-ezil-image.sh): on a phone, Explorer and Chat sit side by side and leave the chat
-// header about 160 px, so its pickers cannot all keep their labels. The model picker must keep its name, ellipsized
+// composer's mode/model row about 160 px, so its pickers cannot all keep their labels. The model picker must keep its name, ellipsized
 // if need be (patch-copilot-chat.sh `picker-order`), and be usable by touch (`picker-touch`, `title-tap`): real taps
 // (touch events, not mouse clicks: a mouse click in a touch context never showed that a tap did nothing) open it, it
 // stays open, and a tapped Kimi K3 is the model the Gateway receives for the turn. The pick survives a reload and a
@@ -86,6 +86,14 @@ try {
         width: b ? Math.round(b.width) : 0, compact: Boolean(item?.classList.contains('compact-picker')),
         chatWidth: Math.round(document.querySelector('.part.auxiliarybar')?.getBoundingClientRect().width ?? 0),
         mode: mode ? { aria: mode.querySelector('.action-label')?.getAttribute('aria-label') ?? '', compact: mode.classList.contains('compact-picker') } : null,
+        inComposer: Boolean(m?.closest('.interactive-input-part')), inHeader: Boolean(m?.closest('.chat-view-title-container')),
+        // Send must stay inside the composer's box, not pushed out by the pickers beside it.
+        send: (() => {
+          const part = m?.closest('.interactive-input-part')?.getBoundingClientRect();
+          const btn = document.querySelector('.part.auxiliarybar .chat-controls-container > .interactive-session .chat-execute-toolbar .action-item.chat-submit-button');
+          const r = btn?.getBoundingClientRect();
+          return r && part ? { found: true, inside: r.width > 0 && r.left >= part.left - 1 && r.right <= part.right + 1, left: Math.round(r.left), right: Math.round(r.right), partRight: Math.round(part.right) } : { found: false };
+        })(),
       };
     });
     try {
@@ -97,12 +105,26 @@ try {
       check(`${at}: a fresh profile starts on the declared default, ${MODEL_NAME}`, before.aria === `Models, ${MODEL_NAME}`, before.aria);
       check(`${at}: the model picker shows its name, not only an icon`, !before.compact && before.text === MODEL_NAME && before.labelWidth >= 40, JSON.stringify(before));
       check(`${at}: the mode picker keeps an accessible name`, Boolean(before.mode?.aria), JSON.stringify(before.mode));
+      check(`${at}: the model picker sits in the composer, not the chat header`, before.inComposer && !before.inHeader, JSON.stringify(before));
+      check(`${at}: Send stays visible inside the composer beside the pickers`, before.send.found && before.send.inside, JSON.stringify(before.send));
       if (!v.touch) check(`${at}: a desktop chat keeps every label (the mode picker is not compacted)`, before.mode && !before.mode.compact, JSON.stringify(before.mode));
 
-      // The mode picker sits in the same header: a tap opens it and it stays open.
+      // The mode picker sits in the same composer row: a tap opens it and it stays open.
       const modeLabel = page.locator('.part.auxiliarybar .chat-input-toolbar .action-item.chat-input-picker-item:not(.model-picker-item) .action-label').first();
       if (await modeLabel.count()) { await press(modeLabel); await page.waitForTimeout(1200); }
       check(`${at}: the mode picker opens and stays open`, (await modeLabel.count()) > 0 && (await page.locator(rowsSel).count()) > 0);
+      for (let i = 0; i < 2; i++) { await page.keyboard.press('Escape'); await page.waitForTimeout(200); }
+
+      // The permission picker stays in the chat header (title row): a tap opens it and the title row's own Tap
+      // handler does not close it by focusing the input (`title-tap`).
+      // On a phone it is compacted to its shield icon, so find it by its accessible name, not its label text.
+      const headerPickers = page.locator('.part.auxiliarybar .chat-view-title-container .ezil-chat-header .chat-input-picker-item .action-label');
+      const names = await headerPickers.evaluateAll(els => els.map(e => `${e.getAttribute('aria-label') ?? ''}|${e.textContent ?? ''}`));
+      const permIndex = names.findIndex(n => /permission/i.test(n));
+      const permLabel = headerPickers.nth(permIndex < 0 ? names.length - 1 : permIndex);
+      if (names.length) { await press(permLabel); await page.waitForTimeout(1200); }
+      const permRows = await page.locator(rowsSel).count();
+      check(`${at}: the header's permission picker opens and stays open`, permIndex >= 0 && permRows > 0, JSON.stringify({ names, permRows }));
       for (let i = 0; i < 2; i++) { await page.keyboard.press('Escape'); await page.waitForTimeout(200); }
 
       await press(model);
