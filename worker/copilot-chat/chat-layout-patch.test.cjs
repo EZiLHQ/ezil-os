@@ -72,7 +72,10 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       const tail = style.slice(style.lastIndexOf('\n.chat-viewpane.ezil-compact-chat>.chat-view-title-container'));
       const rules = tail.trim().split('}').filter(Boolean);
       assert(rules.length >= 7, String(rules.length));
-      for (const r of rules) assert.match(r.trim(), /^\.chat-viewpane[.\s]/, r);
+      // Every rule is scoped to the chat view, also inside the narrow-composer container query.
+      for (const r of rules) assert.match(r.trim().replace(/^@container ezil-composer \(max-width:207px\)\{/, ''), /^\.chat-viewpane[.\s]/, r);
+      assert.equal(style.split('@container ezil-composer (max-width:207px){').length, 2);
+      assert(style.includes('.chat-input-toolbars>.chat-input-toolbar .model-picker-item{min-width:56px!important}'));
       assert.equal(style.split('.chat-viewpane .chat-getting-started-tip-container{display:none!important}').length, 2);
       // The composer keeps upstream's input over its mode/model + Send row (no one-row grid): the model picker sits at the input.
       assert(!style.includes('.chat-input-container{display:grid;'));
