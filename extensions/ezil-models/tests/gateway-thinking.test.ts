@@ -207,24 +207,35 @@ describe('Gateway thinking validation', () => {
 });
 
 describe('Gateway usage normalization', () => {
-    test('missing start counters default to zero; final counters replace instead of accumulate', async () => {
-        expect((await parse([start({}), finish({ output_tokens: 22 }), stop()])).at(-2)).toEqual({
-            type: 'usage', usage: { inputTokens: 0, outputTokens: 22, cacheReadTokens: 0, cacheWriteTokens: 0 },
-        });
-        expect((await parse([frame('message_start', { message: { role: 'assistant' } }), finish({}), stop()])).at(-2)).toEqual({
-            type: 'usage', usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
-        });
-        for (const [field, normalized] of [['input_tokens', 'inputTokens'], ['output_tokens', 'outputTokens'],
-            ['cache_read_input_tokens', 'cacheReadTokens'], ['cache_creation_input_tokens', 'cacheWriteTokens']] as const) {
-            for (const value of [0, Number.MAX_SAFE_INTEGER]) expect((await parse([start(), finish({ [field]: value }), stop()])).at(-2)).toEqual({
-                type: 'usage', usage: { ...normalizedUsage, outputTokens: startUsage.output_tokens, [normalized]: value },
-            });
-        }
+    const usageOf = async (input: string[]) => (await parse(input)).at(-2);
+    test('native: input and cache counters from message_start, cumulative output from the final delta', async () => {
+        expect(await usageOf([start(), finish({ output_tokens: 22 }), stop()])).toEqual({ type: 'usage', usage: normalizedUsage });
+        // A native delta may repeat input counters, unchanged.
+        expect(await usageOf([start(), finish({ output_tokens: 22, input_tokens: 120 }), stop()])).toEqual({ type: 'usage', usage: normalizedUsage });
+        expect(await usageOf([start(), finish({ ...startUsage, output_tokens: 22 }), stop()])).toEqual({ type: 'usage', usage: normalizedUsage });
+    });
+    test('Converse: all three input counters in the final delta are authoritative over message_start zeros', async () => {
+        const zeros = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+        expect(await usageOf([start(zeros), finish({ ...startUsage, output_tokens: 22 }), stop()])).toEqual({ type: 'usage', usage: normalizedUsage });
+    });
+    test('missing authority is never zero-filled', async () => {
+        // No input authority anywhere: message_start without counters, or without usage at all.
+        await malformed([start({}), finish({ output_tokens: 22 }), stop()]);
+        await malformed([frame('message_start', { type: 'message_start', message: { role: 'assistant' } }), finish({ output_tokens: 22 }), stop()]);
+        await malformed([start({ input_tokens: 120, output_tokens: 1 }), finish({ output_tokens: 22 }), stop()]);
+        // Empty final usage, with or without start usage.
+        await malformed([start(), finish({}), stop()]);
+        await malformed([frame('message_start', { type: 'message_start', message: { role: 'assistant' } }), finish({}), stop()]);
+        // A preliminary output count is never kept when the final one is missing, nor may the final one go below it.
+        await malformed([start(), finish({ input_tokens: 120 }), stop()]);
+        await malformed([start({ ...startUsage, output_tokens: 30 }), finish({ output_tokens: 22 }), stop()]);
+        // A native delta that changes one input counter without restating all three is inconsistent.
+        await malformed([start(), finish({ output_tokens: 22, input_tokens: 121 }), stop()]);
     });
 
     for (const phase of ['start', 'delta']) for (const field of Object.keys(finalUsage)) test(`validates every present ${phase} usage counter: ${field}`, async () => {
         for (const value of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1, '1', null, true]) {
-            await malformed([start(phase === 'start' ? { [field]: value } : startUsage), finish(phase === 'delta' ? { [field]: value } : {}), stop()]);
+            await malformed([start(phase === 'start' ? { ...startUsage, [field]: value } : startUsage), finish(phase === 'delta' ? { output_tokens: 22, [field]: value } : { output_tokens: 22 }), stop()]);
         }
     });
     test('non-object usage and missing final usage remain malformed', async () => {

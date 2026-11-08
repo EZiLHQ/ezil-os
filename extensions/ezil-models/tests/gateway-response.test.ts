@@ -33,9 +33,13 @@ test('malformed tool JSON, missing block stop, and bad event order fail closed',
     await expect(collect(frames().filter((_, i) => i !== 7))).rejects.toThrow('interrupted');
     await expect(collect(frames().slice(1))).rejects.toThrow('interrupted');
 });
-test('partial final usage is normalized and trailing errors cannot succeed', async () => {
+test('a final delta with only output needs every input counter from message_start; nothing is zero-filled; trailing errors cannot succeed', async () => {
+    // This fixture's message_start carries no cache counters, so output alone leaves cache usage without authority.
     const input = frames(); input[8] = frame('message_delta', { delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } });
-    expect((await collect(input)).at(-2)).toEqual({ type: 'usage', usage: { inputTokens: 0, outputTokens: 1, cacheReadTokens: 0, cacheWriteTokens: 0 } });
+    await expect(collect(input)).rejects.toThrow('interrupted');
+    input[0] = frame('message_start', { type: 'message_start', message: { role: 'assistant',
+        usage: { input_tokens: 5, output_tokens: 1, cache_read_input_tokens: 2, cache_creation_input_tokens: 3 } } });
+    expect((await collect(input)).at(-2)).toEqual({ type: 'usage', usage: { inputTokens: 5, outputTokens: 1, cacheReadTokens: 2, cacheWriteTokens: 3 } });
     await expect(collect([...frames(), frame('error', {})])).rejects.toThrow('interrupted');
 });
 test('JSON path emits thinking, text and tools in original order after validation', () => {

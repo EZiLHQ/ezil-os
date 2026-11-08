@@ -1,5 +1,5 @@
 import type { SseEvent } from './sse';
-import { emptyUsage, type StreamEvent, type Usage } from './types';
+import type { StreamEvent, Usage } from './types';
 import { isObject } from './gateway-messages';
 import { GatewayError } from './gateway-error';
 
@@ -51,17 +51,50 @@ export async function* gatewayBodyEvents(events: AsyncIterable<SseEvent>, reques
     catch (error) { throw responseFailure(error, requestId, 'connection_reset'); }
 }
 
-/** JSON requires all counters; SSE replaces only counters present in this event. */
-function usage(value: unknown, previous?: Usage): Usage {
+/** A JSON reply's usage: all four counters, each a safe non-negative integer. */
+function usage(value: unknown): Usage {
+    const c = counters(value);
+    if (c.input_tokens === undefined || c.output_tokens === undefined || c.cache_read_input_tokens === undefined || c.cache_creation_input_tokens === undefined) throw new Error('Invalid usage');
+    return { inputTokens: c.input_tokens, outputTokens: c.output_tokens, cacheReadTokens: c.cache_read_input_tokens, cacheWriteTokens: c.cache_creation_input_tokens };
+}
+
+const COUNTERS = ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'] as const;
+type Counters = Partial<Record<typeof COUNTERS[number], number>>;
+/** The counters an event carries; every one present must be a safe non-negative integer. Absent ones stay absent. */
+function counters(value: unknown): Counters {
     if (!isObject(value)) throw new Error('Invalid usage');
-    const count = (key: string, fallback: number | undefined) => {
-        if (!(key in value) && fallback !== undefined) return fallback;
+    const out: Counters = {};
+    for (const key of COUNTERS) {
+        if (!(key in value)) continue;
         const n = value[key];
         if (typeof n !== 'number' || !Number.isSafeInteger(n) || n < 0) throw new Error('Invalid usage');
-        return n;
+        out[key] = n;
+    }
+    return out;
+}
+
+/**
+ * A stream's final usage, with the authority rules of the Gateway's own usage tap (EZiL AI Gateway
+ * src/protocols/anthropic/sse.ts). The final message_delta must carry the cumulative output count, never below
+ * message_start's preliminary one, which is never used. Input and cache counters come from the final delta (the
+ * Converse route reports them only there, all three together), else from message_start (the native route); a native
+ * delta that repeats one must repeat it unchanged. A counter neither event carries fails the stream: nothing is zero-filled.
+ */
+function streamUsage(start: Counters, final: unknown): Usage {
+    const f = counters(final);
+    if (f.output_tokens === undefined || (start.output_tokens !== undefined && f.output_tokens < start.output_tokens)) throw new Error('Invalid usage');
+    const allInputs = f.input_tokens !== undefined && f.cache_read_input_tokens !== undefined && f.cache_creation_input_tokens !== undefined;
+    const input = (key: 'input_tokens' | 'cache_read_input_tokens' | 'cache_creation_input_tokens'): number => {
+        const final = f[key], initial = start[key];
+        if (final !== undefined) {
+            if (!allInputs && initial !== undefined && initial !== final) throw new Error('Invalid usage');
+            return final;
+        }
+        if (initial === undefined) throw new Error('Invalid usage');
+        return initial;
     };
-    return { inputTokens: count('input_tokens', previous?.inputTokens), outputTokens: count('output_tokens', previous?.outputTokens),
-        cacheReadTokens: count('cache_read_input_tokens', previous?.cacheReadTokens), cacheWriteTokens: count('cache_creation_input_tokens', previous?.cacheWriteTokens) };
+    return { inputTokens: input('input_tokens'), outputTokens: f.output_tokens, cacheReadTokens: input('cache_read_input_tokens'),
+        cacheWriteTokens: input('cache_creation_input_tokens') };
 }
 
 type ThinkingBlock = { kind: 'thinking'; thinking: string; signature: string };
@@ -115,7 +148,7 @@ type PendingBlock = ThinkingBlock | { kind: 'text' | 'redacted_thinking' }
 export async function* gatewayStream(events: AsyncIterable<SseEvent>, requestId?: string): AsyncGenerator<StreamEvent> {
     let started = false;
     let stopped = false;
-    let provisionalUsage = emptyUsage();
+    let startCounters: Counters = {};
     let finalUsage: Usage | undefined;
     let stopReason: string | undefined;
     const blocks = new Map<number, PendingBlock>();
@@ -131,14 +164,14 @@ export async function* gatewayStream(events: AsyncIterable<SseEvent>, requestId?
             if (stopped || (raw.type !== undefined && raw.type !== type)) throw new Error('Invalid order');
             if (type === 'message_start') {
                 if (started || !isObject(raw.message) || raw.message.role !== 'assistant') throw new Error('Invalid start');
-                provisionalUsage = usage(raw.message.usage === undefined ? {} : raw.message.usage, provisionalUsage);
+                if (raw.message.usage !== undefined) startCounters = counters(raw.message.usage);
                 started = true;
                 continue;
             }
             if (!started) throw new Error('Missing start');
             if (type === 'message_delta') {
                 if (blocks.size || finalUsage || !isObject(raw.delta) || typeof raw.delta.stop_reason !== 'string' || !STOP_REASONS.has(raw.delta.stop_reason)) throw new Error('Invalid final delta');
-                finalUsage = usage(raw.usage, provisionalUsage);
+                finalUsage = streamUsage(startCounters, raw.usage);
                 stopReason = raw.delta.stop_reason;
                 continue;
             }
