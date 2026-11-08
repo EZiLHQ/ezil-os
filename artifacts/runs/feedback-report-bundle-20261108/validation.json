@@ -1,0 +1,59 @@
+{
+  "app": {
+    "passed": 220,
+    "failed": 0,
+    "skipped": 0,
+    "files": 8
+  },
+  "shell": {
+    "feedbackChecks": 29,
+    "captureTests": 31,
+    "traceChecks": 26,
+    "failed": 0,
+    "skipped": 0
+  },
+  "mutation": {
+    "description": "removed admin authorization guard",
+    "passed": 28,
+    "failed": 1,
+    "restored": true
+  },
+  "browser": {
+    "checksCompleted": 0,
+    "suiteFailedToLaunch": 1,
+    "reason": "Chromium sandbox_host_linux.cc:41 shutdown: Operation not permitted; SIGTRAP",
+    "earlierSkips": [
+      "missing scratch bundle",
+      "broken suggested Playwright dependency directory; valid fallback later found"
+    ]
+  },
+  "typecheck": {
+    "passed": false,
+    "missingModuleErrors": 19,
+    "ownedPathErrors": 0,
+    "missingPackages": [
+      "@vercel/analytics",
+      "@vercel/speed-insights",
+      "@aws-sdk/client-ec2",
+      "@aws-sdk/client-sfn",
+      "@aws-sdk/client-sts"
+    ]
+  },
+  "lint": {
+    "errors": 0,
+    "warnings": 1,
+    "note": "pre-existing unused eslint-disable in boot-payload.ts:227"
+  },
+  "build": {
+    "passed": true,
+    "output": "work/os",
+    "published": false
+  },
+  "commit": {
+    "created": false,
+    "reason": "parent Git index.lock is on read-only filesystem; no staging or commit possible"
+  },
+  "unownedObserved": [
+    "deploy/aws/os-staging/Caddyfile"
+  ]
+}

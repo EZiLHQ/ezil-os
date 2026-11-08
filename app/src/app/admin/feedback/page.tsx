@@ -3,8 +3,8 @@ import { notFound, redirect } from 'next/navigation';
 import { env } from '@/env';
 import { db } from '@/server/db';
 import { isFeedbackAdmin } from '@/server/feedback/admin';
-import { deleteFeedbackReport, feedbackAdminQueries, loadFeedbackList, loadFeedbackReport } from '@/server/feedback/admin-queries';
-import { diagnosticsSchema } from '@/server/feedback/types';
+import { updateFeedbackStatus, deleteFeedbackReport, feedbackAdminQueries, loadFeedbackList, loadFeedbackReport } from '@/server/feedback/admin-queries';
+import { diagnosticsSchema, FEEDBACK_STATUSES } from '@/server/feedback/types';
 import { createClient } from '@/utils/supabase/server';
 
 export const dynamic = 'force-dynamic';
@@ -23,6 +23,12 @@ async function deleteReport(form: FormData) {
     redirect('/admin/feedback');
 }
 
+async function updateStatus(form: FormData) {
+    'use server';
+    if (!await updateFeedbackStatus(form.get('id'), form.get('status'), await context())) notFound();
+    redirect(`/admin/feedback?id=${encodeURIComponent(String(form.get('id')))}`);
+}
+
 /** Server-rendered, uncached, with plain links so prefetch never records a view. */
 export default async function FeedbackAdminPage({ searchParams }: {
     searchParams: Promise<Record<string, string | string[] | undefined>>;
@@ -39,7 +45,7 @@ export default async function FeedbackAdminPage({ searchParams }: {
             <div className="mx-auto max-w-5xl space-y-8">
                 <header>
                     <h1 className="text-xl font-semibold">Feedback review</h1>
-                    <p className="mt-1 text-sm text-offwhite/60">Report views, screenshot views, and deletions are logged.</p>
+                    <p className="mt-1 text-sm text-offwhite/60">Report views, screenshot views, status changes, and deletions are logged.</p>
                 </header>
                 {report ? (
                     <section className="space-y-4">
@@ -54,6 +60,13 @@ export default async function FeedbackAdminPage({ searchParams }: {
                         {report.hasScreenshot ? (
                             <p><a href={`/api/admin/feedback/screenshot?id=${encodeURIComponent(report.id)}`} className="underline">View screenshot</a></p>
                         ) : <p className="text-sm text-offwhite/60">No screenshot available.</p>}
+                        <form action={updateStatus}>
+                            <input type="hidden" name="id" value={report.id} />
+                            <label>Status <select name="status" defaultValue={report.status} className="bg-black">
+                                {FEEDBACK_STATUSES.map(status => <option key={status} value={status}>{status}</option>)}
+                            </select></label>
+                            <button type="submit" className="ml-3 rounded border px-3 py-2">Update status</button>
+                        </form>
                         <form action={deleteReport}>
                             <input type="hidden" name="id" value={report.id} />
                             <button type="submit" className="rounded border border-offwhite/30 px-3 py-2 text-sm">Delete report and screenshot</button>
@@ -63,13 +76,14 @@ export default async function FeedbackAdminPage({ searchParams }: {
                     <div className="overflow-x-auto">
                         <table className="w-full min-w-[800px] text-left text-sm">
                             <thead><tr className="border-b border-offwhite/20">
-                                {['Report', 'Created', 'Category', 'Description', 'Screenshot', 'Computer', 'Commit', 'Diagnostics'].map((heading) => <th key={heading} className="py-2 pr-4 font-medium">{heading}</th>)}
+                                {['Report', 'Created', 'Category', 'Status', 'Description', 'Screenshot', 'Computer', 'Commit', 'Diagnostics'].map((heading) => <th key={heading} className="py-2 pr-4 font-medium">{heading}</th>)}
                             </tr></thead>
                             <tbody>{reports.map((row) => (
                                 <tr key={row.id} className="border-b border-offwhite/10">
                                     <td className="py-2 pr-4 font-mono text-xs"><a href={`/admin/feedback?id=${encodeURIComponent(row.id)}`} className="underline">{row.id}</a></td>
                                     <td className="py-2 pr-4">{timestamp(row.createdAt)}</td>
                                     <td className="py-2 pr-4">{row.category}</td>
+                                    <td className="py-2 pr-4">{row.status}</td>
                                     <td className="max-w-xs break-words py-2 pr-4">{row.descriptionPreview}</td>
                                     <td className="py-2 pr-4">{row.hasScreenshot ? 'Yes' : 'No'}</td>
                                     <td className="py-2 pr-4 font-mono text-xs">{row.computerId ?? '—'}</td>

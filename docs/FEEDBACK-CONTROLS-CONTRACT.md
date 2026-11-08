@@ -1,7 +1,8 @@
-# Floating controls + Feedback — pinned contract (v1, 2026-10-14)
+# Floating controls + Feedback — pinned contract (v2 feedback extension, 2026-11-08)
 
-The single source of truth for the parallel lanes. A lane that needs to change
-anything here stops and reports instead of changing it. Plan of record:
+The single source of truth for the parallel lanes. The founder authorized the
+2026-11-08 feedback report-bundle extension below; unrelated lane contracts remain
+unchanged. Historical plan of record:
 `/root/.claude/plans/sprightly-bouncing-dusk.md` (founder defaults D1–D11 taken
 as recommended).
 
@@ -19,7 +20,8 @@ as recommended).
 Shell side: features are feature-detected exactly like `endpoints.focus`.
 
 ```
-desktopState.ui = { floatingControls: boolean, feedbackScreenshots: boolean }
+desktopState.ui = { floatingControls: boolean, feedbackScreenshots: boolean,
+  feedbackEventDiagnostics?: true, feedbackReportBundle?: true }
 desktopState.endpoints.feedback?: '/api/shell/feedback'
 ```
 
@@ -117,7 +119,7 @@ glyph on a 20px disc, low emphasis; hit target 24×24 on a fine pointer, 44×44 
 `shell/ezil/ui/feedback/diagnostics.js`: `build_diagnostics() → Diagnostics` (§3 shape only).
 Teardown, history navigation and page exit close the form and any nested editor,
 cancel pending captures, and discard late results without suppressing shell Back.
-Editor Cancel returns to the draft; form Cancel discards it. Once submission starts,
+Editor Cancel returns to the draft; closing the form preserves its local text draft. Once submission starts,
 the button says Close and explains that closing does not cancel the sent request.
 
 ### `shell/ezil/ui/feedback/capture.js` + `redact-editor.js` (lane FCAPTURE)
@@ -145,13 +147,16 @@ Diagnostics (strict, every field optional):
 { shellVersion ≤64, appCommit ≤64, browser {family ≤32, major int}, os ≤32,
   deviceClass 'phone'|'tablet'|'desktop', viewport {w,h int, dpr number},
   fullscreen bool, fullbleed bool, computerStatus ≤32, traceId ≤64, phases string[≤24]≤40,
-  recentEvents {eventClass ≤40, site ≤80, code ≤80}[≤50], stream {state ≤24, kbps int, rttMs int} }
+  recentEvents {eventClass ≤40, site ≤80, code ≤80, ageMs?: int, reason?: string≤96, correlationId?: string≤64}[≤50],
+  session?: {capturedAt: UTC ISO string, pageAgeMs: int, online: bool, visibility: 'visible'|'hidden',
+    network?: {effectiveType?: 'slow-2g'|'2g'|'3g'|'4g', saveData?: bool}},
+  tracePhases?: {code: machine string≤40, tMs: int}[≤24], stream {state ≤24, kbps int, rttMs int} }
 ```
 Responses: `201 {id, createdAt, screenshotAccepted}` · idempotent replay `200` same body ·
 `400 {error:'invalid_request'}` · `401` · `404` (feature off) · `413` · `415` · `429 {error:'rate_limited'}`.
 GET → `200 {reports:[{id, createdAt, category, descriptionPreview ≤140, hasScreenshot, status}]}` (newest first, ≤50).
 DELETE `?id=<uuid>` → `204`; `404` if not the caller's.
-Limits: body 32 KiB without screenshot, 2.5 MiB with; decoded image ≤1.5 MiB, ≤4096 px per side,
+Limits: canonical metadata without image ≤32 KiB even with screenshot support enabled; body 32 KiB without screenshot support, 2.5 MiB with; decoded image ≤1.5 MiB, ≤4096 px per side,
 magic bytes must match contentType; rate 10/h and 30/day per user (DB count); global attachment
 budget 500 MB/day and 5 GB total → over budget: report stored, `screenshotAccepted:false`.
 
@@ -171,11 +176,12 @@ schema tool only (see `docs/feedback-migration.md`); it is refused for `aws-prod
 Two `localStorage` keys per account, keyed by the opaque account id from
 `__EZIL_BOOT__.user.id` (never the email), never sent anywhere:
 - `ezil:feedback:draft:v1:<accountId>` — `{clientRequestId, category, description}` of the
-  unsent form. Survives closing the dialog; removed when the form is emptied or a send with
+  unsent form, plus `bug: {activity, steps, expected, actual, reproducibility, impact}`.
+  Every structured field survives category changes and closing the dialog; removed when the form is emptied or a send with
   that id is confirmed (200/201). Consent boxes and screenshots are never remembered.
-- `ezil:feedback:outbox:v1:<accountId>` — at most 10 `{clientRequestId, body}` entries: the
+- `ezil:feedback:outbox:v1:<accountId>` — at most 10 `{clientRequestId, body, draft}` entries (draft retains structured text): the
   exact submitted request bodies (including any diagnostics the user consented to) that have
-  not been confirmed. Re-sent byte-for-byte, same `clientRequestId`, on the `online` event,
+  not been confirmed. Re-sent byte-for-byte, same `clientRequestId` (except the explicit compatibility downgrade below), on the `online` event,
   when the shell mounts (boot → `mount_feedback_chip()` → `resume_feedback_outbox()`, whether
   or not an app window is open) and on a back/forward-cache restore (`pageshow` with
   `persisted`); each entry is sent once even when two flushes overlap. Removed on 200/201;
@@ -186,3 +192,37 @@ Two `localStorage` keys per account, keyed by the opaque account id from
 `document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, `log.js` ring, headers,
 clipboard, keystrokes; no continuous recording. Consent checkboxes default OFF; preview shows the
 exact JSON that is sent; nothing hits the network before Submit.
+
+
+## 6. Founder-authorized report bundle and developer loop (2026-11-08)
+
+See [feedback-report-bundle.md](feedback-report-bundle.md) for the exact collection,
+flow, capability and handoff contract. Bugs require context, steps, expected and
+actual results, reproducibility and impact, formatted with headings in the existing
+4,000-character description. Ideas/Other remain one field. No migration.
+
+Diagnostics consent stays OFF until selected. Selection freezes the snapshot;
+only the explicit Refresh action replaces it. No DOM text, form values, console
+text or privileged device logs are read. The existing local event ring provides
+up to 50 event ages; a detached trace read provides up to 24 phases. Numeric fields
+are bounded to 0..1,000,000,000. At most ten events keep validated failure references;
+reporter/computer IDs cannot be used as correlations. Standard server time, report
+ID and deployed version are recorded without optional diagnostic consent.
+
+New boot capability flags are present only when feedback is enabled. Missing
+`feedbackEventDiagnostics` omits event reason/correlation; missing
+`feedbackReportBundle` omits session, tracePhases and event ages. A rollback 400
+retries once without all these expanded fields; report text/image/ID are preserved.
+The fallback replaces the queued body and visible preview. No new upload runs in
+the background beyond the existing explicitly submitted outbox retry.
+
+Screenshot consent, feature gates, masking, cancellation and image limits remain.
+The form explains disabled/unsupported capture; the attached image can be edited
+again starting from its redacted pixels. Upload and clipboard are not added.
+
+Admin status changes use the existing status column: new / investigating / resolved.
+Every action reauthenticates, checks the fail-closed admin list, validates report ID
+and status, awaits a `status_<target>` audit record, then updates only that report.
+The audit is intent; it does not assert update success. Admin list/detail and
+Settings → Feedback show persisted status, with an explicit reporter refresh.
+Existing audit-before-content and owner-scoped reporter reads/deletes remain.

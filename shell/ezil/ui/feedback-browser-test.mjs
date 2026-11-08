@@ -66,7 +66,7 @@ const boot = { user: { id: ACCOUNT, email: 'fixture@example.test' },
     computer: { id: COMPUTER, name: 'Computer', slot: 1, createdAt: '2026-07-31T00:00:00.000Z', lastOpenedAt: null, isNew: false },
     apps: [{ id: 'desktop', name: 'Browser', icon: 'desktop', kind: 'desktop' }],
     desktopState: { provider: 'cloudflare-guacamole', configured: true, hasHmacSecret: true, status: 'idle',
-        endpoints: ENDPOINTS, ui: { floatingControls: false, feedbackScreenshots: false } } };
+        endpoints: ENDPOINTS, ui: { floatingControls: false, feedbackScreenshots: false, feedbackReportBundle: true } } };
 const page_html = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>${css}</style></head><body><div id="ezil-os-root"><div id="ezil-os-root-inner"></div></div></body></html>`;
 // The streamed desktop: reports decoded frames so the window goes full-bleed.
@@ -203,6 +203,10 @@ try {
 
         await check(`${tag}: the preview is byte-for-byte the request body; JSON content-type; 201 shows thanks`, async () => {
             await description.fill('[synthetic r3] browser test report');
+            assert.equal(await page.locator('button[type="submit"]').isDisabled(), true);
+            for (const [name, value] of Object.entries({ activity: 'Opening a project', steps: '1. Click Browser', expected: 'Desktop opens', actual: 'Spinner stays' })) await page.locator(`[name="${name}"]`).fill(value);
+            await page.locator('[name="reproducibility"]').selectOption({ label: 'Every time' });
+            await page.locator('[name="impact"]').selectOption({ label: 'Blocked' });
             await page.locator('input[name="diagnostics"]').check();
             await page.locator('.ezil-feedback-preview summary').click();
             const shown = await preview();
@@ -213,6 +217,8 @@ try {
             assert.match(posts[0].contentType, /^application\/json/);
             const sent = JSON.parse(posts[0].body);
             assert.equal(sent.computerId, COMPUTER);
+            assert.match(sent.description, /Steps to reproduce\n1. Click Browser/);
+            assert.ok(sent.diagnostics.session.pageAgeMs >= 0);
             assert.equal(sent.screenshot, null);
             assert.equal(sent.diagnostics.fullbleed, true, 'sent from the full-bleed desktop');
             assert.doesNotMatch(posts[0].body, /fixture@example\.test|33333333-3333/, 'no email and no account id leave the browser');
@@ -229,6 +235,7 @@ try {
         ] ) await check(`${tag}: ${code} keeps the text, says so and is not retried`, async () => {
             reply = () => ({ status: code, body: { error: 'x' } });
             await openByChip();
+            await page.locator('input[name="category"][value="idea"]').check();
             await description.fill(`[synthetic r3] refused ${code}`);
             await page.locator('button[type="submit"]').click();
             await status.filter({ hasText: copy }).waitFor();
@@ -245,6 +252,7 @@ try {
         await check(`${tag}: the draft survives closing the dialog (Escape) and keeps its request id`, async () => {
             reply = () => ({ status: 201, body: { id: REPORT, screenshotAccepted: false } });
             await openByChip();
+            await page.locator('input[name="category"][value="idea"]').check();
             await description.fill('[synthetic r3] half-written');
             const id = JSON.parse(await preview()).clientRequestId;
             await page.keyboard.press('Escape');

@@ -1,0 +1,9 @@
+{
+  "taskId": "feedback-report-bundle",
+  "runId": "feedback-report-bundle-20261108",
+  "status": "blocked",
+  "doneRung": "validated-owned-source-awaits-coordinator-commit",
+  "evidence": "220 app tests + 86 shell checks pass / 0 unit failures, 24 source/docs files; auth guard mutant -> 1 fail / 28 pass; restored -> 220 pass. Browser launch blocked; typecheck 19 missing-module errors; commit read-only.",
+  "startedAt": "2026-11-08T14:02:09.272028+00:00",
+  "updatedAt": "2026-11-08T14:11:33.490169+00:00"
+}

@@ -108,6 +108,11 @@ export function newEventId () {
  * `.end()` calls still work fine against its own closure, it just stops
  * being what `ambientCorrelationId()` returns while a nested one is open. */
 let ambientTrace = null;
+let latestTrace = null;
+/** Detached, read-only phases of the current or most recent app open. */
+export function feedbackPhaseSnapshot () {
+    return (ambientTrace || latestTrace)?.snapshot() ?? [];
+}
 
 /**
  * Open a new trace and make it ambient. Returns `{id, step, end}`.
@@ -125,6 +130,8 @@ export function beginTrace (name) {
     const trace = {
         id,
         name: String(name ?? 'unknown'),
+        snapshot: () => breadcrumbs.filter(b => /^[a-z][a-z0-9_:-]{0,39}$/.test(b.code))
+            .map(b => ({ code: b.code, tMs: Math.min(1_000_000_000, b.t) })),
 
         /** Record one breadcrumb. Capped at `MAX_BREADCRUMBS` — additional
          * calls are silently dropped, same "oldest guarantee kept, never an
@@ -161,6 +168,7 @@ export function beginTrace (name) {
     };
 
     ambientTrace = trace;
+    latestTrace = trace;
     return trace;
 }
 

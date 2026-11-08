@@ -5,7 +5,14 @@
 os-staging.ezil.work {
     encode gzip zstd
     header Strict-Transport-Security "max-age=31536000"
-    request_body {
+    # Feedback accepts a 2.5 MiB JSON envelope (a 1.5 MiB image expands
+    # under base64). Keep the usual cap for every other route.
+    @feedback path /api/shell/feedback
+    request_body @feedback {
+        max_size 3MB
+    }
+    @other not path /api/shell/feedback
+    request_body @other {
         max_size 2MB
     }
     reverse_proxy 127.0.0.1:3000
