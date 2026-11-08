@@ -1,6 +1,6 @@
 // Gateway's stateless, text/function-only Responses subset. No direct provider URLs or state IDs.
 import type { ResolvedModel } from './config';
-import { escapeNonAscii, GATEWAY_INPUT_TOKENS, gatewayOutputTokens, isObject, LocalRequestError } from './gateway-messages';
+import { escapeNonAscii, GATEWAY_INPUT_TOKENS, gatewayOutputTokens, isObject, LocalRequestError, samplingRefused } from './gateway-messages';
 import { GatewayResponseError } from './gateway-response';
 import type { SseEvent } from './sse';
 import { isCacheMarker, isStatefulMarker, type ChatRequest, type Part, type StreamEvent, type Usage } from './types';
@@ -92,7 +92,10 @@ export function buildGatewayResponsesBody(model: ResolvedModel, request: ChatReq
     const body: GatewayResponsesBody = { model: model.model, input, max_output_tokens: gatewayOutputTokens(model), stream: model.stream !== false, store: false };
     if (tools.length) { body.tools = tools; body.tool_choice = 'auto'; }
     if (request.toolMode === 'required') log?.('[gateway] required tool choice mapped to auto');
-    for (const [key, configured] of [['temperature', model.temperature], ['top_p', model.topP]] as const) {
+    // As on Messages: aliases the Gateway refuses sampling for never get it, on either protocol.
+    if (samplingRefused(model.model)) {
+        if (['temperature', 'top_p'].some(key => request.modelOptions[key] !== undefined) || model.temperature !== undefined || model.topP !== undefined) log?.(`[gateway] temperature/top_p not sent: ${model.model} refuses sampling options`);
+    } else for (const [key, configured] of [['temperature', model.temperature], ['top_p', model.topP]] as const) {
         const value = request.modelOptions[key] ?? configured;
         if (typeof value === 'number' && Number.isFinite(value)) body[key] = Math.max(0, Math.min(key === 'temperature' ? 2 : 1, value));
     }

@@ -591,6 +591,15 @@ describe('the Gateway\'s suggested default model', () => {
             [FLASH, undefined, undefined, 1], [QWEN, 0.2, 0.9, 1]]);
     });
 
+    test('a configured model for the suggested alias (any case) is the one made default, not a second entry', async () => {
+        const config = load();
+        const flashConfigured = { ...config.models[1]!, id: 'flash-configured', name: 'Flash (configured)', model: 'Gemini-3.8-Flash', default: false };
+        const g = gateway({ ...config, models: [config.models[0]!, flashConfigured] }, () => Response.json(v1([row(QWEN, 'available'), flash()], { default_model: FLASH })));
+        const infos = await list(g.provider);
+        expect(ids(infos)).toEqual([QWEN, 'flash-configured']);
+        expect(defaults(infos)).toEqual(['flash-configured']);
+    });
+
     test('a change of the suggested default alone re-lists the models', async () => {
         let catalog = v1([row(QWEN, 'available'), flash()]);
         const g = gateway(load(), () => Response.json(catalog));
