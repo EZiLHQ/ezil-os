@@ -183,8 +183,9 @@ when no longer needed.
 
 - `preview_host.py`: host-side slot manager (deploy, teardown, reap, status,
   install-reaper). It runs as root through SSM and imports `../install_receipt.py`.
-- `preview.sh`: S3 publish and SSM wrapper. It pins the staging host, VPC and
-  artifact bucket, and prints only the host's one-line result.
+- `preview.sh`: S3 publish and SSM wrapper. Every command pins the artifact bucket.
+  Host commands also pin the staging host and VPC. It prints only the host's
+  one-line result.
 - `plan.py`: decides deploy, teardown or skip from the event's exact base...head file
   list (renames included; fails closed past the API's 300-file limit). It reads its
   activation from the PR's base commit.

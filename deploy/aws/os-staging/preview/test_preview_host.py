@@ -307,6 +307,30 @@ class Failures(Host):
         self.assertEqual(sorted(self.removed_images()),
                          sorted([f'ezil-os-staging:{tag(289)}', f'ezil-os-staging:{tag(289, SHA2)}']))
 
+    def test_a_killed_redeploy_leaves_the_reaper_both_images(self):
+        self.deploy(289)
+        self.fail_up = True
+        self.at_up = None
+
+        def killed(args, **kwargs):
+            if args[:2] == ['docker', 'compose'] and 'up' in args:
+                self.starting = json.loads(ph.receipt_path(1).read_text())
+                raise KeyboardInterrupt  # stands in for SIGTERM from the SSM timeout
+            return self.fake_run(args, **kwargs)
+        with mock.patch.object(ph, 'run', killed), self.assertRaises(KeyboardInterrupt):
+            self.deploy(289, SHA2)
+        self.assertEqual((self.starting['tag'], self.starting['previous_tag']), (tag(289, SHA2), tag(289)))
+        # A real SIGTERM runs no cleanup: the starting receipt stays, and once it expires the reaper
+        # must remove the replaced image as well as the new one.
+        self.starting['expires_at'] = ph.iso(ph.now() - dt.timedelta(seconds=1))
+        ph.write_receipt(1, self.starting)
+        self.calls.clear()
+        with mock.patch('sys.stdout'):
+            ph.main(['reap'])
+        self.assertEqual(sorted(self.removed_images()),
+                         sorted([f'ezil-os-staging:{tag(289)}', f'ezil-os-staging:{tag(289, SHA2)}']))
+        self.assertEqual(ph.read_receipts(), {})
+
     def test_a_failed_down_keeps_the_receipt_for_the_reaper_and_the_original_error(self):
         self.fail_up = True
         original = self.fake_run

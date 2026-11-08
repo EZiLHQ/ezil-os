@@ -242,6 +242,7 @@ def teardown_slot(slot, reason):
     (ETC / f'pv{slot}.env').unlink(missing_ok=True)
     path.unlink(missing_ok=True)
     remove_image(receipt.get('tag'))
+    remove_image(receipt.get('previous_tag'))
     return {'slot': slot, 'pr': receipt.get('pr'), 'sha': receipt.get('sha'), 'removed': reason}
 
 
@@ -285,6 +286,8 @@ def deploy(args):
             'tag': args.tag, 'image_id': image_id, 'receipt_sha256': args.receipt_sha256, 'computers': args.computers,
             'data_plane': 'shared-staging-preview-supabase', 'deployed_at': iso(moment),
             'expires_at': iso(moment + dt.timedelta(minutes=STARTING_MINUTES)), 'run': args.run,
+            # Named so a reaper run after a killed redeploy also removes the image this one replaces.
+            'previous_tag': old_tag if old_tag != args.tag else None,
         }
         # The slot is claimed before its container starts: if this command dies (SSM timeout) after `up`,
         # the short expiry hands the container to the reaper instead of leaving it serving unowned.
@@ -295,7 +298,7 @@ def deploy(args):
         atomic_write(ROOT / f'pv{slot}' / 'compose.json', compose_file(slot, args.tag, receipt), 0o644)
         compose(slot, 'up', '--detach', '--force-recreate', '--wait', '--wait-timeout', '120')
         wait_healthy(slot, args.sha)
-        receipt.update(state='serving', expires_at=iso(moment + dt.timedelta(hours=args.ttl_hours)))
+        receipt.update(state='serving', expires_at=iso(moment + dt.timedelta(hours=args.ttl_hours)), previous_tag=None)
         write_receipt(slot, receipt)
     except BaseException:
         # A preview has no rollback. Before the slot is touched, the old head keeps serving; after, the

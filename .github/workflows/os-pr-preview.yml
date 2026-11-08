@@ -36,7 +36,7 @@ jobs:
       ttl_hours: ${{ steps.plan.outputs.ttl_hours }}
       computers: ${{ steps.plan.outputs.computers }}
     steps:
-      # The base commit's planner and activation file: the PR under test cannot change either.
+      # The base commit's planner and activation file (an on/off switch; the reviewers are the boundary).
       - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.pull_request.base.sha }}
@@ -97,7 +97,8 @@ jobs:
           name: os-pr-preview-${{ needs.plan.outputs.tag }}
           path: deploy/aws/os-staging/artifacts/${{ needs.plan.outputs.tag }}.*
           compression-level: 0
-          retention-days: 1
+          # Outlives a slow approval; the S3 tag is still published only once.
+          retention-days: 7
           if-no-files-found: error
 
   deploy:
@@ -165,6 +166,14 @@ jobs:
           image=
           if [[ $line == *mode=fresh* ]]; then [[ $receipt == "$BUILT_RECEIPT" ]]; image=$BUILT_IMAGE; fi
           printf 'receipt_sha256=%s\nimage_id=%s\n' "$receipt" "$image" | tee -a "$GITHUB_OUTPUT"
+      - name: Re-check the PR is still open and labelled (a teardown may have run meanwhile)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: preview:os
+        run: |
+          set -euo pipefail
+          state=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR" --jq '[.state, .head.sha, ([.labels[].name] | index(env.LABEL) != null)] | @tsv')
+          [[ $state == "open"$'\t'"$SHA"$'\t'"true" ]] || { echo "::notice::PR $PR is closed, unlabelled or has a newer head; not deploying."; exit 1; }
       - name: Deploy the slot and check it from the host
         id: host
         env:
