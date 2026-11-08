@@ -71,6 +71,10 @@ export async function handleFeedbackRequest(req: Request, deps: FeedbackHandlerD
             } catch { return invalidRequest(); }
             const parsed = feedbackSubmitSchema.safeParse(raw);
             if (!parsed.success || (!features.feedbackScreenshots && parsed.data.screenshot != null)) return invalidRequest();
+            const metadata = { ...parsed.data, screenshot: null };
+            if (new TextEncoder().encode(JSON.stringify(metadata)).length > FEEDBACK_LIMITS.bodyBytesNoScreenshot) {
+                return shellJson({ error: 'payload_too_large' }, 413);
+            }
             const result = await ingestFeedback(db, user.id, parsed.data, deps.now?.() ?? new Date(), deps.deploySha ?? null);
             return result.status === 429 ? shellJson({ error: 'rate_limited' }, 429) : shellJson(result.created, result.status);
         }

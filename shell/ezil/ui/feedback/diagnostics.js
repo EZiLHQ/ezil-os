@@ -1,7 +1,25 @@
 // diagnostics.js — EZiL-authored. Feedback's small, explicit allowlist.
 // No general-purpose state dump: even telemetry's redacted detail is excluded.
-import { ambientCorrelationId } from '../../trace.js';
+import { feedbackTraceSnapshot } from '../../trace.js';
 import { recentEvents } from '../../telemetry.js';
+import { isCorrelationId, isFailureReason } from './failure-shapes.js';
+
+/**
+ * FEEDBACK-DIAG: at most this many recent events — the newest — carry the
+ * server's `reason`/`correlationId`. Keeps the worst case well inside the
+ * 32 KiB no-screenshot body. Mirrors `FEEDBACK_LIMITS.recentEventsAnnotatedMax`.
+ */
+const MAX_ANNOTATED_EVENTS = 10;
+
+/**
+ * FEEDBACK-DIAG: does THIS server's feedback schema accept
+ * `recentEvents[].reason`/`.correlationId`? Read fresh every call; absent means
+ * no — the `activityEndpoint()` contract in `../../session.js`. An older server
+ * parses `recentEvents` strictly and would 400 the whole report on either key.
+ */
+export function event_diagnostics_accepted () {
+    return globalThis.window?.__EZIL_BOOT__?.desktopState?.ui?.feedbackEventDiagnostics === true;
+}
 
 const integer = value => Math.min(1_000_000_000, Math.max(0, Math.round(value)));
 
@@ -44,6 +62,23 @@ function os_family () {
 /** @returns {object} Matches diagnosticsSchema; absent information is omitted. */
 export function build_diagnostics () {
     const result = {};
+    const trace = feedbackTraceSnapshot();
+    const captured = Date.now();
+    const expanded = globalThis.window?.__EZIL_BOOT__?.desktopState?.ui?.feedbackReportBundle === true;
+    if (expanded) {
+        result.session = { capturedAt: new Date(captured).toISOString(),
+            pageAgeMs: integer(globalThis.performance?.now?.() ?? 0), online: navigator.onLine !== false,
+            visibility: document.visibilityState === 'hidden' ? 'hidden' : 'visible' };
+        const connection = navigator.connection;
+        if (connection) {
+            const network = {};
+            if (['slow-2g', '2g', '3g', '4g'].includes(connection.effectiveType)) network.effectiveType = connection.effectiveType;
+            if (typeof connection.saveData === 'boolean') network.saveData = connection.saveData;
+            result.session.network = network;
+        }
+        result.tracePhases = trace?.phases ?? [];
+        if (trace?.app) result.traceApp = trace.app;
+    }
     const version = globalThis.ezil?.version;
     if ( typeof version === 'string' || typeof version === 'number' ) result.shellVersion = String(version).slice(0, 64);
     const agent = browser();
@@ -58,28 +93,29 @@ export function build_diagnostics () {
     }
     result.fullscreen = !! document.fullscreenElement;
     result.fullbleed = [...document.querySelectorAll('.ezil-fullbleed')].some(visible);
-    const status = [...document.querySelectorAll('.window[data-app="desktop"] .ezil-drawer-status, .window[data-app="desktop"] .ezil-boot-title')]
-        .find(el => visible(el) && el.textContent.trim());
-    if ( status ) result.computerStatus = status.textContent.trim().slice(0, 32);
-    const traceId = ambientCorrelationId();
-    if ( typeof traceId === 'string' ) result.traceId = traceId.slice(0, 64);
-    // trace.js exposes no non-mutating breadcrumb snapshot. Calling end() here
-    // would finish the user's app-open; omit phases until a read API exists.
-    result.recentEvents = recentEvents().slice(-50)
-        .filter(event => ['eventClass', 'site', 'code'].every(key => typeof event[key] === 'string'))
-        .map(event => ({ eventClass: event.eventClass.slice(0, 40), site: event.site.slice(0, 80), code: event.code.slice(0, 80) }));
-
-    // The stream controllers keep vitals private. Read ONLY the two numeric
-    // measurements Settings already renders, without requesting new samples.
-    const stream = {};
-    for ( const row of document.querySelectorAll('.ezil-settings-system .ezil-sys-row') ) {
-        const label = row.querySelector('.ezil-sys-k')?.textContent;
-        const key = label === 'Bitrate' ? 'kbps' : label === 'Round trip' ? 'rttMs' : null;
-        if ( ! key ) continue;
-        const value = row.querySelector('.ezil-sys-v')?.textContent?.trim();
-        if ( ! /^\d+(?:\.\d+)? (?:kbit\/s|ms)$/.test(value || '') ) continue;
-        stream[key] = integer(parseFloat(value));
+    if (trace) result.traceId = trace.id;
+    // Expanded phase snapshots above never finish the active app-open.
+    const events = recentEvents().slice(-50)
+        .filter(event => ['eventClass', 'site', 'code'].every(key => typeof event[key] === 'string'
+            && /^[a-zA-Z0-9_:#/.-]+$/.test(event[key]) && !event[key].includes('://') && !/[a-f0-9]{24,}/i.test(event[key])));
+    // FEEDBACK-DIAG: `{code, reason, correlationId}` of a failed API call. Both
+    // extra fields are re-checked against the allowlist, emitted only when
+    // present, only on the newest MAX_ANNOTATED_EVENTS that have them, and only
+    // to a server that advertises them (`event_diagnostics_accepted`).
+    const annotated = new Set();
+    const accepted = event_diagnostics_accepted();
+    for ( let i = events.length - 1; accepted && i >= 0 && annotated.size < MAX_ANNOTATED_EVENTS; i-- ) {
+        if ( isFailureReason(events[i].reason) || isCorrelationId(events[i].serverCorrelationId) ) annotated.add(i);
     }
-    if ( Object.keys(stream).length ) result.stream = stream;
+    result.recentEvents = events.map((event, i) => {
+        const out = { eventClass: event.eventClass.slice(0, 40), site: event.site.slice(0, 80), code: event.code.slice(0, 80) };
+        if ( expanded && Number.isFinite(event.t) ) out.ageMs = integer(captured - event.t);
+        if ( annotated.has(i) ) {
+            if ( isFailureReason(event.reason) ) out.reason = event.reason;
+            if ( isCorrelationId(event.serverCorrelationId) ) out.correlationId = event.serverCorrelationId;
+        }
+        return out;
+    });
+
     return result;
 }

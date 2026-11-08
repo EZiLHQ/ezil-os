@@ -115,7 +115,7 @@ const current = () => document.querySelector('dialog.ezil-feedback-dialog');
 const form = () => current().querySelector('form');
 const payload = () => JSON.parse(current().querySelector('pre').textContent);
 const status = () => current().querySelector('.ezil-feedback-result').textContent;
-const setDescription = value => { form().elements.description.value = value; form().elements.description.dispatchEvent(new window.Event('input', { bubbles: true })); };
+const setDescription = value => { form().elements.category.value = 'idea'; form().elements.description.value = value; form().elements.description.dispatchEvent(new window.Event('input', { bubbles: true })); };
 const change = (name, checked) => { form().elements[name].checked = checked; form().elements[name].dispatchEvent(new window.Event('change', { bubbles: true })); };
 const send = () => form().dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
 const close = () => current().querySelector('[data-action="cancel"]').click();
@@ -150,7 +150,7 @@ try {
         assert.doesNotMatch(JSON.stringify(data), /SECRET|example\.test|auth-token|detail|outcome/);
         assert.equal(calls.length, 0);
     });
-    await check('diagnostics clamp values and read only rendered stream measurements', () => {
+    await check('diagnostics clamp values and exclude DOM stream measurements', () => {
         globalThis.ezil.version = 'v'.repeat(100);
         Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: 100 });
         Object.defineProperty(navigator, 'userAgentData', { configurable: true, value: {
@@ -169,7 +169,7 @@ try {
         assert.equal(data.viewport.dpr, 16);
         assert.equal(data.deviceClass, 'phone');
         assert.deepEqual(data.browser, { family: 'Chromium', major: 140 });
-        assert.deepEqual(data.stream, { kbps: 124, rttMs: 24 });
+        assert.equal(data.stream, undefined, 'DOM text is excluded');
         vitals.remove();
         document.body.classList.remove('device-phone');
     });
@@ -355,6 +355,113 @@ try {
         close();
         assert.equal(document.activeElement.id, 'opener');
     });
+    await check('rich bugs validate all fields, preserve drafts and total text without truncation', () => {
+        window.localStorage.removeItem(draftKey); open();
+        setDescription('Cannot open the desktop');
+        form().elements.category.value = 'bug';
+        form().dispatchEvent(new window.Event('change', { bubbles: true }));
+        assert.equal(current().querySelector('[type="submit"]').disabled, true);
+        for (const [key, value] of Object.entries({ activity: 'Opening a project', steps: '1. Click Browser', expected: 'Desktop opens', actual: 'Spinner stays', reproducibility: 'Every time', impact: 'Blocked' })) form().elements[key].value = value;
+        form().dispatchEvent(new window.Event('input', { bubbles: true }));
+        assert.equal(current().querySelector('[type="submit"]').disabled, false);
+        assert.match(payload().description, /Steps to reproduce\n1. Click Browser/);
+        const before = payload().description; close(); open();
+        assert.equal(payload().description, before);
+        assert.equal(form().elements.steps.value, '1. Click Browser');
+        form().elements.actual.value = 'x'.repeat(4000);
+        form().dispatchEvent(new window.Event('input', { bubbles: true }));
+        assert.equal(current().querySelector('[type="submit"]').disabled, true);
+        assert.match(payload().description, new RegExp('x{4000}'));
+        close(); window.localStorage.removeItem(draftKey);
+    });
+    await check('failure references require the upstream capability and remain bounded', () => {
+        const events = telemetry.recentEvents();
+        const event = events.at(-1);
+        event.reason = 'worker_http_401:hmac_signature_mismatch';
+        event.serverCorrelationId = 'srv_0123456789ab';
+        assert.equal(build_diagnostics().recentEvents.at(-1).reason, undefined);
+        window.__EZIL_BOOT__.desktopState.ui.feedbackEventDiagnostics = true;
+        assert.equal(build_diagnostics().recentEvents.at(-1).reason, event.reason);
+        assert.equal(build_diagnostics().recentEvents.at(-1).correlationId, event.serverCorrelationId);
+        event.reason = 'https://private.test/?token=secret';
+        event.serverCorrelationId = 'Bearer private';
+        assert.equal(build_diagnostics().recentEvents.at(-1).reason, undefined);
+        assert.equal(build_diagnostics().recentEvents.at(-1).correlationId, undefined);
+        delete event.reason; delete event.serverCorrelationId;
+        delete window.__EZIL_BOOT__.desktopState.ui.feedbackEventDiagnostics;
+    });
+    await check('expanded diagnostics are consented, frozen, refreshed and downgraded on a strict old server', async () => {
+        window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle = true;
+        open(); setDescription('Snapshot test');
+        assert.equal(payload().diagnostics, null);
+        change('diagnostics', true);
+        const snapshot = JSON.stringify(payload().diagnostics);
+        assert.equal(payload().diagnostics.recentEvents.length, 50);
+        assert.ok(payload().diagnostics.tracePhases.some(p => p.code === 'display'));
+        telemetry.capture({ eventClass: 'api_failure', site: 's', code: 'new_failure' });
+        setDescription('Edited context');
+        assert.equal(JSON.stringify(payload().diagnostics), snapshot);
+        current().querySelector('[data-action="refresh-diagnostics"]').click();
+        assert.equal(payload().diagnostics.recentEvents.at(-1).code, 'new_failure');
+        const original = payload(); const count = calls.length;
+        respond = async () => calls.length === count + 1 ? { status: 400 } : { status: 201, json: async () => ({ id: reportId }) };
+        send(); await until(() => status().includes(reportId));
+        const first = JSON.parse(calls[count].body), second = JSON.parse(calls[count + 1].body);
+        assert.deepEqual(first, original);
+        assert.equal(second.description, original.description);
+        assert.equal(second.clientRequestId, original.clientRequestId);
+        assert.equal(second.diagnostics.session, undefined);
+        assert.equal(second.diagnostics.tracePhases, undefined);
+        assert.equal(second.diagnostics.recentEvents[0].ageMs, undefined);
+        assert.equal(current().querySelector('pre').textContent, calls[count + 1].body);
+        assert.ok(Buffer.byteLength(calls[count].body) < 32768);
+        close(); delete window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle;
+        respond = async () => ({ status: 201, ok: true, json: async () => ({ id: reportId, screenshotAccepted: true }) });
+    });
+    await check('editing an unconfirmed report forks its ID before an old receipt can discard edits', async () => {
+        open(); setDescription('Original unconfirmed report');
+        const originalId = payload().clientRequestId;
+        respond = async () => { throw new TypeError('Failed to fetch'); };
+        send(); await until(() => stored(outboxKey)?.some(entry => entry.clientRequestId === originalId) && !current().querySelector('[type="submit"]').disabled);
+        setDescription('New evidence after the first attempt');
+        assert.notEqual(payload().clientRequestId, originalId);
+        window.dispatchEvent(new window.CustomEvent('ezil:feedback-sent', { detail: { clientRequestId: originalId, id: reportId } }));
+        assert.equal(current().querySelector('.ezil-feedback-fields').hidden, false);
+        assert.equal(form().elements.description.value, 'New evidence after the first attempt');
+        close(); window.localStorage.removeItem(outboxKey); window.localStorage.removeItem(draftKey);
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true }) });
+    });
+    await check('completed app trace keeps matching ID, app and phases in the diagnostic bundle', () => {
+        const completed = beginTrace('desktop'); completed.step('display'); completed.end('ok');
+        window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle = true;
+        const snapshot = build_diagnostics();
+        assert.equal(snapshot.traceId, completed.id);
+        assert.equal(snapshot.traceApp, 'desktop');
+        assert.equal(snapshot.tracePhases[0].code, 'display');
+        diagnosticsSchema.parse(snapshot);
+        delete window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle;
+    });
+    await check('quota failure retains text and never claims an image report is saved for automatic retry', async () => {
+        open(); setDescription('Keep my report when storage fills');
+        const prototype = Object.getPrototypeOf(window.localStorage);
+        const original = prototype.setItem;
+        prototype.setItem = function (key, value) {
+            if (key === outboxKey) throw new Error('QuotaExceededError');
+            return original.call(this, key, value);
+        };
+        try {
+            respond = async () => ({ status: 503 });
+            send(); await until(() => status().includes('Could not save this report'));
+            assert.equal(stored(draftKey).description, 'Keep my report when storage fills');
+            assert.match(status(), /copy your report text/);
+            assert.equal(stored(outboxKey), null);
+        } finally {
+            prototype.setItem = original;
+            close();
+            window.localStorage.removeItem(draftKey);
+            respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true }) });
+        }
+    });
     await check('all capture tiers use the editor; tab capture starts synchronously; no upload before Submit', async () => {
         open(); setDescription('Screenshot report'); change('screenshot', true);
         const count = calls.length;
@@ -371,6 +478,17 @@ try {
                 assert.equal(payload().screenshot, null);
             }
         }
+        const attached = current().querySelector('.ezil-feedback-image img');
+        Object.defineProperties(attached, { naturalWidth: { value: 1 }, naturalHeight: { value: 1 } });
+        const originalContext = window.HTMLCanvasElement.prototype.getContext;
+        let source;
+        window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage(image) { source = image; } });
+        const editCount = captureCalls.length;
+        current().querySelector('[data-capture="edit"]').click();
+        await until(() => captureCalls.length > editCount && !current().querySelector('[type="submit"]').disabled);
+        assert.equal(source, attached, 'editing starts from the redacted attached image');
+        assert.equal(captureCalls.at(-1), 'editor');
+        window.HTMLCanvasElement.prototype.getContext = originalContext;
         respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true }) });
         const before = current().querySelector('pre').textContent;
         send(); await until(() => status().includes(reportId));
@@ -469,7 +587,7 @@ try {
         assert.equal(stored(draftKey), null, 'an emptied form leaves no draft behind');
         close();
     });
-    await check('the outbox keeps only the newest 10 unconfirmed sends, and a flush sends no more', async () => {
+    await check('a full outbox keeps all 10 pending reports and retains the unqueued draft', async () => {
         open(); setDescription('Queued report 10');
         const template = payload();
         const seeded = Array.from({ length: 10 }, (_, i) => {
@@ -479,10 +597,11 @@ try {
         window.localStorage.setItem(outboxKey, JSON.stringify(seeded));
         setOnline(false);
         respond = async () => { throw new TypeError('Failed to fetch'); };
-        send(); await until(() => /offline/.test(status()));
+        send(); await until(() => /Could not save this report/.test(status()));
         const kept = stored(outboxKey);
-        assert.deepEqual(kept.map(entry => entry.clientRequestId), [...seeded.slice(1), { clientRequestId: template.clientRequestId }]
-            .map(entry => entry.clientRequestId), 'an 11th queued send drops the oldest');
+        assert.deepEqual(kept.map(entry => entry.clientRequestId), seeded.map(entry => entry.clientRequestId),
+            'a new report never evicts an unconfirmed report');
+        assert.equal(stored(draftKey).description, 'Queued report 10', 'the unqueued report remains a text draft');
         close();
         // A stored list longer than the cap (an older build, another tab) is read capped too.
         window.localStorage.setItem(outboxKey, JSON.stringify([seeded[0], ...kept]));
@@ -745,7 +864,9 @@ try {
         globalThis.html_encode = value => { const el = document.createElement('span'); el.textContent = String(value); return el.innerHTML; };
         const { default: troubleshoot } = await import('../Settings/tabs/troubleshoot.js');
         const pane = document.createElement('div');
-        pane.innerHTML = troubleshoot.html();
+        const { default: feedbackTab } = await import('../Settings/tabs/feedback.js');
+        pane.innerHTML = feedbackTab.html() + troubleshoot.html();
+        const statusHost = pane.querySelector('[data-role="feedback-status-reports"]');
         document.body.append(pane);
         const $pane = $(pane);
         const count = calls.length;
@@ -762,6 +883,7 @@ try {
         pane.querySelector('[data-action="load-reports"]').click();
         await until(() => pane.querySelector('.ezil-feedback-reports li'));
         assert.equal(pane.querySelector('.ezil-feedback-reports img'), null);
+        assert.equal(statusHost.textContent, '', 'Troubleshoot never writes into the other Feedback pane');
         assert.match(pane.querySelector('.ezil-feedback-reports').textContent, /Idea/);
         const remove = pane.querySelector('.ezil-feedback-reports button');
         window.confirm = () => false;
@@ -806,13 +928,16 @@ try {
         assert.equal(entry.textContent, 'Send feedback');
         entry.click();
         assert.equal(current().querySelector('h2').textContent, 'Send feedback');
-        assert.equal(calls.length, count, 'opening the form sends nothing');
+        assert.equal(calls.length, count + 1, 'Settings loads reports once; opening the form sends nothing');
+        assert.equal(calls[count].method, 'GET');
+        await tick();
+        assert.match(pane.querySelector('[data-role="feedback-status-reports"]').textContent, /New/);
         close(); assert.equal(document.activeElement, entry, 'closing the form returns focus to the Settings button');
         delete window.__EZIL_BOOT__.desktopState.endpoints.feedback;
         assert.equal(tab.available(), false, 'no endpoint: no Feedback tab');
         entry.click();
         assert.equal(current(), null);
-        assert.equal(calls.length, count);
+        assert.equal(calls.length, count + 1);
         pane.remove();
     });
     console.log(`\n${checks} feedback checks passed. jsdom does not validate browser layout or real capture.`);

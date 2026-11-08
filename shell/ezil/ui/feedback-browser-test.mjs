@@ -66,7 +66,7 @@ const boot = { user: { id: ACCOUNT, email: 'fixture@example.test' },
     computer: { id: COMPUTER, name: 'Computer', slot: 1, createdAt: '2026-07-31T00:00:00.000Z', lastOpenedAt: null, isNew: false },
     apps: [{ id: 'desktop', name: 'Browser', icon: 'desktop', kind: 'desktop' }],
     desktopState: { provider: 'cloudflare-guacamole', configured: true, hasHmacSecret: true, status: 'idle',
-        endpoints: ENDPOINTS, ui: { floatingControls: false, feedbackScreenshots: false } } };
+        endpoints: ENDPOINTS, ui: { floatingControls: false, feedbackScreenshots: false, feedbackReportBundle: true } } };
 const page_html = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>${css}</style></head><body><div id="ezil-os-root"><div id="ezil-os-root-inner"></div></div></body></html>`;
 // The streamed desktop: reports decoded frames so the window goes full-bleed.
@@ -203,6 +203,10 @@ try {
 
         await check(`${tag}: the preview is byte-for-byte the request body; JSON content-type; 201 shows thanks`, async () => {
             await description.fill('[synthetic r3] browser test report');
+            assert.equal(await page.locator('button[type="submit"]').isDisabled(), true);
+            for (const [name, value] of Object.entries({ activity: 'Opening a project', steps: '1. Click Browser', expected: 'Desktop opens', actual: 'Spinner stays' })) await page.locator(`[name="${name}"]`).fill(value);
+            await page.locator('[name="reproducibility"]').selectOption({ label: 'Every time' });
+            await page.locator('[name="impact"]').selectOption({ label: 'Blocked' });
             await page.locator('input[name="diagnostics"]').check();
             await page.locator('.ezil-feedback-preview summary').click();
             const shown = await preview();
@@ -213,6 +217,8 @@ try {
             assert.match(posts[0].contentType, /^application\/json/);
             const sent = JSON.parse(posts[0].body);
             assert.equal(sent.computerId, COMPUTER);
+            assert.match(sent.description, /Steps to reproduce\n1. Click Browser/);
+            assert.ok(sent.diagnostics.session.pageAgeMs >= 0);
             assert.equal(sent.screenshot, null);
             assert.equal(sent.diagnostics.fullbleed, true, 'sent from the full-bleed desktop');
             assert.doesNotMatch(posts[0].body, /fixture@example\.test|33333333-3333/, 'no email and no account id leave the browser');
@@ -229,6 +235,7 @@ try {
         ] ) await check(`${tag}: ${code} keeps the text, says so and is not retried`, async () => {
             reply = () => ({ status: code, body: { error: 'x' } });
             await openByChip();
+            await page.locator('input[name="category"][value="idea"]').check();
             await description.fill(`[synthetic r3] refused ${code}`);
             await page.locator('button[type="submit"]').click();
             await status.filter({ hasText: copy }).waitFor();
@@ -245,6 +252,7 @@ try {
         await check(`${tag}: the draft survives closing the dialog (Escape) and keeps its request id`, async () => {
             reply = () => ({ status: 201, body: { id: REPORT, screenshotAccepted: false } });
             await openByChip();
+            await page.locator('input[name="category"][value="idea"]').check();
             await description.fill('[synthetic r3] half-written');
             const id = JSON.parse(await preview()).clientRequestId;
             await page.keyboard.press('Escape');
@@ -279,6 +287,59 @@ try {
             await page.waitForTimeout(100);
             assert.equal(posts.length, 1);
             posts.length = 0;
+        });
+
+        await check(`${tag}: screenshot file is reviewed, redacted, cropped and sent only after Submit`, async () => {
+            await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = true; });
+            await openByChip();
+            await page.locator('input[name="category"][value="idea"]').check();
+            await description.fill('[synthetic] screenshot attachment');
+            assert.equal(await page.locator('input[name="screenshot"]').isChecked(), false);
+            assert.equal(await page.locator('input[name="diagnostics"]').isChecked(), false);
+            await page.locator('input[name="screenshot"]').check();
+            const encoded = await page.evaluate(() => {
+                const c = document.createElement('canvas'); c.width = 120; c.height = 80;
+                const ctx = c.getContext('2d'); ctx.fillStyle = '#3366cc'; ctx.fillRect(0, 0, 120, 80);
+                return c.toDataURL('image/png').split(',')[1];
+            });
+            const file = page.locator('input[name="screenshotFile"]');
+            await file.setInputFiles({ name: 'test-private-name.png', mimeType: 'image/png', buffer: Buffer.from(encoded, 'base64') });
+            const editor = page.getByRole('dialog', { name: 'Edit screenshot' });
+            await editor.waitFor({ state: 'visible' });
+            assert.equal(posts.length, 0, 'selecting an image sends nothing');
+            await editor.locator('[data-action="add"]').click();
+            await editor.locator('[data-action="crop"]').click();
+            await editor.locator('[data-box="crop"]').press('Shift+ArrowLeft');
+            await editor.locator('[data-action="confirm"]').click();
+            await editor.waitFor({ state: 'detached' });
+            await page.locator('.ezil-feedback-image').waitFor({ state: 'visible' });
+            const attached = JSON.parse(await preview()).screenshot;
+            assert.ok(attached && ['image/webp', 'image/jpeg'].includes(attached.contentType), 'fresh raster encoding, not original PNG');
+            const pixels = await page.evaluate(async image => {
+                const bytes = Uint8Array.from(atob(image.dataBase64), c => c.charCodeAt(0));
+                const bitmap = await createImageBitmap(new Blob([bytes], { type: image.contentType }));
+                const c = document.createElement('canvas'); c.width = bitmap.width; c.height = bitmap.height;
+                const ctx = c.getContext('2d'); ctx.drawImage(bitmap, 0, 0);
+                const pixel = (x, y) => [...ctx.getImageData(x, y, 1, 1).data].slice(0, 3);
+                const result = { width: bitmap.width, height: bitmap.height, centre: pixel(60, 40), corner: pixel(2, 2) };
+                bitmap.close(); return result;
+            }, attached);
+            assert.deepEqual([pixels.width, pixels.height], [110, 80], 'keyboard crop changes the encoded dimensions');
+            assert.ok(pixels.centre.every(v => v < 20), 'solid black redaction is baked into pixels');
+            assert.ok(pixels.corner[2] > 100, 'unredacted pixels remain');
+            assert.equal(posts.length, 0, 'editing an image sends nothing');
+            assert.doesNotMatch(await preview(), /test-private-name/);
+            const finalPreview = await preview();
+            reply = () => ({ status: 201, body: { id: REPORT, screenshotAccepted: true } });
+            await page.locator('button[type="submit"]').click();
+            await status.filter({ hasText: 'Thanks — we got it' }).waitFor();
+            assert.equal(posts.length, 1); assert.equal(posts[0].body, finalPreview);
+            assert.equal(JSON.parse(posts[0].body).diagnostics, null);
+            await closeDialog(); posts.length = 0;
+            await openByChip();
+            assert.equal(await page.locator('input[name="screenshot"]').isChecked(), false, 'image consent is never remembered');
+            await closeDialog();
+            await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = false; });
         });
 
         await check(`${tag}: minimising the Browser (the last app window) hides the icon`, async () => {

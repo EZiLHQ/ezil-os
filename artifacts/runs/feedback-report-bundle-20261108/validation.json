@@ -1,0 +1,54 @@
+{
+  "taskId": "feedback-report-bundle-validation",
+  "runId": "feedback-report-bundle-20261108",
+  "status": "done",
+  "doneRung": "review-ready-local-verified",
+  "evidence": "294 server tests / 0 failed / 0 skipped including 5 real local PostgreSQL checks; full app typecheck and lint pass (0 errors, 30 warnings); 32 feedback + 31 capture + 12 file import + 27 trace unit checks; 26 Chromium checks across desktop and phone. Built bundle consistency verified. Not deployed.",
+  "startedAt": "2026-11-08T14:00:40Z",
+  "updatedAt": "2026-11-08T14:32:00Z",
+  "details": {
+    "server": {
+      "passed": 294,
+      "failed": 0,
+      "skipped": 0,
+      "files": 14,
+      "postgres": 5,
+      "typecheck": "passed",
+      "lint": {
+        "errors": 0,
+        "warnings": 30
+      }
+    },
+    "shell": {
+      "feedback": 32,
+      "capture": 31,
+      "staticImageImport": 12,
+      "trace": 27,
+      "failed": 0,
+      "skipped": 0
+    },
+    "browser": {
+      "passed": 26,
+      "failed": 0,
+      "skipped": 0,
+      "viewports": [
+        "1440x900",
+        "390x844"
+      ],
+      "environment": "real Chromium with built bundle and local API route responses; actual crop/redaction pixels asserted"
+    },
+    "proxy": {
+      "feedbackBytes2129920": 201,
+      "otherBytes2129920": 413,
+      "feedbackBytes3000001": 413,
+      "configAdapted": true,
+      "cleanup": "wrapper wait timed out after assertions; disposable container absence subsequently confirmed"
+    },
+    "databaseMcp": {
+      "snapshotAt": "2026-11-08T02:15:02.516516Z",
+      "live": false,
+      "feedbackTablesExposed": false
+    },
+    "liveDeploymentVerified": false
+  }
+}
