@@ -357,6 +357,24 @@ reloaded.
 COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/static-id-patch.test.cjs
 ```
 
+## App-failure renderer command
+
+`app-failure` registers `_ezil.appFailure` in the renderer's CommandsRegistry. The extension host invokes it
+with a canonical, content-free record. Its handler only dispatches `CustomEvent("ezil-app-failure")` on
+`window`, with `detail: JSON.stringify(record)`, swallowing serialization or dispatch errors. The separate
+Worker-injected diagnostic bridge validates the record and transports it to the pinned shell parent after
+`ezil.code.diag.hello` (see `docs/FEEDBACK-APP-FAILURES-CONTRACT.md`). No logging or storage is added.
+
+The exact 4.141.0 anchor is `qe.registerCommand("noop",()=>{});var YLi=`: **one occurrence** in the pristine
+workbench. `qe` is the CommandsRegistry instance defined immediately before it; `YLi` is the following
+declaration and is used only as an anchor boundary. The new registration goes between them. Verification
+requires zero old-anchor occurrences, one exact replacement and one `_ezil.appFailure` registration.
+Re-running apply on a bundle with the exact replacement runs all verification gates without changing bytes,
+including the static-id gate; partially patched or altered bundles fail. Existing upstream registrations stay.
+
+`COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/app-failure-patch.test.cjs`
+checks apply, verify, idempotence, the actual registered handler and gate rejection on drift.
+
 ## Re-deriving the 4.141.0 anchors
 
 The three moved anchors are `token` (`yGe.env.devDeviceId`), `accounts-menu`

@@ -3,6 +3,7 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { ConfigError, describeConfig, parseModelsConfig, type ResolvedConfig, type ResolvedModel } from './config';
 import { forgetGatewayModels, gatewayModels } from './gateway';
+import { isAppFailure } from './failure';
 import { CompactionNotice } from './compaction-notice';
 import { EZiLAIStatus } from './status';
 import { EZiLModelsProvider } from './provider';
@@ -204,6 +205,13 @@ export function settingsSnippet(models: readonly ResolvedModel[]): Record<string
     return snippet;
 }
 
+/** Older workbenches may not register this command. Neither dispatch nor its rejection affects a turn. */
+export function sendAppFailure(record: unknown): void {
+    try {
+        if (isAppFailure(record)) void Promise.resolve(vscode.commands.executeCommand('_ezil.appFailure', record)).catch(() => {});
+    } catch { /* Diagnostics are optional and never logged. */ }
+}
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
     const output = vscode.window.createOutputChannel('EZiL Models');
     const log = (line: string) => output.appendLine(line.startsWith('{') ? line : `${new Date().toISOString()} ${line}`);
@@ -218,6 +226,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         secrets: () => store.secrets(),
         logRequests: () => settings().get<boolean>('logRequests') === true,
         log,
+        appFailure: sendAppFailure,
         recordUsage: (model, used, elapsedMs) => {
             usage.record(model, used, elapsedMs);
             if (model.provider.type !== 'ezil-gateway') log(`[usage] ${model.id} input=${used.inputTokens} output=${used.outputTokens} cache_read=${used.cacheReadTokens} cache_write=${used.cacheWriteTokens} ${elapsedMs}ms`);

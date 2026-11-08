@@ -3,6 +3,7 @@
 
 import * as vscode from 'vscode';
 import type { CompactionInfo } from './compact';
+import type { AppFailure } from './failure';
 import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, knownGatewayModels, parseCatalogModelId, withCatalogDefault, withGatewayModelLimits, type GatewayModels } from './gateway';
 import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
@@ -21,6 +22,8 @@ export type ProviderHost = {
     log(line: string): void;
     recordUsage(model: ResolvedModel, usage: Usage, elapsedMs: number): void;
     requestFinished?(model: ResolvedModel): void;
+    /** Content-free gateway outcomes; observer errors must never change a turn. */
+    appFailure?(record: AppFailure): void;
     /** The request goes compacted (compact.ts); `finished` settles when its turn ends. */
     compacted?(model: ResolvedModel, info: CompactionInfo, finished: Promise<void>): void;
     fetch?: typeof fetch;
@@ -293,7 +296,10 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             const events = chat(resolved, request, {
                 signal: controller.signal,
                 fetch: this.host.fetch,
-                gateway: { onCompact: info => this.host.compacted?.(sending, info, finished) },
+                gateway: {
+                    onCompact: info => this.host.compacted?.(sending, info, finished),
+                    onOutcome: record => { try { this.host.appFailure?.(record); } catch { /* Optional observer. */ } },
+                },
                 log: line => this.host.log(redact(line, this.host.secrets())),
                 onRequest: (url, body) => {
                     if (resolved.provider.type === 'ezil-gateway') return;

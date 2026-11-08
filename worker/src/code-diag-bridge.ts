@@ -1,0 +1,73 @@
+/** Content-free app failures: a separate closure/channel from the folder bridge. Contract §1–§3:
+ * docs/FEEDBACK-APP-FAILURES-CONTRACT.md. Origins come only from codeShellOriginsFor at the existing
+ * workbench injection sites. No storage, logging, global names or readiness message. */
+export const DIAG_BRIDGE_MARKER = 'data-ezil-diag-bridge';
+
+export function codeDiagBridgeScript(origins: readonly string[]): string {
+  // Plain JavaScript embedded in the document; the golden fixtures exercise this exact validator.
+  return `(()=>{try{
+const origins=${JSON.stringify(origins)};
+if(window.parent===window||!origins.length)return;
+const matches=(v,re)=>typeof v==="string"&&re.exec(v)?.[0]===v;
+const uuid=v=>matches(v,/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+const integer=(v,min,max)=>Number.isSafeInteger(v)&&v>=min&&v<=max;
+const codes={interrupted:["stream_interrupted"],network:["network_offline","network_failed"],timeout:["request_timeout","first_token_timeout"],auth:["auth_expired","auth_invalid","session_expired"],credits:["credits_exhausted"],entitlement:["membership_required","model_not_entitled"],rate_limit:["rate_limited"],provider:["provider_error","provider_overloaded","provider_refused","model_unavailable"],cancellation:["request_cancelled"],app_startup:["app_start_failed","app_start_timeout","chat_unavailable"]};
+const enums={source:["ezil_chat","code_app"],operation:["chat_request","app_start"],stage:["startup","admission","request","headers","stream"],outcome:["failed","retrying","recovered","cancelled"],streamReason:["eof","malformed_event","missing_terminal"],cancellationSource:["caller","user_stop","unknown"]};
+const keys=new Set(["eventId","source","operation","category","code","stage","outcome","streamReason","cancellationSource","clientRequestId","gatewayRequestId","vscodeRequestId","retryOfClientRequestId","attempt","retryable","durationMs","modelKey","httpStatus"]);
+const valid=r=>{
+if(!r||typeof r!=="object"||Array.isArray(r)||!Object.keys(r).every(k=>keys.has(k)))return false;
+for(const [k,values] of Object.entries(enums))if(r[k]!==undefined&&!values.includes(r[k]))return false;
+if(!uuid(r.eventId)||r.source===undefined||r.operation===undefined||r.stage===undefined||r.outcome===undefined)return false;
+if(typeof r.category!=="string"||!Object.prototype.hasOwnProperty.call(codes,r.category)||typeof r.code!=="string")return false;
+if(r.code!=="unexpected_error"&&!codes[r.category].includes(r.code))return false;
+if(r.streamReason!==undefined&&r.stage!=="stream")return false;
+if((r.category==="cancellation")!==(r.cancellationSource!==undefined))return false;
+if(r.outcome==="cancelled"&&r.category!=="cancellation")return false;
+if(r.category==="cancellation"&&(r.code!=="request_cancelled"||r.outcome!=="cancelled"))return false;
+for(const k of ["clientRequestId","gatewayRequestId","vscodeRequestId","retryOfClientRequestId"])if(r[k]!==undefined&&!uuid(r[k]))return false;
+if(r.attempt!==undefined&&!integer(r.attempt,1,64))return false;
+if(r.retryable!==undefined&&typeof r.retryable!=="boolean")return false;
+if(r.durationMs!==undefined&&!integer(r.durationMs,0,3600000))return false;
+// The contract forbids URLs; the rejected model-key URL fixture also matches the character allowlist.
+if(r.modelKey!==undefined&&(!matches(r.modelKey,/^[a-z0-9][a-z0-9._:/-]{0,63}$/)||r.modelKey.includes("://")))return false;
+if(r.httpStatus!==undefined&&!integer(r.httpStatus,100,599))return false;
+return true;
+};
+let nonce,origin;const queue=[],posts=[];
+const send=failure=>{try{
+const envelope={type:"ezil.code.failure",v:1,nonce,failure};
+if(new TextEncoder().encode(JSON.stringify(envelope)).byteLength>2048)return;
+const now=Date.now();while(posts.length&&posts[0]<=now-60000)posts.shift();
+if(posts.length>=20)return;posts.push(now);
+window.parent.postMessage(envelope,origin);
+}catch{}};
+window.addEventListener("message",ev=>{try{
+const d=ev.data;
+if(ev.source!==window.parent||!origins.includes(ev.origin)||!d||typeof d!=="object"||Array.isArray(d))return;
+if(Object.keys(d).length!==3||!Object.keys(d).every(k=>["type","v","nonce"].includes(k)))return;
+if(d.type!=="ezil.code.diag.hello"||d.v!==1||!matches(d.nonce,/^[A-Za-z0-9_-]{22}$/))return;
+nonce=d.nonce;origin=ev.origin;for(const r of queue.splice(0))send(r);
+}catch{}});
+window.addEventListener("ezil-app-failure",ev=>{try{
+if(typeof ev.detail!=="string")return;
+const r=JSON.parse(ev.detail);if(!valid(r))return;
+if(nonce){send(r);return}if(queue.length===10)queue.shift();queue.push(r);
+}catch{}});
+}catch{}})();`;
+}
+
+/** Same insertion point and CSP nonce rule as the folder bridge, with independent idempotence. */
+export function injectCodeDiagBridge(html: string, origins: readonly string[]): string {
+  if (!origins.length || html.includes(DIAG_BRIDGE_MARKER)) return html;
+  const nonce = /<script\s+nonce="([^"]*)"/i.exec(html)?.[1];
+  if (!nonce || !/^[A-Za-z0-9+/=_-]{8,128}$/.test(nonce)) return html;
+  const head = /<head(\s[^>]*)?>/i.exec(html);
+  if (!head) return html;
+  const script = codeDiagBridgeScript(origins);
+  if (/<\/|<!--/.test(script)) return html;
+  const start = head.index + head[0].length;
+  const end = html.indexOf('</head>', start);
+  const charset = /<meta\s+charset\s*=\s*["']?[A-Za-z0-9_-]+["']?\s*\/?>/i.exec(html.slice(start, end < 0 ? undefined : end));
+  const at = charset ? start + charset.index + charset[0].length : start;
+  return `${html.slice(0, at)}\n<script nonce="${nonce}" ${DIAG_BRIDGE_MARKER}="1">${script}</script>${html.slice(at)}`;
+}
