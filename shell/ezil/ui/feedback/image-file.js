@@ -43,8 +43,10 @@ function header_size(b,type) {
         const length=v.getUint32(o+4,true),start=o+8,end=start+length;
         if(end+length%2>b.length)return null;
         let size=null;
+        // Screenshots are static; reject animation frames whose nested raster headers are not inspected.
+        if(ascii(o,'ANIM') || ascii(o,'ANMF'))return null;
         if(ascii(o,'VP8X')) {
-            if(length!==10 || canvas)return null;
+            if(length!==10 || canvas || (b[start]&2))return null;
             size=[u24(start+4)+1,u24(start+7)+1];canvas=size;
         }else if(ascii(o,'VP8L')) {
             if(length<5 || b[start]!==47 || (b[start+4]&224))return null;

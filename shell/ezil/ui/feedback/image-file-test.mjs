@@ -35,6 +35,12 @@ await test('matching PNG, JPEG, WebP and extended WebP headers reach decoder',as
         assert.equal(c.width,800);assert.equal(c.height,600);assert.equal(calls,1);assert.equal(closed,1);
     }
 });
+await test('animated WebP flags and animation chunks reject before decode; static WebP remains accepted',async()=>{
+    const flagged=webp(800,600,true);flagged[20]|=2;
+    const chunked=Buffer.concat([webp(),Buffer.from('ANMF'),Buffer.alloc(4)]);chunked.writeUInt32LE(chunked.length-8,4);
+    for(const b of [flagged,chunked]){setup();assert.equal(await uploaded_image_canvas(file(b,'image/webp')),null);assert.equal(calls,0);}
+    setup();assert.ok(await uploaded_image_canvas(file(webp(),'image/webp')));
+});
 await test('decoded orientation is respected, long edge fits1920 without upscaling',async()=>{
     setup(3000,4000);const c=await uploaded_image_canvas(file(png(4000,3000)));
     assert.deepEqual([c.width,c.height],[1440,1920]);assert.equal(closed,1);assert.deepEqual(draws[0].slice(1),[0,0,1440,1920]);
