@@ -42,16 +42,24 @@ try {
       await page.goto(`${CODE_URL}/?folder=${encodeURIComponent(FOLDER)}`, { waitUntil: 'domcontentloaded' });
       const editor = aux.locator('.chat-input-container .monaco-editor').first();
       await editor.waitFor({ state: 'visible', timeout: 120_000 });
-      let typed = false;
+      // Monaco's rendered text is only a hint that the prompt landed (it can lag or carry decorations); what proves the
+      // send is the Gateway receiving this exact prompt, checked below. Its text goes into the details either way.
+      let typed = false, seen = '';
       for (let attempt = 0; attempt < 3 && !typed; attempt++) {
         const lines = editor.locator('.view-lines').first();
         await (v.touch ? lines.tap({ force: true }) : lines.click({ force: true }));
         await page.keyboard.press('Control+A'); await page.keyboard.press('Delete');
         await page.keyboard.type(prompt, { delay: 2 });
         // Monaco's text carries non-breaking spaces and wraps: compare without any whitespace.
-        typed = (await editor.innerText()).replace(/[\s\u00a0]+/g, '').includes(prompt.replace(/\s+/g, ''));
+        // Monaco paints typed text on a later frame: let the rendering settle before retyping (CI on 6df1871d retyped
+        // while its screenshot shows the whole prompt in the input).
+        for (let i = 0; i < 15 && !typed; i++) {
+          seen = await editor.innerText();
+          typed = seen.replace(/[\s\u00a0\u200b]+/g, '').includes(prompt.replace(/\s+/g, ''));
+          if (!typed) await page.waitForTimeout(200);
+        }
+        if (!typed) console.log(`[early] ${v.name}: attempt ${attempt + 1}, the input shows ${JSON.stringify(clean(seen).slice(0, 120))}`);
       }
-      if (!typed) throw new Error('the prompt never landed in the chat input');
       await page.keyboard.press('Enter');
       const sentAt = (Date.now() - t0) / 1000;
       let answered = false, tooLong = false, reached = false;
@@ -70,7 +78,7 @@ try {
       check(`${at}: the message went early (within 15 s of navigation)`, sentAt < 15, `${sentAt.toFixed(1)} s`);
       check(`${at}: no "Chat took too long to get ready"`, !tooLong, `after ${waited} s`);
       check(`${at}: the first message is answered`, answered, `after ${waited} s`);
-      check(`${at}: the Gateway received the first message`, reached);
+      check(`${at}: the Gateway received the first message`, reached, typed ? '' : `input showed ${JSON.stringify(clean(seen).slice(0, 120))}`);
     } catch (error) {
       check(`${v.name}: ran to completion`, false, String(error).slice(0, 300));
       await page.screenshot({ path: join(OUT, `${v.name}-error.png`) }).catch(() => {});
