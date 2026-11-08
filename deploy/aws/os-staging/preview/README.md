@@ -107,7 +107,12 @@ staging release.
 With the `OS_PREVIEW_QA_EMAIL` / `OS_PREVIEW_QA_PASSWORD` secrets on the
 `os-pr-preview` environment (referenced by name only), it also checks signed-in
 desktop and phone. Without them the result is PARTIAL, reported as a warning and
-never as a pass. It starts no computer and sends no chat.
+never as a pass. It starts no computer and sends no chat: after sign-in, every
+non-GET request is aborted.
+
+The QA password is typed into a sign-in page served by the PR's code. Use a
+dedicated low-privilege QA account, and rotate it if an approved preview turns out
+to be hostile (see Trust boundary).
 
 ## Cost
 

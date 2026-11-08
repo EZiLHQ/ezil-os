@@ -30,6 +30,7 @@ jobs:
         run: |
           python3 -m pip install --quiet PyYAML==6.0.2
           python3 -B -m unittest discover -s deploy/aws/os-staging/preview -p 'test_*.py' -v
+          node --test e2e/os-preview-smoke.test.mjs
       - uses: actions/upload-artifact@v4
         with:
           name: os-source-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
