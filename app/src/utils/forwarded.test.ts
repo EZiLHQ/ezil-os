@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { forwardedHost, forwardedProto, withoutDefaultPort } from './forwarded';
 
@@ -68,5 +68,51 @@ describe('ownedPublicOrigin', () => {
         const { ownedPublicOrigin } = await import('./forwarded');
         const h = new Headers({ 'x-forwarded-host': host, 'x-forwarded-proto': 'https' });
         expect(ownedPublicOrigin(h, 'https://localhost:3000/')).toBe('https://os.ezil.org');
+    });
+});
+
+describe('PR preview slot origin', () => {
+    afterEach(() => vi.unstubAllEnvs());
+    const slot = (host: string) => new Headers({ 'x-forwarded-host': host, 'x-forwarded-proto': 'https' });
+    const preview = (origin: string) => {
+        vi.stubEnv('EZIL_DEPLOY_ENV', 'pr-preview');
+        vi.stubEnv('EZIL_PR_PREVIEW_ORIGIN', origin);
+    };
+
+    it('keeps the container\'s own slot origin, so the Auth0 callback stays on the preview', async () => {
+        const { ownedPublicOrigin, prPreviewOrigin } = await import('./forwarded');
+        preview('https://os-pv1.ezil.work');
+        expect(prPreviewOrigin()).toBe('https://os-pv1.ezil.work');
+        expect(ownedPublicOrigin(slot('os-pv1.ezil.work'), 'http://127.0.0.1:3101/')).toBe('https://os-pv1.ezil.work');
+    });
+
+    it('sends an unowned host to its own slot, never to production', async () => {
+        const { ownedPublicOrigin } = await import('./forwarded');
+        preview('https://os-pv2.ezil.work');
+        expect(ownedPublicOrigin(slot('evil-app.ezil.work'), 'http://127.0.0.1:3102/')).toBe('https://os-pv2.ezil.work');
+        // Another slot is another lane: it is not owned by this container.
+        expect(ownedPublicOrigin(slot('os-pv1.ezil.work'), 'http://127.0.0.1:3102/')).toBe('https://os-pv2.ezil.work');
+    });
+
+    it('ignores the origin outside the pr-preview deploy env', async () => {
+        const { ownedPublicOrigin, prPreviewOrigin } = await import('./forwarded');
+        for (const env of [undefined, '', 'staging', 'production', 'PR-PREVIEW']) {
+            vi.stubEnv('EZIL_DEPLOY_ENV', env);
+            vi.stubEnv('EZIL_PR_PREVIEW_ORIGIN', 'https://os-pv1.ezil.work');
+            expect(prPreviewOrigin()).toBeNull();
+            expect(ownedPublicOrigin(slot('os-pv1.ezil.work'), 'https://localhost:3000/')).toBe('https://os.ezil.org');
+        }
+    });
+
+    it.each([
+        'https://os-pv0.ezil.work', 'https://os-pv10.ezil.work', 'https://os-pv1.ezil.work.evil.example',
+        'https://evil.os-pv1.ezil.work', 'http://os-pv1.ezil.work', 'https://os-pv1.ezil.work/',
+        'https://os-pv1.ezil.work:443', 'https://OS-PV1.ezil.work', ' https://os-pv1.ezil.work',
+        'https://os-pv1.ezil.work\n', 'https://os-pv1-app.ezil.work', 'https://os-staging.ezil.work.', '',
+    ])('refuses a configured value that is not exactly a slot origin %#', async origin => {
+        const { isOwnedAppOrigin, prPreviewOrigin } = await import('./forwarded');
+        preview(origin);
+        expect(prPreviewOrigin()).toBeNull();
+        expect(isOwnedAppOrigin(origin)).toBe(false);
     });
 });

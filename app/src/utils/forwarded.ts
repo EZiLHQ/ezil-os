@@ -55,10 +55,35 @@ export const OWNED_APP_ORIGINS = [
 ] as const;
 const CANONICAL_ORIGIN = 'https://os.ezil.org';
 
+/** The fixed PR preview slot hosts (`deploy/aws/os-staging/preview`). Exact hosts, never a `*.ezil.work` grant. */
+const PR_PREVIEW_SLOT_ORIGIN = /^https:\/\/os-pv[1-9]\.ezil\.work$/;
+
+/**
+ * This container's own PR preview origin, or `null`. Read at runtime, so the image a
+ * preview tested can be promoted unchanged: only the preview host's env overlay sets
+ * both `EZIL_DEPLOY_ENV=pr-preview` and the slot origin, and a value that is not
+ * exactly a slot origin is ignored.
+ */
+export function prPreviewOrigin(): string | null {
+    if (process.env.EZIL_DEPLOY_ENV !== 'pr-preview') return null;
+    const origin = process.env.EZIL_PR_PREVIEW_ORIGIN ?? '';
+    return PR_PREVIEW_SLOT_ORIGIN.test(origin) ? origin : null;
+}
+
+/** An owned origin: a fixed one, or this container's own preview slot. */
+export function isOwnedAppOrigin(origin: string): boolean {
+    return (OWNED_APP_ORIGINS as readonly string[]).includes(origin) || origin === prPreviewOrigin();
+}
+
+/** Where an unowned origin is sent: a preview never bounces its QA session into production. */
+export function canonicalAppOrigin(): string {
+    return prPreviewOrigin() ?? CANONICAL_ORIGIN;
+}
+
 /** `publicOrigin`, but only an owned origin (or local dev outside production); otherwise the canonical one. */
 export function ownedPublicOrigin(headers: HeaderReader, fallback: string): string {
     const origin = publicOrigin(headers, fallback);
-    if ((OWNED_APP_ORIGINS as readonly string[]).includes(origin)) return origin;
+    if (isOwnedAppOrigin(origin)) return origin;
     if (process.env.NODE_ENV !== 'production' && /^http:\/\/(?:localhost|127\.0\.0\.1)(?::[0-9]{1,5})?$/.test(origin)) return origin;
-    return CANONICAL_ORIGIN;
+    return canonicalAppOrigin();
 }
