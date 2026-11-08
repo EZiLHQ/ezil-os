@@ -341,8 +341,9 @@ token branch. Do not copy minifier names from a different release.
 
 Extract the checksummed .deb with `dpkg-deb -x`, copy the extracted tree,
 and run this script followed by `--verify` against `lib/vscode` in that copy.
-Every pre-patch count must match. The verification also parses all three
-patched JS files, compares the NLS JS/JSON arrays, checks the 0.69.0 manifest
+Every pre-patch count must match. The verification also parses the four
+patched JS files (`server-main.js` in place, where `lib/vscode/package.json`
+makes it a module), compares the NLS JS/JSON arrays, checks the 0.69.0 manifest
 identity and provider contribution, and requires `defaultChatAgent`, the MIT
 license and original Microsoft headers. Compare LICENSE.txt with the original
 extraction when reviewing an update. The JSON and CSS modifications are

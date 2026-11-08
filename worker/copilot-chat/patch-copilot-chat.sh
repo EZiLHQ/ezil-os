@@ -407,7 +407,8 @@ if(json.length!==js.length)throw new Error(`nls.messages.js (${js.length}) and .
 for(let i=0;i<js.length;i++)if(js[i]!==json[i])throw new Error("nls.messages.js and .json differ at index "+i);
 console.log("patch-copilot-chat: gate ok [nls-parse] "+js.length+" messages, .js and .json identical");
 ' "$NLS_JSON" "$NLS_JS"
-for f in "$EXT" "$WB" "$NLS_JS"; do node --check "$f"; done
+# server-main.js is checked in place: lib/vscode/package.json makes it a module there, as when code-server loads it
+for f in "$EXT" "$WB" "$NLS_JS" "$SERVER"; do node --check "$f"; done
 echo "patch-copilot-chat: gate ok [patched JavaScript parses]"
 # license/copyright notices must be intact
 test -s "$ROOT/extensions/copilot/LICENSE.txt"
