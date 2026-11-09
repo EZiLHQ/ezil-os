@@ -202,6 +202,11 @@ window.addEventListener('message',e=>{if(e.source===frame.contentWindow&&e.origi
       state('free');
       await page.goto(`${PARENT}/os`, { waitUntil: 'domcontentloaded' });
       await c.ready(FLASH_NAME);
+      // Ready means connected: the model picker shows Flash and no workbench WebSocket has failed (diagnostics so far).
+      const wsFailed = diagnostics.filter(line => /^ws (error|close)/.test(line));
+      check('framed: the workbench connects inside the OS page (WebSocket open, the picker shows Flash)',
+        (await c.label()) === `Models, ${FLASH_NAME}` && wsFailed.length === 0, `${await c.label()}; ${JSON.stringify(wsFailed.slice(0, 3))}`);
+      if ((await c.label()) !== `Models, ${FLASH_NAME}` || wsFailed.length) throw new Error('framed workbench not ready');
       check('framed: the Worker\'s injector adds the bridge to the workbench, and it answers the OS page\'s hello',
         injected > 0 && (await billing()).some(m => m.type === 'ezil.code.billing.ready'), `injected ${injected}; ${JSON.stringify(await billing())}`);
       await c.press(c.model); await page.waitForTimeout(1200);
