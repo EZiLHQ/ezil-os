@@ -224,7 +224,8 @@ describe('billing asks: exactly two credit codes, once a minute', () => {
     });
 
     test('an unknown plan (503 os_plan_unavailable) offers Retry at most once a minute, and never billing', async () => {
-        const g = gateway(free(), refusal(503, 'os_plan_unavailable'));
+        let code = 'os_plan_unavailable';
+        const g = gateway(free(), () => refusal(code === 'os_plan_unavailable' ? 503 : 502, code)());
         await list(g.provider);
         const start = Date.now();
         try {
@@ -234,12 +235,18 @@ describe('billing asks: exactly two credit codes, once a minute', () => {
             await Bun.sleep(0);
             expect(errors).toHaveBeenCalledTimes(1);
             expect(errors.mock.calls[0]?.slice(1)).toEqual(['Retry']);
-            setSystemTime(new Date(start + 61_000));
+            // The limit is the plan notice's own: another temporary failure in the same minute still offers Retry.
+            code = 'os_ai_unavailable';
             await expect(send(g.provider, `ezil/${FLASH}`)).rejects.toThrow();
             await Bun.sleep(0);
             expect(errors).toHaveBeenCalledTimes(2);
+            code = 'os_plan_unavailable';
+            setSystemTime(new Date(start + 61_000));
+            await expect(send(g.provider, `ezil/${FLASH}`)).rejects.toThrow();
+            await Bun.sleep(0);
+            expect(errors).toHaveBeenCalledTimes(3);
         } finally { setSystemTime(); }
-        expect(g.posts).toHaveLength(5);
+        expect(g.posts).toHaveLength(6);
         expect(g.intents).toEqual([]);
         expect(warnings).not.toHaveBeenCalled();
     });
