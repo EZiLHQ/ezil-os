@@ -917,9 +917,13 @@ validators, both `json-tool.py` guards and the GC guard. Every earlier app accep
 at most twenty-five and cannot read a twenty-six-record registry. Install the
 compatible app with `apply-app` first: it reads back the running commit and
 deployment before writing its receipt, and `promote-canary` refuses without that
-receipt before reading the secret, so the twenty-sixth record is never appended
-under an older app. App and agent must still come from the same reviewed commit,
-which must contain both this change and the feature being released. Rollback must
+receipt before reading the secret. The receipt proves only that the installed app
+equals the plan's pinned app; nothing checks that the pinned commit contains this
+change. If it does not, an operator checkout that does can still append the
+twenty-sixth record under that older app, which then fails closed reading the
+registry. App and agent must still come from the same reviewed commit, which must
+contain both this change and the feature being released; check that before
+`apply-app`. Rollback must
 retain the invoking twenty-six-compatible app while restoring the prior deployment
 tuple and all twenty-six records; do not reinstall the older app. The 24,000-byte
 readback and 65,536-byte secret limits, immutable records and GC proofs are
