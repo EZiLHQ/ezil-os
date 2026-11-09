@@ -211,6 +211,10 @@ Two `localStorage` keys per account, keyed by the opaque account id from
   queued screenshot in full, so a link too slow for one keeps spending that upload.
 - After a server error (408 or 5xx) while online, the copy says the report is saved and to
   press Send; a reconnect is promised only after a network failure.
+- Listing and deleting the reporter's own reports (`list_my_reports`, `delete_my_report`)
+  have a 20 s deadline (`REPORTS_DEADLINE_MS`) that also covers reading the response: a
+  stalled list fails with "Could not load your reports" and a stalled delete settles as not
+  deleted, so Settings shows its retry copy instead of loading forever.
 
 ## 5. Never collected
 `document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, `log.js` ring, headers,

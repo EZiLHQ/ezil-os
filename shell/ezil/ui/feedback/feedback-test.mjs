@@ -671,6 +671,31 @@ try {
             window.localStorage.removeItem(outboxKey);
         } finally { timers.restore(); flushing = false; }
     });
+    await check('a flush never rewrites the stored order, and equal-size entries go oldest first', async () => {
+        const ids = ['c1111111-1111-4111-8111-111111111111', 'c2222222-2222-4222-8222-222222222222',
+            'c3333333-3333-4333-8333-333333333333', 'c4444444-4444-4444-8444-444444444444'];
+        // Oldest first in storage: two equal text bodies, one screenshot, then another equal text body.
+        const bodies = [queuedReport(ids[0], 'Equal A'), queuedReport(ids[1], 'Equal B'),
+            queuedReport(ids[2], 'Screenshot', 'A'.repeat(70 * 1024)), queuedReport(ids[3], 'Equal C')];
+        const seeded = ids.map((clientRequestId, i) => ({ clientRequestId, body: bodies[i], draft: null }));
+        window.localStorage.setItem(outboxKey, JSON.stringify(seeded));
+        flushing = true;
+        try {
+            const count = calls.length;
+            const before = window.localStorage.getItem(outboxKey);
+            respond = async () => { throw new TypeError('Failed to fetch'); };
+            await feedback.flush_feedback_outbox();
+            assert.equal(window.localStorage.getItem(outboxKey), before, '🔴 a flush leaves the stored age order untouched');
+            // Only the screenshot is answered with a retryable server error, so it stays queued.
+            respond = async (url, options) => JSON.parse(options.body).clientRequestId === ids[2]
+                ? { status: 503 } : { status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) };
+            await feedback.flush_feedback_outbox();
+            assert.deepEqual(calls.slice(count + 1).map(c => JSON.parse(c.body).clientRequestId), [ids[0], ids[1], ids[3], ids[2]],
+                '🔴 equal sizes keep their age order; the larger body goes last');
+            assert.deepEqual(stored(outboxKey).map(entry => entry.clientRequestId), [ids[2]]);
+            window.localStorage.removeItem(outboxKey);
+        } finally { flushing = false; }
+    });
     await check('a timeout on the compatibility re-send still counts as a timeout', async () => {
         const leanId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', nextId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
         const withDiagnostics = JSON.stringify({ v: 1, clientRequestId: leanId, category: 'bug', description: 'Old server',
@@ -1034,6 +1059,45 @@ try {
         const count = calls.length;
         assert.equal(await feedback.delete_my_report('invalid'), false);
         assert.equal(calls.length, count);
+    });
+    await check('a stalled report list or delete fails at its deadline instead of loading forever', async () => {
+        const timers = [];
+        const realSetTimeout = globalThis.setTimeout, realClearTimeout = globalThis.clearTimeout;
+        globalThis.setTimeout = (fn, ms, ...rest) => {
+            if ( ms !== feedback.REPORTS_DEADLINE_MS ) return realSetTimeout(fn, ms, ...rest);
+            const timer = { fn, ms, cleared: false };
+            timers.push(timer);
+            return timer;
+        };
+        globalThis.clearTimeout = timer => { if ( timers.includes(timer) ) timer.cleared = true; else realClearTimeout(timer); };
+        // Without a signal the request can only hang, exactly as a real stalled one would.
+        const stall = (url, options) => new Promise((resolve, reject) => {
+            options.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        });
+        const settled = promise => Promise.race([promise.then(value => ({ value }), error => ({ error })),
+            new Promise(resolve => realSetTimeout(() => resolve({ hung: true }), 200))]);
+        try {
+            // The list's headers arrive, then its body stalls.
+            respond = (url, options) => Promise.resolve({ status: 200, ok: true, json: () => stall(url, options) });
+            const listing = feedback.list_my_reports();
+            await until(() => timers.length === 1);
+            assert.ok(feedback.REPORTS_DEADLINE_MS >= 10_000 && feedback.REPORTS_DEADLINE_MS <= 30_000);
+            timers[0].fn();
+            const listed = await settled(listing);
+            assert.equal(listed.hung, undefined, '🔴 the deadline ends a stalled list');
+            assert.match(String(listed.error?.message), /Could not load your reports/, 'with the readable error');
+            assert.equal(timers[0].cleared, true, 'the list deadline is released');
+            respond = stall;
+            const removal = feedback.delete_my_report(reportId);
+            await until(() => timers.length === 2);
+            timers[1].fn();
+            assert.deepEqual(await settled(removal), { value: false }, '🔴 a stalled delete settles as not deleted');
+            assert.equal(timers[1].cleared, true, 'the delete deadline is released');
+            const reports = [{ id: reportId, category: 'bug', createdAt: '2026-10-15', descriptionPreview: 'Desktop froze', hasScreenshot: false, status: 'new' }];
+            respond = async () => ({ status: 200, ok: true, json: async () => ({ reports }) });
+            assert.deepEqual(await feedback.list_my_reports(), reports);
+            assert.equal(timers[2].cleared, true, '🔴 a successful list clears its deadline');
+        } finally { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout; }
     });
     await check('Troubleshoot entry and reports are gated; explicit load, escaped preview and confirmed deletion', async () => {
         // Existing Troubleshoot deliberately reads the diagnostic-log ring;
