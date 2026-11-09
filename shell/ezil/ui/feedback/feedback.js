@@ -155,15 +155,25 @@ function without_event_diagnostics (body) {
     } catch { return null; }
 }
 
+/**
+ * A stalled POST would otherwise leave "Sending…" up forever. Hitting this is
+ * an unanswered send (status 0): the outbox keeps the body, and a re-send
+ * reuses its clientRequestId, which the server answers as a replay.
+ */
+export const SEND_TIMEOUT_MS = Object.freeze({ text: 45_000, screenshot: 180_000 });
+
 /** One POST. Never throws; `{ status, data }` with status 0 = no usable answer. */
 async function post (body) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(),
+        body.length > 64 * 1024 ? SEND_TIMEOUT_MS.screenshot : SEND_TIMEOUT_MS.text);
     try {
         const response = await fetch(endpoint(), { method: 'POST', credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' }, body });
+            headers: { 'Content-Type': 'application/json' }, body, signal: controller.signal });
         if ( response.status !== 200 && response.status !== 201 ) return { status: response.status, data: null };
         const data = await response.json();
         return typeof data?.id === 'string' && UUID.test(data.id) ? { status: response.status, data } : { status: 0, data: null };
-    } catch { return { status: 0, data: null }; }
+    } catch { return { status: 0, data: null }; } finally { clearTimeout(timer); }
 }
 
 /**

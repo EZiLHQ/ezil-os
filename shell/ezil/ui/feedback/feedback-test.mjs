@@ -573,6 +573,39 @@ try {
         assert.equal(stored(outboxKey), null); assert.equal(stored(draftKey), null);
         close();
     });
+    await check('a send that never answers times out, unlocks the form and re-sends the same id', async () => {
+        open(); setDescription('Stalled send');
+        const id = payload().clientRequestId;
+        const body = current().querySelector('pre').textContent;
+        let signal;
+        respond = (url, options) => new Promise((resolve, reject) => {
+            signal = options.signal;
+            signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        });
+        const timers = [];
+        const realSetTimeout = globalThis.setTimeout;
+        globalThis.setTimeout = (fn, ms, ...rest) => {
+            if ( ms === feedback.SEND_TIMEOUT_MS.text || ms === feedback.SEND_TIMEOUT_MS.screenshot ) { timers.push({ fn, ms }); return 0; }
+            return realSetTimeout(fn, ms, ...rest);
+        };
+        try {
+            send(); await until(() => timers.length === 1);
+        } finally { globalThis.setTimeout = realSetTimeout; }
+        assert.equal(timers[0].ms, feedback.SEND_TIMEOUT_MS.text, 'a text-only body gets the short deadline');
+        assert.match(status(), /^Sending…/, 'setup: the request is still pending');
+        assert.equal(signal.aborted, false);
+        timers[0].fn();
+        await until(() => ! current().querySelector('[type="submit"]').disabled);
+        assert.equal(signal.aborted, true, '🔴 the deadline aborts the request');
+        assert.match(status(), /Check your connection/);
+        assert.equal(stored(outboxKey).at(-1).body, body, 'the unanswered body stays queued');
+        // Pressing Send again reuses the id, which the server answers as a replay.
+        respond = async () => ({ status: 200, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+        send(); await until(() => /Thanks — we got it/.test(status()));
+        assert.equal(JSON.parse(calls.at(-1).body).clientRequestId, id);
+        assert.equal(stored(outboxKey), null);
+        close();
+    });
     await check('reports carry the switched current computer, frozen through a later switch and replay', async () => {
         const computerB = '55555555-5555-4555-8555-555555555555';
         const computerC = '66666666-6666-4666-8666-666666666666';
