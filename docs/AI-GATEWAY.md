@@ -101,6 +101,36 @@ JWT signature/member verification on each request. Transactional storage keeps
 the later-expiring token. A gateway 401 drops that token only if a newer push
 has not replaced it. Teardown/idle stop delete the credential and nonce.
 
+## Plan model list (Free includes Gemini 3.8 Flash only)
+
+A push may also carry `"includedModels"`: the models the owner's plan includes,
+from the same effective plan the computer start gate uses
+(`app/src/server/billing/v3/ai-models.ts`; Free is `["gemini-3.8-flash"]`,
+Standard and Premium are `null`, every model). It is signed in the same body.
+When billing metering is off the app sends `null`. When the app cannot read the
+plan it leaves the field out, and the Worker keeps the list it has. A value
+other than `null` or 1–16 distinct Gateway aliases refuses the whole push
+(`400 included_models_malformed`). The list is stored apart from the token and
+ordered by its own signature time, so a later push always wins whichever token
+is kept. It stays through logout, a dropped token and stop: it only restricts,
+and the next push with a readable plan replaces it.
+
+With a list stored, `POST /ai/v1/messages` and `/ai/v1/responses` read the
+body's `model` exactly as the Gateway reads it (fatal UTF-8, `JSON.parse`, last
+repeated key wins). Any other model gets a local
+`403 os_model_not_included` (source `ezil-os-proxy`), and a body that names no
+model gets `400 os_invalid_request`. In both cases nothing reaches the Gateway,
+so nothing is held or charged. Every `GET /ai/v1/models` answer, and the 403,
+carries `x-ezil-os-included-models: <aliases, comma-separated>`. The proxy
+sets this header itself and never relays it from the Gateway. Without a list,
+requests pass exactly as before. Credit refusals (`402 insufficient_credits`,
+`no_live_grant`) always pass through unchanged. The OS chooses Standard upgrade
+or Add credits from its own billing summary.
+
+This enforcement is on the OS proxy path only. The Gateway itself has no notion
+of OS plans, so a member who calls it directly with their own token is limited
+only by their credits.
+
 Without a usable JWT the proxy returns `401 os_session_missing`. Logout finds
 **all** computer rows owned by the authenticated user, including soft-deleted
 rows, derives their sandbox ids with the existing provider helper, and sends

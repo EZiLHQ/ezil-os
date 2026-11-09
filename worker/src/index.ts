@@ -645,6 +645,7 @@ import {
   handleAiProxyRequest,
   isAiProxyPath,
   parsePushedAccessToken,
+  parsePushedModelAccess,
   proxyError,
   resolveGatewayUrl,
   usableAiCredential,
@@ -652,9 +653,11 @@ import {
   DEFAULT_AI_GATEWAY_URL,
   AI_CREDENTIAL_STORAGE_KEY,
   AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY,
+  AI_MODEL_ACCESS_STORAGE_KEY,
   AI_PROXY_NONCE_STORAGE_KEY,
   readLimited,
   type StoredAiCredential,
+  type StoredAiModelAccess,
 } from './ai-proxy';
 
 import { captureEditorState } from './editor-state';
@@ -803,7 +806,7 @@ const PUBLIC_ERROR_CODES = [
   'hmac_v2_invalid_claims', 'hmac_v2_invalid_request', 'hmac_v2_malformed_token',
   'hmac_v2_query_not_allowed', 'hmac_v2_required', 'hmac_v2_sandbox_mismatch', 'hmac_v2_scope_mismatch',
   'hmac_v2_token_misplaced', 'hmac_v2_token_missing', 'hmac_v2_unverified', 'import_busy', 'import_mismatch',
-  'import_not_started', 'internal_error', 'invalid',
+  'import_not_started', 'included_models_malformed', 'internal_error', 'invalid',
   'invalid_body', 'invalid_body_base64', 'invalid_chunk_index', 'invalid_code_port',
   'invalid_content_type', 'invalid_continuation_token', 'invalid_desktop_mode', 'invalid_focus_app',
   'invalid_if_match_version', 'invalid_json_body', 'invalid_key', 'invalid_max_results', 'invalid_prefix',
@@ -972,8 +975,9 @@ interface EzilWorkspacePersistRpc {
   recordActivity(lastInputAgoMs: number): Promise<void>;
   startAiDesktop(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string>;
   getAiProxyNonce(): Promise<string | null>;
-  putAiCredential(credential: StoredAiCredential, signedAt: number): Promise<{ stored: boolean; expiresAt: number }>;
+  putAiCredential(credential: StoredAiCredential, signedAt: number, includedModels?: readonly string[] | null): Promise<{ stored: boolean; expiresAt: number }>;
   getAiCredential(): Promise<string | null>;
+  getAiModelAccess(): Promise<readonly string[] | null>;
   dropAiCredential(token?: string, signedAt?: number): Promise<void>;
   /**
    * Observe → flush → cancel the flush loop → destroy → RE-OBSERVE, returning
@@ -3895,13 +3899,23 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     return (await this.ctx.storage.get<string>(AI_PROXY_NONCE_STORAGE_KEY)) ?? null;
   }
 
-  /** Order pushes against logout and each other atomically. No container access. */
-  async putAiCredential(credential: StoredAiCredential, signedAt: number): Promise<{ stored: boolean; expiresAt: number }> {
+  /**
+   * Order pushes against logout and each other atomically. No container access. `includedModels` (the plan's models,
+   * `parsePushedModelAccess`) is ordered on its own: the later signed push wins, whichever token is kept. It is kept
+   * across stop and logout: it restricts, it grants nothing, and the next push with a readable plan replaces it.
+   */
+  async putAiCredential(credential: StoredAiCredential, signedAt: number, includedModels?: readonly string[] | null): Promise<{ stored: boolean; expiresAt: number }> {
     return this.ctx.storage.transaction(async (txn) => {
       const current = await txn.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY);
       const revokedAt = await txn.get<number>(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY);
       if (revokedAt !== undefined && signedAt <= revokedAt) {
         return { stored: false, expiresAt: current?.expiresAt ?? credential.expiresAt };
+      }
+      if (includedModels !== undefined) {
+        const access = await txn.get<StoredAiModelAccess>(AI_MODEL_ACCESS_STORAGE_KEY);
+        if (access === undefined || access.signedAt < signedAt) {
+          await txn.put(AI_MODEL_ACCESS_STORAGE_KEY, { includedModels, signedAt } satisfies StoredAiModelAccess);
+        }
       }
       const { keep, stored } = chooseAiCredential(current, { ...credential, signedAt });
       if (stored && keep !== current) await txn.put(AI_CREDENTIAL_STORAGE_KEY, keep);
@@ -3911,6 +3925,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 
   async getAiCredential(): Promise<string | null> {
     return usableAiCredential(await this.ctx.storage.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY));
+  }
+
+  /** The models the owner's plan includes; null = every model (none pushed yet, or the plan includes all). */
+  async getAiModelAccess(): Promise<readonly string[] | null> {
+    const access = await this.ctx.storage.get<StoredAiModelAccess>(AI_MODEL_ACCESS_STORAGE_KEY);
+    return Array.isArray(access?.includedModels) ? access.includedModels : null;
   }
 
   /** Signed logout keeps a watermark; teardown/401 retain their unconditional/token-only deletion. */
@@ -7633,9 +7653,10 @@ async function handleBrowserSidecar(
 // ── EZiL AI proxy (code bridge host `/ai/v1/*` + credential push) ────────────
 //
 // See `./ai-proxy.ts` for the contract. Two halves:
-//   - `POST /sandbox/:name/ai-credential  { accessToken }` (Worker API host):
+//   - `POST /sandbox/:name/ai-credential  { accessToken, includedModels? }` (Worker API host):
 //     the Next server pushes the signed-in user's Supabase access token, signed
 //     with `x-ezil-signature` over sandbox id + body hash. Stored in the DO only.
+//     `includedModels` is the plan's model list (null = all; absent = unchanged).
 //   - `/ai/v1/*` on `<8443>-<id>-code.<zone>`: the container's chat extension,
 //     authenticated by the per-sandbox proxy token injected at boot
 //     (`EZIL_AI_PROXY_TOKEN`), forwarded to the gateway with the stored token.
@@ -7667,6 +7688,7 @@ async function handleAiProxy(request: Request, env: Env, sandboxId: string, awsN
     proxySecret: resolveNekoDerivationSecret(env),
     proxyNonce: awsNonce !== undefined ? awsNonce : sandbox ? await sandbox.getAiProxyNonce() : null,
     credential: () => sandbox ? sandbox.getAiCredential() : Promise.resolve(null),
+    modelAccess: () => sandbox ? sandbox.getAiModelAccess() : Promise.resolve(null),
     dropCredential: (token) => sandbox ? sandbox.dropAiCredential(token) : Promise.resolve(),
     fetch: (upstream) => fetch(upstream),
     log: (fields) => console.log(JSON.stringify(fields)),
@@ -7709,10 +7731,12 @@ async function handleAiCredential(request: Request, env: Env, sandboxName: strin
   const accessToken = (body as { accessToken?: unknown } | null)?.accessToken;
   const parsed = parsePushedAccessToken(accessToken, sandboxName);
   if (!parsed.ok) return json({ ok: false, error: parsed.error }, 400);
+  const access = parsePushedModelAccess((body as { includedModels?: unknown } | null)?.includedModels);
+  if (!access.ok) return json({ ok: false, error: access.error }, 400);
 
   try {
     const sandbox = openSandbox(env, sandboxName);
-    const result = await sandbox.putAiCredential(parsed.credential, auth.timestamp);
+    const result = await sandbox.putAiCredential(parsed.credential, auth.timestamp, access.includedModels);
     return json({ ok: true, sandboxId: sandboxName, stored: result.stored, expiresAt: result.expiresAt });
   } catch {
     return json(

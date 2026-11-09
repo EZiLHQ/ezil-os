@@ -22,7 +22,7 @@
  * one proves the entrypoint starts; this one proves what it routes.
  */
 
-import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, exactCacheScope, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
+import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_MODEL_ACCESS_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, exactCacheScope, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
 import { beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 
 // Must be registered before `./index.ts` is imported (see module doc). The
@@ -194,14 +194,17 @@ function fakeSandboxNamespace(options: {
   };
 
   let credential: StoredAiCredential | undefined;
+  let modelAccess: readonly string[] | null = null;
   let nonce: string | null = null;
   let processResult: unknown;
   const impl: Record<string, (...args: unknown[]) => Promise<unknown>> = {
     getAiProxyNonce: async () => nonce,
     getAiCredential: async () => usableAiCredential(credential),
+    getAiModelAccess: async () => modelAccess,
     putAiCredential: async (...args) => {
       const result = chooseAiCredential(credential, args[0] as StoredAiCredential);
       credential = result.keep;
+      if (args[2] !== undefined) modelAccess = args[2] as readonly string[] | null;
       if (result.stored) calls.aiStored.push(result.keep);
       return { stored: result.stored, expiresAt: result.keep.expiresAt };
     },
@@ -3503,6 +3506,43 @@ describe('AI credential and code-host routes', () => {
     expect(calls.containerFetch).toHaveLength(0);
   });
 
+  it('a pushed plan list reaches the proxy: another model is refused before any upstream call; a malformed list stores nothing', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, AWS_ROUTING_ENABLED: 'on',
+      SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.org', AWS_ORIGIN_ZONE: 'origin.ezil.org', AWS_ORIGIN_ZONE_ALLOWLIST: 'origin.ezil.org',
+      AWS_TUNNELS: { idFromName: (id: string) => id, get: (id: string) => ({ fetch: async () =>
+        Response.json({ record: { sandboxId: id, aiProxyNonce: 'aws-boot-plan' } }) }) } };
+    const push = async (includedModels: unknown) => {
+      const body = JSON.stringify({ accessToken: token(), includedModels });
+      return worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/ai-credential`, { method: 'POST', body,
+        headers: { 'x-ezil-signature': await mintAiCredentialSignature(SECRET, SANDBOX_NAME, new TextEncoder().encode(body), Date.now(), 'POST') } }), env);
+    };
+    const auth = await deriveAiProxyToken(SECRET, SANDBOX_NAME, 'aws-boot-plan');
+    const send = (model: string) => worker.fetch(new Request(`https://aws-8443-${SANDBOX_NAME}-aws.ezil.org/ai/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model, max_tokens: 16 }), headers: { authorization: `Bearer ${auth}`, 'content-type': 'application/json' } }), env);
+    const realFetch = globalThis.fetch;
+    const upstream: Request[] = [];
+    globalThis.fetch = (async (request: Request) => { upstream.push(request); return Response.json({ ok: true }); }) as typeof fetch;
+    try {
+      for (const bad of [[], ['Gemini'], 'gemini-3.8-flash']) {
+        const res = await push(bad);
+        expect(res.status).toBe(400);
+        expect(await res.json()).toMatchObject({ error: 'included_models_malformed' });
+      }
+      expect(calls.aiStored).toHaveLength(0);
+      expect((await push(['gemini-3.8-flash'])).status).toBe(200);
+      const refused = await send('claude-opus-5-5');
+      expect(refused.status).toBe(403);
+      expect(await refused.json()).toMatchObject({ error: { code: 'os_model_not_included', source: 'ezil-os-proxy' } });
+      expect(upstream).toHaveLength(0);
+      expect((await send('gemini-3.8-flash')).status).toBe(200);
+      expect(upstream).toHaveLength(1);
+      expect((await push(null)).status).toBe(200);
+      expect((await send('claude-opus-5-5')).status).toBe(200);
+      expect(upstream).toHaveLength(2);
+    } finally { globalThis.fetch = realFetch; }
+  });
+
   it('AWS code hosts share the signed credential store and enforce every proxy guard', async () => {
     const { binding, calls } = fakeSandboxNamespace({});
     let nonce: string | null = 'aws-boot-one';
@@ -3751,6 +3791,36 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     await obj.putAiCredential({ token: 'new', expiresAt }, 3);
     await obj.dropAiCredential();
     expect(values.has(AI_CREDENTIAL_STORAGE_KEY)).toBe(false);
+  });
+
+  it('orders the plan list by its own signed time and keeps it through logout, a dropped token and teardown', async () => {
+    const { obj, values } = await object();
+    const expiresAt = Date.now() + 3600_000;
+    const flash = ['gemini-3.8-flash'];
+    expect(await obj.getAiModelAccess()).toBeNull();
+    await obj.putAiCredential({ token: 'a', expiresAt }, 10, flash);
+    expect(await obj.getAiModelAccess()).toEqual(flash);
+    // A push signed earlier (a beat that read the plan before a change landed) never overwrites a later one.
+    await obj.putAiCredential({ token: 'a', expiresAt }, 9, null);
+    expect(await obj.getAiModelAccess()).toEqual(flash);
+    // A later push that keeps the older, longer-lived token still updates the plan.
+    await obj.putAiCredential({ token: 'b', expiresAt: expiresAt - 1000 }, 11, null);
+    expect(await obj.getAiCredential()).toBe('a');
+    expect(await obj.getAiModelAccess()).toBeNull();
+    // Absent: the server could not read the plan this time, so it stays.
+    await obj.putAiCredential({ token: 'a', expiresAt }, 12, flash);
+    await obj.putAiCredential({ token: 'a', expiresAt }, 13);
+    expect(await obj.getAiModelAccess()).toEqual(flash);
+    // It restricts and grants nothing: logout, a dropped token and teardown leave it for the next push to replace.
+    await obj.dropAiCredential(undefined, 14);
+    await obj.dropAiCredential('a');
+    await obj.dropAiCredential();
+    expect(await obj.getAiCredential()).toBeNull();
+    expect(await obj.getAiModelAccess()).toEqual(flash);
+    // A push signed at or before the logout watermark changes neither the token nor the plan.
+    await obj.putAiCredential({ token: 'c', expiresAt }, 14, null);
+    expect(await obj.getAiCredential()).toBeNull();
+    expect(values.get(AI_MODEL_ACCESS_STORAGE_KEY)).toEqual({ includedModels: flash, signedAt: 12 });
   });
 
   it('serializes concurrent starts, reuses their nonce, and rotates when the stopped launcher is restarted', async () => {

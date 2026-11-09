@@ -36,6 +36,13 @@ export const AI_CREDENTIAL_STORAGE_KEY = 'ezil:aiCredential';
 /** Latest signed logout timestamp; retained even after the JWT is deleted. */
 export const AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY = 'ezil:aiCredentialRevokedAt';
 export const AI_PROXY_NONCE_STORAGE_KEY = 'ezil:aiProxyNonce';
+/** DO storage key for the models the owner's plan includes, pushed with the token (`StoredAiModelAccess`). */
+export const AI_MODEL_ACCESS_STORAGE_KEY = 'ezil:aiModelAccess';
+/**
+ * Set by this proxy only (never relayed from the Gateway): the models the plan includes, comma-separated, on every
+ * `GET /ai/v1/models` answer and on an `os_model_not_included` refusal. Absent means every model.
+ */
+export const AI_INCLUDED_MODELS_HEADER = 'x-ezil-os-included-models';
 
 // ── Routes ───────────────────────────────────────────────────────────────────
 
@@ -259,6 +266,49 @@ export function usableAiCredential(stored: StoredAiCredential | undefined, now: 
   return stored.expiresAt - AI_CREDENTIAL_MIN_REMAINING_MS > now ? stored.token : null;
 }
 
+/**
+ * The models the owner's plan includes, as the Next server last pushed them (billing v3 `aiIncludedModels`): `null`
+ * is every model. Kept apart from the token, so a push that keeps an older token still updates the plan; the later
+ * signed push wins.
+ */
+export interface StoredAiModelAccess {
+  readonly includedModels: readonly string[] | null;
+  readonly signedAt: number;
+}
+
+/** The Gateway's model alias rule (EZiL AI Gateway src/catalog.ts MODEL_ALIAS). */
+const MODEL_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+/**
+ * `includedModels` of a credential push. Absent: unchanged (the server could not read the plan this time). `null`:
+ * every model. Otherwise 1–16 distinct Gateway aliases. Anything else refuses the whole push.
+ */
+export function parsePushedModelAccess(
+  value: unknown,
+): { ok: true; includedModels: readonly string[] | null | undefined } | { ok: false; error: string } {
+  if (value === undefined || value === null) return { ok: true, includedModels: value };
+  if (!Array.isArray(value) || value.length === 0 || value.length > 16 || new Set(value).size !== value.length
+    || !value.every((alias) => typeof alias === 'string' && MODEL_ALIAS.test(alias))) {
+    return { ok: false, error: 'included_models_malformed' };
+  }
+  return { ok: true, includedModels: Object.freeze([...value] as string[]) };
+}
+
+/**
+ * The `model` a Messages or Responses body names, read exactly as the Gateway reads it (fatal UTF-8, then JSON.parse,
+ * where a repeated key's last value wins), or null when the body is not a JSON object naming one.
+ */
+export function requestModel(body: Uint8Array): string | null {
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(body));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+    const { model } = parsed as { model?: unknown };
+    return typeof model === 'string' ? model : null;
+  } catch {
+    return null;
+  }
+}
+
 // ── Proxying ─────────────────────────────────────────────────────────────────
 
 export interface AiProxyDeps {
@@ -272,6 +322,8 @@ export interface AiProxyDeps {
   readonly enabled?: string;
   /** The stored user token for this sandbox, if usable. */
   readonly credential: () => Promise<string | null>;
+  /** The models the owner's plan includes (`StoredAiModelAccess`); null or absent = every model. */
+  readonly modelAccess?: () => Promise<readonly string[] | null>;
   /** Forget `token` if it is still the stored one (after a gateway 401). */
   readonly dropCredential: (token: string) => Promise<void>;
   readonly fetch: (input: Request) => Promise<Response>;
@@ -290,10 +342,10 @@ const PASS_THROUGH_RESPONSE_HEADERS = [
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,200}$/;
 
 /** A proxy-originated error, told apart from gateway codes by the `os_` prefix (plus `not_found`/`body_too_large`, same meaning). */
-export function proxyError(status: number, code: string, message?: string): Response {
+export function proxyError(status: number, code: string, message?: string, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify({ error: { code, message, source: 'ezil-os-proxy' } }), {
     status,
-    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...headers },
   });
 }
 
@@ -659,6 +711,22 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
     body = bytes;
   }
 
+  // The models the owner's plan includes (pushed with the token by the Next server). A request for any other model
+  // is answered here: nothing reaches the Gateway, so nothing is held or charged. Only the body's `model` is read.
+  const included = route.method === 'POST' || route.upstreamPath === '/v1/models' ? (await deps.modelAccess?.()) ?? null : null;
+  const includedHeaders: Record<string, string> = included === null ? {} : { [AI_INCLUDED_MODELS_HEADER]: included.join(',') };
+  if (included !== null && body !== undefined) {
+    const model = requestModel(body);
+    if (model === null) {
+      log({ status: 400, code: 'os_invalid_request' });
+      return proxyError(400, 'os_invalid_request', 'The request does not name a model.');
+    }
+    if (!included.includes(model)) {
+      log({ status: 403, code: 'os_model_not_included', model: MODEL_ALIAS.test(model) ? model : null });
+      return proxyError(403, 'os_model_not_included', 'This model is not included in your plan.', includedHeaders);
+    }
+  }
+
   const upstreamUrl = new URL(route.upstreamPath.replace(':id', route.requestId ?? ''), deps.gatewayUrl);
   for (const name of route.query) {
     const value = url.searchParams.get(name);
@@ -723,6 +791,7 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
     const value = upstream.headers.get(name);
     if (value !== null) outHeaders.set(name, value);
   }
+  if (route.upstreamPath === '/v1/models') for (const [name, value] of Object.entries(includedHeaders)) outHeaders.set(name, value);
   const requestId = upstream.headers.get('x-ezil-request-id');
   // The Gateway's own answer for an opted-in call, HIT or MISS only; for any other call nothing is passed back.
   const upstreamCache = upstream.headers.get('x-ezil-cache');
