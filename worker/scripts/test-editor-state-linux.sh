@@ -53,8 +53,10 @@ const machine = JSON.parse(fs.readFileSync(root + '/Machine/settings.json', 'utf
 assert.equal(machine['chat.allowAnonymousAccess'], true);
 assert.equal(machine['chat.disableAIFeatures'], false);
 assert.equal(machine['chat.byokUtilityModelDefault'], 'mainAgent');
-assert.equal(machine['chat.utilityModel'], 'ezil/qwen.qwen3-coder-next');
-assert.equal(machine['chat.utilitySmallModel'], 'ezil/qwen.qwen3-coder-next');
+// Copilot's title/summary utility slots on Gemini 3.8 Flash, the model every plan includes (Free: the only one). A
+// utility slot on a model the plan does not include is refused before sending, so titles and summaries would be lost.
+assert.equal(machine['chat.utilityModel'], 'ezil/ezil/gemini-3.8-flash');
+assert.equal(machine['chat.utilitySmallModel'], 'ezil/ezil/gemini-3.8-flash');
 // No chat.defaultModel: VS Code 1.141 puts a configured default over the user's remembered model in every new or
 // reloaded empty chat. The first model comes from the provider's declared default (models.json "default").
 assert.equal('chat.defaultModel' in machine, false);
