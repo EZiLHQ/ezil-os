@@ -4,7 +4,7 @@
 import * as vscode from 'vscode';
 import type { CompactionInfo } from './compact';
 import { appFailure, type AppFailure } from './failure';
-import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, includedModelNames, knownGatewayModels, modelIncluded, parseCatalogModelId, withCatalogDefault, withDefaultModel, withGatewayModelLimits, withPlanLocks, type GatewayModels } from './gateway';
+import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, includedModelNames, knownGatewayModels, knownGatewayPlan, modelIncluded, parseCatalogModelId, withCatalogDefault, withDefaultModel, withGatewayModelLimits, withPlanLocks, type GatewayModels } from './gateway';
 import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
 import { redact, type ResolvedModel, type ResolvedProvider } from './config';
@@ -238,9 +238,9 @@ function osBillingLink(query: string): vscode.Uri | undefined {
     return undefined;
 }
 
-/** A catalog as listed, for noticing that a later read changed it (ids, availability, caps and capabilities). */
+/** A catalog as listed, for noticing that a later read changed it (ids, availability, caps, capabilities and the plan's limit). */
 function catalogSignature(catalog: GatewayModels | undefined): string {
-    return catalog ? JSON.stringify([catalog.default_model ?? null, catalog.data.map(entry => [entry.id, entry.enabled, entry.protocols, entry.availability?.state,
+    return catalog ? JSON.stringify([catalog.default_model ?? null, catalog.included ?? null, catalog.data.map(entry => [entry.id, entry.enabled, entry.protocols, entry.availability?.state,
         entry.name, entry.max_input_tokens, entry.max_output_tokens, entry.capabilities])]) : 'unread';
 }
 
@@ -358,7 +358,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             if (token.isCancellationRequested) return [];
             // Configured models follow only a catalog read now (unknown keeps them listed). Catalog-only models are listed
             // from this read, or the last one for the same base URL and token while this one fails (sent only once checked).
-            const used = new Map(providers.map(provider => [provider, catalog.get(provider) ?? knownGatewayModels(provider)]));
+            // Past that, a limited plan (Free) still lists the models it includes, from the last verified read (knownGatewayPlan).
+            const used = new Map(providers.map(provider => [provider, catalog.get(provider) ?? knownGatewayPlan(provider)]));
             const listed = providers.flatMap(provider => gatewayCatalogModels(provider, used.get(provider), models));
             // What the catalog-only rows came from: during an outage, the last catalog, so requests do not re-list each time.
             this.listedCatalogs = new Map(providers.map(provider => [provider, catalogSignature(used.get(provider))]));
@@ -445,13 +446,15 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 // account. Otherwise the named model serves it. Copilot 0.69 marks none of its own requests: the image's
                 // Machine settings pin its utility slots to Flash (worker/scripts/editor-state.sh).
                 const selected = resolved;
-                const plan = await gatewayModels(selected.provider, this.host.fetch ?? fetch, Date.now(), controller.signal) ?? knownGatewayModels(selected.provider);
+                const read = await gatewayModels(selected.provider, this.host.fetch ?? fetch, Date.now(), controller.signal) ?? knownGatewayModels(selected.provider);
+                // The plan's own model is the last verified one's only to decide with: a catalog-only row is sent only from a catalog.
+                const plan = read ?? knownGatewayPlan(selected.provider);
                 const sameAccount = (candidate: ResolvedModel) => candidate.provider.type === 'ezil-gateway' && candidate.providerName === selected.providerName;
                 if (selected.gatewayProtocol !== 'openai-responses' && modelIncluded(plan, QWEN)) {
                     resolved = this.configuredModels().find(candidate => sameAccount(candidate) && candidate.gatewayProtocol !== 'openai-responses' && candidate.model === QWEN) ?? resolved;
                 } else if (!modelIncluded(plan, selected.model)) {
                     const own = plan?.included?.[0];
-                    resolved = [...this.configuredModels(), ...gatewayCatalogModels(selected.provider, plan, this.configuredModels())]
+                    resolved = [...this.configuredModels(), ...gatewayCatalogModels(selected.provider, read, this.configuredModels())]
                         .find(candidate => sameAccount(candidate) && candidate.model === own) ?? resolved;
                 }
             }
@@ -479,7 +482,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 // Not in the account's OS plan (Free: Gemini 3.8 Flash only): refused here, so nothing is sent, held or
                 // charged. No billing dialog either: a saved pick, an agent's or subagent's model choice or a stale
                 // picker reaches this, and only a pick in the picker offers the upgrade (lockedModelChosen).
-                const plan = catalog ?? knownGatewayModels(resolved.provider);
+                const plan = catalog ?? knownGatewayPlan(resolved.provider);
                 if (!modelIncluded(plan, resolved.model)) {
                     throw new GatewayError(`EZiL AI: ${resolved.name} is not included in your plan. Nothing was sent or charged. Pick ${includedModelNames(plan)}, `
                         + 'or upgrade in Settings → Billing.', undefined, 'os_model_not_included', undefined, undefined, 'local');
@@ -620,13 +623,13 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         const alias = configured?.model ?? catalogId?.alias;
         if (!provider || provider.type !== 'ezil-gateway' || !alias) return 'ignored';
         const fresh = await gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), undefined, true);
-        if (modelIncluded(fresh ?? knownGatewayModels(provider), alias)) {
+        if (modelIncluded(fresh ?? knownGatewayPlan(provider), alias)) {
             this.refresh();
             return 'listed';
         }
         if (!await this.askBilling({ reason: 'model_locked', model: alias })) {
             const link = osBillingLink('upgrade=standard');
-            const name = configured?.name ?? (fresh ?? knownGatewayModels(provider))?.data.find(row => row.id === alias)?.name ?? alias;
+            const name = configured?.name ?? (fresh ?? knownGatewayPlan(provider))?.data.find(row => row.id === alias)?.name ?? alias;
             void Promise.resolve(vscode.window.showInformationMessage(`${name} is not included in your plan.`, ...link ? ['Upgrade'] : []))
                 .then(choice => { if (choice === 'Upgrade' && link) return vscode.env.openExternal(link); }).catch(() => {});
         }

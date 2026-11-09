@@ -288,10 +288,15 @@ auth context.
     it. One naming a model the plan does not include goes to the plan's own
     model on the same account. Copilot's own utility requests are already
     Flash requests: the image pins its utility slots to Flash.
-  - The locks come from the last catalog read. When reads fail for more than
-    30 minutes, nothing is locked and the configured default (Qwen) returns
-    to the picker. The proxy still refuses Qwen on Free, with nothing sent or
-    charged and no dialog.
+  - Availability follows the catalog (five minutes, listing-only for 30
+    more). The plan's limit does not: the last verified one, with the rows of
+    the models it includes, is kept for as long as the same sign-in cannot
+    re-read it. When reads fail for more than 30 minutes, Free keeps its locks
+    and Flash stays the default, and Qwen never returns. Nothing else is
+    listed or sent on it: Flash is still sent only after a read that succeeds
+    now ("could not load the model list ... Nothing was sent or charged").
+    Only a successful read that names no limit (a paid plan) or a reload
+    clears the memory. Another sign-in starts without it.
 - **Default model (every plan).** A new or unset chat starts on Gemini 3.8 Flash
   while it is listed and calls tools, whatever the Gateway's `default_model`
   says. Otherwise the Gateway's suggestion, then the configured default, is a

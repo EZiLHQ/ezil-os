@@ -18,8 +18,8 @@ const { frames, messageJson } = await import('./fixtures/gateway-response');
 const BASE = 'https://computer.test/ai/v1';
 const FLASH = 'gemini-3.8-flash', PRO = 'synthetic-pro';
 const REQUEST = '6f1d3a52-9b0e-4c1d-8a7b-2e5f4d3c2b1a';
-const load = (): ResolvedConfig => parseModelsConfig(readFileSync(`${import.meta.dir}/../../../worker/ezil-models/models.json`, 'utf8'),
-    { env: { EZIL_AI_BASE_URL: BASE, EZIL_AI_PROXY_TOKEN: 'synthetic-proxy-token' } });
+const load = (proxyToken: string): ResolvedConfig => parseModelsConfig(readFileSync(`${import.meta.dir}/../../../worker/ezil-models/models.json`, 'utf8'),
+    { env: { EZIL_AI_BASE_URL: BASE, EZIL_AI_PROXY_TOKEN: proxyToken } });
 
 type Row = Record<string, unknown>;
 const tools = { capabilities: { tool_calling: true, image_input: false, streaming: true } };
@@ -32,8 +32,9 @@ const free = (data = ROWS, header = FLASH) => () => Response.json(catalog(data),
 const paid = (data = ROWS) => () => Response.json(catalog(data));
 
 type Sent = { url: string; body: Record<string, unknown> };
-function gateway(models: () => Response, answer: (body: Record<string, unknown>) => Response = ok, ask: (intent: unknown) => Promise<boolean> = async () => true) {
-    const config = load();
+function gateway(models: () => Response, answer: (body: Record<string, unknown>) => Response = ok, ask: (intent: unknown) => Promise<boolean> = async () => true,
+    proxyToken = 'synthetic-proxy-token') {
+    const config = load(proxyToken);
     const posts: Sent[] = []; let gets = 0;
     const intents: unknown[] = []; const failures: AppFailure[] = [];
     const fetch = (async (input: string | URL | Request, init: RequestInit = {}) => {
@@ -310,5 +311,150 @@ describe('sendBillingIntent: what crosses into the workbench', () => {
             expect(await sendBillingIntent({ reason: 'credits_exhausted' })).toBe(false);
         }
         (fakeVscode.commands as Record<string, unknown>).executeCommand = async () => undefined;
+    });
+});
+
+// The plan's limit is not availability: it outlives the five-minute cache and the 30 minutes a failed read still lists
+// rows (CATALOG_STALE_MS), so a Free account keeps its locks and Flash default while /models cannot be read, and never
+// gets a model its plan refuses. The clock is the system clock; every response is a fixture.
+describe('the plan limit outlives the catalog', () => {
+    const MIN = 60_000;
+    type Mode = 'free' | 'paid' | 'down' | 'unreadable';
+    const account = (mode: Mode = 'free') => {
+        const state = { mode };
+        const models = () => state.mode === 'free' ? free()() : state.mode === 'paid' ? paid()()
+            : state.mode === 'unreadable' ? Response.json(catalog(ROWS), { headers: { [INCLUDED_MODELS_HEADER]: 'not an alias' } })
+            : new Response('', { status: 503 });
+        return { state, models };
+    };
+    const at = (start: number, minutes: number) => setSystemTime(new Date(start + minutes * MIN));
+    const sent = (g: ReturnType<typeof gateway>) => g.posts.map(post => post.body.model);
+
+    test('Free, 31 minutes on with the refresh failing: the locks and the Flash default stay, Qwen never returns', async () => {
+        const a = account(); const g = gateway(a.models); const start = Date.now();
+        try {
+            expect(defaults(await list(g.provider))).toEqual([`ezil/${FLASH}`]);
+            at(start, 10); a.state.mode = 'down';
+            expect(locked(await list(g.provider))).toEqual([QWEN, KIMI, `ezil/${PRO}`]);
+            at(start, 31);
+            const infos = await list(g.provider);
+            expect(infos.map(info => info.id)).toEqual([QWEN, KIMI, `ezil/${FLASH}`]);
+            expect(locked(infos)).toEqual([QWEN, KIMI]);
+            expect(defaults(infos)).toEqual([`ezil/${FLASH}`]);
+            expect(infos.find(info => info.id === `ezil/${FLASH}`)).toMatchObject({ isUserSelectable: true, isDefault: true });
+            at(start, 24 * 60);
+            expect(defaults(await list(g.provider))).toEqual([`ezil/${FLASH}`]);
+        } finally { setSystemTime(); }
+        expect(g.posts).toHaveLength(0);
+    });
+
+    test('a refusal or the panel forgetting the catalog (forgetGatewayModels(baseUrl)) keeps the limit; a reload clears it', async () => {
+        const a = account(); const g = gateway(a.models);
+        await list(g.provider);
+        a.state.mode = 'down';
+        forgetGatewayModels(BASE);
+        expect(locked(await list(g.provider))).toEqual([QWEN, KIMI]);
+        forgetGatewayModels();
+        expect(locked(await list(g.provider))).toEqual([]);
+    });
+
+    test('nothing is sent unchecked: past the expiry a locked model is refused here, a catalog-only Flash needs a read that succeeds now', async () => {
+        const a = account(); const g = gateway(a.models); const start = Date.now();
+        try {
+            await list(g.provider);
+            at(start, 31); a.state.mode = 'down';
+            await expect(send(g.provider, QWEN)).rejects.toThrow(/is not included in your plan/);
+            await expect(send(g.provider, KIMI)).rejects.toThrow(/is not included in your plan/);
+            // Titles and summaries do not slip to Qwen on the strength of a catalog nobody can read.
+            await expect(send(g.provider, QWEN, { requestInitiator: 'title' })).rejects.toThrow(/is not included in your plan/);
+            await expect(send(g.provider, `ezil/${FLASH}`)).rejects.toThrow(/Could not load the model list/);
+            a.state.mode = 'free';
+            await send(g.provider, `ezil/${FLASH}`);
+        } finally { setSystemTime(); }
+        expect(sent(g)).toEqual([FLASH]);
+        expect(g.intents).toEqual([]);
+    });
+
+    test('Flash unavailable at the last verified read: no default and no Flash row after the expiry, never another model', async () => {
+        const a = { mode: 'free' as Mode };
+        const g = gateway(() => a.mode === 'down' ? new Response('', { status: 503 })
+            : free([row(QWEN), row(KIMI), row(FLASH, 'unavailable'), row(PRO)])());
+        const start = Date.now();
+        try {
+            await list(g.provider);
+            at(start, 31); a.mode = 'down';
+            const infos = await list(g.provider);
+            expect(infos.map(info => info.id)).toEqual([QWEN, KIMI]);
+            expect(locked(infos)).toEqual([QWEN, KIMI]);
+            expect(defaults(infos)).toEqual([]);
+        } finally { setSystemTime(); }
+    });
+
+    test('a verified paid read (no header) clears the limit: nothing stays locked, and a saved paid choice is sent', async () => {
+        const a = account(); const g = gateway(a.models); const start = Date.now();
+        try {
+            await list(g.provider);
+            at(start, 31); a.state.mode = 'down';
+            expect(locked(await list(g.provider))).toEqual([QWEN, KIMI]);
+            at(start, 32); a.state.mode = 'paid';
+            const infos = await list(g.provider);
+            expect(locked(infos)).toEqual([]);
+            expect(defaults(infos)).toEqual([`ezil/${FLASH}`]);
+            await send(g.provider, QWEN);
+            // The paid plan is not taken back by the next outage.
+            at(start, 70); a.state.mode = 'down';
+            expect(locked(await list(g.provider))).toEqual([]);
+            await send(g.provider, KIMI);
+        } finally { setSystemTime(); }
+        expect(sent(g)).toEqual([QWEN, KIMI]);
+    });
+
+    test('a header that cannot be read is not a paid plan: the last verified limit stays; with none, nothing is inferred', async () => {
+        const a = account(); const g = gateway(a.models);
+        await list(g.provider);
+        a.state.mode = 'unreadable';
+        forgetGatewayModels(BASE);
+        expect(locked(await list(g.provider))).toEqual([QWEN, KIMI, `ezil/${PRO}`]);
+        forgetGatewayModels();
+        expect(locked(await list(g.provider))).toEqual([]);
+    });
+
+    test('the limit belongs to one sign-in: another token starts without it, and never inherits Free\'s locks', async () => {
+        const a = account(); const g = gateway(a.models); const start = Date.now();
+        try {
+            await list(g.provider);
+            at(start, 31); a.state.mode = 'down';
+            const other = gateway(a.models, ok, async () => true, 'synthetic-other-token');
+            const infos = await list(other.provider);
+            expect(locked(infos)).toEqual([]);
+            expect(infos.map(info => info.id)).toEqual([QWEN, KIMI]);
+            expect(locked(await list(g.provider))).toEqual([QWEN, KIMI]);
+        } finally { setSystemTime(); }
+    });
+
+    test('choosing a locked model with the limit remembered and the re-read failing asks the OS with model_locked only', async () => {
+        const a = account(); const g = gateway(a.models); const start = Date.now();
+        try {
+            await list(g.provider);
+            at(start, 31); a.state.mode = 'down';
+            const before = g.gets();
+            expect(await g.provider.lockedModelChosen(QWEN)).toBe('asked');
+            expect(g.gets()).toBe(before + 1);
+        } finally { setSystemTime(); }
+        expect(g.intents).toEqual([{ reason: 'model_locked', model: QWEN }]);
+        expect(g.posts).toHaveLength(0);
+    });
+
+    test('a request-time read that shows the plan changed re-lists the picker, though no row changed', async () => {
+        const a = account(); const g = gateway(a.models); const start = Date.now();
+        try {
+            await list(g.provider);
+            const changes = g.changes();
+            at(start, 6); a.state.mode = 'paid';
+            await send(g.provider, `ezil/${FLASH}`);
+            g.provider.refreshIfCatalogChanged(); // as extension.ts requestFinished wires it
+            expect(g.changes()).toBeGreaterThan(changes);
+            expect(locked(await list(g.provider))).toEqual([]);
+        } finally { setSystemTime(); }
     });
 });

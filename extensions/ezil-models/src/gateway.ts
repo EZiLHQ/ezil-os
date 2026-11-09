@@ -92,14 +92,26 @@ function providerIdentity(provider: ResolvedProvider): string {
 }
 
 const modelsCache = new Map<string, { baseUrl: ResolvedProvider['baseUrl']; at: number; models: GatewayModels }>();
+/**
+ * Per base URL + token: the plan's limit at the last verified read, with only the rows of the models it includes. Unlike
+ * the catalog it does not expire: a limit that can no longer be re-read stays in force, so a Free account keeps its locks
+ * and its default (Flash) and is never offered one its plan refuses. Those rows list the included models only and are
+ * never what a request is checked against (a catalog-only model is still sent only after a read that succeeds now).
+ * Cleared only by a verified read of a plan with no limit (a 200 catalog without the header: a paid transition) and by
+ * a reload.
+ */
+const accessHints = new Map<string, GatewayModels>();
 
 /** Refusals that mean the catalog this client listed is out of date (contract §4 freshness): read it again, and re-list. */
 export const CATALOG_REFUSALS: readonly string[] = ['killswitch', 'model_disabled', 'model_not_found', 'no_provider_route', 'model_unavailable',
     'no_entitlement', 'model_not_allowed', 'os_model_not_included'];
 
-/** Clear the `/v1/models` cache after availability/limit refusals, and in tests. */
+/**
+ * Clear the `/v1/models` cache after availability/limit refusals, and in tests. A refusal or a panel opening never
+ * forgets the plan limit (`accessHints`): only a reload (no argument) does.
+ */
 export function forgetGatewayModels(baseUrl?: string): void {
-    if (baseUrl === undefined) modelsCache.clear();
+    if (baseUrl === undefined) { modelsCache.clear(); accessHints.clear(); }
     else for (const [key, cached] of modelsCache) if (cached.baseUrl === baseUrl) modelsCache.delete(key);
 }
 
@@ -353,8 +365,16 @@ export async function gatewayModels(provider: ResolvedProvider, doFetch: typeof 
     try {
         const { status, json, headers } = await getJson(provider, '/models', doFetch, signal);
         const models = status === 200 ? parseGatewayModels(json) : undefined;
-        const included = parseIncludedModels(headers.get(INCLUDED_MODELS_HEADER));
-        if (models && included) models.included = included;
+        const header = headers.get(INCLUDED_MODELS_HEADER);
+        const included = parseIncludedModels(header);
+        if (models && included) {
+            models.included = included;
+            accessHints.set(key, { killswitch: models.killswitch, pause: models.pause, data: models.data.filter(row => included.includes(row.id)), included });
+        }
+        // No header on a verified catalog: the proxy names no limit (a paid plan). A header that cannot be read is not
+        // that: the last verified limit stays in force.
+        else if (models && header === null) accessHints.delete(key);
+        else if (models && accessHints.has(key)) models.included = accessHints.get(key)!.included;
         if (models) modelsCache.set(key, { baseUrl: provider.baseUrl, at: now, models });
         return models;
     } catch {
@@ -374,6 +394,17 @@ export const CATALOG_STALE_MS = 30 * 60_000;
 export function knownGatewayModels(provider: ResolvedProvider, now: number = Date.now()): GatewayModels | undefined {
     const cached = modelsCache.get(providerIdentity(provider));
     return cached && now - cached.at < CATALOG_STALE_MS ? cached.models : undefined;
+}
+
+/**
+ * What the account's plan is known to include: the catalog `knownGatewayModels` still holds, else the last verified
+ * limit with the rows of the models it includes (`accessHints`). The picker's list, its locks and its default read this;
+ * a request's availability check never does.
+ */
+export function knownGatewayPlan(provider: ResolvedProvider, now: number = Date.now()): GatewayModels | undefined {
+    const known = knownGatewayModels(provider, now);
+    if (known) return known;
+    return accessHints.get(providerIdentity(provider));
 }
 
 export async function gatewayBalance(provider: ResolvedProvider, doFetch: typeof fetch, signal?: AbortSignal): Promise<GatewayBalance | undefined> {
