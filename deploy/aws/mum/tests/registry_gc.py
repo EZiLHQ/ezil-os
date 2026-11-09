@@ -1307,11 +1307,80 @@ class HistoricalAttestationTests(unittest.TestCase):
                                               'previousLowerImageDigest': self.records[1]['lowerImageDigest']}})
         return {'executionArn': 'arn:test:j', 'status': status, 'input': json.dumps({'document': document})}
 
+    def r1_execution(self, status='FAILED', extra_events=(), incomplete=False):
+        # A terminal execution that links the candidate only by its lower digest, with a complete
+        # proof bundle (describe + history) that execution_proof accepts. extra_events are spliced
+        # before the terminal event so a test can hide a token or a resource inside the history;
+        # incomplete marks the history truncated. The bundle is bound by E1 as built, so a test
+        # must pass the defect here (not mutate after) to reach the execution_proof check.
+        cand, keep = self.records[1], self.records[-1]
+        document = json.dumps({'deployment': {'amiId': keep['amiId'],
+                                              'previousLowerImageDigest': cand['lowerImageDigest']}})
+        inp = json.dumps({'document': document})
+        version = keep['stateMachineVersionArn']
+        arn = f'arn:aws:states:{gc.tool.REGION}:{gc.tool.ACCOUNT}:execution:test:r1exec'
+        d = {'executionArn': arn, 'status': status, 'stateMachineVersionArn': version,
+             'input': inp, 'inputDetails': {'included': True},
+             'startDate': '2026-10-24T18:00:00Z', 'stopDate': '2026-10-24T18:01:00Z'}
+        events = [{'id': 1, 'type': 'ExecutionStarted', 'timestamp': d['startDate'],
+                   'executionStartedEventDetails': {'input': inp, 'stateMachineVersionArn': version}}]
+        events += [dict(e) for e in extra_events]
+        events.append({'id': 0, 'type': gc.TERMINAL[status], 'timestamp': d['stopDate']})
+        for index, event in enumerate(events, 1):
+            event['id'] = index
+        h = {'events': events}
+        if incomplete:
+            h['nextToken'] = 'more'
+        self.evidence['proof'].setdefault('cloudTrail', [])
+        self.evidence['proof'].setdefault('executions', {})[arn] = {'describe': d, 'history': h}
+        self.rows('executions', [d])
+        return d, h, arn
+
     def test_r1_terminal_execution_digest_only_is_exempt(self):
-        row = self.execution_row('SUCCEEDED')
-        self.assertTrue(gc.r1_allowlisted('executions', row, self.records[1]))
-        self.rows('executions', [row])
+        d, h, arn = self.r1_execution()
+        self.assertTrue(gc.r1_allowlisted('executions', d, self.records[1]))
+        self.assertTrue(gc.r1_execution_history_clean(self.evidence, self.snapshot, d, self.records[1]))
         self.assertEqual(len(self.prepare()['releases']), 7)
+
+    def test_r1_execution_history_guards(self):
+        # Finding(1): the separately-stored history is held to the describe's bar. A candidate
+        # non-digest token, a resource the describe's R1 check never sees, or a broken/forged
+        # history each costs the row its exemption (it then needs an ordinary attestation).
+        cand = self.records[1]
+        token_event = {'type': 'TaskStateExited', 'timestamp': '2026-10-24T18:00:30Z',
+                       'stateExitedEventDetails': {'name': 'done', 'output': cand['amiId'] + ' provisioned'}}
+        smuggled = 'i-0ddddddddddddddd0'
+        resource_event = {'type': 'TaskStateExited', 'timestamp': '2026-10-24T18:00:30Z',
+                          'stateExitedEventDetails': {'name': 'launch', 'output': 'started ' + smuggled}}
+        for case in ('candidate-token', 'smuggled-resource', 'incomplete-history', 'describe-mismatch'):
+            with self.subTest(case=case):
+                self.setUp()
+                if case == 'candidate-token':
+                    d, h, arn = self.r1_execution(extra_events=[token_event])
+                    self.assertTrue(gc.references(h, cand))
+                    self.assertFalse(gc.references_only_lower(h, cand))
+                elif case == 'smuggled-resource':
+                    d, h, arn = self.r1_execution(extra_events=[resource_event])
+                    self.assertIn(smuggled, gc.resource_ids([d, h]))
+                elif case == 'incomplete-history':
+                    d, h, arn = self.r1_execution(incomplete=True)
+                else:  # the proof bundle's describe is not the row being exempted
+                    d, h, arn = self.r1_execution()
+                    self.evidence['proof']['executions'][arn]['describe'] = dict(d, surplus='x')
+                    self.rows('executions', [d])
+                self.assertTrue(gc.r1_allowlisted('executions', d, cand))
+                self.assertFalse(gc.r1_execution_history_clean(self.evidence, self.snapshot, d, cand))
+                self.refuse('referenced record')
+
+    def test_resource_ids_finds_control_char_prefixed_id(self):
+        # canonical() escapes a newline to \n, whose 'n' fools the id regex's lookbehind; the raw
+        # per-string scan still sees an id that starts a line of a multi-line last_error.
+        vol = 'vol-0123456789abcdef0'
+        for prefix in ('attach failed\n', 'retry\t', 'line\r'):
+            with self.subTest(prefix=repr(prefix)):
+                self.assertEqual(gc.resource_ids({'last_error': prefix + vol}), {vol})
+                nested = json.dumps({'last_error': prefix + vol})
+                self.assertEqual(gc.resource_ids({'detail': nested}), {vol})
 
     def test_r1_non_terminal_execution_not_exempt(self):
         # A digest-only execution is exempt only if terminal; a RUNNING one must be refused (N1).
@@ -1445,6 +1514,15 @@ class HistoricalAttestationTests(unittest.TestCase):
                 self.a['resources'][self.instance]['inventorySha256'] = gc.sha(gc.inventory(self.evidence))
                 self.refuse('conflicting claimant')
 
+    def test_r2_control_char_prefixed_claimant_refused(self):
+        # A claimant that names the volume at the start of a line of a multi-line last_error must
+        # still refuse. canonical() escapes the newline to \n, so the id regex over the serialised
+        # text is blind to it; the raw per-string scan in resource_ids is not.
+        self.r2_apply([self.r2_volume()], [self.r2_owner()])
+        self.rows('imageJobs', [{'id': 'x1', 'phase': 'succeeded', 'last_error': 'attach failed\n' + self.VOLUME}])
+        self.a['resources'][self.instance]['inventorySha256'] = gc.sha(gc.inventory(self.evidence))
+        self.refuse('conflicting claimant')
+
     def test_r2_released_pool_owner_with_open_usage_refused(self):
         # N1: a pool-mode STOP never closes the usage row (placement.ts), so a released-pool owner
         # with an open usage row cannot pass R2; the real owner (4e8347ca) has its usage closed.
@@ -1571,6 +1649,70 @@ class HistoricalAttestationTests(unittest.TestCase):
         self.assertEqual(len(result['attestations']), 1)
         self.assertEqual(result['attestations'][0]['resources'][volume], {'disposition': 'retained-data-volume'})
         gc.check_evidence(result, self.snapshot, self.plan_sha, self.records[1], self.now, None, SYSTEM_ID)
+
+    def test_collector_refuses_shared_lower_execution_with_dirty_history(self):
+        # Finding(1): a digest-only execution whose separately-stored history carries the candidate
+        # AMI is NOT R1-exempt; the collector puts it on the ordinary path (here unresolved as a
+        # digest-only reference) instead of silently skipping it on the describe alone.
+        self.fixture(pool=False)
+        cand, keep = self.records[1], self.records[-1]
+        document = json.dumps({'deployment': {'amiId': keep['amiId'], 'previousLowerImageDigest': cand['lowerImageDigest']}})
+        inp = json.dumps({'document': document})
+        version = keep['stateMachineVersionArn']
+        self.d = {'executionArn': self.arn, 'status': 'FAILED', 'stateMachineArn': version.rsplit(':', 1)[0],
+                  'name': 'dirty', 'stateMachineVersionArn': version, 'input': inp, 'inputDetails': {'included': True},
+                  'startDate': '2026-10-24T18:00:00Z', 'stopDate': '2026-10-24T18:01:00Z'}
+        self.h = {'events': [
+            {'id': 1, 'type': 'ExecutionStarted', 'timestamp': self.d['startDate'],
+             'executionStartedEventDetails': {'input': inp, 'stateMachineVersionArn': version}},
+            {'id': 2, 'type': 'TaskStateExited', 'timestamp': '2026-10-24T18:00:30Z',
+             'stateExitedEventDetails': {'name': 'x', 'output': cand['amiId'] + ' provisioned'}},
+            {'id': 3, 'type': 'ExecutionFailed', 'timestamp': self.d['stopDate']}]}
+        self.evidence['proof']['executions'] = {self.arn: {'describe': self.d, 'history': self.h}}
+        self.assertTrue(gc.r1_allowlisted('executions', self.d, cand))
+        with patch.dict(sys.modules, {'registry_gc': gc}):
+            spec = importlib.util.spec_from_file_location('collector_r1x', HERE.parent / 'registry_gc_evidence.py')
+            collector = importlib.util.module_from_spec(spec); spec.loader.exec_module(collector)
+        directory = self.root / 'export-r1x'
+        directory.mkdir()
+        def write(name, value):
+            (directory / name).write_text(json.dumps(value))
+        write('db-evidence.json', {'meta': {'captured_at': self.evidence['capturedAt'], 'system_identifier': SYSTEM_ID},
+              'placements': [], 'image_jobs': [], 'pool_hosts': [], 'writer_leases': [], 'migrations': [], 'usage': []})
+        write('registry-snapshot.json', self.records)
+        write('ec2-instances.json', {'Reservations': []})
+        write('ec2-volumes.json', {'Volumes': []})
+        write('ec2-snapshots.json', {'Snapshots': []})
+        write('sfn-lifecycle.json', {'executions': [{k: v for k, v in self.d.items() if k not in ('redriveStatus', 'redriveStatusReason')}]})
+        (directory / 'exec1').mkdir()
+        self.d['redriveStatus'] = 'NOT_REDRIVABLE'
+        self.d['redriveStatusReason'] = 'Execution is FAILED'
+        write('exec1/test.describe.json', self.d)
+        write('exec1/test.history.json', self.h)
+        write('cloudtrail.json', {'Records': []})
+        self.sync()
+        context = {k: self.evidence[k] for k in ('planSha256', 'secretVersionId', 'quiescence')}
+        context['inventoryCapturedAt'] = self.evidence['proof']['inventoryCapturedAt']
+        context['fenceActivatedAt'] = self.evidence['proof']['fenceActivatedAt']
+        context['originalPlanJson'] = self.path.read_text()
+        context['sources'] = {k: self.evidence['sources'][k] for k in ('runtimeConfigs', 'releasePlans')}
+        expected = copy.deepcopy(self.evidence)
+        queries = {'placements': 'db-evidence.json:placements', 'imageJobs': 'db-evidence.json:image_jobs',
+                   'poolHosts': 'db-evidence.json:pool_hosts', 'writerLeases': 'db-evidence.json:writer_leases',
+                   'providerMigrations': 'db-evidence.json:migrations', 'executions': 'sfn-*.json + exec*/*.describe.json'}
+        for name in ('instances', 'volumes', 'snapshots'):
+            queries[name] = 'ec2-' + name + '.json (all account resources)'
+        for name, query in queries.items(): expected['sources'][name]['query'] = query
+        files = {str(p.relative_to(directory)): gc.hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in directory.rglob('*.json') if 'E1' not in p.relative_to(directory).parts}
+        synthetic_e1(expected, self.path.read_text(), files)
+        (directory / 'E1').mkdir(exist_ok=True)
+        write('E1/collection-receipts.json', expected['proof']['collectionReceipts'])
+        with patch.object(collector, 'datetime') as clock:
+            clock.now.return_value = self.now
+            result = collector.collect(directory, cand['recipeVersion'], context)
+        self.assertEqual(result['collection']['sharedLowerExempt'], 0)
+        self.assertEqual([u['source'] for u in result['collection']['unresolved']], ['executions'])
 
     def test_r2_forged_disposition_fields_rejected(self):
         # Even with a valid volume, extra/forged disposition fields are rejected (N7); no

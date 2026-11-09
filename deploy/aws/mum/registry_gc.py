@@ -283,8 +283,35 @@ CLAIMS = ('leased_at', 'lease_token', 'leased_computer_id', 'leased_generation',
 
 def resource_ids(value):
     import re
-    return set(re.findall(r'(?<![A-Za-z0-9-])(?:i|vol)-[0-9a-f]{8,17}(?![0-9a-f])',
-                          canonical(value).decode()))
+    pattern = re.compile(r'(?<![A-Za-z0-9-])(?:i|vol)-[0-9a-f]{8,17}(?![0-9a-f])')
+    found = set(pattern.findall(canonical(value).decode()))
+    found |= raw_resource_ids(value, pattern)
+    return found
+
+
+def raw_resource_ids(value, pattern):
+    """Scan every raw string (and dict key) at every embedded-JSON layer BEFORE serialising.
+    canonical() escapes control characters (a newline becomes the two chars \\n), which lets the id
+    regex's lookbehind see a letter and miss an id that begins a line of a multi-line last_error or
+    log string -- so a conflicting vol-/i- claimant, or a resource named in an execution event,
+    could go unseen. The raw scan has no such blind spot and still descends into embedded documents
+    exactly as references()/decode_embedded parse them (from the first '{'/'[')."""
+    found = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found |= set(pattern.findall(key)) | raw_resource_ids(item, pattern)
+    elif isinstance(value, list):
+        for item in value:
+            found |= raw_resource_ids(item, pattern)
+    elif isinstance(value, str):
+        found |= set(pattern.findall(value))
+        start = min((value.find(c) for c in '{[' if c in value), default=-1)
+        if start >= 0:
+            try:
+                found |= raw_resource_ids(manifest.loads(value[start:]), pattern)
+            except (ValueError, TypeError):
+                pass
+    return found
 
 
 def decoded(value):
@@ -424,14 +451,84 @@ def retained_data_volume(evidence, snapshot, candidate, resource, disposition):
     # Allowlist, not denylist: the app's placement enum has many live states (placement.ts), so
     # only an explicitly STOPPED owner qualifies.
     need(owner.get('state') == 'STOPPED', 'GC retained-data-volume owner placement is not STOPPED')
-    # Scan ids from both the raw row (keeping prefix matches) and the recursively decoded embedded
-    # JSON, so a volume named only inside a document (and an escaped id) is still a claimant.
+    # resource_ids scans every raw string at every embedded-JSON layer, so a volume named only
+    # inside a document, behind an escaped prefix, or at the start of a line in a last_error (where
+    # canonical()'s \n escape would hide it) is still seen as a claimant.
     claimants = [r for src in ('placements', 'poolHosts', 'imageJobs') for r in evidence['sources'][src]['rows']
-                 if r is not owner and resource in (resource_ids(r) | resource_ids(decode_embedded(r)))]
+                 if r is not owner and resource in resource_ids(r)]
     need(not claimants, 'GC retained-data-volume has a conflicting claimant')
     captured = time_value(evidence['capturedAt'])
     need(not any(u.get('computer_id') == owner['computer_id'] and not closed_usage_row(u, captured)
                  for u in evidence['proof']['usage']), 'GC retained-data-volume owner has an open usage row')
+
+
+def absence(evidence, instance):
+    """Build the absence disposition for a terminated instance: exactly one raw CloudTrail
+    TerminateInstances event must name it. This only selects the event; absent_instance does the
+    full validation (the live-join refusal and event authenticity). Shared by the collector's
+    pool-host attestation and resolve_resource so both build absence the same way."""
+    events = [e for e in evidence['proof']['cloudTrail']
+              if e.get('eventName') == 'TerminateInstances' and instance in resource_ids(e)]
+    need(len(events) == 1, 'GC missing or ambiguous raw CloudTrail TerminateInstances event')
+    event = events[0]
+    return {'inventorySha256': sha(inventory(evidence)),
+            'inventoryCapturedAt': evidence['proof']['inventoryCapturedAt'],
+            'terminationEventId': event['eventID'], 'terminationEventTime': event['eventTime'],
+            'terminationEventSha256': sha(event)}
+
+
+def resolve_resource(evidence, snapshot, candidate, resource):
+    """Resolve one resource named by a candidate-referencing terminal execution the single way the
+    execution_terminal disposition does: a kept record's live resource (kept_resource), an R2
+    retained data volume (retained_data_volume), or a terminated instance absent from the live
+    inventory (absent_instance over a raw TerminateInstances event). Returns the disposition and
+    raises ValueError when the resource resolves to none of these. Shared by the collector's
+    attestation builder and the R1 execution-history check so both resolve identically."""
+    for record in snapshot['deployment']['releases']:
+        if record == candidate:
+            continue
+        value = {'disposition': 'kept-record', 'record': identity(record)}
+        try:
+            kept_resource(evidence, snapshot, candidate, resource, value)
+            return value
+        except (ValueError, KeyError, TypeError):
+            pass
+    if resource.startswith('vol-'):
+        value = {'disposition': 'retained-data-volume'}
+        try:
+            retained_data_volume(evidence, snapshot, candidate, resource, value)
+            return value
+        except (ValueError, KeyError, TypeError):
+            pass
+    value = {'disposition': 'attested', **absence(evidence, resource)}
+    absent_instance(evidence, resource, value)
+    return value
+
+
+def r1_execution_history_clean(evidence, snapshot, row, candidate):
+    """R1 exempts an execution on its describe row, but the execution history is a second document
+    kept separately in the proof and never seen by r1_allowlisted. Hold the history to the same bar:
+    it must be the complete, terminal history bound to THIS describe (execution_proof), it must link
+    the candidate only through the shared lower at every decoding layer (references_only_lower -- a
+    candidate AMI/ARN/version hidden in an event is refused), and every resource named in the
+    describe or the history must resolve the way execution_terminal resolves it (resolve_resource).
+    A history that carries an unresolved or candidate-dependent resource keeps the row on the
+    ordinary execution_terminal path. Fails closed on any missing/forged proof."""
+    arn = row.get('executionArn') if isinstance(row, dict) else None
+    if not arn:
+        return False
+    try:
+        bundle = evidence['proof']['executions'][arn]
+        describe, history = execution_proof(evidence, arn, sha(bundle['describe']), sha(bundle['history']))
+        if describe != row:
+            return False
+        if references(history, candidate) and not references_only_lower(history, candidate):
+            return False
+        for resource in resource_ids([row, history]):
+            resolve_resource(evidence, snapshot, candidate, resource)
+        return True
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return False
 
 
 def validate_attestation(a, row, evidence, snapshot, candidate):
@@ -508,7 +605,8 @@ def check_attestations(evidence, snapshot, candidate, views=None):
     # resolver select the candidate by observed AMI, so the alias is not substitutable.
     exempt = set()
     if shared_lower_kept(snapshot, candidate):
-        shared = [(name, row) for name, row in refs if r1_allowlisted(name, view(name, row), candidate)]
+        shared = [(name, row) for name, row in refs if r1_allowlisted(name, view(name, row), candidate)
+                  and (name != 'executions' or r1_execution_history_clean(evidence, snapshot, view(name, row), candidate))]
         if shared:
             need(not candidate_ami_observable(evidence, candidate),
                  'GC shared-lower alias observable on live candidate-AMI instance')

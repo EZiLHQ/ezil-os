@@ -102,14 +102,25 @@ wiring = [
      'return True  # open or unparsable usage row is a live join', commands['registry_gc.py']),
     ('registry_gc.py', 'return parsed <= captured', 'return True', commands['registry_gc.py']),
     # R1 string-prefix gap, terminal gating, spare attestation, stopped-instance (review fixes).
-    ('registry_gc.py', 'return not any(token in blob for token in tokens)', 'return True', commands['registry_gc.py']),
+    ('registry_gc.py', 'return not non_digest_token_present(value, tokens)', 'return True', commands['registry_gc.py']),
     ('registry_gc.py', "row.get('status') in TERMINAL", 'True', commands['registry_gc.py']),
     ('registry_gc.py', "row.get('phase') in TERMINAL_IMAGE_JOB_PHASES", 'True', commands['registry_gc.py']),
     ('registry_gc.py', 'for n, r in required if n == a', 'for n, r in refs if n == a', commands['registry_gc.py']),
     ('registry_gc.py', ".get('Name') != 'terminated'", ".get('Name') == 'running'", commands['registry_gc.py']),
     # Layered non-digest token scan + decoded claimant scan (review fixes).
     ('registry_gc.py', 'return non_digest_token_present(manifest.loads(value[start:]), tokens)', 'return False', commands['registry_gc.py']),
-    ('registry_gc.py', 'resource in (resource_ids(r) | resource_ids(decode_embedded(r)))', 'resource in resource_ids(r)', commands['registry_gc.py']),
+    # Control-char-safe resource id scan (finding 2): dropping the raw per-string walk reverts to a
+    # canonical-only scan blind to an id after a \n/\t, so a claimant (and the primitive test) kills it.
+    ('registry_gc.py', '    found |= raw_resource_ids(value, pattern)', '    pass  # control-char scan dropped', commands['registry_gc.py']),
+    # R1 execution-history check (finding 1): every new guard and both call sites dropped on their own
+    # must be killed. The checker call is exercised by HistoricalAttestationTests via prepare(); the
+    # collector call by the dirty-history collector test.
+    ('registry_gc.py', "and (name != 'executions' or r1_execution_history_clean(evidence, snapshot, view(name, row), candidate))", 'and True', commands['registry_gc.py']),
+    ('registry_gc_evidence.py', "and (name != 'executions' or gc.r1_execution_history_clean(evidence, snapshot, row, candidate))", 'and True', commands['registry_gc.py']),
+    ('registry_gc.py', "        describe, history = execution_proof(evidence, arn, sha(bundle['describe']), sha(bundle['history']))", "        describe, history = bundle['describe'], bundle['history']", commands['registry_gc.py']),
+    ('registry_gc.py', 'if describe != row:', 'if False:', commands['registry_gc.py']),
+    ('registry_gc.py', 'if references(history, candidate) and not references_only_lower(history, candidate):', 'if False:', commands['registry_gc.py']),
+    ('registry_gc.py', 'for resource in resource_ids([row, history]):', 'for resource in []:', commands['registry_gc.py']),
 ]
 for filename, before, after, command in wiring:
     path = HERE.parent / filename

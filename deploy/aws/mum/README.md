@@ -508,7 +508,15 @@ prefix before embedded JSON is refused while a short `recipeVersion` in a prefix
 block. If a lower-only row is not exempt it keeps its ordinary attestation/binding, and
 the whole GC is refused when the candidate AMI is observably live. R1's soundness rests on
 the app's `resolveRebaseReleases` semantics above: a lower-only link resolves identically
-against any retained alias with the same lower. Rule R2 gives an execution's retained data
+against any retained alias with the same lower. For an `executions` row, R1 additionally holds
+the separately-stored execution history to the describe's bar: the history must be the complete,
+terminal history bound to that describe (`execution_proof`), must link the candidate only through
+the shared lower at every decoding layer, and every resource named in the describe or the history
+must resolve the way `execution_terminal` would — a kept record's resource, an R2 retained data
+volume, or a terminated instance absent from the live inventory. A history that carries a candidate
+AMI/ARN or a resource that does not resolve keeps the row on the ordinary attestation path. Resource
+disposition and absence selection are one `resolve_resource`/`absence` shared by the collector and
+this check, so both resolve identically. Rule R2 gives an execution's retained data
 volume a `retained-data-volume` disposition only when the volume is a complete, typed,
 unattached (`SnapshotId == ''`, `Attachments == []`), available data volume with
 non-duplicate tags whose `ezil:computer-id` is its owner, owned by exactly one placement
@@ -517,7 +525,11 @@ states), whose exact lower column equals the candidate lower and resolves as a s
 computer (kept-alias rule), is the sole claimant across placements, pool hosts and image
 jobs, and has no open usage row — validated against inventory as strictly as every other
 disposition. A released-pool STOP never closes its usage row, so a released-pool owner
-with an open usage row cannot pass R2 (the real owner's usage is closed). `begin_operation`'s
+with an open usage row cannot pass R2 (the real owner's usage is closed). Every resource-id scan
+(`resource_ids`) reads each raw string at every embedded-JSON layer, not only the serialized
+`canonical` form: `canonical` escapes a control character (a newline becomes `\n`), which would let
+the id regex's lookbehind miss an `i-`/`vol-` that starts a line of a multi-line `last_error`, so a
+conflicting claimant or an execution resource named after a newline is still seen. `begin_operation`'s
 registry-gc app pin is structural — the plan app tag is the first twelve hex of its app
 gitSha and the live gitSha equals the plan's — so it no longer pins a specific reviewed app
 build and GC runs under later plans.
