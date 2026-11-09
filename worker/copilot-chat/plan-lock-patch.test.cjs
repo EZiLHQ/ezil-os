@@ -14,8 +14,9 @@ const files = ['extensions/copilot/dist/extension.js', 'extensions/copilot/packa
     'out/vs/code/browser/workbench/workbench.css', 'out/server-main.js'];
 const anchors = {
     'billing-intent': 'getCommands(){let s=new Map;for(let o of this._commands.keys()){let e=this.getCommand(o);e&&s.set(o,e)}return s}};',
-    'picker-locked-list': 'u=this._delegate.getModels(),p=this._delegate.getPresentationOptions()',
-    'picker-locked-refresh': 'this._tabbedPicker.value?.refresh(this._delegate.getModels())',
+    'picker-locked-list': 'let D=!1,M=Bhn({models:u,',
+    'picker-locked-pin': 'makePinAction:n=>s.actions.onTogglePin?Lhn(n.identifier,s.pinnedModelIds.includes(n.identifier),s.actions.onTogglePin):void 0',
+    'picker-locked-configure': ',l=(ee,ae,he)=>{c(ee),this._actionWidgetService.hide(),this._configuration.show(',
     'picker-locked-select': 'c=ee=>{a.logModelChange(this._selectedModel,ee,this._delegate.getChatSessionId?.()),this._selectedModel=ee,this._renderLabel(),this._onDidChangeSelection.fire(ee)}',
 };
 const count = (s, needle) => s.split(needle).length - 1;
@@ -41,7 +42,7 @@ test('plan locks: pinned anchors, apply, verify, idempotence and the actual patc
             const result = run(...args); assert.equal(result.status, 0, result.stdout + result.stderr);
             assert.ok(result.stdout.includes('gate ok [billing-intent] workbench.js x1'));
             assert.ok(result.stdout.includes('gate ok [billing-intent-command] workbench.js x1'));
-            for (const id of ['picker-locked-list', 'picker-locked-refresh', 'picker-locked-select']) {
+            for (const id of ['picker-locked-list', 'picker-locked-pin', 'picker-locked-select', 'picker-locked-configure']) {
                 assert.ok(result.stdout.includes(`gate ok [${id}] workbench.js x0`), id);
                 assert.ok(result.stdout.includes(`gate ok [${id}] workbench.js x1`), id);
             }
@@ -50,7 +51,10 @@ test('plan locks: pinned anchors, apply, verify, idempotence and the actual patc
         const again = run(root); assert.equal(again.status, 0, again.stdout + again.stderr);
         files.forEach((file, i) => assert.deepEqual(fs.readFileSync(path.join(root, file)), before[i], file));
         const code = fs.readFileSync(path.join(root, wb), 'utf8');
-        for (const id of ['picker-locked-list', 'picker-locked-refresh', 'picker-locked-select']) assert.equal(count(code, anchors[id]), 0, id);
+        for (const id of ['picker-locked-list', 'picker-locked-pin', 'picker-locked-select', 'picker-locked-configure']) assert.equal(count(code, anchors[id]), 0, id);
+        // The tabbed picker and every other reader of the picker's model list are unchanged.
+        assert.equal(count(code, 'u=this._delegate.getModels(),p=this._delegate.getPresentationOptions()'), 1);
+        assert.equal(count(code, 'this._tabbedPicker.value?.refresh(this._delegate.getModels())'), 1);
         assert.equal(count(code, 'qe.registerCommand("_ezil.billingIntent",'), 1);
         // The app-failure registration right after the insertion is untouched (its re-run detection depends on it).
         assert.equal(count(code, 'qe.registerCommand("noop",()=>{});function ezilDispatchAppFailure(record){'), 1);
@@ -104,7 +108,7 @@ test('plan locks: pinned anchors, apply, verify, idempotence and the actual patc
             getLanguageModelIds: () => Object.keys(models), lookupLanguageModel: id => models[id], isModelHidden: id => hidden.includes(id),
         });
         await t.test('picker list: plan-locked rows are added once, after the picker\'s own rows; nothing else changes', () => {
-            const flash = { identifier: 'ezil/ezil/gemini-3.8-flash', metadata: { id: 'ezil/gemini-3.8-flash', isUserSelectable: true } };
+            const flash = { identifier: 'ezil/ezil/gemini-3.8-flash', metadata: { id: 'ezil/gemini-3.8-flash', vendor: 'ezil', isUserSelectable: true } };
             const models = {
                 'ezil/ezil/gemini-3.8-flash': flash.metadata,
                 'ezil/qwen.qwen3-coder-next': locked('qwen.qwen3-coder-next'),
@@ -113,6 +117,7 @@ test('plan locks: pinned anchors, apply, verify, idempotence and the actual patc
                 'other/not-selectable': { id: 'not-selectable', isUserSelectable: false },
                 'other/info-only': { id: 'info-only', isUserSelectable: true, infoText: { ezilPlanLocked: LOCK_TEXT } },
                 'other/remote-session': locked('remote', { targetChatSessionType: 'cloud' }),
+                'other/foreign-vendor': locked('foreign', { vendor: 'other' }),
                 'other/other-info': { id: 'x', isUserSelectable: false, infoText: { other: 'text' } },
             };
             const listed = sandbox.ezilPickerModels(service(models, ['ezil/hidden']), [flash]);
@@ -126,6 +131,11 @@ test('plan locks: pinned anchors, apply, verify, idempotence and the actual patc
             assert.equal(sandbox.ezilPickerModels(service({ 'ezil/ezil/gemini-3.8-flash': flash.metadata }), plain), plain);
             // A service that fails leaves the picker exactly as it was.
             assert.equal(sandbox.ezilPickerModels({ getLanguageModelIds: () => { throw new Error('x'); } }, plain), plain);
+            // Only for a vendor the picker already lists: an empty picker (session models still loading, another
+            // session type's pool, a mode or location without this vendor) gets no locked rows either.
+            assert.equal(sandbox.ezilPickerModels(service(models), []).length, 0);
+            const otherPool = [{ identifier: 'other/pool', metadata: { id: 'pool', vendor: 'other', isUserSelectable: true } }];
+            assert.deepEqual(sandbox.ezilPickerModels(service(models), otherPool).map(m => m.identifier), ['other/pool', 'other/foreign-vendor']);
             assert.equal(sandbox.ezilPlanLocked({ metadata: locked('q') }), true);
             for (const model of [undefined, {}, { metadata: { isUserSelectable: false } }, { metadata: { ...locked('q'), isUserSelectable: true } },
                 { metadata: { ...locked('q'), infoText: { ezilPlanLocked: 1 } } }, { metadata: locked('q', { targetChatSessionType: 'x' }) }]) {
@@ -159,10 +169,34 @@ test('plan locks: pinned anchors, apply, verify, idempotence and the actual patc
             assert.equal(widget._selectedModel, kimi); assert.deepEqual(fired, [kimi]); assert.equal(logged.length, 1); assert.deepEqual(calls, ['render']);
         });
 
+        await t.test('pin: a locked row offers no pin unless already pinned; configure stops at a locked row', () => {
+            const at = code.indexOf('makePinAction:n=>s.actions.onTogglePin&&');
+            const expr = code.slice(at + 'makePinAction:'.length, code.indexOf(':void 0', at) + ':void 0'.length);
+            const pins = [];
+            const make = (pinned) => runInNewContext(`(${expr})`, { ...sandbox, s: { actions: { onTogglePin: () => {} }, pinnedModelIds: pinned },
+                Lhn: (id, isPinned) => { pins.push([id, isPinned]); return { id }; } });
+            const lockedRow = { identifier: 'ezil/qwen.qwen3-coder-next', metadata: locked('qwen.qwen3-coder-next') };
+            const open = { identifier: 'ezil/ezil/gemini-3.8-flash', metadata: { id: 'ezil/gemini-3.8-flash', isUserSelectable: true } };
+            assert.equal(make([])(lockedRow), undefined);
+            assert.deepEqual(make([])(open), { id: open.identifier });
+            assert.deepEqual(make(['ezil/qwen.qwen3-coder-next'])(lockedRow), { id: lockedRow.identifier }, 'a pin made earlier can still be removed');
+            assert.deepEqual(pins, [[open.identifier, false], [lockedRow.identifier, true]]);
+            const c0 = code.indexOf(',l=(ee,ae,he)=>{if(ezilPlanLocked(ee))return void c(ee);');
+            const configure = code.slice(c0 + 3, code.indexOf('this._configuration.show(', c0)) + 'this._configuration.show(ae)}';
+            const steps = [];
+            const fn = runInNewContext(`(function(){return ${configure}}).call(widget)`, { ...sandbox,
+                widget: { _actionWidgetService: { hide: () => steps.push('hide') }, _configuration: { show: () => steps.push('configure') } }, c: model => steps.push(['select', model.identifier]) });
+            fn(lockedRow, {}, false);
+            assert.deepEqual(steps, [['select', lockedRow.identifier]]);
+            steps.length = 0; fn(open, {}, false);
+            assert.deepEqual(steps, [['select', open.identifier], 'hide', 'configure']);
+        });
+
         await t.test('verify rejects a bundle missing any of the plan-lock patches', () => {
             for (const [id, needle] of [['billing-intent-command', 'qe.registerCommand("_ezil.billingIntent",'],
-                ['picker-locked-list', 'u=ezilPickerModels(this._languageModelsService,this._delegate.getModels()),'],
-                ['picker-locked-refresh', 'refresh(ezilPickerModels(this._languageModelsService,this._delegate.getModels()))'],
+                ['picker-locked-list', 'M=Bhn({models:ezilPickerModels(this._languageModelsService,u),'],
+                ['picker-locked-pin', 'makePinAction:n=>s.actions.onTogglePin&&(!ezilPlanLocked(n)'],
+                ['picker-locked-configure', ',l=(ee,ae,he)=>{if(ezilPlanLocked(ee))return void c(ee);'],
                 ['picker-locked-select', 'c=ee=>{if(ezilPlanLocked(ee)){']]) {
                 fs.writeFileSync(path.join(root, wb), code.replace(needle, `/*removed ${id}*/`));
                 const result = run('--verify', root);

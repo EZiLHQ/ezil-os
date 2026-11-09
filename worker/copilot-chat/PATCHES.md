@@ -449,11 +449,11 @@ node --check e2e/code-app-failure.mjs
 node --check e2e/code-app-failure-mock.mjs
 ```
 
-## Plan-locked models and billing asks (`billing-intent`, `picker-locked-list`, `picker-locked-refresh`, `picker-locked-select`)
+## Plan-locked models and billing asks (`billing-intent`, `picker-locked-list`, `picker-locked-pin`, `picker-locked-select`, `picker-locked-configure`)
 
 The ezil-models extension marks a model the account's OS plan does not include (Free: Gemini 3.8 Flash only) as
 `isUserSelectable: false`, with a lock `statusIcon` and `infoText.ezilPlanLocked`. VS Code therefore never defaults
-to it, restores it or hands it to an agent, and its picker would not list it at all. These four `workbench.js`
+to it, restores it or hands it to an agent, and its picker would not list it at all. These five `workbench.js`
 patches list it in the model picker only, and turn choosing it into the upgrade offer.
 
 - `billing-intent` inserts three module-level functions right after the CommandsRegistry class, then registers the
@@ -467,31 +467,42 @@ patches list it in the model picker only, and turn choosing it into the upgrade 
     - `requestId` must be a lowercase UUID;
     - `model` must be a Gateway alias (`^[a-z0-9][a-z0-9._-]{0,63}$`).
 
-    Anything else returns `false` and dispatches nothing. A valid record is dispatched once as the cancelable window
-    event `ezil-billing-intent`, with `detail` as JSON. The command returns `true` only when a listener called
-    `preventDefault()`, meaning the EZiL OS bridge took it. Otherwise the extension keeps its own notice and link.
+    Anything else rejects the whole record and returns `false`. That includes a present-but-`undefined` optional key;
+    unlike the app-failure projection, nothing is dropped and repaired. A valid record is dispatched once as the
+    cancelable window event `ezil-billing-intent`, with `detail` as JSON. The command returns `true` only when a
+    listener called `preventDefault()`, meaning the EZiL OS bridge took it. Otherwise the extension keeps its own
+    notice and link.
   - `ezilPlanLocked(model)` is true for a local (no `targetChatSessionType`) model with `isUserSelectable === false`
     and a string `infoText.ezilPlanLocked`.
-  - `ezilPickerModels(service, models)` returns the picker's own list plus every such locked model that the
-    language-model service knows, that is not hidden, and that is not already listed. With none locked it returns the
-    same array. If the service throws, it returns the picker's list unchanged.
-- `picker-locked-list` (`u=this._delegate.getModels(),p=this._delegate.getPresentationOptions()`) and
-  `picker-locked-refresh` (`this._tabbedPicker.value?.refresh(this._delegate.getModels())`), **one occurrence each**,
-  pass the picker's model list through `ezilPickerModels`. That covers the flat and grouped picker (`Bhn`), the
-  tabbed picker and its refresh. Every other caller of `getModels()` (the selection controller, defaults, agent
-  models) is unchanged, so a locked model is never chosen automatically. Locked rows follow the picker's own
-  grouping: until used or pinned, they sit under "Other Models".
+  - `ezilPickerModels(service, models)` returns the picker's own list, plus every such locked model that the
+    language-model service knows, that is not hidden, that is not already listed, and **whose vendor the picker
+    already lists**. Because of that vendor check, an empty picker gets no locked rows: session models still
+    loading, another session type's pool, or a mode or location that filters this vendor out. With none locked it
+    returns the same array. If the service throws, it returns the picker's list unchanged.
+- `picker-locked-list` (`let D=!1,M=Bhn({models:u,`, **one occurrence**) passes the list through `ezilPickerModels`
+  for the flat and grouped picker (`Bhn`) only. The tabbed picker (`chat.experimentalModelPicker`, off in the image)
+  and every other caller of `getModels()` are unchanged: the selection controller, defaults, agent models and
+  `_normalizeSelectedModel`. A locked model is therefore never chosen automatically. Locked rows follow the picker's
+  own grouping: until used or pinned, they sit under "Other Models" (observed in real Code).
+- `picker-locked-pin` (the grouped picker's `makePinAction`, **one occurrence**) offers no pin for a locked row. A pin
+  made before the plan changed can still be removed.
 - `picker-locked-select` patches the picker's `onSelect`
   (`c=ee=>{a.logModelChange(this._selectedModel,ee,this._delegate.getChatSessionId?.()),this._selectedModel=ee,this._renderLabel(),this._onDidChangeSelection.fire(ee)}`,
-  **one occurrence**). A locked row runs `_ezil-models.lockedModel` with the model's id; a failure is swallowed. The
-  previous model stays selected and nothing is logged, sent or charged. The extension re-reads the plan: if the plan
-  now includes the model it lists it again; otherwise it asks for the upgrade through `_ezil.billingIntent`. Mouse,
-  keyboard (Enter) and touch all reach this handler. Any other row selects exactly as before.
+  **one occurrence**; the only picker write of `_selectedModel`). A locked row runs `_ezil-models.lockedModel` with the
+  model's id; a failure is swallowed. The previous model stays selected and nothing is logged, sent or charged. The
+  extension re-reads the plan: if the plan now includes the model it lists it again; otherwise it asks for the
+  upgrade through `_ezil.billingIntent`. Mouse, keyboard (Enter) and touch all reach this handler, through the row's
+  single `run`. Any other row selects exactly as before.
+- `picker-locked-configure`
+  (`,l=(ee,ae,he)=>{c(ee),this._actionWidgetService.hide(),this._configuration.show(`, **one occurrence**) stops the
+  hover-configure path at the same refusal, so configuration never opens for the previously selected model. This is
+  unreachable today, because the extension declares no `configurationSchema`.
 
 `--verify` requires the inserted helpers and command once, and **zero old anchors and one replacement** for each
 picker patch. The offline test copies the pristine inputs and checks anchors, apply, verify and idempotence. It
-then runs the actual patched functions (billing validation and its return value, picker list, picker select) and
-checks that verify fails when any piece is missing:
+then runs the actual patched functions (billing validation and its return value, picker list, pin, select and
+configure) and checks that verify fails when any piece is missing. The suite needs a pristine 4.141.0 tree, so CI
+does not run it. The build-time gates are string checks only.
 
 ```sh
 COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/plan-lock-patch.test.cjs

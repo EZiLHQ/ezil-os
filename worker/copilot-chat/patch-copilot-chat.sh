@@ -95,16 +95,20 @@ R_APP_START_TIMEOUT='if(M==="timedout"){try{ezilDispatchAppFailure({eventId:cryp
 # adds, right after the CommandsRegistry class (before the app-failure registration, which stays byte-identical):
 # the renderer command `_ezil.billingIntent` the extension calls to ask the EZiL OS window for its billing dialog (true
 # only when a listener on the cancelable `ezil-billing-intent` window event took it, i.e. called preventDefault), and
-# the two picker helpers. `picker-locked-list` lists those locked rows in the model picker only (flat, grouped and
-# tabbed, and its refresh); the model list every other caller uses is unchanged. `picker-locked-select` turns choosing
-# a locked row into `_ezil-models.lockedModel` (the extension re-reads the plan, then asks for the upgrade) instead of
-# selecting it: the selected model, the conversation and the input stay as they are, and nothing is sent.
+# the two picker helpers. `picker-locked-list` lists those locked rows in the flat/grouped model picker only (`Bhn`),
+# and only for a vendor that picker already lists; the tabbed picker and every other model list are unchanged.
+# `picker-locked-pin` offers no pin for a locked row (unpinning one pinned earlier stays possible).
+# `picker-locked-select` turns choosing a locked row into `_ezil-models.lockedModel` (the extension re-reads the plan,
+# then asks for the upgrade) instead of selecting it, and `picker-locked-configure` stops the configure path there too:
+# the selected model, the conversation and the input stay as they are, and nothing is sent.
 A_BILLING_INTENT='getCommands(){let s=new Map;for(let o of this._commands.keys()){let e=this.getCommand(o);e&&s.set(o,e)}return s}};'
-R_BILLING_INTENT='getCommands(){let s=new Map;for(let o of this._commands.keys()){let e=this.getCommand(o);e&&s.set(o,e)}return s}};function ezilDispatchBillingIntent(record){try{if(!record||typeof record!=="object"||Array.isArray(record))return false;const keys=Reflect.ownKeys(record);if(!keys.every(k=>k==="reason"||k==="requestId"||k==="model"))return false;const clean=Object.create(null);for(const k of keys){const desc=Object.getOwnPropertyDescriptor(record,k);if(!desc||!("value" in desc)||typeof desc.value!=="string")return false;clean[k]=desc.value}if(clean.reason!=="credits_exhausted"&&clean.reason!=="model_locked")return false;if(clean.requestId!==undefined&&!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(clean.requestId))return false;if(clean.model!==undefined&&!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(clean.model))return false;return!window.dispatchEvent(new CustomEvent("ezil-billing-intent",{detail:JSON.stringify(clean),cancelable:true}))}catch{return false}}function ezilPlanLocked(model){try{const metadata=model&&model.metadata,info=metadata&&metadata.infoText;return!!info&&typeof info==="object"&&typeof info.ezilPlanLocked==="string"&&metadata.isUserSelectable===!1&&!metadata.targetChatSessionType}catch{return false}}function ezilPickerModels(service,models){try{const listed=new Set(models.map(model=>model.identifier)),locked=[];for(const identifier of service.getLanguageModelIds()){if(listed.has(identifier)||service.isModelHidden(identifier))continue;const metadata=service.lookupLanguageModel(identifier);if(metadata&&ezilPlanLocked({metadata}))locked.push({identifier,metadata})}return locked.length?models.concat(locked):models}catch{return models}}qe.registerCommand("_ezil.billingIntent",(accessor,record)=>ezilDispatchBillingIntent(record));'
-A_PICKER_LOCKED_LIST='u=this._delegate.getModels(),p=this._delegate.getPresentationOptions()'
-R_PICKER_LOCKED_LIST='u=ezilPickerModels(this._languageModelsService,this._delegate.getModels()),p=this._delegate.getPresentationOptions()'
-A_PICKER_LOCKED_REFRESH='this._tabbedPicker.value?.refresh(this._delegate.getModels())'
-R_PICKER_LOCKED_REFRESH='this._tabbedPicker.value?.refresh(ezilPickerModels(this._languageModelsService,this._delegate.getModels()))'
+R_BILLING_INTENT='getCommands(){let s=new Map;for(let o of this._commands.keys()){let e=this.getCommand(o);e&&s.set(o,e)}return s}};function ezilDispatchBillingIntent(record){try{if(!record||typeof record!=="object"||Array.isArray(record))return false;const keys=Reflect.ownKeys(record);if(!keys.every(k=>k==="reason"||k==="requestId"||k==="model"))return false;const clean=Object.create(null);for(const k of keys){const desc=Object.getOwnPropertyDescriptor(record,k);if(!desc||!("value" in desc)||typeof desc.value!=="string")return false;clean[k]=desc.value}if(clean.reason!=="credits_exhausted"&&clean.reason!=="model_locked")return false;if(clean.requestId!==undefined&&!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(clean.requestId))return false;if(clean.model!==undefined&&!/^[a-z0-9][a-z0-9._-]{0,63}$/.test(clean.model))return false;return!window.dispatchEvent(new CustomEvent("ezil-billing-intent",{detail:JSON.stringify(clean),cancelable:true}))}catch{return false}}function ezilPlanLocked(model){try{const metadata=model&&model.metadata,info=metadata&&metadata.infoText;return!!info&&typeof info==="object"&&typeof info.ezilPlanLocked==="string"&&metadata.isUserSelectable===!1&&!metadata.targetChatSessionType}catch{return false}}function ezilPickerModels(service,models){try{const listed=new Set(models.map(model=>model.identifier)),vendors=new Set(models.map(model=>model.metadata&&model.metadata.vendor)),locked=[];for(const identifier of service.getLanguageModelIds()){if(listed.has(identifier)||service.isModelHidden(identifier))continue;const metadata=service.lookupLanguageModel(identifier);if(metadata&&vendors.has(metadata.vendor)&&ezilPlanLocked({metadata}))locked.push({identifier,metadata})}return locked.length?models.concat(locked):models}catch{return models}}qe.registerCommand("_ezil.billingIntent",(accessor,record)=>ezilDispatchBillingIntent(record));'
+A_PICKER_LOCKED_LIST='let D=!1,M=Bhn({models:u,'
+R_PICKER_LOCKED_LIST='let D=!1,M=Bhn({models:ezilPickerModels(this._languageModelsService,u),'
+A_PICKER_LOCKED_PIN='makePinAction:n=>s.actions.onTogglePin?Lhn(n.identifier,s.pinnedModelIds.includes(n.identifier),s.actions.onTogglePin):void 0'
+R_PICKER_LOCKED_PIN='makePinAction:n=>s.actions.onTogglePin&&(!ezilPlanLocked(n)||s.pinnedModelIds.includes(n.identifier))?Lhn(n.identifier,s.pinnedModelIds.includes(n.identifier),s.actions.onTogglePin):void 0'
+A_PICKER_LOCKED_CONFIGURE=',l=(ee,ae,he)=>{c(ee),this._actionWidgetService.hide(),this._configuration.show('
+R_PICKER_LOCKED_CONFIGURE=',l=(ee,ae,he)=>{if(ezilPlanLocked(ee))return void c(ee);c(ee),this._actionWidgetService.hide(),this._configuration.show('
 A_PICKER_LOCKED_SELECT='c=ee=>{a.logModelChange(this._selectedModel,ee,this._delegate.getChatSessionId?.()),this._selectedModel=ee,this._renderLabel(),this._onDidChangeSelection.fire(ee)}'
 R_PICKER_LOCKED_SELECT='c=ee=>{if(ezilPlanLocked(ee)){Promise.resolve(this._commandService.executeCommand("_ezil-models.lockedModel",ee.metadata.id)).catch(()=>{});return}a.logModelChange(this._selectedModel,ee,this._delegate.getChatSessionId?.()),this._selectedModel=ee,this._renderLabel(),this._onDidChangeSelection.fire(ee)}'
 A_TOKEN='this._logService.info("Allowing anonymous access with devDeviceId");let a=await this.authFromDevDeviceId(yGe.env.devDeviceId);'
@@ -337,8 +341,9 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch app-start-timeout "$WB" 1 "$A_APP_START_TIMEOUT" "$R_APP_START_TIMEOUT"
   patch billing-intent "$WB" 1 "$A_BILLING_INTENT" "$R_BILLING_INTENT"
   patch picker-locked-list "$WB" 1 "$A_PICKER_LOCKED_LIST" "$R_PICKER_LOCKED_LIST"
-  patch picker-locked-refresh "$WB" 1 "$A_PICKER_LOCKED_REFRESH" "$R_PICKER_LOCKED_REFRESH"
+  patch picker-locked-pin "$WB" 1 "$A_PICKER_LOCKED_PIN" "$R_PICKER_LOCKED_PIN"
   patch picker-locked-select "$WB" 1 "$A_PICKER_LOCKED_SELECT" "$R_PICKER_LOCKED_SELECT"
+  patch picker-locked-configure "$WB" 1 "$A_PICKER_LOCKED_CONFIGURE" "$R_PICKER_LOCKED_CONFIGURE"
   patch ai-entry "$WB" 1 "$A_AI_ENTRY" "$R_AI_ENTRY"
   patch token          "$EXT" 1  "$A_TOKEN"  "$R_TOKEN"
   patch known-models   "$EXT" 1  "$A_KNOWN"  "$R_KNOWN"
@@ -412,8 +417,9 @@ gate app-start-timeout "$WB" 0 "$A_APP_START_TIMEOUT"; gate app-start-timeout "$
 gate app-failure-command "$WB" 1 'qe.registerCommand("_ezil.appFailure",'
 gate billing-intent "$WB" 1 "$R_BILLING_INTENT"; gate billing-intent-command "$WB" 1 'qe.registerCommand("_ezil.billingIntent",'
 gate picker-locked-list "$WB" 0 "$A_PICKER_LOCKED_LIST"; gate picker-locked-list "$WB" 1 "$R_PICKER_LOCKED_LIST"
-gate picker-locked-refresh "$WB" 0 "$A_PICKER_LOCKED_REFRESH"; gate picker-locked-refresh "$WB" 1 "$R_PICKER_LOCKED_REFRESH"
+gate picker-locked-pin "$WB" 0 "$A_PICKER_LOCKED_PIN"; gate picker-locked-pin "$WB" 1 "$R_PICKER_LOCKED_PIN"
 gate picker-locked-select "$WB" 0 "$A_PICKER_LOCKED_SELECT"; gate picker-locked-select "$WB" 1 "$R_PICKER_LOCKED_SELECT"
+gate picker-locked-configure "$WB" 0 "$A_PICKER_LOCKED_CONFIGURE"; gate picker-locked-configure "$WB" 1 "$R_PICKER_LOCKED_CONFIGURE"
 gate ai-dashboard "$WB" 0 "$A_AI_DASHBOARD"; gate ai-dashboard "$WB" 1 "$R_AI_DASHBOARD"
 gate ai-entry "$WB" 0 "$A_AI_ENTRY"; gate ai-entry "$WB" 1 "$R_AI_ENTRY"
 gate token            "$EXT" 0  "$A_TOKEN";        gate token            "$EXT" 1  "$R_TOKEN"
