@@ -354,7 +354,14 @@ export const APPS = [
         // start_boot()` runs its mint/confirm well after `open()` returns.
         // See `owns_boot_trace`.
         owns_boot_trace: true,
-        open: openCodeWindow,
+        // Code's billing requests (a credit refusal, a plan-locked model; ../ui/Settings/billing-recovery.js) open
+        // Settings → Billing in this desktop, which picks the dialog from its own summary. Code keeps its chat.
+        open: ctx => openCodeWindow({
+            ...ctx,
+            openBilling: request => launch('settings', { ...gestureContext(launchContext(ctx)), initialTab: 'billing',
+                billingRecovery: { reason: request.reason === 'model_locked' ? 'model_locked' : 'insufficient_credits',
+                    ...(request.requestId ? { requestId: request.requestId } : {}) } }),
+        }),
     },
     {
         id: 'app-store', name: 'App Store', icon: APP_STORE_ICON,

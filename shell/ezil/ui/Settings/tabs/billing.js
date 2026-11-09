@@ -6,7 +6,7 @@ import trpc from '../trpc.js';
 import { openUpgradeSheet } from '../upgrade-sheet.js';
 import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOverageSheet, openPlanPickerSheet } from '../billing-sheets.js';
 import { openConfirmSheet } from '../sheet-frame.js';
-import { openTopupSheet, topupOffer } from '../topup-sheet.js';
+import { billingRecoveryAction, openTopupSheet, topupOffer } from '../topup-sheet.js';
 import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines, heldClosedSize, heldClosedText,
     accountCredits, accountDetailsHtml, staleCreditsCopy, paidComputeUnmetered, TRIAL_SKU, trialOfferOf, trialIneligibleCopy, planTrialOf, trialAmount,
     trialDayLabel, trialMomentLabel } from '../billing-format.js';
@@ -789,11 +789,17 @@ async function load ($win, state) {
             $body.attr('aria-busy', 'false');
         }
     }
-    // An Add credits request (the Usage tab's link, the Code recovery link) is consumed once, on whichever
-    // load first has a summary: the top-up dialog when this account can buy, else the AI credits row.
+    // An Add credits request (the Usage tab's link, the Code recovery link) and a request from Code (a credit refusal
+    // or a plan-locked model) are each consumed once, on whichever load first has a summary. A recovery
+    // (`reason: insufficient_credits`, or a locked model) opens what this summary calls for: the Standard upgrade on
+    // Free, Add credits on a paid plan (`billingRecoveryAction`). A plain Add credits request opens the top-up dialog.
+    // Either falls back to the AI credits row.
     const topup = state.summary ? state.openTopup : null;
     if ( topup ) state.openTopup = null;
-    if ( topup && ! openSheet($win, state, 'topup', undefined, topup) ) {
+    const recovery = state.summary ? state.openRecovery ?? (topup?.reason === 'insufficient_credits' ? topup : null) : null;
+    if ( state.summary ) state.openRecovery = null;
+    if ( recovery ? ! openRecovery($win, state, recovery) && recovery.reason === 'insufficient_credits'
+        : topup && ! openSheet($win, state, 'topup', undefined, topup) ) {
         const card = $body.find('#ai-credits').get(0);
         card?.scrollIntoView?.({ block: 'nearest' });
         card?.querySelector('h4')?.focus({ preventScroll: true });
@@ -803,7 +809,7 @@ async function load ($win, state) {
         const sku = state.openUpgrade;
         // `upgrade=standard` (the pricing page's Standard card, which advertises the free month) opens the free month
         // when the server offers it to this viewer, and the ordinary Standard checkout otherwise.
-        if ( topup ) { /* The deep link's section was the top-up request above. */ } else if ( sku === TRIAL_SKU && trialOfferOf(state.summary) ) openSheet($win, state, 'trial');
+        if ( topup || recovery ) { /* The deep link's section, or Code, asked for billing recovery above. */ } else if ( sku === TRIAL_SKU && trialOfferOf(state.summary) ) openSheet($win, state, 'trial');
         else if ( typeof sku === 'string' && offerFor(state.summary, sku) && state.summary.actions.checkout ) openSheet($win, state, 'checkout', sku);
         else if ( ['compute_monthly_v2', 'premium_monthly_v3'].includes(sku) && state.summary.actions.upgrade ) openSheet($win, state, 'upgrade');
         else if ( sku === true && state.summary.actions.checkout ) {
@@ -845,6 +851,26 @@ function actionStatus ($win, copy) { $win.find('[data-role="billing-action-statu
  * `topup` opens the Add AI credits dialog (`sku` preselects a preset; `intent.reason` frames exhaustion);
  * `topup-checkout` is that dialog's hand-off: the payment sheet for the server's quote (`intent.pack`).
  */
+/** A billing recovery request as Billing keeps it: `insufficient_credits` or `model_locked`, plus Code's request id. */
+function recoveryRequest (value) {
+    if ( ! value || typeof value !== 'object' || ! ['insufficient_credits', 'model_locked'].includes(value.reason) ) return null;
+    const requestId = typeof value.requestId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value.requestId) ? value.requestId : null;
+    return { reason: value.reason, requestId };
+}
+
+/**
+ * The dialog the live summary calls for (`billingRecoveryAction`), or false when none applies or a sheet is already
+ * open (one dialog per failure). It never retries Code's request: the chat and its input stay as they were.
+ */
+function openRecovery ($win, state, request) {
+    const choice = billingRecoveryAction(state.summary, request.reason);
+    // Correlation for support: Code's Gateway request id, never anything of the conversation.
+    console.info('[billing] recovery', { reason: request.reason, requestId: request.requestId ?? null, action: choice?.action ?? null });
+    if ( ! choice ) return false;
+    return choice.action === 'topup' ? openSheet($win, state, 'topup', undefined, { reason: 'insufficient_credits' })
+        : openSheet($win, state, choice.action, choice.sku);
+}
+
 function openSheet ($win, state, action, sku, intent = null) {
     // The Standard trial is the Standard checkout sheet in its trial mode: it quotes, confirms the exact end, then pays $0.
     if ( action === 'trial' ) return trialOfferOf(state.summary) ? openSheet($win, state, 'checkout', TRIAL_SKU, { trial: true }) : false;
@@ -993,9 +1019,11 @@ export default {
             <footer class="ezil-billing-footer"><a href="mailto:contact@ezil.work">Support</a>
                 <a href="/refunds" target="_blank" rel="noopener">Refund policy</a><a href="/pricing" target="_blank" rel="noopener">Plans</a></footer></div>`;
     },
-    init ($win) {
+    init ($win, ctx = {}) {
         const state = { loading: false, pending: false, summary: null, history: [], sheet: null, request: 0, autoOpened: false, openUpgrade: false, openTopup: null, timer: null, active: false, closed: false,
-            lastAccount: null, loadedAt: undefined, userId: null };
+            lastAccount: null, loadedAt: undefined, userId: null,
+            // Code's request (credit refusal or locked model) that opened this window, consumed by the first summary.
+            openRecovery: recoveryRequest(ctx?.billingRecovery) };
         windows.set($win.get(0), state);
         // Back from another window or tab (a hosted checkout, a top-up) with a pane older than five minutes: read it again.
         state.focus = () => {
@@ -1028,7 +1056,8 @@ export default {
             const request = { reason: detail?.reason === 'insufficient_credits' ? 'insufficient_credits' : null };
             const tab = $win.find('.ezil-settings-tab[data-tab="billing"]');
             if ( tab.hasClass('active') && state.summary && ! state.loading ) {
-                if ( ! openSheet($win, state, 'topup', undefined, request) ) $pane.find('#ai-credits h4').get(0)?.focus();
+                const opened = request.reason ? openRecovery($win, state, recoveryRequest(request)) : openSheet($win, state, 'topup', undefined, request);
+                if ( ! opened ) $pane.find('#ai-credits h4').get(0)?.focus();
                 return;
             }
             state.openTopup = request;
@@ -1062,6 +1091,21 @@ export default {
             }
             void load($win, state);
         }
+    },
+    /**
+     * Settings was launched again while open (`registry.js` relaunch, after it selected this tab) with Code's billing
+     * request: open it now when this tab already has a summary, else on the load this activation started.
+     */
+    onRelaunch ($win, ctx = {}) {
+        const state = windows.get($win.get(0));
+        const request = recoveryRequest(ctx.billingRecovery);
+        if ( ! state || state.closed || ! request ) return;
+        if ( state.active && state.summary && ! state.loading ) {
+            if ( ! openRecovery($win, state, request) && request.reason === 'insufficient_credits' ) $win.find('#ai-credits h4').get(0)?.focus();
+            return;
+        }
+        state.openRecovery = request;
+        if ( ! state.active ) $win.find('.ezil-settings-tab[data-tab="billing"]').trigger('click');
     },
     onDeactivate ($win) {
         const state = $win && windows.get($win.get(0));

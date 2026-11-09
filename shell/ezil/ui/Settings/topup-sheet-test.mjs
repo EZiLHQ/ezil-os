@@ -1,7 +1,7 @@
 // topup-sheet-test.mjs — EZiL-authored. The Add AI credits dialog in jsdom with
 // the real module bundled and a fake tRPC client. SYNTHETIC FIXTURES ONLY: no
 // network, no Stripe, no real account; balances and catalogs below are invented.
-import { summaryV3 } from './billing-v3-fixtures.mjs';
+import { summaryV3, trialSummaryV3 } from './billing-v3-fixtures.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -295,6 +295,40 @@ test('keyboard: Escape closes when idle and returns focus to the opener; Tab sta
     assert.equal(h.document.activeElement, h.q('#opener'));
     assert.equal(h.closed, 1);
     assert.equal(h.q('#container').hasAttribute('inert'), false);
+});
+
+test('billingRecoveryAction: Free gets the Standard upgrade for both causes; a paid plan gets Add credits, and nothing for a locked model', async h => {
+    const { billingRecoveryAction } = h.api;
+    const free = fixture('free');
+    assert.deepEqual(plain(billingRecoveryAction(free, 'insufficient_credits')), { action: 'checkout', sku: 'standard_monthly_v3' });
+    assert.deepEqual(plain(billingRecoveryAction(free, 'model_locked')), { action: 'checkout', sku: 'standard_monthly_v3' });
+    // The free month, when the server offers it to this viewer, is the same Standard upgrade.
+    const offer = fixture('free'); offer.trialOffer = plain(trialSummaryV3('offer').trialOffer);
+    assert.deepEqual(plain(billingRecoveryAction(offer, 'model_locked')), { action: 'trial', sku: 'standard_monthly_v3' });
+    // The free month ended and its first charge is still being collected: Free for AI, already subscribed, so a
+    // credit refusal offers Add credits and a locked model opens nothing.
+    const pending = trialSummaryV3('payment_pending'); pending.actions.topup = true; pending.catalog.packs = packs.map(pack => ({ ...pack }));
+    pending.catalog.customTopup = { ...customTopup };
+    assert.deepEqual(plain(billingRecoveryAction(pending, 'insufficient_credits')), { action: 'topup' });
+    assert.equal(billingRecoveryAction(pending, 'model_locked'), null);
+    // Files held on AWS are Free too; so is a paid subscription without paid access (standing free).
+    const held = fixture('free'); held.computer.standing = 'files_on_aws';
+    assert.equal(billingRecoveryAction(held, 'insufficient_credits').action, 'checkout');
+    const lapsed = fixture('standard'); lapsed.computer.standing = 'free'; lapsed.actions.upgrade = false;
+    assert.deepEqual(plain(billingRecoveryAction(lapsed, 'insufficient_credits')), { action: 'topup' });
+    assert.equal(billingRecoveryAction(lapsed, 'model_locked'), null);
+    // No Standard checkout here: a credit refusal still offers Add credits; a locked model has nothing to sell.
+    const noCheckout = fixture('free'); noCheckout.actions.checkout = false;
+    assert.deepEqual(plain(billingRecoveryAction(noCheckout, 'insufficient_credits')), { action: 'topup' });
+    assert.equal(billingRecoveryAction(noCheckout, 'model_locked'), null);
+    for ( const tier of ['standard', 'premium'] ) {
+        assert.deepEqual(plain(billingRecoveryAction(fixture(tier), 'insufficient_credits')), { action: 'topup' }, tier);
+        assert.equal(billingRecoveryAction(fixture(tier), 'model_locked'), null, tier);
+        const cannotBuy = fixture(tier); cannotBuy.actions.topup = false;
+        assert.equal(billingRecoveryAction(cannotBuy, 'insufficient_credits'), null, tier);
+    }
+    for ( const reason of [null, 'rate_limited', 'window_budget_reached', 'no_entitlement'] ) assert.equal(billingRecoveryAction(free, reason), null, String(reason));
+    for ( const summary of [null, { ...free, enabled: false }, { ...free, version: 2 }] ) assert.equal(billingRecoveryAction(summary, 'insufficient_credits'), null);
 });
 
 test('topupOffer: only well-formed USD presets, a valid tariff and an enrolled account; parseCustomAmount edges', async h => {
