@@ -74,7 +74,7 @@ export const AVAILABILITY_REASONS = ['model_disabled', 'no_active_pricing', 'gat
     'entitlement_required', 'catalog_unavailable'] as const;
 export type GatewayAvailability = { state: typeof AVAILABILITY_STATES[number]; reasons: (typeof AVAILABILITY_REASONS[number])[] };
 /** Capability flags a row may carry. Absent means "not established": a catalog-only row gets none of them. */
-export type GatewayCapabilities = { tool_calling?: boolean; image_input?: boolean; streaming?: boolean };
+export type GatewayCapabilities = { tool_calling?: boolean; image_input?: boolean; streaming?: boolean; prompt_cache?: boolean };
 export type GatewayModel = { id: string; enabled: boolean; max_input_tokens: number; max_output_tokens: number; protocols?: readonly GatewayProtocol[];
     availability?: GatewayAvailability; name?: string; capabilities?: GatewayCapabilities };
 export type GatewayModels = { killswitch: boolean; pause: 'operations' | 'reconciliation' | null; data: GatewayModel[];
@@ -137,7 +137,7 @@ function availabilityOf(value: unknown): GatewayAvailability | undefined {
 function capabilitiesOf(value: unknown): GatewayCapabilities | undefined {
     if (!record(value)) return undefined;
     const capabilities: GatewayCapabilities = {};
-    for (const key of ['tool_calling', 'image_input', 'streaming'] as const) if (typeof value[key] === 'boolean') capabilities[key] = value[key];
+    for (const key of ['tool_calling', 'image_input', 'streaming', 'prompt_cache'] as const) if (typeof value[key] === 'boolean') capabilities[key] = value[key];
     return capabilities;
 }
 
@@ -248,7 +248,10 @@ export function gatewayCatalogModels(provider: ResolvedProvider, catalog: Gatewa
             family: entry.id, version: '1',
             maxInputTokens: entry.max_input_tokens, maxOutputTokens: Math.max(16, Math.min(16_384, entry.max_output_tokens)),
             capabilities: { toolCalling: entry.capabilities?.tool_calling === true, imageInput: false },
-            cache: { enabled: false, ttl: '5m' }, default: false, roles: [], forcedToolChoice: false,
+            // Cache markers only where the Gateway says its serving route carries them (native Anthropic, Bedrock InvokeModel
+            // Claude); its validator accepts ttl 5m only.
+            ...entry.capabilities?.prompt_cache === true ? { gatewayPromptCache: true as const } : {},
+            cache: { enabled: entry.capabilities?.prompt_cache === true, ttl: '5m' }, default: false, roles: [], forcedToolChoice: false,
             stream: entry.capabilities?.streaming === true && entry.id !== KIMI, toolReserve: DEFAULT_TOOL_RESERVE,
         });
     }
@@ -436,7 +439,7 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
         case 'not_a_member': case 'role_mismatch': case 'forbidden': return make('Your EZiL account does not have AI membership');
         case 'account_suspended': case 'suspended': return make('AI access is suspended for your EZiL account');
         case 'input_too_large': case 'body_too_large': return tooLarge();
-        case 'unsupported_bedrock_converse_request': case 'unsupported_parameter': case 'invalid_request':
+        case 'unsupported_bedrock_converse_request': case 'unsupported_gemini_request': case 'unsupported_parameter': case 'invalid_request':
         case 'max_output_tokens_invalid': case 'idempotency_conflict': case 'idempotency_key_required':
             return make(`Internal EZiL Models bug (${code}); please report it`);
         case 'killswitch': return make(body.pause === 'reconciliation' ? 'AI is paused while usage is reconciled' : 'AI is paused by operations');
@@ -606,6 +609,9 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     const log = (line: string) => options.log?.(redact(line, [provider.apiKey ?? '', ...Object.values(provider.headers)]));
     let idempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
     let previousIdempotencyKey: string | undefined;
+    // The key of a certain resend that has not been sent yet: it replaces idempotencyKey only when that attempt starts, so
+    // every record and log line names the last attempt actually made, with its own Gateway ID and status.
+    let nextIdempotencyKey: string | undefined;
     let requestId: string | undefined;
     let hold: string | null = null;
     // The Gateway's exact response cache (opt-in set by EZiL OS, never by this extension): HIT or MISS, as evidence only.
@@ -629,6 +635,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         } catch { /* An observer never changes the turn or its telemetry. */ }
     };
     const retrying = (error: GatewayError) => { retriedAfter = { error, stage }; report('retrying', error, stage); };
+    // The request and compaction observers, like `report`: a throwing observer never changes the turn.
+    const observe = (call: () => void) => { try { call(); } catch { /* observer only */ } };
     const responses = model.gatewayProtocol === 'openai-responses';
     let stream = (responses || model.model !== 'us.moonshotai.kimi-k3') && model.stream !== false;
     let used = emptyUsage();
@@ -652,7 +660,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         const compact = (first: LocalRequestError, limits: ResolvedModel, cause?: 'remote') => {
             const compacted = compactRequest(request, first, builder(limits), cause);
             compaction = compacted.info;
-            options.onCompact?.(compaction);
+            const info = compaction;
+            observe(() => options.onCompact?.(info));
             return compacted.built;
         };
         let built: ReturnType<ReturnType<typeof builder>>;
@@ -669,7 +678,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         stream = built.body.stream;
         const url = `${provider.baseUrl}/${responses ? 'responses' : 'messages'}`;
         // Callback is for tests/integration, never used for gateway prompt logging.
-        options.onRequest?.(url, built, idempotencyKey);
+        observe(() => options.onRequest?.(url, built, idempotencyKey));
         const headers = { ...authHeaders(provider), 'content-type': 'application/json', accept: stream ? 'text/event-stream' : 'application/json', 'idempotency-key': idempotencyKey };
         const identity = providerIdentity(provider);
         let retried = false;
@@ -697,7 +706,19 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 if (concurrencyError && now() - concurrencyStarted! > CONCURRENCY_WAIT_BUDGET_MS) throw concurrencyError;
                 // Each attempt reports only its own response: a Gateway ID, status, hold or cache verdict from an earlier
                 // attempt (a 429, a resend, the 413 before a compacted resend under a new key) never carries over.
+                if (nextIdempotencyKey !== undefined) {
+                    // Announce the resend, then commit to it only if the caller has not cancelled meanwhile: a
+                    // cancellation here still names the 413 attempt, and the resend is never sent after it.
+                    const next = nextIdempotencyKey;
+                    observe(() => options.onRequest?.(url, built, next));
+                    options.signal.throwIfAborted();
+                    previousIdempotencyKey = idempotencyKey;
+                    idempotencyKey = next;
+                    nextIdempotencyKey = undefined;
+                    headers['idempotency-key'] = idempotencyKey;
+                }
                 requestId = undefined; status = undefined; hold = null; cache = undefined;
+                // No await from here to the fetch: a later cancellation reaches this attempt's own controller.
                 attemptAbort = new AbortController();
                 const sentAt = resendOf ?? performance.now();
                 let response: Response;
@@ -801,19 +822,18 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                     if (Buffer.from(retry.built.bytes).equals(Buffer.from(refused))) throw refusal;
                     built = retry.built;
                     compaction = retry.info;
-                    options.onCompact?.(compaction);
-                    // The resend is certain now: report the 413 attempt under its own key, Gateway ID and status before the key
-                    // rotates, so the turn's recovered or failed record (under the new key) follows a retrying one. No
-                    // retryOfClientRequestId: the contract reserves it for a known manual retry; the chain is the attempt order.
+                    const info = compaction;
+                    observe(() => options.onCompact?.(info));
+                    // The resend is certain now: report the 413 attempt under its own key, Gateway ID and status, so the turn's
+                    // recovered or failed record (under the new key) follows a retrying one. The new key takes over only when
+                    // the resend starts: a cancellation before then (in this callback, or in the admission wait) reports the
+                    // 413 attempt's own key and Gateway ID, never the unsent key with them. No retryOfClientRequestId: the
+                    // contract reserves it for a known manual retry; the chain is the attempt order.
                     retrying(refusal);
-                    const nextIdempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
-                    previousIdempotencyKey = idempotencyKey;
-                    idempotencyKey = nextIdempotencyKey;
-                    headers['idempotency-key'] = idempotencyKey;
+                    nextIdempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
                     resent = false;
                     // A new request: an earlier concurrency wait does not count against it.
                     concurrencyError = undefined; concurrencyStarted = undefined; concurrencyWaited = 0; concurrencyRetries = 0;
-                    options.onRequest?.(url, built, idempotencyKey);
                     waitMs = 0;
                 }
             } finally {

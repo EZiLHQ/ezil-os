@@ -1,0 +1,207 @@
+[
+ {
+  "name": "read_file",
+  "description": "Read the contents of a file.\n\nYou must specify the line range you're interested in. Line numbers are 1-indexed. If the file contents returned are insufficient for your task, you may call this tool again to retrieve more content. Prefer reading larger ranges over doing many small reads. Binary files use startLine/endLine as byte offsets.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "filePath": {
+     "description": "The absolute path of the file to read.",
+     "type": "string"
+    },
+    "startLine": {
+     "type": "number",
+     "description": "The line number to start reading from, 1-based."
+    },
+    "endLine": {
+     "type": "number",
+     "description": "The inclusive line number to end reading at, 1-based."
+    }
+   },
+   "required": [
+    "filePath",
+    "startLine",
+    "endLine"
+   ]
+  }
+ },
+ {
+  "name": "vscode_askQuestions",
+  "description": "Use this tool to ask the user a small number of clarifying questions before proceeding. Provide the questions array with concise headers and prompts. Use options for fixed choices, set multiSelect when multiple selections are allowed. Users can always provide a freeform text answer alongside options unless you set allowFreeformInput to false.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "questions": {
+     "type": "array",
+     "description": "List of questions to ask the user. Order is preserved.",
+     "items": {
+      "type": "object",
+      "properties": {
+       "header": {
+        "type": "string",
+        "description": "Short identifier for the question. Must be unique so answers can be mapped back to the question. Maximum 50 characters.",
+        "maxLength": 50
+       },
+       "question": {
+        "type": "string",
+        "description": "The question text to display to the user. Keep it concise, ideally one sentence. Maximum 200 characters.",
+        "maxLength": 200
+       },
+       "multiSelect": {
+        "type": "boolean",
+        "description": "Allow selecting multiple options when options are provided."
+       },
+       "allowFreeformInput": {
+        "type": "boolean",
+        "description": "Allow freeform text answers in addition to option selection. Defaults to true; set to false to restrict to predefined options only."
+       },
+       "message": {
+        "type": "string",
+        "description": "Optional markdown message to display below the question text, providing additional context or details."
+       },
+       "options": {
+        "type": "array",
+        "description": "Optional list of selectable answers. If omitted, the question is free text.",
+        "items": {
+         "type": "object",
+         "properties": {
+          "label": {
+           "type": "string",
+           "description": "Display label and value for the option."
+          },
+          "description": {
+           "type": "string",
+           "description": "Optional secondary text shown with the option."
+          },
+          "recommended": {
+           "type": "boolean",
+           "description": "Mark this option as the recommended default."
+          }
+         },
+         "required": [
+          "label"
+         ]
+        }
+       }
+      },
+      "required": [
+       "header",
+       "question"
+      ]
+     },
+     "minItems": 1
+    }
+   },
+   "required": [
+    "questions"
+   ]
+  }
+ },
+ {
+  "name": "get_terminal_output",
+  "description": "Get output from a terminal execution that was moved to background (identified by the `id` returned from run_in_terminal). Use this ONLY when the run_in_terminal result explicitly says the command was moved to background, timed out, or needs input. Do NOT call this after a sync command that completed normally \u2014 sync commands return full output inline. If a background command has not yet completed, you will be automatically notified when it finishes \u2014 do NOT poll; end your turn and wait.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string",
+     "description": "The ID of an active terminal execution to check (returned by run_in_terminal for async executions, or for sync executions that timed out and were moved to the background). This must be the exact opaque UUID returned by that tool; terminal names, labels, or integers are invalid.",
+     "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    }
+   },
+   "required": [
+    "id"
+   ]
+  }
+ },
+ {
+  "name": "kill_terminal",
+  "description": "Kill a terminal by its ID. Use this to clean up terminals that are no longer needed (e.g., after stopping a server or when a long-running task completes). The terminal ID is returned by run_in_terminal in async mode (legacy: isBackground=true).",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string",
+     "description": "The ID of the persistent terminal to kill (returned by run_in_terminal in async mode).",
+     "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    }
+   },
+   "required": [
+    "id"
+   ]
+  }
+ },
+ {
+  "name": "run_in_terminal",
+  "description": "This tool allows you to execute shell commands in a persistent bash terminal session, preserving environment variables, working directory, and other context across multiple commands.\n\nCommand Execution:\n- Use && to chain simple commands on one line\n- Prefer pipelines | over temporary files for data flow\n- Never create a sub-shell (eg. bash -c \"command\") unless explicitly asked\n\nDirectory Management:\n- Prefer relative paths when navigating directories, only use absolute when the path is far away or the current cwd is not expected\n- By default (mode=sync), shell and cwd are reused by subsequent sync commands\n- Use $PWD for current directory references\n- Consider using pushd/popd for directory stack management\n- Supports directory shortcuts like ~ and -\n\nProgram Execution:\n- Supports Python, Node.js, and other executables\n- Install packages via package managers (brew, apt, etc.)\n- Use which or command -v to verify command availability\n\nExecution Mode:\n- For ALL one-shot commands (builds, tests, installs, compilation, linting, downloads, scripts), use mode='sync' and omit timeout. The tool waits for the command to complete and returns full output inline. This is the default and strongly preferred mode.\n- Use mode='async' ONLY for processes that must keep running indefinitely while you do other work (servers, watchers, dev daemons). Async waits for an initial idle/output signal, then returns a terminal ID and output snapshot while the process continues running.\n- In sync mode, the full output is returned when the command completes \u2014 you do NOT need to call get_terminal_output afterward. Only use get_terminal_output if the tool result explicitly says the command was moved to background, timed out, or needs input.\n\nUse send_to_terminal to send commands or input to a terminal session.\n\nOutput Management:\n- Output exceeding 20KB is saved to a temp file; the result includes the file path so you can read the full output with readFile or search it with grep\n- Use head, tail, grep, awk to filter and limit output size\n- For pager commands, disable paging: git --no-pager or add | cat\n- Use wc -l to count lines before displaying large outputs\n\nBest Practices:\n- Quote variables: \"$var\" instead of $var to handle spaces\n- Use find with -exec or xargs for file operations\n- Be specific with commands to avoid excessive output\n- Avoid printing credentials unless absolutely required\n- Avoid commands that require interactive privilege escalation, such as sudo/su/doas without a non-interactive flag (e.g. sudo -n). They block on a password prompt that cannot be answered in this mode, and secrets must never be routed through the model. If a command needs elevated privileges, tell the user to run it themselves in the terminal and stop \u2014 do NOT retry the command with variations.\n- NEVER run sleep or similar wait commands in a terminal. You will be automatically notified on your next turn when async terminal commands or timed-out sync commands complete or need input. Do NOT poll for completion.\n- NEVER pipe interactive commands through tail, head, grep, or other filters \u2014 this hides prompts and prevents the terminal from detecting when input is needed. Run interactive commands without pipes.\n\nInteractive Input Handling:\n- When a terminal command is waiting for interactive input, do NOT suggest alternatives or ask the user whether to proceed. Instead, use the vscode_askQuestions tool to collect the needed values from the user, then send them.\n- NEVER use vscode_askQuestions to request sensitive input such as passwords, passphrases, API keys, tokens, or other secrets \u2014 answers to that tool are sent through the model. If the prompt requires a secret, tell the user to type it directly into the terminal and stop; do not call vscode_askQuestions or send_to_terminal for that prompt.\n- Send exactly one answer per prompt using send_to_terminal. Never send multiple answers in a single send.\n- After each send, call get_terminal_output to read the next prompt before sending the next answer.\n- Continue one prompt at a time until the command finishes.\n- Use [[ ]] for conditional tests instead of [ ]\n- Prefer $() over backticks for command substitution\n\nExecution mode:\n- mode='sync' (strongly preferred): waits for the command to complete and returns full output inline. Use for ALL one-shot commands (builds, tests, installs, compilation, scripts). Omit timeout to let the command run to completion \u2014 the tool handles idle detection and input prompts automatically.\n- mode='async': waits for an initial idle/output signal from the command, then returns a terminal ID and output snapshot while the process continues running. Use ONLY for processes that must keep running indefinitely (servers, watchers, daemons). Timeout caps how long to wait for the initial idle/output signal.\n\nTimeout parameter: Usually omit timeout entirely for sync commands \u2014 the tool returns automatically on completion, input-needed, or cancellation. Only set a timeout as a safety net for commands you suspect might hang. Use 0 to explicitly indicate no timeout.\n\nSync output is final: When a sync command completes, the full output is returned inline \u2014 do NOT call get_terminal_output afterward. Only use get_terminal_output if the tool result explicitly indicates the command was moved to background, timed out, or needs input. Do NOT tell the user to check the terminal panel \u2014 all command output is already included in the tool result.\n\nTerminal notifications: When an async command finishes or a sync command times out, you will be automatically notified on your next turn with the exit code and terminal output. You will also be notified if the terminal needs input. Do NOT poll or sleep to wait for completion.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "command": {
+     "type": "string",
+     "description": "The command to run in the terminal."
+    },
+    "explanation": {
+     "type": "string",
+     "description": "A one-sentence description of what the command does. This will be shown to the user before the command is run."
+    },
+    "goal": {
+     "type": "string",
+     "description": "A short description of the goal or purpose of the command (e.g., \"Install dependencies\", \"Start development server\")."
+    },
+    "mode": {
+     "type": "string",
+     "enum": [
+      "sync",
+      "async"
+     ],
+     "enumDescriptions": [
+      "Wait for command completion and return full output inline. Strongly preferred for all one-shot commands (builds, tests, installs, scripts).",
+      "Wait for an initial idle/output signal, then return a terminal ID and output snapshot while the process continues running. Timeout caps how long to wait for the initial signal. Use ONLY for processes that must keep running indefinitely (servers, watchers, daemons)."
+     ],
+     "description": "Execution mode for this command. Use sync (default) for nearly all commands."
+    },
+    "isBackground": {
+     "type": "boolean",
+     "description": "Legacy execution mode flag. Deprecated in favor of \"mode\". If true, equivalent to mode=async. If false, equivalent to mode=sync."
+    },
+    "timeout": {
+     "type": "number",
+     "description": "Optional. Usually omit entirely for sync commands \u2014 the tool waits for completion automatically. Only set a timeout (in milliseconds) as a safety net if you suspect the command might hang. If the timeout elapses, the command continues in the background and you get a terminal ID to check output later. Use 0 to explicitly indicate no timeout."
+    }
+   },
+   "required": [
+    "command",
+    "explanation",
+    "goal",
+    "mode"
+   ]
+  }
+ },
+ {
+  "name": "send_to_terminal",
+  "description": "Send input text to an active terminal execution (identified by the `id` returned from run_in_terminal). The 'command' field may be empty or whitespace to press Enter (useful for interactive prompts). By default, returns the last 20 lines of terminal output captured shortly after sending. Set 'waitForOutput' to true for interactive programs (games, REPLs, etc.) to wait until the terminal becomes idle before returning output \u2014 this gives you the program's response to your input.",
+  "inputSchema": {
+   "type": "object",
+   "properties": {
+    "id": {
+     "type": "string",
+     "description": "The ID of an active terminal execution to send a command to (returned by run_in_terminal for async executions, or for sync executions that timed out and were moved to the background).",
+     "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-5][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}$"
+    },
+    "command": {
+     "type": "string",
+     "description": "The input text to send to the terminal. The text is sent followed by Enter. Provide an empty or whitespace string to send just Enter (for interactive prompts)."
+    },
+    "waitForOutput": {
+     "type": "boolean",
+     "description": "When true, waits for the terminal to become idle (no new output for a short period) before returning, instead of returning immediately. Use this for interactive programs where you need to see the full response to your input. Defaults to false."
+    }
+   },
+   "required": [
+    "id",
+    "command"
+   ]
+  }
+ }
+]

@@ -40,9 +40,13 @@ export default {
         async function refreshReports() {
             if (!host) return;
             host.textContent = 'Loading your reports…';
+            // Only the newest load may write (see Troubleshoot's loadReports).
+            const seq = String(Number(host.dataset.loadSeq || 0) + 1);
+            host.dataset.loadSeq = seq;
+            const current = () => host.isConnected && host.dataset.loadSeq === seq;
             try {
                 const reports = await list_my_reports();
-                if (!host.isConnected) return;
+                if (!current()) return;
                 host.textContent = reports.length ? '' : 'You have no reports yet.';
                 for (const report of reports) {
                     const row = document.createElement('p');
@@ -50,7 +54,7 @@ export default {
                     row.textContent = `${status} · ${String(report.descriptionPreview || '').slice(0, 140)} · ${report.id}`;
                     host.append(row);
                 }
-            } catch { host.textContent = 'Could not load reports. Try Refresh status.'; }
+            } catch { if (current()) host.textContent = 'Could not load reports. Try Refresh status.'; }
         }
         $win.find('[data-role="feedback-body"]').on('click', '[data-action="refresh-reports"]', refreshReports);
         void refreshReports();

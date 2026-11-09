@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { chat } from '../src/client';
-import { creditState, describeGatewayError, errorOrigin, forgetGatewayModels, gatewayChat, GatewayError, gatewayModels, parseErrorBody, readCredits } from '../src/gateway';
+import { creditState, describeGatewayError, errorOrigin, forgetGatewayModels, gatewayCatalogModels, gatewayChat, GatewayError, gatewayModels, parseErrorBody, parseGatewayModels, readCredits } from '../src/gateway';
 import { credits, creditsFloor2 } from '../src/credits-format';
 import { KIMI } from '../src/gateway-messages';
 import type { StreamEvent } from '../src/types';
@@ -218,6 +218,7 @@ describe('gateway errors and credits', () => {
         [401, 'os_session_missing', 'this account has no EZiL AI access, or this computer has not received your sign-in'], [401, 'os_proxy_unauthorized', 'EZiL OS: This computer’s AI connection was refused'],
         [403, 'not_a_member', 'membership'], [403, 'account_suspended', 'suspended'], [413, 'input_too_large', 'EZiL AI: This conversation is too large for qwen. EZiL AI refused it before the model ran, so it was not charged, and the conversation is kept. Shorten your last message'],
         [400, 'unsupported_bedrock_converse_request', 'Internal EZiL Models bug (unsupported_bedrock_converse_request)'],
+        [400, 'unsupported_gemini_request', 'Internal EZiL Models bug (unsupported_gemini_request)'],
         [503, 'killswitch', 'paused'], [503, 'paused', 'paused'], [503, 'no_provider_route', 'temporarily unavailable'], [504, 'upstream_timeout', 'did not answer'], [409, 'idempotency_replay', 'already processed'],
     ] as const) test(`maps ${code}, always preserving request ID`, () => {
         const e = describeGatewayError('qwen', status, null, { code, request_id: 'body-id' }, 'header-id');
@@ -405,4 +406,28 @@ test('credits-format: the shared vectors (the OS shell pins the same ones for cr
         expect(credits(micro)).toBe(full);
         expect(creditsFloor2(micro)).toBe(floor2);
     }
+});
+
+describe('prompt cache from the catalog', () => {
+    const row = (id: string, capabilities?: Record<string, unknown>) => ({ id, enabled: true, max_input_tokens: 200_000, max_output_tokens: 16_384,
+        protocols: ['anthropic-messages'], availability: { state: 'available', reasons: [] }, ...capabilities ? { capabilities } : {} });
+    test('markers are enabled, at 5m, only for a row that says prompt_cache: true', () => {
+        const catalog = parseGatewayModels({ contract: 'ezil.gateway.models.v1', killswitch: false, pause: null, data: [
+            row('claude-sonnet-5-5', { tool_calling: true, image_input: false, streaming: true, prompt_cache: true }),
+            row('qwen.qwen3-coder-next', { tool_calling: true, image_input: false, streaming: true, prompt_cache: false }),
+            row('zai.glm-5', { tool_calling: true, image_input: false, streaming: true }),
+            row('us.moonshotai.kimi-k3'),
+            row('claude-haiku-5-5', { prompt_cache: 'yes' }),
+        ] });
+        expect(catalog?.data[0]?.capabilities?.prompt_cache).toBe(true);
+        const models = gatewayCatalogModels(gw().provider, catalog, []);
+        expect(models.filter(model => model.gatewayPromptCache === true).map(model => model.model)).toEqual(['claude-sonnet-5-5']);
+        expect(models.map(model => [model.model, model.cache])).toEqual([
+            ['claude-sonnet-5-5', { enabled: true, ttl: '5m' }],
+            ['qwen.qwen3-coder-next', { enabled: false, ttl: '5m' }],
+            ['zai.glm-5', { enabled: false, ttl: '5m' }],
+            ['us.moonshotai.kimi-k3', { enabled: false, ttl: '5m' }],
+            ['claude-haiku-5-5', { enabled: false, ttl: '5m' }],
+        ]);
+    });
 });
