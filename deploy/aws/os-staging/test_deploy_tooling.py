@@ -282,6 +282,21 @@ class RenderRuntimeTests(SandboxTestCase):
                 path.unlink() if before is None else path.write_text(before)
                 shutil.rmtree(self.box.root / "out", ignore_errors=True)
 
+    def test_production_caddyfile_carries_the_3mb_feedback_limit_only_for_that_route(self):
+        # The 3 MB feedback-POST body limit must reach the production runtime generator, not only staging:
+        # render-runtime.py copies the request_body blocks verbatim, changing only the site address.
+        caddyfile = (rendered_production(self.box) / "Caddyfile").read_text()
+        feedback = re.search(r"@feedback [^\n]*path /api/shell/feedback\n\s*request_body @feedback \{\n\s*max_size (\S+)\n", caddyfile)
+        other = re.search(r"@other [^\n]*\n\s*request_body @other \{\n\s*max_size (\S+)\n", caddyfile)
+        self.assertIsNotNone(feedback, "production Caddyfile has no feedback request_body block")
+        self.assertIsNotNone(other, "production Caddyfile has no default request_body block")
+        self.assertEqual(feedback.group(1), "3MB", "the feedback route must carry 3 MB in production")
+        self.assertEqual(other.group(1), "2MB", "every other route must stay at 2 MB in production")
+        # The 3 MB cap is scoped to the feedback route only: exactly one 3 MB and one 2 MB cap, no staging names.
+        self.assertEqual(caddyfile.count("max_size 3MB"), 1)
+        self.assertEqual(caddyfile.count("max_size 2MB"), 1)
+        self.assertNotIn("os-staging", caddyfile)
+
 
 class DeployScriptTests(SandboxTestCase):
     def test_os_env_is_strict(self):
