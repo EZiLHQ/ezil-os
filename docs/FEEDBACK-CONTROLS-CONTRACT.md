@@ -17,7 +17,7 @@ as recommended).
 | `FEEDBACK_ADMIN_EMAILS` | comma list; `/admin/feedback` fail-closed when unset |
 
 `app/src/server/shell/features.ts` → `shellFeaturesFor(email)` is the only reader.
-Shell side: features are feature-detected exactly like `endpoints.focus`. `ui.feedbackEventDiagnostics` is no env switch: always `true` on a server whose schema accepts `recentEvents[].reason`/`.correlationId` (§3), absent on an older one; the shell sends those two keys only on `true`.
+Shell side: features are feature-detected exactly like `endpoints.focus`. `ui.feedbackEventDiagnostics` (with `feedbackReportBundle` and `feedbackAppFailures`) is no standalone switch: boot advertises all three `true` only when the feedback feature is enabled, and they are absent otherwise or on an older server; the shell sends `recentEvents[].reason`/`.correlationId` (§3) only on `true`.
 
 ```
 desktopState.ui = { floatingControls: boolean, feedbackScreenshots: boolean,
