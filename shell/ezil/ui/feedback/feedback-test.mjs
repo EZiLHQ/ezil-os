@@ -573,7 +573,26 @@ try {
         assert.equal(stored(outboxKey), null); assert.equal(stored(draftKey), null);
         close();
     });
-    await check('a send that never answers times out, unlocks the form and re-sends the same id', async () => {
+    // Deadline timers are the only ones at or above the base allowance; the fakes record them instead.
+    function fakeDeadlines () {
+        const timers = [];
+        const realSetTimeout = globalThis.setTimeout, realClearTimeout = globalThis.clearTimeout;
+        globalThis.setTimeout = (fn, ms, ...rest) => {
+            if ( ms < feedback.SEND_DEADLINE.baseMs ) return realSetTimeout(fn, ms, ...rest);
+            const timer = { fn, ms, cleared: false };
+            timers.push(timer);
+            return timer;
+        };
+        globalThis.clearTimeout = timer => { if ( timers.includes(timer) ) timer.cleared = true; else realClearTimeout(timer); };
+        timers.restore = () => { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout; };
+        return timers;
+    }
+    const stalledBody = (url, options) => Promise.resolve({ status: 201, json: () => new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+    }) });
+    const queuedReport = (id, description, base64 = null) => JSON.stringify({ v: 1, clientRequestId: id, category: 'bug', description,
+        ...(base64 ? { screenshot: { contentType: 'image/png', dataBase64: base64 } } : {}) });
+    await check('a send that never answers times out, says so truthfully, unlocks the form and re-sends the same id', async () => {
         open(); setDescription('Stalled send');
         const id = payload().clientRequestId;
         const body = current().querySelector('pre').textContent;
@@ -582,22 +601,19 @@ try {
             signal = options.signal;
             signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
         });
-        const timers = [];
-        const realSetTimeout = globalThis.setTimeout;
-        globalThis.setTimeout = (fn, ms, ...rest) => {
-            if ( ms === feedback.SEND_TIMEOUT_MS.text || ms === feedback.SEND_TIMEOUT_MS.screenshot ) { timers.push({ fn, ms }); return 0; }
-            return realSetTimeout(fn, ms, ...rest);
-        };
+        const timers = fakeDeadlines();
         try {
             send(); await until(() => timers.length === 1);
-        } finally { globalThis.setTimeout = realSetTimeout; }
-        assert.equal(timers[0].ms, feedback.SEND_TIMEOUT_MS.text, 'a text-only body gets the short deadline');
-        assert.match(status(), /^Sending…/, 'setup: the request is still pending');
-        assert.equal(signal.aborted, false);
-        timers[0].fn();
-        await until(() => ! current().querySelector('[type="submit"]').disabled);
+            assert.equal(timers[0].ms, feedback.send_deadline_ms(body.length), 'the deadline follows the body size');
+            assert.ok(timers[0].ms < 60_000, 'a text report keeps a short deadline');
+            assert.match(status(), /^Sending…/, 'setup: the request is still pending');
+            assert.equal(signal.aborted, false);
+            timers[0].fn();
+            await until(() => ! current().querySelector('[type="submit"]').disabled);
+        } finally { timers.restore(); }
         assert.equal(signal.aborted, true, '🔴 the deadline aborts the request');
-        assert.match(status(), /Check your connection/);
+        assert.match(status(), /didn't answer in time.*press Send to try again/, '🔴 a timeout names the retry action');
+        assert.doesNotMatch(status(), /online|connection comes back|Check your connection/, 'no reconnect promise while online');
         assert.equal(stored(outboxKey).at(-1).body, body, 'the unanswered body stays queued');
         // Pressing Send again reuses the id, which the server answers as a replay.
         respond = async () => ({ status: 200, json: async () => ({ id: reportId, screenshotAccepted: false }) });
@@ -606,43 +622,47 @@ try {
         assert.equal(stored(outboxKey), null);
         close();
     });
-    await check('a screenshot body gets the long deadline, a stalled response body aborts, and the timer is cleared', async () => {
-        const id = '77777777-7777-4777-8777-777777777777';
-        const body = JSON.stringify({ v: 1, clientRequestId: id, category: 'bug', description: 'Large queued report',
-            screenshot: { contentType: 'image/png', dataBase64: 'A'.repeat(70 * 1024) } });
-        window.localStorage.setItem(outboxKey, JSON.stringify([{ clientRequestId: id, body, draft: null }]));
-        const timers = [];
-        const realSetTimeout = globalThis.setTimeout, realClearTimeout = globalThis.clearTimeout;
-        globalThis.setTimeout = (fn, ms, ...rest) => {
-            if ( ms !== feedback.SEND_TIMEOUT_MS.text && ms !== feedback.SEND_TIMEOUT_MS.screenshot ) return realSetTimeout(fn, ms, ...rest);
-            const timer = { fn, ms, cleared: false };
-            timers.push(timer);
-            return timer;
-        };
-        globalThis.clearTimeout = timer => { if ( timers.includes(timer) ) timer.cleared = true; else realClearTimeout(timer); };
+    await check('a large report gets a bounded size-aware deadline and a timeout never starves the queued text behind it', async () => {
+        const bigId = '77777777-7777-4777-8777-777777777777', textId = '88888888-8888-4888-8888-888888888888';
+        const big = queuedReport(bigId, 'Large queued report', 'A'.repeat(2 * 1024 * 1024));
+        const text = queuedReport(textId, 'Text queued behind it');
+        // A maximum screenshot over a 40 kbit/s uplink finishes inside its deadline, and the worst case stays bounded.
+        assert.ok(feedback.send_deadline_ms(big.length) > big.length * 8 / 40_000 * 1000, '🔴 a slow but live uplink can finish');
+        assert.ok(feedback.send_deadline_ms(Math.floor(2.5 * 1024 * 1024)) <= 12 * 60_000, 'the 2.5 MiB ceiling bounds the deadline');
+        window.localStorage.setItem(outboxKey, JSON.stringify([
+            { clientRequestId: bigId, body: big, draft: null }, { clientRequestId: textId, body: text, draft: null }]));
+        const timers = fakeDeadlines();
         flushing = true;
         try {
-            // Headers arrive, then the body stalls until the request is aborted.
-            respond = (url, options) => Promise.resolve({ status: 201, json: () => new Promise((resolve, reject) => {
-                options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
-            }) });
+            // Headers arrive for the large report, then its body stalls; the text report is answered.
+            respond = (url, options) => JSON.parse(options.body).clientRequestId === bigId ? stalledBody(url, options)
+                : Promise.resolve({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
             const first = feedback.flush_feedback_outbox();
             await until(() => timers.length === 1);
-            assert.equal(timers[0].ms, feedback.SEND_TIMEOUT_MS.screenshot, '🔴 a screenshot-sized body gets the long deadline');
+            assert.equal(timers[0].ms, feedback.send_deadline_ms(big.length));
             await tick();
             assert.equal(timers[0].cleared, false, 'setup: the body read is still pending');
             timers[0].fn();
             await first;
             assert.equal(timers[0].cleared, true, 'the deadline timer is released after an abort');
-            assert.equal(stored(outboxKey)?.[0]?.body, body, '🔴 an abort during the body read is an unanswered send');
-            respond = async () => ({ status: 200, json: async () => ({ id: reportId, screenshotAccepted: true }) });
+            assert.equal(timers.length, 2, '🔴 the flush moves past a timed-out entry');
+            assert.equal(timers[1].cleared, true, '🔴 a confirmed send clears its deadline timer');
+            assert.deepEqual(stored(outboxKey).map(entry => entry.body), [big], '🔴 an abort during the body read keeps the entry; the text went');
+            // A slow upload that answers before its deadline completes normally.
+            respond = () => new Promise(resolve => setTimeout(() => resolve({ status: 200, json: async () => ({ id: reportId, screenshotAccepted: true }) }), 5));
             await feedback.flush_feedback_outbox();
             assert.equal(stored(outboxKey), null);
-            assert.equal(timers.length, 2);
-            assert.equal(timers[1].cleared, true, '🔴 a confirmed send clears its deadline timer');
-        } finally {
-            globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout; flushing = false;
-        }
+            assert.equal(timers[2].cleared, true);
+            // A network failure (not a timeout) still stops the flush: the rest would fail the same way.
+            window.localStorage.setItem(outboxKey, JSON.stringify([
+                { clientRequestId: bigId, body: big, draft: null }, { clientRequestId: textId, body: text, draft: null }]));
+            respond = async () => { throw new TypeError('Failed to fetch'); };
+            const count = calls.length;
+            await feedback.flush_feedback_outbox();
+            assert.equal(calls.length, count + 1, 'one attempt, then wait for the network');
+            assert.equal(stored(outboxKey).length, 2);
+            window.localStorage.removeItem(outboxKey);
+        } finally { timers.restore(); flushing = false; }
     });
     await check('reports carry the switched current computer, frozen through a later switch and replay', async () => {
         const computerB = '55555555-5555-4555-8555-555555555555';

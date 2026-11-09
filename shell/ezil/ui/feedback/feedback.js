@@ -156,38 +156,43 @@ function without_event_diagnostics (body) {
 }
 
 /**
- * A stalled POST would otherwise leave "Sending…" up forever. Hitting this is
- * an unanswered send (status 0): the outbox keeps the body, and a re-send
- * reuses its clientRequestId, which the server answers as a replay.
+ * A stalled POST would otherwise leave "Sending…" up forever. The deadline is
+ * a fixed allowance plus time to upload the body at a slow uplink, so a
+ * screenshot on a weak link still finishes; the 2.5 MiB body ceiling bounds it
+ * near 11.5 minutes. Hitting it is an unanswered send (status 0, `timedOut`):
+ * the outbox keeps the body, and a re-send reuses its clientRequestId, which
+ * the server answers as a replay.
  */
-export const SEND_TIMEOUT_MS = Object.freeze({ text: 45_000, screenshot: 180_000 });
+export const SEND_DEADLINE = Object.freeze({ baseMs: 45_000, minUploadBytesPerSecond: 4096 });
+export const send_deadline_ms = bytes => SEND_DEADLINE.baseMs + Math.ceil(bytes / SEND_DEADLINE.minUploadBytesPerSecond * 1000);
 
-/** One POST. Never throws; `{ status, data }` with status 0 = no usable answer. */
+/** One POST. Never throws; `{ status, data, timedOut }` with status 0 = no usable answer. */
 async function post (body) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(),
-        body.length > 64 * 1024 ? SEND_TIMEOUT_MS.screenshot : SEND_TIMEOUT_MS.text);
+    let timedOut = false;
+    // Base64 and JSON are ASCII: the length is the byte count, give or take a non-ASCII description.
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, send_deadline_ms(body.length));
     try {
         const response = await fetch(endpoint(), { method: 'POST', credentials: 'same-origin',
             headers: { 'Content-Type': 'application/json' }, body, signal: controller.signal });
-        if ( response.status !== 200 && response.status !== 201 ) return { status: response.status, data: null };
+        if ( response.status !== 200 && response.status !== 201 ) return { status: response.status, data: null, timedOut };
         const data = await response.json();
-        return typeof data?.id === 'string' && UUID.test(data.id) ? { status: response.status, data } : { status: 0, data: null };
-    } catch { return { status: 0, data: null }; } finally { clearTimeout(timer); }
+        return typeof data?.id === 'string' && UUID.test(data.id) ? { status: response.status, data, timedOut } : { status: 0, data: null, timedOut };
+    } catch { return { status: 0, data: null, timedOut }; } finally { clearTimeout(timer); }
 }
 
 /**
  * POST one submitted body and settle the local state from the answer. Never
- * throws; resolves `{ status, data }` (status 0 = no response).
+ * throws; resolves `{ status, data, timedOut }` (status 0 = no response).
  */
 async function deliver (clientRequestId, body) {
     if ( inflight.has(clientRequestId) ) return { status: -1, data: null };
     inflight.add(clientRequestId);
     const savedDraft = read_outbox().find(entry => entry.clientRequestId === clientRequestId)?.draft;
-    let status = 0, data = null;
+    let status = 0, data = null, timedOut = false;
     try {
         // The exact, visible preview string is also the request body.
-        ({ status, data } = await post(body));
+        ({ status, data, timedOut } = await post(body));
         // FEEDBACK-DIAG rollback window: a tab that booted on a server advertising
         // `ui.feedbackEventDiagnostics` keeps that payload after the server is
         // rolled back, and the older strict schema 400s a report carrying the two
@@ -197,7 +202,7 @@ async function deliver (clientRequestId, body) {
             body = lean;
             outbox_put(clientRequestId, lean);
             window.dispatchEvent(new window.CustomEvent('ezil:feedback-downgrade', { detail: { clientRequestId, body: lean } }));
-            ({ status, data } = await post(lean));
+            ({ status, data, timedOut } = await post(lean));
         }
     } finally {
         inflight.delete(clientRequestId);
@@ -221,7 +226,7 @@ async function deliver (clientRequestId, body) {
             } catch { /* An unreadable body has nothing to restore. */ }
         }
     }
-    return { status, data };
+    return { status, data, timedOut };
 }
 
 /** Re-send every submitted-but-unconfirmed report, once each, in order. */
@@ -231,8 +236,10 @@ export async function flush_feedback_outbox () {
         // Flushes can overlap (a back/forward-cache restore runs both the icon's
         // remount and `flush_after_restore`): skip what another one has settled.
         if ( ! read_outbox().some(queued => queued.clientRequestId === entry.clientRequestId) ) continue;
-        const { status } = await deliver(entry.clientRequestId, entry.body);
-        if ( status === 0 ) break; // Still offline or unreachable: wait for the next `online`.
+        const { status, timedOut } = await deliver(entry.clientRequestId, entry.body);
+        // Still offline or unreachable: wait for the next `online`. A send that
+        // only ran out of time stays queued without holding back the rest.
+        if ( status === 0 && ! timedOut ) break;
     }
 }
 
@@ -744,6 +751,10 @@ export function open_feedback_dialog (_opts) {
             write_draft({ clientRequestId: crypto.randomUUID(), category: form.elements.category.value,
                 description: description.value, bug: bug_values() });
             result.textContent = 'Could not save this report for automatic retry. Keep this window open and press Send again, or copy your report text before leaving.';
+        } else if ( outcome.timedOut ) {
+            // The connection may be fine, so no `online` event is coming: say what will retry it.
+            result.textContent = "The server didn't answer in time. Your report is saved — press Send to try again. "
+                + 'It will also be retried the next time EZiL OS opens.';
         } else if ( retryable(outcome.status) ) {
             result.textContent = navigator.onLine === false
                 ? "You're offline. Your report is saved and will be sent when you're back online."

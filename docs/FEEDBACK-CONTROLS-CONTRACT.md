@@ -195,15 +195,14 @@ Two `localStorage` keys per account, keyed by the opaque account id from
   `persisted`); each entry is sent once even when two flushes overlap. Removed on 200/201;
   dropped on a definitive 4xx (the text then returns to the draft). Storage failures
   (blocked, quota, private mode) only lose the convenience.
-- Each POST has a client deadline, `SEND_TIMEOUT_MS`: 45 s, or 180 s when the serialized
-  body exceeds 64 KiB. The choice keys on body length, not on screenshot presence: metadata
-  is capped at 32 KiB, so only a screenshot body can exceed it, but a report with a small
-  image whose whole body stays at or under 64 KiB still gets 45 s. Hitting it aborts
-  the request, including a stalled response body, and counts as an unanswered send: the
-  entry stays queued, the form unlocks, and Send reuses its `clientRequestId`, which the
-  server answers as a replay. Known limits: the 180 s ceiling sets an upload floor of
-  about 95 kbit/s for a maximum screenshot, and a timeout retries only on the triggers
-  above, never on a timer.
+- Each POST has a client deadline, `send_deadline_ms(bodyLength)` = 45 s plus the time to
+  upload the body at 4 KiB/s (`SEND_DEADLINE`): about 46 s for a text report, about 9.5 min
+  for a maximum screenshot, and bounded near 11.5 min by the 2.5 MiB body ceiling. Hitting
+  it aborts the request, including a stalled response body, and counts as an unanswered
+  send: the entry stays queued, the form unlocks with "The server didn't answer in time…
+  press Send to try again", and Send reuses its `clientRequestId`, which the server answers
+  as a replay. A timed-out entry does not stop a flush (the next entry is still sent); a
+  network failure does, until the next trigger above. No timer re-sends on its own.
 
 ## 5. Never collected
 `document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, `log.js` ring, headers,
