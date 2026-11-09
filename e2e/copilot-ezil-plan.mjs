@@ -40,7 +40,8 @@ const check = (name, ok, detail = '') => { results.push({ name, ok: Boolean(ok),
 const rowsSel = '.action-widget .monaco-list-row, .context-view .monaco-list-row';
 const state = words => execFileSync('docker', ['exec', CONTAINER, 'sh', '-c', `printf '%s' "${words}" > ${STATE_FILE}`]);
 const posts = () => {
-  try { return JSON.parse(execFileSync('docker', ['exec', CONTAINER, 'cat', `${CAPTURE_DIR}/captured.json`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })).filter(r => r.method === 'POST' && r.path === '/ai/v1/messages'); } catch { return []; }
+  // The capture holds every request body (an Agent turn carries its tools), well past execFileSync's 1 MiB default.
+  try { return JSON.parse(execFileSync('docker', ['exec', CONTAINER, 'cat', `${CAPTURE_DIR}/captured.json`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], maxBuffer: 256 * 1024 * 1024 })).filter(r => r.method === 'POST' && r.path === '/ai/v1/messages'); } catch { return []; }
 };
 
 /** The workbench helpers for one page, or for Code inside the stand-in OS page's frame. */
@@ -166,9 +167,10 @@ try {
       state('free window');
       const windowMark = posts().length;
       await c.send(`EZIL_E2E_KIMI ${v.name} window`);
+      // Read the notice now: a warning with no action hides by itself after a while.
+      const windowToasts = (await c.toasts()).filter(t => /does not lift this window/.test(t));
       await page.waitForTimeout(5000);
       const windowSent = posts().slice(windowMark);
-      const windowToasts = (await c.toasts()).filter(t => /does not lift this window/.test(t));
       check(`${at}: Free, credit window used up: Code says no purchase lifts it, with its reset and no purchase action; one request`,
         windowSent.length === 1 && windowToasts.length === 1 && /Resets at /.test(windowToasts[0]) && !/Add credits|Upgrade/.test(windowToasts[0]),
         `${windowSent.length} request(s); ${JSON.stringify(windowToasts)}`);

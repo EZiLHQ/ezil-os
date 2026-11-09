@@ -679,8 +679,21 @@ function safeGatewayError(bytes: Uint8Array | null): Record<string, unknown> {
   for (const field of ['available_micro', 'hold_micro', 'max_affordable_output_tokens', 'input_bound_tokens', 'max_input_tokens']) {
     if (Number.isSafeInteger(raw[field]) && (raw[field] as number) >= 0) error[field] = raw[field];
   }
+  // A used-up credit window (the Gateway's docs/credit-window.md): the member's own window, so Code can say when it
+  // resets, or that a request larger than the whole window will not fit by waiting. Amounts are decimal strings (or
+  // whole numbers), resets_at a timestamp or null (no window started yet), and nothing else of the body crosses.
+  if (error.code === 'window_budget_reached') {
+    for (const field of ['budget_micro', 'used_micro', 'hold_micro']) {
+      const value = raw[field];
+      if ((typeof value === 'string' && /^[0-9]{1,20}$/.test(value)) || (Number.isSafeInteger(value) && (value as number) >= 0)) error[field] = value;
+    }
+    if (raw.resets_at === null || (typeof raw.resets_at === 'string' && WINDOW_RESET.test(raw.resets_at))) error.resets_at = raw.resets_at;
+    if (Number.isSafeInteger(raw.retry_after_seconds) && (raw.retry_after_seconds as number) >= 0) error.retry_after_seconds = raw.retry_after_seconds;
+  }
   return error;
 }
+/** An RFC 3339 timestamp as the Gateway's database writes it (`2026-11-09T21:05:33.123456+00:00`) or in UTC (`…Z`). */
+const WINDOW_RESET = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$/;
 
 /**
  * Handle one request under `/ai` on a code bridge host. Order: route

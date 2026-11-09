@@ -1361,6 +1361,40 @@ describe('plan model access (Free includes Gemini 3.8 Flash only)', () => {
     expect(gw.calls).toHaveLength(1);
   });
 
+  // The Gateway's used-up credit window (docs/credit-window.md). Code needs the member's own window numbers through this
+  // proxy to say when it resets, or that a request larger than the whole window will not fit by waiting.
+  it('relays a used-up credit window with its own window numbers and reset, and nothing else of the body', async () => {
+    const window = { budget_micro: '5000000', used_micro: '4800000', hold_micro: '400000', resets_at: '2026-11-09T21:05:33.123456+00:00', retry_after_seconds: 5400 };
+    const gw = mockGateway(() => Response.json({ error: { code: 'window_budget_reached', message: USER_JWT, request_id: 'req-window-1', ...window,
+      policy_id: 'pol-internal', account_id: USER_JWT } }, { status: 429, headers: { 'x-ezil-request-id': 'req-window-1', 'retry-after': '5400' } }));
+    const response = await handleAiProxyRequest(await post('/messages', `{"model":"${FLASH}"}`), await restricted(gw));
+    expect(response.status).toBe(429);
+    expect(await response.json()).toEqual({ error: { code: 'window_budget_reached', request_id: 'req-window-1', ...window } });
+    expect([response.headers.get('x-ezil-request-id'), response.headers.get('retry-after')]).toEqual(['req-window-1', '5400']);
+    expect(gw.calls).toHaveLength(1);
+  });
+
+  it('keeps a window that never started (resets_at null) as null, and drops any malformed window number', async () => {
+    const oversized = mockGateway(() => Response.json({ error: { code: 'window_budget_reached', budget_micro: '5000000', used_micro: '0', hold_micro: '6000000',
+      resets_at: null, retry_after_seconds: 7200 } }, { status: 429 }));
+    const kept = await handleAiProxyRequest(await post('/messages', `{"model":"${FLASH}"}`), await restricted(oversized));
+    expect(await kept.json()).toEqual({ error: { code: 'window_budget_reached', budget_micro: '5000000', used_micro: '0', hold_micro: '6000000',
+      resets_at: null, retry_after_seconds: 7200 } });
+    const malformed = mockGateway(() => Response.json({ error: { code: 'window_budget_reached', budget_micro: '12a', used_micro: -1, hold_micro: '1e9',
+      resets_at: 'tomorrow', retry_after_seconds: 1.5 } }, { status: 429 }));
+    const dropped = await handleAiProxyRequest(await post('/messages', `{"model":"${FLASH}"}`), await restricted(malformed));
+    expect(await dropped.json()).toEqual({ error: { code: 'window_budget_reached' } });
+  });
+
+  it('gives no other refusal the window numbers', async () => {
+    for (const [status, code] of [[429, 'daily_budget_reached'], [402, 'insufficient_credits']] as const) {
+      const gw = mockGateway(() => Response.json({ error: { code, budget_micro: '5000000', used_micro: '4800000', hold_micro: '400000',
+        resets_at: '2026-11-09T21:05:33Z', retry_after_seconds: 60 } }, { status }));
+      const response = await handleAiProxyRequest(await post('/messages', `{"model":"${FLASH}"}`), await restricted(gw));
+      expect(await response.json()).toEqual({ error: { code } });
+    }
+  });
+
   it('accepts only a well-formed pushed list: absent keeps, null is every model, else 1-16 distinct aliases', () => {
     expect(parsePushedModelAccess(undefined)).toEqual({ ok: true, includedModels: undefined });
     expect(parsePushedModelAccess(null)).toEqual({ ok: true, includedModels: null });

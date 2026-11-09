@@ -285,6 +285,17 @@ describe('a used-up credit window: window_limit, never a credit refusal', () => 
         }
     });
 
+    test('the reset as the OS proxy relays it (the Gateway database form) reaches the OS in toISOString form', async () => {
+        // worker/src/ai-proxy.ts safeGatewayError relays the Gateway's own resets_at, e.g. 2026-11-09T21:05:33.123456+00:00.
+        const at = Math.floor(Date.now() / 1000) * 1000 + 90 * 60_000 + 123;
+        const database = new Date(at).toISOString().replace(/\.(\d{3})Z$/, '.$1456+00:00');
+        const g = gateway(free(), windowRefusal({ budget_micro: '5000000', used_micro: '4800000', hold_micro: '400000', resets_at: database }));
+        await list(g.provider);
+        await expect(send(g.provider, `ezil/${FLASH}`)).rejects.toThrow(/Resets at /);
+        await Bun.sleep(0);
+        expect(g.intents).toEqual([{ reason: 'window_limit', requestId: REQUEST, resetsAt: new Date(at).toISOString() }]);
+    });
+
     test('a request larger than the whole window, or one before any window started: no reset, and waiting is not offered', async () => {
         for (const fields of [{ budget_micro: '5000000', used_micro: '1000000', hold_micro: '6000000', resets_at: resetsAt() },
             { budget_micro: '5000000', used_micro: '0', hold_micro: '6000000', resets_at: null }, { resets_at: null }]) {

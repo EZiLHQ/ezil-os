@@ -186,7 +186,11 @@ sets this header itself and never relays it from the Gateway. With an explicit
 or Add credits from its own billing summary.
 
 The Gateway's credit window (`429 window_budget_reached`; its
-`docs/credit-window.md`) also passes through unchanged. It is a plan allowance
+`docs/credit-window.md`) passes through with its `retry-after` and only the
+member's own window fields. Those are `budget_micro`, `used_micro` and
+`hold_micro` (decimal strings), `resets_at` (a timestamp, or `null` before any
+window has started) and `retry_after_seconds`; nothing else of that body crosses,
+and no other refusal carries them. It is a plan allowance
 checked before the wallet, so buying credits or changing plan does not lift it
 today. Code never treats it as a credit refusal. It says when the window resets,
 or that a request larger than the whole window will not fit by waiting, and it
