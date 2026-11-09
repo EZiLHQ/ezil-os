@@ -1,3 +1,5 @@
+import type { SQL } from 'drizzle-orm';
+import { PgDialect } from 'drizzle-orm/pg-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { routeComputer, type RoutedComputer } from '@/server/api/routers/compute-dispatch';
 import { getBillingDeps } from '@/server/billing/deps';
@@ -10,9 +12,11 @@ import { readLastUsageStop, readPlacement, type ResolvedPlacement } from '@/serv
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { advanceReverseMoves } from '@/server/lib/compute/provider-reverse-runtime';
 import { handleBillingSessionSweep, reverseMoveInFlightFor } from './handler';
+import { aiIncludedModelsFor } from '@/server/billing/v3/ai-models';
+import { refreshAiPlans } from '@/server/lib/ai-credential';
 import { GET, maxDuration } from './route';
 
-const mockEnv = vi.hoisted(() => ({ CRON_SECRET: undefined as string | undefined }));
+const mockEnv = vi.hoisted(() => ({ CRON_SECRET: undefined as string | undefined, CLOUDFLARE_GUACAMOLE_HMAC_SECRET: undefined as string | undefined }));
 vi.mock('@/env', () => ({ env: mockEnv }));
 vi.mock('@/server/db', () => ({ db: {} }));
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn() }));
@@ -21,7 +25,10 @@ vi.mock('@/server/lib/compute/placement', () => ({ readPlacement: vi.fn(), readL
 vi.mock('@/server/lib/compute/aws-config', () => ({ isPlacementReadEnabled: vi.fn() }));
 vi.mock('@/server/lib/compute/stop-policy', () => ({ stopComputerForPolicy: vi.fn() }));
 vi.mock('@/server/billing/store', () => ({ runningAwsComputersAfterEpochs: vi.fn() }));
-vi.mock('@/server/lib/cloudflare-guacamole-provider', () => ({ newCorrelationId: () => 'correlation' }));
+vi.mock('@/server/lib/cloudflare-guacamole-provider', () => ({ newCorrelationId: () => 'correlation',
+    resolveCloudflareGuacamoleConfig: () => ({ workerUrl: 'https://worker.test', hasHmacSecret: true, isConfigured: true }) }));
+vi.mock('@/server/lib/ai-credential', () => ({ refreshAiPlans: vi.fn(), AI_PLAN_REFRESH_LIMIT: 500, AI_PLAN_REFRESH_OPENED_WITHIN_MS: 3 * 3_600_000 }));
+vi.mock('@/server/billing/v3/ai-models', () => ({ aiIncludedModelsFor: vi.fn() }));
 vi.mock('./handler', () => ({ handleBillingSessionSweep: vi.fn(), RUNNING_GRACE_MS: 120_000,
     reverseMoveInFlightFor: vi.fn((executor: unknown) => Object.assign(async () => false, { executor })) }));
 vi.mock('@/server/lib/compute/provider-reverse-runtime', () => ({ advanceReverseMoves: vi.fn() }));
@@ -73,12 +80,38 @@ describe('GET /api/cron/billing-session-sweep', () => {
         expect(await response.json()).toEqual(counts);
         expect(handleBillingSessionSweep).toHaveBeenCalledExactlyOnceWith({ deps, now, stop: expect.any(Function),
             isStillRunning: expect.any(Function), awsStopProof: expect.any(Function), runningAwsPlacements: expect.any(Function),
-            reverseMoveInFlight: expect.any(Function) });
+            reverseMoveInFlight: expect.any(Function), refreshAiPlans: expect.any(Function) });
         expect(maxDuration).toBe(300);
         // Phase B (§5.4): the held pass's reverse-move read is built over the app database, once per sweep.
         expect(reverseMoveInFlightFor).toHaveBeenCalledExactlyOnceWith(db);
         // The handler runs the reverse pass itself; the route never runs a second one.
         expect(advanceReverseMoves).not.toHaveBeenCalled();
+    });
+
+    it('wires the AI plan refresh to live computers opened in its window, the effective plan, and no session', async () => {
+        mockEnv.CLOUDFLARE_GUACAMOLE_HMAC_SECRET = ' hmac ';
+        const findMany = vi.fn(async () => [{ id: 'c1', userId: 'u1' }, { id: 'c2', userId: 'u2' }]);
+        Object.assign(db, { query: { computers: { findMany } } });
+        const refreshed = { computers: 2, pushed: 2, stored: 2, unknown: 0, failed: 0 };
+        vi.mocked(refreshAiPlans).mockResolvedValue(refreshed);
+        vi.mocked(aiIncludedModelsFor).mockResolvedValue(['gemini-3.8-flash']);
+        const { refreshAiPlans: wired } = await wiring();
+        expect(refreshAiPlans).not.toHaveBeenCalled();
+        expect(await wired!()).toEqual(refreshed);
+        const params = vi.mocked(refreshAiPlans).mock.calls[0]![0];
+        expect(params.hmacSecret).toBe('hmac');
+        expect(params.config).toMatchObject({ workerUrl: 'https://worker.test', isConfigured: true });
+        expect(Object.keys(params).sort()).toEqual(['config', 'hmacSecret', 'includedModelsFor', 'listComputers']);
+        expect(await params.listComputers()).toEqual([{ userId: 'u1', computerId: 'c1' }, { userId: 'u2', computerId: 'c2' }]);
+        const query = (findMany.mock.calls[0] as unknown as [Record<string, unknown>])[0];
+        expect(query).toMatchObject({ columns: { id: true, userId: true }, limit: 500 });
+        // The window is measured from the sweep's own clock: deleted_at IS NULL and last_opened_at after now - 3 h.
+        const where = new PgDialect().sqlToQuery(query.where as SQL);
+        expect(where.sql).toBe('("ezil_computers"."deleted_at" is null and "ezil_computers"."last_opened_at" > $1)');
+        expect(where.params).toEqual([new Date(now.getTime() - 3 * 3_600_000).toISOString()]);
+        expect(await params.includedModelsFor('u1')).toEqual(['gemini-3.8-flash']);
+        expect(aiIncludedModelsFor).toHaveBeenCalledExactlyOnceWith('u1');
+        mockEnv.CLOUDFLARE_GUACAMOLE_HMAC_SECRET = undefined;
     });
 
     // r7 fixer (§5.4): a billing fault before the handler (its deps or their clock) still drives the reverse moves once,

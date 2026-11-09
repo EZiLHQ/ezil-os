@@ -1,15 +1,18 @@
 import { createHash, createHmac } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 
+import { deriveGuacamoleSandboxId } from './cloudflare-guacamole-provider';
 import {
     AI_CREDENTIAL_REFRESH_BEFORE_MS,
     AI_LOGOUT_TIMEOUT_MS,
+    AI_PLAN_REFRESH_BUDGET_MS,
     deleteAiCredential,
     revokeAiCredentialsOnSignout,
     currentAccessToken,
     mintAiCredentialSignature,
     pushAiCredential,
     readAccessTokenClaims,
+    refreshAiPlans,
     syncAiCredential,
     type SessionSource,
 } from './ai-credential';
@@ -228,6 +231,102 @@ describe('logout credential deletion', () => {
             identify(USER);
             await Promise.resolve();
             expect(list).not.toHaveBeenCalled();
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+});
+
+describe('refreshAiPlans (the server plan refresh, no browser)', () => {
+    const FREE = ['gemini-3.8-flash'];
+    const PAID = 'b0b0b0b0-0000-4000-8000-000000000000';
+    const FREE_OWNER = 'f0f0f0f0-0000-4000-8000-000000000000';
+    const BROKEN = 'e0e0e0e0-0000-4000-8000-000000000000';
+    const C = (n: number) => `${n}${n}${n}${n}${n}${n}${n}${n}-1111-4111-8111-111111111111`;
+    function worker(answer: (sandbox: string) => Response | Promise<Response> = () => Response.json({ ok: true, planStored: true })) {
+        const sent: { sandbox: string; body: unknown; signature: string; raw: string }[] = [];
+        const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+            const sandbox = decodeURIComponent(/\/sandbox\/([^/]+)\/ai-credential$/.exec(url)![1]!);
+            const signature = (init.headers as Record<string, string>)['x-ezil-signature']!;
+            sent.push({ sandbox, body: JSON.parse(init.body as string), signature, raw: init.body as string });
+            expect(init.method).toBe('POST');
+            return answer(sandbox);
+        });
+        return { sent, fetchImpl: fetchImpl as unknown as typeof fetch };
+    }
+
+    it("pushes each computer only its owner's current list, signed, with no token; one plan read per owner", async () => {
+        const { sent, fetchImpl } = worker();
+        const includedModelsFor = vi.fn(async (userId: string) => userId === FREE_OWNER ? FREE : null);
+        const counts = await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl, includedModelsFor,
+            listComputers: async () => [{ userId: FREE_OWNER, computerId: C(1) }, { userId: PAID, computerId: C(2) }, { userId: FREE_OWNER, computerId: C(3) }] });
+        expect(counts).toEqual({ computers: 3, pushed: 3, stored: 3, unknown: 0, failed: 0 });
+        expect(includedModelsFor.mock.calls.map(([u]) => u).sort()).toEqual([FREE_OWNER, PAID].sort());
+        const bySandbox = new Map(sent.map((s) => [s.sandbox, s]));
+        expect(bySandbox.get(deriveGuacamoleSandboxId(FREE_OWNER, C(1)))!.body).toEqual({ includedModels: FREE });
+        expect(bySandbox.get(deriveGuacamoleSandboxId(FREE_OWNER, C(3)))!.body).toEqual({ includedModels: FREE });
+        expect(bySandbox.get(deriveGuacamoleSandboxId(PAID, C(2)))!.body).toEqual({ includedModels: null });
+        for (const s of sent) {
+            expect(Object.keys(s.body as object)).toEqual(['includedModels']);
+            const ts = Number(/^t=(\d+),/.exec(s.signature)![1]);
+            expect(s.signature).toBe(mintAiCredentialSignature(SECRET, s.sandbox, s.raw, ts));
+        }
+    });
+
+    it('a plan that cannot be read sends nothing for that owner (never null), and other owners still refresh', async () => {
+        const { sent, fetchImpl } = worker();
+        const counts = await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl,
+            includedModelsFor: async (userId) => {
+                if (userId === BROKEN) return undefined;
+                if (userId === PAID) throw new Error('billing down');
+                return FREE;
+            },
+            listComputers: async () => [{ userId: BROKEN, computerId: C(1) }, { userId: PAID, computerId: C(2) }, { userId: FREE_OWNER, computerId: C(3) }] });
+        expect(counts).toEqual({ computers: 3, pushed: 1, stored: 1, unknown: 2, failed: 0 });
+        expect(sent.map((s) => [s.sandbox, s.body])).toEqual([[deriveGuacamoleSandboxId(FREE_OWNER, C(3)), { includedModels: FREE }]]);
+    });
+
+    it('an older Worker refusing a token-less body (400) is counted and the pass carries on; a stale push stores nothing', async () => {
+        const refused = deriveGuacamoleSandboxId(PAID, C(1));
+        const { sent, fetchImpl } = worker((sandbox) => sandbox === refused
+            ? Response.json({ ok: false, error: 'invalid_access_token' }, { status: 400 })
+            : Response.json({ ok: true, planStored: false }));
+        const counts = await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl, includedModelsFor: async () => null,
+            listComputers: async () => [{ userId: PAID, computerId: C(1) }, { userId: PAID, computerId: C(2) }] });
+        expect(counts).toEqual({ computers: 2, pushed: 1, stored: 0, unknown: 0, failed: 1 });
+        expect(sent).toHaveLength(2);
+    });
+
+    it('never throws, and sends nothing when unconfigured or the listing fails', async () => {
+        const { sent, fetchImpl } = worker();
+        const listComputers = vi.fn(async () => [{ userId: PAID, computerId: C(1) }]);
+        const zero = { computers: 0, pushed: 0, stored: 0, unknown: 0, failed: 0 };
+        expect(await refreshAiPlans({ config: { ...CONFIG, isConfigured: false }, hmacSecret: SECRET, fetchImpl, listComputers, includedModelsFor: async () => null })).toEqual(zero);
+        expect(await refreshAiPlans({ config: CONFIG, hmacSecret: '', fetchImpl, listComputers, includedModelsFor: async () => null })).toEqual(zero);
+        expect(listComputers).not.toHaveBeenCalled();
+        expect(await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl, includedModelsFor: async () => null,
+            listComputers: async () => { throw new Error('db down'); } })).toEqual(zero);
+        const transport = vi.fn(async () => { throw new Error('offline'); }) as unknown as typeof fetch;
+        expect(await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl: transport, listComputers, includedModelsFor: async () => null }))
+            .toMatchObject({ computers: 1, pushed: 0, failed: 1 });
+        expect(sent).toHaveLength(0);
+    });
+
+    it('is bounded: a hanging Worker is aborted at the budget and later computers are not started', async () => {
+        vi.useFakeTimers();
+        try {
+            const signals: AbortSignal[] = [];
+            const fetchImpl = vi.fn(async (_url: unknown, init?: RequestInit) => {
+                signals.push(init!.signal!);
+                return new Promise<Response>((_resolve, reject) => init!.signal!.addEventListener('abort', () => reject(new Error('aborted'))));
+            });
+            const listed = Array.from({ length: 20 }, (_, i) => ({ userId: PAID, computerId: C(i % 9 + 1) }));
+            const result = refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl: fetchImpl as unknown as typeof fetch,
+                includedModelsFor: async () => null, listComputers: async () => listed });
+            await vi.advanceTimersByTimeAsync(AI_PLAN_REFRESH_BUDGET_MS);
+            await expect(result).resolves.toMatchObject({ computers: 20, pushed: 0 });
+            expect(fetchImpl).toHaveBeenCalledTimes(8);
+            expect(signals.every((s) => s.aborted)).toBe(true);
         } finally {
             vi.useRealTimers();
         }

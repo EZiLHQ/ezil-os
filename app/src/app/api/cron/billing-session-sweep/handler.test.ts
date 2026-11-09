@@ -588,6 +588,48 @@ describe('paid sessions: no hours cap, a six-hour session rotation', () => {
         expect(advanceStaleMigrations).not.toHaveBeenCalled(); // the steps after the fault are skipped, as before
         expect(console.info).not.toHaveBeenCalledWith(expect.stringMatching(/^\{"event":"billing-sweep"/));
     });
+
+    // The AI plan refresh (ai-credential.ts refreshAiPlans) keeps background work's plan current with no browser. It runs
+    // with metering on or off, settles before the reverse pass (still last), and can never fail or block the sweep.
+    describe('AI plan refresh', () => {
+        const planCounts = { computers: 2, pushed: 2, stored: 1, unknown: 0, failed: 0 };
+        const sweep = (f: ReturnType<typeof fixture>, refreshAiPlans: () => Promise<typeof planCounts>, seconds = 1) =>
+            handleBillingSessionSweep({ deps: f.deps, now: at(seconds), stop: f.stop, isStillRunning: f.isStillRunning, refreshAiPlans });
+
+        it.each([['on', true], ['off', false]] as const)('runs once with metering %s and settles before the reverse pass', async (_m, metering) => {
+            vi.mocked(advanceReverseMoves).mockClear();
+            vi.spyOn(aiOutbox, 'drainAiCreditOutbox').mockResolvedValue({ claimed: 0, done: 0, failed: 0, retry: 0, skipped: 0 });
+            const order: string[] = [];
+            vi.mocked(advanceReverseMoves).mockImplementationOnce(async () => { order.push('reverse'); });
+            const refresh = vi.fn(async () => {
+                await new Promise(resolve => setTimeout(resolve, 5));
+                order.push('plans');
+                return planCounts;
+            });
+            const f = fixture();
+            if (!metering) { f.deps.config.enforcementEnabled = false; f.deps.config.tabEnabled = false; }
+            const counts = await sweep(f, refresh);
+            expect(refresh).toHaveBeenCalledOnce();
+            expect(order).toEqual(['plans', 'reverse']);
+            expect(counts.aiPlans).toEqual(planCounts);
+        });
+
+        it('a refresh that rejects is logged and the sweep completes; a billing fault still lets the refresh settle', async () => {
+            vi.mocked(advanceReverseMoves).mockClear();
+            vi.spyOn(aiOutbox, 'drainAiCreditOutbox').mockResolvedValue({ claimed: 0, done: 0, failed: 0, retry: 0, skipped: 0 });
+            const counts = await sweep(fixture(), async () => { throw new Error('plans down'); });
+            expect(counts.aiPlans).toBeUndefined();
+            expect(counts.examined).toBeGreaterThan(0);
+            expect(vi.mocked(console.warn).mock.calls.map(c => c[0])).toContain('[billing.ai] plan refresh unavailable');
+            const f = fixture();
+            f.store.openEpochsForSweep.mockRejectedValue(new Error('epochs down'));
+            const order: string[] = [];
+            vi.mocked(advanceReverseMoves).mockImplementationOnce(async () => { order.push('reverse'); });
+            await expect(sweep(f, async () => { await new Promise(resolve => setTimeout(resolve, 5)); order.push('plans'); return planCounts; }))
+                .rejects.toThrow(/epochs down/);
+            expect(order).toEqual(['plans', 'reverse']);
+        });
+    });
 });
 
 describe('round 6 R1-01: a held host is bounded by its session alone', () => {

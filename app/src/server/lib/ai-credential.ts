@@ -186,6 +186,117 @@ export async function syncAiCredential(params: {
     }
 }
 
+/**
+ * Computers the plan refresh reaches: opened (`last_opened_at`, stamped at most hourly while the owner is present)
+ * within this. A browser push's token lives an hour, so a computer whose token can still be usable was stamped
+ * within two hours; the third is margin. Reaching an older one stores a list that restricts and grants nothing.
+ */
+export const AI_PLAN_REFRESH_OPENED_WITHIN_MS = 3 * 60 * 60_000;
+/** Computers one refresh pass reaches, most recently opened first. */
+export const AI_PLAN_REFRESH_LIMIT = 500;
+/** The whole pass, including plan reads; it runs beside the sweep's 40 s outbox drain. */
+export const AI_PLAN_REFRESH_BUDGET_MS = 20_000;
+const AI_PLAN_REFRESH_CONCURRENCY = 8;
+
+export type AiPlanPushResult = { ok: true; stored: boolean } | { ok: false; error: string };
+
+/**
+ * The plan alone, signed exactly as a credential push but with no token: the Worker stores the list by its signed
+ * time and never touches the credential (`putAiModelAccess`). Never throws and never logs the list.
+ */
+export async function pushAiPlan(
+    config: CloudflareGuacamoleConfig,
+    hmacSecret: string,
+    sandboxName: string,
+    includedModels: readonly string[] | null,
+    signal: AbortSignal,
+    fetchImpl: typeof fetch = fetch,
+    now: number = Date.now(),
+): Promise<AiPlanPushResult> {
+    const body = JSON.stringify({ includedModels });
+    const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/ai-credential`;
+    try {
+        const res = await fetchImpl(endpoint, {
+            method: 'POST',
+            redirect: 'manual',
+            headers: { 'content-type': 'application/json', 'x-ezil-signature': mintAiCredentialSignature(hmacSecret, sandboxName, body, now) },
+            body,
+            signal: AbortSignal.any([signal, AbortSignal.timeout(5_000)]),
+        });
+        const data = await res.json().catch(() => ({})) as { ok?: unknown; planStored?: unknown };
+        // A Worker older than the plan refresh refuses a body without a token (400): logged, and the browser beat still works.
+        if (!res.ok || data.ok !== true) return { ok: false, error: `worker_http_${res.status}` };
+        return { ok: true, stored: data.planStored === true };
+    } catch {
+        return { ok: false, error: 'push_failed' };
+    }
+}
+
+export interface AiPlanRefreshCounts {
+    computers: number;
+    pushed: number;
+    stored: number;
+    /** The owner's plan could not be read: nothing is sent, and the Worker's list ages out as before. */
+    unknown: number;
+    failed: number;
+}
+
+/**
+ * The server half of plan freshness, for active work with no browser (the per-minute billing sweep): every recently
+ * opened computer gets its owner's current list from `includedModelsFor` (`aiIncludedModelsFor`, the start gate's
+ * effective plan). It sends no token, reads no session, and records no activity, presence, lease or meter. A plan
+ * read that fails sends nothing (never `null`, which is every model). Bounded by `AI_PLAN_REFRESH_BUDGET_MS`; never throws.
+ */
+export async function refreshAiPlans(params: {
+    config: CloudflareGuacamoleConfig;
+    hmacSecret: string;
+    listComputers: () => Promise<readonly { userId: string; computerId: string }[]>;
+    includedModelsFor: (userId: string) => Promise<readonly string[] | null | undefined>;
+    fetchImpl?: typeof fetch;
+    budgetMs?: number;
+}): Promise<AiPlanRefreshCounts> {
+    const counts: AiPlanRefreshCounts = { computers: 0, pushed: 0, stored: 0, unknown: 0, failed: 0 };
+    if (!params.config.isConfigured || !params.hmacSecret) return counts;
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), params.budgetMs ?? AI_PLAN_REFRESH_BUDGET_MS);
+    try {
+        const listed = await params.listComputers();
+        counts.computers = listed.length;
+        const plans = new Map<string, Promise<readonly string[] | null | undefined>>();
+        const queue = [...listed];
+        const work = async () => {
+            for (let next = queue.shift(); next !== undefined && !abort.signal.aborted; next = queue.shift()) {
+                const { userId, computerId } = next;
+                let plan = plans.get(userId);
+                if (!plan) {
+                    plan = params.includedModelsFor(userId).catch(() => undefined);
+                    plans.set(userId, plan);
+                }
+                const includedModels = await plan;
+                if (includedModels === undefined) { counts.unknown++; continue; }
+                if (abort.signal.aborted) break;
+                const result = await pushAiPlan(params.config, params.hmacSecret, deriveGuacamoleSandboxId(userId, computerId),
+                    includedModels, abort.signal, params.fetchImpl);
+                if (result.ok) {
+                    counts.pushed++;
+                    if (result.stored) counts.stored++;
+                } else counts.failed++;
+            }
+        };
+        const deadline = new Promise<void>((resolve) => abort.signal.addEventListener('abort', () => resolve(), { once: true }));
+        await Promise.race([Promise.all(Array.from({ length: AI_PLAN_REFRESH_CONCURRENCY }, work)), deadline]);
+    } catch {
+        console.warn('[ai-credential] plan refresh unavailable');
+    } finally {
+        clearTimeout(timer);
+        abort.abort();
+    }
+    // A snapshot: a push the deadline cut short may still settle after this returns.
+    const result = { ...counts };
+    if (result.unknown > 0 || result.failed > 0) console.warn('[ai-credential] plan refresh incomplete', result);
+    return result;
+}
+
 /** Signed deletion, even when the proxy kill switch is off. No bearer needed. */
 export async function deleteAiCredential(
     config: CloudflareGuacamoleConfig,
