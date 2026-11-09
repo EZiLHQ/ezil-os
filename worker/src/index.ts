@@ -641,6 +641,7 @@ import {
   aiProxyBaseUrl,
   aiProxyDisabled,
   chooseAiCredential,
+  currentModelAccess,
   deriveAiProxyToken,
   handleAiProxyRequest,
   isAiProxyPath,
@@ -658,6 +659,7 @@ import {
   readLimited,
   type StoredAiCredential,
   type StoredAiModelAccess,
+  type AiModelAccess,
 } from './ai-proxy';
 
 import { captureEditorState } from './editor-state';
@@ -977,7 +979,7 @@ interface EzilWorkspacePersistRpc {
   getAiProxyNonce(): Promise<string | null>;
   putAiCredential(credential: StoredAiCredential, signedAt: number, includedModels?: readonly string[] | null): Promise<{ stored: boolean; expiresAt: number }>;
   getAiCredential(): Promise<string | null>;
-  getAiModelAccess(): Promise<readonly string[] | null>;
+  getAiModelAccess(): Promise<AiModelAccess>;
   dropAiCredential(token?: string, signedAt?: number): Promise<void>;
   /**
    * Observe → flush → cancel the flush loop → destroy → RE-OBSERVE, returning
@@ -3927,10 +3929,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     return usableAiCredential(await this.ctx.storage.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY));
   }
 
-  /** The models the owner's plan includes; null = every model (none pushed yet, or the plan includes all). */
-  async getAiModelAccess(): Promise<readonly string[] | null> {
-    const access = await this.ctx.storage.get<StoredAiModelAccess>(AI_MODEL_ACCESS_STORAGE_KEY);
-    return Array.isArray(access?.includedModels) ? access.includedModels : null;
+  /** The models the owner's plan includes, if a fresh signed push said so; otherwise unknown (`currentModelAccess`). */
+  async getAiModelAccess(): Promise<AiModelAccess> {
+    return currentModelAccess(await this.ctx.storage.get<StoredAiModelAccess>(AI_MODEL_ACCESS_STORAGE_KEY));
   }
 
   /** Signed logout keeps a watermark; teardown/401 retain their unconditional/token-only deletion. */
@@ -7688,7 +7689,7 @@ async function handleAiProxy(request: Request, env: Env, sandboxId: string, awsN
     proxySecret: resolveNekoDerivationSecret(env),
     proxyNonce: awsNonce !== undefined ? awsNonce : sandbox ? await sandbox.getAiProxyNonce() : null,
     credential: () => sandbox ? sandbox.getAiCredential() : Promise.resolve(null),
-    modelAccess: () => sandbox ? sandbox.getAiModelAccess() : Promise.resolve(null),
+    modelAccess: () => sandbox ? sandbox.getAiModelAccess() : Promise.resolve({ known: false } as const),
     dropCredential: (token) => sandbox ? sandbox.dropAiCredential(token) : Promise.resolve(),
     fetch: (upstream) => fetch(upstream),
     log: (fields) => console.log(JSON.stringify(fields)),

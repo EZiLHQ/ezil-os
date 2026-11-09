@@ -268,12 +268,29 @@ export function usableAiCredential(stored: StoredAiCredential | undefined, now: 
 
 /**
  * The models the owner's plan includes, as the Next server last pushed them (billing v3 `aiIncludedModels`): `null`
- * is every model. Kept apart from the token, so a push that keeps an older token still updates the plan; the later
- * signed push wins.
+ * is every model, an explicit and verified answer. Kept apart from the token, so a push that keeps an older token still
+ * updates the plan; the later signed push wins.
  */
 export interface StoredAiModelAccess {
   readonly includedModels: readonly string[] | null;
   readonly signedAt: number;
+}
+
+/**
+ * How long a pushed plan list stays in force without a newer one. A present user's Code pushes one with every activity
+ * beat (each minute); a push that could not read the plan carries none and never extends this.
+ */
+export const AI_MODEL_ACCESS_MAX_AGE_MS = 30 * 60_000;
+
+/** The plan's models as the proxy acts on them. Unknown (none pushed, stale or malformed) never means every model. */
+export type AiModelAccess = { readonly known: false } | { readonly known: true; readonly includedModels: readonly string[] | null };
+
+export function currentModelAccess(stored: StoredAiModelAccess | undefined, now: number = Date.now()): AiModelAccess {
+  if (!stored || typeof stored.signedAt !== 'number' || !Number.isFinite(stored.signedAt) || now - stored.signedAt > AI_MODEL_ACCESS_MAX_AGE_MS) return { known: false };
+  const list = stored.includedModels;
+  if (list === null) return { known: true, includedModels: null };
+  return Array.isArray(list) && list.length > 0 && list.every((alias) => typeof alias === 'string' && MODEL_ALIAS.test(alias))
+    ? { known: true, includedModels: list } : { known: false };
 }
 
 /** The Gateway's model alias rule (EZiL AI Gateway src/catalog.ts MODEL_ALIAS). */
@@ -322,8 +339,8 @@ export interface AiProxyDeps {
   readonly enabled?: string;
   /** The stored user token for this sandbox, if usable. */
   readonly credential: () => Promise<string | null>;
-  /** The models the owner's plan includes (`StoredAiModelAccess`); null or absent = every model. */
-  readonly modelAccess?: () => Promise<readonly string[] | null>;
+  /** The models the owner's plan includes (`currentModelAccess`); unknown refuses inference as a temporary failure. */
+  readonly modelAccess: () => Promise<AiModelAccess>;
   /** Forget `token` if it is still the stored one (after a gateway 401). */
   readonly dropCredential: (token: string) => Promise<void>;
   readonly fetch: (input: Request) => Promise<Response>;
@@ -713,7 +730,14 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
 
   // The models the owner's plan includes (pushed with the token by the Next server). A request for any other model
   // is answered here: nothing reaches the Gateway, so nothing is held or charged. Only the body's `model` is read.
-  const included = route.method === 'POST' || route.upstreamPath === '/v1/models' ? (await deps.modelAccess?.()) ?? null : null;
+  // An unknown plan (none pushed yet, or none fresh) is never "every model": inference waits for the next push, as a
+  // temporary failure that is no billing matter. Reads (models, balance, limits, usage) pass as before.
+  const access = route.method === 'POST' || route.upstreamPath === '/v1/models' ? await deps.modelAccess() : null;
+  if (route.method === 'POST' && access?.known !== true) {
+    log({ status: 503, code: 'os_plan_unavailable' });
+    return proxyError(503, 'os_plan_unavailable', 'EZiL OS could not confirm which models your plan includes yet. Nothing was sent. Try again in a minute.');
+  }
+  const included = access?.known === true ? access.includedModels : null;
   const includedHeaders: Record<string, string> = included === null ? {} : { [AI_INCLUDED_MODELS_HEADER]: included.join(',') };
   if (included !== null && body !== undefined) {
     const model = requestModel(body);

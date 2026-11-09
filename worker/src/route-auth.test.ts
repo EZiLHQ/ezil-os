@@ -22,7 +22,7 @@
  * one proves the entrypoint starts; this one proves what it routes.
  */
 
-import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_MODEL_ACCESS_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, exactCacheScope, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
+import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_MODEL_ACCESS_MAX_AGE_MS, AI_MODEL_ACCESS_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, exactCacheScope, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
 import { beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 
 // Must be registered before `./index.ts` is imported (see module doc). The
@@ -194,7 +194,8 @@ function fakeSandboxNamespace(options: {
   };
 
   let credential: StoredAiCredential | undefined;
-  let modelAccess: readonly string[] | null = null;
+  // Plans predate these route tests: a verified every-model plan unless a push names a list.
+  let modelAccess: { known: boolean; includedModels?: readonly string[] | null } = { known: true, includedModels: null };
   let nonce: string | null = null;
   let processResult: unknown;
   const impl: Record<string, (...args: unknown[]) => Promise<unknown>> = {
@@ -204,7 +205,7 @@ function fakeSandboxNamespace(options: {
     putAiCredential: async (...args) => {
       const result = chooseAiCredential(credential, args[0] as StoredAiCredential);
       credential = result.keep;
-      if (args[2] !== undefined) modelAccess = args[2] as readonly string[] | null;
+      if (args[2] !== undefined) modelAccess = { known: true, includedModels: args[2] as readonly string[] | null };
       if (result.stored) calls.aiStored.push(result.keep);
       return { stored: result.stored, expiresAt: result.keep.expiresAt };
     },
@@ -3793,34 +3794,43 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     expect(values.has(AI_CREDENTIAL_STORAGE_KEY)).toBe(false);
   });
 
-  it('orders the plan list by its own signed time and keeps it through logout, a dropped token and teardown', async () => {
+  it('orders the plan list by its own signed time; unknown until a fresh push says, and never extended by a token-only push', async () => {
     const { obj, values } = await object();
     const expiresAt = Date.now() + 3600_000;
+    const t = Date.now() - 60_000;
     const flash = ['gemini-3.8-flash'];
-    expect(await obj.getAiModelAccess()).toBeNull();
-    await obj.putAiCredential({ token: 'a', expiresAt }, 10, flash);
-    expect(await obj.getAiModelAccess()).toEqual(flash);
+    const known = (includedModels: readonly string[] | null) => ({ known: true, includedModels });
+    expect(await obj.getAiModelAccess()).toEqual({ known: false });
+    // A push that could not read the plan (no list) leaves it unknown: never every model.
+    await obj.putAiCredential({ token: 'a', expiresAt }, t);
+    expect(await obj.getAiModelAccess()).toEqual({ known: false });
+    await obj.putAiCredential({ token: 'a', expiresAt }, t + 10, flash);
+    expect(await obj.getAiModelAccess()).toEqual(known(flash));
     // A push signed earlier (a beat that read the plan before a change landed) never overwrites a later one.
-    await obj.putAiCredential({ token: 'a', expiresAt }, 9, null);
-    expect(await obj.getAiModelAccess()).toEqual(flash);
-    // A later push that keeps the older, longer-lived token still updates the plan.
-    await obj.putAiCredential({ token: 'b', expiresAt: expiresAt - 1000 }, 11, null);
+    await obj.putAiCredential({ token: 'a', expiresAt }, t + 9, null);
+    expect(await obj.getAiModelAccess()).toEqual(known(flash));
+    // A later push that keeps the older, longer-lived token still updates the plan; null is an explicit answer.
+    await obj.putAiCredential({ token: 'b', expiresAt: expiresAt - 1000 }, t + 11, null);
     expect(await obj.getAiCredential()).toBe('a');
-    expect(await obj.getAiModelAccess()).toBeNull();
-    // Absent: the server could not read the plan this time, so it stays.
-    await obj.putAiCredential({ token: 'a', expiresAt }, 12, flash);
-    await obj.putAiCredential({ token: 'a', expiresAt }, 13);
-    expect(await obj.getAiModelAccess()).toEqual(flash);
+    expect(await obj.getAiModelAccess()).toEqual(known(null));
+    // Token-only pushes keep the last answer only for its own age: they never refresh it.
+    await obj.putAiCredential({ token: 'a', expiresAt }, t + 12, flash);
+    await obj.putAiCredential({ token: 'a', expiresAt }, t + 13);
+    expect(values.get(AI_MODEL_ACCESS_STORAGE_KEY)).toEqual({ includedModels: flash, signedAt: t + 12 });
+    expect(await obj.getAiModelAccess()).toEqual(known(flash));
     // It restricts and grants nothing: logout, a dropped token and teardown leave it for the next push to replace.
-    await obj.dropAiCredential(undefined, 14);
+    await obj.dropAiCredential(undefined, t + 14);
     await obj.dropAiCredential('a');
     await obj.dropAiCredential();
     expect(await obj.getAiCredential()).toBeNull();
-    expect(await obj.getAiModelAccess()).toEqual(flash);
+    expect(await obj.getAiModelAccess()).toEqual(known(flash));
     // A push signed at or before the logout watermark changes neither the token nor the plan.
-    await obj.putAiCredential({ token: 'c', expiresAt }, 14, null);
+    await obj.putAiCredential({ token: 'c', expiresAt }, t + 14, null);
     expect(await obj.getAiCredential()).toBeNull();
-    expect(values.get(AI_MODEL_ACCESS_STORAGE_KEY)).toEqual({ includedModels: flash, signedAt: 12 });
+    expect(values.get(AI_MODEL_ACCESS_STORAGE_KEY)).toEqual({ includedModels: flash, signedAt: t + 12 });
+    // Older than AI_MODEL_ACCESS_MAX_AGE_MS: unknown again, whatever it said.
+    values.set(AI_MODEL_ACCESS_STORAGE_KEY, { includedModels: null, signedAt: Date.now() - AI_MODEL_ACCESS_MAX_AGE_MS - 1000 });
+    expect(await obj.getAiModelAccess()).toEqual({ known: false });
   });
 
   it('serializes concurrent starts, reuses their nonce, and rotates when the stopped launcher is restarted', async () => {
