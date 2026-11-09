@@ -195,7 +195,11 @@ export function withGatewayModelLimits(model: ResolvedModel, catalog: GatewayMod
     const entry = catalog?.data.find(entry => entry.id === model.model);
     if (!entry || model.provider.type !== 'ezil-gateway') return model;
     const capabilities = entry.capabilities;
-    return { ...model, maxInputTokens: Math.min(model.maxInputTokens, entry.max_input_tokens),
+    // A row that no longer says prompt_cache: true takes the catalog-granted markers away (route moved off Claude).
+    const { gatewayPromptCache, ...rest } = model;
+    const cache = gatewayPromptCache && capabilities?.prompt_cache !== true ? { cache: { ...model.cache, enabled: false } } : {};
+    const keep = gatewayPromptCache && capabilities?.prompt_cache === true ? { gatewayPromptCache } : {};
+    return { ...rest, ...keep, ...cache, maxInputTokens: Math.min(model.maxInputTokens, entry.max_input_tokens),
         maxOutputTokens: Math.min(model.maxOutputTokens, entry.max_output_tokens),
         capabilities: { toolCalling: capabilities?.tool_calling === false ? false : model.capabilities.toolCalling,
             imageInput: model.capabilities.imageInput && capabilities?.image_input !== false },

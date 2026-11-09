@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { chat } from '../src/client';
-import { creditState, describeGatewayError, errorOrigin, forgetGatewayModels, gatewayCatalogModels, gatewayChat, GatewayError, gatewayModels, parseErrorBody, parseGatewayModels, readCredits } from '../src/gateway';
+import { creditState, describeGatewayError, errorOrigin, forgetGatewayModels, gatewayCatalogModels, gatewayChat, GatewayError, gatewayModels, parseErrorBody, parseGatewayModels, readCredits, withGatewayModelLimits } from '../src/gateway';
 import { credits, creditsFloor2 } from '../src/credits-format';
-import { KIMI } from '../src/gateway-messages';
+import { buildGatewayBody, KIMI } from '../src/gateway-messages';
 import type { StreamEvent } from '../src/types';
 import { ask, gw, msg, tool, txt } from './fixtures/gateway';
 import { frames, messageJson } from './fixtures/gateway-response';
@@ -429,5 +429,27 @@ describe('prompt cache from the catalog', () => {
             ['us.moonshotai.kimi-k3', { enabled: false, ttl: '5m' }],
             ['claude-haiku-5-5', { enabled: false, ttl: '5m' }],
         ]);
+    });
+
+    test('a refreshed row without prompt_cache: true revokes the markers before the next request', () => {
+        const catalog = (capabilities?: Record<string, unknown>) => parseGatewayModels({ contract: 'ezil.gateway.models.v1', killswitch: false, pause: null,
+            data: [row('claude-sonnet-5-5', capabilities)] });
+        const [model] = gatewayCatalogModels(gw().provider, catalog({ tool_calling: true, streaming: true, prompt_cache: true }), []);
+        expect(model?.gatewayPromptCache).toBe(true);
+        const sent = (limited: typeof model) => new TextDecoder().decode(buildGatewayBody(limited!, ask([msg('system', txt('Stable context.')), msg('user', txt('hi'))])).bytes);
+        expect(sent(withGatewayModelLimits(model!, catalog({ tool_calling: true, streaming: true, prompt_cache: true })))).toContain('cache_control');
+        for (const refreshed of [catalog({ tool_calling: true, streaming: true, prompt_cache: false }), catalog({ tool_calling: true, streaming: true }), catalog()]) {
+            const limited = withGatewayModelLimits(model!, refreshed);
+            expect(limited.gatewayPromptCache).toBeUndefined();
+            expect(limited.cache).toEqual({ enabled: false, ttl: '5m' });
+            expect(sent(limited)).not.toContain('cache_control');
+        }
+    });
+
+    test('limits never grant the markers to a model without them', () => {
+        const limited = withGatewayModelLimits({ ...gw(), model: 'claude-sonnet-5-5' }, parseGatewayModels({ contract: 'ezil.gateway.models.v1', killswitch: false,
+            pause: null, data: [row('claude-sonnet-5-5', { prompt_cache: true })] }));
+        expect(limited.gatewayPromptCache).toBeUndefined();
+        expect(limited.cache).toEqual(gw().cache);
     });
 });
