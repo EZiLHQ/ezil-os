@@ -746,9 +746,20 @@ describe('EZiL gateway VS Code bridge', () => {
             await ask([message(1, [context]), message(1, [prompt])]);
             await ask([message(1, [context, prompt]), message(2, [text, a]), message(2, [b]), results]);
             expect(assistantOf(bodies.at(-1)!).content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
-            // A system message among the turn's messages is hoisted out at the Gateway, so it does not split the turn.
-            await ask([user, message(2, [text, a]), message(3, [new TextPart('a synthetic system note')]), message(2, [b]), results]);
+            // Every system message is hoisted into the turn's effective system prompt: the same system text moved inside the
+            // split turn still restores (it does not split the turn); a new, changed or removed system note never does.
+            const note = (value: string) => message(3, [new TextPart(value)]);
+            const noted = message(1, [new TextPart('make two files, noted')]);
+            await ask([note('a synthetic system note'), noted]);
+            await ask([noted, message(2, [text, a]), note('a synthetic system note'), message(2, [b]), results]);
             expect(assistantOf(bodies.at(-1)!).content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
+            for (const notes of [[note('a synthetic system note'), note('a new synthetic note')], [note('a changed synthetic note')], []]) {
+                await ask([noted, message(2, [text, a]), ...notes, message(2, [b]), results]);
+                expect(leaked(bodies.at(-1)!)).toBe(false);
+            }
+            // Stored with no system text at all; continued with a new system note inside the turn: not restored.
+            await ask([user, message(2, [text, a]), note('new synthetic rules'), message(2, [b]), results]);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
             // System text is compared as the Gateway receives it, hoisted out in order: its position among the messages
             // does not matter, its text does.
             const rules = (value: string) => message(3, [new TextPart(value)]);
