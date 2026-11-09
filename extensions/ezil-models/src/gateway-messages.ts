@@ -1,5 +1,6 @@
 // The Bedrock Converse subset of Anthropic Messages. Construct envelopes from an allowlist;
 // never forward Copilot's provider-specific options, cache markers or unsigned thinking.
+import { applyCacheBreakpoints } from './anthropic';
 import type { GatewayProtocol, ResolvedModel } from './config';
 import { isCacheMarker, isStatefulMarker, type ChatRequest, type Message, type Part, type Tool } from './types';
 
@@ -320,6 +321,10 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
         const value = request.modelOptions[key] ?? configured;
         if (typeof value === 'number' && Number.isFinite(value)) body[key] = Math.max(0, Math.min(1, value));
     }
+    // Prompt-cache breakpoints only for a catalog row advertising prompt_cache (Claude routes); a configured cache flag never
+    // adds them. Never on a Gemini body:
+    // the Gateway's Gemini adapter refuses cache_control on any block. Placed before the byte bound so it counts them.
+    if (model.gatewayPromptCache === true && !geminiRoute(model.model)) applyCacheBreakpoints(body as unknown as Parameters<typeof applyCacheBreakpoints>[0], '5m');
     const bytes = new TextEncoder().encode(JSON.stringify(body));
     // The Gateway's limits: 1024 messages, 1024 blocks in one message, body + framing within the input allowance.
     const counts = (): LocalRequestCounts => ({
