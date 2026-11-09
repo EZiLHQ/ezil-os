@@ -476,6 +476,128 @@ test('image baseline lookup selects successful deployments on the target branch 
   assert.equal(warnings, 1);
 });
 
+const UNION_REF = 'refs/heads/staging/os-union-20261106';
+// Evaluates a job's folded `if: >-` with GitHub semantics for the operators it uses.
+function jobAdmitted(name, {ref, event, changes = 'success', images = 'success', imageChanged = 'true'}) {
+  const job = workflowText.match(new RegExp(`\\n  ${name}:\\n([\\s\\S]*?)(?=\\n  [\\w-]+:\\n|$)`))[1];
+  const condition = job.match(/\n    if: >-\n((?: {6}.*\n)+)/)[1]
+    .replace(/\s+/g, ' ').trim().replace(/^\$\{\{(.*)\}\}$/, '$1').replaceAll('==', '===');
+  return new Function('github', 'needs', 'cancelled', 'startsWith', `return (${condition})`)(
+    {ref, event_name:event},
+    {changes:{result:changes, outputs:{image_changed:imageChanged}}, images:{result:images}},
+    () => false, (value, prefix) => value.startsWith(prefix));
+}
+
+test('only a manual dispatch of the exact staging union joins preview image and staging admission', () => {
+  for (const [ref, event, images, preview, production] of [
+    [UNION_REF, 'workflow_dispatch', true, true, false],
+    [UNION_REF, 'push', false, false, false],
+    [UNION_REF, 'pull_request', false, false, false],
+    ['refs/heads/preview', 'push', true, true, false],
+    ['refs/heads/preview', 'workflow_dispatch', true, true, false],
+    ['refs/heads/main', 'push', true, false, true],
+    ['refs/heads/main', 'workflow_dispatch', true, false, true],
+    ['refs/tags/v1.2.3', 'push', false, false, true],
+    ['refs/heads/feature/x', 'workflow_dispatch', false, false, false],
+    ['refs/heads/staging/os-core-20261026', 'workflow_dispatch', false, false, false],
+    [`${UNION_REF}-copy`, 'workflow_dispatch', false, false, false],
+    ['refs/tags/staging/os-union-20261106', 'workflow_dispatch', false, false, false],
+  ]) {
+    const context = {ref, event};
+    assert.equal(jobAdmitted('images', context), images, `images ${ref} ${event}`);
+    assert.equal(jobAdmitted('preview', context), preview, `preview ${ref} ${event}`);
+    assert.equal(jobAdmitted('production', context), production, `production ${ref} ${event}`);
+  }
+  // The union keeps every preview gate: failed detection or image tests never deploy.
+  const union = {ref:UNION_REF, event:'workflow_dispatch'};
+  assert.equal(jobAdmitted('images', {...union, imageChanged:'false'}), false);
+  assert.equal(jobAdmitted('preview', {...union, images:'skipped'}), true);
+  for (const result of ['failure', 'cancelled']) {
+    assert.equal(jobAdmitted('preview', {...union, changes:result}), false, `changes ${result}`);
+    assert.equal(jobAdmitted('preview', {...union, images:result}), false, `images ${result}`);
+  }
+});
+
+test('union evidence artifacts get a slash-free name; preview, main and tag names are unchanged', () => {
+  const names = [...workflowText.matchAll(/name: (live-(?:changes|evidence)-\$\{\{ (.+?) \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\})/g)];
+  assert.equal(names.length, 3);
+  const evaluate = (expression, ref) => new Function('github', `return (${expression.replaceAll('==', '===')})`)(
+    {ref, ref_name:ref.replace(/^refs\/(?:heads|tags)\//, '')});
+  for (const [, , expression] of names) {
+    assert.equal(evaluate(expression, UNION_REF), expression === 'github.ref_name' ? 'staging/os-union-20261106' : 'staging-os-union-20261106');
+    for (const [ref, name] of [['refs/heads/preview', 'preview'], ['refs/heads/main', 'main'], ['refs/tags/v1.2.3', 'v1.2.3']]) {
+      assert.equal(evaluate(expression, ref), name);
+    }
+  }
+  // The production upload keeps its original name; the union never reaches that job.
+  assert.deepEqual(names.map(([, , expression]) => expression === 'github.ref_name'), [false, false, true]);
+});
+
+test('a manual union deployment after the preview baseline makes the next preview push rebuild', async () => {
+  const step = previewWorkflow.jobs.find(j => j.name === 'changes').steps.find(s => s.text.includes('id: deployed\n'));
+  const script = step.text.match(/script: \|\n([\s\S]*)$/)[1];
+  const execute = new (Object.getPrototypeOf(async function(){}).constructor)('github', 'context', 'core', script);
+  const baseline = {id:10, created_at:'2026-11-09T10:00:00Z', updated_at:'2026-11-09T10:40:00Z', run_attempt:1,
+    path:'.github/workflows/preview.yml', head_branch:'preview', head_sha:sha, conclusion:'success', event:'push'};
+  const union = {id:30, path:'.github/workflows/preview.yml', head_branch:'staging/os-union-20261106',
+    event:'workflow_dispatch', conclusion:'failure'};
+  for (const [branch, unionRuns, expected] of [
+    ['preview', [], {run:'10', sha, artifact:'live-evidence-preview-10-1'}],
+    ['preview', [{...union, updated_at:'2026-11-09T09:59:59Z'}], {run:'10', sha, artifact:'live-evidence-preview-10-1'}],
+    // A failed union run may still have rolled out its container: any later run counts.
+    ['preview', [{...union, updated_at:'2026-11-09T10:00:00Z'}], {}],
+    ['preview', [{...union, updated_at:'2026-11-09T11:00:00Z', conclusion:'success'}], {}],
+    ['preview', [{...union, updated_at:'2026-11-09T11:00:00Z', path:'.github/workflows/ci.yml'}],
+      {run:'10', sha, artifact:'live-evidence-preview-10-1'}],
+    ['main', [{...union, updated_at:'2026-11-09T11:00:00Z'}], {run:'10', sha, artifact:'live-evidence-main-10-1'}],
+  ]) {
+    const outputs = {}, calls = [];
+    const github = {rest:{actions:{listWorkflowRuns:async args => {
+      calls.push(args.branch);
+      if (args.branch === 'staging/os-union-20261106') {
+        assert.equal(args.event, 'workflow_dispatch');
+        assert.equal(args.status, undefined);
+        return {data:{workflow_runs:unionRuns}};
+      }
+      return {data:{workflow_runs:[{...baseline, head_branch:branch}]}};
+    }}}};
+    await execute(github, {ref:`refs/heads/${branch}`, repo:{owner:'test', repo:'os'}, runId:15},
+      {setOutput:(key, value) => { outputs[key] = value; }, warning:assert.fail});
+    assert.deepEqual(outputs, expected, `${branch} ${JSON.stringify(unionRuns)}`);
+    assert.deepEqual(calls, branch === 'preview' ? ['preview', 'staging/os-union-20261106'] : [branch]);
+  }
+  // An unavailable union listing falls back to a rebuild, never to the stale receipt.
+  let warnings = 0;
+  await execute({rest:{actions:{listWorkflowRuns:async args => {
+    if (args.branch !== 'preview') throw new Error('unavailable');
+    return {data:{workflow_runs:[baseline]}};
+  }}}}, {ref:'refs/heads/preview', repo:{owner:'test', repo:'os'}, runId:15},
+  {setOutput:assert.fail, warning:() => warnings++});
+  assert.equal(warnings, 1);
+});
+
+test('production tag verification never accepts a tested image receipt from the staging union', async () => {
+  const step = previewWorkflow.jobs.find(j => j.name === 'production').steps.find(s => s.text.includes('id: tag_receipt\n'));
+  const script = step.text.match(/script: \|\n([\s\S]*)$/)[1];
+  const execute = new (Object.getPrototypeOf(async function(){}).constructor)('github', 'context', 'core', 'process', script);
+  for (const [head_branch, event, accepted] of [
+    ['preview', 'push', true], ['main', 'workflow_dispatch', true],
+    ['staging/os-union-20261106', 'workflow_dispatch', false], ['staging/os-union-20261106', 'push', false],
+  ]) {
+    const run = {id:41, path:'.github/workflows/preview.yml', conclusion:'success', head_sha:sha, head_branch, event,
+      head_repository:{full_name:'test/os'}};
+    const result = {};
+    await execute({
+      paginate:async () => [{expired:false, workflow_run:{id:41, head_sha:sha}}],
+      rest:{actions:{listArtifactsForRepo:{}, getWorkflowRun:async () => ({data:run})}},
+    }, {repo:{owner:'test', repo:'os'}}, {
+      setOutput:(key, value) => { result[key] = value; }, setFailed:message => { result.failed = message; },
+    }, {env:{IMAGE_SOURCE:sha}});
+    assert.deepEqual(result, accepted ? {run_id:'41'} : {failed:'No retained tested image evidence from a successful branch deployment'},
+      `${head_branch} ${event}`);
+  }
+});
+
 test('failed image push remains drift on an app-only successor; untrusted or absent receipts rebuild', t => {
   const step = previewWorkflow.jobs.find(j => j.name === 'changes').steps.find(s => s.text.includes('id: image_changes\n'));
   const script = step.text.match(/run: \|\n([\s\S]*)$/)[1];
