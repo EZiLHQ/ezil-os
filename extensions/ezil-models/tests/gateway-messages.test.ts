@@ -349,3 +349,47 @@ describe('Gemini tool schemas', () => {
         }
     });
 });
+
+describe('prompt cache breakpoints', () => {
+    const CLAUDE = 'claude-sonnet-5-5';
+    const cached = (id: string, ttl: '5m' | '1h' = '5m') => ({ ...gw(), model: id, cache: { enabled: true, ttl }, gatewayPromptCache: true as const });
+    const turn1 = [msg('system', txt('Stable workspace context.')), msg('user', txt('Read the file')), msg('assistant', call('c1')), msg('user', result('c1'))];
+    const turn2 = [...turn1, msg('assistant', txt('Done')), msg('user', txt('Now summarise it'))];
+    const markers = (body: unknown) => (JSON.stringify(body).match(/"cache_control"/g) ?? []).length;
+    const unmarked = (body: unknown) => JSON.parse(JSON.stringify(body, (key, value) => key === 'cache_control' ? undefined : value));
+
+    test('off by default and off without the capability: no marker reaches the wire', () => {
+        expect(markers(buildGatewayBody(gw(), { ...ask(turn1), tools: [tool] }).bytes.toString())).toBe(0);
+        expect(new TextDecoder().decode(buildGatewayBody({ ...gw(), model: CLAUDE, cache: { enabled: true, ttl: '5m' } }, { ...ask(turn1), tools: [tool] }).bytes)).not.toContain('cache_control');
+    });
+
+    test('on a prompt_cache model: last tool, last system block and last user block, ephemeral 5m, counted in the byte bound', () => {
+        const { body, bytes } = buildGatewayBody(cached(CLAUDE, '1h'), { ...ask(turn1), tools: [tool] });
+        expect(body.tools?.at(-1)).toMatchObject({ cache_control: { type: 'ephemeral' } });
+        expect(body.system?.at(-1)).toMatchObject({ cache_control: { type: 'ephemeral' } });
+        expect(body.messages.at(-1)?.content.at(-1)).toMatchObject({ type: 'tool_result', cache_control: { type: 'ephemeral' } });
+        expect(markers(body)).toBe(3);
+        const wire = new TextDecoder().decode(bytes);
+        expect((wire.match(/"cache_control":\{"type":"ephemeral"\}/g) ?? []).length).toBe(3);
+        expect(wire).not.toContain('"ttl"');
+    });
+
+    test('never on a Gemini body, even if the model says cache is enabled', () => {
+        for (const alias of ['gemini-3.8-flash', 'gemini-4-argon']) {
+            expect(new TextDecoder().decode(buildGatewayBody(cached(alias), { ...ask(turn1), tools: [tool] }).bytes)).not.toContain('cache_control');
+        }
+    });
+
+    test('Copilot cache parts are still dropped, and at most four markers are sent', () => {
+        const body = buildGatewayBody(cached(CLAUDE), { ...ask([msg('system', txt('a'), marker), msg('user', txt('b'), marker)]), tools: [tool] }).body;
+        expect(markers(body)).toBeLessThanOrEqual(4);
+        expect(JSON.stringify(body)).not.toContain('"data"');
+    });
+
+    test('the next agent turn keeps the earlier turn as a byte-identical prefix (markers aside)', () => {
+        const first = unmarked(buildGatewayBody(cached(CLAUDE), { ...ask(turn1), tools: [tool] }).body);
+        const second = unmarked(buildGatewayBody(cached(CLAUDE), { ...ask(turn2), tools: [tool] }).body);
+        expect(JSON.stringify([second.tools, second.system])).toBe(JSON.stringify([first.tools, first.system]));
+        expect(JSON.stringify(second.messages.slice(0, first.messages.length))).toBe(JSON.stringify(first.messages));
+    });
+});

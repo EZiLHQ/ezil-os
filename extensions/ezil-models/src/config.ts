@@ -91,6 +91,8 @@ export type ResolvedModel = {
     provider: ResolvedProvider;
     model: string;
     gatewayProtocol?: GatewayProtocol;
+    /** Set only from a Gateway catalog row advertising capabilities.prompt_cache; config never sets it. */
+    gatewayPromptCache?: true;
     family: string;
     version: string;
     tooltip?: string;

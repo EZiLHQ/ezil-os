@@ -74,7 +74,7 @@ export const AVAILABILITY_REASONS = ['model_disabled', 'no_active_pricing', 'gat
     'entitlement_required', 'catalog_unavailable'] as const;
 export type GatewayAvailability = { state: typeof AVAILABILITY_STATES[number]; reasons: (typeof AVAILABILITY_REASONS[number])[] };
 /** Capability flags a row may carry. Absent means "not established": a catalog-only row gets none of them. */
-export type GatewayCapabilities = { tool_calling?: boolean; image_input?: boolean; streaming?: boolean };
+export type GatewayCapabilities = { tool_calling?: boolean; image_input?: boolean; streaming?: boolean; prompt_cache?: boolean };
 export type GatewayModel = { id: string; enabled: boolean; max_input_tokens: number; max_output_tokens: number; protocols?: readonly GatewayProtocol[];
     availability?: GatewayAvailability; name?: string; capabilities?: GatewayCapabilities };
 export type GatewayModels = { killswitch: boolean; pause: 'operations' | 'reconciliation' | null; data: GatewayModel[];
@@ -137,7 +137,7 @@ function availabilityOf(value: unknown): GatewayAvailability | undefined {
 function capabilitiesOf(value: unknown): GatewayCapabilities | undefined {
     if (!record(value)) return undefined;
     const capabilities: GatewayCapabilities = {};
-    for (const key of ['tool_calling', 'image_input', 'streaming'] as const) if (typeof value[key] === 'boolean') capabilities[key] = value[key];
+    for (const key of ['tool_calling', 'image_input', 'streaming', 'prompt_cache'] as const) if (typeof value[key] === 'boolean') capabilities[key] = value[key];
     return capabilities;
 }
 
@@ -248,7 +248,10 @@ export function gatewayCatalogModels(provider: ResolvedProvider, catalog: Gatewa
             family: entry.id, version: '1',
             maxInputTokens: entry.max_input_tokens, maxOutputTokens: Math.max(16, Math.min(16_384, entry.max_output_tokens)),
             capabilities: { toolCalling: entry.capabilities?.tool_calling === true, imageInput: false },
-            cache: { enabled: false, ttl: '5m' }, default: false, roles: [], forcedToolChoice: false,
+            // Cache markers only where the Gateway says its serving route carries them (native Anthropic, Bedrock InvokeModel
+            // Claude); its validator accepts ttl 5m only.
+            ...entry.capabilities?.prompt_cache === true ? { gatewayPromptCache: true as const } : {},
+            cache: { enabled: entry.capabilities?.prompt_cache === true, ttl: '5m' }, default: false, roles: [], forcedToolChoice: false,
             stream: entry.capabilities?.streaming === true && entry.id !== KIMI, toolReserve: DEFAULT_TOOL_RESERVE,
         });
     }
