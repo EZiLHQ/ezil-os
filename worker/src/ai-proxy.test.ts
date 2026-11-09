@@ -286,6 +286,21 @@ describe('forwarding', () => {
     }
   });
 
+  it('relays the Gemini adapter refusal code on Messages, never its message (it names a schema keyword)', async () => {
+    const gw = mockGateway(() => Response.json({ type: 'error', error: { type: 'invalid_request_error', code: 'unsupported_gemini_request',
+      message: 'Tool input_schema keyword "pattern" is not supported by Gemini (refused, not dropped).', request_id: 'gem-refusal-1' } }, {
+      status: 400, headers: { 'x-ezil-request-id': 'gem-refusal-1' },
+    }));
+    const d = await deps({ fetch: gw.fetch });
+    const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/messages`, {
+      method: 'POST', body: '{"model":"gemini-3.8-flash"}', headers: { authorization: await proxyAuth(), 'idempotency-key': 'turn-gemini' },
+    }), d);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: { code: 'unsupported_gemini_request', request_id: 'gem-refusal-1' } });
+    expect(d.logs.at(-1)).toMatchObject({ status: 400, code: 'unsupported_gemini_request', request_id: 'gem-refusal-1' });
+    expect(JSON.stringify(d.logs)).not.toContain('pattern');
+  });
+
   it('forwards member limits once with the stored bearer, dropping all caller queries and private headers', async () => {
     const body = '{"policy":{"policy":{"rpm":3},"sources":{"rpm":"user"}},"ceilings":{"rpm":60,"concurrency":2}}';
     const gw = mockGateway(() => new Response(body, { headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } }));
