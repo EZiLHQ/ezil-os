@@ -866,7 +866,18 @@ function openRecovery ($win, state, request) {
     const choice = billingRecoveryAction(state.summary, request.reason);
     // Correlation for support: Code's Gateway request id, never anything of the conversation.
     console.info('[billing] recovery', { reason: request.reason, requestId: request.requestId ?? null, action: choice?.action ?? null });
-    if ( ! choice ) return false;
+    if ( ! choice ) {
+        // No upgrade to offer here (a lapsed or legacy plan, or checkout off): Code's locked pick still lands on the plan,
+        // where its payment issue or the plans are shown. A credit refusal's callers focus the AI credits row.
+        if ( request.reason === 'model_locked' ) {
+            const plan = $win.find('[data-pane="billing"] [data-role="plan-card"]').get(0);
+            const target = plan?.querySelector('button:not([disabled])') ?? plan?.querySelector('h4, h3');
+            if ( target && target.tagName !== 'BUTTON' && ! target.hasAttribute('tabindex') ) target.setAttribute('tabindex', '-1');
+            plan?.scrollIntoView?.({ block: 'nearest' });
+            target?.focus?.({ preventScroll: true });
+        }
+        return false;
+    }
     return choice.action === 'topup' ? openSheet($win, state, 'topup', undefined, { reason: 'insufficient_credits' })
         : openSheet($win, state, choice.action, choice.sku);
 }

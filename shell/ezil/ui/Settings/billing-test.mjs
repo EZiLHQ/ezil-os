@@ -1533,6 +1533,11 @@ try {
             await window.ezil.registry.launch('settings', { ...context, initialTab: 'billing', billingRecovery: bad }); await settle();
         }
         assert.equal(sheets.length - before, 1, 'only the two recovery reasons open anything');
+        // No upgrade to offer (checkout off): a locked pick still lands on the plan card, never on nothing.
+        summary = freeWithTopup(); summary.actions.checkout = false;
+        await open({ ...context, initialTab: 'billing', billingRecovery: { reason: 'model_locked' } });
+        assert.equal(sheets.length - before, 1, 'no sheet without an upgrade');
+        assert.ok(q('[data-pane="billing"] [data-role="plan-card"]')?.contains(window.document.activeElement), 'focus lands on the plan');
         pass('Code recovery: Free gets the Standard upgrade, a paid plan Add credits, a paid model refusal nothing; once each, never doubled');
     }
     // Round 5 (D6): no operator internals on the user surface, in any AI state.
