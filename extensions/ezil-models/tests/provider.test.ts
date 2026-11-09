@@ -757,6 +757,23 @@ describe('EZiL gateway VS Code bridge', () => {
                 await ask([noted, message(2, [text, a]), ...notes, message(2, [b]), results]);
                 expect(leaked(bodies.at(-1)!)).toBe(false);
             }
+            // Storage takes the system text of the whole answered request too, also when that request ends in an assistant
+            // turn with a system note inside it; and the order of distinct system messages is part of the key.
+            const ruled = message(1, [new TextPart('continue with rules')]);
+            const zCall = message(2, [new TextPart('Earlier step.'), new ToolCallPart('toolu_z', 'create_file', { filePath: 'z', content: '0' })]);
+            const zResults = message(1, [new ToolResultPart('toolu_z', [new TextPart('done')]), new ToolResultPart('toolu_a', [new TextPart('done')]),
+                new ToolResultPart('toolu_b', [new TextPart('done')])]);
+            await ask([ruled, zCall, note('RULES B')]);
+            await ask([ruled, zCall, note('RULES B'), message(2, [text, a, b]), zResults]);
+            expect(assistantOf(bodies.at(-1)!).content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
+            await ask([ruled, zCall, message(2, [text, a, b]), zResults]);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            const ordered = message(1, [new TextPart('make two files, ordered rules')]);
+            await ask([note('RULES A'), note('RULES B'), ordered]);
+            await ask([note('RULES B'), note('RULES A'), ordered, message(2, [text, a, b]), results]);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            await ask([note('RULES A'), note('RULES B'), ordered, message(2, [text, a, b]), results]);
+            expect(assistantOf(bodies.at(-1)!).content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
             // Stored with no system text at all; continued with a new system note inside the turn: not restored.
             await ask([user, message(2, [text, a]), note('new synthetic rules'), message(2, [b]), results]);
             expect(leaked(bodies.at(-1)!)).toBe(false);
