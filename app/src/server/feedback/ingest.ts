@@ -7,6 +7,7 @@ import { feedbackAttachments, feedbackReports } from '@/server/db/schema/feedbac
 import { decodeScreenshot } from './image';
 import { fitsAttachmentBudget, isFeedbackRateLimited } from './rate-limit';
 import { feedbackFailureRefs, redactDescription, sanitizeDiagnostics } from './redact';
+import { captureServerContext } from './server-context';
 import { FEEDBACK_CATEGORIES, FEEDBACK_LIMITS, type FeedbackCreated, type FeedbackReportSummary, type FeedbackSubmit } from './types';
 
 export type FeedbackDb = Pick<
@@ -47,6 +48,11 @@ export async function ingestFeedback(
             });
             computerId = computer?.id ?? null;
         }
+        // App-error coverage: consented reports about the reporter's own computer get a submission-time server
+        // context. A failed or slow lookup still stores the report; a retry returned above never recaptures it.
+        const serverContext = diagnostics && computerId
+            ? await captureServerContext(tx as unknown as Parameters<typeof captureServerContext>[0], { userId, computerId, now })
+            : null;
         let screenshotAccepted = false;
         if (image) {
             await tx.execute(sql`select pg_advisory_xact_lock(${ATTACHMENT_LOCK}::int4, 0)`);
@@ -55,7 +61,8 @@ export async function ingestFeedback(
         const id = randomUUID();
         await tx.insert(feedbackReports).values({
             id, userId, computerId, createdAt: now, category: input.category,
-            description: description.text, diagnostics, clientRequestId: input.clientRequestId,
+            description: description.text, diagnostics: serverContext ? { ...diagnostics, serverContext } : diagnostics,
+            clientRequestId: input.clientRequestId,
             shellVersion: diagnostics?.shellVersion ?? null, status: 'new', redactionCount: description.count,
             hasScreenshot: screenshotAccepted, deploySha,
         });

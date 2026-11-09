@@ -33,6 +33,7 @@ import { ACTIVITY_FRESH_MS } from './activity-heartbeat.js';
 // Phase B: what one `computer.progress` read says about a moving open (the moving view's one reader), and the notes
 // this loop leaves the opening surface (Code and Preview hand it plain failures).
 import { moveAskOf, moveOf, noteMoveAnswer, noteMoveRead, MOVE_BUDGET_SECONDS, MOVE_WATCH_MARGIN_SECONDS } from './ui/computer-progress.js';
+import { isCorrelationId, isFailureReason } from './ui/feedback/failure-shapes.js';
 
 const NS = 'ezil-os:';
 
@@ -965,6 +966,7 @@ async function openDesktopOnce (computerId, screen, signal, intent) {
             ...(data.computeMoving === true ? { computeMoving: true } : {}),
             ...(data.computeMoveNeedsAttention === true ? { computeMoveNeedsAttention: true } : {}),
             ...capacityAttemptOf(data),
+            ...serverFailureOf(data),
             message: typeof data.error === 'string' ? data.error : undefined,
         };
     }
@@ -1039,7 +1041,19 @@ export function pendingOrRefused (data) {
         ...(data?.computePreparing === true ? { computePreparing: true } : {}),
         ...(data?.computeMoving === true ? { computeMoving: true } : {}),
         ...(data?.computeMoveNeedsAttention === true ? { computeMoveNeedsAttention: true } : {}),
-        ...capacityAttemptOf(data) };
+        ...capacityAttemptOf(data), ...serverFailureOf(data) };
+}
+
+/**
+ * App-error coverage: the server's own request id and bounded refusal code for this answer (`awsAnswered`), so the
+ * open's failure capture can record them on the local telemetry mirror. Only the explicit fields, each re-checked;
+ * never `error`'s free text.
+ */
+export function serverFailureOf (data) {
+    return {
+        ...(isCorrelationId(data?.correlationId) ? { serverCorrelationId: data.correlationId } : {}),
+        ...(isFailureReason(data?.refusalReason) ? { reason: data.refusalReason } : {}),
+    };
 }
 
 /** RETRY-118: only a `capacity_attempt_expired` answer carries the attempt an explicit Retry may reset. */

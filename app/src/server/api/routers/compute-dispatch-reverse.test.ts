@@ -92,6 +92,9 @@ const moving = { ok: false, error: 'computer_moving', errorCode: 'sandbox_starti
     provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2', computeMoving: true };
 const blocked = { ok: false, error: 'computer_move_needs_attention', errorCode: 'preconditions_unmet', retryable: false,
     provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2', computeMoveNeedsAttention: true };
+// App-error coverage: the open routes' answers also carry the ask's own correlationId and the bounded reason (`awsAnswered`).
+const routedMoving = { ...moving, correlationId: expect.any(String), refusalReason: 'computer_moving' };
+const routedBlocked = { ...blocked, correlationId: expect.any(String), refusalReason: 'computer_move_needs_attention' };
 /** A paid Standard period around the billing clock (standing.test.ts's fixture shape). */
 const paidSub = { stripeSubscriptionId: 'sub', status: 'active', sku: 'standard_monthly_v3',
     currentPeriodStart: new Date('2026-10-10T00:00:00Z'), currentPeriodEnd: new Date('2026-11-10T00:00:00Z'), cancelAtPeriodEnd: false };
@@ -242,7 +245,7 @@ describe('the open routes during a move (§5.3, r6): the move\'s answer right af
             const { db, fake } = world([held({ state: 'MOUNTING', instance_type: instanceType, generation: 8, lease_epoch: 12 })], { moves: [moveRow({ state: 'booting' })] });
             const answer = await open(db, procedure);
             // toEqual: no computePreparing, computeLaunching or computeMigrating, and error keeps the provider code.
-            expect(answer).toEqual(moving);
+            expect(answer).toEqual(routedMoving);
             expect(h.gate).not.toHaveBeenCalled();
             expect(h.sync).not.toHaveBeenCalled();
             expect(h.preview).not.toHaveBeenCalled();
@@ -259,7 +262,7 @@ describe('the open routes during a move (§5.3, r6): the move\'s answer right af
         'r9 (§5.9): %s during a move answers the move whatever the ask\'s intent (none, open, warm, any other), with no new row', async (_surface, procedure) => {
             for (const intent of [undefined, 'open', 'warm', 'other']) {
                 const w = world([held({ state: 'MOUNTING', instance_type: 'm6i.large', generation: 8, lease_epoch: 12 })], { moves: [moveRow({ state: 'copying' })] });
-                expect(await open(w.db, procedure, undefined, intent)).toEqual(moving);
+                expect(await open(w.db, procedure, undefined, intent)).toEqual(routedMoving);
                 expect(w.moves).toHaveLength(1);
             }
             expect(h.gate).not.toHaveBeenCalled();
@@ -267,7 +270,7 @@ describe('the open routes during a move (§5.3, r6): the move\'s answer right af
         });
     it.each(surfaces)('%s: an open-blocked row answers the blocked value (deterministic, no spinner, no re-ask)', async (surface, procedure) => {
         const { db } = world([held()], { moves: [moveRow({ state: 'failed_needs_operator', last_error: 'boot_unsettled' })] });
-        expect(await open(db, procedure)).toEqual(blocked);
+        expect(await open(db, procedure)).toEqual(routedBlocked);
         expect(h.gate).not.toHaveBeenCalled();
         expect(lines()).toEqual([expect.objectContaining({ surface, error: 'preconditions_unmet', reason: 'computer_move_needs_attention' })]);
     });
@@ -293,7 +296,7 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
     const stopped = () => world([openable()]);
     it('a held STOPPED computer: an open saying intent \'open\' creates an open row, schedules one immediate drive and answers the waiting value', async () => {
         const w = stopped();
-        expect(await open(w.db, 'previewUrl', undefined, 'open')).toEqual(moving);
+        expect(await open(w.db, 'previewUrl', undefined, 'open')).toEqual(routedMoving);
         expect(w.moves).toEqual([expect.objectContaining({ computer_id: C, user_id: U, started_by: 'open', state: 'requested' })]);
         expect(h.schedule).toHaveBeenCalledWith(w.moves[0]!.id);
         expect(h.gate).not.toHaveBeenCalled();
@@ -319,7 +322,7 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
         expect(w.fake.placements[0]).toMatchObject({ state: 'STOPPED', lifecycle_job_id: null });
         // Control: the same computer, asked with intent 'open' (the r9 shell's real open), moves.
         h.gate.mockClear();
-        expect(await open(w.db, procedure, undefined, 'open')).toEqual(moving);
+        expect(await open(w.db, procedure, undefined, 'open')).toEqual(routedMoving);
         expect(w.moves).toEqual([expect.objectContaining({ started_by: 'open', state: 'requested' })]);
         expect(h.schedule).toHaveBeenCalledTimes(1);
         expect(h.gate).not.toHaveBeenCalled();
@@ -358,7 +361,7 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
         expect(await guac(w.db).previewUrl({ sessionId: C, computerId: C, intent: 'warm' })).toEqual(warmHeld);
         expect(w.moves).toEqual([]);
         // The click (the same body with r9's intent 'open') is the open: it starts the move and answers the waiting value.
-        expect(await guac(w.db).previewUrl({ sessionId: C, computerId: C, screen, intent: 'open' })).toEqual(moving);
+        expect(await guac(w.db).previewUrl({ sessionId: C, computerId: C, screen, intent: 'open' })).toEqual(routedMoving);
         expect(w.moves).toEqual([expect.objectContaining({ started_by: 'open', state: 'requested' })]);
         expect(h.schedule).toHaveBeenCalledTimes(1);
         expect(h.gate).not.toHaveBeenCalled();
@@ -394,12 +397,12 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
     });
     it('r8 (§5.9): a warm on a computer with a move in flight still answers computeMoving (routing unchanged), with no new row', async () => {
         const w = world([openable({ state: 'MOUNTING', generation: 8, lease_epoch: 12 })], { moves: [moveRow({ state: 'copying' })] });
-        expect(await guac(w.db).previewUrl({ sessionId: C, computerId: C, screen, intent: 'warm' })).toEqual(moving);
+        expect(await guac(w.db).previewUrl({ sessionId: C, computerId: C, screen, intent: 'warm' })).toEqual(routedMoving);
         expect(w.moves).toHaveLength(1);
         expect(h.gate).not.toHaveBeenCalled();
         expect(lines()).toEqual([expect.objectContaining({ surface: 'desktop', error: 'sandbox_starting', reason: 'computer_moving' })]);
         const stuck = world([openable()], { moves: [moveRow({ state: 'failed_needs_operator', last_error: 'boot_unsettled' })] });
-        expect(await guac(stuck.db).previewUrl({ sessionId: C, computerId: C, intent: 'warm' })).toEqual(blocked);
+        expect(await guac(stuck.db).previewUrl({ sessionId: C, computerId: C, intent: 'warm' })).toEqual(routedBlocked);
     });
     it.each([
         ['a paid standing', { subs: [paidSub] }],
@@ -425,7 +428,7 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
         h.gate.mockClear();
         const click = make();
         const clickAnswer = await guac(click.db, email).previewUrl({ sessionId: C, computerId: C, screen, intent: 'open' });
-        expect(warmAnswer).toEqual(clickAnswer);
+        expect({ ...warmAnswer, correlationId: 'one ask' }).toEqual({ ...clickAnswer, correlationId: 'one ask' });
         expect(warmAnswer).toMatchObject({ ok: false, errorCode: 'billing_files_on_aws' });
         expect(warmGate).toHaveLength(1);
         expect(warmGate).toEqual(gateCalls());
@@ -434,7 +437,7 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
     });
     it('r7 fixer (§5.9): Code is an open too: a held STOPPED std-2 computer gets an open row and the waiting value (r9: the mint says intent \'open\')', async () => {
         const w = stopped();
-        expect(await open(w.db, 'codePreviewUrl', undefined, 'open')).toEqual(moving);
+        expect(await open(w.db, 'codePreviewUrl', undefined, 'open')).toEqual(routedMoving);
         expect(w.moves).toEqual([expect.objectContaining({ computer_id: C, user_id: U, started_by: 'open', state: 'requested' })]);
         expect(h.schedule).toHaveBeenCalledWith(w.moves[0]!.id);
         expect(h.gate).not.toHaveBeenCalled();
@@ -442,7 +445,7 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
         expect(lines()).toEqual([expect.objectContaining({ event: 'aws-preview', surface: 'code', error: 'sandbox_starting', reason: 'computer_moving' })]);
         // A run that ended over a minute ago is outside the stop hold: still a trigger.
         const later = world([openable()], { lastStop: new Date(Date.now() - 61_000) });
-        expect(await open(later.db, 'codePreviewUrl', undefined, 'open')).toEqual(moving);
+        expect(await open(later.db, 'codePreviewUrl', undefined, 'open')).toEqual(routedMoving);
         expect(later.moves).toEqual([expect.objectContaining({ started_by: 'open' })]);
     });
     it('r7 fixer (§5.9): Code within the stop hold creates no row and still answers computer_stopped (a leftover poll)', async () => {
@@ -453,7 +456,7 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
         expect(h.schedule).not.toHaveBeenCalled();
         // The desktop open is never held (Settings → Open desktop still starts it): it triggers, and never reads the stop hold.
         const desk = world([openable()], { lastStop: new Date(Date.now() - 10_000) });
-        expect(await open(desk.db, 'previewUrl', undefined, 'open')).toEqual(moving);
+        expect(await open(desk.db, 'previewUrl', undefined, 'open')).toEqual(routedMoving);
         expect(desk.moves).toEqual([expect.objectContaining({ started_by: 'open' })]);
         expect(desk.fake.statements.some(st => st.sql.includes('placement:usage-last-stop'))).toBe(false);
     });
@@ -505,7 +508,7 @@ describe('the next-open trigger (D20, §5.9): previewUrl and codePreviewUrl, bef
     it('a STOPPED computer still carrying its last session\'s lease is a trigger (a stop never clears lease_until)', async () => {
         // A D16 hold session renewed the lease up to an hour ahead, then stopped: the next open moves the files (moveOnOpen).
         const w = world([openable({ lease_until: new Date(Date.now() + 50 * 60_000), presence_at: new Date(Date.now() - 10 * 60_000) })]);
-        expect(await open(w.db, 'previewUrl', undefined, 'open')).toEqual(moving);
+        expect(await open(w.db, 'previewUrl', undefined, 'open')).toEqual(routedMoving);
         expect(w.moves).toEqual([expect.objectContaining({ computer_id: C, user_id: U, started_by: 'open', state: 'requested' })]);
         expect(h.gate).not.toHaveBeenCalled();
     });
@@ -743,7 +746,7 @@ describe('seam U → A: the shell\'s requests reach the real computer router ove
         expect(seen.map(s => s.body)).toEqual([{ computerId: C, intent: 'warm' }, { computerId: C, intent: 'open' }]);
         expect(seen[0]!.answer).toEqual({ ok: false, error: 'computer_stopped', errorCode: 'computer_stopped', retryable: false,
             provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2' });
-        expect(seen[1]!.answer).toEqual(moving);
+        expect(seen[1]!.answer).toEqual(routedMoving);
         // The window gets the move (its own open then takes the wait over), never the warm's answer.
         expect(res).toMatchObject({ ok: false, errorCode: 'sandbox_starting', computeMoving: true });
         expect(w.moves).toEqual([expect.objectContaining({ started_by: 'open', state: 'requested' })]);
@@ -794,7 +797,7 @@ describe('seam U → A: the shell\'s requests reach the real computer router ove
         warmJs._resetForTests();
         const res = await warmJs.claim(C);
         expect(seen.map(s => s.body)).toEqual([{ computerId: C, intent: 'open' }]);
-        expect(seen[0]!.answer).toEqual(moving);
+        expect(seen[0]!.answer).toEqual(routedMoving);
         expect(res).toMatchObject({ ok: false, errorCode: 'sandbox_starting', computeMoving: true });
         expect(w.moves).toEqual([expect.objectContaining({ started_by: 'open', state: 'requested' })]);
         expect(h.gate).not.toHaveBeenCalled();
@@ -815,7 +818,7 @@ describe('seam U → A: the shell\'s requests reach the real computer router ove
         const w = world([held({ instance_type: 'm6i.large' })]);
         const seen = shellRoutes(w.db);
         await post('/api/shell/code-preview-url', { computerId: C, intent: 'open' });
-        expect(seen.map(s => s.answer)).toEqual([moving]);
+        expect(seen.map(s => s.answer)).toEqual([routedMoving]);
         expect(w.moves).toEqual([expect.objectContaining({ started_by: 'open', state: 'requested' })]);
         expect(h.schedule).toHaveBeenCalledTimes(1);
         expect(h.gate).not.toHaveBeenCalled();

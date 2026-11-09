@@ -483,6 +483,8 @@ describe('routers: AWS previews use their own Worker route', () => {
         await expect(open()).resolves.toEqual({
             ok: false, error: 'sandbox_starting', errorCode: 'sandbox_starting',
             provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2',
+            // App-error coverage: the ask's own id and the Worker's allow-listed code, never its `reason` text.
+            correlationId: expect.any(String), refusalReason: error,
         });
         const out = await open();
         expect(out).toMatchObject({ ...ready, provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2' });

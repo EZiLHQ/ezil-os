@@ -5,6 +5,7 @@ import { db } from '@/server/db';
 import { isFeedbackAdmin } from '@/server/feedback/admin';
 import { updateFeedbackStatus, deleteFeedbackReport, feedbackAdminQueries, loadFeedbackList, loadFeedbackReport } from '@/server/feedback/admin-queries';
 import { appFailureRecordSchema, diagnosticsSchema, FEEDBACK_STATUSES } from '@/server/feedback/types';
+import { serverContextSchema } from '@/server/feedback/server-context';
 import { createClient } from '@/utils/supabase/server';
 
 export const dynamic = 'force-dynamic';
@@ -58,6 +59,7 @@ export default async function FeedbackAdminPage({ searchParams }: {
                         <h3 className="font-semibold">Diagnostics</h3>
                         <pre className="overflow-x-auto whitespace-pre-wrap break-words text-xs">{JSON.stringify(report.diagnostics, null, 2) ?? 'None'}</pre>
                         <AppFailureDiagnostics diagnostics={report.diagnostics} />
+                        <ServerContext value={report.serverContext} />
                         {report.hasScreenshot ? (
                             <p><a href={`/api/admin/feedback/screenshot?id=${encodeURIComponent(report.id)}`} className="underline">View screenshot</a></p>
                         ) : <p className="text-sm text-offwhite/60">No screenshot available.</p>}
@@ -152,6 +154,51 @@ function AppFailureDiagnostics({ diagnostics }: { diagnostics: unknown }) {
                     </li>
                 ))}
             </ol>
+        </section>
+    );
+}
+
+/**
+ * App-error coverage: server-added at submission, after consent and ownership (`server-context.ts`). It is
+ * not part of what the reporter previewed or posted, and it describes submission time, not the error's time.
+ * A table, never a second `<pre>`: the Diagnostics block above stays the only verbatim client data.
+ */
+function ServerContext({ value }: { value: unknown }) {
+    if (value === null || value === undefined) return null;
+    const parsed = serverContextSchema.safeParse(value);
+    const rows: [string, string][] = !parsed.success ? [['outcome', 'unreadable']] : [
+        ['capturedAt', parsed.data.capturedAt],
+        ['outcome', parsed.data.outcome],
+        ...(parsed.data.selected ? [
+            ['selected placement provider', parsed.data.selected.provider],
+            ['selected placement state', parsed.data.selected.state],
+            ['selected migration', parsed.data.selected.migration
+                ? `${parsed.data.selected.migration.direction} · ${parsed.data.selected.migration.state}` : '—'],
+            ['selected unreleased reservation', parsed.data.selected.migration
+                ? (parsed.data.selected.migration.unreleasedReservation ? 'yes' : 'no') : '—'],
+            ['selected reverse move', parsed.data.selected.reverseMove
+                ? `${parsed.data.selected.reverseMove.direction} · ${parsed.data.selected.reverseMove.state}` : '—'],
+        ] as [string, string][] : []),
+        ...(parsed.data.otherComputers ? [
+            ['own other AWS placements', parsed.data.otherComputers.awsPlacements],
+            ['own other unreleased reservations', parsed.data.otherComputers.unreleasedReservations],
+            ['own other active capacity demands', parsed.data.otherComputers.activeDemands],
+        ] as [string, string][] : []),
+    ];
+    return (
+        <section aria-labelledby="server-submission-context" className="space-y-3">
+            <h3 id="server-submission-context" className="font-semibold">Server context at submission</h3>
+            <p className="text-sm text-offwhite/60">Added by the server when the report was stored, after diagnostics consent and ownership checks. It was not part of the reporter’s preview, and it describes the reporter’s own compute state at submission time, not when the error happened.</p>
+            <table className="w-full text-left text-sm">
+                <tbody>
+                    {rows.map(([field, text]) => (
+                        <tr key={field} className="border-b border-offwhite/10">
+                            <th scope="row" className="py-1 pr-4 font-medium">{field}</th>
+                            <td className="break-words py-1">{text}</td>
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
         </section>
     );
 }

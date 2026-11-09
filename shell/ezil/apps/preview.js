@@ -327,7 +327,7 @@ export async function openPreviewWindow (ctx = {}) {
             console.error(`[${PHASE}] preview mint failed after ${Math.round(performance.now() - t0)}ms: ${res.errorCode}`);
             telemetry.capture({
                 eventClass: 'api_failure', site: 'ezil-os:apps/preview#mint', code: res.errorCode,
-                durationMs: performance.now() - t0,
+                durationMs: performance.now() - t0, reason: res.reason, serverCorrelationId: res.serverCorrelationId,
             });
             progress.render(computeBootUiState({
                 requestStatus: 'error',
