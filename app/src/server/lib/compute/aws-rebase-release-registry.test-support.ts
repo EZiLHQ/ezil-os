@@ -133,7 +133,7 @@ export function fixtureReleaseRegistry19() {
 }
 
 /** Synthetic twentieth to twenty-fourth normal records; not actual 1.0.26+ release proof.
- * The count cap is 24: the hashed readback no longer bounds the registry, only the 65,536-byte secret does. */
+ * The hashed readback no longer bounds the registry, only the count cap and the 65,536-byte secret do. */
 export function fixtureReleaseRegistry24() {
     const f = fixtureReleaseRegistry19();
     const later = [26, 27, 28, 29, 30].map((n, i) => ({ ...f.release124, amiId: `ami-${String(20 + i).padStart(17, '0')}`,
@@ -141,4 +141,13 @@ export function fixtureReleaseRegistry24() {
     const release130 = later[4]!;
     return { ...f, later, release130, retained: [...f.retained, ...later],
         deployment130: { ...f.deployment124, amiId: release130.amiId } };
+}
+
+/** Synthetic twenty-fifth normal record at the count cap; not actual release proof. */
+export function fixtureReleaseRegistry25() {
+    const f = fixtureReleaseRegistry24();
+    const release131 = { ...f.release130, amiId: 'ami-00000000000000025', recipeVersion: '1.0.31',
+        createdAt: '2026-11-06T20:00:00.000Z' };
+    return { ...f, release131, retained: [...f.retained, release131],
+        deployment131: { ...f.deployment130, amiId: release131.amiId } };
 }
