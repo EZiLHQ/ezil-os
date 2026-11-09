@@ -485,8 +485,10 @@ records referenced by placements or unfinished jobs. At fourteen records the too
 refuses a fifteenth; it never guesses whether a record can be collected. Registry
 identity is `(lowerImageDigest, amiId)`: duplicate pairs and changes to
 an existing pair refuse, including attempts to fill historical null fields.
-Different AMIs may share a lower. The app resolver still refuses ambiguous
-shared-lower source placements; source disambiguation by observed AMI is deferred.
+Different AMIs may share a lower. The app resolver disambiguates shared-lower
+sources: `resolveRebaseReleases` (aws-rebase-release.ts) selects a provisioned pool
+host by its full tuple, otherwise filters multiple aliases by the observed source
+AMI, and a unique lower needs no observation.
 
 `registry-gc` collects exactly one record against quiesced, fenced, hash-bound
 evidence. A referencing row that links the candidate *only* through its
@@ -496,10 +498,16 @@ attestation or binding **iff** a retained record keeps that same lower digest an
 no non-terminated instance runs the candidate AMI; otherwise the row keeps its
 ordinary attestation/binding, or the whole GC is refused when the candidate AMI is
 observably live. A row that also references a non-digest identity token (AMI, state
-machine/launch-template/recipe version) is never exempted this way. An execution's
-retained data volume (rule R2: `vol-` with empty SnapshotId, unattached, owned by one
-such shared-lower placement) takes a `retained-data-volume` disposition, validated
-against inventory with the same strictness as every other disposition.
+machine/launch-template/recipe version), including one hidden in a string prefix
+before embedded JSON, is never exempted this way, and `executions`/`imageJobs` rows
+are exempted only when the row is itself terminal. R1's safety rests on the app's
+`resolveRebaseReleases` semantics above: a lower-only link resolves identically
+against any retained alias with the same lower. An execution's retained data volume
+(rule R2: `vol-` with empty SnapshotId, unattached, owned by one such shared-lower
+placement) takes a `retained-data-volume` disposition, validated against inventory
+with the same strictness as every other disposition. `begin_operation`'s registry-gc
+app pin is structural — the plan app tag is the first twelve hex of its app gitSha and
+the live gitSha equals the plan's — not a fixed tag, so GC runs under later plans.
 
 For A3, a maintenance bake keeps its maintenance source lower ID, changes the
 reviewed agent commit, clears both previous parameters, and records

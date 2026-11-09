@@ -212,10 +212,11 @@ def collect(directory, candidate_name, context=None):
         for row in evidence['sources'][name]['rows']:
             if not gc.references(row, candidate):
                 continue
-            # R1 shared-lower: a row linked only by the candidate's lower digest needs no
-            # attestation/binding when a retained record keeps the lower and the candidate
+            # R1 shared-lower: a terminal row linked only by the candidate's lower digest needs
+            # no attestation/binding when a retained record keeps the lower and the candidate
             # AMI is not live. Emit no attestation and no unresolved entry; just count it.
-            if (gc.references_only_lower(row, candidate) and gc.shared_lower_kept(snapshot, candidate)
+            if (gc.references_only_lower(row, candidate) and gc.r1_eligible(name, row)
+                    and gc.shared_lower_kept(snapshot, candidate)
                     and not gc.candidate_ami_observable(evidence, candidate)):
                 shared_lower += 1
                 continue

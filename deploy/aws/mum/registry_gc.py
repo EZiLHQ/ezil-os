@@ -133,8 +133,18 @@ def references_only_lower(value, candidate):
     from/to digest). If any non-digest identity token (AMI, state-machine/launch-
     template/recipe version) also links the row, this is False and the row keeps its
     ordinary attestation/binding requirement.
+
+    references() dives into the first embedded {/[ and never scans the surrounding
+    string, so a non-digest token hidden in a plain-text prefix is also rejected here as
+    a substring of the whole canonical value (fail-closed), using references()'s own
+    >12-character threshold so the short recipeVersion keeps its exact-match semantics.
     """
-    return references(value, candidate) and not references(value, dict(candidate, lowerImageDigest=None))
+    masked = dict(candidate, lowerImageDigest=None)
+    if not references(value, candidate) or references(value, masked):
+        return False
+    blob = canonical(value).decode()
+    tokens = [masked[k] for k in IDENTITY_KEYS if k != 'launchTemplateVersion' and masked[k] and len(masked[k]) > 12]
+    return not any(token in blob for token in tokens)
 
 
 def shared_lower_kept(snapshot, candidate):
@@ -148,6 +158,22 @@ def candidate_ami_observable(evidence, candidate):
     return any(instance.get('ImageId') == candidate['amiId']
                and (instance.get('State') or {}).get('Name') != 'terminated'
                for instance in evidence['sources']['instances']['rows'])
+
+
+# Terminal image-job phases, re-derived from the app's IMAGE_JOB_NEXT (aws-rebase-store.ts):
+# the phases with no outgoing transition. A non-terminal job may still change, so R1 never
+# exempts it.
+TERMINAL_IMAGE_JOB_PHASES = frozenset({'succeeded', 'recovered', 'cancelled'})
+
+
+def r1_eligible(name, row):
+    """R1 exempts an executions/imageJobs row only when the row is itself terminal, so a row
+    that may still mutate keeps its ordinary attestation/binding. Other sources pass through."""
+    if name == 'executions':
+        return isinstance(row, dict) and row.get('status') in TERMINAL
+    if name == 'imageJobs':
+        return isinstance(row, dict) and row.get('phase') in TERMINAL_IMAGE_JOB_PHASES
+    return True
 
 
 # Every exemption binds one whole canonical source row. Proof documents are
@@ -274,6 +300,7 @@ def retained_data_volume(evidence, snapshot, candidate, resource, disposition):
     record keeps the lower and no live candidate-AMI instance exists before exempting it.
     Rows are hash-bound by check_evidence; no caller-supplied claim is trusted here.
     """
+    need(set(disposition) == {'disposition'}, 'GC retained-data-volume unexpected disposition fields')
     volumes = [v for v in evidence['sources']['volumes']['rows'] if v.get('VolumeId') == resource]
     need(resource.startswith('vol-') and len(volumes) == 1
          and not volumes[0].get('SnapshotId') and not volumes[0].get('Attachments'),
@@ -357,7 +384,8 @@ def check_attestations(evidence, snapshot, candidate, views=None):
     # resolver select the candidate by observed AMI, so the alias is not substitutable.
     exempt = set()
     if shared_lower_kept(snapshot, candidate):
-        shared = [(name, row) for name, row in refs if references_only_lower(view(name, row), candidate)]
+        shared = [(name, row) for name, row in refs
+                  if references_only_lower(view(name, row), candidate) and r1_eligible(name, view(name, row))]
         if shared:
             need(not candidate_ami_observable(evidence, candidate),
                  'GC shared-lower alias observable on live candidate-AMI instance')

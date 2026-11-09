@@ -337,9 +337,19 @@ class RegistryGcTests(unittest.TestCase):
         for name in gc.SOURCES:
             for key in gc.IDENTITY_KEYS:
                 if key == 'lowerImageDigest':
-                    continue  # a lower-digest-only reference is governed by R1 (see shared-lower tests)
+                    continue  # exercised below, where no retained record keeps the lower
                 self.rows(name, [{key: self.records[1][key]}])
                 self.refuse('referenced record')
+            self.rows(name, [])
+        # A lower-digest-only reference still refuses in every source when no retained record
+        # keeps the (now unique) lower, so R1 does not exempt it.
+        self.records[1]['lowerImageDigest'] = 'sha256:' + '9' * 64
+        self.drops = [gc.identity(self.records[1])]
+        self.evidence['registrySha256'] = gc.sha(self.records)
+        self.assertFalse(gc.shared_lower_kept(self.snapshot, self.records[1]))
+        for name in gc.SOURCES:
+            self.rows(name, [{'lowerImageDigest': self.records[1]['lowerImageDigest']}])
+            self.refuse('referenced record')
             self.rows(name, [])
 
     def test_terminal_jobs_are_conservatively_retained(self):
@@ -1183,6 +1193,63 @@ class HistoricalAttestationTests(unittest.TestCase):
         self.rows('placements', [row])
         self.refuse('referenced record')
 
+    def test_r1_non_digest_token_in_string_prefix_is_not_lower_only(self):
+        # references() dives into the first embedded JSON and skips the prefix; a candidate
+        # AMI or state-machine ARN hiding before the JSON must still defeat lower-only (B1).
+        cand = self.records[1]
+        for token in (cand['amiId'], cand['stateMachineVersionArn']):
+            with self.subTest(token=token):
+                value = token + ' rebase failed: ' + json.dumps({'deployment': {'lowerImageDigest': cand['lowerImageDigest']}})
+                row = {'last_error': value}
+                self.assertTrue(gc.references(row, cand))
+                self.assertFalse(gc.references_only_lower(row, cand))
+                self.rows('placements', [row])
+                self.refuse('referenced record')
+
+    def test_r1_terminal_execution_digest_only_is_exempt(self):
+        row = {'executionArn': 'arn:test:j', 'status': 'SUCCEEDED',
+               'input': json.dumps({'deployment': {'lowerImageDigest': self.records[1]['lowerImageDigest']}})}
+        self.assertTrue(gc.references_only_lower(row, self.records[1]))
+        self.rows('executions', [row])
+        self.assertEqual(len(self.prepare()['releases']), 7)
+
+    def test_r1_non_terminal_execution_not_exempt(self):
+        # A digest-only execution is exempt only if terminal; a RUNNING one must be refused (N1).
+        row = {'executionArn': 'arn:test:j', 'status': 'RUNNING',
+               'input': json.dumps({'deployment': {'lowerImageDigest': self.records[1]['lowerImageDigest']}})}
+        self.assertTrue(gc.references_only_lower(row, self.records[1]))
+        self.rows('executions', [row])
+        self.refuse('referenced record')
+
+    def test_r1_non_terminal_image_job_not_exempt(self):
+        # Only succeeded/recovered/cancelled image jobs are terminal; others may still mutate (N1).
+        for phase in ('verifying', 'failed', 'restore_pending'):
+            with self.subTest(phase=phase):
+                row = {'job_id': 'j1', 'phase': phase, 'from_digest': self.records[1]['lowerImageDigest']}
+                self.assertTrue(gc.references_only_lower(row, self.records[1]))
+                self.rows('imageJobs', [row])
+                self.refuse('referenced record')
+        self.rows('imageJobs', [{'job_id': 'j1', 'phase': 'succeeded', 'from_digest': self.records[1]['lowerImageDigest']}])
+        self.assertEqual(len(self.prepare()['releases']), 7)
+
+    def test_r1_exempt_row_rejects_spare_attestation(self):
+        # An attestation that targets an R1-exempt row is spare: the row needs none (N2).
+        row = {'id': 'ph-1', 'state': 'retired', 'dispatch_status': 'settled',
+               'deployment': {'amiId': self.records[-1]['amiId'],
+                              'previousLowerImageDigest': self.records[1]['lowerImageDigest']}}
+        self.rows('poolHosts', [row])
+        self.evidence['attestations'] = [{'kind': 'pool_host_retired_settled', 'source': 'poolHosts',
+                                          'rowSha256': gc.sha(row)}]
+        self.refuse('spare/duplicate attestation or forged row hash')
+
+    def test_r1_refused_when_stopped_instance_on_candidate_ami(self):
+        # A STOPPED (non-terminated) instance on the candidate AMI is observable: refuse (N2).
+        self.rows('instances', [{'InstanceId': 'i-' + '0' * 17, 'ImageId': self.records[1]['amiId'],
+                                 'State': {'Name': 'stopped'}}])
+        self.rows('placements', [{'lower_image_digest': self.records[1]['lowerImageDigest']}])
+        self.assertTrue(gc.candidate_ami_observable(self.evidence, self.records[1]))
+        self.refuse('alias observable')
+
     # ---- R2 retained data volume disposition ----
     def test_r2_retained_data_volume_accepted(self):
         self.fixture(pool=False)
@@ -1319,17 +1386,18 @@ class HistoricalAttestationTests(unittest.TestCase):
         gc.check_evidence(result, self.snapshot, self.plan_sha, self.records[1], self.now, None, SYSTEM_ID)
 
     def test_r2_forged_disposition_fields_rejected(self):
-        # A caller-supplied record/attachment claim is ignored; data must prove the volume.
+        # Even with a valid volume, extra/forged disposition fields are rejected (N7); no
+        # caller-supplied record/inventory claim is accepted.
         self.fixture(pool=False)
         volume = 'vol-0123456789abcdef0'
         self.d['extraVolume'] = volume
-        self.rows('volumes', [{'VolumeId': volume, 'SnapshotId': 'snap-0123456789abcdef0'}])
+        self.rows('volumes', [{'VolumeId': volume}])
         self.rows('placements', [{'volume_id': volume, 'lower_image_digest': self.records[1]['lowerImageDigest']}])
         self.sync()
         self.a['resources'][volume] = {'disposition': 'retained-data-volume', 'record': gc.identity(self.records[-1]),
                                        'inventorySha256': gc.sha(gc.inventory(self.evidence))}
         self.a['resources'][self.instance]['inventorySha256'] = gc.sha(gc.inventory(self.evidence))
-        self.refuse('unattached non-derived')
+        self.refuse('unexpected disposition fields')
 
 
 if __name__ == '__main__':

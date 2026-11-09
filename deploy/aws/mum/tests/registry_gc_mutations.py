@@ -50,7 +50,7 @@ wiring = [
     ('registry_gc.py', '    check_attestations(evidence, snapshot, candidate, views)', '    pass  # removed reference closure', commands['registry_gc.py']),
     ('registry_gc.py', '            if references(view(name, row), candidate)]', '            if False]  # bound views ignored', commands['registry_gc.py']),
     ('registry_gc.py', '        validate_attestation(a, row, evidence, snapshot, candidate)', '        pass  # removed typed proof validation', commands['registry_gc.py']),
-    ('rebase_release.py', "'rollback', 'registry-gc') and", "'rollback') and", commands['registry_gc.py']),
+    ('rebase_release.py', "'rollback', 'registry-gc', 'app-adopt'", "'rollback', 'app-adopt'", commands['registry_gc.py']),
     ('rebase_release.py', "if pending['operation'] == 'registry-gc':", 'if False:', commands['registry_gc.py']),
     ('rebase_release.py', "rebase_app.public_deployment(d) if operation == 'registry-gc' else None", 'None', rollout),
     ('registry_gc.py', "'registry-gc-app', True,", "'registry-gc-app', False,", rollout),
@@ -62,8 +62,8 @@ wiring = [
     ('registry_gc.py', "             and output.get('leaseEpoch') == document.get('leaseEpoch')\n", '', commands['registry_gc.py']),
     ('registry_gc_evidence.py', "        gc.need(context.get('capturedAt', captured) == captured", "        gc.need(True or context.get('capturedAt', captured) == captured", commands['registry_gc.py']),
     ('registry_gc_evidence.py', "            if row.get('status') not in gc.TERMINAL:", "            if False:", commands['registry_gc.py']),
-    ('registry_gc_evidence.py', "        if any(row[k] != d[k] for k in shared):", "        if False:", commands['registry_gc.py']),
-    ('registry_gc_evidence.py', "            if arn in execution_rows and execution_rows[arn] != row:", "            if False:", commands['registry_gc.py']),
+    ('registry_gc_evidence.py', "    if conflicts: gaps.append('describe contradicts list (' + ','.join(conflicts) + ')')", "    pass  # dropped describe/list conflict detection", commands['registry_gc.py']),
+    ('registry_gc_evidence.py', "            if arn in execution_rows:", "            if False:", commands['registry_gc.py']),
     ('registry_gc_evidence.py', "        events = [e['event'] if isinstance(e, dict) and set(e) >= {'event', 'resourceId', 'query'} else e for e in events]", "        pass", commands['registry_gc.py']),
     ('registry_gc_evidence.py', "            if have != list(range(1, t['LatestVersionNumber'] + 1)):", "            if False:", commands['registry_gc.py']),
     # R1 shared-lower (this PR): each new guard dropped individually must be killed.
@@ -83,6 +83,12 @@ wiring = [
     ('registry_gc.py', 'return False  # open or unparsable usage row is a live join',
      'return True  # open or unparsable usage row is a live join', commands['registry_gc.py']),
     ('registry_gc.py', 'return parsed <= captured', 'return True', commands['registry_gc.py']),
+    # R1 string-prefix gap, terminal gating, spare attestation, stopped-instance (review fixes).
+    ('registry_gc.py', 'return not any(token in blob for token in tokens)', 'return True', commands['registry_gc.py']),
+    ('registry_gc.py', "row.get('status') in TERMINAL", 'True', commands['registry_gc.py']),
+    ('registry_gc.py', "row.get('phase') in TERMINAL_IMAGE_JOB_PHASES", 'True', commands['registry_gc.py']),
+    ('registry_gc.py', 'for n, r in required if n == a', 'for n, r in refs if n == a', commands['registry_gc.py']),
+    ('registry_gc.py', ".get('Name') != 'terminated'", ".get('Name') == 'running'", commands['registry_gc.py']),
 ]
 for filename, before, after, command in wiring:
     path = HERE.parent / filename
