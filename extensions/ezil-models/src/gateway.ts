@@ -79,7 +79,9 @@ export type GatewayModel = { id: string; enabled: boolean; max_input_tokens: num
     availability?: GatewayAvailability; name?: string; capabilities?: GatewayCapabilities };
 export type GatewayModels = { killswitch: boolean; pause: 'operations' | 'reconciliation' | null; data: GatewayModel[];
     /** v1 `default_model`: the Gateway's suggested first model for this caller (contract §2 rule 8); absent when null. */
-    default_model?: string };
+    default_model?: string;
+    /** The models the account's OS plan includes (`INCLUDED_MODELS_HEADER`); absent = every model. */
+    included?: readonly string[] };
 export type GatewayGrant = { remaining_micro: number; live: boolean };
 export type GatewayBalance = { state?: string; available_micro: number; held_micro: number; grants: GatewayGrant[] };
 
@@ -90,14 +92,26 @@ function providerIdentity(provider: ResolvedProvider): string {
 }
 
 const modelsCache = new Map<string, { baseUrl: ResolvedProvider['baseUrl']; at: number; models: GatewayModels }>();
+/**
+ * Per base URL + token: the plan's limit at the last verified read, with only the rows of the models it includes. Unlike
+ * the catalog it does not expire: a limit that can no longer be re-read stays in force, so a Free account keeps its locks
+ * and its default (Flash) and is never offered one its plan refuses. Those rows list the included models only and are
+ * never what a request is checked against (a catalog-only model is still sent only after a read that succeeds now).
+ * Cleared only by a verified read of a plan with no limit (a 200 catalog without the header: a paid transition) and by
+ * a reload.
+ */
+const accessHints = new Map<string, GatewayModels>();
 
 /** Refusals that mean the catalog this client listed is out of date (contract §4 freshness): read it again, and re-list. */
 export const CATALOG_REFUSALS: readonly string[] = ['killswitch', 'model_disabled', 'model_not_found', 'no_provider_route', 'model_unavailable',
-    'no_entitlement', 'model_not_allowed'];
+    'no_entitlement', 'model_not_allowed', 'os_model_not_included'];
 
-/** Clear the `/v1/models` cache after availability/limit refusals, and in tests. */
+/**
+ * Clear the `/v1/models` cache after availability/limit refusals, and in tests. A refusal or a panel opening never
+ * forgets the plan limit (`accessHints`): only a reload (no argument) does.
+ */
 export function forgetGatewayModels(baseUrl?: string): void {
-    if (baseUrl === undefined) modelsCache.clear();
+    if (baseUrl === undefined) { modelsCache.clear(); accessHints.clear(); }
     else for (const [key, cached] of modelsCache) if (cached.baseUrl === baseUrl) modelsCache.delete(key);
 }
 
@@ -106,7 +120,7 @@ function authHeaders(provider: ResolvedProvider): Record<string, string> {
     return headers;
 }
 
-async function getJson(provider: ResolvedProvider, path: string, doFetch: typeof fetch, signal?: AbortSignal): Promise<{ status: number; json: unknown }> {
+async function getJson(provider: ResolvedProvider, path: string, doFetch: typeof fetch, signal?: AbortSignal): Promise<{ status: number; json: unknown; headers: Headers }> {
     const timeout = AbortSignal.timeout(SIDE_CALL_TIMEOUT_MS);
     const response = await doFetch(`${provider.baseUrl}${path}`, {
         headers: authHeaders(provider),
@@ -116,7 +130,27 @@ async function getJson(provider: ResolvedProvider, path: string, doFetch: typeof
     const text = await response.text().catch(() => '');
     let json: unknown;
     try { json = text ? JSON.parse(text) : undefined; } catch { json = undefined; }
-    return { status: response.status, json };
+    return { status: response.status, json, headers: response.headers };
+}
+
+/**
+ * Set by the EZiL OS proxy on every `/models` answer when the account's plan includes only some models (Free: Gemini
+ * 3.8 Flash), never by the Gateway (worker/src/ai-proxy.ts AI_INCLUDED_MODELS_HEADER). The proxy refuses any other
+ * model itself (`os_model_not_included`); this client lists them locked so a click can offer the upgrade.
+ */
+export const INCLUDED_MODELS_HEADER = 'x-ezil-os-included-models';
+
+/** The header's aliases, or undefined (every model) when absent or not 1–16 distinct catalog aliases. */
+export function parseIncludedModels(value: string | null): readonly string[] | undefined {
+    if (value === null) return undefined;
+    const aliases = value.split(',');
+    return aliases.length <= 16 && new Set(aliases).size === aliases.length && aliases.every(alias => CATALOG_ALIAS.test(alias))
+        ? Object.freeze(aliases) : undefined;
+}
+
+/** Whether the account's OS plan includes `alias`; an unread catalog or one without a list includes every model. */
+export function modelIncluded(catalog: GatewayModels | undefined, alias: string): boolean {
+    return !catalog?.included || catalog.included.includes(alias);
 }
 
 const KNOWN_PROTOCOLS: readonly GatewayProtocol[] = ['anthropic-messages', 'openai-responses'];
@@ -280,6 +314,48 @@ export function withCatalogDefault(models: readonly ResolvedModel[], catalogs: R
     return [...models];
 }
 
+/**
+ * The account's OS plan (`included`, Free: Gemini 3.8 Flash only): each other model of that provider stays listed but
+ * locked, so choosing it can offer the upgrade, and it is never the default, never selectable and never sent. A locked
+ * default is dropped here; `withDefaultModel` then chooses among the unlocked. A catalog never read locks nothing; the
+ * proxy decides.
+ */
+export function withPlanLocks(models: readonly ResolvedModel[], catalogs: ReadonlyMap<ResolvedProvider, GatewayModels | undefined>): ResolvedModel[] {
+    return models.map(model => model.provider.type !== 'ezil-gateway' || modelIncluded(catalogs.get(model.provider), model.model) ? model
+        : { ...model, locked: true, default: false });
+}
+
+/** The model a new or unset chat starts on, on every plan, while it is available (founder decision 2026-11-09). */
+export const PREFERRED_DEFAULT_MODEL = 'gemini-3.8-flash';
+
+/**
+ * The declared default, after the plan's locks. VS Code applies it only while nothing is picked, so an entitled user's
+ * saved pick stays. In order:
+ *   - the preferred model (Gemini 3.8 Flash) when it is listed, unlocked and calls tools, on every plan;
+ *   - else the default already chosen (the Gateway's suggestion, else the configured one: a paid plan's fallback), when
+ *     unlocked and tool-calling;
+ *   - else the first model the plan includes that is listed and calls tools;
+ *   - else none: a plan that includes only some models never starts on another, nor on an unavailable one.
+ * A default the user configured on another (non-Gateway) provider is left alone.
+ */
+export function withDefaultModel(models: readonly ResolvedModel[], catalogs: ReadonlyMap<ResolvedProvider, GatewayModels | undefined>): ResolvedModel[] {
+    const usable = (model: ResolvedModel) => model.provider.type === 'ezil-gateway' && !model.locked && !!model.capabilities.toolCalling;
+    const current = models.find(model => model.default);
+    if (current && current.provider.type !== 'ezil-gateway') return [...models];
+    let pick = models.find(model => usable(model) && model.model.toLowerCase() === PREFERRED_DEFAULT_MODEL)
+        ?? (current && usable(current) ? current : undefined);
+    for (const [provider, catalog] of catalogs) {
+        for (const alias of catalog?.included ?? []) pick ??= models.find(model => model.provider === provider && usable(model) && model.model.toLowerCase() === alias);
+    }
+    return models.map(model => model.default === (model === pick) ? model : { ...model, default: model === pick });
+}
+
+/** The display names of the models the plan includes, for refusal copy ("Gemini 3.8 Flash"). */
+export function includedModelNames(catalog: GatewayModels | undefined): string {
+    const names = (catalog?.included ?? []).map(alias => catalog?.data.find(row => row.id === alias)?.name ?? alias);
+    return names.length > 1 ? `${names.slice(0, -1).join(', ')} or ${names.at(-1)}` : names[0] ?? 'an included model';
+}
+
 /** `GET /v1/models`, cached for five minutes per base URL + auth context. `undefined` when it cannot be read. */
 export async function gatewayModels(provider: ResolvedProvider, doFetch: typeof fetch, now: number = Date.now(), signal?: AbortSignal,
     /** Read now even within the five minutes (a panel opening); a failed read keeps the last catalog. */ fresh = false): Promise<GatewayModels | undefined> {
@@ -287,8 +363,18 @@ export async function gatewayModels(provider: ResolvedProvider, doFetch: typeof 
     const cached = modelsCache.get(key);
     if (!fresh && cached && now - cached.at < MODELS_TTL_MS) return cached.models;
     try {
-        const { status, json } = await getJson(provider, '/models', doFetch, signal);
+        const { status, json, headers } = await getJson(provider, '/models', doFetch, signal);
         const models = status === 200 ? parseGatewayModels(json) : undefined;
+        const header = headers.get(INCLUDED_MODELS_HEADER);
+        const included = parseIncludedModels(header);
+        if (models && included) {
+            models.included = included;
+            accessHints.set(key, { killswitch: models.killswitch, pause: models.pause, data: models.data.filter(row => included.includes(row.id)), included });
+        }
+        // No header on a verified catalog: the proxy names no limit (a paid plan). A header that cannot be read is not
+        // that: the last verified limit stays in force.
+        else if (models && header === null) accessHints.delete(key);
+        else if (models && accessHints.has(key)) models.included = accessHints.get(key)!.included;
         if (models) modelsCache.set(key, { baseUrl: provider.baseUrl, at: now, models });
         return models;
     } catch {
@@ -308,6 +394,17 @@ export const CATALOG_STALE_MS = 30 * 60_000;
 export function knownGatewayModels(provider: ResolvedProvider, now: number = Date.now()): GatewayModels | undefined {
     const cached = modelsCache.get(providerIdentity(provider));
     return cached && now - cached.at < CATALOG_STALE_MS ? cached.models : undefined;
+}
+
+/**
+ * What the account's plan is known to include: the catalog `knownGatewayModels` still holds, else the last verified
+ * limit with the rows of the models it includes (`accessHints`). The picker's list, its locks and its default read this;
+ * a request's availability check never does.
+ */
+export function knownGatewayPlan(provider: ResolvedProvider, now: number = Date.now()): GatewayModels | undefined {
+    const known = knownGatewayModels(provider, now);
+    if (known) return known;
+    return accessHints.get(providerIdentity(provider));
 }
 
 export async function gatewayBalance(provider: ResolvedProvider, doFetch: typeof fetch, signal?: AbortSignal): Promise<GatewayBalance | undefined> {
@@ -359,8 +456,16 @@ export function creditState(models: GatewayModels | undefined, balance: GatewayB
 // ── error mapping (by error.code, never by message; contract §8) ─────────────
 
 type ErrorBody = { code?: string; message?: string; request_id?: string; reason?: string; pause?: string; param?: string;
-    no_live_grant?: boolean; available_micro?: number; hold_micro?: number; floor_hold_micro?: number; max_affordable_output_tokens?: number | null;
-    input_bound_tokens?: number; max_input_tokens?: number; status?: string; source?: string };
+    no_live_grant?: boolean; available_micro?: number; hold_micro?: number | string; floor_hold_micro?: number; max_affordable_output_tokens?: number | null;
+    input_bound_tokens?: number; max_input_tokens?: number; status?: string; source?: string;
+    /** window_budget_reached: decimal strings, and the reset (null when no window has started). */
+    budget_micro?: unknown; used_micro?: unknown; resets_at?: unknown };
+
+/** A micro-credit amount sent as a decimal string or a safe integer, or undefined. */
+function microValue(value: unknown): number | undefined {
+    if (typeof value === 'string' && /^\d{1,15}$/.test(value)) return Number(value);
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
 
 /**
  * Who wrote an HTTP refusal. The OS proxy marks its own bodies `source: "ezil-os-proxy"` and uses `os_` codes
@@ -406,13 +511,24 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
     if (body.reason === 'no_ezil_role' || code === 'no_ezil_role') return make('Your EZiL account has no AI access yet');
     switch (code) {
         case 'window_budget_reached': {
+            // A credit window is a plan allowance apart from the wallet (the Gateway's docs/credit-window.md): buying
+            // credits or changing plan does not lift it today. A request larger than the whole window never fits, so
+            // waiting is no answer there: its hold exceeds the budget, or no window has started (resets_at null).
+            const budget = microValue(body.budget_micro), used = microValue(body.used_micro), hold = microValue(body.hold_micro);
+            const oversized = body.resets_at === null || (budget !== undefined && hold !== undefined && hold > budget);
             // This is a reset deadline, not a retry delay: never cap it to the transport's 60 seconds.
             const delay = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) : retryAfter ? (Date.parse(retryAfter) - now) / 1000 : NaN;
-            const reset = new Date(now + Math.max(0, delay) * 1000);
-            const seconds = Number.isFinite(reset.getTime()) ? Math.max(0, Math.ceil(delay)) : undefined;
-            return new GatewayError(`EZiL AI: This window's EZiL AI credits are used up. ${seconds === undefined
-                ? 'Check EZiL AI status for the reset time.' : `Resets at ${localResetTime(reset)} (local time).`}${ref}`,
-                status, code, requestId, seconds, origin);
+            const named = typeof body.resets_at === 'string' ? Date.parse(body.resets_at) : NaN;
+            const at = oversized ? NaN : Number.isFinite(named) ? named : now + delay * 1000;
+            const reset = Number.isFinite(at) && at >= now ? new Date(at) : undefined;
+            const seconds = Number.isFinite(delay) ? Math.max(0, Math.ceil(delay)) : undefined;
+            const left = budget !== undefined && used !== undefined ? Math.max(0, budget - used) : undefined;
+            const head = oversized ? 'This request needs more EZiL AI credits than this window allows, so waiting will not make it fit.'
+                : `This window's EZiL AI credits are used up. ${reset ? `Resets at ${localResetTime(reset)} (local time).` : 'Check EZiL AI status for the reset time.'}`;
+            const guide = oversized || (left ?? 0) > 0
+                ? ` A new chat or a smaller model uses fewer credits${!oversized && left ? `; ${creditsFloor2(left)} credits are left in this window` : ''}.` : '';
+            return new GatewayError(`EZiL AI: ${head} Buying credits or changing plan does not lift this window right now.${guide}${ref}`,
+                status, code, requestId, seconds, origin, undefined, reset?.toISOString());
         }
         case 'insufficient_credits': case 'no_live_grant': {
             if (body.no_live_grant || code === 'no_live_grant') return make('You have no AI credits left. Add credits to continue.');
@@ -452,6 +568,12 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
         // Caller-scoped (catalog reasons entitlement_required and not_allowed_for_caller): neither is about credits.
         case 'no_entitlement': return make('AI access is not included for this account: it needs an active plan');
         case 'model_not_allowed': return make('This model is not included for your access. Pick another model');
+        // The OS proxy's plan list (Free: Gemini 3.8 Flash only), refused before the Gateway.
+        case 'os_model_not_included': return make(`${alias} is not included in your plan. Nothing was sent or charged. `
+            + 'Pick an included model, or upgrade in Settings → Billing');
+        case 'os_invalid_request': return make(`Internal EZiL Models bug (${code}); please report it`);
+        // The proxy has no fresh answer about the plan yet (the computer's sign-in refreshes it each minute): temporary.
+        case 'os_plan_unavailable': return make('EZiL OS could not confirm which models your plan includes yet. Nothing was sent or charged. Try again in a minute');
         case 'upstream_timeout': return make('The model provider did not answer in time');
         case 'upstream_unavailable': return make('The model provider could not be reached');
         case 'upstream_error': return make('The model provider returned an error');

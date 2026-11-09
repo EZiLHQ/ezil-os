@@ -1,0 +1,38 @@
+{
+  "about": "Code's billing request as every layer must read it: ezil-models sendBillingIntent, the workbench `billing-intent` patch, the Worker billing bridge (worker/src/code-billing-bridge.ts) and the shell receiver (shell/ezil/ui/Settings/billing-recovery.js). Each layer's tests run these same records. `accept` pairs a record with the intent the bridge posts and the shell keeps (`expect`), so the bridge's output is the shell's input unchanged; every `reject` record is dropped by the patch, the bridge and the shell. resetsAt is Date.prototype.toISOString form and only travels with window_limit.",
+  "accept": [
+    { "record": { "reason": "credits_exhausted" }, "expect": { "reason": "credits_exhausted" } },
+    { "record": { "reason": "credits_exhausted", "requestId": "6f1d3a52-9b0e-4c1d-8a7b-2e5f4d3c2b1a" },
+      "expect": { "reason": "credits_exhausted", "requestId": "6f1d3a52-9b0e-4c1d-8a7b-2e5f4d3c2b1a" } },
+    { "record": { "reason": "model_locked", "model": "qwen.qwen3-coder-next" }, "expect": { "reason": "model_locked", "model": "qwen.qwen3-coder-next" } },
+    { "record": { "reason": "model_locked", "model": "us.moonshotai.kimi-k3" }, "expect": { "reason": "model_locked", "model": "us.moonshotai.kimi-k3" } },
+    { "record": { "reason": "window_limit" }, "expect": { "reason": "window_limit" } },
+    { "record": { "reason": "window_limit", "requestId": "6f1d3a52-9b0e-4c1d-8a7b-2e5f4d3c2b1a" },
+      "expect": { "reason": "window_limit", "requestId": "6f1d3a52-9b0e-4c1d-8a7b-2e5f4d3c2b1a" } },
+    { "record": { "reason": "window_limit", "requestId": "6f1d3a52-9b0e-4c1d-8a7b-2e5f4d3c2b1a", "resetsAt": "2026-11-09T21:05:33.123Z" },
+      "expect": { "reason": "window_limit", "requestId": "6f1d3a52-9b0e-4c1d-8a7b-2e5f4d3c2b1a", "resetsAt": "2026-11-09T21:05:33.123Z" } },
+    { "record": { "reason": "window_limit", "resetsAt": "2026-11-10T00:00:00.000Z" }, "expect": { "reason": "window_limit", "resetsAt": "2026-11-10T00:00:00.000Z" } }
+  ],
+  "reject": [
+    {},
+    { "reason": "upgrade" },
+    { "reason": "insufficient_credits" },
+    { "reason": "window_budget_reached" },
+    { "reason": "credits_exhausted", "requestId": "not-a-uuid" },
+    { "reason": "credits_exhausted", "requestId": "6F1D3A52-9B0E-4C1D-8A7B-2E5F4D3C2B1A" },
+    { "reason": "credits_exhausted", "extra": "x" },
+    { "reason": "model_locked", "model": "Qwen" },
+    { "reason": "model_locked", "model": "../x" },
+    { "reason": "credits_exhausted", "resetsAt": "2026-11-09T21:05:33.123Z" },
+    { "reason": "model_locked", "model": "qwen.qwen3-coder-next", "resetsAt": "2026-11-09T21:05:33.123Z" },
+    { "reason": "window_limit", "resets_at": "2026-11-09T21:05:33.123Z" },
+    { "reason": "window_limit", "resetsAt": "2026-11-09T21:05:33Z" },
+    { "reason": "window_limit", "resetsAt": "2026-11-09T21:05:33.123456+00:00" },
+    { "reason": "window_limit", "resetsAt": "2026-11-09 21:05:33.123Z" },
+    { "reason": "window_limit", "resetsAt": " 2026-11-09T21:05:33.123Z" },
+    { "reason": "window_limit", "resetsAt": "" },
+    { "reason": "window_limit", "resetsAt": 1762722333123 },
+    { "reason": "window_limit", "resetsAt": null },
+    { "reason": "window_limit", "requestId": "6f1d3a52-9b0e-4c1d-8a7b-2e5f4d3c2b1a", "remaining": "12" }
+  ]
+}
