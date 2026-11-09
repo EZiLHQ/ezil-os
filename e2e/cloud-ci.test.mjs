@@ -866,7 +866,7 @@ test('deployment triggers are preview/main and version-tag pushes plus manual di
   assert.deepEqual(push.children.map(node => node.line), ['branches: [preview, main]', "tags: ['v*']"]);
   const dispatch = triggers.children.find(node => node.line === 'workflow_dispatch:');
   assert.deepEqual(dispatch.children.map(node => node.line), ['inputs:']);
-  assert.deepEqual(dispatch.children[0].children.map(node => node.line), ['deploy_production:']);
+  assert.deepEqual(dispatch.children[0].children.map(node => node.line), ['deploy_production:', 'deploy_worker_only:']);
   assert.deepEqual(dispatch.children[0].children[0].children.map(node => node.line).filter(line => !line.startsWith('description:')),
     ['type: boolean', 'default: false']);
 });

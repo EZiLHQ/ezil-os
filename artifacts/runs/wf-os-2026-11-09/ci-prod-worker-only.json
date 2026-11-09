@@ -3,7 +3,7 @@
   "runId": "wf-os-2026-11-09",
   "status": "running",
   "doneRung": "workflow-validators-and-release-contract-tests-green",
-  "evidence": "Increment 1 landed: release-state.mjs gains Cloudflare-only readWorkerState + assertWorkerOwner (assertRollbackOwner now delegates it) + restoreContainer owner-injection param + worker-capture/worker-rollback-guard/worker-container-rollback/worker-rollback-check CLI modes. cloud-ci.test.mjs: +3 tests. node --test e2e/cloud-ci.test.mjs = 124 pass / 0 fail / 1 pre-existing docker-gated skip (baseline was 121 pass + 1 skip; behavior-preserving). Mutation-proved assertWorkerOwner: weakened guard -> 2 RED, restored -> GREEN. Next: new worker-production job in preview.yml + contract registration + validators.",
+  "evidence": "Increment 2 landed: new preview.yml#worker-production job (Worker-only production deploy, legacy production job untouched); deploy_worker_only dispatch input; environment-contract.json registers preview.yml#worker-production; env-contract.test.mjs pin -> 6266d05e...; cloud-ci.test.mjs dispatch-input assertion updated; check-os-workflows.py gains input/job-set/receipt updates + a dedicated worker-production guard section. GREEN TOGETHER: env-contract scan ok; env-contract.test.mjs 19 pass; cloud-ci.test.mjs 124 pass/0 fail/1 pre-existing skip; check-os-workflows.py passed. actionlint not installed locally (job lives in preview.yml, already in CI actionlint list). Next: mutation-prove new check-os-workflows guards; INFRASTRUCTURE.md paragraph.",
   "startedAt": "2026-11-09T11:31:21Z",
-  "updatedAt": "2026-11-09T11:52:00Z"
+  "updatedAt": "2026-11-09T12:10:00Z"
 }

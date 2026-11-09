@@ -44,7 +44,8 @@
         "preview.yml#preview"
       ],
       "productionJobs": [
-        "preview.yml#production"
+        "preview.yml#production",
+        "preview.yml#worker-production"
       ],
       "secretInheritance": [
         "preview.yml#images",
