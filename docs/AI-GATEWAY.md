@@ -107,13 +107,27 @@ A push may also carry `"includedModels"`: the models the owner's plan includes,
 from the same effective plan the computer start gate uses
 (`app/src/server/billing/v3/ai-models.ts`; Free is `["gemini-3.8-flash"]`,
 Standard and Premium are `null`, every model). It is signed in the same body.
-When billing metering is off the app sends `null`. When the app cannot read the
-plan it leaves the field out, and the Worker keeps the list it has. A value
+When billing metering is off the app sends `null`, which is an explicit answer.
+When the app cannot read the plan it leaves the field out: that push refreshes
+the token only, never the plan. A value
 other than `null` or 1–16 distinct Gateway aliases refuses the whole push
 (`400 included_models_malformed`). The list is stored apart from the token and
 ordered by its own signature time, so a later push always wins whichever token
-is kept. It stays through logout, a dropped token and stop: it only restricts,
-and the next push with a readable plan replaces it.
+is kept. It stays through logout, a dropped token and stop, and the next push
+with a readable plan replaces it. It counts as known for
+`AI_MODEL_ACCESS_MAX_AGE_MS` (30 minutes) from its own signed time. A present
+user's Code pushes one with every activity beat, each minute.
+
+An unknown plan is never "every model". That covers no list pushed, a stale
+list, or a malformed record. `POST /ai/v1/messages` and `/ai/v1/responses` then
+get a local `503 os_plan_unavailable` (source `ezil-os-proxy`): a temporary
+failure, never a billing refusal, and nothing is sent, held or charged. Reads
+(`/models` without the header, balance, limits, usage) pass as before.
+
+Rollout order follows from that. Deploy the app first: an older Worker reads
+only `accessToken` and ignores `includedModels`. Deploy this Worker after it,
+so every computer's next open or activity beat brings a list within a minute.
+A Worker deployed before the app refuses all inference until the app ships.
 
 With a list stored, `POST /ai/v1/messages` and `/ai/v1/responses` read the
 body's `model` exactly as the Gateway reads it (fatal UTF-8, `JSON.parse`, last
@@ -122,8 +136,8 @@ repeated key wins). Any other model gets a local
 model gets `400 os_invalid_request`. In both cases nothing reaches the Gateway,
 so nothing is held or charged. Every `GET /ai/v1/models` answer, and the 403,
 carries `x-ezil-os-included-models: <aliases, comma-separated>`. The proxy
-sets this header itself and never relays it from the Gateway. Without a list,
-requests pass exactly as before. Credit refusals (`402 insufficient_credits`,
+sets this header itself and never relays it from the Gateway. With an explicit
+`null`, requests pass exactly as before. Credit refusals (`402 insufficient_credits`,
 `no_live_grant`) always pass through unchanged. The OS chooses Standard upgrade
 or Add credits from its own billing summary.
 

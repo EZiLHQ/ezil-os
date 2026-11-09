@@ -218,7 +218,7 @@ const BILLING_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 /**
  * Ask the EZiL OS window around Code to open its billing dialog, through the workbench's `_ezil.billingIntent`
- * (patch-copilot-chat.sh `billing-intent-command`, forwarded by the Worker's billing bridge). True only when the OS
+ * (patch-copilot-chat.sh `billing-intent`, forwarded by the Worker's billing bridge). True only when the OS
  * took it; false in a Code outside an OS window, an older workbench, or for anything malformed. Never throws.
  */
 export async function sendBillingIntent(intent: BillingIntent): Promise<boolean> {
@@ -339,7 +339,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('ezil-models.showUsage', showUsage),
         vscode.commands.registerCommand('ezil-models.openConfig', openConfig),
         vscode.commands.registerCommand('ezil-models.compactionInfo', () => compaction.explain()),
-        // Run by the workbench's `picker-locked` patch when a plan-locked model is chosen (never in the palette: `_`).
+        // Run by the workbench's `picker-locked-select` patch when a plan-locked model is chosen (never in the palette: `_`).
         vscode.commands.registerCommand('_ezil-models.lockedModel', (id: unknown) => provider.lockedModelChosen(id)),
     );
     // `@ezil`: plain questions to the selected EZiL model without tools (participant.ts). Registered last and

@@ -279,9 +279,17 @@ auth context.
     (`os_model_not_included`), with nothing sent or charged and no dialog.
   - When Flash itself is unavailable, nothing is the default. The picker shows
     an unavailable model, not an upgrade.
-  - Title and summary requests stay on the selected model unless the plan
-    includes Qwen.
-  - Choosing a locked row in the picker (the workbench's `picker-locked`
+  - Title and summary requests go to Qwen only when the plan includes it. A
+    request naming a model the plan does not include (the image pins Copilot's
+    utility model to Qwen) goes to the plan's own model on the same account.
+- **Default model (every plan).** A new or unset chat starts on Gemini 3.8 Flash
+  while it is listed and calls tools, whatever the Gateway's `default_model`
+  says. Otherwise the Gateway's suggestion, then the configured default, is a
+  paid plan's fallback. On a plan that includes only some models, the fallback
+  is the first of those, or nothing. VS Code keeps a pick the user saved.
+- **Plan unknown.** `503 os_plan_unavailable` from the OS proxy (no fresh plan
+  pushed yet) reads as temporary, with Retry, and never as billing.
+  - Choosing a locked row in the picker (the workbench's `picker-locked-select`
     patch runs `_ezil-models.lockedModel`) re-reads the plan. If the plan now
     includes the model, the picker lists it again. Otherwise the EZiL OS
     window opens its upgrade (`_ezil.billingIntent`, reason `model_locked`).

@@ -1,5 +1,5 @@
 /** Code -> EZiL OS billing requests (Free includes Gemini 3.8 Flash only; app billing/v3/ai-models.ts). The renderer's
- * `_ezil.billingIntent` (patch-copilot-chat.sh `billing-intent-command`) dispatches a cancelable `ezil-billing-intent`
+ * `_ezil.billingIntent` (patch-copilot-chat.sh `billing-intent`) dispatches a cancelable `ezil-billing-intent`
  * event. After a nonce handshake with the shell's pinned origin, this bridge hands that shell a closed record:
  * `{ reason: credits_exhausted | model_locked, requestId?, model? }`. It then cancels the event, so ezil-models knows the
  * OS took it. A sibling of the diagnostic bridge (code-diag-bridge.ts) with its own closure, marker and message types.

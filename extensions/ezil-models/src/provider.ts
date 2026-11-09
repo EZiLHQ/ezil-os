@@ -40,7 +40,7 @@ export type ProviderHost = {
 export type BillingIntent = { reason: 'credits_exhausted' | 'model_locked'; requestId?: string; model?: string };
 /** The credit refusals that ask for the billing dialog; budgets, entitlement and every other code never do. */
 export const CREDIT_REFUSALS: readonly string[] = ['insufficient_credits', 'no_live_grant'];
-/** `infoText` key that marks a plan-locked model for the workbench's `picker-locked` patch (patch-copilot-chat.sh). */
+/** `infoText` key that marks a plan-locked model for the workbench's `picker-locked-*` patches (patch-copilot-chat.sh). */
 export const LOCKED_MODEL_INFO_KEY = 'ezilPlanLocked';
 
 type AnyPart = Record<string, unknown>;
@@ -183,7 +183,7 @@ export function toInformation(model: ResolvedModel): vscode.LanguageModelChatInf
     // `isDefault` is what makes the config's default model the first one in Chat (no chat.defaultModel is configured).
     info.isDefault = model.default;
     // A plan-locked model is never a chat model: VS Code never restores, defaults to or hands it to a subagent, so a saved
-    // pick on Free falls back to the default with no dialog. The `picker-locked` patch still lists it (lock icon and this
+    // pick on Free falls back to the default with no dialog. The `picker-locked-list` patch still lists it (lock icon and this
     // text) and turns choosing it into the upgrade offer.
     info.isUserSelectable = !model.locked;
     if (model.locked) {
@@ -599,7 +599,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     }
 
     /**
-     * A plan-locked model was chosen in the picker (the workbench `picker-locked` patch runs `_ezil-models.lockedModel`
+     * A plan-locked model was chosen in the picker (the workbench `picker-locked-select` patch runs `_ezil-models.lockedModel`
      * instead of selecting it, so the previous model stays selected). The plan is read again first: if it now includes
      * the model (an upgrade just went through), the picker lists it again and nothing opens. Otherwise the OS window
      * opens its upgrade; a Code outside one shows a notice with the Standard link. Nothing is ever sent to a model here.
