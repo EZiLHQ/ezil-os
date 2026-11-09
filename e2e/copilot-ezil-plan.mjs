@@ -2,7 +2,7 @@
 // Gemini 3.8 Flash only (founder 2026-11-09). With the EZiL OS proxy's plan header the picker lists the other models
 // locked. Choosing one by touch (Android, iPhone), mouse or keyboard keeps Flash selected and sends nothing. A model
 // saved on a paid plan resolves to Flash once the account is Free, with no dialog, also in a reloaded chat with turns.
-// Out of credits, one request goes and nothing loops. Framed in a stand-in OS page carrying the Worker's own billing
+// Out of credits, the turn goes once and nothing loops. Framed in a stand-in OS page carrying the Worker's own billing
 // bridge, both causes reach that page as closed requests and Code shows no notice of its own. No real model is called.
 import { createRequire, stripTypeScriptTypes } from 'node:module';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -73,7 +73,8 @@ function code (page, root, v) {
       await page.keyboard.press('Control+A'); await page.keyboard.press('Delete');
       await page.keyboard.type(prompt, { delay: 3 });
       await page.keyboard.press('Enter');
-      for (let i = 0; i < 40 && !posts().slice(before).some(r => JSON.stringify(r.body?.messages ?? '').includes(prompt)); i++) await page.waitForTimeout(500);
+      // Wait for the turn itself, which carries the Agent tools: a first turn's title request quotes the prompt too.
+      for (let i = 0; i < 40 && !posts().slice(before).some(r => r.body?.tools?.length && JSON.stringify(r.body.messages ?? '').includes(prompt)); i++) await page.waitForTimeout(500);
       await page.waitForTimeout(3000);
       return posts().slice(before);
     },
@@ -112,8 +113,8 @@ try {
       check(`${at}: Free: the reloaded chat with turns shows ${FLASH_NAME}, not the saved ${QWEN_NAME}`, (await c.label()) === `Models, ${FLASH_NAME}`, await c.label());
       check(`${at}: Free: no upgrade dialog or notice on load`, (await c.toasts()).every(t => !/not included|Upgrade/i.test(t)), JSON.stringify(await c.toasts()));
       sent = await c.send(`EZIL_E2E_KIMI ${v.name} free`);
-      // The turn carries the Agent tools; title and summary requests carry none (the image pins them to Qwen, which Free
-      // does not include: the provider serves them on Flash).
+      // The turn carries the Agent tools; title and summary requests carry none (the image pins them to Flash, and the
+      // provider would also serve a Free account's on Flash).
       check(`${at}: Free: every request names ${FLASH}, and titles and summaries are still sent, on Flash`,
         sent.length >= 2 && sent.every(r => r.body?.model === FLASH) && sent.some(r => !r.body?.tools?.length),
         JSON.stringify(sent.map(r => [r.body?.model, r.body?.tools?.length ?? 0])));
@@ -168,6 +169,10 @@ try {
     const v = VIEWS.at(-1);
     const ctx = await browser.newContext({ viewport: v.viewport });
     const codeOrigin = new URL(CODE_URL).origin;
+    // The rewritten workbench document comes from Playwright routing, so it has no address, and Chromium's local network
+    // access checks refuse its own loopback WebSocket. This context alone grants local network access to its two loopback
+    // origins, and the stand-in OS page delegates it to its frame. Production's OS and Code hosts are public: no such check.
+    for (const origin of [PARENT, codeOrigin]) await ctx.grantPermissions(['local-network-access'], { origin });
     let injected = 0;
     await ctx.route(request => new URL(request).origin === codeOrigin, async route => {
       if (route.request().resourceType() !== 'document') return route.continue();
@@ -181,10 +186,9 @@ try {
       if (body !== html) injected++;
       return route.fulfill({ response, headers, body });
     });
-    // A real loopback server, like the OS host it stands in for: a page Playwright synthesizes has no address, and Chromium's
-    // local network access checks then refuse the framed workbench's own loopback WebSocket.
+    // A real loopback server, like the OS host it stands in for, so the page that delegates the permission has an address.
     const parentHtml = `<!doctype html><title>EZiL OS (stand-in)</title>
-<body style="margin:0"><iframe id="code" src="${CODE_URL}/?folder=${encodeURIComponent(FOLDER)}" style="border:0;width:100vw;height:100vh"></iframe>
+<body style="margin:0"><iframe id="code" src="${CODE_URL}/?folder=${encodeURIComponent(FOLDER)}" allow="local-network-access; local-network; loopback-network" style="border:0;width:100vw;height:100vh"></iframe>
 <script>window.__billing=[];const frame=document.getElementById('code'),origin=new URL(frame.src).origin;
 let nonce=null;frame.addEventListener('load',()=>{nonce=Array.from(crypto.getRandomValues(new Uint8Array(22)),b=>'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'[b%64]).join('');frame.contentWindow.postMessage({type:'ezil.code.billing.hello',v:1,nonce},origin)});
 window.addEventListener('message',e=>{if(e.source===frame.contentWindow&&e.origin===origin&&e.data&&e.data.nonce===nonce)window.__billing.push(e.data)});</script>`;
@@ -202,11 +206,13 @@ window.addEventListener('message',e=>{if(e.source===frame.contentWindow&&e.origi
       state('free');
       await page.goto(`${PARENT}/os`, { waitUntil: 'domcontentloaded' });
       await c.ready(FLASH_NAME);
-      // Ready means connected: the model picker shows Flash and no workbench WebSocket has failed (diagnostics so far).
-      const wsFailed = diagnostics.filter(line => /^ws (error|close)/.test(line));
-      check('framed: the workbench connects inside the OS page (WebSocket open, the picker shows Flash)',
-        (await c.label()) === `Models, ${FLASH_NAME}` && wsFailed.length === 0, `${await c.label()}; ${JSON.stringify(wsFailed.slice(0, 3))}`);
-      if ((await c.label()) !== `Models, ${FLASH_NAME}` || wsFailed.length) throw new Error('framed workbench not ready');
+      // Ready means connected: the model picker is enabled and shows Flash, and no workbench WebSocket has failed (diagnostics so far).
+      const wsFailed = () => diagnostics.filter(line => /^ws (error|close)/.test(line));
+      const pickerEnabled = (await c.model.getAttribute('aria-disabled')) !== 'true' && !/\bdisabled\b/.test((await c.model.getAttribute('class')) ?? '');
+      const ready = (await c.label()) === `Models, ${FLASH_NAME}` && pickerEnabled && wsFailed().length === 0;
+      check('framed: the workbench connects inside the OS page (WebSocket open, the picker enabled and showing Flash)',
+        ready, `${await c.label()}; enabled ${pickerEnabled}; ${JSON.stringify(wsFailed().slice(0, 3))}`);
+      if (!ready) throw new Error('framed workbench not ready');
       check('framed: the Worker\'s injector adds the bridge to the workbench, and it answers the OS page\'s hello',
         injected > 0 && (await billing()).some(m => m.type === 'ezil.code.billing.ready'), `injected ${injected}; ${JSON.stringify(await billing())}`);
       await c.press(c.model); await page.waitForTimeout(1200);
@@ -223,9 +229,14 @@ window.addEventListener('message',e=>{if(e.source===frame.contentWindow&&e.origi
       const sent = await c.send('EZIL_E2E_KIMI framed exhausted');
       await page.waitForTimeout(2000);
       const credit = (await billing()).filter(m => m.type === 'ezil.code.billing.intent' && m.intent.reason === 'credits_exhausted');
-      check('framed: a credit refusal reaches the OS page once, with its request id; one request, no retry, no Code notice',
-        credit.length === 1 && credit[0].intent.requestId === CREDITS_REQUEST_ID && sent.length === 1 && (await c.toasts()).every(t => !/Add credits/.test(t)),
-        `${JSON.stringify(credit)}; ${sent.length} request(s); ${JSON.stringify(await c.toasts())}`);
+      // This chat's first turn: Copilot's own title and progress-message requests go with it, on Flash. The turn (the one
+      // with the Agent tools) goes once, and no request repeats.
+      const once = sent.filter(r => r.body?.tools?.length).length === 1 && sent.every(r => r.body?.model === FLASH)
+        && new Set(sent.map(r => JSON.stringify(r.body))).size === sent.length;
+      check('framed: a credit refusal reaches the OS page once, with its request id; the turn goes once, nothing repeats, no Code notice',
+        credit.length === 1 && credit[0].intent.requestId === CREDITS_REQUEST_ID && once && (await c.toasts()).every(t => !/Add credits/.test(t)),
+        `${JSON.stringify(credit)}; ${JSON.stringify(sent.map(r => [r.body?.model, r.body?.tools?.length ?? 0]))}; ${JSON.stringify(await c.toasts())}`);
+      check('framed: no workbench WebSocket closed or failed during the run', wsFailed().length === 0, JSON.stringify(wsFailed().slice(0, 3)));
       await page.screenshot({ path: join(OUT, 'framed.png') });
     } catch (e) {
       check('framed: completed', false, String(e).slice(0, 300));
