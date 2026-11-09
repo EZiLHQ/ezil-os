@@ -271,6 +271,26 @@ auth context.
   - When Show AI Status opens.
 - **Protocols.** A protocol it does not speak drops out of that row, never out
   of the whole catalog, and a row left with none is not selectable.
+- **Plan locks (Free includes Gemini 3.8 Flash only).** When the EZiL OS proxy
+  names the plan's models (`x-ezil-os-included-models` on `/models`):
+  - Every other model of that provider stays listed but locked: not
+    selectable, with a lock icon and an `ezilPlanLocked` note. It is never the
+    default and never sent. A locked model asked for anyway is refused here
+    (`os_model_not_included`), with nothing sent or charged and no dialog.
+  - When Flash itself is unavailable, nothing is the default. The picker shows
+    an unavailable model, not an upgrade.
+  - Title and summary requests stay on the selected model unless the plan
+    includes Qwen.
+  - Choosing a locked row in the picker (the workbench's `picker-locked`
+    patch runs `_ezil-models.lockedModel`) re-reads the plan. If the plan now
+    includes the model, the picker lists it again. Otherwise the EZiL OS
+    window opens its upgrade (`_ezil.billingIntent`, reason `model_locked`).
+- **Billing dialog.** Only `insufficient_credits` and `no_live_grant` ask the
+  EZiL OS window for billing (reason `credits_exhausted`, with the request id),
+  at most once a minute. The OS opens the Standard upgrade on Free and Add
+  credits on a paid plan. Budgets, entitlement, validation, provider and network
+  failures never ask. Without an OS window, the warning and its Add credits link
+  remain.
 
 A `null` limit in `/me/limits` is a configured "No limit set", never unknown.
 Only the session window's `resets_at` is shown as a reset time. The EZiL AI

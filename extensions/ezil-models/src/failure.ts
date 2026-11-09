@@ -45,6 +45,7 @@ const FROM_CODE: Readonly<Record<string, string>> = Object.freeze({
     daily_budget_reached: 'credits_exhausted',
     no_ezil_role: 'membership_required', not_a_member: 'membership_required', role_mismatch: 'membership_required',
     forbidden: 'membership_required', no_entitlement: 'membership_required', model_not_allowed: 'model_not_entitled',
+    os_model_not_included: 'model_not_entitled',
     rate_limited: 'rate_limited', concurrency_limit: 'rate_limited',
     upstream_error: 'provider_error', upstream_unavailable: 'provider_error', idempotency_replay: 'provider_error',
     response_incomplete: 'provider_error', response_failed: 'provider_error', max_tokens: 'provider_error',
