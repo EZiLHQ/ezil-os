@@ -176,8 +176,9 @@ function ServerContext({ value }: { value: unknown }) {
                 ? `${parsed.data.selected.migration.direction} · ${parsed.data.selected.migration.state}` : '—'],
             ['selected unreleased reservation', parsed.data.selected.migration
                 ? (parsed.data.selected.migration.unreleasedReservation ? 'yes' : 'no') : '—'],
-            ['selected reverse move', parsed.data.selected.reverseMove
-                ? `${parsed.data.selected.reverseMove.direction} · ${parsed.data.selected.reverseMove.state}` : '—'],
+            ['selected reverse move', parsed.data.selected.reverseMove === undefined ? 'not available on this deployment'
+                : parsed.data.selected.reverseMove
+                    ? `${parsed.data.selected.reverseMove.direction} · ${parsed.data.selected.reverseMove.state}` : '—'],
         ] as [string, string][] : []),
         ...(parsed.data.otherComputers ? [
             ['own other AWS placements', parsed.data.otherComputers.awsPlacements],

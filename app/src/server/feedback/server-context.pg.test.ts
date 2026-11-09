@@ -37,7 +37,7 @@ describe.skipIf(!PG)('feedback submission-time server context on PostgreSQL', ()
     const admin = PG ? postgres(PG, { max: 1, onnotice: () => {} }) : null;
     const schemas: string[] = [];
     const clients: postgres.Sql[] = [];
-    async function world(opts: { compute?: boolean; slowPlacements?: boolean } = {}) {
+    async function world(opts: { compute?: boolean; slowPlacements?: boolean; reverse?: boolean } = {}) {
         const name = `fbctx_${randomUUID().replaceAll('-', '')}`;
         schemas.push(name);
         await admin!.unsafe(`CREATE SCHEMA ${name}`);
@@ -45,7 +45,9 @@ describe.skipIf(!PG)('feedback submission-time server context on PostgreSQL', ()
         await admin!.begin((tx) => tx.unsafe(local(read('app/drizzle/0011_feedback.sql'))));
         await admin!.unsafe(`CREATE TABLE ${name}.ezil_computers (id uuid PRIMARY KEY, user_id uuid NOT NULL, deleted_at timestamptz)`);
         if (opts.compute !== false) {
-            for (const file of ['0006_compute_migrations.sql', '0009_capacity_demands.sql', '0010_migration_restore_progress.sql', '0012_compute_reverse_moves.sql']) {
+            // Production deliberately has no 0012 reverse-move table (`reverse: false`).
+            for (const file of ['0006_compute_migrations.sql', '0009_capacity_demands.sql', '0010_migration_restore_progress.sql',
+                ...(opts.reverse === false ? [] : ['0012_compute_reverse_moves.sql'])]) {
                 await admin!.begin((tx) => tx.unsafe(local(read(`app/drizzle/${file}`))));
             }
             await admin!.begin((tx) => tx.unsafe(local(placementDdl())));
@@ -145,6 +147,36 @@ describe.skipIf(!PG)('feedback submission-time server context on PostgreSQL', ()
             selected: { provider: 'none', state: 'none', migration: { direction: 'cf_to_aws', state: 'provisioning', unreleasedReservation: true }, reverseMove: null },
             otherComputers: { awsPlacements: '1', unreleasedReservations: '1', activeDemands: '1' },
         });
+    });
+
+    it('production shape without the reverse-move table: everything else is still captured; the field is omitted', async () => {
+        const { name, db } = await world({ reverse: false });
+        const [me, selected, other, foreign, foreignComputer] = [randomUUID(), randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+        await seed(name, me, selected, other, foreign, foreignComputer);
+        expect((await admin!.unsafe(`SELECT to_regclass('${name}.ezil_compute_reverse_moves') AS t`))[0]!.t).toBeNull();
+        expect((await ingestFeedback(db, me, input(selected), NOW)).status).toBe(201);
+        const [row] = await stored(name, me);
+        const context = (row!.diagnostics as { serverContext: Record<string, unknown> }).serverContext;
+        expect(context).toEqual({
+            capturedAt: NOW.toISOString(), outcome: 'captured',
+            selected: { provider: 'cloudflare', state: 'STOPPED', migration: null },
+            otherComputers: { awsPlacements: '0', unreleasedReservations: '1', activeDemands: '1' },
+        });
+        expect(serverContextSchema.safeParse(context).success).toBe(true);
+    });
+
+    it('with the reverse-move table, the selected computer\'s own latest move is named; another person\'s is not', async () => {
+        const { name, db } = await world();
+        const [me, selected, other, foreign, foreignComputer] = [randomUUID(), randomUUID(), randomUUID(), randomUUID(), randomUUID()];
+        await seed(name, me, selected, other, foreign, foreignComputer);
+        await admin!.unsafe(`INSERT INTO ${name}.ezil_compute_reverse_moves (user_id, computer_id, started_by, state) VALUES ($1, $2, 'user', 'copying')`, [me, selected]);
+        await admin!.unsafe(`INSERT INTO ${name}.ezil_compute_reverse_moves (user_id, computer_id, started_by, state, retain_until) VALUES ($1, $2, 'user', 'committed', now() + interval '1 day')`, [foreign, selected]);
+        // Newer than the reporter's own row: only the owner filter keeps it out.
+        await admin!.unsafe(`UPDATE ${name}.ezil_compute_reverse_moves SET created_at = now() + interval '1 minute' WHERE user_id = $1`, [foreign]);
+        expect((await ingestFeedback(db, me, input(selected), NOW)).status).toBe(201);
+        const [row] = await stored(name, me);
+        expect((row!.diagnostics as { serverContext: { selected: unknown } }).serverContext.selected)
+            .toMatchObject({ reverseMove: { direction: 'aws_to_cf', state: 'copying' } });
     });
 
     it('consent off: no server context, diagnostics stay null', async () => {
