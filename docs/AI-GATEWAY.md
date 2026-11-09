@@ -124,10 +124,32 @@ get a local `503 os_plan_unavailable` (source `ezil-os-proxy`): a temporary
 failure, never a billing refusal, and nothing is sent, held or charged. Reads
 (`/models` without the header, balance, limits, usage) pass as before.
 
-Rollout order follows from that. Deploy the app first: an older Worker reads
-only `accessToken` and ignores `includedModels`. Deploy this Worker after it,
-so every computer's next open or activity beat brings a list within a minute.
-A Worker deployed before the app refuses all inference until the app ships.
+Rollout order follows from that: the app, then the desktop image, then this
+Worker.
+
+- **App first.** An older Worker reads only `accessToken` and ignores
+  `includedModels`. A Worker deployed before the app refuses all inference
+  until the app ships.
+- **Image before this Worker.** An older image's Code defaults to Qwen, pins
+  Copilot's title and summary requests to Qwen, and does not know these
+  refusals. Under this Worker, a Free account on that image gets a generic
+  `403 os_model_not_included` for each such turn and title, with nothing
+  charged, no billing and no retry, until the user picks Flash or the computer
+  restarts. The new image under an older Worker is safe: with no header there
+  are no locks, and Flash is the default either way.
+- **Old images persist.** A Worker deploy restarts no computer, so a computer
+  still running the old image when this Worker ships keeps it until it
+  restarts.
+- **First minute.** After this Worker ships, every computer's next open or
+  activity beat brings a list within a minute. Until then its model requests
+  get the 503.
+
+Roll back in reverse, this Worker first.
+
+Pushes come only with opens and activity beats, and beats need a present user.
+An idle stop also waits for the container's own work to end, so an agent kept
+busy after its user leaves can outlive the list's 30 minutes. Its next model
+request then gets the 503. Nothing renews a stale list.
 
 With a list stored, `POST /ai/v1/messages` and `/ai/v1/responses` read the
 body's `model` exactly as the Gateway reads it (fatal UTF-8, `JSON.parse`, last
