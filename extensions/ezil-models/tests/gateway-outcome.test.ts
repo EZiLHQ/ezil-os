@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
-import { forgetGatewayModels, gatewayChat, type GatewayOptions } from '../src/gateway';
+import { forgetGatewayModels, gatewayChat, GATEWAY_MAX_IN_FLIGHT, type GatewayOptions } from '../src/gateway';
 import { isAppFailure, type AppFailure } from '../src/failure';
 import { ask, gw, msg, txt } from '../tests/fixtures/gateway';
 import { frames } from '../tests/fixtures/gateway-response';
@@ -148,6 +148,79 @@ for (const protocol of ['Messages', 'Responses'] as const) describe(`${protocol}
             ['retrying', 'unexpected_error', PREVIOUS_ID, 1], ['retrying', 'network_failed', CLIENT_ID, 2], ['failed', 'network_failed', CLIENT_ID, 3]]);
         for (const record of t.records.slice(1)) { expect(record).not.toHaveProperty('gatewayRequestId'); expect(record).not.toHaveProperty('httpStatus'); }
         valid(t.records);
+    });
+    // A cancellation after the 413 but before the compacted resend is sent names the 413 attempt (its key, Gateway ID and
+    // status), never the unsent new key paired with the old attempt's Gateway ID.
+    const cancelledBeforeResend = (t: ReturnType<typeof compactionTurn>, sent: string[]) => {
+        expect(t.s.keys).toEqual([PREVIOUS_ID]);
+        expect(sent).toEqual([PREVIOUS_ID]);
+        expect(t.records).toEqual([expect.objectContaining(retried413),
+            expect.objectContaining({ outcome: 'cancelled', clientRequestId: PREVIOUS_ID, gatewayRequestId: OTHER_GATEWAY_ID, attempt: 1 })]);
+        expect(JSON.stringify(t.records)).not.toContain(CLIENT_ID);
+        const log = JSON.parse(t.logs.at(-1)!);
+        expect(log).toMatchObject({ client_request_id: PREVIOUS_ID, request_id: OTHER_GATEWAY_ID, http_status: 413, attempts: 1, error_code: 'cancelled' });
+        expect(log).not.toHaveProperty('previous_client_request_id');
+        valid(t.records);
+    };
+    test('413 resend: announced once with the new key; a throwing request or compaction observer changes nothing', async () => {
+        for (const throwing of [false, true]) {
+            const logs: string[] = [], records: AppFailure[] = [], sent: string[] = [];
+            let minted = 0;
+            const s = server(index => index === 0 ? refusal(413, 'input_too_large', OTHER_GATEWAY_ID) : success());
+            await collect(turn(s.fetch, { newIdempotencyKey: () => minted++ === 0 ? PREVIOUS_ID : CLIENT_ID, log: line => logs.push(line),
+                onRequest: (_url, _built, key) => { sent.push(key); if (throwing) throw new Error(SENTINEL); },
+                onCompact: () => { if (throwing) throw new Error(SENTINEL); }, onOutcome: record => records.push(record) }, large()));
+            expect(sent).toEqual([PREVIOUS_ID, CLIENT_ID]);
+            expect(s.keys).toEqual([PREVIOUS_ID, CLIENT_ID]);
+            expect(records).toEqual([expect.objectContaining(retried413),
+                expect.objectContaining({ outcome: 'recovered', clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID, attempt: 2 })]);
+            expect(JSON.parse(logs.at(-1)!)).toMatchObject({ client_request_id: CLIENT_ID, previous_client_request_id: PREVIOUS_ID, request_id: GATEWAY_ID, error_code: null });
+            valid(records);
+        }
+    });
+    test('413 then the caller cancels inside the resend announcement: the resend is never sent and the cancellation names the 413 attempt', async () => {
+        const controller = new AbortController(), logs: string[] = [], records: AppFailure[] = [], sent: string[] = [];
+        let minted = 0;
+        const s = server(index => index === 0 ? refusal(413, 'input_too_large', OTHER_GATEWAY_ID) : success());
+        const run = turn(s.fetch, { signal: controller.signal, newIdempotencyKey: () => minted++ === 0 ? PREVIOUS_ID : CLIENT_ID, log: line => logs.push(line),
+            onRequest: (_url, _built, key) => { sent.push(key); if (key === CLIENT_ID) controller.abort(); }, onOutcome: record => records.push(record) }, large());
+        await collect(run);
+        expect(sent).toEqual([PREVIOUS_ID, CLIENT_ID]);
+        cancelledBeforeResend({ s, logs, records, run }, [PREVIOUS_ID]);
+    });
+    test('413 then the caller cancels inside the retrying callback: the cancellation names the 413 attempt, never the unsent key', async () => {
+        const controller = new AbortController(), logs: string[] = [], records: AppFailure[] = [], sent: string[] = [];
+        let minted = 0;
+        const s = server(index => index === 0 ? refusal(413, 'input_too_large', OTHER_GATEWAY_ID) : success());
+        const run = turn(s.fetch, { signal: controller.signal, newIdempotencyKey: () => minted++ === 0 ? PREVIOUS_ID : CLIENT_ID, log: line => logs.push(line),
+            onRequest: (_url, _built, key) => sent.push(key),
+            onOutcome: record => { records.push(record); if (record.outcome === 'retrying') controller.abort(); } }, large());
+        await collect(run);
+        cancelledBeforeResend({ s, logs, records, run }, sent);
+    });
+    test('413 then the caller cancels while the resend waits for an admission slot: the cancellation names the 413 attempt', async () => {
+        const controller = new AbortController(), holders = new AbortController(), logs: string[] = [], records: AppFailure[] = [], sent: string[] = [];
+        let minted = 0;
+        const s = server(index => index === 0 ? refusal(413, 'input_too_large', OTHER_GATEWAY_ID) : success());
+        // Other turns on the same connection hold every admission slot until they are cancelled.
+        let entered = 0;
+        const hanging = (async (url: string | URL | Request, init: RequestInit = {}) => {
+            if (String(url).endsWith('/models')) return s.fetch(url, init);
+            entered++;
+            return new Promise<Response>((_, reject) => init.signal?.addEventListener('abort', () => reject(init.signal!.reason), { once: true }));
+        }) as typeof fetch;
+        const held: Promise<unknown>[] = [];
+        const run = turn(s.fetch, { signal: controller.signal, newIdempotencyKey: () => minted++ === 0 ? PREVIOUS_ID : CLIENT_ID, log: line => logs.push(line),
+            onRequest: (_url, _built, key) => sent.push(key), onOutcome: record => records.push(record),
+            sleep: async () => {
+                for (let i = 0; i < GATEWAY_MAX_IN_FLIGHT; i++) held.push(collect(turn(hanging, { signal: holders.signal, newIdempotencyKey: () => `h${i}` })).catch(() => {}));
+                while (entered < GATEWAY_MAX_IN_FLIGHT) await new Promise(resolve => setTimeout(resolve, 1));
+                setTimeout(() => controller.abort(), 5);
+            } }, large());
+        await collect(run);
+        holders.abort();
+        await Promise.all(held);
+        cancelledBeforeResend({ s, logs, records, run }, sent);
     });
     test('the caller cancelling mid-stream: no throw, exactly one neutral cancellation record (caller), never a failure', async () => {
         const controller = new AbortController(), records: AppFailure[] = [], logs: string[] = [];

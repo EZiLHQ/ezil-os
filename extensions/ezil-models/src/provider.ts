@@ -52,17 +52,46 @@ function canonicalPart(part: Part): unknown {
 /**
  * The identity of one turn's continuation, for the signed-thinking fallback: the resolved connection (provider type,
  * endpoint and credential, so a provider reconfigured to another endpoint or account under the same name never gets
- * the old one's signed thinking) and model, the exact history the turn answered (thinking and cache/stateful markers left out, as Copilot rebuilds them), and the
- * turn's ordered tool calls with their full inputs. The connection enters as `connection`, an opaque number the provider
+ * the old one's signed thinking) and model, the exact history before the turn (thinking and cache/stateful markers left out, as Copilot rebuilds them), and the
+ * turn's ordered tool calls with their full inputs. The turn's own text is not compared. The connection enters as `connection`, an opaque number the provider
  * instance assigns to each distinct connection (connectionIdentity): the credential is never hashed. An HMAC-SHA256
  * under `secret`, a random key of the provider instance that never leaves memory: a cache lookup key, nothing of it is
  * kept or logged as text.
  */
 function continuationKey(secret: Buffer, connection: number, model: ResolvedModel, history: readonly Message[], calls: readonly { callId: string; name: string; input: unknown }[]): string {
-    const turns = history.map(message => [message.role, message.parts
-        .filter(part => part.type !== 'thinking' && !isCacheMarker(part) && !isStatefulMarker(part)).map(canonicalPart)]);
-    return createHmac('sha256', secret).update(JSON.stringify([connection, model.providerName, model.model, turns,
+    // As the Gateway receives it (gatewayConversation): system text hoisted out in order, and the other messages as
+    // logical turns with adjacent same-role messages merged, so a history Copilot splits or rejoins keys the same.
+    const system: unknown[] = [];
+    const turns: [Message['role'], unknown[]][] = [];
+    for (const message of history) {
+        const parts = message.parts.filter(part => part.type !== 'thinking' && !isCacheMarker(part) && !isStatefulMarker(part)).map(canonicalPart);
+        if (message.role === 'system') { system.push(...parts); continue; }
+        const previous = turns.at(-1);
+        if (previous?.[0] === message.role) previous[1].push(...parts);
+        else turns.push([message.role, parts]);
+    }
+    return createHmac('sha256', secret).update(JSON.stringify([connection, model.providerName, model.model, system, turns,
         calls.map(call => [call.callId, call.name, stableJson(call.input)])])).digest('hex');
+}
+
+type TurnCall = { callId: string; name: string; input: unknown };
+function turnCalls(messages: readonly Message[]): TurnCall[] {
+    return messages.flatMap(message => message.role !== 'assistant' ? [] : message.parts.flatMap(part => part.type === 'tool_call' ? [{ callId: part.callId, name: part.name, input: part.input }] : []));
+}
+/**
+ * The end of the assistant turn that starts at `start`: adjacent assistant messages, and system messages among them
+ * (the Gateway hoists those out, so they do not split the turn on the wire).
+ */
+function assistantTurnEnd(messages: readonly Message[], start: number): number {
+    let end = start;
+    for (let i = start; i < messages.length && messages[i]!.role !== 'user'; i++) if (messages[i]!.role === 'assistant') end = i + 1;
+    return end;
+}
+/** Where a history's trailing assistant turn starts (its length when it ends in none): a reply continues that turn. */
+function trailingAssistantTurn(messages: readonly Message[]): number {
+    let start = messages.length;
+    for (let i = messages.length - 1; i >= 0 && messages[i]!.role !== 'user'; i--) if (messages[i]!.role === 'assistant') start = i;
+    return start;
 }
 
 // Constructor lookups are lazy because the proposed ThinkingPart may not exist at all.
@@ -229,15 +258,35 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         while (this.signedThinking.size > 64) this.signedThinking.delete(this.signedThinking.keys().next().value!);
     }
 
-    /** Re-attach kept signed thinking to an assistant message only when it exactly continues the turn that produced it. */
+    /**
+     * Re-attach kept signed thinking to an assistant turn only when it continues exactly the history the thinking was
+     * produced after, with exactly the same ordered calls. A turn is what the Gateway receives as one assistant message:
+     * adjacent assistant messages (Copilot may split one reply's text and calls into several) and system messages among
+     * them, looked up as it was stored (storeSignedThinking). The Gateway puts the thinking first in the merged turn.
+     */
     private restoreSignedThinking(model: ResolvedModel, request: ChatRequest): void {
-        request.messages.forEach((message, index) => {
-            if (message.role !== 'assistant' || message.parts.some(part => part.type === 'thinking')) return;
-            const calls = message.parts.flatMap(part => part.type === 'tool_call' ? [{ callId: part.callId, name: part.name, input: part.input }] : []);
-            if (!calls.length) return;
-            const kept = this.signedThinking.get(continuationKey(this.continuationSecret, this.connectionIdentity(model.provider), model, request.messages.slice(0, index), calls));
-            if (kept) message.parts = [...kept, ...message.parts];
-        });
+        const messages = request.messages;
+        for (let start = 0, end = 0; start < messages.length; start = Math.max(end, start + 1)) {
+            if (messages[start]!.role !== 'assistant') { end = start + 1; continue; }
+            end = assistantTurnEnd(messages, start);
+            const turn = messages.slice(start, end).filter(message => message.role === 'assistant');
+            if (turn.some(message => message.parts.some(part => part.type === 'thinking'))) continue;
+            const calls = turnCalls(turn);
+            if (!calls.length) continue;
+            const kept = this.signedThinking.get(continuationKey(this.continuationSecret, this.connectionIdentity(model.provider), model, messages.slice(0, start), calls));
+            if (kept) turn[0]!.parts = [...kept, ...turn[0]!.parts];
+        }
+    }
+
+    /**
+     * Keep a completed turn's signed thinking under the key its continuation is looked up by. A history that ends in an
+     * assistant turn (the reply continues it, as one assistant message at the Gateway) keys the history before that turn
+     * and its calls followed by the reply's.
+     */
+    private storeSignedThinking(model: ResolvedModel, answered: readonly Message[], calls: readonly TurnCall[], signed: readonly Part[]): void {
+        const start = trailingAssistantTurn(answered);
+        const key = continuationKey(this.continuationSecret, this.connectionIdentity(model.provider), model, answered.slice(0, start), [...turnCalls(answered.slice(start)), ...calls]);
+        this.rememberSignedThinking(key, signed);
     }
 
     private rememberModels(models: ResolvedModel[]): ResolvedModel[] {
@@ -444,7 +493,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             }
             // Only a turn that completed (not cancelled or cut off) and ended in tool calls is kept for its continuation.
             if (fallback && completed && signed.length && calls.length && !token.isCancellationRequested) {
-                this.rememberSignedThinking(continuationKey(this.continuationSecret, this.connectionIdentity(resolved.provider), resolved, answered, calls), signed);
+                this.storeSignedThinking(resolved, answered, calls, signed);
             }
         } catch (error) {
             const known = this.modelIdentities.get(model.id);
