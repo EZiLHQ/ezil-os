@@ -149,6 +149,17 @@ Nothing here has been executed. Account **452630323510**, **ap-south-1**. The
 production database host `i-09012068d96166828` already serves Universe, Works and
 the Gateway: these steps never touch it, its volumes or the SG's other rules.
 
+**Cloudflare Worker production path.** This order deploys the AWS-served app only.
+The production `ezil-os-worker` (desktop/API zone `ezil.org`) now ships through the
+`worker-production` job in `.github/workflows/preview.yml` — a manual dispatch on
+`main` with `deploy_worker_only=true`. It deploys only the Worker (and its
+container when the image changed), reuses the shared production lease, verifies
+Worker identity, probes `https://os.ezil.work/api/health` read-only, and rolls the
+Worker back to the captured version on failure. Do **not** use the legacy
+`deploy_production` path for Worker-only changes: it also applies migrations to the
+old hosted Supabase project and deploys Vercel, and neither serves production now
+(step 9's Vercel push below is pre-cutover history).
+
 **Blockers to clear first**
 - `https://db.ezil.work` had no certificate on 443 and GoTrue `SITE_URL` was
   still the sslip.io name (read-only probe, 2026-10-29). The build bakes
