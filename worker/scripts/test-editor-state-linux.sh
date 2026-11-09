@@ -46,7 +46,7 @@ if ezil_editor_capture "$user_data" "$workspace"; then exit 1; fi
 unset -f mv
 # Fresh users receive the image-owned settings and a single EZiL vendor group.
 ezil_editor_prepare "$root/fresh" "$root/fresh-workspace"
-node - "$root/fresh" <<'JS'
+node - "$root/fresh" "$(dirname "${BASH_SOURCE[0]}")/../ezil-models/models.json" <<'JS'
 const assert = require('node:assert/strict'), fs = require('node:fs');
 const root = process.argv[2];
 const machine = JSON.parse(fs.readFileSync(root + '/Machine/settings.json', 'utf8'));
@@ -57,6 +57,11 @@ assert.equal(machine['chat.byokUtilityModelDefault'], 'mainAgent');
 // utility slot on a model the plan does not include is refused before sending, so titles and summaries would be lost.
 assert.equal(machine['chat.utilityModel'], 'ezil/ezil/gemini-3.8-flash');
 assert.equal(machine['chat.utilitySmallModel'], 'ezil/ezil/gemini-3.8-flash');
+// The pin names Flash as a catalog-only model of provider `ezil` (<vendor ezil>/<provider>/<alias>). Configuring
+// gemini-3.8-flash in the image's models.json would change its id and the pin would silently stop matching.
+const shipped = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+assert.equal(shipped.providers.ezil.type, 'ezil-gateway');
+assert.equal(shipped.models.some(model => model.provider === 'ezil' && String(model.model).toLowerCase() === 'gemini-3.8-flash'), false);
 // No chat.defaultModel: VS Code 1.141 puts a configured default over the user's remembered model in every new or
 // reloaded empty chat. The first model comes from the provider's declared default (models.json "default").
 assert.equal('chat.defaultModel' in machine, false);
