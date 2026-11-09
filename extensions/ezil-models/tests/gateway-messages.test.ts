@@ -259,6 +259,32 @@ describe('Gemini tool schemas', () => {
             expect(projected).toBeDefined();
             expect(projected.properties.a.items.anyOf[0].properties.v).toEqual({ $ref: ref });
         }
+        // Only references inside a subschema with its own base ($id, or draft-04 id) are refused; others still resolve.
+        const T = { $defs: { T: { type: 'string' } } };
+        for (const [where, at] of [['items', (x: object) => ({ type: 'array', items: x })], ['anyOf', (x: object) => ({ anyOf: [x, { type: 'null' }] })],
+            ['additionalProperties', (x: object) => ({ type: 'object', additionalProperties: x })], ['prefixItems', (x: object) => ({ type: 'array', prefixItems: [x] })]] as const) {
+            for (const id of [{ $id: 'https://example.invalid/n' }, { id: 'https://example.invalid/n' }]) {
+                expect([where, geminiToolSchema({ type: 'object', ...T, properties: { a: at({ type: 'object', ...id }), b: { $ref: '#/$defs/T' } } })]).not.toEqual([where, undefined]);
+                expect([where, geminiToolSchema({ type: 'object', ...T, properties: { a: at({ type: 'object', ...id, properties: { v: { $ref: '#/$defs/T' } } }) } })]).toEqual([where, undefined]);
+                expect([where, geminiToolSchema({ type: 'object', properties: { a: at({ type: 'object', ...id, properties: { v: { $ref: '#' } } }) } })]).toEqual([where, undefined]);
+                expect([where, geminiToolSchema({ type: 'object', properties: { a: at({ type: 'object', ...id }) } })]).not.toEqual([where, undefined]);
+            }
+        }
+        // Targets must be schema positions: never a value inside const (rewritten to enum), default or examples.
+        for (const [a, ref] of [[{ const: false }, '#/properties/a/enum/0'], [{ type: 'boolean', default: true }, '#/properties/a/default'],
+            [{ type: 'boolean', examples: [false] }, '#/properties/a/examples/0'], [{ anyOf: [{ type: 'string' }] }, '#/properties/a/anyOf/01']] as const) {
+            expect(geminiToolSchema({ type: 'object', properties: { a, b: { $ref: ref } } })).toBeUndefined();
+        }
+        // RFC 6901 as a URI fragment: percent-decoded before it is split, then ~1 before ~0.
+        expect(geminiToolSchema({ type: 'object', $defs: { 'x/y': { type: 'string' }, x: { type: 'object', properties: { y: { type: 'integer' } } } },
+            properties: { a: { $ref: '#/$defs/x%2Fy' } } })).toBeUndefined();
+        for (const [defs, ref] of [[{ T: { type: 'string' } }, '#/$defs%2FT'], [{ '~1': { type: 'string' } }, '#/$defs/~01']] as const) {
+            expect(geminiToolSchema({ type: 'object', $defs: defs, properties: { a: { $ref: ref } } })).toBeDefined();
+        }
+        for (const ref of ['#/properties/p/prefixItems/1', '#/properties/p/additionalProperties']) {
+            expect(geminiToolSchema({ type: 'object', properties: { p: { type: 'array', prefixItems: [{ type: 'string' }, { type: 'integer' }], additionalProperties: false },
+                q: { $ref: ref } } })).toBeDefined();
+        }
         const lines: string[] = [];
         const body = geminiBody([{ name: 'ok', inputSchema: { type: 'object', properties: { a: { type: 'string' } } } },
             { name: 'anchored', inputSchema: wrap({ $defs: { T: { $anchor: 'item', type: 'string' } } }, deep('#item')) }], line => lines.push(line));
@@ -279,6 +305,7 @@ describe('Gemini tool schemas', () => {
         // Any route: tools that are all invalid (names, schemas) refuse the same way; with no tools offered nothing changes.
         expect(() => buildGatewayBody(gw(), { ...ask(), tools: [{ name: 'bad.name' }, { name: 'array', inputSchema: { type: 'array' } }] })).toThrow(GatewayError);
         expect(buildGatewayBody({ ...gw(), model: 'gemini-3.8-flash' }, ask()).body.tools).toBeUndefined();
+        expect(buildGatewayBody({ ...gw(), model: 'gemini-3.8-flash' }, ask()).body.tool_choice).toBeUndefined();
         // One usable tool is enough: the turn goes with it (the others are logged as dropped).
         expect(geminiBody([...unusable, { name: 'ok', inputSchema: { type: 'object', properties: {} } }], () => {}).tools!.map(t => t.name)).toEqual(['ok']);
     });

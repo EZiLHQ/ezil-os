@@ -196,41 +196,38 @@ export function geminiToolSchema(value: unknown, restated: Set<string> = new Set
         const constraints = `JSON Schema constraints: ${JSON.stringify(moved)}`;
         node.description = typeof node.description === 'string' && node.description ? `${node.description}\n${constraints}` : constraints;
     }
-    // Fail closed: every $ref must still point at a schema of the projected root, so a reference to an anchor or to a
-    // container that moved into a description, an external one, or one under a nested $id (a new base) drops the tool.
-    if (root && !geminiRefsResolve(node)) return undefined;
+    // Fail closed: every $ref must still name a schema position of the root, so a reference to an anchor, into a
+    // container that moved into a description, to a value that is not a schema, external, or inside a nested
+    // $id / draft-04 id (a new base) drops the tool. Checked on the original, whose schema positions the projection keeps.
+    if (root && !geminiRefsResolve(value)) return undefined;
     return node;
 }
 
-/** True when every `$ref` in a projected schema is `#` or a JSON pointer to one of its own schema nodes. */
-function geminiRefsResolve(root: ObjectValue): boolean {
-    const schemas = new Set<unknown>();
-    const refs: string[] = [];
-    let nestedId = false;
-    const walk = (value: unknown, nested: boolean): void => {
+/**
+ * True when every `$ref` in a schema is `#` or a JSON pointer (RFC 6901, read as a URI fragment: percent-decoded, then
+ * split, then `~1` and `~0` unescaped) to one of the root's own schema positions, the ones the Gateway walks. A reference
+ * inside a subschema with its own `$id` or draft-04 `id` resolves against that base instead, so it is not accepted.
+ */
+function geminiRefsResolve(schema: ObjectValue): boolean {
+    const positions = new Set<string>();
+    const refs: { ref: string; rebased: boolean }[] = [];
+    const walk = (value: unknown, path: readonly string[], rebased: boolean): void => {
+        positions.add(JSON.stringify(path));
         if (!isObject(value)) return;
-        schemas.add(value);
-        if (typeof value.$ref === 'string') refs.push(value.$ref);
-        if (nested && Object.hasOwn(value, '$id')) nestedId = true;
-        for (const key of ['properties', '$defs'] as const) if (isObject(value[key])) for (const child of Object.values(value[key])) walk(child, true);
-        for (const key of ['items', 'additionalProperties'] as const) walk(value[key], true);
-        for (const key of ['prefixItems', 'anyOf'] as const) if (Array.isArray(value[key])) for (const child of value[key]) walk(child, true);
+        const base = rebased || (path.length > 0 && (typeof value.$id === 'string' || typeof value.id === 'string'));
+        if (typeof value.$ref === 'string') refs.push({ ref: value.$ref, rebased: base });
+        for (const key of ['properties', '$defs'] as const) if (isObject(value[key])) for (const [name, child] of Object.entries(value[key])) walk(child, [...path, key, name], base);
+        for (const key of ['items', 'additionalProperties'] as const) if (Object.hasOwn(value, key)) walk(value[key], [...path, key], base);
+        for (const key of ['prefixItems', 'anyOf'] as const) if (Array.isArray(value[key])) value[key].forEach((child, index) => walk(child, [...path, key, String(index)], base));
     };
-    walk(root, false);
-    if (!refs.length) return true;
-    if (nestedId) return false;
-    return refs.every(ref => {
-        if (ref === '#') return true;
-        if (!ref.startsWith('#/')) return false;
-        let target: unknown = root;
-        for (const raw of ref.slice(2).split('/')) {
-            let segment: string;
-            try { segment = decodeURIComponent(raw).replace(/~1/g, '/').replace(/~0/g, '~'); } catch { return false; }
-            if (Array.isArray(target) && /^(0|[1-9]\d*)$/.test(segment) && Number(segment) < target.length) target = target[Number(segment)];
-            else if (isObject(target) && Object.hasOwn(target, segment)) target = target[segment];
-            else return false;
-        }
-        return typeof target === 'boolean' || schemas.has(target);
+    walk(schema, [], false);
+    return refs.every(({ ref, rebased }) => {
+        if (rebased || !ref.startsWith('#')) return false;
+        let pointer: string;
+        try { pointer = decodeURIComponent(ref.slice(1)); } catch { return false; }
+        if (pointer === '') return true;
+        if (!pointer.startsWith('/')) return false;
+        return positions.has(JSON.stringify(pointer.slice(1).split('/').map(token => token.replace(/~1/g, '/').replace(/~0/g, '~'))));
     });
 }
 
