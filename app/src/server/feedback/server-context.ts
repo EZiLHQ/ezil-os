@@ -19,8 +19,12 @@
  */
 import { sql } from 'drizzle-orm';
 import { z } from 'zod';
+import { feedbackComputeContextQuery } from '@/server/lib/compute/placement';
 
-/** `placement.ts` `PLACEMENT_PROVIDERS`/`PLACEMENT_STATES`, copied so this module imports no compute code. */
+/**
+ * `placement.ts` `PLACEMENT_PROVIDERS`/`PLACEMENT_STATES`, as closed output enums. The query itself lives in
+ * `placement.ts` (`feedbackComputeContextQuery`): only that module may name the placement tables (C-2).
+ */
 export const CONTEXT_PROVIDERS = ['cloudflare', 'aws-ec2'] as const;
 export const CONTEXT_PLACEMENT_STATES = [
     'PROVISIONING', 'STOPPED', 'LEASED', 'STARTING', 'MOUNTING', 'RUNNING', 'DRAINING', 'STOPPING',
@@ -88,33 +92,6 @@ function bucket(value: unknown): Bucket {
     return n === 1 ? '1' : '2+';
 }
 
-// An unreleased Cloudflare-to-AWS reservation, exactly as admission's CAPACITY_PLACEMENTS counts one
-// (`placement.ts`): provisioning recorded, not committed, not released, no AWS placement yet. Only the boolean
-// leaves SQL.
-const unreleased = (m: ReturnType<typeof sql>) => sql`(${m}.workspace_head ? '_awsProvision' AND ${m}.state <> 'committed'
-    AND COALESCE(${m}.workspace_head #>> '{_awsProvision,released}', 'false') <> 'true'
-    AND NOT EXISTS (SELECT 1 FROM ezil_computer_placements ap WHERE ap.computer_id = ${m}.computer_id AND ap.provider = 'aws-ec2'))`;
-
-function contextQuery(userId: string, computerId: string, reverseTable: boolean) {
-    return sql`/* feedback:server-context */ SELECT
-        (SELECT jsonb_build_object('provider', p.provider, 'state', p.state) FROM ezil_computer_placements p
-            WHERE p.computer_id = ${computerId}::uuid AND p.owner_user_id = ${userId}::uuid LIMIT 1) AS placement,
-        (SELECT jsonb_build_object('state', m.state, 'unreleased', ${unreleased(sql`m`)}) FROM ezil_compute_migrations m
-            WHERE m.computer_id = ${computerId}::uuid AND m.user_id = ${userId}::uuid
-            ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS migration,
-        ${reverseTable ? sql`(SELECT jsonb_build_object('state', r.state) FROM ezil_compute_reverse_moves r
-            WHERE r.computer_id = ${computerId}::uuid AND r.user_id = ${userId}::uuid
-            ORDER BY r.created_at DESC, r.id DESC LIMIT 1)` : sql`NULL::jsonb`} AS reverse,
-        (SELECT count(DISTINCT p.computer_id) FROM ezil_computer_placements p
-            WHERE p.provider = 'aws-ec2' AND p.owner_user_id = ${userId}::uuid
-              AND p.computer_id <> ${computerId}::uuid AND p.state <> 'PURGE_ELIGIBLE') AS other_aws,
-        (SELECT count(*) FROM ezil_compute_migrations m
-            WHERE m.user_id = ${userId}::uuid AND m.computer_id <> ${computerId}::uuid AND ${unreleased(sql`m`)}) AS other_reservations,
-        (SELECT count(*) FROM ezil_compute_capacity_demands d
-            WHERE d.owner_user_id = ${userId}::uuid AND d.computer_id <> ${computerId}::uuid
-              AND d.closed_at IS NULL AND d.expires_at > now()) AS other_demands`;
-}
-
 function shape(row: Record<string, unknown> | undefined, capturedAt: string, reverseTable: boolean): FeedbackServerContext {
     if (!row) return { capturedAt, outcome: 'unavailable' };
     const placement = row.placement as { provider?: unknown; state?: unknown } | null;
@@ -152,7 +129,7 @@ export async function captureServerContext(
                 to_regclass('ezil_compute_reverse_moves') IS NOT NULL AS reverse_table`));
             const reverseTable = previous?.reverse_table === true;
             await sp.execute(sql`SELECT set_config('statement_timeout', ${`${Math.max(1, Math.round(timeoutMs))}ms`}, true)`);
-            const [row] = rowsOf(await sp.execute(contextQuery(input.userId, input.computerId, reverseTable)));
+            const [row] = rowsOf(await sp.execute(feedbackComputeContextQuery(input.userId, input.computerId, reverseTable)));
             // A released savepoint keeps SET LOCAL until the outer COMMIT; the report INSERT must not inherit it.
             await sp.execute(sql`SELECT set_config('statement_timeout', ${String(previous?.t ?? '0')}, true)`);
             return shape(row, capturedAt, reverseTable);
