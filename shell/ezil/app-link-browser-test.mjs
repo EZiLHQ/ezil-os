@@ -81,7 +81,9 @@ const windows = page => page.locator('.window[data-app]');
 const geometry = async page => {
     await page.waitForFunction(() => {
         const w = document.querySelector('.window[data-app="code"]');
-        return !!w && !window.$(w).is(':animated') && w.getAnimations().length === 0;
+        // Also wait out UIWindow.js showWindow's RAF-scheduled opacity 0->1 fade (70ms CSS transition, #242):
+        // getAnimations() can read empty before that transition registers, so require the fade to have settled.
+        return !!w && !window.$(w).is(':animated') && w.getAnimations().length === 0 && getComputedStyle(w).opacity === '1';
     }, null, { timeout: 5000 });
     const read = () => page.evaluate(async () => {
         await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
