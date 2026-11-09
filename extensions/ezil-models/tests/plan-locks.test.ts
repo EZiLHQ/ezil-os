@@ -204,7 +204,7 @@ describe('billing asks: exactly two credit codes, once a minute', () => {
     });
 
     test.each([
-        ['window budget', 429, 'window_budget_reached'], ['daily budget', 429, 'daily_budget_reached'], ['no entitlement (402)', 402, 'no_entitlement'],
+        ['daily budget', 429, 'daily_budget_reached'], ['no entitlement (402)', 402, 'no_entitlement'],
         ['a 402 without a code', 402, undefined], ['validation', 400, 'invalid_request'], ['Gemini refusal', 400, 'unsupported_gemini_request'],
         ['provider error', 502, 'upstream_error'], ['provider unavailable', 503, 'upstream_unavailable'], ['session missing', 401, 'os_session_missing'],
         ['proxy unavailable', 502, 'os_ai_unavailable'], ['plan refusal', 403, 'os_model_not_included'], ['membership', 403, 'not_a_member'],
@@ -250,6 +250,73 @@ describe('billing asks: exactly two credit codes, once a minute', () => {
         expect(g.posts).toHaveLength(6);
         expect(g.intents).toEqual([]);
         expect(warnings).not.toHaveBeenCalled();
+    });
+
+    test('a used-up credit window never asks for credits (window_limit below)', async () => {
+        const g = gateway(paid(), refusal(429, 'window_budget_reached', { budget_micro: '5000000', used_micro: '5000000', hold_micro: '400000', resets_at: null }));
+        await list(g.provider);
+        await expect(send(g.provider, `ezil/${FLASH}`)).rejects.toThrow();
+        await Bun.sleep(0);
+        expect(g.intents.some(intent => (intent as { reason?: string }).reason === 'credits_exhausted')).toBe(false);
+        expect(warnings.mock.calls.flat()).not.toContain('Add credits');
+    });
+});
+
+// A used-up EZiL AI credit window (`window_budget_reached`, the Gateway's docs/credit-window.md): a plan allowance apart
+// from the wallet that no purchase lifts today. Never a credit refusal: Code asks the OS for `window_limit`, which opens
+// no purchase. The 429 names budget, use and hold as decimal strings, and the reset (null when no window has started).
+describe('a used-up credit window: window_limit, never a credit refusal', () => {
+    const resetsAt = () => new Date(Date.now() + 90 * 60_000).toISOString();
+    const windowRefusal = (fields: Row) => refusal(429, 'window_budget_reached', { retry_after_seconds: 5400, ...fields });
+
+    test('on Free and on a paid plan: one window_limit with the reset, never credits_exhausted, at most once a minute', async () => {
+        for (const plan of [free(), paid()]) {
+            forgetGatewayModels();
+            const reset = resetsAt();
+            const g = gateway(plan, windowRefusal({ budget_micro: '5000000', used_micro: '4800000', hold_micro: '400000', resets_at: reset }));
+            await list(g.provider);
+            await expect(send(g.provider, `ezil/${FLASH}`)).rejects.toThrow(
+                /used up\. Resets at .*Buying credits or changing plan does not lift this window right now\. A new chat or a smaller model uses fewer credits; 0\.20 credits are left in this window\./);
+            await expect(send(g.provider, `ezil/${FLASH}`)).rejects.toThrow();
+            await Bun.sleep(0);
+            expect(g.posts).toHaveLength(2);
+            expect(g.intents).toEqual([{ reason: 'window_limit', requestId: REQUEST, resetsAt: reset }]);
+            expect(warnings).not.toHaveBeenCalled();
+        }
+    });
+
+    test('a request larger than the whole window, or one before any window started: no reset, and waiting is not offered', async () => {
+        for (const fields of [{ budget_micro: '5000000', used_micro: '1000000', hold_micro: '6000000', resets_at: resetsAt() },
+            { budget_micro: '5000000', used_micro: '0', hold_micro: '6000000', resets_at: null }, { resets_at: null }]) {
+            forgetGatewayModels();
+            const g = gateway(free(), windowRefusal(fields));
+            await list(g.provider);
+            const error = await send(g.provider, `ezil/${FLASH}`).then(() => undefined, (e: Error) => e);
+            expect(error?.message).toContain('needs more EZiL AI credits than this window allows, so waiting will not make it fit. Buying credits or changing plan does not lift this window right now. A new chat or a smaller model uses fewer credits.');
+            expect(error?.message).not.toContain('Resets at');
+            await Bun.sleep(0);
+            expect(g.intents).toEqual([{ reason: 'window_limit', requestId: REQUEST }]);
+        }
+    });
+
+    test('nothing left in the window: the reset, and no smaller-request advice', async () => {
+        const g = gateway(free(), windowRefusal({ budget_micro: '5000000', used_micro: '5000000', hold_micro: '400000', resets_at: resetsAt() }));
+        await list(g.provider);
+        const error = await send(g.provider, `ezil/${FLASH}`).then(() => undefined, (e: Error) => e);
+        expect(error?.message).toMatch(/used up\. Resets at .*does not lift this window right now\.( \(request|$)/);
+        expect(error?.message).not.toContain('smaller model');
+    });
+
+    test('outside an OS window, Code says the same itself, with no purchase or upgrade action', async () => {
+        const g = gateway(free(), windowRefusal({ budget_micro: '5000000', used_micro: '4800000', hold_micro: '400000', resets_at: resetsAt() }), async () => false);
+        await list(g.provider);
+        await expect(send(g.provider, `ezil/${FLASH}`)).rejects.toThrow();
+        await Bun.sleep(0); await Bun.sleep(0);
+        expect(g.intents).toHaveLength(1);
+        expect(warnings).toHaveBeenCalledTimes(1);
+        expect(warnings.mock.calls[0]).toHaveLength(1);
+        expect(String(warnings.mock.calls[0]![0])).toContain('does not lift this window right now');
+        expect(opened).toEqual([]);
     });
 });
 
@@ -311,6 +378,32 @@ describe('sendBillingIntent: what crosses into the workbench', () => {
             expect(await sendBillingIntent({ reason: 'credits_exhausted' })).toBe(false);
         }
         (fakeVscode.commands as Record<string, unknown>).executeCommand = async () => undefined;
+    });
+
+    test('the shared records (billing-intent-vectors.json): it sends each accepted one as the shell keeps it, and never one the shell refuses', async () => {
+        const vectors = JSON.parse(readFileSync(`${import.meta.dir}/../../../worker/copilot-chat/billing-intent-vectors.json`, 'utf8')) as
+            { accept: Array<{ record: Record<string, unknown>; expect: Record<string, unknown> }>; reject: Array<Record<string, unknown>> };
+        // The shell's own receiver (plain JavaScript, no declarations).
+        const receiver = new URL('../../../shell/ezil/ui/Settings/billing-recovery.js', import.meta.url).href;
+        const { validate_billing_request } = await import(receiver) as { validate_billing_request: (value: unknown) => unknown };
+        const calls: unknown[][] = [];
+        (fakeVscode.commands as Record<string, unknown>).executeCommand = async (...args: unknown[]) => { calls.push(args); return true; };
+        try {
+            for (const { record, expect: kept } of vectors.accept) {
+                calls.length = 0;
+                expect(await sendBillingIntent(record as never)).toBe(true);
+                expect(calls).toEqual([['_ezil.billingIntent', kept]]);
+            }
+            // A refused record is dropped or narrowed to what the shell accepts; what goes out always passes the shell.
+            for (const record of vectors.reject) {
+                calls.length = 0;
+                await sendBillingIntent(record as never);
+                for (const [, sent] of calls) {
+                    expect(sent).not.toEqual(record);
+                    expect(validate_billing_request(sent)).toEqual(sent);
+                }
+            }
+        } finally { (fakeVscode.commands as Record<string, unknown>).executeCommand = async () => undefined; }
     });
 });
 

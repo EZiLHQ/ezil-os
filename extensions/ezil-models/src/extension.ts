@@ -215,6 +215,7 @@ export function sendAppFailure(record: unknown): void {
 
 const BILLING_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const BILLING_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const BILLING_RESETS_AT = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$/;
 
 /**
  * Ask the EZiL OS window around Code to open its billing dialog, through the workbench's `_ezil.billingIntent`
@@ -223,10 +224,11 @@ const BILLING_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
  */
 export async function sendBillingIntent(intent: BillingIntent): Promise<boolean> {
     try {
-        if (intent.reason !== 'credits_exhausted' && intent.reason !== 'model_locked') return false;
+        if (intent.reason !== 'credits_exhausted' && intent.reason !== 'model_locked' && intent.reason !== 'window_limit') return false;
         const record: Record<string, string> = { reason: intent.reason };
         if (typeof intent.requestId === 'string' && BILLING_UUID.test(intent.requestId)) record.requestId = intent.requestId;
         if (typeof intent.model === 'string' && BILLING_ALIAS.test(intent.model)) record.model = intent.model;
+        if (intent.reason === 'window_limit' && typeof intent.resetsAt === 'string' && BILLING_RESETS_AT.test(intent.resetsAt)) record.resetsAt = intent.resetsAt;
         return (await vscode.commands.executeCommand('_ezil.billingIntent', record)) === true;
     } catch {
         return false;

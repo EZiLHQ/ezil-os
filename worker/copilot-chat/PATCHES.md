@@ -462,10 +462,16 @@ patches list it in the model picker only, and turn choosing it into the upgrade 
   (**one occurrence**, before and after the other patches). The insertion lands before the app-failure registration,
   which stays byte-identical, so the re-run detection on `R_APP_FAILURE` is unaffected.
   - `ezilDispatchBillingIntent(record)` accepts only own string data properties from
-    `{reason, requestId?, model?}`:
-    - `reason` must be `credits_exhausted` or `model_locked`;
+    `{reason, requestId?, model?, resetsAt?}`:
+    - `reason` must be `credits_exhausted`, `model_locked` or `window_limit` (a Gateway credit window is used up;
+      a purchase does not lift it, so it is never a credit refusal);
     - `requestId` must be a lowercase UUID;
-    - `model` must be a Gateway alias (`^[a-z0-9][a-z0-9._-]{0,63}$`).
+    - `model` must be a Gateway alias (`^[a-z0-9][a-z0-9._-]{0,63}$`);
+    - `resetsAt` travels only with `window_limit`, in `Date.prototype.toISOString` form
+      (`^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$`).
+
+    `billing-intent-vectors.json` beside this file lists the records every layer must accept or refuse: the extension,
+    this command, the Worker bridge and the shell receiver all test against it.
 
     Anything else rejects the whole record and returns `false`. That includes a present-but-`undefined` optional key;
     unlike the app-failure projection, nothing is dropped and repaired. A valid record is dispatched once as the

@@ -37,7 +37,11 @@ export type ProviderHost = {
  * upgrade; Standard or Premium: Add credits). Only two causes ever ask: a credit refusal (exactly `insufficient_credits`
  * or `no_live_grant`) and a locked model chosen in the picker. Content-free: a Gateway request id and a model alias.
  */
-export type BillingIntent = { reason: 'credits_exhausted' | 'model_locked'; requestId?: string; model?: string };
+/**
+ * What Code asks the EZiL OS window for (worker/copilot-chat/billing-intent-vectors.json): a credit refusal, a locked
+ * model, or a used-up credit window (`window_limit`, with its reset when waiting can help), which opens no purchase.
+ */
+export type BillingIntent = { reason: 'credits_exhausted' | 'model_locked' | 'window_limit'; requestId?: string; model?: string; resetsAt?: string };
 /** The credit refusals that ask for the billing dialog; budgets, entitlement and every other code never do. */
 export const CREDIT_REFUSALS: readonly string[] = ['insufficient_credits', 'no_live_grant'];
 /** `infoText` key that marks a plan-locked model for the workbench's `picker-locked-*` patches (patch-copilot-chat.sh). */
@@ -248,6 +252,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     private readonly changed = new vscode.EventEmitter<void>();
     private lastCreditWarningAt = -Infinity;
     private lastPlanNoticeAt = -Infinity;
+    private lastWindowNoticeAt = -Infinity;
     /** Per configured Gateway provider: the catalog the picker was last given. */
     private listedCatalogs = new Map<ResolvedProvider, string>();
     /** Keep only identity metadata for stale picker selections, including when the config cannot be read. */
@@ -583,6 +588,14 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                     : Promise.resolve(vscode.window.showWarningMessage(message, ...link ? ['Add credits'] : [])).then(choice => {
                         if (choice === 'Add credits' && link) return vscode.env.openExternal(link);
                     })).catch(() => {});
+            }
+            // A used-up credit window is a plan allowance, not the wallet: no purchase lifts it today, so it is never a credit
+            // refusal. The OS window explains it on its AI credits row and opens nothing (`window_limit`), at most once a
+            // minute; a Code outside one shows the same words, with no purchase link.
+            if (error instanceof GatewayError && error.code === 'window_budget_reached' && Date.now() - this.lastWindowNoticeAt >= 60_000) {
+                this.lastWindowNoticeAt = Date.now();
+                void this.askBilling({ reason: 'window_limit', requestId: error.requestId, ...error.resetsAt ? { resetsAt: error.resetsAt } : {} })
+                    .then(opened => opened ? undefined : Promise.resolve(vscode.window.showWarningMessage(message)).then(() => undefined)).catch(() => {});
             }
             // An unknown plan refuses a turn's title and progress requests too: its notice shows at most once a minute.
             const planUnknown = error instanceof GatewayError && error.code === 'os_plan_unavailable';

@@ -456,8 +456,16 @@ export function creditState(models: GatewayModels | undefined, balance: GatewayB
 // ── error mapping (by error.code, never by message; contract §8) ─────────────
 
 type ErrorBody = { code?: string; message?: string; request_id?: string; reason?: string; pause?: string; param?: string;
-    no_live_grant?: boolean; available_micro?: number; hold_micro?: number; floor_hold_micro?: number; max_affordable_output_tokens?: number | null;
-    input_bound_tokens?: number; max_input_tokens?: number; status?: string; source?: string };
+    no_live_grant?: boolean; available_micro?: number; hold_micro?: number | string; floor_hold_micro?: number; max_affordable_output_tokens?: number | null;
+    input_bound_tokens?: number; max_input_tokens?: number; status?: string; source?: string;
+    /** window_budget_reached: decimal strings, and the reset (null when no window has started). */
+    budget_micro?: unknown; used_micro?: unknown; resets_at?: unknown };
+
+/** A micro-credit amount sent as a decimal string or a safe integer, or undefined. */
+function microValue(value: unknown): number | undefined {
+    if (typeof value === 'string' && /^\d{1,15}$/.test(value)) return Number(value);
+    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+}
 
 /**
  * Who wrote an HTTP refusal. The OS proxy marks its own bodies `source: "ezil-os-proxy"` and uses `os_` codes
@@ -503,13 +511,24 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
     if (body.reason === 'no_ezil_role' || code === 'no_ezil_role') return make('Your EZiL account has no AI access yet');
     switch (code) {
         case 'window_budget_reached': {
+            // A credit window is a plan allowance apart from the wallet (the Gateway's docs/credit-window.md): buying
+            // credits or changing plan does not lift it today. A request larger than the whole window never fits, so
+            // waiting is no answer there: its hold exceeds the budget, or no window has started (resets_at null).
+            const budget = microValue(body.budget_micro), used = microValue(body.used_micro), hold = microValue(body.hold_micro);
+            const oversized = body.resets_at === null || (budget !== undefined && hold !== undefined && hold > budget);
             // This is a reset deadline, not a retry delay: never cap it to the transport's 60 seconds.
             const delay = retryAfter && /^\d+$/.test(retryAfter) ? Number(retryAfter) : retryAfter ? (Date.parse(retryAfter) - now) / 1000 : NaN;
-            const reset = new Date(now + Math.max(0, delay) * 1000);
-            const seconds = Number.isFinite(reset.getTime()) ? Math.max(0, Math.ceil(delay)) : undefined;
-            return new GatewayError(`EZiL AI: This window's EZiL AI credits are used up. ${seconds === undefined
-                ? 'Check EZiL AI status for the reset time.' : `Resets at ${localResetTime(reset)} (local time).`}${ref}`,
-                status, code, requestId, seconds, origin);
+            const named = typeof body.resets_at === 'string' ? Date.parse(body.resets_at) : NaN;
+            const at = oversized ? NaN : Number.isFinite(named) ? named : now + delay * 1000;
+            const reset = Number.isFinite(at) && at >= now ? new Date(at) : undefined;
+            const seconds = Number.isFinite(delay) ? Math.max(0, Math.ceil(delay)) : undefined;
+            const left = budget !== undefined && used !== undefined ? Math.max(0, budget - used) : undefined;
+            const head = oversized ? 'This request needs more EZiL AI credits than this window allows, so waiting will not make it fit.'
+                : `This window's EZiL AI credits are used up. ${reset ? `Resets at ${localResetTime(reset)} (local time).` : 'Check EZiL AI status for the reset time.'}`;
+            const guide = oversized || (left ?? 0) > 0
+                ? ` A new chat or a smaller model uses fewer credits${!oversized && left ? `; ${creditsFloor2(left)} credits are left in this window` : ''}.` : '';
+            return new GatewayError(`EZiL AI: ${head} Buying credits or changing plan does not lift this window right now.${guide}${ref}`,
+                status, code, requestId, seconds, origin, undefined, reset?.toISOString());
         }
         case 'insufficient_credits': case 'no_live_grant': {
             if (body.no_live_grant || code === 'no_live_grant') return make('You have no AI credits left. Add credits to continue.');

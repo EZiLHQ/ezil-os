@@ -851,11 +851,41 @@ function actionStatus ($win, copy) { $win.find('[data-role="billing-action-statu
  * `topup` opens the Add AI credits dialog (`sku` preselects a preset; `intent.reason` frames exhaustion);
  * `topup-checkout` is that dialog's hand-off: the payment sheet for the server's quote (`intent.pack`).
  */
-/** A billing recovery request as Billing keeps it: `insufficient_credits` or `model_locked`, plus Code's request id. */
+/**
+ * A billing recovery request as Billing keeps it: `insufficient_credits`, `model_locked` or `window_limit` (with the
+ * window's reset time when Code had one), plus Code's request id.
+ */
 function recoveryRequest (value) {
-    if ( ! value || typeof value !== 'object' || ! ['insufficient_credits', 'model_locked'].includes(value.reason) ) return null;
+    if ( ! value || typeof value !== 'object' || ! ['insufficient_credits', 'model_locked', 'window_limit'].includes(value.reason) ) return null;
     const requestId = typeof value.requestId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value.requestId) ? value.requestId : null;
-    return { reason: value.reason, requestId };
+    if ( value.reason !== 'window_limit' ) return { reason: value.reason, requestId };
+    const resetsAt = typeof value.resetsAt === 'string' && /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$/.test(value.resetsAt) ? value.resetsAt : null;
+    return { reason: value.reason, requestId, resetsAt };
+}
+
+/**
+ * Code's request after an EZiL AI credit window is used up (`window_budget_reached`). The window is a plan allowance,
+ * apart from the wallet: buying credits or changing plan does not lift it today, so no sheet opens. The AI credits row
+ * says so, with the reset time when Code had one, and takes focus.
+ */
+function windowLimitNote ($win, resetsAt, now = Date.now()) {
+    const card = $win.find('[data-pane="billing"] #ai-credits').get(0);
+    if ( ! card ) return;
+    const at = resetsAt ? Date.parse(resetsAt) : NaN;
+    const reset = Number.isFinite(at) && at > now ? new Date(at) : null;
+    const when = ! reset ? null : new Date(now).toDateString() === reset.toDateString()
+        ? reset.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+        : reset.toLocaleString([], { weekday: 'short', hour: 'numeric', minute: '2-digit' });
+    card.querySelector('[data-role="ai-window-note"]')?.remove();
+    const note = card.ownerDocument.createElement('p');
+    note.className = 'ezil-billing-note';
+    note.setAttribute('role', 'status');
+    note.dataset.role = 'ai-window-note';
+    note.textContent = `${when ? `This window's AI credits are used up until ${when}.` : "This window's AI credits can't cover that request."}`
+        + ' Buying credits or changing your plan does not lift this window right now. A new chat or a smaller model uses fewer credits.';
+    card.append(note);
+    card.scrollIntoView?.({ block: 'nearest' });
+    card.querySelector('h4')?.focus({ preventScroll: true });
 }
 
 /**
@@ -863,6 +893,11 @@ function recoveryRequest (value) {
  * open (one dialog per failure). It never retries Code's request: the chat and its input stay as they were.
  */
 function openRecovery ($win, state, request) {
+    if ( request.reason === 'window_limit' ) {
+        console.info('[billing] recovery', { reason: request.reason, requestId: request.requestId ?? null, action: null });
+        windowLimitNote($win, request.resetsAt);
+        return false;
+    }
     const choice = billingRecoveryAction(state.summary, request.reason);
     // Correlation for support: Code's Gateway request id, never anything of the conversation.
     console.info('[billing] recovery', { reason: request.reason, requestId: request.requestId ?? null, action: choice?.action ?? null });

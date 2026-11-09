@@ -1,6 +1,7 @@
 // billing-recovery-test.mjs — EZiL-authored. Node + jsdom: the actual receiver for Code's billing requests (Free
 // includes Gemini 3.8 Flash only). SYNTHETIC values only: no network, no bundle rebuild.
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { JSDOM } from 'jsdom';
 
 const M = await import('./billing-recovery.js');
@@ -9,7 +10,7 @@ async function check (name, run) { await run(); checks++; console.log(`PASS ${na
 
 const UUID = '6f1d3a52-9b0e-4c1d-8a7b-2e5f4d3c2b1a';
 const OTHER_UUID = '7a2e4b63-0c1f-4d2e-9b8c-3f6a5e4d3c2b';
-await check('validate_billing_request: two reasons, a lowercase UUID and a catalog alias; a fresh copy; never repaired', () => {
+await check('validate_billing_request: the known reasons, a lowercase UUID and a catalog alias; a fresh copy; never repaired', () => {
     for (const value of [{ reason: 'credits_exhausted' }, { reason: 'model_locked', model: 'gemini-3.1-pro' }, { reason: 'credits_exhausted', requestId: UUID }]) {
         const clean = M.validate_billing_request(value);
         assert.deepEqual(clean, value);
@@ -20,6 +21,23 @@ await check('validate_billing_request: two reasons, a lowercase UUID and a catal
         { reason: 'model_locked', model: 'Gemini' }, { reason: 'model_locked', model: 'a/b' }, { reason: 'model_locked', model: 1 }]) {
         assert.equal(M.validate_billing_request(value), null, JSON.stringify(value));
     }
+});
+
+// The records every layer reads (worker/copilot-chat/billing-intent-vectors.json): what the Worker bridge posts
+// (`expect`, asserted by its own test) is what this receiver keeps, unchanged; every refused record stays refused.
+const vectors = JSON.parse(readFileSync(new URL('../../../../worker/copilot-chat/billing-intent-vectors.json', import.meta.url), 'utf8'));
+await check('validate_billing_request: keeps exactly what the bridge posts for every shared record, refuses every refused one', () => {
+    assert.ok(vectors.accept.length >= 8 && vectors.reject.length >= 20);
+    for (const { expect } of vectors.accept) assert.deepEqual(M.validate_billing_request(expect), expect, JSON.stringify(expect));
+    for (const record of vectors.reject) assert.equal(M.validate_billing_request(record), null, JSON.stringify(record));
+});
+await check('billing_recovery_context: a credit refusal asks for credits, a locked model for its plan, a credit window keeps its reset and never becomes a credit refusal', () => {
+    const want = {
+        credits_exhausted: e => ({ reason: 'insufficient_credits', ...(e.requestId ? { requestId: e.requestId } : {}) }),
+        model_locked: e => ({ reason: 'model_locked', ...(e.requestId ? { requestId: e.requestId } : {}) }),
+        window_limit: e => ({ reason: 'window_limit', ...(e.requestId ? { requestId: e.requestId } : {}), ...(e.resetsAt ? { resetsAt: e.resetsAt } : {}) }),
+    };
+    for (const { expect } of vectors.accept) assert.deepEqual(M.billing_recovery_context(expect), want[expect.reason](expect), JSON.stringify(expect));
 });
 
 const dom = new JSDOM('<!doctype html><body></body>', { url: 'https://os.test/os', pretendToBeVisual: true });

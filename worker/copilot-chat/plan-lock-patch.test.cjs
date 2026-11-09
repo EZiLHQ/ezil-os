@@ -73,7 +73,7 @@ test('plan locks: pinned anchors, apply, verify, idempotence and the actual patc
         runInNewContext(`${registration};this.ezilPlanLocked=ezilPlanLocked;this.ezilPickerModels=ezilPickerModels;`, sandbox);
         const ask = value => handlers.get('_ezil.billingIntent')({}, value);
 
-        await t.test('billing intent: only the two reasons, a request UUID and a model alias; true only when the OS took it', () => {
+        await t.test('billing intent: only the known reasons, a request UUID and a model alias; true only when the OS took it', () => {
             assert.deepEqual([...handlers.keys()], ['_ezil.billingIntent']);
             const valid = [{ reason: 'credits_exhausted', requestId: REQUEST_ID }, { reason: 'model_locked', model: 'qwen.qwen3-coder-next' },
                 { reason: 'credits_exhausted' }, { reason: 'model_locked', model: 'us.moonshotai.kimi-k3' }];
@@ -102,6 +102,20 @@ test('plan locks: pinned anchors, apply, verify, idempotence and the actual patc
             const original = window.dispatchEvent;
             window.dispatchEvent = () => { throw new Error('unavailable'); };
             assert.equal(ask({ reason: 'model_locked' }), false); window.dispatchEvent = original;
+        });
+
+        await t.test('billing intent: the shared records every layer reads (billing-intent-vectors.json)', () => {
+            const vectors = JSON.parse(fs.readFileSync(path.join(__dirname, 'billing-intent-vectors.json'), 'utf8'));
+            assert.ok(vectors.accept.length >= 8 && vectors.reject.length >= 20);
+            for (const { record, expect } of vectors.accept) {
+                events.length = 0; takes = true;
+                assert.equal(ask(record), true, JSON.stringify(record));
+                assert.equal(events.length, 1);
+                assert.deepEqual(JSON.parse(events[0].detail), expect);
+            }
+            events.length = 0;
+            for (const record of vectors.reject) assert.equal(ask(record), false, JSON.stringify(record));
+            assert.equal(events.length, 0);
         });
 
         const service = (models, hidden = []) => ({

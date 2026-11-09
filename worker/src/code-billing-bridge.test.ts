@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { injectCodeFolderBridge } from './code-folder-bridge';
 import { injectCodeDiagBridge } from './code-diag-bridge';
@@ -78,7 +79,21 @@ describe('billing bridge: Code asks the EZiL OS shell that frames it for its bil
     ]);
   });
 
-  it('drops anything but the two reasons, a UUID and a catalog alias, and never cancels what it dropped', () => {
+  it('posts what the shell keeps for every shared record, and drops every refused one (billing-intent-vectors.json)', () => {
+    const vectors = JSON.parse(readFileSync(new URL('../copilot-chat/billing-intent-vectors.json', import.meta.url), 'utf8')) as
+      { accept: Array<{ record: unknown; expect: unknown }>; reject: unknown[] };
+    const b = run(); b.message();
+    for (const { record, expect: kept } of vectors.accept) {
+      b.advance(60_001); // each under the ten-a-minute cap
+      expect(b.ask(record)).toBe(true);
+      expect(b.intents().at(-1)?.message.intent).toEqual(kept);
+    }
+    const before = b.intents().length;
+    for (const record of vectors.reject) expect(b.ask(record)).toBe(false);
+    expect(b.intents()).toHaveLength(before);
+  });
+
+  it('drops anything but the known reasons, a UUID and a catalog alias, and never cancels what it dropped', () => {
     const b = run(); b.message();
     for (const bad of [{ reason: 'topup' }, { reason: 'credits_exhausted', extra: 1 }, { reason: 'credits_exhausted', requestId: 'NOT-A-UUID' },
       { reason: 'model_locked', model: 'Bad Alias' }, { reason: 'model_locked', model: 7 }, [], null, 'credits_exhausted', '{', `{"reason":"credits_exhausted","x":"${'a'.repeat(512)}"}`]) {
