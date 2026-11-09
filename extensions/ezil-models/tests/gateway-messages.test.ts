@@ -291,6 +291,16 @@ describe('Gemini tool schemas', () => {
         expect(body.tools!.map(t => t.name)).toEqual(['ok']);
         expect(lines).toContain('[gateway] dropped tools: ["anchored"]');
     });
+    test('a rebase is inherited across every schema position; a pointer must name a position that exists', () => {
+        const T = { $defs: { T: { type: 'string' } } };
+        const v = { type: 'object', properties: { v: { $ref: '#/$defs/T' } } };
+        for (const below of [{ type: 'array', items: v }, { type: 'object', additionalProperties: v }, { anyOf: [v] }, { type: 'array', prefixItems: [v] }]) {
+            expect(geminiToolSchema({ type: 'object', ...T, properties: { a: { $id: 'https://example.invalid/a', ...below } } })).toBeUndefined();
+            expect(geminiToolSchema({ type: 'object', ...T, properties: { a: below } })).toBeDefined();
+        }
+        expect(geminiToolSchema({ type: 'object', properties: { a: { type: 'array' }, b: { $ref: '#/properties/a/items' } } })).toBeUndefined();
+        expect(geminiToolSchema({ type: 'object', items: { type: 'string' }, properties: { a: { $ref: '#Xitems' } } })).toBeUndefined();
+    });
     test('a chat whose tools all cannot be sent is refused locally, never sent as a chat without tools', () => {
         const unusable: Tool[] = [{ name: 'one_of', inputSchema: { type: 'object', properties: { a: { oneOf: [{ type: 'string' }] } } } },
             { name: 'anchored', inputSchema: { type: 'object', $defs: { T: { $anchor: 'item', type: 'string' } }, properties: { a: { $ref: '#item' } } } }];
