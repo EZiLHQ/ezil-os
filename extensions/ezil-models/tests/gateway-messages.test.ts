@@ -167,6 +167,23 @@ const copilotTools = (): Tool[] => JSON.parse(readFileSync(new URL('./fixtures/c
 const geminiBody = (tools: Tool[], log?: (line: string) => void) => buildGatewayBody({ ...gw(), model: 'gemini-3.8-flash' }, { ...ask(), tools }, log).body;
 
 describe('Gemini tool schemas', () => {
+    test('the depth bound is the Gateway\'s, boolean leaves included', () => {
+        const nest = (levels: number, leaf: unknown) => { let node: unknown = leaf; for (let i = 0; i < levels; i++) node = { type: 'array', items: node }; return node; };
+        // The root is depth 0 and `properties.a` depth 1, so a leaf under 63 more arrays sits at depth 64.
+        for (const leaf of [true, { type: 'string' }]) {
+            expect(geminiToolSchema({ type: 'object', properties: { a: nest(63, leaf) } })).toBeDefined();
+            expect(geminiToolSchema({ type: 'object', properties: { a: nest(64, leaf) } })).toBeUndefined();
+        }
+    });
+    test('a JSON-parsed __proto__ key is kept as a property or restated, never lost', () => {
+        const property = JSON.parse('{"type":"object","properties":{"__proto__":{"type":"string","maxLength":3}},"required":["__proto__"]}');
+        const projected = geminiToolSchema(property) as any;
+        expect(Object.hasOwn(projected.properties, '__proto__')).toBe(true);
+        expect(Object.getOwnPropertyDescriptor(projected.properties, '__proto__')!.value).toEqual({ type: 'string', description: 'JSON Schema constraints: {"maxLength":3}' });
+        expect(JSON.stringify(projected)).toBe('{"type":"object","properties":{"__proto__":{"type":"string","description":"JSON Schema constraints: {\\"maxLength\\":3}"}},"required":["__proto__"]}');
+        const keyword = geminiToolSchema(JSON.parse('{"type":"string","__proto__":{"x":1}}')) as any;
+        expect(keyword).toEqual({ type: 'string', description: 'JSON Schema constraints: {"__proto__":{"x":1}}' });
+    });
     test('Copilot tools keep every tool, only allowlisted keywords, and the moved constraints verbatim in descriptions', () => {
         const tools = copilotTools();
         const before = structuredClone(tools);
@@ -229,6 +246,10 @@ describe('Gemini tool schemas', () => {
         expect(body.tools!.map(t => t.name)).toEqual(['ok']);
         expect(lines).toEqual([`[gateway] dropped tools: ${JSON.stringify(refused.map(t => t.name))}`]);
         expect(geminiBody(refused, () => {}).tools).toBeUndefined();
+        for (const inner of [{ type: 'string', contentSchema: { type: 'object' } }, { $dynamicRef: '#node' }, { type: 'object', required: [1] },
+            { type: 'number', minimum: '1' }, { type: 'number', maximum: null }, { type: 'object', properties: [] }]) {
+            expect(geminiToolSchema({ type: 'object', properties: { a: inner } })).toBeUndefined();
+        }
         expect(geminiBody(refused, () => {}).tool_choice).toBeUndefined();
     });
 });

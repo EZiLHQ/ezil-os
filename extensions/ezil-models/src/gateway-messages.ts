@@ -120,9 +120,14 @@ const SCHEMA_TYPES: ReadonlySet<string> = new Set(['string', 'number', 'integer'
 /** Keywords whose value holds schemas: one the Gateway refuses changes the shape, so it cannot be restated as text. */
 const SUBSCHEMA_KEYWORDS: ReadonlySet<string> = new Set([
     'oneOf', 'allOf', 'not', 'if', 'then', 'else', 'contains', 'patternProperties', 'propertyNames', 'dependentSchemas',
-    'dependencies', 'definitions', 'additionalItems', 'unevaluatedProperties', 'unevaluatedItems',
+    'dependencies', 'definitions', 'additionalItems', 'unevaluatedProperties', 'unevaluatedItems', 'contentSchema',
+    '$dynamicRef', '$recursiveRef',
 ]);
 const GEMINI_SCHEMA_MAX_DEPTH = 64;
+/** An own property, also for a key such as `__proto__` from a JSON-parsed schema (plain assignment would hit the setter). */
+function own(target: ObjectValue, key: string, value: unknown): void {
+    Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+}
 
 /**
  * The tool schema sent on a Gemini route, a new object (Copilot's inputSchema is never changed). Accepted keywords pass
@@ -133,8 +138,10 @@ const GEMINI_SCHEMA_MAX_DEPTH = 64;
  * schema cannot be expressed (a schema-holding keyword, or a value the Gateway refuses): the caller drops that tool.
  */
 export function geminiToolSchema(value: unknown, restated: Set<string> = new Set(), depth = 0): unknown {
+    // The Gateway's order: the depth bound applies to boolean schemas too.
+    if (depth > GEMINI_SCHEMA_MAX_DEPTH) return undefined;
     if (typeof value === 'boolean') return value;
-    if (!isObject(value) || depth > GEMINI_SCHEMA_MAX_DEPTH) return undefined;
+    if (!isObject(value)) return undefined;
     const node: ObjectValue = {};
     const moved: ObjectValue = {};
     const schemas = (member: unknown): unknown[] | undefined => {
@@ -145,7 +152,7 @@ export function geminiToolSchema(value: unknown, restated: Set<string> = new Set
     for (const [key, member] of Object.entries(value)) {
         if (key === 'const' && !Object.hasOwn(value, 'enum')) { node.enum = [member]; continue; }
         if (SUBSCHEMA_KEYWORDS.has(key)) return undefined;
-        if (!GEMINI_SCHEMA_KEYWORDS.has(key)) { moved[key] = member; restated.add(key); continue; }
+        if (!GEMINI_SCHEMA_KEYWORDS.has(key)) { own(moved, key, member); restated.add(key); continue; }
         let kept: unknown = member;
         switch (key) {
             case 'type': {
@@ -159,7 +166,7 @@ export function geminiToolSchema(value: unknown, restated: Set<string> = new Set
                 for (const [name, child] of Object.entries(member)) {
                     const projected = geminiToolSchema(child, restated, depth + 1);
                     if (projected === undefined) return undefined;
-                    children[name] = projected;
+                    own(children, name, projected);
                 }
                 kept = children;
                 break;
