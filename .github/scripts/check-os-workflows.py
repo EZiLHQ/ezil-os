@@ -83,6 +83,8 @@ assert not re.search(r'\bvercel\s+(?:alias\s+set|promote)\b', preview_text)
 triggers = preview.get('on', preview.get(True))
 assert set(triggers) == {'push', 'workflow_dispatch'}
 assert triggers['push'] == {'branches': ['preview', 'main'], 'tags': ['v*']}
+# Manual runs take no inputs: each deploys only its own ref's github.sha.
+assert triggers['workflow_dispatch'] is None
 assert preview['permissions'] == {'contents': 'read'}
 assert preview['concurrency'] == {'group': 'os-live-${{ github.ref }}', 'cancel-in-progress': False}
 assert set(preview['jobs']) == {'changes', 'images', 'preview', 'production'}
@@ -130,6 +132,17 @@ assert "run.path === '.github/workflows/preview.yml'" in lookup['with']['script'
 assert 'run.head_branch === branch' in lookup['with']['script']
 assert "['push', 'workflow_dispatch'].includes(run.event)" in lookup['with']['script']
 assert 'Date.parse(b.updated_at) - Date.parse(a.updated_at)' in lookup['with']['script']
+# A union deployment after the preview baseline invalidates its image receipt.
+assert "branch: 'staging/os-union-20261106'" in lookup['with']['script']
+assert '!(Date.parse(other.updated_at) < Date.parse(run.created_at)))) return;' in lookup['with']['script']
+# Case variants of admitted refs fail detection, so no image or deploy job runs.
+case_guard = changes['steps'][0]
+assert case_guard['name'] == 'Refuse case variants of admitted refs' and not {'if', 'continue-on-error'} & set(case_guard)
+assert 'for ref in refs/heads/preview refs/heads/main refs/heads/staging/os-union-20261106; do' in case_guard['run']
+# Slash-free artifact names: identical for preview, main and tags; fixed for the union.
+evidence_ref = "${{ github.ref == 'refs/heads/staging/os-union-20261106' && 'staging-os-union-20261106' || github.ref_name }}"
+assert next(step for step in changes['steps'] if step.get('name') == 'Upload live evidence')['with']['name'] == (
+    f'live-changes-{evidence_ref}-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}')
 evidence = next(step for step in changes['steps'] if step.get('id') == 'deployed_evidence')
 assert evidence['continue-on-error'] is True
 assert evidence['with']['run-id'] == '${{ steps.deployed.outputs.run }}'
@@ -169,8 +182,10 @@ assert any(not step.get('if') and 'node --test' in step.get('run', '') and
            for step in cloud_tests)
 images = preview['jobs']['images']
 assert images['needs'] == 'changes'
-assert images['if'] == ("needs.changes.outputs.image_changed == 'true' && "
-                        "(github.ref == 'refs/heads/preview' || github.ref == 'refs/heads/main')")
+# Only a manual dispatch of the exact qualified staging union joins preview and main.
+union = "(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/staging/os-union-20261106')"
+assert ' '.join(images['if'].split()) == ("needs.changes.outputs.image_changed == 'true' && "
+                        "(github.ref == 'refs/heads/preview' || github.ref == 'refs/heads/main' || " + union + ")")
 assert images['uses'] == './.github/workflows/image.yml'
 assert images['with']['source'] == '${{ github.sha }}'
 assert images['secrets'] == 'inherit'
@@ -197,7 +212,7 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     assert job['environment'] == environment
     assert job['runs-on'] == 'ubuntu-latest' and job['timeout-minutes'] == (42 if job_name == 'preview' else 71)
     assert job['needs'] == ['changes', 'images']
-    ref_condition = ("github.ref == 'refs/heads/preview'" if job_name == 'preview' else
+    ref_condition = ("(github.ref == 'refs/heads/preview' || " + union + ")" if job_name == 'preview' else
                      "(github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))")
     assert ' '.join(job['if'].split()) == (
         "${{ !cancelled() && " + ref_condition + " && "
@@ -324,6 +339,8 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     upload = by_name['Upload live evidence']
     assert upload['if'] == 'always()' and upload['uses'].startswith('actions/upload-artifact@')
     assert 'live-evidence' in upload['with']['path'].splitlines()
+    assert upload['with']['name'] == ('live-evidence-' + (evidence_ref if job_name == 'preview' else '${{ github.ref_name }}') +
+                                      '-${{ github.run_id }}-${{ github.run_attempt }}')
     assert position(check) < position(upload) < position(release)
     assert 'hosted-continuity-evidence/container-rollout.json' in upload['with']['path'].splitlines()
     receipt = by_name['Record successfully deployed image source']
