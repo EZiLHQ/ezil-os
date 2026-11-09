@@ -8,6 +8,7 @@ import { createRequire, stripTypeScriptTypes } from 'node:module';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
+import http from 'node:http';
 
 const require = createRequire(process.env.PLAYWRIGHT_REQUIRE_DIR ? `${process.env.PLAYWRIGHT_REQUIRE_DIR}/` : import.meta.url);
 const { chromium } = require('playwright');
@@ -83,7 +84,8 @@ function code (page, root, v) {
 const browser = await chromium.launch();
 try {
   if (!CONTAINER) throw new Error('EZIL_E2E_CONTAINER is required');
-  for (const v of VIEWS) {
+  // EZIL_E2E_PLAN_ONLY=framed runs only the framed part (iteration aid; the suite runs everything).
+  for (const v of process.env.EZIL_E2E_PLAN_ONLY === 'framed' ? [] : VIEWS) {
     const ctx = await browser.newContext({ viewport: v.viewport, isMobile: v.touch, hasTouch: v.touch, deviceScaleFactor: v.deviceScaleFactor, ...v.userAgent ? { userAgent: v.userAgent } : {} });
     const page = await ctx.newPage();
     const c = code(page, page, v);
@@ -132,16 +134,16 @@ try {
       await page.screenshot({ path: join(OUT, `${v.name}-locked-chosen.png`) });
       await c.escape();
       if (v.keyboard) {
-        // Keyboard only: open the picker on the focused button, walk to Kimi K3, Enter.
+        // Keyboard only: open the picker on the focused button, walk to locked Qwen3 Coder Next, Enter.
         await c.model.focus(); await page.keyboard.press('Enter'); await page.waitForTimeout(1200);
         let reached = false;
         for (let i = 0; i < 20 && !reached; i++) {
           await page.keyboard.press('ArrowDown'); await page.waitForTimeout(150);
-          reached = /Kimi K3/.test((await page.locator(`${rowsSel.split(', ').map(s => `${s}.focused`).join(', ')}`).allTextContents()).join(' '));
+          reached = /Qwen3 Coder Next/.test((await page.locator(`${rowsSel.split(', ').map(s => `${s}.focused`).join(', ')}`).allTextContents()).join(' '));
         }
         const keyed = posts().length;
         if (reached) { await page.keyboard.press('Enter'); await page.waitForTimeout(2500); }
-        check(`${at}: Free: the keyboard reaches locked ${KIMI_NAME}; Enter keeps ${FLASH_NAME} and sends nothing`,
+        check(`${at}: Free: the keyboard reaches locked ${QWEN_NAME}; Enter keeps ${FLASH_NAME} and sends nothing`,
           reached && (await c.label()) === `Models, ${FLASH_NAME}` && posts().length === keyed, `reached ${reached}; ${await c.label()}`);
         await c.escape();
       }
@@ -179,12 +181,20 @@ try {
       if (body !== html) injected++;
       return route.fulfill({ response, headers, body });
     });
-    await ctx.route(`${PARENT}/**`, route => route.fulfill({ contentType: 'text/html', body: `<!doctype html><title>EZiL OS (stand-in)</title>
+    // A real loopback server, like the OS host it stands in for: a page Playwright synthesizes has no address, and Chromium's
+    // local network access checks then refuse the framed workbench's own loopback WebSocket.
+    const parentHtml = `<!doctype html><title>EZiL OS (stand-in)</title>
 <body style="margin:0"><iframe id="code" src="${CODE_URL}/?folder=${encodeURIComponent(FOLDER)}" style="border:0;width:100vw;height:100vh"></iframe>
 <script>window.__billing=[];const frame=document.getElementById('code'),origin=new URL(frame.src).origin;
 let nonce=null;frame.addEventListener('load',()=>{nonce=Array.from(crypto.getRandomValues(new Uint8Array(22)),b=>'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'[b%64]).join('');frame.contentWindow.postMessage({type:'ezil.code.billing.hello',v:1,nonce},origin)});
-window.addEventListener('message',e=>{if(e.source===frame.contentWindow&&e.origin===origin&&e.data&&e.data.nonce===nonce)window.__billing.push(e.data)});</script>` }));
+window.addEventListener('message',e=>{if(e.source===frame.contentWindow&&e.origin===origin&&e.data&&e.data.nonce===nonce)window.__billing.push(e.data)});</script>`;
+    const parentServer = http.createServer((_req, res) => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end(parentHtml); });
+    await new Promise(done => parentServer.listen(Number(new URL(PARENT).port), '127.0.0.1', done));
     const page = await ctx.newPage();
+    const diagnostics = [];
+    page.on('console', m => { if (/error|websocket|refused|failed/i.test(m.text())) diagnostics.push(`console ${m.type()}: ${m.text().slice(0, 300)}`); });
+    page.on('requestfailed', r => diagnostics.push(`failed ${r.method()} ${r.url().slice(0, 160)} ${r.failure()?.errorText}`));
+    page.on('websocket', ws => { diagnostics.push(`ws open ${ws.url().slice(0, 160)}`); ws.on('close', () => diagnostics.push(`ws close ${ws.url().slice(0, 120)}`)); ws.on('socketerror', e => diagnostics.push(`ws error ${e}`)); });
     const frame = page.frameLocator('#code');
     const c = code(page, frame, v);
     const billing = () => page.evaluate(() => window.__billing);
@@ -215,7 +225,7 @@ window.addEventListener('message',e=>{if(e.source===frame.contentWindow&&e.origi
     } catch (e) {
       check('framed: completed', false, String(e).slice(0, 300));
       await page.screenshot({ path: join(OUT, 'framed-error.png') }).catch(() => {});
-    } finally { await ctx.close(); }
+    } finally { writeFileSync(join(OUT, 'framed-diagnostics.json'), JSON.stringify(diagnostics.slice(0, 200), null, 1)); await ctx.close(); parentServer.close(); }
   }
 } catch (e) {
   check('completed', false, String(e).slice(0, 300));
