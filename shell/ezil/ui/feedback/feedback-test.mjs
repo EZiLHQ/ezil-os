@@ -606,6 +606,44 @@ try {
         assert.equal(stored(outboxKey), null);
         close();
     });
+    await check('a screenshot body gets the long deadline, a stalled response body aborts, and the timer is cleared', async () => {
+        const id = '77777777-7777-4777-8777-777777777777';
+        const body = JSON.stringify({ v: 1, clientRequestId: id, category: 'bug', description: 'Large queued report',
+            screenshot: { contentType: 'image/png', dataBase64: 'A'.repeat(70 * 1024) } });
+        window.localStorage.setItem(outboxKey, JSON.stringify([{ clientRequestId: id, body, draft: null }]));
+        const timers = [];
+        const realSetTimeout = globalThis.setTimeout, realClearTimeout = globalThis.clearTimeout;
+        globalThis.setTimeout = (fn, ms, ...rest) => {
+            if ( ms !== feedback.SEND_TIMEOUT_MS.text && ms !== feedback.SEND_TIMEOUT_MS.screenshot ) return realSetTimeout(fn, ms, ...rest);
+            const timer = { fn, ms, cleared: false };
+            timers.push(timer);
+            return timer;
+        };
+        globalThis.clearTimeout = timer => { if ( timers.includes(timer) ) timer.cleared = true; else realClearTimeout(timer); };
+        flushing = true;
+        try {
+            // Headers arrive, then the body stalls until the request is aborted.
+            respond = (url, options) => Promise.resolve({ status: 201, json: () => new Promise((resolve, reject) => {
+                options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+            }) });
+            const first = feedback.flush_feedback_outbox();
+            await until(() => timers.length === 1);
+            assert.equal(timers[0].ms, feedback.SEND_TIMEOUT_MS.screenshot, '🔴 a screenshot-sized body gets the long deadline');
+            await tick();
+            assert.equal(timers[0].cleared, false, 'setup: the body read is still pending');
+            timers[0].fn();
+            await first;
+            assert.equal(timers[0].cleared, true, 'the deadline timer is released after an abort');
+            assert.equal(stored(outboxKey)?.[0]?.body, body, '🔴 an abort during the body read is an unanswered send');
+            respond = async () => ({ status: 200, json: async () => ({ id: reportId, screenshotAccepted: true }) });
+            await feedback.flush_feedback_outbox();
+            assert.equal(stored(outboxKey), null);
+            assert.equal(timers.length, 2);
+            assert.equal(timers[1].cleared, true, '🔴 a confirmed send clears its deadline timer');
+        } finally {
+            globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout; flushing = false;
+        }
+    });
     await check('reports carry the switched current computer, frozen through a later switch and replay', async () => {
         const computerB = '55555555-5555-4555-8555-555555555555';
         const computerC = '66666666-6666-4666-8666-666666666666';

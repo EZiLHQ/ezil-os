@@ -195,6 +195,13 @@ Two `localStorage` keys per account, keyed by the opaque account id from
   `persisted`); each entry is sent once even when two flushes overlap. Removed on 200/201;
   dropped on a definitive 4xx (the text then returns to the draft). Storage failures
   (blocked, quota, private mode) only lose the convenience.
+- Each POST has a client deadline, `SEND_TIMEOUT_MS`: 45 s, or 180 s for a body over
+  64 KiB (only a screenshot body can be; metadata is capped at 32 KiB). Hitting it aborts
+  the request, including a stalled response body, and counts as an unanswered send: the
+  entry stays queued, the form unlocks, and Send reuses its `clientRequestId`, which the
+  server answers as a replay. Known limits: the 180 s ceiling sets an upload floor of
+  about 95 kbit/s for a maximum screenshot, and a timeout retries only on the triggers
+  above, never on a timer.
 
 ## 5. Never collected
 `document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, `log.js` ring, headers,
