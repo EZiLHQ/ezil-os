@@ -214,7 +214,10 @@ Two `localStorage` keys per account, keyed by the opaque account id from
 - Listing and deleting the reporter's own reports (`list_my_reports`, `delete_my_report`)
   have a 20 s deadline (`REPORTS_DEADLINE_MS`) that also covers reading the response: a
   stalled list fails with "Could not load your reports" and a stalled delete settles as not
-  deleted, so Settings shows its retry copy instead of loading forever.
+  deleted, so Settings shows its retry copy instead of loading forever. Only the newest load writes
+  its list: an older load failing at its deadline never replaces a list a later one rendered.
+  A failed delete keeps one message per row and does not claim the report still exists (a
+  timed-out delete may have committed; loading the list again shows which).
 
 ## 5. Never collected
 `document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, `log.js` ring, headers,
