@@ -21,7 +21,6 @@ const STATE_FILE = process.env.EZIL_E2E_STATE_FILE ?? '/tmp/copilot-ezil-mock-st
 mkdirSync(OUT, { recursive: true });
 const FLASH = 'gemini-3.8-flash', FLASH_NAME = 'Gemini 3.8 Flash';
 const QWEN = 'qwen.qwen3-coder-next', QWEN_NAME = 'Qwen3 Coder Next', KIMI_NAME = 'Kimi K3';
-const CREDITS_REQUEST_ID = '6f1d3a52-9b0e-4c1d-8a7b-2e5f4d3c2b1a';
 const VIEWS = [
   { name: 'android-412x915', viewport: { width: 412, height: 915 }, touch: true, deviceScaleFactor: 2.625,
     userAgent: 'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Mobile Safari/537.36' },
@@ -149,10 +148,13 @@ try {
         await c.escape();
       }
 
-      // Out of credits: one request, no retry, and outside an OS window today's notice with Add credits.
+      // Out of credits: one request, no retry (read again after a pause, so a late retry shows), and outside an OS window
+      // today's notice with Add credits.
       state('free exhausted');
-      sent = await c.send(`EZIL_E2E_KIMI ${v.name} exhausted`);
-      await page.waitForTimeout(2000);
+      const mark = posts().length;
+      await c.send(`EZIL_E2E_KIMI ${v.name} exhausted`);
+      await page.waitForTimeout(5000);
+      sent = posts().slice(mark);
       check(`${at}: Free, no credits: one request for the turn, no retry`, sent.length === 1 && sent[0].body?.model === FLASH, JSON.stringify(sent.map(r => r.body?.model)));
       check(`${at}: Free, no credits: outside an OS window the notice offers Add credits`, (await c.toasts()).some(t => /Add credits/.test(t)), JSON.stringify(await c.toasts()));
       await page.screenshot({ path: join(OUT, `${v.name}-exhausted.png`) });
@@ -206,12 +208,14 @@ window.addEventListener('message',e=>{if(e.source===frame.contentWindow&&e.origi
       state('free');
       await page.goto(`${PARENT}/os`, { waitUntil: 'domcontentloaded' });
       await c.ready(FLASH_NAME);
-      // Ready means connected: the model picker is enabled and shows Flash, and no workbench WebSocket has failed (diagnostics so far).
+      // Ready means connected: the model picker is enabled and shows Flash, the workbench opened its WebSocket to the code
+      // host, and none has failed (diagnostics so far).
       const wsFailed = () => diagnostics.filter(line => /^ws (error|close)/.test(line));
+      const wsOpened = () => diagnostics.some(line => line.startsWith(`ws open ws://${new URL(CODE_URL).host}/`));
       const pickerEnabled = (await c.model.getAttribute('aria-disabled')) !== 'true' && !/\bdisabled\b/.test((await c.model.getAttribute('class')) ?? '');
-      const ready = (await c.label()) === `Models, ${FLASH_NAME}` && pickerEnabled && wsFailed().length === 0;
+      const ready = (await c.label()) === `Models, ${FLASH_NAME}` && pickerEnabled && wsOpened() && wsFailed().length === 0;
       check('framed: the workbench connects inside the OS page (WebSocket open, the picker enabled and showing Flash)',
-        ready, `${await c.label()}; enabled ${pickerEnabled}; ${JSON.stringify(wsFailed().slice(0, 3))}`);
+        ready, `${await c.label()}; enabled ${pickerEnabled}; opened ${wsOpened()}; ${JSON.stringify(wsFailed().slice(0, 3))}`);
       if (!ready) throw new Error('framed workbench not ready');
       check('framed: the Worker\'s injector adds the bridge to the workbench, and it answers the OS page\'s hello',
         injected > 0 && (await billing()).some(m => m.type === 'ezil.code.billing.ready'), `injected ${injected}; ${JSON.stringify(await billing())}`);
@@ -226,17 +230,22 @@ window.addEventListener('message',e=>{if(e.source===frame.contentWindow&&e.origi
         (await c.label()) === `Models, ${FLASH_NAME}` && posts().length === before && (await c.toasts()).every(t => !/not included/.test(t)), `${await c.label()}; ${JSON.stringify(await c.toasts())}`);
       await c.escape();
       state('free exhausted');
-      const sent = await c.send('EZIL_E2E_KIMI framed exhausted');
-      await page.waitForTimeout(2000);
+      const mark = posts().length;
+      await c.send('EZIL_E2E_KIMI framed exhausted');
+      // Read again after a pause, so a late retry shows.
+      await page.waitForTimeout(5000);
+      const sent = posts().slice(mark);
       const credit = (await billing()).filter(m => m.type === 'ezil.code.billing.intent' && m.intent.reason === 'credits_exhausted');
-      // This chat's first turn: Copilot's own title and progress-message requests go with it, on Flash. The turn (the one
-      // with the Agent tools) goes once, and no request repeats.
+      // This chat's first turn: Copilot's own title and progress-message requests go with it, on Flash, each refused with
+      // its own request id. The ask names one of them: the minute's first refusal, which can be the title request sent
+      // just before the turn (provider.ts). The turn (the one with the Agent tools) goes once, and no request repeats.
       const once = sent.filter(r => r.body?.tools?.length).length === 1 && sent.every(r => r.body?.model === FLASH)
         && new Set(sent.map(r => JSON.stringify(r.body))).size === sent.length;
-      check('framed: a credit refusal reaches the OS page once, with its request id; the turn goes once, nothing repeats, no Code notice',
-        credit.length === 1 && credit[0].intent.requestId === CREDITS_REQUEST_ID && once && (await c.toasts()).every(t => !/Add credits/.test(t)),
-        `${JSON.stringify(credit)}; ${JSON.stringify(sent.map(r => [r.body?.model, r.body?.tools?.length ?? 0]))}; ${JSON.stringify(await c.toasts())}`);
-      check('framed: no workbench WebSocket closed or failed during the run', wsFailed().length === 0, JSON.stringify(wsFailed().slice(0, 3)));
+      const refused = sent.map(r => r.requestId).filter(Boolean);
+      check('framed: a credit refusal reaches the OS page once, naming one of this turn\'s refused requests; the turn goes once, nothing repeats, no Code notice',
+        credit.length === 1 && refused.includes(credit[0].intent.requestId) && once && (await c.toasts()).every(t => !/Add credits/.test(t)),
+        `${JSON.stringify(credit)}; ${JSON.stringify(sent.map(r => [r.n, r.body?.model, r.body?.tools?.length ?? 0, r.requestId]))}; ${JSON.stringify(await c.toasts())}`);
+      check('framed: the workbench WebSocket opened, and none closed or failed during the run', wsOpened() && wsFailed().length === 0, JSON.stringify(wsFailed().slice(0, 3)));
       await page.screenshot({ path: join(OUT, 'framed.png') });
     } catch (e) {
       check('framed: completed', false, String(e).slice(0, 300));

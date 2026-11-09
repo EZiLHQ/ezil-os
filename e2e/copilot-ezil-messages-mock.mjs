@@ -114,9 +114,11 @@ function scriptedContent(body, folder) {
 // Opt-in (stateFile, env EZIL_MOCK_STATE_FILE; flash catalogs only): plain words read on every request, so a pass can change
 // the account between reloads. `free` adds what the EZiL OS proxy adds for Free (`x-ezil-os-included-models: gemini-3.8-flash`
 // on /models) and refuses any other model as the proxy does (403 os_model_not_included); `exhausted` answers every
-// message with 402 insufficient_credits and a UUID request id, as the Gateway does when no credits are left.
+// message with 402 insufficient_credits and its own UUID request id (recorded in the capture as `requestId`), as the
+// Gateway does when no credits are left.
 export const PLAN_HEADER = 'x-ezil-os-included-models';
-export const CREDITS_REQUEST_ID = '6f1d3a52-9b0e-4c1d-8a7b-2e5f4d3c2b1a';
+/** The request id of the credit refusal answering request number `n`. */
+export const creditsRequestId = n => `6f1d3a52-9b0e-4c1d-8a7b-${n.toString(16).padStart(12, '0')}`;
 const readState = file => { try { return new Set(readFileSync(file, 'utf8').split(/\s+/).filter(Boolean)); } catch { return new Set(); } };
 
 // slow: a marked answer streams `parts` numbered parts `ms` apart (the image suite leaves a chat mid-answer).
@@ -136,8 +138,11 @@ export function createMock({ token, folder, captureDir, slow: { parts = 20, ms =
     captured.push(record);
     writeFileSync(join(captureDir, String(n).padStart(4, '0') + '.body.json'), raw);
     // Readers poll this file while requests arrive: replace it whole, never let them see it half-written.
-    writeFileSync(join(captureDir, 'captured.json.tmp'), JSON.stringify(captured, null, 2));
-    renameSync(join(captureDir, 'captured.json.tmp'), join(captureDir, 'captured.json'));
+    const save = () => {
+      writeFileSync(join(captureDir, 'captured.json.tmp'), JSON.stringify(captured, null, 2));
+      renameSync(join(captureDir, 'captured.json.tmp'), join(captureDir, 'captured.json'));
+    };
+    save();
     const state = flash && stateFile ? readState(stateFile) : new Set();
     record.state = [...state];
     const json = (status, value, headers = {}) => { res.writeHead(status, { 'content-type': 'application/json', 'x-request-id': 'e2e-' + n, ...headers }); res.end(JSON.stringify(value)); };
@@ -155,8 +160,10 @@ export function createMock({ token, folder, captureDir, slow: { parts = 20, ms =
       return json(403, { error: { code: 'os_model_not_included', message: 'This model is not included in your plan.', source: 'ezil-os-proxy' } }, { [PLAN_HEADER]: FLASH });
     }
     if (state.has('exhausted')) {
-      return json(402, { error: { code: 'insufficient_credits', message: 'Insufficient credits.', request_id: CREDITS_REQUEST_ID, available_micro: 0, hold_micro: 1200 } },
-        { 'x-ezil-request-id': CREDITS_REQUEST_ID });
+      record.requestId = creditsRequestId(n);
+      save();
+      return json(402, { error: { code: 'insufficient_credits', message: 'Insufficient credits.', request_id: record.requestId, available_micro: 0, hold_micro: 1200 } },
+        { 'x-ezil-request-id': record.requestId });
     }
     const invalid = validateBody(body, raw.length, flash ? [QWEN, KIMI, FLASH] : [QWEN, KIMI]);
     if (invalid) return error(invalid.status, invalid.code, invalid.message);
