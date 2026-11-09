@@ -48,7 +48,8 @@ export interface FeedbackServerContext {
         provider: typeof CONTEXT_PROVIDERS[number] | 'none' | 'other';
         state: typeof CONTEXT_PLACEMENT_STATES[number] | 'none' | 'other';
         migration: { direction: 'cf_to_aws'; state: typeof CONTEXT_MIGRATION_STATES[number] | 'other'; unreleasedReservation: boolean } | null;
-        reverseMove: { direction: 'aws_to_cf'; state: typeof CONTEXT_REVERSE_STATES[number] | 'other' } | null;
+        /** Absent where the deployment has no reverse-move table (production skips 0012). */
+        reverseMove?: { direction: 'aws_to_cf'; state: typeof CONTEXT_REVERSE_STATES[number] | 'other' } | null;
     };
     otherComputers?: { awsPlacements: Bucket; unreleasedReservations: Bucket; activeDemands: Bucket };
 }
@@ -62,7 +63,7 @@ export const serverContextSchema = z.object({
         provider: z.enum([...CONTEXT_PROVIDERS, 'none', 'other']),
         state: z.enum([...CONTEXT_PLACEMENT_STATES, 'none', 'other']),
         migration: z.object({ direction: z.literal('cf_to_aws'), state: stateOf(CONTEXT_MIGRATION_STATES), unreleasedReservation: z.boolean() }).strict().nullable(),
-        reverseMove: z.object({ direction: z.literal('aws_to_cf'), state: stateOf(CONTEXT_REVERSE_STATES) }).strict().nullable(),
+        reverseMove: z.object({ direction: z.literal('aws_to_cf'), state: stateOf(CONTEXT_REVERSE_STATES) }).strict().nullable().optional(),
     }).strict().optional(),
     otherComputers: z.object({
         awsPlacements: z.enum(CONTEXT_BUCKETS), unreleasedReservations: z.enum(CONTEXT_BUCKETS), activeDemands: z.enum(CONTEXT_BUCKETS),
@@ -94,16 +95,16 @@ const unreleased = (m: ReturnType<typeof sql>) => sql`(${m}.workspace_head ? '_a
     AND COALESCE(${m}.workspace_head #>> '{_awsProvision,released}', 'false') <> 'true'
     AND NOT EXISTS (SELECT 1 FROM ezil_computer_placements ap WHERE ap.computer_id = ${m}.computer_id AND ap.provider = 'aws-ec2'))`;
 
-function contextQuery(userId: string, computerId: string) {
+function contextQuery(userId: string, computerId: string, reverseTable: boolean) {
     return sql`/* feedback:server-context */ SELECT
         (SELECT jsonb_build_object('provider', p.provider, 'state', p.state) FROM ezil_computer_placements p
             WHERE p.computer_id = ${computerId}::uuid AND p.owner_user_id = ${userId}::uuid LIMIT 1) AS placement,
         (SELECT jsonb_build_object('state', m.state, 'unreleased', ${unreleased(sql`m`)}) FROM ezil_compute_migrations m
             WHERE m.computer_id = ${computerId}::uuid AND m.user_id = ${userId}::uuid
             ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS migration,
-        (SELECT jsonb_build_object('state', r.state) FROM ezil_compute_reverse_moves r
+        ${reverseTable ? sql`(SELECT jsonb_build_object('state', r.state) FROM ezil_compute_reverse_moves r
             WHERE r.computer_id = ${computerId}::uuid AND r.user_id = ${userId}::uuid
-            ORDER BY r.created_at DESC, r.id DESC LIMIT 1) AS reverse,
+            ORDER BY r.created_at DESC, r.id DESC LIMIT 1)` : sql`NULL::jsonb`} AS reverse,
         (SELECT count(DISTINCT p.computer_id) FROM ezil_computer_placements p
             WHERE p.provider = 'aws-ec2' AND p.owner_user_id = ${userId}::uuid
               AND p.computer_id <> ${computerId}::uuid AND p.state <> 'PURGE_ELIGIBLE') AS other_aws,
@@ -114,7 +115,7 @@ function contextQuery(userId: string, computerId: string) {
               AND d.closed_at IS NULL AND d.expires_at > now()) AS other_demands`;
 }
 
-function shape(row: Record<string, unknown> | undefined, capturedAt: string): FeedbackServerContext {
+function shape(row: Record<string, unknown> | undefined, capturedAt: string, reverseTable: boolean): FeedbackServerContext {
     if (!row) return { capturedAt, outcome: 'unavailable' };
     const placement = row.placement as { provider?: unknown; state?: unknown } | null;
     const migration = row.migration as { state?: unknown; unreleased?: unknown } | null;
@@ -126,7 +127,8 @@ function shape(row: Record<string, unknown> | undefined, capturedAt: string): Fe
             state: placement ? oneOf(CONTEXT_PLACEMENT_STATES, placement.state) : 'none',
             migration: migration ? { direction: 'cf_to_aws', state: oneOf(CONTEXT_MIGRATION_STATES, migration.state),
                 unreleasedReservation: migration.unreleased === true } : null,
-            reverseMove: reverse ? { direction: 'aws_to_cf', state: oneOf(CONTEXT_REVERSE_STATES, reverse.state) } : null,
+            // Omitted, not null, where the deployment has no reverse-move table: "none" would be a claim.
+            ...(reverseTable ? { reverseMove: reverse ? { direction: 'aws_to_cf' as const, state: oneOf(CONTEXT_REVERSE_STATES, reverse.state) } : null } : {}),
         },
         otherComputers: {
             awsPlacements: bucket(row.other_aws), unreleasedReservations: bucket(row.other_reservations), activeDemands: bucket(row.other_demands),
@@ -144,12 +146,16 @@ export async function captureServerContext(
     const capturedAt = input.now.toISOString();
     try {
         return await tx.transaction(async (sp) => {
-            const [previous] = rowsOf(await sp.execute(sql`SELECT current_setting('statement_timeout') AS t`));
+            // The reverse-move table (0012) is optional: production deliberately does not have it. Its absence leaves
+            // that one field out, rather than failing the whole lookup on 42P01.
+            const [previous] = rowsOf(await sp.execute(sql`SELECT current_setting('statement_timeout') AS t,
+                to_regclass('ezil_compute_reverse_moves') IS NOT NULL AS reverse_table`));
+            const reverseTable = previous?.reverse_table === true;
             await sp.execute(sql`SELECT set_config('statement_timeout', ${`${Math.max(1, Math.round(timeoutMs))}ms`}, true)`);
-            const [row] = rowsOf(await sp.execute(contextQuery(input.userId, input.computerId)));
+            const [row] = rowsOf(await sp.execute(contextQuery(input.userId, input.computerId, reverseTable)));
             // A released savepoint keeps SET LOCAL until the outer COMMIT; the report INSERT must not inherit it.
             await sp.execute(sql`SELECT set_config('statement_timeout', ${String(previous?.t ?? '0')}, true)`);
-            return shape(row, capturedAt);
+            return shape(row, capturedAt, reverseTable);
         });
     } catch (error) {
         // Rolled back to the savepoint, which also reverted the timeout. Only the class of failure is kept.
