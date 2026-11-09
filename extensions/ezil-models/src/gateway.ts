@@ -304,13 +304,38 @@ export function withCatalogDefault(models: readonly ResolvedModel[], catalogs: R
 
 /**
  * The account's OS plan (`included`, Free: Gemini 3.8 Flash only): each other model of that provider stays listed but
- * locked, so choosing it can offer the upgrade, and it is never the default, never selectable and never sent. Applied
- * after `withCatalogDefault`, so a locked default is dropped and no other model takes its place: on Free with Flash
- * unavailable nothing is chosen (unavailable, not an upgrade). A catalog never read locks nothing; the proxy decides.
+ * locked, so choosing it can offer the upgrade, and it is never the default, never selectable and never sent. A locked
+ * default is dropped here; `withDefaultModel` then chooses among the unlocked. A catalog never read locks nothing; the
+ * proxy decides.
  */
 export function withPlanLocks(models: readonly ResolvedModel[], catalogs: ReadonlyMap<ResolvedProvider, GatewayModels | undefined>): ResolvedModel[] {
     return models.map(model => model.provider.type !== 'ezil-gateway' || modelIncluded(catalogs.get(model.provider), model.model) ? model
         : { ...model, locked: true, default: false });
+}
+
+/** The model a new or unset chat starts on, on every plan, while it is available (founder decision 2026-11-09). */
+export const PREFERRED_DEFAULT_MODEL = 'gemini-3.8-flash';
+
+/**
+ * The declared default, after the plan's locks. VS Code applies it only while nothing is picked, so an entitled user's
+ * saved pick stays. In order:
+ *   - the preferred model (Gemini 3.8 Flash) when it is listed, unlocked and calls tools, on every plan;
+ *   - else the default already chosen (the Gateway's suggestion, else the configured one: a paid plan's fallback), when
+ *     unlocked and tool-calling;
+ *   - else the first model the plan includes that is listed and calls tools;
+ *   - else none: a plan that includes only some models never starts on another, nor on an unavailable one.
+ * A default the user configured on another (non-Gateway) provider is left alone.
+ */
+export function withDefaultModel(models: readonly ResolvedModel[], catalogs: ReadonlyMap<ResolvedProvider, GatewayModels | undefined>): ResolvedModel[] {
+    const usable = (model: ResolvedModel) => model.provider.type === 'ezil-gateway' && !model.locked && !!model.capabilities.toolCalling;
+    const current = models.find(model => model.default);
+    if (current && current.provider.type !== 'ezil-gateway') return [...models];
+    let pick = models.find(model => usable(model) && model.model.toLowerCase() === PREFERRED_DEFAULT_MODEL)
+        ?? (current && usable(current) ? current : undefined);
+    for (const [provider, catalog] of catalogs) {
+        for (const alias of catalog?.included ?? []) pick ??= models.find(model => model.provider === provider && usable(model) && model.model.toLowerCase() === alias);
+    }
+    return models.map(model => model.default === (model === pick) ? model : { ...model, default: model === pick });
 }
 
 /** The display names of the models the plan includes, for refusal copy ("Gemini 3.8 Flash"). */
@@ -497,6 +522,8 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
         case 'os_model_not_included': return make(`${alias} is not included in your plan. Nothing was sent or charged. `
             + 'Pick an included model, or upgrade in Settings → Billing');
         case 'os_invalid_request': return make(`Internal EZiL Models bug (${code}); please report it`);
+        // The proxy has no fresh answer about the plan yet (the computer's sign-in refreshes it each minute): temporary.
+        case 'os_plan_unavailable': return make('EZiL OS could not confirm which models your plan includes yet. Nothing was sent or charged. Try again in a minute');
         case 'upstream_timeout': return make('The model provider did not answer in time');
         case 'upstream_unavailable': return make('The model provider could not be reached');
         case 'upstream_error': return make('The model provider returned an error');

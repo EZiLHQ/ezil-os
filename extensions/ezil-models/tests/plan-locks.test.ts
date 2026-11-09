@@ -91,6 +91,24 @@ describe('the picker on Free: Flash selectable, every other model listed but loc
         expect(infos.find(info => info.id === `ezil/${FLASH}`)).toMatchObject({ isUserSelectable: true, isDefault: true });
     });
 
+    test('Flash is the default on Free and on a paid plan whatever the Gateway suggests: another model, none, or one unavailable', async () => {
+        for (const over of [{ default_model: QWEN }, { default_model: null }, { default_model: 'synthetic-gone' }, { default_model: PRO }]) {
+            for (const plan of [free, paid]) {
+                forgetGatewayModels();
+                const data = [...ROWS, row('synthetic-gone', 'unavailable')];
+                const g = gateway(plan === free ? () => Response.json(catalog(data, over), { headers: { [INCLUDED_MODELS_HEADER]: FLASH } }) : () => Response.json(catalog(data, over)));
+                expect(defaults(await list(g.provider))).toEqual([`ezil/${FLASH}`]);
+            }
+        }
+    });
+
+    test('a plan that includes another model starts on it, never on the preferred model it locks', async () => {
+        const g = gateway(free(ROWS, PRO));
+        const infos = await list(g.provider);
+        expect(locked(infos)).toEqual([QWEN, KIMI, `ezil/${FLASH}`]);
+        expect(defaults(infos)).toEqual([`ezil/${PRO}`]);
+    });
+
     test('Flash unavailable on Free: no default and nothing selectable (unavailable, never an upgrade in its place)', async () => {
         for (const data of [[row(QWEN), row(FLASH, 'unavailable')], [row(QWEN)], [row(QWEN), row(FLASH, 'available', { enabled: false })]]) {
             forgetGatewayModels();
@@ -132,7 +150,13 @@ describe('a locked model is never sent', () => {
         const f = gateway(free());
         await list(f.provider);
         await send(f.provider, `ezil/${FLASH}`, { requestInitiator: 'title' });
-        expect(f.posts.map(post => post.body.model)).toEqual([FLASH]);
+        // The Machine settings name Qwen as Copilot's utility model: on Free that title goes to Flash, never refused.
+        await send(f.provider, QWEN, { requestInitiator: 'title' });
+        await send(f.provider, QWEN, { role: 'utilitySmall' });
+        expect(f.posts.map(post => post.body.model)).toEqual([FLASH, FLASH, FLASH]);
+        // A turn (not a utility request) naming locked Qwen is still refused.
+        await expect(send(f.provider, QWEN)).rejects.toThrow(/is not included in your plan/);
+        expect(f.posts).toHaveLength(3);
         forgetGatewayModels();
         const p = gateway(paid());
         await list(p.provider);

@@ -4,7 +4,7 @@
 import * as vscode from 'vscode';
 import type { CompactionInfo } from './compact';
 import { appFailure, type AppFailure } from './failure';
-import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, includedModelNames, knownGatewayModels, modelIncluded, parseCatalogModelId, withCatalogDefault, withGatewayModelLimits, withPlanLocks, type GatewayModels } from './gateway';
+import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, includedModelNames, knownGatewayModels, modelIncluded, parseCatalogModelId, withCatalogDefault, withDefaultModel, withGatewayModelLimits, withPlanLocks, type GatewayModels } from './gateway';
 import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
 import { redact, type ResolvedModel, type ResolvedProvider } from './config';
@@ -365,7 +365,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             // The OS plan's locks (Free: Gemini 3.8 Flash only) follow the same catalog as the rows they lock.
             const offered = [...models.filter(model => gatewayModelAvailable(model, catalog.get(model.provider))), ...listed]
                 .map(model => withGatewayModelLimits(model, catalog.get(model.provider)));
-            return this.rememberModels(withPlanLocks(withCatalogDefault(offered, catalog), used)).map(toInformation);
+            return this.rememberModels(withDefaultModel(withPlanLocks(withCatalogDefault(offered, catalog), used), used)).map(toInformation);
         } finally { cancel.dispose(); }
     }
 
@@ -437,14 +437,20 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         try {
             resolved = await this.resolve(model, controller.signal);
             controller.signal.throwIfAborted();
-            if (resolved.provider.type === 'ezil-gateway' && resolved.gatewayProtocol !== 'openai-responses' && isUtilityRequest(options.modelOptions ?? {})) {
-                // Qwen on the selected model's own provider (account) only, and only when the account's plan includes it
-                // (on Free the selected Flash serves titles and summaries); otherwise the selected model serves it.
+            if (resolved.provider.type === 'ezil-gateway' && isUtilityRequest(options.modelOptions ?? {})) {
+                // Titles and summaries: Qwen on the named model's own provider (account), when the account's plan includes
+                // it. On a plan that does not (Free: Gemini 3.8 Flash only) they never fail on a lock: a request naming a
+                // model the plan does not include (the Machine settings' utility model is Qwen) goes to the plan's own
+                // model on the same account. Otherwise the named model serves it.
                 const selected = resolved;
-                const plan = await gatewayModels(selected.provider, this.host.fetch ?? fetch, Date.now(), controller.signal);
-                if (modelIncluded(plan ?? knownGatewayModels(selected.provider), QWEN)) {
-                    resolved = this.configuredModels().find(candidate => candidate.provider.type === 'ezil-gateway' && candidate.providerName === selected.providerName
-                        && candidate.gatewayProtocol !== 'openai-responses' && candidate.model === QWEN) ?? resolved;
+                const plan = await gatewayModels(selected.provider, this.host.fetch ?? fetch, Date.now(), controller.signal) ?? knownGatewayModels(selected.provider);
+                const sameAccount = (candidate: ResolvedModel) => candidate.provider.type === 'ezil-gateway' && candidate.providerName === selected.providerName;
+                if (selected.gatewayProtocol !== 'openai-responses' && modelIncluded(plan, QWEN)) {
+                    resolved = this.configuredModels().find(candidate => sameAccount(candidate) && candidate.gatewayProtocol !== 'openai-responses' && candidate.model === QWEN) ?? resolved;
+                } else if (!modelIncluded(plan, selected.model)) {
+                    const own = plan?.included?.[0];
+                    resolved = [...this.configuredModels(), ...gatewayCatalogModels(selected.provider, plan, this.configuredModels())]
+                        .find(candidate => sameAccount(candidate) && candidate.model === own) ?? resolved;
                 }
             }
             const request = toNeutralRequest(messages, options);
@@ -571,7 +577,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                         if (choice === 'Add credits' && link) return vscode.env.openExternal(link);
                     })).catch(() => {});
             }
-            if (error instanceof GatewayError && ['first_byte_timeout', 'stream_idle_timeout', 'os_unreachable', 'os_ai_unavailable', 'upstream_timeout'].includes(error.code ?? '')) {
+            if (error instanceof GatewayError && ['first_byte_timeout', 'stream_idle_timeout', 'os_unreachable', 'os_ai_unavailable', 'upstream_timeout', 'os_plan_unavailable'].includes(error.code ?? '')) {
                 // Do not await a notification: the failed turn must leave Thinking immediately.
                 void Promise.resolve(vscode.window.showErrorMessage(message, 'Retry')).then(choice => {
                     if (choice === 'Retry') return vscode.commands.executeCommand('workbench.action.chat.retry');
