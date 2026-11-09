@@ -429,6 +429,25 @@ describe('billing router', () => {
         await checkoutControl(f);
     });
 
+    // #242 fail-closed: the real client returns a status instead of throwing on the 400/404 Stripe gives for a
+    // session that is no longer open. A subscription session that completed or vanished during the race comes back
+    // 'complete'/'gone'; the subscription it created may not be listed yet, so the guard refuses before the
+    // subscription check and the new session — on the returned status, not a thrown Stripe error.
+    it.each(['complete', 'gone'] as const)('refuses checkout (stripe_unavailable) when a raced expiry reports %s, before the subscription check', async outcome => {
+        const f = fixture();
+        await f.store.linkCustomer(userId, 'cus_fixture');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+        f.stripe.listOpenCheckoutSessions.mockResolvedValueOnce([{ id: 'cs_racing', mode: 'subscription' }]);
+        f.stripe.expireCheckoutSession.mockResolvedValueOnce(outcome);
+        await domainFailure(() => f.caller.createCheckout({ sku }), 'stripe_unavailable');
+        expect(log).toHaveBeenCalledExactlyOnceWith('Billing Stripe unavailable');
+        expect(f.stripe.expireCheckoutSession).toHaveBeenCalledExactlyOnceWith('cs_racing');
+        expect(f.stripe.listCustomerSubscriptions).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        // Positive control: a clean 'expired' lets the same customer's checkout proceed.
+        await checkoutControl(f);
+    });
+
     it('creates a first customer\'s checkout without the Stripe subscription guard, then guards that customer', async () => {
         const f = await checkoutControl();
         expect(f.stripe.createCustomer).toHaveBeenCalledTimes(1);

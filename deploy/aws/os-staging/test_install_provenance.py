@@ -143,6 +143,16 @@ class VerifiedInstallTests(SandboxTestCase):
             self.assertNotEqual(result.returncode, 0)
         self.assertFalse(any('send-command' in c for c in self.box.calls()))
 
+    def test_a_sixth_positional_argument_on_the_verified_path_is_refused_before_host_changes(self):
+        # deploy.sh passes five positional arguments on the verified path and the fixed document four; a smuggled
+        # sixth must be refused by the source-provenance arg-count guard before any host-changing command runs.
+        script = self.box.root / 'with_verifier_stub.sh'
+        script.write_text('verify_install_source() { :; }\n' + (self.box.deploy / 'install-host.sh').read_text())
+        _, result = self.box.install(['v1', BUCKET, 'staging', 'a' * 40, 'b' * 64, 'extra'], script=script)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('Installed TAG', result.stdout)
+        self.assertEqual(self.box.calls(), [])
+
 
 if __name__ == '__main__':
     unittest.main()

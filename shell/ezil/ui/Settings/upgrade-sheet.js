@@ -225,7 +225,11 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, summary,
         heading.textContent = 'What happens next';
         const list = doc.createElement('dl');
         const credits = Number.isSafeInteger(offer.aiCredits?.amount) && offer.aiCredits.amount > 0 ? offer.aiCredits.amount.toLocaleString('en-US') : null;
-        const computer = (offer.machineChoice ?? []).length > 1 ? 'Your own AWS computer. Choose 2, 4 or 8 vCPU in Settings → Computer.' : 'Your own AWS computer, set up when you first open it.';
+        // Promotion review (#242): a held AWS computer keeps its own computer and disk — never a new plan-sized one.
+        const choice = (offer.machineChoice ?? []).length > 1;
+        const computer = keepsComputer
+            ? `Your existing AWS computer and its disk are kept.${choice ? ' Choose 2, 4 or 8 vCPU in Settings → Computer.' : ''}`
+            : choice ? 'Your own AWS computer. Choose 2, 4 or 8 vCPU in Settings → Computer.' : 'Your own AWS computer, set up when you first open it.';
         // Standard trial: nothing is paid today; the first charge is the quoted end (filled in by renderTrialTerms).
         for ( const [term, detail, role] of trialMode ? [
             ['Today', `$0. Your free month of ${offer.name} starts once you add a payment method.`],

@@ -5,9 +5,16 @@ set +x
 umask 077
 tag=$1
 bucket=$2
-environment=${3:-staging}
-approved_source=${4:-}
-receipt_hash=${5:-}
+# Two invocation shapes reach this installer. deploy.sh passes the environment positionally
+# (tag bucket ENVIRONMENT [approved receipt]); the reviewed staging SSM document (fixed_document.py) passes
+# only tag bucket APPROVED_SHA RECEIPT, with the environment always staging. An environment is the word
+# staging|production; an approved source is a 40/64-hex SHA, so a 4-argument call whose $3 is a SHA is the
+# fixed-document path. Every other call keeps main's positional contract (and its environment check below).
+if [[ $# == 4 && ${3:-} =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+    environment=staging approved_source=$3 receipt_hash=${4:-} provenance_args=4
+else
+    environment=${3:-staging} approved_source=${4:-} receipt_hash=${5:-} provenance_args=5
+fi
 # Staging keeps its original names; production has its own paths, units, image and S3 prefix.
 case $environment in
     staging) slug=ezil-os-staging prefix=os-staging/images other=ezil-os-production;;
@@ -16,7 +23,7 @@ case $environment in
 esac
 # Source-provenance (staging install-verified only): an approved source SHA and receipt gate the install.
 if [[ -n $approved_source || -n $receipt_hash ]]; then
-    [[ $environment == staging && $# == 5 && $approved_source =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ &&
+    [[ $environment == staging && $# == $provenance_args && $approved_source =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ &&
        $receipt_hash =~ ^[0-9a-f]{64}$ ]] && declare -F verify_install_source >/dev/null || exit 1
 fi
 [[ $EUID == 0 && $(uname -m) == x86_64 ]]

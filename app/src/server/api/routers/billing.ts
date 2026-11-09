@@ -106,14 +106,21 @@ const ENDED_SUBSCRIPTION_STATUSES: ReadonlySet<string> = new Set(['canceled', 'i
  * Checkout Session has its own idempotency key, so two windows (or one slow webhook) could each pay for a
  * plan. Before a subscription Checkout for an existing customer: expire that customer's other open
  * subscription-mode sessions (only the new one can then be paid), THEN ask Stripe for a live subscription
- * (one completed before the expiry is listed; one completing during it makes the expiry fail). Any Stripe
- * failure refuses (`stripe_unavailable`); a live subscription refuses `already_subscribed`. Fail-closed.
+ * (one completed before the expiry is listed; one completing during it leaves its session un-expired).
+ * `expireCheckoutSession` returns that session's status, so anything but a clean `'expired'` — the
+ * `'complete'`/`'gone'` a race produces — is treated as a Stripe failure. Any Stripe failure refuses
+ * (`stripe_unavailable`); a live subscription refuses `already_subscribed`. Fail-closed.
  */
 async function refuseLiveStripeSubscription(stripe: StripeApi, customerId: string): Promise<void> {
     const subscriptions = await stripeCall(async () => {
         const open = await stripe.listOpenCheckoutSessions(customerId);
         for (const session of open) {
-            if (session.mode === 'subscription') await stripe.expireCheckoutSession(session.id);
+            // Only a clean 'expired' is safe: a session that completed or vanished during the race comes back
+            // 'complete'/'gone', so treat it as a Stripe failure and fail closed — the new subscription it
+            // created may not be in the list below yet.
+            if (session.mode === 'subscription' && await stripe.expireCheckoutSession(session.id) !== 'expired') {
+                throw new Error('open subscription Checkout Session could not be expired');
+            }
         }
         return stripe.listCustomerSubscriptions(customerId);
     });
