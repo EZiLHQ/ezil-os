@@ -135,10 +135,12 @@ Worker.
 - **Image before this Worker.** An older image's Code defaults to Qwen, pins
   Copilot's title and summary requests to Qwen, and does not know these
   refusals. Under this Worker, a Free account on that image gets a generic
-  `403 os_model_not_included` for each such turn and title, with nothing
-  charged, no billing and no retry, until the user picks Flash or the computer
-  restarts. The new image under an older Worker is safe: with no header there
-  are no locks, and Flash is the default either way.
+  `403 os_model_not_included` for each such turn and for every title and
+  summary, with nothing charged, no billing and no retry. Its turns recover
+  when the user picks Flash. Its titles and summaries recover only when the
+  computer restarts on the new image, because the older provider sends them to
+  Qwen whichever model is chosen. The new image under an older Worker is safe:
+  with no header there are no locks, and Flash is the default either way.
 - **Old images persist.** A Worker deploy restarts no computer, so a computer
   still running the old image when this Worker ships keeps it until it
   restarts.
