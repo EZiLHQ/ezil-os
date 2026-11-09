@@ -1,0 +1,9 @@
+{
+  "taskId": "plan-only-refresh",
+  "runId": "background-plan-freshness-20261109-v1",
+  "status": "running",
+  "doneRung": "source + focused regressions, mutation-proved",
+  "evidence": "started: base d89419ae; no tests run yet",
+  "startedAt": "2026-11-09T17:22:35Z",
+  "updatedAt": "2026-11-09T17:22:35Z"
+}
