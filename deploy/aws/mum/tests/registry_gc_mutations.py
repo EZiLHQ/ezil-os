@@ -107,6 +107,9 @@ wiring = [
     ('registry_gc.py', "row.get('phase') in TERMINAL_IMAGE_JOB_PHASES", 'True', commands['registry_gc.py']),
     ('registry_gc.py', 'for n, r in required if n == a', 'for n, r in refs if n == a', commands['registry_gc.py']),
     ('registry_gc.py', ".get('Name') != 'terminated'", ".get('Name') == 'running'", commands['registry_gc.py']),
+    # Layered non-digest token scan + decoded claimant scan (review fixes).
+    ('registry_gc.py', 'return non_digest_token_present(manifest.loads(value[start:]), tokens)', 'return False', commands['registry_gc.py']),
+    ('registry_gc.py', 'resource in (resource_ids(r) | resource_ids(decode_embedded(r)))', 'resource in resource_ids(r)', commands['registry_gc.py']),
 ]
 for filename, before, after, command in wiring:
     path = HERE.parent / filename

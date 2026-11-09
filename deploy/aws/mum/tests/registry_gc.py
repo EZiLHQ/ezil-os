@@ -1181,6 +1181,26 @@ class HistoricalAttestationTests(unittest.TestCase):
         self.rows('imageJobs', [row])
         self.refuse('referenced record')
 
+    @staticmethod
+    def unicode_escape(text, n=3):
+        # Escape the first n characters as \uXXXX so the raw text omits the literal spelling but
+        # JSON decoding restores it.
+        return ''.join('\\u%04x' % ord(c) for c in text[:n]) + text[n:]
+
+    def test_r1_escaped_non_digest_token_in_nested_prefix_refused(self):
+        # A non-digest token revealed only after decoding a nested string -- in its prefix, which
+        # references() discards -- must still be checked at every decoding layer.
+        cand = self.records[1]
+        for token in (cand['amiId'], cand['stateMachineVersionArn']):
+            with self.subTest(token=token):
+                note = self.unicode_escape(token) + ' failed {\\"k\\":1}'
+                row = {'id': 'p1', 'state': 'STOPPED', 'lower_image_digest': cand['lowerImageDigest'],
+                       'last_error': '{"note":"' + note + '"}'}
+                self.assertNotIn(token, gc.canonical(row).decode())  # raw text omits the literal token
+                self.assertFalse(gc.r1_allowlisted('placements', row, cand))
+                self.rows('placements', [row])
+                self.refuse('referenced record')
+
     def test_r1_forged_marker_keys_refused(self):
         # N2: $json/$substr are not in-band decision markers; a literal data key of that name
         # does not forge an allowlisted edge.
@@ -1413,6 +1433,17 @@ class HistoricalAttestationTests(unittest.TestCase):
         self.rows('imageJobs', [{'job_id': 'j1', 'phase': 'succeeded', 'quarantined_volume_id': self.VOLUME}])
         self.a['resources'][self.instance]['inventorySha256'] = gc.sha(gc.inventory(self.evidence))
         self.refuse('conflicting claimant')
+
+    def test_r2_escaped_id_claimant_in_embedded_document_refused(self):
+        # A volume named only inside an embedded (and escaped) document is still a claimant.
+        doc = '{"volumeId":"' + self.unicode_escape(self.VOLUME) + '"}'
+        self.assertNotIn(self.VOLUME, doc)  # raw document omits the literal id
+        for src, field in (('imageJobs', 'launch_document'), ('poolHosts', 'lifecycle_input')):
+            with self.subTest(source=src):
+                self.r2_apply([self.r2_volume()], [self.r2_owner()])
+                self.rows(src, [{'id': 'x1', 'phase': 'succeeded', field: doc}])
+                self.a['resources'][self.instance]['inventorySha256'] = gc.sha(gc.inventory(self.evidence))
+                self.refuse('conflicting claimant')
 
     def test_r2_released_pool_owner_with_open_usage_refused(self):
         # N1: a pool-mode STOP never closes the usage row (placement.ts), so a released-pool owner

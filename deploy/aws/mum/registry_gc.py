@@ -124,6 +124,27 @@ def references(value, record):
     return False
 
 
+def non_digest_token_present(value, tokens):
+    """True when a long (>12 char) non-digest identity token appears as a substring of a string at
+    ANY embedded-JSON layer. The whole string is checked before references() would discard a
+    prefix, and embedded JSON is decoded first so an escaped token is seen too -- so the same
+    oracle covers every layer, including an AMI/ARN hidden in a nested string prefix."""
+    if isinstance(value, dict):
+        return any(non_digest_token_present(v, tokens) for v in value.values())
+    if isinstance(value, list):
+        return any(non_digest_token_present(v, tokens) for v in value)
+    if isinstance(value, str):
+        if any(token in value for token in tokens):
+            return True
+        start = min((value.find(c) for c in '{[' if c in value), default=-1)
+        if start >= 0:
+            try:
+                return non_digest_token_present(manifest.loads(value[start:]), tokens)
+            except (ValueError, TypeError):
+                return False
+    return False
+
+
 def references_only_lower(value, candidate):
     """R1: value references the candidate solely through its lowerImageDigest token.
 
@@ -134,17 +155,15 @@ def references_only_lower(value, candidate):
     template/recipe version) also links the row, this is False and the row keeps its
     ordinary attestation/binding requirement.
 
-    references() dives into the first embedded {/[ and never scans the surrounding
-    string, so a non-digest token hidden in a plain-text prefix is also rejected here as
-    a substring of the whole canonical value (fail-closed), using references()'s own
-    >12-character threshold so the short recipeVersion keeps its exact-match semantics.
-    """
+    references() dives into the first embedded {/[ and never scans the surrounding string, so a
+    non-digest token hidden in a prefix -- at the top level or escaped inside a nested document --
+    is rejected here by non_digest_token_present, which checks every string at every decoding layer
+    using references()'s own >12-character threshold (so a short recipeVersion keeps exact match)."""
     masked = dict(candidate, lowerImageDigest=None)
     if not references(value, candidate) or references(value, masked):
         return False
-    blob = canonical(value).decode()
     tokens = [masked[k] for k in IDENTITY_KEYS if k != 'launchTemplateVersion' and masked[k] and len(masked[k]) > 12]
-    return not any(token in blob for token in tokens)
+    return not non_digest_token_present(value, tokens)
 
 
 def shared_lower_kept(snapshot, candidate):
@@ -405,8 +424,10 @@ def retained_data_volume(evidence, snapshot, candidate, resource, disposition):
     # Allowlist, not denylist: the app's placement enum has many live states (placement.ts), so
     # only an explicitly STOPPED owner qualifies.
     need(owner.get('state') == 'STOPPED', 'GC retained-data-volume owner placement is not STOPPED')
+    # Scan ids from both the raw row (keeping prefix matches) and the recursively decoded embedded
+    # JSON, so a volume named only inside a document (and an escaped id) is still a claimant.
     claimants = [r for src in ('placements', 'poolHosts', 'imageJobs') for r in evidence['sources'][src]['rows']
-                 if r is not owner and resource in resource_ids(r)]
+                 if r is not owner and resource in (resource_ids(r) | resource_ids(decode_embedded(r)))]
     need(not claimants, 'GC retained-data-volume has a conflicting claimant')
     captured = time_value(evidence['capturedAt'])
     need(not any(u.get('computer_id') == owner['computer_id'] and not closed_usage_row(u, captured)
