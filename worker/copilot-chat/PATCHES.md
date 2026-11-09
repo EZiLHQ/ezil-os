@@ -510,7 +510,7 @@ COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/p
 
 **OS side (adapter, not in this patch):** the Worker-injected bridge listens for `ezil-billing-intent`. With an
 acknowledged shell channel, it validates `detail` with the same rules, calls `preventDefault()` and posts
-`{type:"ezil.code.billing",v:1,nonce,intent}` to the pinned parent. Without a ready channel it leaves the event
+`{type:"ezil.code.billing.intent",v:1,nonce,intent}` to the pinned parent. Without a ready channel it leaves the event
 alone, so Code shows its own notice. The shell opens the Standard upgrade on Free and Add credits on a paid plan,
 from its own billing summary.
 

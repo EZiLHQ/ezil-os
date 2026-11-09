@@ -118,34 +118,50 @@ with a readable plan replaces it. It counts as known for
 `AI_MODEL_ACCESS_MAX_AGE_MS` (30 minutes) from its own signed time. A present
 user's Code pushes one with every activity beat, each minute.
 
-Work can keep running with nobody present: a build the agent started holds the
-idle stop, and a hidden or closed browser sends no beats. So the app's
-per-minute billing sweep (`refreshAiPlans` in
-`app/src/server/lib/ai-credential.ts`) also pushes the plan on its own. Every
-live computer opened in the last three hours (`last_opened_at`, on either
-provider) gets a signed body `{ "includedModels": … }` with no `accessToken`.
-The list comes from the same effective plan, so a paid plan that ends reaches
-the computer within a minute. The Worker stores only the list, ordered as above.
-It never creates, extends or reads the token, so the work still ends with the
-pushed token: `401 os_session_missing` once it expires. A plan the app cannot
-read sends nothing, never `null`, and the stored list ages out to the 503 below.
-A token-less body without `includedModels` is refused (`400
-included_models_missing`). The refresh records no activity, presence, lease or
-meter, and is bounded at 20 seconds per sweep.
-
 An unknown plan is never "every model". That covers no list pushed, a stale
 list, or a malformed record. `POST /ai/v1/messages` and `/ai/v1/responses` then
 get a local `503 os_plan_unavailable` (source `ezil-os-proxy`): a temporary
 failure, never a billing refusal, and nothing is sent, held or charged. Reads
 (`/models` without the header, balance, limits, usage) pass as before.
 
-Rollout order follows from that. Deploy the app first: an older Worker reads
-only `accessToken` and ignores `includedModels`. Deploy this Worker after it,
-so every computer's next open or activity beat brings a list within a minute.
-A Worker deployed before the app refuses all inference until the app ships.
-The plan refresh goes either way round. An older Worker refuses the token-less
-body with a 400, which the sweep logs and carries on past, and browser beats
-work as before.
+Rollout order follows from that: the app, then the desktop image, then this
+Worker.
+
+- **App first.** An older Worker reads only `accessToken` and ignores
+  `includedModels`. A Worker deployed before the app refuses all inference
+  until the app ships. The app's plan refresh (below) is safe either way
+  round: an older Worker refuses its token-less body with a 400, which the
+  sweep logs and carries on past.
+- **Image before this Worker.** An older image's Code defaults to Qwen, pins
+  Copilot's title and summary requests to Qwen, and does not know these
+  refusals. Under this Worker, a Free account on that image gets a generic
+  `403 os_model_not_included` for each such turn and title, with nothing
+  charged, no billing and no retry, until the user picks Flash or the computer
+  restarts. The new image under an older Worker is safe: with no header there
+  are no locks, and Flash is the default either way.
+- **Old images persist.** A Worker deploy restarts no computer, so a computer
+  still running the old image when this Worker ships keeps it until it
+  restarts.
+- **First minute.** After this Worker ships, every computer's next open,
+  activity beat or plan refresh brings a list within a minute. Until then its
+  model requests get the 503.
+
+Roll back in reverse, this Worker first.
+
+Activity beats need a present user, and an idle stop also waits for the
+container's own work to end, so an agent kept busy after its user leaves can
+outlive a beat's list. The app's per-minute billing sweep (`refreshAiPlans` in
+`app/src/server/lib/ai-credential.ts`) therefore pushes the plan on its own:
+every live computer opened in the last three hours (`last_opened_at`, on either
+provider) gets a signed body `{ "includedModels": … }` with no `accessToken`,
+from the same effective plan, so a paid plan that ends reaches the computer
+within a minute. The Worker stores only the list, ordered as above, and never
+creates, extends or reads the token: the work still ends with the pushed token
+(`401 os_session_missing` once it expires). Nothing renews a stale list. A plan
+the app cannot read sends nothing, never `null`, so the stored list ages out to
+the 503. A token-less body without `includedModels` is refused (`400
+included_models_missing`). The refresh records no activity, presence, lease or
+meter, and is bounded at 20 seconds per sweep.
 
 With a list stored, `POST /ai/v1/messages` and `/ai/v1/responses` read the
 body's `model` exactly as the Gateway reads it (fatal UTF-8, `JSON.parse`, last

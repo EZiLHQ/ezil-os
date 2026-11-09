@@ -247,6 +247,7 @@ function catalogSignature(catalog: GatewayModels | undefined): string {
 export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     private readonly changed = new vscode.EventEmitter<void>();
     private lastCreditWarningAt = -Infinity;
+    private lastPlanNoticeAt = -Infinity;
     /** Per configured Gateway provider: the catalog the picker was last given. */
     private listedCatalogs = new Map<ResolvedProvider, string>();
     /** Keep only identity metadata for stale picker selections, including when the config cannot be read. */
@@ -438,10 +439,11 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             resolved = await this.resolve(model, controller.signal);
             controller.signal.throwIfAborted();
             if (resolved.provider.type === 'ezil-gateway' && isUtilityRequest(options.modelOptions ?? {})) {
-                // Titles and summaries: Qwen on the named model's own provider (account), when the account's plan includes
-                // it. On a plan that does not (Free: Gemini 3.8 Flash only) they never fail on a lock: a request naming a
-                // model the plan does not include (the Machine settings' utility model is Qwen) goes to the plan's own
-                // model on the same account. Otherwise the named model serves it.
+                // Requests marked as titles or summaries (role or requestInitiator): Qwen on the named model's own provider
+                // (account), when the account's plan includes it. On a plan that does not (Free: Gemini 3.8 Flash only) they
+                // never fail on a lock: one naming a model the plan does not include goes to the plan's own model on the same
+                // account. Otherwise the named model serves it. Copilot 0.69 marks none of its own requests: the image's
+                // Machine settings pin its utility slots to Flash (worker/scripts/editor-state.sh).
                 const selected = resolved;
                 const plan = await gatewayModels(selected.provider, this.host.fetch ?? fetch, Date.now(), controller.signal) ?? knownGatewayModels(selected.provider);
                 const sameAccount = (candidate: ResolvedModel) => candidate.provider.type === 'ezil-gateway' && candidate.providerName === selected.providerName;
@@ -568,7 +570,9 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             if (resolved && resolved.provider.type !== 'ezil-gateway') this.host.log(`[error] ${resolved.id}: ${message}`);
             // Exactly these two codes ask for billing, at most once a minute (in-flight turns or an agent loop that all run
             // out ask once). The OS window opens the upgrade on Free and Add credits on a paid plan; a Code outside one
-            // keeps the notice and its link. The turn is not retried: the conversation and input stay as they are.
+            // keeps the notice and its link. The turn is not retried: the conversation and input stay as they are. The ask
+            // carries the first refusal's request id, which in a new chat can be Copilot's title request, sent just before
+            // the turn (the OS only logs it and dedupes on it).
             if (error instanceof GatewayError && CREDIT_REFUSALS.includes(error.code ?? '') && Date.now() - this.lastCreditWarningAt >= 60_000) {
                 this.lastCreditWarningAt = Date.now();
                 const link = aiCreditsLink();
@@ -577,7 +581,11 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                         if (choice === 'Add credits' && link) return vscode.env.openExternal(link);
                     })).catch(() => {});
             }
-            if (error instanceof GatewayError && ['first_byte_timeout', 'stream_idle_timeout', 'os_unreachable', 'os_ai_unavailable', 'upstream_timeout', 'os_plan_unavailable'].includes(error.code ?? '')) {
+            // An unknown plan refuses a turn's title and progress requests too: its notice shows at most once a minute.
+            const planUnknown = error instanceof GatewayError && error.code === 'os_plan_unavailable';
+            if (error instanceof GatewayError && ['first_byte_timeout', 'stream_idle_timeout', 'os_unreachable', 'os_ai_unavailable', 'upstream_timeout', 'os_plan_unavailable'].includes(error.code ?? '')
+                && !(planUnknown && Date.now() - this.lastPlanNoticeAt < 60_000)) {
+                if (planUnknown) this.lastPlanNoticeAt = Date.now();
                 // Do not await a notification: the failed turn must leave Thinking immediately.
                 void Promise.resolve(vscode.window.showErrorMessage(message, 'Retry')).then(choice => {
                     if (choice === 'Retry') return vscode.commands.executeCommand('workbench.action.chat.retry');

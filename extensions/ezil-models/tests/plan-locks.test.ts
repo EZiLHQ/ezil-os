@@ -2,7 +2,7 @@
 // `x-ezil-os-included-models` on every /models answer (worker/src/ai-proxy.ts) and refuses any other model itself; this
 // client lists the other models locked, never sends them, and asks the OS window for billing only on an exact credit
 // refusal or a locked model chosen in the picker. Zero inference: every response is a fixture.
-import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test';
+import { afterAll, beforeEach, describe, expect, mock, setSystemTime, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { parseModelsConfig, type ResolvedConfig } from '../src/config';
 import { forgetGatewayModels, INCLUDED_MODELS_HEADER, parseIncludedModels } from '../src/gateway';
@@ -67,6 +67,7 @@ const defaults = (infos: Info[]) => infos.filter(info => info.isDefault).map(inf
 
 const warnings = mock(async (..._args: unknown[]): Promise<string | undefined> => undefined);
 const notices = mock(async (..._args: unknown[]): Promise<string | undefined> => undefined);
+const errors = mock(async (..._args: unknown[]): Promise<string | undefined> => undefined);
 const opened: string[] = [];
 (fakeVscode.window as Record<string, unknown>).showWarningMessage = warnings;
 (fakeVscode.window as Record<string, unknown>).showInformationMessage = notices;
@@ -74,8 +75,11 @@ const opened: string[] = [];
 
 // The OS links come from the computer's own EZIL_AI_BASE_URL (provider.ts osBillingLink), as in the image.
 const savedBase = process.env.EZIL_AI_BASE_URL;
-beforeEach(() => { forgetGatewayModels(); warnings.mockClear(); notices.mockClear(); opened.length = 0; process.env.EZIL_AI_BASE_URL = BASE; });
-afterAll(() => { if (savedBase === undefined) delete process.env.EZIL_AI_BASE_URL; else process.env.EZIL_AI_BASE_URL = savedBase; });
+beforeEach(() => {
+    forgetGatewayModels(); warnings.mockClear(); notices.mockClear(); errors.mockClear(); opened.length = 0; process.env.EZIL_AI_BASE_URL = BASE;
+    (fakeVscode.window as Record<string, unknown>).showErrorMessage = errors;
+});
+afterAll(() => { setSystemTime(); if (savedBase === undefined) delete process.env.EZIL_AI_BASE_URL; else process.env.EZIL_AI_BASE_URL = savedBase; });
 
 describe('the picker on Free: Flash selectable, every other model listed but locked', () => {
     test('other models are locked (not selectable, lock icon, marker text); Flash is the one default', async () => {
@@ -150,7 +154,7 @@ describe('a locked model is never sent', () => {
         const f = gateway(free());
         await list(f.provider);
         await send(f.provider, `ezil/${FLASH}`, { requestInitiator: 'title' });
-        // The Machine settings name Qwen as Copilot's utility model: on Free that title goes to Flash, never refused.
+        // A marked title naming Qwen (the extension's own utility default; the image pins Flash): on Free it goes to Flash.
         await send(f.provider, QWEN, { requestInitiator: 'title' });
         await send(f.provider, QWEN, { role: 'utilitySmall' });
         expect(f.posts.map(post => post.body.model)).toEqual([FLASH, FLASH, FLASH]);
@@ -217,6 +221,27 @@ describe('billing asks: exactly two credit codes, once a minute', () => {
         await list(g.provider);
         await expect(send(g.provider, `ezil/${FLASH}`)).rejects.toThrow();
         expect(g.intents).toEqual([]);
+    });
+
+    test('an unknown plan (503 os_plan_unavailable) offers Retry at most once a minute, and never billing', async () => {
+        const g = gateway(free(), refusal(503, 'os_plan_unavailable'));
+        await list(g.provider);
+        const start = Date.now();
+        try {
+            setSystemTime(new Date(start));
+            // A new chat's title, two progress messages and the turn are all refused alike: one notice.
+            for (let i = 0; i < 4; i++) await expect(send(g.provider, `ezil/${FLASH}`)).rejects.toThrow();
+            await Bun.sleep(0);
+            expect(errors).toHaveBeenCalledTimes(1);
+            expect(errors.mock.calls[0]?.slice(1)).toEqual(['Retry']);
+            setSystemTime(new Date(start + 61_000));
+            await expect(send(g.provider, `ezil/${FLASH}`)).rejects.toThrow();
+            await Bun.sleep(0);
+            expect(errors).toHaveBeenCalledTimes(2);
+        } finally { setSystemTime(); }
+        expect(g.posts).toHaveLength(5);
+        expect(g.intents).toEqual([]);
+        expect(warnings).not.toHaveBeenCalled();
     });
 });
 
