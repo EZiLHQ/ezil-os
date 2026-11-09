@@ -57,6 +57,21 @@ same(parseAppLink(`/app/code?project={${P}}&repo=${R}`, apps), { id: 'code', pro
 for (const dup of [`/app/code?${pr}&project=${P}`, `/app/code?${pr}&repo=${R}`, `/app/code?${pr}&path=a&path=b`, `/os?app=code&${pr}&path=a&path=a`]) {
     same(parseAppLink(dup, apps), null, `duplicate key rejects the whole link: ${dup}`);
 }
+// Founder 547ed35a: a repository by its address, `/app/code?repo=<URL-encoded https URL>` (navigation intent only).
+{
+    const GH = 'https://github.com/EZiLHQ/ezil-os.git';
+    same(parseAppLink(`/app/code?repo=${encodeURIComponent(GH)}`, apps), { id: 'code', project: { repoUrl: GH } }, 'the founder\'s acceptance link');
+    same(parseAppLink(`/os?app=code&repo=${encodeURIComponent(GH)}`, apps), { id: 'code', project: { repoUrl: GH } }, 'the alias too');
+    same(parseAppLink(`/app/code?repo=${GH}`, apps), { id: 'code', project: { repoUrl: GH } }, 'unencoded slashes read the same');
+    same(parseAppLink(`/app/code?repo=${encodeURIComponent(GH)}&path=src`, apps), { id: 'code', project: { repoUrl: GH } }, 'path is not read with an address');
+    same(parseAppLink(`/app/code?project=${P}&repo=${encodeURIComponent(GH)}`, apps), { id: 'code', projectRejected: 'repo_invalid' }, 'an address beside a project is ambiguous');
+    for (const bad of ['http://github.com/a/b.git', 'https://u:p@github.com/a/b.git', 'https://github.com/a/b.git?x=1', 'https://github.com/a/b.git#x',
+        'https://github.com/a/b c.git', 'https://github.com/a%2Fb.git', 'https://github.com\\a\\b.git', 'javascript:alert(1)', 'file:///etc/passwd',
+        'ssh://git@github.com/a/b.git', `https://${'a'.repeat(510)}`]) {
+        same(parseAppLink(`/app/code?repo=${encodeURIComponent(bad)}`, apps), { id: 'code', projectRejected: 'repo_url_invalid' }, `refused: ${bad}`);
+    }
+    same(parseAppLink(`/app/code?repo=${encodeURIComponent(GH)}&repo=${encodeURIComponent(GH)}`, apps), null, 'a repeated repo rejects the whole link');
+}
 // An invalid path is dropped (the project is not) and the reason is kept.
 for (const [raw, reason] of [['', 'empty'], ['a%2Fb', 'encoded_separator'], ['a%2fb', 'encoded_separator'], ['a%5Cb', 'encoded_separator'],
     ['%2Fabs', 'encoded_separator'], ['/abs', 'absolute'], ['a\\b', 'backslash'], ['a/../b', 'dot_segment'], ['./a', 'dot_segment'],
@@ -86,6 +101,8 @@ same(pathProblem('src/x.ts'), null);
     ]) same(folder(raw), { id: 'code', folderRejected: reason }, `folder=${raw} refused`);
     same(parseAppLink('/os?app=code&folder=/workspace/a', apps), { id: 'code', folder: '/workspace/a' }, 'the alias reads folder too');
     same(parseAppLink('/app/code?folder=/workspace/a&folder=/workspace/b', apps), null, 'a repeated folder rejects the whole link');
+    same(parseAppLink(`/app/code?repo=${encodeURIComponent('https://github.com/a/b.git')}&folder=web`, apps),
+        { id: 'code', project: { repoUrl: 'https://github.com/a/b.git' }, folderRejected: 'with_repository' }, 'a folder beside a repository address is refused');
     same(parseAppLink('/app/settings?tab=billing&folder=/workspace/a', apps), { id: 'settings', initialTab: 'billing' }, 'only Code reads folder');
     same(parseAppLink('/app/code?folder=/workspace/a&ref=main&token=t', apps), { id: 'code', folder: '/workspace/a' }, 'a ref or token beside it is never read');
 }
@@ -129,7 +146,7 @@ for (const target of ['code', 'browser']) {
     const { w, ctx, url, win, opens } = await boot(`/os?app=${target}&project=demo&path=%2Fa%20b`);
     const id = target === 'browser' ? 'desktop' : target;
     same([...w.document.querySelectorAll('.window[data-app]')].map(el => el.dataset.app), [id], 'fresh target opens only requested app');
-    same(url(), `/app/${id}?project=demo&path=%2Fa%20b`, 'the alias is canonicalised in place, other keys byte for byte');
+    same(url(), `/app/${target}?project=demo&path=%2Fa%20b`, 'the alias is canonicalised in place, other keys byte for byte');
     same(w.history.length, 1, 'canonicalising adds no history entry');
     if (id === 'code') same(opens.map(c => c.view), ['full'], 'Code opened from its route is full (contract item 3)');
     const original = win(id);
@@ -158,7 +175,7 @@ for (const target of ['code', 'browser']) {
     same(w.document.querySelectorAll('.window').length, 2, 'history app request preserves other windows');
     ok(win(id) === original, 'same app focuses its original window');
     ok(original.classList.contains('window-active'), 'Back focused it');
-    same(url(), `/app/${id}?project=demo&path=%2Fa%20b`, 'the entry kept its own URL');
+    same(url(), `/app/${target}?project=demo&path=%2Fa%20b`, 'the entry kept its own URL');
     done(w);
 }
 {
@@ -190,7 +207,10 @@ for (const [entry, canonical] of [
     [`/app/settings?tab=billing&upgrade=pro&computer=${COMPUTER}`, `/app/settings?tab=billing&computer=${COMPUTER}`],
     [`/os?settings=billing&section=ai-credits`, '/app/settings?tab=billing'],
     [`/os?app=settings&settings=system&computer=${COMPUTER}`, `/app/settings?tab=system&computer=${COMPUTER}`],
-    [`/app/browser?computer=${COMPUTER}`, `/app/desktop?computer=${COMPUTER}`],
+    [`/app/browser?computer=${COMPUTER}`, `/app/browser?computer=${COMPUTER}`],
+    // Legacy Browser links: the registry id and the old alias form.
+    [`/app/desktop?computer=${COMPUTER}&x=%41`, `/app/browser?computer=${COMPUTER}&x=%41`],
+    [`/os?app=desktop&computer=${COMPUTER}`, `/app/browser?computer=${COMPUTER}`],
     [`/os?computer=${COMPUTER}&app=code&${pr}&path=a%2Fb`, `/app/code?computer=${COMPUTER}&${pr}&path=a%2Fb`],
 ]) {
     const { w, url } = await boot(entry);

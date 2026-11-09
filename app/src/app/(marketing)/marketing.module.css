@@ -45,6 +45,8 @@
 .hero .description { max-width: 590px; margin-inline: auto; color: var(--muted); }
 .heroActions { display: flex; justify-content: center; flex-wrap: wrap; gap: 12px; margin: 24px 0 12px; }
 .caption { color: var(--muted); font-size: 12px; line-height: 16px; }
+/* Standard trial line on the Standard card only (pricing-content.ts `trialNote`). */
+.trial { color: var(--text); font-size: 14px; line-height: 20px; font-weight: 600; }
 /* Keep the five Horizon layers identical to the shell's desktop wallpaper. */
 .desktop {
     position: relative;

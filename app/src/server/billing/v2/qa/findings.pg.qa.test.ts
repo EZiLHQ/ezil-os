@@ -106,7 +106,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('qa FINDINGS (Postgres)'
         // Oct 3: the customer, unaware, raises the cap; the router allows it (no issue recorded yet).
         await caller(a, new Date('2026-10-03T00:00:00Z')).setOverage({ enabled: true, capCents: 10_000, termsVersion: OVERAGE_TERMS_VERSION });
         stripe.invoices.set('in_prev_overage', { id: 'in_prev_overage', customer: a.customerId, status: 'open', subscriptionId: null,
-            billingReason: 'manual', metadataKind: 'overage', hostedInvoiceUrl: null, lines: [], periodStart: null, periodEnd: null });
+            billingReason: 'manual', metadataKind: 'overage', hostedInvoiceUrl: null, total: 0, amountPaid: 0, lines: [], periodStart: null, periodEnd: null });
         await processStripeEvent(invoicePaidEvent(stripe.invoices.get('in_prev_overage')!, failedAt, 'invoice.payment_failed'),
             { store, stripe: stripe.api, now: () => new Date('2026-10-04T00:00:00Z') });
         // Summary now says overage is off / paused for payment.

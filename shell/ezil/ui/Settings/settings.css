@@ -649,6 +649,7 @@
 .ezil-settings-billing [data-role="plan-status"][data-status="free"] { background: var(--surface-2); color: var(--muted); }
 .ezil-settings-billing [data-role="plan-status"][data-status="cancels"],
 .ezil-settings-billing [data-role="plan-status"][data-status="incomplete"],
+.ezil-settings-billing [data-role="plan-status"][data-status="payment_pending"],
 .ezil-settings-billing [data-role="plan-status"][data-status="upgrade_pending"] { background: color-mix(in srgb, var(--warn) 12%, var(--surface)); color: var(--warn); }
 .ezil-settings-billing [data-role="plan-status"][data-status="past_due"] { background: color-mix(in srgb, var(--danger) 12%, var(--surface)); color: var(--danger); }
 

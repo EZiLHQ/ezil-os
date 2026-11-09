@@ -6,7 +6,10 @@ import trpc from '../trpc.js';
 import { openUpgradeSheet } from '../upgrade-sheet.js';
 import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOverageSheet, openPlanPickerSheet } from '../billing-sheets.js';
 import { openConfirmSheet } from '../sheet-frame.js';
-import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines, heldClosedSize, heldClosedText } from '../billing-format.js';
+import { openTopupSheet, topupOffer } from '../topup-sheet.js';
+import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines, heldClosedSize, heldClosedText,
+    accountCredits, accountDetailsHtml, staleCreditsCopy, paidComputeUnmetered, TRIAL_SKU, trialOfferOf, trialIneligibleCopy, planTrialOf, trialAmount,
+    trialDayLabel, trialMomentLabel } from '../billing-format.js';
 import { settingsAliasSearch } from '../../../app-link.js';
 
 const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
@@ -15,8 +18,10 @@ const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
 const STATES = new Set(['ok', 'low', 'exhausted', 'over_cap', 'unavailable']);
 const ATTENTION = new Set(['low', 'exhausted', 'over_cap']);
 const windows = new WeakMap();
+const FOCUS_RELOAD_MS = 5 * 60 * 1000;
 let upgradeSheetOpener = openUpgradeSheet;
-let sheetOpeners = { upgrade: openComputeUpgradeSheet, downgrade: openDowngradeSheet, cancel: openCancelSheet, overage: openOverageSheet, choose: openPlanPickerSheet };
+let sheetOpeners = { upgrade: openComputeUpgradeSheet, downgrade: openDowngradeSheet, cancel: openCancelSheet, overage: openOverageSheet, choose: openPlanPickerSheet,
+    topup: openTopupSheet };
 
 export function setUpgradeSheetOpener (fn) { upgradeSheetOpener = fn; }
 export function setBillingSheetOpeners (openers) { sheetOpeners = { ...sheetOpeners, ...openers }; }
@@ -31,10 +36,15 @@ function actionHtml (action, label, primary = false, sku) {
     return `<button type="button" class="ezil-settings-btn${primary ? ' ezil-settings-btn-primary' : ''}" data-action="${action}"${sku ? ` data-sku="${encode(sku)}"` : ''}>${encode(label)}</button>`;
 }
 
+/** Storage in GiB (1024³), labelled "GB" like every disk size in Billing, to one decimal. */
 function gigabytes (bytes) {
-    const tenths = (BigInt(bytes) + 50_000_000n) / 100_000_000n;
+    const tenths = (BigInt(bytes) * 20n + 1_073_741_824n) / 2_147_483_648n;
     return `${tenths / 10n}.${tenths % 10n} GB`;
 }
+
+/** A v2 storage meter that was measured: digit strings AND a measurement time (an older server sent "0" with none). */
+const measuredStorage = storage => typeof storage?.usedBytes === 'string' && /^\d+$/.test(storage.usedBytes)
+    && typeof storage.capBytes === 'string' && /^\d+$/.test(storage.capBytes) && typeof storage.measuredAt === 'string';
 
 function percent (used, cap) {
     if ( cap <= 0n ) return 0;
@@ -80,7 +90,7 @@ export function standingCopy (standing, data) {
         // Round 6 (R4-02): a held 4 or 8 vCPU computer does not open on Free (the hold never resizes).
         const closed = heldClosedSize(data?.computer);
         return closed ? heldClosedText(closed.vcpu)
-            : 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.';
+            : 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours.';
     }
     return '';
 }
@@ -254,11 +264,13 @@ function ezilIdHref (value) {
 }
 
 /** One meter row. `percent` is the share LEFT (null: no bar); tone comes from the server state. */
-function meterRowV3 ({ role, id, label, value, percent = null, tone = 'ok', notes = [], extra = '' }) {
+function meterRowV3 ({ role, id, label, value, percent = null, tone = 'ok', notes = [], extra = '', action = '' }) {
     const bar = percent === null ? '' : `<div class="ezil-billing-gauge" role="meter" aria-label="${encode(`${label}: ${value}`)}"
             aria-valuemin="0" aria-valuemax="100" aria-valuenow="${percent}" aria-valuetext="${encode(value)}"><span style="width: ${percent}%"></span></div>`;
     return `<div class="ezil-billing-meter-row is-${tone}" data-role="${role}"${id ? ` id="${id}"` : ''}>
-        <div class="ezil-billing-meter-head"><h4${id ? ' tabindex="-1"' : ''}>${encode(label)}</h4><span class="ezil-billing-meter-value">${encode(value)}</span></div>
+        <div class="ezil-billing-meter-head"><h4${id ? ' tabindex="-1"' : ''}>${encode(label)}</h4>${action
+            ? `<span class="ezil-billing-meter-trail"><span class="ezil-billing-meter-value">${encode(value)}</span>${action}</span>`
+            : `<span class="ezil-billing-meter-value">${encode(value)}</span>`}</div>
         ${bar}${notes.filter(Boolean).map(note => typeof note === 'string' ? paragraph(note, 'ezil-billing-note') : note.html).join('')}${extra}</div>`;
 }
 
@@ -268,6 +280,8 @@ function meterRowV3 ({ role, id, label, value, percent = null, tone = 'ok', note
  * Never "standard-hour" or "compute hours" (scanCopy).
  */
 export function timeV3Html ({ computer, fairUse, plan }, usage = null) {
+    // Paid compute policy v1: no hours meter for a paid plan (a hidden placeholder keeps the refresh target).
+    if ( paidComputeUnmetered({ plan, fairUse }) ) return '<div data-role="meter-time" hidden></div>';
     // `usage` null: billing.usage has not answered yet; false: it answered without a reading.
     const period = usage?.period ?? null;
     // Round 6 (R1-06): Free (also held on AWS) says the month's allowance, "About 5 of 8 hours left this month";
@@ -294,8 +308,39 @@ export function timeV3Html ({ computer, fairUse, plan }, usage = null) {
     ] });
 }
 
-/** AI credits (D1 + founder 2026-10-29): whole numbers, denominator = the plan's grant for the period. */
-function aiMeterV3 (summary) {
+/**
+ * Identity credits (`ai.account`): every live grant in the total, from exact microcredit strings. The headline is
+ * whole credits (floor); the details are exact to 2 decimals with every microcredit in their titles. Neither number
+ * ever comes from the catalog: unreadable shows the last balance read for this user, as of its time, or "—".
+ */
+function aiAccountMeterV3 (summary, { lastAccount = null, userId = null } = {}) {
+    const { ai, plan } = summary;
+    const view = accountCredits(ai.account, { previous: lastAccount, userId, planSku: plan?.sku });
+    if ( ! view ) return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value: '—',
+        notes: ["We couldn't read your credits. Try again later.", 'Used by EZiL AI in Code and Chat.'] });
+    const tone = view.empty ? 'danger' : ! view.stale && view.low ? 'warn' : 'ok';
+    const pending = ai.pendingFromRenewal && safeCount(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? ai.pendingFromRenewal : null;
+    // Round 4 D17: in the payment grace this period's plan credits arrive with the payment, never "more from <renewal>".
+    const awaitingPayment = pending !== null && plan?.paymentIssue != null && ai.included?.granted === 0;
+    const expiry = { previous: `from ${plan?.sku === 'free_v3' ? 'your previous plan' : 'an earlier billing period'}`, purchased: 'purchased', added: 'added' };
+    const periodEnd = ai.included && Number.isFinite(Date.parse(ai.included.periodEnd ?? '')) ? ai.included.periodEnd : null;
+    return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', action: topupMeterAction(summary), value: `${view.left} credits left${view.total !== null ? ` of ${view.total}` : ''}`,
+        percent: view.percent, tone, notes: [
+            view.stale ? staleCreditsCopy(view.asOf) : view.empty ? '■ No credits left' : tone === 'warn' ? '! Running low' : '',
+            { html: `<p class="ezil-billing-note" data-role="ai-details">${accountDetailsHtml(view.details, encode)}</p>` },
+            ...view.expiring.map(item => `${item.remaining} ${expiry[item.kind]} · expire ${dateLabel(item.expiresAt, true)}`),
+            awaitingPayment ? `${whole(pending.credits)} credits for this period. Added once your payment goes through.`
+                : pending ? `${whole(pending.credits)} more from ${dateLabel(pending.at)}` : '',
+            // The usage card's header already names the period's reset date; repeat it only when credits reset on another day.
+            // Paid compute policy v1: an unmetered usage card names no reset date, so the credits always say theirs.
+            view.stale ? '' : periodEnd ? paidComputeUnmetered(summary) || dateLabel(periodEnd, true) !== dateLabel(summary.fairUse?.resetsAt, true) ? `Resets ${dateLabel(periodEnd)}.` : ''
+                : ai.grant?.per === 'period' && safeCount(ai.grant.amount) && ai.grant.amount > 0 ? `Your plan adds ${whole(ai.grant.amount)} credits each month.` : '',
+            'Used by EZiL AI in Code and Chat.',
+        ] });
+}
+
+/** AI credits (D1 + founder 2026-10-29): whole numbers, denominator = the plan's grant for the period (an older server). */
+function aiMeterV3 (summary, options = {}) {
     const { ai, actions, plan } = summary;
     const enrollment = ai.enrollment ?? 'enrolled';
     const waiting = ai.waiting && safeCount(ai.waiting.credits) && ai.waiting.credits > 0 ? ai.waiting.credits : null;
@@ -309,6 +354,7 @@ function aiMeterV3 (summary) {
         return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value: 'Setting up your AI credits…',
             notes: [waiting ? `${whole(waiting)} credits are added when this finishes.` : ''] });
     }
+    if ( 'account' in ai ) return aiAccountMeterV3(summary, options);
     const grant = ai.grant && safeCount(ai.grant.amount) && ai.grant.amount > 0 ? ai.grant : null;
     const included = ai.included && safeCount(ai.included.remaining) && safeCount(ai.included.granted) ? ai.included : null;
     const pending = ai.pendingFromRenewal && safeCount(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? ai.pendingFromRenewal : null;
@@ -348,10 +394,10 @@ function aiMeterV3 (summary) {
     const grantNote = grant ? grant.per === 'period' ? `Your plan adds ${whole(grant.amount)} credits each month.`
         : (starter && starter.remaining > 0) || beyondStarter ? '' : `${whole(grant.amount)} credits to start.` : '';
     split = split ? `${whole(split.plan)} from your plan + ${whole(split.extra)} extra` : '';
-    return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value, percent, tone, notes: [
+    return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value, percent, tone, action: topupMeterAction(summary), notes: [
         state, awaitingPayment ? 'Added once your payment goes through.' : '', split, value === '—' ? "We couldn't read your credits. Try again later." : '',
         // The usage card's header already names the period's reset date; repeat it only when credits reset on another day.
-        ...extras, included && dateLabel(included.periodEnd, true) !== dateLabel(summary.fairUse?.resetsAt, true) ? `Resets ${dateLabel(included.periodEnd)}.` : grantNote,
+        ...extras, included && (paidComputeUnmetered(summary) || dateLabel(included.periodEnd, true) !== dateLabel(summary.fairUse?.resetsAt, true)) ? `Resets ${dateLabel(included.periodEnd)}.` : grantNote,
         'Used by EZiL AI in Code and Chat.',
     ] });
 }
@@ -360,13 +406,21 @@ const GIB = 2 ** 30;
 /** Disk bytes in the disk's own unit (GiB, shown as "GB" like the disk size itself). */
 const diskText = bytes => bytes >= GIB ? `${(bytes / GIB).toLocaleString('en-US', { maximumFractionDigits: 1 })} GB`
     : `${Math.floor(bytes / 2 ** 20).toLocaleString('en-US')} MB`;
-/** Storage (D3): the computer's REAL disk; a used figure and a bar only once something measures it. */
+/**
+ * Storage (D3): the computer's REAL disk; a used figure and a bar only once something measures it.
+ * An AWS disk is measured by its host (every 15 min, once its image carries the sampler): until the
+ * first sample it shows the disk's size and says space used isn't measured yet, never "0 used" and
+ * never a "Measuring…" that may wait for an image rollout; a computer with no disk figure
+ * (Cloudflare) has no measurement at all and says so.
+ */
 function storageMeterV3 ({ computer }) {
     const disk = computer.disk;
     const gb = Number.isFinite(disk?.provisionedGiB) && disk.provisionedGiB > 0 ? disk.provisionedGiB : null;
     const usedBytes = typeof disk?.usedBytes === 'string' && /^\d+$/.test(disk.usedBytes) ? Number(disk.usedBytes) : null;
-    if ( gb === null ) return meterRowV3({ role: 'meter-storage', label: 'Storage', value: 'Files saved', notes: ['Your files are saved between sessions.'] });
-    if ( usedBytes === null ) return meterRowV3({ role: 'meter-storage', label: 'Storage', value: `${gb} GB`, notes: [`${gb} GB disk for your projects`] });
+    if ( gb === null ) return meterRowV3({ role: 'meter-storage', label: 'Storage', value: 'Files saved',
+        notes: ['Your files are saved between sessions.', usedBytes === null ? "Space used isn't measured on this computer." : `${diskText(usedBytes)} used`] });
+    if ( usedBytes === null ) return meterRowV3({ role: 'meter-storage', label: 'Storage', value: `${gb} GB`,
+        notes: [`${gb} GB disk for your projects`, "Space used isn't measured yet."] });
     // ADV-2: the disk is provisionedGiB × 2^30 bytes (the server's cap), so used and left use the same unit.
     const capBytes = gb * GIB;
     const leftBytes = Math.max(0, capBytes - usedBytes);
@@ -384,6 +438,34 @@ function bannerV3 (summary) {
     if ( plan.paymentIssue === 'requires_action' ) {
         return banner('payment-banner', 'warn', 'Your bank needs you to confirm a payment.', '',
             '<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open-invoice" data-kind="subscription">Confirm payment</button>');
+    }
+    // Standard trial: these states ride on past_due / cancels, so they come before the paid-plan copy. A trial that
+    // never paid has no grace (graceEndsAt is null): never "keep your plan" or a grace date here.
+    const trial = planTrialOf(summary);
+    if ( trial?.state === 'payment_failed' ) {
+        const amount = trialAmount(summary, trial);
+        return banner('payment-banner', 'danger', `Your free month ended and the ${amount ? `${amount} ` : ''}payment didn't go through.`,
+            'Standard is paused until a payment succeeds; your files are kept.',
+            actions.portal ? actionHtml('portal', 'Update payment method', true) : '', true);
+    }
+    if ( trial?.state === 'payment_pending' ) {
+        // Stripe collects the first charge about an hour after the end. Nothing has failed: no alarm, no primary.
+        // A cancel here (cancelAtPeriodEnd) stops later renewals only; that first payment is still collected.
+        const amount = trialAmount(summary, trial);
+        const cancelled = plan.status === 'cancels';
+        const until = cancelled && Number.isFinite(Date.parse(plan.cancelsAt ?? '')) ? trialDayLabel(plan.cancelsAt) : null;
+        return { primary: false, html: `<aside class="ezil-billing-banner is-warn" data-role="trial-payment-pending" role="status">
+        <div><p class="ezil-billing-banner-title">Your free month has ended.</p>${paragraph(`We're collecting your first ${amount ? `${amount} ` : ''}payment; Standard resumes as soon as it goes through. Your files are kept.`)}${cancelled
+            ? paragraph(`You cancelled later renewals. If that payment goes through, Standard runs ${until ? `until ${until}` : 'to the end of that month'} and then ends.`, 'ezil-billing-note') : ''}</div>${actions.portal
+            ? actionHtml('portal', 'Update payment method') : ''}${cancelled && actions.cancel ? actionHtml('resume', 'Resume plan') : ''}</aside>` };
+    }
+    if ( trial?.state === 'ending' ) {
+        const amount = trialAmount(summary, trial);
+        const day = trialDayLabel(trial.endsAt);
+        const resume = actions.cancel === true;
+        return { primary: resume, html: `<aside class="ezil-billing-banner is-warn" data-role="trial-ending" role="status">
+        <div><p class="ezil-billing-banner-title">${encode(`Your free month ends on ${day}.`)}</p>${paragraph("You won't be charged. Standard stays available until then.")}${resume && amount
+            ? paragraph(`If you resume, ${amount} is charged from ${day}, then every month until you cancel.`, 'ezil-billing-note') : ''}</div>${resume ? actionHtml('resume', 'Resume plan', true) : ''}</aside>` };
     }
     // ADV-3: the server reports every incomplete subscription as payment_failed (summary.ts); the plan
     // never started, so the ask is to finish that payment, not to keep a plan.
@@ -416,10 +498,12 @@ function bannerV3 (summary) {
     return null;
 }
 
-/** The plan's upgrade CTA: Free → Standard (checkout), Standard → Premium (upgrade). */
+/** The plan's upgrade CTA: Free → Standard (the free month when the server offers it, else checkout), Standard → Premium (upgrade). */
 function upgradeCta (summary, primary) {
     const { plan, actions } = summary;
-    if ( (plan.sku === 'free_v3' || standingOf(summary) === 'files_on_aws') && actions.checkout && offerFor(summary, 'standard_monthly_v3') ) return actionHtml('checkout', 'Upgrade to Standard', primary, 'standard_monthly_v3');
+    if ( (plan.sku === 'free_v3' || standingOf(summary) === 'files_on_aws') && actions.checkout && offerFor(summary, 'standard_monthly_v3') ) {
+        return trialOfferOf(summary) ? actionHtml('trial', 'Start your free month', primary, TRIAL_SKU) : actionHtml('checkout', 'Upgrade to Standard', primary, 'standard_monthly_v3');
+    }
     if ( plan.sku === 'standard_monthly_v3' && actions.upgrade ) return actionHtml('upgrade', 'Upgrade to Premium', primary);
     return '';
 }
@@ -429,13 +513,19 @@ function planPrimaryV3 (summary) {
     const upgrade = upgradeCta(summary, true);
     if ( upgrade ) return upgrade;
     const { plan, ai } = summary;
-    if ( plan.sku === 'premium_monthly_v3' && ['low', 'exhausted'].includes(ai.state) && topupPacks(summary).length ) {
+    // Identity credits: the AI meter's own warning (a large added grant beside a spent plan bucket is not low).
+    const view = 'account' in ai ? accountCredits(ai.account) : undefined;
+    const low = view === undefined ? ['low', 'exhausted'].includes(ai.state) : view !== null && (view.empty || view.low);
+    if ( plan.sku === 'premium_monthly_v3' && low && topupOffer(summary) ) {
         return '<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open-topup">Add AI credits</button>';
     }
     return '';
 }
 
-const topupPacks = ({ ai, actions, catalog }) => (ai.enrollment ?? 'enrolled') === 'enrolled' && actions.topup === true ? catalog.packs ?? [] : [];
+/** Beside the balance: the same top-up dialog every entry opens (secondary; the page keeps one primary). */
+function topupMeterAction (summary) {
+    return topupOffer(summary) ? '<button type="button" class="ezil-settings-btn ezil-billing-meter-action" data-action="topup">Add credits</button>' : '';
+}
 
 function yourComputerV3 (summary) {
     const { computer, plan } = summary;
@@ -462,25 +552,46 @@ function currentPlanV3 (summary, banner) {
     const standing = standingOf(summary);
     const status = { free: 'Free', active: 'Active', cancels: 'Ends soon', past_due: 'Past due', incomplete: 'Payment incomplete', upgrade_pending: 'Upgrade pending' }[plan.status] ?? 'Active';
     const offer = offerFor(summary, plan.sku);
-    const price = plan.sku === 'free_v3' ? '$0' : offer ? `${dollars(offer.priceCents, { compact: true })} / month`
+    // Product entitlements v1: a plan an EZiL operator assigned is not a payment: no price, renewal or Stripe action.
+    const assigned = plan.access?.source === 'operator' ? plan.access : null;
+    const price = assigned ? 'Assigned by EZiL · no payment' : plan.sku === 'free_v3' ? '$0' : offer ? `${dollars(offer.priceCents, { compact: true })} / month`
         : plan.renewal ? `${dollars(plan.renewal.amountCents, { compact: true })} / month` : '';
-    const renewal = plan.sku === 'free_v3' ? 'Free · no card on file'
+    const renewal = assigned ? assigned.untilRevoked || !assigned.endsAt ? 'Your access continues until EZiL ends it.' : `Your access ends on ${dateLabel(assigned.endsAt, true)}.`
+        : plan.sku === 'free_v3' ? 'Free · no card on file'
         : plan.renewal && ['active', 'upgrade_pending'].includes(plan.status) ? `Renews on ${dateLabel(plan.renewal.at, true)} for ${dollars(plan.renewal.amountCents, { compact: true })}.` : '';
     const primary = banner?.primary ? '' : planPrimaryV3(summary);
-    return `<section class="ezil-billing-card ezil-billing-plan" data-role="plan-card" data-version="3" aria-label="Current plan">
+    // Standard trial: the free month replaces the price and renewal lines, in the viewer's zone. The first charge is a
+    // DATE ("from <date>"): Stripe collects it about an hour after the end, and `plan.renewal.at` (that collection) is
+    // never shown as a second charge. After the end the trial is waiting for (or missed) its first payment: never active.
+    const trial = planTrialOf(summary);
+    const after = trial?.state === 'payment_failed' || trial?.state === 'payment_pending';
+    const live = trial && ! after;
+    const amount = trial ? trialAmount(summary, trial) : null;
+    const trialLines = ! trial ? '' : after ? price ? paragraph(price, 'ezil-billing-plan-price') : ''
+        : `<p class="ezil-billing-plan-price" data-role="trial-until">Free until <time datetime="${encode(trial.endsAt)}">${encode(trialMomentLabel(trial.endsAt))}</time></p>${trial.state === 'trialing'
+            ? `${amount ? paragraph(`First charge ${amount} from ${trialDayLabel(trial.firstChargeAt ?? trial.endsAt)}.`, 'ezil-billing-status') : ''}${paragraph('Cancel before then and you pay nothing.', 'ezil-billing-status')}`
+            : paragraph("Cancelled · you won't be charged.", 'ezil-billing-status')}`;
+    const pill = trial?.state === 'payment_failed' ? 'Paused' : trial?.state === 'payment_pending' ? 'Payment pending' : live && trial.state === 'trialing' ? 'Free trial' : status;
+    // `payment_pending` rides on status active: its chip carries its own state so it is never painted as Active.
+    const chip = trial?.state === 'payment_pending' ? 'payment_pending' : plan.status;
+    return `<section class="ezil-billing-card ezil-billing-plan" data-role="plan-card" data-version="3"${trial ? ` data-trial="${encode(trial.state)}"` : ''} aria-label="Current plan">
         <div class="ezil-billing-plan-grid"><div>
-            <div class="ezil-billing-plan-heading"><h4>${encode(plan.name)}</h4><span class="ezil-settings-pill" data-role="plan-status" data-status="${encode(plan.status)}">${encode(status)}</span></div>
-            ${price ? paragraph(price, 'ezil-billing-plan-price') : ''}${renewal ? paragraph(renewal, 'ezil-billing-status') : ''}
+            <div class="ezil-billing-plan-heading"><h4>${encode(live ? `Free trial · ${plan.name}` : plan.name)}</h4><span class="ezil-settings-pill" data-role="plan-status" data-status="${encode(chip)}">${encode(pill)}</span></div>
+            ${trial ? trialLines : `${price ? paragraph(price, 'ezil-billing-plan-price') : ''}${renewal ? paragraph(renewal, 'ezil-billing-status') : ''}`}
             ${plan.scheduledChange ? paragraph(`Changes to ${offerFor(summary, plan.scheduledChange.toSku)?.name ?? 'Standard'} on ${dateLabel(plan.scheduledChange.effectiveAt)}.`, 'ezil-billing-status') : ''}
-            ${standing === 'files_on_aws' ? `<p role="status" data-role="files-held">${encode(standingCopy('files_on_aws', summary))}</p>` : ''}
+            ${standing === 'files_on_aws' && ! after ? `<p role="status" data-role="files-held">${encode(standingCopy('files_on_aws', summary))}</p>` : ''}
         </div><div class="ezil-billing-actions" data-role="plan-actions">${primary}</div></div>
         ${yourComputerV3(summary)}</section>`;
 }
 
-function usageCardV3 (summary, usage) {
+function usageCardV3 (summary, usage, options) {
+    const unmetered = paidComputeUnmetered(summary);
     return `<section class="ezil-billing-section" data-role="billing-usage" aria-labelledby="billing-usage-heading">
-        <div class="ezil-billing-section-head"><h3 id="billing-usage-heading">This period</h3><span class="ezil-billing-note">Resets ${encode(dateLabel(summary.fairUse.resetsAt, true))}</span></div>
-        <div class="ezil-billing-card ezil-billing-usage-card" data-role="billing-meters">${timeV3Html(summary, usage)}${aiMeterV3(summary)}${storageMeterV3(summary)}</div></section>`;
+        <div class="ezil-billing-section-head"><h3 id="billing-usage-heading">${unmetered ? 'Usage' : 'This period'}</h3>${unmetered ? '' : `<span class="ezil-billing-note">Resets ${encode(dateLabel(summary.fairUse.resetsAt, true))}</span>`}</div>
+        <div class="ezil-billing-card ezil-billing-usage-card" data-role="billing-meters">${unmetered
+            // Paid compute policy v1: storage first, then AI credits; computer time is recorded but not metered here.
+            ? `${storageMeterV3(summary)}${aiMeterV3(summary, options)}${timeV3Html(summary, usage)}`
+            : `${timeV3Html(summary, usage)}${aiMeterV3(summary, options)}${storageMeterV3(summary)}`}</div></section>`;
 }
 
 function offerCardV3 (summary, offer) {
@@ -491,10 +602,11 @@ function offerCardV3 (summary, offer) {
     const configs = (offer.machineChoice ?? []).map(code => {
         const size = sizeInfoV3(summary, code);
         if ( ! size ) return '';
-        const time = code === 'free-cf' ? `sessions up to ${offer.sessionMaxSeconds / 3600} hour${offer.sessionMaxSeconds === 3600 ? '' : 's'}`
-            : `about ${whole(offer.fairUseHours / size.weight)} hours a month`;
+        // Paid compute policy v1: no plan card sells monthly computer hours; each configuration shows its session length.
+        const time = Number.isFinite(offer.sessionMaxSeconds) && offer.sessionMaxSeconds >= 3600
+            ? `sessions up to ${offer.sessionMaxSeconds / 3600} hour${offer.sessionMaxSeconds === 3600 ? '' : 's'}` : '';
         const now = current && code === computer.size ? ' <span class="ezil-billing-now">Now</span>' : '';
-        return `<li data-size="${encode(code)}"><strong>${encode(`${size.vcpu} vCPU · ${size.memoryGiB} GB`)}</strong>${now} <span>${encode(time.charAt(0).toUpperCase() + time.slice(1))}</span></li>`;
+        return `<li data-size="${encode(code)}"><strong>${encode(`${size.vcpu} vCPU · ${size.memoryGiB} GB`)}</strong>${now}${time ? ` <span>${encode(time.charAt(0).toUpperCase() + time.slice(1))}</span>` : ''}</li>`;
     }).join('');
     // The current card never contradicts "Your computer": a disk made smaller than today's plan disk says so.
     const realDisk = Number.isFinite(computer.disk?.provisionedGiB) && computer.disk.provisionedGiB > 0 ? computer.disk.provisionedGiB : null;
@@ -503,17 +615,28 @@ function offerCardV3 (summary, offer) {
     const storage = Number.isSafeInteger(offer.storageGiB) && offer.storageGiB > 0
         ? `${offer.storageGiB} GB disk${current && realDisk !== null && realDisk !== offer.storageGiB ? ` · yours has ${realDisk} GB` : keepsOwn ? ' for new computers' : ''}` : 'Files saved between sessions';
     const credits = offer.aiCredits?.amount ? `${whole(offer.aiCredits.amount)} AI credits ${offer.aiCredits.per === 'once' ? 'to start' : 'every month'}` : '';
+    // Standard trial (Standard only, never Premium): offered from Free when the server says this viewer is eligible.
+    // The date is the server's preview of the end if a trial started now; the confirmation shows the exact quote.
+    const fromFree = currentRank === 0 && ! current && actions.checkout;
+    const trial = fromFree && offer.sku === TRIAL_SKU ? trialOfferOf(summary) : null;
+    const trialDay = trial ? trialDayLabel(trial.endsAt) : '';
+    const trialHtml = trial ? `<div class="ezil-billing-offer-trial" data-role="trial-offer"><p><strong>$0 today</strong></p>
+        ${paragraph(`${dollars(trial.amountCents, { compact: true })}/month from ${trialDay}`, 'ezil-billing-note')}
+        ${paragraph(`Cancel any time before ${trialDay} and you pay nothing.`, 'ezil-billing-note')}</div>` : '';
+    const ineligible = fromFree && offer.sku === TRIAL_SKU ? trialIneligibleCopy(summary) : '';
     let cta = '';
     if ( current ) cta = '<span class="ezil-billing-current" data-role="current-plan">Current plan</span>';
     else if ( plan.scheduledChange?.toSku === offer.sku ) cta = paragraph(`Starts ${dateLabel(plan.scheduledChange.effectiveAt, true)}`, 'ezil-billing-note');
     else if ( currentRank !== undefined && rank > currentRank ) {
-        if ( actions.checkout && currentRank === 0 ) cta = actionHtml('checkout', `Choose ${offer.name}`, false, offer.sku);
+        if ( trial ) cta = actionHtml('trial', 'Start your free month', false, offer.sku);
+        else if ( actions.checkout && currentRank === 0 ) cta = actionHtml('checkout', `Choose ${offer.name}`, false, offer.sku)
+            + (ineligible ? `<p class="ezil-billing-note" data-role="trial-ineligible">${encode(ineligible)}</p>` : '');
         else if ( actions.upgrade && ! plan.pendingUpgrade && offer.sku === 'premium_monthly_v3' ) cta = actionHtml('upgrade', 'Upgrade');
     } else if ( currentRank !== undefined && rank < currentRank && rank > 0 && actions.downgrade ) cta = linkAction('downgrade', `Switch to ${offer.name}`);
     return `<article class="ezil-billing-card ezil-billing-offer${current ? ' is-current' : ''}" data-role="plan-offer" data-sku="${encode(offer.sku)}"${current ? ' data-current' : ''}>
         <h4>${encode(offer.name)}</h4>
         <p class="ezil-billing-offer-price"><strong>${encode(dollars(offer.priceCents, { compact: true }))}</strong><span>${offer.priceCents ? ' / month' : ''}</span></p>
-        ${paragraph(offer.tagline, 'ezil-billing-note')}
+        ${trialHtml}${paragraph(offer.tagline, 'ezil-billing-note')}
         <ul class="ezil-billing-offer-configs">${configs}</ul>
         <ul class="ezil-billing-offer-facts"><li>${encode(storage)}</li>${credits ? `<li>${encode(credits)}</li>` : ''}</ul>
         <div class="ezil-billing-offer-cta">${cta}</div></article>`;
@@ -531,28 +654,35 @@ function plansV3 (summary) {
         ${paragraph(`Storage is the disk on your computer; some space is used by the system.${keeps}`, 'ezil-billing-note')}</section>`;
 }
 
+/** The top-up entry below the plans: one button into the same dialog (presets and a custom amount), never a second purchase surface. */
 function topupV3 (summary) {
-    const packs = topupPacks(summary);
-    if ( ! packs.length ) return '';
-    return `<details class="ezil-billing-card ezil-billing-topup" data-role="ai-topup"><summary>Add AI credits</summary>
-        <div class="ezil-billing-actions">${packs.map(pack => actionHtml('topup', `Add ${whole(pack.aiCredits)} credits — ${dollars(pack.totalCents, { compact: true })}${pack.discountPercent ? ` (save ${pack.discountPercent}%)` : ''}`, false, pack.sku)).join('')}</div></details>`;
+    const offer = topupOffer(summary);
+    if ( ! offer ) return '';
+    const presets = offer.packs.map(pack => `${whole(pack.aiCredits)}`);
+    const choices = presets.length ? `${presets.length > 1 ? `${presets.slice(0, -1).join(', ')} or ${presets.at(-1)}` : presets[0]} credits${offer.custom ? ', or a custom amount' : ''}` : 'Choose any whole-dollar amount';
+    return `<section class="ezil-billing-card ezil-billing-topup" data-role="ai-topup" aria-labelledby="billing-topup-heading">
+        <div><h4 id="billing-topup-heading">Add AI credits</h4>${paragraph(`One-time purchase in USD. ${choices}.`, 'ezil-billing-note')}</div>
+        <div class="ezil-billing-actions">${actionHtml('topup', 'Add credits')}</div></section>`;
 }
 
-export function summaryV3Html (summary, usage = null) {
+/** `options`: `userId` (the signed-in user) and `lastAccount`, that user's last readable `ai.account` (kept across reloads of this pane). */
+export function summaryV3Html (summary, usage = null, options = {}) {
     const { plan, actions } = summary;
     const banner = bannerV3(summary);
     return `<header class="ezil-billing-header"><div><h3>Billing</h3><p class="ezil-settings-lead">Your plan, usage and payments.</p></div>
         ${actions.portal ? `<div class="ezil-billing-actions">${linkAction('portal', 'Manage payment')}</div>` : ''}</header>
         ${banner?.html ?? ''}
         ${currentPlanV3(summary, banner)}
-        ${usageCardV3(summary, usage)}
+        ${usageCardV3(summary, usage, options)}
         ${plansV3(summary)}
         ${topupV3(summary)}
         <p class="ezil-billing-action-error" data-role="billing-action-error" role="alert"></p>
+        <p class="ezil-billing-note" data-role="billing-action-status" role="status"></p>
         <section class="ezil-billing-invoices" data-role="invoices" aria-label="Invoices"><h3 tabindex="-1">Invoices</h3>
             <div data-role="invoice-rows" aria-busy="true"><p class="ezil-billing-note">Loading invoices…</p></div></section>
         <div class="ezil-billing-v3-footer"><p class="ezil-billing-note">Prices before tax.</p>
-            ${actions.cancel && plan.status !== 'cancels' && standingOf(summary) !== 'plan_ending' ? linkAction('cancel', 'Cancel plan') : ''}</div>`;
+            ${actions.cancel && plan.status !== 'cancels' && standingOf(summary) !== 'plan_ending'
+                ? linkAction('cancel', planTrialOf(summary)?.state === 'trialing' ? 'Cancel free month' : 'Cancel plan') : ''}</div>`;
 }
 
 function summaryHtml (summary) {
@@ -566,8 +696,11 @@ function summaryHtml (summary) {
             ${compute.session.activeDeadline ? '<p data-role="session-countdown" aria-live="polite"></p>' : ''}</section>
         ${overageHtml(summary)}${estimateHtml(summary)}
         <div class="ezil-billing-meters">
-            ${meterHtml('storage', 'Saved storage', storage.state, gigabytes(storage.usedBytes), `of ${gigabytes(storage.capBytes)}`,
-                percent(BigInt(storage.usedBytes), BigInt(storage.capBytes)), updated(storage.measuredAt), "Saved project files across your computers — not the computer's working disk.")}
+            ${measuredStorage(storage) ? meterHtml('storage', 'Saved storage', storage.state, gigabytes(storage.usedBytes), `of ${gigabytes(storage.capBytes)}`,
+                percent(BigInt(storage.usedBytes), BigInt(storage.capBytes)), updated(storage.measuredAt), "Saved project files across your computers — not the computer's working disk.")
+                // Unmeasured: no number, no bar and no Full/Almost full state, never "0.0 GB of 2.0 GB".
+                : meterHtml('storage', 'Saved storage', 'unavailable', 'Not measured yet', /^\d+$/.test(storage?.capBytes ?? '') ? `${gigabytes(storage.capBytes)} allowance` : '',
+                    0, 'Space used appears once a computer is measured.', "Saved project files across your computers — not the computer's working disk.")}
             ${meterHtml('ai', 'AI credits', ai.state, unavailable ? 'Coming soon' : `${dollars(balance / 10_000n)} left`, unavailable ? '' : 'Available balance',
                 balance > 0n ? 100 : 0, unavailable ? 'AI assistant coming soon' : ai.includedExpiresAt ? `Included credit expires ${dateLabel(ai.includedExpiresAt)}` : 'No included credit expiry.', '')}
         </div>${nudgeHtml(summary)}
@@ -634,8 +767,16 @@ async function load ($win, state) {
         if ( result.data?.enabled === false || ! [2, 3].includes(result.data?.version) ) {
             $body.html('<p>Billing isn\'t available yet.</p>');
         } else {
-            $body.html(result.data.version === 3 ? summaryV3Html(result.data) : summaryHtml(result.data));
+            // The server names the user it read: another user's billing (a session changed elsewhere) is never shown.
+            const account = result.data.version === 3 ? result.data.ai?.account : undefined, userId = state.userId;
+            if ( typeof account?.userId === 'string' && typeof userId === 'string' && account.userId !== userId ) {
+                state.lastAccount = null;
+                throw new Error('summary for another user');
+            }
+            if ( accountCredits(account, { userId }) !== null ) state.lastAccount = account;
+            $body.html(result.data.version === 3 ? summaryV3Html(result.data, null, { lastAccount: state.lastAccount, userId }) : summaryHtml(result.data));
             state.summary = result.data;
+            state.loadedAt = Date.now();
             startCountdown($win, state);
             if ( result.data.version === 3 ) void loadUsage($win, state, request);
         }
@@ -648,14 +789,22 @@ async function load ($win, state) {
             $body.attr('aria-busy', 'false');
         }
     }
+    // An Add credits request (the Usage tab's link, the Code recovery link) is consumed once, on whichever
+    // load first has a summary: the top-up dialog when this account can buy, else the AI credits row.
+    const topup = state.summary ? state.openTopup : null;
+    if ( topup ) state.openTopup = null;
+    if ( topup && ! openSheet($win, state, 'topup', undefined, topup) ) {
+        const card = $body.find('#ai-credits').get(0);
+        card?.scrollIntoView?.({ block: 'nearest' });
+        card?.querySelector('h4')?.focus({ preventScroll: true });
+    }
     if ( state.summary && ! state.autoOpened ) {
         state.autoOpened = true;
         const sku = state.openUpgrade;
-        if ( state.openSection === 'ai-credits' ) {
-            const card = $body.find('#ai-credits').get(0);
-            card?.scrollIntoView?.({ block: 'nearest' });
-            card?.querySelector('h4')?.focus({ preventScroll: true });
-        } else if ( typeof sku === 'string' && offerFor(state.summary, sku) && state.summary.actions.checkout ) openSheet($win, state, 'checkout', sku);
+        // `upgrade=standard` (the pricing page's Standard card, which advertises the free month) opens the free month
+        // when the server offers it to this viewer, and the ordinary Standard checkout otherwise.
+        if ( topup ) { /* The deep link's section was the top-up request above. */ } else if ( sku === TRIAL_SKU && trialOfferOf(state.summary) ) openSheet($win, state, 'trial');
+        else if ( typeof sku === 'string' && offerFor(state.summary, sku) && state.summary.actions.checkout ) openSheet($win, state, 'checkout', sku);
         else if ( ['compute_monthly_v2', 'premium_monthly_v3'].includes(sku) && state.summary.actions.upgrade ) openSheet($win, state, 'upgrade');
         else if ( sku === true && state.summary.actions.checkout ) {
             if ( state.summary.version === 3 ) openSheet($win, state, 'choose');
@@ -689,14 +838,26 @@ async function loadUsage ($win, state, request) {
 }
 
 function actionError ($win, copy) { $win.find('[data-role="billing-action-error"]').text(copy); }
+/** A neutral outcome (not an error) beside the actions, e.g. a checkout closed before payment finished. */
+function actionStatus ($win, copy) { $win.find('[data-role="billing-action-status"]').text(copy); }
 
-function openSheet ($win, state, action, sku) {
-    if ( state.pending || state.sheet || state.closed || state.summary?.actions[action === 'choose' ? 'checkout' : action] !== true ) return;
+/**
+ * `topup` opens the Add AI credits dialog (`sku` preselects a preset; `intent.reason` frames exhaustion);
+ * `topup-checkout` is that dialog's hand-off: the payment sheet for the server's quote (`intent.pack`).
+ */
+function openSheet ($win, state, action, sku, intent = null) {
+    // The Standard trial is the Standard checkout sheet in its trial mode: it quotes, confirms the exact end, then pays $0.
+    if ( action === 'trial' ) return trialOfferOf(state.summary) ? openSheet($win, state, 'checkout', TRIAL_SKU, { trial: true }) : false;
+    const flag = action === 'choose' ? 'checkout' : action === 'topup-checkout' ? 'topup' : action;
+    if ( state.pending || state.sheet || state.closed || state.summary?.actions[flag] !== true ) return false;
     const summary = state.summary;
     const offer = action === 'checkout' ? offerFor(summary, sku) : null;
-    const pack = action === 'topup' ? summary.catalog.packs?.find(pack => pack.sku === sku) : null;
-    if ( action === 'checkout' && (! offer || offer.sku === 'free_v3') ) return;
-    if ( action === 'topup' && (summary.version !== 3 || ! pack) ) return;
+    const pack = action === 'topup-checkout' ? intent?.pack : null;
+    const trial = action === 'checkout' && intent?.trial === true;
+    if ( action === 'checkout' && (! offer || offer.sku === 'free_v3') ) return false;
+    if ( trial && (sku !== TRIAL_SKU || ! trialOfferOf(summary)) ) return false;
+    if ( action === 'topup' && ! topupOffer(summary) ) return false;
+    if ( action === 'topup-checkout' && (summary.version !== 3 || ! pack) ) return false;
     const container = $win.find('.window-body').get(0);
     const token = {};
     state.sheet = token;
@@ -707,15 +868,23 @@ function openSheet ($win, state, action, sku) {
     };
     const onDone = () => { onClose(); void load($win, state); };
     actionError($win, '');
+    actionStatus($win, '');
     try {
         // After an upgrade, "Switch to 4 vCPU · 16 GB" hands over to the Computer tab, which owns the switch.
         const onSwitch = size => {
             window.dispatchEvent(new CustomEvent('ezil:computer-switch-request', { detail: { size } }));
             $win.find('.ezil-settings-tab[data-tab="computers"]').trigger('click');
         };
-        const options = { container, trpc, onDone, onClose, onSwitch, checkout: params => openSheet($win, state, 'checkout', params.sku) };
-        token.handle = action === 'topup' ? upgradeSheetOpener({ ...options, sku, pack })
-            : action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes, summary })
+        // The plan picker and the session-end sheet hand back `{ sku, trial }`; a trial request opens the trial mode.
+        const options = { container, trpc, onDone, onClose, onSwitch, checkout: params => params?.trial === true ? openSheet($win, state, 'trial')
+            : openSheet($win, state, 'checkout', params.sku) };
+        token.handle = action === 'topup' ? sheetOpeners.topup({ ...options, summary, userId: state.userId, lastAccount: state.lastAccount,
+            preselect: sku, reason: intent?.reason ?? null,
+            checkout: params => openSheet($win, state, 'topup-checkout', null, params),
+            upgrade: choice => openSheet($win, state, choice.action, choice.sku) })
+            : action === 'topup-checkout' ? upgradeSheetOpener({ ...options, sku: pack.sku, pack, summary, userId: state.userId,
+                onCancel: () => actionStatus($win, 'Checkout closed before payment finished. If you did pay, your credits appear here once the payment is confirmed.') })
+            : action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes, summary, ...(trial ? { trial: true } : {}) })
             : sheetOpeners[action]({ ...options, summary });
         // The v1 checkout sheet predates onClose. New billing sheets use the callback.
         const checkoutRoot = action === 'checkout' && container.ownerDocument.querySelector('[data-role="upgrade-sheet"]');
@@ -729,7 +898,9 @@ function openSheet ($win, state, action, sku) {
     } catch {
         onClose();
         actionError($win, 'Could not open billing. Try again.');
+        return false;
     }
+    return true;
 }
 
 function invoiceUrl (state, kind) {
@@ -823,8 +994,15 @@ export default {
                 <a href="/refunds" target="_blank" rel="noopener">Refund policy</a><a href="/pricing" target="_blank" rel="noopener">Plans</a></footer></div>`;
     },
     init ($win) {
-        const state = { loading: false, pending: false, summary: null, history: [], sheet: null, request: 0, autoOpened: false, openUpgrade: false, openSection: null, timer: null, active: false, closed: false };
+        const state = { loading: false, pending: false, summary: null, history: [], sheet: null, request: 0, autoOpened: false, openUpgrade: false, openTopup: null, timer: null, active: false, closed: false,
+            lastAccount: null, loadedAt: undefined, userId: null };
         windows.set($win.get(0), state);
+        // Back from another window or tab (a hosted checkout, a top-up) with a pane older than five minutes: read it again.
+        state.focus = () => {
+            if ( state.active && ! state.closed && ! state.loading && ! state.pending && ! state.sheet
+                && Date.now() - (state.loadedAt ?? 0) > FOCUS_RELOAD_MS ) void load($win, state);
+        };
+        window.addEventListener?.('focus', state.focus);
         const $pane = $win.find('[data-pane="billing"]');
         $pane.on('click', 'button[data-action]', function () {
             if ( this.disabled ) return;
@@ -835,22 +1013,30 @@ export default {
                 heading?.scrollIntoView?.({ block: 'start' });
                 heading?.focus({ preventScroll: true });
             } else if ( action === 'computer-tab' ) $win.find('.ezil-settings-tab[data-tab="computers"]').trigger('click');
-            else if ( action === 'open-topup' ) {
-                // Premium's "Add AI credits" opens the top-up disclosure; the pack rows stay secondary.
-                const details = $pane.find('[data-role="ai-topup"]').get(0);
-                if ( details ) {
-                    details.open = true;
-                    details.scrollIntoView?.({ block: 'nearest' });
-                    details.querySelector('summary')?.focus();
-                }
-            }
-            else if ( ['checkout', 'topup', 'choose', 'upgrade', 'downgrade', 'cancel', 'overage'].includes(action) ) openSheet($win, state, action, this.dataset.sku);
+            // Every Add credits control (Premium's primary, the balance, the card) opens the same dialog.
+            else if ( action === 'open-topup' || action === 'topup' ) openSheet($win, state, 'topup', this.dataset.sku);
+            else if ( ['checkout', 'trial', 'choose', 'upgrade', 'downgrade', 'cancel', 'overage'].includes(action) ) openSheet($win, state, action, this.dataset.sku);
             else void act($win, state, action, this.dataset.kind);
         });
         $pane.on('change', 'input[name="ezil-billing-size"]', function () {
             if ( ! this.disabled && this.checked ) void act($win, state, 'size', this.value);
         });
+        // In-window Add credits (the Usage tab): switch to Billing and open the dialog once it has a summary,
+        // with no page navigation (Code and its conversation keep running in their own window).
+        $win.on('ezil:billing-topup', (_event, detail) => {
+            if ( state.closed ) return;
+            const request = { reason: detail?.reason === 'insufficient_credits' ? 'insufficient_credits' : null };
+            const tab = $win.find('.ezil-settings-tab[data-tab="billing"]');
+            if ( tab.hasClass('active') && state.summary && ! state.loading ) {
+                if ( ! openSheet($win, state, 'topup', undefined, request) ) $pane.find('#ai-credits h4').get(0)?.focus();
+                return;
+            }
+            state.openTopup = request;
+            tab.trigger('click');
+        });
         $win.on('remove.billing', () => {
+            $win.off('ezil:billing-topup');
+            window.removeEventListener?.('focus', state.focus);
             state.closed = true;
             state.request++;
             stopCountdown(state);
@@ -863,10 +1049,17 @@ export default {
         if ( state ) {
             state.active = true;
             state.openUpgrade ||= ctx.openUpgrade;
+            // The signed-in user the kept AI balance belongs to; another user's is dropped, never shown.
+            const userId = ctx?.payload?.user?.id ?? bootPayload()?.user?.id ?? null;
+            if ( userId !== state.userId ) state.lastAccount = null;
+            state.userId = userId;
             // `/app/settings?tab=billing` is the same link as `/os?settings=billing`
             // (docs/APP-ROUTES.md); read both through the boot's own spelling.
             const params = new URLSearchParams(settingsAliasSearch(window.location));
-            if ( ! state.autoOpened && params.get('settings') === 'billing' && params.get('section') === 'ai-credits' ) state.openSection = 'ai-credits';
+            // `reason=insufficient_credits` (Code's recovery link) frames the same dialog as exhaustion recovery.
+            if ( ! state.autoOpened && params.get('settings') === 'billing' && params.get('section') === 'ai-credits' ) {
+                state.openTopup = { reason: params.get('reason') === 'insufficient_credits' ? 'insufficient_credits' : null };
+            }
             void load($win, state);
         }
     },

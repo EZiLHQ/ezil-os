@@ -58,7 +58,7 @@ export function baseLine(sub: StripeSubscription, lookupKey: string | null, over
 export function paidInvoice(sub: StripeSubscription, overrides: Partial<StripeInvoice> = {}): StripeInvoice {
     return {
         id: `in_${randomUUID()}`, customer: sub.customer, status: 'paid', subscriptionId: sub.id,
-        billingReason: 'subscription_cycle', metadataKind: null, hostedInvoiceUrl: null,
+        billingReason: 'subscription_cycle', metadataKind: null, hostedInvoiceUrl: null, total: 2_000, amountPaid: 2_000,
         periodStart: sub.currentPeriodStart, periodEnd: sub.currentPeriodEnd,
         lines: [
             // A decoy first line: only the lookup key may select the base line.

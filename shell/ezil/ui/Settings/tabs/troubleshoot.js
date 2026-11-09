@@ -117,8 +117,8 @@ let computerReason = '';
 let computerTransition = null;
 let computerTimer = null;
 const RESTART_KEY = 'ezil-os:restart.';
-/** D11: the AWS ledger cap, distinct from plan time ("Paused until <date>"). */
-const AWS_CAP_COPY = "You've used this month's AWS computer time. It resets on the 1st — or contact us.";
+/** D11: the AWS ledger cap, distinct from plan time ("Paused until <date>"); same sentence as computers.js AWS_CAP_COPY. */
+const AWS_CAP_COPY = "Your computer reached EZiL's monthly AWS limit, which is separate from your plan's time. It resets on the 1st (UTC) — or contact us.";
 // 'idle' | 'copied' | 'manual' — 'manual' means the clipboard was unavailable
 // (no `navigator.clipboard`, a denied permission, a non-secure origin) and the
 // report is shown in a textarea for the user to select and copy by hand.

@@ -1,17 +1,47 @@
 // The Bedrock Converse subset of Anthropic Messages. Construct envelopes from an allowlist;
 // never forward Copilot's provider-specific options, cache markers or previous reasoning.
-import type { ResolvedModel } from './config';
+import type { GatewayProtocol, ResolvedModel } from './config';
 import { isCacheMarker, isStatefulMarker, type ChatRequest, type Message, type Part, type Tool } from './types';
+
+export type LocalRequestCode = 'local_input_too_large' | 'local_too_many_messages' | 'local_too_many_blocks';
+/** Sizes only, never payload text. `bodyBytes` is the size checked against `limitBytes`. */
+export type LocalRequestCounts = {
+    bodyBytes: number; limitBytes: number; messages: number; maxBlocks: number; tools: number; toolBytes: number;
+};
+
+/**
+ * A request this computer refused before sending anything: nothing reached EZiL OS or EZiL AI. `afterCompaction`: the
+ * counts are those of the most compacted form, which still did not fit (compact.ts).
+ */
+export class LocalRequestError extends Error {
+    constructor(public readonly code: LocalRequestCode, public readonly counts: LocalRequestCounts, public readonly afterCompaction = false) {
+        super(`EZiL Models: request refused before sending (${code})`);
+        this.name = 'LocalRequestError';
+    }
+}
+
+/** JSON text with every non-ASCII UTF-16 unit written as `\uXXXX`, as the Gateway's Responses bound counts it. */
+export function escapeNonAscii(json: string): string {
+    return json.replace(/[\u0080-\uffff]/g, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
 
 export const QWEN = 'qwen.qwen3-coder-next';
 export const KIMI = 'us.moonshotai.kimi-k3';
+/**
+ * Gateway aliases that refuse `temperature`/`top_p` (EZiL AI Gateway src/providers/gemini-request.ts): Google ignores
+ * sampling on gemini-3.8-flash, and gemini-4-argon's handling is unverified, so the Gateway refuses the request rather
+ * than drop or forward them. They are never sent for these aliases, whatever Copilot or the config pass.
+ */
+export const SAMPLING_REFUSED: ReadonlySet<string> = new Set(['gemini-3.8-flash', 'gemini-4-argon']);
+export function samplingRefused(alias: string): boolean { return SAMPLING_REFUSED.has(alias.trim().toLowerCase()); }
 export const GATEWAY_INPUT_TOKENS = 131_072;
 export const INPUT_FRAMING = 1056;
 export const ENVELOPE_RESERVE = 1536;
 // Copilot 0.69 counts its tool definitions (38 tools, 54,221 bytes in Agent mode, image e2e
 // 2026-10-20) against maxInputTokens itself: a 60 KB reserve double-counted them and forced history
-// summarisation on a near-empty conversation. Keep only a margin for counting differences; the
-// byte bound in buildGatewayBody still refuses anything over the gateway limit before sending.
+// summarisation on a near-empty conversation. Keep only a margin for counting differences (Copilot
+// never counts schema numbers, booleans or punctuation); the byte bound in buildGatewayBody still
+// refuses anything over the gateway limit before sending (LocalRequestError, nothing sent).
 export const DEFAULT_TOOL_RESERVE = 8_000;
 const TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
 type ObjectValue = Record<string, unknown>;
@@ -155,19 +185,44 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
     if (conversation.system.length) body.system = conversation.system;
     if (tools.length) { body.tools = tools; body.tool_choice = { type: 'auto' }; }
     if (request.toolMode === 'required') log?.('[gateway] required tool choice mapped to auto');
-    for (const [key, configured] of [['temperature', model.temperature], ['top_p', model.topP]] as const) {
+    if (samplingRefused(model.model)) {
+        if (['temperature', 'top_p'].some(key => request.modelOptions[key] !== undefined) || model.temperature !== undefined || model.topP !== undefined) log?.(`[gateway] temperature/top_p not sent: ${model.model} refuses sampling options`);
+    } else for (const [key, configured] of [['temperature', model.temperature], ['top_p', model.topP]] as const) {
         const value = request.modelOptions[key] ?? configured;
         if (typeof value === 'number' && Number.isFinite(value)) body[key] = Math.max(0, Math.min(1, value));
     }
-    if (body.messages.length > 1024 || body.messages.some(message => message.content.length > 1024)) throw new Error('Conversation too large — start a new chat');
     const bytes = new TextEncoder().encode(JSON.stringify(body));
-    if (bytes.byteLength + INPUT_FRAMING > Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens)) throw new Error('Conversation too large — start a new chat');
+    // The Gateway's limits: 1024 messages, 1024 blocks in one message, body + framing within the input allowance.
+    const counts = (): LocalRequestCounts => ({
+        bodyBytes: bytes.byteLength, limitBytes: Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens) - INPUT_FRAMING,
+        messages: body.messages.length, maxBlocks: body.messages.reduce((most, message) => Math.max(most, message.content.length), 0),
+        tools: tools.length, toolBytes: tools.length ? Buffer.byteLength(JSON.stringify(tools), 'utf8') : 0,
+    });
+    if (body.messages.length > 1024) throw new LocalRequestError('local_too_many_messages', counts());
+    if (body.messages.some(message => message.content.length > 1024)) throw new LocalRequestError('local_too_many_blocks', counts());
+    if (bytes.byteLength + INPUT_FRAMING > Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens)) throw new LocalRequestError('local_input_too_large', counts());
     return { body, bytes };
 }
 
-/** Copilot does not count tool definitions. Their configurable reserve is subtracted from advertised input. */
-export function gatewayTokenCount(value: string | Message): number {
-    if (typeof value === 'string') return Buffer.byteLength(JSON.stringify(text(value)), 'utf8');
+/**
+ * Copilot 0.69 calls this for its own tool definitions against maxInputTokens (countToolTokens: one
+ * countTokens(string) per schema key and string value; numbers, booleans and falsy entries are not passed; plus 8
+ * per tool, 16, and 10%), for its tool budget arithmetic and for its text tool-result cap. Its prompt renderer
+ * counts message text with its own o200k_base tokenizer, not this call. A string counts as the text block it would be
+ * sent as, 23 bytes over its JSON literal for ASCII. Keep that: Copilot starts background compaction when message
+ * plus tool tokens reach 0.78-0.82 of the advertised input, and this heavier tool count starts it while its summary
+ * request still fits the byte bound. Measured with a mock on the image (38 agent tools, 53,066 wire bytes; Qwen, 10
+ * turns of about 8.5 KB; 3 Nov 2026): this count (about 87,400) compacted and completed all 10 turns; bare literals
+ * (about 57,100) delayed compaction until the summary itself was over the bound, and every chat was refused from its
+ * 7th turn. 64 tools count over the advertised input (unmeasured). The Responses bound also escapes non-ASCII tool
+ * text and adds 128 bytes per tool and 32 per item, so Responses strings count escaped. Messages count as their
+ * serialized wire message.
+ */
+export function gatewayTokenCount(value: string | Message, protocol: GatewayProtocol = 'anthropic-messages'): number {
+    if (typeof value === 'string') {
+        const block = JSON.stringify(text(value));
+        return protocol === 'openai-responses' ? escapeNonAscii(block).length : Buffer.byteLength(block, 'utf8');
+    }
     if (value.role === 'system') {
         const blocks = value.parts.map(partText).filter(Boolean).map(text);
         return blocks.length ? Buffer.byteLength(JSON.stringify(blocks), 'utf8') : 0;

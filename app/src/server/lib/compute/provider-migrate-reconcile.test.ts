@@ -70,10 +70,11 @@ describe('paid Cloudflare reconciliation', () => {
         });
     it.each([false, true])('production wiring respects admission %s and advances the existing runtime', async admit => {
         fake.execute.mockResolvedValue([{ user_id: 'u', computer_id: 'c', sku: 'premium_monthly_v3' }]);
-        fake.entitlement.mockResolvedValue({ status: 'active', provider: 'aws', planId: 'premium_monthly_v3', size: 'cmp-8' });
+        fake.entitlement.mockResolvedValue({ source: 'billing_v2', status: 'active', provider: 'aws', planId: 'premium_monthly_v3', size: 'cmp-8' });
         fake.admission.mockReturnValue({ admit }); fake.create.mockResolvedValue({ id: 'm' });
         await reconcilePaidCloudflareUsers(Date.now(), env);
-        expect(fake.admission).toHaveBeenCalledWith(expect.objectContaining({ instanceType: 'm6i.2xlarge' }));
+        // Paid compute policy v1 (a521 review): a paid move is not refused by the per-person hour cap.
+        expect(fake.admission).toHaveBeenCalledWith(expect.objectContaining({ instanceType: 'm6i.2xlarge', userHoursExempt: true }));
         expect(fake.create).toHaveBeenCalledTimes(Number(admit)); expect(fake.advance).toHaveBeenCalledTimes(Number(admit));
         if (admit) expect(fake.create).toHaveBeenCalledWith({ userId: 'u', computerId: 'c', toSize: 'premium' });
     });
@@ -88,7 +89,7 @@ describe('paid Cloudflare reconciliation', () => {
 describe('paid candidate SQL guards', () => {
     const dialect = new PgDialect();
     it.each([
-        "s.sku IN ('standard_monthly_v3', 'premium_monthly_v3')", "s.status = 'active'",
+        "s.sku IN ('standard_monthly_v3', 'premium_monthly_v3')", "s.status IN ('active', 'trialing')", 's.covers', 'funding.amount > 0', 's.source_priority',
         's.current_period_start <=', 's.current_period_end >', 'c.deleted_at IS NULL',
         'c.user_id = s.user_id', 'p.computer_id = c.id', "(p.computer_id IS NULL OR p.provider = 'cloudflare')",
         'SELECT DISTINCT ON (s.user_id)', 'm.user_id = s.user_id',
@@ -96,7 +97,7 @@ describe('paid candidate SQL guards', () => {
     ])('requires %s', async guard => {
         const execute = vi.fn(async (_query: SQL) => []);
         await paidCloudflareCandidates({ execute }, new Date('2026-10-20T12:00:00Z'));
-        const query = dialect.sqlToQuery(execute.mock.calls[0]![0]);
+        const query = execute.mock.calls.map(([q]) => dialect.sqlToQuery(q)).find(q => q.sql.includes('FROM eligible s'))!;
         expect(query.sql).toContain(guard);
         expect(query.params).toContain('2026-10-20T11:50:00.000Z');
         expect(query.params.at(-1)).toBe(10);
@@ -112,7 +113,7 @@ describe('paid candidate SQL guards', () => {
             const execute = vi.fn(async (_query: SQL) => wrap ? { rows } : rows);
             expect(await paidCloudflareCandidates({ execute }, new Date(), 20)).toEqual([
                 { userId: 's', computerId: 'c1', toSize: 'standard' }, { userId: 'p', computerId: 'c2', toSize: 'premium' }]);
-            expect(dialect.sqlToQuery(execute.mock.calls[0]![0]).params.at(-1)).toBe(10);
+            expect(execute.mock.calls.map(([q]) => dialect.sqlToQuery(q)).find(q => q.sql.includes('FROM eligible s'))!.params.at(-1)).toBe(10);
         }
     });
 });

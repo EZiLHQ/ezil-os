@@ -145,7 +145,14 @@ describe('Free, Standard and Premium billing disclosures', () => {
     it('explains file migration, excluded software and 14-day paid disk retention', () => {
         const files = section(renderToStaticMarkup(createElement(TermsPage)), 'plan-changes-files');
         expect(files).toContain('project files and HOME directory move to the new computer');
-        expect(files).toContain('dotfiles, SSH keys, git configuration, and AI chat history');
+        expect(files).toContain('dotfiles, SSH keys and git configuration');
+        // The Terms ship with the app; where EZiL Chat history lives ships with the desktop image and host AMI
+        // (editor-state.sh `ezil_editor_prepare_chat`, the copilot-chat `history-root` patch). Until those are
+        // released, running computers keep chat in the editor profile, so the Terms promise neither the old
+        // "AI chat history" move nor the `.ezil/chat` folder.
+        expect(files).not.toContain('AI chat history');
+        expect(files).not.toContain('.ezil/chat');
+        expect(files).not.toContain('EZiL Chat');
         expect(files).toContain('Software installed with apt or npm -g, or in /opt, does not move and must be reinstalled');
         expect(files).toContain('Running processes stop during the move');
         expect(files).toContain('your files move back to the Free computer');

@@ -51,23 +51,48 @@ if name == "aws":
             sys.exit(1)
         shutil.copyfile(source, args[6])
 elif name == "docker":
+    if args[:1] == ["build"]:
+        context = pathlib.Path(args[-1])
+        (state / 'built-dockerfile').write_bytes(pathlib.Path(after('--file')).read_bytes())
+        fixture = context / 'app/provenance-fixture.txt'
+        if fixture.exists():
+            (state / 'built-fixture').write_bytes(fixture.read_bytes())
+        (state / 'built-ignored').write_text(str((context / 'app/ignored.txt').exists()))
+        if os.environ.get('MUTATE_DURING_BUILD'):
+            pathlib.Path(os.environ['MUTATE_DURING_BUILD']).write_text('changed during build\n')
     if args[:1] == ["save"]:
         sys.stdout.write("image:" + args[1])
     elif args[:1] == ["load"]:
-        (state / "loaded").write_text(sys.stdin.read())
+        (state / "loaded").write_bytes(sys.stdin.buffer.read())
     elif args[:2] == ["image", "inspect"]:
+        if args[2] == 'sha256:' + '1' * 64:
+            print('2' * 40)
+            sys.exit(0)
         loaded = state / "loaded"
-        if not loaded.exists() or loaded.read_text() != "image:" + args[2]:
+        if os.environ.get('FAKE_INSPECT_JSON') and loaded.exists():
+            data = json.loads(os.environ['FAKE_INSPECT_JSON'])
+            print(json.dumps(data) if after('--format') == '{{json .}}' else data['Architecture'])
+            sys.exit(0)
+        if not loaded.exists() or loaded.read_bytes() != ("image:" + args[2]).encode():
             sys.exit(1)
         print("amd64")
     elif args[:3] == ["compose", "version", "--short"]:
         print("2.39.4")
+    elif args[:2] == ["container", "inspect"] and '--format' in args:
+        print('ezil-os-staging:previous sha256:' + '1' * 64)
     elif "up" in args:
         with open(state / "log", "a") as log:
             log.write(json.dumps(["compose.env", pathlib.Path("compose.env").read_text()]) + "\n")
     elif "exec" in args:
-        print("Deployed SHA: " + os.environ["FAKE_SHA"])
+        print(os.environ['FAKE_SHA'] if 'process.stdout.write' in args[-1] else "Deployed SHA: " + os.environ["FAKE_SHA"])
 elif name == "curl":
+    if args[-1] == 'http://169.254.169.254/latest/api/token':
+        print('fixture-imds-token')
+        sys.exit(0)
+    if args[-1] == 'http://169.254.169.254/latest/dynamic/instance-identity/document':
+        print(os.environ.get('FAKE_INSTANCE_IDENTITY', json.dumps({'instanceId': 'i-014810524754b9ed0',
+              'accountId': '452630323510', 'region': 'ap-south-1'})))
+        sys.exit(0)
     pathlib.Path(after("--output")).write_text(os.environ.get("FAKE_HEALTH", ""))
     sys.stdout.write(after("--write-out").replace("%{http_code}", os.environ.get("FAKE_STATUS", "200"))
                      .replace("%{remote_ip}", os.environ.get("FAKE_REMOTE_IP", "203.0.113.10")))
@@ -91,6 +116,12 @@ class Sandbox:
         (self.root / "repo/app").mkdir()
         (self.root / "repo/app/Dockerfile").write_text("FROM scratch\n")
         (self.root / "repo/app/.dockerignore").write_text("*\n")
+        (self.root / "repo/.gitignore").write_text("app/ignored.txt\n")
+        subprocess.run(['git', 'init', '-q', str(self.root / 'repo')], check=True)
+        subprocess.run(['git', '-C', str(self.root / 'repo'), 'add', '.'], check=True)
+        subprocess.run(['git', '-C', str(self.root / 'repo'), '-c', 'user.name=Offline Fixture',
+                        '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'fixture'], check=True)
+        self.sha = subprocess.check_output(['git', '-C', str(self.root / 'repo'), 'rev-parse', 'HEAD'], text=True).strip()
         self.state = self.root / "state"
         self.bin = self.root / "bin"
         self.s3 = self.root / "s3"
@@ -107,7 +138,8 @@ class Sandbox:
         base = {key: value for key, value in os.environ.items()
                 if not key.startswith(("OS_ENV", "OS_STAGING_", "OS_PRODUCTION_", "NEXT_PUBLIC_", "AWS_"))}
         base.update(PATH=f"{self.bin}:{os.environ['PATH']}", TMPDIR=str(self.root / "tmp"),
-                    SHIM_STATE=str(self.state), FAKE_S3=str(self.s3), FAKE_SHA=SHA, GIT_SHA=SHA)
+                    SHIM_STATE=str(self.state), FAKE_S3=str(self.s3), FAKE_SHA=SHA, GIT_SHA=self.sha,
+                    OS_STAGING_PROMOTION_LEDGER=str(self.root / "absent-ledger.json"))
         base.update(extra)
         return base
 
@@ -127,6 +159,13 @@ class Sandbox:
         directory.mkdir(parents=True, exist_ok=True)
         for suffix in ("tar.gz", "runtime.tar.gz"):
             (directory / f"{tag}.{suffix}").write_bytes(suffix.encode())
+        environment = 'production' if directory.name == 'production' else 'staging'
+        (directory / f'{tag}.source.json').write_text(json.dumps({
+            'schema': 1, 'environment': environment, 'component': 'aws-app',
+            'source': self.sha, 'tree': self.sha, 'source_archive_sha256': '0' * 64,
+            'image': f'ezil-os-{environment}:{tag}',
+            'artifacts': {f'{tag}.{s}': hashlib.sha256((directory / f'{tag}.{s}').read_bytes()).hexdigest()
+                          for s in ('tar.gz', 'runtime.tar.gz')}}))
         with (directory / f"{tag}.sha256").open("w") as manifest:
             subprocess.run(["sha256sum", f"{tag}.tar.gz", f"{tag}.runtime.tar.gz"], cwd=directory, check=True,
                            stdout=manifest)
@@ -303,7 +342,7 @@ class DeployScriptTests(SandboxTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         puts = [(c[c.index("--bucket") + 1], c[c.index("--key") + 1]) for c in self.box.calls() if "put-object" in c]
         self.assertEqual(puts, [("ezil-preview-artifacts-example", f"os-staging/images/v1.{s}")
-                                for s in ("tar.gz", "runtime.tar.gz", "sha256")])
+                                for s in ("tar.gz", "runtime.tar.gz", "source.json", "sha256")])
 
     def test_production_upload_uses_its_bucket_prefix_and_artifacts(self):
         self.box.fake_artifacts(self.box.deploy / "artifacts", "v1")  # A staging build of the same tag.
@@ -440,5 +479,60 @@ class InstallHostTests(SandboxTestCase):
         self.assertIn("this host carries", result.stderr)
 
 
-if __name__ == "__main__":
+class LegacyStagingTests(SandboxTestCase):
+    def test_generated_legacy_install_keeps_two_arguments_and_no_receipt(self):
+        self.box.publish('fixture-staging', 'os-staging/images', 'old', 'ezil-os-staging', self.box.deploy)
+        result = self.box.deploy_sh('install', 'old', OS_STAGING_INSTANCE_ID='i-0123456789abcdef0',
+                                   OS_STAGING_ARTIFACT_BUCKET='fixture-staging', FAKE_DESCRIBE='staging')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = '\n'.join(self.box.payloads()[-1].splitlines()[1:-1]) + '\n'
+        self.assertTrue(body.startswith('set -- old fixture-staging staging\n'))
+        self.assertNotIn('verify_install_source() {', body)
+        path = self.box.root / 'legacy.sh'
+        path.write_text(body)
+        _, result = self.box.install([], script=path)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Installed TAG: old', result.stdout)
+        self.assertIn(['render-env.py', 'staging'], self.box.calls())
+        enabled = [c[3] for c in self.box.calls() if c[:3] == ['systemctl', 'enable', '--now']]
+        self.assertEqual(enabled, [f'ezil-os-staging-{j}.timer' for j in JOBS])
+        self.assertFalse(any('.source.json' in ' '.join(c) for c in self.box.calls()))
+
+    def test_legacy_checksum_failure_stops_before_load_or_timer_changes(self):
+        self.box.publish('fixture-staging', 'os-staging/images', 'old', 'ezil-os-staging', self.box.deploy)
+        (self.box.s3 / 'fixture-staging/os-staging/images/old.tar.gz').write_bytes(b'changed')
+        _, result = self.box.install(['old', 'fixture-staging'])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Checksum mismatch', result.stderr)
+        self.assertFalse(any(c[:2] == ['docker', 'load'] or c[0] == 'systemctl' for c in self.box.calls()))
+
+    def test_legacy_staging_refuses_production_or_missing_host_name(self):
+        for name in ('prod-host', 'None', ''):
+            result = self.box.deploy_sh('install', 'old', OS_STAGING_INSTANCE_ID='i-0123456789abcdef0',
+                                       OS_STAGING_ARTIFACT_BUCKET='fixture-staging', FAKE_DESCRIBE=name)
+            self.assertNotEqual(result.returncode, 0)
+        self.assertFalse(any('send-command' in c for c in self.box.calls()))
+
+    def test_install_refuses_pending_or_unreadable_ledger_before_any_aws_call(self):
+        # Cooperative fence only: it guards this checkout's deploy.sh, not raw SSM or older checkouts.
+        ledger = self.box.root / 'ledger.json'
+        environment = dict(OS_STAGING_INSTANCE_ID='i-0123456789abcdef0', OS_STAGING_ARTIFACT_BUCKET='fixture-staging',
+                           FAKE_DESCRIBE='staging', OS_STAGING_PROMOTION_LEDGER=str(ledger))
+        for content in (json.dumps({'entries': [{'state': 'completed'}, {'state': 'pending'}]}), '{not json'):
+            ledger.write_text(content)
+            for command in (('install', 'old'), ('install-verified', 'old', SHA, '0' * 64)):
+                result = self.box.deploy_sh(*command, **environment)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('pending operation', result.stderr)
+        self.assertEqual(self.box.calls(), [])
+        self.box.publish('fixture-staging', 'os-staging/images', 'old', 'ezil-os-staging', self.box.deploy)
+        ledger.write_text(json.dumps({'entries': [{'state': 'pending'}, {'state': 'completed'}]}))
+        self.assertEqual(self.box.deploy_sh('install', 'old', **environment).returncode, 0)
+
+    # os-union merge: staging's `test_staging_tooling_refuses_production_selection` was DROPPED — it asserted
+    # OS_ENV=production is refused ("targets staging only"), which directly contradicts main's retained
+    # OS_ENV=production profile (covered by DeployScriptTests/InstallHostTests). See the promotion report.
+
+
+if __name__ == '__main__':
     unittest.main()

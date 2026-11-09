@@ -173,6 +173,24 @@ describe('ConfigStore', () => {
         expect(loaded).not.toContain('sk-abc-12345');
         store.dispose();
     });
+
+    test('an ignored setting of a served model is reported as ignored, not as an entry that is not served', () => {
+        const file = path.join(root, 'kimi', 'models.json');
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, JSON.stringify({
+            providers: { ezil: { type: 'ezil-gateway', baseUrl: 'https://proxy.invalid/ai/v1', apiKey: 'synthetic-proxy-token' }, q: { type: 'anthropic', apiKey: '{env:EZIL_TEST_UNSET_KEY}' } },
+            models: [{ id: 'kimi', provider: 'ezil', model: 'us.moonshotai.kimi-k3', stream: true }, { id: 'c', provider: 'q', model: 'claude-sonnet-5' }],
+        }));
+        const logs: string[] = [];
+        const store = new ConfigStore(file, line => logs.push(line));
+        expect(store.load()).toBe(true);
+        expect(store.models().map(model => [model.id, model.stream])).toEqual([['kimi', false]]);
+        expect(store.notices()).toEqual(['models[0].stream is ignored for us.moonshotai.kimi-k3: EZiL AI cannot settle its streams exactly, so its replies arrive complete (stream: false)']);
+        expect(store.problems()).toHaveLength(2);
+        const loaded = logs.find(line => line.startsWith('[config] loaded'))!;
+        expect(loaded).toContain('1 model(s), 1 entry not served, 1 setting ignored (see below)');
+        store.dispose();
+    });
 });
 
 test('resolveConfigPath: env wins over the setting, the setting over the default', () => {
@@ -181,7 +199,7 @@ test('resolveConfigPath: env wins over the setting, the setting over the default
     expect(resolveConfigPath('/x/models.json', { EZIL_MODELS_CONFIG: '/env/models.json' })).toBe('/env/models.json');
 });
 
-test('settingsSnippet maps roles to the Copilot Chat settings', () => {
+test('settingsSnippet maps roles to the Copilot Chat settings, never chat.defaultModel (it would override a picked model)', () => {
     const config = parseModelsConfig(VALID);
-    expect(settingsSnippet(config.models)).toEqual({ 'chat.allowAnonymousAccess': true, 'chat.byokUtilityModelDefault': 'mainAgent', 'chat.defaultModel': 'm', 'chat.utilityModel': 'ezil/m' });
+    expect(settingsSnippet(config.models)).toEqual({ 'chat.allowAnonymousAccess': true, 'chat.byokUtilityModelDefault': 'mainAgent', 'chat.utilityModel': 'ezil/m' });
 });

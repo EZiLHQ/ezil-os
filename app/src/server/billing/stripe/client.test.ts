@@ -115,11 +115,12 @@ const expectedSubscription = {
     id: 'sub_fixture', customer: 'cus_fixture', status: 'active', cancelAtPeriodEnd: true,
     currentPeriodStart: new Date(start * 1000), currentPeriodEnd: new Date(end * 1000), sku: 'pro_monthly_v1',
     pendingUpdateExpiresAt: null, defaultPaymentMethod: null, scheduleId: null, latestInvoiceId: null,
+    trialStart: null, trialEnd: null, trialId: null, endedAt: null,
 };
-const invoice = { id: 'in_fixture', customer: 'cus_fixture', status: 'paid', period_start: 10, period_end: 20 };
+const invoice = { id: 'in_fixture', customer: 'cus_fixture', status: 'paid', period_start: 10, period_end: 20, total: 2000, amount_paid: 2000 };
 const expectedInvoice = {
     id: 'in_fixture', customer: 'cus_fixture', status: 'paid', subscriptionId: 'sub_fixture',
-    billingReason: null, metadataKind: null, hostedInvoiceUrl: null,
+    billingReason: null, metadataKind: null, hostedInvoiceUrl: null, total: 2000, amountPaid: 2000,
     periodStart: new Date(start * 1000), periodEnd: new Date(end * 1000),
 };
 const session = {
@@ -130,7 +131,7 @@ const session = {
 const expectedSession = {
     id: 'cs_fixture', customer: 'cus_fixture', clientReferenceId: 'user_fixture',
     mode: 'payment', status: 'complete', paymentStatus: 'paid', paymentIntentId: 'pi_fixture', sku: 'ai_pack_10_v1',
-    amountTotal: null, currency: null, metadataCredits: null,
+    amountTotal: null, currency: null, metadataCredits: null, trialId: null,
 };
 const charge = {
     id: 'ch_fixture', customer: 'cus_fixture', invoice: 'in_fixture', payment_intent: 'pi_fixture',
@@ -729,6 +730,21 @@ describe('v2 Stripe response mapping and checkout', () => {
         expect(fetcher.mock.calls.filter(([url]) => String(url).endsWith('/prices/price_standard'))).toHaveLength(1);
         await client.retrieveInvoice('in_fixture');
         expect(fetcher).toHaveBeenCalledTimes(4); // Price ids persist across retrievals.
+    });
+
+    it.each([
+        ['missing', {}],
+        ['strings', { total: '2000', amount_paid: '2000' }],
+        ['fractions', { total: 19.5, amount_paid: 19.5 }],
+        ['null', { total: null, amount_paid: null }],
+    ])('reads %s invoice amounts as NaN, which no positive-amount rule accepts', async (_name, amounts) => {
+        const { client } = fixture({ ...invoice, total: undefined, amount_paid: undefined, ...amounts });
+        const mapped = await client.retrieveInvoice('in_fixture');
+        expect(Number.isNaN(mapped.total) && Number.isNaN(mapped.amountPaid)).toBe(true);
+    });
+    it('reads an explicit $0 trial invoice as 0 total and 0 paid', async () => {
+        const { client } = fixture({ ...invoice, total: 0, amount_paid: 0, billing_reason: 'subscription_create' });
+        expect(await client.retrieveInvoice('in_fixture')).toMatchObject({ total: 0, amountPaid: 0, billingReason: 'subscription_create' });
     });
 
     it('uses expanded modern and legacy Price lookup keys without extra fetches', async () => {

@@ -1173,7 +1173,7 @@ describe('handlePreview response carries ready-to-embed bridge URLs', () => {
       + '      cloudflareCodeFolderResolver((command, options) => sandbox.exec(command, options), codeFolderRoot));',
     );
     expect(src).toContain(
-      'const codeFolderRoot = workspace.mounted && workspace.mountPath ? workspace.mountPath : CODE_FOLDER_UNMOUNTED_ROOT;',
+      'const codeFolderRoot = workspace.mounted && workspace.mountPath ? workspace.mountPath : REPO_OPEN_UNMOUNTED_ROOT;',
     );
     expect(src).toContain("codeFolder.outcome = 'too_long';");
     expect(src).toContain('codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace));');

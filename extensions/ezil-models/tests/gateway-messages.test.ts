@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { buildGatewayBody, gatewayInputTokens, gatewayMessage, gatewayOutputTokens, gatewayTokenCount, gatewayTools, KIMI } from '../src/gateway-messages';
+import { buildGatewayBody, gatewayInputTokens, gatewayMessage, gatewayOutputTokens, gatewayTokenCount, gatewayTools, KIMI, LocalRequestError } from '../src/gateway-messages';
 import { ask, call, fixtureRequests, gw, image, marker, msg, result, thinking, tool, txt } from './fixtures/gateway';
 
 const build = (request = ask()) => buildGatewayBody(gw(), request).body;
@@ -17,6 +17,21 @@ describe('gateway sanitizer', () => {
         const model = { ...gw(), temperature: -1, topP: 3 };
         expect(buildGatewayBody(model, ask()).body).toMatchObject({ temperature: 0, top_p: 1 });
         expect(buildGatewayBody(model, { ...ask(), modelOptions: { temperature: NaN, top_p: Infinity } }).body.temperature).toBeUndefined();
+    });
+    test('Gemini aliases that refuse sampling never get temperature/top_p; other models keep them', () => {
+        const options = { ...ask(), modelOptions: { temperature: 0.2, top_p: 0.9 } };
+        for (const alias of ['gemini-3.8-flash', ' Gemini-3.8-Flash ', 'gemini-4-argon']) {
+            const lines: string[] = [];
+            const body = buildGatewayBody({ ...gw(), model: alias, temperature: 0.5, topP: 0.5 }, options, line => lines.push(line)).body;
+            expect(body.temperature).toBeUndefined(); expect(body.top_p).toBeUndefined();
+            expect(Object.keys(body).sort()).toEqual(['max_tokens', 'messages', 'model', 'stream']);
+            expect(lines).toEqual([`[gateway] temperature/top_p not sent: ${alias} refuses sampling options`]);
+        }
+        expect(buildGatewayBody({ ...gw(), model: 'gemini-3.8-flash' }, ask(), () => { throw new Error('no option, no log'); }).body.temperature).toBeUndefined();
+        for (const alias of [gw().model, KIMI, 'gemini-3.1-pro-preview', 'gemini-3.8-flash-lite']) {
+            expect(buildGatewayBody({ ...gw(), model: alias }, options).body).toMatchObject({ temperature: 0.2, top_p: 0.9 });
+            expect(buildGatewayBody({ ...gw(), model: alias, temperature: 0.4, topP: 0.6 }, ask()).body).toMatchObject({ temperature: 0.4, top_p: 0.6 });
+        }
     });
     test('system messages become text blocks and empty system text is dropped', () => {
         const body = build(ask([msg('system', txt(''), txt('rules'), marker), msg('user', txt('q'))]));
@@ -101,6 +116,7 @@ describe('gateway sanitizer', () => {
     test('byte count matches serialized UTF-8 wire messages and text parts', () => {
         const message = msg('user', txt('你好 🌍\n"'));
         expect(gatewayTokenCount(message)).toBe(Buffer.byteLength(JSON.stringify(gatewayMessage(message))));
+        // A string counts as the text block it would be sent as (gateway-budget.test.ts says why).
         expect(gatewayTokenCount('你好')).toBe(Buffer.byteLength(JSON.stringify({ type: 'text', text: '你好' })));
         expect(gatewayTokenCount(msg('system', thinking))).toBe(0);
         expect(gatewayInputTokens(gw())).toBe(104480);
@@ -109,7 +125,8 @@ describe('gateway sanitizer', () => {
         expect(gatewayInputTokens({ maxInputTokens: 131072 })).toBe(131072 - 1056 - 1536 - 8000);
     });
     test('actual body bytes plus 1056 are bounded before sending', () => {
-        expect(() => build(ask([msg('user', txt('字'.repeat(44000)))]))).toThrow('Conversation too large');
+        expect(() => build(ask([msg('user', txt('字'.repeat(44000)))]))).toThrow(LocalRequestError);
+        expect(() => build(ask([msg('user', txt('字'.repeat(43000)))]))).not.toThrow();
     });
     for (const [name, fixture] of Object.entries(fixtureRequests())) test(`fixture ${name} is produced by sanitizer`, () => {
         const expected = JSON.parse(readFileSync(`${import.meta.dir}/fixtures/gateway-bodies/${name}.json`, 'utf8'));

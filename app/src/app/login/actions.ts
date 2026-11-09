@@ -3,6 +3,7 @@
 import { redirect } from 'next/navigation';
 import { headers } from 'next/headers';
 
+import { auth0Enabled } from '@/server/auth/auth0';
 import { Routes, safeReturnUrl } from '@/utils/constants';
 import { forwardedHost, forwardedProto } from '@/utils/forwarded';
 import { createClient } from '@/utils/supabase/server';
@@ -113,8 +114,12 @@ export async function signInWithPassword(formData: FormData): Promise<AuthAction
  * Starts the Google OAuth flow. Supabase returns a provider authorization
  * URL rather than establishing a session directly — we redirect the browser
  * there, and `/auth/callback` exchanges the resulting code for a session.
+ *
+ * With EZiL ID configured, Google sign-in belongs to EZiL ID: a page cached before the button was removed, or
+ * a hand-made post, is sent to the EZiL ID entry and never reaches Supabase's Google OAuth.
  */
 export async function signInWithGoogle(returnUrl: string): Promise<never> {
+    if (auth0Enabled()) redirect(`/auth/auth0/login?${new URLSearchParams({ returnUrl: safeReturnUrl(returnUrl) })}`);
     const supabase = await createClient();
     const origin = await siteOrigin();
 

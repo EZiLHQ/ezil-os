@@ -1,6 +1,7 @@
 import { decideAdmission } from './admission';
 import { awsTierForSize, instanceTypeForTier, readAwsAdmissionConfig, type Env } from './aws-config';
 import { paidCloudflareCandidates, readAdmissionCounters, withAdmission, type PaidMigrationCandidate, type PlacementExecutor } from './placement';
+import { paidComputeUnmetered } from './paid-compute-policy';
 import { advanceMigration } from './provider-migrate-orchestrator';
 import { utcMonthStart } from './usage';
 
@@ -78,7 +79,7 @@ export async function reconcilePaidCloudflareUsers(startedAt: number, env: Env =
                     const counters = await readAdmissionCounters(tx, lock, { ...candidate, now, monthStart: utcMonthStart(now) });
                     return decideAdmission({ config, counters, userId: candidate.userId, now,
                         region: { kind: 'lease', region: 'ap-south-1' },
-                        instanceType: instanceTypeForTier(tier) }).admit;
+                        instanceType: instanceTypeForTier(tier), userHoursExempt: paidComputeUnmetered(plan) }).admit;
                 });
             },
             create: candidate => runtime.store.createOrGetActive(candidate),

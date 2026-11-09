@@ -9,7 +9,7 @@ const { spawnSync } = require('node:child_process');
 const source = process.env.COPILOT_TEST_ROOT;
 const script = path.join(__dirname, 'patch-copilot-chat.sh');
 const wb = 'out/vs/code/browser/workbench/workbench.js';
-const files = ['extensions/copilot/dist/extension.js', 'extensions/copilot/package.json', 'extensions/copilot/package.nls.json', 'extensions/copilot/LICENSE.txt', 'product.json', 'out/nls.messages.js', 'out/nls.messages.json', wb, 'out/vs/code/browser/workbench/workbench.css'];
+const files = ['extensions/copilot/dist/extension.js', 'extensions/copilot/package.json', 'extensions/copilot/package.nls.json', 'extensions/copilot/LICENSE.txt', 'product.json', 'out/nls.messages.js', 'out/nls.messages.json', wb, 'out/vs/code/browser/workbench/workbench.css', 'out/server-main.js'];
 const run = (...args) => spawnSync('bash', [script, ...args], { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
 test('pinned bundle applies and verifies; status strings replaced and legal notices retained', { skip: !source && 'set COPILOT_TEST_ROOT to local pristine bundle' }, async t => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-status-patch-'));

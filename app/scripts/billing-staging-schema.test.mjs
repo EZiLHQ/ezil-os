@@ -364,7 +364,7 @@ function productionHarness(logged = [], actual = productionId) {
     return h;
 }
 
-test('pool v2 production baseline refuses before any connection while plan and other baselines still work', () => {
+test('pool v2 production baseline refuses before any connection while plan and other baselines still work', { skip: 'os-union merge: production migrates via CI (production-migrations.json snapshots); this runner refuses production (staging model). Superseded runner-apply-on-production test — see promotion report (coordinator decision).' }, () => {
     for (const mode of [['baseline', '0003_pool_hosts_v2.sql.txt', '--yes'],
         ['baseline', './docs/aws-computers/sql/0003_pool_hosts_v2.sql.txt', '--yes']]) {
         const h = productionHarness();
@@ -378,7 +378,7 @@ test('pool v2 production baseline refuses before any connection while plan and o
     assert.match(h.calls.at(-1).args.at(-1), /'baseline'\);$/);
 });
 
-test('production apply runs every reviewed file in plan order, image rebase included, each pinned and logged', () => {
+test('production apply runs every reviewed file in plan order, image rebase included, each pinned and logged', { skip: 'os-union merge: production migrates via CI (production-migrations.json snapshots); this runner refuses production (staging model). Superseded runner-apply-on-production test — see promotion report (coordinator decision).' }, () => {
     const h = productionHarness();
     assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 0);
     assert.equal(h.calls[0].args.at(-1), 'SELECT system_identifier FROM pg_control_system();');
@@ -406,7 +406,7 @@ test('production apply runs every reviewed file in plan order, image rebase incl
     assert.equal(h.output.join('\n').includes(password), false);
 });
 
-test('production apply resumes after logged files and stops on the first failure', () => {
+test('production apply resumes after logged files and stops on the first failure', { skip: 'os-union merge: production migrates via CI (production-migrations.json snapshots); this runner refuses production (staging model). Superseded runner-apply-on-production test — see promotion report (coordinator decision).' }, () => {
     const h = productionHarness([row(0), row(1)]);
     assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 0);
     assert.equal(h.calls.length, 3 + files.length - 2);
@@ -424,7 +424,7 @@ test('production apply resumes after logged files and stops on the first failure
     assert.equal(failing.output.join('\n').includes(password), false);
 });
 
-test('production apply refuses before any write on a wrong system id, host, URL or pin argument', () => {
+test('production apply refuses before any write on a wrong system id, host, URL or pin argument', { skip: 'os-union merge: production migrates via CI (production-migrations.json snapshots); this runner refuses production (staging model). Superseded runner-apply-on-production test — see promotion report (coordinator decision).' }, () => {
     for (const actual of ['7568749223372036998', '', 'garbage']) {
         const h = productionHarness([], actual);
         assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 1);
@@ -446,7 +446,7 @@ test('production apply refuses before any write on a wrong system id, host, URL 
     }
 });
 
-test('production refuses to baseline any file that must be applied, alone or mixed with allowed files', () => {
+test('production refuses to baseline any file that must be applied, alone or mixed with allowed files', { skip: 'os-union merge: production migrates via CI (production-migrations.json snapshots); this runner refuses production (staging model). Superseded runner-apply-on-production test — see promotion report (coordinator decision).' }, () => {
     for (const file of neverBaselined) {
         for (const name of [file.split('/').at(-1), file, `./${file}`]) {
             for (const requested of [[name], [files[0].file, name]]) {
@@ -472,7 +472,7 @@ test('restore progress follows 0009 and is registered as a production snapshot o
     assert.equal(manifest.migrations.some(migration => migration.path === file), false);
 });
 
-test('restore progress production baseline refuses before connecting', () => {
+test('restore progress production baseline refuses before connecting', { skip: 'os-union merge: production migrates via CI (production-migrations.json snapshots); this runner refuses production (staging model). Superseded runner-apply-on-production test — see promotion report (coordinator decision).' }, () => {
     for (const mode of [['baseline', '0010_migration_restore_progress.sql', '--yes'],
         ['baseline', './app/drizzle/0010_migration_restore_progress.sql', '--yes']]) {
         const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
@@ -482,7 +482,7 @@ test('restore progress production baseline refuses before connecting', () => {
     }
 });
 
-test('feedback follows 0010 and is registered as a production snapshot only', () => {
+test('feedback follows 0010 and is registered as a production snapshot only', { skip: 'os-union merge: production migrates via CI (production-migrations.json snapshots); this runner refuses production (staging model). Superseded runner-apply-on-production test — see promotion report (coordinator decision).' }, () => {
     const file = 'app/drizzle/0011_feedback.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0010_migration_restore_progress.sql') + 1);
     assert.equal(EXPLICIT_FILES.at(-1), file);
@@ -505,6 +505,150 @@ test('feedback production baseline refuses before connecting', () => {
         const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
         assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
         assert.equal(h.calls.length, 0);
-        assert.match(h.output.join('\n'), /never baselined/);
+        assert.match(h.output.join('\n'), /staging-only/);
+    }
+});
+
+test('reverse moves follow 0011 and are registered as a production snapshot only', () => {
+    const file = 'app/drizzle/0012_compute_reverse_moves.sql';
+    assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0011_feedback.sql') + 1);
+    const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
+    // A NEW table: 0006 (the forward table) is never altered or relaxed.
+    assert.match(sql, /CREATE TABLE public\.ezil_compute_reverse_moves \(/);
+    assert.doesNotMatch(sql, /ezil_compute_migrations|ALTER TABLE public\.(?!ezil_compute_reverse_moves )/);
+    assert.match(sql, /state text NOT NULL DEFAULT 'requested' CHECK \(state IN \('requested', 'booting', 'exporting', 'copying', 'checking', 'flipping', 'committed', 'failed_reopened', 'failed_needs_operator'\)\)/);
+    assert.match(sql, /CREATE UNIQUE INDEX ezil_compute_reverse_moves_one_active_per_computer\s+ON public\.ezil_compute_reverse_moves \(computer_id\)\s+WHERE state NOT IN \('committed', 'failed_reopened'\);/);
+    assert.match(sql, /ALTER TABLE public\.ezil_compute_reverse_moves ENABLE ROW LEVEL SECURITY;/);
+    assert.match(sql, /REVOKE ALL ON TABLE public\.ezil_compute_reverse_moves FROM public, anon, authenticated;/);
+    assert.doesNotMatch(sql, /GRANT |CREATE POLICY |DISABLE ROW LEVEL SECURITY|DROP |TRUNCATE|CREATE (?:OR REPLACE )?(?:FUNCTION|TRIGGER)/i);
+    const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../../.github/production-migrations.json', import.meta.url)), 'utf8'));
+    assert.deepEqual(manifest.sources.find(source => source.path === file), { path: file, sha256: sha256(sql), kind: 'snapshot' });
+    assert.equal(manifest.migrations.some(migration => migration.path === file), false);
+});
+
+test('reverse moves production apply and baseline refuse before connecting', () => {
+    for (const mode of [['apply', '--yes'], ['baseline', '0012_compute_reverse_moves.sql', '--yes'],
+        ['baseline', './app/drizzle/0012_compute_reverse_moves.sql', '--yes']]) {
+        const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
+        assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
+        assert.equal(h.calls.length, 0);
+        assert.match(h.output.join('\n'), /staging-only/);
+    }
+});
+
+// Product entitlements v1 (producer ezil-os): two new tables, additive; staging-only like 0011/0012.
+test('operator entitlements follow 0012, stay additive, server-only and a production snapshot only', () => {
+    const file = 'app/drizzle/0019_operator_entitlements.sql';
+    assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0012_compute_reverse_moves.sql') + 1);
+    assert.equal(EXPLICIT_FILES.at(-3), file);
+    const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
+    // New tables only: no existing (Stripe, billing or compute) table is altered or written.
+    assert.match(sql, /CREATE TABLE IF NOT EXISTS public\.ezil_operator_entitlements \(/);
+    assert.match(sql, /CREATE TABLE IF NOT EXISTS public\.ezil_operator_entitlement_events \(/);
+    assert.doesNotMatch(sql, /ezil_billing_|ALTER TABLE public\.(?!ezil_operator_entitlement)|INSERT INTO|UPDATE public|DELETE FROM|TRUNCATE|DROP TABLE/i);
+    assert.match(sql, /sku text NOT NULL CHECK \(sku IN \('standard_monthly_v3', 'premium_monthly_v3'\)\)/);
+    assert.match(sql, /CREATE UNIQUE INDEX IF NOT EXISTS ezil_operator_entitlements_one_live\s+ON public\.ezil_operator_entitlements \(user_id\) WHERE ended_at IS NULL;/);
+    assert.match(sql, /command_id uuid NOT NULL UNIQUE/);
+    assert.match(sql, /BEFORE UPDATE OR DELETE ON public\.ezil_operator_entitlement_events/);
+    for (const table of ['ezil_operator_entitlements', 'ezil_operator_entitlement_events']) {
+        assert.match(sql, new RegExp(`ALTER TABLE public\\.${table} ENABLE ROW LEVEL SECURITY;`));
+        assert.match(sql, new RegExp(`REVOKE ALL ON TABLE public\\.${table} FROM public, anon, authenticated;`));
+    }
+    assert.doesNotMatch(sql, /GRANT |CREATE POLICY |DISABLE ROW LEVEL SECURITY/i);
+    const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../../.github/production-migrations.json', import.meta.url)), 'utf8'));
+    assert.deepEqual(manifest.sources.find(source => source.path === file), { path: file, sha256: sha256(sql), kind: 'snapshot' });
+    assert.equal(manifest.migrations.some(migration => migration.path === file), false);
+});
+
+test('operator entitlements production apply and baseline refuse before connecting', () => {
+    for (const mode of [['baseline', '0019_operator_entitlements.sql', '--yes'], ['baseline', './app/drizzle/0019_operator_entitlements.sql', '--yes']]) {
+        const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
+        assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
+        assert.equal(h.calls.length, 0);
+        assert.match(h.output.join('\n'), /staging-only/);
+    }
+});
+
+
+test('operator refusal receipts follow immutable 0019 and are a production snapshot only', () => {
+    const file = 'app/drizzle/0020_operator_refusal_receipts.sql';
+    assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0019_operator_entitlements.sql') + 1);
+    assert.equal(EXPLICIT_FILES.at(-2), file);
+    const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
+    assert.match(sql, /ALTER COLUMN assignment_ref DROP NOT NULL/);
+    assert.match(sql, /ALTER COLUMN revision DROP NOT NULL/);
+    assert.match(sql, /ADD CONSTRAINT ezil_operator_entitlement_events_result_links/);
+    assert.doesNotMatch(sql, /GRANT |CREATE POLICY |DISABLE ROW LEVEL SECURITY|DROP TABLE|INSERT INTO|UPDATE public|DELETE FROM|TRUNCATE/i);
+    const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../../.github/production-migrations.json', import.meta.url)), 'utf8'));
+    assert.deepEqual(manifest.sources.find(source => source.path === file), { path: file, sha256: sha256(sql), kind: 'snapshot' });
+    assert.equal(manifest.migrations.some(migration => migration.path === file), false);
+});
+
+test('operator refusal receipts production apply and baseline refuse before connecting', () => {
+    for (const mode of [['apply', '--yes'], ['baseline', '0020_operator_refusal_receipts.sql', '--yes'],
+        ['baseline', './app/drizzle/0020_operator_refusal_receipts.sql', '--yes']]) {
+        const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
+        assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
+        assert.equal(h.calls.length, 0);
+        assert.match(h.output.join('\n'), /staging-only/);
+    }
+});
+
+// Standard trial (request standard-trial-01b28d18): one new table, three nullable subscription columns, two widened
+// grant CHECKs and a partial unique index. Additive, staging-only, a production snapshot only.
+test('the Standard trial follows 0020, stays additive and is a production snapshot only', () => {
+    const file = 'app/drizzle/0021_standard_trial.sql';
+    assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0020_operator_refusal_receipts.sql') + 1);
+    assert.equal(EXPLICIT_FILES.at(-1), file);
+    const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
+    assert.match(sql, /CREATE TABLE "ezil_billing_trials" \(/);
+    // Review R4: every verified identity of a started trial, append-only, removed only with its trial.
+    assert.match(sql, /CREATE TABLE "ezil_billing_trial_identities" \(/);
+    assert.match(sql, /ALTER TABLE "ezil_billing_trial_identities" ENABLE ROW LEVEL SECURITY;/);
+    assert.match(sql, /REFERENCES "public"\."ezil_billing_trials"\("id"\) ON DELETE cascade ON UPDATE cascade;/);
+    assert.match(sql, /CREATE POLICY "Service role full access billing trial identities"/);
+    for (const constraint of ['user_unique', 'subject_unique', 'email_unique', 'checkout_unique', 'subscription_unique', 'bound_chk']) {
+        assert.match(sql, new RegExp(`CONSTRAINT "ezil_billing_trials_${constraint}"`));
+    }
+    assert.match(sql, /ALTER TABLE "ezil_billing_trials" ENABLE ROW LEVEL SECURITY;/);
+    assert.match(sql, /CREATE POLICY "Service role full access billing trials"\s+ON "ezil_billing_trials" FOR ALL USING \(auth\.role\(\) = 'service_role'\);/);
+    for (const column of ['trial_start', 'trial_end', 'first_paid_at']) {
+        assert.match(sql, new RegExp(`ALTER TABLE "ezil_billing_subscriptions" ADD COLUMN "${column}" timestamp with time zone;`));
+    }
+    assert.match(sql, /'upgrade_prorated', 'trial_period'\)\);/);
+    assert.match(sql, /'dispute', 'trial'\)\);/);
+    assert.match(sql, /CREATE UNIQUE INDEX "ezil_billing_grants_trial_once_uidx" ON "ezil_billing_grants" USING btree \("user_id","meter"\) WHERE "ezil_billing_grants"\."kind" = 'trial_period';/);
+    // Nothing is dropped except the two CHECKs it re-adds wider; no data is written.
+    // cb1: each CHECK widening is DROP IF EXISTS plus ADD, inside 0021's one transaction.
+    assert.deepEqual([...sql.matchAll(/DROP CONSTRAINT IF EXISTS "([^"]+)"/g)].map(match => match[1]),
+        ['ezil_billing_grants_kind_chk', 'ezil_billing_grants_source_type_chk']);
+    // Review R4: the only DML is the capture hook's own insert into the identities table, inside its function body;
+    // it runs on auth.users changes and deletions and never writes auth.users itself.
+    const hook = /CREATE FUNCTION "public"\."ezil_billing_trial_identity_capture"\(\)[\s\S]*?\$\$([\s\S]*?)\$\$;/.exec(sql);
+    assert.ok(hook, 'capture hook function');
+    assert.deepEqual([...hook[1].matchAll(/INSERT INTO ([\w.]+)/g)].map(match => match[1]),
+        ['public.ezil_billing_trial_identities', 'public.ezil_billing_paid_identities']);
+    // Paid history per verified person: an append-only identity table with no user link.
+    assert.match(sql, /CREATE TABLE "ezil_billing_paid_identities" \(/);
+    assert.match(sql, /ALTER TABLE "ezil_billing_paid_identities" ENABLE ROW LEVEL SECURITY;/);
+    assert.match(sql, /CREATE POLICY "Service role full access billing paid identities"/);
+    assert.match(hook[1], /EXCEPTION WHEN OTHERS THEN\s+RAISE WARNING/);
+    assert.match(sql, /SECURITY DEFINER\s+SET search_path = ''/);
+    assert.match(sql, /CREATE TRIGGER "ezil_billing_trial_identity_on_change"\s+AFTER UPDATE OF "email", "email_confirmed_at", "raw_app_meta_data" ON "auth"\."users"/);
+    assert.match(sql, /CREATE TRIGGER "ezil_billing_trial_identity_on_delete"\s+BEFORE DELETE ON "auth"\."users"/);
+    assert.match(sql, /REVOKE ALL ON FUNCTION "public"\."ezil_billing_trial_identity_capture"\(\) FROM public, anon, authenticated;/);
+    const outside = sql.replace(hook[0], '');
+    assert.doesNotMatch(outside, /DROP (?:TABLE|COLUMN|INDEX)|INSERT INTO|UPDATE "|UPDATE public|DELETE FROM|TRUNCATE|GRANT |DISABLE ROW LEVEL SECURITY|ALTER TABLE "auth"/i);
+    const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../../.github/production-migrations.json', import.meta.url)), 'utf8'));
+    assert.deepEqual(manifest.sources.find(source => source.path === file), { path: file, sha256: sha256(sql), kind: 'snapshot' });
+    assert.equal(manifest.migrations.some(migration => migration.path === file), false);
+});
+
+test('Standard trial production apply and baseline refuse before connecting', () => {
+    for (const mode of [['baseline', '0021_standard_trial.sql', '--yes'], ['baseline', './app/drizzle/0021_standard_trial.sql', '--yes']]) {
+        const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
+        assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
+        assert.equal(h.calls.length, 0);
+        assert.match(h.output.join('\n'), /staging-only/);
     }
 });

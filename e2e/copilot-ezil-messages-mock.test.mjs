@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createMock, validateBody, QWEN, KIMI } from './copilot-ezil-messages-mock.mjs';
+import { createMock, validateBody, QWEN, KIMI, FLASH, SLOW_DONE } from './copilot-ezil-messages-mock.mjs';
 
 const base = () => ({ model: QWEN, max_tokens: 16, stream: true, messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] });
 const tool = name => ({ name, input_schema: { type: 'object', properties: {} } });
@@ -84,12 +84,78 @@ test('authenticated request handler, Qwen SSE, Kimi JSON and scripted tool seque
       body.messages.push({ role: 'assistant', content: [call] }, { role: 'user', content: [{ type: 'tool_result', tool_use_id: call.id, content: 'success' }] });
     }
     assert.match(await (await post(body)).text(), /EZIL_E2E_DONE/);
+    // Subagent script: the parent calls runSubagent with the model it names; the child's prompt gets a plain answer.
+    const parent = { ...base(), tools: [tool('runSubagent')], tool_choice: { type: 'auto' }, messages: [{ role: 'user', content: 'EZIL_E2E_SUBAGENT model=[Kimi K3 (no streaming) (ezil)]' }] };
+    const events = (await (await post(parent)).text()).split('\n').filter(line => line.startsWith('data: ')).map(line => JSON.parse(line.slice(6)));
+    const subagent = events.find(event => event.type === 'content_block_start').content_block;
+    assert.equal(subagent.name, 'runSubagent');
+    assert.deepEqual(JSON.parse(events.find(event => event.type === 'content_block_delta').delta.partial_json), { prompt: 'Reply with exactly EZIL_E2E_CHILD', description: 'Child model check', model: 'Kimi K3 (no streaming) (ezil)' });
+    assert.match(await (await post({ ...base(), model: KIMI, stream: false, messages: [{ role: 'user', content: 'Reply with exactly EZIL_E2E_CHILD' }] })).text(), /EZIL_CHILD_OK/);
+    parent.messages.push({ role: 'assistant', content: [{ ...subagent, input: {} }] }, { role: 'user', content: [{ type: 'tool_result', tool_use_id: subagent.id, content: 'EZIL_CHILD_OK' }] });
+    assert.match(await (await post(parent)).text(), /EZIL_SUBAGENT_DONE/);
     const invalid = await post({ ...base(), messages: [{ role: 'user', content: 'x'.repeat(131072) }] });
     assert.equal(invalid.status, 413);
     const captures = JSON.parse(readFileSync(join(captureDir, 'captured.json')));
-    assert.equal(captures.length, 10);
+    assert.equal(captures.length, 13);
     assert.equal(captures.filter(record => !record.authorized).length, 2);
+    assert.deepEqual(readdirSync(captureDir).filter(name => name.endsWith('.tmp')), [], 'captured.json is replaced whole');
     assert.equal(readFileSync(join(captureDir, '0002.body.json'), 'utf8'), JSON.stringify(base()));
+  } finally {
+    server.close();
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+});
+
+test('a slow answer streams its parts over time, stops for a closed client, and answers whole unstreamed', async () => {
+  const captureDir = mkdtempSync(join(tmpdir(), 'ezil-messages-slow-'));
+  const server = createMock({ token: 'test-only', folder: '/project', captureDir, slow: { parts: 3, ms: 40 } });
+  const handle = server.listeners('request')[0];
+  const call = async (body, { closeAfter } = {}) => {
+    const request = Readable.from([Buffer.from(JSON.stringify(body))]);
+    Object.assign(request, { method: 'POST', url: '/ai/v1/messages', headers: { authorization: 'Bearer test-only' } });
+    const writes = [];
+    const response = { destroyed: false, writeHead() {}, write(chunk) { writes.push({ at: Date.now(), chunk }); if (writes.length === closeAfter) this.destroyed = true; }, end(chunk = '') { writes.push({ at: Date.now(), chunk, end: true }); } };
+    await handle(request, response);
+    return writes;
+  };
+  try {
+    const slow = { ...base(), messages: [{ role: 'user', content: 'EZIL_E2E_SLOW: keep going' }] };
+    const writes = await call(slow);
+    const deltas = writes.filter(w => w.chunk.includes('text_delta')).map(w => ({ at: w.at, text: JSON.parse(w.chunk.split('data: ')[1]).delta.text }));
+    assert.deepEqual(deltas.map(d => d.text), ['EZiL Chat: slow reply.', ' part 1.', ' part 2.', ' part 3.', SLOW_DONE]);
+    assert.ok(deltas.at(-1).at - deltas[0].at >= 4 * 40 - 5, 'parts arrive over time');
+    assert.equal(writes.at(-1).end, true);
+    // A client that went away stops the stream: nothing after the close, and no end.
+    const closed = await call(slow, { closeAfter: 4 });
+    assert.equal(closed.length, 4);
+    // Unstreamed, the same answer arrives whole and carries no test-only field.
+    const whole = JSON.parse((await call({ ...slow, stream: false })).at(-1).chunk);
+    assert.deepEqual(whole.content, [{ type: 'text', text: 'EZiL Chat: slow reply. part 1. part 2. part 3.' + SLOW_DONE }]);
+    // A plain prompt is not slowed.
+    assert.equal((await call(base())).filter(w => w.chunk.includes('text_delta')).length, 1);
+  } finally {
+    server.close();
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+});
+
+test('Flash catalog mode: v1 catalog names Flash default_model; Flash requests refuse sampling; default mode unchanged', async () => {
+  assert.equal(validateBody({ ...base(), model: FLASH })?.message, 'unsupported model', 'default mode does not accept Flash');
+  assert.equal(validateBody({ ...base(), model: FLASH }, undefined, [QWEN, KIMI, FLASH]), null);
+  for (const key of ['temperature', 'top_p']) assert.match(validateBody({ ...base(), model: FLASH, [key]: 0.5 }, undefined, [QWEN, KIMI, FLASH]).message, /refused for gemini-3.8-flash/);
+  assert.equal(validateBody({ ...base(), temperature: 0.5 }, undefined, [QWEN, KIMI, FLASH]), null, 'Qwen keeps sampling');
+  const captureDir = mkdtempSync(join(tmpdir(), 'ezil-messages-flash-'));
+  const server = createMock({ token: 'test-only', folder: '/project', captureDir, flash: true });
+  try {
+    let status, output = '';
+    const request = Readable.from([]);
+    Object.assign(request, { method: 'GET', url: '/ai/v1/models', headers: { authorization: 'Bearer test-only' } });
+    await server.listeners('request')[0](request, { writeHead(code) { status = code; }, write(c) { output += c; }, end(c = '') { output += c; } });
+    const catalog = JSON.parse(output);
+    assert.equal(status, 200);
+    assert.equal(catalog.contract, 'ezil.gateway.models.v1');
+    assert.equal(catalog.default_model, FLASH);
+    assert.deepEqual(catalog.data.map(row => [row.id, row.availability.state, row.capabilities.tool_calling]), [[QWEN, 'available', true], [KIMI, 'available', true], [FLASH, 'available', true]]);
   } finally {
     server.close();
     rmSync(captureDir, { recursive: true, force: true });

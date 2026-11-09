@@ -221,11 +221,14 @@ test('gateway defaults and configurable reserves; forced choice and images stay 
     expect(config.models[1]).toMatchObject({ maxOutputTokens: 4096, stream: false, capabilities: { imageInput: false } });
 });
 
-test('manifest and image keep Qwen utility roles independent of Kimi selection', () => {
+test('manifest and image keep Qwen utility roles independent of Kimi selection; no configured chat default', () => {
     const manifest = JSON.parse(readFileSync(join(import.meta.dir, '..', 'package.json'), 'utf8'));
     expect(manifest.license).toBe('AGPL-3.0-only');
     expect(manifest.contributes.configurationDefaults['chat.utilityModel']).toBe('ezil/qwen.qwen3-coder-next');
     expect(manifest.contributes.configurationDefaults['chat.utilitySmallModel']).toBe('ezil/qwen.qwen3-coder-next');
+    // A configured chat.defaultModel wins over the user's remembered model in every new or reloaded empty chat (VS
+    // Code 1.141), so a picked model would not stick; the first model is the provider's declared default instead.
+    expect('chat.defaultModel' in manifest.contributes.configurationDefaults).toBe(false);
     expect(manifest.contributes.commands.some((c: { command: string }) => c.command === 'ezil-models.showCredits')).toBe(true);
 });
 
@@ -279,13 +282,28 @@ describe('explicit Gateway protocol configuration', () => {
         expect(config.errors).toEqual(['defaults.gatewayProtocol is not supported; set gatewayProtocol on each Gateway model (ignored)']);
     });
 
-    test('Kimi compatibility settings apply only to the legacy protocol', () => {
+    test('Kimi compatibility settings apply only to the legacy protocol, and an ignored stream request is a warning', () => {
         const config = parse([
             { id: 'legacy', provider: 'gateway', model: 'us.moonshotai.kimi-k3', stream: true },
             { id: 'responses', provider: 'gateway', model: 'us.moonshotai.kimi-k3', gatewayProtocol: 'openai-responses', stream: true },
             { id: 'json', provider: 'gateway', model: 'x', gatewayProtocol: 'openai-responses', stream: false },
+            { id: 'qwen', provider: 'gateway', model: 'qwen.qwen3-coder-next', stream: true },
+            { id: 'quiet', provider: 'gateway', model: 'us.moonshotai.kimi-k3', stream: false },
         ]);
         expect(config.errors).toEqual([]);
-        expect(config.models.map(model => [model.stream, model.maxOutputTokens])).toEqual([[false, 4096], [true, 8192], [false, 8192]]);
+        expect(config.models.map(model => [model.stream, model.maxOutputTokens])).toEqual([[false, 4096], [true, 8192], [false, 8192], [true, 8192], [false, 4096]]);
+        // Kimi is still served and still never streams; the override is reported, not silent.
+        expect(config.warnings).toEqual(['models[0].stream is ignored for us.moonshotai.kimi-k3: EZiL AI cannot settle its streams exactly, so its replies arrive complete (stream: false)']);
+        expect(describeConfig(config)).toContain('warning: models[0].stream is ignored');
+    });
+    test('a stream default inherited by legacy Kimi is reported against the defaults', () => {
+        const config = parse([{ id: 'kimi', provider: 'gateway', model: 'us.moonshotai.kimi-k3' }, { id: 'qwen', provider: 'gateway', model: 'qwen.qwen3-coder-next' }], { stream: true });
+        expect(config.models.map(model => model.stream)).toEqual([false, true]);
+        expect(config.warnings).toEqual(['defaults.stream is ignored for us.moonshotai.kimi-k3: EZiL AI cannot settle its streams exactly, so its replies arrive complete (stream: false)']);
+        expect(config.errors).toEqual([]);
+    });
+    test('the shipped image config has no warnings', () => {
+        const config = parseModelsConfig(shipped, { env: { EZIL_AI_BASE_URL: 'https://proxy.invalid/ai/v1', EZIL_AI_PROXY_TOKEN: 'synthetic-key' } });
+        expect(config.warnings).toEqual([]); expect(config.errors).toEqual([]);
     });
 });

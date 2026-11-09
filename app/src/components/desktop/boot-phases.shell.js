@@ -702,13 +702,14 @@ export const BOOT_FAILURE_COPY = {
         title: 'No capacity in India right now',
         body: 'Your files are kept. This computer can start when capacity in India is available. Try again checks availability.',
     },
+    // P0 2026-11-04 (journey-920): EZiL's AWS hour backstops, not the plan's fair use (see boot-phases.ts).
     user_hours_cap: {
-        title: "This month's computer hours are used up",
-        body: 'Your files are kept. Your monthly computer hours renew next month. Try again only checks whether the limit has changed.',
+        title: "Your computer reached EZiL's monthly AWS limit",
+        body: "This is EZiL's limit on each person's AWS computer hours, separate from your plan's time in Settings → Billing. Your files are kept. It resets on the 1st of next month (UTC); use Send feedback to ask for it to be lifted sooner. Try again only checks whether the limit has changed.",
     },
     global_hours_cap: {
-        title: "This month's computer hours are used up",
-        body: "The service has reached its monthly computer hours limit. Your files are kept. Try again only checks whether the limit has changed.",
+        title: "All AWS computers reached EZiL's monthly limit",
+        body: "EZiL's limit on AWS computer hours across all accounts is reached. It isn't your plan's time in Settings → Billing. Your files are kept. It resets on the 1st of next month (UTC). Try again only checks whether the limit has changed.",
     },
     worker_unreachable: {
         title: "Can't reach your computer",

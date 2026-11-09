@@ -143,7 +143,8 @@ try {
   let auxVisible = false;
   try { await aux.waitFor({ state: 'visible', timeout: T }); auxVisible = true; } catch { /* asserted */ }
   check('secondary sidebar is visible by default', auxVisible);
-  const chatWidget = aux.locator('.interactive-session, .chat-widget').first();
+  // The chat header's wrapper also carries `interactive-session` (for upstream picker styles): pin the chat widget.
+  const chatWidget = aux.locator('.chat-controls-container > .interactive-session, .chat-widget').first();
   let chatVisible = false;
   try { await chatWidget.waitFor({ state: 'visible', timeout: T }); chatVisible = true; } catch { /* asserted */ }
   const auxTitle = clean(await aux.locator('.composite.title, .title-label').first().innerText().catch(() => ''));
@@ -152,23 +153,33 @@ try {
   // extension host time to activate copilot-chat and ezil-models.
   const inputContainer = aux.locator('.chat-input-container').first();
   await inputContainer.waitFor({ state: 'visible', timeout: T }).catch(() => {});
+  // The mode/model pickers sit in the composer, under the input beside Add Context and Send; Local and
+  // the permission picker sit in the chat header (the title row, patch-copilot-chat.sh `chat-header`).
+  const chatControls = aux.locator('.chat-controls-container > .interactive-session .interactive-input-part').first();
   let toolbar = '';
   for (let i = 0; i < 40; i++) {
-    toolbar = clean(await inputContainer.innerText().catch(() => ''));
+    toolbar = clean(await chatControls.innerText().catch(() => ''));
     if (toolbar && !/sign in/i.test(toolbar) && /Agent|Auto|Manage|Model|Pick/i.test(toolbar)) break;
     await page.waitForTimeout(750);
   }
   check('model picker does not say "Sign in to use Copilot"', toolbar !== '' && !/sign in/i.test(toolbar), `toolbar=${JSON.stringify(toolbar.slice(0, 160))}`);
+  const headerText = clean(await aux.locator('.chat-view-title-container').first().innerText().catch(() => ''));
+  check('the chat header (Local, permissions) does not say "Sign in"', !/sign in/i.test(headerText), `header=${JSON.stringify(headerText.slice(0, 160))}`);
   await page.screenshot({ path: join(OUT, 'workbench.png') });
   if (auxVisible) await aux.screenshot({ path: join(OUT, 'chat-panel.png') }).catch(() => {});
 
   // 6 (revision 3). EZiL Chat branding on the boot path.
   await page.waitForTimeout(1500);
   const NOTICE = 'AI responses may be inaccurate. Review changes before applying them.';
-  const disclaimer = aux.locator('.chat-welcome-view-disclaimer').first();
-  const disclaimerText = clean(await disclaimer.innerText().catch(() => ''));
-  const disclaimerVisible = await disclaimer.isVisible().catch(() => false);
-  check('chat welcome shows the EZiL notice (no GitHub Terms / Privacy Statement)', disclaimerVisible && disclaimerText.includes(NOTICE) && !/terms|privacy|github|copilot/i.test(disclaimerText), `visible=${disclaimerVisible} text=${JSON.stringify(disclaimerText.slice(0, 120))}`);
+  // The notice is the chat header's info button (patch-copilot-chat.sh `chat-header`): its accessible
+  // name and tooltip carry it in every chat state, and it opens EZiL AI status, which repeats it. The
+  // welcome disclaimer stays hidden upstream but must not carry GitHub terms.
+  const notice = await page.evaluate(text => {
+    const help = document.querySelector('.part.auxiliarybar .chat-viewpane .chat-view-title-container .ezil-chat-help');
+    const box = help?.getBoundingClientRect();
+    return { shown: Boolean(help?.offsetHeight) && (help.getAttribute('aria-label') ?? '').includes(text) && help.title.includes(text) && box.bottom <= innerHeight, disclaimer: document.querySelector('.part.auxiliarybar .chat-welcome-view-disclaimer')?.textContent ?? '' };
+  }, NOTICE);
+  check('the AI notice is on the chat header\'s info control: its accessible name and tooltip (no GitHub Terms / Privacy Statement anywhere)', notice.shown && !/terms|privacy|github|copilot/i.test(notice.disclaimer), JSON.stringify({ shown: notice.shown, disclaimer: notice.disclaimer.slice(0, 120) }));
   await aux.screenshot({ path: join(OUT, 'welcome.png') }).catch(() => {});
   const brandingBoot = await visibleBranding();
   check('no visible "Copilot" / "GitHub" text anywhere in the workbench after boot', brandingBoot.length === 0, JSON.stringify(brandingBoot.slice(0, 4)));
@@ -207,11 +218,11 @@ try {
     await page.screenshot({ path: join(OUT, 'target-picker.png') });
     await page.keyboard.press('Escape'); await page.waitForTimeout(400);
   } else {
-    info('session-target picker', 'no "Local" button found in the chat footer');
+    info('session-target picker', 'no "Local" button found in the chat view');
   }
 
   // 5 (informational). Mode picker rows — is Plan there?
-  const modeBtn = inputContainer.locator('a.action-label, .action-label').filter({ hasText: /^(Agent|Ask|Edit|Plan)\b/ }).first();
+  const modeBtn = chatControls.locator('a.action-label, .action-label').filter({ hasText: /^(Agent|Ask|Edit|Plan)\b/ }).first();
   if (await modeBtn.count()) {
     await modeBtn.click({ timeout: 8_000 }).catch(() => {});
     await page.waitForTimeout(1200);
@@ -221,13 +232,22 @@ try {
     info('Plan agent offered in the mode picker', String(rows.some((r) => /\bPlan\b/.test(r))));
     await page.keyboard.press('Escape'); await page.waitForTimeout(400);
   } else {
-    info('mode picker', 'no mode button found in the chat input toolbar');
+    info('mode picker', 'no mode button found in the composer');
   }
 
   // The picker must expose both models, with Qwen selected before any input.
-  const modelButton = () => inputContainer.locator('.action-label').filter({ hasText: /Qwen3 Coder Next|Kimi K3|^Auto$/ }).first();
+  const modelButton = () => chatControls.locator('.action-label').filter({ hasText: /Qwen3 Coder Next|Kimi K3|^Auto$/ }).first();
   await modelButton().waitFor({ state: 'visible', timeout: T });
   check('Qwen is selected by default', (await modelButton().innerText()).includes(MODEL_NAME));
+  // Founder feedback 2026-11-08: the model picker belongs with the composer, not across the panel in the header.
+  const placement = await page.evaluate(() => {
+    const m = document.querySelector('.part.auxiliarybar .action-label[aria-label^="Models, "]');
+    const input = document.querySelector('.part.auxiliarybar .chat-controls-container > .interactive-session .interactive-input-part .chat-editor-container');
+    if (!m || !input) return { found: false };
+    const a = m.getBoundingClientRect(), b = input.getBoundingClientRect();
+    return { found: true, inHeader: !!m.closest('.chat-view-title-container'), inComposer: !!m.closest('.interactive-input-part'), gap: Math.round(a.top - b.bottom) };
+  });
+  check('the model picker sits in the composer, just under the input (not in the chat header)', placement.found && placement.inComposer && !placement.inHeader && placement.gap >= -2 && placement.gap <= 40, JSON.stringify(placement));
   await modelButton().click();
   await page.waitForTimeout(800);
   let models = await pickerRows();

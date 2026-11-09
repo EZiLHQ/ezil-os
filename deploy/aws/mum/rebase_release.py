@@ -27,6 +27,28 @@ PLAN_KEYS = ('schemaVersion', 'accountId', 'region', 'namespace', 'bake', 'build
              'configPath', 'configSha256', 'identityConfigPath', 'identityConfigSha256', 'schemaPath', 'schemaSha256', 'databaseSystemIdentifier', 'maintenance', 'rollout', 'evidence', 'ledgerGeneration')
 VERSION_KEYS = ('stateMachineVersionArn', 'preparationStateMachineVersionArn', 'recoveryStateMachineVersionArn')
 LEDGER_PATH = Path('/root/ezil-aws-mum/releases/promotion-ledger.json')
+# Image-pinned app-only operations (rebase_app_swap.py). Older tooling refuses them as unknown.
+APP_OPERATIONS = ('app-swap', 'app-restore')
+# Fixed, nonsecret refusals the operator acts on; any other error prints only 'release refused'.
+PUBLIC_REASONS = {'ledger drift', 'manual reconciliation required',
+                  'identity stack drifted from the reviewed template',
+                  'remote command not terminal; wait or cancel',
+                  'secret written; app not yet adopted — resume the same operation',
+                  'pending operation of another plan; run ledger-reconcile',
+                  'pending operation differs; run ledger-reconcile',
+                  'ledger-reconcile requires this plan pending entry',
+                  'pending operation; run ledger-reconcile before planning',
+                  'app operation pending; run app-swap-reconcile',
+                  'one-shot SSM command already ended; reconcile it, never resubmit',
+                  'one-shot SSM command failed; reconcile under the retained fence',
+                  # App operations: the plan's stop conditions branch on these.
+                  'live app differs from the plan before-state', 'staging host is not quiescent',
+                  'candidate tag already names another image', 'post-install state differs; run app-swap-reconcile',
+                  'staging host is not proven quiescent; retain the fence', 'app-swap-reconcile requires this plan pending entry',
+                  'uncertain SSM submission; reconcile command before retry', 'archive receipt missing; run app-archive-check',
+                  'stale plan: ledger generation advanced', 'app-restore must undo the latest completed app-swap',
+                  'app secret changed while pending; manual reconciliation required',
+                  'archive receipt does not match the inspected artifacts; run app-archive-check'}
 
 
 def release_roles(directory, maintenance=False, legacy=False):
@@ -62,7 +84,10 @@ def ledger_tuple(d):
 
 
 def load_ledger(ledger_path):
-    value = manifest.read(safe_path(ledger_path))
+    return validate_ledger(manifest.read(safe_path(ledger_path)))
+
+
+def validate_ledger(value):
     need(isinstance(value, dict) and set(value) == {'schemaVersion', 'entries'} and type(value['schemaVersion']) is int and value['schemaVersion'] == 1,
          'invalid promotion ledger')
     entries = value['entries']
@@ -78,11 +103,17 @@ def load_ledger(ledger_path):
         adopt = isinstance(entry, dict) and entry.get('operation') == 'app-adopt'
         if adopt:
             fields |= {'state', 'before', 'expected', 'registrySha256'}
+        app_op = isinstance(entry, dict) and entry.get('operation') in APP_OPERATIONS
+        if app_op:
+            fields |= {'state'} | (set() if state == 'pending' else {'registrySha256', 'appImageId'})
         need(isinstance(entry, dict) and set(entry) == fields, 'invalid ledger entry')
         need(state in ('pending', 'completed', 'aborted'), 'invalid ledger state')
         need(type(entry['generation']) is int and entry['generation'] == generation, 'invalid ledger generation')
         snapshots = [entry['before'], entry['expected']] if state == 'pending' else [entry]
-        if state == 'pending':
+        if app_op and state == 'pending':
+            need(isinstance(entry['before'], dict) and set(entry['before']) == {'secretVersionId', 'tuple', 'registrySha256', 'appGitSha', 'appImageId'} and
+                 isinstance(entry['expected'], dict) and set(entry['expected']) == {'tuple', 'registrySha256', 'appGitSha', 'appImageId'}, 'invalid app operation snapshots')
+        elif state == 'pending':
             need(isinstance(entry['before'], dict) and set(entry['before']) - {'registrySha256'} == {'secretVersionId', 'tuple', 'appGitSha'} and
                  isinstance(entry['expected'], dict) and set(entry['expected']) - {'registrySha256'} == {'tuple', 'appGitSha'}, 'invalid pending snapshots')
         if adopt:
@@ -95,7 +126,8 @@ def load_ledger(ledger_path):
             need(manifest.matches(r'[0-9a-f]{40}', snapshot['appGitSha']) and
                  (entry['planSha256'] == 'app-adopt:' + entry['appGitSha'] if adopt else manifest.matches(r'[0-9a-f]{64}', entry['planSha256'])),
                  'invalid ledger source pin')
-            need(entry['operation'] in ('apply-app', 'promote-canary', 'rollback', 'registry-gc', 'app-adopt') and
+            need(not app_op or manifest.matches(r'sha256:[0-9a-f]{64}', snapshot['appImageId']), 'invalid ledger app image ID')
+            need(entry['operation'] in ('apply-app', 'promote-canary', 'rollback', 'registry-gc', 'app-adopt', *APP_OPERATIONS) and
                  isinstance(snapshot.get('secretVersionId', 'expected'), str) and bool(snapshot.get('secretVersionId', 'expected')), 'invalid ledger operation/version')
             need(isinstance(snapshot['tuple'], dict) and set(snapshot['tuple']) == set(manifest.PROMOTION), 'invalid ledger tuple')
         if entry['operation'] == 'registry-gc':
@@ -123,6 +155,26 @@ def load_ledger(ledger_path):
             need(state == 'pending' and prior is not None, 'registry-gc requires pending predecessor')
         elif 'state' in entry:
             need(state == 'pending' and prior is not None or state == 'completed' and generation == 1, 'terminal ledger entry requires pending')
+        if app_op and state == 'pending':
+            before, expected = entry['before'], entry['expected']
+            # An aborted entry records the unchanged before-state, so it is a valid baseline too.
+            need(prior is not None and prior.get('state', 'completed') in ('completed', 'aborted') and 'registrySha256' in prior and
+                 state_matches(before, prior) and (prior['operation'] not in APP_OPERATIONS or before['appImageId'] == prior['appImageId']),
+                 'app operation requires the completed registry baseline')
+            need(before['tuple'] == expected['tuple'] and before['registrySha256'] == expected['registrySha256'] and
+                 before['appGitSha'] != expected['appGitSha'] and before['appImageId'] != expected['appImageId'],
+                 'app operation must change only app identity')
+            if entry['operation'] == 'app-restore':
+                swap = entries[generation - 3] if generation > 2 else None
+                need(prior['operation'] == 'app-swap' and swap is not None and swap.get('state') == 'pending' and
+                     swap['planSha256'] == prior['planSha256'] and
+                     (swap['before']['appGitSha'], swap['before']['appImageId']) == (expected['appGitSha'], expected['appImageId']),
+                     'app-restore must undo the latest completed app-swap')
+        elif app_op:
+            need(prior is not None and prior.get('state') == 'pending', 'app operation terminal requires pending')
+            side = prior['expected' if state == 'completed' else 'before']
+            need(state_matches(entry, side) and entry['registrySha256'] == side['registrySha256'] and entry['appImageId'] == side['appImageId'],
+                 'app operation terminal state mismatch')
     return value
 
 
@@ -673,6 +725,7 @@ def ledger_reconcile(path, apply=False, ledger_path=None):
         ledger = load_ledger(ledger_path)
         pending = ledger['entries'][-1]
         need(pending.get('state') == 'pending' and pending['planSha256'] == digest(path), 'ledger-reconcile requires this plan pending entry')
+        need(pending['operation'] not in APP_OPERATIONS, 'app operation pending; run app-swap-reconcile')
         need(rebase_ssm.generation_terminal(path.parent, pending['generation'], aws), 'remote command not terminal; wait or cancel')
         envelope = json_tool.secret_aws(['get-secret-value', '--secret-id', json_tool.SECRET, '--output', 'json'], lock_fd=fd)
         _, d = secret_deployment(envelope)
@@ -778,7 +831,8 @@ def ledger_adopt_app(git_sha, source_repo, apply=False, ledger_path=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=('plan', 'finalize', 'apply-schema', 'apply-identity', 'apply-workflows', 'apply-app', 'promote-canary', 'rollback', 'ledger-init', 'ledger-reconcile', 'ledger-adopt-app'))
+    parser.add_argument('operation', choices=('plan', 'finalize', 'apply-schema', 'apply-identity', 'apply-workflows', 'apply-app', 'promote-canary', 'rollback', 'ledger-init', 'ledger-reconcile', 'ledger-adopt-app',
+                                              'app-swap', 'app-swap-reconcile', 'app-archive-check'))
     parser.add_argument('--release-dir', type=Path)
     parser.add_argument('--plan', type=Path)
     parser.add_argument('--manifest', type=Path)
@@ -789,8 +843,15 @@ def main():
     parser.add_argument('--ledger', type=Path, default=LEDGER_PATH)
     parser.add_argument('--git-sha')
     parser.add_argument('--source-repo', type=Path)
+    parser.add_argument('--archive', type=Path)
+    parser.add_argument('--checksum', type=Path)
+    parser.add_argument('--runtime', type=Path)
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
+    if args.operation in ('app-swap', 'app-swap-reconcile', 'app-archive-check'):
+        import rebase_app_swap
+        rebase_app_swap.cli(args)
+        return
     if args.operation == 'plan':
         need(args.release_dir is not None and args.plan is None and args.manifest is None, 'plan requires --release-dir')
         make_plan(args.release_dir, args.config, args.identity_config, args.expect_system_id, args.rollout, args.ledger)
@@ -825,14 +886,7 @@ if __name__ == '__main__':
     try:
         main()
     except (ValueError, KeyError, TypeError, OSError, subprocess.TimeoutExpired) as error:
-        public_reasons = {'ledger drift', 'manual reconciliation required',
-                          'identity stack drifted from the reviewed template',
-                          'remote command not terminal; wait or cancel',
-                          'secret written; app not yet adopted — resume the same operation',
-                          'pending operation of another plan; run ledger-reconcile',
-                          'pending operation differs; run ledger-reconcile',
-                          'ledger-reconcile requires this plan pending entry',
-                          'pending operation; run ledger-reconcile before planning'}
+        public_reasons = PUBLIC_REASONS
         reason = str(error) if isinstance(error, ValueError) and str(error) in public_reasons else 'release refused'
         print('ERROR: '+reason+'; check reviewed inputs, staging identity and published readbacks. Inspect retained phase journals before retrying.', file=sys.stderr)
         sys.exit(1)

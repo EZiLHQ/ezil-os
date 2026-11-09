@@ -39,12 +39,7 @@ import {
   type FetchLike,
 } from './aws-origin';
 import type { CodeFolderOutcome, CodeFolderResolver } from './code-folder';
-
-/** The slice of the Sandbox SDK's `sandbox.exec` the Cloudflare walk uses. */
-export type CodeFolderExec = (
-  command: string,
-  options: { env: Record<string, string>; timeout: number; origin: 'internal' },
-) => Promise<{ exitCode: number; stdout?: string; stderr?: string }>;
+import type { RepoOpenExec } from './repo-open';
 
 /** The longest walk; past it the answer is `error` and today's default folder opens. */
 export const CODE_FOLDER_RESOLVE_TIMEOUT_MS = 5_000;
@@ -112,7 +107,7 @@ export const CODE_FOLDER_RESOLVE_COMMAND = `(\n${CODE_FOLDER_RESOLVE_SCRIPT}\n)`
  * `rel` in its env, the exec bounded by CODE_FOLDER_RESOLVE_TIMEOUT_MS and the whole call by
  * `boundMs`. Never throws (a refused, failed or late exec is `error`); stderr is never read.
  */
-export function cloudflareCodeFolderResolver(exec: CodeFolderExec, root: string, boundMs = CODE_FOLDER_RESOLVE_BOUND_MS): CodeFolderResolver {
+export function cloudflareCodeFolderResolver(exec: RepoOpenExec, root: string, boundMs = CODE_FOLDER_RESOLVE_BOUND_MS): CodeFolderResolver {
   return async (rel) => {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<CodeFolderOutcome>((resolve) => { timer = setTimeout(() => resolve('error'), boundMs); });

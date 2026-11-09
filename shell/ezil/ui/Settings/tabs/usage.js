@@ -1,7 +1,7 @@
 // Authenticated observations. Durations and balances never advance on the client.
 import trpc from '../trpc.js';
 import session from '../../../session.js';
-import { creditsLabel, hoursLeftLines, heldClosedSize, heldClosedText } from '../billing-format.js';
+import { accountCredits, accountDetailsHtml, creditsLabel, hoursLeftLines, heldClosedSize, heldClosedText, paidComputeUnmetered, staleCreditsCopy } from '../billing-format.js';
 
 const states = new WeakMap();
 let active = null;
@@ -42,7 +42,11 @@ const meter = (id, label, value, percent, text, note, state, action = '') => `<s
     <div class="usage-meter-heading"><h4 id="usage-${id}-label">${label}</h4><span class="usage-value">${value}</span></div>
     ${bar(id, percent, text)}<div class="usage-caption"><p class="usage-note">${note}</p>${action}</div></section>`;
 
-export function usageHtml(data, summary = null, { stale = false } = {}) {
+/**
+ * `lastAccount`: the last readable `ai.account` for `userId` (the signed-in user), shown with "Couldn't refresh ·
+ * as of HH:MM" when this summary has no readable balance or failed.
+ */
+export function usageHtml(data, summary = null, { stale = false, lastAccount = null, userId = null, summaryLoading = false, usageLoading = false } = {}) {
     if (data != null && data.enabled !== false && (data.enabled !== true || data.version !== 1 || !data.session || data.period?.unit !== 'standard_seconds' || !data.storage)) throw Error('Unsupported usage response');
     if (summary?.enabled !== true || summary.version !== 3) summary = null;
     const usage = data?.enabled === true ? data : null;
@@ -56,7 +60,12 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const timeState = timePercent === null ? 'unavailable'
         : summary?.fairUse?.status === 'paused' || remainingSeconds === 0 ? 'danger'
         : summary?.fairUse?.status === 'near' ? 'warn' : 'ok';
-    const paused = summary?.fairUse?.status === 'paused' || timeState === 'danger';
+    // Paid compute policy v1: a paid plan has no computer-hours cutoff, so nothing here pauses it or counts its hours down.
+    // Computer time (meter, pause, reset) shows only once the summary says the plan is metered: with no summary the plan
+    // is unknown, and a paid user must never read "used up" from the usage figures alone.
+    const unmetered = paidComputeUnmetered(summary);
+    const metered = summary !== null && !unmetered;
+    const paused = metered && (summary.fairUse?.status === 'paused' || timeState === 'danger');
     const primary = plan?.status === 'past_due'
         ? actions.portal === true ? billingLink('Fix payment', 'usage-payment', true) : ''
         : plan?.sku === 'free_v3' && actions.checkout === true ? billingLink('Upgrade', 'usage-upgrade', true, '&amp;upgrade=pro')
@@ -75,11 +84,12 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const free = plan?.sku === 'free_v3' || ['files_on_aws', 'free'].includes(summary?.computer?.standing);
     const lines = hoursLeftLines(hoursPeriod, choices, { monthly: free });
     const lessThanHour = lines && hoursPeriod.remainingHoursAtCurrent === 0 && period.remainingStandardSeconds > 0;
-    const left = !lines ? 'Time left unavailable' : lessThanHour ? lines.main.replace(/^About 0 hours left/, 'Less than an hour left') : lines.main;
+    // Nothing read yet is a load in progress, never a failure (live staging 2026-11-01: a 0.2 s "couldn't read" flash).
+    const left = !lines ? usageLoading ? 'Checking…' : 'Time left unavailable' : lessThanHour ? lines.main.replace(/^About 0 hours left/, 'Less than an hour left') : lines.main;
     const closed = summary?.computer?.standing === 'files_on_aws' ? heldClosedSize(summary.computer) : null;
     const sessionHours = count(summary?.computer?.sessionMaxSeconds) && summary.computer.sessionMaxSeconds >= 3600 ? Math.floor(summary.computer.sessionMaxSeconds / 3600) : null;
     const timeNote = period.allowanceStandardSeconds === 0 ? 'No computer time included this period.'
-        : timePercent === null ? "We couldn't read your usage. Try Refresh."
+        : timePercent === null ? usageLoading ? '' : "We couldn't read your usage. Try Refresh."
         : timeState === 'danger' ? '■ No computer time left · new sessions paused'
         : timeState === 'warn' ? `! Running low. When it runs out, this session ends and new sessions pause until ${timestamp(resetsAt)}.`
         : lines?.equivalents ? esc(lines.equivalents)
@@ -99,8 +109,8 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const aboveGrant = !included && balance !== null && denominator !== null && balance > denominator;
     // ADV-6: nothing to measure until the account is enrolled — no bar beside "N credits waiting".
     // Round 6 (R1-10): a balance above the grant has no denominator to show, so no bar (never a full one by construction).
-    const aiPercent = enrollment !== 'enrolled' || aboveGrant ? null : balance === null || denominator === null ? null : Math.floor(ratio(balance, denominator));
-    const aiState = enrollment && enrollment !== 'enrolled' ? 'pending' : balance === null ? 'unavailable' : balance === 0 || ai?.state === 'exhausted' ? 'danger'
+    let aiPercent = enrollment !== 'enrolled' || aboveGrant ? null : balance === null || denominator === null ? null : Math.floor(ratio(balance, denominator));
+    let aiState = enrollment && enrollment !== 'enrolled' ? 'pending' : balance === null ? 'unavailable' : balance === 0 || ai?.state === 'exhausted' ? 'danger'
         : ai?.state === 'low' ? 'warn' : 'ok';
     const grantLabel = denominator !== null ? creditsLabel(null, denominator) : null;
     // ADV-1 (same rule as Billing): split only from the server's breakdown, and only when it adds up
@@ -123,13 +133,42 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
         previous ? `${esc(creditsLabel(null, previous.remaining))} from ${plan?.sku === 'free_v3' ? 'your previous plan' : 'an earlier billing period'} · expire ${timestamp(previous.expiresAt)}` : '',
         ai?.pendingFromRenewal && Number.isSafeInteger(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? `${esc(creditsLabel(null, ai.pendingFromRenewal.credits))} more from ${timestamp(ai.pendingFromRenewal.at)}` : '',
     ].filter(Boolean);
-    const aiNote = enrollment === 'needs_ezil_id' ? 'AI credits activate when you sign in with EZiL ID. Use the same email as this account.'
+    let aiNote = enrollment === 'needs_ezil_id' ? 'AI credits activate when you sign in with EZiL ID. Use the same email as this account.'
         : enrollment === 'activating' ? (waiting ? `${esc(creditsLabel(null, waiting))} credits are added when this finishes.` : '')
         : (status => [status, split, status ? '' : grantNote, ...extras])(aiState === 'unavailable' ? "We couldn't read your balance." : aiState === 'danger' ? '■ No credits left.' : aiState === 'warn' ? '! Running low' : '').filter(Boolean).join('<br>');
-    const aiValue = enrollment === 'needs_ezil_id' ? waiting ? `${esc(creditsLabel(null, waiting))} credits waiting` : 'Not active yet'
+    let aiValue = enrollment === 'needs_ezil_id' ? waiting ? `${esc(creditsLabel(null, waiting))} credits waiting` : 'Not active yet'
         : enrollment === 'activating' ? 'Setting up your AI credits…'
         : balance === null ? 'Unavailable' : aboveGrant ? `${esc(balanceLabel)} left`
         : `${esc(included ? creditsLabel(null, included.remaining) : balanceLabel)}${grantLabel ? ` of ${esc(grantLabel)}` : ''} left`;
+    let aiText = `${aboveGrant ? balanceLabel : included ? creditsLabel(null, included.remaining) : balanceLabel} credits left${included ? ` of ${creditsLabel(null, included.granted)} this period` : ''}.${aboveGrant ? split ? ` ${split}.` : '' : !included && grantNote ? ` ${grantNote.replace(/^Your plan/, 'Plan')}.` : ''}`;
+    // Identity credits (`ai.account`, sent by this server even when the balance is unreadable; an older server omits
+    // the key and keeps the rendering above): every live grant is in the total, exact microcredits, and neither
+    // number ever comes from the catalog. Unreadable: the kept balance for this user, as of its time, or "unavailable".
+    const identity = (enrollment ?? 'enrolled') === 'enrolled' && (ai ? 'account' in ai : lastAccount !== null)
+        ? accountCredits(ai?.account ?? null, { previous: lastAccount, userId, planSku: plan?.sku }) : undefined;
+    if (identity !== undefined) {
+        aiState = identity === null ? 'unavailable' : identity.empty ? 'danger' : !identity.stale && identity.low ? 'warn' : 'ok';
+        aiPercent = identity?.percent ?? null;
+        const headline = identity && `${identity.left} credits left${identity.total !== null ? ` of ${identity.total}` : ''}`;
+        aiValue = identity === null ? 'Unavailable' : esc(headline);
+        aiText = identity === null ? '' : `${headline}.`;
+        const expiry = { previous: `from ${plan?.sku === 'free_v3' ? 'your previous plan' : 'an earlier billing period'}`, purchased: 'purchased', added: 'added' };
+        const pending = ai?.pendingFromRenewal && Number.isSafeInteger(ai.pendingFromRenewal.credits) && ai.pendingFromRenewal.credits > 0 ? ai.pendingFromRenewal : null;
+        // Round 4 D17 (as Billing): in the payment grace this period's plan credits arrive with the payment, never "more from <renewal>".
+        const awaitingPayment = pending !== null && plan?.paymentIssue != null && ai.included?.granted === 0;
+        aiNote = identity === null ? "We couldn't read your balance." : [
+            identity.stale ? esc(staleCreditsCopy(identity.asOf)) : aiState === 'danger' ? '■ No credits left.' : aiState === 'warn' ? '! Running low' : '',
+            accountDetailsHtml(identity.details, esc),
+            ...identity.expiring.map(item => `${esc(item.remaining)} ${expiry[item.kind]} · expire ${timestamp(item.expiresAt)}`),
+            awaitingPayment ? `${esc(creditsLabel(null, pending.credits))} credits for this period. Added once your payment goes through.`
+                : pending ? `${esc(creditsLabel(null, pending.credits))} more from ${timestamp(pending.at)}` : '',
+            identity.stale ? '' : ai?.included && validDate(ai.included.periodEnd) ? `Resets ${timestamp(ai.included.periodEnd)}` : grant?.per === 'period' && grantLabel ? `Your plan adds ${grantLabel} every month` : '',
+        ].filter(Boolean).join('<br>');
+    }
+    // Usage can answer before the summary: until the first summary arrives the credits are being read, not unreadable.
+    if (summaryLoading && !ai && identity === undefined) {
+        aiState = 'pending'; aiPercent = null; aiValue = 'Checking…'; aiText = 'Checking your AI credits.'; aiNote = '';
+    }
     const aiAction = enrollment === 'needs_ezil_id' ? ezilHref ? `<a class="ezil-settings-btn" data-action="ezil-id" href="${esc(ezilHref)}">Sign in with EZiL ID</a>` : ''
         : enrollment === 'enrolled' && actions.topup === true ? billingLink('Add credits', 'usage-add-credits', false, '&amp;section=ai-credits') : '';
     // Round 3 (D4): the provisioned disk; a used figure only when measured; Free shows no invented number.
@@ -149,12 +188,15 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
     const storageState = storagePercent === null ? 'unavailable' : storagePercent === 0 ? 'danger' : storagePercent <= 20 ? 'warn' : 'ok';
     const measuredAt = samples.map(sample => sample.measuredAt).filter(validDate).sort((a, b) => Date.parse(b) - Date.parse(a))[0];
     const freePlan = summary?.plan?.sku === 'free_v3';
+    // An AWS disk is measured by its host every 15 minutes once its image carries the sampler: until the first
+    // sample it shows the disk and says space used isn't measured yet, never "0 used". A computer with no disk
+    // figure (Cloudflare) has no measurement at all and says so.
     const storageValue = leftBytes !== null ? `${esc(diskBytes(leftBytes))} left`
-        : diskGB ? `${diskGB} GB disk` : freePlan || (storage && storage.capBytes === null) ? 'Saved with your computer' : 'Not measured yet';
+        : diskGB ? `${diskGB} GB disk` : freePlan || (storage && storage.capBytes === null) ? 'Saved with your computer' : usageLoading ? 'Checking…' : 'Not measured yet';
     const storageNote = storageState === 'danger' ? '■ Full. Delete files you no longer need.'
         : storageState === 'warn' ? '! Almost full. Delete files you no longer need.'
-        : diskGB ? `${usedBytes !== null ? `${esc(diskBytes(usedBytes))} used of your ${diskGB} GB disk` : `${diskGB} GB disk for your projects`}${usedBytes !== null && measuredAt ? ` · measured ${timestamp(measuredAt)}` : ''}`
-        : freePlan || (storage && storage.capBytes === null) ? 'Your files are saved between sessions.' : '';
+        : diskGB ? `${usedBytes !== null ? `${esc(diskBytes(usedBytes))} used of your ${diskGB} GB disk` : `${diskGB} GB disk for your projects. Space used isn't measured yet.`}${usedBytes !== null && measuredAt ? ` · measured ${timestamp(measuredAt)}` : ''}`
+        : freePlan || (storage && storage.capBytes === null) ? `Your files are saved between sessions.${usedBytes === null ? " Space used isn't measured on this computer." : ''}` : '';
     // Round 6 (CR-2): the open session's deadline is said even while its heartbeat is late (the Free hold's
     // 1-hour cut comes with a time). A clock time only within a day of the reading; a paid fair-use
     // deadline weeks away is no time "today".
@@ -168,26 +210,26 @@ export function usageHtml(data, summary = null, { stale = false } = {}) {
         : current.state === 'stale' || stale ? `${measuringLine(current.elapsedSeconds)}${ends}`
         : `This session: ${duration(current.elapsedSeconds)} · running${ends}`;
     const weights = (summary?.computer?.machineChoice ?? []).filter(option => count(option.weight) && option.weight > 1 && count(option.vcpu));
+    const storageMeter = meter('storage', 'Storage', storageValue, storagePercent, `${diskBytes(leftBytes)} left of ${diskGB} GB.`, storageNote, storageState);
     return `${data?.enabled === false ? '<p class="usage-note">Usage tracking is unavailable in this deployment.</p>' : ''}
     ${paused ? `<aside class="usage-banner"><strong>Computer time is used up</strong><p>You can't start a new session until ${timestamp(resetsAt)}.</p>${primary}</aside>` : ''}
-    <header class="usage-plan"><div class="usage-plan-copy"><h4>${plan ? `${esc(plan.name)} plan` : 'Plan unavailable'}</h4>
-        ${validDate(resetsAt) ? `<p class="usage-note">${paused ? 'Paused until' : 'Usage resets'} ${timestamp(resetsAt)}</p>` : ''}${pill ? `<span class="ezil-settings-pill">${pill}</span>` : ''}</div>
+    <header class="usage-plan"><div class="usage-plan-copy"><h4>${plan ? `${esc(plan.name)} plan` : summaryLoading ? 'Checking your plan…' : 'Plan unavailable'}</h4>
+        ${metered && validDate(resetsAt) ? `<p class="usage-note">${paused ? 'Paused until' : 'Usage resets'} ${timestamp(resetsAt)}</p>` : ''}${pill ? `<span class="ezil-settings-pill">${pill}</span>` : ''}</div>
         <div class="usage-plan-actions">${paused ? '' : primary}${billingLink('Billing details ›', 'usage-billing')}</div></header>
     <div class="usage-meters">
-        ${meter('compute', 'Computer time', timePercent === null ? 'Not measured' : esc(left), timePercent,
+        ${!metered ? storageMeter : meter('compute', 'Computer time', timePercent === null ? 'Not measured' : esc(left), timePercent,
             `${left}.${lines?.equivalents ? ` ${lines.equivalents}` : ''}`, timeNote, timeState)}
-        ${meter('ai', 'AI credits', aiValue, aiPercent, `${aboveGrant ? balanceLabel : included ? creditsLabel(null, included.remaining) : balanceLabel} credits left${included ? ` of ${creditsLabel(null, included.granted)} this period` : ''}.${aboveGrant ? split ? ` ${split}.` : '' : !included && grantNote ? ` ${grantNote.replace(/^Your plan/, 'Plan')}.` : ''}`, aiNote, aiState, aiAction)}
-        ${meter('storage', 'Storage', storageValue, storagePercent,
-            `${diskBytes(leftBytes)} left of ${diskGB} GB.`, storageNote, storageState)}
+        ${meter('ai', 'AI credits', aiValue, aiPercent, aiText, aiNote, aiState, aiAction)}
+        ${!metered ? '' : storageMeter}
     </div>
     <p class="usage-session-line" data-usage="session">${sessionLine}</p>
     <div class="usage-details">
-        <details data-usage-detail="period"><summary>How computer time works</summary><p class="usage-note">Time counts while your computer is running.</p>
+        ${!metered ? '' : `<details data-usage-detail="period"><summary>How computer time works</summary><p class="usage-note">Time counts while your computer is running.</p>
             ${weights.map(option => `<p class="usage-note">${esc(option.vcpu)} vCPU counts ${esc(option.weight)} h for each hour it runs.</p>`).join('')}
             ${weights.length ? '<p class="usage-note">Bigger configurations use your monthly time sooner, so the hours left depend on the configuration you run.</p>' : ''}
-            <p class="usage-note">Period: ${timestamp(period.startsAt)} – ${timestamp(resetsAt)}</p></details>
+            ${usageLoading ? '' : `<p class="usage-note">Period: ${timestamp(period.startsAt)} – ${timestamp(resetsAt)}</p>`}</details>`}
         <details data-usage-detail="storage"><summary>Storage details</summary><p class="usage-note">Storage is the disk on your computer; some space is used by the system. A used figure appears once it is measured.</p></details>
-        <details data-usage-detail="session"><summary>Session details</summary><dl>${row('Started', timestamp(current.startedAt))}${row('Last update', timestamp(current.observedAt))}${current.endedAt ? row('Ended', timestamp(current.endedAt)) : ''}</dl></details>
+        <details data-usage-detail="session"><summary>Session details</summary><dl>${usageLoading ? '' : `${row('Started', timestamp(current.startedAt))}${row('Last update', timestamp(current.observedAt))}${current.endedAt ? row('Ended', timestamp(current.endedAt)) : ''}`}</dl></details>
     </div>`;
 }
 
@@ -195,6 +237,7 @@ function stop(state) {
     if (!state) return;
     state.visible = false; state.generation++; clearTimeout(state.timer);
     document.removeEventListener('visibilitychange', state.visibility);
+    document.defaultView?.removeEventListener('focus', state.focus);
 }
 const scope = state => {
     const payload = session.payload();
@@ -236,6 +279,11 @@ function announce(state, body) {
     if (changes.length) state.win.find('[data-role="usage-announcement"]').text(changes.join(' '));
 }
 const SUMMARY_MAX_AGE_MS = 5 * 60 * 1000;
+/** Window focus re-reads the summary (credits after a checkout in another tab) at most this often: the summary's side
+ * effects (Stripe preview, Gateway reads, free-credit enqueue) keep it at Billing's 5-minute focus rule. */
+const FOCUS_SUMMARY_MS = 5 * 60 * 1000;
+// Every observation, the kept AI balance included, belongs to one user and computer (`scope`): a change of
+// either clears it before anything is shown. Sign-out is a document load, so nothing outlives it either.
 async function load(state, manual = false) {
     if (!state.visible || document.hidden || !state.win.get(0).isConnected) return;
     clearTimeout(state.timer);
@@ -243,7 +291,8 @@ async function load(state, manual = false) {
     const body = state.win.find('[data-role="usage-body"]'), status = state.win.find('[data-role="usage-refresh-status"]');
     if (!sameScope(state.observedScope, requested)) {
         state.usage = null; state.summary = null; state.summaryAt = undefined; state.meterStates = null; state.observedScope = requested;
-        body.html(usageHtml(null)); state.win.find('[data-role="usage-announcement"]').empty();
+        state.lastAccount = null;
+        body.html(usageHtml(null, null, { usageLoading: true, summaryLoading: true })); state.win.find('[data-role="usage-announcement"]').empty();
     }
     status.removeAttr('role').removeClass('usage-warning').text(state.usage ? 'Refreshing…' : 'Loading usage…');
     body.attr('aria-busy', 'true');
@@ -272,6 +321,15 @@ async function load(state, manual = false) {
                 if (!result.data || (requested.computerId && result.data.session?.computerId && result.data.session.computerId !== requested.computerId)) throw Error('Usage unavailable');
                 usageHtml(result.data);
             } else if (result.data?.enabled !== true || result.data.version !== 3) throw Error('Summary unavailable');
+            else {
+                // The server names the user it read: another user's credits (a session changed elsewhere) are never shown.
+                const account = result.data.ai?.account;
+                if (typeof account?.userId === 'string' && typeof requested.ownerId === 'string' && account.userId !== requested.ownerId) {
+                    state.lastAccount = null;
+                    throw Error('Summary for another user');
+                }
+                if (accountCredits(account, { userId: requested.ownerId }) !== null) state.lastAccount = account;
+            }
             state[source] = result.data;
         } catch {
             if (!currentRequest()) return;
@@ -282,7 +340,9 @@ async function load(state, manual = false) {
             pending.delete(source);
         }
         if (!currentRequest()) return;
-        paint(body, usageHtml(state.usage, state.summary, { stale: failed.has('usage') || pending.has('usage') }));
+        paint(body, usageHtml(state.usage, state.summary, { stale: failed.has('usage') || pending.has('usage'),
+            lastAccount: state.lastAccount ?? null, userId: requested.ownerId ?? null, summaryLoading: pending.has('summary') && !state.summary,
+            usageLoading: pending.has('usage') && !state.usage }));
         if (!pending.size) {
             body.attr('aria-busy', 'false');
             status.toggleClass('usage-warning', failed.size > 0).html(failed.size
@@ -300,15 +360,28 @@ export default {
     available: ctx => ctx?.desktopState?.provider !== 'native-macos' && Boolean(ctx?.payload?.user?.id ?? session.payload()?.user?.id),
     html: () => '<div class="ezil-settings-usage"><div class="usage-heading"><h3>Usage</h3><button type="button" class="ezil-settings-btn" data-action="refresh-usage">Refresh</button></div><p class="usage-refresh-status" data-role="usage-refresh-status"></p><p class="usage-announcement" data-role="usage-announcement" aria-live="polite" aria-atomic="true"></p><div data-role="usage-body"></div></div>',
     init(win, ctx) {
-        const state = { win, ctx, generation: 0, visible: false, timer: null, usage: null, summary: null };
+        const state = { win, ctx, generation: 0, visible: false, timer: null, usage: null, summary: null, lastAccount: null };
         state.visibility = () => { if (document.hidden) { state.generation++; clearTimeout(state.timer); } else void load(state); };
+        state.focus = () => {
+            if (!state.visible || document.hidden || Date.now() - (state.summaryAt ?? 0) < FOCUS_SUMMARY_MS) return;
+            state.summaryAt = undefined; void load(state);
+        };
         states.set(win.get(0), state);
         win.on('click', '[data-action="refresh-usage"]', () => { void load(state, true); });
+        // Add credits opens Billing's top-up dialog in this window; the link stays the fallback without a Billing tab.
+        win.on('click', '[data-action="usage-add-credits"]', event => {
+            if (!win.find('.ezil-settings-tab[data-tab="billing"]').length) return;
+            event.preventDefault();
+            win.trigger('ezil:billing-topup', [{ reason: null }]);
+        });
     },
     onActivate(win) {
         stop(active); active = states.get(win.get(0)); if (!active) return;
         active.visible = true;
         document.addEventListener('visibilitychange', active.visibility);
+        document.defaultView?.addEventListener('focus', active.focus);
+        // Opening the tab reads the summary afresh: credits after an upgrade, checkout or top-up in Billing.
+        active.summaryAt = undefined;
         void load(active);
     },
     onDeactivate() { stop(active); active = null; },

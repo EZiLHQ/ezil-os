@@ -16,6 +16,8 @@ export interface EntitlementRecord {
     size?: SizeCode;
     provider?: 'cloudflare' | 'aws';
     paymentIssue?: boolean;
+    /** Paid compute policy v1: the active paid plan's new-period grant is still on its way (billing GRANT_PENDING_SECONDS). */
+    grantPending?: boolean;
 }
 
 export interface EntitlementReader {
