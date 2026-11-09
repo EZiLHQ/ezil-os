@@ -76,21 +76,118 @@ function jsonValue(value: unknown, seen = new Set<unknown>(), depth = 0): boolea
 
 const text = (value: string): TextBlock => ({ type: 'text', text: value });
 
-export function gatewayTools(tools: readonly Tool[], log: (line: string) => void = () => {}): GatewayTool[] {
+export function gatewayTools(tools: readonly Tool[], log: (line: string) => void = () => {}, gemini = false): GatewayTool[] {
     const names = new Set<string>();
     const dropped = new Set<string>();
+    const restated = new Set<string>();
     const result: GatewayTool[] = [];
     for (const tool of tools) {
-        const schema = tool.inputSchema ?? { type: 'object', properties: {} };
+        let schema: unknown = tool.inputSchema ?? { type: 'object', properties: {} };
         if (typeof tool.name !== 'string' || !TOOL_NAME.test(tool.name) || names.has(tool.name) || result.length >= 64 || !isObject(schema) || schema.type !== 'object' || !jsonValue(schema)) {
             dropped.add(String(tool.name));
             continue;
         }
+        if (gemini) {
+            const keywords = new Set<string>();
+            schema = geminiToolSchema(schema, keywords);
+            if (!isObject(schema)) { dropped.add(tool.name); continue; }
+            if (keywords.size) restated.add(tool.name);
+        }
         names.add(tool.name);
-        result.push({ name: tool.name, input_schema: schema, ...(typeof tool.description === 'string' && tool.description.trim() ? { description: tool.description } : {}) });
+        result.push({ name: tool.name, input_schema: schema as ObjectValue, ...(typeof tool.description === 'string' && tool.description.trim() ? { description: tool.description } : {}) });
     }
     if (dropped.size) log(`[gateway] dropped tools: ${JSON.stringify([...dropped])}`);
+    if (restated.size) log(`[gateway] tool schema keywords Gemini refuses restated in descriptions: ${JSON.stringify([...restated])}`);
     return result;
+}
+
+/**
+ * Gateway aliases served by its Gemini adapter (EZiL AI Gateway src/providers/gemini-request.ts, GEMINI_MODELS). Its tool
+ * schema check accepts only the JSON Schema keywords Google honors and refuses the whole request on any other keyword
+ * (400 unsupported_gemini_request, before admission), rather than let Google silently drop a constraint. Copilot's own
+ * tools carry three such keywords (maxLength, pattern, enumDescriptions; 0.69, Agent and Ask mode), so every Gemini turn
+ * that offered tools was refused.
+ */
+export const GEMINI_ALIASES: ReadonlySet<string> = new Set(['gemini-3.8-flash', 'gemini-3.1-pro-preview', 'gemini-4-argon']);
+export function geminiRoute(alias: string): boolean { return GEMINI_ALIASES.has(alias.trim().toLowerCase()); }
+/** The Gateway's GEMINI_SCHEMA_KEYWORDS, exactly. */
+const GEMINI_SCHEMA_KEYWORDS: ReadonlySet<string> = new Set([
+    'type', 'properties', 'required', 'additionalProperties', 'enum', 'format', 'minimum', 'maximum',
+    'items', 'prefixItems', 'minItems', 'maxItems', 'anyOf', '$ref', '$defs', 'title', 'description',
+    '$schema', '$id', '$comment', 'default', 'examples',
+]);
+const SCHEMA_TYPES: ReadonlySet<string> = new Set(['string', 'number', 'integer', 'boolean', 'object', 'array', 'null']);
+/** Keywords whose value holds schemas: one the Gateway refuses changes the shape, so it cannot be restated as text. */
+const SUBSCHEMA_KEYWORDS: ReadonlySet<string> = new Set([
+    'oneOf', 'allOf', 'not', 'if', 'then', 'else', 'contains', 'patternProperties', 'propertyNames', 'dependentSchemas',
+    'dependencies', 'definitions', 'additionalItems', 'unevaluatedProperties', 'unevaluatedItems',
+]);
+const GEMINI_SCHEMA_MAX_DEPTH = 64;
+
+/**
+ * The tool schema sent on a Gemini route, a new object (Copilot's inputSchema is never changed). Accepted keywords pass
+ * unchanged under the Gateway's own value checks. `const` becomes the equivalent one-value `enum`. Any other keyword that
+ * holds no schema (maxLength, pattern, enumDescriptions, …) is moved, with its exact value, into that node's description,
+ * so the model still reads it; the constraint stays enforced because Copilot validates every tool call's input against
+ * the original schema before running the tool, and answers a violation with an error result. `undefined` when the
+ * schema cannot be expressed (a schema-holding keyword, or a value the Gateway refuses): the caller drops that tool.
+ */
+export function geminiToolSchema(value: unknown, restated: Set<string> = new Set(), depth = 0): unknown {
+    if (typeof value === 'boolean') return value;
+    if (!isObject(value) || depth > GEMINI_SCHEMA_MAX_DEPTH) return undefined;
+    const node: ObjectValue = {};
+    const moved: ObjectValue = {};
+    const schemas = (member: unknown): unknown[] | undefined => {
+        if (!Array.isArray(member) || !member.length) return undefined;
+        const out = member.map(child => geminiToolSchema(child, restated, depth + 1));
+        return out.includes(undefined) ? undefined : out;
+    };
+    for (const [key, member] of Object.entries(value)) {
+        if (key === 'const' && !Object.hasOwn(value, 'enum')) { node.enum = [member]; continue; }
+        if (SUBSCHEMA_KEYWORDS.has(key)) return undefined;
+        if (!GEMINI_SCHEMA_KEYWORDS.has(key)) { moved[key] = member; restated.add(key); continue; }
+        let kept: unknown = member;
+        switch (key) {
+            case 'type': {
+                const types = Array.isArray(member) ? member : [member];
+                if (!types.length || types.some(t => typeof t !== 'string' || !SCHEMA_TYPES.has(t))) return undefined;
+                break;
+            }
+            case 'properties': case '$defs': {
+                if (!isObject(member)) return undefined;
+                const children: ObjectValue = {};
+                for (const [name, child] of Object.entries(member)) {
+                    const projected = geminiToolSchema(child, restated, depth + 1);
+                    if (projected === undefined) return undefined;
+                    children[name] = projected;
+                }
+                kept = children;
+                break;
+            }
+            case 'items': case 'additionalProperties':
+                kept = geminiToolSchema(member, restated, depth + 1);
+                if (kept === undefined) return undefined;
+                break;
+            case 'prefixItems': case 'anyOf':
+                kept = schemas(member);
+                if (kept === undefined) return undefined;
+                break;
+            case 'required': if (!Array.isArray(member) || member.some(item => typeof item !== 'string')) return undefined; break;
+            case 'enum': if (!Array.isArray(member) || !member.length) return undefined; break;
+            case 'minimum': case 'maximum': if (typeof member !== 'number') return undefined; break;
+            case 'minItems': case 'maxItems': if (typeof member !== 'number' || !Number.isSafeInteger(member) || member < 0) return undefined; break;
+            case 'format': case 'title': case 'description': case '$ref': case '$schema': case '$id': case '$comment':
+                if (typeof member !== 'string') return undefined;
+                break;
+            default: break; // default, examples: annotations with any JSON value
+        }
+        node[key] = kept;
+    }
+    if (Object.keys(moved).length) {
+        const constraints = `JSON Schema constraints: ${JSON.stringify(moved)}`;
+        node.description = typeof node.description === 'string' && node.description ? `${node.description}\n${constraints}` : constraints;
+    }
+    return node;
 }
 
 function partText(part: Part): string {
@@ -201,7 +298,7 @@ export function gatewayInputTokens(model: Pick<ResolvedModel, 'maxInputTokens' |
 }
 
 export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log?: (line: string) => void): { body: GatewayBody; bytes: Uint8Array<ArrayBuffer> } {
-    const tools = gatewayTools(request.tools, log);
+    const tools = gatewayTools(request.tools, log, geminiRoute(model.model));
     const conversation = gatewayConversation(request.messages, tools, replaysThinking(model.model));
     const body: GatewayBody = {
         model: model.model, messages: conversation.messages, max_tokens: gatewayOutputTokens(model),
