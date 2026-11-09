@@ -1,5 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
+import { GatewayError } from '../src/gateway-error';
+import { gatewayChat } from '../src/gateway';
 import { buildGatewayBody, gatewayInputTokens, gatewayMessage, gatewayOutputTokens, gatewayTokenCount, gatewayTools, geminiRoute, geminiToolSchema, KIMI, LocalRequestError, replaysThinking } from '../src/gateway-messages';
 import type { Tool } from '../src/types';
 import { ask, call, fixtureRequests, gw, image, marker, msg, result, thinking, tool, txt } from './fixtures/gateway';
@@ -231,6 +233,65 @@ describe('Gemini tool schemas', () => {
             additionalProperties: { type: 'string', description: 'JSON Schema constraints: {"deprecated":true}' } });
         expect([...restated].sort()).toEqual(['deprecated', 'exclusiveMinimum', 'maxLength', 'minLength', 'multipleOf', 'uniqueItems']);
     });
+    test('every $ref must resolve inside the projected schema, at any depth; otherwise only that tool is dropped', () => {
+        const wrap = (extra: object, a: unknown) => ({ type: 'object', ...extra, properties: { a } });
+        const deep = (ref: string) => ({ type: 'array', items: { anyOf: [{ type: 'object', properties: { v: { $ref: ref } } }, { type: 'null' }] } });
+        // Anchors are moved into descriptions, so a reference by anchor would dangle: dropped, however deep the reference.
+        for (const anchor of ['$anchor', '$dynamicAnchor']) {
+            expect(geminiToolSchema(wrap({ $defs: { T: { [anchor]: 'item', type: 'string' } } }, { $ref: '#item' }))).toBeUndefined();
+            expect(geminiToolSchema(wrap({ $defs: { T: { [anchor]: 'item', type: 'string' } } }, deep('#item')))).toBeUndefined();
+        }
+        for (const [extra, ref] of [[{ components: { X: { type: 'string' } } }, '#/components/X'], [{}, 'https://example.invalid/schema.json'],
+            [{}, 'other.json#/x'], [{ $defs: { T: { type: 'string' } } }, '#/$defs/U'], [{ $defs: { T: { type: 'string' } } }, '#/$defs'],
+            [{ $defs: { T: { type: 'string' } } }, '#/$defs/T/type'], [{ $defs: { T: { type: 'string' } } }, '#/$defs/%E0%A4%A']] as const) {
+            expect(geminiToolSchema(wrap(extra, deep(ref)))).toBeUndefined();
+        }
+        // A nested $id starts a new base for the references below it: not resolved here, so dropped.
+        // (Here the pointer would resolve from the root, so only the nested $id makes it ambiguous.)
+        const underId = (id: object) => ({ type: 'object', properties: { a: { ...id, $defs: { T: { type: 'string' } }, properties: { v: { $ref: '#/properties/a/$defs/T' } } } } });
+        expect(geminiToolSchema(underId({ $id: 'https://example.invalid/a' }))).toBeUndefined();
+        expect(geminiToolSchema(underId({}))).toBeDefined();
+        // Pointers to the projected root's own schemas are kept unchanged, escapes and array indexes included.
+        for (const [extra, ref] of [[{}, '#'], [{ $defs: { T: { type: 'string', minLength: 1 } } }, '#/$defs/T'], [{ $defs: { 'a/b~c': { type: 'string' } } }, '#/$defs/a~1b~0c'],
+            [{ $defs: { 'x y': { type: 'string' } } }, '#/$defs/x%20y'], [{ $defs: { L: { anyOf: [{ type: 'string' }, { type: 'null' }] } } }, '#/$defs/L/anyOf/1'],
+            [{ $defs: { B: true } }, '#/$defs/B'], [{ $id: 'https://example.invalid/root' }, '#/properties/a']] as const) {
+            const projected = geminiToolSchema(wrap(extra, deep(ref))) as any;
+            expect(projected).toBeDefined();
+            expect(projected.properties.a.items.anyOf[0].properties.v).toEqual({ $ref: ref });
+        }
+        const lines: string[] = [];
+        const body = geminiBody([{ name: 'ok', inputSchema: { type: 'object', properties: { a: { type: 'string' } } } },
+            { name: 'anchored', inputSchema: wrap({ $defs: { T: { $anchor: 'item', type: 'string' } } }, deep('#item')) }], line => lines.push(line));
+        expect(body.tools!.map(t => t.name)).toEqual(['ok']);
+        expect(lines).toContain('[gateway] dropped tools: ["anchored"]');
+    });
+    test('a chat whose tools all cannot be sent is refused locally, never sent as a chat without tools', () => {
+        const unusable: Tool[] = [{ name: 'one_of', inputSchema: { type: 'object', properties: { a: { oneOf: [{ type: 'string' }] } } } },
+            { name: 'anchored', inputSchema: { type: 'object', $defs: { T: { $anchor: 'item', type: 'string' } }, properties: { a: { $ref: '#item' } } } }];
+        for (const toolMode of ['auto', 'required'] as const) {
+            let error: unknown;
+            try { buildGatewayBody({ ...gw(), model: 'gemini-3.8-flash' }, { ...ask(), tools: unusable, toolMode }, () => {}); } catch (caught) { error = caught; }
+            expect(error).toBeInstanceOf(GatewayError);
+            expect(error).toMatchObject({ code: 'local_tools_unsupported', origin: 'local', status: undefined });
+            expect((error as Error).message).toBe("EZiL Models: none of this chat's 2 tools can be sent to gemini-3.8-flash (their input schemas use features this model "
+                + 'cannot take, or they are invalid; see the EZiL Models log). Nothing was sent or charged. Pick another model, or turn those tools off with Configure Tools');
+        }
+        // Any route: tools that are all invalid (names, schemas) refuse the same way; with no tools offered nothing changes.
+        expect(() => buildGatewayBody(gw(), { ...ask(), tools: [{ name: 'bad.name' }, { name: 'array', inputSchema: { type: 'array' } }] })).toThrow(GatewayError);
+        expect(buildGatewayBody({ ...gw(), model: 'gemini-3.8-flash' }, ask()).body.tools).toBeUndefined();
+        // One usable tool is enough: the turn goes with it (the others are logged as dropped).
+        expect(geminiBody([...unusable, { name: 'ok', inputSchema: { type: 'object', properties: {} } }], () => {}).tools!.map(t => t.name)).toEqual(['ok']);
+    });
+    test('the local refusal ends the turn before any request is sent', async () => {
+        const sent: string[] = [];
+        const fetch = (async (url: string | URL | Request) => { sent.push(String(url)); return Response.json({ data: [] }); }) as typeof globalThis.fetch;
+        const turn = gatewayChat({ ...gw(), model: 'gemini-3.8-flash' }, { ...ask(), tools: [{ name: 'one_of', inputSchema: { type: 'object', properties: { a: { oneOf: [{ type: 'string' }] } } } }], toolMode: 'required' },
+            { signal: new AbortController().signal, fetch, sleep: async () => {}, now: () => 0 });
+        let error: unknown;
+        try { for await (const _ of turn) { /* nothing arrives */ } } catch (caught) { error = caught; }
+        expect(error).toMatchObject({ code: 'local_tools_unsupported', origin: 'local' });
+        expect(sent.filter(url => url.endsWith('/messages'))).toEqual([]);
+    });
     test('a schema-holding keyword or a value the Gateway refuses drops only that tool', () => {
         const ok: Tool = { name: 'ok', inputSchema: { type: 'object', properties: { a: { type: 'string' } } } };
         const bad = (name: string, inner: object): Tool => ({ name, inputSchema: { type: 'object', properties: { a: inner } } });
@@ -245,11 +306,9 @@ describe('Gemini tool schemas', () => {
         const body = geminiBody([ok, ...refused], line => lines.push(line));
         expect(body.tools!.map(t => t.name)).toEqual(['ok']);
         expect(lines).toEqual([`[gateway] dropped tools: ${JSON.stringify(refused.map(t => t.name))}`]);
-        expect(geminiBody(refused, () => {}).tools).toBeUndefined();
         for (const inner of [{ type: 'string', contentSchema: { type: 'object' } }, { $dynamicRef: '#node' }, { type: 'object', required: [1] },
             { type: 'number', minimum: '1' }, { type: 'number', maximum: null }, { type: 'object', properties: [] }]) {
             expect(geminiToolSchema({ type: 'object', properties: { a: inner } })).toBeUndefined();
         }
-        expect(geminiBody(refused, () => {}).tool_choice).toBeUndefined();
     });
 });
