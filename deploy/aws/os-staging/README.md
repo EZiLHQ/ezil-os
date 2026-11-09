@@ -1,5 +1,13 @@
 # OS billing staging on AWS
 
+For the source/branch/build identity checks, the GitHub path mismatch and the
+gates before connecting this installer to CI, see
+[OS CI/CD provenance](../../../docs/OS-CICD-PROVENANCE.md).
+`build TAG` now requires a clean Git checkout and `GIT_SHA=HEAD`, builds from
+a committed snapshot, and emits `TAG.source.json`. `upload TAG` verifies and
+publishes that source receipt before the checksum marker. Existing installation
+and rollback artifacts keep their original format.
+
 Author-only runbook for `https://os-staging.ezil.work`: a new x86_64 t3.medium
 running Amazon Linux 2023 in Mumbai (`ap-south-1`). Caddy publishes TCP 80/443;
 Next listens only on the Compose network at `web:3000`. Caddy persists TLS state
