@@ -196,13 +196,21 @@ Two `localStorage` keys per account, keyed by the opaque account id from
   dropped on a definitive 4xx (the text then returns to the draft). Storage failures
   (blocked, quota, private mode) only lose the convenience.
 - Each POST has a client deadline, `send_deadline_ms(bodyLength)` = 45 s plus the time to
-  upload the body at 4 KiB/s (`SEND_DEADLINE`): about 46 s for a text report, about 9.5 min
-  for a maximum screenshot, and bounded near 11.5 min by the 2.5 MiB body ceiling. Hitting
-  it aborts the request, including a stalled response body, and counts as an unanswered
-  send: the entry stays queued, the form unlocks with "The server didn't answer in time…
-  press Send to try again", and Send reuses its `clientRequestId`, which the server answers
-  as a replay. A timed-out entry does not stop a flush (the next entry is still sent); a
-  network failure does, until the next trigger above. No timer re-sends on its own.
+  upload the body at 4 KiB/s (`SEND_DEADLINE`): about 46-53 s for a text report and about
+  9.5 min for a maximum screenshot (the client's 1.5 MiB image cap, about 2 MiB of base64).
+  The deadline only stops the client giving up early; any server or proxy limit applies on
+  its own (not measured here) and comes back as an answer or a network error. A 400 with
+  the diagnostics downgrade gives the lean re-send its own deadline, so the worst case is
+  twice that. Hitting the deadline aborts the request, including a stalled response body,
+  and counts as an unanswered send: the entry stays queued, the form unlocks with "The
+  server didn't answer in time… press Send to try again", and Send reuses its
+  `clientRequestId`, which the server answers as a replay.
+- A flush sends the queued entries smallest first, so text reports never wait behind a
+  screenshot. A timed-out entry does not stop the flush; a network failure does, until the
+  next trigger above. No timer re-sends on its own, but every trigger re-uploads each
+  queued screenshot in full, so a link too slow for one keeps spending that upload.
+- After a server error (408 or 5xx) while online, the copy says the report is saved and to
+  press Send; a reconnect is promised only after a network failure.
 
 ## 5. Never collected
 `document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, `log.js` ring, headers,

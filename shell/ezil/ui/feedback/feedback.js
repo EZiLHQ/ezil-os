@@ -157,11 +157,12 @@ function without_event_diagnostics (body) {
 
 /**
  * A stalled POST would otherwise leave "Sending…" up forever. The deadline is
- * a fixed allowance plus time to upload the body at a slow uplink, so a
- * screenshot on a weak link still finishes; the 2.5 MiB body ceiling bounds it
- * near 11.5 minutes. Hitting it is an unanswered send (status 0, `timedOut`):
- * the outbox keeps the body, and a re-send reuses its clientRequestId, which
- * the server answers as a replay.
+ * a fixed allowance plus time to upload the body at a slow uplink, so the
+ * client never gives up on a screenshot a weak link is still sending (any
+ * server or proxy limit applies on its own and comes back as an answer or a
+ * network error). The 1.5 MiB image cap bounds it near 9.5 minutes. Hitting
+ * it is an unanswered send (status 0, `timedOut`): the outbox keeps the body,
+ * and a re-send reuses its clientRequestId, which the server answers as a replay.
  */
 export const SEND_DEADLINE = Object.freeze({ baseMs: 45_000, minUploadBytesPerSecond: 4096 });
 export const send_deadline_ms = bytes => SEND_DEADLINE.baseMs + Math.ceil(bytes / SEND_DEADLINE.minUploadBytesPerSecond * 1000);
@@ -229,10 +230,14 @@ async function deliver (clientRequestId, body) {
     return { status, data, timedOut };
 }
 
-/** Re-send every submitted-but-unconfirmed report, once each, in order. */
+/**
+ * Re-send every submitted-but-unconfirmed report, once each, smallest first:
+ * a large screenshot report that a slow link or a server-side limit keeps
+ * failing then never holds back the text reports queued with it.
+ */
 export async function flush_feedback_outbox () {
     if ( ! feedback_enabled() || navigator.onLine === false ) return;
-    for ( const entry of read_outbox() ) {
+    for ( const entry of read_outbox().sort((a, b) => a.body.length - b.body.length) ) {
         // Flushes can overlap (a back/forward-cache restore runs both the icon's
         // remount and `flush_after_restore`): skip what another one has settled.
         if ( ! read_outbox().some(queued => queued.clientRequestId === entry.clientRequestId) ) continue;
@@ -758,7 +763,10 @@ export function open_feedback_dialog (_opts) {
         } else if ( retryable(outcome.status) ) {
             result.textContent = navigator.onLine === false
                 ? "You're offline. Your report is saved and will be sent when you're back online."
-                : error_copy(outcome.status) + " We'll also send it automatically when your connection comes back.";
+                : outcome.status === 0 ? error_copy(0) + " We'll also send it automatically when your connection comes back."
+                // The server answered, so no `online` event is coming either.
+                : 'Could not send feedback — the server could not take it right now. Your report is saved — press Send to try again. '
+                    + 'It will also be retried the next time EZiL OS opens.';
         } else result.textContent = error_copy(outcome.status);
         refresh();
     });
