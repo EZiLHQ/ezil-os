@@ -2,8 +2,10 @@
 // Gemini 3.8 Flash only (founder 2026-11-09). With the EZiL OS proxy's plan header the picker lists the other models
 // locked. Choosing one by touch (Android, iPhone), mouse or keyboard keeps Flash selected and sends nothing. A model
 // saved on a paid plan resolves to Flash once the account is Free, with no dialog, also in a reloaded chat with turns.
-// Out of credits, the turn goes once and nothing loops. Framed in a stand-in OS page carrying the Worker's own billing
-// bridge, both causes reach that page as closed requests and Code shows no notice of its own. No real model is called.
+// Out of credits, the turn goes once and nothing loops. A used-up credit window (a plan allowance no purchase lifts) is
+// never a credit refusal: Code says so with its reset and no purchase action. Framed in a stand-in OS page carrying the
+// Worker's own billing bridge, each cause reaches that page as a closed request (a window as window_limit, with its
+// reset) and Code shows no notice of its own. No real model is called.
 import { createRequire, stripTypeScriptTypes } from 'node:module';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
@@ -158,6 +160,18 @@ try {
       check(`${at}: Free, no credits: one request for the turn, no retry`, sent.length === 1 && sent[0].body?.model === FLASH, JSON.stringify(sent.map(r => r.body?.model)));
       check(`${at}: Free, no credits: outside an OS window the notice offers Add credits`, (await c.toasts()).some(t => /Add credits/.test(t)), JSON.stringify(await c.toasts()));
       await page.screenshot({ path: join(OUT, `${v.name}-exhausted.png`) });
+
+      // A used-up credit window (a plan allowance no purchase lifts): outside an OS window Code says so itself, with the
+      // reset and no purchase action, and sends the turn once.
+      state('free window');
+      const windowMark = posts().length;
+      await c.send(`EZIL_E2E_KIMI ${v.name} window`);
+      await page.waitForTimeout(5000);
+      const windowSent = posts().slice(windowMark);
+      const windowToasts = (await c.toasts()).filter(t => /does not lift this window/.test(t));
+      check(`${at}: Free, credit window used up: Code says no purchase lifts it, with its reset and no purchase action; one request`,
+        windowSent.length === 1 && windowToasts.length === 1 && /Resets at /.test(windowToasts[0]) && !/Add credits|Upgrade/.test(windowToasts[0]),
+        `${windowSent.length} request(s); ${JSON.stringify(windowToasts)}`);
     } catch (e) {
       check(`${v.name}: completed`, false, String(e).slice(0, 300));
       await page.screenshot({ path: join(OUT, `${v.name}-error.png`) }).catch(() => {});
@@ -245,6 +259,20 @@ window.addEventListener('message',e=>{if(e.source===frame.contentWindow&&e.origi
       check('framed: a credit refusal reaches the OS page once, naming one of this turn\'s refused requests; the turn goes once, nothing repeats, no Code notice',
         credit.length === 1 && refused.includes(credit[0].intent.requestId) && once && (await c.toasts()).every(t => !/Add credits/.test(t)),
         `${JSON.stringify(credit)}; ${JSON.stringify(sent.map(r => [r.n, r.body?.model, r.body?.tools?.length ?? 0, r.requestId]))}; ${JSON.stringify(await c.toasts())}`);
+      // A used-up credit window: the OS page gets window_limit with its reset, naming one of this turn's refusals, and
+      // never another credit refusal; Code shows no notice of its own.
+      state('free window');
+      const windowMark = posts().length;
+      await c.send('EZIL_E2E_KIMI framed window');
+      await page.waitForTimeout(5000);
+      const windowSent = posts().slice(windowMark);
+      const intents = (await billing()).filter(m => m.type === 'ezil.code.billing.intent');
+      const windowAsks = intents.filter(m => m.intent.reason === 'window_limit');
+      check('framed: a used-up credit window reaches the OS page as window_limit with its reset, never as a credit refusal; Code shows no notice',
+        windowAsks.length === 1 && Date.parse(windowAsks[0].intent.resetsAt ?? '') > Date.now()
+          && windowSent.map(r => r.requestId).includes(windowAsks[0].intent.requestId)
+          && intents.filter(m => m.intent.reason === 'credits_exhausted').length === 1 && (await c.toasts()).every(t => !/does not lift/.test(t)),
+        `${JSON.stringify(windowAsks)}; ${windowSent.length} request(s); ${JSON.stringify(await c.toasts())}`);
       check('framed: the workbench WebSocket opened, and none closed or failed during the run', wsOpened() && wsFailed().length === 0, JSON.stringify(wsFailed().slice(0, 3)));
       await page.screenshot({ path: join(OUT, 'framed.png') });
     } catch (e) {

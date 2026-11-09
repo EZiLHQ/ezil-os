@@ -165,6 +165,15 @@ export function createMock({ token, folder, captureDir, slow: { parts = 20, ms =
       return json(402, { error: { code: 'insufficient_credits', message: 'Insufficient credits.', request_id: record.requestId, available_micro: 0, hold_micro: 1200 } },
         { 'x-ezil-request-id': record.requestId });
     }
+    // `window`: the Gateway's used-up credit window (docs/credit-window.md), a plan allowance no top-up lifts: 429 with
+    // the reset as Retry-After, budget, use and hold as decimal strings, and resets_at.
+    if (state.has('window')) {
+      record.requestId = creditsRequestId(n);
+      save();
+      return json(429, { error: { code: 'window_budget_reached', message: "This account's AI credit window budget is reached.", request_id: record.requestId,
+        budget_micro: '5000000', used_micro: '4800000', hold_micro: '400000', resets_at: new Date(Date.now() + 5400_000).toISOString(), retry_after_seconds: 5400 } },
+        { 'x-ezil-request-id': record.requestId, 'retry-after': '5400' });
+    }
     const invalid = validateBody(body, raw.length, flash ? [QWEN, KIMI, FLASH] : [QWEN, KIMI]);
     if (invalid) return error(invalid.status, invalid.code, invalid.message);
     let scripted;

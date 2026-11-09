@@ -189,6 +189,13 @@ test('state file: free adds the OS proxy header and its refusal; exhausted answe
     assert.equal(again.body.error.request_id, creditsRequestId(6), 'each refusal has its own request id');
     const recorded = JSON.parse(readFileSync(join(captureDir, 'captured.json'), 'utf8')).filter(r => r.requestId).map(r => [r.n, r.requestId]);
     assert.deepEqual(recorded, [[5, creditsRequestId(5)], [6, creditsRequestId(6)]], 'the capture records which request each refusal answered');
+    writeFileSync(stateFile, 'free window');
+    const window = await call('POST', '/ai/v1/messages', turn(FLASH));
+    assert.deepEqual([window.status, window.body.error.code, window.body.error.request_id, window.headers['x-ezil-request-id'], window.headers['retry-after']],
+      [429, 'window_budget_reached', creditsRequestId(7), creditsRequestId(7), '5400']);
+    assert.deepEqual([typeof window.body.error.budget_micro, typeof window.body.error.used_micro, typeof window.body.error.hold_micro], ['string', 'string', 'string'],
+      'decimal strings, as the Gateway sends them');
+    assert.ok(Date.parse(window.body.error.resets_at) > Date.now(), 'a reset ahead');
     writeFileSync(stateFile, '');
     assert.equal((await call('POST', '/ai/v1/messages', turn(QWEN))).status, 200, 'paid again');
   } finally {
