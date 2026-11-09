@@ -439,7 +439,7 @@ await check('Computer: tiles sell — title, one benefit line, the weight note, 
         const card = tile(el, size);
         assert.equal(clean(card.querySelector('[data-role="config-title"]')), title);
         assert.ok(clean(card.querySelector('[data-role="config-benefit"]')).length > 10, `${size} has a benefit line`);
-        if ( weight ) assert.match(clean(card), new RegExp(weight.replace(/[×]/g, '×')));
+        if ( weight ) assert.ok(clean(card).includes(weight));
     }
     for ( const size of ['cmp-4', 'cmp-8'] ) {
         const card = tile(el, size);
@@ -677,7 +677,8 @@ await check('Feedback: the dialog copy passes scanCopy', () => {
 });
 await check('Feedback: the dialog is dark with an accent primary, through tokens only', () => {
     const css = read('../feedback/feedback.css').replace(/\/\*[\s\S]*?\*\//g, '');
-    const rule = selector => (css.match(new RegExp(`(?:^|\\})\\s*${selector.replace(/[.[\]()*"=]/g, '\\$&')}\\s*\\{([^}]*)\\}`)) ?? [])[1] ?? '';
+    const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const rule = selector => (css.match(new RegExp(`(?:^|\\})\\s*${escapeRe(selector)}\\s*\\{([^}]*)\\}`)) ?? [])[1] ?? '';
     const dialog = rule('.ezil-feedback-dialog');
     assert.match(dialog, /background:\s*var\(--/);
     assert.match(dialog, /color:\s*var\(--/);

@@ -577,7 +577,7 @@ for ( const [stage, sentence] of Object.entries(STEP_TEXT) ) {
             assert.deepEqual(model.chip, { state: 'moving', text: 'Moving files…' }, label);
             assert.equal(model.busy, true, label);
             assert.ok(html.includes('data-role="move-progress"'), label);
-            assert.match(text(html), new RegExp(`Moving your files to your Free computer ${sentence.replace(/\./g, '\\.')}`), label);
+            assert.ok(text(html).includes(`Moving your files to your Free computer ${sentence}`), label);
             if ( stage === 'copying' ) assert.match(text(html), /120 MB of 2\.4 GB copied/, label);
             assert.doesNotMatch(html, /data-action="(open|stop|move-start|move-retry|switch-config)"/, label);
             assert.match(html, /data-action="delete" hidden disabled/, label);
@@ -594,7 +594,7 @@ check('Phase B: a move from an open in another window (progress moving, reverseM
         const data = held({ moveAvailable: true });
         const { model, html } = render(data, prog);
         assert.equal(model.chip.text, 'Moving files…');
-        assert.match(text(html), new RegExp(sentence.replace(/\./g, '\\.')));
+        assert.ok(text(html).includes(sentence));
         if ( phase === 'importing' ) assert.match(text(html), /120 MB of 0\.4 GB copied/);
         assert.equal(moveSummaryLags(prog, data), true, 'the tab re-reads the summary');
         assert.equal(moveSummaryLags(prog, held({ reverseMove: reverseMove({ stage: 'copying' }) })), false);
@@ -654,7 +654,7 @@ for ( const [label, row, want, actions] of ROWS ) {
             tabProg(terminalProgress({ outcome: row.stage, reason: row.reason, retry: row.retry, holdOpenable: row.holdOpenable, stage: 'stopped' }))] ) {
             const { model, html } = render(held({ reverseMove: row, moveAvailable: row.retry === 'now' }, row.holdOpenable === false ? 'cmp-8' : 'std-2'), prog);
             const card = html.split(/data-role="move-(failed|attention)"/)[2]?.split('</div></div>')[0] ?? '';
-            if ( want ) assert.match(text(html), new RegExp(want.replace(/[.()?]/g, '\\$&')), `${label} / ${prog?.stage}`);
+            if ( want ) assert.ok(text(html).includes(want), `${label} / ${prog?.stage}`);
             assert.equal(/data-action="move-retry"/.test(card), !! actions.retry, `${label}: Try again only when retry is 'now'`);
             assert.equal(/data-action="move-upgrade"/.test(card), !! actions.upgrade, `${label}: Upgrade`);
             assert.equal(/data-action="move-feedback"/.test(card), !! actions.feedback, `${label}: Send feedback`);
@@ -671,7 +671,7 @@ check('Phase B §6.3 committed: the files are on the Free computer, what was not
     const done = n => render(afterCommit({ reverseMove: reverseMove({ stage: 'committed', bytesDone: '400000000', bytesTotal: '400000000', skipped: n, retainUntil: at }) }), null).html;
     assert.equal(text(done(0)).match(/Your files are on your Free computer\.[^]*?kept until [A-Z][a-z]{2} \d+, \d{4}\./)?.[0],
         `Your files are on your Free computer. Not moved: ${NOT_MOVED}. Your AWS disk is kept until Nov 13, 2026.`);
-    assert.match(text(done(3)), new RegExp(`Not moved: ${NOT_MOVED.replace(/[.()]/g, '\\$&')}, and 3 items that can't be copied, like links that point outside your Workspace folder\\. Your AWS disk is kept until Nov 13, 2026\\.`));
+    assert.ok(text(done(3)).includes(`Not moved: ${NOT_MOVED}, and 3 items that can't be copied, like links that point outside your Workspace folder. Your AWS disk is kept until Nov 13, 2026.`));
     assert.match(text(done(1)), /, and 1 item that can't be copied, like links that point outside your Workspace folder\./);
     const html = done(0);
     assert.ok(html.includes('data-role="move-done"'));
@@ -687,12 +687,12 @@ check('Phase B pre-move (§6.3): moveAvailable false keeps 6a\'s banner exactly;
     assert.doesNotMatch(plain, /data-role="move-|data-action="move-/);
     const onOpen = render(held({ moveAvailable: true, moveOnOpen: true })).html;
     // r8 (§6.3, §5.9): the copy names the two opens that start the move, the desktop and Code (Preview and a hover never do).
-    assert.match(text(onOpen), new RegExp(`Your files are on your AWS computer\\. The next time you open your desktop or Code, we'll first move the files in your Workspace folder to your Free computer\\. ${KEPT.replace(/[.()']/g, '\\$&')} Move my files now`));
+    assert.ok(text(onOpen).includes(`Your files are on your AWS computer. The next time you open your desktop or Code, we'll first move the files in your Workspace folder to your Free computer. ${KEPT} Move my files now`));
     assert.doesNotMatch(text(onOpen), /open your computer/);
     assert.match(onOpen, /data-action="move-start">Move my files now<\/button>/);
     assert.ok(onOpen.includes(BANNER.replace(/'/g, '&#39;')), '6a\'s banner stays');
     const later = render(held({ moveAvailable: true, moveOnOpen: false })).html;
-    assert.match(text(later), new RegExp(`Your files are on your AWS computer\\. Opening it uses your Free limits\\. You can move the files in your Workspace folder to your Free computer\\. ${KEPT.replace(/[.()']/g, '\\$&')} Move my files to my Free computer`));
+    assert.ok(text(later).includes(`Your files are on your AWS computer. Opening it uses your Free limits. You can move the files in your Workspace folder to your Free computer. ${KEPT} Move my files to my Free computer`));
     assert.match(later, /data-action="move-start">Move my files to my Free computer<\/button>/);
     for ( const html of [onOpen, later] ) assert.match(html, /<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open">Open desktop<\/button>/);
 });

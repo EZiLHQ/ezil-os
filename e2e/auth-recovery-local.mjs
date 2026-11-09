@@ -35,6 +35,7 @@ import { readFileSync } from 'node:fs';
 import { createServer } from 'node:https';
 import { createRequire } from 'node:module';
 import path from 'node:path';
+import { safeLocalRedirect } from './local-redirect.mjs';
 
 const base = new URL(process.env.AUTH_RECOVERY_BASE_URL || 'http://localhost:3187');
 assert(['127.0.0.1', 'localhost'].includes(base.hostname), 'Use a local app server');
@@ -50,14 +51,18 @@ try {
     idp = createServer({ cert: readFileSync(process.env.AUTH_RECOVERY_IDP_CERT), key: readFileSync(process.env.AUTH_RECOVERY_IDP_KEY) }, (req, res) => {
         const url = new URL(req.url, 'https://id.ezil.work');
         let location = null;
+        // Both redirect targets must be the local app's exact origin, never an attacker-supplied one.
         if (url.pathname === '/oidc/logout') {
             seen.logout.push(url);
-            location = url.searchParams.get('post_logout_redirect_uri');
+            location = safeLocalRedirect(url.searchParams.get('post_logout_redirect_uri'), base.origin);
         } else if (url.pathname === '/authorize') {
             seen.authorize.push(url);
-            const back = new URL(url.searchParams.get('redirect_uri'));
-            back.search = new URLSearchParams({ error: 'access_denied', error_description: 'fixture cancel', state: url.searchParams.get('state') }).toString();
-            location = back.toString();
+            const back = safeLocalRedirect(url.searchParams.get('redirect_uri'), base.origin);
+            if (back) {
+                const target = new URL(back);
+                target.search = new URLSearchParams({ error: 'access_denied', error_description: 'fixture cancel', state: url.searchParams.get('state') }).toString();
+                location = target.toString();
+            }
         }
         res.writeHead(location ? 302 : 404, location ? { location } : {}).end();
     });

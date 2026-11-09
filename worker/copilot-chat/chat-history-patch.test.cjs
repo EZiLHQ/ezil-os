@@ -19,7 +19,11 @@ const between = (code, start, end) => {
   const j = code.indexOf(end, i); assert(j > i, `missing ${end.slice(0, 40)}`);
   return code.slice(i, j);
 };
-const bash = (command, ...args) => spawnSync('bash', ['-c', `set -euo pipefail\n. "$1"\nshift\n${command}`, 'bash', editorState, ...args], { encoding: 'utf8' });
+// A fixed stdin script, never a caller-supplied command string: editor-state.sh is sourced from $1 and the
+// remaining paths stay positional arguments, so spaces, quotes and $(...) in them are never evaluated.
+const PREPARE_EDITOR = 'set -euo pipefail\n. "$1"\nshift\nexport EZIL_HOSTS_FILE="$3"; : >"$3"; ezil_editor_prepare "$1" "$2"\n';
+const prepareEditor = (userData, workspace, hostsFile, cwd) =>
+  spawnSync('bash', ['-s', '--', editorState, userData, workspace, hostsFile], { encoding: 'utf8', input: PREPARE_EDITOR, cwd });
 
 // Minimal stand-ins for the workbench services the store calls. Files are real.
 function harness(code) {
@@ -125,7 +129,7 @@ const log = (id, { title, location = 'panel', requests = [request('Fix the login
     const workspace = path.join(tmp, 'workspace'), userData = path.join(tmp, 'user');
     const wsHome = path.join(userData, 'User', 'workspaceStorage');
     fs.mkdirSync(workspace);
-    const prep = bash('export EZIL_HOSTS_FILE="$3"; : >"$3"; ezil_editor_prepare "$1" "$2"', userData, workspace, path.join(tmp, 'hosts'));
+    const prep = prepareEditor(userData, workspace, path.join(tmp, 'hosts'));
     assert.equal(prep.status, 0, prep.stderr);
     const chat = path.join(workspace, '.ezil', 'chat');
     assert(fs.statSync(chat).isDirectory());
@@ -286,5 +290,20 @@ const log = (id, { title, location = 'panel', requests = [request('Fix the login
       fs.writeFileSync(path.join(root, wb), code.replace('this.storeQueue.queue(()=>this._ezilUseWorkspaceChat(f.folders[0].uri))', 'void 0'));
       r = run('--verify', root); assert.notEqual(r.status, 0); assert.match(r.stderr, /GATE FAILED \[history-root\]/);
     });
+  } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
+});
+
+// Runs without a pristine bundle: it exercises only editor-state.sh through the prepareEditor harness.
+test('editor-state receives paths with spaces, quotes and $() literally; the harness never evaluates them', () => {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ezil-chat-literal-'));
+  try {
+    // A workspace path carrying every shell hazard: a space, single and double quotes, and a command
+    // substitution. `injected` is a bare name; were $(...) ever evaluated, touch would drop it in cwd (tmp).
+    const workspace = path.join(tmp, `ws $(touch injected) 'q" end`);
+    fs.mkdirSync(workspace);
+    const prep = prepareEditor(path.join(tmp, 'user'), workspace, path.join(tmp, 'hosts'), tmp);
+    assert.equal(prep.status, 0, prep.stderr);
+    assert(!fs.existsSync(path.join(tmp, 'injected')), 'the $(...) in the path must never run');
+    assert(fs.statSync(path.join(workspace, '.ezil', 'chat')).isDirectory(), 'the literal path reached ezil_editor_prepare');
   } finally { fs.rmSync(tmp, { recursive: true, force: true }); }
 });
