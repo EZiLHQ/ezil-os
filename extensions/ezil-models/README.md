@@ -15,9 +15,14 @@ The image ships one `ezil-gateway` provider and two models:
 `EZIL_AI_BASE_URL` already ends in `/ai/v1`; the provider appends `/messages`.
 `EZIL_AI_PROXY_TOKEN` supplies Bearer auth. Only these environment references
 appear in the image configuration. The extension's configuration defaults pin
-Copilot's title/summary/progress utility slots to Qwen independently of the
-selected chat model. Explicit utility initiator metadata also selects Qwen.
-Deployments must preserve the utility settings if overriding VS Code defaults.
+Copilot's title/summary/progress utility slots to Qwen, a configured model that
+is always listed, independently of the selected chat model. The image's Machine
+settings (`worker/scripts/editor-state.sh`) replace them with Gemini 3.8 Flash,
+so a Free account keeps its titles and summaries: VS Code never invokes a
+locked utility model. Requests carrying explicit utility metadata (`role` or
+`requestInitiator`) also select Qwen; Copilot 0.69 sends none to an extension
+model. Deployments must preserve the utility settings if overriding VS Code
+defaults.
 
 The legacy direct adapters remain available for compatibility and their offline
 regression tests; no direct providers are configured in the image or example.
@@ -236,9 +241,9 @@ auth context.
     upstream.
   - **Requests stay on that provider.** A request reads only that provider's
     catalog and uses only its credential. An id that does not name exactly one
-    configured Gateway provider is refused before anything is sent. Title,
-    summary and progress requests go to Qwen on the same provider, or else to
-    the selected model.
+    configured Gateway provider is refused before anything is sent. Requests
+    marked as titles, summaries or progress (`role` or `requestInitiator`) go
+    to Qwen on the same provider, or else to the selected model.
   - A model configured on the same provider with the same alias wins; another
     provider's configuration never hides this account's row. A catalog without
     `availability`, as served today, adds nothing.
@@ -279,16 +284,22 @@ auth context.
     (`os_model_not_included`), with nothing sent or charged and no dialog.
   - When Flash itself is unavailable, nothing is the default. The picker shows
     an unavailable model, not an upgrade.
-  - Title and summary requests go to Qwen only when the plan includes it. A
-    request naming a model the plan does not include (the image pins Copilot's
-    utility model to Qwen) goes to the plan's own model on the same account.
+  - Marked title and summary requests go to Qwen only when the plan includes
+    it. One naming a model the plan does not include goes to the plan's own
+    model on the same account. Copilot's own utility requests are already
+    Flash requests: the image pins its utility slots to Flash.
+  - The locks come from the last catalog read. When reads fail for more than
+    30 minutes, nothing is locked and the configured default (Qwen) returns
+    to the picker. The proxy still refuses Qwen on Free, with nothing sent or
+    charged and no dialog.
 - **Default model (every plan).** A new or unset chat starts on Gemini 3.8 Flash
   while it is listed and calls tools, whatever the Gateway's `default_model`
   says. Otherwise the Gateway's suggestion, then the configured default, is a
   paid plan's fallback. On a plan that includes only some models, the fallback
   is the first of those, or nothing. VS Code keeps a pick the user saved.
 - **Plan unknown.** `503 os_plan_unavailable` from the OS proxy (no fresh plan
-  pushed yet) reads as temporary, with Retry, and never as billing.
+  pushed yet) reads as temporary, with Retry at most once a minute (a turn's
+  title and progress requests are refused alike), and never as billing.
   - Choosing a locked row in the picker (the workbench's `picker-locked-select`
     patch runs `_ezil-models.lockedModel`) re-reads the plan. If the plan now
     includes the model, the picker lists it again. Otherwise the EZiL OS
