@@ -878,6 +878,37 @@ class HistoricalAttestationTests(unittest.TestCase):
                 self.refuse('GC|E1')
                 for name in ('instances', 'volumes', 'snapshots', 'placements'): self.rows(name, [])
 
+    def test_absent_instance_closed_usage_row_is_not_a_live_join(self):
+        # A terminated instance that survives only in a CLOSED usage row (permanent billing
+        # history) is still provably absent; the execution is attested.
+        self.fixture(pool=False)
+        self.evidence['proof']['usage'] = [{'instance_id': self.instance, 'stopped_at': '2026-10-24T18:30:00Z'}]
+        synthetic_e1(self.evidence, self.path.read_text())
+        self.a['resources'][self.instance]['inventorySha256'] = gc.sha(gc.inventory(self.evidence))
+        self.assertEqual(len(self.prepare()['releases']), 7)
+
+    def test_absent_instance_open_or_future_usage_row_refuses(self):
+        for name, stopped in (('open-null', None), ('open-missing', '__omit__'), ('open-empty', ''),
+                              ('unparsable', 'not-a-timestamp'), ('future', '2026-10-24T19:05:00Z')):
+            with self.subTest(case=name):
+                self.fixture(pool=False)
+                usage = {'instance_id': self.instance}
+                if stopped != '__omit__':
+                    usage['stopped_at'] = stopped
+                self.evidence['proof']['usage'] = [usage]
+                synthetic_e1(self.evidence, self.path.read_text())
+                self.a['resources'][self.instance]['inventorySha256'] = gc.sha(gc.inventory(self.evidence))
+                self.refuse('live instance or volume/snapshot/usage/placement join')
+
+    def test_absent_instance_closed_usage_does_not_exempt_other_sections(self):
+        # The closed-usage exemption never leaks to other sections: an any-mention in
+        # placements still refuses even when the same instance is in a closed usage row.
+        self.fixture(pool=False)
+        self.evidence['proof']['usage'] = [{'instance_id': self.instance, 'stopped_at': '2026-10-24T18:30:00Z'}]
+        self.rows('placements', [{'instance_id': self.instance}])
+        self.a['resources'][self.instance]['inventorySha256'] = gc.sha(gc.inventory(self.evidence))
+        self.refuse('live instance or volume/snapshot/usage/placement join')
+
     def test_kept_resources_exact_join(self):
         self.fixture(pool=False)
         disposition = {'disposition': 'kept-record', 'record': gc.identity(self.records[-1])}

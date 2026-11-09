@@ -204,6 +204,19 @@ def execution_proof(evidence, arn, describe_sha, history_sha):
     return d, h
 
 
+def closed_usage_row(row, captured):
+    """A usage row is permanent billing history, not a live resource, only when it is
+    closed: stopped_at parses to a timestamp (an open, missing or unparsable stopped_at
+    returns False and keeps the row live) that is not after capture.
+    """
+    stopped = row.get('stopped_at') if isinstance(row, dict) else None
+    try:
+        parsed = time_value(stopped)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return False  # open or unparsable usage row is a live join
+    return parsed <= captured
+
+
 def absent_instance(evidence, instance, disposition):
     inv = inventory(evidence)
     need(disposition.get('inventorySha256') == sha(inv)
@@ -215,7 +228,12 @@ def absent_instance(evidence, instance, disposition):
         if row.get('instance_id') == instance:
             joins.update(row[k] for k in ('id', 'lifecycle_job_id', 'lifecycle_digest') if row.get(k))
             joins.update(resource_ids(row))
-    need(not any(token in canonical(rows).decode() for token in joins for rows in inv.values()),
+    captured = time_value(evidence['capturedAt'])
+    # Closed usage rows are permanent billing history, not a live resource; every other
+    # section keeps the any-mention rule, and an open/unparsable usage row still refuses.
+    live = {**{k: inv[k] for k in ('instances', 'volumes', 'snapshots', 'placements')},
+            'usage': [row for row in inv['usage'] if not closed_usage_row(row, captured)]}
+    need(not any(token in canonical(rows).decode() for token in joins for rows in live.values()),
          'GC live instance or volume/snapshot/usage/placement join')
     matches = [event for event in evidence['proof']['cloudTrail']
                if event.get('eventID') == disposition.get('terminationEventId')]

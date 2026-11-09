@@ -79,6 +79,10 @@ wiring = [
     # Generalized app-tag pin (this PR): restoring a fixed literal or dropping either condition must be killed.
     ('rebase_release.py', "app.get('tag') == app['gitSha'][:12]", "app.get('tag') == '478c66b3559c'", commands['registry_gc.py']),
     ('rebase_release.py', "result['gitSha'] == app['gitSha']", 'True', commands['registry_gc.py']),
+    # Closed-usage absence (this PR): dropping either usage guard must be killed.
+    ('registry_gc.py', 'return False  # open or unparsable usage row is a live join',
+     'return True  # open or unparsable usage row is a live join', commands['registry_gc.py']),
+    ('registry_gc.py', 'return parsed <= captured', 'return True', commands['registry_gc.py']),
 ]
 for filename, before, after, command in wiring:
     path = HERE.parent / filename
