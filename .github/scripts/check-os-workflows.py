@@ -83,6 +83,8 @@ assert not re.search(r'\bvercel\s+(?:alias\s+set|promote)\b', preview_text)
 triggers = preview.get('on', preview.get(True))
 assert set(triggers) == {'push', 'workflow_dispatch'}
 assert triggers['push'] == {'branches': ['preview', 'main'], 'tags': ['v*']}
+# Manual runs take no inputs: each deploys only its own ref's github.sha.
+assert triggers['workflow_dispatch'] is None
 assert preview['permissions'] == {'contents': 'read'}
 assert preview['concurrency'] == {'group': 'os-live-${{ github.ref }}', 'cancel-in-progress': False}
 assert set(preview['jobs']) == {'changes', 'images', 'preview', 'production'}
@@ -132,7 +134,11 @@ assert "['push', 'workflow_dispatch'].includes(run.event)" in lookup['with']['sc
 assert 'Date.parse(b.updated_at) - Date.parse(a.updated_at)' in lookup['with']['script']
 # A union deployment after the preview baseline invalidates its image receipt.
 assert "branch: 'staging/os-union-20261106'" in lookup['with']['script']
-assert 'Date.parse(other.updated_at) >= Date.parse(run.created_at))) return;' in lookup['with']['script']
+assert '!(Date.parse(other.updated_at) < Date.parse(run.created_at)))) return;' in lookup['with']['script']
+# Case variants of admitted refs fail detection, so no image or deploy job runs.
+case_guard = changes['steps'][0]
+assert case_guard['name'] == 'Refuse case variants of admitted refs' and not {'if', 'continue-on-error'} & set(case_guard)
+assert 'for ref in refs/heads/preview refs/heads/main refs/heads/staging/os-union-20261106; do' in case_guard['run']
 # Slash-free artifact names: identical for preview, main and tags; fixed for the union.
 evidence_ref = "${{ github.ref == 'refs/heads/staging/os-union-20261106' && 'staging-os-union-20261106' || github.ref_name }}"
 assert next(step for step in changes['steps'] if step.get('name') == 'Upload live evidence')['with']['name'] == (

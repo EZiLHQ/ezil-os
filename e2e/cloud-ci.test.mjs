@@ -518,6 +518,23 @@ test('only a manual dispatch of the exact staging union joins preview image and 
   }
 });
 
+test('case variants of admitted refs fail change detection before any image or deploy job', () => {
+  const step = previewWorkflow.jobs.find(j => j.name === 'changes').steps[0];
+  const script = step.text.match(/run: \|\n([\s\S]*)$/)[1];
+  for (const [ref, ok] of [
+    [UNION_REF, true], ['refs/heads/preview', true], ['refs/heads/main', true], ['refs/tags/v1.2.3', true],
+    ['refs/heads/feature/x', true], ['refs/heads/Staging/OS-Union-20261106', false],
+    ['refs/heads/STAGING/os-union-20261106', false], ['refs/heads/Preview', false], ['refs/heads/MAIN', false],
+  ]) {
+    const result = runWorkflowScript('bash', ['-e', '-c', script], {env:{PATH:process.env.PATH, GITHUB_REF:ref}});
+    assert.equal(result.status === 0, ok, `${ref}: ${result.output}`);
+  }
+  // Every job that builds or deploys depends on change detection succeeding.
+  for (const name of ['images', 'preview', 'production']) {
+    assert.match(workflowText.match(new RegExp(`\\n  ${name}:\\n[\\s\\S]*?\\n    needs: (.+)\\n`))[1], /changes/);
+  }
+});
+
 test('union evidence artifacts get a slash-free name; preview, main and tag names are unchanged', () => {
   const names = [...workflowText.matchAll(/name: (live-(?:changes|evidence)-\$\{\{ (.+?) \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\})/g)];
   assert.equal(names.length, 3);
@@ -547,6 +564,7 @@ test('a manual union deployment after the preview baseline makes the next previe
     // A failed union run may still have rolled out its container: any later run counts.
     ['preview', [{...union, updated_at:'2026-11-09T10:00:00Z'}], {}],
     ['preview', [{...union, updated_at:'2026-11-09T11:00:00Z', conclusion:'success'}], {}],
+    ['preview', [{...union, updated_at:undefined}], {}],
     ['preview', [{...union, updated_at:'2026-11-09T11:00:00Z', path:'.github/workflows/ci.yml'}],
       {run:'10', sha, artifact:'live-evidence-preview-10-1'}],
     ['main', [{...union, updated_at:'2026-11-09T11:00:00Z'}], {run:'10', sha, artifact:'live-evidence-main-10-1'}],
@@ -596,6 +614,18 @@ test('production tag verification never accepts a tested image receipt from the 
     assert.deepEqual(result, accepted ? {run_id:'41'} : {failed:'No retained tested image evidence from a successful branch deployment'},
       `${head_branch} ${event}`);
   }
+  // A union artifact for the same source is skipped, never chosen, ahead of a valid one.
+  const runs = {41:{id:41, path:'.github/workflows/preview.yml', conclusion:'success', head_sha:sha,
+    head_branch:'staging/os-union-20261106', event:'workflow_dispatch', head_repository:{full_name:'test/os'}}};
+  runs[42] = {...runs[41], id:42, head_branch:'preview', event:'push'};
+  const result = {};
+  await execute({
+    paginate:async () => [41, 42].map(id => ({expired:false, workflow_run:{id, head_sha:sha}})),
+    rest:{actions:{listArtifactsForRepo:{}, getWorkflowRun:async ({run_id}) => ({data:runs[run_id]})}},
+  }, {repo:{owner:'test', repo:'os'}}, {
+    setOutput:(key, value) => { result[key] = value; }, setFailed:assert.fail,
+  }, {env:{IMAGE_SOURCE:sha}});
+  assert.deepEqual(result, {run_id:'42'});
 });
 
 test('failed image push remains drift on an app-only successor; untrusted or absent receipts rebuild', t => {

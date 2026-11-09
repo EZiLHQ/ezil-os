@@ -53,6 +53,15 @@ jobs:
       image_changed: ${{ steps.image_changes.outputs.changed }}
       image_source: ${{ steps.image_changes.outputs.source }}
     steps:
+      # Expression == ignores case; every image and deploy job needs this job.
+      - name: Refuse case variants of admitted refs
+        run: |
+          for ref in refs/heads/preview refs/heads/main refs/heads/staging/os-union-20261106; do
+            if [[ "${GITHUB_REF,,}" == "$ref" && "$GITHUB_REF" != "$ref" ]]; then
+              echo "::error::$GITHUB_REF is a case variant of $ref"
+              exit 1
+            fi
+          done
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -83,7 +92,7 @@ jobs:
                   event: 'workflow_dispatch', per_page: 100,
                 });
                 if (union.data.workflow_runs.some(other => other.path === '.github/workflows/preview.yml'
-                    && Date.parse(other.updated_at) >= Date.parse(run.created_at))) return;
+                    && !(Date.parse(other.updated_at) < Date.parse(run.created_at)))) return;
               }
               core.setOutput('run', String(run.id));
               core.setOutput('sha', run.head_sha);
