@@ -23,7 +23,7 @@ The preparation document gains `releasedPoolHost {poolHostId, lifecycleDigest, r
 ## Prerequisites (release window, not this change)
 1. **Deploy.** Ship the app from this commit. Rebuild and publish all three workflows (lifecycle, preparation, recovery) from this commit with `apply-workflows`. Each state-machine version pins its own Lambda, and each strict-parses the preparation document. If any one is stale, the job fails after the snapshot.
 2. **Active target.** The active target's `previousLowerImageDigest` must equal the computer's lower. For lower 34acdd28 that means re-releasing 1.0.30 with the new workflows, or a later bake with previous = 34acdd28 after the 67c939f0 computers have moved.
-3. **Registry capacity.** The registry holds at most 24 records, and every re-release adds one. Check the current count first.
+3. **Registry capacity.** The registry holds at most 25 records (24 before the twenty-five-record compatible app), and every re-release adds one. Check the current count first.
 4. **Running computers.** Once two records share an AMI and differ only in workflows, matching a running computer by AMI is ambiguous (`release_mismatch`). Stop it through the normal lifecycle first, which releases its host, then use this path.
 
 ## Finding the release execution (read-only)
