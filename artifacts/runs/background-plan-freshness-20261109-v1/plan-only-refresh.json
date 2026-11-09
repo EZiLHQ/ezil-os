@@ -1,9 +1,9 @@
 {
   "taskId": "plan-only-refresh",
   "runId": "background-plan-freshness-20261109-v1",
-  "status": "running",
-  "doneRung": "source + focused regressions, mutation-proved",
-  "evidence": "started: base d89419ae; no tests run yet",
+  "status": "done",
+  "doneRung": "source + focused regressions, mutation-proved; exact-head CI 16/17 (tools triage failure inherited from the candidate's ci.yml line shift, reproduced at 4693f36a 63/1 vs d89419ae 64/0, fixed upstream in 8752c02f)",
+  "evidence": "worker route-auth + ai-proxy 288 pass / 0 fail; app ai-credential + billing-session-sweep handler/route + signout 206 pass / 0 fail, 4 files; worker and app tsc clean. Mutants 11/11 RED then GREEN: plan-only branch removed -> 2 red; signedAt ordering ignored -> 1 red; TTL removed -> 1 red; missing list accepted -> 1 red; plan-only push extends token -> 1 red; plan-only push drops token -> 1 red; failed plan read sent as null -> 1 red; no deadline -> 1 red; reverse pass before plans on a fault -> 2 red; metering-off skips plans -> 1 red; deleted computers listed -> 1 red. Full worker suite 2452/8 under load avg 12 (all 8 real-git/fs 5 s timeouts in untouched files; 88/0 with --timeout 60000); full app suite 10116/0 tests with 2 files unloadable for missing shell/node_modules (54/0 once present).",
   "startedAt": "2026-11-09T17:22:35Z",
-  "updatedAt": "2026-11-09T17:22:35Z"
+  "updatedAt": "2026-11-09T19:12:00Z"
 }
