@@ -1203,7 +1203,8 @@ try {
         respond = (url, options) => options.method === 'GET'
             ? new Promise((resolve, reject) => gates.push({ resolve, reject }))
             : Promise.resolve({ status: 503 });
-        const answer = gate => gate.resolve({ status: 200, ok: true, json: async () => ({ reports }) });
+        const answer = (gate, list = reports) => gate.resolve({ status: 200, ok: true, json: async () => ({ reports: list }) });
+        const stale = [{ ...reports[0], descriptionPreview: 'STALE older answer' }];
         // Settings → Feedback: init loads once; Refresh starts a second load.
         const settings = document.createElement('div');
         settings.innerHTML = feedbackTab.html();
@@ -1217,6 +1218,15 @@ try {
         gates[0].reject(new Error('Could not load your reports. Try again.'));
         await tick(); await tick();
         assert.match(statusHost.textContent, /Desktop froze/, '🔴 an older failed load never replaces the newer list (Settings)');
+        // An older load that succeeds late is discarded too.
+        settings.querySelector('[data-action="refresh-reports"]').click();
+        settings.querySelector('[data-action="refresh-reports"]').click();
+        await until(() => gates.length === 4);
+        answer(gates[3]);
+        await until(() => /Desktop froze/.test(statusHost.textContent));
+        answer(gates[2], stale);
+        await tick(); await tick();
+        assert.doesNotMatch(statusHost.textContent, /STALE/, '🔴 an older successful load never replaces the newer list (Settings)');
         settings.remove();
         // Troubleshoot: same race through its explicit load.
         const pane = document.createElement('div');
@@ -1225,12 +1235,20 @@ try {
         troubleshoot.init($(pane));
         const load = pane.querySelector('[data-action="load-reports"]');
         load.click(); load.click();
-        await until(() => gates.length === 4);
-        answer(gates[3]);
+        await until(() => gates.length === 6);
+        answer(gates[5]);
         await until(() => pane.querySelector('.ezil-feedback-reports li'));
-        gates[2].reject(new Error('Could not load your reports. Try again.'));
+        gates[4].reject(new Error('Could not load your reports. Try again.'));
         await tick(); await tick();
         assert.ok(pane.querySelector('.ezil-feedback-reports li'), '🔴 an older failed load never replaces the newer list (Troubleshoot)');
+        load.click(); load.click();
+        await until(() => gates.length === 8);
+        answer(gates[7]);
+        await until(() => /Desktop froze/.test(pane.querySelector('[data-role="feedback-reports"]').textContent));
+        answer(gates[6], stale);
+        await tick(); await tick();
+        assert.doesNotMatch(pane.querySelector('[data-role="feedback-reports"]').textContent, /STALE/,
+            '🔴 an older successful load never replaces the newer list (Troubleshoot)');
         // Two failed deletes leave one message that does not claim the report is still there.
         window.confirm = () => true;
         const remove = pane.querySelector('.ezil-feedback-reports button');
