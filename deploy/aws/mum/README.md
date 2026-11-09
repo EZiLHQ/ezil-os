@@ -491,27 +491,36 @@ host by its full tuple, otherwise filters multiple aliases by the observed sourc
 AMI, and a unique lower needs no observation.
 
 `registry-gc` collects exactly one record against quiesced, fenced, hash-bound
-evidence. Rule R1 exempts a referencing row from attestation/binding only when every
-occurrence of the candidate's lower digest sits at a typed, allowlisted `(source,
-path)` edge — the pool-host and terminal-execution
-`lifecycle_input`/`input → document → deployment.previousLowerImageDigest`, the
-placement `lower_image_digest` column, and the terminal image-job release/document
-digest fields — **and** a retained record keeps that same lower digest **and** no
-non-terminated instance runs the candidate AMI. The digest at any other source or
-field (a migration, a recovery blob, a bare column, a string prefix before embedded
-JSON) is never exempt; a row that also references a non-digest identity token (AMI,
-state-machine/launch-template/recipe version) is never exempt; `executions`/`imageJobs`
-rows must be terminal and pool hosts retired+settled. If a lower-only row is not
-exempt it keeps its ordinary attestation/binding, and the whole GC is refused when the
-candidate AMI is observably live. R1's safety rests on the app's `resolveRebaseReleases`
-semantics above: a lower-only link resolves identically against any retained alias with
-the same lower. Rule R2 gives an execution's retained data volume a
-`retained-data-volume` disposition only when the volume is a complete, typed, unattached
-non-derived available data volume tagged to its owner, owned by exactly one stopped
-shared-lower placement (resolvable as a stopped computer, sole claimant, no open usage),
-validated against inventory as strictly as every other disposition. `begin_operation`'s
+evidence. Rule R1 exempts a referencing row from attestation/binding by a single oracle:
+decode the row exactly as `references()` does (parsing embedded JSON strings, so a
+`\u`-escaped digest is seen and in-band `$json`/`$substr` markers cannot be forged by a
+data key), delete only the values at the typed allowlisted `(source, path)` edges — the
+pool-host and terminal-execution `lifecycle_input`/`input → document →
+deployment.previousLowerImageDigest`, the placement `lower_image_digest` column, and the
+terminal image-job release/document digest fields — and require that **no** reference to
+the candidate survives, **and** that a retained record keeps that lower digest **and** no
+non-terminated instance runs the candidate AMI. So a digest at any other source or field
+(a migration, a recovery blob, a bare column, a list-wrapped or escaped value), or a row
+that also references a non-digest identity token, is never exempt; `executions`/`imageJobs`
+rows must be terminal and pool hosts retired+settled. The non-digest/prefix rule checks
+only identity tokens longer than 12 characters, so an AMI or ARN hidden in a string
+prefix before embedded JSON is refused while a short `recipeVersion` in a prefix does not
+block. If a lower-only row is not exempt it keeps its ordinary attestation/binding, and
+the whole GC is refused when the candidate AMI is observably live. R1's soundness rests on
+the app's `resolveRebaseReleases` semantics above: a lower-only link resolves identically
+against any retained alias with the same lower. Rule R2 gives an execution's retained data
+volume a `retained-data-volume` disposition only when the volume is a complete, typed,
+unattached (`SnapshotId == ''`, `Attachments == []`), available data volume with
+non-duplicate tags whose `ezil:computer-id` is its owner, owned by exactly one placement
+that is explicitly `STOPPED` (an allowlist, since the app's placement enum has many live
+states), whose exact lower column equals the candidate lower and resolves as a stopped
+computer (kept-alias rule), is the sole claimant across placements, pool hosts and image
+jobs, and has no open usage row — validated against inventory as strictly as every other
+disposition. A released-pool STOP never closes its usage row, so a released-pool owner
+with an open usage row cannot pass R2 (the real owner's usage is closed). `begin_operation`'s
 registry-gc app pin is structural — the plan app tag is the first twelve hex of its app
-gitSha and the live gitSha equals the plan's — not a fixed tag, so GC runs under later plans.
+gitSha and the live gitSha equals the plan's — so it no longer pins a specific reviewed app
+build and GC runs under later plans.
 
 For A3, a maintenance bake keeps its maintenance source lower ID, changes the
 reviewed agent commit, clears both previous parameters, and records

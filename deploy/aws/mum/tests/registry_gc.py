@@ -1153,6 +1153,73 @@ class HistoricalAttestationTests(unittest.TestCase):
         self.rows('providerMigrations', [row])
         self.refuse('referenced record')
 
+    def escaped_digest_json(self):
+        # Embedded JSON whose RAW text omits the literal digest (one char \u-escaped) but which
+        # decodes back to the exact digest -- references() sees it, a literal substring scan cannot.
+        d = self.records[1]['lowerImageDigest']
+        esc = '{"deployment":{"lowerImageDigest":"' + d[:8] + '\\u00' + format(ord(d[8]), '02x') + d[9:] + '"}}'
+        self.assertNotIn(d, esc)
+        self.assertEqual(gc.manifest.loads(esc)['deployment']['lowerImageDigest'], d)
+        return esc
+
+    def test_r1_escaped_digest_in_forbidden_column_refused(self):
+        # B1: a \u-escaped digest in a non-allowlisted column must not slip through a vacuous scan.
+        esc = self.escaped_digest_json()
+        for name, row in (('imageJobs', {'job_id': 'j1', 'phase': 'succeeded', 'recovery_document': esc}),
+                          ('placements', {'id': 'p1', 'state': 'STOPPED', 'unknown_column': esc})):
+            with self.subTest(source=name):
+                self.assertFalse(gc.r1_allowlisted(name, row, self.records[1]))
+                self.rows(name, [row])
+                self.refuse('referenced record')
+
+    def test_r1_mixed_literal_edge_and_escaped_forbidden_refused(self):
+        # B1: a literal digest at an allowlisted edge must not MASK an escaped one elsewhere.
+        esc = self.escaped_digest_json()
+        row = {'job_id': 'j1', 'phase': 'succeeded', 'from_digest': self.records[1]['lowerImageDigest'],
+               'recovery_document': esc}
+        self.assertFalse(gc.r1_allowlisted('imageJobs', row, self.records[1]))
+        self.rows('imageJobs', [row])
+        self.refuse('referenced record')
+
+    def test_r1_forged_marker_keys_refused(self):
+        # N2: $json/$substr are not in-band decision markers; a literal data key of that name
+        # does not forge an allowlisted edge.
+        d = self.records[1]['lowerImageDigest']
+        for row in ({'job_id': 'j1', 'phase': 'succeeded', 'preparation_document': {'$json': {'fromDigest': d}}},
+                    {'job_id': 'j1', 'phase': 'succeeded', 'source_release': {'lowerImageRef': {'$substr': d}}}):
+            with self.subTest(marker=[k for k in row if k not in ('job_id', 'phase')][0]):
+                self.assertFalse(gc.r1_allowlisted('imageJobs', row, self.records[1]))
+                self.rows('imageJobs', [row])
+                self.refuse('referenced record')
+
+    def test_r1_digest_in_a_list_at_edge_refused(self):
+        # A list-wrapped digest at an allowlisted edge is not the typed (string) form; the single
+        # oracle leaves non-string edge values in place so references() still flags it.
+        row = {'job_id': 'j1', 'phase': 'succeeded', 'from_digest': [self.records[1]['lowerImageDigest']]}
+        self.assertTrue(gc.references(row, self.records[1]))
+        self.assertFalse(gc.r1_allowlisted('imageJobs', row, self.records[1]))
+        self.rows('imageJobs', [row])
+        self.refuse('referenced record')
+
+    def test_r1_short_recipe_version_in_prefix_does_not_block(self):
+        # N5/N6: the prefix rule is >12-char tokens only, so a short recipeVersion in a prefix
+        # before embedded JSON does not defeat an otherwise-allowlisted edge.
+        row = {'job_id': 'j1', 'phase': 'succeeded', 'from_digest': self.records[1]['lowerImageDigest'],
+               'note': 'recipe ' + self.records[1]['recipeVersion'] + ' {"ok":1}'}
+        self.assertTrue(gc.r1_allowlisted('imageJobs', row, self.records[1]))
+        self.rows('imageJobs', [row])
+        self.assertEqual(len(self.prepare()['releases']), 7)
+
+    def test_r1_pool_host_must_be_dispatch_settled(self):
+        # E2: a retired pool host that is not dispatch-settled is not exempt.
+        document = json.dumps({'deployment': {'amiId': self.records[-1]['amiId'],
+                                              'previousLowerImageDigest': self.records[1]['lowerImageDigest']}})
+        row = {'id': 'ph-1', 'state': 'retired', 'dispatch_status': 'pending',
+               'lifecycle_input': json.dumps({'document': document})}
+        self.assertFalse(gc.r1_eligible('poolHosts', row))
+        self.rows('poolHosts', [row])
+        self.refuse('referenced record')
+
     def test_r1_pool_host_embedded_json_previous_lower_only_is_exempt(self):
         # Real retired pool hosts carry the reference inside lifecycle_input, a JSON string
         # whose 'document' is itself a JSON string. The lower-only link must survive the
@@ -1312,10 +1379,19 @@ class HistoricalAttestationTests(unittest.TestCase):
             ('zero-owners', [self.r2_volume()], [self.r2_owner(volume_id=other)], (), 'exactly one placement'),
             ('two-owners', [self.r2_volume()], [self.r2_owner(), self.r2_owner(id='pl-2')], (), 'exactly one placement'),
             ('tag-mismatch', [self.r2_volume(Tags=[{'Key': 'ezil:computer-id', 'Value': 'other'}])], [self.r2_owner()], (), 'tag not bound'),
+            ('duplicate-tag-keys', [self.r2_volume(Tags=[{'Key': 'ezil:computer-id', 'Value': 'c-own'},
+             {'Key': 'ezil:computer-id', 'Value': 'c-own'}])], [self.r2_owner()], (), 'complete unattached'),
             ('owner-non-digest', [self.r2_volume()], [self.r2_owner(amiId=cand['amiId'])], (), 'supported shared-lower'),
             ('owner-lower-not-exact', [self.r2_volume()], [self.r2_owner(lower_image_digest=cand['lowerImageDigest'] + 'x')], (), 'supported shared-lower'),
-            ('owner-active', [self.r2_volume()], [self.r2_owner(state='STARTING')], (), 'owner placement is active'),
-            ('conflicting-claimant', [self.r2_volume()], [self.r2_owner(), {'id': 'pl-x', 'note': self.VOLUME}], (), 'conflicting claimant'),
+            ('owner-starting', [self.r2_volume()], [self.r2_owner(state='STARTING')], (), 'not STOPPED'),
+            ('owner-unconfirmed', [self.r2_volume()], [self.r2_owner(state='UNCONFIRMED')], (), 'not STOPPED'),
+            ('owner-recovering', [self.r2_volume()], [self.r2_owner(state='RECOVERING')], (), 'not STOPPED'),
+            ('owner-leased', [self.r2_volume()], [self.r2_owner(state='LEASED')], (), 'not STOPPED'),
+            ('owner-state-missing', [self.r2_volume()], [{'id': 'pl-own', 'computer_id': 'c-own', 'volume_id': self.VOLUME,
+             'lower_image_digest': self.records[1]['lowerImageDigest']}], (), 'not STOPPED'),
+            ('owner-state-empty', [self.r2_volume()], [self.r2_owner(state='')], (), 'not STOPPED'),
+            ('owner-state-lowercase', [self.r2_volume()], [self.r2_owner(state='stopped')], (), 'not STOPPED'),
+            ('conflicting-placement', [self.r2_volume()], [self.r2_owner(), {'id': 'pl-x', 'note': self.VOLUME}], (), 'conflicting claimant'),
             ('open-usage', [self.r2_volume()], [self.r2_owner()], ({'computer_id': 'c-own'},), 'open usage row')]
         for name, volumes, placements, usage, text in cases:
             with self.subTest(case=name):
@@ -1331,9 +1407,22 @@ class HistoricalAttestationTests(unittest.TestCase):
         self.r2_apply([self.r2_volume()], [self.r2_owner()])
         self.refuse('supported shared-lower')
 
-    def test_r2_stale_cas_refused(self):
-        # R2 sits behind the CAS gate: a secret VersionId that differs from the snapshot hits
-        # the stale-evidence refusal before any disposition is examined.
+    def test_r2_imagejob_claimant_refused(self):
+        # N3: any non-owner row naming the volume refuses, image jobs included.
+        self.r2_apply([self.r2_volume()], [self.r2_owner()])
+        self.rows('imageJobs', [{'job_id': 'j1', 'phase': 'succeeded', 'quarantined_volume_id': self.VOLUME}])
+        self.a['resources'][self.instance]['inventorySha256'] = gc.sha(gc.inventory(self.evidence))
+        self.refuse('conflicting claimant')
+
+    def test_r2_released_pool_owner_with_open_usage_refused(self):
+        # N1: a pool-mode STOP never closes the usage row (placement.ts), so a released-pool owner
+        # with an open usage row cannot pass R2; the real owner (4e8347ca) has its usage closed.
+        self.r2_apply([self.r2_volume()], [self.r2_owner()], ({'computer_id': 'c-own'},))
+        self.refuse('open usage row')
+
+    def test_cas_gate_precedes_retained_data_volume(self):
+        # Generic CAS gate (not R2-specific): a secret VersionId differing from the snapshot hits
+        # the stale-evidence refusal in check_evidence, before any disposition is examined.
         self.r2_apply([self.r2_volume()], [self.r2_owner()])
         self.evidence['secretVersionId'] = 'raced-version'
         self.refuse('stale evidence')

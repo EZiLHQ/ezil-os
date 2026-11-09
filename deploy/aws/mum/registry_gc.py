@@ -166,29 +166,29 @@ def candidate_ami_observable(evidence, candidate):
 TERMINAL_IMAGE_JOB_PHASES = frozenset({'succeeded', 'recovered', 'cancelled'})
 
 # Typed (source, path-to-digest) edges where a digest-only link is acceptable, derived EXACTLY
-# from the edges the real-data exemptions use. A path is the dict-key chain to the digest value;
-# '$json' marks a parsed JSON-string boundary and '$substr' a longer string (an ECR ref) that
-# contains the digest. A digest at any other source or path keeps its ordinary proof.
+# from the edges the real-data exemptions use. A path is the key chain, into the row AFTER embedded
+# JSON strings are decoded (so no in-band '$json'/'$substr' markers that a literal data key could
+# forge); the ECR-ref edges name the whole ref string, which carries the digest. A digest at any
+# other source or path keeps its ordinary proof.
 R1_DIGEST_EDGES = {
-    'poolHosts': frozenset({('lifecycle_input', '$json', 'document', '$json', 'deployment', 'previousLowerImageDigest')}),
-    'executions': frozenset({('input', '$json', 'document', '$json', 'deployment', 'previousLowerImageDigest')}),
+    'poolHosts': frozenset({('lifecycle_input', 'document', 'deployment', 'previousLowerImageDigest')}),
+    'executions': frozenset({('input', 'document', 'deployment', 'previousLowerImageDigest')}),
     'placements': frozenset({('lower_image_digest',)}),
     'imageJobs': frozenset({
         ('from_digest',), ('to_digest',),
         ('host_evidence', 'lowerImageDigest'),
-        ('launch_document', '$json', 'deployment', 'lowerImageDigest'),
-        ('launch_document', '$json', 'deployment', 'previousLowerImageDigest'),
-        ('preparation_document', '$json', 'deployment', 'lowerImageDigest'),
-        ('preparation_document', '$json', 'deployment', 'previousLowerImageDigest'),
-        ('preparation_document', '$json', 'fromDigest'),
-        ('preparation_document', '$json', 'toDigest'),
-        ('preparation_document', '$json', 'sourceDeployment', 'lowerImageDigest'),
-        ('preparation_document', '$json', 'sourceDeployment', 'previousLowerImageDigest'),
+        ('launch_document', 'deployment', 'lowerImageDigest'),
+        ('launch_document', 'deployment', 'previousLowerImageDigest'),
+        ('preparation_document', 'deployment', 'lowerImageDigest'),
+        ('preparation_document', 'deployment', 'previousLowerImageDigest'),
+        ('preparation_document', 'fromDigest'), ('preparation_document', 'toDigest'),
+        ('preparation_document', 'sourceDeployment', 'lowerImageDigest'),
+        ('preparation_document', 'sourceDeployment', 'previousLowerImageDigest'),
         ('snapshot_evidence', 'fromDigest'), ('snapshot_evidence', 'toDigest'),
         ('source_release', 'lowerImageDigest'), ('source_release', 'previousLowerImageDigest'),
-        ('source_release', 'lowerImageRef', '$substr'), ('source_release', 'previousLowerImageRef', '$substr'),
+        ('source_release', 'lowerImageRef'), ('source_release', 'previousLowerImageRef'),
         ('target_release', 'lowerImageDigest'), ('target_release', 'previousLowerImageDigest'),
-        ('target_release', 'lowerImageRef', '$substr'), ('target_release', 'previousLowerImageRef', '$substr'),
+        ('target_release', 'lowerImageRef'), ('target_release', 'previousLowerImageRef'),
     }),
 }
 
@@ -208,44 +208,50 @@ def r1_eligible(name, row):
     return name in R1_DIGEST_EDGES
 
 
-def digest_paths(value, digest, prefix=()):
-    """Every path at which `digest` occurs in value, mirroring references()'s detection: a
-    dict-key chain, '$json' at a parsed JSON-string boundary, '$substr' for a longer string that
-    merely contains the digest. Used to confirm the digest sits only at allowlisted edges."""
-    out = []
+def decode_embedded(value):
+    """Deep copy with embedded JSON strings parsed exactly as references() parses them (from the
+    first '{'/'['); an uninterpretable one is kept as a string so references() still flags it."""
     if isinstance(value, dict):
-        for key, child in value.items():
-            out += digest_paths(child, digest, prefix + (key,))
-    elif isinstance(value, list):
-        for child in value:
-            out += digest_paths(child, digest, prefix + ('[*]',))
-    elif isinstance(value, str):
-        if value == digest:
-            out.append(prefix)
-        elif len(digest) > 12 and digest in value:
-            start = min((value.find(c) for c in '{[' if c in value), default=-1)
-            parsed = False
-            if start >= 0:
-                try:
-                    out += digest_paths(manifest.loads(value[start:]), digest, prefix + ('$json',))
-                    parsed = True
-                except (ValueError, TypeError):
-                    pass
-            if not parsed:
-                out.append(prefix + ('$substr',))
-    return out
+        return {k: decode_embedded(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [decode_embedded(v) for v in value]
+    if isinstance(value, str):
+        start = min((value.find(c) for c in '{[' if c in value), default=-1)
+        if start >= 0:
+            try:
+                return decode_embedded(manifest.loads(value[start:]))
+            except (ValueError, TypeError):
+                return value
+    return value
+
+
+def strip_edge(obj, path):
+    """Delete the string value at the typed edge `path` of a decoded row. Non-string values (a
+    list or object forged at an edge) are left in place so references() still sees the digest."""
+    for key in path[:-1]:
+        if not isinstance(obj, dict) or key not in obj:
+            return
+        obj = obj[key]
+    if isinstance(obj, dict) and isinstance(obj.get(path[-1]), str):
+        del obj[path[-1]]
 
 
 def r1_allowlisted(name, value, candidate):
-    """R1 exempts `value` only when the row is eligible (r1_eligible), references the candidate
-    solely through its lower digest with no non-digest token anywhere including a string prefix
-    (references_only_lower), and every occurrence of that digest sits at a typed allowlisted
-    (source, path) edge (R1_DIGEST_EDGES). A digest in any unknown source or field is never
-    exempt and keeps its ordinary binding/attestation requirement."""
+    """R1 exempts `value` only when it is eligible (r1_eligible) and links the candidate solely by
+    its lower digest at typed allowlisted edges. Single oracle: decode the row exactly as
+    references() does, delete only the values at the allowlisted edges, and require that NO
+    reference to the candidate survives -- so an escaped, list-wrapped or mislocated digest, or a
+    digest in any unknown source/field, is still seen and refused. references_only_lower adds the
+    non-digest/prefix rule over the original (references() ignores a string prefix)."""
     if not (r1_eligible(name, value) and references_only_lower(value, candidate)):
         return False
-    allowed = R1_DIGEST_EDGES.get(name)
-    return allowed is not None and all(path in allowed for path in digest_paths(value, candidate['lowerImageDigest']))
+    edges = R1_DIGEST_EDGES.get(name)
+    if edges is None:
+        return False
+    stripped = decode_embedded(value)
+    for path in edges:
+        strip_edge(stripped, path)
+    return not references(stripped, candidate)
 
 
 # Every exemption binds one whole canonical source row. Proof documents are
@@ -377,14 +383,17 @@ def retained_data_volume(evidence, snapshot, candidate, resource, disposition):
     volumes = [v for v in evidence['sources']['volumes']['rows'] if v.get('VolumeId') == resource]
     need(resource.startswith('vol-') and len(volumes) == 1, 'GC retained-data-volume missing/duplicate volume')
     volume = volumes[0]
+    raw_tags = volume.get('Tags') if isinstance(volume.get('Tags'), list) else []
+    keys = [t['Key'] for t in raw_tags if isinstance(t, dict) and 'Key' in t]
     need(type(volume.get('SnapshotId')) is str and volume['SnapshotId'] == ''
          and type(volume.get('Attachments')) is list and volume['Attachments'] == []
-         and volume.get('State') == 'available' and bool(volume.get('VolumeType')),
+         and volume.get('State') == 'available' and bool(volume.get('VolumeType'))
+         and len(set(keys)) == len(keys),
          'GC retained-data-volume not a complete unattached non-derived available data volume')
     owners = [p for p in evidence['sources']['placements']['rows'] if p.get('volume_id') == resource]
     need(len(owners) == 1, 'GC retained-data-volume not owned by exactly one placement')
     owner = owners[0]
-    tags = {t['Key']: t.get('Value') for t in volume.get('Tags', []) if isinstance(t, dict) and 'Key' in t}
+    tags = {t['Key']: t.get('Value') for t in raw_tags if isinstance(t, dict) and 'Key' in t}
     need(bool(owner.get('computer_id')) and tags.get('ezil:computer-id') == owner['computer_id'],
          'GC retained-data-volume tag not bound to the owner computer')
     # The owner's lower must be resolvable the way the app resolves a stopped computer: its exact
@@ -393,9 +402,10 @@ def retained_data_volume(evidence, snapshot, candidate, resource, disposition):
     need(owner.get('lower_image_digest') == candidate['lowerImageDigest']
          and r1_allowlisted('placements', owner, candidate) and shared_lower_kept(snapshot, candidate),
          'GC retained-data-volume owner is not a supported shared-lower placement')
-    need(owner.get('state') not in ('RUNNING', 'STARTING', 'STOPPING'),
-         'GC retained-data-volume owner placement is active')
-    claimants = [r for src in ('placements', 'poolHosts') for r in evidence['sources'][src]['rows']
+    # Allowlist, not denylist: the app's placement enum has many live states (placement.ts), so
+    # only an explicitly STOPPED owner qualifies.
+    need(owner.get('state') == 'STOPPED', 'GC retained-data-volume owner placement is not STOPPED')
+    claimants = [r for src in ('placements', 'poolHosts', 'imageJobs') for r in evidence['sources'][src]['rows']
                  if r is not owner and resource in resource_ids(r)]
     need(not claimants, 'GC retained-data-volume has a conflicting claimant')
     captured = time_value(evidence['capturedAt'])
