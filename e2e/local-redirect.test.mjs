@@ -6,9 +6,17 @@ import { safeLocalRedirect } from './local-redirect.mjs';
 
 const APP = 'http://localhost:3187';
 
-test('accepts only the exact configured local app origin, keeping path and query', () => {
+test('accepts the local app callback at the exact origin, keeping its state query and its fragment', () => {
     assert.equal(safeLocalRedirect('http://localhost:3187/login', APP), 'http://localhost:3187/login');
-    assert.equal(safeLocalRedirect('http://localhost:3187/app/browser?x=1#h', APP), 'http://localhost:3187/app/browser?x=1#h');
+    assert.equal(safeLocalRedirect('http://localhost:3187/api/auth/callback?state=abc123', APP), 'http://localhost:3187/api/auth/callback?state=abc123');
+    assert.equal(safeLocalRedirect('http://localhost:3187/app/browser#section', APP), 'http://localhost:3187/app/browser#section');
+});
+
+test('refuses a same-origin blob: URL and a same-origin URL carrying credentials', () => {
+    assert.equal(safeLocalRedirect('blob:http://localhost:3187/abc', APP), null);
+    assert.equal(safeLocalRedirect('http://user:pass@localhost:3187/cb', APP), null);
+    assert.equal(safeLocalRedirect('http://user@localhost:3187/cb', APP), null); // username only
+    assert.equal(safeLocalRedirect('data:text/html,evil', APP), null);
 });
 
 test('refuses a foreign origin', () => {
