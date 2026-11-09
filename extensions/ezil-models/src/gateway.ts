@@ -632,6 +632,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         } catch { /* An observer never changes the turn or its telemetry. */ }
     };
     const retrying = (error: GatewayError) => { retriedAfter = { error, stage }; report('retrying', error, stage); };
+    // The request and compaction observers, like `report`: a throwing observer never changes the turn.
+    const observe = (call: () => void) => { try { call(); } catch { /* observer only */ } };
     const responses = model.gatewayProtocol === 'openai-responses';
     let stream = (responses || model.model !== 'us.moonshotai.kimi-k3') && model.stream !== false;
     let used = emptyUsage();
@@ -655,7 +657,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         const compact = (first: LocalRequestError, limits: ResolvedModel, cause?: 'remote') => {
             const compacted = compactRequest(request, first, builder(limits), cause);
             compaction = compacted.info;
-            options.onCompact?.(compaction);
+            const info = compaction;
+            observe(() => options.onCompact?.(info));
             return compacted.built;
         };
         let built: ReturnType<ReturnType<typeof builder>>;
@@ -672,7 +675,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         stream = built.body.stream;
         const url = `${provider.baseUrl}/${responses ? 'responses' : 'messages'}`;
         // Callback is for tests/integration, never used for gateway prompt logging.
-        options.onRequest?.(url, built, idempotencyKey);
+        observe(() => options.onRequest?.(url, built, idempotencyKey));
         const headers = { ...authHeaders(provider), 'content-type': 'application/json', accept: stream ? 'text/event-stream' : 'application/json', 'idempotency-key': idempotencyKey };
         const identity = providerIdentity(provider);
         let retried = false;
@@ -701,13 +704,18 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 // Each attempt reports only its own response: a Gateway ID, status, hold or cache verdict from an earlier
                 // attempt (a 429, a resend, the 413 before a compacted resend under a new key) never carries over.
                 if (nextIdempotencyKey !== undefined) {
+                    // Announce the resend, then commit to it only if the caller has not cancelled meanwhile: a
+                    // cancellation here still names the 413 attempt, and the resend is never sent after it.
+                    const next = nextIdempotencyKey;
+                    observe(() => options.onRequest?.(url, built, next));
+                    options.signal.throwIfAborted();
                     previousIdempotencyKey = idempotencyKey;
-                    idempotencyKey = nextIdempotencyKey;
+                    idempotencyKey = next;
                     nextIdempotencyKey = undefined;
                     headers['idempotency-key'] = idempotencyKey;
-                    options.onRequest?.(url, built, idempotencyKey);
                 }
                 requestId = undefined; status = undefined; hold = null; cache = undefined;
+                // No await from here to the fetch: a later cancellation reaches this attempt's own controller.
                 attemptAbort = new AbortController();
                 const sentAt = resendOf ?? performance.now();
                 let response: Response;
@@ -811,7 +819,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                     if (Buffer.from(retry.built.bytes).equals(Buffer.from(refused))) throw refusal;
                     built = retry.built;
                     compaction = retry.info;
-                    options.onCompact?.(compaction);
+                    const info = compaction;
+                    observe(() => options.onCompact?.(info));
                     // The resend is certain now: report the 413 attempt under its own key, Gateway ID and status, so the turn's
                     // recovered or failed record (under the new key) follows a retrying one. The new key takes over only when
                     // the resend starts: a cancellation before then (in this callback, or in the admission wait) reports the

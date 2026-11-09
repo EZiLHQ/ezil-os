@@ -746,6 +746,28 @@ describe('EZiL gateway VS Code bridge', () => {
             await ask([message(1, [context]), message(1, [prompt])]);
             await ask([message(1, [context, prompt]), message(2, [text, a]), message(2, [b]), results]);
             expect(assistantOf(bodies.at(-1)!).content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
+            // A system message among the turn's messages is hoisted out at the Gateway, so it does not split the turn.
+            await ask([user, message(2, [text, a]), message(3, [new TextPart('a synthetic system note')]), message(2, [b]), results]);
+            expect(assistantOf(bodies.at(-1)!).content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
+            // System text is compared as the Gateway receives it, hoisted out in order: its position among the messages
+            // does not matter, its text does.
+            const rules = (value: string) => message(3, [new TextPart(value)]);
+            const asked = message(1, [new TextPart('make two files, with rules')]);
+            await ask([rules('synthetic rules'), asked]);
+            await ask([asked, rules('synthetic rules'), message(2, [text, a, b]), results]);
+            expect(assistantOf(bodies.at(-1)!).content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
+            await ask([rules('other synthetic rules'), asked, message(2, [text, a, b]), results]);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            // A history that ends in an assistant turn: the reply continues that turn (one assistant message at the
+            // Gateway), and the continuation finds the thinking with the earlier calls ahead of the reply's.
+            const earlier = message(2, [new TextPart('Earlier step.'), new ToolCallPart('toolu_z', 'create_file', { filePath: 'z', content: '0' })]);
+            const ending = [message(1, [new TextPart('continue the plan')]), earlier];
+            await ask(ending);
+            await ask([...ending, message(2, [text, a, b]), message(1, [new ToolResultPart('toolu_z', [new TextPart('done')]),
+                new ToolResultPart('toolu_a', [new TextPart('done')]), new ToolResultPart('toolu_b', [new TextPart('done')])])]);
+            const merged = assistantOf(bodies.at(-1)!).content;
+            expect(merged[0]).toEqual({ type: 'thinking', thinking: thought, signature });
+            expect(merged.filter(block => block.type === 'tool_use').map(block => block.id)).toEqual(['toolu_z', 'toolu_a', 'toolu_b']);
             // Split the same way, but not this turn's exact continuation: another chat, a missing call, the calls reordered,
             // or another model. None of these gets the thinking.
             for (const [history, model] of [[[message(1, [new TextPart('an unrelated chat')]), message(2, [text]), message(2, [a, b]), results], claude],
