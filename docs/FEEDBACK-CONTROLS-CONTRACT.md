@@ -195,8 +195,10 @@ Two `localStorage` keys per account, keyed by the opaque account id from
   `persisted`); each entry is sent once even when two flushes overlap. Removed on 200/201;
   dropped on a definitive 4xx (the text then returns to the draft). Storage failures
   (blocked, quota, private mode) only lose the convenience.
-- Each POST has a client deadline, `SEND_TIMEOUT_MS`: 45 s, or 180 s for a body over
-  64 KiB (only a screenshot body can be; metadata is capped at 32 KiB). Hitting it aborts
+- Each POST has a client deadline, `SEND_TIMEOUT_MS`: 45 s, or 180 s when the serialized
+  body exceeds 64 KiB. The choice keys on body length, not on screenshot presence: metadata
+  is capped at 32 KiB, so only a screenshot body can exceed it, but a report with a small
+  image whose whole body stays at or under 64 KiB still gets 45 s. Hitting it aborts
   the request, including a stalled response body, and counts as an unanswered send: the
   entry stays queued, the form unlocks, and Send reuses its `clientRequestId`, which the
   server answers as a replay. Known limits: the 180 s ceiling sets an upload floor of
