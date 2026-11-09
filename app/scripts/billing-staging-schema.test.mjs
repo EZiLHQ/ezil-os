@@ -352,7 +352,8 @@ const productionId = '7568749223372036999';
 const productionUrl = `postgres://postgres:${password}@localhost:5432/postgres`;
 const productionArgs = ['--target', 'aws-production', '--expect-system-id', productionId];
 const neverBaselined = ['docs/aws-computers/sql/0003_pool_hosts_v2.sql.txt', 'app/drizzle/0008_pool_dispatch.sql',
-    'app/drizzle/0009_capacity_demands.sql', 'app/drizzle/0010_migration_restore_progress.sql', 'app/drizzle/0011_feedback.sql'];
+    'app/drizzle/0009_capacity_demands.sql', 'app/drizzle/0010_migration_restore_progress.sql', 'app/drizzle/0011_feedback.sql',
+    'app/drizzle/0019_operator_entitlements.sql', 'app/drizzle/0020_operator_refusal_receipts.sql', 'app/drizzle/0021_standard_trial.sql'];
 function productionHarness(logged = [], actual = productionId) {
     const h = harness(logged, { BILLING_STAGING_DATABASE_URL: productionUrl, PGHOSTADDR: '10.63.20.252', PGSERVICE: 'other' });
     const original = h.options.spawnSyncImpl;
@@ -364,7 +365,7 @@ function productionHarness(logged = [], actual = productionId) {
     return h;
 }
 
-test('pool v2 production baseline refuses before any connection while plan and other baselines still work', { skip: 'os-union merge: production migrates via CI (production-migrations.json snapshots); this runner refuses production (staging model). Superseded runner-apply-on-production test — see promotion report (coordinator decision).' }, () => {
+test('pool v2 production baseline refuses before any connection while plan and other baselines still work', () => {
     for (const mode of [['baseline', '0003_pool_hosts_v2.sql.txt', '--yes'],
         ['baseline', './docs/aws-computers/sql/0003_pool_hosts_v2.sql.txt', '--yes']]) {
         const h = productionHarness();
@@ -378,13 +379,17 @@ test('pool v2 production baseline refuses before any connection while plan and o
     assert.match(h.calls.at(-1).args.at(-1), /'baseline'\);$/);
 });
 
-test('production apply runs every reviewed file in plan order, image rebase included, each pinned and logged', { skip: 'os-union merge: production migrates via CI (production-migrations.json snapshots); this runner refuses production (staging model). Superseded runner-apply-on-production test — see promotion report (coordinator decision).' }, () => {
+test('production apply runs the reviewed files that belong on production (0019-0021 applied), 0012 skipped, each pinned and logged', () => {
+    const applied = files.filter(f => !f.file.endsWith('0012_compute_reverse_moves.sql'));
     const h = productionHarness();
     assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 0);
     assert.equal(h.calls[0].args.at(-1), 'SELECT system_identifier FROM pg_control_system();');
     const migrations = h.calls.slice(3);
-    assert.deepEqual(migrations.map(({ args }) => EXPLICIT_FILES.find(file => args[args.indexOf('-f') + 1].endsWith(`/${file}`))), [...EXPLICIT_FILES]);
+    assert.deepEqual(migrations.map(({ args }) => EXPLICIT_FILES.find(file => args[args.indexOf('-f') + 1].endsWith(`/${file}`))), applied.map(f => f.file));
     assert.ok(EXPLICIT_FILES.includes('docs/aws-computers/sql/0002_image_rebase.sql.txt'));
+    // 0012 (reverse moves) is staging-only on production: skipped, never applied.
+    assert.match(h.output.join('\n'), /0012_compute_reverse_moves\.sql: staging-only on production; skipped/);
+    assert.equal(migrations.some(({ args }) => args.join(' ').includes('0012_compute_reverse_moves')), false);
     for (const { args, settings } of h.calls.slice(1)) {
         const guardIndex = args.findIndex(arg => arg.startsWith('DO $pin$'));
         assert.ok(guardIndex > 0 && args[guardIndex].includes(productionId));
@@ -399,17 +404,18 @@ test('production apply runs every reviewed file in plan order, image rebase incl
         assert.ok(args.includes('--single-transaction'));
         assert.ok(args.findIndex(arg => arg.startsWith('DO $pin$')) < args.indexOf('-f'));
         assert.ok(args.indexOf('-f') < args.lastIndexOf('-c'));
-        assert.ok(args.at(-1).includes(files[index].file) && args.at(-1).includes(files[index].sha256));
+        assert.ok(args.at(-1).includes(applied[index].file) && args.at(-1).includes(applied[index].sha256));
         assert.match(args.at(-1), /INSERT INTO public\.ezil_staging_schema_log .*'apply'\);$/);
     });
-    assert.equal(h.output.filter(line => line.endsWith(': applied')).length, EXPLICIT_FILES.length);
+    assert.equal(h.output.filter(line => line.endsWith(': applied')).length, applied.length);
     assert.equal(h.output.join('\n').includes(password), false);
 });
 
-test('production apply resumes after logged files and stops on the first failure', { skip: 'os-union merge: production migrates via CI (production-migrations.json snapshots); this runner refuses production (staging model). Superseded runner-apply-on-production test — see promotion report (coordinator decision).' }, () => {
+test('production apply resumes after logged files and stops on the first failure', () => {
     const h = productionHarness([row(0), row(1)]);
     assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 0);
-    assert.equal(h.calls.length, 3 + files.length - 2);
+    // 0 and 1 already logged (skipped); 0012 is staging-only on production (skipped); the rest apply.
+    assert.equal(h.calls.length, 3 + files.length - 2 - 1);
     assert.ok(h.calls[3].args[h.calls[3].args.indexOf('-f') + 1].endsWith(files[2].file));
     const failing = productionHarness();
     const successful = failing.options.spawnSyncImpl;
@@ -424,7 +430,7 @@ test('production apply resumes after logged files and stops on the first failure
     assert.equal(failing.output.join('\n').includes(password), false);
 });
 
-test('production apply refuses before any write on a wrong system id, host, URL or pin argument', { skip: 'os-union merge: production migrates via CI (production-migrations.json snapshots); this runner refuses production (staging model). Superseded runner-apply-on-production test — see promotion report (coordinator decision).' }, () => {
+test('production apply refuses before any write on a wrong system id, host, URL or pin argument', () => {
     for (const actual of ['7568749223372036998', '', 'garbage']) {
         const h = productionHarness([], actual);
         assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 1);
@@ -446,7 +452,7 @@ test('production apply refuses before any write on a wrong system id, host, URL 
     }
 });
 
-test('production refuses to baseline any file that must be applied, alone or mixed with allowed files', { skip: 'os-union merge: production migrates via CI (production-migrations.json snapshots); this runner refuses production (staging model). Superseded runner-apply-on-production test — see promotion report (coordinator decision).' }, () => {
+test('production refuses to baseline any file that must be applied, alone or mixed with allowed files', () => {
     for (const file of neverBaselined) {
         for (const name of [file.split('/').at(-1), file, `./${file}`]) {
             for (const requested of [[name], [files[0].file, name]]) {
@@ -472,7 +478,7 @@ test('restore progress follows 0009 and is registered as a production snapshot o
     assert.equal(manifest.migrations.some(migration => migration.path === file), false);
 });
 
-test('restore progress production baseline refuses before connecting', { skip: 'os-union merge: production migrates via CI (production-migrations.json snapshots); this runner refuses production (staging model). Superseded runner-apply-on-production test — see promotion report (coordinator decision).' }, () => {
+test('restore progress production baseline refuses before connecting', () => {
     for (const mode of [['baseline', '0010_migration_restore_progress.sql', '--yes'],
         ['baseline', './app/drizzle/0010_migration_restore_progress.sql', '--yes']]) {
         const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
@@ -482,10 +488,23 @@ test('restore progress production baseline refuses before connecting', { skip: '
     }
 });
 
-test('feedback follows 0010 and is registered as a production snapshot only', { skip: 'os-union merge: production migrates via CI (production-migrations.json snapshots); this runner refuses production (staging model). Superseded runner-apply-on-production test — see promotion report (coordinator decision).' }, () => {
+test('a production log that already has 0000-0011 plans cleanly: only 0019-0021 are pending, 0012 is skipped', () => {
+    // Production reality (public.ezil_staging_schema_log on the prod primary): 0000-0011 and the docs/aws-computers
+    // SQL are applied; 0012 and 0019-0021 are not. Such a log must not make plan or apply refuse.
+    const stagingOrNew = ['0012_compute_reverse_moves.sql', '0019_operator_entitlements.sql', '0020_operator_refusal_receipts.sql', '0021_standard_trial.sql'];
+    const logged = files.filter(f => !stagingOrNew.some(n => f.file.endsWith(n))).map(f => ({ ...f, mode: 'apply' }));
+    assert.equal(run(['plan', ...productionArgs], productionHarness(logged).options), 0);
+    const h = productionHarness(logged);
+    assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 0);
+    const appliedNow = h.output.filter(line => line.endsWith(': applied')).map(line => line.slice(0, line.indexOf(':')));
+    assert.deepEqual(appliedNow, ['app/drizzle/0019_operator_entitlements.sql', 'app/drizzle/0020_operator_refusal_receipts.sql', 'app/drizzle/0021_standard_trial.sql']);
+    assert.match(h.output.join('\n'), /0012_compute_reverse_moves\.sql: staging-only on production; skipped/);
+});
+
+test('feedback follows 0010 and is registered as a production snapshot only', () => {
     const file = 'app/drizzle/0011_feedback.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0010_migration_restore_progress.sql') + 1);
-    assert.equal(EXPLICIT_FILES.at(-1), file);
+    assert.equal(EXPLICIT_FILES.indexOf('app/drizzle/0012_compute_reverse_moves.sql'), EXPLICIT_FILES.indexOf(file) + 1);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     for (const table of ['ezil_feedback_reports', 'ezil_feedback_attachments', 'ezil_feedback_access_log']) {
         assert.match(sql, new RegExp(`CREATE TABLE public\\.${table} \\(`));
@@ -505,7 +524,7 @@ test('feedback production baseline refuses before connecting', () => {
         const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
         assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
         assert.equal(h.calls.length, 0);
-        assert.match(h.output.join('\n'), /staging-only/);
+        assert.match(h.output.join('\n'), /never baselined/);
     }
 });
 
@@ -526,13 +545,21 @@ test('reverse moves follow 0011 and are registered as a production snapshot only
     assert.equal(manifest.migrations.some(migration => migration.path === file), false);
 });
 
-test('reverse moves production apply and baseline refuse before connecting', () => {
-    for (const mode of [['apply', '--yes'], ['baseline', '0012_compute_reverse_moves.sql', '--yes'],
+test('reverse moves (0012) stay staging-only on production: baseline refused, and a full apply skips it', () => {
+    for (const mode of [['baseline', '0012_compute_reverse_moves.sql', '--yes'],
         ['baseline', './app/drizzle/0012_compute_reverse_moves.sql', '--yes']]) {
         const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
         assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
         assert.equal(h.calls.length, 0);
-        assert.match(h.output.join('\n'), /staging-only/);
+        assert.match(h.output.join('\n'), /staging-only; production apply\/baseline is forbidden/);
+    }
+    // A full production apply succeeds but NEVER applies 0012 (it is skipped), while 0019-0021 do apply.
+    const h = productionHarness();
+    assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 0);
+    assert.match(h.output.join('\n'), /0012_compute_reverse_moves\.sql: staging-only on production; skipped/);
+    assert.equal(h.output.join('\n').includes('0012_compute_reverse_moves.sql: applied'), false);
+    for (const f of ['0019_operator_entitlements.sql', '0020_operator_refusal_receipts.sql', '0021_standard_trial.sql']) {
+        assert.ok(h.output.join('\n').includes(`${f}: applied`));
     }
 });
 
@@ -560,12 +587,12 @@ test('operator entitlements follow 0012, stay additive, server-only and a produc
     assert.equal(manifest.migrations.some(migration => migration.path === file), false);
 });
 
-test('operator entitlements production apply and baseline refuse before connecting', () => {
+test('operator entitlements (0019) production baseline refuses: it must be applied, never baselined', () => {
     for (const mode of [['baseline', '0019_operator_entitlements.sql', '--yes'], ['baseline', './app/drizzle/0019_operator_entitlements.sql', '--yes']]) {
         const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
         assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
         assert.equal(h.calls.length, 0);
-        assert.match(h.output.join('\n'), /staging-only/);
+        assert.match(h.output.join('\n'), /never baselined/);
     }
 });
 
@@ -584,13 +611,13 @@ test('operator refusal receipts follow immutable 0019 and are a production snaps
     assert.equal(manifest.migrations.some(migration => migration.path === file), false);
 });
 
-test('operator refusal receipts production apply and baseline refuse before connecting', () => {
-    for (const mode of [['apply', '--yes'], ['baseline', '0020_operator_refusal_receipts.sql', '--yes'],
+test('operator refusal receipts (0020) production baseline refuses: it must be applied, never baselined', () => {
+    for (const mode of [['baseline', '0020_operator_refusal_receipts.sql', '--yes'],
         ['baseline', './app/drizzle/0020_operator_refusal_receipts.sql', '--yes']]) {
         const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
         assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
         assert.equal(h.calls.length, 0);
-        assert.match(h.output.join('\n'), /staging-only/);
+        assert.match(h.output.join('\n'), /never baselined/);
     }
 });
 
@@ -644,11 +671,11 @@ test('the Standard trial follows 0020, stays additive and is a production snapsh
     assert.equal(manifest.migrations.some(migration => migration.path === file), false);
 });
 
-test('Standard trial production apply and baseline refuse before connecting', () => {
+test('Standard trial (0021) production baseline refuses: it must be applied, never baselined', () => {
     for (const mode of [['baseline', '0021_standard_trial.sql', '--yes'], ['baseline', './app/drizzle/0021_standard_trial.sql', '--yes']]) {
         const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost:5432/postgres' });
         assert.equal(run([...mode, '--target', 'aws-production', '--expect-system-id', previewId], h.options), 1);
         assert.equal(h.calls.length, 0);
-        assert.match(h.output.join('\n'), /staging-only/);
+        assert.match(h.output.join('\n'), /never baselined/);
     }
 });
