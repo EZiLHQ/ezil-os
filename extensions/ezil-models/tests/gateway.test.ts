@@ -218,6 +218,7 @@ describe('gateway errors and credits', () => {
         [401, 'os_session_missing', 'this account has no EZiL AI access, or this computer has not received your sign-in'], [401, 'os_proxy_unauthorized', 'EZiL OS: This computer’s AI connection was refused'],
         [403, 'not_a_member', 'membership'], [403, 'account_suspended', 'suspended'], [413, 'input_too_large', 'EZiL AI: This conversation is too large for qwen. EZiL AI refused it before the model ran, so it was not charged, and the conversation is kept. Shorten your last message'],
         [400, 'unsupported_bedrock_converse_request', 'Internal EZiL Models bug (unsupported_bedrock_converse_request)'],
+        [400, 'unsupported_gemini_request', 'Internal EZiL Models bug (unsupported_gemini_request)'],
         [503, 'killswitch', 'paused'], [503, 'paused', 'paused'], [503, 'no_provider_route', 'temporarily unavailable'], [504, 'upstream_timeout', 'did not answer'], [409, 'idempotency_replay', 'already processed'],
     ] as const) test(`maps ${code}, always preserving request ID`, () => {
         const e = describeGatewayError('qwen', status, null, { code, request_id: 'body-id' }, 'header-id');

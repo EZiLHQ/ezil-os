@@ -436,7 +436,7 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
         case 'not_a_member': case 'role_mismatch': case 'forbidden': return make('Your EZiL account does not have AI membership');
         case 'account_suspended': case 'suspended': return make('AI access is suspended for your EZiL account');
         case 'input_too_large': case 'body_too_large': return tooLarge();
-        case 'unsupported_bedrock_converse_request': case 'unsupported_parameter': case 'invalid_request':
+        case 'unsupported_bedrock_converse_request': case 'unsupported_gemini_request': case 'unsupported_parameter': case 'invalid_request':
         case 'max_output_tokens_invalid': case 'idempotency_conflict': case 'idempotency_key_required':
             return make(`Internal EZiL Models bug (${code}); please report it`);
         case 'killswitch': return make(body.pause === 'reconciliation' ? 'AI is paused while usage is reconciled' : 'AI is paused by operations');
