@@ -333,7 +333,7 @@ test('production requires both production aliases to resolve the exact returned 
 });
 
 const { imagePlan } = await import('../.github/scripts/image-plan.mjs');
-const { readState, readWorkerState, assertWorkerOwner, pullCloudflareImage, restoreVercel, captureContainerVersion, candidateRolloutDigest } = await import('../.github/scripts/release-state.mjs');
+const { readState, readWorkerState, assertWorkerOwner, workerVersionId, pullCloudflareImage, restoreVercel, captureContainerVersion, candidateRolloutDigest } = await import('../.github/scripts/release-state.mjs');
 
 test('image keys rebuild changed base and branding independently without changing local pins', () => {
   const tree = p => `${p}-original`;
@@ -404,6 +404,16 @@ test('Worker-only state reads Cloudflare identity, strips configuration and neve
   assert.equal(JSON.stringify(state).includes('do-not-store'), false);
   assert.ok(seen.length > 0 && seen.every(hostname => hostname === 'api.cloudflare.com'));
   await assert.rejects(readWorkerState(env, async () => ({ ok: false, status: 403 })), /HTTP 403/);
+});
+
+test('Worker version id is validated before it reaches the rollback shell command', () => {
+  const uuid = 'a1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d';
+  assert.equal(workerVersionId(uuid), uuid);
+  // A newline would inject extra GITHUB_OUTPUT lines; a quote would break out of
+  // the wrangler rollback quoting. Both, and non-UUID shapes, are refused.
+  for (const bad of ['', 'version-test', `${uuid}\nmalicious=1`, `${uuid}'; echo hi`, undefined]) {
+    assert.throws(() => workerVersionId(bad), /Unexpected Worker version id/);
+  }
 });
 
 test('Worker-only container rollback is gated by the Worker owner check and no-ops on an unchanged image', async () => {
@@ -979,6 +989,7 @@ test('failed lease acquisition skips snapshots, deployments, recovery and live c
     ['preview', 'refs/heads/preview', 'lease'],
     ['production', 'refs/heads/main', 'production_lease'],
     ['production', 'refs/tags/v1.2.3', 'production_lease'],
+    ['worker-production', 'refs/heads/main', 'production_lease'],
   ]) {
     const job = previewWorkflow.jobs.find(job => job.name === name);
     const acquire = job.steps.findIndex(step => step.text.includes(`id: ${leaseId}\n`));
@@ -1002,7 +1013,7 @@ test('failed lease acquisition skips snapshots, deployments, recovery and live c
 });
 
 test('lease release runs after failure or cancellation only when this run acquired it', () => {
-  for (const [name, leaseId] of [['preview', 'lease'], ['production', 'production_lease']]) {
+  for (const [name, leaseId] of [['preview', 'lease'], ['production', 'production_lease'], ['worker-production', 'production_lease']]) {
     const release = previewWorkflow.jobs.find(job => job.name === name).steps.at(-1);
     const condition = release.text.match(/^if: (.+)$/m)[1];
     for (const outcome of ['success', 'failure', 'cancelled', 'skipped']) {

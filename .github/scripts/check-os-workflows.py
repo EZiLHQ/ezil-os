@@ -536,6 +536,12 @@ assert wsteps[-1] == wrelease
 # Capture prior Worker and container identity before any mutation; archive it.
 wcapture = wby_id['worker_capture']
 assert wcapture['run'] == 'node .github/scripts/release-state.mjs worker-capture'
+# The shared lease fences every mutation: its AWS credentials and the acquire step
+# are unconditional and come before the first identity capture, so no mutation can
+# run outside the lease.
+for step in (wcreds[0], wby_id['production_lease']):
+    assert not {'if', 'continue-on-error', 'shell'} & set(step)
+assert wpos(wcreds[0]) < wpos(wby_id['production_lease']) < wpos(wcapture)
 assert wby_name['Preserve recovery identities before Worker mutation']['with']['if-no-files-found'] == 'error'
 # Superseded-main guard before the deploy: a github-script check plus the in-step gh api recheck.
 wcurrent = wby_id['current_main']

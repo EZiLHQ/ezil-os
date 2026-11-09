@@ -199,6 +199,14 @@ export async function candidateRolloutDigest(images, env, {
 export function assertWorkerOwner(previous, state, sha) {
   assert.ok(state.worker_version === previous.worker_version || state.worker_source === sha, 'Another Worker release owns production');
 }
+// Cloudflare Worker version ids are UUIDs. The Worker-only rollback target is
+// interpolated into a shell `wrangler rollback '<id>'` through GITHUB_OUTPUT, so
+// reject anything that could inject an output line or break the quoting before it
+// is written (the legacy previous_worker step validated the same shape in jq).
+export function workerVersionId(id) {
+  assert.match(id ?? '', /^[a-f0-9-]{36}$/, 'Unexpected Worker version id');
+  return id;
+}
 export function assertRollbackOwner(previous, state, sha) {
   assertWorkerOwner(previous, state, sha);
   assert.ok(state.vercel_deployment === previous.vercel_deployment || state.vercel_source === sha, 'Another Vercel release owns production');
@@ -269,7 +277,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     // container image. No Vercel, so this never reads os.ezil.work or VERCEL_*.
     const state = await readWorkerState(env);
     fs.writeFileSync('previous-release.json', JSON.stringify(state, null, 2));
-    if (env.GITHUB_OUTPUT) fs.appendFileSync(env.GITHUB_OUTPUT, `worker_version=${state.worker_version}\n`);
+    if (env.GITHUB_OUTPUT) fs.appendFileSync(env.GITHUB_OUTPUT, `worker_version=${workerVersionId(state.worker_version)}\n`);
   } else if (mode === 'worker-rollback-guard') {
     // Admit Worker recovery only while this release (or the untouched previous one)
     // still owns production; never clobber a third release that deployed meanwhile.
