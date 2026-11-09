@@ -87,6 +87,39 @@ export async function readState(env, fetchImpl = fetch) {
       digest:container.configuration.image.match(/@(sha256:[a-f0-9]{64})$/)?.[1] ?? null},
   };
 }
+// Cloudflare-only identity for the Worker-only production path: the active Worker
+// version, its git source annotation, and the production container image. It reads
+// no Vercel, so a Worker-only deploy never asserts VERCEL_* or touches os.ezil.work.
+// Fetch order and keys mirror readState's Worker/container half exactly.
+export async function readWorkerState(env, fetchImpl = fetch) {
+  for (const key of ['CLOUDFLARE_ACCOUNT_ID','CLOUDFLARE_API_TOKEN']) assert.ok(env[key], `Missing ${key}`);
+  const request = async (url, token) => {
+    const r = await fetchImpl(url, {headers: {authorization: `Bearer ${token}`}, redirect:'error', signal:AbortSignal.timeout(15000)});
+    assert.ok(r.ok, `Provider readback HTTP ${r.status}`);
+    return r.json();
+  };
+  const cf = `https://api.cloudflare.com/client/v4/accounts/${env.CLOUDFLARE_ACCOUNT_ID}`;
+  const worker = `${cf}/workers/scripts/ezil-os-worker`;
+  const list = await request(`${worker}/deployments`, env.CLOUDFLARE_API_TOKEN);
+  assert.equal(list.success, true);
+  const active = list.result?.deployments?.[0];
+  assert.equal(active?.versions?.length, 1, 'Split Worker deployment');
+  assert.equal(active.versions[0].percentage, 100);
+  const version = await request(`${worker}/versions/${encodeURIComponent(active.versions[0].version_id)}`, env.CLOUDFLARE_API_TOKEN);
+  assert.equal(version.success, true);
+  const containers = await request(`${cf}/containers/applications`, env.CLOUDFLARE_API_TOKEN);
+  const apps = containers.result ?? containers;
+  assert.ok(Array.isArray(apps), 'Expected Containers applications list');
+  const container = apps.find(a => a.name === 'ezil-os-worker-sandbox');
+  assert.ok(container?.configuration?.image, 'Production container image missing');
+  return {
+    worker_version: active.versions[0].version_id,
+    worker_deployment: active.id ?? null,
+    worker_source: version.result.annotations?.['workers/message']?.match(/^git:([a-f0-9]{40})$/)?.[1] ?? null,
+    cloudflare_container: {id:container.id, image:container.configuration.image,
+      digest:container.configuration.image.match(/@(sha256:[a-f0-9]{64})$/)?.[1] ?? null},
+  };
+}
 export async function pullCloudflareImage(image, env, fetchImpl = fetch, exec = execFileSync) {
   assert.match(env.CLOUDFLARE_ACCOUNT_ID, /^[a-f0-9]{32}$/);
   assert.ok(image.startsWith(`registry.cloudflare.com/${env.CLOUDFLARE_ACCOUNT_ID}/`));
@@ -163,12 +196,15 @@ export async function candidateRolloutDigest(images, env, {
   }
   throw new Error('No distinct container rollout appeared after deployment');
 }
-export function assertRollbackOwner(previous, state, sha) {
+export function assertWorkerOwner(previous, state, sha) {
   assert.ok(state.worker_version === previous.worker_version || state.worker_source === sha, 'Another Worker release owns production');
+}
+export function assertRollbackOwner(previous, state, sha) {
+  assertWorkerOwner(previous, state, sha);
   assert.ok(state.vercel_deployment === previous.vercel_deployment || state.vercel_source === sha, 'Another Vercel release owns production');
 }
-export async function restoreContainer(previous, state, env, fetchImpl = fetch) {
-  assertRollbackOwner(previous, state, env.EZIL_DEPLOY_SHA);
+export async function restoreContainer(previous, state, env, fetchImpl = fetch, assertOwner = assertRollbackOwner) {
+  assertOwner(previous, state, env.EZIL_DEPLOY_SHA);
   assert.equal(state.cloudflare_container.id, previous.cloudflare_container.id, 'Container application was replaced');
   const image = previous.cloudflare_container.image;
   assert.match(image, /@sha256:[a-f0-9]{64}$/, 'Previous container must have an immutable digest');
@@ -228,6 +264,28 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   } else if (mode === 'vercel-rollback') {
     const previous = JSON.parse(fs.readFileSync('previous-release.json', 'utf8'));
     console.log(JSON.stringify(await restoreVercel(previous, env)));
+  } else if (mode === 'worker-capture') {
+    // Worker-only pre-deploy snapshot: Worker version (also the rollback target) and
+    // container image. No Vercel, so this never reads os.ezil.work or VERCEL_*.
+    const state = await readWorkerState(env);
+    fs.writeFileSync('previous-release.json', JSON.stringify(state, null, 2));
+    if (env.GITHUB_OUTPUT) fs.appendFileSync(env.GITHUB_OUTPUT, `worker_version=${state.worker_version}\n`);
+  } else if (mode === 'worker-rollback-guard') {
+    // Admit Worker recovery only while this release (or the untouched previous one)
+    // still owns production; never clobber a third release that deployed meanwhile.
+    const previous = JSON.parse(fs.readFileSync('previous-release.json', 'utf8'));
+    assertWorkerOwner(previous, await readWorkerState(env), env.EZIL_DEPLOY_SHA);
+  } else if (mode === 'worker-container-rollback') {
+    const previous = JSON.parse(fs.readFileSync('previous-release.json', 'utf8'));
+    const result = await restoreContainer(previous, await readWorkerState(env), env, fetch, assertWorkerOwner);
+    fs.writeFileSync('container-rollback.json', JSON.stringify(result, null, 2));
+  } else if (mode === 'worker-rollback-check') {
+    const previous = JSON.parse(fs.readFileSync('previous-release.json', 'utf8'));
+    const state = await readWorkerState(env);
+    fs.writeFileSync('rollback-state.json', JSON.stringify(state, null, 2));
+    assert.equal(state.worker_version, previous.worker_version, 'Worker rollback incomplete');
+    assert.equal(state.cloudflare_container.image, previous.cloudflare_container.image,
+      'Container rollback incomplete; operator must restore previous-release.json container image. Never reverse SQL.');
   } else {
     const state = await readState(env);
     if (mode === 'capture') fs.writeFileSync('previous-release.json', JSON.stringify(state,null,2));

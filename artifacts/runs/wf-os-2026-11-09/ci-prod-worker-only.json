@@ -1,0 +1,9 @@
+{
+  "taskId": "ci-prod-worker-only",
+  "runId": "wf-os-2026-11-09",
+  "status": "running",
+  "doneRung": "workflow-validators-and-release-contract-tests-green",
+  "evidence": "Increment 1 landed: release-state.mjs gains Cloudflare-only readWorkerState + assertWorkerOwner (assertRollbackOwner now delegates it) + restoreContainer owner-injection param + worker-capture/worker-rollback-guard/worker-container-rollback/worker-rollback-check CLI modes. cloud-ci.test.mjs: +3 tests. node --test e2e/cloud-ci.test.mjs = 124 pass / 0 fail / 1 pre-existing docker-gated skip (baseline was 121 pass + 1 skip; behavior-preserving). Mutation-proved assertWorkerOwner: weakened guard -> 2 RED, restored -> GREEN. Next: new worker-production job in preview.yml + contract registration + validators.",
+  "startedAt": "2026-11-09T11:31:21Z",
+  "updatedAt": "2026-11-09T11:52:00Z"
+}
