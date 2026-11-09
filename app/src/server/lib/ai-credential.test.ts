@@ -6,6 +6,9 @@ import {
     AI_CREDENTIAL_REFRESH_BEFORE_MS,
     AI_LOGOUT_TIMEOUT_MS,
     AI_PLAN_REFRESH_BUDGET_MS,
+    AI_PLAN_REFRESH_LIMIT,
+    AI_PLAN_REFRESH_MIN_REACH,
+    aiPlanRefreshSlice,
     deleteAiCredential,
     revokeAiCredentialsOnSignout,
     currentAccessToken,
@@ -242,7 +245,13 @@ describe('refreshAiPlans (the server plan refresh, no browser)', () => {
     const PAID = 'b0b0b0b0-0000-4000-8000-000000000000';
     const FREE_OWNER = 'f0f0f0f0-0000-4000-8000-000000000000';
     const BROKEN = 'e0e0e0e0-0000-4000-8000-000000000000';
-    const C = (n: number) => `${n}${n}${n}${n}${n}${n}${n}${n}-1111-4111-8111-111111111111`;
+    const C = (n: number) => `${String(n).padStart(8, '0')}-1111-4111-8111-111111111111`;
+    type Row = { userId: string; computerId: string };
+    /** The route's source over an in-memory table, already in its stable order. */
+    const source = (rows: readonly Row[]) => ({
+        count: vi.fn(async () => rows.length),
+        page: vi.fn(async (offset: number, limit: number) => rows.slice(offset, offset + limit)),
+    });
     function worker(answer: (sandbox: string) => Response | Promise<Response> = () => Response.json({ ok: true, planStored: true })) {
         const sent: { sandbox: string; body: unknown; signature: string; raw: string }[] = [];
         const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
@@ -258,9 +267,9 @@ describe('refreshAiPlans (the server plan refresh, no browser)', () => {
     it("pushes each computer only its owner's current list, signed, with no token; one plan read per owner", async () => {
         const { sent, fetchImpl } = worker();
         const includedModelsFor = vi.fn(async (userId: string) => userId === FREE_OWNER ? FREE : null);
-        const counts = await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl, includedModelsFor,
-            listComputers: async () => [{ userId: FREE_OWNER, computerId: C(1) }, { userId: PAID, computerId: C(2) }, { userId: FREE_OWNER, computerId: C(3) }] });
-        expect(counts).toEqual({ computers: 3, pushed: 3, stored: 3, unknown: 0, failed: 0 });
+        const counts = await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl, includedModelsFor, pass: 0,
+            computers: source([{ userId: FREE_OWNER, computerId: C(1) }, { userId: PAID, computerId: C(2) }, { userId: FREE_OWNER, computerId: C(3) }]) });
+        expect(counts).toEqual({ eligible: 3, computers: 3, pushed: 3, stored: 3, unknown: 0, failed: 0 });
         expect(includedModelsFor.mock.calls.map(([u]) => u).sort()).toEqual([FREE_OWNER, PAID].sort());
         const bySandbox = new Map(sent.map((s) => [s.sandbox, s]));
         expect(bySandbox.get(deriveGuacamoleSandboxId(FREE_OWNER, C(1)))!.body).toEqual({ includedModels: FREE });
@@ -273,16 +282,33 @@ describe('refreshAiPlans (the server plan refresh, no browser)', () => {
         }
     });
 
+    it('signs each push at its plan read, so a browser beat that read the plan later wins', async () => {
+        vi.useFakeTimers();
+        try {
+            vi.setSystemTime(1_800_000_000_000);
+            const { sent, fetchImpl } = worker();
+            const result = refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl, pass: 0,
+                includedModelsFor: () => new Promise((resolve) => setTimeout(() => resolve(FREE), 3_000)),
+                computers: source([{ userId: FREE_OWNER, computerId: C(1) }]) });
+            await vi.advanceTimersByTimeAsync(3_000);
+            await result;
+            expect(sent).toHaveLength(1);
+            expect(sent[0]!.signature).toBe(mintAiCredentialSignature(SECRET, sent[0]!.sandbox, sent[0]!.raw, 1_800_000_000_000));
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
     it('a plan that cannot be read sends nothing for that owner (never null), and other owners still refresh', async () => {
         const { sent, fetchImpl } = worker();
-        const counts = await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl,
+        const counts = await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl, pass: 0,
             includedModelsFor: async (userId) => {
                 if (userId === BROKEN) return undefined;
                 if (userId === PAID) throw new Error('billing down');
                 return FREE;
             },
-            listComputers: async () => [{ userId: BROKEN, computerId: C(1) }, { userId: PAID, computerId: C(2) }, { userId: FREE_OWNER, computerId: C(3) }] });
-        expect(counts).toEqual({ computers: 3, pushed: 1, stored: 1, unknown: 2, failed: 0 });
+            computers: source([{ userId: BROKEN, computerId: C(1) }, { userId: PAID, computerId: C(2) }, { userId: FREE_OWNER, computerId: C(3) }]) });
+        expect(counts).toEqual({ eligible: 3, computers: 3, pushed: 1, stored: 1, unknown: 2, failed: 0 });
         expect(sent.map((s) => [s.sandbox, s.body])).toEqual([[deriveGuacamoleSandboxId(FREE_OWNER, C(3)), { includedModels: FREE }]]);
     });
 
@@ -291,23 +317,26 @@ describe('refreshAiPlans (the server plan refresh, no browser)', () => {
         const { sent, fetchImpl } = worker((sandbox) => sandbox === refused
             ? Response.json({ ok: false, error: 'invalid_access_token' }, { status: 400 })
             : Response.json({ ok: true, planStored: false }));
-        const counts = await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl, includedModelsFor: async () => null,
-            listComputers: async () => [{ userId: PAID, computerId: C(1) }, { userId: PAID, computerId: C(2) }] });
-        expect(counts).toEqual({ computers: 2, pushed: 1, stored: 0, unknown: 0, failed: 1 });
+        const counts = await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl, includedModelsFor: async () => null, pass: 0,
+            computers: source([{ userId: PAID, computerId: C(1) }, { userId: PAID, computerId: C(2) }]) });
+        expect(counts).toEqual({ eligible: 2, computers: 2, pushed: 1, stored: 0, unknown: 0, failed: 1 });
         expect(sent).toHaveLength(2);
     });
 
     it('never throws, and sends nothing when unconfigured or the listing fails', async () => {
         const { sent, fetchImpl } = worker();
-        const listComputers = vi.fn(async () => [{ userId: PAID, computerId: C(1) }]);
-        const zero = { computers: 0, pushed: 0, stored: 0, unknown: 0, failed: 0 };
-        expect(await refreshAiPlans({ config: { ...CONFIG, isConfigured: false }, hmacSecret: SECRET, fetchImpl, listComputers, includedModelsFor: async () => null })).toEqual(zero);
-        expect(await refreshAiPlans({ config: CONFIG, hmacSecret: '', fetchImpl, listComputers, includedModelsFor: async () => null })).toEqual(zero);
-        expect(listComputers).not.toHaveBeenCalled();
-        expect(await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl, includedModelsFor: async () => null,
-            listComputers: async () => { throw new Error('db down'); } })).toEqual(zero);
+        const computers = source([{ userId: PAID, computerId: C(1) }]);
+        const zero = { eligible: 0, computers: 0, pushed: 0, stored: 0, unknown: 0, failed: 0 };
+        expect(await refreshAiPlans({ config: { ...CONFIG, isConfigured: false }, hmacSecret: SECRET, fetchImpl, computers, pass: 0, includedModelsFor: async () => null })).toEqual(zero);
+        expect(await refreshAiPlans({ config: CONFIG, hmacSecret: '', fetchImpl, computers, pass: 0, includedModelsFor: async () => null })).toEqual(zero);
+        expect(computers.count).not.toHaveBeenCalled();
+        for (const broken of [{ ...computers, count: async () => { throw new Error('db down'); } },
+            { ...computers, page: async () => { throw new Error('db down'); } }]) {
+            expect(await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl, includedModelsFor: async () => null, pass: 0, computers: broken }))
+                .toMatchObject({ computers: 0, pushed: 0 });
+        }
         const transport = vi.fn(async () => { throw new Error('offline'); }) as unknown as typeof fetch;
-        expect(await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl: transport, listComputers, includedModelsFor: async () => null }))
+        expect(await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl: transport, computers, pass: 0, includedModelsFor: async () => null }))
             .toMatchObject({ computers: 1, pushed: 0, failed: 1 });
         expect(sent).toHaveLength(0);
     });
@@ -320,15 +349,106 @@ describe('refreshAiPlans (the server plan refresh, no browser)', () => {
                 signals.push(init!.signal!);
                 return new Promise<Response>((_resolve, reject) => init!.signal!.addEventListener('abort', () => reject(new Error('aborted'))));
             });
-            const listed = Array.from({ length: 20 }, (_, i) => ({ userId: PAID, computerId: C(i % 9 + 1) }));
+            const listed = Array.from({ length: 200 }, (_, i) => ({ userId: PAID, computerId: C(i) }));
             const result = refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl: fetchImpl as unknown as typeof fetch,
-                includedModelsFor: async () => null, listComputers: async () => listed });
+                includedModelsFor: async () => null, computers: source(listed), pass: 0 });
             await vi.advanceTimersByTimeAsync(AI_PLAN_REFRESH_BUDGET_MS);
-            await expect(result).resolves.toMatchObject({ computers: 20, pushed: 0 });
-            expect(fetchImpl).toHaveBeenCalledTimes(8);
+            await expect(result).resolves.toMatchObject({ computers: 200, pushed: 0 });
+            // Every push hangs to its own 5 s timeout: 8 in flight, four rounds in the budget.
+            expect(fetchImpl).toHaveBeenCalledTimes(AI_PLAN_REFRESH_MIN_REACH);
             expect(signals.every((s) => s.aborted)).toBe(true);
         } finally {
             vi.useRealTimers();
         }
+    });
+
+    it.each(['count', 'page'] as const)('a listing (%s) that never answers settles at the budget, and pushes nothing when it answers late', async (stuck) => {
+        vi.useFakeTimers();
+        try {
+            const { sent, fetchImpl } = worker();
+            const rows = [{ userId: PAID, computerId: C(1) }];
+            let release!: () => void;
+            const gate = new Promise<void>((resolve) => { release = resolve; });
+            const computers = source(rows);
+            if (stuck === 'count') computers.count.mockImplementation(async () => { await gate; return rows.length; });
+            else computers.page.mockImplementation(async () => { await gate; return rows; });
+            let settled = false;
+            const result = refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl, includedModelsFor: async () => null, computers, pass: 0 })
+                .then((counts) => { settled = true; return counts; });
+            await vi.advanceTimersByTimeAsync(AI_PLAN_REFRESH_BUDGET_MS - 1);
+            expect(settled).toBe(false);
+            await vi.advanceTimersByTimeAsync(1);
+            expect(settled).toBe(true);
+            await expect(result).resolves.toMatchObject({ computers: 0, pushed: 0 });
+            release();
+            await vi.advanceTimersByTimeAsync(10_000);
+            expect(sent).toHaveLength(0);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    describe('fair selection across passes (aiPlanRefreshSlice)', () => {
+        /** Which rows the passes from `from` reach, when each pass reaches only its first `reach` rows. */
+        const reached = (n: number, from: number, passes: number, reach: number) => {
+            const seen = new Set<number>();
+            for (let pass = from; pass < from + passes; pass++) {
+                const { start, take } = aiPlanRefreshSlice(n, pass);
+                for (let i = 0; i < Math.min(take, reach); i++) seen.add((start + i) % n);
+            }
+            return seen.size;
+        };
+
+        it('takes at most the limit; passes that finish reach all of up to 7,468 rows in any 15 in a row', () => {
+            expect(aiPlanRefreshSlice(0, 5)).toEqual({ start: 0, take: 0, passes: 0 });
+            expect(aiPlanRefreshSlice(1200, 0).take).toBe(AI_PLAN_REFRESH_LIMIT);
+            for (const n of [1, 2, 31, 33, 100, 469, 501, 1200, 5000, 7467, 7468]) {
+                expect(aiPlanRefreshSlice(n, 0).passes).toBe(15);
+                for (const from of [0, 1, 7, 14, 15, 29_000_123, 1e9 + 7]) expect(reached(n, from, 15, AI_PLAN_REFRESH_LIMIT)).toBe(n);
+            }
+            // Above the bound a rotation takes ceil((N + 32) / 500) passes, never more.
+            for (const n of [7469, 9001, 20_000]) {
+                const { passes } = aiPlanRefreshSlice(n, 0);
+                expect(passes).toBe(Math.ceil((n + AI_PLAN_REFRESH_MIN_REACH) / AI_PLAN_REFRESH_LIMIT));
+                expect(reached(n, 3, passes - 1, AI_PLAN_REFRESH_LIMIT)).toBeLessThan(n);
+                for (const from of [0, 3, 29_000_123]) expect(reached(n, from, passes, AI_PLAN_REFRESH_LIMIT)).toBe(n);
+            }
+        });
+
+        it('rows a slow pass never reached lead a later pass: every row is reached even when each pass reaches only 32', () => {
+            expect(AI_PLAN_REFRESH_MIN_REACH).toBe(32);
+            for (const n of [33, 100, 501, 1200, 7468]) {
+                const { passes } = aiPlanRefreshSlice(n, 0);
+                const worst = passes * (Math.ceil(Math.ceil((n + AI_PLAN_REFRESH_MIN_REACH) / passes) / AI_PLAN_REFRESH_MIN_REACH) + 1);
+                for (const from of [0, 11, 29_000_123]) expect(reached(n, from, worst, AI_PLAN_REFRESH_MIN_REACH)).toBe(n);
+            }
+        });
+
+        it('over 1,200 computers, 15 real sweeps refresh every one, though 40 early ones hang every time', async () => {
+            vi.useFakeTimers();
+            try {
+                const rows = Array.from({ length: 1200 }, (_, i) => ({ userId: PAID, computerId: C(i) }));
+                const hanging = new Set(rows.slice(0, 40).map((r) => deriveGuacamoleSandboxId(r.userId, r.computerId)));
+                const refreshed = new Set<string>();
+                const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+                    const sandbox = decodeURIComponent(/\/sandbox\/([^/]+)\/ai-credential$/.exec(url)![1]!);
+                    if (hanging.has(sandbox)) {
+                        return new Promise<Response>((_resolve, reject) => init.signal!.addEventListener('abort', () => reject(new Error('aborted'))));
+                    }
+                    refreshed.add(sandbox);
+                    return Response.json({ ok: true, planStored: true });
+                }) as unknown as typeof fetch;
+                const computers = source(rows);
+                for (let pass = 29_000_000; pass < 29_000_015; pass++) {
+                    const result = refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, fetchImpl, includedModelsFor: async () => null, computers, pass });
+                    await vi.advanceTimersByTimeAsync(AI_PLAN_REFRESH_BUDGET_MS);
+                    await result;
+                }
+                expect(refreshed.size).toBe(1200 - 40);
+                expect(computers.page.mock.calls.every(([, limit]) => limit <= AI_PLAN_REFRESH_LIMIT)).toBe(true);
+            } finally {
+                vi.useRealTimers();
+            }
+        });
     });
 });

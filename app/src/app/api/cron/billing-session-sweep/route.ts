@@ -1,4 +1,4 @@
-import { and, desc, gt, isNull } from 'drizzle-orm';
+import { and, asc, gt, isNull } from 'drizzle-orm';
 import { env } from '@/env';
 import { routeComputer } from '@/server/api/routers/compute-dispatch';
 import { getBillingDeps } from '@/server/billing/deps';
@@ -6,7 +6,7 @@ import { runningAwsComputersAfterEpochs } from '@/server/billing/store';
 import { aiIncludedModelsFor } from '@/server/billing/v3/ai-models';
 import { db } from '@/server/db';
 import { computers } from '@/server/db/schema';
-import { AI_PLAN_REFRESH_LIMIT, AI_PLAN_REFRESH_OPENED_WITHIN_MS, refreshAiPlans } from '@/server/lib/ai-credential';
+import { AI_PLAN_REFRESH_OPENED_WITHIN_MS, refreshAiPlans } from '@/server/lib/ai-credential';
 import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { readLastUsageStop, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
@@ -59,19 +59,22 @@ async function awsStopProof(computer: ComputerRef): Promise<{ running: boolean; 
 }
 
 /**
- * The AI plan refresh (`refreshAiPlans`): each live computer opened within `AI_PLAN_REFRESH_OPENED_WITHIN_MS` gets its
- * owner's current plan list, whichever provider runs it (both share the Worker's credential store), with no browser.
+ * The AI plan refresh (`refreshAiPlans`): live computers opened within `AI_PLAN_REFRESH_OPENED_WITHIN_MS`, whichever
+ * provider runs them (both share the Worker's credential store), in one stable order (by id) so each minute's pass takes
+ * its own slice (`aiPlanRefreshSlice`). No browser is involved.
  */
 function aiPlanRefresh(now: Date) {
+    const eligible = and(isNull(computers.deletedAt), gt(computers.lastOpenedAt, new Date(now.getTime() - AI_PLAN_REFRESH_OPENED_WITHIN_MS)));
     return () => refreshAiPlans({
         config: resolveCloudflareGuacamoleConfig(),
         hmacSecret: env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '',
-        listComputers: async () => (await db.query.computers.findMany({
-            where: and(isNull(computers.deletedAt), gt(computers.lastOpenedAt, new Date(now.getTime() - AI_PLAN_REFRESH_OPENED_WITHIN_MS))),
-            columns: { id: true, userId: true },
-            orderBy: desc(computers.lastOpenedAt),
-            limit: AI_PLAN_REFRESH_LIMIT,
-        })).map(row => ({ userId: row.userId, computerId: row.id })),
+        pass: Math.floor(now.getTime() / 60_000),
+        computers: {
+            count: async () => db.$count(computers, eligible),
+            page: async (offset, limit) => (await db.query.computers.findMany({
+                where: eligible, columns: { id: true, userId: true }, orderBy: asc(computers.id), offset, limit,
+            })).map(row => ({ userId: row.userId, computerId: row.id })),
+        },
         includedModelsFor: userId => aiIncludedModelsFor(userId),
     });
 }

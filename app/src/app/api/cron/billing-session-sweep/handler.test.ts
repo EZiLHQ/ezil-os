@@ -592,7 +592,7 @@ describe('paid sessions: no hours cap, a six-hour session rotation', () => {
     // The AI plan refresh (ai-credential.ts refreshAiPlans) keeps background work's plan current with no browser. It runs
     // with metering on or off, settles before the reverse pass (still last), and can never fail or block the sweep.
     describe('AI plan refresh', () => {
-        const planCounts = { computers: 2, pushed: 2, stored: 1, unknown: 0, failed: 0 };
+        const planCounts = { eligible: 2, computers: 2, pushed: 2, stored: 1, unknown: 0, failed: 0 };
         const sweep = (f: ReturnType<typeof fixture>, refreshAiPlans: () => Promise<typeof planCounts>, seconds = 1) =>
             handleBillingSessionSweep({ deps: f.deps, now: at(seconds), stop: f.stop, isStillRunning: f.isStillRunning, refreshAiPlans });
 

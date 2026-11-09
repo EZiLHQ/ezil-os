@@ -151,17 +151,25 @@ Roll back in reverse, this Worker first.
 Activity beats need a present user, and an idle stop also waits for the
 container's own work to end, so an agent kept busy after its user leaves can
 outlive a beat's list. The app's per-minute billing sweep (`refreshAiPlans` in
-`app/src/server/lib/ai-credential.ts`) therefore pushes the plan on its own:
-every live computer opened in the last three hours (`last_opened_at`, on either
-provider) gets a signed body `{ "includedModels": … }` with no `accessToken`,
-from the same effective plan, so a paid plan that ends reaches the computer
-within a minute. The Worker stores only the list, ordered as above, and never
+`app/src/server/lib/ai-credential.ts`) therefore pushes the plan on its own,
+as a signed body `{ "includedModels": … }` with no `accessToken`, from the same
+effective plan and signed at the time that plan was read. Its computers are the
+live ones opened in the last three hours (`last_opened_at`, on either provider),
+in id order. Each minute's pass takes up to 500, starting further along each
+time (`aiPlanRefreshSlice`). When passes finish, any 15 in a row reach every
+computer, up to 7,468 of them; above that a rotation takes ceil((N + 32) / 500)
+minutes. A pass the deadline cuts short still reaches at least 32. Each rotation
+starts 32 rows further on, so rows it missed come first in a later pass, though
+covering N rows at 32 a minute takes about N / 32 minutes. A running filter is
+not possible: no table says a Cloudflare computer still runs, and its compute
+session closes 15 minutes after the last beat. The Worker stores only the list, ordered as above, and never
 creates, extends or reads the token: the work still ends with the pushed token
 (`401 os_session_missing` once it expires). Nothing renews a stale list. A plan
 the app cannot read sends nothing, never `null`, so the stored list ages out to
 the 503. A token-less body without `includedModels` is refused (`400
-included_models_missing`). The refresh records no activity, presence, lease or
-meter, and is bounded at 20 seconds per sweep.
+included_models_missing`), and so is one that names a token, even `null`. The
+refresh records no activity, presence, lease or meter. One 20-second deadline
+covers the listing, plan reads and pushes; each push has 5 seconds.
 
 With a list stored, `POST /ai/v1/messages` and `/ai/v1/responses` read the
 body's `model` exactly as the Gateway reads it (fatal UTF-8, `JSON.parse`, last

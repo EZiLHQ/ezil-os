@@ -6,6 +6,7 @@ import { getBillingDeps } from '@/server/billing/deps';
 import { readBillingConfig } from '@/server/billing/config';
 import type { BillingDeps, BillingStore } from '@/server/billing/ports';
 import { db } from '@/server/db';
+import { computers } from '@/server/db/schema';
 import { runningAwsComputersAfterEpochs } from '@/server/billing/store';
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { readLastUsageStop, readPlacement, type ResolvedPlacement } from '@/server/lib/compute/placement';
@@ -88,11 +89,12 @@ describe('GET /api/cron/billing-session-sweep', () => {
         expect(advanceReverseMoves).not.toHaveBeenCalled();
     });
 
-    it('wires the AI plan refresh to live computers opened in its window, the effective plan, and no session', async () => {
+    it('wires the AI plan refresh: live computers opened in its window, counted and paged by id, this minute, the effective plan', async () => {
         mockEnv.CLOUDFLARE_GUACAMOLE_HMAC_SECRET = ' hmac ';
         const findMany = vi.fn(async () => [{ id: 'c1', userId: 'u1' }, { id: 'c2', userId: 'u2' }]);
-        Object.assign(db, { query: { computers: { findMany } } });
-        const refreshed = { computers: 2, pushed: 2, stored: 2, unknown: 0, failed: 0 };
+        const $count = vi.fn(async (..._args: unknown[]) => 1200);
+        Object.assign(db, { query: { computers: { findMany } }, $count });
+        const refreshed = { eligible: 2, computers: 2, pushed: 2, stored: 2, unknown: 0, failed: 0 };
         vi.mocked(refreshAiPlans).mockResolvedValue(refreshed);
         vi.mocked(aiIncludedModelsFor).mockResolvedValue(['gemini-3.8-flash']);
         const { refreshAiPlans: wired } = await wiring();
@@ -101,14 +103,19 @@ describe('GET /api/cron/billing-session-sweep', () => {
         const params = vi.mocked(refreshAiPlans).mock.calls[0]![0];
         expect(params.hmacSecret).toBe('hmac');
         expect(params.config).toMatchObject({ workerUrl: 'https://worker.test', isConfigured: true });
-        expect(Object.keys(params).sort()).toEqual(['config', 'hmacSecret', 'includedModelsFor', 'listComputers']);
-        expect(await params.listComputers()).toEqual([{ userId: 'u1', computerId: 'c1' }, { userId: 'u2', computerId: 'c2' }]);
-        const query = (findMany.mock.calls[0] as unknown as [Record<string, unknown>])[0];
-        expect(query).toMatchObject({ columns: { id: true, userId: true }, limit: 500 });
+        expect(Object.keys(params).sort()).toEqual(['computers', 'config', 'hmacSecret', 'includedModelsFor', 'pass']);
+        expect(params.pass).toBe(Math.floor(now.getTime() / 60_000));
         // The window is measured from the sweep's own clock: deleted_at IS NULL and last_opened_at after now - 3 h.
-        const where = new PgDialect().sqlToQuery(query.where as SQL);
-        expect(where.sql).toBe('("ezil_computers"."deleted_at" is null and "ezil_computers"."last_opened_at" > $1)');
-        expect(where.params).toEqual([new Date(now.getTime() - 3 * 3_600_000).toISOString()]);
+        const window = { sql: '("ezil_computers"."deleted_at" is null and "ezil_computers"."last_opened_at" > $1)',
+            params: [new Date(now.getTime() - 3 * 3_600_000).toISOString()] };
+        expect(await params.computers.count()).toBe(1200);
+        expect($count.mock.calls[0]![0]).toBe(computers);
+        expect(new PgDialect().sqlToQuery($count.mock.calls[0]![1] as SQL)).toMatchObject(window);
+        expect(await params.computers.page(700, 500)).toEqual([{ userId: 'u1', computerId: 'c1' }, { userId: 'u2', computerId: 'c2' }]);
+        const query = (findMany.mock.calls[0] as unknown as [Record<string, unknown>])[0];
+        expect(query).toMatchObject({ columns: { id: true, userId: true }, offset: 700, limit: 500 });
+        expect(new PgDialect().sqlToQuery(query.where as SQL)).toMatchObject(window);
+        expect(new PgDialect().sqlToQuery(query.orderBy as SQL).sql).toBe('"ezil_computers"."id" asc');
         expect(await params.includedModelsFor('u1')).toEqual(['gemini-3.8-flash']);
         expect(aiIncludedModelsFor).toHaveBeenCalledExactlyOnceWith('u1');
         mockEnv.CLOUDFLARE_GUACAMOLE_HMAC_SECRET = undefined;

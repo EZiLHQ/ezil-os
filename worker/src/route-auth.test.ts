@@ -3899,7 +3899,9 @@ describe('AI Durable Object storage and boot lifecycle', () => {
       expect(await c.send('claude-opus-5-5')).toEqual({ status: 403, code: 'os_model_not_included' });
       expect(await c.send(FLASH)).toEqual({ status: 200, code: null });
       expect(upstream).toEqual(['claude-opus-5-5', FLASH]);
-      // A refresh signed before the change, arriving late, never reopens every model.
+      // A refresh signed before the change, arriving a minute late, never reopens every model: the Worker orders by
+      // the signed time, not by when the push arrives.
+      at(47);
       expect(await (await c.push({ includedModels: null }, t0 + 45 * MINUTE)).json()).toMatchObject({ ok: true, planStored: false });
       expect(await c.send('claude-opus-5-5')).toEqual({ status: 403, code: 'os_model_not_included' });
       // No refresh touched the token: once it expires, a fresh plan is not enough.
@@ -3930,6 +3932,8 @@ describe('AI Durable Object storage and boot lifecycle', () => {
         expect(res.status).toBe(400);
         expect(await res.json()).toMatchObject({ error: error });
       }
+      // A body that names a token at all, even null, is a credential push and is refused as one.
+      expect((await c.push({ accessToken: null, includedModels: [FLASH] })).status).toBe(400);
       expect(c.values.has(AI_MODEL_ACCESS_STORAGE_KEY)).toBe(false);
       expect(await (await c.push({ includedModels: null })).json()).toMatchObject({ ok: true, planStored: true });
       expect(c.values.has(AI_CREDENTIAL_STORAGE_KEY)).toBe(false);
