@@ -583,7 +583,7 @@ function errorCodeOf(bytes: Uint8Array): string | null {
 const GATEWAY_ERROR_CODES = new Set([
   'unauthorized', 'no_ezil_role', 'insufficient_credits', 'no_live_grant', 'not_a_member', 'role_mismatch',
   'forbidden', 'account_suspended', 'suspended', 'input_too_large', 'body_too_large',
-  'unsupported_bedrock_converse_request', 'unsupported_parameter', 'invalid_request', 'max_output_tokens_invalid',
+  'unsupported_bedrock_converse_request', 'unsupported_gemini_request', 'unsupported_parameter', 'invalid_request', 'max_output_tokens_invalid',
   'idempotency_conflict', 'idempotency_key_required', 'idempotency_replay', 'killswitch', 'paused', 'pause',
   'global_cap_reached', 'daily_budget_reached', 'window_budget_reached', 'no_provider_route', 'model_disabled', 'model_not_found', 'upstream_timeout',
   'rate_limited', 'concurrency_limit', 'tpm_limited', 'internal_error',

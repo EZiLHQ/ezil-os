@@ -1,7 +1,8 @@
-import { isCorrelationId, isFailureReason } from '@/server/lib/failure-diagnostics';
+import { isCorrelationId, isFailureReason } from './failure-shapes';
 import { sanitizeErrorMessage } from '@/server/telemetry/sanitize';
-import { FEEDBACK_LIMITS, type FeedbackDiagnostics } from './types';
+import { appFailureRecordSchema, APP_FAILURE_LIMITS, APP_FAILURE_REQUEST_ID_FIELDS, diagnosticsSchema, FEEDBACK_LIMITS, type FeedbackDiagnostics } from './types';
 
+const IDENTIFIER_LIKE = /[0-9a-f]{8,}|\d{6,}/i;
 const JWT = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g;
 
 /** Preserve useful prose (including email addresses); only credential-shaped
@@ -46,8 +47,8 @@ type RecentEvent = NonNullable<FeedbackDiagnostics['recentEvents']>[number];
  * FEEDBACK-DIAG: one recent event's failure annotation, ALLOWLISTED — a value
  * that does not match its shape is dropped, never repaired.
  *
- * 🔴 `correlationId` is the ONE diagnostics field exempt from the UUID mask
- * below, and narrowly: it must be a server-minted correlation id
+ * `correlationId` bypasses the UUID mask below, like validated app-failure
+ * request ids, and narrowly: it must be a server-minted correlation id
  * (`isCorrelationId`: a lowercase `randomUUID`, `cid_…` or `srv_…`), it
  * identifies one request rather than a person or a computer, and it is
  * dropped if it equals the reporter's own user or computer id. Masking it
@@ -62,7 +63,7 @@ function annotation(event: RecentEvent, excludeIds: ReadonlySet<string>): Pick<R
 }
 
 export interface SanitizeDiagnosticsOptions {
-    /** Ids a `correlationId` must never equal (the reporter's user and computer). Compared lowercase. */
+    /** Ids correlations and app-failure request ids must never equal (reporter's user/computer). Compared lowercase. */
     excludeIds?: readonly (string | null | undefined)[];
 }
 
@@ -71,6 +72,24 @@ export function sanitizeDiagnostics(
 ): FeedbackDiagnostics | null {
     if (!input) return null;
     const out: FeedbackDiagnostics = {};
+    const excludeIds = new Set((options.excludeIds ?? []).filter((id): id is string => !!id).map(id => id.toLowerCase()));
+    if (input.traceApp && diagnosticsSchema.shape.traceApp.safeParse(input.traceApp).success) out.traceApp = input.traceApp;
+    // Parse each new nested object independently; never spread client state.
+    if (input.session) {
+        const parsed = diagnosticsSchema.shape.session.safeParse(input.session);
+        if (parsed.success) out.session = parsed.data;
+    }
+    if (input.tracePhases) {
+        // A phase code skips `diagnosticString`, so a credential- or
+        // identifier-shaped code (an `sk-…` key, a letter-leading UUID or a hex
+        // run all fit the shape regex) is dropped, never repaired.
+        out.tracePhases = input.tracePhases.slice(-24).flatMap(phase => {
+            const parsed = diagnosticsSchema.shape.tracePhases.unwrap().element.safeParse(phase);
+            if (!parsed.success) return [];
+            const { code } = parsed.data;
+            return redactDescription(code).count > 0 || IDENTIFIER_LIKE.test(code) ? [] : [parsed.data];
+        });
+    }
     if (input.shellVersion !== undefined) out.shellVersion = diagnosticString(input.shellVersion, 64);
     if (input.appCommit !== undefined) out.appCommit = diagnosticString(input.appCommit, 64);
     if (input.browser) out.browser = { family: diagnosticString(input.browser.family, 32), major: input.browser.major };
@@ -80,23 +99,42 @@ export function sanitizeDiagnostics(
     if (input.fullscreen !== undefined) out.fullscreen = input.fullscreen;
     if (input.fullbleed !== undefined) out.fullbleed = input.fullbleed;
     if (input.computerStatus !== undefined) out.computerStatus = diagnosticString(input.computerStatus, 32);
-    if (input.traceId !== undefined) out.traceId = diagnosticString(input.traceId, 64);
+    if (input.traceId !== undefined && !excludeIds.has(input.traceId.toLowerCase())) {
+        out.traceId = isCorrelationId(input.traceId) ? input.traceId : diagnosticString(input.traceId, 64);
+    }
     if (input.phases) out.phases = input.phases.map((phase) => diagnosticString(phase, 40));
     if (input.recentEvents) {
-        const excludeIds = new Set((options.excludeIds ?? []).filter((id): id is string => !!id).map((id) => id.toLowerCase()));
+        const events = input.recentEvents.slice(-50);
         // Events are oldest-first; only the newest `recentEventsAnnotatedMax`
         // annotated ones keep their annotation.
         const kept = new Map<number, Pick<RecentEvent, 'reason' | 'correlationId'>>();
-        for (let i = input.recentEvents.length - 1; i >= 0 && kept.size < FEEDBACK_LIMITS.recentEventsAnnotatedMax; i--) {
-            const extra = annotation(input.recentEvents[i]!, excludeIds);
+        for (let i = events.length - 1; i >= 0 && kept.size < FEEDBACK_LIMITS.recentEventsAnnotatedMax; i--) {
+            const extra = annotation(events[i]!, excludeIds);
             if (extra.reason || extra.correlationId) kept.set(i, extra);
         }
-        out.recentEvents = input.recentEvents.map((event, i) => ({
+        out.recentEvents = events.map((event, i) => ({
             eventClass: diagnosticString(event.eventClass, 40),
             site: diagnosticString(event.site, 80),
             code: diagnosticString(event.code, 80),
+            ...(Number.isInteger(event.ageMs) && event.ageMs! >= 0 && event.ageMs! <= 1_000_000_000 ? { ageMs: event.ageMs } : {}),
             ...kept.get(i),
         }));
+    }
+    if (Array.isArray(input.appFailures)) {
+        // Like recentEvents, records arrive oldest-first. Validate before
+        // capping so invalid records cannot evict valid neighboring entries.
+        out.appFailures = input.appFailures.flatMap(failure => {
+            const parsed = appFailureRecordSchema.safeParse(failure);
+            if (!parsed.success) return [];
+            // Defence in depth over the schema's shape rule: never store a key the
+            // description redactor would mask.
+            if (parsed.data.modelKey !== undefined && redactDescription(parsed.data.modelKey).count > 0) return [];
+            if (APP_FAILURE_REQUEST_ID_FIELDS.some(field => {
+                const id = parsed.data[field];
+                return id !== undefined && excludeIds.has(id.toLowerCase());
+            })) return [];
+            return [parsed.data];
+        }).slice(-APP_FAILURE_LIMITS.recordsMax);
     }
     if (input.stream) {
         out.stream = { ...input.stream };

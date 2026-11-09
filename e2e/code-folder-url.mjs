@@ -3,6 +3,7 @@
 // injects the REAL bridge (worker/src/code-folder-bridge.ts) into the workbench document, framed by the REAL shell
 // bundle. Drives VS Code's own File > Open Folder, Back/Forward, an edited file across switches, and a reload.
 // Started by code-folder-url-image.sh (no network egress; no staging contact).
+// Also exercises the diagnostic event -> real Worker bridge -> real shell parent transport without model traffic.
 // Args: <code-server ip> <evidence dir>
 import assert from 'node:assert/strict';
 import { createServer, request as httpRequest } from 'node:http';
@@ -16,6 +17,7 @@ const TREE = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 const require = createRequire(path.join(process.env.PLAYWRIGHT_REQUIRE_DIR || '/opt/ezil-testkit', 'noop.js'));
 const { chromium } = require('playwright');
 const { injectCodeFolderBridge } = await import(`${TREE}/worker/src/code-folder-bridge.ts`);
+const { injectCodeDiagBridge } = await import(`${TREE}/worker/src/code-diag-bridge.ts`);
 const assets = `${TREE}/app/public/os/`;
 mkdirSync(EVIDENCE, { recursive: true });
 const lines = [];
@@ -55,7 +57,7 @@ const shell = createServer((req, res) => {
   res.end('<!doctype html><html><head><link rel="stylesheet" href="/os/bundle.min.css"></head><body><div id="ezil-os-root"></div><script src="/os/icons.js"></script><script src="/os/bundle.min.js"></script></body></html>');
 });
 // The Worker stand-in: bootstrap redirect as the Worker's, the bridge into the workbench document, all else passed through.
-let injected = 0;
+let injected = 0, diagInjected = 0;
 const editor = createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
   if (url.pathname === '/preview-bootstrap') {
@@ -70,8 +72,9 @@ const editor = createServer((req, res) => {
     const html = req.method === 'GET' && url.pathname === '/' && ur.statusCode === 200 && /text\/html/.test(ur.headers['content-type'] ?? '');
     if (!html) { res.writeHead(ur.statusCode, ur.headers); ur.pipe(res); return; }
     const chunks = []; ur.on('data', (c) => chunks.push(c)); ur.on('end', () => {
-      const out = injectCodeFolderBridge(Buffer.concat(chunks).toString('utf8'), [shellOrigin]);
+      const out = injectCodeDiagBridge(injectCodeFolderBridge(Buffer.concat(chunks).toString('utf8'), [shellOrigin]), [shellOrigin]);
       if (out.includes('data-ezil-folder-bridge')) injected += 1;
+      if (out.includes('data-ezil-diag-bridge')) diagInjected += 1;
       const h = { ...ur.headers }; delete h['content-length'];
       res.writeHead(ur.statusCode, h); res.end(out);
     });
@@ -124,6 +127,48 @@ ok(await waitAddress('/app/code?folder=/workspace/a'), `link: address ${await ad
 await page.waitForTimeout(2000);
 await shot('01-link-a');
 const len0 = await page.evaluate(() => history.length);
+
+// Diagnostic positive path. This is a parent-window transport probe on the actual shell page, not a replacement
+// shell consumer. The parent chooses the nonce and sends the hello to the actual editor frame/origin.
+// TODO(app-failure-extension-host): coordinator image with the new EZiL Models VSIX + patched workbench must
+// exercise provider onOutcome -> executeCommand('_ezil.appFailure') -> renderer event as well. Playwright cannot
+// reach the real workbench command service; this scenario starts at its documented CustomEvent boundary.
+ok(diagInjected >= 1, 'diagnostics: the real workbench document carried the separate Worker bridge');
+const syntheticFailure = {
+  eventId: 'a0000000-0000-4000-8000-000000000001', source: 'ezil_chat', operation: 'chat_request',
+  category: 'network', code: 'network_failed', stage: 'request', outcome: 'failed',
+  clientRequestId: 'c0000000-0000-4000-8000-000000000001', gatewayRequestId: 'd0000000-0000-4000-8000-000000000001',
+};
+await page.evaluate((origin) => {
+  const editor = [...document.querySelectorAll('iframe')].find(el => {
+    try { return new URL(el.src, location.href).origin === origin; } catch { return false; }
+  });
+  if (!editor?.contentWindow) throw new Error('Code iframe missing in shell');
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  const nonce = btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const state = window.__codeDiagTest = { nonce, received: [] };
+  const receive = ev => {
+    if (ev.data?.type === 'ezil.code.failure') state.received.push({ data: ev.data, origin: ev.origin, sourceMatches: ev.source === editor.contentWindow });
+  };
+  window.addEventListener('message', receive);
+  state.dispose = () => window.removeEventListener('message', receive);
+  editor.contentWindow.postMessage({ type: 'ezil.code.diag.hello', v: 1, nonce }, origin);
+}, editorOrigin);
+await f.evaluate(failure => window.dispatchEvent(new CustomEvent('ezil-app-failure', { detail: JSON.stringify(failure) })), syntheticFailure);
+await page.waitForFunction(() => window.__codeDiagTest.received.length >= 1);
+await f.evaluate(failure => window.dispatchEvent(new CustomEvent('ezil-app-failure', {
+  detail: JSON.stringify({ ...failure, eventId: 'a0000000-0000-4000-8000-000000000002', extra: true }),
+})), syntheticFailure);
+await page.waitForTimeout(500);
+const diag = await page.evaluate(() => {
+  const state = window.__codeDiagTest; state.dispose(); delete window.__codeDiagTest;
+  return { nonce: state.nonce, received: state.received };
+});
+ok(diag.received.length === 1, 'diagnostics: parent received exactly one failure; forged extra-key record was dropped');
+assert.deepEqual(diag.received[0], {
+  data: { type: 'ezil.code.failure', v: 1, nonce: diag.nonce, failure: syntheticFailure }, origin: editorOrigin, sourceMatches: true,
+});
+ok(true, 'diagnostics: parent received the unchanged record from its Code frame with its own nonce and exact origin');
 
 // 2. VS Code's own Open Folder (File > Open Folder…, the simple file dialog) to B.
 async function openFolder (target) {

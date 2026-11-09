@@ -186,6 +186,8 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                 .map(h => ({ id: h.id, generation: String(h.generation), region: h.region, zone_id: h.zone_id, instance_type: h.instance_type,
                     instance_id: h.instance_id, lifecycle_job_id: h.lifecycle_job_id, lifecycle_digest: h.lifecycle_digest, lifecycle_input: h.lifecycle_input })) };
         }
+        if (text.startsWith('/* placement:recorded-lower */')) return { rows: placements.filter(r => r.computer_id === params[0])
+            .slice(0, 2).map(r => ({ lower_image_digest: r.lower_image_digest ?? null })) };
         if (text.startsWith('SELECT lower_image_digest')) return { rows: placements.filter(r => r.computer_id === params[0]
             && r.generation === params[1] && r.lease_epoch === params[2] && r.enroll_consumed_hash === params[3]
             && r.image_upgrade_job_id == null).map(r => ({ lower_image_digest: r.lower_image_digest })) };
@@ -478,6 +480,9 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
                     if (nullable) return (r) => (r[nullable[1]!] ?? null) === value(nullable[2]!, params);
                     const available = text.match(/^\((\w+) IS NULL OR \1 = (\$\d+)\)$/);
                     if (available) return (r) => r[available[1]!] == null || r[available[1]!] === value(available[2]!, params);
+                    // Fake rows hold JavaScript Dates, already whole milliseconds.
+                    const truncated = text.match(/^date_trunc\('milliseconds', (\w+)\) = (\$\d+::timestamptz)$/);
+                    if (truncated) return (r) => instant(r[truncated[1]!]) === instant(value(truncated[2]!, params));
                     const list = text.match(/^(\w+) IN \(([^)]+)\)$/);
                     if (list) {
                         const values = list[2]!.split(',').map((v) => value(v.trim(), params));

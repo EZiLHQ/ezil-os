@@ -827,3 +827,115 @@ describe('round 6 R2-2: aws-open decision lines', () => {
         expect(await open(refused)).toEqual([{ event: 'aws-open', computer: id, path: 'none', reason: 'region_capacity' }]);
     });
 });
+
+// Acceptance 1.0.34: a volume whose recorded lower is not the deployment's warm-adopted a new pool host (and later cold
+// replaced) only for the host guard to refuse it (`lower_digest_mismatch`), so the open stayed computer_starting forever.
+describe('a volume on another lower is refused before any host is spent', () => {
+    const CURRENT = 'sha256:' + 'b'.repeat(64), PREVIOUS = 'sha256:' + 'a'.repeat(64), OLDER = 'sha256:' + '9'.repeat(64);
+    const machine = (name: string) => `arn:aws:states:${D.region}:${D.accountId}:stateMachine:ezil-mum-${name}:1`;
+    const R: typeof D = { ...D, lowerImageDigest: CURRENT, previousLowerImageDigest: PREVIOUS,
+        preparationStateMachineVersionArn: machine('rebase-preparation'), recoveryStateMachineVersionArn: machine('recovery') };
+    const recorded = (digest: string | null) => ({ lower_image_digest: digest, lower_digest_observed_at: digest ? new Date(NOW.getTime() - 86_400_000) : null });
+    const open = async (s: ReturnType<typeof setup>) => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        try {
+            const result = await s.ensure();
+            const lines = info.mock.calls.map(call => String(call[0])).filter(line => line.startsWith('{"event":"aws-open"')).map(line => JSON.parse(line));
+            return { result, lines };
+        } finally { info.mockRestore(); }
+    };
+    const expectUntouched = (s: ReturnType<typeof setup>, before: Record<string, unknown>) => {
+        expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+        expect(s.deps.describer!.describeVolume).not.toHaveBeenCalled();
+        expect(s.starts).toEqual([]);
+        expect(s.statements.filter(st => /^\s*(UPDATE|INSERT|DELETE)\b/i.test(st.sql))).toEqual([]);
+        expect(s.placements[0]).toEqual(before);
+    };
+
+    it.each([
+        ['the previous release', PREVIOUS],
+        ['an older release', OLDER],
+        ['never recorded', null],
+    ] as const)('lower %s: computer_rebase_required, no lease, write or start', async (_name, digest) => {
+        const s = setup({ rows: [stopped(recorded(digest))], deployment: R });
+        const before = structuredClone(s.placements[0]!);
+        const { result, lines } = await open(s);
+        expect(result).toEqual({ ok: false, error: 'computer_rebase_required', errorCode: 'computer_rebase_required', retryable: false });
+        expect(lines).toEqual([{ event: 'aws-open', computer: C.slice(0, 8), path: 'none', reason: 'rebase_required' }]);
+        expectUntouched(s, before);
+        // Asking again answers the same and still spends nothing.
+        expect(await s.ensure()).toMatchObject({ errorCode: 'computer_rebase_required', retryable: false });
+        expectUntouched(s, before);
+    });
+
+    it.each([
+        // The stuck state: a refused adopt's stall release settled, so the open used to cold replace onto the same refusal.
+        ['UNCONFIRMED after a failed enrollment', { state: 'UNCONFIRMED', last_error: ENROLLMENT_FAILED }],
+        // A lost instance comes back only as a replace: that replace would boot the same guard refusal.
+        ['STOPPED after the host retire', { last_error: 'instance_lost' }],
+    ] as const)('%s on the previous lower is refused too', async (_name, over) => {
+        const s = setup({ rows: [stopped({ ...over, ...recorded(PREVIOUS) })], deployment: R });
+        const before = structuredClone(s.placements[0]!);
+        expect((await open(s)).result).toMatchObject({ errorCode: 'computer_rebase_required', retryable: false });
+        expectUntouched(s, before);
+    });
+
+    it('a Free open (cold path) is refused the same way', async () => {
+        const s = setup({ rows: [stopped(recorded(PREVIOUS))], deployment: R, entitlement: null, grantPending: async () => false });
+        const before = structuredClone(s.placements[0]!);
+        expect((await open(s)).result).toMatchObject({ errorCode: 'computer_rebase_required', retryable: false });
+        expectUntouched(s, before);
+    });
+
+    it('a volume attached to its old host is not released first: the refusal comes before the pool-open release', async () => {
+        const s = setup({ rows: [stopped(recorded(PREVIOUS))], deployment: R });
+        s.volume.state = 'in-use'; s.volume.attachments = [{ instanceId: s.source.instanceId, state: 'attached' }];
+        const before = structuredClone(s.placements[0]!);
+        expect((await open(s)).result).toMatchObject({ errorCode: 'computer_rebase_required' });
+        expectUntouched(s, before);
+    });
+
+    it.each([
+        // In-flight answers stay ahead of the refusal: a recovery or a capacity wait is never shown as "needs an update".
+        ['a recovery in progress', { state: 'UNCONFIRMED', last_error: 'lifecycle_start_failed' }, 'computer_recovering'],
+        ['a capacity refusal', { state: 'UNCONFIRMED', last_error: 'capacity:insufficient' }, 'capacity_unavailable'],
+    ] as const)('%s on another lower keeps its own answer', async (_name, over, errorCode) => {
+        const s = setup({ rows: [stopped({ ...over, ...recorded(PREVIOUS) })], deployment: R });
+        expect(await s.ensure()).toMatchObject({ errorCode });
+        expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+        expect(s.starts).toEqual([]);
+    });
+
+    it('an image job reservation keeps its existing answer (the rebase path), never the refusal', async () => {
+        const reserved = { image_upgrade_job_id: 'dddddddd-dddd-4ddd-8ddd-dddddddddddd', ...recorded(PREVIOUS) };
+        const before = setup({ rows: [stopped(reserved)] });
+        const baseline = await before.ensure().then(r => r, (e: unknown) => ({ threw: (e as Error).name }));
+        const s = setup({ rows: [stopped(reserved)], deployment: R });
+        const result = await s.ensure().then(r => r, (e: unknown) => ({ threw: (e as Error).name }));
+        expect(baseline).toEqual({ threw: 'ImageJobConflictError' });
+        expect(result).toEqual(baseline);
+        expect(JSON.stringify(result)).not.toContain('computer_rebase_required');
+        expect(s.pool.leasePoolHost).not.toHaveBeenCalled();
+        expect(s.starts).toEqual([]);
+    });
+
+    it('the current lower adopts warm exactly as before', async () => {
+        const s = setup({ rows: [stopped(recorded(CURRENT))], deployment: R });
+        const { result, lines } = await open(s);
+        expect(result).toMatchObject({ errorCode: 'computer_starting', retryable: true });
+        expect(lines).toEqual([{ event: 'aws-open', computer: C.slice(0, 8), path: 'warm', reason: 'adopted' }]);
+        expect(s.starts.map(w => w.intent.operation)).toEqual(['adopt']);
+    });
+
+    it('a deployment without a lower (legacy shape) keeps today\'s open, even with no recorded lower', async () => {
+        const s = setup({ rows: [stopped(recorded(null))] });
+        expect((await open(s)).lines).toEqual([{ event: 'aws-open', computer: C.slice(0, 8), path: 'warm', reason: 'adopted' }]);
+        expect(s.starts.map(w => w.intent.operation)).toEqual(['adopt']);
+    });
+
+    it('a new computer (no volume yet) provisions as before', async () => {
+        const s = setup({ rows: [], deployment: R });
+        expect((await open(s)).lines).toEqual([{ event: 'aws-open', computer: C.slice(0, 8), path: 'warm', reason: 'adopted' }]);
+        expect(s.starts).toHaveLength(1);
+    });
+});

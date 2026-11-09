@@ -254,3 +254,16 @@ describe('route/proxy wiring', () => {
         for (const method of ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'OPTIONS', 'HEAD']) expect(source).toContain(`export const ${method} = handle`);
     });
 });
+
+
+describe('report bundle byte budget', () => {
+    it('enforces the 32KiB metadata cap even with screenshots enabled', async () => {
+        const h = harness(); h.deps.env.EZIL_OS_FEEDBACK_SCREENSHOTS = '1';
+        const recentEvents = Array.from({ length: 50 }, () => ({ eventClass: '界'.repeat(40), site: '界'.repeat(80), code: '界'.repeat(80) }));
+        const response = await handleFeedbackRequest(request({ ...VALID, description: '界'.repeat(4000), diagnostics: { recentEvents }, screenshot: SCREENSHOT }), h.deps);
+        expect(response.status).toBe(413);
+        expect(await response.json()).toEqual({ error: 'payload_too_large' });
+        expect(h.statements).toEqual([]);
+        expect((await handleFeedbackRequest(request({ ...VALID, diagnostics: { recentEvents: recentEvents.slice(0, 1) }, screenshot: SCREENSHOT }), h.deps)).status).toBe(201);
+    });
+});

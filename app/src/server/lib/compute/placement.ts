@@ -293,10 +293,11 @@ export type PlacementFields = Partial<{
     [K in keyof typeof MUTABLE_COLUMNS]: (typeof MUTABLE_COLUMNS)[K][1] extends 'timestamptz' ? Date | null : string | null;
 }>;
 
-// Placement.updatedAt is a JavaScript Date and the generation CAS uses exact
-// SQL equality. Every placement updated_at writer must therefore store whole
-// milliseconds. Advance at least 1 ms on updates, even within one transaction
-// (now() is fixed there), so a same-state write always invalidates old snapshots.
+// Placement.updatedAt is a JavaScript Date; legacy rows may hold sub-millisecond
+// values, so the CAS compares at millisecond precision. Every placement updated_at
+// writer stores whole milliseconds. Advance to at least the next millisecond on
+// updates, even within one transaction (now() is fixed there), so a same-state
+// write always invalidates old snapshots.
 const PLACEMENT_INSERT_TIME = sql`date_trunc('milliseconds', now())`;
 const PLACEMENT_UPDATE_TIME = sql`GREATEST(date_trunc('milliseconds', now()), date_trunc('milliseconds', updated_at) + interval '1 millisecond')`;
 
@@ -1041,7 +1042,7 @@ async function casInTx(
                 ${guard.lifecycleDigest !== undefined ? sql` AND lifecycle_digest = ${guard.lifecycleDigest}` : sql``}
                 ${guard.fenceToken !== undefined ? sql` AND fence_token = ${guard.fenceToken}::uuid` : sql``}
                 ${guard.volumeId !== undefined ? sql` AND volume_id = ${guard.volumeId}` : sql``}
-                ${guard.updatedAt !== undefined ? sql` AND updated_at = ${guard.updatedAt.toISOString()}::timestamptz` : sql``}
+                ${guard.updatedAt !== undefined ? sql` AND date_trunc('milliseconds', updated_at) = ${guard.updatedAt.toISOString()}::timestamptz` : sql``}
             RETURNING ${SELECT_COLUMNS}`),
     );
     if (rows.length === 0) return { ok: false, reason: 'cas_conflict' };
@@ -1634,6 +1635,14 @@ export async function checkEnrollmentDigest(db: PlacementExecutor, p: Placement,
     return rows.length === 1 && rows[0]!.lower_image_digest === digest;
 }
 
+/** The lower this computer's volume last booted on (enrollment or image-job evidence); null when never recorded or unreadable. */
+export async function readRecordedLowerDigest(db: PlacementExecutor, computerId: string): Promise<string | null> {
+    const rows = rowsOf(await db.execute(sql`/* placement:recorded-lower */ SELECT lower_image_digest
+        FROM public.ezil_computer_placements WHERE computer_id = ${canonicalId(computerId)}::uuid LIMIT 2`));
+    const digest = rows.length === 1 ? rows[0]!.lower_image_digest : null;
+    return typeof digest === 'string' && /^sha256:[0-9a-f]{64}$/.test(digest) ? digest : null;
+}
+
 /** Complete only the consumed boot, preserving receipt progress and fencing a moved epoch. */
 export const POOL_SESSION_PENDING = 'pool_session_pending';
 export async function finishEnrollment(
@@ -2015,7 +2024,7 @@ export async function savePoolEnrollmentNonce(tx: PlacementExecutor, p: Placemen
     nonce: { nonceHash: string; expiresAt: Date }): Promise<boolean> {
     return rowsOf(await tx.execute(sql`UPDATE public.ezil_computer_placements
         SET enroll_nonce_hash = ${nonce.nonceHash}, enroll_expires_at = ${nonce.expiresAt.toISOString()}::timestamptz,
-            updated_at = greatest(updated_at + interval '1 millisecond', clock_timestamp())
+            updated_at = ${PLACEMENT_UPDATE_TIME}
         WHERE computer_id = ${p.computerId}::uuid AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch}
             AND instance_id = ${p.instanceId} AND enroll_consumed_hash IS NULL AND enroll_nonce_hash IS NULL
         RETURNING computer_id`)).length === 1;

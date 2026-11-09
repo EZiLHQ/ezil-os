@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { chat } from '../src/client';
-import { creditState, describeGatewayError, errorOrigin, forgetGatewayModels, gatewayChat, GatewayError, gatewayModels, parseErrorBody, readCredits } from '../src/gateway';
+import { creditState, describeGatewayError, errorOrigin, forgetGatewayModels, gatewayCatalogModels, gatewayChat, GatewayError, gatewayModels, parseErrorBody, parseGatewayModels, readCredits, withGatewayModelLimits } from '../src/gateway';
 import { credits, creditsFloor2 } from '../src/credits-format';
-import { KIMI } from '../src/gateway-messages';
+import { buildGatewayBody, KIMI } from '../src/gateway-messages';
 import type { StreamEvent } from '../src/types';
 import { ask, gw, msg, tool, txt } from './fixtures/gateway';
 import { frames, messageJson } from './fixtures/gateway-response';
@@ -40,7 +40,8 @@ describe('gateway transport', () => {
         const headers = Object.fromEntries(new Headers(s.calls[0]!.init.headers));
         expect(headers).toEqual({ authorization: 'Bearer synthetic-proxy-token', 'content-type': 'application/json', accept: 'text/event-stream', 'idempotency-key': 'fixed-key' });
         expect(logs).toHaveLength(1);
-        expect(JSON.parse(logs[0]!)).toEqual({ request_id: 'req-ok', model: gw().id, stream: true, hold: '1000', http_status: 200, latency_ms: 0,
+        expect(JSON.parse(logs[0]!)).toEqual({ request_id: 'req-ok', model: gw().id, stream: true, hold: '1000', http_status: 200,
+            client_request_id: null, attempts: 1, partial: false, latency_ms: 0,
             usage: { input: 100, output: 8, cache_read: 3, cache_write: 4 }, stop_reason: 'end_turn', error_code: null, origin: null });
         expect(logs.join()).not.toMatch(/Hello|synthetic-proxy-token|never log/);
     });
@@ -217,6 +218,7 @@ describe('gateway errors and credits', () => {
         [401, 'os_session_missing', 'this account has no EZiL AI access, or this computer has not received your sign-in'], [401, 'os_proxy_unauthorized', 'EZiL OS: This computer’s AI connection was refused'],
         [403, 'not_a_member', 'membership'], [403, 'account_suspended', 'suspended'], [413, 'input_too_large', 'EZiL AI: This conversation is too large for qwen. EZiL AI refused it before the model ran, so it was not charged, and the conversation is kept. Shorten your last message'],
         [400, 'unsupported_bedrock_converse_request', 'Internal EZiL Models bug (unsupported_bedrock_converse_request)'],
+        [400, 'unsupported_gemini_request', 'Internal EZiL Models bug (unsupported_gemini_request)'],
         [503, 'killswitch', 'paused'], [503, 'paused', 'paused'], [503, 'no_provider_route', 'temporarily unavailable'], [504, 'upstream_timeout', 'did not answer'], [409, 'idempotency_replay', 'already processed'],
     ] as const) test(`maps ${code}, always preserving request ID`, () => {
         const e = describeGatewayError('qwen', status, null, { code, request_id: 'body-id' }, 'header-id');
@@ -350,7 +352,8 @@ describe('local refusals and error origin', () => {
             + 'Shorten your last message or its attachments, or pick a model with a larger input limit. (local_input_too_large)');
         expect(error.message).not.toMatch(/invalid|new chat/i);
         expect(logs).toHaveLength(1);
-        expect(JSON.parse(logs[0]!)).toEqual({ request_id: null, model: KIMI, stream: false, hold: null, http_status: null, latency_ms: 0,
+        expect(JSON.parse(logs[0]!)).toEqual({ request_id: null, model: KIMI, stream: false, hold: null, http_status: null,
+            client_request_id: expect.stringMatching(/^[0-9a-f-]{36}$/), attempts: 0, partial: false, latency_ms: 0,
             usage: { input: 0, output: 0, cache_read: 0, cache_write: 0 }, stop_reason: null, error_code: 'local_input_too_large', origin: 'local',
             body_bytes: bodyBytes, limit_bytes: 130_016, messages: 1, max_blocks: 1, tools: 1, tool_bytes: toolBytes });
         for (const text of [logs[0]!, error.message]) expect(text).not.toMatch(new RegExp(`${SENTINEL}|字|invalid_request`));
@@ -403,4 +406,50 @@ test('credits-format: the shared vectors (the OS shell pins the same ones for cr
         expect(credits(micro)).toBe(full);
         expect(creditsFloor2(micro)).toBe(floor2);
     }
+});
+
+describe('prompt cache from the catalog', () => {
+    const row = (id: string, capabilities?: Record<string, unknown>) => ({ id, enabled: true, max_input_tokens: 200_000, max_output_tokens: 16_384,
+        protocols: ['anthropic-messages'], availability: { state: 'available', reasons: [] }, ...capabilities ? { capabilities } : {} });
+    test('markers are enabled, at 5m, only for a row that says prompt_cache: true', () => {
+        const catalog = parseGatewayModels({ contract: 'ezil.gateway.models.v1', killswitch: false, pause: null, data: [
+            row('claude-sonnet-5-5', { tool_calling: true, image_input: false, streaming: true, prompt_cache: true }),
+            row('qwen.qwen3-coder-next', { tool_calling: true, image_input: false, streaming: true, prompt_cache: false }),
+            row('zai.glm-5', { tool_calling: true, image_input: false, streaming: true }),
+            row('us.moonshotai.kimi-k3'),
+            row('claude-haiku-5-5', { prompt_cache: 'yes' }),
+        ] });
+        expect(catalog?.data[0]?.capabilities?.prompt_cache).toBe(true);
+        const models = gatewayCatalogModels(gw().provider, catalog, []);
+        expect(models.filter(model => model.gatewayPromptCache === true).map(model => model.model)).toEqual(['claude-sonnet-5-5']);
+        expect(models.map(model => [model.model, model.cache])).toEqual([
+            ['claude-sonnet-5-5', { enabled: true, ttl: '5m' }],
+            ['qwen.qwen3-coder-next', { enabled: false, ttl: '5m' }],
+            ['zai.glm-5', { enabled: false, ttl: '5m' }],
+            ['us.moonshotai.kimi-k3', { enabled: false, ttl: '5m' }],
+            ['claude-haiku-5-5', { enabled: false, ttl: '5m' }],
+        ]);
+    });
+
+    test('a refreshed row without prompt_cache: true revokes the markers before the next request', () => {
+        const catalog = (capabilities?: Record<string, unknown>) => parseGatewayModels({ contract: 'ezil.gateway.models.v1', killswitch: false, pause: null,
+            data: [row('claude-sonnet-5-5', capabilities)] });
+        const [model] = gatewayCatalogModels(gw().provider, catalog({ tool_calling: true, streaming: true, prompt_cache: true }), []);
+        expect(model?.gatewayPromptCache).toBe(true);
+        const sent = (limited: typeof model) => new TextDecoder().decode(buildGatewayBody(limited!, ask([msg('system', txt('Stable context.')), msg('user', txt('hi'))])).bytes);
+        expect(sent(withGatewayModelLimits(model!, catalog({ tool_calling: true, streaming: true, prompt_cache: true })))).toContain('cache_control');
+        for (const refreshed of [catalog({ tool_calling: true, streaming: true, prompt_cache: false }), catalog({ tool_calling: true, streaming: true }), catalog()]) {
+            const limited = withGatewayModelLimits(model!, refreshed);
+            expect(limited.gatewayPromptCache).toBeUndefined();
+            expect(limited.cache).toEqual({ enabled: false, ttl: '5m' });
+            expect(sent(limited)).not.toContain('cache_control');
+        }
+    });
+
+    test('limits never grant the markers to a model without them', () => {
+        const limited = withGatewayModelLimits({ ...gw(), model: 'claude-sonnet-5-5' }, parseGatewayModels({ contract: 'ezil.gateway.models.v1', killswitch: false,
+            pause: null, data: [row('claude-sonnet-5-5', { prompt_cache: true })] }));
+        expect(limited.gatewayPromptCache).toBeUndefined();
+        expect(limited.cache).toEqual(gw().cache);
+    });
 });

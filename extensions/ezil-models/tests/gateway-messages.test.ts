@@ -1,6 +1,9 @@
 import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { buildGatewayBody, gatewayInputTokens, gatewayMessage, gatewayOutputTokens, gatewayTokenCount, gatewayTools, KIMI, LocalRequestError } from '../src/gateway-messages';
+import { GatewayError } from '../src/gateway-error';
+import { gatewayChat } from '../src/gateway';
+import { buildGatewayBody, gatewayInputTokens, gatewayMessage, gatewayOutputTokens, gatewayTokenCount, gatewayTools, geminiRoute, geminiToolSchema, KIMI, LocalRequestError, replaysThinking } from '../src/gateway-messages';
+import type { Tool } from '../src/types';
 import { ask, call, fixtureRequests, gw, image, marker, msg, result, thinking, tool, txt } from './fixtures/gateway';
 
 const build = (request = ask()) => buildGatewayBody(gw(), request).body;
@@ -55,9 +58,22 @@ describe('gateway sanitizer', () => {
         const request = { ...ask([msg('system', txt('sys'), marker), msg('user', txt('q'), marker), msg('assistant', call('a'), marker), msg('user', result('a', [txt('out'), marker]), marker)]), tools: [{ ...tool, cache_control: { type: 'ephemeral' } }], modelOptions: { cache_control: { type: 'ephemeral' } } };
         expect(JSON.stringify(buildGatewayBody({ ...gw(), cache: { enabled: true, ttl: '1h' } }, request).body)).not.toContain('cache_control');
     });
-    test('thinking and redacted thinking are dropped', () => {
-        const body = build(ask([msg('user', txt('q')), msg('assistant', thinking, { ...thinking, metadata: { redactedData: 'hidden' } }, txt('answer')), msg('user', txt('next'))]));
-        expect(JSON.stringify(body)).not.toMatch(/thinking|reasoning|signature|hidden/);
+    test('signed thinking and redacted thinking are dropped on every non-native route (Qwen, Kimi Converse)', () => {
+        for (const id of [gw().model, KIMI]) {
+            const body = buildGatewayBody(gw(id), ask([msg('user', txt('q')), msg('assistant', thinking, { ...thinking, metadata: { redactedData: 'hidden' } }, txt('answer')), msg('user', txt('next'))])).body;
+            expect(body.messages[1]!.content).toEqual([{ type: 'text', text: 'answer' }]);
+            expect(JSON.stringify(body)).not.toMatch(/thinking|hidden|"sig"/);
+        }
+    });
+    test('the native route is decided by the explicit Claude model id only', () => {
+        for (const id of ['claude-sonnet-5-5', 'anthropic.claude-sonnet-5-5', 'us.anthropic.claude-sonnet-5-5']) expect(replaysThinking(id)).toBe(true);
+        for (const id of [gw().model, KIMI, 'gemini-3.8-flash', 'gpt-6.1-sol', 'claude', 'x.claude-sonnet-5-5', 'us.anthropic.claude-sonnet-5-5\n']) expect(replaysThinking(id)).toBe(false);
+    });
+    test('signed thinking and redacted thinking are replayed on the native Anthropic route', () => {
+        const body = buildGatewayBody(gw('us.anthropic.claude-sonnet-5-5'), ask([msg('user', txt('q')), msg('assistant', thinking, { ...thinking, metadata: { redactedData: 'hidden' } }, txt('answer')), msg('user', txt('next'))])).body;
+        expect(body.messages[1]!.content).toEqual([{ type: 'thinking', thinking: 'reasoning', signature: 'sig' },
+            { type: 'redacted_thinking', data: 'hidden' }, { type: 'text', text: 'answer' }]);
+        expect(JSON.stringify(body)).not.toContain(thinking.value);
     });
     test('tool_use arguments are objects; invalid arguments and identifiers become text', () => {
         const request = { ...ask([msg('assistant', call('valid'), call('bad.id'), call('array', 'read_file', []), call('inf', 'read_file', { n: Infinity }))]), tools: [tool] };
@@ -131,5 +147,249 @@ describe('gateway sanitizer', () => {
     for (const [name, fixture] of Object.entries(fixtureRequests())) test(`fixture ${name} is produced by sanitizer`, () => {
         const expected = JSON.parse(readFileSync(`${import.meta.dir}/fixtures/gateway-bodies/${name}.json`, 'utf8'));
         expect(buildGatewayBody(fixture.model, fixture.request).body).toEqual(expected);
+    });
+});
+
+// The Gateway's Gemini schema allowlist (EZiL AI Gateway d59b82a5 src/providers/gemini-request.ts GEMINI_SCHEMA_KEYWORDS).
+const GATEWAY_GEMINI_KEYWORDS = new Set(['type', 'properties', 'required', 'additionalProperties', 'enum', 'format', 'minimum', 'maximum',
+    'items', 'prefixItems', 'minItems', 'maxItems', 'anyOf', '$ref', '$defs', 'title', 'description', '$schema', '$id', '$comment', 'default', 'examples']);
+/** Every keyword in a schema, walking the same schema positions as the Gateway. */
+function keywords(schema: unknown, found = new Set<string>()): Set<string> {
+    if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return found;
+    for (const [key, member] of Object.entries(schema)) {
+        found.add(key);
+        if (key === 'properties' || key === '$defs') for (const child of Object.values(member as object)) keywords(child, found);
+        if (key === 'items' || key === 'additionalProperties') keywords(member, found);
+        if (key === 'prefixItems' || key === 'anyOf') for (const child of member as unknown[]) keywords(child, found);
+    }
+    return found;
+}
+// Copilot Chat 0.69's own tools whose schemas carry keywords the Gateway refuses for Gemini (captured from the image, Agent mode).
+const copilotTools = (): Tool[] => JSON.parse(readFileSync(new URL('./fixtures/copilot-0.69-gemini-tools.json', import.meta.url), 'utf8'));
+const geminiBody = (tools: Tool[], log?: (line: string) => void) => buildGatewayBody({ ...gw(), model: 'gemini-3.8-flash' }, { ...ask(), tools }, log).body;
+
+describe('Gemini tool schemas', () => {
+    test('the depth bound is the Gateway\'s, boolean leaves included', () => {
+        const nest = (levels: number, leaf: unknown) => { let node: unknown = leaf; for (let i = 0; i < levels; i++) node = { type: 'array', items: node }; return node; };
+        // The root is depth 0 and `properties.a` depth 1, so a leaf under 63 more arrays sits at depth 64.
+        for (const leaf of [true, { type: 'string' }]) {
+            expect(geminiToolSchema({ type: 'object', properties: { a: nest(63, leaf) } })).toBeDefined();
+            expect(geminiToolSchema({ type: 'object', properties: { a: nest(64, leaf) } })).toBeUndefined();
+        }
+    });
+    test('a JSON-parsed __proto__ key is kept as a property or restated, never lost', () => {
+        const property = JSON.parse('{"type":"object","properties":{"__proto__":{"type":"string","maxLength":3}},"required":["__proto__"]}');
+        const projected = geminiToolSchema(property) as any;
+        expect(Object.hasOwn(projected.properties, '__proto__')).toBe(true);
+        expect(Object.getOwnPropertyDescriptor(projected.properties, '__proto__')!.value).toEqual({ type: 'string', description: 'JSON Schema constraints: {"maxLength":3}' });
+        expect(JSON.stringify(projected)).toBe('{"type":"object","properties":{"__proto__":{"type":"string","description":"JSON Schema constraints: {\\"maxLength\\":3}"}},"required":["__proto__"]}');
+        const keyword = geminiToolSchema(JSON.parse('{"type":"string","__proto__":{"x":1}}')) as any;
+        expect(keyword).toEqual({ type: 'string', description: 'JSON Schema constraints: {"__proto__":{"x":1}}' });
+    });
+    test('Copilot tools keep every tool, only allowlisted keywords, and the moved constraints verbatim in descriptions', () => {
+        const tools = copilotTools();
+        const before = structuredClone(tools);
+        const lines: string[] = [];
+        const body = geminiBody(tools, line => lines.push(line));
+        expect(body.tools!.map(t => t.name)).toEqual(tools.map(t => t.name));
+        for (const t of body.tools!) for (const key of keywords(t.input_schema)) expect(GATEWAY_GEMINI_KEYWORDS.has(key)).toBe(true);
+        const sent = JSON.stringify(body.tools);
+        const terminalId = (before.find(t => t.name === 'get_terminal_output')!.inputSchema as any).properties.id;
+        expect((body.tools!.find(t => t.name === 'get_terminal_output')!.input_schema as any).properties.id).toEqual({
+            type: 'string', description: `${terminalId.description}\nJSON Schema constraints: ${JSON.stringify({ pattern: terminalId.pattern })}`,
+        });
+        expect(sent).toContain(JSON.stringify(JSON.stringify({ maxLength: 50 })).slice(1, -1));
+        expect(sent).toContain('enumDescriptions');
+        // Copilot validates tool input against its own schema: that object must be untouched.
+        expect(tools).toEqual(before);
+        expect(lines).toEqual(['[gateway] tool schema keywords Gemini refuses restated in descriptions: ["vscode_askQuestions","get_terminal_output","kill_terminal","run_in_terminal","send_to_terminal"]']);
+    });
+    test('other routes send the schemas unchanged', () => {
+        const tools = copilotTools();
+        for (const model of ['qwen.qwen3-coder-next', KIMI, 'claude-sonnet-5-5', 'gemini-3.8-flash-preview', 'google.gemini-3.8-flash']) {
+            const body = buildGatewayBody({ ...gw(), model }, { ...ask(), tools }, () => { throw new Error('no log'); }).body;
+            expect(body.tools!.map(t => t.input_schema)).toEqual(tools.map(t => t.inputSchema as Record<string, unknown>));
+        }
+        expect(['gemini-3.8-flash', ' Gemini-3.1-Pro-Preview ', 'gemini-4-argon'].every(geminiRoute)).toBe(true);
+    });
+    test('const becomes a one-value enum; beside an enum it is restated instead', () => {
+        expect(geminiToolSchema({ type: 'object', properties: { mode: { type: 'string', const: 'read' } } }))
+            .toEqual({ type: 'object', properties: { mode: { type: 'string', enum: ['read'] } } });
+        expect(geminiToolSchema({ type: 'string', enum: ['a', 'b'], const: 'a' }))
+            .toEqual({ type: 'string', enum: ['a', 'b'], description: 'JSON Schema constraints: {"const":"a"}' });
+    });
+    test('nested positions are projected; a property named like a keyword stays a property', () => {
+        const restated = new Set<string>();
+        const schema = { type: 'object', description: 'Top.', properties: { pattern: { type: 'string', minLength: 1 },
+            list: { type: 'array', uniqueItems: true, items: { anyOf: [{ type: 'string', format: 'uri', maxLength: 9 }, { type: 'null' }] } },
+            pair: { type: 'array', prefixItems: [{ type: 'number', multipleOf: 2 }] }, ref: { $ref: '#/$defs/x' } },
+            $defs: { x: { type: 'integer', exclusiveMinimum: 0 } }, additionalProperties: { type: 'string', deprecated: true } };
+        expect(geminiToolSchema(schema, restated)).toEqual({ type: 'object', description: 'Top.', properties: {
+            pattern: { type: 'string', description: 'JSON Schema constraints: {"minLength":1}' },
+            list: { type: 'array', items: { anyOf: [{ type: 'string', format: 'uri', description: 'JSON Schema constraints: {"maxLength":9}' }, { type: 'null' }] },
+                description: 'JSON Schema constraints: {"uniqueItems":true}' },
+            pair: { type: 'array', prefixItems: [{ type: 'number', description: 'JSON Schema constraints: {"multipleOf":2}' }] }, ref: { $ref: '#/$defs/x' } },
+            $defs: { x: { type: 'integer', description: 'JSON Schema constraints: {"exclusiveMinimum":0}' } },
+            additionalProperties: { type: 'string', description: 'JSON Schema constraints: {"deprecated":true}' } });
+        expect([...restated].sort()).toEqual(['deprecated', 'exclusiveMinimum', 'maxLength', 'minLength', 'multipleOf', 'uniqueItems']);
+    });
+    test('every $ref must resolve inside the projected schema, at any depth; otherwise only that tool is dropped', () => {
+        const wrap = (extra: object, a: unknown) => ({ type: 'object', ...extra, properties: { a } });
+        const deep = (ref: string) => ({ type: 'array', items: { anyOf: [{ type: 'object', properties: { v: { $ref: ref } } }, { type: 'null' }] } });
+        // Anchors are moved into descriptions, so a reference by anchor would dangle: dropped, however deep the reference.
+        for (const anchor of ['$anchor', '$dynamicAnchor']) {
+            expect(geminiToolSchema(wrap({ $defs: { T: { [anchor]: 'item', type: 'string' } } }, { $ref: '#item' }))).toBeUndefined();
+            expect(geminiToolSchema(wrap({ $defs: { T: { [anchor]: 'item', type: 'string' } } }, deep('#item')))).toBeUndefined();
+        }
+        for (const [extra, ref] of [[{ components: { X: { type: 'string' } } }, '#/components/X'], [{}, 'https://example.invalid/schema.json'],
+            [{}, 'other.json#/x'], [{ $defs: { T: { type: 'string' } } }, '#/$defs/U'], [{ $defs: { T: { type: 'string' } } }, '#/$defs'],
+            [{ $defs: { T: { type: 'string' } } }, '#/$defs/T/type'], [{ $defs: { T: { type: 'string' } } }, '#/$defs/%E0%A4%A']] as const) {
+            expect(geminiToolSchema(wrap(extra, deep(ref)))).toBeUndefined();
+        }
+        // A nested $id starts a new base for the references below it: not resolved here, so dropped.
+        // (Here the pointer would resolve from the root, so only the nested $id makes it ambiguous.)
+        const underId = (id: object) => ({ type: 'object', properties: { a: { ...id, $defs: { T: { type: 'string' } }, properties: { v: { $ref: '#/properties/a/$defs/T' } } } } });
+        expect(geminiToolSchema(underId({ $id: 'https://example.invalid/a' }))).toBeUndefined();
+        expect(geminiToolSchema(underId({}))).toBeDefined();
+        // Pointers to the projected root's own schemas are kept unchanged, escapes and array indexes included.
+        for (const [extra, ref] of [[{}, '#'], [{ $defs: { T: { type: 'string', minLength: 1 } } }, '#/$defs/T'], [{ $defs: { 'a/b~c': { type: 'string' } } }, '#/$defs/a~1b~0c'],
+            [{ $defs: { 'x y': { type: 'string' } } }, '#/$defs/x%20y'], [{ $defs: { L: { anyOf: [{ type: 'string' }, { type: 'null' }] } } }, '#/$defs/L/anyOf/1'],
+            [{ $defs: { B: true } }, '#/$defs/B'], [{ $id: 'https://example.invalid/root' }, '#/properties/a']] as const) {
+            const projected = geminiToolSchema(wrap(extra, deep(ref))) as any;
+            expect(projected).toBeDefined();
+            expect(projected.properties.a.items.anyOf[0].properties.v).toEqual({ $ref: ref });
+        }
+        // Only references inside a subschema with its own base ($id, or draft-04 id) are refused; others still resolve.
+        const T = { $defs: { T: { type: 'string' } } };
+        for (const [where, at] of [['items', (x: object) => ({ type: 'array', items: x })], ['anyOf', (x: object) => ({ anyOf: [x, { type: 'null' }] })],
+            ['additionalProperties', (x: object) => ({ type: 'object', additionalProperties: x })], ['prefixItems', (x: object) => ({ type: 'array', prefixItems: [x] })]] as const) {
+            for (const id of [{ $id: 'https://example.invalid/n' }, { id: 'https://example.invalid/n' }]) {
+                expect([where, geminiToolSchema({ type: 'object', ...T, properties: { a: at({ type: 'object', ...id }), b: { $ref: '#/$defs/T' } } })]).not.toEqual([where, undefined]);
+                expect([where, geminiToolSchema({ type: 'object', ...T, properties: { a: at({ type: 'object', ...id, properties: { v: { $ref: '#/$defs/T' } } }) } })]).toEqual([where, undefined]);
+                expect([where, geminiToolSchema({ type: 'object', properties: { a: at({ type: 'object', ...id, properties: { v: { $ref: '#' } } }) } })]).toEqual([where, undefined]);
+                expect([where, geminiToolSchema({ type: 'object', properties: { a: at({ type: 'object', ...id }) } })]).not.toEqual([where, undefined]);
+            }
+        }
+        // Targets must be schema positions: never a value inside const (rewritten to enum), default or examples.
+        for (const [a, ref] of [[{ const: false }, '#/properties/a/enum/0'], [{ type: 'boolean', default: true }, '#/properties/a/default'],
+            [{ type: 'boolean', examples: [false] }, '#/properties/a/examples/0'], [{ anyOf: [{ type: 'string' }] }, '#/properties/a/anyOf/01']] as const) {
+            expect(geminiToolSchema({ type: 'object', properties: { a, b: { $ref: ref } } })).toBeUndefined();
+        }
+        // RFC 6901 as a URI fragment: percent-decoded before it is split, then ~1 before ~0.
+        expect(geminiToolSchema({ type: 'object', $defs: { 'x/y': { type: 'string' }, x: { type: 'object', properties: { y: { type: 'integer' } } } },
+            properties: { a: { $ref: '#/$defs/x%2Fy' } } })).toBeUndefined();
+        for (const [defs, ref] of [[{ T: { type: 'string' } }, '#/$defs%2FT'], [{ '~1': { type: 'string' } }, '#/$defs/~01']] as const) {
+            expect(geminiToolSchema({ type: 'object', $defs: defs, properties: { a: { $ref: ref } } })).toBeDefined();
+        }
+        for (const ref of ['#/properties/p/prefixItems/1', '#/properties/p/additionalProperties']) {
+            expect(geminiToolSchema({ type: 'object', properties: { p: { type: 'array', prefixItems: [{ type: 'string' }, { type: 'integer' }], additionalProperties: false },
+                q: { $ref: ref } } })).toBeDefined();
+        }
+        const lines: string[] = [];
+        const body = geminiBody([{ name: 'ok', inputSchema: { type: 'object', properties: { a: { type: 'string' } } } },
+            { name: 'anchored', inputSchema: wrap({ $defs: { T: { $anchor: 'item', type: 'string' } } }, deep('#item')) }], line => lines.push(line));
+        expect(body.tools!.map(t => t.name)).toEqual(['ok']);
+        expect(lines).toContain('[gateway] dropped tools: ["anchored"]');
+    });
+    test('a rebase is inherited across every schema position; a pointer must name a position that exists', () => {
+        const T = { $defs: { T: { type: 'string' } } };
+        const v = { type: 'object', properties: { v: { $ref: '#/$defs/T' } } };
+        for (const below of [{ type: 'array', items: v }, { type: 'object', additionalProperties: v }, { anyOf: [v] }, { type: 'array', prefixItems: [v] }]) {
+            expect(geminiToolSchema({ type: 'object', ...T, properties: { a: { $id: 'https://example.invalid/a', ...below } } })).toBeUndefined();
+            expect(geminiToolSchema({ type: 'object', ...T, properties: { a: below } })).toBeDefined();
+        }
+        expect(geminiToolSchema({ type: 'object', properties: { a: { type: 'array' }, b: { $ref: '#/properties/a/items' } } })).toBeUndefined();
+        expect(geminiToolSchema({ type: 'object', items: { type: 'string' }, properties: { a: { $ref: '#Xitems' } } })).toBeUndefined();
+    });
+    test('a chat whose tools all cannot be sent is refused locally, never sent as a chat without tools', () => {
+        const unusable: Tool[] = [{ name: 'one_of', inputSchema: { type: 'object', properties: { a: { oneOf: [{ type: 'string' }] } } } },
+            { name: 'anchored', inputSchema: { type: 'object', $defs: { T: { $anchor: 'item', type: 'string' } }, properties: { a: { $ref: '#item' } } } }];
+        for (const toolMode of ['auto', 'required'] as const) {
+            let error: unknown;
+            try { buildGatewayBody({ ...gw(), model: 'gemini-3.8-flash' }, { ...ask(), tools: unusable, toolMode }, () => {}); } catch (caught) { error = caught; }
+            expect(error).toBeInstanceOf(GatewayError);
+            expect(error).toMatchObject({ code: 'local_tools_unsupported', origin: 'local', status: undefined });
+            expect((error as Error).message).toBe("EZiL Models: none of this chat's 2 tools can be sent to gemini-3.8-flash (their input schemas use features this model "
+                + 'cannot take, or they are invalid; see the EZiL Models log). Nothing was sent or charged. Pick another model, or turn those tools off with Configure Tools');
+        }
+        // Any route: tools that are all invalid (names, schemas) refuse the same way; with no tools offered nothing changes.
+        expect(() => buildGatewayBody(gw(), { ...ask(), tools: [{ name: 'bad.name' }, { name: 'array', inputSchema: { type: 'array' } }] })).toThrow(GatewayError);
+        expect(buildGatewayBody({ ...gw(), model: 'gemini-3.8-flash' }, ask()).body.tools).toBeUndefined();
+        expect(buildGatewayBody({ ...gw(), model: 'gemini-3.8-flash' }, ask()).body.tool_choice).toBeUndefined();
+        // One usable tool is enough: the turn goes with it (the others are logged as dropped).
+        expect(geminiBody([...unusable, { name: 'ok', inputSchema: { type: 'object', properties: {} } }], () => {}).tools!.map(t => t.name)).toEqual(['ok']);
+    });
+    test('the local refusal ends the turn before any request is sent', async () => {
+        const sent: string[] = [];
+        const fetch = (async (url: string | URL | Request) => { sent.push(String(url)); return Response.json({ data: [] }); }) as typeof globalThis.fetch;
+        const turn = gatewayChat({ ...gw(), model: 'gemini-3.8-flash' }, { ...ask(), tools: [{ name: 'one_of', inputSchema: { type: 'object', properties: { a: { oneOf: [{ type: 'string' }] } } } }], toolMode: 'required' },
+            { signal: new AbortController().signal, fetch, sleep: async () => {}, now: () => 0 });
+        let error: unknown;
+        try { for await (const _ of turn) { /* nothing arrives */ } } catch (caught) { error = caught; }
+        expect(error).toMatchObject({ code: 'local_tools_unsupported', origin: 'local' });
+        expect(sent.filter(url => url.endsWith('/messages'))).toEqual([]);
+    });
+    test('a schema-holding keyword or a value the Gateway refuses drops only that tool', () => {
+        const ok: Tool = { name: 'ok', inputSchema: { type: 'object', properties: { a: { type: 'string' } } } };
+        const bad = (name: string, inner: object): Tool => ({ name, inputSchema: { type: 'object', properties: { a: inner } } });
+        let deep: object = { type: 'string' };
+        for (let i = 0; i < 70; i++) deep = { type: 'array', items: deep };
+        const refused = [bad('one_of', { oneOf: [{ type: 'string' }] }), bad('all_of', { allOf: [{ type: 'string' }] }), bad('not_', { not: { type: 'null' } }),
+            bad('if_then', { if: { type: 'string' }, then: { minLength: 1 } }), bad('pattern_props', { type: 'object', patternProperties: { x: {} } }),
+            { name: 'definitions', inputSchema: { type: 'object', definitions: { x: { type: 'string' } } } },
+            bad('bad_type', { type: 'date' }), bad('empty_enum', { enum: [] }), bad('frac_items', { type: 'array', minItems: 1.5 }),
+            bad('num_description', { type: 'string', description: 3 }), bad('empty_any_of', { anyOf: [] }), bad('deep', deep)];
+        const lines: string[] = [];
+        const body = geminiBody([ok, ...refused], line => lines.push(line));
+        expect(body.tools!.map(t => t.name)).toEqual(['ok']);
+        expect(lines).toEqual([`[gateway] dropped tools: ${JSON.stringify(refused.map(t => t.name))}`]);
+        for (const inner of [{ type: 'string', contentSchema: { type: 'object' } }, { $dynamicRef: '#node' }, { type: 'object', required: [1] },
+            { type: 'number', minimum: '1' }, { type: 'number', maximum: null }, { type: 'object', properties: [] }]) {
+            expect(geminiToolSchema({ type: 'object', properties: { a: inner } })).toBeUndefined();
+        }
+    });
+});
+
+describe('prompt cache breakpoints', () => {
+    const CLAUDE = 'claude-sonnet-5-5';
+    const cached = (id: string, ttl: '5m' | '1h' = '5m') => ({ ...gw(), model: id, cache: { enabled: true, ttl }, gatewayPromptCache: true as const });
+    const turn1 = [msg('system', txt('Stable workspace context.')), msg('user', txt('Read the file')), msg('assistant', call('c1')), msg('user', result('c1'))];
+    const turn2 = [...turn1, msg('assistant', txt('Done')), msg('user', txt('Now summarise it'))];
+    const markers = (body: unknown) => (JSON.stringify(body).match(/"cache_control"/g) ?? []).length;
+    const unmarked = (body: unknown) => JSON.parse(JSON.stringify(body, (key, value) => key === 'cache_control' ? undefined : value));
+
+    test('off by default and off without the capability: no marker reaches the wire', () => {
+        expect(markers(buildGatewayBody(gw(), { ...ask(turn1), tools: [tool] }).bytes.toString())).toBe(0);
+        expect(new TextDecoder().decode(buildGatewayBody({ ...gw(), model: CLAUDE, cache: { enabled: true, ttl: '5m' } }, { ...ask(turn1), tools: [tool] }).bytes)).not.toContain('cache_control');
+    });
+
+    test('on a prompt_cache model: last tool, last system block and last user block, ephemeral 5m, counted in the byte bound', () => {
+        const { body, bytes } = buildGatewayBody(cached(CLAUDE, '1h'), { ...ask(turn1), tools: [tool] });
+        expect(body.tools?.at(-1)).toMatchObject({ cache_control: { type: 'ephemeral' } });
+        expect(body.system?.at(-1)).toMatchObject({ cache_control: { type: 'ephemeral' } });
+        expect(body.messages.at(-1)?.content.at(-1)).toMatchObject({ type: 'tool_result', cache_control: { type: 'ephemeral' } });
+        expect(markers(body)).toBe(3);
+        const wire = new TextDecoder().decode(bytes);
+        expect((wire.match(/"cache_control":\{"type":"ephemeral"\}/g) ?? []).length).toBe(3);
+        expect(wire).not.toContain('"ttl"');
+    });
+
+    test('never on a Gemini body, even if the model says cache is enabled', () => {
+        for (const alias of ['gemini-3.8-flash', 'gemini-4-argon']) {
+            expect(new TextDecoder().decode(buildGatewayBody(cached(alias), { ...ask(turn1), tools: [tool] }).bytes)).not.toContain('cache_control');
+        }
+    });
+
+    test('Copilot cache parts are still dropped, and at most four markers are sent', () => {
+        const body = buildGatewayBody(cached(CLAUDE), { ...ask([msg('system', txt('a'), marker), msg('user', txt('b'), marker)]), tools: [tool] }).body;
+        expect(markers(body)).toBeLessThanOrEqual(4);
+        expect(JSON.stringify(body)).not.toContain('"data"');
+    });
+
+    test('the next agent turn keeps the earlier turn as a byte-identical prefix (markers aside)', () => {
+        const first = unmarked(buildGatewayBody(cached(CLAUDE), { ...ask(turn1), tools: [tool] }).body);
+        const second = unmarked(buildGatewayBody(cached(CLAUDE), { ...ask(turn2), tools: [tool] }).body);
+        expect(JSON.stringify([second.tools, second.system])).toBe(JSON.stringify([first.tools, first.system]));
+        expect(JSON.stringify(second.messages.slice(0, first.messages.length))).toBe(JSON.stringify(first.messages));
     });
 });

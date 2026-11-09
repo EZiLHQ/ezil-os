@@ -192,6 +192,27 @@ hold, HTTP status, latency, four usage buckets, stop reason, error code and
 error origin (`local`, `os_proxy`, `gateway`, `transport` or `response`). Local
 refusals add their sizes only: body and limit bytes, messages, largest message
 blocks, tools and tool bytes.
+The line also includes the current client request UUID, send count (`attempts`),
+and whether text or a tool call preceded a failure (`partial`). A size-compaction
+retry adds the previous client request UUID. Response failures add `reason`:
+`stream_error_event` for an SSE error event, `stream_truncated` for missing terminal
+completion, `stream_malformed` for invalid JSON/event shapes or unsupported blocks,
+`connection_reset` for a failed body read, or `invalid_response` for an invalid
+complete JSON reply or response envelope. An SSE error may also add `upstream_type`,
+selected from a closed error-type allowlist; event data and messages are discarded.
+The existing `stream_interrupted`/`invalid_response` codes and interruption text
+are unchanged. Typed deadlines keep their existing codes instead of becoming
+connection resets.
+
+`classifyChatFailure` in `src/failure.ts` produces version 1 failure metadata with
+validated codes, model identifiers, UUIDs, origins, HTTP status, counts and times.
+Invalid required metadata becomes null (invalid booleans become false); invalid
+optional metadata is omitted. Counts must be safe non-negative integers and are
+capped at one billion; valid timestamps are ISO strings. It never copies messages,
+causes or payloads. `gatewayChat` exposes an optional `onOutcome` callback, called
+once for failure or cancellation and never for success. Callback exceptions are
+ignored. The provider does not register it yet; no additional reporting is wired.
+
 Prompts, bodies and tokens are never logged for the gateway, even when legacy
 request logging is enabled. Cancellation aborts fetch, stops reporting parts,
 and logs `cancelled; may still be charged (request …)`.
