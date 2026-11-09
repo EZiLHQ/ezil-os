@@ -1523,7 +1523,7 @@ export async function openDesktopWindow (ctx = {}) {
                 + `${res.message ? ` (${res.message})` : ''}`);
             telemetry.capture({
                 eventClass: 'api_failure', site: 'ezil-os:apps/desktop#mint', code: res.errorCode,
-                durationMs: performance.now() - t0,
+                durationMs: performance.now() - t0, reason: res.reason, serverCorrelationId: res.serverCorrelationId,
                 // 🔴 The SERVER's own words, not just our classification of
                 // them. `desktop_unreachable` is one code covering
                 // `desktop_frame_http_error_404`, `_410`, `_500` and

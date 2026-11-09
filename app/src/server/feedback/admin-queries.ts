@@ -18,7 +18,10 @@ export interface AdminReportSummary {
     descriptionPreview: string;
     hasScreenshot: boolean;
     computerId: string | null;
+    /** The client's diagnostics exactly as previewed and posted; `serverContext` is split out below. */
     diagnostics: unknown;
+    /** Server-added at submission (`server-context.ts`); null when not captured. Never part of the client preview. */
+    serverContext: unknown;
     deploySha: string | null;
     status: string;
 }
@@ -54,6 +57,12 @@ function adminId(deps: FeedbackAdminContext): string | null {
     return deps.user && isFeedbackAdmin(deps.user.email, deps.allowList) ? deps.user.id : null;
 }
 
+// App-error coverage: `server-context.ts` stores its submission-time context under `diagnostics.serverContext`, a key
+// the strict client schema cannot send. Admin reads return the client's diagnostics without it, exactly as previewed
+// and posted, and the server context as its own field. A scalar or null diagnostics value is returned unchanged.
+const CLIENT_DIAGNOSTICS = sql.raw(`CASE WHEN jsonb_typeof(r.diagnostics) = 'object' THEN r.diagnostics - 'serverContext' ELSE r.diagnostics END`);
+const SERVER_CONTEXT = sql.raw(`CASE WHEN jsonb_typeof(r.diagnostics) = 'object' THEN r.diagnostics -> 'serverContext' END`);
+
 function rowsOf<T>(result: unknown): T[] {
     return (Array.isArray(result) ? result : (result as { rows?: T[] })?.rows ?? []) as T[];
 }
@@ -72,7 +81,7 @@ export function feedbackAdminQueries(db: FeedbackDb): FeedbackAdminQueries & Pic
             return rowsOf<AdminReportSummary>(await db.execute(sql`
                 SELECT r.id, r.created_at AS "createdAt", r.category,
                     left(r.description, ${FEEDBACK_LIMITS.descriptionPreview}) AS "descriptionPreview",
-                    left(r.computer_id::text, 8) AS "computerId", r.diagnostics, r.status, r.deploy_sha AS "deploySha",
+                    left(r.computer_id::text, 8) AS "computerId", ${CLIENT_DIAGNOSTICS} AS diagnostics, ${SERVER_CONTEXT} AS "serverContext", r.status, r.deploy_sha AS "deploySha",
                     EXISTS (SELECT 1 FROM ezil_feedback_attachments a WHERE a.report_id = r.id) AS "hasScreenshot"
                 FROM ezil_feedback_reports r
                 WHERE r.id IN (${sql.join(ids.map((id) => sql`${id}`), sql`, `)})
@@ -82,7 +91,7 @@ export function feedbackAdminQueries(db: FeedbackDb): FeedbackAdminQueries & Pic
         async findReport(id) {
             return rowsOf<AdminReport>(await db.execute(sql`
                 SELECT r.id, r.created_at AS "createdAt", r.category, r.description,
-                    r.computer_id AS "computerId", r.diagnostics, r.status, r.deploy_sha AS "deploySha",
+                    r.computer_id AS "computerId", ${CLIENT_DIAGNOSTICS} AS diagnostics, ${SERVER_CONTEXT} AS "serverContext", r.status, r.deploy_sha AS "deploySha",
                     EXISTS (SELECT 1 FROM ezil_feedback_attachments a WHERE a.report_id = r.id) AS "hasScreenshot"
                 FROM ezil_feedback_reports r WHERE r.id = ${id} LIMIT 1
             `))[0] ?? null;
