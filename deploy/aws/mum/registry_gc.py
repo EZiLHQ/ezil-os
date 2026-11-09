@@ -165,15 +165,87 @@ def candidate_ami_observable(evidence, candidate):
 # exempts it.
 TERMINAL_IMAGE_JOB_PHASES = frozenset({'succeeded', 'recovered', 'cancelled'})
 
+# Typed (source, path-to-digest) edges where a digest-only link is acceptable, derived EXACTLY
+# from the edges the real-data exemptions use. A path is the dict-key chain to the digest value;
+# '$json' marks a parsed JSON-string boundary and '$substr' a longer string (an ECR ref) that
+# contains the digest. A digest at any other source or path keeps its ordinary proof.
+R1_DIGEST_EDGES = {
+    'poolHosts': frozenset({('lifecycle_input', '$json', 'document', '$json', 'deployment', 'previousLowerImageDigest')}),
+    'executions': frozenset({('input', '$json', 'document', '$json', 'deployment', 'previousLowerImageDigest')}),
+    'placements': frozenset({('lower_image_digest',)}),
+    'imageJobs': frozenset({
+        ('from_digest',), ('to_digest',),
+        ('host_evidence', 'lowerImageDigest'),
+        ('launch_document', '$json', 'deployment', 'lowerImageDigest'),
+        ('launch_document', '$json', 'deployment', 'previousLowerImageDigest'),
+        ('preparation_document', '$json', 'deployment', 'lowerImageDigest'),
+        ('preparation_document', '$json', 'deployment', 'previousLowerImageDigest'),
+        ('preparation_document', '$json', 'fromDigest'),
+        ('preparation_document', '$json', 'toDigest'),
+        ('preparation_document', '$json', 'sourceDeployment', 'lowerImageDigest'),
+        ('preparation_document', '$json', 'sourceDeployment', 'previousLowerImageDigest'),
+        ('snapshot_evidence', 'fromDigest'), ('snapshot_evidence', 'toDigest'),
+        ('source_release', 'lowerImageDigest'), ('source_release', 'previousLowerImageDigest'),
+        ('source_release', 'lowerImageRef', '$substr'), ('source_release', 'previousLowerImageRef', '$substr'),
+        ('target_release', 'lowerImageDigest'), ('target_release', 'previousLowerImageDigest'),
+        ('target_release', 'lowerImageRef', '$substr'), ('target_release', 'previousLowerImageRef', '$substr'),
+    }),
+}
+
 
 def r1_eligible(name, row):
-    """R1 exempts an executions/imageJobs row only when the row is itself terminal, so a row
-    that may still mutate keeps its ordinary attestation/binding. Other sources pass through."""
+    """R1 exempts a row only when its own state proves it will not change: a terminal execution
+    or image job, or a retired+settled pool host. Placements pass (the live-AMI guard covers an
+    active placement whose instance is on the candidate AMI); unknown sources never pass."""
+    if not isinstance(row, dict):
+        return False
     if name == 'executions':
-        return isinstance(row, dict) and row.get('status') in TERMINAL
+        return row.get('status') in TERMINAL
     if name == 'imageJobs':
-        return isinstance(row, dict) and row.get('phase') in TERMINAL_IMAGE_JOB_PHASES
-    return True
+        return row.get('phase') in TERMINAL_IMAGE_JOB_PHASES
+    if name == 'poolHosts':
+        return row.get('state') == 'retired' and row.get('dispatch_status') == 'settled'
+    return name in R1_DIGEST_EDGES
+
+
+def digest_paths(value, digest, prefix=()):
+    """Every path at which `digest` occurs in value, mirroring references()'s detection: a
+    dict-key chain, '$json' at a parsed JSON-string boundary, '$substr' for a longer string that
+    merely contains the digest. Used to confirm the digest sits only at allowlisted edges."""
+    out = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            out += digest_paths(child, digest, prefix + (key,))
+    elif isinstance(value, list):
+        for child in value:
+            out += digest_paths(child, digest, prefix + ('[*]',))
+    elif isinstance(value, str):
+        if value == digest:
+            out.append(prefix)
+        elif len(digest) > 12 and digest in value:
+            start = min((value.find(c) for c in '{[' if c in value), default=-1)
+            parsed = False
+            if start >= 0:
+                try:
+                    out += digest_paths(manifest.loads(value[start:]), digest, prefix + ('$json',))
+                    parsed = True
+                except (ValueError, TypeError):
+                    pass
+            if not parsed:
+                out.append(prefix + ('$substr',))
+    return out
+
+
+def r1_allowlisted(name, value, candidate):
+    """R1 exempts `value` only when the row is eligible (r1_eligible), references the candidate
+    solely through its lower digest with no non-digest token anywhere including a string prefix
+    (references_only_lower), and every occurrence of that digest sits at a typed allowlisted
+    (source, path) edge (R1_DIGEST_EDGES). A digest in any unknown source or field is never
+    exempt and keeps its ordinary binding/attestation requirement."""
+    if not (r1_eligible(name, value) and references_only_lower(value, candidate)):
+        return False
+    allowed = R1_DIGEST_EDGES.get(name)
+    return allowed is not None and all(path in allowed for path in digest_paths(value, candidate['lowerImageDigest']))
 
 
 # Every exemption binds one whole canonical source row. Proof documents are
@@ -298,16 +370,37 @@ def retained_data_volume(evidence, snapshot, candidate, resource, disposition):
     that links the candidate only by the shared lower. That placement is itself a
     shared-lower reference, so check_attestations' R1 rule enforces that a retained
     record keeps the lower and no live candidate-AMI instance exists before exempting it.
-    Rows are hash-bound by check_evidence; no caller-supplied claim is trusted here.
+    Every field is read from the hash-bound inventory; no caller-supplied claim is trusted and a
+    missing or wrongly typed field never reads as absent/empty.
     """
     need(set(disposition) == {'disposition'}, 'GC retained-data-volume unexpected disposition fields')
     volumes = [v for v in evidence['sources']['volumes']['rows'] if v.get('VolumeId') == resource]
-    need(resource.startswith('vol-') and len(volumes) == 1
-         and not volumes[0].get('SnapshotId') and not volumes[0].get('Attachments'),
-         'GC retained-data-volume not an unattached non-derived data volume')
+    need(resource.startswith('vol-') and len(volumes) == 1, 'GC retained-data-volume missing/duplicate volume')
+    volume = volumes[0]
+    need(type(volume.get('SnapshotId')) is str and volume['SnapshotId'] == ''
+         and type(volume.get('Attachments')) is list and volume['Attachments'] == []
+         and volume.get('State') == 'available' and bool(volume.get('VolumeType')),
+         'GC retained-data-volume not a complete unattached non-derived available data volume')
     owners = [p for p in evidence['sources']['placements']['rows'] if p.get('volume_id') == resource]
-    need(len(owners) == 1 and references_only_lower(owners[0], candidate),
-         'GC retained-data-volume not owned by one shared-lower placement')
+    need(len(owners) == 1, 'GC retained-data-volume not owned by exactly one placement')
+    owner = owners[0]
+    tags = {t['Key']: t.get('Value') for t in volume.get('Tags', []) if isinstance(t, dict) and 'Key' in t}
+    need(bool(owner.get('computer_id')) and tags.get('ezil:computer-id') == owner['computer_id'],
+         'GC retained-data-volume tag not bound to the owner computer')
+    # The owner's lower must be resolvable the way the app resolves a stopped computer: its exact
+    # lower column equals the candidate lower, it links the candidate only via the placement edge,
+    # and a retained alias keeps that lower (R1 kept-alias rule), re-checked here.
+    need(owner.get('lower_image_digest') == candidate['lowerImageDigest']
+         and r1_allowlisted('placements', owner, candidate) and shared_lower_kept(snapshot, candidate),
+         'GC retained-data-volume owner is not a supported shared-lower placement')
+    need(owner.get('state') not in ('RUNNING', 'STARTING', 'STOPPING'),
+         'GC retained-data-volume owner placement is active')
+    claimants = [r for src in ('placements', 'poolHosts') for r in evidence['sources'][src]['rows']
+                 if r is not owner and resource in resource_ids(r)]
+    need(not claimants, 'GC retained-data-volume has a conflicting claimant')
+    captured = time_value(evidence['capturedAt'])
+    need(not any(u.get('computer_id') == owner['computer_id'] and not closed_usage_row(u, captured)
+                 for u in evidence['proof']['usage']), 'GC retained-data-volume owner has an open usage row')
 
 
 def validate_attestation(a, row, evidence, snapshot, candidate):
@@ -384,8 +477,7 @@ def check_attestations(evidence, snapshot, candidate, views=None):
     # resolver select the candidate by observed AMI, so the alias is not substitutable.
     exempt = set()
     if shared_lower_kept(snapshot, candidate):
-        shared = [(name, row) for name, row in refs
-                  if references_only_lower(view(name, row), candidate) and r1_eligible(name, view(name, row))]
+        shared = [(name, row) for name, row in refs if r1_allowlisted(name, view(name, row), candidate)]
         if shared:
             need(not candidate_ami_observable(evidence, candidate),
                  'GC shared-lower alias observable on live candidate-AMI instance')

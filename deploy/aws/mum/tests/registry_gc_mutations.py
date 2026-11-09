@@ -70,12 +70,24 @@ wiring = [
     ('registry_gc.py', '    if shared_lower_kept(snapshot, candidate):', '    if True:  # dropped R1 kept-alias gate', commands['registry_gc.py']),
     ('registry_gc.py', 'not candidate_ami_observable(evidence, candidate)', 'not False', commands['registry_gc.py']),
     ('registry_gc.py', 'dict(candidate, lowerImageDigest=None)', 'candidate', commands['registry_gc.py']),
-    # R2 retained-data-volume (this PR): each data check dropped individually must be killed.
-    ('registry_gc.py', "not volumes[0].get('SnapshotId')", 'True', commands['registry_gc.py']),
-    ('registry_gc.py', "not volumes[0].get('Attachments')", 'True', commands['registry_gc.py']),
+    # R2 retained-data-volume (this PR): each typed data check dropped individually must be killed.
     ('registry_gc.py', "resource.startswith('vol-') and len(volumes) == 1", "resource.startswith('vol-') and True", commands['registry_gc.py']),
+    ('registry_gc.py', "volume['SnapshotId'] == ''", 'True', commands['registry_gc.py']),
+    ('registry_gc.py', "volume['Attachments'] == []", 'True', commands['registry_gc.py']),
+    ('registry_gc.py', "volume.get('State') == 'available'", 'True', commands['registry_gc.py']),
+    ('registry_gc.py', "bool(volume.get('VolumeType'))", 'True', commands['registry_gc.py']),
     ('registry_gc.py', 'len(owners) == 1', 'True', commands['registry_gc.py']),
-    ('registry_gc.py', 'references_only_lower(owners[0], candidate)', 'True', commands['registry_gc.py']),
+    ('registry_gc.py', "tags.get('ezil:computer-id') == owner['computer_id']", 'True', commands['registry_gc.py']),
+    ('registry_gc.py', "r1_allowlisted('placements', owner, candidate) and shared_lower_kept(snapshot, candidate)",
+     "True and shared_lower_kept(snapshot, candidate)", commands['registry_gc.py']),
+    ('registry_gc.py', "r1_allowlisted('placements', owner, candidate) and shared_lower_kept(snapshot, candidate)",
+     "r1_allowlisted('placements', owner, candidate) and True", commands['registry_gc.py']),
+    ('registry_gc.py', "owner.get('state') not in ('RUNNING', 'STARTING', 'STOPPING')", 'True', commands['registry_gc.py']),
+    ('registry_gc.py', 'need(not claimants,', 'need(True or not claimants,', commands['registry_gc.py']),
+    ('registry_gc.py', 'and not closed_usage_row(u, captured)', 'and False', commands['registry_gc.py']),
+    # R1 typed allowlist + poolHost eligibility (this PR).
+    ('registry_gc.py', "all(path in allowed for path in digest_paths(value, candidate['lowerImageDigest']))", 'True', commands['registry_gc.py']),
+    ('registry_gc.py', "row.get('state') == 'retired'", 'True', commands['registry_gc.py']),
     # Generalized app-tag pin (this PR): restoring a fixed literal or dropping either condition must be killed.
     ('rebase_release.py', "app.get('tag') == app['gitSha'][:12]", "app.get('tag') == '478c66b3559c'", commands['registry_gc.py']),
     ('rebase_release.py', "result['gitSha'] == app['gitSha']", 'True', commands['registry_gc.py']),

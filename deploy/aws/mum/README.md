@@ -491,23 +491,27 @@ host by its full tuple, otherwise filters multiple aliases by the observed sourc
 AMI, and a unique lower needs no observation.
 
 `registry-gc` collects exactly one record against quiesced, fenced, hash-bound
-evidence. A referencing row that links the candidate *only* through its
-`lowerImageDigest` (rule R1: e.g. a retired pool host's
-`deployment.previousLowerImageDigest`, a stopped computer's placement) needs no
-attestation or binding **iff** a retained record keeps that same lower digest and
-no non-terminated instance runs the candidate AMI; otherwise the row keeps its
-ordinary attestation/binding, or the whole GC is refused when the candidate AMI is
-observably live. A row that also references a non-digest identity token (AMI, state
-machine/launch-template/recipe version), including one hidden in a string prefix
-before embedded JSON, is never exempted this way, and `executions`/`imageJobs` rows
-are exempted only when the row is itself terminal. R1's safety rests on the app's
-`resolveRebaseReleases` semantics above: a lower-only link resolves identically
-against any retained alias with the same lower. An execution's retained data volume
-(rule R2: `vol-` with empty SnapshotId, unattached, owned by one such shared-lower
-placement) takes a `retained-data-volume` disposition, validated against inventory
-with the same strictness as every other disposition. `begin_operation`'s registry-gc
-app pin is structural — the plan app tag is the first twelve hex of its app gitSha and
-the live gitSha equals the plan's — not a fixed tag, so GC runs under later plans.
+evidence. Rule R1 exempts a referencing row from attestation/binding only when every
+occurrence of the candidate's lower digest sits at a typed, allowlisted `(source,
+path)` edge — the pool-host and terminal-execution
+`lifecycle_input`/`input → document → deployment.previousLowerImageDigest`, the
+placement `lower_image_digest` column, and the terminal image-job release/document
+digest fields — **and** a retained record keeps that same lower digest **and** no
+non-terminated instance runs the candidate AMI. The digest at any other source or
+field (a migration, a recovery blob, a bare column, a string prefix before embedded
+JSON) is never exempt; a row that also references a non-digest identity token (AMI,
+state-machine/launch-template/recipe version) is never exempt; `executions`/`imageJobs`
+rows must be terminal and pool hosts retired+settled. If a lower-only row is not
+exempt it keeps its ordinary attestation/binding, and the whole GC is refused when the
+candidate AMI is observably live. R1's safety rests on the app's `resolveRebaseReleases`
+semantics above: a lower-only link resolves identically against any retained alias with
+the same lower. Rule R2 gives an execution's retained data volume a
+`retained-data-volume` disposition only when the volume is a complete, typed, unattached
+non-derived available data volume tagged to its owner, owned by exactly one stopped
+shared-lower placement (resolvable as a stopped computer, sole claimant, no open usage),
+validated against inventory as strictly as every other disposition. `begin_operation`'s
+registry-gc app pin is structural — the plan app tag is the first twelve hex of its app
+gitSha and the live gitSha equals the plan's — not a fixed tag, so GC runs under later plans.
 
 For A3, a maintenance bake keeps its maintenance source lower ID, changes the
 reviewed agent commit, clears both previous parameters, and records
