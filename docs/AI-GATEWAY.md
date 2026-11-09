@@ -185,6 +185,15 @@ sets this header itself and never relays it from the Gateway. With an explicit
 `no_live_grant`) always pass through unchanged. The OS chooses Standard upgrade
 or Add credits from its own billing summary.
 
+The Gateway's credit window (`429 window_budget_reached`; its
+`docs/credit-window.md`) also passes through unchanged. It is a plan allowance
+checked before the wallet, so buying credits or changing plan does not lift it
+today. Code never treats it as a credit refusal. It says when the window resets,
+or that a request larger than the whole window will not fit by waiting, and it
+asks the OS for `window_limit`: Billing explains it on the AI credits row and
+opens no purchase. Lifting a window with a purchase would need a Gateway policy
+change, which this does not make.
+
 This enforcement is on the OS proxy path only. The Gateway itself has no notion
 of OS plans, so a member who calls it directly with their own token is limited
 only by their credits.

@@ -315,6 +315,15 @@ auth context.
   credits on a paid plan. Budgets, entitlement, validation, provider and network
   failures never ask. Without an OS window, the warning and its Add credits link
   remain.
+- **Credit window.** `window_budget_reached` is a plan allowance apart from the
+  wallet: buying credits or changing plan does not lift it today, so it is
+  never a credit refusal. The text gives the reset, or says a request larger
+  than the whole window will not fit by waiting (its hold exceeds the budget, or
+  no window has started). It adds that a new chat or a smaller model uses fewer
+  credits only when that can help. Code asks the OS window for `window_limit`,
+  with the reset when waiting can help, at most once a minute; Billing explains
+  it and opens no purchase. Without an OS window, Code shows the same words,
+  with no action.
 
 A `null` limit in `/me/limits` is a configured "No limit set", never unknown.
 Only the session window's `resets_at` is shown as a reset time. The EZiL AI
