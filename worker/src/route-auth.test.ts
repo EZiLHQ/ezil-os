@@ -23,7 +23,7 @@
  */
 
 import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_MODEL_ACCESS_MAX_AGE_MS, AI_MODEL_ACCESS_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, exactCacheScope, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
-import { beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it, mock, setSystemTime, spyOn } from 'bun:test';
 
 // Must be registered before `./index.ts` is imported (see module doc). The
 // shapes are only what `@cloudflare/sandbox` destructures at import time.
@@ -3831,6 +3831,115 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     // Older than AI_MODEL_ACCESS_MAX_AGE_MS: unknown again, whatever it said.
     values.set(AI_MODEL_ACCESS_STORAGE_KEY, { includedModels: null, signedAt: Date.now() - AI_MODEL_ACCESS_MAX_AGE_MS - 1000 });
     expect(await obj.getAiModelAccess()).toEqual({ known: false });
+  });
+
+  // Background work with the browser hidden or closed: one browser push, then only the server's plan-only pushes.
+  // Route signatures, DO storage ordering and the proxy all run for real on a moved clock; only the Gateway is faked.
+  describe('server plan refresh with no browser (accelerated clock)', () => {
+    const FLASH = 'gemini-3.8-flash';
+    const MINUTE = 60_000;
+    async function computer() {
+      const state = await object();
+      state.values.set(AI_PROXY_NONCE_STORAGE_KEY, 'boot');
+      const stub = new Proxy({}, {
+        get(_target, prop) {
+          if (prop === 'then') return undefined;
+          if (typeof prop === 'string' && /^(put|get|drop)Ai/.test(prop)) return state.obj[prop].bind(state.obj);
+          return async () => undefined;
+        },
+      });
+      const env = { Sandbox: { idFromName: () => ({}), get: () => stub }, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_AI_PROXY: 'on' };
+      const push = async (fields: Record<string, unknown>, signedAt = Date.now(), signed = true) => {
+        const body = JSON.stringify(fields);
+        return worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/ai-credential`, { method: 'POST', body,
+          headers: signed ? { 'x-ezil-signature': await mintAiCredentialSignature(SECRET, SANDBOX_NAME, new TextEncoder().encode(body), signedAt, 'POST') } : {} }), env);
+      };
+      const bearer = await deriveAiProxyToken(SECRET, SANDBOX_NAME, 'boot');
+      const send = async (model: string) => {
+        const res = await worker.fetch(new Request(`https://8443-${SANDBOX_NAME}-code.ezil.org/ai/v1/messages`, {
+          method: 'POST', body: JSON.stringify({ model, max_tokens: 16 }),
+          headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' } }), env);
+        return { status: res.status, code: res.status === 200 ? null : ((await res.json()) as { error: { code: string } }).error.code };
+      };
+      return { ...state, push, send };
+    }
+    const realFetch = globalThis.fetch;
+    const upstream: string[] = [];
+    let t0 = 0;
+    const at = (minutes: number) => setSystemTime(new Date(t0 + minutes * MINUTE));
+    beforeEach(() => {
+      t0 = Date.now();
+      upstream.length = 0;
+      globalThis.fetch = (async (request: Request) => {
+        upstream.push(((await request.json()) as { model: string }).model);
+        return Response.json({ ok: true });
+      }) as typeof fetch;
+    });
+    afterEach(() => { setSystemTime(); globalThis.fetch = realFetch; });
+    const browserPush = (c: Awaited<ReturnType<typeof computer>>, includedModels: readonly string[] | null) => c.push({
+      accessToken: `e30.${Buffer.from(JSON.stringify({ sub: 'abcdef01-2345-6789-abcd-ef0123456789', role: 'authenticated',
+        exp: Math.floor(t0 / 1000) + 3600 })).toString('base64url')}.c2ln`, includedModels });
+
+    it('keeps the current plan past its 30 minutes, follows a paid-to-Free change, and still ends with the token', async () => {
+      const c = await computer();
+      expect((await browserPush(c, null)).status).toBe(200);
+      const credential = c.values.get(AI_CREDENTIAL_STORAGE_KEY);
+      // The tab is hidden from here on: the server refreshes the plan every 10 minutes and sends nothing else.
+      for (const minute of [10, 20, 30, 40]) {
+        at(minute);
+        const res = await c.push({ includedModels: null });
+        expect(await res.json()).toMatchObject({ ok: true, planStored: true });
+      }
+      at(45);
+      expect(await c.send('claude-opus-5-5')).toEqual({ status: 200, code: null });
+      expect(upstream).toEqual(['claude-opus-5-5']);
+      // The paid plan ends: the next refresh carries Free's list, and only Flash passes.
+      at(46);
+      await c.push({ includedModels: [FLASH] });
+      expect(await c.send('claude-opus-5-5')).toEqual({ status: 403, code: 'os_model_not_included' });
+      expect(await c.send(FLASH)).toEqual({ status: 200, code: null });
+      expect(upstream).toEqual(['claude-opus-5-5', FLASH]);
+      // A refresh signed before the change, arriving a minute late, never reopens every model: the Worker orders by
+      // the signed time, not by when the push arrives.
+      at(47);
+      expect(await (await c.push({ includedModels: null }, t0 + 45 * MINUTE)).json()).toMatchObject({ ok: true, planStored: false });
+      expect(await c.send('claude-opus-5-5')).toEqual({ status: 403, code: 'os_model_not_included' });
+      // No refresh touched the token: once it expires, a fresh plan is not enough.
+      expect(c.values.get(AI_CREDENTIAL_STORAGE_KEY)).toBe(credential);
+      at(61);
+      await c.push({ includedModels: [FLASH] });
+      expect(await c.send(FLASH)).toEqual({ status: 401, code: 'os_session_missing' });
+      expect(upstream).toEqual(['claude-opus-5-5', FLASH]);
+    });
+
+    it('with no refresh (the plan could not be read) the same call waits for a plan and sends nothing', async () => {
+      const c = await computer();
+      await browserPush(c, null);
+      at(30);
+      expect(await c.send('claude-opus-5-5')).toEqual({ status: 200, code: null });
+      at(31);
+      expect(await c.send('claude-opus-5-5')).toEqual({ status: 503, code: 'os_plan_unavailable' });
+      expect(await c.send(FLASH)).toEqual({ status: 503, code: 'os_plan_unavailable' });
+      expect(upstream).toEqual(['claude-opus-5-5']);
+    });
+
+    it('refuses an unsigned, empty or malformed refresh and stores nothing; a refresh never creates a token', async () => {
+      const c = await computer();
+      expect((await c.push({ includedModels: [FLASH] }, Date.now(), false)).status).toBe(401);
+      for (const [fields, error] of [[{}, 'included_models_missing'], [{ includedModels: [] }, 'included_models_malformed'],
+        [{ includedModels: 'gemini-3.8-flash' }, 'included_models_malformed']] as const) {
+        const res = await c.push(fields);
+        expect(res.status).toBe(400);
+        expect(await res.json()).toMatchObject({ error: error });
+      }
+      // A body that names a token at all, even null, is a credential push and is refused as one.
+      expect((await c.push({ accessToken: null, includedModels: [FLASH] })).status).toBe(400);
+      expect(c.values.has(AI_MODEL_ACCESS_STORAGE_KEY)).toBe(false);
+      expect(await (await c.push({ includedModels: null })).json()).toMatchObject({ ok: true, planStored: true });
+      expect(c.values.has(AI_CREDENTIAL_STORAGE_KEY)).toBe(false);
+      expect(await c.send(FLASH)).toEqual({ status: 401, code: 'os_session_missing' });
+      expect(upstream).toEqual([]);
+    });
   });
 
   it('serializes concurrent starts, reuses their nonce, and rotates when the stopped launcher is restarted', async () => {

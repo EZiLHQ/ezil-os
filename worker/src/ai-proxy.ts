@@ -278,7 +278,8 @@ export interface StoredAiModelAccess {
 
 /**
  * How long a pushed plan list stays in force without a newer one. A present user's Code pushes one with every activity
- * beat (each minute); a push that could not read the plan carries none and never extends this.
+ * beat (each minute), and the server's per-minute sweep pushes the list alone to recently opened computers, so work that
+ * runs on with no browser keeps its current plan; a push that could not read the plan carries none and never extends this.
  */
 export const AI_MODEL_ACCESS_MAX_AGE_MS = 30 * 60_000;
 

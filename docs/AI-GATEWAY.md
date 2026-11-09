@@ -129,7 +129,9 @@ Worker.
 
 - **App first.** An older Worker reads only `accessToken` and ignores
   `includedModels`. A Worker deployed before the app refuses all inference
-  until the app ships.
+  until the app ships. The app's plan refresh (below) is safe either way
+  round: an older Worker refuses its token-less body with a 400, which the
+  sweep logs and carries on past.
 - **Image before this Worker.** An older image's Code defaults to Qwen, pins
   Copilot's title and summary requests to Qwen, and does not know these
   refusals. Under this Worker, a Free account on that image gets a generic
@@ -142,16 +144,34 @@ Worker.
 - **Old images persist.** A Worker deploy restarts no computer, so a computer
   still running the old image when this Worker ships keeps it until it
   restarts.
-- **First minute.** After this Worker ships, every computer's next open or
-  activity beat brings a list within a minute. Until then its model requests
-  get the 503.
+- **First minute.** After this Worker ships, every computer's next open,
+  activity beat or plan refresh brings a list within a minute. Until then its
+  model requests get the 503.
 
 Roll back in reverse, this Worker first.
 
-Pushes come only with opens and activity beats, and beats need a present user.
-An idle stop also waits for the container's own work to end, so an agent kept
-busy after its user leaves can outlive the list's 30 minutes. Its next model
-request then gets the 503. Nothing renews a stale list.
+Activity beats need a present user, and an idle stop also waits for the
+container's own work to end, so an agent kept busy after its user leaves can
+outlive a beat's list. The app's per-minute billing sweep (`refreshAiPlans` in
+`app/src/server/lib/ai-credential.ts`) therefore pushes the plan on its own,
+as a signed body `{ "includedModels": … }` with no `accessToken`, from the same
+effective plan and signed at the time that plan was read. Its computers are the
+live ones opened in the last three hours (`last_opened_at`, on either provider),
+in id order. Each minute's pass takes up to 500, starting further along each
+time (`aiPlanRefreshSlice`). When passes finish, any 15 in a row reach every
+computer, up to 7,468 of them; above that a rotation takes ceil((N + 32) / 500)
+minutes. A pass the deadline cuts short still reaches at least 32. Each rotation
+starts 32 rows further on, so rows it missed come first in a later pass, though
+covering N rows at 32 a minute takes about N / 32 minutes. A running filter is
+not possible: no table says a Cloudflare computer still runs, and its compute
+session closes 15 minutes after the last beat. The Worker stores only the list, ordered as above, and never
+creates, extends or reads the token: the work still ends with the pushed token
+(`401 os_session_missing` once it expires). Nothing renews a stale list. A plan
+the app cannot read sends nothing, never `null`, so the stored list ages out to
+the 503. A token-less body without `includedModels` is refused (`400
+included_models_missing`), and so is one that names a token, even `null`. The
+refresh records no activity, presence, lease or meter. One 20-second deadline
+covers the listing, plan reads and pushes; each push has 5 seconds.
 
 With a list stored, `POST /ai/v1/messages` and `/ai/v1/responses` read the
 body's `model` exactly as the Gateway reads it (fatal UTF-8, `JSON.parse`, last
