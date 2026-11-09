@@ -7,6 +7,7 @@ import { codeDiagBridgeScript, DIAG_BRIDGE_MARKER, injectCodeDiagBridge } from '
 
 const SHELL = 'https://os-staging.ezil.work';
 const OTHER = 'https://other.ezil.work';
+const PROD = 'https://os.ezil.work';
 const NONCE = 'AAAAAAAAAAAAAAAAAAAAAA';
 const hello = { type: 'ezil.code.diag.hello', v: 1, nonce: NONCE };
 const record = fixtures.valid[0]!.failure;
@@ -198,13 +199,35 @@ describe('diagnostic script injection', () => {
     expect(injectCodeDiagBridge(out, [SHELL])).toBe(out);
     expect(out.split(DIAG_BRIDGE_MARKER)).toHaveLength(2);
   });
-  it('production has no origins and injects nothing; missing head/nonce also leaves HTML alone', () => {
-    for (const zone of [undefined, 'ezil.org']) expect(injectCodeDiagBridge(html, codeShellOriginsFor(zone))).toBe(html);
+  it('production (zone undefined or ezil.org) injects the bridge for the production origin only', () => {
+    for (const zone of [undefined, 'ezil.org']) {
+      const origins = codeShellOriginsFor(zone);
+      expect(origins).toEqual([PROD]);
+      const out = injectCodeDiagBridge(html, origins);
+      expect(out).toContain('<meta charset="utf-8">\n<script nonce="12345678-abcd" data-ezil-diag-bridge="1">');
+      expect(out).toContain(DIAG_BRIDGE_MARKER);
+      expect(out).toContain(JSON.stringify([PROD]));
+      expect(out).not.toContain('os-staging.ezil.work');
+    }
+    // The running production bridge accepts only the production origin: the default/staging origin posts nothing.
+    const staging = run({ origins: codeShellOriginsFor(undefined) });
+    staging.message(); staging.failure();
+    expect(staging.posted).toEqual([]);
+    // A hello from the production origin, then a failure, emit ready and the failure to the production origin only.
+    const prod = run({ origins: codeShellOriginsFor('ezil.org') });
+    prod.message(hello, { origin: PROD }); prod.failure();
+    expect(prod.posted.map(p => p.origin)).toEqual([PROD, PROD]);
+    expect(prod.posted[0]!.message).toEqual(ready);
+    expect(prod.posted[1]!.message.type).toBe('ezil.code.failure');
+    expect(prod.posted[1]!.message.failure).toEqual(record);
+  });
+  it('leaves HTML alone without a head or valid nonce, and an unknown zone injects nothing', () => {
     for (const bad of [html.replace('nonce="12345678-abcd"', ''), html.replace('12345678-abcd', 'bad'), html.replace('<head>', '')]) {
       expect(injectCodeDiagBridge(bad, [SHELL])).toBe(bad);
     }
     const noMeta = html.replace('<meta charset="utf-8">', '');
     expect(injectCodeDiagBridge(noMeta, [SHELL])).toContain('<head>\n<script nonce="12345678-abcd" data-ezil-diag-bridge="1">');
+    expect(injectCodeDiagBridge(html, codeShellOriginsFor('unknown.example'))).toBe(html);
   });
   it('cannot close its own script tag or send to a wildcard', () => {
     expect(codeDiagBridgeScript([SHELL])).not.toMatch(/<\/|<!--|["']\*["']/);
