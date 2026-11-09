@@ -52,20 +52,24 @@ function canonicalPart(part: Part): unknown {
 /**
  * The identity of one turn's continuation, for the signed-thinking fallback: the resolved connection (provider type,
  * endpoint and credential, so a provider reconfigured to another endpoint or account under the same name never gets
- * the old one's signed thinking) and model, the exact history before the turn (thinking and cache/stateful markers left out, as Copilot rebuilds them), and the
- * turn's ordered tool calls with their full inputs. The turn's own text is not compared. The connection enters as `connection`, an opaque number the provider
+ * the old one's signed thinking) and model, ALL system text of the request (the turn's effective system prompt: the Gateway
+ * hoists every system message, wherever it sits, so a system note added, changed or removed anywhere never restores old
+ * thinking), the exact non-system history before the turn (thinking and cache/stateful markers left out, as Copilot rebuilds
+ * them), and the turn's ordered tool calls with their full inputs. The turn's own text is not compared. The connection enters as `connection`, an opaque number the provider
  * instance assigns to each distinct connection (connectionIdentity): the credential is never hashed. An HMAC-SHA256
  * under `secret`, a random key of the provider instance that never leaves memory: a cache lookup key, nothing of it is
  * kept or logged as text.
  */
-function continuationKey(secret: Buffer, connection: number, model: ResolvedModel, history: readonly Message[], calls: readonly { callId: string; name: string; input: unknown }[]): string {
-    // As the Gateway receives it (gatewayConversation): system text hoisted out in order, and the other messages as
-    // logical turns with adjacent same-role messages merged, so a history Copilot splits or rejoins keys the same.
-    const system: unknown[] = [];
+function continuationKey(secret: Buffer, connection: number, model: ResolvedModel, request: readonly Message[], history: readonly Message[], calls: readonly { callId: string; name: string; input: unknown }[]): string {
+    // As the Gateway receives it (gatewayConversation): the whole request's system text hoisted out in order, and the
+    // non-system history as logical turns with adjacent same-role messages merged, so a history Copilot splits or rejoins
+    // keys the same.
+    const canonical = (message: Message) => message.parts.filter(part => part.type !== 'thinking' && !isCacheMarker(part) && !isStatefulMarker(part)).map(canonicalPart);
+    const system = request.filter(message => message.role === 'system').flatMap(canonical);
     const turns: [Message['role'], unknown[]][] = [];
     for (const message of history) {
-        const parts = message.parts.filter(part => part.type !== 'thinking' && !isCacheMarker(part) && !isStatefulMarker(part)).map(canonicalPart);
-        if (message.role === 'system') { system.push(...parts); continue; }
+        if (message.role === 'system') continue;
+        const parts = canonical(message);
         const previous = turns.at(-1);
         if (previous?.[0] === message.role) previous[1].push(...parts);
         else turns.push([message.role, parts]);
@@ -273,7 +277,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             if (turn.some(message => message.parts.some(part => part.type === 'thinking'))) continue;
             const calls = turnCalls(turn);
             if (!calls.length) continue;
-            const kept = this.signedThinking.get(continuationKey(this.continuationSecret, this.connectionIdentity(model.provider), model, messages.slice(0, start), calls));
+            const kept = this.signedThinking.get(continuationKey(this.continuationSecret, this.connectionIdentity(model.provider), model, messages, messages.slice(0, start), calls));
             if (kept) turn[0]!.parts = [...kept, ...turn[0]!.parts];
         }
     }
@@ -285,7 +289,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
      */
     private storeSignedThinking(model: ResolvedModel, answered: readonly Message[], calls: readonly TurnCall[], signed: readonly Part[]): void {
         const start = trailingAssistantTurn(answered);
-        const key = continuationKey(this.continuationSecret, this.connectionIdentity(model.provider), model, answered.slice(0, start), [...turnCalls(answered.slice(start)), ...calls]);
+        const key = continuationKey(this.continuationSecret, this.connectionIdentity(model.provider), model, answered, answered.slice(0, start), [...turnCalls(answered.slice(start)), ...calls]);
         this.rememberSignedThinking(key, signed);
     }
 

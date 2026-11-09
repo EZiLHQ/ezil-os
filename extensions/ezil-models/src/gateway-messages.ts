@@ -1,6 +1,7 @@
 // The Bedrock Converse subset of Anthropic Messages. Construct envelopes from an allowlist;
 // never forward Copilot's provider-specific options, cache markers or unsigned thinking.
 import type { GatewayProtocol, ResolvedModel } from './config';
+import { GatewayError } from './gateway-error';
 import { isCacheMarker, isStatefulMarker, type ChatRequest, type Message, type Part, type Tool } from './types';
 
 export type LocalRequestCode = 'local_input_too_large' | 'local_too_many_messages' | 'local_too_many_blocks';
@@ -144,6 +145,7 @@ export function geminiToolSchema(value: unknown, restated: Set<string> = new Set
     if (!isObject(value)) return undefined;
     const node: ObjectValue = {};
     const moved: ObjectValue = {};
+    const root = depth === 0;
     const schemas = (member: unknown): unknown[] | undefined => {
         if (!Array.isArray(member) || !member.length) return undefined;
         const out = member.map(child => geminiToolSchema(child, restated, depth + 1));
@@ -194,7 +196,39 @@ export function geminiToolSchema(value: unknown, restated: Set<string> = new Set
         const constraints = `JSON Schema constraints: ${JSON.stringify(moved)}`;
         node.description = typeof node.description === 'string' && node.description ? `${node.description}\n${constraints}` : constraints;
     }
+    // Fail closed: every $ref must still name a schema position of the root, so a reference to an anchor, into a
+    // container that moved into a description, to a value that is not a schema, external, or inside a nested
+    // $id / draft-04 id (a new base) drops the tool. Checked on the original, whose schema positions the projection keeps.
+    if (root && !geminiRefsResolve(value)) return undefined;
     return node;
+}
+
+/**
+ * True when every `$ref` in a schema is `#` or a JSON pointer (RFC 6901, read as a URI fragment: percent-decoded, then
+ * split, then `~1` and `~0` unescaped) to one of the root's own schema positions, the ones the Gateway walks. A reference
+ * inside a subschema with its own `$id` or draft-04 `id` resolves against that base instead, so it is not accepted.
+ */
+function geminiRefsResolve(schema: ObjectValue): boolean {
+    const positions = new Set<string>();
+    const refs: { ref: string; rebased: boolean }[] = [];
+    const walk = (value: unknown, path: readonly string[], rebased: boolean): void => {
+        positions.add(JSON.stringify(path));
+        if (!isObject(value)) return;
+        const base = rebased || (path.length > 0 && (typeof value.$id === 'string' || typeof value.id === 'string'));
+        if (typeof value.$ref === 'string') refs.push({ ref: value.$ref, rebased: base });
+        for (const key of ['properties', '$defs'] as const) if (isObject(value[key])) for (const [name, child] of Object.entries(value[key])) walk(child, [...path, key, name], base);
+        for (const key of ['items', 'additionalProperties'] as const) if (Object.hasOwn(value, key)) walk(value[key], [...path, key], base);
+        for (const key of ['prefixItems', 'anyOf'] as const) if (Array.isArray(value[key])) value[key].forEach((child, index) => walk(child, [...path, key, String(index)], base));
+    };
+    walk(schema, [], false);
+    return refs.every(({ ref, rebased }) => {
+        if (rebased || !ref.startsWith('#')) return false;
+        let pointer: string;
+        try { pointer = decodeURIComponent(ref.slice(1)); } catch { return false; }
+        if (pointer === '') return true;
+        if (!pointer.startsWith('/')) return false;
+        return positions.has(JSON.stringify(pointer.slice(1).split('/').map(token => token.replace(/~1/g, '/').replace(/~0/g, '~'))));
+    });
 }
 
 function partText(part: Part): string {
@@ -306,6 +340,13 @@ export function gatewayInputTokens(model: Pick<ResolvedModel, 'maxInputTokens' |
 
 export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log?: (line: string) => void): { body: GatewayBody; bytes: Uint8Array<ArrayBuffer> } {
     const tools = gatewayTools(request.tools, log, geminiRoute(model.model));
+    // Never a silent chat without its tools: when Copilot offered tools and none of them can be sent to this model,
+    // refuse here (nothing sent, nothing charged) with what to do, rather than answer as if no tools existed.
+    if (request.tools.length && !tools.length) {
+        throw new GatewayError(`EZiL Models: none of this chat's ${request.tools.length} tools can be sent to ${model.model} (their input schemas use `
+            + 'features this model cannot take, or they are invalid; see the EZiL Models log). Nothing was sent or charged. Pick another model, '
+            + 'or turn those tools off with Configure Tools', undefined, 'local_tools_unsupported', undefined, undefined, 'local');
+    }
     const conversation = gatewayConversation(request.messages, tools, replaysThinking(model.model));
     const body: GatewayBody = {
         model: model.model, messages: conversation.messages, max_tokens: gatewayOutputTokens(model),
