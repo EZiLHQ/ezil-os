@@ -908,3 +908,21 @@ all twenty-five records; do not reinstall the older app. The 24,000-byte readbac
 and 65,536-byte secret limits, immutable records and GC proofs are unchanged.
 Synthetic tests are not release proof: verify the actual record count, secret and
 readback byte sizes before promotion. No cleanup or history removal is implied.
+
+### Twenty-six-record registry compatibility
+The release owner reported twenty-five retained records after 1.0.37, so the next
+immutable image needs a twenty-sixth slot. The next matched app/host release
+permits twenty-six retained records, refusing a twenty-seventh, in both app
+validators, both `json-tool.py` guards and the GC guard. Every earlier app accepts
+at most twenty-five and cannot read a twenty-six-record registry. Install the
+compatible app with `apply-app` first: it reads back the running commit and
+deployment before writing its receipt, and `promote-canary` refuses without that
+receipt before reading the secret, so the twenty-sixth record is never appended
+under an older app. App and agent must still come from the same reviewed commit,
+which must contain both this change and the feature being released. Rollback must
+retain the invoking twenty-six-compatible app while restoring the prior deployment
+tuple and all twenty-six records; do not reinstall the older app. The 24,000-byte
+readback and 65,536-byte secret limits, immutable records and GC proofs are
+unchanged. Synthetic tests are not release proof: verify the actual record count,
+secret and readback byte sizes before promotion. No cleanup or history removal is
+implied.
