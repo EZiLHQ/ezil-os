@@ -141,6 +141,45 @@ describe('syncAiCredential', () => {
         expect(result).toEqual({ ok: false, error: 'sync_failed' });
         warn.mockRestore();
     });
+
+    it('signs the plan list into the same body; leaves it out when unknown, so the Worker keeps its list', async () => {
+        const token = builderToken();
+        const bodies: unknown[] = [];
+        const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
+            const headers = init.headers as Record<string, string>;
+            const ts = Number(/^t=(\d+),/.exec(headers['x-ezil-signature']!)![1]);
+            expect(headers['x-ezil-signature']).toBe(mintAiCredentialSignature(SECRET, SANDBOX, init.body as string, ts));
+            bodies.push(JSON.parse(init.body as string));
+            return new Response(JSON.stringify({ ok: true, stored: true }), { status: 200 });
+        }) as unknown as typeof fetch;
+        const sync = (includedModels?: () => Promise<readonly string[] | null | undefined>) => syncAiCredential({
+            config: CONFIG, hmacSecret: SECRET, sandboxName: SANDBOX, userId: USER, headers: new Headers(),
+            supabase: async () => session(token), fetchImpl, ...(includedModels ? { includedModels } : {}),
+        });
+        await sync(async () => ['gemini-3.8-flash']);
+        await sync(async () => null);
+        await sync(async () => undefined);
+        await sync(async () => { throw new Error('billing down'); });
+        await sync();
+        expect(bodies).toEqual([
+            { accessToken: token, includedModels: ['gemini-3.8-flash'] },
+            { accessToken: token, includedModels: null },
+            { accessToken: token }, { accessToken: token }, { accessToken: token },
+        ]);
+    });
+
+    it('reads the plan only for a push that will be sent', async () => {
+        const includedModels = vi.fn(async () => ['gemini-3.8-flash']);
+        const fetchImpl = vi.fn() as unknown as typeof fetch;
+        for (const token of [null, jwt({ sub: USER, exp: inAnHour() })]) {
+            expect(await syncAiCredential({ config: CONFIG, hmacSecret: SECRET, sandboxName: SANDBOX, userId: USER, headers: new Headers(),
+                supabase: async () => session(token), fetchImpl, includedModels })).toMatchObject({ ok: false });
+        }
+        expect(await syncAiCredential({ config: { ...CONFIG, isConfigured: false }, hmacSecret: SECRET, sandboxName: SANDBOX, userId: USER,
+            headers: new Headers(), supabase: async () => session(builderToken()), fetchImpl, includedModels })).toMatchObject({ skipped: 'not_configured' });
+        expect(includedModels).not.toHaveBeenCalled();
+        expect(fetchImpl).not.toHaveBeenCalled();
+    });
 });
 
 describe('logout credential deletion', () => {

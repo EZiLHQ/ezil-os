@@ -102,6 +102,10 @@ export type AiCredentialPushResult =
  * the provider is unconfigured, there is no HMAC secret (the Worker refuses
  * unsigned pushes), or the token has no `app_metadata.ezil_role` (the gateway
  * would refuse it with 401 `no_ezil_role`).
+ *
+ * `includedModels` travels in the same signed body: the models the owner's plan
+ * includes (`billing/v3/ai-models.ts`; `null` = every model). Left out when
+ * `undefined` (the plan could not be read), so the Worker keeps its list.
  */
 export async function pushAiCredential(
     config: CloudflareGuacamoleConfig,
@@ -109,12 +113,13 @@ export async function pushAiCredential(
     sandboxName: string,
     accessToken: string | null,
     fetchImpl: typeof fetch = fetch,
+    includedModels?: readonly string[] | null,
 ): Promise<AiCredentialPushResult> {
     if (!config.isConfigured || !hmacSecret) return { ok: false, skipped: 'not_configured' };
     if (accessToken === null) return { ok: false, skipped: 'no_session' };
     if (readAccessTokenClaims(accessToken)?.ezilRole == null) return { ok: false, skipped: 'no_ezil_role' };
 
-    const body = JSON.stringify({ accessToken });
+    const body = JSON.stringify(includedModels === undefined ? { accessToken } : { accessToken, includedModels });
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/ai-credential`;
     try {
         const res = await fetchImpl(endpoint, {
@@ -153,6 +158,8 @@ export async function pushAiCredential(
 
 /**
  * `currentAccessToken` + `pushAiCredential`, for the router. Never throws.
+ * `includedModels` (`aiIncludedModelsFor`) is read only for a push that will be
+ * sent; a read that rejects counts as unknown and leaves the Worker's list.
  */
 export async function syncAiCredential(params: {
     config: CloudflareGuacamoleConfig;
@@ -162,11 +169,14 @@ export async function syncAiCredential(params: {
     headers: Headers;
     supabase: () => Promise<SessionSource>;
     fetchImpl?: typeof fetch;
+    includedModels?: () => Promise<readonly string[] | null | undefined>;
 }): Promise<AiCredentialPushResult> {
     try {
         if (!params.config.isConfigured || !params.hmacSecret) return { ok: false, skipped: 'not_configured' };
         const token = await currentAccessToken(params.userId, params.headers, await params.supabase());
-        return await pushAiCredential(params.config, params.hmacSecret, params.sandboxName, token, params.fetchImpl);
+        const models = token !== null && readAccessTokenClaims(token)?.ezilRole != null && params.includedModels
+            ? await params.includedModels().catch(() => undefined) : undefined;
+        return await pushAiCredential(params.config, params.hmacSecret, params.sandboxName, token, params.fetchImpl, models);
     } catch {
         console.warn('[ai-credential] sync failed (non-fatal)', {
             sandboxName: params.sandboxName,

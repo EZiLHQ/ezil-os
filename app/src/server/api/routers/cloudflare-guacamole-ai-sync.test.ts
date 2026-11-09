@@ -42,4 +42,12 @@ describe('EZiL Chat credentials reach AWS computers too', () => {
         expect(body).toContain('await syncAiCredential(');
         expect(body).not.toMatch(/if \(routed\.kind !== 'aws-ec2'\) \{\s*await syncAiCredential/);
     });
+
+    // Free includes Gemini 3.8 Flash only (billing/v3/ai-models.ts): every push carries the owner's plan list, so an
+    // upgrade or a lapse reaches the Worker's AI proxy on the next open or activity beat.
+    it.each(['previewUrl', 'codePreviewUrl', 'reportActivity'])('%s pushes the plan list read for the signed-in owner', name => {
+        const body = block(name);
+        const call = body.slice(body.indexOf('syncAiCredential({'), body.indexOf('});', body.indexOf('syncAiCredential({')));
+        expect(call).toContain('includedModels: () => aiIncludedModelsFor(ctx.user.id),');
+    });
 });
