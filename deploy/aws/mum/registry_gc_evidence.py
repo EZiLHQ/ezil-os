@@ -196,12 +196,28 @@ def collect(directory, candidate_name, context=None):
                 return value
             except (ValueError, KeyError, TypeError):
                 pass
+        if resource.startswith('vol-'):
+            # R2: an unattached non-derived data volume owned by a shared-lower placement.
+            value = {'disposition': 'retained-data-volume'}
+            try:
+                gc.retained_data_volume(evidence, snapshot, candidate, resource, value)
+                return value
+            except (ValueError, KeyError, TypeError):
+                pass
         return {'disposition': 'attested', **absence(resource)}
 
     pending = []
+    shared_lower = 0
     for name in gc.SOURCES:
         for row in evidence['sources'][name]['rows']:
             if not gc.references(row, candidate):
+                continue
+            # R1 shared-lower: a row linked only by the candidate's lower digest needs no
+            # attestation/binding when a retained record keeps the lower and the candidate
+            # AMI is not live. Emit no attestation and no unresolved entry; just count it.
+            if (gc.references_only_lower(row, candidate) and gc.shared_lower_kept(snapshot, candidate)
+                    and not gc.candidate_ami_observable(evidence, candidate)):
+                shared_lower += 1
                 continue
             row_id = row.get('id', row.get('executionArn', row.get('computer_id', row.get('job_id'))))
             try:
@@ -265,7 +281,7 @@ def collect(directory, candidate_name, context=None):
         except (ValueError, KeyError, TypeError, AttributeError) as error:
             unresolved.append({'source': p['source'], 'rowId': p['rowId'], 'rowSha256': p['rowSha256'], 'reason': 'binding: ' + str(error)})
     evidence['collection'] = {**evidence['collection'], 'candidate': gc.identity(candidate), 'filesSha256': files,
-                              'unresolved': unresolved,
+                              'unresolved': unresolved, 'sharedLowerExempt': shared_lower,
                               'missingContext': not bool(context)}
     # The main checker sees collection gaps even if the remaining references
     # could otherwise be exempted. Sources retain every original canonical row.
@@ -287,6 +303,7 @@ def main():
     gc.immutable(args.output, evidence)
     print(json.dumps({'output': str(args.output), 'attestations': len(evidence['attestations']),
                       'unresolved': evidence['collection']['unresolved'],
+                      'sharedLowerExempt': evidence['collection']['sharedLowerExempt'],
                       'missingContext': evidence['collection']['missingContext']}, indent=2))
     return 2 if evidence['collection']['unresolved'] or evidence['collection']['missingContext'] else 0
 

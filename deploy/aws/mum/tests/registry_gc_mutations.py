@@ -66,6 +66,19 @@ wiring = [
     ('registry_gc_evidence.py', "            if arn in execution_rows and execution_rows[arn] != row:", "            if False:", commands['registry_gc.py']),
     ('registry_gc_evidence.py', "        events = [e['event'] if isinstance(e, dict) and set(e) >= {'event', 'resourceId', 'query'} else e for e in events]", "        pass", commands['registry_gc.py']),
     ('registry_gc_evidence.py', "            if have != list(range(1, t['LatestVersionNumber'] + 1)):", "            if False:", commands['registry_gc.py']),
+    # R1 shared-lower (this PR): each new guard dropped individually must be killed.
+    ('registry_gc.py', '    if shared_lower_kept(snapshot, candidate):', '    if True:  # dropped R1 kept-alias gate', commands['registry_gc.py']),
+    ('registry_gc.py', 'not candidate_ami_observable(evidence, candidate)', 'not False', commands['registry_gc.py']),
+    ('registry_gc.py', 'dict(candidate, lowerImageDigest=None)', 'candidate', commands['registry_gc.py']),
+    # R2 retained-data-volume (this PR): each data check dropped individually must be killed.
+    ('registry_gc.py', "not volumes[0].get('SnapshotId')", 'True', commands['registry_gc.py']),
+    ('registry_gc.py', "not volumes[0].get('Attachments')", 'True', commands['registry_gc.py']),
+    ('registry_gc.py', "resource.startswith('vol-') and len(volumes) == 1", "resource.startswith('vol-') and True", commands['registry_gc.py']),
+    ('registry_gc.py', 'len(owners) == 1', 'True', commands['registry_gc.py']),
+    ('registry_gc.py', 'references_only_lower(owners[0], candidate)', 'True', commands['registry_gc.py']),
+    # Generalized app-tag pin (this PR): restoring a fixed literal or dropping either condition must be killed.
+    ('rebase_release.py', "app.get('tag') == app['gitSha'][:12]", "app.get('tag') == '478c66b3559c'", commands['registry_gc.py']),
+    ('rebase_release.py', "result['gitSha'] == app['gitSha']", 'True', commands['registry_gc.py']),
 ]
 for filename, before, after, command in wiring:
     path = HERE.parent / filename

@@ -124,6 +124,32 @@ def references(value, record):
     return False
 
 
+def references_only_lower(value, candidate):
+    """R1: value references the candidate solely through its lowerImageDigest token.
+
+    Re-running the same reference scan against a copy whose lowerImageDigest cannot
+    match isolates links that survive only via that one token (a pool host's
+    deployment.previousLowerImageDigest, a placement's shared lower, an image job's
+    from/to digest). If any non-digest identity token (AMI, state-machine/launch-
+    template/recipe version) also links the row, this is False and the row keeps its
+    ordinary attestation/binding requirement.
+    """
+    return references(value, candidate) and not references(value, dict(candidate, lowerImageDigest=None))
+
+
+def shared_lower_kept(snapshot, candidate):
+    """R1(a): a retained record (after the one-record drop) keeps the candidate's lower."""
+    return any(identity(r) != identity(candidate) and r['lowerImageDigest'] == candidate['lowerImageDigest']
+               for r in snapshot['deployment']['releases'])
+
+
+def candidate_ami_observable(evidence, candidate):
+    """R1(b): a non-terminated instance runs the candidate AMI, so the alias is live."""
+    return any(instance.get('ImageId') == candidate['amiId']
+               and (instance.get('State') or {}).get('Name') != 'terminated'
+               for instance in evidence['sources']['instances']['rows'])
+
+
 # Every exemption binds one whole canonical source row. Proof documents are
 # retained in evidence, so hashes are checked against data, never accepted alone.
 TERMINAL = {'SUCCEEDED': 'ExecutionSucceeded', 'FAILED': 'ExecutionFailed',
@@ -222,6 +248,23 @@ def kept_resource(evidence, snapshot, candidate, resource, disposition):
          'GC resource lacks exact kept AMI join')
 
 
+def retained_data_volume(evidence, snapshot, candidate, resource, disposition):
+    """R2: a vol- named by the candidate's terminal execution is an unattached data
+    volume (empty SnapshotId, not AMI/snapshot-derived) owned by exactly one placement
+    that links the candidate only by the shared lower. That placement is itself a
+    shared-lower reference, so check_attestations' R1 rule enforces that a retained
+    record keeps the lower and no live candidate-AMI instance exists before exempting it.
+    Rows are hash-bound by check_evidence; no caller-supplied claim is trusted here.
+    """
+    volumes = [v for v in evidence['sources']['volumes']['rows'] if v.get('VolumeId') == resource]
+    need(resource.startswith('vol-') and len(volumes) == 1
+         and not volumes[0].get('SnapshotId') and not volumes[0].get('Attachments'),
+         'GC retained-data-volume not an unattached non-derived data volume')
+    owners = [p for p in evidence['sources']['placements']['rows'] if p.get('volume_id') == resource]
+    need(len(owners) == 1 and references_only_lower(owners[0], candidate),
+         'GC retained-data-volume not owned by one shared-lower placement')
+
+
 def validate_attestation(a, row, evidence, snapshot, candidate):
     if a['kind'] == 'pool_host_retired_settled':
         need(a.get('poolId') == row.get('id') and a.get('generation') == row.get('generation')
@@ -272,11 +315,13 @@ def validate_attestation(a, row, evidence, snapshot, candidate):
         need(isinstance(dispositions, dict) and set(dispositions) == resource_ids([d, h]),
              'GC unresolved execution resources')
         for resource, disposition in dispositions.items():
-            need(isinstance(disposition, dict) and disposition.get('disposition') in ('attested', 'kept-record'),
-                 'GC invalid resource disposition')
+            need(isinstance(disposition, dict) and disposition.get('disposition')
+                 in ('attested', 'kept-record', 'retained-data-volume'), 'GC invalid resource disposition')
             if disposition['disposition'] == 'attested':
                 need(resource.startswith('i-'), 'GC absent volume cannot be attested')
                 absent_instance(evidence, resource, disposition)
+            elif disposition['disposition'] == 'retained-data-volume':
+                retained_data_volume(evidence, snapshot, candidate, resource, disposition)
             else:
                 kept_resource(evidence, snapshot, candidate, resource, disposition)
 
@@ -288,13 +333,25 @@ def check_attestations(evidence, snapshot, candidate, views=None):
     need(isinstance(attestations, list), 'GC attestations must be a list')
     refs = [(name, row) for name in SOURCES for row in evidence['sources'][name]['rows']
             if references(view(name, row), candidate)]
+    # R1 shared-lower: a row linked to the candidate only by its lower digest needs no
+    # attestation when a retained record keeps that lower (a) and the candidate AMI is
+    # not observably live (b). A non-terminated candidate-AMI instance would let the app
+    # resolver select the candidate by observed AMI, so the alias is not substitutable.
+    exempt = set()
+    if shared_lower_kept(snapshot, candidate):
+        shared = [(name, row) for name, row in refs if references_only_lower(view(name, row), candidate)]
+        if shared:
+            need(not candidate_ami_observable(evidence, candidate),
+                 'GC shared-lower alias observable on live candidate-AMI instance')
+            exempt = {(name, sha(row)) for name, row in shared}
+    required = [(name, row) for name, row in refs if (name, sha(row)) not in exempt]
     covered = set()
     for a in attestations:
         need(isinstance(a, dict) and a.get('kind') in ('pool_host_retired_settled', 'execution_terminal')
              and a.get('source') == {'pool_host_retired_settled': 'poolHosts',
                                     'execution_terminal': 'executions'}[a['kind']],
              'GC invalid attestation kind/source')
-        matches = [(n, r) for n, r in refs if n == a['source'] and sha(r) == a.get('rowSha256')]
+        matches = [(n, r) for n, r in required if n == a['source'] and sha(r) == a.get('rowSha256')]
         need(len(matches) == 1 and (a['source'], a['rowSha256']) not in covered,
              'GC spare/duplicate attestation or forged row hash')
         name, row = matches[0]
@@ -302,7 +359,7 @@ def check_attestations(evidence, snapshot, candidate, views=None):
         need(not ambiguous_lower(view(name, row), candidate), 'GC undisambiguated digest-only reference')
         validate_attestation(a, row, evidence, snapshot, candidate)
         covered.add((name, a['rowSha256']))
-    need(len(covered) == len(refs), 'GC referenced record: missing attestation or forbidden source')
+    need(len(covered) == len(required), 'GC referenced record: missing attestation or forbidden source')
 
 
 def ambiguous_lower(value, candidate):

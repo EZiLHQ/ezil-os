@@ -488,6 +488,19 @@ an existing pair refuse, including attempts to fill historical null fields.
 Different AMIs may share a lower. The app resolver still refuses ambiguous
 shared-lower source placements; source disambiguation by observed AMI is deferred.
 
+`registry-gc` collects exactly one record against quiesced, fenced, hash-bound
+evidence. A referencing row that links the candidate *only* through its
+`lowerImageDigest` (rule R1: e.g. a retired pool host's
+`deployment.previousLowerImageDigest`, a stopped computer's placement) needs no
+attestation or binding **iff** a retained record keeps that same lower digest and
+no non-terminated instance runs the candidate AMI; otherwise the row keeps its
+ordinary attestation/binding, or the whole GC is refused when the candidate AMI is
+observably live. A row that also references a non-digest identity token (AMI, state
+machine/launch-template/recipe version) is never exempted this way. An execution's
+retained data volume (rule R2: `vol-` with empty SnapshotId, unattached, owned by one
+such shared-lower placement) takes a `retained-data-volume` disposition, validated
+against inventory with the same strictness as every other disposition.
+
 For A3, a maintenance bake keeps its maintenance source lower ID, changes the
 reviewed agent commit, clears both previous parameters, and records
 `maintenance-source-release.json`. The selected commit must contain the

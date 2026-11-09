@@ -277,8 +277,9 @@ def begin_operation(ledger_path, ledger, path, plan, operation, envelope, d, exp
     result = live_app(path, plan, ('registry-gc-check-g' if operation == 'registry-gc' else 'ledger-check-g') + str(latest['generation']), envelope, fd,
                       rebase_app.public_deployment(d) if operation == 'registry-gc' else None)
     if operation == 'registry-gc':
-        need(plan['rollout']['app']['tag'] == '478c66b3559c' and
-             result['gitSha'] == plan['rollout']['app']['gitSha'], 'registry-gc requires the same frozen app')
+        app = plan['rollout']['app']
+        need(manifest.matches(r'[0-9a-f]{40}', app.get('gitSha', '')) and app.get('tag') == app['gitSha'][:12]
+             and result['gitSha'] == app['gitSha'], 'registry-gc requires the same frozen app')
     ledger_drift(ledger, envelope, d, result['gitSha'])
     expected = release_state(expected_d, plan['rollout']['app']['gitSha'])
     if latest.get('state') == 'pending':

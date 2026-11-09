@@ -55,7 +55,7 @@ class RegistryGcTests(unittest.TestCase):
         self.directory = self.root / 'registry-gc-g2'
         self.directory.mkdir()
         self.path = self.root / 'rebase-plan.json'
-        self.plan = {'ledgerGeneration': 1, 'databaseSystemIdentifier': SYSTEM_ID, 'rollout': {'app': {'tag': '478c66b3559c', 'gitSha': 'e' * 40, 'checksumSha256': 'f' * 64}}}
+        self.plan = {'ledgerGeneration': 1, 'databaseSystemIdentifier': SYSTEM_ID, 'rollout': {'app': {'tag': 'e' * 12, 'gitSha': 'e' * 40, 'checksumSha256': 'f' * 64}}}
         self.path.write_text(json.dumps(self.plan))
         self.ledger = self.root / 'promotion-ledger.json'
         self.lock = self.root / 'app-secret.lock'
@@ -336,6 +336,8 @@ class RegistryGcTests(unittest.TestCase):
     def test_every_source_and_reference_field_refuses(self):
         for name in gc.SOURCES:
             for key in gc.IDENTITY_KEYS:
+                if key == 'lowerImageDigest':
+                    continue  # a lower-digest-only reference is governed by R1 (see shared-lower tests)
                 self.rows(name, [{key: self.records[1][key]}])
                 self.refuse('referenced record')
             self.rows(name, [])
@@ -350,11 +352,14 @@ class RegistryGcTests(unittest.TestCase):
             self.rows('placements', [{'last_error': value}])
             self.refuse('referenced record')
 
-    def test_shared_lower_only_is_uncertain_but_other_ami_is_disambiguated(self):
+    def test_shared_lower_only_exempt_with_kept_alias_and_other_ami_disambiguated(self):
+        # A full record sharing the candidate's lower is disambiguated by its own AMI: not a reference.
         self.rows('runtimeConfigs', [self.records[-1]])
         self.prepare()
+        # A placement linked to the candidate only by the shared lower needs no attestation (R1):
+        # retained records keep that lower digest and no candidate-AMI instance is live.
         self.rows('placements', [{'lower_image_digest': self.records[1]['lowerImageDigest']}])
-        self.refuse('referenced record')
+        self.assertEqual(len(self.prepare()['releases']), 7)
 
     def test_stale_cas_version_or_deployment(self):
         after = self.prepare()
@@ -535,6 +540,37 @@ class RegistryGcTests(unittest.TestCase):
     def test_frozen_app_tag_and_running_sha(self):
         gc.backup_registry(self.directory, self.snapshot)
         self.plan['rollout']['app']['tag'] = 'different'
+        with self.assertRaisesRegex(ValueError, 'same frozen app'):
+            self.commit()
+        self.assertNotIn('put', self.calls)
+
+    def test_app_tag_admits_consistent_nondefault_plan(self):
+        # The pin is structural, not a hardcoded 1.0.12 tag: a different plan whose app tag is
+        # the first 12 hex of its app gitSha (and whose live gitSha matches) is admitted.
+        sha = 'c5bb996ded78' + 'c' * 28
+        self.plan['rollout']['app'].update(tag=sha[:12], gitSha=sha)
+        self.path.write_text(json.dumps(self.plan))
+        self.plan_sha = gc.release.digest(self.path)
+        self.evidence['planSha256'] = self.plan_sha
+        synthetic_e1(self.evidence, self.path.read_text())
+        self.running_sha = sha
+        initial = gc.release.ledger_entry(self.path, 'apply-app', self.live, self.snapshot['deployment'], sha, 1)
+        gc.tool.write(self.ledger, {'schemaVersion': 1, 'entries': [initial]})
+        gc.backup_registry(self.directory, self.snapshot)
+        self.assertEqual(self.commit()['state'], 'completed')
+
+    def test_app_tag_refused_for_old_literal_tag(self):
+        # The previously hardcoded 1.0.12 tag is not the gitSha prefix of this plan: refused.
+        gc.backup_registry(self.directory, self.snapshot)
+        self.plan['rollout']['app']['tag'] = '478c66b3559c'
+        with self.assertRaisesRegex(ValueError, 'same frozen app'):
+            self.commit()
+        self.assertNotIn('put', self.calls)
+
+    def test_app_tag_refused_when_live_gitsha_differs(self):
+        # Tag matches the plan gitSha prefix, but the live app gitSha differs: refused.
+        gc.backup_registry(self.directory, self.snapshot)
+        self.running_sha = 'f' * 40
         with self.assertRaisesRegex(ValueError, 'same frozen app'):
             self.commit()
         self.assertNotIn('put', self.calls)
@@ -1053,6 +1089,216 @@ class HistoricalAttestationTests(unittest.TestCase):
         self.a['resources'][self.instance] = {'disposition': 'untyped', 'record': gc.identity(self.records[-1])}
         self.rows('instances', [{'InstanceId': self.instance, 'ImageId': self.records[-1]['amiId']}])
         self.refuse('invalid resource disposition')
+
+    # ---- R1 shared-lower exemption (checker is the authority) ----
+    def test_r1_pool_host_previous_lower_only_is_exempt(self):
+        # A retired pool host whose recorded deployment references the candidate only via
+        # previousLowerImageDigest (its own AMI is a retained alias) needs no attestation:
+        # a retained record keeps the lower (a) and no candidate-AMI instance is live (b).
+        row = {'id': 'pool-x', 'state': 'retired', 'dispatch_status': 'settled',
+               'deployment': {'amiId': self.records[-1]['amiId'],
+                              'previousLowerImageDigest': self.records[1]['lowerImageDigest']}}
+        self.assertTrue(gc.references(row, self.records[1]))
+        self.assertTrue(gc.references_only_lower(row, self.records[1]))
+        self.rows('poolHosts', [row])
+        self.assertEqual(len(self.prepare()['releases']), 7)
+
+    def test_r1_pool_host_embedded_json_previous_lower_only_is_exempt(self):
+        # Real retired pool hosts carry the reference inside lifecycle_input, a JSON string
+        # whose 'document' is itself a JSON string. The lower-only link must survive the
+        # embedded-JSON scan and be exempted (no pool attestation, so no runtime validator).
+        kept = self.records[0]
+        document = json.dumps({'operation': 'pool-retire', 'poolHostId': 'ph-1',
+                               'deployment': {'amiId': kept['amiId'], 'lowerImageDigest': kept['lowerImageDigest'],
+                                              'previousLowerImageDigest': self.records[1]['lowerImageDigest']}})
+        row = {'id': 'ph-1', 'state': 'retired', 'dispatch_status': 'settled',
+               'lifecycle_input': json.dumps({'document': document,
+                                              'digest': gc.hashlib.sha256(document.encode()).hexdigest()})}
+        self.assertTrue(gc.references(row, self.records[1]))
+        self.assertTrue(gc.references_only_lower(row, self.records[1]))
+        self.rows('poolHosts', [row])
+        self.assertEqual(len(self.prepare()['releases']), 7)
+
+    def test_r1_placement_shared_lower_only_is_exempt(self):
+        # A stopped computer's placement linked to the candidate only by the shared lower,
+        # its instance terminated (so absent from the live inventory), needs no binding.
+        self.rows('placements', [{'lower_image_digest': self.records[1]['lowerImageDigest'], 'state': 'STOPPED'}])
+        self.assertEqual(len(self.prepare()['releases']), 7)
+
+    def test_r1_requires_kept_alias_sharing_lower(self):
+        # No retained record keeps the candidate's (now unique) lower: refuse exactly as before.
+        self.records[1]['lowerImageDigest'] = 'sha256:' + '9' * 64
+        self.drops = [gc.identity(self.records[1])]
+        self.evidence['registrySha256'] = gc.sha(self.records)
+        self.assertFalse(gc.shared_lower_kept(self.snapshot, self.records[1]))
+        self.rows('placements', [{'lower_image_digest': self.records[1]['lowerImageDigest']}])
+        self.refuse('referenced record')
+
+    def test_r1_refused_when_candidate_ami_observable(self):
+        # A live (non-terminated) instance on the candidate AMI makes the shared-lower alias
+        # observable, so the whole GC is refused even though a retained alias shares the lower.
+        self.rows('instances', [{'InstanceId': 'i-' + '0' * 17, 'ImageId': self.records[1]['amiId'],
+                                 'State': {'Name': 'running'}}])
+        self.rows('placements', [{'lower_image_digest': self.records[1]['lowerImageDigest']}])
+        self.assertTrue(gc.candidate_ami_observable(self.evidence, self.records[1]))
+        self.refuse('alias observable')
+
+    def test_r1_non_digest_reference_still_needs_attestation(self):
+        # A row that also references a non-digest identity token is not lower-only; it keeps
+        # its ordinary requirement and is never exempted by R1.
+        row = {'lower_image_digest': self.records[1]['lowerImageDigest'], 'amiId': self.records[1]['amiId']}
+        self.assertTrue(gc.references(row, self.records[1]))
+        self.assertFalse(gc.references_only_lower(row, self.records[1]))
+        self.rows('placements', [row])
+        self.refuse('referenced record')
+
+    # ---- R2 retained data volume disposition ----
+    def test_r2_retained_data_volume_accepted(self):
+        self.fixture(pool=False)
+        volume = 'vol-0123456789abcdef0'
+        self.d['extraVolume'] = volume
+        self.rows('volumes', [{'VolumeId': volume}])
+        self.rows('placements', [{'volume_id': volume, 'lower_image_digest': self.records[1]['lowerImageDigest']}])
+        self.sync()
+        self.a['resources'][volume] = {'disposition': 'retained-data-volume'}
+        self.a['resources'][self.instance]['inventorySha256'] = gc.sha(gc.inventory(self.evidence))
+        self.assertEqual(len(self.prepare()['releases']), 7)
+
+    def test_r2_retained_data_volume_guards(self):
+        volume = 'vol-0123456789abcdef0'
+        good = {'volume_id': volume, 'lower_image_digest': self.records[1]['lowerImageDigest']}
+        cases = [
+            ('snapshot-derived', [{'VolumeId': volume, 'SnapshotId': 'snap-0123456789abcdef0'}], [good], 'unattached non-derived'),
+            ('attached', [{'VolumeId': volume, 'Attachments': [{'InstanceId': 'i-' + '0' * 17}]}], [good], 'unattached non-derived'),
+            ('duplicate-volume', [{'VolumeId': volume}, {'VolumeId': volume}], [good], 'unattached non-derived'),
+            ('zero-placements', [{'VolumeId': volume}], [], 'one shared-lower placement'),
+            ('two-placements', [{'VolumeId': volume}], [good, good], 'one shared-lower placement'),
+            ('owner-non-digest', [{'VolumeId': volume}], [{'volume_id': volume, 'amiId': self.records[1]['amiId']}],
+             'one shared-lower placement')]
+        for name, volumes, placements, text in cases:
+            with self.subTest(case=name):
+                self.fixture(pool=False)
+                self.d['extraVolume'] = volume
+                self.rows('volumes', volumes)
+                self.rows('placements', placements)
+                self.sync()
+                self.a['resources'][volume] = {'disposition': 'retained-data-volume'}
+                self.a['resources'][self.instance]['inventorySha256'] = gc.sha(gc.inventory(self.evidence))
+                self.refuse(text)
+
+    def test_collector_skips_shared_lower_rows_and_counts_them(self):
+        # The collector emits no attestation and no unresolved entry for a lower-only row
+        # (R1), and reports how many such rows it satisfied.
+        with patch.dict(sys.modules, {'registry_gc': gc}):
+            spec = importlib.util.spec_from_file_location('collector_r1', HERE.parent / 'registry_gc_evidence.py')
+            collector = importlib.util.module_from_spec(spec); spec.loader.exec_module(collector)
+        directory = self.root / 'export-r1'
+        directory.mkdir()
+        def write(name, value):
+            (directory / name).write_text(json.dumps(value))
+        lower_only = {'id': 'pl-1', 'state': 'STOPPED', 'lower_image_digest': self.records[1]['lowerImageDigest']}
+        write('db-evidence.json', {'meta': {'captured_at': self.evidence['capturedAt'], 'system_identifier': SYSTEM_ID},
+              'placements': [lower_only], 'image_jobs': [], 'pool_hosts': [], 'writer_leases': [], 'migrations': [], 'usage': []})
+        write('registry-snapshot.json', self.records)
+        write('ec2-instances.json', {'Reservations': []})
+        write('ec2-volumes.json', {'Volumes': []})
+        write('ec2-snapshots.json', {'Snapshots': []})
+        context = {k: self.evidence[k] for k in ('planSha256', 'secretVersionId', 'quiescence')}
+        context['inventoryCapturedAt'] = self.evidence['proof']['inventoryCapturedAt']
+        context['fenceActivatedAt'] = self.evidence['proof']['fenceActivatedAt']
+        context['originalPlanJson'] = self.path.read_text()
+        context['sources'] = {k: self.evidence['sources'][k] for k in ('runtimeConfigs', 'releasePlans')}
+        expected = copy.deepcopy(self.evidence)
+        expected['sources']['placements'].update(rows=[lower_only], rowsSha256=gc.sha([lower_only]))
+        expected['sources']['executions'].update(rows=[], rowsSha256=gc.sha([]))
+        queries = {'placements': 'db-evidence.json:placements', 'imageJobs': 'db-evidence.json:image_jobs',
+                   'poolHosts': 'db-evidence.json:pool_hosts', 'writerLeases': 'db-evidence.json:writer_leases',
+                   'providerMigrations': 'db-evidence.json:migrations', 'executions': 'sfn-*.json + exec*/*.describe.json'}
+        for name in ('instances', 'volumes', 'snapshots'):
+            queries[name] = 'ec2-' + name + '.json (all account resources)'
+        for name, query in queries.items(): expected['sources'][name]['query'] = query
+        files = {str(p.relative_to(directory)): gc.hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in directory.rglob('*.json') if 'E1' not in p.relative_to(directory).parts}
+        synthetic_e1(expected, self.path.read_text(), files)
+        (directory / 'E1').mkdir(exist_ok=True)
+        write('E1/collection-receipts.json', expected['proof']['collectionReceipts'])
+        with patch.object(collector, 'datetime') as clock:
+            clock.now.return_value = self.now
+            result = collector.collect(directory, self.records[1]['recipeVersion'], context)
+        self.assertEqual(result['collection']['sharedLowerExempt'], 1)
+        self.assertEqual((result['attestations'], result['collection']['unresolved']), ([], []))
+        # The checker accepts the collector's output end to end.
+        gc.check_evidence(result, self.snapshot, self.plan_sha, self.records[1], self.now, None, SYSTEM_ID)
+
+    def test_collector_generates_retained_data_volume_disposition(self):
+        # The collector gives a candidate execution's unattached data volume a
+        # retained-data-volume disposition (R2) and skips its shared-lower owner placement (R1).
+        self.fixture(pool=False)
+        volume = 'vol-0123456789abcdef0'
+        self.d['extraVolume'] = volume
+        owner = {'id': 'pl-own', 'state': 'STOPPED', 'volume_id': volume,
+                 'lower_image_digest': self.records[1]['lowerImageDigest']}
+        with patch.dict(sys.modules, {'registry_gc': gc}):
+            spec = importlib.util.spec_from_file_location('collector_r2', HERE.parent / 'registry_gc_evidence.py')
+            collector = importlib.util.module_from_spec(spec); spec.loader.exec_module(collector)
+        directory = self.root / 'export-r2'
+        directory.mkdir()
+        def write(name, value):
+            (directory / name).write_text(json.dumps(value))
+        write('db-evidence.json', {'meta': {'captured_at': self.evidence['capturedAt'], 'system_identifier': SYSTEM_ID},
+              'placements': [owner], 'image_jobs': [], 'pool_hosts': [], 'writer_leases': [], 'migrations': [], 'usage': []})
+        write('registry-snapshot.json', self.records)
+        write('ec2-instances.json', {'Reservations': []})
+        write('ec2-volumes.json', {'Volumes': [{'VolumeId': volume}]})
+        write('ec2-snapshots.json', {'Snapshots': []})
+        write('sfn-lifecycle.json', {'executions': [{k: v for k, v in self.d.items() if k not in ('redriveStatus', 'redriveStatusReason')}]})
+        (directory / 'exec107').mkdir()
+        self.d['redriveStatus'] = 'NOT_REDRIVABLE'
+        self.d['redriveStatusReason'] = 'Execution is SUCCEEDED'
+        write('exec107/test.describe.json', self.d)
+        write('exec107/test.history.json', self.h)
+        write('cloudtrail.json', {'Records': self.evidence['proof']['cloudTrail']})
+        self.sync()
+        context = {k: self.evidence[k] for k in ('planSha256', 'secretVersionId', 'quiescence')}
+        context['inventoryCapturedAt'] = self.evidence['proof']['inventoryCapturedAt']
+        context['fenceActivatedAt'] = self.evidence['proof']['fenceActivatedAt']
+        context['originalPlanJson'] = self.path.read_text()
+        context['sources'] = {k: self.evidence['sources'][k] for k in ('runtimeConfigs', 'releasePlans')}
+        expected = copy.deepcopy(self.evidence)
+        expected['sources']['placements'].update(rows=[owner], rowsSha256=gc.sha([owner]))
+        expected['sources']['volumes'].update(rows=[{'VolumeId': volume}], rowsSha256=gc.sha([{'VolumeId': volume}]))
+        queries = {'placements': 'db-evidence.json:placements', 'imageJobs': 'db-evidence.json:image_jobs',
+                   'poolHosts': 'db-evidence.json:pool_hosts', 'writerLeases': 'db-evidence.json:writer_leases',
+                   'providerMigrations': 'db-evidence.json:migrations', 'executions': 'sfn-*.json + exec*/*.describe.json'}
+        for name in ('instances', 'volumes', 'snapshots'):
+            queries[name] = 'ec2-' + name + '.json (all account resources)'
+        for name, query in queries.items(): expected['sources'][name]['query'] = query
+        files = {str(p.relative_to(directory)): gc.hashlib.sha256(p.read_bytes()).hexdigest()
+                 for p in directory.rglob('*.json') if 'E1' not in p.relative_to(directory).parts}
+        synthetic_e1(expected, self.path.read_text(), files)
+        (directory / 'E1').mkdir(exist_ok=True)
+        write('E1/collection-receipts.json', expected['proof']['collectionReceipts'])
+        with patch.object(collector, 'datetime') as clock:
+            clock.now.return_value = self.now
+            result = collector.collect(directory, self.records[1]['recipeVersion'], context)
+        self.assertEqual(result['collection']['unresolved'], [])
+        self.assertEqual(result['collection']['sharedLowerExempt'], 1)
+        self.assertEqual(len(result['attestations']), 1)
+        self.assertEqual(result['attestations'][0]['resources'][volume], {'disposition': 'retained-data-volume'})
+        gc.check_evidence(result, self.snapshot, self.plan_sha, self.records[1], self.now, None, SYSTEM_ID)
+
+    def test_r2_forged_disposition_fields_rejected(self):
+        # A caller-supplied record/attachment claim is ignored; data must prove the volume.
+        self.fixture(pool=False)
+        volume = 'vol-0123456789abcdef0'
+        self.d['extraVolume'] = volume
+        self.rows('volumes', [{'VolumeId': volume, 'SnapshotId': 'snap-0123456789abcdef0'}])
+        self.rows('placements', [{'volume_id': volume, 'lower_image_digest': self.records[1]['lowerImageDigest']}])
+        self.sync()
+        self.a['resources'][volume] = {'disposition': 'retained-data-volume', 'record': gc.identity(self.records[-1]),
+                                       'inventorySha256': gc.sha(gc.inventory(self.evidence))}
+        self.a['resources'][self.instance]['inventorySha256'] = gc.sha(gc.inventory(self.evidence))
+        self.refuse('unattached non-derived')
 
 
 if __name__ == '__main__':
