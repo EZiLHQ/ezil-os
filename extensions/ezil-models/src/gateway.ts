@@ -606,6 +606,9 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     const log = (line: string) => options.log?.(redact(line, [provider.apiKey ?? '', ...Object.values(provider.headers)]));
     let idempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
     let previousIdempotencyKey: string | undefined;
+    // The key of a certain resend that has not been sent yet: it replaces idempotencyKey only when that attempt starts, so
+    // every record and log line names the last attempt actually made, with its own Gateway ID and status.
+    let nextIdempotencyKey: string | undefined;
     let requestId: string | undefined;
     let hold: string | null = null;
     // The Gateway's exact response cache (opt-in set by EZiL OS, never by this extension): HIT or MISS, as evidence only.
@@ -697,6 +700,13 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 if (concurrencyError && now() - concurrencyStarted! > CONCURRENCY_WAIT_BUDGET_MS) throw concurrencyError;
                 // Each attempt reports only its own response: a Gateway ID, status, hold or cache verdict from an earlier
                 // attempt (a 429, a resend, the 413 before a compacted resend under a new key) never carries over.
+                if (nextIdempotencyKey !== undefined) {
+                    previousIdempotencyKey = idempotencyKey;
+                    idempotencyKey = nextIdempotencyKey;
+                    nextIdempotencyKey = undefined;
+                    headers['idempotency-key'] = idempotencyKey;
+                    options.onRequest?.(url, built, idempotencyKey);
+                }
                 requestId = undefined; status = undefined; hold = null; cache = undefined;
                 attemptAbort = new AbortController();
                 const sentAt = resendOf ?? performance.now();
@@ -802,18 +812,16 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                     built = retry.built;
                     compaction = retry.info;
                     options.onCompact?.(compaction);
-                    // The resend is certain now: report the 413 attempt under its own key, Gateway ID and status before the key
-                    // rotates, so the turn's recovered or failed record (under the new key) follows a retrying one. No
-                    // retryOfClientRequestId: the contract reserves it for a known manual retry; the chain is the attempt order.
+                    // The resend is certain now: report the 413 attempt under its own key, Gateway ID and status, so the turn's
+                    // recovered or failed record (under the new key) follows a retrying one. The new key takes over only when
+                    // the resend starts: a cancellation before then (in this callback, or in the admission wait) reports the
+                    // 413 attempt's own key and Gateway ID, never the unsent key with them. No retryOfClientRequestId: the
+                    // contract reserves it for a known manual retry; the chain is the attempt order.
                     retrying(refusal);
-                    const nextIdempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
-                    previousIdempotencyKey = idempotencyKey;
-                    idempotencyKey = nextIdempotencyKey;
-                    headers['idempotency-key'] = idempotencyKey;
+                    nextIdempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
                     resent = false;
                     // A new request: an earlier concurrency wait does not count against it.
                     concurrencyError = undefined; concurrencyStarted = undefined; concurrencyWaited = 0; concurrencyRetries = 0;
-                    options.onRequest?.(url, built, idempotencyKey);
                     waitMs = 0;
                 }
             } finally {

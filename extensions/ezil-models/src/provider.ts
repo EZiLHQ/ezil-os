@@ -59,8 +59,15 @@ function canonicalPart(part: Part): unknown {
  * kept or logged as text.
  */
 function continuationKey(secret: Buffer, connection: number, model: ResolvedModel, history: readonly Message[], calls: readonly { callId: string; name: string; input: unknown }[]): string {
-    const turns = history.map(message => [message.role, message.parts
-        .filter(part => part.type !== 'thinking' && !isCacheMarker(part) && !isStatefulMarker(part)).map(canonicalPart)]);
+    // Logical turns, as the Gateway receives them (gatewayConversation merges adjacent same-role messages), so a turn
+    // Copilot splits into several messages or rejoins into one keys the same at storage and at lookup.
+    const turns: [Message['role'], unknown[]][] = [];
+    for (const message of history) {
+        const parts = message.parts.filter(part => part.type !== 'thinking' && !isCacheMarker(part) && !isStatefulMarker(part)).map(canonicalPart);
+        const previous = turns.at(-1);
+        if (previous?.[0] === message.role) previous[1].push(...parts);
+        else turns.push([message.role, parts]);
+    }
     return createHmac('sha256', secret).update(JSON.stringify([connection, model.providerName, model.model, turns,
         calls.map(call => [call.callId, call.name, stableJson(call.input)])])).digest('hex');
 }
@@ -229,15 +236,24 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         while (this.signedThinking.size > 64) this.signedThinking.delete(this.signedThinking.keys().next().value!);
     }
 
-    /** Re-attach kept signed thinking to an assistant message only when it exactly continues the turn that produced it. */
+    /**
+     * Re-attach kept signed thinking to an assistant turn only when it exactly continues the turn that produced it. A turn
+     * is a run of adjacent assistant messages (Copilot may split one reply's text and calls into several), looked up with
+     * all its calls in order, as it was stored; the thinking goes on its first message, ahead of what the Gateway merges.
+     */
     private restoreSignedThinking(model: ResolvedModel, request: ChatRequest): void {
-        request.messages.forEach((message, index) => {
-            if (message.role !== 'assistant' || message.parts.some(part => part.type === 'thinking')) return;
-            const calls = message.parts.flatMap(part => part.type === 'tool_call' ? [{ callId: part.callId, name: part.name, input: part.input }] : []);
-            if (!calls.length) return;
-            const kept = this.signedThinking.get(continuationKey(this.continuationSecret, this.connectionIdentity(model.provider), model, request.messages.slice(0, index), calls));
-            if (kept) message.parts = [...kept, ...message.parts];
-        });
+        const messages = request.messages;
+        for (let start = 0, end = 0; start < messages.length; start = end) {
+            end = start + 1;
+            if (messages[start]!.role !== 'assistant') continue;
+            while (end < messages.length && messages[end]!.role === 'assistant') end++;
+            const run = messages.slice(start, end);
+            if (run.some(message => message.parts.some(part => part.type === 'thinking'))) continue;
+            const calls = run.flatMap(message => message.parts.flatMap(part => part.type === 'tool_call' ? [{ callId: part.callId, name: part.name, input: part.input }] : []));
+            if (!calls.length) continue;
+            const kept = this.signedThinking.get(continuationKey(this.continuationSecret, this.connectionIdentity(model.provider), model, messages.slice(0, start), calls));
+            if (kept) run[0]!.parts = [...kept, ...run[0]!.parts];
+        }
     }
 
     private rememberModels(models: ResolvedModel[]): ResolvedModel[] {
