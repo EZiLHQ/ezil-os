@@ -796,13 +796,27 @@ export function open_feedback_dialog (_opts) {
     description.focus();
 }
 
+/** Listing and deleting reports are small requests: a stalled one fails instead of loading forever. */
+export const REPORTS_DEADLINE_MS = 20_000;
+
+/** Run one request under `REPORTS_DEADLINE_MS`; the signal also covers reading the response body. */
+async function within_reports_deadline (run) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REPORTS_DEADLINE_MS);
+    try { return await run(controller.signal); } finally { clearTimeout(timer); }
+}
+
 /** @returns {Promise<Array<{id:string,createdAt:string,category:string,descriptionPreview:string,hasScreenshot:boolean,status:string}>>} */
 export async function list_my_reports () {
     if ( ! feedback_enabled() ) return [];
-    const response = await fetch(endpoint(), { method: 'GET', credentials: 'same-origin' });
-    if ( ! response.ok ) throw new Error('Could not load your reports. Try again.');
-    const data = await response.json();
-    if ( ! Array.isArray(data.reports) ) throw new Error('Could not load your reports. Try again.');
+    const data = await within_reports_deadline(async signal => {
+        let response;
+        try { response = await fetch(endpoint(), { method: 'GET', credentials: 'same-origin', signal }); }
+        catch { throw new Error('Could not load your reports. Try again.'); }
+        if ( ! response.ok ) throw new Error('Could not load your reports. Try again.');
+        try { return await response.json(); } catch { throw new Error('Could not load your reports. Try again.'); }
+    });
+    if ( ! Array.isArray(data?.reports) ) throw new Error('Could not load your reports. Try again.');
     return data.reports.slice(0, 50);
 }
 
@@ -810,7 +824,11 @@ export async function list_my_reports () {
 export async function delete_my_report (_id) {
     if ( ! feedback_enabled() || typeof _id !== 'string' || ! UUID.test(_id) ) return false;
     const route = endpoint();
-    const response = await fetch(`${route}${route.includes('?') ? '&' : '?'}id=${encodeURIComponent(_id)}`,
-        { method: 'DELETE', credentials: 'same-origin' });
-    return response.status === 204;
+    return within_reports_deadline(async signal => {
+        try {
+            const response = await fetch(`${route}${route.includes('?') ? '&' : '?'}id=${encodeURIComponent(_id)}`,
+                { method: 'DELETE', credentials: 'same-origin', signal });
+            return response.status === 204;
+        } catch { return false; }
+    });
 }

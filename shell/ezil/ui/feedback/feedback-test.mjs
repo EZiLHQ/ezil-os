@@ -671,6 +671,31 @@ try {
             window.localStorage.removeItem(outboxKey);
         } finally { timers.restore(); flushing = false; }
     });
+    await check('a flush never rewrites the stored order, and equal-size entries go oldest first', async () => {
+        const ids = ['c1111111-1111-4111-8111-111111111111', 'c2222222-2222-4222-8222-222222222222',
+            'c3333333-3333-4333-8333-333333333333', 'c4444444-4444-4444-8444-444444444444'];
+        // Oldest first in storage: two equal text bodies, one screenshot, then another equal text body.
+        const bodies = [queuedReport(ids[0], 'Equal A'), queuedReport(ids[1], 'Equal B'),
+            queuedReport(ids[2], 'Screenshot', 'A'.repeat(70 * 1024)), queuedReport(ids[3], 'Equal C')];
+        const seeded = ids.map((clientRequestId, i) => ({ clientRequestId, body: bodies[i], draft: null }));
+        window.localStorage.setItem(outboxKey, JSON.stringify(seeded));
+        flushing = true;
+        try {
+            const count = calls.length;
+            const before = window.localStorage.getItem(outboxKey);
+            respond = async () => { throw new TypeError('Failed to fetch'); };
+            await feedback.flush_feedback_outbox();
+            assert.equal(window.localStorage.getItem(outboxKey), before, '🔴 a flush leaves the stored age order untouched');
+            // Only the screenshot is answered with a retryable server error, so it stays queued.
+            respond = async (url, options) => JSON.parse(options.body).clientRequestId === ids[2]
+                ? { status: 503 } : { status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) };
+            await feedback.flush_feedback_outbox();
+            assert.deepEqual(calls.slice(count + 1).map(c => JSON.parse(c.body).clientRequestId), [ids[0], ids[1], ids[3], ids[2]],
+                '🔴 equal sizes keep their age order; the larger body goes last');
+            assert.deepEqual(stored(outboxKey).map(entry => entry.clientRequestId), [ids[2]]);
+            window.localStorage.removeItem(outboxKey);
+        } finally { flushing = false; }
+    });
     await check('a timeout on the compatibility re-send still counts as a timeout', async () => {
         const leanId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', nextId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
         const withDiagnostics = JSON.stringify({ v: 1, clientRequestId: leanId, category: 'bug', description: 'Old server',
@@ -1035,6 +1060,53 @@ try {
         assert.equal(await feedback.delete_my_report('invalid'), false);
         assert.equal(calls.length, count);
     });
+    await check('a stalled report list or delete fails at its deadline instead of loading forever', async () => {
+        const timers = [];
+        const realSetTimeout = globalThis.setTimeout, realClearTimeout = globalThis.clearTimeout;
+        globalThis.setTimeout = (fn, ms, ...rest) => {
+            if ( ms !== feedback.REPORTS_DEADLINE_MS ) return realSetTimeout(fn, ms, ...rest);
+            const timer = { fn, ms, cleared: false };
+            timers.push(timer);
+            return timer;
+        };
+        globalThis.clearTimeout = timer => { if ( timers.includes(timer) ) timer.cleared = true; else realClearTimeout(timer); };
+        // Without a signal the request can only hang, exactly as a real stalled one would.
+        const stall = (url, options) => new Promise((resolve, reject) => {
+            options.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        });
+        const settled = promise => Promise.race([promise.then(value => ({ value }), error => ({ error })),
+            new Promise(resolve => realSetTimeout(() => resolve({ hung: true }), 200))]);
+        try {
+            // The list's headers arrive, then its body stalls.
+            respond = (url, options) => Promise.resolve({ status: 200, ok: true, json: () => stall(url, options) });
+            const listing = feedback.list_my_reports();
+            await until(() => timers.length === 1);
+            assert.ok(feedback.REPORTS_DEADLINE_MS >= 10_000 && feedback.REPORTS_DEADLINE_MS <= 30_000);
+            timers[0].fn();
+            const listed = await settled(listing);
+            assert.equal(listed.hung, undefined, '🔴 the deadline ends a stalled list');
+            assert.match(String(listed.error?.message), /Could not load your reports/, 'with the readable error');
+            assert.equal(timers[0].cleared, true, 'the list deadline is released');
+            respond = stall;
+            const removal = feedback.delete_my_report(reportId);
+            await until(() => timers.length === 2);
+            timers[1].fn();
+            assert.deepEqual(await settled(removal), { value: false }, '🔴 a stalled delete settles as not deleted');
+            assert.equal(timers[1].cleared, true, 'the delete deadline is released');
+            // A list whose headers never arrive fails the same readable way.
+            respond = stall;
+            const headless = feedback.list_my_reports();
+            await until(() => timers.length === 3);
+            timers[2].fn();
+            assert.match(String((await settled(headless)).error?.message), /Could not load your reports/, '🔴 a stall before headers is readable too');
+            respond = async () => ({ status: 200, ok: true, json: async () => null });
+            await assert.rejects(feedback.list_my_reports(), /Could not load your reports/, '🔴 a null body is a readable failure');
+            const reports = [{ id: reportId, category: 'bug', createdAt: '2026-10-15', descriptionPreview: 'Desktop froze', hasScreenshot: false, status: 'new' }];
+            respond = async () => ({ status: 200, ok: true, json: async () => ({ reports }) });
+            assert.deepEqual(await feedback.list_my_reports(), reports);
+            assert.equal(timers.at(-1).cleared, true, '🔴 a successful list clears its deadline');
+        } finally { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout; }
+    });
     await check('Troubleshoot entry and reports are gated; explicit load, escaped preview and confirmed deletion', async () => {
         // Existing Troubleshoot deliberately reads the diagnostic-log ring;
         // the feedback isolation checks above have already kept that forbidden.
@@ -1119,6 +1191,72 @@ try {
         entry.click();
         assert.equal(current(), null);
         assert.equal(calls.length, count + 1);
+        pane.remove();
+    });
+    await check('only the newest report load may write, and a failed delete keeps one truthful message', async () => {
+        window.__EZIL_BOOT__.desktopState.endpoints.feedback = '/api/shell/feedback';
+        const { default: troubleshoot } = await import('../Settings/tabs/troubleshoot.js');
+        const { default: feedbackTab } = await import('../Settings/tabs/feedback.js');
+        const reports = [{ id: reportId, category: 'bug', createdAt: '2026-10-15', descriptionPreview: 'Desktop froze', hasScreenshot: false, status: 'new' }];
+        // Each GET waits on its own gate, so the test decides the settle order.
+        const gates = [];
+        respond = (url, options) => options.method === 'GET'
+            ? new Promise((resolve, reject) => gates.push({ resolve, reject }))
+            : Promise.resolve({ status: 503 });
+        const answer = (gate, list = reports) => gate.resolve({ status: 200, ok: true, json: async () => ({ reports: list }) });
+        const stale = [{ ...reports[0], descriptionPreview: 'STALE older answer' }];
+        // Settings → Feedback: init loads once; Refresh starts a second load.
+        const settings = document.createElement('div');
+        settings.innerHTML = feedbackTab.html();
+        document.body.append(settings);
+        feedbackTab.init($(settings));
+        settings.querySelector('[data-action="refresh-reports"]').click();
+        await until(() => gates.length === 2);
+        const statusHost = settings.querySelector('[data-role="feedback-status-reports"]');
+        answer(gates[1]);
+        await until(() => /Desktop froze/.test(statusHost.textContent));
+        gates[0].reject(new Error('Could not load your reports. Try again.'));
+        await tick(); await tick();
+        assert.match(statusHost.textContent, /Desktop froze/, '🔴 an older failed load never replaces the newer list (Settings)');
+        // An older load that succeeds late is discarded too.
+        settings.querySelector('[data-action="refresh-reports"]').click();
+        settings.querySelector('[data-action="refresh-reports"]').click();
+        await until(() => gates.length === 4);
+        answer(gates[3]);
+        await until(() => /Desktop froze/.test(statusHost.textContent));
+        answer(gates[2], stale);
+        await tick(); await tick();
+        assert.doesNotMatch(statusHost.textContent, /STALE/, '🔴 an older successful load never replaces the newer list (Settings)');
+        settings.remove();
+        // Troubleshoot: same race through its explicit load.
+        const pane = document.createElement('div');
+        pane.innerHTML = troubleshoot.html();
+        document.body.append(pane);
+        troubleshoot.init($(pane));
+        const load = pane.querySelector('[data-action="load-reports"]');
+        load.click(); load.click();
+        await until(() => gates.length === 6);
+        answer(gates[5]);
+        await until(() => pane.querySelector('.ezil-feedback-reports li'));
+        gates[4].reject(new Error('Could not load your reports. Try again.'));
+        await tick(); await tick();
+        assert.ok(pane.querySelector('.ezil-feedback-reports li'), '🔴 an older failed load never replaces the newer list (Troubleshoot)');
+        load.click(); load.click();
+        await until(() => gates.length === 8);
+        answer(gates[7]);
+        await until(() => /Desktop froze/.test(pane.querySelector('[data-role="feedback-reports"]').textContent));
+        answer(gates[6], stale);
+        await tick(); await tick();
+        assert.doesNotMatch(pane.querySelector('[data-role="feedback-reports"]').textContent, /STALE/,
+            '🔴 an older successful load never replaces the newer list (Troubleshoot)');
+        // Two failed deletes leave one message that does not claim the report is still there.
+        window.confirm = () => true;
+        const remove = pane.querySelector('.ezil-feedback-reports button');
+        remove.click(); await until(() => ! remove.disabled && pane.querySelector('.ezil-settings-error'));
+        remove.click(); await tick(); await until(() => ! remove.disabled);
+        const messages = pane.querySelectorAll('.ezil-feedback-reports li .ezil-settings-error');
+        assert.equal(messages.length, 1, '🔴 repeated failures update one message');
+        assert.match(messages[0].textContent, /Could not confirm.*load your reports again to check/);
         pane.remove();
     });
     console.log(`\n${checks} feedback checks passed. jsdom does not validate browser layout or real capture.`);

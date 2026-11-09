@@ -467,9 +467,14 @@ async function loadReports ($win) {
     if ( ! host ) return;
     host.textContent = 'Loading your reports…';
     host.dataset.loaded = '1';
+    // Only the newest load may write: an older request that fails at its
+    // deadline must not replace a list a later load already rendered.
+    const seq = String(Number(host.dataset.loadSeq || 0) + 1);
+    host.dataset.loadSeq = seq;
+    const current = () => host.isConnected && host.dataset.loadSeq === seq;
     try {
         const reports = await list_my_reports();
-        if ( ! host.isConnected || ! feedback_enabled() ) return;
+        if ( ! current() || ! feedback_enabled() ) return;
         host.textContent = '';
         if ( reports.length === 0 ) { host.textContent = 'You have no reports yet.'; return; }
         const list = document.createElement('ul');
@@ -489,14 +494,16 @@ async function loadReports ($win) {
             remove.addEventListener('click', async () => {
                 if ( ! feedback_enabled() || ! window.confirm('Delete this report and its screenshot?') ) return;
                 remove.disabled = true;
-                const message = document.createElement('p');
+                // One message per row: repeated failures update it instead of stacking.
+                const message = row.querySelector('.ezil-settings-error') || document.createElement('p');
                 message.className = 'ezil-settings-error';
                 try {
                     if ( ! await delete_my_report(report.id) ) throw new Error('delete_failed');
                     row.remove();
                     if ( ! list.children.length ) host.textContent = 'You have no reports yet.';
                 } catch {
-                    message.textContent = 'Could not delete this report. Try again.';
+                    // A timed-out delete may still have removed it; reloading the list shows which.
+                    message.textContent = 'Could not confirm this report was deleted. Try again, or load your reports again to check.';
                     row.append(message);
                     remove.disabled = false;
                 }
@@ -506,7 +513,7 @@ async function loadReports ($win) {
         }
         host.append(list);
     } catch {
-        if ( host.isConnected ) host.textContent = 'Could not load your reports. Try again.';
+        if ( current() ) host.textContent = 'Could not load your reports. Try again.';
     }
 }
 

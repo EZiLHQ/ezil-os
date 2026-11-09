@@ -609,6 +609,9 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     const log = (line: string) => options.log?.(redact(line, [provider.apiKey ?? '', ...Object.values(provider.headers)]));
     let idempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
     let previousIdempotencyKey: string | undefined;
+    // The key of a certain resend that has not been sent yet: it replaces idempotencyKey only when that attempt starts, so
+    // every record and log line names the last attempt actually made, with its own Gateway ID and status.
+    let nextIdempotencyKey: string | undefined;
     let requestId: string | undefined;
     let hold: string | null = null;
     // The Gateway's exact response cache (opt-in set by EZiL OS, never by this extension): HIT or MISS, as evidence only.
@@ -632,6 +635,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         } catch { /* An observer never changes the turn or its telemetry. */ }
     };
     const retrying = (error: GatewayError) => { retriedAfter = { error, stage }; report('retrying', error, stage); };
+    // The request and compaction observers, like `report`: a throwing observer never changes the turn.
+    const observe = (call: () => void) => { try { call(); } catch { /* observer only */ } };
     const responses = model.gatewayProtocol === 'openai-responses';
     let stream = (responses || model.model !== 'us.moonshotai.kimi-k3') && model.stream !== false;
     let used = emptyUsage();
@@ -655,7 +660,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         const compact = (first: LocalRequestError, limits: ResolvedModel, cause?: 'remote') => {
             const compacted = compactRequest(request, first, builder(limits), cause);
             compaction = compacted.info;
-            options.onCompact?.(compaction);
+            const info = compaction;
+            observe(() => options.onCompact?.(info));
             return compacted.built;
         };
         let built: ReturnType<ReturnType<typeof builder>>;
@@ -672,7 +678,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         stream = built.body.stream;
         const url = `${provider.baseUrl}/${responses ? 'responses' : 'messages'}`;
         // Callback is for tests/integration, never used for gateway prompt logging.
-        options.onRequest?.(url, built, idempotencyKey);
+        observe(() => options.onRequest?.(url, built, idempotencyKey));
         const headers = { ...authHeaders(provider), 'content-type': 'application/json', accept: stream ? 'text/event-stream' : 'application/json', 'idempotency-key': idempotencyKey };
         const identity = providerIdentity(provider);
         let retried = false;
@@ -700,7 +706,19 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 if (concurrencyError && now() - concurrencyStarted! > CONCURRENCY_WAIT_BUDGET_MS) throw concurrencyError;
                 // Each attempt reports only its own response: a Gateway ID, status, hold or cache verdict from an earlier
                 // attempt (a 429, a resend, the 413 before a compacted resend under a new key) never carries over.
+                if (nextIdempotencyKey !== undefined) {
+                    // Announce the resend, then commit to it only if the caller has not cancelled meanwhile: a
+                    // cancellation here still names the 413 attempt, and the resend is never sent after it.
+                    const next = nextIdempotencyKey;
+                    observe(() => options.onRequest?.(url, built, next));
+                    options.signal.throwIfAborted();
+                    previousIdempotencyKey = idempotencyKey;
+                    idempotencyKey = next;
+                    nextIdempotencyKey = undefined;
+                    headers['idempotency-key'] = idempotencyKey;
+                }
                 requestId = undefined; status = undefined; hold = null; cache = undefined;
+                // No await from here to the fetch: a later cancellation reaches this attempt's own controller.
                 attemptAbort = new AbortController();
                 const sentAt = resendOf ?? performance.now();
                 let response: Response;
@@ -804,19 +822,18 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                     if (Buffer.from(retry.built.bytes).equals(Buffer.from(refused))) throw refusal;
                     built = retry.built;
                     compaction = retry.info;
-                    options.onCompact?.(compaction);
-                    // The resend is certain now: report the 413 attempt under its own key, Gateway ID and status before the key
-                    // rotates, so the turn's recovered or failed record (under the new key) follows a retrying one. No
-                    // retryOfClientRequestId: the contract reserves it for a known manual retry; the chain is the attempt order.
+                    const info = compaction;
+                    observe(() => options.onCompact?.(info));
+                    // The resend is certain now: report the 413 attempt under its own key, Gateway ID and status, so the turn's
+                    // recovered or failed record (under the new key) follows a retrying one. The new key takes over only when
+                    // the resend starts: a cancellation before then (in this callback, or in the admission wait) reports the
+                    // 413 attempt's own key and Gateway ID, never the unsent key with them. No retryOfClientRequestId: the
+                    // contract reserves it for a known manual retry; the chain is the attempt order.
                     retrying(refusal);
-                    const nextIdempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
-                    previousIdempotencyKey = idempotencyKey;
-                    idempotencyKey = nextIdempotencyKey;
-                    headers['idempotency-key'] = idempotencyKey;
+                    nextIdempotencyKey = (options.newIdempotencyKey ?? randomUUID)();
                     resent = false;
                     // A new request: an earlier concurrency wait does not count against it.
                     concurrencyError = undefined; concurrencyStarted = undefined; concurrencyWaited = 0; concurrencyRetries = 0;
-                    options.onRequest?.(url, built, idempotencyKey);
                     waitMs = 0;
                 }
             } finally {
