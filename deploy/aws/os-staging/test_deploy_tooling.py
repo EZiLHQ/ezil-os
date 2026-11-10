@@ -56,7 +56,12 @@ elif name == "docker":
         (state / 'built-ignored').write_text(str((context / 'app/ignored.txt').exists()))
         if os.environ.get('MUTATE_DURING_BUILD'):
             pathlib.Path(os.environ['MUTATE_DURING_BUILD']).write_text('changed during build\n')
-    if args[:1] == ["save"]:
+    if args[:2] == ["save", "-o"]:
+        if os.environ.get('FAKE_SAVE_FAIL'):
+            sys.exit(1)
+        shutil.copyfile(os.environ.get('FAKE_SAVE_TAR') or state / "save.tar", args[2])
+        (state / "saved").touch()
+    elif args[:1] == ["save"]:
         sys.stdout.write("image:" + args[1])
     elif args[:1] == ["load"]:
         (state / "loaded").write_bytes(sys.stdin.buffer.read())
@@ -67,6 +72,9 @@ elif name == "docker":
         loaded = state / "loaded"
         if os.environ.get('FAKE_INSPECT_JSON') and loaded.exists():
             data = json.loads(os.environ['FAKE_INSPECT_JSON'])
+            if after('--format') == '{{.Id}}':
+                print(os.environ.get('FAKE_ID_AFTER_SAVE', data['Id']) if (state / "saved").exists() else data['Id'])
+                sys.exit(0)
             print(json.dumps(data) if after('--format') == '{{json .}}' else data['Architecture'])
             sys.exit(0)
         if not loaded.exists() or loaded.read_bytes() != ("image:" + args[2]).encode():
@@ -75,8 +83,12 @@ elif name == "docker":
     elif args[:3] == ["compose", "version", "--short"]:
         print("2.39.4")
     elif args[:2] == ["container", "inspect"] and '--format' in args:
-        print('ezil-os-staging:previous sha256:' + '1' * 64)
+        if after('--format') == '{{.Image}}':
+            print(os.environ.get('FAKE_RUNNING_IMAGE') or json.loads(os.environ['FAKE_INSPECT_JSON'])['Id'])
+        else:
+            print('ezil-os-staging:previous sha256:' + '1' * 64)
     elif "up" in args:
+        (state / "export_at_up").write_text(str(bool(list(pathlib.Path(os.environ["TMPDIR"]).rglob("loaded-export.tar")))))
         with open(state / "log", "a") as log:
             log.write(json.dumps(["compose.env", pathlib.Path("compose.env").read_text()]) + "\n")
     elif "exec" in args:
