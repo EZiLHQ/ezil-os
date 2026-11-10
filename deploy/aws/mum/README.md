@@ -948,3 +948,21 @@ deployment tuple and all twenty-seven records; do not reinstall the older app. T
 are unchanged. Synthetic tests are not release proof: verify the actual record
 count, secret and readback byte sizes before promotion. No cleanup or history
 removal is implied.
+
+### Twenty-eight-record registry compatibility
+The 1.0.39 release occupies the twenty-seventh slot, so the following immutable
+image needs a twenty-eighth. The next matched app/host release permits
+twenty-eight retained records, refusing a twenty-ninth, in both app validators,
+both `json-tool.py` guards and the GC guard. Every earlier app accepts at most
+twenty-seven and cannot read a twenty-eight-record registry. Install the
+compatible app with `apply-app` first: it reads back the running commit and
+deployment before writing its receipt, and `promote-canary` refuses without that
+receipt before reading the secret, so the twenty-eighth record is never appended
+under an older app. App and agent must still come from the same reviewed commit,
+which must contain both this change and the feature being released. Rollback must
+retain the invoking twenty-eight-compatible app while restoring the prior
+deployment tuple and all twenty-eight records; do not reinstall the older app. The
+24,000-byte readback and 65,536-byte secret limits, immutable records and GC proofs
+are unchanged. Synthetic tests are not release proof: verify the actual record
+count, secret and readback byte sizes before promotion. No cleanup or history
+removal is implied.
