@@ -9,18 +9,25 @@ import { GitAddressGrantError, GIT_ADDRESS_GRANT_URL, grantForGitAddress } from 
 const URL = 'https://github.ezil.work/acme/site.git';
 const COMPUTER = '22222222-2222-4222-8222-222222222222';
 const REPO = '44444444-4444-4444-8444-444444444444';
+const PROJECT = '33333333-3333-4333-8333-333333333333';
+const BINDING_VERSION = 'b'.repeat(64);
 const TOKEN = `egg_${'a'.repeat(64)}`;
 const identity = (): RetainedIdentity => ({ token: 'private-id-token', issuer: 'https://id.ezil.work/', subject: 'auth0|builder',
     expiresAt: Date.now() + 240_000, userId: '11111111-1111-4111-8111-111111111111', sessionId: 'session-1' });
 const answer = (over: Record<string, unknown> = {}) => ({ username: 'ezil', token: TOKEN, expiresAt: new Date(Date.now() + 180_000).toISOString(),
-    cloneUrl: URL, repositoryId: REPO, routeName: 'acme/site', handle: 'acme', name: 'site', scope: 'write', defaultBranch: 'topic/main', class: 'project', ...over });
+    cloneUrl: URL, repositoryId: REPO,
+    binding: { projectId: PROJECT, repositoryId: REPO, canonicalURL: URL, ref: 'refs/heads/topic/main', bindingVersion: BINDING_VERSION },
+    identity: { issuer: 'https://id.ezil.work/', subject: 'auth0|builder' },
+    routeName: 'acme/site', handle: 'acme', name: 'site', scope: 'write', defaultBranch: 'topic/main', class: 'project', ...over });
 
 describe('production EZiL Git address grant', () => {
     it('sends the exact owned address and returns only the bounded Worker fields', async () => {
         const fetcher = vi.fn(async () => Response.json(answer(), { status: 201 }));
         const grant = await grantForGitAddress(identity(), COMPUTER, URL, { fetch: fetcher as typeof fetch });
         expect(grant).toEqual({ repositoryId: REPO, canonicalURL: URL, ref: 'refs/heads/topic/main',
-            git: { token: TOKEN, expiresAt: expect.any(String), scope: 'write' } });
+            git: { token: TOKEN, expiresAt: expect.any(String), scope: 'write' },
+            privateBinding: { projectId: PROJECT, bindingVersion: BINDING_VERSION,
+                issuer: 'https://id.ezil.work/', subject: 'auth0|builder' } });
         expect(fetcher).toHaveBeenCalledTimes(1);
         const [where, init] = fetcher.mock.calls[0] as unknown as [string, RequestInit];
         expect(where).toBe(GIT_ADDRESS_GRANT_URL);
@@ -41,6 +48,12 @@ describe('production EZiL Git address grant', () => {
     it.each([
         { cloneUrl: 'https://git-qa.ezil.work/acme/site.git' }, { repositoryId: 'not-a-uuid' },
         { defaultBranch: '../other' }, { routeName: 'other/site' }, { scope: 'admin' },
+        { binding: { ...answer().binding, projectId: 'not-a-uuid' } },
+        { binding: { ...answer().binding, bindingVersion: 'not-a-binding-version' } },
+        { binding: { ...answer().binding, repositoryId: '55555555-5555-4555-8555-555555555555' } },
+        { binding: { ...answer().binding, canonicalURL: 'https://github.ezil.work/acme/other.git' } },
+        { binding: { ...answer().binding, ref: 'refs/heads/other' } },
+        { identity: { issuer: 'https://id.ezil.work/', subject: 'auth0|other' } },
         { expiresAt: new Date(Date.now() + 600_000).toISOString() },
     ])('refuses an answer outside the authenticated route/ref/grant bounds', async over => {
         const fetcher = vi.fn(async () => Response.json(answer(over), { status: 201 }));

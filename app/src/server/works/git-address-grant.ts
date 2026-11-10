@@ -12,12 +12,16 @@ const BRANCH = /^[A-Za-z0-9][A-Za-z0-9._/-]{0,243}$/;
 const answer = z.object({
     username: z.literal('ezil'), token: z.string().regex(/^egg_[0-9a-f]{64}$/), expiresAt: z.string().datetime(),
     cloneUrl: z.string(), repositoryId: z.string().regex(UUID), routeName: z.string(), handle: z.string(), name: z.string(),
+    binding: z.object({ projectId: z.string().regex(UUID), repositoryId: z.string().regex(UUID),
+        canonicalURL: z.string(), ref: z.string(), bindingVersion: z.string().regex(/^[a-f0-9]{64}$/) }).strict(),
+    identity: z.object({ issuer: z.literal('https://id.ezil.work/'), subject: z.string().min(1).max(255) }).strict(),
     scope: z.enum(['read', 'write']), defaultBranch: z.string().regex(BRANCH), class: z.literal('project'),
 }).strict();
 
 export type GitAddressGrant = {
     repositoryId: string; canonicalURL: string; ref: string;
     git: { token: string; expiresAt: string; scope: 'read' | 'write' };
+    privateBinding: { projectId: string; bindingVersion: string; issuer: 'https://id.ezil.work/'; subject: string };
 };
 export type GitAddressGrantErrorCode = 'identity_refused' | 'not_found' | 'not_ready' | 'unavailable';
 export class GitAddressGrantError extends Error {
@@ -80,10 +84,15 @@ export async function grantForGitAddress(
     const expiry = Date.parse(grant.expiresAt);
     if (grant.cloneUrl !== canonicalURL || grant.handle !== parts[0] || grant.name !== parts[1]
         || grant.routeName !== `${parts[0]}/${parts[1]}` || !validBranch(grant.defaultBranch)
+        || grant.binding.repositoryId !== grant.repositoryId || grant.binding.canonicalURL !== canonicalURL
+        || grant.binding.ref !== `refs/heads/${grant.defaultBranch}`
+        || grant.identity.issuer !== identity.issuer || grant.identity.subject !== identity.subject
         || !Number.isFinite(expiry) || expiry <= receivedAt + 5_000 || expiry > receivedAt + 330_000
         || identity.expiresAt <= receivedAt || expiry > identity.expiresAt + 30_000) {
         throw new GitAddressGrantError('unavailable');
     }
     return { repositoryId: grant.repositoryId, canonicalURL: grant.cloneUrl, ref: `refs/heads/${grant.defaultBranch}`,
-        git: { token: grant.token, expiresAt: grant.expiresAt, scope: grant.scope } };
+        git: { token: grant.token, expiresAt: grant.expiresAt, scope: grant.scope },
+        privateBinding: { projectId: grant.binding.projectId, bindingVersion: grant.binding.bindingVersion,
+            issuer: grant.identity.issuer, subject: grant.identity.subject } };
 }

@@ -9,6 +9,7 @@ import {
     REPO_OPEN_MAX_TIMEOUT_MS, REPO_OPEN_MIN_TIMEOUT_MS, REPO_OPEN_TRANSPORT_MARGIN_MS, requestRepoOpen, withRepositoryFolder,
 } from '@/server/lib/compute/repo-open';
 import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/shell/http';
+import type { GitAddressGrant } from '@/server/works/git-address-grant';
 import {
     identityRefreshRequired, projectGrantOrRefusal, projectIds, projectInvalid, projectRepoConfiguredOrRefusal, retainedIdentityOrRefusal, shellRefusal,
 } from '@/server/works/shell-project';
@@ -238,17 +239,17 @@ const repoUrlInvalid = () => shellRefusal(400, 'repo_url_invalid', "This isn't a
  * Open a repository from its address (`/app/code?repo=<URL-encoded https URL>`, founder 547ed35a), on the caller's
  * own selected computer, with its own provider and plan rules. In this order, each step only after the one before:
  *
- *  1. the address is one canonical public github.com repository (`parseRepositoryUrl`), else `repo_url_invalid`
- *     (400) or, for EZiL Git's own hosts, `repo_url_unsupported` (409), before anything is read;
+ *  1. the address is one canonical github.com or github.ezil.work repository (`parseRepositoryUrl`), else
+ *     `repo_url_invalid` (400) or `repo_url_unsupported` (409), before anything is read;
  *  2. the computer is the caller's own (`computer.get`: NOT_FOUND otherwise);
  *  3. it is a Cloudflare computer (AWS: `repo_open_unsupported_provider`, 409; os-builder-project-open-v1 §8);
- *  4. the repository exists publicly and has a default branch: one anonymous read (`resolvePublicGitHub`); a missing
- *     or private one is "This repository doesn't exist." (404), before the computer is woken for it;
- *  5. Code is minted exactly as without a repository (the same wake loop, Free policy and billing gates);
- *  6. the Worker fetches it anonymously into `<root>/projects/<id>` (`repositoryIdFor`: the same folder on every
- *     reopen, which then fetches only and keeps uncommitted work) and only that folder goes into the URL.
+ *  4. github.com is resolved anonymously; github.ezil.work is authorized by Works using the retained EZiL ID token.
+ *     Missing and unauthorized addresses are indistinguishable before Code can wake the computer;
+ *  5. Code is minted through its existing wake loop, Free policy and billing gates. A near-expired Git grant is
+ *     renewed after a long mint, then the computer placement is re-read;
+ *  6. the signed Worker route opens `<root>/projects/<repositoryId>` and only that validated folder enters Code's URL.
  *
- * No credential is sent anywhere: EZiL ID grants nothing on GitHub, and a private repository is not opened this way.
+ * The Git grant is sent only from the OS server to the Worker; public github.com opens have no grant.
  */
 async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: {
     computerId: string; intent: unknown; repository: unknown; startedAt: number; signal: AbortSignal;
@@ -286,21 +287,12 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
         return shellRefusal(503, 'repo_url_unavailable', "We couldn't reach this repository. Try again.");
     }
 
-    const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent }) as { ok: boolean; codePreviewUrl?: unknown };
-    if (!preview.ok || typeof preview.codePreviewUrl !== 'string') return shellJson(preview);
-    // Re-read after the mint: a computer that moved to AWS meanwhile is refused, never signed for as Cloudflare.
-    const controls = await target(ctx, computerId);
-    if (isAws(controls)) return unsupportedProvider();
-    let repositoryId: string;
-    let ref: string;
-    let git: { token: string; expiresAt: string; scope: 'read' | 'write' } | null = null;
-    if (parsed.host === 'github.ezil.work') {
+    // Gate an EZiL Git address by Works authority before Code can wake the
+    // computer. The selected computer's ownership/provider were checked above.
+    const loadAddressGrant = async (): Promise<GitAddressGrant | Response> => {
         const { grantForGitAddress, GitAddressGrantError } = await import('@/server/works/git-address-grant');
         try {
-            const grant = await grantForGitAddress(identity!, computerId, parsed.canonicalURL, { signal: deadline });
-            repositoryId = grant.repositoryId;
-            ref = grant.ref;
-            git = grant.git;
+            return await grantForGitAddress(identity!, computerId, parsed.canonicalURL, { signal: deadline });
         } catch (error) {
             const code = error instanceof GitAddressGrantError ? error.code : 'unavailable';
             console.warn('[shell] code-preview-url address grant refused', { code });
@@ -312,10 +304,27 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
             if (code === 'not_found') return shellRefusal(404, 'repo_not_found', "This repository doesn't exist.");
             return shellRefusal(503, 'repo_url_unavailable', "We couldn't reach this repository. Try again.");
         }
-    } else {
-        repositoryId = repositoryIdFor(parsed.canonicalURL);
-        ref = resolved!.ref;
+    };
+    let addressGrant = parsed.host === 'github.ezil.work' ? await loadAddressGrant() : null;
+    if (addressGrant instanceof Response) return addressGrant;
+
+    const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent }) as { ok: boolean; codePreviewUrl?: unknown };
+    if (!preview.ok || typeof preview.codePreviewUrl !== 'string') return shellJson(preview);
+    if (left() < REPO_OPEN_MIN_TIMEOUT_MS + REPO_OPEN_TRANSPORT_MARGIN_MS) return openTimedOut();
+    // A cold Code mint may outlive the first grant. Reauthorize that exact
+    // address before the Worker call when its token could expire mid-open.
+    if (addressGrant && Date.parse(addressGrant.git.expiresAt) - Date.now()
+        < Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS) + 30_000) {
+        addressGrant = await loadAddressGrant();
+        if (addressGrant instanceof Response) return addressGrant;
     }
+    // Re-read after the mint: a computer that moved to AWS meanwhile is refused, never signed for as Cloudflare.
+    const controls = await target(ctx, computerId);
+    if (isAws(controls)) return unsupportedProvider();
+    const repositoryId = addressGrant?.repositoryId ?? repositoryIdFor(parsed.canonicalURL);
+    const ref = addressGrant?.ref ?? resolved!.ref;
+    const git = addressGrant?.git ?? null;
+    const privateBinding = addressGrant?.privateBinding;
     // Works can take up to ten seconds. Bound the signed Worker operation with
     // the remaining deadline after that fetch, not with a pre-grant snapshot.
     const timeoutMs = Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS);
@@ -325,7 +334,7 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     }
     const config = resolveCloudflareGuacamoleConfig();
     const opened = await requestRepoOpen(config.workerUrl, process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '', controls,
-        { userId: ctx.user.id, computerId }, { repositoryId, canonicalURL: parsed.canonicalURL, ref, git, timeoutMs },
+        { userId: ctx.user.id, computerId }, { repositoryId, canonicalURL: parsed.canonicalURL, ref, git, privateBinding, timeoutMs },
         { correlationId: newCorrelationId(), signal: deadline });
     if (!opened.ok) {
         if (opened.errorCode === 'repo_open_unsupported_provider') return unsupportedProvider();

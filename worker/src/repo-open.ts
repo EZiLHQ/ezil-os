@@ -282,6 +282,9 @@ export interface RepoOpenRequest {
   expiresAt: string;
   /** The grant's scope when the caller sent it (`git.scope`): an EZiL Git open then installs push access (`./repo-grant.ts`). */
   scope?: 'read' | 'write';
+  /** Authoritative Works binding plus the retained, verified EZiL ID identity.
+   * Present only for the direct production EZiL Git address on os-staging. */
+  privateBinding?: { projectId: string; bindingVersion: string; issuer: 'https://id.ezil.work/'; subject: string };
   /** Chosen from the URL's host by `parseRepoOpenRequest`, never by the caller. */
   auth: RepoOpenAuth;
   /** The whole open's bound, ms: the caller's `timeoutMs`, or `REPO_OPEN_EXEC_TIMEOUT_MS`. */
@@ -361,10 +364,12 @@ export function parseRepoOpenRequest(
 ): { ok: true; request: RepoOpenRequest } | { ok: false; error: 'repo_open_invalid_request' | 'repo_open_token_expired' } {
   const invalid = { ok: false as const, error: 'repo_open_invalid_request' as const };
   if (!isPlainObject(body)) return invalid;
-  const keys = Object.keys(body).filter((k) => k !== 'timeoutMs').sort().join(',');
-  const { repositoryId, canonicalURL, ref, git } = body;
+  const keys = Object.keys(body).filter((k) => k !== 'timeoutMs' && k !== 'privateBinding').sort().join(',');
+  const { repositoryId, canonicalURL, ref, git, privateBinding } = body;
   const auth = repoOpenAuthFor(canonicalURL, remotes);
   if (auth === null) return invalid;
+  if (Object.hasOwn(body, 'privateBinding') && (privateBinding === undefined || !EZIL_GIT_REPOSITORY_URL.test(canonicalURL as string)
+    || !optedIntoStagingGitQa(remotes))) return invalid;
   // An anonymous (public github.com) open carries no grant at all; every other remote carries exactly one.
   if (keys !== (auth === 'none' ? 'canonicalURL,ref,repositoryId' : 'canonicalURL,git,ref,repositoryId')) return invalid;
   if (typeof repositoryId !== 'string' || !UUID.test(repositoryId)) return invalid;
@@ -391,11 +396,22 @@ export function parseRepoOpenRequest(
   const expiry = Date.parse(expiresAt);
   if (!Number.isFinite(expiry)) return invalid;
   if (expiry - now < REPO_OPEN_MIN_TOKEN_LIFETIME_MS) return { ok: false, error: 'repo_open_token_expired' };
+  if (privateBinding !== undefined) {
+    if (!EZIL_GIT_REPOSITORY_URL.test(canonicalURL as string) || !isPlainObject(privateBinding)
+      || Object.keys(privateBinding).sort().join(',') !== 'bindingVersion,issuer,projectId,subject'
+      || typeof privateBinding.projectId !== 'string' || !UUID.test(privateBinding.projectId)
+      || typeof privateBinding.bindingVersion !== 'string' || !/^[a-f0-9]{64}$/.test(privateBinding.bindingVersion)
+      || privateBinding.issuer !== 'https://id.ezil.work/'
+      || typeof privateBinding.subject !== 'string' || !privateBinding.subject || privateBinding.subject.length > 255
+      || !/^egg_[a-f0-9]{64}$/.test(token) || (git.scope !== 'read' && git.scope !== 'write')
+      || expiry - now > 330_000) return invalid;
+  }
   return {
     ok: true,
     request: {
       repositoryId, canonicalURL: canonicalURL as string, ref: ref as string, branch, token, expiresAt,
       ...(git.scope === 'read' || git.scope === 'write' ? { scope: git.scope } : {}), auth, timeoutMs,
+      ...(privateBinding !== undefined ? { privateBinding: privateBinding as RepoOpenRequest['privateBinding'] } : {}),
     },
   };
 }
@@ -674,6 +690,22 @@ export function repoOpenCommand(params: {
   return `(t=$${REPO_OPEN_TOKEN_ENV}; unset ${REPO_OPEN_TOKEN_ENV}; exec ${script} 3<<<"$t")`;
 }
 
+/** The private CLI receives only an authoritative, HMAC-bound packet on fd 3.
+ * Its command line contains the canonical URL and fixed workspace path, never
+ * the grant. The short-lived shell is replaced with a clean-env supervisor. */
+export const REPO_OPEN_CLI_PACKET_ENV = 'EZIL_REPO_OPEN_CLI_PACKET';
+export function repoOpenCliCommand(request: RepoOpenRequest, root: RepoOpenRoot): { command: string; packet: string } {
+  if (!request.privateBinding || !EZIL_GIT_REPOSITORY_URL.test(request.canonicalURL) || !request.scope) throw new Error('invalid private CLI open');
+  const packet = JSON.stringify({ version: 1, binding: {
+    projectId: request.privateBinding.projectId, repositoryId: request.repositoryId,
+    canonicalURL: request.canonicalURL, ref: request.ref, bindingVersion: request.privateBinding.bindingVersion,
+  }, identity: { issuer: request.privateBinding.issuer, subject: request.privateBinding.subject },
+  git: { username: REPO_OPEN_GIT_USERNAME, token: request.token, expiresAt: request.expiresAt, scope: request.scope } });
+  const args = [String(request.timeoutMs - 5_000), '3000', '--repo-open', shq(root.path), shq(request.repositoryId),
+    shq(request.canonicalURL), root.requireHydrated ? '1' : '0'];
+  return { command: `(p=$${REPO_OPEN_CLI_PACKET_ENV}; unset ${REPO_OPEN_CLI_PACKET_ENV}; exec python3 /opt/ezil-repo-open/supervise.py ${args.join(' ')} 3<<<"$p")`, packet };
+}
+
 /** The script's result line (the last `ezil-repo-open:` line), or null when there is none or it is malformed. */
 export function parseRepoOpenOutput(
   stdout: string,
@@ -687,6 +719,24 @@ export function parseRepoOpenOutput(
   if (ok) return HEAD.test(ok[2]!) ? { ok: true, status: ok[1] as RepoOpenStatus, head: ok[2]! } : null;
   const error = /^ezil-repo-open:error:([a-z_]+)$/.exec(line)?.[1];
   return error && (REPO_OPEN_ERRORS as readonly string[]).includes(error) ? { ok: false, error: error as RepoOpenError } : null;
+}
+
+/** Validate every result field from the private CLI before allowing Code to
+ * open a folder. The CLI's destination is nested except for a retained older
+ * root-level checkout; the public answer is always the same project folder. */
+export function parsePrivateCliOutput(stdout: string, request: RepoOpenRequest, root: RepoOpenRoot): RepoOpenAnswer | null {
+  const prepared = parseRepoOpenOutput(stdout);
+  if (prepared && !prepared.ok) return prepared;
+  let value: unknown;
+  try { value = JSON.parse(stdout); } catch { return null; }
+  if (!isPlainObject(value) || Object.keys(value).sort().join(',') !== 'canonicalUrl,folder,identity,status'
+    || value.canonicalUrl !== request.canonicalURL || !isPlainObject(value.identity)
+    || Object.keys(value.identity).sort().join(',') !== 'issuer,subject'
+    || value.identity.issuer !== request.privateBinding?.issuer || value.identity.subject !== request.privateBinding?.subject
+    || (value.status !== 'cloned' && value.status !== 'reused')) return null;
+  const folder = `${root.path}/projects/${request.repositoryId}`;
+  if (value.folder !== `${folder}/${REPO_OPEN_NESTED_DIR}` && value.folder !== folder) return null;
+  return { ok: true, folder, status: value.status === 'reused' ? 'fetched' : 'cloned' };
 }
 
 export type RepoOpenExec = (
@@ -726,14 +776,15 @@ export function ownSessionExec(
  * is read; `stderr` is never read, logged or returned.
  */
 export async function runRepoOpen(exec: RepoOpenExec, request: RepoOpenRequest, root: RepoOpenRoot): Promise<RepoOpenAnswer> {
-  const command = repoOpenCommand({
+  const cli = request.privateBinding ? repoOpenCliCommand(request, root) : null;
+  const command = cli?.command ?? repoOpenCommand({
     root: root.path, repositoryId: request.repositoryId, url: request.canonicalURL,
     branch: request.branch, requireHydrated: root.requireHydrated, auth: request.auth, timeoutMs: request.timeoutMs,
   });
   let stdout: string;
   try {
     const result = await exec(command, {
-      env: { [REPO_OPEN_TOKEN_ENV]: request.token },
+      env: cli ? { [REPO_OPEN_CLI_PACKET_ENV]: cli.packet } : { [REPO_OPEN_TOKEN_ENV]: request.token },
       timeout: Math.min(Math.max(request.timeoutMs, REPO_OPEN_MIN_TIMEOUT_MS), REPO_OPEN_EXEC_TIMEOUT_MS),
       origin: 'internal',
     });
@@ -744,6 +795,7 @@ export async function runRepoOpen(exec: RepoOpenExec, request: RepoOpenRequest, 
   // Belt and braces: the script never prints the token, and nothing that
   // contains it is ever parsed. (An anonymous open has none: '' is in every string.)
   if (request.token !== '' && stdout.includes(request.token)) return { ok: false, error: 'repo_open_failed' };
+  if (cli) return parsePrivateCliOutput(stdout, request, root) ?? { ok: false, error: 'repo_open_failed' };
   const parsed = parseRepoOpenOutput(stdout);
   if (!parsed) return { ok: false, error: 'repo_open_failed' };
   if (!parsed.ok) return parsed;

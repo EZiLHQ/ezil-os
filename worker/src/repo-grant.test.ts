@@ -6,7 +6,7 @@
 import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'bun:test';
 
-import { REPO_OPEN_TOKEN_ENV, type RepoOpenExec, type RepoOpenRequest } from './repo-open';
+import { REPO_OPEN_CLI_PACKET_ENV, REPO_OPEN_TOKEN_ENV, type RepoOpenExec, type RepoOpenRequest } from './repo-open';
 import {
   grantRequestFromOpen, parseRepoGrantOutput, parseRepoGrantRequest, repoGrantCommand, repoGrantStatus, repoGrantSubject,
   repoGrantWhenRunning, repoOpenThenGrant, runRepoGrant, REPO_GRANT_ERRORS, REPO_GRANT_HELPER_CONFIG_VALUE,
@@ -163,6 +163,26 @@ describe('runRepoGrant, repoGrantWhenRunning and repoOpenThenGrant (fake exec)',
     expect(await repoOpenThenGrant({ running: async () => true, touch: () => undefined, exec: failing }, openReq, root, SUBJECT))
       .toEqual({ ok: false, error: 'repo_open_folder_conflict' });
     expect(commands.filter((c) => c.includes('ezil-repo-grant'))).toHaveLength(0);
+  });
+
+  it('a private CLI reuse still installs the current write grant through the existing helper', async () => {
+    const calls: Array<{ command: string; env: Record<string, string> }> = [];
+    const openReq: RepoOpenRequest = { repositoryId: REPO, canonicalURL: GITHUB, ref: 'refs/heads/main', branch: 'main',
+      token: EGG, expiresAt: new Date(Date.now() + 240_000).toISOString(), scope: 'write', auth: 'basic', timeoutMs: 90_000,
+      privateBinding: { projectId: '33333333-3333-4333-8333-333333333333', bindingVersion: 'b'.repeat(64),
+        issuer: 'https://id.ezil.work/', subject: 'auth0|builder' } };
+    const exec: RepoOpenExec = async (command, options) => {
+      calls.push({ command, env: options.env });
+      return { exitCode: 0, stdout: command.includes('ezil-repo-grant') ? 'ezil-repo-grant:ok\n'
+        : JSON.stringify({ canonicalUrl: GITHUB, folder: `/workspace/projects/${REPO}/repository`,
+          identity: { issuer: 'https://id.ezil.work/', subject: 'auth0|builder' }, status: 'reused' }) };
+    };
+    expect(await repoOpenThenGrant({ running: async () => true, touch: () => undefined, exec }, openReq, root, SUBJECT))
+      .toEqual({ ok: true, folder: `/workspace/projects/${REPO}`, status: 'fetched' });
+    expect(calls).toHaveLength(2);
+    expect(Object.keys(calls[0]!.env)).toEqual([REPO_OPEN_CLI_PACKET_ENV]);
+    expect(calls[1]!.env).toEqual({ [REPO_OPEN_TOKEN_ENV]: EGG });
+    expect(calls[1]!.command).not.toContain(EGG);
   });
 });
 

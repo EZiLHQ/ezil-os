@@ -449,6 +449,18 @@ RUN set -eu; \
 # (copilot-chat/PATCHES.md "static-id"). Re-check it after every layer that could
 # have edited them, so a stale id (an old URL for new bytes) fails the build.
 RUN /usr/local/lib/ezil/patch-copilot-chat.sh --verify /usr/lib/code-server/lib/vscode >/dev/null
+# The reviewed private CLI is an opt-in staging image ingredient. Source builds
+# have no bundle and install none. BuildKit supplies only the checksum-pinned
+# executable, never a source-tree or published artifact.
+COPY repo-open/install-cli.mjs repo-open/cli-pin.json repo-open/supervise.py /opt/ezil-repo-open/
+RUN python3 -m py_compile /opt/ezil-repo-open/supervise.py
+ARG EZIL_PRIVATE_CLI=0
+RUN --mount=type=secret,id=ezil_cli_bundle \
+    if [ "$EZIL_PRIVATE_CLI" = 1 ]; then \
+      node /opt/ezil-repo-open/install-cli.mjs /run/secrets/ezil_cli_bundle /opt/ezil-repo-open/cli-pin.json /opt/ezil-cli \
+      && command -v git >/dev/null \
+      && /opt/ezil-cli/ezil --version; \
+    elif [ "$EZIL_PRIVATE_CLI" != 0 ]; then exit 1; fi
 # Baked LAST so it describes the finished image: every entry under the system
 # roots (kind/size/mtime/link) plus /etc/ezil-image-id, a fingerprint of the
 # installed package set (stable across rebuilds of the same packages).

@@ -100,7 +100,11 @@ beforeEach(() => {
         universe: () => Response.json(grant()),
         works: () => Response.json({ username: 'ezil', token: `egg_${'a'.repeat(64)}`,
             expiresAt: new Date(Date.now() + 240_000).toISOString(), cloneUrl: 'https://github.ezil.work/acme/site.git',
-            repositoryId: REPO, routeName: 'acme/site', handle: 'acme', name: 'site', scope: 'write', defaultBranch: 'main', class: 'project' }, { status: 201 }),
+            repositoryId: REPO,
+            binding: { projectId: PROJECT, repositoryId: REPO, canonicalURL: 'https://github.ezil.work/acme/site.git',
+                ref: 'refs/heads/main', bindingVersion: 'b'.repeat(64) },
+            identity: { issuer: 'https://id.ezil.work/', subject: 'auth0|builder' },
+            routeName: 'acme/site', handle: 'acme', name: 'site', scope: 'write', defaultBranch: 'main', class: 'project' }, { status: 201 }),
         worker: () => Response.json({ folder: `/workspace/projects/${REPO}`, head: 'b'.repeat(40) }),
         github: () => new Response(advertisement('refs/heads/main'), { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-advertisement' } }) });
     vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN', UNIVERSE);
@@ -145,14 +149,16 @@ describe('opening a repository from its address in Code', () => {
         s.worker = body => Response.json({ folder: `/workspace/projects/${JSON.parse(body).repositoryId}` });
         const response = await openUrl('https://github.ezil.work/acme/site.git');
         expect(response.status).toBe(200);
-        expect(s.order).toEqual(['computer.get', 'target', 'identity', 'codePreviewUrl', 'target', 'works', 'worker']);
+        expect(s.order).toEqual(['computer.get', 'target', 'identity', 'works', 'codePreviewUrl', 'target', 'worker']);
         const works = s.requests.find(r => r.url.origin === 'https://api.ezil.work')!;
         expect(works.url.pathname).toBe('/v1/builder/selfserve-repositories/os-grant');
         expect(JSON.parse(String(works.init.body))).toMatchObject({ class: 'project', url: 'https://github.ezil.work/acme/site.git' });
         const worker = s.requests.find(r => r.url.origin === WORKER)!;
         expect(JSON.parse(String(worker.init.body))).toMatchObject({ repositoryId: REPO,
             canonicalURL: 'https://github.ezil.work/acme/site.git', ref: 'refs/heads/main',
-            git: { token: `egg_${'a'.repeat(64)}`, scope: 'write' } });
+            git: { token: `egg_${'a'.repeat(64)}`, scope: 'write' },
+            privateBinding: { projectId: PROJECT, bindingVersion: 'b'.repeat(64),
+                issuer: 'https://id.ezil.work/', subject: 'auth0|builder' } });
         const body = await response.clone().json();
         expect(body.repository).toEqual({ name: 'acme/site', id: REPO });
         expect(new URL(body.codePreviewUrl).searchParams.getAll('folder')).toEqual([`/workspace/projects/${REPO}`]);
@@ -166,8 +172,16 @@ describe('opening a repository from its address in Code', () => {
             const response = await openUrl('https://github.ezil.work/acme/site.git');
             expect(response.status).toBe(404);
             expect((await response.json()).error).toMatchObject({ code: 'repo_not_found', message: "This repository doesn't exist." });
+            expect(s.order).not.toContain('codePreviewUrl');
             expect(s.order).not.toContain('worker');
         }
+    });
+
+    it('refuses an incomplete Works packet before Code can wake the computer', async () => {
+        s.works = () => Response.json({ repositoryId: REPO }, { status: 201 });
+        const response = await openUrl('https://github.ezil.work/acme/site.git');
+        expect(response.status).toBe(503);
+        expect(s.order).toEqual(['computer.get', 'target', 'identity', 'works']);
     });
 
     it('measures the Worker deadline after the Works grant response', async () => {
@@ -190,6 +204,31 @@ describe('opening a repository from its address in Code', () => {
         expect(response.status).toBe(504);
         expect((await response.json()).error.code).toBe('repo_open_timeout');
         expect(s.order).not.toContain('worker');
+    });
+
+    it('renews an address grant after a slow Code mint and sends only the fresh grant to Worker', async () => {
+        s.mintTakes = 100_000;
+        const original = s.works!;
+        let issued = 0;
+        s.works = body => {
+            issued += 1;
+            const response = original(body);
+            // The first grant has too little lifetime after the slow mint.
+            return Response.json({ username: 'ezil', token: `egg_${String(issued).repeat(64)}`,
+                expiresAt: new Date(Date.now() + (issued === 1 ? 120_000 : 240_000)).toISOString(),
+                cloneUrl: 'https://github.ezil.work/acme/site.git', repositoryId: REPO,
+                binding: { projectId: PROJECT, repositoryId: REPO, canonicalURL: 'https://github.ezil.work/acme/site.git',
+                    ref: 'refs/heads/main', bindingVersion: 'b'.repeat(64) },
+                identity: { issuer: 'https://id.ezil.work/', subject: 'auth0|builder' },
+                routeName: 'acme/site', handle: 'acme', name: 'site', scope: 'write', defaultBranch: 'main', class: 'project' },
+            { status: response.status });
+        };
+        const response = await openUrl('https://github.ezil.work/acme/site.git');
+        expect(response.status).toBe(200);
+        expect(issued).toBe(2);
+        expect(s.order).toEqual(['computer.get', 'target', 'identity', 'works', 'codePreviewUrl', 'works', 'target', 'worker']);
+        const worker = s.requests.find(r => r.url.origin === WORKER)!;
+        expect(JSON.parse(String(worker.init.body)).git.token).toBe(`egg_${'2'.repeat(64)}`);
     });
 
     it('ownership, provider, GitHub, mint, Worker: in that order; answers the folder URL and the name, nothing secret', async () => {
