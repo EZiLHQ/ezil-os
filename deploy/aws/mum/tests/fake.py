@@ -31,7 +31,7 @@ def save(name, value):
 
 
 def lifecycle_template(config):
-    return {"Parameters": {"Keep": {"Type": "String"}}, "Resources": {
+    result = {"Parameters": {"Keep": {"Type": "String"}}, "Resources": {
         "Observer": {"Type": "AWS::Lambda::Function", "Properties": {
             "Environment": {"Variables": {"EZIL_LIFECYCLE_SETTINGS": json.dumps(config["settings"], separators=(",", ":"))}},
             "Code": {"S3Bucket": "fixed-assets", "S3Key": "fixed-code.zip"}, "MemorySize": 256}},
@@ -40,6 +40,14 @@ def lifecycle_template(config):
         "Key": {"Type": "AWS::KMS::Key", "Properties": {}},
         "Nested": {"Type": "AWS::CloudFormation::Stack", "Properties": {"TemplateURL": "fixed"}},
     }}
+    if 'recoveryVersionArn' in config:
+        result['Resources']['RecoveryObserver'] = {'Type':'AWS::Lambda::Function','Properties':{
+            'Environment':{'Variables':{'EZIL_LIFECYCLE_RECOVERY_SETTINGS':json.dumps({'lifecycle':config['settings'],
+                'recoveryVersionArn':config['recoveryVersionArn']}, separators=(',', ':'))}},
+            'Code':{'S3Bucket':'fixed-assets','S3Key':'recovery.zip'}}}
+        result['Resources']['Reconciler'] = {'Type':'AWS::Lambda::Function','Properties':{
+            'Environment':{'Variables':{'RECOVERY':config['recoveryVersionArn']}}, 'Code':{'S3Key':'reconciler.zip'}}}
+    return result
 
 
 def assert_locked(name):
@@ -306,6 +314,9 @@ elif tool == "aws":
                 if scenario.get("lifecycle_no_role"):
                     value["Stacks"][0].pop("RoleARN", None)
                 value["Stacks"][0]["Outputs"] = [{"OutputKey": "WorkflowVersionArn", "OutputValue": read("config.json")["settings"]["deployment"]["stateMachineVersionArn"]}]
+                if 'recoveryVersionArn' in read('config.json'):
+                    recovery = read('config.json')['recoveryVersionArn']
+                    value['Stacks'][0]['Outputs'].append({'OutputKey':'RecoveryVersionArn', 'OutputValue':recovery+'9' if scenario.get('wrong_recovery_output') else recovery})
                 if scenario.get("wrong_output"):
                     value["Stacks"][0]["Outputs"][0]["OutputValue"] += "9"
             out(value)
@@ -353,6 +364,13 @@ elif tool == "aws":
                 cs["Parameters"] = [{"ParameterKey": "Keep", "ParameterValue": "unchanged", "ResolvedValue": "fixed"}]
                 cs["Changes"] = [{"Type": "Resource", "ResourceChange": {"Action": "Modify", "LogicalResourceId": "Observer", "ResourceType": "AWS::Lambda::Function", "Replacement": "False",
                     "Scope": ["Properties"], "Details": [{"Target": {"Attribute": "Properties", "Name": "Environment", "RequiresRecreation": "Never"}, "ChangeSource": "DirectModification", "Evaluation": "Static"}]}}]
+                if scenario.get('recovery'):
+                    for logical in ('RecoveryObserver', 'Reconciler'):
+                        change = json.loads(json.dumps(cs['Changes'][0]))
+                        change['ResourceChange']['LogicalResourceId'] = logical
+                        change['ResourceChange']['BeforeContext'] = {'Properties': lifecycle_template(read('live-lifecycle-config.json'))['Resources'][logical]['Properties']}
+                        change['ResourceChange']['AfterContext'] = {'Properties': read('synth-lifecycle-target.json')['Resources'][logical]['Properties']}
+                        cs['Changes'].append(change)
                 if scenario.get("noop_rollback") and flag("--change-set-name").startswith("rollback-"):
                     cs.update(Status="FAILED", ExecutionStatus="UNAVAILABLE", Changes=[], StatusReason="The submitted information didn't contain changes.")
                 if scenario.get("durable"):
@@ -478,6 +496,14 @@ elif tool == "aws":
             raise SystemExit("unexpected CFN command")
     elif service == "stepfunctions":
         assert operation == "list-state-machine-versions"
+        if flag('--state-machine-arn').endswith('-recovery'):
+            counter = root/'recovery-reads'
+            count = int(counter.read_text()) if counter.exists() else 0
+            counter.write_text(str(count+1))
+            published = [1]
+            if (root/'executed').exists() or scenario.get('recovery_version_race') and count > 0: published.append(2)
+            out({'stateMachineVersions':[{'stateMachineVersionArn':flag('--state-machine-arn')+':'+str(n)} for n in published]})
+            raise SystemExit(0)
         count = int((root / "version-reads").read_text()) if (root / "version-reads").exists() else 0
         (root / "version-reads").write_text(str(count + 1))
         published = [4, 2, 10, 1]  # deliberately unordered, config still pins :4

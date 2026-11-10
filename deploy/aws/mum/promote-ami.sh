@@ -22,9 +22,8 @@ while (($#)); do
 done
 use_namespace "$namespace_arg"
 config=${config:-$config_dir/lifecycle.$namespace.json}
+check_namespace_path "$config" "$release_dir" "$manifest"
 if [[ "$namespace" != mum ]]; then
-    # No release tuple: manifest promotion and its rollback (rebase-release.sh) are mum-only.
-    [[ -z "$manifest" && ! -e "$release_dir/rebase-promotion.json" ]] || die "$namespace has no rebase tuple; manifest promotion is mum-only"
     [[ "$config" != /root/ezil-aws-mum/* ]] || die "$namespace never reads mum operator configs"
 fi
 if [[ -n "$manifest" || "$rollback" == true && -f "$release_dir/rebase-promotion.json" ]]; then
@@ -34,7 +33,7 @@ if [[ -n "$manifest" || "$rollback" == true && -f "$release_dir/rebase-promotion
     if "$rollback"; then operation=rollback; fi
     options=()
     if "$apply"; then options=(--apply); fi
-    exec bash "$script_dir/rebase-release.sh" "$operation" --manifest "$manifest" "${options[@]}"
+    exec bash "$script_dir/rebase-release.sh" "$operation" --namespace "$namespace" --manifest "$manifest" "${options[@]}"
 fi
 if "$rollback"; then [[ -z "$ami" ]] || die '--rollback uses the journal AMI, omit --ami'
 else [[ "$ami" =~ ^ami-[0-9a-f]{17}$ ]] || { usage; die 'valid AMI required'; }; fi
@@ -52,6 +51,13 @@ aws_read cloudformation describe-stacks --stack-name "$foundation_stack" --outpu
 aws_read cloudformation describe-stack-resource --stack-name "$foundation_stack" --logical-resource-id ComputerLaunchTemplate --output json > "$work/foundation-resource.json"
 json foundation-check "$work/foundation-before.json" "$work/foundation-resource.json"
 aws_read stepfunctions list-state-machine-versions --state-machine-arn "$machine" --output json > "$work/versions.json"
+recovery_arn=$(json recovery-arn "$config")
+recovery_options=()
+if [[ -n "$recovery_arn" ]]; then
+    recovery_machine=${recovery_arn%:*}
+    aws_read stepfunctions list-state-machine-versions --state-machine-arn "$recovery_machine" --output json > "$work/recovery-versions.json"
+    recovery_options=("$work/recovery-versions.json")
+fi
 if "$rollback"; then
     [[ -f "$release_dir/promotion.json" ]] || die 'rollback journal missing'
     json rollback "$release_dir/promotion.json" "$config" "$work/versions.json" "$work/target.json" "$work/before.json"
@@ -63,7 +69,7 @@ else
     json launch-template-version "$config" "$work/configured-template.json"
     aws_read ec2 describe-launch-template-versions --launch-template-id "$launch_template" --versions '$Latest' --output json > "$work/latest-template-before.json"
     template_version=$(json foundation-plan "$work/foundation-before.json" "$work/latest-template-before.json" "$ami" "$work/foundation-parameters.json")
-    json plan-promotion "$config" "$work/versions.json" "$ami" "$template_version" "$work/target.json"
+    json plan-promotion "$config" "$work/versions.json" "$ami" "$template_version" "$work/target.json" "${recovery_options[@]}"
 fi
 deployment_pair=$(json pair "$work/target.json")
 read -r ami version template_version <<< "$deployment_pair"
@@ -71,6 +77,7 @@ if "$rollback"; then
     # Rollback pins the retained version; it never modifies/deletes template versions.
     aws_read ec2 describe-launch-template-versions --launch-template-id "$launch_template" --versions "$template_version" --output json > "$work/rollback-template.json"
     json launch-template-version "$work/target.json" "$work/rollback-template.json"
+    if [[ -n "$recovery_arn" ]]; then json recovery-published "$work/target.json" "$work/recovery-versions.json"; fi
 fi
 aws_read ec2 describe-images --image-ids "$ami" --owners "$account" --output json > "$work/image.json"
 json image "$work/image.json" "$ami"
@@ -186,7 +193,10 @@ fi
 # Prevent another publisher from silently taking the predicted version number.
 aws_read stepfunctions list-state-machine-versions --state-machine-arn "$machine" --output json > "$work/pre-execute-versions.json"
 if ! "$rollback"; then
-    json plan-promotion "$work/before.json" "$work/pre-execute-versions.json" "$ami" "$template_version" "$work/rechecked.json" >/dev/null
+    if [[ -n "$recovery_arn" ]]; then
+        aws_read stepfunctions list-state-machine-versions --state-machine-arn "$recovery_machine" --output json > "$work/recovery-versions.json"
+    fi
+    json plan-promotion "$work/before.json" "$work/pre-execute-versions.json" "$ami" "$template_version" "$work/rechecked.json" "${recovery_options[@]}" >/dev/null
     cmp -s "$work/rechecked.json" "$work/target.json" || die 'published versions changed; refuse execution and review journal'
 fi
 cmp -s "$config" "$work/target.json" || die 'lifecycle config changed before execution'
@@ -199,6 +209,14 @@ json published "$work/published.json" "$version"
 if ! "$rollback"; then
     aws_read cloudformation describe-stacks --stack-name "$lifecycle_stack" --output json > "$work/lifecycle-stack.json"
     [[ "$(json output "$work/lifecycle-stack.json" WorkflowVersionArn)" == "$version" ]] || die 'published version differs from prediction; app secret unchanged; inspect journal'
+fi
+if [[ -n "$recovery_arn" ]]; then
+    aws_read stepfunctions list-state-machine-versions --state-machine-arn "$recovery_machine" --output json > "$work/recovery-published.json"
+    if "$rollback"; then
+        json recovery-published "$work/target.json" "$work/recovery-published.json"
+    else
+        json recovery-published "$work/target.json" "$work/recovery-published.json" "$work/lifecycle-stack.json"
+    fi
 fi
 json secret-update "$work/before.json" "$work/target.json"
 json copy-config "$work/target.json" "$release_dir/promoted-config.json"

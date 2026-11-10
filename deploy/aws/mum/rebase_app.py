@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 import rebase_manifest as manifest
+import rebase_namespace as context
 
 need=manifest.need
 
@@ -15,7 +16,7 @@ JOBS=('telemetry-maintenance','sandbox-reap','billing-session-sweep','aws-stop-s
 PROBE=r"""
 import json, subprocess, sys
 def run(*command):
-    return subprocess.run(list(command),cwd='/opt/ezil-os-staging',text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)
+    return subprocess.run(list(command),cwd=APP_DIR,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)
 try:
     r=run('docker','compose','--env-file','compose.env','exec','-T','web','node','-e',NODE)
     if r.returncode: raise RuntimeError()
@@ -61,7 +62,7 @@ def body(install_script, app, deployment=None, install=True):
     # Keep all existing installer checks and additionally pin the checksum marker.
     guard='printf "%s  %s\\n" '+app['checksumSha256']+' "$temporary/$tag.sha256" | sha256sum --check --status\n'
     install_script=install_script.replace(anchor,guard+anchor)
-    command='set -- '+app['tag']+' ezil-main-preview-artifacts-452630323510-aps1\n'+install_script
+    command='set -- '+app['tag']+' '+context.ARTIFACT_BUCKET+' '+context.ENVIRONMENT+'\n'+install_script
     # JSON.stringify(d.releases) matches public_deployment's compact UTF-8 JSON:
     # registry strings are ASCII, numbers are ints, nulls match, and both parsers preserve insertion order.
     program=r'''
@@ -70,7 +71,7 @@ try:
     if INSTALL:
         r=subprocess.run(['bash','-s'],input=SCRIPT,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=840)
         if r.returncode: raise RuntimeError()
-    r=subprocess.run(['docker','compose','--env-file','compose.env','exec','-T','web','node','-e',NODE],cwd='/opt/ezil-os-staging',text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)
+    r=subprocess.run(['docker','compose','--env-file','compose.env','exec','-T','web','node','-e',NODE],cwd=APP_DIR,text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=60)
     if r.returncode: raise RuntimeError()
     result=json.loads(r.stdout)
     if result['killSwitch']!='1': raise RuntimeError()
@@ -80,7 +81,7 @@ try:
 except Exception:
     print('staging app operation refused',file=sys.stderr);sys.exit(1)
 '''
-    constants={'INSTALL':install,'SCRIPT':command,'NODE':NODE,'APP':app,'EXPECTED':deployment}
+    constants={'INSTALL':install,'SCRIPT':command,'NODE':NODE,'APP':app,'EXPECTED':deployment,'APP_DIR':'/opt/'+context.SLUG}
     return "set -euo pipefail\nset +x\npython3 - <<'EZIL_APP_PY'\n"+'\n'.join(k+' = '+repr(v) for k,v in constants.items())+program+"\nEZIL_APP_PY\n"
 
 
@@ -96,6 +97,7 @@ def public_deployment(d):
 
 def probe_body(tag):
     """Read-only host probe: app identity, web image ID, candidate tag owner, compose.env tag and its image, served health, timers and deploy lock."""
+    need(context.NAMESPACE == 'mum', 'app-swap probe is staging-only')
     need(manifest.matches(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}',tag),'invalid probe tag')
-    constants={'NODE':NODE,'TAG':tag,'JOBS':JOBS}
+    constants={'NODE':NODE,'TAG':tag,'JOBS':JOBS,'APP_DIR':'/opt/'+context.SLUG}
     return "set -euo pipefail\nset +x\npython3 - <<'EZIL_APP_PY'\n"+'\n'.join(k+' = '+repr(v) for k,v in constants.items())+PROBE+"\nEZIL_APP_PY\n"

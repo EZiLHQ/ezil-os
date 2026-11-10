@@ -58,7 +58,7 @@ def collect(directory, candidate_name, context=None):
     candidate = candidates[0]
     captured = db['meta']['captured_at']
     evidence = {'schemaVersion': 1, 'accountId': gc.tool.ACCOUNT, 'region': gc.tool.REGION,
-                'namespace': 'mum', 'registrySha256': gc.sha(records),
+                'namespace': gc.tool.NAMESPACE, 'registrySha256': gc.sha(records),
                 'planSha256': None, 'secretVersionId': None, 'capturedAt': captured,
                 'expiresAt': (gc.time_value(captured) + timedelta(minutes=15)).isoformat(),
                 'quiescence': {}, 'sources': {}, 'attestations': [],
@@ -276,11 +276,15 @@ def collect(directory, candidate_name, context=None):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--namespace', choices=('mum', 'prd'), default='mum')
     parser.add_argument('--directory', required=True, type=Path)
     parser.add_argument('--candidate', required=True)
     parser.add_argument('--context', type=Path)
     parser.add_argument('--output', required=True, type=Path)
     args = parser.parse_args()
+    gc.release.use_namespace(args.namespace)
+    for value in (args.directory, args.context, args.output):
+        if value: gc.release.context.path(value)
     gc.need(args.directory.resolve() not in args.output.resolve().parents,
             'collector output must be outside source evidence')
     evidence = collect(args.directory, args.candidate, gc.manifest.read(args.context) if args.context else None)
