@@ -448,13 +448,12 @@ export function open_feedback_dialog (_opts) {
         <form>
             <fieldset class="ezil-feedback-fields">
                 <label for="ezil-feedback-description">Description (optional)</label>
-                <textarea id="ezil-feedback-description" name="description" maxlength="4000" rows="5"
+                <textarea id="ezil-feedback-description" name="description" maxlength="4000" rows="3"
                     aria-describedby="ezil-feedback-counter ezil-feedback-warning"${touchPrimary ? '' : ' autofocus'}></textarea>
                 <p id="ezil-feedback-counter" class="ezil-feedback-muted" aria-live="polite"></p>
                 <p id="ezil-feedback-warning" class="ezil-feedback-warning" role="status" hidden></p>
                 <p class="ezil-feedback-muted" data-role="context-line" aria-live="polite" hidden></p>
-                <label class="ezil-feedback-consent"><input type="checkbox" name="diagnostics" checked> Include diagnostics</label>
-                <p class="ezil-feedback-muted" data-role="server-context-note">With diagnostics on, EZiL adds a small summary of your computer's state (categories and counts only) when you send; it is not shown in the preview.</p>
+                <label class="ezil-feedback-consent"><input type="checkbox" name="diagnostics" checked> Include diagnostics <small class="ezil-feedback-muted" data-role="server-context-note">With diagnostics on, EZiL also adds a small computer-state summary when you send (not shown in the preview).</small></label>
                 <details class="ezil-feedback-details"><summary>What diagnostics include</summary>
                     <p class="ezil-feedback-muted">A frozen snapshot of browser/OS, viewport, page age, network state and recent machine-coded events. No console text, URLs, cookies or form values. Nothing uploads until Send.</p>
                     <p class="ezil-feedback-muted" data-role="server-context-detail">The server-added summary, when you send with diagnostics on, covers where your computer runs and its state, any move or reserved capacity in progress, and how many of your other computers use AWS. Only categories and counts, never addresses, IDs or anyone else's data. It is added after you press Send, so it is not in the preview below.</p>
@@ -531,10 +530,14 @@ export function open_feedback_dialog (_opts) {
     // request: its diagnostics and screenshot come from the queued body, so a re-send stays byte-identical
     // (same clientRequestId) instead of becoming a second report.
     let restoredFromQueue = false;
+    let errorCode = null;
     const queuedEntry = draft ? read_outbox().find(entry => entry.clientRequestId === clientRequestId) : null;
     if ( queuedEntry ) {
         try {
             const queuedBody = JSON.parse(queuedEntry.body);
+            // The queued request keeps the error line it was sent with.
+            const queuedCode = /(?:^|\n\n)Error code: ([a-z0-9_:-]{1,64})$/i.exec(String(queuedBody.description ?? ''))?.[1];
+            errorCode = typeof queuedCode === 'string' && /^[a-z0-9_:-]{1,64}$/i.test(queuedCode) && scan(queuedCode).length === 0 ? queuedCode : null;
             // The queued request keeps the computer it was sent for, even if the current one changed since.
             computerId = typeof queuedBody.computerId === 'string' && UUID.test(queuedBody.computerId) ? queuedBody.computerId : null;
             diagnosticSnapshot = queuedBody.diagnostics ?? null;
@@ -552,17 +555,17 @@ export function open_feedback_dialog (_opts) {
             restoredFromQueue = true;
         } catch { /* An unreadable queued body is treated as a new report. */ }
     }
-    // A resumed queued request is resent as it was: no new prefill.
-    if ( ! restoredFromQueue && typeof _opts?.errorCode === 'string' && /^[a-z0-9_:-]{1,64}$/i.test(_opts.errorCode) ) {
-        // Opened from the opening screen's "Send feedback": name the error code so the report can be routed.
-        // Round 4: also with a saved draft (appended once, within the 4,000-character limit).
-        const line = `Error code: ${_opts.errorCode}`;
-        const text = description.value;
-        if ( ! text.trim() ) description.value = `${line}\n\n`;
-        else if ( ! text.split('\n').some(row => row.trim() === line) && text.trimEnd().length + line.length + 2 <= 4000 ) {
-            description.value = `${text.trimEnd()}\n\n${line}`;
-        }
-    }
+    // The opener's error code (trusted shell context, a bounded machine code that passes the secret scan) is shown
+    // as an observed fact and sent as a final "Error code:" line; it is not written into the comment box.
+    const valid_code = value => typeof value === 'string' && /^[a-z0-9_:-]{1,64}$/i.test(value) && scan(value).length === 0;
+    if ( ! restoredFromQueue ) errorCode = valid_code(_opts?.errorCode) ? _opts.errorCode : null;
+    // The description as sent: the comment, then the error line (once, even if an older draft already holds it).
+    const with_error_code = text => {
+        if ( ! errorCode ) return text;
+        const line = `Error code: ${errorCode}`;
+        if ( text.split('\n').some(row => row.trim() === line) ) return text;
+        return text.trim() ? `${text.trimEnd()}\n\n${line}` : line;
+    };
 
     function save_draft () {
         if ( sent || closed ) return;
@@ -601,13 +604,16 @@ export function open_feedback_dialog (_opts) {
 
     function refresh () {
         if ( sending || sent || closed ) return;
-        const text = description.value;
-        const kinds = [...new Set(scan(text).map(match => match.kind))];
+        const comment = description.value;
+        const kinds = [...new Set(scan(comment).map(match => match.kind))];
         const warning = dialog.querySelector('.ezil-feedback-warning');
         warning.hidden = kinds.length === 0;
         warning.textContent = kinds.length
             ? 'This looks like a token / email address — remove it before sending? ' + kinds.join(', ') : '';
-        dialog.querySelector('#ezil-feedback-counter').textContent = `${text.length} / ${DESCRIPTION_MAX} characters${text.length > DESCRIPTION_MAX ? ' — shorten the description' : ''}`;
+        const text = with_error_code(comment);
+        // The character count only appears when it matters (near or over the limit), keeping the form short.
+        dialog.querySelector('#ezil-feedback-counter').textContent = text.length > DESCRIPTION_MAX - 1000
+            ? `${text.length} / ${DESCRIPTION_MAX} characters${text.length > DESCRIPTION_MAX ? ' — shorten the description' : ''}` : '';
         const imageSection = dialog.querySelector('.ezil-feedback-capture');
         if ( imageSection ) imageSection.hidden = ! screenshotConsent.checked;
         const body_of = () => ({ v: 1, clientRequestId, category: CATEGORY,
@@ -649,7 +655,7 @@ export function open_feedback_dialog (_opts) {
         const text = dialog.querySelector('[data-role="capture-scope-text"]');
         if ( ! text ) return;
         text.textContent = ! screenshot ? 'No screenshot attached. Embedded apps are never captured automatically.'
-            : { window: 'Embedded app not captured. This screenshot shows the EZiL OS window only; embedded apps are masked.',
+            : { window: 'Embedded app not captured; this is the EZiL OS window only.',
                 tab: 'Captured from the browser surface you chose.', desktop: 'Captured from the desktop frame.',
                 file: 'Attached from your device.', queued: 'The screenshot already queued with this report.' }[screenshotSource] ?? 'Screenshot attached.';
     }
@@ -658,6 +664,7 @@ export function open_feedback_dialog (_opts) {
     function render_context () {
         const line = dialog.querySelector('[data-role="context-line"]');
         const parts = [];
+        if ( errorCode ) parts.push(`error code ${errorCode}`);
         const known = currentComputer();
         if ( computerId && known?.id === computerId && typeof known.name === 'string' && known.name.trim() ) parts.push(`computer “${known.name.trim().slice(0, 40)}”`);
         if ( diagnostics.checked && diagnosticSnapshot ) {

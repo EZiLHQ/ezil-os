@@ -357,7 +357,10 @@ try {
         feedback.open_feedback_dialog({ source: 'chip' });
         assert.equal(modalCalls, 1);
         setDescription('The desktop froze.');
-        assert.match(current().querySelector('#ezil-feedback-counter').textContent, /18 \/ 4000/);
+        assert.equal(current().querySelector('#ezil-feedback-counter').textContent, '', 'the character count stays out of the way until it matters');
+        setDescription('y'.repeat(3100));
+        assert.match(current().querySelector('#ezil-feedback-counter').textContent, /3100 \/ 4000/);
+        setDescription('The desktop froze.');
         change('diagnostics', true);
         assert.doesNotMatch(current().querySelector('pre').textContent, /SECRET|example\.test/);
         assert.equal(calls.length, 0);
@@ -1200,26 +1203,64 @@ try {
         Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: user });
         open(); setDescription(''); close();
     });
-    await check('Round 4: the opening screen\'s error code is prefilled, appended once to a saved draft, and kept within 4,000 characters', async () => {
+    await check('the opening screen error code is an observed fact outside the comment box: shown, sent as one final line, never duplicated, bounded and redacted', async () => {
         const openWith = errorCode => { document.querySelector('#opener').focus(); feedback.open_feedback_dialog({ source: 'opening', errorCode }); };
+        const line = () => current().querySelector('[data-role="context-line"]');
+        window.localStorage.removeItem(draftKey);
         openWith('billing_files_on_aws');
-        assert.equal(form().elements.description.value, 'Error code: billing_files_on_aws\n\n', 'no draft: the code leads the report');
-        setDescription(''); close();
-        open(); setDescription('Code would not open after I cancelled'); close();
-        openWith('billing_files_on_aws');
-        assert.equal(form().elements.description.value, 'Code would not open after I cancelled\n\nError code: billing_files_on_aws',
-            'a saved draft keeps its text and gains the code');
-        setDescription(form().elements.description.value); close();
-        openWith('billing_files_on_aws');
-        assert.equal((form().elements.description.value.match(/Error code: billing_files_on_aws/g) ?? []).length, 1, 'appended once');
+        assert.equal(form().elements.description.value, '', 'the optional comment stays empty');
+        assert.match(line().textContent, /error code billing_files_on_aws/);
+        assert.equal(payload().description, 'Error code: billing_files_on_aws', 'a blank comment still sends the code');
+        assert.equal(current().querySelector('[type="submit"]').disabled, false);
+        setDescription('Code would not open after I cancelled');
+        assert.equal(payload().description, 'Code would not open after I cancelled\n\nError code: billing_files_on_aws');
+        assert.equal(stored(draftKey).description, 'Code would not open after I cancelled', 'the draft keeps only the comment');
         close();
-        openWith('not a code!');
-        assert.doesNotMatch(form().elements.description.value, /not a code/, 'an invalid code is never written');
-        const full = 'x'.repeat(3995);
-        setDescription(full); close();
+        // An older draft that already holds the line is not duplicated.
+        window.localStorage.setItem(draftKey, JSON.stringify({ clientRequestId: '77777777-7777-4777-8777-777777777777', category: 'bug',
+            description: 'Old note\n\nError code: billing_files_on_aws' }));
+        openWith('billing_files_on_aws');
+        assert.equal((payload().description.match(/Error code: billing_files_on_aws/g) ?? []).length, 1, 'once');
+        close(); window.localStorage.removeItem(draftKey);
+        // Invalid or secret-looking codes are neither shown nor sent.
+        for ( const bad of ['not a code!', 'sk-proj-abc123', 'x'.repeat(65), 7, null, undefined] ) {
+            openWith(bad);
+            assert.doesNotMatch(line().textContent, /error code/, String(bad));
+            assert.doesNotMatch(payload().description, /Error code/, `${String(bad)}: not sent`);
+            close();
+        }
+        // The line counts toward the 4,000 limit, so a near-full comment cannot push the report over it silently.
         openWith('billing_payment_issue');
-        assert.equal(form().elements.description.value, full, 'a draft at the limit is not pushed past 4,000 characters');
+        setDescription('x'.repeat(3995));
+        assert.equal(current().querySelector('[type="submit"]').disabled, true);
+        assert.match(current().querySelector('#ezil-feedback-counter').textContent, /shorten the description/);
         setDescription(''); close();
+        window.localStorage.removeItem(draftKey);
+    });
+    await check('a queued report that carried an error code reopens as the same request even from an opener without one', async () => {
+        const realRespond = respond;
+        try {
+            respond = async () => { throw new TypeError('Failed to fetch'); };
+            window.localStorage.removeItem(draftKey);
+            document.querySelector('#opener').focus();
+            feedback.open_feedback_dialog({ source: 'opening', errorCode: 'billing_files_on_aws' });
+            setDescription('Queued with a code');
+            await tick();
+            const requests = calls.length;
+            send();
+            await until(() => calls.length === requests + 1 && ! current().querySelector('[type="submit"]').disabled);
+            const first = calls.at(-1).body;
+            assert.match(JSON.parse(first).description, /Queued with a code\n\nError code: billing_files_on_aws$/);
+            close();
+            open();
+            assert.equal(JSON.stringify(payload(), null, 2), first, 'the same body: the queued request keeps its error line');
+            assert.equal(form().elements.description.value, 'Queued with a code', 'the comment box holds only the comment');
+            close();
+        } finally {
+            respond = realRespond;
+            window.localStorage.removeItem(outboxKey);
+            window.localStorage.removeItem(draftKey);
+        }
     });
     await check('teardown and navigation close the form, abort pending captures and leave Back unhandled', async () => {
         const count = calls.length;

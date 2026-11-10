@@ -380,6 +380,23 @@ try {
             assert.match(await page.locator('[data-role="capture-scope-text"]').textContent(), /Embedded app not captured.*EZiL OS window only/);
             assert.equal(await page.locator('.ezil-feedback-details').evaluate(el => el.open), false, 'diagnostics details start collapsed');
             assert.equal(await page.locator('[data-role="server-context-note"]').isVisible(), true, 'the short server-context notice stays visible');
+            // Layout: the modal fits the viewport and, in its default state with the screenshot attached, needs no scrolling at all.
+            const fit = await page.evaluate(() => {
+                const d = document.querySelector('dialog.ezil-feedback-dialog');
+                const box = el => { const r = el.getBoundingClientRect(); return { top: r.top, bottom: r.bottom, left: r.left, right: r.right }; };
+                const inside = el => { const r = el.getBoundingClientRect(), m = d.getBoundingClientRect(); return r.top >= m.top - 0.5 && r.bottom <= m.bottom + 0.5 && r.left >= m.left - 0.5 && r.right <= m.right + 0.5; };
+                const key = ['#ezil-feedback-description', 'input[name="diagnostics"]', 'input[name="screenshot"]', '[data-role="capture-scope"]', '.ezil-feedback-image img', 'button[type="submit"]'];
+                return { dialog: box(d), vw: innerWidth, vh: innerHeight, scrollHeight: d.scrollHeight, clientHeight: d.clientHeight, scrollTop: d.scrollTop,
+                    pageScroll: document.scrollingElement.scrollTop, rows: document.querySelector('#ezil-feedback-description').rows,
+                    parts: [...d.querySelectorAll('h2, .ezil-feedback-fields > *, .ezil-feedback-capture > *, .ezil-feedback-preview, .ezil-feedback-footer')]
+                        .map(el => `${el.tagName.toLowerCase()}.${el.dataset.role || el.className || el.id || el.name || ''}:${Math.round(el.getBoundingClientRect().height)}`),
+                    outside: key.filter(selector => { const el = d.querySelector(selector); return ! el || ! inside(el); }) };
+            });
+            assert.ok(fit.dialog.top >= 0 && fit.dialog.left >= 0 && fit.dialog.bottom <= fit.vh && fit.dialog.right <= fit.vw, `the modal fits the viewport (${JSON.stringify(fit)})`);
+            assert.ok(fit.scrollHeight <= fit.clientHeight + 1, `no initial scroll: all content fits (${fit.scrollHeight} > ${fit.clientHeight}; ${fit.parts.join(' ')})`);
+            assert.deepEqual([fit.scrollTop, fit.pageScroll], [0, 0], 'nothing scrolled');
+            assert.ok(fit.rows <= 3, 'a compact comment box');
+            assert.deepEqual(fit.outside, [], 'every key control is inside the modal');
             // Primary action: fully inside the viewport and hit-testable without any scrolling.
             const send = page.locator('button[type="submit"]');
             const place = await send.evaluate(el => {
@@ -410,6 +427,28 @@ try {
             }, sent.screenshot);
             assert.ok(size.width > 0 && size.height > 0 && Math.max(size.width, size.height) <= 1920 && size.bytes <= 1.5 * 1024 * 1024, `bounded image ${JSON.stringify(size)}`);
             assert.equal(await page.evaluate(() => window.__pickerCalls), 0);
+            await closeDialog(); posts.length = 0;
+            await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = false; });
+        });
+
+        await check(`${tag}: unchecking both options sends neither: the real POST carries no diagnostics and no image`, async () => {
+            await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = true; });
+            reply = () => ({ status: 201, body: { id: REPORT, screenshotAccepted: false } });
+            posts.length = 0;
+            await openByChip();
+            await page.locator('.ezil-feedback-image').waitFor({ state: 'visible', timeout: 20_000 });
+            await page.locator('input[name="diagnostics"]').uncheck();
+            await page.locator('input[name="screenshot"]').uncheck();
+            const shown = await preview();
+            assert.equal(JSON.parse(shown).diagnostics, null);
+            assert.equal(JSON.parse(shown).screenshot, null);
+            const send = page.locator('button[type="submit"]');
+            if ( touch ) await send.tap(); else await send.click();
+            await status.filter({ hasText: 'Thanks — we got it' }).waitFor();
+            assert.equal(posts.length, 1);
+            assert.equal(posts[0].body, shown, 'the preview is the POST body');
+            const sent = JSON.parse(posts[0].body);
+            assert.deepEqual([sent.diagnostics, sent.screenshot, sent.description, sent.category], [null, null, '', 'bug']);
             await closeDialog(); posts.length = 0;
             await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = false; });
         });
