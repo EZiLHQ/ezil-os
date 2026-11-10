@@ -48,6 +48,28 @@ describe('production EZiL Git address grant', () => {
             .rejects.toBeInstanceOf(GitAddressGrantError);
     });
 
+    it('rejects a grant that expired while Works was answering, including an expired retained identity', async () => {
+        let now = 1_800_000_000_000;
+        const retained = { ...identity(), expiresAt: now + 12_000 };
+        const fetcher = vi.fn(async () => {
+            const response = Response.json(answer({ expiresAt: new Date(now + 6_000).toISOString() }), { status: 201 });
+            now += 10_000;
+            return response;
+        });
+        await expect(grantForGitAddress(retained, COMPUTER, URL, { fetch: fetcher as typeof fetch, now: () => now }))
+            .rejects.toMatchObject({ code: 'unavailable' });
+
+        now = 1_800_000_000_000;
+        const identityExpiry = { ...identity(), expiresAt: now + 6_000 };
+        const slower = vi.fn(async () => {
+            const response = Response.json(answer({ expiresAt: new Date(now + 8_000).toISOString() }), { status: 201 });
+            now += 10_000;
+            return response;
+        });
+        await expect(grantForGitAddress(identityExpiry, COMPUTER, URL, { fetch: slower as typeof fetch, now: () => now }))
+            .rejects.toMatchObject({ code: 'unavailable' });
+    });
+
     it('does not contact Works for an invalid identity or a different host', async () => {
         const fetcher = vi.fn(async () => Response.json(answer(), { status: 201 }));
         await expect(grantForGitAddress({ ...identity(), expiresAt: Date.now() - 1 }, COMPUTER, URL, { fetch: fetcher as typeof fetch }))

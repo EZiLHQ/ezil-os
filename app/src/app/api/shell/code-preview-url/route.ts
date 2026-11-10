@@ -291,11 +291,6 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     // Re-read after the mint: a computer that moved to AWS meanwhile is refused, never signed for as Cloudflare.
     const controls = await target(ctx, computerId);
     if (isAws(controls)) return unsupportedProvider();
-    const timeoutMs = Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS);
-    if (timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS) {
-        console.warn('[shell] code-preview-url repository refused', { code: 'deadline' });
-        return openTimedOut();
-    }
     let repositoryId: string;
     let ref: string;
     let git: { token: string; expiresAt: string; scope: 'read' | 'write' } | null = null;
@@ -320,6 +315,13 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     } else {
         repositoryId = repositoryIdFor(parsed.canonicalURL);
         ref = resolved!.ref;
+    }
+    // Works can take up to ten seconds. Bound the signed Worker operation with
+    // the remaining deadline after that fetch, not with a pre-grant snapshot.
+    const timeoutMs = Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS);
+    if (timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS) {
+        console.warn('[shell] code-preview-url repository refused', { code: 'deadline' });
+        return openTimedOut();
     }
     const config = resolveCloudflareGuacamoleConfig();
     const opened = await requestRepoOpen(config.workerUrl, process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '', controls,

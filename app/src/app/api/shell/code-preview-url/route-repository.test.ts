@@ -170,6 +170,28 @@ describe('opening a repository from its address in Code', () => {
         }
     });
 
+    it('measures the Worker deadline after the Works grant response', async () => {
+        s.mintTakes = 80_000;
+        const original = s.works!;
+        s.works = body => { const response = original(body); s.skew += 10_000; return response; };
+        const response = await openUrl('https://github.ezil.work/acme/site.git');
+        expect(response.status).toBe(200);
+        const worker = s.requests.find(r => r.url.origin === WORKER)!;
+        const timeoutMs = JSON.parse(String(worker.init.body)).timeoutMs as number;
+        expect(timeoutMs).toBeGreaterThan(104_000);
+        expect(timeoutMs).toBeLessThanOrEqual(105_000);
+    });
+
+    it('refuses to send an expired Worker budget after a slow Works grant response', async () => {
+        s.mintTakes = 170_000;
+        const original = s.works!;
+        s.works = body => { const response = original(body); s.skew += 10_000; return response; };
+        const response = await openUrl('https://github.ezil.work/acme/site.git');
+        expect(response.status).toBe(504);
+        expect((await response.json()).error.code).toBe('repo_open_timeout');
+        expect(s.order).not.toContain('worker');
+    });
+
     it('ownership, provider, GitHub, mint, Worker: in that order; answers the folder URL and the name, nothing secret', async () => {
         const { repositoryIdFor } = await import('@/server/works/repo-url');
         const id = repositoryIdFor(CANONICAL);

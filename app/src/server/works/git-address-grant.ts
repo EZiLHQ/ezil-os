@@ -74,10 +74,14 @@ export async function grantForGitAddress(
     if (!checked.success) throw new GitAddressGrantError('unavailable');
     const grant = checked.data;
     const parts = new URL(canonicalURL).pathname.slice(1, -4).split('/');
+    // The Works request can consume most of its ten-second bound. Check the
+    // grant and retained identity at the time we would hand them to the Worker.
+    const receivedAt = (deps.now ?? Date.now)();
     const expiry = Date.parse(grant.expiresAt);
     if (grant.cloneUrl !== canonicalURL || grant.handle !== parts[0] || grant.name !== parts[1]
         || grant.routeName !== `${parts[0]}/${parts[1]}` || !validBranch(grant.defaultBranch)
-        || !Number.isFinite(expiry) || expiry <= now + 5_000 || expiry > now + 330_000 || expiry > identity.expiresAt + 30_000) {
+        || !Number.isFinite(expiry) || expiry <= receivedAt + 5_000 || expiry > receivedAt + 330_000
+        || identity.expiresAt <= receivedAt || expiry > identity.expiresAt + 30_000) {
         throw new GitAddressGrantError('unavailable');
     }
     return { repositoryId: grant.repositoryId, canonicalURL: grant.cloneUrl, ref: `refs/heads/${grant.defaultBranch}`,
