@@ -7,12 +7,14 @@ import { forgetGatewayModels, gatewayModels } from './gateway';
 import { isAppFailure, type AppFailure } from './failure';
 import { CompactionNotice } from './compaction-notice';
 import { EZiLAIStatus } from './status';
-import { EZiLModelsProvider } from './provider';
+import { EZiLModelsProvider, type BillingIntent } from './provider';
 import { PARTICIPANT_ID, registerNoToolsParticipant } from './participant';
 import type { Usage } from './types';
 
 export const DEFAULT_CONFIG_PATH = '/etc/ezil/models.json';
 export const CONFIG_ENV = 'EZIL_MODELS_CONFIG';
+/** How often a picker filled without a readable model list tries to read it again. */
+export const CATALOG_RECOVERY_MS = 20_000;
 
 export function resolveConfigPath(setting: string | undefined, env: NodeJS.ProcessEnv = process.env): string {
     const fromEnv = env[CONFIG_ENV]?.trim();
@@ -213,6 +215,28 @@ export function sendAppFailure(record: unknown): void {
     } catch { /* Diagnostics are optional and never logged. */ }
 }
 
+const BILLING_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const BILLING_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+const BILLING_RESETS_AT = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$/;
+
+/**
+ * Ask the EZiL OS window around Code to open its billing dialog, through the workbench's `_ezil.billingIntent`
+ * (patch-copilot-chat.sh `billing-intent`, forwarded by the Worker's billing bridge). True only when the OS
+ * took it; false in a Code outside an OS window, an older workbench, or for anything malformed. Never throws.
+ */
+export async function sendBillingIntent(intent: BillingIntent): Promise<boolean> {
+    try {
+        if (intent.reason !== 'credits_exhausted' && intent.reason !== 'model_locked' && intent.reason !== 'window_limit') return false;
+        const record: Record<string, string> = { reason: intent.reason };
+        if (typeof intent.requestId === 'string' && BILLING_UUID.test(intent.requestId)) record.requestId = intent.requestId;
+        if (typeof intent.model === 'string' && BILLING_ALIAS.test(intent.model)) record.model = intent.model;
+        if (intent.reason === 'window_limit' && typeof intent.resetsAt === 'string' && BILLING_RESETS_AT.test(intent.resetsAt)) record.resetsAt = intent.resetsAt;
+        return (await vscode.commands.executeCommand('_ezil.billingIntent', record)) === true;
+    } catch {
+        return false;
+    }
+}
+
 /** Only a definite activation config failure calls this builder; no config or error text enters the record. */
 export function appStartFailure(): AppFailure {
     return { eventId: randomUUID(), source: 'ezil_chat', operation: 'app_start', category: 'app_startup',
@@ -234,6 +258,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         logRequests: () => settings().get<boolean>('logRequests') === true,
         log,
         appFailure: sendAppFailure,
+        billingIntent: sendBillingIntent,
         recordUsage: (model, used, elapsedMs) => {
             usage.record(model, used, elapsedMs);
             if (model.provider.type !== 'ezil-gateway') log(`[usage] ${model.id} input=${used.inputTokens} output=${used.outputTokens} cache_read=${used.cacheReadTokens} cache_write=${used.cacheWriteTokens} ${elapsedMs}ms`);
@@ -249,6 +274,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // VS Code 1.141 subscribes to model changes at registration and does not enumerate models
     // then; the change fired by the load above was missed, so announce the models once more.
     provider.refresh();
+    // A model list that could not be read when the picker was filled is read again until it reads (no request otherwise).
+    const recover = setInterval(() => { void provider.recoverCatalog(); }, CATALOG_RECOVERY_MS);
+    recover.unref?.();
+    context.subscriptions.push({ dispose: () => clearInterval(recover) });
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
         if (event.affectsConfiguration('ezilModels.configPath')) store.setPath(resolveConfigPath(settings().get<string>('configPath')));
     }));
@@ -318,6 +347,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('ezil-models.showUsage', showUsage),
         vscode.commands.registerCommand('ezil-models.openConfig', openConfig),
         vscode.commands.registerCommand('ezil-models.compactionInfo', () => compaction.explain()),
+        // Run by the workbench's `picker-locked-select` patch when a plan-locked model is chosen (never in the palette: `_`).
+        vscode.commands.registerCommand('_ezil-models.lockedModel', (id: unknown) => provider.lockedModelChosen(id)),
     );
     // `@ezil`: plain questions to the selected EZiL model without tools (participant.ts). Registered last and
     // guarded, so a host without chat participants still gets every command above.

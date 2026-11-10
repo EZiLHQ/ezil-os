@@ -34,6 +34,9 @@ CODESERVER_SETTINGS_JSON
 }
 
 # Machine settings belong to the image and are refreshed on every prepare.
+# Copilot's title/summary utility slots name Gemini 3.8 Flash (catalog id ezil/gemini-3.8-flash on provider ezil),
+# the model every OS plan includes: on Free a slot on any other model is refused before sending and its titles and
+# summaries are lost (measured: 3 utility requests per first turn).
 # User settings (including JSONC) continue through the existing restore path.
 # `task.allowAutomaticTasks` is "off" here as well as in the user settings
 # (ezil_editor_enforce_user_policy): a repository opened from a project link
@@ -51,8 +54,8 @@ seed_codeserver_machine_settings() {
   "chat.disableAIFeatures": false,
   "chat.allowAnonymousAccess": true,
   "chat.byokUtilityModelDefault": "mainAgent",
-  "chat.utilityModel": "ezil/qwen.qwen3-coder-next",
-  "chat.utilitySmallModel": "ezil/qwen.qwen3-coder-next",
+  "chat.utilityModel": "ezil/ezil/gemini-3.8-flash",
+  "chat.utilitySmallModel": "ezil/ezil/gemini-3.8-flash",
   "chat.titleBar.signIn.enabled": false,
   "chat.welcomePage.signIn.enabled": false,
   "github.copilot.enable": { "*": false },

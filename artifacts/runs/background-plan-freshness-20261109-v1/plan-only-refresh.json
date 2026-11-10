@@ -1,0 +1,9 @@
+{
+  "taskId": "plan-only-refresh",
+  "runId": "background-plan-freshness-20261109-v1",
+  "status": "done",
+  "doneRung": "source + focused regressions, mutation-proved, after review repair (fair rotation, deadline over listing, sign at plan read); exact-head CI pending for this head; the tools triage failure is inherited from the candidate's ci.yml line shift and fixed upstream in 8752c02f",
+  "evidence": "worker route-auth + ai-proxy 288 pass / 0 fail, 2 files; app ai-credential + billing-session-sweep handler/route + signout 212 pass / 0 fail, 4 files; worker and app tsc clean. Mutants 18/18 RED then GREEN: W1 plan-only branch removed 2 red; W2 signedAt ordering ignored 1; W3 TTL removed 1; W4 missing list accepted 1; W5 plan-only extends token 1; W6 plan-only drops token 1; W7 signed at arrival 1; W8 null token read as plan-only 1; A1 failed read sent as null 1; A2 no deadline 4; A3 listing outside deadline 2; A4 no rotation 3; A5 no per-rotation shift 2; A6 signed at send 1; H1 reverse before plans on fault 2; H2 metering-off skips plans 1; R1 deleted computers listed 1; R2 unstable order 1 (partly a ReferenceError: desc not imported). Slice schedule checked exhaustively offline for N 1..7468 x 300+ start minutes: 0 gaps. Earlier full suites at 4144d6e1: worker 2452/8 (load-avg-12 git/fs timeouts, 88/0 at --timeout 60000), app 10116/0 with 2 files needing shell/node_modules (54/0 once present).",
+  "startedAt": "2026-11-09T17:22:35Z",
+  "updatedAt": "2026-11-09T20:20:54Z"
+}

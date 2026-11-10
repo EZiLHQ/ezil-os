@@ -322,7 +322,11 @@ describe('EZiL gateway VS Code bridge', () => {
                 const provider = new EZiLModelsProvider(host);
                 await expect(provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
                     { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never)).rejects.toThrow();
-                expect(showCreditWarning).not.toHaveBeenCalled();
+                await Bun.sleep(0);
+                // A used-up credit window (no OS window here) gets Code's own notice saying no purchase lifts it, with no action.
+                expect(showCreditWarning).toHaveBeenCalledTimes(code === 'window_budget_reached' ? 1 : 0);
+                expect(showCreditWarning.mock.calls.every(call => call.length === 1)).toBe(true);
+                if (code === 'window_budget_reached') expect(String(showCreditWarning.mock.calls[0]![0])).toContain('does not lift this window right now');
                 expect(openExternal).not.toHaveBeenCalled();
             });
         }

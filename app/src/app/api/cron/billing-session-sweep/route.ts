@@ -1,9 +1,13 @@
+import { and, asc, gt, isNull } from 'drizzle-orm';
 import { env } from '@/env';
 import { routeComputer } from '@/server/api/routers/compute-dispatch';
 import { getBillingDeps } from '@/server/billing/deps';
 import { runningAwsComputersAfterEpochs } from '@/server/billing/store';
+import { aiIncludedModelsFor } from '@/server/billing/v3/ai-models';
 import { db } from '@/server/db';
-import { newCorrelationId } from '@/server/lib/cloudflare-guacamole-provider';
+import { computers } from '@/server/db/schema';
+import { AI_PLAN_REFRESH_OPENED_WITHIN_MS, refreshAiPlans } from '@/server/lib/ai-credential';
+import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
 import { isPlacementReadEnabled } from '@/server/lib/compute/aws-config';
 import { readLastUsageStop, readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
 import type { ComputerRef } from '@/server/lib/compute/provider';
@@ -54,6 +58,27 @@ async function awsStopProof(computer: ComputerRef): Promise<{ running: boolean; 
     return { running: ['RUNNING', 'LEASED', 'STARTING', 'MOUNTING'].includes(record.state), stoppedAt: null };
 }
 
+/**
+ * The AI plan refresh (`refreshAiPlans`): live computers opened within `AI_PLAN_REFRESH_OPENED_WITHIN_MS`, whichever
+ * provider runs them (both share the Worker's credential store), in one stable order (by id) so each minute's pass takes
+ * its own slice (`aiPlanRefreshSlice`). No browser is involved.
+ */
+function aiPlanRefresh(now: Date) {
+    const eligible = and(isNull(computers.deletedAt), gt(computers.lastOpenedAt, new Date(now.getTime() - AI_PLAN_REFRESH_OPENED_WITHIN_MS)));
+    return () => refreshAiPlans({
+        config: resolveCloudflareGuacamoleConfig(),
+        hmacSecret: env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '',
+        pass: Math.floor(now.getTime() / 60_000),
+        computers: {
+            count: async () => db.$count(computers, eligible),
+            page: async (offset, limit) => (await db.query.computers.findMany({
+                where: eligible, columns: { id: true, userId: true }, orderBy: asc(computers.id), offset, limit,
+            })).map(row => ({ userId: row.userId, computerId: row.id })),
+        },
+        includedModelsFor: userId => aiIncludedModelsFor(userId),
+    });
+}
+
 export async function GET(req: Request): Promise<Response> {
     if (!env.CRON_SECRET) return new Response(null, { status: 404 });
     if (req.headers.get('authorization') !== `Bearer ${env.CRON_SECRET}`) return new Response(null, { status: 404 });
@@ -73,6 +98,7 @@ export async function GET(req: Request): Promise<Response> {
         stop: (computer, reason) => stopComputerForPolicy(db, computer, reason),
         isStillRunning: isStillRunningAt(now),
         awsStopProof,
+        refreshAiPlans: aiPlanRefresh(now),
         // The held bound reads placements (C-2, through placement.ts): only where placement reads are on, as sandbox-reap.
         ...(isPlacementReadEnabled(process.env)
             ? { runningAwsPlacements: (after: string | null, limit: number) => runningAwsComputersAfterEpochs(db, after, limit),

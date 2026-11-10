@@ -641,10 +641,12 @@ import {
   aiProxyBaseUrl,
   aiProxyDisabled,
   chooseAiCredential,
+  currentModelAccess,
   deriveAiProxyToken,
   handleAiProxyRequest,
   isAiProxyPath,
   parsePushedAccessToken,
+  parsePushedModelAccess,
   proxyError,
   resolveGatewayUrl,
   usableAiCredential,
@@ -652,9 +654,12 @@ import {
   DEFAULT_AI_GATEWAY_URL,
   AI_CREDENTIAL_STORAGE_KEY,
   AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY,
+  AI_MODEL_ACCESS_STORAGE_KEY,
   AI_PROXY_NONCE_STORAGE_KEY,
   readLimited,
   type StoredAiCredential,
+  type StoredAiModelAccess,
+  type AiModelAccess,
 } from './ai-proxy';
 
 import { captureEditorState } from './editor-state';
@@ -803,7 +808,7 @@ const PUBLIC_ERROR_CODES = [
   'hmac_v2_invalid_claims', 'hmac_v2_invalid_request', 'hmac_v2_malformed_token',
   'hmac_v2_query_not_allowed', 'hmac_v2_required', 'hmac_v2_sandbox_mismatch', 'hmac_v2_scope_mismatch',
   'hmac_v2_token_misplaced', 'hmac_v2_token_missing', 'hmac_v2_unverified', 'import_busy', 'import_mismatch',
-  'import_not_started', 'internal_error', 'invalid',
+  'import_not_started', 'included_models_malformed', 'included_models_missing', 'internal_error', 'invalid',
   'invalid_body', 'invalid_body_base64', 'invalid_chunk_index', 'invalid_code_port',
   'invalid_content_type', 'invalid_continuation_token', 'invalid_desktop_mode', 'invalid_focus_app',
   'invalid_if_match_version', 'invalid_json_body', 'invalid_key', 'invalid_max_results', 'invalid_prefix',
@@ -972,8 +977,10 @@ interface EzilWorkspacePersistRpc {
   recordActivity(lastInputAgoMs: number): Promise<void>;
   startAiDesktop(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string>;
   getAiProxyNonce(): Promise<string | null>;
-  putAiCredential(credential: StoredAiCredential, signedAt: number): Promise<{ stored: boolean; expiresAt: number }>;
+  putAiCredential(credential: StoredAiCredential, signedAt: number, includedModels?: readonly string[] | null): Promise<{ stored: boolean; expiresAt: number }>;
+  putAiModelAccess(includedModels: readonly string[] | null, signedAt: number): Promise<{ stored: boolean }>;
   getAiCredential(): Promise<string | null>;
+  getAiModelAccess(): Promise<AiModelAccess>;
   dropAiCredential(token?: string, signedAt?: number): Promise<void>;
   /**
    * Observe → flush → cancel the flush loop → destroy → RE-OBSERVE, returning
@@ -3895,22 +3902,41 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     return (await this.ctx.storage.get<string>(AI_PROXY_NONCE_STORAGE_KEY)) ?? null;
   }
 
-  /** Order pushes against logout and each other atomically. No container access. */
-  async putAiCredential(credential: StoredAiCredential, signedAt: number): Promise<{ stored: boolean; expiresAt: number }> {
+  /**
+   * Order pushes against logout and each other atomically. No container access. `includedModels` (the plan's models,
+   * `parsePushedModelAccess`) is ordered on its own: the later signed push wins, whichever token is kept. It is kept
+   * across stop and logout: it restricts, it grants nothing, and the next push with a readable plan replaces it.
+   */
+  async putAiCredential(credential: StoredAiCredential, signedAt: number, includedModels?: readonly string[] | null): Promise<{ stored: boolean; expiresAt: number }> {
     return this.ctx.storage.transaction(async (txn) => {
       const current = await txn.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY);
       const revokedAt = await txn.get<number>(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY);
       if (revokedAt !== undefined && signedAt <= revokedAt) {
         return { stored: false, expiresAt: current?.expiresAt ?? credential.expiresAt };
       }
+      if (includedModels !== undefined) await storeAiModelAccess(txn, includedModels, signedAt);
       const { keep, stored } = chooseAiCredential(current, { ...credential, signedAt });
       if (stored && keep !== current) await txn.put(AI_CREDENTIAL_STORAGE_KEY, keep);
       return { stored, expiresAt: keep.expiresAt };
     });
   }
 
+  /**
+   * The server's plan refresh (a signed push with no token): the plan list alone, ordered exactly as in
+   * `putAiCredential`. It never reads, creates or extends the credential, and ignores the logout watermark because the
+   * list restricts and grants nothing. An expired or missing token still answers `os_session_missing`.
+   */
+  async putAiModelAccess(includedModels: readonly string[] | null, signedAt: number): Promise<{ stored: boolean }> {
+    return this.ctx.storage.transaction(async (txn) => ({ stored: await storeAiModelAccess(txn, includedModels, signedAt) }));
+  }
+
   async getAiCredential(): Promise<string | null> {
     return usableAiCredential(await this.ctx.storage.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY));
+  }
+
+  /** The models the owner's plan includes, if a fresh signed push said so; otherwise unknown (`currentModelAccess`). */
+  async getAiModelAccess(): Promise<AiModelAccess> {
+    return currentModelAccess(await this.ctx.storage.get<StoredAiModelAccess>(AI_MODEL_ACCESS_STORAGE_KEY));
   }
 
   /** Signed logout keeps a watermark; teardown/401 retain their unconditional/token-only deletion. */
@@ -7633,9 +7659,11 @@ async function handleBrowserSidecar(
 // ── EZiL AI proxy (code bridge host `/ai/v1/*` + credential push) ────────────
 //
 // See `./ai-proxy.ts` for the contract. Two halves:
-//   - `POST /sandbox/:name/ai-credential  { accessToken }` (Worker API host):
+//   - `POST /sandbox/:name/ai-credential  { accessToken, includedModels? }` (Worker API host):
 //     the Next server pushes the signed-in user's Supabase access token, signed
 //     with `x-ezil-signature` over sandbox id + body hash. Stored in the DO only.
+//     `includedModels` is the plan's model list (null = all; absent = unchanged).
+//     A body without `accessToken` is the server's plan refresh: `includedModels` only, never the token.
 //   - `/ai/v1/*` on `<8443>-<id>-code.<zone>`: the container's chat extension,
 //     authenticated by the per-sandbox proxy token injected at boot
 //     (`EZIL_AI_PROXY_TOKEN`), forwarded to the gateway with the stored token.
@@ -7667,6 +7695,7 @@ async function handleAiProxy(request: Request, env: Env, sandboxId: string, awsN
     proxySecret: resolveNekoDerivationSecret(env),
     proxyNonce: awsNonce !== undefined ? awsNonce : sandbox ? await sandbox.getAiProxyNonce() : null,
     credential: () => sandbox ? sandbox.getAiCredential() : Promise.resolve(null),
+    modelAccess: () => sandbox ? sandbox.getAiModelAccess() : Promise.resolve({ known: false } as const),
     dropCredential: (token) => sandbox ? sandbox.dropAiCredential(token) : Promise.resolve(),
     fetch: (upstream) => fetch(upstream),
     log: (fields) => console.log(JSON.stringify(fields)),
@@ -7674,6 +7703,14 @@ async function handleAiProxy(request: Request, env: Env, sandboxId: string, awsN
 }
 
 const AI_CREDENTIAL_MAX_BODY_BYTES = 32 * 1024;
+
+/** Store a signed plan list unless the stored one was signed at the same time or later. */
+async function storeAiModelAccess(txn: Pick<DurableObjectTransaction, 'get' | 'put'>, includedModels: readonly string[] | null, signedAt: number): Promise<boolean> {
+  const access = await txn.get<StoredAiModelAccess>(AI_MODEL_ACCESS_STORAGE_KEY);
+  if (access !== undefined && access.signedAt >= signedAt) return false;
+  await txn.put(AI_MODEL_ACCESS_STORAGE_KEY, { includedModels, signedAt } satisfies StoredAiModelAccess);
+  return true;
+}
 
 async function handleAiCredential(request: Request, env: Env, sandboxName: string): Promise<Response> {
   if (Number(request.headers.get('content-length') ?? 0) > AI_CREDENTIAL_MAX_BODY_BYTES) {
@@ -7706,13 +7743,29 @@ async function handleAiCredential(request: Request, env: Env, sandboxName: strin
   } catch {
     return json({ ok: false, error: 'invalid_json_body' }, 400);
   }
+  // No token: the server's plan refresh (`refreshAiPlans` in the app), which needs no browser. It names the plan
+  // explicitly; an empty body is refused rather than answered as a no-op.
+  if (typeof body === 'object' && body !== null && !Array.isArray(body) && !('accessToken' in body)) {
+    const fields = body as { includedModels?: unknown };
+    if (!('includedModels' in fields)) return json({ ok: false, error: 'included_models_missing' }, 400);
+    const plan = parsePushedModelAccess(fields.includedModels);
+    if (!plan.ok) return json({ ok: false, error: plan.error }, 400);
+    try {
+      const result = await openSandbox(env, sandboxName).putAiModelAccess(plan.includedModels as readonly string[] | null, auth.timestamp);
+      return json({ ok: true, sandboxId: sandboxName, planStored: result.stored });
+    } catch {
+      return json({ ok: false, sandboxId: sandboxName, error: 'ai_credential_storage_failed' }, 500);
+    }
+  }
   const accessToken = (body as { accessToken?: unknown } | null)?.accessToken;
   const parsed = parsePushedAccessToken(accessToken, sandboxName);
   if (!parsed.ok) return json({ ok: false, error: parsed.error }, 400);
+  const access = parsePushedModelAccess((body as { includedModels?: unknown } | null)?.includedModels);
+  if (!access.ok) return json({ ok: false, error: access.error }, 400);
 
   try {
     const sandbox = openSandbox(env, sandboxName);
-    const result = await sandbox.putAiCredential(parsed.credential, auth.timestamp);
+    const result = await sandbox.putAiCredential(parsed.credential, auth.timestamp, access.includedModels);
     return json({ ok: true, sandboxId: sandboxName, stored: result.stored, expiresAt: result.expiresAt });
   } catch {
     return json(

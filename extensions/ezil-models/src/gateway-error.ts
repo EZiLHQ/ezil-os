@@ -19,6 +19,8 @@ export class GatewayError extends Error {
         public readonly origin: GatewayErrorOrigin = 'gateway',
         /** Local refusals only: sizes, never payload text. */
         public readonly counts?: LocalRequestCounts,
+        /** A used-up credit window's reset (toISOString), only when waiting for it can help. */
+        public readonly resetsAt?: string,
     ) {
         super(message);
         this.name = 'GatewayError';

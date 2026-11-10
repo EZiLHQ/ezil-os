@@ -37,6 +37,7 @@ import {
 } from './code-folder';
 import { injectCodeFolderBridge, isHtmlDocument, isWorkbenchDocumentRequest } from './code-folder-bridge';
 import { injectCodeDiagBridge } from './code-diag-bridge';
+import { injectCodeBillingBridge } from './code-billing-bridge';
 import {
   PREVIEW_COOKIE_NAME,
   PREVIEW_COOKIE_TTL_S,
@@ -356,7 +357,7 @@ async function withCodeFolderBridge(res: Response, origins: readonly string[]): 
   // validators no longer hold (the runtime encodes it again from Content-Encoding), and it is never cached.
   for (const name of ['content-length', 'etag', 'last-modified']) headers.delete(name);
   headers.set('cache-control', 'no-cache, no-store');
-  return new Response(injectCodeDiagBridge(injectCodeFolderBridge(html, origins), origins), { status: res.status, statusText: res.statusText, headers });
+  return new Response(injectCodeBillingBridge(injectCodeDiagBridge(injectCodeFolderBridge(html, origins), origins), origins), { status: res.status, statusText: res.statusText, headers });
 }
 
 /**

@@ -25,7 +25,11 @@ install -d -m 0700 /opt/ezil-os-staging /etc/ezil-os-staging
 cd /opt/ezil-os-staging
 exec 9>deploy.lock
 flock -x 9
-temporary=$(mktemp -d)
+# Archives and the loaded-image export are ~GB; /tmp may be a small tmpfs and the remote shell
+# ignores the caller's TMPDIR. Use a private directory on the root disk, under the 0700 install
+# directory. The flock is held, so leftovers from a killed run are stale.
+rm -rf /opt/ezil-os-staging/.install-tmp.*
+temporary=$(mktemp -d /opt/ezil-os-staging/.install-tmp.XXXXXXXX)
 trap 'rm -rf "$temporary"' EXIT
 # Downloads use only the instance role, never local profiles/static credentials.
 unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE
@@ -62,7 +66,17 @@ docker image inspect "ezil-os-staging:$tag" --format '{{.Architecture}}' | \
     python3 -c 'import sys; sys.exit(0 if sys.stdin.read().strip() == "amd64" else 1)'
 if [[ -n $approved_source ]]; then
     docker image inspect "$slug:$tag" --format '{{json .}}' > "$temporary/loaded-image.json"
-    verify_install_source loaded "$temporary/loaded-image.json" "$approved_source" "$verified_image_id"
+    # verified_image_id is the approved config digest; the engine store ID (classic image ID or
+    # containerd index digest) differs. Prove the exact loaded tag carries the approved config
+    # blob by exporting it, then bind runtime to that store ID.
+    docker save -o "$temporary/loaded-export.tar" "$slug:$tag"
+    verified_store_id=$(verify_install_source loaded "$temporary/loaded-image.json" \
+        "$temporary/loaded-export.tar" "$tag" "$approved_source" "$verified_image_id")
+    rm -f "$temporary/loaded-export.tar"
+    [[ $(docker image inspect "$slug:$tag" --format '{{.Id}}') == "$verified_store_id" ]] || {
+        echo 'Loaded image changed during verification' >&2
+        exit 1
+    }
     # Capture only nonsecret recovery identities before overwriting runtime files.
     # These observations do not substitute for the reviewed rollback archives.
     previous_image_ref=unavailable previous_image_id=unavailable previous_source=unavailable
@@ -96,7 +110,9 @@ for job in "${jobs[@]}"; do
         systemctl stop "ezil-os-staging-$job.timer" "ezil-os-staging-$job.service"
     fi
 done
-python3 render-env.py
+# The script arrives on bash's stdin (SSM heredoc), so any child that reads stdin would swallow the
+# unparsed rest of it (timer restore, footer) and still exit 0. Isolate stdin for every such child.
+python3 render-env.py </dev/null
 printf 'OS_STAGING_TAG=%s\n' "$tag" >compose.env
 # D4: --force-recreate deletes the outgoing web container's json-file log. Keep a gzip copy first
 # (root-only, 7-day retention). Best effort: a snapshot problem never blocks the install.
@@ -113,12 +129,14 @@ snapshot_web_log() {
     find "$dir" -maxdepth 1 -type f -name 'web-*.log.gz*' -mmin +10080 -delete 2>/dev/null || true
 }
 snapshot_web_log
-docker compose --env-file compose.env up -d --force-recreate --wait --wait-timeout 120
+docker compose --env-file compose.env up -d --force-recreate --wait --wait-timeout 120 </dev/null
 if [[ -n $approved_source ]]; then
-    observed_source=$(docker compose --env-file compose.env exec -T web node -e 'process.stdout.write(process.env.EZIL_GIT_SHA || "")') || observed_source=unavailable
-    if [[ $observed_source != "$approved_source" ]]; then
+    observed_source=$(docker compose --env-file compose.env exec -T web node -e 'process.stdout.write(process.env.EZIL_GIT_SHA || "")' </dev/null) || observed_source=unavailable
+    observed_image=$(docker container inspect "$slug-web-1" --format '{{.Image}}') || observed_image=unavailable
+    if [[ $observed_source != "$approved_source" || $observed_image != "$verified_store_id" ]]; then
         echo 'Runtime SHA mismatch; release owner must recover. App replacement already ran; stopped timers remain stopped. No automatic rollback.' >&2
-        printf 'Candidate: image=%s:%s source=%s image_id=%s receipt_sha256=%s\n' "$slug" "$tag" "$approved_source" "$verified_image_id" "$receipt_hash" >&2
+        printf 'Candidate: image=%s:%s source=%s image_id=%s store_id=%s receipt_sha256=%s\n' "$slug" "$tag" "$approved_source" "$verified_image_id" "$verified_store_id" "$receipt_hash" >&2
+        printf 'Observed runtime: source=%s image=%s\n' "$observed_source" "$observed_image" >&2
         printf 'Previous observed: image=%s source=%s image_id=%s (use separately reviewed rollback archives).\n' "$previous_image_ref" "$previous_source" "$previous_image_id" >&2
         printf 'Recovery: inspect the SSM command and current container; owner must restore the approved app/runtime pair or repair this candidate, verify health/source, then restore the reviewed timer set: %s\n' "${jobs[*]}" >&2
         exit 1
@@ -132,4 +150,4 @@ for job in "${jobs[@]}"; do
     systemctl enable --now "ezil-os-staging-$job.timer"
 done
 printf 'Installed TAG: %s\n' "$tag"
-docker compose --env-file compose.env exec -T web node -e 'console.log("Deployed SHA: " + process.env.EZIL_GIT_SHA)'
+docker compose --env-file compose.env exec -T web node -e 'console.log("Deployed SHA: " + process.env.EZIL_GIT_SHA)' </dev/null

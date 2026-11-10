@@ -38,6 +38,7 @@ import { z } from 'zod';
 import { computers } from '@/server/db/schema';
 import { getBillingDeps } from '@/server/billing/deps';
 import { gateComputerStart } from '@/server/billing/v2/compute-access';
+import { aiIncludedModelsFor } from '@/server/billing/v3/ai-models';
 import { billingComputeMeter } from '@/server/billing/v2/compute-meter';
 import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
 import { syncAiCredential } from '@/server/lib/ai-credential';
@@ -311,6 +312,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 config, hmacSecret,
                 sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
                 userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
+                includedModels: () => aiIncludedModelsFor(ctx.user.id),
             });
             if (routed.kind === 'aws-ec2') {
                 let preview: AwsPreviewResult | undefined;
@@ -828,6 +830,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 config, hmacSecret,
                 sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
                 userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
+                includedModels: () => aiIncludedModelsFor(ctx.user.id),
             });
             if (routed.kind === 'aws-ec2') {
                 // Hotfix r5: a hosted-app poll never restarts a computer that just stopped.
@@ -1459,6 +1462,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 config, hmacSecret: process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '',
                 sandboxName: deriveGuacamoleSandboxId(ctx.user.id, input.computerId),
                 userId: ctx.user.id, headers: ctx.headers, supabase: supabaseServerClient,
+                includedModels: () => aiIncludedModelsFor(ctx.user.id),
             });
             const result = await routed.provider.activity({ correlationId }, computer, {
                 lastInputAgoMs: input.lastInputAgoMs,

@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Readable } from 'node:stream';
-import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createMock, validateBody, QWEN, KIMI, FLASH, SLOW_DONE } from './copilot-ezil-messages-mock.mjs';
+import { createMock, validateBody, QWEN, KIMI, FLASH, SLOW_DONE, PLAN_HEADER, creditsRequestId } from './copilot-ezil-messages-mock.mjs';
 
 const base = () => ({ model: QWEN, max_tokens: 16, stream: true, messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }] });
 const tool = name => ({ name, input_schema: { type: 'object', properties: {} } });
@@ -156,6 +156,48 @@ test('Flash catalog mode: v1 catalog names Flash default_model; Flash requests r
     assert.equal(catalog.contract, 'ezil.gateway.models.v1');
     assert.equal(catalog.default_model, FLASH);
     assert.deepEqual(catalog.data.map(row => [row.id, row.availability.state, row.capabilities.tool_calling]), [[QWEN, 'available', true], [KIMI, 'available', true], [FLASH, 'available', true]]);
+  } finally {
+    server.close();
+    rmSync(captureDir, { recursive: true, force: true });
+  }
+});
+
+test('state file: free adds the OS proxy header and its refusal; exhausted answers 402 with its own UUID request id; read per request', async () => {
+  const captureDir = mkdtempSync(join(tmpdir(), 'ezil-messages-plan-'));
+  const stateFile = join(captureDir, 'state');
+  const server = createMock({ token: 'test-only', folder: '/project', captureDir, flash: true, stateFile });
+  const call = async (method, url, body) => {
+    let status, headers = {}, output = '';
+    const request = Readable.from(body ? [Buffer.from(JSON.stringify(body))] : []);
+    Object.assign(request, { method, url, headers: { authorization: 'Bearer test-only' } });
+    await server.listeners('request')[0](request, { writeHead(code, h = {}) { status = code; headers = h; }, write(c) { output += c; }, end(c = '') { output += c; } });
+    return { status, headers, body: output && output.startsWith('{') ? JSON.parse(output) : output };
+  };
+  const turn = model => ({ ...base(), model, stream: false });
+  try {
+    assert.equal((await call('GET', '/ai/v1/models')).headers[PLAN_HEADER], undefined, 'no state file: paid');
+    writeFileSync(stateFile, 'free\n');
+    assert.equal((await call('GET', '/ai/v1/models')).headers[PLAN_HEADER], FLASH);
+    const refused = await call('POST', '/ai/v1/messages', turn(QWEN));
+    assert.deepEqual([refused.status, refused.body.error.code, refused.body.error.source], [403, 'os_model_not_included', 'ezil-os-proxy']);
+    assert.equal((await call('POST', '/ai/v1/messages', turn(FLASH))).status, 200);
+    writeFileSync(stateFile, 'free exhausted');
+    const out = await call('POST', '/ai/v1/messages', turn(FLASH));
+    const again = await call('POST', '/ai/v1/messages', turn(FLASH));
+    assert.deepEqual([out.status, out.body.error.code, out.body.error.request_id, out.headers['x-ezil-request-id']], [402, 'insufficient_credits', creditsRequestId(5), creditsRequestId(5)]);
+    assert.match(out.body.error.request_id, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    assert.equal(again.body.error.request_id, creditsRequestId(6), 'each refusal has its own request id');
+    const recorded = JSON.parse(readFileSync(join(captureDir, 'captured.json'), 'utf8')).filter(r => r.requestId).map(r => [r.n, r.requestId]);
+    assert.deepEqual(recorded, [[5, creditsRequestId(5)], [6, creditsRequestId(6)]], 'the capture records which request each refusal answered');
+    writeFileSync(stateFile, 'free window');
+    const window = await call('POST', '/ai/v1/messages', turn(FLASH));
+    assert.deepEqual([window.status, window.body.error.code, window.body.error.request_id, window.headers['x-ezil-request-id'], window.headers['retry-after']],
+      [429, 'window_budget_reached', creditsRequestId(7), creditsRequestId(7), '5400']);
+    assert.deepEqual([typeof window.body.error.budget_micro, typeof window.body.error.used_micro, typeof window.body.error.hold_micro], ['string', 'string', 'string'],
+      'decimal strings, as the Gateway sends them');
+    assert.ok(Date.parse(window.body.error.resets_at) > Date.now(), 'a reset ahead');
+    writeFileSync(stateFile, '');
+    assert.equal((await call('POST', '/ai/v1/messages', turn(QWEN))).status, 200, 'paid again');
   } finally {
     server.close();
     rmSync(captureDir, { recursive: true, force: true });

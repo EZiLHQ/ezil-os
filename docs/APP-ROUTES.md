@@ -48,6 +48,14 @@ app. There is no `launcher` app in the registry today.
   `section=ai-credits` after it, and the URL becomes
   `/app/settings?tab=billing…` (§5 "Order", one-shot keys). Any other
   Settings link loses `upgrade` the same way.
+- **Code's credit recovery link follows the plan.**
+  `/os?settings=billing&section=ai-credits&reason=insufficient_credits` is the
+  link Code shows outside an OS window when EZiL AI credits run out. Billing
+  opens what its own summary calls for (`billingRecoveryAction`): the Standard
+  upgrade on Free (Free includes Gemini 3.8 Flash only), and Add credits on a
+  paid plan. Inside an OS window, Code asks through the Worker's billing
+  bridge instead (`ui/Settings/billing-recovery.js`), and Settings opens with
+  the same request in its launch context. No URL carries it.
 - **Hosts that serve only `/os` are never rewritten.** The native Mac host
   (`provider: 'native-macos'`, which also refuses any query string) and the
   local runtime (`provider: 'local-vm'`) serve the shell at `/os` alone.

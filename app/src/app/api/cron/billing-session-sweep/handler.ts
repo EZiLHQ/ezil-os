@@ -8,6 +8,7 @@ import type { HeldCandidate } from '@/server/billing/store';
 import { drainAiCreditOutbox } from '@/server/billing/ai-credit-outbox';
 import { billingMeteringActive, loadComputeBillingState, paidComputeUnmeteredState, type ComputeBillingState } from '@/server/billing/v2/compute-access';
 import type { ComputerRef } from '@/server/lib/compute/provider';
+import type { AiPlanRefreshCounts } from '@/server/lib/ai-credential';
 import type { PolicyStopReason, StopOutcome } from '@/server/lib/compute/stop-policy';
 
 type SweepReason = Exclude<PolicyStopReason, 'user_stop'>;
@@ -45,6 +46,8 @@ export interface BillingSessionSweepCounts {
     heldOverrun?: number;
     /** Round 3 D6: the AI credit outbox drain of this sweep. */
     ai?: { drained: number; delivered: number; retried: number; failed: number };
+    /** The AI plan refresh of this sweep (`refreshAiPlans`), when wired. */
+    aiPlans?: AiPlanRefreshCounts;
 }
 
 /** Placement evidence for a stale AWS epoch; `stoppedAt` is the provider-observed stop, when recorded. */
@@ -79,7 +82,7 @@ export function reverseMoveInFlightFor(executor: PlacementExecutor): ReverseMove
     };
 }
 
-export async function handleBillingSessionSweep({ deps, now, stop, isStillRunning, awsStopProof, runningAwsPlacements, reverseMoveInFlight, limit = 50 }: {
+export async function handleBillingSessionSweep({ deps, now, stop, isStillRunning, awsStopProof, runningAwsPlacements, reverseMoveInFlight, refreshAiPlans, limit = 50 }: {
     deps: BillingDeps;
     now: Date;
     stop: (computer: ComputerRef, reason: SweepReason) => Promise<StopOutcome>;
@@ -91,24 +94,35 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
     runningAwsPlacements?: RunningAwsPlacements;
     /** Phase B: the held pass skips a computer in a reverse move; omitted (no 0012, tests) = round 6a's held pass exactly. */
     reverseMoveInFlight?: ReverseMoveInFlight;
+    /**
+     * Keeps each recently opened computer's AI plan current with no browser (`refreshAiPlans`). Runs beside the whole
+     * sweep with metering on or off, and settles before the reverse pass, which stays last. Omitted (tests) = no refresh.
+     */
+    refreshAiPlans?: () => Promise<AiPlanRefreshCounts>;
     limit?: number;
 }): Promise<BillingSessionSweepCounts> {
     const startedAt = Date.now();
     const counts = { examined: 0, stopped: 0, closed: 0, stopFailed: 0, heartbeatClosed: 0, retried: 0, shadow: 0, awsStaleClosed: 0,
-        heldOverrun: 0, ai: { drained: 0, delivered: 0, retried: 0, failed: 0 } };
+        heldOverrun: 0, ai: { drained: 0, delivered: 0, retried: 0, failed: 0 }, aiPlans: undefined as AiPlanRefreshCounts | undefined };
     const drain = async () => {
         try {
             const drained = await drainAiCreditOutbox(deps, { limit: 25, deadlineMs: startedAt + 40_000 });
             counts.ai = { drained: drained.claimed, delivered: drained.done, retried: drained.retry, failed: drained.failed };
         } catch { console.warn('[billing.ai] outbox sweep unavailable'); }
     };
+    const plans = (async () => {
+        if (!refreshAiPlans) return;
+        try {
+            counts.aiPlans = await refreshAiPlans();
+        } catch { console.warn('[billing.ai] plan refresh unavailable'); }
+    })();
     const finish = () => {
         console.info(JSON.stringify({ event: 'billing-sweep', ...counts }));
         return counts;
     };
     // Phase B: the reverse pass is the LAST step on both paths (§5.4). Only it enforces a move's deadlines, so it runs with
     // metering off too; after drain(), because reconcile and the outbox start no work after + 40 s and the pass may take 90 s.
-    if (!billingMeteringActive(deps.config)) { await drain(); await advanceReverseMoves(startedAt); return finish(); }
+    if (!billingMeteringActive(deps.config)) { await drain(); await plans; await advanceReverseMoves(startedAt); return finish(); }
 
     // Standard trial (review R4): every metered minute, keep each started trial account's current verified identity, so
     // a later account deletion keeps all of them claimed. Best effort: it never blocks the sweep.
@@ -320,6 +334,7 @@ export async function handleBillingSessionSweep({ deps, now, stop, isStillRunnin
         await reconcilePaidCloudflareUsers(startedAt);
         await drain();
     } finally {
+        await plans;
         await advanceReverseMoves(startedAt);
     }
     return finish();
