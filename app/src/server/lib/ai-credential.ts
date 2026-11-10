@@ -102,6 +102,10 @@ export type AiCredentialPushResult =
  * the provider is unconfigured, there is no HMAC secret (the Worker refuses
  * unsigned pushes), or the token has no `app_metadata.ezil_role` (the gateway
  * would refuse it with 401 `no_ezil_role`).
+ *
+ * `includedModels` travels in the same signed body: the models the owner's plan
+ * includes (`billing/v3/ai-models.ts`; `null` = every model). Left out when
+ * `undefined` (the plan could not be read), so the Worker keeps its list.
  */
 export async function pushAiCredential(
     config: CloudflareGuacamoleConfig,
@@ -109,12 +113,13 @@ export async function pushAiCredential(
     sandboxName: string,
     accessToken: string | null,
     fetchImpl: typeof fetch = fetch,
+    includedModels?: readonly string[] | null,
 ): Promise<AiCredentialPushResult> {
     if (!config.isConfigured || !hmacSecret) return { ok: false, skipped: 'not_configured' };
     if (accessToken === null) return { ok: false, skipped: 'no_session' };
     if (readAccessTokenClaims(accessToken)?.ezilRole == null) return { ok: false, skipped: 'no_ezil_role' };
 
-    const body = JSON.stringify({ accessToken });
+    const body = JSON.stringify(includedModels === undefined ? { accessToken } : { accessToken, includedModels });
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/ai-credential`;
     try {
         const res = await fetchImpl(endpoint, {
@@ -153,6 +158,8 @@ export async function pushAiCredential(
 
 /**
  * `currentAccessToken` + `pushAiCredential`, for the router. Never throws.
+ * `includedModels` (`aiIncludedModelsFor`) is read only for a push that will be
+ * sent; a read that rejects counts as unknown and leaves the Worker's list.
  */
 export async function syncAiCredential(params: {
     config: CloudflareGuacamoleConfig;
@@ -162,11 +169,14 @@ export async function syncAiCredential(params: {
     headers: Headers;
     supabase: () => Promise<SessionSource>;
     fetchImpl?: typeof fetch;
+    includedModels?: () => Promise<readonly string[] | null | undefined>;
 }): Promise<AiCredentialPushResult> {
     try {
         if (!params.config.isConfigured || !params.hmacSecret) return { ok: false, skipped: 'not_configured' };
         const token = await currentAccessToken(params.userId, params.headers, await params.supabase());
-        return await pushAiCredential(params.config, params.hmacSecret, params.sandboxName, token, params.fetchImpl);
+        const models = token !== null && readAccessTokenClaims(token)?.ezilRole != null && params.includedModels
+            ? await params.includedModels().catch(() => undefined) : undefined;
+        return await pushAiCredential(params.config, params.hmacSecret, params.sandboxName, token, params.fetchImpl, models);
     } catch {
         console.warn('[ai-credential] sync failed (non-fatal)', {
             sandboxName: params.sandboxName,
@@ -174,6 +184,184 @@ export async function syncAiCredential(params: {
         });
         return { ok: false, error: 'sync_failed' };
     }
+}
+
+/**
+ * Computers the plan refresh reaches: opened (`last_opened_at`, stamped at most hourly while the owner is present)
+ * within this. A browser push's token lives an hour, so a computer whose token can still be usable was stamped
+ * within two hours; the third is margin. Reaching an older one stores a list that restricts and grants nothing.
+ */
+export const AI_PLAN_REFRESH_OPENED_WITHIN_MS = 3 * 60 * 60_000;
+/** Computers one refresh pass takes at most. */
+export const AI_PLAN_REFRESH_LIMIT = 500;
+/**
+ * Passes (sweep minutes) in which every eligible computer is reached when passes finish, well inside the plan's 30
+ * minutes. Holds for up to `15 * 500 - 32` (7,468) eligible computers; beyond that a rotation takes
+ * ceil((N + 32) / 500) passes (logged).
+ */
+export const AI_PLAN_REFRESH_ROTATION_PASSES = 15;
+/** The whole pass, listing and plan reads included; it runs beside the sweep's 40 s outbox drain. */
+export const AI_PLAN_REFRESH_BUDGET_MS = 20_000;
+const AI_PLAN_PUSH_TIMEOUT_MS = 5_000;
+const AI_PLAN_REFRESH_CONCURRENCY = 8;
+/**
+ * Rows a pass reaches even when every push hangs to its timeout (8 in flight, four 5 s pushes each in 20 s), while
+ * the listing and plan reads are quick. Steps never go below it, and each rotation shifts by it (`aiPlanRefreshSlice`).
+ */
+export const AI_PLAN_REFRESH_MIN_REACH = AI_PLAN_REFRESH_CONCURRENCY * Math.floor(AI_PLAN_REFRESH_BUDGET_MS / AI_PLAN_PUSH_TIMEOUT_MS);
+
+export type AiPlanPushResult = { ok: true; stored: boolean } | { ok: false; error: string };
+
+/**
+ * The plan alone, signed exactly as a credential push but with no token: the Worker stores the list by its signed
+ * time and never touches the credential (`putAiModelAccess`). `now` is when the plan was read, so a browser beat that
+ * read it later wins. Never throws and never logs the list.
+ */
+export async function pushAiPlan(
+    config: CloudflareGuacamoleConfig,
+    hmacSecret: string,
+    sandboxName: string,
+    includedModels: readonly string[] | null,
+    signal: AbortSignal,
+    fetchImpl: typeof fetch = fetch,
+    now: number = Date.now(),
+): Promise<AiPlanPushResult> {
+    const body = JSON.stringify({ includedModels });
+    const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/ai-credential`;
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(), AI_PLAN_PUSH_TIMEOUT_MS);
+    try {
+        const res = await fetchImpl(endpoint, {
+            method: 'POST',
+            redirect: 'manual',
+            headers: { 'content-type': 'application/json', 'x-ezil-signature': mintAiCredentialSignature(hmacSecret, sandboxName, body, now) },
+            body,
+            signal: AbortSignal.any([signal, timeout.signal]),
+        });
+        const data = await res.json().catch(() => ({})) as { ok?: unknown; planStored?: unknown };
+        // A Worker older than the plan refresh refuses a body without a token (400): logged, and the browser beat still works.
+        if (!res.ok || data.ok !== true) return { ok: false, error: `worker_http_${res.status}` };
+        return { ok: true, stored: data.planStored === true };
+    } catch {
+        return { ok: false, error: 'push_failed' };
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/**
+ * Where pass `pass` starts in the stable (by id) order of `eligible` computers, and how many it takes (all, up to the
+ * limit). Over `passes` passes the start moves on by N + MIN_REACH rows in near-equal steps of at most the limit, so:
+ * - passes that finish chain without a gap: any `passes` in a row (15 for N up to 7,468) reach every computer;
+ * - each rotation lands `AI_PLAN_REFRESH_MIN_REACH` rows past the last, so rows a slow pass never reached lead a later
+ *   one: even when every pass reaches only that minimum, every computer is reached within
+ *   `passes * (ceil(ceil((N + MIN_REACH) / passes) / MIN_REACH) + 1)` passes. Rows that hang every time cannot starve
+ *   the ones after them.
+ *
+ * Rotation rather than a running filter: no table says a Cloudflare computer still runs without a provider call, and
+ * its compute session closes 15 minutes after the last browser beat, exactly when this refresh is needed. Stopped
+ * computers in the window cost a push each, never another computer's turn.
+ */
+export function aiPlanRefreshSlice(eligible: number, pass: number): { start: number; take: number; passes: number } {
+    if (!(eligible > 0)) return { start: 0, take: 0, passes: 0 };
+    const reach = AI_PLAN_REFRESH_MIN_REACH;
+    const passes = Math.max(AI_PLAN_REFRESH_ROTATION_PASSES, Math.ceil((eligible + reach) / AI_PLAN_REFRESH_LIMIT));
+    const p = Math.max(0, Math.floor(pass));
+    const rotation = Math.floor(p / passes);
+    const start = (Math.floor((p % passes) * (eligible + reach) / passes) + ((rotation % eligible) * reach) % eligible) % eligible;
+    return { start, take: Math.min(AI_PLAN_REFRESH_LIMIT, eligible), passes };
+}
+
+/** The refresh's computers: live ones opened within `AI_PLAN_REFRESH_OPENED_WITHIN_MS`, in one stable order (by id). */
+export interface AiPlanRefreshSource {
+    count: () => Promise<number>;
+    page: (offset: number, limit: number) => Promise<readonly { userId: string; computerId: string }[]>;
+}
+
+export interface AiPlanRefreshCounts {
+    /** Computers eligible this pass; `computers` of them were taken. */
+    eligible: number;
+    computers: number;
+    pushed: number;
+    stored: number;
+    /** The owner's plan could not be read: nothing is sent, and the Worker's list ages out as before. */
+    unknown: number;
+    failed: number;
+}
+
+/**
+ * The server half of plan freshness, for active work with no browser (the per-minute billing sweep): each pass takes
+ * its slice of the recently opened computers (`aiPlanRefreshSlice`), and each gets its owner's current list from `includedModelsFor` (`aiIncludedModelsFor`, the start gate's
+ * effective plan). It sends no token, reads no session, and records no activity, presence, lease or meter. A plan
+ * read that fails sends nothing (never `null`, which is every model). Bounded by `AI_PLAN_REFRESH_BUDGET_MS`; never throws.
+ */
+export async function refreshAiPlans(params: {
+    config: CloudflareGuacamoleConfig;
+    hmacSecret: string;
+    computers: AiPlanRefreshSource;
+    /** This sweep's index (its minute): which slice of the computers it takes (`aiPlanRefreshSlice`). */
+    pass: number;
+    includedModelsFor: (userId: string) => Promise<readonly string[] | null | undefined>;
+    fetchImpl?: typeof fetch;
+    budgetMs?: number;
+}): Promise<AiPlanRefreshCounts> {
+    const counts: AiPlanRefreshCounts = { eligible: 0, computers: 0, pushed: 0, stored: 0, unknown: 0, failed: 0 };
+    if (!params.config.isConfigured || !params.hmacSecret) return counts;
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), params.budgetMs ?? AI_PLAN_REFRESH_BUDGET_MS);
+    // One deadline from the start: it bounds the listing too, so a database that never answers cannot hold the sweep.
+    const deadline = new Promise<void>((resolve) => abort.signal.addEventListener('abort', () => resolve(), { once: true }));
+    const pass = async () => {
+        const eligible = await params.computers.count();
+        if (abort.signal.aborted) return;
+        counts.eligible = eligible;
+        if (eligible > AI_PLAN_REFRESH_LIMIT * AI_PLAN_REFRESH_ROTATION_PASSES - AI_PLAN_REFRESH_MIN_REACH) {
+            console.warn('[ai-credential] plan refresh rotation exceeds its passes', { eligible });
+        }
+        const { start, take } = aiPlanRefreshSlice(eligible, params.pass);
+        const listed = take === 0 ? [] : [...await params.computers.page(start, take)];
+        // Wrap round to the front for the rest of the slice.
+        if (listed.length < take && start > 0 && !abort.signal.aborted) {
+            listed.push(...await params.computers.page(0, Math.min(take - listed.length, start)));
+        }
+        if (abort.signal.aborted) return;
+        counts.computers = listed.length;
+        // Each owner's plan is read once, and its pushes are signed at that read: a beat that read it later wins.
+        const plans = new Map<string, { readAt: number; plan: Promise<readonly string[] | null | undefined> }>();
+        const queue = [...listed];
+        const work = async () => {
+            for (let next = queue.shift(); next !== undefined && !abort.signal.aborted; next = queue.shift()) {
+                const { userId, computerId } = next;
+                let read = plans.get(userId);
+                if (!read) {
+                    read = { readAt: Date.now(), plan: params.includedModelsFor(userId).catch(() => undefined) };
+                    plans.set(userId, read);
+                }
+                const includedModels = await read.plan;
+                if (includedModels === undefined) { counts.unknown++; continue; }
+                if (abort.signal.aborted) break;
+                const result = await pushAiPlan(params.config, params.hmacSecret, deriveGuacamoleSandboxId(userId, computerId),
+                    includedModels, abort.signal, params.fetchImpl, read.readAt);
+                if (result.ok) {
+                    counts.pushed++;
+                    if (result.stored) counts.stored++;
+                } else counts.failed++;
+            }
+        };
+        await Promise.all(Array.from({ length: AI_PLAN_REFRESH_CONCURRENCY }, work));
+    };
+    try {
+        await Promise.race([pass(), deadline]);
+    } catch {
+        console.warn('[ai-credential] plan refresh unavailable');
+    } finally {
+        clearTimeout(timer);
+        abort.abort();
+    }
+    // A snapshot: a push the deadline cut short may still settle after this returns.
+    const result = { ...counts };
+    if (result.unknown > 0 || result.failed > 0) console.warn('[ai-credential] plan refresh incomplete', result);
+    return result;
 }
 
 /** Signed deletion, even when the proxy kill switch is off. No bearer needed. */

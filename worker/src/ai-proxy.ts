@@ -36,6 +36,13 @@ export const AI_CREDENTIAL_STORAGE_KEY = 'ezil:aiCredential';
 /** Latest signed logout timestamp; retained even after the JWT is deleted. */
 export const AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY = 'ezil:aiCredentialRevokedAt';
 export const AI_PROXY_NONCE_STORAGE_KEY = 'ezil:aiProxyNonce';
+/** DO storage key for the models the owner's plan includes, pushed with the token (`StoredAiModelAccess`). */
+export const AI_MODEL_ACCESS_STORAGE_KEY = 'ezil:aiModelAccess';
+/**
+ * Set by this proxy only (never relayed from the Gateway): the models the plan includes, comma-separated, on every
+ * `GET /ai/v1/models` answer and on an `os_model_not_included` refusal. Absent means every model.
+ */
+export const AI_INCLUDED_MODELS_HEADER = 'x-ezil-os-included-models';
 
 // ── Routes ───────────────────────────────────────────────────────────────────
 
@@ -259,6 +266,67 @@ export function usableAiCredential(stored: StoredAiCredential | undefined, now: 
   return stored.expiresAt - AI_CREDENTIAL_MIN_REMAINING_MS > now ? stored.token : null;
 }
 
+/**
+ * The models the owner's plan includes, as the Next server last pushed them (billing v3 `aiIncludedModels`): `null`
+ * is every model, an explicit and verified answer. Kept apart from the token, so a push that keeps an older token still
+ * updates the plan; the later signed push wins.
+ */
+export interface StoredAiModelAccess {
+  readonly includedModels: readonly string[] | null;
+  readonly signedAt: number;
+}
+
+/**
+ * How long a pushed plan list stays in force without a newer one. A present user's Code pushes one with every activity
+ * beat (each minute), and the server's per-minute sweep pushes the list alone to recently opened computers, so work that
+ * runs on with no browser keeps its current plan; a push that could not read the plan carries none and never extends this.
+ */
+export const AI_MODEL_ACCESS_MAX_AGE_MS = 30 * 60_000;
+
+/** The plan's models as the proxy acts on them. Unknown (none pushed, stale or malformed) never means every model. */
+export type AiModelAccess = { readonly known: false } | { readonly known: true; readonly includedModels: readonly string[] | null };
+
+export function currentModelAccess(stored: StoredAiModelAccess | undefined, now: number = Date.now()): AiModelAccess {
+  if (!stored || typeof stored.signedAt !== 'number' || !Number.isFinite(stored.signedAt) || now - stored.signedAt > AI_MODEL_ACCESS_MAX_AGE_MS) return { known: false };
+  const list = stored.includedModels;
+  if (list === null) return { known: true, includedModels: null };
+  return Array.isArray(list) && list.length > 0 && list.every((alias) => typeof alias === 'string' && MODEL_ALIAS.test(alias))
+    ? { known: true, includedModels: list } : { known: false };
+}
+
+/** The Gateway's model alias rule (EZiL AI Gateway src/catalog.ts MODEL_ALIAS). */
+const MODEL_ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
+
+/**
+ * `includedModels` of a credential push. Absent: unchanged (the server could not read the plan this time). `null`:
+ * every model. Otherwise 1–16 distinct Gateway aliases. Anything else refuses the whole push.
+ */
+export function parsePushedModelAccess(
+  value: unknown,
+): { ok: true; includedModels: readonly string[] | null | undefined } | { ok: false; error: string } {
+  if (value === undefined || value === null) return { ok: true, includedModels: value };
+  if (!Array.isArray(value) || value.length === 0 || value.length > 16 || new Set(value).size !== value.length
+    || !value.every((alias) => typeof alias === 'string' && MODEL_ALIAS.test(alias))) {
+    return { ok: false, error: 'included_models_malformed' };
+  }
+  return { ok: true, includedModels: Object.freeze([...value] as string[]) };
+}
+
+/**
+ * The `model` a Messages or Responses body names, read exactly as the Gateway reads it (fatal UTF-8, then JSON.parse,
+ * where a repeated key's last value wins), or null when the body is not a JSON object naming one.
+ */
+export function requestModel(body: Uint8Array): string | null {
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(body));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+    const { model } = parsed as { model?: unknown };
+    return typeof model === 'string' ? model : null;
+  } catch {
+    return null;
+  }
+}
+
 // ── Proxying ─────────────────────────────────────────────────────────────────
 
 export interface AiProxyDeps {
@@ -272,6 +340,8 @@ export interface AiProxyDeps {
   readonly enabled?: string;
   /** The stored user token for this sandbox, if usable. */
   readonly credential: () => Promise<string | null>;
+  /** The models the owner's plan includes (`currentModelAccess`); unknown refuses inference as a temporary failure. */
+  readonly modelAccess: () => Promise<AiModelAccess>;
   /** Forget `token` if it is still the stored one (after a gateway 401). */
   readonly dropCredential: (token: string) => Promise<void>;
   readonly fetch: (input: Request) => Promise<Response>;
@@ -290,10 +360,10 @@ const PASS_THROUGH_RESPONSE_HEADERS = [
 const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,200}$/;
 
 /** A proxy-originated error, told apart from gateway codes by the `os_` prefix (plus `not_found`/`body_too_large`, same meaning). */
-export function proxyError(status: number, code: string, message?: string): Response {
+export function proxyError(status: number, code: string, message?: string, headers: Record<string, string> = {}): Response {
   return new Response(JSON.stringify({ error: { code, message, source: 'ezil-os-proxy' } }), {
     status,
-    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' },
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', ...headers },
   });
 }
 
@@ -609,8 +679,21 @@ function safeGatewayError(bytes: Uint8Array | null): Record<string, unknown> {
   for (const field of ['available_micro', 'hold_micro', 'max_affordable_output_tokens', 'input_bound_tokens', 'max_input_tokens']) {
     if (Number.isSafeInteger(raw[field]) && (raw[field] as number) >= 0) error[field] = raw[field];
   }
+  // A used-up credit window (the Gateway's docs/credit-window.md): the member's own window, so Code can say when it
+  // resets, or that a request larger than the whole window will not fit by waiting. Amounts are decimal strings (or
+  // whole numbers), resets_at a timestamp or null (no window started yet), and nothing else of the body crosses.
+  if (error.code === 'window_budget_reached') {
+    for (const field of ['budget_micro', 'used_micro', 'hold_micro']) {
+      const value = raw[field];
+      if ((typeof value === 'string' && /^[0-9]{1,20}$/.test(value)) || (Number.isSafeInteger(value) && (value as number) >= 0)) error[field] = value;
+    }
+    if (raw.resets_at === null || (typeof raw.resets_at === 'string' && WINDOW_RESET.test(raw.resets_at))) error.resets_at = raw.resets_at;
+    if (Number.isSafeInteger(raw.retry_after_seconds) && (raw.retry_after_seconds as number) >= 0) error.retry_after_seconds = raw.retry_after_seconds;
+  }
   return error;
 }
+/** An RFC 3339 timestamp as the Gateway's database writes it (`2026-11-09T21:05:33.123456+00:00`) or in UTC (`…Z`). */
+const WINDOW_RESET = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$/;
 
 /**
  * Handle one request under `/ai` on a code bridge host. Order: route
@@ -657,6 +740,29 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
       return proxyError(413, 'body_too_large', 'Request body is too large.');
     }
     body = bytes;
+  }
+
+  // The models the owner's plan includes (pushed with the token by the Next server). A request for any other model
+  // is answered here: nothing reaches the Gateway, so nothing is held or charged. Only the body's `model` is read.
+  // An unknown plan (none pushed yet, or none fresh) is never "every model": inference waits for the next push, as a
+  // temporary failure that is no billing matter. Reads (models, balance, limits, usage) pass as before.
+  const access = route.method === 'POST' || route.upstreamPath === '/v1/models' ? await deps.modelAccess() : null;
+  if (route.method === 'POST' && access?.known !== true) {
+    log({ status: 503, code: 'os_plan_unavailable' });
+    return proxyError(503, 'os_plan_unavailable', 'EZiL OS could not confirm which models your plan includes yet. Nothing was sent. Try again in a minute.');
+  }
+  const included = access?.known === true ? access.includedModels : null;
+  const includedHeaders: Record<string, string> = included === null ? {} : { [AI_INCLUDED_MODELS_HEADER]: included.join(',') };
+  if (included !== null && body !== undefined) {
+    const model = requestModel(body);
+    if (model === null) {
+      log({ status: 400, code: 'os_invalid_request' });
+      return proxyError(400, 'os_invalid_request', 'The request does not name a model.');
+    }
+    if (!included.includes(model)) {
+      log({ status: 403, code: 'os_model_not_included', model: MODEL_ALIAS.test(model) ? model : null });
+      return proxyError(403, 'os_model_not_included', 'This model is not included in your plan.', includedHeaders);
+    }
   }
 
   const upstreamUrl = new URL(route.upstreamPath.replace(':id', route.requestId ?? ''), deps.gatewayUrl);
@@ -723,6 +829,7 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
     const value = upstream.headers.get(name);
     if (value !== null) outHeaders.set(name, value);
   }
+  if (route.upstreamPath === '/v1/models') for (const [name, value] of Object.entries(includedHeaders)) outHeaders.set(name, value);
   const requestId = upstream.headers.get('x-ezil-request-id');
   // The Gateway's own answer for an opted-in call, HIT or MISS only; for any other call nothing is passed back.
   const upstreamCache = upstream.headers.get('x-ezil-cache');

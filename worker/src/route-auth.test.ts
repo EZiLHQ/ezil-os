@@ -22,8 +22,8 @@
  * one proves the entrypoint starts; this one proves what it routes.
  */
 
-import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, exactCacheScope, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
-import { beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
+import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_MODEL_ACCESS_MAX_AGE_MS, AI_MODEL_ACCESS_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, exactCacheScope, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
+import { afterEach, beforeEach, describe, expect, it, mock, setSystemTime, spyOn } from 'bun:test';
 
 // Must be registered before `./index.ts` is imported (see module doc). The
 // shapes are only what `@cloudflare/sandbox` destructures at import time.
@@ -194,14 +194,18 @@ function fakeSandboxNamespace(options: {
   };
 
   let credential: StoredAiCredential | undefined;
+  // Plans predate these route tests: a verified every-model plan unless a push names a list.
+  let modelAccess: { known: boolean; includedModels?: readonly string[] | null } = { known: true, includedModels: null };
   let nonce: string | null = null;
   let processResult: unknown;
   const impl: Record<string, (...args: unknown[]) => Promise<unknown>> = {
     getAiProxyNonce: async () => nonce,
     getAiCredential: async () => usableAiCredential(credential),
+    getAiModelAccess: async () => modelAccess,
     putAiCredential: async (...args) => {
       const result = chooseAiCredential(credential, args[0] as StoredAiCredential);
       credential = result.keep;
+      if (args[2] !== undefined) modelAccess = { known: true, includedModels: args[2] as readonly string[] | null };
       if (result.stored) calls.aiStored.push(result.keep);
       return { stored: result.stored, expiresAt: result.keep.expiresAt };
     },
@@ -3503,6 +3507,43 @@ describe('AI credential and code-host routes', () => {
     expect(calls.containerFetch).toHaveLength(0);
   });
 
+  it('a pushed plan list reaches the proxy: another model is refused before any upstream call; a malformed list stores nothing', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, AWS_ROUTING_ENABLED: 'on',
+      SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.org', AWS_ORIGIN_ZONE: 'origin.ezil.org', AWS_ORIGIN_ZONE_ALLOWLIST: 'origin.ezil.org',
+      AWS_TUNNELS: { idFromName: (id: string) => id, get: (id: string) => ({ fetch: async () =>
+        Response.json({ record: { sandboxId: id, aiProxyNonce: 'aws-boot-plan' } }) }) } };
+    const push = async (includedModels: unknown) => {
+      const body = JSON.stringify({ accessToken: token(), includedModels });
+      return worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/ai-credential`, { method: 'POST', body,
+        headers: { 'x-ezil-signature': await mintAiCredentialSignature(SECRET, SANDBOX_NAME, new TextEncoder().encode(body), Date.now(), 'POST') } }), env);
+    };
+    const auth = await deriveAiProxyToken(SECRET, SANDBOX_NAME, 'aws-boot-plan');
+    const send = (model: string) => worker.fetch(new Request(`https://aws-8443-${SANDBOX_NAME}-aws.ezil.org/ai/v1/messages`, {
+      method: 'POST', body: JSON.stringify({ model, max_tokens: 16 }), headers: { authorization: `Bearer ${auth}`, 'content-type': 'application/json' } }), env);
+    const realFetch = globalThis.fetch;
+    const upstream: Request[] = [];
+    globalThis.fetch = (async (request: Request) => { upstream.push(request); return Response.json({ ok: true }); }) as typeof fetch;
+    try {
+      for (const bad of [[], ['Gemini'], 'gemini-3.8-flash']) {
+        const res = await push(bad);
+        expect(res.status).toBe(400);
+        expect(await res.json()).toMatchObject({ error: 'included_models_malformed' });
+      }
+      expect(calls.aiStored).toHaveLength(0);
+      expect((await push(['gemini-3.8-flash'])).status).toBe(200);
+      const refused = await send('claude-opus-5-5');
+      expect(refused.status).toBe(403);
+      expect(await refused.json()).toMatchObject({ error: { code: 'os_model_not_included', source: 'ezil-os-proxy' } });
+      expect(upstream).toHaveLength(0);
+      expect((await send('gemini-3.8-flash')).status).toBe(200);
+      expect(upstream).toHaveLength(1);
+      expect((await push(null)).status).toBe(200);
+      expect((await send('claude-opus-5-5')).status).toBe(200);
+      expect(upstream).toHaveLength(2);
+    } finally { globalThis.fetch = realFetch; }
+  });
+
   it('AWS code hosts share the signed credential store and enforce every proxy guard', async () => {
     const { binding, calls } = fakeSandboxNamespace({});
     let nonce: string | null = 'aws-boot-one';
@@ -3751,6 +3792,154 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     await obj.putAiCredential({ token: 'new', expiresAt }, 3);
     await obj.dropAiCredential();
     expect(values.has(AI_CREDENTIAL_STORAGE_KEY)).toBe(false);
+  });
+
+  it('orders the plan list by its own signed time; unknown until a fresh push says, and never extended by a token-only push', async () => {
+    const { obj, values } = await object();
+    const expiresAt = Date.now() + 3600_000;
+    const t = Date.now() - 60_000;
+    const flash = ['gemini-3.8-flash'];
+    const known = (includedModels: readonly string[] | null) => ({ known: true, includedModels });
+    expect(await obj.getAiModelAccess()).toEqual({ known: false });
+    // A push that could not read the plan (no list) leaves it unknown: never every model.
+    await obj.putAiCredential({ token: 'a', expiresAt }, t);
+    expect(await obj.getAiModelAccess()).toEqual({ known: false });
+    await obj.putAiCredential({ token: 'a', expiresAt }, t + 10, flash);
+    expect(await obj.getAiModelAccess()).toEqual(known(flash));
+    // A push signed earlier (a beat that read the plan before a change landed) never overwrites a later one.
+    await obj.putAiCredential({ token: 'a', expiresAt }, t + 9, null);
+    expect(await obj.getAiModelAccess()).toEqual(known(flash));
+    // A later push that keeps the older, longer-lived token still updates the plan; null is an explicit answer.
+    await obj.putAiCredential({ token: 'b', expiresAt: expiresAt - 1000 }, t + 11, null);
+    expect(await obj.getAiCredential()).toBe('a');
+    expect(await obj.getAiModelAccess()).toEqual(known(null));
+    // Token-only pushes keep the last answer only for its own age: they never refresh it.
+    await obj.putAiCredential({ token: 'a', expiresAt }, t + 12, flash);
+    await obj.putAiCredential({ token: 'a', expiresAt }, t + 13);
+    expect(values.get(AI_MODEL_ACCESS_STORAGE_KEY)).toEqual({ includedModels: flash, signedAt: t + 12 });
+    expect(await obj.getAiModelAccess()).toEqual(known(flash));
+    // It restricts and grants nothing: logout, a dropped token and teardown leave it for the next push to replace.
+    await obj.dropAiCredential(undefined, t + 14);
+    await obj.dropAiCredential('a');
+    await obj.dropAiCredential();
+    expect(await obj.getAiCredential()).toBeNull();
+    expect(await obj.getAiModelAccess()).toEqual(known(flash));
+    // A push signed at or before the logout watermark changes neither the token nor the plan.
+    await obj.putAiCredential({ token: 'c', expiresAt }, t + 14, null);
+    expect(await obj.getAiCredential()).toBeNull();
+    expect(values.get(AI_MODEL_ACCESS_STORAGE_KEY)).toEqual({ includedModels: flash, signedAt: t + 12 });
+    // Older than AI_MODEL_ACCESS_MAX_AGE_MS: unknown again, whatever it said.
+    values.set(AI_MODEL_ACCESS_STORAGE_KEY, { includedModels: null, signedAt: Date.now() - AI_MODEL_ACCESS_MAX_AGE_MS - 1000 });
+    expect(await obj.getAiModelAccess()).toEqual({ known: false });
+  });
+
+  // Background work with the browser hidden or closed: one browser push, then only the server's plan-only pushes.
+  // Route signatures, DO storage ordering and the proxy all run for real on a moved clock; only the Gateway is faked.
+  describe('server plan refresh with no browser (accelerated clock)', () => {
+    const FLASH = 'gemini-3.8-flash';
+    const MINUTE = 60_000;
+    async function computer() {
+      const state = await object();
+      state.values.set(AI_PROXY_NONCE_STORAGE_KEY, 'boot');
+      const stub = new Proxy({}, {
+        get(_target, prop) {
+          if (prop === 'then') return undefined;
+          if (typeof prop === 'string' && /^(put|get|drop)Ai/.test(prop)) return state.obj[prop].bind(state.obj);
+          return async () => undefined;
+        },
+      });
+      const env = { Sandbox: { idFromName: () => ({}), get: () => stub }, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_AI_PROXY: 'on' };
+      const push = async (fields: Record<string, unknown>, signedAt = Date.now(), signed = true) => {
+        const body = JSON.stringify(fields);
+        return worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/ai-credential`, { method: 'POST', body,
+          headers: signed ? { 'x-ezil-signature': await mintAiCredentialSignature(SECRET, SANDBOX_NAME, new TextEncoder().encode(body), signedAt, 'POST') } : {} }), env);
+      };
+      const bearer = await deriveAiProxyToken(SECRET, SANDBOX_NAME, 'boot');
+      const send = async (model: string) => {
+        const res = await worker.fetch(new Request(`https://8443-${SANDBOX_NAME}-code.ezil.org/ai/v1/messages`, {
+          method: 'POST', body: JSON.stringify({ model, max_tokens: 16 }),
+          headers: { authorization: `Bearer ${bearer}`, 'content-type': 'application/json' } }), env);
+        return { status: res.status, code: res.status === 200 ? null : ((await res.json()) as { error: { code: string } }).error.code };
+      };
+      return { ...state, push, send };
+    }
+    const realFetch = globalThis.fetch;
+    const upstream: string[] = [];
+    let t0 = 0;
+    const at = (minutes: number) => setSystemTime(new Date(t0 + minutes * MINUTE));
+    beforeEach(() => {
+      t0 = Date.now();
+      upstream.length = 0;
+      globalThis.fetch = (async (request: Request) => {
+        upstream.push(((await request.json()) as { model: string }).model);
+        return Response.json({ ok: true });
+      }) as typeof fetch;
+    });
+    afterEach(() => { setSystemTime(); globalThis.fetch = realFetch; });
+    const browserPush = (c: Awaited<ReturnType<typeof computer>>, includedModels: readonly string[] | null) => c.push({
+      accessToken: `e30.${Buffer.from(JSON.stringify({ sub: 'abcdef01-2345-6789-abcd-ef0123456789', role: 'authenticated',
+        exp: Math.floor(t0 / 1000) + 3600 })).toString('base64url')}.c2ln`, includedModels });
+
+    it('keeps the current plan past its 30 minutes, follows a paid-to-Free change, and still ends with the token', async () => {
+      const c = await computer();
+      expect((await browserPush(c, null)).status).toBe(200);
+      const credential = c.values.get(AI_CREDENTIAL_STORAGE_KEY);
+      // The tab is hidden from here on: the server refreshes the plan every 10 minutes and sends nothing else.
+      for (const minute of [10, 20, 30, 40]) {
+        at(minute);
+        const res = await c.push({ includedModels: null });
+        expect(await res.json()).toMatchObject({ ok: true, planStored: true });
+      }
+      at(45);
+      expect(await c.send('claude-opus-5-5')).toEqual({ status: 200, code: null });
+      expect(upstream).toEqual(['claude-opus-5-5']);
+      // The paid plan ends: the next refresh carries Free's list, and only Flash passes.
+      at(46);
+      await c.push({ includedModels: [FLASH] });
+      expect(await c.send('claude-opus-5-5')).toEqual({ status: 403, code: 'os_model_not_included' });
+      expect(await c.send(FLASH)).toEqual({ status: 200, code: null });
+      expect(upstream).toEqual(['claude-opus-5-5', FLASH]);
+      // A refresh signed before the change, arriving a minute late, never reopens every model: the Worker orders by
+      // the signed time, not by when the push arrives.
+      at(47);
+      expect(await (await c.push({ includedModels: null }, t0 + 45 * MINUTE)).json()).toMatchObject({ ok: true, planStored: false });
+      expect(await c.send('claude-opus-5-5')).toEqual({ status: 403, code: 'os_model_not_included' });
+      // No refresh touched the token: once it expires, a fresh plan is not enough.
+      expect(c.values.get(AI_CREDENTIAL_STORAGE_KEY)).toBe(credential);
+      at(61);
+      await c.push({ includedModels: [FLASH] });
+      expect(await c.send(FLASH)).toEqual({ status: 401, code: 'os_session_missing' });
+      expect(upstream).toEqual(['claude-opus-5-5', FLASH]);
+    });
+
+    it('with no refresh (the plan could not be read) the same call waits for a plan and sends nothing', async () => {
+      const c = await computer();
+      await browserPush(c, null);
+      at(30);
+      expect(await c.send('claude-opus-5-5')).toEqual({ status: 200, code: null });
+      at(31);
+      expect(await c.send('claude-opus-5-5')).toEqual({ status: 503, code: 'os_plan_unavailable' });
+      expect(await c.send(FLASH)).toEqual({ status: 503, code: 'os_plan_unavailable' });
+      expect(upstream).toEqual(['claude-opus-5-5']);
+    });
+
+    it('refuses an unsigned, empty or malformed refresh and stores nothing; a refresh never creates a token', async () => {
+      const c = await computer();
+      expect((await c.push({ includedModels: [FLASH] }, Date.now(), false)).status).toBe(401);
+      for (const [fields, error] of [[{}, 'included_models_missing'], [{ includedModels: [] }, 'included_models_malformed'],
+        [{ includedModels: 'gemini-3.8-flash' }, 'included_models_malformed']] as const) {
+        const res = await c.push(fields);
+        expect(res.status).toBe(400);
+        expect(await res.json()).toMatchObject({ error: error });
+      }
+      // A body that names a token at all, even null, is a credential push and is refused as one.
+      expect((await c.push({ accessToken: null, includedModels: [FLASH] })).status).toBe(400);
+      expect(c.values.has(AI_MODEL_ACCESS_STORAGE_KEY)).toBe(false);
+      expect(await (await c.push({ includedModels: null })).json()).toMatchObject({ ok: true, planStored: true });
+      expect(c.values.has(AI_CREDENTIAL_STORAGE_KEY)).toBe(false);
+      expect(await c.send(FLASH)).toEqual({ status: 401, code: 'os_session_missing' });
+      expect(upstream).toEqual([]);
+    });
   });
 
   it('serializes concurrent starts, reuses their nonce, and rotates when the stopped launcher is restarted', async () => {

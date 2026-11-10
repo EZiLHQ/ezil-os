@@ -237,6 +237,7 @@ jobs:
                    shell/ezil/ui/Settings/sheet-frame-test.mjs \
                    shell/ezil/ui/Settings/upgrade-sheet-test.mjs \
                    shell/ezil/ui/Settings/topup-sheet-test.mjs \
+                   shell/ezil/ui/Settings/billing-recovery-test.mjs \
                    shell/ezil/local-surfaces-test.mjs \
                    shell/ezil/ui/Settings/settings-test.mjs \
                    shell/ezil/ui/Settings/current-computer-test.mjs \

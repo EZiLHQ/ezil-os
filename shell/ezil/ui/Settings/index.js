@@ -238,6 +238,17 @@ export async function openSettingsWindow (ctx = {}) {
         const target = tabs.find(tab => tab.id === initialTab) ?? tabs.find(tab => tab === DEFAULT_TAB) ?? TabComputers;
         $win.find(`.ezil-settings-tab[data-tab="${target.id}"]`).trigger('click');
     };
+    // A launch while open (`registry.js` `relaunched`, after `ezilActivateSettings`) hands each tab its new context,
+    // e.g. Billing's `billingRecovery` from Code. The context this window opened with stays as it was.
+    el_window._ezil_relaunch = (next) => {
+        for ( const tab of tabs ) {
+            try {
+                tab.onRelaunch?.($win, next ?? {});
+            } catch ( err ) {
+                console.error(`[${PHASE}] tab "${tab.id}" failed to take a relaunch`, err);
+            }
+        }
+    };
 
     for ( const tab of tabs ) {
         try {

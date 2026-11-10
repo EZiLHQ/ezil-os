@@ -109,6 +109,8 @@ export type ResolvedModel = {
     topP?: number;
     stream?: boolean;
     toolReserve?: number;
+    /** Listed for an upgrade only: the account's OS plan does not include it (gateway.ts `withPlanLocks`). Never sent. */
+    locked?: boolean;
 };
 
 export type ResolvedConfig = {

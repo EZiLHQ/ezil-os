@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Deterministic EZiL gateway double. No model service or credentials required.
 import http from 'node:http';
-import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -111,8 +111,18 @@ function scriptedContent(body, folder) {
   return [{ type: 'text', text: body.model === KIMI ? 'EZiL Chat: Kimi JSON response. EZIL_KIMI_OK' : 'EZiL Chat' }];
 }
 
+// Opt-in (stateFile, env EZIL_MOCK_STATE_FILE; flash catalogs only): plain words read on every request, so a pass can change
+// the account between reloads. `free` adds what the EZiL OS proxy adds for Free (`x-ezil-os-included-models: gemini-3.8-flash`
+// on /models) and refuses any other model as the proxy does (403 os_model_not_included); `exhausted` answers every
+// message with 402 insufficient_credits and its own UUID request id (recorded in the capture as `requestId`), as the
+// Gateway does when no credits are left.
+export const PLAN_HEADER = 'x-ezil-os-included-models';
+/** The request id of the credit refusal answering request number `n`. */
+export const creditsRequestId = n => `6f1d3a52-9b0e-4c1d-8a7b-${n.toString(16).padStart(12, '0')}`;
+const readState = file => { try { return new Set(readFileSync(file, 'utf8').split(/\s+/).filter(Boolean)); } catch { return new Set(); } };
+
 // slow: a marked answer streams `parts` numbered parts `ms` apart (the image suite leaves a chat mid-answer).
-export function createMock({ token, folder, captureDir, slow: { parts = 20, ms = 1000 } = {}, flash = false }) {
+export function createMock({ token, folder, captureDir, slow: { parts = 20, ms = 1000 } = {}, flash = false, stateFile }) {
   if (!nonempty(token)) throw new Error('a test token is required');
   const slowParts = () => Array.from({ length: parts }, (_, i) => ` part ${i + 1}.`);
   mkdirSync(captureDir, { recursive: true });
@@ -128,9 +138,14 @@ export function createMock({ token, folder, captureDir, slow: { parts = 20, ms =
     captured.push(record);
     writeFileSync(join(captureDir, String(n).padStart(4, '0') + '.body.json'), raw);
     // Readers poll this file while requests arrive: replace it whole, never let them see it half-written.
-    writeFileSync(join(captureDir, 'captured.json.tmp'), JSON.stringify(captured, null, 2));
-    renameSync(join(captureDir, 'captured.json.tmp'), join(captureDir, 'captured.json'));
-    const json = (status, value) => { res.writeHead(status, { 'content-type': 'application/json', 'x-request-id': 'e2e-' + n }); res.end(JSON.stringify(value)); };
+    const save = () => {
+      writeFileSync(join(captureDir, 'captured.json.tmp'), JSON.stringify(captured, null, 2));
+      renameSync(join(captureDir, 'captured.json.tmp'), join(captureDir, 'captured.json'));
+    };
+    save();
+    const state = flash && stateFile ? readState(stateFile) : new Set();
+    record.state = [...state];
+    const json = (status, value, headers = {}) => { res.writeHead(status, { 'content-type': 'application/json', 'x-request-id': 'e2e-' + n, ...headers }); res.end(JSON.stringify(value)); };
     const error = (status, code, message) => json(status, { error: { code, message, request_id: 'e2e-' + n } });
     if (!record.authorized) return error(401, 'os_proxy_unauthorized', 'test bearer token required');
     if (req.method === 'GET' && req.url === '/ai/v1/models') {
@@ -138,9 +153,27 @@ export function createMock({ token, folder, captureDir, slow: { parts = 20, ms =
       const row = (id, name, streaming) => ({ id, object: 'model', name, enabled: true, max_input_tokens: 131072, max_output_tokens: id === KIMI ? 4096 : 8192,
         protocols: ['anthropic-messages'], availability: { state: 'available', reasons: [] }, capabilities: { tool_calling: true, image_input: false, streaming } });
       return json(200, { object: 'list', contract: 'ezil.gateway.models.v1', catalog_ttl_seconds: 60, killswitch: false, pause: null, default_model: FLASH,
-        data: [row(QWEN, 'Qwen3 Coder Next', true), row(KIMI, 'Kimi K3', false), row(FLASH, 'Gemini 3.8 Flash', true)] });
+        data: [row(QWEN, 'Qwen3 Coder Next', true), row(KIMI, 'Kimi K3', false), row(FLASH, 'Gemini 3.8 Flash', true)] }, state.has('free') ? { [PLAN_HEADER]: FLASH } : {});
     }
     if (req.method !== 'POST' || req.url !== '/ai/v1/messages') return error(404, 'not_found', 'unsupported route');
+    if (state.has('free') && body?.model !== FLASH) {
+      return json(403, { error: { code: 'os_model_not_included', message: 'This model is not included in your plan.', source: 'ezil-os-proxy' } }, { [PLAN_HEADER]: FLASH });
+    }
+    if (state.has('exhausted')) {
+      record.requestId = creditsRequestId(n);
+      save();
+      return json(402, { error: { code: 'insufficient_credits', message: 'Insufficient credits.', request_id: record.requestId, available_micro: 0, hold_micro: 1200 } },
+        { 'x-ezil-request-id': record.requestId });
+    }
+    // `window`: the Gateway's used-up credit window (docs/credit-window.md), a plan allowance no top-up lifts: 429 with
+    // the reset as Retry-After, budget, use and hold as decimal strings, and resets_at.
+    if (state.has('window')) {
+      record.requestId = creditsRequestId(n);
+      save();
+      return json(429, { error: { code: 'window_budget_reached', message: "This account's AI credit window budget is reached.", request_id: record.requestId,
+        budget_micro: '5000000', used_micro: '4800000', hold_micro: '400000', resets_at: new Date(Date.now() + 5400_000).toISOString(), retry_after_seconds: 5400 } },
+        { 'x-ezil-request-id': record.requestId, 'retry-after': '5400' });
+    }
     const invalid = validateBody(body, raw.length, flash ? [QWEN, KIMI, FLASH] : [QWEN, KIMI]);
     if (invalid) return error(invalid.status, invalid.code, invalid.message);
     let scripted;
@@ -175,6 +208,7 @@ export function createMock({ token, folder, captureDir, slow: { parts = 20, ms =
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {
   const port = Number(process.argv[2] ?? 4142);
-  const server = createMock({ token: process.env.EZIL_E2E_TEST_TOKEN ?? 'lanec-e2e-only', folder: process.argv[3] ?? '/home/neko/project', captureDir: process.argv[4] ?? '/tmp/copilot-ezil-mock', flash: process.env.EZIL_MOCK_FLASH === '1' });
+  const server = createMock({ token: process.env.EZIL_E2E_TEST_TOKEN ?? 'lanec-e2e-only', folder: process.argv[3] ?? '/home/neko/project', captureDir: process.argv[4] ?? '/tmp/copilot-ezil-mock', flash: process.env.EZIL_MOCK_FLASH === '1',
+    stateFile: process.env.EZIL_MOCK_STATE_FILE || undefined });
   server.listen(port, '127.0.0.1', () => console.log('EZiL messages mock listening on loopback port ' + port));
 }
