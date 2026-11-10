@@ -1,4 +1,6 @@
-// One-shot feedback captures. Raw canvases must pass through the redaction editor.
+// One-shot feedback captures. Tier B/C canvases (a picked tab, the desktop frame) and uploads must pass
+// through the redaction editor. The tier A window snapshot below is already masked (private fields and
+// frames) and excludes the feedback UI, so feedback.js may attach it by default; it stays editable.
 import { capture_target_registered, request_frame_capture } from '../frame-controls-bridge.js';
 import { fit_long_edge } from './redact-editor.js';
 

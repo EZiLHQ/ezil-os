@@ -162,27 +162,26 @@ try {
             const dialog = document.querySelector('[data-role="upgrade-sheet"]');
             const rect = dialog.getBoundingClientRect();
             const ends = dialog.querySelector('[data-role="trial-ends"]');
-            const button = dialog.querySelector('[data-action="trial-continue"]');
-            const b = button.getBoundingClientRect();
+            const terms = dialog.querySelector('[data-role="trial-terms"]');
+            const box = terms?.getBoundingClientRect();
             return {
                 ends: ends?.textContent.replace(/\s+/g, ' ').trim() ?? null, datetime: ends?.querySelector('time')?.getAttribute('datetime') ?? null,
-                charge: dialog.querySelector('[data-role="trial-charge"]')?.textContent ?? null,
+                charge: dialog.querySelector('[data-role="trial-charge"]')?.textContent.replace(/\s+/g, ' ').trim() ?? null,
+                termsVisible: !! box && box.width > 0 && box.height > 0,
+                continueButton: !! dialog.querySelector('[data-action="trial-continue"]'), stripe: !! dialog.querySelector('[data-role="fake-stripe"]'),
                 inside: rect.left >= -0.5 && rect.right <= innerWidth + 0.5, overflow: dialog.scrollWidth - dialog.clientWidth,
-                continueHeight: Math.round(b.height), continueWidth: Math.round(b.width), checkouts: window.calls.filter(call => call.method === 'billing.createCheckout').length,
+                checkouts: window.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input),
             };
         }, { offer, END });
-        push(`${label} · confirmation: the exact quoted end in the browser's zone, with the zone's name`,
+        push(`${label} · terms: the exact quoted end in the browser's zone, with the zone's name`,
             t.ends === 'Your free month ends on Saturday, February 27, 2027 at 7:00 PM Pacific Standard Time (America/Los_Angeles).' && t.datetime === END, `${t.ends} | ${t.datetime}`);
-        push(`${label} · confirmation: a payment method is required and $20.00 is charged monthly from that date`,
-            t.charge === 'A payment method is required. $20.00 is charged monthly from that date unless you cancel.', t.charge);
-        push(`${label} · confirmation: no checkout before Continue`, t.checkouts === 0, `${t.checkouts}`);
-        push(`${label} · confirmation: the sheet stays inside the viewport with no horizontal overflow`, t.inside && t.overflow <= 0, JSON.stringify(t));
-        push(`${label} · confirmation: Continue is a real target (at least 32 px tall)`, t.continueHeight >= 32 && t.continueWidth >= 44, `${t.continueWidth}x${t.continueHeight}`);
-        if ( shots ) await page.screenshot({ path: path.join(shots, `trial-confirm-${viewport.width}.png`) });
-        await page.click('[data-action="trial-continue"]');
-        await page.waitForSelector('[data-role="fake-stripe"]');
-        const echoed = await page.evaluate(() => window.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input));
-        push(`${label} · Continue: createCheckout echoes exactly the quoted end`, JSON.stringify(echoed) === JSON.stringify([{ sku: 'standard_monthly_v3', trial: { trialEndsAt: END } }]), JSON.stringify(echoed));
+        push(`${label} · terms: a payment method is required and $20.00 is charged monthly from that date`,
+            t.charge === 'A payment method is required. $20.00 is charged monthly from that date unless you cancel. Cancel any time before then in Settings → Billing and you pay nothing.', t.charge);
+        push(`${label} · terms stay visible beside the payment form (also when the summary is collapsed)`, t.termsVisible, JSON.stringify(t));
+        push(`${label} · no Continue step: checkout opens on its own and echoes exactly the quoted end`,
+            ! t.continueButton && t.stripe && JSON.stringify(t.checkouts) === JSON.stringify([{ sku: 'standard_monthly_v3', trial: { trialEndsAt: END } }]), JSON.stringify(t));
+        push(`${label} · the sheet stays inside the viewport with no horizontal overflow`, t.inside && t.overflow <= 0, JSON.stringify(t));
+        if ( shots ) await page.screenshot({ path: path.join(shots, `trial-terms-${viewport.width}.png`) });
         if ( shots && viewport.width === 1440 ) await page.screenshot({ path: path.join(shots, 'trial-checkout-1440.png') });
         await context.close();
     }

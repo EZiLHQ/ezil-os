@@ -118,6 +118,8 @@
 .ezil-upgrade-sheet [hidden] { display: none; }
 .ezil-upgrade-sheet [data-role="upgrade-success"] > span { color: var(--accent); font-size: 28px; }
 .ezil-upgrade-payment [data-role="checkout-state"] > p:empty { display: none; }
+.ezil-upgrade-payment [data-role="trial-terms"] { margin: 0 0 12px; font-size: 13px; line-height: 1.45; }
+.ezil-upgrade-payment [data-role="trial-terms"] p { margin: 0 0 4px; }
 
 /* Viewport width, rather than Settings width, decides when payment stacks. */
 .ezil-upgrade-backdrop.is-compact .ezil-upgrade-sheet {

@@ -51,7 +51,7 @@ export default {
                 for (const report of reports) {
                     const row = document.createElement('p');
                     const status = { new: 'New', investigating: 'Investigating', resolved: 'Resolved' }[report.status] || 'Received';
-                    row.textContent = `${status} · ${String(report.descriptionPreview || '').slice(0, 140)} · ${report.id}`;
+                    row.textContent = `${status} · ${String(report.descriptionPreview || '(No description)').slice(0, 140)} · ${report.id}`;
                     host.append(row);
                 }
             } catch { if (current()) host.textContent = 'Could not load reports. Try Refresh status.'; }

@@ -180,7 +180,8 @@ export const feedbackSubmitSchema = z
         v: z.literal(1),
         clientRequestId: z.string().uuid(),
         category: z.enum(FEEDBACK_CATEGORIES),
-        description: z.string().trim().min(1).max(FEEDBACK_LIMITS.descriptionMax),
+        // A blank description is a valid report: the form has one optional field, and the attachments can carry it.
+        description: z.string().trim().max(FEEDBACK_LIMITS.descriptionMax),
         computerId: z.string().uuid().nullable().optional(),
         diagnostics: diagnosticsSchema.nullable().optional(),
         screenshot: z
