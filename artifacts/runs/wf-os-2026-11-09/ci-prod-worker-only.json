@@ -1,0 +1,9 @@
+{
+  "taskId": "ci-prod-worker-only",
+  "runId": "wf-os-2026-11-09",
+  "status": "done",
+  "doneRung": "workflow-validators-and-release-contract-tests-green",
+  "evidence": "Worker-only production deploy path shipped as new preview.yml#worker-production job (legacy production job byte-for-byte unchanged). Reuses changes/images, shared production lease + deploy-production group, release-state prepare/container-version/rollout-target/await-container-rollout, verify-cloud-deployment worker mode. New Vercel-free release-state: readWorkerState + assertWorkerOwner + workerVersionId (UUID guard before GITHUB_OUTPUT) + worker-capture/-rollback-guard/-container-rollback/-rollback-check modes. GREEN (final): env-contract scan decision ok; env-contract.test.mjs 19 pass/0 fail; node --test e2e/{cloud-ci,hosted-continuity-contract,live-check,billing-staging-journey}.test.mjs = 192 tests, 191 pass, 0 fail, 1 skip; check-os-workflows.py passed; staging-lock.test.py ok; actionlint v1.7.7 on preview.yml EXIT 0. Only skip: '@supabase/ssr writes the same cookies...' # app dependencies are not installed (pre-existing green-by-absence, runs in CI). Mutation-proved 4 guards: assertWorkerOwner (weaken->2 RED), workerVersionId (weaken->RED), check-os-workflows worker-rollback-guard requirement (RED), check-os-workflows lease-unconditional (continue-on-error->RED), env-contract scan+validator contract-assert removal (RED); all restored GREEN. NOT RUN: e2e/production-migrations.test.mjs (docker, untouched area, CI runs it). Local PyYAML 6.0.1 vs CI 6.0.2. HAND-OFF: environment-contract.json is shared+checksum-pinned (docs/ENVIRONMENT-CONTRACT.md); same productionJobs entry + pin 6266d05e... must land in sibling repos (ezil-work/ezil-ai-gateway; old pin e84392d3... seen in EZiL-Works.leads-20261014/open-os/tools/ci-runtime-env-contract.test.mjs).",
+  "startedAt": "2026-11-09T11:31:21Z",
+  "updatedAt": "2026-11-09T12:45:00Z"
+}

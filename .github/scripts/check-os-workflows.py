@@ -85,14 +85,16 @@ triggers = preview.get('on', preview.get(True))
 assert set(triggers) == {'push', 'workflow_dispatch'}
 assert triggers['push'] == {'branches': ['preview', 'main'], 'tags': ['v*']}
 assert set(triggers['workflow_dispatch']) == {'inputs'}
-assert set(triggers['workflow_dispatch']['inputs']) == {'deploy_production'}
+assert set(triggers['workflow_dispatch']['inputs']) == {'deploy_production', 'deploy_worker_only'}
 confirm = triggers['workflow_dispatch']['inputs']['deploy_production']
 assert confirm['type'] == 'boolean' and confirm['default'] is False and 'required' not in confirm
-# Only the production job gate reads it, as a boolean (github.event.inputs is a string).
-assert preview_text.count('inputs.deploy_production') == 1 and 'github.event.inputs' not in preview_text
+worker_only = triggers['workflow_dispatch']['inputs']['deploy_worker_only']
+assert worker_only['type'] == 'boolean' and worker_only['default'] is False and 'required' not in worker_only
+# Each production job gate reads exactly its own boolean (github.event.inputs is a string).
+assert preview_text.count('inputs.deploy_production') == 1 and preview_text.count('inputs.deploy_worker_only') == 1 and 'github.event.inputs' not in preview_text
 assert preview['permissions'] == {'contents': 'read'}
 assert preview['concurrency'] == {'group': 'os-live-${{ github.ref }}', 'cancel-in-progress': False}
-assert set(preview['jobs']) == {'changes', 'images', 'preview', 'production'}
+assert set(preview['jobs']) == {'changes', 'images', 'preview', 'production', 'worker-production'}
 assert not (root / '.github/workflows/live.yml').exists()
 assert 'live.yml' not in (root / '.github/workflows/ci.yml').read_text()
 
@@ -153,7 +155,7 @@ assert 'inputs.' not in lookup['with']['script'] and '.event ===' not in lookup[
 receipt_jobs = {name for name, job in preview['jobs'].items() for step in job.get('steps', [])
                 if step.get('uses', '').startswith('actions/upload-artifact@')
                 and step['with']['name'].startswith('live-evidence-')}
-assert receipt_jobs == {'preview', 'production'}, receipt_jobs
+assert receipt_jobs == {'preview', 'production', 'worker-production'}, receipt_jobs
 assert 'live-evidence' not in (root / '.github/workflows/image.yml').read_text()
 evidence = next(step for step in changes['steps'] if step.get('id') == 'deployed_evidence')
 assert evidence['continue-on-error'] is True
@@ -493,6 +495,107 @@ for job_name, branch, environment, url, deploy_name, check_id in (
         if re.search(r'wrangler (?:deploy|rollback)|vercel deploy|vercel-api.mjs promote|release-state.mjs (?:prepare|capture|container-rollback|rollback-check|rollback-guard|container-version|rollout-target)|production-migrations.mjs apply', step.get('run', '')):
             assert main in step.get('if', ''), step.get('name')
     assert 'exit 1' in fail['run'] and not fail.get('continue-on-error', False)
+
+# The Worker-only production path ships ONLY the ezil-os-worker Cloudflare Worker.
+# It reuses the shared production lease and the deploy-production concurrency group,
+# captures and recovers the Worker (and, on an image change, the container) under an
+# ownership guard, and must never run production migrations, a Vercel deploy, or a
+# Vercel readback. AWS serves os.ezil.work and is only probed read-only here.
+wonly = preview['jobs']['worker-production']
+assert wonly['environment'] == 'production' and wonly['runs-on'] == 'ubuntu-latest'
+assert wonly['needs'] == ['changes', 'images']
+assert wonly['concurrency'] == {'group': 'deploy-production', 'cancel-in-progress': False}
+assert wonly['permissions'] == {'contents': 'read', 'packages': 'read', 'actions': 'read', 'id-token': 'write'}
+assert wonly['env']['EZIL_WORKER_NAME'] == 'ezil-os-worker' and wonly['env']['EZIL_DEPLOY_SHA'] == '${{ github.sha }}'
+assert wonly['env']['EZIL_E2E_WORKER'] == '${{ vars.OS_WORKER_URL }}'
+# Main dispatch plus its own confirmation only: never a push/merge, a tag, or the legacy input.
+assert ' '.join(wonly['if'].split()) == (
+    "${{ !cancelled() && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.deploy_worker_only == true && "
+    "needs.changes.result == 'success' && "
+    "(needs.images.result == 'success' || needs.images.result == 'skipped') }}")
+wsteps = wonly['steps']
+wby_name = {step.get('name'): step for step in wsteps}
+wby_id = {step['id']: step for step in wsteps if 'id' in step}
+wpos = lambda step: wsteps.index(step)
+# The contract assertion is the one fail-closed step right after setup-node.
+wcommand = 'node .github/scripts/env-contract.mjs assert-job --repo ezil-os --environment production'
+wchecks = [step for step in wsteps if step.get('run') == wcommand]
+assert len(wchecks) == 1 and set(wchecks[0]) <= {'name', 'id', 'run'}
+assert wpos(wchecks[0]) == next(
+    i for i, step in enumerate(wsteps) if step.get('uses', '').startswith('actions/setup-node@')) + 1
+for credential in contract['productionCredentialNames']:
+    assert credential not in yaml.safe_dump({k: v for k, v in wonly.items() if k != 'steps'})
+# Shared lease and deploy-production group only; no competing outer lock is added.
+wcreds = [step for step in wsteps if step.get('uses', '').startswith('aws-actions/configure-aws-credentials@')]
+assert len(wcreds) == 1 and wcreds[0]['with']['role-to-assume'] == 'arn:aws:iam::452630323510:role/ezil-os-staging-lease'
+assert wby_id['production_lease']['run'] == 'python3 .github/scripts/staging-lock.py acquire --scope shared-production --owner "$LEASE_OWNER" --ttl 7200 --wait 1200'
+wrelease = wby_name['Release shared production lease']
+assert wrelease['if'] == "always() && steps.production_lease.outcome == 'success'"
+assert wrelease['run'] == 'python3 .github/scripts/staging-lock.py release --scope shared-production --owner "$LEASE_OWNER"'
+assert wsteps[-1] == wrelease
+# Capture prior Worker and container identity before any mutation; archive it.
+wcapture = wby_id['worker_capture']
+assert wcapture['run'] == 'node .github/scripts/release-state.mjs worker-capture'
+# The shared lease fences every mutation: its AWS credentials and the acquire step
+# are unconditional and come before the first identity capture, so no mutation can
+# run outside the lease.
+for step in (wcreds[0], wby_id['production_lease']):
+    assert not {'if', 'continue-on-error', 'shell'} & set(step)
+assert wpos(wcreds[0]) < wpos(wby_id['production_lease']) < wpos(wcapture)
+assert wby_name['Preserve recovery identities before Worker mutation']['with']['if-no-files-found'] == 'error'
+# Superseded-main guard before the deploy: a github-script check plus the in-step gh api recheck.
+wcurrent = wby_id['current_main']
+assert wcurrent['uses'] == 'actions/github-script@v8'
+assert "github.rest.git.getRef({ ...context.repo, ref: 'heads/main' })" in wcurrent['with']['script']
+assert wpos(wcapture) < wpos(wcurrent) < wpos(wby_id['worker'])
+# Read-only AWS app probe: a GET of /api/health that never asserts the release SHA or mutates.
+whealth = wby_id['aws_health']
+assert "fetch('https://os.ezil.work/api/health'" in whealth['run']
+assert 'EZIL_DEPLOY_SHA' not in whealth['run'] and 'POST' not in whealth['run']
+assert wpos(whealth) < wpos(wby_id['worker'])
+# Dockerfile.release and container rollout handling when the image changed.
+wprepare = wby_name['Prepare Dockerfile.release from the tested image']
+assert wprepare['if'] == "needs.changes.outputs.image_changed == 'true'"
+assert 'node .github/scripts/release-state.mjs prepare' in wprepare['run']
+assert wby_id['container_before']['run'] == 'node .github/scripts/release-state.mjs container-version'
+assert wby_id['container_before']['if'] == "needs.changes.outputs.image_changed == 'true'"
+wrollout = wby_id['rollout']
+assert wrollout['if'] == "needs.changes.outputs.image_changed == 'true'"
+assert 'release-state.mjs rollout-target' in wrollout['run'] and 'node e2e/await-container-rollout.mjs' in wrollout['run']
+# Deploy the Worker with a git: message and an in-step superseded-main recheck.
+wworker = wby_id['worker']
+assert wworker['working-directory'] == 'worker'
+assert './node_modules/.bin/wrangler deploy "${args[@]}" --containers-rollout "$rollout" --message "git:$EZIL_DEPLOY_SHA"' in wworker['run']
+assert 'gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq \'.object.sha\'' in wworker['run']
+assert '[[ "$current_main" == "$EZIL_DEPLOY_SHA" ]] ||' in wworker['run']
+# Worker identity verification uses the Cloudflare-only mode; no Vercel or app URL.
+widentity = wby_id['identity']
+assert widentity['run'] == 'node e2e/verify-cloud-deployment.mjs worker > live-evidence/deployment-identity.json'
+assert wpos(wworker) < wpos(wrollout) < wpos(widentity)
+# Ownership-guarded recovery: guard, Worker rollback to the captured version, container
+# restore when the image changed, bounded readback, then fail.
+wfailset = "always() && (steps.worker.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure')"
+wguard = wby_id['rollback_guard']
+assert wguard['if'] == wfailset + " && steps.worker_capture.outcome == 'success'"
+assert 'node .github/scripts/release-state.mjs worker-rollback-guard' in wguard['run']
+assert 'no rollback mutations will run' in wguard['run'] and 'exit 1' in wguard['run']
+wguarded = wfailset + " && steps.rollback_guard.outcome == 'success'"
+wrollback = wby_name['Roll back production Worker']
+assert wrollback['if'] == wguarded
+assert wrollback['run'] == "./node_modules/.bin/wrangler rollback '${{ steps.worker_capture.outputs.worker_version }}' -y"
+wcontainer = wby_name['Restore previous container image and await rollback rollout']
+assert wcontainer['if'] == wguarded + " && needs.changes.outputs.image_changed == 'true'"
+assert wcontainer['run'] == 'node .github/scripts/release-state.mjs worker-container-rollback'
+wcheck = wby_name['Verify production Worker recovery']
+assert wcheck['if'] == wguarded and 'release-state.mjs worker-rollback-check' in wcheck['run']
+assert wby_name['Fail after production Worker recovery']['if'] == wfailset
+for step in (wguard, wrollback, wcontainer, wcheck):
+    assert wpos(widentity) < wpos(step)
+# NEGATIVE: the Worker-only path never touches Vercel, migrations, Supabase, an app
+# URL, or the Vercel-coupled release-state modes.
+wtext = yaml.safe_dump(wonly)
+assert not re.search(r'vercel|production-migrations|EZIL_E2E_APP|SUPABASE', wtext, re.I)
+assert not re.search(r'release-state\.mjs (?:capture|record|rollback-guard|container-rollback|rollback-check|vercel-rollback)\b', wtext)
 
 # The port requires only the existing environment-scoped secrets and variables. The two
 # NEXT_PUBLIC_SUPABASE_* values are public and only feed the live check's sign-in.

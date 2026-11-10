@@ -10,7 +10,7 @@ const manifestProject = loadManifestProject(root);
 const workflows = readWorkflows(root);
 
 test('environment contract matches the shared Universe checksum', () => {
-  assert.equal(sha256, 'e84392d3521d318373aa56991ced132c441057c3c136c5d97dc8fb850493cae8');
+  assert.equal(sha256, '6266d05e9d58bff9028990462b8b618c68e18509ad9029c4dc9020ed0c7ca2e9');
 });
 
 test('environment contract accepts the OS production migration manifest', () => {
