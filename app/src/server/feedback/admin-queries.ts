@@ -9,7 +9,7 @@ import { z } from 'zod';
 
 import { isFeedbackAdmin } from './admin';
 import { recordAccess, type FeedbackAccess, type FeedbackDb } from './access-log';
-import { FEEDBACK_LIMITS } from './types';
+import { FEEDBACK_LIMITS, FEEDBACK_STATUSES } from './types';
 
 export interface AdminReportSummary {
     id: string;
@@ -20,6 +20,7 @@ export interface AdminReportSummary {
     computerId: string | null;
     diagnostics: unknown;
     deploySha: string | null;
+    status: string;
 }
 
 export interface AdminReport extends Omit<AdminReportSummary, 'descriptionPreview'> {
@@ -44,6 +45,7 @@ export interface FeedbackAdminQueries {
     findReport: (id: string) => Promise<AdminReport | null>;
     findScreenshot: (id: string) => Promise<AdminScreenshot | null>;
     deleteReport: (id: string) => Promise<void>;
+    updateStatus: (id: string, status: typeof FEEDBACK_STATUSES[number]) => Promise<boolean>;
 }
 
 const reportIdSchema = z.string().uuid();
@@ -70,7 +72,7 @@ export function feedbackAdminQueries(db: FeedbackDb): FeedbackAdminQueries & Pic
             return rowsOf<AdminReportSummary>(await db.execute(sql`
                 SELECT r.id, r.created_at AS "createdAt", r.category,
                     left(r.description, ${FEEDBACK_LIMITS.descriptionPreview}) AS "descriptionPreview",
-                    left(r.computer_id::text, 8) AS "computerId", r.diagnostics, r.deploy_sha AS "deploySha",
+                    left(r.computer_id::text, 8) AS "computerId", r.diagnostics, r.status, r.deploy_sha AS "deploySha",
                     EXISTS (SELECT 1 FROM ezil_feedback_attachments a WHERE a.report_id = r.id) AS "hasScreenshot"
                 FROM ezil_feedback_reports r
                 WHERE r.id IN (${sql.join(ids.map((id) => sql`${id}`), sql`, `)})
@@ -90,6 +92,10 @@ export function feedbackAdminQueries(db: FeedbackDb): FeedbackAdminQueries & Pic
                 SELECT bytes, content_type AS "contentType"
                 FROM ezil_feedback_attachments WHERE report_id = ${id} LIMIT 1
             `))[0] ?? null;
+        },
+        async updateStatus(id, status) {
+            const rows = rowsOf(await db.execute(sql`UPDATE ezil_feedback_reports SET status = ${status} WHERE id = ${id} RETURNING id`));
+            return rows.length > 0;
         },
         async deleteReport(id) {
             // One atomic statement. The dependency on the CTE completes the
@@ -169,4 +175,15 @@ export async function handleFeedbackScreenshot(
         // An audit failure must not expose even part of the screenshot.
         return new Response(null, { status: 500, headers });
     }
+}
+
+/** Re-authenticated admin operation; audit intent before changing persisted state. */
+export async function updateFeedbackStatus(id: unknown, status: unknown,
+    deps: FeedbackAdminContext & Pick<FeedbackAdminQueries, 'updateStatus'>): Promise<boolean> {
+    const userId = adminId(deps);
+    const parsed = reportIdSchema.safeParse(id);
+    const state = z.enum(FEEDBACK_STATUSES).safeParse(status);
+    if (!userId || !parsed.success || !state.success) return false;
+    await deps.recordAccess({ reportId: parsed.data, adminUserId: userId, action: `status_${state.data}` });
+    return deps.updateStatus(parsed.data, state.data);
 }

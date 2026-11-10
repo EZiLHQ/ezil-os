@@ -27,7 +27,7 @@ import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { JSDOM } from 'jsdom';
 import { scanCopy } from '../../../../e2e/billing-e2e-lib.mjs';
-import { summaryV3 } from './billing-v3-fixtures.mjs';
+import { summaryV3, trialSummaryV3 } from './billing-v3-fixtures.mjs';
 import { honestyBans, v3CopyForAudit } from './billing-copy-test-helpers.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -66,6 +66,12 @@ const packs = [
 ];
 const EZIL_ID = 'https://ezil.work/login?method=ezil-id&returnUrl=%2Fos%3Fsettings%3Dbilling';
 function billingState (name) {
+    // Standard trial: the server's own combinations (billing-v3-fixtures.mjs), with this table's top-up catalog.
+    if ( name.startsWith('trial-') ) {
+        const s = trialSummaryV3(name.slice('trial-'.length));
+        s.ai.state = 'ok'; s.ai.balanceState = 'ok'; s.actions.topup = true; s.catalog.packs = packs;
+        return s;
+    }
     const tier = name.startsWith('free') || name === 'files_on_aws' || name.startsWith('needs') || name.startsWith('activating') ? 'free'
         : name.startsWith('standard') || name === 'upgrade_pending' || name === 'incomplete' || name === 'paused-standard' ? 'standard' : 'premium';
     const s = summaryV3(tier);
@@ -98,6 +104,11 @@ const STATES = {
     free: 'Upgrade to Standard', standard: 'Upgrade to Premium', premium: null, 'premium-low': 'Add AI credits', 'premium-exhausted': 'Add AI credits',
     grace: 'Update payment method', past_due: 'Update payment method', cancels: 'Resume plan', upgrade_pending: 'Finish payment', incomplete: 'Finish payment',
     'paused-standard': 'Upgrade to Premium', 'paused-premium': null, files_on_aws: 'Upgrade to Standard', needs_ezil_id: 'Upgrade to Standard', activating: 'Upgrade to Standard',
+    // Standard trial: the free month replaces Free's primary; a live trial has none (never an upgrade); ending resumes;
+    // a failed first charge updates the payment method; a first charge still being collected has none (nothing
+    // failed: the portal is a secondary). Ineligible keeps the paid Standard checkout.
+    'trial-offer': 'Start your free month', 'trial-ineligible': 'Upgrade to Standard', 'trial-trialing': null, 'trial-ending': 'Resume plan',
+    'trial-payment_failed': 'Update payment method', 'trial-payment_pending': null,
 };
 
 await check('Billing: at most ONE primary button in every page state, and it is the state\'s own CTA', () => {
@@ -228,16 +239,22 @@ await check('Billing: needs_ezil_id shows waiting credits, the EZiL ID link and 
     const unsafe = billingState('needs_ezil_id'); unsafe.actions.ezilId = 'javascript:alert(1)';
     assert.equal(fragment(summaryV3Html(unsafe)).querySelector('a[data-action="ezil-id"]'), null, 'only an http(s) or same-site link');
 });
-await check('Billing: the AI top-up is a closed disclosure, only when enrolled with packs', () => {
+await check('Billing: Add AI credits is one card and one balance control into the same dialog, only when enrolled', () => {
     const el = fragment(summaryV3Html(billingState('premium')));
-    const topup = el.querySelector('details[data-role="ai-topup"]');
-    assert.ok(topup, 'disclosure exists');
-    assert.equal(topup.open, false);
-    assert.match(clean(topup.querySelector('summary')), /Add AI credits/);
-    assert.equal(topup.querySelectorAll('[data-action="topup"]').length, 2);
-    for ( const button of topup.querySelectorAll('button') ) assert.ok(! button.classList.contains('ezil-settings-btn-primary'));
+    assert.equal(el.querySelector('details[data-role="ai-topup"]'), null, 'no buried disclosure');
+    const topup = el.querySelector('section[data-role="ai-topup"]');
+    assert.ok(topup, 'card exists');
+    assert.match(clean(topup.querySelector('h4')), /Add AI credits/);
+    assert.equal(topup.querySelectorAll('[data-action="topup"]').length, 1, 'one entry, not one checkout per pack');
+    const meter = el.querySelector('#ai-credits [data-action="topup"]');
+    assert.ok(meter, 'Add credits beside the balance');
+    // WCAG 2.5.3: the accessible name is the visible label (no aria-label that a speech user would not say).
+    assert.equal(meter.getAttribute('aria-label'), null);
+    assert.equal(clean(meter), 'Add credits');
+    for ( const button of [...topup.querySelectorAll('button'), meter] ) assert.ok(! button.classList.contains('ezil-settings-btn-primary'));
     const none = billingState('premium'); none.actions.topup = false;
     assert.equal(fragment(summaryV3Html(none)).querySelector('[data-role="ai-topup"]'), null);
+    assert.equal(fragment(summaryV3Html(none)).querySelector('[data-action="topup"]'), null);
 });
 await check('Billing: three plan cards with configurations, storage and credits; the current one says "Current plan"', () => {
     for ( const name of ['free', 'standard', 'premium'] ) {
@@ -374,6 +391,25 @@ await check('Billing and Usage: storage is measured in the disk\'s own GiB, so a
     assert.match(clean(section), /3\.4 GB left/);
 });
 
+await check('Billing: an unmeasured AWS disk shows its size and "not measured yet"; a computer without a disk figure says it is not measured', () => {
+    const s = billingState('standard'); s.computer.disk = { provisionedGiB: 50, usedBytes: null, growsOnSwitch: false };
+    const row = fragment(summaryV3Html(s)).querySelector('[data-role="meter-storage"]');
+    // The disk's size, as before the sampler existed; no "Measuring…" that may wait on a host image rollout.
+    assert.equal(row.querySelector('.ezil-billing-meter-value').textContent, '50 GB');
+    assert.match(clean(row), /50 GB disk for your projects/);
+    assert.match(clean(row), /Space used isn't measured yet\./);
+    assert.equal(row.querySelector('[role="meter"]'), null, 'no bar without a measurement');
+    assert.doesNotMatch(clean(row), /Measuring…|\b0 (MB|GB)\b|used of your|left|on this computer/);
+    const free = fragment(summaryV3Html(billingState('free'))).querySelector('[data-role="meter-storage"]');
+    assert.match(clean(free), /Space used isn't measured on this computer\./);
+    assert.doesNotMatch(clean(free), /Measuring…|measured yet|\d+ GB/);
+    // Positive control: measured, the same disk shows a bar, used and left.
+    s.computer.disk.usedBytes = '0';
+    const measured = fragment(summaryV3Html(s)).querySelector('[data-role="meter-storage"]');
+    assert.ok(measured.querySelector('[role="meter"]')); assert.match(clean(measured), /50 GB left/);
+    assert.doesNotMatch(clean(measured), /Measuring…|isn't measured/);
+});
+
 // ── Computer: source module with its imports stubbed (computers-test Part A) ──
 globalThis.__dSession = { currentComputer: () => null, payload: () => null };
 const computersSrc = read('tabs/computers.js')
@@ -403,7 +439,7 @@ await check('Computer: tiles sell — title, one benefit line, the weight note, 
         const card = tile(el, size);
         assert.equal(clean(card.querySelector('[data-role="config-title"]')), title);
         assert.ok(clean(card.querySelector('[data-role="config-benefit"]')).length > 10, `${size} has a benefit line`);
-        if ( weight ) assert.match(clean(card), new RegExp(weight.replace(/[×]/g, '×')));
+        if ( weight ) assert.ok(clean(card).includes(weight));
     }
     for ( const size of ['cmp-4', 'cmp-8'] ) {
         const card = tile(el, size);
@@ -641,7 +677,8 @@ await check('Feedback: the dialog copy passes scanCopy', () => {
 });
 await check('Feedback: the dialog is dark with an accent primary, through tokens only', () => {
     const css = read('../feedback/feedback.css').replace(/\/\*[\s\S]*?\*\//g, '');
-    const rule = selector => (css.match(new RegExp(`(?:^|\\})\\s*${selector.replace(/[.[\]()*"=]/g, '\\$&')}\\s*\\{([^}]*)\\}`)) ?? [])[1] ?? '';
+    const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const rule = selector => (css.match(new RegExp(`(?:^|\\})\\s*${escapeRe(selector)}\\s*\\{([^}]*)\\}`)) ?? [])[1] ?? '';
     const dialog = rule('.ezil-feedback-dialog');
     assert.match(dialog, /background:\s*var\(--/);
     assert.match(dialog, /color:\s*var\(--/);

@@ -1,10 +1,14 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
 import { ConfigError, describeConfig, parseModelsConfig, type ResolvedConfig, type ResolvedModel } from './config';
-import { forgetGatewayModels } from './gateway';
+import { forgetGatewayModels, gatewayModels } from './gateway';
+import { isAppFailure, type AppFailure } from './failure';
+import { CompactionNotice } from './compaction-notice';
 import { EZiLAIStatus } from './status';
 import { EZiLModelsProvider } from './provider';
+import { PARTICIPANT_ID, registerNoToolsParticipant } from './participant';
 import type { Usage } from './types';
 
 export const DEFAULT_CONFIG_PATH = '/etc/ezil/models.json';
@@ -15,6 +19,17 @@ export function resolveConfigPath(setting: string | undefined, env: NodeJS.Proce
     if (fromEnv) return fromEnv;
     const fromSetting = setting?.trim();
     return fromSetting ? fromSetting : DEFAULT_CONFIG_PATH;
+}
+
+/** A config warning about a served model's setting (not a skipped provider): its model is still served. */
+function isSettingNotice(warning: string): boolean {
+    return !warning.startsWith('providers.');
+}
+
+/** "2 entries not served, 1 setting ignored", or '' when there is nothing to report. */
+function problemSummary(notServed: number, ignored: number): string {
+    return [notServed ? `${notServed} entr${notServed === 1 ? 'y' : 'ies'} not served` : '',
+        ignored ? `${ignored} setting${ignored === 1 ? '' : 's'} ignored` : ''].filter(Boolean).join(', ');
 }
 
 /**
@@ -39,8 +54,10 @@ export class ConfigStore implements vscode.Disposable {
     secrets(): string[] { return this.current?.secrets ?? []; }
     /** Why the file as a whole could not be loaded (unreadable, not JSON, no providers/models). */
     error(): string | undefined { return this.lastError; }
-    /** Entries of the loaded file that are not served: providers whose secret is not set (warnings) and invalid entries (errors). */
+    /** Warnings and errors of the loaded file: skipped providers, ignored settings of served models, invalid entries. */
     problems(): string[] { return this.current ? [...this.current.warnings, ...this.current.errors] : []; }
+    /** Warnings about a served model's setting that is not applied; everything else in problems() is not served. */
+    notices(): string[] { return this.current ? this.current.warnings.filter(isSettingNotice) : []; }
     onChange(listener: () => void): vscode.Disposable { this.listeners.add(listener); return { dispose: () => this.listeners.delete(listener) }; }
 
     setPath(configPath: string): void {
@@ -60,7 +77,8 @@ export class ConfigStore implements vscode.Disposable {
             this.lastText = text;
             this.current = parseModelsConfig(text, { source: this.configPath });
             this.lastError = undefined;
-            this.log(`[config] loaded ${this.configPath}: ${this.current.models.length} model(s)${this.problems().length ? `, ${this.problems().length} entr${this.problems().length === 1 ? 'y' : 'ies'} not served (see below)` : ''}\n${describeConfig(this.current)}`);
+            const summary = problemSummary(this.problems().length - this.notices().length, this.notices().length);
+            this.log(`[config] loaded ${this.configPath}: ${this.current.models.length} model(s)${summary ? `, ${summary} (see below)` : ''}\n${describeConfig(this.current)}`);
             if (!this.watcher && !this.poll) this.watch(); // the directory may not have existed when watching was first attempted
         } catch (error) {
             if (!(error instanceof ConfigError)) this.lastText = undefined;
@@ -174,16 +192,31 @@ export const CONFIG_TEMPLATE = {
     ]
 };
 
-/** The VS Code settings that pin EZiL models into Copilot Chat's default/plan/utility slots. */
+/**
+ * The VS Code settings that pin EZiL models into Copilot Chat's plan/utility slots. Not `chat.defaultModel`: VS Code
+ * 1.141 puts a configured default over the user's remembered model in every new or reloaded empty chat, so a picked
+ * model would not stick. The first model comes from the config's `default` model (the provider's declared default).
+ */
 export function settingsSnippet(models: readonly ResolvedModel[]): Record<string, unknown> {
     const byRole = (role: ResolvedModel['roles'][number]) => models.find(model => model.roles.includes(role));
     const snippet: Record<string, unknown> = { 'chat.allowAnonymousAccess': true, 'chat.byokUtilityModelDefault': 'mainAgent' };
-    const main = byRole('default') ?? models.find(model => model.default);
-    if (main) snippet['chat.defaultModel'] = main.id;
     const plan = byRole('plan'); if (plan) snippet['chat.planAgent.defaultModel'] = plan.id;
     const utility = byRole('utility'); if (utility) snippet['chat.utilityModel'] = `ezil/${utility.id}`;
     const small = byRole('utilitySmall'); if (small) snippet['chat.utilitySmallModel'] = `ezil/${small.id}`;
     return snippet;
+}
+
+/** Older workbenches may not register this command. Neither dispatch nor its rejection affects a turn. */
+export function sendAppFailure(record: unknown): void {
+    try {
+        if (isAppFailure(record)) void Promise.resolve(vscode.commands.executeCommand('_ezil.appFailure', record)).catch(() => {});
+    } catch { /* Diagnostics are optional and never logged. */ }
+}
+
+/** Only a definite activation config failure calls this builder; no config or error text enters the record. */
+export function appStartFailure(): AppFailure {
+    return { eventId: randomUUID(), source: 'ezil_chat', operation: 'app_start', category: 'app_startup',
+        code: 'app_start_failed', stage: 'startup', outcome: 'failed' };
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
@@ -193,22 +226,25 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const store = new ConfigStore(resolveConfigPath(settings().get<string>('configPath')), log);
     const usage = new UsageTracker();
     const aiStatus = new EZiLAIStatus(() => store.models().find(model => model.provider.type === 'ezil-gateway')?.provider);
+    const compaction = new CompactionNotice(log);
     const provider = new EZiLModelsProvider({
         models: () => store.models(),
         configError: () => store.error(),
         secrets: () => store.secrets(),
         logRequests: () => settings().get<boolean>('logRequests') === true,
         log,
+        appFailure: sendAppFailure,
         recordUsage: (model, used, elapsedMs) => {
             usage.record(model, used, elapsedMs);
             if (model.provider.type !== 'ezil-gateway') log(`[usage] ${model.id} input=${used.inputTokens} output=${used.outputTokens} cache_read=${used.cacheReadTokens} cache_write=${used.cacheWriteTokens} ${elapsedMs}ms`);
         },
-        requestFinished: model => { if (model.provider.type === 'ezil-gateway') void aiStatus.refresh(); },
+        requestFinished: model => { if (model.provider.type === 'ezil-gateway') { void aiStatus.refresh(); provider.refreshIfCatalogChanged(); } },
+        compacted: (model, info, finished) => compaction.show(model.name, info, finished),
     });
-    context.subscriptions.push(output, store, provider, aiStatus);
+    context.subscriptions.push(output, store, provider, aiStatus, compaction);
     context.subscriptions.push(store.onChange(() => { provider.refresh(); void aiStatus.refresh(); }));
     store.watch();
-    store.load();
+    if (!store.load()) sendAppFailure(appStartFailure());
     context.subscriptions.push(vscode.lm.registerLanguageModelChatProvider('ezil', provider));
     // VS Code 1.141 subscribes to model changes at registration and does not enumerate models
     // then; the change fired by the load above was missed, so announce the models once more.
@@ -236,14 +272,20 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     const reload = () => {
         forgetGatewayModels();
         const ok = store.load();
-        const problems = store.problems().length;
+        const summary = problemSummary(store.problems().length - store.notices().length, store.notices().length);
         void (ok
-            ? problems
-                ? vscode.window.showWarningMessage(`EZiL Models: loaded ${store.models().length} model(s) from ${store.path}; ${problems} entr${problems === 1 ? 'y is' : 'ies are'} not served.`, 'Show output').then(choice => { if (choice) output.show(); })
+            ? summary
+                ? vscode.window.showWarningMessage(`EZiL Models: loaded ${store.models().length} model(s) from ${store.path}; ${summary}.`, 'Show output').then(choice => { if (choice) output.show(); })
                 : vscode.window.showInformationMessage(`EZiL Models: loaded ${store.models().length} model(s) from ${store.path}.`)
             : vscode.window.showErrorMessage(`EZiL Models: ${store.error()}`, 'Show output').then(choice => { if (choice) output.show(); }));
     };
-    const showCredits = () => aiStatus.show();
+    const showCredits = () => {
+        // The panel just opened: read the model list fresh too (contract §1), and re-list if it changed. A failed read
+        // keeps the last catalog: unknown is not unavailable.
+        const gateway = store.models().find(model => model.provider.type === 'ezil-gateway')?.provider;
+        if (gateway) void gatewayModels(gateway, fetch, Date.now(), undefined, true).then(() => provider.refreshIfCatalogChanged());
+        return aiStatus.show();
+    };
     const showUsage = () => { log(`[usage report]\n${usage.report()}`); output.show(); };
     const manage = async () => {
         type Item = vscode.QuickPickItem & { action?: () => void | Promise<void> };
@@ -252,17 +294,17 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             { label: '$(refresh) Reload config', description: store.error() ? 'last load failed' : `${store.models().length} model(s)`, action: reload },
             { label: '$(credit-card) Show AI credits', action: showCredits },
             { label: '$(graph) Show token usage', action: showUsage },
-            { label: '$(clippy) Copy settings snippet', description: 'chat.defaultModel / plan / utility for the configured roles', action: async () => { await vscode.env.clipboard.writeText(JSON.stringify(settingsSnippet(store.models()), null, 2)); void vscode.window.showInformationMessage('EZiL Models: settings snippet copied to the clipboard.'); } },
+            { label: '$(clippy) Copy settings snippet', description: 'plan / utility models for the configured roles', action: async () => { await vscode.env.clipboard.writeText(JSON.stringify(settingsSnippet(store.models()), null, 2)); void vscode.window.showInformationMessage('EZiL Models: settings snippet copied to the clipboard.'); } },
         ];
         if (store.error()) items.push({ label: '$(error) Config error', detail: store.error(), action: () => output.show() });
-        for (const problem of store.problems()) items.push({ label: `$(warning) ${problem.startsWith('providers.') && problem.includes(' skipped ') ? 'Provider skipped' : 'Invalid entry'}`, detail: problem, action: () => output.show() });
+        for (const problem of store.problems()) items.push({ label: `$(warning) ${problem.startsWith('providers.') && problem.includes(' skipped ') ? 'Provider skipped' : store.notices().includes(problem) ? 'Setting ignored' : 'Invalid entry'}`, detail: problem, action: () => output.show() });
         if (store.models().length) items.push({ label: 'Models', kind: vscode.QuickPickItemKind.Separator });
         for (const model of store.models()) {
             items.push({
                 label: `${model.default ? '$(star-full) ' : ''}${model.name}`,
                 description: `${model.id} -> ${model.providerName}/${model.model}`,
                 detail: `${model.provider.type} · in ${model.maxInputTokens} / out ${model.maxOutputTokens}${model.thinking ? ` · thinking ${model.thinking.type}${model.thinking.effort ? `/${model.thinking.effort}` : ''}` : ''}${model.cache.enabled ? ` · cache ${model.cache.ttl}` : ''}${model.roles.length ? ` · roles ${model.roles.join(', ')}` : ''}`,
-                action: () => { void vscode.window.showInformationMessage(`EZiL Models: set "chat.defaultModel": "${model.id}" to make ${model.name} the default.`); },
+                action: () => { void vscode.window.showInformationMessage(`EZiL Models: mark ${model.name} "default": true in the config to make it the first model; a model picked in Chat stays picked.`); },
             });
         }
         const picked = await vscode.window.showQuickPick(items, { title: 'EZiL Models', placeHolder: 'Manage the EZiL model provider' });
@@ -275,8 +317,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         vscode.commands.registerCommand('ezil-models.showStatus', showCredits),
         vscode.commands.registerCommand('ezil-models.showUsage', showUsage),
         vscode.commands.registerCommand('ezil-models.openConfig', openConfig),
+        vscode.commands.registerCommand('ezil-models.compactionInfo', () => compaction.explain()),
     );
-    log(`[activate] config path ${store.path}${process.env[CONFIG_ENV] ? ` (from ${CONFIG_ENV})` : ''}; proposals: languageModelThinkingPart=${'LanguageModelThinkingPart' in vscode} languageModelSystem=${(vscode.LanguageModelChatMessageRole as unknown as Record<string, unknown>).System === 3}`);
+    // `@ezil`: plain questions to the selected EZiL model without tools (participant.ts). Registered last and
+    // guarded, so a host without chat participants still gets every command above.
+    let participant = 'none';
+    try {
+        context.subscriptions.push(registerNoToolsParticipant());
+        participant = PARTICIPANT_ID;
+    } catch (error) {
+        log(`[activate] @ezil participant not registered: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    log(`[activate] config path ${store.path}${process.env[CONFIG_ENV] ? ` (from ${CONFIG_ENV})` : ''}; proposals: languageModelThinkingPart=${'LanguageModelThinkingPart' in vscode} languageModelSystem=${(vscode.LanguageModelChatMessageRole as unknown as Record<string, unknown>).System === 3}; participant=${participant}`);
 }
 
 export function deactivate(): void {}

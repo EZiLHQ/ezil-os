@@ -22,7 +22,7 @@
  * one proves the entrypoint starts; this one proves what it routes.
  */
 
-import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
+import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, exactCacheScope, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
 import { beforeEach, describe, expect, it, mock, spyOn } from 'bun:test';
 
 // Must be registered before `./index.ts` is imported (see module doc). The
@@ -3567,6 +3567,43 @@ describe('AI credential and code-host routes', () => {
     } finally { globalThis.fetch = realFetch; }
   });
 
+  it('opts eligible chat into the exact cache only when the existing EZIL_AI_GATEWAY_URL is the staging Gateway', async () => {
+    const { binding } = fakeSandboxNamespace({});
+    const nonce = 'aws-boot-cache';
+    const base = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, AWS_ROUTING_ENABLED: 'on',
+      SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.org', AWS_ORIGIN_ZONE: 'origin.ezil.org', AWS_ORIGIN_ZONE_ALLOWLIST: 'origin.ezil.org',
+      AWS_TUNNELS: { idFromName: (id: string) => id, get: (id: string) => ({ fetch: async () =>
+        Response.json({ record: { sandboxId: id, aiProxyNonce: nonce } }) }) } };
+    const auth = await deriveAiProxyToken(SECRET, SANDBOX_NAME, nonce);
+    const body = JSON.stringify({ model: 'us.moonshotai.kimi-k3', max_tokens: 16, stream: false, messages: [{ role: 'user', content: 'q' }] });
+    const send = (env: Record<string, unknown>) => worker.fetch(new Request(`https://aws-8443-${SANDBOX_NAME}-aws.ezil.org/ai/v1/messages`, {
+      method: 'POST', body, headers: { authorization: `Bearer ${auth}`, 'content-type': 'application/json',
+        'x-ezil-cache': 'exact', 'x-ezil-cache-scope': 'client-chosen' } }), env);
+    const realFetch = globalThis.fetch;
+    const upstream: Request[] = [];
+    globalThis.fetch = (async (request: Request) => { upstream.push(request);
+      return new Response('{"id":"m"}', { status: 200, headers: { 'content-type': 'application/json', 'x-ezil-cache': 'HIT' } }); }) as typeof fetch;
+    try {
+      expect((await worker.fetch(await credentialRequest('POST', token()), base)).status).toBe(200);
+      const staging = await send({ ...base, EZIL_AI_GATEWAY_URL: 'https://ai-staging.ezil.work' });
+      expect(staging.status).toBe(200);
+      expect(staging.headers.get('x-ezil-cache')).toBe('HIT');
+      expect(upstream[0]!.url).toBe('https://ai-staging.ezil.work/v1/messages');
+      expect(upstream[0]!.headers.get('x-ezil-cache')).toBe('exact');
+      expect(upstream[0]!.headers.get('x-ezil-cache-scope')).toBe(await exactCacheScope(SECRET, SANDBOX_NAME));
+      expect(await upstream[0]!.text()).toBe(body);
+      // Production's Gateway, and the default when the variable is unset: no opt-in, nothing passed back.
+      for (const env of [{ ...base, EZIL_AI_GATEWAY_URL: 'https://ai.ezil.work' }, base]) {
+        upstream.length = 0;
+        const res = await send(env);
+        expect(res.status).toBe(200);
+        expect(res.headers.get('x-ezil-cache')).toBeNull();
+        expect(upstream[0]!.url).toBe('https://ai.ezil.work/v1/messages');
+        expect([...upstream[0]!.headers.keys()].filter((k) => k.startsWith('x-ezil-cache'))).toEqual([]);
+      }
+    } finally { globalThis.fetch = realFetch; }
+  });
+
   it('injects boot vars even with the kill switch off; an exposed warm desktop never rotates', async () => {
     const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
     const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_AI_PROXY: 'off', SANDBOX_DESKTOP_MODE: 'neko', SANDBOX_NEKO_ICE_POLICY: 'diagnostic', SANDBOX_WORKSPACE_R2_BUCKET: {} };
@@ -3998,5 +4035,8 @@ describe('Code folder bridge on the code host: each realm reports to its own app
     const body = await workbenchAt(`8443-${SANDBOX_NAME}-code.ezil.work`, { SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.work' });
     expect(body.split('data-ezil-folder-bridge').length - 1).toBe(1);
     expect(body).toContain(JSON.stringify(['https://os-staging.ezil.work']));
+    // The older image's composer notice is hidden by the same insertion, once.
+    expect(body.split('<style data-ezil-legacy-notice="1">.chat-viewpane .interactive-session>.interactive-input-part::after'
+      + '{content:none!important;display:none!important}</style>').length - 1).toBe(1);
   });
 });

@@ -5,13 +5,15 @@ import type { SubscriptionRow } from '../meters';
 import type { BillingDeps, BillingStore, GrantRow, PaymentIssueRow, StoredComputeEpoch } from '../ports';
 import { freeSkuFor } from './catalog';
 import { CATALOG_V2, SIZES, type ComputeEpoch } from './contract';
-import { billingMeteringActive, billingV2EntitlementReader, computeGrantPending, loadComputeBillingState, gateComputerStart, openComputeEpochAtReady } from './compute-access';
+import { billingMeteringActive, billingV2EntitlementReader, computeGrantPending, loadComputeBillingState, gateComputerStart, openComputeEpochAtReady, paidComputeUnmeteredState } from './compute-access';
+import { paidComputeUnmetered } from '../../lib/compute/paid-compute-policy';
 import { buildSummaryV2 } from './summary';
 import { buildSummaryV3 } from '../v3/summary';
 import * as rating from './rating';
 import * as admissionV3 from '../v3/admission';
 import { epochSeconds, isoSeconds } from './time';
 import { resolveEntitlement } from '../../lib/compute/tier';
+import type { OperatorEntitlementRow } from '../v3/operator-access';
 
 vi.mock('../deps', () => ({ getBillingDeps: vi.fn(() => { throw new Error('Inject billing deps'); }) }));
 
@@ -51,8 +53,11 @@ function fixture(over: Partial<Input> = {}) {
         storage: [], sizePreference: null, hasCustomer: false, ...over,
     };
     const calls: { name: string; args: unknown[] }[] = [];
+    // Product entitlements v1: the account's operator assignments (none unless a test adds them).
+    const operator: OperatorEntitlementRow[] = [];
     const methods = {
         subscriptionsFor: async () => input.subs,
+        operatorEntitlementsFor: async () => [...operator],
         userCreatedAt: async () => input.userCreatedAt,
         openPlanChanges: async () => [...input.planChanges],
         epochsFor: async (_userId: string, since: Date) => input.epochs.filter(e => e.endedAt === null || new Date(e.endedAt) > since).map(stored),
@@ -91,7 +96,7 @@ function fixture(over: Partial<Input> = {}) {
         },
     }) as unknown as BillingStore;
     const deps: BillingDeps = { config: input.config, store, stripe: null, usage: null, now: () => NOW };
-    return { input, deps, calls };
+    return { input, deps, calls, operator };
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -106,8 +111,9 @@ describe('loadComputeBillingState', () => {
             usedStdSeconds: 14400, allowanceStdSeconds: CATALOG_V2[freeSkuFor(null)].allowanceStdSeconds, overage: null,
         });
         expect(state.summary).toEqual(buildSummaryV3(input));
+        // Product entitlements v1 adds one read (operator grants); with none, nothing else changes.
         expect(calls.map(c => c.name).sort()).toEqual([
-            'epochsFor', 'grantsForPeriod', 'openPaymentIssues', 'openPlanChanges', 'sizePreference', 'subscriptionsFor', 'userCreatedAt',
+            'epochsFor', 'grantsForPeriod', 'openPaymentIssues', 'openPlanChanges', 'operatorEntitlementsFor', 'sizePreference', 'subscriptionsFor', 'userCreatedAt',
         ]);
     });
 
@@ -210,7 +216,7 @@ describe('billingV2EntitlementReader', () => {
     it.each([{ BILLING_TAB_ENABLED: '1' }, { BILLING_ENFORCEMENT: '1' }])('either metering flag reads billing (%j)', async config => {
         const { deps } = fixture({ config: readBillingConfig(config), subs: [subscription({ sku: 'compute_monthly_v2' })], grants:[grant()], sizePreference: 'cmp-8' });
         expect(await billingV2EntitlementReader(() => deps).read(USER)).toEqual({ source: 'billing_v2',
-            status: 'active', planId: 'compute_monthly_v2', size: 'cmp-8', provider: 'aws', paymentIssue: false });
+            status: 'active', planId: 'compute_monthly_v2', size: 'cmp-8', provider: 'aws', paymentIssue: false, grantPending: false });
     });
 
     it('a failed billing read is logged and resolves as no entitlement', async () => {
@@ -443,37 +449,43 @@ describe('v3 compute enforcement', () => {
         expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'aws-ec2', instanceType: 'm6i.2xlarge', now: NOW })).toEqual({ allowed: true });
         expect(spy).toHaveBeenLastCalledWith(expect.objectContaining({ size: 'std-2' }));
     });
-    it.each([239, 240])('cmp-8 requires 240 standard-seconds to start (remaining=%s)', async remaining => {
+    // Paid compute policy v1: an unmetered paid session stores readiness + its six-hour session cap (the sweep ends it there,
+    // never earlier for hours), which also marks it paid-era for the R1-04 drop rule (past Free's one hour).
+    const paidEra = (readyAt: Date, maxRunSeconds: number) => ({ decision: { admit: true, maxRunSeconds },
+        deadlineAt: new Date((Math.floor(readyAt.getTime() / 1000) + maxRunSeconds) * 1000).toISOString().replace('.000Z', 'Z') });
+    // Paid compute policy v1 (founder e713d157): what used to be the 240-second cmp-8 floor no longer refuses a paid start.
+    it.each([0, 239, 240])('Premium cmp-8 starts with %s standard-seconds of its grant left, with no hours cutoff', async remaining => {
         const { deps } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
             subs: [subscription({ sku: 'premium_monthly_v3' })], sizePreference: 'cmp-8',
             epochs: [epoch(START, '2026-10-10T01:00:00Z')], grants: [grant({ amount: BigInt(14400 + remaining) })] });
         expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'aws-ec2', instanceType: null, now: NOW }))
-            .toEqual(remaining === 240 ? { allowed: true } : { allowed: false, reason: 'fair_use_paused' });
+            .toEqual({ allowed: true });
+        // The six-hour session, never the 60 s left of the grant.
         expect(await openComputeEpochAtReady({ deps, userId: USER, computerId: 'new', size: 'cmp-8', readyAt: NOW, overheadSeconds: 0 }))
-            .toMatchObject({ decision: remaining === 240 ? { admit: true, maxRunSeconds: 60 } : { admit: false, reason: 'fair_use_paused' } });
+            .toMatchObject({ status: 'opened', ...paidEra(NOW, 21_600) });
     });
     it('rates an existing paid Cloudflare machine at weight one despite a cmp-8 preference', async () => {
         const { deps } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
             subs: [subscription({ sku: 'premium_monthly_v3' })], sizePreference: 'cmp-8', grants: [grant({ amount: BigInt(60) })] });
         expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'cloudflare', instanceType: null, now: NOW })).toEqual({ allowed: true });
+        // Weight one; the six-hour session cap.
         expect(await openComputeEpochAtReady({ deps, userId: USER, computerId: 'new', size: 'free-cf', readyAt: NOW, overheadSeconds: 0 }))
-            .toMatchObject({ decision: { admit: true, maxRunSeconds: 60 } });
+            .toMatchObject({ ...paidEra(NOW, 21_600), decision: { size: 'std-2' } });
     });
 
     it.each([
-        ['standard_monthly_v3', 'std-2', 144000, 129600],
-        ['premium_monthly_v3', 'cmp-8', 1800000, 446400],
-    ] as const)('%s uses weighted standard-seconds and its session limit', async (sku, size, allowance, maxRunSeconds) => {
+        ['standard_monthly_v3', 'std-2', 144000],
+        ['premium_monthly_v3', 'cmp-8', 1800000],
+    ] as const)('%s records weighted standard-seconds and opens with no hours cutoff (paid compute policy v1)', async (sku, size, allowance) => {
         const { deps, calls } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
             subs: [subscription({ sku })], grants: [grant({ amount: BigInt(allowance) })],
             epochs: [epoch(START, '2026-10-10T01:00:00Z')], sizePreference: 'cmp-8' });
         const state = await loadComputeBillingState(deps, USER, NOW);
-        expect(state).toMatchObject({ planSku: sku, entitledSize: size, sessionMaxSeconds: null,
+        expect(state).toMatchObject({ planSku: sku, entitledSize: size, sessionMaxSeconds: 21_600,
             usedStdSeconds: 14400, allowanceStdSeconds: allowance, overage: null });
         const readyAt = new Date('2026-10-18T13:00:00Z');
         expect(await openComputeEpochAtReady({ deps, userId: USER, computerId: 'new', size, readyAt, overheadSeconds: 0 }))
-            .toMatchObject({ status: 'opened', decision: { admit: true, maxRunSeconds },
-                deadlineAt: isoSeconds(epochSeconds(readyAt) + maxRunSeconds) });
+            .toMatchObject({ status: 'opened', ...paidEra(readyAt, 21_600) });
         expect(calls.find(call => call.name === 'epochsFor')?.args).toEqual([USER, new Date(START)]);
     });
     it('Free creates a one-hour deadline and refuses the next session with 59 seconds left', async () => {
@@ -510,6 +522,55 @@ describe('v3 compute enforcement', () => {
         input.grants = [...input.grants, grant({ kind: 'revoke', amount: BigInt(-144000) })];
         expect(await gate()).toEqual({ allowed: false, reason: 'fair_use_paused' });
         expect(await billingV2EntitlementReader(() => deps).read(USER)).toMatchObject({status:'expired'});
+    });
+    // Paid compute policy v1 (founder e713d157): no hours cutoff for verified paid plans, the Standard trial included.
+    const overGrant = () => Array.from({ length: 3 }, (_, i) => epoch(`2026-10-1${i + 1}T00:00:00Z`, `2026-10-1${i + 1}T23:00:00Z`)); // 69 h
+    it.each([['active', 'standard_monthly_v3'], ['trialing', 'standard_monthly_v3'], ['active', 'premium_monthly_v3']] as const)(
+        '%s %s past its 40 h grant starts, opens with no hours cutoff, and reads as exempt', async (status, sku) => {
+            const { deps } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }), subs: [subscription({ sku, status })],
+                grants: [grant({ amount: BigInt(144000) })], epochs: overGrant() });
+            const state = await loadComputeBillingState(deps, USER, NOW);
+            // Recorded past the 40 h grant, never clipped at it: each (pre-policy 23 h) session is rated to its six-hour
+            // cap at cmp-8's weight four (3 × 6 h × 4 = 72 h), and it is never a refusal.
+            expect(state.usedStdSeconds).toBe(3 * 21_600 * 4);
+            expect(paidComputeUnmeteredState(state)).toBe(true);
+            expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'aws-ec2', instanceType: null, now: NOW })).toEqual({ allowed: true });
+            // Past the grant it still gets the whole six-hour session.
+            expect(await openComputeEpochAtReady({ deps, userId: USER, computerId: 'new', size: 'std-2', readyAt: NOW, overheadSeconds: 0 }))
+                .toMatchObject({ status: 'opened', ...paidEra(NOW, 21_600) });
+            expect(paidComputeUnmetered(await billingV2EntitlementReader(() => deps).read(USER))).toBe(true);
+            expect(state.summary).toMatchObject({ fairUse: { status: 'ok', policy: 'unmetered' } });
+        });
+    it.each([
+        ['cancelled', { status: 'canceled' }], ['incomplete (never paid)', { status: 'incomplete' }],
+        ['ended at period end', { cancelAtPeriodEnd: true, currentPeriodEnd: NOW }],
+    ] as const)('a %s paid plan gets no exemption: it runs as Free, with Free hours', async (_name, over) => {
+        const { deps } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
+            subs: [subscription({ sku: 'premium_monthly_v3', ...over })], grants: [grant({ amount: BigInt(1800000) })], epochs: overGrant() });
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state.planSku).toBe('free_v3');
+        expect(paidComputeUnmeteredState(state)).toBe(false);
+        expect(paidComputeUnmetered(await billingV2EntitlementReader(() => deps).read(USER))).toBe(false);
+        expect(state.summary).not.toMatchObject({ fairUse: { policy: 'unmetered' } });
+    });
+    it('an unknown account (no subscription) and a paid row without its period receipt are not exempt', async () => {
+        const none = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }) });
+        expect(paidComputeUnmeteredState(await loadComputeBillingState(none.deps, USER, NOW))).toBe(false);
+        const unreceipted = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }), subs: [subscription({ sku: 'premium_monthly_v3' })] });
+        expect(paidComputeUnmeteredState(await loadComputeBillingState(unreceipted.deps, USER, NOW))).toBe(false);
+        expect(await gateComputerStart({ deps: unreceipted.deps, userId: USER, computerId: 'new', kind: 'aws-ec2', instanceType: null, now: NOW }))
+            .toEqual({ allowed: false, reason: 'fair_use_paused' });
+    });
+    it('Free keeps its allowance: exhausted is refused, the summary pauses until the reset, and nothing says unmetered', async () => {
+        const { deps, input } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }) });
+        // Eight full hours: this account's (legacy) Free allowance, used up.
+        input.epochs = Array.from({ length: 8 }, (_, i) => ({ ...epoch(`2026-10-10T0${i}:00:00Z`, `2026-10-10T0${i + 1}:00:00Z`), size: 'free-cf' as const, weight: 1 as const }));
+        expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'cloudflare', instanceType: null, now: NOW }))
+            .toEqual({ allowed: false, reason: 'fair_use_paused' });
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(paidComputeUnmeteredState(state)).toBe(false);
+        expect(state.summary).toMatchObject({ fairUse: { status: 'paused', resetsAt: MONTH.end } });
+        expect(state.summary).not.toMatchObject({ fairUse: { policy: 'unmetered' } });
     });
     it('retains paid Standard while an upgrade requires payment and blocks a second computer', async () => {
         const { deps, input } = fixture({ config: readBillingConfig({ BILLING_ENFORCEMENT: '1' }),
@@ -553,6 +614,41 @@ describe('round 4: grace (D17), dropped plans (D18) and the Free hold on AWS (D1
         expect(await gate(premium.deps, { instanceType: 'm6i.2xlarge' })).toEqual({ allowed: true });
         premium.input.grants = [grant({ periodStart: ago(2 * DAY), periodEnd: new Date(NOW.getTime() + 28 * DAY), amount: BigInt(0) })];
         expect(await gate(premium.deps, { instanceType: 'm6i.2xlarge' })).toEqual({ allowed: false, reason: 'fair_use_paused' });
+    });
+
+    // Coordinator decision under founder e713d157: the EXISTING seven-day renewal grace of a previously paid plan gets the
+    // same no-monthly-hours policy. The renewal is unpaid, so the period has no receipt: the grace itself is the access.
+    // `renewal()` is past_due after a paid period: what Stripe reports for a failed renewal. (A trial's failed first charge
+    // is also past_due; trials are not issued yet, and the trial slice must exclude them from grace before they are.)
+    it('paid compute policy v1: a previously paid renewal in its seven-day grace (no current receipt) has no hours cutoff', async () => {
+        // Two 22 h cmp-8 sessions this (renewal) period, rated to their six-hour caps at weight four: 48 standard-hours,
+        // over Standard's 40 h fair use, and no compute grant for the period.
+        const used = [epoch('2026-10-16T13:00:00Z', '2026-10-17T11:00:00Z'), epoch('2026-10-17T11:30:00Z', '2026-10-18T09:30:00Z')];
+        const { deps, input } = fixture({ config: enforced(), subs: [renewal()], paymentIssues: [issue({ stripeEventCreated: ago(2 * DAY) })], epochs: used });
+        expect(input.grants).toEqual([]);
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state).toMatchObject({ planSku: 'standard_monthly_v3', planActive: true, paymentIssue: false, grantPending: false });
+        expect(state.usedStdSeconds).toBe(2 * 21_600 * 4); // never clipped at the 40 h allowance
+        expect(paidComputeUnmeteredState(state)).toBe(true);
+        const record = await billingV2EntitlementReader(() => deps).read(USER);
+        expect(record).toMatchObject({ status: 'active', paymentIssue: false });
+        expect(paidComputeUnmetered(record)).toBe(true);
+        expect(state.summary).toMatchObject({ fairUse: { status: 'ok', policy: 'unmetered' }, plan: { paymentIssue: 'payment_failed' } });
+        expect(await gate(deps)).toEqual({ allowed: true });
+        // The grace is not extended: on day 7 the plan runs as Free, with Free hours and no exemption.
+        input.paymentIssues = [issue({ stripeEventCreated: ago(7 * DAY) })];
+        const ended = await loadComputeBillingState(deps, USER, NOW);
+        expect(ended.planSku).toBe('free_v3');
+        expect(paidComputeUnmeteredState(ended)).toBe(false);
+        expect(paidComputeUnmetered(await billingV2EntitlementReader(() => deps).read(USER))).toBe(false);
+    });
+
+    it.each(['unpaid', 'incomplete'])('paid compute policy v1: a raw %s plan (no grace, e.g. a never-paid first charge) is not exempt', async status => {
+        const { deps } = fixture({ config: enforced(), subs: [renewal({ status })], paymentIssues: [issue()] });
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state.planSku).toBe('free_v3');
+        expect(paidComputeUnmeteredState(state)).toBe(false);
+        expect(paidComputeUnmetered(await billingV2EntitlementReader(() => deps).read(USER))).toBe(false);
     });
 
     it.each([
@@ -637,10 +733,14 @@ describe('round 6 R2-3: a paid period whose compute grant has not landed yet', (
     it('an AWS open passes the gate to ensure() (which waits) instead of a fair_use_paused refusal; the grant then admits it', async () => {
         const { deps, input } = fixture({ config: enforced(), subs: [started(120)] });
         expect(await gate(deps)).toEqual({ allowed: true });
-        // The Cloudflare path has no wait of its own: unchanged.
-        expect(await gate(deps, 'cloudflare')).toEqual({ allowed: false, reason: 'fair_use_paused' });
+        // Paid compute policy v1: a renewal whose grant is still landing counts as paid, so the Cloudflare path (no wait
+        // of its own) is no longer refused for hours, and the per-person hour cap reads it as exempt.
+        expect(paidComputeUnmeteredState(await loadComputeBillingState(deps, USER, NOW))).toBe(true);
+        expect(await gate(deps, 'cloudflare')).toEqual({ allowed: true });
         // The entitlement stays unpaid until the grant lands (ensure() reads it as Free, so it must wait).
-        expect(await billingV2EntitlementReader(() => deps).read(USER)).toMatchObject({ status: 'expired' });
+        const pending = await billingV2EntitlementReader(() => deps).read(USER);
+        expect(pending).toMatchObject({ status: 'expired', grantPending: true });
+        expect(paidComputeUnmetered(pending)).toBe(true);
         input.grants = [grant({ amount: BigInt(144000), periodStart: new Date(NOW.getTime() - 120_000), periodEnd: new Date(NOW.getTime() + 30 * 86_400_000) })];
         expect((await loadComputeBillingState(deps, USER, NOW)).grantPending).toBe(false);
         expect(await gate(deps)).toEqual({ allowed: true });
@@ -666,3 +766,96 @@ describe('round 6 R2-3: a paid period whose compute grant has not landed yet', (
         await expect(computeGrantPending(USER, () => broken.deps)).rejects.toThrow('db down');
     });
 });
+
+// Product entitlements v1 (producer ezil-os): an operator-assigned plan is real product access through the same readers
+// as a paid plan (gate, ready-time epoch, entitlement reader, paid policy, summary), with no Stripe row, receipt or AI
+// credits; Stripe paid access always wins; Free is unchanged without a grant.
+describe('product entitlements v1: operator-assigned access', () => {
+    const DAY = 86_400_000;
+    const grantRow = (over: Partial<OperatorEntitlementRow> = {}): OperatorEntitlementRow => ({ ref: 'osg-00000000-0000-4000-8000-000000000001',
+        revision: 1, userId: USER, accountPublicId: '10000000-0000-4000-8000-0000000000a1', sku: 'standard_monthly_v3',
+        startsAt: new Date(NOW.getTime() - DAY), endsAt: new Date(NOW.getTime() + 30 * DAY), endedAt: null, ...over });
+    const enforced = () => readBillingConfig({ BILLING_ENFORCEMENT: '1' });
+    // 69 h of 2 vCPU this month: past Standard's 40 h, Free's 5 h and the old per-person cap's scale alike.
+    const heavy = () => Array.from({ length: 3 }, (_, i) => ({ ...epoch(`2026-10-1${i + 1}T00:00:00Z`, `2026-10-1${i + 1}T23:00:00Z`), size: 'std-2' as const, weight: 1 as const }));
+
+    it.each([['standard_monthly_v3', 'std-2', 'm6i.large'], ['premium_monthly_v3', 'cmp-8', 'm6i.2xlarge']] as const)(
+        'an operator %s grant: paid state, unmetered, no hours cutoff, active entitlement, six-hour sessions', async (sku, size, instanceType) => {
+            const { deps, operator, calls } = fixture({ config: enforced(), epochs: heavy(), sizePreference: 'cmp-8' });
+            operator.push(grantRow({ sku }));
+            const state = await loadComputeBillingState(deps, USER, NOW);
+            expect(state).toMatchObject({ planSku: sku, v3: { sku }, planActive: true, paymentIssue: false, subscriptionId: null, provider: 'aws',
+                entitledSize: size, sessionMaxSeconds: 21_600, grantPending: false, freeSince: null });
+            expect(paidComputeUnmeteredState(state)).toBe(true);
+            expect(state.summary).toMatchObject({ fairUse: { status: 'ok', policy: 'unmetered' }, plan: { sku, status: 'active', renewal: null,
+                cancelsAt: null, access: { source: 'operator', ref: 'osg-00000000-0000-4000-8000-000000000001', untilRevoked: false } },
+                ai: { grant: { amount: 0, per: 'period' } }, actions: { checkout: false, upgrade: false, downgrade: false, cancel: false } });
+            expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'aws-ec2', instanceType, now: NOW })).toEqual({ allowed: true });
+            expect(await openComputeEpochAtReady({ deps, userId: USER, computerId: 'new', size, readyAt: NOW, overheadSeconds: 0 }))
+                .toMatchObject({ status: 'opened', decision: { admit: true, maxRunSeconds: 21_600 } });
+            const record = await billingV2EntitlementReader(() => deps).read(USER);
+            expect(record).toMatchObject({ source: 'billing_v2', status: 'active', planId: sku, provider: 'aws', size, paymentIssue: false });
+            expect(paidComputeUnmetered(record)).toBe(true);
+            // Only reads, plus the session's own epoch: no subscription, grant or credit write (the strict store throws on any other method).
+            expect([...new Set(calls.map(c => c.name))].sort()).toEqual(['epochsFor', 'grantsForPeriod', 'openEpoch', 'openEpochFor', 'openPaymentIssues',
+                'openPlanChanges', 'operatorEntitlementsFor', 'sizePreference', 'subscriptionsFor', 'userCreatedAt']);
+        });
+
+    it('an operator plan never waits for a renewal grant (it has no Stripe period), even at the start of the month', async () => {
+        const monthStart = new Date('2026-11-01T00:02:00.000Z');
+        const { deps, operator } = fixture({ config: enforced(), now: monthStart });
+        deps.now = () => monthStart;
+        operator.push(grantRow({ startsAt: new Date('2026-10-20T00:00:00Z') }));
+        const state = await loadComputeBillingState(deps, USER, monthStart);
+        expect(state).toMatchObject({ planSku: 'standard_monthly_v3', grantPending: false });
+        expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'cloudflare', instanceType: null, now: monthStart })).toEqual({ allowed: true });
+    });
+
+    it('until revoked is access with no end; the summary says so', async () => {
+        const { deps, operator } = fixture({ config: enforced() });
+        operator.push(grantRow({ endsAt: null }));
+        expect((await loadComputeBillingState(deps, USER, NOW)).summary).toMatchObject({ plan: { access: { endsAt: null, untilRevoked: true } } });
+    });
+
+    it.each([
+        ['ended by an operator', { endedAt: new Date(NOW.getTime() - 1000) }],
+        ['past its end date', { endsAt: new Date(NOW.getTime() - 1000) }],
+        ['not started yet', { startsAt: new Date(NOW.getTime() + 60_000) }],
+    ])('a grant %s gives nothing: Free, with Free hours and Free refusals', async (_name, over) => {
+        // Eight full Free hours (Free rates each session at its one-hour cap): this account's Free allowance, used up.
+        const freeHours = Array.from({ length: 8 }, (_, i) => ({ ...epoch(`2026-10-0${i + 1}T00:00:00Z`, `2026-10-0${i + 1}T01:00:00Z`), size: 'free-cf' as const, weight: 1 as const }));
+        const { deps, operator } = fixture({ config: enforced(), epochs: freeHours });
+        operator.push(grantRow(over));
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state).toMatchObject({ planSku: 'free_v3', provider: 'cloudflare' });
+        expect(paidComputeUnmeteredState(state)).toBe(false);
+        expect(state.summary.version === 3 && state.summary.plan).not.toHaveProperty('access');
+        expect(await gateComputerStart({ deps, userId: USER, computerId: 'new', kind: 'cloudflare', instanceType: null, now: NOW }))
+            .toEqual({ allowed: false, reason: 'fair_use_paused' });
+    });
+
+    it('Stripe paid access wins: the operator grant is ignored while a paid subscription covers the account', async () => {
+        const { deps, operator } = fixture({ config: enforced(), subs: [subscription({ sku: 'premium_monthly_v3' })], grants: [grant({ amount: BigInt(1_800_000) })] });
+        operator.push(grantRow({ sku: 'standard_monthly_v3' }));
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state).toMatchObject({ planSku: 'premium_monthly_v3', subscriptionId: 'sub_a' });
+        expect(state.summary.version === 3 && state.summary.plan).not.toHaveProperty('access');
+        expect(await billingV2EntitlementReader(() => deps).read(USER)).toMatchObject({ planId: 'premium_monthly_v3' });
+    });
+
+    it('a Stripe plan past its grace (Free) lets the operator grant decide', async () => {
+        const { deps, operator } = fixture({ config: enforced(), subs: [subscription({ sku: 'premium_monthly_v3', status: 'past_due' })],
+            paymentIssues: [issue({ stripeEventCreated: new Date(NOW.getTime() - 8 * DAY) })] });
+        operator.push(grantRow());
+        expect(await loadComputeBillingState(deps, USER, NOW)).toMatchObject({ planSku: 'standard_monthly_v3', subscriptionId: null });
+    });
+
+    it('without a grant nothing changes: Free stays Free, with its quota', async () => {
+        const { deps } = fixture({ config: enforced() });
+        const state = await loadComputeBillingState(deps, USER, NOW);
+        expect(state).toMatchObject({ planSku: 'free_v3', allowanceStdSeconds: expect.any(Number) });
+        expect(paidComputeUnmeteredState(state)).toBe(false);
+        expect(state.summary.version === 3 && state.summary.plan).not.toHaveProperty('access');
+    });
+});
+

@@ -80,7 +80,7 @@ function v2(family = 'compute', freeHours = 2) {
             nextChargeAt: free ? null : END, subscriptionCents: free ? null : compute ? 10000 : 2000,
             accruedOverageCents: 0, worstCaseOverageCents: 0, currency: 'usd', taxNote: 'before_tax',
         },
-        storage: { usedBytes: '1500000000', capBytes: '2000000000', state: 'ok', measuredAt: '2026-10-18T11:58:00Z' },
+        storage: { usedBytes: '1610612736', capBytes: '2147483648', state: 'ok', measuredAt: '2026-10-18T11:58:00Z' }, // 1.5 of 2 GiB
         ai: { state: 'unavailable', trialMicro: '0', includedMicro: '0', purchasedMicro: '0', includedExpiresAt: null },
         actions: { checkout: free, portal: !free, upgrade: family === 'standard', downgrade: compute, cancel: !free, overage: compute, selectSize: compute },
         catalog: {

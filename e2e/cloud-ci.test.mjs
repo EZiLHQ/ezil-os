@@ -333,7 +333,7 @@ test('production requires both production aliases to resolve the exact returned 
 });
 
 const { imagePlan } = await import('../.github/scripts/image-plan.mjs');
-const { readState, pullCloudflareImage, restoreVercel, captureContainerVersion, candidateRolloutDigest } = await import('../.github/scripts/release-state.mjs');
+const { readState, readWorkerState, assertWorkerOwner, workerVersionId, pullCloudflareImage, restoreVercel, captureContainerVersion, candidateRolloutDigest } = await import('../.github/scripts/release-state.mjs');
 
 test('image keys rebuild changed base and branding independently without changing local pins', () => {
   const tree = p => `${p}-original`;
@@ -367,6 +367,68 @@ test('release capture separates provider/container identities and strips configu
   assert.equal(result.cloudflare_container.digest, `sha256:${'d'.repeat(64)}`);
   assert.equal(JSON.stringify(result).includes('do-not-store'), false);
   await assert.rejects(readState(env, async()=>({ok:false,status:403})), /HTTP 403/);
+});
+
+test('Worker-only ownership guard admits this release or an untouched previous one, refuses a third', () => {
+  const previous = { worker_version: 'v-old', worker_source: 'b'.repeat(40) };
+  // Still the pre-deploy version (the deploy failed cleanly): we may recover it.
+  assertWorkerOwner(previous, { worker_version: 'v-old', worker_source: 'b'.repeat(40) }, sha);
+  // Our own just-deployed version carries this release's SHA: we own production.
+  assertWorkerOwner(previous, { worker_version: 'v-new', worker_source: sha }, sha);
+  // A third release owns neither our version nor our SHA: refuse before any rollback.
+  assert.throws(() => assertWorkerOwner(previous, { worker_version: 'v-other', worker_source: 'c'.repeat(40) }, sha),
+    /Another Worker release owns production/);
+  // assertRollbackOwner still enforces the Worker half it now delegates.
+  assert.throws(() => assertRollbackOwner(previous,
+    { worker_version: 'v-other', worker_source: 'c'.repeat(40), vercel_deployment: 'dpl', vercel_source: sha }, sha),
+    /Another Worker release owns production/);
+});
+
+test('Worker-only state reads Cloudflare identity, strips configuration and never touches Vercel', async () => {
+  const image = `registry.cloudflare.com/account/image@sha256:${'d'.repeat(64)}`;
+  const seen = [];
+  const fetchWorker = async (input, options) => {
+    const url = new URL(input);
+    seen.push(url.hostname);
+    assert.notEqual(url.hostname, 'api.vercel.com', 'Worker-only state must not read Vercel');
+    if (url.pathname.endsWith('/containers/applications')) return { ok: true, json: async () => ({ success: true, result: [
+      { id: 'container-id', name: 'ezil-os-worker-sandbox', configuration: { image, env: { SECRET: 'do-not-store' } } },
+    ] }) };
+    return fakeAPI().fetch(input, options);
+  };
+  const state = await readWorkerState(env, fetchWorker);
+  assert.equal(state.worker_version, 'version-test');
+  assert.equal(state.worker_source, sha);
+  assert.equal(state.cloudflare_container.image, image);
+  assert.equal(state.cloudflare_container.digest, `sha256:${'d'.repeat(64)}`);
+  assert.equal(JSON.stringify(state).includes('do-not-store'), false);
+  assert.ok(seen.length > 0 && seen.every(hostname => hostname === 'api.cloudflare.com'));
+  await assert.rejects(readWorkerState(env, async () => ({ ok: false, status: 403 })), /HTTP 403/);
+});
+
+test('Worker version id is validated before it reaches the rollback shell command', () => {
+  const uuid = 'a1b2c3d4-5e6f-7a8b-9c0d-1e2f3a4b5c6d';
+  assert.equal(workerVersionId(uuid), uuid);
+  // A newline would inject extra GITHUB_OUTPUT lines; a quote would break out of
+  // the wrangler rollback quoting. Both, and non-UUID shapes, are refused.
+  for (const bad of ['', 'version-test', `${uuid}\nmalicious=1`, `${uuid}'; echo hi`, undefined]) {
+    assert.throws(() => workerVersionId(bad), /Unexpected Worker version id/);
+  }
+});
+
+test('Worker-only container rollback is gated by the Worker owner check and no-ops on an unchanged image', async () => {
+  const container = { id: 'container-id', image: `registry.cloudflare.com/account/image@sha256:${'e'.repeat(64)}` };
+  const previous = { worker_version: 'v-old', worker_source: 'b'.repeat(40), cloudflare_container: container };
+  const refuse = async () => { throw new Error('must not call the container API'); };
+  // A third release owns the Worker: refuse before any container mutation.
+  await assert.rejects(restoreContainer(previous,
+    { worker_version: 'v-other', worker_source: 'c'.repeat(40), cloudflare_container: container },
+    { ...env, EZIL_DEPLOY_SHA: sha }, refuse, assertWorkerOwner), /Another Worker release owns production/);
+  // We own it and the deployed image already equals the captured one: unchanged, no API call.
+  const result = await restoreContainer(previous,
+    { worker_version: 'v-new', worker_source: sha, cloudflare_container: container },
+    { ...env, EZIL_DEPLOY_SHA: sha }, refuse, assertWorkerOwner);
+  assert.deepEqual(result, { image: container.image, status: 'unchanged', rollout: null });
 });
 
 test('Vercel rollback resolves legacy receipts and promotes the verified ID through the team API', async () => {
@@ -814,7 +876,7 @@ test('deployment triggers are preview/main and version-tag pushes plus manual di
   assert.deepEqual(push.children.map(node => node.line), ['branches: [preview, main]', "tags: ['v*']"]);
   const dispatch = triggers.children.find(node => node.line === 'workflow_dispatch:');
   assert.deepEqual(dispatch.children.map(node => node.line), ['inputs:']);
-  assert.deepEqual(dispatch.children[0].children.map(node => node.line), ['deploy_production:']);
+  assert.deepEqual(dispatch.children[0].children.map(node => node.line), ['deploy_production:', 'deploy_worker_only:']);
   assert.deepEqual(dispatch.children[0].children[0].children.map(node => node.line).filter(line => !line.startsWith('description:')),
     ['type: boolean', 'default: false']);
 });
@@ -927,6 +989,7 @@ test('failed lease acquisition skips snapshots, deployments, recovery and live c
     ['preview', 'refs/heads/preview', 'lease'],
     ['production', 'refs/heads/main', 'production_lease'],
     ['production', 'refs/tags/v1.2.3', 'production_lease'],
+    ['worker-production', 'refs/heads/main', 'production_lease'],
   ]) {
     const job = previewWorkflow.jobs.find(job => job.name === name);
     const acquire = job.steps.findIndex(step => step.text.includes(`id: ${leaseId}\n`));
@@ -950,7 +1013,7 @@ test('failed lease acquisition skips snapshots, deployments, recovery and live c
 });
 
 test('lease release runs after failure or cancellation only when this run acquired it', () => {
-  for (const [name, leaseId] of [['preview', 'lease'], ['production', 'production_lease']]) {
+  for (const [name, leaseId] of [['preview', 'lease'], ['production', 'production_lease'], ['worker-production', 'production_lease']]) {
     const release = previewWorkflow.jobs.find(job => job.name === name).steps.at(-1);
     const condition = release.text.match(/^if: (.+)$/m)[1];
     for (const outcome of ['success', 'failure', 'cancelled', 'skipped']) {

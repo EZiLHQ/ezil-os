@@ -13,6 +13,8 @@ OUT="$(mkdir -p "${EZIL_COPILOT_E2E_OUT:-./ezil-e2e-out}" && cd "${EZIL_COPILOT_
 CODE_URL=""
 FORWARD_PORT="${EZIL_COPILOT_E2E_PORT:-18443}"
 FORWARD_PID=""
+# Passes to run, in order (default all): fresh returning history sessions compaction phone early subagent flash
+PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions compaction phone early subagent flash} "
 MOCK_PORT=4142
 TEST_TOKEN=lanec-e2e-only
 CAPTURE_DIR=/tmp/copilot-ezil-mock
@@ -118,6 +120,18 @@ boot() { # boot <stage-dir>
 
 inx() { docker exec "$NAME" bash -lc "$*"; }
 
+settings_kept_with_policy() {
+  docker exec -i "$NAME" node - <<'JS'
+const fs = require("fs");
+const read = path => JSON.parse(fs.readFileSync(path, "utf8"));
+const kept = read("/home/neko/project/.ezil/settings.json");
+const user = read("/tmp/code-server-data/User/settings.json");
+const want = { ...kept, "task.allowAutomaticTasks": "off" };
+const entries = o => JSON.stringify(Object.keys(o).sort().map(k => [k, o[k]]));
+process.exit(entries(user) === entries(want) ? 0 : 1);
+JS
+}
+
 container_checks() { # container_checks <report-file>
   local rep="$1" ok=1
   {
@@ -143,9 +157,10 @@ if(machine["chat.allowAnonymousAccess"]!==true||machine["chat.disableAIFeatures"
   [[ "$ok" == 1 ]]
 }
 
-start_mock() {
+start_mock() { # start_mock [flash]: flash serves a v1 catalog that suggests Gemini 3.8 Flash (EZIL_MOCK_FLASH=1)
+  local flash=0; [[ "${1:-}" == flash ]] && flash=1
   docker cp "$here/copilot-ezil-messages-mock.mjs" "$NAME:/tmp/copilot-ezil-messages-mock.mjs"
-  docker exec -d "$NAME" bash -c "node /tmp/copilot-ezil-messages-mock.mjs ${MOCK_PORT} /home/neko/project ${CAPTURE_DIR} >/tmp/copilot-ezil-mock.log 2>&1"
+  docker exec -d "$NAME" bash -c "EZIL_MOCK_FLASH=$flash node /tmp/copilot-ezil-messages-mock.mjs ${MOCK_PORT} /home/neko/project ${CAPTURE_DIR} >/tmp/copilot-ezil-mock.log 2>&1"
   sleep 1
   inx "curl -fsS -H 'Authorization: Bearer ${TEST_TOKEN}' http://127.0.0.1:${MOCK_PORT}/ai/v1/models" >/dev/null
 }
@@ -154,6 +169,15 @@ run_browser() { # run_browser <outdir>
   EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project \
   EZIL_E2E_CONTAINER="$NAME" EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" \
   EZIL_E2E_OUT="$1" node "$here/copilot-ezil.mjs"
+}
+
+run_compaction() { # run_compaction <outdir>
+  EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" \
+  EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" EZIL_E2E_OUT="$1" node "$here/copilot-ezil-compaction.mjs"
+}
+run_history() { # run_history <create|verify|sessions> <outdir>
+  EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" \
+  EZIL_E2E_PHASE="$1" EZIL_E2E_OUT="$2" node "$here/copilot-ezil-history.mjs"
 }
 
 collect_logs() { # collect_logs <prefix>
@@ -167,8 +191,9 @@ collect_logs() { # collect_logs <prefix>
 }
 
 # ── Pass 1: fresh user ───────────────────────────────────────────────────────
-echo "[e2e] pass 1 — fresh user, image $IMAGE"
 start_dns_sidecar || exit 1
+if [[ "$PASSES" == *" fresh "* ]]; then
+echo "[e2e] pass 1 — fresh user, image $IMAGE"
 ST1="$WORK/fresh"; WS1="$ST1/home/neko/project"; mkdir -p "$WS1" "$ST1/etc/ezil"
 echo 'hello from the e2e workspace' >"$WS1/README.md"
 printf 'before\n' >"$WS1/existing.txt"
@@ -184,8 +209,10 @@ run_browser "$OUT/fresh" || fail=1
 collect_logs fresh
 network_checks fresh || fail=1
 reset_sink_logs
+fi
 
 # ── Pass 2: returning user ───────────────────────────────────────────────────
+if [[ "$PASSES" == *" returning "* ]]; then
 echo "[e2e] pass 2 — returning user with restored .ezil/ state, a masking User settings.json and a pre-existing BYOK group"
 ST2="$WORK/returning"; WS2="$ST2/home/neko/project"; mkdir -p "$WS2/.ezil" "$ST2/etc/ezil"
 cp "$here/copilot-ezil-models.json" "$ST2/etc/ezil/models.e2e.json"
@@ -200,13 +227,123 @@ cp "$WS2/.ezil/settings.json" "$UD2/Machine/settings.json"
 echo '[{"name":"Someone else","vendor":"openai","apiKey":"${input:chat.lm.secret.e2e}"}]' >"$UD2/User/chatLanguageModels.json"
 boot "$ST2"
 container_checks "$OUT/returning-container-checks.txt" || fail=1
-inx 'cmp /home/neko/project/.ezil/settings.json /tmp/code-server-data/User/settings.json' || fail=1
+# Restore is exact apart from the one key editor-state.sh enforces on every launch (it keeps a
+# cloned repository's tasks from running on open): task.allowAutomaticTasks is always "off".
+settings_kept_with_policy && echo "PASS  restored user settings equal the workspace copy plus task.allowAutomaticTasks=off" \
+  || { echo "FAIL  restored user settings differ from the workspace copy beyond the enforced task policy"; fail=1; }
 inx 'grep -Eq "\"vendor\": ?\"openai\"" /tmp/code-server-data/User/chatLanguageModels.json' && echo "PASS  pre-existing BYOK group survived the merge" || { echo "FAIL  pre-existing BYOK group was clobbered"; fail=1; }
 start_mock || fail=1
 run_browser "$OUT/returning" || fail=1
 collect_logs returning
 network_checks returning || fail=1
+reset_sink_logs
+fi
 
+# ── Pass 3: chat history survives a restart (Cloudflare: /tmp is new, the workspace is not) ──
+if [[ "$PASSES" == *" history "* ]]; then
+echo "[e2e] pass 3 — history: chat in a fresh profile, then a new container with the same workspace and a new browser"
+ST3="$WORK/history"; mkdir -p "$ST3/home/neko/project" "$ST3/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST3/etc/ezil/models.e2e.json"
+boot "$ST3"
+start_mock || fail=1
+run_history create "$OUT/history-create" || fail=1
+collect_logs history-create
+network_checks history-create || fail=1
+reset_sink_logs
+ST4="$WORK/history-restart"; mkdir -p "$ST4/home/neko" "$ST4/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST4/etc/ezil/models.e2e.json"
+docker cp "$NAME:/home/neko/project" "$ST4/home/neko/"
+# Another address: code-server keys its workspace storage (and the browser its IndexedDB) to
+# the host, as a Cloudflare <-> AWS move or a new hostname would.
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$ST4"
+start_mock || fail=1
+run_history verify "$OUT/history-verify" || fail=1
+collect_logs history-verify
+reset_sink_logs
+fi
+
+# ── Pass 4: a chat left while it answers stays reachable (the in-view Sessions list) ──
+if [[ "$PASSES" == *" sessions "* ]]; then
+echo "[e2e] pass 4 — sessions: Go Back while an answer streams, reopen it from Sessions, then a new browser"
+ST5="$WORK/sessions"; mkdir -p "$ST5/home/neko/project" "$ST5/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST5/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$ST5"
+start_mock || fail=1
+run_history sessions "$OUT/sessions" || fail=1
+collect_logs sessions
+network_checks sessions || fail=1
+fi
+
+# ── Pass 5: a long Kimi chat outgrows the input bound and continues, compacted (founder 75e327c8) ──
+if [[ "$PASSES" == *" compaction "* ]]; then
+echo "[e2e] pass 5 — compaction: a long Kimi K3 chat with Copilot's summariser off continues past the byte bound"
+ST6="$WORK/compaction"; mkdir -p "$ST6/home/neko/project" "$ST6/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST6/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$ST6"
+start_mock || fail=1
+run_compaction "$OUT/compaction" || fail=1
+collect_logs compaction
+network_checks compaction || fail=1
+fi
+
+# ── Pass 6: a phone's narrow chat keeps the model picker's name (patch-copilot-chat.sh picker-order) ──
+if [[ "$PASSES" == *" phone "* ]]; then
+echo "[e2e] pass 6 — phone: the composer's model picker keeps its name, opens and switches by touch (Android and iPhone), the pick reaches the Gateway and survives a reload; desktop by mouse"
+ST7="$WORK/phone"; mkdir -p "$ST7/home/neko/project" "$ST7/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST7/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$ST7"
+start_mock || fail=1
+EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" \
+  EZIL_E2E_OUT="$OUT/phone" node "$here/copilot-ezil-phone.mjs" || fail=1
+collect_logs phone
+network_checks phone || fail=1
+fi
+
+# ── Pass 6b: a new browser profile's first, early message is answered (patch-copilot-chat.sh chat-enabled) ──
+if [[ "$PASSES" == *" early "* ]]; then
+echo "[e2e] pass 6b — early: a new browser profile sends at once (desktop and Android touch); answered, no \"Chat took too long to get ready\""
+ST6B="$WORK/early"; mkdir -p "$ST6B/home/neko/project" "$ST6B/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST6B/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$ST6B"
+start_mock || fail=1
+EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" \
+  EZIL_E2E_OUT="$OUT/early" node "$here/copilot-ezil-early.mjs" || fail=1
+collect_logs early
+network_checks early || fail=1
+fi
+
+# ── Pass 7: an Agent turn starts a subagent on another EZiL model (VS Code's runSubagent `model`) ──
+if [[ "$PASSES" == *" subagent "* ]]; then
+echo "[e2e] pass 7 — subagent: runSubagent with a model runs the child on it, without one inherits the parent's, an unlisted one is refused"
+ST8="$WORK/subagent"; mkdir -p "$ST8/home/neko/project" "$ST8/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST8/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$ST8"
+start_mock || fail=1
+EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" \
+  EZIL_E2E_OUT="$OUT/subagent" node "$here/copilot-ezil-subagent.mjs" || fail=1
+collect_logs subagent
+network_checks subagent || fail=1
+fi
+
+# ── Pass 8: the Gateway's suggested Gemini 3.8 Flash is the first model; a pick stays picked ──
+if [[ "$PASSES" == *" flash "* ]]; then
+echo "[e2e] pass 8 — flash: a catalog that suggests Gemini 3.8 Flash makes it the first model, its turn has no sampling, a picked Qwen survives a reload and a new chat"
+ST9="$WORK/flash"; mkdir -p "$ST9/home/neko/project" "$ST9/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$ST9/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$ST9"
+start_mock flash || fail=1
+EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" \
+  EZIL_E2E_OUT="$OUT/flash" node "$here/copilot-ezil-flash.mjs" || fail=1
+collect_logs flash
+network_checks flash || fail=1
+fi
 rm -rf "$WORK" 2>/dev/null || true
 if [[ $fail == 0 ]]; then echo "[e2e] ALL PASSED — artifacts in $OUT"; else echo "[e2e] FAILURES — see $OUT" >&2; fi
 exit $fail

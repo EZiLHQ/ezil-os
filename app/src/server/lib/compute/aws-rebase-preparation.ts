@@ -3,18 +3,26 @@ import { z } from 'zod';
 import { LifecycleDeploymentSchema, SourceLifecycleDeploymentSchema } from './aws-intent';
 import { RebaseCounter, RebaseDigest, RebaseHash, RebaseSnapshot, RebaseTime, RebaseUuid, RebaseVolume } from './aws-rebase-json';
 
+/** DESIGN R: a STOPPED computer's released warm-pool host (retired claim row, provision digest, proven release). Last key and
+ * omitted when absent, as in infra's PreparationDocumentSchema: existing documents and digests are byte-identical. */
+export const ReleasedPoolHostSchema = z.object({ poolHostId: RebaseUuid, lifecycleDigest: RebaseHash,
+    releaseExecutionArn: z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:execution:[A-Za-z0-9_-]{1,80}:computer-[0-9a-f-]{36}$/) }).strict();
 export const RebasePreparationSchema = z.object({
     schemaVersion: z.literal(1), jobId: RebaseUuid, computerId: RebaseUuid,
     sourceInstanceId: z.string().regex(/^i-[0-9a-f]{17}$/), sourceVolumeId: RebaseVolume, fsUuid: RebaseUuid,
     sourceGeneration: RebaseCounter, sourceLeaseEpoch: RebaseCounter, sourceFenceToken: RebaseUuid,
     fromDigest: RebaseDigest, toDigest: RebaseDigest, volumeGiB: z.number().int().min(1).max(16384),
     sourceDeployment: SourceLifecycleDeploymentSchema, deployment: LifecycleDeploymentSchema, createdAt: RebaseTime,
+    releasedPoolHost: ReleasedPoolHostSchema.optional(),
 }).strict().superRefine((p, ctx) => {
     const from = p.sourceDeployment, to = p.deployment;
     if (p.fromDigest === p.toDigest || p.fromDigest !== from.lowerImageDigest || p.fromDigest !== to.previousLowerImageDigest
         || p.toDigest !== to.lowerImageDigest || !to.preparationStateMachineVersionArn
         || ['accountId', 'region', 'namespace', 'zoneId', 'dataKeyArn'].some((key) => from[key as keyof typeof from] !== to[key as keyof typeof to])
-        || p.volumeGiB < to.storage.dataMinGiB || p.volumeGiB > to.storage.dataMaxGiB)
+        || p.volumeGiB < to.storage.dataMinGiB || p.volumeGiB > to.storage.dataMaxGiB
+        // The release ran on this namespace's lifecycle machine, in this account and region.
+        || (p.releasedPoolHost && !p.releasedPoolHost.releaseExecutionArn.startsWith(
+            to.stateMachineVersionArn.replace(':stateMachine:', ':execution:').replace(/:[1-9][0-9]*$/, ':computer-'))))
         ctx.addIssue({ code: 'custom', message: 'release_mismatch' });
 });
 export type RebasePreparation = z.infer<typeof RebasePreparationSchema>;

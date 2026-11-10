@@ -16,6 +16,10 @@ on:
         description: 'On main only - deploy the legacy Vercel and Worker production (rollback path)'
         type: boolean
         default: false
+      deploy_worker_only:
+        description: 'On main only - deploy ONLY the ezil-os-worker Cloudflare Worker (no Vercel, no migrations; AWS serves os.ezil.work)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -929,6 +933,283 @@ jobs:
             rollback-state.json
             production-release.json
             hosted-continuity-evidence/container-rollout.json
+          if-no-files-found: warn
+      - name: Release shared production lease
+        if: always() && steps.production_lease.outcome == 'success'
+        env:
+          LEASE_OWNER: os-prod-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 .github/scripts/staging-lock.py release --scope shared-production --owner "$LEASE_OWNER"
+
+  # Worker-only production deploy. The legacy `production` job above still owns the
+  # full Vercel+Worker+migrations path for `deploy_production`; this job ships ONLY
+  # the ezil-os-worker Cloudflare Worker (desktop/API zone ezil.org) and never runs
+  # production-migrations.mjs, a Vercel deploy, or a Vercel readback. AWS serves
+  # os.ezil.work and is deployed separately (deploy/aws/os-staging/deploy.sh), so the
+  # only AWS touch here is a read-only /api/health probe. It reuses the shared
+  # production lease and the deploy-production concurrency group, so it can never run
+  # beside the legacy path, and it rolls the Worker (and, when the image changed, the
+  # container) back to the captured version on failure under an ownership guard.
+  worker-production:
+    name: Deploy and verify the production Worker only
+    needs: [changes, images]
+    # Main deploys only from a confirmed manual dispatch, never from a push or merge.
+    if: >-
+      ${{ !cancelled() && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.deploy_worker_only == true &&
+          needs.changes.result == 'success' &&
+          (needs.images.result == 'success' || needs.images.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    environment: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read
+      actions: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      EZIL_DEPLOY_SHA: ${{ github.sha }}
+      EZIL_E2E_WORKER: ${{ vars.OS_WORKER_URL }}
+      EZIL_WORKER_NAME: ezil-os-worker
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22.16.0'
+      - name: Assert production environment contract
+        run: node .github/scripts/env-contract.mjs assert-job --repo ezil-os --environment production
+      - name: Validate production Worker target
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          from urllib.parse import urlparse
+          with open('worker/wrangler.toml', 'rb') as f:
+              config = tomllib.load(f)
+          assert config['name'] == os.environ['EZIL_WORKER_NAME'] == 'ezil-os-worker', 'Production must deploy the ezil-os-worker Worker'
+          url = urlparse(os.environ['EZIL_E2E_WORKER'])
+          assert url.scheme == 'https' and url.hostname == 'api-desktop.ezil.org' and not url.username and not url.password and not url.port and not url.query and not url.fragment and url.path in ('', '/'), 'OS_WORKER_URL must be the production api-desktop.ezil.org origin'
+          PY
+      - name: Reserve time for Worker deployment and recovery
+        id: deadline
+        # 45-minute deploy/rollout/recovery budget inside the 58-minute job timeout,
+        # with room to absorb up to 20 minutes of shared-lease wait.
+        run: echo "at=$(( $(date +%s) + 45 * 60 ))" >> "$GITHUB_OUTPUT"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.14'
+      - name: Initialize live evidence
+        run: |
+          mkdir -p live-evidence
+          printf 'source=%s\nbranch=%s\nimage_changed=%s\n' "$GITHUB_SHA" "$GITHUB_REF_NAME" '${{ needs.changes.outputs.image_changed }}' > live-evidence/run.txt
+      - name: Install Worker dependencies
+        working-directory: worker
+        run: bun install --frozen-lockfile
+      - name: Setup image builder
+        if: needs.changes.outputs.image_changed == 'true'
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: 'v0.25.0'
+      - name: Log in to the image registry
+        if: needs.changes.outputs.image_changed == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Download tested candidate image identities
+        if: needs.changes.outputs.image_changed == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: os-images-${{ github.sha }}
+      # GitHub concurrency is repository-local; this lease also fences other repos.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::452630323510:role/ezil-os-staging-lease
+          aws-region: us-east-1
+          role-duration-seconds: 7200
+      - name: Acquire shared production lease
+        id: production_lease
+        env:
+          LEASE_OWNER: os-prod-${{ github.run_id }}-${{ github.run_attempt }}
+        run: python3 .github/scripts/staging-lock.py acquire --scope shared-production --owner "$LEASE_OWNER" --ttl 7200 --wait 1200
+      - name: Probe AWS app health
+        id: aws_health
+        timeout-minutes: 2
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          // Read-only liveness of the AWS-served public app. The app ships separately
+          // (deploy/aws/os-staging/deploy.sh), so its SHA need not equal this release;
+          // record it as evidence and never assert it, never mutate.
+          const response = await fetch('https://os.ezil.work/api/health', { redirect: 'error', signal: AbortSignal.timeout(15000) });
+          assert.ok(response.ok, `AWS app health HTTP ${response.status}`);
+          const body = await response.json();
+          assert.equal(body.ok, true, 'AWS app /api/health did not report ok');
+          const sha = typeof body.sha === 'string' && /^[0-9a-f]{7,64}$/.test(body.sha) ? body.sha : null;
+          fs.writeFileSync('live-evidence/aws-health.json', JSON.stringify({ ok: body.ok, sha }));
+          JS
+      - name: Capture previous Worker and container identity
+        id: worker_capture
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node .github/scripts/release-state.mjs worker-capture
+      - name: Preserve recovery identities before Worker mutation
+        uses: actions/upload-artifact@v4
+        with:
+          name: os-worker-recovery-${{ github.sha }}-${{ github.run_attempt }}
+          path: previous-release.json
+          if-no-files-found: error
+      - name: Refuse a superseded main commit before deploy
+        id: current_main
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const { data: ref } = await github.rest.git.getRef({ ...context.repo, ref: 'heads/main' });
+            if (ref.object.sha !== process.env.EZIL_DEPLOY_SHA) core.setFailed('main moved; wait for its CI run');
+      - name: Prepare Dockerfile.release from the tested image
+        if: needs.changes.outputs.image_changed == 'true'
+        run: |
+          set -euo pipefail
+          node .github/scripts/release-state.mjs prepare
+          # prepare changes the default container; the Worker deploy must use it too.
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('worker/wrangler.toml')
+          path.write_text(path.read_text().replace('image = "./Dockerfile"', 'image = "./Dockerfile.release"'))
+          PY
+      - name: Capture container version before deploy
+        id: container_before
+        if: needs.changes.outputs.image_changed == 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node .github/scripts/release-state.mjs container-version
+      - name: Deploy Worker
+        id: worker
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          args=()
+          rollout=none
+          if [[ '${{ needs.changes.outputs.image_changed }}' == true ]]; then rollout=immediate; fi
+          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 16 * 60 ))
+          (( remaining > 0 )) || { echo '::error::Insufficient time to deploy and recover'; exit 1; }
+          current_main="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          [[ "$current_main" == "$EZIL_DEPLOY_SHA" ]] || { echo '::error::main moved; refusing Worker deploy'; exit 1; }
+          timeout --kill-after=10s "${remaining}s" ./node_modules/.bin/wrangler deploy "${args[@]}" --containers-rollout "$rollout" --message "git:$EZIL_DEPLOY_SHA"
+      - name: Wait for production container rollout
+        id: rollout
+        if: needs.changes.outputs.image_changed == 'true'
+        timeout-minutes: 11
+        env:
+          EZIL_PREVIOUS_CONTAINER_VERSION: ${{ steps.container_before.outputs.version }}
+          EZIL_CONTAINER_APPLICATION_ID: ${{ steps.container_before.outputs.id }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 16 * 60 ))
+          (( remaining > 0 )) || { echo '::error::Candidate image verification budget exhausted'; exit 1; }
+          EZIL_EXPECTED_CONTAINER_DIGEST="$(timeout --kill-after=10s "${remaining}s" node .github/scripts/release-state.mjs rollout-target)"
+          export EZIL_EXPECTED_CONTAINER_DIGEST
+          remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 16 * 60 ))
+          (( remaining > 0 )) || { echo '::error::Container rollout budget exhausted'; exit 1; }
+          timeout --kill-after=10s "${remaining}s" node e2e/await-container-rollout.mjs
+      - name: Verify production Worker identity
+        id: identity
+        timeout-minutes: 3
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node e2e/verify-cloud-deployment.mjs worker > live-evidence/deployment-identity.json
+      - name: Record successfully deployed image source
+        if: steps.identity.outcome == 'success'
+        env:
+          IMAGE_CHANGED: ${{ needs.changes.outputs.image_changed }}
+          REUSED_IMAGE_SOURCE: ${{ needs.changes.outputs.image_source }}
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          let source = process.env.REUSED_IMAGE_SOURCE;
+          if (process.env.IMAGE_CHANGED === 'true') {
+            const images = JSON.parse(fs.readFileSync('tested-images.json', 'utf8'));
+            assert.equal(images.tested, true);
+            assert.equal(images.source, process.env.EZIL_DEPLOY_SHA);
+            source = images.source;
+          }
+          assert.match(source ?? '', /^[a-f0-9]{40}$/);
+          fs.writeFileSync('live-evidence/image-source.json', JSON.stringify({source, tested:true,
+            deployment:process.env.EZIL_DEPLOY_SHA, branch:process.env.GITHUB_REF_NAME}));
+          JS
+      - name: Guard production Worker recovery ownership
+        id: rollback_guard
+        if: always() && (steps.worker.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure') && steps.worker_capture.outcome == 'success'
+        timeout-minutes: 1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if ! node .github/scripts/release-state.mjs worker-rollback-guard; then
+            echo '::error::Recovery ownership check failed: another release may own production; no rollback mutations will run.'
+            exit 1
+          fi
+      - name: Roll back production Worker
+        if: always() && (steps.worker.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure') && steps.rollback_guard.outcome == 'success'
+        timeout-minutes: 2
+        working-directory: worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: ./node_modules/.bin/wrangler rollback '${{ steps.worker_capture.outputs.worker_version }}' -y
+      - name: Restore previous container image and await rollback rollout
+        if: always() && (steps.worker.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure') && steps.rollback_guard.outcome == 'success' && needs.changes.outputs.image_changed == 'true'
+        timeout-minutes: 7
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: node .github/scripts/release-state.mjs worker-container-rollback
+      - name: Verify production Worker recovery
+        if: always() && (steps.worker.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure') && steps.rollback_guard.outcome == 'success'
+        timeout-minutes: 3
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          for attempt in {1..12}; do
+            if node .github/scripts/release-state.mjs worker-rollback-check; then exit 0; fi
+            sleep 5
+          done
+          exit 1
+      - name: Fail after production Worker recovery
+        if: always() && (steps.worker.outcome == 'failure' || steps.rollout.outcome == 'failure' || steps.identity.outcome == 'failure')
+        run: |
+          if [[ '${{ steps.rollback_guard.outcome }}' != success ]]; then
+            echo '::error::Production Worker failed and recovery ownership was not established; rollback mutations were skipped.'
+          fi
+          echo '::error::Production Worker deploy or identity check failed; see the preceding rollback results.'
+          exit 1
+      - name: Upload live evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-evidence-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            live-evidence
+            previous-release.json
+            container-rollback.json
+            rollback-state.json
           if-no-files-found: warn
       - name: Release shared production lease
         if: always() && steps.production_lease.outcome == 'success'

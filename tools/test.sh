@@ -377,7 +377,7 @@ run_app () {
     typecheck "$TREE/app" npx tsc --noEmit -p tsconfig.json || return 1
     # A configured linter nobody runs is a linter that is already failing.
     ( cd "$TREE/app" && bun run lint ) || return 1
-    ( cd "$TREE/app" && npx vitest run )
+    ( cd "$TREE/app" && npx vitest run "$@" )
 }
 
 run_worker () {

@@ -333,7 +333,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI credit outbox with P
         const subscription = { id: subId, customer, status: 'active', sku: 'standard_monthly_v3', currentPeriodStart: start,
             currentPeriodEnd: end, cancelAtPeriodEnd: false } as StripeSubscription;
         const invoice: StripeInvoice = { id: invoiceId, customer, status: 'paid', subscriptionId: subId,
-            billingReason: 'subscription_cycle', metadataKind: null, hostedInvoiceUrl: null, periodStart: start, periodEnd: end,
+            billingReason: 'subscription_cycle', metadataKind: null, hostedInvoiceUrl: null, total: 2000, amountPaid: 2000, periodStart: start, periodEnd: end,
             lines: [{ id: 'line', lookupKey: 'ezil_standard_monthly_v3', subscriptionId: subId,
                 amount: 2000, proration: false, periodStart: start, periodEnd: end }] };
         const stripe = { retrieveInvoice: async () => invoice, retrieveSubscription: async () => subscription,
@@ -361,7 +361,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI credit outbox with P
         const subscription = { id: subId, customer, status: 'active', sku: 'premium_monthly_v3', currentPeriodStart: start,
             currentPeriodEnd: end, cancelAtPeriodEnd: false } as StripeSubscription;
         const invoice: StripeInvoice = { id: invoiceId, customer, status: 'paid', subscriptionId: subId,
-            billingReason: 'subscription_update', metadataKind: null, hostedInvoiceUrl: null, periodStart: start, periodEnd: end,
+            billingReason: 'subscription_update', metadataKind: null, hostedInvoiceUrl: null, total: 4000, amountPaid: 4000, periodStart: start, periodEnd: end,
             lines: [{ id: 'credit', lookupKey: 'ezil_standard_monthly_v3', subscriptionId: subId, amount: -1000, proration: true, periodStart: effective, periodEnd: end },
                 { id: 'premium', lookupKey: 'ezil_premium_monthly_v3', subscriptionId: subId, amount: 5000, proration: true, periodStart: effective, periodEnd: end }] };
         const stripe = { retrieveInvoice: async () => invoice, retrieveSubscription: async () => subscription,

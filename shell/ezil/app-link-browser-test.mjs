@@ -81,7 +81,9 @@ const windows = page => page.locator('.window[data-app]');
 const geometry = async page => {
     await page.waitForFunction(() => {
         const w = document.querySelector('.window[data-app="code"]');
-        return !!w && !window.$(w).is(':animated') && w.getAnimations().length === 0;
+        // Also wait out UIWindow.js showWindow's RAF-scheduled opacity 0->1 fade (70ms CSS transition, #242):
+        // getAnimations() can read empty before that transition registers, so require the fade to have settled.
+        return !!w && !window.$(w).is(':animated') && w.getAnimations().length === 0 && getComputedStyle(w).opacity === '1';
     }, null, { timeout: 5000 });
     const read = () => page.evaluate(async () => {
         await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
@@ -214,7 +216,7 @@ try {
         assert.equal((await where())[0], bad, `${bad} is left as it was`);
     }
     await nav.goto(`${origin}/app/browser`); await nav.locator('.window[data-app="desktop"]').waitFor();
-    assert.equal((await where())[0], '/app/desktop', 'the browser alias becomes the registry id');
+    assert.equal((await where())[0], '/app/browser', 'the Browser is written at /app/browser');
     // ── the entry follows the screen (docs/APP-ROUTES.md §5 "State") ───────
     // Back never resizes an open Code, so the entry it lands on takes the
     // view Code shows now, and a reload of that entry reopens Code that way.

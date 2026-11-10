@@ -27,6 +27,10 @@ export const EXPLICIT_FILES = Object.freeze([
     'app/drizzle/0009_capacity_demands.sql',
     'app/drizzle/0010_migration_restore_progress.sql',
     'app/drizzle/0011_feedback.sql',
+    'app/drizzle/0012_compute_reverse_moves.sql',
+    'app/drizzle/0019_operator_entitlements.sql',
+    'app/drizzle/0020_operator_refusal_receipts.sql',
+    'app/drizzle/0021_standard_trial.sql',
 ]);
 const TABLE = 'public.ezil_staging_schema_log';
 const HASH = /^[a-f0-9]{64}$/;
@@ -170,12 +174,20 @@ export function run(args = process.argv.slice(2), {
         const connection = databaseUrl ? validateDatabaseUrl(databaseUrl, target) : null;
         if (!connection && (mode !== 'plan' || target.startsWith('aws-'))) refuse('BILLING_STAGING_DATABASE_URL is required.');
         const ordered = orderFiles(readdirSync(resolve(ROOT, 'app/drizzle')), readdirSync(resolve(ROOT, 'docs/aws-computers/sql')));
-        // Production applies the full ordered list under the same guards as preview: localhost:5432 host
-        // pin, pg_control system-id pin, SHA-256 re-check, one logged transaction per file (release plan
-        // §4.1-4.2). These files must really run there, never be recorded as already present.
+        // Production applies the reviewed list that belongs there (release plan §4.1-4.2) under the same guards as
+        // preview: localhost:5432 host pin, pg_control system-id pin, SHA-256 re-check, one logged transaction per
+        // file. 0003-0011 are already applied there; 0019-0021 apply with THIS release. None of them may be baselined
+        // (recorded as already present) on production — they must really run.
         if (target === 'aws-production' && mode === 'baseline' &&
-            requested.some(name => ['0003_pool_hosts_v2.sql.txt', '0008_pool_dispatch.sql', '0009_capacity_demands.sql', '0010_migration_restore_progress.sql', '0011_feedback.sql'].includes(basename(name)))) {
-            refuse('Pool hosts v2, pool dispatch, capacity demand, migration restore progress and feedback must be applied on production, never baselined.');
+            requested.some(name => ['0003_pool_hosts_v2.sql.txt', '0008_pool_dispatch.sql', '0009_capacity_demands.sql', '0010_migration_restore_progress.sql', '0011_feedback.sql', '0019_operator_entitlements.sql', '0020_operator_refusal_receipts.sql', '0021_standard_trial.sql'].includes(basename(name)))) {
+            refuse('Pool hosts v2, pool dispatch, capacity demand, migration restore progress, feedback, operator entitlements, operator refusal receipts and the Standard trial must be applied on production, never baselined.');
+        }
+        // 0012 (reverse moves) changes no pre-existing table and the app probes for it ("production today"): it stays
+        // staging-only, never applied or baselined on production (it is skipped in the apply loop below, and any
+        // explicit baseline/apply naming it is refused here).
+        if (target === 'aws-production' &&
+            requested.some(name => basename(name) === '0012_compute_reverse_moves.sql')) {
+            refuse('Reverse moves (0012) are staging-only; production apply/baseline is forbidden.');
         }
         const files = ordered.map((file) => ({ file, sha256: sha256(readFileSync(resolve(ROOT, file))) }));
         const selected = new Set(requested.map((name) => {
@@ -238,6 +250,11 @@ export function run(args = process.argv.slice(2), {
         }
         for (const entry of plan) {
             if (mode === 'baseline' && !selected.has(entry.file)) continue;
+            // 0012 (reverse moves) is staging-only on production: never applied or logged there (the app probes for it).
+            if (target === 'aws-production' && basename(entry.file) === '0012_compute_reverse_moves.sql') {
+                emit(`${entry.file}: staging-only on production; skipped`);
+                continue;
+            }
             if (entry.status !== 'pending') {
                 emit(`${entry.file}: already logged; skipped`);
                 continue;

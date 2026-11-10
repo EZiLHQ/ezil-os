@@ -32,7 +32,7 @@
 // local runtime serve the shell at `/os` alone (the native one refuses any
 // query string), so a rewritten URL there would be a 404 on reload. On those
 // providers this module never rewrites the path; Back/Forward still focuses.
-import { parseAppLink, parseFolder } from './app-link.js';
+import { parseAppLink, parseFolder, routeName } from './app-link.js';
 
 export const OS_PATH = '/os';
 // Page-level: the server picks the computer from it on a reload, so it rides
@@ -55,12 +55,13 @@ function query (entries) {
 }
 
 /**
- * `/app/<id>` plus its parameters, in the given order.
+ * `/app/<id>` plus its parameters, in the given order. The path names the
+ * app's route (`routeName`: the Browser, id `desktop`, is `/app/browser`).
  * @param {string} id  A registry app id.
  * @param {Record<string, string|undefined>|[string, string][]} [params]
  */
 export function appUrl (id, params = {}) {
-    return `/app/${encodeURIComponent(id)}${query(Array.isArray(params) ? params : Object.entries(params))}`;
+    return `/app/${encodeURIComponent(routeName(id))}${query(Array.isArray(params) ? params : Object.entries(params))}`;
 }
 
 /** The URL parameters that belong to one app, from a parsed link. */
@@ -68,7 +69,9 @@ export function linkParams (link) {
     if ( ! link ) return {};
     if ( link.id === 'settings' ) return link.initialTab ? { tab: link.initialTab } : {};
     if ( link.id !== 'code' ) return {};
-    const project = link.project ? { project: link.project.projectId, repo: link.project.repoId, path: link.project.path } : {};
+    // A repository address (founder 547ed35a) is written back as `repo` alone, so history, reload and relaunch keep it.
+    const project = link.project?.repoUrl ? { repo: link.project.repoUrl }
+        : link.project ? { project: link.project.projectId, repo: link.project.repoId, path: link.project.path } : {};
     // Code's folder (folder-url-sync): always written as the absolute path the parser normalised.
     return typeof link.folder === 'string' ? { ...project, folder: link.folder } : project;
 }
@@ -99,6 +102,7 @@ export function replaceCodeParamsUrl (location, next, pageParams = []) {
     }
     return `${location.pathname}${pairs.length ? `?${pairs.join('&')}` : ''}${location.hash ?? ''}`;
 }
+
 
 /**
  * The Code parameters a Code window announces for the folder its editor shows
@@ -172,7 +176,7 @@ export function canonicalUrl (location, link, { search } = {}) {
     const kept = raw.split('&').filter(pair => pair !== '' && ! SELECTOR_KEYS.has(decodedKey(pair))
         && ! (tabbed && decodedKey(pair) === 'tab'));
     if ( tabbed ) kept.unshift(`tab=${encodeQueryValue(link.initialTab)}`);
-    return `/app/${encodeURIComponent(link.id)}${kept.length ? `?${kept.join('&')}` : ''}${location.hash ?? ''}`;
+    return `/app/${encodeURIComponent(routeName(link.id))}${kept.length ? `?${kept.join('&')}` : ''}${location.hash ?? ''}`;
 }
 
 /**

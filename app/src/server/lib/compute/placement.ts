@@ -43,6 +43,8 @@
 
 import { TRPCError } from '@trpc/server';
 import { sql, type SQL } from 'drizzle-orm';
+import { operatorBranchEnabled } from '@/server/entitlements/operator/installed';
+import { paidComputeAccessCtes } from '@/server/billing/v3/paid-compute-access-sql';
 
 import { totalsOf, utcNextMonthStart, type MonthUsage, type UsageTotals } from './usage';
 import { INSTANCE_VCPU, instanceVcpu } from './aws-config';
@@ -291,10 +293,11 @@ export type PlacementFields = Partial<{
     [K in keyof typeof MUTABLE_COLUMNS]: (typeof MUTABLE_COLUMNS)[K][1] extends 'timestamptz' ? Date | null : string | null;
 }>;
 
-// Placement.updatedAt is a JavaScript Date and the generation CAS uses exact
-// SQL equality. Every placement updated_at writer must therefore store whole
-// milliseconds. Advance at least 1 ms on updates, even within one transaction
-// (now() is fixed there), so a same-state write always invalidates old snapshots.
+// Placement.updatedAt is a JavaScript Date; legacy rows may hold sub-millisecond
+// values, so the CAS compares at millisecond precision. Every placement updated_at
+// writer stores whole milliseconds. Advance to at least the next millisecond on
+// updates, even within one transaction (now() is fixed there), so a same-state
+// write always invalidates old snapshots.
 const PLACEMENT_INSERT_TIME = sql`date_trunc('milliseconds', now())`;
 const PLACEMENT_UPDATE_TIME = sql`GREATEST(date_trunc('milliseconds', now()), date_trunc('milliseconds', updated_at) + interval '1 millisecond')`;
 
@@ -1039,7 +1042,7 @@ async function casInTx(
                 ${guard.lifecycleDigest !== undefined ? sql` AND lifecycle_digest = ${guard.lifecycleDigest}` : sql``}
                 ${guard.fenceToken !== undefined ? sql` AND fence_token = ${guard.fenceToken}::uuid` : sql``}
                 ${guard.volumeId !== undefined ? sql` AND volume_id = ${guard.volumeId}` : sql``}
-                ${guard.updatedAt !== undefined ? sql` AND updated_at = ${guard.updatedAt.toISOString()}::timestamptz` : sql``}
+                ${guard.updatedAt !== undefined ? sql` AND date_trunc('milliseconds', updated_at) = ${guard.updatedAt.toISOString()}::timestamptz` : sql``}
             RETURNING ${SELECT_COLUMNS}`),
     );
     if (rows.length === 0) return { ok: false, reason: 'cas_conflict' };
@@ -1632,6 +1635,14 @@ export async function checkEnrollmentDigest(db: PlacementExecutor, p: Placement,
     return rows.length === 1 && rows[0]!.lower_image_digest === digest;
 }
 
+/** The lower this computer's volume last booted on (enrollment or image-job evidence); null when never recorded or unreadable. */
+export async function readRecordedLowerDigest(db: PlacementExecutor, computerId: string): Promise<string | null> {
+    const rows = rowsOf(await db.execute(sql`/* placement:recorded-lower */ SELECT lower_image_digest
+        FROM public.ezil_computer_placements WHERE computer_id = ${canonicalId(computerId)}::uuid LIMIT 2`));
+    const digest = rows.length === 1 ? rows[0]!.lower_image_digest : null;
+    return typeof digest === 'string' && /^sha256:[0-9a-f]{64}$/.test(digest) ? digest : null;
+}
+
 /** Complete only the consumed boot, preserving receipt progress and fencing a moved epoch. */
 export const POOL_SESSION_PENDING = 'pool_session_pending';
 export async function finishEnrollment(
@@ -1979,25 +1990,26 @@ export interface PaidMigrationCandidate {
     toSize: 'standard' | 'premium';
 }
 
-/** One computer per paid owner, including the implicit Cloudflare placement. */
+/**
+ * One computer per paid owner, including the implicit Cloudflare placement. Product entitlements v1 (0019 applied): an
+ * operator grant in effect is a paid owner too (provider-migrate-reconcile then re-checks the entitlement and admission).
+ */
 export async function paidCloudflareCandidates(db: PlacementExecutor, now: Date, limit = 10): Promise<PaidMigrationCandidate[]> {
     const count = Number.isFinite(limit) ? Math.max(0, Math.min(10, Math.trunc(limit))) : 0;
     if (!count) return [];
-    const result = await db.execute(sql`SELECT DISTINCT ON (s.user_id) s.user_id::text AS user_id,
-        c.id::text AS computer_id, s.sku
-        FROM public.ezil_billing_subscriptions s
+    const at = now.toISOString();
+    const result = await db.execute(sql`WITH ${paidComputeAccessCtes(at, await operatorBranchEnabled(db))}
+        SELECT DISTINCT ON (s.user_id) s.user_id::text AS user_id, c.id::text AS computer_id, s.sku
+        FROM eligible s
         JOIN public.ezil_computers c ON c.user_id = s.user_id AND c.deleted_at IS NULL
         LEFT JOIN public.ezil_computer_placements p ON p.computer_id = c.id
-        WHERE s.sku IN ('standard_monthly_v3', 'premium_monthly_v3') AND s.status = 'active'
-          AND s.current_period_start <= ${now.toISOString()}::timestamptz
-          AND s.current_period_end > ${now.toISOString()}::timestamptz
-          AND (p.computer_id IS NULL OR p.provider = 'cloudflare')
+        WHERE (p.computer_id IS NULL OR p.provider = 'cloudflare')
           AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_migrations done WHERE done.computer_id = c.id
             AND done.state = 'committed' AND done.last_error = 'fresh_provision')
           AND NOT EXISTS (SELECT 1 FROM public.ezil_compute_migrations m WHERE m.user_id = s.user_id
             AND (m.state NOT IN ('committed', 'failed_reopened', 'failed_needs_operator')
               OR m.updated_at >= ${new Date(now.getTime() - 600_000).toISOString()}::timestamptz))
-        ORDER BY s.user_id, s.current_period_end DESC, s.current_period_start DESC, c.slot, c.id LIMIT ${count}`);
+        ORDER BY s.user_id, c.slot, c.id LIMIT ${count}`);
     const rows: Record<string, unknown>[] = (Array.isArray(result) ? result : (result as { rows?: Record<string, unknown>[] })?.rows) ?? [];
     return rows.map(row => ({ userId: String(row.user_id), computerId: String(row.computer_id),
         toSize: row.sku === 'standard_monthly_v3' ? 'standard' : 'premium' }));
@@ -2012,7 +2024,7 @@ export async function savePoolEnrollmentNonce(tx: PlacementExecutor, p: Placemen
     nonce: { nonceHash: string; expiresAt: Date }): Promise<boolean> {
     return rowsOf(await tx.execute(sql`UPDATE public.ezil_computer_placements
         SET enroll_nonce_hash = ${nonce.nonceHash}, enroll_expires_at = ${nonce.expiresAt.toISOString()}::timestamptz,
-            updated_at = greatest(updated_at + interval '1 millisecond', clock_timestamp())
+            updated_at = ${PLACEMENT_UPDATE_TIME}
         WHERE computer_id = ${p.computerId}::uuid AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch}
             AND instance_id = ${p.instanceId} AND enroll_consumed_hash IS NULL AND enroll_nonce_hash IS NULL
         RETURNING computer_id`)).length === 1;

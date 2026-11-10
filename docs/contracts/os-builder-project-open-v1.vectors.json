@@ -1,0 +1,136 @@
+{
+  "contract": "ezil.os-builder-project-open.v1",
+  "version": "1.1.0-proposed",
+  "status": "Proposed 2026-11-03 by e1cd418a (request journey-32d-20261103-repo-open-resolver-v1). Local only; nothing staged or deployed. osWorker is implemented on OS feat/repo-open-resolver-20261103; universeOpen needs Universe slot4, worksCloneToken Works slot5, osApp the OS app owner (cb1d14e6 integrates). 1.1.0 (2026-11-03, request 88e642df-project-grant-contract-closure-v1, with universe-repo-open-v1 1.0.5): the Builder grant comes from Works os-grant with class 'project' (the QA row on api-staging), not clone-token; the open body adds computerLabel; W-2(a) is withdrawn.",
+  "doc": "docs/contracts/os-builder-project-open-v1.md",
+  "issuer": "https://id.ezil.work/",
+  "link": {
+    "owner": "Universe slot4",
+    "template": "<services.ezil_os.app_origins[environment]>/app/code?project=<builder_projects.public_id>&repo=<builder_projects.repository_id>",
+    "rule": "Rendered on the Builder project board for its owner only, when ALL hold: the viewer's account is builder_projects.user_id; repository_state is 'ready'; public_id and repository_id are lowercase canonical UUIDs; clone_url is exactly 'https://' + the deployment's paired Works Git host + '/' + route_name + '.git'; Universe's Works client has seen a clone-token answer carrying scope and defaultRef (worksCloneToken W-1; unchanged in 1.1.0). Otherwise launchUrl stays null with reason repository_not_ready or os_contract_unavailable. The link carries the two UUIDs only: never a token, remote, route name or path.",
+    "cases": [
+      { "case": "ready staging builder project", "row": { "public_id": "7d1f0f7e-5a8b-4c2d-9e3f-0a1b2c3d4e5f", "repository_id": "3c9a7b51-2d4e-4f60-8a1b-9c0d1e2f3a4b", "repository_state": "ready", "clone_url": "https://git-qa.ezil.work/acme-qa/site.git", "route_name": "acme-qa/site" }, "viewerIsOwner": true, "worksFieldsKnown": true, "environment": "staging",
+        "expect": "<services.ezil_os.app_origins.staging>/app/code?project=7d1f0f7e-5a8b-4c2d-9e3f-0a1b2c3d4e5f&repo=3c9a7b51-2d4e-4f60-8a1b-9c0d1e2f3a4b" },
+      { "case": "another account views the board", "row": { "public_id": "7d1f0f7e-5a8b-4c2d-9e3f-0a1b2c3d4e5f", "repository_id": "3c9a7b51-2d4e-4f60-8a1b-9c0d1e2f3a4b", "repository_state": "ready", "clone_url": "https://git-qa.ezil.work/acme-qa/site.git", "route_name": "acme-qa/site" }, "viewerIsOwner": false, "worksFieldsKnown": true, "environment": "staging", "expect": null },
+      { "case": "repository still provisioning", "row": { "public_id": "7d1f0f7e-5a8b-4c2d-9e3f-0a1b2c3d4e5f", "repository_id": null, "repository_state": "provisioning", "clone_url": null, "route_name": null }, "viewerIsOwner": true, "worksFieldsKnown": true, "environment": "staging", "expect": null },
+      { "case": "repository id is not a canonical UUID", "row": { "public_id": "7d1f0f7e-5a8b-4c2d-9e3f-0a1b2c3d4e5f", "repository_id": "repo-42", "repository_state": "ready", "clone_url": "https://git-qa.ezil.work/acme-qa/site.git", "route_name": "acme-qa/site" }, "viewerIsOwner": true, "worksFieldsKnown": true, "environment": "staging", "expect": null },
+      { "case": "clone_url not on the paired host (production gateway on staging)", "row": { "public_id": "7d1f0f7e-5a8b-4c2d-9e3f-0a1b2c3d4e5f", "repository_id": "3c9a7b51-2d4e-4f60-8a1b-9c0d1e2f3a4b", "repository_state": "ready", "clone_url": "https://github.ezil.work/acme-qa/site.git", "route_name": "acme-qa/site" }, "viewerIsOwner": true, "worksFieldsKnown": true, "environment": "staging", "expect": null },
+      { "case": "Works does not yet answer scope and defaultRef", "row": { "public_id": "7d1f0f7e-5a8b-4c2d-9e3f-0a1b2c3d4e5f", "repository_id": "3c9a7b51-2d4e-4f60-8a1b-9c0d1e2f3a4b", "repository_state": "ready", "clone_url": "https://git-qa.ezil.work/acme-qa/site.git", "route_name": "acme-qa/site" }, "viewerIsOwner": true, "worksFieldsKnown": false, "environment": "staging", "expect": null }
+    ]
+  },
+  "universeOpen": {
+    "owner": "Universe slot4",
+    "route": "POST /internal/project-repositories/open (unchanged path and response shape; 1.1.0 adds one request key for the builder branch)",
+    "request": { "keys": ["userIdToken", "projectId", "repositoryId", "computerLabel"], "ids": "lowercase canonical UUIDs", "computerLabelRule": "1.1.0: the OS app cannot tell a hired project from a builder one before Universe resolves it, so it sends computerLabel on EVERY open. Universe accepts the key on every open, requires it on the builder branch and ignores it on the hired branch. Order: Universe accepting it ships before the OS app sends it (an older strict parser would refuse hired opens). ^[0-9a-f]{16}$: the first 16 hex of sha256('ezil-os/computer-label/v1|' + computerId) of the person's own computer the open targets (universe-repo-open-v1 COMPUTER_LABEL), computed by the OS app server, never taken from the browser. Missing or malformed on a builder project: 403 project_repo_not_authorized (the uniform refusal; no new code), before Works is called. The label is not authorization: it only partitions the Works session (and so what os-sessions/revoke can target). Account authority is the bearer's sub (Works ownedByRepositoryId); computer authority is the OS Worker's v2 claims plus the .bind 'v1 <subject> <repositoryId> <url>' check at install." },
+    "identity": "Unchanged: EzilIdTokenVerifier (iss exactly https://id.ezil.work/, aud in services.ezil_os.id_token_audiences, Universe's own client excluded, exp/iat/nbf, sub), then exactly one active users row with provider 'auth0' and provider_id = sub.",
+    "resolution": "Hired first, unchanged: projects.public_id = projectId and a project_repositories row for it with id = repositoryId. Only when no hired project has that public_id: builder_projects.public_id = projectId AND builder_projects.repository_id = repositoryId. A projectId that is a hired AND a builder public_id is refused (403), never guessed. Invariant asserted by tests: a hired repository id never equals its project's id.",
+    "builderAuthorization": "role builder, only for the account that is builder_projects.user_id; the project is not deleted; repository_state is 'ready'; clone_url is exactly 'https://' + paired Works Git host + '/' + route_name + '.git'. Every other case is 403 project_repo_not_authorized, the same answer as a project that does not exist (no existence oracle). The per-account rate limit (60/min) and the append-only open audit apply as for hired projects.",
+    "grant": "1.1.0: Universe calls Works POST /v1/builder/selfserve-repositories/{builder_projects.repository_id}/os-grant on its paired Works (api-staging, the universe-repo-open-v1 QA row) with bearer = the request's own userIdToken (the person's OS-audience EZiL ID token, already verified; never logged, stored or sent anywhere else) and body exactly {computerLabel, class: 'project'}. It checks the 201 answer exactly (universe-repo-open-v1 works.osGrantProjectResponse): exactly its 11 keys; class 'project'; username 'ezil'; token matching ^egg_[0-9a-f]{64}$; repositoryId = the request's; cloneUrl exactly builder_projects.clone_url; expiresAt an ISO datetime after now and at most min(now + 300 s, userIdToken.exp) + 30 s; scope 'read' or 'write'; defaultBranch a branch name (BRANCH_RE). Any other status or answer, including the 60-minute web-clone grant and a legacy answer without class, is 502 project_repo_upstream_unavailable. Universe never substitutes a ref: binding.ref is 'refs/heads/' + defaultBranch, never a guessed 'refs/heads/main', which would open an existing repository as an empty clone without an error. Renewal (calling open again, then repo-grant) is scheduled from the returned expiresAt, never from a fixed timer (universe-repo-open-v1 works.projectGrantRenewal; pushGrant.refreshEndpoint.cadence).",
+    "response": { "binding": { "projectId": "= request projectId", "repositoryId": "= request repositoryId", "canonicalURL": "= builder_projects.clone_url", "ref": "= 'refs/heads/' + Works defaultBranch", "bindingVersion": "1" }, "access": { "role": "builder" }, "git": { "username": "ezil", "token": "Works egg_ grant", "expiresAt": "Works expiresAt", "scope": "Works scope" } },
+    "cases": [
+      { "case": "owner opens a ready builder project", "token": "valid, sub = owner", "project": "builder, ready", "expect": { "status": 200, "role": "builder" } },
+      { "case": "another account (wrong user)", "token": "valid, sub = someone else", "project": "builder, ready", "expect": { "status": 403, "error": "project_repo_not_authorized" } },
+      { "case": "unknown project or repository id", "token": "valid, sub = owner", "project": "no row with that public_id / repository_id pair", "expect": { "status": 403, "error": "project_repo_not_authorized" } },
+      { "case": "repository id of ANOTHER builder project of the same owner", "token": "valid, sub = owner", "project": "builder, ready, repositoryId mismatched", "expect": { "status": 403, "error": "project_repo_not_authorized" } },
+      { "case": "not ready", "token": "valid, sub = owner", "project": "builder, provisioning or failed", "expect": { "status": 403, "error": "project_repo_not_authorized" } },
+      { "case": "token for Universe's own client audience", "token": "aud = Universe client", "project": "builder, ready", "expect": { "status": 401, "error": "project_repo_invalid_identity" } },
+      { "case": "suspended or inactive account", "token": "valid, sub = owner, account inactive", "project": "builder, ready", "expect": { "status": 403, "error": "project_repo_not_authorized" } },
+      { "case": "Works answer without class, or a legacy or web-clone grant (expiresAt beyond now + 330 s)", "token": "valid, sub = owner", "project": "builder, ready", "works": "201 without class 'project', or expiresAt > now + 330 s", "expect": { "status": 502, "error": "project_repo_upstream_unavailable" }},
+      { "case": "Works answer for another cloneUrl", "token": "valid, sub = owner", "project": "builder, ready", "works": "201 cloneUrl differs", "expect": { "status": 502, "error": "project_repo_upstream_unavailable" } },
+      { "case": "flag project_repositories_v1 off", "token": "any", "project": "any", "expect": { "status": 404, "error": "not_found" } },
+      { "case": "hired project unchanged", "token": "valid, sub = assigned builder", "project": "hired, running", "expect": { "status": 200, "role": "builder" } },
+      { "case": "builder open without a valid computerLabel (missing, uppercase, wrong length)", "token": "valid, sub = owner", "project": "builder, ready", "expect": { "status": 403, "error": "project_repo_not_authorized", "worksCalled": false }}
+    ]
+  },
+  "worksCloneToken": {
+    "owner": "Works slot5",
+    "asks": [
+      "W-1 (unchanged; EZiL-Works 2469e704, reviewed separately): the clone-token answer adds scope and defaultRef. Universe's link rule still reads them; the Builder open grant no longer comes from clone-token.",
+      "W-2(a) WITHDRAWN in 1.1.0: the OS-audience token on clone-token. universe-repo-open-v1 §6.4 step 2 refuses an OS-client token on every non-os route, and allowing it would make that token usable for the 60-minute web clone. W-2 is now universe-repo-open-v1 1.0.5 §6.2 QA row + §6.5 class project (worksOsGrant).",
+      "W-3 corrected: clone-token's web-clone grant is 60 minutes (WEB_CLONE_GRANT_MS) and stays so; it is never a Builder open grant. The open grant is at most 300 s (worksOsGrant)."
+    ]
+  },
+  "worksOsGrant": {"owner": "Works slot5 (T1-T5)", "contract": "universe-repo-open-v1 1.0.5 (EZiL-OS feat/u2-project-grant-20261103): §6.2 QA row, §6.4, §6.5 class project, §6.6, §6.7; vectors works.osGrantRequest.project, works.osGrantProjectRule, works.osGrantProjectExpiry, works.osGrantProjectResponse, works.qaEffectivePins and the QA rows of works.authCases.", "summary": "POST /v1/builder/selfserve-repositories/:repositoryId/os-grant on api-staging, OS-audience bearer only, body {computerLabel, class:'project'}, expiresAt = min(now + 300 s, bearer exp), the same session, ownership and scope as the legacy grant, answer = legacy keys + class:'project'. No schema change."},
+  "osApp": {
+    "owner": "OS app (open-project; cb1d14e6 integrates)",
+    "file": "app/src/server/works/project-repo.ts",
+    "rule": "CANONICAL_REPOSITORY also accepts ^https://git-qa\\.ezil\\.work/<namespace>/<name>\\.git$ when, and only when, the app's existing staging gate holds (billing funding origin exactly https://ai-staging.ezil.work, as aiEnrollmentConfigured). repositoryDisplayName names it <namespace>/<name>. 1.1.0: for a builder project the request to Universe open also carries computerLabel (universeOpen.request.computerLabelRule), computed on the server from the computer being opened; the hired request is unchanged, as are the flow in code-preview-url/route.ts and every other rule; AWS computers are still refused with repo_open_unsupported_provider.",
+    "accept": { "staging": ["https://git-qa.ezil.work/acme-qa/site.git", "https://github.ezil.work/acme/site.git"], "production": ["https://github.ezil.work/acme/site.git"] },
+    "refuse": { "staging": ["https://git-staging.ezil.work/acme-qa/site.git", "https://git-qa.ezil.work.evil.com/acme-qa/site.git", "https://git-qa.ezil.work:8443/acme-qa/site.git", "http://git-qa.ezil.work/acme-qa/site.git"], "production": ["https://git-qa.ezil.work/acme-qa/site.git"] }
+  },
+  "osWorker": {
+    "owner": "e1cd418a (worker/src/repo-open.ts; the handleRepoOpen line in worker/src/index.ts, integrated by cb1d14e6)",
+    "routeGate": {
+      "var": "EZIL_AI_GATEWAY_URL",
+      "rule": "The personal route POST /sandbox/:name/repo-open accepts git-qa.ezil.work only when the Worker's existing EZIL_AI_GATEWAY_URL is exactly os-staging's Gateway origin (optionally with a bare '/'). No env var is added; anything else fails closed.",
+      "accept": ["https://ai-staging.ezil.work", "https://ai-staging.ezil.work/"],
+      "refuse": [null, "", "https://ai.ezil.work", "https://ai.ezil.work/", "https://ai-staging.ezil.work/v1", "https://ai-staging.ezil.work?x", "https://ai-staging.ezil.work#x", "http://ai-staging.ezil.work", "https://a@ai-staging.ezil.work", "https://AI-STAGING.EZIL.WORK", " https://ai-staging.ezil.work", "https://ai-staging.ezil.work ", "https://ai-staging.ezil.work:443", "https://ai-staging.ezil.work.evil.com"]
+    },
+    "remotes": {
+      "stagingAccept": ["https://git-qa.ezil.work/acme-qa/site.git", "https://git-qa.ezil.work/acme-qa/p-3c9a7b51-2d4e-4f60-8a1b-9c0d1e2f3a4b.git"],
+      "alwaysRefuse": ["https://git-staging.ezil.work/acme-qa/site.git", "https://git-qa.ezil.work.evil.com/acme-qa/site.git", "https://evil.com/git-qa.ezil.work/acme-qa/site.git", "https://git-qa.ezil.work:8443/acme-qa/site.git", "https://ezil:x@git-qa.ezil.work/acme-qa/site.git", "https://GIT-QA.ezil.work/acme-qa/site.git", "http://git-qa.ezil.work/acme-qa/site.git", "https://git-qa.ezil.work/acme-qa/si..te.git", "https://git-qa.ezil.work/acme-qa/sité.git", "https://git-qa.ezil.work/acme-qa/site"]
+    },
+    "folder": "<root>/projects/<repositoryId>, the repository at <root>/projects/<repositoryId>/repository (REPO_OPEN_NESTED_DIR). Re-open of the same origin fetches only (uncommitted work kept); any other origin at that folder is repo_open_folder_conflict, never adopted or replaced. Unchanged by this contract."
+  },
+  "perTabRestore": {
+    "owner": "shell and app: editor lead f179c8a4; Worker walk: e1cd418a; AWS host op: cb1d14e6 (bake)",
+    "ownFiles": "The tab's record {v:1, path} lives in sessionStorage (per tab, never a URL) and travels only in the Code mint's POST body. The server strips ITS root, refuses .ezil/** and projects/<uuid>/** as not_allowed, and the computer walks the rest with no symlink followed: Cloudflare in the container (code-folder-resolve.ts cloudflareCodeFolderResolver), AWS on the host (awsCodeFolderResolver → the edge's folder op). The answer is a code; only 'restored' puts the folder in the server-built code-server URL.",
+    "projectTab": "The record is the app link's {project, repo} UUIDs only (not secrets; the same as the shell URL). Every restore re-runs the whole project open: computer ownership, Universe authorization with the current EZiL ID, a fresh grant of at most 5 minutes. No grant, token, remote or path is stored or put in a URL. 'path' stays reveal-only and is never an editor root.",
+    "wrongUser": "Walks and opens run only on the signed-in person's own computer (the v2 claims bind sandbox and user); a record another person left in the same tab reveals nothing (codes only) and can only open the signed-in person's own folder. Proposal for the shell: key records by (EZiL ID subject digest, computerId) and drop any mismatch."
+  },
+  "relativePath": {
+    "owner": "editor f179c8a4 (code.js) + app route; walk by e1cd418a",
+    "rule": "path is a reveal-only hint below <root>/projects/<repositoryId>/repository, in the shared code-folder v1 grammar, walked with no symlink followed (cloudflareCodeFolderResolver with that root); revealed only on 'restored'; never an editor root or authority.",
+    "cases": [
+      { "path": "src/app", "tree": "real directory", "expect": "revealed" },
+      { "path": "src/link", "tree": "symlink to a directory", "expect": "not revealed (symlink)" },
+      { "path": "../other", "tree": "-", "expect": "not revealed (invalid)" },
+      { "path": "/etc", "tree": "-", "expect": "not revealed (outside)" },
+      { "path": "gone", "tree": "missing", "expect": "not revealed (missing)" }
+    ]
+  },
+  "pushGrant": {
+    "status": "Worker implemented at OS 28339390 (worker/src/repo-grant.ts). The app/shell refresh loop is pending (editor f179c8a4 + app owner).",
+    "files": { "grant": "/run/ezil/git/grants/<handle>__<name>.json (uid 0, 0600, the u2 helper's 8 keys)", "bind": "/run/ezil/git/grants/<handle>__<name>.bind = 'v1 <subject> <repositoryId> <url>'", "wrapper": "/run/ezil/bin/ezil-git-grant (0500)", "helper": "/run/ezil/bin/ezil-git-grant.mjs (u2 84e4b686, sha256 5de6b39aeb9ecbdc03cf3334e45047652b7249f0a395227deea92000f61ba55e)", "repoConfig": "credential.https://<host>.helper = '' then the fixed wrapper; credential.https://<host>.usehttppath = true" },
+    "subject": "sha256('ezil.repo-grant.subject.v1\\n' + v2 claims userId), hex",
+    "refreshEndpoint": {
+      "route": "POST {worker}/sandbox/<sandboxName>/repo-grant (v2-signed, Cloudflare only, never starts a stopped computer)",
+      "request": { "repositoryId": "<lowercase uuid>", "canonicalURL": "https://github.ezil.work/<h>/<n>.git | (os-staging) https://git-qa.ezil.work/<h>/<n>.git", "git": { "token": "egg_<64 hex>", "expiresAt": "ISO, 60 s to 330 s ahead", "scope": "read | write", "username": "optional, 'ezil'" } },
+      "response": { "200": { "ok": true, "expiresAt": "<normalised ISO>" }, "400": ["repo_open_invalid_request", "repo_grant_unsupported_remote"], "409": ["repo_open_token_expired", "repo_grant_not_open", "repo_grant_conflict", "repo_open_busy", "runtime_not_running", "repo_open_unsupported_provider"], "500": ["repo_open_git_missing"], "502": ["repo_grant_failed"] },
+      "cadence": "1.1.0: from the returned expiresAt while a Code window shows the project, and on reopen/remint; never a ref or branch. universe-repo-open-v1 works.projectGrantRenewal: under 60 s left is not installed; at most 120 s left (bearer-limited) reauthenticates once before the next ask; otherwise renew 120 s before expiry; one renewal in flight per (computer, repository); a failed reauthentication stops renewal without touching files"
+    },
+    "openInstall": "repo-open keeps git.scope; an EZiL Git open with a scope and a v2 subject installs the grant with its own token; the open's answer is unchanged",
+    "expiredHint": "EZiL: Git access for <handle>/<name> expired. Reopen it from EZiL OS (Code renews it while open).",
+    "scope": "Basic-auth hosts only (git-qa.ezil.work on os-staging, github.ezil.work); Cloudflare Artifacts (Bearer) is repo_grant_unsupported_remote",
+    "twoPushProof": ["open, edit, push #1 succeeds", "past expiry without refresh: push refused with expiredHint, no credential sent", "server rotates the grant; refresh installs it; work, HEAD and index untouched", "push #2 succeeds", "refresh for another subject (conflict), repository, host or path (not_open) refused", "symlinks at projects/folder/repository/.git/.git/config and a linked /run grants dir refused", "concurrent refreshes, retried refresh and reopen keep identity and work", "grant never in git config, folder files, output or command"],
+    "evidence": "worker/src/repo-grant.git.test.ts 7/7 on host git 2.43 and in ezil-os-worker-sandbox:5e96dc3f (git 2.34.1, node 22); 18/18 mutants killed"
+  },
+  "aws": {
+    "status": "BLOCKED: no host op on AMI 1.0.30 (host agent = 7b95bcd9) writes into the guest; the app, the Worker repo-open and repo-grant routes refuse AWS (repo_open_unsupported_provider).",
+    "missing": [
+      "e1: u2 contract 1.0.4 class 'project' (paired Works host; projects/<repositoryId>/repository under a fresh wrapper; path reveal-only); kernel + host class tables (AMI inputs); slot1 review",
+      "cb1: bake the A2h host op (POST /__ezil/control/repo-open/<sha256>, repo-open-status/<jobId>; u2 84e4b686 repo_open.py) and kernel b7196b7d into an AMI after 1.0.30",
+      "e1: port the Worker relay (84e4b686 aws-repo-open.ts) and route AWS claims of repo-open and repo-grant to it (the kernel's refresh op installs the same helper/grant in the guest)",
+      "app owner: lift isAws in code-preview-url/route.ts once the relay is live"
+    ]
+  },
+  "isolation": [
+    "OS → Universe: the retained EZiL ID token of THIS session, in the request body only; the computer is checked as the caller's own before Universe hears of the open.",
+    "Universe: iss/aud/exp/sub verified; sub → exactly one active users row; owner-only for builder projects; 403 for everything else, existence never revealed.",
+    "Works: the grant is bound to the same subject and to <handle>/<name>.git, at most 5 minutes (W-2, W-3).",
+    "OS app → Worker: v2-signed for this sandbox and user; the token rides the request body only, never the answer, a URL or a log.",
+    "Worker → computer: the token reaches git through one command's environment only (Basic via a one-shot credential helper on git 2.34.1), never .git/config."
+  ],
+  "negativeCases": [
+    { "case": "wrong user", "where": "universeOpen", "expect": "403 project_repo_not_authorized; OS answers 403 project_not_authorized; nothing reaches the computer" },
+    { "case": "stale binding (folder exists with another origin)", "where": "osWorker", "expect": "repo_open_folder_conflict; OS 502 repo_open_failed; the folder is untouched" },
+    { "case": "foreign origin remote", "where": "osApp + osWorker", "expect": "app: unavailable; Worker: 400 repo_open_invalid_request; never reaches the computer" },
+    { "case": "unknown repo", "where": "universeOpen", "expect": "403 project_repo_not_authorized" },
+    { "case": "deleted or missing folder", "where": "perTabRestore", "expect": "own files: 'missing' notice, today's default folder; project: the next open clones afresh" },
+    { "case": "duplicate / retry", "where": "osWorker", "expect": "a second open of the same origin fetches in place; the computer's repo-open lock serializes; every open gets a fresh grant" },
+    { "case": "unicode", "where": "perTabRestore + osWorker", "expect": "own-files folders with Unicode names restore; a Unicode repository name is refused (ASCII grammar)" },
+    { "case": "nested repository", "where": "perTabRestore", "expect": "a restore into projects/<uuid>/** is not_allowed; the project's own folder opens only through the project flow" },
+    { "case": "git 2.34.1", "where": "osWorker", "expect": "git-qa uses the Basic one-shot helper path; the walk runs in sh and dash" },
+    { "case": "ordinary non-assignment Builder project", "where": "all", "expect": "link → Universe builder branch → Works os-grant class project (≤ 300 s issued, ≤ 330 s accepted) → git-qa accepted on os-staging only" }
+  ]
+}

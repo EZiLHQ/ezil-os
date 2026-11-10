@@ -31,6 +31,9 @@ jobs:
       - name: Verify Linux editor state locking and checkpoint restoration
         if: runner.os == 'Linux'
         run: bash worker/scripts/test-editor-state-linux.sh
+      - name: Verify EZiL Chat history stays in the workspace across restarts
+        if: runner.os == 'Linux'
+        run: bash worker/scripts/test-editor-chat-history-linux.sh
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.3.14'
@@ -230,8 +233,10 @@ jobs:
                    shell/ezil/ui/Settings/usage-test.mjs \
                    shell/ezil/ui/Settings/billing-sheets-test.mjs \
                    shell/ezil/ui/Settings/billing-test.mjs \
+                   shell/ezil/ui/Settings/billing-trial-test.mjs \
                    shell/ezil/ui/Settings/sheet-frame-test.mjs \
                    shell/ezil/ui/Settings/upgrade-sheet-test.mjs \
+                   shell/ezil/ui/Settings/topup-sheet-test.mjs \
                    shell/ezil/local-surfaces-test.mjs \
                    shell/ezil/ui/Settings/settings-test.mjs \
                    shell/ezil/ui/Settings/current-computer-test.mjs \
@@ -244,6 +249,7 @@ jobs:
                    shell/ezil/ui/frame-controls-bridge-test.mjs \
                    shell/ezil/ui/full-view-test.mjs \
                    shell/ezil/ui/feedback/capture-test.mjs \
+                   shell/ezil/ui/feedback/app-failures-test.mjs \
                    shell/ezil/ui/feedback/feedback-test.mjs; do
             echo "── $t"
             # feedback-test.mjs imports app/src/server/feedback/types.ts (the
@@ -261,6 +267,7 @@ jobs:
           for t in shell/touch-focus-browser-test.mjs \
                    shell/ezil/context-menu-stack-browser-test.mjs \
                    shell/ezil/app-link-browser-test.mjs \
+                   shell/ezil/browser-route-browser-test.mjs \
                    shell/ezil/apps/code-history-browser-test.mjs \
                    shell/ezil/launcher-toggle-browser-test.mjs \
                    shell/ezil/apps/app-store-browser-test.mjs \
@@ -272,6 +279,8 @@ jobs:
                    shell/ezil/ui/opening-progress-browser-test.mjs \
                    shell/ezil/ui/Settings/appearance-browser-test.mjs \
                    shell/ezil/ui/Settings/billing-layout-browser-test.mjs \
+                   shell/ezil/ui/Settings/billing-trial-browser-test.mjs \
+                   shell/ezil/ui/Settings/credits-real-shape-browser-test.mjs \
                    shell/ezil/ui/feedback-browser-test.mjs; do
             echo "── $t"
             node "$t"
@@ -309,7 +318,7 @@ jobs:
   # gen-seccomp.py sees newer syscalls, so both checks failed for reasons outside this repo.
   computer-infrastructure:
     name: computer infrastructure (typecheck + test + synth)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-24.04 # Host unit/security inputs target noble, not 26.04.
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -661,7 +670,7 @@ jobs:
       - uses: actions/setup-node@v7
         with: { node-version: '22.16.0' }
       - name: Cloud identity, admission and rollback tests
-        run: node --test e2e/cloud-ci.test.mjs e2e/hosted-continuity-contract.test.mjs e2e/live-check.test.mjs e2e/billing-staging-journey.test.mjs
+        run: node --test e2e/cloud-ci.test.mjs e2e/hosted-continuity-contract.test.mjs e2e/live-check.test.mjs e2e/billing-staging-journey.test.mjs e2e/local-redirect.test.mjs
       - name: Validate production migration manifest and lease
         run: |
           node .github/scripts/production-migrations.mjs validate

@@ -53,12 +53,13 @@ describe('v3 summary', () => {
         expect(summary.catalog.packs).toEqual([]);
         expect(buildSummaryV3({ ...input(), stripeAvailable: false }).actions.topup).toBe(false);
     });
-    it.each([[100, 400, 'near'], [125, 500, 'paused']] as const)(
-        '%s hours at cmp-8 uses %s standard-hours and is %s', (hours, standardHours, status) => {
+    // Paid compute policy v1 (founder e713d157): paid time is still recorded at its weight, but never near or paused.
+    it.each([[100, 400], [125, 500], [200, 800]] as const)(
+        '%s hours at cmp-8 records %s standard-hours and Premium stays unmetered', (hours, standardHours) => {
             const args = input('premium_monthly_v3');
             args.epochs = sessions(hours, 'cmp-8');
             expect(usedSecondsInWindow(args.epochs, { start: start.toISOString(), end: end.toISOString() }, now)).toBe(standardHours * 3600);
-            expect(buildSummaryV3(args).fairUse.status).toBe(status);
+            expect(buildSummaryV3(args).fairUse).toEqual({ status: 'ok', resetsAt: '2026-11-10T00:00:00Z', policy: 'unmetered' });
         });
     it('one hour at cmp-8 is four standard-hours and verifies stored weights', () => {
         const window = { start: start.toISOString(), end: end.toISOString() };
@@ -72,12 +73,13 @@ describe('v3 summary', () => {
         expect(usedSecondsInWindow([{ ...e, deadlineAt: null }], window, now)).toBe(14400);
         expect(usedSecondsInWindow([e], { ...window, end: '2026-10-19T11:15:00Z' }, now)).toBe(3600);
     });
-    it('bounds the active deadline by the running weight, even after a preference change', () => {
+    it('a paid running session ends only at its six-hour cap, even with its grant nearly used (paid compute policy v1)', () => {
         const args = input('premium_monthly_v3');
         args.sizePreference = 'std-2';
         args.epochs = [epoch({ size: 'cmp-8', weight: 4 })];
         args.grants = [{ ...args.grants[0]!, amount: BigInt(14400 + 241) }];
-        expect(buildSummaryV3(args).computer.activeDeadline).toBe('2026-10-19T12:01:00Z');
+        expect(buildSummaryV3(args).computer.activeDeadline).toBe('2026-10-19T17:00:00Z'); // ready 11:00 + 6 h
+        expect(buildSummaryV3(args).fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
     });
     it.each([['std-2', 2, 8], ['cmp-4', 4, 16], ['cmp-8', 8, 32]] as const)(
         'reports selected Premium %s and all choices', (size, vcpu, memoryGiB) => {
@@ -133,12 +135,12 @@ describe('v3 summary', () => {
         expect(usedSecondsInWindow([epoch({ readyAt: '2026-10-09T23:00:00Z', endedAt: '2026-10-10T01:00:00Z' }), epoch()],
             { start: start.toISOString(), end: end.toISOString() }, now)).toBe(14400);
         const args = input('premium_monthly_v3'); args.epochs = [epoch()]; args.sizePreference = 'cmp-4';
-        expect(buildSummaryV3(args).computer).toMatchObject({ vcpu: 4, memoryGiB: 16, sessionMaxSeconds: null, opening: 'standard', activeDeadline: '2026-10-29T21:00:00Z' });
+        expect(buildSummaryV3(args).computer).toMatchObject({ vcpu: 4, memoryGiB: 16, sessionMaxSeconds: 21600, opening: 'standard', activeDeadline: '2026-10-19T17:00:00Z' });
     });
-    it.each([[0.8, 'near'], [1, 'paused']] as const)('reports %s usage as %s', (ratio, status) => {
+    it.each([0.8, 1, 2])('Standard at %s of its 40 hours is recorded but never near or paused (paid compute policy v1)', ratio => {
         const args = input('standard_monthly_v3');
         args.epochs = sessions(40 * ratio, 'std-2');
-        expect(buildSummaryV3(args).fairUse.status).toBe(status);
+        expect(buildSummaryV3(args).fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
     });
     it('ignores grants for other subscriptions and stops after a refund reversal', () => {
         const args = input('standard_monthly_v3');
@@ -165,21 +167,48 @@ describe('v3 summary', () => {
     });
 });
 
-describe('paid fair-use exhaustion deadlines', () => {
+describe('paid compute policy v1: no fair-use exhaustion deadline for paid plans, only the six-hour session cap', () => {
     it.each([['standard_monthly_v3', 'std-2', 1], ['premium_monthly_v3', 'std-2', 1],
         ['premium_monthly_v3', 'cmp-4', 2], ['premium_monthly_v3', 'cmp-8', 4]] as const)(
-        '%s / %s stays anchored after a missed stop and ignores the retired session deadline', (sku, size, weight) => {
+        '%s / %s ends only at ready + 6 h, before or long after the old exhaustion point, and ignores a stored earlier deadline', (sku, size, weight) => {
             const args = input(sku);
             args.grants[0]!.amount = BigInt(144000);
             const readyAt = '2026-10-19T00:00:00Z';
             args.epochs = [epoch({ id: 'prior', size: 'std-2', weight: 1, readyAt: '2026-10-18T00:00:00Z', endedAt: '2026-10-18T01:00:00Z' }),
                 epoch({ size, weight, readyAt, deadlineAt: '2026-10-19T02:00:00Z' })];
-            const deadline = new Date(Date.parse(readyAt) + (144000 - 3600) / weight * 1000).toISOString().replace('.000Z', 'Z');
-            for (const current of [new Date(readyAt), new Date(Date.parse(deadline) + 3600000)]) {
+            const oldExhaustion = Date.parse(readyAt) + (144000 - 3600) / weight * 1000;
+            for (const current of [new Date(readyAt), new Date(oldExhaustion + 3600000)]) {
                 args.now = current;
-                expect(buildSummaryV3(args).computer).toMatchObject({ sessionMaxSeconds: null, activeDeadline: deadline });
+                expect(buildSummaryV3(args).computer).toMatchObject({ sessionMaxSeconds: 21600, activeDeadline: '2026-10-19T06:00:00Z' });
+                expect(buildSummaryV3(args).fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
             }
         });
+    it('a paid plan with no grant for this period (no receipt), or a refunded one, is not unmetered', () => {
+        const args = input('standard_monthly_v3');
+        args.grants = [{ ...args.grants[0]!, subscriptionId: 'other' }];
+        expect(buildSummaryV3(args).fairUse).toEqual({ status: 'paused', resetsAt: '2026-11-10T00:00:00Z' });
+    });
+    // The start gate exempts a renewal whose grant is still landing (compute-access.ts); the summary agrees, so a genuine
+    // renewal never shows monthly time used up for those minutes. Bounded: past GRANT_PENDING_SECONDS, or with a refund
+    // or revoke row (a real zero), it is the unreceipted case above.
+    it('a renewal whose grant is still landing (zero allowance, within ten minutes) is unmetered; after that it is not', () => {
+        const renewal = (secondsAgo: number) => {
+            const args = input('standard_monthly_v3');
+            const periodStart = new Date(now.getTime() - secondsAgo * 1000), periodEnd = new Date(periodStart.getTime() + 30 * 86_400_000);
+            args.subs = [{ ...args.subs[0]!, currentPeriodStart: periodStart, currentPeriodEnd: periodEnd }];
+            args.grants = [];
+            return args;
+        };
+        expect(buildSummaryV3(renewal(120)).fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
+        expect(buildSummaryV3(renewal(599)).fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
+        expect(buildSummaryV3(renewal(600)).fairUse).toMatchObject({ status: 'paused' });
+        expect(buildSummaryV3(renewal(600)).fairUse).not.toHaveProperty('policy');
+        const revoked = renewal(120);
+        revoked.grants = [{ ...input('standard_monthly_v3').grants[0]!, kind: 'revoke', amount: BigInt(0), periodStart: revoked.subs[0]!.currentPeriodStart!, periodEnd: revoked.subs[0]!.currentPeriodEnd! }];
+        expect(buildSummaryV3(revoked).fairUse).not.toHaveProperty('policy');
+        const free = input(); free.grants = [];
+        expect(buildSummaryV3(free).fairUse).not.toHaveProperty('policy');
+    });
 });
 
 describe('round 3 AI credit buckets (D2/D4)', () => {
@@ -243,6 +272,12 @@ describe('round 3 AI credit buckets (D2/D4)', () => {
         expect(summary('premium_monthly_v3', [standard, topup], [grant(500, 400, topup.expiresAt)], M(400)))
             .toMatchObject({ included: { granted: 200, remaining: null }, purchased: null });
     });
+    it('a delivered receipt whose grant was revoked or expired is accounted for, not unknown: this period\'s plan credits are the live ones', () => {
+        const ai = summary('premium_monthly_v3', [standard], [grant(200, 0, standard.expiresAt, false), grant(50, 40, '2027-06-01T00:00:00.000Z')]);
+        expect(ai).toMatchObject({ balance: 40, included: { granted: 0, remaining: 0 }, purchased: null, starter: null });
+        // Before: unmatched, so "known" was false and the meter read the dead receipt's 200 with no remainder.
+        expect(ai.included).not.toMatchObject({ granted: 200 });
+    });
     it('round 6 (R1-10/R4-05): on Free after an immediate cancel, the paid period\'s remainder is its own bucket with its expiry', () => {
         // contact@ on 10-30: 100 starter credits plus 663 left of a cancelled Premium period (kept to periodEnd + 3 days).
         const cancelled = receipt('ezil-os:v1:premium_monthly_v3:sub:2026-10-27T12:00:00.000Z', 1000, '2026-11-30T12:00:00.000Z');
@@ -275,20 +310,195 @@ describe('round 3 AI credit buckets (D2/D4)', () => {
     });
 });
 
+describe('identity credits: ai.account from /v1/me/balance (exact microcredits)', () => {
+    const M = (credits: string) => { const [whole, fraction = ''] = credits.split('.'); return (BigInt(whole!) * BigInt(1_000_000) + BigInt(fraction.padEnd(6, '0'))).toString(); };
+    const expiry = (date: Date) => new Date(date.getTime() + 3 * 86_400_000).toISOString();
+    const receipt = (entitlementId: string, credits: number, expiresAt: string) => ({ entitlementId, credits, expiresAt, deliveredAt: start.toISOString() });
+    const premium = receipt(`ezil-os:v1:premium_monthly_v3:sub:${start.toISOString()}`, 1000, expiry(end));
+    type Grant = NonNullable<NonNullable<Input['ai']>['gatewayGrants']>[number];
+    const grant = (credits: string, remaining: string, expiresAt: string, over: Partial<Grant> = {}): Grant =>
+        ({ creditsMicro: M(credits), remainingMicro: M(remaining), expiresAt, live: true, source: 'entitlement', revokedAt: null, ...over });
+    const admin = (credits: string, remaining: string) => grant(credits, remaining, '2027-06-01T00:00:00.000Z', { source: 'admin' });
+    const ago = (minutes: number) => new Date(now.getTime() - minutes * 60_000).toISOString();
+    type Ai = NonNullable<Input['ai']>;
+    function account(sku: SellableSkuV3 | undefined, ai: Partial<Ai> & Pick<Ai, 'gatewayGrants'>) {
+        const balanceMicro = (ai.gatewayGrants ?? []).filter(g => g.live).reduce((sum, g) => sum + BigInt(g.remainingMicro), BigInt(0)).toString();
+        return buildSummaryV3({ ...input(sku), ai: { receipts: [premium], balanceMicro, heldMicro: '0', userId: 'user-a', ...ai } }).ai.account!;
+    }
+
+    it('worked example: plan 1,000 + added 500, used 252.75, reserved 0.5 → 1,246.75 left of 1,500 (used = total − remaining − held)', () => {
+        const a = account('premium_monthly_v3', { gatewayGrants: [grant('1000', '746.75', premium.expiresAt), admin('500', '500')],
+            heldMicro: M('0.5'), gatewayState: 'ok', openHolds: [{ at: ago(1), heldMicro: M('0.5') }] });
+        expect(a).toEqual({ userId: 'user-a', state: 'ok', asOf: '2026-10-19T12:00:00Z',
+            totalMicro: M('1500'), remainingMicro: M('1246.75'), heldMicro: M('0.5'), usedMicro: M('252.75'), planBaselineMicro: M('1000'), labelled: true,
+            grants: [{ kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('746.75'), expiresAt: premium.expiresAt },
+                { kind: 'added', creditsMicro: M('500'), remainingMicro: M('500'), expiresAt: '2027-06-01T00:00:00.000Z' }] });
+        expect(BigInt(a.totalMicro!) - BigInt(a.remainingMicro!) - BigInt(a.heldMicro!)).toBe(BigInt(a.usedMicro!));
+        // The legacy buckets still split the same read (compatibility): this period's plan grant only.
+        const legacy = buildSummaryV3({ ...input('premium_monthly_v3'), ai: { receipts: [premium], gatewayGrants: [grant('1000', '746.75', premium.expiresAt), admin('500', '500')],
+            balanceMicro: M('1246.75') } }).ai;
+        expect(legacy).toMatchObject({ balance: 1246.75, included: { granted: 1000, remaining: 746.75 } });
+    });
+    it('a fractional 996.25 left of 1,000 keeps every microcredit (no integer guard, no rounding)', () => {
+        const a = account('premium_monthly_v3', { gatewayGrants: [grant('1000', '996.25', premium.expiresAt)] });
+        expect(a).toMatchObject({ totalMicro: M('1000'), remainingMicro: M('996.25'), usedMicro: M('3.75'), heldMicro: '0' });
+        const odd = account('premium_monthly_v3', { gatewayGrants: [grant('1000', '999.000001', premium.expiresAt)] });
+        expect(odd).toMatchObject({ remainingMicro: '999000001', usedMicro: '999999' });
+    });
+    it('an operator grant above the plan enters the total; the catalog is only the labelled baseline', () => {
+        const standard = receipt(`ezil-os:v1:standard_monthly_v3:sub:${start.toISOString()}`, 200, expiry(end));
+        const a = account('standard_monthly_v3', { receipts: [standard], gatewayGrants: [grant('200', '120', standard.expiresAt), admin('5000', '5000')] });
+        expect(a).toMatchObject({ totalMicro: M('5200'), remainingMicro: M('5120'), usedMicro: M('80'), planBaselineMicro: M('200'), labelled: true });
+        expect(a.grants.map(g => g.kind)).toEqual(['plan', 'added']);
+        // Positive control for the admin rule: an operator grant with the plan receipt's amount and expiry never takes its label.
+        const twin = account('standard_monthly_v3', { receipts: [standard], gatewayGrants: [admin('200', '200'), grant('200', '120', standard.expiresAt)].map((g, i) =>
+            i === 0 ? { ...g, expiresAt: standard.expiresAt } : g) });
+        expect(twin.grants.map(g => [g.kind, g.remainingMicro])).toEqual([['added', M('200')], ['plan', M('120')]]);
+    });
+    it('a top-up and an upgrade proration grant each add to the total; the upgrade is this period\'s plan', () => {
+        const standard = receipt(`ezil-os:v1:standard_monthly_v3:sub:${start.toISOString()}`, 200, expiry(end));
+        const upgrade = receipt('ezil-os:v1:premium_monthly_v3:sub:2026-10-13T00:00:00.000Z:upgrade', 696, expiry(end));
+        const topup = receipt('ezil-os:v1:topup:ai_pack_10_v1:pi_1', 500, '2027-09-01T00:00:00.000Z');
+        const before = account('premium_monthly_v3', { receipts: [standard, upgrade, topup], gatewayGrants: [grant('200', '150', standard.expiresAt)] });
+        expect(before).toMatchObject({ totalMicro: M('200'), remainingMicro: M('150') });
+        const after = account('premium_monthly_v3', { receipts: [standard, upgrade, topup],
+            gatewayGrants: [grant('200', '150', standard.expiresAt), grant('696', '696', upgrade.expiresAt), grant('500', '500', topup.expiresAt)] });
+        expect(after).toMatchObject({ totalMicro: M('1396'), remainingMicro: M('1346'), usedMicro: M('50'), labelled: true });
+        expect(after.grants.map(g => g.kind)).toEqual(['plan', 'plan', 'purchased']);
+        // An unmatched grant (no receipt) is still counted, as Added.
+        const unmatched = account('premium_monthly_v3', { receipts: [standard], gatewayGrants: [grant('200', '150', standard.expiresAt), grant('77', '77', '2027-01-01T00:00:00.000Z')] });
+        expect(unmatched).toMatchObject({ totalMicro: M('277'), grants: [{ kind: 'plan' }, { kind: 'added' }] });
+    });
+    it('revoked and expired grants never enter the total or the list; a live one beside them does', () => {
+        const live = grant('1000', '900', premium.expiresAt);
+        const a = account('premium_monthly_v3', { gatewayGrants: [live, grant('500', '0', '2026-10-01T00:00:00.000Z', { live: false }),
+            admin('300', '300'), { ...admin('400', '0'), live: false, revokedAt: '2026-10-02T00:00:00.000Z' }] });
+        expect(a).toMatchObject({ totalMicro: M('1300'), remainingMicro: M('1200'), usedMicro: M('100') });
+        expect(a.grants).toHaveLength(2);
+        // Positive control: the same grants all live count in full.
+        const all = account('premium_monthly_v3', { gatewayGrants: [live, grant('500', '0', '2027-10-01T00:00:00.000Z'), admin('300', '300'), admin('400', '0')] });
+        expect(all).toMatchObject({ totalMicro: M('2200') });
+    });
+    it('a revoked plan grant that matches its delivered receipt is accounted for: still labelled, the operator grant reads Added', () => {
+        // Staging e2e-standard shape: the period's plan grant was revoked, an operator grant carries the balance.
+        const revoked = grant('1000', '0', premium.expiresAt, { live: false, revokedAt: ago(4 * 24 * 60) });
+        const gatewayGrants = [revoked, admin('1000', '982.590906')];
+        const a = account('premium_monthly_v3', { gatewayGrants });
+        expect(a).toMatchObject({ totalMicro: M('1000'), remainingMicro: M('982.590906'), labelled: true,
+            grants: [{ kind: 'added', creditsMicro: M('1000'), remainingMicro: M('982.590906'), expiresAt: '2027-06-01T00:00:00.000Z' }] });
+        // The legacy buckets count live plan grants only: 0 this period, not the dead receipt's 1,000 with an unknown remainder.
+        const legacy = buildSummaryV3({ ...input('premium_monthly_v3'), ai: { receipts: [premium], gatewayGrants, balanceMicro: M('982.590906') } }).ai;
+        expect(legacy).toMatchObject({ included: { granted: 0, remaining: 0 }, pendingFromRenewal: null });
+        // A dead grant that matches nothing (a unit change) proves nothing: still unlabelled.
+        const unit = account('premium_monthly_v3', { gatewayGrants: [{ ...revoked, creditsMicro: M('1') }, admin('1000', '982.590906')] });
+        expect(unit).toMatchObject({ totalMicro: M('1000'), labelled: false });
+    });
+    it('a live grant takes its receipt before a dead twin with the same expiry and amount', () => {
+        const dead = grant('1000', '0', premium.expiresAt, { live: false, revokedAt: ago(4 * 24 * 60) });
+        const a = account('premium_monthly_v3', { gatewayGrants: [dead, grant('1000', '600', premium.expiresAt)] });
+        expect(a).toMatchObject({ totalMicro: M('1000'), labelled: true, grants: [{ kind: 'plan', remainingMicro: M('600') }] });
+        const legacy = buildSummaryV3({ ...input('premium_monthly_v3'), ai: { receipts: [premium],
+            gatewayGrants: [dead, grant('1000', '600', premium.expiresAt)], balanceMicro: M('600') } }).ai;
+        expect(legacy).toMatchObject({ included: { granted: 1000, remaining: 600 } });
+    });
+    it('balance unavailable: no figures at all (never the catalog), state unavailable; the key is still present', () => {
+        const a = buildSummaryV3({ ...input('premium_monthly_v3'), ai: { receipts: [premium], gatewayGrants: null, balanceMicro: null, userId: 'user-a' } }).ai.account!;
+        expect(a).toEqual({ userId: 'user-a', state: 'unavailable', asOf: '2026-10-19T12:00:00Z', totalMicro: null, remainingMicro: null,
+            heldMicro: null, usedMicro: null, planBaselineMicro: M('1000'), labelled: false, grants: [] });
+        // Older v1 callers (no ai input) get no account key: the shell keeps its older rendering for them.
+        expect(buildSummaryV3(input('premium_monthly_v3')).ai).not.toHaveProperty('account');
+    });
+    it('a grant list that does not add up to available_micro gives the remaining only (no total, no used, no labels)', () => {
+        const a = account('premium_monthly_v3', { gatewayGrants: [grant('1000', '900', premium.expiresAt)], balanceMicro: M('950') });
+        expect(a).toMatchObject({ remainingMicro: M('950'), totalMicro: null, usedMicro: null, labelled: false, grants: [] });
+        // Unreadable grants: the same.
+        expect(account('premium_monthly_v3', { gatewayGrants: null, balanceMicro: M('950') })).toMatchObject({ remainingMicro: M('950'), totalMicro: null, state: 'ok' });
+    });
+    it('used is null unless this read proves it: hidden or absorbed holds, or a hold that may sit on a grant that has since died', () => {
+        const grants = [grant('1000', '746.75', premium.expiresAt), admin('500', '500')];
+        const base = { gatewayGrants: grants, heldMicro: M('0.5') };
+        const visible = [{ at: ago(1), heldMicro: M('0.5') }];
+        expect(account('premium_monthly_v3', { ...base, openHolds: visible }).usedMicro).toBe(M('252.75'));
+        expect(account('premium_monthly_v3', { ...base, openHolds: null }).usedMicro).toBeNull();
+        // Σ visible holds ≠ held_micro: an open request off the page, or a platform-absorbed one (0021).
+        expect(account('premium_monthly_v3', { ...base, openHolds: [{ at: ago(1), heldMicro: M('0.25') }] }).usedMicro).toBeNull();
+        expect(account('premium_monthly_v3', { ...base, openHolds: [] }).usedMicro).toBeNull();
+        // A grant that expired AFTER the open request reserved may carry its slice: null. Expired before it: proven.
+        const died = (expiresAt: string, over: Partial<Grant> = {}) => [...grants, grant('100', '40', expiresAt, { live: false, ...over })];
+        expect(account('premium_monthly_v3', { ...base, gatewayGrants: died(ago(0.5)), openHolds: visible }).usedMicro).toBeNull();
+        expect(account('premium_monthly_v3', { ...base, gatewayGrants: died(ago(10)), openHolds: visible }).usedMicro).toBe(M('252.75'));
+        // Revocation: its time is the revoking transaction's start, so 5 minutes of margin; unknown time never proves.
+        const revoked = (at: string | 'unknown') => died('2027-01-01T00:00:00.000Z', { revokedAt: at });
+        expect(account('premium_monthly_v3', { ...base, gatewayGrants: revoked(ago(3)), openHolds: visible }).usedMicro).toBeNull();
+        expect(account('premium_monthly_v3', { ...base, gatewayGrants: revoked('unknown'), openHolds: visible }).usedMicro).toBeNull();
+        expect(account('premium_monthly_v3', { ...base, gatewayGrants: revoked(ago(30)), openHolds: visible }).usedMicro).toBe(M('252.75'));
+        // No open request at all: proven without the page. A negative identity is never shown.
+        expect(account('premium_monthly_v3', { gatewayGrants: grants, heldMicro: '0', openHolds: null }).usedMicro).toBe(M('253.25'));
+        expect(account('premium_monthly_v3', { gatewayGrants: [grant('1000', '1000', premium.expiresAt)], heldMicro: M('0.5'),
+            openHolds: [{ at: ago(1), heldMicro: M('0.5') }] }).usedMicro).toBeNull();
+        expect(account('premium_monthly_v3', { gatewayGrants: grants, heldMicro: null }).usedMicro).toBeNull();
+    });
+    it('labels need readable receipts; the total does not', () => {
+        const a = account('premium_monthly_v3', { receipts: null, gatewayGrants: [grant('1000', '900', premium.expiresAt), admin('500', '500')] });
+        expect(a).toMatchObject({ totalMicro: M('1500'), labelled: false });
+        // Delivered receipts that match nothing (a unit change): unlabelled, total intact.
+        const unit = account('premium_monthly_v3', { gatewayGrants: [grant('1', '1', premium.expiresAt)] });
+        expect(unit).toMatchObject({ totalMicro: M('1'), labelled: false });
+        // The Gateway's own state wins; without it, zero is exhausted.
+        expect(account('premium_monthly_v3', { gatewayGrants: [grant('1000', '0', premium.expiresAt)] }).state).toBe('exhausted');
+        expect(account('premium_monthly_v3', { gatewayGrants: [grant('1000', '5', premium.expiresAt)], gatewayState: 'paused_operations' }).state).toBe('paused_operations');
+    });
+});
+
 describe('round 3 storage: the provisioned disk, never the v1 2 GB (D10)', () => {
     const GiB50 = String(50 * 1024 ** 3);
     it.each([['standard_monthly_v3', null], ['premium_monthly_v3', null], ['premium_monthly_v3', 'cmp-8']] as const)('%s (%s) caps at the 50 GiB AWS data volume', (sku, preference) => {
         const args = input(sku); args.sizePreference = preference;
         const summary = buildSummaryV3(args);
-        expect(summary.storage).toEqual({ usedBytes: '0', capBytes: GiB50, state: 'unavailable' });
+        expect(summary.storage).toEqual({ usedBytes: null, capBytes: GiB50, state: 'unavailable' });
         expect(summary.computer.disk).toEqual({ provisionedGiB: 50, usedBytes: null, growsOnSwitch: false });
         args.storage = [{ computerId: 'c', bytes: BigInt(43) * BigInt(1024) ** BigInt(3), measuredAt: now }];
         expect(buildSummaryV3(args).storage).toEqual({ usedBytes: String(43 * 1024 ** 3), capBytes: GiB50, state: 'low' });
         expect(buildSummaryV3(args).computer.disk).toEqual({ provisionedGiB: 50, usedBytes: String(43 * 1024 ** 3), growsOnSwitch: false });
     });
+    it('a legacy plan with no sample is unmeasured (null, unavailable), never "0 of 2 GB" ok; measured, it meters against 2 GiB', () => {
+        const args = { ...input(), subs: [{ sku: 'standard_monthly_v2', stripeSubscriptionId: 'sub', status: 'active',
+            currentPeriodStart: start, currentPeriodEnd: end, cancelAtPeriodEnd: false }] };
+        expect(buildSummaryV3(args).plan.sku).toBe('legacy');
+        expect(buildSummaryV3(args).storage).toEqual({ usedBytes: null, capBytes: String(2 * 1024 ** 3), state: 'unavailable' });
+        expect(buildSummaryV3(args).computer.disk?.usedBytes).toBeNull();
+        // Positive controls: a measured zero is ok; 1.8e9 bytes is 83.8% of 2 GiB (low); two computers sum.
+        expect(buildSummaryV3({ ...args, storage: [{ computerId: 'c', bytes: BigInt(0), measuredAt: now }] }).storage)
+            .toEqual({ usedBytes: '0', capBytes: String(2 * 1024 ** 3), state: 'ok' });
+        expect(buildSummaryV3({ ...args, storage: [{ computerId: 'c', bytes: BigInt(1_000_000_000), measuredAt: now },
+            { computerId: 'deleted-unpurged', bytes: BigInt(800_000_000), measuredAt: start }] }).storage)
+            .toEqual({ usedBytes: '1800000000', capBytes: String(2 * 1024 ** 3), state: 'low' });
+    });
+    it('a v3 disk counts only live computers on it: a deleted computer\'s retained sample never fills the new computer\'s disk', () => {
+        const GiB = BigInt(1024) ** BigInt(3);
+        const args = { ...input('standard_monthly_v3'), volumeGiB: 50, storage: [
+            { computerId: 'deleted-old', bytes: BigInt(30) * GiB, measuredAt: new Date('2026-10-01T00:00:00Z') },
+            { computerId: 'CF-LIVE', bytes: BigInt(5) * GiB, measuredAt: now },
+            { computerId: 'aws-live', bytes: BigInt(25) * GiB, measuredAt: now }] };
+        const live = [{ computerId: 'AWS-LIVE', provider: 'aws-ec2' }, { computerId: 'cf-live', provider: 'cloudflare' }];
+        // The reviewer's case: 25 GiB on the live 50 GiB volume is ok, not 55 GiB "exhausted" (ids compare case-insensitively).
+        expect(buildSummaryV3({ ...args, liveComputers: live })).toMatchObject({
+            storage: { usedBytes: String(BigInt(25) * GiB), capBytes: String(BigInt(50) * GiB), state: 'ok' },
+            computer: { disk: { provisionedGiB: 50, usedBytes: String(BigInt(25) * GiB) } } });
+        // Control: a caller that names no live computers keeps the unscoped sum (60 GiB on 50: exhausted).
+        expect(buildSummaryV3(args).storage).toMatchObject({ usedBytes: String(BigInt(60) * GiB), state: 'exhausted' });
+        // No live computer on the disk: unmeasured, never a deleted computer's bytes.
+        expect(buildSummaryV3({ ...args, liveComputers: [] }).storage).toEqual({ usedBytes: null, capBytes: String(BigInt(50) * GiB), state: 'unavailable' });
+        // Free (Cloudflare disk, no cap): only the live Cloudflare computer's sample; not the AWS volume, not the deleted one.
+        expect(buildSummaryV3({ ...input(), storage: args.storage, liveComputers: live }).computer.disk?.usedBytes).toBe(String(BigInt(5) * GiB));
+        // Legacy "Saved storage" is the per-user allowance: deleted-but-unpurged computers still count there.
+        const legacy = { ...args, subs: [{ sku: 'standard_monthly_v2', stripeSubscriptionId: 'sub', status: 'active',
+            currentPeriodStart: start, currentPeriodEnd: end, cancelAtPeriodEnd: false }], liveComputers: live };
+        expect(buildSummaryV3(legacy).storage.usedBytes).toBe(String(BigInt(60) * GiB));
+    });
     it('Free shows no invented cap, even with the large-storage flag or a sample', () => {
         const args = input(); args.config.largeStorageEnabled = true;
-        expect(buildSummaryV3(args).storage).toEqual({ usedBytes: '0', capBytes: '0', state: 'unavailable' });
+        expect(buildSummaryV3(args).storage).toEqual({ usedBytes: null, capBytes: '0', state: 'unavailable' });
         args.storage = [{ computerId: 'c', bytes: BigInt(5), measuredAt: now }];
         expect(buildSummaryV3(args)).toMatchObject({ storage: { usedBytes: '5', capBytes: '0', state: 'unavailable' },
             computer: { disk: { provisionedGiB: null, usedBytes: '5' } } });
@@ -338,9 +548,9 @@ describe('round 4: standing fields (additive)', () => {
         expect(summary.fairUse).toEqual({ status: 'ok', resetsAt: free.window.end });
         // Without an AWS placement (standing free) it is still Free's limits, at Free's size.
         expect(buildSummaryV3({ ...lapsed, placementProvider: null, epochs: [] }).computer).toMatchObject({ standing: 'free', size: 'free-cf', sessionMaxSeconds: 3600 });
-        // Still in grace (11-05): the paid plan's limits stand (no session cap, the paid period).
+        // Still in grace (11-05): the paid plan's limits stand (six-hour sessions, the paid period, no hours cutoff).
         const grace = buildSummaryV3({ ...lapsed, now: new Date('2026-11-05T12:00:00Z'), epochs: [] });
-        expect(grace.computer).toMatchObject({ standing: 'grace', sessionMaxSeconds: null });
+        expect(grace.computer).toMatchObject({ standing: 'grace', sessionMaxSeconds: 21600 });
         expect(grace.fairUse).toMatchObject({ status: 'ok', resetsAt: '2026-12-01T00:00:00Z' });
         // A never-paid (incomplete) subscription is Free too.
         expect(buildSummaryV3({ ...lapsed, subs: [{ ...lapsed.subs[0]!, status: 'incomplete' }], paymentIssues: [] }).computer)
@@ -445,7 +655,7 @@ describe('round 5 D3: the shown disk is the computer\'s REAL volume; machine opt
     it.each([null, 'cmp-4', 'cmp-8'] as const)('Premium at %s: a computer created today shows its 100 GiB volume, an older one its 50 GiB volume', preference => {
         const today = { ...input('premium_monthly_v3'), sizePreference: preference, volumeGiB: 100 };
         expect(buildSummaryV3(today).computer.disk).toEqual({ provisionedGiB: 100, usedBytes: null, growsOnSwitch: false });
-        expect(buildSummaryV3(today).storage).toEqual({ usedBytes: '0', capBytes: String(100 * GiB), state: 'unavailable' });
+        expect(buildSummaryV3(today).storage).toEqual({ usedBytes: null, capBytes: String(100 * GiB), state: 'unavailable' });
         const older = { ...today, volumeGiB: 50, storage: [{ computerId: 'c', bytes: BigInt(43) * BigInt(GiB), measuredAt: now }] };
         expect(buildSummaryV3(older).computer.disk).toEqual({ provisionedGiB: 50, usedBytes: String(43 * GiB), growsOnSwitch: false });
         expect(buildSummaryV3(older).storage).toEqual({ usedBytes: String(43 * GiB), capBytes: String(50 * GiB), state: 'low' });
@@ -498,5 +708,114 @@ describe('round 5 D3: used space in GiB, the same unit as the cap', () => {
     });
     it('null, negative or malformed input is null (no invented figure)', () => {
         for (const value of [null, undefined, '', 'abc', '-5', BigInt(-1)]) expect(usedGiBOf(value as never)).toBeNull();
+    });
+});
+
+// Product entitlements v1: an operator-assigned plan with checkout configured offers no Stripe action at all.
+describe('product entitlements v1: the summary of an operator-assigned plan', () => {
+    const row = (sku: 'standard_monthly_v3' | 'premium_monthly_v3') => ({ ref: 'osg-00000000-0000-4000-8000-000000000001', revision: 1, userId: 'u',
+        accountPublicId: '10000000-0000-4000-8000-0000000000a1', sku, startsAt: new Date(now.getTime() - 86_400_000), endsAt: null, endedAt: null });
+    it.each(['standard_monthly_v3', 'premium_monthly_v3'] as const)('%s: assigned access, no checkout, upgrade, downgrade, cancel or renewal, no credits', sku => {
+        const args = input();
+        args.operatorGrants = [row(sku)];
+        const summary = buildSummaryV3(args);
+        expect(summary.plan).toMatchObject({ sku, status: 'active', renewal: null, access: { source: 'operator', untilRevoked: true, endsAt: null } });
+        expect(summary.actions).toMatchObject({ checkout: false, upgrade: false, downgrade: false, cancel: false });
+        expect(summary.ai.grant).toEqual({ amount: 0, per: 'period' });
+        expect(summary.fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
+        // Positive controls with the same configuration: Free can check out, paid Stripe Standard can upgrade, Premium downgrade.
+        expect(buildSummaryV3(input()).actions.checkout).toBe(true);
+        expect(buildSummaryV3(withSubscriptionId(input('standard_monthly_v3'), 'sub_fixture')).actions.upgrade).toBe(true);
+        expect(buildSummaryV3(withSubscriptionId(input('premium_monthly_v3'), 'sub_fixture')).actions.downgrade).toBe(true);
+    });
+});
+
+
+describe('Standard trial summary', () => {
+    const trialStart = new Date('2026-10-10T00:00:00Z'), trialEnd = new Date('2026-11-10T00:00:00Z');
+    const ROOT = `ezil-os:v1:standard_monthly_v3:sub_fixture:${trialStart.toISOString()}:trial`;
+    function trialInput(patch: Partial<Input['subs'][number]> = {}): Input {
+        const args = input('standard_monthly_v3');
+        args.subs = [{ ...args.subs[0]!, status: 'trialing', trialStart, trialEnd, firstPaidAt: null, ...patch }];
+        args.grants = [{ ...args.grants[0]!, kind: 'trial_period', sourceType: 'trial', sourceId: 'sub', periodStart: trialStart, periodEnd: trialEnd }];
+        args.renewal = { at: '2026-11-10T00:00:00Z', amountCents: 2000 };
+        // A real Stripe trial has a `sub_…` id, so its cancel action is offered (operatorGrantedSubscription guard).
+        return withSubscriptionId(args, 'sub_fixture');
+    }
+
+    it('trialing: Standard access, $20 first charge at the trial end, no upgrade offer, same computer and disk', () => {
+        const summary = buildSummaryV3(trialInput());
+        expect(summary.plan.trial).toEqual({ state: 'trialing', startedAt: '2026-10-10T00:00:00Z', endsAt: '2026-11-10T00:00:00Z',
+            firstChargeAt: '2026-11-10T00:00:00Z', amountCents: 2000, currency: 'usd' });
+        expect(summary.plan).toMatchObject({ sku: 'standard_monthly_v3', status: 'active', renewal: { at: '2026-11-10T00:00:00Z', amountCents: 2000 } });
+        expect(summary.actions).toMatchObject({ upgrade: false, cancel: true });
+        expect(summary.computer).toMatchObject({ standing: 'paid', size: 'std-2', vcpu: 2, memoryGiB: 8 });
+        expect(summary.fairUse).toMatchObject({ status: 'ok', policy: 'unmetered' });
+        expect(summary.ai.grant).toEqual({ amount: 200, per: 'period' });
+        // Parity: a paid Standard period shows the same computer, sessions and credits; only the plan's trial block differs.
+        const paid = buildSummaryV3(withSubscriptionId(input('standard_monthly_v3'), 'sub_fixture'));
+        expect(paid.plan.trial).toBeUndefined();
+        expect({ ...paid.computer, activeDeadline: null }).toEqual({ ...summary.computer, activeDeadline: null });
+        expect(paid.ai.grant).toEqual(summary.ai.grant);
+        expect(paid.actions.upgrade).toBe(true);
+    });
+
+    it('ending: a cancelled trial keeps Standard until the trial end with no charge, then is plain Free', () => {
+        const summary = buildSummaryV3(trialInput({ cancelAtPeriodEnd: true }));
+        expect(summary.plan.trial).toMatchObject({ state: 'ending', endsAt: '2026-11-10T00:00:00Z', firstChargeAt: null });
+        expect(summary.plan).toMatchObject({ status: 'cancels', renewal: null, planEndsAt: '2026-11-10T00:00:00Z' });
+        const after = buildSummaryV3({ ...trialInput({ cancelAtPeriodEnd: true, status: 'canceled' }), now: new Date('2026-11-10T00:00:01Z') });
+        expect(after.plan.trial).toBeUndefined();
+        expect(after.plan.sku).toBe('free_v3');
+    });
+
+    it('payment_failed: no grace, Standard access ended, the payment issue is shown', () => {
+        const args = { ...trialInput({ status: 'past_due', currentPeriodStart: trialEnd, currentPeriodEnd: new Date('2026-12-10T00:00:00Z') }),
+            now: new Date('2026-11-10T02:00:00Z') };
+        args.paymentIssues = [{ stripeInvoiceId: 'in_cycle', userId: 'u', subscriptionId: 'sub', invoiceKind: 'subscription', issue: 'payment_failed',
+            hostedInvoiceUrl: null, stripeEventCreated: new Date('2026-11-10T01:00:00Z'), resolvedAt: null, updatedAt: new Date('2026-11-10T01:00:00Z') }];
+        const summary = buildSummaryV3(args);
+        expect(summary.plan.trial).toMatchObject({ state: 'payment_failed', endsAt: '2026-11-10T00:00:00Z' });
+        expect(summary.plan).toMatchObject({ status: 'past_due', paymentIssue: 'payment_failed', graceEndsAt: null });
+        expect(summary.computer.standing).toBe('free');
+    });
+
+    it('payment_pending: the trial ended and the first charge is not collected yet; Standard waits, never shown as active', () => {
+        const args = { ...trialInput({ status: 'active', currentPeriodStart: trialEnd, currentPeriodEnd: new Date('2026-12-10T00:00:00Z') }),
+            now: new Date('2026-11-10T00:30:00Z') };
+        const summary = buildSummaryV3(args);
+        expect(summary.plan.trial).toMatchObject({ state: 'payment_pending', endsAt: '2026-11-10T00:00:00Z', firstChargeAt: '2026-11-10T00:00:00Z' });
+        expect(summary.computer.standing).toBe('free');
+        expect(summary.fairUse.policy).toBeUndefined();
+        // No paid affordance while the first payment is unconfirmed (core review R1 residual). Cancel stays supported:
+        // it stops renewals (the first charge being collected is not voided; clients use paused-access copy).
+        expect(summary.actions).toMatchObject({ upgrade: false, downgrade: false, cancel: true });
+        // One second before the end it is still the trial.
+        expect(buildSummaryV3({ ...trialInput(), now: new Date('2026-11-09T23:59:59Z') }).plan.trial?.state).toBe('trialing');
+        expect(buildSummaryV3({ ...trialInput(), now: new Date('2026-11-09T23:59:59Z') }).computer.standing).toBe('paid');
+    });
+
+    it('a converted trial (first paid period granted) is ordinary Standard', () => {
+        expect(buildSummaryV3(trialInput({ status: 'active', firstPaidAt: trialEnd })).plan.trial).toBeUndefined();
+    });
+
+    it('the trial root counts as this period\'s plan credits, never as an earlier period\'s', () => {
+        const args = trialInput();
+        args.ai = { receipts: [{ entitlementId: ROOT, credits: 200, expiresAt: trialEnd.toISOString(), deliveredAt: start, failed: false }] as never,
+            gatewayGrants: [{ creditsMicro: '200000000', remainingMicro: '150000000', expiresAt: trialEnd.toISOString(), live: true, source: 'os' }] as never,
+            balanceMicro: '150000000' };
+        const summary = buildSummaryV3(args);
+        expect(summary.ai.included).toEqual({ granted: 200, remaining: 150, periodEnd: '2026-11-10T00:00:00Z' });
+        expect(summary.ai.previous).toBeNull();
+        expect(summary.ai.pendingFromRenewal).toBeNull();
+    });
+
+    it('the offer is passed through only for a Free viewer with checkout available', () => {
+        const offer = { eligible: true as const, sku: 'standard_monthly_v3' as const, endsAt: '2026-11-19T12:00:00Z', amountCents: 2000, currency: 'usd' as const };
+        expect(buildSummaryV3({ ...input(), trialOffer: offer }).trialOffer).toEqual(offer);
+        expect(buildSummaryV3({ ...input(), trialOffer: { eligible: false, reason: 'trial_used' } }).trialOffer).toEqual({ eligible: false, reason: 'trial_used' });
+        expect('trialOffer' in buildSummaryV3({ ...input('standard_monthly_v3'), trialOffer: offer })).toBe(false);
+        expect('trialOffer' in buildSummaryV3({ ...input(), stripeAvailable: false, trialOffer: offer })).toBe(false);
+        expect('trialOffer' in buildSummaryV3(input())).toBe(false);
     });
 });

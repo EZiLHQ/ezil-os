@@ -84,6 +84,20 @@ describe('decideAdmission (pure)', () => {
         expect(decide({ runningCount: 1, runningVcpu: 2, usage: [hoursRow(U1, 99, 49 * GB), hoursRow(U2, 400, 100 * GB)] })).toEqual({ admit: true });
     });
 
+    // Paid compute policy v1 (founder e713d157): a verified paid owner is not held to the per-person monthly hour cap.
+    it('an exempt owner passes the per-person hour cap at and far above it; every other refusal, the fleet cap included, stands', () => {
+        const exempt = (counters: DecideCounters) => decideAdmission({ config, counters: { ...empty, ...counters, usage: monthUsageFromRows(counters.usage ?? [], NOW) },
+            userId: U1, now: NOW, instanceType: 'm6i.large', userHoursExempt: true });
+        expect(decide({ usage: [hoursRow(U1, 100)] })).toMatchObject({ admit: false, reason: 'user_hours_cap' });
+        for (const hours of [100, 101, 400]) expect(exempt({ usage: [hoursRow(U1, hours)] })).toEqual({ admit: true });
+        expect(exempt({ usage: [hoursRow(U1, 300), hoursRow(U2, 300)] })).toMatchObject({ admit: false, reason: 'global_hours_cap', reasons: ['global_hours_cap'] });
+        expect(exempt({ runningCount: 2, usage: [hoursRow(U1, 150)] })).toMatchObject({ admit: false, reason: 'max_running' });
+        expect(exempt({ userOtherAwsComputers: 1 })).toMatchObject({ admit: false, reason: 'user_has_aws_computer' });
+        expect(exempt({ targetOwnerId: U2 })).toMatchObject({ admit: false, reason: 'computer_not_owned' });
+        expect(decideAdmission({ config: readAwsAdmissionConfig({ ...ENV, EZIL_AWS_KILL_SWITCH: '1' }), counters: empty, userId: U1, now: NOW, userHoursExempt: true }))
+            .toMatchObject({ admit: false, reason: 'kill_switch' });
+    });
+
     it.each([
         ['disabled', {}, readAwsAdmissionConfig({}), 'aws_disabled'],
         ['not the owner', { targetOwnerId: U2 }, config, 'computer_not_owned'],
@@ -294,6 +308,8 @@ describe('runAdmission (transactional)', () => {
             usage: [{ computer_id: C1, user_id: U1, started_at: new Date(NOW.getTime() - 100 * 3_600_000), stopped_at: null, egress_bytes: null }],
         });
         expect(await runAdmission(db, lease(U1, C1), deps)).toMatchObject({ admitted: false, reason: 'user_hours_cap' });
+        // Paid compute policy v1: the caller's resolved paid plan admits the same lease; the ledger row is untouched.
+        expect(await runAdmission(db, lease(U1, C1), { ...deps, userHoursExempt: true })).toMatchObject({ admitted: true });
     });
 
     it("a create for another user's computer is refused before any write", async () => {

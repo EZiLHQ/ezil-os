@@ -29,6 +29,14 @@ same(appUrl('settings', [['tab', 'billing'], ['computer', C]]), `/app/settings?t
 same(appUrl('settings', { tab: undefined, x: '', y: null }), '/app/settings', 'empty values are left out');
 same(linkParams({ id: 'settings', initialTab: 'usage' }), { tab: 'usage' });
 same(linkParams({ id: 'code', project: { projectId: P, repoId: R } }), { project: P, repo: R });
+// Founder 547ed35a: a repository address is written back as `repo` alone, so history, reload and relaunch keep it.
+{
+    const GH = 'https://github.com/EZiLHQ/ezil-os.git';
+    same(linkParams({ id: 'code', project: { repoUrl: GH } }), { repo: GH });
+    const url = appUrl('code', linkParams({ id: 'code', project: { repoUrl: GH } }));
+    same(url, '/app/code?repo=https%3A//github.com/EZiLHQ/ezil-os.git');
+    same(new URLSearchParams(url.split('?')[1]).get('repo'), GH);
+}
 same(linkParams({ id: 'desktop' }), {});
 same(linkParams(null), {});
 // History-state merge: unknown keys (Next's, a later lane's) survive.
@@ -44,7 +52,16 @@ const loc = (search, hash = '') => ({ pathname: '/os', search, hash });
 same(canonicalUrl(loc('?app=code&project=a%2Fb&x=%41'), { id: 'code' }), '/app/code?project=a%2Fb&x=%41');
 same(canonicalUrl(loc(`?computer=${C}&settings=billing&tab=old`), { id: 'settings', initialTab: 'billing' }), `/app/settings?tab=billing&computer=${C}`);
 same(canonicalUrl(loc('?settings=bogus&app=settings&tab=old'), { id: 'settings' }), '/app/settings?tab=old', 'no valid tab: nothing to replace');
-same(canonicalUrl(loc('?app=browser', '#h'), { id: 'desktop' }), '/app/desktop#h');
+same(canonicalUrl(loc('?app=browser', '#h'), { id: 'desktop' }), '/app/browser#h');
+// The Browser (registry id `desktop`) is written at `/app/browser`, whatever
+// spelling reached it; every other app at its own id.
+same(appUrl('desktop'), '/app/browser', 'the Browser is written at /app/browser');
+same(appUrl('desktop', [['computer', C]]), `/app/browser?computer=${C}`);
+same(canonicalUrl(loc('?app=desktop&x=%41', '#h'), { id: 'desktop' }), '/app/browser?x=%41#h', 'the alias form by its id');
+same(canonicalUrl({ pathname: '/app/desktop', search: `?computer=${C}&x=%41`, hash: '#top' }, { id: 'desktop' }), `/app/browser?computer=${C}&x=%41#top`,
+    'a legacy /app/desktop link: path renamed, query and hash byte for byte');
+same(canonicalUrl({ pathname: '/app/browser', search: '', hash: '' }, { id: 'desktop' }), '/app/browser', 'the canonical link is its own canonical form');
+for (const id of ['code', 'settings', 'preview', 'app-store', 'secure-browser']) same(appUrl(id), `/app/${id}`, `${id} keeps its id as its address`);
 same(canonicalUrl(loc('?app=code&upgrade=pro'), { id: 'code' }, { search: '?keep=1' }), '/app/code?keep=1', 'a consumed query can be passed in');
 same(canonicalUrl(loc(''), { id: 'code' }), '/app/code');
 same(canonicalUrl(loc('?app%3D=1&%61pp=code'), { id: 'code' }), '/app/code?app%3D=1', 'keys compare decoded');
@@ -174,7 +191,7 @@ function harness (entry, { provider = 'cloudflare-guacamole', state = { __NA: tr
     same(w.history.state.ezilView, undefined, "Code's view leaves with Code");
     settings2.setAttribute('data-is_minimized', '1');
     close(settings2);
-    same(url(), `/app/desktop?computer=${C}`, 'a minimised window is not in front');
+    same(url(), `/app/browser?computer=${C}`, 'a minimised window is not in front');
     close(desktop);
     same([url(), w.history.length, w.history.state.ezilApp], [`/os?computer=${C}`, 5, undefined], 'the last close returns to /os, in place');
     const again = open('code', 30);
@@ -407,7 +424,7 @@ for (const fail of [false, true]) {
         const ended = ids.map(() => false);
         const named = () => {
             const i = [2, 1, 0].find(j => ! ended[j] || opened[j]);
-            return i === undefined ? ['/os', 4, undefined] : [`/app/${ids[i]}`, 4, ids[i]];
+            return i === undefined ? ['/os', 4, undefined] : [`/app/${ids[i] === 'desktop' ? 'browser' : ids[i]}`, 4, ids[i]];
         };
         const label = order.map(i => `${ids[i]} ${opened[i] ? 'opens' : 'fails'}`).join(', then ');
         for (const i of order) {
@@ -428,9 +445,9 @@ for (const fail of [false, true]) {
     settings.end(null);
     same(url(), '/app/code', 'Settings fails: Code, still pending, has the address bar back');
     code.end(null);
-    same(url(), '/app/desktop', 'then Code fails: Desktop, still pending, has it');
+    same(url(), '/app/browser', 'then Code fails: Desktop, still pending, has it');
     desktop.end(open('desktop', 10));
-    same([url(), w.history.length, w.history.state.ezilApp], ['/app/desktop', 4, 'desktop'], 'then Desktop opens: it is named');
+    same([url(), w.history.length, w.history.state.ezilApp], ['/app/browser', 4, 'desktop'], 'then Desktop opens: it is named');
 }
 {
     // ... to `/os`, when every launch fails.
@@ -471,12 +488,12 @@ for (const closed of [true, false]) {
     const settings = controller.begin('settings');
     if ( closed ) {
         close(settingsWindow);
-        same(url(), '/app/desktop', 'the close names the front app');
+        same(url(), '/app/browser', 'the close names the front app');
     }
     settings.end(null);
-    same(url(), closed ? '/app/desktop' : '/app/code', closed ? 'Settings fails after the close: nothing given back' : 'positive control: Settings fails, Code has it back');
+    same(url(), closed ? '/app/browser' : '/app/code', closed ? 'Settings fails after the close: nothing given back' : 'positive control: Settings fails, Code has it back');
     code.end(null);
-    same([url(), w.history.length], [closed ? '/app/desktop' : '/app/settings', 5], closed ? 'then Code fails: still the close\'s' : 'positive control: then Code fails, the URL it replaced');
+    same([url(), w.history.length], [closed ? '/app/browser' : '/app/settings', 5], closed ? 'then Code fails: still the close\'s' : 'positive control: then Code fails, the URL it replaced');
 }
 for (const olderFirst of [true, false]) for (const closed of [true, false]) {
     // A close BETWEEN two clicks: the newer one fails and gives back to the
@@ -489,11 +506,11 @@ for (const olderFirst of [true, false]) for (const closed of [true, false]) {
     const code = controller.begin('code');
     if ( closed ) {
         close(settings);
-        same(url(), '/app/desktop', 'the close names the front app');
+        same(url(), '/app/browser', 'the close names the front app');
     }
     const newer = controller.begin('settings');
     for (const launch of olderFirst ? [code, newer] : [newer, code]) launch.end(null);
-    same([url(), w.history.length], closed ? ['/app/desktop', 3] : ['/os', 3], closed
+    same([url(), w.history.length], closed ? ['/app/browser', 3] : ['/os', 3], closed
         ? `${olderFirst ? 'older' : 'newer'} fails first: nothing is given back over the close`
         : `positive control (${olderFirst ? 'older' : 'newer'} first): both give back, to /os`);
     void desktop;
@@ -509,7 +526,7 @@ for (const olderFirst of [true, false]) for (const closed of [true, false]) {
     const newer = controller.begin('desktop');
     const code = open('code', 10);
     older.end(code);
-    same([url(), controller.superseded(code)], ['/app/desktop', true], 'while the newer launch is pending, the older window stands down');
+    same([url(), controller.superseded(code)], ['/app/browser', true], 'while the newer launch is pending, the older window stands down');
     newer.end(null);
     same([url(), controller.superseded(code)], ['/app/code', false], 'the newer launch fails: Code has the address bar back, and the front');
     focus(settings);
@@ -591,9 +608,9 @@ for (const opened of [true, false]) {
     focus(settings);
     const launch = controller.begin('code');
     close(settings);
-    same([url(), w.history.length], ['/app/desktop', 4], 'the close names the front app');
+    same([url(), w.history.length], ['/app/browser', 4], 'the close names the front app');
     launch.end(opened ? open('code', 30) : null);
-    same([url(), w.history.length], [opened ? '/app/code' : '/app/desktop', 4], opened
+    same([url(), w.history.length], [opened ? '/app/code' : '/app/browser', 4], opened
         ? 'a close is not a launch: the window that opened still names itself'
         : "a failed launch does not give back, over the close, a closed app's URL");
 }
@@ -742,12 +759,12 @@ for (const renames of [false, true]) {
     // Settings is open, so the entry names it (and its view) at once.
     same([url(), w.history.state.ezilApp, routes.map(r => r.id)], ['/app/settings?tab=usage', 'settings', ['settings']], 'Back to Settings at Usage, still opening');
     close(renames ? settings : desktop);
-    same(url(), renames ? '/app/desktop' : '/app/settings?tab=usage', renames ? 'the close of the front window renames the entry' : 'a close behind it renames nothing');
+    same(url(), renames ? '/app/browser' : '/app/settings?tab=usage', renames ? 'the close of the front window renames the entry' : 'a close behind it renames nothing');
     const writes = [];
     const replace = w.history.replaceState.bind(w.history);
     w.history.replaceState = (...args) => { writes.push(args[2]); replace(...args); };
     routes.shift().resolve(renames ? open('settings', 20) : settings);
-    same([url(), w.history.state.ezilApp, writes], renames ? ['/app/desktop', 'desktop', []] : ['/app/settings?tab=usage', 'settings', ['/app/settings?tab=usage']],
+    same([url(), w.history.state.ezilApp, writes], renames ? ['/app/browser', 'desktop', []] : ['/app/settings?tab=usage', 'settings', ['/app/settings?tab=usage']],
         renames ? 'it took the entry: the Back launch writes nothing over it' : 'it took nothing: the Back launch commits');
 }
 {
@@ -762,7 +779,7 @@ for (const renames of [false, true]) {
         const { w, controller, open, url } = harness('/os');
         const [a, b, c] = ids.map(id => controller.begin(id));
         c.end(null); b.end(null); a.end(open('desktop', 10));
-        same([url(), apps(w)], ['/app/desktop', ['desktop']], 'N1: Settings fails, Code fails, Desktop opens: Desktop is named');
+        same([url(), apps(w)], ['/app/browser', ['desktop']], 'N1: Settings fails, Code fails, Desktop opens: Desktop is named');
     }
     {
         const { w, controller, url } = harness('/os');

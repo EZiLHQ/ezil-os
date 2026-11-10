@@ -1,6 +1,6 @@
 import { storageCapBytes } from '../catalog';
 import { checkoutAvailable, type BillingConfig } from '../config';
-import { storageState, type SubscriptionRow } from '../meters';
+import { latestStorageTotal, storageState, type SubscriptionRow } from '../meters';
 import type { GrantMeter, GrantRow, OverageConsentRow, OverageInvoiceRow, PaymentIssueRow, PlanChangeRow } from '../ports';
 import { offerBySku, planFromSubscriptions } from './catalog';
 import {
@@ -109,18 +109,8 @@ export function buildSummaryV2(input: {
         }
     }
 
-    // Storage is a level: retain only the newest sample for each computer.
-    const newest = new Map<string, { bytes: bigint; measuredAt: Date }>();
-    for (const sample of storage) {
-        const seen = newest.get(sample.computerId);
-        if (!seen || sample.measuredAt > seen.measuredAt) newest.set(sample.computerId, sample);
-    }
-    let usedBytes = BigInt(0);
-    let measuredAt: Date | null = null;
-    for (const sample of newest.values()) {
-        usedBytes += sample.bytes;
-        if (measuredAt === null || sample.measuredAt > measuredAt) measuredAt = sample.measuredAt;
-    }
+    // Storage is a level: retain only the newest sample for each computer; none is null, not "0".
+    const { usedBytes, measuredAt } = latestStorageTotal(storage);
     const capBytes = storageCapBytes(family === 'free' ? 'free' : 'pro', config.largeStorageEnabled);
     const ca = checkoutAvailable(config);
     const offers: OfferDTO[] = [];
@@ -175,7 +165,8 @@ export function buildSummaryV2(input: {
             currency: 'usd', taxNote: 'before_tax',
         },
         storage: {
-            usedBytes: usedBytes.toString(), capBytes: capBytes.toString(), state: storageState(usedBytes, capBytes),
+            usedBytes: usedBytes?.toString() ?? null, capBytes: capBytes.toString(),
+            state: usedBytes === null ? 'unavailable' : storageState(usedBytes, capBytes),
             measuredAt: measuredAt === null ? null : iso(measuredAt),
         },
         ai: { state: 'unavailable', trialMicro: '0', includedMicro: '0', purchasedMicro: '0', includedExpiresAt: null },

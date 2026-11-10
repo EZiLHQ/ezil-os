@@ -75,6 +75,7 @@ const { scan } = await import('./secret-scan.js');
 const telemetry = await import('../../telemetry.js');
 const { beginTrace, ambientTraceRef } = await import('../../trace.js');
 const { default: log } = await import('../../log.js');
+const { setCurrentComputer } = await import('../../session.js');
 const { feedbackSubmitSchema, diagnosticsSchema } = await import('../../../../app/src/server/feedback/types.ts');
 // FEEDBACK-DIAG: the server allowlist itself (no `@/` imports, erasable TS only), to pin the shell twin to it.
 const serverFailure = await import('../../../../app/src/server/lib/failure-diagnostics.ts');
@@ -119,7 +120,7 @@ const current = () => document.querySelector('dialog.ezil-feedback-dialog');
 const form = () => current().querySelector('form');
 const payload = () => JSON.parse(current().querySelector('pre').textContent);
 const status = () => current().querySelector('.ezil-feedback-result').textContent;
-const setDescription = value => { form().elements.description.value = value; form().elements.description.dispatchEvent(new window.Event('input', { bubbles: true })); };
+const setDescription = value => { form().elements.category.value = 'idea'; form().elements.description.value = value; form().elements.description.dispatchEvent(new window.Event('input', { bubbles: true })); };
 const change = (name, checked) => { form().elements[name].checked = checked; form().elements[name].dispatchEvent(new window.Event('change', { bubbles: true })); };
 const send = () => form().dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
 const close = () => current().querySelector('[data-action="cancel"]').click();
@@ -154,7 +155,7 @@ try {
         assert.doesNotMatch(JSON.stringify(data), /SECRET|example\.test|auth-token|detail|outcome/);
         assert.equal(calls.length, 0);
     });
-    await check('diagnostics clamp values and read only rendered stream measurements', () => {
+    await check('diagnostics clamp values and exclude DOM stream measurements', () => {
         globalThis.ezil.version = 'v'.repeat(100);
         Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: 100 });
         Object.defineProperty(navigator, 'userAgentData', { configurable: true, value: {
@@ -173,7 +174,7 @@ try {
         assert.equal(data.viewport.dpr, 16);
         assert.equal(data.deviceClass, 'phone');
         assert.deepEqual(data.browser, { family: 'Chromium', major: 140 });
-        assert.deepEqual(data.stream, { kbps: 124, rttMs: 24 });
+        assert.equal(data.stream, undefined, 'DOM text is excluded');
         vitals.remove();
         document.body.classList.remove('device-phone');
     });
@@ -431,6 +432,121 @@ try {
         close();
         assert.equal(document.activeElement.id, 'opener');
     });
+    await check('rich bugs validate all fields, preserve drafts and total text without truncation', () => {
+        window.localStorage.removeItem(draftKey); open();
+        setDescription('Cannot open the desktop');
+        form().elements.category.value = 'bug';
+        form().dispatchEvent(new window.Event('change', { bubbles: true }));
+        assert.equal(current().querySelector('[type="submit"]').disabled, true);
+        for (const [key, value] of Object.entries({ activity: 'Opening a project', steps: '1. Click Browser', expected: 'Desktop opens', actual: 'Spinner stays', reproducibility: 'Every time', impact: 'Blocked' })) form().elements[key].value = value;
+        form().dispatchEvent(new window.Event('input', { bubbles: true }));
+        assert.equal(current().querySelector('[type="submit"]').disabled, false);
+        assert.match(payload().description, /Steps to reproduce\n1. Click Browser/);
+        const before = payload().description; close(); open();
+        assert.equal(payload().description, before);
+        assert.equal(form().elements.steps.value, '1. Click Browser');
+        form().elements.actual.value = 'x'.repeat(4000);
+        form().dispatchEvent(new window.Event('input', { bubbles: true }));
+        assert.equal(current().querySelector('[type="submit"]').disabled, true);
+        assert.match(payload().description, new RegExp('x{4000}'));
+        close(); window.localStorage.removeItem(draftKey);
+    });
+    await check('failure references require the upstream capability and remain bounded', () => {
+        // The merged fixture advertises feedbackEventDiagnostics; this case drives the flag itself (absent for
+        // the negative, true for the positive) and restores the prior value so later cases are unaffected.
+        const priorDiag = window.__EZIL_BOOT__.desktopState.ui.feedbackEventDiagnostics;
+        delete window.__EZIL_BOOT__.desktopState.ui.feedbackEventDiagnostics;
+        try {
+            const events = telemetry.recentEvents();
+            const event = events.at(-1);
+            event.reason = 'worker_http_401:hmac_signature_mismatch';
+            event.serverCorrelationId = 'srv_0123456789ab';
+            assert.equal(build_diagnostics().recentEvents.at(-1).reason, undefined);
+            window.__EZIL_BOOT__.desktopState.ui.feedbackEventDiagnostics = true;
+            assert.equal(build_diagnostics().recentEvents.at(-1).reason, event.reason);
+            assert.equal(build_diagnostics().recentEvents.at(-1).correlationId, event.serverCorrelationId);
+            event.reason = 'https://private.test/?token=secret';
+            event.serverCorrelationId = 'Bearer private';
+            assert.equal(build_diagnostics().recentEvents.at(-1).reason, undefined);
+            assert.equal(build_diagnostics().recentEvents.at(-1).correlationId, undefined);
+            delete event.reason; delete event.serverCorrelationId;
+        } finally {
+            if (priorDiag === undefined) delete window.__EZIL_BOOT__.desktopState.ui.feedbackEventDiagnostics;
+            else window.__EZIL_BOOT__.desktopState.ui.feedbackEventDiagnostics = priorDiag;
+        }
+    });
+    await check('expanded diagnostics are consented, frozen, refreshed and downgraded on a strict old server', async () => {
+        window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle = true;
+        open(); setDescription('Snapshot test');
+        assert.equal(payload().diagnostics, null);
+        change('diagnostics', true);
+        const snapshot = JSON.stringify(payload().diagnostics);
+        assert.equal(payload().diagnostics.recentEvents.length, 50);
+        assert.ok(payload().diagnostics.tracePhases.some(p => p.code === 'display'));
+        telemetry.capture({ eventClass: 'api_failure', site: 's', code: 'new_failure' });
+        setDescription('Edited context');
+        assert.equal(JSON.stringify(payload().diagnostics), snapshot);
+        current().querySelector('[data-action="refresh-diagnostics"]').click();
+        assert.equal(payload().diagnostics.recentEvents.at(-1).code, 'new_failure');
+        const original = payload(); const count = calls.length;
+        respond = async () => calls.length === count + 1 ? { status: 400 } : { status: 201, json: async () => ({ id: reportId }) };
+        send(); await until(() => status().includes(reportId));
+        const first = JSON.parse(calls[count].body), second = JSON.parse(calls[count + 1].body);
+        assert.deepEqual(first, original);
+        assert.equal(second.description, original.description);
+        assert.equal(second.clientRequestId, original.clientRequestId);
+        assert.equal(second.diagnostics.session, undefined);
+        assert.equal(second.diagnostics.tracePhases, undefined);
+        assert.equal(second.diagnostics.recentEvents[0].ageMs, undefined);
+        assert.equal(current().querySelector('pre').textContent, calls[count + 1].body);
+        assert.ok(Buffer.byteLength(calls[count].body) < 32768);
+        close(); delete window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle;
+        respond = async () => ({ status: 201, ok: true, json: async () => ({ id: reportId, screenshotAccepted: true }) });
+    });
+    await check('editing an unconfirmed report forks its ID before an old receipt can discard edits', async () => {
+        open(); setDescription('Original unconfirmed report');
+        const originalId = payload().clientRequestId;
+        respond = async () => { throw new TypeError('Failed to fetch'); };
+        send(); await until(() => stored(outboxKey)?.some(entry => entry.clientRequestId === originalId) && !current().querySelector('[type="submit"]').disabled);
+        setDescription('New evidence after the first attempt');
+        assert.notEqual(payload().clientRequestId, originalId);
+        window.dispatchEvent(new window.CustomEvent('ezil:feedback-sent', { detail: { clientRequestId: originalId, id: reportId } }));
+        assert.equal(current().querySelector('.ezil-feedback-fields').hidden, false);
+        assert.equal(form().elements.description.value, 'New evidence after the first attempt');
+        close(); window.localStorage.removeItem(outboxKey); window.localStorage.removeItem(draftKey);
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true }) });
+    });
+    await check('completed app trace keeps matching ID, app and phases in the diagnostic bundle', () => {
+        const completed = beginTrace('desktop'); completed.step('display'); completed.end('ok');
+        window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle = true;
+        const snapshot = build_diagnostics();
+        assert.equal(snapshot.traceId, completed.id);
+        assert.equal(snapshot.traceApp, 'desktop');
+        assert.equal(snapshot.tracePhases[0].code, 'display');
+        diagnosticsSchema.parse(snapshot);
+        delete window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle;
+    });
+    await check('quota failure retains text and never claims an image report is saved for automatic retry', async () => {
+        open(); setDescription('Keep my report when storage fills');
+        const prototype = Object.getPrototypeOf(window.localStorage);
+        const original = prototype.setItem;
+        prototype.setItem = function (key, value) {
+            if (key === outboxKey) throw new Error('QuotaExceededError');
+            return original.call(this, key, value);
+        };
+        try {
+            respond = async () => ({ status: 503 });
+            send(); await until(() => status().includes('Could not save this report'));
+            assert.equal(stored(draftKey).description, 'Keep my report when storage fills');
+            assert.match(status(), /copy your report text/);
+            assert.equal(stored(outboxKey), null);
+        } finally {
+            prototype.setItem = original;
+            close();
+            window.localStorage.removeItem(draftKey);
+            respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true }) });
+        }
+    });
     await check('all capture tiers use the editor; tab capture starts synchronously; no upload before Submit', async () => {
         open(); setDescription('Screenshot report'); change('screenshot', true);
         const count = calls.length;
@@ -447,6 +563,17 @@ try {
                 assert.equal(payload().screenshot, null);
             }
         }
+        const attached = current().querySelector('.ezil-feedback-image img');
+        Object.defineProperties(attached, { naturalWidth: { value: 1 }, naturalHeight: { value: 1 } });
+        const originalContext = window.HTMLCanvasElement.prototype.getContext;
+        let source;
+        window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage(image) { source = image; } });
+        const editCount = captureCalls.length;
+        current().querySelector('[data-capture="edit"]').click();
+        await until(() => captureCalls.length > editCount && !current().querySelector('[type="submit"]').disabled);
+        assert.equal(source, attached, 'editing starts from the redacted attached image');
+        assert.equal(captureCalls.at(-1), 'editor');
+        window.HTMLCanvasElement.prototype.getContext = originalContext;
         respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true }) });
         const before = current().querySelector('pre').textContent;
         send(); await until(() => status().includes(reportId));
@@ -475,6 +602,8 @@ try {
             respond = async () => ({ status: code });
             send(); await until(() => ! current().querySelector('[type="submit"]').disabled);
             assert.match(status(), code === 400 ? /could not be accepted/ : code === 413 ? /too large/ : /Could not send/);
+            if ( code === 500 ) assert.match(status(), /server could not take it.*press Send to try again/, '🔴 a server error while online names the retry action');
+            if ( code === 500 ) assert.doesNotMatch(status(), /connection comes back/, 'no reconnect promise after a server answer');
             assert.equal(form().elements.description.value, 'Contact test@example.com or sk-example123');
         }
         respond = async () => { throw new Error('offline'); };
@@ -528,6 +657,209 @@ try {
         assert.equal(JSON.parse(calls.at(-1).body).clientRequestId, id);
         assert.equal(current().querySelector('[type="submit"]').hidden, true);
         assert.equal(stored(outboxKey), null); assert.equal(stored(draftKey), null);
+        close();
+    });
+    // Deadline timers are the only ones at or above the base allowance; the fakes record them instead.
+    function fakeDeadlines () {
+        const timers = [];
+        const realSetTimeout = globalThis.setTimeout, realClearTimeout = globalThis.clearTimeout;
+        globalThis.setTimeout = (fn, ms, ...rest) => {
+            if ( ms < feedback.SEND_DEADLINE.baseMs ) return realSetTimeout(fn, ms, ...rest);
+            const timer = { fn, ms, cleared: false };
+            timers.push(timer);
+            return timer;
+        };
+        globalThis.clearTimeout = timer => { if ( timers.includes(timer) ) timer.cleared = true; else realClearTimeout(timer); };
+        timers.restore = () => { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout; };
+        return timers;
+    }
+    const stalledBody = (url, options) => Promise.resolve({ status: 201, json: () => new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+    }) });
+    const queuedReport = (id, description, base64 = null) => JSON.stringify({ v: 1, clientRequestId: id, category: 'bug', description,
+        ...(base64 ? { screenshot: { contentType: 'image/png', dataBase64: base64 } } : {}) });
+    await check('a send that never answers times out, says so truthfully, unlocks the form and re-sends the same id', async () => {
+        open(); setDescription('Stalled send');
+        const id = payload().clientRequestId;
+        const body = current().querySelector('pre').textContent;
+        let signal;
+        respond = (url, options) => new Promise((resolve, reject) => {
+            signal = options.signal;
+            signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        });
+        const timers = fakeDeadlines();
+        try {
+            send(); await until(() => timers.length === 1);
+            assert.equal(timers[0].ms, feedback.send_deadline_ms(body.length), 'the deadline follows the body size');
+            assert.ok(timers[0].ms >= 40_000 && timers[0].ms < 60_000, 'a text report keeps a short but real deadline');
+            assert.match(status(), /^Sending…/, 'setup: the request is still pending');
+            assert.equal(signal.aborted, false);
+            timers[0].fn();
+            await until(() => ! current().querySelector('[type="submit"]').disabled);
+        } finally { timers.restore(); }
+        assert.equal(signal.aborted, true, '🔴 the deadline aborts the request');
+        assert.match(status(), /didn't answer in time.*press Send to try again/, '🔴 a timeout names the retry action');
+        assert.doesNotMatch(status(), /online|connection comes back|Check your connection/, 'no reconnect promise while online');
+        assert.equal(stored(outboxKey).at(-1).body, body, 'the unanswered body stays queued');
+        // Pressing Send again reuses the id, which the server answers as a replay.
+        respond = async () => ({ status: 200, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+        send(); await until(() => /Thanks — we got it/.test(status()));
+        assert.equal(JSON.parse(calls.at(-1).body).clientRequestId, id);
+        assert.equal(stored(outboxKey), null);
+        close();
+    });
+    await check('a large report gets a bounded size-aware deadline, text goes first, and a timeout never starves the queue', async () => {
+        const bigId = '77777777-7777-4777-8777-777777777777', textId = '88888888-8888-4888-8888-888888888888';
+        const laterId = '99999999-9999-4999-8999-999999999999';
+        const big = queuedReport(bigId, 'Large queued report', 'A'.repeat(2 * 1024 * 1024));
+        const later = queuedReport(laterId, 'Larger queued report', 'A'.repeat(2 * 1024 * 1024 + 4));
+        const text = queuedReport(textId, 'Text queued behind it');
+        // A maximum screenshot over a 40 kbit/s uplink fits its deadline, and the deadline stays bounded.
+        assert.ok(feedback.send_deadline_ms(big.length) > big.length * 8 / 40_000 * 1000, '🔴 the client waits out a slow but live uplink');
+        assert.ok(feedback.send_deadline_ms(big.length + 32 * 1024) <= 10 * 60_000, 'the 1.5 MiB image cap bounds the deadline');
+        window.localStorage.setItem(outboxKey, JSON.stringify([{ clientRequestId: bigId, body: big, draft: null },
+            { clientRequestId: textId, body: text, draft: null }, { clientRequestId: laterId, body: later, draft: null }]));
+        const timers = fakeDeadlines();
+        flushing = true;
+        try {
+            // Headers arrive for the first large report, then its body stalls; the others are answered.
+            respond = (url, options) => JSON.parse(options.body).clientRequestId === bigId ? stalledBody(url, options)
+                : Promise.resolve({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+            const count = calls.length;
+            const first = feedback.flush_feedback_outbox();
+            await until(() => timers.length === 2);
+            assert.equal(timers[0].ms, feedback.send_deadline_ms(text.length));
+            assert.equal(timers[0].cleared, true, '🔴 a confirmed send clears its deadline timer');
+            assert.equal(timers[1].ms, feedback.send_deadline_ms(big.length));
+            await tick();
+            assert.equal(timers[1].cleared, false, 'setup: the body read is still pending');
+            timers[1].fn();
+            await first;
+            assert.deepEqual(calls.slice(count).map(c => JSON.parse(c.body).clientRequestId), [textId, bigId, laterId],
+                '🔴 smallest first, and the flush moves past a timed-out entry');
+            assert.equal(timers[1].cleared, true, 'the deadline timer is released after an abort');
+            assert.deepEqual(stored(outboxKey).map(entry => entry.body), [big], '🔴 an abort during the body read keeps the entry');
+            // A slow upload that answers before its deadline completes normally.
+            respond = () => new Promise(resolve => setTimeout(() => resolve({ status: 200, json: async () => ({ id: reportId, screenshotAccepted: true }) }), 5));
+            await feedback.flush_feedback_outbox();
+            assert.equal(stored(outboxKey), null);
+            assert.equal(timers[3].cleared, true);
+            // A network failure (not a timeout) still stops the flush: the rest would fail the same way.
+            window.localStorage.setItem(outboxKey, JSON.stringify([
+                { clientRequestId: textId, body: text, draft: null }, { clientRequestId: bigId, body: big, draft: null }]));
+            respond = async () => { throw new TypeError('Failed to fetch'); };
+            const before = calls.length;
+            await feedback.flush_feedback_outbox();
+            assert.equal(calls.length, before + 1, 'one attempt, then wait for the network');
+            assert.equal(stored(outboxKey).length, 2);
+            window.localStorage.removeItem(outboxKey);
+        } finally { timers.restore(); flushing = false; }
+    });
+    await check('a flush never rewrites the stored order, and equal-size entries go oldest first', async () => {
+        const ids = ['c1111111-1111-4111-8111-111111111111', 'c2222222-2222-4222-8222-222222222222',
+            'c3333333-3333-4333-8333-333333333333', 'c4444444-4444-4444-8444-444444444444'];
+        // Oldest first in storage: two equal text bodies, one screenshot, then another equal text body.
+        const bodies = [queuedReport(ids[0], 'Equal A'), queuedReport(ids[1], 'Equal B'),
+            queuedReport(ids[2], 'Screenshot', 'A'.repeat(70 * 1024)), queuedReport(ids[3], 'Equal C')];
+        const seeded = ids.map((clientRequestId, i) => ({ clientRequestId, body: bodies[i], draft: null }));
+        window.localStorage.setItem(outboxKey, JSON.stringify(seeded));
+        flushing = true;
+        try {
+            const count = calls.length;
+            const before = window.localStorage.getItem(outboxKey);
+            respond = async () => { throw new TypeError('Failed to fetch'); };
+            await feedback.flush_feedback_outbox();
+            assert.equal(window.localStorage.getItem(outboxKey), before, '🔴 a flush leaves the stored age order untouched');
+            // Only the screenshot is answered with a retryable server error, so it stays queued.
+            respond = async (url, options) => JSON.parse(options.body).clientRequestId === ids[2]
+                ? { status: 503 } : { status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) };
+            await feedback.flush_feedback_outbox();
+            assert.deepEqual(calls.slice(count + 1).map(c => JSON.parse(c.body).clientRequestId), [ids[0], ids[1], ids[3], ids[2]],
+                '🔴 equal sizes keep their age order; the larger body goes last');
+            assert.deepEqual(stored(outboxKey).map(entry => entry.clientRequestId), [ids[2]]);
+            window.localStorage.removeItem(outboxKey);
+        } finally { flushing = false; }
+    });
+    await check('a timeout on the compatibility re-send still counts as a timeout', async () => {
+        const leanId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', nextId = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+        const withDiagnostics = JSON.stringify({ v: 1, clientRequestId: leanId, category: 'bug', description: 'Old server',
+            diagnostics: { traceApp: 'desktop' } });
+        const next = queuedReport(nextId, 'Queued after the downgraded report, long enough to sort after it');
+        window.localStorage.setItem(outboxKey, JSON.stringify([
+            { clientRequestId: leanId, body: withDiagnostics, draft: null }, { clientRequestId: nextId, body: next, draft: null }]));
+        const timers = fakeDeadlines();
+        flushing = true;
+        try {
+            // The older strict server refuses the extension (400); the lean re-send then stalls.
+            respond = (url, options) => {
+                const sent = JSON.parse(options.body);
+                if ( sent.clientRequestId === nextId ) return Promise.resolve({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+                return sent.diagnostics?.traceApp ? Promise.resolve({ status: 400 }) : stalledBody(url, options);
+            };
+            const count = calls.length;
+            const flush = feedback.flush_feedback_outbox();
+            await until(() => timers.length === 2);
+            await tick();
+            timers[1].fn();
+            await flush;
+            assert.equal(calls.length, count + 3, '🔴 the lean timeout lets the flush reach the next entry');
+            assert.equal(stored(outboxKey).length, 1);
+            assert.equal(JSON.parse(stored(outboxKey)[0].body).diagnostics?.traceApp, undefined, 'the lean body is what stays queued');
+            window.localStorage.removeItem(outboxKey);
+        } finally { timers.restore(); flushing = false; }
+    });
+    await check('a timeout with a full outbox says the report could not be saved', async () => {
+        open(); setDescription('Unqueued stalled report');
+        const template = payload();
+        const seeded = Array.from({ length: 10 }, () => {
+            const clientRequestId = crypto.randomUUID();
+            return { clientRequestId, body: JSON.stringify({ ...template, clientRequestId }) };
+        });
+        window.localStorage.setItem(outboxKey, JSON.stringify(seeded));
+        respond = stalledBody;
+        const timers = fakeDeadlines();
+        try {
+            send(); await until(() => timers.length === 1);
+            await tick();
+            timers[0].fn();
+            await until(() => ! current().querySelector('[type="submit"]').disabled);
+        } finally { timers.restore(); }
+        assert.match(status(), /Could not save this report/, '🔴 never claims a report is saved when it was not queued');
+        close();
+        window.localStorage.removeItem(outboxKey);
+        window.localStorage.removeItem(draftKey);
+    });
+    await check('reports carry the switched current computer, frozen through a later switch and replay', async () => {
+        const computerB = '55555555-5555-4555-8555-555555555555';
+        const computerC = '66666666-6666-4666-8666-666666666666';
+        setCurrentComputer({ id: computerB });
+        open(); setDescription('Filed on computer B');
+        assert.equal(payload().computerId, computerB, 'preview names the current computer, not the boot one');
+        const body = current().querySelector('pre').textContent;
+        setOnline(false);
+        respond = async () => { throw new TypeError('Failed to fetch'); };
+        send(); await until(() => /offline/.test(status()));
+        assert.equal(JSON.parse(stored(outboxKey).at(-1).body).computerId, computerB);
+        // Switch away and drop the dialog (as a reload would); the queued body must not follow.
+        setCurrentComputer({ id: computerC });
+        close();
+        setOnline(true);
+        flushing = true;
+        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) });
+        const count = calls.length;
+        await feedback.flush_feedback_outbox();
+        await until(() => stored(outboxKey) === null);
+        flushing = false;
+        assert.equal(calls.length, count + 1);
+        assert.equal(calls.at(-1).body, body, 'replay sends the frozen body unchanged');
+        assert.equal(JSON.parse(calls.at(-1).body).computerId, computerB);
+        open();
+        assert.equal(payload().computerId, computerC, 'a new report snapshots the computer current at open');
+        close();
+        setCurrentComputer(null);
+        window.localStorage.removeItem(draftKey);
+        open();
+        assert.equal(payload().computerId, computerId, 'cleared choice falls back to the boot computer');
         close();
     });
     await check('a definitive refusal is not retried and keeps the text for editing', async () => {
@@ -626,7 +958,7 @@ try {
         assert.equal(stored(draftKey).description, 'Refused for another reason');
         open(); setDescription(''); close();
     });
-    await check('the outbox keeps only the newest 10 unconfirmed sends, and a flush sends no more', async () => {
+    await check('a full outbox keeps all 10 pending reports and retains the unqueued draft', async () => {
         open(); setDescription('Queued report 10');
         const template = payload();
         const seeded = Array.from({ length: 10 }, (_, i) => {
@@ -636,10 +968,11 @@ try {
         window.localStorage.setItem(outboxKey, JSON.stringify(seeded));
         setOnline(false);
         respond = async () => { throw new TypeError('Failed to fetch'); };
-        send(); await until(() => /offline/.test(status()));
+        send(); await until(() => /Could not save this report/.test(status()));
         const kept = stored(outboxKey);
-        assert.deepEqual(kept.map(entry => entry.clientRequestId), [...seeded.slice(1), { clientRequestId: template.clientRequestId }]
-            .map(entry => entry.clientRequestId), 'an 11th queued send drops the oldest');
+        assert.deepEqual(kept.map(entry => entry.clientRequestId), seeded.map(entry => entry.clientRequestId),
+            'a new report never evicts an unconfirmed report');
+        assert.equal(stored(draftKey).description, 'Queued report 10', 'the unqueued report remains a text draft');
         close();
         // A stored list longer than the cap (an older build, another tab) is read capped too.
         window.localStorage.setItem(outboxKey, JSON.stringify([seeded[0], ...kept]));
@@ -892,6 +1225,53 @@ try {
         assert.equal(await feedback.delete_my_report('invalid'), false);
         assert.equal(calls.length, count);
     });
+    await check('a stalled report list or delete fails at its deadline instead of loading forever', async () => {
+        const timers = [];
+        const realSetTimeout = globalThis.setTimeout, realClearTimeout = globalThis.clearTimeout;
+        globalThis.setTimeout = (fn, ms, ...rest) => {
+            if ( ms !== feedback.REPORTS_DEADLINE_MS ) return realSetTimeout(fn, ms, ...rest);
+            const timer = { fn, ms, cleared: false };
+            timers.push(timer);
+            return timer;
+        };
+        globalThis.clearTimeout = timer => { if ( timers.includes(timer) ) timer.cleared = true; else realClearTimeout(timer); };
+        // Without a signal the request can only hang, exactly as a real stalled one would.
+        const stall = (url, options) => new Promise((resolve, reject) => {
+            options.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+        });
+        const settled = promise => Promise.race([promise.then(value => ({ value }), error => ({ error })),
+            new Promise(resolve => realSetTimeout(() => resolve({ hung: true }), 200))]);
+        try {
+            // The list's headers arrive, then its body stalls.
+            respond = (url, options) => Promise.resolve({ status: 200, ok: true, json: () => stall(url, options) });
+            const listing = feedback.list_my_reports();
+            await until(() => timers.length === 1);
+            assert.ok(feedback.REPORTS_DEADLINE_MS >= 10_000 && feedback.REPORTS_DEADLINE_MS <= 30_000);
+            timers[0].fn();
+            const listed = await settled(listing);
+            assert.equal(listed.hung, undefined, '🔴 the deadline ends a stalled list');
+            assert.match(String(listed.error?.message), /Could not load your reports/, 'with the readable error');
+            assert.equal(timers[0].cleared, true, 'the list deadline is released');
+            respond = stall;
+            const removal = feedback.delete_my_report(reportId);
+            await until(() => timers.length === 2);
+            timers[1].fn();
+            assert.deepEqual(await settled(removal), { value: false }, '🔴 a stalled delete settles as not deleted');
+            assert.equal(timers[1].cleared, true, 'the delete deadline is released');
+            // A list whose headers never arrive fails the same readable way.
+            respond = stall;
+            const headless = feedback.list_my_reports();
+            await until(() => timers.length === 3);
+            timers[2].fn();
+            assert.match(String((await settled(headless)).error?.message), /Could not load your reports/, '🔴 a stall before headers is readable too');
+            respond = async () => ({ status: 200, ok: true, json: async () => null });
+            await assert.rejects(feedback.list_my_reports(), /Could not load your reports/, '🔴 a null body is a readable failure');
+            const reports = [{ id: reportId, category: 'bug', createdAt: '2026-10-15', descriptionPreview: 'Desktop froze', hasScreenshot: false, status: 'new' }];
+            respond = async () => ({ status: 200, ok: true, json: async () => ({ reports }) });
+            assert.deepEqual(await feedback.list_my_reports(), reports);
+            assert.equal(timers.at(-1).cleared, true, '🔴 a successful list clears its deadline');
+        } finally { globalThis.setTimeout = realSetTimeout; globalThis.clearTimeout = realClearTimeout; }
+    });
     await check('Troubleshoot entry and reports are gated; explicit load, escaped preview and confirmed deletion', async () => {
         // Existing Troubleshoot deliberately reads the diagnostic-log ring;
         // the feedback isolation checks above have already kept that forbidden.
@@ -902,7 +1282,9 @@ try {
         globalThis.html_encode = value => { const el = document.createElement('span'); el.textContent = String(value); return el.innerHTML; };
         const { default: troubleshoot } = await import('../Settings/tabs/troubleshoot.js');
         const pane = document.createElement('div');
-        pane.innerHTML = troubleshoot.html();
+        const { default: feedbackTab } = await import('../Settings/tabs/feedback.js');
+        pane.innerHTML = feedbackTab.html() + troubleshoot.html();
+        const statusHost = pane.querySelector('[data-role="feedback-status-reports"]');
         document.body.append(pane);
         const $pane = $(pane);
         const count = calls.length;
@@ -919,6 +1301,7 @@ try {
         pane.querySelector('[data-action="load-reports"]').click();
         await until(() => pane.querySelector('.ezil-feedback-reports li'));
         assert.equal(pane.querySelector('.ezil-feedback-reports img'), null);
+        assert.equal(statusHost.textContent, '', 'Troubleshoot never writes into the other Feedback pane');
         assert.match(pane.querySelector('.ezil-feedback-reports').textContent, /Idea/);
         const remove = pane.querySelector('.ezil-feedback-reports button');
         window.confirm = () => false;
@@ -963,13 +1346,82 @@ try {
         assert.equal(entry.textContent, 'Send feedback');
         entry.click();
         assert.equal(current().querySelector('h2').textContent, 'Send feedback');
-        assert.equal(calls.length, count, 'opening the form sends nothing');
+        assert.equal(calls.length, count + 1, 'Settings loads reports once; opening the form sends nothing');
+        assert.equal(calls[count].method, 'GET');
+        await tick();
+        assert.match(pane.querySelector('[data-role="feedback-status-reports"]').textContent, /New/);
         close(); assert.equal(document.activeElement, entry, 'closing the form returns focus to the Settings button');
         delete window.__EZIL_BOOT__.desktopState.endpoints.feedback;
         assert.equal(tab.available(), false, 'no endpoint: no Feedback tab');
         entry.click();
         assert.equal(current(), null);
-        assert.equal(calls.length, count);
+        assert.equal(calls.length, count + 1);
+        pane.remove();
+    });
+    await check('only the newest report load may write, and a failed delete keeps one truthful message', async () => {
+        window.__EZIL_BOOT__.desktopState.endpoints.feedback = '/api/shell/feedback';
+        const { default: troubleshoot } = await import('../Settings/tabs/troubleshoot.js');
+        const { default: feedbackTab } = await import('../Settings/tabs/feedback.js');
+        const reports = [{ id: reportId, category: 'bug', createdAt: '2026-10-15', descriptionPreview: 'Desktop froze', hasScreenshot: false, status: 'new' }];
+        // Each GET waits on its own gate, so the test decides the settle order.
+        const gates = [];
+        respond = (url, options) => options.method === 'GET'
+            ? new Promise((resolve, reject) => gates.push({ resolve, reject }))
+            : Promise.resolve({ status: 503 });
+        const answer = (gate, list = reports) => gate.resolve({ status: 200, ok: true, json: async () => ({ reports: list }) });
+        const stale = [{ ...reports[0], descriptionPreview: 'STALE older answer' }];
+        // Settings → Feedback: init loads once; Refresh starts a second load.
+        const settings = document.createElement('div');
+        settings.innerHTML = feedbackTab.html();
+        document.body.append(settings);
+        feedbackTab.init($(settings));
+        settings.querySelector('[data-action="refresh-reports"]').click();
+        await until(() => gates.length === 2);
+        const statusHost = settings.querySelector('[data-role="feedback-status-reports"]');
+        answer(gates[1]);
+        await until(() => /Desktop froze/.test(statusHost.textContent));
+        gates[0].reject(new Error('Could not load your reports. Try again.'));
+        await tick(); await tick();
+        assert.match(statusHost.textContent, /Desktop froze/, '🔴 an older failed load never replaces the newer list (Settings)');
+        // An older load that succeeds late is discarded too.
+        settings.querySelector('[data-action="refresh-reports"]').click();
+        settings.querySelector('[data-action="refresh-reports"]').click();
+        await until(() => gates.length === 4);
+        answer(gates[3]);
+        await until(() => /Desktop froze/.test(statusHost.textContent));
+        answer(gates[2], stale);
+        await tick(); await tick();
+        assert.doesNotMatch(statusHost.textContent, /STALE/, '🔴 an older successful load never replaces the newer list (Settings)');
+        settings.remove();
+        // Troubleshoot: same race through its explicit load.
+        const pane = document.createElement('div');
+        pane.innerHTML = troubleshoot.html();
+        document.body.append(pane);
+        troubleshoot.init($(pane));
+        const load = pane.querySelector('[data-action="load-reports"]');
+        load.click(); load.click();
+        await until(() => gates.length === 6);
+        answer(gates[5]);
+        await until(() => pane.querySelector('.ezil-feedback-reports li'));
+        gates[4].reject(new Error('Could not load your reports. Try again.'));
+        await tick(); await tick();
+        assert.ok(pane.querySelector('.ezil-feedback-reports li'), '🔴 an older failed load never replaces the newer list (Troubleshoot)');
+        load.click(); load.click();
+        await until(() => gates.length === 8);
+        answer(gates[7]);
+        await until(() => /Desktop froze/.test(pane.querySelector('[data-role="feedback-reports"]').textContent));
+        answer(gates[6], stale);
+        await tick(); await tick();
+        assert.doesNotMatch(pane.querySelector('[data-role="feedback-reports"]').textContent, /STALE/,
+            '🔴 an older successful load never replaces the newer list (Troubleshoot)');
+        // Two failed deletes leave one message that does not claim the report is still there.
+        window.confirm = () => true;
+        const remove = pane.querySelector('.ezil-feedback-reports button');
+        remove.click(); await until(() => ! remove.disabled && pane.querySelector('.ezil-settings-error'));
+        remove.click(); await tick(); await until(() => ! remove.disabled);
+        const messages = pane.querySelectorAll('.ezil-feedback-reports li .ezil-settings-error');
+        assert.equal(messages.length, 1, '🔴 repeated failures update one message');
+        assert.match(messages[0].textContent, /Could not confirm.*load your reports again to check/);
         pane.remove();
     });
     console.log(`\n${checks} feedback checks passed. jsdom does not validate browser layout or real capture.`);

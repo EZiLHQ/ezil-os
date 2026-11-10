@@ -64,6 +64,12 @@ describe('real migration admission and provisioning seam', () => {
             const intent = JSON.parse((JSON.parse(work.input) as { document: string }).document) as { operation: string; dataVolumeGiB: number };
             expect(intent).toMatchObject({ operation: 'provision', dataVolumeGiB: gib });
         });
+    // Paid compute policy v1 (a521 review): the move's own admission never applies the per-person hour cap to a paid plan.
+    it('a paid move is admitted with the per-person hour cap already reached (paid compute policy v1)', async () => {
+        const f = fixture({ EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '10', EZIL_AWS_USER_MONTHLY_HOURS: '0' }, 'standard_monthly_v3', 'std-2');
+        await f.deps.provision(f.get());
+        expect(f.start).toHaveBeenCalledOnce();
+    });
     it.each([{ EZIL_AWS_COMPUTERS_ENABLED: '0' }, { EZIL_AWS_KILL_SWITCH: '1' }, { AWS_MAX_RUNNING: '0' },
         { EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '0' }, { AWS_REGIONS: 'us-east-1' }])('refusal %j creates no intent/token/instance', async patch => {
         const f = fixture(patch); await expect(f.deps.provision(f.get())).rejects.toThrow();

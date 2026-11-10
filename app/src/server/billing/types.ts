@@ -37,7 +37,8 @@ export interface WorkspaceMeter {
 }
 
 export interface StorageMeter {
-    usedBytes: string;
+    /** null (with state `unavailable`) until a computer has been measured: never a "0" nobody measured. */
+    usedBytes: string | null;
     capBytes: string;
     state: MeterState;
     /** Newest sample the total was built from; null when none exists yet. */

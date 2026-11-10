@@ -115,11 +115,12 @@ const expectedSubscription = {
     id: 'sub_fixture', customer: 'cus_fixture', status: 'active', cancelAtPeriodEnd: true,
     currentPeriodStart: new Date(start * 1000), currentPeriodEnd: new Date(end * 1000), sku: 'pro_monthly_v1',
     pendingUpdateExpiresAt: null, defaultPaymentMethod: null, scheduleId: null, latestInvoiceId: null,
+    trialStart: null, trialEnd: null, trialId: null, endedAt: null,
 };
-const invoice = { id: 'in_fixture', customer: 'cus_fixture', status: 'paid', period_start: 10, period_end: 20 };
+const invoice = { id: 'in_fixture', customer: 'cus_fixture', status: 'paid', period_start: 10, period_end: 20, total: 2000, amount_paid: 2000 };
 const expectedInvoice = {
     id: 'in_fixture', customer: 'cus_fixture', status: 'paid', subscriptionId: 'sub_fixture',
-    billingReason: null, metadataKind: null, hostedInvoiceUrl: null,
+    billingReason: null, metadataKind: null, hostedInvoiceUrl: null, total: 2000, amountPaid: 2000,
     periodStart: new Date(start * 1000), periodEnd: new Date(end * 1000),
 };
 const session = {
@@ -130,7 +131,7 @@ const session = {
 const expectedSession = {
     id: 'cs_fixture', customer: 'cus_fixture', clientReferenceId: 'user_fixture',
     mode: 'payment', status: 'complete', paymentStatus: 'paid', paymentIntentId: 'pi_fixture', sku: 'ai_pack_10_v1',
-    amountTotal: null, currency: null, metadataCredits: null,
+    amountTotal: null, currency: null, metadataCredits: null, trialId: null,
 };
 const charge = {
     id: 'ch_fixture', customer: 'cus_fixture', invoice: 'in_fixture', payment_intent: 'pi_fixture',
@@ -350,7 +351,7 @@ describe('createStripeClient requests', () => {
         await expect(client.listCustomerSubscriptions('cus_fixture')).rejects.toMatchObject({ name: 'StripeRequestError', status: 500 });
     });
 
-    it('lists one customer\'s open Checkout Sessions with their mode and expires one by POST', async () => {
+    it('lists one customer\'s open Checkout Sessions with their mode, and expires one by POST reporting its status', async () => {
         const { client, fetcher } = fixture(null);
         fetcher.mockResolvedValueOnce(Response.json({ data: [{ id: 'cs_sub', mode: 'subscription', status: 'open' }, { id: 'cs_pack', mode: 'payment', status: 'open' }], has_more: false }))
             .mockResolvedValueOnce(Response.json({ id: 'cs_sub', status: 'expired' }));
@@ -358,15 +359,34 @@ describe('createStripeClient requests', () => {
         const listed = inspect(fetcher);
         expect(listed.url).toBe('https://api.stripe.com/v1/checkout/sessions?customer=cus_fixture&status=open&limit=100');
         expect(listed.init?.method).toBe('GET');
-        await expect(client.expireCheckoutSession('cs_sub/../x')).resolves.toBeUndefined();
+        // A 200 expiry reports the session's status ('expired'): a POST to the (encoded) session with an empty body.
+        expect(await client.expireCheckoutSession('cs_sub/../x')).toBe('expired');
         const expired = inspect(fetcher, 1);
         expect(expired.url).toBe('https://api.stripe.com/v1/checkout/sessions/cs_sub%2F..%2Fx/expire');
         expect(expired.init?.method).toBe('POST');
         expect(expired.size).toBe(0);
         expect(expired.headers.get('Authorization')).toBe(`Bearer ${secretKey}`);
-        // Stripe refuses to expire a session that is no longer open; the caller must see that failure.
-        fetcher.mockResolvedValueOnce(Response.json({ error: { type: 'invalid_request_error' } }, { status: 400 }));
-        await expect(client.expireCheckoutSession('cs_done')).rejects.toMatchObject({ name: 'StripeRequestError', status: 400 });
+        // A session that completed as it was being expired reports 'complete' from the POST itself.
+        fetcher.mockResolvedValueOnce(Response.json({ id: 'cs_sub', status: 'complete' }));
+        expect(await client.expireCheckoutSession('cs_sub')).toBe('complete');
+        // Stripe refuses (400/404) to expire a session that is no longer open. The real status is read back by a
+        // GET and reported to the caller — refuseLiveStripeSubscription treats anything but 'expired' as a failure.
+        fetcher.mockResolvedValueOnce(Response.json({ error: { type: 'invalid_request_error' } }, { status: 400 }))
+            .mockResolvedValueOnce(Response.json({ id: 'cs_done', status: 'complete' }));
+        expect(await client.expireCheckoutSession('cs_done')).toBe('complete');
+        const reread = inspect(fetcher, fetcher.mock.calls.length - 1);
+        expect(reread.url).toBe('https://api.stripe.com/v1/checkout/sessions/cs_done');
+        expect(reread.init?.method).toBe('GET');
+        fetcher.mockResolvedValueOnce(Response.json({ error: {} }, { status: 404 }))
+            .mockResolvedValueOnce(Response.json({ id: 'cs_reopened', status: 'expired' }));
+        expect(await client.expireCheckoutSession('cs_reopened')).toBe('expired');
+        // A 400/404 whose status read-back also fails is 'gone' — never a false 'expired' that would look safe.
+        fetcher.mockResolvedValueOnce(Response.json({ error: {} }, { status: 400 }))
+            .mockResolvedValueOnce(Response.json({ error: {} }, { status: 500 }));
+        expect(await client.expireCheckoutSession('cs_unknown')).toBe('gone');
+        // A transient failure (503) is a real Stripe outage: it rejects, so the guard fails closed.
+        fetcher.mockResolvedValueOnce(Response.json({ error: {} }, { status: 503 }));
+        await expect(client.expireCheckoutSession('cs_down')).rejects.toMatchObject({ name: 'StripeRequestError', status: 503 });
     });
 
     it('creates a portal session with its return URL and the pinned version', async () => {
@@ -729,6 +749,21 @@ describe('v2 Stripe response mapping and checkout', () => {
         expect(fetcher.mock.calls.filter(([url]) => String(url).endsWith('/prices/price_standard'))).toHaveLength(1);
         await client.retrieveInvoice('in_fixture');
         expect(fetcher).toHaveBeenCalledTimes(4); // Price ids persist across retrievals.
+    });
+
+    it.each([
+        ['missing', {}],
+        ['strings', { total: '2000', amount_paid: '2000' }],
+        ['fractions', { total: 19.5, amount_paid: 19.5 }],
+        ['null', { total: null, amount_paid: null }],
+    ])('reads %s invoice amounts as NaN, which no positive-amount rule accepts', async (_name, amounts) => {
+        const { client } = fixture({ ...invoice, total: undefined, amount_paid: undefined, ...amounts });
+        const mapped = await client.retrieveInvoice('in_fixture');
+        expect(Number.isNaN(mapped.total) && Number.isNaN(mapped.amountPaid)).toBe(true);
+    });
+    it('reads an explicit $0 trial invoice as 0 total and 0 paid', async () => {
+        const { client } = fixture({ ...invoice, total: 0, amount_paid: 0, billing_reason: 'subscription_create' });
+        expect(await client.retrieveInvoice('in_fixture')).toMatchObject({ total: 0, amountPaid: 0, billingReason: 'subscription_create' });
     });
 
     it('uses expanded modern and legacy Price lookup keys without extra fetches', async () => {

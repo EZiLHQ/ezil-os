@@ -1,7 +1,7 @@
 // Gateway's stateless, text/function-only Responses subset. No direct provider URLs or state IDs.
 import type { ResolvedModel } from './config';
-import { GATEWAY_INPUT_TOKENS, gatewayOutputTokens, isObject } from './gateway-messages';
-import { GatewayResponseError } from './gateway-response';
+import { escapeNonAscii, GATEWAY_INPUT_TOKENS, gatewayOutputTokens, isObject, LocalRequestError, samplingRefused } from './gateway-messages';
+import { gatewayBodyEvents, GatewayResponseError, responseFailure, streamErrorEvent } from './gateway-response';
 import type { SseEvent } from './sse';
 import { isCacheMarker, isStatefulMarker, type ChatRequest, type Part, type StreamEvent, type Usage } from './types';
 
@@ -13,6 +13,7 @@ type FunctionTool = { type: 'function'; name: string; description?: string; para
 export type GatewayResponsesBody = { model: string; input: Input[]; max_output_tokens: number; stream: boolean; store: false;
     tools?: FunctionTool[]; tool_choice?: 'auto'; temperature?: number; top_p?: number };
 const NAME = /^[A-Za-z0-9_-]{1,64}$/;
+const MAX_RESPONSES_BODY_BYTES = 256 * 1024;
 const REFERENCES = new Set(['$ref', '$defs', 'definitions', '$dynamicRef', '$recursiveRef', '$anchor']);
 
 /** Refuse lossy JSON and schema references before serialization, including deep or cyclic schemas. */
@@ -37,6 +38,8 @@ function identifier(value: unknown, max = 256): string {
 function textPart(part: Part): string {
     if (part.type === 'text' && typeof part.value === 'string') return part.value;
     if (part.type === 'thinking' || isCacheMarker(part) || isStatefulMarker(part)) return '';
+    // Text data (an attached or tool-returned text/* file) is text, inlined as on Messages (gateway-messages.ts partText).
+    if (part.type === 'data' && part.mimeType.startsWith('text/')) return Buffer.from(part.data).toString('utf8');
     // Even tool results must be text. Do not silently send an image/file/audio as a successful result.
     throw new Error('Responses supports text and function tools only; images, files and audio are not supported');
 }
@@ -62,11 +65,15 @@ export function buildGatewayResponsesBody(model: ResolvedModel, request: ChatReq
         const flush = () => { if (content) input.push({ type: 'message', role: message.role, content }); content = ''; };
         for (const part of message.parts) {
             if (part.type === 'tool_call') {
-                flush();
                 const id = identifier(part.callId);
                 if (message.role !== 'assistant' || typeof part.name !== 'string' || !NAME.test(part.name) || calls.has(id) || !isObject(part.input)) throw new Error('Invalid function call');
                 jsonSafe(part.input);
-                calls.add(id); pending.add(id);
+                calls.add(id);
+                // A model without tool calling gets earlier calls as text and their results as earlier output, as on
+                // Messages: the Gateway refuses any function item for it ("Model does not support tools").
+                if (!model.capabilities.toolCalling) { content += '[tool call omitted: unavailable tool]'; continue; }
+                flush();
+                pending.add(id);
                 input.push({ type: 'function_call', call_id: id, name: part.name, arguments: JSON.stringify(part.input) });
             } else if (part.type === 'tool_result') {
                 flush();
@@ -81,20 +88,29 @@ export function buildGatewayResponsesBody(model: ResolvedModel, request: ChatReq
     }
     // Cancelled history has no recorded result. Never invent a successful result for such calls.
     for (const id of pending) input.push({ type: 'function_call_output', call_id: id, output: 'No result was recorded for this tool call.' });
-    if (!input.length || input.length > 512) throw new Error('Invalid conversation length');
+    if (!input.length) throw new Error('Invalid conversation length');
     const body: GatewayResponsesBody = { model: model.model, input, max_output_tokens: gatewayOutputTokens(model), stream: model.stream !== false, store: false };
     if (tools.length) { body.tools = tools; body.tool_choice = 'auto'; }
     if (request.toolMode === 'required') log?.('[gateway] required tool choice mapped to auto');
-    for (const [key, configured] of [['temperature', model.temperature], ['top_p', model.topP]] as const) {
+    // As on Messages: aliases the Gateway refuses sampling for never get it, on either protocol.
+    if (samplingRefused(model.model)) {
+        if (['temperature', 'top_p'].some(key => request.modelOptions[key] !== undefined) || model.temperature !== undefined || model.topP !== undefined) log?.(`[gateway] temperature/top_p not sent: ${model.model} refuses sampling options`);
+    } else for (const [key, configured] of [['temperature', model.temperature], ['top_p', model.topP]] as const) {
         const value = request.modelOptions[key] ?? configured;
         if (typeof value === 'number' && Number.isFinite(value)) body[key] = Math.max(0, Math.min(key === 'temperature' ? 2 : 1, value));
     }
     const bytes = new TextEncoder().encode(JSON.stringify(body));
     // Conservative mirror of the Gateway's byte bound, counting the whole envelope and escaped schemas.
     const definitions = JSON.stringify(tools);
-    const escaped = definitions.replace(/[\u0080-\uffff]/g, character => `\\u${character.charCodeAt(0).toString(16).padStart(4, '0')}`);
+    const escaped = escapeNonAscii(definitions);
     const bound = bytes.byteLength + Buffer.byteLength(escaped) - Buffer.byteLength(definitions) + 1024 + 32 * input.length + 128 * tools.length;
-    if (bytes.byteLength > 256 * 1024 || bound > Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens)) throw new Error('Conversation too large — start a new chat');
+    const limit = Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens);
+    // Sizes only. The counted size is the raw body for the 256 KiB cap, otherwise the bound above.
+    const raw = bytes.byteLength > MAX_RESPONSES_BODY_BYTES;
+    const counts = () => ({ bodyBytes: raw ? bytes.byteLength : bound, limitBytes: raw ? MAX_RESPONSES_BODY_BYTES : limit,
+        messages: input.length, maxBlocks: 1, tools: tools.length, toolBytes: tools.length ? Buffer.byteLength(escaped) : 0 });
+    if (input.length > 512) throw new LocalRequestError('local_too_many_messages', counts());
+    if (raw || bound > limit) throw new LocalRequestError('local_input_too_large', counts());
     return { body, bytes };
 }
 
@@ -177,7 +193,7 @@ export function gatewayResponsesJson(value: unknown, requestId?: string): Stream
             ...item.texts.map(part => ({ type: 'text' as const, value: part.value })), ...(item.tool ? [item.tool] : []),
         ]);
         return [...output, { type: 'usage', usage: terminal.usage }, { type: 'stop', reason: terminal.reason, details: { requestId } }];
-    } catch { throw new GatewayResponseError(requestId, 'invalid_response'); }
+    } catch { throw new GatewayResponseError(requestId, 'invalid_response', 'invalid_response'); }
 }
 
 type ItemState = { id: string; index: number; type?: string; callId?: string; name?: string; arguments: string; argumentsDone: boolean;
@@ -186,12 +202,12 @@ const REASONING_EVENTS = new Set(['response.reasoning_summary_part.added', 'resp
     'response.reasoning_summary_text.delta', 'response.reasoning_summary_text.done', 'response.reasoning_text.delta', 'response.reasoning_text.done']);
 
 /** Unlike the legacy SSE reader, never dispatch an unterminated event at EOF. */
-async function* responseEvents(body: ReadableStream<Uint8Array>): AsyncGenerator<SseEvent> {
+async function* responseEvents(body: ReadableStream<Uint8Array>, requestId?: string): AsyncGenerator<SseEvent> {
     const reader = body.getReader(), decoder = new TextDecoder('utf-8', { fatal: true });
     let buffer = '', event: string | undefined, data: string[] = [], size = 0, finished = false;
     try {
         while (true) {
-            const next = await reader.read();
+            const next = await reader.read().catch(error => { throw responseFailure(error, requestId, 'connection_reset'); });
             finished = next.done;
             buffer += decoder.decode(next.value, { stream: !next.done });
             let newline: number;
@@ -215,7 +231,9 @@ async function* responseEvents(body: ReadableStream<Uint8Array>): AsyncGenerator
             if (buffer.length + size > 4 * 1024 * 1024) throw new Error('Oversized SSE event');
             if (next.done) break;
         }
-        if (buffer || data.length || event !== undefined) throw new Error('Truncated SSE event');
+        if (buffer || data.length || event !== undefined) throw new GatewayResponseError(requestId, 'stream_interrupted', 'stream_truncated');
+    } catch (error) {
+        throw responseFailure(error, requestId, 'stream_malformed');
     } finally {
         if (!finished) await reader.cancel().catch(() => {});
         reader.releaseLock();
@@ -224,7 +242,7 @@ async function* responseEvents(body: ReadableStream<Uint8Array>): AsyncGenerator
 
 /** Text is progressive; tools and usage are released only after a validated terminal and clean EOF. */
 export async function* gatewayResponsesStream(source: AsyncIterable<SseEvent> | ReadableStream<Uint8Array>, requestId?: string): AsyncGenerator<StreamEvent> {
-    const events = 'getReader' in source ? responseEvents(source) : source;
+    const events = 'getReader' in source ? responseEvents(source, requestId) : source;
     const items = new Map<string, ItemState>(), indexes = new Map<number, string>();
     let responseId: string | undefined, terminal: Terminal | undefined, created = false;
     const itemState = (id: unknown, index: unknown): ItemState => {
@@ -267,12 +285,14 @@ export async function* gatewayResponsesStream(source: AsyncIterable<SseEvent> | 
         throw new Error('Unsupported content');
     };
     try {
-        for await (const event of events) {
-            if (event.data.trim() === '[DONE]') { if (!terminal) throw new Error('Missing terminal'); continue; }
+        for await (const event of gatewayBodyEvents(events, requestId)) {
+            if (event.event === 'error') throw streamErrorEvent(event.data, requestId);
+            if (event.data.trim() === '[DONE]') { if (!terminal) throw new GatewayResponseError(requestId, 'stream_interrupted', 'stream_truncated'); continue; }
             const raw: unknown = JSON.parse(event.data);
             if (!isObject(raw)) throw new Error('Invalid event');
             const type = event.event ?? raw.type;
-            if (typeof type !== 'string' || (raw.type !== undefined && raw.type !== type) || terminal || type === 'error') throw new Error('Invalid event order');
+            if (type === 'error') throw streamErrorEvent(event.data, requestId);
+            if (typeof type !== 'string' || (raw.type !== undefined && raw.type !== type) || terminal) throw new Error('Invalid event order');
             if (['response.completed', 'response.incomplete', 'response.failed'].includes(type)) {
                 const result = terminalResponse(raw.response);
                 if (type !== `response.${(raw.response as ObjectValue).status}` || (responseId !== undefined && result.id !== responseId)) throw new Error('Mismatched terminal');
@@ -349,7 +369,7 @@ export async function* gatewayResponsesStream(source: AsyncIterable<SseEvent> | 
                 yield* text(state, raw.content_index, refusal ? 'refusal' : 'output_text', delta ? raw.delta : refusal ? raw.refusal : raw.text, delta, !delta);
             } else if (!REASONING_EVENTS.has(type) && type !== 'response.output_text.annotation.added') throw new Error('Unsupported event');
         }
-        if (!terminal) throw new Error('Missing terminal response');
+        if (!terminal) throw new GatewayResponseError(requestId, 'stream_interrupted', 'stream_truncated');
         yield* finalEvents(terminal, requestId);
-    } catch { throw new GatewayResponseError(requestId); }
+    } catch (error) { throw responseFailure(error, requestId, 'stream_malformed'); }
 }

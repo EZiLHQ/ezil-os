@@ -2,7 +2,7 @@ import { PgDialect } from 'drizzle-orm/pg-core';
 import { describe, expect, it, vi } from 'vitest';
 
 import {
-    deleteFeedbackReport, feedbackAdminQueries, handleFeedbackScreenshot, loadFeedbackList, loadFeedbackReport,
+    updateFeedbackStatus, deleteFeedbackReport, feedbackAdminQueries, handleFeedbackScreenshot, loadFeedbackList, loadFeedbackReport,
 } from './admin-queries';
 import type { FeedbackDb } from './access-log';
 
@@ -201,5 +201,39 @@ describe('admin SQL scope and projection', () => {
         expect(statements[0]!.sql).toMatch(/SELECT count\(\*\) FROM deleted_attachments/);
         expect(statements[0]!.sql).not.toContain('ezil_feedback_access_log');
         expect(statements[0]!.params).toEqual([id, id]);
+    });
+});
+
+
+describe('feedback triage', () => {
+    it('requires current allowlisted auth and validates status/id before audit or update', async () => {
+        const updateStatus = vi.fn().mockResolvedValue(true);
+        const d = { ...deps(), updateStatus };
+        for (const override of [{ user: null }, { allowList: undefined }, { user: { id: admin, email: 'reporter@example.test' } }]) {
+            expect(await updateFeedbackStatus(id, 'resolved', { ...d, ...override })).toBe(false);
+        }
+        expect(await updateFeedbackStatus('bad', 'new', d)).toBe(false);
+        expect(await updateFeedbackStatus(id, 'arbitrary', d)).toBe(false);
+        expect(d.recordAccess).not.toHaveBeenCalled();
+        expect(updateStatus).not.toHaveBeenCalled();
+        expect(await updateFeedbackStatus(id, 'investigating', d)).toBe(true);
+        expect(d.recordAccess).toHaveBeenCalledWith({ reportId: id, adminUserId: admin, action: 'status_investigating' });
+        expect(updateStatus).toHaveBeenCalledWith(id, 'investigating');
+        expect(d.recordAccess.mock.invocationCallOrder[0]).toBeLessThan(updateStatus.mock.invocationCallOrder[0]!);
+    });
+    it('fails closed on audit failure and reports a missing report', async () => {
+        const d = { ...deps(), updateStatus: vi.fn().mockResolvedValue(false) };
+        expect(await updateFeedbackStatus(id, 'resolved', d)).toBe(false);
+        expect(d.updateStatus).toHaveBeenCalledWith(id, 'resolved');
+        d.updateStatus.mockClear(); d.recordAccess.mockRejectedValue(new Error('audit unavailable'));
+        await expect(updateFeedbackStatus(id, 'new', d)).rejects.toThrow('audit unavailable');
+        expect(d.updateStatus).not.toHaveBeenCalled();
+    });
+    it('updates only the selected report with bound SQL parameters', async () => {
+        const execute = vi.fn().mockResolvedValue([{ id }]);
+        expect(await feedbackAdminQueries({ execute }).updateStatus(id, 'resolved')).toBe(true);
+        const query = new PgDialect().sqlToQuery(execute.mock.calls[0]![0]);
+        expect(query.sql).toMatch(/UPDATE ezil_feedback_reports SET status = \$1 WHERE id = \$2 RETURNING id/);
+        expect(query.params).toEqual(['resolved', id]);
     });
 });

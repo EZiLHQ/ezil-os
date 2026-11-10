@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { escapeNonAscii, LocalRequestError } from '../src/gateway-messages';
 import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from '../src/gateway-responses';
 import { sseEvents } from '../src/sse';
 import type { ChatRequest, StreamEvent, Tool } from '../src/types';
@@ -50,6 +51,31 @@ describe('Responses request subset', () => {
         expect(new TextDecoder().decode(built.bytes)).not.toContain('private prior reasoning');
     });
 
+    test('a model without tool calling gets earlier calls and results as text, never as function items', () => {
+        // The picker switched from a tool-capable model; provider.ts has already left the tools out.
+        const history = [
+            msg('user', txt('Read a.ts')),
+            msg('assistant', txt('Opening the file.'), call('call/1', 'read_file', { path: 'a.ts' })),
+            msg('user', result('call/1', [txt('export const a = 1;')]), txt('Explain it.')),
+            msg('assistant', call('call/2', 'read_file', { path: 'b.ts' })),
+        ];
+        const toolless = { ...model(), capabilities: { ...model().capabilities, toolCalling: false } };
+        const body = buildGatewayResponsesBody(toolless, { ...ask(history), tools: [] }).body;
+        expect(body.tools).toBeUndefined();
+        expect(body.input).toEqual([
+            { type: 'message', role: 'user', content: 'Read a.ts' },
+            { type: 'message', role: 'assistant', content: 'Opening the file.[tool call omitted: unavailable tool]' },
+            { type: 'message', role: 'user', content: '[Earlier tool output]\nexport const a = 1;' },
+            { type: 'message', role: 'user', content: 'Explain it.' },
+            { type: 'message', role: 'assistant', content: '[tool call omitted: unavailable tool]' },
+        ]);
+        // Control: a model with tool calling keeps the pairs, with or without tools on this turn.
+        for (const tools of [[tool], []]) {
+            expect(build({ ...ask(history), tools }).body.input.filter(item => item.type !== 'message').map(item => item.type))
+                .toEqual(['function_call', 'function_call_output', 'function_call', 'function_call_output']);
+        }
+    });
+
     test('no-tool requests omit tool controls and ignore caller attempts to add hosted/stateful options', () => {
         const built = build({ ...ask(), modelOptions: {
             store: true, previous_response_id: 'resp-secret', conversation: 'conv-secret', background: true,
@@ -60,7 +86,32 @@ describe('Responses request subset', () => {
         expect(buildGatewayResponsesBody({ ...model(), stream: false }, ask()).body.stream).toBe(false);
     });
 
-    for (const mimeType of ['image/png', 'application/pdf', 'audio/wav', 'text/plain']) test(`refuses ${mimeType} in messages and nested tool results`, () => {
+    test('Gemini aliases that refuse sampling never get temperature/top_p over Responses either', () => {
+        const options = { ...ask(), modelOptions: { temperature: 0.2, top_p: 0.9 } };
+        for (const alias of ['gemini-3.8-flash', 'GEMINI-4-ARGON']) {
+            const lines: string[] = [];
+            const body = buildGatewayResponsesBody({ ...model(), model: alias, temperature: 0.5, topP: 0.5 }, options, line => lines.push(line)).body;
+            expect([body.temperature, body.top_p, lines]).toEqual([undefined, undefined, [`[gateway] temperature/top_p not sent: ${alias} refuses sampling options`]]);
+        }
+        expect(buildGatewayResponsesBody(model(), options).body).toMatchObject({ temperature: 0.2, top_p: 0.9 });
+    });
+
+    for (const mimeType of ['text/plain', 'text/markdown']) test(`inlines ${mimeType} data in messages and nested tool results, as on Messages`, () => {
+        const data = { ...image, mimeType, data: new TextEncoder().encode('line one\nline two') };
+        expect(build(ask([msg('user', txt('Inspect this '), data)])).body.input).toEqual([
+            { type: 'message', role: 'user', content: 'Inspect this line one\nline two' }]);
+        const input = build(ask([msg('assistant', call('call_1')), msg('user', result('call_1', [txt('Result:'), data]))])).body.input;
+        expect(input.at(-1)).toEqual({ type: 'function_call_output', call_id: 'call_1', output: 'Result:\nline one\nline two' });
+    });
+
+    test('text data decodes UTF-8 and reads only its own view, never the backing buffer', () => {
+        const backing = new TextEncoder().encode('LEAK|héllo 🌍 日本語|LEAK');
+        const view = backing.subarray(5, backing.byteLength - 5);
+        const data = { ...image, mimeType: 'text/plain; charset=utf-8', data: view };
+        expect(build(ask([msg('user', data)])).body.input).toEqual([{ type: 'message', role: 'user', content: 'héllo 🌍 日本語' }]);
+    });
+
+    for (const mimeType of ['image/png', 'application/pdf', 'audio/wav', 'application/json']) test(`refuses ${mimeType} in messages and nested tool results`, () => {
         const data = { ...image, mimeType };
         expect(() => build(ask([msg('user', txt('Inspect this'), data)]))).toThrow('text and function tools only');
         expect(() => build(ask([msg('assistant', call('call_1')), msg('user', result('call_1', [txt('Result:'), data]))]))).toThrow('text and function tools only');
@@ -92,8 +143,17 @@ describe('Responses request subset', () => {
     });
 
     test('request allowance accounts for each message and escaped tool schema bytes', () => {
-        expect(() => buildGatewayResponsesBody({ ...model(), maxInputTokens: 1500 }, { ...ask(), tools: [{ ...tool, inputSchema: { description: '界'.repeat(150) } }] })).toThrow('Conversation too large');
-        expect(() => build(ask(Array.from({ length: 513 }, () => msg('user', txt('x')))))).toThrow('conversation length');
+        expect(() => buildGatewayResponsesBody({ ...model(), maxInputTokens: 1500 }, { ...ask(), tools: [{ ...tool, inputSchema: { description: '界'.repeat(150) } }] })).toThrow(LocalRequestError);
+        const caught = (run: () => unknown) => { try { run(); } catch (error) { return error as LocalRequestError; } throw new Error('did not throw'); };
+        const big = caught(() => buildGatewayResponsesBody({ ...model(), maxInputTokens: 1500 }, { ...ask(), tools: [{ ...tool, inputSchema: { description: '界'.repeat(150) } }] }));
+        const escapedTools = Buffer.byteLength(escapeNonAscii(JSON.stringify([{ type: 'function', name: tool.name, parameters: { description: '界'.repeat(150) }, description: tool.description }])));
+        // The counted size is the Gateway bound: body + escaped tool text + 1024 + 32/item + 128/tool.
+        expect(big.code).toBe('local_input_too_large');
+        expect(big.counts).toMatchObject({ limitBytes: 1500, messages: 1, maxBlocks: 1, tools: 1, toolBytes: escapedTools });
+        expect(big.counts.bodyBytes).toBeGreaterThan(1500);
+        const many = caught(() => build(ask(Array.from({ length: 513 }, () => msg('user', txt('x'))))));
+        expect(many.code).toBe('local_too_many_messages'); expect(many.counts.messages).toBe(513);
+        expect(() => build(ask([]))).toThrow('conversation length');
     });
 });
 

@@ -64,6 +64,13 @@
       "when": 1793347431166,
       "tag": "0012_compute_reverse_moves",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1793877000000,
+      "tag": "0021_standard_trial",
+      "breakpoints": true
     }
   ]
 }

@@ -11,8 +11,8 @@ describe.each([['app', app], ['shell', shell]] as const)('%s AWS refusal copy', 
         ['capacity_attempt_expired', 'capacity_unavailable', 'No capacity in India right now', 'Try again checks availability'],
         ['region_capacity', 'capacity_unavailable', 'No capacity in India right now', 'Try again checks availability'],
         ['max_running', 'capacity_unavailable', 'No capacity in India right now', 'Try again checks availability'],
-        ['user_hours_cap', 'user_hours_cap', "This month's computer hours are used up", 'Your monthly computer hours renew next month'],
-        ['global_hours_cap', 'global_hours_cap', "This month's computer hours are used up", 'The service has reached its monthly computer hours limit'],
+        ['user_hours_cap', 'user_hours_cap', "Your computer reached EZiL's monthly AWS limit", "separate from your plan's time in Settings → Billing"],
+        ['global_hours_cap', 'global_hours_cap', "All AWS computers reached EZiL's monthly limit", "It isn't your plan's time in Settings → Billing"],
     ] as const)('%s is terminal with truthful copy and an honest manual recheck', (errorCode, reason, title, detail) => {
         expect(boot.computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode })).toEqual({ kind: 'failed', reason, errorCode });
         expect(boot.isRetryableBootErrorCode(errorCode)).toBe(false);
@@ -22,6 +22,23 @@ describe.each([['app', app], ['shell', shell]] as const)('%s AWS refusal copy', 
         expect(copy.body).toContain(detail);
         expect(copy.body).toMatch(/Try again (only )?checks/);
         expect(copy.body).not.toMatch(/retrying usually fixes|upgrade|buy more/i);
+    });
+
+    // P0 2026-11-04 (journey-920): a Premium user (about 479 h granted, about 81 h used) hit the 75 h staging
+    // EZIL_AWS_USER_MONTHLY_HOURS backstop and read "This month's computer hours are used up … renew next month".
+    // Their feedback recorded computerStatus (the title, trimmed and cut to 32 characters by
+    // feedback/diagnostics.js) as "This month's computer hours are", the same string the fleet-wide cap gives.
+    it('the per-person and fleet-wide AWS caps read as EZiL limits, never as the plan’s time, and stay distinguishable in feedback', () => {
+        const user = boot.BOOT_FAILURE_COPY.user_hours_cap, fleet = boot.BOOT_FAILURE_COPY.global_hours_cap;
+        expect(user.title.trim().slice(0, 32)).not.toBe(fleet.title.trim().slice(0, 32));
+        for (const copy of [user, fleet]) {
+            expect(`${copy.title} ${copy.body}`).not.toMatch(/used up|renew next month|you've used/i);
+            expect(copy.title).toContain("EZiL's");
+            expect(copy.body).toContain("plan's time in Settings → Billing");
+            expect(copy.body).toContain('It resets on the 1st of next month (UTC)');
+        }
+        expect(user.body).toContain('Send feedback');
+        expect(fleet.body).toContain('across all accounts');
     });
 
     it.each([undefined, 'unknown', 'worker_http_error', 'future_failure'])('%s keeps the old generic copy and retry behavior', code => {
@@ -49,6 +66,23 @@ describe.each([['app', app], ['shell', shell]] as const)('%s stop-hold copy', (_
         expect(copy.body).toContain('Settings → Computer');
         expect(copy.body).toContain('try again in a minute');
         expect(copy.body).not.toMatch(/retrying usually fixes|upgrade|buy more|something went wrong/i);
+    });
+});
+
+// Acceptance 1.0.34: the server refuses an open whose volume is on another lower (`computer_rebase_required`)
+// instead of spending a host that refuses it. The answer is the same on every re-ask until an operator update,
+// so it is never retried silently, and the copy names the real route (Send feedback), never a button or a retry.
+describe.each([['app', app], ['shell', shell]] as const)('%s computer update copy', (_name, boot) => {
+    it('computer_rebase_required is terminal, keeps files and names the update route', () => {
+        expect(boot.computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'computer_rebase_required' }))
+            .toEqual({ kind: 'failed', reason: 'computer_update_required', errorCode: 'computer_rebase_required' });
+        expect(boot.isRetryableBootErrorCode('computer_rebase_required')).toBe(false);
+        const copy = boot.BOOT_FAILURE_COPY.computer_update_required;
+        expect(copy.title).toBe('Your computer needs an update before it can start');
+        expect(copy.body).toContain('Your files are kept.');
+        expect(copy.body).toContain('Send feedback');
+        expect(copy.body).toContain('Try again only checks');
+        expect(copy.body).not.toMatch(/retrying usually fixes|something went wrong|upgrade your plan|buy more/i);
     });
 });
 
@@ -94,8 +128,8 @@ describe.each([['app', app], ['shell', shell]] as const)('%s billing refusal cop
         ['billing_allowance_exhausted', 'fair_use_paused', 'Computer time is paused', 'Your files are kept.'],
         ['billing_overage_cap_reached', 'fair_use_paused', 'Computer time is paused', 'Your files are kept.'],
         ['billing_files_on_aws', 'files_on_aws', 'Your files are on a bigger AWS (India) computer.', "That size can't open on the Free plan. Your files are kept. Upgrade to open it again."],
-        ['billing_user_hours_cap', 'user_hours_cap', "This month's computer hours are used up", 'Your files are kept.'],
-        ['billing_aws_monthly_cap', 'user_hours_cap', "This month's computer hours are used up", 'Your files are kept.'],
+        ['billing_user_hours_cap', 'user_hours_cap', "Your computer reached EZiL's monthly AWS limit", 'Your files are kept.'],
+        ['billing_aws_monthly_cap', 'user_hours_cap', "Your computer reached EZiL's monthly AWS limit", 'Your files are kept.'],
         ['billing_concurrent_limit', 'unknown', 'Something went wrong', "We couldn't start your computer."],
         ['billing_upgrade_pending', 'unknown', 'Something went wrong', "We couldn't start your computer."],
         ['billing_some_future_reason', 'unknown', 'Something went wrong', "We couldn't start your computer."],

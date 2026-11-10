@@ -388,7 +388,8 @@ export interface EstimateDTO {
 }
 
 export interface StorageMeterDTO {
-    usedBytes: string;
+    /** null (state `unavailable`) until a computer has been measured. */
+    usedBytes: string | null;
     capBytes: string;
     state: MeterState;
     measuredAt: string | null;

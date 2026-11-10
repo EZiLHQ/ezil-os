@@ -1,6 +1,6 @@
 import { v3CopyForAudit, honestyBans } from './billing-copy-test-helpers.mjs';
 // Billing v2: real shell + tRPC client, jsdom, fake fetch and injected sheets.
-import { summaryV3 } from './billing-v3-fixtures.mjs';
+import { summaryV3, trialSummaryV3 } from './billing-v3-fixtures.mjs';
 import { reverseMove } from '../reverse-move-fixtures.mjs';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -88,7 +88,7 @@ function v2 (family = 'compute', freeHours = 2) {
         },
         overage: compute ? { available: true, enabled: false, centsPerStdHour: 25, capCents: 2500, defaultCapCents: 2500, maxCapCents: 10000, accruedCents: 0, termsVersion: TERMS, acceptedVersion: null, acceptedAt: null, pausedReason: null } : null,
         estimate: { nextChargeAt: free ? null : END, subscriptionCents: free ? null : compute ? 10000 : 2000, accruedOverageCents: 0, worstCaseOverageCents: 2500, currency: 'usd', taxNote: 'before_tax' },
-        storage: { usedBytes: '1500000000', capBytes: '2000000000', measuredAt: '2026-10-18T11:58:00Z', state: 'ok' },
+        storage: { usedBytes: '1610612736', capBytes: '2147483648', measuredAt: '2026-10-18T11:58:00Z', state: 'ok' }, // 1.5 of 2 GiB
         ai: { state: 'unavailable', trialMicro: '0', includedMicro: '0', purchasedMicro: '0', includedExpiresAt: null },
         actions: { checkout: free, portal: !free, upgrade: family === 'standard', downgrade: compute, cancel: !free, overage: compute, selectSize: compute },
         catalog: {
@@ -144,7 +144,7 @@ const opener = kind => options => {
     return handle;
 };
 window.billing.setUpgradeSheetOpener(opener('checkout'));
-window.billing.setBillingSheetOpeners(Object.fromEntries(['upgrade', 'downgrade', 'cancel', 'overage'].map(kind => [kind, opener(kind)])));
+window.billing.setBillingSheetOpeners(Object.fromEntries(['upgrade', 'downgrade', 'cancel', 'overage', 'topup'].map(kind => [kind, opener(kind)])));
 window.ezil.boot();
 window.$.fx.off = true;
 const payload = { user: { id: 'test-user', name: 'Test user' }, features: { billing: true }, desktopState: {} };
@@ -671,14 +671,24 @@ try {
     await fixture(); has('[data-role="billing-nudge"]', false);
     contains('[data-meter="storage"]', '1.5 GB'); contains('[data-meter="storage"]', 'of 2.0 GB');
     summary.storage.measuredAt = new Date(now - 120000).toISOString(); await refresh(); contains('[data-meter="storage"]', 'Updated 2 min ago');
-    summary.storage.measuredAt = null; await refresh(); contains('[data-meter="storage"]', 'Not measured yet.');
+    // Unmeasured (no time, or the new server's null): no number, no bar, no Full/Almost full state.
+    summary.storage.measuredAt = null; await refresh(); contains('[data-meter="storage"]', 'Not measured yet');
+    assert.doesNotMatch(q('[data-meter="storage"]').textContent, /1\.5 GB|0\.0 GB/); has('[data-meter="storage"] [role="progressbar"]', false);
+    assert.ok(q('[data-meter="storage"]').classList.contains('is-unavailable')); contains('[data-meter="storage"]', '2.0 GB allowance');
+    Object.assign(summary.storage, { usedBytes: null, state: 'unavailable' }); await refresh(); contains('[data-meter="storage"]', 'Not measured yet');
+    has('[data-meter="storage"] [role="progressbar"]', false); has('[data-role="billing-nudge"]', false);
+    // An older server's synthetic "0" with no measurement time is not a measurement either.
+    Object.assign(summary.storage, { usedBytes: '0', state: 'ok' }); await refresh(); assert.doesNotMatch(q('[data-meter="storage"]').textContent, /0\.0 GB/);
+    // Positive control: a measured zero is shown as measured.
+    summary.storage.measuredAt = new Date(now - 120000).toISOString(); await refresh(); contains('[data-meter="storage"]', '0.0 GB'); contains('[data-meter="storage"]', 'of 2.0 GB');
+    has('[data-meter="storage"] [role="progressbar"]', true);
     contains('[data-meter="ai"]', 'Coming soon'); contains('[data-meter="ai"]', 'AI assistant coming soon');
     assert.doesNotMatch(q('[data-meter="ai"]').textContent, /\$|credit ready|trial ready/i);
     summary.ai = { state: 'ok', trialMicro: '500000', includedMicro: '3000000', purchasedMicro: '10000000', includedExpiresAt: END };
     await refresh(); contains('[data-meter="ai"]', '$13.50 left'); contains('[data-meter="ai"]', 'Included credit expires Nov 1');
     summary.ai.trialMicro = '90071992547409930000'; summary.ai.includedMicro = '70000'; summary.ai.purchasedMicro = '0';
     summary.storage.usedBytes = '900719925474099399999'; await refresh();
-    contains('[data-meter="ai"]', '$90071992547410.00 left'); contains('[data-meter="storage"]', '900719925474.1 GB');
+    contains('[data-meter="ai"]', '$90071992547410.00 left'); contains('[data-meter="storage"]', '838860800000.0 GB');
     assert.equal(q('[data-meter="storage"] [role="progressbar"]').getAttribute('aria-valuenow'), '100');
     summary.ai.state = 'unavailable'; await refresh(); assert.doesNotMatch(q('[data-meter="ai"]').textContent, /\$/);
     for ( const [href, label] of [['/pricing', 'Plans'], ['/refunds', 'Refund policy'], ['mailto:contact@ezil.work', 'Support']] ) assert.equal(pane().querySelector(`a[href="${href}"]`).textContent, label);
@@ -848,7 +858,7 @@ try {
         summary = summaryV3(tier); await open();
         contains('[data-role="plan-card"]', summary.plan.name);
         contains('[data-role="your-computer"]', `${summary.computer.vcpu} vCPU · ${summary.computer.memoryGiB} GB`);
-        contains('[data-role="your-computer"]', summary.computer.sessionMaxSeconds === null ? 'No session time limit' : 'Sessions up to 1 hour');
+        contains('[data-role="your-computer"]', summary.computer.sessionMaxSeconds === 3600 ? 'Sessions up to 1 hour' : 'Sessions up to 6 hours');
         contains('[data-role="your-computer"] [data-action="computer-tab"]', 'Change configuration ›');
         if ( tier !== 'free' ) {
             contains('[data-role="plan-card"]', `$${tier === 'standard' ? 20 : 100} / month`);
@@ -925,6 +935,138 @@ try {
     contains('[data-role="billing-usage"] .ezil-billing-section-head', 'Resets Nov 1, 2026');
     has('[data-role="meter-time"] [role="meter"]', false);
     pass('D6 one column: plan card, Your computer, three left-meters, plan cards; no machine picker; Change configuration links to Computer');
+
+    // Paid compute policy v1 (founder e713d157): the server's `policy: 'unmetered'` means no hours row, no reset, storage first.
+    const usageBefore = getUsage;
+    for ( const tier of ['standard', 'premium'] ) {
+        summary = summaryV3(tier); summary.fairUse = { ...summary.fairUse, status: 'ok', policy: 'unmetered' };
+        summary.computer.disk = { provisionedGiB: 50, usedBytes: null, growsOnSwitch: false };
+        getUsage = () => reply({ enabled: true, version: 1, asOf: END, session: {}, storage: {}, period: { unit: 'standard_seconds', remainingStandardSeconds: 0,
+            allowanceStandardSeconds: 144000, currentSize: 'std-2', currentWeight: 1, remainingHoursAtCurrent: 0 } });
+        await refresh(); audit();
+        const meters = qa('[data-role="billing-meters"] > :not([hidden])').map(el => el.dataset.role);
+        assert.deepEqual(meters, ['meter-storage', 'meter-ai'], tier);
+        assert.equal(q('[data-role="meter-time"]').hidden, true, tier);
+        const card = q('[data-role="billing-usage"]').textContent;
+        assert.doesNotMatch(card, /Resets|h left|hours left|Computer time|used up|vCPU counts|unlimited/i, tier);
+        assert.doesNotMatch(text(), /Computer time is used up/, tier);
+        contains('[data-role="billing-usage"] .ezil-billing-section-head', 'Usage');
+    }
+    // No plan card sells monthly computer hours: each configuration names its session length (Free and paid alike).
+    const offers = qa('[data-role="plans"] li[data-size]').map(el => el.textContent).join(' | ');
+    assert.ok(offers.length > 0);
+    assert.doesNotMatch(offers, /hours a month|monthly time/i, offers);
+    assert.match(offers, /4 vCPU · 16 GB Sessions up to 6 hours/, offers);
+    // With no reset in the usage card head, the AI credits name their own reset, even on the same day.
+    summary.ai = { ...summary.ai, included: { remaining: 500, granted: 1000, periodEnd: summary.fairUse.resetsAt } };
+    await refresh();
+    assert.equal(summary.fairUse.resetsAt, '2026-11-01T00:00:00Z');
+    contains('[data-role="meter-ai"]', 'Resets Nov 1.');
+    // Positive control: a metered summary already shows that date in the head, so the AI row does not repeat it.
+    delete summary.fairUse.policy; await refresh();
+    assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /Resets/);
+    getUsage = usageBefore;
+    pass('paid compute policy v1: Standard and Premium Billing usage is storage-first with no computer-hours row or reset');
+
+    // Product entitlements v1: a plan an EZiL operator assigned is access, not a payment: no price, renewal or Stripe action.
+    for ( const [access, line] of [[{ source: 'operator', ref: 'osg-00000000-0000-4000-8000-000000000001', endsAt: '2026-12-04T12:00:00Z', untilRevoked: false }, 'Your access ends on Dec 4, 2026.'],
+        [{ source: 'operator', ref: 'osg-00000000-0000-4000-8000-000000000001', endsAt: null, untilRevoked: true }, 'Your access continues until EZiL ends it.']] ) {
+        summary = summaryV3('standard');
+        summary.plan = { ...summary.plan, renewal: null, cancelsAt: null, access };
+        summary.actions = { ...summary.actions, checkout: false, upgrade: false, downgrade: false, cancel: false };
+        await refresh(); audit();
+        contains('[data-role="plan-card"]', 'Assigned by EZiL · no payment');
+        contains('[data-role="plan-card"]', line);
+        assert.doesNotMatch(q('[data-role="plan-card"]').textContent, /Renews|\$20 \/ month|Cancel/);
+    }
+    pass('product entitlements v1: an operator-assigned plan shows as assigned access with its validity, never a price or renewal');
+
+    // Identity credits (`ai.account`): every live grant in the total, exact microcredits, never the catalog.
+    {
+        const M = credits => { const [whole, fraction = ''] = String(credits).split('.'); return (BigInt(whole) * 1000000n + BigInt(fraction.padEnd(6, '0'))).toString(); };
+        const worked = { userId: 'test-user', state: 'ok', asOf: '2026-10-26T05:00:00Z', totalMicro: M('1500'), remainingMicro: M('1246.75'), heldMicro: M('0.5'),
+            usedMicro: M('252.75'), planBaselineMicro: M('1000'), labelled: true, grants: [
+                { kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('746.75'), expiresAt: '2026-11-04T00:00:00Z' },
+                { kind: 'added', creditsMicro: M('500'), remainingMicro: M('500'), expiresAt: '2027-06-01T00:00:00Z' }] };
+        const unreadable = { ...worked, state: 'unavailable', totalMicro: null, remainingMicro: null, heldMicro: null, usedMicro: null, labelled: false, grants: [] };
+        const withAccount = account => { const value = summaryV3('premium'); Object.assign(value.ai, { balance: 1246.75, included: { granted: 1000, remaining: 746.75, periodEnd: END }, account }); return value; };
+        const ai = () => q('[data-role="meter-ai"]');
+        summary = withAccount(worked); await refresh();
+        assert.equal(ai().querySelector('.ezil-billing-meter-value').textContent, '1,246 credits left of 1,500');
+        contains('[data-role="meter-ai"] [data-role="ai-details"]', 'Plan 1,000 · Added 500 · Used 252.75 · Reserved 0.5 · Remaining 1,246.75');
+        assert.equal(ai().querySelector('[role="meter"]').getAttribute('aria-valuenow'), '83');
+        assert.deepEqual(qa('[data-role="ai-details"] span[title]').map(span => span.title), ['1,000 credits', '500 credits', '252.75 credits', '0.5 credits', '1,246.75 credits']);
+        contains('[data-role="meter-ai"]', '500 added · expire Jun 1, 2027');
+        assert.doesNotMatch(ai().querySelector('.ezil-billing-meter-value').textContent, /of 1,000|746/);
+        // Gateway down for the same user: the kept balance, as of its own time; never the catalog.
+        summary = withAccount(unreadable); await refresh();
+        contains('[data-role="meter-ai"]', '1,246 credits left of 1,500');
+        contains('[data-role="meter-ai"]', `Couldn't refresh · as of ${new Date(worked.asOf).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' })}`);
+        // A summary the server read for another user is refused, and the kept balance with it.
+        summary = withAccount({ ...worked, userId: 'someone-else' }); await refresh();
+        has('[data-role="meter-ai"]', false);
+        assert.doesNotMatch(text(), /1,246|1,500/);
+        contains('[data-role="billing-body"]', "Couldn't load billing");
+        summary = withAccount(unreadable); await refresh();
+        assert.equal(ai().querySelector('.ezil-billing-meter-value').textContent, '—');
+        contains('[data-role="meter-ai"]', "We couldn't read your credits.");
+        assert.doesNotMatch(ai().textContent, /1,000|1,246|746/);
+        has('[data-role="meter-ai"] [role="meter"]', false);
+        // Positive control: an older server (no `account` key) keeps the legacy meter.
+        summary = withAccount(worked); delete summary.ai.account; summary.ai.included = { granted: 1000, remaining: 812, periodEnd: END }; await refresh();
+        contains('[data-role="meter-ai"]', '812 of 1,000 left');
+        // Window focus reloads a pane older than five minutes, not a fresh one.
+        summary = withAccount(worked); await refresh();
+        const loads = count();
+        window.dispatchEvent(new window.Event('focus')); await settle();
+        assert.equal(count(), loads);
+        // The shell runs in the page's realm: its clock is the page's Date.
+        const realNow = window.Date.now; window.Date.now = () => realNow() + 5 * 60 * 1000 + 1000;
+        try { window.dispatchEvent(new window.Event('focus')); await settle(); } finally { window.Date.now = realNow; }
+        assert.equal(count(), loads + 1);
+        contains('[data-role="meter-ai"]', '1,246 credits left of 1,500');
+        // The warning is the total's own (at most 10% left), never `ai.state`, which judges the plan bucket alone (the
+        // fixture's is 'low'); Premium's "Add AI credits" primary follows the meter. A large added grant is not low:
+        assert.equal(ai().classList.contains('is-ok'), true);
+        const packs = [{ sku: 'ai_pack_10_v1', aiCredits: 2000, totalCents: 1000, currency: 'usd' }];
+        const toned = (account, state) => { const value = withAccount(account); value.ai.state = state; value.actions.topup = true; value.catalog.packs = packs; return value; };
+        const primaries = () => qa('[data-pane="billing"] .ezil-settings-btn-primary').map(button => button.textContent);
+        summary = toned({ ...worked, totalMicro: M('6000'), remainingMicro: M('5050'), heldMicro: '0', usedMicro: M('950'), grants: [
+            { kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('50'), expiresAt: '2026-11-04T00:00:00Z' },
+            { kind: 'added', creditsMicro: M('5000'), remainingMicro: M('5000'), expiresAt: '2027-06-01T00:00:00Z' }] }, 'low'); await refresh();
+        assert.equal(ai().querySelector('.ezil-billing-meter-value').textContent, '5,050 credits left of 6,000');
+        assert.equal(ai().classList.contains('is-ok'), true);
+        assert.doesNotMatch(ai().textContent, /Running low/);
+        assert.deepEqual(primaries(), []);
+        // ...and a nearly spent total is low while the plan bucket is not (500 of 10,000 left).
+        summary = toned({ ...worked, totalMicro: M('10000'), remainingMicro: M('500'), heldMicro: '0', usedMicro: M('9500'), grants: [
+            { kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('500'), expiresAt: '2026-11-04T00:00:00Z' },
+            { kind: 'added', creditsMicro: M('9000'), remainingMicro: '0', expiresAt: '2027-06-01T00:00:00Z' }] }, 'ok'); await refresh();
+        assert.equal(ai().classList.contains('is-warn'), true);
+        contains('[data-role="meter-ai"]', '! Running low');
+        assert.deepEqual(primaries(), ['Add AI credits']);
+        // Billing's own reset: the pane re-activated for another signed-in user (B) drops A's kept balance, even a block
+        // that does not name its user. The same user keeps it (positive control).
+        const userA = payload.user;
+        try {
+            await open();
+            summary = withAccount({ ...worked, userId: null }); await refresh();
+            contains('[data-role="meter-ai"]', '1,246 credits left of 1,500');
+            summary = withAccount({ ...unreadable, userId: null }); await refresh();
+            contains('[data-role="meter-ai"]', '1,246 credits left of 1,500');
+            contains('[data-role="meter-ai"]', "Couldn't refresh · as of");
+            payload.user = { id: 'user-b', name: 'User B' }; await refresh();
+            assert.doesNotMatch(text(), /1,246|1,500/);
+            contains('[data-role="meter-ai"]', "We couldn't read your credits.");
+            summary = withAccount({ ...unreadable, userId: 'user-b' }); await refresh();
+            assert.doesNotMatch(text(), /1,246|1,500/);
+        } finally { payload.user = userA; }
+        // The shared guard on its own (Usage's lifecycle reaches it; here Billing's reset always runs first): a kept block
+        // named for another user is never used, and the same user's is.
+        assert.equal(window.billingFormat.accountCredits(null, { previous: worked, userId: 'user-b' }), null);
+        assert.equal(window.billingFormat.accountCredits(null, { previous: worked, userId: 'test-user' })?.left, '1,246');
+        pass('identity credits: worked example, exact details, kept balance as of its time, foreign-user refusal, no catalog fallback, focus reload, the total\'s own warning, user switch');
+    }
     // Hotfix r5 (ACCEPT #3): the smaller-configuration advice only when the plan allows a size with a
     // smaller time weight than the current one. Standard (2 vCPU only) and Premium on 2 vCPU have none.
     // Review: a computer still on a size its plan no longer offers (Standard on 4 vCPU after a downgrade)
@@ -982,13 +1124,35 @@ try {
         Object.assign(summary.ai, { included: { granted: 1000, remaining: 640, periodEnd: END } }); await refresh();
         contains('[data-role="meter-ai"]', '640 of 1,000 left');
         assert.doesNotMatch(q('[data-role="meter-ai"]').textContent, /added once your payment/i);
+        // The same grace with identity credits (`ai.account`, which this server always sends): the last period's grant
+        // in its tail is the total, and this period's still waits for the payment. No live grant: no "of 0", no bar.
+        {
+            const M = credits => (BigInt(credits) * 1000000n).toString();
+            const tail = { userId: 'test-user', state: 'ok', asOf: '2026-10-26T05:00:00Z', totalMicro: M(1000), remainingMicro: M(640), heldMicro: '0', usedMicro: M(360),
+                planBaselineMicro: M(1000), labelled: true, grants: [{ kind: 'previous', creditsMicro: M(1000), remainingMicro: M(640), expiresAt: '2026-11-04T00:00:00Z' }] };
+            const none = { ...tail, totalMicro: '0', remainingMicro: '0', usedMicro: '0', grants: [] };
+            const meterAi = () => q('[data-role="meter-ai"]');
+            Object.assign(summary.ai, { included: { granted: 0, remaining: 0, periodEnd: END }, pendingFromRenewal: { credits: 1000, at: END }, starter: null, account: tail }); await refresh();
+            assert.equal(meterAi().querySelector('.ezil-billing-meter-value').textContent, '640 credits left of 1,000');
+            contains('[data-role="meter-ai"]', '1,000 credits for this period. Added once your payment goes through.');
+            assert.doesNotMatch(meterAi().textContent, /more from|of 0\b/);
+            summary.ai.account = none; await refresh();
+            assert.equal(meterAi().querySelector('.ezil-billing-meter-value').textContent, '0 credits left');
+            has('[data-role="meter-ai"] [role="meter"]', false);
+            contains('[data-role="meter-ai"]', 'Added once your payment goes through.');
+            assert.doesNotMatch(meterAi().textContent, /more from|of 0\b/);
+            // Positive control: with no payment issue the renewal is a date again.
+            summary.plan.paymentIssue = null; summary.ai.account = tail; await refresh();
+            contains('[data-role="meter-ai"]', '1,000 more from');
+            assert.doesNotMatch(meterAi().textContent, /added once your payment/i);
+        }
         summary = summaryV3('premium'); Object.assign(summary.plan, { status: 'cancels', cancelsAt: ENDS, planEndsAt: ENDS });
         Object.assign(summary.computer, { standing: 'plan_ending', filesOn: 'aws', heldSince: null, move: null }); await refresh();
         contains('[data-role="plan-ending"]', 'Premium ends on Nov 26, 2026. After that your files stay on your AWS computer until they are moved to your Free computer; nothing is deleted.');
         has('[data-role="cancels-banner"]', false);
         contains('[data-role="plan-ending"] [data-action="resume"].ezil-settings-btn-primary', 'Resume plan');
         summary = summaryV3('free'); Object.assign(summary.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: null, move: null }); await refresh();
-        contains('[data-role="files-held"]', 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.');
+        contains('[data-role="files-held"]', 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours.');
         assert.equal(qa('[data-role="files-held"]').length, 1, 'the hold is said once');
         // Round 6 (R1-11): one provider string; the limit is the session line, and nothing to configure under the hold.
         contains('[data-role="your-computer"]', 'AWS (India)');
@@ -1092,7 +1256,7 @@ try {
         // Phase B (reverse move contract §6.2): during a move the standing stays files_on_aws and the Billing tab shows
         // 6a's files-held banner ONLY: no move card, no move action, no move sentence (the move lives on the Computer
         // tab). After the commit the standing is free and the banner goes. The banner's words are 6a's, unchanged.
-        const held = 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for no session time limit.';
+        const held = 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours.';
         const moveWords = /Moving your files|Move my files|move your files|Workspace folder|Step \d of 4|finishing moving|kept for 14 days|kept until|Switching to your Free computer|Stop and move/i;
         for ( const [label, standing, row] of [
             ['before a move', 'files_on_aws', null], ['saving', 'files_on_aws', reverseMove({ stage: 'saving' })],
@@ -1132,6 +1296,47 @@ try {
     await refresh(); assert.equal(qa('[data-role="plan-actions"] button').length, 0); has('[data-action="portal"]', false); has('[data-action="cancel"]', false);
     pass('v3 DTO-only plans, fair-use states, cancellation/payment, invoices, actions, deep links, escaping and failure recovery');
 
+    // Standard trial: every entry from Free opens the checkout sheet in its trial mode (it quotes and confirms the
+    // exact end itself, billing-trial-test.mjs); ineligible keeps the paid Standard checkout; Premium is never a trial.
+    summary = trialSummaryV3('offer'); await open();
+    assert.deepEqual(qa('[data-pane="billing"] .ezil-settings-btn-primary').map(button => button.textContent), ['Start your free month']);
+    click(q('[data-role="plan-actions"] [data-action="trial"]'));
+    assert.deepEqual([sheets.at(-1).kind, sheets.at(-1).sku, sheets.at(-1).trial], ['checkout', 'standard_monthly_v3', true]);
+    await closeSheet();
+    click(q('[data-role="plan-offer"][data-sku="standard_monthly_v3"] [data-action="trial"]'));
+    assert.deepEqual([sheets.at(-1).sku, sheets.at(-1).trial], ['standard_monthly_v3', true]);
+    await closeSheet();
+    click(q('[data-role="plan-offer"][data-sku="premium_monthly_v3"] [data-action="checkout"]'));
+    assert.deepEqual([sheets.at(-1).sku, sheets.at(-1).trial], ['premium_monthly_v3', undefined]);
+    await closeSheet();
+    // The pricing page's Standard card advertises the free month: its deep link opens it when offered, else Standard.
+    await open({ ...context, initialTab: 'billing', openUpgrade: 'standard_monthly_v3' });
+    assert.deepEqual([sheets.at(-1).kind, sheets.at(-1).sku, sheets.at(-1).trial], ['checkout', 'standard_monthly_v3', true]); await closeSheet();
+    summary = trialSummaryV3('ineligible'); await open({ ...context, initialTab: 'billing', openUpgrade: 'standard_monthly_v3' });
+    assert.deepEqual([sheets.at(-1).kind, sheets.at(-1).sku, sheets.at(-1).trial], ['checkout', 'standard_monthly_v3', undefined]); await closeSheet();
+    has('[data-action="trial"]', false);
+    contains('[data-role="plan-offer"][data-sku="standard_monthly_v3"] [data-role="trial-ineligible"]', "You've already used your free month.");
+    // A trial is cancelled with the same cancelAtPeriodEnd, resumed with the same Resume, never upgraded.
+    summary = trialSummaryV3('trialing'); await refresh();
+    has('[data-action="upgrade"]', false); has('[data-action="trial"]', false);
+    click(q('.ezil-billing-v3-footer [data-action="cancel"]')); assert.equal(sheets.at(-1).kind, 'cancel'); await closeSheet();
+    summary = trialSummaryV3('ending'); await refresh();
+    mutation = () => reply({ cancelsAt: null });
+    click(q('[data-role="trial-ending"] [data-action="resume"]')); await settle();
+    assert.deepEqual(calls.filter(call => call.url.includes('/billing.cancelAtPeriodEnd')).at(-1)?.input, { cancel: false });
+    summary = trialSummaryV3('payment_failed'); await refresh();
+    mutation = () => reply({ url: 'https://billing.example.test/trial-portal' });
+    click(q('[data-role="payment-banner"] [data-action="portal"]')); await settle();
+    assert.equal(opened.at(-1)[0], 'https://billing.example.test/trial-portal');
+    // The first charge is being collected: the same portal (secondary), and the server's cancel (its sheet's words
+    // are pinned in billing-trial-test.mjs).
+    summary = trialSummaryV3('payment_pending'); await refresh();
+    click(q('.ezil-billing-v3-footer [data-action="cancel"]')); assert.equal(sheets.at(-1).kind, 'cancel'); await closeSheet();
+    mutation = () => reply({ url: 'https://billing.example.test/trial-pending-portal' });
+    click(q('[data-role="trial-payment-pending"] [data-action="portal"]')); await settle();
+    assert.equal(opened.at(-1)[0], 'https://billing.example.test/trial-pending-portal');
+    pass('Standard trial: free-month entries (plan, card, deep link) open the trial checkout; ineligible stays paid; cancel, resume and portal unchanged');
+
     const packs = [
         { sku: 'ai_pack_10_v1', aiCredits: 2000, totalCents: 1000, currency: 'usd' },
         { sku: 'ai_pack_25_v1', aiCredits: 5000, totalCents: 2500, currency: 'usd' },
@@ -1153,37 +1358,59 @@ try {
         summary.ai.balance = balance; summary.ai.state = state; await refresh();
         contains('#ai-credits .ezil-billing-meter-value', label);
         assert.equal(q('#ai-credits').classList.contains(`is-${tone}`), true);
-        assert.equal(qa('[data-role="ai-topup"] [data-action="topup"]').length, 2);
-        assert.equal(q('[data-role="ai-topup"]').open, false, 'the top-up is a closed disclosure');
+        has('details[data-role="ai-topup"]', false);
+        assert.equal(qa('[data-role="ai-topup"] [data-action="topup"]').length, 1, 'one card entry, not one checkout per pack');
+        assert.equal(qa('#ai-credits [data-action="topup"]').length, 1, 'Add credits beside the balance');
         if ( balance === null ) { has('#ai-credits [role="meter"]', false); assert.doesNotMatch(q('#ai-credits').textContent, /1\.000001|Not available|Unavailable/); }
     }
-    assert.deepEqual(qa('[data-role="ai-topup"] [data-action="topup"]').map(button => button.textContent), ['Add 2,000 credits — $10', 'Add 5,000 credits — $25']);
-    for ( const pack of packs ) {
-        const button = q(`[data-role="ai-topup"] [data-sku="${pack.sku}"]`);
+    contains('[data-role="ai-topup"]', '2,000 or 5,000 credits');
+    // Every entry opens the same dialog with the live summary; a double click opens one.
+    for ( const entry of ['#ai-credits [data-action="topup"]', '[data-role="ai-topup"] [data-action="topup"]'] ) {
+        const button = q(entry);
         assert.equal(button.classList.contains('ezil-settings-btn-primary'), false);
         const before = sheets.length;
         click(button); click(button);
         assert.equal(sheets.length, before + 1);
-        assert.equal(sheets.at(-1).sku, pack.sku);
-        assert.deepEqual(sheets.at(-1).pack, pack);
-        assert.equal(sheets.at(-1).offer, undefined);
-        const reads = count();
-        sheets.at(-1).onDone(); await closeSheet();
-        assert.equal(count(), reads + 1, 'finishing a top-up refreshes Billing');
+        assert.equal(sheets.at(-1).kind, 'topup');
+        assert.deepEqual(sheets.at(-1).summary.catalog.packs, packs);
+        assert.equal(sheets.at(-1).userId, 'test-user');
+        assert.equal(sheets.at(-1).reason, null);
+        await closeSheet();
     }
-    packs[0].totalCents = 1234; await refresh(); contains('[data-role="ai-topup"] button', 'Add 2,000 credits — $12.34');
-    const beforeInvalid = sheets.length;
-    q('[data-role="ai-topup"] button').dataset.sku = 'unknown_pack'; click(q('[data-role="ai-topup"] button'));
-    assert.equal(sheets.length, beforeInvalid, 'unknown packs cannot open a checkout');
-    const staleButton = q('[data-role="ai-topup"] button'); staleButton.dataset.sku = packs[0].sku;
+    // The dialog's hand-off: the server's quote goes to the payment sheet; finishing refreshes Billing.
+    click(q('#ai-credits [data-action="topup"]'));
+    const quote = { sku: 'ai_custom_v2', aiCredits: 500, totalCents: 5000, creditCents: 5000, discountPercent: 0, currency: 'usd',
+        checkout: { customAmountCents: 5000, expectedTotalCents: 5000, expectedCredits: 500 } };
+    const dialog = sheets.at(-1); dialog.handle.close();
+    dialog.checkout({ pack: quote }); await settle();
+    assert.equal(sheets.at(-1).kind, 'checkout');
+    assert.deepEqual(sheets.at(-1).pack, quote);
+    assert.equal(sheets.at(-1).sku, 'ai_custom_v2');
+    assert.equal(sheets.at(-1).userId, 'test-user');
+    const reads = count();
+    sheets.at(-1).onDone(); await closeSheet();
+    assert.equal(count(), reads + 1, 'finishing a top-up refreshes Billing');
+    // Closing the payment sheet early says so neutrally (never an error, never "not charged").
+    click(q('#ai-credits [data-action="topup"]'));
+    const again = sheets.at(-1); again.handle.close(); again.checkout({ pack: quote }); await settle();
+    assert.equal(sheets.at(-1).kind, 'checkout');
+    sheets.at(-1).onCancel(); contains('[data-role="billing-action-status"]', 'Checkout closed before payment finished');
+    assert.equal(q('[data-role="billing-action-error"]').textContent, '');
+    await closeSheet();
+    const staleButton = q('[data-role="ai-topup"] button');
+    const beforeStale = sheets.length;
     summary.actions.topup = false; await refresh(); q('#ai-credits').append(staleButton); click(staleButton);
-    assert.equal(sheets.length, beforeInvalid, 'top-up actions are checked again at click time');
-    // Premium with credits running low: the page's one primary opens the top-up disclosure.
+    assert.equal(sheets.length, beforeStale, 'top-up actions are checked again at click time');
+    // Premium with credits running low: the page's one primary opens the same dialog.
     summary = summaryV3('premium'); summary.ai.state = 'low'; summary.actions.topup = true; summary.catalog.packs = packs; await refresh();
     assert.deepEqual(qa('[data-pane="billing"] .ezil-settings-btn-primary').map(button => button.textContent), ['Add AI credits']);
     click(q('[data-action="open-topup"]')); await settle();
-    assert.equal(q('[data-role="ai-topup"]').open, true);
-    assert.equal(window.document.activeElement, q('[data-role="ai-topup"] summary'));
+    assert.equal(sheets.at(-1).kind, 'topup');
+    await closeSheet();
+    // Only a custom tariff (an empty Stripe catalog): still one entry, into the dialog.
+    summary.catalog.packs = []; summary.catalog.customTopup = { minCents: 1000, maxCents: 1000000, centsPerCredit: 10 }; await refresh();
+    contains('[data-role="ai-topup"]', 'Choose any whole-dollar amount');
+    click(q('#ai-credits [data-action="topup"]')); assert.equal(sheets.at(-1).kind, 'topup'); await closeSheet();
     // needs_ezil_id (D1): the waiting credits and the EZiL ID link; no top-up and no "Unavailable".
     summary = summaryV3('free'); Object.assign(summary.ai, { enrollment: 'needs_ezil_id', waiting: { credits: 100 }, balance: null, state: 'unavailable' });
     summary.actions.ezilId = '/login?method=ezil-id'; summary.actions.topup = true; summary.catalog.packs = packs; await refresh();
@@ -1222,6 +1449,47 @@ try {
         assert.equal(creditsScrolled, 2, `${url} does not focus the card`);
     }
     pass('AI credits deep-link heading focus survives URL cleanup and a failed summary without refocusing; /app/settings?tab=billing is the same link');
+
+    // Founder regression (4 Nov): the Usage link focused a heading and left the purchase accordion closed far
+    // below the viewport. With a top-up available, every Add credits link now opens the dialog itself.
+    summary = summaryV3('premium'); summary.actions.topup = true; summary.catalog.packs = packs;
+    for ( const [search, reason] of [['?settings=billing&section=ai-credits&reason=insufficient_credits', 'insufficient_credits'],
+        ['?settings=billing&section=ai-credits', null], ['?settings=billing&section=ai-credits&reason=rate_limited', null]] ) {
+        window.history.replaceState(null, '', `/os${search}`);
+        const before = sheets.length; await open();
+        assert.equal(sheets.length, before + 1, `${search} opens the dialog`);
+        assert.equal(sheets.at(-1).kind, 'topup');
+        assert.equal(sheets.at(-1).reason, reason, 'only insufficient_credits frames recovery');
+        await closeSheet(); await refresh();
+        assert.equal(sheets.length, before + 1, 'the request is consumed once');
+    }
+    window.history.replaceState(null, '', '/os');
+    // Usage → Add credits: an in-window switch to Billing that opens the dialog, never a page navigation.
+    await open({ ...context, initialTab: 'usage' });
+    const usageLink = q('[data-action="usage-add-credits"]');
+    assert.ok(usageLink, 'Usage shows Add credits');
+    assert.equal(usageLink.getAttribute('href'), '/os?settings=billing&section=ai-credits', 'the link stays the no-Billing fallback');
+    const navigation = new window.MouseEvent('click', { bubbles: true, cancelable: true });
+    const beforeUsage = sheets.length;
+    usageLink.dispatchEvent(navigation); await settle();
+    assert.equal(navigation.defaultPrevented, true, 'no page navigation');
+    assert.equal(active(), 'billing');
+    assert.equal(sheets.length, beforeUsage + 1);
+    assert.equal(sheets.at(-1).kind, 'topup');
+    await closeSheet();
+    // Twice in a row from Usage: each request opens one dialog; a pending one is not duplicated.
+    click(q('[data-tab="usage"]')); await settle();
+    q('[data-action="usage-add-credits"]').dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    q('[data-action="usage-add-credits"]')?.dispatchEvent(new window.MouseEvent('click', { bubbles: true, cancelable: true }));
+    await settle();
+    assert.equal(sheets.length, beforeUsage + 2);
+    await closeSheet();
+    // Without a top-up (needs EZiL ID) the same request falls back to the AI credits row, as before.
+    summary.actions.topup = false; click(q('[data-tab="usage"]')); await settle();
+    window.$(q('.window[data-app="settings"]')).trigger('ezil:billing-topup', [{ reason: 'insufficient_credits' }]); await settle();
+    assert.equal(sheets.length, beforeUsage + 2);
+    assert.equal(window.document.activeElement, q('#ai-credits h4'));
+    pass('Add credits links (Usage, Code recovery deep link) open the top-up dialog directly, once, in this window');
     // Round 5 (D6): no operator internals on the user surface, in any AI state.
     summary = summaryV3(); await refresh();
     for ( const role of ['ai-usage', 'ai-limits', 'ai-recent', 'ai-spending'] ) has(`[data-role="${role}"]`, false);

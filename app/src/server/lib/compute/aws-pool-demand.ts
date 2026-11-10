@@ -29,6 +29,8 @@ export interface DemandRequest {
     region: string; zoneId: string; instanceType: string; deploymentDigest: string;
     /** wake: the exact STOPPED placement generation/epoch the open read; create: null (no placement). */
     source: { generation: number; leaseEpoch: number } | null;
+    /** Paid compute policy v1: the owner's per-person hour-cap exemption, resolved by the caller before any lock. */
+    userHoursExempt?: boolean;
 }
 /** This exact attempt's reservation expired and is terminal until the owner explicitly retries or stops (RETRY-118). */
 export interface ExpiredAttemptOutcome { outcome: 'expired'; attemptId: string }
@@ -84,7 +86,8 @@ export async function reservePoolDemand(deps: PoolDemandDeps, r: DemandRequest):
         if (!eligible || eligible.instanceType !== r.instanceType) return none('refused');
         const counters = await readAdmissionCounters(tx, lock, { userId: r.userId, computerId: r.computerId, monthStart: utcMonthStart(now), now });
         const decision = decideAdmission({ config: readAwsAdmissionConfig(deps.env), counters, userId: r.userId, now,
-            region: r.kind === 'create' ? { kind: 'create' } : { kind: 'lease', region: r.region }, instanceType: r.instanceType });
+            region: r.kind === 'create' ? { kind: 'create' } : { kind: 'lease', region: r.region }, instanceType: r.instanceType,
+            userHoursExempt: r.userHoursExempt });
         if (!decision.admit || (decision.region !== undefined && decision.region !== r.region)) return none('refused');
         await closeExpiredDemands(tx, lock);
         const own = await lockComputerDemand(tx, lock, r.computerId);

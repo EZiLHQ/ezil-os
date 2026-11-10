@@ -32,12 +32,17 @@ RELEASE_OUTCOMES = {'settled', 'recovering', 'waiting', 'unconfirmed', 'not_appl
 SOURCE_EXECUTION = re.escape(json_tool.MACHINE.replace(':stateMachine:', ':execution:') + ':computer-') + UUID
 
 
-def request(operation, computer, job):
+def request(operation, computer, job, retirement=None):
     need(operation in OPERATIONS, 'invalid operation')
     need(wire.matches(UUID, computer) or operation == 'recover' and computer is None, 'invalid computer UUID')
     need(job is None or wire.matches(UUID, job), 'invalid job UUID')
     need(operation != 'recover' or job is not None, 'recover requires exact failed job')
-    return dict(schemaVersion=1, operation=operation, computerId=computer, jobId=job)
+    sent = dict(schemaVersion=1, operation=operation, computerId=computer, jobId=job)
+    # A released pool host's release execution (app DESIGN R): a plan/prepare lookup hint the server re-proves; omitted otherwise.
+    if retirement is not None:
+        need(operation in ('plan', 'prepare') and wire.matches(SOURCE_EXECUTION, retirement), 'retirement hint is only an exact staging lifecycle execution on plan/prepare')
+        sent['sourceRetirementExecutionArn'] = retirement
+    return sent
 
 
 def headers(body, secret, timestamp):
@@ -149,8 +154,8 @@ def reconcile_release(computer, job, execution, apply, secret, sender=None):
     return observed
 
 
-def operate(operation, computer, job, journal, apply, secret, sender=send):
-    sent = request(operation, computer, job)
+def operate(operation, computer, job, journal, apply, secret, sender=send, retirement=None):
+    sent = request(operation, computer, job, retirement)
     journal = Path(journal)
     need(journal.is_absolute() and not journal.is_symlink(), 'absolute non-symlink journal required')
     state = wire.read(journal, 16384) if journal.exists() else None
@@ -162,7 +167,7 @@ def operate(operation, computer, job, journal, apply, secret, sender=send):
         need(state['jobId'] is None or wire.matches(UUID, state['jobId']), 'journal job mismatch')
         if state['pending'] is not None:
             pending = state['pending']
-            need(request(pending['operation'], pending['computerId'], pending['jobId']) == pending, 'pending request mismatch')
+            need(request(pending['operation'], pending['computerId'], pending['jobId'], pending.get('sourceRetirementExecutionArn')) == pending, 'pending request mismatch')
         if state['lastResponse'] is not None:
             response(state['lastResponse'], request('plan', state['computerId'], state['jobId']))
         sent['jobId'] = state['jobId']
@@ -175,7 +180,7 @@ def operate(operation, computer, job, journal, apply, secret, sender=send):
     # A lost create result is reconciled with plan; never issue a second unbound prepare.
     if state['pending'] is not None and state['jobId'] is None:
         need(state['computerId'] is not None, 'uncertain request needs explicit job')
-        status, observed = sender(request('plan', state['computerId'], None), secret)
+        status, observed = sender(request('plan', state['computerId'], None, state['pending'].get('sourceRetirementExecutionArn')), secret)
         need(status == 200 and observed['jobId'] is not None, 'unconfirmed prepare; keep journal and reconcile server job')
         state.update(jobId=observed['jobId'], lastResponse=observed, pending=None)
         sent['jobId'] = observed['jobId']
@@ -204,11 +209,13 @@ def main():
     parser.add_argument('--computer')
     parser.add_argument('--job')
     parser.add_argument('--source-execution-arn')
+    parser.add_argument('--source-retirement-execution-arn')
     parser.add_argument('--journal', type=Path)
     parser.add_argument('--origin', default=ORIGIN)
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
     need(args.origin == ORIGIN, 'only os-staging is allowed; btgq/curomaa refused')
+    need(args.source_retirement_execution_arn is None or args.operation in ('plan', 'prepare'), 'retirement hint is only for plan or prepare')
     if args.operation == RECONCILE:
         reconcile_request(args.computer, args.job, args.source_execution_arn)
         reconcile(args.computer, args.job, args.source_execution_arn, args.apply, os.environ.get('EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET', ''))
@@ -218,11 +225,11 @@ def main():
         reconcile_release(args.computer, args.job, args.source_execution_arn, args.apply, os.environ.get('EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET', ''))
         return
     need(args.source_execution_arn is None, 'source hint is only for reconcile-replacement or reconcile-release')
-    request(args.operation, args.computer, args.job)
+    request(args.operation, args.computer, args.job, args.source_retirement_execution_arn)
     journal = args.journal or Path('/root/ezil-aws-mum/rebase-computers') / ((args.computer or args.job) + '.json')
     # Use only the existing environment name; never a credential file, CLI argument or log.
     secret = os.environ.get('EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET', '')
-    operate(args.operation, args.computer, args.job, journal, args.apply, secret)
+    operate(args.operation, args.computer, args.job, journal, args.apply, secret, retirement=args.source_retirement_execution_arn)
 
 
 if __name__ == '__main__':

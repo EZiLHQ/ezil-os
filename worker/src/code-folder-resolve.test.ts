@@ -35,7 +35,7 @@ import {
   cloudflareCodeFolderResolver,
   codeFolderWalkOutcome,
 } from './code-folder-resolve';
-import type { CodeFolderExec as RepoOpenExec } from './code-folder-resolve';
+import type { RepoOpenExec } from './repo-open';
 
 /** The shared v1 table (shell, app, Worker, host agent): its `walk` rows are every resolver's cases. */
 const V = JSON.parse(readFileSync(new URL('../../docs/contracts/code-folder-v1.vectors.json', import.meta.url), 'utf8')) as {

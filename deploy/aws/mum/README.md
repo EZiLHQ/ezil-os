@@ -828,6 +828,9 @@ The computer interface uses the existing
 AWS account/region and the HTTPS staging origin are fixed; other origins,
 including btgq/curomaa, refuse. `plan` and `verify` are read/reconcile operations.
 `prepare`, `launch` and `recover` print a dry run unless `--apply` is present.
+For a STOPPED computer whose warm-pool host was released, `plan`/`prepare` also take
+`--source-retirement-execution-arn`: the release execution that the server re-proves
+(`docs/aws-computers/RELEASED-POOL-REBASE-RUNBOOK.md`).
 
 ```bash
 bash deploy/aws/mum/rebase-computer.sh plan --computer "$CANARY_COMPUTER_ID"
@@ -999,3 +1002,16 @@ fifteenth. All immutable records, GC proofs, 24,000-byte map/readback limits and
 Rollback must retain the invoking fourteen-compatible app while restoring the
 prior deployment tuple; the 1.0.19 app only supports thirteen records. No resource
 cleanup or history removal is implied by this count change.
+
+### Twenty-five-record registry compatibility
+The next matched app/host release permits twenty-five retained records, refusing
+a twenty-sixth, in both app validators, both `json-tool.py` guards and the GC
+guard. Every earlier app accepts at most twenty-four and cannot read a
+twenty-five-record registry. Install the compatible app with `apply-app` first;
+`promote-canary` refuses without its receipt before reading the secret. App and
+agent must still come from the same reviewed commit. Rollback must retain the
+invoking twenty-five-compatible app while restoring the prior deployment tuple and
+all twenty-five records; do not reinstall the older app. The 24,000-byte readback
+and 65,536-byte secret limits, immutable records and GC proofs are unchanged.
+Synthetic tests are not release proof: verify the actual record count, secret and
+readback byte sizes before promotion. No cleanup or history removal is implied.

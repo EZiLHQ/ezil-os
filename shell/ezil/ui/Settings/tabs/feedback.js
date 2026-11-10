@@ -8,7 +8,7 @@
 // endpoint, the same gate Troubleshoot's "Report a problem" uses — Settings is
 // reachable from a full-bleed desktop through the drawer button
 // (`../drawer-action.js`), so this entry is too.
-import { feedback_enabled, open_feedback_dialog } from '../../feedback/feedback.js';
+import { feedback_enabled, open_feedback_dialog, list_my_reports } from '../../feedback/feedback.js';
 
 const FEEDBACK_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
     + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
@@ -31,11 +31,33 @@ export default {
                     EZiL OS. Nothing is sent until you press Send, and you can preview exactly what
                     will be sent.</p>
                 <button type="button" class="ezil-settings-btn" data-action="send-feedback">Send feedback</button>
-                <p class="ezil-settings-muted">Reports you have sent are listed under Troubleshoot → Your reports.</p>
+                <h3>Your reports</h3><button type="button" class="ezil-settings-btn" data-action="refresh-reports">Refresh status</button><div data-role="feedback-status-reports" aria-live="polite"></div><p class="ezil-settings-muted">You can delete reports under Troubleshoot → Your reports.</p>
             </div>`;
     },
 
     init ($win) {
+        const host = $win.find('[data-role="feedback-body"] [data-role="feedback-status-reports"]')[0];
+        async function refreshReports() {
+            if (!host) return;
+            host.textContent = 'Loading your reports…';
+            // Only the newest load may write (see Troubleshoot's loadReports).
+            const seq = String(Number(host.dataset.loadSeq || 0) + 1);
+            host.dataset.loadSeq = seq;
+            const current = () => host.isConnected && host.dataset.loadSeq === seq;
+            try {
+                const reports = await list_my_reports();
+                if (!current()) return;
+                host.textContent = reports.length ? '' : 'You have no reports yet.';
+                for (const report of reports) {
+                    const row = document.createElement('p');
+                    const status = { new: 'New', investigating: 'Investigating', resolved: 'Resolved' }[report.status] || 'Received';
+                    row.textContent = `${status} · ${String(report.descriptionPreview || '').slice(0, 140)} · ${report.id}`;
+                    host.append(row);
+                }
+            } catch { if (current()) host.textContent = 'Could not load reports. Try Refresh status.'; }
+        }
+        $win.find('[data-role="feedback-body"]').on('click', '[data-action="refresh-reports"]', refreshReports);
+        void refreshReports();
         $win.find('[data-role="feedback-body"]').on('click', '[data-action="send-feedback"]', function () {
             // Focus first so closing the form returns focus here (Safari does not focus buttons on click).
             this.focus();
