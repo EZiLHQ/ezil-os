@@ -45,6 +45,11 @@ if name == "aws":
         source = pathlib.Path(os.environ["FAKE_S3"], bucket, key)
         if not source.is_file():
             sys.exit(1)
+        limited = os.environ.get('FAKE_LIMITED_TMP')  # stands in for a tmpfs too small for GB artifacts
+        with open(state / "dests", "a") as dests:
+            dests.write(args[6] + "\n")
+        if limited and args[6].startswith(limited):
+            sys.exit(1)
         shutil.copyfile(source, args[6])
 elif name == "docker":
     if args[:1] == ["build"]:
@@ -57,7 +62,10 @@ elif name == "docker":
         if os.environ.get('MUTATE_DURING_BUILD'):
             pathlib.Path(os.environ['MUTATE_DURING_BUILD']).write_text('changed during build\n')
     if args[:2] == ["save", "-o"]:
-        if os.environ.get('FAKE_SAVE_FAIL'):
+        (state / "save_path").write_text(args[2])
+        (state / "save_dir_mode").write_text(oct(pathlib.Path(args[2]).parent.stat().st_mode & 0o777))
+        if os.environ.get('FAKE_SAVE_FAIL') or (os.environ.get('FAKE_LIMITED_TMP') and
+                                                args[2].startswith(os.environ['FAKE_LIMITED_TMP'])):
             sys.exit(1)
         shutil.copyfile(os.environ.get('FAKE_SAVE_TAR') or state / "save.tar", args[2])
         (state / "saved").touch()
@@ -88,7 +96,7 @@ elif name == "docker":
         else:
             print('ezil-os-staging:previous sha256:' + '1' * 64)
     elif "up" in args:
-        (state / "export_at_up").write_text(str(bool(list(pathlib.Path(os.environ["TMPDIR"]).rglob("loaded-export.tar")))))
+        (state / "export_at_up").write_text(str(bool(list((pathlib.Path(os.environ["SHIM_STATE"]).parent / "host").rglob("loaded-export.tar")))))
         with open(state / "log", "a") as log:
             log.write(json.dumps(["compose.env", pathlib.Path("compose.env").read_text()]) + "\n")
     elif "exec" in args:

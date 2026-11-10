@@ -25,7 +25,11 @@ install -d -m 0700 /opt/ezil-os-staging /etc/ezil-os-staging
 cd /opt/ezil-os-staging
 exec 9>deploy.lock
 flock -x 9
-temporary=$(mktemp -d)
+# Archives and the loaded-image export are ~GB; /tmp may be a small tmpfs and the remote shell
+# ignores the caller's TMPDIR. Use a private directory on the root disk, under the 0700 install
+# directory. The flock is held, so leftovers from a killed run are stale.
+rm -rf /opt/ezil-os-staging/.install-tmp.*
+temporary=$(mktemp -d /opt/ezil-os-staging/.install-tmp.XXXXXXXX)
 trap 'rm -rf "$temporary"' EXIT
 # Downloads use only the instance role, never local profiles/static credentials.
 unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN AWS_PROFILE AWS_DEFAULT_PROFILE

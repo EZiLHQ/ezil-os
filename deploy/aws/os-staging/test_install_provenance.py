@@ -3,6 +3,7 @@ import gzip
 import hashlib
 import io
 import json
+from pathlib import Path
 import subprocess
 import tarfile
 import unittest
@@ -215,6 +216,40 @@ class VerifiedInstallTests(SandboxTestCase):
         _, result = self.install(receipt)
         self.assert_stopped_before_up(result, 'Loaded image config differs')
 
+    def test_downloads_and_export_use_private_disk_directory_not_caller_tmpdir(self):
+        limited = self.box.root / 'limited-tmpfs'
+        limited.mkdir()
+        env = {'TMPDIR': str(limited), 'FAKE_LIMITED_TMP': str(limited)}
+        install_dir = self.box.root / 'host/opt/ezil-os-staging'
+        work_dirs = []
+        for failure in (False, True):
+            receipt = self.prepare(containerd=True)
+            for name in ('dests', 'save_path', 'save_dir_mode'):
+                (self.box.state / name).unlink(missing_ok=True)
+            _, result = self.install(receipt, **env, **({'FAKE_SAVE_FAIL': '1'} if failure else {}))
+            self.assertEqual(result.returncode != 0, failure, result.stderr)
+            dests = (self.box.state / 'dests').read_text().split()
+            self.assertEqual(len(dests), 4)  # sha256, tar.gz, runtime.tar.gz and source receipt
+            work = Path(dests[0]).parent
+            self.assertTrue(all(Path(d).parent == work for d in dests))
+            self.assertEqual(work.parent, install_dir)
+            self.assertTrue(work.name.startswith('.install-tmp.'))
+            self.assertEqual(Path((self.box.state / 'save_path').read_text()).parent, work)
+            self.assertEqual((self.box.state / 'save_dir_mode').read_text(), '0o700')
+            self.assertFalse(work.exists(), 'private work directory removed on exit')
+            self.assertEqual(list(limited.iterdir()), [])
+            work_dirs.append(work)
+        self.assertNotEqual(work_dirs[0], work_dirs[1])
+
+    def test_stale_install_directory_is_removed_under_the_lock(self):
+        receipt = self.prepare()
+        stale = self.box.root / 'host/opt/ezil-os-staging/.install-tmp.stale'
+        stale.mkdir(parents=True)
+        (stale / 'leftover.tar').write_bytes(b'x')
+        _, result = self.install(receipt)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(stale.exists())
+
     def test_export_failure_or_corrupt_export_fails_closed(self):
         receipt = self.prepare()
         _, result = self.install(receipt, FAKE_SAVE_FAIL='1')
@@ -232,11 +267,12 @@ class VerifiedInstallTests(SandboxTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         # Gone before the app is replaced, not merely at exit.
         self.assertEqual((self.box.state / 'export_at_up').read_text(), 'False')
-        self.assertEqual(list((self.box.root / 'tmp').iterdir()), [])
+        work = self.box.root / 'host/opt/ezil-os-staging'
+        self.assertEqual(list(work.glob('.install-tmp.*')), [])
         receipt = self.prepare(containerd=True)
         (self.box.state / 'save.tar').write_bytes(b'not a tar')
         self.install(receipt)
-        self.assertEqual(list((self.box.root / 'tmp').iterdir()), [])
+        self.assertEqual(list(work.glob('.install-tmp.*')), [])
 
     def test_running_container_not_bound_to_verified_store_id_takes_recovery_path(self):
         receipt = self.prepare(containerd=True)
