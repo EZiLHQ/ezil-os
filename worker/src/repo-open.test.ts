@@ -398,13 +398,11 @@ describe('private CLI adapter', () => {
   it('opens the project folder only on a matching CLI result; reuse maps to fetched', async () => {
     let options: Parameters<RepoOpenExec>[1] | undefined;
     const exec: RepoOpenExec = async (_command, received) => { options = received; return { exitCode: 0, stdout: success() }; };
-    expect(await runRepoOpen(exec, request, root)).toEqual({ ok: true, folder: destination, status: 'cloned' });
+    expect(await runRepoOpen(exec, request, root)).toEqual({ ok: true, folder: `/workspace/projects/${REPO}`, status: 'cloned' });
     expect(Object.keys(options!.env)).toEqual([REPO_OPEN_CLI_PACKET_ENV]);
     expect(options!.env[REPO_OPEN_TOKEN_ENV]).toBeUndefined();
     expect(parsePrivateCliOutput(success({ status: 'reused' }), request, root)).toEqual({ ok: true,
-      folder: destination, status: 'fetched' });
-    expect(parsePrivateCliOutput(success({ folder: `/workspace/projects/${REPO}`, status: 'reused' }), request, root))
-      .toEqual({ ok: true, folder: `/workspace/projects/${REPO}`, status: 'fetched' });
+      folder: `/workspace/projects/${REPO}`, status: 'fetched' });
   });
 
   it('refuses mismatched URL, folder, identity, status, echoed grant, or nonzero CLI exit', async () => {

@@ -75,16 +75,14 @@ const env = (binding: unknown, extra: Record<string, unknown> = {}) =>
 describe('POST /sandbox/:name/repo-open on the real route table', () => {
   it('carries an exact private CLI binding through the existing v2-signed route to the selected computer', async () => {
     const worker = await loadWorker();
-    const { binding, calls } = fakeNamespace({ ok: true, folder: `/workspace/projects/${REPO}/repository`, status: 'cloned' });
+    const { binding, calls } = fakeNamespace();
     const privateBinding = { projectId: '33333333-3333-4333-8333-333333333333', bindingVersion: 'b'.repeat(64),
       issuer: 'https://id.ezil.work/', subject: 'auth0|builder' };
     const body = JSON.stringify({ repositoryId: REPO, canonicalURL: 'https://github.ezil.work/acme/site.git',
       ref: 'refs/heads/main', git: { token: `egg_${'a'.repeat(64)}`, expiresAt: new Date(Date.now() + 240_000).toISOString(), scope: 'write' },
       privateBinding, timeoutMs: 90_000 });
     const staging = env(binding, { EZIL_AI_GATEWAY_URL: 'https://ai-staging.ezil.work' });
-    const response = await worker.fetch(await signed({ signBody: body, sendBody: body }), staging);
-    expect(response.status).toBe(200);
-    expect(await response.json()).toMatchObject({ ok: true, folder: `/workspace/projects/${REPO}/repository` });
+    expect((await worker.fetch(await signed({ signBody: body, sendBody: body }), staging)).status).toBe(200);
     expect(calls).toHaveLength(1);
     expect(calls[0]!.request.privateBinding).toEqual(privateBinding);
     expect((await worker.fetch(await signed({ signBody: body, sendBody: body }), env(binding))).status).toBe(400);

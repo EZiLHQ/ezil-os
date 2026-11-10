@@ -1,8 +1,8 @@
 /**
  * `POST /sandbox/:name/repo-open` — put one project repository into a RUNNING
- * Cloudflare computer, at `<workspace root>/projects/<repositoryId>/repository`.
- * Existing routes open the wrapper; the private EZiL Git address route opens
- * the CLI-validated checkout itself (`folder=` on the code-server URL).
+ * Cloudflare computer, at `<workspace root>/projects/<repositoryId>/repository`,
+ * so the Code window can open `<workspace root>/projects/<repositoryId>`
+ * (`folder=` on the code-server URL).
  *
  * Pure (runtime-free) helpers, factored out of `index.ts` like `./twen` and
  * `./workspace-diag` so the contract runs under plain `bun test`. The route and
@@ -19,7 +19,7 @@
  *     ref: "refs/heads/<branch>",
  *     git: { token: <opaque, visible ASCII, ≤ 4096>, expiresAt: <ISO datetime> },
  *     timeoutMs?: <integer, REPO_OPEN_MIN_TIMEOUT_MS..REPO_OPEN_EXEC_TIMEOUT_MS> }
- *   200 { ok: true, folder: "<root>/projects/<repositoryId>[/repository]", head?: <commit>, status: 'cloned' | 'fetched' | 'created' }
+ *   200 { ok: true, folder: "<root>/projects/<repositoryId>", head?: <commit>, status: 'cloned' | 'fetched' | 'created' }
  *   4xx/5xx { ok: false, error: <one of REPO_OPEN_ERRORS, or an auth code> }
  *
  * The values are Universe's project repository binding and its Git grant,
@@ -116,7 +116,7 @@
  * canonical URL, HEAD on the binding's branch (unborn) with its upstream set,
  * any other branches as remote-tracking refs, `status: 'created'`, no `head`.
  *
- * 🔴 THE EXISTING LAYOUT keeps the repository's own editor and agent configuration
+ * 🔴 THE LAYOUT keeps the repository's own editor and agent configuration
  * inert (review F3). Code opens `folder` as its workspace folder, as root, with
  * workspace trust off, and code-server 4.141 (VS Code 1.141) reads what can
  * run commands from a workspace folder's ROOT only: `.vscode/` (settings,
@@ -129,10 +129,7 @@
  * repository's own configuration opens `repository` itself, explicitly. A
  * folder created before this layout (the repository at `<folder>` itself)
  * keeps it; it is fetched, never moved. Code's git view still finds the
- * repository (`git.repositoryScanMaxDepth` 1). The private EZiL Git address
- * path deliberately opens the checkout itself so a Code terminal's pwd is the
- * Git top-level. With workspace trust off, repository-root editor settings
- * can then affect Code terminals; this is the accepted private-path exception.
+ * repository (`git.repositoryScanMaxDepth` 1).
  *
  * Nothing git prints leaves the container: the script classifies git's stderr
  * into one of the codes below and prints a single result line.
@@ -725,8 +722,8 @@ export function parseRepoOpenOutput(
 }
 
 /** Validate every result field from the private CLI before allowing Code to
- * open the checkout itself. It is nested for a new clone and remains at the
- * project folder only for a retained older root-level checkout. */
+ * open a folder. The CLI's destination is nested except for a retained older
+ * root-level checkout; the public answer is always the same project folder. */
 export function parsePrivateCliOutput(stdout: string, request: RepoOpenRequest, root: RepoOpenRoot): RepoOpenAnswer | null {
   const prepared = parseRepoOpenOutput(stdout);
   if (prepared && !prepared.ok) return prepared;
@@ -739,7 +736,7 @@ export function parsePrivateCliOutput(stdout: string, request: RepoOpenRequest, 
     || (value.status !== 'cloned' && value.status !== 'reused')) return null;
   const folder = `${root.path}/projects/${request.repositoryId}`;
   if (value.folder !== `${folder}/${REPO_OPEN_NESTED_DIR}` && value.folder !== folder) return null;
-  return { ok: true, folder: value.folder, status: value.status === 'reused' ? 'fetched' : 'cloned' };
+  return { ok: true, folder, status: value.status === 'reused' ? 'fetched' : 'cloned' };
 }
 
 export type RepoOpenExec = (

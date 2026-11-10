@@ -146,7 +146,7 @@ const openUrl = (url: unknown = GH) => post({ computerId: COMPUTER, intent: 'ope
 
 describe('opening a repository from its address in Code', () => {
     it('uses an owned computer, the exact production Works address grant, and the Worker folder for EZiL Git', async () => {
-        s.worker = body => Response.json({ folder: `/workspace/projects/${JSON.parse(body).repositoryId}/repository` });
+        s.worker = body => Response.json({ folder: `/workspace/projects/${JSON.parse(body).repositoryId}` });
         const response = await openUrl('https://github.ezil.work/acme/site.git');
         expect(response.status).toBe(200);
         expect(s.order).toEqual(['computer.get', 'target', 'identity', 'works', 'codePreviewUrl', 'target', 'worker']);
@@ -161,7 +161,7 @@ describe('opening a repository from its address in Code', () => {
                 issuer: 'https://id.ezil.work/', subject: 'auth0|builder' } });
         const body = await response.clone().json();
         expect(body.repository).toEqual({ name: 'acme/site', id: REPO });
-        expect(new URL(body.codePreviewUrl).searchParams.getAll('folder')).toEqual([`/workspace/projects/${REPO}/repository`]);
+        expect(new URL(body.codePreviewUrl).searchParams.getAll('folder')).toEqual([`/workspace/projects/${REPO}`]);
         await expectNoSecrets(response);
     });
 

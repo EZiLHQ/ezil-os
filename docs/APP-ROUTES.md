@@ -99,9 +99,10 @@ string. It returns `null` (open nothing) or
   (`app/src/server/works/repo-url.ts`): a public
   `https://github.com/<owner>/<name>[.git]` or, on the selected owned Cloudflare
   staging computer, an exact `https://github.ezil.work/<owner>/<name>.git`.
-  The private EZiL Git address opens the checkout as Code's folder so its
-  terminal is at the Git top-level. With workspace trust off, repository-root
-  editor settings can affect Code terminals. A missing or unauthorized repository is
+  The computer places the checkout at `W/repository`, and Code opens its
+  server-authorised parent wrapper `W`. The seed file is visible inside the
+  `repository` folder; a terminal can `cd repository` before `git push`.
+  A missing or unauthorized repository is
   "This repository doesn't exist." An address that is not plain https is
   `projectRejected: 'repo_url_invalid'`; beside a `project` it is
   `repo_invalid`. `path` is not read with an address.
@@ -288,11 +289,11 @@ Scope and open gates (2026-11-05):
   agent's `folder` op, which ships in an AMI. Until then the server answers
   `unverified`: the default folder opens with the notice, and the address keeps
   the ask. Code→address sync, Back/Forward and Close Folder need no AMI.
-- **Project repository links are unchanged.** `repo=`/`project=` open the
-  server-authorised folder W, with the checkout at `W/repository`, exactly as
-  before. The private EZiL Git address is an exception: it opens the checkout
-  itself. `folder=` beside either form is refused (`with_repository`).
-- **Not implemented for project links: the checkout as Code's folder, and repo+folder.** With
+- **Repository links keep the same wrapper.** `repo=`/`project=` and the
+  private EZiL Git address open the server-authorised folder W, with the
+  checkout at `W/repository`. `folder=` beside them is refused
+  (`with_repository`).
+- **Not implemented: the checkout as Code's folder, and repo+folder.** With
   workspace trust off (today), a repository's own `.vscode/settings.json` at
   Code's root applies: its terminal profile and env run when a terminal opens.
   Measured with trust on, using `e2e/code-trust-spike.sh` with the live image
