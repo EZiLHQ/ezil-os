@@ -33,8 +33,8 @@ done
 [[ -z "$maintenance_release" || -z "$previous_ref$previous_id$previous_release" ]] || die 'maintenance bake cannot include a previous lower'
 use_namespace "$namespace_arg"
 config=${config:-$config_dir/ami.$namespace.json}
+check_namespace_path "$config" "$release_dir" "$previous_release" "$maintenance_release" "$deployed_release"
 if [[ "$namespace" != mum ]]; then
-    [[ -z "$previous_ref$previous_id$previous_release$maintenance_release$deployed_release" ]] || die "$namespace has no rebase tuple; previous/maintenance/deployed release bakes are mum-only"
     [[ "$config" != /root/ezil-aws-mum/* ]] || die "$namespace never reads mum operator configs"
 fi
 require_tools aws docker git python3 mktemp date timeout

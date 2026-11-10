@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 import rebase_manifest as manifest
+import rebase_namespace as context
 import rebase_schema
 import rebase_ssm
 import rebase_app
@@ -51,10 +52,28 @@ PUBLIC_REASONS = {'ledger drift', 'manual reconciliation required',
                   'archive receipt does not match the inspected artifacts; run app-archive-check'}
 
 
+def use_namespace(name):
+    global LEDGER_PATH
+    json_tool.use_namespace(name)
+    cfn.use_namespace(name)
+    rebase_ssm.use_namespace(name)
+    LEDGER_PATH = Path(f'/root/ezil-aws-{name}/releases/promotion-ledger.json')
+
+
+def scoped_manifest(path, **kwargs):
+    value = manifest.load(context.path(path), repository=json_tool.REPOSITORY, **kwargs)
+    context.scope(value)
+    need(value['launchTemplateId'] == json_tool.LAUNCH_TEMPLATE, 'release launch-template identity mismatch')
+    return value
+
+
 def release_roles(directory, maintenance=False, legacy=False):
     source_name = 'maintenance-source-release.json' if maintenance else 'previous-rebase-release.json'
     source = manifest.load(Path(directory) / source_name, source=True, repository=json_tool.REPOSITORY)
     deployed = source if legacy else manifest.load(Path(directory) / 'deployed-release.json', source=True, repository=json_tool.REPOSITORY)
+    for record in (deployed, source):
+        context.scope(record)
+        need(record['launchTemplateId'] == json_tool.LAUNCH_TEMPLATE, 'source launch-template identity mismatch')
     return deployed, source
 
 
@@ -122,14 +141,25 @@ def validate_ledger(value):
                  'invalid app-adopt snapshots')
             snapshots = [entry, entry['before'], entry['expected']]
         for snapshot in snapshots:
+            need(json_tool.NAMESPACE != 'prd' or 'state' in entry and 'registrySha256' in snapshot,
+                 'production ledger requires explicit state and registry pins')
             need('registrySha256' not in snapshot or manifest.matches(r'[0-9a-f]{64}', snapshot['registrySha256']), 'invalid ledger registry hash')
             need(manifest.matches(r'[0-9a-f]{40}', snapshot['appGitSha']) and
                  (entry['planSha256'] == 'app-adopt:' + entry['appGitSha'] if adopt else manifest.matches(r'[0-9a-f]{64}', entry['planSha256'])),
                  'invalid ledger source pin')
             need(not app_op or manifest.matches(r'sha256:[0-9a-f]{64}', snapshot['appImageId']), 'invalid ledger app image ID')
-            need(entry['operation'] in ('apply-app', 'promote-canary', 'rollback', 'registry-gc', 'app-adopt', *APP_OPERATIONS) and
+            need(entry['operation'] in ('source-init', 'apply-app', 'promote-canary', 'rollback', 'registry-gc', 'app-adopt', *APP_OPERATIONS) and
                  isinstance(snapshot.get('secretVersionId', 'expected'), str) and bool(snapshot.get('secretVersionId', 'expected')), 'invalid ledger operation/version')
             need(isinstance(snapshot['tuple'], dict) and set(snapshot['tuple']) == set(manifest.PROMOTION), 'invalid ledger tuple')
+            scope = dict(accountId=json_tool.ACCOUNT, region=json_tool.REGION, namespace=json_tool.NAMESPACE, launchTemplateId=json_tool.LAUNCH_TEMPLATE)
+            # A legacy ledger uses null placeholders for all four absent fields.
+            # A target must have the complete, typed tuple, never partial nulls.
+            pair = dict(snapshot['tuple'])
+            if all(pair[k] is None for k in manifest.TUPLE):
+                for key in manifest.TUPLE: pair.pop(key)
+            json_tool.pair({'settings': {'deployment': {**scope, **pair}}})
+            for key, suffix in zip(VERSION_KEYS, ('lifecycle', 'rebase-preparation', 'recovery')):
+                if snapshot['tuple'][key] is not None: manifest.workflow(snapshot['tuple'][key], scope, suffix)
         if entry['operation'] == 'registry-gc':
             need('state' in entry and all('registrySha256' in snapshot for snapshot in snapshots),
                  'registry-gc requires explicit state and registry pins')
@@ -139,6 +169,14 @@ def validate_ledger(value):
                      entry['before']['registrySha256'] != entry['expected']['registrySha256'],
                      'registry-gc must change only registry identity')
         prior = entries[generation - 2] if generation > 1 else None
+        if entry['operation'] == 'source-init':
+            need(generation == 1 and state == 'completed' and 'state' in entry and
+                 'registrySha256' in entry and all(entry['tuple'][k] is None for k in manifest.TUPLE),
+                 'source-init is only a legacy registry baseline')
+        if state == 'pending':
+            need(prior is None or prior.get('state') != 'pending', 'unresolved pending ledger entry')
+            need(prior is not None and prior.get('state', 'completed') in ('completed', 'aborted') and
+                 state_matches(entry['before'], prior), 'app operation requires the completed registry baseline' if app_op else 'pending ledger before-state mismatch')
         if adopt:
             need(prior is not None and prior.get('state', 'completed') == 'completed' and 'registrySha256' in prior,
                  'app-adopt requires completed registry baseline')
@@ -148,6 +186,7 @@ def validate_ledger(value):
                  entry['appGitSha'] != prior['appGitSha'], 'app-adopt must change only app identity')
         elif prior and prior.get('state') == 'pending':
             need(state in ('completed', 'aborted') and entry['planSha256'] == prior['planSha256'] and entry['operation'] == prior['operation'], 'unresolved pending ledger entry')
+            need(state_matches(entry, prior['expected' if state == 'completed' else 'before']), 'terminal state mismatch')
             if entry['operation'] == 'registry-gc':
                 need(state_matches(entry, prior['expected' if state == 'completed' else 'before']),
                      'registry-gc terminal state mismatch')
@@ -240,6 +279,7 @@ def write_ledger_append(ledger_path, ledger, entry):
     need(load_ledger(ledger_path) == ledger, 'ledger changed during operation')
     # json_tool.write uses temp + fsync + rename + directory fsync. Caller holds app-secret.lock.
     updated = {**ledger, 'entries': [*ledger['entries'], entry]}
+    validate_ledger(updated)
     # Preserve every historical entry's original bytes, including whitespace/key order.
     raw = safe_path(ledger_path).read_bytes().decode('utf-8')
     decoder = json.JSONDecoder()
@@ -293,7 +333,7 @@ def begin_operation(ledger_path, ledger, path, plan, operation, envelope, d, exp
 
 
 def safe_path(path):
-    path = Path(path)
+    path = context.path(path)
     need(path.is_absolute() and path.is_file() and not path.is_symlink(), 'regular absolute artifact path required')
     return path
 
@@ -304,32 +344,40 @@ def digest(path):
 
 def staging(config):
     d = config['settings']['deployment']
-    need((d['accountId'], d['region'], d['namespace']) == (json_tool.ACCOUNT, json_tool.REGION, 'mum'), 'staging deployment identity mismatch')
-    need(config['settings'].get('authorityOrigin') == 'https://os-staging.ezil.work', 'staging authority origin required; btgq/curomaa refused')
+    need((d['accountId'], d['region'], d['namespace']) == (json_tool.ACCOUNT, json_tool.REGION, json_tool.NAMESPACE), 'staging deployment identity mismatch')
+    need(config['settings'].get('authorityOrigin') == json_tool.ORIGIN, 'namespace authority origin mismatch')
     json_tool.pair(config)
+    need(d.get('launchTemplateId') == json_tool.LAUNCH_TEMPLATE, 'configured launch-template identity mismatch')
+    if json_tool.NAMESPACE == 'prd':
+        need(config.get('appCaller') == json_tool.PROFILE['appCaller'], 'production app caller mismatch')
+        need(config.get('deploy', {}).get('assetBucketName') == json_tool.BUCKET, 'production lifecycle bucket mismatch')
     return d
 
 
 def bake_evidence(directory):
     bake = manifest.read(directory / 'bake-inputs.json', 16384)
     need(isinstance(bake, dict) and set(bake) == set(BAKE_KEYS), 'bake evidence fields mismatch')
+    context.scope(bake)
     image = manifest.read(directory / 'image.json')
     need(len(image['Images']) == 1, 'one baked AMI required')
     ami = image['Images'][0]['ImageId']
     json_tool.main(['image', str(directory / 'image.json'), ami])
     build_arn = safe_path(directory / 'build-arn.txt').read_text().strip()
-    need(manifest.matches(r'arn:aws:imagebuilder:ap-south-1:452630323510:image/ezil-host-mum/[0-9]+\.[0-9]+\.[0-9]+/[1-9][0-9]*', build_arn), 'build ARN mismatch')
+    need(manifest.matches(rf'arn:aws:imagebuilder:ap-south-1:452630323510:image/ezil-host-{json_tool.NAMESPACE}/[0-9]+\.[0-9]+\.[0-9]+/[1-9][0-9]*', build_arn), 'build ARN mismatch')
     return bake, ami, build_arn
 
 
 def make_plan(directory, config_path, identity_path, system_id=None, rollout_path=None, ledger_path=None):
-    directory = Path(directory).resolve()
+    directory = context.path(directory).resolve()
     config_path, identity_path = safe_path(config_path), safe_path(identity_path)
     config = manifest.read(config_path)
     deployment = staging(config)
     identity = manifest.read(identity_path)
-    need((identity['accountId'], identity['region'], identity['namespace']) == (json_tool.ACCOUNT, json_tool.REGION, 'mum'), 'staging identity config mismatch')
-    need(system_id is None or manifest.matches(r'[0-9]{1,20}', system_id), 'independently verified DB system identifier required')
+    if json_tool.NAMESPACE == 'prd':
+        json_tool.namespace_config('identity', identity_path)
+        need(identity.get('imageJobDeployment') == deployment, 'identity boundary and deployment tuple disagree')
+    need((identity['accountId'], identity['region'], identity['namespace']) == (json_tool.ACCOUNT, json_tool.REGION, json_tool.NAMESPACE), 'staging identity config mismatch')
+    context.system_id(system_id)
     bake, ami, build_arn = bake_evidence(directory)
     maintenance = (directory / 'maintenance-source-release.json').is_file()
     # Draft references can be desired versions, but no manifest is made until published readbacks.
@@ -342,6 +390,8 @@ def make_plan(directory, config_path, identity_path, system_id=None, rollout_pat
     evidence = {name: digest(directory / name) for name in ('bake-inputs.json', 'build-arn.txt', 'build.json', 'image.json', source_name, 'deployed-release.json')}
     deployed, source = release_roles(directory, maintenance)
     lineage(bake, source, maintenance)
+    rollout = pin_rollout(rollout_path, bake) if rollout_path else None
+    if json_tool.NAMESPACE == 'prd': need(rollout is not None, 'production requires reviewed rollout and app artifact')
     with json_tool.app_secret_lock() as fd:
         envelope = json_tool.secret_aws(['get-secret-value', '--secret-id', json_tool.SECRET, '--output', 'json'], lock_fd=fd)
         _, d = secret_deployment(envelope)
@@ -351,8 +401,17 @@ def make_plan(directory, config_path, identity_path, system_id=None, rollout_pat
         ledger = load_ledger(ledger_path or LEDGER_PATH)
         need(ledger['entries'][-1].get('state') != 'pending', 'pending operation; run ledger-reconcile before planning')
         ledger_drift(ledger, envelope, d)
-    plan = dict(zip(PLAN_KEYS, (1, json_tool.ACCOUNT, json_tool.REGION, 'mum', bake, build_arn, ami,
-        str(config_path), digest(config_path), str(identity_path), digest(identity_path), str(schema), digest(schema), system_id, maintenance, pin_rollout(rollout_path, bake) if rollout_path else None, evidence, completed_entries(ledger)[-1]['generation'])))
+        if json_tool.NAMESPACE == 'prd':
+            latest = completed_entries(ledger)[-1]
+            if latest['operation'] == 'source-init':
+                need(envelope['VersionId'] == latest['secretVersionId'], 'source admission secret version drift')
+            running = app_operation(directory / 'rebase-plan.json', {'rollout': rollout}, 'plan-gate', True,
+                                    rebase_app.public_deployment(d), install=False)
+            ledger_drift(ledger, envelope, d, running['gitSha'])
+            need(json_tool.secret_aws(['get-secret-value', '--secret-id', json_tool.SECRET, '--output', 'json'], lock_fd=fd) == envelope,
+                 'secret changed during plan admission')
+    plan = dict(zip(PLAN_KEYS, (1, json_tool.ACCOUNT, json_tool.REGION, json_tool.NAMESPACE, bake, build_arn, ami,
+        str(config_path), digest(config_path), str(identity_path), digest(identity_path), str(schema), digest(schema), system_id, maintenance, rollout, evidence, completed_entries(ledger)[-1]['generation'])))
     path = directory / 'rebase-plan.json'
     if path.exists():
         need(manifest.read(path) == plan, 'existing plan differs; retain the release and use a new directory')
@@ -365,13 +424,15 @@ def load_plan(path):
     path = safe_path(path)
     plan = manifest.read(path, 65536)
     need(isinstance(plan, dict) and set(plan) in (set(PLAN_KEYS), set(PLAN_KEYS) - {'ledgerGeneration'}) and type(plan['schemaVersion']) is int and plan['schemaVersion'] == 1, 'invalid plan schema')
+    need(json_tool.NAMESPACE == 'mum' or 'ledgerGeneration' in plan, 'production requires a ledger-bound plan')
     if 'ledgerGeneration' in plan:
         need(type(plan['ledgerGeneration']) is int and plan['ledgerGeneration'] >= 1, 'invalid ledger generation pin')
-    need((plan['accountId'], plan['region'], plan['namespace']) == (json_tool.ACCOUNT, json_tool.REGION, 'mum'), 'staging plan identity mismatch')
+    need((plan['accountId'], plan['region'], plan['namespace']) == (json_tool.ACCOUNT, json_tool.REGION, json_tool.NAMESPACE), 'staging plan identity mismatch')
     need(plan['schemaPath'] == str((REPO / 'docs/aws-computers/sql/0002_image_rebase.sql.txt').resolve()), 'unreviewed schema path')
     for field in ('config', 'identityConfig', 'schema'):
         need(digest(plan[field + 'Path']) == plan[field + 'Sha256'], 'reviewed input changed: ' + field)
     need(type(plan['maintenance']) is bool and (plan['databaseSystemIdentifier'] is None or manifest.matches(r'[0-9]{1,20}', plan['databaseSystemIdentifier'])), 'invalid release mode or database identity')
+    context.system_id(plan['databaseSystemIdentifier'])
     source_name = 'maintenance-source-release.json' if plan['maintenance'] else 'previous-rebase-release.json'
     names = {'bake-inputs.json', 'build-arn.txt', 'build.json', 'image.json', source_name}
     if 'ledgerGeneration' in plan or 'deployed-release.json' in plan['evidence']:
@@ -383,7 +444,10 @@ def load_plan(path):
     need(plan['bake'] == bake and plan['amiId'] == ami and plan['buildArn'] == build_arn, 'plan bake mismatch')
     _, source = plan_roles(path, plan)
     lineage(bake, source, plan['maintenance'])
-    staging(manifest.read(plan['configPath']))
+    deployment = staging(manifest.read(plan['configPath']))
+    if json_tool.NAMESPACE == 'prd':
+        json_tool.namespace_config('identity', plan['identityConfigPath'])
+        need(manifest.read(plan['identityConfigPath']).get('imageJobDeployment') == deployment, 'identity boundary and deployment tuple disagree')
     if plan['rollout'] is not None:
         verify_rollout(plan['rollout'])
     return plan
@@ -409,26 +473,32 @@ def readbacks(plan):
     }
 
 
-def final_manifest(plan, evidence, now=None):
-    deployment = staging(manifest.read(plan['configPath']))
-    value = manifest.validate({**plan['bake'], 'amiId': plan['amiId'],
-        **{k: deployment[k] for k in (*VERSION_KEYS, 'launchTemplateId', 'launchTemplateVersion')},
-        'createdAt': now or datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')}, target=not plan.get('maintenance', False), repository=json_tool.REPOSITORY)
-    need(all(deployment[k] == value[k] for k in (*manifest.PROMOTION, 'launchTemplateId')), 'manifest/deployment mismatch')
-    build = evidence['build']['image']
-    need(build['arn'] == plan['buildArn'] and build['state']['status'] == 'AVAILABLE', 'bake not available')
+def validate_build(value, build_arn, build, source=False):
+    need(build['arn'] == build_arn and build['state']['status'] == 'AVAILABLE', 'bake not available')
     amis = build['outputResources']['amis']
     need(len(amis) == 1 and amis[0]['image'] == value['amiId'] and amis[0]['region'] == value['region'] and amis[0].get('accountId', value['accountId']) == value['accountId'], 'build output identity mismatch')
     recipe = build['imageRecipe']
-    need(recipe['version'] == value['recipeVersion'] and recipe['name'] == 'ezil-host-mum', 'bake recipe mismatch')
+    need(recipe['version'] == value['recipeVersion'] and recipe['name'] == f'ezil-host-{json_tool.NAMESPACE}', 'bake recipe mismatch')
     need(len(recipe['components']) == 1, 'unexpected bake components')
     bindings = recipe['components'][0]['parameters']
     params = {v['name']: v['value'] for v in bindings}
     need(len(params) == len(bindings), 'duplicate component binding')
     for key, expected in {'DesktopImageRef': value['lowerImageRef'], 'DesktopImageId': value['lowerImageDigest'],
                           'PreviousDesktopImageRef': value['previousLowerImageRef'], 'PreviousDesktopImageId': value['previousLowerImageDigest'],
-                          'AgentSrcS3Uri': f"s3://ezil-mum-deploy-assets-452630323510/ami/host-agent-{value['agentCommit']}.tgz"}.items():
-        need(params.get(key) == [expected if expected is not None else ''], 'bake binding mismatch: ' + key)
+                          'AgentSrcS3Uri': f"s3://{json_tool.BUCKET}/ami/host-agent-{value['agentCommit']}.tgz"}.items():
+        actual = params.get(key, [''] if source and expected is None and key.startswith('Previous') else None)
+        need(actual == [expected if expected is not None else ''], 'bake binding mismatch: ' + key)
+    if json_tool.NAMESPACE == 'prd':
+        need(params.get('EnrollUrl') == [json_tool.ORIGIN + '/api/compute/aws/enroll'], 'bake enroll origin mismatch')
+
+
+def final_manifest(plan, evidence, now=None):
+    deployment = staging(manifest.read(plan['configPath']))
+    value = manifest.validate({**plan['bake'], 'amiId': plan['amiId'],
+        **{k: deployment[k] for k in (*VERSION_KEYS, 'launchTemplateId', 'launchTemplateVersion')},
+        'createdAt': now or datetime.now(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')}, target=not plan.get('maintenance', False), repository=json_tool.REPOSITORY)
+    need(all(deployment[k] == value[k] for k in (*manifest.PROMOTION, 'launchTemplateId')), 'manifest/deployment mismatch')
+    validate_build(value, plan['buildArn'], evidence['build']['image'])
     images = evidence['image']['Images']
     need(not evidence['image'].get('NextToken') and len(images) == 1, 'AMI readback incomplete')
     image = images[0]
@@ -497,6 +567,7 @@ def pin_rollout(path, bake):
         for name in ('beforeTemplate','candidateTemplate','review'):
             spec[name+'Path']=str(safe_path(spec[name+'Path']))
             spec[name+'Sha256']=digest(spec[name+'Path'])
+        need(spec['roleArn'] == (None if phase == 'identity' else cfn.ROLE), 'rollout execution role mismatch')
         validate_stack_review(phase,spec,pool_iam)
     app=value['app']
     need(set(app)=={'tag','gitSha','checksumSha256'},'invalid app review fields')
@@ -520,6 +591,8 @@ def verify_rollout(value):
     for phase,spec in value['stacks'].items():
         for name in ('beforeTemplate','candidateTemplate','review'):
             need(digest(spec[name+'Path'])==spec[name+'Sha256'],'rollout artifact changed')
+        need(spec['stackName'] == cfn.STACKS[phase], 'rollout stack namespace mismatch')
+        need(spec['roleArn'] == (None if phase == 'identity' else cfn.ROLE), 'rollout execution role mismatch')
         validate_stack_review(phase,spec,pool_iam)
     need(digest(REPO/'deploy/aws/os-staging/install-host.sh')==value['installerSha256'],'staging installer changed')
 
@@ -559,8 +632,9 @@ def secret_deployment(envelope):
     rebase_app.gate(outer)
     ds=manifest.loads(outer[json_tool.KEY]) if isinstance(outer[json_tool.KEY],str) else outer[json_tool.KEY]
     d=ds[json_tool.REGION]
-    need((d['accountId'],d['region'],d['namespace'],d['launchTemplateId'])==(json_tool.ACCOUNT,json_tool.REGION,'mum',json_tool.LAUNCH_TEMPLATE),'secret deployment identity mismatch')
+    need((d['accountId'],d['region'],d['namespace'],d['launchTemplateId'])==(json_tool.ACCOUNT,json_tool.REGION,json_tool.NAMESPACE,json_tool.LAUNCH_TEMPLATE),'secret deployment identity mismatch')
     manifest.deployment_tuple(d)
+    json_tool.pair({'settings': {'deployment': d}})
     return outer,d
 
 
@@ -652,10 +726,15 @@ def apply_app(manifest_path,apply,ledger_path=None):
 
 
 def source_readbacks(value):
-    image=aws('ec2','describe-images','--image-ids',value['amiId'],'--owners',json_tool.ACCOUNT)['Images']
+    response=aws('ec2','describe-images','--image-ids',value['amiId'],'--owners',json_tool.ACCOUNT)
+    need(not response.get('NextToken'), 'source AMI readback incomplete')
+    image=response['Images']
     need(len(image)==1 and all(image[0].get(k)==v for k,v in {'ImageId':value['amiId'],'OwnerId':json_tool.ACCOUNT,'Public':False,'State':'available','Architecture':'x86_64'}.items()),'rollback AMI mismatch')
-    versions=aws('ec2','describe-launch-template-versions','--launch-template-id',value['launchTemplateId'],'--versions',value['launchTemplateVersion'])['LaunchTemplateVersions']
+    response=aws('ec2','describe-launch-template-versions','--launch-template-id',value['launchTemplateId'],'--versions',value['launchTemplateVersion'])
+    need(not response.get('NextToken'), 'source launch-template readback incomplete')
+    versions=response['LaunchTemplateVersions']
     need(len(versions)==1 and str(versions[0]['VersionNumber'])==value['launchTemplateVersion'] and versions[0]['LaunchTemplateId']==value['launchTemplateId'] and versions[0]['LaunchTemplateData']['ImageId']==value['amiId'],'rollback launch template mismatch')
+    context.scope(value)
     for key in VERSION_KEYS:
         if value[key] is None:continue
         versions=aws('stepfunctions','list-state-machine-versions','--state-machine-arn',value[key].rsplit(':',1)[0])
@@ -831,16 +910,20 @@ def ledger_adopt_app(git_sha, source_repo, apply=False, ledger_path=None):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=('plan', 'finalize', 'apply-schema', 'apply-identity', 'apply-workflows', 'apply-app', 'promote-canary', 'rollback', 'ledger-init', 'ledger-reconcile', 'ledger-adopt-app',
+    parser.add_argument('operation', choices=('plan', 'finalize', 'apply-schema', 'apply-identity', 'apply-workflows', 'apply-app', 'promote-canary', 'rollback', 'ledger-init', 'ledger-reconcile', 'ledger-adopt-app', 'source-init',
                                               'app-swap', 'app-swap-reconcile', 'app-archive-check'))
     parser.add_argument('--release-dir', type=Path)
     parser.add_argument('--plan', type=Path)
     parser.add_argument('--manifest', type=Path)
-    parser.add_argument('--config', type=Path, default=Path('/root/ezil-aws-mum/config/lifecycle.mum.json'))
-    parser.add_argument('--identity-config', type=Path, default=Path('/root/ezil-aws-mum/config/identity.mum.json'))
+    parser.add_argument('--namespace', choices=('mum', 'prd'), default='mum')
+    parser.add_argument('--config', type=Path)
+    parser.add_argument('--identity-config', type=Path)
     parser.add_argument('--expect-system-id')
     parser.add_argument('--rollout', type=Path)
-    parser.add_argument('--ledger', type=Path, default=LEDGER_PATH)
+    parser.add_argument('--ledger', type=Path)
+    parser.add_argument('--build-arn')
+    parser.add_argument('--app-artifact', type=Path)
+    parser.add_argument('--expect-secret-version')
     parser.add_argument('--git-sha')
     parser.add_argument('--source-repo', type=Path)
     parser.add_argument('--archive', type=Path)
@@ -848,7 +931,19 @@ def main():
     parser.add_argument('--runtime', type=Path)
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
+    use_namespace(args.namespace)
+    args.config = args.config or Path(f'/root/ezil-aws-{args.namespace}/config/lifecycle.{args.namespace}.json')
+    args.identity_config = args.identity_config or Path(f'/root/ezil-aws-{args.namespace}/config/identity.{args.namespace}.json')
+    args.ledger = args.ledger or LEDGER_PATH
+    for value in vars(args).values():
+        if isinstance(value, Path): context.path(value)
+    if args.operation == 'source-init':
+        import rebase_source
+        need(args.manifest is not None and args.build_arn is not None and args.app_artifact is not None, 'source-init requires manifest, build ARN and app artifact')
+        rebase_source.initialize(sys.modules[__name__], args.manifest, args.config, args.build_arn, args.app_artifact, args.ledger, args.apply, args.expect_secret_version)
+        return
     if args.operation in ('app-swap', 'app-swap-reconcile', 'app-archive-check'):
+        need(args.namespace == 'mum', 'app-swap is staging-only; use the production installer')
         import rebase_app_swap
         rebase_app_swap.cli(args)
         return

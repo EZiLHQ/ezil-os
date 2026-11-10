@@ -47,9 +47,10 @@ def time_value(value):
 
 
 def check_evidence(evidence, snapshot, plan_sha, candidate, now, target=None, system_id=None):
+    if tool.NAMESPACE == 'prd': release.context.system_id(system_id)
     need(evidence.get('schemaVersion') == 1 and type(evidence.get('schemaVersion')) is int
          and evidence.get('accountId') == tool.ACCOUNT and evidence.get('region') == tool.REGION
-         and evidence.get('namespace') == 'mum', 'GC evidence scope mismatch')
+         and evidence.get('namespace') == tool.NAMESPACE, 'GC evidence scope mismatch')
     need(evidence.get('planSha256') == plan_sha
          and evidence.get('secretVersionId') == snapshot['VersionId']
          and evidence.get('registrySha256') == sha(snapshot['deployment']['releases']), 'GC stale evidence')
@@ -331,8 +332,9 @@ def prepare(snapshot, target, roles, evidence, drops, plan_sha, now, system_id=N
     need(isinstance(drops, list) and len(drops) == 1 and isinstance(drops[0], dict)
          and set(drops[0]) == {'lowerImageDigest', 'amiId'}, 'GC requires exactly one exact identity')
     d = snapshot['deployment']
+    need(d.get('launchTemplateId') == tool.LAUNCH_TEMPLATE, 'GC launch-template identity mismatch')
     need(isinstance(snapshot.get('VersionId'), str) and bool(snapshot['VersionId'])
-         and (d.get('accountId'), d.get('region'), d.get('namespace')) == (tool.ACCOUNT, tool.REGION, 'mum'),
+         and (d.get('accountId'), d.get('region'), d.get('namespace')) == (tool.ACCOUNT, tool.REGION, tool.NAMESPACE),
          'GC snapshot scope mismatch')
     records = d.get('releases')
     need(isinstance(records, list) and 1 <= len(records) <= 26, 'GC invalid registry')
@@ -493,6 +495,7 @@ def check_target(target, plan):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--namespace', choices=('mum', 'prd'), default='mum')
     for arg in ('plan', 'manifest', 'snapshot', 'evidence'):
         parser.add_argument('--' + arg, required=True)
     parser.add_argument('--lower-image-digest', action='append', required=True)
@@ -500,6 +503,9 @@ def main(argv=None):
     parser.add_argument('--apply', action='store_true')
     parser.add_argument('--operation-dir', type=Path)
     args = parser.parse_args(argv)
+    release.use_namespace(args.namespace)
+    for key in ('plan', 'manifest', 'snapshot', 'evidence', 'operation_dir'):
+        if getattr(args, key): release.context.path(getattr(args, key))
     need(len(args.lower_image_digest) == len(args.ami_id) == 1, 'GC multiple CLI identities refused')
     path = Path(args.plan).resolve()
     plan = release.load_plan(path)

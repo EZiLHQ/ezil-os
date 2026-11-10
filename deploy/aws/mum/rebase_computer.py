@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Staging-only operator client. Authority material stays in process memory."""
+"""Namespace-pinned operator client. Authority material stays in process memory."""
 import argparse
 import hashlib
 import hmac
@@ -13,6 +13,7 @@ import sys
 import time
 
 import rebase_manifest as wire
+import rebase_namespace as context
 
 spec = importlib.util.spec_from_file_location('mum_json', Path(__file__).with_name('json-tool.py'))
 json_tool = importlib.util.module_from_spec(spec)
@@ -28,8 +29,15 @@ RECONCILE = 'reconcile-replacement'
 RECONCILE_OUTCOMES = {'settled', 'unconfirmed', 'generation_drift', 'not_applicable', 'launch_not_disproven', 'source_not_proven'}
 RECONCILE_RELEASE = 'reconcile-release'
 RELEASE_OUTCOMES = {'settled', 'recovering', 'waiting', 'unconfirmed', 'not_applicable', 'source_not_proven'}
-# The hint must name one execution of the staging lifecycle machine; the server re-reads and proves everything.
+# The hint must name one execution of the selected namespace lifecycle machine; the server re-reads and proves everything.
 SOURCE_EXECUTION = re.escape(json_tool.MACHINE.replace(':stateMachine:', ':execution:') + ':computer-') + UUID
+
+
+def use_namespace(name):
+    global ORIGIN, SOURCE_EXECUTION
+    json_tool.use_namespace(name)
+    ORIGIN = json_tool.ORIGIN
+    SOURCE_EXECUTION = re.escape(json_tool.MACHINE.replace(':stateMachine:', ':execution:') + ':computer-') + UUID
 
 
 def request(operation, computer, job, retirement=None):
@@ -40,7 +48,7 @@ def request(operation, computer, job, retirement=None):
     sent = dict(schemaVersion=1, operation=operation, computerId=computer, jobId=job)
     # A released pool host's release execution (app DESIGN R): a plan/prepare lookup hint the server re-proves; omitted otherwise.
     if retirement is not None:
-        need(operation in ('plan', 'prepare') and wire.matches(SOURCE_EXECUTION, retirement), 'retirement hint is only an exact staging lifecycle execution on plan/prepare')
+        need(operation in ('plan', 'prepare') and wire.matches(SOURCE_EXECUTION, retirement), 'retirement hint is only an exact selected namespace lifecycle execution on plan/prepare')
         sent['sourceRetirementExecutionArn'] = retirement
     return sent
 
@@ -68,7 +76,7 @@ def response(value, sent):
 def send(sent, secret):
     body = json.dumps(sent, separators=(',', ':')).encode('utf-8')
     auth = headers(body, secret, int(time.time()))
-    connection = http.client.HTTPSConnection('os-staging.ezil.work', timeout=6)
+    connection = http.client.HTTPSConnection(ORIGIN.removeprefix('https://'), timeout=6)
     try:
         connection.request('POST', PATH, body=body, headers=auth)
         received = connection.getresponse()
@@ -85,7 +93,7 @@ def send(sent, secret):
 
 def reconcile_request(computer, job, source):
     need(wire.matches(UUID, computer) and wire.matches(UUID, job), 'reconcile requires the exact computer and failed job UUIDs')
-    need(wire.matches(SOURCE_EXECUTION, source), 'source hint must be exactly one staging lifecycle execution ARN')
+    need(wire.matches(SOURCE_EXECUTION, source), 'source hint must be exactly one selected namespace lifecycle execution ARN')
     need(not source.endswith(':computer-' + job), 'source hint cannot be the failed job itself')
     return dict(schemaVersion=1, operation=RECONCILE, computerId=computer, expectedJobId=job, sourceRetirementExecutionArn=source)
 
@@ -102,7 +110,7 @@ def release_request(computer, job, execution):
     need(wire.matches(UUID, computer) and wire.matches(UUID, job), 'reconcile-release requires the exact computer and failed release job UUIDs')
     # Unlike reconcile-replacement, the hint is the expected job's OWN execution (the failed release, or its reserved replay).
     need(wire.matches(SOURCE_EXECUTION, execution) and execution.endswith(':computer-' + job),
-         "the hint must be exactly the expected job's own staging lifecycle execution ARN")
+         "the hint must be exactly the expected job's own selected namespace lifecycle execution ARN")
     return dict(schemaVersion=1, operation=RECONCILE_RELEASE, computerId=computer, expectedJobId=job, releaseExecutionArn=execution)
 
 
@@ -119,7 +127,7 @@ def send_reconcile(sent, secret, validate=None):
     validate = validate or reconcile_response
     body = json.dumps(sent, separators=(',', ':')).encode('utf-8')
     auth = headers(body, secret, int(time.time()))
-    connection = http.client.HTTPSConnection('os-staging.ezil.work', timeout=30)
+    connection = http.client.HTTPSConnection(ORIGIN.removeprefix('https://'), timeout=30)
     try:
         connection.request('POST', PATH, body=body, headers=auth)
         received = connection.getresponse()
@@ -156,11 +164,13 @@ def reconcile_release(computer, job, execution, apply, secret, sender=None):
 
 def operate(operation, computer, job, journal, apply, secret, sender=send, retirement=None):
     sent = request(operation, computer, job, retirement)
-    journal = Path(journal)
+    journal = context.path(journal)
     need(journal.is_absolute() and not journal.is_symlink(), 'absolute non-symlink journal required')
     state = wire.read(journal, 16384) if journal.exists() else None
     if state is not None:
-        need(isinstance(state, dict) and set(state) == {'schemaVersion', 'computerId', 'jobId', 'pending', 'lastResponse'}, 'journal fields mismatch')
+        fields = {'schemaVersion', 'computerId', 'jobId', 'pending', 'lastResponse'}
+        need(isinstance(state, dict) and set(state) in (fields, fields | {'namespace'}), 'journal fields mismatch')
+        need(state.get('namespace', 'mum') == json_tool.NAMESPACE, 'journal namespace mismatch')
         need(type(state['schemaVersion']) is int and state['schemaVersion'] == 1, 'journal version mismatch')
         need(computer is None or state['computerId'] == computer, 'journal computer mismatch')
         need(job is None or job == state['jobId'], 'journal job CAS mismatch')
@@ -172,7 +182,7 @@ def operate(operation, computer, job, journal, apply, secret, sender=send, retir
             response(state['lastResponse'], request('plan', state['computerId'], state['jobId']))
         sent['jobId'] = state['jobId']
     else:
-        state = dict(schemaVersion=1, computerId=computer, jobId=job, pending=None, lastResponse=None)
+        state = dict(schemaVersion=1, namespace=json_tool.NAMESPACE, computerId=computer, jobId=job, pending=None, lastResponse=None)
     mutating = operation in ('prepare', 'launch', 'recover')
     if mutating and not apply:
         print('DRY RUN: ' + json.dumps(sent, separators=(',', ':')) + '; add --apply to submit')
@@ -211,10 +221,12 @@ def main():
     parser.add_argument('--source-execution-arn')
     parser.add_argument('--source-retirement-execution-arn')
     parser.add_argument('--journal', type=Path)
-    parser.add_argument('--origin', default=ORIGIN)
+    parser.add_argument('--namespace', choices=('mum', 'prd'), default='mum')
+    parser.add_argument('--origin')
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
-    need(args.origin == ORIGIN, 'only os-staging is allowed; btgq/curomaa refused')
+    use_namespace(args.namespace)
+    need(args.origin in (None, ORIGIN), 'namespace authority origin mismatch')
     need(args.source_retirement_execution_arn is None or args.operation in ('plan', 'prepare'), 'retirement hint is only for plan or prepare')
     if args.operation == RECONCILE:
         reconcile_request(args.computer, args.job, args.source_execution_arn)
@@ -226,7 +238,7 @@ def main():
         return
     need(args.source_execution_arn is None, 'source hint is only for reconcile-replacement or reconcile-release')
     request(args.operation, args.computer, args.job, args.source_retirement_execution_arn)
-    journal = args.journal or Path('/root/ezil-aws-mum/rebase-computers') / ((args.computer or args.job) + '.json')
+    journal = args.journal or Path(f'/root/ezil-aws-{json_tool.NAMESPACE}/rebase-computers') / ((args.computer or args.job) + '.json')
     # Use only the existing environment name; never a credential file, CLI argument or log.
     secret = os.environ.get('EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET', '')
     operate(args.operation, args.computer, args.job, journal, args.apply, secret, retirement=args.source_retirement_execution_arn)
@@ -236,5 +248,5 @@ if __name__ == '__main__':
     try:
         main()
     except (ValueError, KeyError, TypeError, OSError, http.client.HTTPException):
-        print('ERROR: computer operation refused or unconfirmed; retain the journal and reconcile staging authority/job state.', file=sys.stderr)
+        print('ERROR: computer operation refused or unconfirmed; retain the journal and reconcile the selected namespace authority/job state.', file=sys.stderr)
         sys.exit(1)

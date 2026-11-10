@@ -255,7 +255,6 @@ test_case 'prd recipe version update proceeds' prd-recipe-allowed "{$P}" pass
 test_case 'prd promotion dry-run and latest published N+1' prd-dry-promote "{$P}" dry-promote
 test_case 'prd promotion edits only the production secret deployment' prd-promote "{$P,\"authority_origin\":\"https://os-prod.ezil.work\"}" promote
 test_case 'prd rollback restores previous AMI/template/workflow' prd-rollback "{$P}" rollback
-test_case 'prd promotion with recovery and no tuple refused before any write' prd-recovery-promote "{$P,\"recovery\":true}" 'refuse-cannot promote a lifecycle with recovery'
 test_case 'prd foundation launch-template identity refused' prd-foundation-identity "{$P,\"foundation_identity\":true}" no-foundation-execute
 test_case 'prd lifecycle Lambda code change refused' prd-lifecycle-template-code "{$P,\"lifecycle_template_change\":\"code\"}" 'refuse-unexpected lifecycle property'
 test_case 'prd unpinned rebuild refused before any AWS call' prd-unpinned '{"namespace":"prd"}' 'refuse-not pinned yet'
@@ -265,9 +264,9 @@ test_case 'prd AMI baked with the staging enroll URL refused' prd-enroll "{$P,\"
 test_case 'mum AMI with the production enroll URL refused' enroll-prod '{"enroll_url":"https://os-prod.ezil.work/api/compute/aws/enroll"}' 'refuse-AMI enroll URL mismatch'
 test_case 'prd lifecycle with the staging authority origin refused' prd-origin "{$P,\"authority_origin\":\"https://os-staging.ezil.work\"}" 'refuse-lifecycle authority origin mismatch'
 test_case 'mum lifecycle with the production authority origin refused' origin '{"authority_origin":"https://os-prod.ezil.work"}' 'refuse-lifecycle authority origin mismatch'
-test_case 'prd manifest (rebase) promotion refused' prd-manifest "{$P}" 'refuse-no rebase tuple'
-test_case 'prd rebase bake flags refused' prd-rebase-flags "{$P}" 'refuse-no rebase tuple'
-test_case 'prd never reads mum operator configs' prd-mum-config "{$P}" 'refuse-never reads mum operator configs'
+test_case 'prd malformed manifest promotion refused' prd-manifest "{$P}" 'refuse-release refused'
+test_case 'prd previous pair without source evidence refused' prd-rebase-flags "{$P}" 'refuse-deployed release manifest required'
+test_case 'prd never reads mum operator configs' prd-mum-config "{$P}" 'refuse-foreign namespace operator path'
 test_case 'unknown namespace refused before any AWS call' unknown-ns '{}' 'refuse-unknown namespace'
 printf 'RESULT: %d passed, %d failed\n' "$passed" "$failed"
 ((failed == 0))
@@ -278,3 +277,6 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/rebase.py"
 PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/rollout.py"
 PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/registry_gc.py"
 PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/test_app_swap.py"
+
+PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/prd_rebase.py"
+PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/prd_paths.py"
