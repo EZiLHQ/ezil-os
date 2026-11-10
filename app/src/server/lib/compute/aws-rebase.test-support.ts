@@ -1,7 +1,12 @@
 import { randomUUID } from 'node:crypto';
+import type { HistoryEvent } from '@aws-sdk/client-sfn';
 import type { PlacementDb } from './placement';
 import { vi } from 'vitest';
 import { fixtureRebasePreparation, fixtureRebaseRelease } from './aws-intent.test-support';
+import { buildLifecycleWork, LifecycleDeploymentSchema, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
+import { lifecycleExecutionArn } from './aws-receipts';
+import { releaseHistory } from './aws-historical-source.test-support';
+import { fixtureSharedLowerSuccessor, LOWER_105 } from './aws-rebase-release-registry.test-support';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
 import { createImageJobStore } from './aws-rebase-store';
 import { handleImageRebase, type ImageRebaseDeps, type ImageRebaseRequest } from './aws-rebase-orchestrator';
@@ -98,4 +103,65 @@ export function rebaseSetup(externalDb?: PlacementDb) {
     };
     return { deps, fake, store, env, started, executions, provider, run, current, completePreparation, completeLaunch, completeRecovery, completeRebind,
         advance: (ms: number) => { clock = new Date(clock.getTime() + ms); }, source, owner };
+}
+
+export const RELEASED_POOL_HOST = 'a0a0a0a0-a0a0-4a0a-8a0a-a0a0a0a0a0a0';
+const PROVISION_JOB = 'b1b1b1b1-b1b1-4b1b-8b1b-b1b1b1b1b1b1', RELEASE_JOB = 'd3d3d3d3-d3d3-4d3d-8d3d-d3d3d3d3d3d3';
+type ReleaseIntent = LifecycleWork['intent'];
+/** DESIGN R: the placement's warm-pool host was released and aged out of EC2. Synthetic retired claim row, SUCCEEDED provision and
+ * release executions with a Code-48 termination history. `shared`: 34ac-like lower whose 1.0.5/1.0.6 records share it. */
+export function releasedPoolSetup(options: { shared?: boolean; db?: PlacementDb } = {}) {
+    const s = rebaseSetup(options.db), src = s.source, f = fixtureSharedLowerSuccessor();
+    if (options.shared) { s.env.EZIL_AWS_LIFECYCLE_DEPLOYMENTS = JSON.stringify({ [f.entry.region]: f.entry }); s.fake.placements[0]!.lower_image_digest = LOWER_105; }
+    const provisioned = options.shared ? f.deployment105 : LifecycleDeploymentSchema.parse(src.sourceDeployment);
+    const provisionStart = new Date('2026-10-21T09:00:00.000Z'), releaseStart = new Date('2026-10-22T10:00:00.000Z');
+    const row: Record<string, unknown> = { id: RELEASED_POOL_HOST, generation: 1, region: src.deployment.region, zone_id: src.deployment.zoneId,
+        instance_type: 'm6i.large', instance_id: src.sourceInstanceId, state: 'retired', leased_computer_id: src.computerId,
+        claim_generation: src.sourceGeneration, claim_lease_epoch: src.sourceLeaseEpoch, claim_fence: src.sourceFenceToken,
+        claim_volume_serial: src.sourceVolumeId.replace('-', ''), dispatch_status: 'settled' };
+    s.fake.poolHosts.push(row);
+    const histories = new Map<string, HistoryEvent[]>();
+    const absent = () => new AwsClientError('aws_config', false, 'ExecutionDoesNotExist');
+    s.deps.executions.history = vi.fn(async (_region: string, arn: string) => { const h = histories.get(arn); if (!h) throw absent(); return structuredClone(h); });
+    let provision!: LifecycleWork, release!: LifecycleWork;
+    /** Re-pins the provision tuple: row input/digest/job and the SUCCEEDED execution with its strict pool receipt. */
+    const setProvision = (deployment: LifecycleDeployment) => {
+        provision = buildLifecycleWork({ schemaVersion: 1, jobId: PROVISION_JOB, computerId: RELEASED_POOL_HOST, revision: 1, operation: 'pool-provision',
+            targetGeneration: 1, fenceToken: 'c2c2c2c2-c2c2-4c2c-8c2c-c2c2c2c2c2c2', poolHostId: RELEASED_POOL_HOST, poolGeneration: 1,
+            providerInstanceId: null, dataVolumeId: null, previousGeneration: null, previousInstanceId: null, previousFenceToken: null,
+            deployment, instanceType: 'm6i.large', dataVolumeGiB: null, leaseEpoch: 1, userData: null });
+        Object.assign(row, { lifecycle_job_id: PROVISION_JOB, lifecycle_digest: provision.digest, lifecycle_input: provision.input });
+        const arn = lifecycleExecutionArn(deployment, PROVISION_JOB);
+        s.executions.set(arn, { executionArn: arn, input: provision.input, stateMachineVersionArn: provision.stateMachineArn, redriveCount: 0,
+            status: 'SUCCEEDED', startDate: provisionStart, stopDate: new Date(provisionStart.getTime() + 240000), output: JSON.stringify({ schemaVersion: 1,
+                jobId: PROVISION_JOB, digest: provision.digest, computerId: RELEASED_POOL_HOST, generation: 1, leaseEpoch: 1, fenceToken: provision.intent.fenceToken,
+                instanceId: src.sourceInstanceId, volumeId: null, state: 'running', poolHostId: RELEASED_POOL_HOST, poolGeneration: 1 }) });
+        return arn;
+    };
+    /** Re-pins the release: its exact input, `retired` receipt and the matching Code-48 history (patches apply to all three). */
+    const setRelease = (intent: Partial<ReleaseIntent> = {}, receipt: Record<string, unknown> = {}, current?: { Code: number; Name: string }) => {
+        release = buildLifecycleWork({ schemaVersion: 1, jobId: RELEASE_JOB, computerId: src.computerId, revision: 1, operation: 'release',
+            targetGeneration: src.sourceGeneration, fenceToken: src.sourceFenceToken, providerInstanceId: src.sourceInstanceId, dataVolumeId: src.sourceVolumeId,
+            previousGeneration: null, previousInstanceId: null, previousFenceToken: null, deployment: provisioned, instanceType: 'm6i.large',
+            dataVolumeGiB: null, leaseEpoch: src.sourceLeaseEpoch, userData: null, ...intent } as ReleaseIntent);
+        const i = release.intent, arn = lifecycleExecutionArn(i.deployment, i.jobId);
+        const output = JSON.stringify({ schemaVersion: 1, jobId: i.jobId, digest: release.digest, computerId: i.computerId, generation: i.targetGeneration,
+            leaseEpoch: i.leaseEpoch, fenceToken: i.fenceToken, instanceId: i.providerInstanceId, volumeId: i.dataVolumeId, state: 'retired', ...receipt });
+        s.executions.set(arn, { executionArn: arn, input: release.input, stateMachineVersionArn: release.stateMachineArn, redriveCount: 0,
+            status: 'SUCCEEDED', startDate: releaseStart, stopDate: new Date(releaseStart.getTime() + 60000), output });
+        histories.set(arn, releaseHistory(release.input, output, i.providerInstanceId!, releaseStart, current));
+        return arn;
+    };
+    const provisionArn = setProvision(provisioned), releaseArn = setRelease();
+    /** `hint` null: no release hint at all. */
+    const request = (operation: ImageRebaseRequest['operation'], hint: string | null = releaseArn) => handleImageRebase(s.deps,
+        { schemaVersion: 1, operation, computerId: src.computerId, jobId: null, ...(hint === null ? {} : { sourceRetirementExecutionArn: hint }) });
+    /** EC2 still listing the released host: terminated, with the claim identity and no canonical or pool tag. */
+    const terminatedHost = (): Ec2EnrollmentView => ({ instanceId: src.sourceInstanceId, imageId: provisioned.amiId, state: 'terminated',
+        availabilityZone: 'ap-south-1a', availabilityZoneId: src.deployment.zoneId, publicIp: null, volumes: [], tags: {
+            'ezil:managed-by': 'app-computer-platform', 'ezil:stage': provisioned.namespace, 'ezil:namespace': provisioned.namespace,
+            'ezil:pool-host': RELEASED_POOL_HOST, 'ezil:computer': src.computerId, 'ezil:generation': String(src.sourceGeneration),
+            'ezil:fence': src.sourceFenceToken, 'aws:ec2launchtemplate:id': provisioned.launchTemplateId } });
+    return { ...s, f, provisioned, row, histories, provisionArn, releaseArn, setProvision, setRelease, request, terminatedHost,
+        provision: () => provision, release: () => release };
 }

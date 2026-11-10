@@ -1,22 +1,29 @@
 import type { StripeAiPack } from '../stripe/packs';
 import { aiPackCheckoutEligible, CUSTOM_TOPUP, storageCapBytes } from '../catalog';
 import { checkoutAvailable } from '../config';
-import { storageState } from '../meters';
-import type { GrantRow } from '../ports';
+import { latestStorageTotal, storageState } from '../meters';
 import { SIZES, type ComputeEpoch, type SizeCode, type Window } from '../v2/contract';
 import { buildSummaryV2 } from '../v2/summary';
 import { rateWindow } from '../v2/rating';
 import { epochSeconds, isoSeconds } from '../v2/time';
 import { fairUseStatusOf, HOLD_SIZE } from './admission';
+import { UNMETERED_PAID_PLAN_IDS } from '../../lib/compute/paid-compute-policy';
 import { operatorGrantedSubscription, planFromSubscriptions, publicOffers, type ResolvedPlanV3 } from './catalog';
-import { CATALOG_V3_VERSION, type BillingSummaryV3, type ComputerReverseMoveV3, type ComputeStandingV3, type SellableSkuV3 } from './contract';
-import { deriveStanding, paidAccess } from './standing';
+import {
+    CATALOG_V3, CATALOG_V3_VERSION, type AiAccountV3, type AiGrantKindV3, type BillingSummaryV3, type ComputerReverseMoveV3, type ComputeStandingV3, type SellableSkuV3,
+} from './contract';
+import { deriveStanding, operatorAccessFor, paidAccess } from './standing';
+import { fairUseAllowance, renewalGrantPending } from './funding';
+export { fairUseAllowance, renewalGrantPending, GRANT_PENDING_SECONDS } from './funding';
+import type { OperatorEntitlementRow } from './operator-access';
 import {
     reverseHoldOpenable, reverseMoveView, reverseMoveVisible, reverseTryAgainForbidden, type ReverseMovePlacementView,
 } from '../../lib/compute/provider-reverse';
 import { REVERSE_MOVE_HOLDING, type ComputeReverseMove } from '../../lib/compute/provider-reverse-store';
 import { parseAiUpgradeEntitlement } from '../ai-credits';
-import { aiMicroBalanceState, type AiGatewayGrant } from '../ai-balance';
+import { parseTrialEntitlement, TRIAL_SKU } from './trial';
+import { neverPaidTrial } from './standing';
+import { aiMicroBalanceState, type AiGatewayGrant, type AiOpenHold } from '../ai-balance';
 import type { AiCreditReceipt } from '../ai-credit-outbox';
 import { creditNumber } from '../ai-read';
 
@@ -43,20 +50,6 @@ export function usedSecondsInWindow(epochs: readonly (ComputeEpoch & { deadlineA
     })), window, now: iso(now) }).stdSeconds;
 }
 
-/** Paid receipts and reversals keep the same subscription/period isolation as v2. */
-export function fairUseAllowance(plan: ResolvedPlanV3, grants: readonly GrantRow[], options: { grace?: boolean } = {}): number {
-    if (plan.sku === 'legacy') throw new TypeError('Legacy allowances use v2 rating');
-    if (plan.sku === 'free_v3') return plan.legacyFree ? plan.offer.legacyFairUseSeconds! : plan.offer.fairUseSeconds;
-    const start = new Date(plan.window.start), end = new Date(plan.window.end);
-    const rows = grants.filter(grant => grant.meter === 'compute_std_seconds' && grant.subscriptionId === plan.subscriptionId
-        && grant.periodStart !== null && grant.periodEnd !== null && grant.periodStart < end && grant.periodEnd > start);
-    // Round 4 D17: an unpaid renewal has no receipt yet. In grace the paid computer stays usable on the plan's
-    // fair use; any receipt or reversal (a refund, D19) for the period still wins.
-    if (options.grace && rows.length === 0) return plan.offer.fairUseSeconds;
-    const amount = rows.reduce((sum, grant) => sum + grant.amount, BigInt(0));
-    return Number(amount < BigInt(0) ? BigInt(0) : amount > BigInt(plan.offer.fairUseSeconds) ? BigInt(plan.offer.fairUseSeconds) : amount);
-}
-
 /**
  * Round 6 review (dunning into the hold): the plan the COMPUTER runs under. A paid subscription without paid
  * access (grace over, raw unpaid, never paid; STANDING-CONTRACT) runs the computer as Free, with Free's
@@ -81,43 +74,67 @@ function receiptBucket(entitlementId: string, plan: ResolvedPlanV3): { bucket: A
     const inWindow = (at: number) => plan.subscriptionId !== null && at >= start && at < end;
     const upgrade = parseAiUpgradeEntitlement(entitlementId);
     if (upgrade) return { bucket: upgrade.subscriptionId === plan.subscriptionId && inWindow(upgrade.effectiveAt.getTime()) ? 'included' : 'previous' };
+    // The trial's own root funds the trial window as that period's plan credits (it is the period during the trial).
+    const trial = parseTrialEntitlement(entitlementId);
+    if (trial) return trial.subscriptionId === plan.subscriptionId && inWindow(trial.trialStart.getTime())
+        ? { bucket: 'included', planPeriodSku: TRIAL_SKU } : { bucket: 'previous' };
     const period = PERIOD_ROOT.exec(entitlementId);
     return period && period[2] === plan.subscriptionId && inWindow(Date.parse(period[3]!))
         ? { bucket: 'included', planPeriodSku: period[1] } : { bucket: 'previous' };
 }
 
 const credits = (micro: bigint) => creditNumber(micro.toString());
+const sum = (grants: readonly AiGatewayGrant[] | undefined, field: 'creditsMicro' | 'remainingMicro') =>
+    (grants ?? []).reduce((total, g) => total + BigInt(g[field]), BigInt(0));
+
+/**
+ * The Gateway `grants[]` carries no entitlement id, so a live grant is matched to the stored receipt
+ * with the same expiry and amount. An operator grant (`source` 'admin') is never an OS receipt.
+ * Live grants match first; a receipt left over may then match a revoked or expired grant, which
+ * accounts for it as dead: it funds no bucket, and its receipt no longer reads as unmatched.
+ * `known` false: delivered receipts match nothing (a unit change, or the plan's grant missing).
+ */
+function matchAiGrants(plan: ResolvedPlanV3, input: readonly AiCreditReceipt[] | null, gatewayGrants: readonly AiGatewayGrant[] | null) {
+    const receipts = (input ?? []).map(receipt => ({ ...receipt, ...receiptBucket(receipt.entitlementId, plan) }));
+    const matched = new Map<AiBucket, AiGatewayGrant[]>(), bucketOf = new Map<AiGatewayGrant, AiBucket>();
+    const dead = new Set<AiBucket>();
+    const unused = [...receipts];
+    const take = (grant: AiGatewayGrant) => {
+        const i = unused.findIndex(r => Date.parse(r.expiresAt) === Date.parse(grant.expiresAt) && BigInt(r.credits) * MICRO === BigInt(grant.creditsMicro));
+        return i < 0 ? null : unused.splice(i, 1)[0]!;
+    };
+    const fromOs = (gatewayGrants ?? []).filter(grant => grant.source !== 'admin');
+    for (const grant of fromOs.filter(g => g.live)) {
+        const receipt = take(grant);
+        if (!receipt) continue;
+        matched.set(receipt.bucket, [...matched.get(receipt.bucket) ?? [], grant]);
+        bucketOf.set(grant, receipt.bucket);
+    }
+    for (const grant of fromOs.filter(g => !g.live)) {
+        const receipt = take(grant);
+        if (receipt) dead.add(receipt.bucket);
+    }
+    const current = receipts.filter(r => r.bucket === 'included');
+    // Matching assumes the Gateway stores credits × 10^6 and the sent expiry. If delivered receipts
+    // match nothing, live or dead (a unit change, or the plan's grant missing), report unknown, never "0 of 0".
+    const delivered = (list: typeof receipts) => list.some(r => r.deliveredAt !== null);
+    const known = gatewayGrants !== null && !(delivered(receipts) && matched.size === 0 && dead.size === 0)
+        && !(delivered(current) && !matched.has('included') && !dead.has('included'));
+    return { receipts, current, matched, bucketOf, known };
+}
 
 /**
  * Round 3 D2/D4: split the Gateway balance into the plan's credits for THIS period,
- * purchased and starter credits. The Gateway `grants[]` carries no entitlement id, so a
- * live grant is matched to the stored receipt with the same expiry and amount; an
- * unmatched grant (earlier periods still inside their 3-day tail, legacy or manual
- * grants) counts in `balance` only. The low/exhausted state never mixes buckets.
+ * purchased and starter credits (`matchAiGrants`); an unmatched grant (earlier periods
+ * still inside their 3-day tail, legacy or manual grants) counts in `balance` only.
+ * The low/exhausted state never mixes buckets. `ai.account` carries the whole total.
  */
 export function aiCreditBuckets(input: { plan: ResolvedPlanV3; receipts: readonly AiCreditReceipt[] | null;
     gatewayGrants: readonly AiGatewayGrant[] | null; balanceMicro: string | null }): Pick<BillingSummaryV3['ai'],
     'state' | 'included' | 'purchased' | 'starter' | 'previous' | 'pendingFromRenewal'> {
     const { plan } = input;
     const paid = plan.sku === 'standard_monthly_v3' || plan.sku === 'premium_monthly_v3';
-    const receipts = (input.receipts ?? []).map(receipt => ({ ...receipt, ...receiptBucket(receipt.entitlementId, plan) }));
-    const matched = new Map<AiBucket, AiGatewayGrant[]>();
-    const unused = [...receipts];
-    for (const grant of input.gatewayGrants ?? []) {
-        if (!grant.live) continue;
-        const i = unused.findIndex(r => Date.parse(r.expiresAt) === Date.parse(grant.expiresAt) && BigInt(r.credits) * MICRO === BigInt(grant.creditsMicro));
-        if (i < 0) continue;
-        const [receipt] = unused.splice(i, 1);
-        matched.set(receipt!.bucket, [...matched.get(receipt!.bucket) ?? [], grant]);
-    }
-    const sum = (grants: readonly AiGatewayGrant[] | undefined, field: 'creditsMicro' | 'remainingMicro') =>
-        (grants ?? []).reduce((total, g) => total + BigInt(g[field]), BigInt(0));
-    const current = receipts.filter(r => r.bucket === 'included');
-    // Matching assumes the Gateway stores credits × 10^6 and the sent expiry. If delivered receipts
-    // match nothing (a unit change, or the plan's grant missing), report unknown, never "0 of 0".
-    const delivered = (list: typeof receipts) => list.some(r => r.deliveredAt !== null);
-    const known = input.gatewayGrants !== null && !(delivered(receipts) && matched.size === 0)
-        && !(delivered(current) && !matched.has('included'));
+    const { current, matched, known } = matchAiGrants(plan, input.receipts, input.gatewayGrants);
     const includedGrantedMicro = known ? sum(matched.get('included'), 'creditsMicro')
         : current.filter(r => r.deliveredAt !== null).reduce((total, r) => total + BigInt(r.credits) * MICRO, BigInt(0));
     const included = paid ? { granted: credits(includedGrantedMicro) ?? 0,
@@ -144,7 +161,70 @@ export function aiCreditBuckets(input: { plan: ResolvedPlanV3; receipts: readonl
     return { state, included, purchased, starter, previous, pendingFromRenewal };
 }
 
+const KIND: Record<AiBucket, AiGrantKindV3> = { included: 'plan', purchased: 'purchased', starter: 'starter', previous: 'previous' };
+/** A grant counts as possibly live this long after its `revoked_at` (the revoking transaction's start, not its commit). */
+const REVOKE_MARGIN_MS = 5 * 60_000;
+/** Postgres keeps microseconds; the wire keeps milliseconds. */
+const EXPIRY_MARGIN_MS = 1_000;
+
+/**
+ * Settled credits on the live grants, only when this read proves it. The Gateway ledger (0001 `ledger`,
+ * `grant_balances`, `balance()`, `settle_locked`; 0021 absorptions): a grant's `remaining_micro` is the sum of
+ * its rows, grant (+) hold (−) hold_release (+) debit (−) revoke (− at revocation only); settlement releases
+ * every hold slice and debits the cost, and `overrun` rows carry no grant. So over the live grants
+ * total − remaining = settled debits + the open hold slices on them, exactly. `held_micro` is Σ `hold_micro`
+ * of ALL open requests, which is the open slices on live grants only when no open slice sits on a grant
+ * that has since expired or been revoked, and no open request was platform-absorbed (slices released, still
+ * 'pending'). Proven here: no open request at all, or every open request visible on the usage page, none
+ * absorbed, and each reserved after every non-live grant had died (a slice is placed only on a live grant).
+ */
+function provenUsedMicro(total: bigint, remaining: bigint, held: bigint, grants: readonly AiGatewayGrant[],
+    openHolds: readonly AiOpenHold[] | null | undefined): bigint | null {
+    const used = total - remaining - held;
+    if (used < BigInt(0)) return null;
+    // Every open request holds something (`requests.hold_micro > 0`): none open, no slice anywhere.
+    if (held === BigInt(0)) return used;
+    if (!openHolds || openHolds.reduce((all, hold) => all + BigInt(hold.heldMicro), BigInt(0)) !== held) return null;
+    const deaths = grants.filter(g => !g.live).map(g => g.revokedAt === 'unknown' ? Infinity : Math.min(
+        Date.parse(g.expiresAt) + EXPIRY_MARGIN_MS, g.revokedAt ? Date.parse(g.revokedAt) + REVOKE_MARGIN_MS : Infinity));
+    return openHolds.every(hold => deaths.every(death => death < Date.parse(hold.at))) ? used : null;
+}
+
+/**
+ * The identity's credits (`AiAccountV3`) from `/v1/me/balance`: the total is every live grant, whatever its
+ * source; receipt matching only labels grants. Exact microcredit strings; nothing is rounded or invented.
+ */
+export function aiAccountV3(input: { plan: ResolvedPlanV3; receipts: readonly AiCreditReceipt[] | null;
+    gatewayGrants: readonly AiGatewayGrant[] | null; balanceMicro: string | null; heldMicro?: string | null;
+    gatewayState?: AiAccountV3['state'] | null; openHolds?: readonly AiOpenHold[] | null; userId?: string | null; now: Date }): AiAccountV3 {
+    const { plan } = input;
+    const remaining = input.balanceMicro === null ? null : BigInt(input.balanceMicro);
+    const held = input.heldMicro == null ? null : BigInt(input.heldMicro);
+    const live = (input.gatewayGrants ?? []).filter(grant => grant.live);
+    // `available_micro` is Σ `remaining_micro` of the live grants (which never goes below 0): anything else is an inconsistent read.
+    const consistent = remaining !== null && input.gatewayGrants !== null && sum(live, 'remainingMicro') === remaining;
+    const total = consistent ? sum(live, 'creditsMicro') : null;
+    const { bucketOf, known } = matchAiGrants(plan, input.receipts, input.gatewayGrants);
+    const used = total !== null && remaining !== null && held !== null ? provenUsedMicro(total, remaining, held, input.gatewayGrants!, input.openHolds) : null;
+    return {
+        userId: input.userId ?? null,
+        state: remaining === null ? 'unavailable' : input.gatewayState ?? (remaining === BigInt(0) ? 'exhausted' : 'ok'),
+        asOf: iso(input.now),
+        totalMicro: total?.toString() ?? null, remainingMicro: remaining?.toString() ?? null, heldMicro: held?.toString() ?? null,
+        usedMicro: used?.toString() ?? null,
+        // The catalog allowance is a label only; it is never a numerator or a denominator.
+        planBaselineMicro: plan.sku === 'legacy' ? null : (BigInt(plan.offer.aiCredits.amount) * MICRO).toString(),
+        labelled: consistent && input.receipts !== null && known,
+        grants: consistent ? [...live].sort((a, b) => Date.parse(a.expiresAt) - Date.parse(b.expiresAt)).map(grant => ({
+            kind: grant.source === 'admin' ? 'added' as const : KIND[bucketOf.get(grant)!] ?? 'added',
+            creditsMicro: grant.creditsMicro, remainingMicro: grant.remainingMicro, expiresAt: grant.expiresAt })) : [],
+    };
+}
+
 const GIB = BigInt(1024) ** BigInt(3);
+
+/** A live computer and its provider, as the router's placement read lists it (billing.ts `UserPlacement.computers`). */
+export interface DiskComputer { computerId: string; provider: string | null }
 
 /**
  * Round 5 D3: the disk shown when the computer's volume cannot be read (no AWS placement yet, AWS off,
@@ -180,25 +260,38 @@ export function usedGiBOf(usedBytes: bigint | string | null | undefined): number
  * keeps it, so the cap is that volume's REAL size (`volumeGiB`, read by the caller from EC2), never a
  * per-configuration table; unreadable falls back to `DISK_FALLBACK_GIB`. Free/Cloudflare has no
  * provisioned figure, so no cap is invented. Only legacy v1/v2 plans keep the v1 constant.
+ *
+ * The legacy meter is the per-user "Saved storage" allowance: every computer's latest sample, deleted
+ * ones included until purged (CONTRACT.md §3.2). A v3 disk is one computer's disk, so it counts only
+ * what can be on it: the samples of the user's LIVE computers (`liveComputers`, the router's placement
+ * read) of the disk's kind, aws-ec2 ones on an AWS volume and the others (Cloudflare, or no placement
+ * row yet) on a Cloudflare disk. A deleted computer's retained volume is on no disk the user can reach,
+ * so it never fills this one. Omitted `liveComputers` (callers that read no placement) counts every sample.
  */
-export function storageDisk(plan: ResolvedPlanV3, size: SizeCode, storage: readonly { computerId: string; bytes: bigint; measuredAt: Date }[],
-    largeStorageEnabled: boolean, volumeGiB?: number | null): { provisionedGiB: number | null; usedBytes: bigint | null; capBytes: bigint | null; state: BillingSummaryV3['storage']['state'] } {
-    const newest = new Map<string, typeof storage[number]>();
-    for (const sample of storage) {
-        if (!newest.has(sample.computerId) || newest.get(sample.computerId)!.measuredAt < sample.measuredAt) newest.set(sample.computerId, sample);
-    }
-    const usedBytes = newest.size ? [...newest.values()].reduce((sum, sample) => sum + sample.bytes, BigInt(0)) : null;
-    const meter = (cap: bigint) => {
-        const state = storageState(usedBytes ?? BigInt(0), cap);
+export function storageDisk<S extends { computerId: string; bytes: bigint; measuredAt: Date }>(plan: ResolvedPlanV3, size: SizeCode, storage: readonly S[],
+    largeStorageEnabled: boolean, volumeGiB?: number | null, liveComputers?: readonly DiskComputer[]):
+    { provisionedGiB: number | null; usedBytes: bigint | null; capBytes: bigint | null; state: BillingSummaryV3['storage']['state'];
+        /** The samples this meter counted, for any per-sample detail shown beside it (billing.usage `storage.samples`). */
+        counted: readonly S[] } {
+    // Unmeasured is `unavailable` ("not measured yet"), never the `ok` of a zero nobody measured.
+    const meter = (usedBytes: bigint | null, cap: bigint) => {
+        if (usedBytes === null) return 'unavailable' as const;
+        const state = storageState(usedBytes, cap);
         return state === 'over_cap' ? 'exhausted' as const : state;
     };
     if (plan.sku === 'legacy') {
+        const { usedBytes } = latestStorageTotal(storage);
         const cap = storageCapBytes(plan.family === 'free' ? 'free' : 'pro', largeStorageEnabled);
-        return { provisionedGiB: null, usedBytes, capBytes: cap, state: meter(cap) };
+        return { provisionedGiB: null, usedBytes, capBytes: cap, state: meter(usedBytes, cap), counted: storage };
     }
-    const provisionedGiB = SIZES[size].provider === 'aws' ? readableVolumeGiB(volumeGiB) ?? DISK_FALLBACK_GIB : null;
+    const aws = SIZES[size].provider === 'aws';
+    const onDisk = liveComputers === undefined ? null : new Set(liveComputers
+        .filter(computer => (computer.provider === 'aws-ec2') === aws).map(computer => computer.computerId.toLowerCase()));
+    const counted = onDisk === null ? storage : storage.filter(sample => onDisk.has(sample.computerId.toLowerCase()));
+    const { usedBytes } = latestStorageTotal(counted);
+    const provisionedGiB = aws ? readableVolumeGiB(volumeGiB) ?? DISK_FALLBACK_GIB : null;
     const capBytes = provisionedGiB === null ? null : BigInt(provisionedGiB) * GIB;
-    return { provisionedGiB, usedBytes, capBytes, state: capBytes === null || usedBytes === null ? 'unavailable' : meter(capBytes) };
+    return { provisionedGiB, usedBytes, capBytes, state: capBytes === null ? 'unavailable' : meter(usedBytes, capBytes), counted };
 }
 
 /**
@@ -243,13 +336,40 @@ export function reverseMoveFields(input: ReverseMoveSummaryInput | undefined, st
     };
 }
 
+/**
+ * Standard trial status for the plan's subscription, from stored Stripe state only. Converted trials (a positive paid
+ * period granted) show nothing: they are ordinary Standard. The first charge's amount is Stripe's renewal preview when
+ * it reads, else the catalog price the checkout was refused without.
+ */
+export function trialBlock(sub: (Parameters<typeof neverPaidTrial>[0] & { status: string; cancelAtPeriodEnd: boolean;
+    trialStart?: Date | null }) | undefined, sku: string, paymentIssue: boolean, renewal: BillingSummaryV3['plan']['renewal'] | null,
+now: Date): BillingSummaryV3['plan']['trial'] | undefined {
+    if (!sub || sku !== TRIAL_SKU || !neverPaidTrial(sub) || !sub.trialEnd || !Number.isFinite(sub.trialEnd.getTime())) return undefined;
+    const endsAt = iso(sub.trialEnd);
+    const startedAt = sub.trialStart && Number.isFinite(sub.trialStart.getTime()) ? iso(sub.trialStart) : null;
+    const amountCents = renewal?.amountCents ?? CATALOG_V3[TRIAL_SKU].priceCents;
+    const base = { startedAt, endsAt, amountCents, currency: 'usd' as const };
+    if (sub.status === 'past_due' || sub.status === 'unpaid' || (paymentIssue && now >= sub.trialEnd)) {
+        return { ...base, state: 'payment_failed', firstChargeAt: endsAt };
+    }
+    // Ended but not paid yet (standing.ts ends trial access at the exact end): say so, never "active".
+    if (now >= sub.trialEnd) return sub.status === 'active' || sub.status === 'trialing'
+        ? { ...base, state: 'payment_pending', firstChargeAt: endsAt } : undefined;
+    if (sub.status !== 'trialing') return undefined;
+    return sub.cancelAtPeriodEnd ? { ...base, state: 'ending', firstChargeAt: null } : { ...base, state: 'trialing', firstChargeAt: endsAt };
+}
+
 export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     /** Next invoice preview for this subscription, including discounts/tax/credits. Null when unavailable. */
     renewal?: BillingSummaryV3['plan']['renewal'];
     packs?: readonly StripeAiPack[];
     stripeAvailable?: boolean;
-    /** Round 3: the Gateway balance and stored receipts; omitted = balance filled by the caller (v1 shape). */
-    ai?: { receipts: readonly AiCreditReceipt[] | null; gatewayGrants: readonly AiGatewayGrant[] | null; balanceMicro: string | null };
+    /**
+     * Round 3: the Gateway balance and stored receipts; omitted = balance filled by the caller (v1 shape).
+     * `heldMicro`, `gatewayState`, `openHolds` and `userId` (optional) feed `ai.account`.
+     */
+    ai?: { receipts: readonly AiCreditReceipt[] | null; gatewayGrants: readonly AiGatewayGrant[] | null; balanceMicro: string | null;
+        heldMicro?: string | null; gatewayState?: AiAccountV3['state'] | null; openHolds?: readonly AiOpenHold[] | null; userId?: string | null };
     /** Round 4: any aws-ec2 placement among the user's live computers; null/omitted = none or unreadable. */
     placementProvider?: 'aws-ec2' | 'cloudflare' | null;
     /**
@@ -262,12 +382,19 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     volumeGiB?: number | null;
     /** Round 6 (R4-02): the metered size of the user's AWS computer as placed; null/omitted = none, unreadable or mixed. */
     awsSize?: SizeCode | null;
+    /** The user's live computers (`storageDisk`): the disk meter counts only their samples; omitted = every sample. */
+    liveComputers?: readonly DiskComputer[];
     /** Phase B (§6.1.1): the move computer's reverse row and placement; omitted = today's output exactly (no new key). */
     reverseMove?: ReverseMoveSummaryInput;
+    /** Product entitlements v1: the account's operator assignments; omitted = none (Stripe or Free, as before). */
+    operatorGrants?: readonly OperatorEntitlementRow[];
+    /** Standard trial: the router's eligibility for this viewer (server facts); omitted = no offer key. */
+    trialOffer?: BillingSummaryV3['trialOffer'];
 }): BillingSummaryV3 {
-    const plan = planFromSubscriptions(input);
+    const operator = operatorAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues, grants: input.operatorGrants, now: input.now });
+    const plan = planFromSubscriptions({ ...input, operator });
     const standing = deriveStanding({ subscriptions: input.subs, paymentIssues: input.paymentIssues,
-        placementProvider: input.placementProvider ?? null, now: input.now });
+        placementProvider: input.placementProvider ?? null, now: input.now, operator });
     const legacy = plan.sku === 'legacy' ? buildSummaryV2(input) : null;
     const changes = input.planChanges.filter(change => change.subscriptionId === plan.subscriptionId);
     const upgrade = changes.find(change => change.kind === 'upgrade' && sellable(change.toSku)
@@ -293,26 +420,34 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         : standing.standing === 'files_on_aws' ? SIZES[HOLD_SIZE]
         : SIZES[input.sizePreference !== null && rated.offer.machineChoice.includes(input.sizePreference)
             ? input.sizePreference : rated.offer.size];
+    // Paid compute policy v1: a paid-access Standard/Premium computer with this period's grant, its renewal grace, or a
+    // renewal grant still landing (as compute-access.ts paidComputeUnmeteredState) has no hours cutoff: no fair-use pause,
+    // and its session ends only at the six-hour session cap (never at a stored fair-use deadline).
+    const unmetered = !legacy && UNMETERED_PAID_PLAN_IDS.includes(rated.sku)
+        && (allowance > 0 || renewalGrantPending(plan, standing.standing, input.grants, input.now));
     const latest = input.epochs.filter(epoch => epoch.endedAt === null && epochSeconds(epoch.readyAt) <= epochSeconds(input.now))
         .sort((a, b) => Date.parse(b.readyAt) - Date.parse(a.readyAt))[0];
     // Recompute uncapped deadlines from period usage before this epoch. Old paid
     // epochs may still carry a 2/6-hour session deadline; it is no longer a limit.
     const priorUsage = latest && rated.sessionMaxSeconds === null ? usedSecondsInWindow(
         input.epochs.filter(epoch => epoch.id !== latest.id), rated.window, new Date(latest.readyAt), bounds) : 0;
-    const fairDeadline = latest && rated.sessionMaxSeconds === null
+    const fairDeadline = unmetered ? Infinity : latest && rated.sessionMaxSeconds === null
         ? allowance <= priorUsage ? epochSeconds(input.now)
             : Math.max(epochSeconds(latest.readyAt, 'ceil'), epochSeconds(rated.window.start))
                 + Math.floor((allowance - priorUsage) / latest.weight)
         : latest ? epochSeconds(input.now) + Math.floor(Math.max(0, allowance - usedSeconds) / latest.weight) : Infinity;
-    const activeDeadline = legacy ? legacy.compute.session.activeDeadline : latest ? isoSeconds(Math.min(
+    const activeBound = latest ? Math.min(
         epochSeconds(latest.readyAt, 'ceil') + (rated.sessionMaxSeconds ?? Infinity),
-        rated.sessionMaxSeconds === null || latest.deadlineAt == null ? Infinity : epochSeconds(latest.deadlineAt),
+        unmetered || rated.sessionMaxSeconds === null || latest.deadlineAt == null ? Infinity : epochSeconds(latest.deadlineAt),
         fairDeadline,
-    )) : null;
-    const disk = storageDisk(rated, size.code, input.storage, input.config.largeStorageEnabled, input.volumeGiB);
+    ) : Infinity;
+    const activeDeadline = legacy ? legacy.compute.session.activeDeadline : Number.isFinite(activeBound) ? isoSeconds(activeBound) : null;
+    const disk = storageDisk(rated, size.code, input.storage, input.config.largeStorageEnabled, input.volumeGiB, input.liveComputers);
     const enabled = checkoutAvailable(input.config) && input.stripeAvailable !== false;
     // Promotion review: an operator-granted plan has no Stripe subscription, so no Stripe-backed action applies to it.
     const stripeActions = enabled && !operatorGrantedSubscription(plan.subscriptionId);
+    const trial = operator ? undefined : trialBlock(input.subs.find(sub => sub.stripeSubscriptionId === plan.subscriptionId), plan.sku,
+        paymentIssue !== null, input.renewal ?? null, input.now);
     const enrollment = input.enrollment?.state ?? 'enrolled';
     return {
         enabled: true, version: 3,
@@ -320,7 +455,11 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             : plan.offer.family === 'compute' ? 'Compute (legacy)' : 'Standard (legacy)' : plan.offer.name,
         status: pendingUpgrade && plan.planActive ? 'upgrade_pending' : plan.status,
         renewal: plan.renewsAt !== null ? input.renewal ?? null : null, cancelsAt: plan.cancelsAt,
-        scheduledChange, pendingUpgrade, paymentIssue, graceEndsAt: standing.graceEndsAt, planEndsAt: standing.planEndsAt },
+        scheduledChange, pendingUpgrade, paymentIssue, graceEndsAt: standing.graceEndsAt, planEndsAt: standing.planEndsAt,
+        // Product entitlements v1: assigned by an EZiL operator, not paid (no renewal, no Stripe actions); key absent otherwise.
+        ...(operator ? { access: { source: 'operator' as const, ref: operator.ref, endsAt: operator.endsAt === null ? null : iso(operator.endsAt),
+            untilRevoked: operator.endsAt === null } } : {}),
+        ...(trial ? { trial } : {}) },
         computer: { size: size.code, vcpu: size.vcpu, memoryGiB: size.memoryGiB, sessionMaxSeconds: rated.sessionMaxSeconds,
             opening: rated.sku === 'legacy' ? 'standard' : rated.offer.opening, activeDeadline,
             machineChoice: (rated.sku === 'legacy' ? [size.code] : rated.offer.machineChoice).map(code => ({
@@ -336,20 +475,28 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             // Phase B (§6.1): the move rides its own key; `move` above stays null so an old shell never renders it.
             ...reverseMoveFields(input.reverseMove, standing.standing) },
         // Balance is filled from the AI Gateway by the caller; legacy plans grant nothing new.
-        ai: { grant: plan.sku === 'legacy' ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
+        // An operator grant includes no AI credits (product entitlements v1: credits are never granted with access).
+        ai: { grant: plan.sku === 'legacy' || operator ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
             enrollment, waiting: enrollment === 'enrolled' ? null : waitingCredits(input.ai?.receipts ?? null, input.now),
-            ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro) } : {}) },
-        fairUse: { status: fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: rated.window.end },
+            ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro),
+                account: aiAccountV3({ plan, ...input.ai, now: input.now }) } : {}) },
+        fairUse: { status: unmetered ? 'ok' : fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: rated.window.end,
+            ...(unmetered ? { policy: 'unmetered' as const } : {}) },
         // Free has no provisioned disk: capBytes '0' with 'unavailable' (the pinned wire type is a string).
-        storage: { usedBytes: (disk.usedBytes ?? BigInt(0)).toString(), capBytes: (disk.capBytes ?? BigInt(0)).toString(), state: disk.state },
+        // No sample yet: usedBytes null with 'unavailable', never a measured-looking '0'.
+        storage: { usedBytes: disk.usedBytes?.toString() ?? null, capBytes: (disk.capBytes ?? BigInt(0)).toString(), state: disk.state },
         // Round 5 D1: credits bought before enrollment would only wait, so top-up needs a Gateway member.
         actions: { checkout: enabled && plan.family === 'free', topup: enabled && enrollment === 'enrolled',
-            upgrade: stripeActions && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
-            downgrade: stripeActions && plan.sku === 'premium_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
+            // A trial is not upgraded: its $0 proration would turn a free Standard month into a free Premium one.
+            upgrade: stripeActions && !operator && !trial && plan.sku === 'standard_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
+            downgrade: stripeActions && !operator && plan.sku === 'premium_monthly_v3' && plan.status === 'active' && !pendingUpgrade && !scheduledChange && !paymentIssue,
+            // payment_pending keeps the supported cancel (cancelAtPeriodEnd): it stops renewals; the first charge already
+            // being collected is not voided, and clients say so (paused access, no "stays active").
             cancel: stripeActions && plan.subscriptionId !== null && plan.planActive && !pendingUpgrade,
-            portal: stripeActions && input.hasCustomer,
+            portal: stripeActions && !operator && input.hasCustomer,
             ezilId: enrollment === 'needs_ezil_id' ? input.enrollment?.ezilIdUrl ?? null : null },
         // Round 6 (R1-06): the Free offer says the hours this account gets on Free (legacy 8 h today).
+        ...(input.trialOffer !== undefined && enabled && plan.family === 'free' ? { trialOffer: input.trialOffer } : {}),
         catalog: { version: CATALOG_V3_VERSION, offers: publicOffers({ legacyFree: plan.legacyFree }),
             packs: (input.packs ?? []).filter(aiPackCheckoutEligible).map(({ sku, aiCredits, creditCents, discountPercent, totalCents }) => ({
                 sku, aiCredits, creditCents, discountPercent, totalCents, currency: 'usd' })),

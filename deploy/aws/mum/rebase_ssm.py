@@ -77,11 +77,12 @@ def generation_terminal(directory, generation, aws):
         return False
 
 
-def run(directory, operation, body, apply, aws, write, sleep=time.sleep, fresh=False):
+def run(directory, operation, body, apply, aws, write, sleep=time.sleep, fresh=False, one_shot=False):
     """Journal before submission; reconcile ambiguous sends by the unique comment.
 
     A missing ambiguous result refuses. Never blindly repeat send-command. A
-    completed invocation is read again on resume. stdout must be one JSON object;
+    completed invocation is read again on resume. A one_shot operation never
+    re-arms a failed journal: a new submission needs a new plan generation. stdout must be one JSON object;
     provider errors/stdout are never echoed to an operator on failure.
     """
     host_identity(aws)
@@ -101,6 +102,7 @@ def run(directory, operation, body, apply, aws, write, sleep=time.sleep, fresh=F
         state = {**expected, 'status': 'uploading', 'commandId': None, 'comment': comment, 'attempts': []}
         write(path, state)
     if state['status'] == 'failed' or fresh and state['status'] == 'complete':
+        need(not one_shot, 'one-shot SSM command already ended; reconcile it, never resubmit')
         state['attempts'].append(state['commandId'])
         state.update(status='uploading', commandId=None, comment=comment + '-r' + str(len(state['attempts'])))
         write(path, state)
@@ -130,6 +132,8 @@ def run(directory, operation, body, apply, aws, write, sleep=time.sleep, fresh=F
         if status != 'Success' or result['ResponseCode'] != 0:
             need(status in ('Failed', 'Cancelled', 'TimedOut'), 'unknown SSM state; retain command ID')
             state['status'] = 'failed'; write(path, state)
+            if one_shot:
+                raise ValueError('one-shot SSM command failed; reconcile under the retained fence')
             raise ValueError('SSM operation failed; next apply retries the idempotent transaction; prior command retained')
         receipt = manifest.loads(result['StandardOutputContent'].strip())
         need(isinstance(receipt, dict), 'missing nonsecret operation receipt')

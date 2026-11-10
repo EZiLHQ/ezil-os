@@ -5,13 +5,27 @@ set +x
 umask 077
 tag=$1
 bucket=$2
-environment=${3:-staging}
+# Two invocation shapes reach this installer. deploy.sh passes the environment positionally
+# (tag bucket ENVIRONMENT [approved receipt]); the reviewed staging SSM document (fixed_document.py) passes
+# only tag bucket APPROVED_SHA RECEIPT, with the environment always staging. An environment is the word
+# staging|production; an approved source is a 40/64-hex SHA, so a 4-argument call whose $3 is a SHA is the
+# fixed-document path. Every other call keeps main's positional contract (and its environment check below).
+if [[ $# == 4 && ${3:-} =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]]; then
+    environment=staging approved_source=$3 receipt_hash=${4:-} provenance_args=4
+else
+    environment=${3:-staging} approved_source=${4:-} receipt_hash=${5:-} provenance_args=5
+fi
 # Staging keeps its original names; production has its own paths, units, image and S3 prefix.
 case $environment in
     staging) slug=ezil-os-staging prefix=os-staging/images other=ezil-os-production;;
     production) slug=ezil-os-production prefix=os/images other=ezil-os-staging;;
     *) echo 'Unknown environment.' >&2; exit 1;;
 esac
+# Source-provenance (staging install-verified only): an approved source SHA and receipt gate the install.
+if [[ -n $approved_source || -n $receipt_hash ]]; then
+    [[ $environment == staging && $# == $provenance_args && $approved_source =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ &&
+       $receipt_hash =~ ^[0-9a-f]{64}$ ]] && declare -F verify_install_source >/dev/null || exit 1
+fi
 [[ $EUID == 0 && $(uname -m) == x86_64 ]]
 # A host bootstrapped for one environment never takes the other's release.
 if [[ -e /var/lib/$other ]]; then
@@ -42,6 +56,11 @@ for suffix in sha256 tar.gz runtime.tar.gz; do
     aws --region ap-south-1 --no-cli-pager s3 cp \
         "s3://$bucket/$prefix/$tag.$suffix" "$temporary/$tag.$suffix" --only-show-errors
 done
+if [[ -n $approved_source ]]; then
+    aws --region ap-south-1 --no-cli-pager s3 cp \
+        "s3://$bucket/os-staging/images/$tag.source.json" "$temporary/$tag.source.json" --only-show-errors
+    verified_image_id=$(verify_install_source archive "$temporary" "$tag" staging "$approved_source" "$receipt_hash")
+fi
 python3 - "$temporary" "$tag" <<'PY'
 import hashlib, pathlib, re, sys
 directory, tag = pathlib.Path(sys.argv[1]), sys.argv[2]
@@ -62,6 +81,19 @@ PY
 gzip -dc "$temporary/$tag.tar.gz" | docker load >/dev/null
 docker image inspect "$slug:$tag" --format '{{.Architecture}}' | \
     python3 -c 'import sys; sys.exit(0 if sys.stdin.read().strip() == "amd64" else 1)'
+if [[ -n $approved_source ]]; then
+    docker image inspect "$slug:$tag" --format '{{json .}}' > "$temporary/loaded-image.json"
+    verify_install_source loaded "$temporary/loaded-image.json" "$approved_source" "$verified_image_id"
+    # Capture only nonsecret recovery identities before overwriting runtime files.
+    # These observations do not substitute for the reviewed rollback archives.
+    previous_image_ref=unavailable previous_image_id=unavailable previous_source=unavailable
+    previous_identity=$(docker container inspect "$slug-web-1" --format '{{.Config.Image}} {{.Image}}' 2>/dev/null) || previous_identity=
+    if [[ $previous_identity =~ ^([A-Za-z0-9_./:@-]+)\ (sha256:[0-9a-f]{64})$ ]]; then
+        previous_image_ref=${BASH_REMATCH[1]} previous_image_id=${BASH_REMATCH[2]}
+        previous_source=$(docker image inspect "$previous_image_id" --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null) || previous_source=unavailable
+        [[ $previous_source =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || previous_source=unavailable
+    fi
+fi
 # Extract only known ordinary files; reject links, traversal and extra members.
 python3 - "$temporary/$tag.runtime.tar.gz" "$slug" <<'PY'
 import pathlib, tarfile, sys
@@ -110,6 +142,16 @@ snapshot_web_log() {
 }
 snapshot_web_log
 docker compose --env-file compose.env up -d --force-recreate --wait --wait-timeout 120
+if [[ -n $approved_source ]]; then
+    observed_source=$(docker compose --env-file compose.env exec -T web node -e 'process.stdout.write(process.env.EZIL_GIT_SHA || "")') || observed_source=unavailable
+    if [[ $observed_source != "$approved_source" ]]; then
+        echo 'Runtime SHA mismatch; release owner must recover. App replacement already ran; stopped timers remain stopped. No automatic rollback.' >&2
+        printf 'Candidate: image=%s:%s source=%s image_id=%s receipt_sha256=%s\n' "$slug" "$tag" "$approved_source" "$verified_image_id" "$receipt_hash" >&2
+        printf 'Previous observed: image=%s source=%s image_id=%s (use separately reviewed rollback archives).\n' "$previous_image_ref" "$previous_source" "$previous_image_id" >&2
+        printf 'Recovery: inspect the SSM command and current container; owner must restore the approved app/runtime pair or repair this candidate, verify health/source, then restore the reviewed timer set: %s\n' "${jobs[*]}" >&2
+        exit 1
+    fi
+fi
 for job in "${jobs[@]}"; do
     install -m 0644 "cron/$slug-$job.service" "cron/$slug-$job.timer" /etc/systemd/system/
 done

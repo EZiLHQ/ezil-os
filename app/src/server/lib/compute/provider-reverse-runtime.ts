@@ -73,12 +73,15 @@ export function billingForReverseMoves(): ReverseBilling {
     return {
         async standing(userId) {
             const billing = await deps();
-            const [{ deriveStanding, paidAccess }, { planFromSubscriptions }] = await Promise.all([
+            const [{ deriveStanding, operatorAccessFor, paidAccess }, { planFromSubscriptions }] = await Promise.all([
                 import('@/server/billing/v3/standing'), import('@/server/billing/v3/catalog')]);
             const now = billing.now();
-            const [subscriptions, paymentIssues] = await Promise.all([billing.store.subscriptionsFor(userId), billing.store.openPaymentIssues(userId)]);
-            const { standing } = deriveStanding({ subscriptions, paymentIssues, placementProvider: null, now });
-            return { paid: paidAccess(standing), sku: planFromSubscriptions({ subs: subscriptions, now, userCreatedAt: null }).sku };
+            const [subscriptions, paymentIssues, grants] = await Promise.all([billing.store.subscriptionsFor(userId),
+                billing.store.openPaymentIssues(userId), billing.store.operatorEntitlementsFor?.(userId) ?? []]);
+            // Product entitlements v1: an operator grant in effect is paid access too, so its computer is never moved off AWS.
+            const operator = operatorAccessFor({ subscriptions, paymentIssues, grants, now });
+            const { standing } = deriveStanding({ subscriptions, paymentIssues, placementProvider: null, now, operator });
+            return { paid: paidAccess(standing), sku: planFromSubscriptions({ subs: subscriptions, now, userCreatedAt: null, operator }).sku };
         },
         async openEpoch(computerId) {
             const billing = await deps();

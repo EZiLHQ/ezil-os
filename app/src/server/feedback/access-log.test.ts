@@ -15,9 +15,10 @@ describe('recordAccess', () => {
             expect(statement.sql).toMatch(/INSERT INTO ezil_feedback_access_log \(id, report_id, admin_user_id, action, created_at\)/);
             expect(statement.params[0]).toMatch(/^[\da-f]{8}-[\da-f]{4}-4[\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/);
             expect(statement.params.slice(1, 4)).toEqual(['report', 'admin', action]);
-            expect(statement.params[4]).toBeInstanceOf(Date);
-            expect((statement.params[4] as Date).getTime()).toBeGreaterThanOrEqual(before);
-            expect((statement.params[4] as Date).getTime()).toBeLessThanOrEqual(Date.now());
+            expect(statement.params[4]).toEqual(expect.any(String));
+            expect(statement.sql).toContain('::timestamptz');
+            expect(new Date(statement.params[4] as string).getTime()).toBeGreaterThanOrEqual(before);
+            expect(new Date(statement.params[4] as string).getTime()).toBeLessThanOrEqual(Date.now());
         }
         expect(statements[0]!.params[0]).not.toBe(statements[1]!.params[0]);
     });

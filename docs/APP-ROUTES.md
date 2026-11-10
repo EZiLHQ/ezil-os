@@ -21,8 +21,9 @@ contract, it says so.
 The canonical URL of an open app is **`/app/<appId>`**, where `appId` is a
 shell registry id (`APPS` in `shell/ezil/apps/registry.js`):
 `desktop`, `code`, `settings`, `app-store`, `preview`, `secure-browser`.
-`browser` is an alias of `desktop`; there is no `launcher` app in the
-registry today.
+The one exception is the Browser: its registry id is `desktop`, and its URL
+is **`/app/browser`** (§9). `/app/desktop` is a legacy spelling of the same
+app. There is no `launcher` app in the registry today.
 
 - **`/app/<appId>` renders the same document as `/os`.** Not a redirect: the
   `/app/[appId]` page calls the `/os` page component with `params.appId`.
@@ -82,6 +83,20 @@ string. It returns `null` (open nothing) or
   `projectRejected` says why: `project_missing`, `repo_missing`,
   `project_invalid`, `repo_invalid`.
   Result: `project: { projectId, repoId, path? }`.
+- **A repository by its address** (founder 547ed35a, 2026-11-04):
+  `/app/code?repo=<URL-encoded https repository URL>`, with no `project`.
+  Navigation intent only: shape-checked here (https, no whitespace, query,
+  fragment, userinfo, backslash or escape, at most 508 characters) and then
+  canonicalised, authorised and resolved by the server
+  (`app/src/server/works/repo-url.ts`): today a public
+  `https://github.com/<owner>/<name>[.git]`, opened on the person's selected
+  computer into the folder the computer's checkout returns. EZiL Git hosts are
+  refused for now (`repo_url_unsupported`). A missing or private repository is
+  "This repository doesn't exist." An address that is not plain https is
+  `projectRejected: 'repo_url_invalid'`; beside a `project` it is
+  `repo_invalid`. `path` is not read with an address.
+  Result: `project: { repoUrl }`. Example:
+  `/app/code?repo=https%3A%2F%2Fgithub.com%2FEZiLHQ%2Fezil-os.git`.
 - **`path`.** A relative POSIX path, at most 255 UTF-8 bytes, segments
   matching `/^[A-Za-z0-9._-]+$/`, no `.` or `..` segment, no leading `/`, no
   backslash, no NUL/control character, no empty segment, and no
@@ -98,7 +113,7 @@ string. It returns `null` (open nothing) or
   - `<path>` is absolute (`/workspace/a`) or relative to `/workspace` (`a`,
     `./a`), the workspace root of an AWS computer and of a Cloudflare computer
     whose workspace is mounted. An unmounted Cloudflare computer's root is
-    `/home/neko/project` (`CODE_FOLDER_UNMOUNTED_ROOT`): there a `/workspace`
+    `/home/neko/project` (`REPO_OPEN_UNMOUNTED_ROOT`): there a `/workspace`
     link answers `outside` (default folder and the notice), and only an
     absolute `/home/neko/project/...` link opens. `/` may be written as is or
     as `%2F`; a space as `%20` (or `+`); a literal `+` as `%2B`; any other
@@ -108,18 +123,19 @@ string. It returns `null` (open nothing) or
     relative, above `/workspace`) is `folderRejected: 'outside'`. Also refused:
     `empty`, `control`, `backslash`, `too_long` (2048 bytes, 64 segments, 255
     bytes a segment), `invalid` (a lone surrogate).
-  - Beside `project`/`repo` the folder is `folderRejected: 'with_repository'`
-    and dropped with a visible notice. Until the server can confine a folder to
-    a checkout, a folder is never sent beside a project, and a local folder link
-    never names one.
+  - Beside `project`/`repo` (either form) the folder is
+    `folderRejected: 'with_repository'` and dropped; the repository opens at its
+    own folder with a visible notice. Until the server can confine a folder to
+    the checkout, a folder is never sent beside a repository, and a local folder
+    link never names one, so it never reaches Works or repo-open.
   - The address always WRITES the absolute path (`encodeQueryValue`: `/`
     readable). Precedence when Code mints: the address's folder, then this
     tab's record (`apps/code-folder.js`), then the computer's default.
   Result: `folder: '<absolute path>'` or `folderRejected: '<reason>'`. Example:
   `/app/code?folder=/workspace/sports/sports-web`.
-- **Never read from the URL:** a repo URL, a ref, a user or account id, a
-  token. (Code's folder is read only as above.) Unknown keys are ignored by the
-  parser and preserved in the address bar.
+- **Never read from the URL:** a ref, a user or account id, a token. (A
+  repository address and Code's folder are read only as above.) Unknown keys are ignored by the parser and preserved
+  in the address bar.
 - **Writing `path`.** `/` is left unencoded in query values everywhere this
   codebase writes one (`appUrl` in `app-history.js`, `returnUrlFor` in
   `constants.ts`), so `path=src/main.ts` survives sign-in as written. A link
@@ -205,10 +221,11 @@ code-server's workbench document on both computers
 - **What each switch writes.** A folder: `?folder=<path>`. Close Folder (the
   empty window), a workspace (several roots, a `.code-workspace`) or another
   scheme: bare `/app/code`, so a reload opens the default folder (the tab
-  record is cleared or marked, as before). Code here is always the person's
-  own files, so a folder is written as `folder` alone, never beside a
-  project's keys (§2 refuses that combination, so the shell never writes an
-  address it would refuse on reload). Creating, renaming or deleting
+  record is cleared or marked, as before). In a project's window, a folder
+  inside its checkout writes the project's own keys alone (never `folder`
+  beside them: §2 refuses that combination, so the shell never writes an
+  address it would refuse on reload; a reload opens the project's folder),
+  and one outside it is the person's own files (`folder` alone). Creating, renaming or deleting
   folders inside the root navigates nothing, so it writes nothing.
 - **What a mint's first document writes.** The asked folder, or the default
   when nothing was asked: `replace` with that folder. A different one (the
@@ -249,6 +266,39 @@ record; never with a project), `apps/code-history-browser-test.mjs` (Chromium,
 the real bridge script: link, switch, Back/Forward, reload, reconnect, close,
 workspace, nested, Unicode, relative, invalid, missing, repository, the veto),
 `worker/src/code-folder-bridge.test.ts` (the bridge and where it is injected).
+
+Scope and open gates (2026-11-05):
+
+- **In this change: the person's own folders.** `?folder=` alone, in both
+  directions, on both computers. The bridge rides the Worker: the Cloudflare
+  code host, and the AWS code port. Verified against real code-server 4.141
+  from the live desktop image (`e2e/code-folder-url-image.sh`) and in Chromium.
+  The staging deploy and its signed-in acceptance are the release owner's step.
+- **AWS link folders.** An AWS computer walks `folder` only with the host
+  agent's `folder` op, which ships in an AMI. Until then the server answers
+  `unverified`: the default folder opens with the notice, and the address keeps
+  the ask. Code→address sync, Back/Forward and Close Folder need no AMI.
+- **Repository links are unchanged.** `repo=`/`project=` open the
+  server-authorised folder W, with the checkout at `W/repository`, exactly as
+  before. `folder=` beside them is refused (`with_repository`).
+- **Not implemented: the checkout as Code's folder, and repo+folder.** With
+  workspace trust off (today), a repository's own `.vscode/settings.json` at
+  Code's root applies: its terminal profile and env run when a terminal opens.
+  Measured with trust on, using `e2e/code-trust-spike.sh` with the live image
+  and a marker repository:
+  - Restricted Mode keeps the checkout inert, but there is no terminal and
+    there are no tasks until the person trusts it. Trusting it applies the
+    repository's settings.
+  - Trust is inherited from the longest trusted parent, and only trusted
+    folders are stored. So once the person trusts `/workspace`, every checkout
+    under it is trusted.
+  - A checkout opened from a path outside `/workspace` stays restricted.
+  - The choice is a product decision, still pending:
+    - Restricted Mode with per-checkout trust as consent. This needs trust on
+      for every user, checkouts outside `/workspace`, and an image and AMI.
+    - W stays Code's folder, and the terminal starts in the checkout.
+  - A repo+folder walk (no-follow, inside the checkout) comes after that
+    decision.
 
 Why the push happens first: in Chromium a frame navigation is filed under
 the entry that was current when it started. The Code and Browser windows
@@ -306,7 +356,7 @@ front, because its window is shown and re-asserted.
   decides again (its `end`, its window's late focus and its `ensureOnTop`
   count). If that launch has failed meanwhile, it gives back in turn,
   provided the entry is still the one it held. So three clicks that end
-  Settings fails, Code fails, Desktop opens leave `/app/desktop`, and two
+  Settings fails, Code fails, Desktop opens leave `/app/browser`, and two
   that both fail leave the URL from before them, in either order. A close
   or Back/Forward in between ends the chain: nothing is given back over it.
 - **Settling.** UIWindow focuses a restored window 80ms after `showWindow`,
@@ -494,7 +544,13 @@ route tree (the tree of the document that wrote it).
   remount the page and destroy the shell), this lane did not take that on.
 - Back/Forward to an entry written by a document that has since been
   reloaded is a full document load, which boots the shell at that entry's
-  URL.
+  URL. Correction (3 Nov 2026, §9): measured in Chromium without Next's
+  router, Forward after a reload to an entry the old document pushed was a
+  same-document traversal of the reloaded document. Popstate focused or
+  launched the entry's app, and no document was loaded. The suite models
+  Next's `__NA` state keys, but Next's own popstate handler was not
+  exercised. Under the real Next router this may differ, so neither outcome
+  is assumed.
 
 ## 6. Sign-in return URLs
 
@@ -573,6 +629,7 @@ on `/auth/confirm` links. An absent `next` lands on `/os`.
 Sign-in returns to the exact path and query: `/app/code?…` and
 `/app/desktop?…` come back as written (`app/src/app/os/page.test.ts`, which
 also runs the return through the shell's parser and `routeLaunchContext`).
+The shell then rewrites `/app/desktop` to `/app/browser` in place (§9).
 The return is a full document load, and the boot then opens the linked app
 from the URL alone, with no click:
 
@@ -600,7 +657,7 @@ open (§5 launches it). Not changed here, because it is not a clear bug:
   computer.
 - Settings → Stop closes every window on the computer first, so this tab's
   own address bar falls back to `/os` (or the app still in front). Earlier
-  entries keep their `/app/desktop` URLs, so Back to one relaunches the
+  entries keep their `/app/browser` URLs, so Back to one relaunches the
   Browser. `session.holdAfterStop` blocks only hover warms; any window open
   releases it, a route launch included.
 - Contrast for the owner: since lane A2, Code's return-from-away check no
@@ -657,3 +714,67 @@ Still open:
 ## 8. Visual choices
 
 None. This lane changes no pixels.
+
+## 9. The Browser's address, and shared links (3 Nov 2026)
+
+The founder asked for `/app/browser`, not `/app/desktop`: the app is a
+browser, and "desktop" read as the whole OS. The app streams a full X
+session, but its only focusable app is Chromium (`FOCUS_APPS` in
+`desktop-window.js`). Its name is already "Browser" in the registry and in
+the server's `SHELL_APPS`.
+
+- **The id stays `desktop`.** It is DOM and wire plumbing:
+  `.window[data-app="desktop"]`, telemetry sites, `SHELL_APPS` and the
+  tests. Only the address changes. `routeName` (`app-link.js`) reads
+  `ALIASES` backwards, and `appUrl` and `canonicalUrl` (`app-history.js`)
+  write through it, so every URL the shell writes says `/app/browser`.
+- **Legacy links keep working.** `/app/desktop`, `/os?app=desktop` and
+  `/os?app=browser` parse to the same app. The boot rewrites them in place
+  (`replaceState`, no new entry), keeping every other query pair and the
+  hash byte for byte, as §1 does for any alias. Hosts that serve only `/os`
+  are still never rewritten.
+- **No server change.** `isShellAppId` and `safeReturnUrl` case 3 already
+  accepted both spellings, and `returnUrlFor` keeps the path through
+  sign-in. `/app/desktop` therefore returns to `/app/desktop` and is
+  rewritten after the boot.
+- **A shared link is the address bar.** There is no share or copy-link
+  control. It grants nothing: the server checks the session and the
+  computer's owner exactly as for any page load.
+- **What the "OS desktop" still means.** Wording about the computer or the
+  OS session ("Starting your desktop", the troubleshoot restart copy) is
+  not the Browser's and is unchanged.
+
+Measured in `shell/ezil/browser-route-browser-test.mjs`. That suite runs
+in Chromium with the real bundle and the app's real `constants.ts` rules.
+Its gate, its computer lookup and its sign-in are labelled fixtures, not
+EZiL ID:
+
+| Case | Result |
+|---|---|
+| Fresh `/app/browser?x=1`, signed out | `/login?returnUrl=/app/browser?x=1`; after sign-in, `/app/browser?x=1` with one Browser. Nothing is started before sign-in. |
+| The same link, already signed in; refresh | `/app/browser`, one Browser, no new entry |
+| `/app/desktop?computer=<own>&x=%41#top`, `/os?app=desktop`, `/os?app=browser&x=1` | rewritten to `/app/browser…` in place, query and hash kept |
+| Back/Forward between the Browser and Settings, and after a reload | the entry's app is focused or launched, nothing is closed, never a second Browser. Forward after a reload was a same-document traversal in Chromium (§5, "Next.js"; Next's own popstate handler not exercised). |
+| `/app/code?project=…&repo=…&path=src/main.ts` | unchanged |
+| `/app/unknown`, `/app/Browser`, `/app/browser%2fx`, `/app/desktop.`, `/app/__proto__` | 404, nothing started |
+| Another user's computer in the link (`?computer=<A's>` opened by B), signed in or after sign-in | the gate's "Couldn't open your computer"; nothing is started, and neither A's computer nor B's own is substituted. The real page is pinned by `os/page.test.ts` ("does not substitute another computer for an unowned target"). |
+| A's link, signed in as A on another device | A's Browser |
+| Forged return targets (`//evil.example/…`, `https://evil.example/…`, a backslash, `/app/unknown`) | `/computers`, `/computers`, `/computers`, `/os`; never another origin |
+
+Open, and not changed here:
+
+- **A page load at `/app/browser` (or `/app/desktop`) asks to start the
+  signed-in user's own computer with no click** (§6, "After sign-in"): one
+  request, then one retry. Opening the Browser from a shared link is
+  therefore a compute start. It is only ever the user's own computer, never
+  a second one or another user's. Whether such a load should ask first is
+  still an owner decision.
+- **A link copied from a session that picked a computer carries
+  `computer=<uuid>`** (`PAGE_KEYS`). For anyone else it lands on "Couldn't
+  open your computer… try again", which can never succeed for them. It is
+  safe, but it is not the Browser they expected. A fix belongs to
+  `app/src/app/os/page.tsx` (an explicit-click page, never a silent
+  fallback to the default computer) and is not made in this lane.
+- **The hash through sign-in** is the login page's behaviour. The browser
+  carries `#frag` to `/login`, and the fixture's form drops it. The real
+  login and callback pages decide this.

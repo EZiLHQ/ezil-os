@@ -16,6 +16,6 @@ export interface FeedbackAccess {
 export async function recordAccess(db: FeedbackDb, access: FeedbackAccess): Promise<void> {
     await db.execute(sql`
         INSERT INTO ezil_feedback_access_log (id, report_id, admin_user_id, action, created_at)
-        VALUES (${crypto.randomUUID()}, ${access.reportId}, ${access.adminUserId}, ${access.action}, ${new Date()})
+        VALUES (${crypto.randomUUID()}, ${access.reportId}, ${access.adminUserId}, ${access.action}, ${new Date().toISOString()}::timestamptz)
     `);
 }

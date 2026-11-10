@@ -80,8 +80,12 @@ export interface PlanOfferV3 {
     provider: ComputeProvider;
     vcpu: number;
     memoryGiB: number;
-    /** Hard wall-clock bound of one session. */
-    /** null = no session cap (paid plans, founder 2026-10-20); fair use still applies. */
+    /**
+     * Hard wall-clock bound of one session (null = none). Free: 1 h. Standard and Premium: 6 h (founder e713d157
+     * lifecycle, replacing the 2026-10-20 no-session-cap): at the cap the session is saved and the computer stopped
+     * through the ordinary stop (files and installed tools kept); the next open is a new session through the normal
+     * (pooled) open. It is independent of fair use and never resets monthly usage.
+     */
     sessionMaxSeconds: number | null;
     opening: OpeningSpeed;
     poolPriority: PoolPriority;
@@ -127,20 +131,20 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         sku: 'standard_monthly_v3', tier: 'standard', name: 'Standard', tagline: 'For regular work, every day.',
         priceCents: 2_000, currency: 'usd', interval: 'month', stripeLookupKey: 'ezil_standard_monthly_v3',
         size: 'std-2', provider: 'aws', vcpu: 2, memoryGiB: 8,
-        sessionMaxSeconds: null, opening: 'standard', poolPriority: 1,
+        sessionMaxSeconds: 6 * H, opening: 'standard', poolPriority: 1,
         fairUseSeconds: 40 * H, legacyFairUseSeconds: null,
         highlighted: false, badge: null, machineChoice: ['std-2'], aiCredits: { amount: 200, per: 'period' },
-        bullets: ['Your own 2 vCPU · 8 GB computer on AWS (India)', '50 GB disk for your projects', 'No session time limit'],
+        bullets: ['Your own 2 vCPU · 8 GB computer on AWS (India)', '50 GB disk for your projects', 'Sessions up to 6 hours; your files are kept'],
         storageGiB: 50,
     },
     premium_monthly_v3: {
         sku: 'premium_monthly_v3', tier: 'premium', name: 'Premium', tagline: 'For bigger projects and long sessions.',
         priceCents: 10_000, currency: 'usd', interval: 'month', stripeLookupKey: 'ezil_premium_monthly_v3',
         size: 'std-2', provider: 'aws', vcpu: 2, memoryGiB: 8,
-        sessionMaxSeconds: null, opening: 'standard', poolPriority: 2,
+        sessionMaxSeconds: 6 * H, opening: 'standard', poolPriority: 2,
         fairUseSeconds: 500 * H, legacyFairUseSeconds: null,
         highlighted: true, badge: null, machineChoice: ['std-2', 'cmp-4', 'cmp-8'], aiCredits: { amount: 1_000, per: 'period' },
-        bullets: ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)', '100 GB disk for your projects', 'No session time limit', 'Bigger sizes count more of your monthly time'],
+        bullets: ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)', '100 GB disk for your projects', 'Sessions up to 6 hours; your files are kept'],
         storageGiB: 100,
     },
 });
@@ -295,7 +299,29 @@ export interface BillingSummaryV3 {
         graceEndsAt?: string | null;
         /** Round 4 (additive): a cancel at period end, the paid period's end ("Premium ends on <date>"). */
         planEndsAt?: string | null;
+        /**
+         * Product entitlements v1 (additive, present only then): the plan was assigned by an EZiL operator. It is not a
+         * payment: no renewal, checkout, upgrade, downgrade or cancel through Stripe, and no included AI credits.
+         */
+        access?: { source: 'operator'; ref: string; endsAt: string | null; untilRevoked: boolean };
+        /**
+         * Standard trial (additive, present only for a trial that has not converted): `trialing` = $0 so far, the first
+         * charge of `amountCents` on `firstChargeAt` (= `endsAt`) unless cancelled; `ending` = cancelled, Standard until
+         * `endsAt` and no charge; `payment_pending` = the trial ended and Stripe has not collected the first charge yet
+         * (it tries about an hour after the end), so Standard waits for that payment; `payment_failed` = the first charge
+         * did not go through, so Standard access has ended (files kept) until a payment succeeds. Never a paid period.
+         */
+        trial?: { state: 'trialing' | 'ending' | 'payment_pending' | 'payment_failed'; startedAt: string | null; endsAt: string;
+            firstChargeAt: string | null; amountCents: number; currency: 'usd' };
     };
+    /**
+     * Standard trial offer (additive; only while checkout is available and the viewer is on Free). `eligible` carries
+     * the server's preview of the end if a trial started now; the exact end is quoted by `billing.quoteTrial` and
+     * disclosed before checkout. `eligible: false` names why (a trial used, an earlier paid plan, an unverified email).
+     */
+    trialOffer?: { eligible: true; sku: 'standard_monthly_v3'; endsAt: string; amountCents: number; currency: 'usd' }
+        | { eligible: false; reason: 'not_free' | 'operator_plan' | 'no_email' | 'email_unverified' | 'trial_used' | 'paid_before' }
+        | null;
     computer: {
         /** The size the next session opens with (the chosen size on Premium). */
         size: SizeCode;
@@ -380,9 +406,19 @@ export interface BillingSummaryV3 {
         enrollment: 'enrolled' | 'activating' | 'needs_ezil_id';
         /** Round 5 D1 (additive): whole credits granted but parked until enrollment; null when none. */
         waiting: { credits: number } | null;
+        /**
+         * Identity-based credits (additive; always present from this server, so a shell can tell an
+         * unavailable balance from an older server that omits the key). See `AiAccountV3`.
+         */
+        account?: AiAccountV3;
     };
-    fairUse: { status: FairUseStatus; resetsAt: string };
-    storage: { usedBytes: string; capBytes: string; state: 'ok' | 'low' | 'exhausted' | 'unavailable' };
+    /**
+     * `policy` (additive, paid compute policy v1): 'unmetered' for a paid-access Standard/Premium plan, whose computer
+     * time is recorded but never cut off, so clients show no hours left, reset or pause for it. Absent: the allowance applies.
+     */
+    fairUse: { status: FairUseStatus; resetsAt: string; policy?: 'unmetered' };
+    /** `usedBytes` is null (state `unavailable`) until a computer has been measured: never an unmeasured "0". */
+    storage: { usedBytes: string | null; capBytes: string; state: 'ok' | 'low' | 'exhausted' | 'unavailable' };
     actions: {
         checkout: boolean; topup: boolean; upgrade: boolean; downgrade: boolean; cancel: boolean; portal: boolean;
         /** Round 5 D1 (additive): the EZiL ID sign-in link for the `needs_ezil_id` CTA; null otherwise. */
@@ -397,6 +433,39 @@ export interface BillingSummaryV3 {
 }
 
 export type BillingSummaryV3Result = BillingSummaryV3 | { enabled: false };
+
+/** How a live Gateway grant is labelled. Receipt matching only labels; it never gates `totalMicro`. */
+export type AiGrantKindV3 = 'plan' | 'purchased' | 'added' | 'starter' | 'previous';
+
+/**
+ * The signed-in identity's AI credits, from the Gateway's `GET /v1/me/balance` only (never `/v1/me/limits`,
+ * which are rate and budget ceilings, not a balance). Amounts are decimal microcredit strings
+ * (1 credit = 1,000,000), exact: never rounded, never derived from the catalog.
+ * - `totalMicro`: Σ `credits_micro` of LIVE grants (unrevoked, unexpired); null when the grant list is
+ *   unreadable or does not add up to `available_micro`.
+ * - `remainingMicro`: `available_micro` (already net of holds); null = balance unavailable.
+ * - `heldMicro`: `held_micro` (credits reserved by requests in progress or being settled).
+ * - `usedMicro`: total − remaining − held, only when that identity is proven for this read (no open
+ *   request, or every open hold visible and placed while all of today's non-live grants were already
+ *   dead); else null. Settled cost on live grants; uncovered `overrun` cost is never part of it.
+ * - `planBaselineMicro`: the plan's catalog allowance per period, a label only (never a denominator).
+ * - `labelled`: false when receipts could not label the grants (no Plan/Added split is shown then).
+ * - `state`: the Gateway's balance state, or 'unavailable' when the balance could not be read.
+ * - `userId`: the user this block was read for; a shell drops a block that is not its signed-in user's.
+ */
+export interface AiAccountV3 {
+    userId: string | null;
+    state: 'ok' | 'exhausted' | 'paused_operations' | 'paused_reconciliation' | 'unavailable';
+    asOf: string;
+    totalMicro: string | null;
+    remainingMicro: string | null;
+    heldMicro: string | null;
+    usedMicro: string | null;
+    planBaselineMicro: string | null;
+    labelled: boolean;
+    /** Live grants only, earliest expiry first. */
+    grants: { kind: AiGrantKindV3; creditsMicro: string; remainingMicro: string; expiresAt: string }[];
+}
 
 export interface PublicOfferV3 {
     sku: PlanSkuV3;
@@ -429,7 +498,7 @@ export interface PublicOfferV3 {
  *  Input/output shapes otherwise as v2 (PreviewUpgradeOutput etc. with toSku widened). No overage, no selectSize. */
 export const ROUTER_V3_PROCEDURES = [
     'summary', 'createCheckout', 'createTopupCheckout', 'previewUpgrade', 'confirmUpgrade', 'scheduleDowngrade', 'cancelAtPeriodEnd',
-    'history', 'portal', 'checkoutStatus',
+    'history', 'portal', 'checkoutStatus', 'quoteTrial',
 ] as const;
 
 // ── Machine choice (Premium) ─────────────────────────────────────────────────

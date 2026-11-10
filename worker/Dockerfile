@@ -445,6 +445,10 @@ RUN set -eu; \
     { for d in /usr/local/lib/node_modules/*; do n="$(basename "$d")"; \
         case "$n" in @*) for m in "$d"/*; do [ -e "$m" ] && echo "$n/$(basename "$m")"; done ;; .*) ;; *) echo "$n" ;; esac; \
       done; } 2>/dev/null | sort -u > /etc/ezil-image-npm-global.txt
+# The workbench's static URL carries a content id of the served code-server files
+# (copilot-chat/PATCHES.md "static-id"). Re-check it after every layer that could
+# have edited them, so a stale id (an old URL for new bytes) fails the build.
+RUN /usr/local/lib/ezil/patch-copilot-chat.sh --verify /usr/lib/code-server/lib/vscode >/dev/null
 # Baked LAST so it describes the finished image: every entry under the system
 # roots (kind/size/mtime/link) plus /etc/ezil-image-id, a fingerprint of the
 # installed package set (stable across rebuilds of the same packages).

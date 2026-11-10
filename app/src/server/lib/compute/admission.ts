@@ -100,6 +100,11 @@ export function decideAdmission(input: {
     region?: RegionPlan;
     /** Type being launched; omitted/unknown counts as 8 vCPU. */
     instanceType?: string | null;
+    /**
+     * Paid compute policy v1 (`paid-compute-policy.ts`): the owner holds a verified active Standard/Premium plan, so the
+     * per-person monthly hour cap does not apply. Every other check, the fleet-wide hour cap included, still does.
+     */
+    userHoursExempt?: boolean;
 }): AdmissionDecision {
     const { config, counters } = input;
     if (!config.enabled) return { admit: false, reason: config.reason, reasons: [config.reason] };
@@ -126,7 +131,7 @@ export function decideAdmission(input: {
     if (counters.duplicates.length > 0) reasons.push('duplicate_placement');
     if ((counters.runningVcpu ?? counters.runningCount * 8) + requestedVcpu > caps.maxRunning * 2) reasons.push('max_running');
     if (counters.userOtherAwsComputers >= 1) reasons.push('user_has_aws_computer');
-    if (usage.user.weightedSeconds >= caps.userMonthlyHours * 3_600) reasons.push('user_hours_cap');
+    if (!input.userHoursExempt && usage.user.weightedSeconds >= caps.userMonthlyHours * 3_600) reasons.push('user_hours_cap');
     if (usage.global.weightedSeconds >= caps.globalMonthlyHours * 3_600) reasons.push('global_hours_cap');
     if (usage.user.egressBytes >= caps.userMonthlyEgressGb * BYTES_PER_GB) reasons.push('user_egress_cap');
     if (usage.global.egressBytes >= caps.globalMonthlyEgressGb * BYTES_PER_GB) reasons.push('global_egress_cap');
@@ -189,6 +194,8 @@ export type ExportBootRefusal = 'move_capacity' | 'region_missing';
 export interface AdmissionDeps {
     env?: Env;
     now?: () => Date;
+    /** Paid compute policy v1: resolved by the caller from billing BEFORE the admission lock; absent = not exempt. */
+    userHoursExempt?: boolean;
 }
 
 /**
@@ -201,13 +208,14 @@ export interface AdmissionDeps {
  */
 export async function precheckAdmission(
     db: PlacementExecutor,
-    input: { userId: string; computerId: string; tier?: AwsTier; env?: Env; now?: Date },
+    input: { userId: string; computerId: string; tier?: AwsTier; env?: Env; now?: Date; userHoursExempt?: boolean },
 ): Promise<AdmissionDecision> {
     const config = readAwsAdmissionConfig(input.env ?? process.env);
     if (!config.enabled) return { admit: false, reason: config.reason, reasons: [config.reason] };
     const now = input.now ?? new Date();
     const counters = await peekAdmissionCounters(db, { userId: input.userId, computerId: input.computerId, monthStart: utcMonthStart(now), now });
-    return decideAdmission({ config, counters, userId: input.userId, now, region: { kind: 'create' }, instanceType: instanceTypeForTier(input.tier ?? 'free') });
+    return decideAdmission({ config, counters, userId: input.userId, now, region: { kind: 'create' }, instanceType: instanceTypeForTier(input.tier ?? 'free'),
+        userHoursExempt: input.userHoursExempt });
 }
 
 /**
@@ -237,14 +245,15 @@ export function releaseOwnSlot(counters: AdmissionCounters, placement: Pick<Plac
  */
 export async function admissionDryRun(
     db: PlacementExecutor,
-    input: { userId: string; placement: Placement; instanceType: string; env?: Env; now?: Date },
+    input: { userId: string; placement: Placement; instanceType: string; env?: Env; now?: Date; userHoursExempt?: boolean },
 ): Promise<AdmissionDecision> {
     const config = readAwsAdmissionConfig(input.env ?? process.env);
     if (!config.enabled) return { admit: false, reason: config.reason, reasons: [config.reason] };
     const now = input.now ?? new Date();
     const counters = await peekAdmissionCounters(db, { userId: input.userId, computerId: input.placement.computerId, monthStart: utcMonthStart(now), now });
     if (input.placement.provider === 'aws-ec2' && RUNNING_CLASS_STATES.includes(input.placement.state)) releaseOwnSlot(counters, input.placement);
-    return decideAdmission({ config, counters, userId: input.userId, now, region: { kind: 'lease', region: input.placement.region }, instanceType: input.instanceType });
+    return decideAdmission({ config, counters, userId: input.userId, now, region: { kind: 'lease', region: input.placement.region }, instanceType: input.instanceType,
+        userHoursExempt: input.userHoursExempt });
 }
 
 export async function runAdmission(db: PlacementDb, request: AdmissionRequest, deps: AdmissionDeps = {}): Promise<AdmissionOutcome> {
@@ -286,7 +295,7 @@ export async function runAdmission(db: PlacementDb, request: AdmissionRequest, d
         }
         const instanceType = request.kind === 'create' ? instanceTypeForTier(request.tier)
             : request.resizeTo !== undefined ? instanceTypeForTier(request.resizeTo) : placement?.instanceType;
-        const decision = decideAdmission({ config, counters, userId: request.userId, now, region, instanceType });
+        const decision = decideAdmission({ config, counters, userId: request.userId, now, region, instanceType, userHoursExempt: deps.userHoursExempt });
         if (!decision.admit) return { admitted: false, reason: decision.reason, reasons: decision.reasons };
 
         // The only place a ticket is minted: after the decision admitted this exact request.

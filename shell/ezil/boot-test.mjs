@@ -771,8 +771,8 @@ let display_answer = 'live';  // flipped by the mutation proofs at the end
     open_desktop(window);
     const win = await until(() => $1(window, '.window[data-app="desktop"]'));
     push('the desktop window opens on the React host, on request', !!win);
-    // `app-history.js`: a click on the dock pushes `/app/desktop`.
-    push('opening it named it in the address bar', window.location.pathname === '/app/desktop', window.location.pathname);
+    // `app-history.js`: a click on the dock pushes `/app/browser`.
+    push('opening it named it in the address bar', window.location.pathname === '/app/browser', window.location.pathname);
 
     // Capture what the shell was actually tracking BEFORE the regeneration, so
     // the "did this really get destroyed" check is about the shell's own

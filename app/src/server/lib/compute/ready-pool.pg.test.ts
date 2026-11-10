@@ -68,7 +68,7 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
             CREATE TABLE ${schema}.test_users (id uuid PRIMARY KEY, deleted_at timestamptz, banned_until timestamptz);
             CREATE TABLE ${schema}.ezil_billing_size_preferences (user_id uuid PRIMARY KEY, size text);
             CREATE TABLE ${schema}.ezil_billing_grants (user_id uuid, subscription_id text, meter text, amount bigint, period_start timestamptz, period_end timestamptz);
-            CREATE TABLE ${schema}.ezil_billing_payment_issues (user_id uuid, subscription_id text, invoice_kind text, resolved_at timestamptz, issue text);
+            CREATE TABLE ${schema}.ezil_billing_payment_issues (user_id uuid, subscription_id text, invoice_kind text, resolved_at timestamptz, issue text, stripe_event_created timestamptz);
             CREATE TABLE ${schema}.ezil_billing_subscriptions (
             stripe_subscription_id text PRIMARY KEY, user_id uuid, sku text, status text,
             current_period_start timestamptz, current_period_end timestamptz);
@@ -653,9 +653,13 @@ describe.skipIf(!PG)('P8 ready pool on production Drizzle PostgreSQL', () => {
         await placement(2); await epoch(102, 2, 2);
         expect((await readPoolDemand(db, c, NOW)).activePremium).toBe(0);
     });
-    it.each(['past_due','incomplete','unpaid','canceled','trialing'])('unpaid/inactive %s never supplies a spare floor', async status => {
+    it.each(['incomplete','unpaid','canceled'])('unpaid/inactive %s never supplies a spare floor', async status => {
         await subscriber(1, 'premium_monthly_v3', status);
         expect((await readPoolDemand(db, c, NOW)).activePremium).toBe(0);
+    });
+    it.each(['past_due','trialing'])('funded %s follows paid standing rather than raw status', async status => {
+        await subscriber(1, 'premium_monthly_v3', status);
+        expect((await readPoolDemand(db, c, NOW)).activePremium).toBe(1);
     });
     it('expired, refunded, banned, deleted and payment-failed users do not count; failed upgrades preserve paid Standard', async () => {
         for (let n=1;n<=6;n++) await subscriber(n);

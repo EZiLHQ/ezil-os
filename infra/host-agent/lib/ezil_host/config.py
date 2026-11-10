@@ -41,6 +41,12 @@ DEFAULTS = {
     "shutdownRetryInitialSeconds": 1,
     "shutdownRetryMaxSeconds": 60,
     "stopWarnSeconds": 60,
+    # Storage metering (storage.py): the data volume's statvfs used bytes, posted to the app
+    # origin under the control key every storageSampleSeconds (0 = off), first after
+    # storageFirstSampleSeconds, and once on stop within storageStopBudgetSeconds.
+    "storageSampleSeconds": 900,
+    "storageFirstSampleSeconds": 60,
+    "storageStopBudgetSeconds": 5,
     "canaryConsole": False,                   # opt-in, bounded public diagnostics on ttyS0
     # Host edge (gateway contract GW-2/GW-3): cloudflared's only ingress target. It forwards
     # verified requests to the desktop at edgeUpstreamHost on the edgePorts the CF route exposes.

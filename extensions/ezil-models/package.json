@@ -39,6 +39,14 @@
     "virtualWorkspaces": true
   },
   "contributes": {
+    "chatParticipants": [
+      {
+        "id": "ezil-models.ezil",
+        "name": "ezil",
+        "fullName": "EZiL",
+        "description": "Ask without tools: a plain answer from the selected EZiL model, no file access or edits"
+      }
+    ],
     "languageModelChatProviders": [
       {
         "vendor": "ezil",
@@ -76,6 +84,12 @@
         "command": "ezil-models.showCredits",
         "title": "EZiL Models: Show AI Credits",
         "category": "EZiL Models"
+      },
+      {
+        "command": "ezil-models.compactionInfo",
+        "title": "Conversation compacted to fit the model",
+        "category": "EZiL AI",
+        "icon": "$(fold)"
       }
     ],
     "configuration": {
@@ -106,10 +120,24 @@
       }
     ],
     "configurationDefaults": {
-      "chat.defaultModel": "qwen.qwen3-coder-next",
       "chat.planAgent.defaultModel": "qwen.qwen3-coder-next",
       "chat.utilityModel": "ezil/qwen.qwen3-coder-next",
       "chat.utilitySmallModel": "ezil/qwen.qwen3-coder-next"
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "ezil-models.compactionInfo",
+          "when": "view == workbench.panel.chat.view.copilot && ezilModels.compacting",
+          "group": "navigation@1"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "ezil-models.compactionInfo",
+          "when": "ezilModels.compacting"
+        }
+      ]
     }
   },
   "scripts": {

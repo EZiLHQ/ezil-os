@@ -26,6 +26,9 @@
 //   7. Same-origin discipline — the code-preview host is a cross-origin
 //      iframe by design and is only ever assigned to `iframe.src`, never
 //      fetched by this shell.
+//   8. A project's repository (lane O2): the mint body, the relaunch re-mint,
+//      the repository title, and each refusal's copy — including the one
+//      silent EZiL ID refresh and the guard that stops it looping.
 //
 // jsdom is not a browser: no layout, no real network, no cross-origin frames.
 // This proves construction, wiring, ordering and which URL was used. It
@@ -109,6 +112,11 @@ let confirmAnswer; // Unknown until Direction A supplies an authenticated verdic
 /** What `/api/shell/code-preview-url` should answer next. */
 let codePreviewUrlMode = 'ok';
 /**
+ * Section 8: when set, answers the code-preview mint instead of the modes
+ * above. Called with the request body; returns `{ payload, status? }`.
+ */
+let codeMintAnswer = null;
+/**
  * Scripted `confirm=frame` answers, consumed one per ask before `confirmAnswer`
  * applies: `{ status, body }` is the APP ROUTE's HTTP status and its JSON body
  * (whose own `status` is the ORIGIN's, as the server reports it).
@@ -140,6 +148,11 @@ window.fetch = async (url, opts = {}) => {
     });
 
     if ( u.startsWith(ENDPOINTS.codePreviewUrl) ) {
+        if ( codeMintAnswer ) {
+            const { payload, status } = codeMintAnswer(body);
+            if ( payload?.ok === true && typeof payload.codePreviewUrl === 'string' ) mintedUrls.push(payload.codePreviewUrl);
+            return json(payload, status ?? 200);
+        }
         if ( codePreviewUrlMode === 'unavailable' ) {
             return json({ ok: false, errorCode: 'code_preview_unavailable', error: 'no port',
                 reason: 'code_preview_port_not_exposed', correlationId: 'srv_0123456789ab' });
@@ -1217,6 +1230,367 @@ await settle(4);
 
     window.removeEventListener('ezil:app-view-changed', on_view);
     await closeCode();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 8. 🔴 A PROJECT'S REPOSITORY (lane O2, 2026-10-31). `/app/code?project=&repo=`
+//    launches Code with `ctx.project`; the mint asks for that repository and
+//    the window is named after it. Refusals are their own copy, asked once;
+//    `IDENTITY_REFRESH_REQUIRED` sends the tab to the silent sign-in once per
+//    project, and a sessionStorage guard turns a second one into "Sign in
+//    again" instead of a loop.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    const P1 = { projectId: '11111111-1111-4111-8111-111111111111', repoId: '22222222-2222-4222-8222-222222222222' };
+    // Hex letters on purpose: an uppercased copy must differ (8b).
+    const P2 = { projectId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', repoId: 'fedcba98-7654-4321-8fed-cba987654321' };
+    const GUARD_KEY = 'ezil-os:code.identity-refresh';
+    const store = window.sessionStorage;
+    const codeWin = () => q('.window[data-app="code"]');
+    const closeCode = async () => { if ( codeWin() ) { await window.$(codeWin()).close(); await settle(8); } };
+    const waitFor = async (cond, ms) => { for ( let t = 0; t < ms && ! cond(); t += 50 ) await tick(50); return cond(); };
+    const mints = (from) => calls.slice(from).filter(c => c.url.startsWith(ENDPOINTS.codePreviewUrl));
+    const headTitle = (w) => w?.querySelector(':scope > .window-head .window-head-title')?.textContent;
+    const trayTitle = (w) => w?.querySelector('.dashboard-app-drawer-title')?.textContent;
+    const spinnerTitle = (w) => w?.querySelector('.ezil-app-spinner .ezil-opening-title')?.textContent ?? '';
+    const spinnerKind = (w) => w?.querySelector('.ezil-app-spinner')?.getAttribute('data-kind');
+    const frameSrc = (w) => untag(w?.querySelector('.window-app-iframe')?.getAttribute('src'));
+    /**
+     * A successful project mint: the URL opens `/workspace/projects/<repoId>`, and the answer names the repository the
+     * way the server does (`repository: {name: "<namespace>/<name>"}`), never by its remote.
+     */
+    let seq = 0;
+    const opened = (name, folderFor = (b) => b?.project?.repoId, repository = { name: `acme/${name}` }) => (b) => ({ payload: {
+        ok: true, expiresAt: Date.now() + 300_000,
+        codePreviewUrl: `https://8443-guac-u1-c1-code.ezil.org/preview-bootstrap?token=t=1,v1=ab&mint=p${++seq}&folder=/workspace/projects/${folderFor(b)}`,
+        repository,
+    } });
+    const submits = [];
+    const realSubmit = window.HTMLFormElement.prototype.submit;
+    window.HTMLFormElement.prototype.submit = function () {
+        submits.push({ action: this.getAttribute('action'), method: this.method,
+            fields: Object.fromEntries([...this.querySelectorAll('input')].map(i => [i.name, i.value])) });
+    };
+    const launch = (extra) => ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState, view: 'window', ...extra });
+
+    await closeCode();
+    store.removeItem(GUARD_KEY);
+
+    // 8a. The mint asks for the project: its two ids, nothing else (no `path`).
+    codeMintAnswer = opened('site');
+    let from = calls.length;
+    await launch({ project: { ...P1, path: 'src/main.ts' } });
+    await settle(20);
+    let w = codeWin();
+    push('8a 🔴 a launch with ctx.project mints once with { computerId, intent:"open", project:{projectId, repoId} } — no path',
+        mints(from).length === 1
+        && JSON.stringify(mints(from)[0].body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open', project: P1 }),
+        JSON.stringify(mints(from).map(m => m.body)));
+    push('8a the iframe shows the repository\'s URL (folder=…/projects/<repoId>)',
+        frameSrc(w) === mintedUrls.at(-1) && frameSrc(w)?.endsWith(`folder=/workspace/projects/${P1.repoId}`), frameSrc(w));
+    push('8a 🔴 the window is titled after the repository, head and tray, as text',
+        headTitle(w) === 'acme/site' && trayTitle(w) === 'acme/site', `${headTitle(w)} | ${trayTitle(w)}`);
+
+    // 8b. Relaunches that change nothing: the same project (another path), none, or one a link could not have produced.
+    from = calls.length;
+    for ( const extra of [{ project: P1 }, { project: { ...P1, path: 'README.md' } }, {}, { view: 'window' },
+        { project: P2.projectId }, { project: { projectId: P2.projectId.toUpperCase(), repoId: P2.repoId } },
+        { project: { projectId: P2.projectId } }] ) {
+        await launch(extra);
+    }
+    await settle(10);
+    push('8b 🔴 relaunch with the same project, none, or an invalid one re-mints nothing and keeps the title',
+        mints(from).length === 0 && headTitle(w) === 'acme/site' && codeWin() === w, `${mints(from).length} mint(s), ${headTitle(w)}`);
+
+    // 8c. A relaunch naming another project re-mints for it.
+    codeMintAnswer = opened('docs');
+    from = calls.length;
+    await launch({ project: P2 });
+    await waitFor(() => mints(from).length >= 1 && frameSrc(w) === mintedUrls.at(-1), 3000);
+    await settle(6);
+    push('8c 🔴 a relaunch with ANOTHER project re-mints exactly once, for that project, in the same window',
+        mints(from).length === 1 && JSON.stringify(mints(from)[0].body.project) === JSON.stringify(P2) && codeWin() === w
+        && frameSrc(w)?.endsWith(`/projects/${P2.repoId}`), JSON.stringify(mints(from).map(m => m.body)));
+    push('8c …and the window takes the new repository\'s name', headTitle(w) === 'acme/docs', headTitle(w));
+    await closeCode();
+
+    // 8d. Without a project the body is exactly the r9 body, and the title is the app's.
+    codeMintAnswer = null;
+    from = calls.length;
+    await launch({});
+    await settle(20);
+    push('8d no project: the body is exactly { computerId, intent:"open" } and the window is "Code"',
+        JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open' })
+        && headTitle(codeWin()) === 'Code', JSON.stringify(mints(from)[0]?.body));
+    await closeCode();
+
+    // 8d'. The title: a name wins; an EZiL Git URL still gives `<owner>/<name>`; a Cloudflare Artifacts remote (it names
+    //      the account) is never shown, even if a server sent one.
+    const ACCOUNT = '0123456789abcdef'.repeat(2);
+    for ( const [label, repository, title] of [
+        ['a name, over a URL', { name: 'universe-staging/p-1', canonicalURL: 'https://github.ezil.work/acme/x.git' }, 'universe-staging/p-1'],
+        ['an EZiL Git URL alone', { canonicalURL: 'https://github.ezil.work/acme/legacy.git' }, 'acme/legacy'],
+        ['an Artifacts URL alone', { canonicalURL: `https://${ACCOUNT}.artifacts.cloudflare.net/git/universe-staging/p-1.git` }, 'Code'],
+    ] ) {
+        codeMintAnswer = opened('t', undefined, repository);
+        await launch({ project: P1 });
+        await waitFor(() => frameSrc(codeWin())?.includes('/projects/'), 3000);
+        await settle(6);
+        w = codeWin();
+        push(`8d' ${label}: the window is "${title}"`, headTitle(w) === title && ! w.textContent.includes(ACCOUNT), headTitle(w));
+        await closeCode();
+    }
+
+    // 8e. A server that ignored the project (no folder for this repository, or a second `folder=` the bridge would
+    //     never forward) is refused, never shown.
+    for ( const [name, answer] of [
+        ['another folder', opened('site', () => 'someone-else')],
+        ['the workspace root first, the repository second', (b) => {
+            const r = opened('site')(b);
+            r.payload.codePreviewUrl = r.payload.codePreviewUrl.replace('&folder=', '&folder=/workspace&folder=');
+            return r;
+        }],
+    ] ) {
+        codeMintAnswer = answer;
+        await launch({ project: P1 });
+        await waitFor(() => spinnerKind(codeWin()) === 'failed', 3000);
+        w = codeWin();
+        push(`8e 🔴 ${name}: refused as "Couldn't open this project's repository", frame untouched`,
+            spinnerKind(w) === 'failed' && spinnerTitle(w) === "Couldn't open this project's repository" && frameSrc(w) === 'about:blank',
+            `${spinnerKind(w)} "${spinnerTitle(w)}" ${frameSrc(w)}`);
+        await closeCode();
+    }
+
+    // 8f. Refusals: their own copy, asked exactly once (never silently retried), the frame never navigated.
+    const refusals = [
+        ['403 FORBIDDEN project_not_authorized', { status: 403, payload: { error: { code: 'FORBIDDEN', message: 'project_not_authorized' } } },
+            "You don't have access to this project"],
+        ['{ok:false, errorCode:"project_not_authorized"}', { payload: { ok: false, errorCode: 'project_not_authorized' } },
+            "You don't have access to this project"],
+        ['409 repo_open_unsupported_provider', { status: 409, payload: { error: { code: 'repo_open_unsupported_provider', message: 'x' } } },
+            "Projects can't open on this computer yet"],
+        ['502 project_repo_identity_unavailable', { status: 502, payload: { error: { code: 'BAD_GATEWAY', message: 'project_repo_identity_unavailable' } } },
+            "Couldn't open this project's repository"],
+    ];
+    for ( const [name, answer, title] of refusals ) {
+        codeMintAnswer = () => answer;
+        from = calls.length;
+        await launch({ project: P1 });
+        await waitFor(() => spinnerKind(codeWin()) === 'failed', 4000);
+        await tick(2000); // past session.js RETRY_DELAY_MS (1.5 s): a silent re-ask would have landed
+        w = codeWin();
+        const asked = mints(from).length;
+        const expectAsks = /project_repo_/.test(name) ? 2 : 1; // a generic failed open keeps its one silent retry
+        push(`8f 🔴 ${name}: "${title}", asked ${expectAsks === 1 ? 'exactly once' : 'with its one retry'}, frame untouched, no sign-in`,
+            spinnerKind(w) === 'failed' && spinnerTitle(w) === title && asked === expectAsks && frameSrc(w) === 'about:blank' && submits.length === 0,
+            `${spinnerKind(w)} "${spinnerTitle(w)}" asks=${asked} src=${frameSrc(w)} submits=${submits.length}`);
+        push(`8f ${name}: the title stays the app's (no repository was opened)`, headTitle(w) === 'Code', headTitle(w));
+        await closeCode();
+    }
+
+    // 8g. IDENTITY_REFRESH_REQUIRED: the tab goes to the silent sign-in, once, coming back to this project.
+    const refresh = { status: 409, payload: { error: { code: 'CONFLICT', message: 'IDENTITY_REFRESH_REQUIRED' } } };
+    codeMintAnswer = () => refresh;
+    store.removeItem(GUARD_KEY);
+    from = calls.length;
+    await launch({ project: { ...P1, path: 'src/main.ts' } });
+    await waitFor(() => submits.length > 0, 3000);
+    await tick(2000);
+    w = codeWin();
+    const expectedReturn = `/app/code?project=${P1.projectId}&repo=${P1.repoId}&path=src/main.ts`;
+    push('8g 🔴 IDENTITY_REFRESH_REQUIRED sends the tab ONCE to GET /auth/auth0/login with prompt=none and this project\'s /app/code returnUrl',
+        submits.length === 1 && submits[0].action === '/auth/auth0/login' && submits[0].method === 'get'
+        && JSON.stringify(submits[0].fields) === JSON.stringify({ prompt: 'none', returnUrl: expectedReturn }),
+        JSON.stringify(submits));
+    push('8g …asked exactly once, the frame never navigated, the opening panel still up (not a failure) while the tab leaves',
+        mints(from).length === 1 && frameSrc(w) === 'about:blank' && spinnerKind(w) !== 'failed',
+        `asks=${mints(from).length} kind=${spinnerKind(w)}`);
+    const guard = JSON.parse(store.getItem(GUARD_KEY) ?? 'null');
+    push('8g the guard names this project', guard?.projectId === P1.projectId && guard?.repoId === P1.repoId && typeof guard?.at === 'number',
+        JSON.stringify(guard));
+    await closeCode();
+
+    // 8h. Back from the sign-in and still refused (the same tab, so the guard is there): no second trip.
+    await launch({ project: P1 });
+    await waitFor(() => spinnerKind(codeWin()) === 'failed', 4000);
+    await tick(500);
+    w = codeWin();
+    const retryBtn = w?.querySelector('.ezil-boot-retry');
+    push('8h 🔴 a second refusal for the same project does NOT leave again: "Sign in again to open this project", with Try again',
+        submits.length === 1 && spinnerTitle(w) === 'Sign in again to open this project' && !! retryBtn && retryBtn.hidden === false,
+        `submits=${submits.length} "${spinnerTitle(w)}"`);
+
+    // 8i. Try again is the person's own click: it clears the guard and may make one more silent attempt.
+    click(retryBtn);
+    await waitFor(() => submits.length > 1, 3000);
+    push('8i the person\'s Try again clears the guard and makes exactly one more silent attempt',
+        submits.length === 2 && submits[1].fields.prompt === 'none', `submits=${submits.length}`);
+    await closeCode();
+
+    // 8j. Another project is its own first time; a successful open clears the guard.
+    await launch({ project: P2 });
+    await waitFor(() => submits.length > 2, 3000);
+    push('8j another project gets its own one silent attempt',
+        submits.length === 3 && submits[2].fields.returnUrl === `/app/code?project=${P2.projectId}&repo=${P2.repoId}`, `submits=${submits.length}`);
+    await closeCode();
+    codeMintAnswer = opened('site');
+    await launch({ project: P1 });
+    await settle(20);
+    push('8j a successful project open clears the guard', store.getItem(GUARD_KEY) === null && headTitle(codeWin()) === 'acme/site',
+        String(store.getItem(GUARD_KEY)));
+    await closeCode();
+
+    // 8k. No usable sessionStorage: no proof the trip would not repeat, so it never leaves.
+    codeMintAnswer = () => refresh;
+    const realGet = window.Storage.prototype.getItem;
+    window.Storage.prototype.getItem = function () { throw new window.DOMException('blocked', 'SecurityError'); };
+    const before = submits.length;
+    await launch({ project: P1 });
+    await waitFor(() => spinnerKind(codeWin()) === 'failed', 4000);
+    w = codeWin();
+    push('8k 🔴 with sessionStorage unusable the tab never leaves; it says "Sign in again"',
+        submits.length === before && spinnerTitle(w) === 'Sign in again to open this project', `submits=${submits.length - before} "${spinnerTitle(w)}"`);
+    window.Storage.prototype.getItem = realGet;
+    await closeCode();
+
+    // 9. Per-tab folder continuity (apps/code-folder.js): an own-files tab with a record asks the mint for that
+    //    folder; a project tab never asks (r32); another user's record is never used; no record is today's body.
+    const FOLDER_KEY = 'ezil-os:code.folder.v1';
+    const record = (userId, path) => ({ [`${userId}\n${COMPUTER.id}\n\n`]: { v: 1, kind: 'folder', path, at: 1 } });
+    store.setItem(FOLDER_KEY, JSON.stringify({ v: 1, entries: record(PAYLOAD.user.id, '/workspace/sports/sports-web') }));
+    codeMintAnswer = null;
+    from = calls.length;
+    await launch({});
+    await waitFor(() => mints(from).length >= 1 && untag(codeWin()?.querySelector('.window-app-iframe')?.getAttribute('src')) === mintedUrls.at(-1), 3000);
+    await settle(6);
+    push('9a 🔴 own files with a record: the body is { computerId, intent:"open", codeFolder:{v:1, path} } and nothing else',
+        JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open', codeFolder: { v: 1, path: '/workspace/sports/sports-web' } }),
+        JSON.stringify(mints(from)[0]?.body));
+    const tagged = codeWin()?.querySelector('.window-app-iframe')?.getAttribute('src') ?? '';
+    push('9a the frame URL is the minted URL plus one 22-char ezil_mint', MINT_TAG.test(tagged) && untag(tagged) === mintedUrls.at(-1), tagged);
+    push('9a the folder is not on any URL this shell made (a link can never choose a folder)',
+        ! calls.slice(from).some(c => c.url.includes('sports-web')) && ! tagged.includes('sports-web'));
+    await closeCode();
+
+    codeMintAnswer = opened('site');
+    from = calls.length;
+    await launch({ project: P1 });
+    await settle(20);
+    push('9b 🔴 a project tab never asks for a folder, even with an own-files record in this tab (r32)',
+        JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open', project: P1 }),
+        JSON.stringify(mints(from)[0]?.body));
+    await closeCode();
+
+    store.setItem(FOLDER_KEY, JSON.stringify({ v: 1, entries: record('u-2', '/workspace/other-user') }));
+    codeMintAnswer = null;
+    from = calls.length;
+    await launch({});
+    await settle(20);
+    push('9c another user\'s record in this tab is never asked; no record is exactly today\'s body',
+        JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open' }),
+        JSON.stringify(mints(from)[0]?.body));
+    await closeCode();
+
+    // folder-url-sync: the address bar's folder (a route's `ctx.folder`) is asked over this tab's record; a project
+    // never asks, whatever the ctx carries.
+    store.setItem(FOLDER_KEY, JSON.stringify({ v: 1, entries: record(PAYLOAD.user.id, '/workspace/sports/sports-web') }));
+    codeMintAnswer = null;
+    from = calls.length;
+    await launch({ folder: '/workspace/linked site' });
+    await settle(20);
+    push('9d 🔴 a link folder is asked over the stale tab record',
+        JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open', codeFolder: { v: 1, path: '/workspace/linked site' } }),
+        JSON.stringify(mints(from)[0]?.body));
+    await closeCode();
+    codeMintAnswer = opened('site');
+    from = calls.length;
+    await launch({ project: P1, folder: '/workspace/linked' });
+    await settle(20);
+    push('9e a project never asks for a folder, even one a ctx carries',
+        JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open', project: P1 }),
+        JSON.stringify(mints(from)[0]?.body));
+    await closeCode();
+    store.removeItem(FOLDER_KEY);
+
+    // 10. Founder 547ed35a: a repository opened from its address (`/app/code?repo=<https URL>`).
+    {
+        const GH = 'https://github.com/EZiLHQ/ezil-os.git';
+        const GH2 = 'https://github.com/EZiLHQ/ezil-works.git';
+        const ID = '3d2c1b0a-9f8e-8d7c-a6b5-a4f3e2d1c0b9';
+        const ID2 = '4e3d2c1b-0a9f-8e8d-b7c6-b5a4f3e2d1c0';
+        const byUrl = (id, name) => () => ({ payload: { ok: true, expiresAt: Date.now() + 300_000,
+            codePreviewUrl: `https://8443-guac-u1-c1-code.ezil.org/preview-bootstrap?token=t=1,v1=ab&mint=u${++seq}&folder=/workspace/projects/${id}`,
+            repository: { name, id } } });
+        await closeCode();
+        codeMintAnswer = byUrl(ID, 'EZiLHQ/ezil-os');
+        let from = calls.length;
+        await launch({ project: { repoUrl: GH } });
+        await settle(20);
+        let w = codeWin();
+        push('10a 🔴 an address mints once with { computerId, intent:"open", repository:{url} } and nothing else',
+            mints(from).length === 1 && JSON.stringify(mints(from)[0].body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open', repository: { url: GH } }),
+            JSON.stringify(mints(from).map(m => m.body)));
+        push('10a the iframe opens the folder the server named for it (…/projects/<repository.id>) and the window is titled after it',
+            frameSrc(w)?.endsWith(`folder=/workspace/projects/${ID}`) && headTitle(w) === 'EZiLHQ/ezil-os', `${frameSrc(w)} | ${headTitle(w)}`);
+        // Reopening the same address (a reload, Back/Forward, a retried link) re-mints nothing; another address does.
+        from = calls.length;
+        await launch({ project: { repoUrl: GH } });
+        await settle(8);
+        push('10b 🔴 the same address again re-mints nothing (no second clone, no second window)', mints(from).length === 0 && codeWin() === w, `${mints(from).length}`);
+        codeMintAnswer = byUrl(ID2, 'EZiLHQ/ezil-works');
+        await launch({ project: { repoUrl: GH2 } });
+        await waitFor(() => mints(from).length >= 1 && frameSrc(w)?.endsWith(ID2), 3000);
+        await settle(6);
+        push('10b another address re-mints once for it, in the same window, and never keeps the previous folder',
+            mints(from).length === 1 && mints(from)[0].body.repository?.url === GH2 && frameSrc(w)?.endsWith(`/projects/${ID2}`) && codeWin() === w,
+            `${mints(from).length} ${frameSrc(w)}`);
+        await closeCode();
+        // A server answer that does not open the repository it named is refused, never shown as the person's files.
+        for ( const [name, answer] of [
+            ['no repository.id', () => ({ payload: { ok: true, expiresAt: Date.now() + 300_000, codePreviewUrl: `https://8443-guac-u1-c1-code.ezil.org/preview-bootstrap?token=t=1,v1=ab&mint=x${++seq}&folder=/workspace/projects/${ID}`, repository: { name: 'x' } } })],
+            ['another folder', byUrl(ID, 'x')().payload && (() => ({ payload: { ok: true, expiresAt: Date.now() + 300_000, codePreviewUrl: `https://8443-guac-u1-c1-code.ezil.org/preview-bootstrap?token=t=1,v1=ab&mint=x${++seq}&folder=/workspace`, repository: { name: 'x', id: ID } } }))],
+        ] ) {
+            codeMintAnswer = answer;
+            await launch({ project: { repoUrl: GH } });
+            await waitFor(() => spinnerKind(codeWin()) === 'failed', 4000);
+            w = codeWin();
+            push(`10c 🔴 ${name}: refused with the failure copy, the editor never shown`,
+                spinnerKind(w) === 'failed' && spinnerTitle(w) === "Couldn't open this project's repository" && frameSrc(w) === 'about:blank',
+                `${spinnerKind(w)} "${spinnerTitle(w)}" src=${frameSrc(w)}`);
+            await closeCode();
+        }
+        // The founder's exact message for a repository that is not there; asked once, no silent retry, no generic Code.
+        for ( const [code, words] of [['repo_not_found', "This repository doesn't exist."], ['repo_url_invalid', "This isn't a repository address Code can open"],
+            ['repo_url_unsupported', 'Open this repository from its project'], ['repo_url_not_enabled', "Code can't open repository addresses here yet"],
+            ['repo_url_unavailable', "Couldn't reach this repository"]] ) {
+            codeMintAnswer = () => ({ status: code === 'repo_not_found' ? 404 : 409, payload: { error: { code, message: 'x' } } });
+            from = calls.length;
+            const submitted = submits.length;
+            await launch({ project: { repoUrl: GH } });
+            await waitFor(() => spinnerKind(codeWin()) === 'failed', 4000);
+            await tick(2000); // past session.js RETRY_DELAY_MS: a silent re-ask would have landed
+            w = codeWin();
+            const once = code === 'repo_url_unavailable' ? mints(from).length <= 2 : mints(from).length === 1; // transient: its one retry is allowed
+            push(`10d 🔴 ${code}: "${words}", no editor, no generic Code, no sign-in round trip`,
+                spinnerKind(w) === 'failed' && spinnerTitle(w) === words && once && frameSrc(w) === 'about:blank' && submits.length === submitted,
+                `${spinnerKind(w)} "${spinnerTitle(w)}" asks=${mints(from).length} src=${frameSrc(w)} submits=${submits.length - submitted}`);
+            await closeCode();
+        }
+        // An address that is not one (a project-shaped object, an http URL) is not an address: plain Code, no repository asked.
+        codeMintAnswer = null;
+        from = calls.length;
+        await launch({ project: { repoUrl: 'http://github.com/a/b.git' } });
+        await settle(20);
+        push('10e an invalid address object opens plain Code with today\'s body', JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open' }),
+            JSON.stringify(mints(from)[0]?.body));
+        await closeCode();
+    }
+
+    codeMintAnswer = null;
+    store.removeItem(GUARD_KEY);
+    window.HTMLFormElement.prototype.submit = realSubmit;
+    push('8 nothing in this section put a token or code in a URL it requested',
+        ! calls.some(c => /egg_|eyJ/.test(c.url)));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

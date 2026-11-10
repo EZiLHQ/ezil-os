@@ -10,10 +10,12 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { createImageJobStore, newReservedImageJob, parseImageJobRow } from './aws-rebase-store';
 import { fixtureRebasePreparation, fixtureRebaseRelease, fixtureRebaseIntent } from './aws-intent.test-support';
 import { buildLifecycleWork } from './aws-intent';
-import { rebaseEnv, rebaseSetup } from './aws-rebase.test-support';
+import { rebaseEnv, rebaseSetup, releasedPoolSetup, RELEASED_POOL_HOST } from './aws-rebase.test-support';
 import { parseEnrollmentUserData } from './aws-rebase-lease';
 import { nonceHashOf } from './aws-enroll';
-import { assertNoImageReservation, type PlacementDb, type PlacementExecutor } from './placement';
+import { buildRebasePreparation } from './aws-rebase-preparation';
+import { leasePoolHost } from './ready-pool';
+import { assertNoImageReservation, leasePlacement, mintAdmissionTicket, readAdmissionCounters, withAdmission, type PlacementDb, type PlacementExecutor } from './placement';
 
 const PG = process.env.EZIL_PG_TEST_URL;
 const schema = `rebase_test_${randomUUID().replaceAll('-', '')}`;
@@ -53,8 +55,10 @@ describe.skipIf(!PG)('image reservation on disposable PostgreSQL', () => {
         await client!.unsafe(`DO $$ BEGIN CREATE ROLE anon; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
             DO $$ BEGIN CREATE ROLE authenticated; EXCEPTION WHEN duplicate_object THEN NULL; END $$;`);
         await client!.unsafe(`CREATE SCHEMA ${schema}`); created = true;
-        for (const file of ['0001_compute_placement.sql.txt', '0002_ready_pool.sql.txt', '0002_image_rebase.sql.txt'])
+        // Pool hosts as staging has them (v2 claim columns, 0008 dispatch), which the released-pool evidence read selects.
+        for (const file of ['0001_compute_placement.sql.txt', '0002_ready_pool.sql.txt', '0003_pool_hosts_v2.sql.txt', '0002_image_rebase.sql.txt'])
             await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../../docs/aws-computers/sql', file), 'utf8')));
+        await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0008_pool_dispatch.sql'), 'utf8')));
         // The real capacity-demand schema (admission counts other active demands; placement:count-demand), every constraint kept.
         await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0009_capacity_demands.sql'), 'utf8')));
         await client!.unsafe(`CREATE TABLE ${schema}.ezil_computers (id uuid, user_id uuid, deleted_at timestamptz)`);
@@ -63,7 +67,7 @@ describe.skipIf(!PG)('image reservation on disposable PostgreSQL', () => {
         await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0010_migration_restore_progress.sql'), 'utf8')));
     });
     beforeEach(async () => {
-        await client!.unsafe(`TRUNCATE ${schema}.ezil_compute_usage, ${schema}.ezil_computer_image_jobs, ${schema}.ezil_computer_placements, ${schema}.ezil_compute_migrations, ${schema}.ezil_computers, ${schema}.ezil_compute_capacity_demands`);
+        await client!.unsafe(`TRUNCATE ${schema}.ezil_compute_usage, ${schema}.ezil_computer_image_jobs, ${schema}.ezil_computer_placements, ${schema}.ezil_compute_migrations, ${schema}.ezil_computers, ${schema}.ezil_compute_capacity_demands, ${schema}.ezil_compute_pool_hosts`);
         const j = job();
         await client!.unsafe(`INSERT INTO ${schema}.ezil_computers VALUES ($1,$2,NULL)`, [j.computerId, j.ownerUserId]);
         await client!.unsafe(`INSERT INTO ${schema}.ezil_computer_placements
@@ -294,4 +298,112 @@ describe.skipIf(!PG)('image reservation on disposable PostgreSQL', () => {
         await expectMillisecondWrites();
     });
 
+    describe('DESIGN R: released warm-pool host on PostgreSQL', () => {
+        const OTHER = '99999999-9999-4999-8999-999999999999', START_JOB = '5a5a5a5a-5a5a-4a5a-8a5a-5a5a5a5a5a5a';
+        const insertPool = (row: Record<string, unknown>) => client!.unsafe(`INSERT INTO ${schema}.ezil_compute_pool_hosts
+            (id, region, zone_id, instance_id, instance_type, state, health, generation, leased_computer_id, leased_generation, lease_token,
+             leased_at, created_at, updated_at, claim_generation, claim_lease_epoch, claim_fence, claim_volume_serial,
+             lifecycle_job_id, lifecycle_digest, lifecycle_input, dispatch_status)
+            VALUES ($1, $2, $3, $4, $5, $6, 'unknown', $7, $8, $7, gen_random_uuid(), now(), now(), now(), $9, $10, $11, $12, $13, $14, $15, $16)`,
+        [row.id, row.region, row.zone_id, row.instance_id, row.instance_type, row.state, row.generation, row.leased_computer_id,
+            row.claim_generation, row.claim_lease_epoch, row.claim_fence, row.claim_volume_serial,
+            row.lifecycle_job_id, row.lifecycle_digest, row.lifecycle_input, row.dispatch_status] as never[]);
+        const releasedJob = (s: ReturnType<typeof releasedPoolSetup>) => newReservedImageJob({ ownerUserId: job().ownerUserId,
+            preparation: buildRebasePreparation({ ...prep.intent, releasedPoolHost: { poolHostId: RELEASED_POOL_HOST,
+                lifecycleDigest: s.provision().digest, releaseExecutionArn: s.releaseArn } }),
+            sourceRelease: fixtureRebaseRelease(prep.intent.sourceDeployment), targetRelease: fixtureRebaseRelease(prep.intent.deployment) });
+        const placementRow = async () => (await client!.unsafe(`SELECT image_upgrade_job_id, lifecycle_job_id, state, lease_epoch FROM ${schema}.ezil_computer_placements`))[0]!;
+        const jobCount = async () => (await client!.unsafe(`SELECT count(*)::int AS n FROM ${schema}.ezil_computer_image_jobs`))[0]!.n;
+
+        it('selects exactly the retired claim row of this allocation; every predicate is load-bearing', async () => {
+            const s = releasedPoolSetup({ db }); await insertPool(s.row);
+            expect((await store.releasedPoolHost(prep.intent.computerId)).row).toEqual({ id: RELEASED_POOL_HOST, generation: 1, region: 'ap-south-1',
+                zone_id: prep.intent.deployment.zoneId, instance_type: 'm6i.large', instance_id: prep.intent.sourceInstanceId,
+                lifecycle_job_id: s.row.lifecycle_job_id, lifecycle_digest: s.provision().digest, lifecycle_input: s.provision().input });
+            for (const [column, value] of [['state', `'leased'`], ['state', `'retiring'`], ['dispatch_status', `'started'`], ['dispatch_status', 'NULL'],
+                ['leased_computer_id', `'${OTHER}'`], ['leased_computer_id', 'NULL'], ['instance_id', `'i-99999999999999999'`], ['region', `'us-east-1'`],
+                ['zone_id', `'aps1-az2'`], ['claim_generation', '2'], ['claim_lease_epoch', '2'], ['claim_fence', `'${OTHER}'`],
+                ['claim_volume_serial', `'vol99999999999999999'`], ['lifecycle_job_id', 'NULL'], ['lifecycle_digest', 'NULL'], ['lifecycle_input', 'NULL']]) {
+                await client!.unsafe(`UPDATE ${schema}.ezil_compute_pool_hosts SET ${column} = ${value}`);
+                expect((await store.releasedPoolHost(prep.intent.computerId)).row, `${column}=${value}`).toBeNull();
+                await client!.unsafe(`DELETE FROM ${schema}.ezil_compute_pool_hosts`); await insertPool(s.row);
+            }
+            await client!.unsafe(`UPDATE ${schema}.ezil_computer_placements SET lease_epoch = 4`);
+            expect((await store.releasedPoolHost(prep.intent.computerId)).row).toBeNull();
+        });
+        it('plans and reserves through the orchestrator with the real lock and SQL', async () => {
+            const s = releasedPoolSetup({ db }); await insertPool(s.row);
+            expect((await s.request('plan')).body).toMatchObject({ eligible: true, failureCode: null });
+            expect(await jobCount()).toBe(0);
+            expect((await s.request('prepare')).status).toBe(202);
+            const j = (await store.read(s.started[0]!.name.replace('computer-', '')))!;
+            expect(JSON.parse(j.preparationDocument).releasedPoolHost).toEqual({ poolHostId: RELEASED_POOL_HOST,
+                lifecycleDigest: s.provision().digest, releaseExecutionArn: s.releaseArn });
+            expect((await placementRow()).image_upgrade_job_id).toBe(j.jobId);
+            await expectMillisecondWrites();
+        });
+        it.each([
+            ['no row', 'DELETE FROM pool'], ['row not retired', `UPDATE pool SET state = 'leased'`],
+            ['row digest changed', `UPDATE pool SET lifecycle_digest = '${'e'.repeat(64)}'`],
+            ['placement RUNNING', `UPDATE placements SET state = 'RUNNING'`],
+        ])('reserve re-reads the row under its lock: %s refuses', async (_name, statement) => {
+            const s = releasedPoolSetup({ db }); await insertPool(s.row);
+            await client!.unsafe(statement.replace('pool', `${schema}.ezil_compute_pool_hosts`).replace('placements', `${schema}.ezil_computer_placements`));
+            await expect(store.reserve(releasedJob(s), repository)).rejects.toThrow('image_job_conflict');
+            expect(await jobCount()).toBe(0); expect((await placementRow()).image_upgrade_job_id).toBeNull();
+        });
+        // A lifecycle start (STOPPED -> LEASED with its job) and a pool claim (the same lease plus a spare host) under
+        // admission's real lock and casInTx: exactly one of them or the reservation commits, never both.
+        const start = (claim: boolean) => withAdmission(db, async (tx, lock) => {
+            const now = new Date(), computerId = prep.intent.computerId, userId = job().ownerUserId;
+            await readAdmissionCounters(tx, lock, { userId, computerId, monthStart: new Date(0), now });
+            const r = await leasePlacement(tx, lock, mintAdmissionTicket(tx, lock, { computerId, userId, kind: 'lease' }), { computerId,
+                ownerUserId: userId, expected: { generation: 1, leaseEpoch: 3 }, leaseUntil: new Date(now.getTime() + 3600000),
+                fields: { lifecycleJobId: START_JOB, lifecycleDigest: 'f'.repeat(64) } });
+            if (!r.ok) throw new Error('lease_lost');
+            if (claim && !await leasePoolHost(tx, { region: 'ap-south-1', zoneId: prep.intent.deployment.zoneId, instanceType: 'm6i.large' }, computerId, 1, now))
+                throw new Error('no_spare');
+            return r;
+        });
+        const spare = async () => {
+            const at = new Date(Date.now() - 60000).toISOString();
+            await client!.unsafe(`INSERT INTO ${schema}.ezil_compute_pool_hosts (id, region, zone_id, instance_id, instance_type, state, health,
+                editor_ready_at, generation, created_at, updated_at, ready_at, enrolled_at) VALUES ($1, 'ap-south-1', $2, 'i-77777777777777777',
+                'm6i.large', 'ready', 'healthy', $3, 1, $3, $3, $3, $3)`, [OTHER, prep.intent.deployment.zoneId, at]);
+        };
+        const spareLeased = async () => (await client!.unsafe(`SELECT leased_computer_id FROM ${schema}.ezil_compute_pool_hosts WHERE id = $1`, [OTHER]))[0]!.leased_computer_id;
+        for (const claim of [false, true]) {
+            const name = claim ? 'pool claim' : 'lifecycle start';
+            it(`${name} first: the reservation refuses on the recorded job and moved epoch`, async () => {
+                const s = releasedPoolSetup({ db }); await insertPool(s.row); if (claim) await spare();
+                await start(claim);
+                await expect(store.reserve(releasedJob(s), repository)).rejects.toThrow('image_job_conflict');
+                expect(await placementRow()).toMatchObject({ image_upgrade_job_id: null, lifecycle_job_id: START_JOB, state: 'LEASED' });
+                expect(await jobCount()).toBe(0); if (claim) expect(await spareLeased()).toBe(prep.intent.computerId);
+            });
+            it(`reservation first: the ${name} refuses on the reservation and rolls back`, async () => {
+                const s = releasedPoolSetup({ db }); await insertPool(s.row); if (claim) await spare();
+                const j = await store.reserve(releasedJob(s), repository);
+                await expect(start(claim)).rejects.toThrow('image_job_conflict');
+                expect(await placementRow()).toMatchObject({ image_upgrade_job_id: j.jobId, lifecycle_job_id: null, state: 'STOPPED' });
+                if (claim) expect(await spareLeased()).toBeNull();
+            });
+            it(`concurrent ${name} and reservation: exactly one commits`, async () => {
+                for (let n = 0; n < 4; n++) {
+                    await client!.unsafe(`TRUNCATE ${schema}.ezil_compute_pool_hosts, ${schema}.ezil_computer_image_jobs`);
+                    await client!.unsafe(`UPDATE ${schema}.ezil_computer_placements SET state = 'STOPPED', lease_epoch = 3, lifecycle_job_id = NULL,
+                        lifecycle_digest = NULL, image_upgrade_job_id = NULL, lease_until = NULL`);
+                    const s = releasedPoolSetup({ db }); await insertPool(s.row); if (claim) await spare();
+                    const [reserved, started] = await Promise.allSettled([store.reserve(releasedJob(s), repository), start(claim)]);
+                    expect([reserved.status, started.status].filter(x => x === 'fulfilled')).toHaveLength(1);
+                    const loser = reserved.status === 'rejected' ? reserved : started as PromiseRejectedResult;
+                    expect(String((loser.reason as Error).message)).toBe('image_job_conflict');
+                    const p = await placementRow();
+                    expect(p.image_upgrade_job_id === null).toBe(p.lifecycle_job_id !== null);
+                    expect(await jobCount()).toBe(reserved.status === 'fulfilled' ? 1 : 0);
+                    if (claim) expect(await spareLeased()).toBe(reserved.status === 'fulfilled' ? null : prep.intent.computerId);
+                }
+            });
+        }
+    });
 });

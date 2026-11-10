@@ -2,7 +2,7 @@
 // no jsdom — it is a pure module with zero dependencies (see its own header).
 //
 // Run:  node shell/ezil/trace-test.mjs
-import { ambientCorrelationId, ambientTraceRef, beginTrace, newEventId } from './trace.js';
+import { ambientCorrelationId, ambientTraceRef, beginTrace, newEventId, feedbackPhaseSnapshot, feedbackTraceSnapshot } from './trace.js';
 
 const checks = [];
 const push = (name, pass, detail = '') => {
@@ -113,6 +113,24 @@ push('no trace is ambient before beginTrace() is called', ambientCorrelationId()
     const outerSummary = outer.end('ok');
     const outerCodes = outerSummary.phases.split(',').map((p) => p.split(':')[0]);
     push('the outer trace still records its own steps after no longer being ambient', JSON.stringify(outerCodes) === JSON.stringify(['outer-1', 'outer-2']), outerSummary.phases);
+}
+
+{
+    const trace = beginTrace('feedback'); trace.step('display'); trace.step('https://private.test');
+    const snap = feedbackPhaseSnapshot();
+    push('feedback phase snapshot retains safe phases only', snap.length === 1 && snap[0].code === 'display');
+    snap[0].code = 'changed'; snap.push({ code: 'injected', tMs: 0 });
+    push('feedback snapshot is detached and does not end the trace', feedbackPhaseSnapshot()[0].code === 'display' && ambientTraceRef() === trace);
+    trace.step('ready'); trace.end('ok');
+    push('feedback retains final phases after trace end', feedbackPhaseSnapshot().length === 2 && feedbackPhaseSnapshot()[1].code === 'ready');
+}
+
+{
+    const trace = beginTrace('desktop'); trace.step('display'); trace.end('ok');
+    const snapshot = feedbackTraceSnapshot();
+    push('completed feedback trace retains the matching request ID, app and phases',
+        ambientCorrelationId() === undefined && snapshot.id === trace.id && snapshot.app === 'desktop'
+        && snapshot.phases[0].code === 'display');
 }
 
 console.log(`\n${checks.filter((c) => c.pass).length}/${checks.length} checks passed`);

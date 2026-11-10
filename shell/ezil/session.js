@@ -419,8 +419,18 @@ const RETRY_DELAY_MS = 1_500;
  * the merged tree (38/40) and green on `main` (40/40) for exactly this reason:
  * the delay pushed the panel past the test's settle window. The retry was
  * ALWAYS wrong here; before the delay it was merely invisible.
+ *
+ * ADDED 2026-10-31 (lane O2): Code's project refusals (`apps/code.js`). Universe
+ * said no, this computer cannot open repositories, or the person must sign in
+ * again: an identical second ask gets an identical answer, and the identity
+ * one would only delay the silent sign-in.
  */
-const TERMINAL_ERROR_CODES = ['code_preview_unavailable', 'app_preview_unavailable'];
+const TERMINAL_ERROR_CODES = [
+    'code_preview_unavailable', 'app_preview_unavailable',
+    'project_not_authorized', 'identity_refresh_required', 'repo_open_unsupported_provider',
+    // A repository address that names nothing openable: retrying cannot change the answer (founder 547ed35a).
+    'repo_not_found', 'repo_url_invalid', 'repo_url_unsupported', 'repo_url_not_enabled', 'repo_url_moved', 'repo_url_empty',
+];
 
 /**
  * 🔴 THE HIBERNATION FIX, CLIENT SIDE. One implementation, three callers

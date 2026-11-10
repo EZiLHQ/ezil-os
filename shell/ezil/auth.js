@@ -4,6 +4,7 @@
 // else in the shell signs anyone out.
 
 import telemetry from './telemetry.js';
+import { clear_app_failures } from './ui/feedback/app-failures.js';
 
 /**
  * Ends the session through the app's `POST /auth/signout`, which answers with
@@ -20,6 +21,7 @@ import telemetry from './telemetry.js';
  * still attached.
  */
 export function signOut () {
+    clear_app_failures();
     telemetry.flushNow();
     const form = document.createElement('form');
     form.method = 'POST';

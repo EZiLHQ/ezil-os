@@ -2,11 +2,12 @@
 
 fixture.py renders a prd case (fixtures and the fake AWS/npm/docker tools) through
 it; assert.py first proves that a prd run named no mum resource, then checks it with
-the unchanged mum assertions. The two pins stand in for the reviewed post-P4 commit.
+the unchanged mum assertions. The two pins are the committed ezil-prd-foundation outputs.
 """
-PRD_LAUNCH_TEMPLATE = "lt-0aaaaaaaaaaaaaaaa"
-PRD_REPOSITORY = "452630323510.dkr.ecr.ap-south-1.amazonaws.com/ezil-prd-foundation-applicationimages439f25f1-milwdio3nbs6"
+PRD_LAUNCH_TEMPLATE = "lt-0b68cfb18ad22869a"
+PRD_REPOSITORY = "452630323510.dkr.ecr.ap-south-1.amazonaws.com/ezil-prd-foundation-applicationimages439f25f1-xkgzfggtz2w4"
 PRD = (
+    ("ezil-mum-foundation-applicationimages439f25f1-milwdio3nbs6", PRD_REPOSITORY.split("/", 1)[1]),
     ("ezil-mum-", "ezil-prd-"),
     ("ezil-host-mum", "ezil-host-prd"),
     ("lt-06f691fc1e4dfe3cc", PRD_LAUNCH_TEMPLATE),
@@ -15,11 +16,12 @@ PRD = (
     ('"namespace": "mum"', '"namespace": "prd"'),
 )
 MUM_TOKENS = ("ezil-mum-", "ezil-host-mum", "lt-06f691fc1e4dfe3cc", "billing-staging", "os-staging", "/root/ezil-aws-mum")
-# Pin stand-ins, applied to the copied scripts only (test-only, like the lock paths).
-PINS = (
-    ("            repository=\n", f"            repository={PRD_REPOSITORY}\n"),
-    ("            launch_template=\n", f"            launch_template={PRD_LAUNCH_TEMPLATE}\n"),
-    ('"repository": None, "launchTemplate": None,', f'"repository": "{PRD_REPOSITORY}", "launchTemplate": "{PRD_LAUNCH_TEMPLATE}",'),
+# Emptied pins for the explicitly unpinned cases, applied to the copied scripts only (test-only, like the lock paths).
+UNPIN = (
+    (f"            repository={PRD_REPOSITORY}\n", "            repository=\n"),
+    (f"            launch_template={PRD_LAUNCH_TEMPLATE}\n", "            launch_template=\n"),
+    (f'"repository": f"{{ACCOUNT}}.dkr.ecr.{{REGION}}.amazonaws.com/{PRD_REPOSITORY.split("/", 1)[1]}",\n            "launchTemplate": "{PRD_LAUNCH_TEMPLATE}",',
+     '"repository": None,\n            "launchTemplate": None,'),
 )
 
 
@@ -30,6 +32,7 @@ def to_prd(text):
 
 
 def to_mum(text):
-    for mum, prd in reversed(PRD):
+    # The specific repository pair (PRD[0]) must invert before the generic "ezil-prd-" prefix does.
+    for mum, prd in (PRD[0], *reversed(PRD[1:])):
         text = text.replace(prd, mum)
     return text

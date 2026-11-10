@@ -304,18 +304,14 @@ export interface ShellDesktopState {
     status: 'idle';
     endpoints: Partial<typeof SHELL_API_ROUTES>;
     /** UI switches (`docs/FEEDBACK-CONTROLS-CONTRACT.md` §1). Absent = all off. */
-    ui?: {
-        floatingControls: boolean;
-        feedbackScreenshots: boolean;
-        /**
-         * FEEDBACK-DIAG: this server's feedback schema accepts
-         * `diagnostics.recentEvents[].reason`/`.correlationId`. Not a switch: a
-         * capability, always `true` here. The shell sends the two keys ONLY when
-         * it reads `true`, because an older server parses `recentEvents` strictly
-         * and 400s the whole report on either key.
-         */
-        feedbackEventDiagnostics: boolean;
-    };
+    /**
+     * FEEDBACK-DIAG: this server's feedback schema accepts
+     * `diagnostics.recentEvents[].reason`/`.correlationId` (and the report bundle and app failures). The shell
+     * sends those keys ONLY when it reads the matching capability `true`, because an older server parses
+     * `recentEvents` strictly and 400s the whole report on an unexpected key. All three are gated on the
+     * feedback feature where this object is built, so they are absent unless feedback is enabled.
+     */
+    ui?: { floatingControls: boolean; feedbackScreenshots: boolean; feedbackEventDiagnostics?: boolean; feedbackReportBundle?: boolean; feedbackAppFailures?: boolean };
     /** Present only for the trusted native Mac runtime. No credentials. */
     runtime?: NativeRuntime;
 }
@@ -386,7 +382,7 @@ export function toShellDesktopState(
         status: 'idle',
         endpoints,
         ui: { floatingControls: features.floatingControls, feedbackScreenshots: features.feedbackScreenshots,
-            feedbackEventDiagnostics: true },
+            ...(features.feedback ? { feedbackEventDiagnostics: true, feedbackReportBundle: true, feedbackAppFailures: true } : {}) },
     };
 }
 

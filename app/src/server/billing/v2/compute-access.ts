@@ -6,13 +6,14 @@ import type { BillingDeps } from '../ports';
 import { freeSkuFor, planFromSubscriptions } from './catalog';
 import { planFromSubscriptions as planV3 } from '../v3/catalog';
 import { admitStart as admitStartV3, HOLD_SIZE } from '../v3/admission';
-import { deriveStanding, paidAccess } from '../v3/standing';
-import { buildSummaryV3, fairUseAllowance, usedSecondsInWindow } from '../v3/summary';
+import { deriveStanding, operatorAccessFor, paidAccess } from '../v3/standing';
+import { buildSummaryV3, fairUseAllowance, renewalGrantPending, usedSecondsInWindow } from '../v3/summary';
 import { CATALOG_V3, type PlanSkuV3, type BillingSummaryV3, type AdmitDecisionV3, type AdmitRefusalV3 } from '../v3/contract';
 import { CATALOG_V2, SESSION_MAX_SECONDS, type ComputeEpoch, type AdmitDecision, type AdmitRefusal, type BillingSummaryV2, type PlanFamily, type PlanSku, type SizeCode, type Window } from './contract';
 import { admitStart } from './rating';
 import { buildSummaryV2, summaryMeters } from './summary';
 import { epochSeconds, isoSeconds } from './time';
+import { UNMETERED_PAID_PLAN_IDS } from '../../lib/compute/paid-compute-policy';
 
 export interface ComputeBillingState {
     planSku: PlanSku | PlanSkuV3;
@@ -46,8 +47,24 @@ export interface ComputeBillingState {
     grantPending?: boolean;
 }
 
-/** Round 6 R2-3: how long after a paid period starts a missing compute grant reads as not landed yet, never as used up. */
-export const GRANT_PENDING_SECONDS = 10 * 60;
+export { GRANT_PENDING_SECONDS } from '../v3/summary';
+
+/**
+ * Paid compute policy v1 (`lib/compute/paid-compute-policy.ts`): a v3 Standard/Premium plan with paid access has no
+ * computer-hours cutoff. Paid access is one of: this period's compute grant (the paid-period receipt, as the entitlement
+ * reader's 'active' does; the Standard trial included); a renewal whose grant is still landing (grantPending, at most
+ * GRANT_PENDING_SECONDS); or the existing seven-day renewal grace (D17: no receipt for the current period, a fair-use
+ * allowance of its own). Raw unpaid, incomplete, cancelled and expired plans and a grace that has ended run as Free
+ * here, and a payment issue outside the grace refuses: they fail closed (coordinator decision under founder e713d157).
+ * The grace assumes a previously paid plan: Stripe reports `past_due` only after an earlier invoice was paid, and a
+ * first charge that fails at checkout is `incomplete` (Free). Checkout creates no trials today; before any trial is
+ * issued, the trial slice (trial-safe grants) must make grace require an earlier paid, non-trial receipt, because a
+ * trial's $0 first invoice followed by a failed charge is also `past_due` and must get no grace.
+ */
+export function paidComputeUnmeteredState(state: Pick<ComputeBillingState, 'v3' | 'planSku' | 'planActive' | 'paymentIssue' | 'provider' | 'allowanceStdSeconds' | 'grantPending'>): boolean {
+    return !!state.v3 && UNMETERED_PAID_PLAN_IDS.includes(state.planSku) && state.planActive && !state.paymentIssue
+        && state.provider === 'aws' && (state.allowanceStdSeconds > 0 || state.grantPending === true);
+}
 
 export function billingMeteringActive(config: Pick<BillingConfig, 'tabEnabled' | 'enforcementEnabled'>): boolean {
     return config.tabEnabled || config.enforcementEnabled;
@@ -55,12 +72,16 @@ export function billingMeteringActive(config: Pick<BillingConfig, 'tabEnabled' |
 
 /** The Billing tab's reads and arithmetic, without its storage/customer reads. */
 export async function loadComputeBillingState(deps: BillingDeps, userId: string, now: Date): Promise<ComputeBillingState> {
-    const [subs, userCreatedAt, planChanges] = await Promise.all([
+    const [subs, userCreatedAt, planChanges, operatorGrants] = await Promise.all([
         deps.store.subscriptionsFor(userId),
         deps.store.userCreatedAt(userId),
         deps.store.openPlanChanges(userId),
+        deps.store.operatorEntitlementsFor?.(userId) ?? [],
     ]);
-    const resolved = planV3({ subs, now, userCreatedAt });
+    // Product entitlements v1: an operator grant decides the plan only where Stripe gives no paid access (paid wins).
+    const operator = operatorGrants.length
+        ? operatorAccessFor({ subscriptions: subs, paymentIssues: await deps.store.openPaymentIssues(userId), grants: operatorGrants, now }) : null;
+    const resolved = planV3({ subs, now, userCreatedAt, operator });
     if (resolved.sku !== 'legacy') {
         const [epochs, grants, paymentIssues, sizePreference] = await Promise.all([
             deps.store.epochsFor(userId, new Date(resolved.window.start)),
@@ -69,10 +90,10 @@ export async function loadComputeBillingState(deps: BillingDeps, userId: string,
             deps.store.sizePreference(userId),
         ]);
         const summary = buildSummaryV3({ config: deps.config, now, userCreatedAt, subs, epochs, grants, planChanges,
-            paymentIssues, consent: null, storage: [], sizePreference, hasCustomer: false });
+            paymentIssues, consent: null, storage: [], sizePreference, hasCustomer: false, operatorGrants });
         // Round 4 D17: in grace the paid computer stays usable (the gate's payment refusal runs before
         // decideStart, so the state itself carries no payment issue); the Billing summary still reports it.
-        const { standing } = deriveStanding({ subscriptions: subs, paymentIssues, placementProvider: null, now });
+        const { standing } = deriveStanding({ subscriptions: subs, paymentIssues, placementProvider: null, now, operator });
         const allowance = fairUseAllowance(resolved, grants, { grace: standing === 'grace' });
         const state: ComputeBillingState = {
             planSku: resolved.sku, v3: { sku: resolved.sku, legacyFree: resolved.legacyFree },
@@ -87,10 +108,7 @@ export async function loadComputeBillingState(deps: BillingDeps, userId: string,
             freeSince: paidAccess(standing) ? null
                 : deriveStanding({ subscriptions: subs, paymentIssues, placementProvider: 'aws-ec2', now }).heldSince,
             // Grace has its own allowance (D17); a refund or revoke row is a real zero, not a grant still to come.
-            grantPending: resolved.sku !== 'free_v3' && resolved.offer.provider === 'aws' && paidAccess(standing) && standing !== 'grace'
-                && !grants.some(grant => grant.meter === 'compute_std_seconds' && grant.subscriptionId === resolved.subscriptionId)
-                && now.getTime() >= Date.parse(resolved.window.start)
-                && now.getTime() - Date.parse(resolved.window.start) < GRANT_PENDING_SECONDS * 1000,
+            grantPending: renewalGrantPending(resolved, standing, grants, now),
         };
         if (resolved.sku !== 'free_v3' && !paidAccess(standing)) {
             // D17/D18: grace over, raw unpaid or never paid (incomplete): Free now, with Free's window and limits
@@ -167,8 +185,9 @@ function decideStart(state: ComputeBillingState, computerId: string, size: SizeC
             size: size === 'free-cf' && state.provider === 'aws' ? 'std-2' : size,
             planActive: state.v3.sku === 'free_v3' || state.planActive,
             paymentIssue: state.v3.sku === 'free_v3' ? size !== 'free-cf' && state.paymentIssue : state.paymentIssue,
-            // Prorated receipts/reversals reserve the ungranted portion of the guardrail.
-            usedSeconds: state.usedStdSeconds + Math.max(0, ceiling - state.allowanceStdSeconds),
+            // Prorated receipts/reversals reserve the ungranted portion of the guardrail. Paid compute policy v1: a paid
+            // Standard/Premium start is never refused for hours (runtime is still recorded by its epoch).
+            usedSeconds: paidComputeUnmeteredState(state) ? 0 : state.usedStdSeconds + Math.max(0, ceiling - state.allowanceStdSeconds),
             runningComputers: state.openEpochs.filter(epoch => epoch.computerId !== computerId).length,
             poolHostAvailable: false, now: isoSeconds(epochSeconds(now)) });
     }
@@ -193,7 +212,10 @@ export async function openComputeEpochAtReady({ deps, userId, computerId, size, 
     try {
         const state = await loadComputeBillingState(deps, userId, readyAt);
         const decision = decideStart(state, computerId, size, readyAt);
-        // Anchor to readiness, not a preview request or a copied admission deadline.
+        // Anchor to readiness, not a preview request or a copied admission deadline. Paid compute policy v1: an unmetered
+        // paid session still stores one (readiness + the plan's whole fair use at its weight). Nothing enforces it while
+        // the plan is unmetered (the sweep skips it), but it marks the session paid-era: a later drop to Free ends it at
+        // the drop (round 6 R1-04), never back-dated to readiness + Free's hour, so the recorded runtime is kept.
         const deadlineAt = new Date(readyAt.getTime() + (decision.admit ? decision.maxRunSeconds : 0) * 1000);
         const opened = await deps.store.openEpoch({
             userId, computerId, subscriptionId: state.subscriptionId, size, readyAt, deadlineAt, overheadSeconds,
@@ -278,6 +300,7 @@ export function billingV2EntitlementReader(getDeps: () => BillingDeps = getBilli
                 // Reuse the period-isolated grant/reversal calculation used for admission.
                 status: state.paymentIssue ? 'past_due' : state.planActive && (state.provider !== 'aws' || state.allowanceStdSeconds > 0) ? 'active' : 'expired',
                 size: state.entitledSize, provider: state.provider, paymentIssue: state.paymentIssue,
+                grantPending: state.grantPending === true,
             };
         },
     };

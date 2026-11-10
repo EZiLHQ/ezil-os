@@ -208,7 +208,7 @@ export function describePlan (info) {
         const vcpu = p && SIZE_LABEL[p.current] ? Number.parseInt(SIZE_LABEL[p.current], 10) : info.machine && Number.isFinite(info.machine.vcpu) ? info.machine.vcpu : null;
         if ( onAws ) return { value: 'Plan: Free · files kept on this computer', hint: vcpu !== null && vcpu > 2
             ? "The Free plan can't open it at this size; upgrade to open it again."
-            : 'It opens on the Free plan with Free limits; upgrade for no session time limit.' };
+            : 'It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours.' };
         const size = p && Number.isFinite(p.vcpu) && Number.isFinite(p.memoryGB) ? ` · ${p.vcpu} vCPU / ${p.memoryGB} GB on Cloudflare` : '';
         return { value: `Plan: Free${size}`, hint: '' };
     }

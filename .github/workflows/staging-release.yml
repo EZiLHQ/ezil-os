@@ -1,0 +1,117 @@
+# Source caller graph only. No push/dispatch trigger; activation values remain null.
+name: AWS staging release graph
+on:
+  workflow_call:
+    inputs:
+      candidate:
+        description: 'Reviewed source/target/retained Worker/rollback pins; receipt is produced by the build'
+        type: string
+        required: true
+      public_supabase_url:
+        type: string
+        required: true
+      public_supabase_anon_key:
+        type: string
+        required: true
+      stripe_publishable_key:
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  admit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Admit exact source, checks and protected environment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_JSON: ${{ inputs.candidate }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'candidate.json').write_text(os.environ['CANDIDATE_JSON'])
+          PY
+          python3 -B deploy/aws/os-staging/release_admission.py "$RUNNER_TEMP/candidate.json" > "$RUNNER_TEMP/admission.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: os-staging-admission-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/admission.json
+          if-no-files-found: error
+  build:
+    name: Build approved staging artifact
+    needs: admit
+    # Future protected-environment approval covers the finite build window.
+    environment: staging
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      artifact_digest: ${{ steps.upload.outputs.artifact-digest }}
+      receipt_sha256: ${{ steps.seal.outputs.receipt_sha256 }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Recheck source after build-window approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_JSON: ${{ inputs.candidate }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib
+          pathlib.Path(os.environ['RUNNER_TEMP'], 'candidate.json').write_text(os.environ['CANDIDATE_JSON'])
+          PY
+          python3 -B deploy/aws/os-staging/release_admission.py "$RUNNER_TEMP/candidate.json"
+      - name: Build the immutable app/runtime pair (no AWS identity)
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ inputs.public_supabase_url }}
+          NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ inputs.public_supabase_anon_key }}
+          NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY: ${{ inputs.stripe_publishable_key }}
+        run: |
+          python3 -B deploy/aws/os-staging/public_config.py
+          tag=$(python3 -c 'import json,os; print(json.load(open(os.path.join(os.environ["RUNNER_TEMP"],"candidate.json")))["tag"])')
+          GIT_SHA="$GITHUB_SHA" bash deploy/aws/os-staging/deploy.sh build "$tag"
+      - name: Seal and display the artifact for installation review
+        id: seal
+        run: |
+          python3 -B - <<'PY'
+          import hashlib, json, os, pathlib, sys
+          sys.path.insert(0, 'deploy/aws/os-staging')
+          from staging_delivery import validate_artifacts
+          request = json.loads(pathlib.Path(os.environ['RUNNER_TEMP'], 'candidate.json').read_text())
+          directory = pathlib.Path('deploy/aws/os-staging/artifacts')
+          receipt = directory / (request['tag'] + '.source.json')
+          request['receipt_sha256'] = hashlib.sha256(receipt.read_bytes()).hexdigest()
+          image_id = validate_artifacts(directory, request)
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('receipt_sha256=' + request['receipt_sha256'] + '\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('Review before installation approval:\n```json\n' + json.dumps({'candidate': request, 'image_id': image_id}, indent=2) + '\n```\n')
+          PY
+      - uses: actions/upload-artifact@v4
+        id: upload
+        with:
+          name: os-staging-app-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: deploy/aws/os-staging/artifacts/*
+          compression-level: 0
+          if-no-files-found: error
+  deliver:
+    needs: build
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    uses: ./.github/workflows/staging-delivery.yml
+    with:
+      candidate: ${{ inputs.candidate }}
+      artifact_id: ${{ needs.build.outputs.artifact_id }}
+      artifact_run: ${{ github.run_id }}
+      artifact_digest: ${{ needs.build.outputs.artifact_digest }}
+      receipt_sha256: ${{ needs.build.outputs.receipt_sha256 }}

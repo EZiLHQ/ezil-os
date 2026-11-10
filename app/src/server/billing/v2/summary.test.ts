@@ -359,16 +359,18 @@ describe('buildSummaryV2', () => {
     it('preserves v1 storage sampling, caps and unavailable AI', () => {
         const storage = [
             { computerId: 'a', bytes: BigInt(9000000000), measuredAt: new Date(START) },
-            { computerId: 'a', bytes: BigInt(1500000000), measuredAt: NOW },
+            { computerId: 'a', bytes: BigInt(1700000000), measuredAt: NOW },
             { computerId: 'b', bytes: BigInt(100000000), measuredAt: NOW },
         ];
         const result = buildSummaryV2(compute({ storage }));
-        expect(result.storage).toEqual({ usedBytes: '1600000000', capBytes: '2000000000', state: 'low', measuredAt: '2026-10-18T12:00:00Z' });
+        // 1.8e9 bytes of the 2 GiB (2,147,483,648-byte) cap is 83.8%: low.
+        expect(result.storage).toEqual({ usedBytes: '1800000000', capBytes: '2147483648', state: 'low', measuredAt: '2026-10-18T12:00:00Z' });
         expect(result.ai).toEqual({ state: 'unavailable', trialMicro: '0', includedMicro: '0', purchasedMicro: '0', includedExpiresAt: null });
         const config = { ...input().config, largeStorageEnabled: true };
-        expect(buildSummaryV2(compute({ config, storage })).storage.capBytes).toBe('20000000000');
-        expect(buildSummaryV2(input({ config, storage })).storage.capBytes).toBe('2000000000');
-        expect(buildSummaryV2(input()).storage.measuredAt).toBeNull();
+        expect(buildSummaryV2(compute({ config, storage })).storage.capBytes).toBe('21474836480');
+        expect(buildSummaryV2(input({ config, storage })).storage.capBytes).toBe('2147483648');
+        // No sample: null and unavailable, never a measured-looking '0' of 2 GB.
+        expect(buildSummaryV2(input()).storage).toEqual({ usedBytes: null, capBytes: '2147483648', state: 'unavailable', measuredAt: null });
     });
 
     it('gates actions by family, active entitlement, customer and checkout configuration', () => {

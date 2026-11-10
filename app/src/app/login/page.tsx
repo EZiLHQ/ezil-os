@@ -1,10 +1,12 @@
 import Link from 'next/link';
 import type { Viewport } from 'next';
+import { cookies } from 'next/headers';
 
 import { auth0Enabled } from '@/server/auth/auth0';
 import { readBillingConfig } from '@/server/billing/config';
 import { RETURN_URL_PARAM, Routes, safeReturnUrl } from '@/utils/constants';
 import { LockClock } from './lock-clock';
+import { decodeLoginReturn, LOGIN_RETURN_COOKIE } from './return-cookie';
 
 /** Shown instead of the sign-in button when EZiL ID is not configured here. */
 const UNAVAILABLE = 'Sign-in is unavailable right now. Please try again later or contact contact@ezil.work.';
@@ -25,10 +27,21 @@ export const viewport: Viewport = {
 function noticeFor(error: string | string[] | undefined): string | null {
     if (error === undefined) return null;
     if (error === 'auth_callback_failed') return 'Sign-in did not finish. Please try again.';
-    if (error === 'email_unverified') return 'Verify your email address with EZiL ID first, then sign in again.';
+    if (error === 'email_unverified') {
+        return 'The email address on this EZiL ID is not verified yet. Open the verification link EZiL ID emailed you, then choose Continue with EZiL ID again. Wrong account? Sign out and use another one below.';
+    }
     if (error === 'account_conflict') return 'This email is already linked to a different EZiL ID. Contact contact@ezil.work.';
     if (error === 'auth0_disabled') return UNAVAILABLE;
     return 'We could not sign you in. Please try again.';
+}
+
+/** The destination a "Sign out and use another account" left behind, if any (see `./return-cookie`). */
+async function keptReturnUrl(): Promise<string | undefined> {
+    try {
+        return decodeLoginReturn((await cookies()).get(LOGIN_RETURN_COOKIE)?.value);
+    } catch {
+        return undefined;
+    }
 }
 
 /**
@@ -67,9 +80,10 @@ export default async function LoginPage({
 }) {
     const params = await searchParams;
     // Narrowed here, at the edge, so the value carried through EZiL ID and
-    // back to the browser can only ever be a path on this origin. See
-    // `safeReturnUrl`.
-    const returnUrl = safeReturnUrl(params[RETURN_URL_PARAM]);
+    // back to the browser (and into the sign-out form) can only ever be a path
+    // on this origin. See `safeReturnUrl`. A `returnUrl` in the link wins over
+    // one kept across a sign-out, and both are narrowed alike.
+    const returnUrl = safeReturnUrl(params[RETURN_URL_PARAM] ?? await keptReturnUrl());
     const useAuth0 = auth0Enabled();
     const notice = useAuth0 ? noticeFor(params.error) : UNAVAILABLE;
 
@@ -113,6 +127,31 @@ export default async function LoginPage({
                             Continue with EZiL ID
                         </a>
                     </div>
+                )}
+
+                {/*
+                  Leaves id.ezil.work's session, whose account Continue would otherwise
+                  pick again (a refused, unverified one included), and comes back here
+                  still headed for the same page. A plain same-origin form POST: it needs
+                  no OS session, no JavaScript, and is the document load `/auth/signout`
+                  answers with a 303. Shown with a refusal, which is when id.ezil.work's
+                  account is the problem; the plain lock screen keeps its height
+                  (e2e/login-layout.mjs, short desktop).
+                */}
+                {useAuth0 && notice && (
+                    <form method="post" action="/auth/signout" className="flex w-full flex-col items-center">
+                        <input type="hidden" name={RETURN_URL_PARAM} value={returnUrl} />
+                        <button
+                            type="submit"
+                            aria-describedby="switch-account-hint"
+                            className="mt-1 inline-flex min-h-11 max-w-full items-center justify-center rounded-md p-2 text-[0.8125rem] text-white/70 transition-colors hover:text-white"
+                        >
+                            Sign out and use another account
+                        </button>
+                        <span id="switch-account-hint" className="sr-only">
+                            Signs this browser out of EZiL ID so you can choose an account.
+                        </span>
+                    </form>
                 )}
             </section>
 

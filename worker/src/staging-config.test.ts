@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { codeShellOriginsFor } from './code-folder-bridge';
 import { appPortFor, codePortFor, portFor } from './desktop-mode';
 import { AWS_BROWSER_ROUTE_TOKEN } from './aws-origin';
+import { exactCacheEligible, resolveGatewayUrl } from './ai-proxy';
 
 interface WorkerConfig {
   name: string;
@@ -80,6 +81,14 @@ describe('staging Worker resources and routes', () => {
   it('serves the EZiL Chat AI proxy in production against the production Gateway', () => {
     expect(config.vars.SANDBOX_AI_PROXY).toBe('on');
     expect(config.vars.EZIL_AI_GATEWAY_URL).toBe('https://ai.ezil.work');
+  });
+
+  it('opts EZiL Chat into the exact response cache on staging only, through its existing Gateway URL, with no setting of its own', () => {
+    const eligible = new TextEncoder().encode(JSON.stringify({ model: 'm', stream: false, messages: [] }));
+    expect(exactCacheEligible(resolveGatewayUrl(staging.vars.EZIL_AI_GATEWAY_URL), '/v1/messages', eligible)).toBe(true);
+    expect(exactCacheEligible(resolveGatewayUrl(config.vars.EZIL_AI_GATEWAY_URL), '/v1/messages', eligible)).toBe(false);
+    expect(exactCacheEligible(resolveGatewayUrl(undefined), '/v1/messages', eligible)).toBe(false);
+    expect(readFileSync(new URL('../wrangler.toml', import.meta.url), 'utf8')).not.toMatch(/EXACT_CACHE|x-ezil-cache/i);
   });
 
   it('covers the API and every preview token without claiming a zone catch-all', () => {

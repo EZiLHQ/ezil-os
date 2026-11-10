@@ -9,8 +9,13 @@ import {
   aiProxyBaseUrl,
   chooseAiCredential,
   deriveAiProxyToken,
+  exactCacheEligible,
+  exactCacheScope,
+  AI_PROXY_COMPLETION_TIMEOUT_MS,
+  AI_PROXY_HEADERS_TIMEOUT_MS,
   handleAiProxyRequest,
   isAiProxyPath,
+  isNonStreamBody,
   matchAiRoute,
   mintAiCredentialSignature,
   parsePushedAccessToken,
@@ -281,6 +286,21 @@ describe('forwarding', () => {
     }
   });
 
+  it('relays the Gemini adapter refusal code on Messages, never its message (it names a schema keyword)', async () => {
+    const gw = mockGateway(() => Response.json({ type: 'error', error: { type: 'invalid_request_error', code: 'unsupported_gemini_request',
+      message: 'Tool input_schema keyword "pattern" is not supported by Gemini (refused, not dropped).', request_id: 'gem-refusal-1' } }, {
+      status: 400, headers: { 'x-ezil-request-id': 'gem-refusal-1' },
+    }));
+    const d = await deps({ fetch: gw.fetch });
+    const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/messages`, {
+      method: 'POST', body: '{"model":"gemini-3.8-flash"}', headers: { authorization: await proxyAuth(), 'idempotency-key': 'turn-gemini' },
+    }), d);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual({ error: { code: 'unsupported_gemini_request', request_id: 'gem-refusal-1' } });
+    expect(d.logs.at(-1)).toMatchObject({ status: 400, code: 'unsupported_gemini_request', request_id: 'gem-refusal-1' });
+    expect(JSON.stringify(d.logs)).not.toContain('pattern');
+  });
+
   it('forwards member limits once with the stored bearer, dropping all caller queries and private headers', async () => {
     const body = '{"policy":{"policy":{"rpm":3},"sources":{"rpm":"user"}},"ceilings":{"rpm":60,"concurrency":2}}';
     const gw = mockGateway(() => new Response(body, { headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } }));
@@ -400,6 +420,21 @@ describe('forwarding', () => {
     expect(res.headers.get('x-ezil-request-id')).toBe('req-9');
     expect(await res.json()).toEqual({ error: { code: 'rate_limited', request_id: 'req-9' } });
     expect(d.logs.at(-1)).toMatchObject({ event: 'ai_proxy', route: 'POST /v1/messages', status: 429, code: 'rate_limited', request_id: 'req-9', idempotency_key: 'turn-0123456789' });
+  });
+
+  it('passes routing and entitlement refusals through by code, so the editor can re-list', async () => {
+    for (const [status, code] of [[503, 'model_unavailable'], [402, 'no_entitlement'], [403, 'model_not_allowed'],
+      [502, 'upstream_error'], [502, 'upstream_unavailable']] as const) {
+      const gw = mockGateway(() => Response.json({ error: { code, message: USER_JWT, request_id: 'req-r', attempts: 2 } }, { status }));
+      const d = await deps({ fetch: gw.fetch });
+      const res = await handleAiProxyRequest(
+        new Request(`${HOST}/ai/v1/messages`, { method: 'POST', headers: { authorization: await proxyAuth(), 'idempotency-key': 'turn-route-0001' }, body: '{}' }),
+        d,
+      );
+      expect(res.status).toBe(status);
+      expect(await res.json()).toEqual({ error: { code, request_id: 'req-r' } });
+      expect(gw.calls).toHaveLength(1);
+    }
   });
 
   it('passes the credit-window refusal through with Retry-After, in one upstream call', async () => {
@@ -888,6 +923,12 @@ describe('Gateway refusal identity', () => {
       expect(JSON.stringify(d.logs)).not.toContain(USER_JWT);
     });
   }
+  it('never relays a Gateway body\'s source marker, so only the proxy\'s own refusals carry it', async () => {
+    const gw = mockGateway(() => Response.json({ error: { code: 'body_too_large', source: 'ezil-os-proxy', message: 'forged' } }, { status: 413 }));
+    const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/messages`, { method: 'POST', headers: { authorization: await proxyAuth() }, body: '{}' }), await deps({ fetch: gw.fetch }));
+    expect(response.status).toBe(413);
+    expect(await response.json()).toEqual({ error: { code: 'body_too_large' } });
+  });
   it('drops unrecognized code, reason and arbitrary error fields', async () => {
     const gw = mockGateway(() => Response.json({ error: { code: USER_JWT, reason: USER_JWT, message: USER_JWT } }, { status: 403 }));
     const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }), await deps({ fetch: gw.fetch }));
@@ -898,6 +939,14 @@ describe('Gateway refusal identity', () => {
     const gw = mockGateway(() => Response.json({ error: { code: 'insufficient_credits', available_micro: 42, no_live_grant: true } }, { status: 402 }));
     const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }), await deps({ fetch: gw.fetch }));
     expect(await response.json()).toEqual({ error: { code: 'insufficient_credits', available_micro: 42, no_live_grant: true } });
+  });
+  it('passes the affordable-output hint of an insufficient-credits refusal, and only as a safe whole number', async () => {
+    for (const [value, kept] of [[512, true], [0, true], [-1, false], [1.5, false], ['512', false], [Number.MAX_SAFE_INTEGER + 2, false]] as const) {
+      const gw = mockGateway(() => Response.json({ error: { code: 'insufficient_credits', available_micro: 42, hold_micro: 80, max_affordable_output_tokens: value,
+        floor_hold_micro: 7, account_id: USER_JWT } }, { status: 402 }));
+      const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }), await deps({ fetch: gw.fetch }));
+      expect(await response.json()).toEqual({ error: { code: 'insufficient_credits', available_micro: 42, hold_micro: 80, ...(kept ? { max_affordable_output_tokens: value } : {}) } });
+    }
   });
 });
 
@@ -939,5 +988,248 @@ describe('production timeout budgets with fake timers', () => {
       fire();
       expect((await result).message).toContain('idle timeout'); expect(cancelled).toBe(true);
     } finally { timer.mockRestore(); }
+  });
+});
+
+describe('non-stream completion deadline', () => {
+  const kimiBody = JSON.stringify({ model: 'us.moonshotai.kimi-k3', messages: [{ role: 'user', content: [{ type: 'text', text: 'q' }] }], max_tokens: 4096, stream: false });
+  const post = async (path: string, body: BodyInit) => new Request(`${HOST}${path}`, { method: 'POST', headers: { authorization: await proxyAuth(), 'content-type': 'application/json', 'idempotency-key': 'turn-0123456789' }, body });
+  /** setTimeout as a manual clock: run every timer due by `until`, in order. */
+  function fakeTimers() {
+    const timers: { at: number; ms: number; run: () => void }[] = [];
+    let now = 0;
+    const spy = spyOn(globalThis, 'setTimeout').mockImplementation(((run: () => void, ms = 0) => { timers.push({ at: now + ms, ms, run }); return timers.length; }) as typeof setTimeout);
+    const clear = spyOn(globalThis, 'clearTimeout').mockImplementation(((id: number) => { if (timers[id - 1]) timers[id - 1]!.at = Infinity; }) as typeof clearTimeout);
+    const advance = async (ms: number) => {
+      now += ms;
+      for (const timer of timers.filter(t => t.at <= now).sort((a, b) => a.at - b.at)) { timer.at = Infinity; timer.run(); }
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+    };
+    return { timers, advance, restore: () => { spy.mockRestore(); clear.mockRestore(); } };
+  }
+  function stalledGateway() {
+    let reply!: (response: Response) => void;
+    let attempts = 0;
+    let ready!: () => void;
+    const entered = new Promise<void>(resolve => { ready = resolve; });
+    const gw = mockGateway(request => { attempts++; return new Promise<Response>((resolve, reject) => {
+      reply = resolve; request.signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true }); ready();
+    }); });
+    return { gw, entered, reply: (response: Response) => reply(response), attempts: () => attempts };
+  }
+
+  it('is one value, paired with the extension, leaving the Gateway\'s cited 180 s headers deadline 20 s to answer first', () => {
+    expect(AI_PROXY_COMPLETION_TIMEOUT_MS).toBe(200_000);
+    expect(AI_PROXY_COMPLETION_TIMEOUT_MS - 180_000).toBeGreaterThanOrEqual(20_000);
+    expect(AI_PROXY_HEADERS_TIMEOUT_MS).toBe(30_000);
+  });
+  it('decides non-stream only from a JSON object body with stream exactly false; anything else keeps 30 s', () => {
+    const bytes = (text: string) => new TextEncoder().encode(text);
+    expect(isNonStreamBody(bytes(kimiBody))).toBe(true);
+    expect(isNonStreamBody(bytes('{"input":[],"stream":false,"store":false}'))).toBe(true);
+    for (const unknown of ['{}', '{"stream":true}', '{"stream":"false"}', '{"stream":0}', '{"stream":null}', '[false]', 'false', 'not json', '{"stream":false']) {
+      expect(isNonStreamBody(bytes(unknown))).toBe(false);
+    }
+    expect(isNonStreamBody(new Uint8Array([0x7b, 0xff, 0x7d]))).toBe(false);
+    expect(isNonStreamBody(undefined)).toBe(false);
+    expect(isNonStreamBody(new Uint8Array(0))).toBe(false);
+  });
+  it('a JSON reply whose headers arrive at 45 s succeeds, body bytes unchanged, one attempt', async () => {
+    const stalled = stalledGateway();
+    const d = await deps({ fetch: stalled.gw.fetch });
+    const clock = fakeTimers();
+    try {
+      const result = handleAiProxyRequest(await post('/ai/v1/messages', kimiBody), d);
+      await stalled.entered;
+      expect(clock.timers.map(t => t.ms)).toContain(200_000);
+      expect(clock.timers.map(t => t.ms)).not.toContain(30_000);
+      await clock.advance(45_000);
+      stalled.reply(new Response('{"type":"message"}', { headers: { 'content-type': 'application/json', 'x-ezil-request-id': 'kimi-1' } }));
+      const response = await result;
+      expect(response.status).toBe(200);
+      expect(await response.text()).toBe('{"type":"message"}');
+      expect(stalled.attempts()).toBe(1);
+      expect(new TextDecoder().decode(stalled.gw.calls[0]!.body)).toBe(kimiBody);
+    } finally { clock.restore(); }
+  });
+  it('no JSON headers within the bound: 504 os_completion_timeout from the proxy, no retry', async () => {
+    const stalled = stalledGateway();
+    const d = await deps({ fetch: stalled.gw.fetch });
+    const clock = fakeTimers();
+    try {
+      const result = handleAiProxyRequest(await post('/ai/v1/messages', kimiBody), d);
+      await stalled.entered;
+      await clock.advance(199_999);
+      await clock.advance(1);
+      const response = await result;
+      expect(response.status).toBe(504);
+      expect(await response.json()).toEqual({ error: { code: 'os_completion_timeout', source: 'ezil-os-proxy',
+        message: 'EZiL AI sent no complete reply within 200 seconds. It may still be charged if the model finished.' } });
+      expect(stalled.attempts()).toBe(1);
+      expect(d.logs.at(-1)).toMatchObject({ status: 504, code: 'os_completion_timeout', detail: 'completion_timeout', timeout_ms: 200_000 });
+      expect(JSON.stringify(d.logs)).not.toContain('us.moonshotai');
+    } finally { clock.restore(); }
+  });
+  for (const [label, body] of [['stream:true', JSON.stringify({ model: 'qwen', stream: true })], ['absent stream', '{"model":"x"}'], ['unparsable', 'not json']] as const) {
+    it(`a ${label} body keeps the 30 s headers deadline (504 os_ai_unavailable)`, async () => {
+      const stalled = stalledGateway();
+      const d = await deps({ fetch: stalled.gw.fetch });
+      const clock = fakeTimers();
+      try {
+        const result = handleAiProxyRequest(await post('/ai/v1/messages', body), d);
+        await stalled.entered;
+        expect(clock.timers.map(t => t.ms)).toContain(30_000);
+        expect(clock.timers.map(t => t.ms)).not.toContain(200_000);
+        await clock.advance(30_000);
+        const response = await result;
+        expect(response.status).toBe(504);
+        expect(((await response.json()) as { error: { code: string } }).error.code).toBe('os_ai_unavailable');
+        expect(stalled.attempts()).toBe(1);
+        expect(d.logs.at(-1)).toMatchObject({ status: 504, code: 'os_ai_unavailable', detail: 'headers_timeout' });
+      } finally { clock.restore(); }
+    });
+  }
+  it('a client that leaves a JSON request before the proxy deadline is logged client_disconnected, not a timeout', async () => {
+    const stalled = stalledGateway();
+    const d = await deps({ fetch: stalled.gw.fetch });
+    const clock = fakeTimers();
+    const client = new AbortController();
+    try {
+      const request = new Request(await post('/ai/v1/messages', kimiBody), { signal: client.signal });
+      const result = handleAiProxyRequest(request, d);
+      await stalled.entered;
+      await clock.advance(149_000);
+      client.abort();
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      const response = await result;
+      expect(stalled.attempts()).toBe(1);
+      // Status and code are unchanged (nobody receives this response); only the telemetry detail is precise.
+      expect(response.status).toBe(504);
+      expect(d.logs.at(-1)).toMatchObject({ status: 504, code: 'os_ai_unavailable', detail: 'client_disconnected' });
+      expect(JSON.stringify(d.logs)).not.toContain('us.moonshotai');
+    } finally { clock.restore(); }
+  });
+  it('Responses JSON uses the same deadline; overrides are injectable', async () => {
+    const stalled = stalledGateway();
+    const d = await deps({ fetch: stalled.gw.fetch, completionTimeoutMs: 20, headersTimeoutMs: 5_000 });
+    const response = await (async () => {
+      const result = handleAiProxyRequest(await post('/ai/v1/responses', JSON.stringify({ model: 'x', input: [], stream: false, store: false })), d);
+      await stalled.entered;
+      return result;
+    })();
+    expect(response.status).toBe(504);
+    expect(((await response.json()) as { error: { code: string } }).error.code).toBe('os_completion_timeout');
+  });
+});
+
+describe('exact response cache opt-in (Gateway docs/RESPONSE-CACHE.md): staging Gateway only, no setting', () => {
+  const STAGING = 'https://ai-staging.ezil.work';
+  const enc = (value: unknown) => new TextEncoder().encode(typeof value === 'string' ? value : JSON.stringify(value));
+  const kimi = { model: 'us.moonshotai.kimi-k3', max_tokens: 64, stream: false, messages: [{ role: 'user', content: [{ type: 'text', text: 'q' }] }] };
+  const tool = { name: 'read_file', input_schema: { type: 'object' } };
+
+  it('is eligible only on the staging Gateway, for Messages JSON with stream false and no tools', () => {
+    expect(exactCacheEligible(STAGING, '/v1/messages', enc(kimi))).toBe(true);
+    expect(exactCacheEligible(STAGING, '/v1/messages', enc({ ...kimi, tools: [] }))).toBe(true);
+    // Production (also the default), and anything that is not exactly the staging origin: off.
+    for (const origin of ['https://ai.ezil.work', 'https://ai-staging.ezil.work/', 'https://AI-STAGING.ezil.work', 'http://ai-staging.ezil.work',
+      'https://ai-staging.ezil.work.evil.example', 'http://localhost:8787', '']) {
+      expect(exactCacheEligible(origin, '/v1/messages', enc(kimi))).toBe(false);
+    }
+    for (const body of [{ ...kimi, stream: true }, { ...kimi, stream: undefined }, { ...kimi, stream: 'false' }, { ...kimi, stream: 0 },
+      { ...kimi, tools: [tool] }, { ...kimi, tools: {} }, { ...kimi, tools: null }]) {
+      expect(exactCacheEligible(STAGING, '/v1/messages', enc(body))).toBe(false);
+    }
+    // The Gateway ignores the opt-in on Responses: never sent there.
+    expect(exactCacheEligible(STAGING, '/v1/responses', enc({ model: 'gpt-6-sol', input: 'q', stream: false }))).toBe(false);
+    for (const raw of ['', 'not json', '[]', 'null', '{"stream":false']) {
+      expect(exactCacheEligible(STAGING, '/v1/messages', enc(raw))).toBe(false);
+    }
+    // Decoded exactly as isNonStreamBody decodes it (a leading BOM is UTF-8's, not JSON's): the two never disagree.
+    expect(exactCacheEligible(STAGING, '/v1/messages', enc('﻿{"stream":false}'))).toBe(isNonStreamBody(enc('﻿{"stream":false}')));
+    expect(exactCacheEligible(STAGING, '/v1/messages', undefined)).toBe(false);
+  });
+
+  it('scopes by a versioned HMAC of the computer, never the id itself, within the Gateway grammar', async () => {
+    const scope = await exactCacheScope(SECRET, SANDBOX);
+    expect(scope).toMatch(/^os-[0-9a-f]{32}$/);
+    expect(scope).toMatch(/^[A-Za-z0-9._:-]{1,128}$/);
+    expect(scope).not.toContain(SANDBOX);
+    expect(scope).not.toContain(SANDBOX.split('-')[1]!);
+    expect(await exactCacheScope(SECRET, SANDBOX)).toBe(scope);
+    expect(await exactCacheScope(SECRET, SANDBOX.toUpperCase())).toBe(scope); // hostnames are case-insensitive
+    expect(await exactCacheScope(SECRET, `${SANDBOX}x`)).not.toBe(scope);
+    expect(await exactCacheScope(`${SECRET}x`, SANDBOX)).not.toBe(scope);
+    // Not the proxy token: a different HMAC context.
+    expect(scope.slice(3)).not.toBe((await deriveAiProxyToken(SECRET, SANDBOX, NONCE)).slice(0, 32));
+  });
+
+  async function send(body: unknown, opts: { gatewayUrl?: string; path?: string; extra?: Record<string, string>;
+    respond?: () => Response } = {}) {
+    const gw = mockGateway(opts.respond ?? (() => new Response('{"id":"msg_1"}', { status: 200,
+      headers: { 'content-type': 'application/json', 'x-ezil-cache': 'HIT', 'x-ezil-request-id': 'req-c' } })));
+    const d = await deps({ fetch: gw.fetch, gatewayUrl: opts.gatewayUrl ?? STAGING });
+    const raw = JSON.stringify(body);
+    const res = await handleAiProxyRequest(new Request(`${HOST}${opts.path ?? '/ai/v1/messages'}`, { method: 'POST',
+      headers: { authorization: await proxyAuth(), 'content-type': 'application/json', 'idempotency-key': 'turn-1', ...opts.extra }, body: raw }), d);
+    return { res, call: gw.calls[0]!, logs: d.logs, raw };
+  }
+  const forged = { 'x-ezil-cache': 'exact', 'x-ezil-cache-scope': 'client-chosen', 'x-ezil-cache-anything': 'x' };
+
+  it('opts an eligible call in with the computer scope; client values are dropped; body and auth unchanged; HIT passed back', async () => {
+    const { res, call, logs, raw } = await send(kimi, { extra: forged });
+    expect(call.url).toBe(`${STAGING}/v1/messages`);
+    // Exactly the existing allow-list plus the two server-set cache headers, with the stored member bearer.
+    expect(call.headers).toEqual({ authorization: `Bearer ${USER_JWT}`, 'content-type': 'application/json', 'idempotency-key': 'turn-1',
+      'x-ezil-cache': 'exact', 'x-ezil-cache-scope': await exactCacheScope(SECRET, SANDBOX) });
+    expect(call.body).toEqual(new TextEncoder().encode(raw));
+    expect(res.status).toBe(200);
+    expect(res.headers.get('x-ezil-cache')).toBe('HIT');
+    expect(await res.text()).toBe('{"id":"msg_1"}');
+    expect(logs.at(-1)).toMatchObject({ status: 200, request_id: 'req-c', cache: 'HIT' });
+    expect(JSON.stringify(logs)).not.toContain(SANDBOX);
+  });
+
+  it('passes MISS back, and never an untrusted value', async () => {
+    const miss = await send(kimi, { respond: () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json', 'x-ezil-cache': 'MISS' } }) });
+    expect(miss.res.headers.get('x-ezil-cache')).toBe('MISS');
+    await miss.res.text();
+    expect(miss.logs.at(-1)!.cache).toBe('MISS');
+    for (const value of ['hit', 'FORCED', 'HIT, MISS', '']) {
+      const odd = await send(kimi, { respond: () => new Response('{}', { status: 200, headers: { 'content-type': 'application/json', 'x-ezil-cache': value } }) });
+      expect(odd.res.headers.get('x-ezil-cache')).toBeNull();
+      await odd.res.text();
+      expect(odd.logs.at(-1)!.cache).toBeNull();
+    }
+  });
+
+  it('sends nothing for tool turns, streams, Responses, production or an unknown Gateway, and never passes a cache header back', async () => {
+    const cases: Array<[unknown, { gatewayUrl?: string; path?: string }]> = [
+      [{ ...kimi, tools: [tool] }, {}],
+      [{ ...kimi, stream: true }, {}],
+      [{ model: 'gpt-6-sol', input: 'q', stream: false }, { path: '/ai/v1/responses' }],
+      [kimi, { gatewayUrl: 'https://ai.ezil.work' }],
+      [kimi, { gatewayUrl: 'https://ai-staging.ezil.work.evil.example' }],
+    ];
+    for (const [body, opts] of cases) {
+      const { res, call, logs, raw } = await send(body, { ...opts, extra: forged });
+      expect(Object.keys(call.headers).filter((k) => k.startsWith('x-ezil-cache'))).toEqual([]);
+      expect(call.body).toEqual(new TextEncoder().encode(raw));
+      expect(res.headers.get('x-ezil-cache')).toBeNull(); // the mock Gateway said HIT: not ours to pass on
+      await res.text();
+      expect('cache' in logs.at(-1)!).toBe(false);
+    }
+  });
+
+  it('a Gateway error on an opted-in call is answered exactly as without the opt-in, never masked as a cache result', async () => {
+    const respond = () => Response.json({ error: { code: 'insufficient_credits', reason: 'balance' } }, { status: 402 });
+    const opted = await send(kimi, { respond });
+    const plain = await send(kimi, { respond, gatewayUrl: 'https://ai.ezil.work' });
+    expect(opted.call.headers['x-ezil-cache']).toBe('exact');
+    expect(plain.call.headers['x-ezil-cache']).toBeUndefined();
+    expect(opted.res.status).toBe(402);
+    expect(opted.res.headers.get('x-ezil-cache')).toBeNull();
+    expect(await opted.res.json()).toEqual(await plain.res.json());
+    expect(plain.res.status).toBe(402);
   });
 });

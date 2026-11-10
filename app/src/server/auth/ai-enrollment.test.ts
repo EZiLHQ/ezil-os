@@ -48,7 +48,7 @@ type Query = { statement: string; parameters: unknown[]; role: string; at: numbe
 let allowed: unknown;
 let enrollment: unknown;
 let receipts: Map<string, OutboxInsert>;
-let kicks: string[][];
+let kicks: unknown[][];
 let effects: { kind: string; at: number }[];
 let sockets: FakeSocket[];
 let clients: FakeClient[];
@@ -91,7 +91,7 @@ class FakeClient {
     private inTransaction = false;
     private pendingEnrollment = false;
     private pendingReceipt: OutboxInsert | undefined;
-    private pendingKick: string[] | undefined;
+    private pendingKick: unknown[] | undefined;
     private connection: Promise<FakeSocket> | undefined;
     constructor(readonly options: ClientOptions) {}
     private rollback() {

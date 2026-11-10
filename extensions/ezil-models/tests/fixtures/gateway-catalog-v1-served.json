@@ -1,0 +1,773 @@
+{
+ "member_no_paywall": {
+  "object": "list",
+  "contract": "ezil.gateway.models.v1",
+  "catalog_ttl_seconds": 10,
+  "killswitch": false,
+  "pause": null,
+  "data": [
+   {
+    "id": "claude-haiku-5-5",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "claude-haiku-5-5",
+    "enabled": true,
+    "upstream_model": "claude-haiku-5-5",
+    "max_input_tokens": 100000,
+    "max_output_tokens": 32000,
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    }
+   },
+   {
+    "id": "claude-sonnet-5-5",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "claude-sonnet-5-5",
+    "enabled": true,
+    "upstream_model": "claude-sonnet-5-5",
+    "max_input_tokens": 1000000,
+    "max_output_tokens": 64000,
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    },
+    "name": "Claude Sonnet 5.5"
+   },
+   {
+    "id": "ezil-code",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "ezil-code",
+    "enabled": true,
+    "upstream_model": "gpt-6-sol",
+    "max_input_tokens": 16384,
+    "max_output_tokens": 4096,
+    "protocols": [
+     "openai-responses"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    }
+   },
+   {
+    "id": "ezil-fast",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "ezil-fast",
+    "enabled": true,
+    "upstream_model": "gpt-6-luna",
+    "max_input_tokens": 32768,
+    "max_output_tokens": 8192,
+    "protocols": [
+     "openai-responses"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    }
+   },
+   {
+    "id": "qwen.qwen3-coder-next",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "qwen.qwen3-coder-next",
+    "enabled": true,
+    "upstream_model": "qwen.qwen3-coder-next",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 16384,
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    },
+    "name": "Qwen3 Coder Next"
+   },
+   {
+    "id": "us.moonshotai.kimi-k3",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "us.moonshotai.kimi-k3",
+    "enabled": true,
+    "upstream_model": "us.moonshotai.kimi-k3",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 16384,
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": false
+    },
+    "name": "Kimi K3"
+   }
+  ]
+ },
+ "member_paywall_no_plan": {
+  "object": "list",
+  "contract": "ezil.gateway.models.v1",
+  "catalog_ttl_seconds": 10,
+  "killswitch": false,
+  "pause": null,
+  "data": [
+   {
+    "id": "claude-haiku-5-5",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "claude-haiku-5-5",
+    "enabled": true,
+    "upstream_model": "claude-haiku-5-5",
+    "max_input_tokens": 100000,
+    "max_output_tokens": 32000,
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "unavailable",
+     "reasons": [
+      "entitlement_required"
+     ]
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    }
+   },
+   {
+    "id": "claude-sonnet-5-5",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "claude-sonnet-5-5",
+    "enabled": true,
+    "upstream_model": "claude-sonnet-5-5",
+    "max_input_tokens": 1000000,
+    "max_output_tokens": 64000,
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "unavailable",
+     "reasons": [
+      "entitlement_required"
+     ]
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    },
+    "name": "Claude Sonnet 5.5"
+   },
+   {
+    "id": "ezil-code",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "ezil-code",
+    "enabled": true,
+    "upstream_model": "gpt-6-sol",
+    "max_input_tokens": 16384,
+    "max_output_tokens": 4096,
+    "protocols": [
+     "openai-responses"
+    ],
+    "availability": {
+     "state": "unavailable",
+     "reasons": [
+      "entitlement_required"
+     ]
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    }
+   },
+   {
+    "id": "ezil-fast",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "ezil-fast",
+    "enabled": true,
+    "upstream_model": "gpt-6-luna",
+    "max_input_tokens": 32768,
+    "max_output_tokens": 8192,
+    "protocols": [
+     "openai-responses"
+    ],
+    "availability": {
+     "state": "unavailable",
+     "reasons": [
+      "entitlement_required"
+     ]
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    }
+   },
+   {
+    "id": "qwen.qwen3-coder-next",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "qwen.qwen3-coder-next",
+    "enabled": true,
+    "upstream_model": "qwen.qwen3-coder-next",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 16384,
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "unavailable",
+     "reasons": [
+      "entitlement_required"
+     ]
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    },
+    "name": "Qwen3 Coder Next"
+   },
+   {
+    "id": "us.moonshotai.kimi-k3",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "us.moonshotai.kimi-k3",
+    "enabled": true,
+    "upstream_model": "us.moonshotai.kimi-k3",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 16384,
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "unavailable",
+     "reasons": [
+      "entitlement_required"
+     ]
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": false
+    },
+    "name": "Kimi K3"
+   }
+  ]
+ },
+ "member_paywall_with_plan": {
+  "object": "list",
+  "contract": "ezil.gateway.models.v1",
+  "catalog_ttl_seconds": 10,
+  "killswitch": false,
+  "pause": null,
+  "data": [
+   {
+    "id": "claude-haiku-5-5",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "claude-haiku-5-5",
+    "enabled": true,
+    "upstream_model": "claude-haiku-5-5",
+    "max_input_tokens": 100000,
+    "max_output_tokens": 32000,
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    }
+   },
+   {
+    "id": "claude-sonnet-5-5",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "claude-sonnet-5-5",
+    "enabled": true,
+    "upstream_model": "claude-sonnet-5-5",
+    "max_input_tokens": 1000000,
+    "max_output_tokens": 64000,
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    },
+    "name": "Claude Sonnet 5.5"
+   },
+   {
+    "id": "ezil-code",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "ezil-code",
+    "enabled": true,
+    "upstream_model": "gpt-6-sol",
+    "max_input_tokens": 16384,
+    "max_output_tokens": 4096,
+    "protocols": [
+     "openai-responses"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    }
+   },
+   {
+    "id": "ezil-fast",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "ezil-fast",
+    "enabled": true,
+    "upstream_model": "gpt-6-luna",
+    "max_input_tokens": 32768,
+    "max_output_tokens": 8192,
+    "protocols": [
+     "openai-responses"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    }
+   },
+   {
+    "id": "qwen.qwen3-coder-next",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "qwen.qwen3-coder-next",
+    "enabled": true,
+    "upstream_model": "qwen.qwen3-coder-next",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 16384,
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    },
+    "name": "Qwen3 Coder Next"
+   },
+   {
+    "id": "us.moonshotai.kimi-k3",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "us.moonshotai.kimi-k3",
+    "enabled": true,
+    "upstream_model": "us.moonshotai.kimi-k3",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 16384,
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": false
+    },
+    "name": "Kimi K3"
+   }
+  ]
+ },
+ "operator": {
+  "object": "list",
+  "contract": "ezil.gateway.models.v1",
+  "catalog_ttl_seconds": 10,
+  "killswitch": false,
+  "pause": null,
+  "data": [
+   {
+    "id": "claude-haiku-5-5",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "claude-haiku-5-5",
+    "enabled": true,
+    "upstream_model": "claude-haiku-5-5",
+    "max_input_tokens": 100000,
+    "max_output_tokens": 32000,
+    "pricing": {
+     "markup_bp": 12500,
+     "pricing_id": 6,
+     "inr_per_usd": 1,
+     "deployment_type": "GlobalStandard",
+     "paise_per_credit": 10,
+     "input_usd_micro_per_mtok": 110000,
+     "output_usd_micro_per_mtok": 550000,
+     "cache_write_usd_micro_per_mtok": 137500,
+     "cached_input_usd_micro_per_mtok": 11000
+    },
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    }
+   },
+   {
+    "id": "claude-sonnet-5-5",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "claude-sonnet-5-5",
+    "enabled": true,
+    "upstream_model": "claude-sonnet-5-5",
+    "max_input_tokens": 1000000,
+    "max_output_tokens": 64000,
+    "pricing": {
+     "markup_bp": 12500,
+     "pricing_id": 5,
+     "inr_per_usd": 1,
+     "deployment_type": "GlobalStandard",
+     "paise_per_credit": 10,
+     "input_usd_micro_per_mtok": 2200000,
+     "output_usd_micro_per_mtok": 11000000,
+     "cache_write_usd_micro_per_mtok": 2750000,
+     "cached_input_usd_micro_per_mtok": 110000
+    },
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    },
+    "name": "Claude Sonnet 5.5"
+   },
+   {
+    "id": "ezil-code",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "ezil-code",
+    "enabled": true,
+    "upstream_model": "gpt-6-sol",
+    "max_input_tokens": 16384,
+    "max_output_tokens": 4096,
+    "pricing": {
+     "markup_bp": 12500,
+     "pricing_id": 3,
+     "inr_per_usd": 1,
+     "deployment_type": "GlobalStandard",
+     "paise_per_credit": 10,
+     "input_usd_micro_per_mtok": 2000000,
+     "output_usd_micro_per_mtok": 10000000,
+     "cache_write_usd_micro_per_mtok": 2500000,
+     "cached_input_usd_micro_per_mtok": 200000
+    },
+    "protocols": [
+     "openai-responses"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    }
+   },
+   {
+    "id": "ezil-fast",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "ezil-fast",
+    "enabled": true,
+    "upstream_model": "gpt-6-luna",
+    "max_input_tokens": 32768,
+    "max_output_tokens": 8192,
+    "pricing": {
+     "markup_bp": 12500,
+     "pricing_id": 4,
+     "inr_per_usd": 1,
+     "deployment_type": "GlobalStandard",
+     "paise_per_credit": 10,
+     "input_usd_micro_per_mtok": 100000,
+     "output_usd_micro_per_mtok": 500000,
+     "cache_write_usd_micro_per_mtok": 125000,
+     "cached_input_usd_micro_per_mtok": 10000
+    },
+    "protocols": [
+     "openai-responses"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    }
+   },
+   {
+    "id": "qwen.qwen3-coder-next",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "qwen.qwen3-coder-next",
+    "enabled": true,
+    "upstream_model": "qwen.qwen3-coder-next",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 16384,
+    "pricing": {
+     "markup_bp": 12500,
+     "pricing_id": 8,
+     "inr_per_usd": 1,
+     "deployment_type": "GlobalStandard",
+     "paise_per_credit": 10,
+     "input_usd_micro_per_mtok": 500000,
+     "output_usd_micro_per_mtok": 1200000,
+     "cache_write_usd_micro_per_mtok": 625000,
+     "cached_input_usd_micro_per_mtok": 500000
+    },
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    },
+    "name": "Qwen3 Coder Next"
+   },
+   {
+    "id": "us.moonshotai.kimi-k3",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "us.moonshotai.kimi-k3",
+    "enabled": true,
+    "upstream_model": "us.moonshotai.kimi-k3",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 16384,
+    "pricing": {
+     "markup_bp": 12500,
+     "pricing_id": 7,
+     "inr_per_usd": 1,
+     "deployment_type": "GlobalStandard",
+     "paise_per_credit": 10,
+     "input_usd_micro_per_mtok": 500000,
+     "output_usd_micro_per_mtok": 1200000,
+     "cache_write_usd_micro_per_mtok": 625000,
+     "cached_input_usd_micro_per_mtok": 500000
+    },
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": false
+    },
+    "name": "Kimi K3"
+   }
+  ]
+ },
+ "member_allowed_models_qwen_only": {
+  "object": "list",
+  "contract": "ezil.gateway.models.v1",
+  "catalog_ttl_seconds": 10,
+  "killswitch": false,
+  "pause": null,
+  "data": [
+   {
+    "id": "claude-haiku-5-5",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "claude-haiku-5-5",
+    "enabled": true,
+    "upstream_model": "claude-haiku-5-5",
+    "max_input_tokens": 100000,
+    "max_output_tokens": 32000,
+    "protocols": [],
+    "availability": {
+     "state": "unavailable",
+     "reasons": [
+      "not_allowed_for_caller"
+     ]
+    }
+   },
+   {
+    "id": "claude-sonnet-5-5",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "claude-sonnet-5-5",
+    "enabled": true,
+    "upstream_model": "claude-sonnet-5-5",
+    "max_input_tokens": 1000000,
+    "max_output_tokens": 64000,
+    "protocols": [],
+    "availability": {
+     "state": "unavailable",
+     "reasons": [
+      "not_allowed_for_caller"
+     ]
+    }
+   },
+   {
+    "id": "ezil-code",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "ezil-code",
+    "enabled": true,
+    "upstream_model": "gpt-6-sol",
+    "max_input_tokens": 16384,
+    "max_output_tokens": 4096,
+    "protocols": [],
+    "availability": {
+     "state": "unavailable",
+     "reasons": [
+      "not_allowed_for_caller"
+     ]
+    }
+   },
+   {
+    "id": "ezil-fast",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "ezil-fast",
+    "enabled": true,
+    "upstream_model": "gpt-6-luna",
+    "max_input_tokens": 32768,
+    "max_output_tokens": 8192,
+    "protocols": [],
+    "availability": {
+     "state": "unavailable",
+     "reasons": [
+      "not_allowed_for_caller"
+     ]
+    }
+   },
+   {
+    "id": "qwen.qwen3-coder-next",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "qwen.qwen3-coder-next",
+    "enabled": true,
+    "upstream_model": "qwen.qwen3-coder-next",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 16384,
+    "protocols": [
+     "anthropic-messages"
+    ],
+    "availability": {
+     "state": "available",
+     "reasons": []
+    },
+    "capabilities": {
+     "tool_calling": true,
+     "image_input": false,
+     "streaming": true
+    },
+    "name": "Qwen3 Coder Next"
+   },
+   {
+    "id": "us.moonshotai.kimi-k3",
+    "object": "model",
+    "owned_by": "ezil",
+    "alias": "us.moonshotai.kimi-k3",
+    "enabled": true,
+    "upstream_model": "us.moonshotai.kimi-k3",
+    "max_input_tokens": 200000,
+    "max_output_tokens": 16384,
+    "protocols": [],
+    "availability": {
+     "state": "unavailable",
+     "reasons": [
+      "not_allowed_for_caller"
+     ]
+    }
+   }
+  ]
+ }
+}

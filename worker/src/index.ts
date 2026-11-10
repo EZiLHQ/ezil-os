@@ -35,6 +35,16 @@ import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, fai
  *          bytes, by lines, and per-line; EVERY line is run through
  *          `sanitizeErrorMessage` before it leaves. Kill switch
  *          `EZIL_NEKO_LOGS=off`. See `handleNekoLogs` / `./neko-logs.ts`)
+ *   POST   /sandbox/:name/repo-open → { ok, folder, head?, status }
+ *          (v2-signed only. Clones, or fetches only, one project repository
+ *          (Cloudflare Artifacts, or EZiL Git) into
+ *          `<workspace root>/projects/<repositoryId>/repository` of a RUNNING
+ *          computer, the folder Code opens being `<repositoryId>`;
+ *          the Git token reaches git only through its environment, as a
+ *          Bearer header or an env-fed Basic credential helper, and only for
+ *          a fetch into a private repository, never the person's, within the
+ *          caller's `timeoutMs`. An empty repository opens as an empty clone
+ *          (`created`, no head). See `handleRepoOpen` / `./repo-open.ts`)
  *   DELETE /sandbox/:name          → { ok, sandboxName, terminated, stopped, outcome,
  *                                     wasRunning, runningAfter, mode }
  *          (HMAC-gated with the SAME token envelope as `/sandbox/preview` —
@@ -69,7 +79,7 @@ import { awsCodeServerAnswers, awsRelayRefresh, awsScreenDesktop, ensureAwsDeskt
 // Not exported from here: workerd treats every named export of the entry module as a handler.
 import { recoverableStalePreview } from './stale-preview';
 // Per-tab Code folder continuity: the lexical plan, the restored-folder compose and the URL guard (no filesystem).
-import { codeFolderAnswer, fitsCodeFolderUrl, settleCodeFolder, CODE_FOLDER_UNMOUNTED_ROOT, type CodeFolderSettlement } from './code-folder';
+import { codeFolderAnswer, fitsCodeFolderUrl, settleCodeFolder, type CodeFolderSettlement } from './code-folder';
 import { codeShellOriginsFor } from './code-folder-bridge';
 import { awsCodeFolderResolver, cloudflareCodeFolderResolver } from './code-folder-resolve';
 import { TERMINAL_WORK_PROBE_COMMAND, terminalKeepAliveFromProbe } from './terminal-keepalive';
@@ -607,6 +617,27 @@ import {
 } from './observability';
 import { parseRequestedScreen, formatNekoScreen, fitScreenRequest } from './screen-modes';
 import {
+  parseRepoOpenRequest,
+  repoOpenRemotesFor,
+  repoOpenStatus,
+  ownSessionExec,
+  REPO_OPEN_MAX_BODY_BYTES,
+  REPO_OPEN_UNMOUNTED_ROOT,
+  type RepoOpenAnswer,
+  type RepoOpenRequest,
+  type RepoOpenRoot,
+} from './repo-open';
+import {
+  parseRepoGrantRequest,
+  repoGrantStatus,
+  repoGrantSubject,
+  repoGrantWhenRunning,
+  repoOpenThenGrant,
+  REPO_GRANT_MAX_BODY_BYTES,
+  type RepoGrantAnswer,
+  type RepoGrantRequest,
+} from './repo-grant';
+import {
   aiProxyBaseUrl,
   aiProxyDisabled,
   chooseAiCredential,
@@ -788,7 +819,13 @@ const PUBLIC_ERROR_CODES = [
   'provider_not_routable', 'relay_auth_not_configured', 'relay_bad_request', 'relay_busy',
   'relay_login_failed', 'relay_logout_failed', 'relay_metadata_invalid', 'relay_negotiation_busy',
   'relay_refresh_failed', 'relay_refresh_unconfirmed', 'relay_runtime_changed',
-  'relay_runtime_not_running', 'relay_timeout', 'relay_unavailable', 'reopen_failed', 'request_too_large',
+  'relay_runtime_not_running', 'relay_timeout', 'relay_unavailable', 'reopen_failed',
+  'repo_grant_conflict', 'repo_grant_failed', 'repo_grant_not_open', 'repo_grant_unsupported_remote',
+  'repo_open_auth_failed', 'repo_open_busy', 'repo_open_failed', 'repo_open_folder_conflict',
+  'repo_open_git_failed', 'repo_open_git_missing', 'repo_open_invalid_request', 'repo_open_not_found',
+  'repo_open_ref_not_found', 'repo_open_timeout', 'repo_open_token_expired', 'repo_open_unreachable',
+  'repo_open_unsupported_provider', 'repo_open_workspace_not_ready', 'repo_open_workspace_unavailable',
+  'request_too_large',
   'restart_already_in_progress', 'restart_disabled', 'restart_not_supported_for_mode',
   'restart_not_supported_for_mode:guacamole', 'restart_not_supported_for_mode:neko', 'runtime_not_running',
   'runtime_running', 'sandbox_runtime_blocked', 'screen_bad_request', 'screen_login_failed_no_token',
@@ -958,6 +995,10 @@ interface EzilWorkspacePersistRpc {
     explicitMode: DesktopMode | undefined,
     fallbackMode: DesktopMode,
   ): Promise<RestartReport & { url?: string; appPreviewUrl?: string | null; codePreviewUrl?: string | null }>;
+  /** `POST /sandbox/:name/repo-open` (`./repo-open.ts`). A running computer only; never starts one. */
+  repoOpen(request: RepoOpenRequest, root: RepoOpenRoot, grantSubject?: string): Promise<RepoOpenAnswer>;
+  /** `POST /sandbox/:name/repo-grant` (`./repo-grant.ts`): refresh push access only. A running computer only. */
+  repoGrant(request: RepoGrantRequest, root: RepoOpenRoot, subject: string): Promise<RepoGrantAnswer>;
 }
 
 /** Open (or create) the Sandbox DO for an id with consistent options. */
@@ -2683,6 +2724,31 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       return this.ctx.container!.getTcpPort(port).fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
     });
   }
+  /**
+   * `POST /sandbox/:name/repo-open`: clone or fetch one repository into this
+   * computer's workspace (`./repo-open.ts`). Checked running under the runtime
+   * lock, like `runningContainerFetch`, because an `exec` on a stopped
+   * computer would cold-start it; the git work itself runs outside the lock,
+   * in a shell session of its own (`ownSessionExec`), so a slow clone holds up
+   * neither viewer traffic nor the probes in the default session.
+   */
+  async repoOpen(request: RepoOpenRequest, root: RepoOpenRoot, grantSubject?: string): Promise<RepoOpenAnswer> {
+    // An EZiL Git open with a scope also installs push access for `grantSubject` (`./repo-grant.ts`).
+    return repoOpenThenGrant(this.repoOpenDeps(), request, root, grantSubject);
+  }
+  /** `POST /sandbox/:name/repo-grant`: rewrite this repository's /run grant only; never fetches or touches the folder. */
+  async repoGrant(request: RepoGrantRequest, root: RepoOpenRoot, subject: string): Promise<RepoGrantAnswer> {
+    return repoGrantWhenRunning(this.repoOpenDeps(), request, root, subject);
+  }
+  private repoOpenDeps() {
+    return {
+      running: () => this.withRuntimeMutation(async () =>
+        this.containerIsRunning() && !(await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY))),
+      touch: () => this.renewActivityTimeout(),
+      exec: ownSessionExec(this),
+    };
+  }
+
   override async fetch(request: Request): Promise<Response> {
     // Set only by the authenticated Code bridge. The HTTP entrypoint carries
     // WebSocket responses intact; a DO RPC cannot serialize a WebSocket.
@@ -5100,7 +5166,7 @@ async function handlePreview(
     // else the container's own fallback root) and walked in the container with no symlink followed
     // (`./code-folder-resolve.ts`, e1cd418a: one exec, the whole resolve bounded, a code back, never a path).
     // Only `restored` adds a folder; any other outcome opens today's default.
-    const codeFolderRoot = workspace.mounted && workspace.mountPath ? workspace.mountPath : CODE_FOLDER_UNMOUNTED_ROOT;
+    const codeFolderRoot = workspace.mounted && workspace.mountPath ? workspace.mountPath : REPO_OPEN_UNMOUNTED_ROOT;
     const codeFolder: CodeFolderSettlement = await settleCodeFolder(body.codeFolder, codeFolderRoot,
       cloudflareCodeFolderResolver((command, options) => sandbox.exec(command, options), codeFolderRoot));
     let codePreviewUrl = await buildBridgeUrl(codePreviewExpose, codePreviewFolderParams(workspace, codeFolder.folder));
@@ -5314,6 +5380,104 @@ async function handleRestart(env: Env, url: URL, sandboxName: string, requestedM
       500,
     );
   }
+}
+
+/**
+ * The workspace root repositories are opened under: the root `/sandbox/preview`
+ * hands code-server as `folder=` (`codePreviewFolderParams`), resolved from the
+ * same settings `ensureWorkspaceMount` reads, without mounting or hydrating
+ * anything. A store-backed root must already be hydrated in the container
+ * (checked there); with no store configured it is code-server's own default.
+ * Null when the store is misconfigured, which `/sandbox/preview` refuses too.
+ */
+function repoOpenRoot(env: Env): RepoOpenRoot | null {
+  const store = resolveWorkspaceStore(env);
+  if (!store.ok) return null;
+  const config = resolveWorkspaceMountConfig(env);
+  if (store.kind === 's3') {
+    return { path: config?.mountPath ?? (env.SANDBOX_WORKSPACE_MOUNT_PATH?.trim() || DEFAULT_WORKSPACE_MOUNT_PATH), requireHydrated: true };
+  }
+  if (!config) return { path: REPO_OPEN_UNMOUNTED_ROOT, requireHydrated: false };
+  return { path: config.mountPath, requireHydrated: config.mode === 'r2-binding' };
+}
+
+/**
+ * POST /sandbox/:name/repo-open — see `./repo-open.ts` for the contract.
+ *
+ * v2 ONLY. The body carries a git credential, and a v1 token binds no
+ * sandbox, body or route (any fresh v1 token authorizes every route for every
+ * sandbox), so a v1-signed open is refused outright with `hmac_v2_required`,
+ * as `/internal/aws/tunnels` does. `preauthorizeV2` (top of `fetch`) has
+ * already verified the signature over these exact body bytes and that the
+ * claims name THIS sandbox. Cloudflare computers only: an AWS computer's
+ * container is not reachable from here.
+ *
+ * The caller (the OS server) calls this only after `/sandbox/preview` has
+ * answered for the computer, so the workspace is hydrated and the desktop up;
+ * a stopped computer is refused (409 `runtime_not_running`), never started.
+ * Neither the token nor anything git printed is in the response or the logs.
+ */
+async function handleRepoOpen(request: Request, env: Env, sandboxName: string): Promise<Response> {
+  const v2 = verifiedV2Claims.get(request);
+  if (!v2) {
+    const error = request.headers.get(PREVIEW_TOKEN_V2_HEADER) !== null ? 'hmac_v2_unverified' : 'hmac_v2_required';
+    return json({ ok: false, error }, 401);
+  }
+  if (v2.provider !== 'cloudflare') {
+    return json({ ok: false, error: 'repo_open_unsupported_provider' }, repoOpenStatus('repo_open_unsupported_provider'));
+  }
+  const read = await readProjectFilesBody(request, REPO_OPEN_MAX_BODY_BYTES);
+  if (!read.ok) return read.response;
+  // os-staging also accepts git-qa.ezil.work (ordinary Builder-created projects, repo-open.ts `repoOpenRemotesFor`).
+  const parsed = parseRepoOpenRequest(read.body, Date.now(), repoOpenRemotesFor(env));
+  if (!parsed.ok) return json({ ok: false, error: parsed.error }, repoOpenStatus(parsed.error));
+  const root = repoOpenRoot(env);
+  if (!root) {
+    return json({ ok: false, error: 'repo_open_workspace_unavailable' }, repoOpenStatus('repo_open_workspace_unavailable'));
+  }
+  let answer: RepoOpenAnswer;
+  try {
+    // The subject binds this computer's push access for the repository to the v2 claims' user (`./repo-grant.ts`).
+    answer = await openSandbox(env, sandboxName).repoOpen(parsed.request, root, await repoGrantSubject(v2.userId));
+  } catch {
+    answer = { ok: false, error: 'repo_open_failed' };
+  }
+  if (!answer.ok) return json({ ok: false, error: answer.error }, repoOpenStatus(answer.error));
+  return json({ ok: true, folder: answer.folder, head: answer.head, status: answer.status });
+}
+
+/**
+ * POST /sandbox/:name/repo-grant — refresh push access for a repository an open placed (`./repo-grant.ts`,
+ * docs/contracts/os-builder-project-open-v1.md §7). v2 ONLY, like repo-open (the body carries a Git grant);
+ * Cloudflare computers only; a stopped computer is refused, never started. It rewrites the computer's /run
+ * grant and nothing else: no fetch, no clone, nothing in the person's folder but its fixed credential-helper
+ * lines. Answers `{ ok, expiresAt }`; neither the grant nor anything the script printed is in it or the logs.
+ */
+async function handleRepoGrant(request: Request, env: Env, sandboxName: string): Promise<Response> {
+  const v2 = verifiedV2Claims.get(request);
+  if (!v2) {
+    const error = request.headers.get(PREVIEW_TOKEN_V2_HEADER) !== null ? 'hmac_v2_unverified' : 'hmac_v2_required';
+    return json({ ok: false, error }, 401);
+  }
+  if (v2.provider !== 'cloudflare') {
+    return json({ ok: false, error: 'repo_open_unsupported_provider' }, repoOpenStatus('repo_open_unsupported_provider'));
+  }
+  const read = await readProjectFilesBody(request, REPO_GRANT_MAX_BODY_BYTES);
+  if (!read.ok) return read.response;
+  const parsed = parseRepoGrantRequest(read.body, Date.now(), repoOpenRemotesFor(env));
+  if (!parsed.ok) return json({ ok: false, error: parsed.error }, repoGrantStatus(parsed.error));
+  const root = repoOpenRoot(env);
+  if (!root) {
+    return json({ ok: false, error: 'repo_open_workspace_unavailable' }, repoOpenStatus('repo_open_workspace_unavailable'));
+  }
+  let answer: RepoGrantAnswer;
+  try {
+    answer = await openSandbox(env, sandboxName).repoGrant(parsed.request, root, await repoGrantSubject(v2.userId));
+  } catch {
+    answer = { ok: false, error: 'repo_grant_failed' };
+  }
+  if (!answer.ok) return json({ ok: false, error: answer.error }, repoGrantStatus(answer.error));
+  return json({ ok: true, expiresAt: answer.expiresAt });
 }
 
 /**
@@ -7749,6 +7913,19 @@ export default {
         return json({ ok: false, error: 'twen_disabled' }, 404);
       }
       return handleTwen(request, env, decodeURIComponent(twenMatch[1]));
+    }
+
+    const repoOpenMatch = path.match(/^\/sandbox\/([^/]+)\/repo-open$/);
+    if (method === 'POST' && repoOpenMatch) {
+      // Clone or fetch one project repository into a running computer's
+      // workspace. v2-signed only; see `handleRepoOpen` / `./repo-open.ts`.
+      return handleRepoOpen(request, env, decodeURIComponent(repoOpenMatch[1]));
+    }
+
+    const repoGrantMatch = path.match(/^\/sandbox\/([^/]+)\/repo-grant$/);
+    if (method === 'POST' && repoGrantMatch) {
+      // Refresh push access for a repository repo-open placed. v2-signed only; see `handleRepoGrant` / `./repo-grant.ts`.
+      return handleRepoGrant(request, env, decodeURIComponent(repoGrantMatch[1]));
     }
 
     const browserMatch = path.match(/^\/sandbox\/([^/]+)\/browser\/([a-z_]+)$/);

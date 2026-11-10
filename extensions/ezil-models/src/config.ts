@@ -91,6 +91,8 @@ export type ResolvedModel = {
     provider: ResolvedProvider;
     model: string;
     gatewayProtocol?: GatewayProtocol;
+    /** Set only from a Gateway catalog row advertising capabilities.prompt_cache; config never sets it. */
+    gatewayPromptCache?: true;
     family: string;
     version: string;
     tooltip?: string;
@@ -116,7 +118,8 @@ export type ResolvedConfig = {
     secrets: string[];
     /**
      * One line per provider that was skipped because a `{env:}` / `{file:}` reference could not be resolved
-     * (names the variable or path, never a value). Its models are not served; every other provider is.
+     * (names the variable or path, never a value; it starts with `providers.`): its models are not served, every
+     * other provider is. Also one line per served model setting that is not applied (`models[i].…`/`defaults.…`).
      */
     warnings: string[];
     /** Schema problems in individual providers/models. Those entries are dropped; the rest of the file is served. */
@@ -399,6 +402,10 @@ export function resolveModelsConfig(raw: unknown, options: LoadOptions = {}): Re
             // validated (so every problem shows up in one pass) but counted, not served.
             if (problems.length) { errors.push(...problems); return; }
             if (outcome.problems.length || outcome.unresolved.length) { outcome.omittedModels += 1; return; }
+            // Served, but a requested setting is not applied: say so instead of overriding it silently.
+            if (merged.stream === true && resolved.stream === false) {
+                warnings.push(`${'stream' in entry ? where : 'defaults'}.stream is ignored for ${merged.model}: EZiL AI cannot settle its streams exactly, so its replies arrive complete (stream: false)`);
+            }
             models.push(resolved);
         });
         if (models.length && !models.some(model => model.default)) models[0]!.default = true;

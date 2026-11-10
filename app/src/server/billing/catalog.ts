@@ -11,12 +11,17 @@ export const CATALOG_VERSION = 1;
 export const MANAGED_PAYMENTS_TAX_CODE = 'txcd_10103000';
 
 const HOUR = 3600;
-const GB = BigInt(1_000_000_000);
+/**
+ * Storage is binary: a "GB" in plan copy is a GiB (1024³ bytes), the unit of every v3 disk,
+ * so "2 GB" here and a 50 GB disk are the same unit (docs/billing/CONTRACT.md §3.2). Until
+ * 2026-11-01 these caps were decimal (2,000,000,000 bytes): the GiB figure only ever grants more.
+ */
+const GIB = BigInt(1024) ** BigInt(3);
 
 export const FREE_PLAN = {
     sku: 'free_v1',
     workspaceSeconds: 8 * HOUR,
-    storageBytes: BigInt(2) * GB,
+    storageBytes: BigInt(2) * GIB,
     /** One-time AI trial per verified identity, in USD micro-units (provider cost). */
     aiTrialMicro: BigInt(500_000),
 } as const;
@@ -32,7 +37,7 @@ export const PRO_PLAN = {
      * persistence engine supports it (gate G-STOR). Until then
      * `storageCapBytes()` keeps Pro at the Free cap.
      */
-    storageBytes: BigInt(20) * GB,
+    storageBytes: BigInt(20) * GIB,
     aiIncludedMicro: BigInt(3_000_000),
 } as const;
 

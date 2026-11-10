@@ -23,15 +23,16 @@ PREVIOUS = {"PreviousDesktopImageDigest", "PreviousDesktopImageId"}
 ALLOWED = BASE_ALLOWED | PREVIOUS
 # Operator namespaces (common.sh use_namespace keeps the same table; tests compare them).
 # mum (billing staging) is the default. prd (production) pins its foundation's ECR
-# repository and launch template only by a reviewed commit after its foundation stack
-# exists (README "Production namespace prd"); until then every prd command refuses.
+# repository and launch template (the ezil-prd-foundation outputs) by a reviewed commit
+# (README "Production namespace prd"); an empty pin makes every prd command refuse.
 PROFILES = {
     "mum": {"secret": "ezil-os/billing-staging/app", "origin": "https://os-staging.ezil.work",
             "repository": f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/ezil-mum-foundation-applicationimages439f25f1-milwdio3nbs6",
             "launchTemplate": "lt-06f691fc1e4dfe3cc", "appSecretLock": "/root/ezil-aws-mum/locks/app-secret.lock",
             "deployEnvironment": "aws-pilot", "poolLifecycle": True, "rebase": True, "appCaller": None},
     "prd": {"secret": "ezil-os/production/app", "origin": "https://os-prod.ezil.work",
-            "repository": None, "launchTemplate": None, "appSecretLock": "/root/ezil-aws-prd/locks/app-secret.lock",
+            "repository": f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/ezil-prd-foundation-applicationimages439f25f1-xkgzfggtz2w4",
+            "launchTemplate": "lt-0b68cfb18ad22869a", "appSecretLock": "/root/ezil-aws-prd/locks/app-secret.lock",
             # Founder decisions 2026-10-30: pool mode, no rebase tuple at launch, the prod host's role only.
             "deployEnvironment": "aws-prd", "poolLifecycle": True, "rebase": False,
             "appCaller": {"enabled": True, "roleName": "ezil-prd-app-caller", "providers": [], "ec2CallerEnv": "production",
@@ -953,14 +954,14 @@ def edit_release_secret(envelope, before, after, records):
     """CAS the complete tuple and append immutable records; capacity fails closed.
 
     Retaining ALL records satisfies placement/job retention without racing the DB.
-    A separately reviewed garbage collector is required when nineteen slots are full.
+    A separately reviewed garbage collector is required when all twenty-five slots are full.
     """
     updated = edit_secret(envelope, before, after)
     raw = updated[KEY]
     deployments = release.loads(raw) if isinstance(raw, str) else copy.deepcopy(raw)
     d = deployments[REGION]
     retained = d.get("releases", [])
-    need(isinstance(retained, list) and len(retained) <= 24, "invalid release registry")
+    need(isinstance(retained, list) and len(retained) <= 25, "invalid release registry")
     for record in retained:
         release.validate(record, source=True, repository=REPOSITORY)
         need(all(record[k] == d[k] for k in ("accountId", "region", "namespace", "launchTemplateId")), "foreign registry record")
@@ -972,7 +973,7 @@ def edit_release_secret(envelope, before, after, records):
         need(all(identity(r) != identity(record) or r == record for r in retained), "immutable release pair rewrite refused")
         if record not in retained:
             retained.append(copy.deepcopy(record))
-    need(1 <= len(retained) <= 24, "release registry full; retained placement/job evidence must never be dropped")
+    need(1 <= len(retained) <= 25, "release registry full; retained placement/job evidence must never be dropped")
     retained.sort(key=lambda r: r["createdAt"])
     targets = [r for r in retained if all(r[k] == after.get(k) for k in release.PROMOTION)]
     # Legacy rollback remains a source-only deployment, never a rebase target.

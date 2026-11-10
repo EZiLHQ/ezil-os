@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
+import { DIAG_BRIDGE_MARKER } from './code-diag-bridge';
 
 import { handleAwsBrowserHost, type AwsTunnelRecord, type FetchLike } from './aws-origin';
 import {
@@ -11,11 +12,13 @@ import {
   injectCodeFolderBridge,
   isHtmlDocument,
   isWorkbenchDocumentRequest,
+  LEGACY_NOTICE_HIDE_CSS,
+  LEGACY_NOTICE_MARKER,
   parseShellOrigins,
 } from './code-folder-bridge';
 import { CODE_PREVIEW_PORT, CODE_PREVIEW_TOKEN } from './desktop-mode';
 import { mintPreviewCookie } from './hmac';
-import { handlePreviewProxy, type ContainerFetcher } from './preview-bridge';
+import { handlePreviewProxy, stripFrameAncestors, type ContainerFetcher } from './preview-bridge';
 import vectors from './aws-gateway.vectors.json';
 
 const SHELL = 'https://os-staging.ezil.work';
@@ -37,6 +40,16 @@ const WORKBENCH = `<!-- Copyright (C) Microsoft Corporation. All rights reserved
 \t<script nonce="0f3c1e9a-8b7d-4c2e-9f10-3a5b6c7d8e9f">globalThis._VSCODE_FILE_ROOT = '/out/';</script>
 \t<script type="module" src="/stable-1/static/out/vs/code/browser/workbench/workbench.js"></script>
 </html>`;
+/** code-server 4.141's served workbench CSP, as both editor images (67c939f0, 2031b2c1) send it (measured 2026-11-05). */
+const SERVED_CSP = "default-src 'self'; img-src 'self' https: data: blob:; media-src 'self'; script-src 'self' 'unsafe-eval'  blob: "
+  + "'nonce-0f3c1e9a-8b7d-4c2e-9f10-3a5b6c7d8e9f' 'sha256-daEgfo2VIXpx2Np71KqCCbkeQwv+68vPrx54XRcbdcs=' "
+  + "'sha256-/r7rqQ+yrxt57sxLuQ6AMYcy/lUpvAIzHjIJt/OeLWU=' ; child-src 'self'; frame-src 'self' https://*.vscode-cdn.net data:; "
+  + "worker-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; connect-src 'self' ws: wss: https:; font-src 'self' blob:; manifest-src 'self';";
+/** The notice rule in the older image's workbench.css (AMI 1.0.30, desktop 67c939f0), verbatim. */
+const LEGACY_NOTICE_RULE = '.chat-viewpane .interactive-session>.interactive-input-part::after{content:"AI responses may be inaccurate. '
+  + 'Review changes before applying them.";display:block;padding:2px 4px 0;font-size:11px;line-height:16px;'
+  + 'color:var(--vscode-descriptionForeground);text-align:center}';
+const LEGACY_STYLE = `<style ${LEGACY_NOTICE_MARKER}="1">${LEGACY_NOTICE_HIDE_CSS}</style>`;
 
 describe('parseShellOrigins', () => {
   it('takes plain https origins, comma separated, deduplicated', () => {
@@ -118,7 +131,8 @@ describe('injectCodeFolderBridge', () => {
     expect(out.indexOf(meta)).toBeLessThan(1024);
     expect(out.indexOf(tag)).toBeLessThan(out.indexOf('globalThis._VSCODE_FILE_ROOT'));
     expect(out.split(BRIDGE_MARKER).length - 1).toBe(1);
-    expect(out.replace(/\n<script nonce="[^"]*" data-ezil-folder-bridge="1">[\s\S]*?<\/script>/, '')).toBe(WORKBENCH);
+    expect(out.replace(/\n<script nonce="[^"]*" data-ezil-folder-bridge="1">[\s\S]*?<\/script><style data-ezil-legacy-notice="1">[^<]*<\/style>/, ''))
+      .toBe(WORKBENCH);
     expect(out).toContain(JSON.stringify([SHELL]));
   });
   it('without a <meta charset> in the head, the script goes first in <head>', () => {
@@ -144,6 +158,34 @@ describe('injectCodeFolderBridge', () => {
     expect(script).not.toMatch(/<\/|<!--/);
     expect(script).not.toContain('"*"');
     expect(script).not.toContain("'*'");
+  });
+});
+
+describe('the older image\'s composer notice (hidden by the same insertion)', () => {
+  it('one plain style follows the bridge in <head>, before every workbench stylesheet and script', () => {
+    const out = injectCodeFolderBridge(WORKBENCH, [SHELL]);
+    expect(out.split(LEGACY_NOTICE_MARKER).length - 1).toBe(1);
+    expect(out).toContain(`</script>${LEGACY_STYLE}`);
+    expect(out.indexOf(LEGACY_STYLE)).toBeLessThan(out.indexOf('</head>'));
+    // No nonce of its own: the served CSP allows inline styles ('unsafe-inline', no style nonce), as for
+    // code-server's own startup-fallback <style>.
+    expect(SERVED_CSP).toContain("style-src 'self' 'unsafe-inline';");
+    expect(LEGACY_STYLE).not.toContain('nonce');
+  });
+  it('hides exactly the generated box of the older image\'s rule, and nothing else', () => {
+    const selector = (rule: string) => rule.slice(0, rule.indexOf('{'));
+    expect(selector(LEGACY_NOTICE_HIDE_CSS)).toBe(selector(LEGACY_NOTICE_RULE));
+    expect(LEGACY_NOTICE_HIDE_CSS.slice(LEGACY_NOTICE_HIDE_CSS.indexOf('{'))).toBe('{content:none!important;display:none!important}');
+    // One rule, on that pseudo-element only: never the input, its toolbars, the welcome message or another notice.
+    expect(LEGACY_NOTICE_HIDE_CSS.split('{').length - 1).toBe(1);
+    expect(LEGACY_NOTICE_HIDE_CSS).not.toMatch(/[<@,]|welcome|chat-input-container|monaco|ezil-chat/);
+  });
+  it('nowhere without the bridge: production (no origins), no usable nonce, no <head>, or a second pass', () => {
+    expect(injectCodeFolderBridge(WORKBENCH, [])).not.toContain(LEGACY_NOTICE_MARKER);
+    expect(injectCodeFolderBridge(WORKBENCH.replaceAll(/ nonce="[^"]*"/g, ''), [SHELL])).not.toContain(LEGACY_NOTICE_MARKER);
+    expect(injectCodeFolderBridge(WORKBENCH.replace('<head>', '').replace('</head>', ''), [SHELL])).not.toContain(LEGACY_NOTICE_MARKER);
+    const once = injectCodeFolderBridge(WORKBENCH, [SHELL]);
+    expect(injectCodeFolderBridge(once, [SHELL]).split(LEGACY_NOTICE_MARKER).length - 1).toBe(1);
   });
 });
 
@@ -326,7 +368,22 @@ describe('Cloudflare code host (handlePreviewProxy, code target)', () => {
   };
   it('the workbench document gets the bridge', async () => {
     const res = await get('/preview/?folder=/workspace', '/', [SHELL]);
-    expect(await res.text()).toContain(BRIDGE_MARKER);
+    const body = await res.text();
+    expect(body).toContain(BRIDGE_MARKER);
+    expect(body).toContain(DIAG_BRIDGE_MARKER);
+  });
+  it('and the legacy-notice style, with every header (CSP included) as without the injection', async () => {
+    const f: ContainerFetcher = {
+      async containerFetch() { return new Response(WORKBENCH, { headers: { 'content-type': 'text/html', 'content-security-policy': SERVED_CSP } }); },
+    };
+    const res = await get('/preview/?folder=/workspace', '/', [SHELL], f);
+    const plain = await get('/preview/?folder=/workspace', '/', [], f);
+    expect([...res.headers]).toEqual([...plain.headers]);
+    // This host's existing rewrite only drops frame-ancestors and re-joins the directives; style-src is code-server's.
+    expect(res.headers.get('content-security-policy')).toBe(stripFrameAncestors(SERVED_CSP));
+    expect(res.headers.get('content-security-policy')).toContain("style-src 'self' 'unsafe-inline';");
+    expect((await res.text()).split(LEGACY_STYLE).length - 1).toBe(1);
+    expect(await plain.text()).toBe(WORKBENCH);
   });
   it('no origin configured, another document, another type or status: untouched', async () => {
     expect(await (await get('/preview/?folder=/workspace', '/', [])).text()).toBe(WORKBENCH);
@@ -338,7 +395,10 @@ describe('Cloudflare code host (handlePreviewProxy, code target)', () => {
     const cookie = await mintPreviewCookie(SECRET, SID);
     const req = new Request(`https://3002-${SID}-app.ezil.work/preview/`, { headers: { cookie: `ezil_preview=${cookie}` } });
     const res = await handlePreviewProxy(req, fetcher(WORKBENCH), SID, [SECRET], '/', 3002, 'app', [SHELL]);
-    expect(await res.text()).not.toContain(BRIDGE_MARKER);
+    const body = await res.text();
+    expect(body).not.toContain(BRIDGE_MARKER);
+    expect(body).not.toContain(LEGACY_NOTICE_MARKER);
+    expect(body).not.toContain(DIAG_BRIDGE_MARKER);
   });
 });
 
@@ -364,11 +424,15 @@ describe('AWS code port (handleAwsBrowserHost)', () => {
     }))!;
   };
   const html = () => new Response(WORKBENCH, { headers: { 'content-type': 'text/html', 'content-length': String(WORKBENCH.length), 'x-keep': '1',
-    etag: 'W/"1"', 'last-modified': 'Thu, 05 Nov 2026 00:00:00 GMT' } });
+    etag: 'W/"1"', 'last-modified': 'Thu, 05 Nov 2026 00:00:00 GMT', 'content-security-policy': SERVED_CSP } });
   it('the workbench document gets the bridge, without its stale length or validators, never cached', async () => {
     const res = await call(CODE_PREVIEW_PORT, '/?folder=/workspace', html());
     expect(res.status).toBe(200);
-    expect(await res.text()).toContain(BRIDGE_MARKER);
+    const body = await res.text();
+    expect(body).toContain(BRIDGE_MARKER);
+    expect(body.split(LEGACY_STYLE).length - 1).toBe(1);
+    expect(body).toContain(DIAG_BRIDGE_MARKER);
+    expect(res.headers.get('content-security-policy')).toBe(SERVED_CSP);
     expect(res.headers.get('content-length')).toBeNull();
     expect(res.headers.get('etag')).toBeNull();
     expect(res.headers.get('last-modified')).toBeNull();

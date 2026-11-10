@@ -161,7 +161,7 @@ function fixture() {
         })),
         listCustomerSubscriptions: vi.fn<StripeApi['listCustomerSubscriptions']>().mockResolvedValue([]),
         listOpenCheckoutSessions: vi.fn<StripeApi['listOpenCheckoutSessions']>().mockResolvedValue([]),
-        expireCheckoutSession: vi.fn<StripeApi['expireCheckoutSession']>().mockResolvedValue(undefined),
+        expireCheckoutSession: vi.fn<StripeApi['expireCheckoutSession']>().mockResolvedValue('expired'),
         listInvoices: vi.fn<StripeApi['listInvoices']>(async () => [{ ...invoice }]),
         createPortalSession: vi.fn(async () => ({ url: 'https://billing.example/portal' })),
         retrieveCheckoutSession: vi.fn(async () => ({ ...session })),
@@ -201,9 +201,11 @@ describe('billing router', () => {
         await expect(f.caller.summary()).resolves.toEqual({ enabled: false });
         for (const method of Object.values(f.store)) expect(method).not.toHaveBeenCalled();
         f.deps.config.tabEnabled = true;
+        // The sample's computer is not among the live computers (placement reads are off here, so none is listed):
+        // the disk counts nothing rather than bytes it cannot place (summary.ts storageDisk).
         await expect(f.caller.summary()).resolves.toMatchObject({ enabled: true, version: 3,
             plan: { sku: 'free_v3' }, fairUse: { status: 'ok' },
-            computer: { sessionMaxSeconds: 3600 }, storage: { usedBytes: '123' } });
+            computer: { sessionMaxSeconds: 3600 }, storage: { usedBytes: null, state: 'unavailable' } });
         expect(f.store.subscriptionsFor).toHaveBeenCalledWith(userId);
         expect(f.store.epochsFor).toHaveBeenCalledWith(userId, new Date('2026-10-01T00:00:00Z'));
         expect(f.store.grantsForPeriod).toHaveBeenCalledWith(userId,
@@ -288,7 +290,7 @@ describe('billing router', () => {
         f.deps.stripe = f.stripe;
         await checkoutControl(f);
         await expect(f.caller.portal()).resolves.toEqual({ url: 'https://billing.example/portal' });
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending', paymentStatus: 'unpaid', sku });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending', paymentStatus: 'unpaid', sku, trial: false });
         await expect(f.caller.history()).resolves.toEqual(history);
         expect(f.stripe.listInvoices).toHaveBeenCalledWith('cus_fixture', 12);
         expect(f.stripe.createPortalSession).toHaveBeenCalledTimes(1);
@@ -319,6 +321,53 @@ describe('billing router', () => {
         expect(f.stripe.createCheckoutSession).toHaveBeenCalledTimes(0);
         f.store.subscriptionsFor.mockResolvedValue([subscription({ status: 'canceled' })]);
         await checkoutControl(f);
+    });
+
+    // Product entitlements v1: an operator assignment in effect is the account's plan; Stripe is never layered over it.
+    it('refuses a checkout while an operator assignment is in effect, before Stripe is called; an ended one does not block', async () => {
+        const f = fixture();
+        const row = { ref: 'osg-00000000-0000-4000-8000-000000000001', revision: 1, userId, accountPublicId: '10000000-0000-4000-8000-0000000000a1',
+            sku: 'standard_monthly_v3' as const, startsAt: new Date(now.getTime() - 86_400_000), endsAt: null, endedAt: null };
+        const store = f.store as unknown as { operatorEntitlementsFor: (id: string) => Promise<unknown[]> };
+        store.operatorEntitlementsFor = vi.fn(async () => [row]);
+        await expect(f.caller.createCheckout({ sku })).rejects.toMatchObject({ code: 'CONFLICT', message: 'already_subscribed' });
+        expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        store.operatorEntitlementsFor = vi.fn(async () => [{ ...row, endedAt: new Date(now.getTime() - 1000) }]);
+        await checkoutControl(f);
+    });
+
+    it('operator Premium can select its machine; Stripe-only mutations stay unavailable', async () => {
+        const f = fixture();
+        const row = { ref: 'osg-00000000-0000-4000-8000-000000000001', revision: 1, userId,
+            accountPublicId: '10000000-0000-4000-8000-0000000000a1', sku: 'premium_monthly_v3' as const,
+            startsAt: new Date(now.getTime() - 86_400_000), endsAt: null, endedAt: null };
+        (f.store as BillingStore).operatorEntitlementsFor = vi.fn(async () => [row]);
+        await expect(f.caller.selectMachine({ size: 'cmp-8' })).resolves.toEqual({ size: 'cmp-8', effective: 'next_open' });
+        expect(f.store.setSizePreference).toHaveBeenCalledWith(userId, 'cmp-8');
+        await expect(f.caller.cancelAtPeriodEnd({ cancel: true })).rejects.toMatchObject({ message: 'not_subscribed' });
+        expect(f.stripe.setCancelAtPeriodEnd).not.toHaveBeenCalled();
+        f.store.subscriptionsFor.mockResolvedValue([subscription()]);
+        await expect(f.caller.selectMachine({ size: 'cmp-4' })).rejects.toMatchObject({ message: 'size_not_allowed' });
+        f.store.subscriptionsFor.mockResolvedValue([]);
+        row.sku = 'standard_monthly_v3' as typeof row.sku;
+        await expect(f.caller.selectMachine({ size: 'cmp-4' })).rejects.toMatchObject({ message: 'size_not_allowed' });
+    });
+
+    it('operator-effective access has no Stripe management action despite historical customer and invoices', async () => {
+        const f = fixture();
+        await f.store.linkCustomer(userId, 'cus_fixture');
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ status: 'canceled' })]);
+        (f.store as BillingStore).operatorEntitlementsFor = vi.fn(async () => [{
+            ref: 'osg-00000000-0000-4000-8000-000000000001', revision: 1, userId,
+            accountPublicId: '10000000-0000-4000-8000-0000000000a1', sku: 'standard_monthly_v3' as const,
+            startsAt: new Date(now.getTime() - 86_400_000), endsAt: null, endedAt: null,
+        }]);
+        expect(await f.caller.summary()).toMatchObject({ plan: { access: { source: 'operator' } }, actions: { portal: false } });
+        await expect(f.caller.portal()).rejects.toMatchObject({ message: 'not_subscribed' });
+        expect(f.stripe.createPortalSession).not.toHaveBeenCalled();
+        expect(f.stripe.retrieveSubscription).not.toHaveBeenCalled();
+        await expect(f.caller.history()).resolves.toEqual(history);
     });
 
     it('refuses another checkout for a v2 Standard subscription', async () => {
@@ -377,6 +426,25 @@ describe('billing router', () => {
         expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
         if (step !== 'list subscriptions') expect(f.stripe.listCustomerSubscriptions).not.toHaveBeenCalled();
         // Positive control: the next attempt, with Stripe answering, proceeds.
+        await checkoutControl(f);
+    });
+
+    // #242 fail-closed: the real client returns a status instead of throwing on the 400/404 Stripe gives for a
+    // session that is no longer open. A subscription session that completed or vanished during the race comes back
+    // 'complete'/'gone'; the subscription it created may not be listed yet, so the guard refuses before the
+    // subscription check and the new session — on the returned status, not a thrown Stripe error.
+    it.each(['complete', 'gone'] as const)('refuses checkout (stripe_unavailable) when a raced expiry reports %s, before the subscription check', async outcome => {
+        const f = fixture();
+        await f.store.linkCustomer(userId, 'cus_fixture');
+        const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+        f.stripe.listOpenCheckoutSessions.mockResolvedValueOnce([{ id: 'cs_racing', mode: 'subscription' }]);
+        f.stripe.expireCheckoutSession.mockResolvedValueOnce(outcome);
+        await domainFailure(() => f.caller.createCheckout({ sku }), 'stripe_unavailable');
+        expect(log).toHaveBeenCalledExactlyOnceWith('Billing Stripe unavailable');
+        expect(f.stripe.expireCheckoutSession).toHaveBeenCalledExactlyOnceWith('cs_racing');
+        expect(f.stripe.listCustomerSubscriptions).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        // Positive control: a clean 'expired' lets the same customer's checkout proceed.
         await checkoutControl(f);
     });
 
@@ -444,7 +512,7 @@ describe('billing router', () => {
         f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, clientReferenceId: owner });
         await expect(f.caller.checkoutStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'NOT_FOUND' });
         f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete' });
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'unpaid', sku });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'unpaid', sku, trial: false });
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenNthCalledWith(1, session.id);
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenNthCalledWith(2, session.id);
     });
@@ -452,14 +520,14 @@ describe('billing router', () => {
     it.each(['open', 'complete', 'expired'] as const)('maps %s from a fresh Stripe read', async status => {
         const f = fixture();
         f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status });
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: status === 'open' ? 'pending' : status, paymentStatus: 'unpaid', sku });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: status === 'open' ? 'pending' : status, paymentStatus: 'unpaid', sku, trial: false });
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledWith(session.id);
     });
 
     it.each(['unpaid', 'paid', 'no_payment_required'] as const)('reports complete Checkout and %s independently without granting a plan', async paymentStatus => {
         const f = fixture();
         f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus });
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus, sku });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus, sku, trial: false });
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledExactlyOnceWith(session.id);
         for (const method of Object.values(f.store)) expect(method).not.toHaveBeenCalled();
         expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
@@ -471,14 +539,14 @@ describe('billing router', () => {
         const response = { ...session, status: 'complete', paymentStatus } as unknown as StripeCheckoutSession;
         if (paymentStatus === undefined) delete (response as Partial<StripeCheckoutSession>).paymentStatus;
         f.stripe.retrieveCheckoutSession.mockResolvedValue(response);
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: null, sku });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: null, sku, trial: false });
         for (const method of Object.values(f.store)) expect(method).not.toHaveBeenCalled();
     });
 
     it.each(['standard_monthly_v3', 'premium_monthly_v3', 'compute_monthly_v2'])('returns the verified session SKU %s without looking up or granting a plan', async checkoutSku => {
         const f = fixture();
         f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus: 'paid', sku: checkoutSku });
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid', sku: checkoutSku });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid', sku: checkoutSku, trial: false });
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledExactlyOnceWith(session.id);
         for (const method of Object.values(f.store)) expect(method).not.toHaveBeenCalled();
         expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
@@ -489,7 +557,7 @@ describe('billing router', () => {
         const response = { ...session, status: 'complete', paymentStatus: 'paid', sku: checkoutSku } as unknown as StripeCheckoutSession;
         if (checkoutSku === undefined) delete (response as Partial<StripeCheckoutSession>).sku;
         f.stripe.retrieveCheckoutSession.mockResolvedValue(response);
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid', sku: null });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid', sku: null, trial: false });
         for (const method of Object.values(f.store)) expect(method).not.toHaveBeenCalled();
     });
 
@@ -497,7 +565,7 @@ describe('billing router', () => {
         const f = fixture();
         await expect(f.caller.checkoutStatus({ sessionId })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledTimes(0);
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending', paymentStatus: 'unpaid', sku });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending', paymentStatus: 'unpaid', sku, trial: false });
         expect(f.stripe.retrieveCheckoutSession).toHaveBeenCalledTimes(1);
     });
 
@@ -512,7 +580,7 @@ describe('billing router', () => {
         await expect(f.caller.summary()).resolves.toMatchObject({ enabled: true });
         await checkoutControl(f);
         await expect(f.caller.portal()).resolves.toMatchObject({ url: 'https://billing.example/portal' });
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending', paymentStatus: 'unpaid', sku });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending', paymentStatus: 'unpaid', sku, trial: false });
         await expect(f.caller.history()).resolves.toEqual(history);
     });
 
@@ -773,7 +841,153 @@ describe('billing top-up checkout', () => {
             amount: BigInt(pack.creditCents) * BigInt(10000), sourceType: 'payment_intent', sourceId: 'pi_fixture' })]);
         expect(receipts).toEqual([expect.objectContaining({ kind: 'ai_grant',
             eventKey: `ezil-os:v1:topup:${pack.sku}:pi_fixture:grant`, payload: expect.objectContaining({ credits: pack.aiCredits }) })]);
-        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid', sku: pack.sku });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid', sku: pack.sku, trial: false });
+    });
+});
+
+describe('top-up quote, stale-quote guard and confirmed fulfilment (synthetic fixtures)', () => {
+    function topupFixture() {
+        const f = fixture();
+        f.deps.config.stripePublishableKey = 'pk_test_fixture';
+        return f;
+    }
+    const topupSession = (overrides: Partial<StripeCheckoutSession> = {}): StripeCheckoutSession => ({
+        ...session, mode: 'payment', status: 'complete', paymentStatus: 'paid', paymentIntentId: 'pi_fixture', sku: 'ai_custom_v2', ...overrides });
+    function withReceipt(f: ReturnType<typeof fixture>, receipt: Awaited<ReturnType<AiTopupReceiptStore['aiTopupReceipt']>> | Error) {
+        const aiTopupReceipt = vi.fn<AiTopupReceiptStore['aiTopupReceipt']>(async () => { if (receipt instanceof Error) throw receipt; return receipt; });
+        Object.assign(f.store, { aiTopupReceipt, recordAiTopup: vi.fn<AiTopupReceiptStore['recordAiTopup']>() });
+        return aiTopupReceipt;
+    }
+    const receipt = (delivery: Record<string, unknown> | undefined, owner = userId) => ({
+        eventKey: 'ezil-os:v1:topup:ai_custom_v2:pi_fixture:grant', userId: owner, kind: 'ai_grant' as const,
+        payload: { protocol: 'ezil-ai-credits-v1', credits: 500, paymentIntentId: 'pi_fixture', ...(delivery ? { delivery } : {}) } });
+
+    it('quotes the offered pack from the Stripe catalog and a custom amount at the fixed tariff, with no discount', async () => {
+        const f = topupFixture();
+        await expect(f.caller.quoteTopup({ sku: 'ai_pack_fixture' })).resolves.toEqual({ sku: 'ai_pack_fixture', custom: false,
+            aiCredits: offeredPack.aiCredits, creditCents: offeredPack.creditCents, discountPercent: offeredPack.discountPercent,
+            totalCents: offeredPack.totalCents, currency: 'usd' });
+        await expect(f.caller.quoteTopup({ customAmountCents: 5000 })).resolves.toEqual({ sku: 'ai_custom_v2', custom: true,
+            aiCredits: 500, creditCents: 5000, discountPercent: 0, totalCents: 5000, currency: 'usd' });
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+    });
+
+    it.each([0, -100, 999, 1050, 1000.5, 1000100, Number.NaN])('refuses an invalid custom quote %s (bounds and whole dollars)', async customAmountCents => {
+        const f = topupFixture();
+        await expect(f.caller.quoteTopup({ customAmountCents })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+    });
+
+    it('refuses tampered quote input: unknown SKU, the custom SKU by name, both fields, or extra fields', async () => {
+        const f = topupFixture();
+        await expect(f.caller.quoteTopup({ sku: 'ai_custom_v2' })).rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'unknown_pack' });
+        await expect(f.caller.quoteTopup({ sku: 'ai_pack_tampered' })).rejects.toMatchObject({ code: 'BAD_REQUEST', message: 'unknown_pack' });
+        await expect(f.caller.quoteTopup({ sku: 'ai_pack_fixture', customAmountCents: 1000 } as never)).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+        await expect(f.caller.quoteTopup({ customAmountCents: 1000, aiCredits: 100000 } as never)).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+        await expect(f.caller.createTopupCheckout({ customAmountCents: 1000, totalCents: 1 } as never)).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    it('quote follows the same enrollment and configuration gates as checkout', async () => {
+        const f = topupFixture();
+        const unenrolled = createBillingRouter(() => f.deps, { aiMember: async () => null }).createCaller(f.ctx);
+        await expect(unenrolled.quoteTopup({ customAmountCents: 1000 })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED', message: 'ai_enrollment_required' });
+        f.deps.config.stripePublishableKey = undefined;
+        await expect(f.caller.quoteTopup({ customAmountCents: 1000 })).rejects.toMatchObject({ code: 'PRECONDITION_FAILED', message: 'billing_not_configured' });
+        await expect(f.router.createCaller({ ...f.ctx, user: null }).quoteTopup({ customAmountCents: 1000 })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    });
+
+    it('a stale quote is refused before any customer or checkout is created; the matching quote proceeds', async () => {
+        const f = topupFixture();
+        await expect(f.caller.createTopupCheckout({ sku: 'ai_pack_fixture', expectedTotalCents: offeredPack.totalCents + 1 }))
+            .rejects.toMatchObject({ code: 'CONFLICT', message: 'quote_changed' });
+        await expect(f.caller.createTopupCheckout({ sku: 'ai_pack_fixture', expectedCredits: offeredPack.aiCredits + 1 }))
+            .rejects.toMatchObject({ code: 'CONFLICT', message: 'quote_changed' });
+        await expect(f.caller.createTopupCheckout({ customAmountCents: 5000, expectedCredits: 625 }))
+            .rejects.toMatchObject({ code: 'CONFLICT', message: 'quote_changed' });
+        expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        await f.caller.createTopupCheckout({ customAmountCents: 5000, expectedTotalCents: 5000, expectedCredits: 500 });
+        expect(f.stripe.createCheckoutSession).toHaveBeenCalledWith(expect.objectContaining({ sku: 'ai_custom_v2', customAmountCents: 5000 }));
+        expect(f.stripe.createCheckoutSession.mock.calls[0]![0]).not.toHaveProperty('expectedTotalCents');
+        // A coupon that ended between quote and checkout: the old discounted total no longer matches.
+        resetStripePackCachesForTests();
+        f.stripe.retrieveCoupon.mockResolvedValue(null);
+        await expect(f.caller.createTopupCheckout({ sku: 'ai_pack_fixture', expectedTotalCents: offeredPack.totalCents }))
+            .rejects.toMatchObject({ code: 'CONFLICT', message: 'quote_changed' });
+        expect(f.stripe.createCheckoutSession).toHaveBeenCalledTimes(1);
+    });
+
+    it('payment alone is never credited: open, unpaid, expired and paid-without-receipt stay uncredited', async () => {
+        const f = topupFixture();
+        withReceipt(f, null);
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ status: 'open', paymentStatus: 'unpaid' }));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toEqual({ status: 'pending', paymentStatus: 'unpaid', fulfillment: 'awaiting_payment', credits: null });
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ paymentStatus: 'unpaid' }));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ status: 'complete', fulfillment: 'awaiting_payment' });
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ status: 'expired', paymentStatus: 'unpaid' }));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ status: 'expired', fulfillment: 'awaiting_payment' });
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession());
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid', fulfillment: 'processing', credits: null });
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ paymentIntentId: null }));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing' });
+    });
+
+    it.each([
+        [undefined, 'processing'], [{ status: 'pending' }, 'processing'], [{ status: 'processing' }, 'processing'],
+        [{ status: 'retry' }, 'processing'], [{ status: 'failed' }, 'review'], [{ status: 'done' }, 'credited'],
+    ] as const)('maps the receipt delivery %j to %s, reading only this user\'s receipt', async (delivery, fulfillment) => {
+        const f = topupFixture();
+        const read = withReceipt(f, receipt(delivery));
+        f.stripe.retrieveCheckoutSession.mockResolvedValue(topupSession());
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid',
+            fulfillment, credits: fulfillment === 'credited' ? 500 : null });
+        expect(read).toHaveBeenCalledWith(userId, 'pi_fixture');
+    });
+
+    it('never reports another person\'s session or receipt, nor a non-top-up session', async () => {
+        const f = topupFixture();
+        const read = withReceipt(f, receipt({ status: 'done' }));
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ clientReferenceId: '22222222-2222-4222-8222-222222222222' }));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'NOT_FOUND', message: 'unknown_checkout' });
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ mode: 'subscription', sku }));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession({ sku: null }));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'NOT_FOUND' });
+        expect(read).not.toHaveBeenCalled();
+        // A receipt row for another owner (defence in depth beside the store's own user filter) is not credited.
+        withReceipt(f, receipt({ status: 'done' }, '22222222-2222-4222-8222-222222222222'));
+        f.stripe.retrieveCheckoutSession.mockResolvedValueOnce(topupSession());
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing', credits: null });
+        await expect(f.caller.topupStatus({ sessionId: 'not-a-session' })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
+        await expect(f.router.createCaller({ ...f.ctx, user: null }).topupStatus({ sessionId: session.id })).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    });
+
+    it('an unreadable receipt or store without receipts keeps waiting, never failed or credited', async () => {
+        const f = topupFixture();
+        f.stripe.retrieveCheckoutSession.mockResolvedValue(topupSession());
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing' });
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        withReceipt(f, new Error('db down'));
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing', credits: null });
+    });
+
+    it('duplicate webhook delivery still writes one receipt, and status reports it credited once delivered', async () => {
+        const f = topupFixture();
+        const receipts: Parameters<AiTopupReceiptStore['recordAiTopup']>[1][] = [];
+        const recordAiTopup = vi.fn<AiTopupReceiptStore['recordAiTopup']>(async (_grant, item) => { receipts.push(item); return 'applied'; });
+        Object.assign(f.store, { aiTopupReceipt: vi.fn<AiTopupReceiptStore['aiTopupReceipt']>(async () => receipts[0] ?? null), recordAiTopup });
+        const paid = topupSession({ amountTotal: 5000, currency: 'usd', metadataCredits: '500' });
+        f.stripe.retrieveCheckoutSession.mockResolvedValue(paid);
+        const event = { id: 'evt_dup', type: 'checkout.session.completed', created: now.getTime() / 1000, livemode: false,
+            data: { object: { id: session.id, customer: 'cus_fixture', mode: 'payment', payment_status: 'paid', payment_intent: 'pi_fixture', metadata: { sku: 'ai_custom_v2' } } } };
+        const deps = { store: f.store, stripe: f.stripe, now: () => now };
+        expect(await processStripeEvent(event, deps)).toBe('applied');
+        expect(await processStripeEvent(event, deps)).toBe('applied');
+        expect(recordAiTopup).toHaveBeenCalledTimes(1);
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toMatchObject({ fulfillment: 'processing' });
+        receipts[0]!.payload.delivery = { status: 'done' };
+        await expect(f.caller.topupStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete', paymentStatus: 'paid', fulfillment: 'credited', credits: 500 });
     });
 });
 
@@ -1540,6 +1754,38 @@ describe('round 5 D3: the summary and usage show the computer\'s REAL volume', (
         return { ...f, placement, volumeGiB, caller: createBillingRouter(() => f.deps, { placement, volumeGiB }).createCaller(f.ctx) };
     };
 
+    it('storage: the disk meters the live AWS computer only, never a deleted computer\'s retained sample (summary and unscoped usage)', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const DELETED = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
+        const volumes = [{ computerId: C1, region: 'ap-south-1', volumeId: VOL_OLD }];
+        const f = withVolumes(volumes, { [VOL_OLD]: 50 });
+        f.placement.mockResolvedValue({ provider: 'aws-ec2', awsVolumes: volumes,
+            computers: [{ computerId: C1, provider: 'aws-ec2', placement: null }, { computerId: C2, provider: 'cloudflare', placement: null }] });
+        f.store.latestStorageFor.mockResolvedValue([
+            { computerId: DELETED, bytes: BigInt(30 * GiB), measuredAt: new Date('2026-10-01T00:00:00Z') },
+            { computerId: C2, bytes: BigInt(5 * GiB), measuredAt: now },
+            { computerId: C1, bytes: BigInt(25 * GiB), measuredAt: now }]);
+        const live = String(25 * GiB);
+        await expect(f.caller.summary()).resolves.toMatchObject({ computer: { disk: { provisionedGiB: 50, usedBytes: live } },
+            storage: { usedBytes: live, capBytes: String(50 * GiB), state: 'ok' } });
+        // The samples beside the disk are only the ones it counted (an older shell sums them when disk.usedBytes is null).
+        const usage = await f.caller.usage();
+        expect(usage).toMatchObject({ storage: { state: 'sampled', capBytes: String(50 * GiB), disk: { provisionedGiB: 50, usedBytes: live, usedGiB: 25 } } });
+        if (!usage.enabled) throw new Error('usage disabled');
+        expect(usage.storage.samples.map(sample => sample.computerId)).toEqual([C1]);
+        // A live computer not measured yet (scoped): nothing to sum, not the deleted or the Cloudflare computer's bytes.
+        f.store.latestStorageFor.mockResolvedValue([
+            { computerId: DELETED, bytes: BigInt(30 * GiB), measuredAt: new Date('2026-10-01T00:00:00Z') },
+            { computerId: C2, bytes: BigInt(5 * GiB), measuredAt: now }]);
+        await expect(f.caller.usage({ computerId: C1 })).resolves.toMatchObject({ storage: { state: 'unavailable', samples: [],
+            disk: { provisionedGiB: 50, usedBytes: null, usedGiB: null } } });
+        // Fail closed: a placement read that lists no computers counts none ("not measured yet"), never the deleted 30 GiB.
+        f.placement.mockResolvedValue({ provider: 'aws-ec2', awsVolumes: volumes });
+        await expect(f.caller.summary()).resolves.toMatchObject({ computer: { disk: { usedBytes: null } }, storage: { usedBytes: null, state: 'unavailable' } });
+        await expect(f.caller.usage()).resolves.toMatchObject({ storage: { state: 'unavailable', samples: [], disk: { usedBytes: null, usedGiB: null } } });
+        warn.mockRestore();
+    });
+
     it('a Premium computer created today (100 GiB volume) shows 100; an older one (50 GiB) shows 50; summary and usage agree', async () => {
         for (const [volumeId, gib] of [[VOL_TODAY, 100], [VOL_OLD, 50]] as const) {
             const f = withVolumes([{ computerId: C1, region: 'ap-south-1', volumeId }], { [VOL_TODAY]: 100, [VOL_OLD]: 50 });
@@ -1811,5 +2057,247 @@ describe('round 5 D3: the volume size reader (describeVolume, cached)', () => {
     it('a volume EC2 does not know (null) or AWS off is null', async () => {
         const read = createVolumeSizeReader(async () => null, { timeoutMs: 20 });
         await expect(read(volume)).resolves.toBeNull();
+    });
+});
+
+describe('trial checkout retries', () => {
+    it('retains identical provider parameters after successful create followed by local attach failure', async () => {
+        const f = fixture();
+        let clock = new Date('2026-10-11T12:00:00Z');
+        f.deps.now = () => clock;
+        const trialEnd = new Date('2026-11-11T12:00:00Z');
+        const own = { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, authSubject: 'supabase:' + userId,
+            emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted' as const,
+            quotedAt: new Date(clock), trialEnd, checkoutSessionId: null, stripeCustomerId: null,
+            stripeSubscriptionId: null, trialStart: null, returnOrigin: 'https://os.ezil.work' };
+        Object.assign(f.store, {
+            trialFacts: vi.fn(async () => ({ emailNormalized: own.emailNormalized, emailVerified: true,
+                authSubject: own.authSubject, own, claimedElsewhere: false, paidBefore: false })),
+            trialById: vi.fn(), claimTrialQuote: vi.fn(),
+            attachTrialCheckout: vi.fn().mockRejectedValueOnce(new Error('QA local attach failed after provider create')).mockResolvedValue('attached'),
+            bindTrialSubscription: vi.fn(), setTrialStatus: vi.fn(), markSubscriptionPaid: vi.fn(), outboxByEventKey: vi.fn(),
+        });
+        const input = { sku, trial: { trialEndsAt: trialEnd.toISOString() } } as const;
+        await expect(f.caller.createCheckout(input)).rejects.toThrow('QA local attach failed after provider create');
+        clock = new Date(clock.getTime() + 1000);
+        await expect(f.caller.createCheckout(input)).resolves.toMatchObject({ mode: 'redirect', sessionId: session.id });
+        expect(f.stripe.createCheckoutSession).toHaveBeenCalledTimes(2);
+        const [first] = f.stripe.createCheckoutSession.mock.calls[0]!;
+        const [second] = f.stripe.createCheckoutSession.mock.calls[1]!;
+        expect(second.idempotencyKey).toBe(first.idempotencyKey);
+        expect(second).toEqual(first);
+    });
+    it('returns the same logical session after a completed local attachment and a lost response', async () => {
+        const f = fixture();
+        let clock = new Date('2026-10-11T12:00:00Z');
+        f.deps.now = () => clock;
+        const trialEnd = new Date('2026-11-11T12:00:00Z');
+        const own = { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, authSubject: 'supabase:' + userId,
+            emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted', quotedAt: new Date(clock),
+            trialEnd, checkoutSessionId: null, stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null, returnOrigin: 'https://os.ezil.work' };
+        Object.assign(f.store, {
+            trialFacts: vi.fn(async () => ({ emailNormalized: own.emailNormalized, emailVerified: true,
+                authSubject: own.authSubject, own, claimedElsewhere: false, paidBefore: false })),
+            trialById: vi.fn(), claimTrialQuote: vi.fn(),
+            attachTrialCheckout: vi.fn(async () => { Object.assign(own, { status: 'checkout', checkoutSessionId: session.id,
+                stripeCustomerId: 'cus_fixture' }); return 'attached'; }),
+            bindTrialSubscription: vi.fn(), setTrialStatus: vi.fn(), markSubscriptionPaid: vi.fn(), outboxByEventKey: vi.fn(),
+        });
+        const input = { sku, trial: { trialEndsAt: trialEnd.toISOString() } } as const;
+        const first = await f.caller.createCheckout(input);
+        clock = new Date(clock.getTime() + 1000);
+        expect(await f.caller.createCheckout(input)).toEqual(first);
+        expect(f.stripe.createCheckoutSession.mock.calls[1]?.[0]).toEqual(f.stripe.createCheckoutSession.mock.calls[0]?.[0]);
+    });
+    it('keeps a safe provider lifetime at the last fresh quote boundary without changing its immutable expiry', async () => {
+        const f = fixture();
+        const quotedAt = new Date('2026-10-11T12:00:00Z');
+        const clock = new Date(quotedAt.getTime() + 30 * 60_000);
+        f.deps.now = () => clock;
+        const trialEnd = new Date('2026-11-11T12:00:00Z');
+        const own = { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, authSubject: 'supabase:' + userId,
+            emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted', quotedAt,
+            trialEnd, checkoutSessionId: null, stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null, returnOrigin: 'https://os.ezil.work' };
+        Object.assign(f.store, {
+            trialFacts: vi.fn(async () => ({ emailNormalized: own.emailNormalized, emailVerified: true,
+                authSubject: own.authSubject, own, claimedElsewhere: false, paidBefore: false })),
+            trialById: vi.fn(), claimTrialQuote: vi.fn(), attachTrialCheckout: vi.fn().mockResolvedValue('attached'),
+            bindTrialSubscription: vi.fn(), setTrialStatus: vi.fn(), markSubscriptionPaid: vi.fn(), outboxByEventKey: vi.fn(),
+        });
+        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } }))
+            .resolves.toMatchObject({ sessionId: session.id });
+        const [request] = f.stripe.createCheckoutSession.mock.calls[0]!;
+        expect(request.trial!.expiresAt).toEqual(new Date('2026-10-11T14:00:00Z'));
+        expect(request.trial!.expiresAt.getTime() - clock.getTime()).toBeGreaterThanOrEqual(90 * 60_000);
+        expect(request.trial!.expiresAt.getTime() - clock.getTime()).toBeLessThan(24 * 60 * 60_000);
+    });
+
+});
+
+describe('Standard trial router', () => {
+    const quotedAt = new Date('2026-10-11T12:00:00Z');
+    const trialEnd = new Date('2026-11-11T12:00:00Z');
+    type Own = { id: string; userId: string | null; authSubject: string; emailNormalized: string; sku: string; policyVersion: number;
+        status: 'quoted' | 'checkout' | 'trialing' | 'converted' | 'canceled' | 'ended' | 'payment_failed'; quotedAt: Date; trialEnd: Date;
+        checkoutSessionId: string | null; stripeCustomerId: string | null; stripeSubscriptionId: string | null; trialStart: Date | null; returnOrigin: string };
+    function trialFixture(facts: { emailNormalized?: string | null; emailVerified?: boolean; authSubject?: string; own?: Own | null;
+        claimedElsewhere?: boolean; paidBefore?: boolean } = {}) {
+        const f = fixture();
+        const state = { facts: { emailNormalized: 'fixture@example.org', emailVerified: true, authSubject: `supabase:${userId}`, own: null as Own | null,
+            claimedElsewhere: false, paidBefore: false, ...facts } };
+        const trial = {
+            trialFacts: vi.fn(async () => state.facts),
+            claimTrialQuote: vi.fn(async (input: { quotedAt: Date; trialEnd: Date; authSubject: string; emailNormalized: string; returnOrigin: string }) => {
+                const own: Own = { id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, sku, policyVersion: 1, status: 'quoted', checkoutSessionId: null,
+                    stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null, ...input };
+                state.facts.own = own;
+                return { status: 'quoted' as const, trial: own, supersededCheckoutSessionId: null };
+            }),
+            attachTrialCheckout: vi.fn(async () => 'attached' as const),
+            trialById: vi.fn(), bindTrialSubscription: vi.fn(), setTrialStatus: vi.fn(), markSubscriptionPaid: vi.fn(), outboxByEventKey: vi.fn(),
+        };
+        Object.assign(f.store, trial);
+        return { ...f, trial, state };
+    }
+    const quoted = (patch: Partial<Own> = {}): Own => ({ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, authSubject: `supabase:${userId}`,
+        emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted', quotedAt, trialEnd, checkoutSessionId: null,
+        stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null, returnOrigin: 'https://os.ezil.work', ...patch });
+
+    it('quoteTrial fixes the exact end one calendar month after the server clock, $0 today and $20 then', async () => {
+        const f = trialFixture();
+        await expect(f.caller.quoteTrial()).resolves.toEqual({ sku, todayCents: 0, trialEndsAt: '2026-11-11T12:00:00Z',
+            firstChargeAt: '2026-11-11T12:00:00Z', amountCents: 2000, currency: 'usd', interval: 'month', quoteExpiresAt: '2026-10-11T12:30:00Z' });
+        expect(f.trial.claimTrialQuote).toHaveBeenCalledWith({ userId, authSubject: `supabase:${userId}`, emailNormalized: 'fixture@example.org',
+            quotedAt, trialEnd, returnOrigin: 'https://os.ezil.work' });
+    });
+
+    it.each([
+        ['an unverified email', { emailVerified: false }],
+        ['no email', { emailNormalized: null }],
+        ['a trial already started', { own: quoted({ status: 'trialing', stripeSubscriptionId: 'sub_x' }) }],
+        ['another account holding this person', { claimedElsewhere: true }],
+        ['an earlier paid plan', { paidBefore: true }],
+    ])('quoteTrial refuses %s before any claim or Stripe call', async (_name, facts) => {
+        const f = trialFixture(facts);
+        await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_unavailable' });
+        expect(f.trial.claimTrialQuote).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    it('quoteTrial refuses a paid subscriber and checkout refuses a trial for Premium', async () => {
+        const f = trialFixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ currentPeriodEnd: new Date('2026-11-20T00:00:00Z') })]);
+        await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_unavailable' });
+        const g = trialFixture({ own: quoted() });
+        await expect(g.caller.createCheckout({ sku: 'premium_monthly_v3', trial: { trialEndsAt: trialEnd.toISOString() } }))
+            .rejects.toMatchObject({ message: 'trial_unavailable' });
+        expect(g.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    it('a trial checkout sends the stored quote: its end, a 2 h expiry from the quote, the trial id, one key per quote', async () => {
+        const f = trialFixture({ own: quoted() });
+        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: '2026-11-11T12:00:00Z' } })).resolves.toMatchObject({ sessionId: session.id });
+        expect(f.stripe.createCheckoutSession).toHaveBeenCalledWith(expect.objectContaining({ sku,
+            trial: { trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', trialEnd, expiresAt: new Date('2026-10-11T14:00:00Z') },
+            idempotencyKey: `trial-checkout:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:${epochSeconds(quotedAt)}` }));
+        expect(f.trial.attachTrialCheckout).toHaveBeenCalledWith({ trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, quotedAt,
+            checkoutSessionId: session.id, customerId: 'cus_fixture' });
+    });
+
+    it.each([
+        ['an end the caller was not quoted', quoted(), '2026-11-11T12:00:01Z'],
+        ['a quote older than 30 minutes', quoted({ quotedAt: new Date('2026-10-11T11:29:59Z') }), '2026-11-11T12:00:00Z'],
+        ['no quote at all', null, '2026-11-11T12:00:00Z'],
+        // R3: the verified identity changed after the quote (old@ quoted, new@ verified now): re-quote first.
+        ['a quote claiming an earlier verified email', quoted({ emailNormalized: 'old@gmail.com' }), '2026-11-11T12:00:00Z'],
+        ['a quote claiming an earlier sign-in subject', quoted({ authSubject: 'auth0:old-subject' }), '2026-11-11T12:00:00Z'],
+    ])('a trial checkout refuses %s as trial_quote_stale, before Stripe', async (_name, own, trialEndsAt) => {
+        const f = trialFixture({ own });
+        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt } })).rejects.toMatchObject({ message: 'trial_quote_stale' });
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    it('R3: a re-quote after the email changed claims the CURRENT identity, and checkout then succeeds', async () => {
+        const f = trialFixture({ own: quoted({ emailNormalized: 'old@gmail.com' }), emailNormalized: 'new@gmail.com' });
+        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } })).rejects.toMatchObject({ message: 'trial_quote_stale' });
+        const quote = await f.caller.quoteTrial();
+        expect(f.trial.claimTrialQuote).toHaveBeenCalledWith(expect.objectContaining({ emailNormalized: 'new@gmail.com' }));
+        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: quote.trialEndsAt } })).resolves.toMatchObject({ sessionId: session.id });
+    });
+
+    it('R2: a retry from another owned origin sends identical terms (the quote\'s origin), and a changed configuration re-quotes', async () => {
+        const f = trialFixture({ own: quoted({ returnOrigin: 'https://os-staging.ezil.work' }) });
+        f.trial.attachTrialCheckout.mockRejectedValueOnce(new Error('attach failed after provider create'));
+        const input = { sku, trial: { trialEndsAt: trialEnd.toISOString() } } as const;
+        await expect(f.caller.createCheckout(input)).rejects.toThrow('attach failed after provider create');
+        const other = f.router.createCaller({ ...f.ctx, headers: new Headers({ origin: 'https://os.ezil.org' }) });
+        await expect(other.createCheckout(input)).resolves.toMatchObject({ sessionId: session.id });
+        const [first] = f.stripe.createCheckoutSession.mock.calls[0]!;
+        const [second] = f.stripe.createCheckoutSession.mock.calls[1]!;
+        expect(second).toEqual(first);
+        expect(first.returnUrl).toBe('https://os-staging.ezil.work/billing/return?session_id={CHECKOUT_SESSION_ID}');
+        expect(first.cancelUrl).toBe('https://os-staging.ezil.work/os');
+        f.stripe.createCheckoutSession.mockRejectedValueOnce(new StripeRequestError(400, null, 'idempotency_error'));
+        await expect(f.caller.createCheckout(input)).rejects.toMatchObject({ message: 'trial_quote_stale' });
+        f.stripe.createCheckoutSession.mockRejectedValueOnce(new StripeRequestError(500, null, 'api_error'));
+        await expect(f.caller.createCheckout(input)).rejects.toMatchObject({ message: 'stripe_unavailable' });
+    });
+
+    it('checkoutStatus names a completed free-month checkout as a trial ($0 today), never a payment', async () => {
+        const f = trialFixture();
+        f.stripe.retrieveCheckoutSession.mockResolvedValue({ ...session, status: 'complete', paymentStatus: 'no_payment_required',
+            trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' });
+        await expect(f.caller.checkoutStatus({ sessionId: session.id })).resolves.toEqual({ status: 'complete',
+            paymentStatus: 'no_payment_required', sku, trial: true });
+        await expect(f.caller.quoteTrial({})).resolves.toMatchObject({ todayCents: 0 });
+    });
+
+    it('a superseded attach expires the session it opened and refuses', async () => {
+        const f = trialFixture({ own: quoted() });
+        f.trial.attachTrialCheckout.mockResolvedValue('stale' as never);
+        const expire = vi.fn(async () => 'expired' as const);
+        Object.assign(f.stripe, { expireCheckoutSession: expire });
+        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } })).rejects.toMatchObject({ message: 'trial_quote_stale' });
+        expect(expire).toHaveBeenCalledWith(session.id);
+    });
+
+    it('a re-quote retires the previous open checkout first, and refuses while a completed one is starting the trial', async () => {
+        const f = trialFixture({ own: quoted({ status: 'checkout', checkoutSessionId: 'cs_old' }) });
+        const expire = vi.fn(async () => 'expired' as const);
+        Object.assign(f.stripe, { expireCheckoutSession: expire });
+        await f.caller.quoteTrial();
+        expect(expire).toHaveBeenCalledWith('cs_old');
+        const g = trialFixture({ own: quoted({ status: 'checkout', checkoutSessionId: 'cs_done' }) });
+        Object.assign(g.stripe, { expireCheckoutSession: vi.fn(async () => 'complete' as const) });
+        await expect(g.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_checkout_complete' });
+        expect(g.trial.claimTrialQuote).not.toHaveBeenCalled();
+    });
+
+    it('a trialing Standard subscription is never upgraded to Premium (local row or Stripe status)', async () => {
+        const f = trialFixture();
+        f.store.subscriptionsFor.mockResolvedValue([subscription({ status: 'trialing', currentPeriodEnd: new Date('2026-11-20T00:00:00Z'),
+            trialStart: new Date('2026-09-20T00:00:00Z'), trialEnd: new Date('2026-11-20T00:00:00Z'), firstPaidAt: null })]);
+        f.store.stripeCustomerFor.mockResolvedValue('cus_fixture');
+        await domainFailure(() => f.caller.previewUpgrade(toCompute), 'upgrade_not_allowed');
+        await domainFailure(() => f.caller.confirmUpgrade(confirmInput), 'upgrade_not_allowed');
+        expect(f.stripe.previewUpgrade).not.toHaveBeenCalled();
+        expect(f.stripe.confirmUpgrade).not.toHaveBeenCalled();
+        const g = trialFixture();
+        g.store.subscriptionsFor.mockResolvedValue([subscription({ currentPeriodEnd: new Date('2026-11-20T00:00:00Z') })]);
+        g.store.stripeCustomerFor.mockResolvedValue('cus_fixture');
+        g.stripe.retrieveSubscription.mockResolvedValue({ ...await g.stripe.retrieveSubscription('sub_fixture'), status: 'trialing' });
+        await domainFailure(() => g.caller.previewUpgrade(toCompute), 'upgrade_not_allowed');
+    });
+
+    it('summary offers the trial to an eligible Free viewer with the server-computed end, and says why not otherwise', async () => {
+        const f = trialFixture();
+        await expect(f.caller.summary()).resolves.toMatchObject({ trialOffer: { eligible: true, sku, endsAt: '2026-11-11T12:00:00Z',
+            amountCents: 2000, currency: 'usd' } });
+        f.state.facts.paidBefore = true;
+        await expect(f.caller.summary()).resolves.toMatchObject({ trialOffer: { eligible: false, reason: 'paid_before' } });
+        f.trial.trialFacts.mockRejectedValue(new Error('relation "ezil_billing_trials" does not exist'));
+        const summary = await f.caller.summary();
+        expect(summary).toMatchObject({ enabled: true });
+        expect((summary as { trialOffer?: unknown }).trialOffer).toBeNull();
     });
 });

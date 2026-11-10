@@ -13,6 +13,7 @@ import { lifecycleExecutionArn, readMigrationReadyReceipt, startLifecycleJob } f
 import { isExecutionAbsent, toAwsClientError } from './aws-errors';
 import { cloudflareComputeProvider } from './cloudflare';
 import { finishFreshProvision, flipPlacementToAws, rollbackMigrationPlacement, readAdmissionCounters, readPlacement, withAdmission, type Placement, type PlacementDb } from './placement';
+import { paidComputeUnmetered } from './paid-compute-policy';
 import { advanceMigration, MigrationStepError, type MigrationDeps } from './provider-migrate-orchestrator';
 import { createProviderMigrationStore, type ComputeMigration } from './provider-migrate-store';
 import { provisionFor } from './provider-migrate-provision';
@@ -84,7 +85,8 @@ export function createMigrationRuntime(db: PlacementDb, options: {
                 if (!current || current.state !== 'exported' || provisionFor(current)) return;
                 const counters = await readAdmissionCounters(tx, lock, { userId: m.userId, computerId: m.computerId, now, monthStart: utcMonthStart(now) });
                 const decision = decideAdmission({ config, counters, userId: m.userId, now,
-                    region: { kind: 'lease', region: 'ap-south-1' }, instanceType: instanceTypeForTier(tier) });
+                    region: { kind: 'lease', region: 'ap-south-1' }, instanceType: instanceTypeForTier(tier),
+                    userHoursExempt: paidComputeUnmetered(entitlement) });
                 if (!decision.admit) throw new MigrationStepError(true);
                 const source = (await readPlacement(tx, m.computerId)).record;
                 if (source && source.provider !== 'cloudflare') throw new MigrationStepError(false);

@@ -27,6 +27,7 @@
 //   nested      creating folders inside the root navigates nothing: no entry, same address.
 //   invalid     an escaping link folder is dropped with a notice; the address then follows the editor.
 //   missing     a folder the server cannot open: the default opens with a notice, the address keeps the ask.
+//   repo        a folder beside a repository is refused (repository opens; no own-files ask).
 //   unsaved     a dirty editor's veto ("Stay") stops a Back: address and editor stay together; "Leave" proceeds.
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -444,6 +445,30 @@ const lastAsk = () => asks.at(-1);
     await t.context.close();
 }
 
+// ── a folder beside a repository ─────────────────────────────────────────────────────────────────────────
+{
+    const t = await tab(`/app/code?repo=${encodeURIComponent('https://github.com/octocat/Hello-World.git')}&folder=web`);
+    ok(await t.waitEditor('/workspace/projects/0e0e0e0e-0e0e-4e0e-8e0e-0e0e0e0e0e0e'), 'repo: the repository opens at its own folder');
+    ok(lastAsk().repository?.url === 'https://github.com/octocat/Hello-World.git' && lastAsk().codeFolder === undefined,
+        `repo: one repository ask, no own-files folder ask [${JSON.stringify(lastAsk())}]`);
+    await t.notice().waitFor();
+    ok((await t.notice().getAttribute('data-outcome')) === 'with_repository', 'repo: a visible notice says the folder was not opened');
+    const REPO_ADDR = `/app/code?repo=${encodeURIComponent('https://github.com/octocat/Hello-World.git').replace(/%2F/g, '/')}`;
+    ok(await t.waitAddress(REPO_ADDR), `repo: the address drops the refused folder after the first report, so a reload never says it again [${await t.address()}]`);
+    // A folder inside the checkout: its own entry, under the repository's keys alone (never `folder` beside them).
+    const lenR = await t.len();
+    await t.editorFrame().evaluate(() => window.openFolder('/workspace/projects/0e0e0e0e-0e0e-4e0e-8e0e-0e0e0e0e0e0e/repository'));
+    ok(await t.waitEditor('/workspace/projects/0e0e0e0e-0e0e-4e0e-8e0e-0e0e0e0e0e0e/repository'), 'repo: a folder inside the checkout opens');
+    await t.quiet();
+    ok(await t.len() === lenR + 1 && await t.address() === REPO_ADDR, `repo: one entry, and the address keeps the repository's keys alone [${lenR} -> ${await t.len()}, ${await t.address()}]`);
+    await t.page.goBack();
+    ok(await t.waitEditor('/workspace/projects/0e0e0e0e-0e0e-4e0e-8e0e-0e0e0e0e0e0e') && await t.address() === REPO_ADDR, 'repo: Back returns to the repository folder');
+    // Outside the checkout the person is in their own files: `folder` alone.
+    await t.editorFrame().evaluate(() => window.openFolder('/workspace/b'));
+    ok(await t.waitAddress('/app/code?folder=/workspace/b'), `repo: a folder outside the checkout is the person's own files [${await t.address()}]`);
+    await t.context.close();
+}
+
 // ── unsaved work: a veto stops Back; address and editor stay together ─────────────────────────────────────
 {
     const t = await tab(`/app/code?folder=${enc('/workspace/a')}`);
@@ -470,4 +495,4 @@ const lastAsk = () => asks.at(-1);
 
 ok(errors.length === 0, `no uncaught page errors [${errors.join(' | ')}]`);
 await browser.close(); shell.close(); editor.close();
-console.log(`PASS ${checks} checks: Code folder in the address bar (link, switch, Back/Forward, reload, reconnect, close, multi-root, nested, unicode, relative, invalid, missing, unsaved veto)`);
+console.log(`PASS ${checks} checks: Code folder in the address bar (link, switch, Back/Forward, reload, reconnect, close, multi-root, nested, unicode, relative, invalid, missing, repository, unsaved veto)`);

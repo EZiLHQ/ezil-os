@@ -9,6 +9,22 @@ import { hmacSha256Hex, timingSafeEqualHex, TOKEN_MAX_AGE_MS } from './hmac';
 export const DEFAULT_AI_GATEWAY_URL = 'https://ai.ezil.work';
 export const AI_PROXY_HEADERS_TIMEOUT_MS = 30_000;
 export const AI_PROXY_IDLE_TIMEOUT_MS = 30_000;
+/**
+ * Headers deadline for a non-stream (JSON) POST only. The Gateway sends a JSON reply's headers after the whole
+ * generation (jsonThrough reads the upstream body and settles first), so the 30 s deadline would cut every
+ * reply that takes longer, such as non-streamed Kimi K3. Same value as the extension's
+ * GATEWAY_COMPLETION_TIMEOUT_MS, counted here from this proxy's fetch. The Gateway figures below are cited
+ * from the Gateway owner, not verifiable in this repo: a 180 s upstream headers deadline (EZiL AI Gateway
+ * src/config.ts DEFAULT_UPSTREAM_HEADERS_TIMEOUT_MS) that starts at its upstream fetch, after admission; and,
+ * when this proxy aborts, a 20 s drain, after which a call still unanswered becomes upstream_timeout, pending,
+ * and disables that model route for everyone. 200 s is the Gateway owner's choice (3 Nov 2026): when the Gateway
+ * reaches its upstream fetch within 20 s of this fetch, its own deadline answers first (a 504 with its request
+ * id); within 40 s, its deadline still fires during the drain. Later than that, an abort here can pause a route the
+ * Gateway would still have answered. The extension's deadline, counted from its first send, usually aborts first,
+ * under the same condition from that send. A reply abandoned here may still be charged if the model finished.
+ * Streams keep the 30 s headers deadline.
+ */
+export const AI_PROXY_COMPLETION_TIMEOUT_MS = 200_000;
 /** Local safety ceiling; gateway validation/413 responses below it pass through. */
 export const AI_PROXY_MAX_BODY_BYTES = 160 * 1024;
 /** Error bodies are small JSON; read at most this much of one to log its `error.code`. */
@@ -261,6 +277,8 @@ export interface AiProxyDeps {
   readonly fetch: (input: Request) => Promise<Response>;
   readonly log?: (fields: Record<string, unknown>) => void;
   readonly headersTimeoutMs?: number;
+  /** Headers deadline for non-stream POST bodies (`isNonStreamBody`). */
+  readonly completionTimeoutMs?: number;
   readonly idleTimeoutMs?: number;
   readonly now?: () => number;
 }
@@ -477,6 +495,58 @@ function passThrough(
   );
 }
 
+/**
+ * True only when a POST body parses as a JSON object whose top-level `stream` is exactly `false`. The Gateway
+ * chooses SSE or JSON from this field (Accept is a client hint it does not act on), so it alone predicts when
+ * response headers arrive. Anything else (true, absent, not a boolean, not JSON, not UTF-8) is treated as a
+ * stream and keeps the short headers deadline; an absent `stream` means JSON to the Gateway, so such clients
+ * keep the old 30 s. The body is only inspected, never changed or logged.
+ */
+export function isNonStreamBody(body: Uint8Array | undefined): boolean {
+  if (body === undefined || body.byteLength === 0) return false;
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(body));
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) && (parsed as { stream?: unknown }).stream === false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The Gateways whose exact response cache EZiL Chat opts into, by the Worker's existing `EZIL_AI_GATEWAY_URL` as
+ * `resolveGatewayUrl` normalizes it. Staging's own Gateway only: production (`https://ai.ezil.work`, also the
+ * default) and anything else stay off until a production fee rule exists. Compiled in: the opt-in adds no setting.
+ */
+const EXACT_CACHE_GATEWAY_ORIGINS: ReadonlySet<string> = new Set(['https://ai-staging.ezil.work']);
+
+/**
+ * The Gateway's opt-in exact response cache (EZiL AI Gateway docs/RESPONSE-CACHE.md; contract confirmed by its owner,
+ * 2026-11-04T21:12Z) caches only POST /v1/messages with `stream: false`; /v1/responses ignores the opt-in and a stream
+ * with it is refused. Tool turns stay out too: a HIT would hand Copilot a recorded tool call to run again. So: a
+ * Gateway above, Messages, `stream` exactly false, and no tools or an empty tools array. The body is only read.
+ */
+export function exactCacheEligible(gatewayUrl: string, upstreamPath: string, body: Uint8Array | undefined): boolean {
+  if (!EXACT_CACHE_GATEWAY_ORIGINS.has(gatewayUrl)) return false;
+  if (upstreamPath !== '/v1/messages' || body === undefined || body.byteLength === 0) return false;
+  try {
+    const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(body));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return false;
+    const { stream, tools } = parsed as { stream?: unknown; tools?: unknown };
+    return stream === false && (tools === undefined || (Array.isArray(tools) && tools.length === 0));
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `x-ezil-cache-scope` for this computer: a versioned HMAC of the sandbox id under the proxy secret, never the id
+ * itself. The Gateway keys by the authenticated caller and payer as well, so a scope can only split one user's cache,
+ * never widen it.
+ */
+export async function exactCacheScope(secret: string, sandboxId: string): Promise<string> {
+  return `os-${(await hmacSha256Hex(secret, `ezil-exact-cache-scope:v1:${sandboxId.toLowerCase()}`)).slice(0, 32)}`;
+}
+
 export async function readLimited(body: ReadableStream<Uint8Array> | null, max: number): Promise<Uint8Array | null> {
   if (body === null) return new Uint8Array(0);
   const reader = body.getReader();
@@ -513,10 +583,13 @@ function errorCodeOf(bytes: Uint8Array): string | null {
 const GATEWAY_ERROR_CODES = new Set([
   'unauthorized', 'no_ezil_role', 'insufficient_credits', 'no_live_grant', 'not_a_member', 'role_mismatch',
   'forbidden', 'account_suspended', 'suspended', 'input_too_large', 'body_too_large',
-  'unsupported_bedrock_converse_request', 'unsupported_parameter', 'invalid_request', 'max_output_tokens_invalid',
+  'unsupported_bedrock_converse_request', 'unsupported_gemini_request', 'unsupported_parameter', 'invalid_request', 'max_output_tokens_invalid',
   'idempotency_conflict', 'idempotency_key_required', 'idempotency_replay', 'killswitch', 'paused', 'pause',
   'global_cap_reached', 'daily_budget_reached', 'window_budget_reached', 'no_provider_route', 'model_disabled', 'model_not_found', 'upstream_timeout',
   'rate_limited', 'concurrency_limit', 'tpm_limited', 'internal_error',
+  // Routing and entitlement refusals, never gateway_error: the editor re-lists its models after the first three
+  // (CATALOG_REFUSALS) and shows its own copy for the two upstream failures.
+  'model_unavailable', 'no_entitlement', 'model_not_allowed', 'upstream_error', 'upstream_unavailable',
 ]);
 const GATEWAY_ERROR_REASONS = new Set(['wrong_issuer', 'bad_signature', 'no_ezil_role', 'expired', 'token_expired',
   'wrong_audience', 'missing_token', 'invalid_token', 'revoked']);
@@ -532,7 +605,8 @@ function safeGatewayError(bytes: Uint8Array | null): Record<string, unknown> {
   if (typeof raw.request_id === 'string' && /^[a-zA-Z0-9_-]{1,128}$/.test(raw.request_id)) error.request_id = raw.request_id;
   if (raw.pause === 'operations' || raw.pause === 'reconciliation') error.pause = raw.pause;
   if (typeof raw.no_live_grant === 'boolean') error.no_live_grant = raw.no_live_grant;
-  for (const field of ['available_micro', 'hold_micro', 'input_bound_tokens', 'max_input_tokens']) {
+  // max_affordable_output_tokens: the 402's "a shorter reply would fit" hint, read by the ezil-models extension.
+  for (const field of ['available_micro', 'hold_micro', 'max_affordable_output_tokens', 'input_bound_tokens', 'max_input_tokens']) {
     if (Number.isSafeInteger(raw[field]) && (raw[field] as number) >= 0) error[field] = raw[field];
   }
   return error;
@@ -595,9 +669,18 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
     const value = request.headers.get(name);
     if (value !== null) headers.set(name, value);
   }
+  // Set here only: a client's own x-ezil-cache* headers are never forwarded (the allow-list above).
+  const exactCache = route.method === 'POST' && exactCacheEligible(deps.gatewayUrl, route.upstreamPath, body);
+  if (exactCache) {
+    headers.set('x-ezil-cache', 'exact');
+    headers.set('x-ezil-cache-scope', await exactCacheScope(deps.proxySecret, deps.sandboxId));
+  }
 
   const abort = new AbortController();
-  const headersTimer = setTimeout(() => abort.abort(), deps.headersTimeoutMs ?? AI_PROXY_HEADERS_TIMEOUT_MS);
+  const completion = route.method === 'POST' && isNonStreamBody(body);
+  const headersMs = completion ? deps.completionTimeoutMs ?? AI_PROXY_COMPLETION_TIMEOUT_MS : deps.headersTimeoutMs ?? AI_PROXY_HEADERS_TIMEOUT_MS;
+  let deadlinePassed = false;
+  const headersTimer = setTimeout(() => { deadlinePassed = true; abort.abort(); }, headersMs);
   const onDisconnect = () => abort.abort();
   request.signal.addEventListener('abort', onDisconnect, { once: true });
   if (request.signal.aborted) abort.abort();
@@ -615,8 +698,17 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
     );
   } catch {
     cleanup();
+    if (completion && deadlinePassed) {
+      // Its own code: the upstream may still complete and settle, so the user must not read it as "never ran".
+      log({ status: 504, code: 'os_completion_timeout', detail: 'completion_timeout', timeout_ms: headersMs });
+      return proxyError(504, 'os_completion_timeout',
+        `EZiL AI sent no complete reply within ${Math.round(headersMs / 1000)} seconds. It may still be charged if the model finished.`);
+    }
     const timedOut = abort.signal.aborted;
-    log({ status: timedOut ? 504 : 502, code: 'os_ai_unavailable', detail: timedOut ? 'headers_timeout' : 'fetch_failed' });
+    // The client going away (for a JSON body usually the extension's own deadline, whose clock starts first) is not
+    // a Gateway timeout: telemetry only, as no one receives this response.
+    const detail = request.signal.aborted && !deadlinePassed ? 'client_disconnected' : timedOut ? 'headers_timeout' : 'fetch_failed';
+    log({ status: timedOut ? 504 : 502, code: 'os_ai_unavailable', detail });
     return proxyError(
       timedOut ? 504 : 502,
       'os_ai_unavailable',
@@ -632,6 +724,10 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
     if (value !== null) outHeaders.set(name, value);
   }
   const requestId = upstream.headers.get('x-ezil-request-id');
+  // The Gateway's own answer for an opted-in call, HIT or MISS only; for any other call nothing is passed back.
+  const upstreamCache = upstream.headers.get('x-ezil-cache');
+  const cache = exactCache && (upstreamCache === 'HIT' || upstreamCache === 'MISS') ? upstreamCache : null;
+  if (cache) outHeaders.set('x-ezil-cache', cache);
 
   if (upstream.body === null) {
     cleanup();
@@ -664,7 +760,8 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
   const responses = route.upstreamPath === '/v1/responses';
   const stream = passThrough(upstream.body, deps.idleTimeoutMs ?? AI_PROXY_IDLE_TIMEOUT_MS, isSse, (outcome, terminal, code, usage) => {
     cleanup();
-    log({ status: upstream.status, request_id: requestId, code, stream: isSse, outcome, terminal, ...(responses ? { usage: usage ?? null } : {}) });
+    log({ status: upstream.status, request_id: requestId, code, stream: isSse, outcome, terminal, ...(responses ? { usage: usage ?? null } : {}),
+      ...(exactCache ? { cache } : {}) });
   }, abort, !upstream.ok, responses);
   return new Response(stream, { status: upstream.status, headers: outHeaders });
 }

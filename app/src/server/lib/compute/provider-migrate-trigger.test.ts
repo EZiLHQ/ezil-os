@@ -8,7 +8,7 @@ function fixture(sku = 'standard_monthly_v3') {
     const grant = vi.fn(async () => 'inserted');
     const deps = { now: () => start, store: { userForStripeCustomer: async () => 'user', upsertSubscription: async () => 'applied', enqueueOutbox: async () => {},
         resolvePaymentIssue: async () => {}, insertGrant: grant }, stripe: {
-        retrieveInvoice: async () => ({ id: 'in', status: 'paid', customer: 'cus', subscriptionId: 'sub', billingReason: 'subscription_create',
+        retrieveInvoice: async () => ({ id: 'in', status: 'paid', customer: 'cus', subscriptionId: 'sub', billingReason: 'subscription_create', total: 2000, amountPaid: 2000,
             lines: [{ lookupKey: `ezil_${sku}`, subscriptionId: 'sub', amount: 2000, periodStart: start, periodEnd: end }] }),
         retrieveSubscription: async () => ({ id: 'sub', customer: 'cus', sku, status: 'active', currentPeriodStart: start, currentPeriodEnd: end }),
     } } as unknown as ProcessorDeps;
