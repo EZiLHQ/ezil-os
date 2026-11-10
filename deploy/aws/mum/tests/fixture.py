@@ -27,7 +27,7 @@ for item in source.iterdir():
                 if pinned in text:
                     assert text.count(pinned) == 1, item.name
                     text = text.replace(pinned, unpinned)
-            assert "lt-0b68cfb18ad22869a" not in text, item.name
+            assert namespaces.PRD_LAUNCH_TEMPLATE not in text and namespaces.PRD_REPOSITORY.split("/", 1)[1] not in text, item.name
         (scripts / item.name).write_text(text)
 (checkout / "infra").mkdir()
 (checkout / "infra/app-computers").symlink_to(source.parents[2] / "infra/app-computers", target_is_directory=True)
