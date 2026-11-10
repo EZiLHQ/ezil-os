@@ -147,6 +147,35 @@ describe('park a failed release: settlement', () => {
         expect(s.log.mock.calls.map(c => String(c[0])).join('\n')).toMatch(new RegExp(`"event":"pool-park-settled".*"snapshot":"${SNAP}"`));
     });
 
+    it('closes usage ONCE at the validated physical stop (the saved authoritative time), never at the later replayed stop observation', async () => {
+        const s = parkSetup();
+        await s.reserve();
+        expect(parkReplay(await s.current())!.hostStoppedAt).toBe(HOST_STOPPED.toISOString());
+        const later = () => new Date(NOW.getTime() + 3 * 3_600_000); // the replayed stop is observed three hours later
+        s.finishStop().stopDate = later();
+        const lateDeps = { ...s.deps, now: later, clock: later } as ParkDeps;
+        await applyLifecycleReceipt(lateDeps, await s.current(), D);
+        expect(await s.current()).toMatchObject({ state: 'STOPPED', lastError: PARKED_FAILED_RELEASE });
+        expect(s.usage[0]!.stopped_at).toEqual(HOST_STOPPED); // the physical stop: no extra minutes are billed
+        expect(s.meter.stopped).toHaveBeenCalledTimes(1);
+        expect(s.meter.stopped.mock.calls[0]![0]).toMatchObject({ endedAt: HOST_STOPPED, reason: 'provider_stop' });
+        await applyLifecycleReceipt(lateDeps, await s.current(), D); // once: a later pass rewrites nothing
+        expect(s.usage[0]!.stopped_at).toEqual(HOST_STOPPED);
+        expect(s.meter.stopped).toHaveBeenCalledTimes(1);
+    });
+
+    it('a stop time before the failed release began, or in the future, never closes usage (it stays open, diagnostic recorded)', async () => {
+        const s = parkSetup();
+        await s.reserve();
+        s.finishStop();
+        // A rewritten transition time that no longer matches the saved physical stop is refused before any close.
+        s.host.stateTransitionAt = new Date(HOST_STOPPED.getTime() - 3_600_000);
+        await applyLifecycleReceipt(s.deps, await s.current(), D);
+        expect(parkReplay(await s.current())).toMatchObject({ error: expect.stringMatching(/host_changed|snapshot_not_post_stop/) });
+        expect(s.usage[0]!.stopped_at).toBeNull();
+        expect(s.meter.stopped).not.toHaveBeenCalled();
+    });
+
     it('a lost StartExecution is re-started FROM THE SAVED STOP DOCUMENT (same job id): it can never become a release', async () => {
         const s = parkSetup();
         const start = s.deps.starter!.start as ReturnType<typeof vi.fn>;
