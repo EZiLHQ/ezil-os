@@ -45,6 +45,11 @@ if name == "aws":
         source = pathlib.Path(os.environ["FAKE_S3"], bucket, key)
         if not source.is_file():
             sys.exit(1)
+        limited = os.environ.get('FAKE_LIMITED_TMP')  # stands in for a tmpfs too small for GB artifacts
+        with open(state / "dests", "a") as dests:
+            dests.write(args[6] + "\n")
+        if limited and args[6].startswith(limited):
+            sys.exit(1)
         shutil.copyfile(source, args[6])
 elif name == "docker":
     if args[:1] == ["build"]:
@@ -56,7 +61,15 @@ elif name == "docker":
         (state / 'built-ignored').write_text(str((context / 'app/ignored.txt').exists()))
         if os.environ.get('MUTATE_DURING_BUILD'):
             pathlib.Path(os.environ['MUTATE_DURING_BUILD']).write_text('changed during build\n')
-    if args[:1] == ["save"]:
+    if args[:2] == ["save", "-o"]:
+        (state / "save_path").write_text(args[2])
+        (state / "save_dir_mode").write_text(oct(pathlib.Path(args[2]).parent.stat().st_mode & 0o777))
+        if os.environ.get('FAKE_SAVE_FAIL') or (os.environ.get('FAKE_LIMITED_TMP') and
+                                                args[2].startswith(os.environ['FAKE_LIMITED_TMP'])):
+            sys.exit(1)
+        shutil.copyfile(os.environ.get('FAKE_SAVE_TAR') or state / "save.tar", args[2])
+        (state / "saved").touch()
+    elif args[:1] == ["save"]:
         sys.stdout.write("image:" + args[1])
     elif args[:1] == ["load"]:
         (state / "loaded").write_bytes(sys.stdin.buffer.read())
@@ -67,6 +80,9 @@ elif name == "docker":
         loaded = state / "loaded"
         if os.environ.get('FAKE_INSPECT_JSON') and loaded.exists():
             data = json.loads(os.environ['FAKE_INSPECT_JSON'])
+            if after('--format') == '{{.Id}}':
+                print(os.environ.get('FAKE_ID_AFTER_SAVE', data['Id']) if (state / "saved").exists() else data['Id'])
+                sys.exit(0)
             print(json.dumps(data) if after('--format') == '{{json .}}' else data['Architecture'])
             sys.exit(0)
         if not loaded.exists() or loaded.read_bytes() != ("image:" + args[2]).encode():
@@ -75,11 +91,19 @@ elif name == "docker":
     elif args[:3] == ["compose", "version", "--short"]:
         print("2.39.4")
     elif args[:2] == ["container", "inspect"] and '--format' in args:
-        print('ezil-os-staging:previous sha256:' + '1' * 64)
+        if after('--format') == '{{.Image}}':
+            print(os.environ.get('FAKE_RUNNING_IMAGE') or json.loads(os.environ['FAKE_INSPECT_JSON'])['Id'])
+        else:
+            print('ezil-os-staging:previous sha256:' + '1' * 64)
     elif "up" in args:
+        if os.environ.get('FAKE_UP_CONSUMES_STDIN'):  # a compose child that drains the inline-bash script
+            sys.stdin.buffer.read()
+        (state / "export_at_up").write_text(str(bool(list((pathlib.Path(os.environ["SHIM_STATE"]).parent / "host").rglob("loaded-export.tar")))))
         with open(state / "log", "a") as log:
             log.write(json.dumps(["compose.env", pathlib.Path("compose.env").read_text()]) + "\n")
     elif "exec" in args:
+        if os.environ.get('FAKE_EXEC_CONSUMES_STDIN'):  # real `compose exec -T` forwards stdin
+            sys.stdin.buffer.read()
         print(os.environ['FAKE_SHA'] if 'process.stdout.write' in args[-1] else "Deployed SHA: " + os.environ["FAKE_SHA"])
 elif name == "curl":
     if args[-1] == 'http://169.254.169.254/latest/api/token':
@@ -203,10 +227,12 @@ class Sandbox:
         path.write_text("set -- " + " ".join(set_args) + "\n" + text)
         return host, path
 
-    def install(self, set_args, script=None, **environment):
+    def install(self, set_args, script=None, stdin=False, **environment):
         host, path = self.host_script(set_args, script)
-        result = subprocess.run(["bash", str(path)], capture_output=True, text=True, cwd=self.root,
-                                env=self.environment(**environment), timeout=60)
+        # stdin=True feeds the script on bash's stdin, the SSM `bash <<EOF` transport.
+        command, extra = (["bash"], {"input": path.read_text()}) if stdin else (["bash", str(path)], {})
+        result = subprocess.run(command, capture_output=True, text=True, cwd=self.root,
+                                env=self.environment(**environment), timeout=60, **extra)
         return host, result
 
 
