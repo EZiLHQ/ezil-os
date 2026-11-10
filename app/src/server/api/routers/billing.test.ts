@@ -1481,10 +1481,21 @@ describe('billing.aiAccount: the Usage balance read between summaries', () => {
         const summary = await f.caller.summary();
         const stripe = stripeCalls(f), enqueued = f.store.enqueueOutbox.mock.calls.length;
         const read = await f.caller.aiAccount();
-        expect(read).toEqual({ enabled: true, account: summary.enabled ? summary.ai.account : null });
+        expect(summary.enabled).toBe(true);
+        const ai = summary.enabled ? summary.ai : null;
+        expect(read).toEqual({ enabled: true, enrollment: ai?.enrollment, waiting: ai?.waiting, account: ai?.account });
         expect(read).toMatchObject({ account: { userId } });
         expect(stripeCalls(f)).toBe(stripe);
         expect(f.store.enqueueOutbox.mock.calls.length).toBe(enqueued);
+    });
+    it('returns the fresh enrollment: activating until the Gateway member appears, then enrolled', async () => {
+        const f = fixture();
+        let member: string | null = null;
+        const ctx = { ...f.ctx, user: { ...f.ctx.user!, app_metadata: { auth0_sub: 'auth0|stored' } } };
+        const caller = createBillingRouter(() => f.deps, { aiMember: async () => member }).createCaller(ctx);
+        expect(await caller.aiAccount()).toMatchObject({ enabled: true, enrollment: 'activating' });
+        member = 'works-member-fixture';
+        expect(await caller.aiAccount()).toMatchObject({ enabled: true, enrollment: 'enrolled', waiting: null });
     });
     it('is off with the billing tab and refuses an anonymous caller', async () => {
         const f = fixture();

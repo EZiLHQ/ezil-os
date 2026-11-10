@@ -886,6 +886,20 @@ try {
     balanceReply({ ...freeStarter, userId: 'someone-else', remainingMicro: M('55') });
     await pollAt(4 * 61_000);
     assert.doesNotMatch(win.text(), /\b55 credits|98 credits/);
+    // A new EZiL ID account activating: the balance read carries the fresh enrollment, so the row leaves "Setting up" as
+    // soon as the member exists (not at the next summary), goes back if the read says so, and keeps the summary's on an unknown one.
+    success(sample, freeAI(freeZero, { enrollment: 'activating', waiting: { credits: 100 } })); await refresh();
+    assert.match(win.text(), /Setting up your AI credits…/);
+    balanceReply(freeStarter, { enrollment: 'enrolled', waiting: null });
+    await pollAt(61_000);
+    assert.match(win.text(), /100 credits left of 100/);
+    assert.doesNotMatch(win.text(), /Setting up|credits waiting/);
+    balanceReply(freeZero, { enrollment: 'activating', waiting: { credits: 100 } });
+    await pollAt(2 * 61_000);
+    assert.match(win.text(), /Setting up your AI credits…[\s\S]*100 credits are added when this finishes/);
+    balanceReply(freeStarter, { enrollment: 'unknown-state' });
+    await pollAt(3 * 61_000);
+    assert.match(win.text(), /Setting up your AI credits…/, 'an unknown enrollment keeps the last known one');
     // A confirmed zero asks Billing for its recovery (`insufficient_credits`); Add credits stays a plain top-up.
     const topups = []; win.on('ezil:billing-topup', (_event, detail) => topups.push(detail));
     win.append('<button class="ezil-settings-tab" data-tab="billing"></button>');

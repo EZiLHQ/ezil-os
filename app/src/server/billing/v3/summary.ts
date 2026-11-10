@@ -360,16 +360,18 @@ now: Date): BillingSummaryV3['plan']['trial'] | undefined {
 }
 
 /**
- * `ai.account` and `ai.delivering` exactly as `buildSummaryV3` derives them, from the same plan, for `billing.aiAccount`:
- * the Usage poll's balance read, which needs no compute, Stripe or catalog input.
+ * `ai.enrollment`, `ai.waiting`, `ai.account` and `ai.delivering` exactly as `buildSummaryV3` derives them, from the same
+ * plan, for `billing.aiAccount`: the Usage poll's balance read, which needs no compute, Stripe or catalog input.
  */
 export function aiAccountSummaryV3(input: { subs: Input['subs']; userCreatedAt: Input['userCreatedAt']; paymentIssues: Input['paymentIssues'];
     operatorGrants?: readonly OperatorEntitlementRow[]; enrollment: BillingSummaryV3['ai']['enrollment']; now: Date;
-    ai: NonNullable<Parameters<typeof buildSummaryV3>[0]['ai']> }): { account: AiAccountV3; delivering?: { credits: number } } {
+    ai: NonNullable<Parameters<typeof buildSummaryV3>[0]['ai']> }): Pick<BillingSummaryV3['ai'], 'enrollment' | 'waiting' | 'delivering'> & { account: AiAccountV3 } {
     const operator = operatorAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues, grants: input.operatorGrants, now: input.now });
     const plan = planFromSubscriptions({ subs: input.subs, now: input.now, userCreatedAt: input.userCreatedAt, operator });
-    const delivering = input.enrollment === 'enrolled' ? waitingCredits(input.ai.receipts, input.now) : null;
-    return { account: aiAccountV3({ plan, ...input.ai, now: input.now }), ...(delivering ? { delivering } : {}) };
+    const enrolled = input.enrollment === 'enrolled';
+    const delivering = enrolled ? waitingCredits(input.ai.receipts, input.now) : null;
+    return { enrollment: input.enrollment, waiting: enrolled ? null : waitingCredits(input.ai.receipts, input.now),
+        account: aiAccountV3({ plan, ...input.ai, now: input.now }), ...(delivering ? { delivering } : {}) };
 }
 type Input = Parameters<typeof buildSummaryV2>[0];
 

@@ -664,9 +664,10 @@ describe('round 5 D1: AI enrollment, waiting credits and the EZiL ID action', ()
         for (const [args, state] of cases) {
             const enrollment = state as 'enrolled' | 'activating';
             const summary = buildSummaryV3({ ...args, enrollment: { state: enrollment, ezilIdUrl: null } });
-            const { account, delivering } = summary.ai;
+            const { account, delivering, waiting } = summary.ai;
             expect(aiAccountSummaryV3({ subs: args.subs, userCreatedAt: args.userCreatedAt, paymentIssues: args.paymentIssues,
-                operatorGrants: args.operatorGrants, enrollment, now: args.now, ai: args.ai! })).toEqual({ account, ...(delivering ? { delivering } : {}) });
+                operatorGrants: args.operatorGrants, enrollment, now: args.now, ai: args.ai! }))
+                .toEqual({ enrollment: summary.ai.enrollment, waiting, account, ...(delivering ? { delivering } : {}) });
         }
     });
     it('checkout off keeps top-up off in every state', () => {

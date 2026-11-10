@@ -597,7 +597,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
         }),
 
         /**
-         * `ai.account` and `ai.delivering` as `summary` sends them, for the Usage poll's balance freshness: database reads
+         * `ai.enrollment`, `ai.waiting`, `ai.account` and `ai.delivering` as `summary` sends them, for the Usage poll's balance freshness: database reads
          * and the Gateway's balance and usage page only. No Stripe read, no free-grant enqueue (`summary` and a computer open do that).
          */
         aiAccount: protectedProcedure.query(async ({ ctx, signal }) => {
