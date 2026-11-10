@@ -434,7 +434,7 @@ export function open_feedback_dialog (_opts) {
     const hasAppContext = typeof trusted?.computerId === 'string' && UUID.test(trusted.computerId)
         && typeof trusted.appSession === 'string' && trusted.appSession.length > 0;
     const computer = hasAppContext ? trusted.computerId : currentComputer()?.id;
-    const computerId = typeof computer === 'string' && UUID.test(computer) ? computer : null;
+    let computerId = typeof computer === 'string' && UUID.test(computer) ? computer : null;
     const appContext = Object.freeze({ computerId, ...(hasAppContext ? { appSession: trusted.appSession } : {}) });
     const screenshots = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackScreenshots === true;
     // On a touch device the first focus must not land in a text field: that raises the on-screen keyboard over
@@ -527,6 +527,8 @@ export function open_feedback_dialog (_opts) {
     if ( queuedEntry ) {
         try {
             const queuedBody = JSON.parse(queuedEntry.body);
+            // The queued request keeps the computer it was sent for, even if the current one changed since.
+            computerId = typeof queuedBody.computerId === 'string' && UUID.test(queuedBody.computerId) ? queuedBody.computerId : null;
             diagnosticSnapshot = queuedBody.diagnostics ?? null;
             diagnostics.checked = diagnosticSnapshot !== null;
             if ( screenshotConsent ) {
@@ -541,7 +543,8 @@ export function open_feedback_dialog (_opts) {
             restoredFromQueue = true;
         } catch { /* An unreadable queued body is treated as a new report. */ }
     }
-    if ( typeof _opts?.errorCode === 'string' && /^[a-z0-9_:-]{1,64}$/i.test(_opts.errorCode) ) {
+    // A resumed queued request is resent as it was: no new prefill.
+    if ( ! restoredFromQueue && typeof _opts?.errorCode === 'string' && /^[a-z0-9_:-]{1,64}$/i.test(_opts.errorCode) ) {
         // Opened from the opening screen's "Send feedback": name the error code so the report can be routed.
         // Round 4: also with a saved draft (appended once, within the 4,000-character limit).
         const line = `Error code: ${_opts.errorCode}`;

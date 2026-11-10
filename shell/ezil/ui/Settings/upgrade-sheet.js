@@ -325,6 +325,8 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
     function hideTrialTerms () {
         const box = dialog.querySelector('[data-role="trial-terms"]');
         if ( box ) box.hidden = true;
+        // The wide summary column shows the quoted date too: drop the quote so it does not sit beside the error either.
+        if ( quote ) { quote = null; renderTrialTerms(); }
     }
     function showTrialTerms (changed = false) {
         const box = dialog.querySelector('[data-role="trial-terms"]');
@@ -577,7 +579,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
                 if ( staleRetried ) {
                     if ( ! closed ) {
                         // The date shown is the one that just went stale: hide it until Retry quotes a fresh one.
-                        dialog.querySelector('[data-role="trial-terms"]').hidden = true;
+                        hideTrialTerms();
                         show("Your free month's end date changed again. Try again to see the new date.", 'Retry', () => { quote = null; void create(); });
                     }
                 } else { staleRetried = true; stale = true; }

@@ -336,6 +336,8 @@ test('trial_quote_stale twice stops at an explicit Retry: no checkout loop, one 
     assert.equal(h.count('billing.createCheckout'), 2, 'no third checkout without a click');
     assert.equal(h.mounted, 0);
     assert.match(h.text(), /end date changed again/);
+    assert.doesNotMatch(h.q('[data-role="trial-first-charge"]').textContent + h.q('[data-role="trial-cancel-by"]').textContent, /2027|Feb/,
+        'the stale date is not left in the wide summary column either');
     assert.equal(h.q('[data-role="trial-terms"]').hidden, true, 'the date that just went stale is not shown until Retry quotes a fresh one');
     const retry = h.q('[data-action="retry"]');
     assert.ok(retry);
@@ -382,6 +384,8 @@ test('refusals: trial_unavailable / trial_checkout_complete go back to Billing; 
     assert.ok(h.q('[data-action="return-to-billing"]'));
     assert.equal(h.q('[data-action="retry"]'), null);
     assert.equal(h.q('[data-role="trial-terms"]').hidden, true, 'no "your free month ends on…" beside a refusal');
+    assert.doesNotMatch(h.q('[data-role="trial-first-charge"]').textContent + h.q('[data-role="trial-cancel-by"]').textContent, /2027|Feb/,
+        'nor the quoted date in the summary column');
     h.handle.close();
     // Anything but a $0 Standard quote whose end is its first charge is refused before it is disclosed.
     for ( const bad of [{ todayCents: 2000 }, { sku: 'premium_monthly_v3' }, { firstChargeAt: '2027-03-01T00:00:00Z' }, { trialEndsAt: 'next month' }, { amountCents: 0 }] ) {

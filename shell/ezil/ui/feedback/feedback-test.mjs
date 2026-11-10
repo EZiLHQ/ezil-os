@@ -562,8 +562,14 @@ try {
                 // A new event in the ring would change a fresh snapshot: the resumed request must keep the queued one.
                 telemetry.capture({ eventClass: 'api_failure', site: 's', code: `between_opens_${text.length}` });
                 const shells = captureCalls.length;
-                open();
+                // Reopened later: another computer is current, and (blank case) from an error screen with a code to prefill.
+                const originalComputer = JSON.parse(first).computerId;
+                setCurrentComputer({ id: '66666666-6666-4666-8666-666666666666' });
+                if ( text ) open();
+                else { document.querySelector('#opener').focus(); feedback.open_feedback_dialog({ source: 'opening', errorCode: 'billing_files_on_aws' }); }
                 assert.equal(payload().clientRequestId, id, `${text || 'blank'}: the same request id`);
+                assert.equal(payload().computerId, originalComputer, 'the queued request keeps the computer it was sent for');
+                assert.equal(form().elements.description.value, text, 'no new prefill on a resumed request');
                 assert.equal(current().querySelector('pre').textContent, first, 'the preview is the queued body');
                 assert.equal(captureCalls.length, shells, 'no new capture for a request that is already queued');
                 assert.equal(current().querySelector('.ezil-feedback-image').hidden, false, 'the queued screenshot is shown');
@@ -571,6 +577,7 @@ try {
                 await until(() => calls.length === requests + 2 && ! current().querySelector('[type="submit"]').disabled);
                 assert.equal(calls.at(-1).body, first, 'the re-send is byte-identical');
                 close();
+                setCurrentComputer({ id: originalComputer });
                 window.localStorage.removeItem(outboxKey);
                 window.localStorage.removeItem(draftKey);
             }
