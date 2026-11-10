@@ -3,7 +3,7 @@ import { isPoolReleaseRecovering } from './aws-pool-release-recovery';
 import { isStalledPoolAdoptPending } from './aws-pool-adopt-stall';
 import { settleReplacementGeneration } from './aws-rebase-generation';
 import { adoptRecoveryReplay, matchesAdoptRecovery, failPoolOpenRelease, isPoolOpenRelease, poolAdoptSource, POOL_OPEN_RELEASE, POOL_OPEN_RELEASE_FAILED } from './aws-pool-recovery';
-import { writePoolOpen } from './placement';
+import { readRecordedLowerDigest, writePoolOpen } from './placement';
 import { PoolCapacityPressure } from './aws-pool-errors';
 import { cancelComputerDemand } from './aws-pool-demand';
 import { demandDeploymentDigest, type CapacityDemand } from './capacity-demand';
@@ -67,6 +67,7 @@ import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
 import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
 import { applyLifecycleReceipt, isPoolMode, lifecycleExecutionArn, POOL_RELEASED, sessionEndWork, type PoolDeps, enforceSessionLimits, FLEET_RECONCILE_LIMIT, reconcileAwsFleet, reconcileGuestStop, sessionLimitCaps, settleUnconfirmedAwsPlacement, startLifecycleJob, type LifecycleExecutionReader, type SessionLimit } from './aws-receipts';
 import type { ActivityResult, ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult, TerminateResult } from './provider';
+import { paidComputeUnmetered, paidUserHoursExemption } from './paid-compute-policy';
 import { plusPlanIds, tierForEntitlement, type EntitlementRecord } from './tier';
 import { requestAwsRestart } from './aws-restart';
 import { poolPriorityForEntitlement } from './select';
@@ -146,6 +147,11 @@ export interface AwsProviderDeps {
     /** Legacy tier source for callers that do not supply a resolved record. */
     tierFor?: (userId: string) => Promise<AwsTier>;
     /**
+     * Paid compute policy v1: whether the CALLER holds a verified active Standard/Premium plan (from the same lazily
+     * resolved entitlement as `tierFor`). Absent: read billing for the caller. Any failure: not exempt.
+     */
+    paidCompute?: () => Promise<boolean>;
+    /**
      * Round 6 R2-3: the owner's active paid plan still waits for its new period's compute grant, so the tier reads
      * Free for a moment (billing compute-access `computeGrantPending`; the default imports it lazily, like progress.ts).
      */
@@ -219,7 +225,7 @@ const notReady = (errorCode: string, retryable = false, error = errorCode): Ensu
 /**
  * Round 6 R2-2: one line per AWS boot decision, so a cold open beside an idle spare says why. `path` is warm (a pool
  * adopt), cold (a cold provision/replace), wait (no boot on this ask: capacity demand, a pool release first, a grant
- * pending) or none (admission refused). `reason`: adopted, or why not warm (not_pool, not_stopped, tier_free,
+ * pending) or none (admission refused, or rebase_required: the volume's recorded lower is not the deployment's). `reason`: adopted, or why not warm (not_pool, not_stopped, tier_free,
  * release_failed, pool_type, volume_check, no_spare, capacity, volume_attached, grant_pending), or the refusal. No id beyond 8 chars.
  */
 function logAwsOpen(computerId: string, path: 'warm' | 'cold' | 'wait' | 'none', reason: string): void {
@@ -391,9 +397,20 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         let fresh = (await ownPlacement(c)) ?? p;
         if (await reconcileGuestStop(reconcileDeps(), fresh, deployment)) return { placement: (await ownPlacement(c)) ?? fresh, limit: null };
         if (!limits) return { placement: fresh, limit: null, computeLaunching: isReplacementLaunching(fresh, executionInput) };
-        const limit = await enforceSessionLimits(reconcileDeps(), fresh, deployment, { now: now(), caps: sessionLimitCaps(e), enforceLeaseExpiry: false });
+        const limit = await enforceSessionLimits(reconcileDeps(), fresh, deployment, { now: now(), caps: sessionLimitCaps(e), enforceLeaseExpiry: false,
+            userHoursExempt: owner => owner.toLowerCase() === c.userId.toLowerCase() ? callerUserHoursExempt(c.userId) : paidUserHoursExemption()(owner) });
         if (limit) fresh = (await ownPlacement(c)) ?? fresh;
         return { placement: fresh, limit, computeLaunching: isReplacementLaunching(fresh, executionInput) };
+    };
+
+    /** Paid compute policy v1 (`paid-compute-policy.ts`): the caller's exemption from the per-person monthly hour cap. */
+    const callerUserHoursExempt = async (userId: string): Promise<boolean> => {
+        try {
+            if (deps.entitlement !== undefined) return paidComputeUnmetered(deps.entitlement);
+            return deps.paidCompute ? await deps.paidCompute() : await paidUserHoursExemption()(userId);
+        } catch {
+            return false;
+        }
     };
 
     /**
@@ -488,10 +505,12 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
         /** Round 6 R2-2: why there is no pool tier (the caller knows): not STOPPED, or a failed pool-open release. */
         untiered: 'not_stopped' | 'release_failed' = 'not_stopped') => {
         let own: CapacityDemand | null | undefined;
+        // Paid compute policy v1: resolved before the admission lock, never inside it.
+        const userHoursExempt = await callerUserHoursExempt(request.userId);
         // Round 6 R2-2: why this boot is not a warm adopt, for its one `aws-open` line (set where the pool path declines).
         let coldReason = 'unknown';
         const result = await reservePoolHostForBoot(deps.db,
-            db => runAdmission(db, request, { env: e, now }),
+            db => runAdmission(db, request, { env: e, now, userHoursExempt }),
             async (tx, p) => {
                 const cold = workRef.get()!;
                 const deployment = cold.intent.deployment;
@@ -537,7 +556,7 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                 const outcome = await deps.pool.reserveDemand({ kind: request.kind === 'create' ? 'create' : 'wake', userId: request.userId,
                     computerId: error.target.computerId, requestId: newId(), region: error.target.region, zoneId: error.target.zoneId,
                     instanceType: error.target.instanceType, deploymentDigest: demandDeploymentDigest(cold.intent.deployment),
-                    source: request.kind === 'lease' ? request.expected : null });
+                    source: request.kind === 'lease' ? request.expected : null, userHoursExempt });
                 if (typeof outcome === 'object') return { admitted: false as const, reason: 'capacity_attempt_expired' as const, capacityAttemptId: outcome.attemptId };
                 return outcome === 'refused' ? { admitted: false as const, reason: 'region_capacity' as const }
                     : { admitted: false as const, reason: 'capacity_waiting' as const };
@@ -698,6 +717,14 @@ export function createAwsEc2Provider(deps: AwsProviderDeps): ComputeProvider & {
                     // Region is sticky: the deployment is the placement's own region, never another.
                     const deployment = cfg.deployments[placement.region];
                     if (!deployment) return notReady('region_not_configured');
+                    // A volume opens only on the lower it last booted on: any other host's guard refuses it
+                    // (`lower_digest_mismatch`) after a pool host or a new instance is spent, and every later open
+                    // repeats that. Only an operator rebase moves a volume to this deployment's lower, so an older or
+                    // never-recorded lower is refused here, before any lease, release, admission or start.
+                    if (deployment.lowerImageDigest && await readRecordedLowerDigest(deps.db, placement.computerId) !== deployment.lowerImageDigest) {
+                        logAwsOpen(c.computerId, 'none', 'rebase_required');
+                        return notReady('computer_rebase_required');
+                    }
                     // Round 6 R2-3: a paid plan whose new period's grant has not landed reads as Free for a moment. Never
                     // boot it as the Free hold (cold, at the hold size): wait, so the next ask opens on the paid tier.
                     // Unknown is not pending: a failed billing read keeps today's open, never an endless wait.

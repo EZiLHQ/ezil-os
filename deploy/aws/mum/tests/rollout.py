@@ -88,20 +88,22 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(again,back)
 
     def test_registry_full_refuses_without_dropping_any_record(self):
-        records=[self.source,*[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,43)]]
-        self.assertEqual(len(records),24)
+        records=[self.source,*[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,44)]]
+        self.assertEqual(len(records),25)
         for record in records: manifest.validate(record, source=True, repository=TOOL.REPOSITORY)
         original=copy.deepcopy(records)
         envelope={'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:dict(self.source,releases=records)}})}
+        frozen=copy.deepcopy(envelope)
         with self.assertRaisesRegex(ValueError,'registry full'): TOOL.edit_release_secret(envelope,self.old,self.new,[self.target])
         self.assertEqual(records,original)
+        self.assertEqual(envelope,frozen)
 
-    def test_twenty_three_to_twenty_four_maintenance_and_rollback_preserve_all_records(self):
-        extra=[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,42)]
+    def test_twenty_four_to_twenty_five_maintenance_and_rollback_preserve_all_records(self):
+        extra=[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,43)]
         records=[self.source,*extra]
         target=dict(self.target,previousLowerImageDigest=None,previousLowerImageRef=None)
         after=TOOL.pair({'settings':{'deployment':target}})
-        self.assertEqual(len(records),23)
+        self.assertEqual(len(records),24)
         for encoded in (True,False):
             d={TOOL.REGION:dict(self.source,releases=records),'other':{'keep':True}}
             envelope={'SecretString':json.dumps({'untouched':'synthetic',TOOL.KEY:json.dumps(d) if encoded else d})}
@@ -109,7 +111,7 @@ class RegistryTests(unittest.TestCase):
             forward=TOOL.edit_release_secret(envelope,self.old,after,[self.source,target])
             back=TOOL.edit_release_secret({'SecretString':json.dumps(forward)},after,self.old,[self.source])
             restored=json.loads(back[TOOL.KEY]) if encoded else back[TOOL.KEY]
-            self.assertEqual(len(restored[TOOL.REGION]['releases']),24)
+            self.assertEqual(len(restored[TOOL.REGION]['releases']),25)
             self.assertEqual(restored[TOOL.REGION]['releases'],[*records,target])
             self.assertTrue(all(r['previousLowerImageDigest'] is None and r['previousLowerImageRef'] is None
                                 for r in restored[TOOL.REGION]['releases']))
@@ -131,21 +133,24 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(isinstance(back[TOOL.KEY],str),encoded)
             self.assertEqual(envelope,frozen)
             self.assertEqual(TOOL.edit_release_secret({'SecretString':json.dumps(back)},self.old,self.old,[self.source]),back)
-            twentieth=dict(target,amiId='ami-'+'f'*17)
+            twenty_sixth=dict(target,amiId='ami-'+'f'*17)
+            full={'SecretString':json.dumps(back)};frozen_full=copy.deepcopy(full)
             with self.assertRaisesRegex(ValueError,'registry full'):
-                TOOL.edit_release_secret({'SecretString':json.dumps(back)},self.old,after,[twentieth])
-            oversized=dict(restored[TOOL.REGION],releases=[*records,target,twentieth])
+                TOOL.edit_release_secret(full,self.old,after,[twenty_sixth])
+            self.assertEqual(full,frozen_full)
+            oversized=dict(restored[TOOL.REGION],releases=[*records,target,twenty_sixth])
+            self.assertEqual(len(oversized['releases']),26)
             with self.assertRaisesRegex(ValueError,'invalid release registry'):
                 TOOL.edit_release_secret({'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:oversized}})},self.old,after,[])
 
-    def test_twenty_fourth_record_readback_limit_in_both_directions(self):
-        records=[self.target,*[dict(self.target,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,42)]]
-        self.assertEqual(len(records),23)
+    def test_twenty_fifth_record_readback_limit_in_both_directions(self):
+        records=[self.target,*[dict(self.target,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,43)]]
+        self.assertEqual(len(records),24)
         for maintenance in (True,False):
-            target=dict(self.target,amiId='ami-'+'f'*17,recipeVersion='1.0.25')
+            target=dict(self.target,amiId='ami-'+'f'*17,recipeVersion='1.0.45')
             if maintenance: target.update(previousLowerImageDigest=None,previousLowerImageRef=None)
             retained=[*records,target]
-            self.assertEqual(len(retained),24)
+            self.assertEqual(len(retained),25)
             for record in retained: manifest.validate(record,source=True,repository=TOOL.REPOSITORY)
             after=TOOL.pair({'settings':{'deployment':target}})
             for encoded in (True,False):
@@ -167,13 +172,13 @@ class RegistryTests(unittest.TestCase):
                         self.assertEqual(deployments[TOOL.REGION]['releases'],retained)
                         self.assertEqual(envelope,frozen)
 
-    def test_twenty_four_and_twenty_five_normal_records_fit_readback_but_count_stays_twenty_four(self):
-        records=[self.target,*[dict(self.target,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,44)]]
+    def test_twenty_five_and_twenty_six_normal_records_fit_readback_but_count_stays_twenty_five(self):
+        records=[self.target,*[dict(self.target,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,45)]]
         for record in records:
             manifest.validate(record,source=True,repository=TOOL.REPOSITORY)
             self.assertIsNotNone(record['previousLowerImageDigest'])
             self.assertIsNotNone(record['previousLowerImageRef'])
-        for count in (24,25):
+        for count in (25,26):
             with self.subTest(count=count):
                 d=dict(self.target,releases=records[:count])
                 public=app_ops.public_deployment(d)
@@ -183,7 +188,7 @@ class RegistryTests(unittest.TestCase):
                 self.assertLessEqual(len(json.dumps(readback,separators=(',',':')).encode('utf-8')),24000)
                 before=dict(self.target,releases=records[:count-1])
                 envelope={'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:before}})}
-                if count==24:
+                if count==25:
                     result=TOOL.edit_release_secret(envelope,self.new,self.new,[records[count-1]])
                     self.assertEqual(result[TOOL.KEY][TOOL.REGION]['releases'],records[:count])
                 else:
@@ -198,13 +203,24 @@ class RegistryTests(unittest.TestCase):
             TOOL.edit_release_secret(envelope,self.new,self.new,[])
         self.assertEqual(envelope,frozen)
 
+    def test_readback_byte_guard_refuses_the_twenty_fifth_append_unchanged(self):
+        records=[self.target,*[dict(self.target,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,43)]]
+        self.assertEqual(len(records),24)
+        d=dict(self.target,releases=records,storage={'padding':'x'*24000})
+        envelope={'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:d}})}
+        frozen=copy.deepcopy(envelope)
+        twenty_fifth=dict(self.target,amiId='ami-'+'f'*17,recipeVersion='1.0.45')
+        with self.assertRaisesRegex(ValueError,'^release registry readback exceeds SSM 24000-byte limit$'):
+            TOOL.edit_release_secret(envelope,self.new,self.new,[twenty_fifth])
+        self.assertEqual(envelope,frozen)
+
     def test_registry_cap_parity_with_app_source_and_manifest_contracts(self):
         # The app cannot import operator tooling; pin all five independent guards.
         root=HERE.parents[3]
         for name in ('aws-intent.ts','aws-rebase-release.ts'):
             source=(root/'app/src/server/lib/compute'/name).read_text()
-            self.assertEqual(re.findall(r'z\.array\(RebaseSourceReleaseSchema\)\.min\(1\)\.max\((\d+)\)',source),['24'])
-        for name, expected in (('json-tool.py',[24,24]),('registry_gc.py',[24])):
+            self.assertEqual(re.findall(r'z\.array\(RebaseSourceReleaseSchema\)\.min\(1\)\.max\((\d+)\)',source),['25'])
+        for name, expected in (('json-tool.py',[25,25]),('registry_gc.py',[25])):
             tree=ast.parse((HERE.parent/name).read_text())
             caps=[node.comparators[-1].value for node in ast.walk(tree) if isinstance(node,ast.Compare)
                   and isinstance(node.comparators[-1],ast.Constant)
@@ -1502,6 +1518,54 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.running_deployment['amiId'],self.source['amiId'])
         self.assertEqual(self.running_sha,target['agentCommit'])
         self.assertEqual(RELEASE.load_ledger(self.ledger)['entries'][-1]['appGitSha'],target['agentCommit'])
+
+    def seed_registry(self,count):
+        outer=manifest.loads(self.envelope['SecretString']);d=outer[TOOL.KEY][TOOL.REGION]
+        extra=[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,19+count)]
+        d['releases'].extend(extra)
+        self.assertEqual(len(d['releases']),count)
+        self.envelope['SecretString']=json.dumps(outer)
+        stage1.seed_ledger(self.ledger,self.envelope)
+        self.running_deployment=copy.deepcopy(d)
+        self.value['agentCommit']='9'*40  # new registry-compatible app, different from source
+        self.restage(self.source)
+        return extra
+
+    def test_twenty_four_to_twenty_five_rollback_retains_invoking_compatible_app(self):
+        extra=self.seed_registry(24)
+        before=TOOL.pair({'settings':{'deployment':self.running_deployment}})
+        self.through_app();RELEASE.promote(self.manifest,True)
+        target=manifest.read(self.manifest)
+        self.assertNotEqual(target['agentCommit'],self.source['agentCommit'])
+        self.assertEqual(len(self.running_deployment['releases']),25)
+        RELEASE.promote(self.manifest,True,rollback=True)
+        self.assertEqual(len(self.running_deployment['releases']),25)
+        self.assertCountEqual(self.running_deployment['releases'],[self.source,*extra,target])
+        self.assertEqual(TOOL.pair({'settings':{'deployment':self.running_deployment}}),before)
+        self.assertEqual(self.running_sha,target['agentCommit'])
+        self.assertEqual(RELEASE.load_ledger(self.ledger)['entries'][-1]['appGitSha'],target['agentCommit'])
+
+    def test_full_twenty_five_record_registry_refuses_promotion_before_secret_write(self):
+        self.seed_registry(25)
+        self.through_app()
+        envelope=copy.deepcopy(self.envelope);ledger=self.ledger.read_bytes();self.calls.clear()
+        with self.assertRaisesRegex(ValueError,'registry full'):
+            RELEASE.promote(self.manifest,True)
+        self.assertNotIn(('secret','put-secret-value'),self.calls)
+        self.assertEqual(self.envelope,envelope)
+        self.assertEqual(self.ledger.read_bytes(),ledger)
+
+    def test_twenty_fifth_record_requires_compatible_apply_app_receipt_before_secret_access(self):
+        self.seed_registry(24)
+        self.through_ready()
+        self.assertFalse((self.directory/'apply-app-receipt.json').exists())
+        envelope=copy.deepcopy(self.envelope);ledger=self.ledger.read_bytes();self.calls.clear()
+        with self.assertRaises((OSError,ValueError)):
+            RELEASE.promote(self.manifest,True)
+        self.assertEqual([c for c in self.calls if c[0]=='secret'],[])
+        self.assertEqual(self.envelope,envelope)
+        self.assertEqual(self.ledger.read_bytes(),ledger)
+        self.assertFalse((self.directory/'rebase-promotion.json').exists())
 
     def test_registry_gc_refresh_then_unchanged_promote_at_capacity(self):
         commit, after = self.prepare_registry_gc()

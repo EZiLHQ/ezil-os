@@ -1,11 +1,15 @@
 import type { ResolvedProvider } from './config';
-import { creditState, type GatewayModels } from './gateway';
+import { creditState, parseGatewayModels, type GatewayAvailability, type GatewayModels } from './gateway';
+import { credits } from './credits-format';
 
 type Result<T> = { value: T; code?: never; reason?: never } | { value?: never; code: string; reason?: string };
 export type CreditWindow = { seconds: number; budget_micro: string; used_micro: string; remaining_micro: string; started_at: string | null; resets_at: string | null };
 export type Balance = { available_micro: number; held_micro: number; window?: CreditWindow | null };
 export type UsageRow = { model: string; created_at: string; status: string; cost_micro: number | null; uncollected_micro: number | null };
-type PauseCatalog = Pick<GatewayModels, 'killswitch' | 'pause'>;
+/** A catalog row that states its availability (`ezil.gateway.models.v1`); `selectable` = a protocol this client speaks. */
+export type ModelAvailability = { label: string; availability: GatewayAvailability; selectable: boolean };
+type PauseCatalog = Pick<GatewayModels, 'killswitch' | 'pause'> & { models?: ModelAvailability[] };
+const MODEL_LINES = 20;
 export type AIStatus = { balance: Result<Balance>; usage: Result<UsageRow[]>; limits: Result<EffectiveLimits>; models: Result<PauseCatalog> };
 export const AI_NOTICE = 'AI responses may be inaccurate. Review changes before applying them.';
 const record = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -14,7 +18,8 @@ const micro = (value: unknown): value is number => typeof value === 'number' && 
 // The member_controls response from GET /v1/me/limits. Keep only fields used by the UI.
 const numericLimitKeys = ['concurrency', 'rpm', 'tpm', 'max_output_tokens', 'daily_budget_micro', 'monthly_budget_micro'] as const;
 type NumericLimit = typeof numericLimitKeys[number];
-type LimitPolicy = Partial<Record<NumericLimit, number>> & { allowed_models?: string[] };
+// `null` is a configured "no limit at this level" (Gateway catalog consumer contract §4), never unknown.
+type LimitPolicy = Partial<Record<NumericLimit, number | null>> & { allowed_models?: string[] };
 type Source = 'default' | 'role' | 'plan' | 'account' | 'user';
 type EffectivePolicy = { policy: LimitPolicy; sources: Partial<Record<keyof LimitPolicy, Source>> };
 const counterKeys = ['inflight', 'pending', 'rpm', 'tpm', 'day_micro', 'month_micro'] as const;
@@ -41,7 +46,7 @@ function parsePolicy(value: unknown): EffectivePolicy | undefined {
         if (!(key in value.policy)) continue;
         const n = value.policy[key];
         const s = value.sources[key];
-        if (!count(n) || !source(s)) return undefined;
+        if (!(n === null || count(n)) || !source(s)) return undefined;
         policy[key] = n;
         sources[key] = s;
     }
@@ -86,12 +91,8 @@ function parseEffectiveLimits(value: unknown): EffectiveLimits | undefined {
     };
 }
 
-export function credits(value: number | string): string {
-    // Format integer microcredits exactly, including window strings beyond Number's safe range.
-    const amount = BigInt(value);
-    const fraction = (amount % 1_000_000n).toString().padStart(6, '0').replace(/0+$/, '');
-    return (amount / 1_000_000n).toLocaleString('en-US') + (fraction ? `.${fraction}` : '');
-}
+// The exact formatter lives in credits-format.ts (shared with gateway.ts); re-exported for existing importers.
+export { credits };
 
 export const localResetTime = (date: string | Date): string => new Date(date).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 const windowLength = (seconds: number): string => seconds % 3600 === 0 ? `${seconds / 3600}-hour` : seconds % 60 === 0 ? `${seconds / 60}-minute` : `${seconds}-second`;
@@ -146,11 +147,13 @@ export async function readAIStatus(provider: ResolvedProvider | undefined, doFet
         }, doFetch, signal),
         get(provider, '/me/limits', parseEffectiveLimits, doFetch, signal),
         get<PauseCatalog>(provider, '/models', value => {
-            // Only global availability is displayed here. Missing pause fields stay unknown;
-            // catalog model caps/enabled flags belong to the model picker, not this snapshot.
+            // Global availability, and each row's own availability where the catalog states it. Missing pause fields
+            // stay unknown; catalog caps belong to the model picker, not this snapshot.
             if (!record(value) || typeof value.killswitch !== 'boolean'
                 || !(value.pause === null || value.pause === 'operations' || value.pause === 'reconciliation')) return undefined;
-            return { killswitch: value.killswitch, pause: value.pause };
+            const models = (parseGatewayModels(value)?.data ?? []).flatMap(row => row.availability && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(row.id)
+                ? [{ label: row.name ?? row.id, availability: row.availability, selectable: !!row.protocols?.length }] : []);
+            return { killswitch: value.killswitch, pause: value.pause, ...models.length ? { models } : {} };
         }, doFetch, signal),
     ]);
     return { balance, usage, limits, models };
@@ -184,8 +187,10 @@ const limitLabels: Record<NumericLimit, string> = {
 function policyLines(effective: EffectivePolicy, ceilings?: EffectiveLimits['ceilings']): string[] {
     const lines: string[] = [];
     for (const key of Object.keys(limitLabels) as NumericLimit[]) {
-        const configured = effective.policy[key];
+        const set = effective.policy[key];
         const ceiling = key === 'concurrency' || key === 'rpm' ? ceilings?.[key] : undefined;
+        if (set === null && ceiling === undefined) { lines.push(`${limitLabels[key]}: No limit set (${effective.sources[key]})`); continue; }
+        const configured = set ?? undefined;
         const limit = configured === undefined ? ceiling : ceiling === undefined ? configured : Math.min(configured, ceiling);
         if (limit === undefined) {
             if (ceilings) lines.push(`${limitLabels[key]}: unknown`);
@@ -219,6 +224,20 @@ function limitsLines(limits: EffectiveLimits): string[] {
     return lines;
 }
 
+// Gateway docs/CATALOG-CONSUMER-CONTRACT.md §2 "Reason codes and copy". Never a provider, route or deployment name.
+const REASON_TEXT: Record<GatewayAvailability['reasons'][number], string> = {
+    model_disabled: 'Not enabled on this Gateway.', no_active_pricing: 'Not enabled on this Gateway.', gateway_paused: 'Paused.',
+    no_route: 'Not available right now.', route_not_ready: 'Not available right now.',
+    not_allowed_for_caller: 'Not included for this access.', entitlement_required: 'Needs an active plan.', catalog_unavailable: 'Availability unknown — retry.',
+};
+
+/** Unknown is never "unavailable"; an available row this editor cannot call says so instead of "Available". */
+function availabilityText({ availability, selectable }: ModelAvailability): string {
+    if (availability.state === 'unknown') return 'Availability unknown — retry.';
+    if (availability.state === 'available') return selectable ? 'Available' : 'Not supported in this editor.';
+    return availability.reasons.length ? [...new Set(availability.reasons.map(reason => REASON_TEXT[reason]))].join(' ') : 'Not available right now.';
+}
+
 /** Plain text only; callers must not interpret Gateway fields as Markdown or HTML. */
 export function statusView(state?: AIStatus): { text: string; lines: string[] } {
     if (!state) return { text: 'EZiL AI · Loading…', lines: ['EZiL AI', 'Loading credits, limits and recent usage…', AI_NOTICE] };
@@ -239,8 +258,8 @@ export function statusView(state?: AIStatus): { text: string; lines: string[] } 
     else if (limits?.entitlement.required && limits.entitlement.basis === null) text = 'EZiL AI · AI access needed';
     else {
         if (window && BigInt(window.remaining_micro) === 0n) text += ' · window used';
-        else if (limits?.policy.policy.daily_budget_micro !== undefined && limits.counters.day_micro >= limits.policy.policy.daily_budget_micro) text = 'EZiL AI · Daily credit budget used';
-        else if (limits?.policy.policy.monthly_budget_micro !== undefined && limits.counters.month_micro >= limits.policy.policy.monthly_budget_micro) text = 'EZiL AI · Monthly credit budget used';
+        else if (typeof limits?.policy.policy.daily_budget_micro === 'number' && limits.counters.day_micro >= limits.policy.policy.daily_budget_micro) text = 'EZiL AI · Daily credit budget used';
+        else if (typeof limits?.policy.policy.monthly_budget_micro === 'number' && limits.counters.month_micro >= limits.policy.policy.monthly_budget_micro) text = 'EZiL AI · Monthly credit budget used';
         else if (balance?.available_micro === 0 && balance.held_micro > 0) text = 'EZiL AI · Credits held';
         else if (balance?.available_micro === 0) text = 'EZiL AI · 0 credits';
         if (!limits) text += ' · limits unavailable';
@@ -258,6 +277,9 @@ export function statusView(state?: AIStatus): { text: string; lines: string[] } 
     }
     if (state.models.value) lines.push(paused ? global.text : 'Global AI pause: none reported.');
     else lines.push(`Global AI availability unknown. ${statusProblem(state.models).detail}`);
+    const models = state.models.value?.models ?? [];
+    if (models.length) lines.push('Models (the request still decides)', ...models.slice(0, MODEL_LINES).map(model => `${model.label}: ${availabilityText(model)}`),
+        ...models.length > MODEL_LINES ? [`${models.length - MODEL_LINES} more models not shown`] : []);
     lines.push(...(limits ? limitsLines(limits) : [`Limits unavailable. ${statusProblem(state.limits).detail}`]));
     lines.push('Recent usage (up to 5 requests)');
     if (state.usage.value) {

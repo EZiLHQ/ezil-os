@@ -99,8 +99,10 @@ describe('round 3 hours at the current configuration (D3/D8)', () => {
         args.sizePreference = 'std-2';
         expect(buildUsageV3(args).period.remainingHoursAtCurrent).toBe(0);
         args.epochs = [{ ...epoch, endedAt: '2026-10-26T11:30:00Z' }];
-        const period = buildUsageV3(args).period; // Rating stops a weight-2 session at the last whole second it can afford.
-        expect(period).toMatchObject({ remainingStandardSeconds: 1, remainingHoursAtCurrent: 0, currentWeight: 1 });
+        // Paid compute policy v1: a paid session is rated in full (bounded by its six-hour session cap), never clipped at
+        // the allowance it overran, and what is left floors at zero.
+        const period = buildUsageV3(args).period;
+        expect(period).toMatchObject({ remainingStandardSeconds: 0, remainingHoursAtCurrent: 0, currentWeight: 1 });
         expect(period.equivalents.every(item => item.hours === 0)).toBe(true);
     });
 });
@@ -190,9 +192,12 @@ describe('round 5 D3: usage shows the REAL volume and used space in GiB', () => 
             { computerId: c2, bytes: BigInt(45) * BigInt(GiB), measuredAt: now }];
         const scoped = buildUsageV3({ ...args, computerId: c1, volumeGiB: 50 }).storage;
         expect(scoped).toMatchObject({ capBytes: String(50 * GiB), disk: { provisionedGiB: 50, usedBytes: String(10 * GiB), usedGiB: 10 } });
-        // The upper-case id the router accepts scopes the same computer; the raw samples list stays complete.
+        // The upper-case id the router accepts scopes the same computer. The samples beside the disk are the ones
+        // it counted: an older shell sums `samples` when `disk.usedBytes` is null, so another computer's never shows.
         expect(buildUsageV3({ ...args, computerId: c1.toUpperCase(), volumeGiB: 50 }).storage.disk).toMatchObject({ usedGiB: 10 });
-        expect(scoped.samples.map(sample => sample.computerId).sort()).toEqual([c1, c2]);
+        expect(scoped.samples.map(sample => sample.computerId)).toEqual([c1]);
+        const fresh = buildUsageV3({ ...args, computerId: 'cccccccc-cccc-4ccc-8ccc-cccccccccccc', volumeGiB: 50 }).storage;
+        expect(fresh).toMatchObject({ state: 'unavailable', samples: [], disk: { usedBytes: null, usedGiB: null } });
         // No computer named: every computer's latest sample, as before.
         expect(buildUsageV3({ ...args, volumeGiB: 50 }).storage.disk).toMatchObject({ usedGiB: 55 });
     });

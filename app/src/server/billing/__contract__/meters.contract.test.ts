@@ -159,8 +159,11 @@ describe('billing summary wire contract', () => {
         ] });
         expect(result.meters.storage.usedBytes).toBe('1000');
         expect(result.meters.storage.measuredAt).toBe(now.toISOString());
-        expect(summary().meters.storage.usedBytes).toBe('0');
+        // Nothing measured is null with `unavailable` ("not measured yet"), never a measured-looking '0'.
+        expect(summary().meters.storage.usedBytes).toBeNull();
+        expect(summary().meters.storage.state).toBe('unavailable');
         expect(summary().meters.storage.measuredAt).toBeNull();
+        expect(result.meters.storage.state).toBe('ok');
     });
 
     it('keeps AI unavailable with zero-string balances even with funding keys configured', () => {
@@ -193,7 +196,7 @@ describe('billing summary wire contract', () => {
         expect(result.enabled).toBe(true);
         expect(result.version).toBe(1);
         expect(result.meters.storage.usedBytes).toBe('9007199254740993');
-        expect(result.meters.storage.capBytes).toBe('2000000000');
+        expect(result.meters.storage.capBytes).toBe('2147483648');
         expect(typeof BigInt(1)).toBe('bigint');
         expect(config.stripeSecret).toBe('synthetic-wire-secret');
         expect(config.stripeWebhookSecret).toBe('synthetic-wire-webhook');
@@ -211,8 +214,8 @@ describe('billing summary wire contract', () => {
     });
 
     it('holds Pro storage at Free until large storage is enabled', () => {
-        expect(summary({ subs: [subscription()] }).meters.storage.capBytes).toBe('2000000000');
+        expect(summary({ subs: [subscription()] }).meters.storage.capBytes).toBe('2147483648');
         expect(summary({ subs: [subscription()], config: readBillingConfig({ BILLING_LARGE_STORAGE: '1' }) })
-            .meters.storage.capBytes).toBe('20000000000');
+            .meters.storage.capBytes).toBe('21474836480');
     });
 });

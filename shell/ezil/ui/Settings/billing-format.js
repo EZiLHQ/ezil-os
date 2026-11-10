@@ -50,12 +50,96 @@ const ERRORS = {
     size_not_allowed: "That size isn't included in your plan.",
     customer_conflict: "We couldn't match your billing account. Contact support.",
     stripe_unavailable: 'Payments are unavailable right now. Try again in a few minutes.',
+    // Standard trial (billing.quoteTrial / createCheckout({ trial })).
+    trial_unavailable: "The free month isn't available for this account.",
+    trial_quote_stale: "Your free month's end date changed. Check the new date before you continue.",
+    trial_checkout_complete: 'Your free month is already starting. Wait a moment, then refresh Billing.',
 };
 
 // Optional DTO ceiling lets the consent sheet keep cap errors catalog-driven.
 export function errorCopy (message, maxCapCents) {
     if ( message === 'cap_out_of_range' && maxCapCents != null ) return `Choose a cap between $0 and ${dollars(maxCapCents, { compact: true })}.`;
     return Object.hasOwn(ERRORS, message) ? ERRORS[message] : 'Could not reach billing. Try again.';
+}
+
+// ── Standard trial (request standard-trial-01b28d18-20261105-v1) ─────────────
+// The server fixes the trial end as one UTC instant (one calendar month after the quote, month-end clamped); that
+// instant is the first charge. Every trial date is shown in the VIEWER's time zone, never Billing's UTC `dateLabel`,
+// so "Free until" and "ends on" never name different days near midnight. `timeZone` exists for tests only.
+
+export const TRIAL_SKU = 'standard_monthly_v3';
+// `payment_pending`: the free month ended and Stripe has not collected the first charge yet (it tries about an hour
+// after the end); Standard waits for it and is never shown as active.
+const TRIAL_STATES = new Set(['trialing', 'ending', 'payment_pending', 'payment_failed']);
+
+function zoned (options, timeZone) {
+    try { return new Intl.DateTimeFormat('en-US', { ...options, ...(timeZone ? { timeZone } : {}) }); }
+    catch { return new Intl.DateTimeFormat('en-US', options); }
+}
+
+/** "Feb 27, 2027": the trial instant's calendar day in the viewer's zone, or '—'. */
+export function trialDayLabel (iso, { timeZone } = {}) {
+    const time = Date.parse(iso ?? '');
+    return Number.isFinite(time) ? zoned({ year: 'numeric', month: 'short', day: 'numeric' }, timeZone).format(new Date(time)) : '—';
+}
+
+/**
+ * The trial instant in the viewer's zone, with the zone's name: "Feb 27, 2027 at 7:00 PM Pacific Standard Time";
+ * `full` adds the weekday, the long month and the IANA zone: "Saturday, February 27, 2027 at 7:00 PM Pacific Standard
+ * Time (America/Los_Angeles)". Seconds are never shown; the minute shown is never after the real instant. '—' when invalid.
+ */
+export function trialMomentLabel (iso, { timeZone, full = false } = {}) {
+    const time = Date.parse(iso ?? '');
+    if ( ! Number.isFinite(time) ) return '—';
+    const date = new Date(time);
+    const day = zoned(full ? { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' } : { year: 'numeric', month: 'short', day: 'numeric' }, timeZone);
+    const clock = zoned({ hour: 'numeric', minute: '2-digit', timeZoneName: 'long' }, timeZone);
+    const zone = clock.resolvedOptions().timeZone;
+    const id = full && typeof zone === 'string' && ! /^(Etc\/)?(UTC|GMT|UCT|Universal|Zulu)$/i.test(zone) ? ` (${zone})` : '';
+    return `${day.format(date)} at ${clock.format(date)}${id}`;
+}
+
+/** The server's eligible trial offer (`summary.trialOffer`), only while checkout is offered; null otherwise. */
+export function trialOfferOf (summary) {
+    const offer = summary?.trialOffer;
+    if ( summary?.version !== 3 || summary.actions?.checkout !== true || offer?.eligible !== true || offer.sku !== TRIAL_SKU ) return null;
+    if ( ! Number.isFinite(Date.parse(offer.endsAt ?? '')) || ! Number.isSafeInteger(offer.amountCents) || offer.amountCents <= 0 ) return null;
+    return summary.catalog?.offers?.some(item => item.sku === TRIAL_SKU) ? offer : null;
+}
+
+/** The quiet line for an ineligible viewer, for the three reasons a person can act on or understand; '' otherwise. */
+export function trialIneligibleCopy (summary) {
+    const offer = summary?.trialOffer;
+    if ( summary?.version !== 3 || summary.actions?.checkout !== true || offer?.eligible !== false ) return '';
+    return { trial_used: "You've already used your free month.", paid_before: 'The free month is for accounts without an earlier paid plan.',
+        email_unverified: 'Verify your email to start a free month.' }[offer.reason] ?? '';
+}
+
+/** `plan.trial` when the server reports one of the four states with a readable end; null otherwise. */
+export function planTrialOf (summary) {
+    const trial = summary?.plan?.trial;
+    if ( summary?.version !== 3 || ! trial || ! TRIAL_STATES.has(trial.state) || ! Number.isFinite(Date.parse(trial.endsAt ?? '')) ) return null;
+    return trial;
+}
+
+/**
+ * Current paid access on a v3 summary, never the SKU alone: a paid standing (paid, plan_ending, grace) with no trial,
+ * or a live free month (trialing, ending). A free month that ended (payment_pending, payment_failed) is paused. A
+ * checkout is confirmed only by this plus the purchased SKU (upgrade-sheet.js).
+ */
+const PAID_STANDINGS = new Set(['paid', 'plan_ending', 'grace']);
+export function paidAccess (summary) {
+    if ( summary?.enabled !== true || summary.version !== 3 ) return false;
+    const trial = summary.plan?.trial;
+    if ( trial ) return trial.state === 'trialing' || trial.state === 'ending';
+    return PAID_STANDINGS.has(summary.computer?.standing);
+}
+
+/** "$20.00": the trial's first charge from the server, else the Standard offer's price; null when neither reads. */
+export function trialAmount (summary, trial = planTrialOf(summary)) {
+    const cents = Number.isSafeInteger(trial?.amountCents) && trial.amountCents > 0 ? trial.amountCents
+        : summary?.catalog?.offers?.find(offer => offer.sku === TRIAL_SKU)?.priceCents;
+    return Number.isSafeInteger(cents) && cents > 0 ? dollars(cents) : null;
 }
 
 export function webUrl (value) {
@@ -75,6 +159,96 @@ export function creditsLabel (micro, balance = null) {
     if ( typeof micro === 'string' && /^\d{1,100}$/.test(micro) ) return (BigInt(micro) / 1000000n).toLocaleString('en-US');
     return typeof balance === 'number' && Number.isFinite(balance) && balance >= 0 && balance <= Number.MAX_SAFE_INTEGER
         ? Math.floor(balance).toLocaleString('en-US') : 'Not reported';
+}
+
+// ── Identity credits (`summary.ai.account`, exact microcredit strings) ─────────
+
+const MICRO = 1000000n;
+
+/** A canonical microcredit string as a BigInt, or null. Numbers are refused: they can't carry every microcredit. */
+export function microOf (value) {
+    return typeof value === 'string' && /^\d{1,100}$/.test(value) ? BigInt(value) : null;
+}
+
+/**
+ * Exact credits floored to `digits` decimals (never rounded up), trailing zeros trimmed:
+ * 1,246.75 · 0.5 · 1,000. `digits` 6 keeps every microcredit (the same text as the
+ * ezil-models extension's `credits()`). null for anything but a microcredit string.
+ */
+export function creditsDecimal (micro, digits = 2) {
+    const n = typeof micro === 'bigint' ? micro : microOf(micro);
+    if ( n === null || n < 0n || ! Number.isInteger(digits) || digits < 0 || digits > 6 ) return null;
+    const fraction = digits === 0 ? '' : String(n % MICRO / 10n ** BigInt(6 - digits)).padStart(digits, '0').replace(/0+$/, '');
+    return (n / MICRO).toLocaleString('en-US') + (fraction ? `.${fraction}` : '');
+}
+
+/** "14:02": the local clock time of an ISO instant (the "as of" of a kept balance). */
+export function clockLabel (iso) {
+    const time = Date.parse(iso ?? '');
+    return Number.isFinite(time) ? new Date(time).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }) : null;
+}
+
+const KIND_ORDER = ['plan', 'starter', 'previous', 'purchased', 'added'];
+
+/**
+ * Identity credits for Usage and Billing, from `summary.ai.account` only. The headline is whole
+ * credits (floor, OS-INTEGRATION-CONTRACT §7): "1,246 credits left of 1,500"; the details are
+ * exact to 2 decimals (floored) with every microcredit in `full`. The denominator is the total of
+ * the account's live grants, never the catalog, and only when above 0. `low`: at most 10% of that
+ * total is left. null = no readable balance: say so, show no figure.
+ * `previous` (the last good block for the same user) stands in when this one is unreadable, with
+ * `stale` and its own `asOf`. A block for another user than `userId` is never used.
+ */
+export function accountCredits (account, { previous = null, userId = null, planSku = null } = {}) {
+    const usable = value => value && typeof value === 'object' && microOf(value.remainingMicro) !== null
+        && (typeof value.userId !== 'string' || typeof userId !== 'string' || value.userId === userId) ? value : null;
+    const current = usable(account), shown = current ?? usable(previous);
+    if ( ! shown ) return null;
+    const remaining = microOf(shown.remainingMicro), total = microOf(shown.totalMicro);
+    const held = microOf(shown.heldMicro), used = microOf(shown.usedMicro);
+    const part = (label, micro) => ({ label, text: creditsDecimal(micro), full: creditsDecimal(micro, 6) });
+    const kinds = new Map();
+    const grants = shown.labelled === true && Array.isArray(shown.grants) ? shown.grants : [];
+    for ( const grant of grants ) {
+        const credits = microOf(grant?.creditsMicro);
+        if ( credits !== null && KIND_ORDER.includes(grant.kind) ) kinds.set(grant.kind, (kinds.get(grant.kind) ?? 0n) + credits);
+    }
+    const label = { plan: 'Plan', starter: 'Starter', previous: planSku === 'free_v3' ? 'Previous plan' : 'Earlier period', purchased: 'Purchased', added: 'Added' };
+    const details = [
+        ...KIND_ORDER.filter(kind => kinds.has(kind)).map(kind => part(label[kind], kinds.get(kind))),
+        ...used !== null ? [part('Used', used)] : [],
+        ...held !== null && held > 0n ? [part('Reserved', held)] : [],
+        part('Remaining', remaining),
+    ];
+    // Credits that expire on their own date (not the plan's): the earliest expiry per kind.
+    const expiring = ['previous', 'purchased', 'added'].map(kind => {
+        const live = grants.filter(grant => grant?.kind === kind && (microOf(grant.remainingMicro) ?? 0n) > 0n && Number.isFinite(Date.parse(grant.expiresAt ?? '')));
+        return live.length ? { kind, remaining: creditsLabel(String(live.reduce((sum, grant) => sum + microOf(grant.remainingMicro), 0n))),
+            expiresAt: live.map(grant => grant.expiresAt).sort((a, b) => Date.parse(a) - Date.parse(b))[0] } : null;
+    }).filter(Boolean);
+    // No live grant (every one expired, or the period's not delivered yet): no "of 0", no bar.
+    const known = total !== null && total > 0n ? total : null;
+    return {
+        left: creditsLabel(shown.remainingMicro),
+        total: known !== null ? creditsLabel(shown.totalMicro) : null,
+        percent: known !== null ? Number((remaining > known ? known : remaining) * 100n / known) : null,
+        empty: remaining === 0n,
+        // Warn from this total's own share left (the server's 10% rule), never `ai.state`, which judges one bucket.
+        low: known !== null && remaining * 10n <= known,
+        details, expiring,
+        stale: current === null, asOf: shown.asOf ?? null,
+    };
+}
+
+/** "Couldn't refresh · as of 14:02" for a kept balance (the time is the kept block's own). */
+export function staleCreditsCopy (asOf) {
+    const clock = clockLabel(asOf);
+    return `Couldn't refresh${clock ? ` · as of ${clock}` : ''}`;
+}
+
+/** "Plan 1,000 · Added 500 · Used 252.75 · Reserved 0.5 · Remaining 1,246.75" as HTML, each value titled with every microcredit. */
+export function accountDetailsHtml (details, encode) {
+    return details.map(({ label, text, full }) => `${encode(label)} <span title="${encode(`${full} credits`)}">${encode(text)}</span>`).join(' · ');
 }
 
 // ── Round 3 (plan §6.3/§6.4, contract v3 D1/D3/D4) ───────────────────────────
@@ -103,13 +277,17 @@ export function upgradeAiCreditsFromGrant (grantStdSeconds, fromOffer, toOffer) 
 /**
  * Plan-sheet bullets in the plan's order: configurations → storage → AI
  * credits → computer time. Built from the offer's numbers, never from
- * `offer.bullets` (catalog copy that predates round 3).
+ * `offer.bullets` (catalog copy that predates round 3). Paid compute policy v1:
+ * Standard and Premium have no monthly computer-hours allowance, so their last
+ * bullet is the six-hour session (`offer.sessionMaxSeconds`), never hours a month.
  */
 export function planBullets (offer, { existingDisk } = {}) {
     // A field the offer lacks drops its bullet rather than printing "undefined".
     const known = value => Number.isSafeInteger(value) && value > 0;
     const credits = known(offer.aiCredits?.amount) ? whole(offer.aiCredits.amount) : null;
     const hours = known(offer.fairUseHours) ? whole(offer.fairUseHours) : null;
+    const sessionHours = known(offer.sessionMaxSeconds) && offer.sessionMaxSeconds % 3600 === 0 ? offer.sessionMaxSeconds / 3600 : null;
+    const session = sessionHours && `Sessions up to ${sessionHours} hour${sessionHours === 1 ? '' : 's'}; your files are kept`;
     const size = known(offer.vcpu) && known(offer.memoryGiB) ? ` · ${offer.vcpu} vCPU · ${offer.memoryGiB} GB` : '';
     const keep = list => list.filter(Boolean);
     if ( offer.sku === 'free_v3' ) return { lead: null, bullets: keep([
@@ -129,7 +307,7 @@ export function planBullets (offer, { existingDisk } = {}) {
         `Your own AWS computer${size}`,
         diskBullet,
         credits && `${credits} AI credits every month`,
-        hours && `${hours} hours of computer time each month`,
+        session,
     ]) };
     const choices = offer.machineChoice ?? [];
     const vcpus = { 'std-2': 2, 'cmp-4': 4, 'cmp-8': 8 };
@@ -140,7 +318,7 @@ export function planBullets (offer, { existingDisk } = {}) {
         listed.length > 1 ? `Choose ${listed.slice(0, -1).join(', ')} or ${listed.at(-1)} vCPU — up to ${most} GB` : `Your own AWS computer${size}`,
         diskBullet,
         credits && `${credits} AI credits every month`,
-        hours && `${hours} hours of computer time at 2 vCPU (fewer at 4 or 8 vCPU)`,
+        session,
     ]) };
 }
 
@@ -167,6 +345,17 @@ export function heldClosedText (vcpu) {
  * a calendar-month allowance) says the month's allowance instead of the size: "About 5 of 8 hours left
  * this month" (R1-06).
  */
+/**
+ * Paid compute policy v1 (server: app/src/server/lib/compute/paid-compute-policy.ts): the server says so with
+ * `fairUse.policy: 'unmetered'` for a paid-access Standard or Premium plan, which has no computer-hours cutoff. Usage
+ * and Billing then show no hours left, no monthly time reset and no vCPU time conversion. Without that field (Free, a
+ * paid plan past its grace, an older server) the allowance applies and is shown as before.
+ */
+export function paidComputeUnmetered (summary) {
+    const sku = summary?.plan?.sku;
+    return summary?.fairUse?.policy === 'unmetered' && (sku === 'standard_monthly_v3' || sku === 'premium_monthly_v3');
+}
+
 export function hoursLeftLines (period, machineChoice = [], { monthly = false } = {}) {
     if ( ! period || ! Number.isSafeInteger(period.remainingHoursAtCurrent) || period.remainingHoursAtCurrent < 0 ) return null;
     const vcpuOf = size => machineChoice.find(m => m.size === size)?.vcpu ?? { 'std-2': 2, 'cmp-4': 4, 'cmp-8': 8, 'free-cf': 2 }[size];

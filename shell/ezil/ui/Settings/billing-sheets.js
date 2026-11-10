@@ -1,7 +1,8 @@
 // Versioned billing mutations share one modal lifetime with embedded checkout.
 import { openUpgradeSheet } from './upgrade-sheet.js';
 import { openSheetFrame } from './sheet-frame.js';
-import { dollars, dateLabel, dateTimeLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, planBullets, upgradeAiCreditsFromGrant } from './billing-format.js';
+import { dollars, dateLabel, dateTimeLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, planBullets, upgradeAiCreditsFromGrant,
+    TRIAL_SKU, trialOfferOf, planTrialOf, trialDayLabel, trialMomentLabel } from './billing-format.js';
 
 const COMPUTE = 'compute_monthly_v2';
 const STANDARD = 'standard_monthly_v2';
@@ -179,11 +180,14 @@ export function openDowngradeSheet (options) {
  * the next-start preference (`computer.size`), which the hold does not apply. Files on Cloudflare keep the
  * plain line; an unknown placed size (an older server, unreadable) says only that the files stay.
  */
-function cancelCopyV3 (summary) {
-    const at = summary.plan.renewal?.at;
-    const lead = `Your plan stays active ${at ? `until ${dateLabel(at)}` : 'until the end of your billing period'}, then moves to Free.`;
+function cancelCopyV3 (summary, trial = null) {
+    // Standard trial: the free month's end (the viewer's zone), and no charge; the computer outcome is the same.
+    const at = trial ? trial.endsAt : summary.plan.renewal?.at;
+    const day = iso => trial ? trialDayLabel(iso) : dateLabel(iso);
+    const lead = trial ? `Standard stays available until ${trialMomentLabel(at)} and you won't be charged. Then you move to Free.`
+        : `Your plan stays active ${at ? `until ${dateLabel(at)}` : 'until the end of your billing period'}, then moves to Free.`;
     if ( summary.computer?.filesOn !== 'aws' ) return `${lead} Your files and installed tools stay.`;
-    const after = at ? `After ${dateLabel(at)}` : 'After that';
+    const after = at ? `After ${day(at)}` : 'After that';
     const placed = summary.computer.awsSize;
     if ( ! placed || ! ['std-2', 'cmp-4', 'cmp-8'].includes(placed.size) ) return `${lead} Your files stay on your AWS computer.`;
     if ( placed.size !== 'std-2' && Number.isSafeInteger(placed.vcpu) ) return `${lead} ${after} your ${placed.vcpu} vCPU computer can't open on the Free plan; your files stay on your AWS computer.`;
@@ -192,20 +196,36 @@ function cancelCopyV3 (summary) {
     return `${lead} ${after} your computer opens under Free limits${hours ? ` (sessions up to ${hours} hour${hours === 1 ? '' : 's'})` : ''}; your files stay on your AWS computer.`;
 }
 
+/**
+ * Standard trial, `payment_pending`: the free month has ended and Stripe is collecting the first charge. The same
+ * cancelAtPeriodEnd stops later renewals; it never voids that first payment, and Standard is paused, not "active".
+ */
+function cancelCopyPending (trial) {
+    const amount = Number.isSafeInteger(trial.amountCents) && trial.amountCents > 0 ? `${dollars(trial.amountCents)} ` : '';
+    return `Your free month has ended and your first ${amount}payment is still being collected. Cancelling stops later renewals; it doesn't cancel that first payment. Standard stays paused until it goes through; if it does, Standard runs to the end of that month and then ends.`;
+}
+
 export function openCancelSheet (options) {
-    const sheet = billingSheet(options, 'cancel', `Cancel ${options.summary.version === 3 ? options.summary.plan.name : planName(options.summary.plan.family)}`);
+    // Standard trial: the same cancelAtPeriodEnd, in the free month's words (a live trial, or one whose first payment
+    // is being collected). Normal paid plans keep their copy.
+    const state = planTrialOf(options.summary)?.state;
+    const trial = state === 'trialing' ? options.summary.plan.trial : null;
+    const pending = state === 'payment_pending' ? options.summary.plan.trial : null;
+    const sheet = billingSheet(options, 'cancel', trial ? 'Cancel your free month' : `Cancel ${options.summary.version === 3 ? options.summary.plan.name : planName(options.summary.plan.family)}`);
     if ( sheet.existing ) return sheet.existing;
-    sheet.node('p', options.summary.version === 3
-        ? cancelCopyV3(options.summary)
+    sheet.node('p', pending ? cancelCopyPending(pending) : options.summary.version === 3
+        ? cancelCopyV3(options.summary, trial)
         : `Your plan stays active until ${dateLabel(options.summary.plan.periodEnd)}, then moves to Free. You can resume any time before then.`);
     const actions = sheet.node('div', null);
     actions.className = 'ezil-billing-sheet-actions';
-    sheet.button('Cancel plan', 'confirm', () => {
+    sheet.button(trial ? 'Cancel free month' : pending ? 'Cancel later renewals' : 'Cancel plan', 'confirm', () => {
         void sheet.request('billing.cancelAtPeriodEnd', { cancel: true }, data => {
-            sheet.result([`Your plan ends ${dateLabel(data.cancelsAt)}.`]);
+            sheet.result([trial ? `Your free month ends on ${trialDayLabel(data.cancelsAt ?? trial.endsAt)}. You won't be charged.`
+                : pending ? `Later renewals are cancelled. Your first payment is still being collected; if it goes through, Standard runs${Number.isFinite(Date.parse(data.cancelsAt ?? '')) ? ` until ${trialDayLabel(data.cancelsAt)}` : ' to the end of that month'} and then ends.`
+                : `Your plan ends ${dateLabel(data.cancelsAt)}.`]);
         });
     }, actions).className = 'ezil-billing-sheet-danger';
-    sheet.button('Keep plan', 'keep', sheet.close, actions).className = 'ezil-billing-sheet-secondary';
+    sheet.button(trial ? 'Keep free month' : 'Keep plan', 'keep', sheet.close, actions).className = 'ezil-billing-sheet-secondary';
     return sheet.handle;
 }
 
@@ -328,11 +348,24 @@ export function openPlanPickerSheet (options) {
         sheet.node('h3', offer.name, card);
         sheet.node('p', offer.tagline, card);
         sheet.node('p', offer.priceCents ? `${money(offer.priceCents)}/month` : '$0', card).className = 'ezil-billing-sheet-total';
+        // Standard trial (Standard only): the free month this viewer is offered; the checkout confirms the exact end.
+        const trial = offer.sku === TRIAL_SKU && offer.sku !== options.summary.plan.sku ? trialOfferOf(options.summary) : null;
         if ( offer.sku === options.summary.plan.sku ) {
             const current = sheet.node('button', 'Current plan', card);
             current.type = 'button';
             current.disabled = true;
             current.dataset.role = 'current-plan';
+        } else if ( trial ) {
+            const day = trialDayLabel(trial.endsAt);
+            const terms = sheet.node('div', null, card);
+            terms.dataset.role = 'trial-offer';
+            sheet.node('p', '$0 today', terms).className = 'ezil-billing-choice-lead';
+            sheet.node('p', `${money(trial.amountCents)}/month from ${day}. Cancel any time before ${day} and you pay nothing.`, terms);
+            sheet.button('Start your free month', 'trial', () => {
+                if ( ! options.summary.actions.checkout ) return;
+                sheet.close();
+                (options.checkout ?? openUpgradeSheet)({ ...options, sku: offer.sku, offer, trial: true });
+            }, card).dataset.sku = offer.sku;
         } else if ( offer.sku !== 'free_v3' ) {
             sheet.button('Upgrade', 'checkout', () => {
                 if ( ! options.summary.actions.checkout ) return;
@@ -376,13 +409,18 @@ export function openSessionEndSheet (options) {
     const sheet = billingSheet(options, action, 'Your session ended');
     if ( sheet.existing ) return null;
     sheet.dialog.dataset.sheet = 'session-end';
-    sheet.node('p', `Your ${summary.computer.sessionMaxSeconds / 3600}-hour session ended. ${offer.name}: No session time limit — ${money(offer.priceCents)}/month.`);
+    // Paid compute policy v1: paid sessions last up to six hours (offer.sessionMaxSeconds), never "no limit".
+    const longer = Number.isFinite(offer.sessionMaxSeconds) && offer.sessionMaxSeconds >= 3600 ? `sessions up to ${offer.sessionMaxSeconds / 3600} hours` : 'longer sessions';
+    // Standard trial: the free month this viewer is offered, $0 today; the checkout confirms the exact end.
+    const trial = free && offer.sku === TRIAL_SKU ? trialOfferOf(summary) : null;
+    sheet.node('p', `Your ${summary.computer.sessionMaxSeconds / 3600}-hour session ended. ${offer.name}: ${longer} — ${trial
+        ? `$0 today, then ${money(trial.amountCents)}/month from ${trialDayLabel(trial.endsAt)} unless you cancel` : `${money(offer.priceCents)}/month`}.`);
     offerDetails(sheet, offer);
     sheet.node('p', 'Your files and installed tools stay. Running processes stop. You can start a new session.');
-    sheet.button(free ? `Choose ${offer.name}` : `Upgrade to ${offer.name}`, 'continue', () => {
+    sheet.button(trial ? 'Start your free month' : free ? `Choose ${offer.name}` : `Upgrade to ${offer.name}`, 'continue', () => {
         if ( ! summary.actions[action] ) return;
         sheet.close();
-        const next = free ? (options.checkout ?? openUpgradeSheet)({ ...options, sku: offer.sku, offer })
+        const next = free ? (options.checkout ?? openUpgradeSheet)({ ...options, sku: offer.sku, offer, ...(trial ? { trial: true } : {}) })
             : openComputeUpgradeSheet(options);
         options.onContinue?.(next);
     });

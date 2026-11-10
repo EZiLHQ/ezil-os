@@ -8,6 +8,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import * as schema from '@/server/db/schema';
 import { deleteFeedback, ingestFeedback, listFeedback, type FeedbackDb } from './ingest';
 import { FEEDBACK_LIMITS, type FeedbackSubmit } from './types';
+import { feedbackAdminQueries, loadFeedbackReport, updateFeedbackStatus } from './admin-queries';
 
 const PG = process.env.EZIL_PG_TEST_URL;
 const NOW = new Date('2026-10-28T12:00:00.000Z');
@@ -72,4 +73,27 @@ describe.skipIf(!PG)('feedback ingest on PostgreSQL with app/drizzle/0011_feedba
         expect(await deleteFeedback(db, alice, created.created.id)).toBe(true);
         expect(await listFeedback(db, alice)).toEqual([]);
     });
+    it('persists a diagnostic screenshot report, audits developer triage and removes the owned attachment', async () => {
+        const user = randomUUID();
+        const traceId = randomUUID();
+        const body = { ...input(), diagnostics: { traceId, traceApp: 'desktop' as const,
+            tracePhases: [{ code: 'display', tMs: 42 }],
+            session: { capturedAt: NOW.toISOString(), pageAgeMs: 100, online: true, visibility: 'visible' as const } },
+            screenshot: { contentType: 'image/png' as const, dataBase64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aJx8AAAAASUVORK5CYII=' } };
+        const result = await ingestFeedback(db, user, body, NOW, SHA);
+        if (result.status !== 201) throw new Error('expected new report');
+        expect(result.created.screenshotAccepted).toBe(true);
+        const queries = feedbackAdminQueries(drizzle(client!, { schema }));
+        const deps = { ...queries, user: { id: randomUUID(), email: 'developer@example.test' }, allowList: 'developer@example.test' };
+        const report = await loadFeedbackReport(result.created.id, deps);
+        expect(report?.diagnostics).toMatchObject(body.diagnostics);
+        expect(report?.hasScreenshot).toBe(true);
+        expect(await updateFeedbackStatus(result.created.id, 'resolved', deps)).toBe(true);
+        expect((await listFeedback(db, user))[0]?.status).toBe('resolved');
+        const audit = await admin!.unsafe('SELECT action FROM ' + name + '.ezil_feedback_access_log WHERE report_id = $1 ORDER BY created_at', [result.created.id]);
+        expect(audit.map(row => row.action)).toEqual(['view_report', 'status_resolved']);
+        expect(await deleteFeedback(db, user, result.created.id)).toBe(true);
+        expect(await queries.findScreenshot(result.created.id)).toBeNull();
+    });
+
 });

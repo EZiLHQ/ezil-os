@@ -6,7 +6,7 @@
  * for its own files only, asks the next mint to reopen it: `codeFolder: {v:1, path}` in the
  * v2-signed `/sandbox/preview` body. That ask is a HINT, never authority:
  *   1. `planCodeFolder` checks it lexically, strips the SERVER's root (Cloudflare: the mounted
- *      `mountPath`, else CODE_FOLDER_UNMOUNTED_ROOT; AWS: `/workspace`), and refuses what is
+ *      `mountPath`, else REPO_OPEN_UNMOUNTED_ROOT; AWS: `/workspace`), and refuses what is
  *      outside that root (`outside`) or belongs to EZiL or to a project (`not_allowed`);
  *   2. a resolver walks the remainder ON THE COMPUTER with no symlink followed. The resolver is
  *      not here: it is a Worker path-resolution addition, single writer e1cd418a
@@ -20,11 +20,6 @@
  * Same grammar as the shell and the app: docs/contracts/code-folder-v1.vectors.json.
  */
 
-/**
- * A Cloudflare computer's root when no workspace store is mounted: the container's own `WORKSPACE_ROOT`,
- * `start-neko.sh`'s default (index.ts `codePreviewFolderParams`).
- */
-export const CODE_FOLDER_UNMOUNTED_ROOT = '/home/neko/project';
 /** The longest folder path (UTF-8 bytes) any layer accepts. */
 export const CODE_FOLDER_MAX_BYTES = 2048;
 /**

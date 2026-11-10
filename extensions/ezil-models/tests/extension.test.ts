@@ -6,15 +6,60 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { fakeVscode } from './fixtures/fake-vscode';
+import { isAppFailure } from '../src/failure';
 
 mock.module('vscode', () => fakeVscode);
-const { ConfigStore, resolveConfigPath, settingsSnippet } = await import('../src/extension');
+const { activate, appStartFailure, CONFIG_ENV, ConfigStore, resolveConfigPath, settingsSnippet } = await import('../src/extension');
 const { parseModelsConfig } = await import('../src/config');
 
 const VALID = JSON.stringify({ providers: { p: { type: 'openai', apiKey: 'sk-abc-12345' } }, models: [{ id: 'm', provider: 'p', model: 'gpt-5.5', roles: ['default', 'utility'] }] });
 const VALID_TWO = JSON.stringify({ providers: { p: { type: 'openai', apiKey: 'sk-abc-12345' } }, models: [{ id: 'm', provider: 'p', model: 'gpt-5.5' }, { id: 'n', provider: 'p', model: 'gpt-5.5-mini' }] });
 const root = fs.mkdtempSync(path.join(process.env.TMPDIR ?? os.tmpdir(), 'ezil-models-'));
 afterAll(() => fs.rmSync(root, { recursive: true, force: true }));
+
+describe('activation app failure', () => {
+    test('startup builder produces only fixed metadata and a fresh event ID', () => {
+        const record = appStartFailure();
+        expect(isAppFailure(record)).toBe(true);
+        expect(record).toEqual({ eventId: expect.any(String), source: 'ezil_chat', operation: 'app_start',
+            category: 'app_startup', code: 'app_start_failed', stage: 'startup', outcome: 'failed' });
+        expect(record.eventId).not.toBe(appStartFailure().eventId);
+    });
+    for (const kind of ['missing', 'malformed', 'valid'] as const) {
+        test(`${kind} activation config emits ${kind === 'valid' ? 'no' : 'one'} startup record`, async () => {
+            const configPath = path.join(root, `PRIVATE-startup-${kind}.json`);
+            if (kind !== 'missing') fs.writeFileSync(configPath, kind === 'valid' ? VALID : '{ PRIVATE malformed config');
+            const previousPath = process.env[CONFIG_ENV];
+            const window = fakeVscode.window as Record<string, unknown>;
+            const commands = fakeVscode.commands as Record<string, unknown>;
+            const savedWindow = { ...window }, savedCommands = { ...commands };
+            const sent: unknown[][] = [], logs: string[] = [];
+            const context = { subscriptions: [] as { dispose(): void }[] };
+            process.env[CONFIG_ENV] = configPath;
+            Object.assign(window, {
+                createOutputChannel: () => ({ appendLine: (line: string) => logs.push(line), show() {}, dispose() {} }),
+                createStatusBarItem: () => ({ show() {}, dispose() {} }),
+            });
+            Object.assign(commands, { registerCommand: () => ({ dispose() {} }), executeCommand: async (...args: unknown[]) => { sent.push(args); } });
+            try {
+                await activate(context as never);
+                const failures = sent.filter(([name]) => name === '_ezil.appFailure');
+                expect(failures).toHaveLength(kind === 'valid' ? 0 : 1);
+                if (kind !== 'valid') {
+                    expect(isAppFailure(failures[0]![1])).toBe(true);
+                    expect(failures[0]![1]).toMatchObject({ operation: 'app_start', category: 'app_startup', code: 'app_start_failed', stage: 'startup' });
+                    expect(JSON.stringify(failures)).not.toContain('PRIVATE');
+                    expect(logs.some(line => line.includes('[config]'))).toBe(true);
+                }
+            } finally {
+                for (const subscription of context.subscriptions) subscription.dispose();
+                for (const key of Object.keys(window)) delete window[key]; Object.assign(window, savedWindow);
+                for (const key of Object.keys(commands)) delete commands[key]; Object.assign(commands, savedCommands);
+                if (previousPath === undefined) delete process.env[CONFIG_ENV]; else process.env[CONFIG_ENV] = previousPath;
+            }
+        });
+    }
+});
 
 async function until(predicate: () => boolean, ms = 4000): Promise<boolean> {
     const deadline = Date.now() + ms;
@@ -173,6 +218,24 @@ describe('ConfigStore', () => {
         expect(loaded).not.toContain('sk-abc-12345');
         store.dispose();
     });
+
+    test('an ignored setting of a served model is reported as ignored, not as an entry that is not served', () => {
+        const file = path.join(root, 'kimi', 'models.json');
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, JSON.stringify({
+            providers: { ezil: { type: 'ezil-gateway', baseUrl: 'https://proxy.invalid/ai/v1', apiKey: 'synthetic-proxy-token' }, q: { type: 'anthropic', apiKey: '{env:EZIL_TEST_UNSET_KEY}' } },
+            models: [{ id: 'kimi', provider: 'ezil', model: 'us.moonshotai.kimi-k3', stream: true }, { id: 'c', provider: 'q', model: 'claude-sonnet-5' }],
+        }));
+        const logs: string[] = [];
+        const store = new ConfigStore(file, line => logs.push(line));
+        expect(store.load()).toBe(true);
+        expect(store.models().map(model => [model.id, model.stream])).toEqual([['kimi', false]]);
+        expect(store.notices()).toEqual(['models[0].stream is ignored for us.moonshotai.kimi-k3: EZiL AI cannot settle its streams exactly, so its replies arrive complete (stream: false)']);
+        expect(store.problems()).toHaveLength(2);
+        const loaded = logs.find(line => line.startsWith('[config] loaded'))!;
+        expect(loaded).toContain('1 model(s), 1 entry not served, 1 setting ignored (see below)');
+        store.dispose();
+    });
 });
 
 test('resolveConfigPath: env wins over the setting, the setting over the default', () => {
@@ -181,7 +244,7 @@ test('resolveConfigPath: env wins over the setting, the setting over the default
     expect(resolveConfigPath('/x/models.json', { EZIL_MODELS_CONFIG: '/env/models.json' })).toBe('/env/models.json');
 });
 
-test('settingsSnippet maps roles to the Copilot Chat settings', () => {
+test('settingsSnippet maps roles to the Copilot Chat settings, never chat.defaultModel (it would override a picked model)', () => {
     const config = parseModelsConfig(VALID);
-    expect(settingsSnippet(config.models)).toEqual({ 'chat.allowAnonymousAccess': true, 'chat.byokUtilityModelDefault': 'mainAgent', 'chat.defaultModel': 'm', 'chat.utilityModel': 'ezil/m' });
+    expect(settingsSnippet(config.models)).toEqual({ 'chat.allowAnonymousAccess': true, 'chat.byokUtilityModelDefault': 'mainAgent', 'chat.utilityModel': 'ezil/m' });
 });

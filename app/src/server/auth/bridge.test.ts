@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('server-only', () => ({}));
-const stub = vi.hoisted(() => ({ listUsers: vi.fn(), createUser: vi.fn(), updateUserById: vi.fn(), generateLink: vi.fn(), verifyOtp: vi.fn(), signOut: vi.fn(), adminClient: vi.fn() }));
+const stub = vi.hoisted(() => ({ listUsers: vi.fn(), createUser: vi.fn(), updateUserById: vi.fn(), generateLink: vi.fn(), verifyOtp: vi.fn(), signOut: vi.fn(), getClaims: vi.fn(), adminClient: vi.fn() }));
 vi.mock('./supabase-admin', () => ({ createAdminClient: stub.adminClient }));
-vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({ auth: { verifyOtp: stub.verifyOtp, signOut: stub.signOut } }) }));
+vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({ auth: { verifyOtp: stub.verifyOtp, signOut: stub.signOut, getClaims: stub.getClaims } }) }));
 
-import { bridgeAuth0Identity } from './bridge';
+import { bridgeAuth0Identity, refuseSilentAccountSwitch } from './bridge';
 const identity = { sub: 'auth0|one', email: 'Test@example.com' };
 const user = { id: 'supabase-user', email: 'test@example.com', email_confirmed_at: '2026-10-01T00:00:00Z', app_metadata: { auth0_sub: identity.sub } };
 beforeEach(() => {
@@ -77,5 +77,46 @@ describe('verified Auth0 identity bridge', () => {
         stub.verifyOtp.mockResolvedValue(result);
         await expect(bridgeAuth0Identity(identity)).rejects.toThrow('session_failed');
         expect(stub.signOut).toHaveBeenCalledWith({ scope: 'local' });
+    });
+});
+
+describe('a silent (prompt=none) sign-in never switches the OS account (review #3)', () => {
+    const signedIn = (claims: Record<string, unknown> | null, error: unknown = null) =>
+        stub.getClaims.mockResolvedValue({ data: claims ? { claims } : null, error });
+    const outcome = () => refuseSilentAccountSwitch(identity).then(() => 'allowed', (e: { code?: string }) => e.code ?? 'other');
+
+    it('allows the same linked subject', async () => {
+        signedIn({ sub: 'supabase-user', email: 'test@example.com', app_metadata: { auth0_sub: 'auth0|one' } });
+        expect(await outcome()).toBe('allowed');
+    });
+    it('refuses another linked subject, even with the same email', async () => {
+        signedIn({ sub: 'supabase-user', email: 'test@example.com', app_metadata: { auth0_sub: 'auth0|two' } });
+        expect(await outcome()).toBe('account_conflict');
+    });
+    it('a user not linked yet: the same verified email is the account the bridge would link, any other is a conflict', async () => {
+        signedIn({ sub: 'supabase-user', email: 'TEST@example.com', app_metadata: { provider: 'google' } });
+        expect(await outcome()).toBe('allowed');
+        signedIn({ sub: 'supabase-user', email: 'other@example.com', app_metadata: {} });
+        expect(await outcome()).toBe('account_conflict');
+        signedIn({ sub: 'supabase-user' });
+        expect(await outcome()).toBe('account_conflict');
+    });
+    it('nobody signed in: nothing to switch away from', async () => {
+        signedIn(null);
+        expect(await outcome()).toBe('allowed');
+    });
+    it('a session that cannot be read is session_failed, never a silent bridge', async () => {
+        signedIn(null, new Error('refresh_token_not_found'));
+        expect(await outcome()).toBe('session_failed');
+        stub.getClaims.mockRejectedValue(new Error('network'));
+        expect(await outcome()).toBe('session_failed');
+    });
+    it('reads only the session, and changes nothing', async () => {
+        signedIn({ sub: 'supabase-user', email: 'test@example.com', app_metadata: { auth0_sub: 'auth0|two' } });
+        await outcome();
+        expect(stub.listUsers).not.toHaveBeenCalled();
+        expect(stub.updateUserById).not.toHaveBeenCalled();
+        expect(stub.verifyOtp).not.toHaveBeenCalled();
+        expect(stub.signOut).not.toHaveBeenCalled();
     });
 });

@@ -223,6 +223,17 @@ describe('billing session sweep', () => {
         expect(f.isStillRunning).not.toHaveBeenCalled();
     });
 
+    it('Standard trial (review R4): a metered run retains started trials\' identities, and a retention failure never blocks the sweep', async () => {
+        const f = fixture();
+        const retain = vi.fn(async () => 2);
+        Object.assign(f.deps.store, { recordTrialIdentities: retain });
+        await f.run(21600);
+        expect(retain).toHaveBeenCalledWith();
+        const g = fixture();
+        Object.assign(g.deps.store, { recordTrialIdentities: vi.fn(async () => { throw new Error('db down'); }) });
+        await expect(g.run(21600)).resolves.toMatchObject({ examined: 1 });
+    });
+
     it('a second run at the same time does not stop or close an already stopped session', async () => {
         const f = fixture();
         await f.run(21600);
@@ -310,11 +321,16 @@ describe('billing session sweep', () => {
 });
 
 describe('v3 session deadlines', () => {
-    it('stops cmp-8 after one actual hour consumes four standard-hours', async () => {
+    // Paid compute policy v1 (founder e713d157): a paid session is never stopped or closed for hours, only at its
+    // six-hour session cap.
+    it('a Premium cmp-8 session passes its four standard-hours of grant and stops only at six hours (session_max)', async () => {
         const f = fixture([epoch({ size: 'cmp-8', weight: 4 })], { sku: 'premium_monthly_v3', allowance: 14400 });
-        expect(await f.run(3599)).toMatchObject({ stopped: 0 });
-        expect(await f.run(3600)).toMatchObject({ stopped: 1, closed: 1 });
-        expect(f.epochs[0]).toMatchObject({ endedAt: iso(3600), endReason: 'allowance_exhausted' });
+        for (const seconds of [3599, 3600, 21_599]) expect(await f.run(seconds)).toMatchObject({ stopped: 0, closed: 0 });
+        expect(f.stop).not.toHaveBeenCalled();
+        expect(f.epochs[0]).toMatchObject({ endedAt: null, endReason: null });
+        expect(await f.run(21_660)).toMatchObject({ stopped: 1, closed: 1 });
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(21_660), endReason: 'session_max' }); // the stop's time, not back-dated
     });
 
     it.each([[null, 3600]] as const)
@@ -387,8 +403,8 @@ describe('round 6 CR-1: the hold cap survives whole-second rounding', () => {
 describe('round 6 R1-04: a paid-era session still open after the drop to Free ends at the drop', () => {
     const canceled = (periodEnd: Date) => [{ stripeSubscriptionId: 'sub', sku: 'standard_monthly_v3', status: 'canceled',
         currentPeriodStart: new Date(periodEnd.getTime() - 30 * 86_400_000), currentPeriodEnd: periodEnd, cancelAtPeriodEnd: false }];
-    // Opened on Standard: no session cap, so the stored deadline is the fair-use bound (40 h).
-    const paidEra = () => epoch({ deadlineAt: iso(40 * 3600) });
+    // Opened on Standard: the stored deadline is its six-hour session cap (paid compute policy v1), past Free's hour.
+    const paidEra = () => epoch({ deadlineAt: iso(6 * 3600) });
 
     it('an immediate cancel (no recorded drop time) closes at the sweep that sees it, not ready + 1 h', async () => {
         const f = fixture([paidEra()], { sku: null });
@@ -436,29 +452,63 @@ describe('round 6 R1-04: a paid-era session still open after the drop to Free en
     });
 });
 
-describe('paid sessions have no time cap', () => {
+// Paid compute policy v1 (founder e713d157): no hours cap on a paid session, and a six-hour session rotation independent
+// of any monthly quota: at ready + 6 h the session is saved and stopped through the ordinary stop (files kept), and the
+// next open is a new session on the same, never-reset, period usage.
+describe('paid sessions: no hours cap, a six-hour session rotation', () => {
     it.each([['standard_monthly_v3', 'std-2', 1], ['premium_monthly_v3', 'std-2', 1],
         ['premium_monthly_v3', 'cmp-4', 2], ['premium_monthly_v3', 'cmp-8', 4]] as const)(
-        '%s / %s ignores 2h and 6h, stopping exactly at fair-use exhaustion', async (sku, size, weight) => {
-            const allowance = 144000, deadline = allowance / weight;
-            const f = fixture([epoch({ size, weight, deadlineAt: iso(sku === 'standard_monthly_v3' ? 7200 : 21600) })], { sku, allowance });
-            for (const seconds of [7200, 21600, deadline - 1]) expect(await f.run(seconds)).toMatchObject({ stopped: 0 });
-            expect(await f.run(deadline)).toMatchObject({ stopped: 1, closed: 1 });
-            expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'allowance_exhausted');
-            expect(f.epochs[0]).toMatchObject({ endedAt: iso(deadline), endReason: 'allowance_exhausted' });
+        '%s / %s ignores a stored earlier (2 h) deadline and its grant, and stops only at six hours', async (sku, size, weight) => {
+            const allowance = 7200 * weight; // the grant runs out at 2 h of this size, the old stored deadline
+            const f = fixture([epoch({ size, weight, deadlineAt: iso(7200) })], { sku, allowance });
+            for (const seconds of [7200, 7260, 21_599]) expect(await f.run(seconds)).toMatchObject({ stopped: 0, closed: 0, shadow: 0 });
+            expect(f.stop).not.toHaveBeenCalled();
+            expect(await f.run(21_600)).toMatchObject({ stopped: 1, closed: 1 });
+            expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+            expect(f.epochs[0]).toMatchObject({ endedAt: iso(21_600), endReason: 'session_max' });
         });
-    it('a late failed provider stop still closes at fair-use exhaustion', async () => {
+    // Review (384e4181): a close back-dated to ready + 6 h by a late sweep (the first sweep after a deploy) fell outside the
+    // two-hour retry window, so one failed stop left the computer running with no session and no cap.
+    it('a late sweep closes at the stop it makes, so a failed stop is retried on the next pass; rating stays at six hours', async () => {
         const f = fixture([epoch({ size: 'cmp-8', weight: 4 })], { sku: 'premium_monthly_v3', allowance: 144000 });
-        f.stop.mockRejectedValue(new Error('missed stop'));
-        await f.run(144000);
-        expect(f.epochs[0]).toMatchObject({ endedAt: iso(36000), endReason: 'allowance_exhausted' });
-    });
-    it.each(['standard_monthly_v3', 'premium_monthly_v3'])('does not retry the retired session cap for %s', async sku => {
-        const f = fixture([epoch({ endedAt: iso(7200), endReason: 'session_max' })], { sku });
+        f.stop.mockRejectedValueOnce(new Error('missed stop'));
+        expect(await f.run(144000)).toMatchObject({ stopped: 0, stopFailed: 1, closed: 1 });
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(144000), endReason: 'session_max' });
         f.isStillRunning.mockResolvedValue(true);
-        await f.run(7201);
+        expect(await f.run(144060)).toMatchObject({ retried: 1, stopped: 1 });
+        expect(f.stop).toHaveBeenLastCalledWith(ref, 'session_max');
+        expect(f.isStillRunning).toHaveBeenCalledWith(ref, at(144000));
+        expect((await loadComputeBillingState(f.deps, ref.userId, at(144060))).usedStdSeconds).toBe(21_600 * 4);
+    });
+    it('the next open after a six-hour stop is admitted, on the same period usage (never reset)', async () => {
+        const f = fixture([epoch()], { sku: 'standard_monthly_v3', allowance: 144000 });
+        await f.run(21_600);
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(21_600), endReason: 'session_max' });
+        expect(await gateComputerStart({ deps: f.deps, ...ref, kind: 'aws-ec2', instanceType: 'm6i.large', now: at(21_700) })).toEqual({ allowed: true });
+        await f.store.openEpoch({ ...ref, subscriptionId: 'sub', size: 'std-2', readyAt: at(21_700) });
+        const state = await loadComputeBillingState(f.deps, ref.userId, at(25_300));
+        expect(state.usedStdSeconds).toBe(21_600 + 3600);
+        expect(state.sessionMaxSeconds).toBe(21_600);
+    });
+    it.each(['standard_monthly_v3', 'premium_monthly_v3'])('retries a failed six-hour stop for %s while the same host still runs', async sku => {
+        const f = fixture([epoch({ endedAt: iso(21_600), endReason: 'session_max' })], { sku });
+        f.isStillRunning.mockResolvedValue(true);
+        await f.run(21_660);
+        expect(f.isStillRunning).toHaveBeenCalledExactlyOnceWith(ref, at(21_600));
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+    });
+    it.each(['standard_monthly_v3', 'premium_monthly_v3'])('never retries an hours close (an older app\'s allowance stop) against %s', async sku => {
+        const f = fixture([epoch({ endedAt: iso(100), endReason: 'allowance_exhausted' })], { sku });
+        f.isStillRunning.mockResolvedValue(true);
+        await f.run(160);
         expect(f.stop).not.toHaveBeenCalled();
         expect(f.isStillRunning).not.toHaveBeenCalled();
+        // Positive control: on Free the same close is still retried.
+        const free = fixture([epoch({ size: 'free-cf', endedAt: iso(100), endReason: 'allowance_exhausted' })], { sku: null });
+        free.isStillRunning.mockResolvedValue(true);
+        await free.run(160);
+        expect(free.stop).toHaveBeenCalledExactlyOnceWith(ref, 'allowance_exhausted');
     });
     // Round 4 (D17): a fresh subscription payment issue opens a 7-day grace, so the paid session keeps running.
     it('keeps a paid session running during the payment grace', async () => {
@@ -785,6 +835,15 @@ describe('round 6 R2-3: a paid session waits for its period grant', () => {
         const f = fresh(-600);
         await f.run(60);
         expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'allowance_exhausted');
+    });
+    // Paid compute policy v1: a pending renewal exempts the monthly quota, never the six-hour session cap.
+    it('still ends at its six-hour session cap while the renewal grant is pending', async () => {
+        const f = fresh(21_600 - 120); // the new period started two minutes before the six-hour mark; no grant yet
+        expect(await f.run(21_599)).toMatchObject({ stopped: 0, closed: 0 });
+        expect((await loadComputeBillingState(f.deps, ref.userId, at(21_600))).grantPending).toBe(true);
+        expect(await f.run(21_600)).toMatchObject({ stopped: 1, closed: 1 });
+        expect(f.stop).toHaveBeenCalledExactlyOnceWith(ref, 'session_max');
+        expect(f.epochs[0]).toMatchObject({ endedAt: iso(21_600), endReason: 'session_max' });
     });
 });
 

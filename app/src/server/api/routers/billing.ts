@@ -3,7 +3,9 @@ import { sql, type SQL } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { checkoutAvailable } from '@/server/billing/config';
-import { aiPackCheckoutEligible, CUSTOM_TOPUP, customTopupPack } from '@/server/billing/catalog';
+import { aiPackCheckoutEligible, CUSTOM_TOPUP, CUSTOM_TOPUP_SKU, customTopupPack } from '@/server/billing/catalog';
+import { hasAiTopupReceipts, type AiTopupReceiptStore } from '@/server/billing/ai-credits';
+import type { CatalogPack } from '@/server/billing/types';
 import { enqueueFreeAiCredits, readAiAccount, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
 import { lookupAiAccount, missingAiAccountView } from '@/server/billing/ai-credit-outbox-store';
 import { readAiUsage } from '@/server/billing/ai-usage';
@@ -13,11 +15,14 @@ import type { SubscriptionRow } from '@/server/billing/meters';
 import type { BillingDeps, PaymentIssueRow, StripeApi, StripeCheckoutSession } from '@/server/billing/ports';
 import { billingReturnOrigin } from '@/server/billing/return-origin';
 import { readStripePacks } from '@/server/billing/stripe/packs';
-import { BillingProviderError } from '@/server/billing/stripe/client';
+import { BillingProviderError, StripeRequestError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
 import { operatorGrantedSubscription, planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
 import { buildSummaryV3, computePlanV3, DISK_FALLBACK_GIB, type ReverseMoveSummaryInput } from '@/server/billing/v3/summary';
-import { deriveStanding } from '@/server/billing/v3/standing';
+import { deriveStanding, neverPaidTrial, operatorAccessFor } from '@/server/billing/v3/standing';
+import {
+    hasTrials, quoteFresh, TRIAL_CHECKOUT_TTL_SECONDS, TRIAL_SKU, trialEligibility, trialTerms, type TrialFacts, type TrialStore,
+} from '@/server/billing/v3/trial';
 import { buildUsageV3 } from '@/server/billing/v3/usage';
 import type { BillingSummaryV3, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
 import {
@@ -32,6 +37,7 @@ import type { ReverseMovePlacementView } from '@/server/lib/compute/provider-rev
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
 
 import { createTRPCRouter, protectedProcedure } from '../trpc';
+import { operatorGrantInEffect } from '@/server/billing/v3/operator-access';
 
 /** All router domain failures use the pinned UI vocabulary. */
 function billingError(code: BillingErrorCode, trpcCode: TRPCError['code']): TRPCError {
@@ -66,6 +72,16 @@ async function currentPlan(deps: BillingDeps, userId: string) {
     return { plan, subs, userCreatedAt, changes: changes.filter(change => change.subscriptionId === plan.subscriptionId) };
 }
 
+/** Product access reads may resolve operator grants; Stripe mutation helpers keep using currentPlan above. */
+async function currentEffectivePlan(deps: BillingDeps, userId: string) {
+    const [current, grants, paymentIssues] = await Promise.all([
+        currentPlan(deps, userId), deps.store.operatorEntitlementsFor?.(userId) ?? [], deps.store.openPaymentIssues(userId),
+    ]);
+    const now = deps.now();
+    const operator = operatorAccessFor({ subscriptions: current.subs, paymentIssues, grants, now });
+    return planFromSubscriptions({ subs: current.subs, now, userCreatedAt: current.userCreatedAt, operator });
+}
+
 function paidSubscription(plan: { subscriptionId: string | null; planActive: boolean }): string {
     if (!plan.subscriptionId || !plan.planActive) throw billingError('not_subscribed', 'PRECONDITION_FAILED');
     return plan.subscriptionId;
@@ -90,14 +106,21 @@ const ENDED_SUBSCRIPTION_STATUSES: ReadonlySet<string> = new Set(['canceled', 'i
  * Checkout Session has its own idempotency key, so two windows (or one slow webhook) could each pay for a
  * plan. Before a subscription Checkout for an existing customer: expire that customer's other open
  * subscription-mode sessions (only the new one can then be paid), THEN ask Stripe for a live subscription
- * (one completed before the expiry is listed; one completing during it makes the expiry fail). Any Stripe
- * failure refuses (`stripe_unavailable`); a live subscription refuses `already_subscribed`. Fail-closed.
+ * (one completed before the expiry is listed; one completing during it leaves its session un-expired).
+ * `expireCheckoutSession` returns that session's status, so anything but a clean `'expired'` — the
+ * `'complete'`/`'gone'` a race produces — is treated as a Stripe failure. Any Stripe failure refuses
+ * (`stripe_unavailable`); a live subscription refuses `already_subscribed`. Fail-closed.
  */
 async function refuseLiveStripeSubscription(stripe: StripeApi, customerId: string): Promise<void> {
     const subscriptions = await stripeCall(async () => {
         const open = await stripe.listOpenCheckoutSessions(customerId);
         for (const session of open) {
-            if (session.mode === 'subscription') await stripe.expireCheckoutSession(session.id);
+            // Only a clean 'expired' is safe: a session that completed or vanished during the race comes back
+            // 'complete'/'gone', so treat it as a Stripe failure and fail closed — the new subscription it
+            // created may not be in the list below yet.
+            if (session.mode === 'subscription' && await stripe.expireCheckoutSession(session.id) !== 'expired') {
+                throw new Error('open subscription Checkout Session could not be expired');
+            }
         }
         return stripe.listCustomerSubscriptions(customerId);
     });
@@ -109,17 +132,101 @@ async function refuseLiveStripeSubscription(stripe: StripeApi, customerId: strin
 
 async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: string, toSku: string) {
     if (toSku !== 'premium_monthly_v3') throw billingError('unknown_sku', 'BAD_REQUEST');
-    const { plan, changes } = await currentPlan(deps, userId);
+    const { plan, changes, subs } = await currentPlan(deps, userId);
     const subscriptionId = paidSubscription(plan);
     if (plan.sku !== 'standard_monthly_v3' || plan.status !== 'active') {
         throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
     }
+    // A Standard trial is never upgraded: the $0 proration would make the free month a free Premium month.
+    const row = subs.find(sub => sub.stripeSubscriptionId === subscriptionId);
+    if (row && neverPaidTrial(row)) throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
     if (changes.some(change => change.kind === 'upgrade')) throw billingError('upgrade_pending', 'CONFLICT');
     if (changes.some(change => change.kind === 'downgrade')) throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
     const subscription = await ownedSubscription(deps, stripe, userId, subscriptionId, 'upgrade_not_allowed');
-    if (subscription.scheduleId !== null) throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
+    if (subscription.scheduleId !== null || subscription.status === 'trialing') throw billingError('upgrade_not_allowed', 'PRECONDITION_FAILED');
     return { plan, subscriptionId };
 }
+
+/** Trial refusals carry their own codes (the shell maps `trial_unavailable` / `trial_quote_stale` / `trial_checkout_complete`). */
+function trialError(code: 'trial_unavailable' | 'trial_quote_stale' | 'trial_checkout_complete'): TRPCError {
+    return new TRPCError({ code: code === 'trial_unavailable' ? 'PRECONDITION_FAILED' : 'CONFLICT', message: code });
+}
+
+/**
+ * A trial checkout's Stripe key is fixed per quote. If a deployment's checkout configuration changed since the first
+ * attempt (Stripe answers `idempotency_error`), the quote is stale: the client re-quotes, never a different session.
+ */
+async function trialCheckoutCall<T>(call: () => Promise<T>): Promise<T> {
+    try {
+        return await call();
+    } catch (error) {
+        if (error instanceof StripeRequestError && error.type === 'idempotency_error') throw trialError('trial_quote_stale');
+        if (error instanceof TRPCError) throw error;
+        console.error('Billing Stripe unavailable');
+        throw billingError('stripe_unavailable', 'INTERNAL_SERVER_ERROR');
+    }
+}
+
+/** The viewer's trial eligibility from server facts only (auth.users, trial rows, paid history, plan, operator grant). */
+async function trialEligibilityFor(store: TrialStore, deps: BillingDeps, userId: string, planFamily: string): Promise<{ facts: TrialFacts;
+    decision: ReturnType<typeof trialEligibility> }> {
+    const [facts, grants] = await Promise.all([store.trialFacts(userId), deps.store.operatorEntitlementsFor?.(userId) ?? []]);
+    return { facts, decision: trialEligibility({ facts, planFamily, operatorPlan: operatorGrantInEffect(grants, deps.now()) !== null }) };
+}
+
+async function trialOfferFor(deps: BillingDeps, userId: string, planFamily: string): Promise<BillingSummaryV3['trialOffer']> {
+    if (!hasTrials(deps.store) || planFamily !== 'free') return undefined;
+    try {
+        const { decision } = await trialEligibilityFor(deps.store, deps, userId, planFamily);
+        if (!decision.eligible) return { eligible: false, reason: decision.reason };
+        const terms = trialTerms(deps.now());
+        return { eligible: true, sku: TRIAL_SKU, endsAt: isoSeconds(epochSeconds(terms.trialEnd)), amountCents: terms.amountCents, currency: 'usd' };
+    } catch {
+        // Billing stays readable without the trial tables (0021 not applied yet): no offer, never a guessed one.
+        console.error('Billing trial offer unavailable');
+        return null;
+    }
+}
+
+/**
+ * A superseded trial checkout must not finish after a re-quote: expire it first. A session that already completed
+ * means the trial is starting; the quote is kept so the subscription binds to exactly what was disclosed.
+ */
+async function retireTrialCheckout(stripe: StripeApi, sessionId: string | null): Promise<void> {
+    if (!sessionId) return;
+    const state = stripe.expireCheckoutSession ? await stripeCall(() => stripe.expireCheckoutSession!(sessionId))
+        : (await stripeCall(() => stripe.retrieveCheckoutSession(sessionId))).status;
+    if (state === 'complete') throw trialError('trial_checkout_complete');
+    if (state === 'open') throw trialError('trial_quote_stale');
+}
+
+/**
+ * One preset SKU or one whole-dollar custom amount (the catalog's bounds), never both. `expected*` pins the
+ * quote the person saw: a catalog that changed since (a coupon ended, a pack repriced) refuses with
+ * `quote_changed` instead of charging a different total.
+ */
+const topupExpected = { expectedTotalCents: z.number().int().min(0).optional(), expectedCredits: z.number().int().min(1).optional() };
+const topupInput = z.union([
+    z.object({ sku: z.string(), ...topupExpected }).strict(),
+    z.object({ customAmountCents: z.number().int().min(CUSTOM_TOPUP.minCents).max(CUSTOM_TOPUP.maxCents).multipleOf(100), ...topupExpected }).strict(),
+]);
+type TopupInput = z.infer<typeof topupInput>;
+
+/** The offered pack for a top-up input, from the same Stripe catalog checkout uses; custom amounts from the fixed tariff. */
+async function topupPackFor(stripe: StripeApi, input: TopupInput): Promise<CatalogPack & { aiCredits: number }> {
+    const pack = 'sku' in input ? (await readStripePacks(stripe)).find(pack => pack.sku === input.sku) : customTopupPack(input.customAmountCents);
+    if (!aiPackCheckoutEligible(pack)) throw new TRPCError({ code: 'BAD_REQUEST', message: 'unknown_pack' });
+    if ((input.expectedTotalCents !== undefined && input.expectedTotalCents !== pack.totalCents)
+        || (input.expectedCredits !== undefined && input.expectedCredits !== pack.aiCredits)) {
+        throw new TRPCError({ code: 'CONFLICT', message: 'quote_changed' });
+    }
+    return pack;
+}
+
+/** A Checkout session our top-up created: a payment for an offered pack or the custom SKU. */
+const topupSku = (sku: string | null) => sku === CUSTOM_TOPUP_SKU || (typeof sku === 'string' && /^ai_pack_[A-Za-z0-9_]+$/.test(sku));
+
+export type TopupFulfillment = 'awaiting_payment' | 'processing' | 'credited' | 'review';
 
 /** Stored receipts split the Gateway balance by bucket; unreadable receipts fall back to the total. */
 async function aiReceipts(deps: BillingDeps, userId: string) {
@@ -423,7 +530,12 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             placement = { provider: null, awsVolumes: [] };
         }
         const volumes = computerId ? placement.awsVolumes.filter(volume => volume.computerId === computerId.toLowerCase()) : placement.awsVolumes;
-        return { provider: placement.provider, volumeGiB: await readVolumeGiB(volumes, volumeSize), awsSize: placement.awsSize ?? null, placement };
+        // The disk meter counts only live computers' samples (summary.ts `storageDisk`). A read that lists none
+        // (failed, placement reads off, or a double without `computers`) counts none: "not measured yet", never a
+        // deleted computer's bytes.
+        const liveComputers = (placement.computers ?? []).map(({ computerId: id, provider }) => ({ computerId: id, provider }));
+        return { provider: placement.provider, volumeGiB: await readVolumeGiB(volumes, volumeSize), awsSize: placement.awsSize ?? null, placement,
+            liveComputers };
     };
     return createTRPCRouter({
         usage: protectedProcedure.input(z.object({ computerId: z.string().uuid().optional() }).optional()).query(async ({ ctx, input }) => {
@@ -439,7 +551,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
             // Round 6 (R1-07/R1-09): the placement provider and open payment issues give usage the summary's
             // standing, so under the D16 hold both show the held AWS computer and its disk.
-            const [periodEpochs, grants, storage, consent, overageInvoices, sizePreference, placement, paymentIssues] = await Promise.all([
+            const [periodEpochs, grants, storage, consent, overageInvoices, sizePreference, placement, paymentIssues, operatorGrants] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 deps.store.latestStorageFor(ctx.user.id),
@@ -448,11 +560,13 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 deps.store.sizePreference(ctx.user.id),
                 placementAndVolume(ctx.db, ctx.user.id, input?.computerId),
                 deps.store.openPaymentIssues(ctx.user.id),
+                deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [],
             ]);
             const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
             return buildUsageV3({ config: deps.config, now, subs, userCreatedAt, epochs, grants, storage,
                 consent, overageInvoices, planChanges: [], paymentIssues, sizePreference,
-                hasCustomer: false, computerId: input?.computerId, volumeGiB: placement.volumeGiB, placementProvider: placement.provider });
+                hasCustomer: false, computerId: input?.computerId, volumeGiB: placement.volumeGiB, placementProvider: placement.provider,
+                liveComputers: placement.liveComputers, operatorGrants });
         }),
         summary: protectedProcedure.query(async ({ ctx, signal }): Promise<BillingSummaryWithAi | { enabled: false }> => {
             const deps = getDeps();
@@ -467,7 +581,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const plan = planFromSubscriptions({ subs, now, userCreatedAt });
             const window = { start: new Date(plan.window.start), end: new Date(plan.window.end) };
             const [periodEpochs, grants, consent, paymentIssues, storage, sizePreference, customer, overageInvoices, packs, placement,
-                enrollmentState, ezilIdUrl] = await Promise.all([
+                enrollmentState, ezilIdUrl, operatorGrants] = await Promise.all([
                 deps.store.epochsFor(ctx.user.id, window.start),
                 deps.store.grantsForPeriod(ctx.user.id, window, summaryMeters(plan.family)),
                 plan.subscriptionId === null ? null : deps.store.latestConsent(ctx.user.id, plan.subscriptionId),
@@ -480,6 +594,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 placementAndVolume(ctx.db, ctx.user.id),
                 aiEnrollmentOf(aiMember, ctx.db, ctx.user),
                 ezilIdSignInUrl(),
+                deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [],
             ]);
             const epochs = await computeWindowEpochs(deps, ctx.user.id, periodEpochs, { subs, paymentIssues, now, userCreatedAt });
             // Phase B (§6.1.1): the move computer's reverse row; undefined (today's summary) without 0012 or on any failed read.
@@ -497,13 +612,18 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 }
             }
             await enqueueFreeAiCredits(deps.store, ctx.user.id, plan.sku, now);
-            const [{ gatewayGrants, ...ai }, receipts] = await Promise.all([aiRead, aiReceipts(deps, ctx.user.id)]);
+            const [{ gatewayGrants, openHolds, gatewayState, ...ai }, receipts] = await Promise.all([aiRead, aiReceipts(deps, ctx.user.id)]);
             const summary = buildSummaryV3({
                 config: deps.config, now, userCreatedAt, subs, epochs, grants, consent, planChanges, paymentIssues,
                 storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal, packs, stripeAvailable: deps.stripe !== null,
-                ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro }, placementProvider: placement.provider,
-                volumeGiB: placement.volumeGiB, awsSize: placement.awsSize, enrollment: { state: enrollmentState, ezilIdUrl },
+                // `ai.account` (identity-based credits) is read for the authenticated user only, from /v1/me/balance.
+                ai: { receipts, gatewayGrants, balanceMicro: ai.balanceMicro, heldMicro: ai.heldMicro, gatewayState, openHolds, userId: ctx.user.id },
+                placementProvider: placement.provider,
+                volumeGiB: placement.volumeGiB, awsSize: placement.awsSize, liveComputers: placement.liveComputers,
+                enrollment: { state: enrollmentState, ezilIdUrl },
                 ...(reverseMove ? { reverseMove } : {}),
+                operatorGrants,
+                trialOffer: await trialOfferFor(deps, ctx.user.id, plan.family),
             });
             // Round 3: low/exhausted against this period's plan credits (summary.ts aiCreditBuckets), not the catalog total.
             ai.balanceState = summary.ai.state;
@@ -527,11 +647,54 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             return readAiLimits({ config: deps.config, userId: ctx.user.id, headers: ctx.headers, signal });
         }),
 
-        createCheckout: protectedProcedure.input(z.object({ sku: z.enum(['standard_monthly_v3', 'premium_monthly_v3']) })).mutation(async ({ ctx, input }): Promise<CheckoutStartDTO> => {
+        /**
+         * Standard trial: claim this person's trial and fix the exact end (the first $20 charge) that the confirmation
+         * discloses. Eligibility is decided here from server facts; the client only echoes the end back to checkout.
+         */
+        quoteTrial: protectedProcedure.input(z.object({}).strict().optional()).mutation(async ({ ctx }) => {
+            const deps = getDeps();
+            const stripe = configuredStripe(deps);
+            const store = deps.store;
+            if (!hasTrials(store)) throw trialError('trial_unavailable');
+            const { plan } = await currentPlan(deps, ctx.user.id);
+            const { facts, decision } = await trialEligibilityFor(store, deps, ctx.user.id, plan.family);
+            if (!decision.eligible || facts.emailNormalized === null) throw trialError('trial_unavailable');
+            if (facts.own?.status === 'checkout') await retireTrialCheckout(stripe, facts.own.checkoutSessionId);
+            const terms = trialTerms(deps.now());
+            const claim = await store.claimTrialQuote({ userId: ctx.user.id, authSubject: facts.authSubject,
+                emailNormalized: facts.emailNormalized, quotedAt: terms.quotedAt, trialEnd: terms.trialEnd,
+                returnOrigin: billingReturnOrigin(ctx.headers) });
+            if (claim.status === 'refused') throw trialError('trial_unavailable');
+            return { sku: TRIAL_SKU, todayCents: 0, trialEndsAt: isoSeconds(epochSeconds(claim.trial.trialEnd)),
+                firstChargeAt: isoSeconds(epochSeconds(claim.trial.trialEnd)), amountCents: terms.amountCents, currency: 'usd' as const,
+                interval: 'month' as const, quoteExpiresAt: isoSeconds(epochSeconds(claim.trial.quotedAt) + 30 * 60) };
+        }),
+
+        createCheckout: protectedProcedure.input(z.object({ sku: z.enum(['standard_monthly_v3', 'premium_monthly_v3']),
+            trial: z.object({ trialEndsAt: z.string().datetime({ offset: true }) }).strict().optional() })).mutation(async ({ ctx, input }): Promise<CheckoutStartDTO> => {
             const deps = getDeps();
             const stripe = configuredStripe(deps);
             const { plan } = await currentPlan(deps, ctx.user.id);
             if (plan.family !== 'free') throw billingError('already_subscribed', 'CONFLICT');
+            // Product entitlements v1: an operator assignment in effect is the account's plan; no Stripe checkout is layered
+            // over it (the operator ends it first), refused before Stripe is called.
+            if (operatorGrantInEffect(await deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [], deps.now())) {
+                throw billingError('already_subscribed', 'CONFLICT');
+            }
+            // Standard trial: only the caller's own fresh stored quote, re-checked now, with the end they were shown.
+            let trial: { row: NonNullable<TrialFacts['own']>; store: TrialStore } | null = null;
+            if (input.trial) {
+                const store = deps.store;
+                if (input.sku !== TRIAL_SKU || !hasTrials(store)) throw trialError('trial_unavailable');
+                const { facts, decision } = await trialEligibilityFor(store, deps, ctx.user.id, plan.family);
+                if (!decision.eligible) throw trialError('trial_unavailable');
+                const row = facts.own;
+                if (!row || !['quoted', 'checkout'].includes(row.status) || !quoteFresh(row, deps.now())
+                    || epochSeconds(row.trialEnd) !== epochSeconds(input.trial.trialEndsAt)
+                    // The quote must still claim the caller's CURRENT verified identity; a re-quote moves the claim.
+                    || row.authSubject !== facts.authSubject || row.emailNormalized !== facts.emailNormalized) throw trialError('trial_quote_stale');
+                trial = { row, store };
+            }
 
             let customerId = await deps.store.stripeCustomerFor(ctx.user.id);
             if (customerId) {
@@ -547,10 +710,11 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 if (linked === 'conflict') throw billingError('customer_conflict', 'CONFLICT');
                 customerId = customer.id;
             }
-            const origin = billingReturnOrigin(ctx.headers);
+            // A trial's return origin is the quote's, so a retry from another owned origin sends identical terms.
+            const origin = trial ? trial.row.returnOrigin : billingReturnOrigin(ctx.headers);
             const publishableKey = deps.config.stripePublishableKey;
             const returnUrl = `${origin}/billing/return?session_id={CHECKOUT_SESSION_ID}`;
-            const session = await stripeCall(() => stripe.createCheckoutSession({
+            const session = await (trial ? trialCheckoutCall : stripeCall)(() => stripe.createCheckoutSession({
                 customerId,
                 userId: ctx.user.id,
                 sku: input.sku,
@@ -561,8 +725,21 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 returnUrl,
                 successUrl: returnUrl,
                 cancelUrl: `${origin}/os`,
-                idempotencyKey: `checkout:${ctx.user.id}:${input.sku}:${crypto.randomUUID()}`,
+                // One Stripe session per trial quote: a double click or second tab gets the same session back.
+                idempotencyKey: trial ? `trial-checkout:${trial.row.id}:${epochSeconds(trial.row.quotedAt)}`
+                    : `checkout:${ctx.user.id}:${input.sku}:${crypto.randomUUID()}`,
+                ...(trial ? { trial: { trialId: trial.row.id, trialEnd: trial.row.trialEnd,
+                    // Stripe idempotency compares every parameter: retries use the persisted quote's expiry too.
+                    expiresAt: new Date((epochSeconds(trial.row.quotedAt) + TRIAL_CHECKOUT_TTL_SECONDS) * 1000) } } : {}),
             }));
+            if (trial) {
+                const attached = await trial.store.attachTrialCheckout({ trialId: trial.row.id, userId: ctx.user.id,
+                    quotedAt: trial.row.quotedAt, checkoutSessionId: session.id, customerId });
+                if (attached !== 'attached') {
+                    await stripe.expireCheckoutSession?.(session.id).catch(() => 'gone');
+                    throw trialError('trial_quote_stale');
+                }
+            }
             if (publishableKey) {
                 if (!session.clientSecret) throw billingError('stripe_unavailable', 'INTERNAL_SERVER_ERROR');
                 return { mode: 'embedded', sessionId: session.id, clientSecret: session.clientSecret, publishableKey };
@@ -571,10 +748,23 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             return { mode: 'redirect', sessionId: session.id, url: session.url };
         }),
 
-        createTopupCheckout: protectedProcedure.input(z.union([
-            z.object({ sku: z.string() }).strict(),
-            z.object({ customAmountCents: z.number().int().min(CUSTOM_TOPUP.minCents).max(CUSTOM_TOPUP.maxCents).multipleOf(100) }).strict(),
-        ])).mutation(async ({ ctx, input }): Promise<{ sessionId: string; clientSecret: string; publishableKey: string }> => {
+        /**
+         * The authoritative price of a top-up before checkout: the offered pack's credits, discount and total, or
+         * a custom amount's credits at the fixed tariff (no discount). Same gates and validation as checkout; reads only.
+         */
+        quoteTopup: protectedProcedure.input(topupInput).query(async ({ ctx, input }) => {
+            const deps = getDeps();
+            const stripe = configuredStripe(deps);
+            if (!deps.config.stripePublishableKey) throw billingError('billing_not_configured', 'PRECONDITION_FAILED');
+            if (await aiEnrollmentOf(aiMember, ctx.db, ctx.user) !== 'enrolled') {
+                throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'ai_enrollment_required' });
+            }
+            const pack = await topupPackFor(stripe, input);
+            return { sku: pack.sku, custom: pack.sku === CUSTOM_TOPUP_SKU, aiCredits: pack.aiCredits, creditCents: pack.creditCents,
+                discountPercent: pack.discountPercent, totalCents: pack.totalCents, currency: 'usd' as const };
+        }),
+
+        createTopupCheckout: protectedProcedure.input(topupInput).mutation(async ({ ctx, input }): Promise<{ sessionId: string; clientSecret: string; publishableKey: string }> => {
             const deps = getDeps();
             const stripe = configuredStripe(deps);
             const publishableKey = deps.config.stripePublishableKey;
@@ -583,8 +773,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             if (await aiEnrollmentOf(aiMember, ctx.db, ctx.user) !== 'enrolled') {
                 throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'ai_enrollment_required' });
             }
-            const pack = 'sku' in input ? (await readStripePacks(stripe)).find(pack => pack.sku === input.sku) : customTopupPack(input.customAmountCents);
-            if (!aiPackCheckoutEligible(pack)) throw new TRPCError({ code: 'BAD_REQUEST', message: 'unknown_pack' });
+            const pack = await topupPackFor(stripe, input);
 
             let customerId = await deps.store.stripeCustomerFor(ctx.user.id);
             if (!customerId) {
@@ -764,7 +953,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             { message: 'size_not_allowed' },
         ) })).mutation(async ({ ctx, input }): Promise<SelectMachineOutputV3> => {
             const deps = getDeps();
-            const { plan } = await currentPlan(deps, ctx.user.id);
+            const plan = await currentEffectivePlan(deps, ctx.user.id);
             if (plan.sku !== 'premium_monthly_v3' || plan.status !== 'active'
                 || !plan.offer.machineChoice.includes(input.size)) {
                 throw billingError('size_not_allowed', 'BAD_REQUEST');
@@ -816,15 +1005,18 @@ export function createBillingRouter(getDeps: () => BillingDeps,
         portal: protectedProcedure.mutation(async ({ ctx }) => {
             const deps = getDeps();
             const stripe = configuredStripe(deps);
+            const plan = await currentEffectivePlan(deps, ctx.user.id);
+            if (plan.operator) throw billingError('not_subscribed', 'PRECONDITION_FAILED');
             const customerId = await deps.store.stripeCustomerFor(ctx.user.id);
             if (!customerId) throw billingError('not_subscribed', 'PRECONDITION_FAILED');
-            const { plan } = await currentPlan(deps, ctx.user.id);
             if (plan.subscriptionId) await ownedSubscription(deps, stripe, ctx.user.id, plan.subscriptionId);
             return stripeCall(() => stripe.createPortalSession({ customerId, returnUrl: `${billingReturnOrigin(ctx.headers)}/os` }));
         }),
 
         checkoutStatus: protectedProcedure.input(z.object({ sessionId: z.string() }))
-            .query(async ({ ctx, input }): Promise<{ status: CheckoutStatusDTO; paymentStatus: StripeCheckoutSession['paymentStatus'] | null; sku: string | null }> => {
+            .query(async ({ ctx, input }): Promise<{ status: CheckoutStatusDTO; paymentStatus: StripeCheckoutSession['paymentStatus'] | null; sku: string | null;
+                /** A Standard free-month checkout ($0 today): /billing/return must never call it a payment. */
+                trial: boolean }> => {
                 const deps = getDeps();
                 const stripe = configuredStripe(deps);
                 if (!/^cs_[A-Za-z0-9_]+$/.test(input.sessionId)) throw billingError('not_subscribed', 'BAD_REQUEST');
@@ -835,7 +1027,45 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 const paymentStatus = session.paymentStatus === 'paid' || session.paymentStatus === 'unpaid'
                     || session.paymentStatus === 'no_payment_required' ? session.paymentStatus : null;
                 const sku = typeof session.sku === 'string' && session.sku.trim() ? session.sku : null;
-                return { status: session.status === 'open' ? 'pending' : session.status, paymentStatus, sku };
+                return { status: session.status === 'open' ? 'pending' : session.status, paymentStatus, sku,
+                    trial: session.mode === 'subscription' && typeof session.trialId === 'string' && session.trialId !== '' };
+            }),
+
+        /**
+         * A top-up's fulfilment, for the person who paid: payment alone is never "credited". `credited` means the
+         * receipt this payment wrote (processor `topup_paid`, keyed by its payment intent) was delivered to the
+         * Gateway; `processing` covers a webhook not processed yet and a delivery still queued or retrying; `review`
+         * a delivery that failed and waits for an operator. Another person's session, or a session that is not a
+         * top-up, is NOT_FOUND. Nothing identifying (customer, payment intent, event) leaves the server.
+         */
+        topupStatus: protectedProcedure.input(z.object({ sessionId: z.string() }).strict())
+            .query(async ({ ctx, input }): Promise<{ status: CheckoutStatusDTO; paymentStatus: StripeCheckoutSession['paymentStatus'] | null;
+                fulfillment: TopupFulfillment; credits: number | null }> => {
+                const deps = getDeps();
+                const stripe = configuredStripe(deps);
+                if (!/^cs_[A-Za-z0-9_]+$/.test(input.sessionId)) throw new TRPCError({ code: 'BAD_REQUEST', message: 'unknown_checkout' });
+                const session = await stripeCall(() => stripe.retrieveCheckoutSession(input.sessionId));
+                if (session.clientReferenceId !== ctx.user.id || session.mode !== 'payment' || !topupSku(session.sku)) {
+                    throw new TRPCError({ code: 'NOT_FOUND', message: 'unknown_checkout' });
+                }
+                const paymentStatus = session.paymentStatus === 'paid' || session.paymentStatus === 'unpaid'
+                    || session.paymentStatus === 'no_payment_required' ? session.paymentStatus : null;
+                const status = session.status === 'open' ? 'pending' : session.status;
+                if (session.status !== 'complete' || paymentStatus !== 'paid') return { status, paymentStatus, fulfillment: 'awaiting_payment', credits: null };
+                if (!session.paymentIntentId || !hasAiTopupReceipts(deps.store)) return { status, paymentStatus, fulfillment: 'processing', credits: null };
+                const store = deps.store;
+                let receipt: Awaited<ReturnType<AiTopupReceiptStore['aiTopupReceipt']>> = null;
+                try {
+                    receipt = await store.aiTopupReceipt(ctx.user.id, session.paymentIntentId);
+                } catch {
+                    // An unreadable receipt is not a failed payment: keep waiting.
+                    console.warn('[billing.topup] receipt unavailable');
+                }
+                if (!receipt || receipt.userId !== ctx.user.id) return { status, paymentStatus, fulfillment: 'processing', credits: null };
+                const delivery = (receipt.payload.delivery as { status?: unknown } | null | undefined)?.status;
+                const credits = receipt.payload.credits;
+                if (delivery === 'done') return { status, paymentStatus, fulfillment: 'credited', credits: Number.isSafeInteger(credits) ? credits as number : null };
+                return { status, paymentStatus, fulfillment: delivery === 'failed' ? 'review' : 'processing', credits: null };
             }),
 
         /**

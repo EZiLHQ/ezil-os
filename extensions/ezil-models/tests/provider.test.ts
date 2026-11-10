@@ -308,10 +308,24 @@ describe('EZiL gateway VS Code bridge', () => {
             expect(showCreditWarning).toHaveBeenCalledTimes(1);
             expect(showCreditWarning).toHaveBeenCalledWith(expect.stringContaining(text), 'Add credits');
             expect(openExternal).toHaveBeenCalledTimes(1);
-            expect(openExternal.mock.calls[0]![0].toString()).toBe('https://os.invalid:8443/os?settings=billing&section=ai-credits');
+            expect(openExternal.mock.calls[0]![0].toString()).toBe('https://os.invalid:8443/os?settings=billing&section=ai-credits&reason=insufficient_credits');
             expect(showRetryError).not.toHaveBeenCalled();
             expect(h.host.usage).toHaveLength(0); expect(h.requestFinished).toHaveBeenCalledTimes(1);
         });
+        // Only a credit refusal offers Add credits: buying credits fixes none of these, so none of them may suggest it.
+        // (rate_limited and tpm_limited retry through the transport first; their copy is pinned in gateway.test.ts.)
+        for (const [status, code, extra] of [[429, 'window_budget_reached', {}],
+            [401, 'unauthorized', { reason: 'token_expired' }], [403, 'not_a_member', {}], [503, 'paused', {}], [502, 'os_ai_unavailable', { origin: 'os_proxy' }],
+            [504, 'upstream_timeout', {}], [500, 'internal_error', {}]] as const) {
+            test(`${code} (HTTP ${status}) never offers Add credits`, async () => {
+                const host = gatewayHost((async () => Response.json({ error: { code, ...extra } }, { status })) as unknown as typeof fetch);
+                const provider = new EZiLModelsProvider(host);
+                await expect(provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
+                    { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never)).rejects.toThrow();
+                expect(showCreditWarning).not.toHaveBeenCalled();
+                expect(openExternal).not.toHaveBeenCalled();
+            });
+        }
         for (const value of [undefined, '', 'not a URL', '/ai/v1', 'http://os.invalid/ai/v1', 'javascript:alert(1)', 'file:///ai/v1']) {
             test(`no button without a usable HTTPS environment origin: ${value}`, async () => {
                 if (value === undefined) delete process.env.EZIL_AI_BASE_URL;
@@ -403,10 +417,59 @@ describe('EZiL gateway VS Code bridge', () => {
                 { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
             await send('字'.repeat(10000));
             expect(bodies[0]!.byteLength + 1056).toBeLessThanOrEqual(32768);
-            await expect(send('字'.repeat(11000))).rejects.toThrow('Conversation too large');
+            await expect(send('字'.repeat(11000))).rejects.toThrow('Nothing was sent or charged, and the conversation is kept. Shorten your last message or its attachments, or pick a model with a larger input limit. (local_input_too_large)');
             expect(bodies).toHaveLength(1); expect(host.models()[0]!.maxInputTokens).toBe(configured);
         });
     }
+    test('a long chat is compacted, not refused: one request, the host told once, and its turn settles with the request', async () => {
+        const bodies: Uint8Array[] = [];
+        const host = gatewayHost((async (_url: unknown, init?: RequestInit) => {
+            bodies.push(init!.body as Uint8Array);
+            return Response.json(messageJson());
+        }) as unknown as typeof fetch);
+        const compacted: { model: string; folded: number; finished: Promise<void> }[] = [];
+        const provider = new EZiLModelsProvider({ ...host, compacted: (model, info, finished) => compacted.push({ model: model.id, folded: info.folded, finished }) });
+        const infos = await provider.provideLanguageModelChatInformation({} as never, token() as never);
+        const kimi = infos.find(info => info.id === KIMI)!;
+        const history = Array.from({ length: 50 }, (_, i) => [message(1, [new TextPart(`Rule ${i}.`)]), message(2, [new TextPart('a'.repeat(4000))])]).flat();
+        let settled = false;
+        const turn = provider.provideLanguageModelChatResponse(kimi, [...history, message(1, [new TextPart('Now?')])] as never,
+            { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
+        await turn;
+        expect(bodies).toHaveLength(1);
+        expect(bodies[0]!.byteLength).toBeLessThan(131072);
+        expect(compacted).toHaveLength(1);
+        expect(compacted[0]).toMatchObject({ model: KIMI });
+        expect(compacted[0]!.folded).toBeGreaterThan(0);
+        void compacted[0]!.finished.then(() => { settled = true; });
+        await Promise.resolve(); await Promise.resolve();
+        expect(settled).toBe(true);
+    });
+    test('a failed request reaches Copilot as its message alone, without stack frames (Copilot prints a stack under "Reason:")', async () => {
+        const host = gatewayHost((async () => Response.json({ error: { code: 'killswitch' } }, { status: 503 })) as unknown as typeof fetch);
+        const provider = new EZiLModelsProvider(host);
+        const infos = await provider.provideLanguageModelChatInformation({} as never, token() as never);
+        const send = (text: string) => provider.provideLanguageModelChatResponse(infos[0]!, [message(1, [new TextPart(text)])] as never,
+            { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
+        for (const text of ['q', '字'.repeat(50_000)]) {
+            let caught: Error | undefined;
+            try { await send(text); } catch (error) { caught = error as Error; }
+            expect(caught).toBeInstanceOf(Error);
+            expect(caught!.stack).toBe('');
+            expect(caught!.message).toStartWith('EZiL');
+            expect(caught!.message).not.toMatch(/\n\s+at |extension\.js|provideLanguageModelChatResponse/);
+        }
+    });
+    test('a nested cause reaches Copilot without its stack either (VS Code serializes cause; re-review LOW-3)', async () => {
+        const host = gatewayHost((async () => { throw new Error('socket closed', { cause: new Error('inner') }); }) as unknown as typeof fetch);
+        const failing = { ...host, models: () => { throw new Error('config broke', { cause: new Error('nested reason') }); } };
+        const provider = new EZiLModelsProvider(failing);
+        let caught: Error | undefined;
+        try { await provider.provideLanguageModelChatResponse({ id: 'x' } as never, [] as never, { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never); }
+        catch (error) { caught = error as Error; }
+        expect(caught!.stack).toBe('');
+        expect((caught!.cause as Error).stack).toBe('');
+    });
     for (const [status, code] of [[400, 'max_output_tokens_invalid'], [413, 'input_too_large']] as const) {
         test(`${status} ${code} clears cached limits for the next call without retrying`, async () => {
             let gets = 0;
@@ -421,13 +484,13 @@ describe('EZiL gateway VS Code bridge', () => {
             expect(infos[0]).toMatchObject({ maxInputTokens: 104480, maxOutputTokens: 8192 });
             const send = (text = 'q') => provider.provideLanguageModelChatResponse(infos[0]!, [message(1, [new TextPart(text)])] as never,
                 { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
-            await expect(send()).rejects.toThrow(code === 'input_too_large' ? 'Conversation too large' : code);
+            await expect(send()).rejects.toThrow(code === 'input_too_large' ? 'EZiL AI: This conversation is too large for qwen.qwen3-coder-next. EZiL AI refused it before the model ran' : code);
             expect(bodies).toHaveLength(1); expect(gets).toBe(1);
             await send(); // Still passes the old VS Code information object.
             expect(bodies.map(body => body.max_tokens)).toEqual([8192, 4096]); expect(gets).toBe(2);
             const refreshed = await provider.provideLanguageModelChatInformation({} as never, token() as never);
             expect(refreshed[0]).toMatchObject({ maxInputTokens: 6176, maxOutputTokens: 4096 });
-            await expect(send('字'.repeat(11000))).rejects.toThrow('Conversation too large');
+            await expect(send('字'.repeat(11000))).rejects.toThrow('(local_input_too_large)');
             expect(bodies).toHaveLength(2); expect(gets).toBe(2);
         });
     }
@@ -440,7 +503,7 @@ describe('EZiL gateway VS Code bridge', () => {
         await expect(provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
             { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never)).rejects.toThrow('Retry');
         for (let i = 0; i < 10; i++) await Promise.resolve();
-        expect(showRetryError).toHaveBeenCalledWith(expect.stringContaining('could not reach'), 'Retry');
+        expect(showRetryError).toHaveBeenCalledWith(expect.stringContaining('EZiL OS: Could not reach EZiL AI'), 'Retry');
         expect(retryCommand).toHaveBeenCalledWith('workbench.action.chat.retry');
         expect(posts).toBe(1);
     });
@@ -538,6 +601,210 @@ describe('EZiL gateway VS Code bridge', () => {
             await provider.provideLanguageModelChatResponse(toInformation(host.models()[1]!), [message(1, [new TextPart('q')])] as never,
                 { tools: [], modelOptions: {} } as never, { report: p => parts.push(p) }, token() as never);
             expect(parts.map(p => (p as object).constructor)).toEqual([TextPart, ToolCallPart, TextPart]);
+        } finally { mock.module('vscode', () => fakeVscode); }
+    });
+    test('without the ThinkingPart API, a native Claude tool turn keeps its signed thinking for the next request (memory only)', async () => {
+        mock.module('vscode', () => ({ ...fakeVscode, LanguageModelThinkingPart: undefined }));
+        try {
+            const path = '../src/provider?gateway-signed-thinking-fallback';
+            const { EZiLModelsProvider: Without } = await import(path) as typeof providerModule;
+            const thought = 'PRIVATE-THOUGHT inspect first', signature = 'synthetic-signature==';
+            const ev = (type: string, data: Record<string, unknown>) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+            const usage = { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+            const turn = [ev('message_start', { message: { role: 'assistant', usage } }),
+                ev('content_block_start', { index: 0, content_block: { type: 'thinking', thinking: '' } }),
+                ev('content_block_delta', { index: 0, delta: { type: 'thinking_delta', thinking: thought } }),
+                ev('content_block_delta', { index: 0, delta: { type: 'signature_delta', signature } }), ev('content_block_stop', { index: 0 }),
+                ev('content_block_start', { index: 1, content_block: { type: 'tool_use', id: 'toolu_1', name: 'create_file', input: {} } }),
+                ev('content_block_delta', { index: 1, delta: { type: 'input_json_delta', partial_json: '{"filePath":"a","content":"b"}' } }),
+                ev('content_block_stop', { index: 1 }),
+                ev('message_delta', { delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 9 } }), ev('message_stop', {})].join('');
+            const bodies: Record<string, unknown>[] = [];
+            const claude = { ...gw('claude-sonnet-5-5'), default: true, capabilities: { toolCalling: true, imageInput: false } };
+            const opus = { ...gw('claude-opus-5-5'), default: false, capabilities: { toolCalling: true, imageInput: false } };
+            const make = () => {
+                const host = gatewayHost((async (_input: unknown, init?: RequestInit) => {
+                    bodies.push(JSON.parse(typeof init!.body === 'string' ? init!.body : new TextDecoder().decode(init!.body as Uint8Array)));
+                    return new Response(turn, { headers: { 'content-type': 'text/event-stream', 'x-ezil-request-id': 'thinking-fallback' } });
+                }) as unknown as typeof fetch, () => Response.json({ data: [claude, opus].map(m => ({ id: m.model, enabled: true, max_input_tokens: 131072, max_output_tokens: 8192 })) }));
+                opus.provider = claude.provider;
+                host.models = () => [claude, opus];
+                return { host, provider: new Without(host) };
+            };
+            const ask = (provider: InstanceType<typeof Without>, history: unknown[], model = claude) => {
+                const parts: unknown[] = [];
+                return provider.provideLanguageModelChatResponse(toInformation(model), history as never, { tools: [CREATE_FILE], modelOptions: {} } as never,
+                    { report: p => parts.push(p) }, token() as never).then(() => parts);
+            };
+            const first = make();
+            const parts = await ask(first.provider, [message(1, [new TextPart('make a file')])]);
+            expect(parts.map(p => (p as object).constructor)).toEqual([ToolCallPart]); // no thinking part can be reported
+            const history = [message(1, [new TextPart('make a file')]), message(2, [new ToolCallPart('toolu_1', 'create_file', { filePath: 'a', content: 'b' })]),
+                message(1, [new ToolResultPart('toolu_1', [new TextPart('done')])])];
+            await ask(first.provider, history);
+            const assistant = (bodies[1]!.messages as { role: string; content: Record<string, unknown>[] }[]).find(m => m.role === 'assistant')!;
+            expect(assistant.content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
+            expect(assistant.content[1]).toMatchObject({ type: 'tool_use', id: 'toolu_1' });
+            for (const line of first.host.lines) expect(line).not.toContain('PRIVATE-THOUGHT');
+            // Never into anything but the exact continuation: each body below must carry no thinking at all.
+            const leaked = (body: Record<string, unknown>) => JSON.stringify(body).includes('PRIVATE-THOUGHT') || JSON.stringify(body).includes(signature);
+            const call = (input: Record<string, unknown>) => message(2, [new ToolCallPart('toolu_1', 'create_file', input)]);
+            const result = message(1, [new ToolResultPart('toolu_1', [new TextPart('done')])]);
+            // Another conversation that reuses the same call id, name and input after a different user turn.
+            await ask(first.provider, [message(1, [new TextPart('an unrelated chat')]), call({ filePath: 'a', content: 'b' }), result]);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            // The same history, but the tool call's input differs (another file).
+            await ask(first.provider, [message(1, [new TextPart('make a file')]), call({ filePath: 'different.ts', content: 'b' }), result]);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            // The same history and call, sent to another model.
+            await ask(first.provider, history, opus);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            // The same provider name and model, reconfigured to another endpoint: the old endpoint's thinking never follows.
+            const moved = { ...claude, provider: { ...claude.provider, baseUrl: 'https://other-gateway.invalid/ai/v1' } };
+            const movedHost = first.host.models;
+            first.host.models = () => [moved, opus];
+            await ask(first.provider, history, moved);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            first.host.models = movedHost;
+            // The same endpoint, provider name and model under another credential (account): nothing follows either.
+            const rekeyed = { ...claude, provider: { ...claude.provider, apiKey: 'synthetic-other-account-token' } };
+            first.host.models = () => [rekeyed, opus];
+            await ask(first.provider, history, rekeyed);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            first.host.models = movedHost;
+            // A direct Anthropic provider (custom header auth possible) never uses the fallback: neither an exact
+            // continuation nor one whose x-api-key header override changed gets any thinking back.
+            const direct = { ...claude, provider: { ...claude.provider, type: 'anthropic' as const, headers: { 'x-api-key': 'account-a' } } };
+            const directOther = { ...direct, provider: { ...direct.provider, headers: { 'x-api-key': 'account-b' } } };
+            const gatewayModels = first.host.models;
+            first.host.models = () => [direct];
+            await ask(first.provider, [message(1, [new TextPart('make a file')])], direct);
+            await ask(first.provider, history, direct);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            first.host.models = () => [directOther];
+            await ask(first.provider, history, directOther);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            first.host.models = gatewayModels;
+            // The exact continuation still gets it, after all of the above.
+            await ask(first.provider, history);
+            expect(leaked(bodies.at(-1)!)).toBe(true);
+            // Honest limit: a new provider (a reload) has nothing to replay, and the request goes without it as before.
+            const fresh = make();
+            await ask(fresh.provider, history);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            expect(JSON.stringify(bodies.at(-1))).not.toContain('"thinking"');
+        } finally { mock.module('vscode', () => fakeVscode); }
+    });
+    test('without the ThinkingPart API, a turn Copilot replays as split assistant messages (text and calls, or one call each) still gets its signed thinking', async () => {
+        mock.module('vscode', () => ({ ...fakeVscode, LanguageModelThinkingPart: undefined }));
+        try {
+            const path = '../src/provider?gateway-signed-thinking-split';
+            const { EZiLModelsProvider: Without } = await import(path) as typeof providerModule;
+            const thought = 'PRIVATE-THOUGHT two files', signature = 'synthetic-signature-split==';
+            const ev = (type: string, data: Record<string, unknown>) => `event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`;
+            const usage = { input_tokens: 10, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+            const use = (index: number, id: string, input: object) => [ev('content_block_start', { index, content_block: { type: 'tool_use', id, name: 'create_file', input: {} } }),
+                ev('content_block_delta', { index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(input) } }), ev('content_block_stop', { index })];
+            const turn = [ev('message_start', { message: { role: 'assistant', usage } }),
+                ev('content_block_start', { index: 0, content_block: { type: 'thinking', thinking: '' } }),
+                ev('content_block_delta', { index: 0, delta: { type: 'thinking_delta', thinking: thought } }),
+                ev('content_block_delta', { index: 0, delta: { type: 'signature_delta', signature } }), ev('content_block_stop', { index: 0 }),
+                ev('content_block_start', { index: 1, content_block: { type: 'text', text: '' } }),
+                ev('content_block_delta', { index: 1, delta: { type: 'text_delta', text: 'Creating both.' } }), ev('content_block_stop', { index: 1 }),
+                ...use(2, 'toolu_a', { filePath: 'a', content: '1' }), ...use(3, 'toolu_b', { filePath: 'b', content: '2' }),
+                ev('message_delta', { delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 9 } }), ev('message_stop', {})].join('');
+            const bodies: Record<string, unknown>[] = [];
+            const claude = { ...gw('claude-sonnet-5-5'), default: true, capabilities: { toolCalling: true, imageInput: false } };
+            const opus = { ...gw('claude-opus-5-5'), default: false, capabilities: { toolCalling: true, imageInput: false } };
+            const host = gatewayHost((async (_input: unknown, init?: RequestInit) => {
+                bodies.push(JSON.parse(typeof init!.body === 'string' ? init!.body : new TextDecoder().decode(init!.body as Uint8Array)));
+                return new Response(turn, { headers: { 'content-type': 'text/event-stream', 'x-ezil-request-id': 'thinking-split' } });
+            }) as unknown as typeof fetch, () => Response.json({ data: [claude, opus].map(m => ({ id: m.model, enabled: true, max_input_tokens: 131072, max_output_tokens: 8192 })) }));
+            opus.provider = claude.provider;
+            host.models = () => [claude, opus];
+            const provider = new Without(host);
+            const ask = (history: unknown[], model = claude) => provider.provideLanguageModelChatResponse(toInformation(model), history as never,
+                { tools: [CREATE_FILE], modelOptions: {} } as never, { report: () => {} }, token() as never);
+            const user = message(1, [new TextPart('make two files')]);
+            await ask([user]);
+            const text = new TextPart('Creating both.');
+            const a = new ToolCallPart('toolu_a', 'create_file', { filePath: 'a', content: '1' }), b = new ToolCallPart('toolu_b', 'create_file', { filePath: 'b', content: '2' });
+            const results = message(1, [new ToolResultPart('toolu_a', [new TextPart('done')]), new ToolResultPart('toolu_b', [new TextPart('done')])]);
+            const assistantOf = (body: Record<string, unknown>) => (body.messages as { role: string; content: Record<string, unknown>[] }[]).find(m => m.role === 'assistant')!;
+            const leaked = (body: Record<string, unknown>) => JSON.stringify(body).includes('PRIVATE-THOUGHT') || JSON.stringify(body).includes(signature);
+            for (const assistant of [[message(2, [text, a, b])], [message(2, [text]), message(2, [a, b])], [message(2, [text, a]), message(2, [b])],
+                [message(2, [text]), message(2, [a]), message(2, [b])]]) {
+                await ask([user, ...assistant, results]);
+                const sent = assistantOf(bodies.at(-1)!).content;
+                expect(sent[0]).toEqual({ type: 'thinking', thinking: thought, signature });
+                expect(sent.filter(block => block.type === 'thinking')).toHaveLength(1);
+                expect(sent.filter(block => block.type === 'tool_use').map(block => block.id)).toEqual(['toolu_a', 'toolu_b']);
+            }
+            // The history before the turn is compared as logical turns too: asked as two adjacent user messages, continued
+            // with them joined into one (and the reply split), it is the same continuation.
+            const context = new TextPart('synthetic context'), prompt = new TextPart('make two files, again');
+            await ask([message(1, [context]), message(1, [prompt])]);
+            await ask([message(1, [context, prompt]), message(2, [text, a]), message(2, [b]), results]);
+            expect(assistantOf(bodies.at(-1)!).content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
+            // Every system message is hoisted into the turn's effective system prompt: the same system text moved inside the
+            // split turn still restores (it does not split the turn); a new, changed or removed system note never does.
+            const note = (value: string) => message(3, [new TextPart(value)]);
+            const noted = message(1, [new TextPart('make two files, noted')]);
+            await ask([note('a synthetic system note'), noted]);
+            await ask([noted, message(2, [text, a]), note('a synthetic system note'), message(2, [b]), results]);
+            expect(assistantOf(bodies.at(-1)!).content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
+            for (const notes of [[note('a synthetic system note'), note('a new synthetic note')], [note('a changed synthetic note')], []]) {
+                await ask([noted, message(2, [text, a]), ...notes, message(2, [b]), results]);
+                expect(leaked(bodies.at(-1)!)).toBe(false);
+            }
+            // Storage takes the system text of the whole answered request too, also when that request ends in an assistant
+            // turn with a system note inside it; and the order of distinct system messages is part of the key.
+            const ruled = message(1, [new TextPart('continue with rules')]);
+            const zCall = message(2, [new TextPart('Earlier step.'), new ToolCallPart('toolu_z', 'create_file', { filePath: 'z', content: '0' })]);
+            const zResults = message(1, [new ToolResultPart('toolu_z', [new TextPart('done')]), new ToolResultPart('toolu_a', [new TextPart('done')]),
+                new ToolResultPart('toolu_b', [new TextPart('done')])]);
+            await ask([ruled, zCall, note('RULES B')]);
+            await ask([ruled, zCall, note('RULES B'), message(2, [text, a, b]), zResults]);
+            expect(assistantOf(bodies.at(-1)!).content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
+            await ask([ruled, zCall, message(2, [text, a, b]), zResults]);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            const ordered = message(1, [new TextPart('make two files, ordered rules')]);
+            await ask([note('RULES A'), note('RULES B'), ordered]);
+            await ask([note('RULES B'), note('RULES A'), ordered, message(2, [text, a, b]), results]);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            await ask([note('RULES A'), note('RULES B'), ordered, message(2, [text, a, b]), results]);
+            expect(assistantOf(bodies.at(-1)!).content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
+            // Stored with no system text at all; continued with a new system note inside the turn: not restored.
+            await ask([user, message(2, [text, a]), note('new synthetic rules'), message(2, [b]), results]);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            // System text is compared as the Gateway receives it, hoisted out in order: its position among the messages
+            // does not matter, its text does.
+            const rules = (value: string) => message(3, [new TextPart(value)]);
+            const asked = message(1, [new TextPart('make two files, with rules')]);
+            await ask([rules('synthetic rules'), asked]);
+            await ask([asked, rules('synthetic rules'), message(2, [text, a, b]), results]);
+            expect(assistantOf(bodies.at(-1)!).content[0]).toEqual({ type: 'thinking', thinking: thought, signature });
+            await ask([rules('other synthetic rules'), asked, message(2, [text, a, b]), results]);
+            expect(leaked(bodies.at(-1)!)).toBe(false);
+            // A history that ends in an assistant turn: the reply continues that turn (one assistant message at the
+            // Gateway), and the continuation finds the thinking with the earlier calls ahead of the reply's.
+            const earlier = message(2, [new TextPart('Earlier step.'), new ToolCallPart('toolu_z', 'create_file', { filePath: 'z', content: '0' })]);
+            const ending = [message(1, [new TextPart('continue the plan')]), earlier];
+            await ask(ending);
+            await ask([...ending, message(2, [text, a, b]), message(1, [new ToolResultPart('toolu_z', [new TextPart('done')]),
+                new ToolResultPart('toolu_a', [new TextPart('done')]), new ToolResultPart('toolu_b', [new TextPart('done')])])]);
+            const merged = assistantOf(bodies.at(-1)!).content;
+            expect(merged[0]).toEqual({ type: 'thinking', thinking: thought, signature });
+            expect(merged.filter(block => block.type === 'tool_use').map(block => block.id)).toEqual(['toolu_z', 'toolu_a', 'toolu_b']);
+            // Split the same way, but not this turn's exact continuation: another chat, a missing call, the calls reordered,
+            // or another model. None of these gets the thinking.
+            for (const [history, model] of [[[message(1, [new TextPart('an unrelated chat')]), message(2, [text]), message(2, [a, b]), results], claude],
+                [[user, message(2, [text]), message(2, [a]), message(1, [new ToolResultPart('toolu_a', [new TextPart('done')])])], claude],
+                [[user, message(2, [text]), message(2, [b]), message(2, [a]), results], claude],
+                [[user, message(2, [text]), message(2, [a, b]), results], opus]] as const) {
+                await ask(history as readonly unknown[] as unknown[], model);
+                expect(leaked(bodies.at(-1)!)).toBe(false);
+            }
         } finally { mock.module('vscode', () => fakeVscode); }
     });
 });

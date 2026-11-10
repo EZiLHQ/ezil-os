@@ -8,6 +8,7 @@ import {
     index,
     jsonb,
     pgTable,
+    primaryKey,
     text,
     timestamp,
     unique,
@@ -58,6 +59,11 @@ export const billingSubscriptions = pgTable(
         cancelAtPeriodEnd: boolean('cancel_at_period_end').notNull().default(false),
         stripeEventCreated: timestamp('stripe_event_created', { withTimezone: true }).notNull(),
         updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+        /** 0021: Stripe's trial window as last read; null for a subscription without a trial. */
+        trialStart: timestamp('trial_start', { withTimezone: true }),
+        trialEnd: timestamp('trial_end', { withTimezone: true }),
+        /** 0021: when the first positive paid period was granted; a trial that never paid gets no renewal grace. */
+        firstPaidAt: timestamp('first_paid_at', { withTimezone: true }),
     },
     (table) => [
         foreignKey({
@@ -120,11 +126,15 @@ export const billingGrants = pgTable(
     },
     (table) => [
         check('ezil_billing_grants_meter_chk', sql`${table.meter} in ('workspace_seconds', 'ai_usd_micro', 'compute_std_seconds')`),
-        check('ezil_billing_grants_kind_chk', sql`${table.kind} in ('pro_period', 'topup', 'revoke', 'suspend', 'restore', 'plan_period', 'upgrade_prorated')`),
-        check('ezil_billing_grants_source_type_chk', sql`${table.sourceType} in ('invoice', 'payment_intent', 'refund', 'dispute')`),
+        check('ezil_billing_grants_kind_chk', sql`${table.kind} in ('pro_period', 'topup', 'revoke', 'suspend', 'restore', 'plan_period', 'upgrade_prorated', 'trial_period')`),
+        check('ezil_billing_grants_source_type_chk', sql`${table.sourceType} in ('invoice', 'payment_intent', 'refund', 'dispute', 'trial')`),
         uniqueIndex('ezil_billing_grants_plan_period_uidx')
             .on(table.subscriptionId, table.periodStart, table.meter)
             .where(sql`${table.kind} = 'plan_period'`),
+        // 0021: one trial grant per person and meter, whatever subscription it came from.
+        uniqueIndex('ezil_billing_grants_trial_once_uidx')
+            .on(table.userId, table.meter)
+            .where(sql`${table.kind} = 'trial_period'`),
         unique('ezil_billing_grants_source_meter_kind_unique')
             .on(table.sourceType, table.sourceId, table.meter, table.kind),
         foreignKey({
@@ -419,9 +429,112 @@ export const billingPaymentIssues = pgTable(
     ],
 ).enableRLS();
 
+/**
+ * 0021 Standard trial: one row per person, claimed when the server quotes the trial end it discloses.
+ * `trialEnd` is that disclosed end (the first charge); Stripe's actual window lives on the subscription.
+ */
+export const billingTrials = pgTable(
+    'ezil_billing_trials',
+    {
+        id: uuid('id').primaryKey().defaultRandom(),
+        /** Null once the account is deleted: the row stays as the person's tombstone claim (0021). */
+        userId: uuid('user_id'),
+        authSubject: text('auth_subject').notNull(),
+        emailNormalized: text('email_normalized').notNull(),
+        sku: text('sku').notNull(),
+        policyVersion: integer('policy_version').notNull(),
+        status: text('status', { enum: ['quoted', 'checkout', 'trialing', 'converted', 'canceled', 'ended', 'payment_failed'] })
+            .notNull().default('quoted'),
+        quotedAt: timestamp('quoted_at', { withTimezone: true }).notNull(),
+        trialEnd: timestamp('trial_end', { withTimezone: true }).notNull(),
+        checkoutSessionId: text('checkout_session_id'),
+        stripeCustomerId: text('stripe_customer_id'),
+        stripeSubscriptionId: text('stripe_subscription_id'),
+        trialStart: timestamp('trial_start', { withTimezone: true }),
+        /** The owned app origin the quote was made on: every checkout of this quote returns there (stable request terms). */
+        returnOrigin: text('return_origin').notNull(),
+        createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+        updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => [
+        unique('ezil_billing_trials_user_unique').on(table.userId),
+        unique('ezil_billing_trials_subject_unique').on(table.authSubject),
+        unique('ezil_billing_trials_email_unique').on(table.emailNormalized),
+        unique('ezil_billing_trials_checkout_unique').on(table.checkoutSessionId),
+        unique('ezil_billing_trials_subscription_unique').on(table.stripeSubscriptionId),
+        check('ezil_billing_trials_sku_chk', sql`${table.sku} = 'standard_monthly_v3'`),
+        check('ezil_billing_trials_policy_chk', sql`${table.policyVersion} >= 1`),
+        check('ezil_billing_trials_status_chk', sql`${table.status} in ('quoted', 'checkout', 'trialing', 'converted', 'canceled', 'ended', 'payment_failed')`),
+        check('ezil_billing_trials_bound_chk', sql`(${table.stripeSubscriptionId} is null) = (${table.status} in ('quoted', 'checkout'))`),
+        check('ezil_billing_trials_email_chk', sql`${table.emailNormalized} = lower(${table.emailNormalized}) and position('@' in ${table.emailNormalized}) > 1`),
+        check('ezil_billing_trials_subject_chk', sql`length(${table.authSubject}) between 1 and 255`),
+        check('ezil_billing_trials_end_chk', sql`${table.trialEnd} > ${table.quotedAt}`),
+        check('ezil_billing_trials_origin_chk', sql`${table.returnOrigin} ~ '^https?://[A-Za-z0-9.-]+(:[0-9]{1,5})?$'`),
+        foreignKey({
+            name: 'ezil_billing_trials_user_id_fkey',
+            columns: [table.userId],
+            foreignColumns: [authUsers.id],
+        }).onDelete('set null').onUpdate('cascade'),
+    ],
+).enableRLS();
+
+/**
+ * 0021 (review R4): every verified identity (email, sign-in subject) a STARTED trial's account has had, append-only, so
+ * a deleted account's later identities stay claimed with its trial tombstone.
+ */
+export const billingTrialIdentities = pgTable(
+    'ezil_billing_trial_identities',
+    {
+        trialId: uuid('trial_id').notNull(),
+        kind: text('kind', { enum: ['email', 'subject'] }).notNull(),
+        value: text('value').notNull(),
+        emailDomain: text('email_domain'),
+        firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => [
+        primaryKey({ name: 'ezil_billing_trial_identities_pkey', columns: [table.trialId, table.kind, table.value] }),
+        check('ezil_billing_trial_identities_kind_chk', sql`${table.kind} in ('email', 'subject')`),
+        check('ezil_billing_trial_identities_value_chk', sql`length(${table.value}) between 1 and 320`),
+        check('ezil_billing_trial_identities_email_chk', sql`${table.kind} = 'subject' or (${table.value} = lower(${table.value})
+            and position('@' in ${table.value}) > 1 and ${table.emailDomain} = split_part(${table.value}, '@', 2))`),
+        check('ezil_billing_trial_identities_domain_chk', sql`(${table.kind} = 'email') = (${table.emailDomain} is not null)`),
+        index('ezil_billing_trial_identities_value_idx').on(table.kind, table.value),
+        index('ezil_billing_trial_identities_domain_idx').on(table.emailDomain).where(sql`${table.kind} = 'email'`),
+        foreignKey({
+            name: 'ezil_billing_trial_identities_trial_id_fkey',
+            columns: [table.trialId],
+            foreignColumns: [billingTrials.id],
+        }).onDelete('cascade').onUpdate('cascade'),
+    ],
+).enableRLS();
+
+/**
+ * 0021 (review): the known verified identities (email, sign-in subject) of a person with positive paid history, kept
+ * after the account is deleted (no user link), so "no prior paid plan" holds per verified person.
+ */
+export const billingPaidIdentities = pgTable(
+    'ezil_billing_paid_identities',
+    {
+        kind: text('kind', { enum: ['email', 'subject'] }).notNull(),
+        value: text('value').notNull(),
+        emailDomain: text('email_domain'),
+        firstSeenAt: timestamp('first_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    },
+    (table) => [
+        primaryKey({ name: 'ezil_billing_paid_identities_pkey', columns: [table.kind, table.value] }),
+        check('ezil_billing_paid_identities_kind_chk', sql`${table.kind} in ('email', 'subject')`),
+        check('ezil_billing_paid_identities_value_chk', sql`length(${table.value}) between 1 and 320`),
+        check('ezil_billing_paid_identities_email_chk', sql`${table.kind} = 'subject' or (${table.value} = lower(${table.value})
+            and position('@' in ${table.value}) > 1 and ${table.emailDomain} = split_part(${table.value}, '@', 2))`),
+        check('ezil_billing_paid_identities_domain_chk', sql`(${table.kind} = 'email') = (${table.emailDomain} is not null)`),
+        index('ezil_billing_paid_identities_domain_idx').on(table.emailDomain).where(sql`${table.kind} = 'email'`),
+    ],
+).enableRLS();
+
 export type BillingComputeEpochRow = typeof billingComputeEpochs.$inferSelect;
 export type BillingOverageConsentRow = typeof billingOverageConsents.$inferSelect;
 export type BillingOverageInvoiceRow = typeof billingOverageInvoices.$inferSelect;
 export type BillingPlanChangeRow = typeof billingPlanChanges.$inferSelect;
 export type BillingSizePreferenceRow = typeof billingSizePreferences.$inferSelect;
 export type BillingPaymentIssueRow = typeof billingPaymentIssues.$inferSelect;
+export type BillingTrialRow = typeof billingTrials.$inferSelect;

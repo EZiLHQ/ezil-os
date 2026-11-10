@@ -64,6 +64,10 @@ worker/worker-junit.xml
 # OS / editor cruft
 .DS_Store
 *.log
+# Python bytecode, e.g. from `python3 .github/scripts/local-tests.py` importing its siblings
+# (infra/host-agent/.gitignore already covers that tree)
+__pycache__/
+*.py[co]
 # Agent definitions are COMMITTED (transparency: the models, effort levels and
 # mandatory rules every worker runs under are part of the public record).
 # Worktrees and any other per-machine agent state stay ignored. A trailing-slash

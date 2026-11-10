@@ -31,7 +31,7 @@ import { planFromSubscriptions } from '@/server/billing/v3/catalog';
 import type {
     ComputerMoveRefusalV3, ComputerMoveStartOutputV3, SwitchConfigurationOutputV3, SwitchHealReasonV3, SwitchPhaseV3,
 } from '@/server/billing/v3/contract';
-import { deriveStanding } from '@/server/billing/v3/standing';
+import { deriveStanding, operatorAccessFor } from '@/server/billing/v3/standing';
 import { meteredSizeForInstanceType } from '@/server/lib/compute/aws-config';
 import { failureFields, failureReason, leadingCode } from '@/server/lib/failure-diagnostics';
 import { preflightSwitchCapacity, type SwitchCapacity } from '@/server/lib/compute/aws-pool-runtime';
@@ -67,6 +67,7 @@ import {
     createProviderReverseStore, forwardMoveBusy, ReverseMoveConflictError, reverseMovesTablePresent, type ComputeReverseMove,
 } from '@/server/lib/compute/provider-reverse-store';
 import { plusPlanIds, resolveEntitlement, tierForEntitlement, type EntitlementReader, type EntitlementRecord } from '@/server/lib/compute/tier';
+import { paidComputeUnmetered } from '@/server/lib/compute/paid-compute-policy';
 
 export type RoutedComputer =
     | { kind: 'cloudflare'; provider: CloudflareComputeProvider }
@@ -111,6 +112,8 @@ export function awsDepsFor(env: Env, entitlement: EntitlementRecord | null | und
         ...aws,
         entitlement: typeof entitlement === 'function' ? undefined : entitlement,
         tierFor: async () => tierForEntitlement(typeof entitlement === 'function' ? await entitlement() : entitlement, plusPlanIds(env)),
+        // Paid compute policy v1: the same resolved entitlement decides the per-person hour-cap exemption.
+        paidCompute: async () => paidComputeUnmetered(typeof entitlement === 'function' ? await entitlement() : entitlement),
     };
 }
 
@@ -464,8 +467,12 @@ async function defaultPreparePool(db: PlacementExecutor, computer: ComputerRef, 
 /** The same plan rule `billing.selectMachine` applies: an active Premium plan whose machine choice lists `size`. */
 async function entitledTo(billing: BillingDeps, userId: string, size: SizeCode): Promise<boolean> {
     try {
-        const [subs, userCreatedAt] = await Promise.all([billing.store.subscriptionsFor(userId), billing.store.userCreatedAt(userId)]);
-        const plan = planFromSubscriptions({ subs, now: billing.now(), userCreatedAt });
+        const [subs, userCreatedAt, grants] = await Promise.all([billing.store.subscriptionsFor(userId), billing.store.userCreatedAt(userId),
+            billing.store.operatorEntitlementsFor?.(userId) ?? []]);
+        // Product entitlements v1: an operator-assigned Premium has the same machine choice (Stripe paid access still wins).
+        const operator = grants.length
+            ? operatorAccessFor({ subscriptions: subs, paymentIssues: await billing.store.openPaymentIssues(userId), grants, now: billing.now() }) : null;
+        const plan = planFromSubscriptions({ subs, now: billing.now(), userCreatedAt, operator });
         if (plan.sku !== 'premium_monthly_v3' || plan.status !== 'active' || !plan.offer.machineChoice.includes(size)) return false;
         // The compute entitlement itself (allowance granted, no payment issue), as every AWS open reads it.
         const record = await billingV2EntitlementReader(() => billing).read(userId);
@@ -709,8 +716,11 @@ async function defaultIsOperator(email: string): Promise<boolean> {
  */
 async function heldStanding(billing: BillingDeps, userId: string): Promise<string | null> {
     if (!billing.config.tabEnabled) return null;
-    const [subscriptions, paymentIssues] = await Promise.all([billing.store.subscriptionsFor(userId), billing.store.openPaymentIssues(userId)]);
-    return deriveStanding({ subscriptions, paymentIssues, placementProvider: 'aws-ec2', now: billing.now() }).standing;
+    const [subscriptions, paymentIssues, grants] = await Promise.all([billing.store.subscriptionsFor(userId), billing.store.openPaymentIssues(userId),
+        billing.store.operatorEntitlementsFor?.(userId) ?? []]);
+    // Product entitlements v1: an operator grant in effect is paid standing, never the Free hold.
+    const operator = operatorAccessFor({ subscriptions, paymentIssues, grants, now: billing.now() });
+    return deriveStanding({ subscriptions, paymentIssues, placementProvider: 'aws-ec2', now: billing.now(), operator }).standing;
 }
 /** §5.9 step 7: a D16 hold session is open (or opening, or stopping), or a lifecycle job is pending: "stop first". */
 const MOVE_RUNNING_STATES: readonly PlacementState[] = ['RUNNING', 'LEASED', 'STARTING', 'MOUNTING', 'DRAINING', 'STOPPING'];

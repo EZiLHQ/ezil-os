@@ -5,8 +5,9 @@
 - `json-tool.py --namespace prd namespace-config` accepts the founder's P1-P7 inputs
   (PROD-COMPUTERS-PLAN) and refuses mum/staging values, a rebase tuple, a foreign
   origin or enroll URL, and any other app caller;
-- prd refuses every pinned operation until its foundation pins are committed, and
-  every image-rebase operation; secret errors stay redacted under --namespace.
+- prd carries its committed foundation pins and refuses foreign ones; an emptied pin
+  still refuses every pinned operation; prd refuses every image-rebase operation;
+  secret errors stay redacted under --namespace.
 """
 import contextlib
 import copy
@@ -42,7 +43,7 @@ AMI = {**SCOPE, "version": "1.0.0"}
 SHA = "a" * 40
 AMI_PARAMETERS = [{"ParameterKey": k, "ParameterValue": v} for k, v in {
     "AssetBucketName": f"ezil-prd-deploy-assets-{A}",
-    "ApplicationImageRepositoryUri": f"{A}.dkr.ecr.{R}.amazonaws.com/ezil-prd-foundation-applicationimages0123abcd-a1b2c3d4e5f6",
+    "ApplicationImageRepositoryUri": f"{A}.dkr.ecr.{R}.amazonaws.com/ezil-prd-foundation-applicationimages439f25f1-xkgzfggtz2w4",
     "SubnetId": "subnet-0123456789abcdef0", "SecurityGroupId": "sg-0123456789abcdef0",
     "UbuntuAmiId": "/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id",
     "AgentSrcS3Uri": f"s3://ezil-prd-deploy-assets-{A}/ami/host-agent-{SHA}.tgz",
@@ -54,7 +55,7 @@ AMI_PARAMETERS = [{"ParameterKey": k, "ParameterValue": v} for k, v in {
 LIFECYCLE = {
     "settings": {"deployment": {
         "accountId": A, "region": R, "zoneId": "aps1-az1", "subnetId": "subnet-0123456789abcdef0",
-        "securityGroupId": "sg-0123456789abcdef0", "launchTemplateId": "lt-0123456789abcdef0", "launchTemplateVersion": "2",
+        "securityGroupId": "sg-0123456789abcdef0", "launchTemplateId": "lt-0b68cfb18ad22869a", "launchTemplateVersion": "2",
         "amiId": "ami-0123456789abcdef0", "namespace": "prd", "instanceTypes": ["m6i.large", "m6i.xlarge", "m6i.2xlarge"],
         "storage": {"rootDeviceName": "/dev/sda1", "rootGiB": 30, "dataMinGiB": 20, "dataMaxGiB": 100},
         "dataKeyArn": f"arn:aws:kms:{R}:{A}:key/00000000-0000-4000-8000-000000000000",
@@ -158,6 +159,25 @@ def redirected_tools(folder):
     return tools
 
 
+PRD_REPOSITORY = f"{A}.dkr.ecr.{R}.amazonaws.com/ezil-prd-foundation-applicationimages439f25f1-xkgzfggtz2w4"
+PRD_LAUNCH_TEMPLATE = "lt-0b68cfb18ad22869a"
+
+
+def unpinned_tools(folder):
+    """A redirected copy of the tooling with prd's foundation pins emptied: the empty-pin refusal must survive the pin."""
+    tools = redirected_tools(folder)
+    for name, pins in (("json-tool.py", ((f'f"{{ACCOUNT}}.dkr.ecr.{{REGION}}.amazonaws.com/{PRD_REPOSITORY.split("/", 1)[1]}"', "None"),
+                                         (f'"{PRD_LAUNCH_TEMPLATE}"', "None"))),
+                       ("common.sh", ((f"repository={PRD_REPOSITORY}", "repository="),
+                                      (f"launch_template={PRD_LAUNCH_TEMPLATE}", "launch_template=")))):
+        text = (tools / name).read_text()
+        for pinned, empty in pins:
+            assert text.count(pinned) == 1, (name, pinned)
+            text = text.replace(pinned, empty)
+        (tools / name).write_text(text)
+    return tools
+
+
 class NamespaceConfigTests(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()
@@ -171,12 +191,19 @@ class NamespaceConfigTests(unittest.TestCase):
         path.write_text(json.dumps(value))
         return run("--namespace", "prd", "namespace-config", kind, str(path))
 
-    def test_founder_inputs_pass_before_any_pin_exists(self):
+    def test_founder_inputs_pass_with_the_committed_pins(self):
         for kind, value in GOOD.items():
             with self.subTest(kind):
                 result = self.check(kind, value)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(f"{kind} config matches namespace prd", result.stdout)
+
+    def test_inputs_naming_another_repository_or_launch_template_are_refused(self):
+        foreign_repo = [{**p, "ParameterValue": f"{A}.dkr.ecr.{R}.amazonaws.com/ezil-prd-foundation-applicationimages0123abcd-a1b2c3d4e5f6"}
+                        if p["ParameterKey"] == "ApplicationImageRepositoryUri" else p for p in AMI_PARAMETERS]
+        self.assertIn("ECR repository mismatch", self.check("ami-parameters", foreign_repo).stderr)
+        foreign_lt = edit(LIFECYCLE, ["settings", "deployment", "launchTemplateId"], "lt-0123456789abcdef0")
+        self.assertIn("launch-template identity mismatch", self.check("lifecycle", foreign_lt).stderr)
 
     def test_mum_staging_rebase_and_foreign_values_are_refused(self):
         for kind, cases in REFUSED.items():
@@ -197,7 +224,7 @@ class NamespaceConfigTests(unittest.TestCase):
 
 class ProfileTests(unittest.TestCase):
     def shell(self, namespace):
-        # die is stubbed only to read the profile past the unpinned refusal.
+        # die is stubbed so the profile can be read even past a refusal.
         script = (f'source "{TOOLS / "common.sh"}"; die() {{ :; }}; use_namespace {namespace}; '
                   'printf "%s\\n" "$namespace" "$bucket" "$exec_role" "$machine" "$repository" "$launch_template" '
                   '"$lock_dir" "$ami_stack" "$foundation_stack" "$lifecycle_stack" "$config_dir" "$release_dir"')
@@ -229,20 +256,21 @@ class ProfileTests(unittest.TestCase):
                 "ezil-os/production/app", "https://os-prod.ezil.work", "ezil-prd-deploy-assets-452630323510",
                 "arn:aws:iam::452630323510:role/ezil/identity/ezil-prd-cfn-exec",
                 "arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle", "/root/ezil-aws-prd/locks/app-secret.lock"))
-            self.assertIsNone(tool.REPOSITORY)
-            self.assertIsNone(tool.LAUNCH_TEMPLATE)
+            self.assertEqual((tool.REPOSITORY, tool.LAUNCH_TEMPLATE), (PRD_REPOSITORY, PRD_LAUNCH_TEMPLATE))
             self.assertEqual(tool.PROFILE["appCaller"]["ec2CallerRoleArns"], [HOST])
         finally:
             tool.use_namespace("mum")
 
     def test_unpinned_prd_refuses_and_unknown_namespaces_fail(self):
-        result = run("--namespace", "prd", "pair", "/nonexistent")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("no pinned ECR repository/launch template", result.stderr)
+        with tempfile.TemporaryDirectory() as folder:
+            tools = unpinned_tools(folder)
+            result = run("--namespace", "prd", "pair", "/nonexistent", tools=tools)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("no pinned ECR repository/launch template", result.stderr)
+            shell = subprocess.run(["bash", "-c", f'source "{tools / "common.sh"}"; use_namespace prd'], capture_output=True, text=True)
+            self.assertNotEqual(shell.returncode, 0)
+            self.assertIn("not pinned yet", shell.stderr)
         self.assertIn("unknown operator namespace", run("--namespace", "qa", "namespace-config", "keys", "/nonexistent").stderr)
-        shell = subprocess.run(["bash", "-c", f'source "{TOOLS / "common.sh"}"; use_namespace prd'], capture_output=True, text=True)
-        self.assertNotEqual(shell.returncode, 0)
-        self.assertIn("not pinned yet", shell.stderr)
 
     def test_prd_never_writes_mum_operator_state(self):
         shell = subprocess.run(["bash", "-c", f'source "{TOOLS / "common.sh"}"; release_dir=/root/ezil-aws-mum/release/other; use_namespace prd'],
@@ -257,7 +285,7 @@ class ProfileTests(unittest.TestCase):
                 result = run("--namespace", namespace, "secret-update", "/nonexistent/before.json", "/nonexistent/after.json", tools=tools)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stderr.strip(), "ERROR: secret operation refused; inspect deployment alignment and AWS access")
-            # mum reached its (redirected) app-secret lock before failing; unpinned prd never got that far.
+            # The app-secret lock taken was the redirected one, never the host's real operator lock.
             self.assertTrue((Path(folder) / "locks/app-secret.lock").exists())
 
     def test_pinned_prd_still_refuses_rebase_operations_and_tuples(self):

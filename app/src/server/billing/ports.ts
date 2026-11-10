@@ -10,6 +10,7 @@
  */
 import type { IntervalRow, SubscriptionRow } from './meters';
 import type { ComputeEpoch, EpochEndReason, GrantKindV2, GRANT_METER_COMPUTE, SizeCode } from './v2/contract';
+import type { OperatorEntitlementRow } from './v3/operator-access';
 
 // ── Store (implemented by `store.ts` over drizzle) ───────────────────────────
 
@@ -29,11 +30,15 @@ export interface SubscriptionUpsert {
     cancelAtPeriodEnd: boolean;
     /** `created` of the Stripe event that produced this state; older states never overwrite newer ones. */
     stripeEventCreated: Date;
+    /** 0021: Stripe's trial window as read with this state; omitted by writers that predate the trial. */
+    trialStart?: Date | null;
+    trialEnd?: Date | null;
 }
 
 export type GrantMeter = 'workspace_seconds' | 'ai_usd_micro' | typeof GRANT_METER_COMPUTE;
-export type GrantKind = 'pro_period' | 'topup' | GrantKindV2;
-export type GrantSource = 'invoice' | 'payment_intent' | 'refund' | 'dispute';
+/** `trial_period` (0021): the Standard trial's own grant, sourced from the subscription, never an invoice. */
+export type GrantKind = 'pro_period' | 'topup' | 'trial_period' | GrantKindV2;
+export type GrantSource = 'invoice' | 'payment_intent' | 'refund' | 'dispute' | 'trial';
 
 export interface GrantInsert {
     userId: string;
@@ -220,6 +225,11 @@ export interface BillingStore {
     stripeCustomerFor(userId: string): Promise<string | null>;
     userForStripeCustomer(stripeCustomerId: string): Promise<string | null>;
     subscriptionsFor(userId: string): Promise<SubscriptionRow[]>;
+    /**
+     * Product entitlements v1: the account's operator assignments (never Stripe rows), newest first. Optional: a store
+     * without it (or before 0019 is applied) has none, and every reader then resolves Stripe or Free exactly as before.
+     */
+    operatorEntitlementsFor?(userId: string): Promise<OperatorEntitlementRow[]>;
     /** Intervals that overlap `[since, ∞)`, open ones included. */
     intervalsFor(userId: string, since: Date): Promise<IntervalRow[]>;
     /** Newest sample per computer. */
@@ -250,6 +260,12 @@ export interface BillingStore {
     touchInterval(computerId: string, at: Date): Promise<void>;
     closeInterval(computerId: string, at: Date, reason: string): Promise<void>;
     insertStorageSample(userId: string, sample: StorageSample & { source: string }): Promise<void>;
+    /**
+     * The host agent's sample, at most once per (computer, measured_at, source): a retried
+     * POST is `duplicate`, not a second row. Serialised per computer by an advisory lock
+     * (the append-only table has no unique key and this lane adds no migration).
+     */
+    insertStorageSampleOnce?(userId: string, sample: StorageSample & { source: string }): Promise<'recorded' | 'duplicate'>;
     /** Close every open interval last seen before `staleBefore`, ending it at its `last_seen_at`. Returns how many. */
     closeStaleIntervals(staleBefore: Date, reason: string): Promise<number>;
 }
@@ -270,6 +286,13 @@ export interface StripeSubscription {
     pendingUpdateExpiresAt: Date | null;
     /** Known catalog SKU from metadata or the first recognized item lookup key. */
     sku: string | null;
+    /** Stripe's trial window (null without a trial). Optional for adapters that predate the trial. */
+    trialStart?: Date | null;
+    trialEnd?: Date | null;
+    /** `metadata.ezil_trial` written by our own trial checkout: the trial row id, never an owner. */
+    trialId?: string | null;
+    /** When the subscription ended (canceled / incomplete_expired); null while it lives. */
+    endedAt?: Date | null;
 }
 
 export interface StripeInvoice {
@@ -280,6 +303,12 @@ export interface StripeInvoice {
     billingReason: string | null;
     metadataKind: string | null;
     hostedInvoiceUrl: string | null;
+    /**
+     * Stripe's `total` and `amount_paid` in the invoice currency's minor unit. A period grant needs a
+     * positive total: a $0 invoice (a trial, a 100% coupon) is never proof that a period was paid.
+     */
+    total: number;
+    amountPaid: number;
     lines: {
         id: string;
         lookupKey: string | null;
@@ -307,6 +336,8 @@ export interface StripeCheckoutSession {
     amountTotal?: number | null;
     currency?: string | null;
     metadataCredits?: string | null;
+    /** `metadata.ezil_trial` of our own trial checkout (the trial row id); null otherwise. */
+    trialId?: string | null;
 }
 
 export interface StripeCharge {
@@ -342,6 +373,11 @@ export interface CheckoutRequest {
     successUrl: string;
     cancelUrl: string;
     idempotencyKey: string;
+    /**
+     * Standard trial (0021): the server-quoted trial end (the first charge) and the trial row id. Set only by the
+     * router after its eligibility check; the session then collects a payment method with no charge today.
+     */
+    trial?: { trialId: string; trialEnd: Date; expiresAt: Date };
 }
 
 export interface CheckoutSessionCreated {
@@ -420,8 +456,6 @@ export interface StripeApi extends StripePackApi {
     listCustomerSubscriptions(customerId: string): Promise<{ id: string; status: string }[]>;
     /** One customer's OPEN Checkout Sessions (`status=open`), all pages, with their mode. */
     listOpenCheckoutSessions(customerId: string): Promise<{ id: string; mode: string }[]>;
-    /** Expire one open Checkout Session so it can no longer be paid (Stripe refuses a session that is not open). */
-    expireCheckoutSession(id: string): Promise<void>;
     /** Newest first. */
     listInvoices(customerId: string, limit: number): Promise<StripeInvoiceSummary[]>;
     createPortalSession(input: { customerId: string; returnUrl: string }): Promise<{ url: string }>;
@@ -430,6 +464,9 @@ export interface StripeApi extends StripePackApi {
     retrieveInvoicePaymentState(invoiceId: string): Promise<StripeInvoicePaymentState>;
     retrieveCheckoutSession(id: string): Promise<StripeCheckoutSession>;
     retrieveCharge(id: string): Promise<StripeCharge>;
+    /** Expire one open Checkout Session so it can no longer be paid (Stripe refuses one that is not open); for a
+     *  superseded trial checkout, 'complete' when it already finished. */
+    expireCheckoutSession(id: string): Promise<'expired' | 'complete' | 'gone'>;
 }
 
 export interface StripePrice {

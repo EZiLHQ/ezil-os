@@ -70,6 +70,21 @@
       "path": "app/drizzle/0012_compute_reverse_moves.sql",
       "sha256": "3adc02973b2ea75d08b95cecb7355560391354cae5cea19783af310e7699d340",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0019_operator_entitlements.sql",
+      "sha256": "ffe4ec335eabc8213664e5a71e1fcd4f6edf36cefbcdc69d7a569b5198375fc4",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0020_operator_refusal_receipts.sql",
+      "sha256": "c2b3dedaf9a53d5e449a59ebe1d8a3f0f9b863ed7d2c81c79d3d9bd1ce6b7951",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0021_standard_trial.sql",
+      "sha256": "d44471c2a8fa9880b09aaf4f6654e5856cf1ea356071379021f63571f542ca35",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {

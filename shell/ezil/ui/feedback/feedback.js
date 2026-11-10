@@ -1,14 +1,24 @@
 // feedback.js — EZiL-authored. Explicit consent, preview, then one submission.
 // Wire/API signatures are pinned in docs/FEEDBACK-CONTROLS-CONTRACT.md.
-import { build_diagnostics } from './diagnostics.js';
+import { app_failure_diagnostics_accepted, build_diagnostics } from './diagnostics.js';
 import { scan } from './secret-scan.js';
 import { capture_shell_snapshot, tab_capture_supported, capture_tab_frame, capture_desktop_frame, desktop_capture_supported } from './capture.js';
 import { open_redact_editor } from './redact-editor.js';
+import { uploaded_image_canvas } from './image-file.js';
+import { currentComputer } from '../../session.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">'
     + '<path d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-6 4V6a2 2 0 0 1 2-2Z"/><path d="M7 9h10M7 13h7"/></svg>';
 const CATEGORIES = ['bug', 'idea', 'other'];
+const BUG_FIELDS = [['activity', 'What were you doing?'], ['steps', 'Steps to reproduce'],
+    ['expected', 'Expected result'], ['actual', 'Actual result']];
+function report_text(category, description, bug = {}) {
+    if (category !== 'bug' || !Object.values(bug).some(Boolean)) return description;
+    return [['Summary / context', description], ...BUG_FIELDS.map(([key, title]) => [title, bug[key]]),
+        ['Reproducibility', bug.reproducibility], ['Impact', bug.impact]]
+        .map(([title, value]) => `${title}\n${String(value || '').trim()}`).join('\n\n');
+}
 const DRAFT_KEY = 'ezil:feedback:draft:v1:';
 const OUTBOX_KEY = 'ezil:feedback:outbox:v1:';
 const OUTBOX_MAX = 10;
@@ -72,23 +82,27 @@ function read_json (prefix) {
 
 function write_json (prefix, value) {
     const id = account_id(), s = store();
-    if ( ! id || ! s ) return;
+    if ( ! id || ! s ) return false;
     try {
-        if ( value === null ) s.removeItem(prefix + id);
-        else s.setItem(prefix + id, JSON.stringify(value));
-    } catch { /* Storage is a convenience: full, blocked or private mode only loses the draft. */ }
+        const encoded = value === null ? null : JSON.stringify(value);
+        if (encoded === null) s.removeItem(prefix + id);
+        else s.setItem(prefix + id, encoded);
+        return s.getItem(prefix + id) === encoded;
+    } catch { return false; }
 }
 
 function read_draft () {
     const d = read_json(DRAFT_KEY);
     if ( ! d || typeof d !== 'object' || typeof d.clientRequestId !== 'string' || ! UUID.test(d.clientRequestId) ) return null;
     return { clientRequestId: d.clientRequestId, category: CATEGORIES.includes(d.category) ? d.category : 'bug',
-        description: typeof d.description === 'string' ? d.description.slice(0, 4000) : '' };
+        description: typeof d.description === 'string' ? d.description : '',
+        bug: Object.fromEntries([...BUG_FIELDS.map(([key]) => key), 'reproducibility', 'impact']
+            .map(key => [key, typeof d.bug?.[key] === 'string' ? d.bug[key] : ''])) };
 }
 
 /** @param {{clientRequestId:string,category:string,description:string}|null} draft */
 function write_draft (draft) {
-    write_json(DRAFT_KEY, draft && draft.description.trim() ? draft : null);
+    write_json(DRAFT_KEY, draft && (draft.description.trim() || Object.values(draft.bug || {}).some(Boolean)) ? draft : null);
 }
 
 function read_outbox () {
@@ -102,8 +116,11 @@ function read_outbox () {
 
 function outbox_put (clientRequestId, body) {
     const list = read_outbox().filter(entry => entry.clientRequestId !== clientRequestId);
-    list.push({ clientRequestId, body });
-    write_json(OUTBOX_KEY, list.slice(-OUTBOX_MAX));
+    const prior = read_outbox().find(entry => entry.clientRequestId === clientRequestId);
+    const draft = read_draft();
+    if (list.length >= OUTBOX_MAX) return false;
+    list.push({ clientRequestId, body, draft: prior?.draft ?? (draft?.clientRequestId === clientRequestId ? draft : null) });
+    return write_json(OUTBOX_KEY, list);
 }
 
 function outbox_remove (clientRequestId) {
@@ -121,47 +138,73 @@ function listen_online () {
 function retryable (status) { return status === 0 || status === 408 || status >= 500; }
 
 /**
- * FEEDBACK-DIAG: `body` without `diagnostics.recentEvents[].reason`/`.correlationId`,
- * or null when it carries neither. Only ever removes those two keys.
+ * Roll back optional diagnostic extensions for older strict servers, or null
+ * when the body has none. The remaining frozen report stays unchanged.
  */
 function without_event_diagnostics (body) {
     try {
         const sent = JSON.parse(body);
         const events = sent?.diagnostics?.recentEvents;
-        if ( ! Array.isArray(events) || ! events.some(event => event && ('reason' in event || 'correlationId' in event)) ) return null;
-        for ( const event of events ) { delete event.reason; delete event.correlationId; }
+        if (!sent?.diagnostics) return null;
+        const before = JSON.stringify(sent.diagnostics);
+        delete sent.diagnostics.session; delete sent.diagnostics.tracePhases; delete sent.diagnostics.traceApp;
+        delete sent.diagnostics.appFailures;
+        for (const event of events || []) { delete event.reason; delete event.correlationId; delete event.ageMs; }
+        if (before === JSON.stringify(sent.diagnostics)) return null;
         return JSON.stringify(sent, null, 2);
     } catch { return null; }
 }
 
-/** One POST. Never throws; `{ status, data }` with status 0 = no usable answer. */
+/**
+ * A stalled POST would otherwise leave "Sending…" up forever. The deadline is
+ * a fixed allowance plus time to upload the body at a slow uplink, so the
+ * client never gives up on a screenshot a weak link is still sending (any
+ * server or proxy limit applies on its own and comes back as an answer or a
+ * network error). The 1.5 MiB image cap bounds it near 9.5 minutes. Hitting
+ * it is an unanswered send (status 0, `timedOut`): the outbox keeps the body,
+ * and a re-send reuses its clientRequestId, which the server answers as a replay.
+ */
+export const SEND_DEADLINE = Object.freeze({ baseMs: 45_000, minUploadBytesPerSecond: 4096 });
+export const send_deadline_ms = bytes => SEND_DEADLINE.baseMs + Math.ceil(bytes / SEND_DEADLINE.minUploadBytesPerSecond * 1000);
+
+/** One POST. Never throws; `{ status, data, timedOut }` with status 0 = no usable answer. */
 async function post (body) {
+    const controller = new AbortController();
+    let timedOut = false;
+    // Base64 and JSON are ASCII: the length is the byte count, give or take a non-ASCII description.
+    const timer = setTimeout(() => { timedOut = true; controller.abort(); }, send_deadline_ms(body.length));
     try {
         const response = await fetch(endpoint(), { method: 'POST', credentials: 'same-origin',
-            headers: { 'Content-Type': 'application/json' }, body });
-        if ( response.status !== 200 && response.status !== 201 ) return { status: response.status, data: null };
+            headers: { 'Content-Type': 'application/json' }, body, signal: controller.signal });
+        if ( response.status !== 200 && response.status !== 201 ) return { status: response.status, data: null, timedOut };
         const data = await response.json();
-        return typeof data?.id === 'string' && UUID.test(data.id) ? { status: response.status, data } : { status: 0, data: null };
-    } catch { return { status: 0, data: null }; }
+        return typeof data?.id === 'string' && UUID.test(data.id) ? { status: response.status, data, timedOut } : { status: 0, data: null, timedOut };
+    } catch { return { status: 0, data: null, timedOut }; } finally { clearTimeout(timer); }
 }
 
 /**
  * POST one submitted body and settle the local state from the answer. Never
- * throws; resolves `{ status, data }` (status 0 = no response).
+ * throws; resolves `{ status, data, timedOut }` (status 0 = no response).
  */
 async function deliver (clientRequestId, body) {
     if ( inflight.has(clientRequestId) ) return { status: -1, data: null };
     inflight.add(clientRequestId);
-    let status = 0, data = null;
+    const savedDraft = read_outbox().find(entry => entry.clientRequestId === clientRequestId)?.draft;
+    let status = 0, data = null, timedOut = false;
     try {
         // The exact, visible preview string is also the request body.
-        ({ status, data } = await post(body));
+        ({ status, data, timedOut } = await post(body));
         // FEEDBACK-DIAG rollback window: a tab that booted on a server advertising
         // `ui.feedbackEventDiagnostics` keeps that payload after the server is
         // rolled back, and the older strict schema 400s a report carrying the two
         // keys. Send it once more without them: it costs two fields, not the report.
         const lean = status === 400 ? without_event_diagnostics(body) : null;
-        if ( lean ) ({ status, data } = await post(lean));
+        if ( lean ) {
+            body = lean;
+            outbox_put(clientRequestId, lean);
+            window.dispatchEvent(new window.CustomEvent('ezil:feedback-downgrade', { detail: { clientRequestId, body: lean } }));
+            ({ status, data, timedOut } = await post(lean));
+        }
     } finally {
         inflight.delete(clientRequestId);
     }
@@ -179,23 +222,29 @@ async function deliver (clientRequestId, body) {
         if ( ! read_draft() ) {
             try {
                 const sent = JSON.parse(body);
-                write_draft({ clientRequestId, category: CATEGORIES.includes(sent.category) ? sent.category : 'bug',
+                write_draft(savedDraft || { clientRequestId, category: CATEGORIES.includes(sent.category) ? sent.category : 'bug',
                     description: String(sent.description ?? '').slice(0, 4000) });
             } catch { /* An unreadable body has nothing to restore. */ }
         }
     }
-    return { status, data };
+    return { status, data, timedOut };
 }
 
-/** Re-send every submitted-but-unconfirmed report, once each, in order. */
+/**
+ * Re-send every submitted-but-unconfirmed report, once each, smallest first:
+ * a large screenshot report that a slow link or a server-side limit keeps
+ * failing then never holds back the text reports queued with it.
+ */
 export async function flush_feedback_outbox () {
     if ( ! feedback_enabled() || navigator.onLine === false ) return;
-    for ( const entry of read_outbox() ) {
+    for ( const entry of read_outbox().sort((a, b) => a.body.length - b.body.length) ) {
         // Flushes can overlap (a back/forward-cache restore runs both the icon's
         // remount and `flush_after_restore`): skip what another one has settled.
         if ( ! read_outbox().some(queued => queued.clientRequestId === entry.clientRequestId) ) continue;
-        const { status } = await deliver(entry.clientRequestId, entry.body);
-        if ( status === 0 ) break; // Still offline or unreachable: wait for the next `online`.
+        const { status, timedOut } = await deliver(entry.clientRequestId, entry.body);
+        // Still offline or unreachable: wait for the next `online`. A send that
+        // only ran out of time stays queued without holding back the rest.
+        if ( status === 0 && ! timedOut ) break;
     }
 }
 
@@ -353,16 +402,26 @@ function error_copy (status) {
     return 'Could not send feedback. Check your connection and try again.';
 }
 
-/** @param {{ source: 'chip'|'pill'|'troubleshoot'|'settings', errorCode?: string }} [_opts] */
+/**
+ * appContext is trusted shell registration context only (never producer message data).
+ * It prefills the selection; opening never sends a report.
+ * @param {{ source: 'chip'|'pill'|'troubleshoot'|'settings', errorCode?: string, appContext?: {computerId: string, appSession: string} }} [_opts]
+ */
 export function open_feedback_dialog (_opts) {
     if ( ! feedback_enabled() ) return;
     if ( activeDialog?.isConnected ) { activeDialog.focus(); return; }
     const opener = document.activeElement;
     const draft = read_draft();
-    const clientRequestId = draft?.clientRequestId ?? crypto.randomUUID();
+    let clientRequestId = draft?.clientRequestId ?? crypto.randomUUID();
     const waiting = read_outbox().filter(entry => entry.clientRequestId !== clientRequestId && ! inflight.has(entry.clientRequestId)).length;
-    const computer = window.__EZIL_BOOT__?.computer?.id;
+    // The canonical current computer (Settings switches never rewrite the boot
+    // payload), snapshotted once: the frozen body keeps it through retries.
+    const trusted = _opts?.appContext;
+    const hasAppContext = typeof trusted?.computerId === 'string' && UUID.test(trusted.computerId)
+        && typeof trusted.appSession === 'string' && trusted.appSession.length > 0;
+    const computer = hasAppContext ? trusted.computerId : currentComputer()?.id;
     const computerId = typeof computer === 'string' && UUID.test(computer) ? computer : null;
+    const appContext = Object.freeze({ computerId, ...(hasAppContext ? { appSession: trusted.appSession } : {}) });
     const screenshots = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackScreenshots === true;
     const dialog = document.createElement('dialog');
     dialog.className = 'ezil-feedback-dialog';
@@ -379,11 +438,22 @@ export function open_feedback_dialog (_opts) {
                 <label for="ezil-feedback-description">Description</label>
                 <textarea id="ezil-feedback-description" name="description" required maxlength="4000" rows="6"
                     aria-describedby="ezil-feedback-counter ezil-feedback-warning" autofocus></textarea>
+                <section class="ezil-feedback-bug" aria-label="Bug details">
+                    <p class="ezil-feedback-muted">Help us reproduce this bug. Do not include passwords or private data.</p>
+                    ${BUG_FIELDS.map(([key, title]) => `<label for="feedback-${key}">${title}</label><textarea id="feedback-${key}" name="${key}" rows="2" maxlength="4000"></textarea>`).join('')}
+                    <label>Reproducibility <select name="reproducibility"><option value="">Choose…</option><option>Every time</option><option>Sometimes</option><option>Once</option><option>Not sure</option></select></label>
+                    <label>Impact <select name="impact"><option value="">Choose…</option><option>Blocked</option><option>Workaround available</option><option>Minor issue</option></select></label>
+                </section>
                 <p id="ezil-feedback-counter" class="ezil-feedback-muted" aria-live="polite"></p>
                 <p id="ezil-feedback-warning" class="ezil-feedback-warning" role="status" hidden></p>
                 <label class="ezil-feedback-consent"><input type="checkbox" name="diagnostics"> Include diagnostics</label>
+                <p class="ezil-feedback-muted">Optional: a frozen snapshot of browser/OS, viewport, page age and time, online/network state, up to 50 recent machine-coded events and 24 app-open phases, and available failure references. No console text, URLs, cookies, form values or device logs. Nothing uploads until Send.</p>
+                <button type="button" data-action="refresh-diagnostics" hidden>Refresh diagnostic snapshot</button>
                 ${screenshots ? `<label class="ezil-feedback-consent"><input type="checkbox" name="screenshot"> Include a screenshot</label>
                 <section class="ezil-feedback-capture" hidden aria-label="Screenshot">
+                    <label class="ezil-feedback-upload">Attach a screenshot <input type="file" name="screenshotFile" accept="image/png,image/jpeg,image/webp"></label>
+                    <p class="ezil-feedback-muted">Choose a PNG, JPEG or WebP image (up to 8 MiB and 4096 pixels per side), or use a capture option. Crop and cover private areas before attaching. The EZiL window option masks embedded apps. Tab capture asks you to choose a surface.</p>
+                    ${!tab_capture_supported() ? '<p class="ezil-feedback-muted">This browser cannot capture a tab. Attach a screenshot from your device to include embedded app content.</p>' : ''}
                     <div class="ezil-feedback-actions">
                         <button type="button" data-capture="shell">Capture EZiL OS window</button>
                         ${tab_capture_supported() ? '<button type="button" data-capture="tab">Capture what I see</button>' : ''}
@@ -391,12 +461,14 @@ export function open_feedback_dialog (_opts) {
                     </div>
                     <div class="ezil-feedback-image" hidden>
                         <img alt="Screenshot to include with this report">
+                        <button type="button" data-capture="edit">Edit / crop / redact</button>
                         <button type="button" data-action="remove-screenshot">Remove screenshot</button>
                     </div>
-                </section>` : ''}
+                </section>` : '<p class="ezil-feedback-muted">Screenshots are not available here yet. Describe the visible error in your report.</p>'}
             </fieldset>
             <details class="ezil-feedback-preview"><summary>Preview exactly what will be sent</summary><pre></pre>
-                <p class="ezil-feedback-muted">EZiL also records which version of EZiL OS received the report.</p></details>
+                <p class="ezil-feedback-muted" data-role="app-failure-context" hidden></p>
+                <p class="ezil-feedback-muted">Your report includes its time, reference number and the version of EZiL OS. Technical details and screenshots are included only when you choose them.</p></details>
             <p class="ezil-feedback-result" role="status" aria-live="polite"></p>
             <div class="ezil-feedback-actions">
                 <button type="button" data-action="cancel">Cancel</button>
@@ -415,6 +487,10 @@ export function open_feedback_dialog (_opts) {
     const submit = dialog.querySelector('[type="submit"]');
     const cancel = dialog.querySelector('[data-action="cancel"]');
     let screenshot = null;
+    let diagnosticSnapshot = null;
+    let appContextUnavailable = false;
+    let attemptedBody = null;
+    const bug_values = () => Object.fromEntries([...BUG_FIELDS.map(([key]) => key), 'reproducibility', 'impact'].map(key => [key, form.elements[key].value]));
     let serialized = '';
     let sending = false;
     let sent = false;
@@ -425,6 +501,7 @@ export function open_feedback_dialog (_opts) {
     let captureController = null;
     if ( draft ) {
         description.value = draft.description;
+        for (const [key, value] of Object.entries(draft.bug || {})) form.elements[key].value = value;
         for ( const radio of form.elements.category ) radio.checked = radio.value === draft.category;
     }
     if ( typeof _opts?.errorCode === 'string' && /^[a-z0-9_:-]{1,64}$/i.test(_opts.errorCode) ) {
@@ -440,7 +517,7 @@ export function open_feedback_dialog (_opts) {
 
     function save_draft () {
         if ( sent || closed ) return;
-        write_draft({ clientRequestId, category: form.elements.category.value, description: description.value });
+        write_draft({ clientRequestId, category: form.elements.category.value, description: description.value, bug: bug_values() });
     }
 
     function show_sent (data) {
@@ -468,26 +545,47 @@ export function open_feedback_dialog (_opts) {
         restoreCapture = null;
         capturing = false;
         for ( const button of dialog.querySelectorAll('[data-capture]') ) button.disabled = false;
+        if (form.elements.screenshotFile) form.elements.screenshotFile.disabled = false;
         if ( result.textContent === 'Preparing screenshot…' ) result.textContent = '';
     }
 
     function refresh () {
         if ( sending || sent || closed ) return;
-        const kinds = [...new Set(scan(description.value).map(match => match.kind))];
+        const bug = form.elements.category.value === 'bug';
+        dialog.querySelector('.ezil-feedback-bug').hidden = !bug;
+        const values = bug_values();
+        for (const key of [...BUG_FIELDS.map(([key]) => key), 'reproducibility', 'impact']) form.elements[key].required = bug;
+        const text = report_text(form.elements.category.value, description.value, values);
+        const kinds = [...new Set(scan(text).map(match => match.kind))];
         const warning = dialog.querySelector('.ezil-feedback-warning');
         warning.hidden = kinds.length === 0;
         warning.textContent = kinds.length
             ? 'This looks like a token / email address — remove it before sending? ' + kinds.join(', ') : '';
-        dialog.querySelector('#ezil-feedback-counter').textContent = `${description.value.length} / 4000`;
+        dialog.querySelector('#ezil-feedback-counter').textContent = `${text.length} / 4000 total characters${text.length > 4000 ? " — shorten the report; no sections will be truncated" : ""}`;
         const imageSection = dialog.querySelector('.ezil-feedback-capture');
         if ( imageSection ) imageSection.hidden = ! screenshotConsent.checked;
         const payload = { v: 1, clientRequestId, category: form.elements.category.value,
-            description: description.value, computerId,
-            diagnostics: diagnostics.checked ? build_diagnostics() : null,
+            description: text, computerId,
+            diagnostics: diagnostics.checked ? diagnosticSnapshot : null,
             screenshot: screenshotConsent?.checked ? screenshot : null };
         serialized = JSON.stringify(payload, null, 2);
+        const pendingBody = read_outbox().find(entry => entry.clientRequestId === clientRequestId)?.body ?? attemptedBody;
+        if (pendingBody && pendingBody !== serialized) {
+            // Edits are a new report; a later receipt for the old request must never hide them.
+            clientRequestId = crypto.randomUUID();
+            attemptedBody = null;
+            payload.clientRequestId = clientRequestId;
+            serialized = JSON.stringify(payload, null, 2);
+        }
         preview.textContent = serialized;
-        submit.disabled = capturing || ! description.value.trim() || description.value.length > 4000;
+        const appStatus = dialog.querySelector('[data-role="app-failure-context"]');
+        appStatus.hidden = !diagnostics.checked || (!appContextUnavailable && !diagnosticSnapshot?.appFailures);
+        const appEvents = diagnosticSnapshot?.appFailures || [];
+        appStatus.textContent = appContextUnavailable ? 'App failure context is unavailable for this report.'
+            : `${appEvents.length} app events (${appEvents.filter(event => event.outcome === 'cancelled').length} cancelled).`;
+        const diagnosticBytes = new TextEncoder().encode(JSON.stringify({ ...payload, screenshot: null }, null, 2)).length;
+        submit.disabled = capturing || ! description.value.trim() || text.length > 4000 || diagnosticBytes > 32 * 1024
+            || (bug && Object.values(values).some(value => !value.trim()));
     }
 
     function clear_screenshot () {
@@ -557,7 +655,13 @@ export function open_feedback_dialog (_opts) {
             // activation for getDisplayMedia. All three paths use the editor.
             let capture;
             try {
-                if ( button.dataset.capture === 'tab' ) capture = capture_tab_frame({ hide, signal });
+                if (button.dataset.capture === 'edit') {
+                    const img = dialog.querySelector('.ezil-feedback-image img');
+                    const canvas = document.createElement('canvas');
+                    canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+                    canvas.getContext('2d').drawImage(img, 0, 0);
+                    capture = Promise.resolve(canvas.width && canvas.height ? canvas : null);
+                } else if ( button.dataset.capture === 'tab' ) capture = capture_tab_frame({ hide, signal });
                 else {
                     hide();
                     capture = button.dataset.capture === 'shell' ? capture_shell_snapshot({ signal }) : capture_desktop_frame({ signal });
@@ -566,6 +670,21 @@ export function open_feedback_dialog (_opts) {
             void finish_capture(capture, generation, signal);
         });
     }
+    form.elements.screenshotFile?.addEventListener('change', () => {
+        const input = form.elements.screenshotFile;
+        const file = input.files?.[0];
+        input.value = '';
+        if (!file || capturing || sending || sent || closed || !screenshotConsent.checked) return;
+        capturing = true;
+        const generation = ++captureGeneration;
+        captureController = new AbortController();
+        const { signal } = captureController;
+        for (const button of dialog.querySelectorAll('[data-capture]')) button.disabled = true;
+        input.disabled = true;
+        result.textContent = 'Preparing screenshot…';
+        refresh();
+        void finish_capture(uploaded_image_canvas(file, { signal }), generation, signal);
+    });
     dialog.querySelector('[data-action="remove-screenshot"]')?.addEventListener('click', () => {
         cancel_capture();
         clear_screenshot();
@@ -574,6 +693,27 @@ export function open_feedback_dialog (_opts) {
     screenshotConsent?.addEventListener('change', () => {
         if ( ! screenshotConsent.checked ) { cancel_capture(); clear_screenshot(); }
     });
+    diagnostics.addEventListener('change', () => {
+        snapshot_diagnostics();
+        dialog.querySelector('[data-action="refresh-diagnostics"]').hidden = !diagnostics.checked;
+    });
+    dialog.querySelector('[data-action="refresh-diagnostics"]').addEventListener('click', () => {
+        if (diagnostics.checked) snapshot_diagnostics();
+        refresh();
+    });
+    function snapshot_diagnostics () {
+        diagnosticSnapshot = diagnostics.checked ? build_diagnostics(appContext) : null;
+        appContextUnavailable = diagnostics.checked && app_failure_diagnostics_accepted()
+            && !Object.hasOwn(diagnosticSnapshot, 'appFailures');
+    }
+    function on_downgrade(event) {
+        if (closed || event.detail?.clientRequestId !== clientRequestId) return;
+        serialized = event.detail.body; preview.textContent = serialized;
+        diagnosticSnapshot = JSON.parse(serialized).diagnostics;
+        appContextUnavailable = false;
+        dialog.querySelector('[data-role="app-failure-context"]').hidden = true;
+    }
+    window.addEventListener('ezil:feedback-downgrade', on_downgrade);
     form.addEventListener('input', () => { refresh(); save_draft(); });
     form.addEventListener('change', () => { refresh(); save_draft(); });
     form.addEventListener('submit', async event => {
@@ -582,6 +722,12 @@ export function open_feedback_dialog (_opts) {
         refresh();
         if ( submit.disabled || ! form.reportValidity() ) return;
         if ( ! feedback_enabled() ) { result.textContent = error_copy(404); return; }
+        const previousBody = read_outbox().find(entry => entry.clientRequestId === clientRequestId)?.body ?? attemptedBody;
+        if (previousBody && previousBody !== serialized) {
+            clientRequestId = crypto.randomUUID();
+            refresh();
+            save_draft();
+        }
         sending = true;
         fields.disabled = true;
         submit.disabled = true;
@@ -591,8 +737,9 @@ export function open_feedback_dialog (_opts) {
         // the dialog no longer discards it, and a failure that never got an
         // answer is re-sent with this same body when the connection returns.
         const body = serialized;
-        outbox_put(clientRequestId, body);
-        write_draft(null);
+        const queued = outbox_put(clientRequestId, body);
+        attemptedBody = body;
+        if (queued) write_draft(null);
         let outcome;
         try {
             outcome = await deliver(clientRequestId, body);
@@ -605,10 +752,21 @@ export function open_feedback_dialog (_opts) {
         cancel.textContent = 'Cancel';
         save_draft();
         if ( outcome.status === -1 ) result.textContent = 'This report is already being sent.';
-        else if ( retryable(outcome.status) ) {
+        else if ( retryable(outcome.status) && !queued ) {
+            write_draft({ clientRequestId: crypto.randomUUID(), category: form.elements.category.value,
+                description: description.value, bug: bug_values() });
+            result.textContent = 'Could not save this report for automatic retry. Keep this window open and press Send again, or copy your report text before leaving.';
+        } else if ( outcome.timedOut ) {
+            // The connection may be fine, so no `online` event is coming: say what will retry it.
+            result.textContent = "The server didn't answer in time. Your report is saved — press Send to try again. "
+                + 'It will also be retried the next time EZiL OS opens.';
+        } else if ( retryable(outcome.status) ) {
             result.textContent = navigator.onLine === false
                 ? "You're offline. Your report is saved and will be sent when you're back online."
-                : error_copy(outcome.status) + " We'll also send it automatically when your connection comes back.";
+                : outcome.status === 0 ? error_copy(0) + " We'll also send it automatically when your connection comes back."
+                // The server answered, so no `online` event is coming either.
+                : 'Could not send feedback — the server could not take it right now. Your report is saved — press Send to try again. '
+                    + 'It will also be retried the next time EZiL OS opens.';
         } else result.textContent = error_copy(outcome.status);
         refresh();
     });
@@ -619,6 +777,7 @@ export function open_feedback_dialog (_opts) {
         cancel_capture();
         for ( const type of ['ezil:teardown', 'popstate', 'pagehide', 'hashchange'] ) window.removeEventListener(type, close);
         window.removeEventListener('ezil:feedback-sent', on_sent);
+        window.removeEventListener('ezil:feedback-downgrade', on_downgrade);
         clear_screenshot();
         dialog.remove();
         if ( activeDialog === dialog ) activeDialog = null;
@@ -637,13 +796,27 @@ export function open_feedback_dialog (_opts) {
     description.focus();
 }
 
+/** Listing and deleting reports are small requests: a stalled one fails instead of loading forever. */
+export const REPORTS_DEADLINE_MS = 20_000;
+
+/** Run one request under `REPORTS_DEADLINE_MS`; the signal also covers reading the response body. */
+async function within_reports_deadline (run) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REPORTS_DEADLINE_MS);
+    try { return await run(controller.signal); } finally { clearTimeout(timer); }
+}
+
 /** @returns {Promise<Array<{id:string,createdAt:string,category:string,descriptionPreview:string,hasScreenshot:boolean,status:string}>>} */
 export async function list_my_reports () {
     if ( ! feedback_enabled() ) return [];
-    const response = await fetch(endpoint(), { method: 'GET', credentials: 'same-origin' });
-    if ( ! response.ok ) throw new Error('Could not load your reports. Try again.');
-    const data = await response.json();
-    if ( ! Array.isArray(data.reports) ) throw new Error('Could not load your reports. Try again.');
+    const data = await within_reports_deadline(async signal => {
+        let response;
+        try { response = await fetch(endpoint(), { method: 'GET', credentials: 'same-origin', signal }); }
+        catch { throw new Error('Could not load your reports. Try again.'); }
+        if ( ! response.ok ) throw new Error('Could not load your reports. Try again.');
+        try { return await response.json(); } catch { throw new Error('Could not load your reports. Try again.'); }
+    });
+    if ( ! Array.isArray(data?.reports) ) throw new Error('Could not load your reports. Try again.');
     return data.reports.slice(0, 50);
 }
 
@@ -651,7 +824,11 @@ export async function list_my_reports () {
 export async function delete_my_report (_id) {
     if ( ! feedback_enabled() || typeof _id !== 'string' || ! UUID.test(_id) ) return false;
     const route = endpoint();
-    const response = await fetch(`${route}${route.includes('?') ? '&' : '?'}id=${encodeURIComponent(_id)}`,
-        { method: 'DELETE', credentials: 'same-origin' });
-    return response.status === 204;
+    return within_reports_deadline(async signal => {
+        try {
+            const response = await fetch(`${route}${route.includes('?') ? '&' : '?'}id=${encodeURIComponent(_id)}`,
+                { method: 'DELETE', credentials: 'same-origin', signal });
+            return response.status === 204;
+        } catch { return false; }
+    });
 }

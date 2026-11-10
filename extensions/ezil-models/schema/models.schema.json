@@ -310,7 +310,7 @@
         "id": {
           "type": "string",
           "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$",
-          "description": "Stable id shown to VS Code; use it in chat.defaultModel. Unique, case-insensitive."
+          "description": "Stable id shown to VS Code (chat.planAgent.defaultModel, chat.utilityModel as ezil/<id>). Unique, case-insensitive."
         },
         "name": {
           "type": "string",
@@ -334,7 +334,7 @@
         },
         "family": {
           "type": "string",
-          "description": "VS Code model family (defaults to claude or gpt). chat.defaultModel also matches on family."
+          "description": "VS Code model family (defaults to claude or gpt). Model settings also match on family."
         },
         "version": {
           "type": "string",

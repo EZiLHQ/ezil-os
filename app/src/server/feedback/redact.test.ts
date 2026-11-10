@@ -106,9 +106,10 @@ describe('FEEDBACK-DIAG: recent-event failure annotations', () => {
         expect(JSON.stringify(result)).not.toContain(secret);
     });
 
-    it('keeps the uuid mask everywhere else, including on the event\'s own text fields', () => {
+    it('preserves request trace IDs while masking identifiers in event text', () => {
         const result = sanitizeDiagnostics({ traceId: corr, recentEvents: [event({ code: `x ${corr}`, correlationId: corr })] });
-        expect(result?.traceId).toBe('[redacted:uuid]');
+        expect(result?.traceId).toBe(corr);
+        expect(sanitizeDiagnostics({ traceId: corr }, { excludeIds: [corr] })?.traceId).toBeUndefined();
         expect(result?.recentEvents?.[0]).toEqual(event({ code: 'x [redacted:uuid]', correlationId: corr }));
     });
 
@@ -158,5 +159,47 @@ describe('FEEDBACK-DIAG: the wire schema bounds the new fields', () => {
         expect(feedbackSubmitSchema.safeParse(body({ reason: 1 })).success).toBe(false);
         // Shape is the sanitizer's job (drop, not 400): a charset drift must not lose the report.
         expect(feedbackSubmitSchema.safeParse(body({ reason: 'Not A Code' })).success).toBe(true);
+    });
+});
+
+
+describe('report session bundle', () => {
+    const session = { capturedAt: '2026-11-08T12:00:00.000Z', pageAgeMs: 123, online: true, visibility: 'visible' as const,
+        network: { effectiveType: '4g' as const, saveData: false } };
+    it('preserves allowlisted context, bounds times/counts and deeply rejects extra keys', () => {
+        const bundle = { session, tracePhases: [{ code: 'display', tMs: 42 }], recentEvents: [{ eventClass: 'api_failure', site: 's', code: 'failed', ageMs: 10 }] };
+        expect(sanitizeDiagnostics(bundle)).toEqual(bundle);
+        expect(diagnosticsSchema.safeParse(bundle).success).toBe(true);
+        for (const bad of [
+            { session: { ...session, token: 'private' } },
+            { session: { ...session, network: { ...session.network, url: 'https://private.test' } } },
+            { session: { ...session, pageAgeMs: -1 } },
+            { tracePhases: [{ code: 'https://private.test', tMs: 1 }] },
+            { tracePhases: Array.from({ length: 25 }, () => ({ code: 'display', tMs: 1 })) },
+            { recentEvents: Array.from({ length: 51 }, () => ({ eventClass: 'api_failure', site: 's', code: 'failed' })) },
+        ]) expect(diagnosticsSchema.safeParse(bad).success).toBe(false);
+        expect(sanitizeDiagnostics(null)).toBeNull();
+    });
+
+    it('drops credential- and identifier-shaped phase codes that fit the shape regex', () => {
+        const tracePhases = [
+            { code: 'mint_ok', tMs: 1 },
+            { code: 'sk-' + 'a'.repeat(30), tMs: 1 },
+            { code: 'sk-' + 'z'.repeat(30), tMs: 1 },
+            { code: 'ghp_' + 'z'.repeat(24), tMs: 1 },
+            { code: 'display_live', tMs: 1 },
+            { code: 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d', tMs: 2 },
+            { code: 'step:0123456789abcdef0123456789abcdef', tMs: 3 },
+            { code: 'user:1234567', tMs: 4 },
+            { code: 'confirm_ok', tMs: 5 },
+        ];
+        expect(diagnosticsSchema.safeParse({ tracePhases }).success).toBe(true);
+        expect(sanitizeDiagnostics({ tracePhases })?.tracePhases).toEqual([
+            { code: 'mint_ok', tMs: 1 }, { code: 'display_live', tMs: 1 }, { code: 'confirm_ok', tMs: 5 }]);
+        // Strict shape still holds: an extra key fails the wire schema and is dropped by the sanitizer.
+        const extra = [{ code: 'display_live', tMs: 1, secret: 'x' }];
+        expect(diagnosticsSchema.safeParse({ tracePhases: extra }).success).toBe(false);
+        expect(sanitizeDiagnostics({ tracePhases: extra } as unknown as FeedbackDiagnostics)?.tracePhases).toEqual([]);
+        expect(sanitizeDiagnostics({ tracePhases: Array.from({ length: 30 }, () => ({ code: 'display_live', tMs: 1 })) })?.tracePhases).toHaveLength(24);
     });
 });

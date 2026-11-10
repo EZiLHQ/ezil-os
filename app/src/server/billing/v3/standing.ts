@@ -13,12 +13,16 @@
  *   `incomplete`, or grace over). `files_on_aws` while any of the user's computers still has an aws-ec2
  *   placement (D16 hold); nothing has moved (the move is Phase B, `computer.move` stays null).
  * - D19: a refund is a negative grant, never a status change, so it never changes the standing.
+ * - Standard trial (0021): a subscription with a trial that has never had a positive paid period has no renewal to be
+ *   in grace for. Its first failed charge drops paid access at once (files kept, nothing moved); a later successful
+ *   payment restores it. Grace after a previously paid renewal is unchanged.
  */
 import type { SubscriptionRow } from '../meters';
 import type { PaymentIssueRow } from '../ports';
 import { epochSeconds, isoSeconds } from '../v2/time';
 import { planFromSubscriptions } from './catalog';
 import type { ComputeStandingV3 } from './contract';
+import { operatorAccess, type OperatorEntitlementRow } from './operator-access';
 
 export const PAYMENT_GRACE_DAYS = 7 as const;
 export const PAYMENT_GRACE_SECONDS = PAYMENT_GRACE_DAYS * 86_400;
@@ -46,6 +50,10 @@ export const paidAccess = (standing: ComputeStandingV3): boolean => PAID_ACCESS.
 
 const at = (date: Date) => isoSeconds(epochSeconds(date));
 
+/** A trial subscription that has never been paid (0021 columns; absent on rows that predate them, which are never trials). */
+export const neverPaidTrial = (sub: Pick<SubscriptionRow, 'trialEnd' | 'firstPaidAt'>): boolean =>
+    sub.trialEnd != null && sub.firstPaidAt == null;
+
 /** Unresolved issues on the subscription's own invoices (upgrade/overage invoices never threaten the plan). */
 export function subscriptionIssues(issues: readonly StandingIssue[], subscriptionId: string | null): StandingIssue[] {
     return subscriptionId === null ? [] : issues.filter(issue => issue.subscriptionId === subscriptionId
@@ -69,8 +77,11 @@ export function deriveStanding(input: {
     /** Any aws-ec2 placement among the user's live computers → 'aws-ec2'; null = unknown or none. */
     placementProvider: 'aws-ec2' | 'cloudflare' | null;
     now: Date;
+    /** The operator grant that decides the plan (`operatorAccessFor`): paid standing, no Stripe dates. */
+    operator?: OperatorEntitlementRow | null;
 }): StandingV3 {
     const filesOn = input.placementProvider === 'aws-ec2' ? 'aws' : 'cloudflare';
+    if (input.operator) return { standing: 'paid', graceEndsAt: null, planEndsAt: null, filesOn, heldSince: null };
     const now = epochSeconds(input.now);
     // The same subscription precedence as the plan the Billing tab shows.
     const plan = planFromSubscriptions({ subs: [...input.subscriptions], now: input.now, userCreatedAt: null });
@@ -82,9 +93,18 @@ export function deriveStanding(input: {
     if (!sub || plan.subscriptionId === null) return free(lastEndedPeriod(input.subscriptions, now));
     // planStatusFromStripe folds `unpaid` into past_due; D18 drops it at once (Stripe's final action).
     if (sub.status === 'unpaid' || plan.status === 'incomplete') return free(null);
+    // A new Stripe period/status is not first-payment proof. Trial access ends at its exact boundary,
+    // including while the first invoice or its failure webhook is still arriving. A prior paid receipt
+    // (firstPaidAt) keeps genuine renewal pending/grace behavior unchanged.
+    if (neverPaidTrial(sub) && sub.trialEnd && now >= epochSeconds(sub.trialEnd)) return free(at(sub.trialEnd));
     const issues = subscriptionIssues(input.paymentIssues, plan.subscriptionId);
     const planEndsAt = plan.status === 'cancels' || sub.cancelAtPeriodEnd ? plan.cancelsAt : null;
     if (sub.status === 'past_due' || issues.length) {
+        if (neverPaidTrial(sub)) {
+            const first = issues.map(issue => issue.stripeEventCreated).filter(date => Number.isFinite(date.getTime()))
+                .sort((a, b) => a.getTime() - b.getTime())[0] ?? sub.currentPeriodStart;
+            return free(first && Number.isFinite(first.getTime()) ? at(first) : null);
+        }
         const ends = graceEndsAt(issues, sub.status === 'past_due' ? sub.currentPeriodStart : null);
         if (ends !== null && now < ends) return { standing: 'grace', graceEndsAt: isoSeconds(ends), planEndsAt, filesOn, heldSince: null };
         return free(ends === null ? null : isoSeconds(ends));
@@ -105,3 +125,17 @@ function lastEndedPeriod(subs: readonly SubscriptionRow[], now: number): string 
     const newest = ends[0];
     return newest !== undefined && epochSeconds(newest) <= now ? at(newest) : null;
 }
+
+/**
+ * Product entitlements v1: the operator grant that decides this account's plan. Stripe paid access (paid, renewal grace,
+ * ending at period end) always wins and is never replaced; otherwise the grant in effect at `now`; otherwise null (the
+ * Stripe-only plan, Free when there is none). Every reader passes its result to `planFromSubscriptions` and
+ * `deriveStanding` as `operator`.
+ */
+export function operatorAccessFor(input: { subscriptions: readonly SubscriptionRow[]; paymentIssues: readonly StandingIssue[];
+    grants: readonly OperatorEntitlementRow[] | null | undefined; now: Date }): OperatorEntitlementRow | null {
+    if (!input.grants?.length) return null;
+    const stripe = deriveStanding({ subscriptions: input.subscriptions, paymentIssues: input.paymentIssues, placementProvider: null, now: input.now });
+    return operatorAccess({ grants: input.grants, now: input.now, stripePaidAccess: paidAccess(stripe.standing) });
+}
+

@@ -38,6 +38,26 @@ check('render uses server grants, decimal storage and Billing deep links', () =>
     // Round 6 review (R1-10): above the trial grant (120 of 73) the note would not explain the balance, so it is not said.
     assert.doesNotMatch(usageHtml(sample, { ...summary, ai: { ...summary.ai, grant: { amount: 73, per: 'once' } } }), /one-time trial credits/);
 });
+// Paid compute policy v1 (founder e713d157): paid Usage is storage-first; computer time is recorded but not metered.
+check('paid compute policy v1: Standard and Premium show storage first, no computer-time bar, banner, reset or vCPU conversion', () => {
+    const order = html => [...html.matchAll(/data-usage="(storage|ai|compute)"/g)].map(match => match[1]);
+    const paid = sku => ({ ...summary, plan: { ...summary.plan, sku, name: sku === 'premium_monthly_v3' ? 'Premium' : 'Standard' },
+        fairUse: { ...summary.fairUse, status: 'ok', policy: 'unmetered' },
+        computer: { ...summary.computer, machineChoice: [{ size: 'std-2', vcpu: 2, memoryGiB: 8, weight: 1 }, { size: 'cmp-8', vcpu: 8, memoryGiB: 32, weight: 4 }] } });
+    // Far past the old grant: the server's period still says 0 left, and nothing shows it.
+    const spent = { ...sample, period: { ...sample.period, usedStandardSeconds: 2_000_000, remainingStandardSeconds: 0, remainingHoursAtCurrent: 0 } };
+    for (const sku of ['standard_monthly_v3', 'premium_monthly_v3']) {
+        const html = usageHtml(spent, paid(sku));
+        assert.deepEqual(order(html), ['storage', 'ai'], sku);
+        assert.doesNotMatch(html, /Computer time|used up|Paused until|Usage resets|hours? left|vCPU counts|How computer time works|unlimited/i, sku);
+        assert.match(html, /903 MB left/, sku);
+    }
+    // Free, and an older server without the policy, keep the allowance meter and its reset date; Free never reads unmetered.
+    const free = usageHtml(sample, { ...summary, plan: { ...summary.plan, sku: 'free_v3', name: 'Free' }, fairUse: { ...summary.fairUse, policy: 'unmetered' } });
+    assert.deepEqual(order(free), ['compute', 'ai', 'storage']);
+    assert.match(free, /Usage resets/);
+    assert.deepEqual(order(usageHtml(sample, summary)), ['compute', 'ai', 'storage']);
+});
 check('render keeps null sources honest and escapes plan names', () => {
     assert.match(usageHtml(null, summary), /Not measured yet/);
     assert.match(usageHtml(sample, null), /Plan unavailable/);
@@ -52,6 +72,21 @@ check('render has no proportions for invalid compute and storage caps', () => {
         assert.equal((storage.match(/role="progressbar"/g) ?? []).length, 1, 'only the AI bar remains');
         assert.equal((html.match(/role="progressbar"/g) ?? []).length, 2, 'the capBytes constant is never a disk: storage is measured against the real disk');
     }
+});
+const format = await import(moduleUrl(readFileSync(new URL('./billing-format.js', import.meta.url), 'utf8')));
+check('credit formatters: floor to 2 decimals (never round up), every microcredit at 6, the extension\'s shared vectors', () => {
+    // The same table as extensions/ezil-models/tests/gateway.test.ts (`credits`): full precision, trailing zeros trimmed.
+    for (const [micro, full, two, whole] of [['0', '0', '0', '0'], ['1', '0.000001', '0', '0'], ['500000', '0.5', '0.5', '0'], ['252750000', '252.75', '252.75', '252'],
+        ['1246759999', '1,246.759999', '1,246.75', '1,246'], ['1500000000', '1,500', '1,500', '1,500'], ['9007199254740993123456', '9,007,199,254,740,993.123456', '9,007,199,254,740,993.12', '9,007,199,254,740,993']]) {
+        assert.equal(format.creditsDecimal(micro, 6), full, micro);
+        assert.equal(format.creditsDecimal(micro), two, micro);
+        assert.equal(format.creditsLabel(micro), whole, micro);
+    }
+    for (const bad of [null, undefined, 1246750000, '-1', '1.5', '1e6', '', 'abc']) assert.equal(format.creditsDecimal(bad), null, String(bad));
+    assert.equal(format.microOf(1246750000), null, 'numbers are refused: they cannot carry every microcredit past 2^53');
+    assert.equal(format.clockLabel('2026-10-26T05:00:00Z'), new Date('2026-10-26T05:00:00Z').toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' }));
+    assert.match(format.staleCreditsCopy('2026-10-26T05:00:00Z'), /^Couldn't refresh · as of \d\d:\d\d$/);
+    assert.equal(format.staleCreditsCopy('soon'), "Couldn't refresh");
 });
 if (process.argv.includes('--render-only')) {
     console.log(`PASS ${passed} Usage render checks; 0 failed`);
@@ -253,6 +288,30 @@ check('round 3: storage is the provisioned disk; used only when measured; Free s
     assert.doesNotMatch(meter(free, 'storage').textContent, /\d+ GB|Limit/);
     assert.match(meter(free, 'storage').textContent, /Your files are saved between sessions\./);
 });
+check('storage honesty: an unmeasured AWS disk shows its size and "not measured yet", a Cloudflare computer says it is not measured, never "0 used"', () => {
+    const unmeasured = { state: 'unavailable', capBytes: '53687091200', disk: { provisionedGiB: 50, usedBytes: null }, samples: [] };
+    const aws = meter(rendered({ ...sample, storage: unmeasured }), 'storage');
+    // The disk's size, as before the sampler existed; no "Measuring…" that may wait on a host image rollout.
+    assert.equal(aws.querySelector('.usage-value').textContent, '50 GB disk');
+    assert.match(aws.textContent, /50 GB disk for your projects\. Space used isn't measured yet\./);
+    assert.doesNotMatch(aws.textContent, /Measuring…|\b0 (bytes|MB|GB)\b|used of your|left|Full|Almost full|on this computer/);
+    assert.equal(aws.dataset.state, 'unavailable');
+    // Even a "danger" summary state never brings Full copy without a measurement.
+    const forced = meter(rendered({ ...sample, storage: unmeasured }, { ...summary, storage: { ...summary.storage, usedBytes: null, state: 'exhausted' } }), 'storage');
+    assert.doesNotMatch(forced.textContent, /Full|Almost full/);
+    const cf = meter(rendered({ ...sample, storage: { state: 'unavailable', capBytes: null, disk: { provisionedGiB: null, usedBytes: null }, samples: [] } },
+        { ...summary, plan: { ...summary.plan, sku: 'free_v3', name: 'Free' }, storage: { usedBytes: null, capBytes: '0', state: 'unavailable' } }), 'storage');
+    assert.match(cf.textContent, /Space used isn't measured on this computer\./);
+    assert.doesNotMatch(cf.textContent, /Measuring…|measured yet|\b0 (bytes|MB|GB)\b/);
+    // Positive controls: once measured, the same disk shows used and left, and 96% used is Almost full / 100% Full.
+    const measured = meter(rendered({ ...sample, storage: { ...unmeasured, state: 'sampled', disk: { provisionedGiB: 50, usedBytes: '0' } } }), 'storage');
+    assert.match(measured.textContent, /50 GB left/); assert.match(measured.textContent, /0 bytes used of your 50 GB disk/);
+    assert.doesNotMatch(measured.textContent, /Measuring…|isn't measured/);
+    const almost = meter(rendered({ ...sample, storage: { ...unmeasured, disk: { provisionedGiB: 50, usedBytes: String(48 * 2 ** 30) } } }), 'storage');
+    assert.match(almost.textContent, /Almost full/);
+    const full = meter(rendered({ ...sample, storage: { ...unmeasured, disk: { provisionedGiB: 50, usedBytes: String(50 * 2 ** 30) } } }), 'storage');
+    assert.match(full.textContent, /■ Full\./);
+});
 // Round 6 (R1-06/07/09/10, R4-05, CR-2): the founder's Usage on 10-30. contact@ is Free (every subscription
 // cancelled at once), the files are held on the AWS computer, a std-2 hold session is running with no heartbeat.
 const heldUsage = { ...sample, asOf: '2026-10-30T05:44:00Z',
@@ -356,6 +415,145 @@ check('round 6: AI credits on Free after a cancel — no full bar, the 100 said 
         assert.doesNotMatch(node.textContent, /mumbai|ap-south-1/i);
     }
 });
+// Identity credits (`ai.account`): exact microcredit strings from the server; the total is every live grant.
+const M = credits => { const [whole, fraction = ''] = String(credits).split('.'); return (BigInt(whole) * 1000000n + BigInt(fraction.padEnd(6, '0'))).toString(); };
+const worked = { userId: 'user', state: 'ok', asOf: '2026-10-26T05:00:00Z', totalMicro: M('1500'), remainingMicro: M('1246.75'), heldMicro: M('0.5'),
+    usedMicro: M('252.75'), planBaselineMicro: M('1000'), labelled: true, grants: [
+        { kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('746.75'), expiresAt: '2026-11-04T00:00:00Z' },
+        { kind: 'added', creditsMicro: M('500'), remainingMicro: M('500'), expiresAt: '2027-06-01T00:00:00Z' }] };
+const unreadable = { ...worked, state: 'unavailable', totalMicro: null, remainingMicro: null, heldMicro: null, usedMicro: null, labelled: false, grants: [] };
+// The legacy fields the same server still sends (fractional: they dropped `included` and fell back to the catalog 1,000).
+const premiumAI = account => ({ ...summary, plan: { ...summary.plan, sku: 'premium_monthly_v3', name: 'Premium' },
+    ai: { grant: { amount: 1000, per: 'period' }, balance: 1246.75, balanceMicro: M('1246.75'), state: 'ok', included: { granted: 1000, remaining: 746.75, periodEnd: '2026-11-01T00:00:00Z' }, account } });
+const aiValue = el => meter(el, 'ai').querySelector('.usage-value').textContent;
+const asOf = iso => new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+check('identity credits: the worked example reads "1,246 credits left of 1,500" with exact details and microcredit titles', () => {
+    const el = rendered(sample, premiumAI(worked));
+    assert.equal(aiValue(el), '1,246 credits left of 1,500');
+    assert.match(meter(el, 'ai').textContent, /Plan 1,000 · Added 500 · Used 252\.75 · Reserved 0\.5 · Remaining 1,246\.75/);
+    assert.equal(progress(el, 'ai').getAttribute('aria-valuenow'), '83');
+    assert.equal(progress(el, 'ai').getAttribute('aria-valuetext'), '1,246 credits left of 1,500.');
+    assert.deepEqual([...meter(el, 'ai').querySelectorAll('span[title]')].map(s => s.title),
+        ['1,000 credits', '500 credits', '252.75 credits', '0.5 credits', '1,246.75 credits']);
+    // Floored, never rounded up; the title keeps every microcredit.
+    const odd = rendered(sample, premiumAI({ ...worked, remainingMicro: '1246759999', usedMicro: '252740001', heldMicro: '500000' }));
+    assert.match(meter(odd, 'ai').textContent, /Used 252\.74 · Reserved 0\.5 · Remaining 1,246\.75/);
+    assert.ok([...meter(odd, 'ai').querySelectorAll('span[title]')].some(s => s.title === '1,246.759999 credits'));
+    // Never the catalog 1,000 (or the plan bucket's 746) as the headline.
+    assert.doesNotMatch(aiValue(el), /of 1,000|746/);
+    assert.deepEqual(scanCopy(meter(el, 'ai').textContent), []);
+});
+check('identity credits: fractional 996.25 left of 1,000; an operator grant above the plan keeps its bar; exhausted; unlabelled; unproven used', () => {
+    const fractional = rendered(sample, premiumAI({ ...worked, totalMicro: M('1000'), remainingMicro: M('996.25'), heldMicro: '0', usedMicro: M('3.75'),
+        grants: [{ kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('996.25'), expiresAt: '2026-11-04T00:00:00Z' }] }));
+    assert.equal(aiValue(fractional), '996 credits left of 1,000');
+    assert.match(meter(fractional, 'ai').textContent, /Plan 1,000 · Used 3\.75 · Remaining 996\.25/);
+    assert.doesNotMatch(meter(fractional, 'ai').textContent, /Reserved/);
+    assert.equal(progress(fractional, 'ai').getAttribute('aria-valuenow'), '99');
+    const above = rendered(sample, premiumAI({ ...worked, totalMicro: M('5200'), remainingMicro: M('5120'), heldMicro: '0', usedMicro: M('80'), grants: [
+        { kind: 'plan', creditsMicro: M('200'), remainingMicro: M('120'), expiresAt: '2026-11-04T00:00:00Z' },
+        { kind: 'added', creditsMicro: M('5000'), remainingMicro: M('5000'), expiresAt: '2027-06-01T00:00:00Z' }] }));
+    assert.equal(aiValue(above), '5,120 credits left of 5,200');
+    assert.equal(progress(above, 'ai').getAttribute('aria-valuenow'), '98');
+    assert.match(meter(above, 'ai').textContent, /5,000 added · expire Jun 1, 2027/);
+    const empty = rendered(sample, premiumAI({ ...worked, remainingMicro: '0', usedMicro: M('1499.5') }));
+    assert.equal(meter(empty, 'ai').dataset.state, 'danger');
+    assert.match(meter(empty, 'ai').textContent, /No credits left/);
+    const unlabelled = rendered(sample, premiumAI({ ...worked, labelled: false }));
+    assert.match(meter(unlabelled, 'ai').textContent, /Used 252\.75 · Reserved 0\.5 · Remaining 1,246\.75/);
+    assert.doesNotMatch(meter(unlabelled, 'ai').textContent, /Plan 1,000|Added/);
+    const unproven = rendered(sample, premiumAI({ ...worked, usedMicro: null }));
+    assert.doesNotMatch(meter(unproven, 'ai').textContent, /Used/);
+    assert.match(meter(unproven, 'ai').textContent, /Reserved 0\.5 · Remaining 1,246\.75/);
+    // Unknown total: the remaining alone, no bar, no denominator from anywhere else.
+    const noTotal = rendered(sample, premiumAI({ ...worked, totalMicro: null, labelled: false, grants: [] }));
+    assert.equal(aiValue(noTotal), '1,246 credits left');
+    assert.equal(progress(noTotal, 'ai'), null);
+    // A top-up and an upgrade grant: both in the total, labelled.
+    const upgraded = rendered(sample, premiumAI({ ...worked, totalMicro: M('1396'), remainingMicro: M('1346'), heldMicro: '0', usedMicro: M('50'), grants: [
+        { kind: 'plan', creditsMicro: M('200'), remainingMicro: M('150'), expiresAt: '2026-11-04T00:00:00Z' },
+        { kind: 'plan', creditsMicro: M('696'), remainingMicro: M('696'), expiresAt: '2026-11-04T00:00:00Z' },
+        { kind: 'purchased', creditsMicro: M('500'), remainingMicro: M('500'), expiresAt: '2027-01-15T00:00:00Z' }] }));
+    assert.equal(aiValue(upgraded), '1,346 credits left of 1,396');
+    assert.match(meter(upgraded, 'ai').textContent, /Plan 896 · Purchased 500 · Used 50 · Remaining 1,346/);
+    assert.match(meter(upgraded, 'ai').textContent, /500 purchased · expire Jan 15, 2027/);
+    for (const node of [fractional, above, empty, upgraded]) assert.deepEqual(scanCopy(node.textContent), []);
+});
+check('identity credits: unavailable never falls back to the catalog; a kept balance shows "Couldn\'t refresh · as of"; limits are never a balance', () => {
+    const down = rendered(sample, premiumAI(unreadable));
+    assert.equal(aiValue(down), 'Unavailable');
+    assert.equal(meter(down, 'ai').dataset.state, 'unavailable');
+    assert.equal(progress(down, 'ai'), null);
+    assert.match(meter(down, 'ai').textContent, /We couldn't read your balance\./);
+    assert.doesNotMatch(meter(down, 'ai').textContent, /1,000|1,246|746/);
+    // Positive control: the same summary without the key (an older server) still renders its own legacy view (where the
+    // fractional `included` is dropped by its integer guard: the defect `ai.account` replaces).
+    const { account: _omit, ...legacyAI } = premiumAI(worked).ai;
+    assert.equal(aiValue(rendered(sample, { ...premiumAI(worked), ai: legacyAI })), '1,246 left');
+    const kept = rendered(sample, premiumAI(unreadable), { lastAccount: worked, userId: 'user' });
+    assert.equal(aiValue(kept), '1,246 credits left of 1,500');
+    assert.match(meter(kept, 'ai').textContent, new RegExp(`Couldn't refresh · as of ${asOf(worked.asOf)}`));
+    assert.match(rendered(null, null, { lastAccount: worked, userId: 'user' }).textContent, /1,246 credits left of 1,500[\s\S]*Couldn't refresh · as of/);
+    // Another user's kept balance is never shown.
+    for (const options of [{ lastAccount: { ...worked, userId: 'someone-else' }, userId: 'user' }, { lastAccount: worked, userId: 'someone-else' }])
+        assert.doesNotMatch(rendered(sample, premiumAI(unreadable), options).textContent, /1,246/);
+    // `/v1/me/limits` budgets are never read as a balance or a total.
+    const limits = { policy: { dailyBudgetMicro: '9000000000000', monthlyBudgetMicro: '8000000000000' }, counters: { day_micro: 7000000 } };
+    const limited = rendered(sample, { ...premiumAI(worked), ai: { ...premiumAI(worked).ai, limits, limitsState: 'available' } });
+    assert.equal(aiValue(limited), '1,246 credits left of 1,500');
+    assert.doesNotMatch(limited.textContent, /9,000,000|8,000,000|9000000|\b7\b credits/);
+    assert.doesNotMatch(rendered(sample, { ...premiumAI(unreadable), ai: { ...premiumAI(unreadable).ai, limits } }).textContent, /9,000,000|8,000,000/);
+});
+check('identity credits: in the payment grace (D17) the period\'s credits wait for the payment; no live grant shows no "of 0" and no bar', () => {
+    // The last period's plan grant still in its tail is the whole total; this period's grant waits for the payment.
+    const tail = { ...worked, totalMicro: M('1000'), remainingMicro: M('640'), heldMicro: '0', usedMicro: M('360'), grants: [
+        { kind: 'previous', creditsMicro: M('1000'), remainingMicro: M('640'), expiresAt: '2026-11-04T00:00:00Z' }] };
+    const none = { ...tail, totalMicro: '0', remainingMicro: '0', usedMicro: '0', grants: [] };
+    const grace = (account, paymentIssue = 'payment_failed') => { const value = premiumAI(account);
+        return { ...value, plan: { ...value.plan, status: 'past_due', paymentIssue },
+            ai: { ...value.ai, included: { granted: 0, remaining: 0, periodEnd: '2026-11-01T00:00:00Z' }, pendingFromRenewal: { credits: 1000, at: '2026-11-01T00:00:00Z' } } }; };
+    const live = rendered(sample, grace(tail));
+    assert.equal(aiValue(live), '640 credits left of 1,000');
+    assert.match(meter(live, 'ai').textContent, /1,000 credits for this period\. Added once your payment goes through\./);
+    assert.doesNotMatch(meter(live, 'ai').textContent, /more from|of 0\b/);
+    const empty = rendered(sample, grace(none));
+    assert.equal(aiValue(empty), '0 credits left');
+    assert.equal(progress(empty, 'ai'), null);
+    assert.equal(meter(empty, 'ai').dataset.state, 'danger');
+    assert.match(meter(empty, 'ai').textContent, /Added once your payment goes through\./);
+    assert.doesNotMatch(meter(empty, 'ai').textContent, /more from|of 0\b/);
+    // Outside the grace a total of 0 has no denominator either.
+    assert.equal(aiValue(rendered(sample, premiumAI(none))), '0 credits left');
+    // Positive control: with no payment issue the renewal is a date again.
+    const paid = rendered(sample, grace(tail, null));
+    assert.match(meter(paid, 'ai').textContent, /1,000 more from/);
+    assert.doesNotMatch(meter(paid, 'ai').textContent, /added once your payment/i);
+    for (const node of [live, empty, paid]) assert.deepEqual(scanCopy(node.textContent), []);
+});
+check('identity credits: the warning is the total\'s own (at most 10% left), never `ai.state`, which judges one bucket', () => {
+    const plenty = { ...worked, totalMicro: M('6000'), remainingMicro: M('5050'), heldMicro: '0', usedMicro: M('950'), grants: [
+        { kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('50'), expiresAt: '2026-11-04T00:00:00Z' },
+        { kind: 'added', creditsMicro: M('5000'), remainingMicro: M('5000'), expiresAt: '2027-06-01T00:00:00Z' }] };
+    const spent = { ...worked, totalMicro: M('10000'), remainingMicro: M('500'), heldMicro: '0', usedMicro: M('9500'), grants: [
+        { kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('500'), expiresAt: '2026-11-04T00:00:00Z' },
+        { kind: 'added', creditsMicro: M('9000'), remainingMicro: '0', expiresAt: '2027-06-01T00:00:00Z' }] };
+    const withState = (account, state) => { const value = premiumAI(account); return { ...value, ai: { ...value.ai, state } }; };
+    // The server's 'low' (the plan bucket at 50 of 1,000) beside 5,050 of 6,000 left: no warning.
+    const ok = rendered(sample, withState(plenty, 'low'));
+    assert.equal(aiValue(ok), '5,050 credits left of 6,000');
+    assert.equal(meter(ok, 'ai').dataset.state, 'ok');
+    assert.doesNotMatch(meter(ok, 'ai').textContent, /Running low/);
+    // The server's 'ok' (the plan bucket at half) beside 500 of 10,000 left: running low.
+    const low = rendered(sample, withState(spent, 'ok'));
+    assert.equal(aiValue(low), '500 credits left of 10,000');
+    assert.equal(meter(low, 'ai').dataset.state, 'warn');
+    assert.match(meter(low, 'ai').textContent, /! Running low/);
+    // The line itself: 10% left is low, one microcredit more is not; an unknown or zero total has no share to judge.
+    assert.equal(format.accountCredits({ totalMicro: M('10000'), remainingMicro: M('1000') }).low, true);
+    assert.equal(format.accountCredits({ totalMicro: M('10000'), remainingMicro: '1000000001' }).low, false);
+    assert.equal(format.accountCredits({ totalMicro: null, remainingMicro: M('1') }).low, false);
+    assert.equal(format.accountCredits({ totalMicro: '0', remainingMicro: '0' }).low, false);
+});
 check('round 6 (CR-2): a stale hold session still says when it ends; a far-off paid deadline shows no clock time', () => {
     const el = rendered(heldUsage, heldSummary);
     assert.match(meter(el, 'session').textContent, new RegExp(`Measuring this session… · ends ${clock('2026-10-30T06:42:00Z')}`));
@@ -424,13 +622,24 @@ check('independent null sources and unsupported responses', () => {
     assert.equal(progress(noUsage, 'compute'), null);
     assert.equal(progress(noUsage, 'storage'), null);
     assert.match(noUsage.textContent, /Not measured yet/);
+    // Paid compute policy v1: with no summary the plan is unknown, so no computer-time meter, pause banner or reset
+    // (a paid user must never read "used up" from the usage figures alone); storage still shows.
     const noSummary = rendered(sample, null);
     assert.match(noSummary.textContent, /Plan unavailable/);
-    assert.ok(progress(noSummary, 'compute'));
+    assert.equal(meter(noSummary, 'compute'), null);
     assert.ok(progress(noSummary, 'storage'));
     assert.equal(progress(noSummary, 'ai'), null);
     assert.equal(noSummary.querySelector('.ezil-settings-btn-primary'), null);
-    assert.equal(meter(rendered(withPeriod({ usedStandardSeconds: 144000 }), null), 'compute').dataset.state, 'ok');
+    assert.equal(noSummary.querySelector('details[data-usage-detail="period"]'), null);
+    assert.doesNotMatch(noSummary.textContent, /Usage resets|Paused until/);
+    const spent = rendered(withPeriod({ usedStandardSeconds: 144000, remainingStandardSeconds: 0 }), null);
+    assert.equal(spent.querySelector('.usage-banner'), null);
+    assert.equal(meter(spent, 'compute'), null);
+    assert.doesNotMatch(spent.textContent, /used up|paused/i);
+    // Positive control: the same figures under a known metered (Free) summary still pause, with the reset.
+    const freeSpent = rendered(withPeriod({ usedStandardSeconds: 144000, remainingStandardSeconds: 0 }), { ...summary, plan: { ...summary.plan, sku: 'free_v3', name: 'Free' }, fairUse: { ...summary.fairUse, status: 'paused' } });
+    assert.match(freeSpent.querySelector('.usage-banner').textContent, /Computer time is used up/);
+    assert.equal(meter(freeSpent, 'compute').dataset.state, 'danger');
     assert.throws(() => usageHtml({ enabled: true, version: 99 }));
     assert.match(usageHtml({ enabled: false }, summary), /unavailable in this deployment/);
 });
@@ -465,12 +674,19 @@ try {
     let u = deferred(), s = deferred(); replies = { 'billing.usage': u.promise, 'billing.summary': s.promise };
     tab.onActivate(win);
     assert.match(win.text(), /Loading usage/);
+    // The first painted frame (nothing answered yet) is a load, not a failure.
+    assert.doesNotMatch(win.text(), /couldn't read|Plan unavailable|Unavailable/);
     assert.deepEqual(calls.slice(0, 2), [{ path: 'billing.usage', input: { computerId: 'computer-a' } }, { path: 'billing.summary', input: undefined }]);
     u.resolve({ ok: true, data: sample }); await tick();
-    assert.match(win.text(), /About 16 hours left at 2 vCPU/);
-    assert.match(win.text(), /Plan unavailable/);
+    // Paid compute policy v1: computer time waits for the summary (a paid plan has none to count down); storage does not.
+    assert.doesNotMatch(win.text(), /hours left|Computer time/);
+    assert.match(win.text(), /903 MB left/);
+    // The summary is still on its way: its rows are loading, not failed.
+    assert.match(win.text(), /Checking your plan…/);
+    assert.doesNotMatch(win.text(), /Plan unavailable|couldn't read your balance/);
     assert.equal(win.find('[data-role="usage-body"]').attr('aria-busy'), 'true');
     s.resolve({ ok: true, data: summary }); await tick();
+    assert.match(win.text(), /About 16 hours left at 2 vCPU/);
     assert.match(win.text(), /120 of 200 left/);
     assert.equal(win.find('[data-role="usage-body"]').attr('aria-busy'), 'false');
     assert.match(win.find('[data-role="usage-refresh-status"]').text(), /Updated/);
@@ -505,7 +721,9 @@ try {
     assert.match(win.text(), /120 of 200 left/);
     success(); replies['billing.summary'] = Promise.reject(Error('summary failed')); await refresh();
     assert.match(win.text(), /Plan unavailable/);
-    assert.match(win.text(), /About 16 hours left at 2 vCPU/);
+    // An unknown plan shows no computer time (nor a pause); the usage that did load (storage) stays.
+    assert.doesNotMatch(win.text(), /hours left|used up/);
+    assert.match(win.text(), /903 MB left/);
     assert.equal(win.find('[data-action="usage-add-credits"]').length, 0);
     passed++; console.log('PASS partial failures retain usage honestly without blanking successful sections');
 
@@ -548,6 +766,55 @@ try {
     assert.match(win.text(), /42 s/);
     passed++; console.log('PASS timeouts and owner changes clear unsafe observations');
 
+    // Identity credits: the account switch A → B shows B only; a response read for another user is refused; the kept
+    // balance survives a Gateway outage for the same user only; opening the tab and window focus re-read the summary.
+    const forUser = (userId, account) => premiumAI({ ...account, userId });
+    const userB = { ...worked, totalMicro: M('800'), remainingMicro: M('777.5'), heldMicro: '0', usedMicro: M('22.5'), labelled: false, grants: [] };
+    owner = 'user-a'; success(sample, forUser('user-a', worked)); await refresh();
+    assert.match(win.text(), /1,246 credits left of 1,500/);
+    owner = 'user-b'; u = deferred(); s = deferred(); replies = { 'billing.usage': u.promise, 'billing.summary': s.promise }; await refresh();
+    assert.doesNotMatch(win.text(), /1,246|1,500/, 'nothing of A while B loads');
+    u.resolve({ ok: true, data: sample }); s.resolve({ ok: true, data: forUser('user-b', userB) }); await tick();
+    assert.match(win.text(), /777 credits left of 800/);
+    assert.doesNotMatch(win.text(), /1,246|1,500/);
+    // The server read the session of A while this page is B's: refused, and B's kept balance is dropped too.
+    success(sample, forUser('user-a', worked)); await refresh();
+    assert.doesNotMatch(win.text(), /1,246|1,500|777/);
+    // Gateway down for B: B's last balance, as of its time; then a failed summary keeps it too.
+    success(sample, forUser('user-b', userB)); await refresh();
+    success(sample, forUser('user-b', unreadable)); await refresh();
+    assert.match(win.text(), new RegExp(`777 credits left of 800[\\s\\S]*Couldn't refresh · as of ${asOf(worked.asOf)}`));
+    success(sample, forUser('user-b', userB)); replies['billing.summary'] = Promise.resolve({ ok: false }); await refresh();
+    assert.match(win.text(), /777 credits left of 800[\s\S]*Couldn't refresh · as of/);
+    // Positive control for the kept balance: a fresh read replaces it and the stale note goes.
+    success(sample, forUser('user-b', { ...userB, remainingMicro: M('700'), usedMicro: M('100') })); await refresh();
+    assert.match(win.text(), /700 credits left of 800/);
+    assert.doesNotMatch(win.text(), /Couldn't refresh · as of/);
+    // Focus within 5 minutes of the last summary: no re-read; after it, one re-read. Reopening the tab always re-reads.
+    const summaries = () => calls.filter(call => call.path === 'billing.summary').length;
+    let before = summaries(); success(sample, forUser('user-b', userB));
+    dom.window.dispatchEvent(new dom.window.Event('focus')); await tick();
+    assert.equal(summaries(), before);
+    const realNow = Date.now; Date.now = () => realNow() + 4 * 60_000;
+    try { dom.window.dispatchEvent(new dom.window.Event('focus')); await tick(); } finally { Date.now = realNow; }
+    assert.equal(summaries(), before, 'a focus inside five minutes does not read the summary again');
+    Date.now = () => realNow() + 5 * 60_000 + 1_000;
+    try { dom.window.dispatchEvent(new dom.window.Event('focus')); await tick(); } finally { Date.now = realNow; }
+    assert.equal(summaries(), before + 1);
+    assert.match(win.text(), /777 credits left of 800/);
+    tab.onDeactivate(); before = summaries(); success(sample, forUser('user-b', userB)); tab.onActivate(win); await tick();
+    assert.equal(summaries(), before + 1);
+    dom.window.dispatchEvent(new dom.window.Event('focus')); await tick();
+    assert.equal(summaries(), before + 1, 'a focus right after opening does not read again');
+    // Defence in depth: a kept block that does not name its user is still dropped when the signed-in user changes.
+    owner = 'user-c'; success(sample, premiumAI({ ...worked, userId: null })); await refresh();
+    assert.match(win.text(), /1,246 credits left of 1,500/);
+    owner = 'user-d'; success(sample, premiumAI({ ...unreadable, userId: null })); await refresh();
+    assert.doesNotMatch(win.text(), /1,246|1,500/);
+    assert.match(win.text(), /We couldn't read your balance/);
+    owner = 'other-owner'; success(); await refresh();
+    passed++; console.log('PASS identity credits: account switch, foreign-user refusal, kept balance and refresh triggers');
+
     u = deferred(); s = deferred(); replies = { 'billing.usage': u.promise, 'billing.summary': s.promise }; await refresh();
     success({ ...sample, session: { ...sample.session, elapsedSeconds: 9 } }); await refresh();
     const latest = win.html(); u.resolve({ ok: true, data: sample }); s.resolve({ ok: false }); await tick();
@@ -565,4 +832,19 @@ try {
     passed++; console.log('PASS overlapping, hidden and detached-window late responses cannot repaint');
     tab.onDeactivate();
 } finally { tab.onDeactivate(); globalThis.setTimeout = realSet; globalThis.clearTimeout = realClear; dom.window.close(); }
+{
+    // Live staging (2026-11-01): usage answered first and the row read "Unavailable" for up to 3.6 s.
+    const loading = usageHtml(sample, null, { summaryLoading: true });
+    assert.match(loading, /Checking…/);
+    assert.doesNotMatch(loading, /couldn't read your balance|>Unavailable</);
+    // Positive control: once the summary has failed (not loading) the row says so.
+    assert.match(usageHtml(sample, null, { summaryLoading: false }), /couldn't read your balance/);
+    // The first frame, before anything answered: every row is loading, none says it failed.
+    const first = usageHtml(null, null, { usageLoading: true, summaryLoading: true });
+    assert.doesNotMatch(first, /couldn't read|Unavailable|Plan unavailable|Not measured yet/);
+    assert.match(first, /Checking your plan…/);
+    // Positive control: with nothing loading, the same empty frame reports the failures.
+    assert.match(usageHtml(null, null), /Plan unavailable/);
+    passed++; console.log('PASS the AI row says Checking… while the summary loads, and unreadable only after it fails');
+}
 console.log(`PASS ${passed} Usage checks; 0 failed`);
