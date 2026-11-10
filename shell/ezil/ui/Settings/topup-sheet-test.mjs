@@ -331,22 +331,40 @@ test('billingRecoveryAction: Free gets the Standard upgrade for both causes; a p
     for ( const summary of [null, { ...free, enabled: false }, { ...free, version: 2 }] ) assert.equal(billingRecoveryAction(summary, 'insufficient_credits'), null);
 });
 
-test('billingRecoveryAction: credits already being delivered mean a credit refusal offers no purchase; a locked model and a bad value are unchanged', async h => {
+test('billingRecoveryAction: normal credits still being delivered mean a credit refusal waits (no purchase); a locked model, a bad value and the manual button are unchanged', async h => {
     const { billingRecoveryAction } = h.api;
-    const withDelivering = (tier, value) => { const s = fixture(tier); s.ai = { ...(s.ai ?? {}), delivering: value }; return s; };
+    const withAi = (tier, ai) => { const s = fixture(tier); s.ai = { ...(s.ai ?? {}), ...ai }; return s; };
     for ( const tier of ['free', 'standard', 'premium'] ) {
-        for ( const value of [{ credits: 200 }, 200] ) {
-            assert.equal(billingRecoveryAction(withDelivering(tier, value), 'insufficient_credits'), null, `${tier} ${JSON.stringify(value)}: no purchase while credits arrive`);
+        const ordinary = plain(billingRecoveryAction(fixture(tier), 'insufficient_credits'));
+        // Valid: `{ credits }` positive safe integer, enrolled (explicitly or by a missing enrollment).
+        for ( const ai of [{ delivering: { credits: 200 } }, { delivering: { credits: 1 }, enrollment: 'enrolled' }, { delivering: { credits: Number.MAX_SAFE_INTEGER } }] ) {
+            assert.equal(billingRecoveryAction(withAi(tier, ai), 'insufficient_credits'), null, `${tier} ${JSON.stringify(ai)}: waits, no purchase`);
         }
-        // Only a positive safe integer counts: anything else is the ordinary routing.
-        for ( const value of [{ credits: 0 }, { credits: -5 }, { credits: 1.5 }, { credits: '200' }, { credits: Number.MAX_SAFE_INTEGER + 1 }, {}, null, undefined, NaN] ) {
-            assert.deepEqual(plain(billingRecoveryAction(withDelivering(tier, value), 'insufficient_credits')),
-                plain(billingRecoveryAction(fixture(tier), 'insufficient_credits')), `${tier} ${String(JSON.stringify(value))}: unchanged`);
+        // Guarded regardless of any wallet amount the summary carries.
+        const funded = withAi(tier, { delivering: { credits: 200 }, balance: 0, account: { remainingMicro: '0', userId: 'u' } });
+        assert.equal(billingRecoveryAction(funded, 'insufficient_credits'), null, `${tier}: guard does not read the balance`);
+        // Malformed or not applicable: never masks real exhaustion.
+        for ( const delivering of [{ credits: 0 }, { credits: -5 }, { credits: 1.5 }, { credits: '200' }, { credits: null }, { credits: NaN }, { credits: Infinity },
+            { credits: Number.MAX_SAFE_INTEGER + 1 }, {}, [], [200], 200, '200', true, null, undefined] ) {
+            assert.deepEqual(plain(billingRecoveryAction(withAi(tier, { delivering }), 'insufficient_credits')), ordinary, `${tier} ${String(JSON.stringify(delivering))}: ordinary routing`);
+        }
+        // Not enrolled: the delivery is not coming, so the ordinary routing applies.
+        for ( const enrollment of ['activating', 'needs_ezil_id', 'unknown', null, 7] ) {
+            // The routing is whatever this same account gets without a delivering value (the guard adds nothing).
+            assert.deepEqual(plain(billingRecoveryAction(withAi(tier, { delivering: { credits: 200 }, enrollment }), 'insufficient_credits')),
+                plain(billingRecoveryAction(withAi(tier, { enrollment }), 'insufficient_credits')), `${tier} enrollment ${String(enrollment)}`);
         }
     }
     // A plan-locked model still routes to the Standard upgrade on Free, and nothing on a paid plan.
-    assert.deepEqual(plain(billingRecoveryAction(withDelivering('free', { credits: 200 }), 'model_locked')), { action: 'checkout', sku: 'standard_monthly_v3' });
-    assert.equal(billingRecoveryAction(withDelivering('standard', { credits: 200 }), 'model_locked'), null);
+    const delivering = { delivering: { credits: 200 } };
+    assert.deepEqual(plain(billingRecoveryAction(withAi('free', delivering), 'model_locked')), { action: 'checkout', sku: 'standard_monthly_v3' });
+    assert.equal(billingRecoveryAction(withAi('standard', delivering), 'model_locked'), null);
+    assert.equal(billingRecoveryAction(withAi('premium', delivering), 'model_locked'), null);
+    // The manual Add credits button and the upgrade it may sit beside do not read `delivering`.
+    for ( const tier of ['free', 'standard', 'premium'] ) {
+        assert.deepEqual(plain(h.api.topupOffer(withAi(tier, delivering))), plain(h.api.topupOffer(fixture(tier))), `${tier}: manual Add credits offer`);
+        assert.deepEqual(plain(h.api.topupUpgrade(withAi(tier, delivering))), plain(h.api.topupUpgrade(fixture(tier))), `${tier}: upgrade beside Add credits`);
+    }
 });
 
 test('topupOffer: only well-formed USD presets, a valid tariff and an enrolled account; parseCustomAmount edges', async h => {

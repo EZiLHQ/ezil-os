@@ -1508,6 +1508,9 @@ try {
             [() => { const s = freeWithTopup(); s.ai = { ...s.ai, delivering: { credits: 200 } }; return s; }, 'insufficient_credits', null],
             [() => { const s = summaryV3('standard'); s.actions.topup = true; s.catalog.packs = packs; s.ai = { ...s.ai, delivering: { credits: 200 } }; return s; }, 'insufficient_credits', null],
             [() => { const s = freeWithTopup(); s.ai = { ...s.ai, delivering: { credits: 200 } }; return s; }, 'model_locked', ['checkout', 'standard_monthly_v3']],
+            // Malformed or zero delivering never masks actual exhaustion.
+            [() => { const s = freeWithTopup(); s.ai = { ...s.ai, delivering: { credits: '200' } }; return s; }, 'insufficient_credits', ['checkout', 'standard_monthly_v3']],
+            [() => { const s = summaryV3('premium'); s.actions.topup = true; s.catalog.packs = packs; s.ai = { ...s.ai, delivering: { credits: 0 } }; return s; }, 'insufficient_credits', ['topup', undefined]],
         ];
         for ( const [make, reason, expected] of recoveryCases ) {
             summary = make(); before = sheets.length;
