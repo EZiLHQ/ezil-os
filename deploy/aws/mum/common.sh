@@ -30,15 +30,15 @@ app_environment=staging
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 # prd (production, founder decisions 2026-10-30): its own stacks, exec role, bucket,
 # operator state and app secret; origin https://os-prod.ezil.work; no rebase tuple.
-# Its ECR repository and launch template are pinned here by a reviewed commit once
-# ezil-prd-foundation exists (README "Production namespace prd"); until then it refuses.
+# Its ECR repository and launch template are the ezil-prd-foundation outputs, pinned here
+# by a reviewed commit (README "Production namespace prd"); an empty pin still refuses.
 use_namespace() {
     case "$1" in
         mum) ;;
         prd)
             namespace=prd
             bucket=ezil-prd-deploy-assets-452630323510
-            repository=
+            repository=452630323510.dkr.ecr.ap-south-1.amazonaws.com/ezil-prd-foundation-applicationimages439f25f1-xkgzfggtz2w4
             exec_role=arn:aws:iam::452630323510:role/ezil/identity/ezil-prd-cfn-exec
             machine=arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle
             config_dir=/root/ezil-aws-prd/config
@@ -46,7 +46,7 @@ use_namespace() {
             ami_stack=ezil-prd-ami
             foundation_stack=ezil-prd-foundation
             lifecycle_stack=ezil-prd-lifecycle
-            launch_template=
+            launch_template=lt-0b68cfb18ad22869a
             app_environment=production
             if [[ "$release_dir" == /root/ezil-aws-mum/release/next ]]; then release_dir=/root/ezil-aws-prd/release/next; fi
             [[ "$release_dir" != /root/ezil-aws-mum/* ]] || die 'prd never writes mum operator state'

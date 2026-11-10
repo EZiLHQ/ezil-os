@@ -21,11 +21,13 @@ prd = options.get("namespace") == "prd"
 for item in source.iterdir():
     if item.suffix in (".sh", ".py", ".json"):
         text = item.read_text().replace("/root/ezil-aws-mum/locks", str(root / "locks")).replace("/root/ezil-aws-prd/locks", str(root / "locks"))
-        if options.get("prd_pins"):
-            for unpinned, pinned in namespaces.PINS:
-                if item.name in ("common.sh", "json-tool.py") and unpinned in text:
-                    assert text.count(unpinned) == 1, item.name
-                    text = text.replace(unpinned, pinned)
+        # The real prd pins are committed; only an explicitly unpinned prd case (no prd_pins) empties them.
+        if prd and not options.get("prd_pins") and item.name in ("common.sh", "json-tool.py"):
+            for pinned, unpinned in namespaces.UNPIN:
+                if pinned in text:
+                    assert text.count(pinned) == 1, item.name
+                    text = text.replace(pinned, unpinned)
+            assert "lt-0b68cfb18ad22869a" not in text, item.name
         (scripts / item.name).write_text(text)
 (checkout / "infra").mkdir()
 (checkout / "infra/app-computers").symlink_to(source.parents[2] / "infra/app-computers", target_is_directory=True)

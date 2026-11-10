@@ -23,15 +23,16 @@ PREVIOUS = {"PreviousDesktopImageDigest", "PreviousDesktopImageId"}
 ALLOWED = BASE_ALLOWED | PREVIOUS
 # Operator namespaces (common.sh use_namespace keeps the same table; tests compare them).
 # mum (billing staging) is the default. prd (production) pins its foundation's ECR
-# repository and launch template only by a reviewed commit after its foundation stack
-# exists (README "Production namespace prd"); until then every prd command refuses.
+# repository and launch template (the ezil-prd-foundation outputs) by a reviewed commit
+# (README "Production namespace prd"); an empty pin makes every prd command refuse.
 PROFILES = {
     "mum": {"secret": "ezil-os/billing-staging/app", "origin": "https://os-staging.ezil.work",
             "repository": f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/ezil-mum-foundation-applicationimages439f25f1-milwdio3nbs6",
             "launchTemplate": "lt-06f691fc1e4dfe3cc", "appSecretLock": "/root/ezil-aws-mum/locks/app-secret.lock",
             "deployEnvironment": "aws-pilot", "poolLifecycle": True, "rebase": True, "appCaller": None},
     "prd": {"secret": "ezil-os/production/app", "origin": "https://os-prod.ezil.work",
-            "repository": None, "launchTemplate": None, "appSecretLock": "/root/ezil-aws-prd/locks/app-secret.lock",
+            "repository": f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/ezil-prd-foundation-applicationimages439f25f1-xkgzfggtz2w4",
+            "launchTemplate": "lt-0b68cfb18ad22869a", "appSecretLock": "/root/ezil-aws-prd/locks/app-secret.lock",
             # Founder decisions 2026-10-30: pool mode, no rebase tuple at launch, the prod host's role only.
             "deployEnvironment": "aws-prd", "poolLifecycle": True, "rebase": False,
             "appCaller": {"enabled": True, "roleName": "ezil-prd-app-caller", "providers": [], "ec2CallerEnv": "production",
