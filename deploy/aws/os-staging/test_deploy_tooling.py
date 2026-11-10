@@ -96,6 +96,8 @@ elif name == "docker":
         else:
             print('ezil-os-staging:previous sha256:' + '1' * 64)
     elif "up" in args:
+        if os.environ.get('FAKE_UP_CONSUMES_STDIN'):  # a compose child that drains the inline-bash script
+            sys.stdin.buffer.read()
         (state / "export_at_up").write_text(str(bool(list((pathlib.Path(os.environ["SHIM_STATE"]).parent / "host").rglob("loaded-export.tar")))))
         with open(state / "log", "a") as log:
             log.write(json.dumps(["compose.env", pathlib.Path("compose.env").read_text()]) + "\n")

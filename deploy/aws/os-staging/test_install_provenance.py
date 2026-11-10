@@ -290,15 +290,27 @@ class VerifiedInstallTests(SandboxTestCase):
     def test_script_on_stdin_is_not_consumed_by_compose_exec(self):
         # SSM runs `bash <<EOF`; a child that reads stdin (as `compose exec -T` does) must not eat the
         # unparsed rest of the script: footer, timer restore and both exec checks must still run.
+        for drain in ('FAKE_UP_CONSUMES_STDIN', 'FAKE_EXEC_CONSUMES_STDIN'):
+            with self.subTest(drain=drain):
+                receipt = self.prepare(containerd=True)
+                (self.box.state / 'log').unlink(missing_ok=True)
+                _, result = self.install(receipt, stdin=True, **{drain: '1'})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('Installed TAG: v1', result.stdout)
+                self.assertIn('Deployed SHA: ' + self.box.sha, result.stdout)
+                calls = self.box.calls()
+                enabled = {c[3] for c in calls if c[:3] == ['systemctl', 'enable', '--now']}
+                self.assertEqual(enabled, {f'ezil-os-staging-{j}.timer' for j in JOBS})
+                self.assertEqual(len([c for c in calls if c[0] == 'docker' and 'exec' in c]), 2)
+
+    def test_wrong_image_on_stdin_transport_still_fails_without_timer_restore(self):
         receipt = self.prepare(containerd=True)
-        _, result = self.install(receipt, stdin=True, FAKE_EXEC_CONSUMES_STDIN='1')
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('Installed TAG: v1', result.stdout)
-        self.assertIn('Deployed SHA: ' + self.box.sha, result.stdout)
-        calls = self.box.calls()
-        enabled = {c[3] for c in calls if c[:3] == ['systemctl', 'enable', '--now']}
-        self.assertEqual(enabled, {f'ezil-os-staging-{j}.timer' for j in JOBS})
-        self.assertEqual(len([c for c in calls if c[0] == 'docker' and 'exec' in c]), 2)
+        _, result = self.install(receipt, stdin=True, FAKE_UP_CONSUMES_STDIN='1', FAKE_EXEC_CONSUMES_STDIN='1',
+                                 FAKE_RUNNING_IMAGE='sha256:' + '0' * 64)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Runtime SHA mismatch; release owner must recover', result.stderr)
+        self.assertNotIn('Installed TAG:', result.stdout)
+        self.assertFalse(any(c[:2] == ['systemctl', 'enable'] for c in self.box.calls()))
 
     def test_runtime_mismatch_fails_with_recovery_message(self):
         receipt = self.prepare()
