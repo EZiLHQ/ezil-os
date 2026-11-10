@@ -331,6 +331,24 @@ test('billingRecoveryAction: Free gets the Standard upgrade for both causes; a p
     for ( const summary of [null, { ...free, enabled: false }, { ...free, version: 2 }] ) assert.equal(billingRecoveryAction(summary, 'insufficient_credits'), null);
 });
 
+test('billingRecoveryAction: credits already being delivered mean a credit refusal offers no purchase; a locked model and a bad value are unchanged', async h => {
+    const { billingRecoveryAction } = h.api;
+    const withDelivering = (tier, value) => { const s = fixture(tier); s.ai = { ...(s.ai ?? {}), delivering: value }; return s; };
+    for ( const tier of ['free', 'standard', 'premium'] ) {
+        for ( const value of [{ credits: 200 }, 200] ) {
+            assert.equal(billingRecoveryAction(withDelivering(tier, value), 'insufficient_credits'), null, `${tier} ${JSON.stringify(value)}: no purchase while credits arrive`);
+        }
+        // Only a positive safe integer counts: anything else is the ordinary routing.
+        for ( const value of [{ credits: 0 }, { credits: -5 }, { credits: 1.5 }, { credits: '200' }, { credits: Number.MAX_SAFE_INTEGER + 1 }, {}, null, undefined, NaN] ) {
+            assert.deepEqual(plain(billingRecoveryAction(withDelivering(tier, value), 'insufficient_credits')),
+                plain(billingRecoveryAction(fixture(tier), 'insufficient_credits')), `${tier} ${String(JSON.stringify(value))}: unchanged`);
+        }
+    }
+    // A plan-locked model still routes to the Standard upgrade on Free, and nothing on a paid plan.
+    assert.deepEqual(plain(billingRecoveryAction(withDelivering('free', { credits: 200 }), 'model_locked')), { action: 'checkout', sku: 'standard_monthly_v3' });
+    assert.equal(billingRecoveryAction(withDelivering('standard', { credits: 200 }), 'model_locked'), null);
+});
+
 test('topupOffer: only well-formed USD presets, a valid tariff and an enrolled account; parseCustomAmount edges', async h => {
     const { topupOffer, parseCustomAmount } = h.api;
     assert.equal(topupOffer(null), null);

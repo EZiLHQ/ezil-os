@@ -1649,6 +1649,7 @@ body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;backgro
 .ezil-feedback-dialog.ezil-feedback-capturing::backdrop{background:0 0}
 .ezil-feedback-dialog [hidden]{display:none!important}
 .ezil-feedback-dialog h2{font-size:21px;margin:0 0 16px}
+.ezil-feedback-dialog h2:focus{outline:0}
 .ezil-feedback-fields{border:0;padding:0;margin:0;min-width:0}
 .ezil-feedback-dialog textarea{box-sizing:border-box;display:block;width:100%;margin-top:6px;padding:10px;resize:vertical;border:1px solid var(--fb-border);border-radius:6px;font:inherit;color:inherit;background:var(--fb-field)}
 .ezil-feedback-dialog input{accent-color:var(--fb-accent)}

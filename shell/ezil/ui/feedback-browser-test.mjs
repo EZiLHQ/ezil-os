@@ -207,7 +207,12 @@ try {
             await page.waitForFunction(() => document.querySelector('.window[data-app="desktop"] .ezil-app-drawer')?.classList.contains('collapsed'));
             await assertTiny('drawer collapsed');
             await openByChip();
-            assert.equal(await page.evaluate(() => document.activeElement?.id), 'ezil-feedback-description', 'focus moves into the dialog');
+            const focused = await page.evaluate(() => ({ id: document.activeElement?.id,
+                text: !! document.activeElement?.matches('input, textarea, select, [contenteditable]'),
+                inDialog: !! document.activeElement?.closest('dialog.ezil-feedback-dialog') }));
+            // A touch device must not start in a text field (the keyboard would cover Send); a mouse keeps the description.
+            if ( coarse ) assert.deepEqual([focused.text, focused.inDialog], [false, true], `focus is in the dialog on a non-text element (${JSON.stringify(focused)})`);
+            else assert.equal(focused.id, 'ezil-feedback-description', 'focus moves into the dialog');
         });
 
         await check(`${tag}: the preview is byte-for-byte the request body; JSON content-type; 201 shows thanks`, async () => {
@@ -363,6 +368,7 @@ try {
             assert.equal(await page.evaluate(() => window.__pickerCalls), 0, 'no permission prompt or picker');
             assert.equal(await page.locator('input[name="screenshot"]').isChecked(), true);
             assert.equal(await page.locator('[data-role="capture-note"]').textContent(), '', 'no failure note: the capture worked');
+            if ( coarse ) assert.equal(await page.evaluate(() => !! document.activeElement?.matches('input, textarea, select, [contenteditable]')), false, 'no text field has focus: no on-screen keyboard over Send');
             // Primary action: fully inside the viewport and hit-testable without any scrolling.
             const send = page.locator('button[type="submit"]');
             const place = await send.evaluate(el => {

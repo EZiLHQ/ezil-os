@@ -91,6 +91,7 @@
 .ezil-feedback-dialog.ezil-feedback-capturing::backdrop { background: transparent; }
 .ezil-feedback-dialog [hidden] { display: none !important; }
 .ezil-feedback-dialog h2 { font-size: 21px; margin: 0 0 16px; }
+.ezil-feedback-dialog h2:focus { outline: none; }
 .ezil-feedback-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
 .ezil-feedback-dialog textarea {
     box-sizing: border-box;

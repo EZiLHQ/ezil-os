@@ -389,6 +389,25 @@ try {
         close();
         assert.equal(document.activeElement.id, 'opener');
     });
+    await check('touch primary pointer: the first focus is the heading, never a text field (no keyboard over Send); a fine pointer keeps the description', () => {
+        const realMatchMedia = window.matchMedia;
+        window.matchMedia = query => ({ matches: query === '(pointer: coarse)', addEventListener () {}, removeEventListener () {} });
+        try {
+            open();
+            const focused = document.activeElement;
+            assert.equal(focused.id, 'ezil-feedback-heading');
+            assert.ok(current().contains(focused));
+            assert.equal(focused.matches('input, textarea, select, [contenteditable]'), false);
+            assert.equal(form().elements.description.hasAttribute('autofocus'), false, 'no text field asks for the first focus');
+            assert.equal(current().querySelector('#ezil-feedback-heading').hasAttribute('autofocus'), true, 'showModal focuses the heading');
+            assert.equal(current().querySelector('[type="submit"]').disabled, false, 'a blank report is sendable from the first screen');
+            close();
+        } finally { window.matchMedia = realMatchMedia; }
+        open();
+        assert.equal(document.activeElement.id, 'ezil-feedback-description');
+        assert.equal(form().elements.description.hasAttribute('autofocus'), true);
+        close();
+    });
     await check('a draft saved by the earlier bug form keeps its text; the length limit still holds Send', () => {
         const legacyId = '44444444-4444-4444-8444-444444444444';
         window.localStorage.setItem(draftKey, JSON.stringify({ clientRequestId: legacyId, category: 'idea', description: 'Cannot open the desktop',

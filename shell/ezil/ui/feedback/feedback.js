@@ -437,16 +437,19 @@ export function open_feedback_dialog (_opts) {
     const computerId = typeof computer === 'string' && UUID.test(computer) ? computer : null;
     const appContext = Object.freeze({ computerId, ...(hasAppContext ? { appSession: trusted.appSession } : {}) });
     const screenshots = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackScreenshots === true;
+    // On a touch device the first focus must not land in a text field: that raises the on-screen keyboard over
+    // Send. The heading takes it (showModal honours `autofocus`); a fine pointer keeps the description focused.
+    const touchPrimary = window.matchMedia?.('(pointer: coarse)')?.matches === true;
     const dialog = document.createElement('dialog');
     dialog.className = 'ezil-feedback-dialog';
     dialog.setAttribute('aria-labelledby', 'ezil-feedback-heading');
     dialog.innerHTML = `
-        <h2 id="ezil-feedback-heading">Send feedback</h2>
+        <h2 id="ezil-feedback-heading" tabindex="-1"${touchPrimary ? ' autofocus' : ''}>Send feedback</h2>
         <form>
             <fieldset class="ezil-feedback-fields">
                 <label for="ezil-feedback-description">Description (optional)</label>
                 <textarea id="ezil-feedback-description" name="description" maxlength="4000" rows="5"
-                    aria-describedby="ezil-feedback-counter ezil-feedback-warning" autofocus></textarea>
+                    aria-describedby="ezil-feedback-counter ezil-feedback-warning"${touchPrimary ? '' : ' autofocus'}></textarea>
                 <p id="ezil-feedback-counter" class="ezil-feedback-muted" aria-live="polite"></p>
                 <p id="ezil-feedback-warning" class="ezil-feedback-warning" role="status" hidden></p>
                 <label class="ezil-feedback-consent"><input type="checkbox" name="diagnostics" checked> Include diagnostics</label>
@@ -927,7 +930,8 @@ export function open_feedback_dialog (_opts) {
         ? 'One earlier report is waiting to be sent. It will go when you are back online.'
         : `${waiting} earlier reports are waiting to be sent. They will go when you are back online.`;
     dialog.showModal();
-    description.focus();
+    if ( touchPrimary ) dialog.querySelector('#ezil-feedback-heading').focus({ preventScroll: true });
+    else description.focus();
     if ( ! restoredFromQueue ) start_auto_capture();
 }
 

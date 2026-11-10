@@ -123,6 +123,11 @@ export function topupUpgrade (summary) {
  */
 export function billingRecoveryAction (summary, reason) {
     if ( summary?.enabled !== true || summary.version !== 3 || ! ['insufficient_credits', 'model_locked'].includes(reason) ) return null;
+    // Credits the server is already delivering (for example the starter grant) will arrive: a credit refusal then
+    // offers no purchase. A locked model and the manual Add credits button are unaffected.
+    const delivering = summary.ai?.delivering;
+    const arriving = typeof delivering === 'number' ? delivering : delivering?.credits;
+    if ( reason === 'insufficient_credits' && Number.isSafeInteger(arriving) && arriving > 0 ) return null;
     const free = summary.plan?.sku === 'free_v3' || ['free', 'files_on_aws'].includes(summary.computer?.standing);
     const upgrade = free ? topupUpgrade(summary) : null;
     if ( upgrade && ['trial', 'checkout'].includes(upgrade.action) ) return { action: upgrade.action, sku: upgrade.sku };
