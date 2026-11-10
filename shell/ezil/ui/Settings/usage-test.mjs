@@ -894,12 +894,23 @@ try {
     await pollAt(61_000);
     assert.match(win.text(), /100 credits left of 100/);
     assert.doesNotMatch(win.text(), /Setting up|credits waiting/);
+    // The change re-reads the summary on the next poll, so its enrollment-bound actions (Add credits) follow.
+    before = summaries();
+    success(sample, freeAI(freeStarter, { balance: 100, balanceMicro: M('100'), state: 'ok' }));
+    await triggerTimer(30000);
+    assert.equal(summaries(), before + 1);
+    assert.equal(win.find('[data-usage="ai"] [data-action="usage-add-credits"]').length, 1);
+    // An unknown enrollment keeps the last known one and asks for no extra summary.
+    balanceReply(freeStarter, { enrollment: 'unknown-state' });
+    await pollAt(61_000);
+    assert.match(win.text(), /100 credits left of 100/);
+    await triggerTimer(30000);
+    assert.equal(summaries(), before + 1, 'an unknown enrollment is no change');
+    // And back: the read says activating again.
     balanceReply(freeZero, { enrollment: 'activating', waiting: { credits: 100 } });
     await pollAt(2 * 61_000);
     assert.match(win.text(), /Setting up your AI credits…[\s\S]*100 credits are added when this finishes/);
-    balanceReply(freeStarter, { enrollment: 'unknown-state' });
-    await pollAt(3 * 61_000);
-    assert.match(win.text(), /Setting up your AI credits…/, 'an unknown enrollment keeps the last known one');
+    assert.equal(win.find('[data-usage="ai"] [data-action="usage-add-credits"]').length, 0);
     // A confirmed zero asks Billing for its recovery (`insufficient_credits`); Add credits stays a plain top-up.
     const topups = []; win.on('ezil:billing-topup', (_event, detail) => topups.push(detail));
     win.append('<button class="ezil-settings-tab" data-tab="billing"></button>');

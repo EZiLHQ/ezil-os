@@ -158,25 +158,35 @@ export async function readAiAccountEvidence(input: AiReadInput): Promise<AiAccou
     return accountEvidence(balanceBody, usage.state, usageBody);
 }
 
-export async function enqueueFreeAiCredits(store: Pick<BillingStore, 'enqueueOutbox'>, userId: string, sku: string, now: Date): Promise<void> {
-    if (sku !== 'free_v3') return;
+/** True once the store holds the user's Free grant row (queued now or already there); false when not Free or it failed. */
+export async function enqueueFreeAiCredits(store: Pick<BillingStore, 'enqueueOutbox'>, userId: string, sku: string, now: Date): Promise<boolean> {
+    if (sku !== 'free_v3') return false;
     try {
         const entitlement = aiCreditEntitlement({ userId, sku, subscriptionId: null, periodStart: now, periodEnd: null, invoiceId: null });
         // ON CONFLICT DO NOTHING preserves the first grant instant and expiry across summary reads.
         await store.enqueueOutbox(aiCreditOutboxItem(userId, entitlement, 'grant', null));
-    } catch { console.warn('[billing.ai] free grant enqueue unavailable'); }
+        return true;
+    } catch { console.warn('[billing.ai] free grant enqueue unavailable'); return false; }
 }
+
+/** Users whose Free grant row this process has seen stored: an open (or hover warm) after that reads nothing. Bounded. */
+const freeGrantStored = new Set<string>();
+const FREE_GRANT_MEMO_MAX = 10_000;
+export function resetFreeGrantMemoForTests(): void { freeGrantStored.clear(); }
 
 /**
  * The same Free grant from a desktop or Code open, so a new account's starter credits never wait for a Settings or
  * Billing read of `billing.summary`: that read's plan rule (`planFromSubscriptions` on the stored subscriptions)
- * and gate (`tabEnabled`), then `enqueueFreeAiCredits`, whose ON CONFLICT DO NOTHING keeps it to one grant. Never throws.
+ * and gate (`tabEnabled`), then `enqueueFreeAiCredits`, whose ON CONFLICT DO NOTHING keeps it to one grant. Once the
+ * row is stored this process skips the reads for that user. A paid or failed read is not remembered. Never throws.
  */
 export async function enqueueFreeAiCreditsFor(deps: Pick<BillingDeps, 'config' | 'store' | 'now'>, userId: string): Promise<void> {
     try {
-        if (!deps.config.tabEnabled) return;
+        if (!deps.config.tabEnabled || freeGrantStored.has(userId)) return;
         const now = deps.now();
         const [subs, userCreatedAt] = await Promise.all([deps.store.subscriptionsFor(userId), deps.store.userCreatedAt(userId)]);
-        await enqueueFreeAiCredits(deps.store, userId, planFromSubscriptions({ subs, now, userCreatedAt }).sku, now);
+        if (!await enqueueFreeAiCredits(deps.store, userId, planFromSubscriptions({ subs, now, userCreatedAt }).sku, now)) return;
+        if (freeGrantStored.size >= FREE_GRANT_MEMO_MAX) freeGrantStored.clear();
+        freeGrantStored.add(userId);
     } catch { console.warn('[billing.ai] free grant enqueue unavailable'); }
 }

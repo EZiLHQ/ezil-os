@@ -361,6 +361,8 @@ async function load(state, manual = false) {
                 if (accountCredits(account, { userId: requested.ownerId }) !== null) state.lastAccount = account;
                 // The read's enrollment either way (activating → enrolled, or back); an unknown one keeps the summary's.
                 const fresh = ['enrolled', 'activating', 'needs_ezil_id'].includes(enrollment) ? { enrollment, waiting: waiting ?? null } : {};
+                // The summary's actions (Add credits, the EZiL ID link) follow enrollment: a change re-reads it on the next poll.
+                if (fresh.enrollment && fresh.enrollment !== (state.summary.ai.enrollment ?? 'enrolled')) state.summaryAt = undefined;
                 const { delivering: _previous, ...ai } = state.summary.ai;
                 state.summary = { ...state.summary, ai: { ...ai, ...fresh, account, ...(delivering ? { delivering } : {}) } };
             } else if (result.data?.enabled !== true || result.data.version !== 3) throw Error('Summary unavailable');
