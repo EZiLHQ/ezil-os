@@ -4,7 +4,7 @@
 import * as vscode from 'vscode';
 import type { CompactionInfo } from './compact';
 import { appFailure, type AppFailure } from './failure';
-import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, knownGatewayModels, parseCatalogModelId, withCatalogDefault, withGatewayModelLimits, type GatewayModels } from './gateway';
+import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, includedModelNames, knownGatewayModels, knownGatewayPlan, modelIncluded, parseCatalogModelId, withCatalogDefault, withDefaultModel, withGatewayModelLimits, withPlanLocks, type GatewayModels } from './gateway';
 import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
 import { redact, type ResolvedModel, type ResolvedProvider } from './config';
@@ -27,8 +27,25 @@ export type ProviderHost = {
     appFailure?(record: AppFailure): void;
     /** The request goes compacted (compact.ts); `finished` settles when its turn ends. */
     compacted?(model: ResolvedModel, info: CompactionInfo, finished: Promise<void>): void;
+    /** Ask the EZiL OS window around Code to open its billing dialog; true only when it took the request. */
+    billingIntent?(intent: BillingIntent): Promise<boolean>;
     fetch?: typeof fetch;
 };
+
+/**
+ * What Code asks the EZiL OS window to open; the OS picks the dialog from its own billing summary (Free: the Standard
+ * upgrade; Standard or Premium: Add credits). Only two causes ever ask: a credit refusal (exactly `insufficient_credits`
+ * or `no_live_grant`) and a locked model chosen in the picker. Content-free: a Gateway request id and a model alias.
+ */
+/**
+ * What Code asks the EZiL OS window for (worker/copilot-chat/billing-intent-vectors.json): a credit refusal, a locked
+ * model, or a used-up credit window (`window_limit`, with its reset when waiting can help), which opens no purchase.
+ */
+export type BillingIntent = { reason: 'credits_exhausted' | 'model_locked' | 'window_limit'; requestId?: string; model?: string; resetsAt?: string };
+/** The credit refusals that ask for the billing dialog; budgets, entitlement and every other code never do. */
+export const CREDIT_REFUSALS: readonly string[] = ['insufficient_credits', 'no_live_grant'];
+/** `infoText` key that marks a plan-locked model for the workbench's `picker-locked-*` patches (patch-copilot-chat.sh). */
+export const LOCKED_MODEL_INFO_KEY = 'ezilPlanLocked';
 
 type AnyPart = Record<string, unknown>;
 
@@ -169,7 +186,15 @@ export function toInformation(model: ResolvedModel): vscode.LanguageModelChatInf
     // Proposed `chatProvider` fields. code-server 4.141's extension host accepts them without the proposal enabled, and
     // `isDefault` is what makes the config's default model the first one in Chat (no chat.defaultModel is configured).
     info.isDefault = model.default;
-    info.isUserSelectable = true;
+    // A plan-locked model is never a chat model: VS Code never restores, defaults to or hands it to a subagent, so a saved
+    // pick on Free falls back to the default with no dialog. The `picker-locked-list` patch still lists it (lock icon and this
+    // text) and turns choosing it into the upgrade offer.
+    info.isUserSelectable = !model.locked;
+    if (model.locked) {
+        const ThemeIcon = (vscode as unknown as Record<string, unknown>).ThemeIcon as (new (id: string) => unknown) | undefined;
+        if (ThemeIcon) info.statusIcon = new ThemeIcon('lock');
+        info.infoText = { [LOCKED_MODEL_INFO_KEY]: 'Not included in your plan. Choose it to see the upgrade.' };
+    }
     return info;
 }
 
@@ -201,25 +226,37 @@ function withoutStack(error: unknown): Error {
 }
 
 function aiCreditsLink(): vscode.Uri | undefined {
+    return osBillingLink('section=ai-credits&reason=insufficient_credits');
+}
+
+/**
+ * An OS billing link, for a Code that is not inside an EZiL OS window. `reason=insufficient_credits` frames exhaustion
+ * recovery, where the OS opens the Standard upgrade on Free and Add credits on a paid plan; `upgrade=standard` is the
+ * pricing page's Standard link.
+ */
+function osBillingLink(query: string): vscode.Uri | undefined {
     try {
         const url = new URL(process.env.EZIL_AI_BASE_URL ?? '');
-        // `reason` makes the OS open its Add AI credits dialog as exhaustion recovery (with an upgrade when one exists).
-        if (url.protocol === 'https:') return vscode.Uri.parse(`${url.origin}/os?settings=billing&section=ai-credits&reason=insufficient_credits`);
+        if (url.protocol === 'https:') return vscode.Uri.parse(`${url.origin}/os?settings=billing&${query}`);
     } catch { /* no usable OS origin */ }
     return undefined;
 }
 
-/** A catalog as listed, for noticing that a later read changed it (ids, availability, caps and capabilities). */
+/** A catalog as listed, for noticing that a later read changed it (ids, availability, caps, capabilities and the plan's limit). */
 function catalogSignature(catalog: GatewayModels | undefined): string {
-    return catalog ? JSON.stringify([catalog.default_model ?? null, catalog.data.map(entry => [entry.id, entry.enabled, entry.protocols, entry.availability?.state,
+    return catalog ? JSON.stringify([catalog.default_model ?? null, catalog.included ?? null, catalog.data.map(entry => [entry.id, entry.enabled, entry.protocols, entry.availability?.state,
         entry.name, entry.max_input_tokens, entry.max_output_tokens, entry.capabilities])]) : 'unread';
 }
 
 export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     private readonly changed = new vscode.EventEmitter<void>();
     private lastCreditWarningAt = -Infinity;
+    private lastPlanNoticeAt = -Infinity;
+    private lastWindowNoticeAt = -Infinity;
     /** Per configured Gateway provider: the catalog the picker was last given. */
     private listedCatalogs = new Map<ResolvedProvider, string>();
+    /** The Gateway providers whose catalog could not be read for the last listing (`recoverCatalog`). */
+    private unreadListings = new Set<ResolvedProvider>();
     /** Keep only identity metadata for stale picker selections, including when the config cannot be read. */
     private modelIdentities = new Map<string, { type: ResolvedProvider['type']; model: string }>();
     /**
@@ -313,6 +350,22 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         }
     }
 
+    /**
+     * After a listing whose catalog could not be read (the picker then shows only the configured models, and a limited
+     * plan no locks unless known), read it once more and re-list if it now reads. Nothing is requested otherwise; reads
+     * are shared with every other caller (`gatewayModels`). Called periodically by the extension.
+     */
+    async recoverCatalog(): Promise<void> {
+        // Only connections still configured: a changed URL or credential is never polled with the old one.
+        const current = new Set(this.gatewayProviders().map(provider => JSON.stringify([provider.baseUrl, provider.apiKey ?? ''])));
+        for (const provider of this.unreadListings) if (!current.has(JSON.stringify([provider.baseUrl, provider.apiKey ?? '']))) this.unreadListings.delete(provider);
+        const unread = [...this.unreadListings];
+        if (!unread.length) return;
+        const read = await Promise.all(unread.map(provider => gatewayModels(provider, this.host.fetch ?? fetch)));
+        unread.forEach((provider, i) => { if (read[i]) this.unreadListings.delete(provider); });
+        this.refreshIfCatalogChanged();
+    }
+
     private gatewayProviders(): ResolvedProvider[] {
         return [...new Set(this.configuredModels().filter(model => model.provider.type === 'ezil-gateway').map(model => model.provider))];
     }
@@ -328,14 +381,17 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             if (token.isCancellationRequested) return [];
             // Configured models follow only a catalog read now (unknown keeps them listed). Catalog-only models are listed
             // from this read, or the last one for the same base URL and token while this one fails (sent only once checked).
-            const used = new Map(providers.map(provider => [provider, catalog.get(provider) ?? knownGatewayModels(provider)]));
+            // Past that, a limited plan (Free) still lists the models it includes, from the last verified read (knownGatewayPlan).
+            const used = new Map(providers.map(provider => [provider, catalog.get(provider) ?? knownGatewayPlan(provider)]));
             const listed = providers.flatMap(provider => gatewayCatalogModels(provider, used.get(provider), models));
             // What the catalog-only rows came from: during an outage, the last catalog, so requests do not re-list each time.
             this.listedCatalogs = new Map(providers.map(provider => [provider, catalogSignature(used.get(provider))]));
+            this.unreadListings = new Set(providers.filter(provider => !catalog.get(provider)));
             // The Gateway's suggested default counts only from this read: during an outage the configured default stays.
+            // The OS plan's locks (Free: Gemini 3.8 Flash only) follow the same catalog as the rows they lock.
             const offered = [...models.filter(model => gatewayModelAvailable(model, catalog.get(model.provider))), ...listed]
                 .map(model => withGatewayModelLimits(model, catalog.get(model.provider)));
-            return this.rememberModels(withCatalogDefault(offered, catalog)).map(toInformation);
+            return this.rememberModels(withDefaultModel(withPlanLocks(withCatalogDefault(offered, catalog), used), used)).map(toInformation);
         } finally { cancel.dispose(); }
     }
 
@@ -356,8 +412,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         if (named.length === 1) {
             const provider = named[0]!;
             signal?.throwIfAborted();
-            const read = () => gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), signal);
-            catalog = known ? knownGatewayModels(provider) ?? await read() : await read();
+            // A token count (`known`) never makes a request: Copilot counts every prompt part, often at once.
+            catalog = known ? knownGatewayPlan(provider) : await gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), signal);
             const listed = gatewayCatalogModels(provider, catalog, models).find(candidate => candidate.id === model.id);
             if (listed) return listed;
         }
@@ -407,11 +463,24 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         try {
             resolved = await this.resolve(model, controller.signal);
             controller.signal.throwIfAborted();
-            if (resolved.provider.type === 'ezil-gateway' && resolved.gatewayProtocol !== 'openai-responses' && isUtilityRequest(options.modelOptions ?? {})) {
-                // Qwen on the selected model's own provider (account) only; without one, the selected model serves it.
+            if (resolved.provider.type === 'ezil-gateway' && isUtilityRequest(options.modelOptions ?? {})) {
+                // Requests marked as titles or summaries (role or requestInitiator): Qwen on the named model's own provider
+                // (account), when the account's plan includes it. On a plan that does not (Free: Gemini 3.8 Flash only) they
+                // never fail on a lock: one naming a model the plan does not include goes to the plan's own model on the same
+                // account. Otherwise the named model serves it. Copilot 0.69 marks none of its own requests: the image's
+                // Machine settings pin its utility slots to Flash (worker/scripts/editor-state.sh).
                 const selected = resolved;
-                resolved = this.configuredModels().find(candidate => candidate.provider.type === 'ezil-gateway' && candidate.providerName === selected.providerName
-                    && candidate.gatewayProtocol !== 'openai-responses' && candidate.model === QWEN) ?? resolved;
+                const read = await gatewayModels(selected.provider, this.host.fetch ?? fetch, Date.now(), controller.signal) ?? knownGatewayModels(selected.provider);
+                // The plan's own model is the last verified one's only to decide with: a catalog-only row is sent only from a catalog.
+                const plan = read ?? knownGatewayPlan(selected.provider);
+                const sameAccount = (candidate: ResolvedModel) => candidate.provider.type === 'ezil-gateway' && candidate.providerName === selected.providerName;
+                if (selected.gatewayProtocol !== 'openai-responses' && modelIncluded(plan, QWEN)) {
+                    resolved = this.configuredModels().find(candidate => sameAccount(candidate) && candidate.gatewayProtocol !== 'openai-responses' && candidate.model === QWEN) ?? resolved;
+                } else if (!modelIncluded(plan, selected.model)) {
+                    const own = plan?.included?.[0];
+                    resolved = [...this.configuredModels(), ...gatewayCatalogModels(selected.provider, read, this.configuredModels())]
+                        .find(candidate => sameAccount(candidate) && candidate.model === own) ?? resolved;
+                }
             }
             const request = toNeutralRequest(messages, options);
             // The signed-thinking fallback is for the EZiL Gateway only: its transport sends just its own Bearer credential
@@ -433,6 +502,14 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 controller.signal.throwIfAborted();
                 if (!gatewayModelAvailable(resolved, catalog)) {
                     throw new GatewayError('EZiL AI: This model is not available right now.', undefined, 'model_disabled', undefined, undefined, 'local');
+                }
+                // Not in the account's OS plan (Free: Gemini 3.8 Flash only): refused here, so nothing is sent, held or
+                // charged. No billing dialog either: a saved pick, an agent's or subagent's model choice or a stale
+                // picker reaches this, and only a pick in the picker offers the upgrade (lockedModelChosen).
+                const plan = catalog ?? knownGatewayPlan(resolved.provider);
+                if (!modelIncluded(plan, resolved.model)) {
+                    throw new GatewayError(`EZiL AI: ${resolved.name} is not included in your plan. Nothing was sent or charged. Pick ${includedModelNames(plan)}, `
+                        + 'or upgrade in Settings → Billing.', undefined, 'os_model_not_included', undefined, undefined, 'local');
                 }
                 resolved = withGatewayModelLimits(resolved, catalog);
                 // Never send tools to a model without tool calling: leave them out, as Copilot 0.69 does for its own
@@ -518,14 +595,32 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             // to be free of key material (a gateway may echo headers or carry the key in its path).
             const message = redact(error instanceof Error ? error.message : String(error), this.host.secrets());
             if (resolved && resolved.provider.type !== 'ezil-gateway') this.host.log(`[error] ${resolved.id}: ${message}`);
-            if (error instanceof GatewayError && ['insufficient_credits', 'no_live_grant'].includes(error.code ?? '') && Date.now() - this.lastCreditWarningAt >= 60_000) {
+            // Exactly these two codes ask for billing, at most once a minute (in-flight turns or an agent loop that all run
+            // out ask once). The OS window opens the upgrade on Free and Add credits on a paid plan; a Code outside one
+            // keeps the notice and its link. The turn is not retried: the conversation and input stay as they are. The ask
+            // carries the first refusal's request id, which in a new chat can be Copilot's title request, sent just before
+            // the turn (the OS only logs it and dedupes on it).
+            if (error instanceof GatewayError && CREDIT_REFUSALS.includes(error.code ?? '') && Date.now() - this.lastCreditWarningAt >= 60_000) {
                 this.lastCreditWarningAt = Date.now();
                 const link = aiCreditsLink();
-                void Promise.resolve(vscode.window.showWarningMessage(message, ...link ? ['Add credits'] : [])).then(choice => {
-                    if (choice === 'Add credits' && link) return vscode.env.openExternal(link);
-                }).catch(() => {});
+                void this.askBilling({ reason: 'credits_exhausted', requestId: error.requestId }).then(opened => opened ? undefined
+                    : Promise.resolve(vscode.window.showWarningMessage(message, ...link ? ['Add credits'] : [])).then(choice => {
+                        if (choice === 'Add credits' && link) return vscode.env.openExternal(link);
+                    })).catch(() => {});
             }
-            if (error instanceof GatewayError && ['first_byte_timeout', 'stream_idle_timeout', 'os_unreachable', 'os_ai_unavailable', 'upstream_timeout'].includes(error.code ?? '')) {
+            // A used-up credit window is a plan allowance, not the wallet: no purchase lifts it today, so it is never a credit
+            // refusal. The OS window explains it on its AI credits row and opens nothing (`window_limit`), at most once a
+            // minute; a Code outside one shows the same words, with no purchase link.
+            if (error instanceof GatewayError && error.code === 'window_budget_reached' && Date.now() - this.lastWindowNoticeAt >= 60_000) {
+                this.lastWindowNoticeAt = Date.now();
+                void this.askBilling({ reason: 'window_limit', requestId: error.requestId, ...error.resetsAt ? { resetsAt: error.resetsAt } : {} })
+                    .then(opened => opened ? undefined : Promise.resolve(vscode.window.showWarningMessage(message)).then(() => undefined)).catch(() => {});
+            }
+            // An unknown plan refuses a turn's title and progress requests too: its notice shows at most once a minute.
+            const planUnknown = error instanceof GatewayError && error.code === 'os_plan_unavailable';
+            if (error instanceof GatewayError && ['first_byte_timeout', 'stream_idle_timeout', 'os_unreachable', 'os_ai_unavailable', 'upstream_timeout', 'os_plan_unavailable'].includes(error.code ?? '')
+                && !(planUnknown && Date.now() - this.lastPlanNoticeAt < 60_000)) {
+                if (planUnknown) this.lastPlanNoticeAt = Date.now();
                 // Do not await a notification: the failed turn must leave Thinking immediately.
                 void Promise.resolve(vscode.window.showErrorMessage(message, 'Retry')).then(choice => {
                     if (choice === 'Retry') return vscode.commands.executeCommand('workbench.action.chat.retry');
@@ -541,8 +636,49 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         }
     }
 
+    /** The host's billing request; false (not taken) when there is none or it fails. Never throws. */
+    private async askBilling(intent: BillingIntent): Promise<boolean> {
+        try { return (await this.host.billingIntent?.(intent)) === true; } catch { return false; }
+    }
+
+    /**
+     * A plan-locked model was chosen in the picker (the workbench `picker-locked-select` patch runs `_ezil-models.lockedModel`
+     * instead of selecting it, so the previous model stays selected). The plan is read again first: if it now includes
+     * the model (an upgrade just went through), the picker lists it again and nothing opens. Otherwise the OS window
+     * opens its upgrade; a Code outside one shows a notice with the Standard link. Nothing is ever sent to a model here.
+     */
+    async lockedModelChosen(id: unknown): Promise<'listed' | 'asked' | 'ignored'> {
+        if (typeof id !== 'string') return 'ignored';
+        const configured = this.configuredModels().find(model => model.id === id);
+        const catalogId = configured ? undefined : parseCatalogModelId(id);
+        const provider = configured?.provider ?? this.gatewayProviders().find(candidate => candidate.name === catalogId?.providerName);
+        const alias = configured?.model ?? catalogId?.alias;
+        if (!provider || provider.type !== 'ezil-gateway' || !alias) return 'ignored';
+        const fresh = await gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), undefined, true);
+        if (modelIncluded(fresh ?? knownGatewayPlan(provider), alias)) {
+            this.refresh();
+            return 'listed';
+        }
+        if (!await this.askBilling({ reason: 'model_locked', model: alias })) {
+            const link = osBillingLink('upgrade=standard');
+            const name = configured?.name ?? (fresh ?? knownGatewayPlan(provider))?.data.find(row => row.id === alias)?.name ?? alias;
+            void Promise.resolve(vscode.window.showInformationMessage(`${name} is not included in your plan.`, ...link ? ['Upgrade'] : []))
+                .then(choice => { if (choice === 'Upgrade' && link) return vscode.env.openExternal(link); }).catch(() => {});
+        }
+        return 'asked';
+    }
+
     async provideTokenCount(_model: vscode.LanguageModelChatInformation, value: string | vscode.LanguageModelChatRequestMessage, _token: vscode.CancellationToken): Promise<number> {
-        const resolved = await this.resolve(_model, undefined, true);
+        let resolved: ResolvedModel;
+        try {
+            resolved = await this.resolve(_model, undefined, true);
+        } catch (error) {
+            // A catalog-only model the known catalog cannot place (none known, or a limited plan's list without it):
+            // count as the larger of the Gateway's protocols. The send reads the catalog itself and decides.
+            if (!(error instanceof GatewayError) || !['catalog_unavailable', 'model_unavailable'].includes(error.code ?? '')) throw error;
+            const message = typeof value === 'string' ? value : toNeutralMessage(value);
+            return Math.max(gatewayTokenCount(message, 'anthropic-messages'), gatewayTokenCount(message, 'openai-responses'));
+        }
         if (resolved.provider.type === 'ezil-gateway') return gatewayTokenCount(typeof value === 'string' ? value : toNeutralMessage(value), resolved.gatewayProtocol);
         if (typeof value === 'string') return estimateTextTokens(value);
         return estimateMessageTokens(toNeutralMessage(value));

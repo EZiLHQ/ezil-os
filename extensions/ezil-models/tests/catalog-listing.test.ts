@@ -547,10 +547,19 @@ describe('the Gateway\'s suggested default model', () => {
         expect(defaults(infos)).toEqual([`ezil/${FLASH}`]);
     });
 
-    test('otherwise the configured default (Qwen) stays: no hint, null, legacy, unavailable, no tools, unknown protocol, missing row', async () => {
+    // Founder decision 2026-11-09: a new or unset chat starts on an available Flash on every plan, whatever the hint says.
+    test('Flash is the default whenever it is listed and calls tools: no hint, null, a malformed hint or another model named', async () => {
+        const kimi = row(KIMI, 'available', { capabilities: { tool_calling: true, image_input: false, streaming: false } });
+        for (const catalog of [v1([row(QWEN, 'available'), flash()]), v1([row(QWEN, 'available'), flash()], { default_model: null }),
+            v1([row(QWEN, 'available'), flash()], { default_model: 'Gemini 3.8 Flash' }), v1([row(QWEN, 'available'), kimi, flash()], { default_model: KIMI })]) {
+            forgetGatewayModels();
+            const g = gateway(load(), () => Response.json(catalog));
+            expect(defaults(await list(g.provider))).toEqual([`ezil/${FLASH}`]);
+        }
+    });
+
+    test('without a usable Flash the configured default (Qwen) stays, a paid plan\'s fallback: legacy, unavailable, no tools, unknown protocol, disabled, missing row', async () => {
         const cases: unknown[] = [
-            v1([row(QWEN, 'available'), flash()]),
-            v1([row(QWEN, 'available'), flash()], { default_model: null }),
             { ...legacy([row(QWEN), flash()]), default_model: FLASH },
             v1([row(QWEN, 'available'), flash('unavailable', { availability: { state: 'unavailable', reasons: ['not_allowed_for_caller'] } })], { default_model: FLASH }),
             v1([row(QWEN, 'available'), flash('available', { capabilities: { tool_calling: false, image_input: false, streaming: true } })], { default_model: FLASH }),
@@ -558,7 +567,6 @@ describe('the Gateway\'s suggested default model', () => {
             v1([row(QWEN, 'available'), flash('available', { protocols: ['openai-chat-v9'] })], { default_model: FLASH }),
             v1([row(QWEN, 'available'), flash('available', { enabled: false })], { default_model: FLASH }),
             v1([row(QWEN, 'available')], { default_model: FLASH }),
-            v1([row(QWEN, 'available'), flash()], { default_model: 'Gemini 3.8 Flash' }),
         ];
         for (const catalog of cases) {
             forgetGatewayModels();
@@ -567,18 +575,17 @@ describe('the Gateway\'s suggested default model', () => {
         }
     });
 
-    test('an unreadable catalog keeps the configured default even while the last rows stay listed', async () => {
+    test('an unreadable catalog keeps Flash as the default while its last rows stay listed, then the configured one', async () => {
         let up = true;
         const g = gateway(load(), () => up ? Response.json(v1([row(QWEN, 'available'), flash()], { default_model: FLASH })) : new Response('down', { status: 503 }));
         expect(defaults(await list(g.provider))).toEqual([`ezil/${FLASH}`]);
         up = false;
-        const later = Date.now() + 6 * 60_000;
-        const now = spyOn(Date, 'now').mockReturnValue(later);
-        try {
-            const infos = await list(g.provider);
-            expect(ids(infos)).toContain(`ezil/${FLASH}`);
-            expect(defaults(infos)).toEqual([QWEN]);
-        } finally { now.mockRestore(); }
+        for (const [minutes, expected] of [[6, `ezil/${FLASH}`], [31, QWEN]] as const) {
+            const now = spyOn(Date, 'now').mockReturnValue(Date.now() + minutes * 60_000);
+            try {
+                expect(defaults(await list(g.provider))).toEqual([expected]);
+            } finally { now.mockRestore(); }
+        }
     });
 
     test('a request on the Flash default names gemini-3.8-flash and carries no temperature/top_p; Qwen keeps them', async () => {
@@ -600,14 +607,15 @@ describe('the Gateway\'s suggested default model', () => {
         expect(defaults(infos)).toEqual(['flash-configured']);
     });
 
-    test('a change of the suggested default alone re-lists the models', async () => {
-        let catalog = v1([row(QWEN, 'available'), flash()]);
+    test('a change of the suggested default alone re-lists the models (no Flash listed: the hint decides)', async () => {
+        const kimi = row(KIMI, 'available', { capabilities: { tool_calling: true, image_input: false, streaming: false } });
+        let catalog = v1([row(QWEN, 'available'), kimi]);
         const g = gateway(load(), () => Response.json(catalog));
         expect(defaults(await list(g.provider))).toEqual([QWEN]);
-        catalog = v1([row(QWEN, 'available'), flash()], { default_model: FLASH });
+        catalog = v1([row(QWEN, 'available'), kimi], { default_model: KIMI });
         forgetGatewayModels();
         await send(g.provider, { id: QWEN });
         expect(g.changes()).toBe(1);
-        expect(defaults(await list(g.provider))).toEqual([`ezil/${FLASH}`]);
+        expect(defaults(await list(g.provider))).toEqual([KIMI]);
     });
 });

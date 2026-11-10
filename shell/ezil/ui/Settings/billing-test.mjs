@@ -1490,6 +1490,77 @@ try {
     assert.equal(sheets.length, beforeUsage + 2);
     assert.equal(window.document.activeElement, q('#ai-credits h4'));
     pass('Add credits links (Usage, Code recovery deep link) open the top-up dialog directly, once, in this window');
+
+    // Founder 2026-11-09: Free includes Gemini 3.8 Flash only. Code's recovery (its link, or its request through the
+    // billing bridge) opens the Standard upgrade on Free and Add credits on a paid plan; a model refusal on a paid plan
+    // opens nothing. Each request opens once, never beside an open sheet, and Code's chat is never touched.
+    {
+        const freeWithTopup = () => { const s = summaryV3('free'); s.actions.topup = true; s.catalog.packs = packs; return s; };
+        summary = freeWithTopup();
+        window.history.replaceState(null, '', '/os?settings=billing&section=ai-credits&reason=insufficient_credits');
+        let before = sheets.length; await open();
+        assert.deepEqual([sheets.length - before, sheets.at(-1).kind, sheets.at(-1).sku], [1, 'checkout', 'standard_monthly_v3'], 'Free: the recovery link opens the Standard upgrade');
+        await closeSheet(); window.history.replaceState(null, '', '/os');
+        const recoveryCases = [
+            [freeWithTopup, 'insufficient_credits', ['checkout', 'standard_monthly_v3']], [freeWithTopup, 'model_locked', ['checkout', 'standard_monthly_v3']],
+            [() => { const s = summaryV3('standard'); s.actions.topup = true; s.catalog.packs = packs; return s; }, 'insufficient_credits', ['topup', undefined]],
+            [() => { const s = summaryV3('premium'); s.actions.topup = true; s.catalog.packs = packs; return s; }, 'insufficient_credits', ['topup', undefined]],
+            [() => { const s = summaryV3('premium'); s.actions.topup = true; s.catalog.packs = packs; return s; }, 'model_locked', null],
+        ];
+        for ( const [make, reason, expected] of recoveryCases ) {
+            summary = make(); before = sheets.length;
+            await open({ ...context, initialTab: 'billing', billingRecovery: { reason, requestId: '6f1d3a52-9b0e-4c1d-8a7b-2e5f4d3c2b1a' } });
+            assert.equal(sheets.length - before, expected ? 1 : 0, `${summary.plan.sku} ${reason}`);
+            if ( expected ) {
+                assert.deepEqual([sheets.at(-1).kind, sheets.at(-1).sku], expected, `${summary.plan.sku} ${reason}`);
+                if ( expected[0] === 'topup' ) assert.equal(sheets.at(-1).reason, 'insufficient_credits');
+                await closeSheet();
+            }
+            // Switching tabs back never replays it.
+            click(q('[data-tab="account"]')); click(q('[data-tab="billing"]')); await settle();
+            assert.equal(sheets.length - before, expected ? 1 : 0, 'consumed once');
+        }
+        // Settings already open on another tab: Code's request selects Billing and opens the dialog once; again while it is
+        // open opens nothing more (one dialog per failure).
+        summary = freeWithTopup();
+        await open({ ...context, initialTab: 'usage' });
+        before = sheets.length;
+        await window.ezil.registry.launch('settings', { ...context, initialTab: 'billing', billingRecovery: { reason: 'model_locked' } }); await settle();
+        assert.equal(active(), 'billing');
+        assert.deepEqual([sheets.length - before, sheets.at(-1).kind], [1, 'checkout']);
+        await window.ezil.registry.launch('settings', { ...context, initialTab: 'billing', billingRecovery: { reason: 'insufficient_credits' } }); await settle();
+        assert.equal(sheets.length - before, 1, 'an open sheet is never doubled');
+        await closeSheet();
+        for ( const bad of [{ reason: 'rate_limited' }, { reason: 'topup' }, 'insufficient_credits', null] ) {
+            await window.ezil.registry.launch('settings', { ...context, initialTab: 'billing', billingRecovery: bad }); await settle();
+        }
+        assert.equal(sheets.length - before, 1, 'only the two recovery reasons open anything');
+        // No upgrade to offer (checkout off): a locked pick still lands on the plan card, never on nothing.
+        summary = freeWithTopup(); summary.actions.checkout = false;
+        await open({ ...context, initialTab: 'billing', billingRecovery: { reason: 'model_locked' } });
+        assert.equal(sheets.length - before, 1, 'no sheet without an upgrade');
+        assert.ok(q('[data-pane="billing"] [data-role="plan-card"]')?.contains(window.document.activeElement), 'focus lands on the plan');
+        // A used-up EZiL AI credit window (`window_limit`) is a plan allowance that no purchase lifts today: on Free and
+        // on a paid plan nothing opens; the AI credits row says so, with the reset time when Code had one, and takes focus.
+        const future = new Date(now + 90 * 60_000).toISOString(), past = new Date(now - 60_000).toISOString(); // the virtual clock
+        for ( const make of [freeWithTopup, () => { const s = summaryV3('standard'); s.actions.topup = true; s.catalog.packs = packs; return s; }] ) {
+            for ( const [request, timed] of [[{ reason: 'window_limit', requestId: '6f1d3a52-9b0e-4c1d-8a7b-2e5f4d3c2b1a', resetsAt: future }, true],
+                [{ reason: 'window_limit' }, false], [{ reason: 'window_limit', resetsAt: past }, false]] ) {
+                summary = make(); before = sheets.length;
+                await open({ ...context, initialTab: 'billing', billingRecovery: request });
+                const at = `${summary.plan.sku} ${JSON.stringify(request)}`;
+                assert.equal(sheets.length - before, 0, `${at}: no sheet`);
+                const notes = window.document.querySelectorAll('[data-pane="billing"] #ai-credits [data-role="ai-window-note"]');
+                assert.equal(notes.length, 1, `${at}: one note on the AI credits row`);
+                assert.match(notes[0].textContent, /Buying credits or changing your plan does not lift this window right now\./, at);
+                assert.match(notes[0].textContent, timed ? /used up until \S/ : /can't cover that request\./, at);
+                assert.doesNotMatch(notes[0].textContent, /add credits to|to continue|restore|unlock|upgrade to/i, at);
+                assert.ok(q('[data-pane="billing"] #ai-credits')?.contains(window.document.activeElement), `${at}: focus on the AI credits row`);
+            }
+        }
+        pass('Code recovery: Free gets the Standard upgrade, a paid plan Add credits, a paid model refusal nothing; once each, never doubled');
+        pass('Code recovery: a used-up credit window opens no purchase on any plan; the AI credits row explains it, with its reset time');
+    }
     // Round 5 (D6): no operator internals on the user surface, in any AI state.
     summary = summaryV3(); await refresh();
     for ( const role of ['ai-usage', 'ai-limits', 'ai-recent', 'ai-spending'] ) has(`[data-role="${role}"]`, false);

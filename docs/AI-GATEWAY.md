@@ -101,6 +101,108 @@ JWT signature/member verification on each request. Transactional storage keeps
 the later-expiring token. A gateway 401 drops that token only if a newer push
 has not replaced it. Teardown/idle stop delete the credential and nonce.
 
+## Plan model list (Free includes Gemini 3.8 Flash only)
+
+A push may also carry `"includedModels"`: the models the owner's plan includes,
+from the same effective plan the computer start gate uses
+(`app/src/server/billing/v3/ai-models.ts`; Free is `["gemini-3.8-flash"]`,
+Standard and Premium are `null`, every model). It is signed in the same body.
+The app resolves that owner policy even when compute metering is off; disabling
+metering never grants model access. Unknown plan SKUs are treated as an unread plan.
+When the app cannot read the plan it leaves the field out: that push refreshes
+the token only, never the plan. A value
+other than `null` or 1–16 distinct Gateway aliases refuses the whole push
+(`400 included_models_malformed`). The list is stored apart from the token and
+ordered by its own signature time, so a later push always wins whichever token
+is kept. It stays through logout, a dropped token and stop, and the next push
+with a readable plan replaces it. It counts as known for
+`AI_MODEL_ACCESS_MAX_AGE_MS` (30 minutes) from its own signed time. A present
+user's Code pushes one with every activity beat, each minute.
+
+An unknown plan is never "every model". That covers no list pushed, a stale
+list, or a malformed record. `POST /ai/v1/messages` and `/ai/v1/responses` then
+get a local `503 os_plan_unavailable` (source `ezil-os-proxy`): a temporary
+failure, never a billing refusal, and nothing is sent, held or charged. Reads
+(`/models` without the header, balance, limits, usage) pass as before.
+
+Rollout order follows from that: the app, then the desktop image, then this
+Worker.
+
+- **App first.** An older Worker reads only `accessToken` and ignores
+  `includedModels`. A Worker deployed before the app refuses all inference
+  until the app ships. The app's plan refresh (below) is safe either way
+  round: an older Worker refuses its token-less body with a 400, which the
+  sweep logs and carries on past.
+- **Image before this Worker.** An older image's Code defaults to Qwen, pins
+  Copilot's title and summary requests to Qwen, and does not know these
+  refusals. Under this Worker, a Free account on that image gets a generic
+  `403 os_model_not_included` for each such turn and for every title and
+  summary, with nothing charged, no billing and no retry. Its turns recover
+  when the user picks Flash. Its titles and summaries recover only when the
+  computer restarts on the new image, because the older provider sends them to
+  Qwen whichever model is chosen. The new image under an older Worker is safe:
+  with no header there are no locks, and Flash is the default either way.
+- **Old images persist.** A Worker deploy restarts no computer, so a computer
+  still running the old image when this Worker ships keeps it until it
+  restarts.
+- **First minute.** After this Worker ships, every computer's next open,
+  activity beat or plan refresh brings a list within a minute. Until then its
+  model requests get the 503.
+
+Roll back in reverse, this Worker first.
+
+Activity beats need a present user, and an idle stop also waits for the
+container's own work to end, so an agent kept busy after its user leaves can
+outlive a beat's list. The app's per-minute billing sweep (`refreshAiPlans` in
+`app/src/server/lib/ai-credential.ts`) therefore pushes the plan on its own,
+as a signed body `{ "includedModels": … }` with no `accessToken`, from the same
+effective plan and signed at the time that plan was read. Its computers are the
+live ones opened in the last three hours (`last_opened_at`, on either provider),
+in id order. Each minute's pass takes up to 500, starting further along each
+time (`aiPlanRefreshSlice`). When passes finish, any 15 in a row reach every
+computer, up to 7,468 of them; above that a rotation takes ceil((N + 32) / 500)
+minutes. A pass the deadline cuts short still reaches at least 32. Each rotation
+starts 32 rows further on, so rows it missed come first in a later pass, though
+covering N rows at 32 a minute takes about N / 32 minutes. A running filter is
+not possible: no table says a Cloudflare computer still runs, and its compute
+session closes 15 minutes after the last beat. The Worker stores only the list, ordered as above, and never
+creates, extends or reads the token: the work still ends with the pushed token
+(`401 os_session_missing` once it expires). Nothing renews a stale list. A plan
+the app cannot read sends nothing, never `null`, so the stored list ages out to
+the 503. A token-less body without `includedModels` is refused (`400
+included_models_missing`), and so is one that names a token, even `null`. The
+refresh records no activity, presence, lease or meter. One 20-second deadline
+covers the listing, plan reads and pushes; each push has 5 seconds.
+
+With a list stored, `POST /ai/v1/messages` and `/ai/v1/responses` read the
+body's `model` exactly as the Gateway reads it (fatal UTF-8, `JSON.parse`, last
+repeated key wins). Any other model gets a local
+`403 os_model_not_included` (source `ezil-os-proxy`), and a body that names no
+model gets `400 os_invalid_request`. In both cases nothing reaches the Gateway,
+so nothing is held or charged. Every `GET /ai/v1/models` answer, and the 403,
+carries `x-ezil-os-included-models: <aliases, comma-separated>`. The proxy
+sets this header itself and never relays it from the Gateway. With an explicit
+`null`, requests pass exactly as before. Credit refusals (`402 insufficient_credits`,
+`no_live_grant`) always pass through unchanged. The OS chooses Standard upgrade
+or Add credits from its own billing summary.
+
+The Gateway's credit window (`429 window_budget_reached`; its
+`docs/credit-window.md`) passes through with its `retry-after` and only the
+member's own window fields. Those are `budget_micro`, `used_micro` and
+`hold_micro` (decimal strings), `resets_at` (a timestamp, or `null` before any
+window has started) and `retry_after_seconds`; nothing else of that body crosses,
+and no other refusal carries them. It is a plan allowance
+checked before the wallet, so buying credits or changing plan does not lift it
+today. Code never treats it as a credit refusal. It says when the window resets,
+or that a request larger than the whole window will not fit by waiting, and it
+asks the OS for `window_limit`: Billing explains it on the AI credits row and
+opens no purchase. Lifting a window with a purchase would need a Gateway policy
+change, which this does not make.
+
+This enforcement is on the OS proxy path only. The Gateway itself has no notion
+of OS plans, so a member who calls it directly with their own token is limited
+only by their credits.
+
 Without a usable JWT the proxy returns `401 os_session_missing`. Logout finds
 **all** computer rows owned by the authenticated user, including soft-deleted
 rows, derives their sandbox ids with the existing provider helper, and sends
@@ -108,22 +210,24 @@ parallel signed DELETEs before Supabase signOut. Identity lookup, database
 listing and deletions share one **three-second total budget**. Failures and
 expired budgets never prevent signout or cookie clearing. DELETE remains
 available while AI is disabled. Deleting an AWS computer's derived credential
-is harmless; no AWS inference proxy is enabled.
+uses the same signed credential store as its AI proxy.
 
 ## Rollout, logs and limits
 
-`SANDBOX_AI_PROXY = "off"` is the production top-level Wrangler default;
-staging sets it to `"on"`. Both set `EZIL_AI_GATEWAY_URL = "https://ai.ezil.work"`.
+Production source keeps `SANDBOX_AI_PROXY = "on"` and
+`EZIL_AI_GATEWAY_URL = "https://ai.ezil.work"`. The staging environment keeps its
+own `https://ai-staging.ezil.work` origin. This source port changes neither setting.
 Off returns exactly HTTP 503 with
 `{"error":{"code":"os_ai_unavailable","source":"ezil-os-proxy"}}`.
 Boot still injects the two environment variables and rotates tokens, so a flag
 change can enable a running v2 container. Credential storage/deletion stays
 available regardless of the flag.
 
-AWS browser hosts (`aws-<port>-<sandboxId>-aws.<zone>`) use a separate dispatcher
-on main. Their `/ai` paths return **404 `os_ai_unavailable`** before AWS routing
-or cookie checks, whether `AWS_ROUTING_ENABLED` is on or off. AWS parity is
-outside this implementation.
+AWS hosts (`aws-<port>-<sandboxId>-aws.<zone>`) use a separate dispatcher.
+Only the Code port can reach the AI proxy; the dispatcher requires enabled AWS
+routing and a current signed tunnel record with its AI proxy nonce. The same
+owner-plan and credential checks then apply. Production routing stays enabled,
+with `ezil.org` as both the AWS origin zone and its allowlist.
 
 Logs contain route labels, status, request id, validated Idempotency-Key,
 `error.code`, terminal Messages SSE event (`message_stop` or `error`), outcome

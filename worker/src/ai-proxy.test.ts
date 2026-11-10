@@ -8,9 +8,11 @@ import { describe, expect, it, spyOn } from 'bun:test';
 import {
   aiProxyBaseUrl,
   chooseAiCredential,
+  currentModelAccess,
   deriveAiProxyToken,
   exactCacheEligible,
   exactCacheScope,
+  AI_MODEL_ACCESS_MAX_AGE_MS,
   AI_PROXY_COMPLETION_TIMEOUT_MS,
   AI_PROXY_HEADERS_TIMEOUT_MS,
   handleAiProxyRequest,
@@ -19,6 +21,8 @@ import {
   matchAiRoute,
   mintAiCredentialSignature,
   parsePushedAccessToken,
+  parsePushedModelAccess,
+  requestModel,
   resolveGatewayUrl,
   sandboxBelongsToUser,
   usableAiCredential,
@@ -72,6 +76,7 @@ async function deps(overrides: Partial<AiProxyDeps> & Pick<AiProxyDeps, 'fetch'>
     proxySecret: SECRET,
     proxyNonce: NONCE,
     credential: async () => USER_JWT,
+    modelAccess: async () => ({ known: true, includedModels: null }),
     dropCredential: async (token) => {
       dropped.push(token);
     },
@@ -1231,5 +1236,174 @@ describe('exact response cache opt-in (Gateway docs/RESPONSE-CACHE.md): staging 
     expect(opted.res.headers.get('x-ezil-cache')).toBeNull();
     expect(await opted.res.json()).toEqual(await plain.res.json());
     expect(plain.res.status).toBe(402);
+  });
+});
+
+describe('plan model access (Free includes Gemini 3.8 Flash only)', () => {
+  const FLASH = 'gemini-3.8-flash';
+  const post = async (path: string, body: BodyInit) => new Request(`${HOST}/ai/v1${path}`, {
+    method: 'POST', body, headers: { authorization: await proxyAuth(), 'content-type': 'application/json', 'idempotency-key': 'turn-plan' },
+  });
+  const restricted = (gw: { fetch: AiProxyDeps['fetch'] }, reads: { count: number } = { count: 0 }) =>
+    deps({ fetch: gw.fetch, modelAccess: async () => { reads.count++; return { known: true, includedModels: [FLASH] }; } });
+
+  it('answers a request for any other model here: nothing reaches the Gateway, so nothing is held or charged', async () => {
+    const gw = mockGateway(() => Response.json({ ok: true }));
+    const d = await restricted(gw);
+    for (const [path, model] of [['/messages', 'qwen.qwen3-coder-next'], ['/messages', 'claude-opus-5-5'], ['/responses', 'gpt-6-astra-code']] as const) {
+      const response = await handleAiProxyRequest(await post(path, JSON.stringify({ model, max_tokens: 64, stream: true })), d);
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({ error: { code: 'os_model_not_included', message: 'This model is not included in your plan.', source: 'ezil-os-proxy' } });
+      expect(response.headers.get('x-ezil-os-included-models')).toBe(FLASH);
+      expect(d.logs.at(-1)).toMatchObject({ status: 403, code: 'os_model_not_included', model });
+    }
+    expect(gw.calls).toHaveLength(0);
+    // Positive control: the included model goes upstream once, byte for byte.
+    const body = JSON.stringify({ model: FLASH, max_tokens: 64, stream: true });
+    const ok = await handleAiProxyRequest(await post('/messages', body), d);
+    expect(ok.status).toBe(200);
+    expect(gw.calls).toHaveLength(1);
+    expect(new TextDecoder().decode(gw.calls[0]!.body)).toBe(body);
+  });
+
+  it('reads `model` exactly as the Gateway does: last repeated key, exact case, fatal UTF-8, BOM stripped', async () => {
+    const gw = mockGateway(() => Response.json({ ok: true }));
+    const d = await restricted(gw);
+    const status = async (body: BodyInit) => (await handleAiProxyRequest(await post('/messages', body), d)).status;
+    expect(await status(`{"model":"${FLASH}","model":"claude-opus-5-5"}`)).toBe(403);
+    expect(await status('{"model":"Gemini-3.8-Flash"}')).toBe(403);
+    expect(await status(`{"model":" ${FLASH}"}`)).toBe(403);
+    expect(gw.calls).toHaveLength(0);
+    expect(await status(`{"model":"claude-opus-5-5","model":"${FLASH}"}`)).toBe(200);
+    expect(await status(new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode(`{"model":"${FLASH}"}`)]))).toBe(200);
+    expect(gw.calls).toHaveLength(2);
+  });
+
+  it('refuses a body that names no model as a plain bad request, never a plan or credit code', async () => {
+    const gw = mockGateway(() => Response.json({ ok: true }));
+    const d = await restricted(gw);
+    // The last one is valid JSON naming Flash once decoded leniently; the Gateway refuses its bytes (fatal UTF-8), so does this.
+    const lenient = new Uint8Array([...new TextEncoder().encode(`{"model":"${FLASH}","note":"`), 0xff, ...new TextEncoder().encode('"}')]);
+    for (const body of ['{}', '[]', '{"model":1}', '{"model":null}', 'not json', new Uint8Array([0x7b, 0xff, 0x7d]), lenient]) {
+      const response = await handleAiProxyRequest(await post('/messages', body), d);
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: { code: 'os_invalid_request', source: 'ezil-os-proxy' } });
+      expect(response.headers.get('x-ezil-os-included-models')).toBeNull();
+    }
+    expect(gw.calls).toHaveLength(0);
+  });
+
+  it('a verified every-model plan forwards every model unchanged', async () => {
+    const gw = mockGateway(() => Response.json({ ok: true }));
+    const d = await deps({ fetch: gw.fetch, modelAccess: async () => ({ known: true, includedModels: null }) });
+    expect((await handleAiProxyRequest(await post('/messages', '{"model":"claude-opus-5-5"}'), d)).status).toBe(200);
+    // An unreadable body is still the Gateway's to judge, as before.
+    expect((await handleAiProxyRequest(await post('/messages', 'not json'), d)).status).toBe(200);
+    expect(gw.calls).toHaveLength(2);
+  });
+
+  it('an unknown plan (none pushed, stale) refuses inference as a temporary, non-billing failure; reads pass', async () => {
+    const gw = mockGateway(() => Response.json({ object: 'list', data: [] }));
+    const d = await deps({ fetch: gw.fetch, modelAccess: async () => ({ known: false }) });
+    for (const [path, model] of [['/messages', 'claude-opus-5-5'], ['/messages', FLASH], ['/responses', 'gpt-6-astra-code']] as const) {
+      const response = await handleAiProxyRequest(await post(path, JSON.stringify({ model })), d);
+      expect(response.status).toBe(503);
+      expect(await response.json()).toMatchObject({ error: { code: 'os_plan_unavailable', source: 'ezil-os-proxy' } });
+      expect(d.logs.at(-1)).toMatchObject({ status: 503, code: 'os_plan_unavailable' });
+    }
+    expect(gw.calls).toHaveLength(0);
+    const models = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }), d);
+    expect(models.status).toBe(200);
+    expect(models.headers.get('x-ezil-os-included-models')).toBeNull();
+    expect(gw.calls).toHaveLength(1);
+  });
+
+  it('currentModelAccess: only a fresh, well-formed signed push is known; null is an explicit every-model answer', () => {
+    const now = 1_800_000_000_000;
+    expect(currentModelAccess(undefined, now)).toEqual({ known: false });
+    expect(currentModelAccess({ includedModels: [FLASH], signedAt: now - 1000 }, now)).toEqual({ known: true, includedModels: [FLASH] });
+    expect(currentModelAccess({ includedModels: null, signedAt: now - AI_MODEL_ACCESS_MAX_AGE_MS }, now)).toEqual({ known: true, includedModels: null });
+    expect(currentModelAccess({ includedModels: null, signedAt: now - AI_MODEL_ACCESS_MAX_AGE_MS - 1 }, now)).toEqual({ known: false });
+    expect(currentModelAccess({ includedModels: [FLASH], signedAt: now - AI_MODEL_ACCESS_MAX_AGE_MS - 1 }, now)).toEqual({ known: false });
+    for (const includedModels of [undefined, [], ['Bad'], 'gemini-3.8-flash', [1]]) {
+      expect(currentModelAccess({ includedModels, signedAt: now } as never, now)).toEqual({ known: false });
+    }
+    expect(currentModelAccess({ includedModels: null, signedAt: Number.NaN }, now)).toEqual({ known: false });
+  });
+
+  it('names the list on every GET /models answer from this proxy only, and reads it for no other GET', async () => {
+    const catalog = '{"object":"list","data":[]}';
+    const gw = mockGateway(() => new Response(catalog, { headers: { 'content-type': 'application/json', 'x-ezil-os-included-models': 'everything' } }));
+    const reads = { count: 0 };
+    const d = await restricted(gw, reads);
+    const get = async (path: string) => handleAiProxyRequest(new Request(`${HOST}/ai/v1${path}`, { headers: { authorization: await proxyAuth() } }), d);
+    const models = await get('/models');
+    expect(models.status).toBe(200);
+    expect(models.headers.get('x-ezil-os-included-models')).toBe(FLASH);
+    expect(await models.text()).toBe(catalog);
+    expect(reads.count).toBe(1);
+    const balance = await get('/me/balance');
+    expect(balance.headers.get('x-ezil-os-included-models')).toBeNull();
+    expect(reads.count).toBe(1);
+    const open = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }),
+      await deps({ fetch: gw.fetch, modelAccess: async () => ({ known: true, includedModels: null }) }));
+    expect(open.headers.get('x-ezil-os-included-models')).toBeNull();
+  });
+
+  it('relays a credit refusal on the included model unchanged: the OS, not this proxy, chooses upgrade or add credits', async () => {
+    const gw = mockGateway(() => Response.json({ error: { code: 'insufficient_credits', request_id: 'req-credits-1', available_micro: 0, hold_micro: 1200 } },
+      { status: 402, headers: { 'x-ezil-request-id': 'req-credits-1' } }));
+    const d = await restricted(gw);
+    const response = await handleAiProxyRequest(await post('/messages', `{"model":"${FLASH}"}`), d);
+    expect(response.status).toBe(402);
+    expect(await response.json()).toEqual({ error: { code: 'insufficient_credits', request_id: 'req-credits-1', available_micro: 0, hold_micro: 1200 } });
+    expect(response.headers.get('x-ezil-request-id')).toBe('req-credits-1');
+    expect(gw.calls).toHaveLength(1);
+  });
+
+  // The Gateway's used-up credit window (docs/credit-window.md). Code needs the member's own window numbers through this
+  // proxy to say when it resets, or that a request larger than the whole window will not fit by waiting.
+  it('relays a used-up credit window with its own window numbers and reset, and nothing else of the body', async () => {
+    const window = { budget_micro: '5000000', used_micro: '4800000', hold_micro: '400000', resets_at: '2026-11-09T21:05:33.123456+00:00', retry_after_seconds: 5400 };
+    const gw = mockGateway(() => Response.json({ error: { code: 'window_budget_reached', message: USER_JWT, request_id: 'req-window-1', ...window,
+      policy_id: 'pol-internal', account_id: USER_JWT } }, { status: 429, headers: { 'x-ezil-request-id': 'req-window-1', 'retry-after': '5400' } }));
+    const response = await handleAiProxyRequest(await post('/messages', `{"model":"${FLASH}"}`), await restricted(gw));
+    expect(response.status).toBe(429);
+    expect(await response.json()).toEqual({ error: { code: 'window_budget_reached', request_id: 'req-window-1', ...window } });
+    expect([response.headers.get('x-ezil-request-id'), response.headers.get('retry-after')]).toEqual(['req-window-1', '5400']);
+    expect(gw.calls).toHaveLength(1);
+  });
+
+  it('keeps a window that never started (resets_at null) as null, and drops any malformed window number', async () => {
+    const oversized = mockGateway(() => Response.json({ error: { code: 'window_budget_reached', budget_micro: '5000000', used_micro: '0', hold_micro: '6000000',
+      resets_at: null, retry_after_seconds: 7200 } }, { status: 429 }));
+    const kept = await handleAiProxyRequest(await post('/messages', `{"model":"${FLASH}"}`), await restricted(oversized));
+    expect(await kept.json()).toEqual({ error: { code: 'window_budget_reached', budget_micro: '5000000', used_micro: '0', hold_micro: '6000000',
+      resets_at: null, retry_after_seconds: 7200 } });
+    const malformed = mockGateway(() => Response.json({ error: { code: 'window_budget_reached', budget_micro: '12a', used_micro: -1, hold_micro: '1e9',
+      resets_at: 'tomorrow', retry_after_seconds: 1.5 } }, { status: 429 }));
+    const dropped = await handleAiProxyRequest(await post('/messages', `{"model":"${FLASH}"}`), await restricted(malformed));
+    expect(await dropped.json()).toEqual({ error: { code: 'window_budget_reached' } });
+  });
+
+  it('gives no other refusal the window numbers', async () => {
+    for (const [status, code] of [[429, 'daily_budget_reached'], [402, 'insufficient_credits']] as const) {
+      const gw = mockGateway(() => Response.json({ error: { code, budget_micro: '5000000', used_micro: '4800000', hold_micro: '400000',
+        resets_at: '2026-11-09T21:05:33Z', retry_after_seconds: 60 } }, { status }));
+      const response = await handleAiProxyRequest(await post('/messages', `{"model":"${FLASH}"}`), await restricted(gw));
+      expect(await response.json()).toEqual({ error: { code } });
+    }
+  });
+
+  it('accepts only a well-formed pushed list: absent keeps, null is every model, else 1-16 distinct aliases', () => {
+    expect(parsePushedModelAccess(undefined)).toEqual({ ok: true, includedModels: undefined });
+    expect(parsePushedModelAccess(null)).toEqual({ ok: true, includedModels: null });
+    expect(parsePushedModelAccess([FLASH])).toEqual({ ok: true, includedModels: [FLASH] });
+    for (const bad of [[], [FLASH, FLASH], [1], ['Gemini'], [' gemini'], ['a/b'], [`${FLASH}\n`], FLASH, { [FLASH]: true },
+      Array.from({ length: 17 }, (_, i) => `model-${i}`)]) {
+      expect(parsePushedModelAccess(bad)).toEqual({ ok: false, error: 'included_models_malformed' });
+    }
+    expect(requestModel(new TextEncoder().encode(`{"model":"${FLASH}"}`))).toBe(FLASH);
+    expect(requestModel(new TextEncoder().encode('{"model":["x"]}'))).toBeNull();
   });
 });
