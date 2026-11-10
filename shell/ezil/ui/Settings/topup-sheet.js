@@ -113,6 +113,23 @@ export function topupUpgrade (summary) {
 }
 
 /**
+ * Which existing dialog recovers an EZiL AI refusal (founder 2026-11-09: Free includes Gemini 3.8 Flash only).
+ * `reason` is 'insufficient_credits' (Code's credit refusal or its recovery link) or 'model_locked' (a model the plan
+ * does not include, chosen in Code's picker). From the live summary, the plan the computer runs under:
+ *   - Free (no paid access, files held on AWS included): the Standard upgrade (its free month when offered) for both.
+ *     Without a Standard checkout here, a credit refusal falls back to Add credits.
+ *   - Standard or Premium: Add credits for a credit refusal; nothing for a model refusal (every model is included).
+ * Returns `{ action: 'trial' | 'checkout', sku }`, `{ action: 'topup' }` or null.
+ */
+export function billingRecoveryAction (summary, reason) {
+    if ( summary?.enabled !== true || summary.version !== 3 || ! ['insufficient_credits', 'model_locked'].includes(reason) ) return null;
+    const free = summary.plan?.sku === 'free_v3' || ['free', 'files_on_aws'].includes(summary.computer?.standing);
+    const upgrade = free ? topupUpgrade(summary) : null;
+    if ( upgrade && ['trial', 'checkout'].includes(upgrade.action) ) return { action: upgrade.action, sku: upgrade.sku };
+    return reason === 'insufficient_credits' && topupOffer(summary) ? { action: 'topup' } : null;
+}
+
+/**
  * Options: `container`, `summary`, `trpc`, `userId`, `lastAccount`, `preselect` (a pack SKU or 'custom'),
  * `reason` ('insufficient_credits' from the recovery link, else null), `checkout({ pack })` (hands the server's
  * quote to the payment sheet), `upgrade(choice)` and `onClose`. Returns the sheet handle, or the open one.

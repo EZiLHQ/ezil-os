@@ -1,6 +1,6 @@
 // ConfigStore: file loading, last-good retention across invalid rewrites, directory watching (with a fake `vscode`).
 
-import { afterAll, describe, expect, mock, test } from 'bun:test';
+import { afterAll, describe, expect, mock, spyOn, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -9,7 +9,7 @@ import { fakeVscode } from './fixtures/fake-vscode';
 import { isAppFailure } from '../src/failure';
 
 mock.module('vscode', () => fakeVscode);
-const { activate, appStartFailure, CONFIG_ENV, ConfigStore, resolveConfigPath, settingsSnippet } = await import('../src/extension');
+const { activate, appStartFailure, CATALOG_RECOVERY_MS, CONFIG_ENV, ConfigStore, resolveConfigPath, settingsSnippet } = await import('../src/extension');
 const { parseModelsConfig } = await import('../src/config');
 
 const VALID = JSON.stringify({ providers: { p: { type: 'openai', apiKey: 'sk-abc-12345' } }, models: [{ id: 'm', provider: 'p', model: 'gpt-5.5', roles: ['default', 'utility'] }] });
@@ -58,6 +58,32 @@ describe('activation app failure', () => {
                 if (previousPath === undefined) delete process.env[CONFIG_ENV]; else process.env[CONFIG_ENV] = previousPath;
             }
         });
+    }
+});
+
+test('activation schedules model-list recovery and disposal stops it', async () => {
+    const configPath = path.join(root, 'recovery.json');
+    fs.writeFileSync(configPath, VALID);
+    const previousPath = process.env[CONFIG_ENV];
+    const window = fakeVscode.window as Record<string, unknown>;
+    const commands = fakeVscode.commands as Record<string, unknown>;
+    const savedWindow = { ...window }, savedCommands = { ...commands };
+    const context = { subscriptions: [] as { dispose(): void }[] };
+    const intervals = spyOn(globalThis, 'setInterval'), cleared = spyOn(globalThis, 'clearInterval');
+    process.env[CONFIG_ENV] = configPath;
+    Object.assign(window, { createOutputChannel: () => ({ appendLine() {}, show() {}, dispose() {} }), createStatusBarItem: () => ({ show() {}, dispose() {} }) });
+    Object.assign(commands, { registerCommand: () => ({ dispose() {} }), executeCommand: async () => {} });
+    try {
+        await activate(context as never);
+        const scheduled = intervals.mock.calls.flatMap((call, i) => call[1] === CATALOG_RECOVERY_MS ? [intervals.mock.results[i]!.value] : []);
+        expect(scheduled).toHaveLength(1);
+        for (const subscription of context.subscriptions) subscription.dispose();
+        expect(cleared.mock.calls.some(([handle]) => handle === scheduled[0])).toBe(true);
+    } finally {
+        intervals.mockRestore(); cleared.mockRestore();
+        for (const key of Object.keys(window)) delete window[key]; Object.assign(window, savedWindow);
+        for (const key of Object.keys(commands)) delete commands[key]; Object.assign(commands, savedCommands);
+        if (previousPath === undefined) delete process.env[CONFIG_ENV]; else process.env[CONFIG_ENV] = previousPath;
     }
 });
 

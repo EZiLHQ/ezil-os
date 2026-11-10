@@ -53,6 +53,15 @@ jobs:
       image_changed: ${{ steps.image_changes.outputs.changed }}
       image_source: ${{ steps.image_changes.outputs.source }}
     steps:
+      # Expression == ignores case; every image and deploy job needs this job.
+      - name: Refuse case variants of admitted refs
+        run: |
+          for ref in refs/heads/preview refs/heads/main refs/heads/staging/os-union-20261106; do
+            if [[ "${GITHUB_REF,,}" == "$ref" && "$GITHUB_REF" != "$ref" ]]; then
+              echo "::error::$GITHUB_REF is a case variant of $ref"
+              exit 1
+            fi
+          done
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -75,6 +84,16 @@ jobs:
                 && ['push', 'workflow_dispatch'].includes(run.event)
                 && run.id !== context.runId).sort((a,b) => Date.parse(b.updated_at) - Date.parse(a.updated_at))[0];
               if (!run) return;
+              // A manual union run also deploys staging. If one ran after this baseline,
+              // staging may serve its container, so the preview receipt is stale: rebuild.
+              if (branch === 'preview') {
+                const union = await github.rest.actions.listWorkflowRuns({
+                  ...context.repo, workflow_id: 'preview.yml', branch: 'staging/os-union-20261106',
+                  event: 'workflow_dispatch', per_page: 100,
+                });
+                if (union.data.workflow_runs.some(other => other.path === '.github/workflows/preview.yml'
+                    && !(Date.parse(other.updated_at) < Date.parse(run.created_at)))) return;
+              }
               core.setOutput('run', String(run.id));
               core.setOutput('sha', run.head_sha);
               core.setOutput('artifact', `live-evidence-${branch}-${run.id}-${run.run_attempt}`);
@@ -135,16 +154,20 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: live-changes-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Artifact names cannot contain the union branch's slash.
+          name: live-changes-${{ github.ref == 'refs/heads/staging/os-union-20261106' && 'staging-os-union-20261106' || github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: live-evidence
           if-no-files-found: warn
 
   images:
     name: Build and test release images
     needs: changes
+    # The qualified staging union is admitted only by a manual dispatch of that exact
+    # branch; it builds and deploys this run's own github.sha like a preview push.
     if: >-
       needs.changes.outputs.image_changed == 'true' &&
-      (github.ref == 'refs/heads/preview' || github.ref == 'refs/heads/main')
+      (github.ref == 'refs/heads/preview' || github.ref == 'refs/heads/main' ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/staging/os-union-20261106'))
     permissions:
       contents: read
       packages: write
@@ -160,7 +183,9 @@ jobs:
     needs: [changes, images]
     # A skipped image build must not skip deployments for app/Worker-only pushes.
     if: >-
-      ${{ !cancelled() && github.ref == 'refs/heads/preview' &&
+      ${{ !cancelled() &&
+          (github.ref == 'refs/heads/preview' ||
+           (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/staging/os-union-20261106')) &&
           needs.changes.result == 'success' &&
           (needs.images.result == 'success' || needs.images.result == 'skipped') }}
     runs-on: ubuntu-latest
@@ -393,7 +418,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: live-evidence-${{ github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          name: live-evidence-${{ github.ref == 'refs/heads/staging/os-union-20261106' && 'staging-os-union-20261106' || github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             live-evidence
             hosted-continuity-evidence/container-rollout.json
