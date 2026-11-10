@@ -134,6 +134,12 @@ export async function main(env = process.env) {
         const submitted = await record('submit', async evidence => {
             await dialog.locator('#ezil-feedback-description').fill(marker);
             await dialog.locator('input[name="diagnostics"]').check();
+            // Screenshots are selected by default where enabled; this run submits a text + diagnostics report only.
+            const screenshotBox = dialog.locator('input[name="screenshot"]');
+            if (await screenshotBox.count()) await screenshotBox.uncheck();
+            // The preview renders only while it is open.
+            await dialog.locator('.ezil-feedback-preview summary').click();
+            await page.waitForFunction(() => document.querySelector('.ezil-feedback-preview pre')?.textContent.length > 0);
             const preview = JSON.parse(await dialog.locator('.ezil-feedback-preview pre').textContent());
             evidence.clientRequestId = preview.clientRequestId;
             evidence.diagnosticsKeys = Object.keys(preview.diagnostics ?? {}).sort();

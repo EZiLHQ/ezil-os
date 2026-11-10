@@ -127,8 +127,10 @@ function isStripeModalFrame (iframe) {
 
 /**
  * `trial: true` (Standard only) is the free month: the sheet first asks `billing.quoteTrial` for the exact end, shows
- * it in the viewer's zone with what is charged and when, and only on Continue opens `billing.createCheckout({ sku,
- * trial: { trialEndsAt } })` with that same end. Payment then runs exactly as the Standard checkout does ($0 today).
+ * it in the viewer's zone with what is charged and when (a passive terms line above the payment form, no extra
+ * confirmation step), and opens `billing.createCheckout({ sku, trial: { trialEndsAt } })` with that same end. Payment
+ * then runs exactly as the Standard checkout does ($0 today). A stale end is re-quoted once automatically; a second
+ * one stops at an explicit Retry.
  */
 export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, onDone, onClose, onCancel, userId = null, loadStripe = defaultLoadStripe, now = Date.now, trial = false, timeZone }) {
     container = container?.get?.(0) ?? container;
@@ -154,6 +156,8 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
     const trialMode = ! pack && trial === true && sku === TRIAL_SKU;
     /** The disclosed quote (`trialQuote`); null until `billing.quoteTrial` answers. Checkout echoes its end exactly. */
     let quote = null;
+    /** A stale quote is re-quoted automatically once per open; the next one waits for an explicit Retry. */
+    let staleRetried = false;
     const name = pack ? 'AI credits' : v3 ? offer.name : planName(offer.family);
     const price = trialMode ? '$0' : dollars(pack ? pack.totalCents : offer.priceCents, { compact: true });
     const allowance = pack ? `${pack.aiCredits.toLocaleString('en-US')} AI credits`
@@ -200,6 +204,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
                 <p class="ezil-upgrade-security"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></svg><span>Payments are processed securely by Stripe.</span></p>
             </details>
             <section class="ezil-upgrade-payment" aria-label="Secure payment">
+                ${trialMode ? '<div data-role="trial-terms" aria-live="polite" hidden></div>' : ''}
                 <div data-role="checkout-state" role="status" aria-live="polite"></div>
                 <div id="ezil-embedded-checkout"></div>
             </section>
@@ -311,12 +316,22 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
             : 'Cancel before your free month ends and you pay nothing.');
         set('trial-renews', `A payment method is required. ${amount} is charged monthly from the end of your free month unless you cancel.`);
     }
-    /** The confirmation step: the exact quoted end in the viewer's zone, what is charged from then, and Continue. */
-    function showTrialConfirm (changed = false) {
-        const hadFocus = state.contains(doc.activeElement);
-        state.replaceChildren();
-        const box = doc.createElement('div');
-        box.dataset.role = 'trial-confirm';
+    /**
+     * The passive terms line above the payment form (never cleared by `show()`/`embed()`, so it stays visible in the
+     * compact layout where the summary column is collapsed): the exact quoted end in the viewer's zone and what is
+     * charged from then. No button: the checkout opens on its own. `changed` adds the new-date notice.
+     */
+    /** Terminal and error states say nothing was started or charged: the quoted terms must not sit beside them. */
+    function hideTrialTerms () {
+        const box = dialog.querySelector('[data-role="trial-terms"]');
+        if ( box ) box.hidden = true;
+        // The wide summary column shows the quoted date too: drop the quote so it does not sit beside the error either.
+        if ( quote ) { quote = null; renderTrialTerms(); }
+    }
+    function showTrialTerms (changed = false) {
+        const box = dialog.querySelector('[data-role="trial-terms"]');
+        if ( ! box || ! quote ) return;
+        box.replaceChildren();
         const line = (text, role) => {
             const p = doc.createElement('p');
             if ( text ) p.textContent = text;
@@ -324,22 +339,14 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
             box.append(p);
             return p;
         };
-        if ( changed ) line(errorCopy('trial_quote_stale'), 'trial-changed');
+        if ( changed ) line("Your free month's end date changed. The new date is below.", 'trial-changed');
         const ends = line('', 'trial-ends');
         const time = doc.createElement('time');
         time.dateTime = quote.trialEndsAt;
         time.textContent = trialMoment(true);
         ends.append('Your free month ends on ', time, '.');
-        line(`A payment method is required. ${trialAmount()} is charged monthly from that date unless you cancel.`, 'trial-charge');
-        line('Cancel any time before then in Settings → Billing and you pay nothing.', 'trial-cancel');
-        const button = doc.createElement('button');
-        button.type = 'button';
-        button.textContent = 'Continue';
-        button.dataset.action = 'trial-continue';
-        button.addEventListener('click', () => { if ( ! closed && ! busy ) void create(); });
-        box.append(button);
-        state.append(box);
-        if ( hadFocus || changed ) button.focus();
+        line(`A payment method is required. ${trialAmount()} is charged monthly from that date unless you cancel. Cancel any time before then in Settings → Billing and you pay nothing.`, 'trial-charge');
+        box.hidden = false;
     }
     /** `billing.quoteTrial`: claim this person's trial and fix the end shown above. `changed`: the last one went stale. */
     async function requote (changed = false) {
@@ -356,10 +363,13 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         if ( next ) {
             quote = next;
             renderTrialTerms();
-            showTrialConfirm(changed);
+            showTrialTerms(changed);
+            // No confirmation step: the quote is disclosed above the form and checkout opens with exactly that end.
+            void create();
             return;
         }
         // Not this person's to start (or already starting): back to Billing, which re-reads the offer.
+        hideTrialTerms();
         if ( failure?.code === 'trial_unavailable' || failure?.code === 'trial_checkout_complete' ) show(failure.message, 'Back to Billing', returnToBilling, 'return-to-billing');
         else show(failure?.message || errorCopy('unavailable'), 'Retry', () => { void requote(changed); });
     }
@@ -456,6 +466,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
                 if ( result.status === 'expired' ) {
                     finished = true;
                     clearTimers();
+                    hideTrialTerms();
                     show(trialMode ? 'This checkout expired, so nothing was charged. Close this and start your free month again.' : 'This checkout has expired. Close the sheet and try again.');
                     return;
                 }
@@ -538,7 +549,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
     }
     async function create () {
         if ( closed || busy ) return;
-        // Standard trial: no checkout before the person has seen the exact end; Continue comes back here.
+        // Standard trial: no checkout before the exact end is quoted and shown above the form; a successful quote comes back here.
         if ( trialMode && ! quote ) { await requote(); return; }
         busy = true;
         show('Preparing your checkout…');
@@ -563,12 +574,26 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
             session = null;
             // Standard trial: a stale quote is re-quoted and its NEW end shown before anything else; a refused or
             // already-starting trial goes back to Billing, never to a paid checkout.
-            if ( trialMode && error?.code === 'trial_quote_stale' ) stale = true;
-            else if ( closed ) { /* Nothing to show. */ }
-            else if ( trialMode && TRIAL_ERRORS.has(error?.code) ) show(error.message, 'Back to Billing', returnToBilling, 'return-to-billing');
+            if ( trialMode && error?.code === 'trial_quote_stale' ) {
+                // One automatic re-quote per open; a second stale end stops at an explicit Retry (no checkout loop).
+                if ( staleRetried ) {
+                    if ( ! closed ) {
+                        // The date shown is the one that just went stale: hide it until Retry quotes a fresh one.
+                        hideTrialTerms();
+                        show("Your free month's end date changed again. Try again to see the new date.", 'Retry', () => { quote = null; void create(); });
+                    }
+                } else { staleRetried = true; stale = true; }
+            } else if ( closed ) { /* Nothing to show. */ }
+            else if ( trialMode && TRIAL_ERRORS.has(error?.code) ) { hideTrialTerms(); show(error.message, 'Back to Billing', returnToBilling, 'return-to-billing'); }
             else show(error?.message || 'Could not open billing. Try again.', 'Retry', () => { void create(); });
         } finally { busy = false; }
-        if ( stale && ! closed ) { quote = null; renderTrialTerms(); void requote(true); return; }
+        if ( stale && ! closed ) {
+            quote = null;
+            dialog.querySelector('[data-role="trial-terms"]').hidden = true;
+            renderTrialTerms();
+            void requote(true);
+            return;
+        }
         if ( ! closed && session?.mode === 'embedded' ) void embed();
     }
     renderTrialTerms();

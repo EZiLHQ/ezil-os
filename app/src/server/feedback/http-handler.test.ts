@@ -62,7 +62,7 @@ describe('feedback HTTP boundary', () => {
 
     it.each([
         { ...VALID, userId: USER.id }, { ...VALID, clientRequestId: 'bad-uuid' }, { ...VALID, computerId: 'bad-uuid' },
-        { ...VALID, description: 'x'.repeat(4001) }, { ...VALID, description: '  ' },
+        { ...VALID, description: 'x'.repeat(4001) },
         { ...VALID, diagnostics: { cookie: 'never collect' } },
         { ...VALID, diagnostics: { browser: { family: 'Chrome', major: 130, email: 'private@example.com' } } },
         { ...VALID, screenshot: { ...SCREENSHOT, width: 1 } },
@@ -160,6 +160,20 @@ describe('feedback HTTP boundary', () => {
         const h = harness(); const response = await handleFeedbackRequest(request(), h.deps);
         expect(response.status).toBe(201); expect(await response.json()).toEqual({ id: expect.any(String), createdAt: NOW.toISOString(), screenshotAccepted: false });
         expect(h.statements.some((s) => s.sql.startsWith('insert'))).toBe(true);
+    });
+
+    it.each(['', '   \n '])('stores a blank description (one optional field) with its screenshot or diagnostics: %j', async (description) => {
+        const h = harness(); h.deps.env.EZIL_OS_FEEDBACK_SCREENSHOTS = '1';
+        const response = await handleFeedbackRequest(request({ ...VALID, description, screenshot: SCREENSHOT, diagnostics: { shellVersion: '1' } }), h.deps);
+        expect(response.status).toBe(201);
+        expect(h.statements.some((s) => s.sql.startsWith('insert') && s.sql.includes('ezil_feedback_reports') && s.params.includes(''))).toBe(true);
+    });
+
+    it('still bounds the description length and requires the field', async () => {
+        for (const description of ['x'.repeat(FEEDBACK_LIMITS.descriptionMax + 1), undefined]) {
+            const h = harness(); const response = await handleFeedbackRequest(request({ ...VALID, description }), h.deps);
+            expect(response.status).toBe(400); expect(h.statements).toEqual([]);
+        }
     });
 
     it('accepts an explicit null screenshot when screenshots are off (the shell always sends the key)', async () => {
