@@ -219,6 +219,12 @@ try {
             assert.equal(await page.locator('button[type="submit"]').isDisabled(), false, 'a blank report is sendable: nothing is required');
             assert.equal(await page.locator('[name="category"], [name="steps"], select').count(), 0, 'one description, no questionnaire');
             assert.equal(await page.locator('input[name="diagnostics"]').isChecked(), true, 'diagnostics are selected by default');
+            // The always-visible server-context notice does not depend on the diagnostics checkbox.
+            const contextNote = page.locator('[data-role="server-context-note"]');
+            assert.equal(await contextNote.isVisible(), true, 'the server-context notice is visible with diagnostics on');
+            await page.locator('input[name="diagnostics"]').uncheck();
+            assert.equal(await contextNote.isVisible(), true, 'and with diagnostics off (the unchecked opt-out)');
+            await page.locator('input[name="diagnostics"]').check();
             await description.fill('[synthetic r3] browser test report');
             await page.locator('.ezil-feedback-preview summary').click();
             const shown = await preview();

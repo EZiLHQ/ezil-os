@@ -630,6 +630,23 @@ try {
         assert.doesNotMatch(JSON.stringify(payload()), /serverContext/);
         close();
     });
+    await check('the server-context notice stays visible with diagnostics on or off; on is the default and unchecking it sends no diagnostics', async () => {
+        const visible = el => { for ( let n = el; n && n !== document; n = n.parentElement ) { const s = window.getComputedStyle(n); if ( n.hidden || s.display === 'none' || s.visibility === 'hidden' ) return false; } return true; };
+        open();
+        const note = () => current().querySelector('[data-role="server-context-note"]');
+        assert.equal(form().elements.diagnostics.checked, true, 'selected by default');
+        assert.equal(visible(note()), true, 'the notice is shown with diagnostics on');
+        change('diagnostics', false);
+        assert.equal(visible(note()), true, 'the notice does not depend on the checkbox');
+        assert.equal(payload().diagnostics, null, 'opt-out: no diagnostics in the body, so the server adds no context (it only does so for a report carrying diagnostics)');
+        const requests = calls.length;
+        await tick();
+        send();
+        await until(() => calls.length === requests + 1);
+        assert.equal(JSON.parse(calls.at(-1).body).diagnostics, null, 'the sent report carries no diagnostics');
+        await until(() => status().includes(reportId));
+        close();
+    });
     await check('expanded diagnostics are consented, frozen, refreshed and downgraded on a strict old server', async () => {
         window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle = true;
         open(); setDescription('Snapshot test');
