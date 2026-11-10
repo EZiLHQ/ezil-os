@@ -2,7 +2,7 @@
  * `POST /api/shell/code-preview-url` with `repository: {url}` (founder 547ed35a: `/app/code?repo=<https URL>`).
  *
  * Same boundaries as route-project.test.ts: the tRPC caller and the placement read are stubbed; the resolver
- * (`@/server/works/repo-url`) and the Worker client (`@/server/lib/compute/repo-open`) are REAL behind one stubbed
+ * (`@/server/git/repo-url`) and the Worker client (`@/server/lib/compute/repo-open`) are REAL behind one stubbed
  * `fetch`, with github.com answering a real git-upload-pack advertisement. What they prove: nothing is read for an
  * address that is not one; ownership, then the provider, then GitHub, then the mint, then the Worker; a missing or
  * private repository is "This repository doesn't exist." before the computer is woken; the Worker is asked
@@ -19,6 +19,8 @@ const COMPUTER = '22222222-2222-4222-8222-222222222222';
 const PROJECT = '3333abcd-3333-4333-8333-33333333cdef';
 const REPO = '44444444-4444-4444-8444-444444444444';
 const ID_TOKEN = 'eyJhbGciOiJSUzI1NiJ9.private-retained-id-token.signature';
+const PRIVATE_GIT_TOKEN = 'opaque-gateway-credential';
+const EZIL_URL = 'https://github.ezil.work/default/os-code-url-20261110-a.git';
 /** An opaque Cloudflare Artifacts repo token, as Universe hands it out. */
 const GIT_TOKEN = `art_v1_${'f'.repeat(64)}`;
 const SECRET = 'route-test-hmac-secret';
@@ -33,6 +35,8 @@ const s = vi.hoisted(() => ({
     order: [] as string[],
     owned: true,
     identity: 'ok' as 'ok' | 'missing',
+    sessionId: 'session-a',
+    swapSessionOnMint: false,
     aws: [false, false] as boolean[],
     preview: { ok: true } as Record<string, unknown>,
     /** How long the stubbed Code mint takes, ms of `Date.now()`. */
@@ -41,6 +45,7 @@ const s = vi.hoisted(() => ({
     universe: null as null | ((body: unknown) => Response),
     worker: null as null | ((body: string) => Response),
     github: null as null | ((url: URL, init: RequestInit) => Response),
+    gateway: null as null | ((scope: 'read' | 'write') => Response),
     requests: [] as { url: URL; init: RequestInit }[],
     cleared: 0,
     /** What the route handed the Code mint (per-tab folder continuity: never a `codeFolder` with a project). */
@@ -55,14 +60,16 @@ vi.mock('@/server/api/root', () => ({ appRouter: { createCaller: () => ({
         return { id };
     } },
     cloudflareGuacamole: { codePreviewUrl: async (input: unknown) => {
-        s.order.push('codePreviewUrl'); s.mintInputs.push(input); s.skew += s.mintTakes; return s.preview;
+        s.order.push('codePreviewUrl'); s.mintInputs.push(input); s.skew += s.mintTakes;
+        if (s.swapSessionOnMint) s.sessionId = 'session-b';
+        return s.preview;
     } },
 }) } }));
 vi.mock('@/server/auth/retained-identity', () => ({
     retainedIdentity: async (userId: string) => {
         s.order.push('identity');
         if (s.identity === 'missing' || userId !== USER) throw new Error('IDENTITY_REFRESH_REQUIRED');
-        return { token: ID_TOKEN, issuer: 'https://id.ezil.work/', subject: 'auth0|builder', expiresAt: Date.now() + 3_600_000, userId: USER, sessionId: 'session-a' };
+        return { token: ID_TOKEN, issuer: 'https://id.ezil.work/', subject: 'auth0|builder', expiresAt: Date.now() + 3_600_000, userId: USER, sessionId: s.sessionId };
     },
     clearProjectIdentity: async () => { s.cleared += 1; },
 }));
@@ -91,13 +98,19 @@ const grant = (over: Record<string, unknown> = {}) => ({
     git: { username: 'ezil', token: GIT_TOKEN, expiresAt: new Date(Date.now() + 240_000).toISOString(), scope: 'write' },
     ...over,
 });
+const standalonePacket = (scope: 'read' | 'write') => ({ version: 2,
+    repository: { id: 'fg1wtcrexaf7acl0', canonicalURL: EZIL_URL, ref: 'refs/heads/main' },
+    identity: { issuer: 'https://id.ezil.work/', subject: 'auth0|builder' },
+    git: { username: 'ezil', token: PRIVATE_GIT_TOKEN, expiresAt: new Date(Date.now() + 240_000).toISOString(), scope } });
 
 let logs: ReturnType<typeof vi.spyOn>[];
 beforeEach(() => {
-    Object.assign(s, { order: [], owned: true, identity: 'ok', aws: [false, false], requests: [], cleared: 0, mintTakes: 0, skew: 0, mintInputs: [],
+    Object.assign(s, { order: [], owned: true, identity: 'ok', sessionId: 'session-a', swapSessionOnMint: false,
+        aws: [false, false], requests: [], cleared: 0, mintTakes: 0, skew: 0, mintInputs: [],
         preview: { ok: true, correlationId: 'c', codePreviewUrl: MINTED, expiresAt: Date.now() + 300_000, provider: 'cloudflare-guacamole' },
         universe: () => Response.json(grant()),
         worker: () => Response.json({ folder: `/workspace/projects/${REPO}`, head: 'b'.repeat(40) }),
+        gateway: (scope: 'read' | 'write') => Response.json(standalonePacket(scope)),
         github: () => new Response(advertisement('refs/heads/main'), { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-advertisement' } }) });
     vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN', UNIVERSE);
     vi.stubEnv('CLOUDFLARE_GUACAMOLE_HMAC_SECRET', SECRET);
@@ -108,6 +121,7 @@ beforeEach(() => {
         if (url.origin === UNIVERSE) { s.order.push('universe'); return s.universe!(JSON.parse(String(init.body))); }
         if (url.origin === WORKER) { s.order.push('worker'); return s.worker!(String(init.body)); }
         if (url.origin === 'https://github.com') { s.order.push('github'); return s.github!(url, init); }
+        if (url.origin === 'https://github.ezil.work') { s.order.push('gateway'); return s.gateway!(JSON.parse(String(init.body)).scope); }
         throw new Error(`unexpected fetch ${url.origin}`);
     }));
     logs = [vi.spyOn(console, 'log').mockImplementation(() => {}), vi.spyOn(console, 'info').mockImplementation(() => {}),
@@ -124,7 +138,7 @@ const post = (body: unknown) => POST(new Request('https://os-staging.example/api
 async function expectNoSecrets(response: Response) {
     const text = await response.clone().text();
     const logged = JSON.stringify(logs.flatMap(l => l.mock.calls));
-    for (const secret of [GIT_TOKEN, 'art_v1_', 'egg_', ID_TOKEN, 'eyJ', ACCOUNT, 'artifacts.cloudflare.net']) {
+    for (const secret of [GIT_TOKEN, PRIVATE_GIT_TOKEN, 'art_v1_', 'egg_', ID_TOKEN, 'eyJ', ACCOUNT, 'artifacts.cloudflare.net']) {
         expect(text).not.toContain(secret);
         expect(logged).not.toContain(secret);
     }
@@ -137,7 +151,7 @@ const openUrl = (url: unknown = GH) => post({ computerId: COMPUTER, intent: 'ope
 
 describe('opening a repository from its address in Code', () => {
     it('ownership, provider, GitHub, mint, Worker: in that order; answers the folder URL and the name, nothing secret', async () => {
-        const { repositoryIdFor } = await import('@/server/works/repo-url');
+        const { repositoryIdFor } = await import('@/server/git/repo-url');
         const id = repositoryIdFor(CANONICAL);
         s.worker = () => Response.json({ folder: `/workspace/projects/${id}`, head: 'b'.repeat(40) });
         const response = await openUrl();
@@ -271,5 +285,67 @@ describe('opening a repository from its address in Code', () => {
         const response = await openUrl();
         expect(response.status).toBe(409);
         expect(s.order).toEqual(['computer.get', 'target', 'github', 'codePreviewUrl', 'target']);
+    });
+});
+
+describe('standalone EZiL Git URL open', () => {
+    it('grants before Code wakes and sends v2 CLI packet for the owned Cloudflare computer', async () => {
+        const { repositoryIdFor } = await import('@/server/git/repo-url');
+        const checkout = repositoryIdFor(EZIL_URL);
+        s.worker = body => Response.json({ ok: true, folder: `/workspace/projects/${JSON.parse(body).repositoryId}` });
+        const response = await openUrl(EZIL_URL);
+        expect(response.status).toBe(200);
+        expect(s.order).toEqual(['computer.get', 'target', 'identity', 'gateway', 'identity', 'codePreviewUrl', 'identity', 'target', 'worker']);
+        const gateway = s.requests.find(r => r.url.origin === 'https://github.ezil.work')!;
+        expect(gateway.url.toString()).toBe('https://github.ezil.work/v2/git/grant');
+        expect(JSON.parse(String(gateway.init.body))).toEqual({ repoURL: EZIL_URL, scope: 'write' });
+        expect(new Headers(gateway.init.headers).get('authorization')).toBe(`Bearer ${ID_TOKEN}`);
+        const worker = s.requests.find(r => r.url.origin === WORKER)!;
+        expect(JSON.parse(String(worker.init.body))).toMatchObject({ repositoryId: checkout,
+            privatePacket: { version: 2, repository: { id: 'fg1wtcrexaf7acl0', canonicalURL: EZIL_URL, ref: 'refs/heads/main' } } });
+        expect(JSON.parse(String(worker.init.body)).repositoryId).not.toBe(JSON.parse(String(worker.init.body)).privatePacket.repository.id);
+        await expectNoSecrets(response);
+        const answer = await response.json();
+        expect(answer.repository).toEqual({ name: 'default/os-code-url-20261110-a', id: checkout });
+        expect(new URL(answer.codePreviewUrl).searchParams.getAll('folder')).toEqual([`/workspace/projects/${checkout}`]);
+        expect(s.requests.some(r => r.url.origin === UNIVERSE)).toBe(false);
+    });
+    it('uses an actual read grant only after a write 403', async () => {
+        s.gateway = scope => scope === 'write' ? new Response(null, { status: 403 }) : Response.json(standalonePacket('read'));
+        s.worker = body => Response.json({ ok: true, folder: `/workspace/projects/${JSON.parse(body).repositoryId}` });
+        expect((await openUrl(EZIL_URL)).status).toBe(200);
+        expect(s.requests.filter(r => r.url.origin === 'https://github.ezil.work').map(r => JSON.parse(String(r.init.body)).scope)).toEqual(['write', 'read']);
+        const worker = s.requests.find(r => r.url.origin === WORKER)!;
+        expect(JSON.parse(String(worker.init.body)).privatePacket.git.scope).toBe('read');
+    });
+    it('a 401 requests OAuth refresh before Code wakes; an unowned computer reaches no grant', async () => {
+        s.gateway = () => new Response(null, { status: 401 });
+        const response = await openUrl(EZIL_URL);
+        expect(response.status).toBe(409);
+        expect((await response.json()).error.code).toBe('IDENTITY_REFRESH_REQUIRED');
+        expect(s.order).toEqual(['computer.get', 'target', 'identity', 'gateway']);
+        expect(s.cleared).toBe(1);
+        s.order = []; s.requests = []; s.owned = false;
+        expect((await openUrl(EZIL_URL)).status).toBe(404);
+        expect(s.order).toEqual(['computer.get']);
+        expect(s.requests).toEqual([]);
+    });
+    it('a session switch during Code wake sends no credential to the Worker', async () => {
+        s.swapSessionOnMint = true;
+        const response = await openUrl(EZIL_URL);
+        expect(response.status).toBe(409);
+        expect((await response.json()).error.code).toBe('IDENTITY_REFRESH_REQUIRED');
+        expect(s.order).toEqual(['computer.get', 'target', 'identity', 'gateway', 'identity', 'codePreviewUrl', 'identity']);
+        expect(s.requests.some(r => r.url.origin === WORKER)).toBe(false);
+    });
+    it('refreshes a grant made short by Code wake, preserving provider ID and ref', async () => {
+        s.mintTakes = 90_000;
+        s.gateway = scope => Response.json({ ...standalonePacket(scope), git: { ...standalonePacket(scope).git,
+            expiresAt: new Date(Date.now() + 150_000).toISOString() } });
+        s.worker = body => Response.json({ ok: true, folder: `/workspace/projects/${JSON.parse(body).repositoryId}` });
+        expect((await openUrl(EZIL_URL)).status).toBe(200);
+        expect(s.order.filter(event => event === 'gateway')).toHaveLength(2);
+        const body = JSON.parse(String(s.requests.find(r => r.url.origin === WORKER)!.init.body));
+        expect(Date.parse(body.privatePacket.git.expiresAt) - Date.now()).toBeGreaterThan(body.timeoutMs);
     });
 });

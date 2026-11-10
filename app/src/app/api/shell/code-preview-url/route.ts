@@ -238,35 +238,34 @@ const repoUrlInvalid = () => shellRefusal(400, 'repo_url_invalid', "This isn't a
  * Open a repository from its address (`/app/code?repo=<URL-encoded https URL>`, founder 547ed35a), on the caller's
  * own selected computer, with its own provider and plan rules. In this order, each step only after the one before:
  *
- *  1. the address is one canonical public github.com repository (`parseRepositoryUrl`), else `repo_url_invalid`
- *     (400) or, for EZiL Git's own hosts, `repo_url_unsupported` (409), before anything is read;
+ *  1. the address is one canonical public github.com or standalone github.ezil.work repository;
  *  2. the computer is the caller's own (`computer.get`: NOT_FOUND otherwise);
  *  3. it is a Cloudflare computer (AWS: `repo_open_unsupported_provider`, 409; os-builder-project-open-v1 §8);
- *  4. the repository exists publicly and has a default branch: one anonymous read (`resolvePublicGitHub`); a missing
- *     or private one is "This repository doesn't exist." (404), before the computer is woken for it;
+ *  4. public GitHub is resolved anonymously; standalone EZiL Git is granted under this session's retained OAuth
+ *     identity before Code wakes, and the gateway's v2 packet binds its actual provider repository ID and ref;
  *  5. Code is minted exactly as without a repository (the same wake loop, Free policy and billing gates);
  *  6. the Worker fetches it anonymously into `<root>/projects/<id>` (`repositoryIdFor`: the same folder on every
  *     reopen, which then fetches only and keeps uncommitted work) and only that folder goes into the URL.
  *
- * No credential is sent anywhere: EZiL ID grants nothing on GitHub, and a private repository is not opened this way.
+ * A standalone credential is sent only in the signed Worker body, then to the bundled CLI on private fd 3.
  */
 async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: {
     computerId: string; intent: unknown; repository: unknown; startedAt: number; signal: AbortSignal;
 }) {
     const { computerId, intent, startedAt } = request;
-    const { parseRepositoryUrl, repositoryIdFor, resolvePublicGitHub } = await import('@/server/works/repo-url');
+    const { parseRepositoryUrl, repositoryIdFor, resolvePublicGitHub } = await import('@/server/git/repo-url');
     const raw = typeof request.repository === 'object' && request.repository !== null && !Array.isArray(request.repository)
         && Object.keys(request.repository).length === 1 ? (request.repository as { url?: unknown }).url : undefined;
     const parsed = parseRepositoryUrl(raw);
     if (!parsed.ok) {
         return parsed.reason === 'unsupported_host'
-            ? shellRefusal(409, 'repo_url_unsupported', 'Open this EZiL Git repository from its project in Universe for now.')
+            ? shellRefusal(409, 'repo_url_unsupported', 'This Git host is not available for direct URL opens.')
             : repoUrlInvalid();
     }
     // The Worker fetches a public github.com repository only on os-staging (`repoOpenRemotesFor`); any other
     // deployment would wake the computer for an open it then refuses. Refused first, with nothing read or woken.
-    const { stagingGitQaAccepted } = await import('@/server/works/project-repo');
-    if (!stagingGitQaAccepted()) {
+    const { standaloneGitUrlEnabled } = await import('@/server/git/staging');
+    if (!standaloneGitUrlEnabled()) {
         return shellRefusal(409, 'repo_url_not_enabled', "Opening a repository from its address isn't available here yet.");
     }
     const left = () => startedAt + PROJECT_OPEN_BUDGET_MS - Date.now();
@@ -275,8 +274,8 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     await caller.computer.get({ id: computerId });
     if (isAws(await target(ctx, computerId))) return unsupportedProvider();
 
-    const resolved = await resolvePublicGitHub(parsed.canonicalURL, { signal: deadline });
-    if (!resolved.ok) {
+    const resolved = parsed.host === 'github.com' ? await resolvePublicGitHub(parsed.canonicalURL, { signal: deadline }) : null;
+    if (resolved && !resolved.ok) {
         console.warn('[shell] code-preview-url repository refused', { code: resolved.reason });
         if (resolved.reason === 'not_found') return shellRefusal(404, 'repo_not_found', "This repository doesn't exist.");
         if (resolved.reason === 'moved') return shellRefusal(409, 'repo_url_moved', 'This repository has moved. Open it from its new address.');
@@ -284,12 +283,58 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
         return shellRefusal(503, 'repo_url_unavailable', "We couldn't reach this repository. Try again.");
     }
 
+    const loadIdentity = async () => {
+        const { retainedIdentity } = await import('@/server/auth/retained-identity');
+        try { return await retainedIdentity(ctx.user.id); } catch { return null; }
+    };
+    const identity = parsed.host === 'github.ezil.work' ? await loadIdentity() : null;
+    if (parsed.host === 'github.ezil.work' && !identity) {
+        return shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
+    }
+    const sameSession = async () => {
+        if (!identity) return true;
+        const current = await loadIdentity();
+        return Boolean(current && current.sessionId === identity.sessionId
+            && current.issuer === identity.issuer && current.subject === identity.subject);
+    };
+    const loadGrant = async () => {
+        const { grantForStandaloneGit, GitAccessError } = await import('@/server/git/access');
+        try { return await grantForStandaloneGit(identity!, parsed.canonicalURL, { signal: deadline }); }
+        catch (error) {
+            const code = error instanceof GitAccessError ? error.code : 'unavailable';
+            console.warn('[shell] code-preview-url standalone Git refused', { code });
+            if (code === 'identity_refused') {
+                const { clearProjectIdentity } = await import('@/server/auth/retained-identity');
+                try { await clearProjectIdentity(); } catch { /* the next request asks for a fresh identity */ }
+                return shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
+            }
+            if (code === 'not_found') return shellRefusal(404, 'repo_not_found', "This repository doesn't exist or you cannot access it.");
+            return shellRefusal(503, 'repo_url_unavailable', "We couldn't reach this repository. Try again.");
+        }
+    };
+    let privatePacket = parsed.host === 'github.ezil.work' ? await loadGrant() : null;
+    if (privatePacket instanceof Response) return privatePacket;
+    if (!(await sameSession())) return shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
+
     const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent }) as { ok: boolean; codePreviewUrl?: unknown };
     if (!preview.ok || typeof preview.codePreviewUrl !== 'string') return shellJson(preview);
+    if (left() < REPO_OPEN_MIN_TIMEOUT_MS + REPO_OPEN_TRANSPORT_MARGIN_MS) return openTimedOut();
+    if (!(await sameSession())) return shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
+    // A cold Code mint can consume a short credential. Refresh before the Worker call, never after an expired send.
+    if (privatePacket && Date.parse(privatePacket.git.expiresAt) - Date.now()
+        < Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS) + 30_000) {
+        const refreshed = await loadGrant();
+        if (refreshed instanceof Response) return refreshed;
+        if (refreshed.repository.id !== privatePacket.repository.id || refreshed.repository.ref !== privatePacket.repository.ref)
+            return shellRefusal(409, 'repo_url_changed', 'This repository changed while opening. Try again.');
+        privatePacket = refreshed;
+        if (!(await sameSession())) return shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
+    }
     // Re-read after the mint: a computer that moved to AWS meanwhile is refused, never signed for as Cloudflare.
     const controls = await target(ctx, computerId);
     if (isAws(controls)) return unsupportedProvider();
-    const timeoutMs = Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS);
+    const timeoutMs = Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS,
+        privatePacket ? Date.parse(privatePacket.git.expiresAt) - Date.now() - 15_000 : REPO_OPEN_MAX_TIMEOUT_MS);
     if (timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS) {
         console.warn('[shell] code-preview-url repository refused', { code: 'deadline' });
         return openTimedOut();
@@ -297,7 +342,10 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     const repositoryId = repositoryIdFor(parsed.canonicalURL);
     const config = resolveCloudflareGuacamoleConfig();
     const opened = await requestRepoOpen(config.workerUrl, process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '', controls,
-        { userId: ctx.user.id, computerId }, { repositoryId, canonicalURL: parsed.canonicalURL, ref: resolved.ref, git: null, timeoutMs },
+        { userId: ctx.user.id, computerId }, { repositoryId, canonicalURL: parsed.canonicalURL,
+            ref: privatePacket?.repository.ref ?? resolved!.ref,
+            git: privatePacket ? { token: privatePacket.git.token, expiresAt: privatePacket.git.expiresAt, scope: privatePacket.git.scope } : null,
+            ...(privatePacket ? { privatePacket } : {}), timeoutMs },
         { correlationId: newCorrelationId(), signal: deadline });
     if (!opened.ok) {
         if (opened.errorCode === 'repo_open_unsupported_provider') return unsupportedProvider();

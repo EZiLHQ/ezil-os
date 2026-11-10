@@ -1564,6 +1564,38 @@ await settle(4);
                 `${spinnerKind(w)} "${spinnerTitle(w)}" asks=${mints(from).length} src=${frameSrc(w)} submits=${submits.length - submitted}`);
             await closeCode();
         }
+        // Standalone EZiL Git uses the shared ID session; one silent refresh is tied to this exact URL.
+        const EZIL_GIT = 'https://github.ezil.work/default/os-code-url-20261110-a.git';
+        const EZIL_GIT_2 = 'https://github.ezil.work/default/os-code-url-20261110-b.git';
+        store.removeItem(GUARD_KEY);
+        codeMintAnswer = () => refresh;
+        const firstSubmit = submits.length;
+        await launch({ project: { repoUrl: EZIL_GIT } });
+        await waitFor(() => submits.length > firstSubmit, 3000);
+        const returnUrl = new URL(submits.at(-1)?.fields?.returnUrl ?? '/', 'https://ezil.local');
+        push('10e standalone EZiL Git URL refreshes ID once and returns to the exact repository address',
+            submits.length === firstSubmit + 1 && submits.at(-1).action === '/auth/auth0/login'
+            && submits.at(-1).fields.prompt === 'none' && returnUrl.pathname === '/app/code'
+            && returnUrl.searchParams.get('repo') === EZIL_GIT && [...returnUrl.searchParams.keys()].join(',') === 'repo',
+            JSON.stringify(submits.at(-1)));
+        push('10e the refresh guard names the URL, without a project or provider repository ID',
+            JSON.stringify(Object.keys(JSON.parse(store.getItem(GUARD_KEY) ?? '{}')).sort()) === JSON.stringify(['at', 'repoUrl'])
+            && JSON.parse(store.getItem(GUARD_KEY)).repoUrl === EZIL_GIT,
+            String(store.getItem(GUARD_KEY)));
+        await closeCode();
+        await launch({ project: { repoUrl: EZIL_GIT } });
+        await waitFor(() => spinnerKind(codeWin()) === 'failed', 4000);
+        push('10e a repeated refusal for the same URL cannot loop through sign-in',
+            submits.length === firstSubmit + 1 && spinnerTitle(codeWin()) === 'Sign in again to open this project',
+            `submits=${submits.length - firstSubmit} title=${spinnerTitle(codeWin())}`);
+        await closeCode();
+        await launch({ project: { repoUrl: EZIL_GIT_2 } });
+        await waitFor(() => submits.length > firstSubmit + 1, 3000);
+        push('10e another EZiL Git URL gets its own one refresh',
+            submits.length === firstSubmit + 2 && new URL(submits.at(-1).fields.returnUrl, 'https://ezil.local').searchParams.get('repo') === EZIL_GIT_2,
+            JSON.stringify(submits.at(-1)));
+        await closeCode();
+        store.removeItem(GUARD_KEY);
         // An address that is not one (a project-shaped object, an http URL) is not an address: plain Code, no repository asked.
         codeMintAnswer = null;
         from = calls.length;
