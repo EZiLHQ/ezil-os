@@ -62,6 +62,13 @@ describe('park a failed release: reservation', () => {
         ['host in another zone', 'instance_identity', s => { s.host.availabilityZoneId = 'aps1-az2'; }],
         ['host pool marker', 'instance_identity', s => { s.host.tags['ezil:pool'] = '1'; }],
         ['host alias disagreeing', 'instance_identity', s => { s.host.tags['ezil:fence'] = 'someone-else'; }],
+        ['host carrying a legacy fence alias that AGREES (adopted/claimed shape)', 'instance_identity', s => { s.host.tags['ezil:fence'] = s.i.fenceToken; }],
+        ['host carrying the legacy computer alias', 'instance_identity', s => { s.host.tags['ezil:computer'] = s.i.computerId; }],
+        ['legacy-only host (no canonical computer-id/fence-token)', 'instance_identity', s => {
+            delete s.host.tags['ezil:computer-id']; delete s.host.tags['ezil:fence-token'];
+            s.host.tags['ezil:computer'] = s.i.computerId; s.host.tags['ezil:fence'] = s.i.fenceToken; }],
+        ['host with the pool-host marker', 'instance_identity', s => { s.host.tags['ezil:pool-host'] = 'ph-1'; }],
+        ['host of another generation', 'instance_identity', s => { s.host.tags['ezil:generation'] = '2'; }],
         ['host with a third disk', 'instance_disks', s => { (s.host.volumes as unknown[]).push({ deviceName: '/dev/sdg', volumeId: 'vol-0bbbbbbbbbbbbbbbb', deleteOnTermination: false }); }],
         ['data disk deleted on termination', 'instance_disks', s => { (s.host.volumes as { deleteOnTermination: boolean }[])[1]!.deleteOnTermination = true; }],
         ['stop time unknown', 'stop_time_unknown', s => { s.host.stateTransitionAt = null; }],
@@ -165,6 +172,8 @@ describe('park a failed release: settlement', () => {
         ['stop job failed', 'execution_failed', s => { s.finishStop().status = 'FAILED'; }],
         ['host started and stopped again after the reservation', 'host_changed', s => { s.finishStop(); s.host.stateTransitionAt = new Date(HOST_STOPPED.getTime() + 300_000); }], // 15:25: still before the snapshot, but not the proven stop
         ['host running again', 'instance_identity', s => { s.finishStop(); s.host.state = 'running'; }],
+        ['host re-tagged with a legacy alias after the reservation', 'instance_identity', s => { s.finishStop(); s.host.tags['ezil:fence'] = s.i.fenceToken; }],
+        ['placement lease taken again after the reservation', 'writer_lease_active', s => { s.finishStop(); s.placements[0]!.lease_until = new Date(NOW.getTime() + 60_000); }],
         ['volume detached', 'volume_attachment', s => { s.finishStop(); Object.assign(s.volume, { state: 'available', attachments: [] }); }],
         ['snapshot no longer completed', 'snapshot_not_proven', s => { s.finishStop(); s.snapshot.state = 'error'; }],
         ['source execution rewritten (other stop time)', 'source_identity', s => { s.finishStop(); s.failed.stopDate = new Date(NOW.getTime() - 1000); }],
@@ -231,6 +240,19 @@ describe('park a failed release: exclusions under the reservation locks', () => 
         await untouched(s);
         // The same proof reserves once the blocker is gone.
         expect(await s.reserve()).toEqual({ outcome: 'reserved', error: null });
+    });
+
+    it('refuses on a writer-lease ROW even when the placement lease proxy is empty (lease_until null)', async () => {
+        const s = parkSetup();
+        s.placements[0]!.lease_until = null;
+        const writer = (t: string) => /to_regclass\('public\.ezil_compute_writer_leases'\)/.test(t) ? { rows: [{ present: true }] }
+            : t.startsWith('/* placement:park-writer-lease */') ? { rows: [{ held: 1 }] } : null;
+        expect(await s.reserve(s.request, intercepting(s.deps, writer))).toEqual({ outcome: 'refused', error: 'blocked_writer_lease' });
+        await untouched(s);
+        // With the table present but no row for the computer the same proof reserves.
+        const noRow = (t: string) => /to_regclass\('public\.ezil_compute_writer_leases'\)/.test(t) ? { rows: [{ present: true }] }
+            : t.startsWith('/* placement:park-writer-lease */') ? { rows: [] } : null;
+        expect(await s.reserve(s.request, intercepting(s.deps, noRow))).toEqual({ outcome: 'reserved', error: null });
     });
 
     it('takes admission, the canonical computer lock and the row lock before it writes (the ordinary lock order)', async () => {

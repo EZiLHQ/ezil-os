@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { awsSandboxId } from './aws-enroll';
 import { isExecutionAbsent } from './aws-errors';
 import { buildLifecycleWork, currentGenerationIntent, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
-import { boundedTime, executionMatches, executionWork, matchesPoolReleaseRecovery, ownedTags, poolReleaseReplay, sameIdentity } from './aws-pool-release-recovery';
+import { boundedTime, executionMatches, executionWork, matchesPoolReleaseRecovery, poolReleaseReplay, sameIdentity } from './aws-pool-release-recovery';
 import type { RebaseSnapshotDescriber } from './aws-rebase-evidence';
 import { isPoolMode, lifecycleExecutionArn, LifecycleReceiptSchema, startLifecycleJob, USAGE_OBSERVER,
     type LifecycleExecutionReader, type ReceiptDeps } from './aws-receipts';
@@ -78,6 +78,16 @@ function coldVolumeTags(tags: Readonly<Record<string, string>> | undefined, p: P
         .every(([k, v]) => tags[k] === undefined || tags[k] === v);
 }
 
+/** A COLD-canonical host: canonical identity only (computer-id and fence-token for this generation). Any legacy computer/fence alias or
+ * pool/claim marker means a legacy-only, adopted or claimed host: out of scope here, and not one the ordinary stop would accept for it.
+ * `ownedTags` is deliberately NOT used for the host (it allows those shapes) and is not changed. */
+function coldHostTags(tags: Readonly<Record<string, string>> | undefined, p: Placement, d: LifecycleDeployment): boolean {
+    if (!tags || tags['ezil:managed-by'] !== 'app-computer-platform' || tags['ezil:stage'] !== d.namespace || tags['ezil:computer-id'] !== p.computerId
+        || tags['ezil:generation'] !== String(p.generation) || tags['ezil:fence-token'] !== p.fenceToken) return false;
+    if (tags['ezil:namespace'] !== undefined && tags['ezil:namespace'] !== d.namespace) return false;
+    return ['ezil:computer', 'ezil:fence', 'ezil:pool', 'ezil:pool-host'].every(k => tags[k] === undefined);
+}
+
 type Evidence = { error: string } | { hostStoppedAt: Date };
 /** The physical proof, re-read at reservation and again at settlement. */
 async function parkEvidence(deps: ParkDeps, p: Placement, d: LifecycleDeployment, snapshotId: string, now: Date): Promise<Evidence> {
@@ -91,7 +101,7 @@ async function parkEvidence(deps: ParkDeps, p: Placement, d: LifecycleDeployment
         || volume.attachments[0].instanceId !== p.instanceId || volume.attachments[0].state !== 'attached') return { error: 'volume_attachment' };
     const host = await describer.describeForEnrollment(p.region!, p.instanceId!);
     if (!host || host.instanceId !== p.instanceId || host.state !== 'stopped' || host.instanceType !== p.instanceType
-        || host.availabilityZoneId !== p.zoneId || !ownedTags(host.tags, p, d) || host.tags['ezil:pool'] !== undefined) return { error: 'instance_identity' };
+        || host.availabilityZoneId !== p.zoneId || !coldHostTags(host.tags, p, d)) return { error: 'instance_identity' };
     const rootName = d.storage.rootDeviceName ?? '/dev/sda1';
     const root = host.volumes.filter(v => v.deviceName === rootName && v.volumeId !== p.volumeId && v.deleteOnTermination);
     const data = host.volumes.filter(v => v.volumeId === p.volumeId && !v.deleteOnTermination && v.deviceName !== rootName);
