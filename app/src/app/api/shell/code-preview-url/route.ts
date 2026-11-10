@@ -10,7 +10,7 @@ import {
 } from '@/server/lib/compute/repo-open';
 import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/shell/http';
 import {
-    projectGrantOrRefusal, projectIds, projectInvalid, projectRepoConfiguredOrRefusal, retainedIdentityOrRefusal, shellRefusal,
+    identityRefreshRequired, projectGrantOrRefusal, projectIds, projectInvalid, projectRepoConfiguredOrRefusal, retainedIdentityOrRefusal, shellRefusal,
 } from '@/server/works/shell-project';
 
 /**
@@ -275,8 +275,10 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     await caller.computer.get({ id: computerId });
     if (isAws(await target(ctx, computerId))) return unsupportedProvider();
 
-    const resolved = await resolvePublicGitHub(parsed.canonicalURL, { signal: deadline });
-    if (!resolved.ok) {
+    const identity = parsed.host === 'github.ezil.work' ? await retainedIdentityOrRefusal(ctx.user.id) : null;
+    if (identity instanceof Response) return identity;
+    const resolved = parsed.host === 'github.com' ? await resolvePublicGitHub(parsed.canonicalURL, { signal: deadline }) : null;
+    if (resolved && !resolved.ok) {
         console.warn('[shell] code-preview-url repository refused', { code: resolved.reason });
         if (resolved.reason === 'not_found') return shellRefusal(404, 'repo_not_found', "This repository doesn't exist.");
         if (resolved.reason === 'moved') return shellRefusal(409, 'repo_url_moved', 'This repository has moved. Open it from its new address.');
@@ -294,10 +296,34 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
         console.warn('[shell] code-preview-url repository refused', { code: 'deadline' });
         return openTimedOut();
     }
-    const repositoryId = repositoryIdFor(parsed.canonicalURL);
+    let repositoryId: string;
+    let ref: string;
+    let git: { token: string; expiresAt: string; scope: 'read' | 'write' } | null = null;
+    if (parsed.host === 'github.ezil.work') {
+        const { grantForGitAddress, GitAddressGrantError } = await import('@/server/works/git-address-grant');
+        try {
+            const grant = await grantForGitAddress(identity!, computerId, parsed.canonicalURL, { signal: deadline });
+            repositoryId = grant.repositoryId;
+            ref = grant.ref;
+            git = grant.git;
+        } catch (error) {
+            const code = error instanceof GitAddressGrantError ? error.code : 'unavailable';
+            console.warn('[shell] code-preview-url address grant refused', { code });
+            if (code === 'identity_refused') {
+                const { clearProjectIdentity } = await import('@/server/auth/retained-identity');
+                try { await clearProjectIdentity(); } catch { /* the next request must sign in again */ }
+                return identityRefreshRequired();
+            }
+            if (code === 'not_found') return shellRefusal(404, 'repo_not_found', "This repository doesn't exist.");
+            return shellRefusal(503, 'repo_url_unavailable', "We couldn't reach this repository. Try again.");
+        }
+    } else {
+        repositoryId = repositoryIdFor(parsed.canonicalURL);
+        ref = resolved!.ref;
+    }
     const config = resolveCloudflareGuacamoleConfig();
     const opened = await requestRepoOpen(config.workerUrl, process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '', controls,
-        { userId: ctx.user.id, computerId }, { repositoryId, canonicalURL: parsed.canonicalURL, ref: resolved.ref, git: null, timeoutMs },
+        { userId: ctx.user.id, computerId }, { repositoryId, canonicalURL: parsed.canonicalURL, ref, git, timeoutMs },
         { correlationId: newCorrelationId(), signal: deadline });
     if (!opened.ok) {
         if (opened.errorCode === 'repo_open_unsupported_provider') return unsupportedProvider();

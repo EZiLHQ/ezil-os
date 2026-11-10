@@ -13,6 +13,21 @@ const advertisement = (head: string | null, refs: string[] = ['refs/heads/main']
 
 describe('parseRepositoryUrl: one canonical public github.com repository, or a refusal', () => {
     it.each([
+        ['https://github.ezil.work/acme/site.git', 'site'],
+        ['https://github.ezil.work/acme/site', 'site'],
+    ])('accepts the exact EZiL Git route %s', (raw, name) => {
+        expect(parseRepositoryUrl(raw)).toEqual({ ok: true, host: 'github.ezil.work', owner: 'acme', name,
+            canonicalURL: 'https://github.ezil.work/acme/site.git', displayName: 'acme/site' });
+    });
+    it.each([
+        'https://GitHub.ezil.work/acme/site.git', 'https://github.ezil.work:443/acme/site.git',
+        'https://u@github.ezil.work/acme/site.git', 'https://github.ezil.work/acme/site.git?token=x',
+        'https://github.ezil.work/acme/site.git.git', 'https://github.ezil.work/acme/si..te.git',
+        'https://github.ezil.work/acme/Site.git', 'https://github.ezil.work/acme/site.git/',
+    ])('refuses noncanonical EZiL Git address %s', raw => {
+        expect(parseRepositoryUrl(raw)).toEqual({ ok: false, reason: 'invalid' });
+    });
+    it.each([
         ['https://github.com/EZiLHQ/ezil-os.git', 'https://github.com/ezilhq/ezil-os.git', 'EZiLHQ/ezil-os'],
         ['https://github.com/EZiLHQ/ezil-os', 'https://github.com/ezilhq/ezil-os.git', 'EZiLHQ/ezil-os'],
         ['https://github.com/EZiLHQ/ezil-os/', 'https://github.com/ezilhq/ezil-os.git', 'EZiLHQ/ezil-os'],
@@ -33,7 +48,7 @@ describe('parseRepositoryUrl: one canonical public github.com repository, or a r
         expect(parseRepositoryUrl(raw)).toEqual({ ok: false, reason: 'invalid' });
     });
     it.each([
-        'https://github.ezil.work/acme/site.git', 'https://git.ezil.work/acme/site.git',
+        'https://git.ezil.work/acme/site.git',
         'https://git-staging.ezil.work/acme-qa/site.git', 'https://git-qa.ezil.work/acme-qa/site.git',
     ])(
         'recognises EZiL Git %s and refuses it for now (needs a Works grant by address)', raw => {

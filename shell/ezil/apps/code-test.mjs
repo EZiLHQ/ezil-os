@@ -1564,6 +1564,26 @@ await settle(4);
                 `${spinnerKind(w)} "${spinnerTitle(w)}" asks=${mints(from).length} src=${frameSrc(w)} submits=${submits.length - submitted}`);
             await closeCode();
         }
+        // A production EZiL Git address needs the retained EZiL ID token; one silent refresh keeps the exact URL.
+        const EZIL = 'https://github.ezil.work/acme/site.git';
+        codeMintAnswer = () => ({ status: 409, payload: { error: { code: 'IDENTITY_REFRESH_REQUIRED', message: 'Confirm your EZiL ID.' } } });
+        store.removeItem(GUARD_KEY);
+        let submitted = submits.length;
+        from = calls.length;
+        await launch({ project: { repoUrl: EZIL } });
+        await waitFor(() => submits.length > submitted, 4000);
+        const returnUrl = submits.at(-1)?.fields?.returnUrl;
+        push('10e an EZiL Git address refreshes identity once and preserves its exact address',
+            submits.length === submitted + 1 && new URL(returnUrl, 'https://ezil.local').searchParams.get('repo') === EZIL
+            && mints(from).length === 1 && JSON.parse(store.getItem(GUARD_KEY) ?? 'null')?.repoUrl === EZIL,
+            `submits=${submits.length - submitted} return=${returnUrl}`);
+        await closeCode();
+        submitted = submits.length;
+        await launch({ project: { repoUrl: EZIL } });
+        await waitFor(() => spinnerKind(codeWin()) === 'failed', 4000);
+        push('10e a second identity refusal for the same EZiL Git address cannot loop', submits.length === submitted,
+            `submits=${submits.length - submitted}`);
+        await closeCode();
         // An address that is not one (a project-shaped object, an http URL) is not an address: plain Code, no repository asked.
         codeMintAnswer = null;
         from = calls.length;
