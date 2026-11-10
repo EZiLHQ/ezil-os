@@ -49,6 +49,9 @@ jobs:
         working-directory: worker
         # Container coverage runs separately against a published image.
         run: bun test --reporter=junit --reporter-outfile=worker-junit.xml
+      - name: Private CLI supervisor process cleanup
+        if: runner.os == 'Linux'
+        run: python3 worker/repo-open/supervise.test.py
       - name: Show the bash -n file list (verify_cmd evidence)
         shell: bash
         working-directory: worker

@@ -18,6 +18,7 @@ env:
   IMAGE_INPUTS: |-
     docker/neko
     worker/neko
+    worker/repo-open
     worker/assets
     worker/bootstrap
     worker/copilot-chat

@@ -1564,8 +1564,18 @@ await settle(4);
                 `${spinnerKind(w)} "${spinnerTitle(w)}" asks=${mints(from).length} src=${frameSrc(w)} submits=${submits.length - submitted}`);
             await closeCode();
         }
-        // A production EZiL Git address needs the retained EZiL ID token; one silent refresh keeps the exact URL.
+        // The private address opens the CLI checkout itself, not its wrapper.
         const EZIL = 'https://github.ezil.work/acme/site.git';
+        codeMintAnswer = () => ({ payload: { ok: true, expiresAt: Date.now() + 300_000,
+            codePreviewUrl: `https://8443-guac-u1-c1-code.ezil.org/preview-bootstrap?token=t=1,v1=ab&mint=u${++seq}&folder=/workspace/projects/${ID}/repository`,
+            repository: { name: 'acme/site', id: ID } } });
+        await launch({ project: { repoUrl: EZIL } });
+        await settle(20);
+        w = codeWin();
+        push('10e the private EZiL Git address opens the actual checkout as Code folder',
+            frameSrc(w)?.endsWith(`/projects/${ID}/repository`) && headTitle(w) === 'acme/site', `${frameSrc(w)} | ${headTitle(w)}`);
+        await closeCode();
+        // A production EZiL Git address needs the retained EZiL ID token; one silent refresh keeps the exact URL.
         codeMintAnswer = () => ({ status: 409, payload: { error: { code: 'IDENTITY_REFRESH_REQUIRED', message: 'Confirm your EZiL ID.' } } });
         store.removeItem(GUARD_KEY);
         let submitted = submits.length;

@@ -84,12 +84,18 @@ process.exit(result.status??1);
       assert.equal(first.code, 0, first.stdout);
       assert.deepEqual(JSON.parse(first.stdout), { canonicalUrl: canonical, folder: destination,
         identity: packet.identity, status: 'cloned' });
+      const terminalPwd = execFileSync('pwd', { cwd: destination, encoding: 'utf8' }).trim();
+      const gitTop = execFileSync(realGit, ['rev-parse', '--show-toplevel'], { cwd: destination, encoding: 'utf8' }).trim();
+      assert.equal(terminalPwd, destination, 'Code terminal starts in the checkout');
+      assert.equal(gitTop, terminalPwd, 'plain git commands see the opened folder as the repository root');
       assert.equal(await readFile(credentialMarker, 'utf8'), 'ok');
       assert.equal(await readFile(join(destination, 'file.txt'), 'utf8'), 'committed\n');
       await writeFile(join(destination, 'file.txt'), 'dirty\n');
       const second = await runWithPrivateFd(operation, packet, env);
       assert.equal(second.code, 0, second.stdout);
       assert.equal(JSON.parse(second.stdout).status, 'reused');
+      assert.equal(execFileSync(realGit, ['rev-parse', '--show-toplevel'], { cwd: destination, encoding: 'utf8' }).trim(), destination);
+      assert.match(execFileSync(realGit, ['status', '--short'], { cwd: destination, encoding: 'utf8' }), /^ M file\.txt\n$/);
       assert.equal(await readFile(join(destination, 'file.txt'), 'utf8'), 'dirty\n');
       assert.equal(await readFile(cloneCount, 'utf8'), '1');
     } finally { await rm(root, { recursive: true, force: true }); }

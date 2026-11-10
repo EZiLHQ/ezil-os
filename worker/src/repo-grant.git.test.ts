@@ -51,8 +51,8 @@ describe.skipIf(!AVAILABLE)('repo-grant: renewable push access against real git 
     return { code: p.exitCode, out: p.stdout.toString(), err: p.stderr.toString() };
   };
   /** The same, asynchronously: anything that talks to the in-process server must never block its event loop. */
-  const inNsAsync = async (argv: string[], env: Record<string, string> = {}, stdin?: string) => {
-    const p = Bun.spawn(['nsenter', '-t', String(holder.pid), '-m', '--', ...argv], {
+  const inNsAsync = async (argv: string[], env: Record<string, string> = {}, stdin?: string, cwd?: string) => {
+    const p = Bun.spawn(['nsenter', '-t', String(holder.pid), '-m', ...(cwd ? [`--wd=${cwd}`] : []), '--', ...argv], {
       env: { PATH: process.env.PATH!, HOME: home, GIT_SSL_CAINFO: cert, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1', ...env },
       stdin: stdin !== undefined ? new Blob([stdin]) : 'ignore', stdout: 'pipe', stderr: 'pipe',
     });
@@ -82,7 +82,8 @@ describe.skipIf(!AVAILABLE)('repo-grant: renewable push access against real git 
     expect(git(repoDir(), 'add', file).code).toBe(0);
     expect(git(repoDir(), '-c', 'user.name=b', '-c', 'user.email=b@example.test', 'commit', '-qm', `edit ${file}`).code).toBe(0);
   };
-  const push = () => inNsAsync(['git', '-C', repoDir(), 'push', 'origin', 'HEAD:main'], { GIT_CONFIG_GLOBAL: '/dev/null' });
+  // Code's terminal runs here; no -C or explicit repository path is needed.
+  const push = () => inNsAsync(['git', 'push', 'origin', 'HEAD:main'], { GIT_CONFIG_GLOBAL: '/dev/null' }, undefined, repoDir());
   const grantFile = () => inNs(['cat', `${REPO_GRANT_GRANTS_DIR}/acme__site.json`]).out;
   const upstreamHead = () => Bun.spawnSync(['git', '--git-dir', join(upstream, 'acme', 'site.git'), 'rev-parse', 'refs/heads/main']).stdout.toString().trim();
 
@@ -170,7 +171,7 @@ describe.skipIf(!AVAILABLE)('repo-grant: renewable push access against real git 
     expect(await runRepoGrant(exec(T1), first, { path: root, requireHydrated: false }, subjectA)).toEqual({ ok: true, expiresAt: first.expiresAt });
     edit('one.txt', 'first edit\n');
     const p1 = await push();
-    expect(p1.code).toBe(0);
+    expect(p1.code, p1.err).toBe(0);
     expect(upstreamHead()).toBe(git(repoDir(), 'rev-parse', 'HEAD').out.trim());
     expect(seen.some((s) => s.service === 'git-receive-pack' && s.user === 'T1')).toBe(true);
     // Expiry: a grant with less than the helper's 30 s margin left is refused locally, with the fixed hint,

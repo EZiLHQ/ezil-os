@@ -25,6 +25,15 @@ describe('isRepositoryFolder', () => {
         `//projects/${REPO}`, `workspace/projects/${REPO}`, `/workspace/project/${REPO}`, '/workspace', `/work space/projects/${REPO}`, 7, null])('refuses %j', f => {
         expect(isRepositoryFolder(f, REPO)).toBe(false);
     });
+    it('permits only the actual nested checkout for a private CLI open', () => {
+        const checkout = `/workspace/projects/${REPO}/repository`;
+        expect(isRepositoryFolder(checkout, REPO)).toBe(false);
+        expect(isRepositoryFolder(checkout, REPO, true)).toBe(true);
+        for (const bad of [`${checkout}/child`, `${checkout}/../other`, `/workspace/projects/${REPO}/other`,
+            `/workspace/projects/${REPO}//repository`, `/workspace/./projects/${REPO}/repository`]) {
+            expect(isRepositoryFolder(bad, REPO, true)).toBe(false);
+        }
+    });
 });
 
 describe('withRepositoryFolder', () => {
@@ -36,6 +45,19 @@ describe('withRepositoryFolder', () => {
 });
 
 describe('requestRepoOpen', () => {
+    it('returns only the exact private checkout path, including a retained root-level checkout', async () => {
+        const privateRequest = { ...request, privateBinding: { projectId: '33333333-3333-4333-8333-333333333333',
+            bindingVersion: 'b'.repeat(64), issuer: 'https://id.ezil.work/' as const, subject: 'auth0|builder' } };
+        const fetcher = (folder: string) => (async () => Response.json({ folder })) as unknown as typeof fetch;
+        const open = (folder: string) => requestRepoOpen('https://worker.example', 'secret', cloudflare, computer,
+            privateRequest, { fetch: fetcher(folder) });
+        const checkout = `/workspace/projects/${REPO}/repository`;
+        expect(await open(checkout)).toEqual({ ok: true, folder: checkout });
+        expect(await open(`/workspace/projects/${REPO}`)).toEqual({ ok: true, folder: `/workspace/projects/${REPO}` });
+        expect(await open(`${checkout}/other`)).toEqual({ ok: false, errorCode: 'repo_open_failed' });
+        expect(await requestRepoOpen('https://worker.example', 'secret', cloudflare, computer, request,
+            { fetch: fetcher(checkout) })).toEqual({ ok: false, errorCode: 'repo_open_failed' });
+    });
     it('returns the folder and a well-formed head', async () => {
         const { result } = run(() => Response.json({ folder: `/workspace/projects/${REPO}`, head: 'a'.repeat(40) }));
         expect(await result).toEqual({ ok: true, folder: `/workspace/projects/${REPO}`, head: 'a'.repeat(40) });

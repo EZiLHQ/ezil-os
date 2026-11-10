@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Linux-only CLI deadline. Own one process group, reap it, never remove files."""
+"""Linux-only CLI deadline. Reap the CLI and its adopted children, never remove files."""
 import ctypes
 import hashlib
 import json
@@ -83,6 +83,17 @@ def main():
     # Reparent orphaned Git/helper grandchildren here rather than container PID 1.
     if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
         return 125
+    # pidfds bind signals to the exact child identity even if a PID is reused.
+    # /proc's children list contains only our direct children, including those
+    # reparented to this subreaper after a helper calls setsid().
+    if not hasattr(os, 'pidfd_open') or not hasattr(signal, 'pidfd_send_signal'):
+        return 125
+    children_path = f'/proc/self/task/{os.getpid()}/children'
+    try:
+        with open(children_path, encoding='ascii'):
+            pass
+    except OSError:
+        return 125
     timeout_ms, grace_ms = int(sys.argv[1]), int(sys.argv[2])
     if not 1 <= timeout_ms <= 180000 or not 1 <= grace_ms <= 5000:
         return 125
@@ -90,21 +101,58 @@ def main():
     deadline = time.monotonic() + timeout_ms / 1000
     stopping = False
     kill_at = None
+    finish_at = None
     forced = False
     output = bytearray()
     output_valid = True
+    adopted = {}
+
+    def signal_adopted(sig):
+        for fd in adopted.values():
+            try:
+                signal.pidfd_send_signal(fd, sig)
+            except ProcessLookupError:
+                pass
+
+    def capture_adopted():
+        with open(children_path, encoding='ascii') as handle:
+            children = handle.read().split()
+        for item in children:
+            pid = int(item)
+            if (pid == child.pid and child.returncode is None) or pid in adopted:
+                continue
+            try:
+                fd = os.pidfd_open(pid)
+            except ProcessLookupError:
+                continue
+            try:
+                with open(f'/proc/{pid}/status', encoding='ascii') as handle:
+                    still_ours = any(line.strip() == f'PPid:\t{os.getpid()}' for line in handle)
+            except FileNotFoundError:
+                still_ours = False
+            if not still_ours:
+                os.close(fd)
+                continue
+            adopted[pid] = fd
+            if stopping:
+                try:
+                    signal.pidfd_send_signal(fd, signal.SIGKILL if forced else signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
 
     def stop(_signum=None, _frame=None):
-        nonlocal stopping, kill_at
+        nonlocal stopping, kill_at, finish_at
         if stopping:
             return
         stopping = True
         kill_at = time.monotonic() + grace_ms / 1000
+        finish_at = kill_at + 0.5  # a stuck child must not hold the supervisor forever
         try:
-            if child is not None:
+            if child is not None and child.returncode is None:
                 os.killpg(child.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
+        signal_adopted(signal.SIGTERM)
 
     signal.signal(signal.SIGTERM, stop)
     signal.signal(signal.SIGINT, stop)
@@ -137,10 +185,12 @@ def main():
             stop()
         if kill_at is not None and now >= kill_at:
             try:
-                os.killpg(child.pid, signal.SIGKILL)
-                forced = True
+                if child.returncode is None:
+                    os.killpg(child.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
+            signal_adopted(signal.SIGKILL)
+            forced = True
             kill_at = None
         for key, _ in selector.select(0.025):
             chunk = os.read(key.fd, 65536)
@@ -155,21 +205,35 @@ def main():
                 output.extend(chunk)
         parent_code = child.poll()
         if parent_code is not None:
-            # poll reaps the direct child first. Only adopted descendants remain.
-            remaining = False
+            # poll reaps the direct CLI first. An escaped session is still an
+            # exact adopted child and is signalled through its own pidfd.
+            capture_adopted()
             while True:
                 try:
                     pid, _ = os.waitpid(-1, os.WNOHANG)
                     if pid == 0:
-                        remaining = True
                         break
+                    fd = adopted.pop(pid, None)
+                    if fd is not None:
+                        os.close(fd)
                 except ChildProcessError:
                     break
+            capture_adopted()
+            with open(children_path, encoding='ascii') as handle:
+                remaining = bool(handle.read().strip())
             if remaining:
                 stop()  # a CLI exit never licenses descendants to continue
             elif not selector.get_map():
                 break
+        if finish_at is not None and now >= finish_at:
+            forced = True
+            break
     selector.close()
+    for fd in adopted.values():
+        os.close(fd)
+    if finish_at is not None and forced:
+        # Reaching the hard deadline is failure even if the CLI printed JSON.
+        return 126
     try:
         error = json.loads(output).get("error", {}) if output_valid else {}
         recovery = error.get("code") == "clone-failed" and error.get("message") == (

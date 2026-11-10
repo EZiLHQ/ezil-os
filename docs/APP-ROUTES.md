@@ -96,10 +96,12 @@ string. It returns `null` (open nothing) or
   Navigation intent only: shape-checked here (https, no whitespace, query,
   fragment, userinfo, backslash or escape, at most 508 characters) and then
   canonicalised, authorised and resolved by the server
-  (`app/src/server/works/repo-url.ts`): today a public
-  `https://github.com/<owner>/<name>[.git]`, opened on the person's selected
-  computer into the folder the computer's checkout returns. EZiL Git hosts are
-  refused for now (`repo_url_unsupported`). A missing or private repository is
+  (`app/src/server/works/repo-url.ts`): a public
+  `https://github.com/<owner>/<name>[.git]` or, on the selected owned Cloudflare
+  staging computer, an exact `https://github.ezil.work/<owner>/<name>.git`.
+  The private EZiL Git address opens the checkout as Code's folder so its
+  terminal is at the Git top-level. With workspace trust off, repository-root
+  editor settings can affect Code terminals. A missing or unauthorized repository is
   "This repository doesn't exist." An address that is not plain https is
   `projectRejected: 'repo_url_invalid'`; beside a `project` it is
   `repo_invalid`. `path` is not read with an address.
@@ -286,10 +288,11 @@ Scope and open gates (2026-11-05):
   agent's `folder` op, which ships in an AMI. Until then the server answers
   `unverified`: the default folder opens with the notice, and the address keeps
   the ask. Code→address sync, Back/Forward and Close Folder need no AMI.
-- **Repository links are unchanged.** `repo=`/`project=` open the
+- **Project repository links are unchanged.** `repo=`/`project=` open the
   server-authorised folder W, with the checkout at `W/repository`, exactly as
-  before. `folder=` beside them is refused (`with_repository`).
-- **Not implemented: the checkout as Code's folder, and repo+folder.** With
+  before. The private EZiL Git address is an exception: it opens the checkout
+  itself. `folder=` beside either form is refused (`with_repository`).
+- **Not implemented for project links: the checkout as Code's folder, and repo+folder.** With
   workspace trust off (today), a repository's own `.vscode/settings.json` at
   Code's root applies: its terminal profile and env run when a terminal opens.
   Measured with trust on, using `e2e/code-trust-spike.sh` with the live image

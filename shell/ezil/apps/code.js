@@ -283,9 +283,10 @@ function repositoryNameOf (data) {
 
 /**
  * Whether a minted Code URL opens THIS repository's folder: exactly one
- * `folder=`, ending `/projects/<repoId>`. One, because the bridge forwards only
- * the first (`worker/src/preview-bridge.ts`), so a second could not be the one
- * code-server opens.
+ * plain absolute `folder=`. A private EZiL Git address may open the actual
+ * `/projects/<repoId>/repository` checkout; an older root-level checkout and
+ * every other repository route still open `/projects/<repoId>`. The bridge
+ * forwards only the first (`worker/src/preview-bridge.ts`).
  */
 function opensRepository (url, project, data) {
     // A repository opened from its address has no id in the link: the server names it (`repository.id`, a UUID).
@@ -293,7 +294,14 @@ function opensRepository (url, project, data) {
     if ( typeof id !== 'string' || ! PROJECT_UUID.test(id) ) return false;
     try {
         const folders = new URL(url).searchParams.getAll('folder');
-        return folders.length === 1 && folders[0].endsWith(`/projects/${id}`);
+        if ( folders.length !== 1 || ! folders[0].startsWith('/') ) return false;
+        const parts = folders[0].slice(1).split('/');
+        if ( ! parts.every(p => /^[A-Za-z0-9._-]+$/.test(p) && p !== '.' && p !== '..') ) return false;
+        if ( parts.slice(-2).join('/') === `projects/${id}` ) return true;
+        const ezilAddress = typeof project.repoUrl === 'string'
+            && /^https:\/\/github\.ezil\.work\/[a-z0-9][a-z0-9-]{0,63}\/[a-z0-9][a-z0-9._-]{0,99}(?:\.git)?$/.test(project.repoUrl)
+            && ! project.repoUrl.includes('..') && ! project.repoUrl.endsWith('.git.git');
+        return ezilAddress && parts.slice(-3).join('/') === `projects/${id}/repository`;
     } catch {
         return false;
     }

@@ -178,7 +178,7 @@ describe('runRepoGrant, repoGrantWhenRunning and repoOpenThenGrant (fake exec)',
           identity: { issuer: 'https://id.ezil.work/', subject: 'auth0|builder' }, status: 'reused' }) };
     };
     expect(await repoOpenThenGrant({ running: async () => true, touch: () => undefined, exec }, openReq, root, SUBJECT))
-      .toEqual({ ok: true, folder: `/workspace/projects/${REPO}`, status: 'fetched' });
+      .toEqual({ ok: true, folder: `/workspace/projects/${REPO}/repository`, status: 'fetched' });
     expect(calls).toHaveLength(2);
     expect(Object.keys(calls[0]!.env)).toEqual([REPO_OPEN_CLI_PACKET_ENV]);
     expect(calls[1]!.env).toEqual({ [REPO_OPEN_TOKEN_ENV]: EGG });
