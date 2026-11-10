@@ -101,6 +101,14 @@ const modelsCache = new Map<string, { baseUrl: ResolvedProvider['baseUrl']; at: 
  * a reload.
  */
 const accessHints = new Map<string, GatewayModels>();
+/**
+ * Per base URL + token: the `/v1/models` read under way. Every concurrent caller (the picker, a request, the credits
+ * panel) shares it, so a cold or failing catalog costs one request at a time, not one per caller.
+ */
+type ModelsRead = { baseUrl: ResolvedProvider['baseUrl']; read: Promise<GatewayModels | undefined>;
+    /** Set when the catalog is forgotten while this read is under way: its answer then changes and returns nothing of its own. */
+    stale: boolean };
+const modelsReads = new Map<string, ModelsRead>();
 
 /** Refusals that mean the catalog this client listed is out of date (contract §4 freshness): read it again, and re-list. */
 export const CATALOG_REFUSALS: readonly string[] = ['killswitch', 'model_disabled', 'model_not_found', 'no_provider_route', 'model_unavailable',
@@ -111,8 +119,15 @@ export const CATALOG_REFUSALS: readonly string[] = ['killswitch', 'model_disable
  * forgets the plan limit (`accessHints`): only a reload (no argument) does.
  */
 export function forgetGatewayModels(baseUrl?: string): void {
-    if (baseUrl === undefined) { modelsCache.clear(); accessHints.clear(); }
-    else for (const [key, cached] of modelsCache) if (cached.baseUrl === baseUrl) modelsCache.delete(key);
+    // A read already under way answers for before the refusal or reload: it may no longer change the cache or the plan's
+    // limit, nor answer with its own catalog (readGatewayModels), and the next caller starts its own.
+    for (const [key, pending] of modelsReads) {
+        if (baseUrl !== undefined && pending.baseUrl !== baseUrl) continue;
+        pending.stale = true;
+        modelsReads.delete(key);
+    }
+    if (baseUrl === undefined) { modelsCache.clear(); accessHints.clear(); return; }
+    for (const [key, cached] of modelsCache) if (cached.baseUrl === baseUrl) modelsCache.delete(key);
 }
 
 function authHeaders(provider: ResolvedProvider): Record<string, string> {
@@ -356,14 +371,37 @@ export function includedModelNames(catalog: GatewayModels | undefined): string {
     return names.length > 1 ? `${names.slice(0, -1).join(', ')} or ${names.at(-1)}` : names[0] ?? 'an included model';
 }
 
-/** `GET /v1/models`, cached for five minutes per base URL + auth context. `undefined` when it cannot be read. */
+/**
+ * `GET /v1/models`, cached for five minutes per base URL + auth context. `undefined` when it cannot be read. One read at
+ * a time per base URL + auth context (`modelsReads`): a caller's signal ends only its own wait, never the shared read.
+ */
 export async function gatewayModels(provider: ResolvedProvider, doFetch: typeof fetch, now: number = Date.now(), signal?: AbortSignal,
     /** Read now even within the five minutes (a panel opening); a failed read keeps the last catalog. */ fresh = false): Promise<GatewayModels | undefined> {
     const key = providerIdentity(provider);
     const cached = modelsCache.get(key);
     if (!fresh && cached && now - cached.at < MODELS_TTL_MS) return cached.models;
+    if (signal?.aborted) return undefined;
+    let pending = modelsReads.get(key);
+    if (!pending) {
+        const entry: ModelsRead = pending = { baseUrl: provider.baseUrl, read: Promise.resolve(undefined), stale: false };
+        entry.read = readGatewayModels(provider, key, doFetch, now, entry)
+            .finally(() => { if (modelsReads.get(key) === entry) modelsReads.delete(key); });
+        modelsReads.set(key, entry);
+    }
+    if (!signal) return pending.read;
+    const read = pending.read;
+    return new Promise(resolve => {
+        const onAbort = () => resolve(undefined);
+        signal.addEventListener('abort', onAbort, { once: true });
+        void read.then(resolve).finally(() => signal.removeEventListener('abort', onAbort));
+    });
+}
+
+async function readGatewayModels(provider: ResolvedProvider, key: string, doFetch: typeof fetch, now: number, entry: ModelsRead): Promise<GatewayModels | undefined> {
     try {
-        const { status, json, headers } = await getJson(provider, '/models', doFetch, signal);
+        const { status, json, headers } = await getJson(provider, '/models', doFetch);
+        // Forgotten meanwhile: only what was read since then (a later read's catalog, or none) answers.
+        if (entry.stale) return modelsCache.get(key)?.models;
         const models = status === 200 ? parseGatewayModels(json) : undefined;
         const header = headers.get(INCLUDED_MODELS_HEADER);
         const included = parseIncludedModels(header);
