@@ -447,6 +447,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     const trial = operator ? undefined : trialBlock(input.subs.find(sub => sub.stripeSubscriptionId === plan.subscriptionId), plan.sku,
         paymentIssue !== null, input.renewal ?? null, input.now);
     const enrollment = input.enrollment?.state ?? 'enrolled';
+    // Undelivered receipts of an enrolled account are on their way (the outbox drain), not parked.
+    const delivering = enrollment === 'enrolled' ? waitingCredits(input.ai?.receipts ?? null, input.now) : null;
     return {
         enabled: true, version: 3,
         plan: { sku: plan.sku, name: plan.sku === 'legacy' ? plan.offer.family === 'pro_legacy' ? 'Pro (legacy)'
@@ -476,6 +478,7 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         // An operator grant includes no AI credits (product entitlements v1: credits are never granted with access).
         ai: { grant: plan.sku === 'legacy' || operator ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
             enrollment, waiting: enrollment === 'enrolled' ? null : waitingCredits(input.ai?.receipts ?? null, input.now),
+            ...(delivering ? { delivering } : {}),
             ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro),
                 account: aiAccountV3({ plan, ...input.ai, now: input.now }) } : {}) },
         fairUse: { status: unmetered ? 'ok' : fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: rated.window.end,

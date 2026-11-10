@@ -164,6 +164,16 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
                 : pending ? `${esc(creditsLabel(null, pending.credits))} more from ${timestamp(pending.at)}` : '',
             identity.stale ? '' : ai?.included && validDate(ai.included.periodEnd) ? `Resets ${timestamp(ai.included.periodEnd)}` : grant?.per === 'period' && grantLabel ? `Your plan adds ${grantLabel} every month` : '',
         ].filter(Boolean).join('<br>');
+        // Granted credits the Gateway has not acknowledged yet (a new account's starter grant): on their way,
+        // never "No credits left". The balance shown stays the Gateway's; nothing is added to it here.
+        const delivering = deliveringCredits(summary);
+        if (identity && delivering !== null) {
+            const adding = `${esc(creditsLabel(null, delivering))} credits are being added to your account.`;
+            if (identity.empty) {
+                aiState = 'pending'; aiPercent = null; aiValue = 'Adding your AI credits…'; aiText = adding;
+                aiNote = [identity.stale ? esc(staleCreditsCopy(identity.asOf)) : '', adding].filter(Boolean).join('<br>');
+            } else aiNote = [aiNote, adding].filter(Boolean).join('<br>');
+        }
     }
     // Usage can answer before the summary: until the first summary arrives the credits are being read, not unreadable.
     if (summaryLoading && !ai && identity === undefined) {
@@ -279,6 +289,14 @@ function announce(state, body) {
     if (changes.length) state.win.find('[data-role="usage-announcement"]').text(changes.join(' '));
 }
 const SUMMARY_MAX_AGE_MS = 5 * 60 * 1000;
+/** While granted credits are on their way (`ai.delivering`), the poll re-reads the summary this often, so they show on arrival. */
+const DELIVERING_SUMMARY_MS = 60 * 1000;
+/** Whole credits an enrolled account was granted that the Gateway has not acknowledged yet, or null. */
+function deliveringCredits(summary) {
+    const ai = summary?.enabled === true && summary.version === 3 ? summary.ai : null;
+    const credits = (ai?.enrollment ?? 'enrolled') === 'enrolled' ? ai?.delivering?.credits : null;
+    return Number.isSafeInteger(credits) && credits > 0 ? credits : null;
+}
 /** Window focus re-reads the summary (credits after a checkout in another tab) at most this often: the summary's side
  * effects (Stripe preview, Gateway reads, free-credit enqueue) keep it at Billing's 5-minute focus rule. */
 const FOCUS_SUMMARY_MS = 5 * 60 * 1000;
@@ -298,8 +316,11 @@ async function load(state, manual = false) {
     body.attr('aria-busy', 'true');
     if (state.usage?.session.state === 'recording') body.find('.usage-session-line').html(measuringLine(state.usage.session.elapsedSeconds));
     // billing.summary has side effects (Stripe renewal preview, Gateway balance read, free-credit enqueue):
-    // read it on open, on manual Refresh, or when older than five minutes. The 30 s poll reads usage only.
-    const summaryDue = manual || state.summaryAt === undefined || Date.now() - state.summaryAt > SUMMARY_MAX_AGE_MS;
+    // read it on open, on manual Refresh, or when older than five minutes (one minute while credits are being
+    // added). Otherwise the 30 s poll reads usage only.
+    const summaryAge = Date.now() - (state.summaryAt ?? 0);
+    const summaryDue = manual || state.summaryAt === undefined || summaryAge > SUMMARY_MAX_AGE_MS
+        || (deliveringCredits(state.summary) !== null && summaryAge >= DELIVERING_SUMMARY_MS);
     if (summaryDue) state.summaryAt = Date.now();
     const sources = summaryDue ? ['usage', 'summary'] : ['usage'];
     const pending = new Set(sources), failed = new Set();

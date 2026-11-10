@@ -504,6 +504,42 @@ check('identity credits: unavailable never falls back to the catalog; a kept bal
     assert.doesNotMatch(limited.textContent, /9,000,000|8,000,000|9000000|\b7\b credits/);
     assert.doesNotMatch(rendered(sample, { ...premiumAI(unreadable), ai: { ...premiumAI(unreadable).ai, limits } }).textContent, /9,000,000|8,000,000/);
 });
+// A new Free account's starter grant between the first summary (which enqueues it) and the outbox drain.
+const freeZero = { ...worked, state: 'exhausted', totalMicro: '0', remainingMicro: '0', heldMicro: '0', usedMicro: '0', planBaselineMicro: M('100'), grants: [] };
+const freeStarter = { ...freeZero, state: 'ok', totalMicro: M('100'), remainingMicro: M('100'),
+    grants: [{ kind: 'starter', creditsMicro: M('100'), remainingMicro: M('100'), expiresAt: '2027-11-10T00:00:00Z' }] };
+const freeAI = (account, extra = {}) => ({ ...summary, plan: { ...summary.plan, sku: 'free_v3', name: 'Free' },
+    ai: { grant: { amount: 100, per: 'once' }, balance: 0, balanceMicro: '0', state: 'exhausted', enrollment: 'enrolled', waiting: null, account, ...extra } });
+check('identity credits: a starter grant on its way reads "being added", never a confirmed zero; arrival and a genuine zero are unchanged', () => {
+    const adding = rendered(sample, freeAI(freeZero, { delivering: { credits: 100 } }));
+    assert.equal(aiValue(adding), 'Adding your AI credits…');
+    assert.equal(meter(adding, 'ai').dataset.state, 'pending');
+    assert.equal(progress(adding, 'ai'), null);
+    assert.match(meter(adding, 'ai').textContent, /100 credits are being added to your account\./);
+    assert.doesNotMatch(meter(adding, 'ai').textContent, /No credits left|0 credits left|Remaining 0|Used 0/);
+    // Negative control: the same Gateway zero with nothing on its way is a genuine shortage.
+    for (const extra of [{}, { delivering: { credits: 0 } }, { delivering: { credits: -1 } }, { delivering: { credits: 1.5 } }, { delivering: { credits: '100' } }, { delivering: null }]) {
+        const none = rendered(sample, freeAI(freeZero, extra));
+        assert.equal(meter(none, 'ai').dataset.state, 'danger');
+        assert.match(meter(none, 'ai').textContent, /No credits left/);
+    }
+    // Not enrolled: the enrollment copy stays; `delivering` never applies.
+    const parked = rendered(sample, freeAI(freeZero, { enrollment: 'activating', waiting: { credits: 100 }, delivering: { credits: 100 } }));
+    assert.equal(aiValue(parked), 'Setting up your AI credits…');
+    assert.doesNotMatch(meter(parked, 'ai').textContent, /being added/);
+    // Arrived: the Gateway's 100, once, with no pending line; the balance is never raised by `delivering`.
+    const arrived = rendered(sample, freeAI(freeStarter, { balance: 100, balanceMicro: M('100'), state: 'ok' }));
+    assert.equal(aiValue(arrived), '100 credits left of 100');
+    assert.doesNotMatch(meter(arrived, 'ai').textContent, /being added/);
+    const beside = rendered(sample, freeAI(freeStarter, { balance: 100, balanceMicro: M('100'), state: 'ok', delivering: { credits: 50 } }));
+    assert.equal(aiValue(beside), '100 credits left of 100');
+    assert.match(meter(beside, 'ai').textContent, /50 credits are being added to your account\./);
+    // An unreadable balance stays unavailable: an expected grant is not a balance.
+    const down = rendered(sample, freeAI(unreadable, { balance: null, balanceMicro: null, state: 'unavailable', delivering: { credits: 100 } }));
+    assert.equal(aiValue(down), 'Unavailable');
+    assert.doesNotMatch(meter(down, 'ai').textContent, /100 credits left/);
+    for (const node of [adding, arrived, beside]) assert.deepEqual(scanCopy(node.textContent), []);
+});
 check('identity credits: in the payment grace (D17) the period\'s credits wait for the payment; no live grant shows no "of 0" and no bar', () => {
     // The last period's plan grant still in its tail is the whole total; this period's grant waits for the payment.
     const tail = { ...worked, totalMicro: M('1000'), remainingMicro: M('640'), heldMicro: '0', usedMicro: M('360'), grants: [
@@ -806,6 +842,21 @@ try {
     assert.equal(summaries(), before + 1);
     dom.window.dispatchEvent(new dom.window.Event('focus')); await tick();
     assert.equal(summaries(), before + 1, 'a focus right after opening does not read again');
+    // Credits on their way: the 30 s poll re-reads the summary once it is a minute old, and stops once they arrive.
+    owner = 'user'; success(sample, freeAI(freeZero, { delivering: { credits: 100 } })); await refresh();
+    assert.match(win.text(), /Adding your AI credits…/);
+    before = summaries();
+    await triggerTimer(30000);
+    assert.equal(summaries(), before, 'inside a minute the poll reads usage only');
+    success(sample, freeAI(freeStarter, { balance: 100, balanceMicro: M('100'), state: 'ok' }));
+    Date.now = () => realNow() + 61_000;
+    try { await triggerTimer(30000); } finally { Date.now = realNow; }
+    assert.equal(summaries(), before + 1);
+    assert.match(win.text(), /100 credits left of 100/);
+    assert.doesNotMatch(win.text(), /being added|No credits left/);
+    Date.now = () => realNow() + 2 * 61_000;
+    try { await triggerTimer(30000); } finally { Date.now = realNow; }
+    assert.equal(summaries(), before + 1, 'with nothing on its way the poll is back to usage only');
     // Defence in depth: a kept block that does not name its user is still dropped when the signed-in user changes.
     owner = 'user-c'; success(sample, premiumAI({ ...worked, userId: null })); await refresh();
     assert.match(win.text(), /1,246 credits left of 1,500/);
