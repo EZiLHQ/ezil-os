@@ -1392,6 +1392,7 @@ to{opacity:0;-webkit-transform:translate3d(100%,0,0);transform:translate3d(100%,
 .ezil-upgrade-payment [data-role=checkout-state]>p:empty{display:none}
 .ezil-upgrade-payment [data-role=trial-terms]{margin:0 0 12px;font-size:13px;line-height:1.45}
 .ezil-upgrade-payment [data-role=trial-terms] p{margin:0 0 4px}
+.ezil-upgrade-backdrop:not(.is-compact) .ezil-upgrade-payment [data-role=trial-terms]{display:none}
 .ezil-upgrade-backdrop.is-compact .ezil-upgrade-sheet{position:absolute;inset:0;width:100%;max-height:100%;border:0;border-radius:0}
 .ezil-upgrade-backdrop.is-compact .ezil-upgrade-columns{grid-template-columns:minmax(0,1fr)}
 .ezil-upgrade-backdrop.is-compact .ezil-upgrade-summary{padding:56px 12px 16px}

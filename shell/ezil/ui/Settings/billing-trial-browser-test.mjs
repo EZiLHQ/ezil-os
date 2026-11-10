@@ -168,6 +168,9 @@ try {
                 ends: ends?.textContent.replace(/\s+/g, ' ').trim() ?? null, datetime: ends?.querySelector('time')?.getAttribute('datetime') ?? null,
                 charge: dialog.querySelector('[data-role="trial-charge"]')?.textContent.replace(/\s+/g, ' ').trim() ?? null,
                 termsVisible: !! box && box.width > 0 && box.height > 0,
+                compact: dialog.closest('.ezil-upgrade-backdrop')?.classList.contains('is-compact') ?? null,
+                firstCharge: dialog.querySelector('[data-role="trial-first-charge"]')?.textContent ?? '',
+                firstChargeVisible: (() => { const r = dialog.querySelector('[data-role="trial-first-charge"]')?.getBoundingClientRect(); return !! r && r.width > 0 && r.height > 0; })(),
                 continueButton: !! dialog.querySelector('[data-action="trial-continue"]'), stripe: !! dialog.querySelector('[data-role="fake-stripe"]'),
                 inside: rect.left >= -0.5 && rect.right <= innerWidth + 0.5, overflow: dialog.scrollWidth - dialog.clientWidth,
                 checkouts: window.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input),
@@ -177,7 +180,10 @@ try {
             t.ends === 'Your free month ends on Saturday, February 27, 2027 at 7:00 PM Pacific Standard Time (America/Los_Angeles).' && t.datetime === END, `${t.ends} | ${t.datetime}`);
         push(`${label} · terms: a payment method is required and $20.00 is charged monthly from that date`,
             t.charge === 'A payment method is required. $20.00 is charged monthly from that date unless you cancel. Cancel any time before then in Settings → Billing and you pay nothing.', t.charge);
-        push(`${label} · terms stay visible beside the payment form (also when the summary is collapsed)`, t.termsVisible, JSON.stringify(t));
+        // Wide: the summary column shows the quoted date beside the form, so the passive line is not repeated.
+        // Compact: the summary collapses, so the passive line above the form is where the date stays visible.
+        push(`${label} · the quoted date is visible beside the form exactly once (summary column wide, passive line compact)`,
+            t.compact === true ? t.termsVisible : (! t.termsVisible && t.firstChargeVisible && /2027/.test(t.firstCharge)), JSON.stringify(t));
         push(`${label} · no Continue step: checkout opens on its own and echoes exactly the quoted end`,
             ! t.continueButton && t.stripe && JSON.stringify(t.checkouts) === JSON.stringify([{ sku: 'standard_monthly_v3', trial: { trialEndsAt: END } }]), JSON.stringify(t));
         push(`${label} · the sheet stays inside the viewport with no horizontal overflow`, t.inside && t.overflow <= 0, JSON.stringify(t));

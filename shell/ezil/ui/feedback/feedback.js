@@ -112,8 +112,9 @@ function read_draft () {
 }
 
 /** @param {{clientRequestId:string,category:string,description:string}|null} draft */
-function write_draft (draft) {
-    write_json(DRAFT_KEY, draft && draft.description.trim()
+function write_draft (draft, keepBlank = false) {
+    // A blank draft is kept only while its report is queued: reopening must resume that same request.
+    write_json(DRAFT_KEY, draft && (keepBlank || draft.description.trim())
         ? { clientRequestId: draft.clientRequestId, category: CATEGORY, description: draft.description } : null);
 }
 
@@ -515,6 +516,28 @@ export function open_feedback_dialog (_opts) {
     let restoreCapture = null;
     let captureController = null;
     if ( draft ) description.value = draft.description;
+    // A draft whose report is already queued (sent offline or after a server error) reopens as that same
+    // request: its diagnostics and screenshot come from the queued body, so a re-send stays byte-identical
+    // (same clientRequestId) instead of becoming a second report.
+    let restoredFromQueue = false;
+    const queuedEntry = draft ? read_outbox().find(entry => entry.clientRequestId === clientRequestId) : null;
+    if ( queuedEntry ) {
+        try {
+            const queuedBody = JSON.parse(queuedEntry.body);
+            diagnosticSnapshot = queuedBody.diagnostics ?? null;
+            diagnostics.checked = diagnosticSnapshot !== null;
+            if ( screenshotConsent ) {
+                screenshotConsent.checked = !! queuedBody.screenshot;
+                if ( queuedBody.screenshot ) {
+                    screenshot = queuedBody.screenshot;
+                    const image = dialog.querySelector('.ezil-feedback-image');
+                    image.querySelector('img').src = `data:${screenshot.contentType};base64,${screenshot.dataBase64}`;
+                    image.hidden = false;
+                }
+            }
+            restoredFromQueue = true;
+        } catch { /* An unreadable queued body is treated as a new report. */ }
+    }
     if ( typeof _opts?.errorCode === 'string' && /^[a-z0-9_:-]{1,64}$/i.test(_opts.errorCode) ) {
         // Opened from the opening screen's "Send feedback": name the error code so the report can be routed.
         // Round 4: also with a saved draft (appended once, within the 4,000-character limit).
@@ -528,7 +551,8 @@ export function open_feedback_dialog (_opts) {
 
     function save_draft () {
         if ( sent || closed ) return;
-        write_draft({ clientRequestId, category: CATEGORY, description: description.value });
+        write_draft({ clientRequestId, category: CATEGORY, description: description.value },
+            read_outbox().some(entry => entry.clientRequestId === clientRequestId));
     }
 
     function show_sent (data) {
@@ -814,10 +838,13 @@ export function open_feedback_dialog (_opts) {
             submit.disabled = true;
             capture_note.textContent = 'Finishing the screenshot…';
             let timer;
-            await Promise.race([autoPending, new Promise(resolve => { timer = setTimeout(resolve, AUTO_CAPTURE_WAIT_MS); })]);
-            clearTimeout(timer);
-            abort_auto();
-            settling = false;
+            try {
+                await Promise.race([autoPending, new Promise(resolve => { timer = setTimeout(resolve, AUTO_CAPTURE_WAIT_MS); })]);
+            } finally {
+                clearTimeout(timer);
+                abort_auto();
+                settling = false;
+            }
             if ( closed ) return;
             if ( ! screenshot ) capture_note.textContent = NO_AUTO_CAPTURE;
             else capture_note.textContent = '';
@@ -893,7 +920,7 @@ export function open_feedback_dialog (_opts) {
     for ( const type of ['ezil:teardown', 'popstate', 'pagehide', 'hashchange'] ) window.addEventListener(type, close);
     previewBox.addEventListener('toggle', () => { if ( previewBox.open ) preview.textContent = serialized; });
     // Diagnostics are selected by default: the frozen snapshot is taken now (nothing uploads until Send).
-    if ( diagnostics.checked ) snapshot_diagnostics();
+    if ( diagnostics.checked && ! restoredFromQueue ) snapshot_diagnostics();
     dialog.querySelector('[data-action="refresh-diagnostics"]').hidden = ! diagnostics.checked;
     refresh();
     if ( waiting ) result.textContent = waiting === 1
@@ -901,7 +928,7 @@ export function open_feedback_dialog (_opts) {
         : `${waiting} earlier reports are waiting to be sent. They will go when you are back online.`;
     dialog.showModal();
     description.focus();
-    start_auto_capture();
+    if ( ! restoredFromQueue ) start_auto_capture();
 }
 
 /** Listing and deleting reports are small requests: a stalled one fails instead of loading forever. */

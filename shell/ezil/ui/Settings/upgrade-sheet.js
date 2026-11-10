@@ -321,6 +321,11 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
      * compact layout where the summary column is collapsed): the exact quoted end in the viewer's zone and what is
      * charged from then. No button: the checkout opens on its own. `changed` adds the new-date notice.
      */
+    /** Terminal and error states say nothing was started or charged: the quoted terms must not sit beside them. */
+    function hideTrialTerms () {
+        const box = dialog.querySelector('[data-role="trial-terms"]');
+        if ( box ) box.hidden = true;
+    }
     function showTrialTerms (changed = false) {
         const box = dialog.querySelector('[data-role="trial-terms"]');
         if ( ! box || ! quote ) return;
@@ -362,6 +367,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
             return;
         }
         // Not this person's to start (or already starting): back to Billing, which re-reads the offer.
+        hideTrialTerms();
         if ( failure?.code === 'trial_unavailable' || failure?.code === 'trial_checkout_complete' ) show(failure.message, 'Back to Billing', returnToBilling, 'return-to-billing');
         else show(failure?.message || errorCopy('unavailable'), 'Retry', () => { void requote(changed); });
     }
@@ -458,6 +464,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
                 if ( result.status === 'expired' ) {
                     finished = true;
                     clearTimers();
+                    hideTrialTerms();
                     show(trialMode ? 'This checkout expired, so nothing was charged. Close this and start your free month again.' : 'This checkout has expired. Close the sheet and try again.');
                     return;
                 }
@@ -568,10 +575,14 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
             if ( trialMode && error?.code === 'trial_quote_stale' ) {
                 // One automatic re-quote per open; a second stale end stops at an explicit Retry (no checkout loop).
                 if ( staleRetried ) {
-                    if ( ! closed ) show("Your free month's end date changed again. Check the date above, then try again.", 'Retry', () => { quote = null; void create(); });
+                    if ( ! closed ) {
+                        // The date shown is the one that just went stale: hide it until Retry quotes a fresh one.
+                        dialog.querySelector('[data-role="trial-terms"]').hidden = true;
+                        show("Your free month's end date changed again. Try again to see the new date.", 'Retry', () => { quote = null; void create(); });
+                    }
                 } else { staleRetried = true; stale = true; }
             } else if ( closed ) { /* Nothing to show. */ }
-            else if ( trialMode && TRIAL_ERRORS.has(error?.code) ) show(error.message, 'Back to Billing', returnToBilling, 'return-to-billing');
+            else if ( trialMode && TRIAL_ERRORS.has(error?.code) ) { hideTrialTerms(); show(error.message, 'Back to Billing', returnToBilling, 'return-to-billing'); }
             else show(error?.message || 'Could not open billing. Try again.', 'Retry', () => { void create(); });
         } finally { busy = false; }
         if ( stale && ! closed ) {

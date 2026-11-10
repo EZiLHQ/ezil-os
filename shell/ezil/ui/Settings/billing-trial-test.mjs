@@ -336,6 +336,7 @@ test('trial_quote_stale twice stops at an explicit Retry: no checkout loop, one 
     assert.equal(h.count('billing.createCheckout'), 2, 'no third checkout without a click');
     assert.equal(h.mounted, 0);
     assert.match(h.text(), /end date changed again/);
+    assert.equal(h.q('[data-role="trial-terms"]').hidden, true, 'the date that just went stale is not shown until Retry quotes a fresh one');
     const retry = h.q('[data-action="retry"]');
     assert.ok(retry);
     // Two clicks in a row open one request, not two.
@@ -368,6 +369,7 @@ test('refusals: trial_unavailable / trial_checkout_complete go back to Billing; 
     h.openTrial();
     await settle();
     assert.match(h.text(), /The free month isn't available for this account\./);
+    assert.equal(h.q('[data-role="trial-terms"]').hidden, true);
     assert.equal(h.count('billing.createCheckout'), 0);
     h.click('[data-action="return-to-billing"]');
     assert.equal(h.done, 1, 'Billing re-reads the offer');
@@ -379,6 +381,7 @@ test('refusals: trial_unavailable / trial_checkout_complete go back to Billing; 
     assert.match(h.text(), /Your free month is already starting\. Wait a moment, then refresh Billing\./);
     assert.ok(h.q('[data-action="return-to-billing"]'));
     assert.equal(h.q('[data-action="retry"]'), null);
+    assert.equal(h.q('[data-role="trial-terms"]').hidden, true, 'no "your free month ends on…" beside a refusal');
     h.handle.close();
     // Anything but a $0 Standard quote whose end is its first charge is refused before it is disclosed.
     for ( const bad of [{ todayCents: 2000 }, { sku: 'premium_monthly_v3' }, { firstChargeAt: '2027-03-01T00:00:00Z' }, { trialEndsAt: 'next month' }, { amountCents: 0 }] ) {

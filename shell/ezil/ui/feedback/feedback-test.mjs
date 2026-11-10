@@ -523,6 +523,40 @@ try {
             close();
         } finally { defaultCapture = false; nextCanvas = () => Promise.resolve(document.createElement('canvas')); }
     });
+    await check('reopening after a send that got no answer resumes that same request byte for byte (text or blank), never a second report', async () => {
+        defaultCapture = true;
+        const realRespond = respond;
+        try {
+            respond = async () => { throw new TypeError('Failed to fetch'); };
+            for ( const text of ['Reopen me', ''] ) {
+                window.localStorage.removeItem(draftKey);
+                open();
+                if ( text ) setDescription(text);
+                await until(() => ! current().querySelector('.ezil-feedback-image').hidden);
+                const requests = calls.length;
+                send();
+                await until(() => calls.length === requests + 1 && ! current().querySelector('[type="submit"]').disabled);
+                const first = calls.at(-1).body;
+                const id = JSON.parse(first).clientRequestId;
+                assert.ok(JSON.parse(first).screenshot && JSON.parse(first).diagnostics, 'default attachments were sent');
+                close();
+                // A new event in the ring would change a fresh snapshot: the resumed request must keep the queued one.
+                telemetry.capture({ eventClass: 'api_failure', site: 's', code: `between_opens_${text.length}` });
+                const shells = captureCalls.length;
+                open();
+                assert.equal(payload().clientRequestId, id, `${text || 'blank'}: the same request id`);
+                assert.equal(current().querySelector('pre').textContent, first, 'the preview is the queued body');
+                assert.equal(captureCalls.length, shells, 'no new capture for a request that is already queued');
+                assert.equal(current().querySelector('.ezil-feedback-image').hidden, false, 'the queued screenshot is shown');
+                send();
+                await until(() => calls.length === requests + 2 && ! current().querySelector('[type="submit"]').disabled);
+                assert.equal(calls.at(-1).body, first, 'the re-send is byte-identical');
+                close();
+                window.localStorage.removeItem(outboxKey);
+                window.localStorage.removeItem(draftKey);
+            }
+        } finally { defaultCapture = false; respond = realRespond; }
+    });
     await check('switching the screenshot off aborts the default capture, switching it on starts one, and a manual capture replaces it', async () => {
         defaultCapture = true;
         try {
