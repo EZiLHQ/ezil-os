@@ -1247,8 +1247,9 @@ export type ParkReservationResult = TransitionResult
  * The park reservation (aws-failed-release-park.ts): UNCONFIRMED -> RECOVERING in ONE transaction that takes the same lock order as
  * every other placement writer (global admission -> canonical computer -> placement row) and, under those locks, refuses while ANYTHING
  * else could be writing for the computer: an image job in any non-terminal phase or an orphaned reservation (`assertNoImageReservation`),
- * a pool-host lease or tenant binding, a writer lease row (the table exists only where the ready-pool SQL is registered), a migration
- * that is not committed, or a reverse move that still holds the computer. The identity CAS is the ordinary one (`casInTx`): owner,
+ * a pool-host lease or tenant binding, a writer lease row (the table exists only where the ready-pool SQL is registered), a forward
+ * migration the machine still has work for (`forwardMoveBusy`: a non-terminal row, or a failed one whose AWS provision is not released;
+ * historical committed/failed rows do not hold), or a reverse move that still holds the computer. The identity CAS is the ordinary one (`casInTx`): owner,
  * generation, lease epoch, state, job, digest, fence, instance, volume, last error and updated-at. Compute SQL stays in this file.
  */
 export async function writeParkedStopReservation(db: PlacementDb, p: Placement, fields: PlacementFields): Promise<ParkReservationResult> {
@@ -1264,16 +1265,15 @@ export async function writeParkedStopReservation(db: PlacementDb, p: Placement, 
         if (!current || current.state !== 'UNCONFIRMED') return { ok: false, reason: 'cas_conflict' } as const;
         await assertNoImageReservation(tx, p.computerId);
         const held = rowsOf(await tx.execute(sql`/* placement:park-blockers */
-            SELECT kind FROM (
-                SELECT 'pool_lease' AS kind FROM public.ezil_compute_pool_hosts WHERE leased_computer_id = ${id}::uuid AND state <> 'retired'
-                UNION ALL SELECT 'migration' AS kind FROM public.ezil_compute_migrations WHERE computer_id = ${id}::uuid AND state <> 'committed'
-            ) b LIMIT 1`));
-        if (held.length) return { ok: false, reason: 'blocked', blocker: held[0]!.kind === 'migration' ? 'migration' : 'pool_lease' } as const;
+            SELECT 'pool_lease' AS kind FROM public.ezil_compute_pool_hosts WHERE leased_computer_id = ${id}::uuid AND state <> 'retired' LIMIT 1`));
+        if (held.length) return { ok: false, reason: 'blocked', blocker: 'pool_lease' } as const;
+        // The canonical forward-machine check (the reverse-move create uses it under this same computer lock): an unknown state holds.
+        const { forwardMoveBusy, reverseMoveHolds } = await import('./provider-reverse-store');
+        if (await forwardMoveBusy(tx, id)) return { ok: false, reason: 'blocked', blocker: 'migration' } as const;
         const leases = rowsOf(await tx.execute(sql`SELECT to_regclass('public.ezil_compute_writer_leases') IS NOT NULL AS present`));
         if (leases[0]?.present === true
             && rowsOf(await tx.execute(sql`/* placement:park-writer-lease */ SELECT 1 AS held FROM public.ezil_compute_writer_leases
                 WHERE computer_id = ${id}::uuid LIMIT 1`)).length > 0) return { ok: false, reason: 'blocked', blocker: 'writer_lease' } as const;
-        const { reverseMoveHolds } = await import('./provider-reverse-store');
         if (await reverseMoveHolds(tx, id)) return { ok: false, reason: 'blocked', blocker: 'reverse_move' } as const;
         return casInTx(tx, p.computerId, p, 'RECOVERING', { generation: 0, leaseEpoch: 0 }, fields, {
             provider: 'aws-ec2', ownerUserId: p.ownerUserId, instanceId: p.instanceId, lastError: p.lastError,

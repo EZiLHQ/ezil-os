@@ -335,7 +335,7 @@ function intercepting(deps: ParkDeps, answer: (text: string) => { rows: unknown[
 describe('park a failed release: exclusions under the reservation locks', () => {
     const blockers: [string, string, (text: string) => { rows: unknown[] } | null][] = [
         ['a pool-host lease on the computer', 'blocked_pool_lease', t => t.startsWith('/* placement:park-blockers */') ? { rows: [{ kind: 'pool_lease' }] } : null],
-        ['an uncommitted migration', 'blocked_migration', t => t.startsWith('/* placement:park-blockers */') ? { rows: [{ kind: 'migration' }] } : null],
+        ['a forward migration the machine still has work for', 'blocked_migration', t => /FROM public\.ezil_compute_migrations/.test(t) ? { rows: [{ busy: 1 }] } : null],
         ['a writer lease row (table present)', 'blocked_writer_lease', t => /to_regclass\('public\.ezil_compute_writer_leases'\)/.test(t) ? { rows: [{ present: true }] }
             : t.startsWith('/* placement:park-writer-lease */') ? { rows: [{ held: 1 }] } : null],
         ['a reverse move that still holds the computer', 'blocked_reverse_move', t => /to_regclass\('public\.ezil_compute_reverse_moves'\)/.test(t) ? { rows: [{ present: true }] }
@@ -348,6 +348,19 @@ describe('park a failed release: exclusions under the reservation locks', () => 
         await untouched(s);
         // The same proof reserves once the blocker is gone.
         expect(await s.reserve()).toMatchObject({ outcome: 'reserved', error: null, parkJobId: STOP_JOB });
+    });
+
+    it('asks the canonical forward-machine question: terminal committed/failed history does not hold, an unreleased AWS provision does, and only under the park locks', async () => {
+        const s = parkSetup();
+        const seen: string[] = [];
+        const spy = intercepting(s.deps, t => { if (/FROM public\.ezil_compute_migrations/.test(t)) seen.push(t); return null; });
+        expect(await s.reserve(s.request, spy)).toMatchObject({ outcome: 'reserved' });
+        expect(seen).toHaveLength(1);
+        const text = seen[0]!.replace(/\s+/g, ' ');
+        expect(text).toContain("state NOT IN ('committed', 'failed_reopened', 'failed_needs_operator')");
+        expect(text).toContain("state IN ('failed_reopened', 'failed_needs_operator') AND workspace_head ? '_awsProvision'");
+        expect(text).toContain("'{_awsProvision,released}'");
+        expect(text).not.toMatch(/state <> 'committed'/); // the old predicate also held every historical failed row
     });
 
     it('refuses on a writer-lease ROW even when the placement lease proxy is empty (lease_until null)', async () => {
