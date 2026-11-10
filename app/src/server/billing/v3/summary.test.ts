@@ -3,7 +3,7 @@ import { offeredPack } from '../stripe/packs.test-support';
 import { readBillingConfig } from '../config';
 import { CATALOG_V3, type SellableSkuV3 } from './contract';
 import { planFromSubscriptions } from './catalog';
-import { buildSummaryV3, usedGiBOf, usedSecondsInWindow } from './summary';
+import { aiAccountSummaryV3, buildSummaryV3, usedGiBOf, usedSecondsInWindow } from './summary';
 
 const now = new Date('2026-10-19T12:00:00Z');
 const start = new Date('2026-10-10T00:00:00Z'), end = new Date('2026-11-10T00:00:00Z');
@@ -651,6 +651,23 @@ describe('round 5 D1: AI enrollment, waiting credits and the EZiL ID action', ()
             enrollment: { state: 'activating', ezilIdUrl: link } });
         expect(parked.ai).toMatchObject({ waiting: { credits: 100 } });
         expect(parked.ai).not.toHaveProperty('delivering');
+    });
+    it('aiAccountSummaryV3 (the Usage balance read) carries exactly the summary\'s ai.account and ai.delivering', () => {
+        const grant = { creditsMicro: '100000000', remainingMicro: '98418718', expiresAt: future, live: true, source: 'entitlement' as const };
+        const cases: [Input, string][] = [
+            [{ ...input(), ai: { receipts: [starter], gatewayGrants: [], balanceMicro: '0', heldMicro: '0', userId: 'u' } }, 'enrolled'],
+            [{ ...input(), ai: { receipts: [{ ...starter, deliveredAt: '2026-10-19T12:00:30.000Z' }], gatewayGrants: [grant],
+                balanceMicro: '98418718', heldMicro: '0', userId: 'u' } }, 'enrolled'],
+            [{ ...input('premium_monthly_v3'), ai }, 'enrolled'],
+            [{ ...input(), ai: { receipts: [starter], gatewayGrants: null, balanceMicro: null } }, 'activating'],
+        ];
+        for (const [args, state] of cases) {
+            const enrollment = state as 'enrolled' | 'activating';
+            const summary = buildSummaryV3({ ...args, enrollment: { state: enrollment, ezilIdUrl: null } });
+            const { account, delivering } = summary.ai;
+            expect(aiAccountSummaryV3({ subs: args.subs, userCreatedAt: args.userCreatedAt, paymentIssues: args.paymentIssues,
+                operatorGrants: args.operatorGrants, enrollment, now: args.now, ai: args.ai! })).toEqual({ account, ...(delivering ? { delivering } : {}) });
+        }
     });
     it('checkout off keeps top-up off in every state', () => {
         const args = input(); args.config.checkoutEnabled = false;

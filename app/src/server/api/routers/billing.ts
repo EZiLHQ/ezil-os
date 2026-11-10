@@ -6,7 +6,7 @@ import { checkoutAvailable } from '@/server/billing/config';
 import { aiPackCheckoutEligible, CUSTOM_TOPUP, CUSTOM_TOPUP_SKU, customTopupPack } from '@/server/billing/catalog';
 import { hasAiTopupReceipts, type AiTopupReceiptStore } from '@/server/billing/ai-credits';
 import type { CatalogPack } from '@/server/billing/types';
-import { enqueueFreeAiCredits, readAiAccount, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
+import { enqueueFreeAiCredits, readAiAccount, readAiAccountEvidence, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
 import { lookupAiAccount, missingAiAccountView } from '@/server/billing/ai-credit-outbox-store';
 import { readAiUsage } from '@/server/billing/ai-usage';
 import { readAiLimits } from '@/server/billing/ai-limits';
@@ -18,7 +18,7 @@ import { readStripePacks } from '@/server/billing/stripe/packs';
 import { BillingProviderError, StripeRequestError } from '@/server/billing/stripe/client';
 import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
 import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
-import { buildSummaryV3, computePlanV3, DISK_FALLBACK_GIB, type ReverseMoveSummaryInput } from '@/server/billing/v3/summary';
+import { aiAccountSummaryV3, buildSummaryV3, computePlanV3, DISK_FALLBACK_GIB, type ReverseMoveSummaryInput } from '@/server/billing/v3/summary';
 import { deriveStanding, neverPaidTrial, operatorAccessFor } from '@/server/billing/v3/standing';
 import {
     hasTrials, quoteFresh, TRIAL_CHECKOUT_TTL_SECONDS, TRIAL_SKU, trialEligibility, trialTerms, type TrialFacts, type TrialStore,
@@ -594,6 +594,27 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             return { ...summary, ai: { ...summary.ai, ...ai,
                 // Older consumers cannot describe a pause. They must not call it healthy or exhausted.
                 state: ai.spendingState === 'available' ? ai.balanceState : 'unavailable' } };
+        }),
+
+        /**
+         * `ai.account` and `ai.delivering` as `summary` sends them, for the Usage poll's balance freshness: database reads
+         * and the Gateway's balance and usage page only. No Stripe read, no free-grant enqueue (`summary` and a computer open do that).
+         */
+        aiAccount: protectedProcedure.query(async ({ ctx, signal }) => {
+            const deps = getDeps();
+            if (!deps.config.tabEnabled) return { enabled: false as const };
+            const now = deps.now();
+            const [subs, userCreatedAt, paymentIssues, operatorGrants, enrollment, receipts, gateway] = await Promise.all([
+                deps.store.subscriptionsFor(ctx.user.id),
+                deps.store.userCreatedAt(ctx.user.id),
+                deps.store.openPaymentIssues(ctx.user.id),
+                deps.store.operatorEntitlementsFor?.(ctx.user.id) ?? [],
+                aiEnrollmentOf(aiMember, ctx.db, ctx.user),
+                aiReceipts(deps, ctx.user.id),
+                readAiAccountEvidence({ config: deps.config, userId: ctx.user.id, headers: ctx.headers, signal }),
+            ]);
+            return { enabled: true as const, ...aiAccountSummaryV3({ subs, userCreatedAt, paymentIssues, operatorGrants, enrollment, now,
+                ai: { receipts, ...gateway, userId: ctx.user.id } }) };
         }),
 
         aiUsage: protectedProcedure.input(z.object({

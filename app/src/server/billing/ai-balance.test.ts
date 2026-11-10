@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { aiBalanceState, enqueueFreeAiCredits, parseAiBalance, parseAiBalanceMicro, parseAiGatewayState, parseAiGrants, parseAiOpenHolds, aiMicroBalanceState, readAiBalance, readAiAccount } from './ai-balance';
+import { aiBalanceState, enqueueFreeAiCredits, enqueueFreeAiCreditsFor, parseAiBalance, parseAiBalanceMicro, parseAiGatewayState, parseAiGrants, parseAiOpenHolds, aiMicroBalanceState, readAiBalance, readAiAccount, readAiAccountEvidence } from './ai-balance';
 import type { OutboxInsert } from './ports';
 
 const input = { config: { fundingUrl: 'https://gateway.test/' }, userId: 'current-user', headers: new Headers(),
@@ -130,6 +130,65 @@ describe('Free summary grant', () => {
         await expect(enqueueFreeAiCredits({ enqueueOutbox: vi.fn().mockRejectedValue(new Error('postgres://secret-token')) },
             'user', 'free_v3', new Date())).resolves.toBeUndefined();
         expect(warn).toHaveBeenCalledExactlyOnceWith('[billing.ai] free grant enqueue unavailable');
+    });
+});
+
+describe('Free grant from a desktop or Code open', () => {
+    const now = new Date('2026-11-10T12:00:00Z');
+    const outbox = () => {
+        const rows = new Map<string, OutboxInsert>();
+        return { rows, enqueueOutbox: vi.fn(async (item: OutboxInsert) => {
+            if (rows.has(item.eventKey)) return 'duplicate' as const;
+            rows.set(item.eventKey, item); return 'queued' as const;
+        }) };
+    };
+    const deps = (store: ReturnType<typeof outbox>, subs: unknown[] = [], tabEnabled = true) => ({
+        config: { tabEnabled }, now: () => now,
+        store: { ...store, subscriptionsFor: vi.fn(async () => subs), userCreatedAt: vi.fn(async () => null) },
+    }) as unknown as Parameters<typeof enqueueFreeAiCreditsFor>[0];
+    it('a new Free account gets one starter grant however often it opens, and a later summary adds none', async () => {
+        const store = outbox();
+        await enqueueFreeAiCreditsFor(deps(store), 'user');
+        await enqueueFreeAiCreditsFor(deps(store), 'user');
+        await enqueueFreeAiCredits(store, 'user', 'free_v3', new Date('2026-11-11Z'));
+        expect(store.rows.size).toBe(1);
+        expect([...store.rows.values()][0]).toMatchObject({ eventKey: 'ezil-os:v1:free-once:user:grant',
+            payload: { credits: 100, expiresAt: '2027-11-10T12:00:00.000Z' } });
+    });
+    it('a paid subscriber, a disabled billing tab or a failed read enqueues nothing and never throws', async () => {
+        const paid = outbox();
+        await enqueueFreeAiCreditsFor(deps(paid, [{ sku: 'standard_monthly_v3', stripeSubscriptionId: 'sub', status: 'active',
+            currentPeriodStart: new Date('2026-11-01Z'), currentPeriodEnd: new Date('2026-12-01Z'), cancelAtPeriodEnd: false }]), 'user');
+        const off = outbox();
+        await enqueueFreeAiCreditsFor(deps(off, [], false), 'user');
+        expect(paid.enqueueOutbox).not.toHaveBeenCalled();
+        expect(off.enqueueOutbox).not.toHaveBeenCalled();
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const failing = { config: { tabEnabled: true }, now: () => now,
+            store: { subscriptionsFor: vi.fn().mockRejectedValue(new Error('postgres://secret-token')), userCreatedAt: vi.fn(), enqueueOutbox: vi.fn() } };
+        await expect(enqueueFreeAiCreditsFor(failing as unknown as Parameters<typeof enqueueFreeAiCreditsFor>[0], 'user')).resolves.toBeUndefined();
+        expect(warn).toHaveBeenCalledExactlyOnceWith('[billing.ai] free grant enqueue unavailable');
+    });
+});
+
+describe('AI account evidence (the Usage balance read)', () => {
+    it('reads the balance and usage page only, with the same parsing as readAiAccount', async () => {
+        const paths: string[] = [];
+        const balance = { available_micro: '100000000', held_micro: '0', state: 'ok',
+            grants: [{ credits_micro: '100000000', remaining_micro: '100000000', expires_at: '2027-11-10T00:00:00Z', live: true, source: 'entitlement' }] };
+        const fetch = vi.fn(async (url: string) => {
+            const path = new URL(url).pathname; paths.push(path);
+            return new Response(JSON.stringify(path === '/v1/me/balance' ? balance : { object: 'list', data: [] }), { status: 200 });
+        });
+        const input = { config: { fundingUrl: 'https://gateway.test' }, userId: 'user',
+            headers: new Headers({ authorization: 'Bearer token' }), fetch: fetch as unknown as typeof globalThis.fetch };
+        const evidence = await readAiAccountEvidence(input);
+        expect(paths.sort()).toEqual(['/v1/me/balance', '/v1/me/usage']);
+        expect(evidence).toEqual({ balanceMicro: '100000000', heldMicro: '0', gatewayState: 'ok', openHolds: [],
+            gatewayGrants: [{ creditsMicro: '100000000', remainingMicro: '100000000', expiresAt: '2027-11-10T00:00:00.000Z', live: true, source: 'entitlement', revokedAt: null }] });
+        const full = await readAiAccount(input);
+        expect({ balanceMicro: full.balanceMicro, heldMicro: full.heldMicro, gatewayState: full.gatewayState, openHolds: full.openHolds,
+            gatewayGrants: full.gatewayGrants }).toEqual(evidence);
     });
 });
 

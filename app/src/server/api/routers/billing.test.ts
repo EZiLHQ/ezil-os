@@ -1473,6 +1473,27 @@ describe('round 4: the computer standing in the summary', () => {
     });
 });
 
+describe('billing.aiAccount: the Usage balance read between summaries', () => {
+    const stripeCalls = (f: ReturnType<typeof fixture>) => Object.values(f.stripe)
+        .reduce((total, fn) => total + ((fn as { mock?: { calls: unknown[] } }).mock?.calls.length ?? 0), 0);
+    it('returns the summary\'s ai.account for the signed-in user, with no Stripe read and no grant enqueue', async () => {
+        const f = fixture();
+        const summary = await f.caller.summary();
+        const stripe = stripeCalls(f), enqueued = f.store.enqueueOutbox.mock.calls.length;
+        const read = await f.caller.aiAccount();
+        expect(read).toEqual({ enabled: true, account: summary.enabled ? summary.ai.account : null });
+        expect(read).toMatchObject({ account: { userId } });
+        expect(stripeCalls(f)).toBe(stripe);
+        expect(f.store.enqueueOutbox.mock.calls.length).toBe(enqueued);
+    });
+    it('is off with the billing tab and refuses an anonymous caller', async () => {
+        const f = fixture();
+        f.deps.config.tabEnabled = false;
+        await expect(f.caller.aiAccount()).resolves.toEqual({ enabled: false });
+        await expect(f.router.createCaller({ ...f.ctx, user: null }).aiAccount()).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
+    });
+});
+
 describe('round 5 D1: summary enrollment state and top-up gating', () => {
     const link = '/auth/auth0/login?returnUrl=/os';
     function enrolling(member: string | null | Error, sub?: unknown) {

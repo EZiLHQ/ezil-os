@@ -517,12 +517,21 @@ check('identity credits: a starter grant on its way reads "being added", never a
     assert.equal(progress(adding, 'ai'), null);
     assert.match(meter(adding, 'ai').textContent, /100 credits are being added to your account\./);
     assert.doesNotMatch(meter(adding, 'ai').textContent, /No credits left|0 credits left|Remaining 0|Used 0/);
-    // Negative control: the same Gateway zero with nothing on its way is a genuine shortage.
+    // Pending is a re-read, never a purchase.
+    const action = (el, selector) => meter(el, 'ai').querySelector(selector);
+    assert.equal(action(adding, '[data-action="refresh-usage"]').textContent, 'Retry');
+    assert.equal(action(adding, '[data-action="usage-ai-recovery"], [data-action="usage-add-credits"]'), null);
+    // Negative control: the same Gateway zero with nothing on its way is a genuine shortage, whose action is Billing's
+    // recovery (`insufficient_credits`).
     for (const extra of [{}, { delivering: { credits: 0 } }, { delivering: { credits: -1 } }, { delivering: { credits: 1.5 } }, { delivering: { credits: '100' } }, { delivering: null }]) {
         const none = rendered(sample, freeAI(freeZero, extra));
         assert.equal(meter(none, 'ai').dataset.state, 'danger');
         assert.match(meter(none, 'ai').textContent, /No credits left/);
+        assert.equal(action(none, '[data-action="usage-ai-recovery"]').getAttribute('href'), '/os?settings=billing&section=ai-credits&reason=insufficient_credits');
+        assert.equal(action(none, '[data-action="refresh-usage"], [data-action="usage-add-credits"]'), null);
     }
+    // Without checkout or top-up there is nothing to offer.
+    assert.equal(action(rendered(sample, { ...freeAI(freeZero), actions: { ...summary.actions, checkout: false, topup: false } }), 'a'), null);
     // Not enrolled: the enrollment copy stays; `delivering` never applies.
     const parked = rendered(sample, freeAI(freeZero, { enrollment: 'activating', waiting: { credits: 100 }, delivering: { credits: 100 } }));
     assert.equal(aiValue(parked), 'Setting up your AI credits…');
@@ -538,6 +547,8 @@ check('identity credits: a starter grant on its way reads "being added", never a
     const down = rendered(sample, freeAI(unreadable, { balance: null, balanceMicro: null, state: 'unavailable', delivering: { credits: 100 } }));
     assert.equal(aiValue(down), 'Unavailable');
     assert.doesNotMatch(meter(down, 'ai').textContent, /100 credits left/);
+    assert.equal(action(down, '[data-action="refresh-usage"]').textContent, 'Retry');
+    assert.equal(action(arrived, '[data-action="usage-add-credits"]').getAttribute('href'), '/os?settings=billing&section=ai-credits');
     for (const node of [adding, arrived, beside]) assert.deepEqual(scanCopy(node.textContent), []);
 });
 check('identity credits: in the payment grace (D17) the period\'s credits wait for the payment; no live grant shows no "of 0" and no bar', () => {
@@ -649,7 +660,9 @@ check('Billing navigation reuses the existing AI credits and upgrade deep links'
     assert.equal(el.querySelector('[data-action="usage-billing"]').getAttribute('href'), '/os?settings=billing');
     assert.equal(el.querySelector('[data-action="usage-upgrade"]').getAttribute('href'), '/os?settings=billing&upgrade=premium');
     assert.equal(el.querySelector('[role="dialog"]'), null);
-    assert.match(meter(rendered(sample, withAI({ balance: null })), 'ai').textContent, /Unavailable.*Add credits/s);
+    // An unreadable balance offers a re-read, not a purchase.
+    assert.match(meter(rendered(sample, withAI({ balance: null })), 'ai').textContent, /Unavailable.*Retry/s);
+    assert.doesNotMatch(meter(rendered(sample, withAI({ balance: null })), 'ai').textContent, /Add credits/);
     assert.deepEqual([...el.querySelectorAll('a, summary')].map(el => el.dataset.action || el.parentElement.dataset.usageDetail), ['usage-upgrade', 'usage-billing', 'usage-add-credits', 'period', 'storage', 'session']);
 });
 check('independent null sources and unsupported responses', () => {
@@ -842,35 +855,46 @@ try {
     assert.equal(summaries(), before + 1);
     dom.window.dispatchEvent(new dom.window.Event('focus')); await tick();
     assert.equal(summaries(), before + 1, 'a focus right after opening does not read again');
-    // Free: the 30 s poll re-reads the summary once it is a minute old, so a starter grant shows on arrival and
-    // credits used in Code show here without a Refresh.
+    // Between summaries the poll re-reads the AI balance (`billing.aiAccount`, no Stripe) once it is a minute old: a
+    // starter grant shows on arrival and credits used in Code show without a Refresh. The summary keeps its five minutes.
+    const reads = path => calls.filter(call => call.path === path).length;
+    const balanceReply = (account, extra = {}) => { replies['billing.aiAccount'] = Promise.resolve({ ok: true, data: { enabled: true, account, ...extra } }); };
+    const pollAt = async ms => { Date.now = () => realNow() + ms; try { await triggerTimer(30000); } finally { Date.now = realNow; } };
     owner = 'user'; success(sample, freeAI(freeZero, { delivering: { credits: 100 } })); await refresh();
     assert.match(win.text(), /Adding your AI credits…/);
-    before = summaries();
+    before = summaries(); const balances = reads('billing.aiAccount');
     await triggerTimer(30000);
-    assert.equal(summaries(), before, 'inside a minute the poll reads usage only');
-    success(sample, freeAI(freeStarter, { balance: 100, balanceMicro: M('100'), state: 'ok' }));
-    Date.now = () => realNow() + 61_000;
-    try { await triggerTimer(30000); } finally { Date.now = realNow; }
-    assert.equal(summaries(), before + 1);
+    assert.equal(reads('billing.aiAccount'), balances, 'inside a minute the poll reads usage only');
+    balanceReply(freeStarter);
+    await pollAt(61_000);
+    assert.equal(reads('billing.aiAccount'), balances + 1);
     assert.match(win.text(), /100 credits left of 100/);
     assert.doesNotMatch(win.text(), /being added|No credits left/);
-    success(sample, freeAI({ ...freeStarter, remainingMicro: M('98.418718'), usedMicro: M('1.581282'),
-        grants: [{ ...freeStarter.grants[0], remainingMicro: M('98.418718') }] }, { balance: 98.418718, balanceMicro: M('98.418718'), state: 'ok' }));
-    Date.now = () => realNow() + 2 * 61_000;
-    try { await triggerTimer(30000); } finally { Date.now = realNow; }
-    assert.equal(summaries(), before + 2);
+    balanceReply({ ...freeStarter, remainingMicro: M('98.418718'), usedMicro: M('1.581282'),
+        grants: [{ ...freeStarter.grants[0], remainingMicro: M('98.418718') }] });
+    await pollAt(2 * 61_000);
+    assert.equal(reads('billing.aiAccount'), balances + 2);
     assert.match(win.text(), /98 credits left of 100[\s\S]*Used 1\.58/);
-    // Paid: credits on their way do not shorten the five-minute rule (its summary previews the renewal on Stripe).
-    owner = 'user-paid'; success(sample, forUser('user-paid', { ...worked, remainingMicro: '0', usedMicro: M('1499.5') })); await refresh();
-    replies['billing.summary'] = Promise.resolve({ ok: true, data: { ...forUser('user-paid', { ...worked, remainingMicro: '0', usedMicro: M('1499.5') }),
-        ai: { ...forUser('user-paid', { ...worked, remainingMicro: '0', usedMicro: M('1499.5') }).ai, delivering: { credits: 1000 } } } });
-    await refresh();
-    before = summaries();
-    Date.now = () => realNow() + 2 * 60_000;
-    try { await triggerTimer(30000); } finally { Date.now = realNow; }
-    assert.equal(summaries(), before, 'a paid plan keeps the five-minute summary rule');
-    assert.match(win.text(), /Adding your AI credits…/);
+    assert.equal(summaries(), before, 'the balance read is not a summary read (no Stripe preview, no enqueue)');
+    // An unreadable balance between summaries keeps the last one as "Couldn't refresh · as of", with a re-read, never as current.
+    replies['billing.aiAccount'] = Promise.resolve({ ok: false });
+    await pollAt(3 * 61_000);
+    assert.match(win.text(), new RegExp(`98 credits left of 100[\\s\\S]*Couldn't refresh · as of ${asOf(worked.asOf)}`));
+    assert.equal(win.find('[data-usage="ai"] [data-action="refresh-usage"]').length, 1);
+    assert.equal(win.find('[data-action="usage-ai-recovery"], [data-action="usage-add-credits"]').length, 0);
+    // Another user's balance is never shown.
+    balanceReply({ ...freeStarter, userId: 'someone-else', remainingMicro: M('55') });
+    await pollAt(4 * 61_000);
+    assert.doesNotMatch(win.text(), /\b55 credits|98 credits/);
+    // A confirmed zero asks Billing for its recovery (`insufficient_credits`); Add credits stays a plain top-up.
+    const topups = []; win.on('ezil:billing-topup', (_event, detail) => topups.push(detail));
+    win.append('<button class="ezil-settings-tab" data-tab="billing"></button>');
+    success(sample, freeAI(freeZero)); await refresh();
+    win.find('[data-action="usage-ai-recovery"]').get(0).click();
+    success(sample, freeAI(freeStarter, { balance: 100, balanceMicro: M('100'), state: 'ok' })); await refresh();
+    win.find('[data-action="usage-add-credits"]').get(0).click();
+    assert.deepEqual(topups, [{ reason: 'insufficient_credits' }, { reason: null }]);
+    win.find('.ezil-settings-tab[data-tab="billing"]').remove(); win.off('ezil:billing-topup');
     // Defence in depth: a kept block that does not name its user is still dropped when the signed-in user changes.
     owner = 'user-c'; success(sample, premiumAI({ ...worked, userId: null })); await refresh();
     assert.match(win.text(), /1,246 credits left of 1,500/);

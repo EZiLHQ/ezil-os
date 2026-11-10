@@ -1,4 +1,5 @@
-import type { BillingStore } from './ports';
+import type { BillingDeps, BillingStore } from './ports';
+import { planFromSubscriptions } from './v3/catalog';
 import type { BillingSummaryV3 } from './v3/contract';
 import { aiCreditEntitlement, aiCreditOutboxItem } from './ai-credits';
 import { createAiReader, creditNumber, isoTimestamp, microString, record, type AiReadInput } from './ai-read';
@@ -133,12 +134,28 @@ export async function readAiAccount(input: AiReadInput): Promise<AiAccountView &
     const [balanceBody, usage, limitsResult, models] = await Promise.all([
         read('/v1/me/balance'), readAiUsage(input, { limit: 20 }, async path => usageBody = await read(path)), readAiLimits(input, read), read('/v1/models'),
     ]);
-    const balanceMicro = parseAiBalanceMicro(balanceBody);
-    return { gatewayGrants: balanceMicro === null ? null : parseAiGrants(balanceBody),
-        openHolds: usage.state === 'available' ? parseAiOpenHolds(usageBody) : null, gatewayState: parseAiGatewayState(balanceBody),
-        balanceMicro, heldMicro: microString(record(balanceBody)?.held_micro), balance: creditNumber(balanceMicro),
+    const { balanceMicro, ...evidence } = accountEvidence(balanceBody, usage.state, usageBody);
+    return { ...evidence, balanceMicro, balance: creditNumber(balanceMicro),
         balanceState: aiMicroBalanceState(balanceMicro, 0), spendingState: spendingState(balanceBody, models, limitsResult.limits),
         recentUsage: usage.recentUsage, limits: limitsResult.limits, usageState: usage.state, limitsState: limitsResult.state };
+}
+
+function accountEvidence(balanceBody: unknown, usageState: 'available' | 'unavailable', usageBody: unknown):
+    AiAccountEvidence & Pick<AiAccountView, 'balanceMicro' | 'heldMicro'> {
+    const balanceMicro = parseAiBalanceMicro(balanceBody);
+    return { gatewayGrants: balanceMicro === null ? null : parseAiGrants(balanceBody),
+        openHolds: usageState === 'available' ? parseAiOpenHolds(usageBody) : null, gatewayState: parseAiGatewayState(balanceBody),
+        balanceMicro, heldMicro: microString(record(balanceBody)?.held_micro) };
+}
+
+/** Only what `ai.account` needs (`billing.aiAccount`, the Usage poll): the balance and the usage page, not limits or models. */
+export async function readAiAccountEvidence(input: AiReadInput): Promise<AiAccountEvidence & Pick<AiAccountView, 'balanceMicro' | 'heldMicro'>> {
+    const read = createAiReader(input);
+    let usageBody: unknown = null;
+    const [balanceBody, usage] = await Promise.all([
+        read('/v1/me/balance'), readAiUsage(input, { limit: 20 }, async path => usageBody = await read(path)),
+    ]);
+    return accountEvidence(balanceBody, usage.state, usageBody);
 }
 
 export async function enqueueFreeAiCredits(store: Pick<BillingStore, 'enqueueOutbox'>, userId: string, sku: string, now: Date): Promise<void> {
@@ -147,5 +164,19 @@ export async function enqueueFreeAiCredits(store: Pick<BillingStore, 'enqueueOut
         const entitlement = aiCreditEntitlement({ userId, sku, subscriptionId: null, periodStart: now, periodEnd: null, invoiceId: null });
         // ON CONFLICT DO NOTHING preserves the first grant instant and expiry across summary reads.
         await store.enqueueOutbox(aiCreditOutboxItem(userId, entitlement, 'grant', null));
+    } catch { console.warn('[billing.ai] free grant enqueue unavailable'); }
+}
+
+/**
+ * The same Free grant from a desktop or Code open, so a new account's starter credits never wait for a Settings or
+ * Billing read of `billing.summary`: that read's plan rule (`planFromSubscriptions` on the stored subscriptions)
+ * and gate (`tabEnabled`), then `enqueueFreeAiCredits`, whose ON CONFLICT DO NOTHING keeps it to one grant. Never throws.
+ */
+export async function enqueueFreeAiCreditsFor(deps: Pick<BillingDeps, 'config' | 'store' | 'now'>, userId: string): Promise<void> {
+    try {
+        if (!deps.config.tabEnabled) return;
+        const now = deps.now();
+        const [subs, userCreatedAt] = await Promise.all([deps.store.subscriptionsFor(userId), deps.store.userCreatedAt(userId)]);
+        await enqueueFreeAiCredits(deps.store, userId, planFromSubscriptions({ subs, now, userCreatedAt }).sku, now);
     } catch { console.warn('[billing.ai] free grant enqueue unavailable'); }
 }
