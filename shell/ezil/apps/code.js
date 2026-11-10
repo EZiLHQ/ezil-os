@@ -1024,7 +1024,7 @@ export async function openCodeWindow (ctx = {}) {
             console.error(`[${PHASE}] code-preview mint failed after ${Math.round(performance.now() - t0)}ms: ${res.errorCode}`);
             telemetry.capture({
                 eventClass: 'api_failure', site: 'ezil-os:apps/code#mint', code: res.errorCode,
-                durationMs: performance.now() - t0,
+                durationMs: performance.now() - t0, reason: res.reason, serverCorrelationId: res.serverCorrelationId,
             });
             const failed = computeBootUiState({
                 requestStatus: 'error',

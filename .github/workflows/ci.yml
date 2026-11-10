@@ -249,6 +249,7 @@ jobs:
                    shell/ezil/ui/full-view-test.mjs \
                    shell/ezil/ui/feedback/capture-test.mjs \
                    shell/ezil/ui/feedback/app-failures-test.mjs \
+                   shell/ezil/app-error-correlation-test.mjs \
                    shell/ezil/ui/feedback/feedback-test.mjs; do
             echo "── $t"
             # feedback-test.mjs imports app/src/server/feedback/types.ts (the

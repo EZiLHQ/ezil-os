@@ -88,6 +88,7 @@ import type { PlacementDb } from '@/server/lib/compute/placement';
 import type { ComputeProvider } from '@/server/lib/compute/provider';
 import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { codeFolderAnswer, parseCodeFolderAsk } from '@/server/lib/compute/code-folder';
+import { isFailureReason } from '@/server/feedback/failure-shapes';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
 /** Ownership check shared by every procedure below — never trust a bare computerId. */
@@ -142,18 +143,24 @@ const LOG_CODE = /^[a-z0-9_]{1,64}$/;
  * (`awsPreviewRefusal`: a category or an allow-listed Worker code, `status` the Worker's HTTP status), else
  * the answer's own server code (an ensure refusal, the stop hold, a billing refusal). Bounded codes only:
  * no URL, token, body or full id. `ms` is this ask's time on the server.
+ *
+ * App-error coverage: the line also carries this ask's own `correlationId` (minted once per ask by
+ * `newCorrelationId`), and the answer returns it with the same `reason` as `refusalReason` when that reason is a
+ * bounded server code (`isFailureReason`). Nothing else: never `error`'s free text. The shell keeps both on its
+ * local telemetry mirror, and only a consented feedback report carries them, so a report joins this line.
  */
-function awsAnswered<T extends { ok: boolean }>(kind: string, surface: 'desktop' | 'app' | 'code', computerId: string, answer: T,
-    startedAt: number, preview?: AwsPreviewResult): T {
+function awsAnswered<T extends { ok: boolean }>(kind: string, surface: 'desktop' | 'app' | 'code', computerId: string, correlationId: string,
+    answer: T, startedAt: number, preview?: AwsPreviewResult): T {
     if (kind !== 'aws-ec2' || answer.ok) return answer;
     const own = answer as { error?: unknown; errorCode?: unknown };
     const refusal = preview ? awsPreviewRefusal(preview) : undefined;
     const code = (value: unknown) => typeof value === 'string' && LOG_CODE.test(value) ? value : 'other';
+    const reason = code(refusal?.reason ?? own.error);
     console.info(JSON.stringify({ event: 'aws-preview', surface, computer: computerId.toLowerCase().slice(0, 8), status: refusal?.status ?? null,
-        error: code(own.errorCode), reason: code(refusal?.reason ?? own.error),
+        error: code(own.errorCode), reason,
         // Round 6: the Worker's allow-listed `aws_desktop_starting` reason (config_pending, code_starting, …) when it gave one.
-        ...(refusal?.detail ? { detail: code(refusal.detail) } : {}), ms: Date.now() - startedAt }));
-    return answer;
+        ...(refusal?.detail ? { detail: code(refusal.detail) } : {}), ms: Date.now() - startedAt, correlationId }));
+    return { ...answer, correlationId, ...(reason !== 'other' && isFailureReason(reason) ? { refusalReason: reason } : {}) };
 }
 
 /**
@@ -291,12 +298,12 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
             // 🔴 Phase B (§5.3): a computer in a move answers the move right after routing: before the billing gate (a held
             // Free user's gate would refuse it as `billing_*` and break the move overlay), the credential sync and any Worker call.
-            if (routed.kind === 'aws-ec2' && routed.reverse) return awsAnswered(routed.kind, 'desktop', input.computerId,
+            if (routed.kind === 'aws-ec2' && routed.reverse) return awsAnswered(routed.kind, 'desktop', input.computerId, correlationId,
                 await reverseRouteAnswer(routed.provider, correlationId, computer), startedAt);
             const billingDeps = getBillingDeps();
             const gate = await gateComputerStart({ deps: billingDeps, ...computer, kind: routed.kind,
                 instanceType: routed.kind === 'aws-ec2' ? routed.instanceType : null, now: billingDeps.now() });
-            if (!gate.allowed) return awsAnswered(routed.kind, 'desktop', input.computerId, {
+            if (!gate.allowed) return awsAnswered(routed.kind, 'desktop', input.computerId, correlationId, {
                 ok: false as const, error: `billing_${gate.reason}`, errorCode: `billing_${gate.reason}`,
                 billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
             }, startedAt);
@@ -316,7 +323,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     { wait: () => waitForAwsPreviewPlacement(ctx.db, computer, signal),
                         ensure: () => routed.provider.ensure({ correlationId }, computer, ensureOptions), signal },
                 );
-                return awsAnswered(routed.kind, 'desktop', input.computerId, answer, startedAt, preview);
+                return awsAnswered(routed.kind, 'desktop', input.computerId, correlationId, answer, startedAt, preview);
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
             const migrating = cloudflareMigrationAnswer(result);
@@ -576,19 +583,19 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             const ensureOptions = { sessionId: input.computerId, desktopMode: 'neko' as const };
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
             // 🔴 Phase B (§5.3): the move's answer first (before the gate, the stop hold and the AWS preview).
-            if (routed.kind === 'aws-ec2' && routed.reverse) return awsAnswered(routed.kind, 'app', input.computerId,
+            if (routed.kind === 'aws-ec2' && routed.reverse) return awsAnswered(routed.kind, 'app', input.computerId, correlationId,
                 await reverseRouteAnswer(routed.provider, correlationId, computer), startedAt);
             const billingDeps = getBillingDeps();
             const gate = await gateComputerStart({ deps: billingDeps, ...computer, kind: routed.kind,
                 instanceType: routed.kind === 'aws-ec2' ? routed.instanceType : null, now: billingDeps.now() });
-            if (!gate.allowed) return awsAnswered(routed.kind, 'app', input.computerId, {
+            if (!gate.allowed) return awsAnswered(routed.kind, 'app', input.computerId, correlationId, {
                 ok: false as const, error: `billing_${gate.reason}`, errorCode: `billing_${gate.reason}`,
                 billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
             }, startedAt);
             if (routed.kind === 'aws-ec2') {
                 // Hotfix r5: a hosted-app poll never restarts a computer that just stopped.
                 const held = await stopCooldownAnswer(ctx.db, computer);
-                if (held) return awsAnswered(routed.kind, 'app', input.computerId, held, startedAt);
+                if (held) return awsAnswered(routed.kind, 'app', input.computerId, correlationId, held, startedAt);
                 let preview: AwsPreviewResult | undefined;
                 const answer = await awsPreviewAnswer(
                     await routed.provider.ensure({ correlationId }, computer, ensureOptions),
@@ -596,7 +603,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                     async () => (preview = await requestAwsPreview(ctx.db, computer, { ...ensureOptions, surface: 'app' }, config, hmacSecret, correlationId)),
                     () => prepareAwsPoolSession(ctx.db, computer, ensureOptions, config, hmacSecret, correlationId),
                 );
-                return awsAnswered(routed.kind, 'app', input.computerId, answer, startedAt, preview);
+                return awsAnswered(routed.kind, 'app', input.computerId, correlationId, answer, startedAt, preview);
             }
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);
             const migrating = cloudflareMigrationAnswer(result);
@@ -809,12 +816,12 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             }
             const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
             // 🔴 Phase B (§5.3): the move's answer first (before the gate, the stop hold, the credential sync and the AWS preview).
-            if (routed.kind === 'aws-ec2' && routed.reverse) return awsAnswered(routed.kind, 'code', input.computerId,
+            if (routed.kind === 'aws-ec2' && routed.reverse) return awsAnswered(routed.kind, 'code', input.computerId, correlationId,
                 await reverseRouteAnswer(routed.provider, correlationId, computer), startedAt);
             const billingDeps = getBillingDeps();
             const gate = await gateComputerStart({ deps: billingDeps, ...computer, kind: routed.kind,
                 instanceType: routed.kind === 'aws-ec2' ? routed.instanceType : null, now: billingDeps.now() });
-            if (!gate.allowed) return awsAnswered(routed.kind, 'code', input.computerId, {
+            if (!gate.allowed) return awsAnswered(routed.kind, 'code', input.computerId, correlationId, {
                 ok: false as const, error: `billing_${gate.reason}`, errorCode: `billing_${gate.reason}`,
                 billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
             }, startedAt);
@@ -828,7 +835,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             if (routed.kind === 'aws-ec2') {
                 // Hotfix r5: a hosted-app poll never restarts a computer that just stopped.
                 const held = await stopCooldownAnswer(ctx.db, computer);
-                if (held) return awsAnswered(routed.kind, 'code', input.computerId, held, startedAt);
+                if (held) return awsAnswered(routed.kind, 'code', input.computerId, correlationId, held, startedAt);
                 // WARM-118: after the ownership and billing gates, the (never-throwing) credential sync overlaps the
                 // first ensure. Both settle before any preview or relay preparation; an ensure rejection is rethrown
                 // only once the sync has drained, so nothing is left running. Cloudflare keeps its order below.
@@ -846,7 +853,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 // Per-tab folder continuity: the Worker's code passes through the preview allowlist (aws-preview.ts);
                 // a hint this app refused says `invalid` here. Only on an open, never on a refusal.
                 const folded = answer.ok ? { ...answer, ...folderAnswer((answer as { codeFolder?: unknown }).codeFolder) } : answer;
-                return awsAnswered(routed.kind, 'code', input.computerId, folded, startedAt, preview);
+                return awsAnswered(routed.kind, 'code', input.computerId, correlationId, folded, startedAt, preview);
             }
             await syncCredential();
             const result = await routed.provider.ensure({ correlationId }, computer, ensureOptions);

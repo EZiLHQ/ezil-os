@@ -391,6 +391,17 @@ try {
         delete event.reason; delete event.serverCorrelationId;
         delete window.__EZIL_BOOT__.desktopState.ui.feedbackEventDiagnostics;
     });
+    await check('the reporter is told about the server-added context, and the client preview stays client-only', () => {
+        open();
+        const consentNote = current().querySelector('[data-role="server-context-note"]').textContent;
+        assert.match(consentNote, /With diagnostics on/);
+        assert.match(consentNote, /after you press Send, so it is not in the preview/);
+        assert.match(consentNote, /never addresses, IDs or anyone else's data/);
+        assert.match(current().querySelector('[data-role="server-context-preview-note"]').textContent, /does not appear here/);
+        change('diagnostics', true);
+        assert.doesNotMatch(current().querySelector('.ezil-feedback-preview pre').textContent, /serverContext/);
+        close();
+    });
     await check('expanded diagnostics are consented, frozen, refreshed and downgraded on a strict old server', async () => {
         window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle = true;
         open(); setDescription('Snapshot test');
