@@ -289,8 +289,11 @@ function announce(state, body) {
     if (changes.length) state.win.find('[data-role="usage-announcement"]').text(changes.join(' '));
 }
 const SUMMARY_MAX_AGE_MS = 5 * 60 * 1000;
-/** While granted credits are on their way (`ai.delivering`), the poll re-reads the summary this often, so they show on arrival. */
-const DELIVERING_SUMMARY_MS = 60 * 1000;
+/**
+ * On Free the poll re-reads the summary this often: a starter grant on its way shows on arrival, and credits used in
+ * Code show here. Free has no renewal preview and the pack catalog is cached, so the read is Gateway-only.
+ */
+const FREE_SUMMARY_MAX_AGE_MS = 60 * 1000;
 /** Whole credits an enrolled account was granted that the Gateway has not acknowledged yet, or null. */
 function deliveringCredits(summary) {
     const ai = summary?.enabled === true && summary.version === 3 ? summary.ai : null;
@@ -316,11 +319,10 @@ async function load(state, manual = false) {
     body.attr('aria-busy', 'true');
     if (state.usage?.session.state === 'recording') body.find('.usage-session-line').html(measuringLine(state.usage.session.elapsedSeconds));
     // billing.summary has side effects (Stripe renewal preview, Gateway balance read, free-credit enqueue):
-    // read it on open, on manual Refresh, or when older than five minutes (one minute while credits are being
-    // added). Otherwise the 30 s poll reads usage only.
-    const summaryAge = Date.now() - (state.summaryAt ?? 0);
-    const summaryDue = manual || state.summaryAt === undefined || summaryAge > SUMMARY_MAX_AGE_MS
-        || (deliveringCredits(state.summary) !== null && summaryAge >= DELIVERING_SUMMARY_MS);
+    // read it on open, on manual Refresh, or when older than five minutes (one minute on Free). Otherwise the 30 s
+    // poll reads usage only.
+    const maxAge = state.summary?.plan?.sku === 'free_v3' ? FREE_SUMMARY_MAX_AGE_MS : SUMMARY_MAX_AGE_MS;
+    const summaryDue = manual || state.summaryAt === undefined || Date.now() - state.summaryAt > maxAge;
     if (summaryDue) state.summaryAt = Date.now();
     const sources = summaryDue ? ['usage', 'summary'] : ['usage'];
     const pending = new Set(sources), failed = new Set();

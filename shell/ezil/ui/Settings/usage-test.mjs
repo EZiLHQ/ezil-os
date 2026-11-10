@@ -842,7 +842,8 @@ try {
     assert.equal(summaries(), before + 1);
     dom.window.dispatchEvent(new dom.window.Event('focus')); await tick();
     assert.equal(summaries(), before + 1, 'a focus right after opening does not read again');
-    // Credits on their way: the 30 s poll re-reads the summary once it is a minute old, and stops once they arrive.
+    // Free: the 30 s poll re-reads the summary once it is a minute old, so a starter grant shows on arrival and
+    // credits used in Code show here without a Refresh.
     owner = 'user'; success(sample, freeAI(freeZero, { delivering: { credits: 100 } })); await refresh();
     assert.match(win.text(), /Adding your AI credits…/);
     before = summaries();
@@ -854,9 +855,22 @@ try {
     assert.equal(summaries(), before + 1);
     assert.match(win.text(), /100 credits left of 100/);
     assert.doesNotMatch(win.text(), /being added|No credits left/);
+    success(sample, freeAI({ ...freeStarter, remainingMicro: M('98.418718'), usedMicro: M('1.581282'),
+        grants: [{ ...freeStarter.grants[0], remainingMicro: M('98.418718') }] }, { balance: 98.418718, balanceMicro: M('98.418718'), state: 'ok' }));
     Date.now = () => realNow() + 2 * 61_000;
     try { await triggerTimer(30000); } finally { Date.now = realNow; }
-    assert.equal(summaries(), before + 1, 'with nothing on its way the poll is back to usage only');
+    assert.equal(summaries(), before + 2);
+    assert.match(win.text(), /98 credits left of 100[\s\S]*Used 1\.58/);
+    // Paid: credits on their way do not shorten the five-minute rule (its summary previews the renewal on Stripe).
+    owner = 'user-paid'; success(sample, forUser('user-paid', { ...worked, remainingMicro: '0', usedMicro: M('1499.5') })); await refresh();
+    replies['billing.summary'] = Promise.resolve({ ok: true, data: { ...forUser('user-paid', { ...worked, remainingMicro: '0', usedMicro: M('1499.5') }),
+        ai: { ...forUser('user-paid', { ...worked, remainingMicro: '0', usedMicro: M('1499.5') }).ai, delivering: { credits: 1000 } } } });
+    await refresh();
+    before = summaries();
+    Date.now = () => realNow() + 2 * 60_000;
+    try { await triggerTimer(30000); } finally { Date.now = realNow; }
+    assert.equal(summaries(), before, 'a paid plan keeps the five-minute summary rule');
+    assert.match(win.text(), /Adding your AI credits…/);
     // Defence in depth: a kept block that does not name its user is still dropped when the signed-in user changes.
     owner = 'user-c'; success(sample, premiumAI({ ...worked, userId: null })); await refresh();
     assert.match(win.text(), /1,246 credits left of 1,500/);
