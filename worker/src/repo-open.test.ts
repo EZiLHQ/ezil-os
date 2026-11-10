@@ -8,10 +8,12 @@ import { describe, expect, it } from 'bun:test';
 import {
   branchOf,
   parseRepoOpenOutput,
+  parsePrivateCliOutput,
   parseRepoOpenRequest,
   repoOpenAuthFor,
   repoOpenBounds,
   repoOpenCommand,
+  repoOpenCliCommand,
   repoOpenStatus,
   repoOpenWhenRunning,
   runRepoOpen,
@@ -23,6 +25,7 @@ import {
   REPO_OPEN_NESTED_DIR,
   REPO_OPEN_LOCK,
   REPO_OPEN_TOKEN_ENV,
+  REPO_OPEN_CLI_PACKET_ENV,
   type RepoOpenExec,
   type RepoOpenRequest,
 } from './repo-open';
@@ -36,6 +39,16 @@ const ACCOUNT = '0123456789abcdef'.repeat(2);
 const ARTIFACTS = `https://${ACCOUNT}.artifacts.cloudflare.net/git/universe-staging/p-${REPO}.git`;
 const HEAD = 'c'.repeat(40);
 const NOW = Date.parse('2026-10-31T12:00:00Z');
+const PRIVATE_URL = 'https://github.ezil.work/acme/site.git';
+const PRIVATE_BINDING = { projectId: '33333333-3333-4333-8333-333333333333', bindingVersion: 'b'.repeat(64),
+  issuer: 'https://id.ezil.work/' as const, subject: 'auth0|builder' };
+const privateBody = (patch: Record<string, unknown> = {}) => body({ canonicalURL: PRIVATE_URL,
+  privateBinding: PRIVATE_BINDING, ...patch }, { token: GRANT, scope: 'write' });
+const parsedPrivate = (b: unknown = privateBody()): RepoOpenRequest => {
+  const result = parseRepoOpenRequest(b, NOW, { stagingGitQa: true });
+  if (!result.ok) throw new Error(result.error);
+  return result.request;
+};
 const body = (patch: Record<string, unknown> = {}, git: Record<string, unknown> = {}) => ({
   repositoryId: REPO,
   canonicalURL: ARTIFACTS,
@@ -50,6 +63,18 @@ const parsed = (b: unknown = body()): RepoOpenRequest => {
 };
 
 describe('parseRepoOpenRequest', () => {
+  it('accepts a complete signed CLI binding only for the production EZiL Git host', () => {
+    expect(parsedPrivate().privateBinding).toEqual(PRIVATE_BINDING);
+    expect(parseRepoOpenRequest(privateBody(), NOW)).toEqual({ ok: false, error: 'repo_open_invalid_request' });
+    for (const invalid of [
+      privateBody({ privateBinding: { ...PRIVATE_BINDING, projectId: 'wrong' } }),
+      privateBody({ privateBinding: { ...PRIVATE_BINDING, bindingVersion: 'x' } }),
+      privateBody({ privateBinding: { ...PRIVATE_BINDING, issuer: 'https://other.example/' } }),
+      privateBody({ privateBinding: { ...PRIVATE_BINDING, subject: '' } }),
+      privateBody({ canonicalURL: ARTIFACTS }),
+      body({ canonicalURL: 'https://github.com/acme/site.git', privateBinding: PRIVATE_BINDING }),
+    ]) expect(parseRepoOpenRequest(invalid, NOW, { stagingGitQa: true })).toEqual({ ok: false, error: 'repo_open_invalid_request' });
+  });
   it('accepts the contract body, derives the branch, and sends an Artifacts remote Bearer auth', () => {
     expect(parsed()).toEqual({
       repositoryId: REPO, canonicalURL: ARTIFACTS, ref: 'refs/heads/main',
@@ -347,6 +372,52 @@ describe('runRepoOpen', () => {
     expect(touched).toBe(0);
     expect((await repoOpenWhenRunning({ running: async () => true, touch: () => { touched++; }, exec }, parsed(), root)).ok).toBe(true);
     expect(touched).toBe(1);
+  });
+});
+
+describe('private CLI adapter', () => {
+  const root = { path: '/workspace', requireHydrated: true };
+  const request = parsedPrivate();
+  const destination = `/workspace/projects/${REPO}/repository`;
+  const success = (patch: Record<string, unknown> = {}) => JSON.stringify({ canonicalUrl: PRIVATE_URL, folder: destination,
+    identity: { issuer: PRIVATE_BINDING.issuer, subject: PRIVATE_BINDING.subject }, status: 'cloned', ...patch });
+
+  it('constructs the exact version-1 FD packet from the signed binding; no grant or identity enters argv', () => {
+    const { command, packet } = repoOpenCliCommand(request, root);
+    expect(command).toContain('exec python3 /opt/ezil-repo-open/supervise.py');
+    expect(command).toContain('3<<<"$p"');
+    expect(command).not.toContain(GRANT);
+    expect(command).not.toContain(PRIVATE_BINDING.subject);
+    expect(JSON.parse(packet)).toEqual({ version: 1,
+      binding: { projectId: PRIVATE_BINDING.projectId, repositoryId: REPO, canonicalURL: PRIVATE_URL,
+        ref: 'refs/heads/main', bindingVersion: PRIVATE_BINDING.bindingVersion },
+      identity: { issuer: PRIVATE_BINDING.issuer, subject: PRIVATE_BINDING.subject },
+      git: { username: 'ezil', token: GRANT, expiresAt: '2026-10-31T12:04:00.000Z', scope: 'write' } });
+  });
+
+  it('opens the project folder only on a matching CLI result; reuse maps to fetched', async () => {
+    let options: Parameters<RepoOpenExec>[1] | undefined;
+    const exec: RepoOpenExec = async (_command, received) => { options = received; return { exitCode: 0, stdout: success() }; };
+    expect(await runRepoOpen(exec, request, root)).toEqual({ ok: true, folder: `/workspace/projects/${REPO}`, status: 'cloned' });
+    expect(Object.keys(options!.env)).toEqual([REPO_OPEN_CLI_PACKET_ENV]);
+    expect(options!.env[REPO_OPEN_TOKEN_ENV]).toBeUndefined();
+    expect(parsePrivateCliOutput(success({ status: 'reused' }), request, root)).toEqual({ ok: true,
+      folder: `/workspace/projects/${REPO}`, status: 'fetched' });
+  });
+
+  it('refuses mismatched URL, folder, identity, status, echoed grant, or nonzero CLI exit', async () => {
+    for (const output of [
+      success({ canonicalUrl: 'https://github.ezil.work/acme/other.git' }),
+      success({ folder: `/workspace/projects/${REPO}/other` }),
+      success({ identity: { ...PRIVATE_BINDING, subject: 'auth0|other' } }),
+      success({ status: 'created' }),
+      `${GRANT}\n${success()}`,
+    ]) expect(await runRepoOpen(async () => ({ exitCode: 0, stdout: output }), request, root))
+      .toEqual({ ok: false, error: 'repo_open_failed' });
+    expect(await runRepoOpen(async () => ({ exitCode: 126, stdout: success() }), request, root))
+      .toEqual({ ok: false, error: 'repo_open_failed' });
+    expect(parsePrivateCliOutput('ezil-repo-open:error:repo_open_workspace_not_ready', request, root))
+      .toEqual({ ok: false, error: 'repo_open_workspace_not_ready' });
   });
 });
 

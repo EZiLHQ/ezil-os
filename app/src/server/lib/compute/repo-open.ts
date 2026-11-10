@@ -30,6 +30,8 @@ export interface RepoOpenRequest {
      * `null`: an anonymous open of a public github.com repository (a direct repository URL): no grant is sent at all.
      */
     git: { token: string; expiresAt: string; scope?: 'read' | 'write' } | null;
+    /** Works' authoritative project binding and this session's verified EZiL ID identity, for the private CLI FD. */
+    privateBinding?: { projectId: string; bindingVersion: string; issuer: 'https://id.ezil.work/'; subject: string };
     /** The Worker's whole bound for this open, ms (`worker/src/repo-open.ts` REPO_OPEN_MIN/EXEC_TIMEOUT_MS). */
     timeoutMs: number;
 }
@@ -86,6 +88,7 @@ export async function requestRepoOpen(
         const body = JSON.stringify({
             repositoryId: request.repositoryId, canonicalURL: request.canonicalURL, ref: request.ref,
             ...(request.git ? { git: { token: request.git.token, expiresAt: request.git.expiresAt, ...(request.git.scope ? { scope: request.git.scope } : {}) } } : {}),
+            ...(request.privateBinding ? { privateBinding: request.privateBinding } : {}),
             timeoutMs: request.timeoutMs,
         });
         // A Cloudflare computer's v2 claims, as `compute/cloudflare.ts` `authOf` mints them: no generation or lease,

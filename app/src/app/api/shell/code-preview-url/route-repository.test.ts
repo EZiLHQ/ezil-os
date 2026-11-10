@@ -39,6 +39,7 @@ const s = vi.hoisted(() => ({
     mintTakes: 0,
     skew: 0,
     universe: null as null | ((body: unknown) => Response),
+    works: null as null | ((body: unknown) => Response),
     worker: null as null | ((body: string) => Response),
     github: null as null | ((url: URL, init: RequestInit) => Response),
     requests: [] as { url: URL; init: RequestInit }[],
@@ -97,6 +98,13 @@ beforeEach(() => {
     Object.assign(s, { order: [], owned: true, identity: 'ok', aws: [false, false], requests: [], cleared: 0, mintTakes: 0, skew: 0, mintInputs: [],
         preview: { ok: true, correlationId: 'c', codePreviewUrl: MINTED, expiresAt: Date.now() + 300_000, provider: 'cloudflare-guacamole' },
         universe: () => Response.json(grant()),
+        works: () => Response.json({ username: 'ezil', token: `egg_${'a'.repeat(64)}`,
+            expiresAt: new Date(Date.now() + 240_000).toISOString(), cloneUrl: 'https://github.ezil.work/acme/site.git',
+            repositoryId: REPO,
+            binding: { projectId: PROJECT, repositoryId: REPO, canonicalURL: 'https://github.ezil.work/acme/site.git',
+                ref: 'refs/heads/main', bindingVersion: 'b'.repeat(64) },
+            identity: { issuer: 'https://id.ezil.work/', subject: 'auth0|builder' },
+            routeName: 'acme/site', handle: 'acme', name: 'site', scope: 'write', defaultBranch: 'main', class: 'project' }, { status: 201 }),
         worker: () => Response.json({ folder: `/workspace/projects/${REPO}`, head: 'b'.repeat(40) }),
         github: () => new Response(advertisement('refs/heads/main'), { status: 200, headers: { 'content-type': 'application/x-git-upload-pack-advertisement' } }) });
     vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN', UNIVERSE);
@@ -106,6 +114,7 @@ beforeEach(() => {
         const url = new URL(String(input));
         s.requests.push({ url, init });
         if (url.origin === UNIVERSE) { s.order.push('universe'); return s.universe!(JSON.parse(String(init.body))); }
+        if (url.origin === 'https://api.ezil.work') { s.order.push('works'); return s.works!(JSON.parse(String(init.body))); }
         if (url.origin === WORKER) { s.order.push('worker'); return s.worker!(String(init.body)); }
         if (url.origin === 'https://github.com') { s.order.push('github'); return s.github!(url, init); }
         throw new Error(`unexpected fetch ${url.origin}`);
@@ -136,6 +145,92 @@ const CANONICAL = 'https://github.com/ezilhq/ezil-os.git';
 const openUrl = (url: unknown = GH) => post({ computerId: COMPUTER, intent: 'open', repository: { url } });
 
 describe('opening a repository from its address in Code', () => {
+    it('uses an owned computer, the exact production Works address grant, and the Worker folder for EZiL Git', async () => {
+        s.worker = body => Response.json({ folder: `/workspace/projects/${JSON.parse(body).repositoryId}` });
+        const response = await openUrl('https://github.ezil.work/acme/site.git');
+        expect(response.status).toBe(200);
+        expect(s.order).toEqual(['computer.get', 'target', 'identity', 'works', 'codePreviewUrl', 'target', 'worker']);
+        const works = s.requests.find(r => r.url.origin === 'https://api.ezil.work')!;
+        expect(works.url.pathname).toBe('/v1/builder/selfserve-repositories/os-grant');
+        expect(JSON.parse(String(works.init.body))).toMatchObject({ class: 'project', url: 'https://github.ezil.work/acme/site.git' });
+        const worker = s.requests.find(r => r.url.origin === WORKER)!;
+        expect(JSON.parse(String(worker.init.body))).toMatchObject({ repositoryId: REPO,
+            canonicalURL: 'https://github.ezil.work/acme/site.git', ref: 'refs/heads/main',
+            git: { token: `egg_${'a'.repeat(64)}`, scope: 'write' },
+            privateBinding: { projectId: PROJECT, bindingVersion: 'b'.repeat(64),
+                issuer: 'https://id.ezil.work/', subject: 'auth0|builder' } });
+        const body = await response.clone().json();
+        expect(body.repository).toEqual({ name: 'acme/site', id: REPO });
+        expect(new URL(body.codePreviewUrl).searchParams.getAll('folder')).toEqual([`/workspace/projects/${REPO}`]);
+        await expectNoSecrets(response);
+    });
+
+    it('keeps missing or unauthorized EZiL Git addresses indistinguishable before Worker open', async () => {
+        for (const status of [403, 404]) {
+            s.works = () => new Response('private producer detail', { status });
+            s.order = []; s.requests = [];
+            const response = await openUrl('https://github.ezil.work/acme/site.git');
+            expect(response.status).toBe(404);
+            expect((await response.json()).error).toMatchObject({ code: 'repo_not_found', message: "This repository doesn't exist." });
+            expect(s.order).not.toContain('codePreviewUrl');
+            expect(s.order).not.toContain('worker');
+        }
+    });
+
+    it('refuses an incomplete Works packet before Code can wake the computer', async () => {
+        s.works = () => Response.json({ repositoryId: REPO }, { status: 201 });
+        const response = await openUrl('https://github.ezil.work/acme/site.git');
+        expect(response.status).toBe(503);
+        expect(s.order).toEqual(['computer.get', 'target', 'identity', 'works']);
+    });
+
+    it('measures the Worker deadline after the Works grant response', async () => {
+        s.mintTakes = 80_000;
+        const original = s.works!;
+        s.works = body => { const response = original(body); s.skew += 10_000; return response; };
+        const response = await openUrl('https://github.ezil.work/acme/site.git');
+        expect(response.status).toBe(200);
+        const worker = s.requests.find(r => r.url.origin === WORKER)!;
+        const timeoutMs = JSON.parse(String(worker.init.body)).timeoutMs as number;
+        expect(timeoutMs).toBeGreaterThan(104_000);
+        expect(timeoutMs).toBeLessThanOrEqual(105_000);
+    });
+
+    it('refuses to send an expired Worker budget after a slow Works grant response', async () => {
+        s.mintTakes = 170_000;
+        const original = s.works!;
+        s.works = body => { const response = original(body); s.skew += 10_000; return response; };
+        const response = await openUrl('https://github.ezil.work/acme/site.git');
+        expect(response.status).toBe(504);
+        expect((await response.json()).error.code).toBe('repo_open_timeout');
+        expect(s.order).not.toContain('worker');
+    });
+
+    it('renews an address grant after a slow Code mint and sends only the fresh grant to Worker', async () => {
+        s.mintTakes = 100_000;
+        const original = s.works!;
+        let issued = 0;
+        s.works = body => {
+            issued += 1;
+            const response = original(body);
+            // The first grant has too little lifetime after the slow mint.
+            return Response.json({ username: 'ezil', token: `egg_${String(issued).repeat(64)}`,
+                expiresAt: new Date(Date.now() + (issued === 1 ? 120_000 : 240_000)).toISOString(),
+                cloneUrl: 'https://github.ezil.work/acme/site.git', repositoryId: REPO,
+                binding: { projectId: PROJECT, repositoryId: REPO, canonicalURL: 'https://github.ezil.work/acme/site.git',
+                    ref: 'refs/heads/main', bindingVersion: 'b'.repeat(64) },
+                identity: { issuer: 'https://id.ezil.work/', subject: 'auth0|builder' },
+                routeName: 'acme/site', handle: 'acme', name: 'site', scope: 'write', defaultBranch: 'main', class: 'project' },
+            { status: response.status });
+        };
+        const response = await openUrl('https://github.ezil.work/acme/site.git');
+        expect(response.status).toBe(200);
+        expect(issued).toBe(2);
+        expect(s.order).toEqual(['computer.get', 'target', 'identity', 'works', 'codePreviewUrl', 'works', 'target', 'worker']);
+        const worker = s.requests.find(r => r.url.origin === WORKER)!;
+        expect(JSON.parse(String(worker.init.body)).git.token).toBe(`egg_${'2'.repeat(64)}`);
+    });
+
     it('ownership, provider, GitHub, mint, Worker: in that order; answers the folder URL and the name, nothing secret', async () => {
         const { repositoryIdFor } = await import('@/server/works/repo-url');
         const id = repositoryIdFor(CANONICAL);
