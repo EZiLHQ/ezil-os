@@ -11,7 +11,7 @@ export interface StandaloneCliPin {
   version: string;
 }
 
-/** CLI .1 candidate; keep the release gate off until root verifies the public download bytes. */
+/** Public CLI .1 release; the release owner verified the published archive and entry bytes. */
 export const STANDALONE_CLI_CANDIDATE: StandaloneCliPin = {
   url: 'https://github.com/EZiLHQ/ezil-cli/releases/download/standalone-20261110.1/ezil-cli-0.3.0-standalone.20261110.1.tar.gz',
   archiveSha256: 'a8b47e8ff292afbfbf17e24be0a12f335fc2169ac9f50d055c8e546939f8a2b5',
@@ -21,8 +21,8 @@ export const STANDALONE_CLI_CANDIDATE: StandaloneCliPin = {
   version: '0.3.0-standalone.20261110.1',
 };
 
-/** Deliberately false until the release owner confirms the published bytes and flips this in reviewed source. */
-export const STANDALONE_CLI_RELEASE_READY = false;
+/** Enabled after release-owner verification of the public download against the exact pins above. */
+export const STANDALONE_CLI_RELEASE_READY = true;
 export const STANDALONE_CLI_STAGE_TIMEOUT_MS = 20_000;
 
 function shq(value: string): string {

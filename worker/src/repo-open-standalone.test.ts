@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 
 import { parsePrivateCliOutput, parseRepoOpenRequest, repoOpenCliCommand, runRepoOpen, type RepoOpenRequest } from './repo-open';
 import { grantRequestFromOpen } from './repo-grant';
-import { STANDALONE_CLI_CANDIDATE } from './repo-open-runtime';
+import { standaloneCliStageCommand, STANDALONE_CLI_CANDIDATE } from './repo-open-runtime';
 
 const CHECKOUT = '44444444-4444-4444-8444-444444444444';
 const URL = 'https://github.ezil.work/default/os-code-url-20261110-a.git';
@@ -81,11 +81,36 @@ describe('standalone CLI v2 Worker open', () => {
     expect(parsePrivateCliOutput(JSON.stringify({ ...JSON.parse(output), repository: { ...packet().repository, id: 'otherproviderid01' } }), request, root)).toBeNull();
     expect(parsePrivateCliOutput(JSON.stringify({ ...JSON.parse(output), repository: { ...packet().repository, ref: 'refs/heads/other' } }), request, root)).toBeNull();
   });
-  it('fails closed before cloning while the public artifact release gate is off', async () => {
-    let called = false;
-    const answer = await runRepoOpen(async () => { called = true; return { exitCode: 0 }; }, accepted(), root);
+  it('stages the public release before handing the private packet to the CLI', async () => {
+    let calls = 0;
+    const output = JSON.stringify({ canonicalUrl: URL, folder: `/workspace/projects/${CHECKOUT}/repository`,
+      repository: packet().repository, identity: packet().identity, status: 'cloned' });
+    const answer = await runRepoOpen(async (command, options) => {
+      calls += 1;
+      if (calls === 1) {
+        expect(command).toBe(standaloneCliStageCommand(STANDALONE_CLI_CANDIDATE));
+        expect(options.env).toEqual({});
+        expect(command).not.toContain(TOKEN);
+        return { exitCode: 0, stdout: 'ezil-cli-bootstrap:ok' };
+      }
+      expect(command).toContain('exec python3 -I /run/ezil/bin/supervise.py');
+      expect(command).not.toContain(TOKEN);
+      expect(options.env).toEqual({ EZIL_REPO_OPEN_CLI_PACKET: JSON.stringify(packet()) });
+      expect(options.timeout).toBe(59_000);
+      return { exitCode: 0, stdout: output };
+    }, accepted(), root, undefined, () => NOW);
+    expect(answer).toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'cloned' });
+    expect(calls).toBe(2);
+  });
+  it('fails closed before cloning when public runtime staging fails', async () => {
+    const calls: { command: string; env: Record<string, string> | undefined }[] = [];
+    const answer = await runRepoOpen(async (command, options) => {
+      calls.push({ command, env: options.env });
+      return { exitCode: 1 };
+    }, accepted(), root, undefined, () => NOW);
     expect(answer).toEqual({ ok: false, error: 'repo_open_git_missing' });
-    expect(called).toBe(false);
+    expect(calls).toEqual([{ command: standaloneCliStageCommand(STANDALONE_CLI_CANDIDATE), env: {} }]);
+    expect(calls[0].command).not.toContain(TOKEN);
   });
   it('charges bootstrap time to the open deadline and never starts an unbounded clone', async () => {
     let clock = NOW;
