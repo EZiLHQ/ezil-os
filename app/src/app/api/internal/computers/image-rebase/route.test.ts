@@ -156,19 +156,39 @@ describe('park-failed-release on the same signed route', () => {
         const response = await POST(signed(body));
         expect(response.status).toBe(200); expect(response.headers.get('cache-control')).toBe('no-store');
         const data = await response.json();
-        expect(Object.keys(data)).toEqual(['schemaVersion', 'computerId', 'jobId', 'outcome', 'error']);
-        expect(data).toMatchObject({ schemaVersion: 1, computerId: body.computerId, jobId: body.expectedJobId, error: null, outcome: 'reserved' });
+        expect(Object.keys(data)).toEqual(['schemaVersion', 'computerId', 'sourceJobId', 'parkJobId', 'parkDigest', 'outcome', 'error']);
+        // The failed release's job and the stop's job are separate fields; the digest is the saved stop's own.
+        expect(data).toEqual({ schemaVersion: 1, computerId: body.computerId, sourceJobId: body.expectedJobId, parkJobId: body.parkJobId,
+            parkDigest: s.starts[0]!.digest, error: null, outcome: 'reserved' });
+        expect(data.parkJobId).not.toBe(data.sourceJobId);
         expect(s.starts.map(w => w.intent.operation)).toEqual(['stop']);
-        expect(s.placements[0]).toMatchObject({ state: 'RECOVERING', generation: 1, lease_epoch: 1 });
-        // A replay of the same request starts nothing more.
-        expect((await (await POST(signed(body))).json()).outcome).toBe('already_reserved');
+        expect(s.placements[0]).toMatchObject({ state: 'RECOVERING', generation: 1, lease_epoch: 1, lifecycle_job_id: body.parkJobId });
+        // A replay of the same request starts nothing more and names the same job and digest.
+        const replay = await (await POST(signed(body))).json();
+        expect(replay).toEqual({ ...data, outcome: 'already_reserved' });
         expect(s.starts).toHaveLength(1);
+    });
+    it('a replay naming another stop job id is refused with explicit nulls and starts nothing', async () => {
+        const { s, body, signed } = await setup();
+        await POST(signed(body));
+        const response = await POST(signed({ ...body, parkJobId: '8a8a8a8a-8a8a-4a8a-8a8a-8a8a8a8a8a8a' }));
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({ schemaVersion: 1, computerId: body.computerId, sourceJobId: body.expectedJobId, parkJobId: null,
+            parkDigest: null, error: 'park_in_progress', outcome: 'refused' });
+        expect(s.starts).toHaveLength(1);
+    });
+    it('refuses the failed release id as the stop id explicitly, before dependencies are read', async () => {
+        const { s, body, signed } = await setup();
+        const data = await (await POST(signed({ ...body, parkJobId: body.expectedJobId }))).json();
+        expect(data).toMatchObject({ outcome: 'refused', error: 'park_job_is_source', parkJobId: null, parkDigest: null, sourceJobId: body.expectedJobId });
+        expect(s.starts).toHaveLength(0);
+        expect(s.placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: 'failed:LifecycleUnconfirmed' });
     });
     it('a refusal answers 200 with the classified reason and writes and starts nothing', async () => {
         const { s, body, signed } = await setup();
         s.describeSnapshot.mockResolvedValue(null);
         const data = await (await POST(signed(body))).json();
-        expect(data).toMatchObject({ outcome: 'refused', error: 'snapshot_not_proven' });
+        expect(data).toMatchObject({ outcome: 'refused', error: 'snapshot_not_proven', parkJobId: null, parkDigest: null, sourceJobId: body.expectedJobId });
         expect(s.starts).toHaveLength(0);
         expect(s.placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: 'failed:LifecycleUnconfirmed' });
     });
@@ -185,19 +205,20 @@ describe('park-failed-release on the same signed route', () => {
         expect((await POST(signed(body))).status).toBe(503);
         expect(mocks.execute).not.toHaveBeenCalled(); expect(s.starts).toHaveLength(0);
     });
-    it.each(['extra field', 'missing snapshot', 'malformed snapshot id', 'missing job', 'oversize hint'])('refuses a malformed park body (%s) before dependencies', async mode => {
+    it.each(['extra field', 'missing snapshot', 'malformed snapshot id', 'missing job', 'missing park job', 'park job not a uuid', 'oversize hint'])('refuses a malformed park body (%s) before dependencies', async mode => {
         const base = { schemaVersion: 1, operation: 'park-failed-release', computerId: '11111111-1111-4111-8111-111111111111',
-            expectedJobId: '22222222-2222-4222-8222-222222222222', snapshotId: 'snap-0123456789abcdef0',
+            expectedJobId: '22222222-2222-4222-8222-222222222222', parkJobId: '33333333-3333-4333-8333-333333333333', snapshotId: 'snap-0123456789abcdef0',
             releaseExecutionArn: 'arn:aws:states:ap-south-1:123456789012:execution:ezil-mum-lifecycle:computer-22222222-2222-4222-8222-222222222222' };
         const body = mode === 'extra field' ? { ...base, force: true } : mode === 'missing snapshot' ? { ...base, snapshotId: undefined }
             : mode === 'malformed snapshot id' ? { ...base, snapshotId: 'snap-xyz' } : mode === 'missing job' ? { ...base, expectedJobId: undefined }
+            : mode === 'missing park job' ? { ...base, parkJobId: undefined } : mode === 'park job not a uuid' ? { ...base, parkJobId: 'not-a-job' }
             : { ...base, releaseExecutionArn: 'a'.repeat(301) };
         const response = await POST(request(JSON.stringify(body)));
         expect(response.status).toBe(403); expect(mocks.collaborators).not.toHaveBeenCalled();
     });
     it('an unsigned or wrongly signed park request never reaches dependencies', async () => {
         const body = JSON.stringify({ schemaVersion: 1, operation: 'park-failed-release', computerId: '11111111-1111-4111-8111-111111111111',
-            expectedJobId: '22222222-2222-4222-8222-222222222222', releaseExecutionArn: 'x', snapshotId: 'snap-0123456789abcdef0' });
+            expectedJobId: '22222222-2222-4222-8222-222222222222', parkJobId: '33333333-3333-4333-8333-333333333333', releaseExecutionArn: 'x', snapshotId: 'snap-0123456789abcdef0' });
         for (const response of [await POST(request(body, '/api/internal/computers/lifecycle-authority')), await POST(request(body, path, '1')),
             await POST(new Request('https://os.example.com' + path, { method: 'POST', body, headers: { 'content-type': 'application/json' } }))]) {
             expect(response.status).toBe(403);

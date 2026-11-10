@@ -775,6 +775,167 @@ class ComputerTests(unittest.TestCase):
         self.assertEqual(send.call_args.args[0], COMPUTER.release_request(self.computer, self.job, own))
         self.assertIs(send.call_args.args[2], COMPUTER.release_response)
 
+    park_job = '44444444-4444-4444-8444-444444444444'
+    snapshot = 'snap-0123456789abcdef0'
+
+    def park_reply(self, sent, **over):
+        return dict(dict(schemaVersion=1, computerId=sent['computerId'], sourceJobId=sent['expectedJobId'], parkJobId=sent['parkJobId'],
+                         parkDigest='d' * 64, outcome='reserved', error=None), **over)
+
+    def refused_reply(self, sent, error='snapshot_not_proven'):
+        return self.park_reply(sent, parkJobId=None, parkDigest=None, outcome='refused', error=error)
+
+    def park_sender(self, calls, reply=None):
+        """A sender that proves the journal already holds exactly the request about to leave (fsync before send)."""
+        def sender(sent, secret):
+            self.assertEqual(secret, self.secret)
+            self.assertEqual(manifest.read(self.journal)['pending'], sent)
+            calls.append(dict(sent))
+            return (reply or self.park_reply)(sent)
+        return sender
+
+    def test_park_request_is_exact_ordered_and_bound_to_the_failed_releases_own_execution(self):
+        own = self.source(self.job)
+        sent = COMPUTER.park_request(self.computer, self.job, own, self.snapshot, self.park_job)
+        self.assertEqual(list(sent), ['schemaVersion', 'operation', 'computerId', 'expectedJobId', 'parkJobId', 'releaseExecutionArn', 'snapshotId'])
+        self.assertEqual(sent['operation'], 'park-failed-release')
+        for args in ((None, self.job, own, self.snapshot, self.park_job), (self.computer, None, own, self.snapshot, self.park_job),
+                     ('not-a-uuid', self.job, own, self.snapshot, self.park_job), (self.computer, self.job, own, self.snapshot, 'not-a-uuid'),
+                     (self.computer, self.job, own, self.snapshot, None), (self.computer, self.job, own, self.snapshot, self.job),  # stop id = failed release id
+                     (self.computer, self.job, self.source(), self.snapshot, self.park_job),  # another job's execution
+                     (self.computer, self.job, own + 'x', self.snapshot, self.park_job),
+                     (self.computer, self.job, own.replace('ezil-mum-lifecycle', 'ezil-other-lifecycle'), self.snapshot, self.park_job),
+                     (self.computer, self.job, own.replace('452630323510', '123456789012'), self.snapshot, self.park_job),
+                     (self.computer, self.job, own.replace(':execution:', ':stateMachine:'), self.snapshot, self.park_job),
+                     (self.computer, self.job, None, self.snapshot, self.park_job),
+                     (self.computer, self.job, own, None, self.park_job), (self.computer, self.job, own, 'snap-xyz', self.park_job),
+                     (self.computer, self.job, own, 'snap-0123456', self.park_job), (self.computer, self.job, own, 'snap-0123456789abcdef012', self.park_job),
+                     (self.computer, self.job, own, 'SNAP-0123456789abcdef0', self.park_job), (self.computer, self.job, own, self.snapshot + '\n', self.park_job)):
+            with self.assertRaises(ValueError, msg=args):
+                COMPUTER.park_request(*args)
+
+    def test_park_response_accepts_only_the_exact_shape_for_the_same_work(self):
+        sent = COMPUTER.park_request(self.computer, self.job, self.source(self.job), self.snapshot, self.park_job)
+        for reply in (self.park_reply(sent), self.park_reply(sent, outcome='already_reserved'), self.park_reply(sent, error='start_unknown'),
+                      self.refused_reply(sent), self.refused_reply(sent, 'park_in_progress')):
+            self.assertEqual(COMPUTER.park_response(reply, sent), reply)
+        good = self.park_reply(sent)
+        old_shape = dict(schemaVersion=1, computerId=self.computer, jobId=self.job, outcome='reserved', error=None)  # the pre-park-id response
+        for bad in (old_shape, dict(good, extra=1), {k: v for k, v in good.items() if k != 'parkDigest'},
+                    dict(good, schemaVersion=True), dict(good, schemaVersion=2), dict(good, computerId=self.job), dict(good, sourceJobId=self.park_job),
+                    dict(good, parkJobId=self.job),  # the failed release's job offered as the stop
+                    dict(good, parkJobId='55555555-5555-4555-8555-555555555555'),  # another stop than the one the caller chose
+                    dict(good, parkJobId=None), dict(good, parkDigest=None), dict(good, parkDigest='D' * 64), dict(good, parkDigest='d' * 63),
+                    dict(good, outcome='settled'), dict(good, outcome='recovering'), dict(good, error='Not A Code'), dict(good, error='x' * 61), dict(good, error=3),
+                    dict(self.refused_reply(sent), parkJobId=self.park_job), dict(self.refused_reply(sent), parkDigest='d' * 64),
+                    dict(self.refused_reply(sent), error=None)):
+            with self.assertRaises(ValueError, msg=bad):
+                COMPUTER.park_response(bad, sent)
+
+    def test_park_dry_run_never_touches_the_network_or_creates_a_journal(self):
+        own = self.source(self.job)
+        calls = []
+        self.assertIsNone(COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, False, self.secret, lambda *a: calls.append(a)))
+        self.assertEqual(calls, []); self.assertFalse(self.journal.exists())
+        with patch.object(sys, 'argv', ['rebase_computer.py', 'park-failed-release', '--computer', self.computer, '--job', self.job,
+                                        '--source-execution-arn', own, '--snapshot-id', self.snapshot, '--journal', str(self.journal)]), \
+                patch.object(COMPUTER.http.client, 'HTTPSConnection') as connection:
+            COMPUTER.main()
+        connection.assert_not_called(); self.assertFalse(self.journal.exists())
+
+    def test_park_mints_the_stop_uuid_once_and_journals_it_before_the_request_leaves(self):
+        own = self.source(self.job); calls = []
+        minted = iter([self.park_job, '55555555-5555-4555-8555-555555555555'])
+        observed = COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret,
+                                                self.park_sender(calls), lambda: next(minted))
+        sent = COMPUTER.park_request(self.computer, self.job, own, self.snapshot, self.park_job)
+        self.assertEqual(calls, [sent]); self.assertEqual(observed['parkJobId'], self.park_job)
+        state = manifest.read(self.journal)
+        self.assertEqual(state, dict(schemaVersion=1, kind='park-failed-release', request=sent, pending=None, lastResponse=observed))
+        # A rerun resends the SAME request (the minter is never consulted again) and the server's replay answer is accepted.
+        again = COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret,
+                                             self.park_sender(calls, lambda s: self.park_reply(s, outcome='already_reserved')), lambda: next(minted))
+        self.assertEqual(calls, [sent, sent]); self.assertEqual(again['outcome'], 'already_reserved')
+
+    def test_park_unknown_response_keeps_the_journal_pending_and_resends_only_the_same_request(self):
+        own = self.source(self.job); calls = []
+        minted = iter([self.park_job])
+        for failure in (OSError('timeout'), ValueError('response fields mismatch'), COMPUTER.http.client.HTTPException('bad status line')):
+            def broken(sent, secret, failure=failure):
+                self.assertEqual(manifest.read(self.journal)['pending'], sent); calls.append(dict(sent)); raise failure
+            with self.assertRaises(Exception):
+                COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, broken, lambda: next(minted))
+            state = manifest.read(self.journal)
+            self.assertEqual(state['pending'], state['request']); self.assertEqual(state['request']['parkJobId'], self.park_job)
+            self.assertIsNone(state['lastResponse'])
+        self.assertEqual({json.dumps(c, sort_keys=True) for c in calls}, {json.dumps(calls[0], sort_keys=True)})
+        # The reconciling run uses the journaled request and clears `pending` only after a valid answer.
+        COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, self.park_sender(calls), lambda: self.fail('minted again'))
+        self.assertIsNone(manifest.read(self.journal)['pending']); self.assertEqual(calls[-1], calls[0])
+
+    def test_park_refusal_is_recorded_exits_nonzero_and_a_retry_keeps_the_same_uuid(self):
+        own = self.source(self.job); calls = []
+        with self.assertRaises(ValueError):
+            COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret,
+                                         self.park_sender(calls, self.refused_reply), lambda: self.park_job)
+        state = manifest.read(self.journal)
+        self.assertEqual(state['lastResponse']['outcome'], 'refused'); self.assertIsNone(state['pending'])
+        COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, self.park_sender(calls), lambda: self.fail('minted again'))
+        self.assertEqual([c['parkJobId'] for c in calls], [self.park_job, self.park_job])
+
+    def test_park_refuses_a_journal_for_other_work_and_a_malformed_journal(self):
+        own = self.source(self.job); calls = []
+        COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, self.park_sender(calls), lambda: self.park_job)
+        calls.clear()
+        for args in ((self.computer, self.job, own, 'snap-0fedcba9876543210'), ('33333333-3333-4333-8333-333333333333', self.job, own, self.snapshot),
+                     (self.computer, '55555555-5555-4555-8555-555555555555', self.source('55555555-5555-4555-8555-555555555555'), self.snapshot)):
+            with self.assertRaises(ValueError, msg=args):
+                COMPUTER.park_failed_release(*args, self.journal, True, self.secret, lambda *a: calls.append(a), lambda: self.park_job)
+        self.assertEqual(calls, [])
+        state = manifest.read(self.journal)
+        for tampered in (dict(state, kind='plan'), dict(state, extra=1), dict(state, pending=dict(state['request'], snapshotId='snap-0fedcba9876543210')),
+                         dict(state, request=dict(state['request'], parkJobId=self.job)), dict(state, lastResponse=dict(self.park_reply(state['request']), outcome='settled')),
+                         dict(state, schemaVersion=2)):
+            self.journal.write_text(json.dumps(tampered))
+            with self.assertRaises(ValueError, msg=tampered):
+                COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, lambda *a: calls.append(a), lambda: self.park_job)
+        self.assertEqual(calls, [])
+
+    def test_park_journal_never_collides_with_the_rebase_journal_of_the_same_computer(self):
+        own = self.source(self.job); calls = []
+        self.assertNotEqual(COMPUTER.PARK_JOURNAL_DIR, Path('/root/ezil-aws-mum/rebase-computers'))
+        COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, self.park_sender(calls), lambda: self.park_job)
+        # operate() refuses the park journal as its own (key sets are disjoint)...
+        with self.assertRaises(ValueError):
+            COMPUTER.operate('plan', self.computer, None, self.journal, False, '', lambda *a: calls.append(a))
+        # ...and park refuses the rebase journal.
+        rebase_journal = Path(self.temp.name) / 'rebase.json'
+        rebase_journal.write_text(json.dumps(dict(schemaVersion=1, computerId=self.computer, jobId=self.job, pending=None, lastResponse=None)))
+        with self.assertRaises(ValueError):
+            COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, rebase_journal, True, self.secret, lambda *a: calls.append(a))
+        self.assertEqual(len(calls), 1)
+
+    def test_park_cli_is_staging_only_strict_and_applies_through_the_park_validator(self):
+        own = self.source(self.job)
+        base = ['rebase_computer.py', 'park-failed-release', '--computer', self.computer, '--job', self.job, '--source-execution-arn', own,
+                '--snapshot-id', self.snapshot, '--journal', str(self.journal)]
+        for extra in (['--origin', 'https://os.ezil.work'], ['--source-retirement-execution-arn', own]):
+            with patch.object(sys, 'argv', base + extra), self.assertRaises(ValueError):
+                COMPUTER.main()
+        with patch.object(sys, 'argv', [a for a in base if a not in ('--snapshot-id', self.snapshot)]), self.assertRaises(ValueError):
+            COMPUTER.main()
+        for other in ('plan', 'reconcile-release', 'reconcile-replacement'):  # a snapshot id belongs to the park only
+            with patch.object(sys, 'argv', ['rebase_computer.py', other, '--computer', self.computer, '--job', self.job, '--source-execution-arn', own,
+                                            '--snapshot-id', self.snapshot]), self.assertRaises(ValueError):
+                COMPUTER.main()
+        with patch.object(sys, 'argv', base + ['--apply']), patch.dict(os.environ, {'EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET': self.secret}), \
+                patch.object(COMPUTER, 'send_reconcile', side_effect=lambda sent, secret, validate: validate(self.park_reply(sent), sent)) as send:
+            COMPUTER.main()
+        sent = send.call_args.args[0]
+        self.assertEqual(send.call_args.args[1], self.secret); self.assertIs(send.call_args.args[2], COMPUTER.park_response)
+        self.assertEqual(sent, manifest.read(self.journal)['request']); self.assertEqual(sent['operation'], 'park-failed-release')
+        self.assertTrue(COMPUTER.wire.matches(COMPUTER.UUID, sent['parkJobId'])); self.assertNotEqual(sent['parkJobId'], self.job)
+
     def test_staging_origin_refuses_btgq_and_curomaa_without_http(self):
         for origin in ('https://btgq.supabase.co', 'https://curomaa.example.com', 'https://os.ezil.work', COMPUTER.ORIGIN + '/extra'):
             with patch.object(sys, 'argv', ['rebase_computer.py', 'plan', '--computer', self.computer, '--origin', origin]), self.assertRaises(ValueError):

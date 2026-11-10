@@ -98,9 +98,11 @@ async function parkFailedRelease(raw: unknown): Promise<Response> {
         if (!configs.ok || !starter || !executions?.history || !describer?.describeVolume || !describer.describeSnapshot || !tunnels)
             return Response.json({ error: 'park_unavailable' }, { status: 503, headers });
         const placementDb = db as unknown as PlacementDb;
-        const { outcome, error } = await reserveParkedStop({ db: placementDb, starter, executions, describer, tunnels,
+        const { outcome, error, parkJobId, parkDigest } = await reserveParkedStop({ db: placementDb, starter, executions, describer, tunnels,
             meter: billingComputeMeter(), pool: createPoolDeps(placementDb, process.env) }, configs.deployments, input);
-        return Response.json({ schemaVersion: 1, computerId: input.computerId, jobId: input.expectedJobId, outcome, error }, { status: 200, headers });
+        // The failed release's job (`sourceJobId`) is never the stop's: the saved STOP's own id and digest are separate fields.
+        return Response.json({ schemaVersion: 1, computerId: input.computerId, sourceJobId: input.expectedJobId, parkJobId, parkDigest, outcome, error },
+            { status: 200, headers });
     } catch (error) {
         return Response.json({ error: error instanceof ImageJobConflictError ? 'image_job_conflict' : 'park_unavailable' },
             { status: error instanceof ImageJobConflictError ? 409 : 503, headers });

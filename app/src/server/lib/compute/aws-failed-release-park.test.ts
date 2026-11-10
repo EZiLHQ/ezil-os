@@ -2,7 +2,7 @@ import { PgDialect } from 'drizzle-orm/pg-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { D, NOW } from './aws-failed-release.test-support';
 import type { LifecycleDeployment } from './aws-intent';
-import { HOST_STOPPED, parkSetup, SNAP, STOP_JOB, type Setup } from './aws-failed-release-park.test-support';
+import { HOST_STOPPED, parkSetup, refused, SNAP, STOP_JOB, type Setup } from './aws-failed-release-park.test-support';
 import { PARKED_FAILED_RELEASE, parkReplay, POOL_PARK_RECOVERY_PREFIX, reconcileParkedStop, reserveParkedStop,
     type ParkDeps, type ParkFailedReleaseRequest } from './aws-failed-release-park';
 import { applyLifecycleReceipt } from './aws-receipts';
@@ -18,7 +18,7 @@ const untouched = async (s: Setup) => {
 describe('park a failed release: reservation', () => {
     it('reserves ONE ordinary stop job (explicit stop intent, current deployment, same tuple), tolerating only the stale legacy fence alias', async () => {
         const s = parkSetup();
-        expect(await s.reserve()).toEqual({ outcome: 'reserved', error: null });
+        expect(await s.reserve()).toMatchObject({ outcome: 'reserved', error: null, parkJobId: STOP_JOB });
         const p = await s.current();
         expect(p).toMatchObject({ state: 'RECOVERING', generation: 1, leaseEpoch: 1, lifecycleJobId: STOP_JOB, instanceId: s.i.providerInstanceId, volumeId: s.i.dataVolumeId });
         expect(p.lifecycleDigest).not.toBe(s.original.digest);
@@ -43,9 +43,83 @@ describe('park a failed release: reservation', () => {
     it('is idempotent: the same request again starts nothing; another snapshot is refused while a park is in progress', async () => {
         const s = parkSetup();
         await s.reserve();
-        expect(await s.reserve()).toEqual({ outcome: 'already_reserved', error: null });
-        expect(await s.reserve({ ...s.request, snapshotId: 'snap-0fedcba9876543210' })).toEqual({ outcome: 'refused', error: 'park_in_progress' });
+        expect(await s.reserve()).toMatchObject({ outcome: 'already_reserved', error: null, parkJobId: STOP_JOB });
+        expect(await s.reserve({ ...s.request, snapshotId: 'snap-0fedcba9876543210' })).toEqual(refused('park_in_progress'));
         expect(s.starts).toHaveLength(1);
+    });
+
+    describe('the caller-chosen stop job id', () => {
+        const OTHER_STOP = '8a8a8a8a-8a8a-4a8a-8a8a-8a8a8a8a8a8a';
+
+        it('is bound into the saved intent, the row and the started execution, with the digest of that same work; the failed release id stays separate', async () => {
+            const s = parkSetup();
+            const result = await s.reserve();
+            const p = await s.current();
+            expect(result).toEqual({ outcome: 'reserved', error: null, parkJobId: STOP_JOB, parkDigest: p.lifecycleDigest });
+            expect(result.parkJobId).not.toBe(s.i.jobId);
+            expect(p.lifecycleJobId).toBe(STOP_JOB);
+            expect(parkReplay(p)!.intent.jobId).toBe(STOP_JOB);
+            expect(parkReplay(p)!.sourceJobId).toBe(s.i.jobId);
+            expect(s.starts.map(w => w.intent.jobId)).toEqual([STOP_JOB]);
+            expect(result.parkDigest).toBe(s.starts[0]!.digest);
+        });
+
+        it('is never minted by the server: the result and the saved work follow the request id', async () => {
+            const s = parkSetup();
+            expect(await s.reserve({ ...s.request, parkJobId: OTHER_STOP })).toMatchObject({ outcome: 'reserved', parkJobId: OTHER_STOP });
+            expect((await s.current()).lifecycleJobId).toBe(OTHER_STOP);
+            expect(s.starts.map(w => w.intent.jobId)).toEqual([OTHER_STOP]);
+        });
+
+        it('refuses the failed release id as the stop id before any read, write or start', async () => {
+            const s = parkSetup();
+            const read = vi.spyOn(s.deps.db, 'execute');
+            expect(await s.reserve({ ...s.request, parkJobId: s.i.jobId })).toEqual(refused('park_job_is_source'));
+            expect(read).not.toHaveBeenCalled();
+            await untouched(s);
+        });
+
+        it('answers a replay of the identical request with the SAME job and digest and never starts a second job', async () => {
+            const s = parkSetup();
+            const first = await s.reserve();
+            const again = await s.reserve();
+            expect(again).toEqual({ ...first, outcome: 'already_reserved' });
+            expect(s.starts).toHaveLength(1);
+        });
+
+        it.each([
+            ['another stop job id', (s: Setup) => ({ ...s.request, parkJobId: '8a8a8a8a-8a8a-4a8a-8a8a-8a8a8a8a8a8a' })],
+            ['another snapshot', (s: Setup) => ({ ...s.request, snapshotId: 'snap-0fedcba9876543210' })],
+            ['another source job', (s: Setup) => ({ ...s.request, expectedJobId: '7a7a7a7a-7a7a-4a7a-8a7a-7a7a7a7a7a7a' })],
+            ['another source execution', (s: Setup) => ({ ...s.request, releaseExecutionArn: s.request.releaseExecutionArn.replace(s.i.jobId, '7a7a7a7a-7a7a-4a7a-8a7a-7a7a7a7a7a7a') })],
+        ])('refuses a replay naming %s while a park is in progress: no write, no start, no job or digest in the answer', async (_name, make) => {
+            const s = parkSetup();
+            await s.reserve();
+            const before = await s.current();
+            const answer = await s.reserve(make(s));
+            expect(answer.outcome).toBe('refused');
+            expect(answer).toMatchObject({ parkJobId: null, parkDigest: null });
+            expect(s.starts).toHaveLength(1);
+            expect(await s.current()).toEqual(before);
+        });
+
+        it('a replay whose saved document and row no longer agree (job or digest) is refused as replay_invalid, never answered from either', async () => {
+            const s = parkSetup();
+            await s.reserve();
+            const row = s.placements[0]!;
+            row.lifecycle_digest = 'ef'.repeat(32);
+            expect(await s.reserve()).toEqual(refused('replay_invalid'));
+        });
+
+        it('never answers a replay as a fresh reservation after the park has settled: the settled row is not_applicable', async () => {
+            const s = parkSetup();
+            await s.reserve();
+            s.finishStop();
+            expect(await s.settle()).toBe(true);
+            expect((await s.current()).state).toBe('STOPPED');
+            expect(await s.reserve()).toEqual(refused('not_applicable'));
+            expect(s.starts).toHaveLength(1);
+        });
     });
 
     const refusals: [string, string, (s: Setup) => void][] = [
@@ -97,17 +171,17 @@ describe('park a failed release: reservation', () => {
     it.each(refusals)('refuses with nothing written or started: %s', async (_name, error, mutate) => {
         const s = parkSetup();
         mutate(s);
-        expect(await s.reserve()).toEqual({ outcome: 'refused', error });
+        expect(await s.reserve()).toEqual(refused(error));
         await untouched(s);
     });
 
     it('refuses without a starter or a snapshot reader, and for a placement that is not the failed release (nothing written)', async () => {
         const s = parkSetup();
-        expect(await s.reserve(s.request, { ...s.deps, starter: undefined })).toEqual({ outcome: 'refused', error: 'starter_missing' });
+        expect(await s.reserve(s.request, { ...s.deps, starter: undefined })).toEqual(refused('starter_missing'));
         const noSnapshotReader = { ...s.deps, describer: { ...s.deps.describer, describeSnapshot: undefined } } as ParkDeps;
-        expect(await s.reserve(s.request, noSnapshotReader)).toEqual({ outcome: 'refused', error: 'describer_missing' });
+        expect(await s.reserve(s.request, noSnapshotReader)).toEqual(refused('describer_missing'));
         s.placements[0]!.state = 'STOPPED'; // not UNCONFIRMED
-        expect(await s.reserve()).toEqual({ outcome: 'refused', error: 'not_applicable' });
+        expect(await s.reserve()).toEqual(refused('not_applicable'));
         expect(s.starts).toHaveLength(0);
     });
 
@@ -117,7 +191,7 @@ describe('park a failed release: reservation', () => {
             await writeLivePoolRecovery(s.db, await s.current(), 'UNCONFIRMED', { lastError: 'failed:Concurrent' });
             return s.snapshot;
         });
-        expect(await s.reserve()).toEqual({ outcome: 'refused', error: 'cas_conflict' });
+        expect(await s.reserve()).toEqual(refused('cas_conflict'));
         expect(s.starts).toHaveLength(0);
         expect((await s.current()).state).toBe('UNCONFIRMED');
     });
@@ -182,9 +256,13 @@ describe('park a failed release: settlement', () => {
         const start = s.deps.starter!.start as ReturnType<typeof vi.fn>;
         const real = start.getMockImplementation()!;
         start.mockRejectedValueOnce(new Error('lost')).mockRejectedValueOnce(new Error('lost')).mockRejectedValueOnce(new Error('lost'));
-        expect(await s.reserve()).toEqual({ outcome: 'reserved', error: null });
+        // The reservation is durable even though the start is not: the answer names the SAME job and says the start is unconfirmed.
+        expect(await s.reserve()).toMatchObject({ outcome: 'reserved', error: 'start_unknown', parkJobId: STOP_JOB });
         expect(s.starts).toHaveLength(0);
         expect(parkReplay(await s.current())).toMatchObject({ error: 'start_unknown' });
+        // The caller's replay of the identical request is answered from the saved work (same job and digest) and starts nothing itself.
+        expect(await s.reserve()).toMatchObject({ outcome: 'already_reserved', error: 'start_unknown', parkJobId: STOP_JOB, parkDigest: (await s.current()).lifecycleDigest });
+        expect(s.starts).toHaveLength(0);
         start.mockImplementation(real);
         await applyLifecycleReceipt(s.deps, await s.current(), D); // execution absent -> start the saved stop
         expect(s.starts).toHaveLength(1);
@@ -236,7 +314,7 @@ describe('park a failed release: settlement', () => {
         expect(p.state).toBe('UNCONFIRMED'); // the ordinary recovery refuses the legacy alias: unchanged, no weakening
         expect(s.starts).toHaveLength(0);
         // The ordinary recovery only wrote its own diagnostic; the park still reserves from that row.
-        expect(await s.reserve()).toEqual({ outcome: 'reserved', error: null });
+        expect(await s.reserve()).toMatchObject({ outcome: 'reserved', error: null, parkJobId: STOP_JOB });
         expect(s.starts.map(w => w.intent.operation)).toEqual(['stop']);
     });
 });
@@ -266,10 +344,10 @@ describe('park a failed release: exclusions under the reservation locks', () => 
     ];
     it.each(blockers)('refuses with nothing written or started while there is %s', async (_name, error, answer) => {
         const s = parkSetup();
-        expect(await s.reserve(s.request, intercepting(s.deps, answer))).toEqual({ outcome: 'refused', error });
+        expect(await s.reserve(s.request, intercepting(s.deps, answer))).toEqual(refused(error));
         await untouched(s);
         // The same proof reserves once the blocker is gone.
-        expect(await s.reserve()).toEqual({ outcome: 'reserved', error: null });
+        expect(await s.reserve()).toMatchObject({ outcome: 'reserved', error: null, parkJobId: STOP_JOB });
     });
 
     it('refuses on a writer-lease ROW even when the placement lease proxy is empty (lease_until null)', async () => {
@@ -277,12 +355,12 @@ describe('park a failed release: exclusions under the reservation locks', () => 
         s.placements[0]!.lease_until = null;
         const writer = (t: string) => /to_regclass\('public\.ezil_compute_writer_leases'\)/.test(t) ? { rows: [{ present: true }] }
             : t.startsWith('/* placement:park-writer-lease */') ? { rows: [{ held: 1 }] } : null;
-        expect(await s.reserve(s.request, intercepting(s.deps, writer))).toEqual({ outcome: 'refused', error: 'blocked_writer_lease' });
+        expect(await s.reserve(s.request, intercepting(s.deps, writer))).toEqual(refused('blocked_writer_lease'));
         await untouched(s);
         // With the table present but no row for the computer the same proof reserves.
         const noRow = (t: string) => /to_regclass\('public\.ezil_compute_writer_leases'\)/.test(t) ? { rows: [{ present: true }] }
             : t.startsWith('/* placement:park-writer-lease */') ? { rows: [] } : null;
-        expect(await s.reserve(s.request, intercepting(s.deps, noRow))).toEqual({ outcome: 'reserved', error: null });
+        expect(await s.reserve(s.request, intercepting(s.deps, noRow))).toMatchObject({ outcome: 'reserved', error: null, parkJobId: STOP_JOB });
     });
 
     it('takes admission, the canonical computer lock and the row lock before it writes (the ordinary lock order)', async () => {
@@ -311,7 +389,7 @@ describe('park a failed release: versions, authority and durable retry', () => {
     it('runs the NEW stop on the current state-machine version while the old failed release keeps ITS OWN version', async () => {
         const s = parkSetup();
         expect(d36.stateMachineVersionArn).not.toBe(D.stateMachineVersionArn);
-        expect(await reserveParkedStop(s.deps, { [D.region]: d36 }, s.request)).toEqual({ outcome: 'reserved', error: null });
+        expect(await reserveParkedStop(s.deps, { [D.region]: d36 }, s.request)).toMatchObject({ outcome: 'reserved', error: null, parkJobId: STOP_JOB });
         expect(s.starts[0]!.stateMachineArn).toBe(d36.stateMachineVersionArn);
         expect(parkReplay(await s.current())).toMatchObject({ sourceStateMachineVersionArn: s.original.stateMachineArn });
         expect(s.original.stateMachineArn).toBe(D.stateMachineVersionArn);
@@ -335,7 +413,7 @@ describe('park a failed release: versions, authority and durable retry', () => {
     it('refuses a current deployment with another root-device authority (deployment_identity)', async () => {
         const s = parkSetup();
         const other = { ...d36, storage: { ...d36.storage, rootDeviceName: '/dev/xvda' as const } };
-        expect(await reserveParkedStop(s.deps, { [D.region]: other }, s.request)).toEqual({ outcome: 'refused', error: 'deployment_identity' });
+        expect(await reserveParkedStop(s.deps, { [D.region]: other }, s.request)).toEqual(refused('deployment_identity'));
         await untouched(s);
     });
 

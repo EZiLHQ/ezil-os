@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { awsSandboxId } from './aws-enroll';
 import { isExecutionAbsent } from './aws-errors';
@@ -29,7 +28,7 @@ export const PARKED_FAILED_RELEASE = 'parked_failed_release';
 
 type Execution = Awaited<ReturnType<LifecycleExecutionReader['describe']>>;
 export type ParkDescriber = NonNullable<ReceiptDeps['describer']> & Partial<RebaseSnapshotDescriber>;
-export type ParkDeps = Omit<ReceiptDeps, 'describer' | 'executions'> & { executions: LifecycleExecutionReader; describer?: ParkDescriber; newId?: () => string };
+export type ParkDeps = Omit<ReceiptDeps, 'describer' | 'executions'> & { executions: LifecycleExecutionReader; describer?: ParkDescriber };
 
 /** The durable replay document: the SAVED stop intent plus the audit of the failed release and the proven backup. */
 export interface ParkReplay {
@@ -63,11 +62,16 @@ export function parkReplay(p: Placement): ParkReplay | null {
 export const isParkedStopRecovering = (p: Placement): boolean => p.state === 'RECOVERING' && !!parkReplay(p);
 
 const Uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-/** `park-failed-release` on the signed image-rebase operator route. Nothing in it is trusted beyond selecting records. */
+/** `park-failed-release` on the signed image-rebase operator route. Nothing in it is trusted beyond selecting records, except `parkJobId`:
+ * the CALLER chooses (and journals before sending) the new STOP job's id, so a lost response can only ever be reconciled against the same
+ * work. The server never mints a job id; it binds this one into the saved stop and replays only the identical request. */
 export const ParkFailedReleaseRequestSchema = z.object({ schemaVersion: z.literal(1), operation: z.literal('park-failed-release'),
-    computerId: Uuid, expectedJobId: Uuid, releaseExecutionArn: z.string().min(1).max(300), snapshotId: z.string().regex(/^snap-[0-9a-f]{8,17}$/) }).strict();
+    computerId: Uuid, expectedJobId: Uuid, parkJobId: Uuid, releaseExecutionArn: z.string().min(1).max(300),
+    snapshotId: z.string().regex(/^snap-[0-9a-f]{8,17}$/) }).strict();
 export type ParkFailedReleaseRequest = z.infer<typeof ParkFailedReleaseRequestSchema>;
 export type ParkOutcome = 'reserved' | 'already_reserved' | 'refused';
+/** `parkJobId`/`parkDigest` are the SAVED stop's (never echoed from the request) and null only on a refusal. */
+export interface ParkResult { outcome: ParkOutcome; error: string | null; parkJobId: string | null; parkDigest: string | null }
 
 /** The cold-volume tag rule: every canonical field agrees; the legacy computer alias (if present) agrees; ONLY the legacy `ezil:fence`
  * alias may differ (the lifecycle helper's cold-disk tolerance). Any pool marker or other disagreeing alias refuses. */
@@ -132,18 +136,27 @@ function failedSource(p: Placement, e: Execution, d: LifecycleDeployment): { err
 
 export interface ParkDeployments { [region: string]: LifecycleDeployment }
 
-/** Reserve the park: prove everything, then ONE CAS UNCONFIRMED -> RECOVERING carrying the saved STOP intent, then start that job only. */
-export async function reserveParkedStop(deps: ParkDeps, deployments: ParkDeployments, request: ParkFailedReleaseRequest):
-    Promise<{ outcome: ParkOutcome; error: string | null }> {
-    const refuse = (error: string) => ({ outcome: 'refused' as const, error });
+/** Reserve the park: prove everything, then ONE CAS UNCONFIRMED -> RECOVERING carrying the saved STOP intent, then start that job only.
+ * The stop's job id is the caller's `parkJobId`; a replay is answered only for the identical request (same job, source, snapshot). */
+export async function reserveParkedStop(deps: ParkDeps, deployments: ParkDeployments, request: ParkFailedReleaseRequest): Promise<ParkResult> {
+    const refuse = (error: string): ParkResult => ({ outcome: 'refused', error, parkJobId: null, parkDigest: null });
+    if (request.parkJobId === request.expectedJobId) return refuse('park_job_is_source');
     await assertNoImageReservation(deps.db, request.computerId);
     const computer = await readCanaryComputer(deps.db, request.computerId);
     const p = (await readPlacement(deps.db, request.computerId)).record;
     const d = p?.region ? deployments[p.region] : undefined;
     if (!computer || computer.deleted || !p || !d || p.ownerUserId !== computer.userId || p.provider !== 'aws-ec2' || !isPoolMode(d)) return refuse('not_applicable');
     const saved = parkReplay(p);
-    if (saved && p.state === 'RECOVERING') return saved.sourceJobId === request.expectedJobId && saved.snapshotId === request.snapshotId
-        ? { outcome: 'already_reserved', error: saved.error } : refuse('park_in_progress');
+    if (saved && p.state === 'RECOVERING') {
+        const replay = saved.sourceJobId === request.expectedJobId && saved.snapshotId === request.snapshotId
+            && saved.sourceExecutionArn === request.releaseExecutionArn && saved.intent.jobId === request.parkJobId
+            && p.lifecycleJobId === request.parkJobId && !!p.lifecycleDigest;
+        if (!replay) return refuse('park_in_progress');
+        let work: LifecycleWork;
+        try { work = buildLifecycleWork(saved.intent); } catch { return refuse('replay_invalid'); }
+        return work.digest === p.lifecycleDigest
+            ? { outcome: 'already_reserved', error: saved.error, parkJobId: work.intent.jobId, parkDigest: work.digest } : refuse('replay_invalid');
+    }
     if (p.state !== 'UNCONFIRMED' || p.lifecycleJobId !== request.expectedJobId || !p.lifecycleDigest || poolReleaseReplay(p)?.intent) return refuse('not_applicable');
     if (request.releaseExecutionArn !== lifecycleExecutionArn(d, request.expectedJobId)) return refuse('source_not_proven');
     if (!p.region || !p.zoneId || !p.instanceId || !p.volumeId || !p.fenceToken || !p.instanceType) return refuse('placement_identity');
@@ -165,7 +178,7 @@ export async function reserveParkedStop(deps: ParkDeps, deployments: ParkDeploym
     let next: LifecycleWork;
     try {
         // Explicit STOP on the CURRENT deployment (never sessionEndWork, which would map stop to release for the pool deployment).
-        next = buildLifecycleWork(currentGenerationIntent(p, 'stop', d, { jobId: (deps.newId ?? randomUUID)(), userData: null, leaseEpoch: p.leaseEpoch }));
+        next = buildLifecycleWork(currentGenerationIntent(p, 'stop', d, { jobId: request.parkJobId, userData: null, leaseEpoch: p.leaseEpoch }));
     } catch { return refuse('stop_intent_invalid'); }
     const doc: ParkReplay = { v: 1, intent: next.intent, snapshotId: request.snapshotId, hostStoppedAt: evidence.hostStoppedAt.toISOString(),
         sourceJobId: request.expectedJobId, sourceExecutionArn: source.executionArn!, sourceDigest: failed.work.digest,
@@ -181,7 +194,8 @@ export async function reserveParkedStop(deps: ParkDeps, deployments: ParkDeploym
     if (outcome !== 'started') await writeLivePoolRecovery(deps.db, reserved.placement, 'RECOVERING', {
         lastError: POOL_PARK_RECOVERY_PREFIX + JSON.stringify({ ...doc, error: 'start_' + outcome }),
     });
-    return { outcome: 'reserved', error: null };
+    // The saved work's own id and digest; a start that was not confirmed is reported and left to the receipt pass (same saved stop, same id).
+    return { outcome: 'reserved', error: outcome === 'started' ? null : 'start_' + outcome, parkJobId: next.intent.jobId, parkDigest: next.digest };
 }
 
 /**

@@ -29,7 +29,7 @@ afterEach(() => { vi.unstubAllEnvs(); vi.restoreAllMocks(); });
 async function parked() {
     const s = parkSetup();
     execute.mockImplementation(s.db.execute);
-    expect(await s.reserve()).toEqual({ outcome: 'reserved', error: null });
+    expect(await s.reserve()).toMatchObject({ outcome: 'reserved', error: null });
     expect(s.starts).toHaveLength(1);
     return { ...s, work: s.starts[0]! };
 }

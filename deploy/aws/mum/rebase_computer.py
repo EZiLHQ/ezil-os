@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import sys
 import time
+import uuid
 
 import rebase_manifest as wire
 
@@ -28,6 +29,13 @@ RECONCILE = 'reconcile-replacement'
 RECONCILE_OUTCOMES = {'settled', 'unconfirmed', 'generation_drift', 'not_applicable', 'launch_not_disproven', 'source_not_proven'}
 RECONCILE_RELEASE = 'reconcile-release'
 RELEASE_OUTCOMES = {'settled', 'recovering', 'waiting', 'unconfirmed', 'not_applicable', 'source_not_proven'}
+PARK = 'park-failed-release'
+PARK_OUTCOMES = {'reserved', 'already_reserved', 'refused'}
+SNAPSHOT = r'snap-[0-9a-f]{8,17}'
+# Its own directory and key set: never the plan/prepare/launch journal of the same computer, which the rebase that follows the park uses.
+PARK_JOURNAL_DIR = Path('/root/ezil-aws-mum/park-failed-releases')
+PARK_JOURNAL_KEYS = {'schemaVersion', 'kind', 'request', 'pending', 'lastResponse'}
+PARK_PLACEHOLDER_JOB = '00000000-0000-4000-8000-000000000000'  # validation only; the real stop UUID is minted once on --apply
 # The hint must name one execution of the staging lifecycle machine; the server re-reads and proves everything.
 SOURCE_EXECUTION = re.escape(json_tool.MACHINE.replace(':stateMachine:', ':execution:') + ':computer-') + UUID
 
@@ -154,6 +162,78 @@ def reconcile_release(computer, job, execution, apply, secret, sender=None):
     return observed
 
 
+def park_request(computer, job, execution, snapshot, park_job):
+    need(wire.matches(UUID, computer) and wire.matches(UUID, job), 'park-failed-release requires the exact computer and failed release job UUIDs')
+    need(wire.matches(UUID, park_job) and park_job != job, 'the stop job UUID must be a new UUID, never the failed release job')
+    need(wire.matches(SOURCE_EXECUTION, execution) and execution.endswith(':computer-' + job),
+         "the hint must be exactly the failed release job's own staging lifecycle execution ARN")
+    need(wire.matches(SNAPSHOT, snapshot), 'the snapshot must be exactly one snapshot id (snap-<8-17 hex>)')
+    return dict(schemaVersion=1, operation=PARK, computerId=computer, expectedJobId=job, parkJobId=park_job, releaseExecutionArn=execution, snapshotId=snapshot)
+
+
+def park_response(value, sent):
+    need(isinstance(value, dict) and set(value) == {'schemaVersion', 'computerId', 'sourceJobId', 'parkJobId', 'parkDigest', 'outcome', 'error'},
+         'park response fields mismatch')
+    need(type(value['schemaVersion']) is int and value['schemaVersion'] == 1, 'park response version mismatch')
+    need(value['computerId'] == sent['computerId'] and value['sourceJobId'] == sent['expectedJobId'], 'park response names another computer or failed release job')
+    need(value['outcome'] in PARK_OUTCOMES, 'park outcome mismatch')
+    need(value['error'] is None or wire.matches(r'[a-z_]{1,60}', value['error']), 'park error code mismatch')
+    if value['outcome'] == 'refused':
+        need(value['parkJobId'] is None and value['parkDigest'] is None and value['error'] is not None, 'a refusal names an error and no stop job')
+    else:
+        # The saved stop must be exactly the one this caller chose: the response can never introduce another job.
+        need(value['parkJobId'] == sent['parkJobId'] and wire.matches(r'[0-9a-f]{64}', value['parkDigest']), 'park response names another stop job or no digest')
+    return {k: value[k] for k in ('schemaVersion', 'computerId', 'sourceJobId', 'parkJobId', 'parkDigest', 'outcome', 'error')}
+
+
+def read_park_journal(journal):
+    state = wire.read(journal, 16384)
+    need(isinstance(state, dict) and set(state) == PARK_JOURNAL_KEYS and state['kind'] == PARK, 'park journal fields mismatch')
+    need(type(state['schemaVersion']) is int and state['schemaVersion'] == 1, 'park journal version mismatch')
+    request = state['request']
+    need(isinstance(request, dict) and request == park_request(request.get('computerId'), request.get('expectedJobId'), request.get('releaseExecutionArn'),
+                                                               request.get('snapshotId'), request.get('parkJobId')), 'park journal request mismatch')
+    need(state['pending'] is None or state['pending'] == request, 'park journal pending mismatch')
+    need(state['lastResponse'] is None or park_response(state['lastResponse'], request) == state['lastResponse'], 'park journal response mismatch')
+    return state
+
+
+def park_failed_release(computer, job, execution, snapshot, journal, apply, secret, sender=None, new_id=lambda: str(uuid.uuid4())):
+    """Reserve ONE ordinary stop for a failed release (server re-proves everything); dry run unless --apply.
+
+    The stop job UUID is chosen here, ONCE, and journaled (fsync) before the request leaves. Every later run reuses the journaled request
+    byte for byte: an unknown outcome is reconciled only by the same request (the server answers the same saved work or refuses), never by a
+    new UUID or a new intent. Arguments that differ from the journal are refused."""
+    journal = Path(journal)
+    need(journal.is_absolute() and not journal.is_symlink(), 'absolute non-symlink journal required')
+    park_request(computer, job, execution, snapshot, PARK_PLACEHOLDER_JOB)  # validate every argument before anything else (mints nothing)
+    state = read_park_journal(journal) if journal.exists() else None
+    if state is not None:
+        sent = state['request']
+        need(sent == park_request(computer, job, execution, snapshot, sent['parkJobId']), 'journal names other work; use the matching arguments or a separately reviewed journal')
+    elif not apply:
+        shown = dict(park_request(computer, job, execution, snapshot, PARK_PLACEHOLDER_JOB), parkJobId='<new uuid, journaled before send>')
+        print('DRY RUN: ' + json.dumps(shown, separators=(',', ':')) + '; add --apply to submit')
+        return None
+    else:
+        sent = park_request(computer, job, execution, snapshot, new_id())
+        state = dict(schemaVersion=1, kind=PARK, request=sent, pending=None, lastResponse=None)
+    if not apply:
+        print('DRY RUN: ' + json.dumps(sent, separators=(',', ':')) + '; add --apply to submit')
+        return None
+    journal.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    state['pending'] = sent
+    json_tool.write(journal, state)  # fsync before the network call
+    observed = (sender or (lambda value, key: send_reconcile(value, key, park_response)))(sent, secret)
+    # Any failure above leaves `pending` (and the UUID) in the journal for the identical resend.
+    state.update(pending=None, lastResponse=observed)
+    json_tool.write(journal, state)
+    print(json.dumps(observed, separators=(',', ':')))
+    if observed['outcome'] == 'refused':  # recorded above; a custodian script must not carry on into the rebase
+        raise ValueError('park refused: ' + observed['error'])
+    return observed
+
+
 def operate(operation, computer, job, journal, apply, secret, sender=send, retirement=None):
     sent = request(operation, computer, job, retirement)
     journal = Path(journal)
@@ -205,10 +285,11 @@ def operate(operation, computer, job, journal, apply, secret, sender=send, retir
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=(*OPERATIONS, RECONCILE, RECONCILE_RELEASE))
+    parser.add_argument('operation', choices=(*OPERATIONS, RECONCILE, RECONCILE_RELEASE, PARK))
     parser.add_argument('--computer')
     parser.add_argument('--job')
     parser.add_argument('--source-execution-arn')
+    parser.add_argument('--snapshot-id')
     parser.add_argument('--source-retirement-execution-arn')
     parser.add_argument('--journal', type=Path)
     parser.add_argument('--origin', default=ORIGIN)
@@ -216,6 +297,14 @@ def main():
     args = parser.parse_args()
     need(args.origin == ORIGIN, 'only os-staging is allowed; btgq/curomaa refused')
     need(args.source_retirement_execution_arn is None or args.operation in ('plan', 'prepare'), 'retirement hint is only for plan or prepare')
+    need(args.snapshot_id is None or args.operation == PARK, 'snapshot id is only for park-failed-release')
+    if args.operation == PARK:
+        # The failed release's own job and execution (--job, --source-execution-arn) plus the fresh post-stop snapshot; the stop's UUID is minted
+        # once into the park journal (default: its own file, never the rebase journal of the same computer).
+        journal = args.journal or PARK_JOURNAL_DIR / ((args.computer or '') + '.json')
+        park_failed_release(args.computer, args.job, args.source_execution_arn, args.snapshot_id, journal, args.apply,
+                            os.environ.get('EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET', ''))
+        return
     if args.operation == RECONCILE:
         reconcile_request(args.computer, args.job, args.source_execution_arn)
         reconcile(args.computer, args.job, args.source_execution_arn, args.apply, os.environ.get('EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET', ''))
