@@ -136,3 +136,72 @@ describe('reconcile-release on the same signed route', () => {
         expect(mocks.collaborators).not.toHaveBeenCalled(); expect(mocks.execute).not.toHaveBeenCalled();
     });
 });
+
+describe('park-failed-release on the same signed route', () => {
+    async function setup() {
+        const { D, NOW } = await import('@/server/lib/compute/aws-failed-release.test-support');
+        const { parkSetup } = await import('@/server/lib/compute/aws-failed-release-park.test-support');
+        vi.setSystemTime(NOW);
+        const s = parkSetup();
+        vi.stubEnv('AWS_REGIONS', D.region);
+        vi.stubEnv('EZIL_AWS_LIFECYCLE_DEPLOYMENTS', JSON.stringify({ [D.region]: D }));
+        mocks.execute.mockImplementation(s.db.execute); mocks.transaction.mockImplementation(s.db.transaction);
+        mocks.collaborators.mockReturnValue({ starter: s.deps.starter, executions: s.deps.executions, describer: s.deps.describer });
+        mocks.tunnels.mockReturnValue({ createTunnel: vi.fn(), deleteTunnel: vi.fn(async () => ({ ok: true })) });
+        const signed = (value: unknown) => request(JSON.stringify(value), path, String(NOW.getTime() / 1000));
+        return { s, body: s.request, signed };
+    }
+    it('reserves one ordinary STOP job for the proven failed release (never a release) with a bounded response', async () => {
+        const { s, body, signed } = await setup();
+        const response = await POST(signed(body));
+        expect(response.status).toBe(200); expect(response.headers.get('cache-control')).toBe('no-store');
+        const data = await response.json();
+        expect(Object.keys(data)).toEqual(['schemaVersion', 'computerId', 'jobId', 'outcome', 'error']);
+        expect(data).toMatchObject({ schemaVersion: 1, computerId: body.computerId, jobId: body.expectedJobId, error: null, outcome: 'reserved' });
+        expect(s.starts.map(w => w.intent.operation)).toEqual(['stop']);
+        expect(s.placements[0]).toMatchObject({ state: 'RECOVERING', generation: 1, lease_epoch: 1 });
+        // A replay of the same request starts nothing more.
+        expect((await (await POST(signed(body))).json()).outcome).toBe('already_reserved');
+        expect(s.starts).toHaveLength(1);
+    });
+    it('a refusal answers 200 with the classified reason and writes and starts nothing', async () => {
+        const { s, body, signed } = await setup();
+        s.describeSnapshot.mockResolvedValue(null);
+        const data = await (await POST(signed(body))).json();
+        expect(data).toMatchObject({ outcome: 'refused', error: 'snapshot_not_proven' });
+        expect(s.starts).toHaveLength(0);
+        expect(s.placements[0]).toMatchObject({ state: 'UNCONFIRMED', last_error: 'failed:LifecycleUnconfirmed' });
+    });
+    it('answers 503 without a snapshot reader, history reader, starter or tunnel client, before any placement read', async () => {
+        const { s, body, signed } = await setup();
+        const full = { starter: s.deps.starter, executions: s.deps.executions, describer: s.deps.describer };
+        mocks.collaborators.mockReturnValue({ ...full, describer: { ...s.deps.describer, describeSnapshot: undefined } });
+        expect((await POST(signed(body))).status).toBe(503);
+        mocks.collaborators.mockReturnValue({ ...full, starter: undefined });
+        expect((await POST(signed(body))).status).toBe(503);
+        mocks.collaborators.mockReturnValue({ ...full, executions: { describe: s.deps.executions.describe } });
+        expect((await POST(signed(body))).status).toBe(503);
+        mocks.collaborators.mockReturnValue(full); mocks.tunnels.mockReturnValue(null);
+        expect((await POST(signed(body))).status).toBe(503);
+        expect(mocks.execute).not.toHaveBeenCalled(); expect(s.starts).toHaveLength(0);
+    });
+    it.each(['extra field', 'missing snapshot', 'malformed snapshot id', 'missing job', 'oversize hint'])('refuses a malformed park body (%s) before dependencies', async mode => {
+        const base = { schemaVersion: 1, operation: 'park-failed-release', computerId: '11111111-1111-4111-8111-111111111111',
+            expectedJobId: '22222222-2222-4222-8222-222222222222', snapshotId: 'snap-0123456789abcdef0',
+            releaseExecutionArn: 'arn:aws:states:ap-south-1:123456789012:execution:ezil-mum-lifecycle:computer-22222222-2222-4222-8222-222222222222' };
+        const body = mode === 'extra field' ? { ...base, force: true } : mode === 'missing snapshot' ? { ...base, snapshotId: undefined }
+            : mode === 'malformed snapshot id' ? { ...base, snapshotId: 'snap-xyz' } : mode === 'missing job' ? { ...base, expectedJobId: undefined }
+            : { ...base, releaseExecutionArn: 'a'.repeat(301) };
+        const response = await POST(request(JSON.stringify(body)));
+        expect(response.status).toBe(403); expect(mocks.collaborators).not.toHaveBeenCalled();
+    });
+    it('an unsigned or wrongly signed park request never reaches dependencies', async () => {
+        const body = JSON.stringify({ schemaVersion: 1, operation: 'park-failed-release', computerId: '11111111-1111-4111-8111-111111111111',
+            expectedJobId: '22222222-2222-4222-8222-222222222222', releaseExecutionArn: 'x', snapshotId: 'snap-0123456789abcdef0' });
+        for (const response of [await POST(request(body, '/api/internal/computers/lifecycle-authority')), await POST(request(body, path, '1')),
+            await POST(new Request('https://os.example.com' + path, { method: 'POST', body, headers: { 'content-type': 'application/json' } }))]) {
+            expect(response.status).toBe(403);
+        }
+        expect(mocks.collaborators).not.toHaveBeenCalled(); expect(mocks.execute).not.toHaveBeenCalled();
+    });
+});

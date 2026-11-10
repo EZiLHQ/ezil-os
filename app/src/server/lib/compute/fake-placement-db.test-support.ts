@@ -165,6 +165,12 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
         // The reverse-move table probe (provider-reverse-store.ts `reverseMovesTablePresent`): this model has no 0012, exactly
         // as production. Reverse-move tests wrap this executor and answer it (and the reverse reads) themselves.
         if (/^SELECT to_regclass\('public\.ezil_compute_reverse_moves'\) IS NOT NULL AS present$/.test(text)) return { rows: [{ present: false }] };
+        // The writer-lease table exists only where the ready-pool SQL is registered (production: it is not), and the park
+        // reservation's blocker probe (pool-host lease or uncommitted migration) finds nothing unless a test wraps this executor.
+        if (/^SELECT to_regclass\('public\.ezil_compute_writer_leases'\) IS NOT NULL AS present$/.test(text)) return { rows: [{ present: false }] };
+        if (text.startsWith('/* placement:park-blockers */')) return { rows: [] };
+        // `SELECT ... FOR UPDATE` row lock of the park reservation: the fake serializes through its advisory-lock mutexes already.
+        if (text.startsWith('/* placement:park-row-lock */')) return { rows: placements.filter(r => uuidEq(r.computer_id, params[0])).map(r => ({ computer_id: r.computer_id })) };
         const imageTable = text.includes('public.ezil_computer_image_jobs') && !text.includes('UNION ALL');
         const writeRows = imageTable ? imageJobs : placements;
         const presentWrite = imageTable ? (r: Row) => ({ ...r }) : present;

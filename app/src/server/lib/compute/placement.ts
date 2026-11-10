@@ -1240,6 +1240,49 @@ export async function writeLivePoolRecovery(db: PlacementDb, p: Placement,
     });
 }
 
+export type ParkReservationResult = TransitionResult
+    | { ok: false; reason: 'blocked'; blocker: 'pool_lease' | 'migration' | 'writer_lease' | 'reverse_move' };
+
+/**
+ * The park reservation (aws-failed-release-park.ts): UNCONFIRMED -> RECOVERING in ONE transaction that takes the same lock order as
+ * every other placement writer (global admission -> canonical computer -> placement row) and, under those locks, refuses while ANYTHING
+ * else could be writing for the computer: an image job in any non-terminal phase or an orphaned reservation (`assertNoImageReservation`),
+ * a pool-host lease or tenant binding, a writer lease row (the table exists only where the ready-pool SQL is registered), a migration
+ * that is not committed, or a reverse move that still holds the computer. The identity CAS is the ordinary one (`casInTx`): owner,
+ * generation, lease epoch, state, job, digest, fence, instance, volume, last error and updated-at. Compute SQL stays in this file.
+ */
+export async function writeParkedStopReservation(db: PlacementDb, p: Placement, fields: PlacementFields): Promise<ParkReservationResult> {
+    if (p.provider !== 'aws-ec2' || p.state !== 'UNCONFIRMED') return { ok: false, reason: 'illegal_transition' };
+    return withAdmission(db, async (tx, lock) => {
+        await lockComputerUnderAdmission(tx, lock, p.computerId);
+        const computer = await readCanaryComputer(tx, p.computerId);
+        if (!computer || computer.deleted || computer.userId !== p.ownerUserId) return { ok: false, reason: 'cas_conflict' } as const;
+        // The row lock and a fresh read: a placement that moved since the proof loses the CAS below.
+        const id = canonicalId(p.computerId);
+        await tx.execute(sql`/* placement:park-row-lock */ SELECT computer_id FROM public.ezil_computer_placements WHERE computer_id = ${id}::uuid FOR UPDATE`);
+        const current = (await readPlacement(tx, id)).record;
+        if (!current || current.state !== 'UNCONFIRMED') return { ok: false, reason: 'cas_conflict' } as const;
+        await assertNoImageReservation(tx, p.computerId);
+        const held = rowsOf(await tx.execute(sql`/* placement:park-blockers */
+            SELECT kind FROM (
+                SELECT 'pool_lease' AS kind FROM public.ezil_compute_pool_hosts WHERE leased_computer_id = ${id}::uuid AND state <> 'retired'
+                UNION ALL SELECT 'migration' AS kind FROM public.ezil_compute_migrations WHERE computer_id = ${id}::uuid AND state <> 'committed'
+            ) b LIMIT 1`));
+        if (held.length) return { ok: false, reason: 'blocked', blocker: held[0]!.kind === 'migration' ? 'migration' : 'pool_lease' } as const;
+        const leases = rowsOf(await tx.execute(sql`SELECT to_regclass('public.ezil_compute_writer_leases') IS NOT NULL AS present`));
+        if (leases[0]?.present === true
+            && rowsOf(await tx.execute(sql`/* placement:park-writer-lease */ SELECT 1 AS held FROM public.ezil_compute_writer_leases
+                WHERE computer_id = ${id}::uuid LIMIT 1`)).length > 0) return { ok: false, reason: 'blocked', blocker: 'writer_lease' } as const;
+        const { reverseMoveHolds } = await import('./provider-reverse-store');
+        if (await reverseMoveHolds(tx, id)) return { ok: false, reason: 'blocked', blocker: 'reverse_move' } as const;
+        return casInTx(tx, p.computerId, p, 'RECOVERING', { generation: 0, leaseEpoch: 0 }, fields, {
+            provider: 'aws-ec2', ownerUserId: p.ownerUserId, instanceId: p.instanceId, lastError: p.lastError,
+            lifecycleJobId: p.lifecycleJobId ?? undefined, lifecycleDigest: p.lifecycleDigest ?? undefined,
+            fenceToken: p.fenceToken ?? undefined, volumeId: p.volumeId ?? undefined, updatedAt: p.updatedAt,
+        });
+    });
+}
+
 /** Call while holding the placement and pool locks. Any open computer usage,
  * or any historical use of this host (even for another computer), disqualifies it. */
 export async function assertUnopenedAdoptUsage(tx: PlacementExecutor, p: Placement): Promise<void> {
