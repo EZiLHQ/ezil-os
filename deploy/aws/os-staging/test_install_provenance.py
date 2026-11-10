@@ -66,7 +66,7 @@ class VerifiedInstallTests(SandboxTestCase):
         self.directory = directory
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
-    def install(self, receipt_hash, source=None, **extra):
+    def install(self, receipt_hash, source=None, stdin=False, **extra):
         source = source or self.box.sha
         # Use deploy.sh's real embedding logic, but only a fake send-command.
         result = self.box.deploy_sh('install-verified', 'v1', source, receipt_hash,
@@ -75,7 +75,7 @@ class VerifiedInstallTests(SandboxTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         generated = self.box.root / 'generated.sh'
         generated.write_text('\n'.join(self.box.payloads()[-1].splitlines()[1:-1]) + '\n')
-        return self.box.install([], script=generated, FAKE_INSPECT_JSON=json.dumps(self.loaded),
+        return self.box.install([], script=generated, stdin=stdin, FAKE_INSPECT_JSON=json.dumps(self.loaded),
                                 **{'FAKE_SHA': source, **extra})
 
     def test_verified_install_accepts_bound_archives_and_loaded_image(self):
@@ -286,6 +286,19 @@ class VerifiedInstallTests(SandboxTestCase):
         self.assertIn('Observed runtime: source=' + self.box.sha + ' image=' + config_digest, result.stderr)
         self.assertFalse(any(c[:2] == ['systemctl', 'enable'] for c in self.box.calls()))
         self.assertNotIn('Installed TAG:', result.stdout)
+
+    def test_script_on_stdin_is_not_consumed_by_compose_exec(self):
+        # SSM runs `bash <<EOF`; a child that reads stdin (as `compose exec -T` does) must not eat the
+        # unparsed rest of the script: footer, timer restore and both exec checks must still run.
+        receipt = self.prepare(containerd=True)
+        _, result = self.install(receipt, stdin=True, FAKE_EXEC_CONSUMES_STDIN='1')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Installed TAG: v1', result.stdout)
+        self.assertIn('Deployed SHA: ' + self.box.sha, result.stdout)
+        calls = self.box.calls()
+        enabled = {c[3] for c in calls if c[:3] == ['systemctl', 'enable', '--now']}
+        self.assertEqual(enabled, {f'ezil-os-staging-{j}.timer' for j in JOBS})
+        self.assertEqual(len([c for c in calls if c[0] == 'docker' and 'exec' in c]), 2)
 
     def test_runtime_mismatch_fails_with_recovery_message(self):
         receipt = self.prepare()

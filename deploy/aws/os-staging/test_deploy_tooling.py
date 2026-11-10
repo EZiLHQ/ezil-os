@@ -100,6 +100,8 @@ elif name == "docker":
         with open(state / "log", "a") as log:
             log.write(json.dumps(["compose.env", pathlib.Path("compose.env").read_text()]) + "\n")
     elif "exec" in args:
+        if os.environ.get('FAKE_EXEC_CONSUMES_STDIN'):  # real `compose exec -T` forwards stdin
+            sys.stdin.buffer.read()
         print(os.environ['FAKE_SHA'] if 'process.stdout.write' in args[-1] else "Deployed SHA: " + os.environ["FAKE_SHA"])
 elif name == "curl":
     if args[-1] == 'http://169.254.169.254/latest/api/token':
@@ -223,10 +225,12 @@ class Sandbox:
         path.write_text("set -- " + " ".join(set_args) + "\n" + text)
         return host, path
 
-    def install(self, set_args, script=None, **environment):
+    def install(self, set_args, script=None, stdin=False, **environment):
         host, path = self.host_script(set_args, script)
-        result = subprocess.run(["bash", str(path)], capture_output=True, text=True, cwd=self.root,
-                                env=self.environment(**environment), timeout=60)
+        # stdin=True feeds the script on bash's stdin, the SSM `bash <<EOF` transport.
+        command, extra = (["bash"], {"input": path.read_text()}) if stdin else (["bash", str(path)], {})
+        result = subprocess.run(command, capture_output=True, text=True, cwd=self.root,
+                                env=self.environment(**environment), timeout=60, **extra)
         return host, result
 
 

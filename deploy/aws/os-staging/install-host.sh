@@ -110,7 +110,9 @@ for job in "${jobs[@]}"; do
         systemctl stop "ezil-os-staging-$job.timer" "ezil-os-staging-$job.service"
     fi
 done
-python3 render-env.py
+# The script arrives on bash's stdin (SSM heredoc), so any child that reads stdin would swallow the
+# unparsed rest of it (timer restore, footer) and still exit 0. Isolate stdin for every such child.
+python3 render-env.py </dev/null
 printf 'OS_STAGING_TAG=%s\n' "$tag" >compose.env
 # D4: --force-recreate deletes the outgoing web container's json-file log. Keep a gzip copy first
 # (root-only, 7-day retention). Best effort: a snapshot problem never blocks the install.
@@ -127,9 +129,9 @@ snapshot_web_log() {
     find "$dir" -maxdepth 1 -type f -name 'web-*.log.gz*' -mmin +10080 -delete 2>/dev/null || true
 }
 snapshot_web_log
-docker compose --env-file compose.env up -d --force-recreate --wait --wait-timeout 120
+docker compose --env-file compose.env up -d --force-recreate --wait --wait-timeout 120 </dev/null
 if [[ -n $approved_source ]]; then
-    observed_source=$(docker compose --env-file compose.env exec -T web node -e 'process.stdout.write(process.env.EZIL_GIT_SHA || "")') || observed_source=unavailable
+    observed_source=$(docker compose --env-file compose.env exec -T web node -e 'process.stdout.write(process.env.EZIL_GIT_SHA || "")' </dev/null) || observed_source=unavailable
     observed_image=$(docker container inspect "$slug-web-1" --format '{{.Image}}') || observed_image=unavailable
     if [[ $observed_source != "$approved_source" || $observed_image != "$verified_store_id" ]]; then
         echo 'Runtime SHA mismatch; release owner must recover. App replacement already ran; stopped timers remain stopped. No automatic rollback.' >&2
@@ -148,4 +150,4 @@ for job in "${jobs[@]}"; do
     systemctl enable --now "ezil-os-staging-$job.timer"
 done
 printf 'Installed TAG: %s\n' "$tag"
-docker compose --env-file compose.env exec -T web node -e 'console.log("Deployed SHA: " + process.env.EZIL_GIT_SHA)'
+docker compose --env-file compose.env exec -T web node -e 'console.log("Deployed SHA: " + process.env.EZIL_GIT_SHA)' </dev/null
