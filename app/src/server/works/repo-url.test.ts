@@ -24,6 +24,9 @@ describe('parseRepositoryUrl: one canonical public github.com repository, or a r
         'https://u@github.ezil.work/acme/site.git', 'https://github.ezil.work/acme/site.git?token=x',
         'https://github.ezil.work/acme/site.git.git', 'https://github.ezil.work/acme/si..te.git',
         'https://github.ezil.work/acme/Site.git', 'https://github.ezil.work/acme/site.git/',
+        'https://github.ezil.work/acme/./site.git', 'https://github.ezil.work/acme/ignored/../site.git',
+        'https://github.ezil.work/acme/%2e/site.git', 'https://github.ezil.work/acme/%2e%2e/site.git',
+        'https://github.ezil.work/acme/ignored/%2E%2E/site.git',
     ])('refuses noncanonical EZiL Git address %s', raw => {
         expect(parseRepositoryUrl(raw)).toEqual({ ok: false, reason: 'invalid' });
     });

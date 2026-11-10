@@ -43,19 +43,24 @@ export function parseRepositoryUrl(raw: unknown): ParsedRepositoryUrl {
     if (typeof raw !== 'string' || raw.length === 0 || raw.length > MAX_URL_LENGTH) return invalid;
     // Refused before parsing: anything URL parsing would normalise away or that git could read differently.
     if (/[\s\\%?#@]/.test(raw) || /[\u0000-\u001f\u007f-￿]/.test(raw)) return invalid;
+    // WHATWG URL removes dot segments. Validate this host's exact route from the
+    // original string before constructing a URL, so no alternate spelling can
+    // become a canonical EZiL Git address through normalization.
+    const ezilPrefix = 'https://github.ezil.work/';
+    if (raw.startsWith(ezilPrefix)) {
+        const parts = raw.slice(ezilPrefix.length).split('/');
+        if (parts.length !== 2 || !EZIL_NAMESPACE.test(parts[0]!)) return invalid;
+        const name = parts[1]!.endsWith('.git') ? parts[1]!.slice(0, -4) : parts[1]!;
+        if (!EZIL_NAME.test(name) || name.endsWith('.')) return invalid;
+        const owner = parts[0]!;
+        return { ok: true, host: 'github.ezil.work', owner, name,
+            canonicalURL: `https://github.ezil.work/${owner}/${name}.git`, displayName: `${owner}/${name}` };
+    }
     let url: URL;
     try { url = new URL(raw); } catch { return invalid; }
     if (url.protocol !== 'https:' || url.username || url.password || url.port || url.search || url.hash) return invalid;
     if (!raw.startsWith(`https://${url.hostname}/`)) return invalid; // no case games or trailing dots in the host as typed
-    if (url.hostname === 'github.ezil.work') {
-        const parts = url.pathname.split('/');
-        if (parts.length !== 3 || parts[0] !== '' || !EZIL_NAMESPACE.test(parts[1]!)) return invalid;
-        const name = parts[2]!.endsWith('.git') ? parts[2]!.slice(0, -4) : parts[2]!;
-        if (!EZIL_NAME.test(name) || name.endsWith('.')) return invalid;
-        const owner = parts[1]!;
-        return { ok: true, host: 'github.ezil.work', owner, name,
-            canonicalURL: `https://github.ezil.work/${owner}/${name}.git`, displayName: `${owner}/${name}` };
-    }
+    if (url.hostname === 'github.ezil.work') return invalid;
     if (EZIL_GIT_HOSTS.has(url.hostname)) return { ok: false, reason: 'unsupported_host' };
     if (url.hostname !== 'github.com') return invalid;
     const parts = url.pathname.replace(/\/$/, '').split('/');
