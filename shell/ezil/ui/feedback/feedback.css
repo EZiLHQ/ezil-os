@@ -90,11 +90,9 @@
 .ezil-feedback-dialog.ezil-feedback-capturing { visibility: hidden; }
 .ezil-feedback-dialog.ezil-feedback-capturing::backdrop { background: transparent; }
 .ezil-feedback-dialog [hidden] { display: none !important; }
-.ezil-feedback-dialog h2 { font-size: 21px; margin: 0 0 16px; }
+.ezil-feedback-dialog h2 { font-size: 21px; margin: 0 0 8px; }
+.ezil-feedback-dialog h2:focus { outline: none; }
 .ezil-feedback-fields { border: 0; padding: 0; margin: 0; min-width: 0; }
-.ezil-feedback-category { border: 0; padding: 0; margin: 0 0 16px; }
-.ezil-feedback-category label { display: inline-flex; gap: 4px; align-items: center; margin-right: 16px; }
-.ezil-feedback-category legend { margin-bottom: 6px; }
 .ezil-feedback-dialog textarea {
     box-sizing: border-box;
     display: block;
@@ -111,7 +109,8 @@
 .ezil-feedback-dialog input { accent-color: var(--fb-accent); }
 .ezil-feedback-muted { color: var(--fb-muted); margin: 4px 0 12px; }
 .ezil-feedback-warning { padding: 10px; background: var(--fb-warn-bg); color: var(--fb-warn); border-radius: 6px; }
-.ezil-feedback-consent { display: flex; align-items: center; gap: 6px; margin: 12px 0; }
+.ezil-feedback-consent { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; margin: 8px 0; }
+.ezil-feedback-consent small { flex-basis: 100%; padding-left: 22px; font-size: 12px; line-height: 1.35; }
 .ezil-feedback-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
 .ezil-feedback-dialog button {
     border: 1px solid var(--fb-border);
@@ -141,7 +140,11 @@
     font-size: 12px;
     user-select: text;
 }
-.ezil-feedback-image img { display: block; max-width: 100%; max-height: 240px; margin: 12px 0; object-fit: contain; }
+/* A compact thumbnail row: the image beside its Edit / Remove actions, stacked in a column. */
+.ezil-feedback-image { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 4px 10px; margin: 4px 0; }
+.ezil-feedback-image img { grid-row: span 2; display: block; max-width: 130px; max-height: 72px; object-fit: contain; }
+.ezil-feedback-image button { justify-self: start; }
+[data-role="capture-scope"] { font-size: 12px; line-height: 1.35; }
 .ezil-feedback-result { overflow-wrap: anywhere; }
 .ezil-feedback-reports { padding-left: 20px; }
 .ezil-feedback-reports li { margin: 12px 0; overflow-wrap: anywhere; }
@@ -154,7 +157,12 @@
 }
 @media (any-pointer: coarse) {
     .ezil-feedback-dialog button, .ezil-feedback-dialog summary,
-    .ezil-feedback-consent, .ezil-feedback-category label { min-height: 44px; }
+    .ezil-feedback-consent { min-height: 44px; }
+    /* Secondary controls stay comfortably tappable at 36px so the default form fits a phone without scrolling;
+     * Send and Cancel keep the full 44px. */
+    .ezil-feedback-dialog .ezil-feedback-details > summary, .ezil-feedback-dialog .ezil-feedback-capture-options > summary,
+    .ezil-feedback-dialog .ezil-feedback-preview > summary, .ezil-feedback-dialog .ezil-feedback-image button,
+    .ezil-feedback-dialog .ezil-feedback-consent { min-height: 36px; }
 }
 @media (pointer: coarse) {
     /* A 44px target from the corner down; the disc stays level with the head. */
@@ -198,5 +206,12 @@
 }
 .ezil-feedback-chip[data-look="outline"]:focus-visible svg { outline-width: 2px; outline-offset: 1px; }
 
-.ezil-feedback-bug label { display: block; margin: 10px 0 5px; }
-.ezil-feedback-bug select { max-width: 100%; min-height: 36px; background: var(--fb-field); color: inherit; border: 1px solid var(--fb-border); border-radius: 6px; }
+/* Send stays on screen however tall the form is (a default screenshot, the open preview, a phone): the
+ * dialog scrolls and its status line and actions stick to the bottom edge. */
+.ezil-feedback-footer { position: sticky; bottom: 0; z-index: 1; margin-top: 12px; padding: 4px 0 12px; background: var(--fb-bg); }
+.ezil-feedback-details { margin: 4px 0 8px; }
+.ezil-feedback-details > summary { cursor: pointer; color: var(--fb-muted); }
+[data-role="capture-scope"] { margin: 6px 0; }
+[data-role="capture-scope"] .ezil-feedback-link { display: inline; padding: 0; min-height: 0; border: 0; background: none; color: var(--fb-accent); text-decoration: underline; font: inherit; cursor: pointer; }
+.ezil-feedback-capture-options { margin: 8px 0; }
+.ezil-feedback-capture-options > summary { cursor: pointer; }

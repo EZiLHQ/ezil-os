@@ -37,12 +37,24 @@ const editorOptions = [];
 let supported = true;
 let desktopSupported = true;
 let nextCanvas = () => Promise.resolve(document.createElement('canvas'));
+let defaultCapture = false;
+let manualClick = false;
+document.addEventListener('click', event => {
+    if ( ! event.target.closest?.('[data-capture]') ) return;
+    manualClick = true;
+    queueMicrotask(() => { manualClick = false; });
+}, true);
+let encodeResult = () => new window.Blob([imageBytes], { type: 'image/webp' });
 const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aJx8AAAAASUVORK5CYII=', 'base64');
 let editorResult = () => ({ blob: new window.Blob([imageBytes], { type: 'image/png' }), contentType: 'image/png', width: 1, height: 1 });
 globalThis.__feedbackCapture = {
     supported: () => supported,
     desktopSupported: () => desktopSupported,
+    encode: (canvas, limit, options) => Promise.resolve(options?.signal?.aborted ? null : encodeResult(canvas, limit)),
     capture: (kind, options) => {
+        // The default screenshot also calls the shell snapshot at open. Existing checks drive the manual buttons,
+        // so unless a check opts in (`defaultCapture = true`) the default one is answered with no image, unrecorded.
+        if ( kind === 'shell' && ! manualClick && ! defaultCapture ) return Promise.resolve(null);
         captureCalls.push(kind);
         captureOptions.push(options);
         if ( options?.hide ) {
@@ -65,7 +77,8 @@ const hooks = registerHooks({ load (url, context, next) {
         export const capture_tab_frame = options => globalThis.__feedbackCapture.capture('tab', options);
         export const capture_desktop_frame = options => globalThis.__feedbackCapture.capture('desktop', options);` };
     if ( url === editorUrl ) return { format: 'module', shortCircuit: true,
-        source: 'export const open_redact_editor = (canvas, options) => globalThis.__feedbackCapture.edit(canvas, options);' };
+        source: 'export const open_redact_editor = (canvas, options) => globalThis.__feedbackCapture.edit(canvas, options);'
+            + 'export const encode_under_limit = (canvas, limit, options) => globalThis.__feedbackCapture.encode(canvas, limit, options);' };
     return next(url, context);
 } });
 
@@ -99,7 +112,11 @@ let flushing = false;
 let respond = async () => ({ status: 201, ok: true, json: async () => ({ id: reportId, screenshotAccepted: true }) });
 globalThis.fetch = window.fetch = (url, options) => {
     if ( options.method === 'POST' ) {
-        if ( ! flushing ) assert.equal(options.body, document.querySelector('.ezil-feedback-preview pre').textContent, 'preview is the exact request body at dispatch');
+        if ( ! flushing ) {
+            const box = document.querySelector('.ezil-feedback-preview');
+            if ( ! box.open ) { box.open = true; box.dispatchEvent(new window.Event('toggle')); }
+            assert.equal(options.body, box.querySelector('pre').textContent, 'preview is the exact request body at dispatch');
+        }
         feedbackSubmitSchema.parse(JSON.parse(options.body));
     }
     calls.push({ url, ...options });
@@ -114,9 +131,11 @@ let checks = 0;
 async function check (label, run) { await run(); checks++; console.log(`PASS ${label}`); }
 const current = () => document.querySelector('dialog.ezil-feedback-dialog');
 const form = () => current().querySelector('form');
-const payload = () => JSON.parse(current().querySelector('pre').textContent);
+// The preview renders only while open (the default screenshot makes the body large): opening it is the reader's act.
+const showPreview = () => { const box = current().querySelector('.ezil-feedback-preview'); if ( ! box.open ) { box.open = true; box.dispatchEvent(new window.Event('toggle')); } };
+const payload = () => { showPreview(); return JSON.parse(current().querySelector('pre').textContent); };
 const status = () => current().querySelector('.ezil-feedback-result').textContent;
-const setDescription = value => { form().elements.category.value = 'idea'; form().elements.description.value = value; form().elements.description.dispatchEvent(new window.Event('input', { bubbles: true })); };
+const setDescription = value => { form().elements.description.value = value; form().elements.description.dispatchEvent(new window.Event('input', { bubbles: true })); };
 const change = (name, checked) => { form().elements[name].checked = checked; form().elements[name].dispatchEvent(new window.Event('change', { bubbles: true })); };
 const send = () => form().dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
 const close = () => current().querySelector('[data-action="cancel"]').click();
@@ -309,22 +328,39 @@ try {
         feedback.mount_feedback_chip();
         await tick();
     });
-    await check('native dialog semantics, default-off consent, live preview, no pre-submit request', () => {
+    await check('one optional description, default attachments, live preview, no pre-submit request', async () => {
         open();
         assert.equal(modalCalls, 1);
         assert.equal(current().getAttribute('aria-labelledby'), current().querySelector('h2').id);
-        assert.equal(form().elements.description.required, true);
+        assert.equal(form().elements.description.required, false, 'no required question');
         assert.equal(form().elements.description.maxLength, 4000);
-        assert.equal(form().elements.diagnostics.checked, false);
-        assert.equal(form().elements.screenshot.checked, false);
+        assert.equal(form().elements.category, undefined, 'no category picker');
+        assert.equal(current().querySelector('.ezil-feedback-bug'), null, 'no bug questionnaire');
+        assert.equal(current().querySelector('select'), null);
+        assert.equal(form().elements.diagnostics.checked, true, 'diagnostics selected by default');
+        assert.equal(form().elements.screenshot.checked, true, 'screenshot selected by default');
+        assert.equal(current().querySelector('[type="submit"]').disabled, false, 'a blank report can be sent');
         assert.equal(payload().category, 'bug');
-        assert.equal(payload().diagnostics, null);
-        assert.equal(payload().screenshot, null);
+        assert.equal(payload().description, '');
+        assert.ok(payload().diagnostics?.recentEvents, 'the diagnostic snapshot is taken at open');
+        diagnosticsSchema.parse(payload().diagnostics);
+        assert.equal(payload().screenshot, null, 'capture unavailable: the report carries no image and is not blocked');
         assert.equal(payload().computerId, computerId);
+        await until(() => /No screenshot was captured automatically/.test(current().querySelector('[data-role="capture-note"]').textContent));
+        assert.equal(current().querySelector('[type="submit"]').disabled, false);
+        change('diagnostics', false);
+        assert.equal(payload().diagnostics, null, 'the attachment can still be switched off');
+        change('screenshot', false);
+        change('diagnostics', true);
+        change('screenshot', true);
+        await tick();
         feedback.open_feedback_dialog({ source: 'chip' });
         assert.equal(modalCalls, 1);
         setDescription('The desktop froze.');
-        assert.match(current().querySelector('#ezil-feedback-counter').textContent, /18 \/ 4000/);
+        assert.equal(current().querySelector('#ezil-feedback-counter').textContent, '', 'the character count stays out of the way until it matters');
+        setDescription('y'.repeat(3100));
+        assert.match(current().querySelector('#ezil-feedback-counter').textContent, /3100 \/ 4000/);
+        setDescription('The desktop froze.');
         change('diagnostics', true);
         assert.doesNotMatch(current().querySelector('pre').textContent, /SECRET|example\.test/);
         assert.equal(calls.length, 0);
@@ -356,24 +392,219 @@ try {
         close();
         assert.equal(document.activeElement.id, 'opener');
     });
-    await check('rich bugs validate all fields, preserve drafts and total text without truncation', () => {
-        window.localStorage.removeItem(draftKey); open();
-        setDescription('Cannot open the desktop');
-        form().elements.category.value = 'bug';
-        form().dispatchEvent(new window.Event('change', { bubbles: true }));
+    await check('touch primary pointer: the first focus is the heading, never a text field (no keyboard over Send); a fine pointer keeps the description', () => {
+        const realMatchMedia = window.matchMedia;
+        window.matchMedia = query => ({ matches: query === '(pointer: coarse)', addEventListener () {}, removeEventListener () {} });
+        try {
+            open();
+            const focused = document.activeElement;
+            assert.equal(focused.id, 'ezil-feedback-heading');
+            assert.ok(current().contains(focused));
+            assert.equal(focused.matches('input, textarea, select, [contenteditable]'), false);
+            assert.equal(form().elements.description.hasAttribute('autofocus'), false, 'no text field asks for the first focus');
+            assert.equal(current().querySelector('#ezil-feedback-heading').hasAttribute('autofocus'), true, 'showModal focuses the heading');
+            assert.equal(current().querySelector('[type="submit"]').disabled, false, 'a blank report is sendable from the first screen');
+            close();
+        } finally { window.matchMedia = realMatchMedia; }
+        open();
+        assert.equal(document.activeElement.id, 'ezil-feedback-description');
+        assert.equal(form().elements.description.hasAttribute('autofocus'), true);
+        close();
+    });
+    await check('a draft saved by the earlier bug form keeps its text; the length limit still holds Send', () => {
+        const legacyId = '44444444-4444-4444-8444-444444444444';
+        window.localStorage.setItem(draftKey, JSON.stringify({ clientRequestId: legacyId, category: 'idea', description: 'Cannot open the desktop',
+            bug: { activity: 'Opening a project', steps: '1. Click Browser', expected: 'Desktop opens', actual: 'Spinner stays', reproducibility: 'Every time', impact: 'Blocked' } }));
+        open();
+        assert.match(payload().description, /^Summary \/ context\nCannot open the desktop\n\nWhat were you doing\?\nOpening a project/);
+        assert.match(payload().description, /Steps to reproduce\n1\. Click Browser/);
+        assert.match(payload().description, /Impact\nBlocked$/);
+        assert.equal(payload().clientRequestId, legacyId);
+        assert.equal(payload().category, 'bug');
+        form().elements.description.value = payload().description + '!';
+        form().elements.description.dispatchEvent(new window.Event('input', { bubbles: true }));
+        assert.deepEqual(Object.keys(stored(draftKey)), ['clientRequestId', 'category', 'description'], 'it is saved back as one description');
+        form().elements.description.value = 'x'.repeat(4001);
+        form().elements.description.dispatchEvent(new window.Event('input', { bubbles: true }));
         assert.equal(current().querySelector('[type="submit"]').disabled, true);
-        for (const [key, value] of Object.entries({ activity: 'Opening a project', steps: '1. Click Browser', expected: 'Desktop opens', actual: 'Spinner stays', reproducibility: 'Every time', impact: 'Blocked' })) form().elements[key].value = value;
-        form().dispatchEvent(new window.Event('input', { bubbles: true }));
-        assert.equal(current().querySelector('[type="submit"]').disabled, false);
-        assert.match(payload().description, /Steps to reproduce\n1. Click Browser/);
-        const before = payload().description; close(); open();
-        assert.equal(payload().description, before);
-        assert.equal(form().elements.steps.value, '1. Click Browser');
-        form().elements.actual.value = 'x'.repeat(4000);
-        form().dispatchEvent(new window.Event('input', { bubbles: true }));
-        assert.equal(current().querySelector('[type="submit"]').disabled, true);
-        assert.match(payload().description, new RegExp('x{4000}'));
+        form().elements.description.value = '';
+        form().elements.description.dispatchEvent(new window.Event('input', { bubbles: true }));
+        assert.equal(current().querySelector('[type="submit"]').disabled, false, 'a blank report is sendable');
         close(); window.localStorage.removeItem(draftKey);
+    });
+    await check('an overlong legacy draft is restored whole (never truncated); Send asks to shorten it', () => {
+        window.localStorage.setItem(draftKey, JSON.stringify({ clientRequestId: '55555555-5555-4555-8555-555555555555', category: 'bug',
+            description: 'Short summary', bug: { activity: 'a'.repeat(1500), steps: 'b'.repeat(1500), expected: 'c'.repeat(1500), actual: 'd'.repeat(1500), impact: 'TAIL_MARKER' } }));
+        open();
+        const text = form().elements.description.value;
+        assert.ok(text.length > 4000, 'the migrated text is longer than one report may be');
+        assert.ok(text.endsWith('Impact\nTAIL_MARKER'), 'the tail of the saved text is not cut');
+        assert.equal(payload().description, text);
+        assert.equal(current().querySelector('[type="submit"]').disabled, true, 'sending waits for the person to shorten it');
+        assert.match(current().querySelector('#ezil-feedback-counter').textContent, /shorten the description/);
+        form().elements.description.value = text.slice(-100);
+        form().elements.description.dispatchEvent(new window.Event('input', { bubbles: true }));
+        assert.equal(current().querySelector('[type="submit"]').disabled, false);
+        close(); window.localStorage.removeItem(draftKey);
+    });
+    await check('default capture: the masked window snapshot is attached without the editor, and a blank report sends with it', async () => {
+        defaultCapture = true;
+        try {
+            const shells = captureCalls.length, editors = editorOptions.length, requests = calls.length;
+            open();
+            await until(() => ! current().querySelector('.ezil-feedback-image').hidden);
+            assert.equal(current().querySelector('pre').textContent, '', 'the large body is rendered only while the preview is open');
+            assert.deepEqual(captureCalls.slice(shells), ['shell'], 'only the EZiL window snapshot: no tab or desktop picker, no editor');
+            assert.equal(editorOptions.length, editors);
+            assert.equal(captureOptions.at(-1).hide, undefined, 'no hide-and-restore step: the snapshot excludes this dialog itself');
+            assert.equal(payload().screenshot.contentType, 'image/webp');
+            assert.equal(calls.length, requests, 'nothing uploads until Send');
+            assert.equal(current().querySelector('[data-role="capture-note"]').textContent, '');
+            assert.equal(current().querySelector('[type="submit"]').disabled, false);
+            respond = async () => ({ status: 201, ok: true, json: async () => ({ id: reportId, screenshotAccepted: true }) });
+            send();
+            await until(() => status().includes(reportId));
+            const body = JSON.parse(calls.at(-1).body);
+            assert.equal(calls.length, requests + 1);
+            assert.equal(body.description, '');
+            assert.equal(body.category, 'bug');
+            assert.ok(body.diagnostics?.recentEvents);
+            assert.ok(body.screenshot.dataBase64.length > 0);
+            close();
+        } finally { defaultCapture = false; }
+    });
+    await check('a failed, empty, oversized or unencodable default capture never blocks Send', async () => {
+        defaultCapture = true;
+        const canvas = () => Promise.resolve(document.createElement('canvas'));
+        const wide = () => { const c = document.createElement('canvas'); c.width = 5000; c.height = 10; return Promise.resolve(c); };
+        const realEncode = encodeResult;
+        try {
+            for ( const [label, setup] of [
+                ['capture rejects', () => { nextCanvas = () => Promise.reject(new Error('capture failed')); }],
+                ['no canvas', () => { nextCanvas = () => Promise.resolve(null); }],
+                ['unencodable', () => { nextCanvas = canvas; encodeResult = () => null; }],
+                ['over the byte limit', () => { nextCanvas = canvas; encodeResult = () => ({ size: 2 * 1024 * 1024, type: 'image/webp' }); }],
+                ['over the pixel limit', () => { nextCanvas = wide; }],
+            ] ) {
+                nextCanvas = canvas; encodeResult = realEncode;
+                setup();
+                open();
+                await until(() => /No screenshot was captured automatically/.test(current().querySelector('[data-role="capture-note"]').textContent));
+                assert.equal(current().querySelector('[type="submit"]').disabled, false, label);
+                assert.equal(payload().screenshot, null, label);
+                const requests = calls.length;
+                send();
+                await until(() => status().includes(reportId));
+                assert.equal(calls.length, requests + 1, label);
+                const body = JSON.parse(calls.at(-1).body);
+                assert.equal(body.screenshot, null, label);
+                assert.equal(body.description, '', `${label}: blank`);
+                assert.ok(body.diagnostics, label);
+                close();
+            }
+        } finally { defaultCapture = false; nextCanvas = canvas; encodeResult = realEncode; }
+    });
+    await check('Send while the default screenshot is still capturing waits briefly; a late capture never changes the frozen body or id', async () => {
+        defaultCapture = true;
+        const requests = calls.length;
+        try {
+            // (1) Ready within the wait: it is included, and a repeated Send makes no second request.
+            let ready;
+            nextCanvas = () => new Promise(resolve => { ready = resolve; });
+            open(); setDescription('Sent while capturing');
+            send(); send();
+            assert.equal(calls.length, requests, 'waiting for the screenshot');
+            assert.equal(current().querySelector('[type="submit"]').disabled, true);
+            assert.match(current().querySelector('[data-role="capture-note"]').textContent, /Finishing the screenshot/);
+            ready(document.createElement('canvas'));
+            await until(() => status().includes(reportId));
+            assert.equal(calls.length, requests + 1, 'one report');
+            assert.ok(JSON.parse(calls.at(-1).body).screenshot, 'the screenshot that finished in time is included');
+            close();
+            // (2) Not ready within the wait: sent without it; the late capture cannot alter the body, and a retry is byte-identical.
+            respond = async () => { throw new TypeError('Failed to fetch'); };
+            let late;
+            nextCanvas = () => new Promise(resolve => { late = resolve; });
+            open(); setDescription('Capture never finishes');
+            const sentBefore = calls.length;
+            send();
+            await new Promise(resolve => setTimeout(resolve, feedback.AUTO_CAPTURE_WAIT_MS + 300));
+            await until(() => calls.length === sentBefore + 1 && ! current().querySelector('[type="submit"]').disabled);
+            const first = JSON.parse(calls.at(-1).body);
+            assert.equal(first.screenshot, null);
+            assert.equal(stored(outboxKey).filter(entry => entry.clientRequestId === first.clientRequestId).length, 1, 'kept for retry');
+            late(document.createElement('canvas')); await tick(); await tick();
+            assert.equal(current().querySelector('.ezil-feedback-image').hidden, true, 'a late capture is discarded');
+            send(); await until(() => calls.length === sentBefore + 2);
+            assert.equal(calls.at(-1).body, calls.at(-2).body, 'the retry is the same request, byte for byte');
+            assert.equal(JSON.parse(calls.at(-1).body).clientRequestId, first.clientRequestId);
+            respond = async () => ({ status: 201, ok: true, json: async () => ({ id: reportId, screenshotAccepted: true }) });
+            await until(() => ! current().querySelector('[type="submit"]').disabled);
+            send(); await until(() => status().includes(reportId));
+            assert.equal(calls.at(-1).body, calls.at(-2).body);
+            close();
+        } finally { defaultCapture = false; nextCanvas = () => Promise.resolve(document.createElement('canvas')); }
+    });
+    await check('reopening after a send that got no answer resumes that same request byte for byte (text or blank), never a second report', async () => {
+        defaultCapture = true;
+        const realRespond = respond;
+        try {
+            respond = async () => { throw new TypeError('Failed to fetch'); };
+            for ( const text of ['Reopen me', ''] ) {
+                window.localStorage.removeItem(draftKey);
+                open();
+                if ( text ) setDescription(text);
+                await until(() => ! current().querySelector('.ezil-feedback-image').hidden);
+                const requests = calls.length;
+                send();
+                await until(() => calls.length === requests + 1 && ! current().querySelector('[type="submit"]').disabled);
+                const first = calls.at(-1).body;
+                const id = JSON.parse(first).clientRequestId;
+                assert.ok(JSON.parse(first).screenshot && JSON.parse(first).diagnostics, 'default attachments were sent');
+                close();
+                // A new event in the ring would change a fresh snapshot: the resumed request must keep the queued one.
+                telemetry.capture({ eventClass: 'api_failure', site: 's', code: `between_opens_${text.length}` });
+                const shells = captureCalls.length;
+                // Reopened later: another computer is current, and (blank case) from an error screen with a code to prefill.
+                const originalComputer = JSON.parse(first).computerId;
+                setCurrentComputer({ id: '66666666-6666-4666-8666-666666666666' });
+                if ( text ) open();
+                else { document.querySelector('#opener').focus(); feedback.open_feedback_dialog({ source: 'opening', errorCode: 'billing_files_on_aws' }); }
+                assert.equal(payload().clientRequestId, id, `${text || 'blank'}: the same request id`);
+                assert.equal(payload().computerId, originalComputer, 'the queued request keeps the computer it was sent for');
+                assert.equal(form().elements.description.value, text, 'no new prefill on a resumed request');
+                assert.equal(current().querySelector('pre').textContent, first, 'the preview is the queued body');
+                assert.equal(captureCalls.length, shells, 'no new capture for a request that is already queued');
+                assert.equal(current().querySelector('.ezil-feedback-image').hidden, false, 'the queued screenshot is shown');
+                send();
+                await until(() => calls.length === requests + 2 && ! current().querySelector('[type="submit"]').disabled);
+                assert.equal(calls.at(-1).body, first, 'the re-send is byte-identical');
+                close();
+                setCurrentComputer({ id: originalComputer });
+                window.localStorage.removeItem(outboxKey);
+                window.localStorage.removeItem(draftKey);
+            }
+        } finally { defaultCapture = false; respond = realRespond; }
+    });
+    await check('switching the screenshot off aborts the default capture, switching it on starts one, and a manual capture replaces it', async () => {
+        defaultCapture = true;
+        try {
+            nextCanvas = () => new Promise(() => {});
+            const shells = captureCalls.length;
+            open();
+            const first = captureOptions.at(-1).signal;
+            assert.equal(captureCalls.length, shells + 1);
+            change('screenshot', false);
+            assert.equal(first.aborted, true);
+            assert.equal(payload().screenshot, null);
+            change('screenshot', true);
+            assert.equal(captureCalls.length, shells + 2, 'selecting it again captures again');
+            const second = captureOptions.at(-1).signal;
+            current().querySelector('[data-capture="shell"]').click();
+            assert.equal(second.aborted, true, 'a manual capture takes over from the default one');
+            close();
+            assert.equal(captureOptions.at(-1).signal.aborted, true, 'closing the form aborts the capture');
+        } finally { defaultCapture = false; nextCanvas = () => Promise.resolve(document.createElement('canvas')); }
     });
     await check('failure references require the upstream capability and remain bounded', () => {
         const events = telemetry.recentEvents();
@@ -393,20 +624,72 @@ try {
     });
     await check('the reporter is told about the server-added context, and the client preview stays client-only', () => {
         open();
+        // A short notice is always visible; the full text sits in the collapsed diagnostics details.
         const consentNote = current().querySelector('[data-role="server-context-note"]').textContent;
         assert.match(consentNote, /With diagnostics on/);
-        assert.match(consentNote, /after you press Send, so it is not in the preview/);
-        assert.match(consentNote, /never addresses, IDs or anyone else's data/);
+        assert.match(consentNote, /not shown in the preview/);
+        assert.ok(consentNote.length < 200, 'the always-visible notice is succinct');
+        const detail = current().querySelector('.ezil-feedback-details [data-role="server-context-detail"]').textContent;
+        assert.match(detail, /after you press Send, so it is not in the preview/);
+        assert.match(detail, /never addresses, IDs or anyone else's data/);
+        assert.equal(current().querySelector('.ezil-feedback-details').open, false, 'details start collapsed');
         assert.match(current().querySelector('[data-role="server-context-preview-note"]').textContent, /does not appear here/);
         change('diagnostics', true);
-        assert.doesNotMatch(current().querySelector('.ezil-feedback-preview pre').textContent, /serverContext/);
+        assert.doesNotMatch(JSON.stringify(payload()), /serverContext/);
         close();
+    });
+    await check('the server-context notice stays visible with diagnostics on or off; on is the default and unchecking it sends no diagnostics', async () => {
+        const visible = el => { for ( let n = el; n && n !== document; n = n.parentElement ) { const s = window.getComputedStyle(n); if ( n.hidden || s.display === 'none' || s.visibility === 'hidden' ) return false; } return true; };
+        open();
+        const note = () => current().querySelector('[data-role="server-context-note"]');
+        assert.equal(form().elements.diagnostics.checked, true, 'selected by default');
+        assert.equal(visible(note()), true, 'the notice is shown with diagnostics on');
+        change('diagnostics', false);
+        assert.equal(visible(note()), true, 'the notice does not depend on the checkbox');
+        assert.equal(payload().diagnostics, null, 'opt-out: no diagnostics in the body, so the server adds no context (it only does so for a report carrying diagnostics)');
+        const requests = calls.length;
+        await tick();
+        send();
+        await until(() => calls.length === requests + 1);
+        assert.equal(JSON.parse(calls.at(-1).body).diagnostics, null, 'the sent report carries no diagnostics');
+        await until(() => status().includes(reportId));
+        close();
+    });
+    await check('compact and honest: capture scope caption, one context line from observed facts, details collapsed', async () => {
+        defaultCapture = true;
+        try {
+            setCurrentComputer({ id: computerId, name: 'Work PC' });
+            open();
+            const scope = () => current().querySelector('[data-role="capture-scope-text"]').textContent;
+            assert.match(scope(), /No screenshot attached\. Embedded apps are never captured automatically/);
+            await until(() => ! current().querySelector('.ezil-feedback-image').hidden);
+            assert.match(scope(), /Embedded app not captured/);
+            assert.match(scope(), /EZiL OS window only/);
+            assert.ok(current().querySelector('[data-role="capture-scope"] [data-capture="tab"]'), 'one optional "Capture what I see" next to the caption');
+            // Short text only in the open form; the long explanations are inside collapsed details.
+            for ( const p of current().querySelectorAll('.ezil-feedback-fields > p.ezil-feedback-muted') ) assert.ok(p.textContent.length < 220, `succinct: ${p.textContent.slice(0, 40)}`);
+            assert.equal(current().querySelector('.ezil-feedback-details').open, false);
+            // One line of observed facts only; never steps, expected or actual.
+            const line = () => current().querySelector('[data-role="context-line"]');
+            assert.equal(line().hidden, false);
+            assert.match(line().textContent, /^Noticed: .*computer “Work PC”/);
+            assert.doesNotMatch(line().textContent, /steps|expected|actual|reproduc/i);
+            change('diagnostics', false);
+            assert.doesNotMatch(line().textContent, /app /, 'diagnostics-derived facts go away with the checkbox');
+            change('diagnostics', true);
+            // A manual capture names its own source; removing leaves an honest empty state.
+            current().querySelector('[data-capture="tab"]').click();
+            await until(() => /browser surface you chose/.test(scope()));
+            assert.doesNotMatch(scope(), /EZiL OS window only/);
+            current().querySelector('[data-action="remove-screenshot"]').click();
+            assert.match(scope(), /No screenshot attached/);
+            close();
+        } finally { defaultCapture = false; setCurrentComputer({ id: computerId }); }
     });
     await check('expanded diagnostics are consented, frozen, refreshed and downgraded on a strict old server', async () => {
         window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle = true;
         open(); setDescription('Snapshot test');
-        assert.equal(payload().diagnostics, null);
-        change('diagnostics', true);
+        assert.ok(payload().diagnostics, 'selected by default: the snapshot is taken when the form opens');
         const snapshot = JSON.stringify(payload().diagnostics);
         assert.equal(payload().diagnostics.recentEvents.length, 50);
         assert.ok(payload().diagnostics.tracePhases.some(p => p.code === 'display'));
@@ -898,16 +1181,14 @@ try {
         flushing = false;
     });
     await check('the draft survives closing, keeps its id, is per account and never holds an email', async () => {
-        open(); setDescription('Half-written report'); change('diagnostics', true);
-        form().elements.category.value = 'idea';
-        form().querySelector('input[value="idea"]').dispatchEvent(new window.Event('change', { bubbles: true }));
+        open(); setDescription('Half-written report'); change('diagnostics', false);
         const id = payload().clientRequestId;
         close();
         open();
         assert.equal(form().elements.description.value, 'Half-written report');
-        assert.equal(form().elements.category.value, 'idea');
+        assert.equal(payload().category, 'bug');
         assert.equal(payload().clientRequestId, id);
-        assert.equal(form().elements.diagnostics.checked, false, 'consent is never remembered');
+        assert.equal(form().elements.diagnostics.checked, true, 'attachment choices are never remembered: each form starts from the defaults');
         close();
         for ( let i = 0; i < window.localStorage.length; i++ ) {
             const key = window.localStorage.key(i);
@@ -922,26 +1203,64 @@ try {
         Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: user });
         open(); setDescription(''); close();
     });
-    await check('Round 4: the opening screen\'s error code is prefilled, appended once to a saved draft, and kept within 4,000 characters', async () => {
+    await check('the opening screen error code is an observed fact outside the comment box: shown, sent as one final line, never duplicated, bounded and redacted', async () => {
         const openWith = errorCode => { document.querySelector('#opener').focus(); feedback.open_feedback_dialog({ source: 'opening', errorCode }); };
+        const line = () => current().querySelector('[data-role="context-line"]');
+        window.localStorage.removeItem(draftKey);
         openWith('billing_files_on_aws');
-        assert.equal(form().elements.description.value, 'Error code: billing_files_on_aws\n\n', 'no draft: the code leads the report');
-        setDescription(''); close();
-        open(); setDescription('Code would not open after I cancelled'); close();
-        openWith('billing_files_on_aws');
-        assert.equal(form().elements.description.value, 'Code would not open after I cancelled\n\nError code: billing_files_on_aws',
-            'a saved draft keeps its text and gains the code');
-        setDescription(form().elements.description.value); close();
-        openWith('billing_files_on_aws');
-        assert.equal((form().elements.description.value.match(/Error code: billing_files_on_aws/g) ?? []).length, 1, 'appended once');
+        assert.equal(form().elements.description.value, '', 'the optional comment stays empty');
+        assert.match(line().textContent, /error code billing_files_on_aws/);
+        assert.equal(payload().description, 'Error code: billing_files_on_aws', 'a blank comment still sends the code');
+        assert.equal(current().querySelector('[type="submit"]').disabled, false);
+        setDescription('Code would not open after I cancelled');
+        assert.equal(payload().description, 'Code would not open after I cancelled\n\nError code: billing_files_on_aws');
+        assert.equal(stored(draftKey).description, 'Code would not open after I cancelled', 'the draft keeps only the comment');
         close();
-        openWith('not a code!');
-        assert.doesNotMatch(form().elements.description.value, /not a code/, 'an invalid code is never written');
-        const full = 'x'.repeat(3995);
-        setDescription(full); close();
+        // An older draft that already holds the line is not duplicated.
+        window.localStorage.setItem(draftKey, JSON.stringify({ clientRequestId: '77777777-7777-4777-8777-777777777777', category: 'bug',
+            description: 'Old note\n\nError code: billing_files_on_aws' }));
+        openWith('billing_files_on_aws');
+        assert.equal((payload().description.match(/Error code: billing_files_on_aws/g) ?? []).length, 1, 'once');
+        close(); window.localStorage.removeItem(draftKey);
+        // Invalid or secret-looking codes are neither shown nor sent.
+        for ( const bad of ['not a code!', 'sk-proj-abc123', 'x'.repeat(65), 7, null, undefined] ) {
+            openWith(bad);
+            assert.doesNotMatch(line().textContent, /error code/, String(bad));
+            assert.doesNotMatch(payload().description, /Error code/, `${String(bad)}: not sent`);
+            close();
+        }
+        // The line counts toward the 4,000 limit, so a near-full comment cannot push the report over it silently.
         openWith('billing_payment_issue');
-        assert.equal(form().elements.description.value, full, 'a draft at the limit is not pushed past 4,000 characters');
+        setDescription('x'.repeat(3995));
+        assert.equal(current().querySelector('[type="submit"]').disabled, true);
+        assert.match(current().querySelector('#ezil-feedback-counter').textContent, /shorten the description/);
         setDescription(''); close();
+        window.localStorage.removeItem(draftKey);
+    });
+    await check('a queued report that carried an error code reopens as the same request even from an opener without one', async () => {
+        const realRespond = respond;
+        try {
+            respond = async () => { throw new TypeError('Failed to fetch'); };
+            window.localStorage.removeItem(draftKey);
+            document.querySelector('#opener').focus();
+            feedback.open_feedback_dialog({ source: 'opening', errorCode: 'billing_files_on_aws' });
+            setDescription('Queued with a code');
+            await tick();
+            const requests = calls.length;
+            send();
+            await until(() => calls.length === requests + 1 && ! current().querySelector('[type="submit"]').disabled);
+            const first = calls.at(-1).body;
+            assert.match(JSON.parse(first).description, /Queued with a code\n\nError code: billing_files_on_aws$/);
+            close();
+            open();
+            assert.equal(JSON.stringify(payload(), null, 2), first, 'the same body: the queued request keeps its error line');
+            assert.equal(form().elements.description.value, 'Queued with a code', 'the comment box holds only the comment');
+            close();
+        } finally {
+            respond = realRespond;
+            window.localStorage.removeItem(outboxKey);
+            window.localStorage.removeItem(draftKey);
+        }
     });
     await check('teardown and navigation close the form, abort pending captures and leave Back unhandled', async () => {
         const count = calls.length;
@@ -1022,6 +1341,7 @@ try {
     });
     await check('closing during submission is truthful and late success cannot change a new draft', async () => {
         open(); setDescription('Submitted report');
+        await tick(); // the default screenshot (unavailable here) has settled
         let finish;
         respond = () => new Promise(resolve => { finish = resolve; });
         const count = calls.length;
