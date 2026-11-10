@@ -50,9 +50,18 @@ BASELINE_MISSING = STATE + '/baseline-missing.json'
 IMAGE_MANIFEST = '/etc/ezil-image-manifest.tsv'
 MAX_DELETED = 20000
 ROOTS = ['/usr', '/etc', '/opt', '/var/lib/dpkg', '/var/lib/apt', '/root', '/home']
+# The qualified Code products and their static URL identity always belong to
+# the receiving image, even when its package-set image id has not changed.
+# Keep this list to fixed managed files: user extensions and installs survive.
+MANAGED_CODE_FILES = [
+    '/usr/lib/code-server/lib/vscode/extensions/ezil.ezil-models/dist/extension.js',
+    '/usr/lib/code-server/lib/vscode/extensions/copilot/dist/extension.js',
+    '/usr/lib/code-server/lib/vscode/out/vs/code/browser/workbench/workbench.js',
+    '/usr/lib/code-server/lib/vscode/out/server-main.js',
+]
 # Caches, logs, per-boot platform files and anything credential-like the
 # platform writes at boot. Persisting browser logins is a separate decision.
-EXCLUDE = [
+EXCLUDE = MANAGED_CODE_FILES + [
     # Baked identity and inventories belong to the receiving image, never the user's layer.
     '/etc/ezil-image-id', IMAGE_MANIFEST, '/etc/ezil-image-apt-manual.txt', '/etc/ezil-image-npm-global.txt',
     STATE, '/var/lib/apt/lists', '/var/lib/dpkg/lock', '/var/lib/dpkg/lock-frontend', '/var/lib/apt/lists/lock',
@@ -74,6 +83,12 @@ assert os.path.dirname(work) == '/tmp' and os.path.basename(work).startswith('ez
 
 def excluded(path):
     return os.path.basename(path) in EXCLUDE_NAMES or any(path == e or path.startswith(e + '/') for e in EXCLUDE)
+
+def managed_code_restore_path(path):
+    # Resolve ancestors, not the final component: replacing or unlinking an
+    # ordinary user's symlink is safe, but writing through its parent is not.
+    destination = os.path.join(os.path.realpath(os.path.dirname(path)), os.path.basename(path))
+    return destination in MANAGED_CODE_FILES
 
 def image_id():
     try:
@@ -427,7 +442,7 @@ def restore():
             assert not any(part == '..' for part in m.name.split('/')), 'unsafe archive path'
             if m.isdir() and root_ancestor(path): continue
             assert in_roots(path), 'path outside system roots'
-            if excluded(path): continue
+            if excluded(path) or managed_code_restore_path(path): continue
             if not same_image and m.isfile() and path == DPKG_STATUS:
                 with tar.extractfile(m) as src:
                     merged = merged_dpkg_status(src.read().decode('utf-8', 'surrogateescape'))
@@ -473,7 +488,7 @@ def restore():
     # Deletions of image files only make sense against the image they were made on.
     if same_image:
         for path in sorted(deleted_list, key=lambda x: -x.count('/')):
-            if not in_roots(path) or excluded(path): continue
+            if not in_roots(path) or excluded(path) or managed_code_restore_path(path): continue
             if os.path.islink(path) or os.path.isfile(path):
                 os.unlink(path); deleted.append(path)
             elif os.path.isdir(path) and not os.listdir(path):
