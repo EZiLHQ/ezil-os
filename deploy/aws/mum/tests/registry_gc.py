@@ -230,9 +230,9 @@ class RegistryGcTests(unittest.TestCase):
         self.refuse('identity absent')
 
     def test_invalid_registry(self):
-        # 8 + 20 = 28 records: one beyond the twenty-seven-record bound.
-        self.snapshot['deployment']['releases'] = self.records + [self.target, *[dict(self.target,amiId='ami-'+c*17) for c in 'bcdefa0123456789'], dict(self.target,amiId='ami-'+'9'*16+'a'), dict(self.target,amiId='ami-'+'9'*16+'b'), dict(self.target,amiId='ami-'+'9'*16+'c')]
-        self.assertEqual(len(self.snapshot['deployment']['releases']),28)
+        # 8 + 21 = 29 records: one beyond the twenty-eight-record bound.
+        self.snapshot['deployment']['releases'] = self.records + [self.target, *[dict(self.target,amiId='ami-'+c*17) for c in 'bcdefa0123456789'], dict(self.target,amiId='ami-'+'9'*16+'a'), dict(self.target,amiId='ami-'+'9'*16+'b'), dict(self.target,amiId='ami-'+'9'*16+'c'), dict(self.target,amiId='ami-'+'9'*16+'d')]
+        self.assertEqual(len(self.snapshot['deployment']['releases']),29)
         self.refuse('invalid registry')
 
     def test_twenty_four_record_gc_removes_exactly_one_preserving_twenty_three(self):
@@ -277,6 +277,18 @@ class RegistryGcTests(unittest.TestCase):
         before=copy.deepcopy(self.snapshot)
         after=self.prepare()
         self.assertEqual(len(after['releases']),26)
+        self.assertEqual(after['releases'],self.records[:1]+self.records[2:])
+        self.assertEqual(self.snapshot,before)
+
+    def test_twenty_eight_record_gc_removes_exactly_one_preserving_twenty_seven(self):
+        self.records.extend([copy.deepcopy(self.target),*[dict(self.target,amiId='ami-'+c*17)
+                             for c in 'bcdefa0123456789'],dict(self.target,amiId='ami-'+'9'*16+'a'),
+                             dict(self.target,amiId='ami-'+'9'*16+'b'),dict(self.target,amiId='ami-'+'9'*16+'c')])
+        self.assertEqual(len(self.records),28)
+        self.evidence['registrySha256']=gc.sha(self.records)
+        before=copy.deepcopy(self.snapshot)
+        after=self.prepare()
+        self.assertEqual(len(after['releases']),27)
         self.assertEqual(after['releases'],self.records[:1]+self.records[2:])
         self.assertEqual(self.snapshot,before)
 
