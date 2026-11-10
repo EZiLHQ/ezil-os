@@ -13,6 +13,8 @@ import type { Usage } from './types';
 
 export const DEFAULT_CONFIG_PATH = '/etc/ezil/models.json';
 export const CONFIG_ENV = 'EZIL_MODELS_CONFIG';
+/** How often a picker filled without a readable model list tries to read it again. */
+export const CATALOG_RECOVERY_MS = 20_000;
 
 export function resolveConfigPath(setting: string | undefined, env: NodeJS.ProcessEnv = process.env): string {
     const fromEnv = env[CONFIG_ENV]?.trim();
@@ -272,6 +274,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // VS Code 1.141 subscribes to model changes at registration and does not enumerate models
     // then; the change fired by the load above was missed, so announce the models once more.
     provider.refresh();
+    // A model list that could not be read when the picker was filled is read again until it reads (no request otherwise).
+    const recover = setInterval(() => { void provider.recoverCatalog(); }, CATALOG_RECOVERY_MS);
+    recover.unref?.();
+    context.subscriptions.push({ dispose: () => clearInterval(recover) });
     context.subscriptions.push(vscode.workspace.onDidChangeConfiguration(event => {
         if (event.affectsConfiguration('ezilModels.configPath')) store.setPath(resolveConfigPath(settings().get<string>('configPath')));
     }));

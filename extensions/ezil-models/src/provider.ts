@@ -255,6 +255,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     private lastWindowNoticeAt = -Infinity;
     /** Per configured Gateway provider: the catalog the picker was last given. */
     private listedCatalogs = new Map<ResolvedProvider, string>();
+    /** The Gateway providers whose catalog could not be read for the last listing (`recoverCatalog`). */
+    private unreadListings = new Set<ResolvedProvider>();
     /** Keep only identity metadata for stale picker selections, including when the config cannot be read. */
     private modelIdentities = new Map<string, { type: ResolvedProvider['type']; model: string }>();
     /**
@@ -348,6 +350,22 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         }
     }
 
+    /**
+     * After a listing whose catalog could not be read (the picker then shows only the configured models, and a limited
+     * plan no locks unless known), read it once more and re-list if it now reads. Nothing is requested otherwise; reads
+     * are shared with every other caller (`gatewayModels`). Called periodically by the extension.
+     */
+    async recoverCatalog(): Promise<void> {
+        // Only connections still configured: a changed URL or credential is never polled with the old one.
+        const current = new Set(this.gatewayProviders().map(provider => JSON.stringify([provider.baseUrl, provider.apiKey ?? ''])));
+        for (const provider of this.unreadListings) if (!current.has(JSON.stringify([provider.baseUrl, provider.apiKey ?? '']))) this.unreadListings.delete(provider);
+        const unread = [...this.unreadListings];
+        if (!unread.length) return;
+        const read = await Promise.all(unread.map(provider => gatewayModels(provider, this.host.fetch ?? fetch)));
+        unread.forEach((provider, i) => { if (read[i]) this.unreadListings.delete(provider); });
+        this.refreshIfCatalogChanged();
+    }
+
     private gatewayProviders(): ResolvedProvider[] {
         return [...new Set(this.configuredModels().filter(model => model.provider.type === 'ezil-gateway').map(model => model.provider))];
     }
@@ -368,6 +386,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             const listed = providers.flatMap(provider => gatewayCatalogModels(provider, used.get(provider), models));
             // What the catalog-only rows came from: during an outage, the last catalog, so requests do not re-list each time.
             this.listedCatalogs = new Map(providers.map(provider => [provider, catalogSignature(used.get(provider))]));
+            this.unreadListings = new Set(providers.filter(provider => !catalog.get(provider)));
             // The Gateway's suggested default counts only from this read: during an outage the configured default stays.
             // The OS plan's locks (Free: Gemini 3.8 Flash only) follow the same catalog as the rows they lock.
             const offered = [...models.filter(model => gatewayModelAvailable(model, catalog.get(model.provider))), ...listed]
@@ -393,8 +412,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         if (named.length === 1) {
             const provider = named[0]!;
             signal?.throwIfAborted();
-            const read = () => gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), signal);
-            catalog = known ? knownGatewayModels(provider) ?? await read() : await read();
+            // A token count (`known`) never makes a request: Copilot counts every prompt part, often at once.
+            catalog = known ? knownGatewayPlan(provider) : await gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), signal);
             const listed = gatewayCatalogModels(provider, catalog, models).find(candidate => candidate.id === model.id);
             if (listed) return listed;
         }
@@ -650,7 +669,16 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     }
 
     async provideTokenCount(_model: vscode.LanguageModelChatInformation, value: string | vscode.LanguageModelChatRequestMessage, _token: vscode.CancellationToken): Promise<number> {
-        const resolved = await this.resolve(_model, undefined, true);
+        let resolved: ResolvedModel;
+        try {
+            resolved = await this.resolve(_model, undefined, true);
+        } catch (error) {
+            // A catalog-only model the known catalog cannot place (none known, or a limited plan's list without it):
+            // count as the larger of the Gateway's protocols. The send reads the catalog itself and decides.
+            if (!(error instanceof GatewayError) || !['catalog_unavailable', 'model_unavailable'].includes(error.code ?? '')) throw error;
+            const message = typeof value === 'string' ? value : toNeutralMessage(value);
+            return Math.max(gatewayTokenCount(message, 'anthropic-messages'), gatewayTokenCount(message, 'openai-responses'));
+        }
         if (resolved.provider.type === 'ezil-gateway') return gatewayTokenCount(typeof value === 'string' ? value : toNeutralMessage(value), resolved.gatewayProtocol);
         if (typeof value === 'string') return estimateTextTokens(value);
         return estimateMessageTokens(toNeutralMessage(value));

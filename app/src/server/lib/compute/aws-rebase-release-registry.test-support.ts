@@ -152,11 +152,20 @@ export function fixtureReleaseRegistry25() {
         deployment131: { ...f.deployment130, amiId: release131.amiId } };
 }
 
-/** Synthetic twenty-sixth normal record at the count cap; not actual release proof. */
+/** Synthetic twenty-sixth normal record; not actual release proof. */
 export function fixtureReleaseRegistry26() {
     const f = fixtureReleaseRegistry25();
     const release132 = { ...f.release131, amiId: 'ami-00000000000000026', recipeVersion: '1.0.32',
         createdAt: '2026-11-07T20:00:00.000Z' };
     return { ...f, release132, retained: [...f.retained, release132],
         deployment132: { ...f.deployment131, amiId: release132.amiId } };
+}
+
+/** Synthetic twenty-seventh normal record at the count cap; not actual release proof. */
+export function fixtureReleaseRegistry27() {
+    const f = fixtureReleaseRegistry26();
+    const release133 = { ...f.release132, amiId: 'ami-00000000000000027', recipeVersion: '1.0.33',
+        createdAt: '2026-11-08T20:00:00.000Z' };
+    return { ...f, release133, retained: [...f.retained, release133],
+        deployment133: { ...f.deployment132, amiId: release133.amiId } };
 }
