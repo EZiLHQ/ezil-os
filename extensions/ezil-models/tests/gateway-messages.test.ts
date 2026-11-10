@@ -23,7 +23,7 @@ describe('gateway sanitizer', () => {
     });
     test('Gemini aliases that refuse sampling never get temperature/top_p; other models keep them', () => {
         const options = { ...ask(), modelOptions: { temperature: 0.2, top_p: 0.9 } };
-        for (const alias of ['gemini-3.8-flash', ' Gemini-3.8-Flash ', 'gemini-4-argon']) {
+        for (const alias of ['gemini-3.8-flash', ' Gemini-3.8-Flash ', 'gemini-4-argon', 'gemini-4-carbon', ' Gemini-4-Carbon ']) {
             const lines: string[] = [];
             const body = buildGatewayBody({ ...gw(), model: alias, temperature: 0.5, topP: 0.5 }, options, line => lines.push(line)).body;
             expect(body.temperature).toBeUndefined(); expect(body.top_p).toBeUndefined();
@@ -169,6 +169,30 @@ const copilotTools = (): Tool[] => JSON.parse(readFileSync(new URL('./fixtures/c
 const geminiBody = (tools: Tool[], log?: (line: string) => void) => buildGatewayBody({ ...gw(), model: 'gemini-3.8-flash' }, { ...ask(), tools }, log).body;
 
 describe('Gemini tool schemas', () => {
+    test('Carbon Agent keeps Copilot tools and tool-result links while projecting schemas and omitting refused sampling/cache fields', () => {
+        const tools = copilotTools();
+        const before = structuredClone(tools);
+        const input = { filePath: '/workspace/fixture.ts', startLine: 1, endLine: 2 };
+        const request = { ...ask([
+            msg('user', txt('Read the fixture.')),
+            msg('assistant', call('carbon_read', 'read_file', input)),
+            msg('user', result('carbon_read', [txt('fixture output')])),
+        ]), tools, modelOptions: { temperature: 0.2, top_p: 0.9 } };
+        const model = { ...gw(), model: 'gemini-4-carbon', temperature: 0.5, topP: 0.5, gatewayPromptCache: true as const };
+        const { bytes } = buildGatewayBody(model, request);
+        const wire: ReturnType<typeof buildGatewayBody>['body'] = JSON.parse(Buffer.from(bytes).toString('utf8'));
+        expect(Object.hasOwn(wire, 'temperature')).toBe(false);
+        expect(Object.hasOwn(wire, 'top_p')).toBe(false);
+        expect(JSON.stringify(wire)).not.toContain('"cache_control":');
+        expect(wire.tools!.map(t => t.name)).toEqual(tools.map(t => t.name));
+        for (const t of wire.tools!) for (const key of keywords(t.input_schema)) expect(GATEWAY_GEMINI_KEYWORDS.has(key)).toBe(true);
+        expect(wire.tool_choice).toEqual({ type: 'auto' });
+        expect(wire.messages[1]!.content).toEqual([{ type: 'tool_use', id: 'carbon_read', name: 'read_file', input }]);
+        expect(wire.messages[2]!.content).toEqual([{ type: 'tool_result', tool_use_id: 'carbon_read', content: [{ type: 'text', text: 'fixture output' }] }]);
+        expect(tools).toEqual(before);
+        const argon = buildGatewayBody({ ...model, model: 'gemini-4-argon' }, request).body;
+        expect({ ...wire, model: 'gemini-4-argon' }).toEqual(argon);
+    });
     test('the depth bound is the Gateway\'s, boolean leaves included', () => {
         const nest = (levels: number, leaf: unknown) => { let node: unknown = leaf; for (let i = 0; i < levels; i++) node = { type: 'array', items: node }; return node; };
         // The root is depth 0 and `properties.a` depth 1, so a leaf under 63 more arrays sits at depth 64.
@@ -210,7 +234,7 @@ describe('Gemini tool schemas', () => {
             const body = buildGatewayBody({ ...gw(), model }, { ...ask(), tools }, () => { throw new Error('no log'); }).body;
             expect(body.tools!.map(t => t.input_schema)).toEqual(tools.map(t => t.inputSchema as Record<string, unknown>));
         }
-        expect(['gemini-3.8-flash', ' Gemini-3.1-Pro-Preview ', 'gemini-4-argon'].every(geminiRoute)).toBe(true);
+        expect(['gemini-3.8-flash', ' Gemini-3.1-Pro-Preview ', 'gemini-4-argon', 'gemini-4-carbon', ' Gemini-4-Carbon '].every(geminiRoute)).toBe(true);
     });
     test('const becomes a one-value enum; beside an enum it is restated instead', () => {
         expect(geminiToolSchema({ type: 'object', properties: { mode: { type: 'string', const: 'read' } } }))

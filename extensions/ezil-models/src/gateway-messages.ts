@@ -31,10 +31,10 @@ export const QWEN = 'qwen.qwen3-coder-next';
 export const KIMI = 'us.moonshotai.kimi-k3';
 /**
  * Gateway aliases that refuse `temperature`/`top_p` (EZiL AI Gateway src/providers/gemini-request.ts): Google ignores
- * sampling on gemini-3.8-flash, and gemini-4-argon's handling is unverified, so the Gateway refuses the request rather
- * than drop or forward them. They are never sent for these aliases, whatever Copilot or the config pass.
+ * sampling on gemini-3.8-flash and gemini-4-carbon, and gemini-4-argon's handling is unverified, so the Gateway refuses
+ * the request rather than drop or forward them. They are never sent for these aliases, whatever Copilot or the config pass.
  */
-export const SAMPLING_REFUSED: ReadonlySet<string> = new Set(['gemini-3.8-flash', 'gemini-4-argon']);
+export const SAMPLING_REFUSED: ReadonlySet<string> = new Set(['gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon']);
 export function samplingRefused(alias: string): boolean { return SAMPLING_REFUSED.has(alias.trim().toLowerCase()); }
 export const GATEWAY_INPUT_TOKENS = 131_072;
 export const INPUT_FRAMING = 1056;
@@ -110,7 +110,7 @@ export function gatewayTools(tools: readonly Tool[], log: (line: string) => void
  * tools carry three such keywords (maxLength, pattern, enumDescriptions; 0.69, Agent and Ask mode), so every Gemini turn
  * that offered tools was refused.
  */
-export const GEMINI_ALIASES: ReadonlySet<string> = new Set(['gemini-3.8-flash', 'gemini-3.1-pro-preview', 'gemini-4-argon']);
+export const GEMINI_ALIASES: ReadonlySet<string> = new Set(['gemini-3.8-flash', 'gemini-3.1-pro-preview', 'gemini-4-argon', 'gemini-4-carbon']);
 export function geminiRoute(alias: string): boolean { return GEMINI_ALIASES.has(alias.trim().toLowerCase()); }
 /** The Gateway's GEMINI_SCHEMA_KEYWORDS, exactly. */
 const GEMINI_SCHEMA_KEYWORDS: ReadonlySet<string> = new Set([
