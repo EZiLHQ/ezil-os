@@ -31,12 +31,12 @@ function replay(p: Placement): Replay | null {
 }
 export const isPoolReleaseRecovering = (p: Placement): boolean => p.state === 'RECOVERING' && !!replay(p)?.intent;
 
-function boundedTime(at: Date | null | undefined, start: Date | null | undefined, now: Date): at is Date {
+export function boundedTime(at: Date | null | undefined, start: Date | null | undefined, now: Date): at is Date {
     return !!at && !!start && Number.isFinite(at.getTime()) && Number.isFinite(start.getTime())
         && at >= start && at <= now;
 }
 
-function executionWork(e: Execution): LifecycleWork | null {
+export function executionWork(e: Execution): LifecycleWork | null {
     try {
         const envelope = JSON.parse(e.input ?? '');
         const work = buildLifecycleWork(JSON.parse(envelope.document));
@@ -54,19 +54,19 @@ function matches(p: Placement, work: LifecycleWork): boolean {
 export { replay as poolReleaseReplay, matches as matchesPoolReleaseRecovery };
 /** The failed source release's identity for this placement (its job/digest are not the placement's after the reservation),
  * under the same deployment authority (account, namespace, region, zone, data key) as the recovery's own deployment. */
-function sameIdentity(p: Placement, work: LifecycleWork, d: LifecycleDeployment): boolean {
+export function sameIdentity(p: Placement, work: LifecycleWork, d: LifecycleDeployment): boolean {
     const i = work.intent;
     return i.operation === 'release' && i.computerId === p.computerId && i.targetGeneration === p.generation && i.leaseEpoch === p.leaseEpoch
         && i.fenceToken === p.fenceToken && i.providerInstanceId === p.instanceId && i.dataVolumeId === p.volumeId && i.instanceType === p.instanceType
         && i.deployment.region === p.region && i.deployment.zoneId === p.zoneId && i.deployment.accountId === d.accountId
         && i.deployment.namespace === d.namespace && i.deployment.region === d.region && i.deployment.dataKeyArn === d.dataKeyArn;
 }
-function executionMatches(e: Execution, work: LifecycleWork): boolean {
+export function executionMatches(e: Execution, work: LifecycleWork): boolean {
     return !e.stateMachineAliasArn && e.redriveCount === 0
         && e.executionArn === lifecycleExecutionArn(work.intent.deployment, work.intent.jobId)
         && e.stateMachineVersionArn === work.stateMachineArn;
 }
-function ownedTags(tags: Record<string, string> | undefined, p: Placement, d: LifecycleDeployment): boolean {
+export function ownedTags(tags: Record<string, string> | undefined, p: Placement, d: LifecycleDeployment): boolean {
     if (!tags || tags['ezil:managed-by'] !== 'app-computer-platform' || tags['ezil:stage'] !== d.namespace
         || tags['ezil:generation'] !== String(p.generation) || (tags['ezil:namespace'] !== undefined && tags['ezil:namespace'] !== d.namespace)) return false;
     return ((tags['ezil:computer-id'] === p.computerId && tags['ezil:fence-token'] === p.fenceToken)

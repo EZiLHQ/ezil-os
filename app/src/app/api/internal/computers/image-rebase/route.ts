@@ -10,6 +10,7 @@ import { readLifecycleDeployments } from '@/server/lib/compute/aws-intent';
 import { workerTunnelClientFromEnv } from '@/server/lib/compute/aws-enroll';
 import { ReconcileReplacementRequestSchema, reconcileReplacementWithHistoricalSource } from '@/server/lib/compute/aws-historical-source';
 import { ReconcileReleaseRequestSchema, reconcileFailedRelease } from '@/server/lib/compute/aws-pool-release-recovery';
+import { ParkFailedReleaseRequestSchema, reserveParkedStop } from '@/server/lib/compute/aws-failed-release-park';
 import { createPoolDeps } from '@/server/lib/compute/aws-pool-runtime';
 import type { PlacementDb } from '@/server/lib/compute/placement';
 
@@ -25,6 +26,7 @@ export async function POST(req: Request): Promise<Response> {
     catch { return Response.json({ authorized: false }, { status: 403, headers }); }
     if ((raw as { operation?: unknown } | null)?.operation === 'reconcile-replacement') return reconcileReplacement(raw);
     if ((raw as { operation?: unknown } | null)?.operation === 'reconcile-release') return reconcileRelease(raw);
+    if ((raw as { operation?: unknown } | null)?.operation === 'park-failed-release') return parkFailedRelease(raw);
     let input;
     try { input = ImageRebaseRequestSchema.parse(raw); }
     catch { return Response.json({ authorized: false }, { status: 403, headers }); }
@@ -79,6 +81,30 @@ async function reconcileRelease(raw: unknown): Promise<Response> {
         return Response.json({ schemaVersion: 1, computerId: input.computerId, jobId: input.expectedJobId, outcome, error }, { status: 200, headers });
     } catch (error) {
         return Response.json({ error: error instanceof ImageJobConflictError ? 'image_job_conflict' : 'reconcile_unavailable' },
+            { status: error instanceof ImageJobConflictError ? 409 : 503, headers });
+    }
+}
+
+/** Park a failed pool release whose host is already gracefully stopped: reserve ONE ordinary STOP job (explicit stop intent, saved in
+ * the row) under the normal reservation CAS. Never release, detach or terminate; every precondition is re-proven server side. */
+async function parkFailedRelease(raw: unknown): Promise<Response> {
+    let input;
+    try { input = ParkFailedReleaseRequestSchema.parse(raw); }
+    catch { return Response.json({ authorized: false }, { status: 403, headers }); }
+    try {
+        const regions = (process.env.AWS_REGIONS ?? '').split(',').map(r => r.trim()).filter(Boolean);
+        const configs = readLifecycleDeployments(process.env, regions);
+        const { starter, executions, describer } = sharedAwsSdkCollaborators(), tunnels = workerTunnelClientFromEnv(process.env);
+        if (!configs.ok || !starter || !executions?.history || !describer?.describeVolume || !describer.describeSnapshot || !tunnels)
+            return Response.json({ error: 'park_unavailable' }, { status: 503, headers });
+        const placementDb = db as unknown as PlacementDb;
+        const { outcome, error, parkJobId, parkDigest } = await reserveParkedStop({ db: placementDb, starter, executions, describer, tunnels,
+            meter: billingComputeMeter(), pool: createPoolDeps(placementDb, process.env) }, configs.deployments, input);
+        // The failed release's job (`sourceJobId`) is never the stop's: the saved STOP's own id and digest are separate fields.
+        return Response.json({ schemaVersion: 1, computerId: input.computerId, sourceJobId: input.expectedJobId, parkJobId, parkDigest, outcome, error },
+            { status: 200, headers });
+    } catch (error) {
+        return Response.json({ error: error instanceof ImageJobConflictError ? 'image_job_conflict' : 'park_unavailable' },
             { status: error instanceof ImageJobConflictError ? 409 : 503, headers });
     }
 }

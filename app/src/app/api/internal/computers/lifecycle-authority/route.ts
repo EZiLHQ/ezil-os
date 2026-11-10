@@ -2,6 +2,7 @@ import { poolJobAuthority } from '@/server/lib/compute/aws-pool-dispatch';
 import { authorizeAdoptRecovery } from '@/server/lib/compute/aws-pool-recovery';
 import { authorizeStalledAdoptRelease } from '@/server/lib/compute/aws-pool-adopt-stall';
 import { buildLifecycleWork } from '@/server/lib/compute/aws-intent';
+import { authorizeParkedStop, isParkedStopRecovering } from '@/server/lib/compute/aws-failed-release-park';
 import { isPoolReleaseRecovering, poolReleaseReplay, matchesPoolReleaseRecovery } from '@/server/lib/compute/aws-pool-release-recovery';
 import { isPoolMode } from '@/server/lib/compute/aws-receipts';
 import { createImageJobStore } from '@/server/lib/compute/aws-rebase-store';
@@ -78,6 +79,11 @@ export async function POST(req: Request): Promise<Response> {
             // A stalled pool adoption's release: the automatic recovery's only job.
             if (await authorizeStalledAdoptRelease(db, record))
                 return Response.json({ authorized: true, ...authority }, { status: 200, headers: NO_STORE });
+            // A parked failed release: only its saved, strictly validated ordinary STOP (own prefix and handler); never any other row.
+            if (isParkedStopRecovering(record)) {
+                if (!await authorizeParkedStop(db, record)) return refuse();
+                return Response.json({ authorized: true, ...authority }, { status: 200, headers: NO_STORE });
+            }
             // Only the durable live-release replay can authorize RECOVERING.
             // Deleted-computer and image recovery have separate authority.
             if (!isPoolReleaseRecovering(record)) return refuse();
