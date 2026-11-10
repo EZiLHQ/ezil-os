@@ -69,7 +69,12 @@
 // cannot disturb the "telemetry.js must be the FIRST import" ordering
 // `boot.js` depends on — see `trace.js`'s own header for the full account of
 // why the dependency runs this direction and not the other.
+//
+// `./ui/feedback/failure-shapes.js` is safe for the same reason: pure
+// validators with no imports and no top-level side effects. It shape-checks
+// the server reason and request id `capture()` keeps on the local mirror.
 import { newEventId, ambientCorrelationId } from './trace.js';
+import { isCorrelationId, isFailureReason } from './ui/feedback/failure-shapes.js';
 
 function bootPayload () {
     const raw = typeof window === 'undefined' ? null : window.__EZIL_BOOT__;
@@ -429,7 +434,8 @@ function pushRecent (entry) {
  *
  * Every field here is ALREADY the sanitized closed-vocabulary wire form:
  * `site` and `code` are hand-written low-cardinality literals and `detail`
- * has been through `redact()`. There is nothing in here that is not already
+ * has been through `redact()`. The optional `reason`/`serverCorrelationId`
+ * are shape-checked server codes and ids that this module never sends. There is nothing in here that is not already
  * permitted to cross the wire, which is what makes it safe for
  * Settings → Troubleshoot to show and for a user to copy.
  */
@@ -530,6 +536,11 @@ function flush () {
  * @param {Record<string, string|number|boolean>} [input.attrs] Bounded extras;
  *   the ingest route strips anything not on its per-class allow-list, so this
  *   file does not need its own copy of that list.
+ * @param {string} [input.reason] The server's bounded refusal code
+ *   (`session.js` `serverFailureOf`). LOCAL MIRROR ONLY: never sent by this module.
+ * @param {string} [input.serverCorrelationId] The server's own request id for the
+ *   failed call. LOCAL MIRROR ONLY, as `reason`: only a feedback report the user
+ *   consents to carries either (`ui/feedback/diagnostics.js`).
  */
 export function capture (input) {
     if ( reentering ) return;
@@ -551,7 +562,9 @@ export function capture (input) {
         // precisely the deployment where a user asking "what went wrong" has
         // no other source. It never leaves the browser on its own; only the
         // user's own copy action moves it anywhere.
-        pushRecent({ t: Date.now(), eventClass, site, code, outcome, detail });
+        pushRecent({ t: Date.now(), eventClass, site, code, outcome, detail,
+            ...(isFailureReason(input.reason) ? { reason: input.reason } : {}),
+            ...(isCorrelationId(input.serverCorrelationId) ? { serverCorrelationId: input.serverCorrelationId } : {}) });
 
         if ( ! isArmed() ) return;
 

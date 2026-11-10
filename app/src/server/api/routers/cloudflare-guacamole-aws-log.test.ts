@@ -63,16 +63,20 @@ afterEach(() => { vi.unstubAllEnvs(); vi.unstubAllGlobals(); vi.restoreAllMocks(
 
 describe.each(surfaces)('%s (%s): one aws-preview line per non-ok answer', (surface, procedure) => {
     it('the Worker answered 503 aws_desktop_starting (the live Code stall): its code and status', async () => {
-        expect(await ask(procedure)).toMatchObject({ ok: false, errorCode: 'sandbox_starting', computeProvider: 'aws-ec2' });
+        const answer = await ask(procedure) as { correlationId?: string; refusalReason?: string };
+        expect(answer).toMatchObject({ ok: false, errorCode: 'sandbox_starting', computeProvider: 'aws-ec2' });
         expect(lines()).toEqual([{ event: 'aws-preview', surface, computer: '22222222', status: 503, error: 'sandbox_starting',
-            reason: 'aws_desktop_starting', ms: expect.any(Number) }]);
+            reason: 'aws_desktop_starting', ms: expect.any(Number), correlationId: expect.any(String) }]);
+        // App-error coverage: the answer carries the SAME id as this line, and the line's bounded reason.
+        expect(answer.correlationId).toBe(lines()[0]!.correlationId);
+        expect(answer.refusalReason).toBe('aws_desktop_starting');
     });
     it('an ensure refusal that never reached the preview: the ensure code', async () => {
         mocks.ensure.mockResolvedValue({ ok: false, error: 'computer_stopping', errorCode: 'computer_stopping', retryable: true });
         expect(await ask(procedure)).toMatchObject({ ok: false, errorCode: 'sandbox_starting' });
         expect(mocks.preview).not.toHaveBeenCalled();
         expect(lines()).toEqual([{ event: 'aws-preview', surface, computer: '22222222', status: null, error: 'sandbox_starting',
-            reason: 'computer_stopping', ms: expect.any(Number) }]);
+            reason: 'computer_stopping', ms: expect.any(Number), correlationId: expect.any(String) }]);
     });
     it('a billing refusal on an AWS computer; none for a Cloudflare one', async () => {
         mocks.gate.mockResolvedValue({ allowed: false, reason: 'fair_use_paused' });
@@ -81,6 +85,20 @@ describe.each(surfaces)('%s (%s): one aws-preview line per non-ok answer', (surf
         mocks.route.mockResolvedValue({ kind: 'cloudflare', provider: { ensure: mocks.ensure } });
         await ask(procedure);
         expect(lines()).toHaveLength(1);
+    });
+    it('app-error coverage: an id on every non-ok AWS answer; a reason only when it is a bounded code; none for Cloudflare', async () => {
+        // A code-shaped but opaque value (a hex run) passes the log's charset; it is still never offered as a reason.
+        mocks.ensure.mockResolvedValue({ ok: false, error: 'deadbeefcafe0123', errorCode: 'deadbeefcafe0123', retryable: false });
+        const opaque = await ask(procedure) as Record<string, unknown>;
+        expect(opaque.correlationId).toBe(lines()[0]!.correlationId);
+        expect(opaque).not.toHaveProperty('refusalReason');
+        mocks.ensure.mockResolvedValue({ ok: false, error: 'user_has_aws_computer', errorCode: 'user_has_aws_computer', retryable: false });
+        expect(await ask(procedure)).toMatchObject({ refusalReason: 'user_has_aws_computer', correlationId: lines()[1]!.correlationId });
+        expect(lines()[0]!.correlationId).not.toBe(lines()[1]!.correlationId);
+        mocks.route.mockResolvedValue({ kind: 'cloudflare', provider: { ensure: mocks.ensure } });
+        const cloudflare = await ask(procedure).catch(() => ({})) as Record<string, unknown>;
+        expect(cloudflare).not.toHaveProperty('refusalReason');
+        expect(cloudflare).not.toHaveProperty('correlationId');
     });
     it('an ok answer writes nothing', async () => {
         vi.mocked(fetch).mockResolvedValue(Response.json({ ok: false, error: 'other' }, { status: 200 }));
@@ -128,7 +146,7 @@ describe.each(surfaces)('%s (%s): round 6 seams', (surface, procedure) => {
         vi.mocked(fetch).mockResolvedValue(Response.json({ ok: false, error: 'aws_desktop_starting', reason: 'config_pending' }, { status: 503 }));
         expect(await ask(procedure)).toMatchObject({ ok: false, errorCode: 'sandbox_starting', computePreparing: true, computeProvider: 'aws-ec2' });
         expect(lines()).toEqual([{ event: 'aws-preview', surface, computer: '22222222', status: 503, error: 'sandbox_starting',
-            reason: 'aws_desktop_starting', detail: 'config_pending', ms: expect.any(Number) }]);
+            reason: 'aws_desktop_starting', detail: 'config_pending', ms: expect.any(Number), correlationId: expect.any(String) }]);
     });
     it.each([['aws_desktop_config_unapplied', 'desktop_config_unapplied'], ['aws_desktop_failed', 'desktop_failed']])(
         'the Worker\'s terminal %s reaches the shell as %s', async (error, errorCode) => {
@@ -137,6 +155,6 @@ describe.each(surfaces)('%s (%s): round 6 seams', (surface, procedure) => {
             expect(out).toMatchObject({ ok: false, error, errorCode, computeProvider: 'aws-ec2' });
             expect(out).not.toHaveProperty('computePreparing');
             expect(lines()).toEqual([{ event: 'aws-preview', surface, computer: '22222222', status: 502, error: errorCode,
-                reason: error, ms: expect.any(Number) }]);
+                reason: error, ms: expect.any(Number), correlationId: expect.any(String) }]);
         });
 });

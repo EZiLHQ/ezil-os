@@ -2036,3 +2036,40 @@ export async function readPoolMigrationReservations(tx: PlacementExecutor): Prom
             AND p.provider = 'aws-ec2' AND p.state NOT IN ('STOPPED', 'RETIRED', 'PURGE_ELIGIBLE'))`));
     return Number(result[0]?.count);
 }
+
+// ── Feedback diagnostics (read-only) ──────────────────────────────────────
+
+// An unreleased Cloudflare-to-AWS reservation, exactly as admission's CAPACITY_PLACEMENTS (above) counts one:
+// provisioning recorded, not committed, not released, no AWS placement yet. Only the boolean
+// leaves SQL.
+const feedbackUnreleased = (m: SQL) => sql`(${m}.workspace_head ? '_awsProvision' AND ${m}.state <> 'committed'
+    AND COALESCE(${m}.workspace_head #>> '{_awsProvision,released}', 'false') <> 'true'
+    AND NOT EXISTS (SELECT 1 FROM ezil_computer_placements ap WHERE ap.computer_id = ${m}.computer_id AND ap.provider = 'aws-ec2'))`;
+
+/**
+ * App-error coverage (`feedback/server-context.ts`): ONE read-only statement describing the reporter's own compute
+ * state, run in that module's savepoint under its statement deadline. It lives here because only this module may
+ * name the placement tables (C-2). Every subquery filters on the reporter as owner, never on usage, and only
+ * enums, booleans and counts leave SQL. Table names are unqualified, like the feedback tables, so they resolve
+ * through the connection's search_path (`public` in the app; a per-run schema in the disposable-PG tests).
+ * `reverseTable` false (production has no 0012) selects NULL instead of naming the absent table.
+ */
+export function feedbackComputeContextQuery(userId: string, computerId: string, reverseTable: boolean) {
+    return sql`/* feedback:server-context */ SELECT
+        (SELECT jsonb_build_object('provider', p.provider, 'state', p.state) FROM ezil_computer_placements p
+            WHERE p.computer_id = ${computerId}::uuid AND p.owner_user_id = ${userId}::uuid LIMIT 1) AS placement,
+        (SELECT jsonb_build_object('state', m.state, 'unreleased', ${feedbackUnreleased(sql`m`)}) FROM ezil_compute_migrations m
+            WHERE m.computer_id = ${computerId}::uuid AND m.user_id = ${userId}::uuid
+            ORDER BY m.created_at DESC, m.id DESC LIMIT 1) AS migration,
+        ${reverseTable ? sql`(SELECT jsonb_build_object('state', r.state) FROM ezil_compute_reverse_moves r
+            WHERE r.computer_id = ${computerId}::uuid AND r.user_id = ${userId}::uuid
+            ORDER BY r.created_at DESC, r.id DESC LIMIT 1)` : sql`NULL::jsonb`} AS reverse,
+        (SELECT count(DISTINCT p.computer_id) FROM ezil_computer_placements p
+            WHERE p.provider = 'aws-ec2' AND p.owner_user_id = ${userId}::uuid
+              AND p.computer_id <> ${computerId}::uuid AND p.state <> 'PURGE_ELIGIBLE') AS other_aws,
+        (SELECT count(*) FROM ezil_compute_migrations m
+            WHERE m.user_id = ${userId}::uuid AND m.computer_id <> ${computerId}::uuid AND ${feedbackUnreleased(sql`m`)}) AS other_reservations,
+        (SELECT count(*) FROM ezil_compute_capacity_demands d
+            WHERE d.owner_user_id = ${userId}::uuid AND d.computer_id <> ${computerId}::uuid
+              AND d.closed_at IS NULL AND d.expires_at > now()) AS other_demands`;
+}

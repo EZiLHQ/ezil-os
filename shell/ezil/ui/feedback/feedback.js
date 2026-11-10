@@ -454,6 +454,7 @@ export function open_feedback_dialog (_opts) {
                 <p id="ezil-feedback-warning" class="ezil-feedback-warning" role="status" hidden></p>
                 <label class="ezil-feedback-consent"><input type="checkbox" name="diagnostics" checked> Include diagnostics</label>
                 <p class="ezil-feedback-muted">A frozen snapshot of browser/OS, viewport, page age, network state and recent machine-coded events. No console text, URLs, cookies or form values. Nothing uploads until Send.</p>
+                <p class="ezil-feedback-muted" data-role="server-context-note">With diagnostics on, when you send, EZiL also adds a small summary of your own computer's state at that moment: where it runs and its state, any move or reserved capacity in progress, and how many of your other computers use AWS. Only categories and counts, never addresses, IDs or anyone else's data. It is added after you press Send, so it is not in the preview below.</p>
                 <button type="button" data-action="refresh-diagnostics">Refresh diagnostic snapshot</button>
                 ${screenshots ? `<label class="ezil-feedback-consent"><input type="checkbox" name="screenshot" checked> Include a screenshot</label>
                 <section class="ezil-feedback-capture" aria-label="Screenshot">
@@ -477,7 +478,8 @@ export function open_feedback_dialog (_opts) {
             </fieldset>
             <details class="ezil-feedback-preview"><summary>Preview exactly what will be sent</summary><pre></pre>
                 <p class="ezil-feedback-muted" data-role="app-failure-context" hidden></p>
-                <p class="ezil-feedback-muted">Your report includes its time, reference number and the version of EZiL OS. Technical details and screenshots are included only while they are selected.</p></details>
+                <p class="ezil-feedback-muted">Your report includes its time, reference number and the version of EZiL OS. Technical details and screenshots are included only while they are selected.</p>
+                <p class="ezil-feedback-muted" data-role="server-context-preview-note">This preview is what your browser sends. With diagnostics on, the server-added summary of your computer's state is attached when the report is stored, so it does not appear here.</p></details>
             <div class="ezil-feedback-footer">
                 <p class="ezil-feedback-result" role="status" aria-live="polite"></p>
                 <div class="ezil-feedback-actions">

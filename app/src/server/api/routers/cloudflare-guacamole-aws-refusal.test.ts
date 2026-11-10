@@ -40,7 +40,8 @@ afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe('AWS Code and desktop preview holds', () => {
     const starting = { ok: false, error: 'computer_starting', errorCode: 'computer_starting', retryable: true, computeLaunching: true };
-    const waitingAnswer = { ...starting, errorCode: 'sandbox_starting', provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2' };
+    const waitingAnswer = { ...starting, errorCode: 'sandbox_starting', provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2' ,
+        correlationId: expect.any(String), refusalReason: 'computer_starting' };
     function setup(signal?: AbortSignal) {
         vi.useFakeTimers();
         const userId = '11111111-1111-4111-8111-111111111111';
