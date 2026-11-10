@@ -13,6 +13,24 @@ const advertisement = (head: string | null, refs: string[] = ['refs/heads/main']
 
 describe('parseRepositoryUrl: one canonical public github.com repository, or a refusal', () => {
     it.each([
+        ['https://github.ezil.work/acme/site.git', 'site'],
+        ['https://github.ezil.work/acme/site', 'site'],
+    ])('accepts the exact EZiL Git route %s', (raw, name) => {
+        expect(parseRepositoryUrl(raw)).toEqual({ ok: true, host: 'github.ezil.work', owner: 'acme', name,
+            canonicalURL: 'https://github.ezil.work/acme/site.git', displayName: 'acme/site' });
+    });
+    it.each([
+        'https://GitHub.ezil.work/acme/site.git', 'https://github.ezil.work:443/acme/site.git',
+        'https://u@github.ezil.work/acme/site.git', 'https://github.ezil.work/acme/site.git?token=x',
+        'https://github.ezil.work/acme/site.git.git', 'https://github.ezil.work/acme/si..te.git',
+        'https://github.ezil.work/acme/Site.git', 'https://github.ezil.work/acme/site.git/',
+        'https://github.ezil.work/acme/./site.git', 'https://github.ezil.work/acme/ignored/../site.git',
+        'https://github.ezil.work/acme/%2e/site.git', 'https://github.ezil.work/acme/%2e%2e/site.git',
+        'https://github.ezil.work/acme/ignored/%2E%2E/site.git',
+    ])('refuses noncanonical EZiL Git address %s', raw => {
+        expect(parseRepositoryUrl(raw)).toEqual({ ok: false, reason: 'invalid' });
+    });
+    it.each([
         ['https://github.com/EZiLHQ/ezil-os.git', 'https://github.com/ezilhq/ezil-os.git', 'EZiLHQ/ezil-os'],
         ['https://github.com/EZiLHQ/ezil-os', 'https://github.com/ezilhq/ezil-os.git', 'EZiLHQ/ezil-os'],
         ['https://github.com/EZiLHQ/ezil-os/', 'https://github.com/ezilhq/ezil-os.git', 'EZiLHQ/ezil-os'],
@@ -33,10 +51,10 @@ describe('parseRepositoryUrl: one canonical public github.com repository, or a r
         expect(parseRepositoryUrl(raw)).toEqual({ ok: false, reason: 'invalid' });
     });
     it.each([
-        'https://github.ezil.work/acme/site.git', 'https://git.ezil.work/acme/site.git',
+        'https://git.ezil.work/acme/site.git',
         'https://git-staging.ezil.work/acme-qa/site.git', 'https://git-qa.ezil.work/acme-qa/site.git',
     ])(
-        'recognises EZiL Git %s and refuses it for now (needs a Works grant by address)', raw => {
+        'recognises a nonproduction EZiL Git host %s and refuses it', raw => {
             expect(parseRepositoryUrl(raw)).toEqual({ ok: false, reason: 'unsupported_host' });
         });
 });
@@ -48,7 +66,7 @@ describe('repositoryIdFor: the same folder on every reopen, never another reposi
         expect(repositoryIdFor('https://github.com/ezilhq/ezil-os.git')).toBe(id);
         const a = parseRepositoryUrl('https://github.com/EZiLHQ/ezil-os'), b = parseRepositoryUrl('https://github.com/ezilhq/EZIL-OS.git');
         expect(a.ok && b.ok && repositoryIdFor(a.canonicalURL) === repositoryIdFor(b.canonicalURL)).toBe(true);
-        expect(repositoryIdFor('https://github.com/ezilhq/ezil-works.git')).not.toBe(id);
+        expect(repositoryIdFor('https://github.com/ezilhq/other-repo.git')).not.toBe(id);
     });
 });
 
@@ -77,7 +95,7 @@ describe('resolvePublicGitHub: one anonymous ref advertisement read', () => {
             await expect(resolvePublicGitHub('https://github.com/a/b.git', { fetch: fetcher as unknown as typeof fetch })).resolves.toEqual({ ok: false, reason: 'unavailable' });
         }
     });
-    it('defaultRefOf refuses a ref git could read as an option or that Universe\'s ref rules refuse', () => {
+    it('defaultRefOf refuses a ref git could read as an option or that the Worker refuses', () => {
         for (const head of ['refs/heads/-x', 'refs/heads/a..b', 'refs/tags/v1', 'refs/heads/.hidden', 'refs/heads/a.lock']) {
             expect(defaultRefOf(advertisement(head))).toBeNull();
         }

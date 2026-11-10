@@ -5464,7 +5464,8 @@ async function handleRepoOpen(request: Request, env: Env, sandboxName: string): 
   let answer: RepoOpenAnswer;
   try {
     // The subject binds this computer's push access for the repository to the v2 claims' user (`./repo-grant.ts`).
-    answer = await openSandbox(env, sandboxName).repoOpen(parsed.request, root, await repoGrantSubject(v2.userId));
+    answer = await openSandbox(env, sandboxName).repoOpen(parsed.request, root,
+      parsed.request.privatePacket ? undefined : await repoGrantSubject(v2.userId));
   } catch {
     answer = { ok: false, error: 'repo_open_failed' };
   }
