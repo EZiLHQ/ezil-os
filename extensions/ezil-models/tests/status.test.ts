@@ -45,8 +45,9 @@ describe('EZiL AI Gateway status', () => {
         try {
             await h.status.show();
             expect(localResetTime(creditWindow.resets_at)).toBe(reset);
-            expect(h.item.text).toBe(`EZiL AI · 12.5 credits left · resets ${reset}`);
+            expect(h.item.text).toBe(`EZiL AI · 12.345678 credits · 2-hour window 12.5 of 20 left · resets ${reset}`);
             expect(h.item.tooltip).toContain('2-hour window: 12.5 credits left of 20');
+            expect(h.item.tooltip).toContain('The window limits how many credits you can use per period. It is not your balance.');
             expect(h.item.tooltip).toContain('Window used (held + settled): 7.5 credits');
             expect(h.item.tooltip).toContain(`Resets at ${reset} (local time)`);
             expect(h.item.tooltip).toContain('Available credits: 12.345678');
@@ -62,15 +63,27 @@ describe('EZiL AI Gateway status', () => {
     test('inactive windows show the allowance without inventing a reset time', async () => {
         const view = statusView(await readAIStatus(provider, server({ ...balance, window: { ...creditWindow,
             started_at: null, resets_at: null, used_micro: '0', remaining_micro: '20000000' } }).fetch));
-        expect(view.text).toBe('EZiL AI · 20 credits left');
+        expect(view.text).toBe('EZiL AI · 12.345678 credits · 2-hour window 20 of 20 left');
         expect(view.lines).toContain('Window starts with your next admitted request.');
         expect(view.lines.join()).not.toContain('Resets at');
     });
     test('zero remaining and non-default window length come from the gateway', async () => {
         const view = statusView(await readAIStatus(provider, server({ ...balance, window: { ...creditWindow,
             seconds: 5400, remaining_micro: '0', used_micro: creditWindow.budget_micro } }).fetch));
-        expect(view.text).toStartWith('EZiL AI · 0 credits left · resets ');
+        expect(view.text).toStartWith('EZiL AI · 12.345678 credits · 90-minute window used · resets ');
         expect(view.lines).toContain('90-minute window: 0 credits left of 20');
+    });
+    // Reported 2026-11-10: a new Free account's window (98.418718 of 100) read as its credits while Settings showed the wallet.
+    test('the headline is the wallet; the window is a separately named limit and never the balance', async () => {
+        const window = { ...creditWindow, budget_micro: '100000000', used_micro: '1581282', remaining_micro: '98418718' };
+        const empty = statusView(await readAIStatus(provider, server({ available_micro: 0, held_micro: 0, window }).fetch));
+        expect(empty.text).toStartWith('EZiL AI · 0 credits · 2-hour window 98.418718 of 100 left');
+        expect(empty.text).not.toMatch(/98\.418718 credits/);
+        expect(empty.lines).toContain('Available credits: 0');
+        const funded = statusView(await readAIStatus(provider, server({ available_micro: 98418718, held_micro: 0, window }).fetch));
+        expect(funded.text).toStartWith('EZiL AI · 98.418718 credits · 2-hour window 98.418718 of 100 left');
+        const held = statusView(await readAIStatus(provider, server({ available_micro: 0, held_micro: 500000, window }).fetch));
+        expect(held.text).toStartWith('EZiL AI · Credits held · 2-hour window 98.418718 of 100 left');
     });
     test('micro-credit strings use the same unit, grouping and six-place precision as balances', () => {
         for (const [micro, expected] of [[0, '0'], [1, '0.000001'], [10, '0.00001'], [1000000, '1'], [12500000, '12.5'],
@@ -97,7 +110,7 @@ describe('EZiL AI Gateway status', () => {
         }) as typeof fetch);
         try {
             await h.status.refresh();
-            expect(h.item.text).toContain('credits left');
+            expect(h.item.text).toContain('2-hour window 12.5 of 20 left');
             fail = true; await h.status.refresh();
             expect(h.item.text).toBe('EZiL AI · Credits unavailable · limits unavailable · availability unknown · usage unavailable');
             expect(h.item.tooltip).toContain('Credits unavailable. Could not load current information. Try again.');
@@ -115,10 +128,10 @@ describe('EZiL AI Gateway status', () => {
         const h = harness((async (url, init) => server({ ...balance, window: { ...creditWindow, remaining_micro } }).fetch(url, init)) as typeof fetch);
         try {
             await h.status.refresh();
-            expect(h.item.text).toContain('12.5 credits left');
+            expect(h.item.text).toContain('2-hour window 12.5 of 20 left');
             remaining_micro = '1000000'; tick();
             for (let i = 0; i < 20; i++) await Promise.resolve();
-            expect(h.item.text).toContain('1 credits left');
+            expect(h.item.text).toContain('2-hour window 1 of 20 left');
             h.status.dispose();
             expect(clear).toHaveBeenCalledWith(timer);
         } finally { interval.mockRestore(); clear.mockRestore(); }
@@ -326,7 +339,7 @@ describe('EZiL AI Gateway status', () => {
         for (const [micro, formatted] of [[1, '0.000001'], [999999, '0.999999'], [1000001, '1.000001']] as const) {
             const view = statusView(await readAIStatus(provider, server({ available_micro: micro, held_micro: micro,
                 window: { ...creditWindow, remaining_micro: String(micro) } }, { data: [{ ...row, cost_micro: micro + 1, uncollected_micro: 1 }] }).fetch));
-            expect(view.text).toStartWith(`EZiL AI · ${formatted} credits left`);
+            expect(view.text).toStartWith(`EZiL AI · ${formatted} credits · 2-hour window ${formatted} of 20 left`);
             expect(view.lines).toContain(`Available credits: ${formatted}`);
             expect(view.lines).toContain(`Held credits: ${formatted}`);
             expect(view.lines.join('\n')).toContain(`settled · ${formatted} credits`);
@@ -335,7 +348,7 @@ describe('EZiL AI Gateway status', () => {
         const view = statusView(await readAIStatus(provider, server({ ...balance, window: {
             ...creditWindow, budget_micro: large, remaining_micro: large, used_micro: '0',
         } }).fetch));
-        expect(view.text).toStartWith('EZiL AI · 9,007,199,254,740,993.123456 credits left');
+        expect(view.text).toStartWith('EZiL AI · 12.345678 credits · 2-hour window 9,007,199,254,740,993.123456 of 9,007,199,254,740,993.123456 left');
     });
 
     test('global operations and reconciliation pauses override positive credits and preserve their details', async () => {
@@ -437,8 +450,7 @@ describe('EZiL AI Gateway status', () => {
         expect(held.text).toBe('EZiL AI · Credits held');
         expect(held.lines).toContain('Held credits: 0.000001');
         const used = statusView(await readAIStatus(provider, server({ ...balance, window: { ...creditWindow, remaining_micro: '0' } }).fetch));
-        expect(used.text).toContain('0 credits left');
-        expect(used.text).toContain('window used');
+        expect(used.text).toStartWith('EZiL AI · 12.345678 credits · 2-hour window used');
         expect(used.lines).toContain('This window’s AI credits are used up.');
         for (const [key, counter, label] of [['daily_budget_micro', 'day_micro', 'Daily'], ['monthly_budget_micro', 'month_micro', 'Monthly']] as const) {
             const effective = { ...limits, policy: { policy: { [key]: 1000001 }, sources: { [key]: 'user' } },
