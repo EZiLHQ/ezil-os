@@ -1688,6 +1688,10 @@ body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;backgro
 @media (max-width:600px){
 .ezil-feedback-image img{max-height:120px}
 }
+.ezil-feedback-details{margin:4px 0 8px}
+.ezil-feedback-details>summary{cursor:pointer;color:var(--fb-muted)}
+[data-role=capture-scope]{margin:6px 0}
+[data-role=capture-scope] .ezil-feedback-link{display:inline;padding:0;min-height:0;border:0;background:0 0;color:var(--fb-accent);text-decoration:underline;font:inherit;cursor:pointer}
 .ezil-feedback-capture-options{margin:8px 0}
 .ezil-feedback-capture-options>summary{cursor:pointer}
 .ezil-redact-editor{box-sizing:border-box;width:min(1100px,calc(100vw - 24px));max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);margin:auto;padding:20px;overflow:auto;border:1px solid #5f6879;border-radius:12px;background:#17202e;color:#f5f7fb;font:14px/1.45 system-ui,sans-serif;color-scheme:dark}

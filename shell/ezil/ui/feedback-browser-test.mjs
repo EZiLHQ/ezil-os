@@ -375,6 +375,11 @@ try {
             assert.equal(await page.locator('input[name="screenshot"]').isChecked(), true);
             assert.equal(await page.locator('[data-role="capture-note"]').textContent(), '', 'no failure note: the capture worked');
             if ( coarse ) assert.equal(await page.evaluate(() => !! document.activeElement?.matches('input, textarea, select, [contenteditable]')), false, 'no text field has focus: no on-screen keyboard over Send');
+            // Honest scope next to the thumbnail: the shell window only, never the embedded app; long text stays collapsed.
+            assert.equal(await page.locator('[data-role="capture-scope"]').isVisible(), true);
+            assert.match(await page.locator('[data-role="capture-scope-text"]').textContent(), /Embedded app not captured.*EZiL OS window only/);
+            assert.equal(await page.locator('.ezil-feedback-details').evaluate(el => el.open), false, 'diagnostics details start collapsed');
+            assert.equal(await page.locator('[data-role="server-context-note"]').isVisible(), true, 'the short server-context notice stays visible');
             // Primary action: fully inside the viewport and hit-testable without any scrolling.
             const send = page.locator('button[type="submit"]');
             const place = await send.evaluate(el => {

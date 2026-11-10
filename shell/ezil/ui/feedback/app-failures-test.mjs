@@ -285,12 +285,18 @@ try {
         assert.deepEqual(payload().diagnostics.appFailures.map(f => f.eventId), [uuid(11), uuid(101)]);
         assert.equal(payload().diagnostics.appFailures[0].outcome, 'cancelled');
         assert.match(line().textContent, /2 app events \(1 cancelled\)/);
+        // The one-line summary names only what the record says: the newest failure's operation, code and outcome.
+        const noticed = () => current().querySelector('[data-role="context-line"]');
+        assert.equal(noticed().hidden, false);
+        assert.match(noticed().textContent, /latest app failure: .+ \(cancelled\)/);
+        assert.doesNotMatch(noticed().textContent, /steps|expected|reproduc/i);
         const frozen = body(); a.send(failure(102));
         form().dispatchEvent(new window.Event('input', { bubbles: true })); assert.equal(body(), frozen);
         current().querySelector('[data-action="refresh-diagnostics"]').click();
         assert.equal(payload().diagnostics.appFailures[0].eventId, uuid(102));
         assert.equal(calls.length, count, 'prefill and consent never send');
-        change(false); assert.equal(payload().diagnostics, null); assert.equal(line().hidden, true); close();
+        change(false); assert.equal(payload().diagnostics, null); assert.equal(line().hidden, true);
+        assert.doesNotMatch(noticed().textContent, /latest app failure/, 'unchecked: the failure is not summarised or sent'); close();
     });
     await check('flag absent/false omits appFailures; unavailable context has an honest preview line', () => {
         for (const value of [undefined, false, 'true']) {

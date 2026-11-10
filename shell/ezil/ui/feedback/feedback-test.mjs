@@ -621,10 +621,15 @@ try {
     });
     await check('the reporter is told about the server-added context, and the client preview stays client-only', () => {
         open();
+        // A short notice is always visible; the full text sits in the collapsed diagnostics details.
         const consentNote = current().querySelector('[data-role="server-context-note"]').textContent;
         assert.match(consentNote, /With diagnostics on/);
-        assert.match(consentNote, /after you press Send, so it is not in the preview/);
-        assert.match(consentNote, /never addresses, IDs or anyone else's data/);
+        assert.match(consentNote, /not shown in the preview/);
+        assert.ok(consentNote.length < 200, 'the always-visible notice is succinct');
+        const detail = current().querySelector('.ezil-feedback-details [data-role="server-context-detail"]').textContent;
+        assert.match(detail, /after you press Send, so it is not in the preview/);
+        assert.match(detail, /never addresses, IDs or anyone else's data/);
+        assert.equal(current().querySelector('.ezil-feedback-details').open, false, 'details start collapsed');
         assert.match(current().querySelector('[data-role="server-context-preview-note"]').textContent, /does not appear here/);
         change('diagnostics', true);
         assert.doesNotMatch(JSON.stringify(payload()), /serverContext/);
@@ -646,6 +651,37 @@ try {
         assert.equal(JSON.parse(calls.at(-1).body).diagnostics, null, 'the sent report carries no diagnostics');
         await until(() => status().includes(reportId));
         close();
+    });
+    await check('compact and honest: capture scope caption, one context line from observed facts, details collapsed', async () => {
+        defaultCapture = true;
+        try {
+            setCurrentComputer({ id: computerId, name: 'Work PC' });
+            open();
+            const scope = () => current().querySelector('[data-role="capture-scope-text"]').textContent;
+            assert.match(scope(), /No screenshot attached\. Embedded apps are never captured automatically/);
+            await until(() => ! current().querySelector('.ezil-feedback-image').hidden);
+            assert.match(scope(), /Embedded app not captured/);
+            assert.match(scope(), /EZiL OS window only/);
+            assert.ok(current().querySelector('[data-role="capture-scope"] [data-capture="tab"]'), 'one optional "Capture what I see" next to the caption');
+            // Short text only in the open form; the long explanations are inside collapsed details.
+            for ( const p of current().querySelectorAll('.ezil-feedback-fields > p.ezil-feedback-muted') ) assert.ok(p.textContent.length < 220, `succinct: ${p.textContent.slice(0, 40)}`);
+            assert.equal(current().querySelector('.ezil-feedback-details').open, false);
+            // One line of observed facts only; never steps, expected or actual.
+            const line = () => current().querySelector('[data-role="context-line"]');
+            assert.equal(line().hidden, false);
+            assert.match(line().textContent, /^Noticed: .*computer “Work PC”/);
+            assert.doesNotMatch(line().textContent, /steps|expected|actual|reproduc/i);
+            change('diagnostics', false);
+            assert.doesNotMatch(line().textContent, /app /, 'diagnostics-derived facts go away with the checkbox');
+            change('diagnostics', true);
+            // A manual capture names its own source; removing leaves an honest empty state.
+            current().querySelector('[data-capture="tab"]').click();
+            await until(() => /browser surface you chose/.test(scope()));
+            assert.doesNotMatch(scope(), /EZiL OS window only/);
+            current().querySelector('[data-action="remove-screenshot"]').click();
+            assert.match(scope(), /No screenshot attached/);
+            close();
+        } finally { defaultCapture = false; setCurrentComputer({ id: computerId }); }
     });
     await check('expanded diagnostics are consented, frozen, refreshed and downgraded on a strict old server', async () => {
         window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle = true;

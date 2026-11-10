@@ -452,13 +452,18 @@ export function open_feedback_dialog (_opts) {
                     aria-describedby="ezil-feedback-counter ezil-feedback-warning"${touchPrimary ? '' : ' autofocus'}></textarea>
                 <p id="ezil-feedback-counter" class="ezil-feedback-muted" aria-live="polite"></p>
                 <p id="ezil-feedback-warning" class="ezil-feedback-warning" role="status" hidden></p>
+                <p class="ezil-feedback-muted" data-role="context-line" aria-live="polite" hidden></p>
                 <label class="ezil-feedback-consent"><input type="checkbox" name="diagnostics" checked> Include diagnostics</label>
-                <p class="ezil-feedback-muted">A frozen snapshot of browser/OS, viewport, page age, network state and recent machine-coded events. No console text, URLs, cookies or form values. Nothing uploads until Send.</p>
-                <p class="ezil-feedback-muted" data-role="server-context-note">With diagnostics on, when you send, EZiL also adds a small summary of your own computer's state at that moment: where it runs and its state, any move or reserved capacity in progress, and how many of your other computers use AWS. Only categories and counts, never addresses, IDs or anyone else's data. It is added after you press Send, so it is not in the preview below.</p>
-                <button type="button" data-action="refresh-diagnostics">Refresh diagnostic snapshot</button>
+                <p class="ezil-feedback-muted" data-role="server-context-note">With diagnostics on, EZiL adds a small summary of your computer's state (categories and counts only) when you send; it is not shown in the preview.</p>
+                <details class="ezil-feedback-details"><summary>What diagnostics include</summary>
+                    <p class="ezil-feedback-muted">A frozen snapshot of browser/OS, viewport, page age, network state and recent machine-coded events. No console text, URLs, cookies or form values. Nothing uploads until Send.</p>
+                    <p class="ezil-feedback-muted" data-role="server-context-detail">The server-added summary, when you send with diagnostics on, covers where your computer runs and its state, any move or reserved capacity in progress, and how many of your other computers use AWS. Only categories and counts, never addresses, IDs or anyone else's data. It is added after you press Send, so it is not in the preview below.</p>
+                    <button type="button" data-action="refresh-diagnostics">Refresh diagnostic snapshot</button>
+                </details>
                 ${screenshots ? `<label class="ezil-feedback-consent"><input type="checkbox" name="screenshot" checked> Include a screenshot</label>
                 <section class="ezil-feedback-capture" aria-label="Screenshot">
                     <p class="ezil-feedback-muted" data-role="capture-note" role="status" aria-live="polite"></p>
+                    <p class="ezil-feedback-muted" data-role="capture-scope"><span data-role="capture-scope-text"></span>${tab_capture_supported() ? ' <button type="button" class="ezil-feedback-link" data-capture="tab">Capture what I see</button>' : ''}</p>
                     <div class="ezil-feedback-image" hidden>
                         <img alt="Screenshot to include with this report">
                         <button type="button" data-capture="edit">Edit / crop / redact</button>
@@ -466,11 +471,10 @@ export function open_feedback_dialog (_opts) {
                     </div>
                     <details class="ezil-feedback-capture-options"><summary>Change screenshot</summary>
                         <label class="ezil-feedback-upload">Attach a screenshot <input type="file" name="screenshotFile" accept="image/png,image/jpeg,image/webp"></label>
-                        <p class="ezil-feedback-muted">PNG, JPEG or WebP (up to 8 MiB and 4096 pixels per side). The EZiL window option masks embedded apps. Tab capture asks you to choose a surface; crop and cover private areas before attaching.</p>
+                        <p class="ezil-feedback-muted">PNG, JPEG or WebP (up to 8 MiB and 4096 pixels per side). The EZiL window option masks embedded apps. "Capture what I see" asks you to choose a surface; crop and cover private areas before attaching.</p>
                         ${!tab_capture_supported() ? '<p class="ezil-feedback-muted">This browser cannot capture a tab. Attach a screenshot from your device to include embedded app content.</p>' : ''}
                         <div class="ezil-feedback-actions">
                             <button type="button" data-capture="shell">Capture EZiL OS window</button>
-                            ${tab_capture_supported() ? '<button type="button" data-capture="tab">Capture what I see</button>' : ''}
                             ${desktop_capture_supported() ? '<button type="button" data-capture="desktop">Capture the desktop</button>' : ''}
                         </div>
                     </details>
@@ -501,6 +505,8 @@ export function open_feedback_dialog (_opts) {
     const submit = dialog.querySelector('[type="submit"]');
     const cancel = dialog.querySelector('[data-action="cancel"]');
     let screenshot = null;
+    /** Where the attached image came from: 'window' (the masked EZiL OS window), 'tab', 'desktop', 'file' or 'queued'. */
+    let screenshotSource = null;
     let diagnosticSnapshot = null;
     let appContextUnavailable = false;
     let attemptedBody = null;
@@ -537,6 +543,7 @@ export function open_feedback_dialog (_opts) {
                 screenshotConsent.checked = !! queuedBody.screenshot;
                 if ( queuedBody.screenshot ) {
                     screenshot = queuedBody.screenshot;
+                    screenshotSource = 'queued';
                     const image = dialog.querySelector('.ezil-feedback-image');
                     image.querySelector('img').src = `data:${screenshot.contentType};base64,${screenshot.dataBase64}`;
                     image.hidden = false;
@@ -631,12 +638,43 @@ export function open_feedback_dialog (_opts) {
         const appEvents = diagnosticSnapshot?.appFailures || [];
         appStatus.textContent = appContextUnavailable ? 'App failure context is unavailable for this report.'
             : `${appEvents.length} app events (${appEvents.filter(event => event.outcome === 'cancelled').length} cancelled).`;
+        render_scope();
+        render_context();
         // A blank description is a valid report: only a running manual capture, the settle wait or an over-long text hold Send.
         submit.disabled = capturing || settling || text.length > DESCRIPTION_MAX;
     }
 
+    /** The honest scope of what is attached: the default is the masked EZiL OS window, never the embedded app. */
+    function render_scope () {
+        const text = dialog.querySelector('[data-role="capture-scope-text"]');
+        if ( ! text ) return;
+        text.textContent = ! screenshot ? 'No screenshot attached. Embedded apps are never captured automatically.'
+            : { window: 'Embedded app not captured. This screenshot shows the EZiL OS window only; embedded apps are masked.',
+                tab: 'Captured from the browser surface you chose.', desktop: 'Captured from the desktop frame.',
+                file: 'Attached from your device.', queued: 'The screenshot already queued with this report.' }[screenshotSource] ?? 'Screenshot attached.';
+    }
+
+    /** One line of facts the shell actually observed and will send: the computer and, with diagnostics on, the app and latest app failure. */
+    function render_context () {
+        const line = dialog.querySelector('[data-role="context-line"]');
+        const parts = [];
+        const known = currentComputer();
+        if ( computerId && known?.id === computerId && typeof known.name === 'string' && known.name.trim() ) parts.push(`computer “${known.name.trim().slice(0, 40)}”`);
+        if ( diagnostics.checked && diagnosticSnapshot ) {
+            if ( typeof diagnosticSnapshot.traceApp === 'string' && diagnosticSnapshot.traceApp ) parts.push(`app ${diagnosticSnapshot.traceApp}`);
+            const failure = diagnosticSnapshot.appFailures?.[0];
+            if ( failure ) {
+                const words = [failure.operation, failure.code].map(word => String(word).replace(/_/g, ' ')).join(' — ');
+                parts.push(`latest app failure: ${words}${failure.outcome ? ` (${failure.outcome})` : ''}`);
+            }
+        }
+        line.hidden = ! parts.length;
+        line.textContent = parts.length ? `Noticed: ${parts.join(' · ')}` : '';
+    }
+
     function clear_screenshot () {
         screenshot = null;
+        screenshotSource = null;
         const image = dialog.querySelector('.ezil-feedback-image');
         if ( image ) { image.hidden = true; image.querySelector('img').removeAttribute('src'); }
     }
@@ -654,7 +692,7 @@ export function open_feedback_dialog (_opts) {
         return restore;
     }
 
-    async function finish_capture (capture, generation, signal) {
+    async function finish_capture (capture, generation, signal, source = screenshotSource) {
         const current = () => ! closed && generation === captureGeneration && ! signal.aborted;
         try {
             const canvas = await capture;
@@ -677,6 +715,7 @@ export function open_feedback_dialog (_opts) {
             const dataBase64 = await read_blob(edited.blob, signal);
             if ( ! current() || ! screenshotConsent.checked ) return;
             screenshot = { contentType: edited.contentType, dataBase64 };
+            screenshotSource = source;
             const image = dialog.querySelector('.ezil-feedback-image');
             image.querySelector('img').src = `data:${screenshot.contentType};base64,${dataBase64}`;
             image.hidden = false;
@@ -730,6 +769,7 @@ export function open_feedback_dialog (_opts) {
                 const dataBase64 = await read_blob(blob, signal);
                 if ( ! current() ) return;
                 screenshot = { contentType: blob.type, dataBase64 };
+                screenshotSource = 'window';
                 const image = dialog.querySelector('.ezil-feedback-image');
                 image.querySelector('img').src = `data:${screenshot.contentType};base64,${dataBase64}`;
                 image.hidden = false;
@@ -776,7 +816,8 @@ export function open_feedback_dialog (_opts) {
                     capture = button.dataset.capture === 'shell' ? capture_shell_snapshot({ signal }) : capture_desktop_frame({ signal });
                 }
             } catch (error) { capture = Promise.reject(error); }
-            void finish_capture(capture, generation, signal);
+            // An edit keeps where the image came from; each capture names its own source.
+            void finish_capture(capture, generation, signal, { shell: 'window', tab: 'tab', desktop: 'desktop' }[button.dataset.capture] ?? screenshotSource);
         });
     }
     form.elements.screenshotFile?.addEventListener('change', () => {
@@ -794,7 +835,7 @@ export function open_feedback_dialog (_opts) {
         input.disabled = true;
         result.textContent = 'Preparing screenshot…';
         refresh();
-        void finish_capture(uploaded_image_canvas(file, { signal }), generation, signal);
+        void finish_capture(uploaded_image_canvas(file, { signal }), generation, signal, 'file');
     });
     dialog.querySelector('[data-action="remove-screenshot"]')?.addEventListener('click', () => {
         abort_auto();
