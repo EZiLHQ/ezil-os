@@ -29,7 +29,7 @@ app_environment=staging
 
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 # prd (production, founder decisions 2026-10-30): its own stacks, exec role, bucket,
-# operator state and app secret; origin https://os-prod.ezil.work; no rebase tuple.
+# operator state and app secret; origin https://os-prod.ezil.work; explicit qualified rebase tuples only.
 # Its ECR repository and launch template are the ezil-prd-foundation outputs, pinned here
 # by a reviewed commit (README "Production namespace prd"); an empty pin still refuses.
 use_namespace() {
@@ -75,7 +75,7 @@ assert_identity() {
     [[ "$caller" == "$account" ]] || die "wrong AWS account (expected $account)"
 }
 init_work() {
-    work=$(mktemp -d /tmp/ezil-mum.XXXXXXXX)
+    work=$(mktemp -d /tmp/ezil-$namespace.XXXXXXXX)
     trap 'rm -rf -- "$work"' EXIT
 }
 lock_operator() {
@@ -108,4 +108,28 @@ wait_changeset() {
 execute_changeset() {
     aws_act cloudformation execute-change-set --stack-name "$1" --change-set-name "$2"
     aws_read cloudformation wait stack-update-complete --stack-name "$1"
+}
+
+select_rebase_namespace() {
+    local selected=mum seen=false arg
+    while (($#)); do
+        arg=$1; shift
+        if [[ "$arg" == --namespace ]]; then
+            (($#)) && ! "$seen" || die 'namespace must be specified once'
+            selected=$1; seen=true; shift
+        elif [[ "$arg" == --namespace=* ]]; then
+            die 'use --namespace mum|prd as two arguments'
+        fi
+    done
+    use_namespace "$selected"
+}
+check_namespace_path() {
+    python3 -B - "$namespace" "$script_dir" "$@" <<'PY_PATH'
+import sys
+sys.path.insert(0, sys.argv[2])
+import rebase_namespace as context
+context.select(sys.argv[1])
+for path in sys.argv[3:]:
+    if path: context.path(path)
+PY_PATH
 }

@@ -13,6 +13,7 @@ import sys
 import tempfile
 
 import rebase_app
+import rebase_namespace as context
 import rebase_manifest as release
 
 ACCOUNT = "452630323510"
@@ -33,8 +34,8 @@ PROFILES = {
     "prd": {"secret": "ezil-os/production/app", "origin": "https://os-prod.ezil.work",
             "repository": f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/ezil-prd-foundation-applicationimages439f25f1-xkgzfggtz2w4",
             "launchTemplate": "lt-0b68cfb18ad22869a", "appSecretLock": "/root/ezil-aws-prd/locks/app-secret.lock",
-            # Founder decisions 2026-10-30: pool mode, no rebase tuple at launch, the prod host's role only.
-            "deployEnvironment": "aws-prd", "poolLifecycle": True, "rebase": False,
+            # Legacy pool config remains readable; rebase requires explicit immutable evidence.
+            "deployEnvironment": "aws-prd", "poolLifecycle": True, "rebase": True,
             "appCaller": {"enabled": True, "roleName": "ezil-prd-app-caller", "providers": [], "ec2CallerEnv": "production",
                           "ec2CallerRoleArns": [f"arn:aws:iam::{ACCOUNT}:role/ezil-os-prod-host-InstanceRole-uJIGAhHeIYOr"]}},
 }
@@ -49,6 +50,7 @@ def use_namespace(name):
     global NAMESPACE, PROFILE, MACHINE, SECRET, ORIGIN, REPOSITORY, ROLE, LAUNCH_TEMPLATE, APP_SECRET_LOCK, BUCKET
     need(name in PROFILES, "unknown operator namespace")
     NAMESPACE, PROFILE = name, PROFILES[name]
+    context.select(name)
     MACHINE = f"arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:ezil-{name}-lifecycle"
     ROLE = f"arn:aws:iam::{ACCOUNT}:role/ezil/identity/ezil-{name}-cfn-exec"
     BUCKET = f"ezil-{name}-deploy-assets-{ACCOUNT}"
@@ -65,12 +67,13 @@ use_namespace("mum")
 
 
 def read(path):
-    return release.read(path)
+    return release.read(context.path(path))
 
 
 def write(path, value, *, serialized=None):
     """Atomic, private file for NONSECRET configuration and release evidence only."""
     need(serialized is None or release.loads(serialized) == value, 'serialized evidence mismatch')
+    context.path(path)
     folder = os.path.dirname(os.path.abspath(path))
     fd, temp = tempfile.mkstemp(dir=folder, prefix=".mum-")
     try:
@@ -116,6 +119,7 @@ def template(path):
 def pair(config):
     d = config["settings"]["deployment"]
     need(d["accountId"] == ACCOUNT and d["region"] == REGION and d["namespace"] == NAMESPACE, "config account/region/namespace mismatch")
+    if NAMESPACE == 'prd': need(d.get('launchTemplateId') == LAUNCH_TEMPLATE, 'configured launch-template identity mismatch')
     # The lifecycle callback origin is the namespace's app (computer-lifecycle.ts authorityOrigin).
     need(config["settings"].get("authorityOrigin", ORIGIN) == ORIGIN, "lifecycle authority origin mismatch")
     need(PROFILE["rebase"] or not ((set(release.TUPLE) | {"releases"}) & d.keys()), "namespace has no rebase tuple or release registry")
@@ -123,22 +127,40 @@ def pair(config):
     need(re.fullmatch(re.escape(MACHINE) + r":[1-9][0-9]*", d["stateMachineVersionArn"]), "invalid lifecycle version")
     need(isinstance(d.get("launchTemplateVersion"), str) and re.fullmatch(r"[1-9][0-9]{0,9}", d["launchTemplateVersion"]), "invalid launch-template version")
     release.deployment_tuple(d)
+    if "releases" in d:
+        validate_registry(d)
     if "recoveryVersionArn" in config:
         # Without a release tuple, recovery is pinned by its namespace machine name instead.
-        need(config["recoveryVersionArn"] == d.get("recoveryStateMachineVersionArn") if PROFILE["rebase"] else
+        need(config["recoveryVersionArn"] == d.get("recoveryStateMachineVersionArn") if set(release.TUPLE) <= d.keys() else
              re.fullmatch(re.escape(f"arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:ezil-{NAMESPACE}-recovery:") + r"[1-9][0-9]*",
                           config["recoveryVersionArn"]), "recovery version config mismatch")
     return {k: d[k] for k in ("amiId", "stateMachineVersionArn", "launchTemplateVersion", *release.TUPLE) if k in d}
 
 
+def validate_registry(d):
+    records = d['releases']
+    need(isinstance(records, list) and len(records) <= 26, 'invalid release registry')
+    need(records or not set(release.TUPLE) & d.keys(), 'tuple requires a retained registry')
+    for record in records:
+        release.validate(record, source=True, repository=REPOSITORY)
+        context.scope(record)
+        need(record['launchTemplateId'] == LAUNCH_TEMPLATE, 'foreign registry launch template')
+    need(len({(r['lowerImageDigest'], r['amiId']) for r in records}) == len(records), 'duplicate release pair')
+
+
 def ami_promotable(config):
-    """An --ami promotion moves only the lifecycle pair. With recovery wired (bin/lifecycle.ts
-    builds it whenever recoveryVersionArn is set) and no release tuple, CloudFormation also
-    republishes the recovery workflow, whose observer settings carry the lifecycle version,
-    while recoveryVersionArn stays old: the Reconciler keeps starting the old recovery version,
-    which refuses every interrupted execution of the new lifecycle version (recovery-helper.ts)."""
-    need("recoveryVersionArn" not in config or bool(set(release.TUPLE) & config["settings"]["deployment"].keys()),
-         "namespace without a release tuple cannot promote a lifecycle with recovery")
+    # A tuple deployment must always use immutable manifest promotion. A plain
+    # recovery-wired deployment is supported only with explicit version readbacks.
+    pair(config)
+
+
+def recovery_versions(path):
+    base = MACHINE.removesuffix('-lifecycle') + '-recovery'
+    response = read(path)
+    arns = [v['stateMachineVersionArn'] for v in response['stateMachineVersions']]
+    need(not response.get('nextToken') and arns and all(release.matches(re.escape(base) + r':[1-9][0-9]*', v) for v in arns),
+         'invalid recovery version readback')
+    return arns
 
 
 def versions(path):
@@ -575,13 +597,13 @@ def promotion_substitution(value, old_pair, new_pair, version_ids=None):
         nested = isinstance(settings, dict) and "deployment" not in settings and isinstance(settings.get("lifecycle"), dict)
         holder = settings["lifecycle"] if nested else settings
         if isinstance(holder, dict) and isinstance(holder.get("deployment"), dict) and all(
-                holder["deployment"].get(k) == v for k, v in old_pair.items()):
+                holder["deployment"].get(k) == v for k, v in old_pair.items() if k != "recoveryVersionArn"):
             expected = copy.deepcopy(settings)
             target = expected["lifecycle"] if nested else expected
             for key in release.PROMOTION:
                 if key not in new_pair:
                     target["deployment"].pop(key, None)
-            target["deployment"].update(new_pair)
+            target["deployment"].update({k: v for k, v in new_pair.items() if k != "recoveryVersionArn"})
             match = re.search(r'"deployment"\s*:\s*', value)
             if match:
                 _, length = json.JSONDecoder().raw_decode(value[match.end():])
@@ -590,7 +612,7 @@ def promotion_substitution(value, old_pair, new_pair, version_ids=None):
                 adjusted = value[:match.end()] + json.dumps(target["deployment"], separators=separators) + value[match.end() + length:]
                 if same_json(json.loads(adjusted), expected):
                     value = adjusted
-        replacements = {old_pair[key]: new_pair[key] for key in ("amiId", "stateMachineVersionArn", "preparationStateMachineVersionArn", "recoveryStateMachineVersionArn") if key in old_pair and key in new_pair}
+        replacements = {old_pair[key]: new_pair[key] for key in ("amiId", "stateMachineVersionArn", "preparationStateMachineVersionArn", "recoveryStateMachineVersionArn", "recoveryVersionArn") if key in old_pair and key in new_pair}
         pattern = r"(?<![A-Za-z0-9_])(?:" + "|".join(re.escape(k) for k in replacements) + r")(?![A-Za-z0-9_])"
         return re.sub(pattern, lambda match: replacements[match[0]], value)
     if isinstance(value, list):
@@ -625,30 +647,32 @@ def promotion_substitution(value, old_pair, new_pair, version_ids=None):
             result["Fn::Sub"] = text
         else:
             result["Fn::Sub"][0] = text
-    old_arn, new_arn = old_pair["stateMachineVersionArn"], new_pair["stateMachineVersionArn"]
-    if promotion_literal(value) == old_arn and promotion_literal(result) != new_arn:
-        # Only the terminal version component can change, and the fully resolved
-        # expression must then equal the new ARN. Never replace every matching digit.
-        previous, target = old_arn.rsplit(":", 1)[1], new_arn.rsplit(":", 1)[1]
-        adjusted = copy.deepcopy(result)
-        if "Fn::Join" in value:
-            tail = value["Fn::Join"][1][-1]
-            if isinstance(tail, str) and tail.endswith(previous):
-                adjusted["Fn::Join"][1][-1] = tail[:-len(previous)] + target
-        elif "Fn::Sub" in value:
-            sub = value["Fn::Sub"]
-            text, variables = (sub, {}) if isinstance(sub, str) else sub
-            placeholder = re.search(r"\$\{([^}]+)\}$", text)
-            if placeholder and isinstance(variables.get(placeholder[1]), str) and variables[placeholder[1]].endswith(previous):
-                adjusted["Fn::Sub"][1][placeholder[1]] = variables[placeholder[1]][:-len(previous)] + target
-            elif text.endswith(previous):
-                text = text[:-len(previous)] + target
-                if isinstance(sub, str):
-                    adjusted["Fn::Sub"] = text
-                else:
-                    adjusted["Fn::Sub"][0] = text
-        if promotion_literal(adjusted) == new_arn:
-            result = adjusted
+    for key in ('stateMachineVersionArn', 'preparationStateMachineVersionArn', 'recoveryStateMachineVersionArn', 'recoveryVersionArn'):
+        if key not in old_pair or key not in new_pair: continue
+        old_arn, new_arn = old_pair[key], new_pair[key]
+        if promotion_literal(value) == old_arn and promotion_literal(result) != new_arn:
+            # Only the terminal version component can change, and the fully resolved
+            # expression must then equal the new ARN. Never replace every matching digit.
+            previous, target = old_arn.rsplit(":", 1)[1], new_arn.rsplit(":", 1)[1]
+            adjusted = copy.deepcopy(result)
+            if "Fn::Join" in value:
+                tail = value["Fn::Join"][1][-1]
+                if isinstance(tail, str) and tail.endswith(previous):
+                    adjusted["Fn::Join"][1][-1] = tail[:-len(previous)] + target
+            elif "Fn::Sub" in value:
+                sub = value["Fn::Sub"]
+                text, variables = (sub, {}) if isinstance(sub, str) else sub
+                placeholder = re.search(r"\$\{([^}]+)\}$", text)
+                if placeholder and isinstance(variables.get(placeholder[1]), str) and variables[placeholder[1]].endswith(previous):
+                    adjusted["Fn::Sub"][1][placeholder[1]] = variables[placeholder[1]][:-len(previous)] + target
+                elif text.endswith(previous):
+                    text = text[:-len(previous)] + target
+                    if isinstance(sub, str):
+                        adjusted["Fn::Sub"] = text
+                    else:
+                        adjusted["Fn::Sub"][0] = text
+            if promotion_literal(adjusted) == new_arn:
+                result = adjusted
     return result
 
 
@@ -702,6 +726,12 @@ def lifecycle_template(live_path, baseline_path, candidate_path, before_path, af
         if key not in new_pair:
             expected["settings"]["deployment"].pop(key, None)
     expected["settings"]["deployment"].update(new_pair)
+    need(('recoveryVersionArn' in before) == ('recoveryVersionArn' in after), 'recovery enablement requires reviewed rollout')
+    if 'recoveryVersionArn' in before:
+        if old_pair != new_pair:
+            need(before['recoveryVersionArn'] != after['recoveryVersionArn'], 'recovery version must change with lifecycle promotion')
+        expected['recoveryVersionArn'] = after['recoveryVersionArn']
+        old_pair['recoveryVersionArn'], new_pair['recoveryVersionArn'] = before['recoveryVersionArn'], after['recoveryVersionArn']
     need(same_json(expected, after), "unexpected lifecycle config change outside AMI/version pair")
     live, baseline, candidate = template(live_path), read(baseline_path), read(candidate_path)
     # A failed promotion can leave the stack at the rollback target already.
@@ -809,6 +839,9 @@ def lifecycle_changeset(cs_path, stack_path, *template_paths):
              value.get("ResolvedValue") == old.get("ResolvedValue"), "lifecycle parameter/resolved SSM change refused")
     version_ids = {logical for logical, change in allowed.items() if change["action"] in ("Add", "Remove")}
     context_old_pair, context_new_pair = pair(read(template_paths[3])), pair(read(template_paths[4]))
+    for pair_value, path in ((context_old_pair, template_paths[3]), (context_new_pair, template_paths[4])):
+        config = read(path)
+        if 'recoveryVersionArn' in config: pair_value['recoveryVersionArn'] = config['recoveryVersionArn']
     context_version_ids = lifecycle_version_pair(live["Resources"], candidate["Resources"], context_old_pair, context_new_pair)
     seen = set()
     for change in cs["Changes"]:
@@ -939,6 +972,8 @@ def edit_secret(envelope, before, after):
     deployments = release.loads(raw) if isinstance(raw, str) else copy.deepcopy(raw)
     need(isinstance(deployments, dict) and isinstance(deployments.get(REGION), dict), "regional deployments missing")
     d = deployments[REGION]
+    context.scope(d)
+    need(d.get("launchTemplateId") == LAUNCH_TEMPLATE, "secret launch-template identity mismatch")
     release.deployment_tuple(d)
     keys = set(before) | set(after) | set(release.TUPLE)
     current = {k: d[k] for k in keys if k in d}
@@ -1010,6 +1045,8 @@ def _secret_update(before_path, after_path, apply, lock_fd):
         return secret_aws(args, payload, lock_fd=lock_fd)
 
     before, after = pair(read(before_path)), pair(read(after_path))
+    need(NAMESPACE != 'prd' or not set(release.TUPLE) & (before.keys() | after.keys()),
+         'production tuple updates require the ledger-bound manifest promotion')
     envelope = aws(["get-secret-value", "--secret-id", SECRET, "--output", "json"])
     outer = release.loads(envelope["SecretString"])
     deployments = release.loads(outer[KEY]) if isinstance(outer[KEY], str) else outer[KEY]
@@ -1046,7 +1083,12 @@ def namespace_config(kind, path):
         need(value.get("assetBucketName") == BUCKET, "identity asset bucket mismatch")
         need(value.get("poolLifecycle", False) is PROFILE["poolLifecycle"], "identity pool lifecycle mismatch")
         need(value.get("killSwitch", False) is False, "identity kill switch must be off for stack creation")
-        need(PROFILE["rebase"] or "imageJobDeployment" not in value, "namespace has no rebase tuple: omit imageJobDeployment")
+        if "imageJobDeployment" in value:
+            image = value['imageJobDeployment']
+            context.scope(image)
+            need(set(release.TUPLE) <= image.keys(), 'image-job boundary requires complete rebase tuple')
+            pair({'settings': {'deployment': image}})
+            need(image.get('launchTemplateId') == LAUNCH_TEMPLATE, 'image-job launch-template identity mismatch')
         caller = (PROFILE["appCaller"] or {}).get("roleName")
         need(value.get("appCallerRoleName") == caller, "identity appCallerRoleName must equal the namespace's reviewed app caller role name")
     elif kind == "foundation":
@@ -1061,7 +1103,9 @@ def namespace_config(kind, path):
         need(re.fullmatch(re.escape(f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/ezil-{NAMESPACE}-foundation-") + r"[a-z0-9-]+",
                           params.get("ApplicationImageRepositoryUri") or ""), "AMI repository is not the namespace foundation's")
         need(REPOSITORY is None or params["ApplicationImageRepositoryUri"] == REPOSITORY, "ECR repository mismatch")
-        need(PROFILE["rebase"] or not any(params.get(k) for k in PREVIOUS), "namespace has no rebase tuple: no previous image pair")
+        previous = [params.get(k) or '' for k in sorted(PREVIOUS)]
+        need(bool(previous[0]) == bool(previous[1]) and all(not v or release.matches(release.DIGEST, v) for v in previous),
+             'previous image pair must be complete and immutable')
     elif kind == "lifecycle":
         need(value.get("deploy", {}).get("assetBucketName") == BUCKET, "lifecycle asset bucket mismatch")
         pair(value)
@@ -1113,8 +1157,9 @@ def main(args):
     elif op == "previous-parameters":
         need(PREVIOUS <= mapping(stack(a[0])["Parameters"]).keys(), "previous pair requires a recipe version bump")
     elif op in ("previous-release", "secret-predecessor", "secret-retained"):
-        manifest = release.load(a[0], source=True, repository=REPOSITORY)
+        manifest = release.load(context.path(a[0]), source=True, repository=REPOSITORY)
         need(manifest["accountId"] == ACCOUNT and manifest["region"] == REGION and manifest["namespace"] == NAMESPACE, "previous release identity mismatch")
+        need(manifest['launchTemplateId'] == LAUNCH_TEMPLATE, 'previous launch-template identity mismatch')
         if op == "previous-release":
             need((manifest["lowerImageRef"], manifest["lowerImageDigest"]) == tuple(a[1:3]), "previous release lower mismatch")
         else:
@@ -1123,12 +1168,16 @@ def main(args):
                 outer = release.loads(envelope["SecretString"])
                 deployments = release.loads(outer[KEY]) if isinstance(outer[KEY], str) else outer[KEY]
                 d = deployments[REGION]
+                context.scope(d)
+                need(d.get("launchTemplateId") == LAUNCH_TEMPLATE, "secret launch-template identity mismatch")
                 if op == "secret-retained":
                     release.retained_release(d, manifest)
                 else:
                     release.promoted_release(d, manifest)
     elif op in ("maintenance-agent", "maintenance-lower"):
-        manifest = release.load(a[0], source=True, repository=REPOSITORY)
+        manifest = release.load(context.path(a[0]), source=True, repository=REPOSITORY)
+        context.scope(manifest)
+        need(manifest["launchTemplateId"] == LAUNCH_TEMPLATE, "source launch-template identity mismatch")
         if op == "maintenance-agent":
             need(release.matches(r"[0-9a-f]{40}", a[1]) and a[1] != manifest["agentCommit"], "maintenance bake requires a new reviewed agent commit")
         else:
@@ -1230,6 +1279,13 @@ def main(args):
         need(not (set(release.TUPLE) & previous.keys()), "rebase deployment requires manifest promotion")
         ami_promotable(config)
         published = versions(a[1])
+        if 'recoveryVersionArn' in config:
+            need(len(a) == 6, 'recovery promotion requires published version readback')
+            recovered = recovery_versions(a[5])
+            need(config['recoveryVersionArn'] in recovered, 'configured recovery version is not published')
+            config['recoveryVersionArn'] = MACHINE.removesuffix('-lifecycle') + '-recovery:' + str(max(int(v.rsplit(':', 1)[1]) for v in recovered) + 1)
+        else:
+            need(len(a) == 5, 'unexpected recovery version readback')
         need(previous["stateMachineVersionArn"] in published, "configured lifecycle version is not published")
         need(previous["amiId"] != a[2], "AMI already configured")
         version = max(int(v.rsplit(":", 1)[1]) for v in published) + 1
@@ -1275,6 +1331,16 @@ def main(args):
         write(a[3], record["previous"])
         write(a[4], record["target"])
         print(json.dumps({"rollback": pair(record["previous"])}, indent=2))
+    elif op == "recovery-arn":
+        config = read(a[0]); pair(config)
+        print(config.get('recoveryVersionArn', ''))
+    elif op == "recovery-published":
+        config = read(a[0]); pair(config)
+        need(config['recoveryVersionArn'] in recovery_versions(a[1]), 'expected recovery version not published')
+        if len(a) == 3:
+            outputs = [v['OutputValue'] for v in stack(a[2]).get('Outputs', [])
+                       if v['OutputKey'] == 'RecoveryVersionArn' or re.fullmatch(r'(?:\w*)RecoveryVersionArn[0-9A-F]{8}', v['OutputKey'])]
+            need(outputs == [config['recoveryVersionArn']], 'recovery stack output mismatch')
     elif op == "published":
         need(a[1] in versions(a[0]), "expected lifecycle version not published")
     elif op == "lifecycle-changeset":

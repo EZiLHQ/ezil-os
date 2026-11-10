@@ -3,10 +3,10 @@
 
 - common.sh use_namespace and json-tool.py PROFILES name the same resources;
 - `json-tool.py --namespace prd namespace-config` accepts the founder's P1-P7 inputs
-  (PROD-COMPUTERS-PLAN) and refuses mum/staging values, a rebase tuple, a foreign
+  (PROD-COMPUTERS-PLAN) and refuses mum/staging values, a partial tuple, a foreign
   origin or enroll URL, and any other app caller;
 - prd carries its committed foundation pins and refuses foreign ones; an emptied pin
-  still refuses every pinned operation; prd refuses every image-rebase operation;
+  still refuses every pinned operation; prd requires immutable image-rebase evidence;
   secret errors stay redacted under --namespace.
 """
 import contextlib
@@ -123,11 +123,10 @@ REFUSED = {
         ("staging authority origin", edit(LIFECYCLE, ["settings", "authorityOrigin"], "https://os-staging.ezil.work")),
         ("pre-cutover origin", edit(LIFECYCLE, ["settings", "authorityOrigin"], "https://os.ezil.work")),
         ("authority origin omitted", edit(LIFECYCLE, ["settings", "authorityOrigin"], DELETE)),
-        ("rebase tuple", edit(LIFECYCLE, ["settings", "deployment"], {**LIFECYCLE["settings"]["deployment"],
+        ("partial rebase tuple", edit(LIFECYCLE, ["settings", "deployment"], {**LIFECYCLE["settings"]["deployment"],
             "lowerImageDigest": "sha256:" + "5" * 64, "previousLowerImageDigest": None,
-            "preparationStateMachineVersionArn": f"arn:aws:states:{R}:{A}:stateMachine:ezil-prd-rebase-preparation:1",
             "recoveryStateMachineVersionArn": f"arn:aws:states:{R}:{A}:stateMachine:ezil-prd-recovery:1"})),
-        ("release registry", edit(LIFECYCLE, ["settings", "deployment", "releases"], [])),
+        ("partial release registry", edit(LIFECYCLE, ["settings", "deployment", "releases"], [{}])),
         ("mum workflow", edit(LIFECYCLE, ["settings", "deployment", "stateMachineVersionArn"], f"arn:aws:states:{R}:{A}:stateMachine:ezil-mum-lifecycle:1")),
         ("mum recovery", edit(LIFECYCLE, ["recoveryVersionArn"], f"arn:aws:states:{R}:{A}:stateMachine:ezil-mum-recovery:1")),
         ("mum namespace", edit(LIFECYCLE, ["settings", "deployment", "namespace"], "mum")),
@@ -288,67 +287,43 @@ class ProfileTests(unittest.TestCase):
             # The app-secret lock taken was the redirected one, never the host's real operator lock.
             self.assertTrue((Path(folder) / "locks/app-secret.lock").exists())
 
-    def test_pinned_prd_still_refuses_rebase_operations_and_tuples(self):
-        pinned = {**tool.PROFILES["prd"], "repository": f"{A}.dkr.ecr.{R}.amazonaws.com/ezil-prd-foundation-x", "launchTemplate": "lt-0123456789abcdef0"}
-        original = tool.PROFILES
-        tool.PROFILES = {**original, "prd": pinned}
-        try:
-            for op in sorted(tool.REBASE_OPS):
-                with self.subTest(op):
-                    with self.assertRaisesRegex(ValueError, "no rebase tuple"):
-                        tool.main(["--namespace", "prd", op, "a", "b", "c"])
-            tool.use_namespace("prd")
-            with self.assertRaisesRegex(ValueError, "no rebase tuple or release registry"):
-                tool.pair(REFUSED["lifecycle"][3][1])
-            self.assertEqual(tool.pair(LIFECYCLE)["amiId"], "ami-0123456789abcdef0")
-            # Without a tuple, recovery is pinned to the namespace's own machine.
-            for recovery in (f"arn:aws:states:{R}:{A}:stateMachine:ezil-mum-recovery:1", f"arn:aws:states:{R}:{A}:stateMachine:ezil-prd-lifecycle:1"):
-                with self.assertRaisesRegex(ValueError, "recovery version config mismatch"):
-                    tool.pair(edit(LIFECYCLE, ["recoveryVersionArn"], recovery))
-            with self.assertRaisesRegex(ValueError, "lifecycle authority origin mismatch"):
-                tool.pair(edit(LIFECYCLE, ["settings", "authorityOrigin"], "https://os-staging.ezil.work"))
-        finally:
-            tool.PROFILES = original
-            tool.use_namespace("mum")
+    def test_prd_accepts_full_tuple_but_refuses_partial_and_foreign_workflows(self):
+        tool.use_namespace('prd')
+        self.addCleanup(tool.use_namespace, 'mum')
+        d = {**LIFECYCLE['settings']['deployment'], 'lowerImageDigest':'sha256:'+'a'*64,
+             'previousLowerImageDigest':'sha256:'+'b'*64,
+             'preparationStateMachineVersionArn':tool.MACHINE.replace('-lifecycle','-rebase-preparation')+':1',
+             'recoveryStateMachineVersionArn':LIFECYCLE['recoveryVersionArn']}
+        config = edit(LIFECYCLE, ['settings','deployment'], d)
+        self.assertEqual(tool.pair(config)['lowerImageDigest'], d['lowerImageDigest'])
+        for field in tool.release.TUPLE:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                tool.pair(edit(config, ['settings','deployment',field], DELETE))
+        for field in ('stateMachineVersionArn','preparationStateMachineVersionArn','recoveryStateMachineVersionArn'):
+            with self.assertRaises(ValueError): tool.pair(edit(config, ['settings','deployment',field], d[field].replace('prd','mum')))
+        self.assertEqual(tool.pair(LIFECYCLE)['amiId'], LIFECYCLE['settings']['deployment']['amiId'])
 
-    def test_pinned_prd_refuses_an_ami_promotion_while_recovery_is_wired(self):
-        # The recovery workflow republishes with the promoted observer while recoveryVersionArn
-        # stays old; the machine exists whenever the ARN is set, whatever recoveryEnabled says.
-        pinned = {**tool.PROFILES["prd"], "repository": f"{A}.dkr.ecr.{R}.amazonaws.com/ezil-prd-foundation-x", "launchTemplate": "lt-0123456789abcdef0"}
-        original = tool.PROFILES
-        tool.PROFILES = {**original, "prd": pinned}
-        try:
-            with tempfile.TemporaryDirectory() as folder:
-                root = Path(folder)
-                (root / "versions.json").write_text(json.dumps({"stateMachineVersions": [
-                    {"stateMachineVersionArn": LIFECYCLE["settings"]["deployment"]["stateMachineVersionArn"]}]}))
-                target = edit(LIFECYCLE, ["settings", "deployment"], {**LIFECYCLE["settings"]["deployment"], "amiId": "ami-22222222222222222",
-                              "launchTemplateVersion": "3", "stateMachineVersionArn": f"arn:aws:states:{R}:{A}:stateMachine:ezil-prd-lifecycle:2"})
-                for why, before, after in (("recovery enabled", LIFECYCLE, target),
-                                           ("recovery wired but its rules disabled", edit(LIFECYCLE, ["recoveryEnabled"], False),
-                                            edit(target, ["recoveryEnabled"], False))):
-                    with self.subTest(why):
-                        (root / "before.json").write_text(json.dumps(before))
-                        (root / "after.json").write_text(json.dumps(after))
-                        with self.assertRaisesRegex(ValueError, "cannot promote a lifecycle with recovery"):
-                            tool.main(["--namespace", "prd", "plan-promotion", str(root / "before.json"), str(root / "versions.json"),
-                                       "ami-22222222222222222", "3", str(root / "planned.json")])
-                        self.assertFalse((root / "planned.json").exists())
-                        for reverse in ("false", "true"):
-                            with self.assertRaisesRegex(ValueError, "cannot promote a lifecycle with recovery"):
-                                tool.lifecycle_template(*(str(root / n) for n in ("live", "baseline", "candidate", "before.json", "after.json")), reverse)
-                # Without recovery the plain promotion still plans N+1.
-                (root / "before.json").write_text(json.dumps(edit(edit(LIFECYCLE, ["recoveryVersionArn"], DELETE), ["recoveryEnabled"], DELETE)))
-                with contextlib.redirect_stdout(io.StringIO()):
-                    tool.main(["--namespace", "prd", "plan-promotion", str(root / "before.json"), str(root / "versions.json"),
-                               "ami-22222222222222222", "3", str(root / "planned.json")])
-                planned = json.loads((root / "planned.json").read_text())["settings"]["deployment"]
-                self.assertEqual((planned["amiId"], planned["stateMachineVersionArn"]),
-                                 ("ami-22222222222222222", f"arn:aws:states:{R}:{A}:stateMachine:ezil-prd-lifecycle:2"))
-        finally:
-            tool.PROFILES = original
-            tool.use_namespace("mum")
+    def test_plain_recovery_promotion_requires_both_published_version_readbacks(self):
+        tool.use_namespace('prd')
+        self.addCleanup(tool.use_namespace, 'mum')
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for name, value in [('before', LIFECYCLE), ('versions', {'stateMachineVersions':[
+                {'stateMachineVersionArn':tool.MACHINE+':1'}]}), ('recovery', {'stateMachineVersions':[
+                {'stateMachineVersionArn':tool.MACHINE.replace('-lifecycle','-recovery')+':1'}]})]:
+                tool.write(root/(name+'.json'), value)
+            args = ['plan-promotion', str(root/'before.json'), str(root/'versions.json'), 'ami-'+'2'*17, '3', str(root/'planned.json')]
+            with self.assertRaisesRegex(ValueError, 'requires published version readback'): tool.main(args)
+            with contextlib.redirect_stdout(io.StringIO()): tool.main([*args, str(root/'recovery.json')])
+            planned = tool.read(root/'planned.json')
+            self.assertEqual(planned['recoveryVersionArn'], tool.MACHINE.replace('-lifecycle','-recovery')+':2')
+            self.assertEqual(planned['settings']['deployment']['stateMachineVersionArn'], tool.MACHINE+':2')
+            self.assertFalse(set(tool.release.TUPLE) & planned['settings']['deployment'].keys())
+            for bad in ({'stateMachineVersions':[]}, {'stateMachineVersions':[{'stateMachineVersionArn':tool.MACHINE+':1'}]},
+                        {'nextToken':'more', 'stateMachineVersions':[{'stateMachineVersionArn':LIFECYCLE['recoveryVersionArn']}] }):
+                tool.write(root/'recovery.json', bad)
+                with self.assertRaises(ValueError): tool.main([*args, str(root/'recovery.json')])
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main(verbosity=1)

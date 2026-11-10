@@ -462,12 +462,12 @@ time it runs.
 | App caller | staging host role, `ezil:env=billing-staging` | exactly the prod host role, `ezil:env=production`, no OIDC |
 
 `common.sh` (`use_namespace`) and `json-tool.py` (`PROFILES`) hold this table;
-`tests/prd_namespace.py` checks they agree. `rebuild-ami.sh`, `promote-ami.sh`,
-`with-app-secret-lock.sh` and `json-tool.py` take `--namespace prd`. Under prd
-they refuse mum stacks, roles, buckets and operator paths, the staging enroll URL
-or origin, any rebase tuple or release registry, manifest (rebase) promotion, and
-previous/maintenance/deployed-release bakes. The rebase and registry tools
-(`rebase-*.sh`, `rebase_*.py`, `registry_gc*`) remain mum-only.
+`tests/prd_namespace.py` checks they agree. The shell and Python rebase release,
+computer and registry tools also accept explicit `--namespace prd`; mum remains
+the default. Qualified production upgrades, including first admission from the
+legacy plain deployment, follow [PRODUCTION-REBASE.md](PRODUCTION-REBASE.md).
+Legacy plain configuration remains readable. Namespace selection alone does not
+supply an immutable target or authorize retained-volume launch.
 
 **Creating the namespace** (plan §4 P1–P7). Keep configs under `/root/ezil-aws-prd/config/`
 (ARNs only) and synth only in a scratch copy, as `prepare_synth` does. Before each
@@ -525,19 +525,17 @@ bash deploy/aws/mum/rebuild-ami.sh --namespace prd --desktop-image "$desktop_ima
 bash deploy/aws/mum/promote-ami.sh --namespace prd --ami "$(cat /root/ezil-aws-prd/release/next/ami-id.txt)"
 ```
 
-Promotion updates only `amiId`, `launchTemplateVersion` and `stateMachineVersionArn`
-in `ezil-os/production/app`. It is the plain path; prd has no manifest promotion
-until the rebase tooling is parameterized.
+Plain promotion updates `amiId`, `launchTemplateVersion` and
+`stateMachineVersionArn` in `ezil-os/production/app`. If recovery is wired, it
+also predicts, checks and publishes the matching `recoveryVersionArn` in the
+lifecycle config, verifies both published version lists and stack outputs, and
+restores both on rollback. Any version race or stale output refuses the secret
+write. This path does not migrate existing users' retained EBS lowers.
 
-**`--ami` promotion refuses while recovery is wired** (any `recoveryVersionArn` in the
-lifecycle config, which the P7 config has). Without a release tuple, the promoted
-lifecycle republishes the recovery workflow: its observer's settings carry the
-lifecycle version. `recoveryVersionArn` would stay on the old version, so the
-Reconciler would keep starting a recovery that refuses every interrupted execution
-of the new lifecycle version. The tooling does not yet predict and read back
-`RecoveryVersionArn`. Until it does, a prd AMI change is a reviewed, hand-run
-lifecycle update that pins both new versions. The first prd stacks (P6 foundation
-`HostAmiId` update, P7 lifecycle create) do not use `promote-ami.sh`.
+The full manifest path is required for desktop image rebase. See the production
+runbook for bootstrap, OLD+NEW bake, reviewed IAM/DB/workflows, atomic tuple
+promotion and signed per-computer jobs. Source support is not evidence that any
+of these production operations have happened.
 
 ## Rebase release tooling (contract v1, lane E increment)
 

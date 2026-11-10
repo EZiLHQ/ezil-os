@@ -5,6 +5,7 @@ import json
 import re
 
 import rebase_manifest as manifest
+import rebase_namespace as context
 
 need = manifest.need
 PLACEMENTS = {'lower_image_digest': ['text', False], 'lower_digest_observed_at': ['timestamp with time zone', False], 'image_upgrade_job_id': ['uuid', False]}
@@ -52,6 +53,7 @@ SELECT json_build_object(
 
 
 def body(sql_bytes, system_id):
+    context.system_id(system_id)
     need(manifest.matches(r'[0-9]{1,20}', system_id), 'independently verified DB system identifier required')
     sql = sql_bytes.decode('utf-8'); expected = expected_schema(sql)
     sha = hashlib.sha256(sql_bytes).hexdigest()
@@ -81,16 +83,17 @@ def require(ok):
 try:
     sql = base64.b64decode(SQL64).decode('utf-8')
     require(hashlib.sha256(sql.encode()).hexdigest() == SHA)
-    values = dict(line.split('=',1) for line in Path('/etc/ezil-os-staging/app.env').read_text().splitlines() if '=' in line)
+    values = dict(line.split('=',1) for line in Path(APP_ENV).read_text().splitlines() if '=' in line)
     raw = values['SUPABASE_DATABASE_URL']
     require(not any(s in unquote(raw).lower() for s in ('btgq','curomaa')))
     url = urlsplit(raw)
-    require(url.scheme in ('postgres','postgresql') and url.hostname == '10.61.20.35' and url.port == 5432 and not url.fragment)
+    require(url.scheme in ('postgres','postgresql') and url.hostname == DB_HOST and url.port == 5432 and not url.fragment)
     # Python 3.9 (the staging host) raises on parse_qsl('', strict_parsing=True).
     query = dict(parse_qsl(url.query, strict_parsing=True)) if url.query else {}
     require(set(query) <= {'sslmode'} and query.get('sslmode','disable') in ('disable','require','verify-ca','verify-full'))
+    if PRODUCTION: require(url.path == '/postgres' and query == {'sslmode':'require'})
     require(url.username and url.password and url.path.startswith('/') and re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,62}',unquote(url.path[1:])))
-    env = {'PATH':os.defpath + ':/usr/local/bin', 'PGHOST':'10.61.20.35','PGPORT':'5432',
+    env = {'PATH':os.defpath + ':/usr/local/bin', 'PGHOST':DB_HOST,'PGPORT':'5432',
            'PGUSER':unquote(url.username),'PGPASSWORD':unquote(url.password),'PGDATABASE':unquote(url.path[1:]),
            'PGSSLMODE':query.get('sslmode','disable'),'PGCONNECT_TIMEOUT':'10'}
     command = ['docker','run','--rm','-i','--network','host']
@@ -109,12 +112,14 @@ except Exception:
     print('staging schema operation refused',file=sys.stderr)
     sys.exit(1)
 '''
-    constants = dict(SQL64=base64.b64encode(sql_bytes).decode(), SHA=sha, SYSTEM=system_id, TRANSACTION=transaction)
+    constants = dict(SQL64=base64.b64encode(sql_bytes).decode(), SHA=sha, SYSTEM=system_id, TRANSACTION=transaction, APP_ENV='/etc/'+context.SLUG+'/app.env',
+                     DB_HOST=context.DB_HOST, PRODUCTION=context.NAMESPACE=='prd')
     prefix = '\n'.join(k + ' = ' + repr(v) for k, v in constants.items())
     return "set -euo pipefail\nset +x\numask 077\npython3 - <<'EZIL_SCHEMA_PY'\n" + prefix + program + "\nEZIL_SCHEMA_PY\n"
 
 
 def validate_receipt(receipt, sql_bytes, system_id):
+    context.system_id(system_id)
     need(set(receipt) == {'schemaVersion','systemIdentifier','schemaSha256','applied','before','after'}, 'invalid schema receipt')
     need(type(receipt['schemaVersion']) is int and receipt['schemaVersion'] == 1 and type(receipt['applied']) is bool, 'invalid schema receipt types')
     need(receipt['systemIdentifier'] == system_id and receipt['schemaSha256'] == hashlib.sha256(sql_bytes).hexdigest(), 'schema receipt identity mismatch')

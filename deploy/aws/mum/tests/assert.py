@@ -16,7 +16,8 @@ if prd:
     recorded = ((root / "calls.jsonl").read_text() + output).replace(str(root.parent), "<scratch>")
     leaked = [t for t in namespaces.MUM_TOKENS if t in recorded]
     assert not leaked, leaked
-    assert not calls or any("ezil-prd-" in json.dumps(c) for c in calls), calls
+    # Early artifact refusals may have checked only the shared AWS account.
+    assert not calls or all('sts' in c and 'get-caller-identity' in c for c in calls) or any("ezil-prd-" in json.dumps(c) for c in calls), calls
     calls = [json.loads(namespaces.to_mum(line)) for line in (root / "calls.jsonl").read_text().splitlines()]
     output = namespaces.to_mum(output)
 

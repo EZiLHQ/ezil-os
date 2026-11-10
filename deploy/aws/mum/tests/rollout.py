@@ -220,7 +220,7 @@ class RegistryTests(unittest.TestCase):
         for name in ('aws-intent.ts','aws-rebase-release.ts'):
             source=(root/'app/src/server/lib/compute'/name).read_text()
             self.assertEqual(re.findall(r'z\.array\(RebaseSourceReleaseSchema\)\.min\(1\)\.max\((\d+)\)',source),['26'])
-        for name, expected in (('json-tool.py',[26,26]),('registry_gc.py',[26])):
+        for name, expected in (('json-tool.py',[26,26,26]),('registry_gc.py',[26])):
             tree=ast.parse((HERE.parent/name).read_text())
             caps=[node.comparators[-1].value for node in ast.walk(tree) if isinstance(node,ast.Compare)
                   and isinstance(node.comparators[-1],ast.Constant)
@@ -2103,7 +2103,11 @@ class IntegrationTests(unittest.TestCase):
         self.through_app()
         outer=manifest.loads(self.envelope['SecretString']);outer[TOOL.KEY][TOOL.REGION]['amiId']='ami-'+'9'*17;self.envelope['SecretString']=json.dumps(outer)
         # Keep ledger coherent to isolate deployed identity from drift detection.
-        ledger=RELEASE.load_ledger(self.ledger);ledger['entries'][-1]['tuple']=RELEASE.ledger_tuple(outer[TOOL.KEY][TOOL.REGION]);TOOL.write(self.ledger,ledger)
+        ledger=RELEASE.load_ledger(self.ledger)
+        for entry in ledger['entries']:
+            for snapshot in ([entry['before'],entry['expected']] if entry.get('state')=='pending' else [entry]):
+                snapshot['tuple']['amiId']=outer[TOOL.KEY][TOOL.REGION]['amiId']
+        TOOL.write(self.ledger,ledger)
         for action in (lambda:RELEASE.make_plan(self.directory,self.config,self.identity,'1234567890123456789',self.rollout),
                        lambda:RELEASE.apply_cloud(self.path,'apply-identity',True),lambda:RELEASE.apply_cloud(self.path,'apply-workflows',True),
                        lambda:RELEASE.apply_app(self.manifest,True),lambda:RELEASE.promote(self.manifest,True)):
@@ -2111,7 +2115,7 @@ class IntegrationTests(unittest.TestCase):
 
     def test_predecessor_must_be_retained_and_match_both_bake_fields(self):
         outer=manifest.loads(self.envelope['SecretString']);outer[TOOL.KEY][TOOL.REGION]['releases']=[];self.envelope['SecretString']=json.dumps(outer)
-        self.assert_no_mutation(lambda:RELEASE.make_plan(self.directory,self.config,self.identity,'1234567890123456789',self.rollout),'not retained')
+        self.assert_no_mutation(lambda:RELEASE.make_plan(self.directory,self.config,self.identity,'1234567890123456789',self.rollout),'tuple requires a retained registry')
         self.envelope['SecretString']=json.dumps(self.outer_original)
         for field,value in (('lowerImageDigest','sha256:'+'f'*64),('lowerImageRef',TOOL.REPOSITORY+'@sha256:'+'f'*64)):
             changed=dict(self.source,**{field:value});TOOL.write(self.directory/'previous-rebase-release.json',changed)

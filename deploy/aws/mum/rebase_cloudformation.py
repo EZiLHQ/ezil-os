@@ -13,6 +13,7 @@ from pathlib import Path
 import time
 
 import rebase_manifest as manifest
+import rebase_namespace as context
 
 need = manifest.need
 STACKS = {'identity':'ezil-identity-mum','foundation':'ezil-mum-foundation','workflows':'ezil-mum-lifecycle'}
@@ -131,7 +132,7 @@ def validate_pool_iam(phase,before,after,review):
                          and ('Action' in s or 'NotAction' in s) for s in delta[name]) for name in ('added','removed'))
                  for logical,delta in resources.items()) for resources in review['stacks'].values()),
          'invalid pool IAM review')
-    need(review['namespace']=='mum','pool IAM namespace mismatch')
+    need(review['namespace']==context.NAMESPACE,'pool IAM namespace mismatch')
     for resources in review['stacks'].values():
         for delta in resources.values():
             for s in delta['added']:
@@ -257,7 +258,7 @@ def _narrow_image_role_allow(statement):
             and action_set(statement) and action_set(statement)<=ROLE_WRITES
             and isinstance(resources,list) and resources and set(resources)<=set(IMAGE_JOB_ROLES)
             and statement.get('Condition')=={'StringEquals':{'iam:PermissionsBoundary':
-                'arn:aws:iam::452630323510:policy/ezil/mum/ezil-mum-image-job-boundary'}}
+                f'arn:aws:iam::452630323510:policy/ezil/{context.NAMESPACE}/ezil-{context.NAMESPACE}-image-job-boundary'}}
             and set(statement)<={'Sid','Effect','Action','Resource','Condition'})
 
 IMAGE_JOB_ROLE_NAMES=tuple(arn.replace(':role/ezil/mum/',':role/') for arn in IMAGE_JOB_ROLES)
@@ -311,8 +312,8 @@ def image_boundary_condition(value):
     Only this existing condition key can expand; trust, actions, resources,
     other conditions, and the identity role itself are unchanged.
     """
-    old='arn:aws:iam::452630323510:policy/ezil/identity/ezil-mum-boundary'
-    new='arn:aws:iam::452630323510:policy/ezil/mum/ezil-mum-image-job-boundary'
+    old=f'arn:aws:iam::452630323510:policy/ezil/identity/ezil-{context.NAMESPACE}-boundary'
+    new=f'arn:aws:iam::452630323510:policy/ezil/{context.NAMESPACE}/ezil-{context.NAMESPACE}-image-job-boundary'
     if isinstance(value,list):return [image_boundary_condition(v) for v in value]
     if isinstance(value,dict):return {k:([old,new] if k=='iam:PermissionsBoundary' and v==old else image_boundary_condition(v)) for k,v in value.items()}
     return value
@@ -340,6 +341,8 @@ def dependent_lambda_arns(logical, entry, old, new, actual):
     return sources
 
 def validate_templates(phase, before, after, review, unchanged=False, pool_iam=None):
+    context.identities(before)
+    context.identities(after)
     need(set(review)=={'schemaVersion','changes'} and type(review['schemaVersion']) is int and review['schemaVersion']==1,'invalid exact template review')
     raw_old,raw_new=before['Resources'],after['Resources']
     action_reorder=before!=after
@@ -364,10 +367,10 @@ def validate_templates(phase, before, after, review, unchanged=False, pool_iam=N
         need(review['changes']==exact,'foundation review must contain only its parameter-forced AMI change')
         return exact
     old,new=before['Resources'],after['Resources'];actual={};right_resources=new
-    boundary='arn:aws:iam::452630323510:policy/ezil/mum/ezil-mum-image-job-boundary'
+    boundary=f'arn:aws:iam::452630323510:policy/ezil/{context.NAMESPACE}/ezil-{context.NAMESPACE}-image-job-boundary'
     if phase=='identity':
-        policies=[v for v in new.values() if v['Type']=='AWS::IAM::ManagedPolicy' and v.get('Properties',{}).get('ManagedPolicyName')=='ezil-mum-image-job-boundary']
-        need(len(policies)==1 and policies[0]['Properties'].get('Path')=='/ezil/mum/', 'amendment A2 image-job boundary required')
+        policies=[v for v in new.values() if v['Type']=='AWS::IAM::ManagedPolicy' and v.get('Properties',{}).get('ManagedPolicyName')==f'ezil-{context.NAMESPACE}-image-job-boundary']
+        need(len(policies)==1 and policies[0]['Properties'].get('Path')==f'/ezil/{context.NAMESPACE}/', 'amendment A2 image-job boundary required')
         need(len(json.dumps(policies[0]['Properties']['PolicyDocument'],separators=(',',':')).encode())<=6144,'image-job managed policy exceeds size limit')
         shared=[v for k,v in old.items() if is_shared_boundary(k,v)]
         need(len(shared)==1,'one existing shared workload boundary required')
@@ -405,7 +408,7 @@ def validate_templates(phase, before, after, review, unchanged=False, pool_iam=N
             recovery_key=(phase=='workflows' and kind=='AWS::KMS::Key' and logical.startswith('RecoveryHistoryKey')
                           and right.get('DeletionPolicy')=='Retain' and right.get('UpdateReplacePolicy')=='Retain'
                           and right.get('Properties',{}).get('EnableKeyRotation') is True
-                          and {'Key':'ezil:namespace','Value':'mum'} in right.get('Properties',{}).get('Tags',[]))
+                          and {'Key':'ezil:namespace','Value':context.NAMESPACE} in right.get('Properties',{}).get('Tags',[]))
             need(kind not in ('AWS::KMS::Key','AWS::IAM::ManagedPolicy') or phase=='identity' or recovery_key,'unreviewed key or policy addition')
             actual[logical]={'action':'Add','properties':[],'attributes':[]}
         elif right is None:
@@ -608,3 +611,13 @@ def execute(phase, spec, directory, apply, aws, write, digest, sleep=time.sleep,
         need(live==after,'post-deployment template mismatch')
         receipt={**binding,'status':'complete'};write(path,receipt);return receipt
     raise ValueError('stack still updating; resume journal')
+
+
+def use_namespace(name):
+    global STACKS, ROLE, IMAGE_JOB_ROLES, IMAGE_JOB_ROLE_NAMES
+    context.select(name)
+    STACKS = {'identity': f'ezil-identity-{name}', 'foundation': f'ezil-{name}-foundation', 'workflows': f'ezil-{name}-lifecycle'}
+    ROLE = f'arn:aws:iam::452630323510:role/ezil/identity/ezil-{name}-cfn-exec'
+    IMAGE_JOB_ROLES = tuple(f'arn:aws:iam::452630323510:role/ezil/{name}/ezil-{name}-{suffix}'
+                            for suffix in ('rebase-preparation', 'recovery'))
+    IMAGE_JOB_ROLE_NAMES = tuple(arn.replace(f':role/ezil/{name}/', ':role/') for arn in IMAGE_JOB_ROLES)

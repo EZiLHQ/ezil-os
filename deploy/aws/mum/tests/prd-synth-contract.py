@@ -3,9 +3,9 @@
 
 Synthesizes the founder's prd lifecycle (PROD-COMPUTERS-PLAN P7: recovery on, no
 release tuple, EC2-only app caller) before and after an AMI promotion, then runs the
-prd promotion validators of json-tool.py on the real templates: they must refuse it,
-because the recovery workflow would republish while recoveryVersionArn stays old. The
-same promotion without recovery must pass. The tooling copy gets the test pin
+prd promotion validators of json-tool.py on the real templates: both workflow
+versions must move together. A stale recovery reference must fail. The same
+promotion without recovery must pass. The tooling copy gets the test pin
 stand-ins, exactly as the offline suite does.
 """
 import copy
@@ -51,6 +51,7 @@ with tempfile.TemporaryDirectory(prefix="ezil-prd-real-synth.") as folder:
     config = copy.deepcopy(baseline)
     config["settings"]["deployment"].update(amiId="ami-22222222222222222", launchTemplateVersion="3",
         stateMachineVersionArn="arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-lifecycle:2")
+    config["recoveryVersionArn"] = baseline["recoveryVersionArn"].rsplit(":",1)[0] + ":2"
     # The same promotion with recovery unwired: the plain --ami path the tooling admits.
     plain_baseline, plain_config = copy.deepcopy(baseline), copy.deepcopy(config)
     for value in (plain_baseline, plain_config):
@@ -125,13 +126,12 @@ with tempfile.TemporaryDirectory(prefix="ezil-prd-real-synth.") as folder:
         ok = result.returncode == 0 if error is None else result.returncode == 1 and error in result.stderr
         check(label, ok, result.stdout + result.stderr)
 
-    # Founder shape: CloudFormation would republish the recovery workflow while
-    # recoveryVersionArn stays old, so the Reconciler would keep the old observer.
     old, new = templates[:2]
-    recovery = "cannot promote a lifecycle with recovery"
-    validate("real prd promotion with recovery and no tuple refused", old, new, (baseline, config), error=recovery)
-    validate("exact real prd change set with recovery refused", old, new, (baseline, config), cs=changeset(old, new), error=recovery)
-    validate("real prd rollback with recovery refused", new, old, (config, baseline), reverse=True, error=recovery)
+    validate("real prd promotion pins recovery", old, new, (baseline, config))
+    validate("exact real prd change set pins recovery", old, new, (baseline, config), cs=changeset(old, new))
+    validate("real prd rollback restores recovery", new, old, (config, baseline), reverse=True)
+    stale = copy.deepcopy(config); stale['recoveryVersionArn'] = baseline['recoveryVersionArn']
+    validate("stale recovery reference refused", old, new, (baseline, stale), error="recovery version must change")
     old, new = templates[2:]
     baseline, config = plain_baseline, plain_config
     validate("real prd promotion accepted", old, new, (baseline, config))
@@ -161,6 +161,6 @@ with tempfile.TemporaryDirectory(prefix="ezil-prd-real-synth.") as folder:
     validate("prd config with the staging origin refused", old, new, (baseline, staging), error="authority origin mismatch")
     tuple_config = copy.deepcopy(config)
     tuple_config["settings"]["deployment"]["releases"] = []
-    validate("prd config with a release registry refused", old, new, (baseline, tuple_config), error="no rebase tuple")
+    validate("plain promotion cannot add a registry", old, new, (baseline, tuple_config), error="outside AMI/version pair")
 print(f"RESULT: {passed} passed, {failed} failed")
 raise SystemExit(1 if failed else 0)

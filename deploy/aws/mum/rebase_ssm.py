@@ -1,4 +1,4 @@
-"""Staging-only SSM/S3 transport. Payloads and receipts contain no secret values."""
+"""Namespace-pinned SSM/S3 transport. Receipts contain no secret values."""
 import hashlib
 import json
 from pathlib import Path
@@ -8,6 +8,7 @@ import tempfile
 import time
 
 import rebase_manifest as manifest
+import rebase_namespace as context
 
 HOST = 'i-014810524754b9ed0'
 BUCKET = 'ezil-main-preview-artifacts-452630323510-aps1'
@@ -15,17 +16,47 @@ PREFIX = 'os-staging/images/rebase-release/'
 need = manifest.need
 
 
+def use_namespace(name):
+    global HOST, BUCKET, PREFIX
+    context.select(name)
+    HOST = 'i-014810524754b9ed0' if name == 'mum' else None
+    BUCKET = context.ARTIFACT_BUCKET
+    PREFIX = context.ARTIFACT_PREFIX + 'rebase-release/'
+
+
 def host_identity(aws):
+    global HOST
     identity = aws('sts', 'get-caller-identity')
     need(identity['Account'] == '452630323510', 'staging account required')
+    if context.NAMESPACE == 'prd':
+        response = aws('cloudformation', 'describe-stacks', '--stack-name', 'ezil-os-prod-host')
+        need(not response.get('NextToken'), 'production app stack readback incomplete')
+        stacks = response['Stacks']
+        need(len(stacks) == 1 and stacks[0]['StackStatus'] in ('CREATE_COMPLETE', 'UPDATE_COMPLETE', 'UPDATE_ROLLBACK_COMPLETE'),
+             'production app stack is not stable')
+        outputs = [o['OutputValue'] for o in stacks[0].get('Outputs', []) if o['OutputKey'] == 'InstanceId']
+        need(len(outputs) == 1 and manifest.matches(r'i-[0-9a-f]{17}', outputs[0]) and
+             outputs[0] not in ('i-09012068d96166828', 'i-014810524754b9ed0'), 'production app host output mismatch')
+        need(HOST is None or HOST == outputs[0], 'production app host changed during operation')
+        HOST = outputs[0]
     response = aws('ec2', 'describe-instances', '--instance-ids', HOST)
     instances = [i for r in response['Reservations'] for i in r['Instances']]
     need(not response.get('NextToken') and len(instances) == 1, 'incomplete staging host readback')
     host = instances[0]
     tags = {t['Key']: t['Value'] for t in host.get('Tags', [])}
-    need(host['InstanceId'] == HOST and host['State']['Name'] == 'running' and
-         tags.get('ezil:purpose') == 'os-staging' and tags.get('ezil:env') == 'billing-staging' and
-         'prod' not in tags.get('Name', '').lower(), 'staging host identity mismatch')
+    need(host['InstanceId'] == HOST and host['State']['Name'] == 'running', 'app host identity mismatch')
+    if context.NAMESPACE == 'prd':
+        need(host.get('VpcId') == 'vpc-040bdd6e09e35425f' and tags.get('Name') == 'ezil-os-prod-host' and
+             tags.get('ezil:purpose') == 'os' and tags.get('ezil:env') == 'production', 'production host identity mismatch')
+        arn = host.get('IamInstanceProfile', {}).get('Arn', '')
+        need(manifest.matches(r'arn:aws:iam::452630323510:instance-profile/ezil-os-prod-host-[A-Za-z0-9-]+', arn),
+             'production host profile mismatch')
+        profile = aws('iam', 'get-instance-profile', '--instance-profile-name', arn.rsplit('/', 1)[1])['InstanceProfile']
+        need(profile['Arn'] == arn and [r['Arn'] for r in profile['Roles']] ==
+             ['arn:aws:iam::452630323510:role/ezil-os-prod-host-InstanceRole-uJIGAhHeIYOr'], 'production host role mismatch')
+    else:
+        need(tags.get('ezil:purpose') == 'os-staging' and tags.get('ezil:env') == 'billing-staging' and
+             'prod' not in tags.get('Name', '').lower(), 'staging host identity mismatch')
 
 
 def submitted_command(state, aws):
@@ -45,6 +76,7 @@ def generation_terminal(directory, generation, aws):
     Only an uploading journal with no current ID proves no send was attempted.
     Local complete/failed labels are not evidence of remote terminal status.
     """
+    if context.NAMESPACE == 'prd': host_identity(aws)
     terminal = ('Success', 'Failed', 'Cancelled', 'TimedOut')
     try:
         for path in sorted(Path(directory).glob('*-ssm.json')):
@@ -85,6 +117,7 @@ def run(directory, operation, body, apply, aws, write, sleep=time.sleep, fresh=F
     re-arms a failed journal: a new submission needs a new plan generation. stdout must be one JSON object;
     provider errors/stdout are never echoed to an operator on failure.
     """
+    context.path(directory)
     host_identity(aws)
     content = body.encode('utf-8')
     sha = hashlib.sha256(content).hexdigest()
@@ -96,7 +129,7 @@ def run(directory, operation, body, apply, aws, write, sleep=time.sleep, fresh=F
     if state:
         need(all(state.get(k) == v for k, v in expected.items()), 'SSM journal input drift')
     if not apply:
-        print('DRY RUN: verified staging host; ' + operation + ' via SSM/S3; no submission')
+        print('DRY RUN: verified ' + context.NAMESPACE + ' host; ' + operation + ' via SSM/S3; no submission')
         return None
     if state is None:
         state = {**expected, 'status': 'uploading', 'commandId': None, 'comment': comment, 'attempts': []}
