@@ -1,3 +1,5 @@
+import { ensureStandaloneCliRuntime, STANDALONE_CLI_CANDIDATE } from './repo-open-runtime';
+
 /**
  * `POST /sandbox/:name/repo-open` — put one project repository into a RUNNING
  * Cloudflare computer, at `<workspace root>/projects/<repositoryId>/repository`,
@@ -135,8 +137,8 @@
  * into one of the codes below and prints a single result line.
  */
 
-/** Largest request body the route reads (the contract body is well under 1 KiB). */
-export const REPO_OPEN_MAX_BODY_BYTES = 8 * 1024;
+/** Largest signed request body the route reads, allowing the CLI v2 packet's bounded credential. */
+export const REPO_OPEN_MAX_BODY_BYTES = 20 * 1024;
 /** The environment variable that carries the token into the container for this one command. */
 export const REPO_OPEN_TOKEN_ENV = 'EZIL_REPO_OPEN_TOKEN';
 /** Universe (and EZiL Git) issue every Git grant to this user name (`ProjectRepositories::GIT_USERNAME`). */
@@ -263,6 +265,9 @@ const REF = /^refs\/heads\/[A-Za-z0-9._/-]+$/;
  * can break neither an HTTP header nor a credential-helper line.
  */
 const GIT_TOKEN = /^[\x21-\x7e]{1,4096}$/;
+/** The public CLI's private v2 credential alphabet and bound; no legacy prefix is assumed. */
+const PRIVATE_GIT_TOKEN = /^[A-Za-z0-9._~+\/=\-?]{16,8192}$/;
+const PRIVATE_ID = /^[^\s\x00-\x1f\x7f]{1,255}$/u;
 const ISO_DATETIME = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 const HEAD = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 
@@ -282,10 +287,19 @@ export interface RepoOpenRequest {
   expiresAt: string;
   /** The grant's scope when the caller sent it (`git.scope`): an EZiL Git open then installs push access (`./repo-grant.ts`). */
   scope?: 'read' | 'write';
+  /** Standalone EZiL Git authorization, kept separate from the deterministic OS checkout folder ID. */
+  privatePacket?: PrivateGitPacket;
   /** Chosen from the URL's host by `parseRepoOpenRequest`, never by the caller. */
   auth: RepoOpenAuth;
   /** The whole open's bound, ms: the caller's `timeoutMs`, or `REPO_OPEN_EXEC_TIMEOUT_MS`. */
   timeoutMs: number;
+}
+
+export interface PrivateGitPacket {
+  version: 2;
+  repository: { id: string; canonicalURL: string; ref: string };
+  identity: { issuer: 'https://id.ezil.work/'; subject: string };
+  git: { username: 'ezil'; token: string; expiresAt: string; scope: 'read' | 'write' };
 }
 
 /** Where repositories go, as `handleRepoOpen` resolved it from the Worker's workspace settings. */
@@ -361,6 +375,40 @@ export function parseRepoOpenRequest(
 ): { ok: true; request: RepoOpenRequest } | { ok: false; error: 'repo_open_invalid_request' | 'repo_open_token_expired' } {
   const invalid = { ok: false as const, error: 'repo_open_invalid_request' as const };
   if (!isPlainObject(body)) return invalid;
+  if (Object.hasOwn(body, 'privatePacket')) {
+    if (Object.keys(body).filter(k => k !== 'timeoutMs').sort().join(',') !== 'privatePacket,repositoryId'
+      || typeof body.repositoryId !== 'string' || !UUID.test(body.repositoryId)
+      || !isPlainObject(body.privatePacket)) return invalid;
+    const packet = body.privatePacket;
+    if (Object.keys(packet).sort().join(',') !== 'git,identity,repository,version' || packet.version !== 2
+      || !isPlainObject(packet.repository) || Object.keys(packet.repository).sort().join(',') !== 'canonicalURL,id,ref'
+      || typeof packet.repository.id !== 'string' || !/^[a-z0-9]{1,64}$/.test(packet.repository.id)
+      || !EZIL_GIT_REPOSITORY_URL.test(packet.repository.canonicalURL as string)
+      || (packet.repository.canonicalURL as string).endsWith('.git.git')
+      || branchOf(packet.repository.ref) === null
+      || !isPlainObject(packet.identity) || Object.keys(packet.identity).sort().join(',') !== 'issuer,subject'
+      || packet.identity.issuer !== 'https://id.ezil.work/'
+      || typeof packet.identity.subject !== 'string' || !PRIVATE_ID.test(packet.identity.subject)
+      || !isPlainObject(packet.git) || Object.keys(packet.git).sort().join(',') !== 'expiresAt,scope,token,username'
+      || packet.git.username !== REPO_OPEN_GIT_USERNAME || (packet.git.scope !== 'read' && packet.git.scope !== 'write')
+      || typeof packet.git.token !== 'string' || !PRIVATE_GIT_TOKEN.test(packet.git.token)
+      || typeof packet.git.expiresAt !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(packet.git.expiresAt)) return invalid;
+    const timeoutMs = Object.hasOwn(body, 'timeoutMs') ? body.timeoutMs : REPO_OPEN_EXEC_TIMEOUT_MS;
+    if (typeof timeoutMs !== 'number' || !Number.isInteger(timeoutMs)
+      || timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS || timeoutMs > REPO_OPEN_EXEC_TIMEOUT_MS) return invalid;
+    const expiry = Date.parse(packet.git.expiresAt);
+    if (!Number.isFinite(expiry) || expiry > now + 300_000) return invalid;
+    if (expiry - now < Math.max(REPO_OPEN_MIN_TOKEN_LIFETIME_MS, timeoutMs + 5_000)) {
+      return { ok: false, error: 'repo_open_token_expired' };
+    }
+    return { ok: true, request: {
+      repositoryId: body.repositoryId, canonicalURL: packet.repository.canonicalURL as string,
+      ref: packet.repository.ref as string, branch: branchOf(packet.repository.ref)!,
+      token: packet.git.token as string, expiresAt: packet.git.expiresAt as string,
+      scope: packet.git.scope as 'read' | 'write', auth: 'basic', timeoutMs,
+      privatePacket: packet as unknown as PrivateGitPacket,
+    } };
+  }
   const keys = Object.keys(body).filter((k) => k !== 'timeoutMs').sort().join(',');
   const { repositoryId, canonicalURL, ref, git } = body;
   const auth = repoOpenAuthFor(canonicalURL, remotes);
@@ -674,6 +722,17 @@ export function repoOpenCommand(params: {
   return `(t=$${REPO_OPEN_TOKEN_ENV}; unset ${REPO_OPEN_TOKEN_ENV}; exec ${script} 3<<<"$t")`;
 }
 
+/** The supervisor receives the validated v2 packet on fd 3, with no secret in argv. */
+export const REPO_OPEN_CLI_PACKET_ENV = 'EZIL_REPO_OPEN_CLI_PACKET';
+export function repoOpenCliCommand(request: RepoOpenRequest, root: RepoOpenRoot): { command: string; packet: string } {
+  if (!request.privatePacket || !EZIL_GIT_REPOSITORY_URL.test(request.canonicalURL)) throw new Error('invalid standalone CLI open');
+  const args = [String(request.timeoutMs - 5_000), '3000', '--repo-open', shq(root.path), shq(request.repositoryId),
+    shq(request.canonicalURL), root.requireHydrated ? '1' : '0', STANDALONE_CLI_CANDIDATE.cliSha256,
+    STANDALONE_CLI_CANDIDATE.version];
+  return { command: `(p=$${REPO_OPEN_CLI_PACKET_ENV}; unset ${REPO_OPEN_CLI_PACKET_ENV}; exec python3 -I /run/ezil/bin/supervise.py ${args.join(' ')} 3<<<"$p")`,
+    packet: JSON.stringify(request.privatePacket) };
+}
+
 /** The script's result line (the last `ezil-repo-open:` line), or null when there is none or it is malformed. */
 export function parseRepoOpenOutput(
   stdout: string,
@@ -687,6 +746,29 @@ export function parseRepoOpenOutput(
   if (ok) return HEAD.test(ok[2]!) ? { ok: true, status: ok[1] as RepoOpenStatus, head: ok[2]! } : null;
   const error = /^ezil-repo-open:error:([a-z_]+)$/.exec(line)?.[1];
   return error && (REPO_OPEN_ERRORS as readonly string[]).includes(error) ? { ok: false, error: error as RepoOpenError } : null;
+}
+
+/** A CLI answer may open only the checkout beneath the safe Code wrapper. */
+export function parsePrivateCliOutput(stdout: string, request: RepoOpenRequest, root: RepoOpenRoot): RepoOpenAnswer | null {
+  const packet = request.privatePacket;
+  if (!packet) return null;
+  const prepared = parseRepoOpenOutput(stdout);
+  if (prepared && !prepared.ok) return prepared;
+  let value: unknown;
+  try { value = JSON.parse(stdout); } catch { return null; }
+  if (!isPlainObject(value) || Object.keys(value).sort().join(',') !== 'canonicalUrl,folder,identity,repository,status'
+    || value.canonicalUrl !== request.canonicalURL || !isPlainObject(value.identity)
+    || Object.keys(value.identity).sort().join(',') !== 'issuer,subject'
+    || value.identity.issuer !== packet.identity.issuer
+    || value.identity.subject !== packet.identity.subject
+    || !isPlainObject(value.repository) || Object.keys(value.repository).sort().join(',') !== 'canonicalURL,id,ref'
+    || value.repository.id !== packet.repository.id
+    || value.repository.canonicalURL !== packet.repository.canonicalURL
+    || value.repository.ref !== packet.repository.ref
+    || (value.status !== 'cloned' && value.status !== 'reused')) return null;
+  const folder = `${root.path}/projects/${request.repositoryId}`;
+  if (value.folder !== `${folder}/${REPO_OPEN_NESTED_DIR}`) return null;
+  return { ok: true, folder, status: value.status === 'reused' ? 'fetched' : 'cloned' };
 }
 
 export type RepoOpenExec = (
@@ -725,16 +807,32 @@ export function ownSessionExec(
  * Run one open on a computer known to be running. Only `stdout`'s result line
  * is read; `stderr` is never read, logged or returned.
  */
-export async function runRepoOpen(exec: RepoOpenExec, request: RepoOpenRequest, root: RepoOpenRoot): Promise<RepoOpenAnswer> {
-  const command = repoOpenCommand({
-    root: root.path, repositoryId: request.repositoryId, url: request.canonicalURL,
-    branch: request.branch, requireHydrated: root.requireHydrated, auth: request.auth, timeoutMs: request.timeoutMs,
+export async function runRepoOpen(
+  exec: RepoOpenExec, request: RepoOpenRequest, root: RepoOpenRoot,
+  ensureCli: (exec: RepoOpenExec) => Promise<boolean> = ensureStandaloneCliRuntime,
+  now: () => number = Date.now,
+): Promise<RepoOpenAnswer> {
+  let boundedRequest = request;
+  if (request.privatePacket) {
+    const startedAt = now();
+    if (!(await ensureCli(exec))) return { ok: false, error: 'repo_open_git_missing' };
+    const remaining = request.timeoutMs - Math.max(0, now() - startedAt) - 1_000;
+    if (remaining < REPO_OPEN_MIN_TIMEOUT_MS) return { ok: false, error: 'repo_open_timeout' };
+    if (Date.parse(request.expiresAt) - now() < remaining + 5_000) {
+      return { ok: false, error: 'repo_open_token_expired' };
+    }
+    boundedRequest = { ...request, timeoutMs: remaining };
+  }
+  const cli = boundedRequest.privatePacket ? repoOpenCliCommand(boundedRequest, root) : null;
+  const command = cli?.command ?? repoOpenCommand({
+    root: root.path, repositoryId: boundedRequest.repositoryId, url: boundedRequest.canonicalURL,
+    branch: boundedRequest.branch, requireHydrated: root.requireHydrated, auth: boundedRequest.auth, timeoutMs: boundedRequest.timeoutMs,
   });
   let stdout: string;
   try {
     const result = await exec(command, {
-      env: { [REPO_OPEN_TOKEN_ENV]: request.token },
-      timeout: Math.min(Math.max(request.timeoutMs, REPO_OPEN_MIN_TIMEOUT_MS), REPO_OPEN_EXEC_TIMEOUT_MS),
+      env: cli ? { [REPO_OPEN_CLI_PACKET_ENV]: cli.packet } : { [REPO_OPEN_TOKEN_ENV]: request.token },
+      timeout: Math.min(Math.max(boundedRequest.timeoutMs, REPO_OPEN_MIN_TIMEOUT_MS), REPO_OPEN_EXEC_TIMEOUT_MS),
       origin: 'internal',
     });
     stdout = result.exitCode === 0 ? result.stdout ?? '' : '';
@@ -744,6 +842,7 @@ export async function runRepoOpen(exec: RepoOpenExec, request: RepoOpenRequest, 
   // Belt and braces: the script never prints the token, and nothing that
   // contains it is ever parsed. (An anonymous open has none: '' is in every string.)
   if (request.token !== '' && stdout.includes(request.token)) return { ok: false, error: 'repo_open_failed' };
+  if (cli) return parsePrivateCliOutput(stdout, request, root) ?? { ok: false, error: 'repo_open_failed' };
   const parsed = parseRepoOpenOutput(stdout);
   if (!parsed) return { ok: false, error: 'repo_open_failed' };
   if (!parsed.ok) return parsed;

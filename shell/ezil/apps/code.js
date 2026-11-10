@@ -170,8 +170,8 @@ export const LEAVING_SETTLE_MS = 3_000;
 const PROJECT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /**
  * sessionStorage: the silent EZiL ID refresh this tab last made for a project,
- * `{projectId, repoId, at}`. Present (and younger than the TTL) for the same
- * project means the refresh already happened and did not help.
+ * `{projectId, repoId, at}` or `{repoUrl, at}`. Present (and younger than the TTL)
+ * for the same repository means the refresh already happened and did not help.
  */
 export const IDENTITY_REFRESH_KEY = 'ezil-os:code.identity-refresh';
 const IDENTITY_REFRESH_TTL_MS = 10 * 60_000;
@@ -321,17 +321,17 @@ function projectReturnUrl (project) {
  * the relative `returnUrl` the login route accepts.
  */
 function refreshIdentityOnce (project) {
-    // A repository opened from its address asks for no EZiL ID (nothing is granted for it): never leave the tab for one.
-    if ( project.repoUrl ) return false;
     try {
         const seen = JSON.parse(sessionStorage.getItem(IDENTITY_REFRESH_KEY) ?? 'null');
-        if ( seen && seen.projectId === project.projectId && seen.repoId === project.repoId
+        if ( seen && (project.repoUrl ? seen.repoUrl === project.repoUrl : seen.projectId === project.projectId && seen.repoId === project.repoId)
              && Date.now() - seen.at < IDENTITY_REFRESH_TTL_MS ) return false;
     } catch ( err ) {
         if ( ! (err instanceof SyntaxError) ) return false;
     }
     try {
-        sessionStorage.setItem(IDENTITY_REFRESH_KEY, JSON.stringify({ projectId: project.projectId, repoId: project.repoId, at: Date.now() }));
+        sessionStorage.setItem(IDENTITY_REFRESH_KEY, JSON.stringify(project.repoUrl
+            ? { repoUrl: project.repoUrl, at: Date.now() }
+            : { projectId: project.projectId, repoId: project.repoId, at: Date.now() }));
     } catch {
         return false;
     }

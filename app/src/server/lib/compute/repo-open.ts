@@ -20,6 +20,7 @@ import { CORRELATION_HEADER } from '../cloudflare-guacamole-provider';
 import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER } from './preview-token-v2';
 import type { ControlTarget } from './aws-control-auth';
 import type { ComputerRef } from './provider';
+import type { PrivateGitPacket } from '@/server/git/private-packet';
 
 export interface RepoOpenRequest {
     repositoryId: string;
@@ -30,6 +31,8 @@ export interface RepoOpenRequest {
      * `null`: an anonymous open of a public github.com repository (a direct repository URL): no grant is sent at all.
      */
     git: { token: string; expiresAt: string; scope?: 'read' | 'write' } | null;
+    /** Standalone EZiL Git CLI v2 authorization. Its repository.id is the provider ID, not repositoryId. */
+    privatePacket?: PrivateGitPacket;
     /** The Worker's whole bound for this open, ms (`worker/src/repo-open.ts` REPO_OPEN_MIN/EXEC_TIMEOUT_MS). */
     timeoutMs: number;
 }
@@ -80,14 +83,19 @@ export async function requestRepoOpen(
     if (!Number.isInteger(request.timeoutMs) || request.timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS || request.timeoutMs > REPO_OPEN_MAX_TIMEOUT_MS) {
         return failed(null, 'timeout_out_of_range');
     }
+    if (request.privatePacket && (request.privatePacket.repository.canonicalURL !== request.canonicalURL
+        || request.privatePacket.repository.ref !== request.ref || request.privatePacket.git.token !== request.git?.token
+        || request.privatePacket.git.expiresAt !== request.git.expiresAt)) return failed(null, 'packet_mismatch');
     try {
         const endpoint = new URL(`/sandbox/${encodeURIComponent(target.sandboxName)}/repo-open`, workerUrl);
         // Fixed key order: the Worker re-reads exactly these fields from exactly this string.
-        const body = JSON.stringify({
-            repositoryId: request.repositoryId, canonicalURL: request.canonicalURL, ref: request.ref,
-            ...(request.git ? { git: { token: request.git.token, expiresAt: request.git.expiresAt, ...(request.git.scope ? { scope: request.git.scope } : {}) } } : {}),
-            timeoutMs: request.timeoutMs,
-        });
+        const body = request.privatePacket
+            ? JSON.stringify({ repositoryId: request.repositoryId, privatePacket: request.privatePacket, timeoutMs: request.timeoutMs })
+            : JSON.stringify({
+                repositoryId: request.repositoryId, canonicalURL: request.canonicalURL, ref: request.ref,
+                ...(request.git ? { git: { token: request.git.token, expiresAt: request.git.expiresAt, ...(request.git.scope ? { scope: request.git.scope } : {}) } } : {}),
+                timeoutMs: request.timeoutMs,
+            });
         // A Cloudflare computer's v2 claims, as `compute/cloudflare.ts` `authOf` mints them: no generation or lease,
         // and no store claim.
         const claims = target.auth.kind === 'v2' ? target.auth.claims : {
