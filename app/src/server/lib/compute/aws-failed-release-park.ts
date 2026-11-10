@@ -7,7 +7,8 @@ import { boundedTime, executionMatches, executionWork, matchesPoolReleaseRecover
 import type { RebaseSnapshotDescriber } from './aws-rebase-evidence';
 import { isPoolMode, lifecycleExecutionArn, LifecycleReceiptSchema, startLifecycleJob, USAGE_OBSERVER,
     type LifecycleExecutionReader, type ReceiptDeps } from './aws-receipts';
-import { assertNoImageReservation, readCanaryComputer, readPlacement, writeLivePoolRecovery, writeParkedStopReservation, type Placement } from './placement';
+import { assertNoImageReservation, readCanaryComputer, readPlacement, writeLivePoolRecovery, writeParkedStopReservation,
+    type Placement, type PlacementExecutor } from './placement';
 import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
 
 /**
@@ -181,6 +182,38 @@ export async function reserveParkedStop(deps: ParkDeps, deployments: ParkDeploym
         lastError: POOL_PARK_RECOVERY_PREFIX + JSON.stringify({ ...doc, error: 'start_' + outcome }),
     });
     return { outcome: 'reserved', error: null };
+}
+
+/**
+ * The lifecycle authority route's answer for a parked failed release (the workflow's observer calls back with the stop job's id, digest and
+ * lease epoch before it acts). The ONLY RECOVERING shape it ever authorizes besides the existing release replay: a row carrying its own
+ * prefix whose SAVED document is a strictly valid, ordinary `stop` of exactly this placement's current tuple, in a pool deployment, with
+ * a NEW job and digest (never the failed release's), a well-formed proof binding (source execution of the current state machine,
+ * snapshot id, authoritative stop time), an existing non-deleted computer of the same owner, and no image reservation. DB-only: it reads
+ * no AWS state and never loosens the ordinary guards.
+ */
+export async function authorizeParkedStop(db: PlacementExecutor, p: Placement): Promise<boolean> {
+    const saved = parkReplay(p);
+    if (p.state !== 'RECOVERING' || p.provider !== 'aws-ec2' || !saved) return false;
+    let work: LifecycleWork;
+    try { work = buildLifecycleWork(saved.intent); } catch { return false; }
+    const i = work.intent;
+    if (i.operation !== 'stop' || !isPoolMode(i.deployment) || !matchesPoolReleaseRecovery(p, work)) return false;
+    // An ordinary current-generation stop carries no previous-generation fields and no user data.
+    if (i.userData !== null || i.previousGeneration !== null || i.previousInstanceId !== null || i.previousFenceToken !== null) return false;
+    // The proof binding: a different, earlier job; its execution under this deployment's state machine; a backup id; consistent times.
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+    if (!uuid.test(saved.sourceJobId) || saved.sourceJobId === i.jobId || !/^[a-f0-9]{64}$/.test(saved.sourceDigest) || saved.sourceDigest === work.digest) return false;
+    if (saved.sourceExecutionArn !== lifecycleExecutionArn(i.deployment, saved.sourceJobId)) return false;
+    const machine = (arn: string) => arn.slice(0, arn.lastIndexOf(':'));
+    if (machine(saved.sourceStateMachineVersionArn) !== machine(i.deployment.stateMachineVersionArn)) return false;
+    if (!/^snap-[0-9a-f]{8,17}$/.test(saved.snapshotId)) return false;
+    const [started, stopped, hostStopped] = [saved.sourceStartedAt, saved.sourceStoppedAt, saved.hostStoppedAt].map(v => Date.parse(v));
+    if (![started, stopped, hostStopped].every(Number.isFinite) || started! > stopped! || started! > hostStopped!) return false;
+    const computer = await readCanaryComputer(db, p.computerId);
+    if (!computer || computer.deleted || computer.userId !== p.ownerUserId) return false;
+    await assertNoImageReservation(db, p.computerId); // throws ImageJobConflictError: the route refuses
+    return true;
 }
 
 /** Receipt-pass handler for a RECOVERING row that carries a park document. Returns true when it owns the row. */

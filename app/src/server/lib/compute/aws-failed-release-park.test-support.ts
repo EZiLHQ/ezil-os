@@ -35,6 +35,7 @@ export function parkSetup() {
             state: 'stopped', ...over }) });
         return execution;
     };
-    return { ...s, i, deps, snapshot, describeSnapshot, request, reserve, settle, finishStop };
+    const hostTags = s.host.tags as Record<string, string>; // the fixture's tag map, mutable for the tests
+    return { ...s, i, deps, snapshot, describeSnapshot, request, reserve, settle, finishStop, hostTags };
 }
 export type Setup = ReturnType<typeof parkSetup>;

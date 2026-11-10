@@ -1,6 +1,7 @@
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { D, NOW } from './aws-failed-release.test-support';
+import type { LifecycleDeployment } from './aws-intent';
 import { HOST_STOPPED, parkSetup, SNAP, STOP_JOB, type Setup } from './aws-failed-release-park.test-support';
 import { PARKED_FAILED_RELEASE, parkReplay, POOL_PARK_RECOVERY_PREFIX, reconcileParkedStop, reserveParkedStop,
     type ParkDeps, type ParkFailedReleaseRequest } from './aws-failed-release-park';
@@ -60,17 +61,17 @@ describe('park a failed release: reservation', () => {
         ['host running', 'instance_identity', s => { s.host.state = 'running'; }],
         ['host of another type', 'instance_identity', s => { s.host.instanceType = 'c7i.large'; }],
         ['host in another zone', 'instance_identity', s => { s.host.availabilityZoneId = 'aps1-az2'; }],
-        ['host pool marker', 'instance_identity', s => { s.host.tags['ezil:pool'] = '1'; }],
-        ['host alias disagreeing', 'instance_identity', s => { s.host.tags['ezil:fence'] = 'someone-else'; }],
-        ['host carrying a legacy fence alias that AGREES (adopted/claimed shape)', 'instance_identity', s => { s.host.tags['ezil:fence'] = s.i.fenceToken; }],
-        ['host carrying the legacy computer alias', 'instance_identity', s => { s.host.tags['ezil:computer'] = s.i.computerId; }],
+        ['host pool marker', 'instance_identity', s => { s.hostTags['ezil:pool'] = '1'; }],
+        ['host alias disagreeing', 'instance_identity', s => { s.hostTags['ezil:fence'] = 'someone-else'; }],
+        ['host carrying a legacy fence alias that AGREES (adopted/claimed shape)', 'instance_identity', s => { s.hostTags['ezil:fence'] = s.i.fenceToken; }],
+        ['host carrying the legacy computer alias', 'instance_identity', s => { s.hostTags['ezil:computer'] = s.i.computerId; }],
         ['legacy-only host (no canonical computer-id/fence-token)', 'instance_identity', s => {
-            delete s.host.tags['ezil:computer-id']; delete s.host.tags['ezil:fence-token'];
-            s.host.tags['ezil:computer'] = s.i.computerId; s.host.tags['ezil:fence'] = s.i.fenceToken; }],
-        ['host with the pool-host marker', 'instance_identity', s => { s.host.tags['ezil:pool-host'] = 'ph-1'; }],
-        ['host of another generation', 'instance_identity', s => { s.host.tags['ezil:generation'] = '2'; }],
-        ['host with a third disk', 'instance_disks', s => { (s.host.volumes as unknown[]).push({ deviceName: '/dev/sdg', volumeId: 'vol-0bbbbbbbbbbbbbbbb', deleteOnTermination: false }); }],
-        ['data disk deleted on termination', 'instance_disks', s => { (s.host.volumes as { deleteOnTermination: boolean }[])[1]!.deleteOnTermination = true; }],
+            delete s.hostTags['ezil:computer-id']; delete s.hostTags['ezil:fence-token'];
+            s.hostTags['ezil:computer'] = s.i.computerId; s.hostTags['ezil:fence'] = s.i.fenceToken; }],
+        ['host with the pool-host marker', 'instance_identity', s => { s.hostTags['ezil:pool-host'] = 'ph-1'; }],
+        ['host of another generation', 'instance_identity', s => { s.hostTags['ezil:generation'] = '2'; }],
+        ['host with a third disk', 'instance_disks', s => { (s.host.volumes as unknown as unknown[]).push({ deviceName: '/dev/sdg', volumeId: 'vol-0bbbbbbbbbbbbbbbb', deleteOnTermination: false }); }],
+        ['data disk deleted on termination', 'instance_disks', s => { (s.host.volumes as unknown as { deleteOnTermination: boolean }[])[1]!.deleteOnTermination = true; }],
         ['stop time unknown', 'stop_time_unknown', s => { s.host.stateTransitionAt = null; }],
         ['volume detached', 'volume_attachment', s => { Object.assign(s.volume, { state: 'available', attachments: [] }); }],
         ['volume attached to another host', 'volume_attachment', s => { Object.assign(s.volume, { attachments: [{ instanceId: 'i-0ffffffffffffffff', state: 'attached' }] }); }],
@@ -201,7 +202,7 @@ describe('park a failed release: settlement', () => {
         ['stop job failed', 'execution_failed', s => { s.finishStop().status = 'FAILED'; }],
         ['host started and stopped again after the reservation', 'host_changed', s => { s.finishStop(); s.host.stateTransitionAt = new Date(HOST_STOPPED.getTime() + 300_000); }], // 15:25: still before the snapshot, but not the proven stop
         ['host running again', 'instance_identity', s => { s.finishStop(); s.host.state = 'running'; }],
-        ['host re-tagged with a legacy alias after the reservation', 'instance_identity', s => { s.finishStop(); s.host.tags['ezil:fence'] = s.i.fenceToken; }],
+        ['host re-tagged with a legacy alias after the reservation', 'instance_identity', s => { s.finishStop(); s.hostTags['ezil:fence'] = s.i.fenceToken; }],
         ['placement lease taken again after the reservation', 'writer_lease_active', s => { s.finishStop(); s.placements[0]!.lease_until = new Date(NOW.getTime() + 60_000); }],
         ['volume detached', 'volume_attachment', s => { s.finishStop(); Object.assign(s.volume, { state: 'available', attachments: [] }); }],
         ['snapshot no longer completed', 'snapshot_not_proven', s => { s.finishStop(); s.snapshot.state = 'error'; }],
@@ -326,14 +327,14 @@ describe('park a failed release: versions, authority and durable retry', () => {
         ['another zone', { zoneId: 'aps1-az2' }],
     ])('refuses a current deployment of %s: the authority must be the failed release\'s', async (_name, over) => {
         const s = parkSetup();
-        const outcome = await reserveParkedStop(s.deps, { [D.region]: { ...d36, ...over } }, s.request);
+        const outcome = await reserveParkedStop(s.deps, { [D.region]: { ...d36, ...over } as LifecycleDeployment }, s.request);
         expect(outcome.outcome).toBe('refused');
         await untouched(s);
     });
 
     it('refuses a current deployment with another root-device authority (deployment_identity)', async () => {
         const s = parkSetup();
-        const other = { ...d36, storage: { ...d36.storage, rootDeviceName: '/dev/xvda' } };
+        const other = { ...d36, storage: { ...d36.storage, rootDeviceName: '/dev/xvda' as const } };
         expect(await reserveParkedStop(s.deps, { [D.region]: other }, s.request)).toEqual({ outcome: 'refused', error: 'deployment_identity' });
         await untouched(s);
     });
