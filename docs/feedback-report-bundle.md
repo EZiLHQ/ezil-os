@@ -1,19 +1,30 @@
 # Feedback report bundle
 
-Settings → Feedback now requires bug summary, activity, reproduction steps, expected
-and actual results, reproducibility and impact. Ideas/Other remain a single description.
-Sections become readable headings in the existing description column (4,000 combined
-UTF-16 code units, including headings). The form never truncates sections. Existing
-free-text API clients remain valid. No migration or new dependency is required.
+Founder request, 2026-11-10: the form is ONE optional description and Send feedback.
+No category picker and no required question (the earlier required bug questionnaire is
+removed). The category is sent as `bug` because the wire schema still requires one; a
+blank description is a valid report (`description` is `0..4000` after trimming).
+Drafts saved by the earlier questionnaire are folded into the one description, whole:
+the form never truncates, and an over-long migrated draft asks the person to shorten it.
+Existing free-text API clients remain valid. No migration or new dependency is required.
 
 ## Screenshots
 
-Consent starts OFF. Attach a static PNG/JPEG/WebP from any supported device, including
+Selected by default (when the boot payload enables screenshots), switchable off, and
+nothing uploads until Send. Opening the form starts a best-effort capture of the masked
+EZiL OS window only (the existing `capture_shell_snapshot`: no picker, no browser/OS
+permission, no other application). It is encoded within the existing limits and attached
+without the editor; any failure, timeout (10 s) or oversize result leaves the report as
+it is and never blocks Send, including a blank one. Send waits up to 3 s for a capture
+still running, then freezes the body: a late capture is discarded so it cannot change the
+body or mint a second `clientRequestId`. Tab and desktop capture remain manual
+(they need the browser picker). Attach a static PNG/JPEG/WebP from any supported device, including
 phones, or use the existing capture options. Imported files remain local: MIME/magic,
 8 MiB source size and 4096px side bounds are checked before decoding, then checked again.
 Animated WebP is refused. The canvas is scaled to a 1920px long edge.
 
-Every import/capture enters the crop/redaction editor. Fresh flattened WebP/JPEG output
+Every manual import/capture enters the crop/redaction editor; the default capture is
+already masked and "Edit / crop / redact" stays one click away. Fresh flattened WebP/JPEG output
 bakes the crop and black boxes into pixels; original filenames/metadata are not sent.
 Users can preview, re-edit or remove it. Cancellation discards late decodes, releases
 object URLs/bitmaps and stops media tracks. Shell capture masks private fields and
@@ -32,8 +43,10 @@ so valid base64 envelopes fit; other routes keep 2 MB.
 
 ## Diagnostics and compatibility
 
-Consent starts OFF. Checking it freezes the snapshot; Refresh diagnostic snapshot
-explicitly replaces it. The preview is the initial request body. Contents are bounded:
+Selected by default (switchable off). The snapshot is taken when the form opens and is
+frozen; Refresh diagnostic snapshot explicitly replaces it. A snapshot that cannot be
+built, or is over the 32 KiB metadata cap, is left out rather than blocking Send. The
+preview (rendered while it is open) is the exact request body. Contents are bounded:
 browser/OS/version/device/viewport/fullscreen, capture time/page age, online/visibility,
 coarse network/data-saver state, at most 50 recent machine-coded events with ages,
 and at most 24 current/latest app-open phases. Trace ID, built-in app identity and
@@ -56,7 +69,8 @@ image and request ID remain. The open preview and outbox adopt the downgraded bo
 
 ## Delivery and triage
 
-Account-scoped drafts retain all bug fields, never screenshot/consent. Submitted bodies
+Account-scoped drafts retain the description only, never the screenshot or attachment
+choices (every form starts from the defaults). Submitted bodies
 enter a ten-report retry outbox with stable IDs. New reports never evict pending ones.
 Queue/quota failure retains text and truthfully explains automatic retry was not saved.
 Editing an unconfirmed report forks its ID before a delayed prior receipt can hide edits.

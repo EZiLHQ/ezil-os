@@ -260,13 +260,14 @@ try {
     globalThis.fetch = async (url, opts) => { assert.equal(url, '/feedback'); calls.push(opts.body); return respond(); };
     const current = () => document.querySelector('dialog');
     const form = () => current().querySelector('form');
-    const body = () => current().querySelector('pre').textContent;
+    // The preview renders only while it is open.
+    const body = () => { const box = current().querySelector('.ezil-feedback-preview'); if (!box.open) { box.open = true; box.dispatchEvent(new window.Event('toggle')); } return current().querySelector('pre').textContent; };
     const payload = () => JSON.parse(body());
     const line = () => current().querySelector('[data-role="app-failure-context"]');
     const change = checked => { form().elements.diagnostics.checked = checked; form().elements.diagnostics.dispatchEvent(new window.Event('change', { bubbles: true })); };
     const close = () => current().querySelector('[data-action="cancel"]').click();
     const open = appContext => { feedback.open_feedback_dialog({ source: 'settings', appContext });
-        form().elements.category.value = 'idea'; form().elements.description.value = 'Report';
+        form().elements.description.value = 'Report';
         form().elements.description.dispatchEvent(new window.Event('input', { bubbles: true })); };
     const send = () => form().dispatchEvent(new window.Event('submit', { cancelable: true, bubbles: true }));
     const until = async predicate => { for (let i = 0; i < 100 && !predicate(); i++) await new Promise(r => setTimeout(r, 0)); assert.ok(predicate()); };
@@ -274,11 +275,12 @@ try {
     const backgroundListeners = listeners.size;
     const a = frame(M); a.send(failure(101));
     const b = frame(M, { ...options, computerId: B, appSession: 'session-b' }); b.send(failure(201));
-    await check('dialog freezes current computer at open, consent snapshot and cancelled presentation', () => {
-        setCurrentComputer({ id: A }); open(); setCurrentComputer({ id: B });
-        assert.equal(payload().diagnostics, null); assert.equal(line().hidden, true);
+    await check('dialog freezes current computer at open, default snapshot and cancelled presentation', () => {
+        setCurrentComputer({ id: A });
         a.send(fixtures.valid.find(f => f.failure.category === 'cancellation').failure);
-        const count = calls.length; change(true);
+        const count = calls.length;
+        // Diagnostics are selected by default: the snapshot is taken when the form opens.
+        open(); setCurrentComputer({ id: B });
         assert.equal(payload().computerId, A);
         assert.deepEqual(payload().diagnostics.appFailures.map(f => f.eventId), [uuid(11), uuid(101)]);
         assert.equal(payload().diagnostics.appFailures[0].outcome, 'cancelled');

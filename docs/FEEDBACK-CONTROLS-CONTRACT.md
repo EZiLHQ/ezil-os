@@ -148,7 +148,7 @@ POST `/api/shell/feedback` (JSON; `Content-Type: application/json` required, par
 `charset` allowed — anything else is `415 {error:'unsupported_media_type'}` before the body is read,
 so a cross-site simple form cannot post a report on the lax session cookie):
 ```
-{ v: 1, clientRequestId: uuid, category: 'bug'|'idea'|'other', description: string 1..4000,
+{ v: 1, clientRequestId: uuid, category: 'bug'|'idea'|'other', description: string 0..4000 (trimmed; blank is valid, 2026-11-10),
   computerId?: uuid|null, diagnostics?: Diagnostics|null,
   screenshot?: { contentType: 'image/png'|'image/jpeg'|'image/webp', dataBase64: string } | null }
 Diagnostics (strict, every field optional):
@@ -184,7 +184,8 @@ schema tool only (see `docs/feedback-migration.md`); it is refused for `aws-prod
 Two `localStorage` keys per account, keyed by the opaque account id from
 `__EZIL_BOOT__.user.id` (never the email), never sent anywhere:
 - `ezil:feedback:draft:v1:<accountId>` — `{clientRequestId, category, description}` of the
-  unsent form, plus `bug: {activity, steps, expected, actual, reproducibility, impact}`.
+  unsent form. Drafts saved before 2026-11-10 may also carry `bug: {activity, steps, expected, actual,
+  reproducibility, impact}`; it is folded whole into the one description when read and never written again.
   Every structured field survives category changes and closing the dialog; removed when the form is emptied or a send with
   that id is confirmed (200/201). Consent boxes and screenshots are never remembered.
 - `ezil:feedback:outbox:v1:<accountId>` — at most 10 `{clientRequestId, body, draft}` entries (draft retains structured text): the
@@ -221,19 +222,19 @@ Two `localStorage` keys per account, keyed by the opaque account id from
 
 ## 5. Never collected
 `document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, `log.js` ring, headers,
-clipboard, keystrokes; no continuous recording. Consent checkboxes default OFF; preview shows the
+clipboard, keystrokes; no continuous recording. Attachment checkboxes (diagnostics; the masked window screenshot when enabled) default ON since 2026-11-10, can be switched off, and nothing uploads before Send; preview shows the
 exact JSON that is sent; nothing hits the network before Submit.
 
 
 ## 6. Founder-authorized report bundle and developer loop (2026-11-08)
 
 See [feedback-report-bundle.md](feedback-report-bundle.md) for the exact collection,
-flow, capability and handoff contract. Bugs require context, steps, expected and
-actual results, reproducibility and impact, formatted with headings in the existing
-4,000-character description. Ideas/Other remain one field. No migration.
+flow, capability and handoff contract. Amended 2026-11-10 (founder): the form is one
+optional description (category fixed to `bug`, no required question, blank is valid).
+No migration.
 
-Diagnostics consent stays OFF until selected. Selection freezes the snapshot;
-only the explicit Refresh action replaces it. No DOM text, form values, console
+Diagnostics are selected by default and can be switched off. The snapshot is taken
+when the form opens and frozen; only the explicit Refresh action replaces it. No DOM text, form values, console
 text or privileged device logs are read. The existing local event ring provides
 up to 50 event ages; a detached trace read provides up to 24 phases. Numeric fields
 are bounded to 0..1,000,000,000. At most ten events keep validated failure references;

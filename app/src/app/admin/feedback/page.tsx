@@ -53,7 +53,7 @@ export default async function FeedbackAdminPage({ searchParams }: {
                         <a href="/admin/feedback" className="underline">All reports</a>
                         <h2 className="font-mono text-sm">{report.id}</h2>
                         <p className="text-sm">{timestamp(report.createdAt)} · {report.category} · {report.status}</p>
-                        <p className="whitespace-pre-wrap break-words">{report.description}</p>
+                        <p className="whitespace-pre-wrap break-words">{report.description || '(No description)'}</p>
                         <p className="text-sm">Computer: {report.computerId ?? '—'}</p>
                         <p className="text-sm">Deployed commit: <span className="font-mono">{report.deploySha ?? '—'}</span></p>
                         <h3 className="font-semibold">Diagnostics</h3>
@@ -87,7 +87,7 @@ export default async function FeedbackAdminPage({ searchParams }: {
                                     <td className="py-2 pr-4">{timestamp(row.createdAt)}</td>
                                     <td className="py-2 pr-4">{row.category}</td>
                                     <td className="py-2 pr-4">{row.status}</td>
-                                    <td className="max-w-xs break-words py-2 pr-4">{row.descriptionPreview}</td>
+                                    <td className="max-w-xs break-words py-2 pr-4">{row.descriptionPreview || '(No description)'}</td>
                                     <td className="py-2 pr-4">{row.hasScreenshot ? 'Yes' : 'No'}</td>
                                     <td className="py-2 pr-4 font-mono text-xs">{row.computerId ?? '—'}</td>
                                     <td className="py-2 pr-4 font-mono text-xs">{row.deploySha?.slice(0, 8) ?? '—'}</td>
