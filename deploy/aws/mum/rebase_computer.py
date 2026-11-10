@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Staging-only operator client. Authority material stays in process memory."""
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import hmac
 import http.client
@@ -198,12 +200,37 @@ def read_park_journal(journal):
     return state
 
 
+@contextmanager
+def park_journal_lock(journal):
+    """Exclusive, non-blocking flock on a stable sibling of the journal, held from the journal read through the response write."""
+    journal.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(str(journal) + '.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise ValueError('another park run holds this journal; let it finish, then rerun to reconcile') from None
+        yield
+    finally:
+        os.close(fd)
+
+
 def park_failed_release(computer, job, execution, snapshot, journal, apply, secret, sender=None, new_id=lambda: str(uuid.uuid4())):
     """Reserve ONE ordinary stop for a failed release (server re-proves everything); dry run unless --apply.
 
     The stop job UUID is chosen here, ONCE, and journaled (fsync) before the request leaves. Every later run reuses the journaled request
     byte for byte: an unknown outcome is reconciled only by the same request (the server answers the same saved work or refuses), never by a
-    new UUID or a new intent. Arguments that differ from the journal are refused."""
+    new UUID or a new intent. Arguments that differ from the journal are refused. Concurrent --apply runs cannot interleave: the journal is
+    read, the UUID minted, the request sent and the response saved under one exclusive lock (a second run refuses instead of minting another id)."""
+    journal = Path(journal)
+    need(journal.is_absolute() and not journal.is_symlink(), 'absolute non-symlink journal required')
+    if not apply:
+        return park_under_lock(computer, job, execution, snapshot, journal, apply, secret, sender, new_id)
+    with park_journal_lock(journal):
+        return park_under_lock(computer, job, execution, snapshot, journal, apply, secret, sender, new_id)
+
+
+def park_under_lock(computer, job, execution, snapshot, journal, apply, secret, sender, new_id):
     journal = Path(journal)
     need(journal.is_absolute() and not journal.is_symlink(), 'absolute non-symlink journal required')
     park_request(computer, job, execution, snapshot, PARK_PLACEHOLDER_JOB)  # validate every argument before anything else (mints nothing)

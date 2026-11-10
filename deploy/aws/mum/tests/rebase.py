@@ -915,6 +915,49 @@ class ComputerTests(unittest.TestCase):
             COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, rebase_journal, True, self.secret, lambda *a: calls.append(a))
         self.assertEqual(len(calls), 1)
 
+    def test_park_apply_holds_one_exclusive_journal_lock_so_a_concurrent_run_never_mints_another_uuid(self):
+        import fcntl
+        own = self.source(self.job); calls = []; minted = []
+        def competing(sent, secret):
+            # A second --apply while the first is mid-request (its HTTP response not yet saved): refused before minting, journaling or sending.
+            def new_id():
+                minted.append(1); return '55555555-5555-4555-8555-555555555555'
+            with self.assertRaises(ValueError):
+                COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, lambda *a: calls.append(a), new_id)
+            self.assertEqual(minted, [])
+            self.assertEqual(manifest.read(self.journal)['request'], sent)
+            return self.park_reply(sent)
+        COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, competing, lambda: self.park_job)
+        self.assertEqual(calls, [])
+        self.assertEqual(manifest.read(self.journal)['request']['parkJobId'], self.park_job)
+        # The lock is released afterwards (the lock file stays): a later run reconciles with the journaled UUID.
+        lock = Path(str(self.journal) + '.lock'); self.assertTrue(lock.exists())
+        COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, self.park_sender(calls), lambda: self.fail('minted again'))
+        # An external holder blocks --apply entirely (nothing journaled or sent) but never a dry run.
+        other = Path(self.temp.name) / 'other.json'
+        fd = os.open(str(other) + '.lock', os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            sent_before = len(calls)
+            with self.assertRaises(ValueError):
+                COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, other, True, self.secret, lambda *a: calls.append(a), lambda: self.park_job)
+            self.assertFalse(other.exists()); self.assertEqual(len(calls), sent_before)
+            self.assertIsNone(COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, other, False, self.secret))
+        finally:
+            os.close(fd)
+
+    def test_park_crash_mid_request_releases_the_lock_and_the_rerun_reuses_the_same_uuid(self):
+        own = self.source(self.job); calls = []
+        def crash(sent, secret):
+            self.assertEqual(manifest.read(self.journal)['pending'], sent); calls.append(dict(sent)); raise KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, crash, lambda: self.park_job)
+        state = manifest.read(self.journal)
+        self.assertEqual(state['pending'], state['request']); self.assertEqual(state['request']['parkJobId'], self.park_job)
+        # The lock died with the process/exception: the rerun is not refused, mints nothing, and resends the identical request.
+        COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, self.park_sender(calls), lambda: self.fail('minted again'))
+        self.assertEqual(calls, [state['request'], state['request']]); self.assertIsNone(manifest.read(self.journal)['pending'])
+
     def test_park_cli_is_staging_only_strict_and_applies_through_the_park_validator(self):
         own = self.source(self.job)
         base = ['rebase_computer.py', 'park-failed-release', '--computer', self.computer, '--job', self.job, '--source-execution-arn', own,
