@@ -227,7 +227,7 @@ describe('protocol 2 is used only when OS and the workbench both speak it', () =
 
     test('controlReport: only a runtime readback is applied; unknown outcomes are uncertain, never not_delivered', () => {
         expect(controlReport(OP, { ok: true, status: 'created', sessionResource: NEW, model: 'ezil/qwen', observedAt: 1, reason: 'model_not_applied' }))
-            .toEqual({ operationId: OP, status: 'applied', sessionResource: NEW, model: 'ezil/qwen', observedAt: 1, reason: 'model_not_applied' });
+            .toEqual({ operationId: OP, status: 'applied', sessionResource: NEW, model: 'ezil/qwen', effort: null, observedAt: 1, reason: 'model_not_applied' });
         expect(controlReport(OP, { ok: true, status: 'applied', model: 'ezil/qwen', observedAt: 1 }).status).toBe('uncertain');
         for (const view of [undefined, {}, { ok: true, status: 'uncertain', reason: 'create_outcome_unknown' }, { ok: false, error: 'command_in_flight' }]) {
             expect(controlReport(OP, view).status).toBe('uncertain');
@@ -277,4 +277,42 @@ describe('catalog availability: only the Gateway evidence the extension read for
         await client.tick(); await client.tick(); await client.tick();
         expect([asked, bodies.some((b) => 'catalog' in b)]).toEqual([0, false]);
     });
+});
+
+test('protocol3 capability intersects fresh account evidence and downgrade strips observed effort', async () => {
+    const bodies: any[] = [], calls: any[] = [];
+    let fresh = true, osProtocol = 3;
+    const client = new ChatBridgeClient({
+        syncUrl:'https://h/editor-bridge/v1/sync',token:'f'.repeat(64),ownerId:'ext.p3',log:()=>{},
+        modelEvidence: async () => ({available:new Set(['qwen']),efforts: fresh ? new Map([['qwen',{protocol:'openai-responses' as const,values:['low'],default:null}]]) : new Map()}),
+        execute: async r => {
+            calls.push(r);
+            if(r.op === 'sessions') return {ok:true,sessions:[{resource:S1,title:'',open:true,status:'idle',model:'ezil/qwen',effort:'low',requests:0}]};
+            if(r.op === 'models') return {ok:true,status:'ok',models:[{...PICKER[1],efforts:['low','max'],defaultEffort:'max'}]};
+            return {ok:true,protocol:3};
+        },
+        fetch:async (_url,init)=>{bodies.push(JSON.parse(String(init.body)));return Response.json(self(osProtocol));},
+    });
+    await client.tick(); await client.tick();
+    expect(bodies[1].protocol).toBe(3);
+    expect(bodies[1].sessions[0].effort).toBe('low');
+    expect(bodies[1].catalog.models[0].efforts).toEqual(['low']);
+    expect(bodies[1].catalog.models[0].defaultEffort).toBeNull();
+    fresh=false; for(let i=0;i<4;i++) await client.tick();
+    expect(bodies[5].catalog.models[0].efforts).toEqual([]);
+    osProtocol=2; for(let i=0;i<5;i++) await client.tick();
+    expect(bodies[10].protocol).toBe(2);
+    expect(bodies[10].sessions[0]).not.toHaveProperty('effort');
+    expect(bodies[10].catalog.models[0].efforts).toEqual([]);
+});
+
+test('new client starts with protocol1, requires advertised protocol3, and absent capability stays protocol2', async () => {
+    for(const advertised of [false,true]) {
+        const bodies:any[]=[];
+        const client=new ChatBridgeClient({syncUrl:'https://h/editor-bridge/v1/sync',token:'f'.repeat(64),ownerId:'ext.p3',log:()=>{},
+            execute:async r=> r.op==='sessions' ? {ok:true,sessions:[]} : r.op==='models' ? {ok:true,status:'unavailable',reason:'no_chat_widget'} : {ok:true,protocol:3},
+            fetch:async(_url,init)=>{bodies.push(JSON.parse(String(init.body)));return Response.json({...self(2),...(advertised?{supportedProtocols:[1,2,3]}:{})});}});
+        await client.tick();await client.tick();
+        expect(bodies.map(b=>b.protocol)).toEqual([1,advertised?3:2]);
+    }
 });

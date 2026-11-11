@@ -15,13 +15,13 @@ const submit = (w, n, extra = {}) => w.bridge.handle({ op: 'submit', ownerId: 'o
 
 test('hello and sessions describe this workbench and each open session\'s selected model', async () => {
     const w = world();
-    assert.deepEqual(await w.bridge.handle({ op: 'hello' }), { ok: true, protocol: 2, owner: null, workspaceFolders: ['vscode-remote://remote/workspace'] });
+    assert.deepEqual(await w.bridge.handle({ op: 'hello' }), { ok: true, protocol: 3, owner: null, workspaceFolders: ['vscode-remote://remote/workspace'] });
     assert.deepEqual(await w.bridge.handle({ op: 'sessions' }), { ok: false, error: 'no_owner' });
     await claimed(w);
     const listed = await w.bridge.handle({ op: 'sessions', ...OWNER });
     assert.deepEqual(listed, { ok: true, sessions: [
-        { resource: 'vscode-chat-session://local/s1', title: 'Live s1', open: true, status: 'idle', model: 'ezil/kimi-k2', requests: 1 },
-        { resource: 'vscode-chat-session://local/s2', title: 'Saved s2', open: false, status: 'unknown', model: null, requests: null },
+        { resource: 'vscode-chat-session://local/s1', title: 'Live s1', open: true, status: 'idle', model: 'ezil/kimi-k2', effort: null, requests: 1 },
+        { resource: 'vscode-chat-session://local/s2', title: 'Saved s2', open: false, status: 'unknown', model: null, effort: null, requests: null },
     ] });
     assert.doesNotThrow(() => JSON.stringify(listed));
 });
@@ -51,7 +51,7 @@ test('accepted: the exact session, with the open pane\'s own mode/model options,
     await claimed(w);
     const result = await submit(w, 1);
     assert.deepEqual(result, { ok: true, status: 'in_progress', commandId: CMD(1), sessionResource: 'vscode-chat-session://local/s1',
-        requestId: 'req-1', mode: 'ask', selectedModelId: 'ezil/kimi-k2', acceptedAt: 1700000000000 });
+        requestId: 'req-1', mode: 'ask', selectedModelId: 'ezil/kimi-k2', selectedEffort: null, acceptedAt: 1700000000000 });
     assert.equal(w.calls.send.length, 1);
     const sent = w.calls.send[0];
     assert.equal(sent.id, 's1');
@@ -299,8 +299,8 @@ test('models: exactly what the picker offers (user-selectable only), fenced; una
     assert.deepEqual(await w.bridge.handle({ op: 'models' }), { ok: false, error: 'no_owner' });
     await claimed(w);
     assert.deepEqual(await w.bridge.handle({ op: 'models', ...OWNER }), { ok: true, status: 'ok', observedAt: 1700000000000, models: [
-        { id: 'ezil/kimi-k2', label: 'Kimi K2', vendor: 'ezil', modelId: 'kimi-k2', configurable: false },
-        { id: 'ezil/qwen', label: 'Qwen', vendor: 'ezil', modelId: 'qwen', configurable: false },
+        { id: 'ezil/kimi-k2', label: 'Kimi K2', vendor: 'ezil', modelId: 'kimi-k2', configurable: false, efforts: [], defaultEffort: null },
+        { id: 'ezil/qwen', label: 'Qwen', vendor: 'ezil', modelId: 'qwen', configurable: false, efforts: [], defaultEffort: null },
     ] });
     const none = world({ open: [] });
     await claimed(none);
@@ -314,7 +314,7 @@ test('create: a NEW empty session, opened as a tab without focus, with the model
     const before = (await w.bridge.handle({ op: 'sessions', ...OWNER })).sessions.map((s) => s.resource);
     const made = await control(w, 'create', 1, { model: 'ezil/qwen' });
     assert.deepEqual(made, { ok: true, status: 'created', commandId: CMD(1), kind: 'create', sessionResource: 'vscode-chat-session://local/new1',
-        model: 'ezil/qwen', requestCount: 0, reason: null, observedAt: 1700000000000 });
+        model: 'ezil/qwen', effort: null, requestCount: 0, reason: null, observedAt: 1700000000000 });
     assert.ok(!before.includes(made.sessionResource));
     assert.deepEqual(w.calls.opened, [{ id: 'new1', target: -1, options: { preserveFocus: true, pinned: true } }]);
     // Selected for this session only: a user action that is not stored as the window's default.
@@ -322,7 +322,7 @@ test('create: a NEW empty session, opened as a tab without focus, with the model
     // Every other session keeps its own model; the new one is listed (empty) and can be sent to.
     const after = (await w.bridge.handle({ op: 'sessions', ...OWNER })).sessions;
     assert.deepEqual(after.find((s) => s.resource.endsWith('/s1')).model, 'ezil/kimi-k2');
-    assert.deepEqual(after.find((s) => s.resource === made.sessionResource), { resource: made.sessionResource, title: '', open: true, status: 'idle', model: 'ezil/qwen', requests: 0 });
+    assert.deepEqual(after.find((s) => s.resource === made.sessionResource), { resource: made.sessionResource, title: '', open: true, status: 'idle', model: 'ezil/qwen', effort: null, requests: 0 });
     const sent = await submit(w, 2, { sessionResource: made.sessionResource });
     assert.equal(sent.status, 'in_progress');
     assert.equal(sent.selectedModelId, 'ezil/qwen');
@@ -375,7 +375,7 @@ test('create: a model the runtime does not keep is reported as read back (model_
     const w = world({ sticky: false });
     await claimed(w);
     const made = await control(w, 'create', 1, { model: 'ezil/qwen' });
-    assert.equal(made.status, 'created');
+    assert.equal(made.status, 'uncertain');
     assert.equal(made.model, 'ezil/kimi-k2');
     assert.equal(made.reason, 'model_not_applied');
 });
@@ -385,7 +385,7 @@ test('setModel: one open, idle session only, read back; busy, closed, unknown an
     await claimed(w);
     const s1 = 'vscode-chat-session://local/s1';
     const applied = await control(w, 'setModel', 1, { sessionResource: s1, model: 'ezil/qwen' });
-    assert.deepEqual(applied, { ok: true, status: 'applied', commandId: CMD(1), kind: 'configure', sessionResource: s1, model: 'ezil/qwen',
+    assert.deepEqual(applied, { ok: true, status: 'applied', commandId: CMD(1), kind: 'configure', sessionResource: s1, model: 'ezil/qwen', effort: null,
         requestCount: 1, reason: null, observedAt: 1700000000000 });
     assert.deepEqual(await control(w, 'setModel', 1, { sessionResource: s1, model: 'ezil/qwen' }), { ...applied, duplicate: true });
     assert.deepEqual(await control(w, 'setModel', 1, { sessionResource: s1, model: 'ezil/kimi-k2' }), { ok: false, error: 'command_conflict' });
@@ -505,4 +505,73 @@ test('setModel cannot mutate after disposal during an awaited open', async () =>
     release.resolve();
     assert.deepEqual(await pending, { ok: false, error: 'disconnected' });
     assert.equal(w.calls.switched.length, 0);
+});
+
+test('protocol3 effort is local to two chats, flushed, read back and carried to the exact request', async () => {
+    const { PICKER } = require('./chat-bridge-fake.cjs');
+    const picker = structuredClone(PICKER);
+    picker[0].metadata.configurationSchema = { properties: { reasoningEffort: { type: 'string', enum: ['low', 'high'] } } };
+    const w = world({ open: ['s1', 's2'], picker });
+    await claimed(w);
+    for (const [n, id, effort] of [[1, 's1', 'low'], [2, 's2', 'high']]) {
+        const res = await control(w, 'setModel', n, { sessionResource: `vscode-chat-session://local/${id}`, effort });
+        assert.equal(res.status, 'applied'); assert.equal(res.effort, effort);
+        assert.equal(w.models.get(id).inputState.modelConfiguration.reasoningEffort, effort);
+    }
+    assert.equal(w.widget('s1').input.getModelConfiguration('ezil/kimi-k2').reasoningEffort, 'low');
+    // Hide/show does not transfer configuration between widgets.
+    w.open.splice(w.open.indexOf('s1'), 1); w.open.push('s1');
+    const sent = await submit(w, 3);
+    assert.equal(sent.selectedEffort, 'low');
+    assert.equal(w.calls.send[0].options.userSelectedModelConfiguration.reasoningEffort, 'low');
+    assert.equal(w.calls.send[0].options.modeInfo.kind, 'ask');
+    w.models.get('s1').lastRequest.response.finish(false);
+    assert.equal(w.widget('s2').input.getModelConfiguration('ezil/kimi-k2').reasoningEffort, 'high');
+});
+
+test('effort refuses missing capability, changed keys, busy sessions and failed persistence readback', async () => {
+    const { PICKER } = require('./chat-bridge-fake.cjs');
+    const picker = structuredClone(PICKER);
+    picker[0].metadata.configurationSchema = { properties: { reasoningEffort: { type: 'string', enum: ['low', 'high'] } } };
+    const w = world({ picker }); await claimed(w);
+    const sessionResource = 'vscode-chat-session://local/s1';
+    assert.equal((await control(w, 'setModel', 1, { sessionResource, effort: 'max' })).reason, 'effort_unavailable');
+    assert.equal((await control(w, 'setModel', 2, { sessionResource, effort: 'low' })).status, 'applied');
+    assert.equal((await control(w, 'setModel', 2, { sessionResource, effort: 'high' })).error, 'command_conflict');
+    w.models.get('s1').requestInProgress.value = true;
+    assert.equal((await control(w, 'setModel', 3, { sessionResource, effort: 'high' })).status, 'busy');
+    w.models.get('s1').requestInProgress.value = false;
+    w.widget('s1').input.getCurrentInputState = () => ({});
+    assert.equal((await control(w, 'setModel', 4, { sessionResource, effort: 'high' })).status, 'uncertain');
+    const old = world(); await claimed(old);
+    assert.equal((await control(old, 'setModel', 1, { sessionResource, effort: 'high' })).reason, 'effort_unavailable');
+});
+
+test('effort cannot change while approval is pending even without a running request', async () => {
+    const { PICKER } = require('./chat-bridge-fake.cjs');
+    const picker = structuredClone(PICKER);
+    picker[0].metadata.configurationSchema = {properties:{reasoningEffort:{type:'string',enum:['low','high']}}};
+    const w = world({picker}); await claimed(w);
+    w.models.get('s1').requestInProgress.value = false;
+    w.models.get('s1').requestNeedsInput.value = true;
+    const response = await control(w,'setModel',1,{sessionResource:'vscode-chat-session://local/s1',effort:'high'});
+    assert.equal(response.status,'busy');
+    assert.equal(w.models.get('s1').inputState,undefined);
+    assert.equal(w.widget('s1').input.currentModeKind,'ask');
+});
+
+test('missing or mismatched native session input binding never advertises effort or reports success', async () => {
+    const { PICKER, uri } = require('./chat-bridge-fake.cjs');
+    const picker=structuredClone(PICKER);
+    picker[0].metadata.configurationSchema={properties:{reasoningEffort:{type:'string',enum:['low']}}};
+    for(const missing of [true,false]) {
+        const w=world({picker});await claimed(w);
+        if(missing) w.widget('s1').input._inputModel=undefined;
+        else w.widget('s1').input._inputModelSessionResource=uri('s2');
+        const rows=(await w.bridge.handle({op:'models',...OWNER})).models;
+        assert.deepEqual(rows[0].efforts,[]);
+        const result=await control(w,'setModel',1,{sessionResource:'vscode-chat-session://local/s1',effort:'low'});
+        assert.equal(result.status,'rejected');
+        assert.equal(w.models.get('s1').inputState,undefined);
+    }
 });

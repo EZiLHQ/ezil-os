@@ -102,13 +102,24 @@ function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, no
     let editorShown = null;
     const widget = (id) => {
         if (widgets.has(id)) return widgets.get(id);
+        const configurations = new Map();
         const w = {
             viewModel: { sessionResource: uri(id) }, location: 'panel',
             _lockedAgent: lockedAgent ? { id: 'agent-host' } : undefined,
             _lastSelectedAgent: { id: 'ezil', capabilities: { images: true } },
             input: {
                 currentModeKind: 'ask', currentModeInfo: { kind: 'ask', isBuiltin: true }, currentLanguageModel: 'ezil/kimi-k2',
+                _inputModel: { state: { get: () => models.get(id).inputState } },
+                _inputModelSessionResource: uri(id), _currentSessionKey: uri(id).toString(),
                 getModels: () => picker,
+                restoreModelConfiguration(modelId, config, persist) {
+                    assert.equal(persist, false, 'must never write shared model preferences');
+                    configurations.set(modelId, structuredClone(config));
+                },
+                getModelConfiguration(modelId) { return configurations.get(modelId); },
+                getCurrentInputState() { return { modelConfiguration: this.getModelConfiguration(this.currentLanguageModel) }; },
+                flushInputStateToModel() { models.get(id).inputState = structuredClone(this.getCurrentInputState()); },
+                setModelConfiguration() { throw new Error('global preference setter forbidden'); },
                 switchModelByIdentifier(identifier, persist, userAction) {
                     calls.switched.push({ id, identifier, persist, userAction });
                     const found = picker.find((m) => m.identifier === identifier);
@@ -116,7 +127,7 @@ function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, no
                     return !!found;
                 },
             },
-            getSelectedModelRequestOptions: () => ({ userSelectedModelId: w.input.currentLanguageModel, userSelectedModelConfiguration: undefined }),
+            getSelectedModelRequestOptions: () => ({ userSelectedModelId: w.input.currentLanguageModel, userSelectedModelConfiguration: w.input.getModelConfiguration(w.input.currentLanguageModel) }),
             getModeRequestOptions: () => ({ modeInfo: { kind: 'ask', isBuiltin: true }, userSelectedTools: { get: () => ({}) } }),
             _getInstructionRouting: () => ({ enabledTools: undefined }),
         };

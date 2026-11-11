@@ -69,7 +69,7 @@ test('[chat-bridge] adds exactly its two hunks to the real workbench.js, inert b
         assert.deepEqual([...registered.keys()], ['_ezil.chatBridge.v1']);
         assert.equal(disposables.length, 1, 'a second pane in the same window does not register a second bridge');
         await Promise.resolve(registered.get('_ezil.chatBridge.v1')({}, { op: 'hello' })).then((hello) => {
-            assert.deepEqual(hello, { ok: true, protocol: 2, owner: null, workspaceFolders: ['vscode-remote://remote/workspace'] });
+            assert.deepEqual(hello, { ok: true, protocol: 3, owner: null, workspaceFolders: ['vscode-remote://remote/workspace'] });
             disposables[0].dispose();
             assert.equal(registered.size, 0);
             assert.equal(fakeGlobal.__ezilChatBridgeV1, false);

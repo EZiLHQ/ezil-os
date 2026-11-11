@@ -15,7 +15,7 @@
 // and this window's workbench speaks it; until then every body, delivery and report is exactly protocol 1. It adds
 // the picker's models (`catalog`) and each open session's selected model to the sync, and two deliveries: `create`
 // (a new, empty chat) and `configure` (one idle session's model). Their reports carry only what the runtime read
-// back after the change. Effort is not a session setting in this editor: a requested effort is refused.
+// back after the change. Protocol 3 adds capability-gated session effort; older peers refuse effort requests.
 
 export const BRIDGE_COMMAND = '_ezil.chatBridge.v1';
 export const SYNC_PATH = '/editor-bridge/v1/sync';
@@ -37,10 +37,12 @@ export interface Report {
     requestId?: string;
     mode?: string;
     selectedModelId?: string;
+    selectedEffort?: string | null;
     responseText?: string;
     /** Protocol 2, `applied` only: the session and the model the runtime reports after the change. */
     sessionResource?: string;
     model?: string | null;
+    effort?: string | null;
     requestCount?: number;
     observedAt?: number;
 }
@@ -61,15 +63,15 @@ export interface Delivery {
 }
 
 type SyncReply =
-    | { ok: true; protocol?: number; owner: 'self'; epoch: number; pollMs: number; deliver: Delivery[] }
-    | { ok: true; protocol?: number; owner: 'other'; pollMs: number };
+    | { ok: true; protocol?: number; supportedProtocols?: number[]; owner: 'self'; epoch: number; pollMs: number; deliver: Delivery[] }
+    | { ok: true; protocol?: number; supportedProtocols?: number[]; owner: 'other'; pollMs: number };
 
 /**
  * One catalog row, in the MCP proposal's shape. Effort is per model here: `efforts` is empty, `configuredEffort` is
  * read-only. `availability: "available"` only on fresh evidence that the EZiL Gateway allows this computer's account to
  * use the model; a row without it (a static configured model, or no fresh evidence) is listed, not attested.
  */
-export interface CatalogModel { id: string; label: string; engine: 'ezil-chat'; efforts: string[]; defaultEffort: null; configuredEffort: string | null;
+export interface CatalogModel { id: string; label: string; engine: 'ezil-chat'; efforts: string[]; defaultEffort: string | null; configuredEffort: string | null;
     availability?: 'available' }
 
 type View = Record<string, unknown>;
@@ -90,6 +92,7 @@ export interface BridgeClientDeps {
      */
     ensureAgent?: () => Promise<boolean>;
     /** The fixed `thinking.effort` this extension sends for one of its own models (picker metadata id), or null. */
+    modelEvidence?: (ids: readonly string[]) => Promise<{ available: Set<string>; efforts: Map<string, import('./effort').GatewayEffortCapability> }>;
     effortOf?: (modelId: string) => string | null;
     /** Of these picker metadata ids (this extension's own models), those with fresh Gateway evidence for this account. */
     availableIds?: (modelIds: string[]) => Promise<Set<string>>;
@@ -124,6 +127,7 @@ export function submitReport(operationId: string, view: unknown): Report {
         operationId,
         ...(typeof v.requestId === 'string' ? { requestId: v.requestId.slice(0, 256) } : {}),
         ...(typeof v.mode === 'string' ? { mode: v.mode.slice(0, 64) } : {}),
+        ...(typeof v.selectedEffort === 'string' ? { selectedEffort: v.selectedEffort.slice(0,32) } : {}),
         ...(typeof v.selectedModelId === 'string' ? { selectedModelId: v.selectedModelId.slice(0, 256) } : {}),
     };
     switch (v.status) {
@@ -159,7 +163,7 @@ export function controlReport(operationId: string, view: unknown): Report {
                 return { operationId, status: 'uncertain', reason: 'bad_response' };
             }
             return {
-                operationId, status: 'applied', sessionResource: v.sessionResource, model: typeof v.model === 'string' ? v.model.slice(0, 256) : null,
+                operationId, status: 'applied', sessionResource: v.sessionResource, model: typeof v.model === 'string' ? v.model.slice(0, 256) : null, effort: typeof v.effort === 'string' ? v.effort.slice(0,32) : null,
                 ...(Number.isSafeInteger(v.requestCount) ? { requestCount: v.requestCount as number } : {}), observedAt: v.observedAt as number,
                 ...(v.reason === 'model_not_applied' ? { reason: 'model_not_applied' } : {}),
             };
@@ -238,7 +242,7 @@ export class ChatBridgeClient {
         // No bridge in this window (setting off, or no EZiL Chat pane yet): nothing to offer OS.
         try {
             const hello = await this.call({ op: 'hello' }) as View | undefined;
-            if (!hello || hello.ok !== true || (hello.protocol !== 1 && hello.protocol !== 2)) return IDLE_MS;
+            if (!hello || hello.ok !== true || (hello.protocol !== 1 && hello.protocol !== 2 && hello.protocol !== 3)) return IDLE_MS;
             this.workbench = hello.protocol;
         } catch {
             return IDLE_MS;
@@ -250,10 +254,13 @@ export class ChatBridgeClient {
         if (this.epoch > 0 && this.claimedEpoch === this.epoch && (this.ticks % SESSIONS_EVERY === 1 || this.ticks <= 2)) {
             const sessions = await this.sessions(protocol);
             if (sessions) body.sessions = sessions;
-            if (protocol === 2) body.catalog = await this.catalog();
+            if (protocol >= 2) body.catalog = await this.catalog();
         }
         const sending = this.reports.splice(0, MAX_REPORTS);
-        if (sending.length) body.reports = sending;
+        if (sending.length) body.reports = sending.map(report => {
+            if (protocol === 3) return report;
+            const { effort: _effort, selectedEffort: _selected, ...old } = report; return old;
+        });
 
         const reply = await this.sync(body);
         if (!reply) {
@@ -261,7 +268,7 @@ export class ChatBridgeClient {
             this.reports.unshift(...sending);
             return IDLE_MS;
         }
-        this.os = reply.protocol === 2 ? 2 : 1;
+        this.os = reply.protocol === 3 || (reply.protocol === 2 && reply.supportedProtocols?.includes(3)) ? 3 : reply.protocol === 2 ? 2 : 1;
         if (reply.owner === 'other') {
             this.lose();
             return Math.max(reply.pollMs, 1_000);
@@ -282,9 +289,9 @@ export class ChatBridgeClient {
         return this.reports.length ? 200 : Math.max(reply.pollMs, 500);
     }
 
-    /** Protocol 2 only when both OS and the workbench speak it. */
-    private protocol(): 1 | 2 {
-        return this.os === 2 && this.workbench === 2 ? 2 : 1;
+    /** Start at 1; use only the highest protocol both peers explicitly advertise. */
+    private protocol(): 1 | 2 | 3 {
+        return Math.min(this.os, this.workbench) as 1 | 2 | 3;
     }
 
     private lose(): void {
@@ -322,7 +329,7 @@ export class ChatBridgeClient {
         }
     }
 
-    private async sessions(protocol: 1 | 2): Promise<unknown[] | null> {
+    private async sessions(protocol: 1 | 2 | 3): Promise<unknown[] | null> {
         try {
             const result = await this.call({ op: 'sessions', ...this.fence() }) as View | undefined;
             if (!result || result.ok !== true || !Array.isArray(result.sessions)) return null;
@@ -333,8 +340,9 @@ export class ChatBridgeClient {
                     resource: s.resource, title: typeof s.title === 'string' ? s.title.slice(0, 512) : '', open: s.open === true,
                     status: s.status === 'idle' || s.status === 'running' ? s.status : 'unknown',
                     // Protocol 1 sessions are exactly the four fields OS v1 accepts.
-                    ...(protocol === 2 ? {
+                    ...(protocol >= 2 ? {
                         model: typeof s.model === 'string' ? s.model.slice(0, 256) : null,
+                        ...(protocol === 3 ? { effort: typeof s.effort === 'string' ? s.effort.slice(0,32) : null } : {}),
                         requests: Number.isSafeInteger(s.requests) ? s.requests : null,
                     } : {}),
                 }));
@@ -358,8 +366,11 @@ export class ChatBridgeClient {
         const rows = (result.models as View[]).filter((m) => typeof m.id === 'string' && m.id.length > 0 && m.id.length <= 256).slice(0, 100);
         const ownId = (m: View) => (m.vendor === 'ezil' && typeof m.modelId === 'string' ? m.modelId : null);
         let allowed = new Set<string>();
+        let efforts = new Map<string, import('./effort').GatewayEffortCapability>();
         try {
-            if (this.deps.availableIds) allowed = await this.deps.availableIds(rows.map(ownId).filter((id): id is string => id !== null));
+            const ids = rows.map(ownId).filter((id): id is string => id !== null);
+            if (this.deps.modelEvidence) ({available: allowed, efforts} = await this.deps.modelEvidence(ids));
+            else if (this.deps.availableIds) allowed = await this.deps.availableIds(ids);
         } catch {
             allowed = new Set();
         }
@@ -367,7 +378,9 @@ export class ChatBridgeClient {
             const id = ownId(m);
             const own = id !== null && this.deps.effortOf ? this.deps.effortOf(id) : null;
             return { id: m.id as string, label: typeof m.label === 'string' ? m.label.slice(0, 128) : (m.id as string), engine: 'ezil-chat',
-                efforts: [], defaultEffort: null, configuredEffort: own ?? null, ...(id !== null && allowed.has(id) ? { availability: 'available' as const } : {}) };
+                efforts: this.protocol() === 3 && id !== null && allowed.has(id) && Array.isArray(m.efforts)
+                    ? m.efforts.filter((v): v is string => typeof v === 'string' && !!efforts.get(id)?.values.includes(v)) : [],
+                defaultEffort: this.protocol() === 3 && id !== null && allowed.has(id) && Array.isArray(m.efforts) && m.efforts.includes(m.defaultEffort) && efforts.get(id)?.default === m.defaultEffort && typeof m.defaultEffort === 'string' ? m.defaultEffort : null, configuredEffort: own ?? null, ...(id !== null && allowed.has(id) ? { availability: 'available' as const } : {}) };
         });
         return { status: 'available', models, observedAt };
     }
@@ -399,7 +412,7 @@ export class ChatBridgeClient {
                 const deliverWithinMs = Math.max(0, Math.floor(delivery.deliverWithinMs - (Date.now() - receivedAt)));
                 report = submitReport(delivery.operationId, await this.call({
                     op: 'submit', ...this.fence(), commandId: delivery.operationId, sessionResource: delivery.sessionResource, text: delivery.text,
-                    deliverWithinMs, ...(this.protocol() === 2 && delivery.reveal === true ? { reveal: true } : {}),
+                    deliverWithinMs, ...(this.protocol() >= 2 && delivery.reveal === true ? { reveal: true } : {}),
                 }));
             } catch {
                 // The call itself failed mid-flight (window closing): it may have reached the model.
@@ -446,15 +459,15 @@ export class ChatBridgeClient {
     /** A protocol-2 control, answered within this round (never tracked: it has no running state). */
     private async control(delivery: Delivery, receivedAt: number): Promise<Report> {
         const operationId = delivery.operationId;
-        if (this.protocol() !== 2) return { operationId, status: 'rejected', reason: 'unsupported_kind' };
+        if (this.protocol() < 2) return { operationId, status: 'rejected', reason: 'unsupported_kind' };
         // Effort is per model in this editor (and for the whole window), never one session's setting.
-        if (delivery.effort !== undefined) return { operationId, status: 'rejected', reason: 'effort_not_per_session' };
-        if (delivery.kind === 'configure' && delivery.model === undefined) return { operationId, status: 'rejected', reason: 'nothing_to_change' };
+        if (delivery.effort !== undefined && this.protocol() < 3) return { operationId, status: 'rejected', reason: 'effort_not_per_session' };
+        if (delivery.kind === 'configure' && delivery.model === undefined && delivery.effort === undefined) return { operationId, status: 'rejected', reason: 'nothing_to_change' };
         const deliverWithinMs = Math.max(0, Math.floor(delivery.deliverWithinMs - (Date.now() - receivedAt)));
         try {
             return controlReport(operationId, await this.call(delivery.kind === 'create'
-                ? { op: 'create', ...this.fence(), commandId: operationId, deliverWithinMs, ...(delivery.model !== undefined ? { model: delivery.model } : {}) }
-                : { op: 'setModel', ...this.fence(), commandId: operationId, sessionResource: delivery.sessionResource, model: delivery.model, deliverWithinMs,
+                ? { op: 'create', ...this.fence(), commandId: operationId, deliverWithinMs, ...(delivery.effort !== undefined ? { effort: delivery.effort } : {}), ...(delivery.model !== undefined ? { model: delivery.model } : {}) }
+                : { op: 'setModel', ...this.fence(), commandId: operationId, sessionResource: delivery.sessionResource, ...(delivery.model !== undefined ? { model: delivery.model } : {}), ...(delivery.effort !== undefined ? { effort: delivery.effort } : {}), deliverWithinMs,
                     ...(delivery.reveal === true ? { reveal: true } : {}) }));
         } catch {
             // The call failed mid-flight (window closing): the change may or may not have happened.

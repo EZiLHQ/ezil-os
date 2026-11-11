@@ -1,4 +1,4 @@
-/* EZiL Chat bridge, workbench side, protocol 2 (PATCHES.md "Chat bridge").
+/* EZiL Chat bridge, workbench side, protocol 3 (PATCHES.md "Chat bridge").
  * Injected by patch-copilot-chat.sh [chat-bridge] into ChatViewPane, which registers it as the
  * internal command "_ezil.chatBridge.v1" only when the setting ezil.chatBridge.enabled is true.
  * Lets a remote owner (the EZiL extension, fenced by an OS-issued epoch) put an instruction into
@@ -18,7 +18,7 @@
  * This file is one function expression; tests evaluate it with fake services (chat-bridge.test.cjs). */
 (function ezilChatBridge(deps) {
     'use strict';
-    const PROTOCOL = 2;
+    const PROTOCOL = 3;
     // editorService group ids (code-server 4.141.0): open a created chat as a tab in the active group, so the
     // chat the person has in the panel is never replaced.
     const ACTIVE_GROUP = -1;
@@ -135,7 +135,7 @@
         }
         return Object.assign({
             ok: true, status, commandId: record.commandId, sessionResource: record.key,
-            requestId: record.requestId, mode: record.mode, selectedModelId: record.selectedModelId, acceptedAt: record.acceptedAt,
+            requestId: record.requestId, mode: record.mode, selectedModelId: record.selectedModelId, selectedEffort: record.selectedEffort ?? null, acceptedAt: record.acceptedAt,
         }, extra || {});
     }
 
@@ -184,7 +184,7 @@
         const record = {
             commandId: req.commandId, key, resource: session.resource, text: req.text, status: 'uncertain',
             requestId: null, response: null, mode: (widget.input && widget.input.currentModeKind) || null,
-            selectedModelId: options.userSelectedModelId || null, acceptedAt: now(), cancelRequested: false, settled: false,
+            selectedModelId: options.userSelectedModelId || null, selectedEffort: options.userSelectedModelConfiguration?.reasoningEffort ?? null, acceptedAt: now(), cancelRequested: false, settled: false,
         };
         let result;
         try {
@@ -228,7 +228,7 @@
     function controlView(record, extra) {
         return Object.assign({
             ok: true, status: record.status, commandId: record.commandId, kind: record.kind, sessionResource: record.key,
-            model: record.model, requestCount: record.requestCount, reason: record.reason, observedAt: record.observedAt,
+            model: record.model, effort: record.effort ?? null, requestCount: record.requestCount, reason: record.reason, observedAt: record.observedAt,
         }, extra || {});
     }
 
@@ -239,8 +239,39 @@
         return (list || []).filter((m) => m && typeof m.identifier === 'string' && MODEL_ID.test(m.identifier) && m.metadata
             && m.metadata.isUserSelectable !== false).map((m) => ({
             id: m.identifier, label: String(m.metadata.name || m.identifier).slice(0, 128), vendor: String(m.metadata.vendor || ''),
-            modelId: String(m.metadata.id || ''), configurable: !!m.metadata.configurationSchema,
+            modelId: String(m.metadata.id || ''), configurable: !!m.metadata.configurationSchema, ...effortSchema(input, m),
         }));
+    }
+
+    const EFFORT = /^[A-Za-z0-9._-]{1,32}$/;
+    function effortSchema(input, model) {
+        const schema = model.metadata.configurationSchema?.properties?.reasoningEffort;
+        const values = schema?.enum;
+        const usable = typeof input.restoreModelConfiguration === 'function' && typeof input.getModelConfiguration === 'function'
+            && typeof input._inputModel?.state?.get === 'function' && input._inputModelSessionResource?.toString() === input._currentSessionKey
+            && typeof input.flushInputStateToModel === 'function' && typeof input.getCurrentInputState === 'function' && schema?.type === 'string' && Array.isArray(values) && values.length > 0 && values.length <= 16
+            && values.every(v => typeof v === 'string' && EFFORT.test(v)) && new Set(values).size === values.length;
+        return { efforts: usable ? [...values] : [], defaultEffort: usable && values.includes(schema.default) ? schema.default : null };
+    }
+    function currentEffort(widget) {
+        const id = currentModel(widget);
+        const value = id && widget?.input?.getModelConfiguration?.(id)?.reasoningEffort;
+        return typeof value === 'string' && EFFORT.test(value) ? value : null;
+    }
+    function effortAllowed(widget, id, effort) {
+        return effort === undefined || pickerModels(widget).some(m => m.id === id && m.efforts.includes(effort));
+    }
+    function selectEffort(widget, effort) {
+        if (effort === undefined) return true;
+        const id = currentModel(widget);
+        if (!effortAllowed(widget, id, effort)) return false;
+        const input = widget.input;
+        input.restoreModelConfiguration(id, { ...(input.getModelConfiguration(id) || {}), reasoningEffort: effort }, false);
+        input.flushInputStateToModel();
+        // Both the live input and its persisted session input state must agree.
+        return currentEffort(widget) === effort && input.getCurrentInputState?.().modelConfiguration?.reasoningEffort === effort
+            && input._inputModelSessionResource?.toString() === widget.viewModel?.sessionResource?.toString()
+            && input._inputModel?.state?.get()?.modelConfiguration?.reasoningEffort === effort;
     }
 
     function currentModel(widget) {
@@ -282,17 +313,20 @@
      */
     async function create(req) {
         if (!UUID.test(req.commandId) || !Number.isSafeInteger(req.deliverWithinMs) || req.deliverWithinMs < 0
-            || (req.model !== undefined && (typeof req.model !== 'string' || !MODEL_ID.test(req.model)))) return fail('bad_request');
+            || (req.model !== undefined && (typeof req.model !== 'string' || !MODEL_ID.test(req.model)))
+            || (req.effort !== undefined && (typeof req.effort !== 'string' || !EFFORT.test(req.effort)))) return fail('bad_request');
         const denied = fenced(req);
         if (denied) return denied;
         const deadline = now() + req.deliverWithinMs;
         const wanted = req.model === undefined ? null : req.model;
-        return reserve(req, 'create', { kind: 'create', request: String(wanted) }, async () => {
+        const selection = JSON.stringify([wanted, req.effort ?? null]);
+        return reserve(req, 'create', { kind: 'create', request: selection }, async () => {
             const stale = fenced(req);
             if (stale) return stale;
             if (now() > deadline) return { ok: true, status: 'expired' };
             if (wanted && !pickerModels(someWidget()).some((m) => m.id === wanted)) return { ok: true, status: 'rejected', reason: 'model_not_offered' };
-            const record = { commandId: req.commandId, kind: 'create', request: String(wanted), key: null, resource: null, status: 'uncertain',
+            if (!effortAllowed(someWidget(), wanted || currentModel(someWidget()), req.effort)) return { ok: true, status: 'rejected', reason: 'effort_unavailable' };
+            const record = { commandId: req.commandId, kind: 'create', request: selection, key: null, resource: null, status: 'uncertain',
                 model: null, requestCount: null, reason: 'create_outcome_unknown', observedAt: null };
             remember(record);
             let ref;
@@ -322,11 +356,12 @@
                 return controlView(record);
             }
             if (!widget) { record.status = 'failed'; record.reason = 'not_opened'; return controlView(record); }
-            const applied = wanted ? selectModel(widget, wanted) : true;
+            const applied = (wanted ? selectModel(widget, wanted) : true) && selectEffort(widget, req.effort);
             record.model = currentModel(widget);
+            record.effort = currentEffort(widget);
             record.requestCount = model.getRequests().length;
             record.observedAt = now();
-            record.status = 'created';
+            record.status = applied ? 'created' : 'uncertain';
             record.reason = applied ? null : 'model_not_applied';
             log('created a chat');
             return controlView(record);
@@ -335,12 +370,14 @@
 
     /** Change one open, idle session's model, then read it back. Never queued: busy is answered now. */
     async function setModel(req) {
-        if (!UUID.test(req.commandId) || !isText(req.sessionResource, 2048) || typeof req.model !== 'string' || !MODEL_ID.test(req.model)
+        if (!UUID.test(req.commandId) || !isText(req.sessionResource, 2048) || (req.model !== undefined && (typeof req.model !== 'string' || !MODEL_ID.test(req.model)))
+            || (req.effort !== undefined && (typeof req.effort !== 'string' || !EFFORT.test(req.effort)))
+            || (req.model === undefined && req.effort === undefined)
             || !Number.isSafeInteger(req.deliverWithinMs) || req.deliverWithinMs < 0) return fail('bad_request');
         const denied = fenced(req);
         if (denied) return denied;
         const deadline = now() + req.deliverWithinMs;
-        return reserve(req, req.sessionResource, { kind: 'configure', key: req.sessionResource, request: req.model }, async () => {
+        return reserve(req, req.sessionResource, { kind: 'configure', key: req.sessionResource, request: JSON.stringify([req.model ?? null, req.effort ?? null]) }, async () => {
             const stale = fenced(req);
             if (stale) return stale;
             const session = (await localSessions()).get(req.sessionResource);
@@ -356,16 +393,18 @@
             if (!model) return { ok: true, status: 'not_open' };
             const busy = busyState(model);
             if (busy.inProgress || busy.needsInput || busy.blocked || busy.pending > 0) return { ok: true, status: 'busy' };
-            if (!pickerModels(widget).some((m) => m.id === req.model)) return { ok: true, status: 'rejected', reason: 'model_not_offered' };
+            if (req.model !== undefined && !pickerModels(widget).some((m) => m.id === req.model)) return { ok: true, status: 'rejected', reason: 'model_not_offered' };
             if (now() > deadline) return { ok: true, status: 'expired' };
-            const record = { commandId: req.commandId, kind: 'configure', request: req.model, key: req.sessionResource, resource: session.resource,
+            if (!effortAllowed(widget, req.model ?? currentModel(widget), req.effort)) return { ok: true, status: 'rejected', reason: 'effort_unavailable' };
+            const record = { commandId: req.commandId, kind: 'configure', request: JSON.stringify([req.model ?? null, req.effort ?? null]), key: req.sessionResource, resource: session.resource,
                 status: 'uncertain', model: null, requestCount: null, reason: 'configure_outcome_unknown', observedAt: null };
             remember(record);
-            const applied = selectModel(widget, req.model);
+            const applied = (req.model === undefined || selectModel(widget, req.model)) && selectEffort(widget, req.effort);
             record.model = currentModel(widget);
+            record.effort = currentEffort(widget);
             record.requestCount = model.getRequests().length;
             record.observedAt = now();
-            record.status = applied ? 'applied' : 'failed';
+            record.status = applied ? 'applied' : 'uncertain';
             record.reason = applied ? null : 'model_not_applied';
             return controlView(record);
         });
@@ -513,7 +552,7 @@
                         const model = open ? chat.getSession(session.resource) : undefined;
                         const status = model ? (busyState(model).inProgress ? 'running' : 'idle') : 'unknown';
                         // The model selected in that session's own input now (open sessions only), and how many requests it has.
-                        sessions.push({ resource, title: session.title, open, status, model: open ? currentModel(widget) : null,
+                        sessions.push({ resource, title: session.title, open, status, model: open ? currentModel(widget) : null, effort: open ? currentEffort(widget) : null,
                             requests: model ? model.getRequests().length : null });
                     }
                     return { ok: true, sessions };

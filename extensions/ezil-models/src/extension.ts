@@ -5,7 +5,7 @@ import * as vscode from 'vscode';
 import { BRIDGE_COMMAND, ChatBridgeClient, syncUrlFrom } from './chat-bridge-client';
 import { sentEffort } from './client';
 import { ConfigError, describeConfig, parseModelsConfig, type ResolvedConfig, type ResolvedModel } from './config';
-import { accountAvailableIds, forgetGatewayModels, gatewayModels } from './gateway';
+import { accountModelEvidence, accountAvailableIds, forgetGatewayModels, gatewayModels } from './gateway';
 import { isAppFailure, type AppFailure } from './failure';
 import { CompactionNotice } from './compaction-notice';
 import { EZiLAIStatus } from './status';
@@ -381,6 +381,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             // Which of its own picker models the EZiL Gateway allows this computer's account to use, from a fresh
             // `/v1/models` read with the computer's AI token (never the static config, an older read or the request).
             availableIds: (ids) => accountAvailableIds(store.models(), ids, fetch),
+            modelEvidence: (ids) => accountModelEvidence(store.models(), ids, fetch),
             // The effort this extension really sends for its own model (none through the Gateway), read-only.
             effortOf: (modelId) => {
                 const model = store.models().find((candidate) => candidate.id === modelId);
