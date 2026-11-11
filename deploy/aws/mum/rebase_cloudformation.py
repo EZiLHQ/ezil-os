@@ -701,9 +701,12 @@ def validate_change_details(phase, r, expected, resource, lambda_arns):
             if detail.get('ChangeSource')=='ParameterReference':
                 need(phase=='foundation' and detail.get('CausingEntity')=='HostAmiId','unapproved parameter dependency')
         targets={(d['Target'].get('Attribute'),d['Target'].get('Name')) for d in r.get('Details',[])}
-        wanted={('Properties',p) for p in expected['properties']} | {(p,None) for p in expected['attributes']}
+        # DependsOn stays pinned in the exact template/review and submitted bytes;
+        # CloudFormation's target Attribute and Scope enums cannot report it.
+        provider_attributes=set(expected['attributes'])-{'DependsOn'}
+        wanted={('Properties',p) for p in expected['properties']} | {(p,None) for p in provider_attributes}
         need(targets==wanted,'change-set property details differ from exact review')
-        need(set(r.get('Scope',[]))==({'Properties'} if expected['properties'] else set()) | set(expected['attributes']),'change-set scope mismatch')
+        need(set(r.get('Scope',[]))==({'Properties'} if expected['properties'] else set()) | provider_attributes,'change-set scope mismatch')
     else:
         need(not r.get('Details') and not r.get('Scope'),'unexpected add/remove details')
 

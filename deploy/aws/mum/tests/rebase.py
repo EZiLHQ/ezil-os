@@ -968,5 +968,79 @@ class LegacyLifecycleCapabilityTests(unittest.TestCase):
         self.cfn.preserve_legacy_lifecycle(before, copy.deepcopy(before))
 
 
+class CloudFormationDetailTests(unittest.TestCase):
+    def setUp(self):
+        import rebase_cloudformation as cfn
+        self.cfn = cfn
+        cfn.use_namespace(TOOL.NAMESPACE)
+        self.resource = {'Type': 'AWS::StepFunctions::StateMachine'}
+        self.expected = {'action': 'Modify', 'properties': ['DefinitionString', 'RoleArn'], 'attributes': ['DependsOn']}
+        # The staged Recovery change emits duplicate property targets for direct
+        # and referenced causes, but no DependsOn target or scope attribute.
+        self.change = {'Action': 'Modify', 'ResourceType': self.resource['Type'], 'Replacement': 'False',
+            'Scope': ['Properties'], 'Details': [
+                {'Target': {'Attribute': 'Properties', 'Name': name, 'RequiresRecreation': 'Never'},
+                 'Evaluation': evaluation, 'ChangeSource': cause, **({'CausingEntity': entity} if entity else {})}
+                for name, evaluation, cause, entity in (
+                    ('DefinitionString', 'Dynamic', 'DirectModification', None),
+                    ('RoleArn', 'Dynamic', 'DirectModification', None),
+                    ('RoleArn', 'Static', 'ResourceAttribute', 'RecoveryImageRecoveryRole9D9A3190.Arn'),
+                    ('DefinitionString', 'Static', 'ResourceReference', 'RecoveryObserverCurrentVersion680AB0D7' + 'd' * 32))]}
+
+    def check(self, change=None, expected=None):
+        self.cfn.validate_change_details('workflows', change or self.change,
+            expected or self.expected, self.resource, set())
+
+    def test_actual_provider_properties_omit_only_unreportable_depends_on(self):
+        self.check()
+        expected = copy.deepcopy(self.expected); expected['attributes'].append('Metadata')
+        with self.assertRaisesRegex(ValueError, 'property details differ'):
+            self.check(expected=expected)
+
+    def test_real_properties_scope_and_replacement_fences_are_unchanged(self):
+        for kind in ('missing-property', 'extra-property', 'scope', 'recreation', 'replacement', 'unexpected-depends-on'):
+            change = copy.deepcopy(self.change)
+            if kind == 'missing-property': change['Details'] = [d for d in change['Details'] if d['Target']['Name'] != 'RoleArn']
+            elif kind == 'extra-property': change['Details'][0]['Target']['Name'] = 'EncryptionConfiguration'
+            elif kind == 'scope': change['Scope'].append('Metadata')
+            elif kind == 'recreation': change['Details'][0]['Target']['RequiresRecreation'] = 'Always'
+            elif kind == 'replacement': change['Replacement'] = 'True'
+            else: change['Details'].append({'Target': {'Attribute': 'DependsOn', 'RequiresRecreation': 'Never'}, 'ChangeSource': 'DirectModification'})
+            with self.subTest(kind=kind), self.assertRaises(ValueError): self.check(change=change)
+
+    def test_depends_on_review_artifact_and_submitted_template_remain_exact(self):
+        import hashlib
+        before = manifest.read(HERE / 'fixtures/pool-iam-templates.json')['workflows']['before']
+        # Reuse the known image-role projection; the workflow itself has a real
+        # DependsOn-only template change independently of provider reporting.
+        del before['Resources'][self.cfn.LIFECYCLE_CONTROLLER_POLICY]
+        role = self.cfn.LEGACY_RECOVERY_ROLE
+        preparation = next(k for k in before['Resources'] if 'RebasePreparationRole' in k and before['Resources'][k]['Type'] == 'AWS::IAM::Role')
+        before['Resources']['Workflow'] = {'Type': self.resource['Type'], 'DependsOn': [role],
+            'Properties': {'DefinitionString': '{"StartAt":"Done","States":{"Done":{"Type":"Succeed"}}}', 'RoleArn': {'Fn::GetAtt': [role, 'Arn']}}}
+        after = copy.deepcopy(before); after['Resources']['Workflow']['DependsOn'].append(preparation)
+        review = {'schemaVersion': 1, 'changes': {'Workflow': {'action': 'Modify', 'properties': [], 'attributes': ['DependsOn']}}}
+        self.assertEqual(self.cfn.validate_templates('workflows', before, after, review), review['changes'])
+        bad = copy.deepcopy(review); bad['changes']['Workflow']['attributes'] = []
+        with self.assertRaisesRegex(ValueError, 'exactly enumerate template changes'):
+            self.cfn.validate_templates('workflows', before, after, bad)
+        with tempfile.TemporaryDirectory() as directory:
+            spec = {'stackName': self.cfn.STACKS['workflows'], 'changeSetArn': 'staged-change'}
+            for name, value in (('beforeTemplate', before), ('candidateTemplate', after), ('review', review)):
+                path = Path(directory) / (name + '.json'); path.write_text(json.dumps(value))
+                spec[name + 'Path'] = str(path); spec[name + 'Sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+            digest = lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            submitted = copy.deepcopy(after); submitted['Resources']['Workflow']['DependsOn'] = [role]
+            def aws(*args):
+                if args[1] == 'describe-change-set': return {'ChangeSetId': spec['changeSetArn'], 'StackName': spec['stackName']}
+                if args[1] == 'get-template': return {'TemplateBody': submitted}
+                self.fail('unexpected cloud operation')
+            with self.assertRaisesRegex(ValueError, 'submitted template differs'):
+                self.cfn.execute('workflows', spec, directory, False, aws, lambda *_: self.fail('unexpected write'), digest)
+            Path(spec['candidateTemplatePath']).write_text(json.dumps(submitted))
+            with self.assertRaisesRegex(ValueError, 'reviewed CloudFormation artifact changed'):
+                self.cfn.execute('workflows', spec, directory, False, aws, lambda *_: self.fail('unexpected write'), digest)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
