@@ -388,7 +388,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             this.listedCatalogs = new Map(providers.map(provider => [provider, catalogSignature(used.get(provider))]));
             this.unreadListings = new Set(providers.filter(provider => !catalog.get(provider)));
             // The Gateway's suggested default counts only from this read: during an outage the configured default stays.
-            // The OS plan's locks (Free: Gemini 3.8 Flash only) follow the same catalog as the rows they lock.
+            // The OS plan's locks (Free: Flash and two fallbacks) follow the same catalog as the rows they lock.
             const offered = [...models.filter(model => gatewayModelAvailable(model, catalog.get(model.provider))), ...listed]
                 .map(model => withGatewayModelLimits(model, catalog.get(model.provider)));
             return this.rememberModels(withDefaultModel(withPlanLocks(withCatalogDefault(offered, catalog), used), used)).map(toInformation);
@@ -465,7 +465,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             controller.signal.throwIfAborted();
             if (resolved.provider.type === 'ezil-gateway' && isUtilityRequest(options.modelOptions ?? {})) {
                 // Requests marked as titles or summaries (role or requestInitiator): Qwen on the named model's own provider
-                // (account), when the account's plan includes it. On a plan that does not (Free: Gemini 3.8 Flash only) they
+                // (account), when the account's plan includes it. On a plan that does not (Free: Flash and two fallbacks) they
                 // never fail on a lock: one naming a model the plan does not include goes to the plan's own model on the same
                 // account. Otherwise the named model serves it. Copilot 0.69 marks none of its own requests: the image's
                 // Machine settings pin its utility slots to Flash (worker/scripts/editor-state.sh).
@@ -503,7 +503,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 if (!gatewayModelAvailable(resolved, catalog)) {
                     throw new GatewayError('EZiL AI: This model is not available right now.', undefined, 'model_disabled', undefined, undefined, 'local');
                 }
-                // Not in the account's OS plan (Free: Gemini 3.8 Flash only): refused here, so nothing is sent, held or
+                // Not in the account's OS plan (Free: Flash and two fallbacks): refused here, so nothing is sent, held or
                 // charged. No billing dialog either: a saved pick, an agent's or subagent's model choice or a stale
                 // picker reaches this, and only a pick in the picker offers the upgrade (lockedModelChosen).
                 const plan = catalog ?? knownGatewayPlan(resolved.provider);

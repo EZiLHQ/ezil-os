@@ -36,6 +36,7 @@ import { and, eq, isNull } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { computers } from '@/server/db/schema';
+import { enqueueFreeAiCreditsFor } from '@/server/billing/ai-balance';
 import { getBillingDeps } from '@/server/billing/deps';
 import { gateComputerStart } from '@/server/billing/v2/compute-access';
 import { aiIncludedModelsFor } from '@/server/billing/v3/ai-models';
@@ -307,6 +308,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 ok: false as const, error: `billing_${gate.reason}`, errorCode: `billing_${gate.reason}`,
                 billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
             }, startedAt);
+            // A new Free account's starter credits, before its first AI request (idempotent; never blocks the open).
+            await enqueueFreeAiCreditsFor(billingDeps, ctx.user.id);
             // EZiL Chat: AWS and Cloudflare computers share the per-computer credential store.
             await syncAiCredential({
                 config, hmacSecret,
@@ -825,6 +828,8 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 ok: false as const, error: `billing_${gate.reason}`, errorCode: `billing_${gate.reason}`,
                 billingRefusal: gate.reason, provider: 'cloudflare-guacamole' as const,
             }, startedAt);
+            // A new Free account's starter credits, before its first AI request (idempotent; never blocks the open).
+            await enqueueFreeAiCreditsFor(billingDeps, ctx.user.id);
             // EZiL Chat: AWS and Cloudflare computers share the per-computer credential store.
             const syncCredential = () => syncAiCredential({
                 config, hmacSecret,

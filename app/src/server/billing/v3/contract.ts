@@ -407,6 +407,13 @@ export interface BillingSummaryV3 {
         /** Round 5 D1 (additive): whole credits granted but parked until enrollment; null when none. */
         waiting: { credits: number } | null;
         /**
+         * Additive, `enrolled` only: whole credits granted to this account (stored receipts) that the Gateway has
+         * not acknowledged yet, e.g. a new Free account's starter grant between the first summary and the
+         * outbox drain. Never part of `balance` or `account`; a zero balance beside it is not exhaustion.
+         * Absent when nothing is on its way or receipts are unreadable.
+         */
+        delivering?: { credits: number };
+        /**
          * Identity-based credits (additive; always present from this server, so a shell can tell an
          * unavailable balance from an older server that omits the key). See `AiAccountV3`.
          */

@@ -1,3 +1,4 @@
+import './billing-pending-test.mjs';
 import { v3CopyForAudit, honestyBans } from './billing-copy-test-helpers.mjs';
 // Billing v2: real shell + tRPC client, jsdom, fake fetch and injected sheets.
 import { summaryV3, trialSummaryV3 } from './billing-v3-fixtures.mjs';
@@ -991,7 +992,7 @@ try {
         const ai = () => q('[data-role="meter-ai"]');
         summary = withAccount(worked); await refresh();
         assert.equal(ai().querySelector('.ezil-billing-meter-value').textContent, '1,246 credits left of 1,500');
-        contains('[data-role="meter-ai"] [data-role="ai-details"]', 'Plan 1,000 · Added 500 · Used 252.75 · Reserved 0.5 · Remaining 1,246.75');
+        contains('[data-role="meter-ai"] [data-role="ai-details"]', 'Plan 1,000 · Added 500 · Used 252 · Reserved 0 · Remaining 1,246');
         assert.equal(ai().querySelector('[role="meter"]').getAttribute('aria-valuenow'), '83');
         assert.deepEqual(qa('[data-role="ai-details"] span[title]').map(span => span.title), ['1,000 credits', '500 credits', '252.75 credits', '0.5 credits', '1,246.75 credits']);
         contains('[data-role="meter-ai"]', '500 added · expire Jun 1, 2027');

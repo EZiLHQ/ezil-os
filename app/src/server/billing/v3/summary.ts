@@ -359,6 +359,22 @@ now: Date): BillingSummaryV3['plan']['trial'] | undefined {
     return sub.cancelAtPeriodEnd ? { ...base, state: 'ending', firstChargeAt: null } : { ...base, state: 'trialing', firstChargeAt: endsAt };
 }
 
+/**
+ * `ai.enrollment`, `ai.waiting`, `ai.account` and `ai.delivering` exactly as `buildSummaryV3` derives them, from the same
+ * plan, for `billing.aiAccount`: the Usage poll's balance read, which needs no compute, Stripe or catalog input.
+ */
+export function aiAccountSummaryV3(input: { subs: Input['subs']; userCreatedAt: Input['userCreatedAt']; paymentIssues: Input['paymentIssues'];
+    operatorGrants?: readonly OperatorEntitlementRow[]; enrollment: BillingSummaryV3['ai']['enrollment']; now: Date;
+    ai: NonNullable<Parameters<typeof buildSummaryV3>[0]['ai']> }): Pick<BillingSummaryV3['ai'], 'enrollment' | 'waiting' | 'delivering'> & { account: AiAccountV3 } {
+    const operator = operatorAccessFor({ subscriptions: input.subs, paymentIssues: input.paymentIssues, grants: input.operatorGrants, now: input.now });
+    const plan = planFromSubscriptions({ subs: input.subs, now: input.now, userCreatedAt: input.userCreatedAt, operator });
+    const enrolled = input.enrollment === 'enrolled';
+    const delivering = enrolled ? waitingCredits(input.ai.receipts, input.now) : null;
+    return { enrollment: input.enrollment, waiting: enrolled ? null : waitingCredits(input.ai.receipts, input.now),
+        account: aiAccountV3({ plan, ...input.ai, now: input.now }), ...(delivering ? { delivering } : {}) };
+}
+type Input = Parameters<typeof buildSummaryV2>[0];
+
 export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     /** Next invoice preview for this subscription, including discounts/tax/credits. Null when unavailable. */
     renewal?: BillingSummaryV3['plan']['renewal'];
@@ -447,6 +463,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
     const trial = operator ? undefined : trialBlock(input.subs.find(sub => sub.stripeSubscriptionId === plan.subscriptionId), plan.sku,
         paymentIssue !== null, input.renewal ?? null, input.now);
     const enrollment = input.enrollment?.state ?? 'enrolled';
+    // Undelivered receipts of an enrolled account are on their way (the outbox drain), not parked.
+    const delivering = enrollment === 'enrolled' ? waitingCredits(input.ai?.receipts ?? null, input.now) : null;
     return {
         enabled: true, version: 3,
         plan: { sku: plan.sku, name: plan.sku === 'legacy' ? plan.offer.family === 'pro_legacy' ? 'Pro (legacy)'
@@ -476,6 +494,7 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         // An operator grant includes no AI credits (product entitlements v1: credits are never granted with access).
         ai: { grant: plan.sku === 'legacy' || operator ? { amount: 0, per: 'period' } : { ...plan.offer.aiCredits }, balance: null, state: 'unavailable',
             enrollment, waiting: enrollment === 'enrolled' ? null : waitingCredits(input.ai?.receipts ?? null, input.now),
+            ...(delivering ? { delivering } : {}),
             ...(input.ai ? { ...aiCreditBuckets({ plan, ...input.ai }), balance: creditNumber(input.ai.balanceMicro),
                 account: aiAccountV3({ plan, ...input.ai, now: input.now }) } : {}) },
         fairUse: { status: unmetered ? 'ok' : fairUseStatusOf({ usedSeconds, fairUseSeconds: allowance }), resetsAt: rated.window.end,

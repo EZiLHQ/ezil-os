@@ -52,7 +52,7 @@ app. There is no `launcher` app in the registry today.
   `/os?settings=billing&section=ai-credits&reason=insufficient_credits` is the
   link Code shows outside an OS window when EZiL AI credits run out. Billing
   opens what its own summary calls for (`billingRecoveryAction`): the Standard
-  upgrade on Free (Free includes Gemini 3.8 Flash only), and Add credits on a
+  upgrade on Free (Free includes Gemini 3.8 Flash and two low-tier fallbacks), and Add credits on a
   paid plan. Inside an OS window, Code asks through the Worker's billing
   bridge instead (`ui/Settings/billing-recovery.js`), and Settings opens with
   the same request in its launch context. No URL carries it.

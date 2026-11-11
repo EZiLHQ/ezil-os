@@ -182,6 +182,15 @@ export function creditsDecimal (micro, digits = 2) {
     return (n / MICRO).toLocaleString('en-US') + (fraction ? `.${fraction}` : '');
 }
 
+/**
+ * Whole credits, floored (founder decision 2026-11-11): every USER balance, total, used, remaining and reserved label is a whole
+ * number that never shows more than the account has: 99.999 is "99". The exact microcredit amount is never touched; this is
+ * display only. A negative or unreadable value is null (never a fake 0).
+ */
+export function creditsWhole (micro) {
+    return creditsDecimal(micro, 0);
+}
+
 /** "14:02": the local clock time of an ISO instant (the "as of" of a kept balance). */
 export function clockLabel (iso) {
     const time = Date.parse(iso ?? '');
@@ -193,7 +202,7 @@ const KIND_ORDER = ['plan', 'starter', 'previous', 'purchased', 'added'];
 /**
  * Identity credits for Usage and Billing, from `summary.ai.account` only. The headline is whole
  * credits (floor, OS-INTEGRATION-CONTRACT §7): "1,246 credits left of 1,500"; the details are
- * exact to 2 decimals (floored) with every microcredit in `full`. The denominator is the total of
+ * whole floored credits too (founder decision 2026-11-11), in `text` and `full` alike. The denominator is the total of
  * the account's live grants, never the catalog, and only when above 0. `low`: at most 10% of that
  * total is left. null = no readable balance: say so, show no figure.
  * `previous` (the last good block for the same user) stands in when this one is unreadable, with
@@ -206,7 +215,8 @@ export function accountCredits (account, { previous = null, userId = null, planS
     if ( ! shown ) return null;
     const remaining = microOf(shown.remainingMicro), total = microOf(shown.totalMicro);
     const held = microOf(shown.heldMicro), used = microOf(shown.usedMicro);
-    const part = (label, micro) => ({ label, text: creditsDecimal(micro), full: creditsDecimal(micro, 6) });
+    // Whole floored credits in the line and in its hover title alike: no user-visible label shows a fraction.
+    const part = (label, micro) => ({ label, text: creditsWhole(micro), full: creditsWhole(micro) });
     const kinds = new Map();
     const grants = shown.labelled === true && Array.isArray(shown.grants) ? shown.grants : [];
     for ( const grant of grants ) {
@@ -246,7 +256,7 @@ export function staleCreditsCopy (asOf) {
     return `Couldn't refresh${clock ? ` · as of ${clock}` : ''}`;
 }
 
-/** "Plan 1,000 · Added 500 · Used 252.75 · Reserved 0.5 · Remaining 1,246.75" as HTML, each value titled with every microcredit. */
+/** "Plan 1,000 · Added 500 · Used 252 · Reserved 0 · Remaining 1,246" as HTML: whole floored credits, in the text and in its title. */
 export function accountDetailsHtml (details, encode) {
     return details.map(({ label, text, full }) => `${encode(label)} <span title="${encode(`${full} credits`)}">${encode(text)}</span>`).join(' · ');
 }
