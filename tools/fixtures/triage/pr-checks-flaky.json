@@ -1,5 +1,5 @@
 [
-  { "name": "shell (bundle check + browser suites) (ubuntu-latest)", "bucket": "fail", "state": "FAILURE" },
+  { "name": "shell (bundle check + browser suites) (ubuntu-24.04)", "bucket": "fail", "state": "FAILURE" },
   { "name": "shell (bundle check + browser suites) (windows-latest)", "bucket": "pass", "state": "SUCCESS" },
   { "name": "shell (bundle check + browser suites) (macos-latest)", "bucket": "pass", "state": "SUCCESS" },
   { "name": "worker (typecheck + unit) (ubuntu-latest)", "bucket": "pass", "state": "SUCCESS" },

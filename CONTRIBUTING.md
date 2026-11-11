@@ -109,7 +109,7 @@ will not offer the merge button until every one of these exact names is green:
 - `sdk + mcp (typecheck + unit) (ubuntu-latest)`
 - `sdk + mcp (typecheck + unit) (windows-latest)`
 - `sdk + mcp (typecheck + unit) (macos-latest)`
-- `shell (bundle check + browser suites) (ubuntu-latest)`
+- `shell (bundle check + browser suites) (ubuntu-24.04)`
 - `shell (bundle check + browser suites) (windows-latest)`
 - `shell (bundle check + browser suites) (macos-latest)`
 - `tools (typecheck + unit)`

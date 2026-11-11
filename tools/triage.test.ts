@@ -219,7 +219,7 @@ describe("the check discriminator: not-required-red > ci-flaky > ci-red", () => 
 	});
 
 	it("positive control: a required leg red-on-PR/green-on-main from the SAME main is ci-flaky", () => {
-		const shellOnly: Check[] = [{ name: "shell (bundle check + browser suites) (ubuntu-latest)", bucket: "fail" }];
+		const shellOnly: Check[] = [{ name: "shell (bundle check + browser suites) (ubuntu-24.04)", bucket: "fail" }];
 		expect([...classifyChecks(shellOnly, mainChecks)]).toEqual(["ci-flaky"]);
 	});
 
