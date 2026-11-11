@@ -38,6 +38,24 @@ function harness(doFetch: typeof fetch, currentProvider: () => ResolvedProvider 
 }
 
 describe('EZiL AI Gateway status', () => {
+    test('a new pending answer replaces a previous zero snapshot without exhaustion or purchase copy', async () => {
+        let pending = false;
+        const plain = server({ available_micro: 0, held_micro: 0 });
+        const doFetch = (async (url: string | URL | Request, init?: RequestInit) => pending && new URL(String(url)).pathname.endsWith('/me/balance')
+            ? Response.json({ error: { code: 'os_credits_pending' } }, { status: 503 }) : plain.fetch(url, init)) as typeof fetch;
+        const h = harness(doFetch);
+        try {
+            await h.status.refresh();
+            expect(h.item.text).toContain('0 credits');
+            pending = true;
+            await h.status.show();
+            expect(h.item.text).toBe('EZiL AI · Confirming credits');
+            expect(h.item.tooltip).toContain('Your AI credits are being confirmed');
+            expect(h.item.tooltip).not.toMatch(/0 credits|No AI credits|Add credits|Upgrade/);
+            expect(JSON.stringify(h.popover.mock.calls)).not.toMatch(/No AI credits|Add credits|Upgrade/);
+        } finally { h.status.dispose(); }
+    });
+
     test('shows window credits and local reset time in the item, tooltip and popover', async () => {
         const h = harness(server({ ...balance, window: creditWindow }).fetch);
         const date = new Date(creditWindow.resets_at);

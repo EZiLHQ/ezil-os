@@ -616,11 +616,11 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 void this.askBilling({ reason: 'window_limit', requestId: error.requestId, ...error.resetsAt ? { resetsAt: error.resetsAt } : {} })
                     .then(opened => opened ? undefined : Promise.resolve(vscode.window.showWarningMessage(message)).then(() => undefined)).catch(() => {});
             }
-            // An unknown plan refuses a turn's title and progress requests too: its notice shows at most once a minute.
-            const planUnknown = error instanceof GatewayError && error.code === 'os_plan_unavailable';
-            if (error instanceof GatewayError && ['first_byte_timeout', 'stream_idle_timeout', 'os_unreachable', 'os_ai_unavailable', 'upstream_timeout', 'os_plan_unavailable'].includes(error.code ?? '')
-                && !(planUnknown && Date.now() - this.lastPlanNoticeAt < 60_000)) {
-                if (planUnknown) this.lastPlanNoticeAt = Date.now();
+            // Unconfirmed plans or credits refuse utility requests too: their retry notice appears at most once a minute.
+            const confirmationUnknown = error instanceof GatewayError && ['os_plan_unavailable', 'os_credits_pending'].includes(error.code ?? '');
+            if (error instanceof GatewayError && ['first_byte_timeout', 'stream_idle_timeout', 'os_unreachable', 'os_ai_unavailable', 'upstream_timeout', 'os_plan_unavailable', 'os_credits_pending'].includes(error.code ?? '')
+                && !(confirmationUnknown && Date.now() - this.lastPlanNoticeAt < 60_000)) {
+                if (confirmationUnknown) this.lastPlanNoticeAt = Date.now();
                 // Do not await a notification: the failed turn must leave Thinking immediately.
                 void Promise.resolve(vscode.window.showErrorMessage(message, 'Retry')).then(choice => {
                     if (choice === 'Retry') return vscode.commands.executeCommand('workbench.action.chat.retry');

@@ -164,6 +164,7 @@ function statusProblem(result: { code?: string; reason?: string }): { label: str
         || ['os_session_expired', 'access_token_expired', 'token_expired', 'expired'].includes(result.code ?? '')) {
         return { label: 'Session expired', detail: 'Your AI sign-in has expired. Reopen Code or sign in to EZiL OS again.', attention: true };
     }
+    if (result.code === 'os_credits_pending') return { label: 'Confirming credits', detail: 'Your AI credits are being confirmed. Please try again shortly.', attention: true };
     if (result.code === 'not_configured') return { label: 'Not configured', detail: 'EZiL AI is not configured for this computer.', attention: true };
     if (result.code === 'os_session_missing') return { label: 'Sign-in needed', detail: 'This computer has not received an AI sign-in. Open EZiL OS and reopen Code. If this persists, check your account access.', attention: true };
     if (result.reason === 'no_ezil_role' || ['not_a_member', 'no_ezil_role', 'role_mismatch', 'forbidden', 'http_403'].includes(result.code ?? '')) {

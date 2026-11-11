@@ -591,6 +591,7 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
             if (body.reason === 'wrong_issuer') return make('EZiL AI does not accept this account’s sign-in (this OS environment is not connected to EZiL AI)');
             if (body.reason === 'bad_signature') return make('EZiL AI could not verify this account’s sign-in signature. Contact your administrator');
             return make('EZiL AI refused this account’s sign-in. Contact your administrator');
+        case 'os_credits_pending': return make('Your AI credits are being confirmed. Please try again shortly');
         case 'os_ai_unavailable': return make('Could not reach EZiL AI. Retry the request');
         case 'os_completion_timeout': return make(`No complete reply from EZiL AI within ${GATEWAY_COMPLETION_TIMEOUT_MS / 1000} seconds, so EZiL OS stopped waiting. `
             + 'The request may still be charged if the model finished, never more than EZiL AI settles for it. You can retry or switch to a streaming model');

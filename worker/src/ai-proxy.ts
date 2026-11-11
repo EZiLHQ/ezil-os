@@ -266,6 +266,27 @@ export function usableAiCredential(stored: StoredAiCredential | undefined, now: 
   return stored.expiresAt - AI_CREDENTIAL_MIN_REMAINING_MS > now ? stored.token : null;
 }
 
+/** Signed receipt status, deliberately separate from model permissions and credentials. */
+export interface StoredAiCreditsPending { readonly pending: boolean | null; readonly signedAt: number }
+export const AI_CREDITS_PENDING_STORAGE_KEY = 'ezil-ai-credits-pending-v1';
+export const AI_CREDITS_PENDING_MAX_AGE_MS = 30 * 60_000;
+export type CreditsRelay = 'legacy' | 'none' | 'pending' | 'unknown';
+
+/** No answer is legacy; explicit null and stale/malformed answers are unknown, never measured zero. */
+export function currentCreditsRelay(stored: StoredAiCreditsPending | undefined, now = Date.now()): CreditsRelay {
+  if (stored === undefined) return 'legacy';
+  if (!stored || typeof stored.signedAt !== 'number' || !Number.isFinite(stored.signedAt)
+    || now < stored.signedAt || now - stored.signedAt > AI_CREDITS_PENDING_MAX_AGE_MS) return 'unknown';
+  return stored.pending === true ? 'pending' : stored.pending === false ? 'none' : 'unknown';
+}
+
+/** Missing means an older producer/omitted update; null says a new producer could not read its receipts. */
+export function parsePushedCreditsPending(value: unknown):
+  { ok: true; creditsPending: boolean | null | undefined } | { ok: false; error: string } {
+  return value === undefined || value === null || typeof value === 'boolean'
+    ? { ok: true, creditsPending: value } : { ok: false, error: 'credits_pending_malformed' };
+}
+
 /**
  * The models the owner's plan includes, as the Next server last pushed them (billing v3 `aiIncludedModels`): `null`
  * is every model, an explicit and verified answer. Kept apart from the token, so a push that keeps an older token still
@@ -342,6 +363,8 @@ export interface AiProxyDeps {
   readonly credential: () => Promise<string | null>;
   /** The models the owner's plan includes (`currentModelAccess`); unknown refuses inference as a temporary failure. */
   readonly modelAccess: () => Promise<AiModelAccess>;
+  /** Signed receipt status, independently ordered; storage failure is unknown. */
+  readonly creditsRelay?: () => Promise<CreditsRelay>;
   /** Forget `token` if it is still the stored one (after a gateway 401). */
   readonly dropCredential: (token: string) => Promise<void>;
   readonly fetch: (input: Request) => Promise<Response>;
@@ -695,6 +718,22 @@ function safeGatewayError(bytes: Uint8Array | null): Record<string, unknown> {
 /** An RFC 3339 timestamp as the Gateway's database writes it (`2026-11-09T21:05:33.123456+00:00`) or in UTC (`…Z`). */
 const WINDOW_RESET = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$/;
 
+const CREDITS_PENDING_MESSAGE = 'Your AI credits are being confirmed. Please try again shortly.';
+async function creditsUnconfirmed(deps: AiProxyDeps): Promise<boolean> {
+  if (!deps.creditsRelay) return false;
+  try {
+    const answer = await deps.creditsRelay();
+    return answer === 'pending' || answer === 'unknown';
+  } catch { return true; }
+}
+function walletIsZero(bytes: Uint8Array): boolean {
+  try {
+    const value: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+      && (value as { available_micro?: unknown }).available_micro === 0;
+  } catch { return false; }
+}
+
 /**
  * Handle one request under `/ai` on a code bridge host. Order: route
  * allow-list (404) -> proxy token (401 `os_proxy_unauthorized`) -> stored user
@@ -848,6 +887,13 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
       const bytes = await readLimited(passThrough(upstream.body, deps.idleTimeoutMs ?? AI_PROXY_IDLE_TIMEOUT_MS,
         false, () => {}, abort, false), MAX_ERROR_BODY_BYTES);
       const error = safeGatewayError(bytes);
+      // A positive wallet is a real request-size refusal even while another grant is pending.
+      if ((error.code === 'insufficient_credits' || error.code === 'no_live_grant')
+        && !(typeof error.available_micro === 'number' && error.available_micro > 0) && await creditsUnconfirmed(deps)) {
+        cleanup();
+        log({ status: 503, code: 'os_credits_pending', upstream_code: error.code, request_id: requestId });
+        return proxyError(503, 'os_credits_pending', CREDITS_PENDING_MESSAGE);
+      }
       // Configuration/membership failures do not become a misleading OS session failure on the next call.
       if (upstream.status === 401 && (error.reason === 'expired' || error.reason === 'token_expired')) {
         await deps.dropCredential(token).catch(() => undefined);
@@ -860,6 +906,30 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
     } catch {
       cleanup();
       return proxyError(504, 'os_ai_unavailable', 'EZiL AI did not finish its error response. Retry the request.');
+    }
+  }
+
+  if (route.upstreamPath === '/v1/me/balance' && await creditsUnconfirmed(deps)) {
+    // Consume the original under the existing idle deadline, never an unbounded clone. Reconstruct positive or
+    // unrecognized responses byte-for-byte; the extension validates their shape as before.
+    try {
+      const bytes = await readLimited(passThrough(upstream.body, deps.idleTimeoutMs ?? AI_PROXY_IDLE_TIMEOUT_MS,
+        false, () => {}, abort, false), MAX_ERROR_BODY_BYTES);
+      cleanup();
+      if (bytes === null) {
+        abort.abort();
+        return proxyError(502, 'os_ai_unavailable', 'EZiL AI returned an unreadable balance. Retry the request.');
+      }
+      if (walletIsZero(bytes)) {
+        log({ status: 503, code: 'os_credits_pending', upstream_code: 'zero_balance', request_id: requestId });
+        return proxyError(503, 'os_credits_pending', CREDITS_PENDING_MESSAGE);
+      }
+      log({ status: upstream.status, code: null, request_id: requestId });
+      return new Response(bytes, { status: upstream.status, headers: outHeaders });
+    } catch {
+      abort.abort();
+      cleanup();
+      return proxyError(504, 'os_ai_unavailable', 'EZiL AI did not finish its balance response. Retry the request.');
     }
   }
 
