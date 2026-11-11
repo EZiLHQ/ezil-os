@@ -1,4 +1,4 @@
-// Local screenshot imports. Caller MUST open the redaction editor before attaching.
+// Local screenshot imports. The caller re-encodes the pixels before attaching; the redaction editor is the explicit Edit step.
 // Original file bytes, filenames and metadata are never uploaded by this module.
 const SOURCE_BYTES_MAX = 8 * 1024 * 1024;
 // A pasted or saved screenshot from a 5K/6K or HiDPI display is wider than 4096 px. It is decoded once
