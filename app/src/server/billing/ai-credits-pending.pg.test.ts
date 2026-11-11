@@ -42,7 +42,7 @@ describe.skipIf(!fixtureUrl)('pending credit evidence with actual PostgreSQL', (
             values (${options.owner ?? OWNER}::uuid, ${options.kind ?? 'ai_grant'},
                 ${JSON.stringify(options.body ?? payload())}::jsonb, ${options.delivered ? NOW.toISOString() : null}::timestamptz)`;
     }
-    const pending = () => aiCreditsPendingFor(OWNER, database as Parameters<typeof aiCreditsPendingFor>[1], NOW);
+    const pending = () => aiCreditsPendingFor(OWNER, database as unknown as Parameters<typeof aiCreditsPendingFor>[1], NOW);
 
     it('proves an empty negative, then reads a live whole-credit receipt', async () => {
         expect(await pending()).toBe(false);
