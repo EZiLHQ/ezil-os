@@ -31,6 +31,7 @@ const CALLERS = [
     'server/api/routers/computer.ts',
     'server/api/routers/compute-dispatch.ts',
     'server/lib/compute/stop-policy.ts',
+    'server/computer-start/port.ts',
     'app/api/cron/billing-session-sweep/route.ts',
     'app/api/cron/billing-session-sweep/handler.ts',
     'app/api/cron/sandbox-reap/route.ts',
@@ -42,7 +43,7 @@ const CALLERS = [
  * (`server/api/routers/compute-dispatch.ts`). A router that named a selector or
  * an adapter directly would have a path that ignores the computer's placement.
  */
-const ROUTERS = ['server/api/routers/cloudflare-guacamole.ts', 'server/api/routers/computer.ts'];
+const ROUTERS = ['server/api/routers/cloudflare-guacamole.ts', 'server/api/routers/computer.ts', 'server/computer-start/port.ts'];
 const DIRECT_SELECTORS = [
     'selectComputeProvider',
     'resolveComputeProvider',
