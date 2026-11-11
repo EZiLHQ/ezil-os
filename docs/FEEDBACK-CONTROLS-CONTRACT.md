@@ -330,6 +330,15 @@ table: no DDL, no bucket, no URL, no image GET.
     - each image's `created_at` becomes now plus its position (this order is what the admin viewer shows)
     - the report row is inserted with the ticket as its id
   - The rows are under an hour old, so moving them keeps the global sums unchanged.
+- **Account guard.** The shell sends `X-EZiL-Feedback-Account: <boot user id>` on every PUT and every POST it makes.
+  The server compares it with the signed-in user only; it is not an identity or permission.
+  - It is checked before the body is read or the DB is touched.
+  - A malformed header is 400 `invalid_account_header`.
+  - A different account is 409 `account_changed`, which never echoes either id.
+  - The header is required on PUT and with `screenshotRefs` (400 `account_header_required`).
+  - On a legacy inline POST it is optional, and is checked only when present.
+  - This keeps one account's staged images from being sent under another account's cookie after a cross-tab
+    account switch.
 - **Visibility.** Staged rows have no report row. The reporter's list, the admin list and detail, and `findScreenshot`
   never show them.
 - **Cleanup.** The existing maintenance cron deletes staged rows with no report after 24 h (`retention.ts`). Finalize

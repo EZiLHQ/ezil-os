@@ -15,6 +15,20 @@ export interface FeedbackHandlerDeps {
 
 const invalidRequest = () => shellJson({ error: 'invalid_request' }, 400);
 
+/**
+ * Upload-first spans several requests, and the session cookie can change between them (another tab signs in as
+ * someone else). The shell names the account it froze the report for in this header; it is compared with the
+ * signed-in user only, never trusted as an identity. Required for staging and `screenshotRefs`, checked when present
+ * on any other POST. 'absent' = no header; null = this account; otherwise the refusal (which never names the other account).
+ */
+export const FEEDBACK_ACCOUNT_HEADER = 'x-ezil-feedback-account';
+function accountRefusal(req: Request, userId: string): Response | null | 'absent' {
+    const value = req.headers.get(FEEDBACK_ACCOUNT_HEADER);
+    if (value === null) return 'absent';
+    if (!z.string().uuid().safeParse(value.trim()).success) return shellJson({ error: 'invalid_account_header' }, 400);
+    return value.trim().toLowerCase() === userId.toLowerCase() ? null : shellJson({ error: 'account_changed' }, 409);
+}
+
 /** Round-3 F10: a cross-site form can only send simple content types, so a
  * JSON-only POST cannot be forged by a page that rides the lax session cookie. */
 function isJson(req: Request): boolean {
@@ -80,6 +94,9 @@ export async function handleFeedbackRequest(req: Request, deps: FeedbackHandlerD
         if (!features.feedback) return shellJson({ error: 'not_found' }, 404);
         if (req.method === 'POST') {
             if (!isJson(req)) return shellJson({ error: 'unsupported_media_type' }, 415);
+            // Before the body is read: a report frozen for another account is never stored under this one.
+            const account = accountRefusal(req, user.id);
+            if (account instanceof Response) return account;
             let raw: unknown;
             try {
                 const body = await readBoundedBody(req, features.feedbackScreenshots
@@ -90,6 +107,7 @@ export async function handleFeedbackRequest(req: Request, deps: FeedbackHandlerD
             const parsed = feedbackSubmitSchema.safeParse(raw);
             if (!parsed.success || (!features.feedbackScreenshots
                 && (submittedImages(parsed.data).length > 0 || parsed.data.screenshotRefs))) return invalidRequest();
+            if (parsed.data.screenshotRefs && account === 'absent') return shellJson({ error: 'account_header_required' }, 400);
             // The references are metadata: they count toward the small-body limit like the text.
             const metadata = { ...parsed.data, screenshot: null, screenshots: undefined };
             if (new TextEncoder().encode(JSON.stringify(metadata)).length > FEEDBACK_LIMITS.bodyBytesNoScreenshot) {
@@ -102,6 +120,9 @@ export async function handleFeedbackRequest(req: Request, deps: FeedbackHandlerD
         }
         if (req.method === 'PUT') {
             if (!features.feedbackScreenshots) return shellJson({ error: 'not_found' }, 404);
+            const account = accountRefusal(req, user.id);
+            if (account === 'absent') return shellJson({ error: 'account_header_required' }, 400);
+            if (account) return account;
             return await stageImage(req, deps, user.id, db);
         }
         if (req.method === 'GET') return shellJson({ reports: await listFeedback(db, user.id) });

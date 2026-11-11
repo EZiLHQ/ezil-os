@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { drizzle } from 'drizzle-orm/pg-proxy';
 import { describe, expect, it, vi } from 'vitest';
 import * as schema from '@/server/db/schema';
-import { handleFeedbackRequest, type FeedbackHandlerDeps } from './http-handler';
+import { FEEDBACK_ACCOUNT_HEADER, handleFeedbackRequest, type FeedbackHandlerDeps } from './http-handler';
 import type { FeedbackDb } from './ingest';
 import { FEEDBACK_LIMITS } from './types';
 
@@ -363,8 +363,19 @@ describe('report bundle byte budget', () => {
 describe('upload-first staging boundary', () => {
     const PNG_BYTES = Buffer.from(SCREENSHOT.dataBase64, 'base64');
     const REF = { sha256: 'a'.repeat(64), contentType: 'image/png' };
-    function put(body: BodyInit = PNG_BYTES, { crid = ID, type = 'image/png' }: { crid?: string; type?: string } = {}) {
-        return new Request(`${URL}?crid=${crid}`, { method: 'PUT', body, headers: { 'content-type': type } });
+    const OTHER = '550e8400-e29b-41d4-a716-4466554400ff';
+    function put(body: BodyInit = PNG_BYTES, { crid = ID, type = 'image/png', account = USER.id as string | null }: { crid?: string; type?: string; account?: string | null } = {}) {
+        return new Request(`${URL}?crid=${crid}`, { method: 'PUT', body, headers: { 'content-type': type, ...(account === null ? {} : { [FEEDBACK_ACCOUNT_HEADER]: account }) } });
+    }
+    const post = (body: unknown, account?: string) => new Request(URL, { method: 'POST', body: JSON.stringify(body),
+        headers: { ...JSON_HEADERS, ...(account === undefined ? {} : { [FEEDBACK_ACCOUNT_HEADER]: account }) } });
+    /** A body whose first read is observable: the account guard must refuse before it. */
+    function watched(method: 'PUT' | 'POST', headers: Record<string, string>) {
+        const pull = vi.fn((controller: ReadableStreamDefaultController) => { controller.enqueue(new Uint8Array(PNG_BYTES)); controller.close(); });
+        const req = new Request(method === 'PUT' ? `${URL}?crid=${ID}` : URL, { method, headers,
+            // highWaterMark 0: nothing is pulled until someone actually reads.
+            body: new ReadableStream({ pull }, { highWaterMark: 0 }), duplex: 'half' } as RequestInit);
+        return { req, pull };
     }
     const screenshotsOn = () => { const h = harness(); h.deps.env.EZIL_OS_FEEDBACK_SCREENSHOTS = '1'; return h; };
 
@@ -415,13 +426,59 @@ describe('upload-first staging boundary', () => {
 
     it('refuses references while screenshots are off', async () => {
         const h = harness();
-        expect((await handleFeedbackRequest(request({ ...VALID, screenshotRefs: [REF] }), h.deps)).status).toBe(400);
+        expect((await handleFeedbackRequest(post({ ...VALID, screenshotRefs: [REF] }, USER.id), h.deps)).status).toBe(400);
         expect(h.statements).toEqual([]);
+    });
+
+    it.each([
+        ['missing', {}, 400, 'account_header_required'],
+        ['malformed', { [FEEDBACK_ACCOUNT_HEADER]: 'alice' }, 400, 'invalid_account_header'],
+        ['for another account', { [FEEDBACK_ACCOUNT_HEADER]: OTHER }, 409, 'account_changed'],
+    ])('a PUT whose account header is %s is refused before its body is read', async (_label, account, status, error) => {
+        const h = screenshotsOn();
+        const { req, pull } = watched('PUT', { 'content-type': 'image/png', ...account });
+        const response = await handleFeedbackRequest(req, h.deps);
+        expect(response.status).toBe(status);
+        const text = await response.text();
+        expect(JSON.parse(text)).toEqual({ error });
+        // Neither account id is echoed.
+        expect(text).not.toContain(USER.id);
+        expect(text).not.toContain(OTHER);
+        expect(pull).not.toHaveBeenCalled();
+        expect(h.statements).toEqual([]);
+    });
+
+    it.each([
+        ['malformed', 'not-a-uuid', 400, 'invalid_account_header'],
+        ['for another account', OTHER, 409, 'account_changed'],
+    ])('any POST whose account header is %s is refused before its body is read', async (_label, account, status, error) => {
+        const h = screenshotsOn();
+        const { req, pull } = watched('POST', { ...JSON_HEADERS, [FEEDBACK_ACCOUNT_HEADER]: account });
+        const response = await handleFeedbackRequest(req, h.deps);
+        expect(response.status).toBe(status);
+        expect(await response.json()).toEqual({ error });
+        expect(pull).not.toHaveBeenCalled();
+        expect(h.statements).toEqual([]);
+    });
+
+    it('a finalize by reference requires the account header', async () => {
+        const h = screenshotsOn();
+        const response = await handleFeedbackRequest(post({ ...VALID, screenshotRefs: [REF] }), h.deps);
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({ error: 'account_header_required' });
+        expect(h.statements).toEqual([]);
+    });
+
+    it('legacy inline reports need no header, and a matching one (any case) is accepted', async () => {
+        for (const account of [undefined, USER.id, USER.id.toUpperCase()]) {
+            const h = screenshotsOn();
+            expect((await handleFeedbackRequest(post({ ...VALID, screenshot: SCREENSHOT }, account), h.deps)).status).toBe(201);
+        }
     });
 
     it('answers a finalize whose images are not staged with 409 and stores no report', async () => {
         const h = screenshotsOn();
-        const response = await handleFeedbackRequest(request({ ...VALID, screenshotRefs: [REF] }), h.deps);
+        const response = await handleFeedbackRequest(post({ ...VALID, screenshotRefs: [REF] }, USER.id), h.deps);
         expect(response.status).toBe(409);
         expect(await response.json()).toEqual({ error: 'staged_images_missing' });
         expect(h.statements.some(s => s.sql.startsWith('insert'))).toBe(false);
