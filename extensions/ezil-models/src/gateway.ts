@@ -76,7 +76,9 @@ export type GatewayAvailability = { state: typeof AVAILABILITY_STATES[number]; r
 /** Capability flags a row may carry. Absent means "not established": a catalog-only row gets none of them. */
 export type GatewayCapabilities = { tool_calling?: boolean; image_input?: boolean; streaming?: boolean; prompt_cache?: boolean };
 export type GatewayModel = { id: string; enabled: boolean; max_input_tokens: number; max_output_tokens: number; protocols?: readonly GatewayProtocol[];
-    availability?: GatewayAvailability; name?: string; capabilities?: GatewayCapabilities };
+    availability?: GatewayAvailability; name?: string; capabilities?: GatewayCapabilities;
+    /** Derived only from the complete raw reason list; unknown restriction reasons must not be lost. */
+    globalPauseOnly?: true };
 export type GatewayModels = { killswitch: boolean; pause: 'operations' | 'reconciliation' | null; data: GatewayModel[];
     /** v1 `default_model`: the Gateway's suggested first model for this caller (contract §2 rule 8); absent when null. */
     default_model?: string;
@@ -216,6 +218,8 @@ export function parseGatewayModels(json: unknown): GatewayModels | undefined {
         if (!v1) return row;
         const availability = availabilityOf(entry.availability);
         if (availability) row.availability = availability;
+        if (record(entry.availability) && entry.availability.state === 'unavailable' && Array.isArray(entry.availability.reasons)
+            && entry.availability.reasons.length === 1 && entry.availability.reasons[0] === 'gateway_paused') row.globalPauseOnly = true;
         if (typeof entry.name === 'string' && DISPLAY_NAME.test(entry.name.trim())) row.name = entry.name.trim();
         const capabilities = capabilitiesOf(entry.capabilities);
         if (capabilities && protocols?.length && KNOWN_PROTOCOLS.includes(protocols[0]!)) row.capabilities = capabilities;
@@ -224,6 +228,20 @@ export function parseGatewayModels(json: unknown): GatewayModels | undefined {
     const models: GatewayModels = { killswitch: raw.killswitch === true, pause: raw.pause === 'operations' || raw.pause === 'reconciliation' ? raw.pause : null, data };
     if (v1 && typeof raw.default_model === 'string' && CATALOG_ALIAS.test(raw.default_model)) models.default_model = raw.default_model;
     return models;
+}
+
+/** A global pause changes admission, not model identity. Other unavailable reasons still hide the row. */
+function pausedCatalogRow(entry: GatewayModel | undefined, catalog: GatewayModels | undefined): boolean {
+    return catalog?.killswitch === true && entry?.enabled === true && entry.globalPauseOnly === true
+        && entry.availability?.state === 'unavailable';
+}
+
+/** Picker-only availability. Requests still use `gatewayModelAvailable` and the normal pause guard. */
+export function gatewayModelListed(model: ResolvedModel, catalog: GatewayModels | undefined): boolean {
+    const entry = catalog?.data.find(entry => entry.id === model.model);
+    if (model.provider.type !== 'ezil-gateway' || !pausedCatalogRow(entry, catalog)) return gatewayModelAvailable(model, catalog);
+    const protocol = model.gatewayProtocol ?? 'anthropic-messages';
+    return entry?.protocols?.includes(protocol) === true;
 }
 
 /** Legacy catalogs imply Messages only. Responses requires an explicit, enabled catalog route. */
@@ -259,8 +277,8 @@ export function withGatewayModelLimits(model: ResolvedModel, catalog: GatewayMod
  * Contract §2 rules 1 and 7: available for this caller, over the row's first protocol this client speaks. That is the
  * route its capabilities describe (when its first protocol is one this client does not speak, it has none).
  */
-function selectableProtocol(entry: GatewayModel): GatewayProtocol | undefined {
-    if (entry.enabled !== true || entry.availability?.state !== 'available') return undefined;
+function selectableProtocol(entry: GatewayModel, catalog?: GatewayModels, listing = false): GatewayProtocol | undefined {
+    if (entry.enabled !== true || (entry.availability?.state !== 'available' && !(listing && pausedCatalogRow(entry, catalog)))) return undefined;
     return entry.protocols?.[0];
 }
 
@@ -285,14 +303,15 @@ export function parseCatalogModelId(id: string): { providerName: string; alias: 
  * on the same provider with the same alias wins; another provider's configuration never hides this account's row.
  * A catalog without `availability` adds nothing. Nothing the row does not say is assumed: tool calling, image input
  * and streaming stay off unless its capabilities turn them on (images always do, as for every Gateway model), and
- * caps are the row's own.
+ * caps are the row's own. `listing` also preserves rows whose only unavailable reason is the active global pause;
+ * that exception never changes request admission.
  */
-export function gatewayCatalogModels(provider: ResolvedProvider, catalog: GatewayModels | undefined, configured: readonly ResolvedModel[]): ResolvedModel[] {
+export function gatewayCatalogModels(provider: ResolvedProvider, catalog: GatewayModels | undefined, configured: readonly ResolvedModel[], listing = false): ResolvedModel[] {
     if (provider.type !== 'ezil-gateway' || !catalog) return [];
     const taken = new Set(configured.filter(model => model.provider.type === 'ezil-gateway' && model.providerName === provider.name).map(model => model.model.toLowerCase()));
     const models: ResolvedModel[] = [];
     for (const entry of catalog.data) {
-        const protocol = selectableProtocol(entry);
+        const protocol = selectableProtocol(entry, catalog, listing);
         if (!protocol || !CATALOG_ALIAS.test(entry.id) || taken.has(entry.id)) continue;
         taken.add(entry.id);
         models.push({

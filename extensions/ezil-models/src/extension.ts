@@ -274,7 +274,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     // VS Code 1.141 subscribes to model changes at registration and does not enumerate models
     // then; the change fired by the load above was missed, so announce the models once more.
     provider.refresh();
-    // A model list that could not be read when the picker was filled is read again until it reads (no request otherwise).
+    // Re-read an unread or globally paused catalog until it recovers; no inference and no polling for a healthy catalog.
     const recover = setInterval(() => { void provider.recoverCatalog(); }, CATALOG_RECOVERY_MS);
     recover.unref?.();
     context.subscriptions.push({ dispose: () => clearInterval(recover) });
