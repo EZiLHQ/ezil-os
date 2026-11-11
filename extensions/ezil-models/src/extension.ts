@@ -1,9 +1,11 @@
+import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { randomUUID } from 'node:crypto';
 import * as vscode from 'vscode';
+import { BRIDGE_COMMAND, ChatBridgeClient, syncUrlFrom } from './chat-bridge-client';
+import { sentEffort } from './client';
 import { ConfigError, describeConfig, parseModelsConfig, type ResolvedConfig, type ResolvedModel } from './config';
-import { forgetGatewayModels, gatewayModels } from './gateway';
+import { accountAvailableIds, forgetGatewayModels, gatewayModels } from './gateway';
 import { isAppFailure, type AppFailure } from './failure';
 import { CompactionNotice } from './compaction-notice';
 import { EZiLAIStatus } from './status';
@@ -359,7 +361,37 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     } catch (error) {
         log(`[activate] @ezil participant not registered: ${error instanceof Error ? error.message : String(error)}`);
     }
-    log(`[activate] config path ${store.path}${process.env[CONFIG_ENV] ? ` (from ${CONFIG_ENV})` : ''}; proposals: languageModelThinkingPart=${'LanguageModelThinkingPart' in vscode} languageModelSystem=${(vscode.LanguageModelChatMessageRole as unknown as Record<string, unknown>).System === 3}; participant=${participant}`);
+    // EZiL Chat bridge (chat-bridge-client.ts): only when ezil.chatBridge.enabled is true (the same setting the
+    // workbench side reads) and this computer was given an editor-bridge token. One owner id per window's extension host.
+    const bridgeSync = syncUrlFrom(process.env.EZIL_AI_BASE_URL);
+    // The bridge's own boot token (Worker editor-bridge.ts), never the AI proxy token.
+    const bridgeToken = process.env.EZIL_EDITOR_BRIDGE_TOKEN ?? '';
+    let chatBridge = 'off';
+    if (vscode.workspace.getConfiguration('ezil').get('chatBridge.enabled') === true && bridgeSync && /^[0-9a-f]{64}$/.test(bridgeToken)) {
+        const client = new ChatBridgeClient({
+            syncUrl: bridgeSync, token: bridgeToken, ownerId: `ext.${randomUUID()}`, log,
+            execute: (request) => Promise.resolve(vscode.commands.executeCommand(BRIDGE_COMMAND, request)),
+            fetch: (url, init) => fetch(url, init),
+            ensureAgent: async () => {
+                const agent = vscode.extensions.getExtension('GitHub.copilot-chat');
+                if (!agent) return false;
+                if (!agent.isActive) await agent.activate();
+                return agent.isActive;
+            },
+            // Which of its own picker models the EZiL Gateway allows this computer's account to use, from a fresh
+            // `/v1/models` read with the computer's AI token (never the static config, an older read or the request).
+            availableIds: (ids) => accountAvailableIds(store.models(), ids, fetch),
+            // The effort this extension really sends for its own model (none through the Gateway), read-only.
+            effortOf: (modelId) => {
+                const model = store.models().find((candidate) => candidate.id === modelId);
+                return model ? sentEffort(model) : null;
+            },
+        });
+        client.start();
+        context.subscriptions.push({ dispose: () => client.stop() });
+        chatBridge = 'on';
+    }
+    log(`[activate] config path ${store.path}${process.env[CONFIG_ENV] ? ` (from ${CONFIG_ENV})` : ''}; proposals: languageModelThinkingPart=${'LanguageModelThinkingPart' in vscode} languageModelSystem=${(vscode.LanguageModelChatMessageRole as unknown as Record<string, unknown>).System === 3}; participant=${participant}; chatBridge=${chatBridge}`);
 }
 
 export function deactivate(): void {}

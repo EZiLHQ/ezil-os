@@ -1,0 +1,86 @@
+{
+  "providers": {
+    "ezil": {
+      "type": "ezil-gateway",
+      "baseUrl": "{env:EZIL_AI_BASE_URL}",
+      "apiKey": "{env:EZIL_AI_PROXY_TOKEN}"
+    },
+    "direct": {
+      "type": "anthropic",
+      "baseUrl": "{env:EZIL_AI_BASE_URL}",
+      "apiKey": "{env:EZIL_AI_PROXY_TOKEN}"
+    }
+  },
+  "models": [
+    {
+      "id": "qwen.qwen3-coder-next",
+      "model": "qwen.qwen3-coder-next",
+      "name": "Qwen3 Coder Next",
+      "provider": "ezil",
+      "family": "qwen",
+      "default": true,
+      "roles": [
+        "default",
+        "plan",
+        "utility",
+        "utilitySmall"
+      ],
+      "stream": true,
+      "maxInputTokens": 131072,
+      "maxOutputTokens": 8192,
+      "capabilities": {
+        "toolCalling": true,
+        "imageInput": false
+      }
+    },
+    {
+      "id": "us.moonshotai.kimi-k3",
+      "model": "us.moonshotai.kimi-k3",
+      "name": "Kimi K3 (no streaming)",
+      "provider": "ezil",
+      "family": "kimi",
+      "stream": false,
+      "maxInputTokens": 131072,
+      "maxOutputTokens": 4096,
+      "capabilities": {
+        "toolCalling": true,
+        "imageInput": false
+      }
+    },
+    {
+      "id": "effort-probe-direct",
+      "model": "claude-effort-probe",
+      "name": "Effort Probe Direct (never sent)",
+      "provider": "direct",
+      "family": "claude",
+      "maxInputTokens": 131072,
+      "maxOutputTokens": 8192,
+      "thinking": {
+        "type": "adaptive",
+        "effort": "high"
+      },
+      "capabilities": {
+        "toolCalling": true,
+        "imageInput": false
+      }
+    },
+    {
+      "id": "effort-probe-gateway",
+      "model": "qwen.qwen3-coder-next",
+      "name": "Effort Probe Gateway (never sent)",
+      "provider": "ezil",
+      "family": "qwen",
+      "stream": true,
+      "maxInputTokens": 131072,
+      "maxOutputTokens": 8192,
+      "thinking": {
+        "type": "adaptive",
+        "effort": "max"
+      },
+      "capabilities": {
+        "toolCalling": true,
+        "imageInput": false
+      }
+    }
+  ]
+}

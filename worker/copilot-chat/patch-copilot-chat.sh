@@ -227,6 +227,25 @@ P_TOUCH_CHIP='this._renderDisposables.add(hs.addTarget(t));for(let i of[oe.CLICK
 P_TOUCH_GESTURE='var hs=tx;'
 P_TOUCH_TAP='var jn;(n=>(n.Tap="-monaco-gesturetap",'
 P_TOUCH_DOWN='var oe={CLICK:"click",AUXCLICK:"auxclick",DBLCLICK:"dblclick",MOUSE_UP:"mouseup",MOUSE_DOWN:"mousedown",'
+# Part 4 — EZiL Chat bridge (workbench.js, PATCHES.md "Chat bridge"). ChatViewPane gains
+# _ezilChatBridge() just before createControls, which calls it before the chat header. When the setting
+# ezil.chatBridge.enabled is true it registers the internal command _ezil.chatBridge.v1, built from
+# chat-bridge.js next to this script, with the same in-scope command registry (qe) the pane already
+# uses for its _chat.voice.* commands. Off by default: without the setting nothing is registered.
+# Both anchors are inside the [chat-header] patch's output, so this runs after it.
+BRIDGE_JS_FILE="$(dirname "$0")/chat-bridge.js"
+[ -s "$BRIDGE_JS_FILE" ] || { echo "patch-copilot-chat: missing $BRIDGE_JS_FILE" >&2; exit 1; }
+BRIDGE_JS="$(cat "$BRIDGE_JS_FILE")"
+P_BRIDGE_SCOPE='this._voiceBarDisposables.add(qe.registerCommand("_chat.voice.acceptInput",'
+P_BRIDGE_SERVICES='this.chatWidgetService=ee;this.workspaceContextService=De;'
+P_BRIDGE_CHAT='this.storageService=h;this.chatService=g;this.chatAgentService=f;this.logService=v;'
+A_BRIDGE_METHOD='createControls(e){let t=this.createSessionsControl(e),'
+R_BRIDGE_METHOD='_ezilChatBridge(){if(this.configurationService.getValue("ezil.chatBridge.enabled")!==!0||globalThis.__ezilChatBridgeV1)return;let b=('"$BRIDGE_JS"')({chatService:this.chatService,chatWidgetService:this.chatWidgetService,workspaceFolders:()=>this.workspaceContextService.getWorkspace().folders.map(w=>w.uri.toString()),log:m=>this.logService.info("EZiL chat bridge: "+m)}),c=qe.registerCommand("_ezil.chatBridge.v1",(a,r)=>b.handle(r));globalThis.__ezilChatBridgeV1=!0;this._register({dispose:()=>{c.dispose(),b.dispose(),globalThis.__ezilChatBridgeV1=!1}})}createControls(e){let t=this.createSessionsControl(e),'
+A_BRIDGE_CALL='this.updateSessionsControlVisibility();try{this._ezilChatHeader(e)}'
+R_BRIDGE_CALL='this.updateSessionsControlVisibility();try{this._ezilChatBridge()}catch(f){this.logService.error("EZiL: chat bridge not registered",f)}try{this._ezilChatHeader(e)}'
+# What [chat-header] leaves in workbench.js once [chat-bridge] has extended it (literal split/join, no shell substitution).
+R_CHAT_HEADER_FINAL="$(node -e 'const [s,a1,r1,a2,r2]=process.argv.slice(1);process.stdout.write(s.split(a1).join(r1).split(a2).join(r2))' "$R_CHAT_HEADER" "$A_BRIDGE_CALL" "$R_BRIDGE_CALL" "$A_BRIDGE_METHOD" "$R_BRIDGE_METHOD")"
+
 # Part 2 — identity in the system prompt (extension.js)
 A_IDENT='When asked for your name, you must respond with "GitHub Copilot".'
 R_IDENT='You are EZiL Chat, an AI coding assistant. When asked for your name, you must respond with "EZiL Chat".'
@@ -385,6 +404,10 @@ if [ "$VERIFY_ONLY" = 0 ]; then
     gate header-names "$WB" 1 "$p"
   done
   patch chat-header    "$WB"  1  "$A_CHAT_HEADER" "$R_CHAT_HEADER"
+  for p in "$P_BRIDGE_SCOPE" "$P_BRIDGE_SERVICES" "$P_BRIDGE_CHAT"; do gate chat-bridge-names "$WB" 1 "$p"; done
+  gate chat-bridge-command "$WB" 0 '"_ezil.chatBridge.v1"'
+  patch chat-bridge-method "$WB" 1 "$A_BRIDGE_METHOD" "$R_BRIDGE_METHOD"
+  patch chat-bridge-call   "$WB" 1 "$A_BRIDGE_CALL" "$R_BRIDGE_CALL"
   patch attach-execute "$WB"  1  "$A_ATTACH" "$R_ATTACH"
   patch chat-enabled   "$WB"  1  "$A_CHAT_ENABLED" "$R_CHAT_ENABLED"
   for p in "$P_PICKER_OPTIONS" "$P_PICKER_DIALOG"; do gate picker-names "$WB" 1 "$p"; done
@@ -461,7 +484,9 @@ gate session-filter   "$WB"  0  "$A_SESSION_FILTER"; gate session-filter   "$WB"
 for p in "$P_HEADER_TITLE" "$P_HEADER_TITLE_ROOT" "$P_HEADER_INPUT_PART" "$P_HEADER_SECONDARY" "$P_HEADER_COMMANDS" "$P_HEADER_NOTIFY"; do
   gate header-names "$WB" 1 "$p"
 done
-gate chat-header      "$WB"  0  "$A_CHAT_HEADER";   gate chat-header      "$WB"  1  "$R_CHAT_HEADER"
+gate chat-header      "$WB"  0  "$A_CHAT_HEADER";   gate chat-header      "$WB"  1  "$R_CHAT_HEADER_FINAL"
+gate chat-bridge-method "$WB" 1 "$R_BRIDGE_METHOD"; gate chat-bridge-call "$WB" 1 "$R_BRIDGE_CALL"
+gate chat-bridge-command "$WB" 1 'qe.registerCommand("_ezil.chatBridge.v1",'
 gate attach-execute   "$WB"  0  "$A_ATTACH";        gate attach-execute   "$WB"  1  "$R_ATTACH"
 gate chat-enabled     "$WB"  0  "$A_CHAT_ENABLED";  gate chat-enabled     "$WB"  1  "$R_CHAT_ENABLED"
 for p in "$P_PICKER_OPTIONS" "$P_PICKER_DIALOG"; do gate picker-names "$WB" 1 "$p"; done

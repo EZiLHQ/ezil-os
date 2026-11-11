@@ -420,6 +420,81 @@ async function readGatewayModels(provider: ResolvedProvider, key: string, doFetc
     }
 }
 
+/**
+ * How old a `/v1/models` read may be, at the moment the editor emits its catalog, to count as evidence of what the Gateway
+ * allows this account. This is the editor's own policy. OS separately treats a catalog as fresh for 45 s after IT receives it
+ * (control-store CATALOG_FRESH_MS) and the MCP accepts OS's reading for 60 s; the two are different clocks, and the time in
+ * transit between emission and receipt is not bounded by either.
+ */
+export const ACCOUNT_EVIDENCE_MAX_AGE_MS = 15_000;
+
+/**
+ * This token's `/v1/models` read no older than `maxAgeMs`: the cached one when it is that fresh, otherwise a new read.
+ * A failed read is `undefined`, never the older catalog (unlike `knownGatewayModels`, which keeps listing rows): it is
+ * evidence of what the Gateway allows THIS account now, so stale or missing evidence is no evidence.
+ */
+export async function freshGatewayModels(provider: ResolvedProvider, doFetch: typeof fetch, now: number = Date.now(),
+    maxAgeMs: number = ACCOUNT_EVIDENCE_MAX_AGE_MS): Promise<{ at: number; models: GatewayModels } | undefined> {
+    const cached = modelsCache.get(providerIdentity(provider));
+    if (cached && now >= cached.at && now - cached.at <= maxAgeMs) return { at: cached.at, models: cached.models };
+    const models = await gatewayModels(provider, doFetch, now, undefined, true);
+    return models ? { at: now, models } : undefined;
+}
+
+/**
+ * The Gateway says this account may use `alias` right now: its exact row is enabled and `available` under the catalog
+ * contract (a legacy row carries no availability, so it says nothing), with no killswitch or pause.
+ */
+export function availableForAccount(catalog: GatewayModels, alias: string): boolean {
+    if (catalog.killswitch || catalog.pause !== null) return false;
+    const entry = catalog.data.find(row => row.id === alias);
+    return entry?.enabled === true && entry.availability?.state === 'available';
+}
+
+/**
+ * Of the picker ids `ids`, those the Gateway allows THIS account to use, on fresh evidence from each provider's own token.
+ * A configured id names its row by its upstream alias (`model`); a catalog-only id is `<provider>/<alias>`. An id served
+ * by any other provider type (a static, directly configured model) never has Gateway evidence, so it is never included.
+ *
+ * Freshness is judged against the clock at EVERY decision, not once at the start: a provider read can be slow and several
+ * are made one after another. Each cache-or-read choice uses the time it is made, evidence that has aged out while the
+ * others were read is read again, and when the set is emitted anything whose read began more than
+ * `ACCOUNT_EVIDENCE_MAX_AGE_MS` ago (or whose clock ran backwards) is dropped: a slow collection fails closed.
+ * Each read is stamped with the time it BEGAN, so its age is an upper bound. `now` is a fixed instant (tests) or a clock.
+ * This bounds the age at emission only: the time the sync then spends in transit to OS is not counted here.
+ */
+export async function accountAvailableIds(models: readonly ResolvedModel[], ids: readonly string[], doFetch: typeof fetch,
+    now: number | (() => number) = Date.now): Promise<Set<string>> {
+    const clock = typeof now === 'function' ? now : () => now;
+    type Evidence = { at: number; models: GatewayModels } | undefined;
+    const evidence = new Map<string, Promise<Evidence>>();
+    const read = async (provider: ResolvedProvider): Promise<Evidence> => {
+        const key = providerIdentity(provider);
+        const earlier = evidence.get(key);
+        const value = earlier ? await earlier : undefined;
+        // A read that failed stays failed for this build; one that has since aged out is read again.
+        if (earlier && (!value || (clock() >= value.at && clock() - value.at <= ACCOUNT_EVIDENCE_MAX_AGE_MS))) return value;
+        const next = freshGatewayModels(provider, doFetch, clock()).catch(() => undefined);
+        evidence.set(key, next);
+        return next;
+    };
+    const candidates = new Map<string, number>();
+    for (const id of ids) {
+        const configured = models.find(model => model.id === id);
+        const catalogOnly = configured ? undefined : parseCatalogModelId(id);
+        const provider = configured ? configured.provider
+            : catalogOnly && models.find(model => model.provider.type === 'ezil-gateway' && model.providerName === catalogOnly.providerName)?.provider;
+        const alias = configured ? configured.model : catalogOnly?.alias;
+        if (!provider || provider.type !== 'ezil-gateway' || !alias) continue;
+        const seen = await read(provider);
+        if (seen && availableForAccount(seen.models, alias)) candidates.set(id, seen.at);
+    }
+    const emitted = clock();
+    const allowed = new Set<string>();
+    for (const [id, at] of candidates) if (emitted >= at && emitted - at <= ACCOUNT_EVIDENCE_MAX_AGE_MS) allowed.add(id);
+    return allowed;
+}
+
 /** How long a catalog that can no longer be read still lists the rows it had (only for its own base URL + token). */
 export const CATALOG_STALE_MS = 30 * 60_000;
 

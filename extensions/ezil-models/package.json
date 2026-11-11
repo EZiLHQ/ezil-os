@@ -101,6 +101,12 @@
           "markdownDescription": "Path of the EZiL models config file (JSON, see the extension README). The environment variable `EZIL_MODELS_CONFIG` overrides this setting.",
           "scope": "machine"
         },
+        "ezil.chatBridge.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Let EZiL OS (and the EZiL app in ChatGPT, for you) send instructions to an EZiL Chat session you have open here. An instruction runs with that pane's current mode, model and tool approvals, including auto-approve. Off by default.",
+          "scope": "machine"
+        },
         "ezilModels.logRequests": {
           "type": "boolean",
           "default": false,
