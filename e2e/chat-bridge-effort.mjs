@@ -1,4 +1,5 @@
 // Real Code UI + extension; no fake adapter or native state injection.
+import {safeDiagnostic,diagnosticBuffer} from './chat-bridge-effort-diagnostics.mjs';
 import {captureEvidence} from './chat-bridge-effort-evidence.mjs';
 import {createRequire} from 'node:module';
 import {mkdirSync,writeFileSync,mkdtempSync} from 'node:fs';
@@ -10,6 +11,8 @@ mkdirSync(outputRoot,{recursive:true});
 const out=mkdtempSync(join(outputRoot,'evidence-'));
 console.log('Native evidence directory: '+out);
 const controller=required('EZIL_EFFORT_CONTROLLER_TOKEN');
+const diagnosticSecrets=[controller,process.env.EZIL_AI_PROXY_TOKEN,process.env.EZIL_EDITOR_BRIDGE_TOKEN].filter(Boolean);
+const diagnostics=diagnosticBuffer(diagnosticSecrets);
 const controlHeaders={authorization:`Bearer ${controller}`};
 const {chromium}=createRequire(required('PLAYWRIGHT_REQUIRE_DIR')+'/fixture.js')('playwright');
 const chromiumArgs=JSON.parse(process.env.EZIL_CHROMIUM_ARGS_JSON??'[]');
@@ -26,7 +29,7 @@ const until=async p=>{const end=Date.now()+150000;while(Date.now()<end){const s=
 const op=(s,r)=>s.ops.find(o=>o.role===r);
 const done=r=>until(s=>['applied','completed','uncertain','rejected','failed','expired','busy'].includes(op(s,r)?.status));
 let browser,context,page;
-const launch=async()=>{browser=await chromium.launch(launchOptions);context=await browser.newContext({viewport:{width:1440,height:900}});await context.route('**/*',r=>new URL(r.request().url()).origin===code?r.continue():r.abort());page=await context.newPage();};
+const launch=async()=>{browser=await chromium.launch(launchOptions);context=await browser.newContext({viewport:{width:1440,height:900}});await context.route('**/*',r=>new URL(r.request().url()).origin===code?r.continue():r.abort());page=await context.newPage();page.on('console',m=>diagnostics.add('console:'+m.type(),m.text()));page.on('pageerror',e=>diagnostics.add('pageerror',e.message));};
 const open=async()=>{await page.goto(code+'/?folder='+encodeURIComponent(required('EZIL_EFFORT_WORKSPACE')));await page.locator('.part.auxiliarybar .chat-input-container .monaco-editor').first().waitFor({timeout:120000});};
 const command=async title=>{await page.keyboard.press('Control+Shift+P');await page.locator('.quick-input-widget input').fill('>'+title);await page.keyboard.press('Enter');};
 const send=async(role,marker,model,effort)=>{
@@ -92,7 +95,21 @@ try {
  }
  results.push({name:'pending native tool approval',status:'NOT_EXERCISED',reason:'Requires separate real tool approval fixture; no approval state fabricated.'});
  await page.screenshot({path:join(out,'native-effort.png')});
-} catch(e) {results.push({name:'native run',ok:false,error:String(e.message)});process.exitCode=1;}
+ } catch(e) {
+ results.push({name:'native run',ok:false,error:safeDiagnostic(e.message,diagnosticSecrets)});process.exitCode=1;
+ try {
+  const visible=page?await page.locator('body').innerText({timeout:5000}):'';
+  writeFileSync(join(out,'failure-diagnostics.json'),JSON.stringify({visibleText:safeDiagnostic(visible,diagnosticSecrets,12000),events:diagnostics.entries},null,2));
+  if(page){
+   // Sanitize visible diagnostic text only after failure; no native settings/state repair.
+   await page.evaluate(secrets=>{
+    const scrub=value=>{let s=value;for(const secret of secrets)s=s.split(secret).join('[redacted]');return s.replace(/(?:https?|wss?|file):\/\/[^\s<>"']+/gi,'[url]').replace(/Bearer\s+[^\s,"'}]+/gi,'Bearer [redacted]').replace(/((?:access_token|refresh_token|id_token|authorization|api[_-]?key|password|secret|token)\s*[=:]\s*)[^\s,;}]+/gi,'$1[redacted]');};
+    const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_TEXT);let node;while(node=walker.nextNode())node.textContent=scrub(node.textContent??'');
+   },diagnosticSecrets);
+   await page.screenshot({path:join(out,'failure.png'),fullPage:false,timeout:5000,mask:[page.locator('input,textarea,[contenteditable="true"]')]});
+  }
+ }catch(diagnosticError){results.push({name:'failure diagnostics',ok:false,error:safeDiagnostic(diagnosticError.message,diagnosticSecrets)});}
+}
 finally {
  try {await browser?.close();}catch(e){results.push({name:'browser cleanup',ok:false,error:String(e.message)});process.exitCode=1;}
  if(!await captureEvidence(out,results,state))process.exitCode=1;
