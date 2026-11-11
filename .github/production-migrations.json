@@ -85,6 +85,11 @@
       "path": "app/drizzle/0021_standard_trial.sql",
       "sha256": "d44471c2a8fa9880b09aaf4f6654e5856cf1ea356071379021f63571f542ca35",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0022_feedback_notifications.sql",
+      "sha256": "07696b64fb9f729ca2b54873cff294c192305c1cc3b70fc2d83c239fba36e974",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {
