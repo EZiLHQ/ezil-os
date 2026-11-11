@@ -78,6 +78,7 @@ export interface Op {
     expiresAt?: string;
     mode?: string;
     selectedModelId?: string;
+    selectedEffort?: string | null;
     reason?: string;
 }
 
@@ -143,6 +144,7 @@ function opView(row: Record<string, unknown>): Op {
     if (status === 'queued' || status === 'queued_disconnected' || status === 'accepted') op.expiresAt = iso(row.expires_at);
     if (typeof row.mode === 'string') op.mode = row.mode;
     if (typeof row.selected_model_id === 'string') op.selectedModelId = row.selected_model_id;
+    if (typeof row.selected_effort === 'string') op.selectedEffort = row.selected_effort;
     if (typeof row.reason === 'string') op.reason = row.reason;
     return op;
 }
@@ -156,7 +158,7 @@ function opView(row: Record<string, unknown>): Op {
 async function readOp(db: SqlExecutor, userId: string, operationId: string, liveComputer = true): Promise<Record<string, unknown> | null> {
     const rows = await db.execute(sql`/* agent-session:op */
         SELECT o.id, o.session_id, o.kind, o.status, o.idempotency_key, o.target_id, o.updated_at, o.expires_at,
-            o.mode, o.selected_model_id, o.reason, o.delivered_epoch, (o.expires_at <= now()) AS past_expiry,
+            o.mode, o.selected_model_id, to_jsonb(o)->>'selected_effort' AS selected_effort, o.reason, o.delivered_epoch, (o.expires_at <= now()) AS past_expiry,
             (w.lease_until > now() AND w.user_id = o.user_id) IS TRUE AS lease_live, w.epoch AS owner_epoch
         FROM public.ezil_agent_operations o
         ${liveComputer ? sql`JOIN public.ezil_computers c ON c.id = o.computer_id AND c.deleted_at IS NULL AND c.user_id = o.user_id` : sql``}
@@ -366,10 +368,12 @@ export interface EditorReport {
     requestId?: string;
     mode?: string;
     selectedModelId?: string;
+    selectedEffort?: string | null;
     responseText?: string;
     /** Protocol 2, `applied` only: the session, its runtime model after the change, and its request count. */
     sessionResource?: string;
     model?: string | null;
+    effort?: string | null;
     requestCount?: number;
 }
 
@@ -380,12 +384,13 @@ export interface EditorSession {
     status: 'idle' | 'running' | 'unknown';
     /** Protocol 2: the model selected in this session's own input now (null when closed) and its request count. */
     model?: string | null;
+    effort?: string | null;
     requests?: number | null;
 }
 
 export interface EditorSync {
     /** What the body spoke. Anything but 2 is protocol 1; 2 only counts while the controls flag is on (`SyncOptions`). */
-    protocol?: 1 | 2;
+    protocol?: 1 | 2 | 3;
     ownerId: string;
     /** The epoch this editor last received, or 0 before its first sync. Reports are only taken at the current epoch. */
     epoch: number;
@@ -402,6 +407,7 @@ export interface SyncOptions {
      * no control row, column or pass is touched.
      */
     controls?: boolean;
+    effort?: boolean;
 }
 
 export interface Delivery {
@@ -473,7 +479,8 @@ async function finalize(tx: SqlExecutor, rows: ArrayLike<Record<string, unknown>
 export async function syncEditor(db: SessionDb, computer: { id: string; userId: string }, body: EditorSync, options: SyncOptions = {}): Promise<SyncResult> {
     const controls = options.controls === true;
     // Protocol 2 counts only while the controls are on; otherwise a protocol-2 body is handled as protocol 1 (its extras ignored).
-    const proto2 = controls && body.protocol === 2;
+    const proto3 = controls && options.effort === true && body.protocol === 3;
+    const proto2 = controls && (body.protocol === 2 || body.protocol === 3);
     const outcome = await db.transaction(async (tx): Promise<SyncResult> => {
         // The caller resolved `computer` BEFORE this transaction. Everything below (the lease, the reassigned passes, the handout
         // and every report) trusts `computer.userId`, so confirm it NOW and hold it: FOR SHARE conflicts with the row UPDATE of a
@@ -512,8 +519,8 @@ export async function syncEditor(db: SessionDb, computer: { id: string; userId: 
         if (controls) {
             // The protocol this owner syncs with; a new owner starts with no catalog (never the previous window's).
             await tx.execute(same
-                ? sql`/* agent-session:owner-protocol */ UPDATE public.ezil_editor_bridge_owner SET protocol = ${proto2 ? 2 : 1} WHERE computer_id = ${computer.id}::uuid`
-                : sql`/* agent-session:owner-protocol-reset */ UPDATE public.ezil_editor_bridge_owner SET protocol = ${proto2 ? 2 : 1}, catalog = NULL, catalog_at = NULL
+                ? sql`/* agent-session:owner-protocol */ UPDATE public.ezil_editor_bridge_owner SET protocol = ${proto3 ? 3 : proto2 ? 2 : 1} WHERE computer_id = ${computer.id}::uuid`
+                : sql`/* agent-session:owner-protocol-reset */ UPDATE public.ezil_editor_bridge_owner SET protocol = ${proto3 ? 3 : proto2 ? 2 : 1}, catalog = NULL, catalog_at = NULL
                     WHERE computer_id = ${computer.id}::uuid`);
         }
 
@@ -552,9 +559,11 @@ export async function syncEditor(db: SessionDb, computer: { id: string; userId: 
 
         let applied = 0;
         if (same && body.epoch === epoch) {
-            for (const report of body.reports ?? []) {
+            for (const rawReport of body.reports ?? []) {
+                const { effort: _effort, selectedEffort: _selected, ...oldReport } = rawReport;
+                const report = proto3 ? rawReport : oldReport;
                 if (await applyReport(tx, computer, epoch, now, report)) applied += 1;
-                else if (controls && await applyControlReport(tx, computer, epoch, now, report)) applied += 1;
+                else if (controls && await applyControlReport(tx, computer, epoch, now, report, proto3)) applied += 1;
             }
         }
 
@@ -564,13 +573,13 @@ export async function syncEditor(db: SessionDb, computer: { id: string; userId: 
             if (proto2) {
                 await tx.execute(sql`/* agent-session:sessions-v2 */
                     INSERT INTO public.ezil_agent_sessions AS s (id, computer_id, user_id, resource, title, present, open, status, seen_at, next_seq,
-                        model, model_at, request_count)
+                        model, model_at, request_count${proto3 ? sql`, effort` : sql``})
                     SELECT gen_random_uuid(), ${computer.id}::uuid, ${computer.userId}::uuid, x.resource, x.title, true, x.open, x.status, ${now}, 0,
-                        CASE WHEN x.open THEN x.model END, ${now}, x.requests
-                    FROM jsonb_to_recordset(${reported}::jsonb) AS x(resource text, title text, open boolean, status text, model text, requests integer)
+                        CASE WHEN x.open THEN x.model END, ${now}, x.requests${proto3 ? sql`, CASE WHEN x.open THEN x.effort END` : sql``}
+                    FROM jsonb_to_recordset(${reported}::jsonb) AS x(resource text, title text, open boolean, status text, model text, requests integer, effort text)
                     ON CONFLICT (computer_id, user_id, resource) DO UPDATE SET
                         title = EXCLUDED.title, open = EXCLUDED.open, status = EXCLUDED.status, seen_at = EXCLUDED.seen_at, present = true,
-                        model = EXCLUDED.model, model_at = EXCLUDED.model_at, request_count = EXCLUDED.request_count`);
+                        model = EXCLUDED.model, model_at = EXCLUDED.model_at, request_count = EXCLUDED.request_count${proto3 ? sql`, effort = EXCLUDED.effort` : sql``}`);
             } else {
                 await tx.execute(sql`/* agent-session:sessions */
                     INSERT INTO public.ezil_agent_sessions AS s (id, computer_id, user_id, resource, title, present, open, status, seen_at, next_seq)
@@ -586,7 +595,8 @@ export async function syncEditor(db: SessionDb, computer: { id: string; userId: 
         }
 
         // The editor's catalog, from the owner at its current epoch only (the first sync of a new owner never carries one).
-        if (proto2 && same && body.epoch === epoch && body.catalog) await storeCatalog(tx, computer.id, now, body.catalog);
+        if (proto2 && same && body.epoch === epoch && body.catalog) await storeCatalog(tx, computer.id, now, !proto3 && body.catalog.status === 'available'
+                ? { ...body.catalog, models: body.catalog.models.map(m => ({...m, efforts: [], defaultEffort: null})) } : body.catalog);
 
         const expired = await tx.execute(sql`/* agent-session:expire */
             UPDATE public.ezil_agent_operations SET status = 'expired', updated_at = ${now}
@@ -595,7 +605,7 @@ export async function syncEditor(db: SessionDb, computer: { id: string; userId: 
         await finalize(tx, expired, 'expired');
 
         // Controls first (protocol 2 bodies only): a create or configure is judged against the same owner and epoch as a send.
-        const controlDeliveries = proto2 && body.protocol === 2 ? await handOutControls(tx, computer, epoch, now) : [];
+        const controlDeliveries = proto2 ? await handOutControls(tx, computer, epoch, now) : [];
 
         // Fair handout: at most one operation per session per sync (a cancel first), only work of the
         // computer's current owner in a session that is theirs and present, ready (not backed off) and
@@ -680,6 +690,7 @@ async function applyReport(tx: SqlExecutor, computer: { id: string; userId: stri
             request_id = COALESCE(${report.requestId ?? null}, request_id),
             mode = COALESCE(${report.mode ?? null}, mode),
             selected_model_id = COALESCE(${report.selectedModelId ?? null}, selected_model_id)
+            ${report.selectedEffort !== undefined ? sql`, selected_effort = ${report.selectedEffort}` : sql``}
         WHERE id = ${id}::uuid`);
     if (op.kind === 'send' && current === 'delivered' && KNOWN_SENT.includes(status)) {
         await appendEvent(tx, sessionId, id, 'user', { text: String(op.text) });

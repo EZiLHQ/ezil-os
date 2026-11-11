@@ -1,5 +1,5 @@
 /**
- * The editor-sync half of the MCP session controls (editor bridge protocol 2, docs/EDITOR-BRIDGE-PROTOCOL-2.md): the
+ * The editor-sync half of the MCP session controls (editor bridge protocols 2/3, docs/EDITOR-BRIDGE-PROTOCOL-3.md): the
  * passes `syncEditor` (./store.ts) runs INSIDE its transaction, after the computer row and the owner row are locked and
  * the current owner is confirmed, so a create or configure is judged against exactly the owner a send would be:
  *
@@ -11,8 +11,7 @@
  *  - `controlReassigned`: another person's rows on a computer that changed hands never reach the new owner's editor;
  *  - `storeCatalog`: the editor's latest catalog, stamped with OS's own clock.
  *
- * Every new SQL statement here touches only 0025's columns (app/drizzle/hardening/0025_editor_controls.sql); `syncEditor`
- * calls them only while the controls flag is on, so a deployment that has not applied 0025 keeps protocol 1 exactly.
+ * Controls use 0025 only while its flag is on. Protocol-3 effort persistence additionally requires 0026 and its separate gate.
  */
 import { sql, type SQL } from 'drizzle-orm';
 
@@ -41,8 +40,8 @@ export interface CatalogRow {
     id: string;
     label: string;
     engine: 'ezil-chat';
-    efforts: never[];
-    defaultEffort: null;
+    efforts: string[];
+    defaultEffort: string | null;
     configuredEffort: string | null;
     availability?: 'available';
 }
@@ -56,6 +55,7 @@ export interface ControlDelivery {
     kind: 'create' | 'configure';
     deliverWithinMs: number;
     model?: string;
+    effort?: string;
     /** `configure` only: the target session. */
     sessionResource?: string;
     /** `configure` only, and only for a session OS created (docs/EDITOR-BRIDGE-PROTOCOL-2.md, `reveal`). */
@@ -145,7 +145,7 @@ export async function handOutControls(tx: SqlExecutor, computer: { id: string; u
         SET status = 'delivered', delivered_epoch = ${epoch}, attempt_id = gen_random_uuid(), attempts = COALESCE(c.attempts, 0) + 1,
             delivered_at = ${now}, updated_at = ${now}
         WHERE c.id IN (SELECT id FROM picked) AND c.status = 'queued'
-        RETURNING c.id, c.kind, c.attempt_id, c.requested_model, c.created_at,
+        RETURNING c.id, c.kind, c.attempt_id, c.requested_model, c.requested_effort, c.created_at,
             GREATEST(0, floor(extract(epoch FROM (c.expires_at - ${now})) * 1000))::bigint AS within_ms,
             (SELECT s.resource FROM public.ezil_agent_sessions s WHERE s.id = c.session_id) AS resource,
             (SELECT s.created_by_os IS TRUE FROM public.ezil_agent_sessions s WHERE s.id = c.session_id) AS created_by_os`);
@@ -157,6 +157,7 @@ export async function handOutControls(tx: SqlExecutor, computer: { id: string; u
                 operationId: String(row.id), attemptId: String(row.attempt_id), kind: configure ? 'configure' : 'create',
                 deliverWithinMs: Number(row.within_ms),
                 ...(typeof row.requested_model === 'string' ? { model: row.requested_model } : {}),
+                ...(typeof row.requested_effort === 'string' ? { effort: row.requested_effort } : {}),
                 ...(configure ? { sessionResource: String(row.resource) } : {}),
                 ...(configure && row.created_by_os === true ? { reveal: true as const } : {}),
             };
@@ -202,9 +203,9 @@ async function configuredEffort(tx: SqlExecutor, computerId: string, model: stri
  * `delivered`; a duplicate or late report finds the row no longer `delivered` and changes nothing.
  */
 export async function applyControlReport(tx: SqlExecutor, computer: { id: string; userId: string }, epoch: number, now: SQL,
-    report: EditorReport): Promise<boolean> {
+    report: EditorReport, proto3 = false): Promise<boolean> {
     const rows = await tx.execute(sql`/* control-sync:report-target */
-        SELECT c.id, c.kind, c.status, c.session_id, c.requested_model, c.attempts, c.expires_at, (c.expires_at > ${now}) AS unexpired
+        SELECT c.id, c.kind, c.status, c.session_id, c.requested_model, c.requested_effort, c.attempts, c.expires_at, (c.expires_at > ${now}) AS unexpired
         FROM public.ezil_control_operations c
         WHERE c.id = ${report.operationId}::uuid AND c.computer_id = ${computer.id}::uuid AND c.user_id = ${computer.userId}::uuid
           AND c.delivered_epoch = ${epoch} AND c.attempt_id = ${report.attemptId}::uuid
@@ -216,15 +217,21 @@ export async function applyControlReport(tx: SqlExecutor, computer: { id: string
 
     if (report.status === 'applied') {
         const model = typeof report.model === 'string' ? report.model : null;
+        const effort = proto3 ? report.effort ?? null : await configuredEffort(tx, computer.id, model);
+        if ((typeof op.requested_model === 'string' && model !== op.requested_model)
+            || (typeof op.requested_effort === 'string' && (!proto3 || effort !== op.requested_effort))) {
+            await tx.execute(sql`UPDATE public.ezil_control_operations SET status='uncertain', reason='settings_readback_mismatch', attempt_id=NULL, updated_at=${now} WHERE id=${id}::uuid`);
+            return true;
+        }
         if (kind === 'create') {
             // A created session is OS's only if it is new to OS and the editor says it holds no request: anything else
             // may be the person's own chat, which `reveal` must never open.
             const tracked = typeof report.sessionResource === 'string' && report.sessionResource !== '' && report.requestCount === 0
                 ? await tx.execute(sql`/* control-sync:created-session */
                     INSERT INTO public.ezil_agent_sessions AS s (id, computer_id, user_id, resource, title, present, open, status, seen_at, next_seq,
-                        model, model_at, request_count, created_by_os, created_control_id)
+                        model, model_at, request_count, created_by_os, created_control_id${proto3 ? sql`, effort` : sql``})
                     VALUES (gen_random_uuid(), ${computer.id}::uuid, ${computer.userId}::uuid, ${report.sessionResource}, '', true, true, 'idle',
-                        ${now}, 0, ${model}, ${now}, 0, true, ${id}::uuid)
+                        ${now}, 0, ${model}, ${now}, 0, true, ${id}::uuid${proto3 ? sql`, ${effort}` : sql``})
                     ON CONFLICT (computer_id, user_id, resource) DO NOTHING
                     RETURNING s.id`)
                 : [];
@@ -237,16 +244,16 @@ export async function applyControlReport(tx: SqlExecutor, computer: { id: string
             await tx.execute(sql`/* control-sync:created */
                 UPDATE public.ezil_control_operations SET status = 'applied', session_id = ${String(tracked[0]!.id)}::uuid,
                     reason = ${report.reason ?? 'ephemeral_until_first_send'}, attempt_id = NULL,
-                    effective_model = ${model}, effective_effort = ${await configuredEffort(tx, computer.id, model)}, effective_at = ${now}, updated_at = ${now}
+                    effective_model = ${model}, effective_effort = ${effort}, effective_at = ${now}, updated_at = ${now}
                 WHERE id = ${id}::uuid`);
             return true;
         }
         await tx.execute(sql`/* control-sync:session-model */
-            UPDATE public.ezil_agent_sessions SET model = ${model}, model_at = ${now}
+            UPDATE public.ezil_agent_sessions SET model = ${model}, model_at = ${now}${proto3 ? sql`, effort = ${effort}` : sql``}
             WHERE id = ${String(op.session_id)}::uuid AND computer_id = ${computer.id}::uuid AND user_id = ${computer.userId}::uuid`);
         await tx.execute(sql`/* control-sync:configured */
             UPDATE public.ezil_control_operations SET status = 'applied', reason = ${report.reason ?? null}, attempt_id = NULL,
-                effective_model = ${model}, effective_effort = ${await configuredEffort(tx, computer.id, model)}, effective_at = ${now}, updated_at = ${now}
+                effective_model = ${model}, effective_effort = ${effort}, effective_at = ${now}, updated_at = ${now}
             WHERE id = ${id}::uuid`);
         return true;
     }

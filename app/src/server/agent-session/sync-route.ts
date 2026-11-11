@@ -100,7 +100,18 @@ const bodyV2 = z.object({
     }).strict()).max(MAX_REPORTS).optional(),
     catalog: catalog.optional(),
 }).strict();
-const syncBody = z.discriminatedUnion('protocol', [bodyV1, bodyV2]);
+const effortToken = z.string().regex(/^[A-Za-z0-9._-]{1,32}$/);
+const catalogRowV3 = catalogRow.extend({ efforts: z.array(effortToken).max(16), defaultEffort: effortToken.nullable() })
+    .refine(row => new Set(row.efforts).size === row.efforts.length && (row.defaultEffort === null || row.efforts.includes(row.defaultEffort)));
+const bodyV3 = bodyV2.extend({ protocol: z.literal(3),
+    sessions: z.array(sessionV1.extend({ model: modelToken.nullable(), effort: effortToken.nullable(), requests: z.number().int().min(0).nullable() }).strict()).max(MAX_SESSIONS).optional(),
+    reports: z.array(reportV1.extend({ status: z.enum(EDITOR_REPORTS_V2), sessionResource: z.string().min(1).max(2048).optional(),
+        model: modelToken.nullable().optional(), effort: effortToken.nullable().optional(), selectedEffort: effortToken.nullable().optional(),
+        requestCount: z.number().int().min(0).optional(), observedAt: z.number().int().min(0).optional() }).strict()).max(MAX_REPORTS).optional(),
+    catalog: z.discriminatedUnion('status', [z.object({ status:z.literal('available'), models:z.array(catalogRowV3).max(100), observedAt:z.number().int().min(0) }).strict(),
+        z.object({ status:z.literal('unavailable'), reason:z.string().regex(/^[a-z_]{1,64}$/), observedAt:z.number().int().min(0) }).strict()]).optional(),
+}).strict();
+const syncBody = z.discriminatedUnion('protocol', [bodyV1, bodyV2, bodyV3]);
 
 export interface EditorSyncDeps {
     db: SessionDb;
@@ -111,6 +122,8 @@ export interface EditorSyncDeps {
      * accepted (so a window that already upgraded keeps syncing) but handled, and answered, as protocol 1.
      */
     controls?: string | undefined;
+    /** Enable only after 0026 and protocol-3 readers are qualified. */
+    effort?: string | undefined;
     now: () => number;
 }
 
@@ -183,7 +196,8 @@ export async function handleEditorSync(request: Request, deps: EditorSyncDeps): 
         const computer = await computerForSandbox(deps.db, sandbox);
         if (!computer) return reply(404, { error: 'unknown_computer' });
         const controls = deps.controls === 'enabled';
-        const result = await syncEditor(deps.db, computer, parsed, { controls });
+        const effort = controls && deps.effort === 'enabled';
+        const result = await syncEditor(deps.db, computer, parsed, { controls, effort });
         if (result.owner === 'gone') return reply(404, { error: 'unknown_computer' });
         if (result.owner === 'replayed') return reply(409, { error: 'replayed_sync' });
         console.info(JSON.stringify({
@@ -191,7 +205,7 @@ export async function handleEditorSync(request: Request, deps: EditorSyncDeps): 
             epoch: result.owner === 'self' ? result.epoch : null, delivered: result.owner === 'self' ? result.deliver.length : 0,
             reports: parsed.reports?.length ?? 0, applied: result.owner === 'self' ? result.applied : 0,
         }));
-        return reply(200, { ok: true, protocol: controls ? 2 : 1, ...result });
+        return reply(200, { ok: true, protocol: effort && parsed.protocol === 3 ? 3 : controls ? 2 : 1, ...(effort ? { supportedProtocols: [1, 2, 3] } : {}), ...result });
     } catch {
         return reply(500, { error: 'sync_failed' });
     }

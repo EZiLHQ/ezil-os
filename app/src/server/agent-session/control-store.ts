@@ -13,8 +13,7 @@
  *     execution authority.
  *   - `settings`: only what a connected editor reported for that session's own input, read within CATALOG_FRESH_MS.
  *   - `create` / `configure`: a durable row, handed to the editor by the next sync and answered by its report. `effective`
- *     is only ever what the editor read back after the change. An effort is refused BEFORE anything is stored
- *     (`effort_not_per_session`): the editor cannot set one for a session. A configure is never held: busy, disconnected or
+ *     is only ever what the editor read back after the change. Effort requires protocol 3 and fresh account/route capability. A configure is never held: busy, disconnected or
  *     an unanswered handout is final, and nothing but an `applied` report says it changed.
  *
  * Idempotency is per (person, OAuth client, procedure, key) for 7 days, checked FIRST so a retry returns the original row
@@ -230,7 +229,7 @@ interface BridgeInfo {
     catalogAgeMs: number | null;
     now: string;
 }
-interface CatalogEntry { id: string; label: string; engine: string; configuredEffort: string | null; availability?: string }
+interface CatalogEntry { efforts: string[]; defaultEffort: string | null; id: string; label: string; engine: string; configuredEffort: string | null; availability?: string }
 
 async function bridgeInfo(db: SqlExecutor, userId: string, computerId: string): Promise<BridgeInfo> {
     const rows = await db.execute(sql`/* control:bridge */
@@ -255,7 +254,7 @@ async function bridgeInfo(db: SqlExecutor, userId: string, computerId: string): 
 const UNSAFE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
 const UNSAFE_ALL = new RegExp(`${UNSAFE.source}+`, 'g');
 
-export interface CatalogModelOut { id: string; label: string; engine: string; efforts: never[]; defaultEffort: null; configuredEffort: string | null }
+export interface CatalogModelOut { id: string; label: string; engine: string; efforts: string[]; defaultEffort: string | null; configuredEffort: string | null }
 
 type Attestation = { ok: true; models: CatalogModelOut[]; observedAt: string } | { ok: false; reason: string };
 
@@ -276,7 +275,7 @@ const GAP_NOT_ACCOUNT = 'The editor lists the models its picker offers, includin
  */
 function attest(info: BridgeInfo): Attestation {
     if (!info.live) return { ok: false, reason: GAP_NO_EDITOR };
-    if (info.protocol !== 2) return { ok: false, reason: GAP_PROTOCOL };
+    if ((info.protocol !== 2 && info.protocol !== 3)) return { ok: false, reason: GAP_PROTOCOL };
     if (!info.catalog || info.catalogAt === null) return { ok: false, reason: GAP_NO_CATALOG };
     if (info.catalogAgeMs === null || info.catalogAgeMs > CATALOG_FRESH_MS) return { ok: false, reason: GAP_STALE };
     if (info.catalog.status === 'unavailable') return { ok: false, reason: `The editor could not read its model list (${info.catalog.reason}), so EZiL OS cannot list the models this account may use.` };
@@ -290,7 +289,7 @@ function attest(info: BridgeInfo): Attestation {
     if (rows.length === 0) return { ok: false, reason: GAP_NOT_ACCOUNT };
     return {
         ok: true, observedAt: info.catalogAt,
-        models: rows.map((m) => ({ id: m.id, label: m.label, engine: m.engine, efforts: [], defaultEffort: null, configuredEffort: m.configuredEffort ?? null })),
+        models: rows.map((m) => ({ id: m.id, label: m.label, engine: m.engine, efforts: info.protocol === 3 ? m.efforts : [], defaultEffort: info.protocol === 3 ? m.defaultEffort : null, configuredEffort: m.configuredEffort ?? null })),
     };
 }
 
@@ -322,7 +321,7 @@ export interface SessionSettings {
     status: 'idle' | 'running' | 'unknown';
     bridge: 'connected' | 'disconnected';
     /** Only what a connected editor reported for this session's own input, within CATALOG_FRESH_MS; otherwise null. */
-    settings: { model: string | null; effort: string | null; effortSupported: false; observedAt: string; source: 'runtime' } | null;
+    settings: { model: string | null; effort: string | null; effortSupported: boolean; observedAt: string; source: 'runtime' } | null;
 }
 
 export async function sessionSettings(db: SqlExecutor, userId: string, sessionId: string): Promise<SessionSettings> {
@@ -330,26 +329,31 @@ export async function sessionSettings(db: SqlExecutor, userId: string, sessionId
     const base = { sessionId: session.id, computerId: session.computerId, status: session.status, bridge: session.bridge };
     if (session.bridge !== 'connected' || !session.open) return { ...base, settings: null };
     const rows = await db.execute(sql`/* control:session-model */
-        SELECT s.model, s.model_at, extract(epoch FROM (clock_timestamp() - s.model_at)) * 1000 AS age_ms
+        SELECT s.model, to_jsonb(s)->>'effort' AS effort, s.model_at, extract(epoch FROM (clock_timestamp() - s.model_at)) * 1000 AS age_ms
         FROM public.ezil_agent_sessions s WHERE s.id = ${sessionId}::uuid AND s.user_id = ${userId}::uuid AND s.present`);
     const row = rows[0];
     if (!row || typeof row.model !== 'string' || row.model_at === null || row.age_ms === null || Number(row.age_ms) > CATALOG_FRESH_MS) {
         return { ...base, settings: null };
     }
-    // The model's fixed effort comes from the catalog the same editor reported (null when it sent none, or it is not listed).
+    // Protocol 3 reads jointly observed session effort; protocol 2 keeps its legacy catalog-only readback.
     const info = await bridgeInfo(db, userId, session.computerId);
-    const listed = info.protocol === 2 && info.catalog?.status === 'available' && info.catalogAgeMs !== null && info.catalogAgeMs <= CATALOG_FRESH_MS
+    const listed = (info.protocol === 2 || info.protocol === 3) && info.catalog?.status === 'available' && info.catalogAgeMs !== null && info.catalogAgeMs <= CATALOG_FRESH_MS
         ? info.catalog.models.find((m) => m.id === row.model) : undefined;
-    return { ...base, settings: { model: row.model, effort: listed?.configuredEffort ?? null, effortSupported: false, observedAt: iso(row.model_at), source: 'runtime' } };
+    return { ...base, settings: { model: row.model, effort: info.protocol === 3 ? (typeof row.effort === 'string' ? row.effort : null) : listed?.configuredEffort ?? null, effortSupported: info.live && info.protocol === 3 && listed?.availability === 'available' && !!listed?.efforts.length, observedAt: iso(row.model_at), source: 'runtime' } };
 }
 
 /** The stored outcome of an earlier create or configure by this person's client under this key (for the MCP's retry reconciliation). */
-export async function getControl(db: SqlExecutor, caller: ControlCaller, input: { kind: ControlKind; idempotencyKey: string }):
-    Promise<{ found: false } | { found: true; row: ControlRow }> {
+export async function getControl(db: SqlExecutor, caller: ControlCaller, input: { kind: ControlKind | 'start'; idempotencyKey: string }):
+    Promise<{ found: false } | { found: true; row: ControlRow | import('@/server/computer-start/start').StartRow }> {
     const rows = await db.execute(sql`/* control:get */
         SELECT id FROM public.ezil_control_operations
         WHERE user_id = ${caller.userId}::uuid AND client_id = ${caller.clientId} AND proc = ${PROCEDURE_OF[input.kind]}
           AND idempotency_key = ${input.idempotencyKey}::uuid`);
+    if (input.kind === 'start' && rows.length === 1) {
+        const starts = await db.execute(sql`SELECT id, computer_id, status, updated_at, reason FROM public.ezil_control_operations WHERE id=${String(rows[0]!.id)}::uuid AND user_id=${caller.userId}::uuid AND client_id=${caller.clientId} AND proc='computer.start'`);
+        const start = starts[0];
+        return start ? { found:true, row:{id:String(start.id),computerId:String(start.computer_id),status:start.status as StartStatus,updatedAt:iso(start.updated_at),reason:typeof start.reason==='string'?start.reason:null} } : {found:false};
+    }
     return rows.length === 1 ? { found: true, row: (await readControl(db, String(rows[0]!.id))).row } : { found: false };
 }
 
@@ -362,10 +366,6 @@ export interface ConfigureInput { sessionId: string; model?: string; effort?: st
 export interface ControlTiming { createWaitMs: number; configureWaitMs: number; pollMs: number }
 export const CONTROL_TIMING: ControlTiming = { createWaitMs: 4_000, configureWaitMs: CONFIGURE_WAIT_MS, pollMs: 200 };
 
-/** The editor is refused the effort before anything is stored: it cannot set one for a session (docs/EDITOR-BRIDGE-PROTOCOL-2.md). */
-const refuseEffort = (effort: string | undefined) => {
-    if (effort !== undefined) throw new SessionStoreError('BAD_REQUEST', 'effort_not_per_session');
-};
 
 type Verdict = { queue: true } | { queue: false; status: string; reason: string };
 
@@ -375,6 +375,15 @@ function modelVerdict(info: BridgeInfo, model: string | null): Verdict | null {
     const attested = attest(info);
     if (!attested.ok) return { queue: false, status: 'rejected', reason: CATALOG_UNAVAILABLE_REASON };
     return attested.models.some((m) => m.id === model) ? null : { queue: false, status: 'rejected', reason: 'model_not_offered' };
+}
+
+function effortVerdict(info: BridgeInfo, model: string | null, effort: string | null): Verdict | null {
+    if (effort === null) return null;
+    if (info.protocol !== 3) return { queue:false,status:'rejected',reason:'effort_not_per_session' };
+    const available = attest(info);
+    if (!available.ok || model === null || !available.models.find(m => m.id === model)?.efforts.includes(effort))
+        return { queue:false,status:'rejected',reason:'effort_unavailable' };
+    return null;
 }
 
 /**
@@ -402,8 +411,7 @@ async function settle(db: SqlExecutor, id: string, kind: ControlKind, timing: Co
 }
 
 export async function createSession(db: SessionDb, caller: ControlCaller, input: CreateInput, timing: ControlTiming = CONTROL_TIMING): Promise<ControlRow> {
-    refuseEffort(input.effort);
-    const requested: Selection = { model: input.model ?? null, effort: null };
+    const requested: Selection = { model: input.model ?? null, effort: input.effort ?? null };
     const inputDigest = digest({ computerId: input.computerId.toLowerCase(), ...requested });
     const id = await db.transaction(async (tx) => {
         const replay = await replayControl(tx, caller, PROCEDURE_OF.create, input.idempotencyKey, inputDigest);
@@ -413,8 +421,8 @@ export async function createSession(db: SessionDb, caller: ControlCaller, input:
         const info = await bridgeInfo(tx, caller.userId, input.computerId);
         let verdict: Verdict;
         if (!info.live) verdict = { queue: false, status: 'disconnected', reason: NO_EDITOR_REASON };
-        else if (info.protocol !== 2) verdict = { queue: false, status: 'rejected', reason: 'editor_controls_unsupported' };
-        else verdict = modelVerdict(info, requested.model) ?? { queue: true };
+        else if ((info.protocol !== 2 && info.protocol !== 3)) verdict = { queue: false, status: 'rejected', reason: 'editor_controls_unsupported' };
+        else verdict = modelVerdict(info, requested.model) ?? effortVerdict(info, requested.model, requested.effort) ?? { queue: true };
         return String((await insertControl(tx, caller, {
             proc: PROCEDURE_OF.create, key: input.idempotencyKey, inputDigest, kind: 'create', computerId: input.computerId, sessionId: null,
             status: verdict.queue ? 'queued' : verdict.status, reason: verdict.queue ? null : verdict.reason, requested,
@@ -426,9 +434,8 @@ export async function createSession(db: SessionDb, caller: ControlCaller, input:
 }
 
 export async function configureSession(db: SessionDb, caller: ControlCaller, input: ConfigureInput, timing: ControlTiming = CONTROL_TIMING): Promise<ControlRow> {
-    refuseEffort(input.effort);
-    if (input.model === undefined) throw new SessionStoreError('BAD_REQUEST', 'nothing_to_change');
-    const requested: Selection = { model: input.model, effort: null };
+    if (input.model === undefined && input.effort === undefined) throw new SessionStoreError('BAD_REQUEST', 'nothing_to_change');
+    const requested: Selection = { model: input.model ?? null, effort: input.effort ?? null };
     const inputDigest = digest({ sessionId: input.sessionId.toLowerCase(), ...requested });
     const id = await db.transaction(async (tx) => {
         const replay = await replayControl(tx, caller, PROCEDURE_OF.configure, input.idempotencyKey, inputDigest);
@@ -446,12 +453,12 @@ export async function configureSession(db: SessionDb, caller: ControlCaller, inp
             SELECT created_by_os IS TRUE AS own FROM public.ezil_agent_sessions WHERE id = ${session.id}::uuid`))[0]?.own === true;
         let verdict: Verdict;
         if (session.bridge !== 'connected') verdict = { queue: false, status: 'disconnected', reason: NO_EDITOR_REASON };
-        else if (info.protocol !== 2) verdict = { queue: false, status: 'rejected', reason: 'editor_controls_unsupported' };
+        else if ((info.protocol !== 2 && info.protocol !== 3)) verdict = { queue: false, status: 'rejected', reason: 'editor_controls_unsupported' };
         else if (session.status === 'running' || holding.length > 0) verdict = { queue: false, status: 'busy', reason: 'session_running' };
         else if (!session.open && !own) verdict = { queue: false, status: 'rejected', reason: 'session_not_open' };
         // Connected, but the editor has not shown this session idle: not provably safe to change (the editor re-checks and says busy).
         else if (session.status !== 'idle' && !(own && session.status === 'unknown')) verdict = { queue: false, status: 'rejected', reason: 'session_state_unknown' };
-        else verdict = modelVerdict(info, requested.model) ?? { queue: true };
+        else verdict = modelVerdict(info, requested.model) ?? effortVerdict(info, requested.model ?? (requested.effort !== null ? (await sessionSettings(tx, caller.userId, session.id)).settings?.model ?? null : null), requested.effort) ?? { queue: true };
         return String((await insertControl(tx, caller, {
             proc: PROCEDURE_OF.configure, key: input.idempotencyKey, inputDigest, kind: 'configure', computerId: session.computerId, sessionId: session.id,
             status: verdict.queue ? 'queued' : verdict.status, reason: verdict.queue ? null : verdict.reason, requested,

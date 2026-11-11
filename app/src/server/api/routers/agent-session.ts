@@ -80,7 +80,7 @@ export const agentSessionRouter = createTRPCRouter({
 
     /** The stored outcome of an earlier create or configure by this client under a key, for the MCP's retry reconciliation. */
     control: protectedProcedure
-        .input(z.object({ kind: z.enum(['create', 'configure']), idempotencyKey: uuid }).strict())
+        .input(z.object({ kind: z.enum(['create', 'configure', 'start']), idempotencyKey: uuid }).strict())
         .query(({ ctx, input }) => run(() => getControl(ctx.db, { userId: ctx.user.id, clientId: clientOf(ctx) }, input))),
 
     create: protectedProcedure

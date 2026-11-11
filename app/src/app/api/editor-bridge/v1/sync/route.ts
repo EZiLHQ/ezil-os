@@ -12,6 +12,7 @@ export async function POST(request: Request): Promise<Response> {
         secret: process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET,
         enabled: process.env.EZIL_EDITOR_BRIDGE,
         controls: process.env.EZIL_EDITOR_BRIDGE_CONTROLS,
+        effort: process.env.EZIL_EDITOR_BRIDGE_EFFORT,
         now: () => Date.now(),
     });
 }
