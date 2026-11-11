@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { FEEDBACK_LIMITS, type FeedbackSubmit } from './types';
+import { FEEDBACK_LIMITS, type FeedbackImageInput, type FeedbackSubmit } from './types';
 
 export class FeedbackImageError extends Error {
     constructor(public readonly status: 400 | 413 = 400) {
@@ -108,4 +108,17 @@ export function decodeScreenshot(input: NonNullable<FeedbackSubmit['screenshot']
         width: size[0],
         height: size[1],
     };
+}
+
+/** Every submitted image, in order. Each passes `decodeScreenshot`; together they stay
+ * within `imagesBytesTotal`, and the same image twice is a malformed request. */
+export function decodeScreenshots(inputs: readonly FeedbackImageInput[]): FeedbackImage[] {
+    if (inputs.length > FEEDBACK_LIMITS.imagesMax) invalid();
+    // Bound the encoded total before decoding anything (each image pads to a 4-character group).
+    const encoded = inputs.reduce((sum, input) => sum + input.dataBase64.length, 0);
+    if (encoded > Math.ceil(FEEDBACK_LIMITS.imagesBytesTotal / 3) * 4 + 4 * inputs.length) throw new FeedbackImageError(413);
+    const images = inputs.map(decodeScreenshot);
+    if (images.reduce((sum, image) => sum + image.byteLength, 0) > FEEDBACK_LIMITS.imagesBytesTotal) throw new FeedbackImageError(413);
+    if (new Set(images.map(image => image.sha256)).size !== images.length) invalid();
+    return images;
 }

@@ -3,7 +3,7 @@ import { shellFeaturesFor, type ShellFeatureEnv } from '@/server/shell/features'
 import { shellJson, shellUnauthenticated } from '@/server/shell/http';
 import { deleteFeedback, ingestFeedback, listFeedback, type FeedbackDb } from './ingest';
 import { FeedbackImageError } from './image';
-import { FEEDBACK_LIMITS, feedbackSubmitSchema } from './types';
+import { FEEDBACK_LIMITS, feedbackSubmitSchema, submittedImages } from './types';
 
 export interface FeedbackHandlerDeps {
     getContext: (req: Request) => Promise<{ user: { id: string; email?: string | null } | null; db: FeedbackDb }>;
@@ -70,8 +70,8 @@ export async function handleFeedbackRequest(req: Request, deps: FeedbackHandlerD
                 raw = JSON.parse(body);
             } catch { return invalidRequest(); }
             const parsed = feedbackSubmitSchema.safeParse(raw);
-            if (!parsed.success || (!features.feedbackScreenshots && parsed.data.screenshot != null)) return invalidRequest();
-            const metadata = { ...parsed.data, screenshot: null };
+            if (!parsed.success || (!features.feedbackScreenshots && submittedImages(parsed.data).length > 0)) return invalidRequest();
+            const metadata = { ...parsed.data, screenshot: null, screenshots: undefined };
             if (new TextEncoder().encode(JSON.stringify(metadata)).length > FEEDBACK_LIMITS.bodyBytesNoScreenshot) {
                 return shellJson({ error: 'payload_too_large' }, 413);
             }

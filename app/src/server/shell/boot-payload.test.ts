@@ -257,7 +257,7 @@ describe('buildShellBootPayload', () => {
         expect(toShellDesktopState(null).endpoints.feedback).toBeUndefined();
         const on = toShellDesktopState(null, { floatingControls: true, feedback: true, feedbackScreenshots: true });
         expect(on.endpoints.feedback).toBe('/api/shell/feedback');
-        expect(on.ui).toEqual({ floatingControls: true, feedbackScreenshots: true, feedbackEventDiagnostics: true, feedbackReportBundle: true, feedbackAppFailures: true });
+        expect(on.ui).toEqual({ floatingControls: true, feedbackScreenshots: true, feedbackEventDiagnostics: true, feedbackReportBundle: true, feedbackAppFailures: true, feedbackScreenshotsMax: 5 });
         expect(toShellDesktopState(null, { floatingControls: false, feedback: false, feedbackScreenshots: false }).endpoints.feedback).toBeUndefined();
     });
 
