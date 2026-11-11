@@ -136,8 +136,13 @@ def validate_desktop_config(c, now_ms):
             or neko["user"] == neko["admin"]):
         raise ValueError("ice_config_invalid")
     ai = c.get("ai")
-    if "ai" in c and (not isinstance(ai, dict) or set(ai) != {"baseUrl", "proxyToken"}
+    # editorToken (optional): the editor bridge's own boot token, distinct from the AI proxy token.
+    if "ai" in c and (not isinstance(ai, dict) or set(ai) not in ({"baseUrl", "proxyToken"}, {"baseUrl", "proxyToken", "editorToken"},
+                                                                          {"baseUrl", "proxyToken", "osRealm"}, {"baseUrl", "proxyToken", "editorToken", "osRealm"})
             or not isinstance(ai["proxyToken"], str) or not re.fullmatch(r"[0-9a-f]{64}", ai["proxyToken"])
+            or ("editorToken" in ai and (not isinstance(ai["editorToken"], str) or not re.fullmatch(r"[0-9a-f]{64}", ai["editorToken"])
+                                         or ai["editorToken"] == ai["proxyToken"]))
+            or ("osRealm" in ai and ai["osRealm"] not in ("staging", "production"))
             or not isinstance(ai["baseUrl"], str)
             or not re.fullmatch(r"https://aws-8443-guac-[a-z0-9]{1,16}-[a-z0-9]{1,16}-aws\.[a-z0-9.-]+/ai/v1", ai["baseUrl"])):
         raise ValueError("ice_config_invalid")
@@ -208,6 +213,20 @@ def ai_configured(cfg):
             return json.load(f).get("configured") is True
     except (OSError, ValueError, AttributeError, Refused):
         return False
+
+
+def os_realm_origin(realm):
+    """Closed signed-config enum; no URL/default inference."""
+    return {"staging": "https://os-staging.ezil.work", "production": "https://os.ezil.work"}.get(realm, "")
+
+
+def applied_os_realm(cfg):
+    try:
+        with open(_run_file(cfg, AI_STATE), encoding="utf-8") as f:
+            value = json.load(f).get("osRealm")
+        return value if value in ("staging", "production") else None
+    except (OSError, ValueError, AttributeError, Refused):
+        return None
 
 
 def host_boot_id():
@@ -562,7 +581,9 @@ def build_spec(cfg, lease, mode="desktop", extra_binds=(), desktop_config=None):
     # supply these; neither the lease nor the desktop filesystem is a token source.
     ai = desktop_config.get("ai") if desktop_config is not None else None
     env = set_env(env, {"EZIL_AI_BASE_URL": ai["baseUrl"] if ai else "",
-                        "EZIL_AI_PROXY_TOKEN": ai["proxyToken"] if ai else ""})
+                        "EZIL_AI_PROXY_TOKEN": ai["proxyToken"] if ai else "",
+                        "EZIL_EDITOR_BRIDGE_TOKEN": ai.get("editorToken", "") if ai else "",
+                        "EZIL_OS_ORIGIN": os_realm_origin(ai.get("osRealm")) if ai else ""})
     args = (["/bin/bash", "-c", "DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh"] if mode == "desktop"
             else ["/bin/sleep", "infinity"])
     dm = cfg.dataMount
@@ -619,7 +640,7 @@ def build_spec(cfg, lease, mode="desktop", extra_binds=(), desktop_config=None):
     bundle = _run_file(cfg, "bundle")
     os.makedirs(bundle, mode=0o700, exist_ok=True)
     _write_private_atomic(os.path.join(bundle, "config.json"), json.dumps(spec, indent=1).encode())
-    _write_private_atomic(_run_file(cfg, AI_STATE), json.dumps({"configured": bool(ai)}).encode())
+    _write_private_atomic(_run_file(cfg, AI_STATE), json.dumps({"configured": bool(ai), "osRealm": ai.get("osRealm") if ai else None}).encode())
     return bundle
 
 

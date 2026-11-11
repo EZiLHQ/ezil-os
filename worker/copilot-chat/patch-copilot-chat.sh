@@ -88,6 +88,13 @@ R_APP_FAILURE='qe.registerCommand("noop",()=>{});function ezilDispatchAppFailure
 # SetupAgent readiness timeout: NLS 10557/10558, once in 4.141.0. No elapsed duration is in scope.
 A_APP_START_TIMEOUT='if(M==="timedout"){let N;this.chatEntitlementService.anonymous?N=d(10558,null,RF.chatExtensionId):N=d(10557,null,RF.provider.default.name,RF.chatExtensionId);'
 R_APP_START_TIMEOUT='if(M==="timedout"){try{ezilDispatchAppFailure({eventId:crypto.randomUUID(),source:"code_app",operation:"app_start",category:"app_startup",code:"app_start_timeout",stage:"startup",outcome:"failed"})}catch{}let N;this.chatEntitlementService.anonymous?N=d(10558,null,RF.chatExtensionId):N=d(10557,null,RF.provider.default.name,RF.chatExtensionId);'
+# Per-request EZiL effort: external endpoint must pass Code API configuration, not modelOptions.
+A_EZIL_EFFORT_CONTEXT='this.options.invocation.endpoint.makeChatRequest2({...n,modeChanged:p,modelCapabilities:'
+R_EZIL_EFFORT_CONTEXT='this.options.invocation.endpoint.makeChatRequest2({...n,ezilPrimaryRequestEffort:s===7&&typeof u==="string"&&!d&&!this.options.request.isSystemInitiated&&!this.options.request.parentRequestId&&!n.isKeepAliveProbe,modeChanged:p,modelCapabilities:'
+A_EZIL_EFFORT_ARGUMENT='async makeChatRequest2({debugName:e,messages:n,ignoreStatefulMarker:r,summarizedAtRoundId:o,requestOptions:a,finishedCb:s,location:c,source:l,telemetryProperties:u,modelCapabilities:d,conversationId:p},m)'
+R_EZIL_EFFORT_ARGUMENT='async makeChatRequest2({debugName:e,messages:n,ignoreStatefulMarker:r,summarizedAtRoundId:o,requestOptions:a,finishedCb:s,location:c,source:l,telemetryProperties:u,modelCapabilities:d,conversationId:p,ezilPrimaryRequestEffort:ezilPrimaryRequestEffort},m)'
+A_EZIL_EFFORT='y={includeEncryptedThinking:!0,tools:(a?.tools??[]).map(_=>({name:_.function.name,description:_.function.description,inputSchema:_.function.parameters})),modelOptions:{_capturingTokenCorrelationId:g,'
+R_EZIL_EFFORT='y={includeEncryptedThinking:!0,...ezilPrimaryRequestEffort===!0&&this.languageModel.vendor==="ezil"&&typeof d?.reasoningEffort==="string"?{configuration:{reasoningEffort:d.reasoningEffort}}:{},tools:(a?.tools??[]).map(_=>({name:_.function.name,description:_.function.description,inputSchema:_.function.parameters})),modelOptions:{_capturingTokenCorrelationId:g,'
 # Part 1 — no GitHub calls (extension.js)
 # Plan locks and billing asks (PATCHES.md "Plan-locked models and billing asks"). The ezil-models extension lists a
 # model the account's OS plan does not include (Free: Gemini 3.8 Flash only) as isUserSelectable:false with a lock
@@ -227,6 +234,46 @@ P_TOUCH_CHIP='this._renderDisposables.add(hs.addTarget(t));for(let i of[oe.CLICK
 P_TOUCH_GESTURE='var hs=tx;'
 P_TOUCH_TAP='var jn;(n=>(n.Tap="-monaco-gesturetap",'
 P_TOUCH_DOWN='var oe={CLICK:"click",AUXCLICK:"auxclick",DBLCLICK:"dblclick",MOUSE_UP:"mouseup",MOUSE_DOWN:"mousedown",'
+# Part 4 — EZiL Chat bridge (workbench.js, PATCHES.md "Chat bridge"). ChatViewPane gains
+# _ezilChatBridge() just before createControls, which calls it before the chat header. When the setting
+# ezil.chatBridge.enabled is true it registers the internal command _ezil.chatBridge.v1, built from
+# chat-bridge.js next to this script, with the same in-scope command registry (qe) the pane already
+# uses for its _chat.voice.* commands. Off by default: without the setting nothing is registered.
+# Both anchors are inside the [chat-header] patch's output, so this runs after it.
+BRIDGE_JS_FILE="$(dirname "$0")/chat-bridge.js"
+[ -s "$BRIDGE_JS_FILE" ] || { echo "patch-copilot-chat: missing $BRIDGE_JS_FILE" >&2; exit 1; }
+BRIDGE_JS="$(cat "$BRIDGE_JS_FILE")"
+P_BRIDGE_SCOPE='this._voiceBarDisposables.add(qe.registerCommand("_chat.voice.acceptInput",'
+P_BRIDGE_SERVICES='this.chatWidgetService=ee;this.workspaceContextService=De;'
+P_BRIDGE_CHAT='this.storageService=h;this.chatService=g;this.chatAgentService=f;this.logService=v;'
+A_BRIDGE_METHOD='createControls(e){let t=this.createSessionsControl(e),'
+R_BRIDGE_METHOD='_ezilChatBridge(){if(this.configurationService.getValue("ezil.chatBridge.enabled")!==!0||globalThis.__ezilChatBridgeV1)return;let b=('"$BRIDGE_JS"')({chatService:this.chatService,chatWidgetService:this.chatWidgetService,workspaceFolders:()=>this.workspaceContextService.getWorkspace().folders.map(w=>w.uri.toString()),log:m=>this.logService.info("EZiL chat bridge: "+m)}),c=qe.registerCommand("_ezil.chatBridge.v1",(a,r)=>b.handle(r));globalThis.__ezilChatBridgeV1=!0;this._register({dispose:()=>{c.dispose(),b.dispose(),globalThis.__ezilChatBridgeV1=!1}})}createControls(e){let t=this.createSessionsControl(e),'
+A_BRIDGE_CALL='this.updateSessionsControlVisibility();try{this._ezilChatHeader(e)}'
+R_BRIDGE_CALL='this.updateSessionsControlVisibility();try{this._ezilChatBridge()}catch(f){this.logService.error("EZiL: chat bridge not registered",f)}try{this._ezilChatHeader(e)}'
+# What [chat-header] leaves in workbench.js once [chat-bridge] has extended it (literal split/join, no shell substitution).
+R_CHAT_HEADER_FINAL="$(node -e 'const [s,a1,r1,a2,r2]=process.argv.slice(1);process.stdout.write(s.split(a1).join(r1).split(a2).join(r2))' "$R_CHAT_HEADER" "$A_BRIDGE_CALL" "$R_BRIDGE_CALL" "$A_BRIDGE_METHOD" "$R_BRIDGE_METHOD")"
+
+# Native session-only effort hooks: exact pinned methods, no shared preference writes.
+ISOLATION_JS="$(cat "$(dirname "$0")/session-effort-isolation.js")"
+A_ISOLATION_HELPER='function Tcn(s){'
+R_ISOLATION_HELPER="var ezilSessionEffortV1=$ISOLATION_JS;function Tcn(s){"
+A_ISOLATION_API='restoreModelConfiguration(e,t,i=!0){t&&this._modelConfigStore.restoreModelConfiguration(e,t,i)}'
+R_ISOLATION_API='_ezilSessionEffortV2(resource,model,effort){return ezilSessionEffortV1.set(this,resource,model,effort)}restoreModelConfiguration(e,t,i=!0){t&&this._modelConfigStore.restoreModelConfiguration(e,t,i)}'
+A_ISOLATION_DRAFT='this._chatSessionIsEmpty&&this._emptyInputState.set(e,void 0);'
+R_ISOLATION_DRAFT='this._chatSessionIsEmpty&&this._emptyInputState.set(ezilSessionEffortV1.draft(this,e),void 0);'
+A_ISOLATION_STATE='n.getInputState?.(i.contrib);return i}_getAriaLabel()'
+R_ISOLATION_STATE='n.getInputState?.(i.contrib);return ezilSessionEffortV1.annotate(this,i)}_getAriaLabel()'
+A_ISOLATION_PREPARE='_syncFromModel(e,t){if(!this._isSyncingToOrFromInputModel)try{if(this._isSyncingToOrFromInputModel=!0,'
+R_ISOLATION_PREPARE='_syncFromModel(e,t){if(!this._isSyncingToOrFromInputModel)try{e=ezilSessionEffortV1.prepare(this,e,t);if(this._isSyncingToOrFromInputModel=!0,'
+A_ISOLATION_BEFORE='let n=this._schemaDefaults(e);this.getModelConfiguration(e);let r=fcn('
+R_ISOLATION_BEFORE='let n=this._schemaDefaults(e);this.getModelConfiguration(e);ezilSessionEffortV1.beforeApply(this,e,t,i);let r=fcn('
+A_ISOLATION_AFTER='let c=i?this._readBucket():void 0;return qt(this._overrides.get(e),a)'
+R_ISOLATION_AFTER='ezilSessionEffortV1.afterApply(this,e,a,r);let c=i?this._readBucket():void 0;return qt(this._overrides.get(e),a)'
+A_ISOLATION_GET='return Object.keys(t).length>0?t:void 0}async setModelConfiguration(e,t)'
+R_ISOLATION_GET='t=ezilSessionEffortV1.get(this,e,t);return Object.keys(t).length>0?t:void 0}async setModelConfiguration(e,t)'
+A_ISOLATION_RESTORE='restoreModelConfiguration:(ho,fo)=>this.restoreModelConfiguration(ho,fo),'
+R_ISOLATION_RESTORE='restoreModelConfiguration:(ho,fo)=>ezilSessionEffortV1.restore(this,ho,fo),'
+
 # Part 2 — identity in the system prompt (extension.js)
 A_IDENT='When asked for your name, you must respond with "GitHub Copilot".'
 R_IDENT='You are EZiL Chat, an AI coding assistant. When asked for your name, you must respond with "EZiL Chat".'
@@ -345,6 +392,18 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch picker-locked-select "$WB" 1 "$A_PICKER_LOCKED_SELECT" "$R_PICKER_LOCKED_SELECT"
   patch picker-locked-configure "$WB" 1 "$A_PICKER_LOCKED_CONFIGURE" "$R_PICKER_LOCKED_CONFIGURE"
   patch ai-entry "$WB" 1 "$A_AI_ENTRY" "$R_AI_ENTRY"
+  patch session-effort-helper "$WB" 1 "$A_ISOLATION_HELPER" "$R_ISOLATION_HELPER"
+  patch session-effort-api "$WB" 1 "$A_ISOLATION_API" "$R_ISOLATION_API"
+  patch session-effort-draft "$WB" 1 "$A_ISOLATION_DRAFT" "$R_ISOLATION_DRAFT"
+  patch session-effort-state "$WB" 1 "$A_ISOLATION_STATE" "$R_ISOLATION_STATE"
+  patch session-effort-prepare "$WB" 1 "$A_ISOLATION_PREPARE" "$R_ISOLATION_PREPARE"
+  patch session-effort-before "$WB" 1 "$A_ISOLATION_BEFORE" "$R_ISOLATION_BEFORE"
+  patch session-effort-after "$WB" 1 "$A_ISOLATION_AFTER" "$R_ISOLATION_AFTER"
+  patch session-effort-get "$WB" 1 "$A_ISOLATION_GET" "$R_ISOLATION_GET"
+  patch session-effort-restore "$WB" 1 "$A_ISOLATION_RESTORE" "$R_ISOLATION_RESTORE"
+  patch ezil-effort-context "$EXT" 1 "$A_EZIL_EFFORT_CONTEXT" "$R_EZIL_EFFORT_CONTEXT"
+  patch ezil-effort-argument "$EXT" 1 "$A_EZIL_EFFORT_ARGUMENT" "$R_EZIL_EFFORT_ARGUMENT"
+  patch ezil-request-effort "$EXT" 1 "$A_EZIL_EFFORT" "$R_EZIL_EFFORT"
   patch token          "$EXT" 1  "$A_TOKEN"  "$R_TOKEN"
   patch known-models   "$EXT" 1  "$A_KNOWN"  "$R_KNOWN"
   patch embeddings-cache  "$EXT" 1 "$A_EMB_CACHE"  "$R_EMB_CACHE"
@@ -385,6 +444,10 @@ if [ "$VERIFY_ONLY" = 0 ]; then
     gate header-names "$WB" 1 "$p"
   done
   patch chat-header    "$WB"  1  "$A_CHAT_HEADER" "$R_CHAT_HEADER"
+  for p in "$P_BRIDGE_SCOPE" "$P_BRIDGE_SERVICES" "$P_BRIDGE_CHAT"; do gate chat-bridge-names "$WB" 1 "$p"; done
+  gate chat-bridge-command "$WB" 0 '"_ezil.chatBridge.v1"'
+  patch chat-bridge-method "$WB" 1 "$A_BRIDGE_METHOD" "$R_BRIDGE_METHOD"
+  patch chat-bridge-call   "$WB" 1 "$A_BRIDGE_CALL" "$R_BRIDGE_CALL"
   patch attach-execute "$WB"  1  "$A_ATTACH" "$R_ATTACH"
   patch chat-enabled   "$WB"  1  "$A_CHAT_ENABLED" "$R_CHAT_ENABLED"
   for p in "$P_PICKER_OPTIONS" "$P_PICKER_DIALOG"; do gate picker-names "$WB" 1 "$p"; done
@@ -422,6 +485,9 @@ gate picker-locked-select "$WB" 0 "$A_PICKER_LOCKED_SELECT"; gate picker-locked-
 gate picker-locked-configure "$WB" 0 "$A_PICKER_LOCKED_CONFIGURE"; gate picker-locked-configure "$WB" 1 "$R_PICKER_LOCKED_CONFIGURE"
 gate ai-dashboard "$WB" 0 "$A_AI_DASHBOARD"; gate ai-dashboard "$WB" 1 "$R_AI_DASHBOARD"
 gate ai-entry "$WB" 0 "$A_AI_ENTRY"; gate ai-entry "$WB" 1 "$R_AI_ENTRY"
+gate ezil-effort-context "$EXT" 0 "$A_EZIL_EFFORT_CONTEXT"; gate ezil-effort-context "$EXT" 1 "$R_EZIL_EFFORT_CONTEXT"
+gate ezil-effort-argument "$EXT" 0 "$A_EZIL_EFFORT_ARGUMENT"; gate ezil-effort-argument "$EXT" 1 "$R_EZIL_EFFORT_ARGUMENT"
+gate ezil-request-effort "$EXT" 0 "$A_EZIL_EFFORT"; gate ezil-request-effort "$EXT" 1 "$R_EZIL_EFFORT"
 gate token            "$EXT" 0  "$A_TOKEN";        gate token            "$EXT" 1  "$R_TOKEN"
 gate known-models     "$EXT" 0  "$A_KNOWN";        gate known-models     "$EXT" 1  "$R_KNOWN"
 gate identity         "$EXT" 0  "$A_IDENT";        gate identity         "$EXT" 13 "$R_IDENT"
@@ -461,7 +527,9 @@ gate session-filter   "$WB"  0  "$A_SESSION_FILTER"; gate session-filter   "$WB"
 for p in "$P_HEADER_TITLE" "$P_HEADER_TITLE_ROOT" "$P_HEADER_INPUT_PART" "$P_HEADER_SECONDARY" "$P_HEADER_COMMANDS" "$P_HEADER_NOTIFY"; do
   gate header-names "$WB" 1 "$p"
 done
-gate chat-header      "$WB"  0  "$A_CHAT_HEADER";   gate chat-header      "$WB"  1  "$R_CHAT_HEADER"
+gate chat-header      "$WB"  0  "$A_CHAT_HEADER";   gate chat-header      "$WB"  1  "$R_CHAT_HEADER_FINAL"
+gate chat-bridge-method "$WB" 1 "$R_BRIDGE_METHOD"; gate chat-bridge-call "$WB" 1 "$R_BRIDGE_CALL"
+gate chat-bridge-command "$WB" 1 'qe.registerCommand("_ezil.chatBridge.v1",'
 gate attach-execute   "$WB"  0  "$A_ATTACH";        gate attach-execute   "$WB"  1  "$R_ATTACH"
 gate chat-enabled     "$WB"  0  "$A_CHAT_ENABLED";  gate chat-enabled     "$WB"  1  "$R_CHAT_ENABLED"
 for p in "$P_PICKER_OPTIONS" "$P_PICKER_DIALOG"; do gate picker-names "$WB" 1 "$p"; done
@@ -507,3 +575,13 @@ grep -q "Copyright (C) Microsoft Corporation" "$WB"
 grep -q "Copyright (C) Microsoft Corporation" "$SERVER"
 echo "patch-copilot-chat: gate ok [Microsoft copyright headers intact]"
 echo "patch-copilot-chat: all gates passed"
+
+gate session-effort-api "$WB" 1 "$A_ISOLATION_API"; gate session-effort-api "$WB" 1 "$R_ISOLATION_API"
+gate session-effort-draft "$WB" 0 "$A_ISOLATION_DRAFT"; gate session-effort-draft "$WB" 1 "$R_ISOLATION_DRAFT"
+gate session-effort-state "$WB" 0 "$A_ISOLATION_STATE"; gate session-effort-state "$WB" 1 "$R_ISOLATION_STATE"
+gate session-effort-prepare "$WB" 0 "$A_ISOLATION_PREPARE"; gate session-effort-prepare "$WB" 1 "$R_ISOLATION_PREPARE"
+gate session-effort-restore "$WB" 0 "$A_ISOLATION_RESTORE"; gate session-effort-restore "$WB" 1 "$R_ISOLATION_RESTORE"
+gate session-effort-helper "$WB" 1 "$R_ISOLATION_HELPER"
+gate session-effort-before "$WB" 0 "$A_ISOLATION_BEFORE"; gate session-effort-before "$WB" 1 "$R_ISOLATION_BEFORE"
+gate session-effort-after "$WB" 1 "$A_ISOLATION_AFTER"; gate session-effort-after "$WB" 1 "$R_ISOLATION_AFTER"
+gate session-effort-get "$WB" 1 "$A_ISOLATION_GET"; gate session-effort-get "$WB" 1 "$R_ISOLATION_GET"

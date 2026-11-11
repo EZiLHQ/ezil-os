@@ -1,0 +1,262 @@
+{
+  "base": "baeeca350a823e9c8aaba6a9d6e29981138b3bb7",
+  "source_only": true,
+  "native_copy_inputs": 42,
+  "changed_native_copy_inputs": [],
+  "unchanged_closure_sha256": "af15f98e374c3000fc1ea76049ee41a292926e0f0d640a0623f5869bce373d5d",
+  "inputs": [
+    {
+      "path": "worker/.dockerignore",
+      "blob": "0141d57182fa19d438a61eacf12137d9d674aabb",
+      "bytes": 540,
+      "sha256": "2d29d3ebe1552d5da77c120b2ee2fd361e12437b84ff6b2837f5b618921ccd64"
+    },
+    {
+      "path": "worker/Dockerfile",
+      "blob": "8ef65a30d01a0e10317e19c21135d34e658f5dc0",
+      "bytes": 30337,
+      "sha256": "fed04233f241086bea53e1362f6917e101f1be0fe6a046649d6d16b2dffb7bd8"
+    },
+    {
+      "path": "worker/assets/browser-home.html",
+      "blob": "ba99256f4d4e07e0448d998446faa0aa64276d4f",
+      "bytes": 1924,
+      "sha256": "6e8bb0cf6814de8851dc5e04c6202bf15f30d2d90ef8df83aeb7ab8561a7cbc2"
+    },
+    {
+      "path": "worker/assets/ebuilder-menu.xml",
+      "blob": "2ed45f32a59f0339c4ee85629a14fce984061f2c",
+      "bytes": 1315,
+      "sha256": "a22e8e86d00106778fc2d3166ab12571f034b6576594c333f8021d3557340d15"
+    },
+    {
+      "path": "worker/assets/ebuilder-openbox.xml",
+      "blob": "0676fa6b88303e941c0e98169e3cd23d93480318",
+      "bytes": 4063,
+      "sha256": "5ceeb111d17b7fa64f6e92afc802e095e28df3abd53749ac18876abb577d0584"
+    },
+    {
+      "path": "worker/bootstrap/dist/workspace-bootstrap.mjs",
+      "blob": "f108f114f06c343764ac72d4cd1559a470aa2633",
+      "bytes": 1996,
+      "sha256": "8e03b363058f765b31cbbafc21e0452f7081d081fa85efb1ef122c5db6128edc"
+    },
+    {
+      "path": "worker/copilot-chat/PATCHES.md",
+      "blob": "cbb8b5ba8e7bb3a2bc4e63a56f1a0f9189e34b2f",
+      "bytes": 77216,
+      "sha256": "1aceb03a8a2d4074294e01458cc5db5032edc3de7126c70baaa0366720c3e7c0"
+    },
+    {
+      "path": "worker/copilot-chat/chat-bridge.js",
+      "blob": "f245a6d5786ada97503dd17a3c679cc5d0bb239e",
+      "bytes": 36775,
+      "sha256": "b32d7ec92673ba42ece907f7079a79cc1653f3f29639269f42034b00decaf316"
+    },
+    {
+      "path": "worker/copilot-chat/patch-copilot-chat.sh",
+      "blob": "106ff73baede062d66b9571bd1f0ed755438f8a4",
+      "bytes": 67159,
+      "sha256": "70e1409d25e44305ef7b59ea0171933afd6e24cea109b2c7d65e8e895ba7a330"
+    },
+    {
+      "path": "worker/copilot-chat/session-effort-isolation.js",
+      "blob": "e7c6d705c36bde9a82804c0a51c622e4671fbf47",
+      "bytes": 6692,
+      "sha256": "aab1ac1fb6aca0e0d6ccd349773a42c632c638a2ec7b868474b301350f4f0f8d"
+    },
+    {
+      "path": "worker/ezil-models/dist/ezil-models-0.1.0.vsix",
+      "blob": "aaacf6470b55bd72a23bc872f319853efaa025d5",
+      "bytes": 96002,
+      "sha256": "031da7d59b03b06900e2f3d0b2c2f839521fe754716befb51503afc037fa3ac2"
+    },
+    {
+      "path": "worker/ezil-models/models.json",
+      "blob": "3575a3560b802732a17cd562ac51df8660c15862",
+      "bytes": 1009,
+      "sha256": "723a21f3b7ec434c01f96920b65536a40308ef72e1f2c8c7b0e558bca1afbeb9"
+    },
+    {
+      "path": "worker/guacamole/guacamole.properties",
+      "blob": "31108f4e309080b43eb906935c4e9f99c415b5b7",
+      "bytes": 1560,
+      "sha256": "b53d42226c2f75260805100672beaa6251715b5e2a68a02befd3039e48079a6a"
+    },
+    {
+      "path": "worker/guacamole/root-index.html",
+      "blob": "4820f9615d4a108f49fc62ed60c9d32e5e96d33e",
+      "bytes": 5699,
+      "sha256": "0c8385b46f30a418dc8eeaba236c70f5b7a981b547f4599334f67a20a2888acf"
+    },
+    {
+      "path": "worker/guacamole/user-mapping.xml",
+      "blob": "246903ec1073adbb11ee6d1a9759fcecbb9ef506",
+      "bytes": 1117,
+      "sha256": "1905adc24e938ff4b405716b45271ea20314f6894a3ebe57ea1ce9a4833be950"
+    },
+    {
+      "path": "worker/sandbox-template/.gitignore",
+      "blob": "0474dae66557fba226fd54056ded27e97a6a8631",
+      "bytes": 31,
+      "sha256": "c11753a23d4d16a3e8255f767653ec2b4f1871a1d9d0d04cf701e57eff3ae48d"
+    },
+    {
+      "path": "worker/sandbox-template/README.md",
+      "blob": "ed648ba6a1bb0d5aa79688f00e1464a48428f514",
+      "bytes": 1082,
+      "sha256": "5c9094a62d832a04e63a909d6ec46278f0d991c8ad7280d990b781654eb5cc77"
+    },
+    {
+      "path": "worker/sandbox-template/next.config.js",
+      "blob": "cf89e73ec1e79c95b5180116ee26b026ef216eb6",
+      "bytes": 1933,
+      "sha256": "dc83a6988354b3e7a80f9c06b64923d7a19b2da73a297f154aee36d307e6725c"
+    },
+    {
+      "path": "worker/sandbox-template/package.json",
+      "blob": "2aa6ac5fe0efeccedf5c062745fcdcc6cf48c3c6",
+      "bytes": 219,
+      "sha256": "0cfe4be134e3184e6a67fb2cfebb57719f57c913bcabe8cb07cf23427234a565"
+    },
+    {
+      "path": "worker/sandbox-template/pages/index.js",
+      "blob": "2c96e407d57fe1a6c4c8d13e9ec38ab361a6b0bc",
+      "bytes": 619,
+      "sha256": "3130ea347f77c2e2776198c48ffe1520ce25a98e043e8a188e94a819eadee819"
+    },
+    {
+      "path": "worker/scripts/editor-state.sh",
+      "blob": "6c401cbcae9d8963a268e5a1b83222568d1d3582",
+      "bytes": 20826,
+      "sha256": "4ca5093d08ed836dede3741d55ce880c16ae074e67792e401046cb247e8da6c2"
+    },
+    {
+      "path": "worker/scripts/ezil-image-manifest.py",
+      "blob": "8fb984c7d5586f2857b853e73fd88742b933f84c",
+      "bytes": 3147,
+      "sha256": "360822ef19e2e20e660c14c5d1aeea8b0ae66156624dd28c5f56e7634d21d5b5"
+    },
+    {
+      "path": "worker/scripts/ezil-restore-deps.sh",
+      "blob": "7690eaeaa28027a5aa658834114264685fdc4ee6",
+      "bytes": 1890,
+      "sha256": "5a4962ba0b5ed6090ae38f48a05fa6136b0fde6adf16c3d0defcadd20b546db9"
+    },
+    {
+      "path": "worker/scripts/neko-client.js",
+      "blob": "5f98f68d55c04ab7d5a1df43791442e622d8516e",
+      "bytes": 4226,
+      "sha256": "43a06c7ac3929da6c3e1ce660b5aa125554f94efec38377aa544560ec0f99454"
+    },
+    {
+      "path": "worker/scripts/start-codeserver.sh",
+      "blob": "4e1c4c4f34d3c22e6680f54a696a807c7824aef4",
+      "bytes": 5052,
+      "sha256": "0eadcad4d35a1a5c196df89c4952c9e613ed4fc48a21e8f016aa1526a1a7566a"
+    },
+    {
+      "path": "worker/scripts/start-desktop.sh",
+      "blob": "8fe09dd60f8d061a62e7af525b7393c25fb206c6",
+      "bytes": 11329,
+      "sha256": "4102b55008b1838f56aa446dcf38d9c6edd55bbc59c4aa44e0e7fbda61ac0f07"
+    },
+    {
+      "path": "worker/scripts/start-devserver.sh",
+      "blob": "f5d673c082236de98067972bbc2958b041d6dda4",
+      "bytes": 16141,
+      "sha256": "3c91610f0d19bda707c48d22335ab620afde2d6f26aac35a421f6c824619151b"
+    },
+    {
+      "path": "worker/scripts/start-neko.sh",
+      "blob": "581b8cad0e4508b486a13550aa8fd03cc3932737",
+      "bytes": 177325,
+      "sha256": "b3f05060dda15ecee3eaa4fcf6226a8c3d286c62cb3a68b37cb24657bf1b318d"
+    },
+    {
+      "path": "worker/scripts/validate-neko-browser-window.sh",
+      "blob": "bac09ed112ab20073982b98cf5107a0f6182da4c",
+      "bytes": 29636,
+      "sha256": "5e58313919ac2abb062eb564d4299a541168a6ed226d118bacd653110481b3b0"
+    },
+    {
+      "path": "worker/scripts/validate-neko-desktop.sh",
+      "blob": "94dfbf3379be30f7d7b6b8a58d49ef9a3616a83e",
+      "bytes": 10618,
+      "sha256": "ab9c3a9133c67f5f133037126863d1fbbfdd63734fe2ee77e75ebcaffc152653"
+    },
+    {
+      "path": "worker/scripts/validate-neko-focus.sh",
+      "blob": "77c60b55ed2a01250604e2c2737be53b291cac93",
+      "bytes": 5863,
+      "sha256": "d1a7f6e10d65f4bd54b79dd0cb201d2b6429e9c855ec4362ad48989ec1808ad6"
+    },
+    {
+      "path": "worker/sidecar/README.md",
+      "blob": "23d0439371d62065f39f6e6ed612df2c88c2f156",
+      "bytes": 6135,
+      "sha256": "cc99cb8de64d6c8b3ae08640954e64fc50cde5c37bc2de260aef248acc351eec"
+    },
+    {
+      "path": "worker/sidecar/browser.mjs",
+      "blob": "9feea1a71b14210a8662275a167066b323829362",
+      "bytes": 12359,
+      "sha256": "967355887cde5b0c9b506f1c54e21f731d1b38b9702d75cba55fe10201530379"
+    },
+    {
+      "path": "worker/sidecar/contract.mjs",
+      "blob": "a60ff62292ab1d42417e7041c15978ec57ba57ba",
+      "bytes": 3231,
+      "sha256": "51238e6fbba94549553bc90aaed52c609e519aa79ca438b4180a18452b7f5d66"
+    },
+    {
+      "path": "worker/sidecar/package.json",
+      "blob": "fd26c38748e7617c373171938985aecff6bd497e",
+      "bytes": 389,
+      "sha256": "d85b65b24c2709ccb112ecc718bc4bb0ec9ecf92c6f30e717540961fbf036510"
+    },
+    {
+      "path": "worker/sidecar/page-scripts.mjs",
+      "blob": "c438a0fc641e4c3f69f55ebc328a07840e082572",
+      "bytes": 17837,
+      "sha256": "6a52d320d9aa58188424cc07e414056c58285f4cd536c10569e45c1091e121f7"
+    },
+    {
+      "path": "worker/sidecar/redact.mjs",
+      "blob": "6c207339aa48863cd7b562428437b827001b1222",
+      "bytes": 4578,
+      "sha256": "86ffc09cd65576995c63d570b91308df794274de8256435a22bb9cec38866886"
+    },
+    {
+      "path": "worker/sidecar/redaction.test.mjs",
+      "blob": "1bc9ff357e9f176633efe7b11d96e301cc705cc7",
+      "bytes": 7440,
+      "sha256": "bf03aac1f9f5d16da90af928a6610d46e0b8b5326090b9ed67926c26ef0dc598"
+    },
+    {
+      "path": "worker/sidecar/server.mjs",
+      "blob": "50f700d79d281f1f3ef2e30ecce66e182a7ef5ff",
+      "bytes": 9907,
+      "sha256": "85c7e4149943352bf511563110643071eb72a7319ba1f0d18fd39e98e0f85801"
+    },
+    {
+      "path": "worker/sidecar/server.test.mjs",
+      "blob": "502dbaf41768501b4f7dc02a8bdc8cb207230ef2",
+      "bytes": 4838,
+      "sha256": "24b28cc9038971692b3af3ded3bc91cc1c5bba7157b04097a1f1f028c50f90e1"
+    },
+    {
+      "path": "worker/sidecar/verbs.mjs",
+      "blob": "a9913a1cde3dbccbe79e88c43813aecda842f292",
+      "bytes": 13877,
+      "sha256": "8e78415745f174fed1b28efd2d32e91e47d7336fae8d2872744d7a2a8af66078"
+    },
+    {
+      "path": "worker/sidecar/wire.test.mjs",
+      "blob": "a2c055599017a665172bb1cb8bc24b4cb5a469e9",
+      "bytes": 10055,
+      "sha256": "c1bdd77bdbc15b53a3f28f45d0fac77ff1e2bc09599f9dc51a787b6fc9706ce3"
+    }
+  ],
+  "runtime_acceptance": "NOT_RUN; native evidence remains root-owned; host environment adoption requires separate acceptance"
+}

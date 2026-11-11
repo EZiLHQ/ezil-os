@@ -90,7 +90,7 @@ export function standingCopy (standing, data) {
         // Round 6 (R4-02): a held 4 or 8 vCPU computer does not open on Free (the hold never resizes).
         const closed = heldClosedSize(data?.computer);
         return closed ? heldClosedText(closed.vcpu)
-            : 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours.';
+            : 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits.';
     }
     return '';
 }
@@ -308,14 +308,24 @@ export function timeV3Html ({ computer, fairUse, plan }, usage = null) {
     ] });
 }
 
+/** Stored, undelivered grant receipts, not a balance-zero guess or a catalog allowance. */
+function deliveringCreditsV3 ({ ai }) {
+    const credits = (ai.enrollment ?? 'enrolled') === 'enrolled' ? ai.delivering?.credits : null;
+    return safeCount(credits) && credits > 0 ? credits : null;
+}
+
 /**
  * Identity credits (`ai.account`): every live grant in the total, from exact microcredit strings. The headline is
- * whole credits (floor); the details are exact to 2 decimals with every microcredit in their titles. Neither number
+ * whole credits (floor), including details and titles. Neither number
  * ever comes from the catalog: unreadable shows the last balance read for this user, as of its time, or "—".
  */
 function aiAccountMeterV3 (summary, { lastAccount = null, userId = null } = {}) {
     const { ai, plan } = summary;
     const view = accountCredits(ai.account, { previous: lastAccount, userId, planSku: plan?.sku });
+    const delivering = deliveringCreditsV3(summary);
+    const adding = delivering === null ? '' : `${whole(delivering)} credits are being added to your account.`;
+    if ( adding && (! view || view.empty) ) return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits',
+        value: 'Adding your AI credits…', notes: [view?.stale ? staleCreditsCopy(view.asOf) : '', adding, 'Used by EZiL AI in Code and Chat.'] });
     if ( ! view ) return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value: '—',
         notes: ["We couldn't read your credits. Try again later.", 'Used by EZiL AI in Code and Chat.'] });
     const tone = view.empty ? 'danger' : ! view.stale && view.low ? 'warn' : 'ok';
@@ -327,6 +337,7 @@ function aiAccountMeterV3 (summary, { lastAccount = null, userId = null } = {}) 
     return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', action: topupMeterAction(summary), value: `${view.left} credits left${view.total !== null ? ` of ${view.total}` : ''}`,
         percent: view.percent, tone, notes: [
             view.stale ? staleCreditsCopy(view.asOf) : view.empty ? '■ No credits left' : tone === 'warn' ? '! Running low' : '',
+            adding,
             { html: `<p class="ezil-billing-note" data-role="ai-details">${accountDetailsHtml(view.details, encode)}</p>` },
             ...view.expiring.map(item => `${item.remaining} ${expiry[item.kind]} · expire ${dateLabel(item.expiresAt, true)}`),
             awaitingPayment ? `${whole(pending.credits)} credits for this period. Added once your payment goes through.`
@@ -515,6 +526,7 @@ function planPrimaryV3 (summary) {
     const { plan, ai } = summary;
     // Identity credits: the AI meter's own warning (a large added grant beside a spent plan bucket is not low).
     const view = 'account' in ai ? accountCredits(ai.account) : undefined;
+    if ( deliveringCreditsV3(summary) !== null && (! view || view.empty) ) return '';
     const low = view === undefined ? ['low', 'exhausted'].includes(ai.state) : view !== null && (view.empty || view.low);
     if ( plan.sku === 'premium_monthly_v3' && low && topupOffer(summary) ) {
         return '<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open-topup">Add AI credits</button>';
@@ -524,6 +536,8 @@ function planPrimaryV3 (summary) {
 
 /** Beside the balance: the same top-up dialog every entry opens (secondary; the page keeps one primary). */
 function topupMeterAction (summary) {
+    const view = 'account' in summary.ai ? accountCredits(summary.ai.account) : null;
+    if ( deliveringCreditsV3(summary) !== null && (! view || view.empty) ) return '';
     return topupOffer(summary) ? '<button type="button" class="ezil-settings-btn ezil-billing-meter-action" data-action="topup">Add credits</button>' : '';
 }
 
@@ -531,7 +545,6 @@ function yourComputerV3 (summary) {
     const { computer, plan } = summary;
     const standing = standingOf(summary);
     const free = plan.sku === 'free_v3' || standing === 'free' || standing === 'files_on_aws';
-    const hours = computer.sessionMaxSeconds === null ? null : computer.sessionMaxSeconds / 3600;
     const gb = Number.isFinite(computer.disk?.provisionedGiB) && computer.disk.provisionedGiB > 0 ? computer.disk.provisionedGiB : null;
     // Round 6 (R1-11): one provider string, "AWS (India)", on every tab; the Free limits are the session line below.
     const held = standing === 'files_on_aws';
@@ -543,7 +556,7 @@ function yourComputerV3 (summary) {
     const parts = [size, gb ? `${gb} GB disk` : 'files saved between sessions', where];
     return `<div class="ezil-billing-computer" data-role="your-computer">
         <p><span class="ezil-billing-note">Your computer</span> <strong>${encode(parts.join(' · '))}</strong></p>
-        ${paragraph(closed ? "Can't open on the Free plan at this size" : hours === null ? 'No session time limit' : `Sessions up to ${hours} hour${hours === 1 ? '' : 's'}${held ? ' on Free' : ''}`, 'ezil-billing-note')}
+        ${closed ? paragraph("Can't open on the Free plan at this size", 'ezil-billing-note') : ''}
         ${linkAction('computer-tab', held ? 'Computer details ›' : 'Change configuration ›')}</div>`;
 }
 
@@ -602,11 +615,8 @@ function offerCardV3 (summary, offer) {
     const configs = (offer.machineChoice ?? []).map(code => {
         const size = sizeInfoV3(summary, code);
         if ( ! size ) return '';
-        // Paid compute policy v1: no plan card sells monthly computer hours; each configuration shows its session length.
-        const time = Number.isFinite(offer.sessionMaxSeconds) && offer.sessionMaxSeconds >= 3600
-            ? `sessions up to ${offer.sessionMaxSeconds / 3600} hour${offer.sessionMaxSeconds === 3600 ? '' : 's'}` : '';
         const now = current && code === computer.size ? ' <span class="ezil-billing-now">Now</span>' : '';
-        return `<li data-size="${encode(code)}"><strong>${encode(`${size.vcpu} vCPU · ${size.memoryGiB} GB`)}</strong>${now}${time ? ` <span>${encode(time.charAt(0).toUpperCase() + time.slice(1))}</span>` : ''}</li>`;
+        return `<li data-size="${encode(code)}"><strong>${encode(`${size.vcpu} vCPU · ${size.memoryGiB} GB`)}</strong>${now}</li>`;
     }).join('');
     // The current card never contradicts "Your computer": a disk made smaller than today's plan disk says so.
     const realDisk = Number.isFinite(computer.disk?.provisionedGiB) && computer.disk.provisionedGiB > 0 ? computer.disk.provisionedGiB : null;
@@ -692,7 +702,7 @@ function summaryHtml (summary) {
     return `<header class="ezil-billing-header"><div><h3>Plan &amp; usage</h3><p class="ezil-settings-lead">Your plan, compute and what renews when.</p></div>
         ${actions.portal ? actionHtml('portal', 'Manage billing') : ''}</header>
         ${paymentHtml(summary)}${planHtml(summary)}${pickerHtml(summary)}${computeHtml(summary)}${selectorHtml(summary)}
-        <section class="ezil-billing-card ezil-billing-session"><p data-role="session-note">${encode(`Sessions run up to ${compute.session.maxSeconds / 3600} hours, then your work is saved and the computer restarts. Files and installed tools are kept; running processes start fresh.`)}</p>
+        <section class="ezil-billing-card ezil-billing-session"><p data-role="session-note">${encode('When a session ends, your work is saved and the computer restarts. Files and installed tools are kept; running processes start fresh.')}</p>
             ${compute.session.activeDeadline ? '<p data-role="session-countdown" aria-live="polite"></p>' : ''}</section>
         ${overageHtml(summary)}${estimateHtml(summary)}
         <div class="ezil-billing-meters">

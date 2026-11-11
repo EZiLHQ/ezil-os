@@ -74,11 +74,12 @@ if ( FIXTURE.ok?.ai?.account?.totalMicro !== '1300000000' || FIXTURE.ok.ai.accou
 
 // What the shipped formatter makes of these exact microcredits (floored, trailing zeros trimmed).
 const A_HEADLINE = '1,263 credits left of 1,300';
-const A_DETAILS = 'Plan 200 · Starter 100 · Added 1,000 · Used 18.77 · Reserved 17.4 · Remaining 1,263.81';
-const A_DETAILS_UNPROVEN = 'Plan 200 · Starter 100 · Added 1,000 · Reserved 17.4 · Remaining 1,263.81';
-const A_TITLES = ['200 credits', '100 credits', '1,000 credits', '18.775515 credits', '17.409094 credits', '1,263.815391 credits'];
+// Whole floored credits everywhere a user reads a balance (founder decision 2026-11-11): 18.775515 is 18, never 18.77 or 19.
+const A_DETAILS = 'Plan 200 · Starter 100 · Added 1,000 · Used 18 · Reserved 17 · Remaining 1,263';
+const A_DETAILS_UNPROVEN = 'Plan 200 · Starter 100 · Added 1,000 · Reserved 17 · Remaining 1,263';
+const A_TITLES = ['200 credits', '100 credits', '1,000 credits', '18 credits', '17 credits', '1,263 credits'];
 const B_HEADLINE = '37 credits left of 100';
-const B_DETAILS = 'Starter 100 · Used 62.75 · Remaining 37.25';
+const B_DETAILS = 'Starter 100 · Used 62 · Remaining 37';
 // 1,263.815391 of 1,300 = 97.2 %, floored.
 const A_PERCENT = '97';
 // Catalog denominators (Premium 1,000, Standard 200) and the rounded old headline must never be the meter's.
@@ -89,8 +90,8 @@ const renderers = (await build({
     stdin: { contents: `
         import usageTab, { usageHtml } from './tabs/usage.js';
         import { summaryV3Html } from './tabs/billing.js';
-        import { accountCredits, creditsDecimal, creditsLabel } from './billing-format.js';
-        window.real = { usageHtml, usageTabHtml: usageTab.html(), summaryV3Html, accountCredits, creditsDecimal, creditsLabel };
+        import { accountCredits, creditsDecimal, creditsLabel, creditsWhole } from './billing-format.js';
+        window.real = { usageHtml, usageTabHtml: usageTab.html(), summaryV3Html, accountCredits, creditsDecimal, creditsLabel, creditsWhole };
     `, resolveDir: here },
     bundle: true, write: false, format: 'iife', target: 'es2022', logLevel: 'silent',
 })).outputFiles[0].text;
@@ -136,11 +137,11 @@ async function readAiMeter (page) {
     });
 }
 
-/** The full set for a readable account: headline, exact details with every microcredit in titles, a bar, no catalog figure, no overflow. */
+/** The full set for a readable account: headline, whole-floor details and titles, a bar, no catalog figure, no overflow. */
 function expectAccount (label, m, { headline, details, titles = null, percent = null, stale = false }) {
     push(`${label}: headline`, m?.value === headline, m?.value);
     push(`${label}: exact details line`, m?.details === details, m?.details);
-    if ( titles ) push(`${label}: every microcredit in the titles`, JSON.stringify(m.titles) === JSON.stringify(titles), m.titles.join(' | '));
+    if ( titles ) push(`${label}: whole floored credits in the titles`, JSON.stringify(m.titles) === JSON.stringify(titles), m.titles.join(' | '));
     if ( percent !== null ) push(`${label}: the bar is ${percent} % of the live total and painted to match`, m.bar === percent && Math.abs(m.fill - Number(percent)) <= 1, `${m.bar} / ${m.fill?.toFixed(1)}`);
     push(`${label}: no catalog denominator or rounded figure in the AI row`, ! CATALOG.test(m.rowText), m.rowText.slice(0, 120));
     push(`${label}: ${stale ? 'says it could not refresh, as of the kept time' : 'is not marked stale'}`,
@@ -169,6 +170,11 @@ try {
     push('formatter: Reserved 17.409094 → "17.4" (2 dp floored is 17.40; trailing zero trimmed)', fmt[1][0] === '17.4' && fmt[1][1] === '17.409094', fmt[1].join(' / '));
     push('formatter: Remaining 1,263.815391 → "1,263.81", headline "1,263"', fmt[2][0] === '1,263.81' && fmt[2][2] === '1,263', fmt[2].join(' / '));
     push('formatter: total 1,300', fmt[3][2] === '1,300', fmt[3].join(' / '));
+    // The user-facing whole floor: never rounded up, never a fraction, null (not a fake 0) for anything that is not a microcredit string.
+    const whole = await page.evaluate(() => ['99999999', '18775515', '17409094', '1263815391', '999999', '0', '1000000', '-1', '1.5', '', null].map(m => window.real.creditsWhole(m)));
+    push('whole floor: 99.999999 → "99", 18.775515 → "18", 17.409094 → "17", 1,263.815391 → "1,263"', whole.slice(0, 4).join('|') === '99|18|17|1,263', whole.slice(0, 4).join(' | '));
+    push('whole floor: 0.999999 → "0", 0 → "0", 1 → "1"', whole.slice(4, 7).join('|') === '0|0|1', whole.slice(4, 7).join(' | '));
+    push('whole floor: a negative, fractional or missing amount is null, never a fake 0', whole.slice(7).every(value => value === null), whole.slice(7).join(' | '));
 
     const render = async (width, pane, html) => {
         await page.setViewportSize({ width: Math.max(width, 390), height: 1000 });

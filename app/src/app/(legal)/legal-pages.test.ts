@@ -108,21 +108,20 @@ describe('Free, Standard and Premium billing disclosures', () => {
         expect(refunds).toContain(`${offer.name} (${price})`);
     });
 
-    it('discloses hardware, session policy and weighted fair use', () => {
+    it('discloses hardware and weighted fair use, with no session-duration sales statement', () => {
         const plans = section(renderToStaticMarkup(createElement(TermsPage)), 'plans-payments');
         const free = CATALOG_V3.free_v3;
         const standard = CATALOG_V3.standard_monthly_v3;
         expect(plans).toContain(`${free.vcpu} vCPU · ${free.memoryGiB} GB computer on Cloudflare`);
-        expect(plans).toContain(`sessions up to ${free.sessionMaxSeconds! / 3600} hour`);
+        expect(plans).not.toMatch(/sessions? up to|session time limit|session duration/i);
         expect(plans).toContain(`Older accounts keep ${free.legacyFairUseSeconds! / 3600} standard-hours/month`);
         expect(plans).toContain(`${standard.vcpu} vCPU · ${standard.memoryGiB} GB computer on AWS in Mumbai`);
         expect(plans).toContain('choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS in Mumbai');
-        // S5 explicitly removes paid session caps; the existing catalog still needs a separate update.
         const paidItems = [...plans.matchAll(/<li>([\s\S]*?)<\/li>/g)].slice(1);
         expect(paidItems).toHaveLength(2);
-        for (const [, item] of paidItems) expect(item).toContain('no session time limit');
+        for (const [, item] of paidItems) expect(item).toContain('standard-hours/month fair use');
         expect(plans).toContain('4 vCPU uses time at ×2 and 8 vCPU at ×4');
-        expect(plans).toContain('does not remove monthly fair-use limits');
+        expect(plans).toContain('Monthly fair-use limits apply to every plan');
     });
 
     it('requires payment confirmation and explains renewals and plan changes', () => {

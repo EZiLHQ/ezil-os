@@ -68,6 +68,21 @@ export function buildBody(model: ResolvedModel, request: ChatRequest): { endpoin
     return { endpoint, body };
 }
 
+/**
+ * The effort this extension really sends for a model, read from the body it builds: Anthropic `output_config.effort`,
+ * OpenAI `reasoning_effort`, or null (the EZiL Gateway body carries no effort, whatever `thinking.effort` says).
+ */
+export function sentEffort(model: ResolvedModel): string | null {
+    try {
+        const { body } = buildBody(model, { messages: [{ role: 'user', parts: [{ type: 'text', value: 'x' }] }], tools: [], toolMode: 'auto', modelOptions: {} });
+        const fields = body as Record<string, unknown>;
+        const effort = (fields.output_config as { effort?: unknown } | undefined)?.effort ?? fields.reasoning_effort;
+        return typeof effort === 'string' ? effort : null;
+    } catch {
+        return null;
+    }
+}
+
 export async function* chat(model: ResolvedModel, request: ChatRequest, options: ChatOptions): AsyncGenerator<StreamEvent> {
     if (model.provider.type === 'ezil-gateway') {
         yield* gatewayChat(model, request, { signal: options.signal, fetch: options.fetch, log: options.log, ...options.gateway });

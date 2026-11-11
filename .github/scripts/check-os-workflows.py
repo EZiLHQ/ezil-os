@@ -138,11 +138,13 @@ assert '!(Date.parse(other.updated_at) < Date.parse(run.created_at)))) return;' 
 # Case variants of admitted refs fail detection, so no image or deploy job runs.
 case_guard = changes['steps'][0]
 assert case_guard['name'] == 'Refuse case variants of admitted refs' and not {'if', 'continue-on-error'} & set(case_guard)
-assert 'for ref in refs/heads/preview refs/heads/main refs/heads/staging/os-union-20261106; do' in case_guard['run']
-# Slash-free artifact names: identical for preview, main and tags; fixed for the union.
+assert 'for ref in refs/heads/preview refs/heads/main refs/heads/staging/os-union-20261106 refs/heads/staging/os-signup-feedback-hotfix-20261111; do' in case_guard['run']
+# Slash-free artifact names: changes also admits the image-only hotfix.
 evidence_ref = "${{ github.ref == 'refs/heads/staging/os-union-20261106' && 'staging-os-union-20261106' || github.ref_name }}"
+changes_ref = evidence_ref.replace(" || github.ref_name",
+    " || github.ref == 'refs/heads/staging/os-signup-feedback-hotfix-20261111' && 'staging-os-signup-feedback-hotfix-20261111' || github.ref_name")
 assert next(step for step in changes['steps'] if step.get('name') == 'Upload live evidence')['with']['name'] == (
-    f'live-changes-{evidence_ref}-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}')
+    f'live-changes-{changes_ref}-${{{{ github.run_id }}}}-${{{{ github.run_attempt }}}}')
 evidence = next(step for step in changes['steps'] if step.get('id') == 'deployed_evidence')
 assert evidence['continue-on-error'] is True
 assert evidence['with']['run-id'] == '${{ steps.deployed.outputs.run }}'
@@ -182,10 +184,11 @@ assert any(not step.get('if') and 'node --test' in step.get('run', '') and
            for step in cloud_tests)
 images = preview['jobs']['images']
 assert images['needs'] == 'changes'
-# Only a manual dispatch of the exact qualified staging union joins preview and main.
+# Only manual dispatches of the exact qualified staging refs join image builds.
 union = "(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/staging/os-union-20261106')"
+hotfix = "(github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/staging/os-signup-feedback-hotfix-20261111')"
 assert ' '.join(images['if'].split()) == ("needs.changes.outputs.image_changed == 'true' && "
-                        "(github.ref == 'refs/heads/preview' || github.ref == 'refs/heads/main' || " + union + ")")
+                        "(github.ref == 'refs/heads/preview' || github.ref == 'refs/heads/main' || " + union + " || " + hotfix + ")")
 assert images['uses'] == './.github/workflows/image.yml'
 assert images['with']['source'] == '${{ github.sha }}'
 assert images['secrets'] == 'inherit'

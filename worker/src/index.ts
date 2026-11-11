@@ -1,3 +1,4 @@
+import { awsOsRealmFor } from './aws-ice';
 import { openAwsStandaloneRepo } from './aws-repo-open';
 import { ACCEPTANCE_RESET_DELAY_MS } from './acceptance-config';
 import { relayExpiryFor, relayOperation, RelayFailure, relayFailureResult, remainingRelayBudget, type RelayState, type RelayResult } from './relay-refresh';
@@ -81,7 +82,7 @@ import { awsCodeServerAnswers, awsRelayRefresh, awsScreenDesktop, ensureAwsDeskt
 import { recoverableStalePreview } from './stale-preview';
 // Per-tab Code folder continuity: the lexical plan, the restored-folder compose and the URL guard (no filesystem).
 import { codeFolderAnswer, fitsCodeFolderUrl, settleCodeFolder, type CodeFolderSettlement } from './code-folder';
-import { codeShellOriginsFor } from './code-folder-bridge';
+import { codeShellOriginsFor, osBillingOriginFor } from './code-folder-bridge';
 import { awsCodeFolderResolver, cloudflareCodeFolderResolver } from './code-folder-resolve';
 import { TERMINAL_WORK_PROBE_COMMAND, terminalKeepAliveFromProbe } from './terminal-keepalive';
 // Separate value import of the SAME class (under a local alias) so the
@@ -128,6 +129,8 @@ interface Env extends SandboxEnv {
   SANDBOX_PREVIEW_ZONE_ROOT?: string;
   /** AWS computers (GW-4): routing and the tunnel API are off unless this is 1/true/on. */
   AWS_ROUTING_ENABLED?: string;
+  /** Operator admission pause for new CF container starts only; off unless exactly 1. */
+  CF_CONTAINER_ADMISSION_PAUSED?: string;
   /** Narrow standalone Git host operation; off unless explicitly enabled. */
   AWS_STANDALONE_REPO_OPEN_ENABLED?: string;
   /** Origin zone for `c-<sandboxId>-g<gen>-e<epoch>.<zone>`; used only if also allowlisted. */
@@ -390,6 +393,8 @@ interface Env extends SandboxEnv {
   EZIL_AI_GATEWAY_URL?: string;
   /** `off` returns 503 for AI requests. Boot env and credential deletion stay available. */
   SANDBOX_AI_PROXY?: string;
+  /** OS origin for the editor-bridge sync (`./editor-bridge.ts`); unset or invalid = the route is a 404. */
+  EZIL_OS_BRIDGE_URL?: string;
 }
 
 /**
@@ -645,6 +650,8 @@ import {
   aiProxyDisabled,
   chooseAiCredential,
   currentModelAccess,
+  currentCreditsRelay,
+  parsePushedCreditsPending,
   deriveAiProxyToken,
   handleAiProxyRequest,
   isAiProxyPath,
@@ -658,14 +665,19 @@ import {
   AI_CREDENTIAL_STORAGE_KEY,
   AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY,
   AI_MODEL_ACCESS_STORAGE_KEY,
+  AI_CREDITS_PENDING_STORAGE_KEY,
   AI_PROXY_NONCE_STORAGE_KEY,
   readLimited,
   type StoredAiCredential,
   type StoredAiModelAccess,
   type AiModelAccess,
+  type CreditsRelay,
+  type StoredAiCreditsPending,
 } from './ai-proxy';
+import { deriveEditorBridgeToken, handleEditorBridgeRequest, isEditorBridgePath, resolveOsBridgeUrl } from './editor-bridge';
 
 import { captureEditorState } from './editor-state';
+import { CF_ADMISSION_ERROR, cfAdmissionRunningOnly, cfAdmissionResponse, isCfAdmissionError } from './cf-container-admission';
 import {
   selectTelemetryWorthy,
   toTelemetryEventInput,
@@ -833,6 +845,7 @@ const PUBLIC_ERROR_CODES = [
   'repo_open_git_failed', 'repo_open_git_missing', 'repo_open_invalid_request', 'repo_open_not_found',
   'repo_open_ref_not_found', 'repo_open_timeout', 'repo_open_token_expired', 'repo_open_unreachable',
   'repo_open_unsupported_provider', 'repo_open_workspace_not_ready', 'repo_open_workspace_unavailable',
+  'computer_updating',
   'request_too_large',
   'restart_already_in_progress', 'restart_disabled', 'restart_not_supported_for_mode',
   'restart_not_supported_for_mode:guacamole', 'restart_not_supported_for_mode:neko', 'runtime_not_running',
@@ -878,6 +891,7 @@ function publicErrorCode(err: unknown, fallback: PublicErrorCode = 'internal_err
 }
 
 function json(data: unknown, status = 200): Response {
+  if (data !== null && typeof data === 'object' && (data as { error?: unknown }).error === CF_ADMISSION_ERROR) return cfAdmissionResponse(corsHeaders);
   const body = JSON.stringify(data, (key, value: unknown) => {
     if (key === 'stack' || key === 'message' || key === 'detail') {
       if (value !== undefined) console.error('[worker] response diagnostic:', key, value);
@@ -980,10 +994,11 @@ interface EzilWorkspacePersistRpc {
   recordActivity(lastInputAgoMs: number): Promise<void>;
   startAiDesktop(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string>;
   getAiProxyNonce(): Promise<string | null>;
-  putAiCredential(credential: StoredAiCredential, signedAt: number, includedModels?: readonly string[] | null): Promise<{ stored: boolean; expiresAt: number }>;
-  putAiModelAccess(includedModels: readonly string[] | null, signedAt: number): Promise<{ stored: boolean }>;
+  putAiCredential(credential: StoredAiCredential, signedAt: number, includedModels?: readonly string[] | null, creditsPending?: boolean | null): Promise<{ stored: boolean; expiresAt: number }>;
+  putAiModelAccess(includedModels: readonly string[] | null, signedAt: number, creditsPending?: boolean | null): Promise<{ stored: boolean }>;
   getAiCredential(): Promise<string | null>;
   getAiModelAccess(): Promise<AiModelAccess>;
+  getAiCreditsRelay(): Promise<CreditsRelay>;
   dropAiCredential(token?: string, signedAt?: number): Promise<void>;
   /**
    * Observe → flush → cancel the flush loop → destroy → RE-OBSERVE, returning
@@ -2626,19 +2641,35 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   }
   override async start(...args: Parameters<CFSandboxClass<Env>['start']>): Promise<void> {
     return this.withMigrationStart(async () => {
+      const runningOnly = cfAdmissionRunningOnly(this.env?.CF_CONTAINER_ADMISSION_PAUSED, () => this.ctx.container?.running);
       if (await this.migrationStartBlocked()) throw new Error('migrating');
+      if (runningOnly) return; // Never enter the SDK's physical-start path while paused.
       return super.start(...args);
     });
   }
   override async startAndWaitForPorts(...args: Parameters<CFSandboxClass<Env>['startAndWaitForPorts']>): Promise<void> {
     return this.withMigrationStart(async () => {
+      const runningOnly = cfAdmissionRunningOnly(this.env?.CF_CONTAINER_ADMISSION_PAUSED, () => this.ctx.container?.running);
       if (await this.migrationStartBlocked()) throw new Error('migrating');
+      if (runningOnly) return; // A stop after the check must fail the request, never re-enter SDK provisioning.
       return super.startAndWaitForPorts(...args);
     });
   }
   override async containerFetch(...args: Parameters<CFSandboxClass<Env>['containerFetch']>): Promise<Response> {
+    cfAdmissionRunningOnly(this.env?.CF_CONTAINER_ADMISSION_PAUSED, () => this.ctx.container?.running);
     if (await this.migrationStartBlocked()) return json({ ok: false, error: 'migrating' }, 409);
-    return super.containerFetch(...args);
+    try {
+      const response = await super.containerFetch(...args);
+      if (!response.ok) {
+        try { cfAdmissionRunningOnly(this.env?.CF_CONTAINER_ADMISSION_PAUSED, () => this.ctx.container?.running); }
+        catch (error) { void response.body?.cancel().catch(() => {}); throw error; }
+      }
+      return response;
+    } catch (error) {
+      // Throw through SDK transports, whose generic 503 responses otherwise trigger long automatic startup retries.
+      cfAdmissionRunningOnly(this.env?.CF_CONTAINER_ADMISSION_PAUSED, () => this.ctx.container?.running);
+      throw error;
+    }
   }
   override async onStart(): Promise<void> {
     // A replacement container may run a different image; wait for its own codec result.
@@ -3910,10 +3941,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * `parsePushedModelAccess`) is ordered on its own: the later signed push wins, whichever token is kept. It is kept
    * across stop and logout: it restricts, it grants nothing, and the next push with a readable plan replaces it.
    */
-  async putAiCredential(credential: StoredAiCredential, signedAt: number, includedModels?: readonly string[] | null): Promise<{ stored: boolean; expiresAt: number }> {
+  async putAiCredential(credential: StoredAiCredential, signedAt: number, includedModels?: readonly string[] | null, creditsPending?: boolean | null): Promise<{ stored: boolean; expiresAt: number }> {
     return this.ctx.storage.transaction(async (txn) => {
       const current = await txn.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY);
       const revokedAt = await txn.get<number>(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY);
+      // Receipt information grants no access and has its own timestamp; leave the original plan/token watermark below intact.
+      await storeAiCreditsPending(txn, creditsPending, signedAt);
       if (revokedAt !== undefined && signedAt <= revokedAt) {
         return { stored: false, expiresAt: current?.expiresAt ?? credential.expiresAt };
       }
@@ -3929,8 +3962,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * `putAiCredential`. It never reads, creates or extends the credential, and ignores the logout watermark because the
    * list restricts and grants nothing. An expired or missing token still answers `os_session_missing`.
    */
-  async putAiModelAccess(includedModels: readonly string[] | null, signedAt: number): Promise<{ stored: boolean }> {
-    return this.ctx.storage.transaction(async (txn) => ({ stored: await storeAiModelAccess(txn, includedModels, signedAt) }));
+  async putAiModelAccess(includedModels: readonly string[] | null, signedAt: number, creditsPending?: boolean | null): Promise<{ stored: boolean }> {
+    return this.ctx.storage.transaction(async (txn) => {
+      const planStored = await storeAiModelAccess(txn, includedModels, signedAt);
+      const creditsStored = await storeAiCreditsPending(txn, creditsPending, signedAt);
+      return { stored: planStored || creditsStored };
+    });
   }
 
   async getAiCredential(): Promise<string | null> {
@@ -3940,6 +3977,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   /** The models the owner's plan includes, if a fresh signed push said so; otherwise unknown (`currentModelAccess`). */
   async getAiModelAccess(): Promise<AiModelAccess> {
     return currentModelAccess(await this.ctx.storage.get<StoredAiModelAccess>(AI_MODEL_ACCESS_STORAGE_KEY));
+  }
+
+  async getAiCreditsRelay(): Promise<CreditsRelay> {
+    return currentCreditsRelay(await this.ctx.storage.get<StoredAiCreditsPending>(AI_CREDITS_PENDING_STORAGE_KEY));
   }
 
   /** Signed logout keeps a watermark; teardown/401 retain their unconditional/token-only deletion. */
@@ -4557,7 +4598,9 @@ function awsDesktopAiConfig(env: Env, record: AwsTunnelRecord) {
     if (!res.ok || !nonce) throw new RelayFailure('aws_origin_unavailable');
     const previewZone = resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT);
     return { baseUrl: `https://aws-${CODE_PREVIEW_PORT}-${record.sandboxId}-aws.${previewZone}/ai/v1`,
-      proxyToken: await deriveAiProxyToken(secret, record.sandboxId, nonce) };
+      proxyToken: await deriveAiProxyToken(secret, record.sandboxId, nonce),
+      // Only while the bridge is on: a host agent older than editorToken support refuses the key.
+      ...(resolveOsBridgeUrl(env.EZIL_OS_BRIDGE_URL) ? { editorToken: await deriveEditorBridgeToken(secret, record.sandboxId, nonce) } : {}) };
   };
 }
 
@@ -4974,7 +5017,7 @@ async function handlePreview(
         const desktop = async (record: AwsTunnelRecord) => {
           if (!zone) throw new RelayFailure('aws_origin_unavailable');
           return { record, zone, fetch: awsFetch, nowMs: Date.now,
-            aiConfig: awsDesktopAiConfig(env, record), restartPush: awsRestartPush(env, record),
+            osRealm: awsOsRealmFor(env.SANDBOX_PREVIEW_ZONE_ROOT), aiConfig: awsDesktopAiConfig(env, record), restartPush: awsRestartPush(env, record),
             neko: await deriveNekoCredentials(env, record.sandboxId), mint: awsRelayMint(env) };
         };
         const answer = await handleAwsPreview(v2, {
@@ -7107,6 +7150,7 @@ async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<R
     return handlePreviewBootstrap(url, sandboxId, secrets, cookieSecret, target);
   }
 
+  if (target === 'code' && isEditorBridgePath(path)) return handleEditorBridge(request, env, sandboxId);
   if (target === 'code' && isAiProxyPath(path)) return handleAiProxy(request, env, sandboxId);
 
   if (target === 'code') return handleCodeBridge(request, env, url, sandboxId, secrets, port);
@@ -7689,8 +7733,11 @@ async function aiProxyBootEnv(env: Env, hostname: string, sandboxId: string, non
   const code = codePortFor('neko');
   if (!code) return {};
   return {
+    EZIL_OS_ORIGIN: osBillingOriginFor(env.SANDBOX_PREVIEW_ZONE_ROOT),
     EZIL_AI_BASE_URL: aiProxyBaseUrl(hostname, sandboxId, code.port, code.token),
     EZIL_AI_PROXY_TOKEN: secret ? await deriveAiProxyToken(secret, sandboxId, nonce) : '',
+    // The editor bridge's own token (./editor-bridge.ts), same boot nonce, only while the bridge is on.
+    ...(secret && resolveOsBridgeUrl(env.EZIL_OS_BRIDGE_URL) ? { EZIL_EDITOR_BRIDGE_TOKEN: await deriveEditorBridgeToken(secret, sandboxId, nonce) } : {}),
   };
 }
 
@@ -7711,8 +7758,24 @@ async function handleAiProxy(request: Request, env: Env, sandboxId: string, awsN
     proxyNonce: awsNonce !== undefined ? awsNonce : sandbox ? await sandbox.getAiProxyNonce() : null,
     credential: () => sandbox ? sandbox.getAiCredential() : Promise.resolve(null),
     modelAccess: () => sandbox ? sandbox.getAiModelAccess() : Promise.resolve({ known: false } as const),
+    creditsRelay: () => sandbox ? sandbox.getAiCreditsRelay() : Promise.resolve('legacy' as const),
     dropCredential: (token) => sandbox ? sandbox.dropAiCredential(token) : Promise.resolve(),
     fetch: (upstream) => fetch(upstream),
+    log: (fields) => console.log(JSON.stringify(fields)),
+  });
+}
+
+/** `/editor-bridge/v1/sync` on a code host: the same per-boot token as `/ai/v1`, then a signed forward to OS. */
+async function handleEditorBridge(request: Request, env: Env, sandboxId: string, awsNonce?: string | null): Promise<Response> {
+  const osUrl = resolveOsBridgeUrl(env.EZIL_OS_BRIDGE_URL);
+  const sandbox = osUrl && awsNonce === undefined ? openSandbox(env, sandboxId) : null;
+  return handleEditorBridgeRequest(request, {
+    sandboxId,
+    osUrl,
+    secret: resolveNekoDerivationSecret(env),
+    nonce: awsNonce !== undefined ? awsNonce : sandbox ? await sandbox.getAiProxyNonce() : null,
+    fetch: (upstream) => fetch(upstream),
+    now: () => Date.now(),
     log: (fields) => console.log(JSON.stringify(fields)),
   });
 }
@@ -7724,6 +7787,16 @@ async function storeAiModelAccess(txn: Pick<DurableObjectTransaction, 'get' | 'p
   const access = await txn.get<StoredAiModelAccess>(AI_MODEL_ACCESS_STORAGE_KEY);
   if (access !== undefined && access.signedAt >= signedAt) return false;
   await txn.put(AI_MODEL_ACCESS_STORAGE_KEY, { includedModels, signedAt } satisfies StoredAiModelAccess);
+  return true;
+}
+
+/** Receipt status advances independently: a model-only push neither refreshes it nor blocks its delayed newer answer. */
+async function storeAiCreditsPending(txn: Pick<DurableObjectTransaction, 'get' | 'put'>, pending: boolean | null | undefined,
+  signedAt: number): Promise<boolean> {
+  if (pending === undefined) return false;
+  const current = await txn.get<StoredAiCreditsPending>(AI_CREDITS_PENDING_STORAGE_KEY);
+  if (current !== undefined && current.signedAt >= signedAt) return false;
+  await txn.put(AI_CREDITS_PENDING_STORAGE_KEY, { pending, signedAt } satisfies StoredAiCreditsPending);
   return true;
 }
 
@@ -7758,6 +7831,8 @@ async function handleAiCredential(request: Request, env: Env, sandboxName: strin
   } catch {
     return json({ ok: false, error: 'invalid_json_body' }, 400);
   }
+  const pending = parsePushedCreditsPending((body as { creditsPending?: unknown } | null)?.creditsPending);
+  if (!pending.ok) return json({ ok: false, error: pending.error }, 400);
   // No token: the server's plan refresh (`refreshAiPlans` in the app), which needs no browser. It names the plan
   // explicitly; an empty body is refused rather than answered as a no-op.
   if (typeof body === 'object' && body !== null && !Array.isArray(body) && !('accessToken' in body)) {
@@ -7766,7 +7841,7 @@ async function handleAiCredential(request: Request, env: Env, sandboxName: strin
     const plan = parsePushedModelAccess(fields.includedModels);
     if (!plan.ok) return json({ ok: false, error: plan.error }, 400);
     try {
-      const result = await openSandbox(env, sandboxName).putAiModelAccess(plan.includedModels as readonly string[] | null, auth.timestamp);
+      const result = await openSandbox(env, sandboxName).putAiModelAccess(plan.includedModels as readonly string[] | null, auth.timestamp, pending.creditsPending);
       return json({ ok: true, sandboxId: sandboxName, planStored: result.stored });
     } catch {
       return json({ ok: false, sandboxId: sandboxName, error: 'ai_credential_storage_failed' }, 500);
@@ -7780,7 +7855,7 @@ async function handleAiCredential(request: Request, env: Env, sandboxName: strin
 
   try {
     const sandbox = openSandbox(env, sandboxName);
-    const result = await sandbox.putAiCredential(parsed.credential, auth.timestamp, access.includedModels);
+    const result = await sandbox.putAiCredential(parsed.credential, auth.timestamp, access.includedModels, pending.creditsPending);
     return json({ ok: true, sandboxId: sandboxName, stored: result.stored, expiresAt: result.expiresAt });
   } catch {
     return json(
@@ -7792,7 +7867,7 @@ async function handleAiCredential(request: Request, env: Env, sandboxName: strin
 
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
-export default {
+const worker = {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
@@ -7831,6 +7906,17 @@ export default {
     //    `null` (not a Response) for hostnames outside both bridge patterns,
     //    in which case the request continues to the normal `proxyToSandbox`
     //    path below unchanged.
+    if (url.hostname.split('.')[0]!.startsWith('aws-') && isEditorBridgePath(path)) {
+      const route = parseAwsBrowserHost(url.hostname, resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT));
+      if (!route || route.port !== CODE_PREVIEW_PORT) return json({ error: { code: 'not_found', source: 'ezil-os-bridge' } }, 404);
+      const registry = awsRegistryFor(env);
+      if (!awsRoutingEnabled(env.AWS_ROUTING_ENABLED) || !registry || !resolveAwsOriginZone(env)) {
+        return json({ error: { code: 'not_found', source: 'ezil-os-bridge' } }, 404);
+      }
+      // Same rule as /ai/v1 below: only the tunnel record's current boot nonce, never the CF one or a client's.
+      const record = await lookupAwsTunnel(registry, route.sandboxId);
+      return handleEditorBridge(request, env, route.sandboxId, record?.aiProxyNonce ?? null);
+    }
     if (url.hostname.split('.')[0]!.startsWith('aws-') && isAiProxyPath(path)) {
       const route = parseAwsBrowserHost(url.hostname, resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT));
       if (!route || route.port !== CODE_PREVIEW_PORT) return proxyError(404, 'os_ai_unavailable');
@@ -8301,7 +8387,7 @@ export default {
       if (aws) return (await import('./aws-restart')).handleAwsRestart(
         request, aws, resolvePreviewSecrets(env), (input, init) => fetch(input, init), {
           mint: awsRelayMint(env), neko: () => deriveNekoCredentials(env, aws.record.sandboxId),
-          aiConfig: awsDesktopAiConfig(env, aws.record),
+          osRealm: awsOsRealmFor(env.SANDBOX_PREVIEW_ZONE_ROOT), aiConfig: awsDesktopAiConfig(env, aws.record),
         });
       return handleRestart(
         env,
@@ -8351,5 +8437,15 @@ export default {
     }
 
     return json({ ok: false, error: `not_found: ${method} ${path}` }, 404);
+  },
+};
+
+export default {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+    try { return await worker.fetch(request, env, ctx); }
+    catch (error) {
+      if (isCfAdmissionError(error)) return cfAdmissionResponse(corsHeaders);
+      throw error;
+    }
   },
 };

@@ -519,6 +519,134 @@ acknowledged shell channel, it validates `detail` with the same rules, calls `pr
 `{type:"ezil.code.billing.intent",v:1,nonce,intent}` to the pinned parent. Without a ready channel it leaves the event
 alone, so Code shows its own notice. The shell opens the Standard upgrade on Free and Add credits on a paid plan,
 from its own billing summary.
+## Part 4 — Chat bridge — `workbench.js` (`chat-bridge-method`, `chat-bridge-call`)
+
+The bridge lets the EZiL extension put an instruction into the **same** local EZiL Chat session that
+a person has open, and read that session back. It is the workbench end of the EZiL MCP session
+contract (EZiLHQ/ezil-mcp `CONTRACT.md` v3). It is **off by default**. `ChatViewPane` registers
+the internal command `_ezil.chatBridge.v1` only when the setting `ezil.chatBridge.enabled` is
+`true`. Its only caller is the EZiL extension's sync client (`extensions/ezil-models/src/chat-bridge-client.ts`),
+which reads the same setting.
+
+- **Patched code.**
+  - `chat-bridge-method` adds `_ezilChatBridge()` right before `createControls`. It inlines
+    `chat-bridge.js` (copied next to this script by `worker/Dockerfile`) and registers the command
+    through `qe.registerCommand`. That is the same command registry the pane already uses for its own
+    `_chat.voice.*` commands.
+  - `chat-bridge-call` calls `_ezilChatBridge()` from `createControls`, just before
+    `_ezilChatHeader`. A failure there is logged and contained.
+  - Both anchors are inside the `[chat-header]` replacement, so this step runs after it. The
+    `[chat-header]` gate checks its text in this final, extended form.
+  - The bridge is registered once per window, and disposing the pane unregisters it.
+- **Pre-patch gates** prove the names exist in this build:
+  - `qe.registerCommand("_chat.voice.acceptInput",` occurs once, which shows `qe` is the pane's
+    command registry;
+  - the pane's `chatService`, `chatWidgetService`, `workspaceContextService` and `logService` fields
+    are present;
+  - the command id does not occur yet.
+- **Operations.** There is a fixed set: `hello`, `claim`, `sessions`, `submit`, `cancel`, `command`
+  and `read`, plus, in protocol 2, `models`, `create` and `setModel`. Requests and results are plain JSON,
+  and the caller never supplies a command name.
+  `sessions` lists each session's resource, title, whether it is open in this window, and, for an
+  open session whose model this window already has loaded, whether it is `idle` or `running`
+  (otherwise `unknown`; it never loads a model just to look), its selected model (open sessions only)
+  and its request count.
+- **Protocol 2 controls** (`docs/EDITOR-BRIDGE-PROTOCOL-2.md`; the extension uses them only when OS
+  answers a sync with `protocol: 2`). They use the same fence, command ids (a repeat returns the first
+  outcome, other input is `command_conflict`) and deadline as `submit`.
+  - `models`: the user-selectable models of a chat input's own picker (`getModels()`), or `unavailable`
+    without a chat widget.
+  - `create`: `startNewLocalSession('panel')`, then `openSession(resource, ACTIVE_GROUP, { preserveFocus,
+    pinned })`, so the new, empty chat is a tab and the person's panel chat is never replaced. The model, if
+    asked for, is selected in that chat's own input (`switchModelByIdentifier(id, persist=false,
+    userAction=true)`: this session only, not stored as the window default) and **read back**
+    (`currentLanguageModel`). A start that throws is `uncertain`; a chat that could not be opened is
+    `failed` and gone (its only reference is released).
+  - `setModel`: one open, idle session only (`busy` otherwise, never queued), the same selection and
+    readback.
+  - Observed in 4.141.0: there is one chat editor pane per group, so opening a second created chat hides
+    the first. A chat this window created is shown again (tab, no focus) before a send or a model change.
+    So is one the caller marks `reveal`, which survives a reload when this window's memory does not.
+    `reveal` is trusted, not enforced: OS must set it only for chats it created. The bridge never opens a
+    chat on its own initiative, only this window's creations or what `reveal` names. An empty chat (no
+    request yet) is not saved, so it does not survive a window reload.
+  - Effort and mode are never set: a third-party model's configuration is per model for the whole window
+    in 4.141.0, not per session.
+- **Fencing.** `claim` takes an owner id and an epoch. Every operation except `hello` refuses a stale
+  owner or epoch.
+  - The epoch only *orders* callers in this window. Any extension in the extension host could call
+    the command, so this is not authentication.
+  - Authority is the OS lease. The transport authenticates its client before anything reaches this
+    command: the extension syncs with OS through the computer's code host
+    (`POST /editor-bridge/v1/sync`, Worker `src/editor-bridge.ts`) with this boot's own
+    `EZIL_EDITOR_BRIDGE_TOKEN` (never the AI proxy token), and OS grants one window per computer the
+    epoch it then passes to `claim`.
+- **Delivery.**
+  - **Which session.** A command is delivered only to a local panel session listed by
+    `IChatService.getLiveSessionItems`/`getHistorySessionItems` that is open in a chat widget in this
+    window. It is never sent to "whichever chat is focused". Agent-locked sessions are not
+    supported.
+  - **How it is sent.** The session is acquired with `acquireOrLoadSession`, then the command is
+    sent with `sendRequest`, using the options the widget's own submit builds (model, mode, tools
+    and instruction routing), with no attachments. The upstream `queue` option is never used. The
+    model reference is held until `responseCompletePromise` settles.
+  - **Result states:**
+    - `busy`: the session is running, waiting for a tool confirmation, blocked, or has pending
+      requests. Nothing is sent, and the caller keeps the command queued.
+    - `rejected`: the reason comes from `sendRequest`.
+    - accepted, which reports the mode and the pane's *selected* model (`selectedModelId`).
+      Afterwards the status is `in_progress`, `completed` or `cancelled`, read from the response
+      model that `responseCreatedPromise` resolves to.
+    - `finished_unverified`: the request finished without a response model (for example, a silent
+      slash command).
+    - `failed`: the response completed with the model's own error (4.141.0 `ChatResponseModel`: an
+      `errorDetails` other than `canceled`).
+    - `expired`: the delivery deadline (`deliverWithinMs`, time left, never a wall-clock time) had passed
+      at the last check before `sendRequest`. Nothing was sent.
+    - `uncertain`: the send threw. The command is never resent under the same command id.
+  - **Duplicates.** A command id is reserved across all sessions before any await, so the same id is
+    never sent twice, to one session or to two at once (`command_in_flight` / `command_conflict`). The
+    owner and epoch are checked again inside the per-session lock and right before `sendRequest`, so a
+    submit that waited while a newer owner claimed never sends. This window's memory does not survive
+    eviction or restart; the end-to-end at-most-once guarantee is OS's (an operation is handed out
+    again only after a definite "not sent" for its previous attempt).
+- **Cancel.** It calls `cancelCurrentRequestForSession` only when the session's current request is
+  the one this bridge sent (`lastRequest.id` equals the recorded `requestId`). Until the model
+  reports the cancellation, the status is `cancel_requested`. A command this window never received
+  returns `unknown_command`, and the caller withdraws it.
+- **Read.** `read` returns the last 20 requests with their response text (capped) and the session's
+  state. It also returns a version counter that strictly increases with each model change it sees.
+- **Transport (outside this patch).**
+  - Extension: `extensions/ezil-models/src/chat-bridge-client.ts` (one loop per window's extension host).
+  - Worker: `worker/src/editor-bridge.ts` verifies the editor-bridge boot token (provisioned only while
+    `EZIL_OS_BRIDGE_URL` is set: Cloudflare boot env, AWS `config.ai.editorToken` through the host agent)
+    and forwards the body, signed, to OS.
+  - OS: `app/src/server/agent-session/` holds the queue (`app/drizzle/hardening/0023_agent_sessions.sql`):
+    one owner per computer and person, epoch-fenced with a wall-clock lease, one delivery attempt id per
+    handout, `uncertain` for anything an owner held when it lost the lease.
+- **Runtime observation.** The behaviour above was read from the shipped 4.141.0 bytes and tested
+  against fakes (`chat-bridge.test.cjs`, and the OS chain test
+  `app/src/server/agent-session/chain.pg.test.ts`, which runs this file as shipped behind the real
+  extension client, Worker forwarder and OS routes).
+- **Observed in a running editor.** `e2e/chat-bridge-workbench.sh` runs an existing desktop image offline
+  (internal network) with this patched `workbench.js` and the ezil-models build overlaid, the offline
+  messages mock, and an in-container stand-in for OS's sync protocol (not OS itself). It checks, in real
+  code-server 4.141.0 with Copilot Chat:
+  - the extension syncs with the bridge token, never the AI token;
+  - in a cold profile Copilot Chat cannot be activated before the person's first chat use: the extension
+    holds an instruction (`not_delivered`, `agent_not_ready`, nothing sent) and runs it, once, after the
+    person has used chat. Observed before this gate: a bridged request that was the window's first chat
+    request ended canceled while the agent was not yet available. A never-used chat opened after the
+    agent is active works normally;
+  - an instruction runs in the person's own session (agent mode, the selected model), shows in the same
+    chat, and completes with that request's response;
+  - a running bridged request is cancelled only through the bridge;
+  - each instruction is sent once.
+- **Regression test.** `chat-bridge-patch.test.cjs` runs the real pipeline on a pristine bundle.
+  It proves this step adds exactly its two hunks: undoing them gives the pre-bridge hash
+  `281189ea…`, which is the union33 served `workbench.js`. It also runs the shipped method against
+  a fake pane. With this step, the served `workbench.js` is sha256 `0e999287…` (protocol 2; `ffe8f05e…` was
+  protocol 1).
 
 ## Re-deriving the 4.141.0 anchors
 
@@ -539,3 +667,97 @@ identity and provider contribution, and requires `defaultChatAgent`, the MIT
 license and original Microsoft headers. Compare LICENSE.txt with the original
 extraction when reviewing an update. The JSON and CSS modifications are
 recorded here; the three JS files carry inline modification notices.
+
+## Explicit primary request effort (Code 4.141.0 / Copilot 0.69.0)
+
+`ezil-effort-context`, `ezil-effort-argument`, and `ezil-request-effort` repair
+Copilot's extension-contributed endpoint dropping the native chat's explicit
+reasoning effort before `languageModel.sendRequest`. Code's API expects
+`configuration`; the extension host maps this to provider `modelConfiguration`.
+
+Three exact-count anchors apply only in this pinned bundle. The primary fetch
+call sets a private **top-level, per-call** `ezilPrimaryRequestEffort` boolean
+(after spreading request arguments, so a previous value cannot survive). It is
+true only for internal Agent location 7, an explicit string effort from this request,
+no subagent/parent request, no system-initiated request, and no keepalive probe.
+The external endpoint requires literal true, vendor `ezil`, and a string effort
+before allocating `configuration:{reasoningEffort:...}`. Missing or unproven
+contexts omit configuration. There is no endpoint/session/global cache or
+model-name/debug-name inference. Other vendors and absent effort remain unchanged.
+
+Background summarization copies the parent's effort into `_lastModelCapabilities`;
+it does NOT pass this separate top-level provenance field. Title and child
+requests do not qualify. This release supports explicit primary agent-chat effort,
+not a new child/utility effort capability. Fresh provider/catalog validation is
+still authoritative for invalid or revoked effort strings. No default is added.
+
+`request-effort-patch.test.cjs` copies only the required pristine bundle files,
+applies the complete patch and verifies it, evaluates the real before/after
+endpoint options expression and primary provenance expression, tests independent
+low/high objects and excluded contexts, and checks the actual summary/title
+callsites and pinned Code API mapping. It also refuses verification of a bundle
+with the forwarding hunk removed. Run with `COPILOT_TEST_ROOT` set to a pristine
+4.141.0 `lib/vscode` directory; an unset directory is an explicit skip.
+Root must rerun the strict real native harness after patching a fresh official
+Code tree. These source tests do not constitute native acceptance.
+
+
+### Native v5 location correction
+
+The earlier `s===1` guard failed actual native qualification: root observed
+`location:7`, explicit low, and all child/system/parent/keepalive flags false.
+The pinned bundle defines `Fn.Agent=7`; the agent handler sets
+`overrideRequestLocation:7`, and primary fetch computes
+`s=this.options.overrideRequestLocation??this.options.location`. SDK Panel=1
+was therefore the wrong value at this boundary. The guard now pins internal
+Agent=7; other locations still omit effort. Summary also uses location7 but
+bypasses the primary provenance producer and remains excluded. Regression tests
+assert those real pinned source anchors and compose actual producer-expression
+output into the actual endpoint-options expression for low/high. Actual v6
+acceptance remains pending; v4/v5 were failures, despite passing source tests.
+
+### Native session effort isolation v2 (clean v7 and independent review)
+
+Clean v7 reproduced shared empty-draft leakage despite restore(...,false).
+The first source candidate e9780e40 was independently BLOCKED: a single marker
+lost provenance when switching M→N→M, foreign marker.prior leaked into target
+shared state, and an unrelated native manual setting promoted local effort through
+_preferences before the coarse model-ID event could retire it. That candidate is
+not qualified by its original passing tests.
+
+The corrected contract is `docs/proposals/native-effort-isolation-v1.md` (v2).
+`session-effort-isolation.js` is injected with nine exact anchors: helper/API,
+draft projection, state annotation, conversation preparation/restoration, native
+configuration getter, before-apply and after-apply. `_ezilSessionEffortV2` is the
+required capability. Version2 native contrib JSON retains resource-bound per-model
+selections; no preference/prior payload is trusted. Native fallback supplies only
+the projected reasoningEffort; unrelated fields are preserved.
+
+Getter overlay keeps each model's actual session selection. Before/after native
+apply hooks separate local effort from the preference cache and persistence
+candidate. Unrelated manual fields still persist, while only an explicit OWN
+reasoningEffort field on a persistent manual setter retires that model's override.
+Same-value manual reasoning selection is legitimate. No global clearing/setter or
+request-body workaround; pending approvals and modes are untouched.
+
+P4i.toJSON/N4i preserve contrib and config. Explicit tombstones handle native
+contrib merging. Pre-flush follows the old bound input resource before a widget
+rebind; controls require both widget and bound resource. EZiL history restores
+use false even without a marker. Other vendors/manual preference writes retain
+existing behavior. Native old Code restoration of newly marked histories remains
+an unqualified rollback path; do not assume old readers honor this provenance.
+
+Bridge explicit effort is Agent-only; unsupported-mode sends reject before
+sendRequest. Missing/obsolete hook is model-only. Post-create refusal remains
+terminal uncertain (workbench resource retained, no applied OS association or
+safe automatic recreation). Computer-level catalogs are not per-session mode
+proof; request-time admission remains authoritative.
+
+The pinned native-method suite reproduces all three source defects and exercises
+corrected M/N/M plus JSON recreation, poisoned prior/native fallback, unrelated
+manual fields and same-value reasoning. Synthetic services/observables remain;
+this is not browser/native acceptance. Full fresh-Code patch/verify tests retain
+strict Copilot primary-only forwarding. Root's title/primary fixture classifier
+is separately owned by A; no product changes compensate for that fixture issue.
+Root must still run strict clean native wire, close/reopen/full reload, model
+switch, manual preference and approval checks before removing the native hold.

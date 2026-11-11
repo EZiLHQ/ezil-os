@@ -528,9 +528,8 @@ export function computerModel ({ computer, data = null, prog = null, pending = n
     const deadline = data?.computer?.activeDeadline;
     const sessionEnds = running && ! stopping && ! deadlineStale && Number.isFinite(cap) && cap > 0
         && Number.isFinite(Date.parse(deadline ?? '')) && Date.parse(deadline) > now ? deadline : null;
-    // Round 6 (R1-08): the hold's limits in numbers ("Free sessions last 1 hour · About 5 of 8 hours left this month").
-    const capHours = Number.isFinite(cap) && cap >= 3600 ? Math.floor(cap / 3600) : null;
-    const holdLine = held && ! heldClosed && capHours ? [`Free sessions last ${capHours} hour${capHours === 1 ? '' : 's'}`, monthLeft(usage?.period)].filter(Boolean).join(' · ') : null;
+    // Round 6 (R1-08): the hold's limit in numbers ("About 5 of 8 hours left this month").
+    const holdLine = held && ! heldClosed ? monthLeft(usage?.period) || null : null;
     return { computer, data, free, standing, held, heldClosed, move, moving, blocked, offer,
         // §6.3: the pre-move copy's variant; a held-closed computer never gets the "next open" one (it has no Open).
         moveOnOpen: data?.computer?.moveOnOpen === true && ! heldClosed,
@@ -608,7 +607,7 @@ export function standingCopy (standing, data) {
         const placed = data?.computer?.awsSize;
         return placed && (placed.size === 'cmp-4' || placed.size === 'cmp-8') && Number.isSafeInteger(placed.vcpu) && placed.vcpu > 2
             ? heldClosedText(placed.vcpu)
-            : 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours.';
+            : 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits.';
     }
     return '';
 }
@@ -845,19 +844,17 @@ export function paidComputeUnmetered (summary) {
 
 /**
  * Paid compute policy v1: an AWS configuration's line. Standard and Premium have no monthly computer-hours allowance, so
- * a paid viewer (explicit server `fairUse.policy`) or a Free viewer (held on AWS too) comparing plans sees the session length, never
+ * a paid viewer (explicit server `fairUse.policy`) or a Free viewer (held on AWS too) comparing plans sees the provider, never
  * "monthly time". Only a metered paid state, or no summary, keeps the weight line it always had.
  */
 function awsCardLine (card, model) {
-    const cap = model.data?.catalog?.offers?.find(offer => offer.sku === 'standard_monthly_v3')?.sessionMaxSeconds;
-    const session = Number.isFinite(cap) && cap >= 3600 && cap % 3600 === 0 ? `AWS (India) · sessions up to ${cap / 3600} hour${cap === 3600 ? '' : 's'}` : 'AWS (India)';
-    if ( paidComputeUnmetered(model.data) || (model.data && model.free) ) return session;
+    if ( paidComputeUnmetered(model.data) || (model.data && model.free) ) return 'AWS (India)';
     return card.weight > 1 ? `Counts ${card.weight}× of your monthly time` : 'Counts 1× of your monthly time';
 }
 
 function cardHtml (card, model) {
     const title = `${card.vcpu} vCPU · ${card.memoryGiB} GB`;
-    const weight = card.size === 'free-cf' ? 'Cloudflare · sessions up to 1 hour' : awsCardLine(card, model);
+    const weight = card.size === 'free-cf' ? 'Cloudflare' : awsCardLine(card, model);
     let action = '';
     // Round 6 (R1-08): the held computer's size is current, with what Free allows it (or, R4-02, that it can't open).
     if ( card.state === 'current' && model.held ) {
@@ -953,7 +950,7 @@ export function computerHtml (model, prog = progress, older = []) {
     const summaryLine = size ? [`${size.vcpu} vCPU`, `${size.memoryGiB} GB memory`, ...(Number.isFinite(disk) ? [`${disk} GB disk`] : [])].join(' · ') : '';
     const choices = (data?.computer?.machineChoice ?? []).map(m => m.vcpu);
     const premiumOnly = AWS_SIZES.filter(code => ! (data?.computer?.machineChoice ?? []).some(m => m.size === code)).map(code => SIZE_FALLBACK[code].vcpu);
-    const planLine = ! data ? '' : model.held ? 'Standard and Premium sessions last up to 6 hours; Premium unlocks 4 and 8 vCPU.' : premiumOnly.length && ! model.free
+    const planLine = ! data ? '' : model.held ? 'Premium unlocks 4 and 8 vCPU.' : premiumOnly.length && ! model.free
         ? `Your plan includes ${choices.join(', ')} vCPU. Premium unlocks ${premiumOnly.join(' and ')} vCPU.`
         : model.free ? 'Your plan includes a 2 vCPU computer on Cloudflare. Standard and Premium give you your own computer on AWS (India).'
             : `Your plan includes ${choices.slice(0, -1).join(', ')} and ${choices.at(-1)} vCPU.`;

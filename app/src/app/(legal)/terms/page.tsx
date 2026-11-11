@@ -79,11 +79,11 @@ const sections: readonly LegalSection[] = [
         content: <>
             <p>EZiL LLC offers these plans. See <Link href="/pricing" prefetch={false}>the pricing page</Link> before purchasing. Prices are in USD, before tax. Tax is added where it applies and shown before you pay.</p>
             <ul>
-                <li><strong>Free — $0:</strong> a 2 vCPU · 6 GB computer on Cloudflare, sessions up to 1 hour, and about 5 standard-hours/month. Older accounts keep 8 standard-hours/month.</li>
-                <li><strong>Standard — $20/month:</strong> a 2 vCPU · 8 GB computer on AWS in Mumbai, no session time limit, and about 40 standard-hours/month fair use.</li>
-                <li><strong>Premium — $100/month:</strong> choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS in Mumbai, with no session time limit and about 500 standard-hours/month fair use.</li>
+                <li><strong>Free — $0:</strong> a 2 vCPU · 6 GB computer on Cloudflare and about 5 standard-hours/month. Older accounts keep 8 standard-hours/month.</li>
+                <li><strong>Standard — $20/month:</strong> a 2 vCPU · 8 GB computer on AWS in Mumbai and about 40 standard-hours/month fair use.</li>
+                <li><strong>Premium — $100/month:</strong> choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS in Mumbai and about 500 standard-hours/month fair use.</li>
             </ul>
-            <p>One standard-hour is one hour on a 2 vCPU computer. Bigger Premium computers use time faster: 4 vCPU uses time at ×2 and 8 vCPU at ×4. No session time limit on paid plans does not remove monthly fair-use limits. Fair use renews each calendar month in UTC for Free and each billing period for paid plans. If you reach fair use, wait for it to renew or upgrade to a plan with enough time.</p>
+            <p>One standard-hour is one hour on a 2 vCPU computer. Bigger Premium computers use time faster: 4 vCPU uses time at ×2 and 8 vCPU at ×4. Monthly fair-use limits apply to every plan. Fair use renews each calendar month in UTC for Free and each billing period for paid plans. If you reach fair use, wait for it to renew or upgrade to a plan with enough time.</p>
             <p>Paid plans are billed monthly through Stripe and renew automatically until cancelled. A paid plan starts and its Mumbai computer is prepared only after payment succeeds: on signed payment confirmation, not a checkout redirect. Refund requests are covered by our <Link href="/refunds" prefetch={false}>Refund Policy</Link>.</p>
             <p>An upgrade from Standard to Premium is charged on a prorated basis and takes effect only after payment succeeds. Downgrades and cancellations take effect at the end of the paid period. You can cancel any time in Settings → Billing.</p>
             <p>If a renewal payment fails, paid computer use pauses until the payment is fixed. Your files are kept. Use the customer portal in Settings → Billing to update your payment method.</p>

@@ -259,7 +259,8 @@ describe('billing schema and migration 0021 (Standard trial)', () => {
             'ezil_billing_trials_subscription_unique', 'ezil_billing_trials_user_unique']);
         const sql = readFileSync(new URL('../../../../drizzle/0021_standard_trial.sql', import.meta.url), 'utf8');
         expect(sql).toContain('REFERENCES "auth"."users"("id") ON DELETE set null ON UPDATE cascade');
-        expect(journal.entries.at(-1)).toMatchObject({ tag: '0021_standard_trial', version: '7', breakpoints: true });
+        // Registered in the journal (later hardening/ migrations may follow it).
+        expect(journal.entries.find((entry: { tag: string }) => entry.tag === '0021_standard_trial')).toMatchObject({ tag: '0021_standard_trial', version: '7', breakpoints: true });
         const subscriptions = getTableConfig(billing.billingSubscriptions).columns.map(column => [column.name, column.notNull]);
         expect(subscriptions).toEqual(expect.arrayContaining([['trial_start', false], ['trial_end', false], ['first_paid_at', false]]));
     });

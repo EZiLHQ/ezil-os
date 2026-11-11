@@ -9,6 +9,9 @@ import {
   aiProxyBaseUrl,
   chooseAiCredential,
   currentModelAccess,
+  currentCreditsRelay,
+  parsePushedCreditsPending,
+  AI_CREDITS_PENDING_MAX_AGE_MS,
   deriveAiProxyToken,
   exactCacheEligible,
   exactCacheScope,
@@ -1405,5 +1408,67 @@ describe('plan model access (Free includes Gemini 3.8 Flash only)', () => {
     }
     expect(requestModel(new TextEncoder().encode(`{"model":"${FLASH}"}`))).toBe(FLASH);
     expect(requestModel(new TextEncoder().encode('{"model":["x"]}'))).toBeNull();
+  });
+});
+
+
+describe('signed receipt status is neither a grant nor wallet exhaustion', () => {
+  it('parses explicit unknown, preserves legacy omission, and ages both answers to unknown', () => {
+    for (const value of [undefined, null, true, false]) expect(parsePushedCreditsPending(value)).toEqual({ ok: true, creditsPending: value });
+    for (const value of [0, 1, 'false', {}, []]) expect(parsePushedCreditsPending(value).ok).toBe(false);
+    const now = Date.now();
+    expect(currentCreditsRelay(undefined, now)).toBe('legacy');
+    for (const [pending, expected] of [[true, 'pending'], [false, 'none'], [null, 'unknown']] as const) {
+      expect(currentCreditsRelay({ pending, signedAt: now }, now)).toBe(expected);
+      expect(currentCreditsRelay({ pending, signedAt: now - AI_CREDITS_PENDING_MAX_AGE_MS - 1 }, now)).toBe('unknown');
+    }
+    expect(currentCreditsRelay({ pending: false, signedAt: now + 1 }, now)).toBe('unknown');
+  });
+
+  for (const relay of ['pending', 'unknown', 'none', 'legacy'] as const) it(`${relay}: only unconfirmed zero becomes a nonbilling temporary error`, async () => {
+    const upstream = mockGateway(() => Response.json({ available_micro: 0, held_micro: 0 }));
+    const d = await deps({ fetch: upstream.fetch, creditsRelay: async () => relay });
+    const res = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/me/balance`, { headers: { authorization: await proxyAuth() } }), d);
+    expect(res.status).toBe(relay === 'pending' || relay === 'unknown' ? 503 : 200);
+    expect(await res.json()).toEqual(relay === 'pending' || relay === 'unknown'
+      ? { error: { code: 'os_credits_pending', message: 'Your AI credits are being confirmed. Please try again shortly.', source: 'ezil-os-proxy' } }
+      : { available_micro: 0, held_micro: 0 });
+    expect(upstream.calls).toHaveLength(1);
+    expect(d.dropped).toHaveLength(0);
+  });
+
+  it('storage read failure is unknown, while a positive wallet passes unchanged', async () => {
+    for (const available_micro of [0, 99999999]) {
+      const payload = JSON.stringify({ available_micro, held_micro: 0 });
+      const upstream = mockGateway(() => new Response(payload, { headers: { 'content-type': 'application/json', 'x-ezil-request-id': 'balance-1' } }));
+      const res = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/me/balance`, { headers: { authorization: await proxyAuth() } }),
+        await deps({ fetch: upstream.fetch, creditsRelay: async () => { throw new Error('storage unavailable'); } }));
+      expect(res.status).toBe(available_micro === 0 ? 503 : 200);
+      if (available_micro > 0) { expect(await res.text()).toBe(payload); expect(res.headers.get('x-ezil-request-id')).toBe('balance-1'); }
+    }
+  });
+
+  it('only zero/unstated credit refusals are temporary; positive request-size refusals remain real', async () => {
+    for (const available_micro of [undefined, 0, 7]) {
+      const upstream = mockGateway(() => Response.json({ error: { code: 'insufficient_credits', ...(available_micro === undefined ? {} : { available_micro }) } }, { status: 402 }));
+      const res = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/messages`, { method: 'POST', headers: { authorization: await proxyAuth() }, body: JSON.stringify({ model: 'ezil-fast' }) }),
+        await deps({ fetch: upstream.fetch, creditsRelay: async () => 'unknown' }));
+      expect(res.status).toBe(available_micro === 7 ? 402 : 503);
+      expect((await res.json() as { error: { code: string } }).error.code).toBe(available_micro === 7 ? 'insufficient_credits' : 'os_credits_pending');
+      expect(upstream.calls).toHaveLength(1);
+    }
+  });
+
+  it('bounds a stalled successful balance body and cancels it', async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode('{')); }, cancel() { cancelled = true; } });
+    const upstream = mockGateway(() => new Response(body, { headers: { 'content-type': 'application/json' } }));
+    const started = Date.now();
+    const res = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/me/balance`, { headers: { authorization: await proxyAuth() } }),
+      await deps({ fetch: upstream.fetch, creditsRelay: async () => 'pending', idleTimeoutMs: 10 }));
+    expect(res.status).toBe(504);
+    expect((await res.json() as { error: { code: string } }).error.code).toBe('os_ai_unavailable');
+    expect(cancelled).toBe(true);
+    expect(Date.now() - started).toBeLessThan(1000);
   });
 });

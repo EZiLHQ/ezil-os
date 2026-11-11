@@ -2,6 +2,7 @@
 // shapes in types.ts, streams the provider response back as VS Code parts, and records usage.
 
 import * as vscode from 'vscode';
+import { effortConfigurationSchema, withSessionEffort } from './effort';
 import type { CompactionInfo } from './compact';
 import { appFailure, type AppFailure } from './failure';
 import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, includedModelNames, knownGatewayModels, knownGatewayPlan, modelIncluded, parseCatalogModelId, withCatalogDefault, withDefaultModel, withGatewayModelLimits, withPlanLocks, type GatewayModels } from './gateway';
@@ -185,6 +186,8 @@ export function toInformation(model: ResolvedModel): vscode.LanguageModelChatInf
     };
     // Proposed `chatProvider` fields. code-server 4.141's extension host accepts them without the proposal enabled, and
     // `isDefault` is what makes the config's default model the first one in Chat (no chat.defaultModel is configured).
+    const configurationSchema = effortConfigurationSchema(model);
+    if (configurationSchema) info.configurationSchema = configurationSchema;
     info.isDefault = model.default;
     // A plan-locked model is never a chat model: VS Code never restores, defaults to or hands it to a subagent, so a saved
     // pick on Free falls back to the default with no dialog. The `picker-locked-list` patch still lists it (lock icon and this
@@ -235,17 +238,17 @@ function aiCreditsLink(): vscode.Uri | undefined {
  * pricing page's Standard link.
  */
 function osBillingLink(query: string): vscode.Uri | undefined {
-    try {
-        const url = new URL(process.env.EZIL_AI_BASE_URL ?? '');
-        if (url.protocol === 'https:') return vscode.Uri.parse(`${url.origin}/os?settings=billing&${query}`);
-    } catch { /* no usable OS origin */ }
-    return undefined;
+    // Boot-owned navigation authority, separate from the computer's AI/Code proxy.
+    // Exact origins only: no userinfo, path, query, fragment or caller-provided destination.
+    const origin = process.env.EZIL_OS_ORIGIN;
+    if (origin !== 'https://os-staging.ezil.work' && origin !== 'https://os.ezil.work') return undefined;
+    return vscode.Uri.parse(`${origin}/os?settings=billing&${query}`);
 }
 
 /** A catalog as listed, for noticing that a later read changed it (ids, availability, caps, capabilities and the plan's limit). */
 function catalogSignature(catalog: GatewayModels | undefined): string {
     return catalog ? JSON.stringify([catalog.default_model ?? null, catalog.included ?? null, catalog.data.map(entry => [entry.id, entry.enabled, entry.protocols, entry.availability?.state,
-        entry.name, entry.max_input_tokens, entry.max_output_tokens, entry.capabilities])]) : 'unread';
+        entry.name, entry.max_input_tokens, entry.max_output_tokens, entry.capabilities, entry.effort])]) : 'unread';
 }
 
 export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
@@ -388,7 +391,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             this.listedCatalogs = new Map(providers.map(provider => [provider, catalogSignature(used.get(provider))]));
             this.unreadListings = new Set(providers.filter(provider => !catalog.get(provider)));
             // The Gateway's suggested default counts only from this read: during an outage the configured default stays.
-            // The OS plan's locks (Free: Gemini 3.8 Flash only) follow the same catalog as the rows they lock.
+            // The OS plan's locks (Free: Flash and two fallbacks) follow the same catalog as the rows they lock.
             const offered = [...models.filter(model => gatewayModelAvailable(model, catalog.get(model.provider))), ...listed]
                 .map(model => withGatewayModelLimits(model, catalog.get(model.provider)));
             return this.rememberModels(withDefaultModel(withPlanLocks(withCatalogDefault(offered, catalog), used), used)).map(toInformation);
@@ -465,7 +468,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             controller.signal.throwIfAborted();
             if (resolved.provider.type === 'ezil-gateway' && isUtilityRequest(options.modelOptions ?? {})) {
                 // Requests marked as titles or summaries (role or requestInitiator): Qwen on the named model's own provider
-                // (account), when the account's plan includes it. On a plan that does not (Free: Gemini 3.8 Flash only) they
+                // (account), when the account's plan includes it. On a plan that does not (Free: Flash and two fallbacks) they
                 // never fail on a lock: one naming a model the plan does not include goes to the plan's own model on the same
                 // account. Otherwise the named model serves it. Copilot 0.69 marks none of its own requests: the image's
                 // Machine settings pin its utility slots to Flash (worker/scripts/editor-state.sh).
@@ -503,7 +506,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 if (!gatewayModelAvailable(resolved, catalog)) {
                     throw new GatewayError('EZiL AI: This model is not available right now.', undefined, 'model_disabled', undefined, undefined, 'local');
                 }
-                // Not in the account's OS plan (Free: Gemini 3.8 Flash only): refused here, so nothing is sent, held or
+                // Not in the account's OS plan (Free: Flash and two fallbacks): refused here, so nothing is sent, held or
                 // charged. No billing dialog either: a saved pick, an agent's or subagent's model choice or a stale
                 // picker reaches this, and only a pick in the picker offers the upgrade (lockedModelChosen).
                 const plan = catalog ?? knownGatewayPlan(resolved.provider);
@@ -520,6 +523,10 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                     if ((model.capabilities as { toolCalling?: unknown } | undefined)?.toolCalling) this.refresh();
                 }
             }
+            // Code 4.141 passes native modelConfiguration separately from modelOptions.
+            // Stable @types/vscode omits this proposed field; validate it as unknown.
+            resolved = withSessionEffort(resolved,
+                (options as vscode.ProvideLanguageModelChatResponseOptions & { readonly modelConfiguration?: unknown }).modelConfiguration);
             const sending = resolved;
             const events = chat(resolved, request, {
                 signal: controller.signal,
@@ -604,7 +611,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 this.lastCreditWarningAt = Date.now();
                 const link = aiCreditsLink();
                 void this.askBilling({ reason: 'credits_exhausted', requestId: error.requestId }).then(opened => opened ? undefined
-                    : Promise.resolve(vscode.window.showWarningMessage(message, ...link ? ['Add credits'] : [])).then(choice => {
+                    : Promise.resolve(vscode.window.showWarningMessage(link ? message : `${message} Open EZiL OS Settings → Billing.`, ...link ? ['Add credits'] : [])).then(choice => {
                         if (choice === 'Add credits' && link) return vscode.env.openExternal(link);
                     })).catch(() => {});
             }
@@ -616,11 +623,11 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 void this.askBilling({ reason: 'window_limit', requestId: error.requestId, ...error.resetsAt ? { resetsAt: error.resetsAt } : {} })
                     .then(opened => opened ? undefined : Promise.resolve(vscode.window.showWarningMessage(message)).then(() => undefined)).catch(() => {});
             }
-            // An unknown plan refuses a turn's title and progress requests too: its notice shows at most once a minute.
-            const planUnknown = error instanceof GatewayError && error.code === 'os_plan_unavailable';
-            if (error instanceof GatewayError && ['first_byte_timeout', 'stream_idle_timeout', 'os_unreachable', 'os_ai_unavailable', 'upstream_timeout', 'os_plan_unavailable'].includes(error.code ?? '')
-                && !(planUnknown && Date.now() - this.lastPlanNoticeAt < 60_000)) {
-                if (planUnknown) this.lastPlanNoticeAt = Date.now();
+            // Unconfirmed plans or credits refuse utility requests too: their retry notice appears at most once a minute.
+            const confirmationUnknown = error instanceof GatewayError && ['os_plan_unavailable', 'os_credits_pending'].includes(error.code ?? '');
+            if (error instanceof GatewayError && ['first_byte_timeout', 'stream_idle_timeout', 'os_unreachable', 'os_ai_unavailable', 'upstream_timeout', 'os_plan_unavailable', 'os_credits_pending'].includes(error.code ?? '')
+                && !(confirmationUnknown && Date.now() - this.lastPlanNoticeAt < 60_000)) {
+                if (confirmationUnknown) this.lastPlanNoticeAt = Date.now();
                 // Do not await a notification: the failed turn must leave Thinking immediately.
                 void Promise.resolve(vscode.window.showErrorMessage(message, 'Retry')).then(choice => {
                     if (choice === 'Retry') return vscode.commands.executeCommand('workbench.action.chat.retry');
@@ -662,7 +669,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         if (!await this.askBilling({ reason: 'model_locked', model: alias })) {
             const link = osBillingLink('upgrade=standard');
             const name = configured?.name ?? (fresh ?? knownGatewayPlan(provider))?.data.find(row => row.id === alias)?.name ?? alias;
-            void Promise.resolve(vscode.window.showInformationMessage(`${name} is not included in your plan.`, ...link ? ['Upgrade'] : []))
+            void Promise.resolve(vscode.window.showInformationMessage(`${name} is not included in your plan.${link ? '' : ' Open EZiL OS Settings → Billing.'}`, ...link ? ['Upgrade'] : []))
                 .then(choice => { if (choice === 'Upgrade' && link) return vscode.env.openExternal(link); }).catch(() => {});
         }
         return 'asked';

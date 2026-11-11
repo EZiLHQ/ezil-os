@@ -68,7 +68,7 @@ assert.equal('chat.defaultModel' in machine, false);
 assert.equal(machine['telemetry.telemetryLevel'], 'off');
 assert.equal(machine['github.copilot.chat.tools.viewImage.enabled'], false);
 assert.equal(machine['github.copilot.chat.virtualTools.threshold'], 64);
-assert.deepEqual(machine['terminal.integrated.env.linux'], { EZIL_AI_PROXY_TOKEN: null, EZIL_AI_BASE_URL: null });
+assert.deepEqual(machine['terminal.integrated.env.linux'], { EZIL_AI_PROXY_TOKEN: null, EZIL_AI_BASE_URL: null, EZIL_EDITOR_BRIDGE_TOKEN: null });
 assert.equal(machine['task.allowAutomaticTasks'], 'off');
 assert.equal(JSON.parse(fs.readFileSync(root + '/User/settings.json', 'utf8'))['task.allowAutomaticTasks'], 'off');
 assert(!Object.keys(machine).some(key => /auto.?approve/i.test(key)));

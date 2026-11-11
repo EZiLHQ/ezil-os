@@ -156,10 +156,11 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
         createSessionsControl: () => (order.push('sessions'), 's'), instantiationService: { createInstance: () => 'w' }, _register: x => x,
         createChatControl: () => (order.push('chat'), 'c'), registerControlsListeners: (...a) => order.push(['listeners', ...a]),
         updateSessionsControlVisibility: () => order.push('visibility'), _ezilChatHeader: () => { throw new Error('boom'); },
+        _ezilChatBridge: () => order.push('bridge'),
         logService: { error: (m) => order.push(['error', m]) },
       };
       createControls.call(view, {}, class {});
-      assert.deepEqual(order, ['sessions', 'chat', ['listeners', 's', 'c', 'w'], 'visibility', ['error', 'EZiL: chat header layout not applied']]);
+      assert.deepEqual(order, ['sessions', 'chat', ['listeners', 's', 'c', 'w'], 'visibility', 'bridge', ['error', 'EZiL: chat header layout not applied']]);
     });
 
     // The bundle's own picker options (SW), anchor layout (X7) and action widget sizing (computeHeight)

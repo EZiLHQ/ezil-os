@@ -66,7 +66,7 @@ describe.skipIf(!PG)('feedback ingest on PostgreSQL with app/drizzle/0011_feedba
     it('lists and deletes only the caller\'s own reports', async () => {
         const alice = randomUUID(); const bob = randomUUID();
         const created = await ingestFeedback(db, alice, input(), NOW);
-        if (created.status === 429) throw new Error('unexpected 429');
+        if (created.status !== 201) throw new Error(`unexpected ${created.status}`);
         expect((await listFeedback(db, alice)).map((r) => r.id)).toEqual([created.created.id]);
         expect(await listFeedback(db, bob)).toEqual([]);
         expect(await deleteFeedback(db, bob, created.created.id)).toBe(false);

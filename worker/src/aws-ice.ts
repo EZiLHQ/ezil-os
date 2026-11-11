@@ -92,7 +92,7 @@ export interface AwsDesktopConfig {
   /** The sandbox's derived neko credentials (32 hex each). */
   neko: { user: string; admin: string };
   /** Body-bound signed control delivery; no user JWT ever enters the host. */
-  ai?: { baseUrl: string; proxyToken: string };
+  ai?: { baseUrl: string; proxyToken: string; editorToken?: string; osRealm?: 'staging' | 'production' };
 }
 
 const isTurn = (u: string) => u.startsWith('turn:') || u.startsWith('turns:');
@@ -201,7 +201,16 @@ export async function pushAwsDesktopConfig(
   });
 }
 
+export type AwsOsRealm = 'staging' | 'production';
+/** Explicit deployment realm only; never the AI URL or an unset production default. */
+export function awsOsRealmFor(zone: string | undefined): AwsOsRealm | undefined {
+  return zone === 'ezil.work' ? 'staging' : zone === 'ezil.org' ? 'production' : undefined;
+}
+
 export interface AwsDesktopStatus {
+  osRealmConfigV1?: true;
+  osRealmApplied?: AwsOsRealm | null;
+  osRealmConfigured?: AwsOsRealm | null;
   bootId?: string;
   aiConfigured?: boolean;
   /** The host holds an unexpired config for this epoch. */
@@ -253,7 +262,18 @@ export async function readAwsDesktopStatus(
     throw new RelayFailure('aws_desktop_unreachable', 503);
   }
   const exp = d.expiresAt;
+  const epoch = d.osRealmEpoch as Record<string, unknown> | null;
+  const realm = (v: unknown) => v === null || v === 'staging' || v === 'production';
+  const capable = d.osRealmConfigV1 === true && epoch && typeof epoch === 'object'
+    && Object.keys(epoch).sort().join(',') === 'bootId,computerId,generation,leaseEpoch,observedAtMs'
+    && epoch.computerId === record.computerId && epoch.generation === record.generation && epoch.leaseEpoch === record.leaseEpoch
+    && epoch.bootId === d.bootId && typeof d.bootId === 'string' && /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/.test(d.bootId)
+    && typeof epoch.observedAtMs === 'number' && Number.isSafeInteger(epoch.observedAtMs)
+    && epoch.observedAtMs >= nowSeconds * 1000 - AWS_DESKTOP_STATUS_TIMEOUT_MS && epoch.observedAtMs <= nowSeconds * 1000 + 5000
+    && realm(d.osRealmApplied) && realm(d.osRealmConfigured);
   return {
+    ...(capable ? { osRealmConfigV1: true as const, osRealmApplied: d.osRealmApplied as AwsOsRealm | null,
+      osRealmConfigured: d.osRealmConfigured as AwsOsRealm | null } : {}),
     configured: d.configured,
     expiresAt: typeof exp === 'number' && Number.isSafeInteger(exp) ? exp : null,
     desktop: d.desktop,
@@ -387,6 +407,7 @@ export interface AwsDesktopParams {
   nowMs: () => number;
   neko: { user: string; admin: string };
   mint: RelayMint;
+  osRealm?: AwsOsRealm;
   aiConfig?: (bootId: string) => Promise<NonNullable<AwsDesktopConfig['ai']>>;
   /**
    * The tunnel registry's compare-and-set on this host boot's push to its RUNNING desktop
@@ -399,12 +420,26 @@ export interface AwsDesktopParams {
   budgetMs?: number;
 }
 
+/** Both initial/reconfigure and explicit restart must use this final post-await admission. */
+export async function admitAwsOsRealm(config: AwsDesktopConfig, bootId: string,
+  p: Pick<AwsDesktopParams, 'record' | 'zone' | 'fetch' | 'nowMs' | 'osRealm'>): Promise<void> {
+  if (!config.ai) return;
+  config.ai = { ...config.ai };
+  delete config.ai.osRealm;
+  const latest = await readAwsDesktopStatus(p.record, p.zone, p.fetch, Math.floor(p.nowMs() / 1000));
+  if (latest.bootId !== bootId) throw new RelayFailure('aws_origin_unavailable');
+  if (latest.osRealmConfigV1 === true && (p.osRealm === 'staging' || p.osRealm === 'production')) config.ai.osRealm = p.osRealm;
+}
+
 /** Mint once and push this epoch's config (with Chat's AI config when the host reports its boot). */
 async function pushDesktopConfig(p: AwsDesktopParams, status: AwsDesktopStatus): Promise<{ answer: AwsDesktopStarting; expiresAt: number }> {
   const minted = await p.mint(AbortSignal.timeout(20_000), 'boot');
   if (!minted) throw new RelayFailure('turn_unavailable');
   const config = buildAwsDesktopConfig(minted.servers, minted.expiresAt, p.neko, p.nowMs());
-  if (p.aiConfig && status.bootId) config.ai = await p.aiConfig(status.bootId);
+  if (p.aiConfig && status.bootId) {
+    config.ai = await p.aiConfig(status.bootId);
+    await admitAwsOsRealm(config, status.bootId, p);
+  }
   const bounded: FetchLike = (url, init) => p.fetch(url, { ...init, signal: AbortSignal.timeout(AWS_DESKTOP_PUSH_TIMEOUT_MS) });
   let res: Response;
   try {
@@ -457,7 +492,8 @@ export async function ensureAwsDesktopConfig(p: AwsDesktopParams): Promise<AwsDe
   const now = p.nowMs();
   const fresh = status.configured && status.expiresAt !== null && status.expiresAt > now + RELAY_MIN_AHEAD_MS;
   const stalled = !running && status.unit !== null && STALLED_DESKTOP_UNITS.includes(status.unit);
-  const needsAi = !!(p.aiConfig && status.bootId && !status.aiConfigured);
+  const needsRealm = !!(p.aiConfig && status.osRealmConfigV1 === true && status.osRealmApplied !== (p.osRealm ?? null));
+  const needsAi = !!(p.aiConfig && status.bootId && !status.aiConfigured) || needsRealm;
   if (!running && (!fresh || stalled)) return (await pushDesktopConfig(p, status)).answer;
   if (running && (status.ice !== 'applied' || needsAi)) {
     const boot = status.bootId;
@@ -468,7 +504,7 @@ export async function ensureAwsDesktopConfig(p: AwsDesktopParams): Promise<AwsDe
     // Another ask claimed this boot's push and is pushing it (checked before the held config:
     // the host still holds the previous one until that push lands).
     if (seen !== null && restartPushExpiresAt === undefined && now - seen < AWS_DESKTOP_CONFIG_CLAIM_MS) return pending;
-    if (seen !== null && restartPushExpiresAt !== undefined && fresh) {
+    if (seen !== null && restartPushExpiresAt !== undefined && fresh && (!needsRealm || status.osRealmConfigured === (p.osRealm ?? null))) {
       if (status.expiresAt !== restartPushExpiresAt) {
         // The record's push is not the held one (the Restart route staged its own): adopt that.
         await p.restartPush(boot, seen, { expiresAt: status.expiresAt! }).catch(() => null);

@@ -1,3 +1,4 @@
+import { parseGatewayEffort, type GatewayEffortCapability } from './effort';
 // EZiL AI gateway transport (provider type `ezil-gateway`): one Idempotency-Key per chat turn, the body
 // serialized once and the same bytes reused on the only retries the contract allows, error mapping by
 // `error.code`, the `/v1/models` limits cache and the credit states. ezil-ai-gateway
@@ -15,7 +16,7 @@ import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-resp
 import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from './gateway-responses';
 import { emptyUsage } from './types';
 import { localResetTime } from './status-data';
-import { credits, creditsFloor2 } from './credits-format';
+import { creditsWhole } from './credits-format';
 import type { ChatRequest, StreamEvent } from './types';
 
 export const GATEWAY_FIRST_BYTE_TIMEOUT_MS = 30_000;
@@ -76,7 +77,7 @@ export type GatewayAvailability = { state: typeof AVAILABILITY_STATES[number]; r
 /** Capability flags a row may carry. Absent means "not established": a catalog-only row gets none of them. */
 export type GatewayCapabilities = { tool_calling?: boolean; image_input?: boolean; streaming?: boolean; prompt_cache?: boolean };
 export type GatewayModel = { id: string; enabled: boolean; max_input_tokens: number; max_output_tokens: number; protocols?: readonly GatewayProtocol[];
-    availability?: GatewayAvailability; name?: string; capabilities?: GatewayCapabilities };
+    effort?: GatewayEffortCapability; availability?: GatewayAvailability; name?: string; capabilities?: GatewayCapabilities };
 export type GatewayModels = { killswitch: boolean; pause: 'operations' | 'reconciliation' | null; data: GatewayModel[];
     /** v1 `default_model`: the Gateway's suggested first model for this caller (contract §2 rule 8); absent when null. */
     default_model?: string;
@@ -219,6 +220,7 @@ export function parseGatewayModels(json: unknown): GatewayModels | undefined {
         if (typeof entry.name === 'string' && DISPLAY_NAME.test(entry.name.trim())) row.name = entry.name.trim();
         const capabilities = capabilitiesOf(entry.capabilities);
         if (capabilities && protocols?.length && KNOWN_PROTOCOLS.includes(protocols[0]!)) row.capabilities = capabilities;
+        if (protocols?.length && KNOWN_PROTOCOLS.includes(protocols[0]!)) row.effort = parseGatewayEffort(entry.effort, protocols[0]!);
         return row;
     });
     const models: GatewayModels = { killswitch: raw.killswitch === true, pause: raw.pause === 'operations' || raw.pause === 'reconciliation' ? raw.pause : null, data };
@@ -242,13 +244,16 @@ export function gatewayModelAvailable(model: ResolvedModel, catalog: GatewayMode
  */
 export function withGatewayModelLimits(model: ResolvedModel, catalog: GatewayModels | undefined): ResolvedModel {
     const entry = catalog?.data.find(entry => entry.id === model.model);
-    if (!entry || model.provider.type !== 'ezil-gateway') return model;
+    if (model.provider.type !== 'ezil-gateway') return model;
+    if (!entry) { const { gatewayEffort: _effort, ...rest } = model; return rest; }
     const capabilities = entry.capabilities;
     // A row that no longer says prompt_cache: true takes the catalog-granted markers away (route moved off Claude).
-    const { gatewayPromptCache, ...rest } = model;
+    const { gatewayPromptCache, gatewayEffort: _effort, ...rest } = model;
     const cache = gatewayPromptCache && capabilities?.prompt_cache !== true ? { cache: { ...model.cache, enabled: false } } : {};
     const keep = gatewayPromptCache && capabilities?.prompt_cache === true ? { gatewayPromptCache } : {};
-    return { ...rest, ...keep, ...cache, maxInputTokens: Math.min(model.maxInputTokens, entry.max_input_tokens),
+    const effort = entry.enabled && entry.availability?.state === 'available' && !catalog?.killswitch && !catalog?.pause
+        ? parseGatewayEffort(entry.effort, model.gatewayProtocol ?? 'anthropic-messages') : undefined;
+    return { ...rest, ...keep, ...cache, ...(effort ? { gatewayEffort: effort } : {}), maxInputTokens: Math.min(model.maxInputTokens, entry.max_input_tokens),
         maxOutputTokens: Math.min(model.maxOutputTokens, entry.max_output_tokens),
         capabilities: { toolCalling: capabilities?.tool_calling === false ? false : model.capabilities.toolCalling,
             imageInput: model.capabilities.imageInput && capabilities?.image_input !== false },
@@ -298,6 +303,7 @@ export function gatewayCatalogModels(provider: ResolvedProvider, catalog: Gatewa
         models.push({
             id: catalogModelId(provider, entry.id), name: entry.name ?? entry.id, providerName: provider.name, provider, model: entry.id,
             ...protocol === 'openai-responses' ? { gatewayProtocol: protocol } : {},
+            ...!catalog.killswitch && !catalog.pause && parseGatewayEffort(entry.effort, protocol) ? { gatewayEffort: parseGatewayEffort(entry.effort, protocol) } : {},
             family: entry.id, version: '1',
             maxInputTokens: entry.max_input_tokens, maxOutputTokens: Math.max(16, Math.min(16_384, entry.max_output_tokens)),
             capabilities: { toolCalling: entry.capabilities?.tool_calling === true, imageInput: false },
@@ -330,7 +336,7 @@ export function withCatalogDefault(models: readonly ResolvedModel[], catalogs: R
 }
 
 /**
- * The account's OS plan (`included`, Free: Gemini 3.8 Flash only): each other model of that provider stays listed but
+ * The account's OS plan (`included`, Free: Gemini 3.8 Flash and two low-tier fallbacks): each other model of that provider stays listed but
  * locked, so choosing it can offer the upgrade, and it is never the default, never selectable and never sent. A locked
  * default is dropped here; `withDefaultModel` then chooses among the unlocked. A catalog never read locks nothing; the
  * proxy decides.
@@ -420,6 +426,102 @@ async function readGatewayModels(provider: ResolvedProvider, key: string, doFetc
     }
 }
 
+/**
+ * How old a `/v1/models` read may be, at the moment the editor emits its catalog, to count as evidence of what the Gateway
+ * allows this account. This is the editor's own policy. OS separately treats a catalog as fresh for 45 s after IT receives it
+ * (control-store CATALOG_FRESH_MS) and the MCP accepts OS's reading for 60 s; the two are different clocks, and the time in
+ * transit between emission and receipt is not bounded by either.
+ */
+export const ACCOUNT_EVIDENCE_MAX_AGE_MS = 15_000;
+
+/**
+ * This token's `/v1/models` read no older than `maxAgeMs`: the cached one when it is that fresh, otherwise a new read.
+ * A failed read is `undefined`, never the older catalog (unlike `knownGatewayModels`, which keeps listing rows): it is
+ * evidence of what the Gateway allows THIS account now, so stale or missing evidence is no evidence.
+ */
+export async function freshGatewayModels(provider: ResolvedProvider, doFetch: typeof fetch, now: number = Date.now(),
+    maxAgeMs: number = ACCOUNT_EVIDENCE_MAX_AGE_MS): Promise<{ at: number; models: GatewayModels } | undefined> {
+    const cached = modelsCache.get(providerIdentity(provider));
+    if (cached && now >= cached.at && now - cached.at <= maxAgeMs) return { at: cached.at, models: cached.models };
+    const models = await gatewayModels(provider, doFetch, now, undefined, true);
+    // The shared read may have begun before this caller joined it. Only the cache entry for
+    // this exact result carries its real start time; missing/replaced evidence fails closed.
+    const observed = modelsCache.get(providerIdentity(provider));
+    return models && observed?.models === models ? { at: observed.at, models } : undefined;
+}
+
+/**
+ * The Gateway says this account may use `alias` right now: its exact row is enabled and `available` under the catalog
+ * contract (a legacy row carries no availability, so it says nothing), with no killswitch or pause.
+ */
+export function availableForAccount(catalog: GatewayModels, alias: string): boolean {
+    if (catalog.killswitch || catalog.pause !== null) return false;
+    const entry = catalog.data.find(row => row.id === alias);
+    return entry?.enabled === true && entry.availability?.state === 'available';
+}
+
+/**
+ * Of the picker ids `ids`, those the Gateway allows THIS account to use, on fresh evidence from each provider's own token.
+ * A configured id names its row by its upstream alias (`model`); a catalog-only id is `<provider>/<alias>`. An id served
+ * by any other provider type (a static, directly configured model) never has Gateway evidence, so it is never included.
+ *
+ * Freshness is judged against the clock at EVERY decision, not once at the start: a provider read can be slow and several
+ * are made one after another. Each cache-or-read choice uses the time it is made, evidence that has aged out while the
+ * others were read is read again, and when the set is emitted anything whose read began more than
+ * `ACCOUNT_EVIDENCE_MAX_AGE_MS` ago (or whose clock ran backwards) is dropped: a slow collection fails closed.
+ * Each read is stamped with the time it BEGAN, so its age is an upper bound. `now` is a fixed instant (tests) or a clock.
+ * This bounds the age at emission only: the time the sync then spends in transit to OS is not counted here.
+ */
+export async function accountAvailableIds(models: readonly ResolvedModel[], ids: readonly string[], doFetch: typeof fetch,
+    now: number | (() => number) = Date.now, effortEvidence?: Map<string, GatewayEffortCapability>): Promise<Set<string>> {
+    const clock = typeof now === 'function' ? now : () => now;
+    type Evidence = { at: number; models: GatewayModels } | undefined;
+    const evidence = new Map<string, Promise<Evidence>>();
+    const read = async (provider: ResolvedProvider): Promise<Evidence> => {
+        const key = providerIdentity(provider);
+        const earlier = evidence.get(key);
+        const value = earlier ? await earlier : undefined;
+        // A read that failed stays failed for this build; one that has since aged out is read again.
+        if (earlier && (!value || (clock() >= value.at && clock() - value.at <= ACCOUNT_EVIDENCE_MAX_AGE_MS))) return value;
+        const next = freshGatewayModels(provider, doFetch, clock()).catch(() => undefined);
+        evidence.set(key, next);
+        return next;
+    };
+    const candidates = new Map<string, number>();
+    for (const id of ids) {
+        const configured = models.find(model => model.id === id);
+        const catalogOnly = configured ? undefined : parseCatalogModelId(id);
+        const provider = configured ? configured.provider
+            : catalogOnly && models.find(model => model.provider.type === 'ezil-gateway' && model.providerName === catalogOnly.providerName)?.provider;
+        const alias = configured ? configured.model : catalogOnly?.alias;
+        if (!provider || provider.type !== 'ezil-gateway' || !alias) continue;
+        const seen = await read(provider);
+        if (seen && availableForAccount(seen.models, alias)) {
+            candidates.set(id, seen.at);
+            const row = seen.models.data.find(m => m.id === alias);
+            // Configured models execute Messages unless explicitly opted into Responses.
+            // Only catalog-only models select their protocol from the catalog.
+            const protocol = configured
+                ? configured.gatewayProtocol ?? 'anthropic-messages'
+                : row?.protocols?.[0] ?? 'anthropic-messages';
+            const cap = parseGatewayEffort(row?.effort, protocol);
+            if (cap) effortEvidence?.set(id, cap);
+        }
+    }
+    const emitted = clock();
+    const allowed = new Set<string>();
+    for (const [id, at] of candidates) if (emitted >= at && emitted - at <= ACCOUNT_EVIDENCE_MAX_AGE_MS) allowed.add(id);
+    for (const id of effortEvidence?.keys() ?? []) if (!allowed.has(id)) effortEvidence?.delete(id);
+    return allowed;
+}
+
+export async function accountModelEvidence(models: readonly ResolvedModel[], ids: readonly string[], doFetch: typeof fetch,
+    now: number | (() => number) = Date.now): Promise<{ available: Set<string>; efforts: Map<string, GatewayEffortCapability> }> {
+    const efforts = new Map<string, GatewayEffortCapability>();
+    const available = await accountAvailableIds(models, ids, doFetch, now, efforts);
+    return { available, efforts };
+}
+
 /** How long a catalog that can no longer be read still lists the rows it had (only for its own base URL + token). */
 export const CATALOG_STALE_MS = 30 * 60_000;
 
@@ -477,8 +579,8 @@ export const CREDIT_STATE_TEXT: Record<CreditState, string> = {
 
 /** Contract §7 "Credit UX states", evaluated top to bottom. Either input may be unknown. */
 export function creditState(models: GatewayModels | undefined, balance: GatewayBalance | undefined, alias: string): { state: CreditState; text: string; credits?: number } {
-    // The text is the exact decimal (credits-format.ts), never a float's rendering; `credits` stays a number for callers.
-    const pick = (state: CreditState, micro?: number) => ({ state, text: state === 'ok' && micro !== undefined ? `AI credits: ${credits(micro)} remaining` : CREDIT_STATE_TEXT[state],
+    // The text is whole floored credits (credits-format.ts), never a float's rendering; `credits` stays a number for callers.
+    const pick = (state: CreditState, micro?: number) => ({ state, text: state === 'ok' && micro !== undefined ? `AI credits: ${creditsWhole(micro)} remaining` : CREDIT_STATE_TEXT[state],
         ...(micro === undefined ? {} : { credits: micro / MICRO_PER_CREDIT }) });
     if (models?.killswitch) return pick(models.pause === 'reconciliation' ? 'paused_reconciliation' : 'paused_operations');
     if (models && models.data.find(entry => entry.id === alias)?.enabled === false) return pick('model_disabled');
@@ -564,15 +666,15 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
             const head = oversized ? 'This request needs more EZiL AI credits than this window allows, so waiting will not make it fit.'
                 : `This window's EZiL AI credits are used up. ${reset ? `Resets at ${localResetTime(reset)} (local time).` : 'Check EZiL AI status for the reset time.'}`;
             const guide = oversized || (left ?? 0) > 0
-                ? ` A new chat or a smaller model uses fewer credits${!oversized && left ? `; ${creditsFloor2(left)} credits are left in this window` : ''}.` : '';
+                ? ` A new chat or a smaller model uses fewer credits${!oversized && left !== undefined && left >= MICRO_PER_CREDIT ? `; ${creditsWhole(left)} credits are left in this window` : ''}.` : '';
             return new GatewayError(`EZiL AI: ${head} Buying credits or changing plan does not lift this window right now.${guide}${ref}`,
                 status, code, requestId, seconds, origin, undefined, reset?.toISOString());
         }
         case 'insufficient_credits': case 'no_live_grant': {
             if (body.no_live_grant || code === 'no_live_grant') return make('You have no AI credits left. Add credits to continue.');
             const available = body.available_micro ?? balance?.available_micro;
-            // Floored: the balance is never shown as more than it is (the hold below is a requirement, so it keeps toFixed).
-            const credits = typeof available === 'number' && Number.isSafeInteger(available) && available >= 0 ? creditsFloor2(available) : 'Not measured';
+            // Whole and floored: the balance is never shown as more than it is (the hold below is a requirement, so it keeps toFixed).
+            const credits = typeof available === 'number' && Number.isSafeInteger(available) && available >= 0 ? creditsWhole(available) : 'Not measured';
             const state = typeof body.hold_micro === 'number' && Number.isFinite(body.hold_micro)
                 && typeof available === 'number' && Number.isFinite(available) && body.hold_micro > available
                 ? `This request needs up to ${(body.hold_micro / MICRO_PER_CREDIT).toFixed(2)} credits, and you have ${credits}.`
@@ -591,6 +693,7 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
             if (body.reason === 'wrong_issuer') return make('EZiL AI does not accept this account’s sign-in (this OS environment is not connected to EZiL AI)');
             if (body.reason === 'bad_signature') return make('EZiL AI could not verify this account’s sign-in signature. Contact your administrator');
             return make('EZiL AI refused this account’s sign-in. Contact your administrator');
+        case 'os_credits_pending': return make('Your AI credits are being confirmed. Please try again shortly');
         case 'os_ai_unavailable': return make('Could not reach EZiL AI. Retry the request');
         case 'os_completion_timeout': return make(`No complete reply from EZiL AI within ${GATEWAY_COMPLETION_TIMEOUT_MS / 1000} seconds, so EZiL OS stopped waiting. `
             + 'The request may still be charged if the model finished, never more than EZiL AI settles for it. You can retry or switch to a streaming model');
@@ -606,7 +709,7 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
         // Caller-scoped (catalog reasons entitlement_required and not_allowed_for_caller): neither is about credits.
         case 'no_entitlement': return make('AI access is not included for this account: it needs an active plan');
         case 'model_not_allowed': return make('This model is not included for your access. Pick another model');
-        // The OS proxy's plan list (Free: Gemini 3.8 Flash only), refused before the Gateway.
+        // The OS proxy's plan list (Free: Flash and two fallbacks), refused before the Gateway.
         case 'os_model_not_included': return make(`${alias} is not included in your plan. Nothing was sent or charged. `
             + 'Pick an included model, or upgrade in Settings → Billing');
         case 'os_invalid_request': return make(`Internal EZiL Models bug (${code}); please report it`);

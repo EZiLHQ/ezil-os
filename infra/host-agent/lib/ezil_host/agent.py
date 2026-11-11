@@ -386,8 +386,11 @@ class Agent:
                 return {"ok": False, "error": "desktop_restart_exhausted"}
             self.restart_request = True
             return {"ok": True, "state": "restart_scheduled"}
-        if desktop.read_ice_state(self.cfg) == "applied" and (not relay_config.get("ai") or desktop.ai_configured(self.cfg)):
+        realm_matches = desktop.applied_os_realm(self.cfg) == (relay_config.get("ai") or {}).get("osRealm")
+        if desktop.read_ice_state(self.cfg) == "applied" and (not relay_config.get("ai") or desktop.ai_configured(self.cfg)) and realm_matches:
             return {"ok": True, "state": "already_running"}
+        if not realm_matches and self._restarts_exhausted(self.clock()):
+            return {"ok": False, "error": "desktop_restart_exhausted"}
         self.restart_request = True
         return {"ok": True, "state": "restart_scheduled"}
 
@@ -400,6 +403,10 @@ class Agent:
                 "bootId": desktop.host_boot_id(), "aiConfigured": desktop.ai_configured(self.cfg),
                 "desktop": self._desktop_state(), "ice": desktop.read_ice_state(self.cfg),
                 "unit": self._desktop_unit(), "restartsExhausted": self._restarts_exhausted(now)}
+        result.update(osRealmConfigV1=True,
+                      osRealmEpoch={"computerId": self.lease.get("computerId"), "generation": self.lease["generation"],
+                                    "leaseEpoch": self.lease["leaseEpoch"], "bootId": result["bootId"], "observedAtMs": int(now * 1000)},
+                      osRealmApplied=desktop.applied_os_realm(self.cfg), osRealmConfigured=(c.get("ai") or {}).get("osRealm") if c else None)
         from . import pool
         if os.path.lexists(os.path.join(self.cfg.stateDir, pool.EPOCH_FILE)):
             result["sessionReady"] = c is not None and pool.session_ready(self.cfg, self.lease)

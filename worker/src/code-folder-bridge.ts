@@ -49,6 +49,18 @@
  * Production has no entry, so its editors get no bridge at all.
  */
 const SHELL_ORIGINS_BY_PREVIEW_ZONE: Readonly<Record<string, string>> = { 'ezil.work': 'https://os-staging.ezil.work' };
+/**
+ * A navigation destination, not permission to message a parent. Reuse the staging
+ * parent mapping and the existing production realm default without enabling a
+ * production embedded bridge. Unknown realms clear the boot value.
+ */
+export function osBillingOriginFor(previewZoneRoot: string | undefined): string {
+  if (previewZoneRoot === undefined) return 'https://os.ezil.work';
+  const zone = previewZoneRoot.trim().toLowerCase();
+  if (zone === 'ezil.org') return 'https://os.ezil.work';
+  return zone === 'ezil.work' ? SHELL_ORIGINS_BY_PREVIEW_ZONE[zone]! : '';
+}
+
 /** At most this many origins (staging has one). */
 export const CODE_SHELL_ORIGINS_MAX = 4;
 /** How long the editor waits for the shell's `ezil.code.go` before it switches folder by itself. */

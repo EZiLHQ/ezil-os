@@ -4,6 +4,7 @@ import { routeComputer } from '@/server/api/routers/compute-dispatch';
 import { getBillingDeps } from '@/server/billing/deps';
 import { runningAwsComputersAfterEpochs } from '@/server/billing/store';
 import { aiIncludedModelsFor } from '@/server/billing/v3/ai-models';
+import { aiCreditsPendingFor } from '@/server/billing/ai-credits-pending';
 import { db } from '@/server/db';
 import { computers } from '@/server/db/schema';
 import { AI_PLAN_REFRESH_OPENED_WITHIN_MS, refreshAiPlans } from '@/server/lib/ai-credential';
@@ -76,6 +77,7 @@ function aiPlanRefresh(now: Date) {
             })).map(row => ({ userId: row.userId, computerId: row.id })),
         },
         includedModelsFor: userId => aiIncludedModelsFor(userId),
+        creditsPendingFor: userId => aiCreditsPendingFor(userId),
     });
 }
 

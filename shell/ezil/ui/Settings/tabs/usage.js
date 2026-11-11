@@ -87,7 +87,6 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
     // Nothing read yet is a load in progress, never a failure (live staging 2026-11-01: a 0.2 s "couldn't read" flash).
     const left = !lines ? usageLoading ? 'Checking…' : 'Time left unavailable' : lessThanHour ? lines.main.replace(/^About 0 hours left/, 'Less than an hour left') : lines.main;
     const closed = summary?.computer?.standing === 'files_on_aws' ? heldClosedSize(summary.computer) : null;
-    const sessionHours = count(summary?.computer?.sessionMaxSeconds) && summary.computer.sessionMaxSeconds >= 3600 ? Math.floor(summary.computer.sessionMaxSeconds / 3600) : null;
     const timeNote = period.allowanceStandardSeconds === 0 ? 'No computer time included this period.'
         : timePercent === null ? usageLoading ? '' : "We couldn't read your usage. Try Refresh."
         : timeState === 'danger' ? '■ No computer time left · new sessions paused'
@@ -95,7 +94,7 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
         : lines?.equivalents ? esc(lines.equivalents)
         // Round 6 (R4-02): a held 4 or 8 vCPU computer has no Free session to describe; it can't open on Free.
         : closed ? esc(heldClosedText(closed.vcpu))
-        : free && sessionHours ? `Free sessions last up to ${sessionHours} hour${sessionHours === 1 ? '' : 's'}.` : '';
+        : '';
     const ai = summary?.ai, grant = ai?.grant;
     // Round 5 D1: an account without EZiL ID has its credits parked; the server says so, never "Unavailable".
     const enrollment = ai ? ai.enrollment ?? 'enrolled' : null;
@@ -164,13 +163,30 @@ export function usageHtml(data, summary = null, { stale = false, lastAccount = n
                 : pending ? `${esc(creditsLabel(null, pending.credits))} more from ${timestamp(pending.at)}` : '',
             identity.stale ? '' : ai?.included && validDate(ai.included.periodEnd) ? `Resets ${timestamp(ai.included.periodEnd)}` : grant?.per === 'period' && grantLabel ? `Your plan adds ${grantLabel} every month` : '',
         ].filter(Boolean).join('<br>');
+        // Granted credits the Gateway has not acknowledged yet (a new account's starter grant): on their way,
+        // never "No credits left". The balance shown stays the Gateway's; nothing is added to it here.
+        const delivering = deliveringCredits(summary);
+        if (identity && delivering !== null) {
+            const adding = `${esc(creditsLabel(null, delivering))} credits are being added to your account.`;
+            if (identity.empty) {
+                aiState = 'pending'; aiPercent = null; aiValue = 'Adding your AI credits…'; aiText = adding;
+                aiNote = [identity.stale ? esc(staleCreditsCopy(identity.asOf)) : '', adding].filter(Boolean).join('<br>');
+            } else aiNote = [aiNote, adding].filter(Boolean).join('<br>');
+        }
     }
     // Usage can answer before the summary: until the first summary arrives the credits are being read, not unreadable.
     if (summaryLoading && !ai && identity === undefined) {
         aiState = 'pending'; aiPercent = null; aiValue = 'Checking…'; aiText = 'Checking your AI credits.'; aiNote = '';
     }
     const aiAction = enrollment === 'needs_ezil_id' ? ezilHref ? `<a class="ezil-settings-btn" data-action="ezil-id" href="${esc(ezilHref)}">Sign in with EZiL ID</a>` : ''
-        : enrollment === 'enrolled' && actions.topup === true ? billingLink('Add credits', 'usage-add-credits', false, '&amp;section=ai-credits') : '';
+        : enrollment !== 'enrolled' ? ''
+        // Credits being added, an unreadable balance or a kept one offer a re-read, never a purchase.
+        : aiState === 'pending' || aiState === 'unavailable' || identity?.stale ? '<button type="button" class="ezil-settings-btn" data-action="refresh-usage">Retry</button>'
+        // A confirmed zero asks Billing for its recovery (`insufficient_credits`): from Billing's own fresh summary, the
+        // Standard upgrade on Free or Add credits on a paid plan.
+        : aiState === 'danger' && (actions.topup === true || actions.checkout === true)
+            ? billingLink('Get more credits', 'usage-ai-recovery', false, '&amp;section=ai-credits&amp;reason=insufficient_credits')
+        : actions.topup === true ? billingLink('Add credits', 'usage-add-credits', false, '&amp;section=ai-credits') : '';
     // Round 3 (D4): the provisioned disk; a used figure only when measured; Free shows no invented number.
     const storage = usage?.storage, samples = storage?.state === 'sampled' && Array.isArray(storage.samples) ? storage.samples : [];
     const disk = storage?.disk && typeof storage.disk === 'object' ? storage.disk : null;
@@ -279,6 +295,17 @@ function announce(state, body) {
     if (changes.length) state.win.find('[data-role="usage-announcement"]').text(changes.join(' '));
 }
 const SUMMARY_MAX_AGE_MS = 5 * 60 * 1000;
+/**
+ * Between summaries the poll re-reads the AI balance (`billing.aiAccount`: database and Gateway reads, no Stripe) once it
+ * is this old, so a starter grant shows on arrival and credits used in Code show here without a Refresh.
+ */
+const AI_ACCOUNT_MAX_AGE_MS = 60 * 1000;
+/** Whole credits an enrolled account was granted that the Gateway has not acknowledged yet, or null. */
+function deliveringCredits(summary) {
+    const ai = summary?.enabled === true && summary.version === 3 ? summary.ai : null;
+    const credits = (ai?.enrollment ?? 'enrolled') === 'enrolled' ? ai?.delivering?.credits : null;
+    return Number.isSafeInteger(credits) && credits > 0 ? credits : null;
+}
 /** Window focus re-reads the summary (credits after a checkout in another tab) at most this often: the summary's side
  * effects (Stripe preview, Gateway reads, free-credit enqueue) keep it at Billing's 5-minute focus rule. */
 const FOCUS_SUMMARY_MS = 5 * 60 * 1000;
@@ -290,7 +317,7 @@ async function load(state, manual = false) {
     const generation = ++state.generation, requested = scope(state);
     const body = state.win.find('[data-role="usage-body"]'), status = state.win.find('[data-role="usage-refresh-status"]');
     if (!sameScope(state.observedScope, requested)) {
-        state.usage = null; state.summary = null; state.summaryAt = undefined; state.meterStates = null; state.observedScope = requested;
+        state.usage = null; state.summary = null; state.summaryAt = state.aiAt = undefined; state.meterStates = null; state.observedScope = requested;
         state.lastAccount = null;
         body.html(usageHtml(null, null, { usageLoading: true, summaryLoading: true })); state.win.find('[data-role="usage-announcement"]').empty();
     }
@@ -298,10 +325,13 @@ async function load(state, manual = false) {
     body.attr('aria-busy', 'true');
     if (state.usage?.session.state === 'recording') body.find('.usage-session-line').html(measuringLine(state.usage.session.elapsedSeconds));
     // billing.summary has side effects (Stripe renewal preview, Gateway balance read, free-credit enqueue):
-    // read it on open, on manual Refresh, or when older than five minutes. The 30 s poll reads usage only.
+    // read it on open, on manual Refresh, or when older than five minutes. Between summaries the 30 s poll reads usage,
+    // and the AI balance once it is a minute old.
     const summaryDue = manual || state.summaryAt === undefined || Date.now() - state.summaryAt > SUMMARY_MAX_AGE_MS;
-    if (summaryDue) state.summaryAt = Date.now();
-    const sources = summaryDue ? ['usage', 'summary'] : ['usage'];
+    if (summaryDue) state.summaryAt = state.aiAt = Date.now();
+    const accountDue = !summaryDue && !!state.summary?.ai && 'account' in state.summary.ai && Date.now() - (state.aiAt ?? 0) >= AI_ACCOUNT_MAX_AGE_MS;
+    if (accountDue) state.aiAt = Date.now();
+    const sources = summaryDue ? ['usage', 'summary'] : accountDue ? ['usage', 'aiAccount'] : ['usage'];
     const pending = new Set(sources), failed = new Set();
     const currentRequest = () => {
         if (generation !== state.generation || !state.visible || document.hidden || !state.win.get(0).isConnected) return false;
@@ -320,6 +350,20 @@ async function load(state, manual = false) {
             if (source === 'usage') {
                 if (!result.data || (requested.computerId && result.data.session?.computerId && result.data.session.computerId !== requested.computerId)) throw Error('Usage unavailable');
                 usageHtml(result.data);
+            } else if (source === 'aiAccount') {
+                if (result.data?.enabled !== true || !state.summary?.ai) throw Error('AI balance unavailable');
+                const { account, delivering, enrollment, waiting } = result.data;
+                if (typeof account?.userId === 'string' && typeof requested.ownerId === 'string' && account.userId !== requested.ownerId) {
+                    state.lastAccount = null;
+                    throw Error('AI balance for another user');
+                }
+                if (accountCredits(account, { userId: requested.ownerId }) !== null) state.lastAccount = account;
+                // The read's enrollment either way (activating → enrolled, or back); an unknown one keeps the summary's.
+                const fresh = ['enrolled', 'activating', 'needs_ezil_id'].includes(enrollment) ? { enrollment, waiting: waiting ?? null } : {};
+                // The summary's actions (Add credits, the EZiL ID link) follow enrollment: a change re-reads it on the next poll.
+                if (fresh.enrollment && fresh.enrollment !== (state.summary.ai.enrollment ?? 'enrolled')) state.summaryAt = undefined;
+                const { delivering: _previous, ...ai } = state.summary.ai;
+                state.summary = { ...state.summary, ai: { ...ai, ...fresh, account, ...(delivering ? { delivering } : {}) } };
             } else if (result.data?.enabled !== true || result.data.version !== 3) throw Error('Summary unavailable');
             else {
                 // The server names the user it read: another user's credits (a session changed elsewhere) are never shown.
@@ -333,7 +377,10 @@ async function load(state, manual = false) {
             state[source] = result.data;
         } catch {
             if (!currentRequest()) return;
-            failed.add(source);
+            // An unreadable balance between summaries: the AI row shows the kept one as "Couldn't refresh · as of", never as current.
+            if (source === 'aiAccount') {
+                if (state.summary?.ai) state.summary = { ...state.summary, ai: { ...state.summary.ai, account: null } };
+            } else failed.add(source);
             if (source === 'summary') state.summary = null;
         } finally {
             clearTimeout(timeout);
@@ -369,10 +416,10 @@ export default {
         states.set(win.get(0), state);
         win.on('click', '[data-action="refresh-usage"]', () => { void load(state, true); });
         // Add credits opens Billing's top-up dialog in this window; the link stays the fallback without a Billing tab.
-        win.on('click', '[data-action="usage-add-credits"]', event => {
+        win.on('click', '[data-action="usage-add-credits"], [data-action="usage-ai-recovery"]', event => {
             if (!win.find('.ezil-settings-tab[data-tab="billing"]').length) return;
             event.preventDefault();
-            win.trigger('ezil:billing-topup', [{ reason: null }]);
+            win.trigger('ezil:billing-topup', [{ reason: event.currentTarget.dataset.action === 'usage-ai-recovery' ? 'insufficient_credits' : null }]);
         });
     },
     onActivate(win) {

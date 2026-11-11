@@ -69,7 +69,8 @@ seed_codeserver_machine_settings() {
   "telemetry.telemetryLevel": "off",
   "terminal.integrated.env.linux": {
     "EZIL_AI_PROXY_TOKEN": null,
-    "EZIL_AI_BASE_URL": null
+    "EZIL_AI_BASE_URL": null,
+    "EZIL_EDITOR_BRIDGE_TOKEN": null
   },
   "github.copilot.chat.tools.viewImage.enabled": false,
   "github.copilot.chat.virtualTools.threshold": 64,
