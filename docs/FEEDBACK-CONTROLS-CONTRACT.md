@@ -374,8 +374,9 @@ with `?crid=<clientRequestId>`, its image Content-Type, and
 `X-EZiL-Feedback-Account: <validated boot user UUID>`. A 200/201 must return the exact
 SHA-256 of those bytes and a boolean `finalized`. The client then POSTs the small report
 with `screenshot: null` and ordered `screenshotRefs: [{sha256, contentType}]`, omitting
-`screenshots`. This exact finalize JSON is shown in the expanded preview. The same
-expected-account header accompanies finalize and replay. It is comparison only,
+`screenshots`. This exact finalize JSON is shown in the expanded preview. Every new-client POST, including legacy inline/text and compatibility replay,
+carries the same expected-account header. Older servers ignore this extra header;
+updated servers compare it for every POST, requiring it for staged operations. It is comparison only,
 never authentication; the backend must reject missing/malformed/mismatched staged
 headers before body reads or writes. Account identity comes only from
 `window.__EZIL_BOOT__.user.id`, validated as UUID and normalized to lowercase.
@@ -387,7 +388,10 @@ Confirmed finalize removes the local outbox entry. Definitive staged refusals
 mount or bfcache automatic retry sends a paused entry. Reopening restores an editable
 form. Explicit Send retries it; editing a paused payload gives it a fresh ticket and
 atomically replaces its paused local body. Remove / screenshot opt-out discards the
-corresponding raw local bytes. `account_changed` also pauses the original account's
+corresponding raw local bytes. If screenshot capability is disabled on a later boot,
+queued thumbnails and their original ticket/body remain intact, imports and Edit
+are disabled, and Send is blocked until explicit removal or screenshot opt-out.
+`account_changed` also pauses the original account's
 entry and stops requests; it never transfers the report to another account.
 
 Boots without upload-first, and preexisting inline outbox entries, retain the original

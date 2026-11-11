@@ -231,11 +231,11 @@ export async function screenshot_sha256 (image) {
 
 /** Two-phase Send; raw images stay in the original account's local outbox until final confirmation. */
 async function send_report (body, stagedUploads, account, progress) {
-    const current = () => account_id() === account;
+    const current = () => account !== null && account_id() === account;
     if (!current()) return { status: 0, data: null, accountChanged: true };
     const sent = JSON.parse(body);
     const images = Array.isArray(sent.screenshots) ? sent.screenshots : sent.screenshot ? [sent.screenshot] : [];
-    if (!stagedUploads || !images.length) return post(body, stagedUploads ? account : null);
+    if (!stagedUploads || !images.length) return post(body, account);
     const refs = [];
     for (const [index, image] of images.entries()) {
         if (!current()) return { status: 0, data: null, accountChanged: true };
@@ -527,7 +527,12 @@ export function open_feedback_dialog (_opts) {
     const computer = hasAppContext ? trusted.computerId : currentComputer()?.id;
     let computerId = typeof computer === 'string' && UUID.test(computer) ? computer : null;
     const appContext = Object.freeze({ computerId, ...(hasAppContext ? { appSession: trusted.appSession } : {}) });
-    const screenshots = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackScreenshots === true;
+    const queuedEntry = draft ? read_outbox().find(entry => entry.clientRequestId === clientRequestId) : null;
+    const screenshotsAvailable = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackScreenshots === true;
+    const queuedBody = queuedEntry ? JSON.parse(queuedEntry.body) : null;
+    const hasQueuedImages = !!(queuedBody?.screenshot || queuedBody?.screenshots?.length);
+    // Capability loss never implies consent revocation or discards paused raw images.
+    const screenshots = screenshotsAvailable || hasQueuedImages;
     let stagedUploads = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackStagedUploads === true;
     const advertisedMax = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackScreenshotsMax;
     /** Images this report may carry: 1 unless the server advertises more. With one, a new image replaces the old. */
@@ -553,7 +558,7 @@ export function open_feedback_dialog (_opts) {
                     ${screenshots ? '<label class="ezil-feedback-consent"><input type="checkbox" name="screenshot" checked> Screenshots</label>' : ''}
                 </div>
                 ${screenshots ? `<section class="ezil-feedback-capture" aria-label="Screenshots">
-                    <div class="ezil-feedback-dropzone"><label class="ezil-feedback-upload">Attach images<input type="file" name="screenshotFile" accept="image/png,image/jpeg,image/webp"${imagesMax > 1 ? ' multiple' : ''}></label><span class="ezil-feedback-muted">or drop them here</span></div>
+                    ${screenshotsAvailable ? `<div class="ezil-feedback-dropzone"><label class="ezil-feedback-upload">Attach images<input type="file" name="screenshotFile" accept="image/png,image/jpeg,image/webp"${imagesMax > 1 ? ' multiple' : ''}></label><span class="ezil-feedback-muted">or drop them here</span></div>` : ''}
                     <p class="ezil-feedback-muted" data-role="capture-note" role="status" aria-live="polite" hidden></p>
                     <div class="ezil-feedback-image" hidden><ol class="ezil-feedback-images" data-role="images"></ol></div>
                 </section>` : ''}
@@ -603,7 +608,6 @@ export function open_feedback_dialog (_opts) {
     // (same clientRequestId) instead of becoming a second report.
     let restoredFromQueue = false;
     let errorCode = null;
-    const queuedEntry = draft ? read_outbox().find(entry => entry.clientRequestId === clientRequestId) : null;
     if ( queuedEntry ) {
         try {
             const queuedBody = JSON.parse(queuedEntry.body);
@@ -734,11 +738,12 @@ export function open_feedback_dialog (_opts) {
         render_context();
         // Blank reports are valid; local image preparation and invalid text hold Send.
         submit.disabled = capturing || settling || text.length > DESCRIPTION_MAX || account_id() !== ownerAccount
-            || (stagedUploads && screenshotConsent?.checked && images.some(image => !image.sha256));
+            || (stagedUploads && screenshotConsent?.checked && images.some(image => !image.sha256))
+            || (!screenshotsAvailable && screenshotConsent?.checked && images.length > 0);
     }
 
     function render_scope () {
-        if (form.elements.screenshotFile) form.elements.screenshotFile.disabled = capturing || !can_add();
+        if (form.elements.screenshotFile) form.elements.screenshotFile.disabled = capturing || !screenshotsAvailable || !can_add();
         if (capture_note) capture_note.hidden = !capture_note.textContent;
         dialog.querySelector('[data-role="server-context-preview-note"]').hidden = !diagnostics.checked;
     }
@@ -761,7 +766,7 @@ export function open_feedback_dialog (_opts) {
             remove.type = 'button'; remove.dataset.action = 'remove-screenshot';
             remove.textContent = 'Remove';
             remove.setAttribute('aria-label', images.length > 1 ? `Remove screenshot ${index + 1}` : 'Remove screenshot');
-            edit.disabled = capturing;
+            edit.disabled = capturing || !screenshotsAvailable;
             remove.disabled = capturing;
             // Short actions beside the thumbnail keep several images compact.
             const meta = document.createElement('div');
@@ -881,7 +886,7 @@ export function open_feedback_dialog (_opts) {
         }
     }
     function add_files (files, source) {
-        if (!screenshotConsent || !files.length || sending || sent || closed) return;
+        if (!screenshotsAvailable || !screenshotConsent || !files.length || sending || sent || closed) return;
         if (capturing || settling) { capture_note.textContent = 'Wait for this image to finish, then try again.'; refresh(); return; }
         screenshotConsent.checked = true;
         void import_files(files, source);
@@ -1046,6 +1051,7 @@ export function open_feedback_dialog (_opts) {
             .finally(() => { settling = false; refresh(); });
     }
     refresh();
+    if (!screenshotsAvailable && hasQueuedImages) result.textContent = 'Screenshots are unavailable. Remove them to send without images.';
     if ( waiting ) result.textContent = waiting === 1
         ? 'One earlier report is waiting to be sent. It will go when you are back online.'
         : `${waiting} earlier reports are waiting to be sent. They will go when you are back online.`;
