@@ -67,10 +67,10 @@ bash deploy/aws/mum/rebase-computer.sh verify  --computer "$C"
 Follow `LEGACY-REBASE-OPERATOR-PRESERVATION.md` ("preserve, then stop"). Never delete volumes or snapshots, edit image-job rows, or reinstall an old app.
 - **Refused before reservation:** nothing changed. Fix the evidence or wait for the host to age out, then plan again.
 - **Refused in the helper before the snapshot:** this happens on a listed host, an attached volume, a tag or identity mismatch, or an old helper. The job is failed and the volume is untouched. Investigate any attachment as a possible concurrent writer before anything else.
-- **Releasing that failed job:** while the job is active, every placement read for the computer refuses `image_job_conflict`, and `recover` needs a launch document this job never has. Release it only with the explicit operator cancel:
+- **Releasing that failed job:** while the job is active, placement state changes and enrollment for the computer refuse `image_job_conflict`, and `recover` needs a launch document this job never has. Release it only with the explicit operator cancel:
   ```bash
-  python3 deploy/aws/mum/rebase_computer.py --namespace prd cancel-preparation --computer "$C" --job "$JOB" --check   # proves only
-  python3 deploy/aws/mum/rebase_computer.py --namespace prd cancel-preparation --computer "$C" --job "$JOB" --apply   # cancels
+  bash deploy/aws/mum/rebase-computer.sh --namespace prd cancel-preparation --computer "$C" --job "$JOB" --check   # proves only
+  bash deploy/aws/mum/rebase-computer.sh --namespace prd cancel-preparation --computer "$C" --job "$JOB" --apply   # cancels
   ```
   - **Cancel proves before it writes.** The preparation execution must have FAILED at its first observation with the job's own code. Its complete history must schedule no stop, terminate or snapshot. The source volume must still be free, unattached and this generation's.
   - **`check` writes nothing.** `apply` sets the job `cancelled`, keeping its failure history, and returns the placement to STOPPED with the reservation cleared.
