@@ -29,6 +29,17 @@ const PAGE = `<!doctype html><html><head><meta charset="utf-8"></head>
     <input value="PRIVATE_SECRET" style="position:absolute;left:20px;top:20px;width:200px;height:40px;z-index:6;
       color:#ff0000;background:#ff0000;border:0">
   </div>
+  <!-- A transformed window whose scrolled body holds a private field and a small frame. -->
+  <div style="position:fixed;left:560px;top:400px;width:200px;height:150px;transform:translate(10px,10px);background:#ff00ff">
+    <div id="scroller" style="height:150px;overflow:auto">
+      <div style="position:relative;height:400px">
+        <input value="SCROLLED_SECRET" style="position:absolute;left:10px;top:120px;width:100px;height:40px;
+          color:#ff0000;background:#ff0000;border:0">
+        <iframe srcdoc="<body style='background:#ff0000'></body>" style="position:absolute;left:120px;top:120px;width:60px;height:40px;border:0"></iframe>
+      </div>
+    </div>
+  </div>
+  <script>document.getElementById('scroller').scrollTop = 60;</script>
 </body></html>`;
 
 const types = { '.js': 'text/javascript', '.mjs': 'text/javascript', '.html': 'text/html' };
@@ -60,7 +71,9 @@ try {
         for (let i = 0; i < data.length; i += 4) if (data[i] > 180 && data[i + 1] < 80 && data[i + 2] < 80) red++;
         // Page coordinates: window at (40,30); frame (50..750, 40..560); overlay (340..540, 280..380); field (60..260, 50..90).
         return { width, height, frameCoverage: info.frameCoverage, overlay: at(440, 300), frame: at(150, 500), privateField: at(160, 70),
-            windowEdge: at(45, 35), page: at(10, 10), red };
+            windowEdge: at(45, 35), page: at(10, 10),
+            // Transformed window (570..770, 410..560), scrolled by 60: field at (580..680, 470..510), frame (690..750, 470..510).
+            scrolledField: at(630, 490), scrolledFrame: at(720, 490), scrolledWindow: at(600, 530), red };
     });
     assert.ok(result, 'the snapshot was produced');
     const near = (actual, expected, label) => assert.ok(actual.every((v, i) => Math.abs(v - expected[i]) <= 24), `${label}: got rgb(${actual}), want about rgb(${expected})`);
@@ -74,6 +87,12 @@ try {
     near(result.privateField, [0, 0, 0], 'the private field is covered black');
     assert.equal(result.red, 0, 'no frame or private-field pixel (red) appears anywhere');
     checks++; console.log('PASS no frame document or private field content is captured');
+    near(result.scrolledField, [0, 0, 0], 'a private field in a scrolled, transformed window is covered where it is shown');
+    near(result.scrolledFrame, [128, 128, 128], 'a frame in a scrolled, transformed window is masked where it is shown');
+    near(result.scrolledWindow, [255, 0, 255], 'that window itself stays visible');
+    checks++; console.log('PASS masks follow transformed and scrolled placement');
+    // Well above the form's 10% note threshold: this is the "large embedded app" case. The form still attaches
+    // this image (overlay and all) with one note (feedback-test.mjs, "an embedded app in the window snapshot").
     assert.ok(result.frameCoverage > 0.6 && result.frameCoverage < 0.9, `frame coverage is reported (${result.frameCoverage})`);
     checks++; console.log('PASS frame coverage is reported for the caller');
 } finally {
