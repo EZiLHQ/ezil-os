@@ -61,7 +61,7 @@ import subprocess
 import threading
 import time
 
-from . import canary, desktop, export, guard, storage, terminal_work, tunnel
+from . import canary, desktop, export, guard, standalone_git, storage, terminal_work, tunnel
 from .fsops import DIR_FLAGS, Refused, open_dir_below, write_file_durable_at
 
 LOAD_RE = re.compile(r"^\d+(\.\d+)?$")
@@ -149,6 +149,7 @@ class Agent:
         self.restart_ids = []
         self._load_restart_requests()
         self.export_thread = None             # the one reverse-move export job (export.Job)
+        self.standalone_git = standalone_git.Jobs(cfg, lease, clock=clock)
         self.storage_stop = threading.Event()  # ends the periodic storage sampler (storage.Sampler)
 
     # ---------------------------------------------------------------- control
@@ -198,6 +199,13 @@ class Agent:
             if (set(msg) != export.MESSAGE_KEYS or not export.valid_id(msg.get("moveId"))
                     or not export.valid_id(msg.get("importGeneration"))):
                 return {"ok": False, "error": "export_invalid"}
+        elif op == "standalone-repo-open":
+            if set(msg) != standalone_git.MESSAGE_KEYS or not standalone_git.valid_request(msg.get("request"), now * 1000):
+                return {"ok": False, "error": "standalone_repo_invalid"}
+        elif op == "standalone-repo-open-status":
+            if (set(msg) != standalone_git.STATUS_KEYS or not isinstance(msg.get("jobId"), str)
+                    or not standalone_git.HEX64.fullmatch(msg["jobId"])):
+                return {"ok": False, "error": "standalone_repo_invalid"}
         elif op not in ("presence", "fence", "desktop_status"):
             return {"ok": False, "error": "unknown_op"}
         with self.lock:
@@ -215,6 +223,13 @@ class Agent:
                 return self._accept_restart(msg["requestId"], now)
             if op == "export":
                 return self._accept_export(msg["moveId"], msg["importGeneration"], now)
+            if op == "standalone-repo-open":
+                if (self._host_stopping() or self.restart_request or self.restart_in_progress
+                        or self.export_thread is not None and self.export_thread.is_alive()):
+                    return {"ok": False, "error": "stopping"}
+                return self.standalone_git.start(msg["request"])
+            if op == "standalone-repo-open-status":
+                return self.standalone_git.status(msg["jobId"])
             if op == "stop":
                 self.stop_request = {"kind": "stop", "warn": warn, "reason": str(msg.get("reason", "control_plane"))[:64]}
                 return {"ok": True}
@@ -279,6 +294,8 @@ class Agent:
         is not that: the export's own desktop stop sets it, and its re-POSTs must report."""
         if self._host_stopping():
             return {"ok": False, "error": "stopping"}
+        if getattr(self, "standalone_git", None) is not None and self.standalone_git.active():
+            return {"ok": False, "error": "export_busy"}
         accepted = export.accept(self.cfg, move_id, import_generation, now)
         if accepted == "busy":
             return {"ok": False, "error": "export_busy"}

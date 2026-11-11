@@ -47,6 +47,7 @@ from . import agent as agentmod
 from . import desktop
 from . import export
 from . import fsops
+from . import standalone_git
 from .fsops import Refused
 
 GW_HEADER = "x-ezil-gw"
@@ -83,6 +84,9 @@ MAX_EXPORT_BODY = 1024
 FOLDER_RE = re.compile(r"^/__ezil/control/folder/([0-9a-f]{64})$")
 FOLDER_CL_RE = re.compile(r"[1-9][0-9]{0,3}")
 MAX_FOLDER_BODY = 4096
+STANDALONE_REPO_RE = re.compile(r"^/__ezil/control/standalone-repo-open/([0-9a-f]{64})$")
+STANDALONE_STATUS_RE = re.compile(r"^/__ezil/control/standalone-repo-open-status/([0-9a-f]{64})$")
+
 STREAM_BLOCK = 65536
 # The agent's own refusals of an `export` message (agent.handle): 409 export_invalid. Any other
 # answer that is not ok, an empty one included, is 503 agent_unavailable.
@@ -384,6 +388,11 @@ class Edge:
                 return
             self._agent(client, "restart-desktop", requestId=restart.group(1))
             return
+        repo = STANDALONE_REPO_RE.fullmatch(path)
+        status = STANDALONE_STATUS_RE.fullmatch(path)
+        if repo or status:
+            self._standalone_repo(client, head, repo.group(1) if repo else status.group(1), query, status is not None)
+            return
         m = EXPORT_POST_RE.match(path)
         if m:
             self._export_post(client, head, m.group(1), query)
@@ -504,6 +513,71 @@ class Edge:
             return
         result = fsops.classify_dir_below(os.path.join(self.cfg.dataMount, "workspace"), req["rel"])
         _reply(client, 200, {"ok": True, "result": result})
+
+    # ------------------------------------------------------------ standalone Git, no generic execution
+    def _standalone_repo(self, client, head, identifier, query, status):
+        cl, te = head.get("content-length"), head.get("transfer-encoding")
+        if query or te or head.method != ("GET" if status else "POST"):
+            _reply(client, 400, {"ok": False, "error": "standalone_repo_invalid"})
+            return
+        if status:
+            if cl or head.rest:
+                _reply(client, 400, {"ok": False, "error": "standalone_repo_invalid"})
+                return
+            fields = {"jobId": identifier}
+            op = "standalone-repo-open-status"
+        else:
+            if len(cl) != 1 or not re.fullmatch(r"[1-9][0-9]{0,4}", cl[0]) or int(cl[0]) > standalone_git.MAX_BODY:
+                _reply(client, 400, {"ok": False, "error": "standalone_repo_invalid"})
+                return
+            try:
+                raw, trailing = _recv_exact(client, int(cl[0]), head.rest)
+            except (ValueError, OSError):
+                _reply(client, 400, {"ok": False, "error": "standalone_repo_invalid"})
+                return
+            if trailing or not hmac.compare_digest(hashlib.sha256(raw).hexdigest(), identifier):
+                _reply(client, 400, {"ok": False, "error": "standalone_repo_invalid"})
+                return
+            req = standalone_git.parse_request(raw, self.clock() * 1000)
+            if req is None:
+                _reply(client, 400, {"ok": False, "error": "standalone_repo_invalid"})
+                return
+            fields, op = {"request": req}, "standalone-repo-open"
+        try:
+            result = self.seq.send(op, **fields)
+        except (OSError, ValueError, AttributeError):
+            result = None
+        if not isinstance(result, dict) or result.get("ok") is not True:
+            error = result.get("error") if isinstance(result, dict) else None
+            known = {"workspace_busy", "runtime_not_running", "job_replayed", "job_unknown",
+                     "standalone_repo_invalid", "stopping"}
+            allowed = isinstance(error, str) and error in known
+            _reply(client, 409 if allowed else 503,
+                   {"ok": False, "error": error if allowed else "agent_unavailable"})
+            return
+        # Rebuild the closed envelope; never forward arbitrary agent fields.
+        state = result.get("state")
+        valid = state in ("running", "done") and set(result) == (
+            {"ok", "state", "result"} if status and state == "done" else {"ok", "state"})
+        answer = {"ok": True, "state": state}
+        if valid and status and state == "done":
+            item = result["result"]
+            valid = isinstance(item, dict)
+            if valid and item.get("ok") is True:
+                valid = (set(item) == {"ok", "folder", "status"} and isinstance(item["folder"], str)
+                         and re.fullmatch(r"/workspace/projects/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", item["folder"])
+                         and item["status"] in ("cloned", "fetched"))
+            elif valid:
+                valid = (set(item) == {"ok", "error"} and item.get("ok") is False
+                         and isinstance(item["error"], str) and item["error"] in {
+                             "repo_open_failed", "repo_open_timeout", "repo_open_git_missing",
+                             "repo_open_token_expired", "runtime_not_running"})
+            if valid:
+                answer["result"] = item
+        if not valid:
+            _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
+            return
+        _reply(client, 200 if status else 202, answer)
 
     # ------------------------------------------------------------ reverse move export (§2.2)
     def _export_post(self, client, head, digest, query):

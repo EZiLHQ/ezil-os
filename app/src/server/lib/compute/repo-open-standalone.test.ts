@@ -1,5 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+vi.mock('server-only', () => ({}));
+
 import { requestRepoOpen } from './repo-open';
 import type { ControlTarget } from './aws-control-auth';
 import type { PrivateGitPacket } from '@/server/git/private-packet';
@@ -41,5 +43,62 @@ describe('standalone OS to Worker transport', () => {
         expect(await requestRepoOpen('https://worker.example', 'secret', aws, computer, request, deps)).toEqual({ ok: false, errorCode: 'repo_open_unsupported_provider' });
         expect(fetcher).not.toHaveBeenCalled();
         expect(JSON.stringify(warn.mock.calls)).not.toContain(TOKEN);
+    });
+});
+
+describe('AWS standalone OS transport capability', () => {
+    const sandboxName = 'guac-1111111111114111-2222222222224222';
+    const target: ControlTarget = { sandboxName, auth: { kind: 'v2', claims: {
+        sandboxId: sandboxName, computerId: computer.computerId, userId: computer.userId,
+        provider: 'aws-ec2', store: '', generation: 2, leaseEpoch: 4,
+    } } };
+    const now = Date.parse('2026-11-11T12:00:00Z');
+    const currentRequest = () => {
+        const privatePacket = { ...packet, git: { ...packet.git, expiresAt: new Date(now + 240_000).toISOString() } };
+        return { ...request, privatePacket, git: { ...request.git, expiresAt: privatePacket.git.expiresAt } };
+    };
+    it('sends the exact signed packet to AWS only when enabled and revalidates before and after', async () => {
+        const revalidateTarget = vi.fn(async () => target);
+        const fetcher = vi.fn(async (_url: URL, init: RequestInit) => {
+            expect(JSON.parse(String(init.body))).toEqual({ repositoryId: CHECKOUT, privatePacket: currentRequest().privatePacket, timeoutMs: 60_000 });
+            expect(new Headers(init.headers).get('x-ezil-auth')).toMatch(/^v2\./);
+            return Response.json({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'cloned' });
+        });
+        expect(await requestRepoOpen('https://worker.example', 'secret', target, computer, currentRequest(),
+            { fetch: fetcher as unknown as typeof fetch, now: () => now, awsStandaloneEnabled: true, revalidateTarget }))
+            .toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}` });
+        expect(revalidateTarget).toHaveBeenCalledTimes(2);
+        expect(fetcher).toHaveBeenCalledOnce();
+    });
+    it('refuses cancellation that arrives during final placement revalidation', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const abort = new AbortController();
+        let checks = 0;
+        const result = await requestRepoOpen('https://worker.example', 'secret', target, computer, currentRequest(), {
+            now: () => now, awsStandaloneEnabled: true, signal: abort.signal,
+            revalidateTarget: async () => { if (++checks === 2) abort.abort(); return target; },
+            fetch: (async () => Response.json({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'cloned' })) as typeof fetch,
+        });
+        expect(result.ok).toBe(false);
+    });
+    it('rejects missing capability, missing revalidation, moved placement, and nonclosed results', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const fetcher = vi.fn(async () => Response.json({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'cloned' }));
+        const deps = { fetch: fetcher as unknown as typeof fetch, now: () => now, awsStandaloneEnabled: true };
+        expect((await requestRepoOpen('https://worker.example', 'secret', target, computer, currentRequest(),
+            { ...deps, awsStandaloneEnabled: false })).ok).toBe(false);
+        expect((await requestRepoOpen('https://worker.example', 'secret', target, computer, currentRequest(), deps)).ok).toBe(false);
+        expect(fetcher).not.toHaveBeenCalled();
+        let count = 0;
+        const moved = { ...target, auth: { kind: 'v2' as const, claims: { ...(target.auth.kind === 'v2' ? target.auth.claims : {}), leaseEpoch: 5 } } } as ControlTarget;
+        expect((await requestRepoOpen('https://worker.example', 'secret', target, computer, currentRequest(), {
+            ...deps, revalidateTarget: async () => ++count === 1 ? target : moved,
+        })).ok).toBe(false);
+        for (const result of [{ ok: true, folder: `/workspace/projects/${CHECKOUT}` },
+            { ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'created' },
+            { ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'cloned', token: TOKEN }]) {
+            expect((await requestRepoOpen('https://worker.example', 'secret', target, computer, currentRequest(),
+                { ...deps, revalidateTarget: async () => target, fetch: (async () => Response.json(result)) as typeof fetch })).ok).toBe(false);
+        }
     });
 });
