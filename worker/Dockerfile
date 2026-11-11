@@ -293,6 +293,7 @@ RUN node -e "const j=require('/usr/lib/code-server/lib/vscode/extensions/copilot
 COPY copilot-chat/patch-copilot-chat.sh /usr/local/lib/ezil/patch-copilot-chat.sh
 COPY copilot-chat/PATCHES.md /usr/local/lib/ezil/PATCHES.md
 COPY copilot-chat/chat-bridge.js /usr/local/lib/ezil/chat-bridge.js
+COPY copilot-chat/session-effort-isolation.js /usr/local/lib/ezil/session-effort-isolation.js
 RUN chmod 0755 /usr/local/lib/ezil/patch-copilot-chat.sh \
   && /usr/local/lib/ezil/patch-copilot-chat.sh /usr/lib/code-server/lib/vscode \
   && /usr/local/lib/ezil/patch-copilot-chat.sh --verify /usr/lib/code-server/lib/vscode

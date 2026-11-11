@@ -8,9 +8,8 @@
  * Delivery is at most once: a send whose outcome is unknown is reported "uncertain", never retried.
  * Protocol 2 adds three controls, under the same fence, command ids and deadlines: the models the session's
  * own picker offers (`models`), a genuinely new local chat opened in an editor tab (`create`), and a model
- * change for one open, idle session (`setModel`), each read back from the runtime after the change. Effort and
- * mode are never set here: in 4.141.0 a third-party model's configuration is per model for the whole window,
- * not per session.
+ * change for one open, idle session (`setModel`), each read back from the runtime after the change.
+ * Protocol 3 effort requires the pinned native session-isolation hook and Agent mode. Mode is never set here.
  * This window's memory alone cannot guarantee that across eviction or restart; the end-to-end guarantee is
  * OS's (each operation is handed out again only after a definite "not sent" for its previous attempt).
  * The owner epoch only ORDERS callers inside this window (any extension here could call the command);
@@ -181,6 +180,11 @@
         if (stale) { ref.dispose(); return stale; }
         if (now() > deadline) { ref.dispose(); return { ok: true, status: 'expired' }; }
         const options = sendOptions(widget);
+        if (options.userSelectedModelConfiguration?.reasoningEffort !== undefined
+            && widget.input?.currentModeKind !== 'agent') {
+            ref.dispose();
+            return { ok: true, status: 'rejected', reason: 'effort_mode_unsupported' };
+        }
         const record = {
             commandId: req.commandId, key, resource: session.resource, text: req.text, status: 'uncertain',
             requestId: null, response: null, mode: (widget.input && widget.input.currentModeKind) || null,
@@ -247,7 +251,7 @@
     function effortSchema(input, model) {
         const schema = model.metadata.configurationSchema?.properties?.reasoningEffort;
         const values = schema?.enum;
-        const usable = typeof input.restoreModelConfiguration === 'function' && typeof input.getModelConfiguration === 'function'
+        const usable = input.currentModeKind === 'agent' && typeof input._ezilSessionEffortV1 === 'function' && typeof input.restoreModelConfiguration === 'function' && typeof input.getModelConfiguration === 'function'
             && typeof input._inputModel?.state?.get === 'function' && input._inputModelSessionResource?.toString() === input._currentSessionKey
             && typeof input.flushInputStateToModel === 'function' && typeof input.getCurrentInputState === 'function' && schema?.type === 'string' && Array.isArray(values) && values.length > 0 && values.length <= 16
             && values.every(v => typeof v === 'string' && EFFORT.test(v)) && new Set(values).size === values.length;
@@ -266,8 +270,7 @@
         const id = currentModel(widget);
         if (!effortAllowed(widget, id, effort)) return false;
         const input = widget.input;
-        input.restoreModelConfiguration(id, { ...(input.getModelConfiguration(id) || {}), reasoningEffort: effort }, false);
-        input.flushInputStateToModel();
+        if (!input._ezilSessionEffortV1(widget.viewModel?.sessionResource?.toString(), id, effort)) return false;
         // Both the live input and its persisted session input state must agree.
         return currentEffort(widget) === effort && input.getCurrentInputState?.().modelConfiguration?.reasoningEffort === effort
             && input._inputModelSessionResource?.toString() === widget.viewModel?.sessionResource?.toString()
@@ -324,6 +327,7 @@
             const stale = fenced(req);
             if (stale) return stale;
             if (now() > deadline) return { ok: true, status: 'expired' };
+            if (req.effort !== undefined && someWidget()?.input?.currentModeKind !== 'agent') return { ok: true, status: 'rejected', reason: 'effort_mode_unsupported' };
             if (wanted && !pickerModels(someWidget()).some((m) => m.id === wanted)) return { ok: true, status: 'rejected', reason: 'model_not_offered' };
             if (!effortAllowed(someWidget(), wanted || currentModel(someWidget()), req.effort)) return { ok: true, status: 'rejected', reason: 'effort_unavailable' };
             const record = { commandId: req.commandId, kind: 'create', request: selection, key: null, resource: null, status: 'uncertain',
@@ -356,6 +360,11 @@
                 return controlView(record);
             }
             if (!widget) { record.status = 'failed'; record.reason = 'not_opened'; return controlView(record); }
+            if (req.effort !== undefined && (widget.input?.currentModeKind !== 'agent' || typeof widget.input?._ezilSessionEffortV1 !== 'function')) {
+                record.reason = widget.input?.currentModeKind !== 'agent' ? 'created_effort_mode_unsupported' : 'created_effort_isolation_unavailable';
+                record.model = currentModel(widget); record.requestCount = model.getRequests().length; record.observedAt = now();
+                return controlView(record);
+            }
             const applied = (wanted ? selectModel(widget, wanted) : true) && selectEffort(widget, req.effort);
             record.model = currentModel(widget);
             record.effort = currentEffort(widget);
@@ -393,6 +402,7 @@
             if (!model) return { ok: true, status: 'not_open' };
             const busy = busyState(model);
             if (busy.inProgress || busy.needsInput || busy.blocked || busy.pending > 0) return { ok: true, status: 'busy' };
+            if (req.effort !== undefined && widget.input?.currentModeKind !== 'agent') return { ok: true, status: 'rejected', reason: 'effort_mode_unsupported' };
             if (req.model !== undefined && !pickerModels(widget).some((m) => m.id === req.model)) return { ok: true, status: 'rejected', reason: 'model_not_offered' };
             if (now() > deadline) return { ok: true, status: 'expired' };
             if (!effortAllowed(widget, req.model ?? currentModel(widget), req.effort)) return { ok: true, status: 'rejected', reason: 'effort_unavailable' };

@@ -715,3 +715,49 @@ bypasses the primary provenance producer and remains excluded. Regression tests
 assert those real pinned source anchors and compose actual producer-expression
 output into the actual endpoint-options expression for low/high. Actual v6
 acceptance remains pending; v4/v5 were failures, despite passing source tests.
+
+### Native session effort isolation v1 (clean v7 regression)
+
+Clean v7 began with null configured/default efforts, then A-low/B-high succeeded
+on the wire and C without requested effort inherited low. `restore(...,false)`
+alone does not isolate an empty chat: configuration change fires native input
+sync, which writes the whole input to shared `chat.untitledInputState`. Native
+conversation restoration also used the default persist=true model bucket path.
+
+`session-effort-isolation.js` is injected into the pinned workbench, with seven
+exact-count anchors: helper, input hook, shared draft projection, current-state
+annotation, conversation preparation, restoration callback and manual selection.
+The hook/JSON marker contract is in `docs/proposals/native-effort-isolation-v1.md`.
+The native session InputModel.toJSON and N4i import preserve contrib and selected
+model configuration; marker survives that path. Invalid/cross-resource/model
+provenance is not promoted to shared defaults. Native contrib merging requires an
+undefined tombstone when the current value is no longer marked. Manual picker
+selection explicitly retires provenance, including choosing the same value.
+
+Shared draft projection changes only bridge-marked reasoningEffort (back to its
+pre-override value, or absent) and removes the marker. The owning session, picker
+and request use the actual native selected value. Marked native restore callbacks,
+including deferred model reconciliation, use persist=false. The same callback
+uses false for all EZiL-vendor session/history restores, including legacy unmarked
+state; explicit manual preference setters and other vendors remain unchanged. No global setter,
+storage clearing, mode forcing or outgoing request override is introduced.
+Docker must copy the helper alongside the patch script; this is source packaging
+only, no image build was performed here.
+
+Explicit bridge effort is Agent-only. Unsupported/unknown modes reject configure
+before selecting model/effort and reject sends carrying effort before sendRequest.
+Old Code without the hook does not advertise effort; model-only controls remain.
+Post-create unsupported mode/hook returns uncertain, retains resource/command in
+workbench, and does not recreate on duplicate. The backend's existing terminal
+uncertain behavior prevents redelivery; it does not expose a successful created
+session association for that outcome. No new wire fields or migration are added.
+Computer-level catalog snapshots cannot prove a target chat's current mode;
+request-time admission is authoritative. No Ask/Plan effort support claim.
+
+Source tests execute pinned native configuration/sync/JSON methods with synthetic
+services and show old draft/bucket leakage then corrected isolation. They are not
+running native UI acceptance; root must run clean v8 and close/reopen/full reload,
+strict A-low/B-high/C-no-override wire, mode/approval and manual preference checks.
+Rollback to old Code is NOT qualified for marked saved sessions: old readers
+ignore the marker and may promote restored values. Drain/quarantine test profiles;
+do not claim seamless old-Code restoration of newly marked effort sessions.

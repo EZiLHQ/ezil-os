@@ -8,6 +8,7 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, 'chat-bridge.js'), 'utf8');
 // Same realm as the assertions (a separate vm context would give results foreign prototypes).
 const create = vm.runInThisContext(source, { filename: 'chat-bridge.js' });
+const isolation = vm.runInThisContext(fs.readFileSync(path.join(__dirname, 'session-effort-isolation.js'), 'utf8'));
 
 const uri = (id) => ({ id, toString: () => `vscode-chat-session://local/${id}` });
 const obs = (value) => ({ value, get() { return this.value; } });
@@ -27,7 +28,7 @@ const PICKER = [
 ];
 
 function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, now = () => 1700000000000, acquireDelay = null, listDelay = null, openDelay = null, used = true,
-    picker = PICKER, startThrows = false, openFails = false, sticky = true, listEmpty = true } = {}) {
+    mode = 'ask', isolationHook = true, picker = PICKER, startThrows = false, openFails = false, sticky = true, listEmpty = true } = {}) {
     const models = new Map();
     const loaded = new Map();
     const calls = { send: [], cancel: [], acquire: 0, disposed: 0, started: 0, opened: [], switched: [] };
@@ -108,7 +109,7 @@ function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, no
             _lockedAgent: lockedAgent ? { id: 'agent-host' } : undefined,
             _lastSelectedAgent: { id: 'ezil', capabilities: { images: true } },
             input: {
-                currentModeKind: 'ask', currentModeInfo: { kind: 'ask', isBuiltin: true }, currentLanguageModel: 'ezil/kimi-k2',
+                currentModeKind: mode, currentModeInfo: { kind: mode, isBuiltin: true }, currentLanguageModel: 'ezil/kimi-k2',
                 _inputModel: { state: { get: () => models.get(id).inputState } },
                 _inputModelSessionResource: uri(id), _currentSessionKey: uri(id).toString(),
                 getModels: () => picker,
@@ -117,7 +118,7 @@ function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, no
                     configurations.set(modelId, structuredClone(config));
                 },
                 getModelConfiguration(modelId) { return configurations.get(modelId); },
-                getCurrentInputState() { return { modelConfiguration: this.getModelConfiguration(this.currentLanguageModel) }; },
+                getCurrentInputState() { return isolation.annotate(this, { selectedModel: { identifier: this.currentLanguageModel }, contrib: {}, modelConfiguration: this.getModelConfiguration(this.currentLanguageModel) }); },
                 flushInputStateToModel() { models.get(id).inputState = structuredClone(this.getCurrentInputState()); },
                 setModelConfiguration() { throw new Error('global preference setter forbidden'); },
                 switchModelByIdentifier(identifier, persist, userAction) {
@@ -131,6 +132,7 @@ function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, no
             getModeRequestOptions: () => ({ modeInfo: { kind: 'ask', isBuiltin: true }, userSelectedTools: { get: () => ({}) } }),
             _getInstructionRouting: () => ({ enabledTools: undefined }),
         };
+        if (isolationHook) w.input._ezilSessionEffortV1 = function(resource, model, effort) { return isolation.set(this, resource, model, effort); };
         widgets.set(id, w);
         return w;
     };

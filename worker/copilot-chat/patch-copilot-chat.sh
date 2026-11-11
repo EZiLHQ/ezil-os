@@ -253,6 +253,23 @@ R_BRIDGE_CALL='this.updateSessionsControlVisibility();try{this._ezilChatBridge()
 # What [chat-header] leaves in workbench.js once [chat-bridge] has extended it (literal split/join, no shell substitution).
 R_CHAT_HEADER_FINAL="$(node -e 'const [s,a1,r1,a2,r2]=process.argv.slice(1);process.stdout.write(s.split(a1).join(r1).split(a2).join(r2))' "$R_CHAT_HEADER" "$A_BRIDGE_CALL" "$R_BRIDGE_CALL" "$A_BRIDGE_METHOD" "$R_BRIDGE_METHOD")"
 
+# Native session-only effort hooks: exact pinned methods, no shared preference writes.
+ISOLATION_JS="$(cat "$(dirname "$0")/session-effort-isolation.js")"
+A_ISOLATION_HELPER='function Tcn(s){'
+R_ISOLATION_HELPER="var ezilSessionEffortV1=$ISOLATION_JS;function Tcn(s){"
+A_ISOLATION_API='restoreModelConfiguration(e,t,i=!0){t&&this._modelConfigStore.restoreModelConfiguration(e,t,i)}'
+R_ISOLATION_API='_ezilSessionEffortV1(resource,model,effort){return ezilSessionEffortV1.set(this,resource,model,effort)}restoreModelConfiguration(e,t,i=!0){t&&this._modelConfigStore.restoreModelConfiguration(e,t,i)}'
+A_ISOLATION_DRAFT='this._chatSessionIsEmpty&&this._emptyInputState.set(e,void 0);'
+R_ISOLATION_DRAFT='this._chatSessionIsEmpty&&this._emptyInputState.set(ezilSessionEffortV1.draft(this,e),void 0);'
+A_ISOLATION_STATE='n.getInputState?.(i.contrib);return i}_getAriaLabel()'
+R_ISOLATION_STATE='n.getInputState?.(i.contrib);return ezilSessionEffortV1.annotate(this,i)}_getAriaLabel()'
+A_ISOLATION_PREPARE='_syncFromModel(e,t){if(!this._isSyncingToOrFromInputModel)try{if(this._isSyncingToOrFromInputModel=!0,'
+R_ISOLATION_PREPARE='_syncFromModel(e,t){if(!this._isSyncingToOrFromInputModel)try{e=ezilSessionEffortV1.prepare(this,e,t);if(this._isSyncingToOrFromInputModel=!0,'
+A_ISOLATION_MANUAL='this._modelConfigStore.onDidSelectConfiguration(ho=>{let fo='
+R_ISOLATION_MANUAL='this._modelConfigStore.onDidSelectConfiguration(ho=>{this._ezilSessionEffortMarker=void 0;let fo='
+A_ISOLATION_RESTORE='restoreModelConfiguration:(ho,fo)=>this.restoreModelConfiguration(ho,fo),'
+R_ISOLATION_RESTORE='restoreModelConfiguration:(ho,fo)=>ezilSessionEffortV1.restore(this,ho,fo),'
+
 # Part 2 — identity in the system prompt (extension.js)
 A_IDENT='When asked for your name, you must respond with "GitHub Copilot".'
 R_IDENT='You are EZiL Chat, an AI coding assistant. When asked for your name, you must respond with "EZiL Chat".'
@@ -371,6 +388,13 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch picker-locked-select "$WB" 1 "$A_PICKER_LOCKED_SELECT" "$R_PICKER_LOCKED_SELECT"
   patch picker-locked-configure "$WB" 1 "$A_PICKER_LOCKED_CONFIGURE" "$R_PICKER_LOCKED_CONFIGURE"
   patch ai-entry "$WB" 1 "$A_AI_ENTRY" "$R_AI_ENTRY"
+  patch session-effort-helper "$WB" 1 "$A_ISOLATION_HELPER" "$R_ISOLATION_HELPER"
+  patch session-effort-api "$WB" 1 "$A_ISOLATION_API" "$R_ISOLATION_API"
+  patch session-effort-draft "$WB" 1 "$A_ISOLATION_DRAFT" "$R_ISOLATION_DRAFT"
+  patch session-effort-state "$WB" 1 "$A_ISOLATION_STATE" "$R_ISOLATION_STATE"
+  patch session-effort-prepare "$WB" 1 "$A_ISOLATION_PREPARE" "$R_ISOLATION_PREPARE"
+  patch session-effort-manual "$WB" 1 "$A_ISOLATION_MANUAL" "$R_ISOLATION_MANUAL"
+  patch session-effort-restore "$WB" 1 "$A_ISOLATION_RESTORE" "$R_ISOLATION_RESTORE"
   patch ezil-effort-context "$EXT" 1 "$A_EZIL_EFFORT_CONTEXT" "$R_EZIL_EFFORT_CONTEXT"
   patch ezil-effort-argument "$EXT" 1 "$A_EZIL_EFFORT_ARGUMENT" "$R_EZIL_EFFORT_ARGUMENT"
   patch ezil-request-effort "$EXT" 1 "$A_EZIL_EFFORT" "$R_EZIL_EFFORT"
@@ -545,3 +569,11 @@ grep -q "Copyright (C) Microsoft Corporation" "$WB"
 grep -q "Copyright (C) Microsoft Corporation" "$SERVER"
 echo "patch-copilot-chat: gate ok [Microsoft copyright headers intact]"
 echo "patch-copilot-chat: all gates passed"
+
+gate session-effort-api "$WB" 1 "$A_ISOLATION_API"; gate session-effort-api "$WB" 1 "$R_ISOLATION_API"
+gate session-effort-draft "$WB" 0 "$A_ISOLATION_DRAFT"; gate session-effort-draft "$WB" 1 "$R_ISOLATION_DRAFT"
+gate session-effort-state "$WB" 0 "$A_ISOLATION_STATE"; gate session-effort-state "$WB" 1 "$R_ISOLATION_STATE"
+gate session-effort-prepare "$WB" 0 "$A_ISOLATION_PREPARE"; gate session-effort-prepare "$WB" 1 "$R_ISOLATION_PREPARE"
+gate session-effort-restore "$WB" 0 "$A_ISOLATION_RESTORE"; gate session-effort-restore "$WB" 1 "$R_ISOLATION_RESTORE"
+gate session-effort-helper "$WB" 1 "$R_ISOLATION_HELPER"
+gate session-effort-manual "$WB" 0 "$A_ISOLATION_MANUAL"; gate session-effort-manual "$WB" 1 "$R_ISOLATION_MANUAL"

@@ -22,7 +22,10 @@ and validate conversation restoration. Shared projection removes the marker and
 replaces only the marked reasoningEffort with its prior value (or omits that key
 when absent); all other fields survive. Session state keeps actual selected effort.
 All matching marked restoration uses persistence=false, including deferred model
-restoration. Invalid resource/model provenance cannot promote effort into defaults.
+restoration. The native controller restore callback also uses false for EZiL
+metadata vendor sessions without a marker; history restore is not a manual
+preference selection. Other vendors and explicit manual preference setters remain
+unchanged. The marker conveys context provenance only, never authorization. Invalid resource/model provenance cannot promote effort into defaults.
 Manual selections differing from the marker are not claimed as bridge overrides.
 
 Configure explicit effort refuses unsupported/unknown modes before model or input

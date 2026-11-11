@@ -511,7 +511,7 @@ test('protocol3 effort is local to two chats, flushed, read back and carried to 
     const { PICKER } = require('./chat-bridge-fake.cjs');
     const picker = structuredClone(PICKER);
     picker[0].metadata.configurationSchema = { properties: { reasoningEffort: { type: 'string', enum: ['low', 'high'] } } };
-    const w = world({ open: ['s1', 's2'], picker });
+    const w = world({ mode: 'agent', open: ['s1', 's2'], picker });
     await claimed(w);
     for (const [n, id, effort] of [[1, 's1', 'low'], [2, 's2', 'high']]) {
         const res = await control(w, 'setModel', n, { sessionResource: `vscode-chat-session://local/${id}`, effort });
@@ -524,7 +524,7 @@ test('protocol3 effort is local to two chats, flushed, read back and carried to 
     const sent = await submit(w, 3);
     assert.equal(sent.selectedEffort, 'low');
     assert.equal(w.calls.send[0].options.userSelectedModelConfiguration.reasoningEffort, 'low');
-    assert.equal(w.calls.send[0].options.modeInfo.kind, 'ask');
+    assert.equal(w.calls.send[0].options.modeInfo.kind, 'agent');
     w.models.get('s1').lastRequest.response.finish(false);
     assert.equal(w.widget('s2').input.getModelConfiguration('ezil/kimi-k2').reasoningEffort, 'high');
 });
@@ -533,7 +533,7 @@ test('effort refuses missing capability, changed keys, busy sessions and failed 
     const { PICKER } = require('./chat-bridge-fake.cjs');
     const picker = structuredClone(PICKER);
     picker[0].metadata.configurationSchema = { properties: { reasoningEffort: { type: 'string', enum: ['low', 'high'] } } };
-    const w = world({ picker }); await claimed(w);
+    const w = world({ mode: 'agent', picker }); await claimed(w);
     const sessionResource = 'vscode-chat-session://local/s1';
     assert.equal((await control(w, 'setModel', 1, { sessionResource, effort: 'max' })).reason, 'effort_unavailable');
     assert.equal((await control(w, 'setModel', 2, { sessionResource, effort: 'low' })).status, 'applied');
@@ -543,7 +543,7 @@ test('effort refuses missing capability, changed keys, busy sessions and failed 
     w.models.get('s1').requestInProgress.value = false;
     w.widget('s1').input.getCurrentInputState = () => ({});
     assert.equal((await control(w, 'setModel', 4, { sessionResource, effort: 'high' })).status, 'uncertain');
-    const old = world(); await claimed(old);
+    const old = world({mode:'agent'}); await claimed(old);
     assert.equal((await control(old, 'setModel', 1, { sessionResource, effort: 'high' })).reason, 'effort_unavailable');
 });
 
@@ -565,7 +565,7 @@ test('missing or mismatched native session input binding never advertises effort
     const picker=structuredClone(PICKER);
     picker[0].metadata.configurationSchema={properties:{reasoningEffort:{type:'string',enum:['low']}}};
     for(const missing of [true,false]) {
-        const w=world({picker});await claimed(w);
+        const w=world({picker,mode:'agent'});await claimed(w);
         if(missing) w.widget('s1').input._inputModel=undefined;
         else w.widget('s1').input._inputModelSessionResource=uri('s2');
         const rows=(await w.bridge.handle({op:'models',...OWNER})).models;
@@ -591,4 +591,32 @@ for (const protocol of [undefined, 2, 3]) test(`model mismatch preserves negotia
         assert.equal(Object.hasOwn(made, 'effort'), false);
         assert.equal(Object.hasOwn(changed, 'effort'), false);
     }
+});
+
+for (const mode of ['ask', 'plan', undefined]) test(`explicit effort refuses unsupported mode ${mode} before mutation/send`, async () => {
+    const {PICKER} = require('./chat-bridge-fake.cjs');
+    const picker=structuredClone(PICKER);picker[0].metadata.configurationSchema={properties:{reasoningEffort:{type:'string',enum:['low']}}};
+    const w=world({picker});await claimed(w);w.widget('s1').input.currentModeKind=mode;
+    const res=await control(w,'setModel',801,{sessionResource:'vscode-chat-session://local/s1',model:'ezil/qwen',effort:'low'});
+    assert.equal(res.reason,'effort_mode_unsupported');assert.equal(w.calls.switched.length,0);assert.equal(w.models.get('s1').inputState,undefined);
+    w.widget('s1').input.restoreModelConfiguration('ezil/kimi-k2',{reasoningEffort:'low'},false);
+    assert.equal((await submit(w,802)).reason,'effort_mode_unsupported');assert.equal(w.calls.send.length,0);
+});
+test('old native input without isolation hook is model-only, never advertises or applies effort',async()=>{
+    const {PICKER}=require('./chat-bridge-fake.cjs');const picker=structuredClone(PICKER);
+    picker[0].metadata.configurationSchema={properties:{reasoningEffort:{type:'string',enum:['low']}}};
+    const w=world({picker,mode:'agent',isolationHook:false});await claimed(w);
+    assert.deepEqual((await w.bridge.handle({op:'models',...OWNER})).models[0].efforts,[]);
+    assert.equal((await control(w,'setModel',803,{sessionResource:'vscode-chat-session://local/s1',effort:'low',model:'ezil/qwen'})).status,'rejected');
+    assert.equal(w.calls.switched.length,0);
+    assert.equal((await control(w,'setModel',804,{sessionResource:'vscode-chat-session://local/s1',model:'ezil/qwen'})).status,'applied');
+});
+test('new actual widget unsupported mode leaves one empty identity, uncertain and never recreates on retry',async()=>{
+    const {PICKER}=require('./chat-bridge-fake.cjs');const picker=structuredClone(PICKER);
+    picker[0].metadata.configurationSchema={properties:{reasoningEffort:{type:'string',enum:['low']}}};
+    const w=world({picker,mode:'agent',openDelay:async()=>{w.widget('new1').input.currentModeKind='ask';}});await claimed(w);
+    const first=await control(w,'create',805,{model:'ezil/kimi-k2',effort:'low'});
+    assert.equal(first.status,'uncertain');assert.equal(first.reason,'created_effort_mode_unsupported');assert.ok(first.sessionResource);
+    assert.equal((await control(w,'create',805,{model:'ezil/kimi-k2',effort:'low'})).sessionResource,first.sessionResource);
+    assert.equal(w.calls.started,1);assert.equal(w.calls.switched.length,0);assert.equal(w.calls.send.length,0);
 });
