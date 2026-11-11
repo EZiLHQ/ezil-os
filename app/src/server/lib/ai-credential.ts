@@ -105,7 +105,8 @@ export type AiCredentialPushResult =
  *
  * `includedModels` travels in the same signed body: the models the owner's plan
  * includes (`billing/v3/ai-models.ts`; `null` = every model). Left out when
- * `undefined` (the plan could not be read), so the Worker keeps its list.
+ * `undefined` (the plan could not be read), so the Worker keeps its list. `creditsPending` is a separate trusted
+ * owner receipt answer; an unreadable answer is omitted, preserving the stored previous answer.
  */
 export async function pushAiCredential(
     config: CloudflareGuacamoleConfig,
@@ -114,12 +115,14 @@ export async function pushAiCredential(
     accessToken: string | null,
     fetchImpl: typeof fetch = fetch,
     includedModels?: readonly string[] | null,
+    creditsPending?: boolean,
 ): Promise<AiCredentialPushResult> {
     if (!config.isConfigured || !hmacSecret) return { ok: false, skipped: 'not_configured' };
     if (accessToken === null) return { ok: false, skipped: 'no_session' };
     if (readAccessTokenClaims(accessToken)?.ezilRole == null) return { ok: false, skipped: 'no_ezil_role' };
 
-    const body = JSON.stringify(includedModels === undefined ? { accessToken } : { accessToken, includedModels });
+    const body = JSON.stringify({ accessToken, ...(includedModels === undefined ? {} : { includedModels }),
+        ...(creditsPending === undefined ? {} : { creditsPending }) });
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/ai-credential`;
     try {
         const res = await fetchImpl(endpoint, {
@@ -170,13 +173,18 @@ export async function syncAiCredential(params: {
     supabase: () => Promise<SessionSource>;
     fetchImpl?: typeof fetch;
     includedModels?: () => Promise<readonly string[] | null | undefined>;
+    /** Trusted owner-scoped receipt read; undefined or a failed read omits the field. */
+    creditsPending?: () => Promise<boolean | undefined>;
 }): Promise<AiCredentialPushResult> {
     try {
         if (!params.config.isConfigured || !params.hmacSecret) return { ok: false, skipped: 'not_configured' };
         const token = await currentAccessToken(params.userId, params.headers, await params.supabase());
-        const models = token !== null && readAccessTokenClaims(token)?.ezilRole != null && params.includedModels
-            ? await params.includedModels().catch(() => undefined) : undefined;
-        return await pushAiCredential(params.config, params.hmacSecret, params.sandboxName, token, params.fetchImpl, models);
+        const canPush = token !== null && readAccessTokenClaims(token)?.ezilRole != null;
+        const [models, pending] = await Promise.all([
+            canPush && params.includedModels ? params.includedModels().catch(() => undefined) : undefined,
+            canPush && params.creditsPending ? Promise.resolve().then(() => params.creditsPending!()).catch(() => undefined) : undefined,
+        ]);
+        return await pushAiCredential(params.config, params.hmacSecret, params.sandboxName, token, params.fetchImpl, models, pending);
     } catch {
         console.warn('[ai-credential] sync failed (non-fatal)', {
             sandboxName: params.sandboxName,
@@ -215,7 +223,7 @@ export type AiPlanPushResult = { ok: true; stored: boolean } | { ok: false; erro
 /**
  * The plan alone, signed exactly as a credential push but with no token: the Worker stores the list by its signed
  * time and never touches the credential (`putAiModelAccess`). `now` is when the plan was read, so a browser beat that
- * read it later wins. Never throws and never logs the list.
+ * read it later wins. Optional pending-credit metadata uses the same signed body. Never throws and never logs the list.
  */
 export async function pushAiPlan(
     config: CloudflareGuacamoleConfig,
@@ -225,8 +233,9 @@ export async function pushAiPlan(
     signal: AbortSignal,
     fetchImpl: typeof fetch = fetch,
     now: number = Date.now(),
+    creditsPending?: boolean,
 ): Promise<AiPlanPushResult> {
-    const body = JSON.stringify({ includedModels });
+    const body = JSON.stringify({ includedModels, ...(creditsPending === undefined ? {} : { creditsPending }) });
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/ai-credential`;
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(), AI_PLAN_PUSH_TIMEOUT_MS);
@@ -302,6 +311,7 @@ export async function refreshAiPlans(params: {
     /** This sweep's index (its minute): which slice of the computers it takes (`aiPlanRefreshSlice`). */
     pass: number;
     includedModelsFor: (userId: string) => Promise<readonly string[] | null | undefined>;
+    creditsPendingFor?: (userId: string) => Promise<boolean | undefined>;
     fetchImpl?: typeof fetch;
     budgetMs?: number;
 }): Promise<AiPlanRefreshCounts> {
@@ -327,21 +337,22 @@ export async function refreshAiPlans(params: {
         if (abort.signal.aborted) return;
         counts.computers = listed.length;
         // Each owner's plan is read once, and its pushes are signed at that read: a beat that read it later wins.
-        const plans = new Map<string, { readAt: number; plan: Promise<readonly string[] | null | undefined> }>();
+        const plans = new Map<string, { readAt: number; plan: Promise<readonly string[] | null | undefined>; pending: Promise<boolean | undefined> }>();
         const queue = [...listed];
         const work = async () => {
             for (let next = queue.shift(); next !== undefined && !abort.signal.aborted; next = queue.shift()) {
                 const { userId, computerId } = next;
                 let read = plans.get(userId);
                 if (!read) {
-                    read = { readAt: Date.now(), plan: params.includedModelsFor(userId).catch(() => undefined) };
+                    read = { readAt: Date.now(), plan: params.includedModelsFor(userId).catch(() => undefined),
+                        pending: params.creditsPendingFor ? Promise.resolve().then(() => params.creditsPendingFor!(userId)).catch(() => undefined) : Promise.resolve(undefined) };
                     plans.set(userId, read);
                 }
-                const includedModels = await read.plan;
+                const [includedModels, creditsPending] = await Promise.all([read.plan, read.pending]);
                 if (includedModels === undefined) { counts.unknown++; continue; }
                 if (abort.signal.aborted) break;
                 const result = await pushAiPlan(params.config, params.hmacSecret, deriveGuacamoleSandboxId(userId, computerId),
-                    includedModels, abort.signal, params.fetchImpl, read.readAt);
+                    includedModels, abort.signal, params.fetchImpl, read.readAt, creditsPending);
                 if (result.ok) {
                     counts.pushed++;
                     if (result.stored) counts.stored++;

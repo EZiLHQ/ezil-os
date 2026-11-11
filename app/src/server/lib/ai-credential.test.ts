@@ -452,3 +452,62 @@ describe('refreshAiPlans (the server plan refresh, no browser)', () => {
         });
     });
 });
+
+describe('signed pending-credit metadata', () => {
+    it('signs true and false into initial/activity credential pushes, omitting unknown and read failures', async () => {
+        const token = builderToken(), bodies: unknown[] = [];
+        const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
+            const raw = init.body as string, signature = new Headers(init.headers).get('x-ezil-signature')!;
+            expect(signature).toBe(mintAiCredentialSignature(SECRET, SANDBOX, raw, Number(/^t=(\d+),/.exec(signature)![1])));
+            bodies.push(JSON.parse(raw));
+            return Response.json({ ok: true, stored: true });
+        }) as unknown as typeof fetch;
+        const sync = (creditsPending?: () => Promise<boolean | undefined>) => syncAiCredential({ config: CONFIG, hmacSecret: SECRET,
+            sandboxName: SANDBOX, userId: USER, headers: new Headers(), supabase: async () => session(token), fetchImpl,
+            includedModels: async () => ['gemini-3.8-flash'], ...(creditsPending ? { creditsPending } : {}) });
+        await sync(async () => true); await sync(async () => false); await sync(async () => undefined);
+        await sync(async () => { throw new Error('read unavailable'); });
+        await sync(() => { throw new Error('synchronous read unavailable'); });
+        await sync();
+        expect(bodies).toEqual([true, false, undefined, undefined, undefined, undefined].map(pending => ({ accessToken: token,
+            includedModels: ['gemini-3.8-flash'], ...(pending === undefined ? {} : { creditsPending: pending }) })));
+    });
+    it('does not read pending credits for missing, foreign, bearer or unprivileged sessions', async () => {
+        const pending = vi.fn(async () => true), fetchImpl = vi.fn() as unknown as typeof fetch;
+        for (const token of [null, builderToken(inAnHour(), 'other-user'), jwt({ sub: USER, exp: inAnHour() })]) {
+            await syncAiCredential({ config: CONFIG, hmacSecret: SECRET, sandboxName: SANDBOX, userId: USER, headers: new Headers(),
+                supabase: async () => session(token), fetchImpl, creditsPending: pending });
+        }
+        await syncAiCredential({ config: CONFIG, hmacSecret: SECRET, sandboxName: SANDBOX, userId: USER,
+            headers: new Headers({ authorization: 'Bearer unrelated' }), supabase: async () => session(builderToken()), fetchImpl, creditsPending: pending });
+        expect(pending).not.toHaveBeenCalled(); expect(fetchImpl).not.toHaveBeenCalled();
+    });
+    it('refreshes pending evidence once per owner, signed with each plan refresh, omitting unreadable evidence', async () => {
+        const owner2 = 'ffffffff-0000-4000-8000-000000000000';
+        const owner3 = 'eeeeeeee-0000-4000-8000-000000000000';
+        const owner4 = 'dddddddd-0000-4000-8000-000000000000';
+        const rows = [USER, owner2, USER, owner3, owner4].map((userId, n) => ({ userId, computerId: `${String(n + 1).padStart(8, '0')}-1111-4111-8111-111111111111` }));
+        const sent: { url: string; body: Record<string, unknown> }[] = [];
+        const fetchImpl = vi.fn(async (url: string, init: RequestInit) => {
+            const raw = init.body as string, signature = new Headers(init.headers).get('x-ezil-signature')!;
+            const sandbox = decodeURIComponent(/\/sandbox\/([^/]+)\/ai-credential$/.exec(url)![1]!);
+            expect(signature).toBe(mintAiCredentialSignature(SECRET, sandbox, raw, Number(/^t=(\d+),/.exec(signature)![1])));
+            sent.push({ url, body: JSON.parse(raw) });
+            return Response.json({ ok: true, planStored: true });
+        }) as unknown as typeof fetch;
+        const pending = vi.fn(async (userId: string) => { if (userId === owner4) throw new Error('read unavailable'); return userId === USER ? true : userId === owner2 ? false : undefined; });
+        const result = await refreshAiPlans({ config: CONFIG, hmacSecret: SECRET, pass: 0,
+            computers: { count: async () => rows.length, page: async (start, take) => rows.slice(start, start + take) },
+            includedModelsFor: async () => ['gemini-3.8-flash'], creditsPendingFor: pending, fetchImpl });
+        expect(result).toMatchObject({ pushed: 5, failed: 0 });
+        expect(pending).toHaveBeenCalledTimes(4);
+        for (const row of rows) {
+            const body = sent.find(item => item.url.includes(deriveGuacamoleSandboxId(row.userId, row.computerId)))!.body;
+            expect(body.includedModels).toEqual(['gemini-3.8-flash']);
+            if (row.userId === USER) expect(body.creditsPending).toBe(true);
+            else if (row.userId === owner2) expect(body.creditsPending).toBe(false);
+            else expect(body).not.toHaveProperty('creditsPending');
+            expect(body).not.toHaveProperty('accessToken');
+        }
+    });
+});

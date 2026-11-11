@@ -59,5 +59,6 @@ describe('EZiL Chat credentials reach AWS computers too', () => {
         const body = block(name);
         const call = body.slice(body.indexOf('syncAiCredential({'), body.indexOf('});', body.indexOf('syncAiCredential({')));
         expect(call).toContain('includedModels: () => aiIncludedModelsFor(ctx.user.id),');
+        expect(call).toContain('creditsPending: () => aiCreditsPendingFor(ctx.user.id),');
     });
 });
