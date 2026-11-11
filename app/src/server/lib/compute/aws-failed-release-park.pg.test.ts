@@ -91,14 +91,43 @@ describe.skipIf(!PG)('park reservation on disposable PostgreSQL', () => {
         expect((await writeParkedStopReservation(db, before, fields())).ok).toBe(true);
     });
 
-    it('refuses while a migration for the computer is not committed (and accepts a committed one)', async () => {
+    // The canonical forward-machine semantics (`forwardMoveBusy`): active rows hold; committed and failed history does not; a failed row
+    // still holds only while its AWS provision is recorded and not released; an unknown state fails closed.
+    const migration = async (state: string, head: object, computer = j.computerId) => client!.unsafe(
+        `INSERT INTO ${schema}.ezil_compute_migrations (id, computer_id, state, user_id, workspace_head) VALUES ($1,$2,$3,$4,$5::jsonb)`,
+        [randomUUID(), computer, state, j.ownerUserId, JSON.stringify(head)]);
+    const provision = (released?: boolean) => ({ _awsProvision: released === undefined ? {} : { released } });
+    it.each<[string, string, object]>([
+        ['an active requested row', 'requested', {}], ['an active exported row', 'exported', {}], ['an active provisioning row', 'provisioning', {}],
+        ['an unknown future state (fails closed)', 'brand_new_state', {}],
+        ['failed_reopened with an unreleased AWS provision', 'failed_reopened', provision(false)],
+        ['failed_needs_operator with an AWS provision whose release is not recorded', 'failed_needs_operator', provision()],
+    ])('refuses while a migration holds the computer: %s', async (_name, state, head) => {
         const before = await placement();
-        await client!.unsafe(`INSERT INTO ${schema}.ezil_compute_migrations (id, computer_id, state, user_id, workspace_head) VALUES ($1,$2,'requested',$3,'{}')`,
-            [randomUUID(), j.computerId, j.ownerUserId]);
+        await migration(state, head);
         expect(await writeParkedStopReservation(db, before, fields())).toEqual({ ok: false, reason: 'blocked', blocker: 'migration' });
         await untouched(before);
-        await client!.unsafe(`UPDATE ${schema}.ezil_compute_migrations SET state = 'committed'`);
+    });
+    it.each<[string, string, object]>([
+        ['a committed row', 'committed', {}], ['a committed row with a provision record', 'committed', provision(false)],
+        ['failed_reopened history', 'failed_reopened', {}], ['failed_needs_operator history', 'failed_needs_operator', {}],
+        ['failed_reopened with its AWS provision released', 'failed_reopened', provision(true)],
+        ['failed_needs_operator with its AWS provision released', 'failed_needs_operator', provision(true)],
+    ])('reserves despite terminal migration history: %s', async (_name, state, head) => {
+        const before = await placement();
+        await migration(state, head);
         expect((await writeParkedStopReservation(db, before, fields())).ok).toBe(true);
+        expect(await row()).toMatchObject({ state: 'RECOVERING', job: jobIds[0] });
+    });
+    it('only the computer\'s own migrations count, and one active row among terminal history still holds', async () => {
+        const before = await placement();
+        await migration('requested', {}, randomUUID()); // another computer's active move
+        await migration('failed_reopened', {}); await migration('committed', {});
+        expect((await writeParkedStopReservation(db, before, fields())).ok).toBe(true);
+        await client!.unsafe(`UPDATE ${schema}.ezil_computer_placements SET state = 'UNCONFIRMED', last_error = $2, lifecycle_job_id = $3 WHERE computer_id = $1`,
+            [j.computerId, FAILED_ERROR, before.lifecycleJobId]);
+        await migration('provisioning', {});
+        expect(await writeParkedStopReservation(db, await placement(), fields(jobIds[1]))).toEqual({ ok: false, reason: 'blocked', blocker: 'migration' });
     });
 
     it('rejects an orphaned image reservation marker (ImageJobConflictError) and writes nothing', async () => {
