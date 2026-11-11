@@ -279,15 +279,14 @@ export function upgradeAiCreditsFromGrant (grantStdSeconds, fromOffer, toOffer) 
  * credits → computer time. Built from the offer's numbers, never from
  * `offer.bullets` (catalog copy that predates round 3). Paid compute policy v1:
  * Standard and Premium have no monthly computer-hours allowance, so their last
- * bullet is the six-hour session (`offer.sessionMaxSeconds`), never hours a month.
+ * bullet says their files are kept, never hours a month and never a session length.
  */
 export function planBullets (offer, { existingDisk } = {}) {
     // A field the offer lacks drops its bullet rather than printing "undefined".
     const known = value => Number.isSafeInteger(value) && value > 0;
     const credits = known(offer.aiCredits?.amount) ? whole(offer.aiCredits.amount) : null;
     const hours = known(offer.fairUseHours) ? whole(offer.fairUseHours) : null;
-    const sessionHours = known(offer.sessionMaxSeconds) && offer.sessionMaxSeconds % 3600 === 0 ? offer.sessionMaxSeconds / 3600 : null;
-    const session = sessionHours && `Sessions up to ${sessionHours} hour${sessionHours === 1 ? '' : 's'}; your files are kept`;
+    const session = 'Your files are kept';
     const size = known(offer.vcpu) && known(offer.memoryGiB) ? ` · ${offer.vcpu} vCPU · ${offer.memoryGiB} GB` : '';
     const keep = list => list.filter(Boolean);
     if ( offer.sku === 'free_v3' ) return { lead: null, bullets: keep([

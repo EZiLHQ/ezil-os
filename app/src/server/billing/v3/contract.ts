@@ -1,6 +1,6 @@
 /**
  * Billing contract v3 — PINNED (lead only). Simple plans: Free / Standard /
- * Premium. The paid difference is felt, not metered: longer sessions and a
+ * Premium. The paid difference is felt, not metered: a
  * dedicated AWS computer in Mumbai; Premium chooses 2, 4 or 8 vCPU. Monthly
  * time is a fair-use guardrail in standard-seconds (a size of weight w uses w
  * per second). Round 3 (founder 2026-10-28): the time left is shown in hours
@@ -124,7 +124,7 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         sessionMaxSeconds: 1 * H, opening: 'standard', poolPriority: 0,
         fairUseSeconds: 5 * H, legacyFairUseSeconds: 8 * H,
         highlighted: false, badge: null, machineChoice: ['free-cf'], aiCredits: { amount: 100, per: 'once' },
-        bullets: ['A real desktop in your browser', 'VS Code and a browser built in', '2 vCPU · 6 GB computer', 'Sessions up to 1 hour'],
+        bullets: ['A real desktop in your browser', 'VS Code and a browser built in', '2 vCPU · 6 GB computer'],
         storageGiB: null,
     },
     standard_monthly_v3: {
@@ -134,17 +134,17 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         sessionMaxSeconds: 6 * H, opening: 'standard', poolPriority: 1,
         fairUseSeconds: 40 * H, legacyFairUseSeconds: null,
         highlighted: false, badge: null, machineChoice: ['std-2'], aiCredits: { amount: 200, per: 'period' },
-        bullets: ['Your own 2 vCPU · 8 GB computer on AWS (India)', '50 GB disk for your projects', 'Sessions up to 6 hours; your files are kept'],
+        bullets: ['Your own 2 vCPU · 8 GB computer on AWS (India)', '50 GB disk for your projects', 'Your files are kept'],
         storageGiB: 50,
     },
     premium_monthly_v3: {
-        sku: 'premium_monthly_v3', tier: 'premium', name: 'Premium', tagline: 'For bigger projects and long sessions.',
+        sku: 'premium_monthly_v3', tier: 'premium', name: 'Premium', tagline: 'For bigger projects.',
         priceCents: 10_000, currency: 'usd', interval: 'month', stripeLookupKey: 'ezil_premium_monthly_v3',
         size: 'std-2', provider: 'aws', vcpu: 2, memoryGiB: 8,
         sessionMaxSeconds: 6 * H, opening: 'standard', poolPriority: 2,
         fairUseSeconds: 500 * H, legacyFairUseSeconds: null,
         highlighted: true, badge: null, machineChoice: ['std-2', 'cmp-4', 'cmp-8'], aiCredits: { amount: 1_000, per: 'period' },
-        bullets: ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)', '100 GB disk for your projects', 'Sessions up to 6 hours; your files are kept'],
+        bullets: ['Choose 2, 4 or 8 vCPU (8, 16 or 32 GB) on AWS (India)', '100 GB disk for your projects', 'Your files are kept'],
         storageGiB: 100,
     },
 });

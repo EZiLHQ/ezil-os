@@ -1263,7 +1263,7 @@ test('Standard and Compute checkout copy comes from the offer and sizes', async 
     assert.match(h.text(), /2, 4 or 8 vCPU computers, up to 32 GiB/);
     assert.match(h.text(), /Optional usage beyond 510 standard-hours at \$0.30 each — off unless you turn it on/);
     assert.equal(h.q('.ezil-upgrade-compact-title').textContent, 'EZiL Compute · $123.45/month · before applicable tax');
-    assert.match(h.text(), /Sessions run up to 6 hours; files and installed tools are kept/);
+    assert.match(h.text(), /Files and installed tools are kept/);
     assert.deepEqual(JSON.parse(JSON.stringify(h.calls.filter(c => c.method === 'billing.createCheckout').map(c => c.input))), [
         { sku: offer.sku }, { sku: computeOffer.sku },
     ]);

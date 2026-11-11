@@ -406,7 +406,7 @@ test('v3 upgrade shows the round-3 bullets, prorated price, what happens next, e
     assert.match(h.text(), /Upgrade to Premium/); assert.match(h.text(), /\$100\/month/);
     // Plan §6.4 bullet order: configurations → storage → AI credits → computer time.
     assert.deepEqual([...h.doc.querySelectorAll('[data-role="sheet-body"] li')].map(li => li.textContent), [
-        'Choose 2, 4 or 8 vCPU — up to 32 GB', 'Your computer keeps its 50 GB disk', '1,000 AI credits every month', 'Sessions up to 6 hours; your files are kept']);
+        'Choose 2, 4 or 8 vCPU — up to 32 GB', 'Your computer keeps its 50 GB disk', '1,000 AI credits every month', 'Your files are kept']);
     // D1: floor(grant × 800 / 1,656,000) — the preview's 212.599 h grant is 369 credits.
     assert.match(h.text(), /What happens next/);
     assert.match(h.text(), /TodayPremium starts and 369 AI credits are added\./);
@@ -458,7 +458,7 @@ test('v3 plan picker: Free / Standard / Premium, Current plan disabled, ordered 
     assert.equal(current.closest('.ezil-billing-choice').dataset.plan, 'free_v3');
     const bullets = sku => [...h.doc.querySelectorAll(`.ezil-billing-choice[data-plan="${sku}"] li`)].map(li => li.textContent);
     assert.deepEqual(bullets('free_v3'), ['Cloudflare computer · 2 vCPU · 6 GB memory', 'Your files saved with your computer', '100 AI credits to start', '5 hours of computer time each month']);
-    assert.deepEqual(bullets('standard_monthly_v3'), ['Your own AWS computer · 2 vCPU · 8 GB', '50 GB disk for your projects', '200 AI credits every month', 'Sessions up to 6 hours; your files are kept']);
+    assert.deepEqual(bullets('standard_monthly_v3'), ['Your own AWS computer · 2 vCPU · 8 GB', '50 GB disk for your projects', '200 AI credits every month', 'Your files are kept']);
     assert.match(h.q('.ezil-billing-choice[data-plan="premium_monthly_v3"]').textContent, /Everything in Standard, plus:/);
     assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 12);
     assert.doesNotMatch(h.text(), /Most popular/); assert.match(h.text(), /\$20\/month/); assert.match(h.text(), /\$100\/month/);
@@ -480,7 +480,7 @@ test('v3 cancel states the computer outcome: Free limits on 2 vCPU, cannot open 
     const placed = { 'std-2': { size: 'std-2', vcpu: 2, memoryGiB: 8 }, 'cmp-4': { size: 'cmp-4', vcpu: 4, memoryGiB: 16 }, 'cmp-8': { size: 'cmp-8', vcpu: 8, memoryGiB: 32 } };
     const premium = (computer = {}) => { const s = summaryV3('premium'); Object.assign(s.computer, { filesOn: 'aws', standing: 'paid', awsSize: placed['std-2'], ...computer }); return s; };
     h.summary = premium(); await h.ready('cancel');
-    assert.match(h.text(), /Your plan stays active until Nov 1, then moves to Free\. After Nov 1 your computer opens under Free limits \(sessions up to 1 hour\); your files stay on your AWS computer\./);
+    assert.match(h.text(), /Your plan stays active until Nov 1, then moves to Free\. After Nov 1 your computer opens under Free limits; your files stay on your AWS computer\./);
     const texts = [h.text()];
     for ( const [size, vcpu] of [['cmp-4', 4], ['cmp-8', 8]] ) {
         h.handle.close(); h.summary = premium({ awsSize: placed[size] }); await h.ready('cancel');
@@ -531,7 +531,7 @@ for ( const tier of ['free'] ) test(`v3 ${tier} limit stop opens one session-end
     assert.ok(h.q('[data-sheet="session-end"]'));
     assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] button').length, 1);
     assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 4);
-    assert.match(h.text(), tier === 'free' ? /Your 1-hour session ended\. Standard: sessions up to 6 hours — \$20\/month\./ : /Your 2-hour session ended\. Premium gives you 6-hour sessions/);
+    assert.match(h.text(), tier === 'free' ? /Your session ended\. Standard: \$20\/month\./ : /Your session ended\. Premium: \$100\/month\./);
     h.click('[data-action="continue"]'); await settle();
     if ( tier === 'free' ) assert.equal(chosen[0].sku, 'standard_monthly_v3');
     else assert.deepEqual(h.calls[0].input, { toSku: 'premium_monthly_v3' });

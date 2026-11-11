@@ -332,7 +332,7 @@ check('round 6: Free held on AWS — "About 5 of 8 hours left this month", no "S
     const el = rendered(heldUsage, heldSummary);
     assert.match(meter(el, 'compute').querySelector('.usage-value').textContent, /^About 5 of 8 hours left this month$/);
     assert.doesNotMatch(el.textContent, /Same as/);
-    assert.match(meter(el, 'compute').textContent, /Free sessions last up to 1 hour\./);
+    assert.doesNotMatch(meter(el, 'compute').textContent, /sessions? (last|up to)/i);
     assert.match(meter(el, 'storage').textContent, /50 GB disk/);
     assert.doesNotMatch(el.textContent, /Saved with your computer/);
     // An older server (no hold branch) still sends the Cloudflare equivalent: same vCPU and weight, so no line either.
@@ -352,17 +352,17 @@ check('round 6: Free held on AWS — "About 5 of 8 hours left this month", no "S
         assert.doesNotMatch(node.textContent, /mumbai|ap-south-1/i);
     }
 });
-check('round 6 review (R4-02): a held 4 or 8 vCPU computer says it can\'t open on Free, never "Free sessions last up to 1 hour"', () => {
+check('round 6 review (R4-02): a held 4 or 8 vCPU computer says it can\'t open on Free, never a session length', () => {
     for (const [size, vcpu, memoryGiB] of [['cmp-4', 4, 16], ['cmp-8', 8, 32]]) {
         const el = rendered(heldUsage, { ...heldSummary, computer: { ...heldSummary.computer, awsSize: { size, vcpu, memoryGiB } } });
         assert.match(meter(el, 'compute').textContent, new RegExp(`Your files are still on your ${vcpu} vCPU AWS \\(India\\) computer\\. The Free plan can't open it at that size; upgrade to open it again\\.`));
-        assert.doesNotMatch(el.textContent, /Free sessions last/);
+        assert.doesNotMatch(el.textContent, /sessions? (last|up to)/i);
         assert.deepEqual(scanCopy(el.textContent), []);
         assert.doesNotMatch(el.textContent, /mumbai|ap-south-1/i);
     }
-    // A held 2 vCPU placement keeps the Free session line.
+    // A held 2 vCPU placement shows no session length either.
     const open = rendered(heldUsage, { ...heldSummary, computer: { ...heldSummary.computer, awsSize: { size: 'std-2', vcpu: 2, memoryGiB: 8 } } });
-    assert.match(meter(open, 'compute').textContent, /Free sessions last up to 1 hour\./);
+    assert.doesNotMatch(meter(open, 'compute').textContent, /sessions? (last|up to)/i);
     assert.doesNotMatch(open.textContent, /can't open/);
 });
 check('round 6 review (dunning into the hold): a paid plan past its grace says Free\'s month and session, with Fix payment', () => {
@@ -371,7 +371,7 @@ check('round 6 review (dunning into the hold): a paid plan past its grace says F
     const el = rendered({ ...heldUsage, period: { ...heldUsage.period, usedStandardSeconds: 1800, remainingStandardSeconds: 27000, remainingHoursAtCurrent: 7,
         equivalents: [{ size: 'std-2', weight: 1, hours: 7 }] } }, lapsed);
     assert.match(meter(el, 'compute').querySelector('.usage-value').textContent, /^About 7 of 8 hours left this month$/);
-    assert.match(meter(el, 'compute').textContent, /Free sessions last up to 1 hour\./);
+    assert.doesNotMatch(meter(el, 'compute').textContent, /sessions? (last|up to)/i);
     assert.match(el.textContent, /Fix payment/);
     assert.doesNotMatch(el.textContent, /Computer time is used up|at 2 vCPU/);
     assert.deepEqual(scanCopy(el.textContent), []);
