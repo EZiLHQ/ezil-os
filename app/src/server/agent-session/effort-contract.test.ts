@@ -1,8 +1,9 @@
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { sql } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { handleEditorSync, signEditorSync } from './sync-route';
 import { syncEditor, type SessionDb, type SqlExecutor, type EditorReport } from './store';
+import { createSession, configureSession } from './control-store';
 import { applyControlReport } from './control-sync';
 vi.mock('./store', async importOriginal => ({...await importOriginal<typeof import('./store')>(),syncEditor:vi.fn()}));
 const cid='aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', uid='bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
@@ -50,4 +51,19 @@ it('requested effort cannot become effective without matching readback; old prot
         expect(statements[0]?.params).toContain(attempt);
         expect(await applyControlReport({execute:async()=>[]},{id:cid,userId:uid},1,sql`clock_timestamp()`,report,protocol3)).toBe(false);
     }
+});
+
+afterEach(() => vi.unstubAllEnvs());
+it.each(['', 'disabled', 'true'])('effort gate %s rejects before any DB access, regardless of identity or resource', async gate => {
+    vi.stubEnv('EZIL_EDITOR_BRIDGE_EFFORT', gate);
+    const transaction = vi.fn(() => { throw new Error('must not touch database'); });
+    const execute = vi.fn(() => { throw new Error('must not touch database'); });
+    const neverDb = {transaction, execute} as unknown as SessionDb;
+    for (const userId of [uid, cid]) {
+        const caller = {userId, clientId:'synthetic-client'};
+        await expect(createSession(neverDb, caller, {computerId:cid, effort:'high', idempotencyKey:op})).rejects.toMatchObject({code:'BAD_REQUEST', reason:'effort_not_per_session'});
+        await expect(configureSession(neverDb, caller, {sessionId:cid, effort:'high', idempotencyKey:op})).rejects.toMatchObject({code:'BAD_REQUEST', reason:'effort_not_per_session'});
+    }
+    expect(transaction).not.toHaveBeenCalled();
+    expect(execute).not.toHaveBeenCalled();
 });

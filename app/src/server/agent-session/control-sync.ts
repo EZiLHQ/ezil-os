@@ -218,7 +218,7 @@ export async function applyControlReport(tx: SqlExecutor, computer: { id: string
     if (report.status === 'applied') {
         const model = typeof report.model === 'string' ? report.model : null;
         const effort = proto3 ? report.effort ?? null : await configuredEffort(tx, computer.id, model);
-        if ((typeof op.requested_model === 'string' && model !== op.requested_model)
+        if ((proto3 && typeof op.requested_model === 'string' && model !== op.requested_model)
             || (typeof op.requested_effort === 'string' && (!proto3 || effort !== op.requested_effort))) {
             await tx.execute(sql`UPDATE public.ezil_control_operations SET status='uncertain', reason='settings_readback_mismatch', attempt_id=NULL, updated_at=${now} WHERE id=${id}::uuid`);
             return true;

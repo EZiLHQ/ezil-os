@@ -575,3 +575,20 @@ test('missing or mismatched native session input binding never advertises effort
         assert.equal(w.models.get('s1').inputState,undefined);
     }
 });
+
+for (const protocol of [undefined, 2, 3]) test(`model mismatch preserves negotiated workbench semantics: ${protocol ?? 'legacy'}`, async () => {
+    const w = world({sticky:false});
+    await claimed(w);
+    const made = await control(w, 'create', 301, {model:'ezil/qwen', protocol});
+    assert.equal(made.status, protocol === 3 ? 'uncertain' : 'created');
+    assert.equal(made.model, 'ezil/kimi-k2');
+    assert.equal(made.reason, 'model_not_applied');
+    const changed = await control(w, 'setModel', 302, {sessionResource:'vscode-chat-session://local/s1', model:'ezil/qwen', protocol});
+    assert.equal(changed.status, protocol === 3 ? 'uncertain' : 'failed');
+    assert.equal(changed.model, 'ezil/kimi-k2');
+    assert.equal(changed.reason, 'model_not_applied');
+    if (protocol !== 3) {
+        assert.equal(Object.hasOwn(made, 'effort'), false);
+        assert.equal(Object.hasOwn(changed, 'effort'), false);
+    }
+});

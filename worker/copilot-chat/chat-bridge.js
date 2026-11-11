@@ -361,7 +361,7 @@
             record.effort = currentEffort(widget);
             record.requestCount = model.getRequests().length;
             record.observedAt = now();
-            record.status = applied ? 'created' : 'uncertain';
+            record.status = applied || req.protocol !== 3 ? 'created' : 'uncertain';
             record.reason = applied ? null : 'model_not_applied';
             log('created a chat');
             return controlView(record);
@@ -404,7 +404,7 @@
             record.effort = currentEffort(widget);
             record.requestCount = model.getRequests().length;
             record.observedAt = now();
-            record.status = applied ? 'applied' : 'uncertain';
+            record.status = applied ? 'applied' : req.protocol === 3 ? 'uncertain' : 'failed';
             record.reason = applied ? null : 'model_not_applied';
             return controlView(record);
         });

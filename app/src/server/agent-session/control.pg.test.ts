@@ -217,6 +217,24 @@ describe.skipIf(!URL_)('EZiL MCP session controls on Postgres', () => {
             await state.tick(protocol,{reports:[{operationId:delivered!.operationId,attemptId:delivered!.attemptId,status:'applied',...report}]});
             return data<Control>(await response);
         };
+        it('disabled gate rejects against retained live protocol3 evidence without consuming a key or changing state', async () => {
+            const state = await setup();
+            const id = state.sessions[0]!;
+            const before = (await controlRows()).length;
+            const effects = await untouched();
+            vi.stubEnv('EZIL_EDITOR_BRIDGE_EFFORT', ''); // no legacy heartbeat: retain protocol3 lease/catalog
+            for (const [procedure, target] of [
+                ['agentSession.create', {computerId:ids.a1}],
+                ['agentSession.configure', {sessionId:id}],
+            ] as const) {
+                const key = randomUUID();
+                const response = await write(procedure, {...target, effort:'high', idempotencyKey:key});
+                expect(await code(response)).toBe('BAD_REQUEST');
+                expect(await controlRows(client`idempotency_key = ${key}::uuid`)).toHaveLength(0);
+            }
+            expect((await controlRows()).length).toBe(before);
+            expect(await untouched()).toBe(effects);
+        });
         it.each(['snapshot2', 'snapshot1', 'configure2'])('3→legacy %s→3 heartbeat never freshens old effort', async legacy => {
             const state=await setup(); const id=state.sessions[0]!;
             expect((await settings(id)).settings).toMatchObject({model:'ezil/a',effort:'high'});
@@ -515,7 +533,17 @@ describe.skipIf(!URL_)('EZiL MCP session controls on Postgres', () => {
                 expect(await code(response.clone())).toBe('BAD_REQUEST');
                 expect((await response.json()).error.json.message).toBe('effort_not_per_session');
             }
+            const effects = await untouched();
+            await expireLease();
+            for (const computerId of [ids.a1, ids.b1, randomUUID()]) {
+                expect(await code(await write('agentSession.create', { computerId, effort: 'high', idempotencyKey: randomUUID() }))).toBe('BAD_REQUEST');
+            }
+            for (const sessionId of [randomUUID()]) {
+                expect(await code(await write('agentSession.configure', { sessionId, effort: 'high', idempotencyKey: randomUUID() }))).toBe('BAD_REQUEST');
+            }
+            expect(await untouched()).toBe(effects);
             expect((await controlRows()).length).toBe(before);
+            await connect();
             const modelOnly = await data<Control>(await write('agentSession.create', { computerId: ids.a1, model: 'qwen3-coder-next', idempotencyKey: randomUUID() }));
             expect(modelOnly).toMatchObject({ status: 'rejected', requested: { model: 'qwen3-coder-next', effort: null }, effective: null });
             // No editor and a model: disconnected wins (the catalog cannot even be asked).

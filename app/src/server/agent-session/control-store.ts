@@ -16,7 +16,7 @@
  *     is only ever what the editor read back after the change. Effort requires protocol 3 and fresh account/route capability. A configure is never held: busy, disconnected or
  *     an unanswered handout is final, and nothing but an `applied` report says it changed.
  *
- * Idempotency is per (person, OAuth client, procedure, key) for 7 days, checked FIRST so a retry returns the original row
+ * Idempotency is per (person, OAuth client, procedure, key) for 7 days, checked first after feature admission so an admitted retry returns the original row
  * whatever the session or editor has done since; the same key with other input is CONFLICT. Everything is owner-scoped:
  * another person's computer, session or row is NOT_FOUND, exactly like a missing one.
  */
@@ -412,7 +412,15 @@ async function settle(db: SqlExecutor, id: string, kind: ControlKind, timing: Co
     }
 }
 
+// Admission is independent of bridge/catalog state. Disabled effort must not consume a
+// durable key or reveal whether a resource exists. Existing controls remain readable via get_control.
+function requireEffortEnabled(effort: string | undefined): void {
+    if (effort !== undefined && process.env.EZIL_EDITOR_BRIDGE_EFFORT !== 'enabled')
+        throw new SessionStoreError('BAD_REQUEST', 'effort_not_per_session');
+}
+
 export async function createSession(db: SessionDb, caller: ControlCaller, input: CreateInput, timing: ControlTiming = CONTROL_TIMING): Promise<ControlRow> {
+    requireEffortEnabled(input.effort);
     const requested: Selection = { model: input.model ?? null, effort: input.effort ?? null };
     const inputDigest = digest({ computerId: input.computerId.toLowerCase(), ...requested });
     const id = await db.transaction(async (tx) => {
@@ -436,6 +444,7 @@ export async function createSession(db: SessionDb, caller: ControlCaller, input:
 }
 
 export async function configureSession(db: SessionDb, caller: ControlCaller, input: ConfigureInput, timing: ControlTiming = CONTROL_TIMING): Promise<ControlRow> {
+    requireEffortEnabled(input.effort);
     if (input.model === undefined && input.effort === undefined) throw new SessionStoreError('BAD_REQUEST', 'nothing_to_change');
     const requested: Selection = { model: input.model ?? null, effort: input.effort ?? null };
     const inputDigest = digest({ sessionId: input.sessionId.toLowerCase(), ...requested });
