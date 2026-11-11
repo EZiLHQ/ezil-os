@@ -5,6 +5,7 @@ import {
     AUTH0_COOKIE, AUTH0_COOKIE_OPTIONS, Auth0Error, auth0Enabled, exchangeCode, readTransaction, SILENT_LOGIN_FALLBACK_ERRORS, verifyIdToken,
 } from '@/server/auth/auth0';
 import { bridgeAuth0Identity, refuseSilentAccountSwitch } from '@/server/auth/bridge';
+import { sponsorFromTransaction } from '@/server/auth/sponsor';
 import { retainProjectIdentity } from '@/server/auth/retained-identity';
 import { Routes, safeReturnUrl } from '@/utils/constants';
 import { ownedPublicOrigin } from '@/utils/forwarded';
@@ -30,7 +31,7 @@ export async function GET(request: NextRequest) {
     try {
         if (!auth0Enabled()) throw new Auth0Error('auth0_disabled');
         const params = request.nextUrl.searchParams;
-        const transaction = readTransaction(request.cookies.get(AUTH0_COOKIE)?.value, params.get('state'));
+        const transaction = readTransaction(request.cookies.get(AUTH0_COOKIE)?.value, params.get('state'), ownedPublicOrigin(request.headers, request.url));
         returnUrl = safeReturnUrl(transaction.returnUrl);
         const code = params.get('code');
         const providerError = params.get('error');
@@ -45,7 +46,10 @@ export async function GET(request: NextRequest) {
             // A silent sign-in refreshes the signed-in person's EZiL ID; it never switches the OS account. Before the
             // bridge, which replaces the session.
             if (transaction.silent) await refuseSilentAccountSwitch(identity);
-            await bridgeAuth0Identity(identity);
+            const sponsor = transaction.sponsor ? sponsorFromTransaction(transaction.sponsor, ownedPublicOrigin(request.headers, request.url), transaction.state, transaction.nonce) : null;
+            if (transaction.sponsor && !sponsor) throw new Auth0Error('invalid_transaction');
+            if (sponsor) await bridgeAuth0Identity(identity, sponsor);
+            else await bridgeAuth0Identity(identity);
             // After the bridge, so the token is bound to the session it just minted. Additive: a failure here never
             // fails the OS sign-in; opening a project then asks for a refresh (IDENTITY_REFRESH_REQUIRED).
             try { await retainProjectIdentity(token); } catch { console.warn('[auth0] identity not retained'); }
