@@ -7,7 +7,7 @@
 import { sql } from 'drizzle-orm';
 
 import type { FeedbackDb } from './access-log';
-import { FEEDBACK_RETENTION_DAYS } from './types';
+import { FEEDBACK_LIMITS, FEEDBACK_RETENTION_DAYS } from './types';
 
 export const DEFAULT_CHUNK_SIZE = 500;
 export const DEFAULT_BUDGET_MS = 20_000;
@@ -76,6 +76,7 @@ export async function runFeedbackRetention(
     const attachmentCutoff = new Date(started - FEEDBACK_RETENTION_DAYS.attachments * DAY_MS).toISOString();
     const reportCutoff = new Date(started - FEEDBACK_RETENTION_DAYS.reports * DAY_MS).toISOString();
     const accessCutoff = new Date(started - FEEDBACK_RETENTION_DAYS.accessLog * DAY_MS).toISOString();
+    const stagedCutoff = new Date(started - FEEDBACK_LIMITS.stagedImageTtlMs).toISOString();
     const tables = opts.tables ?? ALL_PRESENT;
 
     async function prune(query: ReturnType<typeof sql>): Promise<FeedbackPruneResult> {
@@ -89,7 +90,11 @@ export async function runFeedbackRetention(
         }
     }
 
-    // Remove even a recent attachment when its parent report has expired.
+    // Remove even a recent attachment when its parent report has expired, and
+    // an upload-first image staged a day ago whose report was never sent. A
+    // report only finalizes images staged within the last hour
+    // (FEEDBACK_LIMITS.stagedImageFreshMs), so this never races a finalize; a
+    // re-upload replaces the row, so a stale snapshot's ctid matches nothing.
     // The attachments query also reads reports, so it needs both tables.
     const attachments = !(tables.attachments && tables.reports) ? { ...SKIPPED } : await prune(sql`
         DELETE FROM ezil_feedback_attachments WHERE ctid IN (
@@ -97,6 +102,8 @@ export async function runFeedbackRetention(
             WHERE a.created_at < ${attachmentCutoff}::timestamptz
                 OR EXISTS (SELECT 1 FROM ezil_feedback_reports r
                     WHERE r.id = a.report_id AND r.created_at < ${reportCutoff}::timestamptz)
+                OR (a.created_at < ${stagedCutoff}::timestamptz
+                    AND NOT EXISTS (SELECT 1 FROM ezil_feedback_reports r WHERE r.id = a.report_id))
             ORDER BY a.created_at LIMIT ${chunkSize}
         ) RETURNING report_id
     `);

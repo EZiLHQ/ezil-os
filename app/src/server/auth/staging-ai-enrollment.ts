@@ -5,6 +5,7 @@ import postgres from 'postgres';
 
 import { AI_CREDIT_PROTOCOL, aiCreditEntitlement, aiCreditOutboxItem } from '@/server/billing/ai-credits';
 import { AI_CREDIT_KICK_SQL } from '@/server/billing/ai-credit-outbox-store';
+import { deliverStarterCredits, type AiStarterDelivery } from '@/server/billing/ai-starter-delivery';
 import { readBillingConfig } from '@/server/billing/config';
 
 const WORK_MS = 5_000;
@@ -25,7 +26,7 @@ export type AiEnrollRefusal = typeof AI_ENROLL_SQL_REFUSALS[number] | 'unknown_r
 export type AiEnrollCode = AiEnrollRefusal | typeof AI_ENROLL_UNAVAILABLE[number];
 export type AiEnrollSource = 'auth0' | 'outbox';
 export type AiEnrollResult = { ok: true } | { ok: false; code: AiEnrollCode };
-type Stage = 'config' | 'connect' | 'role' | 'probe' | 'enroll' | 'kick' | 'enqueue' | 'done';
+type Stage = 'config' | 'connect' | 'role' | 'probe' | 'enroll' | 'kick' | 'enqueue' | 'deliver' | 'done';
 
 const SQL_REFUSALS: ReadonlySet<string> = new Set(AI_ENROLL_SQL_REFUSALS);
 export const isAiEnrollRefusal = (code: AiEnrollCode): code is AiEnrollRefusal => SQL_REFUSALS.has(code) || code === 'unknown_refusal';
@@ -71,6 +72,7 @@ async function runEnrollment(authUserId: string, sub: string, source: AiEnrollSo
     let stopped = false;
     let timedOut = false;
     let stage: Stage = 'config';
+    let starter: AiStarterDelivery | undefined;
     const sockets = new Set<Socket>();
     const deadline = performance.now() + WORK_MS;
     const unavailable = () => new Error('staging_enrollment_unavailable');
@@ -117,7 +119,9 @@ async function runEnrollment(authUserId: string, sub: string, source: AiEnrollSo
         // option is supported by postgres.js but absent from its bundled types.
         const options = {
             max: 1, max_pipeline: 1, prepare: false, fetch_types: false,
-            connect_timeout: CONNECT_MS / 1_000, idle_timeout: 1,
+            // The connection idles while the starter grant waits on the Gateway (up to 2 s); a 1 s idle close would drop
+            // its finish write (reconnects are refused below). The work deadline and `end()` still bound its life.
+            connect_timeout: CONNECT_MS / 1_000, idle_timeout: WORK_MS / 1_000,
             onnotice: () => {}, socket: openSocket,
         };
         client = postgres(databaseUrl, options);
@@ -201,6 +205,13 @@ async function runEnrollment(authUserId: string, sub: string, source: AiEnrollSo
                     values ($1, $2::uuid, $3, $4::jsonb) on conflict do nothing`,
                 [item.eventKey, item.userId, item.kind, item.payload as postgres.JSONValue]);
             });
+
+            // The enrollment and the receipt are committed: from here nothing, not even the deadline, can fail them.
+            // One bounded delivery attempt of exactly that grant on this owned client (see deliverStarterCredits), so
+            // Code usually opens on the credits. A miss is left to the sweep; the starter outcome is only logged.
+            stage = 'deliver';
+            starter = await deliverStarterCredits({ client: ownedClient, userId: authUserId,
+                deadlineAt: Date.now() + Math.max(0, deadline - performance.now()), config: readBillingConfig() });
         }
 
         const expired = new Promise<never>((_, reject) => {
@@ -215,7 +226,9 @@ async function runEnrollment(authUserId: string, sub: string, source: AiEnrollSo
         stage = 'done';
         result = { ok: true };
     } catch (error) {
-        result = { ok: false, code: failureCode(error, stage, timedOut) };
+        // Past the committed receipt only the starter delivery remains: a deadline there never un-enrolls the member.
+        // (`stage` is assigned inside `enroll()`, which the compiler's narrowing at this catch does not see.)
+        result = (stage as Stage) === 'deliver' ? { ok: true } : { ok: false, code: failureCode(error, stage, timedOut) };
     } finally {
         stopped = true;
         clearTimeout(deadlineTimer);
@@ -237,7 +250,7 @@ async function runEnrollment(authUserId: string, sub: string, source: AiEnrollSo
         }
     }
     // One line per attempt. Fixed codes only: never ids, the subject, DB/provider text or credentials.
-    const line = JSON.stringify({ event: 'ai-enroll', source, stage, code: result.ok ? null : result.code });
+    const line = JSON.stringify({ event: 'ai-enroll', source, stage, code: result.ok ? null : result.code, ...(starter ? { starter } : {}) });
     if (result.ok) console.info(line);
     else console.warn(line);
     return result;

@@ -93,7 +93,8 @@ check('paid compute policy v1: no "monthly time" on paid tiles or the switch con
     }
     const html = scan(computerHtml(computerModel({ computer: me, data: unmetered('premium'), prog: running() }), running(), []));
     assert.doesNotMatch(text(html), /monthly time|Counts \d×/);
-    assert.match(text(html), /AWS \(India\) · sessions up to 6 hours/);
+    assert.match(text(html), /AWS \(India\)/);
+    assert.doesNotMatch(text(html), /sessions? up to/i);
     const sw = tab.confirmCopy('switch', { target: 'cmp-4', current: 'std-2', data: unmetered('premium') });
     assert.ok(! sw.lines.some(line => /monthly time/.test(line)), sw.lines.join(' | '));
     // Positive control: the same switch on a metered summary still says how the hour counts.
@@ -101,7 +102,8 @@ check('paid compute policy v1: no "monthly time" on paid tiles or the switch con
     // A Free viewer comparing plans is not sold monthly hours on the AWS tiles either.
     const freeHtml = scan(computerHtml(computerModel({ computer: me, data: free(), prog: null }), null, []));
     assert.doesNotMatch(text(freeHtml), /monthly time|Counts \d×/);
-    assert.match(text(freeHtml), /AWS \(India\) · sessions up to 6 hours/);
+    assert.match(text(freeHtml), /AWS \(India\)/);
+    assert.doesNotMatch(text(freeHtml), /sessions? up to/i);
 });
 
 // Follow-up r5 (ACCEPT-9a755827 FINDING 2): until this activation's `computer.progress` answers,
@@ -369,13 +371,13 @@ check('Round 6 held std-2 Running: current with a Free limits pill, 4/8 vCPU loc
     for ( const size of ['cmp-4', 'cmp-8'] ) assert.match(text(card(html, size)), /Included in Premium Upgrade/);
     assert.equal((html.match(/data-role="config-locked"/g) ?? []).length, 2);
     assert.doesNotMatch(html, /data-size="free-cf"|data-action="switch-config"|Included in Standard/);
-    assert.match(text(html), /Your files are still on your AWS \(India\) computer\. It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours\./);
-    assert.match(html, /data-role="hold-time">Free sessions last 1 hour · About 5 of 8 hours left this month<\/p>/);
+    assert.match(text(html), /Your files are still on your AWS \(India\) computer\. It opens on the Free plan with Free limits\./);
+    assert.match(html, /data-role="hold-time">About 5 of 8 hours left this month<\/p>/);
     assert.match(text(html), new RegExp(`This session ends at ${clock('2026-10-30T06:42:00Z')} ?\\.`));
     assert.match(html, /<time datetime="2026-10-30T06:42:00Z">/);
     assert.doesNotMatch(text(html), /Pick a size|More sizes come with|restore full use/);
     assert.match(text(html), /On the Free plan your AWS computer opens at 2 vCPU · 8 GB\. Upgrade to choose a size\./);
-    assert.match(text(html), /Standard and Premium sessions last up to 6 hours; Premium unlocks 4 and 8 vCPU\. Compare plans/);
+    assert.match(text(html), /Premium unlocks 4 and 8 vCPU\. Compare plans/);
 });
 
 check('Round 6 held std-2: Stopped (no session end), no usage yet (no invented hours), a passed deadline (no line)', () => {
@@ -386,13 +388,13 @@ check('Round 6 held std-2: Stopped (no session end), no usage yet (no invented h
     assert.doesNotMatch(stoppedHtml, /data-role="session-ends"/);
     assert.match(stoppedHtml, /About 5 of 8 hours left this month/);
     const unread = scan(computerHtml(computerModel({ computer: me, data: heldData(), prog: running(), usage: null, now: HELD_NOW }), running(), []));
-    assert.match(unread, /data-role="hold-time">Free sessions last 1 hour<\/p>/);
+    assert.doesNotMatch(unread, /data-role="hold-time"|sessions? last/);   // nothing read yet: no month line, and never a session length
     const late = computerModel({ computer: me, data: heldData(), prog: running(), usage: heldUsage, now: Date.parse('2026-10-30T06:42:30Z') });
     assert.equal(late.sessionEnds, null);
     assert.equal(computerModel({ computer: me, data: heldData(), prog: running(), usage: heldUsage, now: HELD_NOW, stopping: true }).sessionEnds, null);
     const under = computerModel({ computer: me, data: heldData(), prog: running(), now: HELD_NOW,
         usage: { ...heldUsage, period: { ...heldUsage.period, remainingStandardSeconds: 600, remainingHoursAtCurrent: 0 } } });
-    assert.equal(under.holdLine, 'Free sessions last 1 hour · Less than an hour left this month');
+    assert.equal(under.holdLine, 'Less than an hour left this month');
 });
 
 check('Round 6 (R4-02) held 4 or 8 vCPU: no Open desktop, says it cannot open on Free, Upgrade; the size is current without Free limits', () => {
@@ -457,7 +459,7 @@ check('Round 6: a Free session on Cloudflare also says when it ends; so does a p
         assert.equal(stale.sessionEnds, null);
         assert.doesNotMatch(scan(computerHtml(stale, prog, [])), /data-role="session-ends"/);
     }
-    // Paid compute policy v1: Standard and Premium sessions last up to six hours, then save and stop (files kept).
+    // Paid compute policy v1: at the session limit the computer saves and stops (files kept); no session length is shown.
     const paid = { ...premium(), computer: { ...premium().computer, activeDeadline: '2026-10-30T06:42:00Z' } };
     assert.equal(paid.computer.sessionMaxSeconds, 21600);
     const paidModel = computerModel({ computer: me, data: paid, prog: running(), now: HELD_NOW });
@@ -494,7 +496,7 @@ check('Round 4: after grace the plan block may still describe the past_due paid 
     // Round 6: the held std-2 is current; only the sizes the hold cannot open are locked.
     assert.deepEqual(states(held), { 'std-2': 'current', 'cmp-4': 'locked', 'cmp-8': 'locked' });
     assert.ok(! /data-action="switch-config"/.test(computerHtml(held, stoppedAws(), [])));
-    // Round 6 review: the server rates a lapsed plan's computer as Free (1-hour sessions, Free's month), so the hold
+    // Round 6 review: the server rates a lapsed plan's computer as Free (Free's month), so the hold
     // line and the session end show for a dunning hold exactly as for an immediate cancel.
     // The server's shape for that state: the Premium plan block with Free's session cap, machine choice and opening.
     const lapsedRunning = withStanding({ ...premium(), computer: { ...premium().computer, size: 'std-2', vcpu: 2, memoryGiB: 8, sessionMaxSeconds: 3600,
@@ -502,7 +504,7 @@ check('Round 4: after grace the plan block may still describe the past_due paid 
         'files_on_aws', {}, { status: 'past_due', paymentIssue: 'payment_failed' });
     const dunning = computerModel({ computer: me, data: lapsedRunning, prog: running(), usage: heldUsage, now: HELD_NOW });
     assert.deepEqual(states(dunning), { 'std-2': 'current', 'cmp-4': 'locked', 'cmp-8': 'locked' });
-    assert.equal(dunning.holdLine, 'Free sessions last 1 hour · About 5 of 8 hours left this month');
+    assert.equal(dunning.holdLine, 'About 5 of 8 hours left this month');
     assert.equal(dunning.sessionEnds, '2026-10-30T06:42:00Z');
     const dunningHtml = scan(computerHtml(dunning, running(), []));
     assert.match(dunningHtml, /data-role="session-ends"/);
@@ -533,7 +535,7 @@ const held = (extra = {}, size = 'std-2') => withStanding(free(), 'files_on_aws'
 const afterCommit = extra => withStanding(free(), 'free', { filesOn: 'cloudflare', reverseMove: null, moveAvailable: false, moveOnOpen: false, ...extra });
 const tabProg = data => ({ ...data, computerId: 'c-1' });
 const render = (data, prog = stoppedAws()) => { const model = computerModel({ computer: me, data, prog }); return { model, html: scan(computerHtml(model, prog, [])) }; };
-const BANNER = 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours.';
+const BANNER = 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits.';
 const NOT_MOVED = 'settings and programs you added on your AWS computer, saved browser sign-ins, installed packages, and build folders you can recreate (node_modules, .next, .turbo and dist, unless Git tracks them)';
 const KEPT = `Not moved: ${NOT_MOVED}. Your AWS computer's disk is kept for 14 days after the move.`;
 
@@ -990,7 +992,7 @@ if ( haveBundle ) {
         assert.ok(card('std-2')?.querySelector('[data-role="config-free-limits"]'));
         assert.equal(card('cmp-4')?.dataset.state, 'locked');
         assert.equal(pane()?.querySelector('[data-role="computer-provider"]')?.textContent, 'AWS (India)');
-        assert.equal(pane()?.querySelector('[data-role="hold-time"]')?.textContent, 'Free sessions last 1 hour · About 5 of 8 hours left this month');
+        assert.equal(pane()?.querySelector('[data-role="hold-time"]')?.textContent, 'About 5 of 8 hours left this month');
         const read = usageReads().at(-1);
         assert.ok(read, 'billing.usage was read');
         assert.match(decodeURIComponent(read.url), /"computerId":"c-1"/);

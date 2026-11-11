@@ -133,7 +133,7 @@ try {
                 overflow: pane.scrollWidth - pane.clientWidth, docOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth };
         }, await page.evaluate(summary => window.layout.summaryV3Html(summary), identity));
         push(`${label} · identity credits: headline over the live-grant total`, a.value === '1,246 credits left of 1,500', a.value);
-        push(`${label} · identity credits: exact details line`, a.details === 'Plan 1,000 · Added 500 · Used 252.75 · Reserved 0.5 · Remaining 1,246.75', a.details);
+        push(`${label} · identity credits: whole-floor details line`, a.details === 'Plan 1,000 · Added 500 · Used 252 · Reserved 0 · Remaining 1,246', a.details);
         push(`${label} · identity credits: the bar is 83 % (1,246.75 of 1,500) and painted to match`, a.gauge === '83' && Math.abs(a.fill - 83) <= 1, `${a.gauge} / ${a.fill}`);
         push(`${label} · identity credits: details wrap inside the row; no horizontal overflow`, a.fits && a.overflow <= 0 && a.docOverflow <= 0, `pane ${a.overflow} doc ${a.docOverflow}`);
         // Payment grace (D17) on a nearly spent total: the row warns from the total, and this period's credits wait for the payment.

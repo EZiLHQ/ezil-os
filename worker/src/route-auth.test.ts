@@ -22,7 +22,7 @@
  * one proves the entrypoint starts; this one proves what it routes.
  */
 
-import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_MODEL_ACCESS_MAX_AGE_MS, AI_MODEL_ACCESS_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, exactCacheScope, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
+import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_CREDITS_PENDING_STORAGE_KEY, AI_MODEL_ACCESS_MAX_AGE_MS, AI_MODEL_ACCESS_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, exactCacheScope, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
 import { afterEach, beforeEach, describe, expect, it, mock, setSystemTime, spyOn } from 'bun:test';
 
 // Must be registered before `./index.ts` is imported (see module doc). The
@@ -3691,7 +3691,7 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     const stub = new Proxy({}, {
       get(_target, prop) {
         if (prop === 'then') return undefined;
-        if (prop === 'putAiCredential' || prop === 'dropAiCredential') return obj[prop].bind(obj);
+        if (prop === 'putAiCredential' || prop === 'putAiModelAccess' || prop === 'dropAiCredential') return obj[prop].bind(obj);
         return async () => undefined;
       },
     });
@@ -3699,8 +3699,8 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     return {
       ...state,
       recover: () => { obj = Object.assign(Object.create(Object.getPrototypeOf(obj)), { ctx: obj.ctx }); },
-      send: async (method: 'POST' | 'DELETE', signedAt: number, accessToken?: string) => {
-        const body = method === 'POST' ? JSON.stringify({ accessToken }) : '';
+      send: async (method: 'POST' | 'DELETE', signedAt: number, accessToken?: string, metadata: Record<string, unknown> = {}) => {
+        const body = method === 'POST' ? JSON.stringify({ accessToken, ...metadata }) : '';
         const response = await worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/ai-credential`, {
           method, body: body || undefined,
           headers: { 'x-ezil-signature': await mintAiCredentialSignature(SECRET, SANDBOX_NAME, new TextEncoder().encode(body), signedAt, method) },
@@ -3831,6 +3831,55 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     // Older than AI_MODEL_ACCESS_MAX_AGE_MS: unknown again, whatever it said.
     values.set(AI_MODEL_ACCESS_STORAGE_KEY, { includedModels: null, signedAt: Date.now() - AI_MODEL_ACCESS_MAX_AGE_MS - 1000 });
     expect(await obj.getAiModelAccess()).toEqual({ known: false });
+  });
+
+  it('a signed first credential push records unknown without inventing model access', async () => {
+    const { obj, values, send } = await credentialRoute();
+    const t = Date.now() - 1000;
+    const token = sessionToken('initial-unknown', t);
+    await send('POST', t, token, { creditsPending: null });
+    expect(values.get(AI_CREDITS_PENDING_STORAGE_KEY)).toEqual({ pending: null, signedAt: t });
+    expect(await obj.getAiCreditsRelay()).toBe('unknown');
+    expect(await obj.getAiModelAccess()).toEqual({ known: false });
+    expect(values.has(AI_MODEL_ACCESS_STORAGE_KEY)).toBe(false);
+    expect(await obj.getAiCredential()).toBe(token);
+  });
+
+  it('a signed server plan-only push carries receipt status without creating a credential', async () => {
+    const { obj, values, send } = await credentialRoute();
+    const t = Date.now() - 1000;
+    await send('POST', t, undefined, { includedModels: ['gemini-3.8-flash'], creditsPending: null });
+    expect(await obj.getAiModelAccess()).toEqual({ known: true, includedModels: ['gemini-3.8-flash'] });
+    expect(await obj.getAiCreditsRelay()).toBe('unknown');
+    expect(values.get(AI_CREDITS_PENDING_STORAGE_KEY)).toEqual({ pending: null, signedAt: t });
+    expect(await obj.getAiCredential()).toBeNull();
+  });
+
+  it('receipt CAS is independent from model timestamps and omitted pushes, including after DO recovery', async () => {
+    const { obj, values } = await object();
+    const t = Date.now() - 1000;
+    const expiresAt = Date.now() + 3600000;
+    const flash = ['gemini-3.8-flash'];
+    expect(await obj.getAiCreditsRelay()).toBe('legacy');
+    await obj.putAiModelAccess(flash, t + 200);
+    await obj.putAiCredential({ token: 'a', expiresAt }, t + 180, undefined, true);
+    expect(values.get(AI_MODEL_ACCESS_STORAGE_KEY)).toEqual({ includedModels: flash, signedAt: t + 200 });
+    expect(values.get(AI_CREDITS_PENDING_STORAGE_KEY)).toEqual({ pending: true, signedAt: t + 180 });
+    await obj.putAiModelAccess(flash, t + 300, true);
+    await obj.putAiModelAccess(null, t + 250, false);
+    expect(values.get(AI_CREDITS_PENDING_STORAGE_KEY)).toEqual({ pending: true, signedAt: t + 300 });
+    await obj.putAiModelAccess(flash, t + 400);
+    expect(values.get(AI_CREDITS_PENDING_STORAGE_KEY)).toEqual({ pending: true, signedAt: t + 300 });
+    const recovered = Object.assign(Object.create(Object.getPrototypeOf(obj)), { ctx: obj.ctx });
+    expect(await recovered.getAiCreditsRelay()).toBe('pending');
+    await obj.putAiModelAccess(null, t + 350, false);
+    expect(values.get(AI_MODEL_ACCESS_STORAGE_KEY)).toEqual({ includedModels: flash, signedAt: t + 400 });
+    expect(await recovered.getAiCreditsRelay()).toBe('none');
+    await obj.dropAiCredential(undefined, t + 500);
+    await obj.putAiCredential({ token: 'old', expiresAt }, t + 450, null, null);
+    expect(await obj.getAiCredential()).toBeNull();
+    expect(values.get(AI_MODEL_ACCESS_STORAGE_KEY)).toEqual({ includedModels: flash, signedAt: t + 400 });
+    expect(await recovered.getAiCreditsRelay()).toBe('unknown');
   });
 
   // Background work with the browser hidden or closed: one browser push, then only the server's plan-only pushes.

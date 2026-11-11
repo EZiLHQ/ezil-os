@@ -477,6 +477,7 @@ test('image baseline lookup selects successful deployments on the target branch 
 });
 
 const UNION_REF = 'refs/heads/staging/os-union-20261106';
+const IMAGE_HOTFIX_REF = 'refs/heads/staging/os-signup-feedback-hotfix-20261111';
 // Evaluates a job's folded `if: >-` with GitHub semantics for the operators it uses.
 function jobAdmitted(name, {ref, event, changes = 'success', images = 'success', imageChanged = 'true'}) {
   const job = workflowText.match(new RegExp(`\\n  ${name}:\\n([\\s\\S]*?)(?=\\n  [\\w-]+:\\n|$)`))[1];
@@ -518,13 +519,44 @@ test('only a manual dispatch of the exact staging union joins preview image and 
   }
 });
 
+test('only manual dispatch of the exact signup feedback hotfix admits images and never deployment', () => {
+  for (const [ref, event, expected] of [
+    [IMAGE_HOTFIX_REF, 'workflow_dispatch', true],
+    [IMAGE_HOTFIX_REF, 'push', false],
+    [IMAGE_HOTFIX_REF, 'pull_request', false],
+    [IMAGE_HOTFIX_REF, 'workflow_call', false],
+    [`${IMAGE_HOTFIX_REF}-copy`, 'workflow_dispatch', false],
+    ['refs/heads/staging/os-signup-feedback-hotfix-20261112', 'workflow_dispatch', false],
+    ['refs/tags/staging/os-signup-feedback-hotfix-20261111', 'workflow_dispatch', false],
+    ['refs/heads/Staging/OS-Signup-Feedback-Hotfix-20261111', 'workflow_dispatch', false],
+  ]) {
+    const context = {ref, event};
+    assert.equal(jobAdmitted('images', context), expected, `images ${ref} ${event}`);
+    for (const name of ['preview', 'production']) {
+      assert.equal(jobAdmitted(name, context), false, `${name} ${ref} ${event}`);
+    }
+  }
+  const hotfix = {ref:IMAGE_HOTFIX_REF, event:'workflow_dispatch'};
+  assert.equal(jobAdmitted('images', {...hotfix, imageChanged:'false'}), false);
+  // No detector or image result can turn the image-only ref into a deployment.
+  for (const changes of ['success', 'failure', 'cancelled', 'skipped']) {
+    for (const images of ['success', 'failure', 'cancelled', 'skipped']) {
+      for (const name of ['preview', 'production']) {
+        assert.equal(jobAdmitted(name, {...hotfix, changes, images}), false, `${name} ${changes} ${images}`);
+      }
+    }
+  }
+});
+
 test('case variants of admitted refs fail change detection before any image or deploy job', () => {
   const step = previewWorkflow.jobs.find(j => j.name === 'changes').steps[0];
   const script = step.text.match(/run: \|\n([\s\S]*)$/)[1];
   for (const [ref, ok] of [
-    [UNION_REF, true], ['refs/heads/preview', true], ['refs/heads/main', true], ['refs/tags/v1.2.3', true],
+    [UNION_REF, true], [IMAGE_HOTFIX_REF, true], ['refs/heads/preview', true], ['refs/heads/main', true], ['refs/tags/v1.2.3', true],
     ['refs/heads/feature/x', true], ['refs/heads/Staging/OS-Union-20261106', false],
     ['refs/heads/STAGING/os-union-20261106', false], ['refs/heads/Preview', false], ['refs/heads/MAIN', false],
+    ['refs/heads/Staging/OS-Signup-Feedback-Hotfix-20261111', false],
+    ['refs/heads/staging/os-signup-feedback-hotfix-20261111'.toUpperCase(), false],
   ]) {
     const result = runWorkflowScript('bash', ['-e', '-c', script], {env:{PATH:process.env.PATH, GITHUB_REF:ref}});
     assert.equal(result.status === 0, ok, `${ref}: ${result.output}`);
@@ -535,7 +567,7 @@ test('case variants of admitted refs fail change detection before any image or d
   }
 });
 
-test('union evidence artifacts get a slash-free name; preview, main and tag names are unchanged', () => {
+test('admitted staging evidence artifacts get slash-free names; preview, main and tags are unchanged', () => {
   const names = [...workflowText.matchAll(/name: (live-(?:changes|evidence)-\$\{\{ (.+?) \}\}-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\})/g)];
   assert.equal(names.length, 3);
   const evaluate = (expression, ref) => new Function('github', `return (${expression.replaceAll('==', '===')})`)(
@@ -546,6 +578,13 @@ test('union evidence artifacts get a slash-free name; preview, main and tag name
       assert.equal(evaluate(expression, ref), name);
     }
   }
+  // Only changes runs on the image-only hotfix: its artifact must also be valid.
+  assert.match(names[0][0], /name: live-changes-/);
+  assert.equal(evaluate(names[0][2], IMAGE_HOTFIX_REF), 'staging-os-signup-feedback-hotfix-20261111');
+  assert.doesNotMatch(evaluate(names[0][2], IMAGE_HOTFIX_REF), /[/\\]/);
+  // Deployment uploads cannot run on this ref and retain their original expressions.
+  assert.equal(evaluate(names[1][2], IMAGE_HOTFIX_REF), 'staging/os-signup-feedback-hotfix-20261111');
+  assert.equal(evaluate(names[2][2], IMAGE_HOTFIX_REF), 'staging/os-signup-feedback-hotfix-20261111');
   // The production upload keeps its original name; the union never reaches that job.
   assert.deepEqual(names.map(([, , expression]) => expression === 'github.ref_name'), [false, false, true]);
 });

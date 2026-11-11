@@ -76,15 +76,16 @@ describe('v3 public plans', () => {
     it('explains sessions, fair use, persistence, billing changes and storage in six FAQs', () => {
         const faq = getPricingContent().faq.items;
         expect(faq).toHaveLength(6);
-        expect(faq[0].answer).toContain('Free sessions last up to 1 hour. Standard and Premium sessions last up to 6 hours.');
+        expect(faq[0].answer).not.toMatch(/sessions? (last|up to)|[0-9]+ hours?\b/i);
         expect(faq[0].answer).toContain('computer stops');
         // Paid compute policy v1: Free keeps its monthly allowance; no paid plan is sold monthly hours (or "unlimited").
         expect(faq[1].question).toBe('How much computer time is included?');
         expect(faq[1].answer).toContain('Free includes about 5 hours of computer time a month; older Free accounts keep 8 hours.');
-        expect(faq[1].answer).toContain('Standard and Premium have no monthly computer-hours allowance: each session lasts up to 6 hours');
+        expect(faq[1].answer).toContain('Standard and Premium have no monthly computer-hours allowance, and starting a computer depends on available capacity.');
         expect(faq[1].answer).toContain('does not reset it');
         expect(faq[1].answer).not.toMatch(/40 hours|500|standard-hours/);
-        expect(JSON.stringify(faq)).not.toMatch(/monthly time|No session time limit/);
+        expect(JSON.stringify(faq)).not.toMatch(/monthly time|No session time limit|sessions? (last|up to)/i);
+        expect(JSON.stringify(getPricingContent())).not.toMatch(/longer sessions|long sessions|sessions? up to/i);
         expect(faq[2].answer).toContain('files and installed tools stay');
         expect(faq[2].answer).toContain('Running processes stop');
         expect(faq[3].answer).toContain('once payment succeeds');

@@ -1,20 +1,42 @@
-import { randomUUID } from 'node:crypto';
-import { and, desc, eq, isNull, sql, type ExtractTablesWithRelations } from 'drizzle-orm';
+import { createHash, randomUUID } from 'node:crypto';
+import { and, desc, eq, gte, isNull, notInArray, sql, type ExtractTablesWithRelations } from 'drizzle-orm';
 import type { PgDatabase, PgQueryResultHKT } from 'drizzle-orm/pg-core';
 import * as schema from '@/server/db/schema';
 import { computers } from '@/server/db/schema';
 import { feedbackAttachments, feedbackReports } from '@/server/db/schema/feedback';
-import { decodeScreenshots } from './image';
+import { decodeScreenshots, type FeedbackImage } from './image';
 import { fitsAttachmentBudget, isFeedbackRateLimited } from './rate-limit';
 import { feedbackFailureRefs, redactDescription, sanitizeDiagnostics } from './redact';
 import { captureServerContext } from './server-context';
-import { FEEDBACK_CATEGORIES, FEEDBACK_LIMITS, submittedImages, type FeedbackCreated, type FeedbackReportSummary, type FeedbackSubmit } from './types';
+import { FEEDBACK_CATEGORIES, FEEDBACK_LIMITS, submittedImages, type FeedbackCreated, type FeedbackReportSummary,
+    type FeedbackStaged, type FeedbackSubmit } from './types';
 
 export type FeedbackDb = Pick<
     PgDatabase<PgQueryResultHKT, typeof schema, ExtractTablesWithRelations<typeof schema>>, 'transaction' | 'select'
 >;
 
-export type FeedbackIngestResult = { status: 200 | 201; created: FeedbackCreated } | { status: 429 };
+export type FeedbackIngestResult = { status: 200 | 201; created: FeedbackCreated } | { status: 429 }
+    /** Upload-first: a referenced image is not staged for this user and request (or is too old); upload it again. */
+    | { status: 409; error: 'staged_images_missing' };
+
+export type FeedbackStageResult = { status: 200 | 201; staged: FeedbackStaged }
+    | { status: 409; error: 'report_already_sent' }
+    | { status: 413; error: 'payload_too_large' }
+    | { status: 429; error: 'staged_reports_limit' }
+    | { status: 507; error: 'attachment_budget' };
+
+/**
+ * Upload-first ticket: the report id a staged report will have, derived from the signed-in user and the
+ * report's clientRequestId (UUIDv8 layout). It is never a credential: every staged row is also read by `user_id`.
+ */
+export function stagingTicket(userId: string, clientRequestId: string): string {
+    const hex = createHash('sha256').update(`ezil-feedback-ticket\0${userId.toLowerCase()}\0${clientRequestId.toLowerCase()}`)
+        .digest('hex').slice(0, 32).split('');
+    hex[12] = '8';
+    hex[16] = (8 | (Number.parseInt(hex[16]!, 16) & 3)).toString(16);
+    const id = hex.join('');
+    return `${id.slice(0, 8)}-${id.slice(8, 12)}-${id.slice(12, 16)}-${id.slice(16, 20)}-${id.slice(20)}`;
+}
 
 // The schema deliberately has no uniqueness constraints (db/schema/feedback.ts:7).
 // Serialize each user's check+insert in a READ COMMITTED transaction so queued
@@ -57,6 +79,35 @@ export async function ingestFeedback(
         const serverContext = diagnostics && computerId
             ? await captureServerContext(tx as unknown as Parameters<typeof captureServerContext>[0], { userId, computerId, now })
             : null;
+        if (input.screenshotRefs) {
+            // Upload-first finalize: the staged rows become this report's images, all or none. Same lock order as a PUT.
+            await tx.execute(sql`select pg_advisory_xact_lock(${ATTACHMENT_LOCK}::int4, 0)`);
+            const id = stagingTicket(userId, input.clientRequestId);
+            const staged = await stagedRows(tx, userId, id);
+            const fresh = now.getTime() - FEEDBACK_LIMITS.stagedImageFreshMs;
+            const ordered = input.screenshotRefs.map(ref => staged.find(row => row.sha256 === ref.sha256
+                && row.contentType === ref.contentType && row.createdAt.getTime() >= fresh));
+            if (ordered.some(row => !row)) return { status: 409, error: 'staged_images_missing' };
+            const kept = input.screenshotRefs.map(ref => ref.sha256);
+            // Staged but no longer referenced (removed before this request was frozen): not part of the report.
+            await tx.delete(feedbackAttachments).where(and(eq(feedbackAttachments.reportId, id),
+                eq(feedbackAttachments.userId, userId), notInArray(feedbackAttachments.sha256, kept)));
+            // Report order, as for inline images. Every row is under an hour old, so moving it to `now` keeps it in
+            // the same 24 h budget window: the global sums do not change.
+            for (const [index, sha256] of kept.entries()) {
+                await tx.update(feedbackAttachments).set({ createdAt: new Date(now.getTime() + index) })
+                    .where(and(eq(feedbackAttachments.reportId, id), eq(feedbackAttachments.userId, userId),
+                        eq(feedbackAttachments.sha256, sha256)));
+            }
+            await tx.insert(feedbackReports).values({
+                id, userId, computerId, createdAt: now, category: input.category,
+                description: description.text, diagnostics: serverContext ? { ...diagnostics, serverContext } : diagnostics,
+                clientRequestId: input.clientRequestId,
+                shellVersion: diagnostics?.shellVersion ?? null, status: 'new', redactionCount: description.count,
+                hasScreenshot: true, deploySha,
+            });
+            return { status: 201, created: { id, createdAt: now.toISOString(), screenshotAccepted: true, screenshotCount: kept.length } };
+        }
         let screenshotAccepted = false;
         if (images.length) {
             await tx.execute(sql`select pg_advisory_xact_lock(${ATTACHMENT_LOCK}::int4, 0)`);
@@ -94,6 +145,71 @@ async function countAttachments(db: Pick<FeedbackDb, 'select'>, userId: string, 
     const [row] = await db.select({ count: sql<number>`count(*)`.mapWith(Number) }).from(feedbackAttachments)
         .where(and(eq(feedbackAttachments.reportId, reportId), eq(feedbackAttachments.userId, userId)));
     return row?.count ?? 0;
+}
+
+type StagedRow = { sha256: string; contentType: string; byteLength: number; createdAt: Date };
+
+/** This user's rows under one ticket, locked for the rest of the transaction. */
+async function stagedRows(db: Pick<FeedbackDb, 'select'>, userId: string, ticket: string): Promise<StagedRow[]> {
+    return db.select({ sha256: feedbackAttachments.sha256, contentType: feedbackAttachments.contentType,
+        byteLength: feedbackAttachments.byteLength, createdAt: feedbackAttachments.createdAt })
+        .from(feedbackAttachments)
+        .where(and(eq(feedbackAttachments.reportId, ticket), eq(feedbackAttachments.userId, userId)))
+        .for('update');
+}
+
+/**
+ * Upload-first: store one image for a report that is not sent yet. Only the shell's explicit Send calls this, then
+ * finalizes with `screenshotRefs`. Idempotent per (user, clientRequestId, image): the same image again is a no-op,
+ * or renews its timestamp once it is too old to finalize. A report already stored is never changed: the same image
+ * is acknowledged, anything else is refused. Lock order matches `ingestFeedback`: the user, then the global budget.
+ */
+export async function stageFeedbackImage(
+    db: FeedbackDb, userId: string, clientRequestId: string, image: FeedbackImage, now = new Date(),
+): Promise<FeedbackStageResult> {
+    return db.transaction(async (tx): Promise<FeedbackStageResult> => {
+        await tx.execute(sql`select pg_advisory_xact_lock(${USER_LOCK}::int4, hashtext(${userId}::uuid::text))`);
+        const staged = { sha256: image.sha256, finalized: false };
+        const [report] = await tx.select({ id: feedbackReports.id }).from(feedbackReports)
+            .where(and(eq(feedbackReports.userId, userId), eq(feedbackReports.clientRequestId, clientRequestId))).limit(1);
+        if (report) {
+            // A finalize whose answer was lost is retried as PUTs first: acknowledge what the report holds, add nothing.
+            const [held] = await tx.select({ sha256: feedbackAttachments.sha256 }).from(feedbackAttachments)
+                .where(and(eq(feedbackAttachments.reportId, report.id), eq(feedbackAttachments.userId, userId),
+                    eq(feedbackAttachments.sha256, image.sha256))).limit(1);
+            return held ? { status: 200, staged: { ...staged, finalized: true } } : { status: 409, error: 'report_already_sent' };
+        }
+        const ticket = stagingTicket(userId, clientRequestId);
+        const rows = await stagedRows(tx, userId, ticket);
+        const same = rows.find(row => row.sha256 === image.sha256);
+        if (same && same.createdAt.getTime() >= now.getTime() - FEEDBACK_LIMITS.stagedImageFreshMs) return { status: 200, staged };
+        const others = rows.filter(row => row !== same);
+        if (others.length >= FEEDBACK_LIMITS.imagesMax
+            || others.reduce((sum, row) => sum + row.byteLength, 0) + image.byteLength > FEEDBACK_LIMITS.imagesBytesTotal) {
+            return { status: 413, error: 'payload_too_large' };
+        }
+        const ttlStart = now.getTime() - FEEDBACK_LIMITS.stagedImageTtlMs;
+        if (!rows.some(row => row.createdAt.getTime() >= ttlStart)) {
+            // Bounded unsent work per user: tickets holding staged rows from the last day that are not reports yet. A
+            // ticket whose rows are all older than that is not counted, so reactivating it is admitted like a new one.
+            const [pending] = await tx.select({ count: sql<number>`count(distinct ${feedbackAttachments.reportId})`.mapWith(Number) })
+                .from(feedbackAttachments)
+                .where(and(eq(feedbackAttachments.userId, userId),
+                    gte(feedbackAttachments.createdAt, new Date(ttlStart)),
+                    sql`not exists (select 1 from ${feedbackReports} r where r.id = ${feedbackAttachments.reportId})`));
+            if ((pending?.count ?? 0) >= FEEDBACK_LIMITS.stagedTicketsPerUser) return { status: 429, error: 'staged_reports_limit' };
+        }
+        await tx.execute(sql`select pg_advisory_xact_lock(${ATTACHMENT_LOCK}::int4, 0)`);
+        // Staged bytes count against the global budgets from the moment they are stored.
+        if (!await fitsAttachmentBudget(tx, image.byteLength, now, same)) return { status: 507, error: 'attachment_budget' };
+        if (same) {
+            await tx.delete(feedbackAttachments).where(and(eq(feedbackAttachments.reportId, ticket),
+                eq(feedbackAttachments.userId, userId), eq(feedbackAttachments.sha256, image.sha256)));
+        }
+        await tx.insert(feedbackAttachments).values({ reportId: ticket, userId, createdAt: now, contentType: image.contentType,
+            sha256: image.sha256, byteLength: image.byteLength, bytes: image.bytes });
+        return { status: 201, staged };
+    }, { isolationLevel: 'read committed' });
 }
 
 export async function listFeedback(db: FeedbackDb, userId: string): Promise<FeedbackReportSummary[]> {
