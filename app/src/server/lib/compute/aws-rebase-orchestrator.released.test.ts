@@ -4,6 +4,7 @@ import { releasedPoolSetup, RELEASED_POOL_HOST } from './aws-rebase.test-support
 import { fixtureReleaseRegistry106 } from './aws-rebase-release-registry.test-support';
 import { parseEnrollmentUserData } from './aws-rebase-lease';
 import { nonceHashOf } from './aws-enroll';
+import { LifecycleDeploymentSchema } from './aws-intent';
 
 type Setup = ReturnType<typeof releasedPoolSetup>;
 const OTHER = '99999999-9999-4999-8999-999999999999';
@@ -35,6 +36,31 @@ describe('DESIGN R: a STOPPED computer whose warm-pool host was released', () =>
         expect((await s.request('prepare')).status).toBe(202);
         expect(s.fake.imageJobs).toHaveLength(1); expect(s.started).toHaveLength(1);
         expect(s.deps.executions.history).toHaveBeenCalledTimes(reads);
+    });
+    it('plans and prepares a proven legacy launch with absent image keys using the retained source record', async () => {
+        const s = releasedPoolSetup({ shared: true });
+        const fields = ['lowerImageDigest', 'previousLowerImageDigest', 'preparationStateMachineVersionArn', 'recoveryStateMachineVersionArn'];
+        const legacy = LifecycleDeploymentSchema.parse(Object.fromEntries(Object.entries(s.provisioned).filter(([k]) => !fields.includes(k))));
+        const record = { ...s.f.release105, previousLowerImageDigest: null, previousLowerImageRef: null,
+            preparationStateMachineVersionArn: null };
+        s.env.EZIL_AWS_LIFECYCLE_DEPLOYMENTS = JSON.stringify({ [s.f.entry.region]: { ...s.f.entry,
+            releases: s.f.entry.releases.map(r => r === s.f.release105 ? record : r) } });
+        s.setProvision(legacy); s.setRelease({ deployment: legacy });
+        const canonicalProvision = s.provision().input;
+        expect((await s.request('plan')).body).toMatchObject({ eligible: true, failureCode: null, jobId: null });
+        expect(s.fake.imageJobs).toHaveLength(0); expect(s.started).toHaveLength(0);
+        expect((await s.request('prepare')).status).toBe(202);
+        const job = await s.current(), document = JSON.parse(job.preparationDocument);
+        expect(job.sourceRelease).toEqual(record);
+        expect(document.sourceDeployment).toMatchObject({ amiId: record.amiId, launchTemplateVersion: record.launchTemplateVersion,
+            stateMachineVersionArn: record.stateMachineVersionArn, lowerImageDigest: record.lowerImageDigest,
+            previousLowerImageDigest: null, preparationStateMachineVersionArn: null,
+            recoveryStateMachineVersionArn: record.recoveryStateMachineVersionArn });
+        expect(document.releasedPoolHost).toEqual({ poolHostId: RELEASED_POOL_HOST,
+            lifecycleDigest: s.provision().digest, releaseExecutionArn: s.releaseArn });
+        expect(s.started).toHaveLength(1); expect(JSON.parse(s.started[0]!.input).document).toBe(job.preparationDocument);
+        expect(s.provision().input).toBe(canonicalProvision);
+        expect(fields.every(k => !Object.prototype.hasOwnProperty.call(legacy, k))).toBe(true);
     });
     it('accepts a unique lower whose aged-out host is the released one', async () => {
         const s = releasedPoolSetup();
