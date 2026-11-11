@@ -56,7 +56,7 @@ vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({ auth: {
 
 type FakeWorld = { bridge: { handle(request: unknown): Promise<unknown> }; models: Map<string, unknown>; calls: { started: number; switched: { id: string; identifier: string }[] };
     widget(id: string): { input: { currentLanguageModel: string } } };
-const fake = createRequire(import.meta.url)('../../../../worker/copilot-chat/chat-bridge-fake.cjs') as {
+let fake: {
     world: (opts?: Record<string, unknown>) => FakeWorld };
 // The picker as the editor offers it: the computer's configured models, one of them a direct (static) provider.
 const PICKER = [
@@ -183,6 +183,8 @@ describe.skipIf(!URL_)('model choice through the MCP: real Gateway evidence per 
         String((await client`SELECT id FROM public.ezil_agent_sessions WHERE computer_id = ${people[who].computer}::uuid AND resource LIKE '%/s1'`)[0]!.id);
 
     beforeAll(async () => {
+        // Resolve desktop fixtures only when the database integration suite actually runs.
+        fake = createRequire(import.meta.url)('../../../../worker/copilot-chat/chat-bridge-fake.cjs');
         server = http.createServer((req, res) => {
             const token = String(req.headers.authorization ?? '').replace(/^Bearer /, '');
             gatewayCalls.push(`${token.slice(0, 5)} ${req.method} ${req.url}`);

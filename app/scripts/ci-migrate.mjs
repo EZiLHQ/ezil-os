@@ -32,6 +32,8 @@ import { fileURLToPath } from 'node:url';
 const DRIZZLE_DIR = fileURLToPath(new URL('../drizzle/', import.meta.url));
 const ENDPOINT = 'https://api.supabase.com/v1/projects/btgqfmnzycdecmeyqubx/database/query';
 const BASENAME = /^\d{4}_[a-z0-9]+(?:_[a-z0-9]+)*\.sql$/;
+// Recognize the separate hardening journal entries without making them selectable by this helper.
+const JOURNAL_SOURCE = /^(?:hardening\/)?\d{4}_[a-z0-9]+(?:_[a-z0-9]+)*\.sql$/;
 const MAX_BYTES = 1024 * 1024;
 const USAGE = 'usage: node app/scripts/ci-migrate.mjs (--dry-run | --apply) <basename.sql> [...]';
 
@@ -225,7 +227,7 @@ export async function loadSelection(names, drizzleDir = DRIZZLE_DIR) {
     const order = new Map();
     let lastIndex = -1;
     for (const entry of manifest.entries) {
-        requireSafe(entry && typeof entry.tag === 'string' && BASENAME.test(`${entry.tag}.sql`)
+        requireSafe(entry && typeof entry.tag === 'string' && JOURNAL_SOURCE.test(`${entry.tag}.sql`)
             && Number.isInteger(entry.idx) && entry.idx > lastIndex
             && !order.has(`${entry.tag}.sql`), 'invalid migration manifest entry');
         lastIndex = entry.idx;

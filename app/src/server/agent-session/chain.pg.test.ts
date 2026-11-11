@@ -70,7 +70,7 @@ type FakeWorld = {
     open: string[];
     widget(id: string): { input: { currentLanguageModel: string } };
 };
-const fake = createRequire(import.meta.url)('../../../../worker/copilot-chat/chat-bridge-fake.cjs') as {
+let fake: {
     world: (opts?: { sessions?: string[]; open?: string[] }) => FakeWorld;
 };
 
@@ -149,6 +149,8 @@ describe.skipIf(!URL_)('OS <-> editor chain (real OS, Worker forwarder, extensio
     };
 
     beforeAll(async () => {
+        // Resolve desktop fixtures only when the database integration suite actually runs.
+        fake = createRequire(import.meta.url)('../../../../worker/copilot-chat/chat-bridge-fake.cjs');
         client = postgres(URL_!, { max: 8, prepare: false, onnotice: () => {} });
         h.db = drizzle(client, { schema });
         await ensureTestSchema(client);
