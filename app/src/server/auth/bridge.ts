@@ -2,7 +2,7 @@ import 'server-only';
 
 import { randomUUID } from 'node:crypto';
 import type { SponsorCampaign } from '@/server/billing/v3/sponsor';
-import { materializeSponsorAttribution, SPONSOR_CREATION_METADATA, sponsorCreationHint } from './sponsor';
+import { materializeSponsorAttribution, SPONSOR_CREATION_METADATA, sponsorCreationHint, sponsorSubjectSupported } from './sponsor';
 
 import { createClient } from '@/utils/supabase/server';
 
@@ -40,6 +40,8 @@ export async function refuseSilentAccountSwitch(identity: Auth0Identity): Promis
 
 /** The caller must first verify the Auth0 ID token, including verified email. */
 export async function bridgeAuth0Identity(identity: Auth0Identity, sponsor?: SponsorCampaign): Promise<void> {
+    // Unsupported sponsor identities fail before Admin effects; ordinary public sign-in keeps its existing contract.
+    if (sponsor && !sponsorSubjectSupported(identity.sub)) throw new Auth0Error('invalid_transaction');
     const admin = createAdminClient().auth.admin;
     const email = identity.email.toLowerCase();
     let user;

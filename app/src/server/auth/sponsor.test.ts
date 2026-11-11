@@ -56,6 +56,30 @@ describe('sponsor auth authority', () => {
         vi.setSystemTime(new Date('2026-11-12T12:00:01Z'));
         expect(sponsorFromCreationHint(hint, 'user-one', 'auth0|one')).toBeNull();
     });
+    it.each(['auth0|' + 's'.repeat(249), '"'.repeat(255)])('materializes genuine signup recovery at maximum UUID/subject/campaign bounds (%#)', async subject => {
+        registry({ ...entry, campaignId: 'c'.repeat(64) });
+        const campaign = sponsorFromLink(token)!;
+        const userId = '11111111-1111-4111-8111-111111111111';
+        expect(subject).toHaveLength(255);
+        const hint = sponsorCreationHint(campaign, userId, subject);
+        expect(hint.split('.')[0].length).toBeGreaterThan(600);
+        expect(hint.split('.')[0].length).toBeLessThanOrEqual(1024);
+        expect(sponsorFromCreationHint(hint, userId, subject)?.campaign).toEqual(campaign);
+        expect(sponsorFromCreationHint(hint + 'x', userId, subject)).toBeNull();
+        await materializeSponsorAttribution({ userId, verifiedSubject: subject,
+            metadata: { auth0_sub: subject, [SPONSOR_CREATION_METADATA]: hint } });
+        expect(stub.record).toHaveBeenCalledWith(stub.db, expect.objectContaining({ campaign, signedUpAt: new Date('2026-11-11T12:00:00Z') }));
+    });
+    it('refuses oversize and non-ASCII subjects only for sponsor hint/sign-up attribution', async () => {
+        const campaign = sponsorFromLink(token)!;
+        const hint = sponsorCreationHint(campaign, 'user-one', 'auth0|one');
+        for (const subject of ['s'.repeat(256), 'é'.repeat(255)]) {
+            expect(() => sponsorCreationHint(campaign, 'user-one', subject)).toThrow('sponsor_subject_unsupported');
+            expect(sponsorFromCreationHint(hint, 'user-one', subject)).toBeNull();
+            await materializeSponsorAttribution({ userId: 'user-one', verifiedSubject: subject, metadata: { auth0_sub: subject }, campaign });
+        }
+        expect(stub.record).not.toHaveBeenCalled();
+    });
     it('existing login attribution has no signup timestamp; recovery retains original creation time on replay', async () => {
         const campaign = sponsorFromLink(token)!;
         await materializeSponsorAttribution({ userId: 'user-one', verifiedSubject: 'auth0|one', metadata: { auth0_sub: 'auth0|one' }, campaign });

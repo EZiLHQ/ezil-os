@@ -111,5 +111,21 @@ describe('account key and signed context', () => {
         expect(verifySponsorContext(KEY, hint, 'auth0:abc', new Date(NOW.getTime() + (SPONSOR_CONTEXT_TTL_SECONDS + 60) * 1000))?.kind).toBe('creation');
         expect(verifySponsorContext(KEY, hint, 'auth0:abc', new Date(NOW.getTime() + (SPONSOR_CREATION_HINT_TTL_SECONDS + 1) * 1000))).toBeNull();
     });
+    it('round-trips the maximum supported UUID/subject/campaign creation hint beyond the former 600-character cap', () => {
+        const subject = `${user}|${'s'.repeat(255)}`;
+        const token = signSponsorContext(KEY, ctx({ kind: 'creation', campaignId: 'c'.repeat(64), nonce: 'n'.repeat(32), subject }));
+        expect(token.split('.')[0].length).toBeGreaterThan(600);
+        expect(token.split('.')[0].length).toBeLessThanOrEqual(1024);
+        expect(verifySponsorContext(KEY, token, subject, NOW)).toMatchObject({ kind: 'creation', campaignId: 'c'.repeat(64) });
+        const [body, signature] = token.split('.');
+        const changed = `${body.slice(0, -1)}${body.endsWith('A') ? 'B' : 'A'}.${signature}`;
+        expect(verifySponsorContext(KEY, changed, subject, NOW)).toBeNull();
+    });
+    it('still refuses a validly signed context body beyond the bounded 1024-character ceiling', () => {
+        const subject = 's'.repeat(1024);
+        const token = signSponsorContext(KEY, ctx({ kind: 'creation', subject }));
+        expect(token.split('.')[0].length).toBeGreaterThan(1024);
+        expect(verifySponsorContext(KEY, token, subject, NOW)).toBeNull();
+    });
     it('refuses to sign with an unusable key', () => expect(() => signSponsorContext('short', ctx())).toThrow('sponsor_key_unusable'));
 });

@@ -120,7 +120,8 @@ export function signSponsorContext(key: string, context: SponsorContext & { subj
     return `${body}.${hmac(key, CONTEXT_DOMAIN, body).toString('base64url')}`;
 }
 export function verifySponsorContext(key: string, value: string | undefined, subject: string, now: Date): SponsorContext | null {
-    const match = /^([A-Za-z0-9_-]{20,600})\.([A-Za-z0-9_-]{43})$/.exec(value ?? '');
+    // Includes the bounded UUID + 255-character verified subject used by creation recovery.
+    const match = /^([A-Za-z0-9_-]{20,1024})\.([A-Za-z0-9_-]{43})$/.exec(value ?? '');
     if (!match || !usableKey(key) || !safeEqual(Buffer.from(match[2]!, 'base64url'), hmac(key, CONTEXT_DOMAIN, match[1]!))) return null;
     try {
         const [kind, campaignId, configSha256, issued, nonce, boundSubject] = JSON.parse(Buffer.from(match[1]!, 'base64url').toString('utf8')) as unknown[];

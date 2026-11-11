@@ -25,14 +25,18 @@ export function sponsorFromTransaction(value: string, origin: string, state: str
     return authorization.ok ? authorization.campaign : null;
 }
 
+/** OIDC subjects are at most 255 ASCII characters. This bound applies only to sponsor handling. */
+export const sponsorSubjectSupported = (subject: string): boolean => /^[\x21-\x7e]{1,255}$/.test(subject);
+
 export const SPONSOR_CREATION_METADATA = 'ezil_sponsor_creation_v1';
 /** Written ONLY during Admin createUser, never on a login/link/update of an existing user. */
 export function sponsorCreationHint(campaign: SponsorCampaign, userId: string, verifiedSubject: string): string {
+    if (!sponsorSubjectSupported(verifiedSubject)) throw new Error('sponsor_subject_unsupported');
     return signSponsorContext(process.env.SPONSOR_KEY!, { kind: 'creation', campaignId: campaign.campaignId,
         configSha256: campaign.configSha256, issuedAt: new Date(), nonce: randomBytes(24).toString('base64url'), subject: `${userId}|${verifiedSubject}` });
 }
 export function sponsorFromCreationHint(value: unknown, userId: string, verifiedSubject: string, now = new Date()): { campaign: SponsorCampaign; signedUpAt: Date } | null {
-    if (typeof value !== 'string') return null;
+    if (typeof value !== 'string' || !sponsorSubjectSupported(verifiedSubject)) return null;
     const context = verifySponsorContext(process.env.SPONSOR_KEY ?? '', value, `${userId}|${verifiedSubject}`, now);
     if (!context || context.kind !== 'creation') return null;
     const runtime = readSponsorRuntime();
@@ -46,7 +50,7 @@ let writer: Promise<readonly [typeof import('@/server/db'), typeof import('./spo
 /** Lazy DB import keeps ordinary auth independent of sponsor SQL/config. Called only after verified OTP session. */
 export async function materializeSponsorAttribution(input: { userId: string; verifiedSubject: string; metadata: Record<string, unknown>; campaign?: SponsorCampaign }): Promise<void> {
     const runtime = readSponsorRuntime();
-    if (!runtime.enabled || input.metadata.auth0_sub !== input.verifiedSubject) return;
+    if (!runtime.enabled || !sponsorSubjectSupported(input.verifiedSubject) || input.metadata.auth0_sub !== input.verifiedSubject) return;
     const recovered = sponsorFromCreationHint(input.metadata[SPONSOR_CREATION_METADATA], input.userId, input.verifiedSubject);
     const campaign = recovered?.campaign ?? input.campaign;
     if (!campaign) return;

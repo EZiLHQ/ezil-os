@@ -20,7 +20,7 @@ beforeEach(() => {
     vi.stubEnv('SPONSOR_REGISTRY', document); vi.stubEnv('SPONSOR_REGISTRY_SIG', signSponsorRegistry(document, key));
     user = { id: 'existing-user', email: identity.email, email_confirmed_at: '2026-11-01T00:00:00Z', app_metadata: { auth0_sub: identity.sub } };
     stub.listUsers.mockResolvedValue({ data: { users: [] }, error: null });
-    stub.createUser.mockImplementation(async input => { user = { ...user, id: input.id, app_metadata: input.app_metadata }; return { data: { user }, error: null }; });
+    stub.createUser.mockImplementation(async input => { user = { ...user, id: input.id ?? user.id, app_metadata: input.app_metadata }; return { data: { user }, error: null }; });
     stub.generateLink.mockImplementation(async () => ({ data: { user, properties: { hashed_token: 'synthetic-otp' } }, error: null }));
     stub.verifyOtp.mockImplementation(async () => ({ data: { user, session: {} }, error: null }));
 });
@@ -42,6 +42,15 @@ describe('sponsor bridge signup authority', () => {
         expect(stub.createUser).not.toHaveBeenCalled();
         expect(stub.updateUserById.mock.calls[0][1].app_metadata).toEqual({ role: 'member', auth0_sub: identity.sub });
         expect(stub.materialize.mock.calls[0][0].metadata[SPONSOR_CREATION_METADATA]).toBeUndefined();
+    });
+    it('unsupported long subject refuses sponsor effects but preserves normal public account creation/sign-in', async () => {
+        const unsupported = { ...identity, sub: 's'.repeat(256) };
+        await expect(bridgeAuth0Identity(unsupported, sponsorFromLink(token)!)).rejects.toThrow('invalid_transaction');
+        expect(stub.listUsers).not.toHaveBeenCalled(); expect(stub.createUser).not.toHaveBeenCalled();
+        expect(stub.materialize).not.toHaveBeenCalled();
+        await expect(bridgeAuth0Identity(unsupported)).resolves.toBeUndefined();
+        expect(stub.createUser).toHaveBeenCalledWith({ email: identity.email, email_confirm: true, app_metadata: { auth0_sub: unsupported.sub } });
+        expect(stub.verifyOtp).toHaveBeenCalledOnce(); expect(stub.materialize).not.toHaveBeenCalled();
     });
     it('failed OTP never materializes attribution', async () => {
         stub.verifyOtp.mockResolvedValue({ data: { user: null, session: null }, error: {} });
