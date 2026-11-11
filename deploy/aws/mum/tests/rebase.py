@@ -940,6 +940,28 @@ class LegacyLifecycleCapabilityTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaises(ValueError):
                 self.cfn.preserve_legacy_lifecycle(self.before, after)
 
+    def test_known_existing_image_iam_projections_have_no_legacy_runtime(self):
+        for filename in ('pool-iam-templates.json', 'pool-iam-incremental.json'):
+            before = manifest.read(HERE / 'fixtures' / filename)['workflows']['before']
+            with self.subTest(filename=filename):
+                self.assertIsNone(self.cfn.retained_lifecycle_source(before, self.source))
+                self.cfn.preserve_legacy_lifecycle(before, copy.deepcopy(before))
+                before['Resources']['ExistingKey'] = {'Type': 'AWS::KMS::Key'}
+                self.assertIsNone(self.cfn.retained_lifecycle_source(before, self.source))
+
+    def test_iam_projection_does_not_hide_unknown_role_or_partial_runtime(self):
+        before = manifest.read(HERE / 'fixtures/pool-iam-templates.json')['workflows']['before']
+        for change in ('generated-role', 'trust', 'boundary', 'name', 'partial-runtime'):
+            candidate = copy.deepcopy(before)
+            role = candidate['Resources'][self.cfn.LEGACY_RECOVERY_ROLE]['Properties']
+            if change == 'generated-role': del role['RoleName']
+            elif change == 'trust': role['AssumeRolePolicyDocument']['Statement'][0]['Principal']['Service'] = 'lambda.amazonaws.com'
+            elif change == 'boundary': role['PermissionsBoundary'] = 'foreign-boundary'
+            elif change == 'name': role['RoleName'] = 'foreign-role'
+            else: candidate['Resources']['UnexpectedRuntime'] = {'Type': 'AWS::Lambda::Function'}
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'observer settings required'):
+                self.cfn.retained_lifecycle_source(candidate, self.source)
+
     def test_image_mode_without_legacy_source_is_unchanged(self):
         before = copy.deepcopy(self.after)
         self.assertIsNone(self.cfn.retained_lifecycle_source(before, self.source))

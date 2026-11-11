@@ -432,6 +432,13 @@ def legacy_lifecycle_capabilities(before):
     resources = before['Resources']
     if LIFECYCLE_CONTROLLER_POLICY not in resources:
         return None
+    # Existing pool-IAM reviews may contain only the known image-role policy
+    # projection. They carry no legacy runtime graph from which to retain refs.
+    if (LIFECYCLE_OBSERVER not in resources
+            and all(r.get('Type') in {'AWS::IAM::Role', 'AWS::IAM::Policy', 'AWS::KMS::Key', 'AWS::CDK::Metadata'}
+                    for r in resources.values())
+            and existing_image_recovery_role(resources.get(LEGACY_RECOVERY_ROLE, {}))):
+        return None
     function = resources.get(LIFECYCLE_OBSERVER, {})
     raw = function.get('Properties', {}).get('Environment', {}).get('Variables', {}).get('EZIL_LIFECYCLE_SETTINGS')
     need(isinstance(raw, str), 'legacy lifecycle observer settings required')
@@ -553,7 +560,6 @@ def validate_templates(phase, before, after, review, unchanged=False, pool_iam=N
         roles=[k for k,v in new.items() if v['Type']=='AWS::IAM::Role' and v.get('Properties',{}).get('PermissionsBoundary')==boundary]
         need(len(roles)==2 and any('RebasePreparationRole' in k for k in roles) and any('RecoveryRole' in k for k in roles),'exactly preparation and recovery execution roles require the image-job boundary')
         preserve_legacy_recovery(before, after, boundary)
-        preserve_legacy_lifecycle(before, after)
 
     for logical in old.keys() | new.keys():
         if old.get(logical)==new.get(logical):
@@ -633,6 +639,8 @@ def validate_templates(phase, before, after, review, unchanged=False, pool_iam=N
             # Full resource equality also pins every other target field.
             actual[logical]=entry
     need(actual==review['changes'] and (bool(actual) or action_reorder),'review does not exactly enumerate template changes')
+    if phase == 'workflows':
+        preserve_legacy_lifecycle(before, after)
     return actual
 
 
