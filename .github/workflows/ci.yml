@@ -178,7 +178,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        os: [ubuntu-24.04]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -418,7 +418,7 @@ jobs:
   # even though it changes nothing about today's (pre-M1) red result.
   container:
     name: container (real image)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Job-level, not workflow-level: only this job and `local` (below) need
     # `packages: read`, and the workflow-level `permissions:` block above
     # stays `contents: read` for every other job, including on a fork's PR.
@@ -504,7 +504,7 @@ jobs:
   # ── local (typecheck + unit + smoke) — pulls the real image too ────────────
   local:
     name: local (typecheck + unit + smoke)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: read

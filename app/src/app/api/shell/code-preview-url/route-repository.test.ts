@@ -241,6 +241,29 @@ describe('opening a repository from its address in Code', () => {
         expect(s.requests).toEqual([]);
     });
 
+    it('allows capability-enabled standalone AWS only with matching preview and final placement', async () => {
+        vi.stubEnv('AWS_STANDALONE_REPO_OPEN_ENABLED', 'true');
+        s.aws = [true, true, true, true];
+        s.preview = { ...s.preview, computeProvider: 'aws-ec2', sandboxId: SANDBOX, generation: 3, leaseEpoch: 1 };
+        s.worker = body => Response.json({ ok: true, folder: `/workspace/projects/${JSON.parse(body).repositoryId}`, status: 'cloned' });
+        const response = await post({ computerId: COMPUTER, repository: { url: EZIL_URL } });
+        expect(response.status).toBe(200);
+        expect(s.order).toContain('worker');
+        expect(s.order).not.toContain('github');
+    });
+    it.each([
+        { computeProvider: 'cloudflare' },
+        { computeProvider: 'aws-ec2', sandboxId: SANDBOX, generation: 2, leaseEpoch: 1 },
+        { computeProvider: 'aws-ec2', sandboxId: SANDBOX, generation: 3, leaseEpoch: 2 },
+    ])('refuses a preview minted for another provider or epoch before AWS repo-open: %j', async preview => {
+        vi.stubEnv('AWS_STANDALONE_REPO_OPEN_ENABLED', 'true');
+        s.aws = [true, true];
+        s.preview = { ...s.preview, ...preview };
+        const response = await post({ computerId: COMPUTER, repository: { url: EZIL_URL } });
+        expect(response.status).toBe(409);
+        expect((await response.json()).error.code).toBe('repo_open_computer_changed');
+        expect(s.order).not.toContain('worker');
+    });
     it.each([[404], [401], [403]])("GitHub %i: \"This repository doesn't exist.\" (404) and the computer is never woken for it", async status => {
         s.github = () => new Response('Repository not found.', { status, headers: { 'content-type': 'text/plain' } });
         const response = await openUrl();

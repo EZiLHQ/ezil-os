@@ -11,3 +11,8 @@ export function standaloneGitUrlEnabled(env: Record<string, string | undefined> 
         return false;
     }
 }
+
+/** Host standalone operation is capability-gated independently of the existing URL feature. */
+export function awsStandaloneGitEnabled(env: Record<string, string | undefined> = process.env): boolean {
+    return /^(1|true|on)$/i.test((env.AWS_STANDALONE_REPO_OPEN_ENABLED ?? '').trim());
+}

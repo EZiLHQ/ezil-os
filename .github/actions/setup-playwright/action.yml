@@ -95,6 +95,25 @@ runs:
         npm init -y >/dev/null
         npm i "playwright@${{ inputs.version }}" >/dev/null
 
+    - name: Linux OS and apt DNS diagnostics
+      shell: bash
+      run: |
+        if [ "${RUNNER_OS}" = "Linux" ]; then
+          sed -n '/^PRETTY_NAME=/p' /etc/os-release
+          for domain in azure.archive.ubuntu.com archive.ubuntu.com security.ubuntu.com; do
+            echo "DNS: ${domain}"
+            timeout 5 getent ahostsv4 "${domain}" | head -n 2 || true
+          done
+        fi
+
+    - name: Verify signed Ubuntu apt mirror fallback
+      shell: bash
+      run: |
+        if [ "${RUNNER_OS}" = "Linux" ]; then
+          python3 "${GITHUB_ACTION_PATH}/ubuntu-apt-mirror.test.py"
+          sudo python3 "${GITHUB_ACTION_PATH}/ubuntu-apt-mirror.py"
+        fi
+
     - name: Install chromium (--with-deps only on Linux)
       shell: bash
       working-directory: ${{ steps.prep.outputs.dir }}

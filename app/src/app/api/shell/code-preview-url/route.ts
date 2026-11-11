@@ -264,7 +264,7 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     }
     // The Worker fetches a public github.com repository only on os-staging (`repoOpenRemotesFor`); any other
     // deployment would wake the computer for an open it then refuses. Refused first, with nothing read or woken.
-    const { standaloneGitUrlEnabled } = await import('@/server/git/staging');
+    const { standaloneGitUrlEnabled, awsStandaloneGitEnabled } = await import('@/server/git/staging');
     if (!standaloneGitUrlEnabled()) {
         return shellRefusal(409, 'repo_url_not_enabled', "Opening a repository from its address isn't available here yet.");
     }
@@ -272,7 +272,7 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     const deadline = AbortSignal.any([request.signal, AbortSignal.timeout(Math.max(1, left()))]);
 
     await caller.computer.get({ id: computerId });
-    if (isAws(await target(ctx, computerId))) return unsupportedProvider();
+    if (isAws(await target(ctx, computerId)) && (parsed.host !== 'github.ezil.work' || !awsStandaloneGitEnabled())) return unsupportedProvider();
 
     const resolved = parsed.host === 'github.com' ? await resolvePublicGitHub(parsed.canonicalURL, { signal: deadline }) : null;
     if (resolved && !resolved.ok) {
@@ -316,7 +316,7 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     if (privatePacket instanceof Response) return privatePacket;
     if (!(await sameSession())) return shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
 
-    const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent }) as { ok: boolean; codePreviewUrl?: unknown };
+    const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent }) as { ok: boolean; codePreviewUrl?: unknown; computeProvider?: unknown; sandboxId?: unknown; generation?: unknown; leaseEpoch?: unknown };
     if (!preview.ok || typeof preview.codePreviewUrl !== 'string') return shellJson(preview);
     if (left() < REPO_OPEN_MIN_TIMEOUT_MS + REPO_OPEN_TRANSPORT_MARGIN_MS) return openTimedOut();
     if (!(await sameSession())) return shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
@@ -332,7 +332,15 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     }
     // Re-read after the mint: a computer that moved to AWS meanwhile is refused, never signed for as Cloudflare.
     const controls = await target(ctx, computerId);
-    if (isAws(controls)) return unsupportedProvider();
+    if (isAws(controls) && (parsed.host !== 'github.ezil.work' || !awsStandaloneGitEnabled())) return unsupportedProvider();
+    if (isAws(controls)) {
+        const c = controls.auth.kind === 'v2' ? controls.auth.claims : null;
+        if (!c || preview.computeProvider !== 'aws-ec2' || preview.sandboxId !== c.sandboxId
+            || preview.generation !== c.generation || preview.leaseEpoch !== c.leaseEpoch)
+            return shellRefusal(409, 'repo_open_computer_changed', 'This computer changed while opening. Try again.');
+    } else if (preview.computeProvider === 'aws-ec2') {
+        return shellRefusal(409, 'repo_open_computer_changed', 'This computer changed while opening. Try again.');
+    }
     const timeoutMs = Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS,
         privatePacket ? Date.parse(privatePacket.git.expiresAt) - Date.now() - 15_000 : REPO_OPEN_MAX_TIMEOUT_MS);
     if (timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS) {
@@ -346,7 +354,8 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
             ref: privatePacket?.repository.ref ?? resolved!.ref,
             git: privatePacket ? { token: privatePacket.git.token, expiresAt: privatePacket.git.expiresAt, scope: privatePacket.git.scope } : null,
             ...(privatePacket ? { privatePacket } : {}), timeoutMs },
-        { correlationId: newCorrelationId(), signal: deadline });
+        { correlationId: newCorrelationId(), signal: deadline, awsStandaloneEnabled: awsStandaloneGitEnabled(),
+            revalidateTarget: () => target(ctx, computerId) });
     if (!opened.ok) {
         if (opened.errorCode === 'repo_open_unsupported_provider') return unsupportedProvider();
         return shellRefusal(502, 'repo_open_failed', "This repository's files could not be opened. Try again.");
