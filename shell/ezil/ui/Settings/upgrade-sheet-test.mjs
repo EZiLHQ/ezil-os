@@ -470,6 +470,33 @@ test('Stripe mount can preload its embedded modal with hidden visibility and lat
     assert.equal(h.destroyed, 0);
 });
 
+test('the card 3-D Secure challenge frame (both hashes seen in the public Stripe.js asset) is exempt like the other modal families; fingerprint and other 3DS families are not', async h => {
+    h.open();
+    await settle();
+    const sheet = h.q('[data-role="upgrade-sheet"]');
+    for ( const hash of ['83d79dd1848b8340a7352627866559b5', '1f5879f0ae81e95dfa2ef27073cf759c'] ) {
+        const portal = providerPortal(h, `https://js.stripe.com/v3/three-ds-2-challenge-${hash}.html?locale=en#test`);
+        await settle();
+        assert.equal(portal.root.hasAttribute('inert'), false, hash);
+        assert.equal(sheet.getAttribute('aria-modal'), 'false', hash);
+        assert.equal(h.document.activeElement, portal.iframe, hash);
+        portal.root.remove();
+        await settle();
+        assert.equal(sheet.getAttribute('aria-modal'), 'true', hash);
+        assert.equal(sheet.hasAttribute('inert'), false, hash);
+    }
+    for ( const family of ['three-ds-2-fingerprint', 'standalone-3ds-challenge', 'standalone-3ds-fingerprinting', 'authorize-with-url-inner'] ) {
+        const portal = providerPortal(h, `https://js.stripe.com/v3/${family}-${'a'.repeat(32)}.html`);
+        await settle();
+        assert.ok(portal.root.hasAttribute('inert'), family);
+        assert.equal(sheet.getAttribute('aria-modal'), 'true', family);
+        portal.root.remove();
+        await settle();
+    }
+    assert.equal(h.count('billing.createCheckout'), 1);
+    assert.equal(h.destroyed, 0);
+});
+
 test('Stripe portal matcher requires the exact trusted origin and known modal path, without srcdoc', async h => {
     h.open();
     await settle();
@@ -490,6 +517,12 @@ test('Stripe portal matcher requires the exact trusted origin and known modal pa
         stripeModalURL('embedded-checkout-modal').replace('embedded-checkout-modal-', 'embedded-checkout-modal-extra-'),
         'https://js.stripe.com/v3',
         'https://hooks.stripe.com/three-d-secure',
+        // The 3-D Secure challenge family is exact too: a hidden fingerprint frame must never take modal focus, and the hash is 32 lowercase hex.
+        `https://js.stripe.com/v3/three-ds-2-fingerprint-${'a'.repeat(32)}.html`,
+        `https://js.stripe.com/v3/three-ds-2-challenge-${'a'.repeat(31)}.html`,
+        `https://js.stripe.com/v3/three-ds-2-challenge-${'a'.repeat(33)}.html`,
+        `https://js.stripe.com/v3/three-ds-2-challenge-${'z'.repeat(32)}.html`,
+        `https://js.stripe.com/v3/three-ds-2-challenge-modal-${'a'.repeat(32)}.html`,
         'about:blank',
         'data:text/html,Stripe',
     ];

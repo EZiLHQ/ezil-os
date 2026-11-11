@@ -132,12 +132,18 @@ the button says Close and explains that closing does not cancel the sent request
 
 ### `shell/ezil/ui/feedback/capture.js` + `redact-editor.js` (lane FCAPTURE)
 ```
-capture_shell_snapshot({ signal } = {}) → Promise<HTMLCanvasElement | null> // tier A, iframes → grey box
+capture_shell_snapshot({ signal, info } = {}) → Promise<HTMLCanvasElement | null> // tier A, iframes → grey box at their own layer; info.frameCoverage 0..1
 tab_capture_supported() → boolean
 capture_tab_frame({ hide, signal } = {}) → Promise<HTMLCanvasElement | null> // tier B; MUST be called synchronously from a click
 capture_desktop_frame({ signal } = {}) → Promise<HTMLCanvasElement | null>  // tier C via request_frame_capture
 open_redact_editor(canvas, { signal } = {}) → Promise<{ blob: Blob, contentType: string, width: number, height: number } | null>
 ```
+Tier A masks (grey + "Desktop stream not captured" for frames, black for private fields) are painted
+inside snapdom's clone, in each filtered node's placeholder at its own position and z-index, never over
+the finished image: shell overlays stacked above an embedded app (needs_operator, progress, errors)
+stay visible (2026-11-11; real-browser pixel test `capture-browser-test.mjs`). Frame documents, URLs and
+field values are never read. A private field whose placeholder cannot be found is still covered on the image.
+`open_redact_editor` also takes `limit` (bytes, ≤ 1.5 MiB): what the report's image total leaves.
 `signal` is an optional AbortSignal. Cancellation resolves null, removes waiting
 listeners and stops acquired media tracks. A browser picker cannot be dismissed by
 the page; a stream granted after cancellation is stopped immediately. Late decoded
@@ -148,9 +154,11 @@ POST `/api/shell/feedback` (JSON; `Content-Type: application/json` required, par
 `charset` allowed — anything else is `415 {error:'unsupported_media_type'}` before the body is read,
 so a cross-site simple form cannot post a report on the lax session cookie):
 ```
-{ v: 1, clientRequestId: uuid, category: 'bug'|'idea'|'other', description: string 1..4000,
+{ v: 1, clientRequestId: uuid, category: 'bug'|'idea'|'other', description: string 0..4000,
   computerId?: uuid|null, diagnostics?: Diagnostics|null,
-  screenshot?: { contentType: 'image/png'|'image/jpeg'|'image/webp', dataBase64: string } | null }
+  screenshot?: Image | null,          // exactly one image (the original key; older servers and queued bodies)
+  screenshots?: Image[1..5] }         // two or more, in order (2026-11-11); never together with a non-null screenshot
+Image = { contentType: 'image/png'|'image/jpeg'|'image/webp', dataBase64: string }
 Diagnostics (strict, every field optional):
 { shellVersion ≤64, appCommit ≤64, browser {family ≤32, major int}, os ≤32,
   deviceClass 'phone'|'tablet'|'desktop', viewport {w,h int, dpr number},
@@ -178,13 +186,22 @@ Rollback: a server from before these keys parses `recentEvents[]` as `{eventClas
 rollback; on a 400 for a body carrying the keys it re-sends once without them (§4a). Not covered: an
 outbox entry with the keys that a pre-FEEDBACK-DIAG bundle replays after a reload. That build re-sends it
 byte-for-byte, gets 400 and drops it, and the text returns to the draft only when no draft exists.
-Responses: `201 {id, createdAt, screenshotAccepted}` · idempotent replay `200` same body ·
+Responses: `201 {id, createdAt, screenshotAccepted, screenshotCount}` · idempotent replay `200` same body (count read from the stored rows) ·
 `400 {error:'invalid_request'}` · `401` · `404` (feature off) · `413` · `415` · `429 {error:'rate_limited'}`.
-GET → `200 {reports:[{id, createdAt, category, descriptionPreview ≤140, hasScreenshot, status}]}` (newest first, ≤50).
+GET → `200 {reports:[{id, createdAt, category, descriptionPreview ≤140, hasScreenshot, screenshotCount, status}]}` (newest first, ≤50).
 DELETE `?id=<uuid>` → `204`; `404` if not the caller's.
 Limits: canonical metadata without image ≤32 KiB even with screenshot support enabled; body 32 KiB without screenshot support, 2.5 MiB with; decoded image ≤1.5 MiB, ≤4096 px per side,
 magic bytes must match contentType; rate 10/h and 30/day per user (DB count); global attachment
 budget 500 MB/day and 5 GB total → over budget: report stored, `screenshotAccepted:false`.
+Several images: at most 5, decoded total ≤1.75 MiB (inside the unchanged 2.5 MiB body and the 3 MB proxy
+limit; the client encodes each image against what the total leaves), the same image twice is a 400, more
+than 5 a 400, a larger total a 413. The budget is checked against their sum, all or none: the report is
+stored either with every previewed image or with none (`screenshotCount: 0`). Each image is one
+`ezil_feedback_attachments` row of the report (no schema change); its `created_at` is the report time plus
+its position in ms, and the admin viewer reads image n with `/api/admin/feedback/screenshot?id=…&n=0..4`
+(`ORDER BY created_at, sha256`; no `n` = the first). Owner delete, admin delete and retention remove every row.
+The boot payload advertises `desktopState.ui.feedbackScreenshotsMax` (5) with screenshots on; without it the
+shell offers one image.
 
 ## 4. Data (`app/src/server/db/schema/feedback.ts`, SQL in `app/src/server/feedback/migration-sql.ts`)
 `ezil_feedback_reports`, `ezil_feedback_attachments`, `ezil_feedback_access_log` — no PKs,
@@ -239,7 +256,9 @@ Two `localStorage` keys per account, keyed by the opaque account id from
 
 ## 5. Never collected
 `document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, `log.js` ring, headers,
-clipboard, keystrokes; no continuous recording. Consent checkboxes default OFF; preview shows the
+clipboard (except image files in a paste the person makes into the open form, each of which opens in the
+redaction editor first; the clipboard is never read programmatically and text pastes are untouched),
+keystrokes; no continuous recording. Attachment checkboxes (diagnostics; the masked window screenshot when enabled) default ON since 2026-11-10, can be switched off, and nothing uploads before Send; preview shows the
 exact JSON that is sent; nothing hits the network before Submit.
 
 

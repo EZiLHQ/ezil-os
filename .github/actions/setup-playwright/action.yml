@@ -37,15 +37,13 @@
 # `inputs.version`), no per-OS branch.
 #
 # ─────────────────────────────────────────────────────────────────────────────
-# WHY `--with-deps` IS LINUX-ONLY
+# WHY LINUX CHECKS CHROMIUM BEFORE INSTALLING SYSTEM DEPENDENCIES
 # ─────────────────────────────────────────────────────────────────────────────
-# `playwright install --with-deps` shells out to the OS package manager (apt)
-# to install the system libraries headless Chromium needs. That flag/behaviour
-# is Linux-specific; Windows and macOS runner images already carry what a
-# GUI-capable Chromium needs, and `--with-deps` is not a supported combination
-# there. `runner.os` (not `matrix.os`, which this action does not have access
-# to) is read at the point this action actually runs, so it is correct
-# regardless of how the caller's matrix is spelled.
+# GitHub's Linux image may already have the libraries and fonts Chromium needs.
+# Prove the pinned default browser can launch and render before using apt, so a
+# redundant dependency install cannot block tests on a package-mirror outage.
+# If that probe fails, install the normal Linux dependencies and require the
+# same probe to pass. Windows and macOS keep their existing browser install.
 
 name: Setup Playwright
 description: >-
@@ -95,13 +93,49 @@ runs:
         npm init -y >/dev/null
         npm i "playwright@${{ inputs.version }}" >/dev/null
 
-    - name: Install chromium (--with-deps only on Linux)
+    - name: Install chromium and verify Linux dependencies
       shell: bash
       working-directory: ${{ steps.prep.outputs.dir }}
       run: |
         set -e
         if [ "${RUNNER_OS}" = "Linux" ]; then
-          npx playwright install --with-deps chromium
+          probe_chromium() {
+            node <<'NODE'
+        const { chromium } = require('playwright');
+        const deadline = setTimeout(() => {
+          console.error('Pinned Chromium probe timed out');
+          process.exit(1);
+        }, 45000);
+        (async () => {
+          let browser;
+          try {
+            browser = await chromium.launch({ headless: true, timeout: 20000 });
+            const page = await browser.newPage({ viewport: { width: 320, height: 200 } });
+            await page.setContent('<main id="probe">Pinned Chromium ready</main>', { timeout: 10000 });
+            if (await page.locator('#probe').innerText({ timeout: 5000 }) !== 'Pinned Chromium ready') {
+              throw new Error('Pinned Chromium did not render the local page');
+            }
+            const screenshot = await page.screenshot({ type: 'png', timeout: 10000 });
+            if (screenshot.length < 100) throw new Error('Pinned Chromium screenshot is empty');
+          } finally {
+            if (browser) await browser.close();
+          }
+        })().then(() => {
+          clearTimeout(deadline);
+          console.log('Pinned Chromium launch and render passed');
+        }, error => {
+          console.error(error);
+          process.exit(1);
+        });
+        NODE
+          }
+          node ./node_modules/playwright/cli.js install chromium
+          if probe_chromium; then
+            echo 'Existing Linux browser dependencies passed the probe'
+          else
+            node ./node_modules/playwright/cli.js install-deps chromium
+            probe_chromium
+          fi
         else
           npx playwright install chromium
         fi

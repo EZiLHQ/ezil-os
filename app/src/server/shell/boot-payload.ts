@@ -43,6 +43,7 @@
 import { readBillingConfig, stripeMode, type BillingConfig } from '@/server/billing/config';
 import type { NativeRuntime } from '../../../../native/src/contract';
 import { NO_SHELL_FEATURES, type ShellFeatures } from './features';
+import { FEEDBACK_LIMITS } from '@/server/feedback/types';
 
 /** Structural input keeps this shared transport independent of database packages. */
 interface ShellComputerRecord {
@@ -311,7 +312,9 @@ export interface ShellDesktopState {
      * `recentEvents` strictly and 400s the whole report on an unexpected key. All three are gated on the
      * feedback feature where this object is built, so they are absent unless feedback is enabled.
      */
-    ui?: { floatingControls: boolean; feedbackScreenshots: boolean; feedbackEventDiagnostics?: boolean; feedbackReportBundle?: boolean; feedbackAppFailures?: boolean };
+    ui?: { floatingControls: boolean; feedbackScreenshots: boolean; feedbackEventDiagnostics?: boolean; feedbackReportBundle?: boolean; feedbackAppFailures?: boolean;
+        /** Images one report may carry; absent = one (a server without `screenshots`). Present only with screenshots on. */
+        feedbackScreenshotsMax?: number };
     /** Present only for the trusted native Mac runtime. No credentials. */
     runtime?: NativeRuntime;
 }
@@ -382,7 +385,8 @@ export function toShellDesktopState(
         status: 'idle',
         endpoints,
         ui: { floatingControls: features.floatingControls, feedbackScreenshots: features.feedbackScreenshots,
-            ...(features.feedback ? { feedbackEventDiagnostics: true, feedbackReportBundle: true, feedbackAppFailures: true } : {}) },
+            ...(features.feedback ? { feedbackEventDiagnostics: true, feedbackReportBundle: true, feedbackAppFailures: true } : {}),
+            ...(features.feedbackScreenshots ? { feedbackScreenshotsMax: FEEDBACK_LIMITS.imagesMax } : {}) },
     };
 }
 

@@ -5,6 +5,7 @@ import { db } from '@/server/db';
 import { isFeedbackAdmin } from '@/server/feedback/admin';
 import { updateFeedbackStatus, deleteFeedbackReport, feedbackAdminQueries, loadFeedbackList, loadFeedbackReport } from '@/server/feedback/admin-queries';
 import { appFailureRecordSchema, diagnosticsSchema, FEEDBACK_STATUSES } from '@/server/feedback/types';
+import { serverContextSchema } from '@/server/feedback/server-context';
 import { createClient } from '@/utils/supabase/server';
 
 export const dynamic = 'force-dynamic';
@@ -52,14 +53,19 @@ export default async function FeedbackAdminPage({ searchParams }: {
                         <a href="/admin/feedback" className="underline">All reports</a>
                         <h2 className="font-mono text-sm">{report.id}</h2>
                         <p className="text-sm">{timestamp(report.createdAt)} · {report.category} · {report.status}</p>
-                        <p className="whitespace-pre-wrap break-words">{report.description}</p>
+                        <p className="whitespace-pre-wrap break-words">{report.description || '(No description)'}</p>
                         <p className="text-sm">Computer: {report.computerId ?? '—'}</p>
                         <p className="text-sm">Deployed commit: <span className="font-mono">{report.deploySha ?? '—'}</span></p>
                         <h3 className="font-semibold">Diagnostics</h3>
                         <pre className="overflow-x-auto whitespace-pre-wrap break-words text-xs">{JSON.stringify(report.diagnostics, null, 2) ?? 'None'}</pre>
                         <AppFailureDiagnostics diagnostics={report.diagnostics} />
-                        {report.hasScreenshot ? (
-                            <p><a href={`/api/admin/feedback/screenshot?id=${encodeURIComponent(report.id)}`} className="underline">View screenshot</a></p>
+                        <ServerContext value={report.serverContext} />
+                        {report.screenshotCount > 0 ? (
+                            <ul className="flex flex-wrap gap-4">{Array.from({ length: report.screenshotCount }, (_, n) => (
+                                <li key={n}><a href={`/api/admin/feedback/screenshot?id=${encodeURIComponent(report.id)}&n=${n}`} className="underline">
+                                    {report.screenshotCount === 1 ? 'View screenshot' : `View screenshot ${n + 1} of ${report.screenshotCount}`}
+                                </a></li>
+                            ))}</ul>
                         ) : <p className="text-sm text-offwhite/60">No screenshot available.</p>}
                         <form action={updateStatus}>
                             <input type="hidden" name="id" value={report.id} />
@@ -85,8 +91,8 @@ export default async function FeedbackAdminPage({ searchParams }: {
                                     <td className="py-2 pr-4">{timestamp(row.createdAt)}</td>
                                     <td className="py-2 pr-4">{row.category}</td>
                                     <td className="py-2 pr-4">{row.status}</td>
-                                    <td className="max-w-xs break-words py-2 pr-4">{row.descriptionPreview}</td>
-                                    <td className="py-2 pr-4">{row.hasScreenshot ? 'Yes' : 'No'}</td>
+                                    <td className="max-w-xs break-words py-2 pr-4">{row.descriptionPreview || '(No description)'}</td>
+                                    <td className="py-2 pr-4">{row.screenshotCount > 0 ? String(row.screenshotCount) : 'No'}</td>
                                     <td className="py-2 pr-4 font-mono text-xs">{row.computerId ?? '—'}</td>
                                     <td className="py-2 pr-4 font-mono text-xs">{row.deploySha?.slice(0, 8) ?? '—'}</td>
                                     <td className="py-2 pr-4">{diagnosticsSummary(row.diagnostics)}</td>
@@ -152,6 +158,52 @@ function AppFailureDiagnostics({ diagnostics }: { diagnostics: unknown }) {
                     </li>
                 ))}
             </ol>
+        </section>
+    );
+}
+
+/**
+ * App-error coverage: server-added at submission, after consent and ownership (`server-context.ts`). It is
+ * not part of what the reporter previewed or posted, and it describes submission time, not the error's time.
+ * A table, never a second `<pre>`: the Diagnostics block above stays the only verbatim client data.
+ */
+function ServerContext({ value }: { value: unknown }) {
+    if (value === null || value === undefined) return null;
+    const parsed = serverContextSchema.safeParse(value);
+    const rows: [string, string][] = !parsed.success ? [['outcome', 'unreadable']] : [
+        ['capturedAt', parsed.data.capturedAt],
+        ['outcome', parsed.data.outcome],
+        ...(parsed.data.selected ? [
+            ['selected placement provider', parsed.data.selected.provider],
+            ['selected placement state', parsed.data.selected.state],
+            ['selected migration', parsed.data.selected.migration
+                ? `${parsed.data.selected.migration.direction} · ${parsed.data.selected.migration.state}` : '—'],
+            ['selected unreleased reservation', parsed.data.selected.migration
+                ? (parsed.data.selected.migration.unreleasedReservation ? 'yes' : 'no') : '—'],
+            ['selected reverse move', parsed.data.selected.reverseMove === undefined ? 'not available on this deployment'
+                : parsed.data.selected.reverseMove
+                    ? `${parsed.data.selected.reverseMove.direction} · ${parsed.data.selected.reverseMove.state}` : '—'],
+        ] as [string, string][] : []),
+        ...(parsed.data.otherComputers ? [
+            ['own other AWS placements', parsed.data.otherComputers.awsPlacements],
+            ['own other unreleased reservations', parsed.data.otherComputers.unreleasedReservations],
+            ['own other active capacity demands', parsed.data.otherComputers.activeDemands],
+        ] as [string, string][] : []),
+    ];
+    return (
+        <section aria-labelledby="server-submission-context" className="space-y-3">
+            <h3 id="server-submission-context" className="font-semibold">Server context at submission</h3>
+            <p className="text-sm text-offwhite/60">Added by the server when the report was stored, after diagnostics consent and ownership checks. It was not part of the reporter’s preview, and it describes the reporter’s own compute state at submission time, not when the error happened.</p>
+            <table className="w-full text-left text-sm">
+                <tbody>
+                    {rows.map(([field, text]) => (
+                        <tr key={field} className="border-b border-offwhite/10">
+                            <th scope="row" className="py-1 pr-4 font-medium">{field}</th>
+                            <td className="break-words py-1">{text}</td>
+                        </tr>
+                    ))}
+                </tbody>
+            </table>
         </section>
     );
 }

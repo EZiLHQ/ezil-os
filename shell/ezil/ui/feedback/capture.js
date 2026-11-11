@@ -16,8 +16,12 @@ const FEEDBACK_UI = 'dialog, #ezil-feedback-chip, .ezil-feedback-chip, '
     + '#feedback-chip, .feedback-chip, [data-ezil-feedback], [data-feedback-ui], '
     + '[id^="ezil-feedback-"], .ezil-feedback-dialog, .ezil-redact-editor';
 
-/** Tier A: exclude private subtrees before snapdom can read or clone them. */
-export async function capture_shell_snapshot ({ signal } = {}) {
+/**
+ * Tier A: exclude private subtrees before snapdom can read or clone them.
+ * `info.frameCoverage` (when an object is passed) is set to the share of the viewport, 0..1, that
+ * masked embedded frames cover, so a caller can tell a mostly grey snapshot from a useful one.
+ */
+export async function capture_shell_snapshot ({ signal, info } = {}) {
     try {
         if (signal?.aborted) return null;
         // 🔴 The whole body, not #ezil-os-root: Puter appends every window and
@@ -35,11 +39,13 @@ export async function capture_shell_snapshot ({ signal } = {}) {
         let unsafe = false;
         const snapdom = await with_timeout(load_snapdom(), null, signal);
         if (signal?.aborted) return null;
+        const placed = new Set();
         const snapshot = await with_timeout(snapdom(root, {
             // Viewport coordinates also work for the fixed-position shell windows.
             clip: 'viewport', dpr: 1, scale: Math.min(1, 1920 / Math.max(width, height)),
             cache: 'disabled', burst: false, embedFonts: false,
             exclude: [FEEDBACK_UI], excludeMode: 'hide', filterMode: 'hide',
+            plugins: [mask_in_clone(masks, placed)],
             filter (node) {
                 try {
                     if (node.nodeType !== 1) return true;
@@ -67,31 +73,113 @@ export async function capture_shell_snapshot ({ signal } = {}) {
         ctx.drawImage(captured, 0, 0, canvas.width, canvas.height);
         const sx = canvas.width / width;
         const sy = canvas.height / height;
-        for (const { rect, frame } of masks.values()) {
-            if (rect.width <= 0 || rect.height <= 0) continue;
+        if (info && typeof info === 'object') info.frameCoverage = frame_coverage(masks.values(), width, height);
+        // 🔴 Masks belong at each element's own layer, painted in the clone (`mask_in_clone`). Painting them
+        // over the finished image also covered shell overlays stacked ABOVE a frame (needs_operator, progress,
+        // errors) and left a reported screenshot almost entirely grey. Only a private field the clone pass could
+        // not place is still covered here; its content is hidden either way. An unplaced frame needs nothing:
+        // its document is never cloned, so that area shows what lies beneath it.
+        for (const [node, { rect, frame }] of masks) {
+            if (frame || placed.has(node) || rect.width <= 0 || rect.height <= 0) continue;
             const x = Math.floor(rect.left * sx);
             const y = Math.floor(rect.top * sy);
-            const w = Math.ceil(rect.right * sx) - x;
-            const h = Math.ceil(rect.bottom * sy) - y;
-            ctx.save();
-            ctx.fillStyle = frame ? '#808080' : '#000000';
-            ctx.fillRect(x, y, w, h);
-            if (frame) {
-                ctx.beginPath();
-                ctx.rect(x, y, w, h);
-                ctx.clip();
-                ctx.fillStyle = '#ffffff';
-                ctx.font = `${Math.max(10, 14 * sx)}px sans-serif`;
-                ctx.textAlign = 'center';
-                ctx.textBaseline = 'middle';
-                ctx.fillText('Desktop stream not captured', x + w / 2, y + h / 2, Math.max(1, w - 8));
-            }
-            ctx.restore();
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(x, y, Math.ceil(rect.right * sx) - x, Math.ceil(rect.bottom * sy) - y);
         }
         return canvas;
     } catch {
         return null;
     }
+}
+
+export const FRAME_MASK_TEXT = 'Desktop stream not captured';
+const PLACEMENT = ['position', 'top', 'right', 'bottom', 'left', 'z-index', 'float', 'transform', 'transform-origin',
+    'margin-top', 'margin-right', 'margin-bottom', 'margin-left', 'vertical-align'];
+
+/**
+ * snapdom plugin: give every filtered node's clone (snapdom keeps it as an invisible box of the same size,
+ * `filterMode: 'hide'`) a visible mask inside it, so the mask sits at that node's place in the stacking
+ * order and anything the shell draws above it stays visible. Frames get a grey box with a label, private
+ * fields a black one. Nothing of the source node is read beyond its identity. `placed` collects the
+ * source nodes that received a mask.
+ */
+export function mask_in_clone (masks, placed) {
+    return {
+        name: 'ezil-feedback-masks',
+        afterClone (context) {
+            const doc = context?.clone?.ownerDocument;
+            if (!doc || !(context.nodeMap instanceof Map)) return;
+            // snapdom 3.3.4 maps clone → source for the nodes it cloned; a filtered node's placeholder is unmapped.
+            const reverse = new Map();
+            for (const [clone, source] of context.nodeMap) reverse.set(source, clone);
+            for (const [source, { frame }] of masks) {
+                const clone = placeholder_of(context.nodeMap, reverse, source);
+                // Never touch a live node: only a detached clone may receive a mask.
+                if (!clone || clone === source || document.contains(clone)) continue;
+                // snapdom's placeholder keeps only the box size: give it the source's placement and layer too
+                // (layout properties only, never content), so it lands where the node was, under what was above it.
+                const style = source.ownerDocument.defaultView.getComputedStyle(source);
+                for (const property of PLACEMENT) clone.style.setProperty(property, style.getPropertyValue(property));
+                const mask = doc.createElement('div');
+                mask.setAttribute('data-ezil-capture-mask', frame ? 'frame' : 'private');
+                // The placeholder keeps `visibility: hidden`; a visible child of it is painted in its place.
+                mask.style.cssText = 'display:flex;align-items:center;justify-content:center;box-sizing:border-box;margin:0;padding:0;'
+                    + 'width:100%;height:100%;overflow:hidden;visibility:visible;opacity:1;'
+                    + `background:${frame ? '#808080' : '#000000'};color:#ffffff;font:14px sans-serif;text-align:center;`;
+                if (frame) mask.textContent = FRAME_MASK_TEXT;
+                clone.replaceChildren(mask);
+                placed.add(source);
+            }
+        },
+    };
+}
+
+/**
+ * The clone placeholder of a filtered source node: inside its parent's clone, the unmapped element children
+ * stand for the parent's unmapped (filtered) source children, in the same order. Only an invisible box
+ * (`visibility: hidden`, as snapdom's hide mode makes it) is accepted; anything else returns null.
+ */
+function placeholder_of (nodeMap, reverse, source) {
+    try {
+        const parent = source.parentElement;
+        const cloneParent = parent && reverse.get(parent);
+        if (!cloneParent) return null;
+        const cloneKids = [...cloneParent.children];
+        let cursor = 0;
+        for (const child of parent.children) {
+            const mapped = reverse.get(child);
+            if (mapped) {
+                const at = cloneKids.indexOf(mapped);
+                if (at >= cursor) cursor = at + 1;
+                continue;
+            }
+            while (cursor < cloneKids.length && nodeMap.has(cloneKids[cursor])) cursor++;
+            const candidate = cloneKids[cursor++];
+            if (child !== source) continue;
+            return candidate && candidate.style?.visibility === 'hidden' ? candidate : null;
+        }
+    } catch { /* No placeholder found: the caller falls back. */ }
+    return null;
+}
+
+/**
+ * Share of the viewport covered by masked frames, 0..1. Rectangles are clipped to the viewport and
+ * overlaps are counted once (a coarse grid is exact enough to decide "mostly grey").
+ */
+export function frame_coverage (masks, width, height) {
+    if (!(width > 0 && height > 0)) return 0;
+    const frames = [...masks].filter(mask => mask.frame && mask.rect.width > 0 && mask.rect.height > 0);
+    if (!frames.length) return 0;
+    const cols = 64, rows = 64;
+    let covered = 0;
+    for (let row = 0; row < rows; row++) {
+        const y = (row + 0.5) * height / rows;
+        for (let col = 0; col < cols; col++) {
+            const x = (col + 0.5) * width / cols;
+            if (frames.some(({ rect }) => x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom)) covered++;
+        }
+    }
+    return covered / (cols * rows);
 }
 
 /** @returns {boolean} whether tier B (getDisplayMedia tab capture) is offered here */

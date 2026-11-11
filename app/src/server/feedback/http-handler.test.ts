@@ -21,9 +21,10 @@ function harness(options: { hour?: number; day?: number; budget?: number; replay
         statements.push({ sql, params });
         if (options.fail) throw new Error('postgres://secret@private-host user submitted private text');
         if (sql.includes('pg_advisory_xact_lock')) return { rows: [] };
+        if (sql.includes('order by')) return { rows: options.list ? [[ID, NOW.toISOString(), 'bug', 'd'.repeat(200), true, 'new', 3]] : [] };
+        if (sql.includes('count(*)') && sql.includes('from "ezil_feedback_attachments"')) return { rows: [[1]] };
         if (sql.includes('count(*)')) return { rows: [[options.hour ?? 0, options.day ?? 0]] };
         if (sql.includes('sum(')) return { rows: [[options.budget ?? 0, 0]] };
-        if (sql.includes('order by')) return { rows: options.list ? [[ID, NOW.toISOString(), 'bug', 'd'.repeat(200), true, 'new']] : [] };
         if (sql.startsWith('select') && sql.includes('"client_request_id"')) return { rows: options.replay ? [[ID, NOW.toISOString(), true]] : [] };
         if ((sql.startsWith('select') && sql.includes('"ezil_feedback_reports"'))
             || (sql.startsWith('delete') && sql.includes('returning'))) return { rows: options.owned ? [[ID]] : [] };
@@ -62,7 +63,7 @@ describe('feedback HTTP boundary', () => {
 
     it.each([
         { ...VALID, userId: USER.id }, { ...VALID, clientRequestId: 'bad-uuid' }, { ...VALID, computerId: 'bad-uuid' },
-        { ...VALID, description: 'x'.repeat(4001) }, { ...VALID, description: '  ' },
+        { ...VALID, description: 'x'.repeat(4001) },
         { ...VALID, diagnostics: { cookie: 'never collect' } },
         { ...VALID, diagnostics: { browser: { family: 'Chrome', major: 130, email: 'private@example.com' } } },
         { ...VALID, screenshot: { ...SCREENSHOT, width: 1 } },
@@ -70,6 +71,13 @@ describe('feedback HTTP boundary', () => {
         const h = harness(); h.deps.env.EZIL_OS_FEEDBACK_SCREENSHOTS = '1';
         const response = await handleFeedbackRequest(request(body), h.deps);
         expect(response.status).toBe(400); expect(await response.json()).toEqual({ error: 'invalid_request' }); expect(h.statements).toEqual([]);
+    });
+
+    it('accepts a blank optional description without relaxing the strict envelope', async () => {
+        const h = harness();
+        expect((await handleFeedbackRequest(request({ ...VALID, description: '  ' }), h.deps)).status).toBe(201);
+        const insert = h.statements.find(row => row.sql.startsWith('insert into "ezil_feedback_reports"'));
+        expect(insert?.params).toContain('');
     });
 
     it.each(['{not-json', '', 'null', '[]'])('rejects malformed or non-object JSON: %j', async (body) => {
@@ -152,13 +160,14 @@ describe('feedback HTTP boundary', () => {
     it('returns the exact original FeedbackCreated for an idempotent replay', async () => {
         const h = harness({ replay: true, hour: 10 }); const response = await handleFeedbackRequest(request(), h.deps);
         expect(response.status).toBe(200);
-        expect(await response.json()).toEqual({ id: ID, createdAt: NOW.toISOString(), screenshotAccepted: true });
-        expect(h.statements.some((s) => s.sql.startsWith('insert') || s.sql.includes('count(*)'))).toBe(false);
+        expect(await response.json()).toEqual({ id: ID, createdAt: NOW.toISOString(), screenshotAccepted: true, screenshotCount: 1 });
+        // The replay counts its stored images, never the reporter's quota.
+        expect(h.statements.some((s) => s.sql.startsWith('insert') || (s.sql.includes('count(*)') && s.sql.includes('ezil_feedback_reports')))).toBe(false);
     });
 
     it('returns 201 only after the report is written', async () => {
         const h = harness(); const response = await handleFeedbackRequest(request(), h.deps);
-        expect(response.status).toBe(201); expect(await response.json()).toEqual({ id: expect.any(String), createdAt: NOW.toISOString(), screenshotAccepted: false });
+        expect(response.status).toBe(201); expect(await response.json()).toEqual({ id: expect.any(String), createdAt: NOW.toISOString(), screenshotAccepted: false, screenshotCount: 0 });
         expect(h.statements.some((s) => s.sql.startsWith('insert'))).toBe(true);
     });
 
@@ -182,6 +191,82 @@ describe('feedback HTTP boundary', () => {
         expect(response.status).toBe(status); expect(h.statements).toEqual([]);
     });
 
+    describe('several images (`screenshots`)', () => {
+        /** A distinct valid 1×1 PNG per index: the width byte differs, so each hashes differently. */
+        const png = (n: number) => {
+            const bytes = Buffer.from(SCREENSHOT.dataBase64, 'base64');
+            bytes.writeUInt32BE(n + 1, 16);
+            return { contentType: 'image/png', dataBase64: bytes.toString('base64') };
+        };
+        const on = () => { const h = harness(); h.deps.env.EZIL_OS_FEEDBACK_SCREENSHOTS = '1'; return h; };
+
+        it('stores every image in order, in one report, and returns their count', async () => {
+            const h = on();
+            const response = await handleFeedbackRequest(request({ ...VALID, screenshots: [png(0), png(1), png(2)] }), h.deps);
+            expect(response.status).toBe(201);
+            expect(await response.json()).toMatchObject({ screenshotAccepted: true, screenshotCount: 3 });
+            const inserts = h.statements.filter((s) => s.sql.startsWith('insert'));
+            expect(inserts.map((s) => s.sql.includes('ezil_feedback_attachments'))).toEqual([false, true]);
+            const columns = 7;
+            const rows = inserts[1]!.params.length / columns;
+            expect(rows).toBe(3);
+            // created_at (3rd column) increases with position, so the admin viewer's order is the send order.
+            const times = Array.from({ length: rows }, (_, r) => String(inserts[1]!.params[r * columns + 2]));
+            expect(times).toEqual([0, 1, 2].map((i) => new Date(NOW.getTime() + i).toISOString()));
+        });
+
+        it('still accepts the original single `screenshot` key', async () => {
+            const h = on();
+            const response = await handleFeedbackRequest(request({ ...VALID, screenshot: SCREENSHOT }), h.deps);
+            expect(response.status).toBe(201);
+            expect(await response.json()).toMatchObject({ screenshotAccepted: true, screenshotCount: 1 });
+        });
+
+        it.each([
+            ['both keys', { screenshot: SCREENSHOT, screenshots: [png(1)] }],
+            ['an empty list', { screenshots: [] }],
+            ['more than the image limit', { screenshots: Array.from({ length: FEEDBACK_LIMITS.imagesMax + 1 }, (_, i) => png(i)) }],
+            ['the same image twice', { screenshots: [png(0), png(0)] }],
+            ['an unknown image field', { screenshots: [{ ...png(0), name: 'secret.png' }] }],
+        ])('rejects %s with a fixed 400 and no writes', async (_label, images) => {
+            const h = on();
+            const response = await handleFeedbackRequest(request({ ...VALID, ...images }), h.deps);
+            expect(response.status).toBe(400); expect(await response.json()).toEqual({ error: 'invalid_request' });
+            expect(h.statements.some((s) => s.sql.startsWith('insert'))).toBe(false);
+        });
+
+        it('rejects images whose decoded total exceeds the limit with 413, before any write', async () => {
+            const h = on();
+            // Each fits the per-image cap; together they exceed imagesBytesTotal yet stay under the 2.5 MiB body.
+            const big = (n: number) => {
+                const bytes = Buffer.alloc(Math.floor(FEEDBACK_LIMITS.imagesBytesTotal / 2) + 1024);
+                Buffer.from(png(n).dataBase64, 'base64').copy(bytes);
+                return { contentType: 'image/png', dataBase64: bytes.toString('base64') };
+            };
+            const response = await handleFeedbackRequest(request({ ...VALID, screenshots: [big(0), big(1)] }), h.deps);
+            expect(response.status).toBe(413);
+            expect(h.statements).toEqual([]);
+        });
+
+        it('rejects `screenshots` when screenshots are off', async () => {
+            const h = harness();
+            const response = await handleFeedbackRequest(request({ ...VALID, screenshots: [png(0), png(1)] }), h.deps);
+            expect(response.status).toBe(400); expect(h.statements).toEqual([]);
+        });
+
+        it('keeps the report and stores none of its images when the attachment budget cannot take them all', async () => {
+            const h = harness({ budget: FEEDBACK_LIMITS.globalAttachmentBytesPerDay - 100 }); h.deps.env.EZIL_OS_FEEDBACK_SCREENSHOTS = '1';
+            const response = await handleFeedbackRequest(request({ ...VALID, screenshots: [png(0), png(1)] }), h.deps);
+            expect(response.status).toBe(201);
+            expect(await response.json()).toMatchObject({ screenshotAccepted: false, screenshotCount: 0 });
+            const inserts = h.statements.filter((s) => s.sql.startsWith('insert'));
+            expect(inserts).toHaveLength(1); expect(inserts[0]!.sql).toContain('ezil_feedback_reports');
+            // The budget is checked against the images' combined size.
+            const budget = h.statements.find((s) => s.sql.includes('sum('));
+            expect(budget).toBeDefined();
+        });
+    });
+
     it('stores the report with screenshotAccepted false when attachment budget is exhausted', async () => {
         const h = harness({ budget: FEEDBACK_LIMITS.globalAttachmentBytesPerDay }); h.deps.env.EZIL_OS_FEEDBACK_SCREENSHOTS = '1';
         const response = await handleFeedbackRequest(request({ ...VALID, screenshot: SCREENSHOT }), h.deps);
@@ -193,9 +278,9 @@ describe('feedback HTTP boundary', () => {
     it('GET returns only scoped summaries with bounded previews', async () => {
         const h = harness({ list: true }); const response = await handleFeedbackRequest(new Request(URL), h.deps);
         expect(response.status).toBe(200);
-        expect(await response.json()).toEqual({ reports: [{ id: ID, createdAt: NOW.toISOString(), category: 'bug', descriptionPreview: 'd'.repeat(140), hasScreenshot: true, status: 'new' }] });
-        expect(h.statements[0]!.params).toEqual([USER.id, 50]);
-        expect(h.statements[0]!.sql).toContain('where "ezil_feedback_reports"."user_id" = $1');
+        expect(await response.json()).toEqual({ reports: [{ id: ID, createdAt: NOW.toISOString(), category: 'bug', descriptionPreview: 'd'.repeat(140), hasScreenshot: true, screenshotCount: 3, status: 'new' }] });
+        expect(h.statements[0]!.params).toEqual([USER.id, USER.id, 50]);
+        expect(h.statements[0]!.sql).toContain('where "ezil_feedback_reports"."user_id" = $2');
     });
 
     it.each(['', '?id=not-a-uuid'])('DELETE validates id %s before querying', async (query) => {

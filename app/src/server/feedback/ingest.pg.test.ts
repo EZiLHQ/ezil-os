@@ -96,4 +96,36 @@ describe.skipIf(!PG)('feedback ingest on PostgreSQL with app/drizzle/0011_feedba
         expect(await queries.findScreenshot(result.created.id)).toBeNull();
     });
 
+    it('round-trips several images byte for byte, in send order, to the admin viewer and deletes them all', async () => {
+        const user = randomUUID();
+        const png = (n: number) => {
+            const bytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aJx8AAAAASUVORK5CYII=', 'base64');
+            bytes.writeUInt32BE(n + 1, 16);
+            return bytes;
+        };
+        const images = [2, 0, 1].map(png);
+        const body = { ...input(), screenshots: images.map((bytes) => ({ contentType: 'image/png' as const, dataBase64: bytes.toString('base64') })) };
+        const result = await ingestFeedback(db, user, body, NOW, SHA);
+        if (result.status !== 201) throw new Error('expected new report');
+        expect(result.created).toMatchObject({ screenshotAccepted: true, screenshotCount: 3 });
+        const replay = await ingestFeedback(db, user, body, new Date(NOW.getTime() + 1000), SHA);
+        expect(replay).toEqual({ ...result, status: 200 });
+        const queries = feedbackAdminQueries(drizzle(client!, { schema }));
+        const deps = { ...queries, user: { id: randomUUID(), email: 'developer@example.test' }, allowList: 'developer@example.test' };
+        expect((await loadFeedbackReport(result.created.id, deps))?.screenshotCount).toBe(3);
+        expect((await queries.listReports([result.created.id]))[0]?.screenshotCount).toBe(3);
+        expect((await listFeedback(db, user))[0]).toMatchObject({ hasScreenshot: true, screenshotCount: 3 });
+        for (const [n, bytes] of images.entries()) {
+            const stored = await queries.findScreenshot(result.created.id, n);
+            expect(stored?.contentType).toBe('image/png');
+            expect(Buffer.from(stored!.bytes)).toEqual(bytes);
+        }
+        expect(await queries.findScreenshot(result.created.id, 3)).toBeNull();
+        // Another user cannot delete it; the owner's delete removes every image.
+        expect(await deleteFeedback(db, randomUUID(), result.created.id)).toBe(false);
+        expect(await deleteFeedback(db, user, result.created.id)).toBe(true);
+        const left = await admin!.unsafe('SELECT count(*)::int AS n FROM ' + name + '.ezil_feedback_attachments WHERE report_id = $1', [result.created.id]);
+        expect(left[0]?.n).toBe(0);
+    });
+
 });
