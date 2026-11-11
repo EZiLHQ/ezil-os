@@ -8,6 +8,7 @@
 // Gateway (no model is called) and the chat runtime; nothing here touches staging.
 import { createHash, randomUUID, webcrypto } from 'node:crypto';
 import http from 'node:http';
+import { existsSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -40,7 +41,7 @@ let handleEditorBridgeRequest: (request: Request, deps: {
     fetch: (request: Request) => Promise<Response>; now: () => number; log: (fields: Record<string, unknown>) => void;
 }) => Promise<Response>;
 
-const MCP = 'https://mcp-staging.ezil.work';
+const MCP = 'https://connect.ezil.work';
 const OS = 'https://os-staging.ezil.work';
 const SUPABASE = 'https://btgqfmnzycdecmeyqubx.supabase.co';
 const CLIENT = 'https://chatgpt.com/oauth/client.json';
@@ -54,7 +55,7 @@ vi.mock('@/env', () => ({ env: {} }));
 vi.mock('@/server/db', () => ({ get db() { return h.db; } }));
 vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({ auth: { getUser: async () => ({ data: { user: null }, error: null }) } }) }));
 
-type FakeWorld = { bridge: { handle(request: unknown): Promise<unknown> }; models: Map<string, unknown>; calls: { started: number; switched: { id: string; identifier: string }[] };
+type FakeWorld = { bridge: { handle(request: unknown): Promise<unknown> }; models: Map<string, unknown>; calls: { send: unknown[]; started: number; switched: { id: string; identifier: string }[] };
     widget(id: string): { input: { currentLanguageModel: string } } };
 let fake: {
     world: (opts?: Record<string, unknown>) => FakeWorld };
@@ -318,9 +319,60 @@ describe.skipIf(!URL_)('model choice through the MCP: real Gateway evidence per 
         const made = await drive(a, write<Row>('alice', 'agentSession.create', { computerId: people.alice.computer, model: 'ezil/qwen', idempotencyKey: randomUUID() }));
         expect(made).toMatchObject({ status: 'applied', effective: { model: 'ezil/qwen' } });
     });
+    // Current unified-connect checkout exposes session tools, separately from the older controls proposal.
+    it.skipIf(!process.env.EZIL_MCP_SOURCE_DIR)('the current connect session tools sign and reach the real OS: owner isolation, send, replay and readback', async () => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        type Tool = { handler: (args: Record<string, unknown>, ctx: unknown) => Promise<{ structuredContent?: Record<string, any>; isError?: boolean }> };
+        const mcp = await import(/* @vite-ignore */ path.join(process.env.EZIL_MCP_SOURCE_DIR!, 'src/tools/sessions.ts')) as
+            { listSessions: Tool; getSession: Tool; sendInstruction: Tool; getInstruction: Tool; readSession: Tool };
+        await fresh();
+        const realFetch = globalThis.fetch;
+        vi.stubGlobal('fetch', async (input: URL | string | Request, init?: RequestInit) => {
+            const request = new Request(input as never, init);
+            if (new URL(request.url).origin !== OS) return realFetch(input as never, init);
+            return request.method === 'GET' ? trpcGet(request) : trpcPost(request);
+        });
+        const call = (tool: Tool, who: Who, args: Record<string, unknown>) => tool.handler(args, {
+            props: { issuer: `${SUPABASE}/auth/v1`, sub: people[who].user, email: `${who}@example.com`, name: who, provider: 'email' },
+            scopes: ['ezil:account', 'ezil:sessions:read', 'ezil:sessions:write'], clientId: CLIENT,
+            env: { SESSION_TOOLS: 'enabled', OS_ORIGIN: OS, PUBLIC_ORIGIN: MCP, SUPABASE_URL: SUPABASE,
+                DELEGATION_CLIENT_IDS: CLIENT, DELEGATION_KID: 'mcp-test', DELEGATION_PRIVATE_JWK: JSON.stringify(privateJwk) },
+        });
+        try {
+            answers[people.alice.aiToken] = v1([row(QWEN, 'available')]);
+            const a = await editor('alice');
+            await a.tick(3);
+            const sessionId = await personSession('alice');
+            const listed = await call(mcp.listSessions, 'alice', { computerId: people.alice.computer });
+            expect(listed.isError).toBeFalsy();
+            expect(listed.structuredContent!.sessions.map((s: { id: string }) => s.id)).toContain(sessionId);
+            expect((await call(mcp.getSession, 'bob', { sessionId })).isError).toBe(true);
+            const key = randomUUID();
+            const args = { sessionId, text: 'paired connect source test', idempotencyKey: key };
+            const sent = await drive(a, call(mcp.sendInstruction, 'alice', args));
+            expect(sent.isError).toBeFalsy();
+            const instructionId = sent.structuredContent!.instruction.id;
+            await a.tick(4);
+            const retried = await call(mcp.sendInstruction, 'alice', args);
+            expect(retried.isError).toBeFalsy();
+            expect(retried.structuredContent!.instruction.id).toBe(instructionId);
+            expect(a.w.calls.send).toHaveLength(1);
+            const model = a.w.models.get('s1') as { lastRequest: { response: { finish(cancelled: boolean): void } } };
+            model.lastRequest.response.finish(false);
+            await a.tick(4);
+            const observed = await call(mcp.getInstruction, 'alice', { instructionId });
+            expect(observed.isError).toBeFalsy();
+            expect(observed.structuredContent!.instruction).toMatchObject({ id: instructionId, sessionId, kind: 'send', status: 'completed' });
+            expect((await call(mcp.getInstruction, 'bob', { instructionId })).isError).toBe(true);
+            const events = await call(mcp.readSession, 'alice', { sessionId });
+            expect(events.isError).toBeFalsy();
+            expect(Array.isArray(events.structuredContent!.events)).toBe(true);
+        } finally { vi.stubGlobal('fetch', realFetch); }
+    });
+
     // The EZiL MCP's own control tools, at the head named by EZIL_MCP_SOURCE_DIR (read only: its source is imported, never
     // edited), calling THIS OS through the real delegated route with its own signing key. Off unless that directory is set.
-    it.skipIf(!process.env.EZIL_MCP_SOURCE_DIR)('the real MCP controls tools (list_models, create_session, get_session_settings, configure_session) against this OS: two accounts, then stale and denied evidence', async () => {
+    it.skipIf(!process.env.EZIL_MCP_SOURCE_DIR || !existsSync(path.join(process.env.EZIL_MCP_SOURCE_DIR, 'src/tools/controls.ts')))('the real MCP controls tools (list_models, create_session, get_session_settings, configure_session) against this OS: two accounts, then stale and denied evidence', async () => {
         const dir = process.env.EZIL_MCP_SOURCE_DIR!;
         const mcp = await import(/* @vite-ignore */ path.join(dir, 'src/tools/controls.ts')) as {
             listModels: Tool; createSession: Tool; getSessionSettings: Tool; configureSession: Tool; startComputer: Tool };
