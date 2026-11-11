@@ -1,8 +1,9 @@
 import { join } from 'node:path';
-import { CfnOutput, Duration, RemovalPolicy, Tags, aws_cloudwatch as cloudwatch, aws_events as events,
+import { CfnOutput, Duration, RemovalPolicy, Stack, Tags, aws_cloudwatch as cloudwatch, aws_events as events,
     aws_iam as iam, aws_kms as kms, aws_lambda as lambda,
     aws_lambda_nodejs as nodejs, aws_logs as logs, aws_sqs as sqs, aws_stepfunctions as states } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
+import { PATH_METADATA_ENABLE_CONTEXT } from 'aws-cdk-lib/cx-api';
 import { RecoverySettingsSchema, machineArn, type RecoverySettings } from './lifecycle/recovery-contract.js';
 import { recoveryDefinition } from './lifecycle/recovery-definition.js';
 import { DENIED_ACTIONS } from './computer-lifecycle.js';
@@ -15,10 +16,11 @@ export class ComputerLifecycleRecovery extends Construct {
     readonly machine: states.CfnStateMachine;
     readonly historyKey: kms.IKey;
     readonly version: states.CfnStateMachineVersion;
-    constructor(scope: Construct, id: string, props: { settings: RecoverySettings; sourceHistoryKey: kms.IKey; enabled?: boolean }) {
+    constructor(scope: Construct, id: string, props: { settings: RecoverySettings; sourceHistoryKey: kms.IKey; enabled?: boolean; retainedObserverVersionLogicalId?: string }) {
         super(scope, id);
         const s = RecoverySettingsSchema.parse(props.settings), d = s.lifecycle.deployment, r = d.region;
         const originalMachine = machineArn(d.stateMachineVersionArn), recoveryMachine = machineArn(s.recoveryVersionArn);
+        const retained = props.retainedObserverVersionLogicalId;
         const key = new kms.Key(this, 'HistoryKey', { enableKeyRotation: true, removalPolicy: RemovalPolicy.RETAIN });
         this.historyKey = key;
         Tags.of(key).add('ezil:namespace', d.namespace);
@@ -44,9 +46,12 @@ export class ComputerLifecycleRecovery extends Construct {
             resources: [originalMachine.replace(':stateMachine:', ':execution:') + ':computer-*'] }));
         observer.addToRolePolicy(new iam.PolicyStatement({ actions: ['ec2:DescribeInstances', 'ec2:DescribeVolumes'], resources: ['*'],
             conditions: { StringEquals: { 'aws:RequestedRegion': r } } }));
-        if (!d.preparationStateMachineVersionArn) props.sourceHistoryKey.grantDecrypt(observer);
+        if (!d.preparationStateMachineVersionArn || retained !== undefined) {
+            // Retained legacy versions share this role and keep their exact old key grants.
+            props.sourceHistoryKey.grantDecrypt(observer);
+            key.grantDecrypt(observer);
+        }
         if (d.preparationStateMachineVersionArn) observer.addToRolePolicy(historyReadStatement(r, key.keyArn, [s.recoveryVersionArn]));
-        else key.grantDecrypt(observer);
         if (d.preparationStateMachineVersionArn) {
             const registration = registeredImageWorkflows(this, d.stateMachineVersionArn).find(v => v.version === d.preparationStateMachineVersionArn);
             if (!registration?.authorityKeyArn) throw new Error('preparation_authority_wiring_missing');
@@ -61,28 +66,56 @@ export class ComputerLifecycleRecovery extends Construct {
                 'kms:ViaService': `secretsmanager.${r}.amazonaws.com`, 'kms:EncryptionContext:SecretARN': s.lifecycle.authoritySecretArn } } }));
             registerImageWorkflow(this, d.stateMachineVersionArn, s.recoveryVersionArn, key.keyArn);
         }
-        const role = new iam.Role(this, 'RecoveryRole', { ...(d.preparationStateMachineVersionArn ? { roleName: `ezil-${d.namespace}-recovery`, path: `/ezil/${d.namespace}/` } : {}), assumedBy: new iam.ServicePrincipal('states.amazonaws.com', {
-            conditions: { StringEquals: { 'aws:SourceAccount': d.accountId }, ArnEquals: { 'aws:SourceArn': recoveryMachine } } }) });
-        if (d.preparationStateMachineVersionArn) {
-            applyImageJobBoundary(role, d);
-            for (const statement of recoveryRestoreStatements(d)) role.addToPolicy(statement);
-            role.addToPolicy(new iam.PolicyStatement({ effect: iam.Effect.DENY, actions: [...imageWorkflowDenies, 'ec2:CopySnapshot', 'ec2:ModifySnapshotAttribute', 'ec2:ResetSnapshotAttribute'], resources: ['*'] }));
+        // Only an explicitly retained legacy graph needs a separate image role.
+        // Already image-enabled/fresh stacks preserve their existing fixed-role layout.
+        const trust = () => new iam.ServicePrincipal('states.amazonaws.com', {
+            conditions: { StringEquals: { 'aws:SourceAccount': d.accountId }, ArnEquals: { 'aws:SourceArn': recoveryMachine } } });
+        const named = { roleName: `ezil-${d.namespace}-recovery`, path: `/ezil/${d.namespace}/` };
+        const role = new iam.Role(this, 'RecoveryRole', {
+            ...(d.preparationStateMachineVersionArn && retained === undefined ? named : {}), assumedBy: trust() });
+        const imageRole = d.preparationStateMachineVersionArn
+            ? retained === undefined ? role : new iam.Role(this, 'ImageRecoveryRole', { ...named, assumedBy: trust() })
+            : undefined;
+        if (imageRole) {
+            applyImageJobBoundary(imageRole, d);
+            for (const statement of recoveryRestoreStatements(d)) imageRole.addToPolicy(statement);
+            imageRole.addToPolicy(new iam.PolicyStatement({ effect: iam.Effect.DENY, actions: [...imageWorkflowDenies, 'ec2:CopySnapshot', 'ec2:ModifySnapshotAttribute', 'ec2:ResetSnapshotAttribute'], resources: ['*'] }));
         }
-        observer.currentVersion.grantInvoke(role); key.grantEncryptDecrypt(role);
-        role.addToPolicy(new iam.PolicyStatement({ actions: ['ec2:StopInstances', 'ec2:TerminateInstances'],
-            resources: [`arn:aws:ec2:${r}:${d.accountId}:instance/*`], conditions: { StringEquals: {
-                'aws:RequestedRegion': r, 'ec2:ResourceTag/ezil:managed-by': 'app-computer-platform',
-                'ec2:ResourceTag/ezil:stage': d.namespace } } }));
-        role.addToPolicy(new iam.PolicyStatement({ effect: iam.Effect.DENY, actions: [...DENIED_ACTIONS,'ec2:DetachVolume','ec2:DeleteTags'], resources: ['*'] }));
-        role.addToPolicy(new iam.PolicyStatement({ actions: ['logs:CreateLogDelivery', 'logs:GetLogDelivery', 'logs:UpdateLogDelivery',
-            'logs:DeleteLogDelivery', 'logs:ListLogDeliveries', 'logs:PutResourcePolicy', 'logs:DescribeResourcePolicies', 'logs:DescribeLogGroups'], resources: ['*'] }));
+        if (retained !== undefined) {
+            const current = observer.currentVersion.node.defaultChild as lambda.CfnVersion;
+            const currentId = Stack.of(this).resolve(current.logicalId) as string;
+            if (!imageRole || !/^RecoveryObserverCurrentVersion[0-9A-F]{8}[a-f0-9]{32}$/.test(retained)
+                || retained.slice(0, -32) !== currentId.slice(0, -32) || retained === currentId)
+                throw new Error('invalid_retained_recovery_observer_version');
+            // Keep the SAME old logical resource, hence its immutable physical version,
+            // rather than changing the old role's grant to the newly published observer.
+            const legacy = new lambda.CfnVersion(this, 'RetainedObserverVersion', { functionName: observer.functionName });
+            legacy.overrideLogicalId(retained);
+            legacy.applyRemovalPolicy(RemovalPolicy.RETAIN);
+            if (legacy.node.tryGetContext(PATH_METADATA_ENABLE_CONTEXT))
+                legacy.addMetadata('aws:cdk:path', observer.currentVersion.node.path + '/Resource');
+            legacy.addMetadata('aws:cdk:do-not-refactor', true);
+            role.addToPolicy(new iam.PolicyStatement({ actions: ['lambda:InvokeFunction'], resources: [legacy.ref] }));
+        } else observer.currentVersion.grantInvoke(role);
+        if (imageRole && imageRole !== role) observer.currentVersion.grantInvoke(imageRole);
+        for (const executionRole of [role, ...(imageRole && imageRole !== role ? [imageRole] : [])]) {
+            key.grantEncryptDecrypt(executionRole);
+            executionRole.addToPolicy(new iam.PolicyStatement({ actions: ['ec2:StopInstances', 'ec2:TerminateInstances'],
+                resources: [`arn:aws:ec2:${r}:${d.accountId}:instance/*`], conditions: { StringEquals: {
+                    'aws:RequestedRegion': r, 'ec2:ResourceTag/ezil:managed-by': 'app-computer-platform',
+                    'ec2:ResourceTag/ezil:stage': d.namespace } } }));
+            executionRole.addToPolicy(new iam.PolicyStatement({ effect: iam.Effect.DENY, actions: [...DENIED_ACTIONS,'ec2:DetachVolume','ec2:DeleteTags'], resources: ['*'] }));
+            executionRole.addToPolicy(new iam.PolicyStatement({ actions: ['logs:CreateLogDelivery', 'logs:GetLogDelivery', 'logs:UpdateLogDelivery',
+                'logs:DeleteLogDelivery', 'logs:ListLogDeliveries', 'logs:PutResourcePolicy', 'logs:DescribeResourcePolicies', 'logs:DescribeLogGroups'], resources: ['*'] }));
+        }
+        const executionRole = imageRole ?? role;
         const workflowLogs = log('WorkflowLogs');
         this.machine = new states.CfnStateMachine(this, 'Workflow', { stateMachineName: recoveryMachine.split(':').at(-1),
-            stateMachineType: 'STANDARD', roleArn: role.roleArn, definitionString: JSON.stringify(recoveryDefinition(observer.currentVersion.functionArn, !!d.preparationStateMachineVersionArn)),
+            stateMachineType: 'STANDARD', roleArn: executionRole.roleArn, definitionString: JSON.stringify(recoveryDefinition(observer.currentVersion.functionArn, !!d.preparationStateMachineVersionArn)),
             encryptionConfiguration: { type: 'CUSTOMER_MANAGED_KMS_KEY', kmsKeyId: key.keyArn },
             loggingConfiguration: { level: 'ERROR', includeExecutionData: false,
                 destinations: [{ cloudWatchLogsLogGroup: { logGroupArn: workflowLogs.logGroupArn } }] } });
-        this.machine.node.addDependency(role);
+        this.machine.node.addDependency(executionRole);
         this.version = new states.CfnStateMachineVersion(this, 'Version', {
             stateMachineArn: this.machine.ref, stateMachineRevisionId: this.machine.attrStateMachineRevisionId });
         this.version.applyRemovalPolicy(RemovalPolicy.RETAIN);

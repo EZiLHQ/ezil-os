@@ -781,5 +781,266 @@ class ComputerTests(unittest.TestCase):
                 COMPUTER.main()
 
 
+
+class LegacyRecoveryCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        import rebase_cloudformation as cfn
+        self.cfn = cfn
+        self.logical = 'RecoveryObserverCurrentVersion680AB0D7' + 'a' * 32
+        self.boundary = f'arn:aws:iam::452630323510:policy/ezil/{TOOL.NAMESPACE}/ezil-{TOOL.NAMESPACE}-image-job-boundary'
+        shared = f'arn:aws:iam::452630323510:policy/ezil/identity/ezil-{TOOL.NAMESPACE}-boundary'
+        self.before = {'Resources': {
+            cfn.LEGACY_RECOVERY_ROLE: {'Type': 'AWS::IAM::Role', 'Properties': {
+                'Path': f'/ezil/{TOOL.NAMESPACE}/', 'PermissionsBoundary': shared}},
+            cfn.LEGACY_RECOVERY_POLICY: {'Type': 'AWS::IAM::Policy', 'Properties': {
+                'PolicyName': cfn.LEGACY_RECOVERY_POLICY, 'Roles': [{'Ref': cfn.LEGACY_RECOVERY_ROLE}],
+                'PolicyDocument': {'Statement': [{'Effect': 'Allow', 'Action': 'lambda:InvokeFunction', 'Resource': {'Ref': self.logical}}]}}},
+            self.logical: {'Type': 'AWS::Lambda::Version', 'Properties': {'FunctionName': {'Ref': 'RecoveryObserver1D350FD8'}},
+                'DeletionPolicy': 'Retain', 'UpdateReplacePolicy': 'Retain'},
+            cfn.LEGACY_OBSERVER_ROLE: {'Type': 'AWS::IAM::Role', 'Properties': {
+                'Path': f'/ezil/{TOOL.NAMESPACE}/', 'PermissionsBoundary': shared}},
+            cfn.LEGACY_OBSERVER_POLICY: {'Type': 'AWS::IAM::Policy', 'Properties': {
+                'PolicyName': cfn.LEGACY_OBSERVER_POLICY, 'Roles': [{'Ref': cfn.LEGACY_OBSERVER_ROLE}],
+                'PolicyDocument': {'Statement': [{'Effect': 'Allow', 'Action': 'kms:Decrypt', 'Resource': {'Fn::GetAtt': ['LifecycleHistoryKey', 'Arn']}}]}}},
+        }}
+        self.after = copy.deepcopy(self.before)
+        self.after['Resources']['RecoveryImageRecoveryRole22222222'] = {'Type': 'AWS::IAM::Role',
+            'Properties': {'RoleName': f'ezil-{TOOL.NAMESPACE}-recovery', 'PermissionsBoundary': self.boundary}}
+
+    def test_derives_only_the_reviewed_old_immutable_observer_and_preserves_legacy_graph(self):
+        self.assertEqual(self.cfn.retained_recovery_observer_version(self.before), self.logical)
+        self.cfn.preserve_legacy_recovery(self.before, self.after, self.boundary)
+        self.assertIsNone(self.cfn.retained_recovery_observer_version({'Resources': {}}))
+
+    def test_legacy_role_policy_version_and_execution_role_changes_fail_closed(self):
+        for logical in (self.cfn.LEGACY_RECOVERY_ROLE, self.cfn.LEGACY_RECOVERY_POLICY,
+                        self.logical, self.cfn.LEGACY_OBSERVER_ROLE):
+            after = copy.deepcopy(self.after)
+            after['Resources'][logical]['Properties']['Unreviewed'] = True
+            with self.assertRaisesRegex(ValueError, 'must remain unchanged'):
+                self.cfn.preserve_legacy_recovery(self.before, after, self.boundary)
+
+    def test_omitted_retention_new_invoke_or_lost_old_observer_key_grant_is_refused(self):
+        after = copy.deepcopy(self.after)
+        after['Resources'][self.cfn.LEGACY_RECOVERY_POLICY]['Properties']['PolicyDocument']['Statement'][0]['Resource'] = {
+            'Ref': 'RecoveryObserverCurrentVersion680AB0D7' + 'b' * 32}
+        with self.assertRaisesRegex(ValueError, 'must remain unchanged'):
+            self.cfn.preserve_legacy_recovery(self.before, after, self.boundary)
+        after = copy.deepcopy(self.after)
+        after['Resources'][self.cfn.LEGACY_OBSERVER_POLICY]['Properties']['PolicyDocument']['Statement'] = []
+        with self.assertRaisesRegex(ValueError, 'loses an existing permission'):
+            self.cfn.preserve_legacy_recovery(self.before, after, self.boundary)
+
+    def test_derivation_rejects_named_roles_unqualified_observers_and_wrong_function_or_retention(self):
+        variants = []
+        bad = copy.deepcopy(self.before); bad['Resources'][self.cfn.LEGACY_RECOVERY_ROLE]['Properties']['RoleName'] = 'fixed'; variants.append(bad)
+        bad = copy.deepcopy(self.before); bad['Resources'][self.cfn.LEGACY_RECOVERY_POLICY]['Properties']['PolicyDocument']['Statement'][0]['Resource'] = '*'; variants.append(bad)
+        bad = copy.deepcopy(self.before); bad['Resources'][self.logical]['Properties']['FunctionName'] = {'Ref': 'OtherFunction'}; variants.append(bad)
+        bad = copy.deepcopy(self.before); bad['Resources'][self.logical]['DeletionPolicy'] = 'Delete'; variants.append(bad)
+        for before in variants:
+            with self.assertRaises(ValueError): self.cfn.retained_recovery_observer_version(before)
+
+    def test_known_already_image_role_remains_supported_but_identity_changes_are_refused(self):
+        role = self.before['Resources'][self.cfn.LEGACY_RECOVERY_ROLE]
+        role['Properties'].update(RoleName=f'ezil-{TOOL.NAMESPACE}-recovery', PermissionsBoundary=self.boundary,
+            AssumeRolePolicyDocument={'Version': '2012-10-17', 'Statement': [{'Action': 'sts:AssumeRole', 'Effect': 'Allow',
+                'Principal': {'Service': 'states.amazonaws.com'}, 'Condition': {
+                    'StringEquals': {'aws:SourceAccount': '452630323510'},
+                    'ArnEquals': {'aws:SourceArn': f'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-{TOOL.NAMESPACE}-recovery'}}}]})
+        after = copy.deepcopy(self.before)
+        self.assertIsNone(self.cfn.retained_recovery_observer_version(self.before))
+        self.cfn.preserve_legacy_recovery(self.before, after, self.boundary)
+        after['Resources'][self.cfn.LEGACY_RECOVERY_ROLE]['Properties']['RoleName'] = 'other'
+        with self.assertRaisesRegex(ValueError, 'existing image recovery role identity'):
+            self.cfn.preserve_legacy_recovery(self.before, after, self.boundary)
+        for key, value in [('RoleName', 'other'), ('Path', '/other/'), ('PermissionsBoundary', 'other')]:
+            bad = copy.deepcopy(self.before)
+            bad['Resources'][self.cfn.LEGACY_RECOVERY_ROLE]['Properties'][key] = value
+            with self.assertRaises(ValueError): self.cfn.retained_recovery_observer_version(bad)
+        bad = copy.deepcopy(self.before)
+        del bad['Resources'][self.cfn.LEGACY_RECOVERY_ROLE]['Properties']['AssumeRolePolicyDocument']['Statement'][0]['Condition']
+        with self.assertRaises(ValueError): self.cfn.retained_recovery_observer_version(bad)
+
+    def test_iam_role_replacement_fence_is_unchanged(self):
+        resource = {'Type': 'AWS::IAM::Role'}
+        change = {'Action': 'Modify', 'ResourceType': resource['Type'], 'Replacement': 'True', 'Details': []}
+        with self.assertRaisesRegex(ValueError, 'unexpected resource replacement'):
+            self.cfn.validate_change_details('workflows', change,
+                {'action': 'Modify', 'properties': ['RoleName'], 'attributes': []}, resource, set())
+
+
+
+class LegacyLifecycleCapabilityTests(unittest.TestCase):
+    def setUp(self):
+        import rebase_cloudformation as cfn
+        self.cfn = cfn
+        cfn.use_namespace(TOOL.NAMESPACE)
+        self.source = dict(release_record(), amiId='ami-' + '1' * 17,
+            stateMachineVersionArn=TOOL.MACHINE + ':1', preparationStateMachineVersionArn=None,
+            recoveryStateMachineVersionArn=TOOL.MACHINE.replace('-lifecycle', '-recovery') + ':1',
+            previousLowerImageDigest=None, previousLowerImageRef=None)
+        self.deployment = {k: self.source[k] for k in ('accountId', 'region', 'namespace', 'amiId',
+            'launchTemplateId', 'launchTemplateVersion', 'stateMachineVersionArn')}
+        self.logical = 'LifecycleObserverCurrentVersion3A1B23A0' + 'a' * 32
+        history = {'Fn::GetAtt': [cfn.LIFECYCLE_HISTORY_KEY, 'Arn']}
+        self.invoke = {'Effect': 'Allow', 'Action': 'lambda:InvokeFunction', 'Resource': {'Ref': self.logical}}
+        self.launch = {'Effect': 'Allow', 'Action': 'ec2:RunInstances',
+            'Resource': [f"arn:aws:ec2:ap-south-1::image/{self.source['amiId']}", 'arn:aws:ec2:ap-south-1:452630323510:network-interface/*'],
+            'Condition': {'ArnEquals': {'ec2:LaunchTemplate': f"arn:aws:ec2:ap-south-1:452630323510:launch-template/{self.source['launchTemplateId']}"}}}
+        self.observer_history = {'Effect': 'Allow', 'Action': 'kms:Decrypt', 'Resource': history}
+        self.app_history = {'Effect': 'Allow', 'Action': 'kms:Decrypt', 'Resource': history, 'Condition': {'StringEquals': {
+            'kms:ViaService': 'states.ap-south-1.amazonaws.com',
+            'kms:EncryptionContext:aws:states:stateMachineArn': [TOOL.MACHINE, TOOL.MACHINE + ':1']}}}
+        def policy(name, role, rows):
+            return {'Type': 'AWS::IAM::Policy', 'Properties': {'PolicyName': name, 'Roles': [{'Ref': role}],
+                'PolicyDocument': {'Version': '2012-10-17', 'Statement': rows}}}
+        self.before = {'Resources': {
+            cfn.LIFECYCLE_OBSERVER: {'Type': 'AWS::Lambda::Function', 'Properties': {'Environment': {'Variables': {
+                'EZIL_LIFECYCLE_SETTINGS': json.dumps({'deployment': self.deployment})}}}},
+            cfn.LIFECYCLE_CONTROLLER_POLICY: policy(cfn.LIFECYCLE_CONTROLLER_POLICY, cfn.LIFECYCLE_CONTROLLER, [self.launch, self.invoke]),
+            cfn.LIFECYCLE_OBSERVER_POLICY: policy(cfn.LIFECYCLE_OBSERVER_POLICY, 'ObserverRole', [self.observer_history]),
+            cfn.APP_CALLER_POLICY: policy(cfn.APP_CALLER_POLICY, 'AppRole', [self.app_history]),
+            self.logical: {'Type': 'AWS::Lambda::Version', 'Properties': {'FunctionName': {'Ref': cfn.LIFECYCLE_OBSERVER}},
+                'DeletionPolicy': 'Retain', 'UpdateReplacePolicy': 'Retain'},
+        }}
+        self.after = copy.deepcopy(self.before)
+        self.after['Resources'][cfn.LIFECYCLE_OBSERVER]['Properties']['Environment']['Variables']['EZIL_LIFECYCLE_SETTINGS'] = json.dumps({
+            'deployment': dict(self.deployment, preparationStateMachineVersionArn=self.source['stateMachineVersionArn'].replace('-lifecycle:', '-rebase-preparation:'))})
+        self.retained_policy = 'LifecycleRetainedSourcePolicy11111111'
+        self.after['Resources'][self.retained_policy] = policy(self.retained_policy, cfn.LIFECYCLE_CONTROLLER, [self.launch, self.invoke])
+
+    def test_derives_only_admitted_source_and_preserves_all_three_capability_groups(self):
+        self.assertEqual(self.cfn.retained_lifecycle_source(self.before, self.source), {
+            'amiId': self.source['amiId'], 'stateMachineVersionArn': self.source['stateMachineVersionArn'],
+            'observerVersionLogicalId': self.logical})
+        self.cfn.preserve_legacy_lifecycle(self.before, self.after)
+        self.assertIsNone(self.cfn.retained_lifecycle_source({'Resources': {}}, self.source))
+
+    def test_source_manifest_mismatch_cannot_authorize_other_ami_or_version(self):
+        for patch in ({'amiId': 'ami-' + '9' * 17}, {'stateMachineVersionArn': TOOL.MACHINE + ':3'}):
+            with self.assertRaisesRegex(ValueError, 'promoted app tuple'):
+                self.cfn.retained_lifecycle_source(self.before, dict(self.source, **patch))
+
+    def test_omitted_lifecycle_retention_is_refused(self):
+        del self.after['Resources'][self.retained_policy]
+        with self.assertRaisesRegex(ValueError, 'rollback capabilities must be retained'):
+            self.cfn.preserve_legacy_lifecycle(self.before, self.after)
+
+    def test_old_ami_invoke_version_and_history_loss_or_scope_expansion_are_refused(self):
+        for change in ('ami', 'invoke', 'version', 'observer-history', 'app-history', 'extra-grant'):
+            after = copy.deepcopy(self.after)
+            rows = after['Resources'][self.retained_policy]['Properties']['PolicyDocument']['Statement']
+            if change == 'ami': rows[0]['Resource'][0] = 'arn:aws:ec2:ap-south-1::image/ami-' + '9' * 17
+            elif change == 'invoke': rows.pop()
+            elif change == 'version': del after['Resources'][self.logical]
+            elif change == 'extra-grant': rows.append({'Effect': 'Allow', 'Action': 'kms:Decrypt', 'Resource': '*'})
+            else:
+                name = self.cfn.LIFECYCLE_OBSERVER_POLICY if change == 'observer-history' else self.cfn.APP_CALLER_POLICY
+                after['Resources'][name]['Properties']['PolicyDocument']['Statement'] = []
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.cfn.preserve_legacy_lifecycle(self.before, after)
+
+    def test_known_existing_image_iam_projections_have_no_legacy_runtime(self):
+        for filename in ('pool-iam-templates.json', 'pool-iam-incremental.json'):
+            before = manifest.read(HERE / 'fixtures' / filename)['workflows']['before']
+            with self.subTest(filename=filename):
+                self.assertIsNone(self.cfn.retained_lifecycle_source(before, self.source))
+                self.cfn.preserve_legacy_lifecycle(before, copy.deepcopy(before))
+                before['Resources']['ExistingKey'] = {'Type': 'AWS::KMS::Key'}
+                self.assertIsNone(self.cfn.retained_lifecycle_source(before, self.source))
+
+    def test_iam_projection_does_not_hide_unknown_role_or_partial_runtime(self):
+        before = manifest.read(HERE / 'fixtures/pool-iam-templates.json')['workflows']['before']
+        for change in ('generated-role', 'trust', 'boundary', 'name', 'partial-runtime'):
+            candidate = copy.deepcopy(before)
+            role = candidate['Resources'][self.cfn.LEGACY_RECOVERY_ROLE]['Properties']
+            if change == 'generated-role': del role['RoleName']
+            elif change == 'trust': role['AssumeRolePolicyDocument']['Statement'][0]['Principal']['Service'] = 'lambda.amazonaws.com'
+            elif change == 'boundary': role['PermissionsBoundary'] = 'foreign-boundary'
+            elif change == 'name': role['RoleName'] = 'foreign-role'
+            else: candidate['Resources']['UnexpectedRuntime'] = {'Type': 'AWS::Lambda::Function'}
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'observer settings required'):
+                self.cfn.retained_lifecycle_source(candidate, self.source)
+
+    def test_image_mode_without_legacy_source_is_unchanged(self):
+        before = copy.deepcopy(self.after)
+        self.assertIsNone(self.cfn.retained_lifecycle_source(before, self.source))
+        self.cfn.preserve_legacy_lifecycle(before, copy.deepcopy(before))
+
+
+class CloudFormationDetailTests(unittest.TestCase):
+    def setUp(self):
+        import rebase_cloudformation as cfn
+        self.cfn = cfn
+        cfn.use_namespace(TOOL.NAMESPACE)
+        self.resource = {'Type': 'AWS::StepFunctions::StateMachine'}
+        self.expected = {'action': 'Modify', 'properties': ['DefinitionString', 'RoleArn'], 'attributes': ['DependsOn']}
+        # The staged Recovery change emits duplicate property targets for direct
+        # and referenced causes, but no DependsOn target or scope attribute.
+        self.change = {'Action': 'Modify', 'ResourceType': self.resource['Type'], 'Replacement': 'False',
+            'Scope': ['Properties'], 'Details': [
+                {'Target': {'Attribute': 'Properties', 'Name': name, 'RequiresRecreation': 'Never'},
+                 'Evaluation': evaluation, 'ChangeSource': cause, **({'CausingEntity': entity} if entity else {})}
+                for name, evaluation, cause, entity in (
+                    ('DefinitionString', 'Dynamic', 'DirectModification', None),
+                    ('RoleArn', 'Dynamic', 'DirectModification', None),
+                    ('RoleArn', 'Static', 'ResourceAttribute', 'RecoveryImageRecoveryRole9D9A3190.Arn'),
+                    ('DefinitionString', 'Static', 'ResourceReference', 'RecoveryObserverCurrentVersion680AB0D7' + 'd' * 32))]}
+
+    def check(self, change=None, expected=None):
+        self.cfn.validate_change_details('workflows', change or self.change,
+            expected or self.expected, self.resource, set())
+
+    def test_actual_provider_properties_omit_only_unreportable_depends_on(self):
+        self.check()
+        expected = copy.deepcopy(self.expected); expected['attributes'].append('Metadata')
+        with self.assertRaisesRegex(ValueError, 'property details differ'):
+            self.check(expected=expected)
+
+    def test_real_properties_scope_and_replacement_fences_are_unchanged(self):
+        for kind in ('missing-property', 'extra-property', 'scope', 'recreation', 'replacement', 'unexpected-depends-on'):
+            change = copy.deepcopy(self.change)
+            if kind == 'missing-property': change['Details'] = [d for d in change['Details'] if d['Target']['Name'] != 'RoleArn']
+            elif kind == 'extra-property': change['Details'][0]['Target']['Name'] = 'EncryptionConfiguration'
+            elif kind == 'scope': change['Scope'].append('Metadata')
+            elif kind == 'recreation': change['Details'][0]['Target']['RequiresRecreation'] = 'Always'
+            elif kind == 'replacement': change['Replacement'] = 'True'
+            else: change['Details'].append({'Target': {'Attribute': 'DependsOn', 'RequiresRecreation': 'Never'}, 'ChangeSource': 'DirectModification'})
+            with self.subTest(kind=kind), self.assertRaises(ValueError): self.check(change=change)
+
+    def test_depends_on_review_artifact_and_submitted_template_remain_exact(self):
+        import hashlib
+        before = manifest.read(HERE / 'fixtures/pool-iam-templates.json')['workflows']['before']
+        # Reuse the known image-role projection; the workflow itself has a real
+        # DependsOn-only template change independently of provider reporting.
+        del before['Resources'][self.cfn.LIFECYCLE_CONTROLLER_POLICY]
+        role = self.cfn.LEGACY_RECOVERY_ROLE
+        preparation = next(k for k in before['Resources'] if 'RebasePreparationRole' in k and before['Resources'][k]['Type'] == 'AWS::IAM::Role')
+        before['Resources']['Workflow'] = {'Type': self.resource['Type'], 'DependsOn': [role],
+            'Properties': {'DefinitionString': '{"StartAt":"Done","States":{"Done":{"Type":"Succeed"}}}', 'RoleArn': {'Fn::GetAtt': [role, 'Arn']}}}
+        after = copy.deepcopy(before); after['Resources']['Workflow']['DependsOn'].append(preparation)
+        review = {'schemaVersion': 1, 'changes': {'Workflow': {'action': 'Modify', 'properties': [], 'attributes': ['DependsOn']}}}
+        self.assertEqual(self.cfn.validate_templates('workflows', before, after, review), review['changes'])
+        bad = copy.deepcopy(review); bad['changes']['Workflow']['attributes'] = []
+        with self.assertRaisesRegex(ValueError, 'exactly enumerate template changes'):
+            self.cfn.validate_templates('workflows', before, after, bad)
+        with tempfile.TemporaryDirectory() as directory:
+            spec = {'stackName': self.cfn.STACKS['workflows'], 'changeSetArn': 'staged-change'}
+            for name, value in (('beforeTemplate', before), ('candidateTemplate', after), ('review', review)):
+                path = Path(directory) / (name + '.json'); path.write_text(json.dumps(value))
+                spec[name + 'Path'] = str(path); spec[name + 'Sha256'] = hashlib.sha256(path.read_bytes()).hexdigest()
+            digest = lambda path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            submitted = copy.deepcopy(after); submitted['Resources']['Workflow']['DependsOn'] = [role]
+            def aws(*args):
+                if args[1] == 'describe-change-set': return {'ChangeSetId': spec['changeSetArn'], 'StackName': spec['stackName']}
+                if args[1] == 'get-template': return {'TemplateBody': submitted}
+                self.fail('unexpected cloud operation')
+            with self.assertRaisesRegex(ValueError, 'submitted template differs'):
+                self.cfn.execute('workflows', spec, directory, False, aws, lambda *_: self.fail('unexpected write'), digest)
+            Path(spec['candidateTemplatePath']).write_text(json.dumps(submitted))
+            with self.assertRaisesRegex(ValueError, 'reviewed CloudFormation artifact changed'):
+                self.cfn.execute('workflows', spec, directory, False, aws, lambda *_: self.fail('unexpected write'), digest)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
