@@ -6,6 +6,8 @@ import { useEffect, useState } from 'react';
 import { Routes } from '@/utils/constants';
 import {
     BOOT_LOAD_GRACE_MS,
+    BOOT_DOCUMENT_LOAD_MAX_MS,
+    BOOT_RECOVERY_MAX_MS,
     BOOT_RELOAD_KEY,
     BOOT_STALL_MS,
     judgeArrival,
@@ -95,30 +97,42 @@ export function BootWatchdog() {
          * place is also why "booted" always wins over "timed out".
          */
         const settled: StallReason = verdict.action === 'stall' ? verdict.reason : 'timeout';
-        let deadline = verdict.action === 'stall' ? 0 : Date.now() + BOOT_STALL_MS;
+        const startedAt = Date.now();
+        const documentDeadline = startedAt + BOOT_DOCUMENT_LOAD_MAX_MS;
+        const recoveryDeadline = startedAt + BOOT_RECOVERY_MAX_MS;
+        let deadline = verdict.action === 'stall' ? 0 : startedAt + BOOT_STALL_MS;
+        let documentPending = verdict.action === 'watch' && document.readyState !== 'complete';
 
         // The deadline moves out if `load` lands late: before `load` the
         // deferred bundle has not necessarily executed, so declaring failure
         // then would be guessing. Only for a boot that might still arrive.
-        const onLoad = () => { deadline = Math.max(deadline, Date.now() + BOOT_LOAD_GRACE_MS); };
-        if (verdict.action === 'watch' && document.readyState !== 'complete') {
+        const onLoad = () => {
+            documentPending = false;
+            deadline = Math.min(recoveryDeadline, Math.max(deadline, Date.now() + BOOT_LOAD_GRACE_MS));
+        };
+        if (documentPending) {
             window.addEventListener('load', onLoad, { once: true });
         }
 
         const poll = setInterval(() => {
             if (shellIsUp()) {
                 forgetReload();
+                setStall(null);
                 clearInterval(poll);
+                window.removeEventListener('load', onLoad);
                 return;
             }
             if (w.ezil?.stalled) {
-                clearInterval(poll);
                 setStall(prev => prev ?? 'shell-gave-up');
-                return;
             }
-            if (Date.now() >= deadline) {
-                clearInterval(poll);
+            const now = Date.now();
+            if (now >= deadline && (!documentPending || now >= documentDeadline)) {
                 setStall(prev => prev ?? settled);
+            }
+            // A failure stays visible, but a late healthy mount can retire it within this fixed window.
+            if (now >= recoveryDeadline) {
+                clearInterval(poll);
+                window.removeEventListener('load', onLoad);
             }
         }, 250);
 

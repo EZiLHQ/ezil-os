@@ -868,7 +868,7 @@ export async function openCodeWindow (ctx = {}) {
 
     // ── the "Reconnecting…" / "Computer stopped" state (lane A2) ─────────
     // An OS-level cover over the frame for the moments the shell KNOWS the
-    // computer is not there: a restart/switch transition in flight, or the
+    // computer needs checking or is not there: a restart/switch transition, or the
     // return-from-away check finding it stopped. Without it the frame keeps
     // code-server's own "Attempting to reconnect" dialog, which lives inside
     // the cross-origin iframe where this shell can neither see nor replace it.
@@ -894,11 +894,17 @@ export async function openCodeWindow (ctx = {}) {
     el_state_start.type = 'button';
     el_state_start.className = 'ezil-code-state-start';
     el_state_start.textContent = 'Start computer';
-    el_state_start.addEventListener('click', () => { void start_boot(); });
+    let return_probe_retry = null;
+    el_state_start.addEventListener('click', () => {
+        if (el_state.dataset.state === 'unknown') return_probe_retry?.();
+        else if (el_state.dataset.state === 'stopped') void start_boot();
+    });
     el_state.append(el_state_title, el_state_body, el_state_start);
     el_body.appendChild(el_state);
 
     const STATE_COPY = {
+        checking: ['Checking computer…', 'Checking whether your computer is still running.'],
+        unknown: ['Could not check computer', 'Try checking again. Your files are safe.'],
         reconnecting: ['Reconnecting…', 'Your computer is restarting or switching configuration. Code reopens here when it is back. Your files are safe.'],
         stopped: ['Computer stopped', "Your computer isn't running, so Code can't reach it. Your files are safe."],
     };
@@ -909,14 +915,20 @@ export async function openCodeWindow (ctx = {}) {
         clearInterval(stopped_timer); stopped_timer = null;
         el_state.hidden = true;
         delete el_state.dataset.state;
+        return_probe_retry = null;
+        el_iframe.inert = false;
+        el_iframe.removeAttribute('aria-hidden');
     };
     const show_state = (kind) => {
         if ( disposed ) return;
         hide_state();
         [el_state_title.textContent, el_state_body.textContent] = STATE_COPY[kind];
         el_state.dataset.state = kind;
-        el_state_start.hidden = kind !== 'stopped';
+        el_state_start.hidden = kind !== 'stopped' && kind !== 'unknown';
+        el_state_start.textContent = kind === 'unknown' ? 'Retry' : 'Start computer';
         el_state.hidden = false;
+        el_iframe.inert = true;
+        el_iframe.setAttribute('aria-hidden', 'true');
         if ( kind !== 'stopped' ) return;
         // Back to running by any other route (the Browser opened it, another
         // tab started it): re-mint the same Code URL through `start_boot()`.
@@ -1341,6 +1353,19 @@ export async function openCodeWindow (ctx = {}) {
         isLive: () => !! el_iframe.getAttribute('src'),
         reboot: () => { show_state('stopped'); },
         desktopRunning: (id) => session.desktopRunning(id),
+        retryUnknownMs: 1000,
+        generation: () => `${session.payload()?.user?.id ?? ''}:${attempt}`,
+        onCheckState: (state, retry) => {
+            if (disposed) return;
+            if (state === 'running') {
+                // Status alone does not verify the existing frame URL or its runtime generation.
+                if (['checking', 'unknown'].includes(el_state.dataset.state)) hide_state();
+            } else if (el_state.dataset.state !== 'reconnecting') {
+                // A return check cannot retire an in-progress restart/switch cover.
+                show_state(state);
+                return_probe_retry = retry;
+            }
+        },
     });
 
     // A completed desktop restart restarts code-server too on an AWS host, and
