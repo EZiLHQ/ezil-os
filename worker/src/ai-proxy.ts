@@ -8,6 +8,8 @@ import { hmacSha256Hex, timingSafeEqualHex, TOKEN_MAX_AGE_MS } from './hmac';
 
 export const DEFAULT_AI_GATEWAY_URL = 'https://ai.ezil.work';
 export const AI_PROXY_HEADERS_TIMEOUT_MS = 30_000;
+/** Explicit streaming POSTs: one combined headers + first body byte budget. */
+export const AI_PROXY_STREAM_START_TIMEOUT_MS = 200_000;
 export const AI_PROXY_IDLE_TIMEOUT_MS = 30_000;
 /**
  * Headers deadline for a non-stream (JSON) POST only. The Gateway sends a JSON reply's headers after the whole
@@ -22,7 +24,7 @@ export const AI_PROXY_IDLE_TIMEOUT_MS = 30_000;
  * id); within 40 s, its deadline still fires during the drain. Later than that, an abort here can pause a route the
  * Gateway would still have answered. The extension's deadline, counted from its first send, usually aborts first,
  * under the same condition from that send. A reply abandoned here may still be charged if the model finished.
- * Streams keep the 30 s headers deadline.
+ * Explicit streams use a 200 s start budget, then retain the 30 s inter-chunk idle deadline.
  */
 export const AI_PROXY_COMPLETION_TIMEOUT_MS = 200_000;
 /** Local safety ceiling; gateway validation/413 responses below it pass through. */
@@ -349,7 +351,10 @@ export interface AiProxyDeps {
   readonly headersTimeoutMs?: number;
   /** Headers deadline for non-stream POST bodies (`isNonStreamBody`). */
   readonly completionTimeoutMs?: number;
+  readonly streamStartTimeoutMs?: number;
   readonly idleTimeoutMs?: number;
+  /** Monotonic elapsed-time clock for the stream-start budget, independent of auth/log wall time. */
+  readonly transportNow?: () => number;
   readonly now?: () => number;
 }
 
@@ -487,6 +492,7 @@ function passThrough(
   abort: AbortController,
   watchError: boolean,
   watchResponses = false,
+  firstByte?: { deadline: number; now: () => number },
 ): ReadableStream<Uint8Array> {
   const reader = body.getReader();
   const decoder = new TextDecoder();
@@ -495,6 +501,7 @@ function passThrough(
   let sseCode: string | null = null;
   let terminal: string | null = null;
   let finished = false;
+  let first = true;
   const errorChunks: Uint8Array[] = [];
   let errorBytes = 0;
   const responses = watchResponses ? responseTelemetry(watchSse) : undefined;
@@ -516,15 +523,17 @@ function passThrough(
       async pull(controller) {
         let timer: ReturnType<typeof setTimeout> | undefined;
         const idle = new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new IdleTimeout()), idleMs);
+          timer = setTimeout(() => reject(new IdleTimeout()), first && firstByte ? Math.max(0, firstByte.deadline - firstByte.now()) : idleMs);
         });
         try {
+          if (first && firstByte && firstByte.now() >= firstByte.deadline) throw new IdleTimeout();
           const next = await Promise.race([reader.read(), idle]);
           if (next.done) {
             finish('eof');
             controller.close();
             return;
           }
+          if (next.value.byteLength > 0) first = false;
           if (watchError) {
             errorBytes += next.value.byteLength;
             if (errorBytes <= MAX_ERROR_BODY_BYTES) errorChunks.push(next.value);
@@ -549,7 +558,7 @@ function passThrough(
         } catch (err) {
           abort.abort();
           reader.cancel().catch(() => undefined);
-          finish(err instanceof IdleTimeout ? 'idle_timeout' : 'upstream_error');
+          finish(err instanceof IdleTimeout ? first && firstByte ? 'first_byte_timeout' : 'idle_timeout' : 'upstream_error');
           controller.error(err);
         } finally {
           if (timer !== undefined) clearTimeout(timer);
@@ -565,22 +574,15 @@ function passThrough(
   );
 }
 
-/**
- * True only when a POST body parses as a JSON object whose top-level `stream` is exactly `false`. The Gateway
- * chooses SSE or JSON from this field (Accept is a client hint it does not act on), so it alone predicts when
- * response headers arrive. Anything else (true, absent, not a boolean, not JSON, not UTF-8) is treated as a
- * stream and keeps the short headers deadline; an absent `stream` means JSON to the Gateway, so such clients
- * keep the old 30 s. The body is only inspected, never changed or logged.
- */
-export function isNonStreamBody(body: Uint8Array | undefined): boolean {
-  if (body === undefined || body.byteLength === 0) return false;
+/** Inspect only a JSON object's explicit stream boolean; never change or log the body. */
+function bodyStreamValue(body: Uint8Array | undefined): unknown {
+  if (body === undefined || body.byteLength === 0) return undefined;
   try {
     const parsed: unknown = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(body));
-    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) && (parsed as { stream?: unknown }).stream === false;
-  } catch {
-    return false;
-  }
+    return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? (parsed as { stream?: unknown }).stream : undefined;
+  } catch { return undefined; }
 }
+export function isNonStreamBody(body: Uint8Array | undefined): boolean { return bodyStreamValue(body) === false; }
 
 /**
  * The Gateways whose exact response cache EZiL Chat opts into, by the Worker's existing `EZIL_AI_GATEWAY_URL` as
@@ -783,8 +785,13 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
   }
 
   const abort = new AbortController();
-  const completion = route.method === 'POST' && isNonStreamBody(body);
-  const headersMs = completion ? deps.completionTimeoutMs ?? AI_PROXY_COMPLETION_TIMEOUT_MS : deps.headersTimeoutMs ?? AI_PROXY_HEADERS_TIMEOUT_MS;
+  const streamValue = route.method === 'POST' ? bodyStreamValue(body) : undefined;
+  const completion = streamValue === false;
+  const streaming = streamValue === true;
+  const headersMs = completion ? deps.completionTimeoutMs ?? AI_PROXY_COMPLETION_TIMEOUT_MS
+    : streaming ? deps.streamStartTimeoutMs ?? AI_PROXY_STREAM_START_TIMEOUT_MS : deps.headersTimeoutMs ?? AI_PROXY_HEADERS_TIMEOUT_MS;
+  const transportNow = deps.transportNow ?? (() => performance.now());
+  const firstByte = streaming ? { deadline: transportNow() + headersMs, now: transportNow } : undefined;
   let deadlinePassed = false;
   const headersTimer = setTimeout(() => { deadlinePassed = true; abort.abort(); }, headersMs);
   const onDisconnect = () => abort.abort();
@@ -846,7 +853,7 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
     // Gateway errors are a bounded, allow-listed envelope; never echo messages or credentials.
     try {
       const bytes = await readLimited(passThrough(upstream.body, deps.idleTimeoutMs ?? AI_PROXY_IDLE_TIMEOUT_MS,
-        false, () => {}, abort, false), MAX_ERROR_BODY_BYTES);
+        false, () => {}, abort, false, false, firstByte), MAX_ERROR_BODY_BYTES);
       const error = safeGatewayError(bytes);
       // Configuration/membership failures do not become a misleading OS session failure on the next call.
       if (upstream.status === 401 && (error.reason === 'expired' || error.reason === 'token_expired')) {
@@ -869,6 +876,6 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
     cleanup();
     log({ status: upstream.status, request_id: requestId, code, stream: isSse, outcome, terminal, ...(responses ? { usage: usage ?? null } : {}),
       ...(exactCache ? { cache } : {}) });
-  }, abort, !upstream.ok, responses);
+  }, abort, !upstream.ok, responses, firstByte);
   return new Response(stream, { status: upstream.status, headers: outHeaders });
 }

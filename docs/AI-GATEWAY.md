@@ -46,10 +46,13 @@ headers are `x-ezil-request-id`, `x-ezil-hold-micro`, `x-ezil-trace-id`,
 `traceparent`, `retry-after`, `content-type`, `cache-control` and
 `x-accel-buffering`. SSE is forwarded chunk by chunk with backpressure;
 cancelling the response or disconnecting the client aborts the upstream fetch.
-Streams must send headers within **30 seconds** and then a chunk at least every
-**30 seconds**. A nonstreaming (JSON) request, whose headers the gateway sends
-only after the whole generation, gets one **200-second** headers deadline
-instead (`AI_PROXY_COMPLETION_TIMEOUT_MS`, paired with the extension). The
+Explicit streaming POSTs have one **200-second** budget for headers and the
+first nonempty body chunk together (`AI_PROXY_STREAM_START_TIMEOUT_MS`, paired
+with the extension). After the first chunk, the idle limit stays **30 seconds**.
+Metadata reads and malformed/unspecified stream bodies retain the **30-second**
+headers limit. A nonstreaming (JSON) request, whose headers the gateway sends
+only after the whole generation, retains its **200-second** headers deadline
+(`AI_PROXY_COMPLETION_TIMEOUT_MS`). The
 gateway owner cites a 180-second upstream deadline that starts at the gateway's
 own upstream fetch, and a 20-second drain after a client leaves. If the gateway
 reaches that fetch within 20 seconds of this one, its own deadline answers

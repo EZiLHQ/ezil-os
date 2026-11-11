@@ -18,7 +18,10 @@ import { localResetTime } from './status-data';
 import { credits, creditsFloor2 } from './credits-format';
 import type { ChatRequest, StreamEvent } from './types';
 
+/** Only an early transport failure may be resent; inference may already be running after this. */
 export const GATEWAY_FIRST_BYTE_TIMEOUT_MS = 30_000;
+/** Headers and first stream byte share this budget, including any early same-key resend. */
+export const GATEWAY_STREAM_START_TIMEOUT_MS = 200_000;
 export const GATEWAY_IDLE_TIMEOUT_MS = 30_000;
 /**
  * Non-stream (JSON) requests only: the Gateway answers a JSON request after the whole generation (jsonThrough
@@ -34,7 +37,7 @@ export const GATEWAY_IDLE_TIMEOUT_MS = 30_000;
  * Gateway's own deadline answers first (a 504 with its request id); within 40 s, its deadline still fires during
  * the drain, so abandoning here never pauses a route the Gateway itself would not have paused. Later than that, a
  * reply that would have finished before the Gateway's deadline is abandoned and its route paused. A reply abandoned
- * here may still be charged if the model finished. Streaming deadlines are unchanged.
+ * here may still be charged if the model finished. Streaming uses the same 200 s start budget, then the existing 30 s inter-chunk idle budget.
  */
 export const GATEWAY_COMPLETION_TIMEOUT_MS = 200_000;
 /** Coupled to the Gateway's default `per_user_concurrency`; shared by all models for an identity. */
@@ -714,7 +717,7 @@ type TransportCode = 'first_byte_timeout' | 'stream_idle_timeout' | 'completion_
 // Mirrors the cancelled notice: a JSON request abandoned or cut off here may still be charged if the model finished.
 const MAY_BE_CHARGED = 'The request may still be charged if the model finished, never more than EZiL AI settles for it.';
 const TRANSPORT_TEXT: Record<TransportCode, string> = {
-    first_byte_timeout: 'did not answer within 30 seconds. Retry the request',
+    first_byte_timeout: `no first reply byte within ${GATEWAY_STREAM_START_TIMEOUT_MS / 1000} seconds, so EZiL Models stopped waiting. ${MAY_BE_CHARGED} You can retry`,
     stream_idle_timeout: 'the response stopped arriving. Retry the request',
     completion_timeout: `no complete reply within ${GATEWAY_COMPLETION_TIMEOUT_MS / 1000} seconds, so EZiL Models stopped waiting (this model sends its reply only when it is complete). `
         + `${MAY_BE_CHARGED} You can retry or switch to a streaming model`,
@@ -722,18 +725,18 @@ const TRANSPORT_TEXT: Record<TransportCode, string> = {
     connection_lost: 'the connection was lost while waiting for the complete reply (this model sends its reply only when it is complete), '
         + `and EZiL AI may already have been running the request, so EZiL Models did not send it again. ${MAY_BE_CHARGED} You can retry or switch to a streaming model`,
 };
-const transportError = (code: TransportCode, requestId?: string) => new GatewayError(
-    `EZiL AI: ${TRANSPORT_TEXT[code]}${requestId ? ` (request ${requestId})` : ''}`, undefined, code, requestId, undefined, 'transport');
+const transportError = (code: TransportCode, requestId?: string, stream = false) => new GatewayError(
+    `EZiL AI: ${code === 'connection_lost' && stream ? `the connection was lost while waiting for the first reply byte, and EZiL AI may already have been running the request, so EZiL Models did not send it again. ${MAY_BE_CHARGED} You can retry` : TRANSPORT_TEXT[code]}${requestId ? ` (request ${requestId})` : ''}`, undefined, code, requestId, undefined, 'transport');
 
 /**
- * Streams: 30 s to the first byte, then 30 s per chunk, per attempt. Non-stream: the whole reply by the completion
+ * Streams: 200 s from first send to first byte, then 30 s per chunk. Non-stream: the whole reply by the completion
  * deadline counted from `sentAt`, when this request was first sent, so a transport resend gets only what is left.
- * With nothing left it fails with `completion_timeout` (`abort` carries it) and sends nothing.
+ * With nothing left it fails with the matching start/completion timeout and sends nothing.
  */
 async function timedResponse(doFetch: typeof fetch, url: string, init: RequestInit, abort: AbortController, stream: boolean, sentAt: number,
     onSend: () => void): Promise<Response> {
-    const started = stream ? performance.now() : sentAt;
-    const deadline = stream ? GATEWAY_FIRST_BYTE_TIMEOUT_MS : GATEWAY_COMPLETION_TIMEOUT_MS;
+    const started = sentAt;
+    const deadline = stream ? GATEWAY_STREAM_START_TIMEOUT_MS : GATEWAY_COMPLETION_TIMEOUT_MS;
     const firstCode: TransportCode = stream ? 'first_byte_timeout' : 'completion_timeout';
     const left = deadline - (performance.now() - started);
     if (left <= 0) { const expired = transportError(firstCode); abort.abort(expired); throw expired; }
@@ -747,11 +750,12 @@ async function timedResponse(doFetch: typeof fetch, url: string, init: RequestIn
         async pull(controller) {
             try {
                 const remaining = deadline - (performance.now() - started);
+                if (first && remaining <= 0) { const error = transportError(firstCode, requestId); abort.abort(error); throw error; }
                 // After the first byte a body may idle 30 s per chunk, and a JSON reply must still finish by its deadline.
                 const [ms, code]: [number, TransportCode] = first ? [remaining, firstCode]
                     : stream || remaining > GATEWAY_IDLE_TIMEOUT_MS ? [GATEWAY_IDLE_TIMEOUT_MS, 'stream_idle_timeout'] : [remaining, 'completion_timeout'];
                 const next = await bounded(reader.read(), ms, abort, transportError(code, requestId));
-                first = false;
+                if (next.done || next.value.byteLength > 0) first = false;
                 if (next.done) controller.close();
                 else controller.enqueue(next.value);
             } catch (error) {
@@ -867,7 +871,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         let retried = false;
         // Set once a transport failure was resent with the same key: a later idempotency_replay means the first send arrived.
         let resent = false;
-        // Non-stream only, on the performance.now() clock: when the request a transport resend repeats was first sent.
+        // On the performance.now() clock: when the request a transport resend repeats was first sent.
         // EZiL AI may already be running it, so the resend shares its completion deadline (and its admission wait
         // counts against it). A 429 refusal answers before anything runs, so the attempt after one starts afresh.
         let resendOf: number | undefined;
@@ -882,7 +886,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
             options.signal.throwIfAborted();
             const release = await acquireGatewaySlot(identity, options.signal,
                 concurrencyError ? { ms: remainingWait(), error: concurrencyError }
-                    : resendOf !== undefined ? { ms: resendOf + GATEWAY_COMPLETION_TIMEOUT_MS - performance.now(), error: transportError('completion_timeout') } : undefined);
+                    : resendOf !== undefined ? { ms: resendOf + GATEWAY_COMPLETION_TIMEOUT_MS - performance.now(), error: transportError(stream ? 'first_byte_timeout' : 'completion_timeout') } : undefined);
             let waitMs: number;
             try {
                 options.signal.throwIfAborted();
@@ -910,11 +914,10 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                         () => { attempts++; stage = 'request'; });
                 } catch (error) {
                     if (options.signal.aborted || attemptAbort.signal.reason instanceof GatewayError) throw error;
-                    // A JSON reply has no headers until it is complete, so a failure this late may have cut off a request
-                    // EZiL AI is already running: a same-key resend could only be answered idempotency_replay.
-                    if (!stream && performance.now() - sentAt > GATEWAY_FIRST_BYTE_TIMEOUT_MS) throw transportError('connection_lost', requestId);
+                    // A late failure may cut off inference already running. Never replay it merely because response headers have not arrived.
+                    if (performance.now() - sentAt > GATEWAY_FIRST_BYTE_TIMEOUT_MS) throw transportError('connection_lost', requestId, stream);
                     if (!retried) {
-                        retried = true; resent = true; resendOf = stream ? undefined : sentAt;
+                        retried = true; resent = true; resendOf = sentAt;
                         retrying(new GatewayError('', undefined, 'os_unreachable', requestId, undefined, 'transport'));
                         continue;
                     }
