@@ -52,6 +52,7 @@ vi.mock('node:net', async () => {
     } };
 });
 
+import { aiCreditEntitlement, aiCreditOutboxItem } from '@/server/billing/ai-credits';
 import { enrollStagingAiMember } from './staging-ai-enrollment';
 
 const userId = '3f2f95a1-5420-4a63-94f9-79b85a1ceeb4';
@@ -67,7 +68,7 @@ function frame(type: string, payload: Buffer) {
 const ready = (status = 'I') => frame('Z', Buffer.from(status));
 const complete = (command: string) => frame('C', Buffer.from(`${command}\0`));
 
-const OID = { bool: 16, bigint: 20, text: 25, uuid: 2950, jsonb: 3802 } as const;
+const OID = { bool: 16, bigint: 20, int4: 23, text: 25, uuid: 2950, jsonb: 3802 } as const;
 type Bound = { statement: string; types: number[]; values: (string | null)[] };
 
 /**
@@ -76,7 +77,7 @@ type Bound = { statement: string; types: number[]; values: (string | null)[] };
  * parameter compared with or stored into text is 25), and records each Bind's text values exactly as
  * PostgreSQL's input functions would receive them.
  */
-function serve(socket: SocketDouble) {
+function serve(socket: SocketDouble, starter?: { eventKey: string; payload: Record<string, unknown>; stallAt?: string }) {
     const bound: Bound[] = [];
     const out: Buffer[] = [];
     let statement = '';
@@ -86,10 +87,16 @@ function serve(socket: SocketDouble) {
         const cast = new RegExp(`\\$${n}(?!\\d)::(\\w+)`).exec(sql)?.[1];
         return cast === 'uuid' ? OID.uuid : cast === 'jsonb' ? OID.jsonb : cast === 'bigint' ? OID.bigint : OID.text;
     };
+    // `starter` answers the scoped delivery on the same connection: the claimed Free row, its Works account, and the pin.
     const columns = (sql: string): [name: string, type: number, value: string][] | null =>
         sql.includes('select exists') ? [['allowed', OID.bool, 't']]
             : sql.includes('enroll_ai_member') ? [['enrollment', OID.jsonb, '{"ok":true}']]
-                : null;
+                : starter && sql.includes('skip locked') ? [['id', OID.uuid, '6b1c2a54-0000-4000-8000-000000000001'], ['eventKey', OID.text, starter.eventKey],
+                    ['userId', OID.uuid, userId], ['kind', OID.text, 'ai_grant'], ['payload', OID.jsonb, JSON.stringify({ ...starter.payload, delivery: { status: 'processing', nextAttemptAt: 1, leaseToken: 'lease' } })],
+                    ['attempts', OID.int4, '1'], ['dependencyWaits', OID.int4, '0'], ['exhausted', OID.bool, 'f']]
+                    : starter && sql.includes('ezil_works.ai_members') ? [['public_id', OID.text, 'works-public-id']]
+                        : starter && sql.includes('jsonb_set(payload, \'{accountPublicId}\'') ? [['id', OID.uuid, '6b1c2a54-0000-4000-8000-000000000001']]
+                            : null;
     const int16 = (n: number) => { const b = Buffer.alloc(2); b.writeInt16BE(n); return b; };
     const int32 = (n: number) => { const b = Buffer.alloc(4); b.writeInt32BE(n); return b; };
     const flush = () => {
@@ -145,9 +152,11 @@ function serve(socket: SocketDouble) {
             } else if (type === 'E') {
                 execute();
             } else if (type === 'S') {
+                if (starter?.stallAt && statement.includes(starter.stallAt)) continue; // The backend goes quiet mid-delivery.
                 out.push(ready(inTransaction ? 'T' : 'I'));
                 flush();
             } else if (type === 'H') {
+                if (starter?.stallAt && statement.includes(starter.stallAt)) continue;
                 flush();
             }
         }
@@ -290,5 +299,78 @@ describe('installed postgres.js serialization of the sign-in Free receipt', () =
         const kick = bound.find(bind => bind.statement.startsWith('update public.ezil_billing_outbox'))!;
         expect(kick.types).toEqual([OID.uuid, OID.bigint, OID.text]);
         expect([kick.values[0], kick.values[2]]).toEqual([userId, 'ezil-ai-credits-v1']);
+    });
+});
+
+describe('installed postgres.js: the scoped starter delivery on the enrollment\'s own connection', () => {
+    const item = aiCreditOutboxItem(userId, aiCreditEntitlement({ userId, sku: 'free_v3', subscriptionId: null,
+        periodStart: new Date('2026-11-05T12:00:00.000Z'), periodEnd: null, invoiceId: null }), 'grant', null);
+
+    async function signIn(fetcher: ReturnType<typeof vi.fn>, stallAt?: string) {
+        vi.stubEnv('BILLING_FUNDING_HMAC_SECRET', 'driver-fixture-secret');
+        vi.stubGlobal('fetch', fetcher);
+        vi.setSystemTime(new Date('2026-11-05T12:00:00.000Z'));
+        const signingIn = enrollStagingAiMember(userId, subject);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(transport.sockets).toHaveLength(1);
+        const bound = serve(transport.sockets[0]!, { eventKey: item.eventKey, payload: item.payload, ...(stallAt ? { stallAt } : {}) });
+        transport.sockets[0]!.connectNow();
+        await vi.advanceTimersByTimeAsync(1);
+        transport.sockets[0]!.emit('data', ready());
+        return { bound, signingIn };
+    }
+
+    it('claims exactly the user\'s Free grant, pins the account, sends the 2 s event and finishes it, all on the one socket', async () => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const fetcher = vi.fn(async () => new Response(null, { status: 204 }));
+        const { bound, signingIn } = await signIn(fetcher);
+        await vi.advanceTimersByTimeAsync(100);
+        await expect(signingIn).resolves.toEqual({ ok: true });
+
+        expect(transport.sockets).toHaveLength(1);
+        const claim = bound.find(bind => bind.statement.includes('skip locked'))!;
+        expect(claim.statement).toMatch(/pending\.user_id = \$\d+::uuid and pending\.event_key = \$\d+ and pending\.kind = \$\d+/);
+        expect(claim.values).toEqual(expect.arrayContaining([userId, item.eventKey, 'ai_grant']));
+        // The receipt insert still binds its payload as a jsonb object (drizzle only wraps the client after it).
+        const insert = bound.find(bind => bind.statement.startsWith('insert into public.ezil_billing_outbox'))!;
+        expect(insert.types).toEqual([OID.text, OID.uuid, OID.text, OID.jsonb]);
+        expect(typeof JSON.parse(insert.values[3]!)).toBe('object');
+        expect(bound.some(bind => bind.statement.includes('{accountPublicId}'))).toBe(true);
+        const finish = bound.find(bind => bind.statement.includes('last_error ='))!;
+        expect(finish.values).toEqual(expect.arrayContaining([null, expect.stringContaining('"status":"done"')]));
+        expect(fetcher).toHaveBeenCalledTimes(1);
+        expect(JSON.parse((fetcher.mock.calls[0] as unknown as [string, RequestInit])[1].body as string))
+            .toMatchObject({ eventId: item.eventKey, action: 'grant', accountPublicId: 'works-public-id' });
+        expect(info.mock.calls.at(-1)).toEqual([JSON.stringify({ event: 'ai-enroll', source: 'auth0', stage: 'done', code: null, starter: 'delivered' })]);
+    });
+
+    it('a Gateway that hangs never fails the enrollment: it is aborted at 2 s and the sign-in is still ok', async () => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const hang = vi.fn((_url: string, init: RequestInit) => new Promise<Response>((_, reject) => {
+            init.signal!.addEventListener('abort', () => reject(new Error('aborted')));
+        }));
+        const { bound, signingIn } = await signIn(hang);
+        await vi.advanceTimersByTimeAsync(100);
+        expect(hang).toHaveBeenCalledTimes(1);
+        await vi.advanceTimersByTimeAsync(2_000);
+        await expect(signingIn).resolves.toEqual({ ok: true });
+        expect(bound.some(bind => bind.statement.includes('last_error =') && bind.values.some(v => v?.includes('"status":"retry"')))).toBe(true);
+        expect(info.mock.calls.at(-1)).toEqual([JSON.stringify({ event: 'ai-enroll', source: 'auth0', stage: 'done', code: null, starter: 'queued' })]);
+    });
+
+    it('the five-second socket deadline cutting the database mid-delivery still reports an enrolled member, not a timeout', async () => {
+        const info = vi.spyOn(console, 'info').mockImplementation(() => {});
+        const never = vi.fn(async () => new Response(null, { status: 204 }));
+        // The backend answers the claim, then goes quiet on the account lookup: the pin, the HTTP call and the finish never happen.
+        const { bound, signingIn } = await signIn(never, 'ezil_works.ai_members');
+        await vi.advanceTimersByTimeAsync(100);
+        expect(bound.some(bind => bind.statement.includes('skip locked'))).toBe(true);
+        await vi.advanceTimersByTimeAsync(6_000);
+        await expect(signingIn).resolves.toEqual({ ok: true });
+        expect(transport.sockets[0]!.destroyed).toBe(true);
+        expect(never).not.toHaveBeenCalled();
+        expect(bound.some(bind => bind.statement.includes('last_error ='))).toBe(false);
+        // The committed enrollment and receipt stand; the claimed row stays `processing` until its 30 s lease lapses.
+        expect(JSON.parse(info.mock.calls.at(-1)![0] as string)).toMatchObject({ event: 'ai-enroll', source: 'auth0', stage: 'deliver', code: null });
     });
 });

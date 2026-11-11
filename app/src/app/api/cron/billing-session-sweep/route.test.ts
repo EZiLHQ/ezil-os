@@ -14,6 +14,7 @@ import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { advanceReverseMoves } from '@/server/lib/compute/provider-reverse-runtime';
 import { handleBillingSessionSweep, reverseMoveInFlightFor } from './handler';
 import { aiIncludedModelsFor } from '@/server/billing/v3/ai-models';
+import { aiCreditsPendingFor } from '@/server/billing/ai-credits-pending';
 import { refreshAiPlans } from '@/server/lib/ai-credential';
 import { GET, maxDuration } from './route';
 
@@ -30,6 +31,7 @@ vi.mock('@/server/lib/cloudflare-guacamole-provider', () => ({ newCorrelationId:
     resolveCloudflareGuacamoleConfig: () => ({ workerUrl: 'https://worker.test', hasHmacSecret: true, isConfigured: true }) }));
 vi.mock('@/server/lib/ai-credential', () => ({ refreshAiPlans: vi.fn(), AI_PLAN_REFRESH_LIMIT: 500, AI_PLAN_REFRESH_OPENED_WITHIN_MS: 3 * 3_600_000 }));
 vi.mock('@/server/billing/v3/ai-models', () => ({ aiIncludedModelsFor: vi.fn() }));
+vi.mock('@/server/billing/ai-credits-pending', () => ({ aiCreditsPendingFor: vi.fn() }));
 vi.mock('./handler', () => ({ handleBillingSessionSweep: vi.fn(), RUNNING_GRACE_MS: 120_000,
     reverseMoveInFlightFor: vi.fn((executor: unknown) => Object.assign(async () => false, { executor })) }));
 vi.mock('@/server/lib/compute/provider-reverse-runtime', () => ({ advanceReverseMoves: vi.fn() }));
@@ -103,7 +105,7 @@ describe('GET /api/cron/billing-session-sweep', () => {
         const params = vi.mocked(refreshAiPlans).mock.calls[0]![0];
         expect(params.hmacSecret).toBe('hmac');
         expect(params.config).toMatchObject({ workerUrl: 'https://worker.test', isConfigured: true });
-        expect(Object.keys(params).sort()).toEqual(['computers', 'config', 'hmacSecret', 'includedModelsFor', 'pass']);
+        expect(Object.keys(params).sort()).toEqual(['computers', 'config', 'creditsPendingFor', 'hmacSecret', 'includedModelsFor', 'pass']);
         expect(params.pass).toBe(Math.floor(now.getTime() / 60_000));
         // The window is measured from the sweep's own clock: deleted_at IS NULL and last_opened_at after now - 3 h.
         const window = { sql: '("ezil_computers"."deleted_at" is null and "ezil_computers"."last_opened_at" > $1)',
@@ -118,6 +120,9 @@ describe('GET /api/cron/billing-session-sweep', () => {
         expect(new PgDialect().sqlToQuery(query.orderBy as SQL).sql).toBe('"ezil_computers"."id" asc');
         expect(await params.includedModelsFor('u1')).toEqual(['gemini-3.8-flash']);
         expect(aiIncludedModelsFor).toHaveBeenCalledExactlyOnceWith('u1');
+        vi.mocked(aiCreditsPendingFor).mockResolvedValue(true);
+        expect(await params.creditsPendingFor!('u1')).toBe(true);
+        expect(aiCreditsPendingFor).toHaveBeenCalledExactlyOnceWith('u1');
         mockEnv.CLOUDFLARE_GUACAMOLE_HMAC_SECRET = undefined;
     });
 
