@@ -57,3 +57,35 @@ test('catalog-only and configured models lose effort when account evidence is ab
     expect(stale.available.size).toBe(0); expect(stale.efforts.size).toBe(0);
     forgetGatewayModels();
 });
+
+
+test('configured default Messages never advertises Responses-first effort; catalog-only Responses does', async () => {
+    const configured = gw();
+    expect(configured.gatewayProtocol).toBeUndefined();
+    for (const protocols of [['openai-responses'], ['openai-responses', 'anthropic-messages']]) {
+        forgetGatewayModels();
+        const alias = 'catalog-only-responses';
+        const row = (id: string) => ({id,enabled:true,max_input_tokens:131072,max_output_tokens:8192,
+            protocols,availability:{state:'available',reasons:[]},effort:{protocol:'openai-responses',values:['low','high'],default:null}});
+        const raw = {contract:'ezil.gateway.models.v1',killswitch:false,pause:null,data:[row(configured.model),row(alias)]};
+        const catalog = parseGatewayModels(raw)!;
+        const catalogModel = gatewayCatalogModels(configured.provider,catalog,[configured])[0]!;
+        expect(catalogModel.gatewayProtocol).toBe('openai-responses');
+        const fetcher = (async () => Response.json(raw)) as unknown as typeof fetch;
+        const evidence = await accountModelEvidence([configured],[configured.id,catalogModel.id],fetcher,1000);
+        // This is the source used to advertise effort, compared with actual execution helpers.
+        expect(evidence.efforts.has(configured.id)).toBe(false);
+        const messages = withGatewayModelLimits(configured,catalog);
+        expect(effortConfigurationSchema(messages)).toBeUndefined();
+        expect(() => withSessionEffort(messages,{reasoningEffort:'high'})).toThrow();
+        expect(buildGatewayBody(messages,ask()).body).not.toHaveProperty('output_config');
+        expect(evidence.efforts.get(catalogModel.id)).toEqual(catalogModel.gatewayEffort);
+        const selected = withSessionEffort(catalogModel,{reasoningEffort:'high'});
+        expect(buildGatewayResponsesBody(selected,ask()).body.reasoning).toEqual({effort:'high'});
+        // Explicit configured Responses still uses the published Responses capability.
+        const responses = {...configured,gatewayProtocol:'openai-responses' as const};
+        const explicit = await accountModelEvidence([responses],[responses.id],fetcher,1000);
+        expect(explicit.efforts.get(responses.id)).toEqual(withGatewayModelLimits(responses,catalog).gatewayEffort);
+    }
+    forgetGatewayModels();
+});

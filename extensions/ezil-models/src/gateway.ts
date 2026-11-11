@@ -499,7 +499,11 @@ export async function accountAvailableIds(models: readonly ResolvedModel[], ids:
         if (seen && availableForAccount(seen.models, alias)) {
             candidates.set(id, seen.at);
             const row = seen.models.data.find(m => m.id === alias);
-            const protocol = configured?.gatewayProtocol ?? row?.protocols?.[0] ?? 'anthropic-messages';
+            // Configured models execute Messages unless explicitly opted into Responses.
+            // Only catalog-only models select their protocol from the catalog.
+            const protocol = configured
+                ? configured.gatewayProtocol ?? 'anthropic-messages'
+                : row?.protocols?.[0] ?? 'anthropic-messages';
             const cap = parseGatewayEffort(row?.effort, protocol);
             if (cap) effortEvidence?.set(id, cap);
         }
