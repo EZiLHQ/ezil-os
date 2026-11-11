@@ -76,6 +76,24 @@ describe('offline unique sponsor link preparation', () => {
         expect(() => signReviewedSponsor(edited({ campaignId: 'fixture-unissued' }), initial, KEY)).toThrow('new_campaign_requires_issue');
         expect(() => signReviewedSponsor(edited({ version: 0 }), initial, KEY)).toThrow('registry_invalid');
     });
+    it('refuses remove-A/retain-B signing so A cannot be reissued to a different partner, including after retirement', async () => {
+        const a = issueSponsor(base, KEY), first = join(directory, 'first');
+        writeSponsorBundle(first, a.bundle, a.link);
+        const both = issueSponsor({ ...base, campaignId: 'fixture-campaign-b', partnerId: 'fixture-partner-b', previousDirectory: first }, KEY);
+        const prior = join(directory, 'both'), reviewed = join(directory, 'removed-a.json'), output = join(directory, 'removed-bundle');
+        writeSponsorBundle(prior, both.bundle, both.link);
+        writeFileSync(reviewed, JSON.stringify({ v: 1, campaigns: both.bundle.entries.filter(entry => entry.campaignId !== base.campaignId) }));
+        await expect(runSponsorOperator(['sign', '--registry', reviewed, '--previous-dir', prior, '--out-dir', output], { SPONSOR_REGISTRY_KEY: KEY }))
+            .rejects.toThrow('campaign_removal_requires_retirement');
+        expect(() => statSync(output)).toThrow();
+        expect(() => issueSponsor({ ...base, partnerId: 'fixture-new-partner', previousDirectory: prior }, KEY)).toThrow('campaign_already_exists');
+        const retired = signReviewedSponsor(JSON.stringify({ v: 1, campaigns: both.bundle.entries.map(entry => entry.campaignId === base.campaignId
+            ? { ...entry, enabled: false, version: entry.version + 1 } : entry) }), both.bundle, KEY);
+        const retiredDirectory = join(directory, 'retired');
+        writeSponsorBundle(retiredDirectory, retired);
+        expect(retired.registry.get(base.campaignId)).toMatchObject({ partnerId: base.partnerId, enabled: false, version: 2, tokenSha256: a.bundle.entries[0].tokenSha256 });
+        expect(() => issueSponsor({ ...base, partnerId: 'fixture-new-partner', previousDirectory: retiredDirectory }, KEY)).toThrow('campaign_already_exists');
+    });
     it('sign mode produces config-only files and leaves private invitation in its original bundle', async () => {
         const initial = issueSponsor(base, KEY), prior = join(directory, 'prior'), reviewed = join(directory, 'reviewed.json'), output = join(directory, 'signed');
         writeSponsorBundle(prior, initial.bundle, initial.link);

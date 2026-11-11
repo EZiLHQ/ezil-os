@@ -7,7 +7,7 @@ No partner campaigns ship in source. The master sponsor switch remains off unles
 ## What is implemented
 
 - `app/scripts/sponsor-operator.ts issue` creates a reusable 256-bit token for one campaign/partner and a signed registry entry containing its SHA-256 hash. The campaign starts disabled.
-- `sign` signs a reviewed registry edit offline. Config changes require a version advance; existing partner/token identity cannot change.
+- `sign` signs a reviewed registry edit offline. Config changes require a version advance; every previous ID must remain and its partner/token identity cannot change.
 - The app resolves `/sponsor/<token>` against that signed registry. Its private document loads no root analytics and sends no-referrer/no-store headers. The token continues only in a same-origin form body, never an OAuth URL.
 - Signed auth state binds origin, state and nonce. Only actual new OS account creation through Supabase Admin writes the UUID/verified-subject-bound recovery hint. Existing accounts, including accounts newly linked to Auth0, receive attribution without signup credit.
 - After the verified OTP session, first campaign attribution wins. Signup recovery can fill its own timestamp once; it cannot claim a trial. The foundation's creation hint lasts 24 hours and still needs the matching active campaign/config.
@@ -51,7 +51,7 @@ bun --no-env-file scripts/sponsor-operator.ts sign \
   --out-dir "$NEW_SIGNED_BUNDLE"
 ```
 
-This writes config files only. It does not enable the runtime, move a deployment or write provider objects. New campaigns must come through `issue`. Existing campaign IDs retain their partner and token hash; removing an entry stops new starts but does not erase durable counts. Sign an updated version to revoke it with `enabled: false`.
+This writes config files only. It does not enable the runtime, move a deployment or write provider objects. New campaigns must come through `issue`. Campaign IDs are immutable for life: signing refuses removal of any previous ID, and issuing refuses reuse of any retained ID. Retire a campaign by advancing its version with `enabled: false`; keep its original partner and token hash. Retired IDs remain in subsequent complete registries and count toward the 500-campaign registry limit. This prevents deletion followed by reissue from splitting historical counts or stale-link identity.
 
 For an eventual approved deployment, copy the two JSON fields in `runtime-config.json` byte-for-byte into the deployment's protected environment. JSON escaping is part of the transport, not part of the registry string. Use the same `SPONSOR_REGISTRY_KEY` on the server. Configure the separate, stable `SPONSOR_KEY` for signed contexts and pseudonymous account keys. Neither key is emitted by the tool. Changing `SPONSOR_KEY` changes account pseudonyms and requires a deliberate data migration plan.
 

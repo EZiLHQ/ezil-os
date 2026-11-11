@@ -86,7 +86,7 @@ export function issueSponsor(options: IssueOptions, key: string, random: () => B
     return { bundle, link: { campaignId: entry.campaignId, partnerId: entry.partnerId, url: `${options.origin}/sponsor/${token}` } };
 }
 
-/** Sign a reviewed edit offline; changed config must advance version. New campaigns come through issue. */
+/** Sign a reviewed edit offline; IDs are permanent, retirement is a disabled version advance. */
 export function signReviewedSponsor(document: string, previous: Bundle, key: string): Bundle {
     const next = inspect(document, signSponsorRegistry(document, key), key);
     for (const [id, campaign] of next.registry) {
@@ -95,6 +95,8 @@ export function signReviewedSponsor(document: string, previous: Bundle, key: str
         if (campaign.partnerId !== before.partnerId || campaign.tokenSha256 !== before.tokenSha256) return refuse('campaign_identity_changed');
         if (campaign.version < before.version || (campaign.version === before.version && campaign.configSha256 !== before.configSha256)) return refuse('campaign_version_must_advance');
     }
+    // Retain every lifetime identity so issue cannot reuse a removed ID with a different partner/token.
+    for (const id of previous.registry.keys()) if (!next.registry.has(id)) return refuse('campaign_removal_requires_retirement');
     return next;
 }
 
