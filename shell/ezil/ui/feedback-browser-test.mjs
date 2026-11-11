@@ -220,12 +220,7 @@ try {
             assert.equal(await page.locator('button[type="submit"]').isDisabled(), false, 'a blank report is sendable: nothing is required');
             assert.equal(await page.locator('[name="category"], [name="steps"], select').count(), 0, 'one description, no questionnaire');
             assert.equal(await page.locator('input[name="diagnostics"]').isChecked(), true, 'diagnostics are selected by default');
-            // The always-visible server-context notice does not depend on the diagnostics checkbox.
-            const contextNote = page.locator('[data-role="server-context-note"]');
-            assert.equal(await contextNote.isVisible(), true, 'the server-context notice is visible with diagnostics on');
-            await page.locator('input[name="diagnostics"]').uncheck();
-            assert.equal(await contextNote.isVisible(), true, 'and with diagnostics off (the unchecked opt-out)');
-            await page.locator('input[name="diagnostics"]').check();
+            assert.equal(await page.locator('[data-role="server-context-note"], .ezil-feedback-details').count(), 0);
             await description.fill('[synthetic r3] browser test report');
             await page.locator('.ezil-feedback-preview summary').click();
             const shown = await preview();
@@ -314,11 +309,7 @@ try {
             assert.equal(await page.locator('input[name="screenshot"]').isChecked(), true, 'the screenshot is selected by default');
             assert.equal(await page.locator('input[name="diagnostics"]').isChecked(), true, 'diagnostics are selected by default');
             await page.locator('input[name="diagnostics"]').uncheck();
-            // Isolate the one file: remove the default window snapshot first (several images may be attached).
-            await page.locator('.ezil-feedback-image').waitFor({ state: 'visible', timeout: 20_000 });
-            await page.locator('[data-action="remove-screenshot"]').click();
-            await page.locator('.ezil-feedback-image').waitFor({ state: 'hidden' });
-            await page.locator('.ezil-feedback-capture-options summary').click();
+            assert.equal(await page.locator('.ezil-feedback-image').isVisible(), false, 'no automatic capture');
             const encoded = await page.evaluate(() => {
                 const c = document.createElement('canvas'); c.width = 120; c.height = 80;
                 const ctx = c.getContext('2d'); ctx.fillStyle = '#3366cc'; ctx.fillRect(0, 0, 120, 80);
@@ -326,9 +317,12 @@ try {
             });
             const file = page.locator('input[name="screenshotFile"]');
             await file.setInputFiles({ name: 'test-private-name.png', mimeType: 'image/png', buffer: Buffer.from(encoded, 'base64') });
+            await page.locator('.ezil-feedback-image').waitFor({ state: 'visible' });
             const editor = page.getByRole('dialog', { name: 'Edit screenshot' });
-            await editor.waitFor({ state: 'visible' });
+            assert.equal(await editor.count(), 0, 'files attach without a compulsory editor');
             assert.equal(posts.length, 0, 'selecting an image sends nothing');
+            await page.locator('[data-capture="edit"]').click();
+            await editor.waitFor({ state: 'visible' });
             await editor.locator('[data-action="add"]').click();
             await editor.locator('[data-action="crop"]').click();
             await editor.locator('[data-box="crop"]').press('Shift+ArrowLeft');
@@ -364,77 +358,30 @@ try {
             await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = false; });
         });
 
-        await check(`${tag}: screenshots on — the default masked window snapshot is attached, Send stays on screen, and one tap sends a blank report`, async () => {
-            await page.evaluate(() => {
-                window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = true;
-                // Any browser capture picker would call this; the default capture must not.
-                window.__pickerCalls = 0;
-                if ( navigator.mediaDevices ) navigator.mediaDevices.getDisplayMedia = () => { window.__pickerCalls++; return Promise.reject(new Error('picker')); };
-            });
+        await check(`${tag}: compact screenshots form fits initially without scroll or capture; blank Send works`, async () => {
+            await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = true; });
             reply = () => ({ status: 201, body: { id: REPORT, screenshotAccepted: true } });
-            posts.length = 0;
-            await openByChip();
-            await page.locator('.ezil-feedback-image').waitFor({ state: 'visible', timeout: 20_000 });
-            assert.equal(posts.length, 0, 'nothing uploads until Send');
-            assert.equal(await page.evaluate(() => window.__pickerCalls), 0, 'no permission prompt or picker');
+            posts.length = 0; await openByChip();
+            assert.equal(await page.locator('.ezil-feedback-image').isVisible(), false);
+            assert.equal(await page.locator('[data-capture], .ezil-feedback-capture-options, .ezil-feedback-details').count(), 0);
+            assert.equal(await page.locator('.ezil-feedback-preview').evaluate(el => el.open), false);
             assert.equal(await page.locator('input[name="screenshot"]').isChecked(), true);
-            // The full-bleed Browser's page is an embedded frame filling the window: the snapshot is still attached
-            // (shell overlays above the frame survive) with the one note that offers a real capture.
-            assert.match(await page.locator('[data-role="capture-note"]').textContent(), /^To include the open app, /,
-                'the capture worked; one note offers a real capture (the scope line below states the limit)');
-            if ( coarse ) assert.equal(await page.evaluate(() => !! document.activeElement?.matches('input, textarea, select, [contenteditable]')), false, 'no text field has focus: no on-screen keyboard over Send');
-            // Honest scope next to the thumbnail: the shell window only, never the embedded app; long text stays collapsed.
-            assert.equal(await page.locator('[data-role="capture-scope"]').isVisible(), true);
-            assert.match(await page.locator('[data-role="capture-scope-text"]').textContent(), /Embedded app not captured.*EZiL OS window only/);
-            assert.equal(await page.locator('.ezil-feedback-details').evaluate(el => el.open), false, 'diagnostics details start collapsed');
-            assert.equal(await page.locator('[data-role="server-context-note"]').isVisible(), true, 'the short server-context notice stays visible');
-            // Layout: the modal fits the viewport and, in its default state with the screenshot attached, needs no scrolling at all.
             const fit = await page.evaluate(() => {
-                const d = document.querySelector('dialog.ezil-feedback-dialog');
-                const box = el => { const r = el.getBoundingClientRect(); return { top: r.top, bottom: r.bottom, left: r.left, right: r.right }; };
-                const inside = el => { const r = el.getBoundingClientRect(), m = d.getBoundingClientRect(); return r.top >= m.top - 0.5 && r.bottom <= m.bottom + 0.5 && r.left >= m.left - 0.5 && r.right <= m.right + 0.5; };
-                const key = ['#ezil-feedback-description', 'input[name="diagnostics"]', 'input[name="screenshot"]', '[data-role="capture-scope"]', '.ezil-feedback-image img', 'button[type="submit"]'];
-                return { dialog: box(d), vw: innerWidth, vh: innerHeight, scrollHeight: d.scrollHeight, clientHeight: d.clientHeight, scrollTop: d.scrollTop,
-                    pageScroll: document.scrollingElement.scrollTop, rows: document.querySelector('#ezil-feedback-description').rows,
-                    parts: [...d.querySelectorAll('h2, .ezil-feedback-fields > *, .ezil-feedback-capture > *, .ezil-feedback-preview, .ezil-feedback-footer')]
-                        .map(el => `${el.tagName.toLowerCase()}.${el.dataset.role || el.className || el.id || el.name || ''}:${Math.round(el.getBoundingClientRect().height)}`),
-                    outside: key.filter(selector => { const el = d.querySelector(selector); return ! el || ! inside(el); }) };
+                const d = document.querySelector('dialog.ezil-feedback-dialog'), r = d.getBoundingClientRect();
+                const send = d.querySelector('button[type="submit"]'), b = send.getBoundingClientRect();
+                return { width: r.width, height: r.height, scrollHeight: d.scrollHeight, clientHeight: d.clientHeight,
+                    fits: r.top >= 0 && r.left >= 0 && r.bottom <= innerHeight && r.right <= innerWidth,
+                    sendVisible: b.top >= r.top && b.bottom <= r.bottom && document.elementFromPoint(b.x + b.width / 2, b.y + b.height / 2) === send,
+                    sendHeight: b.height, visibleText: d.innerText.length };
             });
-            assert.ok(fit.dialog.top >= 0 && fit.dialog.left >= 0 && fit.dialog.bottom <= fit.vh && fit.dialog.right <= fit.vw, `the modal fits the viewport (${JSON.stringify(fit)})`);
-            assert.ok(fit.scrollHeight <= fit.clientHeight + 1, `no initial scroll: all content fits (${fit.scrollHeight} > ${fit.clientHeight}; ${fit.parts.join(' ')})`);
-            assert.deepEqual([fit.scrollTop, fit.pageScroll], [0, 0], 'nothing scrolled');
-            assert.ok(fit.rows <= 3, 'a compact comment box');
-            assert.deepEqual(fit.outside, [], 'every key control is inside the modal');
-            // Primary action: fully inside the viewport and hit-testable without any scrolling.
-            const send = page.locator('button[type="submit"]');
-            const place = await send.evaluate(el => {
-                const r = el.getBoundingClientRect();
-                const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
-                const dialog = el.closest('dialog');
-                return { x: r.x, y: r.y, width: r.width, height: r.height, hit: hit === el || el.contains(hit), scrolled: dialog.scrollTop,
-                    scrollable: dialog.scrollHeight > dialog.clientHeight, vw: innerWidth, vh: innerHeight };
-            });
-            assert.ok(place.x >= 0 && place.y >= 0 && place.x + place.width <= place.vw && place.y + place.height <= place.vh,
-                `Send is on screen without scrolling (${JSON.stringify(place)})`);
-            assert.equal(place.hit, true, 'Send receives the tap');
-            assert.equal(place.scrolled, 0);
-            if ( coarse ) assert.ok(place.height >= 44, `a 44px touch target (${place.height})`);
-            if ( touch ) await send.tap(); else await send.click();
-            await status.filter({ hasText: 'Thanks — we got it' }).waitFor();
-            assert.equal(posts.length, 1);
-            const sent = JSON.parse(posts[0].body);
-            assert.equal(sent.description, '', 'a blank description is sent as is');
-            assert.equal(sent.category, 'bug');
-            assert.ok(sent.diagnostics?.session, 'diagnostics attached');
-            assert.ok(['image/webp', 'image/jpeg'].includes(sent.screenshot?.contentType), 'screenshot attached');
-            const size = await page.evaluate(async image => {
-                const bytes = Uint8Array.from(atob(image.dataBase64), c => c.charCodeAt(0));
-                const bitmap = await createImageBitmap(new Blob([bytes], { type: image.contentType }));
-                const result = { width: bitmap.width, height: bitmap.height, bytes: bytes.length };
-                bitmap.close(); return result;
-            }, sent.screenshot);
-            assert.ok(size.width > 0 && size.height > 0 && Math.max(size.width, size.height) <= 1920 && size.bytes <= 1.5 * 1024 * 1024, `bounded image ${JSON.stringify(size)}`);
-            assert.equal(await page.evaluate(() => window.__pickerCalls), 0);
+            assert.equal(fit.fits, true, JSON.stringify(fit));
+            assert.ok(fit.scrollHeight <= fit.clientHeight + 1, JSON.stringify(fit));
+            assert.equal(fit.sendVisible, true); if (coarse) assert.ok(fit.sendHeight >= 44);
+            assert.ok(fit.visibleText < 240, `compact initial copy (${fit.visibleText})`);
+            console.log(`METRIC ${tag} minimal feedback ${JSON.stringify(fit)}`);
+            assert.equal(posts.length, 0);
+            await page.locator('button[type="submit"]').click(); await status.filter({ hasText: 'Thanks — we got it' }).waitFor();
+            assert.equal(JSON.parse(posts[0].body).screenshot, null);
             await closeDialog(); posts.length = 0;
             await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = false; });
         });
@@ -444,7 +391,6 @@ try {
             reply = () => ({ status: 201, body: { id: REPORT, screenshotAccepted: false } });
             posts.length = 0;
             await openByChip();
-            await page.locator('.ezil-feedback-image').waitFor({ state: 'visible', timeout: 20_000 });
             await page.locator('input[name="diagnostics"]').uncheck();
             await page.locator('input[name="screenshot"]').uncheck();
             const shown = await preview();
