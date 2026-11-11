@@ -37,12 +37,20 @@ function database(options: { hour?: number; day?: number; attachmentDay?: number
             }
             if (sql.startsWith('insert')) {
                 const columns = sql.match(/\(([^)]+)\) values/)![1]!.split(',').map((c) => c.trim().replaceAll('"', ''));
-                const row = Object.fromEntries(columns.map((c, i) => [c, params[i]]));
+                // One statement may insert several rows (one per image).
+                const rows = Array.from({ length: params.length / columns.length },
+                    (_, r) => Object.fromEntries(columns.map((c, i) => [c, params[r * columns.length + i]])));
                 if (sql.includes('ezil_feedback_attachments')) {
                     if (options.failAttachment) throw new Error('attachment write failed');
-                    attachments.push(row);
-                } else reports.push(row);
+                    attachments.push(...rows);
+                } else reports.push(...rows);
                 return { rows: [] };
+            }
+            if (sql.includes('order by')) return { rows: reports.filter((r) => r.user_id === params[1]).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, Number(params[2]))
+                .map((r) => [r.id, r.created_at, r.category, r.description, r.has_screenshot, r.status,
+                    attachments.filter((a) => a.report_id === r.id && a.user_id === params[0]).length]) };
+            if (sql.includes('count(*)') && sql.includes('from "ezil_feedback_attachments"')) {
+                return { rows: [[attachments.filter((a) => a.report_id === params[0] && a.user_id === params[1]).length]] };
             }
             if (sql.includes('count(*)')) return { rows: [[options.hour ?? reports.filter((r) => r.user_id === params[1]).length, options.day ?? reports.filter((r) => r.user_id === params[1]).length]] };
             if (sql.includes('sum(')) return { rows: [[options.attachmentDay ?? attachments.reduce((n, r) => n + Number(r.byte_length), 0), options.attachmentTotal ?? attachments.reduce((n, r) => n + Number(r.byte_length), 0)]] };
@@ -55,7 +63,6 @@ function database(options: { hour?: number; day?: number; attachmentDay?: number
                 return { rows: deleted.map((r) => [r.id]) };
             }
             if (sql.includes('"client_request_id"')) return { rows: reports.filter((r) => r.user_id === params[0] && r.client_request_id === params[1]).map((r) => [r.id, r.created_at, r.has_screenshot]) };
-            if (sql.includes('order by')) return { rows: reports.filter((r) => r.user_id === params[0]).sort((a, b) => String(b.created_at).localeCompare(String(a.created_at))).slice(0, Number(params[1])).map((r) => [r.id, r.created_at, r.category, r.description, r.has_screenshot, r.status]) };
             return { rows: reports.filter((r) => r.id === params[0] && r.user_id === params[1]).map((r) => [r.id]) };
         }, { schema });
     }
@@ -77,6 +84,13 @@ function database(options: { hour?: number; day?: number; attachmentDay?: number
 
 function screenshot() {
     return { contentType: 'image/png' as const, dataBase64: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aWQAAAABJRU5ErkJggg==' };
+}
+
+/** A distinct valid PNG header per index (the width differs, so each hashes differently). */
+function distinctPng(n: number) {
+    const bytes = Buffer.from(screenshot().dataBase64, 'base64');
+    bytes.writeUInt32BE(n + 1, 16);
+    return { contentType: 'image/png' as const, dataBase64: bytes.toString('base64') };
 }
 
 describe('feedback ingest SQL and persisted values', () => {
@@ -149,8 +163,8 @@ describe('feedback ingest SQL and persisted values', () => {
         expect(results.map((r) => r.status).sort()).toEqual([200, 201]);
         expect(reports).toHaveLength(1);
         expect(results.map((result) => 'created' in result ? result.created : null)).toEqual([
-            { id: reports[0]!.id, createdAt: NOW.toISOString(), screenshotAccepted: false },
-            { id: reports[0]!.id, createdAt: NOW.toISOString(), screenshotAccepted: false },
+            { id: reports[0]!.id, createdAt: NOW.toISOString(), screenshotAccepted: false, screenshotCount: 0 },
+            { id: reports[0]!.id, createdAt: NOW.toISOString(), screenshotAccepted: false, screenshotCount: 0 },
         ]);
         expect(statements[0]!.sql).toContain('pg_advisory_xact_lock');
         expect(statements[0]!.sql).toContain('::uuid::text');
@@ -229,6 +243,31 @@ describe('feedback ingest SQL and persisted values', () => {
         expect(state.attachments).toHaveLength(2);
     });
 
+    it('stores several images in send order with the report and replays their count', async () => {
+        const { db, reports, attachments } = database();
+        const images = [0, 1, 2].map(distinctPng);
+        const first = await ingestFeedback(db, USER, { ...input, screenshots: images }, NOW);
+        expect(first).toMatchObject({ status: 201, created: { screenshotAccepted: true, screenshotCount: 3 } });
+        expect(reports).toHaveLength(1);
+        expect(attachments.map((a) => a.bytes)).toEqual(images.map((i) => Buffer.from(i.dataBase64, 'base64')));
+        expect(attachments.map((a) => a.created_at)).toEqual([0, 1, 2].map((i) => new Date(NOW.getTime() + i).toISOString()));
+        expect(new Set(attachments.map((a) => a.report_id))).toEqual(new Set([reports[0]!.id]));
+        expect(attachments.every((a) => a.user_id === USER)).toBe(true);
+        // A retry of the committed request returns the same result without a second report or more images.
+        expect(await ingestFeedback(db, USER, { ...input, screenshots: images }, new Date(NOW.getTime() + 5000))).toEqual({ ...first, status: 200 });
+        expect(reports).toHaveLength(1); expect(attachments).toHaveLength(3);
+    });
+
+    it('checks the attachment budget against the images combined and stores none when they do not all fit', async () => {
+        const images = [0, 1].map(distinctPng);
+        const one = Buffer.from(images[0]!.dataBase64, 'base64').length;
+        const { db, reports, attachments } = database({ attachmentDay: FEEDBACK_LIMITS.globalAttachmentBytesPerDay - one - 1 });
+        const result = await ingestFeedback(db, USER, { ...input, screenshots: images }, NOW);
+        expect(result).toMatchObject({ status: 201, created: { screenshotAccepted: false, screenshotCount: 0 } });
+        expect(reports[0]!.has_screenshot).toBe(false);
+        expect(attachments).toEqual([]);
+    });
+
     it('aborts the transaction when the attachment insert fails', async () => {
         const { db, reports, attachments } = database({ failAttachment: true });
         await expect(ingestFeedback(db, USER, { ...input, screenshot: screenshot() }, NOW)).rejects.toMatchObject({ cause: expect.objectContaining({ message: 'attachment write failed' }) });
@@ -249,10 +288,12 @@ describe('owner-scoped report listing and deletion', () => {
         reports.push({ id: 'foreign', user_id: OTHER, created_at: NOW.toISOString() });
         const result = await listFeedback(db, USER);
         expect(result).toHaveLength(50);
-        expect(result[0]).toEqual({ id: '54', createdAt: new Date(NOW.getTime() + 54000).toISOString(), category: 'bug', descriptionPreview: 'a'.repeat(140), hasScreenshot: false, status: 'new' });
+        expect(result[0]).toEqual({ id: '54', createdAt: new Date(NOW.getTime() + 54000).toISOString(), category: 'bug', descriptionPreview: 'a'.repeat(140), hasScreenshot: false, screenshotCount: 0, status: 'new' });
         expect(result.some((r) => r.id === 'foreign')).toBe(false);
-        expect(statements[0]!.sql).toMatch(/where "ezil_feedback_reports"\."user_id" = \$1 order by .*"created_at" desc.* limit \$2/);
-        expect(statements[0]!.params).toEqual([USER, 50]);
+        expect(statements[0]!.sql).toMatch(/where "ezil_feedback_reports"\."user_id" = \$2 order by .*"created_at" desc.* limit \$3/);
+        // The image count is scoped to the same owner as the listing.
+        expect(statements[0]!.sql).toMatch(/a\.user_id = \$1\)/);
+        expect(statements[0]!.params).toEqual([USER, USER, 50]);
     });
 
     it('returns not found for another user and never deletes their attachment', async () => {
@@ -277,5 +318,20 @@ describe('owner-scoped report listing and deletion', () => {
             expect(statement.sql).toMatch(/where \(.*(?:"report_id"|"id") = \$1 and .*"user_id" = \$2\)/);
             expect(statement.params).toEqual([COMPUTER, USER]);
         }
+    });
+
+    it('deleting a multi-image report removes every one of its images and nothing of another report or user', async () => {
+        const { db, reports, attachments } = database();
+        const mine = await ingestFeedback(db, USER, { ...input, screenshots: [0, 1, 2].map(distinctPng) }, NOW);
+        const other = await ingestFeedback(db, USER, { ...input, clientRequestId: COMPUTER, screenshots: [3, 4].map(distinctPng) }, NOW);
+        const foreign = await ingestFeedback(db, OTHER, { ...input, screenshots: [0, 1].map(distinctPng) }, NOW);
+        expect(attachments).toHaveLength(7);
+        expect(await deleteFeedback(db, OTHER, 'created' in mine ? mine.created.id : '')).toBe(false);
+        expect(attachments).toHaveLength(7);
+        expect(await deleteFeedback(db, USER, 'created' in mine ? mine.created.id : '')).toBe(true);
+        expect(attachments.map((a) => a.report_id).sort()).toEqual([
+            ...Array(2).fill('created' in other ? other.created.id : ''), ...Array(2).fill('created' in foreign ? foreign.created.id : ''),
+        ].sort());
+        expect(reports).toHaveLength(2);
     });
 });

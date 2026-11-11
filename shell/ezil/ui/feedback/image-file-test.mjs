@@ -60,10 +60,13 @@ await test('8MiB cap rejects before read and accepts its inclusive boundary',asy
     const b=Buffer.alloc(8*1024*1024);png().copy(b);assert.ok(await uploaded_image_canvas(file(b)));
 });
 await test('header bombs and oversized hidden WebP frames reject before decode',async()=>{
-    for(const [b,type] of [[png(4097,5),'image/png'],[png(0,5),'image/png'],[jpeg(5,4097),'image/jpeg'],[webp(4097,5),'image/webp'],[webp(8192,600,true),'image/webp']]){
+    for(const [b,type] of [[png(8193,5),'image/png'],[png(0,5),'image/png'],[jpeg(5,8193),'image/jpeg'],[webp(8193,5),'image/webp'],[webp(8193,600,true),'image/webp'],
+        [png(8192,8192),'image/png']]){
         setup();assert.equal(await uploaded_image_canvas(file(b,type)),null);assert.equal(calls,0);
     }
     setup(4096,4096);assert.equal((await uploaded_image_canvas(file(png(4096,4096)))).width,1920);
+    // A 5K display's screenshot (wider than the 4096 px a report image may be) is scaled down, not refused.
+    setup(5120,2880);const big=await uploaded_image_canvas(file(png(5120,2880)));assert.equal(big.width,1920);assert.equal(big.height,1080);
 });
 await test('malformed JPEG segments and WebP chunks reject before decode',async()=>{
     const j=jpeg();j.writeUInt16BE(65535,4);const w=webp();w.writeUInt32LE(65535,16);
@@ -71,7 +74,7 @@ await test('malformed JPEG segments and WebP chunks reject before decode',async(
     setup();assert.ok(await uploaded_image_canvas(file(jpeg(),'image/jpeg')));
 });
 await test('invalid decoded dimensions or unavailable canvas close bitmap without painting',async()=>{
-    for(const size of [[0,4],[5,4097]]){setup(...size);assert.equal(await uploaded_image_canvas(file()),null);assert.equal(closed,1);assert.equal(draws.length,0);}
+    for(const size of [[0,4],[5,8193]]){setup(...size);assert.equal(await uploaded_image_canvas(file()),null);assert.equal(closed,1);assert.equal(draws.length,0);}
     setup();document.createElement=()=>({getContext:()=>null});assert.equal(await uploaded_image_canvas(file()),null);assert.equal(closed,1);
     setup();assert.ok(await uploaded_image_canvas(file()));
 });

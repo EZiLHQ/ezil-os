@@ -38,6 +38,8 @@ let supported = true;
 let desktopSupported = true;
 let nextCanvas = () => Promise.resolve(document.createElement('canvas'));
 let defaultCapture = false;
+/** Share of the viewport the window snapshot reports as masked embedded app. */
+let snapshotCoverage = 0;
 let manualClick = false;
 document.addEventListener('click', event => {
     if ( ! event.target.closest?.('[data-capture]') ) return;
@@ -52,6 +54,7 @@ globalThis.__feedbackCapture = {
     desktopSupported: () => desktopSupported,
     encode: (canvas, limit, options) => Promise.resolve(options?.signal?.aborted ? null : encodeResult(canvas, limit)),
     capture: (kind, options) => {
+        if ( kind === 'shell' && options?.info ) options.info.frameCoverage = snapshotCoverage;
         // The default screenshot also calls the shell snapshot at open. Existing checks drive the manual buttons,
         // so unless a check opts in (`defaultCapture = true`) the default one is answered with no image, unrecorded.
         if ( kind === 'shell' && ! manualClick && ! defaultCapture ) return Promise.resolve(null);
@@ -66,7 +69,9 @@ globalThis.__feedbackCapture = {
         return nextCanvas();
     },
     edit: (canvas, options) => { assert.equal(canvas.tagName, 'CANVAS'); captureCalls.push('editor'); editorOptions.push(options); return Promise.resolve(editorResult()); },
+    upload: (file, options) => { captureCalls.push(`upload:${file.name}`); captureOptions.push(options); return nextCanvas(); },
 };
+const imageFileUrl = new URL('./image-file.js', import.meta.url).href;
 const captureUrl = new URL('./capture.js', import.meta.url).href;
 const editorUrl = new URL('./redact-editor.js', import.meta.url).href;
 const hooks = registerHooks({ load (url, context, next) {
@@ -79,6 +84,8 @@ const hooks = registerHooks({ load (url, context, next) {
     if ( url === editorUrl ) return { format: 'module', shortCircuit: true,
         source: 'export const open_redact_editor = (canvas, options) => globalThis.__feedbackCapture.edit(canvas, options);'
             + 'export const encode_under_limit = (canvas, limit, options) => globalThis.__feedbackCapture.encode(canvas, limit, options);' };
+    if ( url === imageFileUrl ) return { format: 'module', shortCircuit: true,
+        source: 'export const uploaded_image_canvas = (file, options) => globalThis.__feedbackCapture.upload(file, options);' };
     return next(url, context);
 } });
 
@@ -1358,6 +1365,211 @@ try {
         assert.equal(calls.length, count + 1);
         close();
     });
+    // ── Several images (server advertises `ui.feedbackScreenshotsMax`) ──────────────────────────────
+    const ui = window.__EZIL_BOOT__.desktopState.ui;
+    let distinct = 0;
+    /** Each editor result is a different valid PNG (the width byte differs), like distinct screenshots. */
+    const distinctResult = () => {
+        const bytes = Buffer.from(imageBytes); bytes.writeUInt32BE(++distinct + 1, 16);
+        return { blob: new window.Blob([bytes], { type: 'image/png' }), contentType: 'image/png', width: 1, height: 1 };
+    };
+    const png = name => new window.File([imageBytes], name, { type: 'image/png' });
+    const paste = (target, files, text = null) => {
+        const event = new window.Event('paste', { bubbles: true, cancelable: true });
+        const items = files.map(file => ({ kind: 'file', type: file.type, getAsFile: () => file }));
+        if ( text !== null ) items.push({ kind: 'string', type: 'text/plain', getAsFile: () => null });
+        Object.defineProperty(event, 'clipboardData', { value: { items } });
+        target.dispatchEvent(event);
+        return event;
+    };
+    const rows = () => [...current().querySelectorAll('[data-role="images"] > li')];
+    const multi = async run => {
+        const realEditor = editorResult;
+        ui.feedbackScreenshotsMax = 5; editorResult = distinctResult;
+        try { await run(); } finally { delete ui.feedbackScreenshotsMax; editorResult = realEditor; if ( current() ) close(); }
+    };
+
+    await check('paste: an image pasted into the description goes through the editor and joins the report; text pastes are untouched; nothing uploads', async () => {
+        await multi(async () => {
+            open(); setDescription('Pasted screenshots');
+            const requests = calls.length, editors = editorOptions.length;
+            const textPaste = paste(form().elements.description, [], 'plain words');
+            assert.equal(textPaste.defaultPrevented, false, 'a text paste stays a normal paste');
+            const imagePaste = paste(form().elements.description, [png('one.png')]);
+            assert.equal(imagePaste.defaultPrevented, true);
+            await until(() => rows().length === 1 && ! current().querySelector('[type="submit"]').disabled);
+            assert.ok(captureCalls.includes('upload:one.png'));
+            assert.equal(editorOptions.length, editors + 1, 'the pasted image opened in the editor');
+            assert.equal(current().querySelector('[data-role="capture-scope-text"]').textContent, 'Pasted from your clipboard.');
+            assert.equal(calls.length, requests, 'pasting uploads nothing');
+            assert.ok(payload().screenshot, 'one image keeps the single-image key');
+            assert.equal(payload().screenshots, undefined);
+        });
+    });
+
+    await check('several images: pasted, attached and captured images are listed, previewed and sent in order as `screenshots`, only on Send', async () => {
+        await multi(async () => {
+            open(); setDescription('Three images');
+            const requests = calls.length;
+            paste(current(), [png('a.png'), png('b.png')]);
+            await until(() => rows().length === 2 && ! current().querySelector('[type="submit"]').disabled);
+            current().querySelector('[data-capture="tab"]').click();
+            await until(() => rows().length === 3 && ! current().querySelector('[type="submit"]').disabled);
+            assert.deepEqual(rows().map(row => row.querySelector('span').textContent.replace(/ · .*/, '')), ['1. Pasted', '2. Pasted', '3. Screen capture']);
+            assert.match(current().querySelector('[data-role="images-heading"]').textContent, /3 of 5 images/);
+            const body = payload();
+            assert.equal(body.screenshot, null);
+            assert.equal(body.screenshots.length, 3);
+            assert.equal(new Set(body.screenshots.map(image => image.dataBase64)).size, 3);
+            feedbackSubmitSchema.parse(body);
+            // Draft saves and preview toggles never upload, and the draft never holds an image.
+            setDescription('Three images, edited'); showPreview();
+            assert.equal(calls.length, requests);
+            assert.doesNotMatch(window.localStorage.getItem(draftKey) ?? '', /dataBase64|base64/);
+            const before = current().querySelector('pre').textContent;
+            respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true, screenshotCount: 3 }) });
+            send(); await until(() => status().includes(reportId));
+            assert.equal(calls.length, requests + 1, 'one request, on Send');
+            assert.equal(calls.at(-1).body, before, 'the request is the previewed body');
+        });
+    });
+
+    await check('per image: edit replaces that image in place, remove drops only that one, and limits are enforced before the editor', async () => {
+        await multi(async () => {
+            open();
+            paste(current(), [png('a.png'), png('b.png'), png('c.png')]);
+            await until(() => rows().length === 3 && ! current().querySelector('[type="submit"]').disabled);
+            const [first, second, third] = payload().screenshots.map(image => image.dataBase64);
+            // The editor's limit is what the report total leaves after the other images, never above 1.5 MiB.
+            assert.equal(editorOptions.at(-1).limit, Math.floor(1.5 * 1024 * 1024));
+            const img = rows()[1].querySelector('img');
+            Object.defineProperties(img, { naturalWidth: { value: 1 }, naturalHeight: { value: 1 } });
+            const realContext = window.HTMLCanvasElement.prototype.getContext;
+            window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage () {} });
+            try {
+                rows()[1].querySelector('[data-capture="edit"]').click();
+                await until(() => ! current().querySelector('[type="submit"]').disabled && payload().screenshots[1].dataBase64 !== second);
+            } finally { window.HTMLCanvasElement.prototype.getContext = realContext; }
+            const edited = payload().screenshots.map(image => image.dataBase64);
+            assert.equal(edited.length, 3);
+            assert.equal(edited[0], first); assert.equal(edited[2], third);
+            assert.match(rows()[1].textContent, /Pasted/, 'an edit keeps where the image came from');
+            rows()[0].querySelector('[data-action="remove-screenshot"]').click();
+            assert.deepEqual(payload().screenshots.map(image => image.dataBase64), [edited[1], third]);
+            // Fill to the count limit: add controls are disabled, and a further paste never reaches the editor.
+            paste(current(), [png('d.png'), png('e.png'), png('f.png'), png('g.png')]);
+            await until(() => rows().length === 5 && ! current().querySelector('[type="submit"]').disabled);
+            assert.equal(current().querySelector('[data-capture="tab"]').disabled, true);
+            assert.equal(form().elements.screenshotFile.disabled, true);
+            const editors = editorOptions.length;
+            paste(current(), [png('h.png')]);
+            await tick(); await tick();
+            assert.equal(editorOptions.length, editors);
+            assert.match(current().querySelector('[data-role="capture-note"]').textContent, /already has 5 screenshots/);
+            feedbackSubmitSchema.parse(payload());
+        });
+    });
+
+    await check('the same screenshot twice is refused locally with a note (the server would 400 the whole report); an edit into a duplicate keeps the prior image', async () => {
+        await multi(async () => {
+            open();
+            const requests = calls.length;
+            const same = () => ({ blob: new window.Blob([imageBytes], { type: 'image/png' }), contentType: 'image/png', width: 1, height: 1 });
+            editorResult = same;
+            paste(current(), [png('first.png')]);
+            await until(() => rows().length === 1 && ! current().querySelector('[type="submit"]').disabled);
+            paste(current(), [png('again.png')]);
+            await until(() => captureCalls.includes('upload:again.png') && ! current().querySelector('[type="submit"]').disabled);
+            assert.equal(rows().length, 1, 'a repeated paste does not add a row');
+            assert.equal(current().querySelector('[data-role="capture-note"]').textContent, 'This screenshot is already attached.');
+            // A second, different image; then editing it into a copy of the first keeps it as it was.
+            editorResult = distinctResult;
+            paste(current(), [png('other.png')]);
+            await until(() => rows().length === 2 && ! current().querySelector('[type="submit"]').disabled);
+            const before = payload().screenshots.map(image => image.dataBase64);
+            editorResult = same;
+            const img = rows()[1].querySelector('img');
+            Object.defineProperties(img, { naturalWidth: { value: 1 }, naturalHeight: { value: 1 } });
+            const realContext = window.HTMLCanvasElement.prototype.getContext;
+            window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage () {} });
+            const editors = editorOptions.length;
+            try {
+                rows()[1].querySelector('[data-capture="edit"]').click();
+                await until(() => editorOptions.length > editors && ! current().querySelector('[type="submit"]').disabled);
+            } finally { window.HTMLCanvasElement.prototype.getContext = realContext; }
+            assert.deepEqual(payload().screenshots.map(image => image.dataBase64), before, 'both images and their order are unchanged');
+            assert.match(current().querySelector('[data-role="capture-note"]').textContent, /already attached/);
+            assert.equal(calls.length, requests, 'nothing uploaded');
+            respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true, screenshotCount: 2 }) });
+            send(); await until(() => status().includes(reportId));
+            const sent = JSON.parse(calls.at(-1).body).screenshots.map(image => image.dataBase64);
+            assert.equal(new Set(sent).size, sent.length, 'the report carries no duplicate, so the server has no reason to refuse it');
+        });
+    });
+
+    await check('several images: the byte budget is shared, and turning screenshots off sends no image key at all', async () => {
+        await multi(async () => {
+            open();
+            const big = Math.floor(1.2 * 1024 * 1024);
+            const realEditor = editorResult;
+            editorResult = () => ({ blob: new window.Blob([Buffer.alloc(big, 7)], { type: 'image/png' }), contentType: 'image/png', width: 1, height: 1 });
+            try {
+                paste(current(), [png('big.png')]);
+                await until(() => rows().length === 1 && ! current().querySelector('[type="submit"]').disabled);
+                paste(current(), [png('next.png')]);
+                await until(() => editorOptions.at(-1).limit < big && ! current().querySelector('[type="submit"]').disabled);
+                assert.equal(editorOptions.at(-1).limit, Math.floor(1.75 * 1024 * 1024) - big, 'the second image may use only what is left');
+                assert.equal(rows().length, 1, 'an image over what is left is refused, not attached');
+                assert.match(status(), /too large/);
+            } finally { editorResult = realEditor; }
+            change('screenshot', false);
+            const body = payload();
+            assert.equal(body.screenshot, null);
+            assert.equal('screenshots' in body, false, 'consent off: no image list');
+            assert.equal(rows().length, 0);
+        });
+    });
+
+    await check('a multi-image report queued offline reopens and re-sends byte for byte', async () => {
+        await multi(async () => {
+            window.localStorage.removeItem(draftKey); window.localStorage.removeItem(outboxKey);
+            open(); setDescription('Queued images');
+            paste(current(), [png('a.png'), png('b.png')]);
+            await until(() => rows().length === 2 && ! current().querySelector('[type="submit"]').disabled);
+            respond = async () => { throw new TypeError('Failed to fetch'); };
+            const requests = calls.length;
+            send(); await until(() => calls.length === requests + 1 && ! current().querySelector('[type="submit"]').disabled);
+            const first = calls.at(-1).body;
+            close();
+            open();
+            assert.equal(current().querySelector('pre').textContent || (showPreview(), current().querySelector('pre').textContent), first);
+            assert.equal(rows().length, 2);
+            assert.match(rows()[0].textContent, /Queued with this report/);
+            respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false, screenshotCount: 0 }) });
+            send(); await until(() => status().includes(reportId));
+            assert.equal(calls.at(-1).body, first, 'the re-send is byte-identical');
+            assert.match(status(), /Your images weren't stored/, 'a budget refusal is said plainly');
+            window.localStorage.removeItem(outboxKey); window.localStorage.removeItem(draftKey);
+        });
+    });
+
+    await check('an embedded app in the window snapshot: the image is attached (overlays survive) with one note offering a real capture', async () => {
+        defaultCapture = true; snapshotCoverage = 0.8;
+        try {
+            open();
+            await until(() => ! current().querySelector('.ezil-feedback-image').hidden);
+            assert.match(current().querySelector('[data-role="capture-note"]').textContent, /^To include the open app, use "Capture what I see"/);
+            assert.match(current().querySelector('[data-role="capture-scope-text"]').textContent, /Embedded app not captured/, 'the limitation is stated once, beside the image');
+            assert.ok(payload().screenshot, 'the snapshot is still attached');
+            close();
+            snapshotCoverage = 0.05;
+            open();
+            await until(() => ! current().querySelector('.ezil-feedback-image').hidden);
+            assert.equal(current().querySelector('[data-role="capture-note"]').textContent, '', 'no note when the app covers little');
+            close();
+        } finally { defaultCapture = false; snapshotCoverage = 0; }
+    });
+
     await check('screenshot and tab support flags hide unavailable controls; disabled feedback stays dark', async () => {
         supported = false;
         open(); assert.equal(current().querySelector('[data-capture="tab"]'), null); close();

@@ -16,6 +16,9 @@ export const FEEDBACK_LIMITS = Object.freeze({
     bodyBytesWithScreenshot: Math.floor(2.5 * 1024 * 1024),
     imageBytesMax: Math.floor(1.5 * 1024 * 1024),
     imageSideMax: 4096,
+    /** Images per report (`screenshots`). Their decoded total stays inside the unchanged 2.5 MiB body and 3 MB proxy limit. */
+    imagesMax: 5,
+    imagesBytesTotal: Math.floor(1.75 * 1024 * 1024),
     /** FEEDBACK-DIAG: per recent event; see `sanitizeDiagnostics` for the shape allowlist. */
     recentEventReasonMax: 96,
     recentEventCorrelationIdMax: 64,
@@ -175,6 +178,12 @@ export const diagnosticsSchema = z
 
 export type FeedbackDiagnostics = z.infer<typeof diagnosticsSchema>;
 
+const feedbackImageSchema = z
+    .object({ contentType: z.enum(FEEDBACK_IMAGE_TYPES), dataBase64: z.string().min(1) })
+    .strict();
+
+export type FeedbackImageInput = z.infer<typeof feedbackImageSchema>;
+
 export const feedbackSubmitSchema = z
     .object({
         v: z.literal(1),
@@ -184,20 +193,28 @@ export const feedbackSubmitSchema = z
         description: z.string().trim().max(FEEDBACK_LIMITS.descriptionMax),
         computerId: z.string().uuid().nullable().optional(),
         diagnostics: diagnosticsSchema.nullable().optional(),
-        screenshot: z
-            .object({ contentType: z.enum(FEEDBACK_IMAGE_TYPES), dataBase64: z.string().min(1) })
-            .strict()
-            .nullable()
-            .optional(),
+        // One image keeps the original key, so older queued bodies and older servers stay compatible.
+        screenshot: feedbackImageSchema.nullable().optional(),
+        // Two or more images, in the order the reporter arranged them.
+        screenshots: z.array(feedbackImageSchema).min(1).max(FEEDBACK_LIMITS.imagesMax).optional(),
     })
-    .strict();
+    .strict()
+    .refine(body => body.screenshot == null || body.screenshots === undefined,
+        { path: ['screenshots'], message: 'Send screenshot or screenshots, not both' });
 
 export type FeedbackSubmit = z.infer<typeof feedbackSubmitSchema>;
+
+/** The submitted images as one ordered list, whichever key carried them. */
+export function submittedImages(input: Pick<FeedbackSubmit, 'screenshot' | 'screenshots'>): FeedbackImageInput[] {
+    return input.screenshots ?? (input.screenshot ? [input.screenshot] : []);
+}
 
 export interface FeedbackCreated {
     id: string;
     createdAt: string;
     screenshotAccepted: boolean;
+    /** Images stored with the report: all submitted ones, or 0 when the attachment budget refused them. */
+    screenshotCount: number;
 }
 
 export interface FeedbackReportSummary {
@@ -206,6 +223,7 @@ export interface FeedbackReportSummary {
     category: (typeof FEEDBACK_CATEGORIES)[number];
     descriptionPreview: string;
     hasScreenshot: boolean;
+    screenshotCount: number;
     status: string;
 }
 
