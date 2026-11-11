@@ -1,5 +1,5 @@
 import { sql } from 'drizzle-orm';
-import { db } from '@/server/db';
+import type { db } from '@/server/db';
 import { AI_CREDIT_PROTOCOL } from './ai-credits';
 
 type PendingDatabase = Pick<typeof db, 'transaction'>;
@@ -9,9 +9,12 @@ type PendingDatabase = Pick<typeof db, 'transaction'>;
  * false must prove there is no live undelivered grant. Malformed potentially eligible rows never produce a negative
  * answer. Unknown returns undefined; the callback-aware producer signs it as null, never false.
  */
-export async function aiCreditsPendingFor(userId: string, database: PendingDatabase = db, now: Date = new Date()): Promise<boolean | undefined> {
+export async function aiCreditsPendingFor(userId: string, database: PendingDatabase | undefined = undefined, now: Date = new Date()): Promise<boolean | undefined> {
     try {
-        const rows = await database.transaction(async tx => {
+        // Import the existing pool only when a real read needs it. Merely composing a router must not initialize
+        // application credentials, and injected fixture databases never load the production pool.
+        const connection = database ?? (await import('@/server/db')).db;
+        const rows = await connection.transaction(async tx => {
             // A read-only unit on the existing app pool. Server-side limits cancel the actual SQL work; no timer race.
             await tx.execute(sql`set local statement_timeout = '1000ms'`);
             await tx.execute(sql`set local lock_timeout = '500ms'`);
