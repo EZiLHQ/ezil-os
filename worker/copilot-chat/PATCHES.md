@@ -716,48 +716,48 @@ assert those real pinned source anchors and compose actual producer-expression
 output into the actual endpoint-options expression for low/high. Actual v6
 acceptance remains pending; v4/v5 were failures, despite passing source tests.
 
-### Native session effort isolation v1 (clean v7 regression)
+### Native session effort isolation v2 (clean v7 and independent review)
 
-Clean v7 began with null configured/default efforts, then A-low/B-high succeeded
-on the wire and C without requested effort inherited low. `restore(...,false)`
-alone does not isolate an empty chat: configuration change fires native input
-sync, which writes the whole input to shared `chat.untitledInputState`. Native
-conversation restoration also used the default persist=true model bucket path.
+Clean v7 reproduced shared empty-draft leakage despite restore(...,false).
+The first source candidate e9780e40 was independently BLOCKED: a single marker
+lost provenance when switching M→N→M, foreign marker.prior leaked into target
+shared state, and an unrelated native manual setting promoted local effort through
+_preferences before the coarse model-ID event could retire it. That candidate is
+not qualified by its original passing tests.
 
-`session-effort-isolation.js` is injected into the pinned workbench, with seven
-exact-count anchors: helper, input hook, shared draft projection, current-state
-annotation, conversation preparation, restoration callback and manual selection.
-The hook/JSON marker contract is in `docs/proposals/native-effort-isolation-v1.md`.
-The native session InputModel.toJSON and N4i import preserve contrib and selected
-model configuration; marker survives that path. Invalid/cross-resource/model
-provenance is not promoted to shared defaults. Native contrib merging requires an
-undefined tombstone when the current value is no longer marked. Manual picker
-selection explicitly retires provenance, including choosing the same value.
+The corrected contract is `docs/proposals/native-effort-isolation-v1.md` (v2).
+`session-effort-isolation.js` is injected with nine exact anchors: helper/API,
+draft projection, state annotation, conversation preparation/restoration, native
+configuration getter, before-apply and after-apply. `_ezilSessionEffortV2` is the
+required capability. Version2 native contrib JSON retains resource-bound per-model
+selections; no preference/prior payload is trusted. Native fallback supplies only
+the projected reasoningEffort; unrelated fields are preserved.
 
-Shared draft projection changes only bridge-marked reasoningEffort (back to its
-pre-override value, or absent) and removes the marker. The owning session, picker
-and request use the actual native selected value. Marked native restore callbacks,
-including deferred model reconciliation, use persist=false. The same callback
-uses false for all EZiL-vendor session/history restores, including legacy unmarked
-state; explicit manual preference setters and other vendors remain unchanged. No global setter,
-storage clearing, mode forcing or outgoing request override is introduced.
-Docker must copy the helper alongside the patch script; this is source packaging
-only, no image build was performed here.
+Getter overlay keeps each model's actual session selection. Before/after native
+apply hooks separate local effort from the preference cache and persistence
+candidate. Unrelated manual fields still persist, while only an explicit OWN
+reasoningEffort field on a persistent manual setter retires that model's override.
+Same-value manual reasoning selection is legitimate. No global clearing/setter or
+request-body workaround; pending approvals and modes are untouched.
 
-Explicit bridge effort is Agent-only. Unsupported/unknown modes reject configure
-before selecting model/effort and reject sends carrying effort before sendRequest.
-Old Code without the hook does not advertise effort; model-only controls remain.
-Post-create unsupported mode/hook returns uncertain, retains resource/command in
-workbench, and does not recreate on duplicate. The backend's existing terminal
-uncertain behavior prevents redelivery; it does not expose a successful created
-session association for that outcome. No new wire fields or migration are added.
-Computer-level catalog snapshots cannot prove a target chat's current mode;
-request-time admission is authoritative. No Ask/Plan effort support claim.
+P4i.toJSON/N4i preserve contrib and config. Explicit tombstones handle native
+contrib merging. Pre-flush follows the old bound input resource before a widget
+rebind; controls require both widget and bound resource. EZiL history restores
+use false even without a marker. Other vendors/manual preference writes retain
+existing behavior. Native old Code restoration of newly marked histories remains
+an unqualified rollback path; do not assume old readers honor this provenance.
 
-Source tests execute pinned native configuration/sync/JSON methods with synthetic
-services and show old draft/bucket leakage then corrected isolation. They are not
-running native UI acceptance; root must run clean v8 and close/reopen/full reload,
-strict A-low/B-high/C-no-override wire, mode/approval and manual preference checks.
-Rollback to old Code is NOT qualified for marked saved sessions: old readers
-ignore the marker and may promote restored values. Drain/quarantine test profiles;
-do not claim seamless old-Code restoration of newly marked effort sessions.
+Bridge explicit effort is Agent-only; unsupported-mode sends reject before
+sendRequest. Missing/obsolete hook is model-only. Post-create refusal remains
+terminal uncertain (workbench resource retained, no applied OS association or
+safe automatic recreation). Computer-level catalogs are not per-session mode
+proof; request-time admission remains authoritative.
+
+The pinned native-method suite reproduces all three source defects and exercises
+corrected M/N/M plus JSON recreation, poisoned prior/native fallback, unrelated
+manual fields and same-value reasoning. Synthetic services/observables remain;
+this is not browser/native acceptance. Full fresh-Code patch/verify tests retain
+strict Copilot primary-only forwarding. Root's title/primary fixture classifier
+is separately owned by A; no product changes compensate for that fixture issue.
+Root must still run strict clean native wire, close/reopen/full reload, model
+switch, manual preference and approval checks before removing the native hold.

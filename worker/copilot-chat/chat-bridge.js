@@ -251,7 +251,7 @@
     function effortSchema(input, model) {
         const schema = model.metadata.configurationSchema?.properties?.reasoningEffort;
         const values = schema?.enum;
-        const usable = input.currentModeKind === 'agent' && typeof input._ezilSessionEffortV1 === 'function' && typeof input.restoreModelConfiguration === 'function' && typeof input.getModelConfiguration === 'function'
+        const usable = input.currentModeKind === 'agent' && typeof input._ezilSessionEffortV2 === 'function' && typeof input.restoreModelConfiguration === 'function' && typeof input.getModelConfiguration === 'function'
             && typeof input._inputModel?.state?.get === 'function' && input._inputModelSessionResource?.toString() === input._currentSessionKey
             && typeof input.flushInputStateToModel === 'function' && typeof input.getCurrentInputState === 'function' && schema?.type === 'string' && Array.isArray(values) && values.length > 0 && values.length <= 16
             && values.every(v => typeof v === 'string' && EFFORT.test(v)) && new Set(values).size === values.length;
@@ -270,7 +270,7 @@
         const id = currentModel(widget);
         if (!effortAllowed(widget, id, effort)) return false;
         const input = widget.input;
-        if (!input._ezilSessionEffortV1(widget.viewModel?.sessionResource?.toString(), id, effort)) return false;
+        if (!input._ezilSessionEffortV2(widget.viewModel?.sessionResource?.toString(), id, effort)) return false;
         // Both the live input and its persisted session input state must agree.
         return currentEffort(widget) === effort && input.getCurrentInputState?.().modelConfiguration?.reasoningEffort === effort
             && input._inputModelSessionResource?.toString() === widget.viewModel?.sessionResource?.toString()
@@ -360,7 +360,7 @@
                 return controlView(record);
             }
             if (!widget) { record.status = 'failed'; record.reason = 'not_opened'; return controlView(record); }
-            if (req.effort !== undefined && (widget.input?.currentModeKind !== 'agent' || typeof widget.input?._ezilSessionEffortV1 !== 'function')) {
+            if (req.effort !== undefined && (widget.input?.currentModeKind !== 'agent' || typeof widget.input?._ezilSessionEffortV2 !== 'function')) {
                 record.reason = widget.input?.currentModeKind !== 'agent' ? 'created_effort_mode_unsupported' : 'created_effort_isolation_unavailable';
                 record.model = currentModel(widget); record.requestCount = model.getRequests().length; record.observedAt = now();
                 return controlView(record);

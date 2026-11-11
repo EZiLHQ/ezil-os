@@ -620,3 +620,13 @@ test('new actual widget unsupported mode leaves one empty identity, uncertain an
     assert.equal((await control(w,'create',805,{model:'ezil/kimi-k2',effort:'low'})).sessionResource,first.sessionResource);
     assert.equal(w.calls.started,1);assert.equal(w.calls.switched.length,0);assert.equal(w.calls.send.length,0);
 });
+
+test('obsolete single-marker native hook cannot qualify effort capability',async()=>{
+    const {PICKER}=require('./chat-bridge-fake.cjs');const picker=structuredClone(PICKER);
+    picker[0].metadata.configurationSchema={properties:{reasoningEffort:{type:'string',enum:['low']}}};
+    const w=world({picker,mode:'agent',isolationHook:false});await claimed(w);
+    w.widget('s1').input._ezilSessionEffortV1=()=>{throw new Error('obsolete hook must not execute')};
+    assert.deepEqual((await w.bridge.handle({op:'models',...OWNER})).models[0].efforts,[]);
+    assert.equal((await control(w,'setModel',806,{sessionResource:'vscode-chat-session://local/s1',effort:'low'})).status,'rejected');
+    assert.equal(w.calls.switched.length,0);
+});

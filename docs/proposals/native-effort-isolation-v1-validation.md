@@ -57,3 +57,35 @@ Logs: parent artifacts/native-effort-isolation-source-20261111/{focused,full-pat
 During test construction a missing synthetic selection controller caused one
 fixture error; the fixture was completed and final runs above passed. No native
 v8, actual close/reopen/reload, or live acceptance result is claimed.
+
+## Independent-review correction (supersedes e978 qualification)
+
+Independent review BLOCKED e978 on M→N→M cached override provenance and foreign
+marker.prior projection. An artifact-only actual native manual-setter reproduction
+also failed before correction: contextSize2048 promoted low into bucket. Log:
+artifacts/native-isolation-correction-20261111/manual-other-before.log. No fixture
+or runtime profile changes were made to hide these failures.
+
+Corrected v2 tests:54 PASS, zero skips. Native-method suite now uses actual fcn
+rather than a synthetic merge, and actual manual setModelConfiguration; asserts
+M/N/M and native JSON reconstruction, foreign/malformed/v1 prior cannot influence
+native fallback, manual other-field persistence without effort promotion, and
+same-value manual effort retirement only for the selected model. Bound-input
+pre-flush and obsolete-hook refusal are also covered. Nine source anchors reject
+27 missing/duplicate/malformed variants and patched workbench syntax passes.
+During correction test development, the model-mismatch regression exposed an
+initial overly permissive no-entry restore; that admission was tightened before
+final runs. An assertion was corrected to handle entirely absent configuration,
+while retaining strict absent-effort expectations. No source tests are native PASS.
+
+No adapter/classifier changes; v8 title duplicate behavior is separately diagnosed
+as a fixture issue. A owns its classifier. All native acceptance remains held.
+
+Final v2 full patch/verify regression:1 PASS, zero skips (54s). Copilot SHA256
+unchanged `54261c2e1a1192e29304749dbf9431c95f3919b695fe8c6d6b2641ab784ae361`.
+Corrected workbench SHA256:
+`417d8430db39e7ee687fbfe925abdb90acb25be853ed9061e38874b185185407`.
+Final logs: artifacts/native-isolation-correction-20261111/{focused-after,full-patch-after}.log.
+No source changes during the full regression. Bash syntax and diff whitespace
+checks also pass. No installs, TypeScript/backend/schema changes or image/VSIX
+builds were necessary. New immutable source still requires independent review.

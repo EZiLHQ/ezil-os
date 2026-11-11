@@ -132,7 +132,7 @@ function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, no
             getModeRequestOptions: () => ({ modeInfo: { kind: 'ask', isBuiltin: true }, userSelectedTools: { get: () => ({}) } }),
             _getInstructionRouting: () => ({ enabledTools: undefined }),
         };
-        if (isolationHook) w.input._ezilSessionEffortV1 = function(resource, model, effort) { return isolation.set(this, resource, model, effort); };
+        if (isolationHook) w.input._ezilSessionEffortV2 = function(resource, model, effort) { return isolation.set(this, resource, model, effort); };
         widgets.set(id, w);
         return w;
     };

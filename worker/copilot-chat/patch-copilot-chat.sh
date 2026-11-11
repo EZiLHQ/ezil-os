@@ -258,15 +258,19 @@ ISOLATION_JS="$(cat "$(dirname "$0")/session-effort-isolation.js")"
 A_ISOLATION_HELPER='function Tcn(s){'
 R_ISOLATION_HELPER="var ezilSessionEffortV1=$ISOLATION_JS;function Tcn(s){"
 A_ISOLATION_API='restoreModelConfiguration(e,t,i=!0){t&&this._modelConfigStore.restoreModelConfiguration(e,t,i)}'
-R_ISOLATION_API='_ezilSessionEffortV1(resource,model,effort){return ezilSessionEffortV1.set(this,resource,model,effort)}restoreModelConfiguration(e,t,i=!0){t&&this._modelConfigStore.restoreModelConfiguration(e,t,i)}'
+R_ISOLATION_API='_ezilSessionEffortV2(resource,model,effort){return ezilSessionEffortV1.set(this,resource,model,effort)}restoreModelConfiguration(e,t,i=!0){t&&this._modelConfigStore.restoreModelConfiguration(e,t,i)}'
 A_ISOLATION_DRAFT='this._chatSessionIsEmpty&&this._emptyInputState.set(e,void 0);'
 R_ISOLATION_DRAFT='this._chatSessionIsEmpty&&this._emptyInputState.set(ezilSessionEffortV1.draft(this,e),void 0);'
 A_ISOLATION_STATE='n.getInputState?.(i.contrib);return i}_getAriaLabel()'
 R_ISOLATION_STATE='n.getInputState?.(i.contrib);return ezilSessionEffortV1.annotate(this,i)}_getAriaLabel()'
 A_ISOLATION_PREPARE='_syncFromModel(e,t){if(!this._isSyncingToOrFromInputModel)try{if(this._isSyncingToOrFromInputModel=!0,'
 R_ISOLATION_PREPARE='_syncFromModel(e,t){if(!this._isSyncingToOrFromInputModel)try{e=ezilSessionEffortV1.prepare(this,e,t);if(this._isSyncingToOrFromInputModel=!0,'
-A_ISOLATION_MANUAL='this._modelConfigStore.onDidSelectConfiguration(ho=>{let fo='
-R_ISOLATION_MANUAL='this._modelConfigStore.onDidSelectConfiguration(ho=>{this._ezilSessionEffortMarker=void 0;let fo='
+A_ISOLATION_BEFORE='let n=this._schemaDefaults(e);this.getModelConfiguration(e);let r=fcn('
+R_ISOLATION_BEFORE='let n=this._schemaDefaults(e);this.getModelConfiguration(e);ezilSessionEffortV1.beforeApply(this,e,t,i);let r=fcn('
+A_ISOLATION_AFTER='let c=i?this._readBucket():void 0;return qt(this._overrides.get(e),a)'
+R_ISOLATION_AFTER='ezilSessionEffortV1.afterApply(this,e,a,r);let c=i?this._readBucket():void 0;return qt(this._overrides.get(e),a)'
+A_ISOLATION_GET='return Object.keys(t).length>0?t:void 0}async setModelConfiguration(e,t)'
+R_ISOLATION_GET='t=ezilSessionEffortV1.get(this,e,t);return Object.keys(t).length>0?t:void 0}async setModelConfiguration(e,t)'
 A_ISOLATION_RESTORE='restoreModelConfiguration:(ho,fo)=>this.restoreModelConfiguration(ho,fo),'
 R_ISOLATION_RESTORE='restoreModelConfiguration:(ho,fo)=>ezilSessionEffortV1.restore(this,ho,fo),'
 
@@ -393,7 +397,9 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch session-effort-draft "$WB" 1 "$A_ISOLATION_DRAFT" "$R_ISOLATION_DRAFT"
   patch session-effort-state "$WB" 1 "$A_ISOLATION_STATE" "$R_ISOLATION_STATE"
   patch session-effort-prepare "$WB" 1 "$A_ISOLATION_PREPARE" "$R_ISOLATION_PREPARE"
-  patch session-effort-manual "$WB" 1 "$A_ISOLATION_MANUAL" "$R_ISOLATION_MANUAL"
+  patch session-effort-before "$WB" 1 "$A_ISOLATION_BEFORE" "$R_ISOLATION_BEFORE"
+  patch session-effort-after "$WB" 1 "$A_ISOLATION_AFTER" "$R_ISOLATION_AFTER"
+  patch session-effort-get "$WB" 1 "$A_ISOLATION_GET" "$R_ISOLATION_GET"
   patch session-effort-restore "$WB" 1 "$A_ISOLATION_RESTORE" "$R_ISOLATION_RESTORE"
   patch ezil-effort-context "$EXT" 1 "$A_EZIL_EFFORT_CONTEXT" "$R_EZIL_EFFORT_CONTEXT"
   patch ezil-effort-argument "$EXT" 1 "$A_EZIL_EFFORT_ARGUMENT" "$R_EZIL_EFFORT_ARGUMENT"
@@ -576,4 +582,6 @@ gate session-effort-state "$WB" 0 "$A_ISOLATION_STATE"; gate session-effort-stat
 gate session-effort-prepare "$WB" 0 "$A_ISOLATION_PREPARE"; gate session-effort-prepare "$WB" 1 "$R_ISOLATION_PREPARE"
 gate session-effort-restore "$WB" 0 "$A_ISOLATION_RESTORE"; gate session-effort-restore "$WB" 1 "$R_ISOLATION_RESTORE"
 gate session-effort-helper "$WB" 1 "$R_ISOLATION_HELPER"
-gate session-effort-manual "$WB" 0 "$A_ISOLATION_MANUAL"; gate session-effort-manual "$WB" 1 "$R_ISOLATION_MANUAL"
+gate session-effort-before "$WB" 0 "$A_ISOLATION_BEFORE"; gate session-effort-before "$WB" 1 "$R_ISOLATION_BEFORE"
+gate session-effort-after "$WB" 1 "$A_ISOLATION_AFTER"; gate session-effort-after "$WB" 1 "$R_ISOLATION_AFTER"
+gate session-effort-get "$WB" 1 "$A_ISOLATION_GET"; gate session-effort-get "$WB" 1 "$R_ISOLATION_GET"
