@@ -869,5 +869,82 @@ class LegacyRecoveryCompatibilityTests(unittest.TestCase):
                 {'action': 'Modify', 'properties': ['RoleName'], 'attributes': []}, resource, set())
 
 
+
+class LegacyLifecycleCapabilityTests(unittest.TestCase):
+    def setUp(self):
+        import rebase_cloudformation as cfn
+        self.cfn = cfn
+        cfn.use_namespace(TOOL.NAMESPACE)
+        self.source = dict(release_record(), amiId='ami-' + '1' * 17,
+            stateMachineVersionArn=TOOL.MACHINE + ':1', preparationStateMachineVersionArn=None,
+            recoveryStateMachineVersionArn=TOOL.MACHINE.replace('-lifecycle', '-recovery') + ':1',
+            previousLowerImageDigest=None, previousLowerImageRef=None)
+        self.deployment = {k: self.source[k] for k in ('accountId', 'region', 'namespace', 'amiId',
+            'launchTemplateId', 'launchTemplateVersion', 'stateMachineVersionArn')}
+        self.logical = 'LifecycleObserverCurrentVersion3A1B23A0' + 'a' * 32
+        history = {'Fn::GetAtt': [cfn.LIFECYCLE_HISTORY_KEY, 'Arn']}
+        self.invoke = {'Effect': 'Allow', 'Action': 'lambda:InvokeFunction', 'Resource': {'Ref': self.logical}}
+        self.launch = {'Effect': 'Allow', 'Action': 'ec2:RunInstances',
+            'Resource': [f"arn:aws:ec2:ap-south-1::image/{self.source['amiId']}", 'arn:aws:ec2:ap-south-1:452630323510:network-interface/*'],
+            'Condition': {'ArnEquals': {'ec2:LaunchTemplate': f"arn:aws:ec2:ap-south-1:452630323510:launch-template/{self.source['launchTemplateId']}"}}}
+        self.observer_history = {'Effect': 'Allow', 'Action': 'kms:Decrypt', 'Resource': history}
+        self.app_history = {'Effect': 'Allow', 'Action': 'kms:Decrypt', 'Resource': history, 'Condition': {'StringEquals': {
+            'kms:ViaService': 'states.ap-south-1.amazonaws.com',
+            'kms:EncryptionContext:aws:states:stateMachineArn': [TOOL.MACHINE, TOOL.MACHINE + ':1']}}}
+        def policy(name, role, rows):
+            return {'Type': 'AWS::IAM::Policy', 'Properties': {'PolicyName': name, 'Roles': [{'Ref': role}],
+                'PolicyDocument': {'Version': '2012-10-17', 'Statement': rows}}}
+        self.before = {'Resources': {
+            cfn.LIFECYCLE_OBSERVER: {'Type': 'AWS::Lambda::Function', 'Properties': {'Environment': {'Variables': {
+                'EZIL_LIFECYCLE_SETTINGS': json.dumps({'deployment': self.deployment})}}}},
+            cfn.LIFECYCLE_CONTROLLER_POLICY: policy(cfn.LIFECYCLE_CONTROLLER_POLICY, cfn.LIFECYCLE_CONTROLLER, [self.launch, self.invoke]),
+            cfn.LIFECYCLE_OBSERVER_POLICY: policy(cfn.LIFECYCLE_OBSERVER_POLICY, 'ObserverRole', [self.observer_history]),
+            cfn.APP_CALLER_POLICY: policy(cfn.APP_CALLER_POLICY, 'AppRole', [self.app_history]),
+            self.logical: {'Type': 'AWS::Lambda::Version', 'Properties': {'FunctionName': {'Ref': cfn.LIFECYCLE_OBSERVER}},
+                'DeletionPolicy': 'Retain', 'UpdateReplacePolicy': 'Retain'},
+        }}
+        self.after = copy.deepcopy(self.before)
+        self.after['Resources'][cfn.LIFECYCLE_OBSERVER]['Properties']['Environment']['Variables']['EZIL_LIFECYCLE_SETTINGS'] = json.dumps({
+            'deployment': dict(self.deployment, preparationStateMachineVersionArn=self.source['stateMachineVersionArn'].replace('-lifecycle:', '-rebase-preparation:'))})
+        self.retained_policy = 'LifecycleRetainedSourcePolicy11111111'
+        self.after['Resources'][self.retained_policy] = policy(self.retained_policy, cfn.LIFECYCLE_CONTROLLER, [self.launch, self.invoke])
+
+    def test_derives_only_admitted_source_and_preserves_all_three_capability_groups(self):
+        self.assertEqual(self.cfn.retained_lifecycle_source(self.before, self.source), {
+            'amiId': self.source['amiId'], 'stateMachineVersionArn': self.source['stateMachineVersionArn'],
+            'observerVersionLogicalId': self.logical})
+        self.cfn.preserve_legacy_lifecycle(self.before, self.after)
+        self.assertIsNone(self.cfn.retained_lifecycle_source({'Resources': {}}, self.source))
+
+    def test_source_manifest_mismatch_cannot_authorize_other_ami_or_version(self):
+        for patch in ({'amiId': 'ami-' + '9' * 17}, {'stateMachineVersionArn': TOOL.MACHINE + ':3'}):
+            with self.assertRaisesRegex(ValueError, 'promoted app tuple'):
+                self.cfn.retained_lifecycle_source(self.before, dict(self.source, **patch))
+
+    def test_omitted_lifecycle_retention_is_refused(self):
+        del self.after['Resources'][self.retained_policy]
+        with self.assertRaisesRegex(ValueError, 'rollback capabilities must be retained'):
+            self.cfn.preserve_legacy_lifecycle(self.before, self.after)
+
+    def test_old_ami_invoke_version_and_history_loss_or_scope_expansion_are_refused(self):
+        for change in ('ami', 'invoke', 'version', 'observer-history', 'app-history', 'extra-grant'):
+            after = copy.deepcopy(self.after)
+            rows = after['Resources'][self.retained_policy]['Properties']['PolicyDocument']['Statement']
+            if change == 'ami': rows[0]['Resource'][0] = 'arn:aws:ec2:ap-south-1::image/ami-' + '9' * 17
+            elif change == 'invoke': rows.pop()
+            elif change == 'version': del after['Resources'][self.logical]
+            elif change == 'extra-grant': rows.append({'Effect': 'Allow', 'Action': 'kms:Decrypt', 'Resource': '*'})
+            else:
+                name = self.cfn.LIFECYCLE_OBSERVER_POLICY if change == 'observer-history' else self.cfn.APP_CALLER_POLICY
+                after['Resources'][name]['Properties']['PolicyDocument']['Statement'] = []
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.cfn.preserve_legacy_lifecycle(self.before, after)
+
+    def test_image_mode_without_legacy_source_is_unchanged(self):
+        before = copy.deepcopy(self.after)
+        self.assertIsNone(self.cfn.retained_lifecycle_source(before, self.source))
+        self.cfn.preserve_legacy_lifecycle(before, copy.deepcopy(before))
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

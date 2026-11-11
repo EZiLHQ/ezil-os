@@ -152,7 +152,7 @@ export function appCallerTrust(p: z.infer<typeof ProviderSchema>): iam.PolicySta
 
 export class AppCaller extends Construct {
     readonly role: iam.Role;
-    constructor(scope: Construct, id: string, props: { config: z.input<typeof AppCallerConfigSchema>; region: string; versionArns: string[]; historyKeyArn: string; ec2CallerRoleArns?: string[] }) {
+    constructor(scope: Construct, id: string, props: { config: z.input<typeof AppCallerConfigSchema>; region: string; versionArns: string[]; historyKeyArn: string; ec2CallerRoleArns?: string[]; retainedLifecycleVersionArn?: string }) {
         super(scope, id);
         const config = AppCallerConfigSchema.parse({ ...props.config,
             ec2CallerRoleArns: props.ec2CallerRoleArns ?? props.config.ec2CallerRoleArns });
@@ -171,6 +171,13 @@ export class AppCaller extends Construct {
             }));
         }
         for (const s of appCallerStatements(props.region, props.versionArns, props.historyKeyArn)) this.role.addToPolicy(s);
+        if (props.retainedLifecycleVersionArn) {
+            const prior = props.retainedLifecycleVersionArn, current = props.versionArns[0];
+            if (!current || prior === current || prior.replace(/:[1-9][0-9]*$/, '') !== current.replace(/:[1-9][0-9]*$/, ''))
+                throw new Error('invalid_retained_lifecycle_history_scope');
+            // Keep the exact prior key/context row alongside the current row.
+            this.role.addToPolicy(historyReadStatement(props.region, props.historyKeyArn, [prior]));
+        }
         const added = props.versionArns.flatMap(v => registeredImageWorkflows(this, v));
         if (added.length) {
             const versions = [...new Set(added.map(v => v.version))];

@@ -420,6 +420,99 @@ def preserve_legacy_recovery(before, after, boundary):
               Counter(statement_key(s) for s in statements(candidate))),
          'retained legacy observer loses an existing permission')
 
+LIFECYCLE_CONTROLLER = 'LifecycleControllerRole1FB8E154'
+LIFECYCLE_CONTROLLER_POLICY = 'LifecycleControllerRoleDefaultPolicy31C0D948'
+LIFECYCLE_OBSERVER = 'LifecycleObserver4909851D'
+LIFECYCLE_OBSERVER_POLICY = 'LifecycleObserverServiceRoleDefaultPolicy537A1B52'
+LIFECYCLE_HISTORY_KEY = 'LifecycleHistoryKey897F7B53'
+APP_CALLER_POLICY = 'AppCallerRoleDefaultPolicy61BE57D2'
+
+
+def legacy_lifecycle_capabilities(before):
+    resources = before['Resources']
+    if LIFECYCLE_CONTROLLER_POLICY not in resources:
+        return None
+    function = resources.get(LIFECYCLE_OBSERVER, {})
+    raw = function.get('Properties', {}).get('Environment', {}).get('Variables', {}).get('EZIL_LIFECYCLE_SETTINGS')
+    need(isinstance(raw, str), 'legacy lifecycle observer settings required')
+    settings = manifest.loads(raw)
+    deployment = settings['deployment']
+    if deployment.get('preparationStateMachineVersionArn'):
+        return None  # Existing image-mode deployments keep their existing behavior.
+    policy = resources[LIFECYCLE_CONTROLLER_POLICY]
+    need(policy.get('Type') == 'AWS::IAM::Policy'
+         and policy.get('Properties', {}).get('Roles') == [{'Ref': LIFECYCLE_CONTROLLER}],
+         'legacy lifecycle controller attachment mismatch')
+    invokes = [s for s in statements(policy) if s.get('Effect') == 'Allow'
+               and action_set(s) == {'lambda:invokefunction'}]
+    need(len(invokes) == 1 and isinstance(invokes[0].get('Resource'), dict)
+         and set(invokes[0]['Resource']) == {'Ref'}, 'one legacy lifecycle observer reference required')
+    logical = invokes[0]['Resource']['Ref']
+    version = resources.get(logical, {})
+    need(manifest.matches(r'LifecycleObserverCurrentVersion[0-9A-F]{8}[a-f0-9]{32}', logical)
+         and version.get('Type') == 'AWS::Lambda::Version'
+         and version.get('Properties') == {'FunctionName': {'Ref': LIFECYCLE_OBSERVER}}
+         and version.get('DeletionPolicy') == version.get('UpdateReplacePolicy') == 'Retain',
+         'legacy lifecycle immutable observer graph mismatch')
+    image = f"arn:aws:ec2:{deployment['region']}::image/{deployment['amiId']}"
+    launches = [s for s in statements(policy) if s.get('Effect') == 'Allow'
+                and action_set(s) == {'ec2:runinstances'}
+                and image in (s.get('Resource') if isinstance(s.get('Resource'), list) else [s.get('Resource')])]
+    need(len(launches) == 1, 'one exact legacy lifecycle AMI launch grant required')
+    history = {'Fn::GetAtt': [LIFECYCLE_HISTORY_KEY, 'Arn']}
+    need(any(s.get('Effect') == 'Allow' and action_set(s) == {'kms:decrypt'}
+             and s.get('Resource') == history and 'Condition' not in s
+             for s in statements(resources.get(LIFECYCLE_OBSERVER_POLICY, {}))),
+         'legacy lifecycle history-key baseline mismatch')
+    return {'deployment': deployment, 'observerVersionLogicalId': logical,
+            'invoke': invokes[0], 'launch': launches[0]}
+
+
+def retained_lifecycle_source(before, admitted_source):
+    """No IAM documents are inputs: derive three references from the admitted old graph."""
+    prior = legacy_lifecycle_capabilities(before)
+    if prior is None:
+        return None
+    source = manifest.validate(admitted_source, source=True)
+    context.scope(source)
+    manifest.promoted_release(prior['deployment'], source)
+    return {'amiId': source['amiId'], 'stateMachineVersionArn': source['stateMachineVersionArn'],
+            'observerVersionLogicalId': prior['observerVersionLogicalId']}
+
+
+def preserve_legacy_lifecycle(before, after):
+    prior = legacy_lifecycle_capabilities(before)
+    if prior is None:
+        return
+    old, new = before['Resources'], after['Resources']
+    raw = new.get(LIFECYCLE_OBSERVER, {}).get('Properties', {}).get('Environment', {}).get('Variables', {}).get('EZIL_LIFECYCLE_SETTINGS')
+    need(isinstance(raw, str), 'candidate lifecycle observer settings required')
+    if not manifest.loads(raw)['deployment'].get('preparationStateMachineVersionArn'):
+        return
+    policies = [(logical, resource) for logical, resource in new.items()
+                if logical.startswith('LifecycleRetainedSourcePolicy') and resource.get('Type') == 'AWS::IAM::Policy']
+    need(len(policies) == 1, 'legacy lifecycle rollback capabilities must be retained')
+    logical, policy = policies[0]
+    properties = policy.get('Properties', {})
+    need(set(properties) == {'PolicyName', 'Roles', 'PolicyDocument'}
+         and properties['Roles'] == [{'Ref': LIFECYCLE_CONTROLLER}]
+         and properties['PolicyName'] == logical
+         and Counter(statement_key(s) for s in statements(policy)) ==
+             Counter(statement_key(s) for s in (prior['launch'], prior['invoke'])),
+         'retained lifecycle launch or observer scope differs from admitted baseline')
+    retained = prior['observerVersionLogicalId']
+    need(new.get(retained) == old[retained], 'retained lifecycle observer version must remain unchanged')
+    for name in (LIFECYCLE_OBSERVER_POLICY, APP_CALLER_POLICY):
+        previous, candidate = old.get(name, {}), new.get(name, {})
+        need(previous.get('Type') == candidate.get('Type') == 'AWS::IAM::Policy'
+             and {k: v for k, v in previous.get('Properties', {}).items() if k != 'PolicyDocument'} ==
+                 {k: v for k, v in candidate.get('Properties', {}).items() if k != 'PolicyDocument'},
+             'retained lifecycle reader attachment changed')
+        need(not (Counter(statement_key(s) for s in statements(previous)) -
+                  Counter(statement_key(s) for s in statements(candidate))),
+             'retained lifecycle reader loses an admitted history capability')
+
+
 def validate_templates(phase, before, after, review, unchanged=False, pool_iam=None):
     context.identities(before)
     context.identities(after)
@@ -460,6 +553,7 @@ def validate_templates(phase, before, after, review, unchanged=False, pool_iam=N
         roles=[k for k,v in new.items() if v['Type']=='AWS::IAM::Role' and v.get('Properties',{}).get('PermissionsBoundary')==boundary]
         need(len(roles)==2 and any('RebasePreparationRole' in k for k in roles) and any('RecoveryRole' in k for k in roles),'exactly preparation and recovery execution roles require the image-job boundary')
         preserve_legacy_recovery(before, after, boundary)
+        preserve_legacy_lifecycle(before, after)
 
     for logical in old.keys() | new.keys():
         if old.get(logical)==new.get(logical):

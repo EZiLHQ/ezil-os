@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { App, Stack } from 'aws-cdk-lib';
 import { WorkloadDeploySchema, applyWorkloadIdentity, workloadStackName, workloadSynthesizer } from '../lib/workload-identity.js';
 import { z } from 'zod';
-import { ComputerLifecycle } from '../lib/computer-lifecycle.js';
+import { ComputerLifecycle, RetainedLifecycleSourceSchema } from '../lib/computer-lifecycle.js';
 import { ComputerLifecycleRecovery } from '../lib/lifecycle-recovery.js';
 import { SettingsSchema } from '../lib/lifecycle/contract.js';
 import { AppCaller, AppCallerConfigSchema } from '../lib/app-caller.js';
@@ -11,6 +11,7 @@ try {
     const bytes=readFileSync(path);if(bytes.length>16384)throw new Error();
     const config=z.object({settings:SettingsSchema,authorityKeyArn:z.string(),notificationsEnabled:z.boolean().default(false),alertTopicArn:z.string().optional(),
         recoveryVersionArn:z.string().optional(),recoveryEnabled:z.boolean().default(false),
+        retainedLifecycleSource:RetainedLifecycleSourceSchema.optional(),
         retainedRecoveryObserverVersionLogicalId:z.string().regex(/^RecoveryObserverCurrentVersion[0-9A-F]{8}[a-f0-9]{32}$/).optional(),appCaller:AppCallerConfigSchema.default({}),deploy:WorkloadDeploySchema.optional(),
         // null omits the reservation: a new account's whole Lambda pool is 10, and any reservation then breaks the 10-unreserved minimum.
         lambdaReservedConcurrency:z.number().int().min(1).max(100).nullable().default(2)}).strict().parse(JSON.parse(bytes.toString()));
@@ -20,12 +21,12 @@ try {
     const stack=new Stack(app,workloadStackName(d.namespace,'lifecycle'),{env:{account:d.accountId,region:d.region},terminationProtection:true,
         ...(config.deploy?{synthesizer:workloadSynthesizer(config.deploy)}:{})});
     if(config.deploy)applyWorkloadIdentity(stack,d.accountId,d.namespace);
-    const lifecycle=new ComputerLifecycle(stack,'Lifecycle',config);
+    const lifecycle=new ComputerLifecycle(stack,'Lifecycle',{...config,...(config.retainedLifecycleSource?{retainedSource:config.retainedLifecycleSource}:{})});
     if(config.recoveryEnabled&&!config.recoveryVersionArn)throw new Error();
     if(config.recoveryVersionArn)new ComputerLifecycleRecovery(stack,'Recovery',{
         settings:{lifecycle:config.settings,recoveryVersionArn:config.recoveryVersionArn},
         sourceHistoryKey:lifecycle.historyKey,enabled:config.recoveryEnabled,
         ...(config.retainedRecoveryObserverVersionLogicalId ? {retainedObserverVersionLogicalId:config.retainedRecoveryObserverVersionLogicalId}:{})});
     // appCaller includes optional ec2CallerRoleArns; an absent/empty list keeps OIDC-only trust.
-    if(config.appCaller.enabled)new AppCaller(stack,'AppCaller',{config:config.appCaller,ec2CallerRoleArns:config.appCaller.ec2CallerRoleArns,region:d.region,versionArns:[d.stateMachineVersionArn],historyKeyArn:lifecycle.historyKey.keyArn});
+    if(config.appCaller.enabled)new AppCaller(stack,'AppCaller',{config:config.appCaller,ec2CallerRoleArns:config.appCaller.ec2CallerRoleArns,region:d.region,versionArns:[d.stateMachineVersionArn],historyKeyArn:lifecycle.historyKey.keyArn,...(config.retainedLifecycleSource?{retainedLifecycleVersionArn:config.retainedLifecycleSource.stateMachineVersionArn}:{})});
 }catch(cause){throw new Error("EZIL_LIFECYCLE_CONFIG is missing or invalid; supply reviewed references without credentials",{cause})}

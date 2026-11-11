@@ -91,6 +91,13 @@ against a live provider in developing this contribution.
    role/policy/version graph stays unchanged; image recovery adds its own named
    role under the existing exact two-role IAM exception. The IAM replacement
    fence remains mandatory.
+   Derive `retainedLifecycleSource` from the same before template plus the
+   exact admitted source manifest with `retained_lifecycle_source`. Preserve
+   the old AMI/LT-scoped launch, immutable observer invocation and history-read
+   capabilities: full-tuple rollback does not restore CloudFormation IAM.
+   The scheduled reconciler is current-version-only; use the normal signed
+   `reconcile-release` operation for an old failed release under its matching
+   old tuple, rather than claiming an extra ListExecutions grant reconciles it.
    The ordinary role-policy review and resource limits still apply. Stage the
    source SQL contract and independently verify production DB
    `7698288507300208674`, host `10.63.20.252`, database `postgres`, SSL required.

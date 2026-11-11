@@ -3,11 +3,20 @@ import { CfnOutput, Duration, RemovalPolicy, Stack, Tags, aws_cloudwatch as clou
     aws_events as events, aws_iam as iam, aws_kms as kms, aws_lambda as lambda,
     aws_lambda_nodejs as nodejs, aws_logs as logs, aws_sqs as sqs, aws_stepfunctions as states } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
+import { PATH_METADATA_ENABLE_CONTEXT } from 'aws-cdk-lib/cx-api';
+import { z } from 'zod';
 import { RETAG_KEYS, POOL_CLAIM_KEYS, POOL_IAM_TYPES, SettingsSchema, type Settings } from './lifecycle/contract.js';
 import { lifecycleDefinition } from './lifecycle/definition.js';
 import { GuardedTarget, ruleArn } from './guarded-target.js';
 import { RebasePreparation, historyReadStatement } from './rebase-preparation.js';
 import { registerImageWorkflow, registerImageHistoryReader } from './app-caller.js';
+
+export const RetainedLifecycleSourceSchema = z.object({
+    amiId: z.string().regex(/^ami-[a-f0-9]{17}$/),
+    stateMachineVersionArn: z.string().regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:stateMachine:[A-Za-z0-9_-]+:[1-9][0-9]*$/),
+    observerVersionLogicalId: z.string().regex(/^LifecycleObserverCurrentVersion[0-9A-F]{8}[a-f0-9]{32}$/),
+}).strict();
+export type RetainedLifecycleSource = z.infer<typeof RetainedLifecycleSourceSchema>;
 
 /** Shared graph and trusted control role; it does not allocate a computer.
  * Hosts launch with no instance role (R5), so there is no iam:PassRole here.
@@ -17,10 +26,15 @@ export class ComputerLifecycle extends Construct {
     readonly version:states.CfnStateMachineVersion;
     readonly historyKey:kms.IKey;
     readonly preparation?: RebasePreparation;
-    constructor(scope:Construct,id:string,props:{settings:Settings;authorityKeyArn:string;notificationsEnabled?:boolean;lambdaReservedConcurrency?:number|null;alertTopicArn?:string;recoveryVersionArn?:string}){
+    constructor(scope:Construct,id:string,props:{settings:Settings;authorityKeyArn:string;notificationsEnabled?:boolean;lambdaReservedConcurrency?:number|null;alertTopicArn?:string;recoveryVersionArn?:string;retainedSource?:RetainedLifecycleSource}){
         super(scope,id);const s=SettingsSchema.parse(props.settings),d=s.deployment,stack=Stack.of(this),r=d.region;
         const machineArn=d.stateMachineVersionArn.slice(0,d.stateMachineVersionArn.lastIndexOf(':'));
         const machineName=machineArn.split(':').at(-1)!;
+        const retained = props.retainedSource && RetainedLifecycleSourceSchema.parse(props.retainedSource);
+        if (retained && (!d.preparationStateMachineVersionArn || retained.amiId === d.amiId
+            || retained.stateMachineVersionArn === d.stateMachineVersionArn
+            || retained.stateMachineVersionArn.replace(/:[1-9][0-9]*$/, '') !== machineArn))
+            throw new Error('invalid_retained_lifecycle_source');
         if(!new RegExp(`^arn:aws:kms:${r}:${d.accountId}:key/[a-f0-9-]{36}$`).test(props.authorityKeyArn))throw new Error('invalid_authority_key');
         const key=new kms.Key(this,'HistoryKey',{enableKeyRotation:true,removalPolicy:RemovalPolicy.RETAIN});
         this.historyKey=key;
@@ -53,11 +67,33 @@ export class ComputerLifecycle extends Construct {
         helper.addToRolePolicy(new iam.PolicyStatement({actions:['kms:Decrypt'],resources:[props.authorityKeyArn],
             conditions:{StringEquals:{'kms:ViaService':`secretsmanager.${r}.amazonaws.com`,'kms:EncryptionContext:SecretARN':s.authoritySecretArn}}}));
         if (d.preparationStateMachineVersionArn) helper.addToRolePolicy(historyReadStatement(r, key.keyArn, [d.stateMachineVersionArn, d.preparationStateMachineVersionArn]));
-        else key.grantDecrypt(helper);
+        if (!d.preparationStateMachineVersionArn || retained) key.grantDecrypt(helper);
         const role=new iam.Role(this,'ControllerRole',{assumedBy:new iam.ServicePrincipal('states.amazonaws.com',{
             conditions:{StringEquals:{'aws:SourceAccount':d.accountId},ArnEquals:{'aws:SourceArn':machineArn}}})});
         helper.currentVersion.grantInvoke(role);key.grantEncryptDecrypt(role);
         for(const statement of controllerStatements(s))role.addToPolicy(statement);
+        if (retained) {
+            const current = helper.currentVersion.node.defaultChild as lambda.CfnVersion;
+            const currentId = stack.resolve(current.logicalId) as string;
+            if (retained.observerVersionLogicalId.slice(0, -32) !== currentId.slice(0, -32)
+                || retained.observerVersionLogicalId === currentId) throw new Error('invalid_retained_lifecycle_observer');
+            const legacy = new lambda.CfnVersion(this, 'RetainedObserverVersion', { functionName: helper.functionName });
+            legacy.overrideLogicalId(retained.observerVersionLogicalId);
+            legacy.applyRemovalPolicy(RemovalPolicy.RETAIN);
+            if (legacy.node.tryGetContext(PATH_METADATA_ENABLE_CONTEXT))
+                legacy.addMetadata('aws:cdk:path', helper.currentVersion.node.path + '/Resource');
+            legacy.addMetadata('aws:cdk:do-not-refactor', true);
+            const oldImage = `arn:aws:ec2:${r}::image/${retained.amiId}`;
+            const launch = controllerStatements({ ...s, deployment: { ...d, amiId: retained.amiId } })
+                .filter(statement => statement.actions.includes('ec2:RunInstances') && statement.resources.includes(oldImage));
+            if (launch.length !== 1) throw new Error('retained_lifecycle_launch_scope_missing');
+            // Separate attachment preserves the exact prior rows, without merging
+            // old/new resources into a broader-looking default-policy statement.
+            new iam.Policy(this, 'RetainedSourcePolicy', { roles: [role], statements: [
+                ...launch, new iam.PolicyStatement({ actions: ['lambda:InvokeFunction'], resources: [legacy.ref] }),
+            ] });
+        }
+
         const workflowLogs=new logs.LogGroup(this,'WorkflowLogs',{encryptionKey:key,retention:logs.RetentionDays.ONE_WEEK,removalPolicy:RemovalPolicy.RETAIN});
         role.addToPolicy(new iam.PolicyStatement({actions:['logs:CreateLogDelivery','logs:GetLogDelivery','logs:UpdateLogDelivery','logs:DeleteLogDelivery',
             'logs:ListLogDeliveries','logs:PutResourcePolicy','logs:DescribeResourcePolicies','logs:DescribeLogGroups'],resources:['*']}));

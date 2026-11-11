@@ -54,7 +54,7 @@ The example files in `config/` hold public placeholders only.
 
 ### Lifecycle: `EZIL_LIFECYCLE_CONFIG`
 
-The file is `{ settings, authorityKeyArn, notificationsEnabled?, recoveryVersionArn?, recoveryEnabled?, retainedRecoveryObserverVersionLogicalId? }`.
+The file is `{ settings, authorityKeyArn, notificationsEnabled?, recoveryVersionArn?, recoveryEnabled?, retainedRecoveryObserverVersionLogicalId?, retainedLifecycleSource? }`.
 `settings.deployment` is `LifecycleDeploymentSchema` (`lib/lifecycle/deployment.ts`). For the
 full shape, see `config/lifecycle.example.json`. The app builds intents with a mirrored copy of
 this schema (`app/src/server/lib/compute/aws-intent.ts`). `test/app-intent-contract.test.ts`
@@ -70,6 +70,14 @@ boundary; published legacy workflows retain their role, invoke grant and history
 key permissions. The normal rollout validator rejects a changed legacy graph or
 an omitted retention input. Fresh stacks and existing image-enabled fixed-role stacks omit this field; their
 original role layout and conditional observer key permissions remain unchanged.
+
+A legacy-to-image rollout also derives `retainedLifecycleSource` with
+`rebase_cloudformation.retained_lifecycle_source(beforeTemplate, admittedSourceManifest)`.
+Its closed shape is `{ amiId, stateMachineVersionArn, observerVersionLogicalId }`.
+The admitted old observer resource, exact old AMI/LT launch grant, observer invoke
+and history-read grants remain available alongside the current target. This is
+required because normal full-tuple rollback changes the app tuple, not IAM.
+No IAM documents, arbitrary keys or wildcard scopes are accepted as inputs.
 
 | Field | Rule |
 |---|---|

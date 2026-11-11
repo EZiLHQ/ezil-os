@@ -1,23 +1,31 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { App, Stack, assertions } from 'aws-cdk-lib';
-import { ComputerLifecycle } from '../lib/computer-lifecycle.js';
+import { ComputerLifecycle, type RetainedLifecycleSource } from '../lib/computer-lifecycle.js';
 import { ComputerLifecycleRecovery } from '../lib/lifecycle-recovery.js';
+import { AppCaller } from '../lib/app-caller.js';
 import { applyWorkloadIdentity } from '../lib/workload-identity.js';
 import { lifecycleFixture } from './lifecycle-fixture.js';
 import { preparationFixture } from './preparation-fixture.js';
 
 const oldRole = 'RecoveryRecoveryRole1B60FF4C', oldPolicy = 'RecoveryRecoveryRoleDefaultPolicy2A415109';
-function synth(image: boolean, retainedObserverVersionLogicalId?: string, pathMetadata = false) {
-    const settings = image ? preparationFixture().settings : lifecycleFixture().settings;
+function synth(image: boolean, retainedObserverVersionLogicalId?: string, pathMetadata = false, retainedSource?: RetainedLifecycleSource) {
+    const base = image ? preparationFixture().settings : lifecycleFixture().settings;
+    const settings = retainedSource ? { ...base, deployment: { ...base.deployment, amiId: 'ami-33333333333333333',
+        stateMachineVersionArn: base.deployment.stateMachineVersionArn.replace(/:[1-9][0-9]*$/, ':2'),
+        recoveryStateMachineVersionArn: base.deployment.recoveryStateMachineVersionArn?.replace(/:[1-9][0-9]*$/, ':2') } } : base;
     const d = settings.deployment;
     const stack = new Stack(new App({ context: { 'aws:cdk:enable-path-metadata': pathMetadata } }), 'RecoveryMigration', { env: { account: d.accountId, region: d.region } });
     applyWorkloadIdentity(stack, d.accountId, d.namespace);
-    const controller = new ComputerLifecycle(stack, 'Lifecycle', { settings, authorityKeyArn: d.dataKeyArn });
+    const controller = new ComputerLifecycle(stack, 'Lifecycle', { settings, authorityKeyArn: d.dataKeyArn, ...(retainedSource ? { retainedSource } : {}) });
     new ComputerLifecycleRecovery(stack, 'Recovery', { settings: { lifecycle: settings,
         recoveryVersionArn: d.recoveryStateMachineVersionArn ?? `arn:aws:states:${d.region}:${d.accountId}:stateMachine:ezil-${d.namespace}-recovery:1` },
         sourceHistoryKey: controller.historyKey,
         ...(retainedObserverVersionLogicalId ? { retainedObserverVersionLogicalId } : {}) });
+    new AppCaller(stack, 'AppCaller', { config: { enabled: true, roleName: 'ezil-pilot-app-caller', providers: [],
+        ec2CallerRoleArns: [`arn:aws:iam::${d.accountId}:role/ezil-host`], ec2CallerEnv: 'production' },
+        region: d.region, versionArns: [d.stateMachineVersionArn], historyKeyArn: controller.historyKey.keyArn,
+        ...(retainedSource ? { retainedLifecycleVersionArn: retainedSource.stateMachineVersionArn } : {}) });
     return assertions.Template.fromStack(stack).toJSON().Resources as Record<string, any>;
 }
 for (const metadata of [false, true]) test(`image migration preserves legacy resources and observer capabilities (path metadata=${metadata})`, () => {
@@ -73,4 +81,31 @@ test('already-image-enabled and fresh stacks keep the existing fixed role and co
         if (![statement.Action].flat().includes('kms:Decrypt') || !JSON.stringify(statement.Resource).includes('HistoryKey')) continue;
         assert.ok(statement.Condition?.StringEquals?.['kms:ViaService'], 'no unconditional legacy-key expansion in image-only mode');
     }
+});
+
+test('retained Lifecycle1 keeps exact old AMI/invoke and history capabilities alongside the current target', () => {
+    const before = synth(false);
+    const prior = JSON.parse(before.LifecycleObserver4909851D.Properties.Environment.Variables.EZIL_LIFECYCLE_SETTINGS).deployment;
+    const oldController = before.LifecycleControllerRoleDefaultPolicy31C0D948.Properties.PolicyDocument.Statement;
+    const oldInvoke = oldController.find((s: any) => s.Action === 'lambda:InvokeFunction');
+    const oldLaunch = oldController.find((s: any) => s.Action === 'ec2:RunInstances'
+        && JSON.stringify(s.Resource).includes('/' + prior.amiId));
+    const recoveryVersion = before[oldPolicy].Properties.PolicyDocument.Statement.find((s: any) => s.Action === 'lambda:InvokeFunction').Resource.Ref;
+    const retainedSource = { amiId: prior.amiId, stateMachineVersionArn: prior.stateMachineVersionArn,
+        observerVersionLogicalId: oldInvoke.Resource.Ref };
+    const after = synth(true, recoveryVersion, true, retainedSource);
+    const oldVersion = { ...before[retainedSource.observerVersionLogicalId],
+        Metadata: { ...before[retainedSource.observerVersionLogicalId].Metadata,
+            'aws:cdk:path': 'RecoveryMigration/Lifecycle/Observer/CurrentVersion/Resource' } };
+    assert.deepEqual(after[retainedSource.observerVersionLogicalId], oldVersion);
+    const retainedPolicy = Object.entries(after).find(([id]) => id.startsWith('LifecycleRetainedSourcePolicy'))![1];
+    assert.deepEqual(retainedPolicy.Properties.Roles, [{ Ref: 'LifecycleControllerRole1FB8E154' }]);
+    assert.deepEqual(retainedPolicy.Properties.PolicyDocument.Statement, [oldLaunch, oldInvoke]);
+    const current = after.LifecycleControllerRoleDefaultPolicy31C0D948.Properties.PolicyDocument.Statement;
+    assert.ok(current.some((s: any) => s.Action === 'ec2:RunInstances' && JSON.stringify(s.Resource).includes('/ami-33333333333333333')));
+    assert.ok(current.some((s: any) => s.Action === 'lambda:InvokeFunction' && s.Resource.Ref !== oldInvoke.Resource.Ref));
+    for (const id of ['LifecycleObserverServiceRoleDefaultPolicy537A1B52', 'AppCallerRoleDefaultPolicy61BE57D2'])
+        for (const statement of before[id].Properties.PolicyDocument.Statement)
+            assert.ok(after[id].Properties.PolicyDocument.Statement.some((s: any) => JSON.stringify(s) === JSON.stringify(statement)),
+                id + ' loses prior capability: ' + JSON.stringify(statement));
 });
