@@ -51,9 +51,15 @@ function deps(rows: { subs?: SubscriptionRow[]; grants?: GrantRow[]; paymentIssu
 
 afterEach(() => vi.restoreAllMocks());
 
-describe('aiIncludedModels: Free includes Gemini 3.8 Flash only; every paid plan includes every model', () => {
+describe('aiIncludedModels: Free includes a curated low-tier set (Flash first); every paid plan includes every model', () => {
     it('keys on the plan the computer runs under', () => {
-        expect(FREE_AI_MODELS).toEqual(['gemini-3.8-flash']);
+        expect(FREE_AI_MODELS).toEqual(['gemini-3.8-flash', 'qwen.qwen3-coder-next', 'us.moonshotai.kimi-k3']);
+        // Bounded and valid for the Worker push (1-16 distinct aliases): at most 3, Flash first as the preferred default.
+        expect(FREE_AI_MODELS.length).toBeLessThanOrEqual(3);
+        expect(FREE_AI_MODELS[0]).toBe('gemini-3.8-flash');
+        expect(new Set(FREE_AI_MODELS).size).toBe(FREE_AI_MODELS.length);
+        for (const alias of FREE_AI_MODELS) expect(alias).toMatch(/^[a-z0-9][a-z0-9._-]{0,63}$/);
+        expect(Object.isFrozen(FREE_AI_MODELS)).toBe(true);
         for (const sku of ['free_v3', 'free_v2', 'free_v1_legacy'] as const) expect(aiIncludedModels(sku)).toBe(FREE_AI_MODELS);
         for (const sku of ['standard_monthly_v3', 'premium_monthly_v3', 'standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1'] as const) {
             expect(aiIncludedModels(sku)).toBeNull();
