@@ -31,6 +31,7 @@ import { SESSION_MAX_SECONDS, SIZES } from './v2/contract';
 import { epochSeconds, isoSeconds } from './v2/time';
 import { AI_CREDIT_PROTOCOL, planAiReversal, type AiReversalStore, type AiTopupReceiptStore } from './ai-credits';
 import { readOperatorEntitlements } from '@/server/entitlements/operator/store';
+import { claimLinkage, ensureAttribution, linkQuote, refreshLinkedQuote, type SqlRunner } from './v3/sponsor-store';
 import {
     authSubjectFor, mailboxDomains, normalizeEmail, UNBOUND_TRIAL_STATUSES, TRIAL_POLICY_VERSION, TRIAL_SKU, type TrialRow, type TrialStore,
 } from './v3/trial';
@@ -70,6 +71,9 @@ function trialRow(row: BillingTrialRow): TrialRow {
 /** Postgres unique_violation: a concurrent claim by another account (email or subject) or a second quote. */
 const uniqueViolation = (error: unknown) => (error as { code?: string; cause?: { code?: string } })?.code === '23505'
     || (error as { cause?: { code?: string } })?.cause?.code === '23505';
+
+/** Thrown inside a transaction to roll everything back and report a sponsor refusal. */
+class SponsorRollback extends Error { constructor(readonly outcome: 'sponsor_conflict' | 'sponsor_mismatch') { super(outcome); } }
 
 const PAID_GRANT_KINDS = ['plan_period', 'upgrade_prorated', 'pro_period'] as const;
 const PAID_SUBSCRIPTION_SKUS = ['standard_monthly_v3', 'premium_monthly_v3', 'standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1'] as const;
@@ -186,6 +190,10 @@ export function createBillingStore(db: Database): BillingStore {
                     if ((await otherTrialClaims(tx as unknown as Database, input.userId, input.authSubject, input.emailNormalized)).claimed) {
                         return { status: 'refused' as const, reason: 'trial_used' as const };
                     }
+                    // Sponsor entry to this SAME trial: the account's first accepted campaign wins; a different one is refused, nothing written.
+                    if (input.sponsor && await ensureAttribution(tx as unknown as SqlRunner, input.sponsor) === 'other_campaign') {
+                        throw new SponsorRollback('sponsor_conflict');
+                    }
                     // A deleted account's never-started quote on this subject or email gives way; a started one never does.
                     await tx.delete(billingTrials).where(and(isNull(billingTrials.userId), isNull(billingTrials.stripeSubscriptionId),
                         inArray(billingTrials.status, [...UNBOUND_TRIAL_STATUSES]),
@@ -197,14 +205,19 @@ export function createBillingStore(db: Database): BillingStore {
                             checkoutSessionId: null, policyVersion: TRIAL_POLICY_VERSION, updatedAt: sql`now()` })
                             .where(and(eq(billingTrials.id, existing.id), isNull(billingTrials.stripeSubscriptionId))).returning();
                         if (!row) return { status: 'refused' as const, reason: 'trial_used' as const };
+                        // Freeze the campaign on this quote, or (a public re-quote) keep an existing linkage: it can never be stripped.
+                        if (input.sponsor) { if (await linkQuote(tx as unknown as SqlRunner, row.id, input.sponsor, input.quotedAt) === 'conflict') throw new SponsorRollback('sponsor_conflict'); }
+                        else await refreshLinkedQuote(tx as unknown as SqlRunner, row.id, input.quotedAt);
                         return { status: 'quoted' as const, trial: trialRow(row), supersededCheckoutSessionId: existing.checkoutSessionId };
                     }
                     const [row] = await tx.insert(billingTrials).values({ userId: input.userId, authSubject: input.authSubject,
                         emailNormalized: input.emailNormalized, sku: TRIAL_SKU, policyVersion: TRIAL_POLICY_VERSION, status: 'quoted',
                         quotedAt: input.quotedAt, trialEnd: input.trialEnd, returnOrigin: input.returnOrigin }).returning();
+                    if (input.sponsor && await linkQuote(tx as unknown as SqlRunner, row!.id, input.sponsor, input.quotedAt) === 'conflict') throw new SponsorRollback('sponsor_conflict');
                     return { status: 'quoted' as const, trial: trialRow(row!), supersededCheckoutSessionId: null };
                 });
             } catch (error) {
+                if (error instanceof SponsorRollback) return { status: 'refused', reason: 'sponsor_conflict' };
                 // Another account holds this person's email or subject: the unique constraint decides a concurrent race.
                 if (uniqueViolation(error)) return { status: 'refused', reason: 'trial_used' };
                 throw error;
@@ -221,13 +234,27 @@ export function createBillingStore(db: Database): BillingStore {
         },
 
         async bindTrialSubscription(input) {
-            const rows = await db.update(billingTrials).set({ stripeSubscriptionId: input.subscriptionId, trialStart: input.trialStart,
-                stripeCustomerId: input.customerId, status: sql`case when ${billingTrials.status} in ('quoted', 'checkout') then 'trialing' else ${billingTrials.status} end`,
-                updatedAt: sql`now()` }).where(and(eq(billingTrials.id, input.trialId), eq(billingTrials.userId, input.userId),
-                or(isNull(billingTrials.stripeSubscriptionId), eq(billingTrials.stripeSubscriptionId, input.subscriptionId)),
-                or(isNull(billingTrials.stripeCustomerId), eq(billingTrials.stripeCustomerId, input.customerId))))
-                .returning({ id: billingTrials.id });
-            if (rows.length > 0) {
+            // The binding and the sponsor linkage (claimed_at + subscription) are ONE transaction: both or neither. A mismatch between the persisted
+            // linkage and the Stripe metadata rolls the binding back, and the caller sends it to review.
+            let bound = false;
+            try {
+                bound = await db.transaction(async tx => {
+                    const rows = await tx.update(billingTrials).set({ stripeSubscriptionId: input.subscriptionId, trialStart: input.trialStart,
+                        stripeCustomerId: input.customerId, status: sql`case when ${billingTrials.status} in ('quoted', 'checkout') then 'trialing' else ${billingTrials.status} end`,
+                        updatedAt: sql`now()` }).where(and(eq(billingTrials.id, input.trialId), eq(billingTrials.userId, input.userId),
+                        or(isNull(billingTrials.stripeSubscriptionId), eq(billingTrials.stripeSubscriptionId, input.subscriptionId)),
+                        or(isNull(billingTrials.stripeCustomerId), eq(billingTrials.stripeCustomerId, input.customerId))))
+                        .returning({ id: billingTrials.id });
+                    if (rows.length === 0) return false;
+                    const linked = await claimLinkage(tx as unknown as SqlRunner, { trialId: input.trialId, subscriptionId: input.subscriptionId, now: input.trialStart, metadata: input.sponsor ?? null });
+                    if (linked === 'mismatch') throw new SponsorRollback('sponsor_mismatch');
+                    return true;
+                });
+            } catch (error) {
+                if (error instanceof SponsorRollback) return 'sponsor_mismatch';
+                throw error;
+            }
+            if (bound) {
                 await recordTrialIdentities(input.trialId);
                 return 'bound';
             }

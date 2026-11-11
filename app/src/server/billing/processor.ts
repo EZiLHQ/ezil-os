@@ -53,7 +53,7 @@ async function applyTrial(subscription: StripeSubscription, userId: string, even
         if (trial.stripeSubscriptionId === null) {
             if (seconds(trialEnd) !== seconds(trial.trialEnd)) return 'review:trial_terms_mismatch';
             const bound = await store.bindTrialSubscription({ trialId: trial.id, userId, customerId: subscription.customer,
-                subscriptionId: subscription.id, trialStart });
+                subscriptionId: subscription.id, trialStart, sponsor: subscription.sponsor ?? null });
             if (bound !== 'bound') return `review:trial_${bound}`;
         }
         // Review R4: each delivery keeps the started trial account's current verified identity.
@@ -233,7 +233,7 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                             const bound = trial && trial.userId === userId && (trial.stripeSubscriptionId === subscription.id
                                 || (trial.stripeSubscriptionId === null && subscription.trialStart && await store.bindTrialSubscription({
                                     trialId: trial.id, userId, customerId: subscription.customer, subscriptionId: subscription.id,
-                                    trialStart: subscription.trialStart }) === 'bound'));
+                                    trialStart: subscription.trialStart, sponsor: subscription.sponsor ?? null }) === 'bound'));
                             if (trial && bound) {
                                 await store.setTrialStatus({ trialId: trial.id, subscriptionId: subscription.id, status: 'converted',
                                     from: ['trialing', 'payment_failed', 'ended'] });

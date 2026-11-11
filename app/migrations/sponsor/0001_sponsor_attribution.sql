@@ -51,7 +51,7 @@ CREATE INDEX "ezil_sponsor_trial_claims_campaign_claimed_idx" ON "ezil_sponsor_t
 CREATE INDEX "ezil_sponsor_attributions_campaign_signup_idx" ON "ezil_sponsor_attributions" ("campaign_id", "signed_up_at") WHERE "signed_up_at" is not null;--> statement-breakpoint
 
 -- Immutability. Attribution: campaign, partner, config hash, accepted_at never change; signed_up_at may be set once (null -> value).
--- Trial linkage: while unclaimed only quoted_at may move (a re-quote of an unbound quote); once claimed nothing changes and nothing is deleted.
+-- Trial linkage: while unclaimed only quoted_at and the frozen config hash may move (a re-quote of an unbound quote); once claimed nothing changes and nothing is deleted.
 CREATE FUNCTION "public"."ezil_sponsor_attribution_guard"() RETURNS trigger LANGUAGE plpgsql SET search_path = '' AS $$
 BEGIN
 	IF TG_OP = 'DELETE' THEN RAISE EXCEPTION 'sponsor attribution is permanent' USING ERRCODE = '23000'; END IF;
@@ -71,7 +71,7 @@ BEGIN
 	END IF;
 	IF OLD.claimed_at IS NOT NULL THEN RAISE EXCEPTION 'a consumed sponsor trial claim is immutable' USING ERRCODE = '23000'; END IF;
 	IF NEW.trial_id IS DISTINCT FROM OLD.trial_id OR NEW.account_key IS DISTINCT FROM OLD.account_key OR NEW.campaign_id IS DISTINCT FROM OLD.campaign_id
-		OR NEW.partner_id IS DISTINCT FROM OLD.partner_id OR NEW.config_sha256 IS DISTINCT FROM OLD.config_sha256 THEN
+		OR NEW.partner_id IS DISTINCT FROM OLD.partner_id THEN
 		RAISE EXCEPTION 'a sponsor trial claim keeps its campaign and account' USING ERRCODE = '23000';
 	END IF;
 	RETURN NEW;

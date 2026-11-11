@@ -291,6 +291,8 @@ export interface StripeSubscription {
     trialEnd?: Date | null;
     /** `metadata.ezil_trial` written by our own trial checkout: the trial row id, never an owner. */
     trialId?: string | null;
+    /** `metadata.ezil_sponsor_*` written by our own sponsor trial checkout; compared with the persisted linkage at bind, never an authority. */
+    sponsor?: { campaignId: string; configSha256: string } | null;
     /** When the subscription ended (canceled / incomplete_expired); null while it lives. */
     endedAt?: Date | null;
 }
@@ -377,7 +379,7 @@ export interface CheckoutRequest {
      * Standard trial (0021): the server-quoted trial end (the first charge) and the trial row id. Set only by the
      * router after its eligibility check; the session then collects a payment method with no charge today.
      */
-    trial?: { trialId: string; trialEnd: Date; expiresAt: Date };
+    trial?: { trialId: string; trialEnd: Date; expiresAt: Date; sponsor?: { campaignId: string; configSha256: string } };
 }
 
 export interface CheckoutSessionCreated {

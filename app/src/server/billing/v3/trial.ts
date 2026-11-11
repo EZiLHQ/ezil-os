@@ -25,9 +25,14 @@ import { AI_CREDIT_POLICY_VERSION, CATALOG_V3 } from './contract';
 import type { AiCreditEntitlement } from '../ai-credits';
 
 export const TRIAL_POLICY_VERSION = 1 as const;
+/** What a sponsor quote freezes with the trial row (all server-derived: the registry's campaign, never the client). */
+export interface SponsorQuoteInput { accountKey: string; campaignId: string; partnerId: string; configSha256: string }
+export interface SponsorBindMetadata { campaignId: string; configSha256: string }
 export const TRIAL_SKU = 'standard_monthly_v3' as const;
 /** Checkout and subscription metadata key carrying the trial row id (never an owner: ownership is the customer map). */
 export const TRIAL_METADATA_KEY = 'ezil_trial' as const;
+export const SPONSOR_CAMPAIGN_METADATA_KEY = 'ezil_sponsor_campaign' as const;
+export const SPONSOR_CONFIG_METADATA_KEY = 'ezil_sponsor_config' as const;
 /** A quote older than this must be re-quoted before checkout, so the disclosed end stays close to one month. */
 export const TRIAL_QUOTE_TTL_SECONDS = 30 * 60;
 /** Immutable quote-based expiry: even the last fresh 30-minute quote leaves 90 minutes for Stripe (minimum 30 minutes). */
@@ -203,14 +208,18 @@ export interface TrialStore {
      * email or subject, refuses `trial_used` (the unique constraints decide a race). Returns the superseded open
      * checkout session, if any, so the caller can expire it.
      */
-    claimTrialQuote(input: { userId: string; authSubject: string; emailNormalized: string; quotedAt: Date; trialEnd: Date; returnOrigin: string }):
-        Promise<{ status: 'quoted'; trial: TrialRow; supersededCheckoutSessionId: string | null } | { status: 'refused'; reason: 'trial_used' }>;
+    claimTrialQuote(input: { userId: string; authSubject: string; emailNormalized: string; quotedAt: Date; trialEnd: Date; returnOrigin: string;
+        /** Sponsor entry to the SAME trial (v3/sponsor.ts has already authorized the campaign). Absent = the public trial, and any existing sponsor linkage is kept. */
+        sponsor?: SponsorQuoteInput }):
+        Promise<{ status: 'quoted'; trial: TrialRow; supersededCheckoutSessionId: string | null } | { status: 'refused'; reason: 'trial_used' | 'sponsor_conflict' }>;
     /** Record the checkout opened for exactly this quote (CAS on quoted_at); 'stale' when the quote changed or bound. */
     attachTrialCheckout(input: { trialId: string; userId: string; quotedAt: Date; checkoutSessionId: string; customerId: string }):
         Promise<'attached' | 'stale'>;
     /** Bind the trial to the one subscription that started it. 'conflict' when it is already bound elsewhere. */
-    bindTrialSubscription(input: { trialId: string; userId: string; customerId: string; subscriptionId: string; trialStart: Date }):
-        Promise<'bound' | 'conflict' | 'missing'>;
+    bindTrialSubscription(input: { trialId: string; userId: string; customerId: string; subscriptionId: string; trialStart: Date;
+        /** The server-written sponsor metadata read back from Stripe (null when it carried none). Compared with the persisted linkage in the same transaction. */
+        sponsor?: SponsorBindMetadata | null }):
+        Promise<'bound' | 'conflict' | 'missing' | 'sponsor_mismatch'>;
     setTrialStatus(input: { trialId: string; subscriptionId: string; status: TrialStatus; from: readonly TrialStatus[] }): Promise<void>;
     /** first_paid_at = coalesce(first_paid_at, at): set once, by the first positive paid period grant. */
     markSubscriptionPaid(subscriptionId: string, at: Date): Promise<void>;

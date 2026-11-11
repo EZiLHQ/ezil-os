@@ -7,7 +7,7 @@ import { billingOfferByLookupKey as offerByLookupKey, billingOfferBySku as offer
 import { readStripePacks, resetStripePackCachesForTests } from './packs';
 import { CATALOG_V3 } from '../v3/contract';
 import { CATALOG_V2 } from '../v2/contract';
-import { TRIAL_METADATA_KEY, TRIAL_POLICY_VERSION } from '../v3/trial';
+import { SPONSOR_CAMPAIGN_METADATA_KEY, SPONSOR_CONFIG_METADATA_KEY, TRIAL_METADATA_KEY, TRIAL_POLICY_VERSION } from '../v3/trial';
 
 const STRIPE_BASE_URL = 'https://api.stripe.com/v1';
 /** Pin the response schema independently of the Stripe account's default version. */
@@ -38,9 +38,11 @@ function cacheValue<T>(cache: Map<string, CacheEntry<T>>, key: string, value: T)
     cache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
 }
 
-function trialMetadata(trial: { trialId: string; trialEnd: Date }): Record<string, string> {
+function trialMetadata(trial: { trialId: string; trialEnd: Date; sponsor?: { campaignId: string; configSha256: string } }): Record<string, string> {
     return { [TRIAL_METADATA_KEY]: trial.trialId, ezil_trial_policy: String(TRIAL_POLICY_VERSION),
-        ezil_trial_end: String(Math.floor(trial.trialEnd.getTime() / 1000)) };
+        ezil_trial_end: String(Math.floor(trial.trialEnd.getTime() / 1000)),
+        // Server-owned, deterministic for the quote (so the idempotency key stays valid); read back at bind and compared with the persisted linkage.
+        ...(trial.sponsor ? { [SPONSOR_CAMPAIGN_METADATA_KEY]: trial.sponsor.campaignId, [SPONSOR_CONFIG_METADATA_KEY]: trial.sponsor.configSha256 } : {}) };
 }
 
 /**
@@ -48,7 +50,7 @@ function trialMetadata(trial: { trialId: string; trialEnd: Date }): Record<strin
  * parameters, which the signed lifecycle suite reuses because a headless run cannot complete Checkout): the quoted
  * end as `trial_end`, a missing payment method cancels at the end, and the trial row id in metadata.
  */
-export function trialSubscriptionData(sku: string, trial: { trialId: string; trialEnd: Date }) {
+export function trialSubscriptionData(sku: string, trial: { trialId: string; trialEnd: Date; sponsor?: { campaignId: string; configSha256: string } }) {
     return {
         metadata: { sku, ezil_catalog: sku.endsWith('_v3') ? 'v3' : 'v2', ...trialMetadata(trial) },
         trial_end: Math.floor(trial.trialEnd.getTime() / 1000),
@@ -677,6 +679,8 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
             const item = data.find(item => offer?.stripeLookupKey != null && item.price?.lookup_key === offer.stripeLookupKey) ?? data[0];
             const periodEnd = item?.current_period_end ?? subscription.current_period_end;
             const trialId = (subscription.metadata as Record<string, string | undefined> | null | undefined)?.[TRIAL_METADATA_KEY];
+            const sponsorMeta = subscription.metadata as Record<string, string | undefined> | null | undefined;
+            const sponsorCampaign = sponsorMeta?.[SPONSOR_CAMPAIGN_METADATA_KEY], sponsorConfig = sponsorMeta?.[SPONSOR_CONFIG_METADATA_KEY];
             // Round 6 (R4-04): a cancel scheduled as a date (`cancel_at`, e.g. the Dashboard's custom date) at or
             // before the period end ends the plan, so it is a cancel at period end (plan_ending), not a renewal.
             // A cancel_at earlier than the period end still shows the period end as the end date (no stored column;
@@ -698,6 +702,8 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
                 trialStart: date(subscription.trial_start),
                 trialEnd: date(subscription.trial_end),
                 trialId: typeof trialId === 'string' && /^[0-9a-f-]{36}$/.test(trialId) ? trialId : null,
+                ...(typeof sponsorCampaign === 'string' && typeof sponsorConfig === 'string' && /^[a-z0-9][a-z0-9_-]{2,63}$/.test(sponsorCampaign) && /^[0-9a-f]{64}$/.test(sponsorConfig)
+                    ? { sponsor: { campaignId: sponsorCampaign, configSha256: sponsorConfig } } : {}),
                 endedAt: date(subscription.ended_at),
             };
         },

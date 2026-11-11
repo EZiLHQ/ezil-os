@@ -4,39 +4,18 @@
  * Every statement below runs in its own transaction that is rolled back. Skipped without BILLING_TEST_DATABASE_URL.
  */
 import { randomUUID } from 'node:crypto';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
 import postgres from 'postgres';
+import { bootstrapSponsorFixture } from './sponsor-fixture';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 class Rollback extends Error {}
 const HASH = 'a'.repeat(64);
-const SQL_FILE = resolve(__dirname, '../../../../migrations/sponsor/0001_sponsor_attribution.sql');
 
 describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('sponsor attribution schema (separate, unjournaled)', () => {
     let client: ReturnType<typeof postgres>;
     beforeAll(async () => {
         client = postgres(process.env.BILLING_TEST_DATABASE_URL!, { max: 4, prepare: false, onnotice: () => undefined });
-        // Synthetic H compatibility fixture for a bare disposable Postgres (no Supabase image): Supabase's roles and auth.role()/auth.users, and the
-        // REAL `ezil_billing_trials` DDL taken verbatim from drizzle/0021 (the only table the sponsor file references). Skipped where it already exists.
-        const [trials] = await client`select to_regclass('public.ezil_billing_trials') as t`;
-        if (!trials?.t) {
-            const m0021 = readFileSync(resolve(__dirname, '../../../../drizzle/0021_standard_trial.sql'), 'utf8').match(/CREATE TABLE "ezil_billing_trials" \([\s\S]*?\n\);/);
-            if (!m0021) throw new Error('0021 ezil_billing_trials DDL not found');
-            await client.unsafe(`do $$ begin
-                if not exists (select 1 from pg_roles where rolname = 'anon') then create role anon nologin; end if;
-                if not exists (select 1 from pg_roles where rolname = 'authenticated') then create role authenticated nologin; end if; end $$;
-                create schema if not exists auth;
-                create table if not exists auth.users (id uuid primary key default gen_random_uuid());
-                create or replace function auth.role() returns text language sql stable as $f$ select current_setting('request.jwt.claim.role', true) $f$;
-                ${m0021[0]}
-                alter table public.ezil_billing_trials enable row level security;`);
-        }
-        const [present] = await client`select to_regclass('public.ezil_sponsor_attributions') as t`;
-        if (!present?.t) {   // the file carries its own BEGIN/COMMIT, so it runs on a single dedicated connection
-            const one = postgres(process.env.BILLING_TEST_DATABASE_URL!, { max: 1, prepare: false, onnotice: () => undefined });
-            try { await one.unsafe(readFileSync(SQL_FILE, 'utf8').replaceAll('--> statement-breakpoint', '')); } finally { await one.end(); }
-        }
+        await bootstrapSponsorFixture(process.env.BILLING_TEST_DATABASE_URL!);
     });
     afterAll(async () => { await client.end(); });
 
