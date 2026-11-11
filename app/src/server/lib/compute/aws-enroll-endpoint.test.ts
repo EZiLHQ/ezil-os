@@ -22,7 +22,7 @@ import {
 } from './aws-enroll';
 import { AWS_IDENTITY_CERTS_ENV } from './aws-identity';
 import { LIFECYCLE_DEPLOYMENTS_ENV } from './aws-intent';
-import { fixtureDeployment } from './aws-intent.test-support';
+import { fixtureDeployment, fixtureRebaseDeployments } from './aws-intent.test-support';
 import { applyLifecycleReceipt, lifecycleExecutionArn } from './aws-receipts';
 import fx from './aws-identity.fixtures.json';
 import { createFakePlacementDb, placementRow } from './fake-placement-db.test-support';
@@ -799,6 +799,23 @@ describe('an ambiguous Worker answer to the tunnel create keeps the enrollment r
 
 describe('authenticated lower-image observations', () => {
     const digest = 'sha256:' + 'a'.repeat(64);
+    const qualifiedDigest = 'sha256:' + 'b'.repeat(64);
+    const qualifiedEnv = () => env({ [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({ 'ap-south-1': {
+        ...fixtureRebaseDeployments().deployment, instanceTypes: TYPES,
+    } }) });
+    it('requires the actual host lower on a qualified deployment before consuming a nonce or creating a tunnel', async () => {
+        const s = setup([booting()], { e: qualifiedEnv() });
+        const before = structuredClone(s.placements);
+        expect(await s.enroll()).toMatchObject({ status: 403, body: { error: 'host_digest_mismatch' } });
+        expect(s.placements).toEqual(before);
+        expect(s.tunnels).toHaveLength(0);
+    });
+    it('records a matching qualified host lower in the ordinary enrollment nonce transaction', async () => {
+        const s = setup([booting()], { e: qualifiedEnv() });
+        expect((await s.enroll(hostBody({ lowerImageDigest: qualifiedDigest }))).status).toBe(200);
+        expect(s.placements[0]).toMatchObject({ lower_image_digest: qualifiedDigest, enroll_nonce_hash: null });
+        expect(new Date(s.placements[0]!.lower_digest_observed_at as string | Date).getTime()).toBe(NOW.getTime());
+    });
     it('backfills an ordinary host in the nonce transaction and rejects a different replay digest', async () => {
         const s = setup();
         expect((await s.enroll(hostBody({ lowerImageDigest: digest }))).status).toBe(200);
