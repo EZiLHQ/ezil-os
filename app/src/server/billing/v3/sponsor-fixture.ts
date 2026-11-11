@@ -10,7 +10,7 @@ import postgres from 'postgres';
 const APP = resolve(__dirname, '../../../..');
 export const SPONSOR_SQL_FILE = resolve(APP, 'migrations/sponsor/0001_sponsor_attribution.sql');
 
-export async function bootstrapSponsorFixture(url: string): Promise<void> {
+export async function bootstrapSponsorFixture(url: string, options: { applySponsor?: boolean } = {}): Promise<void> {
     const sql = postgres(url, { max: 1, prepare: false, onnotice: () => undefined });
     try {
         const [trials] = await sql`select to_regclass('public.ezil_billing_trials') as t`;
@@ -35,6 +35,6 @@ export async function bootstrapSponsorFixture(url: string): Promise<void> {
                 alter table public.ezil_billing_trial_identities add constraint ezil_billing_trial_identities_trial_id_fkey foreign key (trial_id) references public.ezil_billing_trials(id) on delete cascade;`);
         }
         const [present] = await sql`select to_regclass('public.ezil_sponsor_attributions') as t`;
-        if (!present?.t) await sql.unsafe(readFileSync(SPONSOR_SQL_FILE, 'utf8').replaceAll('--> statement-breakpoint', ''));
+        if (options.applySponsor !== false && !present?.t) await sql.unsafe(readFileSync(SPONSOR_SQL_FILE, 'utf8').replaceAll('--> statement-breakpoint', ''));
     } finally { await sql.end(); }
 }

@@ -21,8 +21,9 @@ import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/
 import { aiAccountSummaryV3, buildSummaryV3, computePlanV3, DISK_FALLBACK_GIB, type ReverseMoveSummaryInput } from '@/server/billing/v3/summary';
 import { deriveStanding, neverPaidTrial, operatorAccessFor } from '@/server/billing/v3/standing';
 import {
-    hasTrials, quoteFresh, TRIAL_CHECKOUT_TTL_SECONDS, TRIAL_SKU, trialEligibility, trialTerms, type TrialFacts, type TrialStore,
+    hasTrials, quoteFresh, TRIAL_CHECKOUT_TTL_SECONDS, TRIAL_SKU, trialEligibility, trialTerms, type SponsorQuoteInput, type TrialFacts, type TrialStore,
 } from '@/server/billing/v3/trial';
+import { authorizeSponsorQuote } from '@/server/billing/v3/sponsor';
 import { buildUsageV3 } from '@/server/billing/v3/usage';
 import type { BillingSummaryV3, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
 import {
@@ -139,8 +140,27 @@ async function trialEligibilityFor(store: TrialStore, deps: BillingDeps, userId:
     return { facts, decision: trialEligibility({ facts, planFamily, operatorPlan: operatorGrantInEffect(grants, deps.now()) !== null }) };
 }
 
+/**
+ * The sponsor entry this viewer may use right now, from SERVER facts only: the sponsor runtime is on, the account holds an attribution row (written by the
+ * authenticated sponsor handoff, never by a URL or client field), and that campaign is still in the signed registry, enabled and in its window. Runtime off
+ * = no store read at all (legacy/off issues no sponsor SQL); the store reads answer "none" when the schema is not applied (a probe, never a caught error).
+ */
+async function sponsorEntryFor(store: TrialStore, deps: BillingDeps, userId: string): Promise<{ input: SponsorQuoteInput } | null> {
+    const runtime = deps.sponsor;
+    if (!runtime?.enabled || !store.sponsorAttributionFor) return null;
+    const accountKey = runtime.accountKey(userId);
+    if (!accountKey) return null;
+    const attribution = await store.sponsorAttributionFor(accountKey);
+    if (!attribution) return null;
+    const decision = authorizeSponsorQuote({ enabled: true, registry: runtime.registry, campaignId: attribution.campaignId, configSha256: null, now: deps.now() });
+    return decision.ok ? { input: { accountKey, campaignId: decision.campaign.campaignId, partnerId: decision.campaign.partnerId, configSha256: decision.campaign.configSha256 } } : null;
+}
+/** The public trial gate (BILLING_PUBLIC_STANDARD_TRIAL, absent = on) is independent of a valid sponsor entry; neither one turns global checkout on or off. */
+const publicTrialOpen = (deps: BillingDeps): boolean => deps.sponsor?.publicTrial ?? true;
+
 async function trialOfferFor(deps: BillingDeps, userId: string, planFamily: string): Promise<BillingSummaryV3['trialOffer']> {
     if (!hasTrials(deps.store) || planFamily !== 'free') return undefined;
+    if (!publicTrialOpen(deps) && !await sponsorEntryFor(deps.store, deps, userId).catch(() => null)) return undefined;
     try {
         const { decision } = await trialEligibilityFor(deps.store, deps, userId, planFamily);
         if (!decision.eligible) return { eligible: false, reason: decision.reason };
@@ -644,11 +664,16 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const { plan } = await currentPlan(deps, ctx.user.id);
             const { facts, decision } = await trialEligibilityFor(store, deps, ctx.user.id, plan.family);
             if (!decision.eligible || facts.emailNormalized === null) throw trialError('trial_unavailable');
+            const sponsor = await sponsorEntryFor(store, deps, ctx.user.id);
+            if (!publicTrialOpen(deps) && !sponsor) throw trialError('trial_unavailable');
             if (facts.own?.status === 'checkout') await retireTrialCheckout(stripe, facts.own.checkoutSessionId);
             const terms = trialTerms(deps.now());
             const claim = await store.claimTrialQuote({ userId: ctx.user.id, authSubject: facts.authSubject,
                 emailNormalized: facts.emailNormalized, quotedAt: terms.quotedAt, trialEnd: terms.trialEnd,
-                returnOrigin: billingReturnOrigin(ctx.headers) });
+                returnOrigin: billingReturnOrigin(ctx.headers),
+                // A sponsor quote carries its campaign; a public quote asks the store to release an unclaimed linkage (the store probes the schema first, so an
+                // unapplied schema issues no sponsor SQL).
+                ...(sponsor ? { sponsor: sponsor.input } : { publicSponsorMode: 'release' as const }) });
             if (claim.status === 'refused') throw trialError('trial_unavailable');
             return { sku: TRIAL_SKU, todayCents: 0, trialEndsAt: isoSeconds(epochSeconds(claim.trial.trialEnd)),
                 firstChargeAt: isoSeconds(epochSeconds(claim.trial.trialEnd)), amountCents: terms.amountCents, currency: 'usd' as const,
@@ -668,12 +693,25 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             }
             // Standard trial: only the caller's own fresh stored quote, re-checked now, with the end they were shown.
             let trial: { row: NonNullable<TrialFacts['own']>; store: TrialStore } | null = null;
+            let sponsorTerms: { campaignId: string; configSha256: string } | null = null;
             if (input.trial) {
                 const store = deps.store;
                 if (input.sku !== TRIAL_SKU || !hasTrials(store)) throw trialError('trial_unavailable');
                 const { facts, decision } = await trialEligibilityFor(store, deps, ctx.user.id, plan.family);
                 if (!decision.eligible) throw trialError('trial_unavailable');
                 const row = facts.own;
+                // The PERSISTED linkage, never the client and never the runtime flag, classifies the quote: the lookup is readiness-safe (null when the schema is not
+                // applied, so a legacy public flow reads nothing). A linked quote may only continue as the SAME sponsor quote: runtime on, campaign enabled and in its
+                // window, same frozen config. Off, disabled, expired or a changed config REFUSES: it never silently becomes a public checkout (that would drop the
+                // metadata under the same Stripe idempotency key and bind unclaimed). The person starts over with an explicit public re-quote, which releases the
+                // unclaimed linkage atomically. An unlinked quote needs the public trial open.
+                const linkage = row && store.sponsorLinkageFor ? await store.sponsorLinkageFor(row.id) : null;
+                if (linkage) {
+                    const authorized = authorizeSponsorQuote({ enabled: deps.sponsor?.enabled === true, registry: deps.sponsor?.registry ?? new Map(), campaignId: linkage.campaignId,
+                        configSha256: linkage.configSha256, now: deps.now() });
+                    if (!authorized.ok) throw trialError(authorized.reason === 'config_changed' ? 'trial_quote_stale' : 'trial_unavailable');
+                    sponsorTerms = { campaignId: linkage.campaignId, configSha256: linkage.configSha256 };
+                } else if (!publicTrialOpen(deps)) throw trialError('trial_unavailable');
                 if (!row || !['quoted', 'checkout'].includes(row.status) || !quoteFresh(row, deps.now())
                     || epochSeconds(row.trialEnd) !== epochSeconds(input.trial.trialEndsAt)
                     // The quote must still claim the caller's CURRENT verified identity; a re-quote moves the claim.
@@ -712,7 +750,8 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                     : `checkout:${ctx.user.id}:${input.sku}:${crypto.randomUUID()}`,
                 ...(trial ? { trial: { trialId: trial.row.id, trialEnd: trial.row.trialEnd,
                     // Stripe idempotency compares every parameter: retries use the persisted quote's expiry too.
-                    expiresAt: new Date((epochSeconds(trial.row.quotedAt) + TRIAL_CHECKOUT_TTL_SECONDS) * 1000) } } : {}),
+                    expiresAt: new Date((epochSeconds(trial.row.quotedAt) + TRIAL_CHECKOUT_TTL_SECONDS) * 1000),
+                    ...(sponsorTerms ? { sponsor: sponsorTerms } : {}) } } : {}),
             }));
             if (trial) {
                 const attached = await trial.store.attachTrialCheckout({ trialId: trial.row.id, userId: ctx.user.id,

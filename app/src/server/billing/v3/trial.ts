@@ -210,16 +210,28 @@ export interface TrialStore {
      */
     claimTrialQuote(input: { userId: string; authSubject: string; emailNormalized: string; quotedAt: Date; trialEnd: Date; returnOrigin: string;
         /** Sponsor entry to the SAME trial (v3/sponsor.ts has already authorized the campaign). Absent = the public trial, and any existing sponsor linkage is kept. */
-        sponsor?: SponsorQuoteInput }):
-        Promise<{ status: 'quoted'; trial: TrialRow; supersededCheckoutSessionId: string | null } | { status: 'refused'; reason: 'trial_used' | 'sponsor_conflict' }>;
+        sponsor?: SponsorQuoteInput;
+        /**
+         * Set ONLY when the sponsor runtime is on and the request is a PUBLIC quote: 'keep' follows an existing unclaimed linkage to the new quote time,
+         * 'release' drops it (its campaign is no longer active). Absent = legacy/off: no sponsor SQL of any kind is issued.
+         */
+        publicSponsorMode?: 'keep' | 'release' }):
+        Promise<{ status: 'quoted'; trial: TrialRow; supersededCheckoutSessionId: string | null } | { status: 'refused'; reason: 'trial_used' | 'sponsor_conflict' | 'sponsor_unavailable' }>;
     /** Record the checkout opened for exactly this quote (CAS on quoted_at); 'stale' when the quote changed or bound. */
     attachTrialCheckout(input: { trialId: string; userId: string; quotedAt: Date; checkoutSessionId: string; customerId: string }):
         Promise<'attached' | 'stale'>;
     /** Bind the trial to the one subscription that started it. 'conflict' when it is already bound elsewhere. */
     bindTrialSubscription(input: { trialId: string; userId: string; customerId: string; subscriptionId: string; trialStart: Date;
-        /** The server-written sponsor metadata read back from Stripe (null when it carried none). Compared with the persisted linkage in the same transaction. */
+        /**
+         * `undefined` = the caller does no sponsor checking (legacy/off): no sponsor SQL. `null` = sponsor runtime on, Stripe carried no sponsor metadata.
+         * An object = the server-written Stripe metadata. Either defined value is compared with the persisted linkage in the same transaction.
+         */
         sponsor?: SponsorBindMetadata | null }):
         Promise<'bound' | 'conflict' | 'missing' | 'sponsor_mismatch'>;
+    /** The campaign this pseudonymous account was first attributed to (null: none). Absent or failing (schema not applied) means no sponsor. */
+    sponsorAttributionFor?(accountKey: string): Promise<{ campaignId: string } | null>;
+    /** The campaign and frozen config hash on this trial's quote (null: a public trial). */
+    sponsorLinkageFor?(trialId: string): Promise<{ campaignId: string; configSha256: string; claimed: boolean } | null>;
     setTrialStatus(input: { trialId: string; subscriptionId: string; status: TrialStatus; from: readonly TrialStatus[] }): Promise<void>;
     /** first_paid_at = coalesce(first_paid_at, at): set once, by the first positive paid period grant. */
     markSubscriptionPaid(subscriptionId: string, at: Date): Promise<void>;

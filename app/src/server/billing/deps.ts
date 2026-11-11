@@ -8,6 +8,7 @@ import { createBillingStore } from './store';
 import { createAiCreditOutboxStore } from './ai-credit-outbox-store';
 import { createStripeClient } from './stripe/client';
 import { createStripeUsageBilling } from './stripe/usage-billing';
+import { readSponsorRuntime } from './v3/sponsor-runtime';
 
 let warnedStripeDisabled = false;
 
@@ -38,6 +39,7 @@ export function getBillingDeps(): BillingDeps {
             ? createStripeClient({ secretKey, priceProMonthly: config.stripePriceProMonthly })
             : null,
         usage: secretKey ? createStripeUsageBilling({ secretKey }) : null,
+        sponsor: readSponsorRuntime(),
         now: () => new Date(),
     };
 }

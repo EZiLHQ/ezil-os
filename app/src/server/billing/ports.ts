@@ -531,5 +531,7 @@ export interface BillingDeps {
     /** Null unless `STRIPE_SECRET` is set. */
     stripe: StripeApi | null;
     usage: UsageBillingPort | null;
+    /** Sponsor trial runtime (disabled and absent by default; billing/v3/sponsor-runtime.ts). */
+    sponsor?: import('./v3/sponsor-runtime').SponsorRuntime;
     now: () => Date;
 }

@@ -89,14 +89,33 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('sponsor entry to the St
         expect((await client`select campaign_id from public.ezil_sponsor_attributions where account_key = ${keys.get(u)!}::uuid`)[0]!.campaign_id).toBe('test-campaign-a');
     });
 
-    it('a public re-quote never strips an existing sponsor linkage; it only follows the new quote time', async () => {
+    it('a public re-quote never strips an existing sponsor linkage: legacy mode leaves it untouched, keep mode follows the new quote time', async () => {
         const u = await account(`sp3.${run}@example.com`);
         await quote(u, `sp3.${run}@example.com`, { sponsor: sponsor(u) });
         const later = new Date(quotedAt.getTime() + 120_000);
+        // legacy/off (no mode) issues no sponsor SQL and leaves the linkage exactly as it was; 'keep' follows the new quote time
         expect((await quote(u, `sp3.${run}@example.com`, { at: later })).status).toBe('quoted');
+        expect(new Date((await linkOf((await trialOf(u)).id))!.quoted_at as string).getTime()).toBe(quotedAt.getTime());
+        expect((await store.claimTrialQuote({ userId: u, authSubject: `supabase:${u}`, emailNormalized: `sp3.${run}@example.com`, quotedAt: later, trialEnd,
+            returnOrigin: 'https://os-staging.ezil.work', publicSponsorMode: 'keep' })).status).toBe('quoted');
         const link = await linkOf((await trialOf(u)).id);
         expect(link).toMatchObject({ campaign_id: 'test-campaign-a', claimed_at: null });
         expect(new Date(link!.quoted_at as string).getTime()).toBe(later.getTime());
+    });
+
+    it('an explicit public re-quote with release drops the UNCLAIMED linkage atomically, keeps the attribution, and the trial then binds as a plain public trial', async () => {
+        const u = await account(`rel.${run}@example.com`);
+        const s = sponsor(u);
+        await quote(u, `rel.${run}@example.com`, { sponsor: s });
+        const trial = await trialOf(u);
+        expect(await linkOf(trial.id)).toBeDefined();
+        const later = new Date(quotedAt.getTime() + 180_000);
+        expect((await store.claimTrialQuote({ userId: u, authSubject: `supabase:${u}`, emailNormalized: `rel.${run}@example.com`, quotedAt: later, trialEnd,
+            returnOrigin: 'https://os-staging.ezil.work', publicSponsorMode: 'release' })).status).toBe('quoted');
+        expect(await linkOf(trial.id)).toBeUndefined();
+        expect((await client`select count(*)::int as n from public.ezil_sponsor_attributions where account_key = ${s.accountKey}::uuid`)[0]!.n).toBe(1);
+        expect(await bind(trial.id, u, `sub_rel${run}`, null)).toBe('bound');
+        expect((await client`select count(*)::int as n from public.ezil_sponsor_trial_claims where account_key = ${s.accountKey}::uuid and claimed_at is not null`)[0]!.n).toBe(0);
     });
 
     it('binding sets claimed_at and the subscription with the trial binding, once; a replay is idempotent; counts distinct claims', async () => {

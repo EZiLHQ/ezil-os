@@ -54,3 +54,39 @@ export async function claimLinkage(db: SqlRunner, input: { trialId: string; subs
         where trial_id = ${input.trialId}::uuid and claimed_at is null`);
     return 'claimed';
 }
+
+/**
+ * Is the sponsor schema applied (both tables, both guard functions)? `to_regclass`/`to_regprocedure` never raise, so this is safe OUTSIDE any
+ * transaction and never aborts one; a sponsor statement is only ever issued after it said yes. Cached briefly per runner so the hot path stays cheap.
+ */
+const READY_TTL_MS = 15_000;
+const readyCache = new WeakMap<object, { at: number; ready: boolean }>();
+export function resetSponsorSchemaReadiness(): void { /* WeakMap entries expire by TTL; tests use fresh runners */ }
+export async function sponsorSchemaReady(db: SqlRunner, now: () => number = Date.now): Promise<boolean> {
+    const hit = readyCache.get(db);
+    if (hit && now() - hit.at < READY_TTL_MS) return hit.ready;
+    const rows = [...await db.execute<{ ready: boolean }>(sql`select (to_regclass('public.ezil_sponsor_attributions') is not null
+        and to_regclass('public.ezil_sponsor_trial_claims') is not null
+        and to_regprocedure('public.ezil_sponsor_attribution_guard()') is not null
+        and to_regprocedure('public.ezil_sponsor_trial_claim_guard()') is not null) as ready`)];
+    const ready = rows[0]?.ready === true;
+    readyCache.set(db, { at: now(), ready });
+    return ready;
+}
+
+/** Reads: null when the schema is not applied (decided by the probe, never by catching an error). */
+export async function attributionFor(db: SqlRunner, accountKey: string): Promise<{ campaignId: string } | null> {
+    if (!await sponsorSchemaReady(db)) return null;
+    const rows = [...await db.execute<{ campaign_id: string }>(sql`select campaign_id from public.ezil_sponsor_attributions where account_key = ${accountKey}::uuid`)];
+    return rows[0] ? { campaignId: rows[0].campaign_id } : null;
+}
+export async function linkageFor(db: SqlRunner, trialId: string): Promise<{ campaignId: string; configSha256: string; claimed: boolean } | null> {
+    if (!await sponsorSchemaReady(db)) return null;
+    const rows = [...await db.execute<{ campaign_id: string; config_sha256: string; claimed_at: string | null }>(sql`
+        select campaign_id, config_sha256, claimed_at from public.ezil_sponsor_trial_claims where trial_id = ${trialId}::uuid`)];
+    return rows[0] ? { campaignId: rows[0].campaign_id, configSha256: rows[0].config_sha256, claimed: rows[0].claimed_at !== null } : null;
+}
+/** A public re-quote after the account's sponsor campaign ended: the UNCLAIMED linkage goes (the DB guard refuses a claimed one), the attribution stays. */
+export async function releaseUnclaimedLinkage(db: SqlRunner, trialId: string): Promise<void> {
+    await db.execute(sql`delete from public.ezil_sponsor_trial_claims where trial_id = ${trialId}::uuid and claimed_at is null`);
+}

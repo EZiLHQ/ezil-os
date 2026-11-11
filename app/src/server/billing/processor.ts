@@ -37,6 +37,14 @@ const seconds = (date: Date) => Math.floor(date.getTime() / 1000);
  * that OUR server quoted this trial to this account, with this end. Never a payment: the grant has its own kind and
  * source, and its AI root expires at the trial end. Statuses after the trial converge on the newest provider state.
  */
+/**
+ * Sponsor checking at bind, ALWAYS (validated even with the runtime off): the Stripe metadata (or null) is compared with the persisted linkage by the store,
+ * which probes the schema first, so a legacy 0021-only database issues no sponsor SQL and a linked trial can never bind unclaimed.
+ */
+function sponsorBind(subscription: StripeSubscription): { sponsor: { campaignId: string; configSha256: string } | null } {
+    return { sponsor: subscription.sponsor ?? null };
+}
+
 async function applyTrial(subscription: StripeSubscription, userId: string, event: StripeEventLike, deps: ProcessorDeps): Promise<string> {
     const { store } = deps;
     if (!subscription.trialId) return 'applied';
@@ -53,7 +61,7 @@ async function applyTrial(subscription: StripeSubscription, userId: string, even
         if (trial.stripeSubscriptionId === null) {
             if (seconds(trialEnd) !== seconds(trial.trialEnd)) return 'review:trial_terms_mismatch';
             const bound = await store.bindTrialSubscription({ trialId: trial.id, userId, customerId: subscription.customer,
-                subscriptionId: subscription.id, trialStart, sponsor: subscription.sponsor ?? null });
+                subscriptionId: subscription.id, trialStart, ...sponsorBind(subscription) });
             if (bound !== 'bound') return `review:trial_${bound}`;
         }
         // Review R4: each delivery keeps the started trial account's current verified identity.
@@ -233,7 +241,7 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps: 
                             const bound = trial && trial.userId === userId && (trial.stripeSubscriptionId === subscription.id
                                 || (trial.stripeSubscriptionId === null && subscription.trialStart && await store.bindTrialSubscription({
                                     trialId: trial.id, userId, customerId: subscription.customer, subscriptionId: subscription.id,
-                                    trialStart: subscription.trialStart, sponsor: subscription.sponsor ?? null }) === 'bound'));
+                                    trialStart: subscription.trialStart, ...sponsorBind(subscription) }) === 'bound'));
                             if (trial && bound) {
                                 await store.setTrialStatus({ trialId: trial.id, subscriptionId: subscription.id, status: 'converted',
                                     from: ['trialing', 'payment_failed', 'ended'] });
