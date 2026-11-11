@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, test, spyOn } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { gatewayChat, GATEWAY_COMPLETION_TIMEOUT_MS, GATEWAY_FIRST_BYTE_TIMEOUT_MS, GATEWAY_IDLE_TIMEOUT_MS } from '../src/gateway';
+import { gatewayChat, GATEWAY_COMPLETION_TIMEOUT_MS, GATEWAY_FIRST_BYTE_TIMEOUT_MS, GATEWAY_IDLE_TIMEOUT_MS, GATEWAY_STREAM_START_TIMEOUT_MS } from '../src/gateway';
 import { KIMI } from '../src/gateway-messages';
 import type { StreamEvent } from '../src/types';
 import { ask, gw } from './fixtures/gateway';
@@ -64,10 +64,22 @@ describe('bounded gateway waits', () => {
         } finally { await Promise.all(holders.map(g => g.return(undefined))); }
     }));
 
-    test('stalled headers time out at 30s, abort transport, and never retry', async () => fakeClock(async advance => {
+    for (const [headersAt, firstAt] of [[20_000, 65_000], [45_000, 45_000]] as const) test(`stream startup accepts its first byte at ${firstAt} with headers at ${headersAt}`, async () => fakeClock(async advance => {
+        let reply!: (response: Response) => void; let push!: () => void; let calls = 0;
+        let finished = false;
+        const result = drain((() => { calls++; return new Promise<Response>(resolve => { reply = resolve; }); }) as unknown as typeof fetch).catch(error => error).finally(() => { finished = true; });
+        await advance(headersAt);
+        expect(finished).toBe(false);
+        reply(new Response(new ReadableStream({ start(c) { push = () => { c.enqueue(new TextEncoder().encode(frames().join(''))); c.close(); }; } }), { headers: { 'content-type': 'text/event-stream' } }));
+        await advance(firstAt - headersAt);
+        expect(finished).toBe(false); push(); await advance(0);
+        expect(await result).toBeUndefined(); expect(calls).toBe(1);
+    }));
+
+    test('stalled headers time out at 200s, abort transport, and never retry', async () => fakeClock(async advance => {
         let calls = 0; let signal: AbortSignal | undefined;
         const result = drain((async (_url, init) => { calls++; signal = init?.signal ?? undefined; return new Promise<Response>(() => {}); }) as typeof fetch).catch(error => error);
-        await advance(GATEWAY_FIRST_BYTE_TIMEOUT_MS - 1);
+        await advance(GATEWAY_STREAM_START_TIMEOUT_MS - 1);
         expect(signal?.aborted).toBe(false);
         await advance(1);
         expect((await result).code).toBe('first_byte_timeout');
@@ -79,7 +91,7 @@ describe('bounded gateway waits', () => {
         const result = drain((() => new Promise<Response>(resolve => { reply = resolve; })) as unknown as typeof fetch).catch(error => error);
         await advance(20_000);
         reply(new Response(new ReadableStream({ cancel() { cancelled = true; } }), { status, headers: { 'content-type': 'text/event-stream' } }));
-        await advance(10_000);
+        await advance(GATEWAY_STREAM_START_TIMEOUT_MS - 20_000);
         expect((await result).code).toBe('first_byte_timeout'); expect(cancelled).toBe(true);
     }));
     for (const stream of [true, false]) test(`${stream ? 'SSE' : 'JSON'} body idle timeout cancels after partial output`, async () => fakeClock(async advance => {
@@ -105,6 +117,19 @@ describe('bounded gateway waits', () => {
         await advance(GATEWAY_IDLE_TIMEOUT_MS);
         expect((await result).code).toBe('stream_idle_timeout');
     }));
+    test('stream startup headers and first body byte cannot each spend 200s', async () => fakeClock(async advance => {
+        let reply!: (response: Response) => void; let cancelled = false; let finished = false;
+        const result = drain((() => new Promise<Response>(resolve => { reply = resolve; })) as unknown as typeof fetch).catch(error => error).finally(() => { finished = true; });
+        await advance(150_000); expect(finished).toBe(false);
+        reply(new Response(new ReadableStream({ cancel() { cancelled = true; } }), { headers: { 'content-type': 'text/event-stream' } }));
+        await advance(49_999); expect(finished).toBe(false);
+        await advance(1); expect((await result).code).toBe('first_byte_timeout'); expect(cancelled).toBe(true);
+    }));
+    test('a stream transport failure after 30s is not resent', async () => fakeClock(async advance => {
+        let calls = 0;
+        const result = drain((async () => { calls++; await new Promise(resolve => setTimeout(resolve, 45_000)); throw new TypeError('socket reset'); }) as unknown as typeof fetch).catch(error => error);
+        await advance(45_000); expect((await result).code).toBe('connection_lost'); expect(calls).toBe(1);
+    }));
     test('caller cancellation interrupts a stalled read and clears timers', async () => fakeClock(async advance => {
         const abort = new AbortController();
         let cancelled = false;
@@ -129,6 +154,8 @@ describe('non-stream completion deadline (paired with the OS proxy)', () => {
         expect(GATEWAY_COMPLETION_TIMEOUT_MS).toBe(200_000);
         expect(GATEWAY_COMPLETION_TIMEOUT_MS - 180_000).toBeGreaterThanOrEqual(20_000);
         expect(GATEWAY_FIRST_BYTE_TIMEOUT_MS).toBe(30_000);
+        const streamValue = /export const AI_PROXY_STREAM_START_TIMEOUT_MS = ([\d_]+);/.exec(proxy)?.[1];
+        expect(Number(streamValue?.replaceAll('_', ''))).toBe(GATEWAY_STREAM_START_TIMEOUT_MS);
     });
     test('a Kimi JSON reply arriving at 45 s succeeds, once', async () => fakeClock(async advance => {
         let reply!: (response: Response) => void; let calls = 0;
@@ -276,21 +303,21 @@ describe('non-stream completion deadline (paired with the OS proxy)', () => {
             const error = result();
             expect([error.code, at]).toEqual(['completion_timeout', 11_000 + GATEWAY_COMPLETION_TIMEOUT_MS]); expect(s.posts).toHaveLength(3);
         }));
-        test('streams keep a fresh 30 s first-byte deadline per attempt', async () => fakeClock(async (advance, now) => {
+        test('streams share one 200 s first-byte deadline across an early resend', async () => fakeClock(async (advance, now) => {
             let at = -1;
             const s = failingThen(20_000, now, () => new Promise<Response>(() => {}));
             const result = track(collect(gw(), s.fetch, [], turn.signal).catch(error => { at = now(); return error; }));
-            await advance(20_000 + GATEWAY_FIRST_BYTE_TIMEOUT_MS);
+            await advance(GATEWAY_STREAM_START_TIMEOUT_MS);
             const error = result();
-            expect([error.code, at]).toEqual(['first_byte_timeout', 20_000 + GATEWAY_FIRST_BYTE_TIMEOUT_MS]); expect(s.posts).toHaveLength(2);
+            expect([error.code, at]).toEqual(['first_byte_timeout', GATEWAY_STREAM_START_TIMEOUT_MS]); expect(s.posts).toHaveLength(2);
         }));
     });
-    test('streaming still fails at 30 s without a first byte', async () => fakeClock(async advance => {
+    test('streaming fails at 200 s without a first byte', async () => fakeClock(async advance => {
         let calls = 0;
         const result = collect(gw(), (async () => { calls++; return new Promise<Response>(() => {}); }) as unknown as typeof fetch).catch(error => error);
-        await advance(GATEWAY_FIRST_BYTE_TIMEOUT_MS);
+        await advance(GATEWAY_STREAM_START_TIMEOUT_MS);
         const error = await result;
-        expect([error.code, error.origin, error.message]).toEqual(['first_byte_timeout', 'transport', 'EZiL AI: did not answer within 30 seconds. Retry the request']);
+        expect([error.code, error.origin]).toEqual(['first_byte_timeout', 'transport']); expect(error.message).toContain('200 seconds'); expect(error.message).toContain('may still be charged');
         expect(calls).toBe(1);
     }));
 });

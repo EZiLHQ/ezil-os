@@ -15,6 +15,7 @@ import {
   AI_MODEL_ACCESS_MAX_AGE_MS,
   AI_PROXY_COMPLETION_TIMEOUT_MS,
   AI_PROXY_HEADERS_TIMEOUT_MS,
+  AI_PROXY_STREAM_START_TIMEOUT_MS,
   handleAiProxyRequest,
   isAiProxyPath,
   isNonStreamBody,
@@ -1010,7 +1011,7 @@ describe('non-stream completion deadline', () => {
       for (const timer of timers.filter(t => t.at <= now).sort((a, b) => a.at - b.at)) { timer.at = Infinity; timer.run(); }
       for (let i = 0; i < 20; i++) await Promise.resolve();
     };
-    return { timers, advance, restore: () => { spy.mockRestore(); clear.mockRestore(); } };
+    return { timers, advance, now: () => now, restore: () => { spy.mockRestore(); clear.mockRestore(); } };
   }
   function stalledGateway() {
     let reply!: (response: Response) => void;
@@ -1075,7 +1076,7 @@ describe('non-stream completion deadline', () => {
       expect(JSON.stringify(d.logs)).not.toContain('us.moonshotai');
     } finally { clock.restore(); }
   });
-  for (const [label, body] of [['stream:true', JSON.stringify({ model: 'qwen', stream: true })], ['absent stream', '{"model":"x"}'], ['unparsable', 'not json']] as const) {
+  for (const [label, body] of [['absent stream', '{"model":"x"}'], ['unparsable', 'not json']] as const) {
     it(`a ${label} body keeps the 30 s headers deadline (504 os_ai_unavailable)`, async () => {
       const stalled = stalledGateway();
       const d = await deps({ fetch: stalled.gw.fetch });
@@ -1113,6 +1114,93 @@ describe('non-stream completion deadline', () => {
       expect(d.logs.at(-1)).toMatchObject({ status: 504, code: 'os_ai_unavailable', detail: 'client_disconnected' });
       expect(JSON.stringify(d.logs)).not.toContain('us.moonshotai');
     } finally { clock.restore(); }
+  });
+  for (const [headersAt, firstAt] of [[20_000, 65_000], [45_000, 45_000]] as const) it(`stream startup accepts first bytes at ${firstAt} with headers at ${headersAt}`, async () => {
+    const stalled = stalledGateway(); const clock = fakeTimers();
+    const d = await deps({ fetch: stalled.gw.fetch, transportNow: clock.now });
+    const request = await post('/ai/v1/messages', JSON.stringify({ model: 'gemini-4-carbon', stream: true }));
+    try {
+      const result = handleAiProxyRequest(request, d); await stalled.entered;
+      await clock.advance(headersAt);
+      let push!: () => void;
+      stalled.reply(new Response(new ReadableStream({ start(c) { push = () => { c.enqueue(new TextEncoder().encode(': ready\n\n')); c.close(); }; } }), { headers: { 'content-type': 'text/event-stream' } }));
+      const response = await result; expect(response.status).toBe(200);
+      let finished = false;
+      const text = response.text().catch(error => error).finally(() => { finished = true; });
+      await clock.advance(firstAt - headersAt); expect(finished).toBe(false);
+      push(); await clock.advance(0); expect(await text).toBe(': ready\n\n'); expect(stalled.attempts()).toBe(1);
+    } finally { clock.restore(); }
+  });
+
+  it('stream startup uses one combined 200s budget for headers and first body byte', async () => {
+    const stalled = stalledGateway(); const clock = fakeTimers();
+    const d = await deps({ fetch: stalled.gw.fetch, transportNow: clock.now });
+    const request = await post('/ai/v1/responses', JSON.stringify({ model: 'x', stream: true }));
+    let cancelled = false;
+    try {
+      const result = handleAiProxyRequest(request, d); await stalled.entered;
+      await clock.advance(150_000);
+      stalled.reply(new Response(new ReadableStream({ cancel() { cancelled = true; } }), { headers: { 'content-type': 'text/event-stream' } }));
+      const response = await result; expect(response.status).toBe(200);
+      let finished = false; const read = response.text().catch(error => error).finally(() => { finished = true; });
+      await clock.advance(49_999); expect(finished).toBe(false);
+      await clock.advance(1); expect(await read).toBeInstanceOf(Error); expect(cancelled).toBe(true);
+      expect(d.logs.at(-1)?.outcome).toBe('first_byte_timeout'); expect(stalled.attempts()).toBe(1);
+    } finally { clock.restore(); }
+  });
+  it('stream startup headers alone expire at 200s, with no retry', async () => {
+    const stalled = stalledGateway(); const clock = fakeTimers();
+    const d = await deps({ fetch: stalled.gw.fetch, transportNow: clock.now });
+    const request = await post('/ai/v1/messages', JSON.stringify({ model: 'x', stream: true }));
+    try {
+      const result = handleAiProxyRequest(request, d); await stalled.entered;
+      await clock.advance(AI_PROXY_STREAM_START_TIMEOUT_MS - 1); expect(stalled.attempts()).toBe(1);
+      await clock.advance(1); expect((await result).status).toBe(504); expect(stalled.attempts()).toBe(1);
+    } finally { clock.restore(); }
+  });
+  it('stream startup switches to the unchanged 30s idle limit after its first byte', async () => {
+    const stalled = stalledGateway(); const clock = fakeTimers();
+    const d = await deps({ fetch: stalled.gw.fetch, transportNow: clock.now });
+    const request = await post('/ai/v1/messages', JSON.stringify({ model: 'x', stream: true }));
+    let push!: () => void; let cancelled = false;
+    try {
+      const result = handleAiProxyRequest(request, d); await stalled.entered;
+      stalled.reply(new Response(new ReadableStream({ start(c) { push = () => c.enqueue(new TextEncoder().encode(': ready\n\n')); }, cancel() { cancelled = true; } }), { headers: { 'content-type': 'text/event-stream' } }));
+      const response = await result; const reader = response.body!.getReader();
+      const first = reader.read(); await clock.advance(45_000); push(); await first;
+      let finished = false; const second = reader.read().catch(error => error).finally(() => { finished = true; });
+      await clock.advance(0);
+      await clock.advance(29_999); expect(finished).toBe(false);
+      await clock.advance(1); expect(await second).toBeInstanceOf(Error); expect(cancelled).toBe(true);
+      expect(d.logs.at(-1)?.outcome).toBe('idle_timeout'); expect(stalled.attempts()).toBe(1);
+    } finally { clock.restore(); }
+  });
+  it('caller cancellation does not wait for the extended streaming header deadline', async () => {
+    const stalled = stalledGateway(); const clock = fakeTimers(); const client = new AbortController();
+    const d = await deps({ fetch: stalled.gw.fetch, transportNow: clock.now });
+    const request = new Request(await post('/ai/v1/messages', JSON.stringify({ model: 'x', stream: true })), { signal: client.signal });
+    try {
+      const result = handleAiProxyRequest(request, d); await stalled.entered;
+      await clock.advance(5_000); client.abort();
+      expect((await result).status).toBe(504); expect(stalled.attempts()).toBe(1);
+      expect(d.logs.at(-1)?.detail).toBe('client_disconnected');
+    } finally { clock.restore(); }
+  });
+  it('stream startup absolute bound uses a transport clock independent of a frozen auth/log clock', async () => {
+    const stalled = stalledGateway(); const clock = fakeTimers();
+    const d = await deps({ fetch: stalled.gw.fetch, now: () => 0, transportNow: clock.now });
+    const request = await post('/ai/v1/messages', JSON.stringify({ model: 'x', stream: true }));
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      const result = handleAiProxyRequest(request, d); await stalled.entered;
+      await clock.advance(150_000);
+      stalled.reply(new Response(new ReadableStream(), { headers: { 'content-type': 'text/event-stream' } }));
+      const response = await result; reader = response.body!.getReader();
+      let finished = false; const read = reader.read().catch(error => error).finally(() => { finished = true; });
+      await clock.advance(49_999); expect(finished).toBe(false);
+      await clock.advance(1); expect(finished).toBe(true); expect(await read).toBeInstanceOf(Error);
+      expect(stalled.attempts()).toBe(1);
+    } finally { await reader?.cancel().catch(() => undefined); clock.restore(); }
   });
   it('Responses JSON uses the same deadline; overrides are injectable', async () => {
     const stalled = stalledGateway();
