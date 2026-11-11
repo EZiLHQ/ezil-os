@@ -343,6 +343,7 @@ PORTABLE_SUITES=(
     "shell/ezil/apps/mobile-browser-test.mjs"
     "shell/ezil/ui/Settings/stacking-browser-test.mjs"
     "shell/ezil/ui/Settings/provider-modal-browser-test.mjs"
+    "shell/ezil/ui/Settings/provider-3ds-browser-test.mjs"
     "shell/ezil/ui/Settings/late-focus-browser-test.mjs"
     "shell/ezil/ui/opening-progress-browser-test.mjs"
     "shell/ezil/ui/Settings/appearance-browser-test.mjs"
@@ -350,6 +351,7 @@ PORTABLE_SUITES=(
     "shell/ezil/ui/Settings/billing-trial-browser-test.mjs"
     "shell/ezil/ui/Settings/credits-real-shape-browser-test.mjs"
     "shell/ezil/ui/feedback-browser-test.mjs"
+    "shell/ezil/ui/feedback/capture-browser-test.mjs"
 )
 
 # suite_family <relpath> -> "portable", "geometry", or "" (unclassified)

@@ -301,7 +301,21 @@ await test('tier C resolves null when bridge never responds (controlled 4000ms t
     } finally { globalThis.setTimeout = originalSet; globalThis.clearTimeout = originalClear; }
 });
 
-await test('shell snapshot filters every iframe/private subtree and feedback UI, then paints opaque placeholders', async () => {
+/** snapdom 3.3.4's clone shape: mapped clone → source, a filtered node becomes an unmapped invisible box. */
+function fake_clone (source, filter, nodeMap) {
+    if (source.nodeType !== 1) return source.cloneNode(false);
+    if (!filter(source)) {
+        const placeholder = document.createElement('div');
+        placeholder.style.cssText = 'display: block; box-sizing: border-box; width: 200px; height: 30px; visibility: hidden;';
+        return placeholder;
+    }
+    const clone = source.cloneNode(false);
+    nodeMap.set(clone, source);
+    for (const child of source.childNodes) clone.appendChild(fake_clone(child, filter, nodeMap));
+    return clone;
+}
+
+await test('shell snapshot masks frames and private fields at their own layer in the clone, never over the finished image', async () => {
     const root = document.getElementById('ezil-os-root');
     // Puter appends windows to <body>, outside #ezil-os-root: the snapshot must
     // cover them (a body-level window's stream iframe is masked too).
@@ -321,17 +335,45 @@ await test('shell snapshot filters every iframe/private subtree and feedback UI,
             assert.equal(options.filter(el), false);
         }
         assert.equal(options.filter(document.createElement('span')), true);
+        const nodeMap = new Map();
+        clone = fake_clone(element, options.filter, nodeMap);
+        for (const plugin of options.plugins) await plugin.afterClone?.({ clone, nodeMap, element });
         return { toCanvas: async () => canvas(window.innerWidth, window.innerHeight) };
     };
-    const result = await capture_shell_snapshot();
+    let clone;
+    const info = {};
+    const result = await capture_shell_snapshot({ info });
+    // 🔴 Nothing is painted over the finished image: that hid shell overlays stacked above a frame.
     const calls = result.getContext('2d').calls;
-    assert.equal(calls.filter(c => c.op === 'fillRect' && c.style === '#808080').length, 3);
-    assert.equal(calls.filter(c => c.op === 'fillRect' && c.style === '#000000').length, 4);
-    assert.equal(calls.filter(c => c.op === 'fillText' && c.args[0] === 'Desktop stream not captured').length, 3);
+    assert.equal(calls.filter(c => c.op === 'fillRect' || c.op === 'fillText').length, 0);
+    const masks = [...clone.querySelectorAll('[data-ezil-capture-mask]')];
+    assert.equal(masks.filter(m => m.dataset.ezilCaptureMask === 'frame' && m.textContent === 'Desktop stream not captured').length, 3);
+    assert.equal(masks.filter(m => m.dataset.ezilCaptureMask === 'private' && m.textContent === '').length, 4);
+    // Each mask fills an invisible placeholder in place of its node; no frame, field or text is cloned.
+    assert.ok(masks.every(m => m.parentElement.style.visibility === 'hidden' && m.style.visibility === 'visible'));
+    assert.equal(clone.querySelector('iframe, input, textarea, [contenteditable], [data-ezil-private]'), null);
+    assert.doesNotMatch(clone.innerHTML, /private text|secret/);
+    assert.ok(info.frameCoverage > 0, 'frame coverage is reported');
     win.remove();
     assert.equal(root.querySelector('[contenteditable]').textContent, 'private text');
     snapshotDom = async () => { throw new Error('snapshot unavailable'); };
     assert.equal(await capture_shell_snapshot(), null);
+    root.replaceChildren();
+});
+
+await test('a private field the clone pass could not place is still covered on the image; an unplaced frame is not overpainted', async () => {
+    const root = document.getElementById('ezil-os-root');
+    root.innerHTML = '<iframe></iframe><input>';
+    for (const el of root.children) el.getBoundingClientRect = () => ({ left: 10, top: 20, right: 210, bottom: 50, width: 200, height: 30 });
+    snapshotDom = async (element, options) => {
+        for (const el of root.children) assert.equal(options.filter(el), false);
+        // No node map (a future snapdom): no mask can be placed in the clone.
+        for (const plugin of options.plugins) await plugin.afterClone?.({ clone: element.cloneNode(false) });
+        return { toCanvas: async () => canvas(window.innerWidth, window.innerHeight) };
+    };
+    const calls = (await capture_shell_snapshot()).getContext('2d').calls;
+    assert.equal(calls.filter(c => c.op === 'fillRect' && c.style === '#000000').length, 1, 'the private field');
+    assert.equal(calls.filter(c => c.op === 'fillRect' && c.style === '#808080').length, 0, 'never a frame-sized overpaint');
     root.replaceChildren();
 });
 

@@ -190,7 +190,27 @@ describe('admin SQL scope and projection', () => {
         expect(await queries.findScreenshot(id)).toBeNull();
         expect(statements[0]!.sql).not.toMatch(/\bbytes\b|SELECT\s+\*/i);
         expect(statements[1]!.sql).toMatch(/SELECT bytes, content_type/);
-        for (const statement of statements) expect(statement.params).toEqual([id]);
+        expect(statements[0]!.params).toEqual([id]);
+        // The first image by default; several images per report are read in send order, one by position.
+        expect(statements[1]!.params).toEqual([id, 0]);
+        expect(statements[1]!.sql).toMatch(/ORDER BY created_at, sha256 OFFSET \$2 LIMIT 1/);
+        await queries.findScreenshot(id, 3);
+        expect(statements[2]!.params).toEqual([id, 3]);
+    });
+
+    it('screenshot n selects the image by position and rejects anything but a small index', async () => {
+        const d = deps();
+        const at = (n: string) => new Request(`https://example.test/api/admin/feedback/screenshot?id=${id}&n=${n}`);
+        expect((await handleFeedbackScreenshot(at('2'), d)).status).toBe(200);
+        expect(d.findScreenshot).toHaveBeenLastCalledWith(id, 2);
+        expect((await handleFeedbackScreenshot(request(), d)).status).toBe(200);
+        expect(d.findScreenshot).toHaveBeenLastCalledWith(id, 0);
+        d.findScreenshot.mockClear(); d.recordAccess.mockClear();
+        for (const bad of ['-1', '5', '10', '1.5', 'x', '', '01']) {
+            expect((await handleFeedbackScreenshot(at(bad), d)).status).toBe(404);
+        }
+        expect(d.findScreenshot).not.toHaveBeenCalled();
+        expect(d.recordAccess).not.toHaveBeenCalled();
     });
 
     it('deletes attachments before reports in one dependent statement, retaining audit history', async () => {

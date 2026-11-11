@@ -69,12 +69,20 @@ export async function encode_under_limit (canvas, limit, { signal } = {}) {
     return null;
 }
 
+/** "1.5 MiB", "820 KiB": the size wording the feedback form also uses. */
+export function format_bytes (bytes) {
+    return bytes >= 1024 * 1024 ? `${Math.round(bytes / (1024 * 1024) * 100) / 100} MiB` : `${Math.max(1, Math.round(bytes / 1024))} KiB`;
+}
+
 /**
  * @param {HTMLCanvasElement} _canvas
+ * @param {{ signal?: AbortSignal, limit?: number }} [options] `limit` (bytes) lowers the per-image cap,
+ *   e.g. to what is left of a report's total; it never raises it above IMAGE_BYTES_MAX.
  * @returns {Promise<{blob: Blob, contentType: string, width: number, height: number} | null>}
  */
-export async function open_redact_editor (_canvas, { signal } = {}) {
+export async function open_redact_editor (_canvas, { signal, limit } = {}) {
     if (signal?.aborted) return null;
+    const byteLimit = Number.isFinite(limit) && limit > 0 ? Math.min(Math.floor(limit), IMAGE_BYTES_MAX) : IMAGE_BYTES_MAX;
     let source;
     try { source = flatten(_canvas); } catch { return null; }
     const doc = source.ownerDocument;
@@ -334,10 +342,10 @@ export async function open_redact_editor (_canvas, { signal } = {}) {
                         ctx.drawImage(output, 0, 0, scaled.width, scaled.height);
                         output = scaled;
                     }
-                    const blob = await encode_under_limit(output, IMAGE_BYTES_MAX, { signal: encodingController.signal });
+                    const blob = await encode_under_limit(output, byteLimit, { signal: encodingController.signal });
                     if (settled) return;
                     if (blob) { finish({ blob, contentType: blob.type, width: output.width, height: output.height }); return; }
-                    status.textContent = 'Could not prepare an image under 1.5 MiB. Try a smaller crop.';
+                    status.textContent = `Could not prepare an image under ${format_bytes(byteLimit)}. Try a smaller crop.`;
                 } catch {
                     if (settled) return;
                     status.textContent = 'Could not prepare this screenshot. Try again or cancel.';

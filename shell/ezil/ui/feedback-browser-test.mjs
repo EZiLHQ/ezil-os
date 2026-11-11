@@ -67,7 +67,8 @@ const boot = { user: { id: ACCOUNT, email: 'fixture@example.test' },
     computer: { id: COMPUTER, name: 'Computer', slot: 1, createdAt: '2026-07-31T00:00:00.000Z', lastOpenedAt: null, isNew: false },
     apps: [{ id: 'desktop', name: 'Browser', icon: 'desktop', kind: 'desktop' }],
     desktopState: { provider: 'cloudflare-guacamole', configured: true, hasHmacSecret: true, status: 'idle',
-        endpoints: ENDPOINTS, ui: { floatingControls: false, feedbackScreenshots: false, feedbackReportBundle: true } } };
+        // feedbackScreenshotsMax: the several-images mode staging advertises (app boot-payload.ts).
+        endpoints: ENDPOINTS, ui: { floatingControls: false, feedbackScreenshots: false, feedbackScreenshotsMax: 5, feedbackReportBundle: true } } };
 const page_html = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>${css}</style></head><body><div id="ezil-os-root"><div id="ezil-os-root-inner"></div></div></body></html>`;
 // The streamed desktop: reports decoded frames so the window goes full-bleed.
@@ -249,7 +250,7 @@ try {
 
         for ( const [code, copy] of [
             [429, "You've sent several reports this hour — try again later."],
-            [413, 'This report is too large. Remove the screenshot and try again.'],
+            [413, 'This report is too large. Remove a screenshot and try again.'],
             [415, 'This page could not send the report. Reload EZiL OS and try again.'],
         ] ) await check(`${tag}: ${code} keeps the text, says so and is not retried`, async () => {
             reply = () => ({ status: code, body: { error: 'x' } });
@@ -313,6 +314,10 @@ try {
             assert.equal(await page.locator('input[name="screenshot"]').isChecked(), true, 'the screenshot is selected by default');
             assert.equal(await page.locator('input[name="diagnostics"]').isChecked(), true, 'diagnostics are selected by default');
             await page.locator('input[name="diagnostics"]').uncheck();
+            // Isolate the one file: remove the default window snapshot first (several images may be attached).
+            await page.locator('.ezil-feedback-image').waitFor({ state: 'visible', timeout: 20_000 });
+            await page.locator('[data-action="remove-screenshot"]').click();
+            await page.locator('.ezil-feedback-image').waitFor({ state: 'hidden' });
             await page.locator('.ezil-feedback-capture-options summary').click();
             const encoded = await page.evaluate(() => {
                 const c = document.createElement('canvas'); c.width = 120; c.height = 80;
@@ -373,7 +378,10 @@ try {
             assert.equal(posts.length, 0, 'nothing uploads until Send');
             assert.equal(await page.evaluate(() => window.__pickerCalls), 0, 'no permission prompt or picker');
             assert.equal(await page.locator('input[name="screenshot"]').isChecked(), true);
-            assert.equal(await page.locator('[data-role="capture-note"]').textContent(), '', 'no failure note: the capture worked');
+            // The full-bleed Browser's page is an embedded frame filling the window: the snapshot is still attached
+            // (shell overlays above the frame survive) with the one note that offers a real capture.
+            assert.match(await page.locator('[data-role="capture-note"]').textContent(), /^To include the open app, /,
+                'the capture worked; one note offers a real capture (the scope line below states the limit)');
             if ( coarse ) assert.equal(await page.evaluate(() => !! document.activeElement?.matches('input, textarea, select, [contenteditable]')), false, 'no text field has focus: no on-screen keyboard over Send');
             // Honest scope next to the thumbnail: the shell window only, never the embedded app; long text stays collapsed.
             assert.equal(await page.locator('[data-role="capture-scope"]').isVisible(), true);
