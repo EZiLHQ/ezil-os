@@ -436,3 +436,73 @@ test('reveal: a chat OS says it created is shown again even after this window fo
     assert.equal(sent.status, 'in_progress');
     assert.deepEqual(w.calls.opened.map((o) => [o.id, o.target, o.options.preserveFocus]), [['s2', -1, true]]);
 });
+
+// Ownership can change at an asynchronous service boundary, not only while waiting on a session lock.
+for (const boundary of ['list', 'open']) test(`setModel rechecks ownership after ${boundary} resolves`, async () => {
+    const entered = deferred(), release = deferred();
+    const delay = async () => { entered.resolve(); await release.promise; };
+    const w = world({ [boundary === 'list' ? 'listDelay' : 'openDelay']: delay });
+    await claimed(w);
+    const pending = control(w, 'setModel', 90, { sessionResource: 'vscode-chat-session://local/s2', model: 'ezil/qwen', reveal: true });
+    await entered.promise;
+    await w.bridge.handle({ op: 'claim', ownerId: 'next-owner', epoch: 2 });
+    release.resolve();
+    assert.deepEqual(await pending, { ok: false, error: 'stale_owner', epoch: 2 });
+    assert.equal(w.calls.switched.length, 0);
+    if (boundary === 'list') assert.equal(w.calls.opened.length, 0, 'stale lookup must not reveal a chat');
+});
+
+test('create that loses ownership while opening never selects a model or retries its partial creation', async () => {
+    const entered = deferred(), release = deferred();
+    const w = world({ openDelay: async () => { entered.resolve(); await release.promise; } });
+    await claimed(w);
+    const pending = control(w, 'create', 91, { model: 'ezil/qwen' });
+    await entered.promise;
+    await w.bridge.handle({ op: 'claim', ownerId: 'next-owner', epoch: 2 });
+    release.resolve();
+    const result = await pending;
+    assert.equal(result.status, 'uncertain');
+    assert.equal(result.reason, 'stale_owner');
+    assert.equal(w.calls.started, 1);
+    assert.equal(w.calls.switched.length, 0);
+    const retry = await control(w, 'create', 91, { ownerId: 'next-owner', epoch: 2, model: 'ezil/qwen' });
+    assert.equal(retry.status, 'uncertain');
+    assert.equal(retry.duplicate, true);
+    assert.equal(w.calls.started, 1);
+});
+
+test('submit whose session lookup loses ownership does not reveal or acquire that session', async () => {
+    const entered = deferred(), release = deferred();
+    const w = world({ listDelay: async () => { entered.resolve(); await release.promise; } });
+    await claimed(w);
+    const pending = submit(w, 92, { sessionResource: 'vscode-chat-session://local/s2', reveal: true });
+    await entered.promise;
+    await w.bridge.handle({ op: 'claim', ownerId: 'next-owner', epoch: 2 });
+    release.resolve();
+    assert.deepEqual(await pending, { ok: false, error: 'stale_owner', epoch: 2 });
+    assert.equal(w.calls.opened.length + w.calls.acquire + w.calls.send.length, 0);
+});
+
+for (const op of ['read', 'sessions']) test(`${op} does not return session data after ownership changes during lookup`, async () => {
+    const entered = deferred(), release = deferred();
+    const w = world({ listDelay: async () => { entered.resolve(); await release.promise; } });
+    await claimed(w);
+    const pending = w.bridge.handle({ op, ...OWNER, sessionResource: 'vscode-chat-session://local/s2' });
+    await entered.promise;
+    await w.bridge.handle({ op: 'claim', ownerId: 'next-owner', epoch: 2 });
+    release.resolve();
+    assert.deepEqual(await pending, { ok: false, error: 'stale_owner', epoch: 2 });
+    assert.equal(w.calls.acquire, 0);
+});
+
+test('setModel cannot mutate after disposal during an awaited open', async () => {
+    const entered = deferred(), release = deferred();
+    const w = world({ openDelay: async () => { entered.resolve(); await release.promise; } });
+    await claimed(w);
+    const pending = control(w, 'setModel', 93, { sessionResource: 'vscode-chat-session://local/s2', model: 'ezil/qwen', reveal: true });
+    await entered.promise;
+    w.bridge.dispose();
+    release.resolve();
+    assert.deepEqual(await pending, { ok: false, error: 'disconnected' });
+    assert.equal(w.calls.switched.length, 0);
+});

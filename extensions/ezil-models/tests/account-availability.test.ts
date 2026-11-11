@@ -2,7 +2,7 @@
 // fresh `/v1/models` read with that provider's own token that says the account may use that exact alias.
 import { beforeEach, expect, test } from 'bun:test';
 
-import { ACCOUNT_EVIDENCE_MAX_AGE_MS, accountAvailableIds, forgetGatewayModels } from '../src/gateway';
+import { ACCOUNT_EVIDENCE_MAX_AGE_MS, accountAvailableIds, forgetGatewayModels, freshGatewayModels, gatewayModels } from '../src/gateway';
 import { model } from './fixtures/load';
 
 const QWEN = 'qwen.qwen3-coder-next';
@@ -135,4 +135,41 @@ test('evidence collected for one id that ages out before a later id of the same 
     // The 16 s filler read ages the first tokOne read out: 'first' and 'filler' are dropped at emission, 'again' re-reads and stays.
     expect(allowed).toEqual(['again', 'plain']);
     expect(reads.tokOne).toEqual([t0, t0 + ACCOUNT_EVIDENCE_MAX_AGE_MS + 1_000]);
+});
+
+test('joined pending evidence retains the underlying read start, not the joining caller time', async () => {
+    const models = [configured('qwen', QWEN, 'joined-token')];
+    const t0 = 1_800_000_000_000;
+    let clock = t0, reads = 0;
+    let finish!: (response: Response) => void;
+    const response = new Promise<Response>(resolve => { finish = resolve; });
+    const doFetch = (async () => { reads++; return response; }) as unknown as typeof fetch;
+    const original = gatewayModels(models[0]!.provider, doFetch, clock, undefined, true);
+    clock += 20_000;
+    const joined = freshGatewayModels(models[0]!.provider, doFetch, clock);
+    const allowed = accountAvailableIds(models, ['qwen'], doFetch, () => clock);
+    clock += 1_000;
+    finish(Response.json(catalog([row(QWEN, 'available')])));
+    await original;
+    expect((await joined)?.at).toBe(t0);
+    expect([...await allowed]).toEqual([]);
+    expect(reads).toBe(1);
+});
+
+test('a joined pending read still inside the evidence window remains usable without a duplicate fetch', async () => {
+    const models = [configured('qwen', QWEN, 'fresh-joined-token')];
+    const t0 = 1_800_000_000_000;
+    let clock = t0, reads = 0;
+    let finish!: (response: Response) => void;
+    const response = new Promise<Response>(resolve => { finish = resolve; });
+    const doFetch = (async () => { reads++; return response; }) as unknown as typeof fetch;
+    const original = gatewayModels(models[0]!.provider, doFetch, clock, undefined, true);
+    clock += 1_000;
+    const joined = freshGatewayModels(models[0]!.provider, doFetch, clock);
+    const allowed = accountAvailableIds(models, ['qwen'], doFetch, () => clock);
+    finish(Response.json(catalog([row(QWEN, 'available')])));
+    await original;
+    expect((await joined)?.at).toBe(t0);
+    expect([...await allowed]).toEqual(['qwen']);
+    expect(reads).toBe(1);
 });

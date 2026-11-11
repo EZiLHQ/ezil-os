@@ -26,7 +26,7 @@ const PICKER = [
     { identifier: 'ezil/hidden', metadata: { id: 'hidden', name: 'Hidden', vendor: 'ezil', isUserSelectable: false } },
 ];
 
-function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, now = () => 1700000000000, acquireDelay = null, used = true,
+function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, now = () => 1700000000000, acquireDelay = null, listDelay = null, openDelay = null, used = true,
     picker = PICKER, startThrows = false, openFails = false, sticky = true, listEmpty = true } = {}) {
     const models = new Map();
     const loaded = new Map();
@@ -50,7 +50,7 @@ function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, no
     let nextSend = null;
     const chatService = {
         // listEmpty: false models a runtime that lists a chat only once it has a request.
-        async getLiveSessionItems() { return [...loaded.keys()].filter((id) => listEmpty || models.get(id).requests.length).map((id) => ({ sessionResource: uri(id), title: `Live ${id}` })); },
+        async getLiveSessionItems() { if (listDelay) await listDelay(); return [...loaded.keys()].filter((id) => listEmpty || models.get(id).requests.length).map((id) => ({ sessionResource: uri(id), title: `Live ${id}` })); },
         async getHistorySessionItems() { return sessions.filter((id) => !loaded.has(id)).map((id) => ({ sessionResource: uri(id), title: `Saved ${id}` })); },
         async acquireOrLoadSession(resource, location, token, owner) {
             calls.acquire++;
@@ -129,6 +129,7 @@ function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, no
         // One chat editor pane per group (observed in 4.141.0): opening a chat as a tab hides the one shown before it.
         async openSession(resource, target, options) {
             calls.opened.push({ id: resource.id, target, options });
+            if (openDelay) await openDelay();
             if (openFails) return undefined;
             if (editorShown && editorShown !== resource.id && open.includes(editorShown)) open.splice(open.indexOf(editorShown), 1);
             editorShown = resource.id;

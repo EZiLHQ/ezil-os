@@ -48,6 +48,7 @@
     const isText = (v, max) => typeof v === 'string' && v.length > 0 && v.length <= max;
 
     function fenced(req) {
+        if (disposed) return fail('disconnected');
         if (!owner) return fail('no_owner');
         if (req.ownerId !== owner.id || req.epoch !== owner.epoch) return fail('stale_owner', { epoch: owner.epoch });
         return null;
@@ -158,7 +159,12 @@
     }
 
     async function deliver(req, session, key, deadline) {
+        // Session lookup may have yielded to a newer claim: do not even reveal/load for the old owner.
+        const denied = fenced(req);
+        if (denied) return denied;
         const widget = await widgetFor(session, req.reveal);
+        const afterWidget = fenced(req);
+        if (afterWidget) return afterWidget;
         // Only a session open here (or one this bridge created, shown again): the request then runs with that
         // pane's own mode, model and tools, and any tool confirmation appears in front of the person.
         if (!widget) return { ok: true, status: 'not_open' };
@@ -309,6 +315,12 @@
             widget = widget || widgets.getWidgetBySessionResource(model.sessionResource);
             // The open editor holds its own reference; without one the empty chat is gone when ours is released.
             ref.dispose();
+            // Creation already began: losing authority cannot truthfully mean 'not delivered' or permit a retry.
+            const afterOpen = fenced(req);
+            if (afterOpen || now() > deadline) {
+                record.reason = afterOpen ? afterOpen.error : 'deadline_passed';
+                return controlView(record);
+            }
             if (!widget) { record.status = 'failed'; record.reason = 'not_opened'; return controlView(record); }
             const applied = wanted ? selectModel(widget, wanted) : true;
             record.model = currentModel(widget);
@@ -332,8 +344,12 @@
             const stale = fenced(req);
             if (stale) return stale;
             const session = (await localSessions()).get(req.sessionResource);
+            const afterLookup = fenced(req);
+            if (afterLookup) return afterLookup;
             if (!session) return { ok: true, status: 'unknown_session' };
             const widget = await widgetFor(session, req.reveal);
+            const afterWidget = fenced(req);
+            if (afterWidget) return afterWidget;
             if (!widget) return { ok: true, status: 'not_open' };
             if (widget._lockedAgent) return { ok: true, status: 'unsupported_session' };
             const model = chat.getSession(session.resource);
@@ -433,6 +449,8 @@
         const denied = fenced(req);
         if (denied) return denied;
         const session = (await localSessions()).get(req.sessionResource);
+        const afterLookup = fenced(req);
+        if (afterLookup) return afterLookup;
         if (!session) return { ok: true, status: 'unknown_session' };
         let model = chat.getSession(session.resource);
         let ref = null;
@@ -442,6 +460,8 @@
             if (!model) return { ok: true, status: 'unknown_session' };
         }
         try {
+            const afterLoad = fenced(req);
+            if (afterLoad) return afterLoad;
             const max = Number.isSafeInteger(req.maxRequests) && req.maxRequests > 0 ? Math.min(req.maxRequests, MAX_READ) : MAX_READ;
             const busy = busyState(model);
             const requests = model.getRequests().slice(-max).map((request) => ({
@@ -482,8 +502,11 @@
                 case 'sessions': {
                     const denied = fenced(request);
                     if (denied) return denied;
+                    const listed = await localSessions();
+                    const afterLookup = fenced(request);
+                    if (afterLookup) return afterLookup;
                     const sessions = [];
-                    for (const [resource, session] of await localSessions()) {
+                    for (const [resource, session] of listed) {
                         const widget = widgets.getWidgetBySessionResource(session.resource);
                         const open = !!widget;
                         // Only a model this window already has loaded; never loads one just to look.

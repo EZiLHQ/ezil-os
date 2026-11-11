@@ -438,7 +438,10 @@ export async function freshGatewayModels(provider: ResolvedProvider, doFetch: ty
     const cached = modelsCache.get(providerIdentity(provider));
     if (cached && now >= cached.at && now - cached.at <= maxAgeMs) return { at: cached.at, models: cached.models };
     const models = await gatewayModels(provider, doFetch, now, undefined, true);
-    return models ? { at: now, models } : undefined;
+    // The shared read may have begun before this caller joined it. Only the cache entry for
+    // this exact result carries its real start time; missing/replaced evidence fails closed.
+    const observed = modelsCache.get(providerIdentity(provider));
+    return models && observed?.models === models ? { at: observed.at, models } : undefined;
 }
 
 /**
