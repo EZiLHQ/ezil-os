@@ -316,6 +316,31 @@ class AiProxyDelivery(unittest.TestCase):
             with self.subTest(ai=ai), self.assertRaisesRegex(ValueError, "^ice_config_invalid$"):
                 desktop.validate_desktop_config(relay_config(now, ai=ai), now)
 
+    def test_editor_bridge_token_is_optional_distinct_and_reaches_only_the_container_env(self):
+        now = int(time.time() * 1000)
+        without = desktop.validate_desktop_config(relay_config(now, ai=self.ai), now)
+        desktop.build_spec(self.cfg, {"generation": 1, "leaseEpoch": 2}, desktop_config=without)
+        env, keys = spec_env(self.cfg)
+        self.assertEqual(env["EZIL_EDITOR_BRIDGE_TOKEN"], "")
+        self.assertEqual(keys.count("EZIL_EDITOR_BRIDGE_TOKEN"), 1)
+        with_bridge = {**self.ai, "editorToken": "ab" * 32}
+        c = desktop.validate_desktop_config(relay_config(now, ai=with_bridge), now)
+        desktop.build_spec(self.cfg, {"generation": 1, "leaseEpoch": 2}, desktop_config=c)
+        env, keys = spec_env(self.cfg)
+        self.assertEqual(env["EZIL_EDITOR_BRIDGE_TOKEN"], "ab" * 32)
+        self.assertEqual(env["EZIL_AI_PROXY_TOKEN"], self.ai["proxyToken"])
+        self.assertEqual(keys.count("EZIL_EDITOR_BRIDGE_TOKEN"), 1)
+        for bad in [{**self.ai, "editorToken": "short"}, {**self.ai, "editorToken": self.ai["proxyToken"]},
+                    {**self.ai, "editorToken": None}, {**self.ai, "editorToken": "AB" * 32}]:
+            with self.subTest(ai=bad), self.assertRaisesRegex(ValueError, "^ice_config_invalid$"):
+                desktop.validate_desktop_config(relay_config(now, ai=bad), now)
+        # The image cannot choose it either.
+        with open(self.cfg.imageConfigFile, "w") as f:
+            json.dump({"Env": ["EZIL_EDITOR_BRIDGE_TOKEN=forged"]}, f)
+        desktop.build_spec(self.cfg, {"generation": 1, "leaseEpoch": 2}, desktop_config=without)
+        env, _ = spec_env(self.cfg)
+        self.assertEqual(env["EZIL_EDITOR_BRIDGE_TOKEN"], "")
+
     def test_unsigned_or_tampered_push_cannot_install_a_token(self):
         a = agentmod.Agent(self.cfg, {"generation": 1, "leaseEpoch": 2}, log=lambda _: None)
         msg = {"op": "ice", "config": relay_config(ai=self.ai), "leaseEpoch": 2, "ts": time.time(), "seq": 1}

@@ -136,8 +136,11 @@ def validate_desktop_config(c, now_ms):
             or neko["user"] == neko["admin"]):
         raise ValueError("ice_config_invalid")
     ai = c.get("ai")
-    if "ai" in c and (not isinstance(ai, dict) or set(ai) != {"baseUrl", "proxyToken"}
+    # editorToken (optional): the editor bridge's own boot token, distinct from the AI proxy token.
+    if "ai" in c and (not isinstance(ai, dict) or set(ai) not in ({"baseUrl", "proxyToken"}, {"baseUrl", "proxyToken", "editorToken"})
             or not isinstance(ai["proxyToken"], str) or not re.fullmatch(r"[0-9a-f]{64}", ai["proxyToken"])
+            or ("editorToken" in ai and (not isinstance(ai["editorToken"], str) or not re.fullmatch(r"[0-9a-f]{64}", ai["editorToken"])
+                                         or ai["editorToken"] == ai["proxyToken"]))
             or not isinstance(ai["baseUrl"], str)
             or not re.fullmatch(r"https://aws-8443-guac-[a-z0-9]{1,16}-[a-z0-9]{1,16}-aws\.[a-z0-9.-]+/ai/v1", ai["baseUrl"])):
         raise ValueError("ice_config_invalid")
@@ -562,7 +565,8 @@ def build_spec(cfg, lease, mode="desktop", extra_binds=(), desktop_config=None):
     # supply these; neither the lease nor the desktop filesystem is a token source.
     ai = desktop_config.get("ai") if desktop_config is not None else None
     env = set_env(env, {"EZIL_AI_BASE_URL": ai["baseUrl"] if ai else "",
-                        "EZIL_AI_PROXY_TOKEN": ai["proxyToken"] if ai else ""})
+                        "EZIL_AI_PROXY_TOKEN": ai["proxyToken"] if ai else "",
+                        "EZIL_EDITOR_BRIDGE_TOKEN": ai.get("editorToken", "") if ai else ""})
     args = (["/bin/bash", "-c", "DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh"] if mode == "desktop"
             else ["/bin/sleep", "infinity"])
     dm = cfg.dataMount
