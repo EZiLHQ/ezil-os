@@ -3,6 +3,8 @@ import importlib.util
 from pathlib import Path
 import stat
 import tempfile
+import subprocess
+import os
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -51,7 +53,8 @@ class AptMirrorTests(unittest.TestCase):
             return release(url.split('/')[-2])
         result = recover(fetch=fetch)
         expected = SOURCE.replace(m.LIST_URI.encode(), m.MIRROR.encode()).replace(
-            b'https://security.ubuntu.com/ubuntu/', m.MIRROR.encode())
+            b'https://security.ubuntu.com/ubuntu/', m.MIRROR.encode()).replace(
+            str(m.KEYRING).encode(), m.SIGNED_BY.encode())
         self.assertEqual(result, expected)
         self.assertEqual({u.split('/')[-2] for u in urls}, m.POCKETS)
         self.assertTrue(all(u.startswith(m.MIRROR) for u in urls))
@@ -88,7 +91,7 @@ class AptMirrorTests(unittest.TestCase):
             recover(fetch=lambda _: b'x' * (m.LIMIT + 1))
         with mock.patch.object(m.subprocess, 'run', return_value=SimpleNamespace(returncode=1)):
             with self.assertRaises(m.Refused):
-                m.verify(b'tampered-clearsigned-payload')
+                m.verify(b'tampered-clearsigned-payload', b'fixture-keyring')
 
     def test_release_identity_expiry_and_date_guards(self):
         patches = [
@@ -131,7 +134,7 @@ class AptMirrorTests(unittest.TestCase):
             write.assert_not_called()
         with mock.patch.object(Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\n'), \
              mock.patch.object(m.os, 'geteuid', return_value=0), \
-             mock.patch.object(m, 'read_owned', return_value=(SOURCE, object())), \
+             mock.patch.object(m, 'read_owned', return_value=(SOURCE, SimpleNamespace(st_mode=0o644))), \
              mock.patch.object(m, 'recover', side_effect=m.Refused('release_signature')), \
              mock.patch.object(m, 'write_sources') as write:
             with self.assertRaises(m.Refused):
@@ -148,6 +151,116 @@ class AptMirrorTests(unittest.TestCase):
     def _unknown_phase_message(self):
         with mock.patch.object(m, 'PHASE', 'private-phase-sentinel'):
             return m.public_failure(RuntimeError('private-error-sentinel'))
+
+    def test_writable_keyring_with_working_dns_still_pins_apt_without_changing_uris(self):
+        urls = []
+        result = m.recover(SOURCE, MIRRORS, lambda _: True,
+            lambda url: (urls.append(url) or release(url.split('/')[-2])), lambda b: b, NOW, pin_required=True)
+        self.assertEqual(result, SOURCE.replace(str(m.KEYRING).encode(), m.SIGNED_BY.encode()))
+        self.assertEqual(len(urls), 4)
+        self.assertIn((m.FINGERPRINT + '!').encode(), result)
+
+    def test_signer_and_primary_must_both_be_exact_and_single(self):
+        def run_for(status):
+            def run(args, **kwargs):
+                Path(args[args.index('--output') + 1]).write_bytes(release('noble'))
+                return SimpleNamespace(returncode=0, stdout=status.encode())
+            return run
+        valid = '[GNUPG:] VALIDSIG ' + m.FINGERPRINT + ' 2024-04-25 1714057881 0 4 0 1 10 01 ' + m.FINGERPRINT + '\n'
+        variants = [valid.replace(m.FINGERPRINT, 'A' * 40, 1),
+            valid.rsplit(m.FINGERPRINT, 1)[0] + 'B' * 40 + '\n', valid + valid, '']
+        for status in variants:
+            with mock.patch.object(m.subprocess, 'run', side_effect=run_for(status)), self.assertRaisesRegex(m.Refused, 'release_signer'):
+                m.verify(b'signed', b'keyring')
+        with mock.patch.object(m.subprocess, 'run', side_effect=run_for(valid)):
+            self.assertEqual(m.verify(b'signed', b'keyring'), release('noble'))
+
+    def test_snapshot_install_does_not_overwrite_foreign_file_or_follow_symlink(self):
+        real_fstat, real_lstat = os.fstat, Path.lstat
+        def owned(info):
+            return SimpleNamespace(st_mode=info.st_mode, st_uid=0, st_nlink=info.st_nlink, st_size=info.st_size)
+        with tempfile.TemporaryDirectory() as folder:
+            parent = Path(folder) / 'keyrings'
+            dest = parent / 'ezil-ci-ubuntu-archive.gpg'
+            with mock.patch.object(m, 'PROTECTED_KEYRING', dest), \
+                 mock.patch.object(m.os, 'fstat', side_effect=lambda fd: owned(real_fstat(fd))), \
+                 mock.patch.object(Path, 'lstat', lambda path: owned(real_lstat(path))):
+                m.install_keyring(b'public-keyring')
+                self.assertEqual(dest.read_bytes(), b'public-keyring')
+                self.assertEqual(stat.S_IMODE(real_lstat(parent).st_mode), 0o755)
+                self.assertEqual(stat.S_IMODE(real_lstat(dest).st_mode), 0o644)
+                m.install_keyring(b'public-keyring')
+                with self.assertRaisesRegex(m.Refused, 'protected_keyring_mismatch'):
+                    m.install_keyring(b'foreign-keyring')
+                self.assertEqual(dest.read_bytes(), b'public-keyring')
+                dest.unlink()
+                dest.symlink_to(Path(folder) / 'foreign')
+                with self.assertRaisesRegex(m.Refused, 'protected_keyring_symlink'):
+                    m.install_keyring(b'public-keyring')
+                dest.unlink()
+                parent.chmod(0o777)
+                with self.assertRaisesRegex(m.Refused, 'protected_keyring_parent'):
+                    m.install_keyring(b'public-keyring')
+                self.assertFalse(dest.exists())
+
+    def test_install_failure_never_flips_sources_and_install_precedes_source_write(self):
+        order = []
+        def read(path, limit):
+            if path == m.KEYRING:
+                return b'fixture-keyring', SimpleNamespace(st_mode=0o777)
+            return (MIRRORS if path == m.MIRROR_LIST else SOURCE), SimpleNamespace(st_mode=0o644)
+        with mock.patch.object(Path, 'read_text', return_value='ID=ubuntu\nVERSION_ID="24.04"\nVERSION_CODENAME=noble\n'), \
+             mock.patch.object(m.os, 'geteuid', return_value=0), mock.patch.object(m, 'read_owned', side_effect=read), \
+             mock.patch.object(m, 'recover', return_value=b'changed'), \
+             mock.patch.object(m, 'install_keyring', side_effect=lambda _: order.append('key')), \
+             mock.patch.object(m, 'write_sources', side_effect=lambda *args: order.append('source')):
+            m.main()
+            self.assertEqual(order, ['key', 'source'])
+            order.clear()
+            with mock.patch.object(m, 'install_keyring', side_effect=m.Refused('protected_keyring_parent')):
+                with self.assertRaises(m.Refused):
+                    m.main()
+            self.assertEqual(order, [])
+
+    def test_real_gpgv_rejects_extra_attacker_key_and_accepts_only_pinned_signature(self):
+        with tempfile.TemporaryDirectory() as folder:
+            os.chmod(folder, 0o700)
+            def gpg(*args):
+                return subprocess.run(['gpg', '--homedir', folder, '--batch', '--yes', '--pinentry-mode',
+                    'loopback', '--passphrase', '', *args], capture_output=True, check=True, timeout=15).stdout
+            try:
+                for name in ['CI Archive Test', 'CI Attacker Test']:
+                    gpg('--quick-gen-key', name, 'ed25519', 'sign', '0')
+                listed = gpg('--with-colons', '--list-keys').decode()
+                fingerprints = [line.split(':')[9] for line in listed.splitlines() if line.startswith('fpr:')]
+                self.assertEqual(len(fingerprints), 2)
+                keys = gpg('--export')
+                payload = Path(folder) / 'payload'
+                payload.write_bytes(release('noble'))
+                signed = Path(folder) / 'InRelease'
+                with mock.patch.object(m, 'FINGERPRINT', fingerprints[0]):
+                    gpg('--local-user', fingerprints[1], '--output', str(signed), '--clearsign', str(payload))
+                    with self.assertRaisesRegex(m.Refused, 'release_signer'):
+                        m.verify(signed.read_bytes(), keys)
+                    gpg('--local-user', fingerprints[0], '--output', str(signed), '--clearsign', str(payload))
+                    self.assertEqual(m.verify(signed.read_bytes(), keys), payload.read_bytes())
+            finally:
+                subprocess.run(['gpgconf', '--homedir', folder, '--kill', 'gpg-agent'], capture_output=True, timeout=5)
+
+    def test_normal_apt_accepts_exact_protected_signed_by_syntax_offline(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            sources = root / 'ubuntu.sources'
+            sources.write_bytes(SOURCE.replace(m.LIST_URI.encode(), m.MIRROR.encode()).replace(
+                str(m.KEYRING).encode(), m.SIGNED_BY.encode()))
+            lists = root / 'lists'
+            lists.mkdir()
+            (lists / 'partial').mkdir()
+            result = subprocess.run(['apt-get', 'indextargets',
+                '-o', 'Dir::Etc::sourcelist=' + str(sources), '-o', 'Dir::Etc::sourceparts=-',
+                '-o', 'Dir::State::lists=' + str(lists), '-o', 'Dir::Cache=' + str(root)],
+                capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr.decode())
 
     def test_download_uses_bounded_verified_https_and_no_signature_bypass(self):
         with mock.patch.object(m.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=b'signed')) as run:

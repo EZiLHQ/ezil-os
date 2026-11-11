@@ -15,6 +15,9 @@ import tempfile
 SOURCES = Path('/etc/apt/sources.list.d/ubuntu.sources')
 MIRROR_LIST = Path('/etc/apt/apt-mirrors.txt')
 KEYRING = Path('/usr/share/keyrings/ubuntu-archive-keyring.gpg')
+PROTECTED_KEYRING = Path('/etc/apt/keyrings/ezil-ci-ubuntu-archive.gpg')
+FINGERPRINT = 'F6ECB3762474EDA9D21B7022871920D1991BC93C'
+SIGNED_BY = str(PROTECTED_KEYRING) + ' ' + FINGERPRINT + '!'
 MIRROR = 'https://mirrors.edge.kernel.org/ubuntu/'
 LIST_URI = 'mirror+file:/etc/apt/apt-mirrors.txt'
 HOSTS = ('azure.archive.ubuntu.com', 'archive.ubuntu.com', 'security.ubuntu.com')
@@ -30,15 +33,16 @@ class Refused(Exception):
 
 PHASE = 'startup'
 PHASES = {'startup', 'os_release', 'source_read', 'mirror_list_read', 'keyring_read',
-          'source_parse', 'configured_dns', 'release_fetch', 'release_verify', 'release_metadata', 'source_write'}
+          'protected_keyring_read', 'protected_keyring_write', 'source_parse', 'configured_dns', 'release_fetch', 'release_verify', 'release_metadata', 'source_write'}
 REASONS = {
     'source_format', 'source_field', 'source_fields', 'source_keyring', 'source_types',
     'source_options', 'source_pocket', 'source_components', 'source_uri', 'mirror_list',
     'source_pockets', 'release_size', 'release_format', 'release_identity', 'release_content',
     'release_time', 'release_future', 'release_stale', 'release_expired', 'release_url',
     'release_download', 'release_signature', 'fixed_path', 'source_size',
-    'unsafe_source_directory', 'source_changed', 'noble_root_required',
-} | {label + '_' + code for label in ('source', 'mirror_list', 'keyring')
+    'unsafe_source_directory', 'source_changed', 'noble_root_required', 'release_signer',
+    'protected_keyring_parent', 'protected_keyring_mode', 'protected_keyring_mismatch',
+} | {label + '_' + code for label in ('source', 'mirror_list', 'keyring', 'protected_keyring')
      for code in ('missing', 'symlink', 'unreadable', 'not_regular', 'not_root_owned', 'multiple_links', 'writable', 'too_large')}
 
 def public_failure(error):
@@ -77,7 +81,7 @@ def parse_sources(raw: bytes, mirrors: bytes | None):
             offset += len(block)
             continue
         need({'Types', 'URIs', 'Suites', 'Components', 'Signed-By'} <= fields.keys(), 'source_fields')
-        need(fields['Signed-By'] == str(KEYRING), 'source_keyring')
+        need(fields['Signed-By'] in (str(KEYRING), SIGNED_BY), 'source_keyring')
         need(set(fields['Types'].split()) <= {'deb', 'deb-src'}, 'source_types')
         need(fields.get('Enabled', 'yes') == 'yes' and fields.get('Check-Valid-Until', 'yes') == 'yes', 'source_options')
         pocket = set(fields['Suites'].split())
@@ -87,7 +91,7 @@ def parse_sources(raw: bytes, mirrors: bytes | None):
         suites |= pocket
         components |= part
         tokens = fields['URIs'].split()
-        need(tokens and all(token in URIS or token == LIST_URI for token in tokens), 'source_uri')
+        need(tokens and all(token in URIS or token in (LIST_URI, MIRROR) for token in tokens), 'source_uri')
         for token in tokens:
             if token == LIST_URI:
                 need(mirrors is not None and len(mirrors) <= 4096, 'mirror_list')
@@ -104,7 +108,9 @@ def parse_sources(raw: bytes, mirrors: bytes | None):
         for m in re.finditer(r'^URIs:[ \t]+([^\n]+)', block, re.M):
             before = m[1]
             after = re.sub(r'\S+', MIRROR, before)
-            replacements.append((offset + m.start(1), offset + m.end(1), after))
+            replacements.append((offset + m.start(1), offset + m.end(1), after, 'uri'))
+        for m in re.finditer(r'^Signed-By:[ \t]+([^\n]+)', block, re.M):
+            replacements.append((offset + m.start(1), offset + m.end(1), SIGNED_BY, 'key'))
         offset += len(block)
     need({'noble', 'noble-updates', 'noble-security'} <= suites and replacements, 'source_pockets')
     return text, replacements, suites, components, hosts
@@ -138,11 +144,12 @@ def validate_release(payload: bytes, pocket: str, components: set[str], now: dt.
         until = timestamp('Valid-Until')
         need(until > now and until >= date, 'release_expired')
 
-def recover(raw, mirrors, resolve, fetch, verify, now):
+def recover(raw, mirrors, resolve, fetch, verify, now, pin_required=False):
     text, replacements, suites, components, hosts = parse_sources(raw, mirrors)
     global PHASE
     PHASE = 'configured_dns'
-    if all(resolve(host) for host in sorted(hosts)):
+    dns_available = all(resolve(host) for host in sorted(hosts))
+    if dns_available and not pin_required:
         return None
     for pocket in sorted(suites):
         PHASE = 'release_fetch'
@@ -152,8 +159,9 @@ def recover(raw, mirrors, resolve, fetch, verify, now):
         payload = verify(signed)
         PHASE = 'release_metadata'
         validate_release(payload, pocket, components, now)
-    for start, end, value in reversed(replacements):
-        text = text[:start] + value + text[end:]
+    for start, end, value, kind in sorted(replacements, reverse=True):
+        if kind == 'key' or not dns_available:
+            text = text[:start] + value + text[end:]
     return text.encode('ascii')
 
 def resolve(host):
@@ -171,19 +179,28 @@ def fetch(url):
     need(r.returncode == 0 and len(r.stdout) <= LIMIT, 'release_download')
     return r.stdout
 
-def verify(signed):
+def verify(signed, keyring):
+    need(0 < len(keyring) <= LIMIT, 'release_size')
     with tempfile.TemporaryDirectory(prefix='ezil-apt-verify-') as folder:
         source, output = Path(folder) / 'InRelease', Path(folder) / 'Release'
+        private_keyring = Path(folder) / 'archive.gpg'
+        private_keyring.write_bytes(keyring)
+        private_keyring.chmod(0o600)
         source.write_bytes(signed)
-        r = subprocess.run(['gpgv', '--homedir', folder, '--keyring', str(KEYRING),
-            '--output', str(output), str(source)], capture_output=True, timeout=5, check=False)
+        r = subprocess.run(['gpgv', '--homedir', folder, '--status-fd', '1',
+            '--keyring', str(private_keyring), '--output', str(output), str(source)],
+            capture_output=True, timeout=5, check=False)
         need(r.returncode == 0 and output.is_file(), 'release_signature')
+        statuses = [line.split() for line in r.stdout.decode('ascii').splitlines()
+                    if line.startswith('[GNUPG:] VALIDSIG ')]
+        need(len(statuses) == 1 and len(statuses[0]) == 12
+             and statuses[0][2] == FINGERPRINT and statuses[0][-1] == FINGERPRINT, 'release_signer')
         return output.read_bytes()
 
 
 def read_owned(path: Path, limit: int):
     global PHASE
-    label = {SOURCES: 'source', MIRROR_LIST: 'mirror_list', KEYRING: 'keyring'}.get(path)
+    label = {SOURCES: 'source', MIRROR_LIST: 'mirror_list', KEYRING: 'keyring', PROTECTED_KEYRING: 'protected_keyring'}.get(path)
     need(label is not None, 'fixed_path')
     PHASE = label + '_read'
     try:
@@ -196,13 +213,60 @@ def read_owned(path: Path, limit: int):
         need(stat.S_ISREG(info.st_mode), label + '_not_regular')
         need(info.st_uid == 0, label + '_not_root_owned')
         need(info.st_nlink == 1, label + '_multiple_links')
-        need(not info.st_mode & 0o022, label + '_writable')
+        need(path == KEYRING or not info.st_mode & 0o022, label + '_writable')
         need(info.st_size <= limit, label + '_too_large')
         data = os.read(fd, limit + 1)
         need(len(data) <= limit, 'source_size')
         return data, info
     finally:
         os.close(fd)
+
+def protected_parent(create=False):
+    parent = PROTECTED_KEYRING.parent
+    for path in (Path('/etc'), Path('/etc/apt')):
+        info = path.lstat()
+        need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0 and not info.st_mode & 0o022, 'protected_keyring_parent')
+    if create:
+        try:
+            parent.mkdir(mode=0o755)
+        except FileExistsError:
+            pass
+    info = parent.lstat()
+    need(stat.S_ISDIR(info.st_mode) and info.st_uid == 0
+         and stat.S_IMODE(info.st_mode) == 0o755, 'protected_keyring_parent')
+
+def existing_keyring(keyring):
+    protected_parent()
+    data, info = read_owned(PROTECTED_KEYRING, LIMIT)
+    need(stat.S_IMODE(info.st_mode) == 0o644, 'protected_keyring_mode')
+    need(data == keyring, 'protected_keyring_mismatch')
+
+def install_keyring(keyring):
+    global PHASE
+    PHASE = 'protected_keyring_write'
+    protected_parent(create=True)
+    if PROTECTED_KEYRING.exists() or PROTECTED_KEYRING.is_symlink():
+        existing_keyring(keyring)
+        return
+    fd, name = tempfile.mkstemp(prefix='.ezil-ci-ubuntu-', dir=PROTECTED_KEYRING.parent)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(keyring)
+            out.flush()
+            os.fchmod(out.fileno(), 0o644)
+            os.fsync(out.fileno())
+        # Atomic create without overwriting a foreign destination.
+        try:
+            os.link(name, PROTECTED_KEYRING, follow_symlinks=False)
+        except FileExistsError:
+            os.unlink(name)
+            existing_keyring(keyring)
+            return
+        os.unlink(name)
+        existing_keyring(keyring)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
 
 def write_sources(before: bytes, info, after: bytes):
     global PHASE
@@ -235,13 +299,17 @@ def main():
     need(release.get('VERSION_CODENAME') == 'noble' and os.geteuid() == 0, 'noble_root_required')
     raw, info = read_owned(SOURCES, 65536)
     mirrors = read_owned(MIRROR_LIST, 4096)[0] if LIST_URI.encode() in raw else None
-    read_owned(KEYRING, LIMIT)
-    after = recover(raw, mirrors, resolve, fetch, verify, dt.datetime.now(dt.timezone.utc))
+    keyring, key_info = read_owned(KEYRING, LIMIT)
+    if SIGNED_BY.encode() in raw:
+        existing_keyring(keyring)
+    after = recover(raw, mirrors, resolve, fetch, lambda signed: verify(signed, keyring),
+                    dt.datetime.now(dt.timezone.utc), pin_required=bool(key_info.st_mode & 0o022))
     if after is None:
         print('Ubuntu apt mirror: unchanged (configured DNS available)')
         return
+    install_keyring(keyring)
     write_sources(raw, info, after)
-    print('Ubuntu apt mirror: verified signed Noble pockets; updated Ubuntu URI tokens only')
+    print('Ubuntu apt mirror: verified signed Noble pockets; protected signer pin installed')
 
 if __name__ == '__main__':
     try:
