@@ -120,6 +120,7 @@ let flushing = false;
 let respond = async () => ({ status: 201, ok: true, json: async () => ({ id: reportId, screenshotAccepted: true }) });
 globalThis.fetch = window.fetch = (url, options) => {
     if ( options.method === 'POST' ) {
+        assert.equal(options.headers['X-EZiL-Feedback-Account'], accountId, 'every new client POST is account-bound, including legacy inline/text');
         if ( ! flushing ) {
             const box = document.querySelector('.ezil-feedback-preview');
             if ( ! box.open ) { box.open = true; box.dispatchEvent(new window.Event('toggle')); }
@@ -1230,6 +1231,47 @@ try {
         });
     });
 
+    await check('legacy text and inline POSTs keep expected account header when cross-tab cookies changed; rejection preserves original draft', async () => {
+        for (const withImage of [false, true]) await multi(async () => {
+            delete ui.feedbackStagedUploads; open(); setDescription('Original account report');
+            if (withImage) await attach([png('legacy.png')]);
+            const frozen = current().querySelector('pre'); showPreview(); const expected = frozen.textContent;
+            const before = calls.length;
+            // Boot identity stays unchanged when another tab switches authentication cookies.
+            respond = async (url, options) => {
+                assert.equal(options.method, 'POST'); assert.equal(options.headers['X-EZiL-Feedback-Account'], accountId);
+                return { status: 409, json: async () => ({ error: 'account_changed' }) };
+            };
+            send(); await until(() => /original account/.test(status()));
+            assert.equal(calls.length, before + 1); assert.equal(calls.at(-1).body, expected);
+            assert.equal(stored(outboxKey)[0].body, expected); assert.equal(form().elements.description.value, 'Original account report');
+            if (withImage) assert.ok(JSON.parse(stored(outboxKey)[0].body).screenshot.dataBase64);
+        });
+    });
+
+    await check('paused image report survives capability-off reopen byte for byte until explicit removal', async () => {
+        await multi(async () => {
+            ui.feedbackStagedUploads = true; open(); await attach([png('a.png'), png('b.png')]);
+            respond = async () => ({ status: 429 }); send(); await until(() => ready() && /several reports/.test(status()));
+            const original = stored(outboxKey)[0], id = payload().clientRequestId; close();
+            ui.feedbackScreenshots = false; const before = calls.length;
+            try {
+                open(); await until(() => rows().length === 2);
+                assert.equal(current().querySelector('input[type=file]'), null);
+                assert.equal(ready(), false); assert.equal(payload().clientRequestId, id);
+                assert.equal(stored(outboxKey)[0].body, original.body);
+                paste(current(), [png('blocked.png')]); await tick(); send(); await tick();
+                assert.equal(calls.length, before); assert.equal(rows().length, 2); assert.equal(stored(outboxKey)[0].body, original.body);
+                rows()[0].querySelector('[data-action="remove-screenshot"]').click();
+                rows()[0].querySelector('[data-action="remove-screenshot"]').click();
+                await until(ready); assert.notEqual(payload().clientRequestId, id);
+                assert.doesNotMatch(stored(outboxKey)[0].body, /dataBase64/);
+                respond = stagedReply; send(); await until(() => status().includes(reportId));
+                assert.equal(calls.length, before + 1); assert.equal(calls.at(-1).method, 'POST');
+            } finally { ui.feedbackScreenshots = true; }
+        });
+    });
+
     await check('report GET and DELETE use the endpoint and same-origin credentials', async () => {
         const reports = [{ id: reportId, category: 'bug', createdAt: '2026-10-15', descriptionPreview: 'Desktop froze', hasScreenshot: false, status: 'new' }];
         respond = async () => ({ status: 200, ok: true, json: async () => ({ reports }) });
@@ -1294,7 +1336,7 @@ try {
         // Existing Troubleshoot deliberately reads the diagnostic-log ring;
         // the feedback isolation checks above have already kept that forbidden.
         log.ringBuffer = readRing;
-        Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: { email: 'BOOT_SECRET@example.test' } });
+        Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: { id: accountId, email: 'BOOT_SECRET@example.test' } });
         window.eval(readFileSync(new URL('../../../src/lib/jquery-3.6.1/jquery-3.6.1.min.js', import.meta.url), 'utf8'));
         globalThis.$ = globalThis.jQuery = window.jQuery;
         globalThis.html_encode = value => { const el = document.createElement('span'); el.textContent = String(value); return el.innerHTML; };
