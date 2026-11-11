@@ -248,7 +248,7 @@ function osBillingLink(query: string): vscode.Uri | undefined {
 /** A catalog as listed, for noticing that a later read changed it (ids, availability, caps, capabilities and the plan's limit). */
 function catalogSignature(catalog: GatewayModels | undefined): string {
     return catalog ? JSON.stringify([catalog.default_model ?? null, catalog.included ?? null, catalog.data.map(entry => [entry.id, entry.enabled, entry.protocols, entry.availability?.state,
-        entry.name, entry.max_input_tokens, entry.max_output_tokens, entry.capabilities])]) : 'unread';
+        entry.name, entry.max_input_tokens, entry.max_output_tokens, entry.capabilities, entry.effort])]) : 'unread';
 }
 
 export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {

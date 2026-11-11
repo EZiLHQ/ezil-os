@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, expect, mock, setSystemTime, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { parseModelsConfig } from '../src/config';
-import { forgetGatewayModels } from '../src/gateway';
+import { forgetGatewayModels, gatewayModels } from '../src/gateway';
 import { QWEN, KIMI } from '../src/gateway-messages';
 import { fakeVscode, TextPart } from './fixtures/fake-vscode';
 mock.module('vscode', () => fakeVscode);
@@ -43,6 +43,11 @@ function fixture(initial: Row[]) {
         provider.provideLanguageModelChatResponse({ id } as never, [{ role: 1, content: [new TextPart('synthetic input')] }] as never,
             { tools: [], modelConfiguration, modelOptions } as never, { report: () => {} }, token() as never);
     return { list, send, posts, config, gets: () => gets,
+        onChange: (listener: () => void) => provider.onDidChangeLanguageModelChatInformation(listener),
+        refresh: async () => {
+            await gatewayModels(config.models[0]!.provider, fetcher);
+            provider.refreshIfCatalogChanged();
+        },
         replace: (rows: Row[]) => { data = rows; forgetGatewayModels(); }, offline: () => { fail = true; } };
 }
 beforeEach(() => forgetGatewayModels());
@@ -129,4 +134,57 @@ test('configured default Messages cannot borrow Responses-first catalog effort',
     expect(new URL(f.posts[0]!.url).pathname).toBe('/ai/v1/messages');
     expect(f.posts[0]?.body.reasoning).toBeUndefined();
     expect(f.posts[0]?.body.output_config).toBeUndefined();
+});
+
+// Exercise the real cache -> change event -> Code re-list -> request path, not the signature helper.
+for (const change of [
+    { name: 'capability addition', before: null, after: capability('openai-responses', ['low']), value: 'low' },
+    { name: 'enum expansion', before: capability('openai-responses', ['low']), after: capability('openai-responses'), value: 'high' },
+    { name: 'enum revocation', before: capability('openai-responses'), after: capability('openai-responses', ['low']), refused: 'high' },
+    { name: 'capability removal', before: capability('openai-responses'), after: null, refused: 'low' },
+    { name: 'default change', before: capability('openai-responses', ['low', 'high'], 'low'),
+        after: capability('openai-responses', ['low', 'high'], 'high') },
+]) test(`effort-only ${change.name} refreshes picker schema without mutating request defaults`, async () => {
+    const f = fixture([row('synthetic-refresh', 'openai-responses', change.before)]);
+    const beforeConfig = JSON.stringify(f.config.models);
+    const initial = (await f.list()).find(m => m.id === 'ezil/synthetic-refresh')!;
+    let events = 0;
+    const subscription = f.onChange(() => { events++; });
+    f.replace([row('synthetic-refresh', 'openai-responses', change.after)]);
+    await f.refresh();
+    expect(events).toBe(1);
+    const updated = (await f.list()).find(m => m.id === initial.id)!;
+    if (change.after) expect(updated).toHaveProperty('configurationSchema', { properties: { reasoningEffort: {
+        type: 'string', enum: change.after.values, ...(change.after.default !== null ? { default: change.after.default } : {}),
+    } } });
+    else expect(updated).not.toHaveProperty('configurationSchema');
+    expect(updated).not.toEqual(initial);
+    await f.refresh();
+    expect(events).toBe(1); // re-listed metadata is now current
+    if (change.refused) {
+        await expect(f.send(initial.id, { reasoningEffort: change.refused })).rejects.toThrow('Requested session effort is unavailable');
+        expect(f.posts).toHaveLength(0);
+    }
+    if (change.value) {
+        await f.send(initial.id, { reasoningEffort: change.value });
+        expect(f.posts.at(-1)?.body.reasoning).toEqual({ effort: change.value });
+    }
+    await f.send(initial.id);
+    expect(f.posts.at(-1)?.body.reasoning).toBeUndefined(); // metadata default never becomes an implicit override
+    expect(JSON.stringify(f.config.models)).toBe(beforeConfig);
+    subscription.dispose();
+});
+
+test('equivalent freshly parsed effort metadata emits no redundant picker event', async () => {
+    const f = fixture([row('synthetic-refresh', 'openai-responses')]);
+    const initial = await f.list();
+    let events = 0;
+    const subscription = f.onChange(() => { events++; });
+    const gets = f.gets();
+    f.replace([row('synthetic-refresh', 'openai-responses')]);
+    await f.refresh();
+    expect(f.gets()).toBeGreaterThan(gets); // independent read, not just cache identity
+    expect(events).toBe(0);
+    expect(await f.list()).toEqual(initial);
+    subscription.dispose();
 });
