@@ -1,21 +1,27 @@
 // Real Code UI + extension; no fake adapter or native state injection.
+import {captureEvidence} from './chat-bridge-effort-evidence.mjs';
 import {createRequire} from 'node:module';
-import {mkdirSync,writeFileSync} from 'node:fs';
+import {mkdirSync,writeFileSync,mkdtempSync} from 'node:fs';
 import {join} from 'node:path';
 const required=n=>{if(!process.env[n])throw Error(n+' required');return process.env[n];};
 const local=v=>{const u=new URL(v);if(u.protocol!=='http:'||u.hostname!=='127.0.0.1')throw Error('loopback HTTP required');return u.origin;};
-const code=local(required('EZIL_CODE_URL')),api=local(required('EZIL_EFFORT_FIXTURE_URL')),out=required('EZIL_E2E_OUT');
-mkdirSync(out,{recursive:true});
+const code=local(required('EZIL_CODE_URL')),api=local(required('EZIL_EFFORT_FIXTURE_URL')),outputRoot=required('EZIL_E2E_OUT');
+mkdirSync(outputRoot,{recursive:true});
+const out=mkdtempSync(join(outputRoot,'evidence-'));
+console.log('Native evidence directory: '+out);
+const controller=required('EZIL_EFFORT_CONTROLLER_TOKEN');
+const controlHeaders={authorization:`Bearer ${controller}`};
 const {chromium}=createRequire(required('PLAYWRIGHT_REQUIRE_DIR')+'/fixture.js')('playwright');
 const chromiumArgs=JSON.parse(process.env.EZIL_CHROMIUM_ARGS_JSON??'[]');
 if (!Array.isArray(chromiumArgs)||chromiumArgs.some(x=>typeof x!=='string')) throw Error('EZIL_CHROMIUM_ARGS_JSON must be a string array');
 if (chromiumArgs.some(x=>x==='--no-sandbox'||x==='--disable-setuid-sandbox') && process.env.EZIL_CHROMIUM_NO_SANDBOX_ALLOWED!=='yes')
  throw Error('Sandbox disabling requires explicit disposable-environment acknowledgment');
-const launchOptions={args:chromiumArgs,...(process.env.EZIL_CHROMIUM_EXECUTABLE_PATH?{executablePath:process.env.EZIL_CHROMIUM_EXECUTABLE_PATH}:{})};
-const results=[],resources={},expectedModels={};
+const browserEnv={...process.env};delete browserEnv.EZIL_EFFORT_CONTROLLER_TOKEN;
+const launchOptions={env:browserEnv,args:chromiumArgs,...(process.env.EZIL_CHROMIUM_EXECUTABLE_PATH?{executablePath:process.env.EZIL_CHROMIUM_EXECUTABLE_PATH}:{})};
+const results=[],resources={},expectedModels={},nativeModes={};
 const check=(name,ok)=>{results.push({name,ok});if(!ok)throw Error(name);};
-const state=async()=>{const r=await fetch(api+'/bridge-state');if(!r.ok)throw Error('fixture read');return r.json();};
-const enqueue=async spec=>{const r=await fetch(api+'/enqueue',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(spec)});if(!r.ok)throw Error('enqueue');return r.json();};
+const state=async()=>{const r=await fetch(api+'/bridge-state',{headers:controlHeaders});if(!r.ok)throw Error('fixture read');return r.json();};
+const enqueue=async spec=>{const r=await fetch(api+'/enqueue',{method:'POST',headers:{...controlHeaders,'content-type':'application/json'},body:JSON.stringify(spec)});if(!r.ok)throw Error('enqueue');return r.json();};
 const until=async p=>{const end=Date.now()+150000;while(Date.now()<end){const s=await state();if(p(s))return s;await new Promise(r=>setTimeout(r,750));}throw Error('native condition timeout');};
 const op=(s,r)=>s.ops.find(o=>o.role===r);
 const done=r=>until(s=>['applied','completed','uncertain','rejected','failed','expired','busy'].includes(op(s,r)?.status));
@@ -28,6 +34,9 @@ const send=async(role,marker,model,effort)=>{
  const s=await done(marker),o=op(s,marker),w=s.upstream.filter(x=>x.marker===marker);
  check(marker+' real output',o?.status==='completed'&&o.responseText?.includes('EZIL_NATIVE_OK '+marker));
  check(marker+' exact single wire request',w.length===1&&w[0].body.model===model&&(w[0].body.reasoning?.effort??null)===effort);
+ check(marker+' native mode witness',typeof o.mode==='string'&&o.mode.length>0);
+ if(nativeModes[role]===undefined)nativeModes[role]=o.mode;
+ check(marker+' native mode preserved',o.mode===nativeModes[role]);
  check(marker+' selected effort',(o.selectedEffort??null)===effort);
  const fresh=await until(x=>x.sessionsAt>s.now&&x.sessions.some(t=>t.resource===resources[role]&&t.open));
  const observed=fresh.sessions.find(t=>t.resource===resources[role]);
@@ -72,7 +81,19 @@ try {
  await new Promise(r=>setTimeout(r,Number(process.env.EZIL_STANDIN_LEASE_MS??30000)+1500));
  await launch();await open();await until(s=>s.epoch>epoch&&s.sessionsAt>s.owners.at(-1).at);
  for(const [role,effort] of [['A','low'],['B','high'],['C',null]]) await send(role,'EZIL_NATIVE_RELOAD_'+role,'native-a',effort);
+ // Actual overlapping requests, same model/different effort, after persistence checks.
+ await Promise.all([['A','low'],['B','high']].map(([role,effort])=>enqueue({role:'EZIL_NATIVE_OVERLAP_'+role,kind:'send',sessionRole:role,text:'EZIL_NATIVE_OVERLAP_'+role,expectedModel:'native-a',expectedEffort:effort,overlapGroup:'same-model-pair'})));
+ const paired=await until(s=>['A','B'].every(role=>['completed','failed','uncertain','rejected'].includes(op(s,'EZIL_NATIVE_OVERLAP_'+role)?.status)));
+ const pair=paired.upstream.filter(x=>['EZIL_NATIVE_OVERLAP_A','EZIL_NATIVE_OVERLAP_B'].includes(x.marker));
+ check('two requests actually overlap at Gateway',pair.length===2&&pair.every(x=>x.overlap===true)&&Math.max(...pair.map(x=>x.at))<=Math.min(...pair.map(x=>x.releasedAt)));
+ for(const [role,effort] of [['A','low'],['B','high']]){
+  const marker='EZIL_NATIVE_OVERLAP_'+role,o=op(paired,marker),wire=pair.find(x=>x.marker===marker);
+  check(role+' overlapping isolation/output/mode',o.status==='completed'&&o.responseText?.includes(marker)&&o.mode===nativeModes[role]&&wire.body.model==='native-a'&&wire.body.reasoning?.effort===effort);
+ }
  results.push({name:'pending native tool approval',status:'NOT_EXERCISED',reason:'Requires separate real tool approval fixture; no approval state fabricated.'});
  await page.screenshot({path:join(out,'native-effort.png')});
 } catch(e) {results.push({name:'native run',ok:false,error:String(e.message)});process.exitCode=1;}
-finally {await browser?.close();writeFileSync(join(out,'results.json'),JSON.stringify(results,null,2));try{writeFileSync(join(out,'fixture-state.json'),JSON.stringify(await state(),null,2));}catch{} }
+finally {
+ try {await browser?.close();}catch(e){results.push({name:'browser cleanup',ok:false,error:String(e.message)});process.exitCode=1;}
+ if(!await captureEvidence(out,results,state))process.exitCode=1;
+}

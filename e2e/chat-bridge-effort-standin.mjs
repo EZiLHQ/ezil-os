@@ -1,19 +1,24 @@
 // Local protocol3 OS stand-in + strict synthetic Responses Gateway; NOT actual OS/DB.
 import http from 'node:http';
+import {overlapBarrier} from './chat-bridge-effort-barrier.mjs';
+const overlap=overlapBarrier();
+import {controllerAllowed,validEnqueue} from './chat-bridge-effort-control.mjs';
 import { randomUUID } from 'node:crypto';
 import { validateResponseRequest, responseBody, effortRows } from './chat-bridge-effort-responses.mjs';
 
 const [port, mockPort, bridgeToken, aiToken] = process.argv.slice(2);
+const controllerToken=process.env.EZIL_EFFORT_CONTROLLER_TOKEN;
+if(!controllerToken||controllerToken.length<32||[bridgeToken,aiToken].includes(controllerToken))throw Error('Separate controller secret required');
 const LEASE_MS = Number(process.env.EZIL_STANDIN_LEASE_MS ?? 30_000);
 const t0 = Date.now();
 const at = () => Date.now() - t0;
 const state = {
   owner: null, epoch: 0, lastSeq: 0, leaseUntil: 0, syncs: [], owners: [], refused: [], protocols: {},
-  catalog: null, catalogs: [], sessions: [], sessionsAt: null, ops: [], reports: [], upstream: [],
+  catalog: null, catalogs: [], sessions: [], sessionsAt: null, ops: [{kind:'warmup',text:'EZIL_NATIVE_WARMUP',expectedModel:'native-a',expectedEffort:null,status:'fixture_registered'}], reports: [], upstream: [],
   gateway: { allow: (process.env.EZIL_STANDIN_ALLOW ?? '').split(',').filter(Boolean), mode: 'ok', calls: [] },
 };
 
-const read = (req) => new Promise((resolve) => { const c = []; req.on('data', (d) => c.push(d)); req.on('end', () => resolve(Buffer.concat(c))); });
+const read = async req=>{const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>512*1024)throw Error('payload_too_large');chunks.push(chunk);}return Buffer.concat(chunks);};
 const json = (res, status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
 const FINAL = new Set(['completed', 'cancelled', 'finished_unverified', 'failed', 'rejected', 'expired', 'uncertain', 'applied', 'busy']);
 
@@ -91,9 +96,16 @@ function sync(body) {
 }
 
 http.createServer(async (req, res) => {
+ try {
+ if(['/bridge-state','/gateway-mode','/enqueue'].includes(req.url)){
+  if(!controllerAllowed(req.headers,controllerToken))return json(res,401,{error:'controller_required'});
+  if(req.method==='POST'&&req.headers['content-type']!=='application/json')return json(res,415,{error:'json_required'});
+ }
   if (req.method === 'GET' && req.url === '/bridge-state') return json(res, 200, { ...state, now: at() });
   if (req.method === 'POST' && req.url === '/gateway-mode') {
-    state.gateway.mode = JSON.parse((await read(req)).toString('utf8')).mode;
+    const change=JSON.parse((await read(req)).toString('utf8'));
+    if(Object.keys(change).join()!=='mode'||!['ok','fail'].includes(change.mode))return json(res,400,{error:'invalid_mode'});
+    state.gateway.mode=change.mode;
     return json(res, 200, { mode: state.gateway.mode, at: at() });
   }
   if (req.method === 'GET' && req.url === '/ai/v1/models') {
@@ -105,6 +117,7 @@ http.createServer(async (req, res) => {
   }
   if (req.method === 'POST' && req.url === '/enqueue') {
     const spec = JSON.parse((await read(req)).toString('utf8'));
+    if(!validEnqueue(spec,state.ops))return json(res,400,{error:'invalid_enqueue'});
     return json(res, 200, enqueue({ ...spec, model: spec.kind === 'send' ? undefined : spec.model, createdAt: at() }));
   }
   if (req.url.startsWith('/editor-bridge')) {
@@ -126,7 +139,16 @@ http.createServer(async (req, res) => {
   try { body=JSON.parse((await read(req)).toString('utf8')); } catch { return json(res,400,{error:{code:'invalid_json'}}); }
   const verdict=validateResponseRequest(body,state.ops);
   if (!verdict.ok) { state.upstream.push({rejected:true,reason:verdict.reason}); return json(res,400,{error:{code:'invalid_request',message:verdict.reason}}); }
+  if(state.upstream.some(x=>x.marker===verdict.marker))return json(res,409,{error:{code:'duplicate_marker'}});
   // Only synthetic fixture request bodies. No headers or credentials are retained.
-  state.upstream.push({body,marker:verdict.marker,model:body.model,effort:body.reasoning?.effort ?? null,at:at()});
+  const observation={body,marker:verdict.marker,model:body.model,effort:body.reasoning?.effort ?? null,at:at()};
+  state.upstream.push(observation);
+  const operation=state.ops.find(o=>o.text===verdict.marker);
+  if(operation?.overlapGroup){
+   observation.overlap=await overlap(operation.overlapGroup,resourceOf(operation));
+   observation.releasedAt=at();
+   if(!observation.overlap)return json(res,408,{error:{code:'overlap_not_observed'}});
+  }
   return json(res,200,responseBody(verdict.marker));
+ } catch {if(!res.headersSent)json(res,400,{error:'invalid_or_oversized_request'});else res.destroy();}
 }).listen(Number(port), '127.0.0.1');

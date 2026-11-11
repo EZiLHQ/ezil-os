@@ -57,12 +57,13 @@ with zipfile.ZipFile(sys.argv[1]) as z:
 PY
 fi
 sha256sum "$run/extensions/ezil.ezil-models/package.json" "$run/extensions/ezil.ezil-models/dist/extension.js" > "$EZIL_E2E_OUT/input-hashes.txt"
+controller_secret="$(openssl rand -hex 32)"
 fixture_pid=''; code_pid=''
 cleanup() { [[ -z "$code_pid" ]] || kill "$code_pid" 2>/dev/null || true; [[ -z "$fixture_pid" ]] || kill "$fixture_pid" 2>/dev/null || true; }
 trap cleanup EXIT
-node "$here/chat-bridge-effort-standin.mjs" "$FIXTURE_PORT" 0 "$EZIL_EDITOR_BRIDGE_TOKEN" "$EZIL_AI_PROXY_TOKEN" > "$run/fixture.log" 2>&1 &
+EZIL_EFFORT_CONTROLLER_TOKEN="$controller_secret" node "$here/chat-bridge-effort-standin.mjs" "$FIXTURE_PORT" 0 "$EZIL_EDITOR_BRIDGE_TOKEN" "$EZIL_AI_PROXY_TOKEN" > "$run/fixture.log" 2>&1 &
 fixture_pid=$!
-"$EZIL_CODE_SERVER_BIN" --bind-addr "127.0.0.1:$CODE_PORT" --auth none --disable-telemetry --disable-update-check --user-data-dir "$run/data" --extensions-dir "$run/extensions" "$run/workspace" > "$run/code.log" 2>&1 &
+env -u EZIL_EFFORT_CONTROLLER_TOKEN "$EZIL_CODE_SERVER_BIN" --bind-addr "127.0.0.1:$CODE_PORT" --auth none --disable-telemetry --disable-update-check --user-data-dir "$run/data" --extensions-dir "$run/extensions" "$run/workspace" > "$run/code.log" 2>&1 &
 code_pid=$!
 for i in $(seq 1 90); do
  kill -0 "$code_pid" "$fixture_pid" 2>/dev/null || { echo 'Local process exited' >&2; exit 1; }
@@ -70,4 +71,4 @@ for i in $(seq 1 90); do
  sleep 1
 done
 curl -fsS -o /dev/null "$EZIL_CODE_URL/healthz"
-node "$here/chat-bridge-effort.mjs"
+EZIL_EFFORT_CONTROLLER_TOKEN="$controller_secret" node "$here/chat-bridge-effort.mjs"
