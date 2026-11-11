@@ -85,6 +85,8 @@ export type ResolvedProvider = Required<Pick<ProviderConfig, 'type' | 'headers' 
     Pick<ProviderConfig, 'apiKey' | 'baseUrl' | 'resource' | 'apiVersion' | 'maxTokensField'> & { name: string };
 
 export type ResolvedModel = {
+    gatewayEffort?: import('./effort').GatewayEffortCapability;
+    sessionEffort?: string;
     id: string;
     name: string;
     providerName: string;

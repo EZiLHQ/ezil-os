@@ -1,3 +1,4 @@
+import { sessionEffort } from './effort';
 // Gateway's stateless, text/function-only Responses subset. No direct provider URLs or state IDs.
 import type { ResolvedModel } from './config';
 import { escapeNonAscii, GATEWAY_INPUT_TOKENS, gatewayOutputTokens, isObject, LocalRequestError, samplingRefused } from './gateway-messages';
@@ -11,7 +12,7 @@ type Input = { type: 'message'; role: 'user' | 'system' | 'assistant'; content: 
     | { type: 'function_call_output'; call_id: string; output: string };
 type FunctionTool = { type: 'function'; name: string; description?: string; parameters: ObjectValue };
 export type GatewayResponsesBody = { model: string; input: Input[]; max_output_tokens: number; stream: boolean; store: false;
-    tools?: FunctionTool[]; tool_choice?: 'auto'; temperature?: number; top_p?: number };
+    reasoning?: { effort: string }; tools?: FunctionTool[]; tool_choice?: 'auto'; temperature?: number; top_p?: number };
 const NAME = /^[A-Za-z0-9_-]{1,64}$/;
 const MAX_RESPONSES_BODY_BYTES = 256 * 1024;
 const REFERENCES = new Set(['$ref', '$defs', 'definitions', '$dynamicRef', '$recursiveRef', '$anchor']);
@@ -90,6 +91,8 @@ export function buildGatewayResponsesBody(model: ResolvedModel, request: ChatReq
     for (const id of pending) input.push({ type: 'function_call_output', call_id: id, output: 'No result was recorded for this tool call.' });
     if (!input.length) throw new Error('Invalid conversation length');
     const body: GatewayResponsesBody = { model: model.model, input, max_output_tokens: gatewayOutputTokens(model), stream: model.stream !== false, store: false };
+    const effort = sessionEffort(model, 'openai-responses');
+    if (effort !== undefined) body.reasoning = { effort };
     if (tools.length) { body.tools = tools; body.tool_choice = 'auto'; }
     if (request.toolMode === 'required') log?.('[gateway] required tool choice mapped to auto');
     // As on Messages: aliases the Gateway refuses sampling for never get it, on either protocol.

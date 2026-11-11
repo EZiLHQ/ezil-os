@@ -1,3 +1,4 @@
+import { sessionEffort } from './effort';
 // The Bedrock Converse subset of Anthropic Messages. Construct envelopes from an allowlist;
 // never forward Copilot's provider-specific options, cache markers or unsigned thinking.
 import { applyCacheBreakpoints } from './anthropic';
@@ -56,7 +57,7 @@ export type GatewayMessage = { role: 'user' | 'assistant'; content: Block[] };
 export type GatewayTool = { name: string; input_schema: ObjectValue; description?: string };
 export type GatewayBody = {
     model: string; messages: GatewayMessage[]; system?: TextBlock[]; max_tokens: number; stream: boolean;
-    tools?: GatewayTool[]; tool_choice?: { type: 'auto' }; temperature?: number; top_p?: number;
+    output_config?: { effort: string }; tools?: GatewayTool[]; tool_choice?: { type: 'auto' }; temperature?: number; top_p?: number;
 };
 
 export function isObject(value: unknown): value is ObjectValue {
@@ -349,6 +350,7 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
             + 'or turn those tools off with Configure Tools', undefined, 'local_tools_unsupported', undefined, undefined, 'local');
     }
     const conversation = gatewayConversation(request.messages, tools, replaysThinking(model.model));
+    const effort = sessionEffort(model, 'anthropic-messages');
     const body: GatewayBody = {
         model: model.model, messages: conversation.messages, max_tokens: gatewayOutputTokens(model),
         stream: model.model !== KIMI && model.stream !== false,
@@ -366,6 +368,7 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
     // adds them. Never on a Gemini body:
     // the Gateway's Gemini adapter refuses cache_control on any block. Placed before the byte bound so it counts them.
     if (model.gatewayPromptCache === true && !geminiRoute(model.model)) applyCacheBreakpoints(body as unknown as Parameters<typeof applyCacheBreakpoints>[0], '5m');
+    if (effort !== undefined) body.output_config = { effort };
     const bytes = new TextEncoder().encode(JSON.stringify(body));
     // The Gateway's limits: 1024 messages, 1024 blocks in one message, body + framing within the input allowance.
     const counts = (): LocalRequestCounts => ({

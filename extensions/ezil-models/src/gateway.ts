@@ -1,3 +1,4 @@
+import { parseGatewayEffort, type GatewayEffortCapability } from './effort';
 // EZiL AI gateway transport (provider type `ezil-gateway`): one Idempotency-Key per chat turn, the body
 // serialized once and the same bytes reused on the only retries the contract allows, error mapping by
 // `error.code`, the `/v1/models` limits cache and the credit states. ezil-ai-gateway
@@ -76,7 +77,7 @@ export type GatewayAvailability = { state: typeof AVAILABILITY_STATES[number]; r
 /** Capability flags a row may carry. Absent means "not established": a catalog-only row gets none of them. */
 export type GatewayCapabilities = { tool_calling?: boolean; image_input?: boolean; streaming?: boolean; prompt_cache?: boolean };
 export type GatewayModel = { id: string; enabled: boolean; max_input_tokens: number; max_output_tokens: number; protocols?: readonly GatewayProtocol[];
-    availability?: GatewayAvailability; name?: string; capabilities?: GatewayCapabilities };
+    effort?: GatewayEffortCapability; availability?: GatewayAvailability; name?: string; capabilities?: GatewayCapabilities };
 export type GatewayModels = { killswitch: boolean; pause: 'operations' | 'reconciliation' | null; data: GatewayModel[];
     /** v1 `default_model`: the Gateway's suggested first model for this caller (contract §2 rule 8); absent when null. */
     default_model?: string;
@@ -219,6 +220,7 @@ export function parseGatewayModels(json: unknown): GatewayModels | undefined {
         if (typeof entry.name === 'string' && DISPLAY_NAME.test(entry.name.trim())) row.name = entry.name.trim();
         const capabilities = capabilitiesOf(entry.capabilities);
         if (capabilities && protocols?.length && KNOWN_PROTOCOLS.includes(protocols[0]!)) row.capabilities = capabilities;
+        if (protocols?.length && KNOWN_PROTOCOLS.includes(protocols[0]!)) row.effort = parseGatewayEffort(entry.effort, protocols[0]!);
         return row;
     });
     const models: GatewayModels = { killswitch: raw.killswitch === true, pause: raw.pause === 'operations' || raw.pause === 'reconciliation' ? raw.pause : null, data };
@@ -242,13 +244,16 @@ export function gatewayModelAvailable(model: ResolvedModel, catalog: GatewayMode
  */
 export function withGatewayModelLimits(model: ResolvedModel, catalog: GatewayModels | undefined): ResolvedModel {
     const entry = catalog?.data.find(entry => entry.id === model.model);
-    if (!entry || model.provider.type !== 'ezil-gateway') return model;
+    if (model.provider.type !== 'ezil-gateway') return model;
+    if (!entry) { const { gatewayEffort: _effort, ...rest } = model; return rest; }
     const capabilities = entry.capabilities;
     // A row that no longer says prompt_cache: true takes the catalog-granted markers away (route moved off Claude).
-    const { gatewayPromptCache, ...rest } = model;
+    const { gatewayPromptCache, gatewayEffort: _effort, ...rest } = model;
     const cache = gatewayPromptCache && capabilities?.prompt_cache !== true ? { cache: { ...model.cache, enabled: false } } : {};
     const keep = gatewayPromptCache && capabilities?.prompt_cache === true ? { gatewayPromptCache } : {};
-    return { ...rest, ...keep, ...cache, maxInputTokens: Math.min(model.maxInputTokens, entry.max_input_tokens),
+    const effort = entry.enabled && entry.availability?.state === 'available' && !catalog?.killswitch && !catalog?.pause
+        ? parseGatewayEffort(entry.effort, model.gatewayProtocol ?? 'anthropic-messages') : undefined;
+    return { ...rest, ...keep, ...cache, ...(effort ? { gatewayEffort: effort } : {}), maxInputTokens: Math.min(model.maxInputTokens, entry.max_input_tokens),
         maxOutputTokens: Math.min(model.maxOutputTokens, entry.max_output_tokens),
         capabilities: { toolCalling: capabilities?.tool_calling === false ? false : model.capabilities.toolCalling,
             imageInput: model.capabilities.imageInput && capabilities?.image_input !== false },
@@ -298,6 +303,7 @@ export function gatewayCatalogModels(provider: ResolvedProvider, catalog: Gatewa
         models.push({
             id: catalogModelId(provider, entry.id), name: entry.name ?? entry.id, providerName: provider.name, provider, model: entry.id,
             ...protocol === 'openai-responses' ? { gatewayProtocol: protocol } : {},
+            ...!catalog.killswitch && !catalog.pause && parseGatewayEffort(entry.effort, protocol) ? { gatewayEffort: parseGatewayEffort(entry.effort, protocol) } : {},
             family: entry.id, version: '1',
             maxInputTokens: entry.max_input_tokens, maxOutputTokens: Math.max(16, Math.min(16_384, entry.max_output_tokens)),
             capabilities: { toolCalling: entry.capabilities?.tool_calling === true, imageInput: false },
@@ -467,7 +473,7 @@ export function availableForAccount(catalog: GatewayModels, alias: string): bool
  * This bounds the age at emission only: the time the sync then spends in transit to OS is not counted here.
  */
 export async function accountAvailableIds(models: readonly ResolvedModel[], ids: readonly string[], doFetch: typeof fetch,
-    now: number | (() => number) = Date.now): Promise<Set<string>> {
+    now: number | (() => number) = Date.now, effortEvidence?: Map<string, GatewayEffortCapability>): Promise<Set<string>> {
     const clock = typeof now === 'function' ? now : () => now;
     type Evidence = { at: number; models: GatewayModels } | undefined;
     const evidence = new Map<string, Promise<Evidence>>();
@@ -490,12 +496,26 @@ export async function accountAvailableIds(models: readonly ResolvedModel[], ids:
         const alias = configured ? configured.model : catalogOnly?.alias;
         if (!provider || provider.type !== 'ezil-gateway' || !alias) continue;
         const seen = await read(provider);
-        if (seen && availableForAccount(seen.models, alias)) candidates.set(id, seen.at);
+        if (seen && availableForAccount(seen.models, alias)) {
+            candidates.set(id, seen.at);
+            const row = seen.models.data.find(m => m.id === alias);
+            const protocol = configured?.gatewayProtocol ?? row?.protocols?.[0] ?? 'anthropic-messages';
+            const cap = parseGatewayEffort(row?.effort, protocol);
+            if (cap) effortEvidence?.set(id, cap);
+        }
     }
     const emitted = clock();
     const allowed = new Set<string>();
     for (const [id, at] of candidates) if (emitted >= at && emitted - at <= ACCOUNT_EVIDENCE_MAX_AGE_MS) allowed.add(id);
+    for (const id of effortEvidence?.keys() ?? []) if (!allowed.has(id)) effortEvidence?.delete(id);
     return allowed;
+}
+
+export async function accountModelEvidence(models: readonly ResolvedModel[], ids: readonly string[], doFetch: typeof fetch,
+    now: number | (() => number) = Date.now): Promise<{ available: Set<string>; efforts: Map<string, GatewayEffortCapability> }> {
+    const efforts = new Map<string, GatewayEffortCapability>();
+    const available = await accountAvailableIds(models, ids, doFetch, now, efforts);
+    return { available, efforts };
 }
 
 /** How long a catalog that can no longer be read still lists the rows it had (only for its own base URL + token). */
