@@ -1,3 +1,4 @@
+import { drainFeedbackNotifications } from '@/server/feedback/notifications';
 import type { SQL } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -18,6 +19,7 @@ import { refreshAiPlans } from '@/server/lib/ai-credential';
 import { GET, maxDuration } from './route';
 
 const mockEnv = vi.hoisted(() => ({ CRON_SECRET: undefined as string | undefined, CLOUDFLARE_GUACAMOLE_HMAC_SECRET: undefined as string | undefined }));
+vi.mock('@/server/feedback/notifications', () => ({ drainFeedbackNotifications: vi.fn() }));
 vi.mock('@/env', () => ({ env: mockEnv }));
 vi.mock('@/server/db', () => ({ db: {} }));
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn() }));
@@ -48,6 +50,7 @@ const request = (authorization?: string) => new Request('https://app.test/api/cr
 beforeEach(() => {
     vi.resetAllMocks();
     mockEnv.CRON_SECRET = 'cron';
+    vi.mocked(drainFeedbackNotifications).mockResolvedValue({ accepted: 0, retry: 0, skipped: true });
     vi.mocked(getBillingDeps).mockReturnValue(deps);
     vi.mocked(handleBillingSessionSweep).mockResolvedValue(counts);
     vi.mocked(isPlacementReadEnabled).mockReturnValue(true);
@@ -267,5 +270,28 @@ describe('GET /api/cron/billing-session-sweep', () => {
         } else vi.mocked(routeComputer).mockResolvedValue({ kind: 'cloudflare',
             provider: { status: vi.fn().mockRejectedValue(fail) } } as unknown as RoutedComputer);
         expect(await (await wiring()).isStillRunning(computer, closedAt)).toBe(false);
+    });
+});
+
+
+describe('feedback notification retry wiring', () => {
+    it('does not drain for unauthenticated cron requests', async () => {
+        expect((await GET(request('Bearer wrong'))).status).toBe(404);
+        expect(drainFeedbackNotifications).not.toHaveBeenCalled();
+    });
+    it('drains before constructing billing dependencies so billing failure cannot strand feedback', async () => {
+        vi.mocked(getBillingDeps).mockImplementation(() => { throw new Error('billing unavailable'); });
+        await expect(GET(request('Bearer cron'))).rejects.toThrow('billing unavailable');
+        expect(drainFeedbackNotifications).toHaveBeenCalledExactlyOnceWith(db, null);
+        expect(vi.mocked(drainFeedbackNotifications).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(getBillingDeps).mock.invocationCallOrder[0]!);
+    });
+    it('mail drain failure cannot interrupt billing work or expose provider errors', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        vi.mocked(drainFeedbackNotifications).mockRejectedValue(new Error('secret-mail-key'));
+        try {
+            expect((await GET(request('Bearer cron'))).status).toBe(200);
+            expect(handleBillingSessionSweep).toHaveBeenCalledTimes(1);
+            expect(warn).toHaveBeenCalledExactlyOnceWith('[feedback] notification sweep unavailable');
+        } finally { warn.mockRestore(); }
     });
 });

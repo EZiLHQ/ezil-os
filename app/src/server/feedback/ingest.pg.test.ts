@@ -26,7 +26,7 @@ describe.skipIf(!PG)('feedback ingest on PostgreSQL with app/drizzle/0011_feedba
         await admin!.unsafe(`DO $$ BEGIN CREATE ROLE anon; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
             DO $$ BEGIN CREATE ROLE authenticated; EXCEPTION WHEN duplicate_object THEN NULL; END $$;`);
         await admin!.unsafe(`CREATE SCHEMA ${name}`); created = true;
-        const sql = readFileSync(path.resolve(__dirname, '../../../drizzle/0011_feedback.sql'), 'utf8');
+        const sql = ['0011_feedback.sql', '0022_feedback_notifications.sql'].map(f => readFileSync(path.resolve(__dirname, '../../../drizzle/', f), 'utf8')).join('\n');
         await admin!.begin((tx) => tx.unsafe(sql.replaceAll('public.', `${name}.`)));
         await admin!.unsafe(`CREATE TABLE ${name}.ezil_computers (id uuid PRIMARY KEY, user_id uuid NOT NULL, deleted_at timestamptz)`);
     });
@@ -42,6 +42,7 @@ describe.skipIf(!PG)('feedback ingest on PostgreSQL with app/drizzle/0011_feedba
         expect(rows.map((r) => [r.relname, r.relrowsecurity, r.anon, r.authed])).toEqual([
             ['ezil_feedback_access_log', true, false, false],
             ['ezil_feedback_attachments', true, false, false],
+            ['ezil_feedback_notifications', true, false, false],
             ['ezil_feedback_reports', true, false, false],
         ]);
     });
@@ -53,6 +54,8 @@ describe.skipIf(!PG)('feedback ingest on PostgreSQL with app/drizzle/0011_feedba
         const rows = await admin!.unsafe(`SELECT deploy_sha, client_request_id FROM ${name}.ezil_feedback_reports WHERE user_id = $1`, [user]);
         expect(rows).toHaveLength(1);
         expect(rows[0]).toMatchObject({ deploy_sha: SHA, client_request_id: body.clientRequestId });
+        const queued = await admin!.unsafe(`SELECT report_id FROM ${name}.ezil_feedback_notifications WHERE report_id IN (SELECT id FROM ${name}.ezil_feedback_reports WHERE user_id=$1)`, [user]);
+        expect(queued).toHaveLength(1);
     });
 
     it('the 11th report in an hour is 429; a replay of an accepted one still answers 200', async () => {

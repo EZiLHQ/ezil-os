@@ -42,7 +42,7 @@ describe.skipIf(!PG)('feedback submission-time server context on PostgreSQL', ()
         schemas.push(name);
         await admin!.unsafe(`CREATE SCHEMA ${name}`);
         const local = (sql: string) => sql.replaceAll('public.', `${name}.`);
-        await admin!.begin((tx) => tx.unsafe(local(read('app/drizzle/0011_feedback.sql'))));
+        await admin!.begin((tx) => tx.unsafe(local(read('app/drizzle/0011_feedback.sql') + '\n' + read('app/drizzle/0022_feedback_notifications.sql'))));
         await admin!.unsafe(`CREATE TABLE ${name}.ezil_computers (id uuid PRIMARY KEY, user_id uuid NOT NULL, deleted_at timestamptz)`);
         if (opts.compute !== false) {
             // Production deliberately has no 0012 reverse-move table (`reverse: false`).

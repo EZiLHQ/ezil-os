@@ -1,3 +1,5 @@
+import { drainFeedbackNotifications } from '@/server/feedback/notifications';
+import { feedbackNotificationMailer } from '@/server/feedback/notification-mail';
 import { and, asc, gt, isNull } from 'drizzle-orm';
 import { env } from '@/env';
 import { routeComputer } from '@/server/api/routers/compute-dispatch';
@@ -82,6 +84,12 @@ function aiPlanRefresh(now: Date) {
 export async function GET(req: Request): Promise<Response> {
     if (!env.CRON_SECRET) return new Response(null, { status: 404 });
     if (req.headers.get('authorization') !== `Bearer ${env.CRON_SECRET}`) return new Response(null, { status: 404 });
+    // Independent of billing configuration: feedback notifications must retry even
+    // when a billing dependency is unavailable. One send adds at most 5 seconds.
+    try {
+        const notices = await drainFeedbackNotifications(db, feedbackNotificationMailer(process.env.FEEDBACK_SMTP2GO_API_KEY));
+        if (notices.accepted || notices.retry) console.info('[feedback] notification sweep', notices);
+    } catch { console.warn('[feedback] notification sweep unavailable'); }
     let deps: ReturnType<typeof getBillingDeps>, now: Date;
     try {
         deps = getBillingDeps();

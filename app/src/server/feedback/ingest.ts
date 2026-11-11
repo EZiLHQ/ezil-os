@@ -71,6 +71,12 @@ export async function ingestFeedback(
             shellVersion: diagnostics?.shellVersion ?? null, status: 'new', redactionCount: description.count,
             hasScreenshot: screenshotAccepted, deploySha,
         });
+        // Same transaction as the report: a crash cannot lose its notification, and a
+        // replay returns above without enqueuing another. This stores no report content.
+        await tx.execute(sql`INSERT INTO ezil_feedback_notifications
+            (report_id, category, created_at, attempts, next_attempt_at, accepted_at, provider_message_id)
+            VALUES (${id}::uuid, ${input.category}, ${now.toISOString()}::timestamptz, 0,
+                ${now.toISOString()}::timestamptz, NULL, NULL)`);
         // The table has no ordinal column (production grammar: no defaults or constraints), so each image's
         // created_at is the report time plus its position in milliseconds; `findScreenshot` orders by it.
         if (screenshotAccepted) await tx.insert(feedbackAttachments).values(images.map((image, index) => ({
@@ -121,6 +127,7 @@ export async function deleteFeedback(db: FeedbackDb, userId: string, id: string)
         // Explicit scope on BOTH deletes prevents an attachment from escaping
         // the owner boundary even without FKs (docs/FEEDBACK-CONTROLS-CONTRACT.md:130).
         await tx.delete(feedbackAttachments).where(and(eq(feedbackAttachments.reportId, id), eq(feedbackAttachments.userId, userId)));
+        await tx.execute(sql`DELETE FROM ezil_feedback_notifications WHERE report_id = ${id}::uuid`);
         const deleted = await tx.delete(feedbackReports).where(owned).returning({ id: feedbackReports.id });
         return deleted.length > 0;
     }, { isolationLevel: 'read committed' });

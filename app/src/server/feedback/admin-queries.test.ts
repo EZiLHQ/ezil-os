@@ -213,14 +213,14 @@ describe('admin SQL scope and projection', () => {
         expect(d.recordAccess).not.toHaveBeenCalled();
     });
 
-    it('deletes attachments before reports in one dependent statement, retaining audit history', async () => {
+    it('deletes queued notifications and attachments with their report, retaining audit history', async () => {
         const { queries, statements } = queryDb();
         await queries.deleteReport(id);
         expect(statements).toHaveLength(1);
-        expect(statements[0]!.sql).toMatch(/WITH deleted_attachments AS \(\s*DELETE FROM ezil_feedback_attachments[\s\S]+DELETE FROM ezil_feedback_reports/);
+        expect(statements[0]!.sql).toMatch(/WITH deleted_notifications AS \(\s*DELETE FROM ezil_feedback_notifications[\s\S]+deleted_attachments AS \(\s*DELETE FROM ezil_feedback_attachments[\s\S]+DELETE FROM ezil_feedback_reports/);
         expect(statements[0]!.sql).toMatch(/SELECT count\(\*\) FROM deleted_attachments/);
         expect(statements[0]!.sql).not.toContain('ezil_feedback_access_log');
-        expect(statements[0]!.params).toEqual([id, id]);
+        expect(statements[0]!.params).toEqual([id, id, id]);
     });
 });
 
