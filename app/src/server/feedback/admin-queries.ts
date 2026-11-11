@@ -121,11 +121,14 @@ export function feedbackAdminQueries(db: FeedbackDb): FeedbackAdminQueries & Pic
             // One atomic statement. The dependency on the CTE completes the
             // attachment delete before deleting the report; audit rows survive.
             await db.execute(sql`
-                WITH deleted_attachments AS (
+                WITH deleted_notifications AS (
+                    DELETE FROM ezil_feedback_notifications WHERE report_id = ${id}::uuid RETURNING report_id
+                ), deleted_attachments AS (
                     DELETE FROM ezil_feedback_attachments WHERE report_id = ${id} RETURNING report_id
                 )
                 DELETE FROM ezil_feedback_reports
                 WHERE id = ${id} AND (SELECT count(*) FROM deleted_attachments) >= 0
+                    AND (SELECT count(*) FROM deleted_notifications) >= 0
             `);
         },
     };

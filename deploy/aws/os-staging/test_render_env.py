@@ -41,7 +41,7 @@ class RenderEnvTests(unittest.TestCase):
         # every key is optional and none is required for a working app.
         feedback = {"EZIL_OS_FEEDBACK": "1", "EZIL_OS_FEEDBACK_SCREENSHOTS": "1",
                     "FEEDBACK_PILOT_EMAILS": "a@example.com,b@example.com",
-                    "FEEDBACK_ADMIN_EMAILS": "contact@ezil.work"}
+                    "FEEDBACK_ADMIN_EMAILS": "contact@ezil.work", "FEEDBACK_SMTP2GO_API_KEY": "synthetic-provider-key"}
         self.assertEqual(renderer.validate({**self.values, **feedback}), {**self.values, **feedback})
         self.assertTrue(set(feedback) <= renderer.OPTIONAL)
         self.assertFalse(set(feedback) & renderer.REQUIRED)

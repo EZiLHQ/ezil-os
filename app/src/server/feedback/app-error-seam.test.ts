@@ -121,7 +121,7 @@ describe('a real router refusal reaches a consented feedback report unchanged', 
             await admin!.unsafe(`DO $$ BEGIN CREATE ROLE anon; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
                 DO $$ BEGIN CREATE ROLE authenticated; EXCEPTION WHEN duplicate_object THEN NULL; END $$;`);
             await admin!.unsafe(`CREATE SCHEMA ${name}`);
-            const sql = readFileSync(path.resolve(__dirname, '../../../drizzle/0011_feedback.sql'), 'utf8');
+            const sql = ['0011_feedback.sql', '0022_feedback_notifications.sql'].map(f => readFileSync(path.resolve(__dirname, '../../../drizzle/', f), 'utf8')).join('\n');
             await admin!.begin((tx) => tx.unsafe(sql.replaceAll('public.', `${name}.`)));
             await admin!.unsafe(`CREATE TABLE ${name}.ezil_computers (id uuid PRIMARY KEY, user_id uuid NOT NULL, deleted_at timestamptz)`);
             await admin!.unsafe(`INSERT INTO ${name}.ezil_computers (id, user_id) VALUES ($1, $2)`, [computerId, userId]);

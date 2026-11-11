@@ -1,4 +1,9 @@
+import { after } from 'next/server';
+import { drainFeedbackNotifications } from '@/server/feedback/notifications';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('next/server', () => ({ after: vi.fn() }));
+vi.mock('@/server/feedback/notifications', () => ({ drainFeedbackNotifications: vi.fn() }));
 
 const state = vi.hoisted(() => ({ statements: [] as { sql: string; params: unknown[] }[] }));
 const USER = { id: '550e8400-e29b-41d4-a716-446655440000', email: 'alice@example.com' };
@@ -27,6 +32,9 @@ const post = () => POST(new Request('https://example.test/api/shell/feedback', {
 const insertedReport = () => state.statements.find((s) => s.sql.startsWith('insert into "ezil_feedback_reports"'));
 
 beforeEach(() => {
+    vi.mocked(after).mockReset();
+    vi.mocked(drainFeedbackNotifications).mockReset();
+    vi.stubEnv('FEEDBACK_SMTP2GO_API_KEY', '');
     state.statements.length = 0;
     vi.stubEnv('EZIL_OS_FEEDBACK', '1');
     vi.stubEnv('FEEDBACK_PILOT_EMAILS', '');
@@ -49,5 +57,33 @@ describe('POST /api/shell/feedback stamps the deployed commit (F6 wiring)', () =
         const insert = insertedReport();
         expect(insert?.sql).toContain('"deploy_sha"');
         expect(insert?.params).not.toContain('not-a-sha');
+    });
+});
+
+
+describe('new feedback quick notification delivery', () => {
+    it('schedules a post-response drain only after report and queue commit', async () => {
+        vi.stubEnv('FEEDBACK_SMTP2GO_API_KEY', 'synthetic-provider-key');
+        expect((await post()).status).toBe(201);
+        expect(state.statements.some(s => s.sql.includes('INSERT INTO ezil_feedback_notifications'))).toBe(true);
+        expect(after).toHaveBeenCalledTimes(1);
+        expect(drainFeedbackNotifications).not.toHaveBeenCalled();
+        const callback = vi.mocked(after).mock.calls[0]![0] as () => Promise<void>;
+        await callback();
+        expect(drainFeedbackNotifications).toHaveBeenCalledTimes(1);
+    });
+    it('a failed post-response drain cannot undo the accepted feedback', async () => {
+        vi.stubEnv('FEEDBACK_SMTP2GO_API_KEY', 'synthetic-provider-key');
+        vi.mocked(drainFeedbackNotifications).mockRejectedValue(new Error('secret-provider-error'));
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        try {
+            expect((await post()).status).toBe(201);
+            await (vi.mocked(after).mock.calls[0]![0] as () => Promise<void>)();
+            expect(warn).toHaveBeenCalledExactlyOnceWith('[feedback] notification delivery deferred');
+        } finally { warn.mockRestore(); }
+    });
+    it('does not schedule delivery without a server mail credential', async () => {
+        expect((await post()).status).toBe(201);
+        expect(after).not.toHaveBeenCalled();
     });
 });
