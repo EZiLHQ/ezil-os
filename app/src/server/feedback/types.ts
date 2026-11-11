@@ -24,6 +24,12 @@ export const FEEDBACK_LIMITS = Object.freeze({
     recentEventCorrelationIdMax: 64,
     /** At most this many recent events (the newest) keep a reason/correlation id. */
     recentEventsAnnotatedMax: 10,
+    /** Upload-first: a staged image must be this fresh when its report is finalized; a re-PUT renews it. */
+    stagedImageFreshMs: 3_600_000,
+    /** Upload-first: staged images that never became a report are deleted after this. */
+    stagedImageTtlMs: 86_400_000,
+    /** Upload-first: tickets (reports not yet finalized) one user may hold staged images for at once. */
+    stagedTicketsPerUser: 3,
     perUserPerHour: 10,
     perUserPerDay: 30,
     globalAttachmentBytesPerDay: 500 * 1024 * 1024,
@@ -184,6 +190,10 @@ const feedbackImageSchema = z
 
 export type FeedbackImageInput = z.infer<typeof feedbackImageSchema>;
 
+const stagedImageRefSchema = z
+    .object({ sha256: z.string().regex(/^[0-9a-f]{64}$/), contentType: z.enum(FEEDBACK_IMAGE_TYPES) })
+    .strict();
+
 export const feedbackSubmitSchema = z
     .object({
         v: z.literal(1),
@@ -197,12 +207,17 @@ export const feedbackSubmitSchema = z
         screenshot: feedbackImageSchema.nullable().optional(),
         // Two or more images, in the order the reporter arranged them.
         screenshots: z.array(feedbackImageSchema).min(1).max(FEEDBACK_LIMITS.imagesMax).optional(),
+        // Upload-first: images already staged by `PUT ?crid=` for this clientRequestId, by hash, in report order.
+        screenshotRefs: z.array(stagedImageRefSchema).min(1).max(FEEDBACK_LIMITS.imagesMax).optional(),
     })
     .strict()
-    .refine(body => body.screenshot == null || body.screenshots === undefined,
-        { path: ['screenshots'], message: 'Send screenshot or screenshots, not both' });
+    .refine(body => [body.screenshot != null, body.screenshots !== undefined, body.screenshotRefs !== undefined].filter(Boolean).length <= 1,
+        { path: ['screenshots'], message: 'Send one of screenshot, screenshots or screenshotRefs' })
+    .refine(body => new Set(body.screenshotRefs?.map(ref => ref.sha256)).size === (body.screenshotRefs?.length ?? 0),
+        { path: ['screenshotRefs'], message: 'The same image twice' });
 
 export type FeedbackSubmit = z.infer<typeof feedbackSubmitSchema>;
+export type StagedImageRef = z.infer<typeof stagedImageRefSchema>;
 
 /** The submitted images as one ordered list, whichever key carried them. */
 export function submittedImages(input: Pick<FeedbackSubmit, 'screenshot' | 'screenshots'>): FeedbackImageInput[] {
@@ -215,6 +230,12 @@ export interface FeedbackCreated {
     screenshotAccepted: boolean;
     /** Images stored with the report: all submitted ones, or 0 when the attachment budget refused them. */
     screenshotCount: number;
+}
+
+/** Answer to an upload-first `PUT`: the hash the server computed, and whether that report is already stored with it. */
+export interface FeedbackStaged {
+    sha256: string;
+    finalized: boolean;
 }
 
 export interface FeedbackReportSummary {

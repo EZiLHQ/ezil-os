@@ -287,3 +287,61 @@ snapshots, audited status changes, non-evicting retry behavior and rollout check
 The authoritative schema includes session, tracePhases, traceApp and bounded ages.
 Validated trace/server request IDs are preserved, excluding reporter/computer IDs;
 arbitrary text fields retain credential/UUID masking. Screenshot flags remain gated.
+
+
+## 2026-11-11 upload-first screenshots
+
+With `ui.feedbackStagedUploads: true` (present only while screenshots are on), Send uploads each image first, then
+posts the report. Nothing is uploaded before Send. The storage is the existing private `ezil_feedback_attachments`
+table: no DDL, no bucket, no URL, no image GET.
+
+- **Ticket.** The report id is derived from the signed-in user and `clientRequestId` (UUIDv8 layout, sha256 of a fixed
+  label, the user id and the request id): `ingest.ts` `stagingTicket`. Every read and write also filters `user_id`, so
+  the ticket is never a credential.
+- **`PUT /api/shell/feedback?crid=<uuid>`**, body is the raw image, `Content-Type` is `image/png|jpeg|webp` (never a
+  simple form type).
+  - Rejected before the DB:
+    - 404 while screenshots are off
+    - 400 for a bad `crid`, an empty body, or a header that does not match the declared type
+    - 415 for any other type
+    - 413 over 1.5 MiB (byte-counted read)
+    - 400 above 4096 px a side
+  - In one READ COMMITTED transaction, taking the user lock and then the global attachment lock, the same order as
+    finalize:
+    - **Report already stored for this request:** 200 `{sha256, finalized: true}` if it holds this image, otherwise
+      409 `report_already_sent`. A stored report is never changed.
+    - **Same image staged within the hour:** 200 `{sha256, finalized: false}`, a no-op.
+    - **Same image staged earlier:** renewed. The row is deleted and re-inserted at now, after a budget check that
+      credits its own bytes once in each window it is already counted in.
+    - **Ticket full:** above 5 images or 1.75 MiB, 413 `payload_too_large`.
+    - **Pending cap:** a ticket with no row from the last 24 h is admitted only while the user holds fewer than 3
+      such unsent tickets, otherwise 429 `staged_reports_limit`.
+    - **Budget:** the global 500 MiB/day and 5 GiB budgets include staged bytes; over them, 507 `attachment_budget`.
+    - Otherwise 201 `{sha256, finalized: false}`.
+- **Finalize: `POST`** with `screenshotRefs: [{sha256, contentType}]`, 1–5 distinct, in report order. It is exclusive
+  with `screenshot` and `screenshots`.
+  - A replay of `(user, clientRequestId)` answers the stored report first, as before.
+  - Otherwise, after the rate limit and under the attachment lock:
+    - Every reference must match this user's staged row on this ticket: same type, staged within the last hour.
+    - If any does not, 409 `staged_images_missing` and nothing is stored. The client uploads again and retries once.
+      Another user's references look the same as missing ones.
+  - Then, atomically:
+    - unreferenced staged rows are deleted
+    - each image's `created_at` becomes now plus its position (this order is what the admin viewer shows)
+    - the report row is inserted with the ticket as its id
+  - The rows are under an hour old, so moving them keeps the global sums unchanged.
+- **Account guard.** The shell sends `X-EZiL-Feedback-Account: <boot user id>` on every PUT and every POST it makes.
+  The server compares it with the signed-in user only; it is not an identity or permission.
+  - It is checked before the body is read or the DB is touched.
+  - A malformed header is 400 `invalid_account_header`.
+  - A different account is 409 `account_changed`, which never echoes either id.
+  - The header is required on PUT and with `screenshotRefs` (400 `account_header_required`).
+  - On a legacy inline POST it is optional, and is checked only when present.
+  - This keeps one account's staged images from being sent under another account's cookie after a cross-tab
+    account switch.
+- **Visibility.** Staged rows have no report row. The reporter's list, the admin list and detail, and `findScreenshot`
+  never show them.
+- **Cleanup.** The existing maintenance cron deletes staged rows with no report after 24 h (`retention.ts`). Finalize
+  only accepts rows under an hour old, so cleanup never races it.
+- **Compatibility.** Inline `screenshot` and `screenshots` keep working, for older shells and for bodies already queued
+  for retry.
