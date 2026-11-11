@@ -186,6 +186,77 @@ describe.skipIf(!URL_)('EZiL MCP session controls on Postgres', () => {
     afterEach(() => { h.cookieUser = null; vi.restoreAllMocks(); vi.unstubAllEnvs(); });
     afterAll(async () => { await client?.end(); });
 
+
+    describe('protocol3 observed effort PostgreSQL regression', () => {
+        const offered = { status: 'available', observedAt: 1, models: ['ezil/a', 'ezil/b'].map(id => ({
+            id, label: id, engine: 'ezil-chat', availability: 'available', efforts: ['low', 'high'], defaultEffort: null, configuredEffort: null,
+        })) };
+        const setup = async () => {
+            vi.stubEnv('EZIL_EDITOR_BRIDGE_EFFORT', 'enabled');
+            const state = await connect('idle', `p3-${randomUUID()}`, 2);
+            const tick = (protocol: number, extra: Record<string, unknown> = {}) => sync({ownerId: state.owner, epoch: state.epoch, protocol, ...extra});
+            const snapshot = (model: string, effort?: string) => ({resource: state.resources[0], title: 'synthetic', open: true, status: 'idle', model, requests: 0,
+                ...(effort === undefined ? {} : {effort})});
+            await tick(3, {sessions: [snapshot('ezil/a', 'high')], catalog: offered});
+            return {...state, tick, snapshot};
+        };
+        const settings = (id: string) => read('agentSession.settings', {sessionId: id}).then(data<{settings: {model: string; effort: string|null}|null}>);
+        const roundControl = async (state: Awaited<ReturnType<typeof setup>>, kind: 'create'|'configure', input: Record<string, unknown>,
+            report: Record<string, unknown>, protocol = 3) => {
+            const key = randomUUID();
+            const response = write(`agentSession.${kind}`, {...input, idempotencyKey:key});
+            let row: Record<string, unknown> | undefined;
+            for(let i=0;i<200;i++) {
+                row=(await client`SELECT id FROM public.ezil_control_operations WHERE user_id=${alice}::uuid AND idempotency_key=${key}::uuid`)[0];
+                if(row) break;
+                await new Promise(resolve=>setTimeout(resolve,5));
+            }
+            expect(row).toBeDefined();
+            const delivered=(await state.tick(protocol)).deliver.find(d=>d.operationId===row!.id);
+            expect(delivered).toBeDefined();
+            await state.tick(protocol,{reports:[{operationId:delivered!.operationId,attemptId:delivered!.attemptId,status:'applied',...report}]});
+            return data<Control>(await response);
+        };
+        it.each(['snapshot2', 'snapshot1', 'configure2'])('3→legacy %s→3 heartbeat never freshens old effort', async legacy => {
+            const state=await setup(); const id=state.sessions[0]!;
+            expect((await settings(id)).settings).toMatchObject({model:'ezil/a',effort:'high'});
+            if(legacy==='snapshot2') await state.tick(2,{sessions:[state.snapshot('ezil/b')]});
+            else if(legacy==='snapshot1') await state.tick(1,{sessions:[{resource:state.resources[0],title:'legacy',open:true,status:'idle'}]});
+            else {
+                await state.tick(2,{catalog:{...offered,models:offered.models.map(m=>({...m,efforts:[],defaultEffort:null}))}});
+                const changed=await roundControl(state,'configure',{sessionId:id,model:'ezil/b'}, {model:'ezil/b'},2);
+                expect(changed.status).toBe('applied');
+                expect((await settings(id)).settings?.model).toBe('ezil/b');
+            }
+            // No snapshot accompanies this re-upgrade; a retained old value is not a new observation.
+            await state.tick(3);
+            expect((await settings(id)).settings?.effort).toBeNull();
+            const stored=(await client`SELECT effort, effort_observed_at, model_at, seen_at FROM public.ezil_agent_sessions WHERE id=${id}::uuid`)[0]!;
+            expect(stored.effort).toBe('high'); // retained history, invalidated witness
+            expect(stored.effort_observed_at).not.toBeNull();
+            await state.tick(3,{sessions:[state.snapshot('ezil/b','low')],catalog:offered});
+            expect((await settings(id)).settings).toMatchObject({model:'ezil/b',effort:'low'});
+        });
+        it('roundtrips protocol3 create/configure settings and operation selected_effort through real routes/store', async()=>{
+            const state=await setup();
+            const created=await roundControl(state,'create',{computerId:ids.a1,model:'ezil/a',effort:'low'},
+                {sessionResource:`vscode-chat-session://local/${randomUUID()}`,requestCount:0,model:'ezil/a',effort:'low'});
+            expect(created.status).toBe('applied');
+            expect(created.effective).toMatchObject({model:'ezil/a',effort:'low',source:'runtime'});
+            expect((await settings(created.sessionId!)).settings).toMatchObject({model:'ezil/a',effort:'low'});
+            const changed=await roundControl(state,'configure',{sessionId:created.sessionId,effort:'high'}, {model:'ezil/a',effort:'high'});
+            expect(changed.effective).toMatchObject({model:'ezil/a',effort:'high'});
+            expect((await settings(created.sessionId!)).settings?.effort).toBe('high');
+            const sent=await data<{id:string}>(await write('agentSession.send',{sessionId:created.sessionId,text:'synthetic bounded instruction',idempotencyKey:randomUUID()}));
+            const delivery=(await state.tick(3)).deliver.find(d=>d.operationId===sent.id)!;
+            expect(delivery).toBeDefined();
+            await state.tick(3,{reports:[{operationId:sent.id,attemptId:delivery.attemptId,status:'completed',selectedModelId:'ezil/a',selectedEffort:'high',responseText:'synthetic output'}]});
+            const observed=await data<{selectedEffort:string}>(await read('agentSession.operation',{operationId:sent.id}));
+            expect(observed.selectedEffort).toBe('high');
+            expect((await client`SELECT selected_effort FROM public.ezil_agent_operations WHERE id=${sent.id}::uuid`)[0]?.selected_effort).toBe('high');
+        });
+    });
+
     describe('computer.start', () => {
         it('starts an owned computer: allowance first, then pin, then boot, and the answer carries no URL', async () => {
             const key = randomUUID();

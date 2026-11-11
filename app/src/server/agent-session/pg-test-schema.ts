@@ -37,13 +37,17 @@ export async function ensureTestSchema(client: ReturnType<typeof postgres>): Pro
         for (const name of HARDENING_MIGRATIONS) {
             // 0025 only adds columns, so its marker is one of them.
             const [row] = name === '0026_session_effort'
-                ? await tx`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public'
-                    AND table_name = 'ezil_agent_sessions' AND column_name = 'effort') AS present`
+                ? await tx`SELECT count(*)::int AS effort_columns FROM information_schema.columns WHERE table_schema = 'public'
+                    AND ((table_name = 'ezil_agent_sessions' AND column_name IN ('effort', 'effort_observed_at'))
+                    OR (table_name = 'ezil_agent_operations' AND column_name = 'selected_effort'))`
                 : name === '0025_editor_controls'
                 ? await tx`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public'
                     AND table_name = 'ezil_control_operations' AND column_name = 'attempt_id') AS present`
                 : await tx`SELECT to_regclass(${marker[name]}) IS NOT NULL AS present`;
-            if (row!.present) continue;
+            if (name === '0026_session_effort') {
+                if (row!.effort_columns === 3) continue;
+                if (row!.effort_columns !== 0) throw new Error('Disposable fixture has an earlier partial 0026 proposal; recreate the fixture explicitly.');
+            } else if (row!.present) continue;
             for (const statement of migrationStatements(name)) await tx.unsafe(statement);
         }
     });

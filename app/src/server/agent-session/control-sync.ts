@@ -229,9 +229,9 @@ export async function applyControlReport(tx: SqlExecutor, computer: { id: string
             const tracked = typeof report.sessionResource === 'string' && report.sessionResource !== '' && report.requestCount === 0
                 ? await tx.execute(sql`/* control-sync:created-session */
                     INSERT INTO public.ezil_agent_sessions AS s (id, computer_id, user_id, resource, title, present, open, status, seen_at, next_seq,
-                        model, model_at, request_count, created_by_os, created_control_id${proto3 ? sql`, effort` : sql``})
+                        model, model_at, request_count, created_by_os, created_control_id${proto3 ? sql`, effort, effort_observed_at` : sql``})
                     VALUES (gen_random_uuid(), ${computer.id}::uuid, ${computer.userId}::uuid, ${report.sessionResource}, '', true, true, 'idle',
-                        ${now}, 0, ${model}, ${now}, 0, true, ${id}::uuid${proto3 ? sql`, ${effort}` : sql``})
+                        ${now}, 0, ${model}, ${now}, 0, true, ${id}::uuid${proto3 ? sql`, ${effort}, ${now}` : sql``})
                     ON CONFLICT (computer_id, user_id, resource) DO NOTHING
                     RETURNING s.id`)
                 : [];
@@ -249,7 +249,7 @@ export async function applyControlReport(tx: SqlExecutor, computer: { id: string
             return true;
         }
         await tx.execute(sql`/* control-sync:session-model */
-            UPDATE public.ezil_agent_sessions SET model = ${model}, model_at = ${now}${proto3 ? sql`, effort = ${effort}` : sql``}
+            UPDATE public.ezil_agent_sessions SET model = ${model}, model_at = ${now}${proto3 ? sql`, effort = ${effort}, effort_observed_at = ${now}` : sql``}
             WHERE id = ${String(op.session_id)}::uuid AND computer_id = ${computer.id}::uuid AND user_id = ${computer.userId}::uuid`);
         await tx.execute(sql`/* control-sync:configured */
             UPDATE public.ezil_control_operations SET status = 'applied', reason = ${report.reason ?? null}, attempt_id = NULL,

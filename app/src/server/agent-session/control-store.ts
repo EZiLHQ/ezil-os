@@ -329,7 +329,9 @@ export async function sessionSettings(db: SqlExecutor, userId: string, sessionId
     const base = { sessionId: session.id, computerId: session.computerId, status: session.status, bridge: session.bridge };
     if (session.bridge !== 'connected' || !session.open) return { ...base, settings: null };
     const rows = await db.execute(sql`/* control:session-model */
-        SELECT s.model, to_jsonb(s)->>'effort' AS effort, s.model_at, extract(epoch FROM (clock_timestamp() - s.model_at)) * 1000 AS age_ms
+        SELECT s.model, CASE WHEN (to_jsonb(s)->>'effort_observed_at')::timestamptz = s.model_at
+            AND (to_jsonb(s)->>'effort_observed_at')::timestamptz >= s.seen_at
+            THEN to_jsonb(s)->>'effort' END AS effort, s.model_at, extract(epoch FROM (clock_timestamp() - s.model_at)) * 1000 AS age_ms
         FROM public.ezil_agent_sessions s WHERE s.id = ${sessionId}::uuid AND s.user_id = ${userId}::uuid AND s.present`);
     const row = rows[0];
     if (!row || typeof row.model !== 'string' || row.model_at === null || row.age_ms === null || Number(row.age_ms) > CATALOG_FRESH_MS) {

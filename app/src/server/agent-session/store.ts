@@ -573,13 +573,13 @@ export async function syncEditor(db: SessionDb, computer: { id: string; userId: 
             if (proto2) {
                 await tx.execute(sql`/* agent-session:sessions-v2 */
                     INSERT INTO public.ezil_agent_sessions AS s (id, computer_id, user_id, resource, title, present, open, status, seen_at, next_seq,
-                        model, model_at, request_count${proto3 ? sql`, effort` : sql``})
+                        model, model_at, request_count${proto3 ? sql`, effort, effort_observed_at` : sql``})
                     SELECT gen_random_uuid(), ${computer.id}::uuid, ${computer.userId}::uuid, x.resource, x.title, true, x.open, x.status, ${now}, 0,
-                        CASE WHEN x.open THEN x.model END, ${now}, x.requests${proto3 ? sql`, CASE WHEN x.open THEN x.effort END` : sql``}
+                        CASE WHEN x.open THEN x.model END, ${now}, x.requests${proto3 ? sql`, CASE WHEN x.open THEN x.effort END, ${now}` : sql``}
                     FROM jsonb_to_recordset(${reported}::jsonb) AS x(resource text, title text, open boolean, status text, model text, requests integer, effort text)
                     ON CONFLICT (computer_id, user_id, resource) DO UPDATE SET
                         title = EXCLUDED.title, open = EXCLUDED.open, status = EXCLUDED.status, seen_at = EXCLUDED.seen_at, present = true,
-                        model = EXCLUDED.model, model_at = EXCLUDED.model_at, request_count = EXCLUDED.request_count${proto3 ? sql`, effort = EXCLUDED.effort` : sql``}`);
+                        model = EXCLUDED.model, model_at = EXCLUDED.model_at, request_count = EXCLUDED.request_count${proto3 ? sql`, effort = EXCLUDED.effort, effort_observed_at = EXCLUDED.effort_observed_at` : sql``}`);
             } else {
                 await tx.execute(sql`/* agent-session:sessions */
                     INSERT INTO public.ezil_agent_sessions AS s (id, computer_id, user_id, resource, title, present, open, status, seen_at, next_seq)
