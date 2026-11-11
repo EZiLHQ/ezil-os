@@ -3717,6 +3717,17 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     session_id: sessionId, iat: Math.floor(issuedAt / 1000), exp: Math.floor(issuedAt / 1000) + 3600,
   })).toString('base64url')}.c2ln`;
 
+  it('boot OS origin uses only the configured realm, never hostname or bridge URL', async () => {
+    const { obj } = await object();
+    for (const [zone, expected] of [[undefined, 'https://os.ezil.work'], ['ezil.org', 'https://os.ezil.work'],
+      ['ezil.work', 'https://os-staging.ezil.work'], ['untrusted.test', ''], ['', '']] as const) {
+      obj.env = { ...obj.env, SANDBOX_PREVIEW_ZONE_ROOT: zone, EZIL_OS_BRIDGE_URL: 'https://untrusted.test' };
+      const boot = await obj.aiProxyBootEnv('wrong-code.test', SANDBOX_NAME);
+      expect(boot.EZIL_OS_ORIGIN).toBe(expected);
+      expect(boot.EZIL_AI_BASE_URL).toContain('wrong-code.test/ai/v1');
+    }
+  });
+
   it('boot env carries a distinct editor-bridge token for the same nonce only while the bridge is on', async () => {
     const { obj, values } = await object();
     const off = await obj.aiProxyBootEnv('ezil.org', SANDBOX_NAME);

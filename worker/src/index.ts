@@ -80,7 +80,7 @@ import { awsCodeServerAnswers, awsRelayRefresh, awsScreenDesktop, ensureAwsDeskt
 import { recoverableStalePreview } from './stale-preview';
 // Per-tab Code folder continuity: the lexical plan, the restored-folder compose and the URL guard (no filesystem).
 import { codeFolderAnswer, fitsCodeFolderUrl, settleCodeFolder, type CodeFolderSettlement } from './code-folder';
-import { codeShellOriginsFor } from './code-folder-bridge';
+import { codeShellOriginsFor, osBillingOriginFor } from './code-folder-bridge';
 import { awsCodeFolderResolver, cloudflareCodeFolderResolver } from './code-folder-resolve';
 import { TERMINAL_WORK_PROBE_COMMAND, terminalKeepAliveFromProbe } from './terminal-keepalive';
 // Separate value import of the SAME class (under a local alias) so the
@@ -7681,6 +7681,7 @@ async function aiProxyBootEnv(env: Env, hostname: string, sandboxId: string, non
   const code = codePortFor('neko');
   if (!code) return {};
   return {
+    EZIL_OS_ORIGIN: osBillingOriginFor(env.SANDBOX_PREVIEW_ZONE_ROOT),
     EZIL_AI_BASE_URL: aiProxyBaseUrl(hostname, sandboxId, code.port, code.token),
     EZIL_AI_PROXY_TOKEN: secret ? await deriveAiProxyToken(secret, sandboxId, nonce) : '',
     // The editor bridge's own token (./editor-bridge.ts), same boot nonce, only while the bridge is on.

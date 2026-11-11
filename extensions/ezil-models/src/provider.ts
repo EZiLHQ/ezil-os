@@ -235,11 +235,11 @@ function aiCreditsLink(): vscode.Uri | undefined {
  * pricing page's Standard link.
  */
 function osBillingLink(query: string): vscode.Uri | undefined {
-    try {
-        const url = new URL(process.env.EZIL_AI_BASE_URL ?? '');
-        if (url.protocol === 'https:') return vscode.Uri.parse(`${url.origin}/os?settings=billing&${query}`);
-    } catch { /* no usable OS origin */ }
-    return undefined;
+    // Boot-owned navigation authority, separate from the computer's AI/Code proxy.
+    // Exact origins only: no userinfo, path, query, fragment or caller-provided destination.
+    const origin = process.env.EZIL_OS_ORIGIN;
+    if (origin !== 'https://os-staging.ezil.work' && origin !== 'https://os.ezil.work') return undefined;
+    return vscode.Uri.parse(`${origin}/os?settings=billing&${query}`);
 }
 
 /** A catalog as listed, for noticing that a later read changed it (ids, availability, caps, capabilities and the plan's limit). */
@@ -604,7 +604,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 this.lastCreditWarningAt = Date.now();
                 const link = aiCreditsLink();
                 void this.askBilling({ reason: 'credits_exhausted', requestId: error.requestId }).then(opened => opened ? undefined
-                    : Promise.resolve(vscode.window.showWarningMessage(message, ...link ? ['Add credits'] : [])).then(choice => {
+                    : Promise.resolve(vscode.window.showWarningMessage(link ? message : `${message} Open EZiL OS Settings → Billing.`, ...link ? ['Add credits'] : [])).then(choice => {
                         if (choice === 'Add credits' && link) return vscode.env.openExternal(link);
                     })).catch(() => {});
             }
@@ -662,7 +662,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         if (!await this.askBilling({ reason: 'model_locked', model: alias })) {
             const link = osBillingLink('upgrade=standard');
             const name = configured?.name ?? (fresh ?? knownGatewayPlan(provider))?.data.find(row => row.id === alias)?.name ?? alias;
-            void Promise.resolve(vscode.window.showInformationMessage(`${name} is not included in your plan.`, ...link ? ['Upgrade'] : []))
+            void Promise.resolve(vscode.window.showInformationMessage(`${name} is not included in your plan.${link ? '' : ' Open EZiL OS Settings → Billing.'}`, ...link ? ['Upgrade'] : []))
                 .then(choice => { if (choice === 'Upgrade' && link) return vscode.env.openExternal(link); }).catch(() => {});
         }
         return 'asked';

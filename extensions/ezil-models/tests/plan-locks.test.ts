@@ -74,13 +74,14 @@ const opened: string[] = [];
 (fakeVscode.window as Record<string, unknown>).showInformationMessage = notices;
 (fakeVscode.env as Record<string, unknown>).openExternal = async (uri: URL) => { opened.push(String(uri)); return true; };
 
-// The OS links come from the computer's own EZIL_AI_BASE_URL (provider.ts osBillingLink), as in the image.
+// OS navigation uses a separate trusted boot origin, never the AI endpoint.
 const savedBase = process.env.EZIL_AI_BASE_URL;
+const savedOrigin = process.env.EZIL_OS_ORIGIN;
 beforeEach(() => {
-    forgetGatewayModels(); warnings.mockClear(); notices.mockClear(); errors.mockClear(); opened.length = 0; process.env.EZIL_AI_BASE_URL = BASE;
+    forgetGatewayModels(); warnings.mockClear(); notices.mockClear(); errors.mockClear(); opened.length = 0; process.env.EZIL_AI_BASE_URL = BASE; process.env.EZIL_OS_ORIGIN = 'https://os-staging.ezil.work';
     (fakeVscode.window as Record<string, unknown>).showErrorMessage = errors;
 });
-afterAll(() => { setSystemTime(); if (savedBase === undefined) delete process.env.EZIL_AI_BASE_URL; else process.env.EZIL_AI_BASE_URL = savedBase; });
+afterAll(() => { if (savedOrigin === undefined) delete process.env.EZIL_OS_ORIGIN; else process.env.EZIL_OS_ORIGIN = savedOrigin; setSystemTime(); if (savedBase === undefined) delete process.env.EZIL_AI_BASE_URL; else process.env.EZIL_AI_BASE_URL = savedBase; });
 
 describe('the picker on Free: Flash selectable, every other model listed but locked', () => {
     test('other models are locked (not selectable, lock icon, marker text); Flash is the one default', async () => {
@@ -200,7 +201,7 @@ describe('billing asks: exactly two credit codes, once a minute', () => {
         await Bun.sleep(0); await Bun.sleep(0);
         expect(g.intents).toHaveLength(1);
         expect(warnings).toHaveBeenCalledTimes(1);
-        expect(opened).toEqual(['https://computer.test/os?settings=billing&section=ai-credits&reason=insufficient_credits']);
+        expect(opened).toEqual(['https://os-staging.ezil.work/os?settings=billing&section=ai-credits&reason=insufficient_credits']);
     });
 
     test.each([
@@ -363,7 +364,7 @@ describe('a locked model chosen in the picker', () => {
         expect(await g.provider.lockedModelChosen(`ezil/${PRO}`)).toBe('asked');
         await Bun.sleep(0); await Bun.sleep(0);
         expect(notices.mock.calls[0]?.slice(0, 2)).toEqual(['Synthetic Pro is not included in your plan.', 'Upgrade']);
-        expect(opened).toEqual(['https://computer.test/os?settings=billing&upgrade=standard']);
+        expect(opened).toEqual(['https://os-staging.ezil.work/os?settings=billing&upgrade=standard']);
         for (const id of [undefined, 42, 'nope', 'other/model']) expect(await g.provider.lockedModelChosen(id)).toBe('ignored');
     });
 });
@@ -560,5 +561,45 @@ describe('the plan limit outlives the catalog', () => {
             expect(g.changes()).toBeGreaterThan(changes);
             expect(locked(await list(g.provider))).toEqual([]);
         } finally { setSystemTime(); }
+    });
+});
+
+describe('OS fallback origin isolation', () => {
+    test.each(['https://os-staging.ezil.work', 'https://os.ezil.work'])('trusted %s survives a wrong AI origin and failed bridge', async origin => {
+        process.env.EZIL_OS_ORIGIN = origin;
+        process.env.EZIL_AI_BASE_URL = 'https://8443-synthetic-code.ezil.work/ai/v1';
+        const g = gateway(free(), ok, async () => { throw new Error('bridge unavailable'); });
+        notices.mockImplementationOnce(async () => 'Upgrade');
+        await g.provider.lockedModelChosen(`ezil/${PRO}`);
+        await Bun.sleep(0); await Bun.sleep(0);
+        expect(opened).toEqual([origin + '/os?settings=billing&upgrade=standard']);
+        expect(g.posts).toEqual([]);
+    });
+
+    test.each([undefined, '', 'https://computer.test', 'https://os.ezil.work.evil.test', 'http://os.ezil.work',
+        'https://user@os.ezil.work', 'https://os.ezil.work/path', 'https://os.ezil.work?next=evil', 'https://os.ezil.work#x',
+        'https://os.ezil.work:443', 'https://os.ezil.work/'])('untrusted/missing origin %s gives instructions, no link', async origin => {
+        if (origin === undefined) delete process.env.EZIL_OS_ORIGIN;
+        else process.env.EZIL_OS_ORIGIN = origin;
+        // Even a trusted-looking AI URL is never an OS navigation authority.
+        process.env.EZIL_AI_BASE_URL = 'https://os.ezil.work/ai/v1';
+        notices.mockImplementationOnce(async () => 'Upgrade');
+        const g = gateway(free(), ok, async () => false);
+        await g.provider.lockedModelChosen(`ezil/${PRO}`);
+        await Bun.sleep(0); await Bun.sleep(0);
+        expect(notices.mock.calls[0]).toEqual(['Synthetic Pro is not included in your plan. Open EZiL OS Settings → Billing.']);
+        expect(opened).toEqual([]);
+    });
+
+    test('missing origin on credit refusal explains Settings without an external action', async () => {
+        delete process.env.EZIL_OS_ORIGIN;
+        const g = gateway(paid(), refusal(402, 'insufficient_credits'), async () => false);
+        const infos = await list(g.provider);
+        warnings.mockImplementationOnce(async () => 'Add credits');
+        await expect(send(g.provider, infos[0]!.id)).rejects.toThrow();
+        await Bun.sleep(0); await Bun.sleep(0);
+        expect(warnings.mock.calls[0]?.length).toBe(1);
+        expect(warnings.mock.calls[0]?.[0]).toContain('Open EZiL OS Settings → Billing.');
+        expect(opened).toEqual([]);
     });
 });
