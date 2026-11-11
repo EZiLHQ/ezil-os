@@ -19,9 +19,10 @@ interface Runner {
     PINNED: Record<string, any>; FIXED_CHECKS: readonly string[];
     parseArgs(argv: string[]): Record<string, any>; decide(rows: unknown, structure?: unknown): Record<string, any>;
     loadPinned(read?: (path: string) => Promise<Buffer>, dir?: string): Promise<Record<string, string>>;
+    stripTransactionMarkers(text: string): string;
 }
 /* eslint-enable @typescript-eslint/no-explicit-any */
-const { main, PINNED, FIXED_CHECKS, parseArgs, decide, loadPinned } = runnerModule as unknown as Runner;
+const { main, PINNED, FIXED_CHECKS, parseArgs, decide, loadPinned, stripTransactionMarkers: loadStrip } = runnerModule as unknown as Runner;
 
 const DIR = resolve(__dirname, '../../../../migrations/sponsor');
 const sha = (b: Buffer) => createHash('sha256').update(b).digest('hex');
@@ -75,28 +76,36 @@ describe('runner pins, arguments and strict decisions (offline, the actual modul
     });
 });
 
-/** A scripted fake of the postgres.js surface the runner uses, to test uncertain-apply recovery and lock ordering without a database. */
-function fake(script: { inspections: { rows: ReturnType<typeof rows>; fingerprint?: string; version?: string }[]; applyError?: string; lockHeldAfterApply?: boolean; pidAfterApply?: number }) {
+/**
+ * A scripted fake of the postgres.js surface the runner uses. Lock custody is asked INSIDE transactions: custody query #1 is the under-the-lock
+ * re-inspection, #2 the DDL transaction, #3 the postflight inspection. `lostAt` makes that query report a replaced backend or a dropped lock.
+ */
+function fake(script: { inspections: { rows: ReturnType<typeof rows>; fingerprint?: string; version?: string }[]; applyError?: string; lostAt?: 1 | 2 | 3; how?: 'pid' | 'lock' }) {
     const calls: string[] = [];
-    let inspection = 0, applied = false;
+    let inspection = 0, custody = 0;
     const text = (strings: TemplateStringsArray) => strings.join('?');
     const route = (t: string) => {
         if (t.includes('pg_control_system')) return [{ id: '1234567890', db: 'd', cu: 'u', su: 'u' }];
         if (t.includes('pg_try_advisory_lock')) { calls.push('lock'); return [{ locked: true, pid: 4242 }]; }
-        if (t.includes('from pg_locks')) { calls.push('holds'); return [{ pid: applied ? (script.pidAfterApply ?? 4242) : 4242, held: applied ? script.lockHeldAfterApply !== false : true }]; }
+        if (t.includes('from pg_locks')) { custody++; const lost = script.lostAt === custody; return [{ pid: lost && script.how !== 'lock' ? 9999 : 4242, held: !(lost && script.how === 'lock') }]; }
         if (t.includes('pg_advisory_unlock')) { calls.push('unlock'); return [{ released: true }]; }
         if (t.includes('show server_version_num')) return [{ server_version_num: script.inspections[Math.max(0, Math.min(inspection, script.inspections.length) - 1)]?.version ?? '170000' }];
         return [];
     };
-    const tagger = () => (strings: TemplateStringsArray) => Promise.resolve(route(text(strings)));   // a distinct function per object: tx.unsafe must not overwrite sql.unsafe
+    const tagger = () => (strings: TemplateStringsArray) => Promise.resolve(route(text(strings)));   // a distinct function per object
     const sql = Object.assign(tagger(), {
-        begin: async (_o: string, fn: (tx: unknown) => Promise<void>) => {
+        begin: async (a: unknown, b?: unknown) => {
+            const ddl = typeof a === 'function', fn = (ddl ? a : b) as (tx: unknown) => Promise<void>;
             const current = script.inspections[Math.min(inspection, script.inspections.length - 1)]!;
-            inspection++; calls.push('inspect');
-            const tx = Object.assign(tagger(), { unsafe: async (t: string) => (t.includes('sponsor schema state') ? current.rows : [{ fingerprint: current.fingerprint ?? PINNED.fingerprints[17], lines: PINNED.fingerprintLines }]) });
+            if (!ddl) inspection++;
+            calls.push(ddl ? 'ddl-tx' : 'inspect');
+            const tx = Object.assign(tagger(), { unsafe: async (t: string) => {
+                if (t.includes('CREATE TABLE')) { calls.push('apply'); if (script.applyError) throw Object.assign(new Error('boom'), { code: script.applyError }); return []; }
+                return t.includes('sponsor schema state') ? current.rows : [{ fingerprint: current.fingerprint ?? PINNED.fingerprints[17], lines: PINNED.fingerprintLines }];
+            } });
             await fn(tx);
         },
-        unsafe: async () => { calls.push('apply'); applied = true; if (script.applyError) throw Object.assign(new Error('boom'), { code: script.applyError }); return []; },
+        unsafe: async () => { calls.push('plain-unsafe-ddl'); return []; },
         end: async () => undefined,
     });
     return { sql, calls };
@@ -107,7 +116,7 @@ describe('uncertain-apply recovery and lock ordering (scripted fake, actual modu
     it('the postflight inspection runs BEFORE the advisory lock is released', async () => {
         const r = await go({ inspections: [{ rows: rows() }, { rows: rows() }, { rows: rows({}, 'present') }] });
         expect(r.receipt.result).toBe('applied_and_verified'); expect(r.code).toBe(0);
-        expect(r.calls).toEqual(['inspect', 'lock', 'inspect', 'holds', 'apply', 'holds', 'inspect', 'unlock']);
+        expect(r.calls).toEqual(['inspect', 'lock', 'inspect', 'ddl-tx', 'apply', 'inspect', 'unlock']);
     });
     it('an apply error with the schema then present and identical is verified, never assumed; with nothing changed it is reported as such', async () => {
         const a = await go({ inspections: [{ rows: rows() }, { rows: rows() }, { rows: rows({}, 'present') }], applyError: '57P01' });
@@ -125,15 +134,24 @@ describe('uncertain-apply recovery and lock ordering (scripted fake, actual modu
         const pre = fake({ inspections: [{ rows: rows(), version: '150002' }] });
         expect(await refusal(() => main({ argv: argv.slice(0, 6), env: { SPONSOR_DB_URL: 'x' }, connect: async () => pre.sql, dir: DIR }))).toBe('no_pinned_fingerprint_for_server_major');
     });
-    it('a lost session after the DDL is UNCERTAIN: no success, no catalog readback from the replacement connection; a new backend or a dropped lock both stop', async () => {
-        for (const lost of [{ lockHeldAfterApply: false }, { pidAfterApply: 9999 }]) {
-            const r = await go({ inspections: [{ rows: rows() }, { rows: rows() }, { rows: rows({}, 'present') }], ...lost });
+    it('custody is proven INSIDE each transaction: lost before the DDL (re-inspection or the DDL transaction itself) means ZERO DDL; lost at the postflight is uncertain, never success', async () => {
+        for (const how of ['pid', 'lock'] as const) {
+            for (const lostAt of [1, 2] as const) {
+                const f = fake({ inspections: [{ rows: rows() }, { rows: rows() }, { rows: rows({}, 'present') }], lostAt, how });
+                expect(await refusal(() => main({ argv, env: { SPONSOR_DB_URL: 'x' }, connect: async () => f.sql, dir: DIR })), `${how}@${lostAt}`).toBe('session_lost_before_apply');
+                expect(f.calls, `${how}@${lostAt}`).not.toContain('apply'); expect(f.calls).not.toContain('plain-unsafe-ddl'); expect(f.calls).toContain('unlock');
+            }
+            const r = await go({ inspections: [{ rows: rows() }, { rows: rows() }, { rows: rows({}, 'present') }], lostAt: 3, how });
             expect(r.code).toBe(2); expect(r.receipt.result).toBe('apply_outcome_uncertain_session_lost'); expect(r.receipt.after).toBe('unknown');
             expect(JSON.stringify(r.receipt)).not.toMatch(/applied_and_verified|already_present|schema_present_and_identical/);
-            expect(r.calls).toEqual(['inspect', 'lock', 'inspect', 'holds', 'apply', 'holds', 'unlock']);   // no inspection after the loss
+            expect(r.calls).toEqual(['inspect', 'lock', 'inspect', 'ddl-tx', 'apply', 'inspect', 'unlock']);
         }
-        const err = await go({ inspections: [{ rows: rows() }, { rows: rows() }, { rows: rows({}, 'present') }], applyError: '57P01', lockHeldAfterApply: false });
+        const err = await go({ inspections: [{ rows: rows() }, { rows: rows() }, { rows: rows({}, 'present') }], applyError: '57P01', lostAt: 3 });
         expect(err.receipt.result).toBe('apply_outcome_uncertain_session_lost'); expect(err.code).toBe(2);
+    });
+    it('the SQL runs ONLY inside the custody transaction: the pinned markers are stripped exactly once, and a file with other markers is refused', () => {
+        expect(loadStrip('-- c\nBEGIN;\nSET LOCAL search_path = pg_catalog;\nCREATE TABLE x ();\nCOMMIT;\n')).toBe('-- c\nSET LOCAL search_path = pg_catalog;\nCREATE TABLE x ();\n');
+        for (const bad of ['SELECT 1;\n', 'BEGIN;\nBEGIN;\nCOMMIT;\n', 'BEGIN;\nCOMMIT;\nSELECT 1;\n', 'BEGIN;\nSELECT 1;\n']) expect(() => loadStrip(bad)).toThrow();
     });
     it('a postflight that does not match the fingerprint is a failure, and the schema changing under the lock aborts before any DDL', async () => {
         const drift = await go({ inspections: [{ rows: rows() }, { rows: rows() }, { rows: rows({}, 'present'), fingerprint: 'e'.repeat(64) }] });
@@ -235,23 +253,32 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('runner against disposab
             expect((await run(pins())).receipt.result, `${name} restored`).toBe('present_identical_no_action_needed');
         }
     });
-    it('a REAL connection loss right after the committed DDL is reported as uncertain, never as success; a fresh preflight then proves the truth', async () => {
-        await probe.unsafe(`drop table if exists public.ezil_sponsor_trial_claims, public.ezil_sponsor_attributions cascade; drop function if exists public.ezil_sponsor_attribution_guard(), public.ezil_sponsor_trial_claim_guard()`);
-        expect(await objects()).toBe(0);
-        let killed = 0;
-        const killingConnect = async (u: string) => {
+    /** A connect() whose backend is terminated at a chosen boundary: `before` the Nth transaction (1 = first inspection, 2 = re-inspection, 3 = the DDL, 4 = postflight) or `after` it. */
+    const killing = (when: { before?: number; after?: number }) => {
+        const state = { killed: 0 };
+        const connectKilling = async (u: string) => {
             const client = postgres(u, { max: 1, prepare: false, onnotice: () => undefined });
-            const [{ pid }] = await client`select pg_backend_pid() as pid`;
-            // The first statement on the runner's session is its identity query, so this pid is the runner's backend; terminate it right after the pinned SQL returns.
-            return new Proxy(client, { get: (target, prop, receiver) => prop === 'unsafe'
-                ? async (text: string, ...rest: unknown[]) => { const out = await (target.unsafe as (...a: unknown[]) => Promise<unknown>)(text, ...rest);
-                    if (text.includes('CREATE TABLE')) { await admin`select pg_terminate_backend(${pid as number})`; killed++; await new Promise(r => setTimeout(r, 200)); }
-                    return out; }
+            const [{ pid }] = await client`select pg_backend_pid() as pid`;      // the runner's identity query is the first statement on this same single backend
+            let n = 0;
+            const kill = async () => { await admin`select pg_terminate_backend(${pid as number})`; state.killed++; await new Promise(r => setTimeout(r, 200)); };
+            return new Proxy(client, { get: (target, prop, receiver) => prop === 'begin'
+                ? async (...args: unknown[]) => { n++; if (when.before === n) await kill(); const out = await (target.begin as (...a: unknown[]) => Promise<unknown>)(...args); if (when.after === n) await kill(); return out; }
                 : Reflect.get(target, prop, receiver) });
         };
-        const r = await run(apply(), url, { connect: killingConnect });
-        expect(killed).toBe(1);
-        expect(await objects()).toBe(2);                                                                 // the DDL really committed
+        return { connectKilling, state };
+    };
+    const clean = async () => probe.unsafe(`drop table if exists public.ezil_sponsor_trial_claims, public.ezil_sponsor_attributions cascade; drop function if exists public.ezil_sponsor_attribution_guard(), public.ezil_sponsor_trial_claim_guard()`);
+    it('REAL disconnects at every boundary: lost before the re-inspection or before the DDL transaction means ZERO DDL; lost right after the committed DDL is uncertain, never success', async () => {
+        await clean(); expect(await objects()).toBe(0);
+        for (const [label, when] of [['before the re-inspection', { before: 2 }], ['between the re-inspection and the DDL', { before: 3 }]] as const) {
+            const { connectKilling, state } = killing(when);
+            expect(await refusal(() => run(apply(), url, { connect: connectKilling })), label).toBe('session_lost_before_apply');
+            expect(state.killed, label).toBe(1);
+            expect(await objects(), `${label}: no unlocked DDL`).toBe(0);
+        }
+        const { connectKilling, state } = killing({ after: 3 });
+        const r = await run(apply(), url, { connect: connectKilling });
+        expect(state.killed).toBe(1); expect(await objects()).toBe(2);                                   // the DDL really committed
         expect(r.code).toBe(2); expect(r.receipt.result).toBe('apply_outcome_uncertain_session_lost'); expect(r.receipt.after).toBe('unknown');
         expect(JSON.stringify(r.receipt)).not.toMatch(/applied_and_verified|already_present|identical/);
         expect((await run(pins())).receipt.result).toBe('present_identical_no_action_needed');          // the operator's fresh preflight is the recovery

@@ -18,11 +18,13 @@ applied or piggybacked.
 - PG 17 ONLY: every inspection (the first, and the one under the lock) refuses any other server major before a catalog row is read, so no DDL can follow on
   an unlisted major. A present schema is a no-op only if its fingerprint equals the pinned one. Any drift (RLS, ACL, index, column, constraint, trigger,
   policy, function) refuses and is never applied over.
-- Apply: exact file hashes on the command line, `--apply --yes`, one advisory lock, a re-inspection under it, the pinned SQL (one transaction), and the
-  post-inspection from the SAME locked session. An advisory lock dies with its session and a pooled client silently reconnects, so the runner records its
-  backend pid with the lock and proves, before and after the DDL, that this very backend still holds it. If it does not (connection lost), the result is
-  `apply_outcome_uncertain_session_lost` with exit 2: no success is claimed and no catalog readback from a replacement connection is used. The operator's fresh
-  preflight on the pinned target is the recovery.
+- Apply: exact file hashes on the command line, `--apply --yes`, one advisory lock, then three transactions, each proving CUSTODY as its first statement: the
+  backend that took the lock must still be the transaction's backend AND hold the lock (`pg_backend_pid()` + `pg_locks`). A check made in a separate query
+  before a transaction proves nothing about it, so none is trusted: (1) the re-inspection under the lock, (2) the DDL transaction itself (the pinned SQL with its
+  own single `BEGIN;`/`COMMIT;` lines stripped, run on the same backend right after the custody check, so a replaced session executes ZERO DDL), (3) the
+  postflight inspection. Lost custody before the DDL refuses (`session_lost_before_apply`, nothing applied); lost custody at the postflight is
+  `apply_outcome_uncertain_session_lost` (exit 2): no success is claimed and nothing is read from a replacement connection. The operator's fresh preflight on the
+  pinned target is the recovery.
 - Never reads `drizzle/` or any journal, never advances one, never runs on startup. The URL comes from a named environment variable and is never printed;
   the receipt holds digests, booleans and counts only.
 

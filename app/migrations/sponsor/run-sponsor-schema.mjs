@@ -87,10 +87,32 @@ export function decide(rows, structure = null) {
   return structure && structure.matches === true ? { action: 'noop', state, failed: [] } : { action: 'refuse', state, failed: ['schema_drift_from_pinned_fingerprint'] };
 }
 
-/** Runs preflight.sql (and verify.sql) in ONE read-only repeatable-read transaction with a fixed search_path; returns the rows and the structure result. */
-export async function inspect(sql, files) {
+class CustodyLost extends Error {}
+
+/**
+ * Custody of the advisory lock, proven INSIDE the transaction whose results are about to be trusted: the same backend that took the lock must still be this
+ * transaction's backend AND still hold it. A transaction lives on exactly one backend, so a check made as its first statement cannot be separated from what
+ * follows by a reconnect. (A separate query before the transaction proves nothing about it.)
+ */
+async function requireCustody(tx, custody, lockKey) {
+  const [r] = await tx`select pg_backend_pid() as pid, exists (select 1 from pg_locks where locktype = 'advisory' and granted and pid = pg_backend_pid()
+    and ((classid::bigint << 32) | objid::bigint) = hashtextextended(${lockKey}, 0)) as held`;
+  if (r.pid !== custody.pid || r.held !== true) throw new CustodyLost();
+}
+
+/** The pinned SQL carries its own BEGIN/COMMIT. To run it inside a transaction that first proves custody, exactly one `BEGIN;` line and one final `COMMIT;` line are removed. */
+export function stripTransactionMarkers(text) {
+  const lines = text.split('\n');
+  const begin = lines.flatMap((l, i) => (l.trim() === 'BEGIN;' ? [i] : [])), commit = lines.flatMap((l, i) => (l.trim() === 'COMMIT;' ? [i] : []));
+  if (begin.length !== 1 || commit.length !== 1 || lines.slice(commit[0] + 1).some(l => l.trim() !== '' && !l.trim().startsWith('--'))) refuse('sql_transaction_markers_unexpected');
+  return lines.filter((_, i) => i !== begin[0] && i !== commit[0]).join('\n');
+}
+
+/** Runs preflight.sql (and verify.sql) in ONE read-only repeatable-read transaction with a fixed search_path; returns the rows and the structure result. With `custody`, lock ownership is proven inside that transaction first. */
+export async function inspect(sql, files, custody = null) {
   let preRows, verRows, major;
   await sql.begin('isolation level repeatable read read only', async tx => {
+    if (custody) await requireCustody(tx, custody, LOCK_KEY);
     await tx`set local search_path = pg_catalog`;
     major = Math.floor(Number((await tx`show server_version_num`)[0].server_version_num) / 10000);
     // PG 17 only: any other major is refused in EVERY inspection (first and under the lock), before a single catalog row is read, so no DDL can follow.
@@ -125,23 +147,22 @@ export async function main({ argv, env, connect, read = readFile, dir = HERE }) 
     // One advisory lock, a re-inspection under it, then exactly the pinned SQL (it carries its own BEGIN/COMMIT), then a postflight that must match the fingerprint.
     const [{ locked, pid }] = await sql`select pg_try_advisory_lock(hashtextextended(${LOCK_KEY}, 0)) as locked, pg_backend_pid() as pid`;
     if (!locked) refuse('another_runner_holds_the_lock');
-    // A max-1 pool silently reconnects after a lost connection, and an advisory lock dies with its session. Before trusting ANY read after DDL, prove that this very
-    // backend is still the one holding the lock; otherwise the outcome is UNCERTAIN and we stop (no success claimed, no recovery attempted here).
-    const holdsLock = async () => {
-      try {
-        const [r] = await sql`select pg_backend_pid() as pid, exists (select 1 from pg_locks where locktype = 'advisory' and granted and pid = pg_backend_pid()
-          and ((classid::bigint << 32) | objid::bigint) = hashtextextended(${LOCK_KEY}, 0)) as held`;
-        return r.pid === pid && r.held === true;
-      } catch { return false; }
-    };
+    const custody = { pid };
+    // A max-1 pool silently reconnects after a lost connection and an advisory lock dies with its session, so lock ownership is proven INSIDE every transaction whose
+    // result is trusted (the re-inspection, the DDL itself, the postflight), never by a separate query before it. No atomic custody = fail closed.
+    const sessionLost = error => error instanceof CustodyLost;
     let applyError = null, afterInspect, uncertain = false;
     try {
-      const recheck = await inspect(sql, files);
+      let recheck;
+      try { recheck = await inspect(sql, files, custody); } catch (error) { if (sessionLost(error)) refuse('session_lost_before_apply'); throw error; }
       if (decide(recheck.rows, recheck.structure).action !== 'apply') refuse('schema_changed_under_the_lock');
-      if (!await holdsLock()) refuse('session_lost_before_apply');
-      try { await sql.unsafe(files.sql); } catch (error) { applyError = error?.code ?? 'apply_failed'; }
-      // Whatever happened (success, error, dropped connection), the only truth is a fresh catalog inspection, but ONLY from the same locked session.
-      if (!await holdsLock()) { uncertain = true; } else afterInspect = await inspect(sql, files);
+      const body = stripTransactionMarkers(files.sql);
+      try {
+        // ONE transaction: custody is its first statement, the pinned DDL follows on the same backend. A replaced session fails here with zero DDL executed.
+        await sql.begin(async tx => { await requireCustody(tx, custody, LOCK_KEY); await tx.unsafe(body); });
+      } catch (error) { if (sessionLost(error)) refuse('session_lost_before_apply'); applyError = error?.code ?? 'apply_failed'; }
+      // Whatever happened (success, error, dropped connection), the only truth is a fresh inspection, trusted only if its OWN transaction proves custody.
+      try { afterInspect = await inspect(sql, files, custody); } catch (error) { uncertain = true; if (!sessionLost(error) && !applyError) applyError = error?.code ?? 'postflight_failed'; }
     } finally {
       try { const [u] = await sql`select pg_advisory_unlock(hashtextextended(${LOCK_KEY}, 0)) as released`; receipt.lockReleased = u?.released === true; } catch { receipt.lockReleased = false; }
     }
