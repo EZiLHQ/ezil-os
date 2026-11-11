@@ -1,4 +1,4 @@
-# Floating controls + Feedback — pinned contract (v2 feedback extension, 2026-11-08)
+# Floating controls + Feedback — pinned contract (feedback amendment, 2026-11-11)
 
 The single source of truth for the parallel lanes. The founder authorized the
 2026-11-08 feedback report-bundle extension below; unrelated lane contracts remain
@@ -21,7 +21,8 @@ Shell side: features are feature-detected exactly like `endpoints.focus`.
 
 ```
 desktopState.ui = { floatingControls: boolean, feedbackScreenshots: boolean,
-  feedbackEventDiagnostics?: true, feedbackReportBundle?: true, feedbackAppFailures?: true }
+  feedbackEventDiagnostics?: true, feedbackReportBundle?: true, feedbackAppFailures?: true,
+  feedbackScreenshotsMax?: 5, feedbackStagedUploads?: true }
 desktopState.endpoints.feedback?: '/api/shell/feedback'
 ```
 
@@ -238,11 +239,13 @@ Two `localStorage` keys per account, keyed by the opaque account id from
   timed-out delete may have committed; loading the list again shows which).
 
 ## 5. Never collected
-`document.cookie`, any URL / iframe `src`, `__EZIL_BOOT__.user`, `log.js` ring, headers,
-clipboard (except image files in a paste the person makes into the open form, each of which opens in the
-redaction editor first; the clipboard is never read programmatically and text pastes are untouched),
-keystrokes; no continuous recording. Attachment checkboxes (diagnostics; the masked window screenshot when enabled) default ON since 2026-11-10, can be switched off, and nothing uploads before Send; preview shows the
-exact JSON that is sent; nothing hits the network before Submit.
+`document.cookie`, any URL / iframe `src`, user emails or names, `log.js` ring,
+request headers, keystrokes or continuous recordings. Only the validated opaque
+`__EZIL_BOOT__.user.id` UUID is read for account-local storage and the staged
+expected-account comparison header described in §7. The clipboard is never read
+programmatically: an image paste the person makes into the open dialog reads its
+image files; text pastes retain their normal behavior. Both attachment checkboxes
+default on, can be switched off, and nothing uploads before explicit Send.
 
 
 ## 6. Founder-authorized report bundle and developer loop (2026-11-08)
@@ -253,7 +256,7 @@ optional description (category fixed to `bug`, no required question, blank is va
 No migration.
 
 Diagnostics are selected by default and can be switched off. The snapshot is taken
-when the form opens and frozen; only the explicit Refresh action replaces it. No DOM text, form values, console
+when the form opens and frozen; switching diagnostics off and back on takes a new snapshot. No DOM text, form values, console
 text or privileged device logs are read. The existing local event ring provides
 up to 50 event ages; a detached trace read provides up to 24 phases. Numeric fields
 are bounded to 0..1,000,000,000. At most ten events keep validated failure references;
@@ -267,9 +270,9 @@ retries once without all these expanded fields; report text/image/ID are preserv
 The fallback replaces the queued body and visible preview. No new upload runs in
 the background beyond the existing explicitly submitted outbox retry.
 
-Screenshot consent, feature gates, masking, cancellation and image limits remain.
-The form explains disabled/unsupported capture; the attached image can be edited
-again starting from its redacted pixels. Upload and clipboard are not added.
+Screenshot consent, feature gates, cancellation and image limits remain. The current
+explicit paste/drop/file flow in §7 replaces the earlier automatic capture UI.
+Edit starts from the attached preview pixels, including any prior redactions.
 
 Admin status changes use the existing status column: new / investigating / resolved.
 Every action reauthenticates, checks the fail-closed admin list, validates report ID
@@ -345,3 +348,52 @@ table: no DDL, no bucket, no URL, no image GET.
   only accepts rows under an hour old, so cleanup never races it.
 - **Compatibility.** Inline `screenshot` and `screenshots` keep working, for older shells and for bodies already queued
   for retry.
+
+## 7. Compact attachments and upload-first amendment (2026-11-11)
+
+The visible form contains one optional Description (`You can paste screenshots here too.`),
+short Diagnostics / Screenshots checkboxes selected by default, one Attach images / drop
+area, local thumbnails with Edit / Remove, a collapsed exact preview, and Send. Context
+and the short server-summary disclosure live inside the preview. There is no automatic
+shell capture, browser capture picker, capture-options disclosure, diagnostic essay or
+image-budget counter. Imported files appear immediately without a mandatory editor;
+Edit opens the existing crop/redaction editor. Pixels are freshly rasterized with the
+existing encoder before the thumbnail is shown. Limits remain five images, 1.75 MiB
+total, 1.5 MiB per image. An older boot without the multi-image flag keeps one image.
+
+Image paste and file drop anywhere within the dialog import sequentially in source
+order and deduplicate exact encoded bytes. File drags outside the dialog are blocked
+while it is open to prevent navigation; text paste/drop remains native. Document drag
+listeners and pending decode/editor work are removed/aborted on close or navigation.
+On a touch-primary device initial focus remains on the heading; Send stays visible.
+
+Only `desktopState.ui.feedbackStagedUploads === true` selects the new protocol.
+Explicit Send freezes the original-account local outbox copy with raw image bytes.
+For each image, in preview order, it PUTs raw raster bytes to the feedback endpoint
+with `?crid=<clientRequestId>`, its image Content-Type, and
+`X-EZiL-Feedback-Account: <validated boot user UUID>`. A 200/201 must return the exact
+SHA-256 of those bytes and a boolean `finalized`. The client then POSTs the small report
+with `screenshot: null` and ordered `screenshotRefs: [{sha256, contentType}]`, omitting
+`screenshots`. This exact finalize JSON is shown in the expanded preview. Every new-client POST, including legacy inline/text and compatibility replay,
+carries the same expected-account header. Older servers ignore this extra header;
+updated servers compare it for every POST, requiring it for staged operations. It is comparison only,
+never authentication; the backend must reject missing/malformed/mismatched staged
+headers before body reads or writes. Account identity comes only from
+`window.__EZIL_BOOT__.user.id`, validated as UUID and normalized to lowercase.
+
+Unanswered sends retain the original raw images, clientRequestId and transport mode
+for safe same-ticket retry, including unknown-finalize replay and expired staging.
+Confirmed finalize removes the local outbox entry. Definitive staged refusals
+(including 400/413/415/429) retain a paused local entry and thumbnails; no online,
+mount or bfcache automatic retry sends a paused entry. Reopening restores an editable
+form. Explicit Send retries it; editing a paused payload gives it a fresh ticket and
+atomically replaces its paused local body. Remove / screenshot opt-out discards the
+corresponding raw local bytes. If screenshot capability is disabled on a later boot,
+queued thumbnails and their original ticket/body remain intact, imports and Edit
+are disabled, and Send is blocked until explicit removal or screenshot opt-out.
+`account_changed` also pauses the original account's
+entry and stops requests; it never transfers the report to another account.
+
+Boots without upload-first, and preexisting inline outbox entries, retain the original
+inline wire body and refusal behavior. No new protocol is inferred from a server
+error. Payment, 3DS and runtime provisioning code are outside this amendment.
