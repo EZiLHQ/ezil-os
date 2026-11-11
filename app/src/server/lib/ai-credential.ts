@@ -106,7 +106,7 @@ export type AiCredentialPushResult =
  * `includedModels` travels in the same signed body: the models the owner's plan
  * includes (`billing/v3/ai-models.ts`; `null` = every model). Left out when
  * `undefined` (the plan could not be read), so the Worker keeps its list. `creditsPending` is a separate trusted
- * owner receipt answer; an unreadable answer is omitted, preserving the stored previous answer.
+ * owner receipt answer; null explicitly means unreadable, while omission preserves the legacy stored answer.
  */
 export async function pushAiCredential(
     config: CloudflareGuacamoleConfig,
@@ -115,7 +115,7 @@ export async function pushAiCredential(
     accessToken: string | null,
     fetchImpl: typeof fetch = fetch,
     includedModels?: readonly string[] | null,
-    creditsPending?: boolean,
+    creditsPending?: boolean | null,
 ): Promise<AiCredentialPushResult> {
     if (!config.isConfigured || !hmacSecret) return { ok: false, skipped: 'not_configured' };
     if (accessToken === null) return { ok: false, skipped: 'no_session' };
@@ -173,7 +173,7 @@ export async function syncAiCredential(params: {
     supabase: () => Promise<SessionSource>;
     fetchImpl?: typeof fetch;
     includedModels?: () => Promise<readonly string[] | null | undefined>;
-    /** Trusted owner-scoped receipt read; undefined or a failed read omits the field. */
+    /** Trusted owner-scoped receipt read; an unreadable result signs null. No callback keeps legacy omission. */
     creditsPending?: () => Promise<boolean | undefined>;
 }): Promise<AiCredentialPushResult> {
     try {
@@ -182,7 +182,7 @@ export async function syncAiCredential(params: {
         const canPush = token !== null && readAccessTokenClaims(token)?.ezilRole != null;
         const [models, pending] = await Promise.all([
             canPush && params.includedModels ? params.includedModels().catch(() => undefined) : undefined,
-            canPush && params.creditsPending ? Promise.resolve().then(() => params.creditsPending!()).catch(() => undefined) : undefined,
+            canPush && params.creditsPending ? Promise.resolve().then(() => params.creditsPending!()).then(value => value ?? null).catch(() => null) : undefined,
         ]);
         return await pushAiCredential(params.config, params.hmacSecret, params.sandboxName, token, params.fetchImpl, models, pending);
     } catch {
@@ -233,7 +233,7 @@ export async function pushAiPlan(
     signal: AbortSignal,
     fetchImpl: typeof fetch = fetch,
     now: number = Date.now(),
-    creditsPending?: boolean,
+    creditsPending?: boolean | null,
 ): Promise<AiPlanPushResult> {
     const body = JSON.stringify({ includedModels, ...(creditsPending === undefined ? {} : { creditsPending }) });
     const endpoint = `${config.workerUrl.replace(/\/$/, '')}/sandbox/${encodeURIComponent(sandboxName)}/ai-credential`;
@@ -337,7 +337,7 @@ export async function refreshAiPlans(params: {
         if (abort.signal.aborted) return;
         counts.computers = listed.length;
         // Each owner's plan is read once, and its pushes are signed at that read: a beat that read it later wins.
-        const plans = new Map<string, { readAt: number; plan: Promise<readonly string[] | null | undefined>; pending: Promise<boolean | undefined> }>();
+        const plans = new Map<string, { readAt: number; plan: Promise<readonly string[] | null | undefined>; pending: Promise<boolean | null | undefined> }>();
         const queue = [...listed];
         const work = async () => {
             for (let next = queue.shift(); next !== undefined && !abort.signal.aborted; next = queue.shift()) {
@@ -345,7 +345,7 @@ export async function refreshAiPlans(params: {
                 let read = plans.get(userId);
                 if (!read) {
                     read = { readAt: Date.now(), plan: params.includedModelsFor(userId).catch(() => undefined),
-                        pending: params.creditsPendingFor ? Promise.resolve().then(() => params.creditsPendingFor!(userId)).catch(() => undefined) : Promise.resolve(undefined) };
+                        pending: params.creditsPendingFor ? Promise.resolve().then(() => params.creditsPendingFor!(userId)).then(value => value ?? null).catch(() => null) : Promise.resolve(undefined) };
                     plans.set(userId, read);
                 }
                 const [includedModels, creditsPending] = await Promise.all([read.plan, read.pending]);

@@ -7,7 +7,7 @@ type PendingDatabase = Pick<typeof db, 'transaction'>;
 /**
  * Stored grant delivery for this owner, independent of wallet balances or catalog allowances. No receipt LIMIT:
  * false must prove there is no live undelivered grant. Malformed potentially eligible rows never produce a negative
- * answer. Unknown is omitted from signed pushes, never changed to false.
+ * answer. Unknown returns undefined; the callback-aware producer signs it as null, never false.
  */
 export async function aiCreditsPendingFor(userId: string, database: PendingDatabase = db, now: Date = new Date()): Promise<boolean | undefined> {
     try {

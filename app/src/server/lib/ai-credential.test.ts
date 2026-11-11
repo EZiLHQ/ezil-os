@@ -454,7 +454,19 @@ describe('refreshAiPlans (the server plan refresh, no browser)', () => {
 });
 
 describe('signed pending-credit metadata', () => {
-    it('signs true and false into initial/activity credential pushes, omitting unknown and read failures', async () => {
+    it('a first push with unreadable receipts explicitly names unknown, while a legacy caller omits the field', async () => {
+        const token = builderToken(), bodies: unknown[] = [];
+        const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
+            bodies.push(JSON.parse(init.body as string));
+            return Response.json({ ok: true, stored: true });
+        }) as unknown as typeof fetch;
+        const params = { config: CONFIG, hmacSecret: SECRET, sandboxName: SANDBOX, userId: USER,
+            headers: new Headers(), supabase: async () => session(token), fetchImpl };
+        await syncAiCredential({ ...params, creditsPending: async () => undefined });
+        await syncAiCredential(params);
+        expect(bodies).toEqual([{ accessToken: token, creditsPending: null }, { accessToken: token }]);
+    });
+    it('signs true, false and explicit unknown into initial/activity pushes, keeping legacy omission', async () => {
         const token = builderToken(), bodies: unknown[] = [];
         const fetchImpl = vi.fn(async (_url: string, init: RequestInit) => {
             const raw = init.body as string, signature = new Headers(init.headers).get('x-ezil-signature')!;
@@ -469,7 +481,7 @@ describe('signed pending-credit metadata', () => {
         await sync(async () => { throw new Error('read unavailable'); });
         await sync(() => { throw new Error('synchronous read unavailable'); });
         await sync();
-        expect(bodies).toEqual([true, false, undefined, undefined, undefined, undefined].map(pending => ({ accessToken: token,
+        expect(bodies).toEqual([true, false, null, null, null, undefined].map(pending => ({ accessToken: token,
             includedModels: ['gemini-3.8-flash'], ...(pending === undefined ? {} : { creditsPending: pending }) })));
     });
     it('does not read pending credits for missing, foreign, bearer or unprivileged sessions', async () => {
@@ -482,7 +494,7 @@ describe('signed pending-credit metadata', () => {
             headers: new Headers({ authorization: 'Bearer unrelated' }), supabase: async () => session(builderToken()), fetchImpl, creditsPending: pending });
         expect(pending).not.toHaveBeenCalled(); expect(fetchImpl).not.toHaveBeenCalled();
     });
-    it('refreshes pending evidence once per owner, signed with each plan refresh, omitting unreadable evidence', async () => {
+    it('refreshes pending evidence once per owner and signs explicit unknown for unreadable evidence', async () => {
         const owner2 = 'ffffffff-0000-4000-8000-000000000000';
         const owner3 = 'eeeeeeee-0000-4000-8000-000000000000';
         const owner4 = 'dddddddd-0000-4000-8000-000000000000';
@@ -506,7 +518,7 @@ describe('signed pending-credit metadata', () => {
             expect(body.includedModels).toEqual(['gemini-3.8-flash']);
             if (row.userId === USER) expect(body.creditsPending).toBe(true);
             else if (row.userId === owner2) expect(body.creditsPending).toBe(false);
-            else expect(body).not.toHaveProperty('creditsPending');
+            else expect(body.creditsPending).toBeNull();
             expect(body).not.toHaveProperty('accessToken');
         }
     });
