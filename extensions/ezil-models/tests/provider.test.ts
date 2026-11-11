@@ -301,7 +301,7 @@ describe('EZiL gateway VS Code bridge', () => {
                 [message(1, [new TextPart('q')])] as never, { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never) };
         }
         for (const [code, extra, text] of [
-            ['insufficient_credits', {}, 'This request needs up to 80.00 credits, and you have 63.09.'],
+            ['insufficient_credits', {}, 'This request needs up to 80.00 credits, and you have 63.'],
             ['insufficient_credits', { no_live_grant: true }, 'You have no AI credits left. Add credits to continue.'],
             ['no_live_grant', {}, 'You have no AI credits left. Add credits to continue.'],
         ] as const) test(`${code} ${JSON.stringify(extra)} opens the OS billing card when chosen`, async () => {
@@ -340,7 +340,7 @@ describe('EZiL gateway VS Code bridge', () => {
                 else process.env.EZIL_OS_ORIGIN = value;
                 const h = refusal();
                 await expect(h.send()).rejects.toThrow('This request needs up to 80.00 credits');
-                expect(showCreditWarning).toHaveBeenCalledWith(expect.stringContaining('and you have 63.09.'));
+                expect(showCreditWarning).toHaveBeenCalledWith(expect.stringContaining('and you have 63.'));
                 expect(openExternal).not.toHaveBeenCalled();
             });
         }
@@ -502,6 +502,29 @@ describe('EZiL gateway VS Code bridge', () => {
             expect(bodies).toHaveLength(2); expect(gets).toBe(2);
         });
     }
+
+    test('pending credits finish the turn with an explicit retry and never open billing or charge recovery', async () => {
+        showRetryError.mockClear(); showCreditWarning.mockClear(); openExternal.mockClear(); retryCommand.mockClear();
+        let posts = 0;
+        const host = gatewayHost((async () => { posts++; return Response.json({ error: { code: 'os_credits_pending', source: 'ezil-os-proxy' } }, { status: 503 }); }) as unknown as typeof fetch);
+        const billingIntent = mock(async () => true);
+        const finished = mock(() => {});
+        const p = new EZiLModelsProvider({ ...host, billingIntent, requestFinished: finished });
+        const send = () => p.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
+            { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
+        await expect(send()).rejects.toThrow('Your AI credits are being confirmed');
+        await expect(send()).rejects.toThrow('Your AI credits are being confirmed');
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        expect(posts).toBe(2); // No automatic replay or transport retry.
+        expect(showRetryError).toHaveBeenCalledTimes(1); // Utility/title failures do not spam notices.
+        expect(showRetryError.mock.calls[0]![1]).toBe('Retry');
+        expect(showCreditWarning).not.toHaveBeenCalled();
+        expect(openExternal).not.toHaveBeenCalled();
+        expect(billingIntent).not.toHaveBeenCalled();
+        expect(retryCommand).not.toHaveBeenCalled();
+        expect(host.usage).toHaveLength(0);
+        expect(finished).toHaveBeenCalledTimes(2);
+    });
     test('recoverable gateway failure ends the turn and Retry resubmits only on user action', async () => {
         showRetryError.mockClear(); retryCommand.mockClear();
         showRetryError.mockImplementationOnce(async () => 'Retry');

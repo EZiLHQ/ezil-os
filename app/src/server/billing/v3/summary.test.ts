@@ -3,7 +3,7 @@ import { offeredPack } from '../stripe/packs.test-support';
 import { readBillingConfig } from '../config';
 import { CATALOG_V3, type SellableSkuV3 } from './contract';
 import { planFromSubscriptions } from './catalog';
-import { buildSummaryV3, usedGiBOf, usedSecondsInWindow } from './summary';
+import { aiAccountSummaryV3, buildSummaryV3, usedGiBOf, usedSecondsInWindow } from './summary';
 
 const now = new Date('2026-10-19T12:00:00Z');
 const start = new Date('2026-10-10T00:00:00Z'), end = new Date('2026-11-10T00:00:00Z');
@@ -621,6 +621,54 @@ describe('round 5 D1: AI enrollment, waiting credits and the EZiL ID action', ()
             expiresAt: future, deliveredAt: null, failed: true };
         const summary = buildSummaryV3({ ...input(), ai: { ...ai, receipts: [...receipts, failed] }, enrollment: { state: 'needs_ezil_id', ezilIdUrl: link } });
         expect(summary.ai.waiting).toEqual({ credits: 300 });
+    });
+    // A new Free account: the first summary enqueues the starter grant and the outbox drain delivers it a pass later.
+    const starter = { entitlementId: 'ezil-os:v1:free-once:u', credits: 100, expiresAt: future, deliveredAt: null };
+    it('enrolled Free with its starter grant undelivered: delivering 100 beside the Gateway zero, which stays exactly as read', () => {
+        const summary = buildSummaryV3({ ...input(), ai: { receipts: [starter], gatewayGrants: [], balanceMicro: '0', heldMicro: '0' },
+            enrollment: { state: 'enrolled', ezilIdUrl: link } });
+        expect(summary.plan.sku).toBe('free_v3');
+        expect(summary.ai).toMatchObject({ enrollment: 'enrolled', waiting: null, delivering: { credits: 100 }, balance: 0, starter: null });
+        expect(summary.ai.account).toMatchObject({ totalMicro: '0', remainingMicro: '0', usedMicro: '0' });
+        // Undelivered paid-period receipts of an enrolled account are on their way too (the D1 fixture: 100 + 200).
+        expect(buildSummaryV3({ ...input('standard_monthly_v3'), ai, enrollment: { state: 'enrolled', ezilIdUrl: link } }).ai.delivering).toEqual({ credits: 300 });
+    });
+    it('delivered once: no delivering, the starter bucket and account carry the Gateway\'s 100 (never 200)', () => {
+        const grant = { creditsMicro: '100000000', remainingMicro: '100000000', expiresAt: future, live: true, source: 'entitlement' as const };
+        const summary = buildSummaryV3({ ...input(), ai: { receipts: [{ ...starter, deliveredAt: '2026-10-19T12:00:30.000Z' }], gatewayGrants: [grant],
+            balanceMicro: '100000000', heldMicro: '0' } });
+        expect(summary.ai).not.toHaveProperty('delivering');
+        expect(summary.ai).toMatchObject({ starter: { remaining: 100 }, balance: 100, state: 'ok' });
+        expect(summary.ai.account).toMatchObject({ totalMicro: '100000000', remainingMicro: '100000000', labelled: true });
+    });
+    it('nothing on its way keeps a genuine zero: failed, expired, absent or unreadable receipts; not enrolled stays waiting', () => {
+        for (const receipts of [[{ ...starter, failed: true as const }], [{ ...starter, expiresAt: past }], [], null]) {
+            const summary = buildSummaryV3({ ...input(), ai: { receipts, gatewayGrants: [], balanceMicro: '0', heldMicro: '0' } });
+            expect(summary.ai).not.toHaveProperty('delivering');
+            expect(summary.ai.state).toBe('exhausted');
+        }
+        const parked = buildSummaryV3({ ...input(), ai: { receipts: [starter], gatewayGrants: null, balanceMicro: null },
+            enrollment: { state: 'activating', ezilIdUrl: link } });
+        expect(parked.ai).toMatchObject({ waiting: { credits: 100 } });
+        expect(parked.ai).not.toHaveProperty('delivering');
+    });
+    it('aiAccountSummaryV3 (the Usage balance read) carries exactly the summary\'s ai.account and ai.delivering', () => {
+        const grant = { creditsMicro: '100000000', remainingMicro: '98418718', expiresAt: future, live: true, source: 'entitlement' as const };
+        const cases: [Input, string][] = [
+            [{ ...input(), ai: { receipts: [starter], gatewayGrants: [], balanceMicro: '0', heldMicro: '0', userId: 'u' } }, 'enrolled'],
+            [{ ...input(), ai: { receipts: [{ ...starter, deliveredAt: '2026-10-19T12:00:30.000Z' }], gatewayGrants: [grant],
+                balanceMicro: '98418718', heldMicro: '0', userId: 'u' } }, 'enrolled'],
+            [{ ...input('premium_monthly_v3'), ai }, 'enrolled'],
+            [{ ...input(), ai: { receipts: [starter], gatewayGrants: null, balanceMicro: null } }, 'activating'],
+        ];
+        for (const [args, state] of cases) {
+            const enrollment = state as 'enrolled' | 'activating';
+            const summary = buildSummaryV3({ ...args, enrollment: { state: enrollment, ezilIdUrl: null } });
+            const { account, delivering, waiting } = summary.ai;
+            expect(aiAccountSummaryV3({ subs: args.subs, userCreatedAt: args.userCreatedAt, paymentIssues: args.paymentIssues,
+                operatorGrants: args.operatorGrants, enrollment, now: args.now, ai: args.ai! }))
+                .toEqual({ enrollment: summary.ai.enrollment, waiting, account, ...(delivering ? { delivering } : {}) });
+        }
     });
     it('checkout off keeps top-up off in every state', () => {
         const args = input(); args.config.checkoutEnabled = false;

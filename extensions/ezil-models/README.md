@@ -276,7 +276,7 @@ auth context.
   - When Show AI Status opens.
 - **Protocols.** A protocol it does not speak drops out of that row, never out
   of the whole catalog, and a row left with none is not selectable.
-- **Plan locks (Free includes Gemini 3.8 Flash only).** When the EZiL OS proxy
+- **Plan locks (Free includes Gemini 3.8 Flash and two low-tier fallbacks).** When the EZiL OS proxy
   names the plan's models (`x-ezil-os-included-models` on `/models`):
   - Every other model of that provider stays listed but locked: not
     selectable, with a lock icon and an `ezilPlanLocked` note. It is never the

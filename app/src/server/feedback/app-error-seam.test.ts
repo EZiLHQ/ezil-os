@@ -130,7 +130,7 @@ describe('a real router refusal reaches a consented feedback report unchanged', 
                 description: '[synthetic app-error] seam', computerId, diagnostics })));
             const created = await ingestFeedback(db, userId, body, new Date());
             expect(created.status).toBe(201);
-            if (created.status === 429) throw new Error('unexpected rate limit');
+            if (created.status !== 201) throw new Error(`unexpected ${created.status}`);
             // The post-commit log names the report beside the server's own id and reason: the join.
             const feedbackLog = info.mock.calls.find(c => c[0] === '[feedback] report carries server failures');
             expect(JSON.stringify(feedbackLog?.[1])).toContain(String(last.correlationId));

@@ -2,7 +2,7 @@ import { CATALOG_V3 } from '@/server/billing/v3/contract';
 
 export const pricingMetadata = {
     title: 'Plans · EZiL OS',
-    description: 'Start free. Choose longer sessions and a bigger computer when you need them.',
+    description: 'Start free. Choose a bigger computer when you need one.',
 } as const;
 
 /** A home-page feature tile: a description, or a short badge (none ships today). */
@@ -46,7 +46,7 @@ export function getPricingContent(...legacyDisplayOptions: [boolean?, (string | 
         hero: {
             eyebrow: 'Your computer in the cloud',
             title: 'Open EZiL OS and get to work.',
-            description: 'A full desktop with a browser and VS Code, in any tab. Start free and choose longer sessions when you need them.',
+            description: 'A full desktop with a browser and VS Code, in any tab. Start free and upgrade when you need more.',
             caption: 'No card needed for Free.',
         },
         plansLabel: 'Choose your plan',
@@ -76,12 +76,12 @@ export function getPricingContent(...legacyDisplayOptions: [boolean?, (string | 
             items: [
                 {
                     question: 'What is a session?',
-                    answer: `A session is one stretch of time while your computer is running. Free sessions last up to ${hours(CATALOG_V3.free_v3.sessionMaxSeconds!)} hour. Standard and Premium sessions last up to ${hours(CATALOG_V3.standard_monthly_v3.sessionMaxSeconds!)} hours. At the session limit, your files are saved and the computer stops. You can start a new session from those files. One computer runs at a time.`,
+                    answer: `A session is one stretch of time while your computer is running. When a session ends, your files are saved and the computer stops. You can start a new session from those files. One computer runs at a time.`,
                 },
                 {
                     // Paid compute policy v1 (founder e713d157): Free keeps a monthly allowance; Standard and Premium have none.
                     question: 'How much computer time is included?',
-                    answer: `Free includes about ${hours(CATALOG_V3.free_v3.fairUseSeconds)} hours of computer time a month; older Free accounts keep ${hours(CATALOG_V3.free_v3.legacyFairUseSeconds!)} hours. If you reach it, your computer pauses until it renews each calendar month in UTC, or you can upgrade. Starting another session does not reset it. Standard and Premium have no monthly computer-hours allowance: each session lasts up to ${hours(CATALOG_V3.standard_monthly_v3.sessionMaxSeconds!)} hours, and starting a computer depends on available capacity.`,
+                    answer: `Free includes about ${hours(CATALOG_V3.free_v3.fairUseSeconds)} hours of computer time a month; older Free accounts keep ${hours(CATALOG_V3.free_v3.legacyFairUseSeconds!)} hours. If you reach it, your computer pauses until it renews each calendar month in UTC, or you can upgrade. Starting another session does not reset it. Standard and Premium have no monthly computer-hours allowance, and starting a computer depends on available capacity.`,
                 },
                 {
                     question: 'What stays after a session?',

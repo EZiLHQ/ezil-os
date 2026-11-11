@@ -1,3 +1,4 @@
+import './billing-pending-test.mjs';
 import { v3CopyForAudit, honestyBans } from './billing-copy-test-helpers.mjs';
 // Billing v2: real shell + tRPC client, jsdom, fake fetch and injected sheets.
 import { summaryV3, trialSummaryV3 } from './billing-v3-fixtures.mjs';
@@ -535,7 +536,7 @@ try {
 
     summary = v2(); summary.compute.session.activeDeadline = new Date(now + (2 * 3600 + 14 * 60) * 1000).toISOString();
     await refresh();
-    assert.equal(q('[data-role="session-note"]').textContent, 'Sessions run up to 6 hours, then your work is saved and the computer restarts. Files and installed tools are kept; running processes start fresh.');
+    assert.equal(q('[data-role="session-note"]').textContent, 'When a session ends, your work is saved and the computer restarts. Files and installed tools are kept; running processes start fresh.');
     assert.equal(q('[data-role="session-countdown"]').textContent, 'This session saves and restarts in 2 h 14 m.');
     assert.ok(q('[data-role="session-note"]').closest('.ezil-billing-card'));
     assert.equal(q('[data-role="session-note"]').nextElementSibling, q('[data-role="session-countdown"]'));
@@ -856,7 +857,7 @@ try {
         summary = summaryV3(tier); await open();
         contains('[data-role="plan-card"]', summary.plan.name);
         contains('[data-role="your-computer"]', `${summary.computer.vcpu} vCPU · ${summary.computer.memoryGiB} GB`);
-        contains('[data-role="your-computer"]', summary.computer.sessionMaxSeconds === 3600 ? 'Sessions up to 1 hour' : 'Sessions up to 6 hours');
+        assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /Sessions? up to|session time limit/i);
         contains('[data-role="your-computer"] [data-action="computer-tab"]', 'Change configuration ›');
         if ( tier !== 'free' ) {
             contains('[data-role="plan-card"]', `$${tier === 'standard' ? 20 : 100} / month`);
@@ -950,11 +951,12 @@ try {
         assert.doesNotMatch(text(), /Computer time is used up/, tier);
         contains('[data-role="billing-usage"] .ezil-billing-section-head', 'Usage');
     }
-    // No plan card sells monthly computer hours: each configuration names its session length (Free and paid alike).
+    // No plan card sells monthly computer hours or a session length (Free and paid alike).
     const offers = qa('[data-role="plans"] li[data-size]').map(el => el.textContent).join(' | ');
     assert.ok(offers.length > 0);
     assert.doesNotMatch(offers, /hours a month|monthly time/i, offers);
-    assert.match(offers, /4 vCPU · 16 GB Sessions up to 6 hours/, offers);
+    assert.match(offers, /4 vCPU · 16 GB/, offers);
+    assert.doesNotMatch(offers, /sessions? up to/i, offers);
     // With no reset in the usage card head, the AI credits name their own reset, even on the same day.
     summary.ai = { ...summary.ai, included: { remaining: 500, granted: 1000, periodEnd: summary.fairUse.resetsAt } };
     await refresh();
@@ -991,9 +993,9 @@ try {
         const ai = () => q('[data-role="meter-ai"]');
         summary = withAccount(worked); await refresh();
         assert.equal(ai().querySelector('.ezil-billing-meter-value').textContent, '1,246 credits left of 1,500');
-        contains('[data-role="meter-ai"] [data-role="ai-details"]', 'Plan 1,000 · Added 500 · Used 252.75 · Reserved 0.5 · Remaining 1,246.75');
+        contains('[data-role="meter-ai"] [data-role="ai-details"]', 'Plan 1,000 · Added 500 · Used 252 · Reserved 0 · Remaining 1,246');
         assert.equal(ai().querySelector('[role="meter"]').getAttribute('aria-valuenow'), '83');
-        assert.deepEqual(qa('[data-role="ai-details"] span[title]').map(span => span.title), ['1,000 credits', '500 credits', '252.75 credits', '0.5 credits', '1,246.75 credits']);
+        assert.deepEqual(qa('[data-role="ai-details"] span[title]').map(span => span.title), ['1,000 credits', '500 credits', '252 credits', '0 credits', '1,246 credits']);
         contains('[data-role="meter-ai"]', '500 added · expire Jun 1, 2027');
         assert.doesNotMatch(ai().querySelector('.ezil-billing-meter-value').textContent, /of 1,000|746/);
         // Gateway down for the same user: the kept balance, as of its own time; never the catalog.
@@ -1150,12 +1152,12 @@ try {
         has('[data-role="cancels-banner"]', false);
         contains('[data-role="plan-ending"] [data-action="resume"].ezil-settings-btn-primary', 'Resume plan');
         summary = summaryV3('free'); Object.assign(summary.computer, { standing: 'files_on_aws', filesOn: 'aws', heldSince: null, move: null }); await refresh();
-        contains('[data-role="files-held"]', 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours.');
+        contains('[data-role="files-held"]', 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits.');
         assert.equal(qa('[data-role="files-held"]').length, 1, 'the hold is said once');
-        // Round 6 (R1-11): one provider string; the limit is the session line, and nothing to configure under the hold.
+        // Round 6 (R1-11): one provider string, and nothing to configure under the hold.
         contains('[data-role="your-computer"]', 'AWS (India)');
         assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /with Free limits|Cloudflare/);
-        contains('[data-role="your-computer"]', 'Sessions up to 1 hour on Free');
+        assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /Sessions? up to/i);
         contains('[data-role="your-computer"] [data-action="computer-tab"]', 'Computer details ›');
         contains('[data-role="plan-actions"] .ezil-settings-btn-primary', 'Upgrade to Standard');
         // Round 6: the founder's Billing on 10-30 (Free, held std-2, 763 AI credits of which 663 are from the cancelled Premium period).
@@ -1195,7 +1197,7 @@ try {
         // A held 2 vCPU placement keeps the hold copy.
         summary.computer.awsSize = { size: 'std-2', vcpu: 2, memoryGiB: 8 }; await refresh();
         contains('[data-role="files-held"]', 'It opens on the Free plan with Free limits');
-        contains('[data-role="your-computer"]', 'Sessions up to 1 hour on Free');
+        assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /Sessions? up to/i);
         delete summary.computer.awsSize;
         getUsage = () => failure('unavailable');
         // After grace the plan block may still describe the unpaid subscription (STANDING-CONTRACT §2).
@@ -1216,7 +1218,7 @@ try {
         contains('[data-role="meter-time"]', 'About 7 of 8 hours left this month');
         assert.doesNotMatch(q('[data-role="meter-time"]').textContent, /left at 2 vCPU|Same as/);
         contains('[data-role="your-computer"]', '2 vCPU · 8 GB memory · 50 GB disk · AWS (India)');
-        contains('[data-role="your-computer"]', 'Sessions up to 1 hour on Free');
+        assert.doesNotMatch(q('[data-role="your-computer"]').textContent, /Sessions? up to/i);
         contains('[data-role="billing-usage"]', 'Resets Dec 1, 2026');
         contains('[data-role="files-held"]', 'It opens on the Free plan with Free limits');
         // Earlier credits on a paid plan (this plan's tail or a cancelled plan's): one label true for both.
@@ -1254,7 +1256,7 @@ try {
         // Phase B (reverse move contract §6.2): during a move the standing stays files_on_aws and the Billing tab shows
         // 6a's files-held banner ONLY: no move card, no move action, no move sentence (the move lives on the Computer
         // tab). After the commit the standing is free and the banner goes. The banner's words are 6a's, unchanged.
-        const held = 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours.';
+        const held = 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits.';
         const moveWords = /Moving your files|Move my files|move your files|Workspace folder|Step \d of 4|finishing moving|kept for 14 days|kept until|Switching to your Free computer|Stop and move/i;
         for ( const [label, standing, row] of [
             ['before a move', 'files_on_aws', null], ['saving', 'files_on_aws', reverseMove({ stage: 'saving' })],

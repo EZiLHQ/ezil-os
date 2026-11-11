@@ -101,11 +101,11 @@ JWT signature/member verification on each request. Transactional storage keeps
 the later-expiring token. A gateway 401 drops that token only if a newer push
 has not replaced it. Teardown/idle stop delete the credential and nonce.
 
-## Plan model list (Free includes Gemini 3.8 Flash only)
+## Plan model list (Free includes a curated low-tier set, Flash first)
 
 A push may also carry `"includedModels"`: the models the owner's plan includes,
 from the same effective plan the computer start gate uses
-(`app/src/server/billing/v3/ai-models.ts`; Free is `["gemini-3.8-flash"]`,
+(`app/src/server/billing/v3/ai-models.ts`; Free is `["gemini-3.8-flash", "qwen.qwen3-coder-next", "us.moonshotai.kimi-k3"]`, Flash first,
 Standard and Premium are `null`, every model). It is signed in the same body.
 When billing metering is off the app sends `null`, which is an explicit answer.
 When the app cannot read the plan it leaves the field out: that push refreshes

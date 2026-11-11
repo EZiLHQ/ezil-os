@@ -1,6 +1,7 @@
 // feedback-test.mjs — EZiL-authored. Run with Node; no browser or network.
 // Actual form/diagnostics/schema, with contract doubles for FCAPTURE's modules.
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { registerHooks } from 'node:module';
 import { JSDOM } from 'jsdom';
@@ -119,12 +120,19 @@ let flushing = false;
 let respond = async () => ({ status: 201, ok: true, json: async () => ({ id: reportId, screenshotAccepted: true }) });
 globalThis.fetch = window.fetch = (url, options) => {
     if ( options.method === 'POST' ) {
+        assert.equal(options.headers['X-EZiL-Feedback-Account'], accountId, 'every new client POST is account-bound, including legacy inline/text');
         if ( ! flushing ) {
             const box = document.querySelector('.ezil-feedback-preview');
             if ( ! box.open ) { box.open = true; box.dispatchEvent(new window.Event('toggle')); }
             assert.equal(options.body, box.querySelector('pre').textContent, 'preview is the exact request body at dispatch');
         }
-        feedbackSubmitSchema.parse(JSON.parse(options.body));
+        const body = JSON.parse(options.body);
+        if (!body.screenshotRefs) feedbackSubmitSchema.parse(body);
+        else {
+            assert.equal(body.screenshot, null); assert.equal(body.screenshots, undefined);
+            assert.ok(body.screenshotRefs.length > 0 && body.screenshotRefs.length <= 5);
+            assert.equal(options.headers['X-EZiL-Feedback-Account'], accountId);
+        }
     }
     calls.push({ url, ...options });
     return respond(url, options);
@@ -353,7 +361,8 @@ try {
         diagnosticsSchema.parse(payload().diagnostics);
         assert.equal(payload().screenshot, null, 'capture unavailable: the report carries no image and is not blocked');
         assert.equal(payload().computerId, computerId);
-        await until(() => /No screenshot was captured automatically/.test(current().querySelector('[data-role="capture-note"]').textContent));
+        assert.equal(current().querySelector('[data-role="capture-note"]').hidden, true);
+        assert.equal(captureCalls.length, 0, 'opening feedback never captures the screen');
         assert.equal(current().querySelector('[type="submit"]').disabled, false);
         change('diagnostics', false);
         assert.equal(payload().diagnostics, null, 'the attachment can still be switched off');
@@ -454,165 +463,9 @@ try {
         assert.equal(current().querySelector('[type="submit"]').disabled, false);
         close(); window.localStorage.removeItem(draftKey);
     });
-    await check('default capture: the masked window snapshot is attached without the editor, and a blank report sends with it', async () => {
-        defaultCapture = true;
-        try {
-            const shells = captureCalls.length, editors = editorOptions.length, requests = calls.length;
-            open();
-            await until(() => ! current().querySelector('.ezil-feedback-image').hidden);
-            assert.equal(current().querySelector('pre').textContent, '', 'the large body is rendered only while the preview is open');
-            assert.deepEqual(captureCalls.slice(shells), ['shell'], 'only the EZiL window snapshot: no tab or desktop picker, no editor');
-            assert.equal(editorOptions.length, editors);
-            assert.equal(captureOptions.at(-1).hide, undefined, 'no hide-and-restore step: the snapshot excludes this dialog itself');
-            assert.equal(payload().screenshot.contentType, 'image/webp');
-            assert.equal(calls.length, requests, 'nothing uploads until Send');
-            assert.equal(current().querySelector('[data-role="capture-note"]').textContent, '');
-            assert.equal(current().querySelector('[type="submit"]').disabled, false);
-            respond = async () => ({ status: 201, ok: true, json: async () => ({ id: reportId, screenshotAccepted: true }) });
-            send();
-            await until(() => status().includes(reportId));
-            const body = JSON.parse(calls.at(-1).body);
-            assert.equal(calls.length, requests + 1);
-            assert.equal(body.description, '');
-            assert.equal(body.category, 'bug');
-            assert.ok(body.diagnostics?.recentEvents);
-            assert.ok(body.screenshot.dataBase64.length > 0);
-            close();
-        } finally { defaultCapture = false; }
-    });
-    await check('a failed, empty, oversized or unencodable default capture never blocks Send', async () => {
-        defaultCapture = true;
-        const canvas = () => Promise.resolve(document.createElement('canvas'));
-        const wide = () => { const c = document.createElement('canvas'); c.width = 5000; c.height = 10; return Promise.resolve(c); };
-        const realEncode = encodeResult;
-        try {
-            for ( const [label, setup] of [
-                ['capture rejects', () => { nextCanvas = () => Promise.reject(new Error('capture failed')); }],
-                ['no canvas', () => { nextCanvas = () => Promise.resolve(null); }],
-                ['unencodable', () => { nextCanvas = canvas; encodeResult = () => null; }],
-                ['over the byte limit', () => { nextCanvas = canvas; encodeResult = () => ({ size: 2 * 1024 * 1024, type: 'image/webp' }); }],
-                ['over the pixel limit', () => { nextCanvas = wide; }],
-            ] ) {
-                nextCanvas = canvas; encodeResult = realEncode;
-                setup();
-                open();
-                await until(() => /No screenshot was captured automatically/.test(current().querySelector('[data-role="capture-note"]').textContent));
-                assert.equal(current().querySelector('[type="submit"]').disabled, false, label);
-                assert.equal(payload().screenshot, null, label);
-                const requests = calls.length;
-                send();
-                await until(() => status().includes(reportId));
-                assert.equal(calls.length, requests + 1, label);
-                const body = JSON.parse(calls.at(-1).body);
-                assert.equal(body.screenshot, null, label);
-                assert.equal(body.description, '', `${label}: blank`);
-                assert.ok(body.diagnostics, label);
-                close();
-            }
-        } finally { defaultCapture = false; nextCanvas = canvas; encodeResult = realEncode; }
-    });
-    await check('Send while the default screenshot is still capturing waits briefly; a late capture never changes the frozen body or id', async () => {
-        defaultCapture = true;
-        const requests = calls.length;
-        try {
-            // (1) Ready within the wait: it is included, and a repeated Send makes no second request.
-            let ready;
-            nextCanvas = () => new Promise(resolve => { ready = resolve; });
-            open(); setDescription('Sent while capturing');
-            send(); send();
-            assert.equal(calls.length, requests, 'waiting for the screenshot');
-            assert.equal(current().querySelector('[type="submit"]').disabled, true);
-            assert.match(current().querySelector('[data-role="capture-note"]').textContent, /Finishing the screenshot/);
-            ready(document.createElement('canvas'));
-            await until(() => status().includes(reportId));
-            assert.equal(calls.length, requests + 1, 'one report');
-            assert.ok(JSON.parse(calls.at(-1).body).screenshot, 'the screenshot that finished in time is included');
-            close();
-            // (2) Not ready within the wait: sent without it; the late capture cannot alter the body, and a retry is byte-identical.
-            respond = async () => { throw new TypeError('Failed to fetch'); };
-            let late;
-            nextCanvas = () => new Promise(resolve => { late = resolve; });
-            open(); setDescription('Capture never finishes');
-            const sentBefore = calls.length;
-            send();
-            await new Promise(resolve => setTimeout(resolve, feedback.AUTO_CAPTURE_WAIT_MS + 300));
-            await until(() => calls.length === sentBefore + 1 && ! current().querySelector('[type="submit"]').disabled);
-            const first = JSON.parse(calls.at(-1).body);
-            assert.equal(first.screenshot, null);
-            assert.equal(stored(outboxKey).filter(entry => entry.clientRequestId === first.clientRequestId).length, 1, 'kept for retry');
-            late(document.createElement('canvas')); await tick(); await tick();
-            assert.equal(current().querySelector('.ezil-feedback-image').hidden, true, 'a late capture is discarded');
-            send(); await until(() => calls.length === sentBefore + 2);
-            assert.equal(calls.at(-1).body, calls.at(-2).body, 'the retry is the same request, byte for byte');
-            assert.equal(JSON.parse(calls.at(-1).body).clientRequestId, first.clientRequestId);
-            respond = async () => ({ status: 201, ok: true, json: async () => ({ id: reportId, screenshotAccepted: true }) });
-            await until(() => ! current().querySelector('[type="submit"]').disabled);
-            send(); await until(() => status().includes(reportId));
-            assert.equal(calls.at(-1).body, calls.at(-2).body);
-            close();
-        } finally { defaultCapture = false; nextCanvas = () => Promise.resolve(document.createElement('canvas')); }
-    });
-    await check('reopening after a send that got no answer resumes that same request byte for byte (text or blank), never a second report', async () => {
-        defaultCapture = true;
-        const realRespond = respond;
-        try {
-            respond = async () => { throw new TypeError('Failed to fetch'); };
-            for ( const text of ['Reopen me', ''] ) {
-                window.localStorage.removeItem(draftKey);
-                open();
-                if ( text ) setDescription(text);
-                await until(() => ! current().querySelector('.ezil-feedback-image').hidden);
-                const requests = calls.length;
-                send();
-                await until(() => calls.length === requests + 1 && ! current().querySelector('[type="submit"]').disabled);
-                const first = calls.at(-1).body;
-                const id = JSON.parse(first).clientRequestId;
-                assert.ok(JSON.parse(first).screenshot && JSON.parse(first).diagnostics, 'default attachments were sent');
-                close();
-                // A new event in the ring would change a fresh snapshot: the resumed request must keep the queued one.
-                telemetry.capture({ eventClass: 'api_failure', site: 's', code: `between_opens_${text.length}` });
-                const shells = captureCalls.length;
-                // Reopened later: another computer is current, and (blank case) from an error screen with a code to prefill.
-                const originalComputer = JSON.parse(first).computerId;
-                setCurrentComputer({ id: '66666666-6666-4666-8666-666666666666' });
-                if ( text ) open();
-                else { document.querySelector('#opener').focus(); feedback.open_feedback_dialog({ source: 'opening', errorCode: 'billing_files_on_aws' }); }
-                assert.equal(payload().clientRequestId, id, `${text || 'blank'}: the same request id`);
-                assert.equal(payload().computerId, originalComputer, 'the queued request keeps the computer it was sent for');
-                assert.equal(form().elements.description.value, text, 'no new prefill on a resumed request');
-                assert.equal(current().querySelector('pre').textContent, first, 'the preview is the queued body');
-                assert.equal(captureCalls.length, shells, 'no new capture for a request that is already queued');
-                assert.equal(current().querySelector('.ezil-feedback-image').hidden, false, 'the queued screenshot is shown');
-                send();
-                await until(() => calls.length === requests + 2 && ! current().querySelector('[type="submit"]').disabled);
-                assert.equal(calls.at(-1).body, first, 'the re-send is byte-identical');
-                close();
-                setCurrentComputer({ id: originalComputer });
-                window.localStorage.removeItem(outboxKey);
-                window.localStorage.removeItem(draftKey);
-            }
-        } finally { defaultCapture = false; respond = realRespond; }
-    });
-    await check('switching the screenshot off aborts the default capture, switching it on starts one, and a manual capture replaces it', async () => {
-        defaultCapture = true;
-        try {
-            nextCanvas = () => new Promise(() => {});
-            const shells = captureCalls.length;
-            open();
-            const first = captureOptions.at(-1).signal;
-            assert.equal(captureCalls.length, shells + 1);
-            change('screenshot', false);
-            assert.equal(first.aborted, true);
-            assert.equal(payload().screenshot, null);
-            change('screenshot', true);
-            assert.equal(captureCalls.length, shells + 2, 'selecting it again captures again');
-            const second = captureOptions.at(-1).signal;
-            current().querySelector('[data-capture="shell"]').click();
-            assert.equal(second.aborted, true, 'a manual capture takes over from the default one');
-            close();
-            assert.equal(captureOptions.at(-1).signal.aborted, true, 'closing the form aborts the capture');
-        } finally { defaultCapture = false; nextCanvas = () => Promise.resolve(document.createElement('canvas')); }
-    });
+
+
+
     await check('failure references require the upstream capability and remain bounded', () => {
         const events = telemetry.recentEvents();
         const event = events.at(-1);
@@ -629,97 +482,10 @@ try {
         delete event.reason; delete event.serverCorrelationId;
         delete window.__EZIL_BOOT__.desktopState.ui.feedbackEventDiagnostics;
     });
-    await check('the reporter is told about the server-added context, and the client preview stays client-only', () => {
-        open();
-        // A short notice is always visible; the full text sits in the collapsed diagnostics details.
-        const consentNote = current().querySelector('[data-role="server-context-note"]').textContent;
-        assert.match(consentNote, /With diagnostics on/);
-        assert.match(consentNote, /not shown in the preview/);
-        assert.ok(consentNote.length < 200, 'the always-visible notice is succinct');
-        const detail = current().querySelector('.ezil-feedback-details [data-role="server-context-detail"]').textContent;
-        assert.match(detail, /after you press Send, so it is not in the preview/);
-        assert.match(detail, /never addresses, IDs or anyone else's data/);
-        assert.equal(current().querySelector('.ezil-feedback-details').open, false, 'details start collapsed');
-        assert.match(current().querySelector('[data-role="server-context-preview-note"]').textContent, /does not appear here/);
-        change('diagnostics', true);
-        assert.doesNotMatch(JSON.stringify(payload()), /serverContext/);
-        close();
-    });
-    await check('the server-context notice stays visible with diagnostics on or off; on is the default and unchecking it sends no diagnostics', async () => {
-        const visible = el => { for ( let n = el; n && n !== document; n = n.parentElement ) { const s = window.getComputedStyle(n); if ( n.hidden || s.display === 'none' || s.visibility === 'hidden' ) return false; } return true; };
-        open();
-        const note = () => current().querySelector('[data-role="server-context-note"]');
-        assert.equal(form().elements.diagnostics.checked, true, 'selected by default');
-        assert.equal(visible(note()), true, 'the notice is shown with diagnostics on');
-        change('diagnostics', false);
-        assert.equal(visible(note()), true, 'the notice does not depend on the checkbox');
-        assert.equal(payload().diagnostics, null, 'opt-out: no diagnostics in the body, so the server adds no context (it only does so for a report carrying diagnostics)');
-        const requests = calls.length;
-        await tick();
-        send();
-        await until(() => calls.length === requests + 1);
-        assert.equal(JSON.parse(calls.at(-1).body).diagnostics, null, 'the sent report carries no diagnostics');
-        await until(() => status().includes(reportId));
-        close();
-    });
-    await check('compact and honest: capture scope caption, one context line from observed facts, details collapsed', async () => {
-        defaultCapture = true;
-        try {
-            setCurrentComputer({ id: computerId, name: 'Work PC' });
-            open();
-            const scope = () => current().querySelector('[data-role="capture-scope-text"]').textContent;
-            assert.match(scope(), /No screenshot attached\. Embedded apps are never captured automatically/);
-            await until(() => ! current().querySelector('.ezil-feedback-image').hidden);
-            assert.match(scope(), /Embedded app not captured/);
-            assert.match(scope(), /EZiL OS window only/);
-            assert.ok(current().querySelector('[data-role="capture-scope"] [data-capture="tab"]'), 'one optional "Capture what I see" next to the caption');
-            // Short text only in the open form; the long explanations are inside collapsed details.
-            for ( const p of current().querySelectorAll('.ezil-feedback-fields > p.ezil-feedback-muted') ) assert.ok(p.textContent.length < 220, `succinct: ${p.textContent.slice(0, 40)}`);
-            assert.equal(current().querySelector('.ezil-feedback-details').open, false);
-            // One line of observed facts only; never steps, expected or actual.
-            const line = () => current().querySelector('[data-role="context-line"]');
-            assert.equal(line().hidden, false);
-            assert.match(line().textContent, /^Noticed: .*computer “Work PC”/);
-            assert.doesNotMatch(line().textContent, /steps|expected|actual|reproduc/i);
-            change('diagnostics', false);
-            assert.doesNotMatch(line().textContent, /app /, 'diagnostics-derived facts go away with the checkbox');
-            change('diagnostics', true);
-            // A manual capture names its own source; removing leaves an honest empty state.
-            current().querySelector('[data-capture="tab"]').click();
-            await until(() => /browser surface you chose/.test(scope()));
-            assert.doesNotMatch(scope(), /EZiL OS window only/);
-            current().querySelector('[data-action="remove-screenshot"]').click();
-            assert.match(scope(), /No screenshot attached/);
-            close();
-        } finally { defaultCapture = false; setCurrentComputer({ id: computerId }); }
-    });
-    await check('expanded diagnostics are consented, frozen, refreshed and downgraded on a strict old server', async () => {
-        window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle = true;
-        open(); setDescription('Snapshot test');
-        assert.ok(payload().diagnostics, 'selected by default: the snapshot is taken when the form opens');
-        const snapshot = JSON.stringify(payload().diagnostics);
-        assert.equal(payload().diagnostics.recentEvents.length, 50);
-        assert.ok(payload().diagnostics.tracePhases.some(p => p.code === 'display'));
-        telemetry.capture({ eventClass: 'api_failure', site: 's', code: 'new_failure' });
-        setDescription('Edited context');
-        assert.equal(JSON.stringify(payload().diagnostics), snapshot);
-        current().querySelector('[data-action="refresh-diagnostics"]').click();
-        assert.equal(payload().diagnostics.recentEvents.at(-1).code, 'new_failure');
-        const original = payload(); const count = calls.length;
-        respond = async () => calls.length === count + 1 ? { status: 400 } : { status: 201, json: async () => ({ id: reportId }) };
-        send(); await until(() => status().includes(reportId));
-        const first = JSON.parse(calls[count].body), second = JSON.parse(calls[count + 1].body);
-        assert.deepEqual(first, original);
-        assert.equal(second.description, original.description);
-        assert.equal(second.clientRequestId, original.clientRequestId);
-        assert.equal(second.diagnostics.session, undefined);
-        assert.equal(second.diagnostics.tracePhases, undefined);
-        assert.equal(second.diagnostics.recentEvents[0].ageMs, undefined);
-        assert.equal(current().querySelector('pre').textContent, calls[count + 1].body);
-        assert.ok(Buffer.byteLength(calls[count].body) < 32768);
-        close(); delete window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle;
-        respond = async () => ({ status: 201, ok: true, json: async () => ({ id: reportId, screenshotAccepted: true }) });
-    });
+
+
+
+
     await check('editing an unconfirmed report forks its ID before an old receipt can discard edits', async () => {
         open(); setDescription('Original unconfirmed report');
         const originalId = payload().clientRequestId;
@@ -764,53 +530,8 @@ try {
             respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true }) });
         }
     });
-    await check('all capture tiers use the editor; tab capture starts synchronously; no upload before Submit', async () => {
-        open(); setDescription('Screenshot report'); change('screenshot', true);
-        const count = calls.length;
-        for ( const kind of ['shell', 'tab', 'desktop'] ) {
-            const index = captureCalls.length;
-            current().querySelector(`[data-capture="${kind}"]`).click();
-            assert.equal(captureCalls[index], kind, 'capture starts in the click stack');
-            await until(() => payload().screenshot !== null && ! current().querySelector('[type="submit"]').disabled);
-            assert.equal(captureCalls[index + 1], 'editor');
-            assert.equal(payload().screenshot.dataBase64, imageBytes.toString('base64'));
-            assert.equal(calls.length, count);
-            if ( kind !== 'desktop' ) {
-                current().querySelector('[data-action="remove-screenshot"]').click();
-                assert.equal(payload().screenshot, null);
-            }
-        }
-        const attached = current().querySelector('.ezil-feedback-image img');
-        Object.defineProperties(attached, { naturalWidth: { value: 1 }, naturalHeight: { value: 1 } });
-        const originalContext = window.HTMLCanvasElement.prototype.getContext;
-        let source;
-        window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage(image) { source = image; } });
-        const editCount = captureCalls.length;
-        current().querySelector('[data-capture="edit"]').click();
-        await until(() => captureCalls.length > editCount && !current().querySelector('[type="submit"]').disabled);
-        assert.equal(source, attached, 'editing starts from the redacted attached image');
-        assert.equal(captureCalls.at(-1), 'editor');
-        window.HTMLCanvasElement.prototype.getContext = originalContext;
-        respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true }) });
-        const before = current().querySelector('pre').textContent;
-        send(); await until(() => status().includes(reportId));
-        assert.equal(calls.at(-1).body, before);
-        close();
-    });
-    await check('revoking screenshot consent discards a pending capture', async () => {
-        open(); setDescription('Capture cancelled'); change('screenshot', true);
-        let finish;
-        nextCanvas = () => new Promise(resolve => { finish = resolve; });
-        current().querySelector('[data-capture="tab"]').click();
-        change('screenshot', false);
-        finish(document.createElement('canvas'));
-        await until(() => ! current().querySelector('[type="submit"]').disabled);
-        assert.equal(payload().screenshot, null);
-        assert.equal(current().querySelector('.ezil-feedback-image').hidden, true);
-        assert.doesNotMatch(status(), /Preparing/);
-        nextCanvas = () => Promise.resolve(document.createElement('canvas'));
-        close();
-    });
+
+
     await check('warnings are advisory; 400/413/network errors preserve text; Escape restores focus', async () => {
         open(); setDescription('Contact test@example.com or sk-example123');
         assert.equal(current().querySelector('.ezil-feedback-warning').hidden, false);
@@ -1269,83 +990,9 @@ try {
             window.localStorage.removeItem(draftKey);
         }
     });
-    await check('teardown and navigation close the form, abort pending captures and leave Back unhandled', async () => {
-        const count = calls.length;
-        for ( const type of ['ezil:teardown', 'popstate', 'pagehide', 'hashchange'] ) {
-            open(); setDescription('Interrupted report'); change('screenshot', true);
-            let finish;
-            nextCanvas = () => new Promise(resolve => { finish = resolve; });
-            const button = current().querySelector('[data-capture="shell"]');
-            const captures = captureCalls.length;
-            button.click(); button.click();
-            assert.equal(captureCalls.length, captures + 1);
-            const { signal } = captureOptions.at(-1);
-            const event = new window.Event(type, { cancelable: true });
-            window.dispatchEvent(event);
-            assert.equal(event.defaultPrevented, false);
-            assert.equal(current(), null);
-            assert.equal(signal.aborted, true);
-            finish(document.createElement('canvas'));
-            await tick();
-            assert.equal(current(), null);
-            assert.equal(captureCalls.length, captures + 1, 'late capture must not open editor');
-        }
-        nextCanvas = () => Promise.resolve(document.createElement('canvas'));
-        assert.equal(calls.length, count);
-        assert.equal(document.querySelector('.ezil-feedback-chip'), null);
-        feedback.mount_feedback_chip();
-        window.dispatchEvent(new window.Event('pagehide'));
-        assert.equal(document.querySelector('.ezil-feedback-chip'), null);
-        window.dispatchEvent(new window.Event('pageshow'));
-        assert.equal(document.querySelectorAll('.ezil-feedback-chip').length, 1);
-    });
-    await check('cancelled capture cannot unlock or reveal a newer pending capture', async () => {
-        open(); setDescription('Recapture'); change('screenshot', true);
-        let oldFinish, newFinish;
-        nextCanvas = () => new Promise(resolve => { oldFinish = resolve; });
-        current().querySelector('[data-capture="shell"]').click();
-        const oldSignal = captureOptions.at(-1).signal;
-        change('screenshot', false);
-        assert.equal(oldSignal.aborted, true);
-        assert.equal(current().classList.contains('ezil-feedback-capturing'), false);
-        change('screenshot', true);
-        nextCanvas = () => new Promise(resolve => { newFinish = resolve; });
-        current().querySelector('[data-capture="shell"]').click();
-        oldFinish(document.createElement('canvas')); await tick();
-        assert.equal(current().querySelector('[data-capture="shell"]').disabled, true);
-        assert.equal(current().querySelector('[type="submit"]').disabled, true);
-        assert.equal(current().classList.contains('ezil-feedback-capturing'), true);
-        assert.equal(status(), 'Preparing screenshot…');
-        assert.equal(payload().screenshot, null);
-        newFinish(document.createElement('canvas'));
-        await until(() => payload().screenshot !== null);
-        nextCanvas = () => Promise.resolve(document.createElement('canvas'));
-        close();
-    });
-    await check('editor Cancel returns to the draft; closing the form aborts editing and discards late edits', async () => {
-        open(); setDescription('Keep this draft'); change('screenshot', true);
-        const originalEditor = editorResult;
-        editorResult = () => null;
-        current().querySelector('[data-capture="shell"]').click();
-        await until(() => !current().querySelector('[type="submit"]').disabled);
-        assert.equal(form().elements.description.value, 'Keep this draft');
-        assert.equal(payload().screenshot, null);
-        let finish;
-        editorResult = () => new Promise(resolve => { finish = resolve; });
-        current().querySelector('[data-capture="shell"]').click();
-        await until(() => !!finish);
-        const { signal } = editorOptions.at(-1);
-        close();
-        assert.equal(signal.aborted, true);
-        finish(originalEditor()); await tick();
-        assert.equal(current(), null);
-        editorResult = originalEditor;
-        open();
-        assert.equal(form().elements.description.value, 'Keep this draft', 'the text draft survives closing the form');
-        assert.equal(payload().screenshot, null, 'a screenshot is never part of the saved draft');
-        setDescription('');
-        close();
-    });
+
+
+
     await check('closing during submission is truthful and late success cannot change a new draft', async () => {
         open(); setDescription('Submitted report');
         await tick(); // the default screenshot (unavailable here) has settled
@@ -1384,212 +1031,247 @@ try {
     };
     const rows = () => [...current().querySelectorAll('[data-role="images"] > li')];
     const multi = async run => {
-        const realEditor = editorResult;
-        ui.feedbackScreenshotsMax = 5; editorResult = distinctResult;
-        try { await run(); } finally { delete ui.feedbackScreenshotsMax; editorResult = realEditor; if ( current() ) close(); }
+        const realEditor = editorResult, realEncode = encodeResult, realCanvas = nextCanvas, realRespond = respond;
+        ui.feedbackScreenshotsMax = 5; editorResult = distinctResult; encodeResult = () => distinctResult().blob;
+        nextCanvas = async () => { const c = document.createElement('canvas'); c.width = c.height = 1; return c; };
+        window.localStorage.removeItem(outboxKey); window.localStorage.removeItem(draftKey);
+        try { await run(); } finally { delete ui.feedbackScreenshotsMax; delete ui.feedbackStagedUploads; editorResult = realEditor; encodeResult = realEncode; nextCanvas = realCanvas; respond = realRespond; if (current()) close(); window.localStorage.removeItem(outboxKey); window.localStorage.removeItem(draftKey); }
     };
 
-    await check('paste: an image pasted into the description goes through the editor and joins the report; text pastes are untouched; nothing uploads', async () => {
-        await multi(async () => {
-            open(); setDescription('Pasted screenshots');
-            const requests = calls.length, editors = editorOptions.length;
-            const textPaste = paste(form().elements.description, [], 'plain words');
-            assert.equal(textPaste.defaultPrevented, false, 'a text paste stays a normal paste');
-            const imagePaste = paste(form().elements.description, [png('one.png')]);
-            assert.equal(imagePaste.defaultPrevented, true);
-            await until(() => rows().length === 1 && ! current().querySelector('[type="submit"]').disabled);
-            assert.ok(captureCalls.includes('upload:one.png'));
-            assert.equal(editorOptions.length, editors + 1, 'the pasted image opened in the editor');
-            assert.equal(current().querySelector('[data-role="capture-scope-text"]').textContent, 'Pasted from your clipboard.');
-            assert.equal(calls.length, requests, 'pasting uploads nothing');
-            assert.ok(payload().screenshot, 'one image keeps the single-image key');
-            assert.equal(payload().screenshots, undefined);
-        });
-    });
 
-    await check('several images: pasted, attached and captured images are listed, previewed and sent in order as `screenshots`, only on Send', async () => {
-        await multi(async () => {
-            open(); setDescription('Three images');
-            const requests = calls.length;
-            paste(current(), [png('a.png'), png('b.png')]);
-            await until(() => rows().length === 2 && ! current().querySelector('[type="submit"]').disabled);
-            current().querySelector('[data-capture="tab"]').click();
-            await until(() => rows().length === 3 && ! current().querySelector('[type="submit"]').disabled);
-            assert.deepEqual(rows().map(row => row.querySelector('span').textContent.replace(/ · .*/, '')), ['1. Pasted', '2. Pasted', '3. Screen capture']);
-            assert.match(current().querySelector('[data-role="images-heading"]').textContent, /3 of 5 images/);
-            const body = payload();
-            assert.equal(body.screenshot, null);
-            assert.equal(body.screenshots.length, 3);
-            assert.equal(new Set(body.screenshots.map(image => image.dataBase64)).size, 3);
-            feedbackSubmitSchema.parse(body);
-            // Draft saves and preview toggles never upload, and the draft never holds an image.
-            setDescription('Three images, edited'); showPreview();
-            assert.equal(calls.length, requests);
-            assert.doesNotMatch(window.localStorage.getItem(draftKey) ?? '', /dataBase64|base64/);
-            const before = current().querySelector('pre').textContent;
-            respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true, screenshotCount: 3 }) });
-            send(); await until(() => status().includes(reportId));
-            assert.equal(calls.length, requests + 1, 'one request, on Send');
-            assert.equal(calls.at(-1).body, before, 'the request is the previewed body');
-        });
-    });
 
-    await check('per image: edit replaces that image in place, remove drops only that one, and limits are enforced before the editor', async () => {
+
+
+
+
+
+
+
+
+
+
+
+
+
+    const ready = () => !current().querySelector('[type="submit"]').disabled;
+    const attach = async files => { paste(current(), files); await until(ready); };
+    const drop = (target, files, types = ['Files']) => {
+        const event = new window.Event('drop', { bubbles: true, cancelable: true });
+        Object.defineProperty(event, 'dataTransfer', { value: { files, types } }); target.dispatchEvent(event); return event;
+    };
+    const stagedReply = async (url, options) => options.method === 'PUT'
+        ? { status: 201, json: async () => ({ sha256: createHash('sha256').update(options.body).digest('hex'), finalized: false }) }
+        : { status: 201, json: async () => ({ id: reportId, screenshotAccepted: true }) };
+    await check('compact form: paste/drop/attach preserve order locally, no capture controls or compulsory editor', async () => {
         await multi(async () => {
-            open();
-            paste(current(), [png('a.png'), png('b.png'), png('c.png')]);
-            await until(() => rows().length === 3 && ! current().querySelector('[type="submit"]').disabled);
-            const [first, second, third] = payload().screenshots.map(image => image.dataBase64);
-            // The editor's limit is what the report total leaves after the other images, never above 1.5 MiB.
-            assert.equal(editorOptions.at(-1).limit, Math.floor(1.5 * 1024 * 1024));
-            const img = rows()[1].querySelector('img');
-            Object.defineProperties(img, { naturalWidth: { value: 1 }, naturalHeight: { value: 1 } });
-            const realContext = window.HTMLCanvasElement.prototype.getContext;
-            window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage () {} });
-            try {
-                rows()[1].querySelector('[data-capture="edit"]').click();
-                await until(() => ! current().querySelector('[type="submit"]').disabled && payload().screenshots[1].dataBase64 !== second);
-            } finally { window.HTMLCanvasElement.prototype.getContext = realContext; }
-            const edited = payload().screenshots.map(image => image.dataBase64);
-            assert.equal(edited.length, 3);
-            assert.equal(edited[0], first); assert.equal(edited[2], third);
-            assert.match(rows()[1].textContent, /Pasted/, 'an edit keeps where the image came from');
-            rows()[0].querySelector('[data-action="remove-screenshot"]').click();
-            assert.deepEqual(payload().screenshots.map(image => image.dataBase64), [edited[1], third]);
-            // Fill to the count limit: add controls are disabled, and a further paste never reaches the editor.
-            paste(current(), [png('d.png'), png('e.png'), png('f.png'), png('g.png')]);
-            await until(() => rows().length === 5 && ! current().querySelector('[type="submit"]').disabled);
-            assert.equal(current().querySelector('[data-capture="tab"]').disabled, true);
-            assert.equal(form().elements.screenshotFile.disabled, true);
-            const editors = editorOptions.length;
-            paste(current(), [png('h.png')]);
-            await tick(); await tick();
+            open(); const before = calls.length, editors = editorOptions.length;
+            assert.equal(current().querySelector('.ezil-feedback-preview').open, false);
+            assert.equal(current().querySelector('[data-capture], .ezil-feedback-capture-options, .ezil-feedback-details'), null);
+            assert.equal(current().querySelector('[data-role="context-line"]').closest('details').open, false);
+            assert.equal(form().elements.description.placeholder, 'You can paste screenshots here too.');
+            assert.equal(paste(form().elements.description, [], 'plain text').defaultPrevented, false);
+            assert.equal(drop(form().elements.description, [], ['text/plain']).defaultPrevented, false);
+            await attach([png('a.png'), png('b.png')]);
+            assert.equal(rows().length, 2); const first = payload().screenshots.map(image => image.dataBase64);
             assert.equal(editorOptions.length, editors);
-            assert.match(current().querySelector('[data-role="capture-note"]').textContent, /already has 5 screenshots/);
-            feedbackSubmitSchema.parse(payload());
-        });
-    });
-
-    await check('the same screenshot twice is refused locally with a note (the server would 400 the whole report); an edit into a duplicate keeps the prior image', async () => {
-        await multi(async () => {
-            open();
-            const requests = calls.length;
-            const same = () => ({ blob: new window.Blob([imageBytes], { type: 'image/png' }), contentType: 'image/png', width: 1, height: 1 });
-            editorResult = same;
-            paste(current(), [png('first.png')]);
-            await until(() => rows().length === 1 && ! current().querySelector('[type="submit"]').disabled);
-            paste(current(), [png('again.png')]);
-            await until(() => captureCalls.includes('upload:again.png') && ! current().querySelector('[type="submit"]').disabled);
-            assert.equal(rows().length, 1, 'a repeated paste does not add a row');
-            assert.equal(current().querySelector('[data-role="capture-note"]').textContent, 'This screenshot is already attached.');
-            // A second, different image; then editing it into a copy of the first keeps it as it was.
-            editorResult = distinctResult;
-            paste(current(), [png('other.png')]);
-            await until(() => rows().length === 2 && ! current().querySelector('[type="submit"]').disabled);
-            const before = payload().screenshots.map(image => image.dataBase64);
-            editorResult = same;
-            const img = rows()[1].querySelector('img');
-            Object.defineProperties(img, { naturalWidth: { value: 1 }, naturalHeight: { value: 1 } });
-            const realContext = window.HTMLCanvasElement.prototype.getContext;
-            window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage () {} });
-            const editors = editorOptions.length;
-            try {
-                rows()[1].querySelector('[data-capture="edit"]').click();
-                await until(() => editorOptions.length > editors && ! current().querySelector('[type="submit"]').disabled);
-            } finally { window.HTMLCanvasElement.prototype.getContext = realContext; }
-            assert.deepEqual(payload().screenshots.map(image => image.dataBase64), before, 'both images and their order are unchanged');
-            assert.match(current().querySelector('[data-role="capture-note"]').textContent, /already attached/);
-            assert.equal(calls.length, requests, 'nothing uploaded');
-            respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true, screenshotCount: 2 }) });
-            send(); await until(() => status().includes(reportId));
-            const sent = JSON.parse(calls.at(-1).body).screenshots.map(image => image.dataBase64);
-            assert.equal(new Set(sent).size, sent.length, 'the report carries no duplicate, so the server has no reason to refuse it');
-        });
-    });
-
-    await check('several images: the byte budget is shared, and turning screenshots off sends no image key at all', async () => {
-        await multi(async () => {
-            open();
-            const big = Math.floor(1.2 * 1024 * 1024);
-            const realEditor = editorResult;
-            editorResult = () => ({ blob: new window.Blob([Buffer.alloc(big, 7)], { type: 'image/png' }), contentType: 'image/png', width: 1, height: 1 });
-            try {
-                paste(current(), [png('big.png')]);
-                await until(() => rows().length === 1 && ! current().querySelector('[type="submit"]').disabled);
-                paste(current(), [png('next.png')]);
-                await until(() => editorOptions.at(-1).limit < big && ! current().querySelector('[type="submit"]').disabled);
-                assert.equal(editorOptions.at(-1).limit, Math.floor(1.75 * 1024 * 1024) - big, 'the second image may use only what is left');
-                assert.equal(rows().length, 1, 'an image over what is left is refused, not attached');
-                assert.match(status(), /too large/);
-            } finally { editorResult = realEditor; }
-            change('screenshot', false);
-            const body = payload();
-            assert.equal(body.screenshot, null);
-            assert.equal('screenshots' in body, false, 'consent off: no image list');
-            assert.equal(rows().length, 0);
-        });
-    });
-
-    await check('a multi-image report queued offline reopens and re-sends byte for byte', async () => {
-        await multi(async () => {
-            window.localStorage.removeItem(draftKey); window.localStorage.removeItem(outboxKey);
-            open(); setDescription('Queued images');
-            paste(current(), [png('a.png'), png('b.png')]);
-            await until(() => rows().length === 2 && ! current().querySelector('[type="submit"]').disabled);
-            respond = async () => { throw new TypeError('Failed to fetch'); };
-            const requests = calls.length;
-            send(); await until(() => calls.length === requests + 1 && ! current().querySelector('[type="submit"]').disabled);
-            const first = calls.at(-1).body;
-            close();
-            open();
-            assert.equal(current().querySelector('pre').textContent || (showPreview(), current().querySelector('pre').textContent), first);
+            assert.equal(drop(document.body, [png('outside.png')]).defaultPrevented, true);
             assert.equal(rows().length, 2);
-            assert.match(rows()[0].textContent, /Queued with this report/);
-            respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: false, screenshotCount: 0 }) });
-            send(); await until(() => status().includes(reportId));
-            assert.equal(calls.at(-1).body, first, 'the re-send is byte-identical');
-            assert.match(status(), /Your images weren't stored/, 'a budget refusal is said plainly');
-            window.localStorage.removeItem(outboxKey); window.localStorage.removeItem(draftKey);
+            assert.equal(drop(form().elements.description, [png('drop.png')]).defaultPrevented, true);
+            await until(() => rows().length === 3 && ready());
+            assert.deepEqual(payload().screenshots.slice(0, 2).map(image => image.dataBase64), first);
+            Object.defineProperty(form().elements.screenshotFile, 'files', { configurable: true, value: [png('file.png')] });
+            form().elements.screenshotFile.dispatchEvent(new window.Event('change'));
+            await until(() => rows().length === 4 && ready());
+            rows()[1].querySelector('[data-action="remove-screenshot"]').click();
+            assert.equal(rows().length, 3); assert.equal(payload().screenshots[0].dataBase64, first[0]);
+            assert.equal(calls.length, before, 'all local preview actions upload nothing');
+            close(); assert.equal(drop(document.body, [png('after.png')]).defaultPrevented, false, 'drop listeners cleaned up');
+        });
+    });
+    await check('explicit Edit preserves order; duplicate/count/byte limits and screenshot opt-out hold', async () => {
+        await multi(async () => {
+            open(); await attach([png('a.png'), png('b.png')]);
+            const before = payload().screenshots.map(image => image.dataBase64);
+            const realImage = window.Image, realContext = window.HTMLCanvasElement.prototype.getContext;
+            window.Image = class { naturalWidth = 1; naturalHeight = 1; async decode () {} };
+            window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage () {} });
+            try { rows()[1].querySelector('[data-capture="edit"]').click(); await until(() => ready() && payload().screenshots[1].dataBase64 !== before[1]); }
+            finally { window.Image = realImage; window.HTMLCanvasElement.prototype.getContext = realContext; }
+            assert.equal(payload().screenshots[0].dataBase64, before[0]); assert.ok(editorOptions.length);
+            encodeResult = () => new window.Blob([Buffer.from(before[0], 'base64')], { type: 'image/png' });
+            await attach([png('duplicate.png')]); assert.equal(rows().length, 2); assert.match(current().querySelector('[data-role="capture-note"]').textContent, /already attached/);
+            encodeResult = () => distinctResult().blob; await attach([png('c.png'), png('d.png'), png('e.png'), png('f.png')]);
+            assert.equal(rows().length, 5); assert.equal(form().elements.screenshotFile.disabled, true);
+            change('screenshot', false); assert.equal(rows().length, 0); assert.equal(payload().screenshot, null);
+            change('screenshot', true);
+            const big = Math.floor(1.2 * 1024 * 1024); encodeResult = () => new window.Blob([Buffer.alloc(big)], { type: 'image/png' });
+            await attach([png('big.png')]); assert.equal(rows().length, 1);
+            await attach([png('too-big.png')]); assert.equal(rows().length, 1); assert.match(status(), /too large/);
+            change('screenshot', false); respond = stagedReply; send(); await until(() => status().includes(reportId));
+            assert.equal(JSON.parse(calls.at(-1).body).screenshot, null);
         });
     });
 
-    await check('an embedded app in the window snapshot: the image is attached (overlays survive) with one note offering a real capture', async () => {
-        defaultCapture = true; snapshotCoverage = 0.8;
-        try {
-            open();
-            await until(() => ! current().querySelector('.ezil-feedback-image').hidden);
-            assert.match(current().querySelector('[data-role="capture-note"]').textContent, /^To include the open app, use "Capture what I see"/);
-            assert.match(current().querySelector('[data-role="capture-scope-text"]').textContent, /Embedded app not captured/, 'the limitation is stated once, beside the image');
-            assert.ok(payload().screenshot, 'the snapshot is still attached');
-            close();
-            snapshotCoverage = 0.05;
-            open();
-            await until(() => ! current().querySelector('.ezil-feedback-image').hidden);
-            assert.equal(current().querySelector('[data-role="capture-note"]').textContent, '', 'no note when the app covers little');
-            close();
-        } finally { defaultCapture = false; snapshotCoverage = 0; }
+    await check('staged Send uploads preview pixels before ordered refs; failed PUT retains raw images and retry ticket', async () => {
+        await multi(async () => {
+            ui.feedbackStagedUploads = true; open(); await attach([png('a.png'), png('b.png')]);
+            showPreview(); const expected = current().querySelector('pre').textContent;
+            assert.equal(JSON.parse(expected).screenshotRefs.length, 2); assert.doesNotMatch(expected, /dataBase64/);
+            const images = rows().map(row => row.querySelector('img').src.split(',')[1]);
+            let fail = true;
+            respond = async (url, options) => options.method === 'PUT' && fail ? { status: 503 } : stagedReply(url, options);
+            const start = calls.length; send(); await until(() => ready() && calls.length > start);
+            const queued = stored(outboxKey)[0]; const ticket = JSON.parse(queued.body).clientRequestId;
+            assert.equal(queued.stagedUploads, true); assert.deepEqual(JSON.parse(queued.body).screenshots.map(image => image.dataBase64), images);
+            assert.equal(calls.slice(start).some(call => call.method === 'POST'), false);
+            fail = false; send(); await until(() => status().includes(reportId));
+            const sent = calls.slice(start); assert.deepEqual(sent.map(call => call.method), ['PUT', 'PUT', 'PUT', 'POST']);
+            for (const call of sent.filter(call => call.method === 'PUT')) {
+                assert.equal(new URL(call.url, window.location.href).searchParams.get('crid'), ticket);
+                assert.equal(call.headers['X-EZiL-Feedback-Account'], accountId);
+            }
+            assert.deepEqual(sent.slice(1, 3).map(call => Buffer.from(call.body).toString('base64')), images);
+            assert.equal(sent.at(-1).body, expected); assert.equal(stored(outboxKey), null);
+        });
+    });
+    await check('unknown finalize retains local image; reopened replay sends identical refs and original ticket', async () => {
+        await multi(async () => {
+            ui.feedbackStagedUploads = true; open(); await attach([png('a.png')]);
+            let fail = true;
+            respond = async (url, options) => { if (options.method === 'POST' && fail) throw new TypeError('lost response'); return stagedReply(url, options); };
+            send(); await until(() => ready() && stored(outboxKey)?.length === 1);
+            const queued = stored(outboxKey)[0], final = calls.at(-1).body;
+            close(); open(); await until(ready); showPreview();
+            assert.equal(rows().length, 1); assert.equal(current().querySelector('pre').textContent, final);
+            fail = false; send(); await until(() => status().includes(reportId));
+            assert.equal(calls.at(-1).body, final); assert.equal(stored(outboxKey), null);
+            assert.ok(JSON.parse(queued.body).screenshot.dataBase64);
+        });
+    });
+    await check('account_changed stops before finalizing and preserves immutable original-account outbox', async () => {
+        await multi(async () => {
+            ui.feedbackStagedUploads = true; open(); await attach([png('a.png'), png('b.png')]);
+            const start = calls.length;
+            respond = async () => ({ status: 409, json: async () => ({ error: 'account_changed' }) });
+            send(); await until(() => /original account/.test(status()));
+            assert.equal(calls.length, start + 1); assert.equal(calls.at(-1).method, 'PUT');
+            assert.equal(stored(outboxKey).length, 1); assert.equal(stored(outboxKey)[0].stagedUploads, true);
+            assert.equal(current().querySelector('[type="submit"]').disabled, true);
+        });
+    });
+    await check('in-page account switch between PUTs blocks requests and never moves the draft to another account', async () => {
+        await multi(async () => {
+            ui.feedbackStagedUploads = true; open(); await attach([png('a.png'), png('b.png')]);
+            const originalUser = window.__EZIL_BOOT__.user, other = '77777777-7777-4777-8777-777777777777';
+            const start = calls.length;
+            respond = async (url, options) => {
+                Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: { id: other } });
+                return stagedReply(url, options);
+            };
+            try {
+                send(); await until(() => /original account/.test(status())); assert.equal(calls.length, start + 1);
+                assert.equal(window.localStorage.getItem(`ezil:feedback:outbox:v1:${other}`), null); assert.equal(stored(outboxKey).length, 1);
+            } finally { Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: originalUser }); }
+        });
     });
 
-    await check('screenshot and tab support flags hide unavailable controls; disabled feedback stays dark', async () => {
-        supported = false;
-        open(); assert.equal(current().querySelector('[data-capture="tab"]'), null); close();
-        desktopSupported = false;
-        open(); change('screenshot', true);
-        assert.equal(current().querySelector('[data-capture="desktop"]'), null, 'no registered desktop frame: no dead "Capture the desktop"');
-        assert.notEqual(current().querySelector('[data-capture="shell"]'), null);
-        close();
-        window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = false;
-        open(); assert.equal(form().elements.screenshot, undefined); close();
-        delete window.__EZIL_BOOT__.desktopState.endpoints.feedback;
-        const count = calls.length;
-        feedback.open_feedback_dialog({ source: 'troubleshoot' });
-        assert.equal(current(), null);
-        assert.equal(feedback.feedback_enabled(), false);
-        assert.deepEqual(await feedback.list_my_reports(), []);
-        assert.equal(await feedback.delete_my_report(reportId), false);
-        assert.equal(calls.length, count);
-        window.__EZIL_BOOT__.desktopState.endpoints.feedback = '/api/shell/feedback';
+    await check('diagnostics stay frozen and a strict older server gets the compatibility downgrade', async () => {
+        window.localStorage.removeItem(outboxKey); window.localStorage.removeItem(draftKey);
+        ui.feedbackReportBundle = true; open(); setDescription('Compatibility report');
+        const initial = payload().diagnostics; assert.ok(initial.session);
+        telemetry.capture({ eventClass: 'api_failure', site: 'later', code: 'later' }); setDescription('Compatibility report updated');
+        assert.deepEqual(payload().diagnostics, initial);
+        let attempts = 0;
+        respond = async () => ++attempts === 1 ? { status: 400 } : { status: 201, json: async () => ({ id: reportId }) };
+        send(); await until(() => status().includes(reportId));
+        assert.equal(attempts, 2); assert.equal(JSON.parse(calls.at(-1).body).diagnostics.session, undefined);
+        close(); delete ui.feedbackReportBundle;
     });
+    await check('screenshot opt-out and modal close abort pending image imports and discard late results', async () => {
+        await multi(async () => {
+            let finish; nextCanvas = () => new Promise(resolve => { finish = resolve; });
+            open(); paste(current(), [png('pending.png')]); assert.equal(ready(), false);
+            change('screenshot', false); finish(Object.assign(document.createElement('canvas'), { width: 1, height: 1 }));
+            await tick(); assert.equal(rows().length, 0); assert.equal(ready(), true);
+            change('screenshot', true); paste(current(), [png('closing.png')]);
+            const signal = captureOptions.at(-1).signal; close(); assert.equal(signal.aborted, true);
+            finish(Object.assign(document.createElement('canvas'), { width: 1, height: 1 })); await tick(); assert.equal(current(), null);
+        });
+    });
+
+    await check('staged 429 pauses raw images across reopen, never auto-retries, and explicit Send keeps the same ticket', async () => {
+        await multi(async () => {
+            ui.feedbackStagedUploads = true; open(); await attach([png('a.png'), png('b.png')]);
+            const id = payload().clientRequestId;
+            respond = async () => ({ status: 429 }); send(); await until(() => ready() && /several reports/.test(status()));
+            const frozen = stored(outboxKey)[0]; assert.equal(frozen.paused, true); assert.equal(JSON.parse(frozen.body).screenshots.length, 2);
+            const before = calls.length; flushing = true;
+            try { await feedback.flush_feedback_outbox(); window.dispatchEvent(new window.Event('online')); await tick(); }
+            finally { flushing = false; }
+            assert.equal(calls.length, before, 'a definitive refusal never automatically resends');
+            close(); open(); await until(ready); assert.equal(rows().length, 2); assert.equal(payload().clientRequestId, id);
+            respond = stagedReply; send(); await until(() => status().includes(reportId));
+            assert.equal(JSON.parse(calls.at(-1).body).clientRequestId, id); assert.equal(stored(outboxKey), null);
+        });
+    });
+    await check('paused staged refusal edits retain screenshots; opt-out removes raw local bytes and explicit Send forks the ticket', async () => {
+        await multi(async () => {
+            ui.feedbackStagedUploads = true; open(); await attach([png('a.png')]); change('diagnostics', false);
+            const id = payload().clientRequestId;
+            respond = async () => ({ status: 413 }); send(); await until(() => ready() && /too large/.test(status()));
+            close(); open(); await until(ready); assert.equal(rows().length, 1);
+            setDescription('Updated report'); const editedId = payload().clientRequestId; assert.notEqual(editedId, id);
+            assert.equal(stored(outboxKey).length, 1); assert.ok(JSON.parse(stored(outboxKey)[0].body).screenshot.dataBase64);
+            close(); open(); await until(ready); assert.equal(rows().length, 1); assert.equal(form().elements.description.value, 'Updated report');
+            change('screenshot', false); const nextId = payload().clientRequestId; assert.notEqual(nextId, editedId);
+            assert.equal(rows().length, 0); assert.doesNotMatch(stored(outboxKey)[0].body, /dataBase64/); assert.equal(stored(outboxKey)[0].paused, true);
+            const before = calls.length; await feedback.flush_feedback_outbox(); assert.equal(calls.length, before);
+            respond = stagedReply; send(); await until(() => status().includes(reportId));
+            assert.equal(calls.length, before + 1); assert.equal(calls.at(-1).method, 'POST'); assert.equal(stored(outboxKey), null);
+        });
+    });
+
+    await check('legacy text and inline POSTs keep expected account header when cross-tab cookies changed; rejection preserves original draft', async () => {
+        for (const withImage of [false, true]) await multi(async () => {
+            delete ui.feedbackStagedUploads; open(); setDescription('Original account report');
+            if (withImage) await attach([png('legacy.png')]);
+            const frozen = current().querySelector('pre'); showPreview(); const expected = frozen.textContent;
+            const before = calls.length;
+            // Boot identity stays unchanged when another tab switches authentication cookies.
+            respond = async (url, options) => {
+                assert.equal(options.method, 'POST'); assert.equal(options.headers['X-EZiL-Feedback-Account'], accountId);
+                return { status: 409, json: async () => ({ error: 'account_changed' }) };
+            };
+            send(); await until(() => /original account/.test(status()));
+            assert.equal(calls.length, before + 1); assert.equal(calls.at(-1).body, expected);
+            assert.equal(stored(outboxKey)[0].body, expected); assert.equal(form().elements.description.value, 'Original account report');
+            if (withImage) assert.ok(JSON.parse(stored(outboxKey)[0].body).screenshot.dataBase64);
+        });
+    });
+
+    await check('paused image report survives capability-off reopen byte for byte until explicit removal', async () => {
+        await multi(async () => {
+            ui.feedbackStagedUploads = true; open(); await attach([png('a.png'), png('b.png')]);
+            respond = async () => ({ status: 429 }); send(); await until(() => ready() && /several reports/.test(status()));
+            const original = stored(outboxKey)[0], id = payload().clientRequestId; close();
+            ui.feedbackScreenshots = false; const before = calls.length;
+            try {
+                open(); await until(() => rows().length === 2);
+                assert.equal(current().querySelector('input[type=file]'), null);
+                assert.equal(ready(), false); assert.equal(payload().clientRequestId, id);
+                assert.equal(stored(outboxKey)[0].body, original.body);
+                paste(current(), [png('blocked.png')]); await tick(); send(); await tick();
+                assert.equal(calls.length, before); assert.equal(rows().length, 2); assert.equal(stored(outboxKey)[0].body, original.body);
+                rows()[0].querySelector('[data-action="remove-screenshot"]').click();
+                rows()[0].querySelector('[data-action="remove-screenshot"]').click();
+                await until(ready); assert.notEqual(payload().clientRequestId, id);
+                assert.doesNotMatch(stored(outboxKey)[0].body, /dataBase64/);
+                respond = stagedReply; send(); await until(() => status().includes(reportId));
+                assert.equal(calls.length, before + 1); assert.equal(calls.at(-1).method, 'POST');
+            } finally { ui.feedbackScreenshots = true; }
+        });
+    });
+
     await check('report GET and DELETE use the endpoint and same-origin credentials', async () => {
         const reports = [{ id: reportId, category: 'bug', createdAt: '2026-10-15', descriptionPreview: 'Desktop froze', hasScreenshot: false, status: 'new' }];
         respond = async () => ({ status: 200, ok: true, json: async () => ({ reports }) });
@@ -1654,7 +1336,7 @@ try {
         // Existing Troubleshoot deliberately reads the diagnostic-log ring;
         // the feedback isolation checks above have already kept that forbidden.
         log.ringBuffer = readRing;
-        Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: { email: 'BOOT_SECRET@example.test' } });
+        Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: { id: accountId, email: 'BOOT_SECRET@example.test' } });
         window.eval(readFileSync(new URL('../../../src/lib/jquery-3.6.1/jquery-3.6.1.min.js', import.meta.url), 'utf8'));
         globalThis.$ = globalThis.jQuery = window.jQuery;
         globalThis.html_encode = value => { const el = document.createElement('span'); el.textContent = String(value); return el.innerHTML; };
