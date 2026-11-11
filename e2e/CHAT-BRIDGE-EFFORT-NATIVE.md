@@ -20,8 +20,7 @@ Example command (placeholders must be replaced from reviewed artifact manifest):
 
 ```sh
 EZIL_EFFORT_ISOLATED=yes \
-EZIL_CODE_SERVER_BIN=/scratch/code-server/bin/code-server \
-EZIL_PREPARED_VSCODE_ROOT=/scratch/code-server/lib/vscode \
+EZIL_CODE_SERVER_ROOT=/scratch/code-server \
 EZIL_EXPECTED_WORKBENCH_SHA256=<reviewed-patched-workbench-sha256> \
 EZIL_EFFORT_VSIX=/scratch/reviewed/ezil-models.vsix \
 EZIL_EXPECTED_VSIX_SHA256=<reviewed-vsix-sha256> \
@@ -38,3 +37,25 @@ Acceptance: results.json must have no false result; fixture-state.json must show
 Pending native tool approval is explicitly NOT_EXERCISED: this Responses fixture returns text, not a tool requiring approval. A separate real tool-approval fixture is needed to claim that scenario. Existing fake-adapter pending-approval tests are not native proof. Production Gateway, actual OS DB, live staging, account entitlement and ChatGPT acceptance are outside this harness.
 
 Source validation performed: node --check for driver/stand-in/Responses module, bash -n runner, six node:test fixture checks PASS, git diff --check. No Code/browser/server/container launch, install, build, real credentials, database or paid request performed.
+
+## Bare-local refinement
+
+No desktop image or Neko is required. EZIL_CODE_SERVER_ROOT is the extracted distribution root containing bin/code-server and lib/vscode; for a deb extracted with dpkg-deb -x it is typically <extraction>/usr/lib/code-server. The executable and checked patched workbench/Copilot files derive from the SAME root. Use the official verified deb already available; no download/install is performed by runner.
+
+Instead of EZIL_EFFORT_VSIX/EXPECTED_VSIX_SHA256, accept a prepared extracted extension directory:
+
+```
+EZIL_EFFORT_EXTENSION_DIR=/scratch/verified-extension
+EZIL_EXPECTED_EXTENSION_SHA256=<reviewed-dist-extension-js-hash>
+EZIL_EXPECTED_PACKAGE_SHA256=<reviewed-package-json-hash>
+```
+
+Directory must contain package.json and dist/extension.js; both hashes are checked before copying into the private profile. Set those variables alongside the other variables in the example. Directory mode takes precedence if both are specified. The source VSIX manifest should bind these hashes to the reviewed combined source SHA.
+
+Startup config is now explicit in e2e/copilot-ezil-effort-settings.json, derived from worker/scripts/editor-state.sh:53–79: anonymous BYOK chat, mainAgent utilities, visible secondary chat sidebar, disabled cloud/background agents/local indexing, no automatic tasks or telemetry. The synthetic fixture deliberately does not use the production Gemini utility-model names. User/chatLanguageModels.json is seeded with [{"name":"EZiL","vendor":"ezil"}], matching seed_codeserver_chat_models; without this BYOK group a fresh bare Code profile may not list EZiL models. Profiles persist on the server for the whole run and remain on disk after browser restarts. No production settings are read or changed.
+
+Driver e2e/chat-bridge-effort.mjs has no docker exec calls: all fixture controls use fetch to EZIL_EFFORT_FIXTURE_URL (http://127.0.0.1:<port>). It can also drive an existing container wrapper if the operator separately runs this protocol3 stand-in and forwards both Code and fixture control ports to host loopback. Supply EZIL_CODE_URL, EZIL_EFFORT_FIXTURE_URL, EZIL_EFFORT_WORKSPACE (runtime workspace path, e.g. /home/neko/project only for that container), PLAYWRIGHT_REQUIRE_DIR and EZIL_E2E_OUT, then node e2e/chat-bridge-effort.mjs. The driver itself does not assume Neko/container paths. Original protocol2 wrapper remains byte-identical.
+
+Offline conditions still required: patched Code/Copilot cloud suppression, local synthetic gateway only, browser request allowlist and operator no-egress environment. No real API keys are needed; runner generates only disposable local bearer strings. Requests to unregistered models/efforts or without registered synthetic markers are refused, never routed to a cloud service.
+
+Refinement checks: bash -n runner; JSON settings parse; node --check driver; original P2 scripts unchanged. Native execution remains NOT RUN.
