@@ -11,7 +11,7 @@ import path from 'node:path';
 
 import type postgres from 'postgres';
 
-export const HARDENING_MIGRATIONS = ['0022_delegation_replay', '0023_agent_sessions', '0024_control_operations', '0025_editor_controls'] as const;
+export const HARDENING_MIGRATIONS = ['0022_delegation_replay', '0023_agent_sessions', '0024_control_operations', '0025_editor_controls', '0026_session_effort'] as const;
 
 export function migrationStatements(name: string): string[] {
     const sql = readFileSync(path.resolve(__dirname, '../../../drizzle/hardening', `${name}.sql`), 'utf8');
@@ -36,7 +36,10 @@ export async function ensureTestSchema(client: ReturnType<typeof postgres>): Pro
             '0024_control_operations': 'public.ezil_control_operations' };
         for (const name of HARDENING_MIGRATIONS) {
             // 0025 only adds columns, so its marker is one of them.
-            const [row] = name === '0025_editor_controls'
+            const [row] = name === '0026_session_effort'
+                ? await tx`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public'
+                    AND table_name = 'ezil_agent_sessions' AND column_name = 'effort') AS present`
+                : name === '0025_editor_controls'
                 ? await tx`SELECT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = 'public'
                     AND table_name = 'ezil_control_operations' AND column_name = 'attempt_id') AS present`
                 : await tx`SELECT to_regclass(${marker[name]}) IS NOT NULL AS present`;

@@ -99,6 +99,13 @@
       "when": 1794045600003,
       "tag": "hardening/0025_editor_controls",
       "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1794393600000,
+      "tag": "hardening/0026_session_effort",
+      "breakpoints": true
     }
   ]
 }
