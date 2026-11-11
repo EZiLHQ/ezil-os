@@ -667,3 +667,36 @@ identity and provider contribution, and requires `defaultChatAgent`, the MIT
 license and original Microsoft headers. Compare LICENSE.txt with the original
 extraction when reviewing an update. The JSON and CSS modifications are
 recorded here; the three JS files carry inline modification notices.
+
+## Explicit primary request effort (Code 4.141.0 / Copilot 0.69.0)
+
+`ezil-effort-context`, `ezil-effort-argument`, and `ezil-request-effort` repair
+Copilot's extension-contributed endpoint dropping the native chat's explicit
+reasoning effort before `languageModel.sendRequest`. Code's API expects
+`configuration`; the extension host maps this to provider `modelConfiguration`.
+
+Three exact-count anchors apply only in this pinned bundle. The primary fetch
+call sets a private **top-level, per-call** `ezilPrimaryRequestEffort` boolean
+(after spreading request arguments, so a previous value cannot survive). It is
+true only for panel location 1, an explicit string effort from this request,
+no subagent/parent request, no system-initiated request, and no keepalive probe.
+The external endpoint requires literal true, vendor `ezil`, and a string effort
+before allocating `configuration:{reasoningEffort:...}`. Missing or unproven
+contexts omit configuration. There is no endpoint/session/global cache or
+model-name/debug-name inference. Other vendors and absent effort remain unchanged.
+
+Background summarization copies the parent's effort into `_lastModelCapabilities`;
+it does NOT pass this separate top-level provenance field. Title and child
+requests do not qualify. This release supports explicit primary panel effort,
+not a new child/utility effort capability. Fresh provider/catalog validation is
+still authoritative for invalid or revoked effort strings. No default is added.
+
+`request-effort-patch.test.cjs` copies only the required pristine bundle files,
+applies the complete patch and verifies it, evaluates the real before/after
+endpoint options expression and primary provenance expression, tests independent
+low/high objects and excluded contexts, and checks the actual summary/title
+callsites and pinned Code API mapping. It also refuses verification of a bundle
+with the forwarding hunk removed. Run with `COPILOT_TEST_ROOT` set to a pristine
+4.141.0 `lib/vscode` directory; an unset directory is an explicit skip.
+Root must rerun the strict real native harness after patching a fresh official
+Code tree. These source tests do not constitute native acceptance.

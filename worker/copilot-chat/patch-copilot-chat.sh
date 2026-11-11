@@ -88,6 +88,13 @@ R_APP_FAILURE='qe.registerCommand("noop",()=>{});function ezilDispatchAppFailure
 # SetupAgent readiness timeout: NLS 10557/10558, once in 4.141.0. No elapsed duration is in scope.
 A_APP_START_TIMEOUT='if(M==="timedout"){let N;this.chatEntitlementService.anonymous?N=d(10558,null,RF.chatExtensionId):N=d(10557,null,RF.provider.default.name,RF.chatExtensionId);'
 R_APP_START_TIMEOUT='if(M==="timedout"){try{ezilDispatchAppFailure({eventId:crypto.randomUUID(),source:"code_app",operation:"app_start",category:"app_startup",code:"app_start_timeout",stage:"startup",outcome:"failed"})}catch{}let N;this.chatEntitlementService.anonymous?N=d(10558,null,RF.chatExtensionId):N=d(10557,null,RF.provider.default.name,RF.chatExtensionId);'
+# Per-request EZiL effort: external endpoint must pass Code API configuration, not modelOptions.
+A_EZIL_EFFORT_CONTEXT='this.options.invocation.endpoint.makeChatRequest2({...n,modeChanged:p,modelCapabilities:'
+R_EZIL_EFFORT_CONTEXT='this.options.invocation.endpoint.makeChatRequest2({...n,ezilPrimaryRequestEffort:s===1&&typeof u==="string"&&!d&&!this.options.request.isSystemInitiated&&!this.options.request.parentRequestId&&!n.isKeepAliveProbe,modeChanged:p,modelCapabilities:'
+A_EZIL_EFFORT_ARGUMENT='async makeChatRequest2({debugName:e,messages:n,ignoreStatefulMarker:r,summarizedAtRoundId:o,requestOptions:a,finishedCb:s,location:c,source:l,telemetryProperties:u,modelCapabilities:d,conversationId:p},m)'
+R_EZIL_EFFORT_ARGUMENT='async makeChatRequest2({debugName:e,messages:n,ignoreStatefulMarker:r,summarizedAtRoundId:o,requestOptions:a,finishedCb:s,location:c,source:l,telemetryProperties:u,modelCapabilities:d,conversationId:p,ezilPrimaryRequestEffort:ezilPrimaryRequestEffort},m)'
+A_EZIL_EFFORT='y={includeEncryptedThinking:!0,tools:(a?.tools??[]).map(_=>({name:_.function.name,description:_.function.description,inputSchema:_.function.parameters})),modelOptions:{_capturingTokenCorrelationId:g,'
+R_EZIL_EFFORT='y={includeEncryptedThinking:!0,...ezilPrimaryRequestEffort===!0&&this.languageModel.vendor==="ezil"&&typeof d?.reasoningEffort==="string"?{configuration:{reasoningEffort:d.reasoningEffort}}:{},tools:(a?.tools??[]).map(_=>({name:_.function.name,description:_.function.description,inputSchema:_.function.parameters})),modelOptions:{_capturingTokenCorrelationId:g,'
 # Part 1 — no GitHub calls (extension.js)
 # Plan locks and billing asks (PATCHES.md "Plan-locked models and billing asks"). The ezil-models extension lists a
 # model the account's OS plan does not include (Free: Gemini 3.8 Flash only) as isUserSelectable:false with a lock
@@ -364,6 +371,9 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch picker-locked-select "$WB" 1 "$A_PICKER_LOCKED_SELECT" "$R_PICKER_LOCKED_SELECT"
   patch picker-locked-configure "$WB" 1 "$A_PICKER_LOCKED_CONFIGURE" "$R_PICKER_LOCKED_CONFIGURE"
   patch ai-entry "$WB" 1 "$A_AI_ENTRY" "$R_AI_ENTRY"
+  patch ezil-effort-context "$EXT" 1 "$A_EZIL_EFFORT_CONTEXT" "$R_EZIL_EFFORT_CONTEXT"
+  patch ezil-effort-argument "$EXT" 1 "$A_EZIL_EFFORT_ARGUMENT" "$R_EZIL_EFFORT_ARGUMENT"
+  patch ezil-request-effort "$EXT" 1 "$A_EZIL_EFFORT" "$R_EZIL_EFFORT"
   patch token          "$EXT" 1  "$A_TOKEN"  "$R_TOKEN"
   patch known-models   "$EXT" 1  "$A_KNOWN"  "$R_KNOWN"
   patch embeddings-cache  "$EXT" 1 "$A_EMB_CACHE"  "$R_EMB_CACHE"
@@ -445,6 +455,9 @@ gate picker-locked-select "$WB" 0 "$A_PICKER_LOCKED_SELECT"; gate picker-locked-
 gate picker-locked-configure "$WB" 0 "$A_PICKER_LOCKED_CONFIGURE"; gate picker-locked-configure "$WB" 1 "$R_PICKER_LOCKED_CONFIGURE"
 gate ai-dashboard "$WB" 0 "$A_AI_DASHBOARD"; gate ai-dashboard "$WB" 1 "$R_AI_DASHBOARD"
 gate ai-entry "$WB" 0 "$A_AI_ENTRY"; gate ai-entry "$WB" 1 "$R_AI_ENTRY"
+gate ezil-effort-context "$EXT" 0 "$A_EZIL_EFFORT_CONTEXT"; gate ezil-effort-context "$EXT" 1 "$R_EZIL_EFFORT_CONTEXT"
+gate ezil-effort-argument "$EXT" 0 "$A_EZIL_EFFORT_ARGUMENT"; gate ezil-effort-argument "$EXT" 1 "$R_EZIL_EFFORT_ARGUMENT"
+gate ezil-request-effort "$EXT" 0 "$A_EZIL_EFFORT"; gate ezil-request-effort "$EXT" 1 "$R_EZIL_EFFORT"
 gate token            "$EXT" 0  "$A_TOKEN";        gate token            "$EXT" 1  "$R_TOKEN"
 gate known-models     "$EXT" 0  "$A_KNOWN";        gate known-models     "$EXT" 1  "$R_KNOWN"
 gate identity         "$EXT" 0  "$A_IDENT";        gate identity         "$EXT" 13 "$R_IDENT"
