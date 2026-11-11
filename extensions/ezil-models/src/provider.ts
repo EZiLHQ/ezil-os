@@ -4,7 +4,7 @@
 import * as vscode from 'vscode';
 import type { CompactionInfo } from './compact';
 import { appFailure, type AppFailure } from './failure';
-import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, includedModelNames, knownGatewayModels, knownGatewayPlan, modelIncluded, parseCatalogModelId, withCatalogDefault, withDefaultModel, withGatewayModelLimits, withPlanLocks, type GatewayModels } from './gateway';
+import { CATALOG_REFUSALS, CREDIT_STATE_TEXT, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModelListed, gatewayModels, includedModelNames, knownGatewayModels, knownGatewayPlan, modelIncluded, parseCatalogModelId, withCatalogDefault, withDefaultModel, withGatewayModelLimits, withPlanLocks, type GatewayModels } from './gateway';
 import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
 import { redact, type ResolvedModel, type ResolvedProvider } from './config';
@@ -244,7 +244,7 @@ function osBillingLink(query: string): vscode.Uri | undefined {
 
 /** A catalog as listed, for noticing that a later read changed it (ids, availability, caps, capabilities and the plan's limit). */
 function catalogSignature(catalog: GatewayModels | undefined): string {
-    return catalog ? JSON.stringify([catalog.default_model ?? null, catalog.included ?? null, catalog.data.map(entry => [entry.id, entry.enabled, entry.protocols, entry.availability?.state,
+    return catalog ? JSON.stringify([catalog.killswitch, catalog.pause, catalog.default_model ?? null, catalog.included ?? null, catalog.data.map(entry => [entry.id, entry.enabled, entry.protocols, entry.availability, entry.globalPauseOnly,
         entry.name, entry.max_input_tokens, entry.max_output_tokens, entry.capabilities])]) : 'unread';
 }
 
@@ -257,6 +257,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     private listedCatalogs = new Map<ResolvedProvider, string>();
     /** The Gateway providers whose catalog could not be read for the last listing (`recoverCatalog`). */
     private unreadListings = new Set<ResolvedProvider>();
+    /** Valid paused catalogs must be re-read by the existing bounded recovery timer too. */
+    private pausedListings = new Set<ResolvedProvider>();
     /** Keep only identity metadata for stale picker selections, including when the config cannot be read. */
     private modelIdentities = new Map<string, { type: ResolvedProvider['type']; model: string }>();
     /**
@@ -351,18 +353,26 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     }
 
     /**
-     * After a listing whose catalog could not be read (the picker then shows only the configured models, and a limited
-     * plan no locks unless known), read it once more and re-list if it now reads. Nothing is requested otherwise; reads
-     * are shared with every other caller (`gatewayModels`). Called periodically by the extension.
+     * Re-read catalogs that could not be read or were globally paused, and re-list when availability changes.
+     * A valid paused catalog needs a fresh read before its normal TTL to recover without a restart. Healthy catalogs
+     * are not polled; reads are shared with every other caller (`gatewayModels`). Called periodically by the extension.
      */
     async recoverCatalog(): Promise<void> {
         // Only connections still configured: a changed URL or credential is never polled with the old one.
         const current = new Set(this.gatewayProviders().map(provider => JSON.stringify([provider.baseUrl, provider.apiKey ?? ''])));
-        for (const provider of this.unreadListings) if (!current.has(JSON.stringify([provider.baseUrl, provider.apiKey ?? '']))) this.unreadListings.delete(provider);
-        const unread = [...this.unreadListings];
-        if (!unread.length) return;
-        const read = await Promise.all(unread.map(provider => gatewayModels(provider, this.host.fetch ?? fetch)));
-        unread.forEach((provider, i) => { if (read[i]) this.unreadListings.delete(provider); });
+        for (const pending of [this.unreadListings, this.pausedListings]) {
+            for (const provider of pending) if (!current.has(JSON.stringify([provider.baseUrl, provider.apiKey ?? '']))) pending.delete(provider);
+        }
+        const pending = [...new Set([...this.unreadListings, ...this.pausedListings])];
+        if (!pending.length) return;
+        const read = await Promise.all(pending.map(provider => gatewayModels(provider, this.host.fetch ?? fetch,
+            Date.now(), undefined, this.pausedListings.has(provider))));
+        pending.forEach((provider, i) => {
+            if (read[i]) {
+                this.unreadListings.delete(provider);
+                if (!read[i]!.killswitch) this.pausedListings.delete(provider);
+            }
+        });
         this.refreshIfCatalogChanged();
     }
 
@@ -383,13 +393,14 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             // from this read, or the last one for the same base URL and token while this one fails (sent only once checked).
             // Past that, a limited plan (Free) still lists the models it includes, from the last verified read (knownGatewayPlan).
             const used = new Map(providers.map(provider => [provider, catalog.get(provider) ?? knownGatewayPlan(provider)]));
-            const listed = providers.flatMap(provider => gatewayCatalogModels(provider, used.get(provider), models));
+            const listed = providers.flatMap(provider => gatewayCatalogModels(provider, used.get(provider), models, true));
             // What the catalog-only rows came from: during an outage, the last catalog, so requests do not re-list each time.
             this.listedCatalogs = new Map(providers.map(provider => [provider, catalogSignature(used.get(provider))]));
             this.unreadListings = new Set(providers.filter(provider => !catalog.get(provider)));
+            this.pausedListings = new Set(providers.filter(provider => used.get(provider)?.killswitch === true));
             // The Gateway's suggested default counts only from this read: during an outage the configured default stays.
             // The OS plan's locks (Free: Gemini 3.8 Flash only) follow the same catalog as the rows they lock.
-            const offered = [...models.filter(model => gatewayModelAvailable(model, catalog.get(model.provider))), ...listed]
+            const offered = [...models.filter(model => gatewayModelListed(model, catalog.get(model.provider))), ...listed]
                 .map(model => withGatewayModelLimits(model, catalog.get(model.provider)));
             return this.rememberModels(withDefaultModel(withPlanLocks(withCatalogDefault(offered, catalog), used), used)).map(toInformation);
         } finally { cancel.dispose(); }
@@ -414,7 +425,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             signal?.throwIfAborted();
             // A token count (`known`) never makes a request: Copilot counts every prompt part, often at once.
             catalog = known ? knownGatewayPlan(provider) : await gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), signal);
-            const listed = gatewayCatalogModels(provider, catalog, models).find(candidate => candidate.id === model.id);
+            const listed = gatewayCatalogModels(provider, catalog, models, true).find(candidate => candidate.id === model.id);
             if (listed) return listed;
         }
         const error = this.host.configError();
@@ -500,6 +511,10 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 // Resolve again for each turn: cached limits may have expired or been invalidated by a refusal.
                 const catalog = await gatewayModels(resolved.provider, this.host.fetch ?? fetch, Date.now(), controller.signal);
                 controller.signal.throwIfAborted();
+                if (catalog?.killswitch) {
+                    const state = catalog.pause === 'reconciliation' ? 'paused_reconciliation' : 'paused_operations';
+                    throw new GatewayError(`EZiL AI: ${CREDIT_STATE_TEXT[state]}`, undefined, 'killswitch', undefined, undefined, 'local');
+                }
                 if (!gatewayModelAvailable(resolved, catalog)) {
                     throw new GatewayError('EZiL AI: This model is not available right now.', undefined, 'model_disabled', undefined, undefined, 'local');
                 }
