@@ -246,9 +246,10 @@ test('payment_pending: "Your free month has ended. We\'re collecting your first 
         assert.equal(el.querySelector('[data-action="upgrade"], [data-action="trial"], [data-action="checkout"], [data-action="resume"]'), null, standing);
         // Review U2: the server's cancel (actions.cancel) is offered; its sheet says what it does and does not do.
         assert.equal(clean(el.querySelector('.ezil-billing-v3-footer [data-action="cancel"]')), 'Cancel plan', standing);
-        // Standard waits: the computer is the one the server rates as Free, never Standard's 6-hour sessions.
+        // Standard waits: the computer is the one the server rates as Free, never Standard's computer.
         assert.match(clean(el.querySelector('[data-role="your-computer"]')), standing === 'free'
-            ? /2 vCPU · 6 GB memory · files saved between sessions · Cloudflare Sessions up to 1 hour/ : /2 vCPU · 8 GB memory · 50 GB disk · AWS \(India\) Sessions up to 1 hour on Free/, standing);
+            ? /2 vCPU · 6 GB memory · files saved between sessions · Cloudflare/ : /2 vCPU · 8 GB memory · 50 GB disk · AWS \(India\)/, standing);
+        assert.doesNotMatch(clean(el.querySelector('[data-role="your-computer"]')), /Sessions? up to/i, standing);
     }
     // No cancel from the server: none offered.
     const noCancel = trialSummaryV3('payment_pending'); noCancel.actions.cancel = false;
@@ -483,7 +484,7 @@ test('plan picker and session end: Standard is the free month when offered (chec
     const ended = trialSummaryV3('offer');
     h.handle = h.api.openSessionEndSheet({ container: h.q('#container'), summary: ended, reason: 'session_max', trpc: h.trpc, onClose: () => {}, checkout: params => handed.push(params) });
     const sheet = h.q('[data-sheet="session-end"]');
-    assert.match(clean(sheet), /Standard: sessions up to 6 hours — \$0 today, then \$20\/month from Dec 5, 2026 unless you cancel\./);
+    assert.match(clean(sheet), /Standard: \$0 today, then \$20\/month from Dec 5, 2026 unless you cancel\./);
     assert.equal(clean(sheet.querySelector('[data-action="continue"]')), 'Start your free month');
     h.click('[data-sheet="session-end"] [data-action="continue"]');
     assert.deepEqual([handed.at(-1).sku, handed.at(-1).trial], ['standard_monthly_v3', true]);

@@ -90,7 +90,7 @@ export function standingCopy (standing, data) {
         // Round 6 (R4-02): a held 4 or 8 vCPU computer does not open on Free (the hold never resizes).
         const closed = heldClosedSize(data?.computer);
         return closed ? heldClosedText(closed.vcpu)
-            : 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits; upgrade for sessions up to 6 hours.';
+            : 'Your files are still on your AWS (India) computer. It opens on the Free plan with Free limits.';
     }
     return '';
 }
@@ -545,7 +545,6 @@ function yourComputerV3 (summary) {
     const { computer, plan } = summary;
     const standing = standingOf(summary);
     const free = plan.sku === 'free_v3' || standing === 'free' || standing === 'files_on_aws';
-    const hours = computer.sessionMaxSeconds === null ? null : computer.sessionMaxSeconds / 3600;
     const gb = Number.isFinite(computer.disk?.provisionedGiB) && computer.disk.provisionedGiB > 0 ? computer.disk.provisionedGiB : null;
     // Round 6 (R1-11): one provider string, "AWS (India)", on every tab; the Free limits are the session line below.
     const held = standing === 'files_on_aws';
@@ -557,7 +556,7 @@ function yourComputerV3 (summary) {
     const parts = [size, gb ? `${gb} GB disk` : 'files saved between sessions', where];
     return `<div class="ezil-billing-computer" data-role="your-computer">
         <p><span class="ezil-billing-note">Your computer</span> <strong>${encode(parts.join(' · '))}</strong></p>
-        ${paragraph(closed ? "Can't open on the Free plan at this size" : hours === null ? 'No session time limit' : `Sessions up to ${hours} hour${hours === 1 ? '' : 's'}${held ? ' on Free' : ''}`, 'ezil-billing-note')}
+        ${closed ? paragraph("Can't open on the Free plan at this size", 'ezil-billing-note') : ''}
         ${linkAction('computer-tab', held ? 'Computer details ›' : 'Change configuration ›')}</div>`;
 }
 
@@ -616,11 +615,8 @@ function offerCardV3 (summary, offer) {
     const configs = (offer.machineChoice ?? []).map(code => {
         const size = sizeInfoV3(summary, code);
         if ( ! size ) return '';
-        // Paid compute policy v1: no plan card sells monthly computer hours; each configuration shows its session length.
-        const time = Number.isFinite(offer.sessionMaxSeconds) && offer.sessionMaxSeconds >= 3600
-            ? `sessions up to ${offer.sessionMaxSeconds / 3600} hour${offer.sessionMaxSeconds === 3600 ? '' : 's'}` : '';
         const now = current && code === computer.size ? ' <span class="ezil-billing-now">Now</span>' : '';
-        return `<li data-size="${encode(code)}"><strong>${encode(`${size.vcpu} vCPU · ${size.memoryGiB} GB`)}</strong>${now}${time ? ` <span>${encode(time.charAt(0).toUpperCase() + time.slice(1))}</span>` : ''}</li>`;
+        return `<li data-size="${encode(code)}"><strong>${encode(`${size.vcpu} vCPU · ${size.memoryGiB} GB`)}</strong>${now}</li>`;
     }).join('');
     // The current card never contradicts "Your computer": a disk made smaller than today's plan disk says so.
     const realDisk = Number.isFinite(computer.disk?.provisionedGiB) && computer.disk.provisionedGiB > 0 ? computer.disk.provisionedGiB : null;
@@ -706,7 +702,7 @@ function summaryHtml (summary) {
     return `<header class="ezil-billing-header"><div><h3>Plan &amp; usage</h3><p class="ezil-settings-lead">Your plan, compute and what renews when.</p></div>
         ${actions.portal ? actionHtml('portal', 'Manage billing') : ''}</header>
         ${paymentHtml(summary)}${planHtml(summary)}${pickerHtml(summary)}${computeHtml(summary)}${selectorHtml(summary)}
-        <section class="ezil-billing-card ezil-billing-session"><p data-role="session-note">${encode(`Sessions run up to ${compute.session.maxSeconds / 3600} hours, then your work is saved and the computer restarts. Files and installed tools are kept; running processes start fresh.`)}</p>
+        <section class="ezil-billing-card ezil-billing-session"><p data-role="session-note">${encode('When a session ends, your work is saved and the computer restarts. Files and installed tools are kept; running processes start fresh.')}</p>
             ${compute.session.activeDeadline ? '<p data-role="session-countdown" aria-live="polite"></p>' : ''}</section>
         ${overageHtml(summary)}${estimateHtml(summary)}
         <div class="ezil-billing-meters">
