@@ -3,11 +3,14 @@
 -- 0022-0025 objects. It needs the 0021 Standard trial schema (ezil_billing_trials) and nothing else. Applied only by a separately
 -- reviewed, exact-file staging runner after migrations/sponsor/preflight.sql passes. Additive, service-only, atomic (one transaction).
 BEGIN;
+-- Every owned object is created in "public" with a fully qualified name, and the search_path is pinned for this transaction, so a writable schema earlier in the
+-- session or role search_path can never receive any of these objects (and nothing here resolves a name through it).
+SET LOCAL search_path = pg_catalog;
 
 -- One row per pseudonymous account (account_key = HMAC of the user id, see v3/sponsor.ts). The FIRST accepted campaign wins and is never
 -- overwritten. signed_up_at is set ONLY for an account the server created through the sponsor path; an existing account never gains it.
 -- No FK to auth.users: the key is kept after the account is deleted, so the counts are durable.
-CREATE TABLE "ezil_sponsor_attributions" (
+CREATE TABLE "public"."ezil_sponsor_attributions" (
 	"account_key" uuid PRIMARY KEY NOT NULL,
 	"campaign_id" text NOT NULL,
 	"partner_id" text NOT NULL,
@@ -23,7 +26,7 @@ CREATE TABLE "ezil_sponsor_attributions" (
 -- The sponsor linkage of ONE trial (the existing trial row stays the only trial authority). Frozen at quote time with the campaign and
 -- its config hash; claimed_at and the Stripe subscription are set once, together, when the subscription binds. Counts are DISTINCT
 -- claimed trial ids: an abandoned quote is never a claim and a later cancellation never removes one.
-CREATE TABLE "ezil_sponsor_trial_claims" (
+CREATE TABLE "public"."ezil_sponsor_trial_claims" (
 	"trial_id" uuid PRIMARY KEY NOT NULL,
 	"account_key" uuid NOT NULL,
 	"campaign_id" text NOT NULL,
@@ -42,13 +45,13 @@ CREATE TABLE "ezil_sponsor_trial_claims" (
 );
 --> statement-breakpoint
 -- The linkage must name the same account and campaign as its attribution (composite FK on the attribution's UNIQUE pair).
-ALTER TABLE "ezil_sponsor_trial_claims" ADD CONSTRAINT "ezil_sponsor_trial_claims_attribution_fkey"
-	FOREIGN KEY ("account_key", "campaign_id") REFERENCES "ezil_sponsor_attributions" ("account_key", "campaign_id") ON DELETE RESTRICT ON UPDATE RESTRICT;--> statement-breakpoint
+ALTER TABLE "public"."ezil_sponsor_trial_claims" ADD CONSTRAINT "ezil_sponsor_trial_claims_attribution_fkey"
+	FOREIGN KEY ("account_key", "campaign_id") REFERENCES "public"."ezil_sponsor_attributions" ("account_key", "campaign_id") ON DELETE RESTRICT ON UPDATE RESTRICT;--> statement-breakpoint
 -- An UNSTARTED linkage may go with its reclaimed trial row (0021 only ever deletes a never-started quote). A consumed one never does.
-ALTER TABLE "ezil_sponsor_trial_claims" ADD CONSTRAINT "ezil_sponsor_trial_claims_trial_fkey"
-	FOREIGN KEY ("trial_id") REFERENCES "ezil_billing_trials" ("id") ON DELETE CASCADE ON UPDATE CASCADE;--> statement-breakpoint
-CREATE INDEX "ezil_sponsor_trial_claims_campaign_claimed_idx" ON "ezil_sponsor_trial_claims" ("campaign_id", "claimed_at");--> statement-breakpoint
-CREATE INDEX "ezil_sponsor_attributions_campaign_signup_idx" ON "ezil_sponsor_attributions" ("campaign_id", "signed_up_at") WHERE "signed_up_at" is not null;--> statement-breakpoint
+ALTER TABLE "public"."ezil_sponsor_trial_claims" ADD CONSTRAINT "ezil_sponsor_trial_claims_trial_fkey"
+	FOREIGN KEY ("trial_id") REFERENCES "public"."ezil_billing_trials" ("id") ON DELETE CASCADE ON UPDATE CASCADE;--> statement-breakpoint
+CREATE INDEX "ezil_sponsor_trial_claims_campaign_claimed_idx" ON "public"."ezil_sponsor_trial_claims" ("campaign_id", "claimed_at");--> statement-breakpoint
+CREATE INDEX "ezil_sponsor_attributions_campaign_signup_idx" ON "public"."ezil_sponsor_attributions" ("campaign_id", "signed_up_at") WHERE "signed_up_at" is not null;--> statement-breakpoint
 
 -- Immutability. Attribution: campaign, partner, config hash, accepted_at never change; signed_up_at may be set once (null -> value).
 -- Trial linkage: while unclaimed only quoted_at and the frozen config hash may move (a re-quote of an unbound quote); once claimed nothing changes and nothing is deleted.
@@ -62,7 +65,7 @@ BEGIN
 	END IF;
 	RETURN NEW;
 END $$;--> statement-breakpoint
-CREATE TRIGGER "ezil_sponsor_attribution_guard" BEFORE UPDATE OR DELETE ON "ezil_sponsor_attributions" FOR EACH ROW EXECUTE FUNCTION "public"."ezil_sponsor_attribution_guard"();--> statement-breakpoint
+CREATE TRIGGER "ezil_sponsor_attribution_guard" BEFORE UPDATE OR DELETE ON "public"."ezil_sponsor_attributions" FOR EACH ROW EXECUTE FUNCTION "public"."ezil_sponsor_attribution_guard"();--> statement-breakpoint
 CREATE FUNCTION "public"."ezil_sponsor_trial_claim_guard"() RETURNS trigger LANGUAGE plpgsql SET search_path = '' AS $$
 BEGIN
 	IF TG_OP = 'DELETE' THEN
@@ -76,14 +79,14 @@ BEGIN
 	END IF;
 	RETURN NEW;
 END $$;--> statement-breakpoint
-CREATE TRIGGER "ezil_sponsor_trial_claim_guard" BEFORE UPDATE OR DELETE ON "ezil_sponsor_trial_claims" FOR EACH ROW EXECUTE FUNCTION "public"."ezil_sponsor_trial_claim_guard"();--> statement-breakpoint
+CREATE TRIGGER "ezil_sponsor_trial_claim_guard" BEFORE UPDATE OR DELETE ON "public"."ezil_sponsor_trial_claims" FOR EACH ROW EXECUTE FUNCTION "public"."ezil_sponsor_trial_claim_guard"();--> statement-breakpoint
 
 -- Service-only: RLS on, a service-role policy, and no privilege for anon, authenticated or public.
-ALTER TABLE "ezil_sponsor_attributions" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
-ALTER TABLE "ezil_sponsor_trial_claims" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
-CREATE POLICY "Service role full access sponsor attributions" ON "ezil_sponsor_attributions" FOR ALL USING (auth.role() = 'service_role');--> statement-breakpoint
-CREATE POLICY "Service role full access sponsor trial claims" ON "ezil_sponsor_trial_claims" FOR ALL USING (auth.role() = 'service_role');--> statement-breakpoint
-REVOKE ALL ON "ezil_sponsor_attributions", "ezil_sponsor_trial_claims" FROM public, anon, authenticated;--> statement-breakpoint
+ALTER TABLE "public"."ezil_sponsor_attributions" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
+ALTER TABLE "public"."ezil_sponsor_trial_claims" ENABLE ROW LEVEL SECURITY;--> statement-breakpoint
+CREATE POLICY "Service role full access sponsor attributions" ON "public"."ezil_sponsor_attributions" FOR ALL USING (auth.role() = 'service_role');--> statement-breakpoint
+CREATE POLICY "Service role full access sponsor trial claims" ON "public"."ezil_sponsor_trial_claims" FOR ALL USING (auth.role() = 'service_role');--> statement-breakpoint
+REVOKE ALL ON "public"."ezil_sponsor_attributions", "public"."ezil_sponsor_trial_claims" FROM public, anon, authenticated;--> statement-breakpoint
 REVOKE ALL ON FUNCTION "public"."ezil_sponsor_attribution_guard"(), "public"."ezil_sponsor_trial_claim_guard"() FROM public, anon, authenticated;
 
 COMMIT;
