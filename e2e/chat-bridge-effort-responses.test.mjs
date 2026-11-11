@@ -1,0 +1,11 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {validateResponseRequest} from './chat-bridge-effort-responses.mjs';
+const op={kind:'send',text:'EZIL_NATIVE_A',expectedModel:'native-a',expectedEffort:'low'};
+const body=()=>({model:'native-a',input:[{role:'user',content:[{type:'input_text',text:'EZIL_NATIVE_A'}]}],max_output_tokens:100,stream:false,store:false,reasoning:{effort:'low'}});
+test('accepts only matching registered synthetic model/effort request',()=>{assert.equal(validateResponseRequest(body(),[op]).ok,true);assert.equal(validateResponseRequest(body(),[]).ok,false);});
+test('rejects cross-session effort and unlisted token',()=>{for(const effort of ['high','max',''])assert.equal(validateResponseRequest({...body(),reasoning:{effort}},[op]).ok,false);});
+test('no override requires absent reasoning, never implicit default',()=>{const o={...op,expectedEffort:null};assert.equal(validateResponseRequest(body(),[o]).reason,'implicit_effort');const b=body();delete b.reasoning;assert.equal(validateResponseRequest(b,[o]).ok,true);});
+test('explicit effort cannot silently disappear',()=>{const b=body();delete b.reasoning;assert.equal(validateResponseRequest(b,[op]).ok,false);});
+test('unknown fields/model/storage/streaming are refused',()=>{for(const change of [{extra:true},{model:'unlisted'},{store:true},{stream:true},{reasoning:{effort:'low',extra:true}}])assert.equal(validateResponseRequest({...body(),...change},[op]).ok,false);});
+test('wrong model cannot borrow another session expected effort',()=>{assert.equal(validateResponseRequest({...body(),model:'native-b'},[op]).reason,'wrong_model');});

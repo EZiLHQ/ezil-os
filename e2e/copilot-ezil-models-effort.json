@@ -1,0 +1,48 @@
+{
+  "providers": {
+    "ezil": {
+      "type": "ezil-gateway",
+      "baseUrl": "{env:EZIL_AI_BASE_URL}",
+      "apiKey": "{env:EZIL_AI_PROXY_TOKEN}"
+    }
+  },
+  "models": [
+    {
+      "id": "native-a",
+      "model": "native-a",
+      "provider": "ezil",
+      "name": "Native A",
+      "gatewayProtocol": "openai-responses",
+      "stream": false,
+      "default": true,
+      "roles": [
+        "default",
+        "plan",
+        "utility",
+        "utilitySmall"
+      ],
+      "maxInputTokens": 100000,
+      "maxOutputTokens": 8192,
+      "capabilities": {
+        "toolCalling": true,
+        "imageInput": false
+      }
+    },
+    {
+      "id": "native-b",
+      "model": "native-b",
+      "provider": "ezil",
+      "name": "Native B",
+      "gatewayProtocol": "openai-responses",
+      "stream": false,
+      "default": false,
+      "roles": [],
+      "maxInputTokens": 100000,
+      "maxOutputTokens": 8192,
+      "capabilities": {
+        "toolCalling": true,
+        "imageInput": false
+      }
+    }
+  ]
+}
