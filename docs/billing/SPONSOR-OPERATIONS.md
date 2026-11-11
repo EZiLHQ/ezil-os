@@ -98,3 +98,5 @@ bun --no-env-file scripts/sponsor-operator.ts help
 ```
 
 Operator tests use synthetic fixture IDs, local temporary private bundles, actual signing/token/hash helpers and an injected reporting connection. They cover permissions, append preservation, collisions, config versioning, safe output, target pins, read-only mode, schema/RLS refusal and independent count/query semantics. These checks do not exercise a live database or Stripe.
+
+The gated `sponsor-operator.pg.test.ts` additionally creates a fresh owned `sponsor_operator_*` database only on an explicitly supplied disposable fixture at loopback port 55443. It executes the actual report SQL against synthetic 0021/sponsor tables: independent lifetime and event-window counts, exact partner totals, historical/canceled claims, target refusal and no report mutations. The integrated source passed all four cases. The test drops only its own database; fixture setup never targets the app database or the held real schema rollout.
