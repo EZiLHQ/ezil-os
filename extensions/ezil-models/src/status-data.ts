@@ -1,6 +1,6 @@
 import type { ResolvedProvider } from './config';
 import { creditState, parseGatewayModels, type GatewayAvailability, type GatewayModels } from './gateway';
-import { credits } from './credits-format';
+import { credits, creditsWhole } from './credits-format';
 
 type Result<T> = { value: T; code?: never; reason?: never } | { value?: never; code: string; reason?: string };
 export type CreditWindow = { seconds: number; budget_micro: string; used_micro: string; remaining_micro: string; started_at: string | null; resets_at: string | null };
@@ -210,7 +210,7 @@ function limitsLines(limits: EffectiveLimits): string[] {
     const counters = limits.counters;
     lines.push(`Current requests: ${counters.inflight} in flight, ${counters.pending} pending`,
         `Last minute: ${counters.rpm} requests, ${counters.tpm} reserved tokens`,
-        `Budget usage (held + settled): ${credits(counters.day_micro)} credits this Gateway day, ${credits(counters.month_micro)} this Gateway month`);
+        `Budget usage (held + settled): ${creditsWhole(counters.day_micro)} credits this Gateway day, ${creditsWhole(counters.month_micro)} this Gateway month`);
     for (const [model, policy] of Object.entries(limits.models)) {
         const detail = policyLines(policy);
         if (detail.length) lines.push(`Model limits — ${model} (also subject to account limits)`, ...detail);
@@ -247,8 +247,8 @@ export function statusView(state?: AIStatus): { text: string; lines: string[] } 
     // The headline is the wallet (`available_micro`, the balance EZiL OS Settings shows). The window is a separate
     // spending limit per period, named as one, and never stands in for the balance.
     const windowPart = window ? ` · ${windowLength(window.seconds)} window ${BigInt(window.remaining_micro) === 0n ? 'used'
-        : `${credits(window.remaining_micro)} of ${credits(window.budget_micro)} left`}${reset ? ` · resets ${reset}` : ''}` : '';
-    let text = balance ? `EZiL AI · ${credits(balance.available_micro)} credits${windowPart}` : 'EZiL AI · Credits unavailable';
+        : `${creditsWhole(window.remaining_micro)} of ${creditsWhole(window.budget_micro)} left`}${reset ? ` · resets ${reset}` : ''}` : '';
+    let text = balance ? `EZiL AI · ${creditsWhole(balance.available_micro)} credits${windowPart}` : 'EZiL AI · Credits unavailable';
     const limits = state.limits.value;
     // Reuse the gateway's precedence and reconciliation/operations wording. No selected
     // model is implied by this global status item, so only the global fields are passed.
@@ -268,13 +268,13 @@ export function statusView(state?: AIStatus): { text: string; lines: string[] } 
         if (!state.models.value) text += ' · availability unknown';
         if (!state.usage.value) text += ' · usage unavailable';
     }
-    const lines = ['EZiL AI', balance ? `Available credits: ${credits(balance.available_micro)}` : `Credits unavailable. ${statusProblem(state.balance).detail}`];
-    if (balance) lines.push(`Held credits: ${credits(balance.held_micro)}`);
+    const lines = ['EZiL AI', balance ? `Available credits: ${creditsWhole(balance.available_micro)}` : `Credits unavailable. ${statusProblem(state.balance).detail}`];
+    if (balance) lines.push(`Held credits: ${creditsWhole(balance.held_micro)}`);
     if (balance?.available_micro === 0) lines.push(balance.held_micro > 0 ? 'Your credits are held by requests in progress or being settled.' : 'No AI credits are available.');
     if (window) {
-        lines.push(`${windowLength(window.seconds)} window: ${credits(window.remaining_micro)} credits left of ${credits(window.budget_micro)}`);
+        lines.push(`${windowLength(window.seconds)} window: ${creditsWhole(window.remaining_micro)} credits left of ${creditsWhole(window.budget_micro)}`);
         lines.push('The window limits how many credits you can use per period. It is not your balance.');
-        lines.push(`Window used (held + settled): ${credits(window.used_micro)} credits`);
+        lines.push(`Window used (held + settled): ${creditsWhole(window.used_micro)} credits`);
         lines.push(reset ? `Resets at ${reset} (local time)` : 'Window starts with your next admitted request.');
         if (BigInt(window.remaining_micro) === 0n) lines.push('This window’s AI credits are used up.');
     }

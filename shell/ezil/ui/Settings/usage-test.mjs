@@ -430,15 +430,15 @@ const asOf = iso => new Date(iso).toLocaleTimeString('en-US', { hour: '2-digit',
 check('identity credits: the worked example reads "1,246 credits left of 1,500" with exact details and microcredit titles', () => {
     const el = rendered(sample, premiumAI(worked));
     assert.equal(aiValue(el), '1,246 credits left of 1,500');
-    assert.match(meter(el, 'ai').textContent, /Plan 1,000 · Added 500 · Used 252\.75 · Reserved 0\.5 · Remaining 1,246\.75/);
+    assert.match(meter(el, 'ai').textContent, /Plan 1,000 · Added 500 · Used 252 · Reserved 0 · Remaining 1,246(?!\.)/);   // whole floored credits, never a fraction
     assert.equal(progress(el, 'ai').getAttribute('aria-valuenow'), '83');
     assert.equal(progress(el, 'ai').getAttribute('aria-valuetext'), '1,246 credits left of 1,500.');
     assert.deepEqual([...meter(el, 'ai').querySelectorAll('span[title]')].map(s => s.title),
-        ['1,000 credits', '500 credits', '252.75 credits', '0.5 credits', '1,246.75 credits']);
-    // Floored, never rounded up; the title keeps every microcredit.
+        ['1,000 credits', '500 credits', '252 credits', '0 credits', '1,246 credits']);
+    // Floored, never rounded up; the title is the same whole floored value (no user-visible fraction).
     const odd = rendered(sample, premiumAI({ ...worked, remainingMicro: '1246759999', usedMicro: '252740001', heldMicro: '500000' }));
-    assert.match(meter(odd, 'ai').textContent, /Used 252\.74 · Reserved 0\.5 · Remaining 1,246\.75/);
-    assert.ok([...meter(odd, 'ai').querySelectorAll('span[title]')].some(s => s.title === '1,246.759999 credits'));
+    assert.match(meter(odd, 'ai').textContent, /Used 252 · Reserved 0 · Remaining 1,246(?!\.)/);
+    assert.ok([...meter(odd, 'ai').querySelectorAll('span[title]')].every(s => !/\.\d/.test(s.title)) && [...meter(odd, 'ai').querySelectorAll('span[title]')].some(s => s.title === '1,246 credits'));   // no title carries a fraction
     // Never the catalog 1,000 (or the plan bucket's 746) as the headline.
     assert.doesNotMatch(aiValue(el), /of 1,000|746/);
     assert.deepEqual(scanCopy(meter(el, 'ai').textContent), []);
@@ -447,7 +447,7 @@ check('identity credits: fractional 996.25 left of 1,000; an operator grant abov
     const fractional = rendered(sample, premiumAI({ ...worked, totalMicro: M('1000'), remainingMicro: M('996.25'), heldMicro: '0', usedMicro: M('3.75'),
         grants: [{ kind: 'plan', creditsMicro: M('1000'), remainingMicro: M('996.25'), expiresAt: '2026-11-04T00:00:00Z' }] }));
     assert.equal(aiValue(fractional), '996 credits left of 1,000');
-    assert.match(meter(fractional, 'ai').textContent, /Plan 1,000 · Used 3\.75 · Remaining 996\.25/);
+    assert.match(meter(fractional, 'ai').textContent, /Plan 1,000 · Used 3 · Remaining 996(?!\.)/);
     assert.doesNotMatch(meter(fractional, 'ai').textContent, /Reserved/);
     assert.equal(progress(fractional, 'ai').getAttribute('aria-valuenow'), '99');
     const above = rendered(sample, premiumAI({ ...worked, totalMicro: M('5200'), remainingMicro: M('5120'), heldMicro: '0', usedMicro: M('80'), grants: [
@@ -460,11 +460,11 @@ check('identity credits: fractional 996.25 left of 1,000; an operator grant abov
     assert.equal(meter(empty, 'ai').dataset.state, 'danger');
     assert.match(meter(empty, 'ai').textContent, /No credits left/);
     const unlabelled = rendered(sample, premiumAI({ ...worked, labelled: false }));
-    assert.match(meter(unlabelled, 'ai').textContent, /Used 252\.75 · Reserved 0\.5 · Remaining 1,246\.75/);
+    assert.match(meter(unlabelled, 'ai').textContent, /Used 252 · Reserved 0 · Remaining 1,246(?!\.)/);
     assert.doesNotMatch(meter(unlabelled, 'ai').textContent, /Plan 1,000|Added/);
     const unproven = rendered(sample, premiumAI({ ...worked, usedMicro: null }));
     assert.doesNotMatch(meter(unproven, 'ai').textContent, /Used/);
-    assert.match(meter(unproven, 'ai').textContent, /Reserved 0\.5 · Remaining 1,246\.75/);
+    assert.match(meter(unproven, 'ai').textContent, /Reserved 0 · Remaining 1,246(?!\.)/);
     // Unknown total: the remaining alone, no bar, no denominator from anywhere else.
     const noTotal = rendered(sample, premiumAI({ ...worked, totalMicro: null, labelled: false, grants: [] }));
     assert.equal(aiValue(noTotal), '1,246 credits left');
@@ -874,7 +874,7 @@ try {
         grants: [{ ...freeStarter.grants[0], remainingMicro: M('98.418718') }] });
     await pollAt(2 * 61_000);
     assert.equal(reads('billing.aiAccount'), balances + 2);
-    assert.match(win.text(), /98 credits left of 100[\s\S]*Used 1\.58/);
+    assert.match(win.text(), /98 credits left of 100[\s\S]*Used 1(?!\.)/);
     assert.equal(summaries(), before, 'the balance read is not a summary read (no Stripe preview, no enqueue)');
     // An unreadable balance between summaries keeps the last one as "Couldn't refresh · as of", with a re-read, never as current.
     replies['billing.aiAccount'] = Promise.resolve({ ok: false });

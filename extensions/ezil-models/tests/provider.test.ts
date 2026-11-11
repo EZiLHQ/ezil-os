@@ -297,7 +297,7 @@ describe('EZiL gateway VS Code bridge', () => {
                 [message(1, [new TextPart('q')])] as never, { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never) };
         }
         for (const [code, extra, text] of [
-            ['insufficient_credits', {}, 'This request needs up to 80.00 credits, and you have 63.09.'],
+            ['insufficient_credits', {}, 'This request needs up to 80.00 credits, and you have 63.'],
             ['insufficient_credits', { no_live_grant: true }, 'You have no AI credits left. Add credits to continue.'],
             ['no_live_grant', {}, 'You have no AI credits left. Add credits to continue.'],
         ] as const) test(`${code} ${JSON.stringify(extra)} opens the OS billing card when chosen`, async () => {
@@ -336,7 +336,7 @@ describe('EZiL gateway VS Code bridge', () => {
                 else process.env.EZIL_AI_BASE_URL = value;
                 const h = refusal();
                 await expect(h.send()).rejects.toThrow('This request needs up to 80.00 credits');
-                expect(showCreditWarning).toHaveBeenCalledWith(expect.stringContaining('and you have 63.09.'));
+                expect(showCreditWarning).toHaveBeenCalledWith(expect.stringContaining('and you have 63.'));
                 expect(openExternal).not.toHaveBeenCalled();
             });
         }
