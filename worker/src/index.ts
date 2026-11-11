@@ -645,6 +645,8 @@ import {
   aiProxyDisabled,
   chooseAiCredential,
   currentModelAccess,
+  currentCreditsRelay,
+  parsePushedCreditsPending,
   deriveAiProxyToken,
   handleAiProxyRequest,
   isAiProxyPath,
@@ -658,11 +660,14 @@ import {
   AI_CREDENTIAL_STORAGE_KEY,
   AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY,
   AI_MODEL_ACCESS_STORAGE_KEY,
+  AI_CREDITS_PENDING_STORAGE_KEY,
   AI_PROXY_NONCE_STORAGE_KEY,
   readLimited,
   type StoredAiCredential,
   type StoredAiModelAccess,
   type AiModelAccess,
+  type CreditsRelay,
+  type StoredAiCreditsPending,
 } from './ai-proxy';
 
 import { captureEditorState } from './editor-state';
@@ -980,10 +985,11 @@ interface EzilWorkspacePersistRpc {
   recordActivity(lastInputAgoMs: number): Promise<void>;
   startAiDesktop(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string>;
   getAiProxyNonce(): Promise<string | null>;
-  putAiCredential(credential: StoredAiCredential, signedAt: number, includedModels?: readonly string[] | null): Promise<{ stored: boolean; expiresAt: number }>;
-  putAiModelAccess(includedModels: readonly string[] | null, signedAt: number): Promise<{ stored: boolean }>;
+  putAiCredential(credential: StoredAiCredential, signedAt: number, includedModels?: readonly string[] | null, creditsPending?: boolean | null): Promise<{ stored: boolean; expiresAt: number }>;
+  putAiModelAccess(includedModels: readonly string[] | null, signedAt: number, creditsPending?: boolean | null): Promise<{ stored: boolean }>;
   getAiCredential(): Promise<string | null>;
   getAiModelAccess(): Promise<AiModelAccess>;
+  getAiCreditsRelay(): Promise<CreditsRelay>;
   dropAiCredential(token?: string, signedAt?: number): Promise<void>;
   /**
    * Observe → flush → cancel the flush loop → destroy → RE-OBSERVE, returning
@@ -3910,10 +3916,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * `parsePushedModelAccess`) is ordered on its own: the later signed push wins, whichever token is kept. It is kept
    * across stop and logout: it restricts, it grants nothing, and the next push with a readable plan replaces it.
    */
-  async putAiCredential(credential: StoredAiCredential, signedAt: number, includedModels?: readonly string[] | null): Promise<{ stored: boolean; expiresAt: number }> {
+  async putAiCredential(credential: StoredAiCredential, signedAt: number, includedModels?: readonly string[] | null, creditsPending?: boolean | null): Promise<{ stored: boolean; expiresAt: number }> {
     return this.ctx.storage.transaction(async (txn) => {
       const current = await txn.get<StoredAiCredential>(AI_CREDENTIAL_STORAGE_KEY);
       const revokedAt = await txn.get<number>(AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY);
+      // Receipt information grants no access and has its own timestamp; leave the original plan/token watermark below intact.
+      await storeAiCreditsPending(txn, creditsPending, signedAt);
       if (revokedAt !== undefined && signedAt <= revokedAt) {
         return { stored: false, expiresAt: current?.expiresAt ?? credential.expiresAt };
       }
@@ -3929,8 +3937,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * `putAiCredential`. It never reads, creates or extends the credential, and ignores the logout watermark because the
    * list restricts and grants nothing. An expired or missing token still answers `os_session_missing`.
    */
-  async putAiModelAccess(includedModels: readonly string[] | null, signedAt: number): Promise<{ stored: boolean }> {
-    return this.ctx.storage.transaction(async (txn) => ({ stored: await storeAiModelAccess(txn, includedModels, signedAt) }));
+  async putAiModelAccess(includedModels: readonly string[] | null, signedAt: number, creditsPending?: boolean | null): Promise<{ stored: boolean }> {
+    return this.ctx.storage.transaction(async (txn) => {
+      const planStored = await storeAiModelAccess(txn, includedModels, signedAt);
+      const creditsStored = await storeAiCreditsPending(txn, creditsPending, signedAt);
+      return { stored: planStored || creditsStored };
+    });
   }
 
   async getAiCredential(): Promise<string | null> {
@@ -3940,6 +3952,10 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   /** The models the owner's plan includes, if a fresh signed push said so; otherwise unknown (`currentModelAccess`). */
   async getAiModelAccess(): Promise<AiModelAccess> {
     return currentModelAccess(await this.ctx.storage.get<StoredAiModelAccess>(AI_MODEL_ACCESS_STORAGE_KEY));
+  }
+
+  async getAiCreditsRelay(): Promise<CreditsRelay> {
+    return currentCreditsRelay(await this.ctx.storage.get<StoredAiCreditsPending>(AI_CREDITS_PENDING_STORAGE_KEY));
   }
 
   /** Signed logout keeps a watermark; teardown/401 retain their unconditional/token-only deletion. */
@@ -7711,6 +7727,7 @@ async function handleAiProxy(request: Request, env: Env, sandboxId: string, awsN
     proxyNonce: awsNonce !== undefined ? awsNonce : sandbox ? await sandbox.getAiProxyNonce() : null,
     credential: () => sandbox ? sandbox.getAiCredential() : Promise.resolve(null),
     modelAccess: () => sandbox ? sandbox.getAiModelAccess() : Promise.resolve({ known: false } as const),
+    creditsRelay: () => sandbox ? sandbox.getAiCreditsRelay() : Promise.resolve('legacy' as const),
     dropCredential: (token) => sandbox ? sandbox.dropAiCredential(token) : Promise.resolve(),
     fetch: (upstream) => fetch(upstream),
     log: (fields) => console.log(JSON.stringify(fields)),
@@ -7724,6 +7741,16 @@ async function storeAiModelAccess(txn: Pick<DurableObjectTransaction, 'get' | 'p
   const access = await txn.get<StoredAiModelAccess>(AI_MODEL_ACCESS_STORAGE_KEY);
   if (access !== undefined && access.signedAt >= signedAt) return false;
   await txn.put(AI_MODEL_ACCESS_STORAGE_KEY, { includedModels, signedAt } satisfies StoredAiModelAccess);
+  return true;
+}
+
+/** Receipt status advances independently: a model-only push neither refreshes it nor blocks its delayed newer answer. */
+async function storeAiCreditsPending(txn: Pick<DurableObjectTransaction, 'get' | 'put'>, pending: boolean | null | undefined,
+  signedAt: number): Promise<boolean> {
+  if (pending === undefined) return false;
+  const current = await txn.get<StoredAiCreditsPending>(AI_CREDITS_PENDING_STORAGE_KEY);
+  if (current !== undefined && current.signedAt >= signedAt) return false;
+  await txn.put(AI_CREDITS_PENDING_STORAGE_KEY, { pending, signedAt } satisfies StoredAiCreditsPending);
   return true;
 }
 
@@ -7758,6 +7785,8 @@ async function handleAiCredential(request: Request, env: Env, sandboxName: strin
   } catch {
     return json({ ok: false, error: 'invalid_json_body' }, 400);
   }
+  const pending = parsePushedCreditsPending((body as { creditsPending?: unknown } | null)?.creditsPending);
+  if (!pending.ok) return json({ ok: false, error: pending.error }, 400);
   // No token: the server's plan refresh (`refreshAiPlans` in the app), which needs no browser. It names the plan
   // explicitly; an empty body is refused rather than answered as a no-op.
   if (typeof body === 'object' && body !== null && !Array.isArray(body) && !('accessToken' in body)) {
@@ -7766,7 +7795,7 @@ async function handleAiCredential(request: Request, env: Env, sandboxName: strin
     const plan = parsePushedModelAccess(fields.includedModels);
     if (!plan.ok) return json({ ok: false, error: plan.error }, 400);
     try {
-      const result = await openSandbox(env, sandboxName).putAiModelAccess(plan.includedModels as readonly string[] | null, auth.timestamp);
+      const result = await openSandbox(env, sandboxName).putAiModelAccess(plan.includedModels as readonly string[] | null, auth.timestamp, pending.creditsPending);
       return json({ ok: true, sandboxId: sandboxName, planStored: result.stored });
     } catch {
       return json({ ok: false, sandboxId: sandboxName, error: 'ai_credential_storage_failed' }, 500);
@@ -7780,7 +7809,7 @@ async function handleAiCredential(request: Request, env: Env, sandboxName: strin
 
   try {
     const sandbox = openSandbox(env, sandboxName);
-    const result = await sandbox.putAiCredential(parsed.credential, auth.timestamp, access.includedModels);
+    const result = await sandbox.putAiCredential(parsed.credential, auth.timestamp, access.includedModels, pending.creditsPending);
     return json({ ok: true, sandboxId: sandboxName, stored: result.stored, expiresAt: result.expiresAt });
   } catch {
     return json(

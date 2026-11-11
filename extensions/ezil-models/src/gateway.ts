@@ -15,7 +15,7 @@ import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-resp
 import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from './gateway-responses';
 import { emptyUsage } from './types';
 import { localResetTime } from './status-data';
-import { credits, creditsFloor2 } from './credits-format';
+import { creditsWhole } from './credits-format';
 import type { ChatRequest, StreamEvent } from './types';
 
 export const GATEWAY_FIRST_BYTE_TIMEOUT_MS = 30_000;
@@ -330,7 +330,7 @@ export function withCatalogDefault(models: readonly ResolvedModel[], catalogs: R
 }
 
 /**
- * The account's OS plan (`included`, Free: Gemini 3.8 Flash only): each other model of that provider stays listed but
+ * The account's OS plan (`included`, Free: Gemini 3.8 Flash and two low-tier fallbacks): each other model of that provider stays listed but
  * locked, so choosing it can offer the upgrade, and it is never the default, never selectable and never sent. A locked
  * default is dropped here; `withDefaultModel` then chooses among the unlocked. A catalog never read locks nothing; the
  * proxy decides.
@@ -477,8 +477,8 @@ export const CREDIT_STATE_TEXT: Record<CreditState, string> = {
 
 /** Contract §7 "Credit UX states", evaluated top to bottom. Either input may be unknown. */
 export function creditState(models: GatewayModels | undefined, balance: GatewayBalance | undefined, alias: string): { state: CreditState; text: string; credits?: number } {
-    // The text is the exact decimal (credits-format.ts), never a float's rendering; `credits` stays a number for callers.
-    const pick = (state: CreditState, micro?: number) => ({ state, text: state === 'ok' && micro !== undefined ? `AI credits: ${credits(micro)} remaining` : CREDIT_STATE_TEXT[state],
+    // The text is whole floored credits (credits-format.ts), never a float's rendering; `credits` stays a number for callers.
+    const pick = (state: CreditState, micro?: number) => ({ state, text: state === 'ok' && micro !== undefined ? `AI credits: ${creditsWhole(micro)} remaining` : CREDIT_STATE_TEXT[state],
         ...(micro === undefined ? {} : { credits: micro / MICRO_PER_CREDIT }) });
     if (models?.killswitch) return pick(models.pause === 'reconciliation' ? 'paused_reconciliation' : 'paused_operations');
     if (models && models.data.find(entry => entry.id === alias)?.enabled === false) return pick('model_disabled');
@@ -564,15 +564,15 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
             const head = oversized ? 'This request needs more EZiL AI credits than this window allows, so waiting will not make it fit.'
                 : `This window's EZiL AI credits are used up. ${reset ? `Resets at ${localResetTime(reset)} (local time).` : 'Check EZiL AI status for the reset time.'}`;
             const guide = oversized || (left ?? 0) > 0
-                ? ` A new chat or a smaller model uses fewer credits${!oversized && left ? `; ${creditsFloor2(left)} credits are left in this window` : ''}.` : '';
+                ? ` A new chat or a smaller model uses fewer credits${!oversized && left !== undefined && left >= MICRO_PER_CREDIT ? `; ${creditsWhole(left)} credits are left in this window` : ''}.` : '';
             return new GatewayError(`EZiL AI: ${head} Buying credits or changing plan does not lift this window right now.${guide}${ref}`,
                 status, code, requestId, seconds, origin, undefined, reset?.toISOString());
         }
         case 'insufficient_credits': case 'no_live_grant': {
             if (body.no_live_grant || code === 'no_live_grant') return make('You have no AI credits left. Add credits to continue.');
             const available = body.available_micro ?? balance?.available_micro;
-            // Floored: the balance is never shown as more than it is (the hold below is a requirement, so it keeps toFixed).
-            const credits = typeof available === 'number' && Number.isSafeInteger(available) && available >= 0 ? creditsFloor2(available) : 'Not measured';
+            // Whole and floored: the balance is never shown as more than it is (the hold below is a requirement, so it keeps toFixed).
+            const credits = typeof available === 'number' && Number.isSafeInteger(available) && available >= 0 ? creditsWhole(available) : 'Not measured';
             const state = typeof body.hold_micro === 'number' && Number.isFinite(body.hold_micro)
                 && typeof available === 'number' && Number.isFinite(available) && body.hold_micro > available
                 ? `This request needs up to ${(body.hold_micro / MICRO_PER_CREDIT).toFixed(2)} credits, and you have ${credits}.`
@@ -591,6 +591,7 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
             if (body.reason === 'wrong_issuer') return make('EZiL AI does not accept this account’s sign-in (this OS environment is not connected to EZiL AI)');
             if (body.reason === 'bad_signature') return make('EZiL AI could not verify this account’s sign-in signature. Contact your administrator');
             return make('EZiL AI refused this account’s sign-in. Contact your administrator');
+        case 'os_credits_pending': return make('Your AI credits are being confirmed. Please try again shortly');
         case 'os_ai_unavailable': return make('Could not reach EZiL AI. Retry the request');
         case 'os_completion_timeout': return make(`No complete reply from EZiL AI within ${GATEWAY_COMPLETION_TIMEOUT_MS / 1000} seconds, so EZiL OS stopped waiting. `
             + 'The request may still be charged if the model finished, never more than EZiL AI settles for it. You can retry or switch to a streaming model');
@@ -606,7 +607,7 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
         // Caller-scoped (catalog reasons entitlement_required and not_allowed_for_caller): neither is about credits.
         case 'no_entitlement': return make('AI access is not included for this account: it needs an active plan');
         case 'model_not_allowed': return make('This model is not included for your access. Pick another model');
-        // The OS proxy's plan list (Free: Gemini 3.8 Flash only), refused before the Gateway.
+        // The OS proxy's plan list (Free: Flash and two fallbacks), refused before the Gateway.
         case 'os_model_not_included': return make(`${alias} is not included in your plan. Nothing was sent or charged. `
             + 'Pick an included model, or upgrade in Settings → Billing');
         case 'os_invalid_request': return make(`Internal EZiL Models bug (${code}); please report it`);
