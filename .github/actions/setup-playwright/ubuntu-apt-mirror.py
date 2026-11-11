@@ -3,6 +3,7 @@
 from __future__ import annotations
 import datetime as dt
 import email.utils
+import errno
 import ipaddress
 import os
 from pathlib import Path
@@ -27,11 +28,34 @@ LIMIT = 1048576
 class Refused(Exception):
     pass
 
+PHASE = 'startup'
+PHASES = {'startup', 'os_release', 'source_read', 'mirror_list_read', 'keyring_read',
+          'source_parse', 'configured_dns', 'release_fetch', 'release_verify', 'release_metadata', 'source_write'}
+REASONS = {
+    'source_format', 'source_field', 'source_fields', 'source_keyring', 'source_types',
+    'source_options', 'source_pocket', 'source_components', 'source_uri', 'mirror_list',
+    'source_pockets', 'release_size', 'release_format', 'release_identity', 'release_content',
+    'release_time', 'release_future', 'release_stale', 'release_expired', 'release_url',
+    'release_download', 'release_signature', 'fixed_path', 'source_size',
+    'unsafe_source_directory', 'source_changed', 'noble_root_required',
+} | {label + '_' + code for label in ('source', 'mirror_list', 'keyring')
+     for code in ('missing', 'symlink', 'unreadable', 'not_regular', 'not_root_owned', 'multiple_links', 'writable', 'too_large')}
+
+def public_failure(error):
+    reason = error.args[0] if isinstance(error, Refused) and error.args else None
+    reason = reason if isinstance(reason, str) and reason in REASONS else (
+        'command_timeout' if isinstance(error, subprocess.TimeoutExpired) else
+        'io_error' if isinstance(error, OSError) else
+        'invalid_metadata_time' if isinstance(error, ValueError) else 'unexpected')
+    return 'Ubuntu apt mirror: refused phase=' + (PHASE if PHASE in PHASES else 'startup') + ' reason=' + reason + '; no unverified source is accepted'
+
 def need(condition, message):
     if not condition:
         raise Refused(message)
 
 def parse_sources(raw: bytes, mirrors: bytes | None):
+    global PHASE
+    PHASE = 'source_parse'
     need(len(raw) <= 65536 and b'\r' not in raw and b'\x00' not in raw, 'source_format')
     text = raw.decode('ascii')
     replacements, suites, components, hosts = [], set(), set(), set()
@@ -116,12 +140,18 @@ def validate_release(payload: bytes, pocket: str, components: set[str], now: dt.
 
 def recover(raw, mirrors, resolve, fetch, verify, now):
     text, replacements, suites, components, hosts = parse_sources(raw, mirrors)
+    global PHASE
+    PHASE = 'configured_dns'
     if all(resolve(host) for host in sorted(hosts)):
         return None
     for pocket in sorted(suites):
+        PHASE = 'release_fetch'
         signed = fetch(MIRROR + 'dists/' + pocket + '/InRelease')
         need(0 < len(signed) <= LIMIT, 'release_size')
-        validate_release(verify(signed), pocket, components, now)
+        PHASE = 'release_verify'
+        payload = verify(signed)
+        PHASE = 'release_metadata'
+        validate_release(payload, pocket, components, now)
     for start, end, value in reversed(replacements):
         text = text[:start] + value + text[end:]
     return text.encode('ascii')
@@ -152,12 +182,22 @@ def verify(signed):
 
 
 def read_owned(path: Path, limit: int):
-    need(path in (SOURCES, MIRROR_LIST, KEYRING), 'fixed_path')
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    global PHASE
+    label = {SOURCES: 'source', MIRROR_LIST: 'mirror_list', KEYRING: 'keyring'}.get(path)
+    need(label is not None, 'fixed_path')
+    PHASE = label + '_read'
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as error:
+        code = 'missing' if error.errno == errno.ENOENT else 'symlink' if error.errno == errno.ELOOP else 'unreadable'
+        raise Refused(label + '_' + code) from None
     try:
         info = os.fstat(fd)
-        need(stat.S_ISREG(info.st_mode) and info.st_uid == 0 and info.st_nlink == 1
-             and not info.st_mode & 0o022 and info.st_size <= limit, 'unsafe_source_file')
+        need(stat.S_ISREG(info.st_mode), label + '_not_regular')
+        need(info.st_uid == 0, label + '_not_root_owned')
+        need(info.st_nlink == 1, label + '_multiple_links')
+        need(not info.st_mode & 0o022, label + '_writable')
+        need(info.st_size <= limit, label + '_too_large')
         data = os.read(fd, limit + 1)
         need(len(data) <= limit, 'source_size')
         return data, info
@@ -165,6 +205,8 @@ def read_owned(path: Path, limit: int):
         os.close(fd)
 
 def write_sources(before: bytes, info, after: bytes):
+    global PHASE
+    PHASE = 'source_write'
     parent = SOURCES.parent
     for path in (Path('/etc'), Path('/etc/apt'), parent):
         item = path.lstat()
@@ -184,6 +226,8 @@ def write_sources(before: bytes, info, after: bytes):
             os.unlink(name)
 
 def main():
+    global PHASE
+    PHASE = 'os_release'
     release = dict(re.findall(r'^([A-Z_]+)=["\x27]?([^"\x27\n]+)["\x27]?$', Path('/etc/os-release').read_text(), re.M))
     if release.get('ID') != 'ubuntu' or release.get('VERSION_ID') != '24.04':
         print('Ubuntu apt mirror: unchanged (not Ubuntu 24.04)')
@@ -202,8 +246,8 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except Exception:
-        # No exception/source/environment content: every failure is closed before mutation.
-        print('Ubuntu apt mirror: refused; no unverified source is accepted', file=__import__('sys').stderr)
+    except Exception as error:
+        # Only closed phase/reason codes; no exception/source/environment content.
+        print(public_failure(error), file=__import__('sys').stderr)
         raise SystemExit(1)
 

@@ -112,7 +112,7 @@ class AptMirrorTests(unittest.TestCase):
             file.write_bytes(SOURCE)
             link = Path(folder) / 'link'
             link.symlink_to(file)
-            with mock.patch.object(m, 'SOURCES', link), self.assertRaises(OSError):
+            with mock.patch.object(m, 'SOURCES', link), self.assertRaisesRegex(m.Refused, '^source_symlink$'):
                 m.read_owned(link, 65536)
             for patch in [{'st_uid': 1000}, {'st_mode': stat.S_IFREG | 0o664}, {'st_nlink': 2}]:
                 info = dict(st_mode=stat.S_IFREG | 0o644, st_uid=0, st_nlink=1, st_size=len(SOURCE))
@@ -137,6 +137,17 @@ class AptMirrorTests(unittest.TestCase):
             with self.assertRaises(m.Refused):
                 m.main()
             write.assert_not_called()
+
+    def test_diagnostics_are_closed_codes_and_never_echo_exception_content(self):
+        for error in [m.Refused('private-sentinel'), ValueError('private-sentinel'),
+                      OSError('private-sentinel'), RuntimeError('private-sentinel')]:
+            self.assertNotIn('private-sentinel', m.public_failure(error))
+        self.assertIn('reason=source_not_root_owned', m.public_failure(m.Refused('source_not_root_owned')))
+        self.assertNotIn('private-phase-sentinel', self._unknown_phase_message())
+
+    def _unknown_phase_message(self):
+        with mock.patch.object(m, 'PHASE', 'private-phase-sentinel'):
+            return m.public_failure(RuntimeError('private-error-sentinel'))
 
     def test_download_uses_bounded_verified_https_and_no_signature_bypass(self):
         with mock.patch.object(m.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=b'signed')) as run:
