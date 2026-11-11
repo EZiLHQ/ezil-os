@@ -114,14 +114,22 @@ const TOPUP_REVIEW_COPY = "Payment received, but your credits couldn't be added 
 const TOPUP_TIMEOUT_COPY = "Payment received, but we couldn't confirm your AI credits yet. You don't need to pay again. Check Settings → Billing for your balance, and contact support if the credits don't appear.";
 
 // Stripe.js v3 mounts these Financial Connections, Link and embedded checkout
-// modal frames in body portals. Validate their URL only; never inspect their DOM.
-function isStripeModalFrame (iframe) {
+// modal frames in body portals, and so does a card's 3-D Secure / OTP challenge.
+// OBSERVED in the public https://js.stripe.com/v3/ asset (sha256 c2d84621627c35aeadd5043cdc97d93baad14d1af61a073ca5879fb28dea5852,
+// read 2026-11-11, two hash variants): frame type STRIPE_3DS2_CHALLENGE is
+// /v3/three-ds-2-challenge-<32 hex>.html, created through its lightbox as a
+// hidden body DIV holding the iframe, shown as a fixed full-screen layer.
+// NOT listed, deliberately: three-ds-2-fingerprint (hidden, must never take
+// focus), standalone-3ds-* and authorize-with-url, none observed as a modal
+// here. Validate the URL only; never inspect a frame's DOM.
+export function isStripeModalFrame (iframe) {
     try {
         if ( iframe.hasAttribute('srcdoc') ) return false;
         const url = new URL(iframe.getAttribute('src'));
         return url.origin === 'https://js.stripe.com' && ! url.username && ! url.password
             && (/^\/v3\/(?:linked-accounts|universal-link-modal)-inner-[a-f0-9]{32}\.html$/.test(url.pathname)
-                || /^\/v3\/embedded-checkout-modal-[a-f0-9]{40}\.html$/.test(url.pathname));
+                || /^\/v3\/embedded-checkout-modal-[a-f0-9]{40}\.html$/.test(url.pathname)
+                || /^\/v3\/three-ds-2-challenge-[a-f0-9]{32}\.html$/.test(url.pathname));
     } catch { return false; }
 }
 

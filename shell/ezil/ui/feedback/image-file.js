@@ -1,12 +1,15 @@
 // Local screenshot imports. Caller MUST open the redaction editor before attaching.
 // Original file bytes, filenames and metadata are never uploaded by this module.
 const SOURCE_BYTES_MAX = 8 * 1024 * 1024;
-const SOURCE_SIDE_MAX = 4096;
+// A pasted or saved screenshot from a 5K/6K or HiDPI display is wider than 4096 px. It is decoded once
+// and scaled to LONG_EDGE_MAX, so the bound is on decode memory: 8192 px per side and ~42 Mpx in all.
+const SOURCE_SIDE_MAX = 8192;
+const SOURCE_PIXELS_MAX = 8192 * 5120;
 const LONG_EDGE_MAX = 1920;
 const TYPES = new Set(['image/png', 'image/jpeg', 'image/webp']);
 function size_ok(w,h) {
     return Number.isInteger(w) && Number.isInteger(h) && w>0 && h>0
-        && w<=SOURCE_SIDE_MAX && h<=SOURCE_SIDE_MAX;
+        && w<=SOURCE_SIDE_MAX && h<=SOURCE_SIDE_MAX && w*h<=SOURCE_PIXELS_MAX;
 }
 function header_size(b,type) {
     const v=new DataView(b.buffer,b.byteOffset,b.byteLength);

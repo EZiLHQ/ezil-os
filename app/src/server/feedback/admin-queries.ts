@@ -17,6 +17,8 @@ export interface AdminReportSummary {
     category: string;
     descriptionPreview: string;
     hasScreenshot: boolean;
+    /** Stored images, viewed one at a time as `/api/admin/feedback/screenshot?id=…&n=0…count-1`. */
+    screenshotCount: number;
     computerId: string | null;
     /** The client's diagnostics exactly as previewed and posted; `serverContext` is split out below. */
     diagnostics: unknown;
@@ -46,12 +48,17 @@ export interface FeedbackAdminQueries {
     listReportIds: () => Promise<string[]>;
     listReports: (ids: string[]) => Promise<AdminReportSummary[]>;
     findReport: (id: string) => Promise<AdminReport | null>;
-    findScreenshot: (id: string) => Promise<AdminScreenshot | null>;
+    /** The report's image at position `n` (0-based, send order). */
+    findScreenshot: (id: string, n?: number) => Promise<AdminScreenshot | null>;
     deleteReport: (id: string) => Promise<void>;
     updateStatus: (id: string, status: typeof FEEDBACK_STATUSES[number]) => Promise<boolean>;
 }
 
 const reportIdSchema = z.string().uuid();
+/** Absent means the first image, so links written before multiple images keep working. */
+const imageIndexSchema = z.string().regex(/^[0-9]$/).transform(Number).pipe(z.number().max(FEEDBACK_LIMITS.imagesMax - 1));
+// Send order: ingest writes each image's created_at as the report time plus its position.
+const SCREENSHOT_COUNT = sql.raw(`(SELECT count(*)::int FROM ezil_feedback_attachments a WHERE a.report_id = r.id)`);
 
 function adminId(deps: FeedbackAdminContext): string | null {
     return deps.user && isFeedbackAdmin(deps.user.email, deps.allowList) ? deps.user.id : null;
@@ -82,7 +89,8 @@ export function feedbackAdminQueries(db: FeedbackDb): FeedbackAdminQueries & Pic
                 SELECT r.id, r.created_at AS "createdAt", r.category,
                     left(r.description, ${FEEDBACK_LIMITS.descriptionPreview}) AS "descriptionPreview",
                     left(r.computer_id::text, 8) AS "computerId", ${CLIENT_DIAGNOSTICS} AS diagnostics, ${SERVER_CONTEXT} AS "serverContext", r.status, r.deploy_sha AS "deploySha",
-                    EXISTS (SELECT 1 FROM ezil_feedback_attachments a WHERE a.report_id = r.id) AS "hasScreenshot"
+                    EXISTS (SELECT 1 FROM ezil_feedback_attachments a WHERE a.report_id = r.id) AS "hasScreenshot",
+                    ${SCREENSHOT_COUNT} AS "screenshotCount"
                 FROM ezil_feedback_reports r
                 WHERE r.id IN (${sql.join(ids.map((id) => sql`${id}`), sql`, `)})
                 ORDER BY r.created_at DESC, r.id DESC
@@ -92,14 +100,17 @@ export function feedbackAdminQueries(db: FeedbackDb): FeedbackAdminQueries & Pic
             return rowsOf<AdminReport>(await db.execute(sql`
                 SELECT r.id, r.created_at AS "createdAt", r.category, r.description,
                     r.computer_id AS "computerId", ${CLIENT_DIAGNOSTICS} AS diagnostics, ${SERVER_CONTEXT} AS "serverContext", r.status, r.deploy_sha AS "deploySha",
-                    EXISTS (SELECT 1 FROM ezil_feedback_attachments a WHERE a.report_id = r.id) AS "hasScreenshot"
+                    EXISTS (SELECT 1 FROM ezil_feedback_attachments a WHERE a.report_id = r.id) AS "hasScreenshot",
+                    ${SCREENSHOT_COUNT} AS "screenshotCount"
                 FROM ezil_feedback_reports r WHERE r.id = ${id} LIMIT 1
             `))[0] ?? null;
         },
-        async findScreenshot(id) {
+        async findScreenshot(id, n = 0) {
+            // Ordered: with several images per report an unordered LIMIT 1 could return any of them.
             return rowsOf<AdminScreenshot>(await db.execute(sql`
                 SELECT bytes, content_type AS "contentType"
-                FROM ezil_feedback_attachments WHERE report_id = ${id} LIMIT 1
+                FROM ezil_feedback_attachments WHERE report_id = ${id}
+                ORDER BY created_at, sha256 OFFSET ${n} LIMIT 1
             `))[0] ?? null;
         },
         async updateStatus(id, status) {
@@ -167,11 +178,13 @@ export async function handleFeedbackScreenshot(
         'Content-Security-Policy': "default-src 'none'",
     };
     const userId = adminId(deps);
-    const parsed = reportIdSchema.safeParse(new URL(req.url).searchParams.get('id'));
-    if (!userId || !parsed.success) return new Response(null, { status: 404, headers });
+    const params = new URL(req.url).searchParams;
+    const parsed = reportIdSchema.safeParse(params.get('id'));
+    const index = params.has('n') ? imageIndexSchema.safeParse(params.get('n')) : { success: true as const, data: 0 };
+    if (!userId || !parsed.success || !index.success) return new Response(null, { status: 404, headers });
     try {
         await deps.recordAccess({ reportId: parsed.data, adminUserId: userId, action: 'view_screenshot' });
-        const screenshot = await deps.findScreenshot(parsed.data);
+        const screenshot = await deps.findScreenshot(parsed.data, index.data);
         if (!screenshot) return new Response(null, { status: 404, headers });
         const stream = new ReadableStream<Uint8Array>({
             start(controller) {

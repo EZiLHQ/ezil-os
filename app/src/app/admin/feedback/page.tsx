@@ -60,8 +60,12 @@ export default async function FeedbackAdminPage({ searchParams }: {
                         <pre className="overflow-x-auto whitespace-pre-wrap break-words text-xs">{JSON.stringify(report.diagnostics, null, 2) ?? 'None'}</pre>
                         <AppFailureDiagnostics diagnostics={report.diagnostics} />
                         <ServerContext value={report.serverContext} />
-                        {report.hasScreenshot ? (
-                            <p><a href={`/api/admin/feedback/screenshot?id=${encodeURIComponent(report.id)}`} className="underline">View screenshot</a></p>
+                        {report.screenshotCount > 0 ? (
+                            <ul className="flex flex-wrap gap-4">{Array.from({ length: report.screenshotCount }, (_, n) => (
+                                <li key={n}><a href={`/api/admin/feedback/screenshot?id=${encodeURIComponent(report.id)}&n=${n}`} className="underline">
+                                    {report.screenshotCount === 1 ? 'View screenshot' : `View screenshot ${n + 1} of ${report.screenshotCount}`}
+                                </a></li>
+                            ))}</ul>
                         ) : <p className="text-sm text-offwhite/60">No screenshot available.</p>}
                         <form action={updateStatus}>
                             <input type="hidden" name="id" value={report.id} />
@@ -88,7 +92,7 @@ export default async function FeedbackAdminPage({ searchParams }: {
                                     <td className="py-2 pr-4">{row.category}</td>
                                     <td className="py-2 pr-4">{row.status}</td>
                                     <td className="max-w-xs break-words py-2 pr-4">{row.descriptionPreview || '(No description)'}</td>
-                                    <td className="py-2 pr-4">{row.hasScreenshot ? 'Yes' : 'No'}</td>
+                                    <td className="py-2 pr-4">{row.screenshotCount > 0 ? String(row.screenshotCount) : 'No'}</td>
                                     <td className="py-2 pr-4 font-mono text-xs">{row.computerId ?? '—'}</td>
                                     <td className="py-2 pr-4 font-mono text-xs">{row.deploySha?.slice(0, 8) ?? '—'}</td>
                                     <td className="py-2 pr-4">{diagnosticsSummary(row.diagnostics)}</td>
