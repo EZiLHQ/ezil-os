@@ -387,6 +387,8 @@ interface Env extends SandboxEnv {
   EZIL_AI_GATEWAY_URL?: string;
   /** `off` returns 503 for AI requests. Boot env and credential deletion stay available. */
   SANDBOX_AI_PROXY?: string;
+  /** OS origin for the editor-bridge sync (`./editor-bridge.ts`); unset or invalid = the route is a 404. */
+  EZIL_OS_BRIDGE_URL?: string;
 }
 
 /**
@@ -661,6 +663,7 @@ import {
   type StoredAiModelAccess,
   type AiModelAccess,
 } from './ai-proxy';
+import { deriveEditorBridgeToken, handleEditorBridgeRequest, isEditorBridgePath, resolveOsBridgeUrl } from './editor-bridge';
 
 import { captureEditorState } from './editor-state';
 import {
@@ -4554,7 +4557,9 @@ function awsDesktopAiConfig(env: Env, record: AwsTunnelRecord) {
     if (!res.ok || !nonce) throw new RelayFailure('aws_origin_unavailable');
     const previewZone = resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT);
     return { baseUrl: `https://aws-${CODE_PREVIEW_PORT}-${record.sandboxId}-aws.${previewZone}/ai/v1`,
-      proxyToken: await deriveAiProxyToken(secret, record.sandboxId, nonce) };
+      proxyToken: await deriveAiProxyToken(secret, record.sandboxId, nonce),
+      // Only while the bridge is on: a host agent older than editorToken support refuses the key.
+      ...(resolveOsBridgeUrl(env.EZIL_OS_BRIDGE_URL) ? { editorToken: await deriveEditorBridgeToken(secret, record.sandboxId, nonce) } : {}) };
   };
 }
 
@@ -7093,6 +7098,7 @@ async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<R
     return handlePreviewBootstrap(url, sandboxId, secrets, cookieSecret, target);
   }
 
+  if (target === 'code' && isEditorBridgePath(path)) return handleEditorBridge(request, env, sandboxId);
   if (target === 'code' && isAiProxyPath(path)) return handleAiProxy(request, env, sandboxId);
 
   if (target === 'code') return handleCodeBridge(request, env, url, sandboxId, secrets, port);
@@ -7677,6 +7683,8 @@ async function aiProxyBootEnv(env: Env, hostname: string, sandboxId: string, non
   return {
     EZIL_AI_BASE_URL: aiProxyBaseUrl(hostname, sandboxId, code.port, code.token),
     EZIL_AI_PROXY_TOKEN: secret ? await deriveAiProxyToken(secret, sandboxId, nonce) : '',
+    // The editor bridge's own token (./editor-bridge.ts), same boot nonce, only while the bridge is on.
+    ...(secret && resolveOsBridgeUrl(env.EZIL_OS_BRIDGE_URL) ? { EZIL_EDITOR_BRIDGE_TOKEN: await deriveEditorBridgeToken(secret, sandboxId, nonce) } : {}),
   };
 }
 
@@ -7699,6 +7707,21 @@ async function handleAiProxy(request: Request, env: Env, sandboxId: string, awsN
     modelAccess: () => sandbox ? sandbox.getAiModelAccess() : Promise.resolve({ known: false } as const),
     dropCredential: (token) => sandbox ? sandbox.dropAiCredential(token) : Promise.resolve(),
     fetch: (upstream) => fetch(upstream),
+    log: (fields) => console.log(JSON.stringify(fields)),
+  });
+}
+
+/** `/editor-bridge/v1/sync` on a code host: the same per-boot token as `/ai/v1`, then a signed forward to OS. */
+async function handleEditorBridge(request: Request, env: Env, sandboxId: string, awsNonce?: string | null): Promise<Response> {
+  const osUrl = resolveOsBridgeUrl(env.EZIL_OS_BRIDGE_URL);
+  const sandbox = osUrl && awsNonce === undefined ? openSandbox(env, sandboxId) : null;
+  return handleEditorBridgeRequest(request, {
+    sandboxId,
+    osUrl,
+    secret: resolveNekoDerivationSecret(env),
+    nonce: awsNonce !== undefined ? awsNonce : sandbox ? await sandbox.getAiProxyNonce() : null,
+    fetch: (upstream) => fetch(upstream),
+    now: () => Date.now(),
     log: (fields) => console.log(JSON.stringify(fields)),
   });
 }
@@ -7817,6 +7840,17 @@ export default {
     //    `null` (not a Response) for hostnames outside both bridge patterns,
     //    in which case the request continues to the normal `proxyToSandbox`
     //    path below unchanged.
+    if (url.hostname.split('.')[0]!.startsWith('aws-') && isEditorBridgePath(path)) {
+      const route = parseAwsBrowserHost(url.hostname, resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT));
+      if (!route || route.port !== CODE_PREVIEW_PORT) return json({ error: { code: 'not_found', source: 'ezil-os-bridge' } }, 404);
+      const registry = awsRegistryFor(env);
+      if (!awsRoutingEnabled(env.AWS_ROUTING_ENABLED) || !registry || !resolveAwsOriginZone(env)) {
+        return json({ error: { code: 'not_found', source: 'ezil-os-bridge' } }, 404);
+      }
+      // Same rule as /ai/v1 below: only the tunnel record's current boot nonce, never the CF one or a client's.
+      const record = await lookupAwsTunnel(registry, route.sandboxId);
+      return handleEditorBridge(request, env, route.sandboxId, record?.aiProxyNonce ?? null);
+    }
     if (url.hostname.split('.')[0]!.startsWith('aws-') && isAiProxyPath(path)) {
       const route = parseAwsBrowserHost(url.hostname, resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT));
       if (!route || route.port !== CODE_PREVIEW_PORT) return proxyError(404, 'os_ai_unavailable');

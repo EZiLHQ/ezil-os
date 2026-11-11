@@ -29,6 +29,8 @@
 import { TRPCError } from '@trpc/server';
 import { z } from 'zod';
 
+import type { SessionDb } from '@/server/agent-session/store';
+import { startComputer } from '@/server/computer-start/start';
 import { computers } from '@/server/db/schema';
 import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
 import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare';
@@ -48,6 +50,7 @@ import {
     pickFreeSlot,
     softDeleteComputer,
 } from './computer-store';
+import { clientOf, controlCall } from '../control-call';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
 /**
@@ -259,6 +262,20 @@ export const computerRouter = createTRPCRouter({
             return switchComputerConfiguration(ctx.db as unknown as PlacementDb, { userId: ctx.user.id, computerId: input.computerId },
                 { size: input.size, requestId: input.requestId });
         }),
+
+    /**
+     * Start (not open) one of the person's computers, for the EZiL MCP (`ezil:computers:start`): a normal start with a
+     * durable idempotent row, the allowance checked before anything boots, and no plan, size or billing change.
+     * It never returns a desktop or preview URL (`../../computer-start/start.ts`).
+     */
+    start: protectedProcedure
+        .input(z.object({ computerId: z.string().uuid(), idempotencyKey: z.string().uuid() }).strict())
+        .mutation(({ ctx, input }) => controlCall(ctx, 'computer.start', input.idempotencyKey, async () => {
+            // Loaded on use: the port pulls in billing and the providers, which validate the server env at import.
+            const { startPort } = await import('@/server/computer-start/port');
+            return startComputer(ctx.db as unknown as SessionDb, startPort(ctx.db, { userId: ctx.user.id, computerId: input.computerId }),
+                { userId: ctx.user.id, clientId: clientOf(ctx) }, input);
+        })),
 
     /**
      * Round 3: restart the WHOLE computer (a confirmed stop, then a server-initiated open on the

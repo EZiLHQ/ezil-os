@@ -289,3 +289,28 @@ test('CLI entry point supports help, no-credential dry-run, and failure return c
     assert.equal(await run(['--apply', OLD[2]], options), 1);
     assert.match(logs.pop(), /apply requires a GitHub Actions pull_request event/);
 });
+
+
+test('hardening journal entries do not block explicit flat selections or replay nested SQL', async (t) => {
+    const { drizzleDir, calls, options } = await fixture(t);
+    const journalPath = join(drizzleDir, 'meta', '_journal.json');
+    const journal = JSON.parse(await readFile(journalPath, 'utf8'));
+    journal.entries.push({ idx: 5, tag: 'hardening/0022_delegation_replay' });
+    await writeFile(journalPath, JSON.stringify(journal));
+    assert.equal(await run(['--dry-run', NEW[0]], options), 0);
+    assert.equal(await run(['--apply', 'hardening/0022_delegation_replay.sql'], options), 1);
+    assert.deepEqual(calls, []);
+});
+
+for (const tag of ['../0022_escape', 'other/0022_escape', 'hardening/../0022_escape',
+    'hardening//0022_escape', 'hardening/hardening/0022_escape']) {
+    test('journal path remains bounded: ' + tag, async (t) => {
+        const { drizzleDir, calls, options } = await fixture(t);
+        const journalPath = join(drizzleDir, 'meta', '_journal.json');
+        const journal = JSON.parse(await readFile(journalPath, 'utf8'));
+        journal.entries.push({ idx: 5, tag });
+        await writeFile(journalPath, JSON.stringify(journal));
+        assert.equal(await run(['--dry-run', NEW[0]], options), 1);
+        assert.deepEqual(calls, []);
+    });
+}

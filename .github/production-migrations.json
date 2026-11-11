@@ -85,6 +85,26 @@
       "path": "app/drizzle/0021_standard_trial.sql",
       "sha256": "d44471c2a8fa9880b09aaf4f6654e5856cf1ea356071379021f63571f542ca35",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/hardening/0022_delegation_replay.sql",
+      "sha256": "fbf9c9b5922719a6d2f991deabd65208727aec436659bf31748d3224484cbd40",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/hardening/0023_agent_sessions.sql",
+      "sha256": "1ae73e8865f488b2736608a88dd0767aebd04dfe49c43db69751db78dc8cc80d",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/hardening/0024_control_operations.sql",
+      "sha256": "0ab5ff43439b281ea6ff8eaa56efb7b166e0cdcb6e283029c2a216baf7c8da59",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/hardening/0025_editor_controls.sql",
+      "sha256": "134e14daa769de62f5ac25298569fd7b5e0a26697cf7e98963c650cd28f08c16",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {

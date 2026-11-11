@@ -71,6 +71,34 @@
       "when": 1793877000000,
       "tag": "0021_standard_trial",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1794045600000,
+      "tag": "hardening/0022_delegation_replay",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1794045600001,
+      "tag": "hardening/0023_agent_sessions",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1794045600002,
+      "tag": "hardening/0024_control_operations",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1794045600003,
+      "tag": "hardening/0025_editor_controls",
+      "breakpoints": true
     }
   ]
 }
