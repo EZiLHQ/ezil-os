@@ -106,6 +106,14 @@ runs:
           done
         fi
 
+    - name: Verify signed Ubuntu apt mirror fallback
+      shell: bash
+      run: |
+        if [ "${RUNNER_OS}" = "Linux" ]; then
+          python3 "${GITHUB_ACTION_PATH}/ubuntu-apt-mirror.test.py"
+          sudo python3 "${GITHUB_ACTION_PATH}/ubuntu-apt-mirror.py"
+        fi
+
     - name: Install chromium (--with-deps only on Linux)
       shell: bash
       working-directory: ${{ steps.prep.outputs.dir }}
