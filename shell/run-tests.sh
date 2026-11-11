@@ -351,6 +351,7 @@ PORTABLE_SUITES=(
     "shell/ezil/ui/Settings/billing-trial-browser-test.mjs"
     "shell/ezil/ui/Settings/credits-real-shape-browser-test.mjs"
     "shell/ezil/ui/feedback-browser-test.mjs"
+    "shell/ezil/ui/feedback/capture-browser-test.mjs"
 )
 
 # suite_family <relpath> -> "portable", "geometry", or "" (unclassified)

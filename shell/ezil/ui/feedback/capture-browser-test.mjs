@@ -8,12 +8,17 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-const requireDir = process.env.PLAYWRIGHT_REQUIRE_DIR;
-if (!requireDir) {
-    console.log('SKIP capture-browser-test: set PLAYWRIGHT_REQUIRE_DIR to run the real-browser capture check.');
-    process.exit(0);
+// Same Playwright lookup and skip code (2) as the other shell browser suites.
+let chromium;
+try { ({ chromium } = createRequire(import.meta.url)('playwright')); } catch {
+    if (process.env.PLAYWRIGHT_REQUIRE_DIR) {
+        try { ({ chromium } = createRequire(path.join(path.resolve(process.env.PLAYWRIGHT_REQUIRE_DIR), 'probe.cjs'))('playwright')); } catch { /* Skip below. */ }
+    }
 }
-const { chromium } = createRequire(path.join(requireDir, 'noop.js'))('playwright');
+if (!chromium) {
+    console.error('SKIP: installed Playwright is unavailable; jsdom cannot prove capture pixels.');
+    process.exit(2);
+}
 const shellDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../..');
 const ORIGIN = 'https://shell.test';
 

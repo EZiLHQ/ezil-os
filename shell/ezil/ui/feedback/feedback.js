@@ -463,7 +463,7 @@ export function open_feedback_dialog (_opts) {
         <form>
             <fieldset class="ezil-feedback-fields">
                 <label for="ezil-feedback-description">Description (optional)</label>
-                <textarea id="ezil-feedback-description" name="description" maxlength="4000" rows="3"
+                <textarea id="ezil-feedback-description" name="description" maxlength="4000" rows="3"${screenshots ? ' placeholder="You can paste screenshots here too."' : ''}
                     aria-describedby="ezil-feedback-counter ezil-feedback-warning"${touchPrimary ? '' : ' autofocus'}></textarea>
                 <p id="ezil-feedback-counter" class="ezil-feedback-muted" aria-live="polite"></p>
                 <p id="ezil-feedback-warning" class="ezil-feedback-warning" role="status" hidden></p>
@@ -483,9 +483,8 @@ export function open_feedback_dialog (_opts) {
                         <p class="ezil-feedback-muted" data-role="images-heading"></p>
                         <ol class="ezil-feedback-images" data-role="images"></ol>
                     </div>
-                    <p class="ezil-feedback-muted" data-role="paste-hint">You can also paste a screenshot here (Ctrl+V or ⌘V). Each one opens in the editor first.</p>
                     <details class="ezil-feedback-capture-options"><summary>More capture options</summary>
-                        <p class="ezil-feedback-muted">PNG, JPEG or WebP, up to 8 MiB each. ${imagesMax > 1 ? `Up to ${imagesMax} images, ${format_bytes(imagesBytesTotal)} in all after editing.` : `One image, up to ${format_bytes(IMAGE_BYTES_MAX)} after editing.`} The EZiL OS window option cannot show embedded apps: they appear as grey boxes. "Capture what I see" asks you to choose a tab or screen; crop and cover private areas before attaching.</p>
+                        <p class="ezil-feedback-muted">You can also paste a screenshot into this form (Ctrl+V or ⌘V); each one opens in the editor first. PNG, JPEG or WebP, up to 8 MiB each. ${imagesMax > 1 ? `Up to ${imagesMax} images, ${format_bytes(imagesBytesTotal)} in all after editing.` : `One image, up to ${format_bytes(IMAGE_BYTES_MAX)} after editing.`} The EZiL OS window option cannot show embedded apps: they appear as grey boxes. "Capture what I see" asks you to choose a tab or screen; crop and cover private areas before attaching.</p>
                         ${!tab_capture_supported() ? '<p class="ezil-feedback-muted">This browser cannot capture a tab. Attach or paste a screenshot from your device to include embedded app content.</p>' : ''}
                         <div class="ezil-feedback-actions">
                             <button type="button" data-capture="shell">Capture EZiL OS window (without embedded apps)</button>
@@ -673,7 +672,7 @@ export function open_feedback_dialog (_opts) {
     const SOURCE_SCOPE = { window: 'Embedded app not captured; this is the EZiL OS window only.',
         tab: 'Captured from the browser surface you chose.', desktop: 'Captured from the desktop frame.',
         file: 'Attached from your device.', paste: 'Pasted from your clipboard.', queued: 'The screenshot already queued with this report.' };
-    const SOURCE_LABEL = { window: 'EZiL OS window (embedded app not captured)', tab: 'Screen capture', desktop: 'Desktop frame',
+    const SOURCE_LABEL = { window: 'EZiL OS window', tab: 'Screen capture', desktop: 'Desktop frame',
         file: 'From your device', paste: 'Pasted', queued: 'Queued with this report' };
 
     /** The honest scope of what is attached: the default is the masked EZiL OS window, never the embedded app. */
@@ -687,9 +686,11 @@ export function open_feedback_dialog (_opts) {
         const used = images.reduce((sum, image) => sum + image.bytes, 0);
         // Adding is offered while there is room; with one image allowed, a new one replaces it.
         const full = ! can_add();
+        // One image: the thumbnail and the scope line say it all (compact on a phone).
+        heading.hidden = imagesMax === 1;
         heading.textContent = imagesMax > 1
-            ? `Sent with your report: ${images.length} of ${imagesMax} images · ${format_bytes(used)} of ${format_bytes(imagesBytesTotal)}${full ? `. ${FULL_NOTE()}` : ''}`
-            : 'Sent with your report:';
+            ? `${images.length} of ${imagesMax} images · ${format_bytes(used)} of ${format_bytes(imagesBytesTotal)}${full ? `. ${FULL_NOTE()}` : ''}`
+            : '';
         for ( const button of dialog.querySelectorAll('[data-capture]:not([data-capture="edit"])') ) button.disabled = capturing || full;
         if ( form.elements.screenshotFile ) form.elements.screenshotFile.disabled = capturing || full;
     }
@@ -712,10 +713,16 @@ export function open_feedback_dialog (_opts) {
             edit.type = 'button'; edit.dataset.capture = 'edit'; edit.textContent = 'Edit / crop / redact';
             const remove = document.createElement('button');
             remove.type = 'button'; remove.dataset.action = 'remove-screenshot';
-            remove.textContent = images.length > 1 ? 'Remove' : 'Remove screenshot';
+            remove.textContent = 'Remove';
             remove.setAttribute('aria-label', images.length > 1 ? `Remove screenshot ${index + 1}` : 'Remove screenshot');
             edit.disabled = capturing;
-            item.append(img, label, edit, remove);
+            // Beside the thumbnail: its label (once there are several; one image is named by the scope line) over Edit and Remove.
+            const meta = document.createElement('div');
+            meta.className = 'ezil-feedback-image-meta';
+            const actions = document.createElement('div');
+            actions.append(edit, remove);
+            meta.append(...(images.length > 1 ? [label, actions] : [actions]));
+            item.append(img, meta);
             return item;
         }));
         box.hidden = images.length === 0;
@@ -751,14 +758,21 @@ export function open_feedback_dialog (_opts) {
         return Math.min(IMAGE_BYTES_MAX, imagesBytesTotal - others);
     }
 
-    /** Put an edited image in place of `replaceKey`, or add it (with one image allowed, it replaces the one there). */
+    /**
+     * Put an edited image in place of `replaceKey`, or add it (with one image allowed, it replaces the one there).
+     * The server refuses the same image twice in one report, so a duplicate of ANOTHER image is not taken: the
+     * images stay as they were and false is returned.
+     */
     function put_image (image, replaceKey = null) {
+        if ( imagesMax > 1 && images.some(other => other.key !== replaceKey
+            && other.contentType === image.contentType && other.dataBase64 === image.dataBase64) ) return false;
         const entry = { key: ++imageKeys, ...image };
         const at = images.findIndex(existing => existing.key === replaceKey);
         if ( at >= 0 ) images = images.map((existing, index) => index === at ? entry : existing);
         else if ( imagesMax === 1 ) images = [entry];
         else images = [...images, entry];
         render_images();
+        return true;
     }
 
     /** Room for another image (one allowed: always, it replaces). */
@@ -810,7 +824,9 @@ export function open_feedback_dialog (_opts) {
             }
             const dataBase64 = await read_blob(edited.blob, signal);
             if ( ! current() || ! screenshotConsent.checked ) return;
-            put_image({ contentType: edited.contentType, dataBase64, bytes: edited.blob.size, source }, replaceKey);
+            if ( ! put_image({ contentType: edited.contentType, dataBase64, bytes: edited.blob.size, source }, replaceKey) ) {
+                capture_note.textContent = 'This screenshot is already attached.';
+            }
             result.textContent = '';
         } catch {
             if ( current() ) result.textContent = 'Could not capture a screenshot. Try another capture option.';
@@ -854,8 +870,9 @@ export function open_feedback_dialog (_opts) {
     }
 
     const NO_AUTO_CAPTURE = 'No screenshot was captured automatically. Send still works, or add one below.';
-    const EMBEDDED_NOTE = 'The open app shows as a grey box in this image. To include it, '
-        + (tab_capture_supported() ? 'use "Capture what I see", paste a screenshot, or attach one.' : 'paste a screenshot or attach one from your device.');
+    // The scope line beside the thumbnail already says the embedded app is not in it; the note adds only the way to include it.
+    const EMBEDDED_NOTE = 'To include the open app, '
+        + (tab_capture_supported() ? 'use "Capture what I see", or paste or attach a screenshot.' : 'paste or attach a screenshot.');
     let autoTimer = null;
     function abort_auto () {
         ++autoGeneration;

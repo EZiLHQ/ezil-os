@@ -1400,7 +1400,7 @@ try {
             await until(() => rows().length === 1 && ! current().querySelector('[type="submit"]').disabled);
             assert.ok(captureCalls.includes('upload:one.png'));
             assert.equal(editorOptions.length, editors + 1, 'the pasted image opened in the editor');
-            assert.match(rows()[0].textContent, /Pasted/);
+            assert.equal(current().querySelector('[data-role="capture-scope-text"]').textContent, 'Pasted from your clipboard.');
             assert.equal(calls.length, requests, 'pasting uploads nothing');
             assert.ok(payload().screenshot, 'one image keeps the single-image key');
             assert.equal(payload().screenshots, undefined);
@@ -1470,6 +1470,43 @@ try {
         });
     });
 
+    await check('the same screenshot twice is refused locally with a note (the server would 400 the whole report); an edit into a duplicate keeps the prior image', async () => {
+        await multi(async () => {
+            open();
+            const requests = calls.length;
+            const same = () => ({ blob: new window.Blob([imageBytes], { type: 'image/png' }), contentType: 'image/png', width: 1, height: 1 });
+            editorResult = same;
+            paste(current(), [png('first.png')]);
+            await until(() => rows().length === 1 && ! current().querySelector('[type="submit"]').disabled);
+            paste(current(), [png('again.png')]);
+            await until(() => captureCalls.includes('upload:again.png') && ! current().querySelector('[type="submit"]').disabled);
+            assert.equal(rows().length, 1, 'a repeated paste does not add a row');
+            assert.equal(current().querySelector('[data-role="capture-note"]').textContent, 'This screenshot is already attached.');
+            // A second, different image; then editing it into a copy of the first keeps it as it was.
+            editorResult = distinctResult;
+            paste(current(), [png('other.png')]);
+            await until(() => rows().length === 2 && ! current().querySelector('[type="submit"]').disabled);
+            const before = payload().screenshots.map(image => image.dataBase64);
+            editorResult = same;
+            const img = rows()[1].querySelector('img');
+            Object.defineProperties(img, { naturalWidth: { value: 1 }, naturalHeight: { value: 1 } });
+            const realContext = window.HTMLCanvasElement.prototype.getContext;
+            window.HTMLCanvasElement.prototype.getContext = () => ({ drawImage () {} });
+            const editors = editorOptions.length;
+            try {
+                rows()[1].querySelector('[data-capture="edit"]').click();
+                await until(() => editorOptions.length > editors && ! current().querySelector('[type="submit"]').disabled);
+            } finally { window.HTMLCanvasElement.prototype.getContext = realContext; }
+            assert.deepEqual(payload().screenshots.map(image => image.dataBase64), before, 'both images and their order are unchanged');
+            assert.match(current().querySelector('[data-role="capture-note"]').textContent, /already attached/);
+            assert.equal(calls.length, requests, 'nothing uploaded');
+            respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true, screenshotCount: 2 }) });
+            send(); await until(() => status().includes(reportId));
+            const sent = JSON.parse(calls.at(-1).body).screenshots.map(image => image.dataBase64);
+            assert.equal(new Set(sent).size, sent.length, 'the report carries no duplicate, so the server has no reason to refuse it');
+        });
+    });
+
     await check('several images: the byte budget is shared, and turning screenshots off sends no image key at all', async () => {
         await multi(async () => {
             open();
@@ -1521,7 +1558,8 @@ try {
         try {
             open();
             await until(() => ! current().querySelector('.ezil-feedback-image').hidden);
-            assert.match(current().querySelector('[data-role="capture-note"]').textContent, /grey box.*Capture what I see/);
+            assert.match(current().querySelector('[data-role="capture-note"]').textContent, /^To include the open app, use "Capture what I see"/);
+            assert.match(current().querySelector('[data-role="capture-scope-text"]').textContent, /Embedded app not captured/, 'the limitation is stated once, beside the image');
             assert.ok(payload().screenshot, 'the snapshot is still attached');
             close();
             snapshotCoverage = 0.05;
