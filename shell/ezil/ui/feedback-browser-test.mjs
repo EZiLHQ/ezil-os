@@ -54,6 +54,7 @@ if ( ! chromium ) {
 
 const icons = fs.readFileSync(path.join(OS, 'icons.js'), 'utf8');
 const bundle = fs.readFileSync(path.join(OS, 'bundle.min.js'), 'utf8');
+const snapdom = fs.readFileSync(path.join(OS, 'vendor', 'snapdom-3.3.4.mjs'), 'utf8');
 const css = fs.readFileSync(path.join(OS, 'bundle.min.css'), 'utf8');
 
 const origin = 'https://os-fixture.test';
@@ -66,7 +67,8 @@ const boot = { user: { id: ACCOUNT, email: 'fixture@example.test' },
     computer: { id: COMPUTER, name: 'Computer', slot: 1, createdAt: '2026-07-31T00:00:00.000Z', lastOpenedAt: null, isNew: false },
     apps: [{ id: 'desktop', name: 'Browser', icon: 'desktop', kind: 'desktop' }],
     desktopState: { provider: 'cloudflare-guacamole', configured: true, hasHmacSecret: true, status: 'idle',
-        endpoints: ENDPOINTS, ui: { floatingControls: false, feedbackScreenshots: false, feedbackReportBundle: true } } };
+        // feedbackScreenshotsMax: the several-images mode staging advertises (app boot-payload.ts).
+        endpoints: ENDPOINTS, ui: { floatingControls: false, feedbackScreenshots: false, feedbackScreenshotsMax: 5, feedbackReportBundle: true } } };
 const page_html = `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>${css}</style></head><body><div id="ezil-os-root"><div id="ezil-os-root-inner"></div></div></body></html>`;
 // The streamed desktop: reports decoded frames so the window goes full-bleed.
@@ -108,6 +110,8 @@ try {
             if ( url.origin !== origin ) return route.abort('blockedbyclient');
             if ( url.pathname === '/os' ) return route.fulfill({ contentType: 'text/html', body: page_html });
             if ( url.pathname === '/frame' ) return route.fulfill({ contentType: 'text/html', body: stream_html });
+            // The window snapshot library the shell loads on first capture (build-shell.sh copies it to /os/vendor/).
+            if ( url.pathname === '/os/vendor/snapdom-3.3.4.mjs' ) return route.fulfill({ contentType: 'text/javascript', body: snapdom });
             if ( url.pathname === '/api/shell/feedback' ) {
                 if ( request.method() === 'POST' ) {
                     if ( offline ) { offlineAttempts++; return route.abort('internetdisconnected'); }
@@ -140,7 +144,13 @@ try {
         const dialog = page.locator('dialog.ezil-feedback-dialog');
         const description = page.locator('#ezil-feedback-description');
         const status = page.locator('.ezil-feedback-result');
-        const preview = () => page.locator('.ezil-feedback-preview pre').textContent();
+        // The preview renders only while it is open (the body can be large): open it, wait for the text.
+        const preview = async () => {
+            const box = page.locator('.ezil-feedback-preview');
+            if ( ! await box.evaluate(el => el.open) ) await box.locator('summary').click();
+            await page.waitForFunction(() => document.querySelector('.ezil-feedback-preview pre')?.textContent.length > 0);
+            return page.locator('.ezil-feedback-preview pre').textContent();
+        };
         const openByChip = async () => { await chip.click(); await dialog.waitFor({ state: 'visible' }); };
         const closeDialog = async () => { await page.locator('[data-action="cancel"]').click(); await dialog.waitFor({ state: 'detached' }); };
         const launch = id => page.evaluate(app => { window.$(`.taskbar-item[data-app="${app}"]`).trigger('click'); }, id);
@@ -198,16 +208,25 @@ try {
             await page.waitForFunction(() => document.querySelector('.window[data-app="desktop"] .ezil-app-drawer')?.classList.contains('collapsed'));
             await assertTiny('drawer collapsed');
             await openByChip();
-            assert.equal(await page.evaluate(() => document.activeElement?.id), 'ezil-feedback-description', 'focus moves into the dialog');
+            const focused = await page.evaluate(() => ({ id: document.activeElement?.id,
+                text: !! document.activeElement?.matches('input, textarea, select, [contenteditable]'),
+                inDialog: !! document.activeElement?.closest('dialog.ezil-feedback-dialog') }));
+            // A touch device must not start in a text field (the keyboard would cover Send); a mouse keeps the description.
+            if ( coarse ) assert.deepEqual([focused.text, focused.inDialog], [false, true], `focus is in the dialog on a non-text element (${JSON.stringify(focused)})`);
+            else assert.equal(focused.id, 'ezil-feedback-description', 'focus moves into the dialog');
         });
 
         await check(`${tag}: the preview is byte-for-byte the request body; JSON content-type; 201 shows thanks`, async () => {
-            await description.fill('[synthetic r3] browser test report');
-            assert.equal(await page.locator('button[type="submit"]').isDisabled(), true);
-            for (const [name, value] of Object.entries({ activity: 'Opening a project', steps: '1. Click Browser', expected: 'Desktop opens', actual: 'Spinner stays' })) await page.locator(`[name="${name}"]`).fill(value);
-            await page.locator('[name="reproducibility"]').selectOption({ label: 'Every time' });
-            await page.locator('[name="impact"]').selectOption({ label: 'Blocked' });
+            assert.equal(await page.locator('button[type="submit"]').isDisabled(), false, 'a blank report is sendable: nothing is required');
+            assert.equal(await page.locator('[name="category"], [name="steps"], select').count(), 0, 'one description, no questionnaire');
+            assert.equal(await page.locator('input[name="diagnostics"]').isChecked(), true, 'diagnostics are selected by default');
+            // The always-visible server-context notice does not depend on the diagnostics checkbox.
+            const contextNote = page.locator('[data-role="server-context-note"]');
+            assert.equal(await contextNote.isVisible(), true, 'the server-context notice is visible with diagnostics on');
+            await page.locator('input[name="diagnostics"]').uncheck();
+            assert.equal(await contextNote.isVisible(), true, 'and with diagnostics off (the unchecked opt-out)');
             await page.locator('input[name="diagnostics"]').check();
+            await description.fill('[synthetic r3] browser test report');
             await page.locator('.ezil-feedback-preview summary').click();
             const shown = await preview();
             await page.locator('button[type="submit"]').click();
@@ -217,7 +236,8 @@ try {
             assert.match(posts[0].contentType, /^application\/json/);
             const sent = JSON.parse(posts[0].body);
             assert.equal(sent.computerId, COMPUTER);
-            assert.match(sent.description, /Steps to reproduce\n1. Click Browser/);
+            assert.equal(sent.description, '[synthetic r3] browser test report');
+            assert.equal(sent.category, 'bug');
             assert.ok(sent.diagnostics.session.pageAgeMs >= 0);
             assert.equal(sent.screenshot, null);
             assert.equal(sent.diagnostics.fullbleed, true, 'sent from the full-bleed desktop');
@@ -230,12 +250,11 @@ try {
 
         for ( const [code, copy] of [
             [429, "You've sent several reports this hour — try again later."],
-            [413, 'This report is too large. Remove the screenshot and try again.'],
+            [413, 'This report is too large. Remove a screenshot and try again.'],
             [415, 'This page could not send the report. Reload EZiL OS and try again.'],
         ] ) await check(`${tag}: ${code} keeps the text, says so and is not retried`, async () => {
             reply = () => ({ status: code, body: { error: 'x' } });
             await openByChip();
-            await page.locator('input[name="category"][value="idea"]').check();
             await description.fill(`[synthetic r3] refused ${code}`);
             await page.locator('button[type="submit"]').click();
             await status.filter({ hasText: copy }).waitFor();
@@ -252,7 +271,6 @@ try {
         await check(`${tag}: the draft survives closing the dialog (Escape) and keeps its request id`, async () => {
             reply = () => ({ status: 201, body: { id: REPORT, screenshotAccepted: false } });
             await openByChip();
-            await page.locator('input[name="category"][value="idea"]').check();
             await description.fill('[synthetic r3] half-written');
             const id = JSON.parse(await preview()).clientRequestId;
             await page.keyboard.press('Escape');
@@ -289,14 +307,18 @@ try {
             posts.length = 0;
         });
 
-        await check(`${tag}: screenshot file is reviewed, redacted, cropped and sent only after Submit`, async () => {
+        await check(`${tag}: uploaded and pasted screenshots are reviewed, ordered, redacted and sent only after Submit`, async () => {
             await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = true; });
             await openByChip();
-            await page.locator('input[name="category"][value="idea"]').check();
             await description.fill('[synthetic] screenshot attachment');
-            assert.equal(await page.locator('input[name="screenshot"]').isChecked(), false);
-            assert.equal(await page.locator('input[name="diagnostics"]').isChecked(), false);
-            await page.locator('input[name="screenshot"]').check();
+            assert.equal(await page.locator('input[name="screenshot"]').isChecked(), true, 'the screenshot is selected by default');
+            assert.equal(await page.locator('input[name="diagnostics"]').isChecked(), true, 'diagnostics are selected by default');
+            await page.locator('input[name="diagnostics"]').uncheck();
+            // Isolate the one file: remove the default window snapshot first (several images may be attached).
+            await page.locator('.ezil-feedback-image').waitFor({ state: 'visible', timeout: 20_000 });
+            await page.locator('[data-action="remove-screenshot"]').click();
+            await page.locator('.ezil-feedback-image').waitFor({ state: 'hidden' });
+            await page.locator('.ezil-feedback-capture-options summary').click();
             const encoded = await page.evaluate(() => {
                 const c = document.createElement('canvas'); c.width = 120; c.height = 80;
                 const ctx = c.getContext('2d'); ctx.fillStyle = '#3366cc'; ctx.fillRect(0, 0, 120, 80);
@@ -329,16 +351,135 @@ try {
             assert.ok(pixels.corner[2] > 100, 'unredacted pixels remain');
             assert.equal(posts.length, 0, 'editing an image sends nothing');
             assert.doesNotMatch(await preview(), /test-private-name/);
+            // A real browser paste opens the real editor and appends a second, distinct image.
+            const pasteConsumed = await page.evaluate(async () => {
+                const canvas = document.createElement('canvas'); canvas.width = 32; canvas.height = 24;
+                const ctx = canvas.getContext('2d'); ctx.fillStyle = '#00cc33'; ctx.fillRect(0, 0, 32, 24);
+                const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+                const data = new DataTransfer(); data.items.add(new File([blob], 'pasted-private-name.png', { type: 'image/png' }));
+                const event = new ClipboardEvent('paste', { bubbles: true, cancelable: true, clipboardData: data });
+                document.querySelector('#ezil-feedback-description').dispatchEvent(event);
+                return event.defaultPrevented;
+            });
+            assert.equal(pasteConsumed, true, 'the form handles the image paste without reading the system clipboard');
+            await editor.waitFor({ state: 'visible' });
+            assert.equal(posts.length, 0, 'pasting and reviewing sends nothing');
+            await editor.locator('[data-action="confirm"]').click();
+            await editor.waitFor({ state: 'detached' });
+            const multiple = JSON.parse(await preview());
+            assert.equal(multiple.screenshot, null);
+            assert.equal(multiple.screenshots.length, 2);
+            assert.deepEqual(multiple.screenshots[0], attached, 'the edited first image retains its exact send order');
+            assert.notEqual(multiple.screenshots[1].dataBase64, attached.dataBase64);
+            assert.equal(await page.locator('[data-role="images"] > li').count(), 2);
+            assert.doesNotMatch(await preview(), /test-private-name|pasted-private-name/);
             const finalPreview = await preview();
-            reply = () => ({ status: 201, body: { id: REPORT, screenshotAccepted: true } });
+            reply = () => ({ status: 201, body: { id: REPORT, screenshotAccepted: true, screenshotCount: 2 } });
             await page.locator('button[type="submit"]').click();
             await status.filter({ hasText: 'Thanks — we got it' }).waitFor();
             assert.equal(posts.length, 1); assert.equal(posts[0].body, finalPreview);
             assert.equal(JSON.parse(posts[0].body).diagnostics, null);
             await closeDialog(); posts.length = 0;
             await openByChip();
-            assert.equal(await page.locator('input[name="screenshot"]').isChecked(), false, 'image consent is never remembered');
+            assert.equal(await page.locator('input[name="screenshot"]').isChecked(), true, 'every form starts from the defaults: the choice is not remembered');
             await closeDialog();
+            await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = false; });
+        });
+
+        await check(`${tag}: screenshots on — the default masked window snapshot is attached, Send stays on screen, and one tap sends a blank report`, async () => {
+            await page.evaluate(() => {
+                window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = true;
+                // Any browser capture picker would call this; the default capture must not.
+                window.__pickerCalls = 0;
+                if ( navigator.mediaDevices ) navigator.mediaDevices.getDisplayMedia = () => { window.__pickerCalls++; return Promise.reject(new Error('picker')); };
+            });
+            reply = () => ({ status: 201, body: { id: REPORT, screenshotAccepted: true } });
+            posts.length = 0;
+            await openByChip();
+            await page.locator('.ezil-feedback-image').waitFor({ state: 'visible', timeout: 20_000 });
+            assert.equal(posts.length, 0, 'nothing uploads until Send');
+            assert.equal(await page.evaluate(() => window.__pickerCalls), 0, 'no permission prompt or picker');
+            assert.equal(await page.locator('input[name="screenshot"]').isChecked(), true);
+            // The full-bleed Browser's page is an embedded frame filling the window: the snapshot is still attached
+            // (shell overlays above the frame survive) with the one note that offers a real capture.
+            assert.match(await page.locator('[data-role="capture-note"]').textContent(), /^To include the open app, /,
+                'the capture worked; one note offers a real capture (the scope line below states the limit)');
+            if ( coarse ) assert.equal(await page.evaluate(() => !! document.activeElement?.matches('input, textarea, select, [contenteditable]')), false, 'no text field has focus: no on-screen keyboard over Send');
+            // Honest scope next to the thumbnail: the shell window only, never the embedded app; long text stays collapsed.
+            assert.equal(await page.locator('[data-role="capture-scope"]').isVisible(), true);
+            assert.match(await page.locator('[data-role="capture-scope-text"]').textContent(), /Embedded app not captured.*EZiL OS window only/);
+            assert.equal(await page.locator('.ezil-feedback-details').evaluate(el => el.open), false, 'diagnostics details start collapsed');
+            assert.equal(await page.locator('[data-role="server-context-note"]').isVisible(), true, 'the short server-context notice stays visible');
+            // Layout: the modal fits the viewport and, in its default state with the screenshot attached, needs no scrolling at all.
+            const fit = await page.evaluate(() => {
+                const d = document.querySelector('dialog.ezil-feedback-dialog');
+                const box = el => { const r = el.getBoundingClientRect(); return { top: r.top, bottom: r.bottom, left: r.left, right: r.right }; };
+                const inside = el => { const r = el.getBoundingClientRect(), m = d.getBoundingClientRect(); return r.top >= m.top - 0.5 && r.bottom <= m.bottom + 0.5 && r.left >= m.left - 0.5 && r.right <= m.right + 0.5; };
+                const key = ['#ezil-feedback-description', 'input[name="diagnostics"]', 'input[name="screenshot"]', '[data-role="capture-scope"]', '.ezil-feedback-image img', 'button[type="submit"]'];
+                return { dialog: box(d), vw: innerWidth, vh: innerHeight, scrollHeight: d.scrollHeight, clientHeight: d.clientHeight, scrollTop: d.scrollTop,
+                    pageScroll: document.scrollingElement.scrollTop, rows: document.querySelector('#ezil-feedback-description').rows,
+                    parts: [...d.querySelectorAll('h2, .ezil-feedback-fields > *, .ezil-feedback-capture > *, .ezil-feedback-preview, .ezil-feedback-footer')]
+                        .map(el => `${el.tagName.toLowerCase()}.${el.dataset.role || el.className || el.id || el.name || ''}:${Math.round(el.getBoundingClientRect().height)}`),
+                    outside: key.filter(selector => { const el = d.querySelector(selector); return ! el || ! inside(el); }) };
+            });
+            assert.ok(fit.dialog.top >= 0 && fit.dialog.left >= 0 && fit.dialog.bottom <= fit.vh && fit.dialog.right <= fit.vw, `the modal fits the viewport (${JSON.stringify(fit)})`);
+            assert.ok(fit.scrollHeight <= fit.clientHeight + 1, `no initial scroll: all content fits (${fit.scrollHeight} > ${fit.clientHeight}; ${fit.parts.join(' ')})`);
+            assert.deepEqual([fit.scrollTop, fit.pageScroll], [0, 0], 'nothing scrolled');
+            assert.ok(fit.rows <= 3, 'a compact comment box');
+            assert.deepEqual(fit.outside, [], 'every key control is inside the modal');
+            // Primary action: fully inside the viewport and hit-testable without any scrolling.
+            const send = page.locator('button[type="submit"]');
+            const place = await send.evaluate(el => {
+                const r = el.getBoundingClientRect();
+                const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+                const dialog = el.closest('dialog');
+                return { x: r.x, y: r.y, width: r.width, height: r.height, hit: hit === el || el.contains(hit), scrolled: dialog.scrollTop,
+                    scrollable: dialog.scrollHeight > dialog.clientHeight, vw: innerWidth, vh: innerHeight };
+            });
+            assert.ok(place.x >= 0 && place.y >= 0 && place.x + place.width <= place.vw && place.y + place.height <= place.vh,
+                `Send is on screen without scrolling (${JSON.stringify(place)})`);
+            assert.equal(place.hit, true, 'Send receives the tap');
+            assert.equal(place.scrolled, 0);
+            if ( coarse ) assert.ok(place.height >= 44, `a 44px touch target (${place.height})`);
+            if ( touch ) await send.tap(); else await send.click();
+            await status.filter({ hasText: 'Thanks — we got it' }).waitFor();
+            assert.equal(posts.length, 1);
+            const sent = JSON.parse(posts[0].body);
+            assert.equal(sent.description, '', 'a blank description is sent as is');
+            assert.equal(sent.category, 'bug');
+            assert.ok(sent.diagnostics?.session, 'diagnostics attached');
+            assert.ok(['image/webp', 'image/jpeg'].includes(sent.screenshot?.contentType), 'screenshot attached');
+            const size = await page.evaluate(async image => {
+                const bytes = Uint8Array.from(atob(image.dataBase64), c => c.charCodeAt(0));
+                const bitmap = await createImageBitmap(new Blob([bytes], { type: image.contentType }));
+                const result = { width: bitmap.width, height: bitmap.height, bytes: bytes.length };
+                bitmap.close(); return result;
+            }, sent.screenshot);
+            assert.ok(size.width > 0 && size.height > 0 && Math.max(size.width, size.height) <= 1920 && size.bytes <= 1.5 * 1024 * 1024, `bounded image ${JSON.stringify(size)}`);
+            assert.equal(await page.evaluate(() => window.__pickerCalls), 0);
+            await closeDialog(); posts.length = 0;
+            await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = false; });
+        });
+
+        await check(`${tag}: unchecking both options sends neither: the real POST carries no diagnostics and no image`, async () => {
+            await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = true; });
+            reply = () => ({ status: 201, body: { id: REPORT, screenshotAccepted: false } });
+            posts.length = 0;
+            await openByChip();
+            await page.locator('.ezil-feedback-image').waitFor({ state: 'visible', timeout: 20_000 });
+            await page.locator('input[name="diagnostics"]').uncheck();
+            await page.locator('input[name="screenshot"]').uncheck();
+            const shown = await preview();
+            assert.equal(JSON.parse(shown).diagnostics, null);
+            assert.equal(JSON.parse(shown).screenshot, null);
+            const send = page.locator('button[type="submit"]');
+            if ( touch ) await send.tap(); else await send.click();
+            await status.filter({ hasText: 'Thanks — we got it' }).waitFor();
+            assert.equal(posts.length, 1);
+            assert.equal(posts[0].body, shown, 'the preview is the POST body');
+            const sent = JSON.parse(posts[0].body);
+            assert.deepEqual([sent.diagnostics, sent.screenshot, sent.description, sent.category], [null, null, '', 'bug']);
+            await closeDialog(); posts.length = 0;
             await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = false; });
         });
 

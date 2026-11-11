@@ -1,23 +1,45 @@
-// feedback.js — EZiL-authored. Explicit consent, preview, then one submission.
+// feedback.js — EZiL-authored. One optional description; diagnostics and a window screenshot are
+// selected by default (each can be switched off), previewable, and uploaded only on Send.
 // Wire/API signatures are pinned in docs/FEEDBACK-CONTROLS-CONTRACT.md.
 import { app_failure_diagnostics_accepted, build_diagnostics } from './diagnostics.js';
 import { scan } from './secret-scan.js';
 import { capture_shell_snapshot, tab_capture_supported, capture_tab_frame, capture_desktop_frame, desktop_capture_supported } from './capture.js';
-import { open_redact_editor } from './redact-editor.js';
+import { encode_under_limit, open_redact_editor } from './redact-editor.js';
 import { uploaded_image_canvas } from './image-file.js';
 import { currentComputer } from '../../session.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true">'
     + '<path d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-6 4V6a2 2 0 0 1 2-2Z"/><path d="M7 9h10M7 13h7"/></svg>';
-const CATEGORIES = ['bug', 'idea', 'other'];
-const BUG_FIELDS = [['activity', 'What were you doing?'], ['steps', 'Steps to reproduce'],
-    ['expected', 'Expected result'], ['actual', 'Actual result']];
-function report_text(category, description, bug = {}) {
-    if (category !== 'bug' || !Object.values(bug).some(Boolean)) return description;
-    return [['Summary / context', description], ...BUG_FIELDS.map(([key, title]) => [title, bug[key]]),
-        ['Reproducibility', bug.reproducibility], ['Impact', bug.impact]]
-        .map(([title, value]) => `${title}\n${String(value || '').trim()}`).join('\n\n');
+// The form is one optional description. The category is fixed to 'bug' (the
+// schema still requires one). Drafts saved by the earlier structured bug form
+// keep their text: it is folded into the description.
+const CATEGORY = 'bug';
+const LEGACY_BUG_FIELDS = [['activity', 'What were you doing?'], ['steps', 'Steps to reproduce'],
+    ['expected', 'Expected result'], ['actual', 'Actual result'], ['reproducibility', 'Reproducibility'], ['impact', 'Impact']];
+const DESCRIPTION_MAX = 4000;
+const IMAGE_BYTES_MAX = Math.floor(1.5 * 1024 * 1024);
+const IMAGE_SIDE_MAX = 4096;
+const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
+// Keep in sync with app/src/server/feedback/types.ts FEEDBACK_LIMITS.imagesMax / imagesBytesTotal. The
+// server advertises its image count as `ui.feedbackScreenshotsMax`; a server that does not keeps one image.
+const IMAGES_MAX_SUPPORTED = 5;
+const IMAGES_BYTES_TOTAL = Math.floor(1.75 * 1024 * 1024);
+/** Above this share of the viewport masked as embedded app, the default snapshot carries a note offering a real capture. */
+const EMBEDDED_COVERAGE_MAX = 0.1;
+/** "1.5 MiB", "820 KiB" (the editor words its limit the same way). */
+const format_bytes = bytes => bytes >= 1024 * 1024 ? `${Math.round(bytes / (1024 * 1024) * 100) / 100} MiB` : `${Math.max(1, Math.round(bytes / 1024))} KiB`;
+/** Decoded size of a base64 image. */
+const base64_bytes = data => Math.floor(data.length * 3 / 4) - (data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0);
+/** How long Send waits for the default screenshot before sending without it. */
+export const AUTO_CAPTURE_WAIT_MS = 3000;
+/** The default screenshot is abandoned (never blocking) after this long. */
+const AUTO_CAPTURE_TIMEOUT_MS = 10_000;
+function legacy_text (description, bug) {
+    const parts = LEGACY_BUG_FIELDS.map(([key, title]) => [title, String(bug?.[key] ?? '').trim()]).filter(([, value]) => value);
+    if ( ! parts.length ) return description;
+    return [description.trim() ? ['Summary / context', description.trim()] : null, ...parts]
+        .filter(Boolean).map(([title, value]) => `${title}\n${value}`).join('\n\n');
 }
 const DRAFT_KEY = 'ezil:feedback:draft:v1:';
 const OUTBOX_KEY = 'ezil:feedback:outbox:v1:';
@@ -94,15 +116,17 @@ function write_json (prefix, value) {
 function read_draft () {
     const d = read_json(DRAFT_KEY);
     if ( ! d || typeof d !== 'object' || typeof d.clientRequestId !== 'string' || ! UUID.test(d.clientRequestId) ) return null;
-    return { clientRequestId: d.clientRequestId, category: CATEGORIES.includes(d.category) ? d.category : 'bug',
-        description: typeof d.description === 'string' ? d.description : '',
-        bug: Object.fromEntries([...BUG_FIELDS.map(([key]) => key), 'reproducibility', 'impact']
-            .map(key => [key, typeof d.bug?.[key] === 'string' ? d.bug[key] : ''])) };
+    const text = typeof d.description === 'string' ? d.description : '';
+    return { clientRequestId: d.clientRequestId, category: CATEGORY,
+        // Never truncated: an over-long migrated draft stays whole and the Send guard asks to shorten it.
+        description: d.bug && typeof d.bug === 'object' ? legacy_text(text, d.bug) : text };
 }
 
 /** @param {{clientRequestId:string,category:string,description:string}|null} draft */
-function write_draft (draft) {
-    write_json(DRAFT_KEY, draft && (draft.description.trim() || Object.values(draft.bug || {}).some(Boolean)) ? draft : null);
+function write_draft (draft, keepBlank = false) {
+    // A blank draft is kept only while its report is queued: reopening must resume that same request.
+    write_json(DRAFT_KEY, draft && (keepBlank || draft.description.trim())
+        ? { clientRequestId: draft.clientRequestId, category: CATEGORY, description: draft.description } : null);
 }
 
 function read_outbox () {
@@ -222,8 +246,9 @@ async function deliver (clientRequestId, body) {
         if ( ! read_draft() ) {
             try {
                 const sent = JSON.parse(body);
-                write_draft(savedDraft || { clientRequestId, category: CATEGORIES.includes(sent.category) ? sent.category : 'bug',
-                    description: String(sent.description ?? '').slice(0, 4000) });
+                const saved = savedDraft && typeof savedDraft === 'object'
+                    ? { ...savedDraft, description: legacy_text(String(savedDraft.description ?? ''), savedDraft.bug) } : null;
+                write_draft(saved || { clientRequestId, description: String(sent.description ?? '').slice(0, DESCRIPTION_MAX) });
             } catch { /* An unreadable body has nothing to restore. */ }
         }
     }
@@ -394,9 +419,9 @@ function read_blob (blob, signal) {
 
 function error_copy (status) {
     if ( status === 429 ) return "You've sent several reports this hour — try again later.";
-    if ( status === 413 ) return 'This report is too large. Remove the screenshot and try again.';
+    if ( status === 413 ) return 'This report is too large. Remove a screenshot and try again.';
     if ( status === 415 ) return 'This page could not send the report. Reload EZiL OS and try again.';
-    if ( status === 400 ) return 'This report could not be accepted. Check the description or remove the screenshot and try again.';
+    if ( status === 400 ) return 'This report could not be accepted. Check the description or remove a screenshot and try again.';
     if ( status === 401 ) return 'Your session expired — sign in again to send feedback.';
     if ( status === 404 ) return 'Feedback is not available in this deployment right now.';
     return 'Could not send feedback. Check your connection and try again.';
@@ -420,59 +445,64 @@ export function open_feedback_dialog (_opts) {
     const hasAppContext = typeof trusted?.computerId === 'string' && UUID.test(trusted.computerId)
         && typeof trusted.appSession === 'string' && trusted.appSession.length > 0;
     const computer = hasAppContext ? trusted.computerId : currentComputer()?.id;
-    const computerId = typeof computer === 'string' && UUID.test(computer) ? computer : null;
+    let computerId = typeof computer === 'string' && UUID.test(computer) ? computer : null;
     const appContext = Object.freeze({ computerId, ...(hasAppContext ? { appSession: trusted.appSession } : {}) });
     const screenshots = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackScreenshots === true;
+    const advertisedMax = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackScreenshotsMax;
+    /** Images this report may carry: 1 unless the server advertises more. With one, a new image replaces the old. */
+    const imagesMax = Number.isInteger(advertisedMax) && advertisedMax >= 1 ? Math.min(advertisedMax, IMAGES_MAX_SUPPORTED) : 1;
+    const imagesBytesTotal = imagesMax > 1 ? IMAGES_BYTES_TOTAL : IMAGE_BYTES_MAX;
+    // On a touch device the first focus must not land in a text field: that raises the on-screen keyboard over
+    // Send. The heading takes it (showModal honours `autofocus`); a fine pointer keeps the description focused.
+    const touchPrimary = window.matchMedia?.('(pointer: coarse)')?.matches === true;
     const dialog = document.createElement('dialog');
     dialog.className = 'ezil-feedback-dialog';
     dialog.setAttribute('aria-labelledby', 'ezil-feedback-heading');
     dialog.innerHTML = `
-        <h2 id="ezil-feedback-heading">Send feedback</h2>
+        <h2 id="ezil-feedback-heading" tabindex="-1"${touchPrimary ? ' autofocus' : ''}>Send feedback</h2>
         <form>
             <fieldset class="ezil-feedback-fields">
-                <fieldset class="ezil-feedback-category"><legend>Category</legend>
-                    <label><input type="radio" name="category" value="bug" checked> Bug</label>
-                    <label><input type="radio" name="category" value="idea"> Idea</label>
-                    <label><input type="radio" name="category" value="other"> Other</label>
-                </fieldset>
-                <label for="ezil-feedback-description">Description</label>
-                <textarea id="ezil-feedback-description" name="description" required maxlength="4000" rows="6"
-                    aria-describedby="ezil-feedback-counter ezil-feedback-warning" autofocus></textarea>
-                <section class="ezil-feedback-bug" aria-label="Bug details">
-                    <p class="ezil-feedback-muted">Help us reproduce this bug. Do not include passwords or private data.</p>
-                    ${BUG_FIELDS.map(([key, title]) => `<label for="feedback-${key}">${title}</label><textarea id="feedback-${key}" name="${key}" rows="2" maxlength="4000"></textarea>`).join('')}
-                    <label>Reproducibility <select name="reproducibility"><option value="">Choose…</option><option>Every time</option><option>Sometimes</option><option>Once</option><option>Not sure</option></select></label>
-                    <label>Impact <select name="impact"><option value="">Choose…</option><option>Blocked</option><option>Workaround available</option><option>Minor issue</option></select></label>
-                </section>
+                <label for="ezil-feedback-description">Description (optional)</label>
+                <textarea id="ezil-feedback-description" name="description" maxlength="4000" rows="3"${screenshots ? ' placeholder="You can paste screenshots here too."' : ''}
+                    aria-describedby="ezil-feedback-counter ezil-feedback-warning"${touchPrimary ? '' : ' autofocus'}></textarea>
                 <p id="ezil-feedback-counter" class="ezil-feedback-muted" aria-live="polite"></p>
                 <p id="ezil-feedback-warning" class="ezil-feedback-warning" role="status" hidden></p>
-                <label class="ezil-feedback-consent"><input type="checkbox" name="diagnostics"> Include diagnostics</label>
-                <p class="ezil-feedback-muted">Optional: a frozen snapshot of browser/OS, viewport, page age and time, online/network state, up to 50 recent machine-coded events and 24 app-open phases, and available failure references. No console text, URLs, cookies, form values or device logs. Nothing uploads until Send.</p>
-                <button type="button" data-action="refresh-diagnostics" hidden>Refresh diagnostic snapshot</button>
-                ${screenshots ? `<label class="ezil-feedback-consent"><input type="checkbox" name="screenshot"> Include a screenshot</label>
-                <section class="ezil-feedback-capture" hidden aria-label="Screenshot">
-                    <label class="ezil-feedback-upload">Attach a screenshot <input type="file" name="screenshotFile" accept="image/png,image/jpeg,image/webp"></label>
-                    <p class="ezil-feedback-muted">Choose a PNG, JPEG or WebP image (up to 8 MiB and 4096 pixels per side), or use a capture option. Crop and cover private areas before attaching. The EZiL window option masks embedded apps. Tab capture asks you to choose a surface.</p>
-                    ${!tab_capture_supported() ? '<p class="ezil-feedback-muted">This browser cannot capture a tab. Attach a screenshot from your device to include embedded app content.</p>' : ''}
-                    <div class="ezil-feedback-actions">
-                        <button type="button" data-capture="shell">Capture EZiL OS window</button>
-                        ${tab_capture_supported() ? '<button type="button" data-capture="tab">Capture what I see</button>' : ''}
-                        ${desktop_capture_supported() ? '<button type="button" data-capture="desktop">Capture the desktop</button>' : ''}
-                    </div>
+                <p class="ezil-feedback-muted" data-role="context-line" aria-live="polite" hidden></p>
+                <label class="ezil-feedback-consent"><input type="checkbox" name="diagnostics" checked> Include diagnostics <small class="ezil-feedback-muted" data-role="server-context-note">With diagnostics on, EZiL also adds a small computer-state summary when you send (not shown in the preview).</small></label>
+                <details class="ezil-feedback-details"><summary>What diagnostics include</summary>
+                    <p class="ezil-feedback-muted">A frozen snapshot of browser/OS, viewport, page age, network state and recent machine-coded events. No console text, URLs, cookies or form values. Nothing uploads until Send.</p>
+                    <p class="ezil-feedback-muted" data-role="server-context-detail">The server-added summary, when you send with diagnostics on, covers where your computer runs and its state, any move or reserved capacity in progress, and how many of your other computers use AWS. Only categories and counts, never addresses, IDs or anyone else's data. It is added after you press Send, so it is not in the preview below.</p>
+                    <button type="button" data-action="refresh-diagnostics">Refresh diagnostic snapshot</button>
+                </details>
+                ${screenshots ? `<label class="ezil-feedback-consent"><input type="checkbox" name="screenshot" checked> ${imagesMax > 1 ? 'Include screenshots' : 'Include a screenshot'}</label>
+                <section class="ezil-feedback-capture" aria-label="${imagesMax > 1 ? 'Screenshots' : 'Screenshot'}">
+                    <p class="ezil-feedback-muted" data-role="capture-note" role="status" aria-live="polite"></p>
+                    <p class="ezil-feedback-muted" data-role="capture-scope"><span data-role="capture-scope-text"></span>${tab_capture_supported() ? ' <button type="button" class="ezil-feedback-link" data-capture="tab">Capture what I see</button>' : ''}
+                        <label class="ezil-feedback-link ezil-feedback-upload">${imagesMax > 1 ? 'Attach images' : 'Attach an image'}<input type="file" name="screenshotFile" accept="image/png,image/jpeg,image/webp"${imagesMax > 1 ? ' multiple' : ''}></label></p>
                     <div class="ezil-feedback-image" hidden>
-                        <img alt="Screenshot to include with this report">
-                        <button type="button" data-capture="edit">Edit / crop / redact</button>
-                        <button type="button" data-action="remove-screenshot">Remove screenshot</button>
+                        <p class="ezil-feedback-muted" data-role="images-heading"></p>
+                        <ol class="ezil-feedback-images" data-role="images"></ol>
                     </div>
+                    <details class="ezil-feedback-capture-options"><summary>More capture options</summary>
+                        <p class="ezil-feedback-muted">You can also paste a screenshot into this form (Ctrl+V or ⌘V); each one opens in the editor first. PNG, JPEG or WebP, up to 8 MiB each. ${imagesMax > 1 ? `Up to ${imagesMax} images, ${format_bytes(imagesBytesTotal)} in all after editing.` : `One image, up to ${format_bytes(IMAGE_BYTES_MAX)} after editing.`} The EZiL OS window option cannot show embedded apps: they appear as grey boxes. "Capture what I see" asks you to choose a tab or screen; crop and cover private areas before attaching.</p>
+                        ${!tab_capture_supported() ? '<p class="ezil-feedback-muted">This browser cannot capture a tab. Attach or paste a screenshot from your device to include embedded app content.</p>' : ''}
+                        <div class="ezil-feedback-actions">
+                            <button type="button" data-capture="shell">Capture EZiL OS window (without embedded apps)</button>
+                            ${desktop_capture_supported() ? '<button type="button" data-capture="desktop">Capture the desktop</button>' : ''}
+                        </div>
+                    </details>
                 </section>` : '<p class="ezil-feedback-muted">Screenshots are not available here yet. Describe the visible error in your report.</p>'}
             </fieldset>
             <details class="ezil-feedback-preview"><summary>Preview exactly what will be sent</summary><pre></pre>
                 <p class="ezil-feedback-muted" data-role="app-failure-context" hidden></p>
-                <p class="ezil-feedback-muted">Your report includes its time, reference number and the version of EZiL OS. Technical details and screenshots are included only when you choose them.</p></details>
-            <p class="ezil-feedback-result" role="status" aria-live="polite"></p>
-            <div class="ezil-feedback-actions">
-                <button type="button" data-action="cancel">Cancel</button>
-                <button type="submit">Send feedback</button>
+                <p class="ezil-feedback-muted">Your report includes its time, reference number and the version of EZiL OS. Technical details and screenshots are included only while they are selected.</p>
+                <p class="ezil-feedback-muted" data-role="server-context-preview-note">This preview is what your browser sends. With diagnostics on, the server-added summary of your computer's state is attached when the report is stored, so it does not appear here.</p></details>
+            <div class="ezil-feedback-footer">
+                <p class="ezil-feedback-result" role="status" aria-live="polite"></p>
+                <div class="ezil-feedback-actions">
+                    <button type="button" data-action="cancel">Cancel</button>
+                    <button type="submit">Send feedback</button>
+                </div>
             </div>
         </form>`;
     document.body.append(dialog);
@@ -483,14 +513,28 @@ export function open_feedback_dialog (_opts) {
     const diagnostics = form.elements.diagnostics;
     const screenshotConsent = form.elements.screenshot;
     const preview = dialog.querySelector('pre');
+    const previewBox = dialog.querySelector('.ezil-feedback-preview');
     const result = dialog.querySelector('.ezil-feedback-result');
     const submit = dialog.querySelector('[type="submit"]');
     const cancel = dialog.querySelector('[data-action="cancel"]');
-    let screenshot = null;
+    /**
+     * The images that Send will upload, in order: `{ key, contentType, dataBase64, bytes, source }`, where source is
+     * where it came from: 'window' (the masked EZiL OS window), 'tab', 'desktop', 'file', 'paste' or 'queued'.
+     * They live only in this form (never in the draft) until Send freezes them into the request body.
+     */
+    let images = [];
+    let imageKeys = 0;
     let diagnosticSnapshot = null;
     let appContextUnavailable = false;
     let attemptedBody = null;
-    const bug_values = () => Object.fromEntries([...BUG_FIELDS.map(([key]) => key), 'reproducibility', 'impact'].map(key => [key, form.elements[key].value]));
+    const capture_note = dialog.querySelector('[data-role="capture-note"]');
+    // The default screenshot runs in the background and never sets `capturing`,
+    // so it cannot block Send. It is settled (waited for briefly, then aborted)
+    // before the body is frozen, and a late result is discarded.
+    let autoPending = null;
+    let autoController = null;
+    let autoGeneration = 0;
+    let settling = false;
     let serialized = '';
     let sending = false;
     let sent = false;
@@ -499,25 +543,57 @@ export function open_feedback_dialog (_opts) {
     let closed = false;
     let restoreCapture = null;
     let captureController = null;
-    if ( draft ) {
-        description.value = draft.description;
-        for (const [key, value] of Object.entries(draft.bug || {})) form.elements[key].value = value;
-        for ( const radio of form.elements.category ) radio.checked = radio.value === draft.category;
+    if ( draft ) description.value = draft.description;
+    // A draft whose report is already queued (sent offline or after a server error) reopens as that same
+    // request: its diagnostics and screenshot come from the queued body, so a re-send stays byte-identical
+    // (same clientRequestId) instead of becoming a second report.
+    let restoredFromQueue = false;
+    let reportCategory = CATEGORY;
+    let queuedReplayBody = null;
+    let queuedReplayState = null;
+    let errorCode = null;
+    const queuedEntry = draft ? read_outbox().find(entry => entry.clientRequestId === clientRequestId) : null;
+    if ( queuedEntry ) {
+        try {
+            const queuedBody = JSON.parse(queuedEntry.body);
+            reportCategory = ['bug', 'idea', 'other'].includes(queuedBody.category) ? queuedBody.category : CATEGORY;
+            queuedReplayBody = queuedEntry.body;
+            // The queued request keeps the error line it was sent with.
+            const queuedCode = /(?:^|\n\n)Error code: ([a-z0-9_:-]{1,64})$/i.exec(String(queuedBody.description ?? ''))?.[1];
+            errorCode = typeof queuedCode === 'string' && /^[a-z0-9_:-]{1,64}$/i.test(queuedCode) && scan(queuedCode).length === 0 ? queuedCode : null;
+            // Show the text of the attempted request, rather than reformatting an older structured draft.
+            const queuedText = String(queuedBody.description ?? '');
+            description.value = errorCode ? queuedText.replace(/(?:^|\n\n)Error code: [a-z0-9_:-]{1,64}$/i, '') : queuedText;
+            // The queued request keeps the computer it was sent for, even if the current one changed since.
+            computerId = typeof queuedBody.computerId === 'string' && UUID.test(queuedBody.computerId) ? queuedBody.computerId : null;
+            diagnosticSnapshot = queuedBody.diagnostics ?? null;
+            diagnostics.checked = diagnosticSnapshot !== null;
+            if ( screenshotConsent ) {
+                const queuedImages = Array.isArray(queuedBody.screenshots) ? queuedBody.screenshots : queuedBody.screenshot ? [queuedBody.screenshot] : [];
+                screenshotConsent.checked = queuedImages.length > 0;
+                // The queued body is re-sent as it is, whatever this server now advertises.
+                images = queuedImages.map(image => ({ key: ++imageKeys, contentType: image.contentType, dataBase64: image.dataBase64,
+                    bytes: base64_bytes(String(image.dataBase64)), source: 'queued' }));
+            }
+            restoredFromQueue = true;
+        } catch { /* An unreadable queued body is treated as a new report. */ }
     }
-    if ( typeof _opts?.errorCode === 'string' && /^[a-z0-9_:-]{1,64}$/i.test(_opts.errorCode) ) {
-        // Opened from the opening screen's "Send feedback": name the error code so the report can be routed.
-        // Round 4: also with a saved draft (appended once, within the 4,000-character limit).
-        const line = `Error code: ${_opts.errorCode}`;
-        const text = description.value;
-        if ( ! text.trim() ) description.value = `${line}\n\n`;
-        else if ( ! text.split('\n').some(row => row.trim() === line) && text.trimEnd().length + line.length + 2 <= 4000 ) {
-            description.value = `${text.trimEnd()}\n\n${line}`;
-        }
-    }
+    // The opener's error code (trusted shell context, a bounded machine code that passes the secret scan) is shown
+    // as an observed fact and sent as a final "Error code:" line; it is not written into the comment box.
+    const valid_code = value => typeof value === 'string' && /^[a-z0-9_:-]{1,64}$/i.test(value) && scan(value).length === 0;
+    if ( ! restoredFromQueue ) errorCode = valid_code(_opts?.errorCode) ? _opts.errorCode : null;
+    // The description as sent: the comment, then the error line (once, even if an older draft already holds it).
+    const with_error_code = text => {
+        if ( ! errorCode ) return text;
+        const line = `Error code: ${errorCode}`;
+        if ( text.split('\n').some(row => row.trim() === line) ) return text;
+        return text.trim() ? `${text.trimEnd()}\n\n${line}` : line;
+    };
 
     function save_draft () {
         if ( sent || closed ) return;
-        write_draft({ clientRequestId, category: form.elements.category.value, description: description.value, bug: bug_values() });
+        write_draft({ clientRequestId, category: CATEGORY, description: description.value },
+            read_outbox().some(entry => entry.clientRequestId === clientRequestId));
     }
 
     function show_sent (data) {
@@ -526,8 +602,9 @@ export function open_feedback_dialog (_opts) {
         dialog.querySelector('.ezil-feedback-preview').hidden = true;
         submit.hidden = true;
         cancel.textContent = 'Close';
+        const sentImages = screenshotConsent?.checked ? images.length : 0;
         result.textContent = `Thanks — we got it. Report ID: ${data.id}.`
-            + (screenshot && data.screenshotAccepted === false ? " Your image wasn't stored." : '');
+            + (sentImages && data.screenshotAccepted === false ? (sentImages > 1 ? " Your images weren't stored." : " Your image wasn't stored.") : '');
         cancel.focus();
     }
     // A queued copy of THIS report went through on reconnect.
@@ -551,24 +628,47 @@ export function open_feedback_dialog (_opts) {
 
     function refresh () {
         if ( sending || sent || closed ) return;
-        const bug = form.elements.category.value === 'bug';
-        dialog.querySelector('.ezil-feedback-bug').hidden = !bug;
-        const values = bug_values();
-        for (const key of [...BUG_FIELDS.map(([key]) => key), 'reproducibility', 'impact']) form.elements[key].required = bug;
-        const text = report_text(form.elements.category.value, description.value, values);
-        const kinds = [...new Set(scan(text).map(match => match.kind))];
+        const comment = description.value;
+        const kinds = [...new Set(scan(comment).map(match => match.kind))];
         const warning = dialog.querySelector('.ezil-feedback-warning');
         warning.hidden = kinds.length === 0;
         warning.textContent = kinds.length
             ? 'This looks like a token / email address — remove it before sending? ' + kinds.join(', ') : '';
-        dialog.querySelector('#ezil-feedback-counter').textContent = `${text.length} / 4000 total characters${text.length > 4000 ? " — shorten the report; no sections will be truncated" : ""}`;
+        const text = with_error_code(comment);
+        // The character count only appears when it matters (near or over the limit), keeping the form short.
+        dialog.querySelector('#ezil-feedback-counter').textContent = text.length > DESCRIPTION_MAX - 1000
+            ? `${text.length} / ${DESCRIPTION_MAX} characters${text.length > DESCRIPTION_MAX ? ' — shorten the description' : ''}` : '';
         const imageSection = dialog.querySelector('.ezil-feedback-capture');
         if ( imageSection ) imageSection.hidden = ! screenshotConsent.checked;
-        const payload = { v: 1, clientRequestId, category: form.elements.category.value,
+        // One image keeps the original `screenshot` key (older servers and queued bodies); two or more use `screenshots`.
+        const chosen = screenshotConsent?.checked ? images.map(({ contentType, dataBase64 }) => ({ contentType, dataBase64 })) : [];
+        const body_of = () => ({ v: 1, clientRequestId, category: reportCategory,
             description: text, computerId,
             diagnostics: diagnostics.checked ? diagnosticSnapshot : null,
-            screenshot: screenshotConsent?.checked ? screenshot : null };
+            screenshot: chosen.length === 1 ? chosen[0] : null,
+            ...(chosen.length > 1 ? { screenshots: chosen } : {}) });
+        let payload = body_of();
+        // A snapshot too large for the wire limit is left out; it must never keep Send disabled.
+        if ( diagnostics.checked && new TextEncoder().encode(JSON.stringify({ ...payload, screenshot: null, screenshots: undefined }, null, 2)).length > 32 * 1024 ) {
+            diagnosticSnapshot = null;
+            diagnostics.checked = false;
+            result.textContent = 'Diagnostics were too large to include, so they were left out.';
+            payload = body_of();
+        }
         serialized = JSON.stringify(payload, null, 2);
+        if (queuedReplayBody !== null) {
+            // An old idea/other report and its original JSON layout are already an attempted request.
+            // Keep those exact wire bytes until the person actually changes the restored form state.
+            const state = JSON.stringify(payload);
+            if (queuedReplayState === null) queuedReplayState = state;
+            if (state === queuedReplayState) serialized = queuedReplayBody;
+            else {
+                queuedReplayBody = null;
+                reportCategory = CATEGORY;
+                payload = body_of();
+                serialized = JSON.stringify(payload, null, 2);
+            }
+        }
         const pendingBody = read_outbox().find(entry => entry.clientRequestId === clientRequestId)?.body ?? attemptedBody;
         if (pendingBody && pendingBody !== serialized) {
             // Edits are a new report; a later receipt for the old request must never hide them.
@@ -577,22 +677,132 @@ export function open_feedback_dialog (_opts) {
             payload.clientRequestId = clientRequestId;
             serialized = JSON.stringify(payload, null, 2);
         }
-        preview.textContent = serialized;
+        // With a default screenshot the body is ~2 MB of base64: render it only while the preview is open.
+        if ( previewBox.open ) preview.textContent = serialized;
         const appStatus = dialog.querySelector('[data-role="app-failure-context"]');
         appStatus.hidden = !diagnostics.checked || (!appContextUnavailable && !diagnosticSnapshot?.appFailures);
         const appEvents = diagnosticSnapshot?.appFailures || [];
         appStatus.textContent = appContextUnavailable ? 'App failure context is unavailable for this report.'
             : `${appEvents.length} app events (${appEvents.filter(event => event.outcome === 'cancelled').length} cancelled).`;
-        const diagnosticBytes = new TextEncoder().encode(JSON.stringify({ ...payload, screenshot: null }, null, 2)).length;
-        submit.disabled = capturing || ! description.value.trim() || text.length > 4000 || diagnosticBytes > 32 * 1024
-            || (bug && Object.values(values).some(value => !value.trim()));
+        render_scope();
+        render_context();
+        // A blank description is a valid report: only a running manual capture, the settle wait or an over-long text hold Send.
+        submit.disabled = capturing || settling || text.length > DESCRIPTION_MAX;
     }
 
-    function clear_screenshot () {
-        screenshot = null;
-        const image = dialog.querySelector('.ezil-feedback-image');
-        if ( image ) { image.hidden = true; image.querySelector('img').removeAttribute('src'); }
+    const SOURCE_SCOPE = { window: 'Embedded app not captured; this is the EZiL OS window only.',
+        tab: 'Captured from the browser surface you chose.', desktop: 'Captured from the desktop frame.',
+        file: 'Attached from your device.', paste: 'Pasted from your clipboard.', queued: 'The screenshot already queued with this report.' };
+    const SOURCE_LABEL = { window: 'EZiL OS window', tab: 'Screen capture', desktop: 'Desktop frame',
+        file: 'From your device', paste: 'Pasted', queued: 'Queued with this report' };
+
+    /** The honest scope of what is attached: the default is the masked EZiL OS window, never the embedded app. */
+    function render_scope () {
+        const text = dialog.querySelector('[data-role="capture-scope-text"]');
+        if ( ! text ) return;
+        text.textContent = ! images.length ? 'No screenshot attached. Embedded apps are never captured automatically.'
+            : images.length === 1 ? SOURCE_SCOPE[images[0].source] ?? 'Screenshot attached.'
+                : `${images.length} screenshots attached.${images.some(image => image.source === 'window') ? ' The EZiL OS window image does not show embedded apps.' : ''}`;
+        const heading = dialog.querySelector('[data-role="images-heading"]');
+        const used = images.reduce((sum, image) => sum + image.bytes, 0);
+        // Adding is offered while there is room; with one image allowed, a new one replaces it.
+        const full = ! can_add();
+        // One image: the thumbnail and the scope line say it all (compact on a phone).
+        heading.hidden = imagesMax === 1;
+        heading.textContent = imagesMax > 1
+            ? `${images.length} of ${imagesMax} images · ${format_bytes(used)} of ${format_bytes(imagesBytesTotal)}${full ? `. ${FULL_NOTE()}` : ''}`
+            : '';
+        for ( const button of dialog.querySelectorAll('[data-capture]:not([data-capture="edit"])') ) button.disabled = capturing || full;
+        if ( form.elements.screenshotFile ) form.elements.screenshotFile.disabled = capturing || full;
     }
+
+    /** One row per image: thumbnail, where it came from, its size, Edit and Remove. Rebuilt only when the images change. */
+    function render_images () {
+        const box = dialog.querySelector('.ezil-feedback-image');
+        if ( ! box ) return;
+        const list = box.querySelector('[data-role="images"]');
+        list.replaceChildren(...images.map((image, index) => {
+            const item = document.createElement('li');
+            item.dataset.key = String(image.key);
+            const img = document.createElement('img');
+            img.alt = images.length > 1 ? `Screenshot ${index + 1} to include with this report` : 'Screenshot to include with this report';
+            img.src = `data:${image.contentType};base64,${image.dataBase64}`;
+            const label = document.createElement('span');
+            label.className = 'ezil-feedback-muted';
+            label.textContent = `${images.length > 1 ? `${index + 1}. ` : ''}${SOURCE_LABEL[image.source] ?? 'Screenshot'} · ${format_bytes(image.bytes)}`;
+            const edit = document.createElement('button');
+            edit.type = 'button'; edit.dataset.capture = 'edit'; edit.textContent = 'Edit / crop / redact';
+            const remove = document.createElement('button');
+            remove.type = 'button'; remove.dataset.action = 'remove-screenshot';
+            remove.textContent = 'Remove';
+            remove.setAttribute('aria-label', images.length > 1 ? `Remove screenshot ${index + 1}` : 'Remove screenshot');
+            edit.disabled = capturing;
+            // Beside the thumbnail: its label (once there are several; one image is named by the scope line) over Edit and Remove.
+            const meta = document.createElement('div');
+            meta.className = 'ezil-feedback-image-meta';
+            const actions = document.createElement('div');
+            actions.append(edit, remove);
+            meta.append(...(images.length > 1 ? [label, actions] : [actions]));
+            item.append(img, meta);
+            return item;
+        }));
+        box.hidden = images.length === 0;
+    }
+
+    /** One line of facts the shell actually observed and will send: the computer and, with diagnostics on, the app and latest app failure. */
+    function render_context () {
+        const line = dialog.querySelector('[data-role="context-line"]');
+        const parts = [];
+        if ( errorCode ) parts.push(`error code ${errorCode}`);
+        const known = currentComputer();
+        if ( computerId && known?.id === computerId && typeof known.name === 'string' && known.name.trim() ) parts.push(`computer “${known.name.trim().slice(0, 40)}”`);
+        if ( diagnostics.checked && diagnosticSnapshot ) {
+            if ( typeof diagnosticSnapshot.traceApp === 'string' && diagnosticSnapshot.traceApp ) parts.push(`app ${diagnosticSnapshot.traceApp}`);
+            const failure = diagnosticSnapshot.appFailures?.[0];
+            if ( failure ) {
+                const words = [failure.operation, failure.code].map(word => String(word).replace(/_/g, ' ')).join(' — ');
+                parts.push(`latest app failure: ${words}${failure.outcome ? ` (${failure.outcome})` : ''}`);
+            }
+        }
+        line.hidden = ! parts.length;
+        line.textContent = parts.length ? `Noticed: ${parts.join(' · ')}` : '';
+    }
+
+    function clear_screenshot (key = null) {
+        images = key === null ? [] : images.filter(image => image.key !== key);
+        render_images();
+    }
+
+    /** Bytes still free for one image: what the report total leaves after the others, at most the per-image cap. */
+    function image_budget (replaceKey = null) {
+        const others = images.reduce((sum, image) => sum + (image.key === replaceKey ? 0 : image.bytes), 0);
+        return Math.min(IMAGE_BYTES_MAX, imagesBytesTotal - others);
+    }
+
+    /**
+     * Put an edited image in place of `replaceKey`, or add it (with one image allowed, it replaces the one there).
+     * The server refuses the same image twice in one report, so a duplicate of ANOTHER image is not taken: the
+     * images stay as they were and false is returned.
+     */
+    function put_image (image, replaceKey = null) {
+        if ( imagesMax > 1 && images.some(other => other.key !== replaceKey
+            && other.contentType === image.contentType && other.dataBase64 === image.dataBase64) ) return false;
+        const entry = { key: ++imageKeys, ...image };
+        const at = images.findIndex(existing => existing.key === replaceKey);
+        if ( at >= 0 ) images = images.map((existing, index) => index === at ? entry : existing);
+        else if ( imagesMax === 1 ) images = [entry];
+        else images = [...images, entry];
+        render_images();
+        return true;
+    }
+
+    /** Room for another image (one allowed: always, it replaces). */
+    function can_add () {
+        return imagesMax === 1 || (images.length < imagesMax && image_budget() >= 1024);
+    }
+    const FULL_NOTE = () => images.length >= imagesMax
+        ? `This report already has ${imagesMax} screenshots. Remove one to add another.`
+        : `These screenshots already use the ${format_bytes(imagesBytesTotal)} limit. Remove one, or crop it smaller, to add another.`;
 
     // Keep the native dialog open (and modal) while excluding it and its
     // backdrop from capture. FCAPTURE owns when to call the returned restore.
@@ -607,7 +817,11 @@ export function open_feedback_dialog (_opts) {
         return restore;
     }
 
-    async function finish_capture (capture, generation, signal) {
+    /**
+     * Every image passes the editor before it is attached. `replaceKey` names the image an edit replaces;
+     * otherwise the result is added. Its encoded size is bounded by what the report total leaves.
+     */
+    async function finish_capture (capture, generation, signal, source, replaceKey = null) {
         const current = () => ! closed && generation === captureGeneration && ! signal.aborted;
         try {
             const canvas = await capture;
@@ -615,24 +829,25 @@ export function open_feedback_dialog (_opts) {
             restoreCapture?.();
             if ( ! screenshotConsent.checked ) return;
             if ( ! canvas ) { result.textContent = 'No screenshot captured. You can try another capture option.'; return; }
-            const edited = await open_redact_editor(canvas, { signal });
+            // With one image allowed, the new one replaces the old, so the old one's bytes are free.
+            const limit = image_budget(replaceKey ?? (imagesMax === 1 ? images[0]?.key ?? null : null));
+            const edited = await open_redact_editor(canvas, { signal, limit });
             if ( ! current() ) return;
             if ( ! edited || ! screenshotConsent.checked ) {
                 result.textContent = '';
                 return;
             }
-            if ( ! ['image/png', 'image/jpeg', 'image/webp'].includes(edited.contentType)
-                || edited.blob.size === 0 || edited.blob.size > 1.5 * 1024 * 1024
-                || ! [edited.width, edited.height].every(n => Number.isInteger(n) && n > 0 && n <= 4096) ) {
+            if ( ! IMAGE_TYPES.includes(edited.contentType)
+                || edited.blob.size === 0 || edited.blob.size > limit
+                || ! [edited.width, edited.height].every(n => Number.isInteger(n) && n > 0 && n <= IMAGE_SIDE_MAX) ) {
                 result.textContent = 'The screenshot is too large or unsupported. Crop it further and try again.';
                 return;
             }
             const dataBase64 = await read_blob(edited.blob, signal);
             if ( ! current() || ! screenshotConsent.checked ) return;
-            screenshot = { contentType: edited.contentType, dataBase64 };
-            const image = dialog.querySelector('.ezil-feedback-image');
-            image.querySelector('img').src = `data:${screenshot.contentType};base64,${dataBase64}`;
-            image.hidden = false;
+            if ( ! put_image({ contentType: edited.contentType, dataBase64, bytes: edited.blob.size, source }, replaceKey) ) {
+                capture_note.textContent = 'This screenshot is already attached.';
+            }
             result.textContent = '';
         } catch {
             if ( current() ) result.textContent = 'Could not capture a screenshot. Try another capture option.';
@@ -641,57 +856,166 @@ export function open_feedback_dialog (_opts) {
         }
     }
 
-    for ( const button of dialog.querySelectorAll('[data-capture]') ) {
-        button.addEventListener('click', () => {
-            if ( capturing || sending || sent || closed || ! screenshotConsent.checked ) return;
-            capturing = true;
-            const generation = ++captureGeneration;
-            captureController = new AbortController();
-            const { signal } = captureController;
-            for ( const el of dialog.querySelectorAll('[data-capture]') ) el.disabled = true;
-            result.textContent = 'Preparing screenshot…';
-            refresh();
-            // No await before capture_tab_frame: preserve the click's browser
-            // activation for getDisplayMedia. All three paths use the editor.
-            let capture;
-            try {
-                if (button.dataset.capture === 'edit') {
-                    const img = dialog.querySelector('.ezil-feedback-image img');
-                    const canvas = document.createElement('canvas');
-                    canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
-                    canvas.getContext('2d').drawImage(img, 0, 0);
-                    capture = Promise.resolve(canvas.width && canvas.height ? canvas : null);
-                } else if ( button.dataset.capture === 'tab' ) capture = capture_tab_frame({ hide, signal });
-                else {
-                    hide();
-                    capture = button.dataset.capture === 'shell' ? capture_shell_snapshot({ signal }) : capture_desktop_frame({ signal });
-                }
-            } catch (error) { capture = Promise.reject(error); }
-            void finish_capture(capture, generation, signal);
-        });
-    }
-    form.elements.screenshotFile?.addEventListener('change', () => {
-        const input = form.elements.screenshotFile;
-        const file = input.files?.[0];
-        input.value = '';
-        if (!file || capturing || sending || sent || closed || !screenshotConsent.checked) return;
+    /** Start one capture or import: later results from an earlier one are discarded. A capture the person
+     * starts also ends a run of file imports still waiting their turn. */
+    let importRun = 0;
+    function begin_capture (fromImport = false) {
+        if ( ! fromImport ) ++importRun;
+        abort_auto();
+        capture_note.textContent = '';
         capturing = true;
         const generation = ++captureGeneration;
         captureController = new AbortController();
-        const { signal } = captureController;
-        for (const button of dialog.querySelectorAll('[data-capture]')) button.disabled = true;
-        input.disabled = true;
+        for ( const el of dialog.querySelectorAll('[data-capture]') ) el.disabled = true;
+        if ( form.elements.screenshotFile ) form.elements.screenshotFile.disabled = true;
         result.textContent = 'Preparing screenshot…';
         refresh();
-        void finish_capture(uploaded_image_canvas(file, { signal }), generation, signal);
+        return { generation, signal: captureController.signal };
+    }
+
+    /**
+     * Local image files (chosen or pasted), one after another, each through the editor. Nothing is read
+     * until a file is the next in line, and nothing uploads: the images join the report for Send.
+     */
+    async function import_files (files, source) {
+        const run = ++importRun;
+        let unsupported = false;
+        for ( const file of files ) {
+            if ( closed || run !== importRun || sending || sent || settling || ! screenshotConsent.checked ) return;
+            if ( ! can_add() ) { capture_note.textContent = FULL_NOTE(); return; }
+            if ( ! IMAGE_TYPES.includes(file.type) ) { unsupported = true; continue; }
+            const { generation, signal } = begin_capture(true);
+            await finish_capture(uploaded_image_canvas(file, { signal }), generation, signal, source);
+        }
+        if ( unsupported && ! closed && run === importRun ) capture_note.textContent = 'Only PNG, JPEG or WebP images can be added.';
+    }
+
+    const NO_AUTO_CAPTURE = 'No screenshot was captured automatically. Send still works, or add one below.';
+    // The scope line beside the thumbnail already says the embedded app is not in it; the note adds only the way to include it.
+    const EMBEDDED_NOTE = 'To include the open app, '
+        + (tab_capture_supported() ? 'use "Capture what I see", or paste or attach a screenshot.' : 'paste or attach a screenshot.');
+    let autoTimer = null;
+    function abort_auto () {
+        ++autoGeneration;
+        clearTimeout(autoTimer);
+        autoTimer = null;
+        autoController?.abort();
+        autoController = null;
+        autoPending = null;
+    }
+    /**
+     * Best-effort default screenshot: the masked EZiL OS window snapshot only (the
+     * same capability as "Capture EZiL OS window"; no picker, no permission, no other
+     * app). Encoded within the existing limits and attached without the editor, which
+     * stays one click away ("Edit / crop / redact"). Any failure leaves the report as is.
+     */
+    function start_auto_capture () {
+        if ( ! screenshotConsent?.checked || images.length || capturing || autoPending || closed || sent || sending ) return;
+        const generation = ++autoGeneration;
+        autoController = new AbortController();
+        const { signal } = autoController;
+        const current = () => ! closed && generation === autoGeneration && ! signal.aborted && screenshotConsent.checked;
+        capture_note.textContent = 'Capturing a screenshot of the EZiL OS window…';
+        autoTimer = setTimeout(() => {
+            if ( generation !== autoGeneration ) return;
+            abort_auto();
+            capture_note.textContent = NO_AUTO_CAPTURE;
+        }, AUTO_CAPTURE_TIMEOUT_MS);
+        autoPending = (async () => {
+            try {
+                const info = {};
+                const canvas = await capture_shell_snapshot({ signal, info });
+                if ( ! current() ) return;
+                // An embedded app (a cross-origin frame) can only be masked; shell overlays above it (an error or
+                // needs-operator panel) still show. When it fills much of the window, one note offers a real capture.
+                const embedded = canvas && info.frameCoverage > EMBEDDED_COVERAGE_MAX;
+                const fits = canvas?.width > 0 && canvas.height > 0 && canvas.width <= IMAGE_SIDE_MAX && canvas.height <= IMAGE_SIDE_MAX;
+                const blob = fits ? await encode_under_limit(canvas, IMAGE_BYTES_MAX, { signal }) : null;
+                if ( ! current() ) return;
+                if ( ! blob || blob.size === 0 || blob.size > IMAGE_BYTES_MAX || ! IMAGE_TYPES.includes(blob.type) ) {
+                    capture_note.textContent = NO_AUTO_CAPTURE;
+                    return;
+                }
+                const dataBase64 = await read_blob(blob, signal);
+                if ( ! current() || images.length ) return;
+                put_image({ contentType: blob.type, dataBase64, bytes: blob.size, source: 'window' });
+                capture_note.textContent = embedded ? EMBEDDED_NOTE : '';
+            } catch {
+                if ( current() ) capture_note.textContent = NO_AUTO_CAPTURE;
+            } finally {
+                if ( generation === autoGeneration ) {
+                    clearTimeout(autoTimer);
+                    autoTimer = null;
+                    autoController = null;
+                    autoPending = null;
+                    refresh();
+                }
+            }
+        })();
+    }
+
+    // Delegated: each image row has its own Edit and Remove. A click still starts tab capture in its own
+    // event dispatch, so the browser activation getDisplayMedia needs is preserved.
+    dialog.addEventListener('click', event => {
+        const button = event.target.closest?.('[data-capture], [data-action="remove-screenshot"]');
+        if ( ! button || ! dialog.contains(button) || button.disabled ) return;
+        const key = Number(button.closest('[data-key]')?.dataset.key) || null;
+        if ( button.dataset.action === 'remove-screenshot' ) {
+            abort_auto();
+            cancel_capture();
+            clear_screenshot(key);
+            capture_note.textContent = '';
+            refresh();
+            return;
+        }
+        if ( capturing || sending || sent || closed || settling || ! screenshotConsent.checked ) return;
+        const kind = button.dataset.capture;
+        const editing = kind === 'edit' ? images.find(image => image.key === key) ?? null : null;
+        if ( kind === 'edit' && ! editing ) return;
+        if ( kind !== 'edit' && ! can_add() ) { capture_note.textContent = FULL_NOTE(); return; }
+        const { generation, signal } = begin_capture();
+        // No await before capture_tab_frame: preserve the click's browser
+        // activation for getDisplayMedia. Every path uses the editor.
+        let capture;
+        try {
+            if ( editing ) {
+                const img = button.closest('li').querySelector('img');
+                const canvas = document.createElement('canvas');
+                canvas.width = img.naturalWidth; canvas.height = img.naturalHeight;
+                canvas.getContext('2d').drawImage(img, 0, 0);
+                capture = Promise.resolve(canvas.width && canvas.height ? canvas : null);
+            } else if ( kind === 'tab' ) capture = capture_tab_frame({ hide, signal });
+            else {
+                hide();
+                capture = kind === 'shell' ? capture_shell_snapshot({ signal }) : capture_desktop_frame({ signal });
+            }
+        } catch (error) { capture = Promise.reject(error); }
+        // An edit keeps where the image came from and its place; each capture names its own source.
+        void finish_capture(capture, generation, signal, editing ? editing.source : { shell: 'window', tab: 'tab', desktop: 'desktop' }[kind],
+            editing?.key ?? null);
     });
-    dialog.querySelector('[data-action="remove-screenshot"]')?.addEventListener('click', () => {
-        cancel_capture();
-        clear_screenshot();
-        refresh();
+    form.elements.screenshotFile?.addEventListener('change', () => {
+        const input = form.elements.screenshotFile;
+        const files = [...(input.files ?? [])].slice(0, imagesMax);
+        input.value = '';
+        if ( ! files.length || capturing || sending || sent || closed || settling || ! screenshotConsent.checked ) return;
+        void import_files(files, 'file');
+    });
+    // Paste an image straight into the form (the description included). Only a paste the person makes is read,
+    // and only its image files; text pastes are left alone, and the clipboard is never read otherwise.
+    dialog.addEventListener('paste', event => {
+        if ( ! screenshotConsent || sending || sent || closed ) return;
+        const items = [...(event.clipboardData?.items ?? [])].filter(item => item.kind === 'file' && /^image\//.test(item.type));
+        if ( ! items.length ) return;
+        event.preventDefault();
+        if ( capturing || settling ) { capture_note.textContent = 'Finish the current screenshot first, then paste again.'; return; }
+        // Pasting an image is choosing to include it: select screenshots without starting the automatic capture.
+        if ( ! screenshotConsent.checked ) { screenshotConsent.checked = true; abort_auto(); refresh(); }
+        void import_files(items.map(item => item.getAsFile()).filter(Boolean).slice(0, imagesMax), 'paste');
     });
     screenshotConsent?.addEventListener('change', () => {
-        if ( ! screenshotConsent.checked ) { cancel_capture(); clear_screenshot(); }
+        if ( ! screenshotConsent.checked ) { ++importRun; abort_auto(); cancel_capture(); clear_screenshot(); capture_note.textContent = ''; }
+        else start_auto_capture();
     });
     diagnostics.addEventListener('change', () => {
         snapshot_diagnostics();
@@ -702,7 +1026,13 @@ export function open_feedback_dialog (_opts) {
         refresh();
     });
     function snapshot_diagnostics () {
-        diagnosticSnapshot = diagnostics.checked ? build_diagnostics(appContext) : null;
+        try {
+            diagnosticSnapshot = diagnostics.checked ? build_diagnostics(appContext) : null;
+        } catch {
+            // A snapshot that cannot be built never blocks the report.
+            diagnosticSnapshot = null;
+            diagnostics.checked = false;
+        }
         appContextUnavailable = diagnostics.checked && app_failure_diagnostics_accepted()
             && !Object.hasOwn(diagnosticSnapshot, 'appFailures');
     }
@@ -710,6 +1040,11 @@ export function open_feedback_dialog (_opts) {
         if (closed || event.detail?.clientRequestId !== clientRequestId) return;
         serialized = event.detail.body; preview.textContent = serialized;
         diagnosticSnapshot = JSON.parse(serialized).diagnostics;
+        if (queuedReplayBody !== null) {
+            // The compatibility retry is still the same request, not a person editing the form.
+            queuedReplayBody = serialized;
+            queuedReplayState = null;
+        }
         appContextUnavailable = false;
         dialog.querySelector('[data-role="app-failure-context"]').hidden = true;
     }
@@ -718,7 +1053,25 @@ export function open_feedback_dialog (_opts) {
     form.addEventListener('change', () => { refresh(); save_draft(); });
     form.addEventListener('submit', async event => {
         event.preventDefault();
-        if ( sending || sent || capturing || closed ) return;
+        if ( sending || sent || capturing || closed || settling ) return;
+        if ( autoPending ) {
+            // Give the default screenshot a short, bounded moment, then freeze the body without it: a
+            // late capture must never change `serialized` (that would mint a second clientRequestId).
+            settling = true;
+            submit.disabled = true;
+            capture_note.textContent = 'Finishing the screenshot…';
+            let timer;
+            try {
+                await Promise.race([autoPending, new Promise(resolve => { timer = setTimeout(resolve, AUTO_CAPTURE_WAIT_MS); })]);
+            } finally {
+                clearTimeout(timer);
+                abort_auto();
+                settling = false;
+            }
+            if ( closed ) return;
+            if ( ! images.length ) { if ( capture_note.textContent !== EMBEDDED_NOTE ) capture_note.textContent = NO_AUTO_CAPTURE; }
+            else capture_note.textContent = '';
+        }
         refresh();
         if ( submit.disabled || ! form.reportValidity() ) return;
         if ( ! feedback_enabled() ) { result.textContent = error_copy(404); return; }
@@ -753,8 +1106,7 @@ export function open_feedback_dialog (_opts) {
         save_draft();
         if ( outcome.status === -1 ) result.textContent = 'This report is already being sent.';
         else if ( retryable(outcome.status) && !queued ) {
-            write_draft({ clientRequestId: crypto.randomUUID(), category: form.elements.category.value,
-                description: description.value, bug: bug_values() });
+            write_draft({ clientRequestId: crypto.randomUUID(), category: CATEGORY, description: description.value });
             result.textContent = 'Could not save this report for automatic retry. Keep this window open and press Send again, or copy your report text before leaving.';
         } else if ( outcome.timedOut ) {
             // The connection may be fine, so no `online` event is coming: say what will retry it.
@@ -774,6 +1126,7 @@ export function open_feedback_dialog (_opts) {
     function cleanup () {
         if ( closed ) return;
         closed = true;
+        abort_auto();
         cancel_capture();
         for ( const type of ['ezil:teardown', 'popstate', 'pagehide', 'hashchange'] ) window.removeEventListener(type, close);
         window.removeEventListener('ezil:feedback-sent', on_sent);
@@ -788,12 +1141,19 @@ export function open_feedback_dialog (_opts) {
     dialog.addEventListener('cancel', event => { event.preventDefault(); close(); });
     dialog.addEventListener('close', cleanup);
     for ( const type of ['ezil:teardown', 'popstate', 'pagehide', 'hashchange'] ) window.addEventListener(type, close);
+    previewBox.addEventListener('toggle', () => { if ( previewBox.open ) preview.textContent = serialized; });
+    // Diagnostics are selected by default: the frozen snapshot is taken now (nothing uploads until Send).
+    if ( diagnostics.checked && ! restoredFromQueue ) snapshot_diagnostics();
+    dialog.querySelector('[data-action="refresh-diagnostics"]').hidden = ! diagnostics.checked;
+    render_images();
     refresh();
     if ( waiting ) result.textContent = waiting === 1
         ? 'One earlier report is waiting to be sent. It will go when you are back online.'
         : `${waiting} earlier reports are waiting to be sent. They will go when you are back online.`;
     dialog.showModal();
-    description.focus();
+    if ( touchPrimary ) dialog.querySelector('#ezil-feedback-heading').focus({ preventScroll: true });
+    else description.focus();
+    if ( ! restoredFromQueue ) start_auto_capture();
 }
 
 /** Listing and deleting reports are small requests: a stalled one fails instead of loading forever. */
