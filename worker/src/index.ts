@@ -1,3 +1,4 @@
+import { awsOsRealmFor } from './aws-ice';
 import { openAwsStandaloneRepo } from './aws-repo-open';
 import { ACCEPTANCE_RESET_DELAY_MS } from './acceptance-config';
 import { relayExpiryFor, relayOperation, RelayFailure, relayFailureResult, remainingRelayBudget, type RelayState, type RelayResult } from './relay-refresh';
@@ -4979,7 +4980,7 @@ async function handlePreview(
         const desktop = async (record: AwsTunnelRecord) => {
           if (!zone) throw new RelayFailure('aws_origin_unavailable');
           return { record, zone, fetch: awsFetch, nowMs: Date.now,
-            aiConfig: awsDesktopAiConfig(env, record), restartPush: awsRestartPush(env, record),
+            osRealm: awsOsRealmFor(env.SANDBOX_PREVIEW_ZONE_ROOT), aiConfig: awsDesktopAiConfig(env, record), restartPush: awsRestartPush(env, record),
             neko: await deriveNekoCredentials(env, record.sandboxId), mint: awsRelayMint(env) };
         };
         const answer = await handleAwsPreview(v2, {
@@ -8336,7 +8337,7 @@ export default {
       if (aws) return (await import('./aws-restart')).handleAwsRestart(
         request, aws, resolvePreviewSecrets(env), (input, init) => fetch(input, init), {
           mint: awsRelayMint(env), neko: () => deriveNekoCredentials(env, aws.record.sandboxId),
-          aiConfig: awsDesktopAiConfig(env, aws.record),
+          osRealm: awsOsRealmFor(env.SANDBOX_PREVIEW_ZONE_ROOT), aiConfig: awsDesktopAiConfig(env, aws.record),
         });
       return handleRestart(
         env,

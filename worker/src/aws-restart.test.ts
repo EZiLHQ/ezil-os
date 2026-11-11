@@ -1,6 +1,6 @@
 import { expect, it, spyOn } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { sha256Hex } from './aws-ice';
+import { sha256Hex, awsOsRealmFor } from './aws-ice';
 import { handleAwsRestart as restartHandler, type RestartBootstrap } from './aws-restart';
 import { decodeControlKey, sendAwsControl, verifyGatewayHeader, type AwsTunnelRecord, type FetchLike } from './aws-origin';
 import { mintPreviewTokenV2 } from './hmac';
@@ -114,8 +114,8 @@ it('expired host boot config is replaced before restart with signed fresh TURN, 
     mint: async (signal, purpose) => { expect(signal).toBeInstanceOf(AbortSignal); expect(purpose).toBe('boot'); return bootstrap.mint(signal); },
   }, now);
   expect(res.status).toBe(202);
-  expect(h.calls.map(c => c.path.split('/')[3])).toEqual(['desktop', 'ice', 'restart-desktop']);
-  const push = h.calls[1]!;
+  expect(h.calls.map(c => c.path.split('/')[3])).toEqual(['desktop', 'desktop', 'ice', 'restart-desktop']);
+  const push = h.calls[2]!;
   const config = JSON.parse(String(push.init.body));
   expect(config.neko).toEqual(neko);
   expect(config.ai).toEqual(ai);
@@ -131,7 +131,7 @@ it('expired host boot config is replaced before restart with signed fresh TURN, 
 it('restart also replaces a currently valid boot config before it can expire during stop', async () => {
   const h = bootstrapHost(() => hostStatus({ configured: true, expiresAt: Date.now() + 70_000 }));
   expect((await restartHandler(await request(), target, [secret], h.fetch, bootstrap, now)).status).toBe(202);
-  expect(h.calls[1]!.path).toContain('/ice/');
+  expect(h.calls[2]!.path).toContain('/ice/');
 });
 
 it.each([undefined, 'invalid'])('missing or invalid host boot identity refuses before config or restart: %s', async bootId => {
@@ -184,7 +184,7 @@ it.each(['mint', 'push'])('a spent shared budget cannot dispatch after %s', asyn
     }, now);
     expect(res.status).toBe(503);
     expect(h.dispatched()).toBe(false);
-    expect(h.calls).toHaveLength(stage === 'mint' ? 1 : 2);
+    expect(h.calls).toHaveLength(stage === 'mint' ? 1 : 3);
     expect(timeout.mock.calls[0]).toEqual([12_000]);
   } finally { timeout.mockRestore(); }
 });
@@ -195,12 +195,29 @@ it('production AWS restart route wires relay mint, derived login and the shared 
   const route = source.slice(start, source.indexOf('      return handleRestart(', start));
   const js = new Bun.Transpiler({ loader: 'ts' }).transformSync(route.replace("(await import('./aws-restart')).handleAwsRestart", 'handler'));
   let args: unknown[] = [];
-  const fn = new Function('aws', 'request', 'env', 'resolvePreviewSecrets', 'fetch', 'awsRelayMint', 'deriveNekoCredentials', 'awsDesktopAiConfig', 'handler', js);
-  fn(target, await request(), {}, () => [secret], hNeverFetch, () => bootstrap.mint, async () => neko, () => bootstrap.aiConfig,
+  const fn = new Function('aws', 'request', 'env', 'resolvePreviewSecrets', 'fetch', 'awsRelayMint', 'deriveNekoCredentials', 'awsDesktopAiConfig', 'awsOsRealmFor', 'handler', js);
+  fn(target, await request(), {SANDBOX_PREVIEW_ZONE_ROOT:'ezil.work'}, () => [secret], hNeverFetch, () => bootstrap.mint, async () => neko, () => bootstrap.aiConfig, awsOsRealmFor,
     (...values: unknown[]) => { args = values; });
   const wired = args[4] as RestartBootstrap;
   expect(wired.mint).toBe(bootstrap.mint);
   expect(await wired.neko()).toEqual(neko);
   expect(wired.aiConfig).toBe(bootstrap.aiConfig);
+  expect(wired.osRealm).toBe('staging');
 });
 const hNeverFetch = () => { throw Error('unexpected external fetch'); };
+
+it('restart uses fresh literal capability after mint and includes admitted realm in signed digest',async()=>{
+  const h=bootstrapHost(()=>hostStatus({osRealmConfigV1:true,osRealmEpoch:{computerId:record.computerId,generation:1,leaseEpoch:2,bootId,observedAtMs:Date.now()},osRealmApplied:null,osRealmConfigured:null}));
+  const res=await restartHandler(await request(),target,[secret],h.fetch,{...bootstrap,osRealm:'production'},now);
+  expect(res.status).toBe(202);
+  const pushed=h.calls.find(c=>c.path.includes('/ice/'))!;
+  expect(JSON.parse(String(pushed.init.body)).ai.osRealm).toBe('production');
+  expect(pushed.path).toBe(`/__ezil/control/ice/${await sha256Hex(String(pushed.init.body))}`);
+  expect(ai).not.toHaveProperty('osRealm');
+});
+it('restart changed boot after mint cannot push config or dispatch',async()=>{
+  let boot=bootId;const h=bootstrapHost(()=>hostStatus({bootId:boot}));
+  const res=await restartHandler(await request(),target,[secret],h.fetch,{...bootstrap,osRealm:'staging',
+    aiConfig:async()=>{boot='22222222-2222-4222-8222-222222222222';return ai}},now);
+  expect(res.status).toBe(503);expect(h.calls.every(c=>c.path.endsWith('/desktop'))).toBe(true);expect(h.dispatched()).toBe(false);
+});

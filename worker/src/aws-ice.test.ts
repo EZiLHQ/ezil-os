@@ -8,6 +8,7 @@ import { describe, expect, it } from 'bun:test';
 import vectors from './aws-gateway.vectors.json';
 import {
   AWS_DESKTOP_CONFIG_APPLY_MS,
+  awsOsRealmFor,
   AWS_DESKTOP_CONFIG_CLAIM_MS,
   AWS_DESKTOP_PUSH_TIMEOUT_MS,
   AWS_DESKTOP_STATUS_TIMEOUT_MS,
@@ -84,6 +85,7 @@ interface HostState {
   /** The host kernel's boot id and whether the running desktop has Chat's AI env (reported together). */
   bootId?: string;
   aiConfigured?: boolean;
+  realmStatus?: Record<string, unknown>;
   /** code-server answers on 8443; otherwise the edge's 502 desktop_unreachable. */
   codeUp?: boolean;
   /** The host's clock for gw1 freshness (ms); NOW unless a test moves it. */
@@ -108,7 +110,7 @@ function fakeHost(over: Partial<HostState> = {}) {
     if (!v.ok) return new Response(JSON.stringify({ ok: false, error: v.error }), { status: 401 });
     const j = (b: unknown, s = 200) => new Response(JSON.stringify(b), { status: s });
     if (method === 'GET' && u.pathname === '/__ezil/control/desktop') {
-      return j({ ok: true, configured: st.configured, expiresAt: st.expiresAt, desktop: st.desktop, ice: st.ice,
+      return j({ ...st.realmStatus, ok: true, configured: st.configured, expiresAt: st.expiresAt, desktop: st.desktop, ice: st.ice,
         ...(st.unit === undefined ? {} : { unit: st.unit, restartsExhausted: st.restartsExhausted === true }),
         ...(st.bootId === undefined ? {} : { bootId: st.bootId, aiConfigured: st.aiConfigured === true }) });
     }
@@ -772,4 +774,60 @@ describe('handleAwsPreview: the Code and app surfaces never wait on neko or its 
     expect(['code', 'app', 'desktop', undefined, 'CODE', 'neko', 1, {}].map(awsPreviewSurface))
       .toEqual(['code', 'app', 'desktop', 'desktop', 'desktop', 'desktop', 'desktop', 'desktop']);
   });
+});
+
+
+describe('closed AWS OS realm admission',()=>{
+  const BOOT='11111111-1111-4111-8111-111111111111';
+  const proof=()=>({osRealmConfigV1:true,osRealmEpoch:{computerId:CID,generation:1,leaseEpoch:2,bootId:BOOT,observedAtMs:NOW},osRealmApplied:null,osRealmConfigured:null});
+  const ai=async()=>({baseUrl:`https://aws-8443-${SID}-aws.ezil.work/ai/v1`,proxyToken:'f'.repeat(64)});
+  it('uses only explicit deployment realm, never unset/unknown/default production',()=>{
+    expect(awsOsRealmFor('ezil.work')).toBe('staging');expect(awsOsRealmFor('ezil.org')).toBe('production');
+    for(const v of [undefined,'','unknown','https://os.ezil.work','https://aws-code.ezil.work'])expect(awsOsRealmFor(v)).toBeUndefined();
+  });
+  for(const realm of ['staging','production',undefined] as const) it(`signed initial push carries only admitted ${realm}`,async()=>{
+    const h=fakeHost({bootId:BOOT,realmStatus:proof()});
+    await ensureAwsDesktopConfig({record:record(),zone:ZONE,fetch:h.fetch,nowMs:()=>NOW,neko:NEKO,mint:mintOk().mint,aiConfig:ai,osRealm:realm});
+    expect(h.st.config?.ai?.osRealm).toBe(realm);expect(h.bad).toEqual([]);
+    expect(h.calls.filter(c=>c.path==='/__ezil/control/desktop').length).toBe(2);
+  });
+  it('missing, nonliteral, stale, wrong identity/epoch/boot, and extra proof fields never permit realm',async()=>{
+    const good=proof();
+    const variants=[{}, {...good,osRealmConfigV1:'true'}, {...good,osRealmConfigV1:1},
+      ...[{computerId:'foreign'},{generation:2},{leaseEpoch:3},{bootId:'22222222-2222-4222-8222-222222222222'},
+        {observedAtMs:NOW-9000},{observedAtMs:NOW+6000},{extra:true}].map(p=>({...good,osRealmEpoch:{...good.osRealmEpoch,...p}}))];
+    for(const realmStatus of variants){
+      const h=fakeHost({bootId:BOOT,realmStatus});
+      await ensureAwsDesktopConfig({record:record(),zone:ZONE,fetch:h.fetch,nowMs:()=>NOW,neko:NEKO,mint:mintOk().mint,
+        aiConfig:async()=>({...await ai(),osRealm:'production'}),osRealm:'staging'});
+      expect(h.st.config?.ai).not.toHaveProperty('osRealm');expect(h.bad).toEqual([]);
+    }
+  });
+  it('fresh check after AI await rejects changed boot before any config POST',async()=>{
+    const h=fakeHost({bootId:BOOT,realmStatus:proof()});
+    await expect(ensureAwsDesktopConfig({record:record(),zone:ZONE,fetch:h.fetch,nowMs:()=>NOW,neko:NEKO,mint:mintOk().mint,
+      aiConfig:async()=>{h.st.bootId='22222222-2222-4222-8222-222222222222';return ai()},osRealm:'staging'})).rejects.toMatchObject({code:'aws_origin_unavailable'});
+    expect(h.calls.filter(c=>c.method==='POST')).toHaveLength(0);
+  });
+  it('configured running host stages realm adoption and clearing through existing push path',async()=>{
+    for(const target of ['staging',undefined] as const){
+      const h=fakeHost({bootId:BOOT,configured:true,expiresAt:NOW+1200000,desktop:'running',ice:'applied',aiConfigured:true,
+        realmStatus:{...proof(),osRealmApplied:target?null:'staging',osRealmConfigured:target?null:'staging'}});
+      await ensureAwsDesktopConfig({record:record(),zone:ZONE,fetch:h.fetch,nowMs:()=>NOW,neko:NEKO,mint:mintOk().mint,aiConfig:ai,osRealm:target});
+      expect(h.st.config?.ai?.osRealm).toBe(target);expect(h.calls.filter(c=>c.method==='POST')).toHaveLength(1);
+    }
+  });
+  it('realm reconfigure distinguishes a previous push from an already pending desired realm',async()=>{
+    for(const staged of [null,'staging']){
+      const h=fakeHost({bootId:BOOT,configured:true,expiresAt:NOW+1200000,desktop:'running',ice:'applied',aiConfigured:true,
+        realmStatus:{...proof(),osRealmConfigured:staged}});
+      const claims:Array<unknown>=[];
+      const result=await ensureAwsDesktopConfig({record:record({restartPushBootId:BOOT,restartPushAt:NOW-10000,restartPushExpiresAt:NOW+1200000}),
+        zone:ZONE,fetch:h.fetch,nowMs:()=>NOW,neko:NEKO,mint:mintOk().mint,aiConfig:ai,osRealm:'staging',
+        restartPush:async(boot,expected,next)=>{claims.push({boot,expected,next});return NOW}});
+      if(staged===null){expect(h.st.config?.ai?.osRealm).toBe('staging');expect(claims.length).toBeGreaterThan(0)}
+      else {expect(result).toEqual({state:'starting',reason:'config_pending'});expect(h.calls.filter(c=>c.method==='POST')).toHaveLength(0);expect(claims).toEqual([])}
+    }
+  });
+
 });

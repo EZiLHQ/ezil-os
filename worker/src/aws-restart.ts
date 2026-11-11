@@ -1,8 +1,10 @@
+import { admitAwsOsRealm, type AwsOsRealm } from './aws-ice';
 import { sendAwsControl, type AwsTunnelRecord, type FetchLike } from './aws-origin';
 import { verifyPreviewTokenV2 } from './hmac';
 import { buildAwsDesktopConfig, pushAwsDesktopConfig, readAwsDesktopStatus, type AwsDesktopConfig, type RelayMint } from './aws-ice';
 
 export interface RestartBootstrap {
+  osRealm?: AwsOsRealm;
   mint: RelayMint;
   neko: () => Promise<{ user: string; admin: string }>;
   aiConfig: (bootId: string) => Promise<NonNullable<AwsDesktopConfig['ai']>>;
@@ -59,6 +61,7 @@ export async function handleAwsRestart(request: Request, target: { record: AwsTu
     config.ai = await bootstrap.aiConfig(status.bootId);
     // Leave 90s to stop, 60s for startup validity and 30s for delivery/queueing.
     if (config.expiresAt <= Date.now() + 180_000) return reply(false, 503);
+    await admitAwsOsRealm(config, status.bootId, { record: r, zone: target.zone, fetch: boundedFetch, nowMs: Date.now, osRealm: bootstrap.osRealm });
     const staged = await pushAwsDesktopConfig(r, target.zone, config, boundedFetch, Math.floor(Date.now() / 1000));
     const stored = await staged.json() as { ok?: unknown; state?: unknown } | null;
     if (!staged.ok || stored?.ok !== true || !['accepted', 'already_running', 'restart_scheduled'].includes(String(stored.state))) {

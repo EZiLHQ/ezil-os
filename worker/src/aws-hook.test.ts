@@ -781,12 +781,12 @@ describe('AWS restart route registration', () => {
       else expect(host.pushed!.ai).toEqual(originalAi);
     }
     expect(host.paths.filter(p => p.includes('/restart-desktop/'))).toEqual(Array(2).fill(`POST /__ezil/control/restart-desktop/${'a'.repeat(64)}`));
-    expect(host.paths.map(p => p.split('/')[3])).toEqual(['desktop', 'ice', 'restart-desktop', 'desktop', 'ice', 'restart-desktop']);
+    expect(host.paths.map(p => p.split('/')[3])).toEqual(['desktop', 'desktop', 'ice', 'restart-desktop', 'desktop', 'desktop', 'ice', 'restart-desktop']);
     expect(host.turnCalls).toBe(2);
     expect(host.bad).toEqual([]);
     expect((await worker.fetch(new Request(`https://api.ezil.work${path}`, { method: 'POST', body }), e)).status).toBe(401);
     expect((await worker.fetch(await signed('POST', path, body, claims({ leaseEpoch: 99 })), e)).status).toBe(502);
     expect((await worker.fetch(await signed('POST', path, JSON.stringify({ requestId: 'a'.repeat(64), action: 'exec' })), e)).status).toBe(400);
-    expect(host.paths).toHaveLength(6);
+    expect(host.paths).toHaveLength(8);
   });
 });
