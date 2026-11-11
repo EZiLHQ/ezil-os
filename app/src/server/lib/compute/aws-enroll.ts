@@ -460,6 +460,9 @@ async function enroll(deps: EnrollDeps, raw: unknown, proven: { subject?: Enroll
     const browserZone = readAwsBrowserZone(deps.env);
     if (!cert || !deployments.ok || (!body.ebsRestore && !browserZone)) return retryLater(503, 'enroll_unavailable');
     const deployment = imageJob ? JSON.parse((body.ebsRestore ? (imageJob as ImageJob).recoveryDocument : (imageJob as ImageJob).preparationDocument)!).deployment as import('./aws-intent').LifecycleDeployment : deployments.deployments[p.region]!;
+    // A qualified deployment requires the guard's actual lower observation. Legacy deployments without
+    // an image identity retain their older wire contract; published image releases must never enroll an unknown lower.
+    if (deployment.lowerImageDigest && !body.lowerImageDigest) return refuse(403, 'host_digest_mismatch');
     if (body.lowerImageDigest && !imageJob && !replay && !pending && deployment.lowerImageDigest && body.lowerImageDigest !== deployment.lowerImageDigest) return refuse(403, 'host_digest_mismatch');
     const signature = verifyIdentitySignature(body.identityDocument, body.signature, cert, now);
     if (!signature.ok) return refuse(403, signature.reason);
