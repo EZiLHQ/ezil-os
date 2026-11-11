@@ -340,6 +340,65 @@ def dependent_lambda_arns(logical, entry, old, new, actual):
             sources.add(source+'.Arn')
     return sources
 
+
+LEGACY_RECOVERY_ROLE = 'RecoveryRecoveryRole1B60FF4C'
+LEGACY_RECOVERY_POLICY = 'RecoveryRecoveryRoleDefaultPolicy2A415109'
+LEGACY_OBSERVER_ROLE = 'RecoveryObserverServiceRole86BC9AF2'
+LEGACY_OBSERVER_POLICY = 'RecoveryObserverServiceRoleDefaultPolicyA036F4CB'
+
+
+def retained_recovery_observer_version(before):
+    """Derive the CDK retention input only from the exact reviewed legacy graph."""
+    resources = before['Resources']
+    if LEGACY_RECOVERY_ROLE not in resources:
+        return None
+    role = resources[LEGACY_RECOVERY_ROLE]
+    need(role.get('Type') == 'AWS::IAM::Role' and 'RoleName' not in role.get('Properties', {})
+         and role['Properties'].get('Path') == f'/ezil/{context.NAMESPACE}/'
+         and role['Properties'].get('PermissionsBoundary') ==
+             f'arn:aws:iam::452630323510:policy/ezil/identity/ezil-{context.NAMESPACE}-boundary',
+         'legacy recovery generated role identity mismatch')
+    policy = resources.get(LEGACY_RECOVERY_POLICY, {})
+    need(policy.get('Type') == 'AWS::IAM::Policy'
+         and policy.get('Properties', {}).get('Roles') == [{'Ref': LEGACY_RECOVERY_ROLE}]
+         and policy['Properties'].get('PolicyName') == LEGACY_RECOVERY_POLICY,
+         'legacy recovery policy attachment mismatch')
+    invokes = [s for s in statements(policy) if s.get('Effect') == 'Allow'
+               and 'lambda:invokefunction' in action_set(s)]
+    need(len(invokes) == 1 and isinstance(invokes[0].get('Resource'), dict)
+         and set(invokes[0]['Resource']) == {'Ref'},
+         'one immutable legacy recovery observer reference required')
+    logical = invokes[0]['Resource']['Ref']
+    need(manifest.matches(r'RecoveryObserverCurrentVersion[0-9A-F]{8}[a-f0-9]{32}', logical),
+         'legacy recovery observer logical identity mismatch')
+    version = resources.get(logical, {})
+    need(version.get('Type') == 'AWS::Lambda::Version'
+         and version.get('Properties') == {'FunctionName': {'Ref': 'RecoveryObserver1D350FD8'}}
+         and version.get('DeletionPolicy') == version.get('UpdateReplacePolicy') == 'Retain',
+         'legacy recovery observer must remain the retained version of the same function')
+    return logical
+
+
+def preserve_legacy_recovery(before, after, boundary):
+    """The new image role may be added; published old versions keep their old role."""
+    old, new = before['Resources'], after['Resources']
+    if LEGACY_RECOVERY_ROLE not in old or not any(
+            r.get('Type') == 'AWS::IAM::Role' and 'RecoveryRole' in logical
+            and r.get('Properties', {}).get('PermissionsBoundary') == boundary for logical, r in new.items()):
+        return
+    retained = retained_recovery_observer_version(before)
+    for logical in (LEGACY_RECOVERY_ROLE, LEGACY_RECOVERY_POLICY, retained, LEGACY_OBSERVER_ROLE):
+        need(logical in old and new.get(logical) == old[logical],
+             'legacy recovery role, policy, observer role and retained version must remain unchanged')
+    prior, candidate = old.get(LEGACY_OBSERVER_POLICY, {}), new.get(LEGACY_OBSERVER_POLICY, {})
+    need(prior.get('Type') == candidate.get('Type') == 'AWS::IAM::Policy'
+         and {k: v for k, v in prior.get('Properties', {}).items() if k != 'PolicyDocument'} ==
+             {k: v for k, v in candidate.get('Properties', {}).items() if k != 'PolicyDocument'},
+         'legacy observer policy attachment changed')
+    need(not (Counter(statement_key(s) for s in statements(prior)) -
+              Counter(statement_key(s) for s in statements(candidate))),
+         'retained legacy observer loses an existing permission')
+
 def validate_templates(phase, before, after, review, unchanged=False, pool_iam=None):
     context.identities(before)
     context.identities(after)
@@ -379,6 +438,7 @@ def validate_templates(phase, before, after, review, unchanged=False, pool_iam=N
     else:
         roles=[k for k,v in new.items() if v['Type']=='AWS::IAM::Role' and v.get('Properties',{}).get('PermissionsBoundary')==boundary]
         need(len(roles)==2 and any('RebasePreparationRole' in k for k in roles) and any('RecoveryRole' in k for k in roles),'exactly preparation and recovery execution roles require the image-job boundary')
+        preserve_legacy_recovery(before, after, boundary)
 
     for logical in old.keys() | new.keys():
         if old.get(logical)==new.get(logical):

@@ -781,5 +781,72 @@ class ComputerTests(unittest.TestCase):
                 COMPUTER.main()
 
 
+
+class LegacyRecoveryCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        import rebase_cloudformation as cfn
+        self.cfn = cfn
+        self.logical = 'RecoveryObserverCurrentVersion680AB0D7' + 'a' * 32
+        self.boundary = f'arn:aws:iam::452630323510:policy/ezil/{TOOL.NAMESPACE}/ezil-{TOOL.NAMESPACE}-image-job-boundary'
+        shared = f'arn:aws:iam::452630323510:policy/ezil/identity/ezil-{TOOL.NAMESPACE}-boundary'
+        self.before = {'Resources': {
+            cfn.LEGACY_RECOVERY_ROLE: {'Type': 'AWS::IAM::Role', 'Properties': {
+                'Path': f'/ezil/{TOOL.NAMESPACE}/', 'PermissionsBoundary': shared}},
+            cfn.LEGACY_RECOVERY_POLICY: {'Type': 'AWS::IAM::Policy', 'Properties': {
+                'PolicyName': cfn.LEGACY_RECOVERY_POLICY, 'Roles': [{'Ref': cfn.LEGACY_RECOVERY_ROLE}],
+                'PolicyDocument': {'Statement': [{'Effect': 'Allow', 'Action': 'lambda:InvokeFunction', 'Resource': {'Ref': self.logical}}]}}},
+            self.logical: {'Type': 'AWS::Lambda::Version', 'Properties': {'FunctionName': {'Ref': 'RecoveryObserver1D350FD8'}},
+                'DeletionPolicy': 'Retain', 'UpdateReplacePolicy': 'Retain'},
+            cfn.LEGACY_OBSERVER_ROLE: {'Type': 'AWS::IAM::Role', 'Properties': {
+                'Path': f'/ezil/{TOOL.NAMESPACE}/', 'PermissionsBoundary': shared}},
+            cfn.LEGACY_OBSERVER_POLICY: {'Type': 'AWS::IAM::Policy', 'Properties': {
+                'PolicyName': cfn.LEGACY_OBSERVER_POLICY, 'Roles': [{'Ref': cfn.LEGACY_OBSERVER_ROLE}],
+                'PolicyDocument': {'Statement': [{'Effect': 'Allow', 'Action': 'kms:Decrypt', 'Resource': {'Fn::GetAtt': ['LifecycleHistoryKey', 'Arn']}}]}}},
+        }}
+        self.after = copy.deepcopy(self.before)
+        self.after['Resources']['RecoveryImageRecoveryRole22222222'] = {'Type': 'AWS::IAM::Role',
+            'Properties': {'RoleName': f'ezil-{TOOL.NAMESPACE}-recovery', 'PermissionsBoundary': self.boundary}}
+
+    def test_derives_only_the_reviewed_old_immutable_observer_and_preserves_legacy_graph(self):
+        self.assertEqual(self.cfn.retained_recovery_observer_version(self.before), self.logical)
+        self.cfn.preserve_legacy_recovery(self.before, self.after, self.boundary)
+        self.assertIsNone(self.cfn.retained_recovery_observer_version({'Resources': {}}))
+
+    def test_legacy_role_policy_version_and_execution_role_changes_fail_closed(self):
+        for logical in (self.cfn.LEGACY_RECOVERY_ROLE, self.cfn.LEGACY_RECOVERY_POLICY,
+                        self.logical, self.cfn.LEGACY_OBSERVER_ROLE):
+            after = copy.deepcopy(self.after)
+            after['Resources'][logical]['Properties']['Unreviewed'] = True
+            with self.assertRaisesRegex(ValueError, 'must remain unchanged'):
+                self.cfn.preserve_legacy_recovery(self.before, after, self.boundary)
+
+    def test_omitted_retention_new_invoke_or_lost_old_observer_key_grant_is_refused(self):
+        after = copy.deepcopy(self.after)
+        after['Resources'][self.cfn.LEGACY_RECOVERY_POLICY]['Properties']['PolicyDocument']['Statement'][0]['Resource'] = {
+            'Ref': 'RecoveryObserverCurrentVersion680AB0D7' + 'b' * 32}
+        with self.assertRaisesRegex(ValueError, 'must remain unchanged'):
+            self.cfn.preserve_legacy_recovery(self.before, after, self.boundary)
+        after = copy.deepcopy(self.after)
+        after['Resources'][self.cfn.LEGACY_OBSERVER_POLICY]['Properties']['PolicyDocument']['Statement'] = []
+        with self.assertRaisesRegex(ValueError, 'loses an existing permission'):
+            self.cfn.preserve_legacy_recovery(self.before, after, self.boundary)
+
+    def test_derivation_rejects_named_roles_unqualified_observers_and_wrong_function_or_retention(self):
+        variants = []
+        bad = copy.deepcopy(self.before); bad['Resources'][self.cfn.LEGACY_RECOVERY_ROLE]['Properties']['RoleName'] = 'fixed'; variants.append(bad)
+        bad = copy.deepcopy(self.before); bad['Resources'][self.cfn.LEGACY_RECOVERY_POLICY]['Properties']['PolicyDocument']['Statement'][0]['Resource'] = '*'; variants.append(bad)
+        bad = copy.deepcopy(self.before); bad['Resources'][self.logical]['Properties']['FunctionName'] = {'Ref': 'OtherFunction'}; variants.append(bad)
+        bad = copy.deepcopy(self.before); bad['Resources'][self.logical]['DeletionPolicy'] = 'Delete'; variants.append(bad)
+        for before in variants:
+            with self.assertRaises(ValueError): self.cfn.retained_recovery_observer_version(before)
+
+    def test_iam_role_replacement_fence_is_unchanged(self):
+        resource = {'Type': 'AWS::IAM::Role'}
+        change = {'Action': 'Modify', 'ResourceType': resource['Type'], 'Replacement': 'True', 'Details': []}
+        with self.assertRaisesRegex(ValueError, 'unexpected resource replacement'):
+            self.cfn.validate_change_details('workflows', change,
+                {'action': 'Modify', 'properties': ['RoleName'], 'attributes': []}, resource, set())
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

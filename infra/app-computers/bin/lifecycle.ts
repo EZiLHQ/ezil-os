@@ -10,7 +10,8 @@ try {
     const path=process.env.EZIL_LIFECYCLE_CONFIG;if(!path)throw new Error();
     const bytes=readFileSync(path);if(bytes.length>16384)throw new Error();
     const config=z.object({settings:SettingsSchema,authorityKeyArn:z.string(),notificationsEnabled:z.boolean().default(false),alertTopicArn:z.string().optional(),
-        recoveryVersionArn:z.string().optional(),recoveryEnabled:z.boolean().default(false),appCaller:AppCallerConfigSchema.default({}),deploy:WorkloadDeploySchema.optional(),
+        recoveryVersionArn:z.string().optional(),recoveryEnabled:z.boolean().default(false),
+        retainedRecoveryObserverVersionLogicalId:z.string().regex(/^RecoveryObserverCurrentVersion[0-9A-F]{8}[a-f0-9]{32}$/).optional(),appCaller:AppCallerConfigSchema.default({}),deploy:WorkloadDeploySchema.optional(),
         // null omits the reservation: a new account's whole Lambda pool is 10, and any reservation then breaks the 10-unreserved minimum.
         lambdaReservedConcurrency:z.number().int().min(1).max(100).nullable().default(2)}).strict().parse(JSON.parse(bytes.toString()));
     const app=new App(),d=config.settings.deployment;
@@ -23,7 +24,8 @@ try {
     if(config.recoveryEnabled&&!config.recoveryVersionArn)throw new Error();
     if(config.recoveryVersionArn)new ComputerLifecycleRecovery(stack,'Recovery',{
         settings:{lifecycle:config.settings,recoveryVersionArn:config.recoveryVersionArn},
-        sourceHistoryKey:lifecycle.historyKey,enabled:config.recoveryEnabled});
+        sourceHistoryKey:lifecycle.historyKey,enabled:config.recoveryEnabled,
+        ...(config.retainedRecoveryObserverVersionLogicalId ? {retainedObserverVersionLogicalId:config.retainedRecoveryObserverVersionLogicalId}:{})});
     // appCaller includes optional ec2CallerRoleArns; an absent/empty list keeps OIDC-only trust.
     if(config.appCaller.enabled)new AppCaller(stack,'AppCaller',{config:config.appCaller,ec2CallerRoleArns:config.appCaller.ec2CallerRoleArns,region:d.region,versionArns:[d.stateMachineVersionArn],historyKeyArn:lifecycle.historyKey.keyArn});
 }catch(cause){throw new Error("EZIL_LIFECYCLE_CONFIG is missing or invalid; supply reviewed references without credentials",{cause})}
