@@ -1,0 +1,11 @@
+# Dedicated historical source proof
+
+A STOPPED dedicated computer whose retired EC2 host is no longer listed can resolve a rebase source from an archived successful or recovered image job. The archive is only a lookup hint. No pool row or placement metadata is manufactured.
+
+The application binds the archive to the current owner, computer, region, zone, instance, retained volume, filesystem UUID, generation, fence, lower digest and provision lease. A later lease must be explained by the exact current retirement. It rebuilds the canonical original dedicated replace and verifies its exact successful, version-bound, non-redriven execution. One connected EC2 RunInstances request/result must bind the canonical launch template, requested image, enrollment payload and fencing tags to the same instance and returned ImageId. The retirement request's deployment is never used as launch evidence.
+
+The exact canonical successful retirement must bind the current generation, lease, fence, instance and volume, finish after provision and before observation, and have a complete history with a positive terminated witness. EC2 must no longer list the instance. Missing, ambiguous, malformed, truncated, failed, aliased, redriven or conflicting evidence fails closed. Exact archive and current-placement bindings are checked again before reservation under the existing admission lock.
+
+The preparation document appends optional `releasedDedicatedHost`, distinct from `releasedPoolHost`; both together are rejected. Omission preserves existing canonical bytes and digests. A matching preparation helper must be published through the normal release pipeline before using the field; an older strict helper rejects it. The helper still requires an absent source and an available, unattached, correctly tagged volume under live reservation authority. It never starts, stops or terminates a source in this path.
+
+Scope: existing dedicated image-job launch/rebind archives only. An unarchived initial provision remains unproven. No new database schema, source-release fallback, controller bypass or cloud mutation is introduced. Provider input/history, including UserData, stays in memory; no raw execution payload or credentials are persisted or logged.

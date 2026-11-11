@@ -33,7 +33,7 @@ function parse(text: string | undefined): unknown {
 }
 
 /** The release work exactly as the execution received it: a normal release or an adopt-recovery release. */
-function releaseWork(input: string | undefined): LifecycleWork | null {
+export function canonicalReleaseWork(input: string | undefined): LifecycleWork | null {
     try {
         const envelope = JSON.parse(input ?? '') as { schemaVersion?: unknown; document?: unknown; digest?: unknown };
         if (envelope.schemaVersion !== 1 || typeof envelope.document !== 'string' || typeof envelope.digest !== 'string'
@@ -46,10 +46,8 @@ function releaseWork(input: string | undefined): LifecycleWork | null {
 
 /** The recorded execution this history must match: input, output and its own start/stop interval. */
 export interface WitnessBounds { input: string; output: string; startedAt: Date; stoppedAt: Date; region: string }
-/** Strict, complete history of a SUCCEEDED release with a positive termination witness for `instanceId`: its first input and
- * final output equal the recorded execution's, every event lies inside the execution's own interval, and the connected EC2
- * terminateInstances chain (scheduled/started/succeeded) names this region, resource and resource type throughout. */
-export function terminationWitnessed(events: readonly HistoryEvent[], bounds: WitnessBounds, instanceId: string): boolean {
+/** Complete SUCCEEDED execution history: canonical input/output, contiguous IDs, bounded timestamps, known events and no truncation. */
+export function executionHistoryBound(events: readonly HistoryEvent[], bounds: WitnessBounds): boolean {
     const from = bounds.startedAt.getTime(), to = bounds.stoppedAt.getTime();
     if (!Number.isFinite(from) || !Number.isFinite(to) || from > to) return false;
     if (events.length < 2 || events[0]?.type !== 'ExecutionStarted' || events[0].executionStartedEventDetails?.input !== bounds.input
@@ -64,7 +62,11 @@ export function terminationWitnessed(events: readonly HistoryEvent[], bounds: Wi
         if (type.endsWith('StateExited') && !named(event.stateExitedEventDetails?.name)) return false;
         return true;
     });
-    if (!valid) return false;
+    return valid;
+}
+
+export function terminationWitnessed(events: readonly HistoryEvent[], bounds: WitnessBounds, instanceId: string): boolean {
+    if (!executionHistoryBound(events, bounds)) return false;
     // Every termination request in this release names exactly this instance, and none is unanswered.
     const scheduled = events.filter(e => e.type === 'TaskScheduled' && /terminateinstances/i.test(e.taskScheduledEventDetails?.resource ?? ''));
     if (!scheduled.length) return false;
@@ -100,7 +102,7 @@ export function proveHistoricalSource(source: Execution, events: readonly Histor
         || !source.input || !source.output || !(source.startDate instanceof Date) || !(source.stopDate instanceof Date) || !(replaceStartedAt instanceof Date)
         || !Number.isFinite(source.startDate.getTime()) || !Number.isFinite(source.stopDate.getTime())
         || !(source.startDate.getTime() <= source.stopDate.getTime()) || !(source.stopDate.getTime() < replaceStartedAt.getTime())) return null;
-    const work = releaseWork(source.input);
+    const work = canonicalReleaseWork(source.input);
     if (!work) return null;
     const i = work.intent, d = i.deployment;
     if (source.executionArn !== lifecycleExecutionArn(d, i.jobId) || source.stateMachineVersionArn !== work.stateMachineArn
@@ -152,7 +154,7 @@ export function proveReleasedPoolHost(p: Placement, d: LifecycleDeployment, row:
             || !(release.startDate instanceof Date) || !(release.stopDate instanceof Date)
             || !(provision.stopDate.getTime() < release.startDate.getTime()) || !(release.startDate.getTime() <= release.stopDate.getTime())
             || !(release.stopDate.getTime() <= now.getTime())) return null;
-        const work = releaseWork(release.input);
+        const work = canonicalReleaseWork(release.input);
         if (!work) return null;
         const r = work.intent;
         if (release.executionArn !== lifecycleExecutionArn(r.deployment, r.jobId) || release.stateMachineVersionArn !== work.stateMachineArn

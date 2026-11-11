@@ -171,6 +171,14 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
         if (text.startsWith('/* placement:park-blockers */')) return { rows: [] };
         // `SELECT ... FOR UPDATE` row lock of the park reservation: the fake serializes through its advisory-lock mutexes already.
         if (text.startsWith('/* placement:park-row-lock */')) return { rows: placements.filter(r => uuidEq(r.computer_id, params[0])).map(r => ({ computer_id: r.computer_id })) };
+        if (text.startsWith('/* image:released-dedicated-host */')) {
+            const [computer, owner, region, zone, instance, volume, generation] = params;
+            return { rows: imageJobs.filter(r => r.computer_id === computer && r.owner_user_id === owner && r.region === region && r.zone_id === zone
+                && ['succeeded', 'recovered'].includes(String(r.phase))
+                && (r.host_evidence as Record<string, unknown> | null)?.instanceId === instance
+                && (r.host_evidence as Record<string, unknown> | null)?.volumeId === volume
+                && String((r.host_evidence as Record<string, unknown> | null)?.generation) === generation).slice(0, 2).map(r => ({ ...r })) };
+        }
         const imageTable = text.includes('public.ezil_computer_image_jobs') && !text.includes('UNION ALL');
         const writeRows = imageTable ? imageJobs : placements;
         const presentWrite = imageTable ? (r: Row) => ({ ...r }) : present;
