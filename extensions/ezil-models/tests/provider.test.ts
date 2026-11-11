@@ -280,13 +280,17 @@ describe('EZiL gateway VS Code bridge', () => {
     }
     describe('credit refusal action', () => {
         const baseUrl = process.env.EZIL_AI_BASE_URL;
+        const osOrigin = process.env.EZIL_OS_ORIGIN;
         beforeEach(() => {
             showCreditWarning.mockReset(); openExternal.mockReset(); showRetryError.mockClear();
             process.env.EZIL_AI_BASE_URL = 'https://os.invalid:8443/ai/v1?discard=yes#discard';
+            process.env.EZIL_OS_ORIGIN = 'https://os-staging.ezil.work';
         });
         afterEach(() => {
             if (baseUrl === undefined) delete process.env.EZIL_AI_BASE_URL;
             else process.env.EZIL_AI_BASE_URL = baseUrl;
+            if (osOrigin === undefined) delete process.env.EZIL_OS_ORIGIN;
+            else process.env.EZIL_OS_ORIGIN = osOrigin;
         });
         function refusal(code = 'insufficient_credits', extra = {}) {
             const host = gatewayHost((async () => Response.json({ error: { code, available_micro: 63_092_750,
@@ -308,7 +312,7 @@ describe('EZiL gateway VS Code bridge', () => {
             expect(showCreditWarning).toHaveBeenCalledTimes(1);
             expect(showCreditWarning).toHaveBeenCalledWith(expect.stringContaining(text), 'Add credits');
             expect(openExternal).toHaveBeenCalledTimes(1);
-            expect(openExternal.mock.calls[0]![0].toString()).toBe('https://os.invalid:8443/os?settings=billing&section=ai-credits&reason=insufficient_credits');
+            expect(openExternal.mock.calls[0]![0].toString()).toBe('https://os-staging.ezil.work/os?settings=billing&section=ai-credits&reason=insufficient_credits');
             expect(showRetryError).not.toHaveBeenCalled();
             expect(h.host.usage).toHaveLength(0); expect(h.requestFinished).toHaveBeenCalledTimes(1);
         });
@@ -331,9 +335,9 @@ describe('EZiL gateway VS Code bridge', () => {
             });
         }
         for (const value of [undefined, '', 'not a URL', '/ai/v1', 'http://os.invalid/ai/v1', 'javascript:alert(1)', 'file:///ai/v1']) {
-            test(`no button without a usable HTTPS environment origin: ${value}`, async () => {
-                if (value === undefined) delete process.env.EZIL_AI_BASE_URL;
-                else process.env.EZIL_AI_BASE_URL = value;
+            test(`no button without a trusted OS environment origin: ${value}`, async () => {
+                if (value === undefined) delete process.env.EZIL_OS_ORIGIN;
+                else process.env.EZIL_OS_ORIGIN = value;
                 const h = refusal();
                 await expect(h.send()).rejects.toThrow('This request needs up to 80.00 credits');
                 expect(showCreditWarning).toHaveBeenCalledWith(expect.stringContaining('and you have 63.09.'));

@@ -2,6 +2,7 @@
 // shapes in types.ts, streams the provider response back as VS Code parts, and records usage.
 
 import * as vscode from 'vscode';
+import { effortConfigurationSchema, withSessionEffort } from './effort';
 import type { CompactionInfo } from './compact';
 import { appFailure, type AppFailure } from './failure';
 import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, includedModelNames, knownGatewayModels, knownGatewayPlan, modelIncluded, parseCatalogModelId, withCatalogDefault, withDefaultModel, withGatewayModelLimits, withPlanLocks, type GatewayModels } from './gateway';
@@ -185,6 +186,8 @@ export function toInformation(model: ResolvedModel): vscode.LanguageModelChatInf
     };
     // Proposed `chatProvider` fields. code-server 4.141's extension host accepts them without the proposal enabled, and
     // `isDefault` is what makes the config's default model the first one in Chat (no chat.defaultModel is configured).
+    const configurationSchema = effortConfigurationSchema(model);
+    if (configurationSchema) info.configurationSchema = configurationSchema;
     info.isDefault = model.default;
     // A plan-locked model is never a chat model: VS Code never restores, defaults to or hands it to a subagent, so a saved
     // pick on Free falls back to the default with no dialog. The `picker-locked-list` patch still lists it (lock icon and this
@@ -520,6 +523,10 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                     if ((model.capabilities as { toolCalling?: unknown } | undefined)?.toolCalling) this.refresh();
                 }
             }
+            // Code 4.141 passes native modelConfiguration separately from modelOptions.
+            // Stable @types/vscode omits this proposed field; validate it as unknown.
+            resolved = withSessionEffort(resolved,
+                (options as vscode.ProvideLanguageModelChatResponseOptions & { readonly modelConfiguration?: unknown }).modelConfiguration);
             const sending = resolved;
             const events = chat(resolved, request, {
                 signal: controller.signal,
