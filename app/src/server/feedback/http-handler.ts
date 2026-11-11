@@ -1,9 +1,9 @@
 import { z } from 'zod';
 import { shellFeaturesFor, type ShellFeatureEnv } from '@/server/shell/features';
 import { shellJson, shellUnauthenticated } from '@/server/shell/http';
-import { deleteFeedback, ingestFeedback, listFeedback, type FeedbackDb } from './ingest';
-import { FeedbackImageError } from './image';
-import { FEEDBACK_LIMITS, feedbackSubmitSchema, submittedImages } from './types';
+import { deleteFeedback, ingestFeedback, listFeedback, stageFeedbackImage, type FeedbackDb } from './ingest';
+import { FeedbackImageError, inspectImage } from './image';
+import { FEEDBACK_IMAGE_TYPES, FEEDBACK_LIMITS, feedbackSubmitSchema, submittedImages } from './types';
 
 export interface FeedbackHandlerDeps {
     getContext: (req: Request) => Promise<{ user: { id: string; email?: string | null } | null; db: FeedbackDb }>;
@@ -25,7 +25,12 @@ function isJson(req: Request): boolean {
 /** Byte-counted, like telemetry/http-handler.ts:80: Content-Length is untrusted,
  * and a too-large stream is cancelled before retaining any further chunks. */
 async function readBoundedBody(req: Request, maxBytes: number): Promise<string | null> {
-    if (!req.body) return '';
+    const bytes = await readBoundedBytes(req, maxBytes);
+    return bytes === null ? null : new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+}
+
+async function readBoundedBytes(req: Request, maxBytes: number): Promise<Uint8Array | null> {
+    if (!req.body) return new Uint8Array(0);
     const reader = req.body.getReader();
     const chunks: Uint8Array[] = [];
     let total = 0;
@@ -46,7 +51,20 @@ async function readBoundedBody(req: Request, maxBytes: number): Promise<string |
     const bytes = new Uint8Array(total);
     let offset = 0;
     for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return bytes;
+}
+
+/** Upload-first `PUT ?crid=`: the raw image as its own content type (never a simple form type, so never cross-site). */
+async function stageImage(req: Request, deps: FeedbackHandlerDeps, userId: string, db: FeedbackDb): Promise<Response> {
+    const crid = z.string().uuid().safeParse(new URL(req.url).searchParams.get('crid'));
+    if (!crid.success) return invalidRequest();
+    const type = z.enum(FEEDBACK_IMAGE_TYPES).safeParse(req.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase());
+    if (!type.success) return shellJson({ error: 'unsupported_media_type' }, 415);
+    const bytes = await readBoundedBytes(req, FEEDBACK_LIMITS.imageBytesMax);
+    if (bytes === null) return shellJson({ error: 'payload_too_large' }, 413);
+    const image = inspectImage(type.data, Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength));
+    const result = await stageFeedbackImage(db, userId, crid.data.toLowerCase(), image, deps.now?.() ?? new Date());
+    return 'staged' in result ? shellJson(result.staged, result.status) : shellJson({ error: result.error }, result.status);
 }
 
 export async function handleFeedbackRequest(req: Request, deps: FeedbackHandlerDeps): Promise<Response> {
@@ -70,13 +88,21 @@ export async function handleFeedbackRequest(req: Request, deps: FeedbackHandlerD
                 raw = JSON.parse(body);
             } catch { return invalidRequest(); }
             const parsed = feedbackSubmitSchema.safeParse(raw);
-            if (!parsed.success || (!features.feedbackScreenshots && submittedImages(parsed.data).length > 0)) return invalidRequest();
+            if (!parsed.success || (!features.feedbackScreenshots
+                && (submittedImages(parsed.data).length > 0 || parsed.data.screenshotRefs))) return invalidRequest();
+            // The references are metadata: they count toward the small-body limit like the text.
             const metadata = { ...parsed.data, screenshot: null, screenshots: undefined };
             if (new TextEncoder().encode(JSON.stringify(metadata)).length > FEEDBACK_LIMITS.bodyBytesNoScreenshot) {
                 return shellJson({ error: 'payload_too_large' }, 413);
             }
             const result = await ingestFeedback(db, user.id, parsed.data, deps.now?.() ?? new Date(), deps.deploySha ?? null);
-            return result.status === 429 ? shellJson({ error: 'rate_limited' }, 429) : shellJson(result.created, result.status);
+            if (result.status === 429) return shellJson({ error: 'rate_limited' }, 429);
+            if (result.status === 409) return shellJson({ error: result.error }, 409);
+            return shellJson(result.created, result.status);
+        }
+        if (req.method === 'PUT') {
+            if (!features.feedbackScreenshots) return shellJson({ error: 'not_found' }, 404);
+            return await stageImage(req, deps, user.id, db);
         }
         if (req.method === 'GET') return shellJson({ reports: await listFeedback(db, user.id) });
         if (req.method === 'DELETE') {

@@ -359,3 +359,71 @@ describe('report bundle byte budget', () => {
         expect((await handleFeedbackRequest(request({ ...VALID, diagnostics: { recentEvents: recentEvents.slice(0, 1) }, screenshot: SCREENSHOT }), h.deps)).status).toBe(201);
     });
 });
+
+describe('upload-first staging boundary', () => {
+    const PNG_BYTES = Buffer.from(SCREENSHOT.dataBase64, 'base64');
+    const REF = { sha256: 'a'.repeat(64), contentType: 'image/png' };
+    function put(body: BodyInit = PNG_BYTES, { crid = ID, type = 'image/png' }: { crid?: string; type?: string } = {}) {
+        return new Request(`${URL}?crid=${crid}`, { method: 'PUT', body, headers: { 'content-type': type } });
+    }
+    const screenshotsOn = () => { const h = harness(); h.deps.env.EZIL_OS_FEEDBACK_SCREENSHOTS = '1'; return h; };
+
+    it('stages a raw image and answers only the hash it computed (no URL, no id)', async () => {
+        const h = screenshotsOn();
+        const response = await handleFeedbackRequest(put(), h.deps);
+        expect(response.status).toBe(201);
+        const body = await response.json();
+        expect(Object.keys(body).sort()).toEqual(['finalized', 'sha256']);
+        expect(body.sha256).toMatch(/^[0-9a-f]{64}$/);
+        expect(h.statements.some(s => s.sql.startsWith('insert into "ezil_feedback_attachments"'))).toBe(true);
+    });
+
+    it('is 404 while screenshots are off, before reading the body or the DB', async () => {
+        const h = harness();
+        expect((await handleFeedbackRequest(put(), h.deps)).status).toBe(404);
+        expect(h.statements).toEqual([]);
+    });
+
+    it.each([
+        ['a missing request id', put(PNG_BYTES, { crid: '' }), 400],
+        ['a malformed request id', put(PNG_BYTES, { crid: 'not-a-uuid' }), 400],
+        ['a form content type', put(PNG_BYTES, { type: 'text/plain' }), 415],
+        ['JSON', put(PNG_BYTES, { type: 'application/json' }), 415],
+        ['an SVG', put(PNG_BYTES, { type: 'image/svg+xml' }), 415],
+        ['a type that does not match the file', put(PNG_BYTES, { type: 'image/jpeg' }), 400],
+        ['an empty body', put(new Uint8Array(0)), 400],
+        ['a body over the image limit', put(new Uint8Array(FEEDBACK_LIMITS.imageBytesMax + 1)), 413],
+    ])('refuses %s without touching the DB', async (_label, req, status) => {
+        const h = screenshotsOn();
+        expect((await handleFeedbackRequest(req, h.deps)).status).toBe(status);
+        expect(h.statements).toEqual([]);
+    });
+
+    it.each([
+        { ...VALID, screenshotRefs: [REF], screenshot: SCREENSHOT },
+        { ...VALID, screenshotRefs: [REF], screenshots: [SCREENSHOT, SCREENSHOT] },
+        { ...VALID, screenshotRefs: [REF, REF] },
+        { ...VALID, screenshotRefs: [] },
+        { ...VALID, screenshotRefs: Array.from({ length: 6 }, (_, n) => ({ ...REF, sha256: String(n).repeat(64) })) },
+        { ...VALID, screenshotRefs: [{ ...REF, sha256: 'A'.repeat(64) }] },
+        { ...VALID, screenshotRefs: [{ ...REF, url: 'https://example.test/x' }] },
+    ])('refuses a malformed finalize %#', async (body) => {
+        const h = screenshotsOn();
+        expect((await handleFeedbackRequest(request(body), h.deps)).status).toBe(400);
+        expect(h.statements).toEqual([]);
+    });
+
+    it('refuses references while screenshots are off', async () => {
+        const h = harness();
+        expect((await handleFeedbackRequest(request({ ...VALID, screenshotRefs: [REF] }), h.deps)).status).toBe(400);
+        expect(h.statements).toEqual([]);
+    });
+
+    it('answers a finalize whose images are not staged with 409 and stores no report', async () => {
+        const h = screenshotsOn();
+        const response = await handleFeedbackRequest(request({ ...VALID, screenshotRefs: [REF] }), h.deps);
+        expect(response.status).toBe(409);
+        expect(await response.json()).toEqual({ error: 'staged_images_missing' });
+        expect(h.statements.some(s => s.sql.startsWith('insert'))).toBe(false);
+    });
+});

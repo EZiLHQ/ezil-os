@@ -39,6 +39,20 @@ describe('database rate and attachment budgets', () => {
         expect(await fitsAttachmentBudget(db, 100, NOW)).toBe(fits);
     });
 
+    it('a renewed staged row is credited once in each window it is already counted in', async () => {
+        const fullDay = FEEDBACK_LIMITS.globalAttachmentBytesPerDay;
+        const recent = { byteLength: 100, createdAt: new Date(NOW.getTime() - 3_600_000 * 2) };
+        // Already in today's sum: replacing it at the same size fits even with the day full.
+        expect(await fitsAttachmentBudget(database([[String(fullDay), '0']]).db, 100, NOW, recent)).toBe(true);
+        // Bigger than the row it replaces: only the difference is new, and the full day refuses it.
+        expect(await fitsAttachmentBudget(database([[String(fullDay), '0']]).db, 101, NOW, recent)).toBe(false);
+        // Staged before the 24 h window: no longer in the day sum, so the day is charged again (no cap bypass).
+        const old = { byteLength: 100, createdAt: new Date(NOW.getTime() - 86_400_001) };
+        expect(await fitsAttachmentBudget(database([[String(fullDay), '0']]).db, 100, NOW, old)).toBe(false);
+        // The total always holds the old row: it is credited there.
+        expect(await fitsAttachmentBudget(database([['0', String(FEEDBACK_LIMITS.globalAttachmentBytesTotal)]]).db, 100, NOW, old)).toBe(true);
+    });
+
     it('sums all users globally and filters only the daily sum', async () => {
         const { db, statements } = database([[0, 0]]);
         await fitsAttachmentBudget(db, 100, NOW);
