@@ -93,6 +93,8 @@ export async function inspect(sql, files) {
   await sql.begin('isolation level repeatable read read only', async tx => {
     await tx`set local search_path = pg_catalog`;
     major = Math.floor(Number((await tx`show server_version_num`)[0].server_version_num) / 10000);
+    // PG 17 only: any other major is refused in EVERY inspection (first and under the lock), before a single catalog row is read, so no DDL can follow.
+    if (PINNED.fingerprints[major] === undefined) refuse('no_pinned_fingerprint_for_server_major');
     preRows = await tx.unsafe(files.preflight);
     verRows = await tx.unsafe(files.verify);
   });
@@ -100,7 +102,6 @@ export async function inspect(sql, files) {
   const pinned = PINNED.fingerprints[major];
   const present = rows.some(r => r.check_name === 'sponsor schema state is present');
   const matches = pinned !== undefined && verRows?.length === 1 && verRows[0].fingerprint === pinned && verRows[0].lines === PINNED.fingerprintLines;
-  if (present && pinned === undefined) refuse('no_pinned_fingerprint_for_server_major');
   return { rows, structure: { matches }, major };
 }
 
@@ -122,16 +123,33 @@ export async function main({ argv, env, connect, read = readFile, dir = HERE }) 
     if (!args.apply) { receipt.result = before.action === 'noop' ? 'present_identical_no_action_needed' : 'ready_to_apply'; return { code: 0, receipt }; }
     if (before.action === 'noop') { receipt.result = 'already_present_identical'; receipt.after = 'present'; return { code: 0, receipt }; }
     // One advisory lock, a re-inspection under it, then exactly the pinned SQL (it carries its own BEGIN/COMMIT), then a postflight that must match the fingerprint.
-    const [{ locked }] = await sql`select pg_try_advisory_lock(hashtextextended(${LOCK_KEY}, 0)) as locked`;
+    const [{ locked, pid }] = await sql`select pg_try_advisory_lock(hashtextextended(${LOCK_KEY}, 0)) as locked, pg_backend_pid() as pid`;
     if (!locked) refuse('another_runner_holds_the_lock');
-    let applyError = null, afterInspect;
+    // A max-1 pool silently reconnects after a lost connection, and an advisory lock dies with its session. Before trusting ANY read after DDL, prove that this very
+    // backend is still the one holding the lock; otherwise the outcome is UNCERTAIN and we stop (no success claimed, no recovery attempted here).
+    const holdsLock = async () => {
+      try {
+        const [r] = await sql`select pg_backend_pid() as pid, exists (select 1 from pg_locks where locktype = 'advisory' and granted and pid = pg_backend_pid()
+          and ((classid::bigint << 32) | objid::bigint) = hashtextextended(${LOCK_KEY}, 0)) as held`;
+        return r.pid === pid && r.held === true;
+      } catch { return false; }
+    };
+    let applyError = null, afterInspect, uncertain = false;
     try {
       const recheck = await inspect(sql, files);
       if (decide(recheck.rows, recheck.structure).action !== 'apply') refuse('schema_changed_under_the_lock');
+      if (!await holdsLock()) refuse('session_lost_before_apply');
       try { await sql.unsafe(files.sql); } catch (error) { applyError = error?.code ?? 'apply_failed'; }
-      // Uncertain-apply recovery, STILL under the lock: whatever happened (success, error, dropped connection), the only truth is a fresh catalog inspection.
-      afterInspect = await inspect(sql, files);
-    } finally { await sql`select pg_advisory_unlock(hashtextextended(${LOCK_KEY}, 0))`; }
+      // Whatever happened (success, error, dropped connection), the only truth is a fresh catalog inspection, but ONLY from the same locked session.
+      if (!await holdsLock()) { uncertain = true; } else afterInspect = await inspect(sql, files);
+    } finally {
+      try { const [u] = await sql`select pg_advisory_unlock(hashtextextended(${LOCK_KEY}, 0)) as released`; receipt.lockReleased = u?.released === true; } catch { receipt.lockReleased = false; }
+    }
+    if (uncertain) {
+      receipt.result = 'apply_outcome_uncertain_session_lost'; receipt.after = 'unknown'; if (applyError) receipt.applyError = String(applyError);
+      receipt.next = 'rerun preflight on the pinned target; this run makes no claim about whether the schema was applied';
+      return { code: 2, receipt };
+    }
     const after = decide(afterInspect.rows, afterInspect.structure);
     receipt.after = after.state;
     if (after.action === 'noop') { receipt.result = applyError ? 'apply_reported_error_but_schema_present_and_identical' : 'applied_and_verified'; if (applyError) receipt.applyError = String(applyError); return { code: 0, receipt }; }

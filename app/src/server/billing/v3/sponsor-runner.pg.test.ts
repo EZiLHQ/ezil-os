@@ -76,15 +76,16 @@ describe('runner pins, arguments and strict decisions (offline, the actual modul
 });
 
 /** A scripted fake of the postgres.js surface the runner uses, to test uncertain-apply recovery and lock ordering without a database. */
-function fake(script: { inspections: { rows: ReturnType<typeof rows>; fingerprint?: string }[]; applyError?: string }) {
+function fake(script: { inspections: { rows: ReturnType<typeof rows>; fingerprint?: string; version?: string }[]; applyError?: string; lockHeldAfterApply?: boolean; pidAfterApply?: number }) {
     const calls: string[] = [];
-    let inspection = 0;
+    let inspection = 0, applied = false;
     const text = (strings: TemplateStringsArray) => strings.join('?');
     const route = (t: string) => {
         if (t.includes('pg_control_system')) return [{ id: '1234567890', db: 'd', cu: 'u', su: 'u' }];
-        if (t.includes('pg_try_advisory_lock')) { calls.push('lock'); return [{ locked: true }]; }
-        if (t.includes('pg_advisory_unlock')) { calls.push('unlock'); return []; }
-        if (t.includes('show server_version_num')) return [{ server_version_num: '170000' }];
+        if (t.includes('pg_try_advisory_lock')) { calls.push('lock'); return [{ locked: true, pid: 4242 }]; }
+        if (t.includes('from pg_locks')) { calls.push('holds'); return [{ pid: applied ? (script.pidAfterApply ?? 4242) : 4242, held: applied ? script.lockHeldAfterApply !== false : true }]; }
+        if (t.includes('pg_advisory_unlock')) { calls.push('unlock'); return [{ released: true }]; }
+        if (t.includes('show server_version_num')) return [{ server_version_num: script.inspections[Math.max(0, Math.min(inspection, script.inspections.length) - 1)]?.version ?? '170000' }];
         return [];
     };
     const tagger = () => (strings: TemplateStringsArray) => Promise.resolve(route(text(strings)));   // a distinct function per object: tx.unsafe must not overwrite sql.unsafe
@@ -95,7 +96,7 @@ function fake(script: { inspections: { rows: ReturnType<typeof rows>; fingerprin
             const tx = Object.assign(tagger(), { unsafe: async (t: string) => (t.includes('sponsor schema state') ? current.rows : [{ fingerprint: current.fingerprint ?? PINNED.fingerprints[17], lines: PINNED.fingerprintLines }]) });
             await fn(tx);
         },
-        unsafe: async () => { calls.push('apply'); if (script.applyError) throw Object.assign(new Error('boom'), { code: script.applyError }); return []; },
+        unsafe: async () => { calls.push('apply'); applied = true; if (script.applyError) throw Object.assign(new Error('boom'), { code: script.applyError }); return []; },
         end: async () => undefined,
     });
     return { sql, calls };
@@ -106,13 +107,33 @@ describe('uncertain-apply recovery and lock ordering (scripted fake, actual modu
     it('the postflight inspection runs BEFORE the advisory lock is released', async () => {
         const r = await go({ inspections: [{ rows: rows() }, { rows: rows() }, { rows: rows({}, 'present') }] });
         expect(r.receipt.result).toBe('applied_and_verified'); expect(r.code).toBe(0);
-        expect(r.calls).toEqual(['inspect', 'lock', 'inspect', 'apply', 'inspect', 'unlock']);
+        expect(r.calls).toEqual(['inspect', 'lock', 'inspect', 'holds', 'apply', 'holds', 'inspect', 'unlock']);
     });
     it('an apply error with the schema then present and identical is verified, never assumed; with nothing changed it is reported as such', async () => {
         const a = await go({ inspections: [{ rows: rows() }, { rows: rows() }, { rows: rows({}, 'present') }], applyError: '57P01' });
         expect(a.receipt.result).toBe('apply_reported_error_but_schema_present_and_identical'); expect(a.code).toBe(0);
         const b = await go({ inspections: [{ rows: rows() }, { rows: rows() }, { rows: rows() }], applyError: '40001' });
         expect(b.receipt.result).toBe('apply_failed_nothing_changed'); expect(b.code).toBe(2);
+    });
+    it('PG17 only: any other server major is refused in the first AND the under-the-lock inspection, before any DDL, preflight included', async () => {
+        const first = fake({ inspections: [{ rows: rows(), version: '160004' }] });
+        expect(await refusal(() => main({ argv, env: { SPONSOR_DB_URL: 'x' }, connect: async () => first.sql, dir: DIR }))).toBe('no_pinned_fingerprint_for_server_major');
+        expect(first.calls).not.toContain('apply'); expect(first.calls).not.toContain('lock');
+        const second = fake({ inspections: [{ rows: rows(), version: '170000' }, { rows: rows(), version: '160004' }] });
+        expect(await refusal(() => main({ argv, env: { SPONSOR_DB_URL: 'x' }, connect: async () => second.sql, dir: DIR }))).toBe('no_pinned_fingerprint_for_server_major');
+        expect(second.calls).not.toContain('apply'); expect(second.calls).toContain('unlock');
+        const pre = fake({ inspections: [{ rows: rows(), version: '150002' }] });
+        expect(await refusal(() => main({ argv: argv.slice(0, 6), env: { SPONSOR_DB_URL: 'x' }, connect: async () => pre.sql, dir: DIR }))).toBe('no_pinned_fingerprint_for_server_major');
+    });
+    it('a lost session after the DDL is UNCERTAIN: no success, no catalog readback from the replacement connection; a new backend or a dropped lock both stop', async () => {
+        for (const lost of [{ lockHeldAfterApply: false }, { pidAfterApply: 9999 }]) {
+            const r = await go({ inspections: [{ rows: rows() }, { rows: rows() }, { rows: rows({}, 'present') }], ...lost });
+            expect(r.code).toBe(2); expect(r.receipt.result).toBe('apply_outcome_uncertain_session_lost'); expect(r.receipt.after).toBe('unknown');
+            expect(JSON.stringify(r.receipt)).not.toMatch(/applied_and_verified|already_present|schema_present_and_identical/);
+            expect(r.calls).toEqual(['inspect', 'lock', 'inspect', 'holds', 'apply', 'holds', 'unlock']);   // no inspection after the loss
+        }
+        const err = await go({ inspections: [{ rows: rows() }, { rows: rows() }, { rows: rows({}, 'present') }], applyError: '57P01', lockHeldAfterApply: false });
+        expect(err.receipt.result).toBe('apply_outcome_uncertain_session_lost'); expect(err.code).toBe(2);
     });
     it('a postflight that does not match the fingerprint is a failure, and the schema changing under the lock aborts before any DDL', async () => {
         const drift = await go({ inspections: [{ rows: rows() }, { rows: rows() }, { rows: rows({}, 'present'), fingerprint: 'e'.repeat(64) }] });
@@ -213,6 +234,27 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('runner against disposab
             await probe.unsafe(restore);
             expect((await run(pins())).receipt.result, `${name} restored`).toBe('present_identical_no_action_needed');
         }
+    });
+    it('a REAL connection loss right after the committed DDL is reported as uncertain, never as success; a fresh preflight then proves the truth', async () => {
+        await probe.unsafe(`drop table if exists public.ezil_sponsor_trial_claims, public.ezil_sponsor_attributions cascade; drop function if exists public.ezil_sponsor_attribution_guard(), public.ezil_sponsor_trial_claim_guard()`);
+        expect(await objects()).toBe(0);
+        let killed = 0;
+        const killingConnect = async (u: string) => {
+            const client = postgres(u, { max: 1, prepare: false, onnotice: () => undefined });
+            const [{ pid }] = await client`select pg_backend_pid() as pid`;
+            // The first statement on the runner's session is its identity query, so this pid is the runner's backend; terminate it right after the pinned SQL returns.
+            return new Proxy(client, { get: (target, prop, receiver) => prop === 'unsafe'
+                ? async (text: string, ...rest: unknown[]) => { const out = await (target.unsafe as (...a: unknown[]) => Promise<unknown>)(text, ...rest);
+                    if (text.includes('CREATE TABLE')) { await admin`select pg_terminate_backend(${pid as number})`; killed++; await new Promise(r => setTimeout(r, 200)); }
+                    return out; }
+                : Reflect.get(target, prop, receiver) });
+        };
+        const r = await run(apply(), url, { connect: killingConnect });
+        expect(killed).toBe(1);
+        expect(await objects()).toBe(2);                                                                 // the DDL really committed
+        expect(r.code).toBe(2); expect(r.receipt.result).toBe('apply_outcome_uncertain_session_lost'); expect(r.receipt.after).toBe('unknown');
+        expect(JSON.stringify(r.receipt)).not.toMatch(/applied_and_verified|already_present|identical/);
+        expect((await run(pins())).receipt.result).toBe('present_identical_no_action_needed');          // the operator's fresh preflight is the recovery
     });
     it('a function body changed in place is drift too, and a tampered SQL file is refused before any connection', async () => {
         await probe.unsafe(`create or replace function public.ezil_sponsor_trial_claim_guard() returns trigger language plpgsql set search_path = '' as $$ begin return new; end $$`);

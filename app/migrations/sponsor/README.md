@@ -15,10 +15,14 @@ applied or piggybacked.
 ## Runner contract
 - Target pinned by cluster system identifier AND exact `current_database()` AND exact `current_user` / `session_user`; no defaults.
 - Preflight rows must be exactly the nine known, unique names with one state row and every `ok` literally true; empty, missing, duplicate or unknown rows refuse.
-- A present schema is a no-op only if its fingerprint equals the pin for the server's MAJOR version (only 17 is pinned; an unlisted major refuses until a
-  review adds it). Any drift (RLS, ACL, index, column, constraint, trigger, policy, function) refuses and is never applied over.
+- PG 17 ONLY: every inspection (the first, and the one under the lock) refuses any other server major before a catalog row is read, so no DDL can follow on
+  an unlisted major. A present schema is a no-op only if its fingerprint equals the pinned one. Any drift (RLS, ACL, index, column, constraint, trigger,
+  policy, function) refuses and is never applied over.
 - Apply: exact file hashes on the command line, `--apply --yes`, one advisory lock, a re-inspection under it, the pinned SQL (one transaction), and the
-  post-inspection STILL under the same lock. After an error or a dropped connection the only truth is a fresh catalog inspection, which is reported.
+  post-inspection from the SAME locked session. An advisory lock dies with its session and a pooled client silently reconnects, so the runner records its
+  backend pid with the lock and proves, before and after the DDL, that this very backend still holds it. If it does not (connection lost), the result is
+  `apply_outcome_uncertain_session_lost` with exit 2: no success is claimed and no catalog readback from a replacement connection is used. The operator's fresh
+  preflight on the pinned target is the recovery.
 - Never reads `drizzle/` or any journal, never advances one, never runs on startup. The URL comes from a named environment variable and is never printed;
   the receipt holds digests, booleans and counts only.
 
