@@ -308,14 +308,24 @@ export function timeV3Html ({ computer, fairUse, plan }, usage = null) {
     ] });
 }
 
+/** Stored, undelivered grant receipts, not a balance-zero guess or a catalog allowance. */
+function deliveringCreditsV3 ({ ai }) {
+    const credits = (ai.enrollment ?? 'enrolled') === 'enrolled' ? ai.delivering?.credits : null;
+    return safeCount(credits) && credits > 0 ? credits : null;
+}
+
 /**
  * Identity credits (`ai.account`): every live grant in the total, from exact microcredit strings. The headline is
- * whole credits (floor); the details are exact to 2 decimals with every microcredit in their titles. Neither number
+ * whole credits (floor), including details and titles. Neither number
  * ever comes from the catalog: unreadable shows the last balance read for this user, as of its time, or "—".
  */
 function aiAccountMeterV3 (summary, { lastAccount = null, userId = null } = {}) {
     const { ai, plan } = summary;
     const view = accountCredits(ai.account, { previous: lastAccount, userId, planSku: plan?.sku });
+    const delivering = deliveringCreditsV3(summary);
+    const adding = delivering === null ? '' : `${whole(delivering)} credits are being added to your account.`;
+    if ( adding && (! view || view.empty) ) return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits',
+        value: 'Adding your AI credits…', notes: [view?.stale ? staleCreditsCopy(view.asOf) : '', adding, 'Used by EZiL AI in Code and Chat.'] });
     if ( ! view ) return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', value: '—',
         notes: ["We couldn't read your credits. Try again later.", 'Used by EZiL AI in Code and Chat.'] });
     const tone = view.empty ? 'danger' : ! view.stale && view.low ? 'warn' : 'ok';
@@ -327,6 +337,7 @@ function aiAccountMeterV3 (summary, { lastAccount = null, userId = null } = {}) 
     return meterRowV3({ role: 'meter-ai', id: 'ai-credits', label: 'AI credits', action: topupMeterAction(summary), value: `${view.left} credits left${view.total !== null ? ` of ${view.total}` : ''}`,
         percent: view.percent, tone, notes: [
             view.stale ? staleCreditsCopy(view.asOf) : view.empty ? '■ No credits left' : tone === 'warn' ? '! Running low' : '',
+            adding,
             { html: `<p class="ezil-billing-note" data-role="ai-details">${accountDetailsHtml(view.details, encode)}</p>` },
             ...view.expiring.map(item => `${item.remaining} ${expiry[item.kind]} · expire ${dateLabel(item.expiresAt, true)}`),
             awaitingPayment ? `${whole(pending.credits)} credits for this period. Added once your payment goes through.`
@@ -515,6 +526,7 @@ function planPrimaryV3 (summary) {
     const { plan, ai } = summary;
     // Identity credits: the AI meter's own warning (a large added grant beside a spent plan bucket is not low).
     const view = 'account' in ai ? accountCredits(ai.account) : undefined;
+    if ( deliveringCreditsV3(summary) !== null && (! view || view.empty) ) return '';
     const low = view === undefined ? ['low', 'exhausted'].includes(ai.state) : view !== null && (view.empty || view.low);
     if ( plan.sku === 'premium_monthly_v3' && low && topupOffer(summary) ) {
         return '<button type="button" class="ezil-settings-btn ezil-settings-btn-primary" data-action="open-topup">Add AI credits</button>';
@@ -524,6 +536,8 @@ function planPrimaryV3 (summary) {
 
 /** Beside the balance: the same top-up dialog every entry opens (secondary; the page keeps one primary). */
 function topupMeterAction (summary) {
+    const view = 'account' in summary.ai ? accountCredits(summary.ai.account) : null;
+    if ( deliveringCreditsV3(summary) !== null && (! view || view.empty) ) return '';
     return topupOffer(summary) ? '<button type="button" class="ezil-settings-btn ezil-billing-meter-action" data-action="topup">Add credits</button>' : '';
 }
 

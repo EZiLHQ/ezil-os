@@ -1,3 +1,4 @@
+import './billing-pending-test.mjs';
 import { v3CopyForAudit, honestyBans } from './billing-copy-test-helpers.mjs';
 // Billing v2: real shell + tRPC client, jsdom, fake fetch and injected sheets.
 import { summaryV3, trialSummaryV3 } from './billing-v3-fixtures.mjs';
