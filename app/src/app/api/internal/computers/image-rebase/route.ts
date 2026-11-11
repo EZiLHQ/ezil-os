@@ -11,6 +11,7 @@ import { workerTunnelClientFromEnv } from '@/server/lib/compute/aws-enroll';
 import { ReconcileReplacementRequestSchema, reconcileReplacementWithHistoricalSource } from '@/server/lib/compute/aws-historical-source';
 import { ReconcileReleaseRequestSchema, reconcileFailedRelease } from '@/server/lib/compute/aws-pool-release-recovery';
 import { createPoolDeps } from '@/server/lib/compute/aws-pool-runtime';
+import { CancelPreparationRequestSchema, cancelFailedPreparation } from '@/server/lib/compute/aws-rebase-cancel';
 import type { PlacementDb } from '@/server/lib/compute/placement';
 
 export const runtime = 'nodejs';
@@ -25,6 +26,7 @@ export async function POST(req: Request): Promise<Response> {
     catch { return Response.json({ authorized: false }, { status: 403, headers }); }
     if ((raw as { operation?: unknown } | null)?.operation === 'reconcile-replacement') return reconcileReplacement(raw);
     if ((raw as { operation?: unknown } | null)?.operation === 'reconcile-release') return reconcileRelease(raw);
+    if ((raw as { operation?: unknown } | null)?.operation === 'cancel-preparation') return cancelPreparation(raw);
     let input;
     try { input = ImageRebaseRequestSchema.parse(raw); }
     catch { return Response.json({ authorized: false }, { status: 403, headers }); }
@@ -60,6 +62,23 @@ async function reconcileReplacement(raw: unknown): Promise<Response> {
     }
 }
 
+
+/** Explicit cancel of a failed pre-snapshot image job: read-only AWS readers, no starter, normal store CAS on `apply`. */
+async function cancelPreparation(raw: unknown): Promise<Response> {
+    let input;
+    try { input = CancelPreparationRequestSchema.parse(raw); }
+    catch { return Response.json({ authorized: false }, { status: 403, headers }); }
+    try {
+        const { executions, describer } = sharedAwsSdkCollaborators();
+        if (!executions?.history || !describer?.describeVolume) return Response.json({ error: 'cancel_unavailable' }, { status: 503, headers });
+        const outcome = await cancelFailedPreparation({ store: createImageJobStore(db), executions, now: () => new Date(),
+            describer: { describeVolume: describer.describeVolume.bind(describer), describeForEnrollment: describer.describeForEnrollment.bind(describer) } }, input);
+        return Response.json({ schemaVersion: 1, computerId: input.computerId, jobId: input.expectedJobId, outcome }, { status: 200, headers });
+    } catch (error) {
+        return Response.json({ error: error instanceof ImageJobConflictError ? 'image_job_conflict' : 'cancel_unavailable' },
+            { status: error instanceof ImageJobConflictError ? 409 : 503, headers });
+    }
+}
 
 /** Failed-release recovery for the placement's expected job: the ordinary pool release recovery (normal reservation CAS,
  * release replay, retired-receipt settlement), never replacement, image or delete recovery. */

@@ -775,6 +775,59 @@ class ComputerTests(unittest.TestCase):
         self.assertEqual(send.call_args.args[0], COMPUTER.release_request(self.computer, self.job, own))
         self.assertIs(send.call_args.args[2], COMPUTER.release_response)
 
+    def test_cancel_preparation_is_explicit_dry_run_check_or_apply(self):
+        for computer, job in ((None, self.job), (self.computer, None), ('not-a-uuid', self.job)):
+            with self.assertRaises(ValueError):
+                COMPUTER.cancel_request(computer, job, 'apply')
+        with self.assertRaises(ValueError):
+            COMPUTER.cancel_request(self.computer, self.job, 'force')
+        calls = []
+        self.assertIsNone(COMPUTER.cancel(self.computer, self.job, False, False, self.secret, lambda v, s: calls.append(v)))
+        self.assertEqual(calls, [])  # neither flag: dry run, nothing sent
+        with self.assertRaises(ValueError):
+            COMPUTER.cancel(self.computer, self.job, True, True, self.secret, lambda v, s: calls.append(v))
+        self.assertEqual(calls, [])
+        for check, apply, mode, outcome in ((True, False, 'check', 'eligible'), (False, True, 'apply', 'cancelled')):
+            reply = dict(schemaVersion=1, computerId=self.computer, jobId=self.job, outcome=outcome)
+            self.assertEqual(COMPUTER.cancel(self.computer, self.job, check, apply, self.secret,
+                                             lambda v, s: calls.append((v, s)) or COMPUTER.cancel_response(reply, v)), reply)
+            self.assertEqual(calls[-1], (dict(schemaVersion=1, operation='cancel-preparation', computerId=self.computer,
+                                              expectedJobId=self.job, mode=mode), self.secret))
+
+    def test_cancel_preparation_response_is_exact(self):
+        sent = COMPUTER.cancel_request(self.computer, self.job, 'apply')
+        good = dict(schemaVersion=1, computerId=self.computer, jobId=self.job, outcome='cancelled')
+        self.assertEqual(COMPUTER.cancel_response(good, sent), good)
+        for outcome in ('not_applicable', 'execution_not_proven', 'provider_not_proven'):
+            self.assertEqual(COMPUTER.cancel_response(dict(good, outcome=outcome), sent)['outcome'], outcome)
+        for key, value in [('outcome', 'eligible'), ('outcome', 'settled'), ('jobId', self.computer), ('computerId', self.job),
+                           ('schemaVersion', True), ('extra', 1)]:
+            with self.assertRaises(ValueError):
+                COMPUTER.cancel_response(dict(good, **{key: value}), sent)
+        check = COMPUTER.cancel_request(self.computer, self.job, 'check')
+        self.assertEqual(COMPUTER.cancel_response(dict(good, outcome='eligible'), check)['outcome'], 'eligible')
+        self.assertEqual(COMPUTER.cancel_response(good, check)['outcome'], 'cancelled')  # replay of an already-cancelled job
+
+    def test_cancel_preparation_cli_flags_and_no_network_without_check_or_apply(self):
+        base = ['rebase_computer.py', 'cancel-preparation', '--computer', self.computer, '--job', self.job]
+        with patch.object(sys, 'argv', base), patch.object(COMPUTER.http.client, 'HTTPSConnection') as connection:
+            COMPUTER.main()
+        connection.assert_not_called()
+        for extra in (['--check', '--apply'], ['--source-execution-arn', self.source()], ['--journal', '/tmp/x.json'],
+                      ['--origin', 'https://os.ezil.work', '--apply']):
+            with patch.object(sys, 'argv', base + extra), patch.object(COMPUTER.http.client, 'HTTPSConnection') as connection, \
+                    self.assertRaises(ValueError):
+                COMPUTER.main()
+            connection.assert_not_called()
+        with patch.object(sys, 'argv', ['rebase_computer.py', 'verify', '--computer', self.computer, '--check']), self.assertRaises(ValueError):
+            COMPUTER.main()
+        with patch.object(sys, 'argv', base + ['--apply']), patch.dict(os.environ, {'EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET': self.secret}), \
+                patch.object(COMPUTER, 'send_reconcile', return_value=dict(schemaVersion=1, computerId=self.computer, jobId=self.job,
+                                                                             outcome='cancelled')) as send:
+            COMPUTER.main()
+        self.assertEqual(send.call_args.args[0], COMPUTER.cancel_request(self.computer, self.job, 'apply'))
+        self.assertIs(send.call_args.args[2], COMPUTER.cancel_response)
+
     def test_staging_origin_refuses_btgq_and_curomaa_without_http(self):
         for origin in ('https://btgq.supabase.co', 'https://curomaa.example.com', 'https://os.ezil.work', COMPUTER.ORIGIN + '/extra'):
             with patch.object(sys, 'argv', ['rebase_computer.py', 'plan', '--computer', self.computer, '--origin', origin]), self.assertRaises(ValueError):

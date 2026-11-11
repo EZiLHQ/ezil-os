@@ -279,6 +279,10 @@ const immutable = ['jobId', 'computerId', 'ownerUserId', 'parentJobId', 'region'
 const writeOnce = ['preparationExecutionArn', 'snapshotId', 'snapshotEvidence', 'launchJobId', 'launchDocument', 'launchDigest', 'launchExecutionArn',
     'targetGeneration', 'targetLeaseEpoch', 'targetFenceToken', 'recoveryJobId', 'recoveryDocument', 'recoveryDigest', 'recoveryExecutionArn',
     'restoredVolumeId', 'quarantinedVolumeId', 'rebindJobId', 'rebindDocument', 'rebindDigest', 'rebindExecutionArn', 'rebindGeneration', 'rebindLeaseEpoch', 'rebindFenceToken', 'hostEvidence'] as const;
+/** A failed top-level job that never got past preparation: nothing but the reservation and its preparation execution. */
+export const cancellablePreparation = (j: ImageJob) => j.phase === 'failed' && j.failureCode !== null && j.parentJobId === null
+    && j.preparationExecutionArn !== null && j.retentionHold && j.completedAt === null
+    && writeOnce.every(k => k === 'preparationExecutionArn' || j[k] === null);
 const valueSql = (j: ImageJob, key: keyof ImageJob, type: string) => {
     const value = j[key];
     // All three write paths validate RebaseTime before binding every timestamp.
@@ -438,6 +442,8 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
                     const row = await releasedPoolRow(tx, p);
                     if (p.state !== 'STOPPED' || row?.id !== released.poolHostId || row.lifecycle_digest !== released.lifecycleDigest) throw new ImageJobConflictError();
                 }
+                // R2: a retired regular source likewise: still STOPPED, and still no claim row that would select DESIGN R.
+                if (prep.intent.retiredSource && (p.state !== 'STOPPED' || await releasedPoolRow(tx, p))) throw new ImageJobConflictError();
                 const inserted = rowsOf(await tx.execute(sql`INSERT INTO public.ezil_computer_image_jobs (${columnNames})
                     VALUES (${sql.join(columns.map(([key, , type]) => valueSql(j, key, type)), sql`, `)}) RETURNING ${columnNames}`));
                 if (inserted.length !== 1) throw new ImageJobConflictError();
@@ -453,6 +459,20 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
             return withAdmission(db, async (tx, lock) => {
                 const p = await context(tx, lock, expected), next = await save(tx, expected, candidate);
                 if (candidate.phase === 'failed') await writeImagePlacement(tx, lock, p, { state: 'UNCONFIRMED', enrollNonceHash: null, enrollConsumedHash: null, enrollExpiresAt: null });
+                return next;
+            });
+        },
+        /** Operator cancel of a preparation proven to have mutated nothing (aws-rebase-cancel.ts). The failed placement
+         * returns to STOPPED and the reservation is released; the terminal row keeps its failure code and documents. */
+        async cancelPreparation(expected: ImageJob, now: Date): Promise<ImageJob> {
+            if (!cancellablePreparation(expected)) throw new ImageJobConflictError();
+            return withAdmission(db, async (tx, lock) => {
+                const p = await context(tx, lock, expected);
+                if (p.state !== 'UNCONFIRMED' || p.lifecycleJobId !== null || p.lifecycleDigest !== null || p.enrollNonceHash !== null
+                    || p.enrollConsumedHash !== null || p.enrollExpiresAt !== null) throw new ImageJobConflictError();
+                const at = time(expected, now);
+                const next = await save(tx, expected, { ...expected, phase: 'cancelled', retentionHold: false, completedAt: at, updatedAt: at });
+                await writeImagePlacement(tx, lock, p, { state: 'STOPPED', imageUpgradeJobId: null });
                 return next;
             });
         },
@@ -607,9 +627,10 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
         async transferRecovered(expected: ImageJob, evidence: { execution: Execution; host: Ec2EnrollmentView | null; volume: Ec2VolumeView | null }, childId: string, now: Date) {
             const r = verifyImageLaunch(expected, evidence.execution, evidence.host, evidence.volume, 'rebind');
             if (expected.phase !== 'rebind_pending' || expected.hostEvidence?.instanceId !== r.instanceId || !expected.hostEvidence.ebsRestore) throw new ImageJobConflictError();
-            // The child's source is the live rebind host, never the parent's released pool host.
+            // The child's source is the live rebind host, never the parent's released pool or retired regular host.
             const parent = JSON.parse(expected.preparationDocument);
             delete parent.releasedPoolHost;
+            delete parent.retiredSource;
             const preparation = buildRebasePreparation({ ...parent, jobId: childId,
                 sourceInstanceId: r.instanceId, sourceVolumeId: r.volumeId, sourceGeneration: r.generation, sourceLeaseEpoch: r.leaseEpoch,
                 sourceFenceToken: r.fenceToken, createdAt: now.toISOString() });

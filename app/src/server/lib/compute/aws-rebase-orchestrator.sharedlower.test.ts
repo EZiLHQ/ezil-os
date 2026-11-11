@@ -70,7 +70,7 @@ describe('shared lower source observation before reservation', () => {
         it.each(['absent', 'terminated', 'shutting-down', 'pending', 'unknown', 'wrong-instance', 'wrong-zone',
             'ezil:managed-by', 'ezil:stage', 'ezil:computer-id', 'ezil:generation', 'ezil:fence-token'])(`${operation} refuses source identity %s`, async fault => {
             const s = sharedLowerSetup();
-            if (fault === 'absent') s.provider.host = null;
+            if (fault === 'absent') { s.provider.host = null; s.provider.sourceListed = false; }
             else if (fault === 'wrong-instance') s.provider.host!.instanceId = 'i-99999999999999999';
             else if (fault === 'wrong-zone') s.provider.host!.availabilityZoneId = 'use1-az1';
             else if (fault.startsWith('ezil:')) s.provider.host!.tags = { ...s.provider.host!.tags, [fault]: 'foreign' };
@@ -109,12 +109,13 @@ describe('shared lower source observation before reservation', () => {
             expect((await s.run(operation)).body).toMatchObject({ eligible: false, failureCode: 'image_job_conflict', jobId: null });
             expect(s.fake.imageJobs).toHaveLength(0); expect(s.started).toHaveLength(0);
         });
-        it(`${operation} leaves unique 8dbc behavior unchanged with no source observation`, async () => {
+        it(`${operation} leaves unique 8dbc resolution unchanged; a STOPPED source is observed once only for R2 fencing`, async () => {
             const s = rebaseSetup(), f = fixtureReleaseRegistry106();
             s.env.EZIL_AWS_LIFECYCLE_DEPLOYMENTS = JSON.stringify({ [f.entry.region]: f.entry });
             s.fake.placements[0]!.lower_image_digest = LOWER_102;
             expect((await s.run(operation)).body).toMatchObject({ eligible: true, failureCode: null });
-            expect(s.deps.describer.describeForEnrollment).not.toHaveBeenCalled();
+            expect(s.deps.describer.describeForEnrollment).toHaveBeenCalledTimes(1);
+            expect(s.deps.describer.describeForEnrollment).toHaveBeenCalledWith(s.source.deployment.region, s.source.sourceInstanceId);
             if (operation === 'prepare') expect((await s.current()).sourceRelease).toEqual(f.release102);
         });
     }

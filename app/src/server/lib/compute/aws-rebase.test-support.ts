@@ -35,8 +35,15 @@ export function rebaseSetup(externalDb?: PlacementDb) {
     const ids = ['11111111-1111-4111-8111-111111111111', '44444444-4444-4444-8444-444444444444', '55555555-5555-4555-8555-555555555555', '66666666-6666-4666-8666-666666666666',
         '77777777-7777-4777-8777-777777777777', '88888888-8888-4888-8888-888888888888', '99999999-9999-4999-8999-999999999999'];
     const started: { stateMachineArn: string; name: string; input: string }[] = [];
+    /** The listed STOPPED source host the preparation helper fences itself (stop, then terminate). */
+    const sourceHost = (): Ec2EnrollmentView => ({ instanceId: source.sourceInstanceId, imageId: source.sourceDeployment.amiId, state: 'stopped',
+        instanceType: 'm6i.large', publicIp: null, availabilityZone: 'ap-south-1a', availabilityZoneId: source.deployment.zoneId, volumes: [],
+        tags: { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': source.deployment.namespace, 'ezil:computer-id': source.computerId,
+            'ezil:generation': String(source.sourceGeneration), 'ezil:fence-token': source.sourceFenceToken } });
     const provider = {
         restoredVolume: null as Ec2VolumeView | null, snapshot: null as RebaseSnapshotView | null, host: null as Ec2EnrollmentView | null,
+        /** EC2 still lists the STOPPED placement's own source instance (the plain path's precondition). False: aged out (R/R2). */
+        sourceListed: true,
         volume: { volumeId: source.sourceVolumeId, state: 'available', sizeGiB: source.volumeGiB, tags: { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': source.deployment.namespace,
             'ezil:computer-id': source.computerId, 'ezil:generation': String(source.sourceGeneration), 'ezil:fence-token': source.sourceFenceToken, 'ezil:backup': source.deployment.namespace }, attachments: [] as { instanceId: string; state: string }[], encrypted: true, kmsKeyId: source.deployment.dataKeyArn },
     };
@@ -46,7 +53,8 @@ export function rebaseSetup(externalDb?: PlacementDb) {
             executions.set(executionArn, { executionArn, input: work.input, stateMachineVersionArn: work.stateMachineArn, redriveCount: 0, status: 'RUNNING' });
         }) },
         executions: { describe: vi.fn(async (_region, arn) => { const e = executions.get(arn); if (!e) throw new AwsClientError('aws_config', false, 'ExecutionDoesNotExist'); return e; }) },
-        describer: { describeSnapshot: vi.fn(async () => provider.snapshot), describeVolume: vi.fn(async (_region, id) => id === provider.restoredVolume?.volumeId ? provider.restoredVolume : provider.volume), describeForEnrollment: vi.fn(async () => provider.host) },
+        describer: { describeSnapshot: vi.fn(async () => provider.snapshot), describeVolume: vi.fn(async (_region, id) => id === provider.restoredVolume?.volumeId ? provider.restoredVolume : provider.volume), describeForEnrollment: vi.fn(async (_region: string, id: string) =>
+            provider.host ?? (provider.sourceListed && id === source.sourceInstanceId ? sourceHost() : null)) },
         desktopHealthy: vi.fn(async () => true), meter: { stopped: vi.fn(async () => {}), ready: vi.fn(async () => {}), heartbeat: vi.fn(async () => {}) } };
     const run = (operation: ImageRebaseRequest['operation'], jobId: string | null = null) => handleImageRebase(deps, { schemaVersion: 1, operation, computerId: source.computerId, jobId });
     const current = async () => (await store.inspect(source.computerId)).job!;
@@ -112,6 +120,7 @@ type ReleaseIntent = LifecycleWork['intent'];
  * release executions with a Code-48 termination history. `shared`: 34ac-like lower whose 1.0.5/1.0.6 records share it. */
 export function releasedPoolSetup(options: { shared?: boolean; db?: PlacementDb } = {}) {
     const s = rebaseSetup(options.db), src = s.source, f = fixtureSharedLowerSuccessor();
+    s.provider.sourceListed = false;
     if (options.shared) { s.env.EZIL_AWS_LIFECYCLE_DEPLOYMENTS = JSON.stringify({ [f.entry.region]: f.entry }); s.fake.placements[0]!.lower_image_digest = LOWER_105; }
     const provisioned = options.shared ? f.deployment105 : LifecycleDeploymentSchema.parse(src.sourceDeployment);
     const provisionStart = new Date('2026-10-21T09:00:00.000Z'), releaseStart = new Date('2026-10-22T10:00:00.000Z');
@@ -164,4 +173,11 @@ export function releasedPoolSetup(options: { shared?: boolean; db?: PlacementDb 
             'ezil:fence': src.sourceFenceToken, 'aws:ec2launchtemplate:id': provisioned.launchTemplateId } });
     return { ...s, f, provisioned, row, histories, provisionArn, releaseArn, setProvision, setRelease, request, terminatedHost,
         provision: () => provision, release: () => release };
+}
+
+/** DESIGN R2: the same STOPPED computer and normal release, but its regular host was never a pool claim (no row). */
+export function retiredSourceSetup(options: { shared?: boolean; db?: PlacementDb } = {}) {
+    const s = releasedPoolSetup(options);
+    s.fake.poolHosts.splice(0);
+    return s;
 }

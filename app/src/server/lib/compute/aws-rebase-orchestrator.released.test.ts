@@ -254,12 +254,10 @@ describe('DESIGN R: a STOPPED computer whose warm-pool host was released', () =>
             sourceRetirementExecutionArn: s.releaseArn })).rejects.toThrow();
         expect(s.deps.executions.describe).not.toHaveBeenCalled();
     });
-    it('leaves a computer without a released row unchanged: no pool proof, unique lower unobserved', async () => {
+    it('without a released row an aged-out host is no longer reserved blind: R2 refuses it before reservation without a hint', async () => {
         const s = releasedPoolSetup(); s.fake.poolHosts.splice(0);
-        expect((await s.request('prepare', null)).status).toBe(202);
-        const j = await s.current();
-        expect(JSON.parse(j.preparationDocument)).not.toHaveProperty('releasedPoolHost');
-        expect(s.deps.describer.describeForEnrollment).not.toHaveBeenCalled(); expect(s.deps.executions.history).not.toHaveBeenCalled();
+        await refused(s, 'prepare', 'source_identity_mismatch', null);
+        expect(s.deps.describer.describeForEnrollment).toHaveBeenCalledTimes(1); expect(s.deps.executions.history).not.toHaveBeenCalled();
     });
     it('a recovered retry prepares from the live rebind host, never the released pool host', async () => {
         const s = releasedPoolSetup({ shared: true });

@@ -29,6 +29,8 @@ RECONCILE = 'reconcile-replacement'
 RECONCILE_OUTCOMES = {'settled', 'unconfirmed', 'generation_drift', 'not_applicable', 'launch_not_disproven', 'source_not_proven'}
 RECONCILE_RELEASE = 'reconcile-release'
 RELEASE_OUTCOMES = {'settled', 'recovering', 'waiting', 'unconfirmed', 'not_applicable', 'source_not_proven'}
+CANCEL = 'cancel-preparation'
+CANCEL_OUTCOMES = {'cancelled', 'eligible', 'not_applicable', 'execution_not_proven', 'provider_not_proven'}
 # The hint must name one execution of the selected namespace lifecycle machine; the server re-reads and proves everything.
 SOURCE_EXECUTION = re.escape(json_tool.MACHINE.replace(':stateMachine:', ':execution:') + ':computer-') + UUID
 
@@ -162,6 +164,33 @@ def reconcile_release(computer, job, execution, apply, secret, sender=None):
     return observed
 
 
+def cancel_request(computer, job, mode):
+    need(wire.matches(UUID, computer) and wire.matches(UUID, job), 'cancel-preparation requires the exact computer and failed job UUIDs')
+    need(mode in ('check', 'apply'), 'invalid cancel mode')
+    return dict(schemaVersion=1, operation=CANCEL, computerId=computer, expectedJobId=job, mode=mode)
+
+
+def cancel_response(value, sent):
+    need(isinstance(value, dict) and set(value) == {'schemaVersion', 'computerId', 'jobId', 'outcome'}, 'cancel response fields mismatch')
+    need(type(value['schemaVersion']) is int and value['schemaVersion'] == 1, 'cancel response version mismatch')
+    need(value['computerId'] == sent['computerId'] and value['jobId'] == sent['expectedJobId'], 'cancel response names another computer or job')
+    # A check may replay an already-cancelled job; an apply never answers "eligible" (it cancels or refuses).
+    need(value['outcome'] in CANCEL_OUTCOMES and not (sent['mode'] == 'apply' and value['outcome'] == 'eligible'), 'cancel outcome mismatch')
+    return {k: value[k] for k in ('schemaVersion', 'computerId', 'jobId', 'outcome')}
+
+
+def cancel(computer, job, check, apply, secret, sender=None):
+    """Explicit cancel of a failed pre-snapshot image job: dry run by default, --check proves only, --apply cancels."""
+    need(not (check and apply), 'choose --check or --apply, not both')
+    sent = cancel_request(computer, job, 'apply' if apply else 'check')
+    if not (check or apply):
+        print('DRY RUN: ' + json.dumps(sent, separators=(',', ':')) + '; add --check to prove or --apply to cancel')
+        return None
+    observed = (sender or (lambda value, key: send_reconcile(value, key, cancel_response)))(sent, secret)
+    print(json.dumps(observed, separators=(',', ':')))
+    return observed
+
+
 def operate(operation, computer, job, journal, apply, secret, sender=send, retirement=None):
     sent = request(operation, computer, job, retirement)
     journal = context.path(journal)
@@ -215,7 +244,7 @@ def operate(operation, computer, job, journal, apply, secret, sender=send, retir
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=(*OPERATIONS, RECONCILE, RECONCILE_RELEASE))
+    parser.add_argument('operation', choices=(*OPERATIONS, RECONCILE, RECONCILE_RELEASE, CANCEL))
     parser.add_argument('--computer')
     parser.add_argument('--job')
     parser.add_argument('--source-execution-arn')
@@ -224,9 +253,16 @@ def main():
     parser.add_argument('--namespace', choices=('mum', 'prd'), default='mum')
     parser.add_argument('--origin')
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
     use_namespace(args.namespace)
     need(args.origin in (None, ORIGIN), 'namespace authority origin mismatch')
+    need(not args.check or args.operation == CANCEL, '--check is only for cancel-preparation')
+    if args.operation == CANCEL:
+        need(args.source_execution_arn is None and args.source_retirement_execution_arn is None and args.journal is None,
+             'cancel-preparation takes only --computer, --job and --check or --apply')
+        cancel(args.computer, args.job, args.check, args.apply, os.environ.get('EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET', ''))
+        return
     need(args.source_retirement_execution_arn is None or args.operation in ('plan', 'prepare'), 'retirement hint is only for plan or prepare')
     if args.operation == RECONCILE:
         reconcile_request(args.computer, args.job, args.source_execution_arn)

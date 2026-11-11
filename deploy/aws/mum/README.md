@@ -826,9 +826,11 @@ The computer interface uses the existing
 AWS account/region and the HTTPS staging origin are fixed; other origins,
 including btgq/curomaa, refuse. `plan` and `verify` are read/reconcile operations.
 `prepare`, `launch` and `recover` print a dry run unless `--apply` is present.
-For a STOPPED computer whose warm-pool host was released, `plan`/`prepare` also take
+For a STOPPED computer whose warm-pool host was released, or whose regular host was
+released and EC2 no longer lists it, `plan`/`prepare` also take
 `--source-retirement-execution-arn`: the release execution that the server re-proves
-(`docs/aws-computers/RELEASED-POOL-REBASE-RUNBOOK.md`).
+(`docs/aws-computers/RELEASED-POOL-REBASE-RUNBOOK.md`, Design R and R2). Without it, an
+aged-out regular source is refused before reservation.
 
 ```bash
 bash deploy/aws/mum/rebase-computer.sh plan --computer "$CANARY_COMPUTER_ID"

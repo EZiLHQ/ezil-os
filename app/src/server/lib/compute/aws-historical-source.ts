@@ -145,29 +145,59 @@ export function proveReleasedPoolHost(p: Placement, d: LifecycleDeployment, row:
         if (!pr.success || pr.data.jobId !== i.jobId || pr.data.digest !== w.digest || pr.data.computerId !== i.computerId
             || pr.data.generation !== i.targetGeneration || pr.data.leaseEpoch !== i.leaseEpoch || pr.data.fenceToken !== i.fenceToken
             || pr.data.poolHostId !== i.poolHostId || pr.data.poolGeneration !== i.poolGeneration || pr.data.instanceId !== p.instanceId) return null;
-        // The hint names an execution of this namespace's lifecycle machine; its job is re-derived and every binding re-read.
-        const job = RELEASE_JOB.exec(requestedArn)?.[1];
-        if (!job || job === i.jobId || lifecycleExecutionArn(d, job) !== requestedArn || release.executionArn !== requestedArn
-            || release.status !== 'SUCCEEDED' || release.redriveCount !== 0 || release.stateMachineAliasArn || !release.input || !release.output
-            || !(release.startDate instanceof Date) || !(release.stopDate instanceof Date)
-            || !(provision.stopDate.getTime() < release.startDate.getTime()) || !(release.startDate.getTime() <= release.stopDate.getTime())
-            || !(release.stopDate.getTime() <= now.getTime())) return null;
-        const work = releaseWork(release.input);
-        if (!work) return null;
-        const r = work.intent;
-        if (release.executionArn !== lifecycleExecutionArn(r.deployment, r.jobId) || release.stateMachineVersionArn !== work.stateMachineArn
-            || r.computerId !== p.computerId || r.providerInstanceId !== p.instanceId || r.dataVolumeId !== p.volumeId
-            || r.targetGeneration !== p.generation || r.fenceToken !== p.fenceToken || r.leaseEpoch !== p.leaseEpoch || !sameAuthority(r.deployment, d)) return null;
-        const receipt = LifecycleReceiptSchema.safeParse(parse(release.output));
-        if (!receipt.success) return null;
-        const x = receipt.data;
-        if (x.jobId !== r.jobId || x.digest !== work.digest || x.computerId !== p.computerId || x.generation !== p.generation
-            || x.leaseEpoch !== p.leaseEpoch || x.fenceToken !== p.fenceToken || x.instanceId !== p.instanceId
-            || x.volumeId !== p.volumeId || x.state !== 'retired' || x.instanceLost) return null;
-        if (!terminationWitnessed(events, { input: release.input, output: release.output, startedAt: release.startDate,
-            stoppedAt: release.stopDate, region: d.region }, p.instanceId)) return null;
+        if (!provePlacementRelease(p, d, release, events, requestedArn, now, { after: provision.stopDate, otherJob: i.jobId })) return null;
         return { poolHostId: i.poolHostId!, lifecycleDigest: w.digest, releaseExecutionArn: requestedArn, provisioned: i.deployment };
     } catch { return null; }
+}
+
+/** (a) above, shared: the operator-named release execution (a lookup hint, re-derived) retired exactly this STOPPED placement's
+ * allocation (computer, instance, volume, generation, fence, lease epoch, account/region/zone/namespace) with a strict `retired`
+ * receipt and a complete history positively witnessing `terminated` for exactly that instance, finished no later than `now`. */
+function provePlacementRelease(p: Placement, d: LifecycleDeployment, release: Execution, events: readonly HistoryEvent[], requestedArn: string,
+    now: Date, bound: { after?: Date; otherJob?: string } = {}): boolean {
+    if (p.state !== 'STOPPED' || !p.instanceId || !p.volumeId || !p.fenceToken || p.region !== d.region || p.zoneId !== d.zoneId) return false;
+    // The hint names an execution of this namespace's lifecycle machine; its job is re-derived and every binding re-read.
+    const job = RELEASE_JOB.exec(requestedArn)?.[1];
+    if (!job || job === bound.otherJob || lifecycleExecutionArn(d, job) !== requestedArn || release.executionArn !== requestedArn
+        || release.status !== 'SUCCEEDED' || release.redriveCount !== 0 || release.stateMachineAliasArn || !release.input || !release.output
+        || !(release.startDate instanceof Date) || !(release.stopDate instanceof Date)
+        || (bound.after && !(bound.after.getTime() < release.startDate.getTime())) || !(release.startDate.getTime() <= release.stopDate.getTime())
+        || !(release.stopDate.getTime() <= now.getTime())) return false;
+    const work = releaseWork(release.input);
+    if (!work) return false;
+    const r = work.intent;
+    if (release.executionArn !== lifecycleExecutionArn(r.deployment, r.jobId) || release.stateMachineVersionArn !== work.stateMachineArn
+        || r.computerId !== p.computerId || r.providerInstanceId !== p.instanceId || r.dataVolumeId !== p.volumeId
+        || r.targetGeneration !== p.generation || r.fenceToken !== p.fenceToken || r.leaseEpoch !== p.leaseEpoch || !sameAuthority(r.deployment, d)) return false;
+    const receipt = LifecycleReceiptSchema.safeParse(parse(release.output));
+    if (!receipt.success) return false;
+    const x = receipt.data;
+    if (x.jobId !== r.jobId || x.digest !== work.digest || x.computerId !== p.computerId || x.generation !== p.generation
+        || x.leaseEpoch !== p.leaseEpoch || x.fenceToken !== p.fenceToken || x.instanceId !== p.instanceId
+        || x.volumeId !== p.volumeId || x.state !== 'retired' || x.instanceLost) return false;
+    return terminationWitnessed(events, { input: release.input, output: release.output, startedAt: release.startDate,
+        stoppedAt: release.stopDate, region: d.region }, p.instanceId);
+}
+
+/** DESIGN R2: a STOPPED computer whose regular (non-pool) host was released by the normal `release` and has aged out of EC2.
+ * There is no claim row or provision: the source release still comes from the registry by the placement's observed lower,
+ * and only (a) proves the writer is gone. EC2 absence is never termination. */
+export interface RetiredSourceProof { releaseExecutionArn: string }
+export function proveRetiredSource(p: Placement, d: LifecycleDeployment, release: Execution, events: readonly HistoryEvent[],
+    requestedArn: string, now: Date): RetiredSourceProof | null {
+    try { return provePlacementRelease(p, d, release, events, requestedArn, now) ? { releaseExecutionArn: requestedArn } : null; }
+    catch { return null; }
+}
+
+/** Read-only SFN reads for proveRetiredSource; the same "not proven" rules as readReleasedPoolHostProof. */
+export async function readRetiredSourceProof(executions: LifecycleExecutionReader, p: Placement, d: LifecycleDeployment,
+    requestedArn: string | undefined, now: Date): Promise<RetiredSourceProof | null> {
+    const job = requestedArn ? RELEASE_JOB.exec(requestedArn)?.[1] : undefined;
+    if (!requestedArn || !job || lifecycleExecutionArn(d, job) !== requestedArn || !executions.history || !p.region) return null;
+    try {
+        const release = await executions.describe(p.region, requestedArn);
+        return proveRetiredSource(p, d, release, await executions.history(p.region, requestedArn), requestedArn, now);
+    } catch (error) { if (isExecutionAbsent(error)) return null; throw error; }
 }
 
 /** Read-only SFN reads for proveReleasedPoolHost. No hint or history reader, a malformed hint or an absent execution is
