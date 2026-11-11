@@ -349,7 +349,8 @@ describe('staging AI enrollment with a bounded owned connection', () => {
         expect([...receipts.keys()]).toEqual([`ezil-os:v1:free-once:${userId}:grant`]);
         expect(clients[0].role).toBe('postgres');
         expect(warn).not.toHaveBeenCalled();
-        expect(info.mock.calls).toEqual([[JSON.stringify({ event: 'ai-enroll', source: 'auth0', stage: 'done', code: null })]]);
+        // The starter delivery is skipped here (no funding secret in this fixture); it is logged as a fixed word, never an id.
+        expect(info.mock.calls).toEqual([[JSON.stringify({ event: 'ai-enroll', source: 'auth0', stage: 'done', code: null, starter: 'skipped' })]]);
     });
 
     it('retries the same entitlement after an outbox rollback without changing existing membership', async () => {
@@ -569,7 +570,7 @@ describe('round 5 D1: coded enrollment split (enrollAiMember)', () => {
         expect(kick.statement).toMatch(/last_error in \('no_ai_account', 'account_not_found'\)/);
         expect(kick.statement).toMatch(/delivered_at is null/);
         expect(kick.statement).not.toMatch(/attempts/);
-        expect(info.mock.calls).toEqual([line('auth0', 'done', null)]);
+        expect(info.mock.calls).toEqual([[JSON.stringify({ event: 'ai-enroll', source: 'auth0', stage: 'done', code: null, starter: 'skipped' })]]);
     });
 
     it.each([...AI_ENROLL_SQL_REFUSALS, 'unknown_refusal'] as const)('isAiEnrollRefusal(%s) is true', code => {

@@ -170,11 +170,14 @@ export function fixtureReleaseRegistry27() {
         deployment133: { ...f.deployment132, amiId: release133.amiId } };
 }
 
-/** Synthetic twenty-eighth normal record at the count cap; not actual release proof. */
-export function fixtureReleaseRegistry28() {
+
+/** Synthetic twenty-eighth and twenty-ninth records; not actual release proof. */
+export function fixtureReleaseRegistry29() {
     const f = fixtureReleaseRegistry27();
     const release134 = { ...f.release133, amiId: 'ami-00000000000000028', recipeVersion: '1.0.34',
         createdAt: '2026-11-09T20:00:00.000Z' };
-    return { ...f, release134, retained: [...f.retained, release134],
-        deployment134: { ...f.deployment133, amiId: release134.amiId } };
+    const release135 = { ...release134, amiId: 'ami-00000000000000029', recipeVersion: '1.0.35',
+        createdAt: '2026-11-10T20:00:00.000Z' };
+    return { ...f, release134, release135, retained: [...f.retained, release134, release135],
+        deployment135: { ...f.deployment133, amiId: release135.amiId } };
 }

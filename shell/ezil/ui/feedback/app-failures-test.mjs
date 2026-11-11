@@ -292,7 +292,9 @@ try {
         assert.doesNotMatch(noticed().textContent, /steps|expected|reproduc/i);
         const frozen = body(); a.send(failure(102));
         form().dispatchEvent(new window.Event('input', { bubbles: true })); assert.equal(body(), frozen);
-        current().querySelector('[data-action="refresh-diagnostics"]').click();
+        // A fresh snapshot is taken only when the compact dialog is explicitly reopened.
+        close(); setCurrentComputer({ id: A }); open();
+        assert.equal(payload().computerId, A);
         assert.equal(payload().diagnostics.appFailures[0].eventId, uuid(102));
         assert.equal(calls.length, count, 'prefill and consent never send');
         change(false); assert.equal(payload().diagnostics, null); assert.equal(line().hidden, true);

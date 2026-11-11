@@ -56,7 +56,7 @@ jobs:
       # Expression == ignores case; every image and deploy job needs this job.
       - name: Refuse case variants of admitted refs
         run: |
-          for ref in refs/heads/preview refs/heads/main refs/heads/staging/os-union-20261106; do
+          for ref in refs/heads/preview refs/heads/main refs/heads/staging/os-union-20261106 refs/heads/staging/os-signup-feedback-hotfix-20261111; do
             if [[ "${GITHUB_REF,,}" == "$ref" && "$GITHUB_REF" != "$ref" ]]; then
               echo "::error::$GITHUB_REF is a case variant of $ref"
               exit 1
@@ -154,20 +154,21 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          # Artifact names cannot contain the union branch's slash.
-          name: live-changes-${{ github.ref == 'refs/heads/staging/os-union-20261106' && 'staging-os-union-20261106' || github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
+          # Artifact names cannot contain admitted staging branches' slashes.
+          name: live-changes-${{ github.ref == 'refs/heads/staging/os-union-20261106' && 'staging-os-union-20261106' || github.ref == 'refs/heads/staging/os-signup-feedback-hotfix-20261111' && 'staging-os-signup-feedback-hotfix-20261111' || github.ref_name }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: live-evidence
           if-no-files-found: warn
 
   images:
     name: Build and test release images
     needs: changes
-    # The qualified staging union is admitted only by a manual dispatch of that exact
-    # branch; it builds and deploys this run's own github.sha like a preview push.
+    # Qualified staging refs require a manual dispatch and build this run's own SHA.
+    # The signup/feedback hotfix is image-only; deployment guards remain separate.
     if: >-
       needs.changes.outputs.image_changed == 'true' &&
       (github.ref == 'refs/heads/preview' || github.ref == 'refs/heads/main' ||
-       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/staging/os-union-20261106'))
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/staging/os-union-20261106') ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/staging/os-signup-feedback-hotfix-20261111'))
     permissions:
       contents: read
       packages: write

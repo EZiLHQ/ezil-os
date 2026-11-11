@@ -1224,9 +1224,28 @@ describe('reverse import: one queue per Durable Object (§4.1)', () => {
     const f = await fixture();
     await f.copied();
     await f.verify();
-    f.r2.timing.latencyMs = 2;
+    // Authenticated requests sign and verify asynchronously: invocation order is
+    // not queue-arrival order. Hold the commit's first read until abort is queued.
+    let readEntered!: () => void, releaseRead!: () => void, abortEntered!: () => void;
+    const reading = new Promise<void>(resolve => { readEntered = resolve; });
+    const resumeRead = new Promise<void>(resolve => { releaseRead = resolve; });
+    const abortQueued = new Promise<void>(resolve => { abortEntered = resolve; });
+    const get = f.r2.bucket.get;
+    let held = false;
+    f.r2.bucket.get = async key => {
+      if (!held) { held = true; readEntered(); await resumeRead; }
+      return get(key);
+    };
+    const reverseImport = f.fake.reverseImport.bind(f.fake);
+    f.fake.reverseImport = (request: ReturnType<typeof parseImportRequest>, routeName: string) => {
+      const pending = reverseImport(request, routeName);
+      if (request.op === 'abort') abortEntered();
+      return pending;
+    };
     const commit = f.commit();
+    await reading;
     const abort = f.abort();
+    try { await abortQueued; } finally { releaseRead(); }
     expect((await commit).status).toBe(200);
     expect(await abort).toEqual({ status: 409, body: { ok: false, error: 'already_imported' } });
     expect(f.r2.json(HEAD).generation).toBe(GEN);

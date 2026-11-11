@@ -1640,7 +1640,7 @@ body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;backgro
 .ezil-feedback-chip:focus-visible{outline:0}
 .ezil-feedback-chip:focus-visible svg{outline:3px solid var(--fb-accent);outline-offset:2px}
 .ezil-feedback-dialog :focus-visible{outline:3px solid var(--fb-accent);outline-offset:3px}
-.ezil-feedback-dialog{box-sizing:border-box;width:min(560px,calc(100vw - 24px));max-height:calc(100dvh - 32px);margin:auto;padding:24px;overflow:auto;border:1px solid var(--fb-border);border-radius:16px;background:var(--fb-bg);color:var(--fb-text);box-shadow:0 16px 60px rgb(0 0 0 / .5);font:14px/1.5 system-ui,sans-serif}
+.ezil-feedback-dialog{box-sizing:border-box;width:min(480px,calc(100vw - 24px));max-height:calc(100dvh - 32px);margin:auto;padding:24px;overflow:auto;border:1px solid var(--fb-border);border-radius:16px;background:var(--fb-bg);color:var(--fb-text);box-shadow:0 16px 60px rgb(0 0 0 / .5);font:14px/1.5 system-ui,sans-serif}
 .ezil-feedback-dialog::backdrop{background:rgb(4 6 12 / .7)}
 .ezil-feedback-dialog.ezil-feedback-capturing{visibility:hidden}
 .ezil-feedback-dialog.ezil-feedback-capturing::backdrop{background:0 0}
@@ -1658,7 +1658,6 @@ body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;backgro
 .ezil-feedback-dialog button{border:1px solid var(--fb-border);border-radius:7px;background:var(--fb-field);color:inherit;padding:8px 12px;font:inherit;cursor:pointer}
 .ezil-feedback-dialog button[type=submit]{background:var(--ezil-accent,#00adb5);border-color:var(--ezil-accent,#00adb5);color:var(--ezil-accent-contrast,#04060c);font-weight:600}
 .ezil-feedback-dialog button:disabled{opacity:.55;cursor:default}
-.ezil-feedback-preview{margin-top:16px}
 .ezil-feedback-preview summary{cursor:pointer}
 .ezil-feedback-preview pre{max-height:230px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding:10px;background:var(--fb-surface);font-size:12px;user-select:text}
 .ezil-feedback-image{margin:4px 0}
@@ -1696,13 +1695,26 @@ body.device-desktop,body.device-phone,body.device-tablet{overflow:hidden;backgro
 .ezil-feedback-chip[data-look=outline]:focus-visible,.ezil-feedback-chip[data-look=outline]:hover{opacity:1}
 .ezil-feedback-chip[data-look=outline] svg{padding:4px;background:0 0;box-shadow:inset 0 0 0 1px currentColor}
 .ezil-feedback-chip[data-look=outline]:focus-visible svg{outline-width:2px;outline-offset:1px}
-.ezil-feedback-footer{position:sticky;bottom:0;z-index:1;margin-top:12px;padding:4px 0 12px;background:var(--fb-bg)}
+.ezil-feedback-footer{position:sticky;bottom:0;z-index:1;padding:4px 0 12px;background:var(--fb-bg)}
 .ezil-feedback-details{margin:4px 0 8px}
 .ezil-feedback-details>summary{cursor:pointer;color:var(--fb-muted)}
 [data-role=capture-scope]{font-size:12px;line-height:1.35;margin:6px 0}
 [data-role=capture-scope] .ezil-feedback-link{display:inline;padding:0;min-height:0;border:0;background:0 0;color:var(--fb-accent);text-decoration:underline;font:inherit;cursor:pointer}
 .ezil-feedback-capture-options{margin:8px 0}
 .ezil-feedback-capture-options>summary{cursor:pointer}
+.ezil-feedback-consents{display:flex;flex-wrap:wrap;gap:4px 20px;margin:8px 0}
+.ezil-feedback-consents .ezil-feedback-consent{margin:0}
+.ezil-feedback-dropzone{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:10px;border:1px dashed var(--fb-border);border-radius:7px}
+.ezil-feedback-dropzone .ezil-feedback-muted{margin:0}
+.ezil-feedback-upload{color:var(--fb-accent);text-decoration:underline;cursor:pointer;padding:4px}
+.ezil-feedback-dragging .ezil-feedback-dropzone{border-color:var(--fb-accent);background:var(--fb-field)}
+.ezil-feedback-images{margin-top:8px}
+#ezil-feedback-counter:empty,.ezil-feedback-result:empty{display:none}
+.ezil-feedback-preview{margin-top:12px}
+.ezil-feedback-footer{margin-top:8px;padding-bottom:0}
+@media (any-pointer:coarse){
+.ezil-feedback-upload{min-height:36px;display:inline-flex;align-items:center}
+}
 .ezil-redact-editor{box-sizing:border-box;width:min(1100px,calc(100vw - 24px));max-width:calc(100vw - 24px);max-height:calc(100dvh - 24px);margin:auto;padding:20px;overflow:auto;border:1px solid #5f6879;border-radius:12px;background:#17202e;color:#f5f7fb;font:14px/1.45 system-ui,sans-serif;color-scheme:dark}
 .ezil-redact-editor::backdrop{background:rgb(0 0 0 / 70%)}
 .ezil-redact-editor h2{margin:0 0 8px;color:inherit;font-size:20px}
