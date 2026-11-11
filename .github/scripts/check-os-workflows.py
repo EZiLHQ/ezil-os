@@ -2,6 +2,7 @@
 from pathlib import Path
 import json
 import ast
+import os
 import re
 import shlex
 import subprocess
@@ -201,12 +202,55 @@ assert images['if'] == ("needs.changes.outputs.image_changed == 'true' && "
 assert images['uses'] == './.github/workflows/image.yml'
 assert images['with']['source'] == '${{ github.sha }}'
 assert images['secrets'] == 'inherit'
-image_steps = workflows['image']['jobs']['images']['steps']
+image_workflow = workflows['image']
+image_on = image_workflow.get('on', image_workflow.get(True))
+# The reusable call contract is unchanged; the manual entry point takes no input at all.
+assert set(image_on) == {'workflow_call', 'workflow_dispatch'}
+assert image_on['workflow_call'] == {'inputs': {'source': {'required': True, 'type': 'string'}},
+                                     'outputs': {'desktop_ref': {'value': '${{ jobs.images.outputs.desktop_ref }}'}}}
+assert image_on['workflow_dispatch'] in (None, {})
+image_job = image_workflow['jobs']['images']
+# One resolved source: the called source, else (dispatch only, admitted below) the dispatched commit.
+assert image_job['env'] == {'EZIL_DEPLOY_SHA': "${{ inputs.source != '' && inputs.source || github.sha }}"}
+image_steps = image_job['steps']
+admit, checkout = image_steps[0], image_steps[1]
+assert admit['name'].startswith('Admit') and checkout['uses'].startswith('actions/checkout@')
+assert checkout['with'] == {'ref': '${{ env.EZIL_DEPLOY_SHA }}', 'persist-credentials': False}
+assert admit['env'] == {'CALLED_SOURCE': '${{ inputs.source }}', 'EVENT_NAME': '${{ github.event_name }}',
+                        'EVENT_REF': '${{ github.ref }}', 'EVENT_SHA': '${{ github.sha }}'}
+assert '${{' not in admit['run']
+# Every other use of the source goes through the resolved env value, never inputs.source directly.
+assert 'inputs.source' not in yaml.safe_dump(image_steps[1:])
 image_runs = '\n'.join(step.get('run', '') for step in image_steps)
-assert image_runs.index('image-plan.mjs') < image_runs.index('build-images.sh') < image_runs.index('test-desktop.sh') < image_runs.index('tested: true')
+assert image_runs.index('CALLED_SOURCE') < image_runs.index('image-plan.mjs') < image_runs.index('build-images.sh') < image_runs.index('test-desktop.sh') < image_runs.index('tested: true')
+assert 'test "$(git rev-parse HEAD)" = "$EZIL_DEPLOY_SHA"' in image_runs
 assert any(step.get('uses', '').startswith('actions/upload-artifact@') and
-           step['with']['name'] == 'os-images-${{ inputs.source }}' and
+           step['with']['name'] == 'os-images-${{ env.EZIL_DEPLOY_SHA }}' and
            'tested-images.json' in step['with']['path'] for step in image_steps)
+
+
+def image_admits(called, event, ref, sha):
+    """Runs the real admission script with GitHub's resolution of EZIL_DEPLOY_SHA for these contexts."""
+    env = {'PATH': os.environ['PATH'], 'CALLED_SOURCE': called, 'EVENT_NAME': event, 'EVENT_REF': ref, 'EVENT_SHA': sha,
+           'EZIL_DEPLOY_SHA': called or sha}
+    return subprocess.run(['bash', '-eo', 'pipefail', '-c', admit['run']], env=env, capture_output=True).returncode == 0
+
+
+main_sha, other_sha = 'a' * 40, 'b' * 40
+# A called run is admitted exactly as before, whatever the caller's own event (preview dispatches on main too).
+for event, ref in (('push', 'refs/heads/preview'), ('push', 'refs/heads/main'), ('workflow_dispatch', 'refs/heads/main')):
+    assert image_admits(other_sha, event, ref, main_sha), (event, ref)
+assert image_admits('', 'workflow_dispatch', 'refs/heads/main', main_sha)
+# Without a called source: only a dispatch of main, pinned to a full dispatched commit; refused before any build.
+for event, ref in (('workflow_dispatch', 'refs/heads/preview'), ('workflow_dispatch', 'refs/heads/main-x'),
+                   ('workflow_dispatch', 'refs/tags/v1.0.0'), ('workflow_dispatch', 'refs/pull/1/merge'),
+                   ('push', 'refs/heads/main'), ('schedule', 'refs/heads/main'), ('workflow_call', 'refs/heads/main')):
+    assert not image_admits('', event, ref, main_sha), (event, ref)
+for sha in ('', 'a' * 39, 'A' * 40, 'main'):
+    assert not image_admits('', 'workflow_dispatch', 'refs/heads/main', sha), sha
+pinned_env = {'PATH': os.environ['PATH'], 'CALLED_SOURCE': '', 'EVENT_NAME': 'workflow_dispatch', 'EVENT_REF': 'refs/heads/main',
+              'EVENT_SHA': main_sha, 'EZIL_DEPLOY_SHA': other_sha}
+assert subprocess.run(['bash', '-eo', 'pipefail', '-c', admit['run']], env=pinned_env, capture_output=True).returncode != 0
 
 bypass = 'VERCEL_AUTOMATION_BYPASS_SECRET'
 assert bypass not in yaml.safe_dump({key: value for key, value in preview.items() if key != 'jobs'})

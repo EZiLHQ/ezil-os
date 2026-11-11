@@ -1,4 +1,6 @@
 # Called with the admitted source SHA: no independent push/path/tag race.
+# A manual dispatch qualifies exactly the dispatched main commit (github.sha) through the same build, tests, signing and
+# attestation; it takes no source input, and any other ref or event without a called source is refused before any build.
 name: Image
 on:
   workflow_call:
@@ -9,6 +11,7 @@ on:
     outputs:
       desktop_ref:
         value: ${{ jobs.images.outputs.desktop_ref }}
+  workflow_dispatch:
 permissions:
   contents: read
   packages: write
@@ -24,11 +27,25 @@ jobs:
     outputs:
       desktop_ref: ${{ steps.build.outputs.desktop_ref }}
     env:
-      EZIL_DEPLOY_SHA: ${{ inputs.source }}
+      # A called run keeps its admitted source. github.event_name is the caller's event inside a reusable call,
+      # so the manual path is selected only by the absence of a called source and admitted by the step below.
+      EZIL_DEPLOY_SHA: ${{ inputs.source != '' && inputs.source || github.sha }}
     steps:
+      - name: Admit a called source, or a manual dispatch of the current main commit only
+        env:
+          CALLED_SOURCE: ${{ inputs.source }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_REF: ${{ github.ref }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          [[ -n "$CALLED_SOURCE" ]] && exit 0
+          if [[ "$EVENT_NAME" != workflow_dispatch || "$EVENT_REF" != refs/heads/main ]]; then
+            echo "::error::manual image qualification runs only as workflow_dispatch on refs/heads/main"; exit 1
+          fi
+          [[ "$EVENT_SHA" =~ ^[0-9a-f]{40}$ && "$EZIL_DEPLOY_SHA" == "$EVENT_SHA" ]] || { echo "::error::manual source must be the dispatched commit"; exit 1; }
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.source }}
+          ref: ${{ env.EZIL_DEPLOY_SHA }}
           persist-credentials: false
       - uses: actions/setup-node@v7
         with: { node-version: '22.16.0' }
@@ -135,7 +152,7 @@ jobs:
           printf 'EZIL_DESKTOP_TAG=sha-%s\n' "$EZIL_DEPLOY_SHA" > published-images.env
       - uses: actions/upload-artifact@v4
         with:
-          name: os-images-${{ inputs.source }}
+          name: os-images-${{ env.EZIL_DEPLOY_SHA }}
           path: |
             tested-images.json
             published-images.env
@@ -143,7 +160,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: os-image-tests-${{ inputs.source }}
+          name: os-image-tests-${{ env.EZIL_DEPLOY_SHA }}
           path: |
             container-junit.xml
             container-test.log
