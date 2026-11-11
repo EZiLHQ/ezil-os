@@ -45,8 +45,9 @@ export function parseRebaseRelease(raw: unknown, deployment: LifecycleDeployment
 }
 
 /** A deployment's full release tuple: the target's identity, and a released pool host's recorded launch (R2). */
-const TUPLE = ['accountId', 'region', 'namespace', 'amiId', 'launchTemplateId', 'launchTemplateVersion', 'stateMachineVersionArn',
-    'lowerImageDigest', 'previousLowerImageDigest', 'preparationStateMachineVersionArn', 'recoveryStateMachineVersionArn'] as const;
+const BOOT_TUPLE = ['accountId', 'region', 'namespace', 'amiId', 'launchTemplateId', 'launchTemplateVersion', 'stateMachineVersionArn'] as const;
+const IMAGE_TUPLE = ['lowerImageDigest', 'previousLowerImageDigest', 'preparationStateMachineVersionArn', 'recoveryStateMachineVersionArn'] as const;
+const TUPLE = [...BOOT_TUPLE, ...IMAGE_TUPLE] as const;
 /** Validate registry evidence before deciding whether the source needs an EC2 observation. */
 export function rebaseReleaseCandidates(entry: unknown, lowerImageDigest: string | null) {
     if (lowerImageDigest === null) throw new Error('source_digest_unknown');
@@ -67,8 +68,14 @@ export function rebaseReleaseCandidates(entry: unknown, lowerImageDigest: string
  * R2: a released pool host's proven launch tuple selects its record exactly, never an alias by lower or AMI alone. */
 export function resolveRebaseReleases(entry: unknown, lowerImageDigest: string | null, observedSourceAmiId?: string, provisioned?: LifecycleDeployment) {
     const { sources, target, deployment, repository } = rebaseReleaseCandidates(entry, lowerImageDigest);
-    const matches = provisioned ? sources.filter(r => TUPLE.every(k => r[k] === provisioned[k]))
-        : sources.length > 1 ? sources.filter(r => r.amiId === observedSourceAmiId) : sources;
+    // Legacy provision documents omitted the whole image group. Validate their original shape; never fill it from a registry record.
+    const legacyProvisioned = provisioned && IMAGE_TUPLE.every(k => !Object.prototype.hasOwnProperty.call(provisioned, k));
+    if (legacyProvisioned) LifecycleDeploymentSchema.parse(provisioned);
+    const matches = provisioned ? sources.filter(r => {
+        // Fully image-enabled records and any present image key retain the exact eleven-field requirement.
+        const legacySource = legacyProvisioned && (r.preparationStateMachineVersionArn === null || r.recoveryStateMachineVersionArn === null);
+        return (legacySource ? BOOT_TUPLE : TUPLE).every(k => r[k] === provisioned[k]);
+    }) : sources.length > 1 ? sources.filter(r => r.amiId === observedSourceAmiId) : sources;
     if (matches.length !== 1) throw new Error('release_mismatch');
     const source = matches[0]!;
     if (source.accountId !== target.accountId || source.region !== target.region || source.namespace !== target.namespace
