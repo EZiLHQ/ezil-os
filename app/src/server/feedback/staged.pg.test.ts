@@ -125,12 +125,20 @@ describe.skipIf(!PG)('feedback upload-first staging on PostgreSQL', () => {
         const user = randomUUID(); const old = randomUUID();
         await stageFeedbackImage(db, user, old, png(70), NOW);
         const later = at(FEEDBACK_LIMITS.stagedImageTtlMs + 1);
-        for (const ticket of [randomUUID(), randomUUID(), randomUUID()]) expect((await stageFeedbackImage(db, user, ticket, png(71), later)).status).toBe(201);
+        const fresh = [randomUUID(), randomUUID(), randomUUID()];
+        for (const ticket of fresh) expect((await stageFeedbackImage(db, user, ticket, png(71), later)).status).toBe(201);
         // Reactivating the expired ticket (same image, or a new one) would be a fourth unsent report.
         const before = await rows(stagingTicket(user, old));
+        const bytes = async () => (await admin!.unsafe(`SELECT coalesce(sum(byte_length), 0)::int AS n FROM ${name}.ezil_feedback_attachments`))[0]?.n;
+        const budget = await bytes();
         expect(await stageFeedbackImage(db, user, old, png(70), later)).toEqual({ status: 429, error: 'staged_reports_limit' });
         expect(await stageFeedbackImage(db, user, old, png(72), later)).toEqual({ status: 429, error: 'staged_reports_limit' });
         expect(await rows(stagingTicket(user, old))).toEqual(before);
+        expect(await bytes()).toBe(budget);
+        // Once one of the three is sent, the old ticket is admitted and renewed in place (one row, now fresh).
+        expect((await ingestFeedback(db, user, report(fresh[0]!, refs(png(71))), at(FEEDBACK_LIMITS.stagedImageTtlMs + 2))).status).toBe(201);
+        expect((await stageFeedbackImage(db, user, old, png(70), at(FEEDBACK_LIMITS.stagedImageTtlMs + 3))).status).toBe(201);
+        expect((await rows(stagingTicket(user, old))).map(row => row.sha256)).toEqual([png(70).sha256]);
     });
 
     it('concurrent PUTs of one image store one row; a concurrent finalize and PUT never add to the report', async () => {
