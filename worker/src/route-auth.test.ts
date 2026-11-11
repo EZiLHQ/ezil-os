@@ -3548,7 +3548,7 @@ describe('AI credential and code-host routes', () => {
     const { binding, calls } = fakeSandboxNamespace({});
     let nonce: string | null = 'aws-boot-one';
     let present = true;
-    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, AWS_ROUTING_ENABLED: 'on',
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, AWS_ROUTING_ENABLED: 'on', CF_CONTAINER_ADMISSION_PAUSED: '1',
       SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.org', AWS_ORIGIN_ZONE: 'origin.ezil.org', AWS_ORIGIN_ZONE_ALLOWLIST: 'origin.ezil.org',
       AWS_TUNNELS: { idFromName: (id: string) => id, get: (id: string) => ({ fetch: async () =>
         Response.json({ record: present ? { sandboxId: id, aiProxyNonce: nonce } : null }) }) } };
@@ -4097,6 +4097,19 @@ describe('AI Durable Object storage and boot lifecycle', () => {
 
 
 describe('Worker JSON error response boundary', () => {
+  it('returns a truthful retryable503 when a central CF start is admission-paused', async () => {
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const { binding } = fakeSandboxNamespace({ restartThrows: new Error('computer_updating') });
+      const res = await worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
+        { Sandbox: binding, CF_CONTAINER_ADMISSION_PAUSED: '1' });
+      expect(res.status).toBe(503); expect(res.headers.get('retry-after')).toBe('10');
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      expect(await res.json()).toEqual({ ok: false, error: 'computer_updating',
+        notice: 'Computers are being updated. Please retry shortly.', retryAfterSeconds: 10 });
+    } finally { logs.mockRestore(); }
+  });
+
   it('keeps explicit route error codes when an exception names a different public code', async () => {
     const logs = spyOn(console, 'error').mockImplementation(() => {});
     try {

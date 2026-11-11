@@ -128,6 +128,8 @@ interface Env extends SandboxEnv {
   SANDBOX_PREVIEW_ZONE_ROOT?: string;
   /** AWS computers (GW-4): routing and the tunnel API are off unless this is 1/true/on. */
   AWS_ROUTING_ENABLED?: string;
+  /** Operator admission pause for new CF container starts only; off unless exactly 1. */
+  CF_CONTAINER_ADMISSION_PAUSED?: string;
   /** Narrow standalone Git host operation; off unless explicitly enabled. */
   AWS_STANDALONE_REPO_OPEN_ENABLED?: string;
   /** Origin zone for `c-<sandboxId>-g<gen>-e<epoch>.<zone>`; used only if also allowlisted. */
@@ -671,6 +673,7 @@ import {
 } from './ai-proxy';
 
 import { captureEditorState } from './editor-state';
+import { CF_ADMISSION_ERROR, cfAdmissionRunningOnly, cfAdmissionResponse, isCfAdmissionError } from './cf-container-admission';
 import {
   selectTelemetryWorthy,
   toTelemetryEventInput,
@@ -838,6 +841,7 @@ const PUBLIC_ERROR_CODES = [
   'repo_open_git_failed', 'repo_open_git_missing', 'repo_open_invalid_request', 'repo_open_not_found',
   'repo_open_ref_not_found', 'repo_open_timeout', 'repo_open_token_expired', 'repo_open_unreachable',
   'repo_open_unsupported_provider', 'repo_open_workspace_not_ready', 'repo_open_workspace_unavailable',
+  'computer_updating',
   'request_too_large',
   'restart_already_in_progress', 'restart_disabled', 'restart_not_supported_for_mode',
   'restart_not_supported_for_mode:guacamole', 'restart_not_supported_for_mode:neko', 'runtime_not_running',
@@ -883,6 +887,7 @@ function publicErrorCode(err: unknown, fallback: PublicErrorCode = 'internal_err
 }
 
 function json(data: unknown, status = 200): Response {
+  if (data !== null && typeof data === 'object' && (data as { error?: unknown }).error === CF_ADMISSION_ERROR) return cfAdmissionResponse(corsHeaders);
   const body = JSON.stringify(data, (key, value: unknown) => {
     if (key === 'stack' || key === 'message' || key === 'detail') {
       if (value !== undefined) console.error('[worker] response diagnostic:', key, value);
@@ -2632,19 +2637,35 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   }
   override async start(...args: Parameters<CFSandboxClass<Env>['start']>): Promise<void> {
     return this.withMigrationStart(async () => {
+      const runningOnly = cfAdmissionRunningOnly(this.env?.CF_CONTAINER_ADMISSION_PAUSED, () => this.ctx.container?.running);
       if (await this.migrationStartBlocked()) throw new Error('migrating');
+      if (runningOnly) return; // Never enter the SDK's physical-start path while paused.
       return super.start(...args);
     });
   }
   override async startAndWaitForPorts(...args: Parameters<CFSandboxClass<Env>['startAndWaitForPorts']>): Promise<void> {
     return this.withMigrationStart(async () => {
+      const runningOnly = cfAdmissionRunningOnly(this.env?.CF_CONTAINER_ADMISSION_PAUSED, () => this.ctx.container?.running);
       if (await this.migrationStartBlocked()) throw new Error('migrating');
+      if (runningOnly) return; // A stop after the check must fail the request, never re-enter SDK provisioning.
       return super.startAndWaitForPorts(...args);
     });
   }
   override async containerFetch(...args: Parameters<CFSandboxClass<Env>['containerFetch']>): Promise<Response> {
+    cfAdmissionRunningOnly(this.env?.CF_CONTAINER_ADMISSION_PAUSED, () => this.ctx.container?.running);
     if (await this.migrationStartBlocked()) return json({ ok: false, error: 'migrating' }, 409);
-    return super.containerFetch(...args);
+    try {
+      const response = await super.containerFetch(...args);
+      if (!response.ok) {
+        try { cfAdmissionRunningOnly(this.env?.CF_CONTAINER_ADMISSION_PAUSED, () => this.ctx.container?.running); }
+        catch (error) { void response.body?.cancel().catch(() => {}); throw error; }
+      }
+      return response;
+    } catch (error) {
+      // Throw through SDK transports, whose generic 503 responses otherwise trigger long automatic startup retries.
+      cfAdmissionRunningOnly(this.env?.CF_CONTAINER_ADMISSION_PAUSED, () => this.ctx.container?.running);
+      throw error;
+    }
   }
   override async onStart(): Promise<void> {
     // A replacement container may run a different image; wait for its own codec result.
@@ -7821,7 +7842,7 @@ async function handleAiCredential(request: Request, env: Env, sandboxName: strin
 
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
-export default {
+const worker = {
   async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
@@ -8380,5 +8401,15 @@ export default {
     }
 
     return json({ ok: false, error: `not_found: ${method} ${path}` }, 404);
+  },
+};
+
+export default {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContext): Promise<Response> {
+    try { return await worker.fetch(request, env, ctx); }
+    catch (error) {
+      if (isCfAdmissionError(error)) return cfAdmissionResponse(corsHeaders);
+      throw error;
+    }
   },
 };
