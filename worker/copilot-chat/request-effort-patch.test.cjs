@@ -29,23 +29,33 @@ test('pinned external endpoint forwards only explicit request effort for EZiL', 
   const patched=fs.readFileSync(path.join(root,files[0]),'utf8'),after=options(patched);
   const sdk=fs.readFileSync(path.join(source,'out/vs/workbench/api/node/extensionHostProcess.js'),'utf8');
   assert.ok(sdk.includes('modelConfiguration:i.configuration'),'pinned SDK maps configuration into provider modelConfiguration');
+  // Internal Agent location overrides SDK Panel: bind this regression to real pinned source.
+  assert.ok(pristine.includes('u[u.Agent=7]="Agent"'));
+  assert.ok(pristine.includes('overrideRequestLocation:7}}async handleRequest(n,r,o,a,s,c,l,u,d)'));
+  assert.ok(pristine.includes('s=this.options.overrideRequestLocation??this.options.location'));
   // Execute the actual patched primary callsite provenance expression.
-  const ca=patched.indexOf('ezilPrimaryRequestEffort:s===1');
+  const ca=patched.indexOf('ezilPrimaryRequestEffort:s===7');
   assert.ok(ca>0);
   const ce=patched.slice(ca+'ezilPrimaryRequestEffort:'.length,patched.indexOf(',modeChanged:p',ca));
   const eligible=new Function('s','d','n','u','return '+ce);
-  const primary=(request={},n={},location=1,effort="low")=>eligible.call({options:{request}},location,!!request.subAgentInvocationId,n,effort);
+  const primary=(request={},n={},location=7,effort="low")=>eligible.call({options:{request}},location,!!request.subAgentInvocationId,n,effort);
   assert.equal(primary(),true);
+  // Root v5 actual context was Agent7 + explicit low + all exclusion flags false.
+  for(const effort of ['low','high']){
+   const provenance=primary({}, {},7,effort);
+   assert.deepEqual(build(after,'ezil',{reasoningEffort:effort},provenance).configuration,{reasoningEffort:effort});
+  }
   for(const req of [{subAgentInvocationId:'child'}, {parentRequestId:'parent'}, {isSystemInitiated:true}])assert.equal(primary(req),false);
   assert.equal(primary({}, {isKeepAliveProbe:true}),false);
-  for(const location of [4,6,7,9])assert.equal(primary({}, {},location),false);
-  for(const effort of [null,7])assert.equal(primary({}, {},1,effort),false);
-  assert.equal(eligible.call({options:{request:{}}},1,false,{},undefined),false);
+  for(const location of [1,4,6,9])assert.equal(primary({}, {},location),false);
+  for(const effort of [null,7])assert.equal(primary({}, {},7,effort),false);
+  assert.equal(eligible.call({options:{request:{}}},7,false,{},undefined),false);
   assert.equal(eligible.call({options:{request:{}}},undefined,false,{},'low'),false);
   // Actual background summarizer copies parent capabilities but never receives the provenance field.
   const summary=pristine.indexOf('debugName:"summarizeConversationHistory",messages:E');
   assert.ok(summary>0);const summaryCall=pristine.slice(summary,pristine.indexOf('},v)',summary));
   assert.ok(summaryCall.includes('modelCapabilities:y'));
+  assert.ok(summaryCall.includes('location:7'),'summary uses same location but lacks primary-call provenance');
   assert.ok(!summaryCall.includes('ezilPrimaryRequestEffort'));
   const title=pristine.indexOf('debugName:"title",messages:c');assert.ok(title>0);
   assert.ok(!pristine.slice(title,pristine.indexOf('},n)',title)).includes('modelCapabilities:'));
