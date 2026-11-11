@@ -20,6 +20,7 @@ export class ComputerLifecycleRecovery extends Construct {
         super(scope, id);
         const s = RecoverySettingsSchema.parse(props.settings), d = s.lifecycle.deployment, r = d.region;
         const originalMachine = machineArn(d.stateMachineVersionArn), recoveryMachine = machineArn(s.recoveryVersionArn);
+        const retained = props.retainedObserverVersionLogicalId;
         const key = new kms.Key(this, 'HistoryKey', { enableKeyRotation: true, removalPolicy: RemovalPolicy.RETAIN });
         this.historyKey = key;
         Tags.of(key).add('ezil:namespace', d.namespace);
@@ -45,8 +46,11 @@ export class ComputerLifecycleRecovery extends Construct {
             resources: [originalMachine.replace(':stateMachine:', ':execution:') + ':computer-*'] }));
         observer.addToRolePolicy(new iam.PolicyStatement({ actions: ['ec2:DescribeInstances', 'ec2:DescribeVolumes'], resources: ['*'],
             conditions: { StringEquals: { 'aws:RequestedRegion': r } } }));
-        props.sourceHistoryKey.grantDecrypt(observer);
-        key.grantDecrypt(observer); // Retained observer versions share this execution role.
+        if (!d.preparationStateMachineVersionArn || retained !== undefined) {
+            // Retained legacy versions share this role and keep their exact old key grants.
+            props.sourceHistoryKey.grantDecrypt(observer);
+            key.grantDecrypt(observer);
+        }
         if (d.preparationStateMachineVersionArn) observer.addToRolePolicy(historyReadStatement(r, key.keyArn, [s.recoveryVersionArn]));
         if (d.preparationStateMachineVersionArn) {
             const registration = registeredImageWorkflows(this, d.stateMachineVersionArn).find(v => v.version === d.preparationStateMachineVersionArn);
@@ -62,18 +66,21 @@ export class ComputerLifecycleRecovery extends Construct {
                 'kms:ViaService': `secretsmanager.${r}.amazonaws.com`, 'kms:EncryptionContext:SecretARN': s.lifecycle.authoritySecretArn } } }));
             registerImageWorkflow(this, d.stateMachineVersionArn, s.recoveryVersionArn, key.keyArn);
         }
-        // Published legacy workflow versions retain this generated physical role.
+        // Only an explicitly retained legacy graph needs a separate image role.
+        // Already image-enabled/fresh stacks preserve their existing fixed-role layout.
         const trust = () => new iam.ServicePrincipal('states.amazonaws.com', {
             conditions: { StringEquals: { 'aws:SourceAccount': d.accountId }, ArnEquals: { 'aws:SourceArn': recoveryMachine } } });
-        const role = new iam.Role(this, 'RecoveryRole', { assumedBy: trust() });
-        const imageRole = d.preparationStateMachineVersionArn ? new iam.Role(this, 'ImageRecoveryRole', {
-            roleName: `ezil-${d.namespace}-recovery`, path: `/ezil/${d.namespace}/`, assumedBy: trust() }) : undefined;
+        const named = { roleName: `ezil-${d.namespace}-recovery`, path: `/ezil/${d.namespace}/` };
+        const role = new iam.Role(this, 'RecoveryRole', {
+            ...(d.preparationStateMachineVersionArn && retained === undefined ? named : {}), assumedBy: trust() });
+        const imageRole = d.preparationStateMachineVersionArn
+            ? retained === undefined ? role : new iam.Role(this, 'ImageRecoveryRole', { ...named, assumedBy: trust() })
+            : undefined;
         if (imageRole) {
             applyImageJobBoundary(imageRole, d);
             for (const statement of recoveryRestoreStatements(d)) imageRole.addToPolicy(statement);
             imageRole.addToPolicy(new iam.PolicyStatement({ effect: iam.Effect.DENY, actions: [...imageWorkflowDenies, 'ec2:CopySnapshot', 'ec2:ModifySnapshotAttribute', 'ec2:ResetSnapshotAttribute'], resources: ['*'] }));
         }
-        const retained = props.retainedObserverVersionLogicalId;
         if (retained !== undefined) {
             const current = observer.currentVersion.node.defaultChild as lambda.CfnVersion;
             const currentId = Stack.of(this).resolve(current.logicalId) as string;
@@ -90,8 +97,8 @@ export class ComputerLifecycleRecovery extends Construct {
             legacy.addMetadata('aws:cdk:do-not-refactor', true);
             role.addToPolicy(new iam.PolicyStatement({ actions: ['lambda:InvokeFunction'], resources: [legacy.ref] }));
         } else observer.currentVersion.grantInvoke(role);
-        if (imageRole) observer.currentVersion.grantInvoke(imageRole);
-        for (const executionRole of [role, ...(imageRole ? [imageRole] : [])]) {
+        if (imageRole && imageRole !== role) observer.currentVersion.grantInvoke(imageRole);
+        for (const executionRole of [role, ...(imageRole && imageRole !== role ? [imageRole] : [])]) {
             key.grantEncryptDecrypt(executionRole);
             executionRole.addToPolicy(new iam.PolicyStatement({ actions: ['ec2:StopInstances', 'ec2:TerminateInstances'],
                 resources: [`arn:aws:ec2:${r}:${d.accountId}:instance/*`], conditions: { StringEquals: {

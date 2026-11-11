@@ -68,7 +68,8 @@ This pins the existing immutable observer resource used by the legacy generated
 Recovery role. The image workflow receives a separate fixed-name role and image
 boundary; published legacy workflows retain their role, invoke grant and history
 key permissions. The normal rollout validator rejects a changed legacy graph or
-an omitted retention input. Fresh stacks without a legacy graph omit this field.
+an omitted retention input. Fresh stacks and existing image-enabled fixed-role stacks omit this field; their
+original role layout and conditional observer key permissions remain unchanged.
 
 | Field | Rule |
 |---|---|

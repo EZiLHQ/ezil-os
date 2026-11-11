@@ -57,3 +57,20 @@ test('retained observer references cannot target another construct, current vers
     const version = before[oldPolicy].Properties.PolicyDocument.Statement.find((s: any) => s.Action === 'lambda:InvokeFunction').Resource.Ref;
     assert.throws(() => synth(false, version), /invalid_retained_recovery_observer_version/);
 });
+
+test('already-image-enabled and fresh stacks keep the existing fixed role and conditional observer key permissions', () => {
+    const before = synth(true), after = synth(true);
+    assert.deepEqual(after[oldRole], before[oldRole]);
+    assert.equal(after[oldRole].Properties.RoleName, 'ezil-pilot-recovery');
+    assert.match(after[oldRole].Properties.PermissionsBoundary, /\/ezil-pilot-image-job-boundary$/);
+    assert.equal(Object.keys(after).some(id => id.startsWith('RecoveryImageRecoveryRole')), false);
+    const roles = Object.entries(after).filter(([, r]) => r.Type === 'AWS::IAM::Role'
+        && r.Properties.PermissionsBoundary.endsWith('/ezil-pilot-image-job-boundary'));
+    assert.equal(roles.length, 2);
+    const workflow = Object.entries(after).find(([id, r]) => id.startsWith('RecoveryWorkflow') && r.Type === 'AWS::StepFunctions::StateMachine')![1];
+    assert.deepEqual(workflow.Properties.RoleArn, { 'Fn::GetAtt': [oldRole, 'Arn'] });
+    for (const statement of after.RecoveryObserverServiceRoleDefaultPolicyA036F4CB.Properties.PolicyDocument.Statement) {
+        if (![statement.Action].flat().includes('kms:Decrypt') || !JSON.stringify(statement.Resource).includes('HistoryKey')) continue;
+        assert.ok(statement.Condition?.StringEquals?.['kms:ViaService'], 'no unconditional legacy-key expansion in image-only mode');
+    }
+});

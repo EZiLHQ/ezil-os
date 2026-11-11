@@ -347,12 +347,29 @@ LEGACY_OBSERVER_ROLE = 'RecoveryObserverServiceRole86BC9AF2'
 LEGACY_OBSERVER_POLICY = 'RecoveryObserverServiceRoleDefaultPolicyA036F4CB'
 
 
+def existing_image_recovery_role(resource):
+    """Recognize only the pre-existing fixed-role image layout, not arbitrary named roles."""
+    properties = resource.get('Properties', {})
+    trust = {'Version': '2012-10-17', 'Statement': [{'Action': 'sts:AssumeRole', 'Effect': 'Allow',
+        'Principal': {'Service': 'states.amazonaws.com'}, 'Condition': {
+            'StringEquals': {'aws:SourceAccount': '452630323510'},
+            'ArnEquals': {'aws:SourceArn': f'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-{context.NAMESPACE}-recovery'}}}]}
+    return (resource.get('Type') == 'AWS::IAM::Role'
+        and properties.get('RoleName') == f'ezil-{context.NAMESPACE}-recovery'
+        and properties.get('Path') == f'/ezil/{context.NAMESPACE}/'
+        and properties.get('PermissionsBoundary') ==
+            f'arn:aws:iam::452630323510:policy/ezil/{context.NAMESPACE}/ezil-{context.NAMESPACE}-image-job-boundary'
+        and canonical_iam(properties.get('AssumeRolePolicyDocument')) == canonical_iam(trust))
+
+
 def retained_recovery_observer_version(before):
     """Derive the CDK retention input only from the exact reviewed legacy graph."""
     resources = before['Resources']
     if LEGACY_RECOVERY_ROLE not in resources:
         return None
     role = resources[LEGACY_RECOVERY_ROLE]
+    if existing_image_recovery_role(role):
+        return None
     need(role.get('Type') == 'AWS::IAM::Role' and 'RoleName' not in role.get('Properties', {})
          and role['Properties'].get('Path') == f'/ezil/{context.NAMESPACE}/'
          and role['Properties'].get('PermissionsBoundary') ==
@@ -385,6 +402,10 @@ def preserve_legacy_recovery(before, after, boundary):
     if LEGACY_RECOVERY_ROLE not in old or not any(
             r.get('Type') == 'AWS::IAM::Role' and 'RecoveryRole' in logical
             and r.get('Properties', {}).get('PermissionsBoundary') == boundary for logical, r in new.items()):
+        return
+    if existing_image_recovery_role(old[LEGACY_RECOVERY_ROLE]):
+        need(new.get(LEGACY_RECOVERY_ROLE) == old[LEGACY_RECOVERY_ROLE],
+             'existing image recovery role identity must remain unchanged')
         return
     retained = retained_recovery_observer_version(before)
     for logical in (LEGACY_RECOVERY_ROLE, LEGACY_RECOVERY_POLICY, retained, LEGACY_OBSERVER_ROLE):

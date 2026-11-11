@@ -840,6 +840,27 @@ class LegacyRecoveryCompatibilityTests(unittest.TestCase):
         for before in variants:
             with self.assertRaises(ValueError): self.cfn.retained_recovery_observer_version(before)
 
+    def test_known_already_image_role_remains_supported_but_identity_changes_are_refused(self):
+        role = self.before['Resources'][self.cfn.LEGACY_RECOVERY_ROLE]
+        role['Properties'].update(RoleName=f'ezil-{TOOL.NAMESPACE}-recovery', PermissionsBoundary=self.boundary,
+            AssumeRolePolicyDocument={'Version': '2012-10-17', 'Statement': [{'Action': 'sts:AssumeRole', 'Effect': 'Allow',
+                'Principal': {'Service': 'states.amazonaws.com'}, 'Condition': {
+                    'StringEquals': {'aws:SourceAccount': '452630323510'},
+                    'ArnEquals': {'aws:SourceArn': f'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-{TOOL.NAMESPACE}-recovery'}}}]})
+        after = copy.deepcopy(self.before)
+        self.assertIsNone(self.cfn.retained_recovery_observer_version(self.before))
+        self.cfn.preserve_legacy_recovery(self.before, after, self.boundary)
+        after['Resources'][self.cfn.LEGACY_RECOVERY_ROLE]['Properties']['RoleName'] = 'other'
+        with self.assertRaisesRegex(ValueError, 'existing image recovery role identity'):
+            self.cfn.preserve_legacy_recovery(self.before, after, self.boundary)
+        for key, value in [('RoleName', 'other'), ('Path', '/other/'), ('PermissionsBoundary', 'other')]:
+            bad = copy.deepcopy(self.before)
+            bad['Resources'][self.cfn.LEGACY_RECOVERY_ROLE]['Properties'][key] = value
+            with self.assertRaises(ValueError): self.cfn.retained_recovery_observer_version(bad)
+        bad = copy.deepcopy(self.before)
+        del bad['Resources'][self.cfn.LEGACY_RECOVERY_ROLE]['Properties']['AssumeRolePolicyDocument']['Statement'][0]['Condition']
+        with self.assertRaises(ValueError): self.cfn.retained_recovery_observer_version(bad)
+
     def test_iam_role_replacement_fence_is_unchanged(self):
         resource = {'Type': 'AWS::IAM::Role'}
         change = {'Action': 'Modify', 'ResourceType': resource['Type'], 'Replacement': 'True', 'Details': []}
