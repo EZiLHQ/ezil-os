@@ -1,3 +1,4 @@
+import { openAwsStandaloneRepo } from './aws-repo-open';
 import { ACCEPTANCE_RESET_DELAY_MS } from './acceptance-config';
 import { relayExpiryFor, relayOperation, RelayFailure, relayFailureResult, remainingRelayBudget, type RelayState, type RelayResult } from './relay-refresh';
 import { bridgeCodeSocket } from './code-socket';
@@ -127,6 +128,8 @@ interface Env extends SandboxEnv {
   SANDBOX_PREVIEW_ZONE_ROOT?: string;
   /** AWS computers (GW-4): routing and the tunnel API are off unless this is 1/true/on. */
   AWS_ROUTING_ENABLED?: string;
+  /** Narrow standalone Git host operation; off unless explicitly enabled. */
+  AWS_STANDALONE_REPO_OPEN_ENABLED?: string;
   /** Origin zone for `c-<sandboxId>-g<gen>-e<epoch>.<zone>`; used only if also allowlisted. */
   AWS_ORIGIN_ZONE?: string;
   AWS_ORIGIN_ZONE_ALLOWLIST?: string;
@@ -5448,6 +5451,17 @@ async function handleRepoOpen(request: Request, env: Env, sandboxName: string): 
   if (!v2) {
     const error = request.headers.get(PREVIEW_TOKEN_V2_HEADER) !== null ? 'hmac_v2_unverified' : 'hmac_v2_required';
     return json({ ok: false, error }, 401);
+  }
+  if (v2.provider === 'aws-ec2') {
+    const registry = awsRegistryFor(env);
+    const read = await readProjectFilesBody(request, REPO_OPEN_MAX_BODY_BYTES);
+    if (!read.ok) return read.response;
+    return openAwsStandaloneRepo(request, v2, sandboxName, read.body, {
+      enabled: awsRoutingEnabled(env.AWS_ROUTING_ENABLED) && awsRoutingEnabled(env.AWS_STANDALONE_REPO_OPEN_ENABLED),
+      zone: resolveAwsOriginZone(env),
+      lookup: sid => registry ? lookupAwsTunnel(registry, sid) : Promise.resolve(null),
+      fetch: (input, init) => fetch(input, init),
+    });
   }
   if (v2.provider !== 'cloudflare') {
     return json({ ok: false, error: 'repo_open_unsupported_provider' }, repoOpenStatus('repo_open_unsupported_provider'));
