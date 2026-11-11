@@ -353,7 +353,7 @@ const productionUrl = `postgres://postgres:${password}@localhost:5432/postgres`;
 const productionArgs = ['--target', 'aws-production', '--expect-system-id', productionId];
 const neverBaselined = ['docs/aws-computers/sql/0003_pool_hosts_v2.sql.txt', 'app/drizzle/0008_pool_dispatch.sql',
     'app/drizzle/0009_capacity_demands.sql', 'app/drizzle/0010_migration_restore_progress.sql', 'app/drizzle/0011_feedback.sql',
-    'app/drizzle/0019_operator_entitlements.sql', 'app/drizzle/0020_operator_refusal_receipts.sql', 'app/drizzle/0021_standard_trial.sql'];
+    'app/drizzle/0019_operator_entitlements.sql', 'app/drizzle/0020_operator_refusal_receipts.sql', 'app/drizzle/0021_standard_trial.sql', 'app/drizzle/0022_feedback_notifications.sql'];
 function productionHarness(logged = [], actual = productionId) {
     const h = harness(logged, { BILLING_STAGING_DATABASE_URL: productionUrl, PGHOSTADDR: '10.63.20.252', PGSERVICE: 'other' });
     const original = h.options.spawnSyncImpl;
@@ -567,7 +567,7 @@ test('reverse moves (0012) stay staging-only on production: baseline refused, an
 test('operator entitlements follow 0012, stay additive, server-only and a production snapshot only', () => {
     const file = 'app/drizzle/0019_operator_entitlements.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0012_compute_reverse_moves.sql') + 1);
-    assert.equal(EXPLICIT_FILES.at(-3), file);
+    assert.equal(EXPLICIT_FILES.at(-4), file);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     // New tables only: no existing (Stripe, billing or compute) table is altered or written.
     assert.match(sql, /CREATE TABLE IF NOT EXISTS public\.ezil_operator_entitlements \(/);
@@ -600,7 +600,7 @@ test('operator entitlements (0019) production baseline refuses: it must be appli
 test('operator refusal receipts follow immutable 0019 and are a production snapshot only', () => {
     const file = 'app/drizzle/0020_operator_refusal_receipts.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0019_operator_entitlements.sql') + 1);
-    assert.equal(EXPLICIT_FILES.at(-2), file);
+    assert.equal(EXPLICIT_FILES.at(-3), file);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     assert.match(sql, /ALTER COLUMN assignment_ref DROP NOT NULL/);
     assert.match(sql, /ALTER COLUMN revision DROP NOT NULL/);
@@ -626,7 +626,7 @@ test('operator refusal receipts (0020) production baseline refuses: it must be a
 test('the Standard trial follows 0020, stays additive and is a production snapshot only', () => {
     const file = 'app/drizzle/0021_standard_trial.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0020_operator_refusal_receipts.sql') + 1);
-    assert.equal(EXPLICIT_FILES.at(-1), file);
+    assert.equal(EXPLICIT_FILES.at(-2), file);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     assert.match(sql, /CREATE TABLE "ezil_billing_trials" \(/);
     // Review R4: every verified identity of a started trial, append-only, removed only with its trial.
@@ -678,4 +678,18 @@ test('Standard trial (0021) production baseline refuses: it must be applied, nev
         assert.equal(h.calls.length, 0);
         assert.match(h.output.join('\n'), /never baselined/);
     }
+});
+
+
+test('feedback notifications follow Standard trial, remain server-only and cannot baseline on production', () => {
+    const file = 'app/drizzle/0022_feedback_notifications.sql';
+    assert.equal(EXPLICIT_FILES.at(-1), file);
+    const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
+    assert.match(sql, /CREATE TABLE public\.ezil_feedback_notifications/);
+    assert.match(sql, /ENABLE ROW LEVEL SECURITY/);
+    assert.match(sql, /REVOKE ALL ON TABLE public\.ezil_feedback_notifications FROM public, anon, authenticated/);
+    assert.doesNotMatch(sql, /INSERT|CREATE TRIGGER|CREATE POLICY|DEFAULT|PRIMARY KEY|FOREIGN KEY/);
+    const h = productionHarness();
+    assert.equal(run(['baseline', '0022_feedback_notifications.sql', '--yes', ...productionArgs], h.options), 1);
+    assert.equal(h.calls.length, 0);
 });
