@@ -742,11 +742,27 @@ describe.skipIf(!URL_)('EZiL MCP session controls on Postgres', () => {
             expect(await data(await read('agentSession.control', { kind: 'configure', idempotencyKey: key }))).toEqual({ found: false });
             expect(await data(await read('agentSession.control', { kind: 'create', idempotencyKey: key }, { client_id: CLIENT2 }))).toEqual({ found: false });
             expect(await data(await read('agentSession.control', { kind: 'create', idempotencyKey: key }, { sub: bob }))).toEqual({ found: false });
-            // A start's row is not a session control row.
+            // Start reconciliation is intentional: exact StartRow, scoped to person/client/procedure.
             const startKey = randomUUID();
-            await data(await start({ computerId: ids.a1, idempotencyKey: startKey }));
-            expect(await data(await read('agentSession.control', { kind: 'create', idempotencyKey: startKey }))).toEqual({ found: false });
-            expect(await code(await read('agentSession.control', { kind: 'start', idempotencyKey: key }))).toBe('BAD_REQUEST');
+            const started = await data<Start>(await start({ computerId: ids.a1, idempotencyKey: startKey }));
+            expect(Object.keys(started).sort()).toEqual(['computerId', 'id', 'reason', 'status', 'updatedAt']);
+            calls.length = 0;
+            port.gate = { allowed: false, reason: 'fair_use_paused' };
+            const effects = await untouched();
+            expect(await data(await read('agentSession.control', { kind: 'start', idempotencyKey: startKey }))).toEqual({ found:true, row:started });
+            expect(await data(await start({ computerId:ids.a1, idempotencyKey:startKey }))).toEqual(started);
+            expect(await data(await read('agentSession.control', { kind: 'start', idempotencyKey: startKey }))).toEqual({ found:true, row:started });
+            expect(calls).toEqual([]); // reads and exact retries never route/gate/boot again
+            expect(await untouched()).toBe(effects);
+            expect(await controlRows(client`idempotency_key = ${startKey}::uuid`)).toHaveLength(1);
+            for (const kind of ['create', 'configure']) {
+                expect(await data(await read('agentSession.control', { kind, idempotencyKey: startKey }))).toEqual({ found:false });
+            }
+            expect(await data(await read('agentSession.control', { kind:'start', idempotencyKey:key }))).toEqual({ found:false });
+            for (const overrides of [{client_id:CLIENT2}, {sub:bob}]) {
+                expect(await data(await read('agentSession.control', {kind:'start', idempotencyKey:startKey}, overrides))).toEqual({found:false});
+            }
+            expect(await code(await read('agentSession.control', {kind:'start', idempotencyKey:startKey}, {}, 'ezil:computers:start'))).toBe('UNAUTHORIZED');
             expect(await code(await read('agentSession.control', { kind: 'create', idempotencyKey: key }, {}, 'ezil:sessions:write'))).toBe('UNAUTHORIZED');
         });
     });

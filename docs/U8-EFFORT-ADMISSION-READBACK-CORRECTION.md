@@ -19,3 +19,14 @@ Validation for this correction:
 An initial new unit assertion incorrectly checked Error.message for the public reason; SessionStoreError stores BAD_REQUEST in message and effort_not_per_session in reason. Corrected the assertion to inspect code/reason, then reran successfully. No production change was made to accommodate that test error.
 
 A provider refresh 3facc3b60517218f5e8f217861f606a5b2570762 independently passed its focused six cases (39 assertions); review is recorded separately under artifacts/gateway-provider-independent-review-20261111/REVIEW.md. No A source was edited or composed here.
+
+
+Follow-up to root's actual PG17.11 run at 51c4f9cd: 80 passed, one failed,
+zero skipped. The remaining expectation rejected kind=start, but the reviewed
+router deliberately accepts start for MCP get_control, and getControl reads only
+the caller/client's computer.start row. No production change is needed. The
+existing reconciliation case now proves exact StartRow shape, kind/owner/client
+isolation, stable mutation retry plus readback, no second provider/gate call,
+one durable row, unchanged session/operation/event state, and read-scope
+requirements. It retains 81 total control+chain cases for root to rerun. No SQL
+was executed here; local collection skips the 75 control PG cases explicitly.
