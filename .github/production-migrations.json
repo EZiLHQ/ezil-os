@@ -85,6 +85,21 @@
       "path": "app/drizzle/0021_standard_trial.sql",
       "sha256": "d44471c2a8fa9880b09aaf4f6654e5856cf1ea356071379021f63571f542ca35",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/migrations/sponsor/0001_sponsor_attribution.sql",
+      "sha256": "fbe54baee38f8032e727785b012e6e59f4fd65fa19b8c7c38d21c3eb85af7167",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/migrations/sponsor/preflight.sql",
+      "sha256": "8c8ab1fe27528052c4a6bd5d102321c38ae46db25417062d287e01000905196b",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/migrations/sponsor/verify.sql",
+      "sha256": "f849ad0bbe24d33ac06180d521d1f0e2cd71d5b676049f2d5b2fff0cd356df85",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {

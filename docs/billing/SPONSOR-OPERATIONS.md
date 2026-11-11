@@ -85,7 +85,7 @@ With `--registry-dir "$SIGNED_BUNDLE"` and `SPONSOR_REGISTRY_KEY`, unused config
 
 ## Schema rollout boundary
 
-The actual new tables are `public.ezil_sponsor_attributions` and `public.ezil_sponsor_trial_claims`. Their SQL remains outside the ordered Drizzle journal. This operator tool never applies it.
+The actual new tables are `public.ezil_sponsor_attributions` and `public.ezil_sponsor_trial_claims`. Their SQL remains outside the ordered Drizzle journal. This operator tool never applies it. The production SQL manifest registers all three sponsor SQL artifacts as `kind: "snapshot"` for byte-inventory validation only. Its executable `migrations` array and historical catalog baseline are unchanged; the generic production helper never executes these snapshot files.
 
 The native runner lane owns the exact-file schema runner and its pinned SQL, preflight, structural verification and documentation under `app/migrations/sponsor/`. Its source admits PostgreSQL 17 only. The staging major must be established before any rollout decision. The two-table DDL is still held for the user's concrete schema approval; pending journal 0022–0025 must not be applied as part of sponsor work. No real schema, campaign, identity, Stripe object or deployment was changed while preparing this source.
 
