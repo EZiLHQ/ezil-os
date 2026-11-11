@@ -59,3 +59,7 @@ Driver e2e/chat-bridge-effort.mjs has no docker exec calls: all fixture controls
 Offline conditions still required: patched Code/Copilot cloud suppression, local synthetic gateway only, browser request allowlist and operator no-egress environment. No real API keys are needed; runner generates only disposable local bearer strings. Requests to unregistered models/efforts or without registered synthetic markers are refused, never routed to a cloud service.
 
 Refinement checks: bash -n runner; JSON settings parse; node --check driver; original P2 scripts unchanged. Native execution remains NOT RUN.
+
+## Existing system Chromium
+
+For a host with an existing qualified Chromium but no Playwright browser download, set `EZIL_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium`. Both initial launch and post-reload new browser process use this per-run option; nothing changes global Playwright paths. Optional `EZIL_CHROMIUM_ARGS_JSON='["--disable-dev-shm-usage"]'` accepts a JSON string array. Only if required inside an operator-verified disposable environment, adding `--no-sandbox` or `--disable-setuid-sandbox` requires `EZIL_CHROMIUM_NO_SANDBOX_ALLOWED=yes`; neither flag is default. Record executable/version/args in the native execution receipt. Browser can remain outside the internal Code/fixture container using separate host127.0.0.1 forwards; driver workspace path is the path inside Code's runtime.

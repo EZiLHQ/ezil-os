@@ -7,6 +7,11 @@ const local=v=>{const u=new URL(v);if(u.protocol!=='http:'||u.hostname!=='127.0.
 const code=local(required('EZIL_CODE_URL')),api=local(required('EZIL_EFFORT_FIXTURE_URL')),out=required('EZIL_E2E_OUT');
 mkdirSync(out,{recursive:true});
 const {chromium}=createRequire(required('PLAYWRIGHT_REQUIRE_DIR')+'/fixture.js')('playwright');
+const chromiumArgs=JSON.parse(process.env.EZIL_CHROMIUM_ARGS_JSON??'[]');
+if (!Array.isArray(chromiumArgs)||chromiumArgs.some(x=>typeof x!=='string')) throw Error('EZIL_CHROMIUM_ARGS_JSON must be a string array');
+if (chromiumArgs.some(x=>x==='--no-sandbox'||x==='--disable-setuid-sandbox') && process.env.EZIL_CHROMIUM_NO_SANDBOX_ALLOWED!=='yes')
+ throw Error('Sandbox disabling requires explicit disposable-environment acknowledgment');
+const launchOptions={args:chromiumArgs,...(process.env.EZIL_CHROMIUM_EXECUTABLE_PATH?{executablePath:process.env.EZIL_CHROMIUM_EXECUTABLE_PATH}:{})};
 const results=[],resources={},expectedModels={};
 const check=(name,ok)=>{results.push({name,ok});if(!ok)throw Error(name);};
 const state=async()=>{const r=await fetch(api+'/bridge-state');if(!r.ok)throw Error('fixture read');return r.json();};
@@ -15,7 +20,7 @@ const until=async p=>{const end=Date.now()+150000;while(Date.now()<end){const s=
 const op=(s,r)=>s.ops.find(o=>o.role===r);
 const done=r=>until(s=>['applied','completed','uncertain','rejected','failed','expired','busy'].includes(op(s,r)?.status));
 let browser,context,page;
-const launch=async()=>{browser=await chromium.launch();context=await browser.newContext({viewport:{width:1440,height:900}});await context.route('**/*',r=>new URL(r.request().url()).origin===code?r.continue():r.abort());page=await context.newPage();};
+const launch=async()=>{browser=await chromium.launch(launchOptions);context=await browser.newContext({viewport:{width:1440,height:900}});await context.route('**/*',r=>new URL(r.request().url()).origin===code?r.continue():r.abort());page=await context.newPage();};
 const open=async()=>{await page.goto(code+'/?folder='+encodeURIComponent(required('EZIL_EFFORT_WORKSPACE')));await page.locator('.part.auxiliarybar .chat-input-container .monaco-editor').first().waitFor({timeout:120000});};
 const command=async title=>{await page.keyboard.press('Control+Shift+P');await page.locator('.quick-input-widget input').fill('>'+title);await page.keyboard.press('Enter');};
 const send=async(role,marker,model,effort)=>{
