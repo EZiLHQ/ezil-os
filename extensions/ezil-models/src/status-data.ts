@@ -244,8 +244,11 @@ export function statusView(state?: AIStatus): { text: string; lines: string[] } 
     const balance = state.balance.value;
     const window = balance?.window;
     const reset = window?.resets_at ? localResetTime(window.resets_at) : undefined;
-    let text = window ? `EZiL AI · ${credits(window.remaining_micro)} credits left${reset ? ` · resets ${reset}` : ''}`
-        : balance ? `EZiL AI · ${credits(balance.available_micro)} credits` : 'EZiL AI · Credits unavailable';
+    // The headline is the wallet (`available_micro`, the balance EZiL OS Settings shows). The window is a separate
+    // spending limit per period, named as one, and never stands in for the balance.
+    const windowPart = window ? ` · ${windowLength(window.seconds)} window ${BigInt(window.remaining_micro) === 0n ? 'used'
+        : `${credits(window.remaining_micro)} of ${credits(window.budget_micro)} left`}${reset ? ` · resets ${reset}` : ''}` : '';
+    let text = balance ? `EZiL AI · ${credits(balance.available_micro)} credits${windowPart}` : 'EZiL AI · Credits unavailable';
     const limits = state.limits.value;
     // Reuse the gateway's precedence and reconciliation/operations wording. No selected
     // model is implied by this global status item, so only the global fields are passed.
@@ -257,11 +260,10 @@ export function statusView(state?: AIStatus): { text: string; lines: string[] } 
     else if (limits?.pauses.some(p => p.scope === 'user' || p.scope === 'account' || p.scope === 'role')) text = 'EZiL AI · Paused';
     else if (limits?.entitlement.required && limits.entitlement.basis === null) text = 'EZiL AI · AI access needed';
     else {
-        if (window && BigInt(window.remaining_micro) === 0n) text += ' · window used';
+        if (window && BigInt(window.remaining_micro) === 0n) { /* the window segment already says "used" */ }
         else if (typeof limits?.policy.policy.daily_budget_micro === 'number' && limits.counters.day_micro >= limits.policy.policy.daily_budget_micro) text = 'EZiL AI · Daily credit budget used';
         else if (typeof limits?.policy.policy.monthly_budget_micro === 'number' && limits.counters.month_micro >= limits.policy.policy.monthly_budget_micro) text = 'EZiL AI · Monthly credit budget used';
-        else if (balance?.available_micro === 0 && balance.held_micro > 0) text = 'EZiL AI · Credits held';
-        else if (balance?.available_micro === 0) text = 'EZiL AI · 0 credits';
+        else if (balance?.available_micro === 0 && balance.held_micro > 0) text = `EZiL AI · Credits held${windowPart}`;
         if (!limits) text += ' · limits unavailable';
         if (!state.models.value) text += ' · availability unknown';
         if (!state.usage.value) text += ' · usage unavailable';
@@ -271,6 +273,7 @@ export function statusView(state?: AIStatus): { text: string; lines: string[] } 
     if (balance?.available_micro === 0) lines.push(balance.held_micro > 0 ? 'Your credits are held by requests in progress or being settled.' : 'No AI credits are available.');
     if (window) {
         lines.push(`${windowLength(window.seconds)} window: ${credits(window.remaining_micro)} credits left of ${credits(window.budget_micro)}`);
+        lines.push('The window limits how many credits you can use per period. It is not your balance.');
         lines.push(`Window used (held + settled): ${credits(window.used_micro)} credits`);
         lines.push(reset ? `Resets at ${reset} (local time)` : 'Window starts with your next admitted request.');
         if (BigInt(window.remaining_micro) === 0n) lines.push('This window’s AI credits are used up.');
