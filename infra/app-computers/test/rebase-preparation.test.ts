@@ -202,6 +202,59 @@ for (const state of ['terminated', 'shutting-down', 'running', 'pending', 'stopp
         assert.equal(result.cause, 'source_identity_mismatch'); assert.deepEqual(calls, []);
     });
 }
+// App DESIGN R2: a regular (non-pool) host retired by a proven normal release; the app's document carries only the release.
+function retiredFixture() {
+    const base = rebaseFixture(), releaseExecutionArn = JSON.parse(pinned.document).releasedPoolHost.releaseExecutionArn as string;
+    const preparation = PreparationDocumentSchema.parse({ ...base.preparation, retiredSource: { releaseExecutionArn } }), preparationEnvelope = envelopeFor(preparation);
+    return { ...base, preparation, preparationEnvelope, reference: { ...base.reference, digest: preparationEnvelope.digest } };
+}
+async function runRetired(mutate: (f: Released) => void = () => {}) {
+    const f = preparationFixture(retiredFixture()), calls: string[] = [];
+    f.state.instances = []; f.volume.State = 'available'; f.volume.Attachments = []; mutate(f);
+    const helper = createPreparationHelper(f.settings, f.deps);
+    const result = await runAsl(preparationDefinition('observer:1'), { input: f.preparationEnvelope, executionArn: f.reference.executionArn,
+        sleep: seconds => { f.state.now += seconds * 1000; }, invoke: async (_resource, p, name) => {
+            if (name.startsWith('Observe-')) return helper(p);
+            calls.push(name); assert.equal(name, 'createSnapshot');
+            const snapshot = f.snapshot(); f.state.snapshots.push(snapshot); return { SnapshotId: snapshot.SnapshotId };
+        }, maxSteps: 100 });
+    return { f, result, calls };
+}
+test('retired regular source: strict last key, never with releasedPoolHost, release on this namespace lifecycle machine only', () => {
+    const f = retiredFixture(), arn = f.preparation.retiredSource!.releaseExecutionArn;
+    assert.equal(Object.keys(f.preparation).at(-1), 'retiredSource');
+    assert.deepEqual(parsePreparationInput(JSON.stringify(f.preparationEnvelope)).document.retiredSource, { releaseExecutionArn: arn });
+    assert.equal(JSON.stringify(rebaseFixture().preparation).includes('retiredSource'), false);
+    assert.throws(() => PreparationDocumentSchema.parse({ ...releasedFixture().preparation, retiredSource: { releaseExecutionArn: arn } }), /release_mismatch/);
+    for (const releaseExecutionArn of [arn.replace('-lifecycle:', '-recovery:'), arn.replace('123456789012', '999999999999'), arn.replace(':ap-south-1:', ':us-east-1:')])
+        assert.throws(() => PreparationDocumentSchema.parse({ ...f.preparation, retiredSource: { releaseExecutionArn } }), /release_mismatch/);
+    assert.throws(() => PreparationDocumentSchema.parse({ ...f.preparation, retiredSource: { releaseExecutionArn: arn, extra: 1 } }));
+    const old = PreparationDocumentSchema.innerType().omit({ retiredSource: true }).strict(), r = old.safeParse(f.preparation);
+    assert.equal(r.success, false); assert.deepEqual(r.error!.issues.map(i => [i.code, (i as { keys?: string[] }).keys]), [['unrecognized_keys', ['retiredSource']]]);
+});
+test('retired regular source aged out of EC2: fences at observation, snapshots, never stops or terminates', async () => {
+    const { f, result, calls } = await runRetired();
+    assert.deepEqual(calls, ['createSnapshot']);
+    assert.equal(result.output.state, 'snapshot_ready'); assert.equal(result.output.digest, f.reference.digest);
+    assert.ok(Date.parse(result.output.fencedAt) <= Date.parse(result.output.snapshotStartedAt));
+});
+// A listed source, even the exact canonical source instance, is refused: the app proved it gone; EC2 disagreeing is never resolved here.
+for (const state of ['terminated', 'shutting-down', 'running', 'pending', 'stopping', 'stopped']) {
+    test(`retired regular source: a listed ${state} source is source_identity_mismatch with no provider action`, async () => {
+        const { result, calls } = await runRetired(f => { f.instance.State = { Name: state as 'running' }; f.state.instances = [f.instance]; });
+        assert.equal(result.cause, 'source_identity_mismatch'); assert.deepEqual(calls, []);
+    });
+}
+for (const [name, volume] of [['attached', { State: 'in-use', Attachments: [{ InstanceId: 'i-99999999999999999', VolumeId: 'vol-11111111111111111', State: 'attached' }] }],
+    ['attaching', { State: 'available', Attachments: [{ InstanceId: 'i-99999999999999999', VolumeId: 'vol-11111111111111111', State: 'attaching' }] }],
+    ['detaching (in-use, empty)', { State: 'in-use', Attachments: [] }]] as const) {
+    test(`retired regular source: a ${name} volume is writer_not_fenced at once, never a wait`, async () => {
+        const f = preparationFixture(retiredFixture()); f.state.instances = []; Object.assign(f.volume, structuredClone(volume));
+        assert.deepEqual(await observe(f), { decision: 'failed', code: 'writer_not_fenced' });
+        const { result, calls } = await runRetired(r => Object.assign(r.volume, structuredClone(volume)));
+        assert.equal(result.cause, 'writer_not_fenced'); assert.deepEqual(calls, []);
+    });
+}
 for (const [name, volume] of [['attached', { State: 'in-use', Attachments: [{ InstanceId: 'i-99999999999999999', VolumeId: 'vol-11111111111111111', State: 'attached' }] }],
     ['attaching', { State: 'available', Attachments: [{ InstanceId: 'i-99999999999999999', VolumeId: 'vol-11111111111111111', State: 'attaching' }] }],
     ['detaching (in-use, empty)', { State: 'in-use', Attachments: [] }]] as const) {

@@ -7,6 +7,10 @@ import { RebaseCounter, RebaseDigest, RebaseHash, RebaseSnapshot, RebaseTime, Re
  * omitted when absent, as in infra's PreparationDocumentSchema: existing documents and digests are byte-identical. */
 export const ReleasedPoolHostSchema = z.object({ poolHostId: RebaseUuid, lifecycleDigest: RebaseHash,
     releaseExecutionArn: z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:execution:[A-Za-z0-9_-]{1,80}:computer-[0-9a-f-]{36}$/) }).strict();
+/** DESIGN R2: a STOPPED computer's regular (non-pool) host, retired by a proven normal release and aged out of EC2. Last key,
+ * omitted when absent, never together with `releasedPoolHost`; mirrors infra's RetiredSourceSchema. */
+export const RetiredSourceSchema = z.object({
+    releaseExecutionArn: z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:execution:[A-Za-z0-9_-]{1,80}:computer-[0-9a-f-]{36}$/) }).strict();
 export const RebasePreparationSchema = z.object({
     schemaVersion: z.literal(1), jobId: RebaseUuid, computerId: RebaseUuid,
     sourceInstanceId: z.string().regex(/^i-[0-9a-f]{17}$/), sourceVolumeId: RebaseVolume, fsUuid: RebaseUuid,
@@ -14,15 +18,18 @@ export const RebasePreparationSchema = z.object({
     fromDigest: RebaseDigest, toDigest: RebaseDigest, volumeGiB: z.number().int().min(1).max(16384),
     sourceDeployment: SourceLifecycleDeploymentSchema, deployment: LifecycleDeploymentSchema, createdAt: RebaseTime,
     releasedPoolHost: ReleasedPoolHostSchema.optional(),
+    retiredSource: RetiredSourceSchema.optional(),
 }).strict().superRefine((p, ctx) => {
     const from = p.sourceDeployment, to = p.deployment;
+    const machine = to.stateMachineVersionArn.replace(':stateMachine:', ':execution:').replace(/:[1-9][0-9]*$/, ':computer-');
     if (p.fromDigest === p.toDigest || p.fromDigest !== from.lowerImageDigest || p.fromDigest !== to.previousLowerImageDigest
         || p.toDigest !== to.lowerImageDigest || !to.preparationStateMachineVersionArn
         || ['accountId', 'region', 'namespace', 'zoneId', 'dataKeyArn'].some((key) => from[key as keyof typeof from] !== to[key as keyof typeof to])
         || p.volumeGiB < to.storage.dataMinGiB || p.volumeGiB > to.storage.dataMaxGiB
-        // The release ran on this namespace's lifecycle machine, in this account and region.
-        || (p.releasedPoolHost && !p.releasedPoolHost.releaseExecutionArn.startsWith(
-            to.stateMachineVersionArn.replace(':stateMachine:', ':execution:').replace(/:[1-9][0-9]*$/, ':computer-'))))
+        // At most one retired-host proof; the release ran on this namespace's lifecycle machine, in this account and region.
+        || (p.releasedPoolHost && p.retiredSource)
+        || (p.releasedPoolHost && !p.releasedPoolHost.releaseExecutionArn.startsWith(machine))
+        || (p.retiredSource && !p.retiredSource.releaseExecutionArn.startsWith(machine)))
         ctx.addIssue({ code: 'custom', message: 'release_mismatch' });
 });
 export type RebasePreparation = z.infer<typeof RebasePreparationSchema>;

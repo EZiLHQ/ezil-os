@@ -15,6 +15,8 @@ import { parseEnrollmentUserData } from './aws-rebase-lease';
 import { nonceHashOf } from './aws-enroll';
 import { buildRebasePreparation } from './aws-rebase-preparation';
 import { leasePoolHost } from './ready-pool';
+import { cancelFailedPreparation } from './aws-rebase-cancel';
+import { numbered, refusedAtFirstObservation } from './aws-rebase-cancel.test-support';
 import { assertNoImageReservation, leasePlacement, mintAdmissionTicket, readAdmissionCounters, withAdmission, type PlacementDb, type PlacementExecutor } from './placement';
 
 const PG = process.env.EZIL_PG_TEST_URL;
@@ -145,6 +147,43 @@ describe.skipIf(!PG)('image reservation on disposable PostgreSQL', () => {
         const next = await s.store.transition(current, { ...current, updatedAt: new Date(observed.getTime() + 1).toISOString() });
         expect(Date.parse(next.updatedAt)).toBe(Date.parse(current.updatedAt) + 1);
         await expect(s.store.transition(current, { ...current, updatedAt: new Date(observed.getTime() + 2).toISOString() })).rejects.toThrow('image_job_conflict');
+        await expectMillisecondWrites();
+    });
+    it('cancel-preparation: one concurrent CAS releases the reservation, drift refuses and replay writes nothing', async () => {
+        const s = rebaseSetup(db);
+        expect((await s.run('prepare')).status).toBe(202);
+        const reserved = await s.current();
+        const e = s.executions.get(reserved.preparationExecutionArn!)!, start = new Date(Date.parse(reserved.createdAt) + 1000);
+        Object.assign(e, { status: 'FAILED', error: 'RebasePreparationFailed', cause: 'writer_not_fenced', startDate: start, stopDate: new Date(start.getTime() + 5000) });
+        s.advance(10000);
+        expect((await s.run('verify')).body).toMatchObject({ phase: 'failed', failureCode: 'writer_not_fenced' });
+        const j = (await store.read(reserved.jobId))!;
+        const events = numbered(refusedAtFirstObservation(e, 'writer_not_fenced'), start);
+        const deps = { store: s.store, now: () => new Date(Date.parse(j.updatedAt) + 60000), describer: s.deps.describer,
+            executions: { describe: s.deps.executions.describe, history: async () => events } };
+        const request = (mode: 'check' | 'apply') => ({ schemaVersion: 1 as const, operation: 'cancel-preparation' as const,
+            computerId: j.computerId, expectedJobId: j.jobId, mode });
+        expect(await cancelFailedPreparation(deps, request('check'))).toBe('eligible');
+        await expect(assertNoImageReservation(db, j.computerId)).rejects.toThrow('image_job_conflict');
+
+        await client!.unsafe(`UPDATE ${schema}.ezil_computer_placements SET generation = generation + 1`);
+        await expect(s.store.cancelPreparation(j, deps.now())).rejects.toThrow('image_job_conflict');
+        await client!.unsafe(`UPDATE ${schema}.ezil_computer_placements SET generation = generation - 1`);
+
+        const results = await Promise.allSettled(Array.from({ length: 8 }, () => s.store.cancelPreparation(j, deps.now())));
+        expect(results.filter(r => r.status === 'fulfilled')).toHaveLength(1);
+        expect(results.filter(r => r.status === 'rejected' && String(r.reason).includes('image_job_conflict'))).toHaveLength(7);
+        const done = (await store.read(j.jobId))!;
+        expect(done).toMatchObject({ phase: 'cancelled', failureCode: 'writer_not_fenced', retentionHold: false, snapshotId: null,
+            preparationExecutionArn: j.preparationExecutionArn });
+        const [placement] = await client!.unsafe(`SELECT state, image_upgrade_job_id, generation, lease_epoch, fence_token::text AS fence_token,
+            instance_id, volume_id FROM ${schema}.ezil_computer_placements`);
+        expect(placement).toEqual({ state: 'STOPPED', image_upgrade_job_id: null, generation: String(j.sourceGeneration),
+            lease_epoch: String(j.sourceLeaseEpoch), fence_token: j.sourceFenceToken, instance_id: j.sourceInstanceId, volume_id: j.sourceVolumeId });
+        await expect(assertNoImageReservation(db, j.computerId)).resolves.toBeUndefined();
+        const snapshot = JSON.stringify(await client!.unsafe(`SELECT * FROM ${schema}.ezil_computer_image_jobs`));
+        expect(await cancelFailedPreparation(deps, request('apply'))).toBe('cancelled');
+        expect(JSON.stringify(await client!.unsafe(`SELECT * FROM ${schema}.ezil_computer_image_jobs`))).toBe(snapshot);
         await expectMillisecondWrites();
     });
     it('duplicate job rows fail closed and do not release the placement', async () => {

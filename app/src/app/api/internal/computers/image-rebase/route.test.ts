@@ -136,3 +136,60 @@ describe('reconcile-release on the same signed route', () => {
         expect(mocks.collaborators).not.toHaveBeenCalled(); expect(mocks.execute).not.toHaveBeenCalled();
     });
 });
+
+describe('cancel-preparation on the same signed route', () => {
+    async function setup() {
+        const { numbered, refusedAtFirstObservation } = await import('@/server/lib/compute/aws-rebase-cancel.test-support');
+        const s = rebaseSetup(); for (const [k, v] of Object.entries(s.env)) vi.stubEnv(k, v);
+        expect((await s.run('prepare')).status).toBe(202);
+        const reserved = await s.current();
+        const e = s.executions.get(reserved.preparationExecutionArn!)!, start = new Date(Date.parse(reserved.createdAt) + 1000);
+        Object.assign(e, { status: 'FAILED', error: 'RebasePreparationFailed', cause: 'writer_not_fenced', startDate: start, stopDate: new Date(start.getTime() + 5000) });
+        s.advance(10000);
+        expect((await s.run('verify')).body.phase).toBe('failed');
+        vi.setSystemTime(new Date(Date.parse((await s.current()).updatedAt) + 60000));
+        mocks.execute.mockImplementation(s.fake.db.execute); mocks.transaction.mockImplementation(s.fake.db.transaction);
+        const history = vi.fn(async () => numbered(refusedAtFirstObservation(e, 'writer_not_fenced'), start));
+        mocks.collaborators.mockReturnValue({ starter: s.deps.starter, describer: s.deps.describer,
+            executions: { describe: s.deps.executions.describe, history } });
+        const body = (mode: string) => ({ schemaVersion: 1, operation: 'cancel-preparation', computerId: reserved.computerId, expectedJobId: reserved.jobId, mode });
+        const signed = (value: unknown) => request(JSON.stringify(value), path, String(Date.now() / 1000));
+        return { s, body, signed, reserved };
+    }
+    it('checks without writing, then cancels and releases the reservation with no provider start', async () => {
+        const { s, body, signed, reserved } = await setup();
+        const check = await POST(signed(body('check')));
+        expect(check.status).toBe(200); expect(check.headers.get('cache-control')).toBe('no-store');
+        expect(await check.json()).toEqual({ schemaVersion: 1, computerId: reserved.computerId, jobId: reserved.jobId, outcome: 'eligible' });
+        expect(s.fake.placements[0]).toMatchObject({ state: 'UNCONFIRMED', image_upgrade_job_id: reserved.jobId });
+        const apply = await POST(signed(body('apply')));
+        expect(await apply.json()).toEqual({ schemaVersion: 1, computerId: reserved.computerId, jobId: reserved.jobId, outcome: 'cancelled' });
+        expect(s.fake.placements[0]).toMatchObject({ state: 'STOPPED', image_upgrade_job_id: null });
+        expect(s.started).toHaveLength(1);
+        expect((await (await POST(signed(body('apply')))).json()).outcome).toBe('cancelled');
+    });
+    it('answers 503 without a history reader, before any placement read', async () => {
+        const { s, body, signed } = await setup();
+        mocks.execute.mockClear();
+        mocks.collaborators.mockReturnValue({ executions: { describe: s.deps.executions.describe }, describer: s.deps.describer });
+        expect((await POST(signed(body('apply')))).status).toBe(503);
+        expect(mocks.execute).not.toHaveBeenCalled();
+    });
+    it.each(['extra field', 'missing mode', 'unknown mode', 'missing job'])('refuses a malformed cancel body (%s) before dependencies', async mode => {
+        const base = { schemaVersion: 1, operation: 'cancel-preparation', computerId: '11111111-1111-4111-8111-111111111111',
+            expectedJobId: '22222222-2222-4222-8222-222222222222', mode: 'apply' };
+        const value = mode === 'extra field' ? { ...base, jobId: null } : mode === 'missing mode' ? { ...base, mode: undefined }
+            : mode === 'unknown mode' ? { ...base, mode: 'force' } : { ...base, expectedJobId: undefined };
+        const response = await POST(request(JSON.stringify(value)));
+        expect(response.status).toBe(403); expect(mocks.collaborators).not.toHaveBeenCalled();
+    });
+    it('an unsigned or wrongly signed cancel request never reaches dependencies', async () => {
+        const body = JSON.stringify({ schemaVersion: 1, operation: 'cancel-preparation', computerId: '11111111-1111-4111-8111-111111111111',
+            expectedJobId: '22222222-2222-4222-8222-222222222222', mode: 'apply' });
+        for (const response of [await POST(request(body, '/api/internal/computers/lifecycle-authority')), await POST(request(body, path, '1')),
+            await POST(new Request('https://os.example.com' + path, { method: 'POST', body, headers: { 'content-type': 'application/json' } }))]) {
+            expect(response.status).toBe(403);
+        }
+        expect(mocks.collaborators).not.toHaveBeenCalled(); expect(mocks.execute).not.toHaveBeenCalled();
+    });
+});

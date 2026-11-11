@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { isAwsComputersEnabled, readAwsEnrollUrl, meteredSizeForInstanceType, type Env } from './aws-config';
-import { buildEnrollmentUserData, issueEnrollmentNonce, type Ec2EnrollmentDescriber } from './aws-enroll';
+import { buildEnrollmentUserData, issueEnrollmentNonce, type Ec2EnrollmentDescriber, type Ec2EnrollmentView } from './aws-enroll';
 import type { Ec2VolumeDescriber } from './aws-clients';
 import type { LifecycleStarter } from './aws-ec2';
 import type { LifecycleExecutionReader } from './aws-receipts';
@@ -13,14 +13,14 @@ import { buildLifecycleWork, LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleDeployment
 import { buildRebasePreparation, validateRebaseSnapshotReceipt } from './aws-rebase-preparation';
 import { parseRebaseJson, RebaseUuid } from './aws-rebase-json';
 import { rebaseReleaseCandidates, resolveRebaseReleases, sourceDeploymentFor } from './aws-rebase-release';
-import { readReleasedPoolHostProof } from './aws-historical-source';
+import { readReleasedPoolHostProof, readRetiredSourceProof } from './aws-historical-source';
 import { createImageJobStore, IMAGE_JOB_FAILURE_CODES, isTerminalImageJob, newReservedImageJob, type ImageJob } from './aws-rebase-store';
 import { assertImageExecution, preparationFor, launchFor, verifyImageSnapshot, ImageLaunchReceiptSchema, type RebaseSnapshotDescriber, type Execution } from './aws-rebase-evidence';
 import { isDefiniteAwsRefusal, isExecutionAbsent, toAwsClientError } from './aws-errors';
 import { ImageJobConflictError, type ImagePlacement } from './placement';
 
-/** `sourceRetirementExecutionArn`: plan/prepare only, a lookup hint for a released pool host's release (DESIGN R, a);
- * nothing in it is trusted (aws-historical-source readReleasedPoolHostProof). */
+/** `sourceRetirementExecutionArn`: plan/prepare only, a lookup hint for the release of a released pool host (DESIGN R, a) or of
+ * an aged-out regular host (R2); nothing in it is trusted (aws-historical-source readReleasedPoolHostProof/readRetiredSourceProof). */
 export const ImageRebaseRequestSchema = z.object({ schemaVersion: z.literal(1), operation: z.enum(['plan', 'prepare', 'launch', 'verify', 'recover']),
     computerId: RebaseUuid.nullable(), jobId: RebaseUuid.nullable(), sourceRetirementExecutionArn: z.string().min(1).max(300).optional() }).strict()
     .refine(r => (r.operation === 'recover' ? r.jobId !== null : r.computerId !== null)
@@ -88,6 +88,25 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
             if (!isDeepStrictEqual(found, await deps.store.releasedPoolHost(p.computerId))) throw new ImageJobConflictError();
             return proof;
         };
+        /** DESIGN R2: a STOPPED computer whose regular (non-pool) host EC2 no longer lists. The preparation helper can fence only
+         * a listed source, so an aged-out one is eligible only with the operator-named normal release proving it was retired and
+         * terminated (aws-historical-source proveRetiredSource); without it, refuse before any reservation. A listed host keeps
+         * the existing path. A release is not evidence of the host's AMI (release drains older AMIs), so an aged-out host of a
+         * shared lower stays unresolvable, as before. */
+        let observed: { host: Ec2EnrollmentView | null } | undefined;
+        /** One EC2 observation of the placement's own source, shared by R2 and the shared-lower AMI disambiguation. */
+        const observe = async () => (observed ??= { host: await deps.describer.describeForEnrollment(p.region!, p.instanceId!) }).host;
+        const retiredSource = async (d: LifecycleDeployment, shared: boolean) => {
+            if (!p.instanceId || await observe()) return null;
+            // Only a STOPPED placement can have a retired source; any other unlisted source is never reserved blind.
+            if (p.state !== 'STOPPED' || shared) throw new Error('source_identity_mismatch');
+            const proof = await readRetiredSourceProof(deps.executions, p, d, input.sourceRetirementExecutionArn, deps.now());
+            if (!proof) throw new Error('source_identity_mismatch');
+            // Observations are outside the lock: still the same placement, and still no claim row.
+            const fresh = await deps.store.releasedPoolHost(p.computerId);
+            if (fresh.row || !isDeepStrictEqual(p, fresh.placement)) throw new ImageJobConflictError();
+            return proof;
+        };
         const resolve = async () => {
             const map = parseRebaseJson(deps.env[LIFECYCLE_DEPLOYMENTS_ENV] ?? '{}', 65536) as Record<string, unknown>;
             const entry = map[p.region!];
@@ -95,10 +114,11 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
             try { candidates = rebaseReleaseCandidates(entry, p.lowerImageDigest); }
             catch (error) { throw new Error(failure(error) ?? 'release_mismatch'); }
             const released = await releasedSource(candidates.deployment);
+            const retired = released ? null : await retiredSource(candidates.deployment, candidates.sources.length > 1);
             let imageId: string | undefined;
-            if (!released && candidates.sources.length > 1) {
+            if (!released && !retired && candidates.sources.length > 1) {
                 if (!p.instanceId) throw new Error('source_identity_mismatch');
-                const host = await deps.describer.describeForEnrollment(p.region!, p.instanceId);
+                const host = await observe();
                 // Observation is outside the lock. Never use it for a placement that changed meanwhile.
                 const fresh = await deps.store.inspect(p.computerId);
                 if (!isDeepStrictEqual(p, fresh.placement)) throw new ImageJobConflictError();
@@ -110,7 +130,7 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
                     throw new Error('source_identity_mismatch');
                 imageId = host.imageId;
             }
-            try { return { ...resolveRebaseReleases(entry, p.lowerImageDigest, imageId, released?.provisioned), released }; }
+            try { return { ...resolveRebaseReleases(entry, p.lowerImageDigest, imageId, released?.provisioned), released, retired }; }
             catch (error) { throw new Error(failure(error) ?? 'release_mismatch'); }
         };
         if (input.operation === 'plan') {
@@ -131,7 +151,8 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
                 sourceLeaseEpoch: p.leaseEpoch, sourceFenceToken: p.fenceToken, fromDigest: r.source.lowerImageDigest,
                 toDigest: r.target.lowerImageDigest, volumeGiB: volume.sizeGiB, sourceDeployment: sourceDeploymentFor(r.deployment, r.source),
                 deployment: r.deployment, createdAt: deps.now().toISOString(), ...(r.released ? { releasedPoolHost: { poolHostId: r.released.poolHostId,
-                    lifecycleDigest: r.released.lifecycleDigest, releaseExecutionArn: r.released.releaseExecutionArn } } : {}) });
+                    lifecycleDigest: r.released.lifecycleDigest, releaseExecutionArn: r.released.releaseExecutionArn } }
+                    : r.retired ? { retiredSource: { releaseExecutionArn: r.retired.releaseExecutionArn } } : {}) });
             j = await deps.store.reserve(newReservedImageJob({ preparation: prep, ownerUserId: p.ownerUserId,
                 sourceRelease: r.source, targetRelease: r.target }), r.repository);
         }
