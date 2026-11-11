@@ -529,7 +529,7 @@
         try {
             switch (request.op) {
                 case 'hello':
-                    return { ok: true, protocol: PROTOCOL, owner: owner && { id: owner.id, epoch: owner.epoch }, workspaceFolders: deps.workspaceFolders() };
+                    return { ok: true, protocol: 2, supportedProtocols: [1, 2, PROTOCOL], owner: owner && { id: owner.id, epoch: owner.epoch }, workspaceFolders: deps.workspaceFolders() };
                 case 'claim': {
                     if (!OWNER.test(request.ownerId) || !Number.isSafeInteger(request.epoch) || request.epoch < 1) return fail('bad_request');
                     if (owner && (request.epoch < owner.epoch || (request.epoch === owner.epoch && request.ownerId !== owner.id))) {
@@ -584,8 +584,29 @@
         }
     }
 
+    // Untagged callers are the shipped protocol-2 extension. Never send them new fields.
+    async function negotiatedHandle(request) {
+        const protocol = request?.protocol ?? 2;
+        if (![1, 2, 3].includes(protocol)) return fail('bad_request');
+        if (request?.effort !== undefined && protocol < 3) return { ok: true, status: 'rejected', reason: 'effort_not_per_session' };
+        if (protocol < 2 && ['models', 'create', 'setModel'].includes(request?.op)) return fail('unsupported_op');
+        const result = await handle(request);
+        if (protocol === 3 || !result || request?.op === 'hello') return result;
+        const strip = value => {
+            const { effort, selectedEffort, efforts, defaultEffort, ...old } = value;
+            return old;
+        };
+        const old = strip(result);
+        if (Array.isArray(result.sessions)) old.sessions = result.sessions.map(value => {
+            const row = strip(value);
+            if (protocol === 1) { delete row.model; delete row.requests; }
+            return row;
+        });
+        if (Array.isArray(result.models)) old.models = result.models.map(strip);
+        return old;
+    }
     return {
-        handle,
+        handle: negotiatedHandle,
         dispose() {
             disposed = true;
             for (const ref of held) ref.dispose();

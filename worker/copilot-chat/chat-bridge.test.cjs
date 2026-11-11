@@ -9,13 +9,13 @@ const assert = require('node:assert/strict');
 
 const { CMD, deferred, world } = require('./chat-bridge-fake.cjs');
 
-const OWNER = { ownerId: 'os-lease', epoch: 1 };
+const OWNER = { ownerId: 'os-lease', epoch: 1, protocol: 3 };
 const claimed = async (w, epoch = 1) => { assert.deepEqual(await w.bridge.handle({ op: 'claim', ownerId: 'os-lease', epoch }), { ok: true, owner: { id: 'os-lease', epoch } }); };
-const submit = (w, n, extra = {}) => w.bridge.handle({ op: 'submit', ownerId: 'os-lease', epoch: 1, commandId: CMD(n), sessionResource: 'vscode-chat-session://local/s1', text: 'Summarize the README', deliverWithinMs: 60000, ...extra });
+const submit = (w, n, extra = {}) => w.bridge.handle({ op: 'submit', protocol: 3, ownerId: 'os-lease', epoch: 1, commandId: CMD(n), sessionResource: 'vscode-chat-session://local/s1', text: 'Summarize the README', deliverWithinMs: 60000, ...extra });
 
 test('hello and sessions describe this workbench and each open session\'s selected model', async () => {
     const w = world();
-    assert.deepEqual(await w.bridge.handle({ op: 'hello' }), { ok: true, protocol: 3, owner: null, workspaceFolders: ['vscode-remote://remote/workspace'] });
+    assert.deepEqual(await w.bridge.handle({ op: 'hello' }), { ok: true, protocol: 2, supportedProtocols: [1, 2, 3], owner: null, workspaceFolders: ['vscode-remote://remote/workspace'] });
     assert.deepEqual(await w.bridge.handle({ op: 'sessions' }), { ok: false, error: 'no_owner' });
     await claimed(w);
     const listed = await w.bridge.handle({ op: 'sessions', ...OWNER });

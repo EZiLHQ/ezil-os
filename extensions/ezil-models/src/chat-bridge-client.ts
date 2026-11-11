@@ -231,7 +231,7 @@ export class ChatBridgeClient {
     }
 
     private call(request: Record<string, unknown>): Promise<unknown> {
-        return this.deps.execute(request);
+        return this.deps.execute(request.op !== 'hello' && this.protocol() === 3 ? { ...request, protocol: 3 } : request);
     }
 
     private fence(): Record<string, unknown> {
@@ -243,7 +243,7 @@ export class ChatBridgeClient {
         try {
             const hello = await this.call({ op: 'hello' }) as View | undefined;
             if (!hello || hello.ok !== true || (hello.protocol !== 1 && hello.protocol !== 2 && hello.protocol !== 3)) return IDLE_MS;
-            this.workbench = hello.protocol;
+            this.workbench = hello.protocol === 2 && Array.isArray(hello.supportedProtocols) && hello.supportedProtocols.includes(3) ? 3 : hello.protocol;
         } catch {
             return IDLE_MS;
         }
