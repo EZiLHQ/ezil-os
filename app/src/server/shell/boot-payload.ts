@@ -307,7 +307,9 @@ export interface ShellDesktopState {
     /** UI switches (`docs/FEEDBACK-CONTROLS-CONTRACT.md` §1). Absent = all off. */
     ui?: { floatingControls: boolean; feedbackScreenshots: boolean; feedbackEventDiagnostics?: boolean; feedbackReportBundle?: boolean; feedbackAppFailures?: boolean;
         /** Images one report may carry; absent = one (a server without `screenshots`). Present only with screenshots on. */
-        feedbackScreenshotsMax?: number };
+        feedbackScreenshotsMax?: number;
+        /** Upload-first: on Send the shell PUTs each image, then posts the report with `screenshotRefs`. Present only with screenshots on. */
+        feedbackStagedUploads?: boolean };
     /** Present only for the trusted native Mac runtime. No credentials. */
     runtime?: NativeRuntime;
 }
@@ -379,7 +381,7 @@ export function toShellDesktopState(
         endpoints,
         ui: { floatingControls: features.floatingControls, feedbackScreenshots: features.feedbackScreenshots,
             ...(features.feedback ? { feedbackEventDiagnostics: true, feedbackReportBundle: true, feedbackAppFailures: true } : {}),
-            ...(features.feedbackScreenshots ? { feedbackScreenshotsMax: FEEDBACK_LIMITS.imagesMax } : {}) },
+            ...(features.feedbackScreenshots ? { feedbackScreenshotsMax: FEEDBACK_LIMITS.imagesMax, feedbackStagedUploads: true } : {}) },
     };
 }
 
