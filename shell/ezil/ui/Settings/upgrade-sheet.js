@@ -256,7 +256,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         const cpus = offeredSizes.map(size => size.vcpu);
         const sizeCopy = offeredSizes.length === 1 ? `${sizeLabel(offeredSizes[0])} computer`
             : `${cpus.slice(0, -1).join(', ')} or ${cpus.at(-1)} vCPU computers, up to ${Math.max(...offeredSizes.map(size => size.memoryGiB))} GiB`;
-        lines = [allowance, sizeCopy, 'Sessions run up to 6 hours; files and installed tools are kept'];
+        lines = [allowance, sizeCopy, 'Files and installed tools are kept'];
         if ( offer.family === 'compute' && offer.overage ) lines.push(`Optional usage beyond ${stdHoursLabel(offer.allowanceStdSeconds)} standard-hours at ${dollars(offer.overage.centsPerStdHour, { compact: true })} each — off unless you turn it on`);
     }
     for ( const line of lines ) {
