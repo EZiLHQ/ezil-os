@@ -11,6 +11,7 @@ import re
 import stat
 import subprocess
 import tempfile
+import time
 
 SOURCES = Path('/etc/apt/sources.list.d/ubuntu.sources')
 MIRROR_LIST = Path('/etc/apt/apt-mirrors.txt')
@@ -27,6 +28,10 @@ FIELDS = {'Types', 'URIs', 'Suites', 'Components', 'Signed-By', 'Architectures',
           'Architectures-Add', 'Architectures-Remove', 'Languages', 'Targets',
           'PDiffs', 'By-Hash', 'Check-Valid-Until', 'Enabled'}
 LIMIT = 1048576
+# One bounded retry of the same HTTPS URL. HTTP status is not captured: curl 22
+# means HTTP failure, not a claim about a particular server response code.
+FETCH_RETRYABLE_CURL_CODES = {5, 6, 7, 16, 18, 22, 28, 35, 52, 55, 56, 92}
+FETCH_BUDGET_SECONDS = 31  # two existing 15 s transfers plus at most 1 s backoff
 
 class Refused(Exception):
     pass
@@ -173,11 +178,25 @@ def resolve(host):
 
 def fetch(url):
     need(url.startswith(MIRROR + 'dists/'), 'release_url')
-    r = subprocess.run(['curl', '--disable', '--fail', '--silent', '--show-error', '--location',
-        '--proto', '=https', '--proto-redir', '=https', '--max-time', '15',
-        '--max-filesize', str(LIMIT), url], capture_output=True, timeout=17, check=False)
-    need(r.returncode == 0 and len(r.stdout) <= LIMIT, 'release_download')
-    return r.stdout
+    started = time.monotonic()
+    deadline = started + FETCH_BUDGET_SECONDS
+    for attempt in (1, 2):
+        remaining = deadline - time.monotonic()
+        need(remaining > 0, 'release_download')
+        r = subprocess.run(['curl', '--disable', '--fail', '--silent', '--show-error', '--location',
+            '--proto', '=https', '--proto-redir', '=https', '--max-time', '15',
+            '--max-filesize', str(LIMIT), url], capture_output=True, timeout=min(17, remaining), check=False)
+        # Fixed numeric diagnostics only: never echo stderr, payloads, URLs or environment.
+        elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
+        print(f'Ubuntu apt mirror: fetch attempt={attempt}/2 curl_rc={r.returncode} elapsed_ms={elapsed_ms}')
+        if r.returncode == 0 and len(r.stdout) <= LIMIT:
+            return r.stdout
+        # Oversize/local/trust failures do not become transport retries. Signature
+        # and release-policy verification remain outside this fetch-only loop.
+        need(len(r.stdout) <= LIMIT and r.returncode in FETCH_RETRYABLE_CURL_CODES
+             and attempt == 1, 'release_download')
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
+    raise Refused('release_download')
 
 def verify(signed, keyring):
     need(0 < len(keyring) <= LIMIT, 'release_size')
