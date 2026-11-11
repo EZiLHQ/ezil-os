@@ -91,6 +91,75 @@ function harness (opts = {}) {
     push('after the window closes (stop) nothing is asked', h.probes.length === 0 && h.reboots === 0);
 }
 
+// Code's opt-in uses a fake scheduler: no real retry delays, GETs, mints or lifecycle calls.
+function boundedHarness (answers = []) {
+    let t = 1_000_000, scope = 'account:attempt-1', live = true, connected = true, focused = true;
+    const doc = new EventTarget(); doc.visibilityState = 'visible'; doc.hasFocus = () => focused;
+    const win = new EventTarget(), timers = new Map(), states = [], probes = [];
+    let timerId = 0, covers = 0, retry;
+    const stop = watchRuntimeOnReturn({ computerId: 'code-1', isLive: () => live, generation: () => scope,
+        desktopRunning: async id => { probes.push(id); const value = answers.shift(); if (value instanceof Error) throw value; return value; },
+        reboot: () => { covers++; }, retryUnknownMs: 1000, onCheckState: (state, action) => { states.push(state); retry = action; },
+        doc, win, now: () => t, online: () => connected,
+        schedule: (fn, delay) => { const id = ++timerId; timers.set(id, { fn, delay }); return id; }, cancel: id => timers.delete(id),
+    });
+    return { stop, probes, states, timers, get covers () { return covers; },
+        away: async () => { doc.visibilityState = 'hidden'; doc.dispatchEvent(new Event('visibilitychange')); t += RECHECK_AFTER_AWAY_MS + 1;
+            doc.visibilityState = 'visible'; doc.dispatchEvent(new Event('visibilitychange')); await flush(); },
+        runRetry: async () => { const [id, timer] = [...timers][0] ?? []; if (!timer) return; timers.delete(id); timer.fn(); await flush(); },
+        retry: () => retry?.(), changeGeneration: () => { scope = 'account:attempt-2'; },
+        hide: () => { doc.visibilityState = 'hidden'; doc.dispatchEvent(new Event('visibilitychange')); },
+        offline: () => { connected = false; win.dispatchEvent(new Event('offline')); },
+        noFrame: () => { live = false; }, unfocus: () => { focused = false; win.dispatchEvent(new Event('blur')); },
+    };
+}
+{
+    const h = boundedHarness([undefined, false]); await h.away();
+    push('Code unknown keeps checking and schedules exactly one bounded retry', h.probes.length === 1 && h.covers === 0
+        && h.states.join(',') === 'checking' && h.timers.size === 1 && [...h.timers.values()][0].delay === 1000);
+    await h.runRetry();
+    push('Code retry gets actual false and covers once, never guessing stopped from unknown', h.probes.length === 2 && h.covers === 1 && h.timers.size === 0); h.stop();
+}
+{
+    const h = boundedHarness([undefined, true]); await h.away(); await h.runRetry();
+    push('Code retry true clears checking without a stopped cover', h.probes.length === 2 && h.covers === 0 && h.states.at(-1) === 'running'); h.stop();
+}
+{
+    const h = boundedHarness([undefined, undefined, true]); await h.away(); await h.runRetry();
+    push('two unknown answers stop automatically with recoverable unknown, no false stopped', h.probes.length === 2 && h.covers === 0
+        && h.states.at(-1) === 'unknown' && h.timers.size === 0);
+    h.retry(); await flush();
+    push('only explicit unknown Retry starts another cheap check', h.probes.length === 3 && h.states.at(-1) === 'running' && h.covers === 0); h.stop();
+}
+{
+    const h = boundedHarness([new Error('synthetic network failure'), false]); await h.away(); await h.runRetry();
+    push('a thrown status read is unknown and gets only the one retry', h.probes.length === 2 && h.covers === 1); h.stop();
+}
+for (const cancel of ['hide', 'offline', 'unfocus', 'changeGeneration', 'noFrame', 'stop']) {
+    const h = boundedHarness([undefined, false]); await h.away(); h[cancel](); await h.runRetry();
+    push('Code cancels its pending retry on ' + cancel, h.probes.length === 1 && h.covers === 0 && h.timers.size === 0); h.stop();
+}
+{
+    let answer; const pending = new Promise(resolve => { answer = resolve; });
+    const h = boundedHarness([pending]); await h.away(); h.stop(); answer(false); await flush();
+    push('an already-started bounded GET cannot update UI or retry after close', h.probes.length === 1 && h.covers === 0
+        && h.states.join(',') === 'checking' && h.timers.size === 0);
+}
+{
+    let answer; const pending = new Promise(resolve => { answer = resolve; });
+    const h = boundedHarness([pending]); await h.away(); h.changeGeneration(); answer(false); await flush();
+    push('a late answer from another account/boot generation is discarded', h.probes.length === 1 && h.covers === 0
+        && h.states.join(',') === 'checking' && h.timers.size === 0); h.stop();
+}
+{
+    let answer; const pending = new Promise(resolve => { answer = resolve; });
+    const h = boundedHarness([pending, true]); await h.away(); await h.away();
+    push('a newer return waits for an old in-flight GET instead of overlapping it', h.probes.length === 1);
+    answer(false); await flush();
+    push('retired false cannot cover a newer return; the queued current check runs once', h.probes.length === 2
+        && h.covers === 0 && h.states.at(-1) === 'running'); h.stop();
+}
+
 let failed = 0;
 for ( const c of checks ) {
     if ( ! c.pass ) failed++;
