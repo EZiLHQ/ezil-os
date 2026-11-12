@@ -52,6 +52,34 @@ class RenderEnvTests(unittest.TestCase):
         with self.assertRaises(renderer.RenderError):
             renderer.validate({**self.values, "EZIL_OS_FEEDBACK": ""})
 
+    def sponsor_values(self):
+        return {
+            "SPONSOR_KEY": "synthetic-context-signing-key-1234567890",
+            "SPONSOR_REGISTRY_KEY": "synthetic-registry-signing-key-1234567890",
+            "SPONSOR_REGISTRY": json.dumps({"campaigns": [{"id": "staging-qa",
+                "label": 'synthetic-$TOKEN-${TOKEN}-#-"'}]}, separators=(",", ":")),
+            "SPONSOR_REGISTRY_SIG": "a" * 64,
+            "SPONSOR_TRIALS_ENABLED": "1",
+        }
+
+    def test_sponsor_runtime_keys_are_optional(self):
+        sponsor = self.sponsor_values()
+        self.assertTrue(set(sponsor) <= renderer.OPTIONAL)
+        self.assertFalse(set(sponsor) & renderer.REQUIRED)
+        self.assertEqual(renderer.validate(dict(self.values)), self.values)
+        self.assertEqual(renderer.validate({**self.values, **sponsor}), {**self.values, **sponsor})
+
+    def test_sponsor_operator_url_and_unknown_keys_are_refused(self):
+        for key in ("SPONSOR_REPORT_DATABASE_URL", "SPONSOR_TRIALS_ENABLE", "SPONSOR_REGISTRY_KEY_EXTRA"):
+            with self.subTest(key=key), self.assertRaises(renderer.RenderError):
+                renderer.validate({**self.values, key: "synthetic"})
+
+    def test_sponsor_values_keep_the_existing_validation(self):
+        for key in self.sponsor_values():
+            for value in (None, "", " padded ", "before\nafter", "before\0after"):
+                with self.subTest(key=key, value=repr(value)), self.assertRaises(renderer.RenderError):
+                    renderer.validate({**self.values, key: value})
+
     def test_missing_key_refused(self):
         del self.values["AUTH0_SECRET_ID"]
         with self.assertRaises(renderer.RenderError):
@@ -80,6 +108,7 @@ class RenderEnvTests(unittest.TestCase):
     def test_write_is_private_raw_and_prints_names_only(self):
         literal = 'synthetic-$TOKEN-${TOKEN}-#-"-\'-\\-secret-1234567890'
         self.values["CRON_SECRET"] = literal
+        self.values.update(self.sponsor_values())
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
             directory = Path(temporary)
             output = io.StringIO()
