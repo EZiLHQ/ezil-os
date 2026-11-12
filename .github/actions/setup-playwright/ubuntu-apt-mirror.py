@@ -20,6 +20,7 @@ PROTECTED_KEYRING = Path('/etc/apt/keyrings/ezil-ci-ubuntu-archive.gpg')
 FINGERPRINT = 'F6ECB3762474EDA9D21B7022871920D1991BC93C'
 SIGNED_BY = str(PROTECTED_KEYRING) + ' ' + FINGERPRINT + '!'
 MIRROR = 'https://mirrors.edge.kernel.org/ubuntu/'
+CANONICAL_MIRROR = 'https://archive.ubuntu.com/ubuntu/'
 LIST_URI = 'mirror+file:/etc/apt/apt-mirrors.txt'
 HOSTS = ('azure.archive.ubuntu.com', 'archive.ubuntu.com', 'security.ubuntu.com')
 URIS = {scheme + '://' + host + '/ubuntu' + slash for scheme in ('http', 'https') for host in HOSTS for slash in ('', '/')}
@@ -28,8 +29,8 @@ FIELDS = {'Types', 'URIs', 'Suites', 'Components', 'Signed-By', 'Architectures',
           'Architectures-Add', 'Architectures-Remove', 'Languages', 'Targets',
           'PDiffs', 'By-Hash', 'Check-Valid-Until', 'Enabled'}
 LIMIT = 1048576
-# One bounded retry of the same HTTPS URL. HTTP status is not captured: curl 22
-# means HTTP failure, not a claim about a particular server response code.
+# At most two fixed HTTPS transports per pocket, within the existing total budget.
+# HTTP status is not captured: curl 22 does not identify a particular response.
 FETCH_RETRYABLE_CURL_CODES = {5, 6, 7, 16, 18, 22, 28, 35, 52, 55, 56, 92}
 FETCH_BUDGET_SECONDS = 31  # two existing 15 s transfers plus at most 1 s backoff
 
@@ -177,24 +178,34 @@ def resolve(host):
         return False
 
 def fetch(url):
-    need(url.startswith(MIRROR + 'dists/'), 'release_url')
+    need(url in {MIRROR + 'dists/' + pocket + '/InRelease' for pocket in POCKETS}, 'release_url')
+    suffix = url[len(MIRROR):]
     started = time.monotonic()
     deadline = started + FETCH_BUDGET_SECONDS
-    for attempt in (1, 2):
+    for attempt, mirror in enumerate((MIRROR, CANONICAL_MIRROR), 1):
         remaining = deadline - time.monotonic()
-        need(remaining > 0, 'release_download')
-        r = subprocess.run(['curl', '--disable', '--fail', '--silent', '--show-error', '--location',
-            '--proto', '=https', '--proto-redir', '=https', '--max-time', '15',
-            '--max-filesize', str(LIMIT), url], capture_output=True, timeout=min(17, remaining), check=False)
-        # Fixed numeric diagnostics only: never echo stderr, payloads, URLs or environment.
-        elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
-        print(f'Ubuntu apt mirror: fetch attempt={attempt}/2 curl_rc={r.returncode} elapsed_ms={elapsed_ms}')
-        if r.returncode == 0 and len(r.stdout) <= LIMIT:
-            return r.stdout
-        # Oversize/local/trust failures do not become transport retries. Signature
-        # and release-policy verification remain outside this fetch-only loop.
-        need(len(r.stdout) <= LIMIT and r.returncode in FETCH_RETRYABLE_CURL_CODES
-             and attempt == 1, 'release_download')
+        need(remaining > 0.25, 'release_download')
+        process_timeout = min(17, remaining)
+        # Leave curl time to exit before Python's unchanged overall deadline.
+        transfer_timeout = min(15, process_timeout - 0.25)
+        try:
+            r = subprocess.run(['curl', '--disable', '--fail', '--silent', '--show-error', '--location',
+                '--proto', '=https', '--proto-redir', '=https', '--max-time', str(transfer_timeout),
+                '--max-filesize', str(LIMIT), mirror + suffix], capture_output=True,
+                timeout=process_timeout, check=False)
+        except subprocess.TimeoutExpired:
+            elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
+            print(f'Ubuntu apt mirror: fetch attempt={attempt}/2 process_timeout=1 elapsed_ms={elapsed_ms}')
+            need(attempt == 1, 'release_download')
+        else:
+            # Fixed numeric diagnostics only: no stderr, payloads, URLs or environment.
+            elapsed_ms = max(0, int((time.monotonic() - started) * 1000))
+            print(f'Ubuntu apt mirror: fetch attempt={attempt}/2 curl_rc={r.returncode} elapsed_ms={elapsed_ms}')
+            if r.returncode == 0 and len(r.stdout) <= LIMIT:
+                return r.stdout
+            # Signature, signer and release-content checks still happen outside this loop.
+            need(len(r.stdout) <= LIMIT and r.returncode in FETCH_RETRYABLE_CURL_CODES
+                 and attempt == 1, 'release_download')
         time.sleep(min(1, max(0, deadline - time.monotonic())))
     raise Refused('release_download')
 

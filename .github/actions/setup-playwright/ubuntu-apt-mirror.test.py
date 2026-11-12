@@ -325,6 +325,69 @@ class AptMirrorTests(unittest.TestCase):
             self.assertEqual(args[args.index('--proto') + 1], '=https')
             self.assertNotIn('--insecure', args)
 
+class TransportFailoverTests(unittest.TestCase):
+    def test_kernel_timeout_uses_fixed_canonical_transport_inside_existing_budget(self):
+        clock = SimpleNamespace(now=0.0)
+        urls = []
+        def run(args, **kwargs):
+            urls.append(args[-1])
+            self.assertLess(float(args[args.index('--max-time') + 1]), kwargs['timeout'])
+            if len(urls) == 1:
+                clock.now += 15.01
+                return SimpleNamespace(returncode=28, stdout=b'', stderr=b'private-sentinel')
+            clock.now += .1
+            self.assertAlmostEqual(kwargs['timeout'], m.FETCH_BUDGET_SECONDS - 16.01, places=6)
+            return SimpleNamespace(returncode=0, stdout=release('noble'))
+        with mock.patch.object(m.subprocess, 'run', side_effect=run), \
+             mock.patch.object(m.time, 'monotonic', side_effect=lambda: clock.now), \
+             mock.patch.object(m.time, 'sleep', side_effect=lambda n: setattr(clock, 'now', clock.now+n)), mock.patch('builtins.print'):
+            payload = m.fetch(m.MIRROR + 'dists/noble/InRelease')
+        self.assertEqual(urls, [m.MIRROR+'dists/noble/InRelease', m.CANONICAL_MIRROR+'dists/noble/InRelease'])
+        self.assertEqual(payload, release('noble'))
+        self.assertLessEqual(clock.now, 31)
+        self.assertEqual(m.FETCH_BUDGET_SECONDS, 31)
+
+    def test_real_transfer_limits_fit_the_second_process_remaining_deadline(self):
+        clock = SimpleNamespace(now=0.0)
+        calls = []
+        def run(args, **kwargs):
+            maximum = float(args[args.index('--max-time')+1]);calls.append((maximum,kwargs['timeout']))
+            self.assertGreaterEqual(kwargs['timeout']-maximum, .249)
+            clock.now += maximum + .01
+            return SimpleNamespace(returncode=28, stdout=b'')
+        with mock.patch.object(m.subprocess,'run',side_effect=run), \
+             mock.patch.object(m.time,'monotonic',side_effect=lambda:clock.now), \
+             mock.patch.object(m.time,'sleep',side_effect=lambda n:setattr(clock,'now',clock.now+n)), mock.patch('builtins.print'):
+            with self.assertRaisesRegex(m.Refused,'^release_download$'):m.fetch(m.MIRROR+'dists/noble/InRelease')
+        self.assertEqual(len(calls),2);self.assertEqual(calls[0],(15,17));self.assertLess(calls[1][0],15);self.assertLessEqual(clock.now,31)
+
+    def test_process_timeout_can_fail_over_but_second_timeout_is_closed_and_not_echoed(self):
+        for results, success in [([subprocess.TimeoutExpired(['private-sentinel'],17),SimpleNamespace(returncode=0,stdout=b'signed')],True),
+                                 ([subprocess.TimeoutExpired(['private-sentinel'],17),subprocess.TimeoutExpired(['private-sentinel'],14)],False)]:
+            with mock.patch.object(m.subprocess,'run',side_effect=results) as calls, mock.patch.object(m.time,'sleep'), mock.patch('builtins.print') as diagnostic:
+                if success:self.assertEqual(m.fetch(m.MIRROR+'dists/noble/InRelease'),b'signed')
+                else:
+                    with self.assertRaisesRegex(m.Refused,'^release_download$'):m.fetch(m.MIRROR+'dists/noble/InRelease')
+                self.assertEqual(calls.call_count,2)
+                self.assertEqual(calls.call_args_list[1].args[0][-1],m.CANONICAL_MIRROR+'dists/noble/InRelease')
+                self.assertNotIn('private-sentinel',str(diagnostic.call_args_list))
+                self.assertTrue(any('process_timeout=1'in c.args[0]for c in diagnostic.call_args_list))
+
+    def test_only_exact_known_pocket_urls_can_select_the_fixed_fallback(self):
+        with mock.patch.object(m.subprocess,'run') as download:
+            for url in [m.MIRROR+'dists/noble/InRelease?url=https://evil.invalid/',m.MIRROR+'dists/../InRelease',
+                        m.MIRROR+'dists/jammy/InRelease','https://evil.invalid/dists/noble/InRelease',m.CANONICAL_MIRROR+'dists/noble/InRelease']:
+                with self.assertRaisesRegex(m.Refused,'^release_url$'):m.fetch(url)
+            download.assert_not_called()
+
+    def test_canonical_payload_still_passes_exact_original_release_policy(self):
+        def fake(url):
+            with mock.patch.object(m.subprocess,'run',side_effect=[SimpleNamespace(returncode=28,stdout=b''),SimpleNamespace(returncode=0,stdout=release(url.split('/')[-2]))]), mock.patch.object(m.time,'sleep'),mock.patch('builtins.print'):
+                return m.fetch(url)
+        self.assertIn(m.SIGNED_BY.encode(), recover(fetch=fake))
+        with self.assertRaisesRegex(m.Refused,'^release_signer$'):
+            recover(fetch=fake,verify=lambda _:(_ for _ in ()).throw(m.Refused('release_signer')))
+
 if __name__ == '__main__':
     unittest.main()
 
