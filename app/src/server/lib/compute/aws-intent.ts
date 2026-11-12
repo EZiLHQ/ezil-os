@@ -24,7 +24,7 @@ import { parseEnrollmentUserData } from './aws-rebase-lease';
 import { parseRebaseJson, RebaseDigest, RebaseHash, RebaseUuid } from './aws-rebase-json';
 
 import { AWS_REGION_PATTERN, type Env } from './aws-config';
-import { RebaseSourceReleaseSchema } from './aws-rebase-release';
+import { REBASE_RELEASE_REGISTRY_CAPACITY, RebaseSourceReleaseSchema } from './aws-rebase-release';
 
 /** JSON object: region → that region's lifecycle deployment (the infra stack's outputs). */
 export const LIFECYCLE_DEPLOYMENTS_ENV = 'EZIL_AWS_LIFECYCLE_DEPLOYMENTS';
@@ -170,7 +170,7 @@ export function readLifecycleDeployments(
     for (const region of regions) {
         const entry = Object.prototype.hasOwnProperty.call(parsed, region) ? (parsed as Record<string, unknown>)[region] : undefined;
         const { releases, ...deployment } = entry && typeof entry === 'object' && !Array.isArray(entry) ? entry as Record<string, unknown> : {};
-        if (releases !== undefined && !z.array(RebaseSourceReleaseSchema).min(1).max(31).safeParse(releases).success) {
+        if (releases !== undefined && !z.array(RebaseSourceReleaseSchema).min(1).max(REBASE_RELEASE_REGISTRY_CAPACITY).safeParse(releases).success) {
             invalid.push(`${LIFECYCLE_DEPLOYMENTS_ENV}.${region}`); continue;
         }
         const d = LifecycleDeploymentSchema.safeParse(deployment);
