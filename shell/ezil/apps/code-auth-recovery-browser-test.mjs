@@ -12,7 +12,7 @@ const source = stripTypeScriptTypes(readFileSync(new URL('../../../worker/src/co
 const { codeAuthRecovery } = await import(`data:text/javascript,${encodeURIComponent(source)}`);
 const assets = process.env.EZIL_SHELL_OUT_DIR || new URL('../../../app/public/os/', import.meta.url).pathname;
 const computerId = '11111111-1111-4111-8111-111111111111';
-let running = true, documents = 0, mints = 0, editorOrigin, oldShell = false;
+let running = true, documents = 0, mints = 0, editorOrigin, oldShell = false, authExpired = false, editorHealthy = false;
 const topPaths = [];
 const shell = createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -26,17 +26,28 @@ const shell = createServer((req, res) => {
         mints++; json({ ok: true, codePreviewUrl: `${editorOrigin}/preview-bootstrap?token=fixture&folder=/workspace`, expiresAt: Date.now()+300_000 }); return;
     }
     if (url.pathname === '/api/shell/desktop') {
+        if (authExpired) { res.statusCode = 401; json({error:{code:'UNAUTHORIZED',message:'Sign in to continue.'}}); return; }
         json(url.searchParams.get('confirm') === 'frame' ? { ok: true, confirmed: true, status: 200 } : { ok: true, guacamoleRunning: running }); return;
     }
     if (url.pathname.startsWith('/api/')) { json({ ok: true }); return; }
     if (url.pathname === '/favicon.ico') { res.writeHead(204); res.end(); return; }
+    if (url.pathname === '/login') {
+        res.setHeader('content-type','text/html'); res.end('<html><body>Normal OS sign-in fixture</body></html>'); return;
+    }
     documents++; topPaths.push(url.pathname + url.search);
+    if (authExpired) {
+        // The normal OS document bootstrap, unlike its API status read, sends an expired session to sign-in.
+        res.writeHead(302,{location:'/login?returnUrl='+encodeURIComponent(url.pathname+url.search)}); res.end(); return;
+    }
     res.setHeader('content-type', 'text/html'); res.end('<!doctype html><html><head><link rel="stylesheet" href="/os/bundle.min.css"></head><body><div id="ezil-os-root"></div><script src="/os/icons.js"></script><script src="/os/bundle.min.js"></script></body></html>');
 });
 const editor = createServer(async (req, res) => {
     const url = new URL(req.url, editorOrigin);
     if (url.pathname === '/preview-bootstrap') {
         res.writeHead(302, { location: '/?folder=/workspace&ezil_mint=' + (url.searchParams.get('ezil_mint') ?? '') }); res.end(); return;
+    }
+    if (editorHealthy && url.pathname === '/') {
+        res.setHeader('content-type','text/html'); res.end('<html><body><button onclick="location.reload()">Reload Code</button></body></html>'); return;
     }
     const response = codeAuthRecovery(new Request(url, { headers: { 'sec-fetch-dest': 'iframe' } }), ['https://os-staging.ezil.work']);
     if (!response) { res.writeHead(404); res.end(); return; }
@@ -49,8 +60,8 @@ editorOrigin = `http://127.0.0.1:${editor.address().port}`;
 const browser = await chromium.launch({ headless: true, args: ['--no-sandbox','--disable-dev-shm-usage'],
     ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}) });
 try {
-    for (const scenario of ['running', 'stopped', 'old-shell']) {
-        running = scenario !== 'stopped'; oldShell = scenario === 'old-shell';
+    for (const scenario of ['running', 'stopped', 'old-shell', 'auth-expired']) {
+        running = scenario !== 'stopped'; oldShell = scenario === 'old-shell'; authExpired = false; editorHealthy = scenario === 'auth-expired';
         documents = 0; mints = 0; topPaths.length = 0;
         const context = await browser.newContext();
         await context.addInitScript(({computerId, oldShell}) => {
@@ -81,6 +92,28 @@ try {
             await page.waitForURL('https://os-staging.ezil.work/app/code');
             assert.ok((await page.textContent('body')).includes('Authenticated OS rebootstrap fixture'));
             console.log('PASS old-shell absent-handler compatibility: real sandbox permits user-click fixed trusted OS top link');
+            await context.close(); continue;
+        }
+        if (scenario === 'auth-expired') {
+            const expireAndReloadCode = async () => {
+                const reloadCode = page.frameLocator('.window-app-iframe').getByRole('button',{name:'Reload Code'});
+                await reloadCode.waitFor({state:'visible'});
+                await page.waitForFunction(() => document.querySelector('.ezil-app-spinner')?.hidden === true);
+                authExpired = true; editorHealthy = false; await reloadCode.click();
+            };
+            await expireAndReloadCode();
+            await page.waitForURL(url => url.pathname === '/login');
+            assert.equal(documents,2); assert.equal(mints,1,'expired OS bootstrap cannot mint another authenticated Code URL');
+            assert.ok(topPaths.every(p=>p===target));
+            // The same tab's guard persists: another expired old window must still offer an explicit full reload.
+            authExpired = false; editorHealthy = true; documents = 0; mints = 0; topPaths.length = 0;
+            await page.goto(shellOrigin+target); await expireAndReloadCode();
+            await page.waitForFunction(() => document.querySelector('.ezil-code-state')?.dataset.state === 'unknown');
+            assert.equal(documents,1,'guard blocks automatic repeat');
+            await page.locator('.ezil-code-state').getByRole('button',{name:'Retry'}).click();
+            await page.waitForURL(url => url.pathname === '/login');
+            assert.equal(documents,2); assert.equal(mints,1);
+            console.log('PASS live Code Reload + actual session401: guarded full OS auth bootstrap, then explicit full reload despite persistent401');
             await context.close(); continue;
         }
         const state = page.locator('.ezil-code-state');

@@ -21,7 +21,9 @@ export function attachCodeAuthRecovery({ iframe, frameUrl, current, desktopRunni
         if (!live() || reloading) return;
         if (running === false) { onStopped(); return; }
         const retry = () => { if (live()) void recover(true); };
-        if (running !== true) { onUnknown(retry); return; }
+        // A refused/unknown status can mean the OS session expired too. Reloading
+        // the OS runs its normal auth bootstrap; it grants no computer access.
+        // Only a known stopped computer stays behind its explicit Start action.
         if (!explicit) {
             try {
                 const previous = Number((storage ?? win.sessionStorage).getItem(GUARD_KEY));

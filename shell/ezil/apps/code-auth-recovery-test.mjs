@@ -27,10 +27,31 @@ test('stopped computer exposes existing Start CTA and never automatically starts
     const h = setup(); h.state.running = false; h.send(); await flush();
     assert.deepEqual(h.seen, ['stopped']); assert.equal(h.store.size, 0);
 });
-test('unknown status stays recoverable: explicit Retry checks again before full reload', async () => {
+test('unknown status uses the guarded full OS auth bootstrap instead of a permanent status Retry', async () => {
     const h = setup(); h.state.running = undefined; h.send(); await flush();
-    assert.deepEqual(h.seen, ['unknown']); h.state.running = true; h.state.retry(); await flush();
-    assert.equal(h.state.probes, 2); assert.deepEqual(h.seen, ['unknown', 'full-os-reload']);
+    assert.deepEqual(h.seen, ['full-os-reload']); h.dispose();
+    const next = setup({ storage: h.options.storage }); next.state.running = undefined; next.send(); await flush();
+    assert.deepEqual(next.seen, ['unknown']); next.state.retry(); await flush();
+    assert.deepEqual(next.seen, ['unknown', 'full-os-reload']);
+});
+test('actual session desktopRunning maps expired401, redirectHTML and network failure to unknown; each can rebootstrap', async () => {
+    const { desktopRunning } = await import('../session.js');
+    const originalFetch = globalThis.fetch;
+    try {
+        for (const mode of ['401', 'redirect-html', 'offline']) {
+            const calls = [];
+            globalThis.fetch = async (url, init) => {
+                calls.push({url,credentials:init.credentials});
+                if (mode === 'offline') throw new TypeError('local fixture offline');
+                return mode === '401' ? new Response(JSON.stringify({error:{code:'UNAUTHORIZED'}}),{status:401})
+                    : new Response('<html>Sign in</html>',{status:200});
+            };
+            const h = setup({ desktopRunning: () => desktopRunning('fixture-computer') });
+            h.send(); await flush(); assert.deepEqual(h.seen,['full-os-reload'],mode);
+            assert.deepEqual(calls,[{url:'/api/shell/desktop?computerId=fixture-computer',credentials:'same-origin'}]);
+            h.dispose();
+        }
+    } finally { globalThis.fetch = originalFetch; }
 });
 test('foreign origin, sibling frame, missing source, other message and stale mint are ignored', async () => {
     const h = setup(); h.send({ origin: 'https://attacker.invalid' }); h.send({ source: {} }); h.send({ source: null });
