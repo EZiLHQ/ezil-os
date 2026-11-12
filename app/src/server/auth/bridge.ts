@@ -1,5 +1,9 @@
 import 'server-only';
 
+import { randomUUID } from 'node:crypto';
+import type { SponsorCampaign } from '@/server/billing/v3/sponsor';
+import { materializeSponsorAttribution, SPONSOR_CREATION_METADATA, sponsorCreationHint, sponsorSubjectSupported } from './sponsor';
+
 import { createClient } from '@/utils/supabase/server';
 
 import { Auth0Error, type Auth0Identity } from './auth0';
@@ -35,7 +39,9 @@ export async function refuseSilentAccountSwitch(identity: Auth0Identity): Promis
 }
 
 /** The caller must first verify the Auth0 ID token, including verified email. */
-export async function bridgeAuth0Identity(identity: Auth0Identity): Promise<void> {
+export async function bridgeAuth0Identity(identity: Auth0Identity, sponsor?: SponsorCampaign): Promise<void> {
+    // Unsupported sponsor identities fail before Admin effects; ordinary public sign-in keeps its existing contract.
+    if (sponsor && !sponsorSubjectSupported(identity.sub)) throw new Auth0Error('invalid_transaction');
     const admin = createAdminClient().auth.admin;
     const email = identity.email.toLowerCase();
     let user;
@@ -48,8 +54,14 @@ export async function bridgeAuth0Identity(identity: Auth0Identity): Promise<void
         if (user || data.users.length < perPage) break;
     }
     if (!user) {
-        const { data, error } = await admin.createUser({ email, email_confirm: true, app_metadata: { auth0_sub: identity.sub } });
+        const sponsorUserId = sponsor ? randomUUID() : undefined;
+        const { data, error } = await admin.createUser({
+            email, email_confirm: true, ...(sponsorUserId ? { id: sponsorUserId } : {}),
+            app_metadata: { auth0_sub: identity.sub, ...(sponsor && sponsorUserId
+                ? { [SPONSOR_CREATION_METADATA]: sponsorCreationHint(sponsor, sponsorUserId, identity.sub) } : {}) },
+        });
         if (error || !data.user) throw new Auth0Error('session_failed');
+        if (sponsorUserId && data.user.id !== sponsorUserId) throw new Auth0Error('session_failed');
         user = data.user;
     } else {
         const subject = user.app_metadata.auth0_sub;
@@ -86,5 +98,11 @@ export async function bridgeAuth0Identity(identity: Auth0Identity): Promise<void
     if (result.error || !result.data.session || result.data.user?.id !== user.id) {
         await supabase.auth.signOut({ scope: 'local' });
         throw new Auth0Error('session_failed');
+    }
+    // Only a verified OTP session may materialize attribution; failure keeps the Admin creation hint for retry.
+    if (sponsor || user.app_metadata[SPONSOR_CREATION_METADATA]) {
+        try { await materializeSponsorAttribution({ userId: user.id, verifiedSubject: identity.sub,
+            metadata: result.data.user.app_metadata, ...(sponsor ? { campaign: sponsor } : {}) }); }
+        catch { console.warn('[auth0] sponsor attribution unavailable'); }
     }
 }

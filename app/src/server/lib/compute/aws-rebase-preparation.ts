@@ -7,6 +7,9 @@ import { RebaseCounter, RebaseDigest, RebaseHash, RebaseSnapshot, RebaseTime, Re
  * omitted when absent, as in infra's PreparationDocumentSchema: existing documents and digests are byte-identical. */
 export const ReleasedPoolHostSchema = z.object({ poolHostId: RebaseUuid, lifecycleDigest: RebaseHash,
     releaseExecutionArn: z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:execution:[A-Za-z0-9_-]{1,80}:computer-[0-9a-f-]{36}$/) }).strict();
+export const ReleasedDedicatedHostSchema = z.object({ imageJobId: RebaseUuid, provisionDigest: RebaseHash,
+    provisionExecutionArn: z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:execution:[A-Za-z0-9_-]{1,80}:computer-[0-9a-f-]{36}$/),
+    releaseExecutionArn: z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:execution:[A-Za-z0-9_-]{1,80}:computer-[0-9a-f-]{36}$/) }).strict();
 export const RebasePreparationSchema = z.object({
     schemaVersion: z.literal(1), jobId: RebaseUuid, computerId: RebaseUuid,
     sourceInstanceId: z.string().regex(/^i-[0-9a-f]{17}$/), sourceVolumeId: RebaseVolume, fsUuid: RebaseUuid,
@@ -14,6 +17,7 @@ export const RebasePreparationSchema = z.object({
     fromDigest: RebaseDigest, toDigest: RebaseDigest, volumeGiB: z.number().int().min(1).max(16384),
     sourceDeployment: SourceLifecycleDeploymentSchema, deployment: LifecycleDeploymentSchema, createdAt: RebaseTime,
     releasedPoolHost: ReleasedPoolHostSchema.optional(),
+    releasedDedicatedHost: ReleasedDedicatedHostSchema.optional(),
 }).strict().superRefine((p, ctx) => {
     const from = p.sourceDeployment, to = p.deployment;
     if (p.fromDigest === p.toDigest || p.fromDigest !== from.lowerImageDigest || p.fromDigest !== to.previousLowerImageDigest
@@ -21,6 +25,10 @@ export const RebasePreparationSchema = z.object({
         || ['accountId', 'region', 'namespace', 'zoneId', 'dataKeyArn'].some((key) => from[key as keyof typeof from] !== to[key as keyof typeof to])
         || p.volumeGiB < to.storage.dataMinGiB || p.volumeGiB > to.storage.dataMaxGiB
         // The release ran on this namespace's lifecycle machine, in this account and region.
+        || (p.releasedPoolHost && p.releasedDedicatedHost)
+        || (p.releasedDedicatedHost && (p.releasedDedicatedHost.provisionExecutionArn === p.releasedDedicatedHost.releaseExecutionArn
+            || [p.releasedDedicatedHost.provisionExecutionArn, p.releasedDedicatedHost.releaseExecutionArn].some(arn => !arn.startsWith(
+                to.stateMachineVersionArn.replace(':stateMachine:', ':execution:').replace(/:[1-9][0-9]*$/, ':computer-')))))
         || (p.releasedPoolHost && !p.releasedPoolHost.releaseExecutionArn.startsWith(
             to.stateMachineVersionArn.replace(':stateMachine:', ':execution:').replace(/:[1-9][0-9]*$/, ':computer-'))))
         ctx.addIssue({ code: 'custom', message: 'release_mismatch' });

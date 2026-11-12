@@ -244,6 +244,16 @@ class AptMirrorTests(unittest.TestCase):
                         m.verify(signed.read_bytes(), keys)
                     gpg('--local-user', fingerprints[0], '--output', str(signed), '--clearsign', str(payload))
                     self.assertEqual(m.verify(signed.read_bytes(), keys), payload.read_bytes())
+                    signed_bytes = signed.read_bytes()
+                    with mock.patch.object(m.subprocess, 'run', side_effect=[
+                            SimpleNamespace(returncode=28, stdout=b'', stderr=b'private-sentinel'),
+                            SimpleNamespace(returncode=0, stdout=signed_bytes)] ) as download, \
+                         mock.patch.object(m.time, 'sleep') as sleep, mock.patch('builtins.print'):
+                        recovered = m.fetch(m.MIRROR + 'dists/noble/InRelease')
+                    self.assertEqual(download.call_count, 2)
+                    sleep.assert_called_once()
+                    self.assertEqual(recovered, signed_bytes)
+                    self.assertEqual(m.verify(recovered, keys), payload.read_bytes())
             finally:
                 subprocess.run(['gpgconf', '--homedir', folder, '--kill', 'gpg-agent'], capture_output=True, timeout=5)
 
@@ -261,6 +271,50 @@ class AptMirrorTests(unittest.TestCase):
                 '-o', 'Dir::State::lists=' + str(lists), '-o', 'Dir::Cache=' + str(root)],
                 capture_output=True, timeout=5)
             self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_transport_retry_exhaustion_is_fail_closed_with_a_31_second_budget(self):
+        clock = SimpleNamespace(now=0.0)
+        def run(*args, **kwargs):
+            clock.now += 15
+            return SimpleNamespace(returncode=28, stdout=b'', stderr=b'private-sentinel')
+        def sleep(seconds):
+            self.assertLessEqual(seconds, 1)
+            clock.now += seconds
+        with mock.patch.object(m.subprocess, 'run', side_effect=run) as download, \
+             mock.patch.object(m.time, 'monotonic', side_effect=lambda: clock.now), \
+             mock.patch.object(m.time, 'sleep', side_effect=sleep) as backoff, \
+             mock.patch('builtins.print') as diagnostic:
+            with self.assertRaisesRegex(m.Refused, '^release_download$'):
+                m.fetch(m.MIRROR + 'dists/noble/InRelease')
+        self.assertEqual(download.call_count, 2)
+        self.assertEqual(clock.now, 31)
+        backoff.assert_called_once_with(1)
+        self.assertEqual([c.kwargs['timeout'] for c in download.call_args_list], [17, 15])
+        for call in diagnostic.call_args_list:
+            self.assertRegex(call.args[0], r'^Ubuntu apt mirror: fetch attempt=[12]/2 curl_rc=28 elapsed_ms=[0-9]+$')
+            self.assertNotIn('private-sentinel', call.args[0])
+
+    def test_oversize_and_nontransport_curl_failures_are_not_retried(self):
+        for code, body in [(0, b'x' * (m.LIMIT + 1)), (63, b''), (60, b''), (3, b'')]:
+            with self.subTest(code=code), \
+                 mock.patch.object(m.subprocess, 'run', return_value=SimpleNamespace(returncode=code, stdout=body)) as download, \
+                 mock.patch.object(m.time, 'sleep') as sleep, mock.patch('builtins.print'):
+                with self.assertRaisesRegex(m.Refused, '^release_download$'):
+                    m.fetch(m.MIRROR + 'dists/noble/InRelease')
+                download.assert_called_once()
+                sleep.assert_not_called()
+
+    def test_successful_fetch_signature_and_content_policy_failures_are_not_retried(self):
+        for payload, verify, reason in [
+                (b'signed', mock.Mock(side_effect=m.Refused('release_signature')), 'release_signature'),
+                (release('noble', Origin='Other'), lambda b: b, 'release_identity')]:
+            with self.subTest(reason=reason), \
+                 mock.patch.object(m.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=payload)) as download, \
+                 mock.patch.object(m.time, 'sleep') as sleep, mock.patch('builtins.print'):
+                with self.assertRaisesRegex(m.Refused, '^' + reason + '$'):
+                    recover(fetch=m.fetch, verify=verify)
+                download.assert_called_once()
+                sleep.assert_not_called()
 
     def test_download_uses_bounded_verified_https_and_no_signature_bypass(self):
         with mock.patch.object(m.subprocess, 'run', return_value=SimpleNamespace(returncode=0, stdout=b'signed')) as run:

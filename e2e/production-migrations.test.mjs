@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, readFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { hash, snapshotHash, tokenize, additiveSQL, validate, run, authorize, query, catalogSQL, applySQL, planSQL, eventTriggersSQL } from '../.github/scripts/production-migrations.mjs';
@@ -48,6 +49,22 @@ test('inventory, source byte checksums, symlinks and malformed manifests fail cl
   await save(); await rm(join(root, 'history.sql')); await writeFile(join(root, 'other.txt'), 'DROP TABLE app.never_run;');
   await symlink(join(root, 'other.txt'), join(root, 'history.sql'));
   await assert.rejects(validate(root), /Symlink/);
+});
+
+test('checked-in sponsor SQL is fully inventoried but absent from automatic apply and ordered journal', async () => {
+  const root = fileURLToPath(new URL('../', import.meta.url));
+  const loaded = await validate(root);
+  const paths = ['0001_sponsor_attribution.sql', 'preflight.sql', 'verify.sql'].map(file => `app/migrations/sponsor/${file}`);
+  for (const path of paths) {
+    const source = loaded.manifest.sources.find(row => row.path === path);
+    assert.equal(source?.kind, 'snapshot', `${path} must remain a non-applying source`);
+    assert.equal(loaded.files.get(path)?.sha256, hash(await readFile(join(root, path))));
+    assert.equal(loaded.manifest.migrations.some(row => row.path === path), false);
+  }
+  const generated = applySQL(loaded); // Generate text only; never execute or contact a database.
+  assert.doesNotMatch(generated, /ezil_sponsor_attributions|ezil_sponsor_trial_claims/);
+  const journal = JSON.parse(await readFile(join(root, 'app/drizzle/meta/_journal.json'), 'utf8'));
+  assert.equal(journal.entries.some(entry => entry.tag.includes('sponsor')), false);
 });
 
 test('plan reports historical and current snapshot digests separately', async t => {

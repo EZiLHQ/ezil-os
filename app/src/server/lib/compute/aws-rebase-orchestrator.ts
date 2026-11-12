@@ -14,12 +14,13 @@ import { buildRebasePreparation, validateRebaseSnapshotReceipt } from './aws-reb
 import { parseRebaseJson, RebaseUuid } from './aws-rebase-json';
 import { rebaseReleaseCandidates, resolveRebaseReleases, sourceDeploymentFor } from './aws-rebase-release';
 import { readReleasedPoolHostProof } from './aws-historical-source';
+import { readReleasedDedicatedHostProof } from './aws-dedicated-source';
 import { createImageJobStore, IMAGE_JOB_FAILURE_CODES, isTerminalImageJob, newReservedImageJob, type ImageJob } from './aws-rebase-store';
 import { assertImageExecution, preparationFor, launchFor, verifyImageSnapshot, ImageLaunchReceiptSchema, type RebaseSnapshotDescriber, type Execution } from './aws-rebase-evidence';
 import { isDefiniteAwsRefusal, isExecutionAbsent, toAwsClientError } from './aws-errors';
 import { ImageJobConflictError, type ImagePlacement } from './placement';
 
-/** `sourceRetirementExecutionArn`: plan/prepare only, a lookup hint for a released pool host's release (DESIGN R, a);
+/** `sourceRetirementExecutionArn`: plan/prepare only, a lookup hint for this allocation's release;
  * nothing in it is trusted (aws-historical-source readReleasedPoolHostProof). */
 export const ImageRebaseRequestSchema = z.object({ schemaVersion: z.literal(1), operation: z.enum(['plan', 'prepare', 'launch', 'verify', 'recover']),
     computerId: RebaseUuid.nullable(), jobId: RebaseUuid.nullable(), sourceRetirementExecutionArn: z.string().min(1).max(300).optional() }).strict()
@@ -75,12 +76,20 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
             if (result.child) await handleImageRebase(deps, { schemaVersion: 1, operation: 'prepare', computerId, jobId: result.child.jobId });
             return reply(isTerminalImageJob(j.phase) || j.phase === 'failed' ? 200 : 202, j.failureCode === null);
         }
-        /** DESIGN R: a STOPPED computer's released warm-pool host. Its retired claim row switches the source evidence to the
-         * provision (b) and release (a) proofs; no row, no change. EC2 must no longer list the host: launch, recovery and
-         * maintenance accept an absent source but refuse a listed claim, after the snapshot. Retry once it ages out. */
+        /** A retired warm-pool claim or archived dedicated launch switches source evidence to exact provision + release proofs.
+         * No matching archive means no historical claim. EC2 must no longer list the source; no host is stopped here. */
         const releasedSource = async (d: LifecycleDeployment) => {
             const found = await deps.store.releasedPoolHost(p.computerId);
-            if (!found.row) return null;
+            if (!found.row) {
+                if (p.state !== 'STOPPED' || !input.sourceRetirementExecutionArn) return null;
+                const dedicated = await deps.store.releasedDedicatedHost(p.computerId);
+                if (!isDeepStrictEqual(p, dedicated.placement)) throw new ImageJobConflictError();
+                if (!dedicated.row) return null;
+                const proof = await readReleasedDedicatedHostProof(deps.executions, p, d, dedicated.row, input.sourceRetirementExecutionArn, deps.now());
+                if (!proof || await deps.describer.describeForEnrollment(p.region!, p.instanceId!)) throw new Error('source_identity_mismatch');
+                if (!isDeepStrictEqual(dedicated, await deps.store.releasedDedicatedHost(p.computerId))) throw new ImageJobConflictError();
+                return proof;
+            }
             if (!isDeepStrictEqual(p, found.placement)) throw new ImageJobConflictError();
             const proof = await readReleasedPoolHostProof(deps.executions, p, d, found.row, input.sourceRetirementExecutionArn, deps.now());
             if (!proof || await deps.describer.describeForEnrollment(p.region!, p.instanceId!)) throw new Error('source_identity_mismatch');
@@ -130,8 +139,11 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
                 sourceInstanceId: p.instanceId, sourceVolumeId: p.volumeId, fsUuid: p.fsUuid, sourceGeneration: p.generation,
                 sourceLeaseEpoch: p.leaseEpoch, sourceFenceToken: p.fenceToken, fromDigest: r.source.lowerImageDigest,
                 toDigest: r.target.lowerImageDigest, volumeGiB: volume.sizeGiB, sourceDeployment: sourceDeploymentFor(r.deployment, r.source),
-                deployment: r.deployment, createdAt: deps.now().toISOString(), ...(r.released ? { releasedPoolHost: { poolHostId: r.released.poolHostId,
-                    lifecycleDigest: r.released.lifecycleDigest, releaseExecutionArn: r.released.releaseExecutionArn } } : {}) });
+                deployment: r.deployment, createdAt: deps.now().toISOString(), ...(r.released && 'poolHostId' in r.released
+                    ? { releasedPoolHost: { poolHostId: r.released.poolHostId, lifecycleDigest: r.released.lifecycleDigest,
+                        releaseExecutionArn: r.released.releaseExecutionArn } }
+                    : r.released ? { releasedDedicatedHost: { imageJobId: r.released.imageJobId, provisionDigest: r.released.provisionDigest,
+                        provisionExecutionArn: r.released.provisionExecutionArn, releaseExecutionArn: r.released.releaseExecutionArn } } : {}) });
             j = await deps.store.reserve(newReservedImageJob({ preparation: prep, ownerUserId: p.ownerUserId,
                 sourceRelease: r.source, targetRelease: r.target }), r.repository);
         }

@@ -3,6 +3,8 @@ import 'server-only';
 import { createHmac, hkdfSync, randomBytes, timingSafeEqual } from 'node:crypto';
 import { cookies } from 'next/headers';
 
+import { loginSponsorContext, sponsorFromLink, sponsorFromTransaction } from './sponsor';
+
 import { safeReturnUrl } from '@/utils/constants';
 
 export const AUTH0_ISSUER = 'https://id.ezil.work/';
@@ -46,6 +48,8 @@ interface Transaction {
     expiresAt: number;
     /** `prompt=none`: a failed silent attempt falls back to one interactive sign-in. */
     silent?: true;
+    sponsor?: string;
+    sponsorOrigin?: string;
 }
 
 /** Auth0's answers to `prompt=none` that mean "ask the person", not "refuse the person". */
@@ -55,7 +59,7 @@ export const SILENT_LOGIN_FALLBACK_ERRORS: ReadonlySet<string> = new Set(['login
  * `prompt: 'none'` is the silent re-auth that refreshes the retained ID token (`./retained-identity.ts`) after it
  * expired or a restart emptied the vault. It rides on the id.ezil.work single sign-on session and shows no UI.
  */
-export async function buildAuthorizeUrl({ origin, returnUrl, prompt }: { origin: string; returnUrl?: string | null; prompt?: 'none' }) {
+export async function buildAuthorizeUrl({ origin, returnUrl, prompt, sponsorToken }: { origin: string; returnUrl?: string | null; prompt?: 'none'; sponsorToken?: string }) {
     const { clientId } = config();
     const transaction: Transaction = {
         state: randomBytes(32).toString('base64url'),
@@ -65,6 +69,13 @@ export async function buildAuthorizeUrl({ origin, returnUrl, prompt }: { origin:
         expiresAt: Date.now() + TEN_MINUTES,
         ...(prompt === 'none' ? { silent: true as const } : {}),
     };
+    if (sponsorToken !== undefined) {
+        const campaign = sponsorFromLink(sponsorToken);
+        if (!campaign || prompt === 'none') throw new Auth0Error('invalid_transaction');
+        transaction.sponsorOrigin = new URL(origin).origin;
+        transaction.sponsor = loginSponsorContext(campaign, transaction.sponsorOrigin, transaction.state, transaction.nonce);
+        transaction.returnUrl = '/os?settings=billing';
+    }
     const payload = Buffer.from(JSON.stringify(transaction)).toString('base64url');
     (await cookies()).set(AUTH0_COOKIE, `${payload}.${signature(payload)}`, {
         ...AUTH0_COOKIE_OPTIONS, maxAge: 600, expires: new Date(transaction.expiresAt),
@@ -81,7 +92,7 @@ export async function buildAuthorizeUrl({ origin, returnUrl, prompt }: { origin:
     return url;
 }
 
-export function readTransaction(cookie: string | undefined, state: string | null): Transaction {
+export function readTransaction(cookie: string | undefined, state: string | null, origin?: string): Transaction {
     if (!cookie || cookie.length > 4096) throw new Auth0Error('invalid_transaction');
     const parts = cookie.split('.');
     if (parts.length !== 2 || !/^[\w-]+$/.test(parts[0]) || !constantTimeEqual(signature(parts[0]), parts[1])) {
@@ -96,6 +107,10 @@ export function readTransaction(cookie: string | undefined, state: string | null
         || typeof value.returnUrl !== 'string'
         || (value.silent !== undefined && value.silent !== true)) throw new Auth0Error('invalid_transaction');
     if (!state || !constantTimeEqual(value.state, state)) throw new Auth0Error('state_mismatch');
+    if (value.sponsor !== undefined || value.sponsorOrigin !== undefined) {
+        if (typeof value.sponsor !== 'string' || typeof value.sponsorOrigin !== 'string' || value.sponsorOrigin !== origin
+            || !sponsorFromTransaction(value.sponsor, origin, value.state, value.nonce)) throw new Auth0Error('invalid_transaction');
+    }
     return value;
 }
 

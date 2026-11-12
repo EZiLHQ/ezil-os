@@ -59,8 +59,8 @@ export function createPreparationHelper(settings: Settings, deps: Dependencies) 
             const rows = await deps.instances([i.sourceInstanceId]), source = rows[0]?.instance;
             if (rows.length > 1 || (source && (rows[0]!.owner !== d.accountId || source.InstanceId !== i.sourceInstanceId)))
                 throw new Error('source_identity_mismatch');
-            if (i.releasedPoolHost) {
-                // App DESIGN R: the app proved this host's release and termination, and EC2 has aged it out. Never stop
+            if (i.releasedPoolHost || i.releasedDedicatedHost) {
+                // The app proved this exact pool/dedicated host's historical launch, release and termination. Never stop
                 // or terminate here. A listed host is refused (launch, recovery and maintenance would refuse its claim
                 // tags after the snapshot), and an attachment is a writer, never waited out.
                 if (source) throw new Error('source_identity_mismatch');
