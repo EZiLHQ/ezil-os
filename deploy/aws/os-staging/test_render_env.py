@@ -52,6 +52,16 @@ class RenderEnvTests(unittest.TestCase):
         with self.assertRaises(renderer.RenderError):
             renderer.validate({**self.values, "EZIL_OS_FEEDBACK": ""})
 
+    def test_public_standard_trial_is_optional_and_zero_is_preserved(self):
+        key = "BILLING_PUBLIC_STANDARD_TRIAL"
+        self.assertIn(key, renderer.OPTIONAL)
+        self.assertNotIn(key, renderer.REQUIRED)
+        self.assertEqual(renderer.validate(dict(self.values)), self.values)
+        self.assertEqual(renderer.validate({**self.values, key: "0"}), {**self.values, key: "0"})
+        for unknown in ("BILLING_PUBLIC_STANDARD_TRIALS", "BILLING_PUBLIC_STANDARD_TRIAL_EXTRA"):
+            with self.subTest(key=unknown), self.assertRaises(renderer.RenderError):
+                renderer.validate({**self.values, unknown: "0"})
+
     def sponsor_values(self):
         return {
             "SPONSOR_KEY": "synthetic-context-signing-key-1234567890",
@@ -109,6 +119,7 @@ class RenderEnvTests(unittest.TestCase):
         literal = 'synthetic-$TOKEN-${TOKEN}-#-"-\'-\\-secret-1234567890'
         self.values["CRON_SECRET"] = literal
         self.values.update(self.sponsor_values())
+        self.values["BILLING_PUBLIC_STANDARD_TRIAL"] = "0"
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
             directory = Path(temporary)
             output = io.StringIO()
@@ -122,7 +133,10 @@ class RenderEnvTests(unittest.TestCase):
                     renderer.render(self.values, directory)
             self.assertEqual(output.getvalue().splitlines(), sorted(self.values))
             for value in self.values.values():
-                self.assertNotIn(value, output.getvalue())
+                # The public-trial flag's "0" also occurs in the AUTH0 key names.
+                # Exact sorted-name output above still excludes any value output.
+                if value != "0":
+                    self.assertNotIn(value, output.getvalue())
             for name in ("app.env", "cron.env"):
                 details = (directory / name).stat()
                 self.assertEqual(stat.S_IMODE(details.st_mode), 0o600)
