@@ -214,6 +214,7 @@ async function reproduceLock(viewport, touch, label) {
 }
 
 try {
+    if ( ! baseline ) await checkProviderVisibility();
     for ( const touch of [false, true] ) for ( const viewport of [touch ? { width: 390, height: 844 } : { width: 1440, height: 900 }] ) {
         const label = `${touch ? 'phone-touch' : 'desktop'} ${viewport.width}x${viewport.height}`;
         if ( baseline ) { await reproduceLock(viewport, touch, label); continue; }
@@ -312,3 +313,98 @@ const receipt = { mode, startedAt, finishedAt: new Date().toISOString(), cases: 
 const receiptFile = path.join(output, `receipt-${mode}.json`);
 await fs.writeFile(receiptFile, JSON.stringify(receipt, null, 2) + '\n', { mode: 0o600 });
 console.log(`${baseline ? 'BASELINE REPRODUCTION' : 'PASS'}: ${receipts.length} real-Chromium 3DS portal cases`, outcomes.join(', '), '| receipt', receiptFile);
+
+// Visibility regressions run inside this registered CI/local browser suite.
+// Every HTTP response below is a local mock; no Stripe transport.
+async function checkProviderVisibility () {
+let checks = 0;
+    const visibilityBrowser = await chromium.launch({ headless: true, executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+    try {
+        for ( const [name, initial] of [
+            ['zero width', 'width:0;height:200px;border:0'],
+            ['zero height', 'width:300px;height:0;border:0'],
+            ['scaled to zero', 'width:300px;height:200px;border:0;transform:scale(0)'],
+            ['transparent frame', 'width:300px;height:200px;border:0;opacity:0'],
+            ['transparent ancestor', 'width:300px;height:200px;border:0'],
+        ] ) {
+            const page = await visibilityBrowser.newPage();
+            await page.route('**/*', route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><button>Mock challenge</button>' }));
+            await page.setContent('<!doctype html><body><button id="opener">Billing</button><main></main></body>');
+            await page.addScriptTag({ content: source });
+            await page.evaluate(({ name, initial }) => {
+                const root = document.createElement('div');
+                root.id = 'provider';
+                if ( name === 'transparent ancestor' ) root.style.opacity = '0';
+                root.innerHTML = '<iframe title="Mock challenge" src="https://js.stripe.com/v3/three-ds-2-challenge-0123456789abcdef0123456789abcdef.html" style="' + initial + '"></iframe>';
+                document.body.append(root);
+                document.querySelector('#opener').focus();
+                const frame = __sheet.openSheetFrame({ container: document.querySelector('main'), title: 'Checkout' });
+                frame.content.innerHTML = '<input id="checkout" aria-label="Payment field">';
+                document.querySelector('#checkout').focus();
+                window.fixture = frame;
+                frame.registerProviderPortals({ matchesFrame: __sheet.matcher });
+            }, { name, initial });
+            const ownership = () => page.evaluate(() => ({
+                inert: fixture.dialog.hasAttribute('inert'),
+                modal: fixture.dialog.getAttribute('aria-modal'),
+                focus: document.activeElement.id,
+            }));
+            assert.deepEqual(await ownership(), { inert: false, modal: 'true', focus: 'checkout' }, `${name}: invisible preload must not own focus`);
+            checks++;
+            await page.evaluate(() => {
+                const root = document.querySelector('#provider');
+                root.style.opacity = '1';
+                root.firstElementChild.style.cssText = 'width:300px;height:200px;border:0';
+            });
+            await page.waitForFunction(() => fixture.dialog.hasAttribute('inert') && document.activeElement.tagName === 'IFRAME');
+            checks++;
+            const hide = () => page.evaluate(({ name, initial }) => {
+                const root = document.querySelector('#provider');
+                if ( name === 'transparent ancestor' ) root.style.opacity = '0';
+                else root.firstElementChild.style.cssText = initial;
+            }, { name, initial });
+            await hide();
+            await page.waitForFunction(() => !fixture.dialog.hasAttribute('inert') && document.activeElement.id === 'checkout');
+            checks++;
+            await page.evaluate(() => {
+                const root = document.querySelector('#provider');
+                root.style.opacity = '1';
+                root.firstElementChild.style.cssText = 'width:300px;height:200px;border:0';
+            });
+            await page.waitForFunction(() => fixture.dialog.hasAttribute('inert'));
+            await page.evaluate(() => { fixture.close(); });
+            assert.equal(await page.locator('[role="dialog"]').count(), 1, `${name}: visible provider owns dismissal`);
+            checks++;
+            await hide();
+            await page.waitForFunction(() => !document.querySelector('[role="dialog"]'));
+            assert.equal(await page.evaluate(() => document.activeElement.id), 'opener', `${name}: hidden provider finishes queued close`);
+            checks++;
+            console.log(`PASS ${name}: preload, show, hide, close`);
+            await page.close();
+        }
+        // An opacity fade begins with computed opacity zero. The style observer
+        // alone cannot observe its final visible state, so transition completion must.
+        const page = await visibilityBrowser.newPage();
+        await page.route('**/*', route => route.fulfill({ contentType: 'text/html', body: '<!doctype html><button>Mock challenge</button>' }));
+        await page.setContent('<!doctype html><body><main></main></body>');
+        await page.addScriptTag({ content: source });
+        await page.evaluate(() => {
+            const root = document.createElement('div');
+            root.id = 'provider';
+            root.style.cssText = 'opacity:0;transition:opacity 100ms linear';
+            root.innerHTML = '<iframe src="https://js.stripe.com/v3/three-ds-2-challenge-0123456789abcdef0123456789abcdef.html" style="width:300px;height:200px;border:0"></iframe>';
+            document.body.append(root);
+            window.fixture = __sheet.openSheetFrame({ container: document.querySelector('main'), title: 'Checkout' });
+            fixture.registerProviderPortals({ matchesFrame: __sheet.matcher });
+            void root.offsetWidth;
+            root.style.opacity = '1';
+        });
+        await page.waitForFunction(() => fixture.dialog.hasAttribute('inert') && document.activeElement.tagName === 'IFRAME');
+        checks++;
+        await page.close();
+        console.log('PASS opacity transition activates visible provider without another style mutation');
+        assert.equal(checks, 26, 'all visibility assertions executed from the registered suite');
+        await record('invisible-provider-ownership', `${checks}_VISIBILITY_ASSERTIONS_PASSED`);
+        console.log(`${checks} real browser visibility assertions passed (registered provider-3ds suite)`);
+    } finally { await visibilityBrowser.close(); }
+}
