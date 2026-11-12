@@ -5,6 +5,7 @@ The generated install and probe payloads really execute here, with subprocess
 replaced by an in-memory host. Passing proves the operator's local decisions,
 not a real IAM, SSM-document or host fence.
 """
+import ast
 import copy
 import hashlib
 import io
@@ -100,6 +101,7 @@ class Host:
     def __init__(self, app, deployment):
         self.git_sha, self.image_id, self.compose_tag, self.deployment = app.sha, app.image, app.tag, deployment
         self.tags = {app.tag: app.image}
+        self.image_store = 'classic'
         self.timers = {job: {'enabled': 'enabled', 'active': 'active', 'service': 'inactive'} for job in JOBS}
         self.lock_free = True
         # Caddy -> web /api/health: serving, the SHA it reports when not the running app's, or a whole replacement body.
@@ -128,6 +130,11 @@ def execute(payload, host, install):
             return real_run(['node', '-e', namespace['NODE']], capture_output=True, text=True, timeout=10,
                             env={'PATH': os.environ['PATH'], 'EZIL_GIT_SHA': host.git_sha, 'EZIL_AWS_KILL_SWITCH': '1',
                                  'EZIL_AWS_LIFECYCLE_DEPLOYMENTS': json.dumps({TOOL.REGION: host.deployment})})
+        if command[:2] == ['docker', 'info']:
+            return done(0, json.dumps(getattr(host, 'store_info', None) or {
+                'driver': 'overlayfs' if host.image_store == 'containerd' else 'overlay2',
+                'status': [['driver-type', 'io.containerd.snapshotter.v1']] if host.image_store == 'containerd' else []}))
+
         if command[:3] == ['docker', 'container', 'inspect']:
             return done(0, host.image_id + '\n')
         if command[:3] == ['docker', 'image', 'inspect']:
@@ -150,7 +157,13 @@ def execute(payload, host, install):
     with patch('subprocess.run', side_effect=run), patch('sys.stdout', new_callable=io.StringIO) as output, \
             patch('sys.stderr', new_callable=io.StringIO):
         try:
+            store_programs = re.findall(r"<<'EZIL_APP_STORE_PY'\n(.*?)\nEZIL_APP_STORE_PY", payload, re.S)
+            if store_programs:
+                exec(compile(store_programs[0], 'store-before', 'exec'), {})
             exec(compile(script, 'generated-payload', 'exec'), namespace)
+            if store_programs:
+                exec(compile(store_programs[1], 'store-after', 'exec'), {})
+
         except SystemExit:
             return {'Status': 'Failed', 'ResponseCode': 1, 'StandardOutputContent': ''}
     return {'Status': 'Success', 'ResponseCode': 0, 'StandardOutputContent': output.getvalue()}
@@ -304,6 +317,27 @@ class AppSwapTests(unittest.TestCase):
                           'from': {'tag': source.tag, 'gitSha': source.sha, 'imageId': source.image},
                           'to': {'tag': target.tag, 'gitSha': target.sha, 'imageId': target.image, 'checksumSha256': target.checksum},
                           'undoes': undoes, 'installerSha256': self.installer_sha, **extra})
+        if check:
+            ops.archive_check(path, target.archive, target.marker, target.runtime, self.repo, True)
+        return path
+
+    def v2_plan(self, name, source=None, target=None, store='containerd', check=True, **kwargs):
+        source, target = source or self.old, target or self.new
+        if not hasattr(self, 'v2_store'):
+            self.v2_store = store
+            for app in (self.old, self.new):
+                app.config_image = app.image
+                app.image = app.manifest_digest if store == 'containerd' else app.config_image
+            self.host.image_store = store
+            self.host.image_id = self.old.image
+            self.host.tags[self.old.tag] = self.old.image
+        path = self.plan(name, source, target, check=False, **kwargs)
+        value = manifest.read(path)
+        value.update(schemaVersion=2, imageStore=store)
+        value['from'].update(configId=source.config_image, checksumSha256=source.checksum,
+            archivePath=str(source.archive), checksumPath=str(source.marker), runtimePath=str(source.runtime))
+        value['to']['configId'] = target.config_image
+        TOOL.write(path, value)
         if check:
             ops.archive_check(path, target.archive, target.marker, target.runtime, self.repo, True)
         return path
@@ -864,6 +898,178 @@ class AppSwapTests(unittest.TestCase):
         self.assertEqual(len(self.installs()), 2)
         with self.assertRaisesRegex(ValueError, 'stale plan'):
             ops.swap(restore, self.repo, True, self.ledger)
+
+    # ---- explicit store/config identity, with real generated probes and ledger transport ----
+    def test_v2_containerd_swap_and_exact_restore(self):
+        path = self.v2_plan('containerd')
+        receipt = manifest.read(ops.receipt_path(path))
+        self.assertEqual(receipt['identity']['runtimeImageId'], self.new.manifest_digest)
+        self.assertEqual(receipt['identity']['configId'], self.new.config_image)
+        self.assertEqual(receipt['fromArtifact']['identity']['configId'], self.old.config_image)
+        ops.swap(path, self.repo, True, self.ledger)
+        self.assertEqual(self.entries()[-1]['appImageId'], self.new.manifest_digest)
+        restore = self.v2_plan('restore-containerd', self.new, self.old, generation=3,
+                               operation='app-restore', undoes=release.digest(path))
+        ops.swap(restore, self.repo, True, self.ledger)
+        self.assertEqual((self.entries()[-1]['appImageId'], self.host.image_id), (self.old.manifest_digest, self.old.manifest_digest))
+        self.assertEqual(len(self.installs()), 2)
+
+    def test_v2_classic_still_uses_only_config_identity(self):
+        path = self.v2_plan('classic', store='classic')
+        receipt = manifest.read(ops.receipt_path(path))
+        self.assertEqual(receipt['identity']['runtimeImageId'], self.new.config_image)
+        ops.swap(path, self.repo, True, self.ledger)
+        self.assertEqual(self.entries()[-1]['appImageId'], self.new.config_image)
+
+    def test_v2_mixed_store_plan_and_live_store_mismatch_refuse_before_pending(self):
+        path = self.v2_plan('mixed')
+        value = manifest.read(path)
+        value['to']['imageId'] = value['to']['configId']
+        TOOL.write(path, value)
+        self.assert_refused_before_pending('mixed app image store', path)
+        value['to']['imageId'] = self.new.manifest_digest
+        TOOL.write(path, value)
+        self.host.image_store = 'classic'
+        self.assert_refused_before_pending('live app differs', path)
+
+    def test_v1_config_identity_cannot_run_on_containerd(self):
+        path = self.plan('v1', self.old, self.new)
+        self.host.image_store = 'containerd'
+        self.assert_refused_before_pending('live app differs', path)
+
+    def test_v2_before_artifacts_reinspected_before_any_aws_call(self):
+        path = self.v2_plan('before-proof')
+        self.old.runtime.write_bytes(b'changed')
+        self.assert_refused_before_pending('archive receipt does not match', path)
+        self.assertEqual(self.calls, [])
+
+    def test_v2_reconcile_requires_source_archive_proofs_and_same_store(self):
+        path = self.v2_plan('reconcile-containerd')
+        self.install_mode = 'failure'
+        with self.assertRaises(ValueError):
+            ops.swap(path, self.repo, True, self.ledger)
+        with self.assertRaisesRegex(ValueError, 'requires --source-repo'):
+            ops.reconcile(path, True, self.ledger)
+        self.host.image_store = 'classic'
+        with self.assertRaisesRegex(ValueError, 'manual reconciliation'):
+            ops.reconcile(path, True, self.ledger, self.repo)
+        self.assertEqual(self.entries()[-1]['state'], 'pending')
+        self.host.image_store = 'containerd'
+        ops.reconcile(path, True, self.ledger, self.repo)
+        self.assertEqual(self.entries()[-1]['state'], 'aborted')
+        self.assertEqual(len(self.installs()), 1)
+
+    def test_v2_archive_identity_rejects_forged_sizes_platform_and_runtime_kind(self):
+        path = self.v2_plan('chain')
+        _, members, _ = ops.scan_archive(self.new.archive)
+        side = manifest.read(path)['to']
+        self.assertEqual(ops.archive_identity(members, side, 'containerd')['configId'], self.new.config_image)
+        for field, value in [('size', 0), ('platform', {'os': 'linux', 'architecture': 'arm64'}),
+                             ('annotations', {'org.opencontainers.image.ref.name': 'unexpected'})]:
+            bad = dict(members); index = json.loads(bad['index.json'])
+            index['manifests'][0][field] = value; bad['index.json'] = json.dumps(index).encode()
+            with self.subTest(field), self.assertRaises(ValueError):
+                ops.archive_identity(bad, side, 'containerd')
+        for store, image in [('classic', side['imageId']), ('containerd', side['configId'])]:
+            with self.subTest(store), self.assertRaises(ValueError):
+                ops.archive_identity(members, dict(side, imageId=image), store)
+        bad = dict(members); bad['blobs/sha256/' + self.new.config_image[7:]] += b'changed'
+        with self.assertRaisesRegex(ValueError, 'config hash/size'):
+            ops.archive_identity(bad, side, 'containerd')
+
+    def test_v2_nested_index_attestation_chain_is_bound_and_unambiguous(self):
+        path = self.v2_plan('nested')
+        _, original, _ = ops.scan_archive(self.new.archive)
+        side = manifest.read(path)['to']
+        image = json.loads(original['index.json'])['manifests'][0]
+        image['platform'] = {'os': 'linux', 'architecture': 'amd64'}
+
+        def graph(variant=None):
+            members = dict(original)
+            def blob(doc):
+                data = json.dumps(doc).encode(); digest = 'sha256:' + sha256(data)
+                members['blobs/sha256/' + digest[7:]] = data
+                return {'digest': digest, 'size': len(data)}
+            cfg = dict(blob({'architecture': 'amd64' if variant == 'attestation executable config' else 'unknown',
+                             'os': 'linux' if variant == 'attestation executable config' else 'unknown'}),
+                       mediaType='application/vnd.oci.image.config.v1+json')
+            layer = dict(blob({'predicateType': 'fixture'}), mediaType='application/vnd.in-toto+json')
+            att = dict(blob({'schemaVersion': 2, 'mediaType': OCI_MANIFEST, 'config': cfg, 'layers': [layer]}),
+                       mediaType=OCI_MANIFEST, platform={'os': 'unknown', 'architecture': 'unknown'},
+                       annotations={'vnd.docker.reference.type': 'attestation-manifest',
+                                    'vnd.docker.reference.digest': image['digest']})
+            children = [copy.deepcopy(image), att]
+            if variant == 'two images': children.append(copy.deepcopy(image))
+            if variant == 'wrong subject': att['annotations']['vnd.docker.reference.digest'] = 'sha256:' + '1' * 64
+            if variant == 'attestation executable platform': att['platform'] = {'os': 'linux', 'architecture': 'amd64'}
+            if variant == 'attestation tagged': att['annotations']['org.opencontainers.image.ref.name'] = 'new-app'
+            if variant == 'attestation bad hash': members['blobs/sha256/' + att['digest'][7:]] += b'changed'
+            if variant == 'attestation content bad hash': members['blobs/sha256/' + layer['digest'][7:]] += b'changed'
+            root = dict(blob({'schemaVersion': 2, 'mediaType': OCI_INDEX, 'manifests': children}),
+                        mediaType=OCI_INDEX, annotations={'io.containerd.image.name': 'docker.io/library/ezil-os-staging:new-app',
+                                                         'org.opencontainers.image.ref.name': 'new-app'})
+            members['index.json'] = json.dumps({'schemaVersion': 2, 'manifests': [root]}).encode()
+            return members, dict(side, imageId=root['digest'])
+        members, expected = graph()
+        ops.archive_tags(members, {k: tarfile.REGTYPE for k in members}, 'new-app', side['configId'], self.candidate_sha)
+        result = ops.archive_identity(members, expected, 'containerd')
+        self.assertEqual(result['manifestDigest'], image['digest'])
+        self.assertNotEqual(result['runtimeImageId'], result['manifestDigest'])
+        for variant in ('two images', 'wrong subject', 'attestation executable platform', 'attestation executable config', 'attestation tagged',
+                        'attestation bad hash', 'attestation content bad hash'):
+            members, expected = graph(variant)
+            with self.subTest(variant), self.assertRaises(ValueError):
+                ops.archive_identity(members, expected, 'containerd')
+
+    def test_probe_unknown_or_ambiguous_store_refuses_before_pending(self):
+        path = self.v2_plan('unknown-store')
+        before = self.ledger.read_bytes()
+        for info in ({'driver': 'overlayfs', 'status': []},
+                     {'driver': 'overlayfs', 'status': [['driver-type', 'io.containerd.snapshotter.v1']] * 2},
+                     {'driver': 'overlay2', 'status': [['driver-type', 'unknown']]},
+                     {'driver': 'overlay2', 'status': ['malformed']}):
+            self.host.store_info = info
+            with self.subTest(info), self.assertRaises(ValueError):
+                ops.swap(path, self.repo, True, self.ledger)
+            self.assertEqual(self.ledger.read_bytes(), before)
+            self.assertEqual(self.installs(), [])
+
+    def test_install_command_checks_store_before_and_after_unchanged_installer(self):
+        path = self.v2_plan('install-store')
+        app = {'tag': self.new.tag, 'gitSha': self.new.sha, 'checksumSha256': self.new.checksum}
+        payload = ops.install_body((release.REPO / ops.INSTALLER).read_text(), app, self.host.deployment, 'containerd')
+        installed = []
+        self.host.image_store = 'classic'
+        result = execute(payload, self.host, lambda ignored: installed.append(True) or True)
+        self.assertEqual((result['Status'], installed), ('Failed', []))
+        self.host.image_store = 'containerd'
+        def change_store(ignored):
+            installed.append(True)
+            self.host.git_sha = self.new.sha
+            self.host.image_store = 'classic'
+            return True
+        result = execute(payload, self.host, change_store)
+        self.assertEqual((result['Status'], installed), ('Failed', [True]))
+
+    def test_generated_install_command_timeout_budget_fits_unchanged_ssm_limit(self):
+        app = {'tag': self.new.tag, 'gitSha': self.new.sha, 'checksumSha256': self.new.checksum}
+        payload = ops.install_body((release.REPO / ops.INSTALLER).read_text(), app, self.host.deployment, 'containerd')
+        stores = re.findall(r"<<'EZIL_APP_STORE_PY'\n(.*?)\nEZIL_APP_STORE_PY", payload, re.S)
+        main = payload.split("<<'EZIL_APP_PY'\n", 1)[1].rsplit('\nEZIL_APP_PY', 1)[0]
+        budgets = []
+        for source in [stores[0], main, stores[1]]:
+            tree = ast.parse(source)
+            constants = {n.targets[0].id: ast.literal_eval(n.value) for n in tree.body
+                         if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name) and isinstance(n.value, ast.Constant)}
+            times = []
+            for call in ast.walk(tree):
+                if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == 'run':
+                    for k in call.keywords:
+                        if k.arg == 'timeout':
+                            times.append(constants[k.value.id] if isinstance(k.value, ast.Name) else ast.literal_eval(k.value))
+            budgets.append(times)
+        self.assertEqual([sorted(row) for row in budgets], [[10], [60, 750], [10]])
+        self.assertLessEqual(sum(sum(row) for row in budgets), 900 - 60)
 
     # ---- ledger schema ---------------------------------------------------------------------
     def test_ledger_schema_binds_app_operations(self):
