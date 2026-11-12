@@ -88,6 +88,20 @@ test('owned lifecycle construct wires preparation, exact observer version, histo
     assert.ok(policies.some(s => list(s.Action).includes('states:StartExecution') && list(s.Resource).includes('arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-rebase-preparation')));
     assert.ok(policies.some(s => list(s.Action).includes('ec2:DescribeSnapshots') && s.Condition.StringEquals['aws:RequestedRegion'] === 'ap-south-1'));
     assert.ok(policies.some(s => list(s.Action).includes('states:StartExecution') && list(s.Resource).includes('arn:aws:states:ap-south-1:123456789012:stateMachine:ezil-pilot-recovery')));
+    // cancel-preparation reads a failed preparation's complete history as the app caller: exactly the selected
+    // namespace's preparation executions, never recovery, never another namespace, and read-only.
+    const histories = policies.filter(s => list(s.Action).includes('states:GetExecutionHistory'));
+    assert.ok(histories.every(s => s.Effect === 'Allow' && list(s.Action).length === 1 && !s.Condition));
+    assert.deepEqual(histories.flatMap(s => list(s.Resource)).sort(), [
+        'arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*',
+        'arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-rebase-preparation:computer-*']);
+    const describes = policies.filter(s => list(s.Action).includes('states:DescribeExecution')).flatMap(s => list(s.Resource)).sort();
+    assert.deepEqual(describes, [
+        'arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-lifecycle:computer-*',
+        'arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-rebase-preparation:computer-*',
+        'arn:aws:states:ap-south-1:123456789012:execution:ezil-pilot-recovery:computer-*']);
+    const actions = new Set(policies.flatMap(s => list(s.Action)));
+    assert.deepEqual([...actions].filter(a => !/^(states:(StartExecution|DescribeExecution|GetExecutionHistory)|kms:Decrypt|ec2:Describe(Instances|Volumes|AvailabilityZones|Snapshots))$/.test(a)), []);
     const decrypts = policies.filter(s => list(s.Action).includes('kms:Decrypt'));
     assert.ok(decrypts.some(s => JSON.stringify(s.Resource).includes('RecoveryHistoryKey') && JSON.stringify(s.Condition).includes('ezil-pilot-recovery')));
     assert.ok(!decrypts.some(s => JSON.stringify(s.Resource).includes('RecoveryHistoryKey') && JSON.stringify(s.Condition).includes('rebase-preparation')));

@@ -43,7 +43,7 @@ export class ComputerLifecycle extends Construct {
             if (props.recoveryVersionArn && props.recoveryVersionArn !== d.recoveryStateMachineVersionArn) throw new Error('recovery_version_mismatch');
             this.preparation = new RebasePreparation(this, 'Preparation', { settings: s, historyKey: key,
                 authorityKeyArn: props.authorityKeyArn, lambdaReservedConcurrency: props.lambdaReservedConcurrency });
-            registerImageWorkflow(this, d.stateMachineVersionArn, d.preparationStateMachineVersionArn, key.keyArn, props.authorityKeyArn);
+            registerImageWorkflow(this, d.stateMachineVersionArn, d.preparationStateMachineVersionArn, key.keyArn, props.authorityKeyArn, true);
         }
         key.addToResourcePolicy(new iam.PolicyStatement({principals:[new iam.ServicePrincipal(`logs.${r}.amazonaws.com`)],
             actions:['kms:Encrypt*','kms:Decrypt*','kms:ReEncrypt*','kms:GenerateDataKey*','kms:Describe*'],resources:['*'],
