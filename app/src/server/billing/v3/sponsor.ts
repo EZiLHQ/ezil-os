@@ -96,6 +96,17 @@ export function resolveByToken(registry: SponsorRegistry, token: string): Sponso
     for (const campaign of registry.values()) if (safeEqual(Buffer.from(campaign.tokenSha256, 'hex'), presented)) found = campaign;
     return found;
 }
+/** A public partner alias must identify exactly one registry entry, including retained disabled/expired entries. Never guess between campaigns. */
+export function resolveByPartnerId(registry: SponsorRegistry, partnerId: string): SponsorCampaign | null {
+    if (!/^[a-z0-9][a-z0-9_-]{2,63}$/.test(partnerId)) return null;
+    let found: SponsorCampaign | null = null;
+    for (const campaign of registry.values()) {
+        if (campaign.partnerId !== partnerId) continue;
+        if (found !== null) return null;
+        found = campaign;
+    }
+    return found;
+}
 export const resolveById = (registry: SponsorRegistry, campaignId: string): SponsorCampaign | null => registry.get(campaignId) ?? null;
 
 /** UUID-shaped pseudonym of a user id under the sponsor key. Same user, same key: same value; deleting the account does not change it. */

@@ -1,7 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { renderToStaticMarkup } from 'react-dom/server';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ user: null as { id: string } | null, enabled: false }));
@@ -47,4 +46,21 @@ describe('root entry routing: / is the OS or its login, never a marketing page',
         expect(source).toMatch(/<a href=\{Routes\.HOME\}/);
         expect(source).not.toMatch(softLink);
     });
+});
+
+describe('root coupon entry precedes the ordinary OS/login redirect', () => {
+    it.each([null, { id: 'signed-in' }])('preserves the registered-slug entry for any auth state', async user => {
+        state.user = user;
+        await expect(HomePage({ searchParams: Promise.resolve({ coupon: 'staging-qa', returnUrl: 'https://evil.example' }) })).rejects.toThrow('redirect:/sponsor/coupon?coupon=staging-qa');
+        expect(redirect).toHaveBeenCalledExactlyOnceWith('/sponsor/coupon?coupon=staging-qa');
+    });
+    it.each([{ coupon: ['staging-qa', 'staging-qa'] }, { coupon: '' }, { coupon: '../evil' }, { coupon: 'x'.repeat(65) }, { coupon: 'https://evil.example' }])('invalid or repeated coupon %j stays unavailable with no reflected input', async ({ coupon }) => {
+        await expect(HomePage({ searchParams: Promise.resolve({ coupon }) })).rejects.toThrow('redirect:/sponsor/coupon');
+        expect(redirect).toHaveBeenCalledExactlyOnceWith('/sponsor/coupon');
+    });
+});
+
+it.each(['', 't'.repeat(43)])('root refuses mixed coupon and opaque token %j', async token => {
+    await expect(HomePage({ searchParams: Promise.resolve({ coupon: 'staging-qa', token }) })).rejects.toThrow('redirect:/sponsor/coupon');
+    expect(redirect).toHaveBeenCalledExactlyOnceWith('/sponsor/coupon');
 });

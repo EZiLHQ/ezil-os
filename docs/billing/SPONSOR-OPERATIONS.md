@@ -100,3 +100,16 @@ bun --no-env-file scripts/sponsor-operator.ts help
 Operator tests use synthetic fixture IDs, local temporary private bundles, actual signing/token/hash helpers and an injected reporting connection. They cover permissions, append preservation, collisions, config versioning, safe output, target pins, read-only mode, schema/RLS refusal and independent count/query semantics. These checks do not exercise a live database or Stripe.
 
 The gated `sponsor-operator.pg.test.ts` additionally creates a fresh owned `sponsor_operator_*` database only on an explicitly supplied disposable fixture at loopback port 55443. It executes the actual report SQL against synthetic 0021/sponsor tables: independent lifetime and event-window counts, exact partner totals, historical/canceled claims, target refusal and no report mutations. The integrated source passed all four cases. The test drops only its own database; fixture setup never targets the app database or the held real schema rollout.
+
+
+### Friendly partner links
+
+A registered partner can share `https://os-staging.ezil.work/?coupon=staging-qa` (replace `staging-qa` with its exact registered lowercase `partnerId`). This is a public alias for an existing campaign in the signed registry, not a Stripe coupon or a new campaign. No runtime setting, key rotation or schema change is needed for this URL format. The root preserves the selection before its ordinary OS/login redirect.
+
+The alias must identify exactly one registry entry, including retained inactive entries; multiple campaigns for the same partner make the alias unavailable rather than guessing. Unknown, disabled, expired, future or ambiguous campaigns fail closed. Existing opaque `/sponsor/<token>` links continue to work. The server never recovers a token from its hash, trusts a client campaign ID, or accepts mixed token/coupon selections.
+
+Both forms show the same one-month Standard offer, card requirement and $20/month renewal unless cancelled. The visitor must click Continue, complete the existing verified Auth0 flow, and review normal checkout eligibility/consent. Visiting a URL grants nothing, does not bypass the one-trial rule, and does not create attribution from an unverified email. The existing signed transaction binds the selected campaign/config to origin, state and nonce; revoked or changed campaign configuration invalidates the handoff.
+
+The invitation document uses `Referrer-Policy: strict-origin`: native same-origin forms retain a real Origin while neither first-party navigation nor external navigation receives the private invitation path. The Continue handler still rejects missing, null and foreign Origin, requires the validated owned public origin behind proxies, bounds actual form bytes and rejects duplicate/mixed fields. Its outgoing Auth0 redirect retains `no-referrer`.
+
+The document CSP permits form handoff only to itself and the fixed EZiL Auth0 issuer origin. Chrome enforces this through the same-origin Continue response’s provider redirect; allowing only self would block that normal redirect. No client-supplied destination or arbitrary external form origin is allowed.
