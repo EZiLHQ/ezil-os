@@ -81,10 +81,23 @@ describe('deliverStarterCredits (the sign-in attempt on the enrollment\'s owned 
         expect(store.claim.mock.calls[0]![1]).toEqual({ userId: USER, eventKey: `ezil-os:v1:free-once:${USER}:grant`, kind: 'ai_grant' });
         expect(fetcher).toHaveBeenCalledTimes(1);
         expect(JSON.parse(fetcher.mock.calls[0]![1]!.body as string)).toEqual({ eventId: `ezil-os:v1:free-once:${USER}:grant`,
-            entitlementId: `ezil-os:v1:free-once:${USER}`, action: 'grant', credits: 100, expiresAt: expect.any(String), accountPublicId: 'works-public-id' });
+            entitlementId: `ezil-os:v1:free-once:${USER}`, action: 'grant', credits: 10, expiresAt: expect.any(String), accountPublicId: 'works-public-id' });
         expect(store.pinAccount).toHaveBeenCalledTimes(1);
         expect(store.finish).toHaveBeenCalledWith(expect.anything(), { status: 'done', reason: null }, expect.any(Number));
         expect(store.enrollFor).not.toHaveBeenCalled();
+    });
+
+    it('delivers an old pending100 receipt unchanged under its original event identity after the new10 policy', async () => {
+        const historical = freeRow();
+        historical.payload = { ...historical.payload, credits: 100, expiresAt: '2027-10-01T00:00:00.000Z' };
+        const store = fakeStore([historical]); stores.create.mockReturnValue(store);
+        const fetcher = ok();
+        expect(freeRow().payload.credits).toBe(10);
+        expect(await deliverStarterCredits({ client: CLIENT, userId: USER, deadlineAt: NOW + 5_000, config: CONFIG, fetch: fetcher })).toBe('delivered');
+        const sent = JSON.parse(fetcher.mock.calls[0]![1]!.body as string);
+        expect(sent).toMatchObject({ eventId: `ezil-os:v1:free-once:${USER}:grant`, entitlementId: `ezil-os:v1:free-once:${USER}`,
+            credits: 100, expiresAt: '2027-10-01T00:00:00.000Z' });
+        expect(store.claim.mock.calls[0]![1]!.eventKey).toBe(historical.eventKey);
     });
 
     it('never enrolls from inside the attempt, even with no account yet: the row retries for the sweep', async () => {

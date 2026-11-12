@@ -293,7 +293,7 @@ describe('installed postgres.js serialization of the sign-in Free receipt', () =
         expect(stored).toEqual({
             protocol: 'ezil-ai-credits-v1', policyVersion: 1, invoiceId: null,
             entitlementId: `ezil-os:v1:free-once:${userId}`, eventId: `ezil-os:v1:free-once:${userId}:grant`,
-            action: 'grant', credits: 100, expiresAt: expect.stringMatching(/^2027-11-05T12:00:00\.\d{3}Z$/),
+            action: 'grant', credits: 10, expiresAt: expect.stringMatching(/^2027-11-05T12:00:00\.\d{3}Z$/),
         });
         // The kick before it keeps its typed text parameters.
         const kick = bound.find(bind => bind.statement.startsWith('update public.ezil_billing_outbox'))!;
