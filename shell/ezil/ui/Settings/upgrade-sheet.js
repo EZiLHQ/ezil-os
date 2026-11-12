@@ -1,7 +1,7 @@
 // upgrade-sheet.js — EZiL-authored. Payment stays inside the desktop;
 // the server confirms payment, and only its summary confirms a purchased plan.
 import { openSheetFrame } from './sheet-frame.js';
-import { dollars, stdHoursLabel, sizeLabel, planName, errorCopy, planBullets, accountCredits, TRIAL_SKU, trialDayLabel, trialMomentLabel, paidAccess } from './billing-format.js';
+import { dollars, stdHoursLabel, sizeLabel, planName, errorCopy, planBullets, accountCredits, TRIAL_SKU, trialDayLabel, paidAccess } from './billing-format.js';
 
 let stripePromise = null;
 
@@ -15,6 +15,8 @@ export function parseBillingDeepLink (search) {
         : upgrade === 'compute' ? 'compute_monthly_v2' : upgrade === 'pro';
     params.delete('settings');
     params.delete('upgrade');
+    // Display-only entry outcome; Billing reads it before normal boot adopts the clean address.
+    params.delete('coupon_entry');
     if ( params.get('section') === 'ai-credits' ) {
         params.delete('section');
         // The recovery hint travels with the section (Billing reads both before the address bar is cleaned).
@@ -135,7 +137,7 @@ export function isStripeModalFrame (iframe) {
 
 /**
  * `trial: true` (Standard only) is the free month: the sheet first asks `billing.quoteTrial` for the exact end, shows
- * it in the viewer's zone with what is charged and when, and only on Continue opens `billing.createCheckout({ sku,
+ * it beside the payment form, and immediately opens `billing.createCheckout({ sku,
  * trial: { trialEndsAt } })` with that same end. Payment then runs exactly as the Standard checkout does ($0 today).
  */
 export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, onDone, onClose, onCancel, userId = null, loadStripe = defaultLoadStripe, now = Date.now, trial = false, timeZone }) {
@@ -168,7 +170,6 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         : v3 ? 'Usage included' : `${stdHoursLabel(offer.allowanceStdSeconds)} standard-hours each billing period`;
     const title = pack ? 'Add AI credits' : trialMode ? 'Start your free month' : `Subscribe to ${name}`;
     const trialAmount = () => dollars(quote?.amountCents ?? offer.priceCents);
-    const trialMoment = (full = false) => quote ? trialMomentLabel(quote.trialEndsAt, { timeZone, full }) : null;
     const paymentUpdate = pack ? 'Your AI credits update after payment is confirmed.' : 'Your plan updates after payment is confirmed.';
     const frame = openSheetFrame({
         container, title, role: 'upgrade-sheet', onClose,
@@ -314,40 +315,10 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         set('trial-then', quote ? `Then ${amount}/month from ${trialDayLabel(quote.trialEndsAt, { timeZone })} · USD · before applicable tax`
             : `Then ${amount}/month · USD · before applicable tax`);
         // A date, never a minute: Stripe collects the first charge about an hour after the end shown beside the form.
-        set('trial-first-charge', quote ? `${amount} from ${trialDayLabel(quote.trialEndsAt, { timeZone })}, then every month until you cancel.` : 'Shown before you continue.');
+        set('trial-first-charge', quote ? `${amount} from ${trialDayLabel(quote.trialEndsAt, { timeZone })}, then every month until you cancel.` : 'Shown in your checkout.');
         set('trial-cancel-by', quote ? `Cancel before ${trialDayLabel(quote.trialEndsAt, { timeZone })} in Settings → Billing and you pay nothing.`
             : 'Cancel before your free month ends and you pay nothing.');
         set('trial-renews', `A payment method is required. ${amount} is charged monthly from the end of your free month unless you cancel.`);
-    }
-    /** The confirmation step: the exact quoted end in the viewer's zone, what is charged from then, and Continue. */
-    function showTrialConfirm (changed = false) {
-        const hadFocus = state.contains(doc.activeElement);
-        state.replaceChildren();
-        const box = doc.createElement('div');
-        box.dataset.role = 'trial-confirm';
-        const line = (text, role) => {
-            const p = doc.createElement('p');
-            if ( text ) p.textContent = text;
-            p.dataset.role = role;
-            box.append(p);
-            return p;
-        };
-        if ( changed ) line(errorCopy('trial_quote_stale'), 'trial-changed');
-        const ends = line('', 'trial-ends');
-        const time = doc.createElement('time');
-        time.dateTime = quote.trialEndsAt;
-        time.textContent = trialMoment(true);
-        ends.append('Your free month ends on ', time, '.');
-        line(`A payment method is required. ${trialAmount()} is charged monthly from that date unless you cancel.`, 'trial-charge');
-        line('Cancel any time before then in Settings → Billing and you pay nothing.', 'trial-cancel');
-        const button = doc.createElement('button');
-        button.type = 'button';
-        button.textContent = 'Continue';
-        button.dataset.action = 'trial-continue';
-        button.addEventListener('click', () => { if ( ! closed && ! busy ) void create(); });
-        box.append(button);
-        state.append(box);
-        if ( hadFocus || changed ) button.focus();
     }
     /** `billing.quoteTrial`: claim this person's trial and fix the end shown above. `changed`: the last one went stale. */
     async function requote (changed = false) {
@@ -364,7 +335,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         if ( next ) {
             quote = next;
             renderTrialTerms();
-            showTrialConfirm(changed);
+            await create(changed);
             return;
         }
         // Not this person's to start (or already starting): back to Billing, which re-reads the offer.
@@ -544,9 +515,9 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
             show("Couldn't load the secure payment form — Try again", 'Try again', () => { void embed(); });
         } finally { busy = false; }
     }
-    async function create () {
+    async function create (requoted = false) {
         if ( closed || busy ) return;
-        // Standard trial: no checkout before the person has seen the exact end; Continue comes back here.
+        // Claim one exact quote and echo it to Checkout; the activating CTA already disclosed the trial terms.
         if ( trialMode && ! quote ) { await requote(); return; }
         busy = true;
         show('Preparing your checkout…');
@@ -569,14 +540,20 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
             }
         } catch (error) {
             session = null;
-            // Standard trial: a stale quote is re-quoted and its NEW end shown before anything else; a refused or
+            // Refresh one stale quote automatically; another refusal offers Retry rather than looping. A refused or
             // already-starting trial goes back to Billing, never to a paid checkout.
             if ( trialMode && error?.code === 'trial_quote_stale' ) stale = true;
             else if ( closed ) { /* Nothing to show. */ }
             else if ( trialMode && TRIAL_ERRORS.has(error?.code) ) show(error.message, 'Back to Billing', returnToBilling, 'return-to-billing');
             else show(error?.message || 'Could not open billing. Try again.', 'Retry', () => { void create(); });
         } finally { busy = false; }
-        if ( stale && ! closed ) { quote = null; renderTrialTerms(); void requote(true); return; }
+        if ( stale && ! closed ) {
+            quote = null;
+            renderTrialTerms();
+            if ( requoted ) show(errorCopy('trial_quote_stale'), 'Retry', () => { void create(); });
+            else void requote(true);
+            return;
+        }
         if ( ! closed && session?.mode === 'embedded' ) void embed();
     }
     renderTrialTerms();

@@ -3,7 +3,7 @@ import { v3CopyForAudit, honestyBans } from './billing-copy-test-helpers.mjs';
 // standard-trial-01b28d18-20261105-v1) on the shell's surfaces, from the real modules bundled from source:
 //   - the Billing tab in the server's states (an eligible offer, trialing, ending, payment pending, payment failed)
 //     and ineligible; the first charge is a date, and the renewal preview an hour later is never a second charge;
-//   - the checkout sheet's trial mode: quote → the exact end in the viewer's zone → Continue echoes that end;
+//   - the checkout sheet's trial mode: one activation → quote → Checkout echoes the exact end;
 //     month-end and leap-day quotes; a stale quote re-quoted; refusals never fall through to a paid checkout;
 //   - the trial variants of the cancel sheet, the plan picker, the session-end sheet and the top-up recovery choice;
 //   - Usage: no new meter, the authoritative balance with plan-labelled credits.
@@ -128,7 +128,7 @@ test('offer: Free with an eligible offer says "Start your free month", $0 today,
     assert.equal(primaries[0].dataset.action, 'trial');
     const card = el.querySelector('[data-role="plan-offer"][data-sku="standard_monthly_v3"]');
     const terms = clean(card.querySelector('[data-role="trial-offer"]'));
-    assert.equal(terms, '$0 today $20/month from Dec 4, 2026 Cancel any time before Dec 4, 2026 and you pay nothing.');
+    assert.equal(terms, '$0 today $20/month from Dec 4, 2026 One calendar month. Card required. Cancel before Dec 4, 2026 and you pay nothing.');
     assert.equal(clean(card.querySelector('[data-action="trial"]')), 'Start your free month');
     assert.ok(! card.querySelector('[data-action="trial"]').classList.contains('ezil-settings-btn-primary'), 'the card CTA is secondary');
     assert.equal(card.querySelector('[data-action="checkout"]'), null, 'the free month replaces the paid Standard checkout');
@@ -146,9 +146,9 @@ test('offer: Free with an eligible offer says "Start your free month", $0 today,
     return el;
 });
 
-test('ineligible: no trial CTA, the Standard checkout stays, one quiet line for trial_used / paid_before / email_unverified only', async h => {
+test('ineligible: no trial CTA, the Standard checkout stays, plain eligibility reasons without a second trial', async h => {
     for ( const [reason, line] of [['trial_used', "You've already used your free month."], ['paid_before', 'The free month is for accounts without an earlier paid plan.'],
-        ['email_unverified', 'Verify your email to start a free month.'], ['not_free', null], ['operator_plan', null], ['no_email', null]] ) {
+        ['email_unverified', 'Verify your email to start a free month.'], ['not_free', 'The free month is for accounts on the Free plan.'], ['operator_plan', 'Your account already has access assigned by EZiL.'], ['no_email', 'Add and verify an email address to start a free month.']] ) {
         const el = h.fragment(h.api.summaryV3Html(trialSummaryV3('ineligible', { reason })));
         assert.deepEqual([...el.querySelectorAll('.ezil-settings-btn-primary')].map(clean), ['Upgrade to Standard'], reason);
         assert.equal(el.querySelector('[data-action="trial"]'), null, reason);
@@ -157,6 +157,34 @@ test('ineligible: no trial CTA, the Standard checkout stays, one quiet line for 
         assert.equal(clean(card.querySelector('[data-role="trial-ineligible"]')) || null, line, reason);
         assert.equal(el.querySelectorAll('[data-role="trial-ineligible"]').length, line ? 1 : 0, `${reason}: one quiet line at most`);
     }
+});
+
+test('coupon source is authoritative: unlocked in Billing, prior eligibility still refuses, query hints cannot grant a trial', async h => {
+    const offered = trialSummaryV3('offer');
+    offered.trialOffer.source = 'sponsor'; offered.trialOffer.partnerId = 'example';
+    const unlocked = h.fragment(h.api.summaryV3Html(offered));
+    assert.match(clean(unlocked.querySelector('[data-role="coupon-offer"]')), /Coupon offer unlocked/);
+    assert.equal(unlocked.querySelectorAll('[data-role="plan-actions"] [data-action="trial"]').length, 1);
+    const used = trialSummaryV3('ineligible', { reason: 'trial_used' }); used.trialOffer.source = 'sponsor';
+    const refused = h.fragment(h.api.summaryV3Html(used));
+    assert.match(clean(refused.querySelector('[data-role="coupon-offer"]')), /already used your free month/);
+    assert.equal(refused.querySelector('[data-action="trial"]'), null);
+    for (const [plan, reason] of [['standard', 'not_free'], ['standard', 'trial_used']]) {
+        const paid = summaryV3(plan);
+        paid.actions.checkout = false;
+        paid.trialOffer = { source: 'sponsor', eligible: false, reason };
+        const el = h.fragment(h.api.summaryV3Html(paid));
+        assert.match(clean(el.querySelector('[data-role="coupon-offer"]')), reason === 'not_free' ? /accounts on the Free plan/ : /already used your free month/);
+        assert.equal(el.querySelector('[data-action="trial"]'), null);
+    }
+    for (const hint of ['unavailable','identity_required']) {
+        const plain = summaryV3('free');
+        const el = h.fragment(h.api.summaryV3Html(plain, null, { couponEntry: hint }));
+        assert.ok(el.querySelector('[data-role="coupon-entry"]'));
+        assert.equal(el.querySelector('[data-action="trial"]'), null);
+        assert.doesNotMatch(clean(el), /Coupon offer unlocked/);
+    }
+    assert.equal(h.fragment(h.api.summaryV3Html(summaryV3('free'), null, { couponEntry: '<script>' })).querySelector('[data-role="coupon-entry"]'), null);
 });
 
 test('trialing: "Free trial · Standard", free until the end, first charge $20.00 from the date, cancel before then; no upgrade, no renewal line', async h => {
@@ -282,52 +310,50 @@ for ( const [label, trialEndsAt, timeZone, expected, day] of [
     ['31 Jan 2027 → 28 Feb (UTC)', '2027-02-28T03:00:00Z', 'UTC', 'Sunday, February 28, 2027 at 3:00 AM Coordinated Universal Time', 'Feb 28, 2027'],
     // Leap year: 31 Jan 2028 → 29 Feb 2028; seconds are never shown and the minute shown is not after the instant.
     ['31 Jan 2028 → 29 Feb (Asia/Tokyo)', '2028-02-29T09:15:42Z', 'Asia/Tokyo', 'Tuesday, February 29, 2028 at 6:15 PM Japan Standard Time (Asia/Tokyo)', 'Feb 29, 2028'],
-] ) test(`confirmation at a month end: ${label} shows the exact quoted end, then Continue echoes it to checkout`, async h => {
+] ) test(`one activation at a month end: ${label} opens Checkout with exactly the quoted end`, async h => {
     h.replies['billing.quoteTrial'] = () => quote(trialEndsAt);
     h.replies['billing.createCheckout'] = () => embedded;
     h.openTrial({ timeZone });
     await settle();
     assert.equal(h.count('billing.quoteTrial'), 1);
-    assert.equal(h.count('billing.createCheckout'), 0, 'no checkout before the person has seen the end');
-    assert.equal(h.mounted, 0);
-    const confirm = h.q('[data-role="trial-confirm"]');
-    assert.equal(clean(confirm.querySelector('[data-role="trial-ends"]')), `Your free month ends on ${expected}.`);
-    assert.equal(confirm.querySelector('time').getAttribute('datetime'), trialEndsAt);
-    assert.equal(clean(confirm.querySelector('[data-role="trial-charge"]')), 'A payment method is required. $20.00 is charged monthly from that date unless you cancel.');
-    assert.equal(clean(confirm.querySelector('[data-role="trial-cancel"]')), 'Cancel any time before then in Settings → Billing and you pay nothing.');
+    assert.deepEqual(plain(h.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input)), [{ sku: 'standard_monthly_v3', trial: { trialEndsAt } }]);
+    assert.equal(h.mounted, 1);
+    assert.equal(h.q('[data-action="trial-continue"]'), null, 'no intermediate Continue');
+    assert.equal(h.q('[data-role="trial-confirm"]'), null, 'the activating CTA opens Checkout directly');
     assert.equal(clean(h.q('#ezil-upgrade-title')), 'Start your free month');
     assert.match(clean(h.q('.ezil-upgrade-price')), /^\$0 today$/);
     assert.equal(clean(h.q('[data-role="trial-then"]')), `Then $20.00/month from ${day} · USD · before applicable tax`);
     assert.equal(clean(h.q('.ezil-upgrade-total')), 'Due today$0.00');
     assert.equal(clean(h.q('[data-role="trial-first-charge"]')), `$20.00 from ${day}, then every month until you cancel.`);
     assert.equal(clean(h.q('[data-role="trial-cancel-by"]')), `Cancel before ${day} in Settings → Billing and you pay nothing.`);
+    assert.match(clean(h.q('[data-role="trial-renews"]')), /A payment method is required/);
     assert.doesNotMatch(h.text(), paidWords);
-    h.click('[data-action="trial-continue"]');
-    await settle();
-    assert.deepEqual(plain(h.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input)), [{ sku: 'standard_monthly_v3', trial: { trialEndsAt } }]);
-    assert.equal(h.mounted, 1, 'the same embedded checkout as Standard');
 });
 
-test('trial_quote_stale: re-quote, show the NEW end with a notice, and only that end reaches checkout', async h => {
+test('trial_quote_stale: one automatic re-quote echoes only each exact quote and opens Checkout without Continue', async h => {
     const first = '2027-02-28T03:00:00Z', second = '2027-02-28T03:41:07Z';
-    let quotes = 0;
+    let quotes = 0, creates = 0;
     h.replies['billing.quoteTrial'] = () => quote(quotes++ ? second : first);
-    let creates = 0;
     h.replies['billing.createCheckout'] = () => creates++ ? embedded : fail('trial_quote_stale');
     h.openTrial({ timeZone: 'UTC' });
     await settle();
-    h.click('[data-action="trial-continue"]');
-    await settle();
-    assert.equal(h.count('billing.quoteTrial'), 2, 'a stale quote is quoted again');
-    assert.equal(h.mounted, 0, 'nothing is mounted for a stale quote');
-    assert.equal(clean(h.q('[data-role="trial-changed"]')), "Your free month's end date changed. Check the new date before you continue.");
-    assert.equal(clean(h.q('[data-role="trial-ends"]')), 'Your free month ends on Sunday, February 28, 2027 at 3:41 AM Coordinated Universal Time.');
-    assert.equal(h.q('[data-role="trial-ends"] time').getAttribute('datetime'), second);
-    assert.equal(h.document.activeElement, h.q('[data-action="trial-continue"]'), 'focus lands on Continue for the new date');
-    h.click('[data-action="trial-continue"]');
-    await settle();
+    assert.equal(h.count('billing.quoteTrial'), 2);
     assert.deepEqual(h.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input.trial.trialEndsAt), [first, second]);
     assert.equal(h.mounted, 1);
+    assert.equal(h.q('[data-action="trial-continue"]'), null);
+});
+
+test('repeated stale quotes stop at Retry instead of creating an unbounded Checkout loop', async h => {
+    h.replies['billing.quoteTrial'] = () => quote('2027-02-28T03:00:00Z');
+    h.replies['billing.createCheckout'] = () => fail('trial_quote_stale');
+    h.openTrial();
+    await settle();
+    assert.equal(h.count('billing.quoteTrial'), 2);
+    assert.equal(h.count('billing.createCheckout'), 2);
+    assert.equal(h.mounted, 0);
+    assert.ok(h.q('[data-action="retry"]'));
+    assert.match(h.text(), /dates changed/);
+    assert.equal(h.q('[data-action="trial-continue"]'), null);
 });
 
 test('refusals: trial_unavailable / trial_checkout_complete go back to Billing; an unreadable quote is never shown; never a paid checkout', async h => {
@@ -342,8 +368,6 @@ test('refusals: trial_unavailable / trial_checkout_complete go back to Billing; 
     h.replies['billing.quoteTrial'] = () => quote('2027-02-28T03:00:00Z');
     h.replies['billing.createCheckout'] = () => fail('trial_checkout_complete');
     h.openTrial();
-    await settle();
-    h.click('[data-action="trial-continue"]');
     await settle();
     assert.match(h.text(), /Your free month is already starting\. Wait a moment, then refresh Billing\./);
     assert.ok(h.q('[data-action="return-to-billing"]'));
@@ -372,8 +396,6 @@ test('completion: "Your free month is starting", then "has started" with the fir
     h.replies['billing.summary'] = () => ok(summary);
     h.openTrial({ timeZone: 'America/Los_Angeles' });
     await settle();
-    h.click('[data-action="trial-continue"]');
-    await settle();
     status = ok({ status: 'complete', paymentStatus: 'no_payment_required', sku: 'standard_monthly_v3' });
     h.complete();
     await settle();
@@ -394,8 +416,6 @@ test('review U1: a completed trial checkout is confirmed only by paid access, ne
     let summary = trialSummaryV3('payment_pending', { endsAt: '2027-02-28T03:00:00Z' });
     h.replies['billing.summary'] = () => ok(summary);
     h.openTrial({ timeZone: 'UTC' });
-    await settle();
-    h.click('[data-action="trial-continue"]');
     await settle();
     h.complete();
     // Standard SKU, but paused (payment_pending, standing free), then the SKU with no standing at all: no success.
@@ -418,12 +438,37 @@ test('redirect mode: the trial checkout opens the same hosted tab and polls as S
     h.replies['billing.summary'] = () => ok(trialSummaryV3('trialing', { endsAt: '2027-02-28T03:00:00Z' }));
     h.openTrial({ timeZone: 'UTC' });
     await settle();
-    h.click('[data-action="trial-continue"]');
-    await settle();
     assert.equal(h.opens[0][0], 'https://checkout.example.test/c/pay');
     await h.tick(1500);
     assert.match(h.text(), /Your free month of Standard has started/);
     assert.equal(h.calls.find(call => call.method === 'billing.createCheckout').input.trial.trialEndsAt, '2027-02-28T03:00:00Z');
+});
+
+test('double activation while quote or Checkout is pending keeps one quote, one session and one payment form', async h => {
+    let resolveQuote, resolveCheckout;
+    h.replies['billing.quoteTrial'] = () => new Promise(resolve => { resolveQuote = resolve; });
+    h.replies['billing.createCheckout'] = () => new Promise(resolve => { resolveCheckout = resolve; });
+    h.openTrial(); h.openTrial();
+    await settle();
+    assert.equal(h.count('billing.quoteTrial'), 1);
+    assert.equal(h.count('billing.createCheckout'), 0);
+    resolveQuote(quote('2027-02-28T03:00:00Z'));
+    await settle();
+    h.openTrial();
+    assert.equal(h.count('billing.createCheckout'), 1);
+    resolveCheckout(embedded);
+    await settle();
+    assert.equal(h.mounted, 1);
+});
+
+test('closing during quote prevents a late Checkout mutation', async h => {
+    let resolve;
+    h.replies['billing.quoteTrial'] = () => new Promise(done => { resolve = done; });
+    h.openTrial(); h.handle.close();
+    resolve(quote('2027-02-28T03:00:00Z'));
+    await settle();
+    assert.equal(h.count('billing.createCheckout'), 0);
+    assert.equal(h.mounted, 0);
 });
 
 // ── Trial variants of the other billing sheets ────────────────────────────────
@@ -471,7 +516,7 @@ test('plan picker and session end: Standard is the free month when offered (chec
     const summary = trialSummaryV3('offer');
     h.handle = h.api.openPlanPickerSheet({ container: h.q('#container'), summary, trpc: h.trpc, onClose: () => {}, checkout: params => handed.push(params) });
     const standard = h.q('[data-plan="standard_monthly_v3"]'), premium = h.q('[data-plan="premium_monthly_v3"]');
-    assert.match(clean(standard.querySelector('[data-role="trial-offer"]')), /^\$0 today\$20\/month from Dec 5, 2026\. Cancel any time before Dec 5, 2026 and you pay nothing\.$/);
+    assert.match(clean(standard.querySelector('[data-role="trial-offer"]')), /^\$0 today\$20\/month from Dec 5, 2026\. One calendar month\. Card required\. Cancel before Dec 5, 2026 and you pay nothing\.$/);
     assert.equal(standard.querySelector('[data-action="checkout"]'), null);
     assert.doesNotMatch(clean(premium), /free month|\$0 today/i);
     h.click('[data-plan="standard_monthly_v3"] [data-action="trial"]');
@@ -491,6 +536,19 @@ test('plan picker and session end: Standard is the free month when offered (chec
     // The top-up recovery dialog offers the same free month.
     assert.deepEqual(plain(h.api.topupUpgrade(trialSummaryV3('offer'))), { action: 'trial', sku: 'standard_monthly_v3', label: 'Start your free month', note: 'Standard adds 200 AI credits every month.' });
     assert.equal(h.api.topupUpgrade(trialSummaryV3('ineligible')).action, 'checkout');
+});
+
+for (const entry of ['plan picker', 'session end']) test(`${entry}: one real CTA reaches the shared quote and Checkout without Continue`, async h => {
+    h.replies['billing.quoteTrial'] = () => quote('2027-02-28T03:00:00Z');
+    h.replies['billing.createCheckout'] = () => embedded;
+    const options = { container: h.q('#container'), summary: trialSummaryV3('offer'), trpc: h.trpc, onClose: () => {}, loadStripe: h.loadStripe };
+    h.handle = entry === 'plan picker' ? h.api.openPlanPickerSheet(options) : h.api.openSessionEndSheet({ ...options, reason: 'session_max' });
+    h.click(entry === 'plan picker' ? '[data-plan="standard_monthly_v3"] [data-action="trial"]' : '[data-sheet="session-end"] [data-action="continue"]');
+    await settle();
+    assert.equal(h.count('billing.quoteTrial'), 1);
+    assert.equal(h.count('billing.createCheckout'), 1);
+    assert.equal(h.mounted, 1);
+    assert.equal(h.q('[data-action="trial-continue"]'), null);
 });
 
 // ── Usage: no new meter, the authoritative balance, plan-labelled credits ─────

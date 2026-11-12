@@ -346,7 +346,7 @@ export function openPlanPickerSheet (options) {
         sheet.node('h3', offer.name, card);
         sheet.node('p', offer.tagline, card);
         sheet.node('p', offer.priceCents ? `${money(offer.priceCents)}/month` : '$0', card).className = 'ezil-billing-sheet-total';
-        // Standard trial (Standard only): the free month this viewer is offered; the checkout confirms the exact end.
+        // Standard trial (Standard only): the free month this viewer is offered; Checkout opens directly with the exact end.
         const trial = offer.sku === TRIAL_SKU && offer.sku !== options.summary.plan.sku ? trialOfferOf(options.summary) : null;
         if ( offer.sku === options.summary.plan.sku ) {
             const current = sheet.node('button', 'Current plan', card);
@@ -358,7 +358,7 @@ export function openPlanPickerSheet (options) {
             const terms = sheet.node('div', null, card);
             terms.dataset.role = 'trial-offer';
             sheet.node('p', '$0 today', terms).className = 'ezil-billing-choice-lead';
-            sheet.node('p', `${money(trial.amountCents)}/month from ${day}. Cancel any time before ${day} and you pay nothing.`, terms);
+            sheet.node('p', `${money(trial.amountCents)}/month from ${day}. One calendar month. Card required. Cancel before ${day} and you pay nothing.`, terms);
             sheet.button('Start your free month', 'trial', () => {
                 if ( ! options.summary.actions.checkout ) return;
                 sheet.close();
@@ -407,11 +407,12 @@ export function openSessionEndSheet (options) {
     const sheet = billingSheet(options, action, 'Your session ended');
     if ( sheet.existing ) return null;
     sheet.dialog.dataset.sheet = 'session-end';
-    // Standard trial: the free month this viewer is offered, $0 today; the checkout confirms the exact end.
+    // Standard trial: the free month this viewer is offered, $0 today; Checkout opens directly with the exact end.
     const trial = free && offer.sku === TRIAL_SKU ? trialOfferOf(summary) : null;
     sheet.node('p', `Your session ended. ${offer.name}: ${trial
         ? `$0 today, then ${money(trial.amountCents)}/month from ${trialDayLabel(trial.endsAt)} unless you cancel` : `${money(offer.priceCents)}/month`}.`);
     offerDetails(sheet, offer);
+    if ( trial ) sheet.node('p', 'One calendar month. Card required. Cancel before your free month ends and you pay nothing.');
     sheet.node('p', 'Your files and installed tools stay. Running processes stop. You can start a new session.');
     sheet.button(trial ? 'Start your free month' : free ? `Choose ${offer.name}` : `Upgrade to ${offer.name}`, 'continue', () => {
         if ( ! summary.actions[action] ) return;

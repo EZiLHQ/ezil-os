@@ -2,8 +2,8 @@
 // (request standard-trial-01b28d18-20261105-v1) against the BUILT stylesheet (app/public/os/bundle.min.css):
 //   - the Billing pane in each trial state fits the 760 px Settings window and a 390 px phone, with the state's one
 //     primary, and the three plan cards still side by side at 760 px with the free-month lines on Standard;
-//   - the checkout sheet's trial confirmation, in a browser whose time zone is America/Los_Angeles, shows a quote on
-//     31 Jan 2027 03:00 UTC (end 28 Feb 03:00 UTC) as Saturday 27 Feb, 7:00 PM, and Continue echoes that end.
+//   - one-activation checkout, in a browser whose time zone is America/Los_Angeles, shows a quote on
+//     31 Jan 2027 03:00 UTC (end 28 Feb 03:00 UTC) in the viewer's date, and Checkout echoes that end without Continue.
 //
 // Run:  PLAYWRIGHT_REQUIRE_DIR=<dir with playwright> node shell/ezil/ui/Settings/billing-trial-browser-test.mjs
 //       (after shell/build-shell.sh). EZIL_TRIAL_SCREENSHOT_DIR=<dir> also saves a PNG per state there; unset
@@ -75,7 +75,7 @@ const page_html = (width, height) => `<!doctype html><html><head><meta name="vie
         </div>
     </div></body></html>`;
 
-const browser = await chromium.launch();
+const browser = await chromium.launch({ ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH } : {}) });
 try {
     for ( const [label, viewport, width] of [['desktop 760 window', { width: 1440, height: 1000 }, 760], ['phone 390 px', { width: 390, height: 844 }, 390]] ) {
         // The browser's own zone, so every trial date is the viewer's: Los Angeles shows the UTC 28 Feb end as 27 Feb.
@@ -119,7 +119,7 @@ try {
                 m.tops.length === 3 && new Set(m.tops).size === 1 && m.widths.every(w => w >= 140), `tops ${m.tops} widths ${m.widths}`);
             else push(`${label} · ${state}: the plan cards stack`, m.tops.length === 3 && new Set(m.tops).size === 3, `${m.tops}`);
             if ( state === 'offer' ) push(`${label} · offer: $0 today, $20/month from the viewer's day, cancel before it`,
-                m.offer === '$0 today $20/month from Feb 27, 2027 Cancel any time before Feb 27, 2027 and you pay nothing.', m.offer);
+                m.offer === '$0 today $20/month from Feb 27, 2027 One calendar month. Card required. Cancel before Feb 27, 2027 and you pay nothing.', m.offer);
             if ( state === 'trialing' ) push(`${label} · trialing: free until the end in the browser's zone, with its name`,
                 m.until === 'Free until Feb 27, 2027 at 7:00 PM Pacific Standard Time', m.until);
             if ( state === 'ending' ) push(`${label} · ending: the free month's end day in the browser's zone`, m.ending === 'Your free month ends on Feb 27, 2027.', m.ending);
@@ -161,28 +161,21 @@ try {
             await new Promise(resolve => setTimeout(resolve, 50));
             const dialog = document.querySelector('[data-role="upgrade-sheet"]');
             const rect = dialog.getBoundingClientRect();
-            const ends = dialog.querySelector('[data-role="trial-ends"]');
-            const button = dialog.querySelector('[data-action="trial-continue"]');
-            const b = button.getBoundingClientRect();
             return {
-                ends: ends?.textContent.replace(/\s+/g, ' ').trim() ?? null, datetime: ends?.querySelector('time')?.getAttribute('datetime') ?? null,
-                charge: dialog.querySelector('[data-role="trial-charge"]')?.textContent ?? null,
+                then: dialog.querySelector('[data-role="trial-then"]')?.textContent ?? null,
+                charge: dialog.querySelector('[data-role="trial-renews"]')?.textContent ?? null,
+                cancel: dialog.querySelector('[data-role="trial-cancel-by"]')?.textContent ?? null,
                 inside: rect.left >= -0.5 && rect.right <= innerWidth + 0.5, overflow: dialog.scrollWidth - dialog.clientWidth,
-                continueHeight: Math.round(b.height), continueWidth: Math.round(b.width), checkouts: window.calls.filter(call => call.method === 'billing.createCheckout').length,
+                continueCount: dialog.querySelectorAll('[data-action="trial-continue"]').length,
+                checkouts: window.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input),
+                mounted: !!dialog.querySelector('[data-role="fake-stripe"]'),
             };
         }, { offer, END });
-        push(`${label} · confirmation: the exact quoted end in the browser's zone, with the zone's name`,
-            t.ends === 'Your free month ends on Saturday, February 27, 2027 at 7:00 PM Pacific Standard Time (America/Los_Angeles).' && t.datetime === END, `${t.ends} | ${t.datetime}`);
-        push(`${label} · confirmation: a payment method is required and $20.00 is charged monthly from that date`,
-            t.charge === 'A payment method is required. $20.00 is charged monthly from that date unless you cancel.', t.charge);
-        push(`${label} · confirmation: no checkout before Continue`, t.checkouts === 0, `${t.checkouts}`);
-        push(`${label} · confirmation: the sheet stays inside the viewport with no horizontal overflow`, t.inside && t.overflow <= 0, JSON.stringify(t));
-        push(`${label} · confirmation: Continue is a real target (at least 32 px tall)`, t.continueHeight >= 32 && t.continueWidth >= 44, `${t.continueWidth}x${t.continueHeight}`);
-        if ( shots ) await page.screenshot({ path: path.join(shots, `trial-confirm-${viewport.width}.png`) });
-        await page.click('[data-action="trial-continue"]');
-        await page.waitForSelector('[data-role="fake-stripe"]');
-        const echoed = await page.evaluate(() => window.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input));
-        push(`${label} · Continue: createCheckout echoes exactly the quoted end`, JSON.stringify(echoed) === JSON.stringify([{ sku: 'standard_monthly_v3', trial: { trialEndsAt: END } }]), JSON.stringify(echoed));
+        push(`${label} · one activation: Checkout mounts without Continue`, t.mounted && t.continueCount === 0, JSON.stringify(t));
+        push(`${label} · quote: the exact end is echoed once`, JSON.stringify(t.checkouts) === JSON.stringify([{ sku: 'standard_monthly_v3', trial: { trialEndsAt: END } }]), JSON.stringify(t.checkouts));
+        push(`${label} · terms: $20/month from the browser's date`, t.then === 'Then $20.00/month from Feb 27, 2027 · USD · before applicable tax', t.then);
+        push(`${label} · terms: card required, renewal and cancellation remain visible`, /A payment method is required/.test(t.charge) && /charged monthly/.test(t.charge) && /Cancel before Feb 27, 2027/.test(t.cancel), `${t.charge} | ${t.cancel}`);
+        push(`${label} · layout: sheet inside viewport without horizontal overflow`, t.inside && t.overflow <= 0, JSON.stringify(t));
         if ( shots && viewport.width === 1440 ) await page.screenshot({ path: path.join(shots, 'trial-checkout-1440.png') });
         await context.close();
     }

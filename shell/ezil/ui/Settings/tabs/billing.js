@@ -560,6 +560,26 @@ function yourComputerV3 (summary) {
         ${linkAction('computer-tab', held ? 'Computer details ›' : 'Change configuration ›')}</div>`;
 }
 
+/** Terms stay beside the activating CTA; Checkout quotes the final charge date. */
+function trialTermsHtml (summary) {
+    const trial = trialOfferOf(summary);
+    if ( ! trial ) return '';
+    return `<p class="ezil-billing-note" data-role="trial-cta-terms">${encode(`$0 today for one calendar month, then ${dollars(trial.amountCents, { compact: true })}/month. Card required. Cancel before ${trialDayLabel(trial.endsAt)} and you pay nothing.`)}</p>`;
+}
+
+/** A trusted server offer is shown in Billing, never inferred from a coupon query or landing page. */
+function couponOfferHtml (summary, entry) {
+    // A query can explain a failed entry, but can never unlock or change an offer.
+    const hint = { unavailable: "This coupon is invalid, expired or no longer available. Your plan is unchanged.",
+        identity_required: "Sign in to this account with EZiL ID to check the coupon. Your plan is unchanged." }[entry];
+    if ( hint && !(summary.trialOffer?.source === 'sponsor' && trialOfferOf(summary)) ) return `<section class="ezil-billing-card ezil-billing-payment" data-role="coupon-entry" role="status">${paragraph(hint, 'ezil-billing-note')}</section>`;
+    if ( summary.trialOffer?.source !== 'sponsor' ) return '';
+    const eligible = trialOfferOf(summary);
+    const reason = trialIneligibleCopy(summary);
+    return `<section class="ezil-billing-card ezil-billing-payment" data-role="coupon-offer" role="status"><h4>${eligible ? 'Coupon offer unlocked' : 'Coupon offer'}</h4>
+        ${eligible ? paragraph('Your coupon unlocks a free month of Standard. Start it below.', 'ezil-billing-note') : paragraph(reason || "This coupon can't start a free month for this account.", 'ezil-billing-note')}</section>`;
+}
+
 function currentPlanV3 (summary, banner) {
     const { plan } = summary;
     const standing = standingOf(summary);
@@ -592,6 +612,7 @@ function currentPlanV3 (summary, banner) {
             <div class="ezil-billing-plan-heading"><h4>${encode(live ? `Free trial · ${plan.name}` : plan.name)}</h4><span class="ezil-settings-pill" data-role="plan-status" data-status="${encode(chip)}">${encode(pill)}</span></div>
             ${trial ? trialLines : `${price ? paragraph(price, 'ezil-billing-plan-price') : ''}${renewal ? paragraph(renewal, 'ezil-billing-status') : ''}`}
             ${plan.scheduledChange ? paragraph(`Changes to ${offerFor(summary, plan.scheduledChange.toSku)?.name ?? 'Standard'} on ${dateLabel(plan.scheduledChange.effectiveAt)}.`, 'ezil-billing-status') : ''}
+            ${trialTermsHtml(summary)}
             ${standing === 'files_on_aws' && ! after ? `<p role="status" data-role="files-held">${encode(standingCopy('files_on_aws', summary))}</p>` : ''}
         </div><div class="ezil-billing-actions" data-role="plan-actions">${primary}</div></div>
         ${yourComputerV3(summary)}</section>`;
@@ -626,13 +647,13 @@ function offerCardV3 (summary, offer) {
         ? `${offer.storageGiB} GB disk${current && realDisk !== null && realDisk !== offer.storageGiB ? ` · yours has ${realDisk} GB` : keepsOwn ? ' for new computers' : ''}` : 'Files saved between sessions';
     const credits = offer.aiCredits?.amount ? `${whole(offer.aiCredits.amount)} AI credits ${offer.aiCredits.per === 'once' ? 'to start' : 'every month'}` : '';
     // Standard trial (Standard only, never Premium): offered from Free when the server says this viewer is eligible.
-    // The date is the server's preview of the end if a trial started now; the confirmation shows the exact quote.
+    // The date is the server's preview of the end if a trial started now; Checkout shows the exact quote.
     const fromFree = currentRank === 0 && ! current && actions.checkout;
     const trial = fromFree && offer.sku === TRIAL_SKU ? trialOfferOf(summary) : null;
     const trialDay = trial ? trialDayLabel(trial.endsAt) : '';
     const trialHtml = trial ? `<div class="ezil-billing-offer-trial" data-role="trial-offer"><p><strong>$0 today</strong></p>
         ${paragraph(`${dollars(trial.amountCents, { compact: true })}/month from ${trialDay}`, 'ezil-billing-note')}
-        ${paragraph(`Cancel any time before ${trialDay} and you pay nothing.`, 'ezil-billing-note')}</div>` : '';
+        ${paragraph(`One calendar month. Card required. Cancel before ${trialDay} and you pay nothing.`, 'ezil-billing-note')}</div>` : '';
     const ineligible = fromFree && offer.sku === TRIAL_SKU ? trialIneligibleCopy(summary) : '';
     let cta = '';
     if ( current ) cta = '<span class="ezil-billing-current" data-role="current-plan">Current plan</span>';
@@ -682,6 +703,7 @@ export function summaryV3Html (summary, usage = null, options = {}) {
     return `<header class="ezil-billing-header"><div><h3>Billing</h3><p class="ezil-settings-lead">Your plan, usage and payments.</p></div>
         ${actions.portal ? `<div class="ezil-billing-actions">${linkAction('portal', 'Manage payment')}</div>` : ''}</header>
         ${banner?.html ?? ''}
+        ${couponOfferHtml(summary, options.couponEntry)}
         ${currentPlanV3(summary, banner)}
         ${usageCardV3(summary, usage, options)}
         ${plansV3(summary)}
@@ -784,7 +806,7 @@ async function load ($win, state) {
                 throw new Error('summary for another user');
             }
             if ( accountCredits(account, { userId }) !== null ) state.lastAccount = account;
-            $body.html(result.data.version === 3 ? summaryV3Html(result.data, null, { lastAccount: state.lastAccount, userId }) : summaryHtml(result.data));
+            $body.html(result.data.version === 3 ? summaryV3Html(result.data, null, { lastAccount: state.lastAccount, userId, couponEntry: state.couponEntry }) : summaryHtml(result.data));
             state.summary = result.data;
             state.loadedAt = Date.now();
             startCountdown($win, state);
@@ -928,7 +950,7 @@ function openRecovery ($win, state, request) {
 }
 
 function openSheet ($win, state, action, sku, intent = null) {
-    // The Standard trial is the Standard checkout sheet in its trial mode: it quotes, confirms the exact end, then pays $0.
+    // The Standard trial is the Standard checkout sheet in its trial mode: one activation quotes the exact end and opens the $0 checkout.
     if ( action === 'trial' ) return trialOfferOf(state.summary) ? openSheet($win, state, 'checkout', TRIAL_SKU, { trial: true }) : false;
     const flag = action === 'choose' ? 'checkout' : action === 'topup-checkout' ? 'topup' : action;
     if ( state.pending || state.sheet || state.closed || state.summary?.actions[flag] !== true ) return false;
@@ -1077,7 +1099,7 @@ export default {
     },
     init ($win, ctx = {}) {
         const state = { loading: false, pending: false, summary: null, history: [], sheet: null, request: 0, autoOpened: false, openUpgrade: false, openTopup: null, timer: null, active: false, closed: false,
-            lastAccount: null, loadedAt: undefined, userId: null,
+            lastAccount: null, loadedAt: undefined, userId: null, couponEntry: null,
             // Code's request (credit refusal or locked model) that opened this window, consumed by the first summary.
             openRecovery: recoveryRequest(ctx?.billingRecovery) };
         windows.set($win.get(0), state);
@@ -1141,6 +1163,8 @@ export default {
             // `/app/settings?tab=billing` is the same link as `/os?settings=billing`
             // (docs/APP-ROUTES.md); read both through the boot's own spelling.
             const params = new URLSearchParams(settingsAliasSearch(window.location));
+            const couponEntry = params.get('coupon_entry');
+            if ( ['unavailable', 'identity_required'].includes(couponEntry) ) state.couponEntry = couponEntry;
             // `reason=insufficient_credits` (Code's recovery link) frames the same dialog as exhaustion recovery.
             if ( ! state.autoOpened && params.get('settings') === 'billing' && params.get('section') === 'ai-credits' ) {
                 state.openTopup = { reason: params.get('reason') === 'insufficient_credits' ? 'insufficient_credits' : null };
