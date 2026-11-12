@@ -4,6 +4,8 @@ import { createHmac, hkdfSync, randomBytes, timingSafeEqual } from 'node:crypto'
 import { cookies } from 'next/headers';
 
 import { loginSponsorContext, sponsorFromCoupon, sponsorFromLink, sponsorFromTransaction } from './sponsor';
+import { sponsorFromEntryContext, SPONSOR_ENTRY_COOKIE } from './sponsor-entry-context';
+import { SPONSOR_BILLING_RETURN } from './sponsor-entry-input';
 
 import { safeReturnUrl } from '@/utils/constants';
 
@@ -70,15 +72,22 @@ export async function buildAuthorizeUrl({ origin, returnUrl, prompt, sponsorToke
         ...(prompt === 'none' ? { silent: true as const } : {}),
     };
     if (sponsorToken !== undefined && sponsorCoupon !== undefined) throw new Auth0Error('invalid_transaction');
-    if (sponsorToken !== undefined || sponsorCoupon !== undefined) {
-        const campaign = sponsorToken !== undefined ? sponsorFromLink(sponsorToken) : sponsorFromCoupon(sponsorCoupon);
-        if (!campaign || prompt === 'none') throw new Auth0Error('invalid_transaction');
+    const explicitSponsor = sponsorToken !== undefined || sponsorCoupon !== undefined;
+    const jar = await cookies();
+    // A failed/cancelled coupon login may retry through the normal login route. Only an origin-bound signed campaign
+    // handoff is recovered, never a callback/query campaign or raw invitation; every retry has new state/nonce/PKCE.
+    const campaign = explicitSponsor
+        ? sponsorToken !== undefined ? sponsorFromLink(sponsorToken) : sponsorFromCoupon(sponsorCoupon)
+        : prompt !== 'none' && transaction.returnUrl === SPONSOR_BILLING_RETURN
+            ? sponsorFromEntryContext(jar.get(SPONSOR_ENTRY_COOKIE)?.value, origin) : null;
+    if (explicitSponsor && (!campaign || prompt === 'none')) throw new Auth0Error('invalid_transaction');
+    if (campaign) {
         transaction.sponsorOrigin = new URL(origin).origin;
         transaction.sponsor = loginSponsorContext(campaign, transaction.sponsorOrigin, transaction.state, transaction.nonce);
-        transaction.returnUrl = '/os?settings=billing';
+        transaction.returnUrl = SPONSOR_BILLING_RETURN;
     }
     const payload = Buffer.from(JSON.stringify(transaction)).toString('base64url');
-    (await cookies()).set(AUTH0_COOKIE, `${payload}.${signature(payload)}`, {
+    jar.set(AUTH0_COOKIE, `${payload}.${signature(payload)}`, {
         ...AUTH0_COOKIE_OPTIONS, maxAge: 600, expires: new Date(transaction.expiresAt),
     });
     const challenge = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(transaction.codeVerifier));

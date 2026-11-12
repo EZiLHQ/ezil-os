@@ -1,9 +1,9 @@
 import type { NextRequest } from 'next/server';
-import { sponsorEntryAvailable } from '@/server/auth/sponsor-entry';
-import { sponsorLandingResponse } from '../landing';
+import { directSponsorEntry } from '../direct-entry';
 export const dynamic = 'force-dynamic';
 export async function GET(request: NextRequest, context: { params: Promise<{ token: string }> }) {
     const { token } = await context.params;
-    const mixed = request.nextUrl.searchParams.has('coupon') || request.nextUrl.searchParams.has('token');
-    return sponsorLandingResponse({ kind: 'token', value: token }, !mixed && await sponsorEntryAvailable(token));
+    const query = request.nextUrl.searchParams;
+    const mixed = query.has('coupon') || query.has('token') || query.toString().length > 2048;
+    return directSponsorEntry(request, mixed ? null : { kind: 'token', value: token });
 }
