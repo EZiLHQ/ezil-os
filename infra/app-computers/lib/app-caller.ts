@@ -5,7 +5,7 @@ import { historyReadStatement } from './rebase-preparation.js';
 
 /** Owned constructs register their exact grants before the existing bin
  * creates AppCaller. No bin edit or guessed history key is needed. */
-type ImageWorkflow = { version: string; historyKeyArn: string; authorityKeyArn?: string };
+type ImageWorkflow = { version: string; historyKeyArn: string; authorityKeyArn?: string; appHistoryRead?: boolean };
 const imageReaders = new WeakMap<Stack, Map<string, iam.Role[]>>();
 export function registerImageHistoryReader(scope: Construct, lifecycleVersion: string, role: iam.Role) {
     const stack = Stack.of(scope), groups = imageReaders.get(stack) ?? new Map<string, iam.Role[]>();
@@ -19,11 +19,13 @@ function grantImageRead(role: iam.Role, item: ImageWorkflow) {
     role.addToPolicy(historyReadStatement(region, item.historyKeyArn, [item.version]));
 }
 const imageWorkflows = new WeakMap<Stack, Map<string, ImageWorkflow[]>>();
-export function registerImageWorkflow(scope: Construct, lifecycleVersion: string, version: string, historyKeyArn: string, authorityKeyArn?: string) {
+/** `appHistoryRead`: the app caller may also read this workflow's execution history (opt-in, preparation only). */
+export function registerImageWorkflow(scope: Construct, lifecycleVersion: string, version: string, historyKeyArn: string, authorityKeyArn?: string,
+    appHistoryRead = false) {
     const stack = Stack.of(scope), groups = imageWorkflows.get(stack) ?? new Map<string, ImageWorkflow[]>();
     const list = groups.get(lifecycleVersion) ?? [];
     if (!list.some(v => v.version === version)) {
-        const item = { version, historyKeyArn, authorityKeyArn }; list.push(item);
+        const item = { version, historyKeyArn, authorityKeyArn, appHistoryRead }; list.push(item);
         for (const role of imageReaders.get(stack)?.get(lifecycleVersion) ?? []) grantImageRead(role, item);
     }
     groups.set(lifecycleVersion, list); imageWorkflows.set(stack, groups);
@@ -183,6 +185,11 @@ export class AppCaller extends Construct {
             const versions = [...new Set(added.map(v => v.version))];
             for (const statement of startVersionStatements(versions)) this.role.addToPolicy(statement);
             this.role.addToPolicy(new iam.PolicyStatement({ actions: ['states:DescribeExecution'], resources: versions.map(v =>
+                v.replace(/:[1-9][0-9]*$/, '').replace(':stateMachine:', ':execution:') + ':computer-*') }));
+            // The operator cancel-preparation (app aws-rebase-cancel.ts) proves from a failed preparation's COMPLETE
+            // history that it never mutated EC2: read-only history of exactly the opted-in (preparation) executions.
+            const histories = [...new Set(added.filter(v => v.appHistoryRead).map(v => v.version))];
+            if (histories.length) this.role.addToPolicy(new iam.PolicyStatement({ actions: ['states:GetExecutionHistory'], resources: histories.map(v =>
                 v.replace(/:[1-9][0-9]*$/, '').replace(':stateMachine:', ':execution:') + ':computer-*') }));
             for (const key of new Set(added.map(v => v.historyKeyArn))) this.role.addToPolicy(historyReadStatement(props.region, key, added.filter(v => v.historyKeyArn === key).map(v => v.version)));
             this.role.addToPolicy(new iam.PolicyStatement({ actions: ['ec2:DescribeSnapshots'], resources: ['*'], conditions: { StringEquals: { 'aws:RequestedRegion': props.region } } }));
