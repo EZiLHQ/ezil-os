@@ -24,6 +24,9 @@ function harness () {
         url: 'https://example.test', pretendToBeVisual: true, runScripts: 'outside-only',
     });
     const { window: win } = dom, doc = win.document;
+    // jsdom has no layout: give fixture iframes a rendered box. Real geometry
+    // and opacity ownership are covered by sheet-frame-visibility-browser-test.
+    win.HTMLIFrameElement.prototype.getClientRects = () => [{ width: 300, height: 200 }];
     win.eval(source);
     const opener = doc.querySelector('#opener');
     opener.focus();

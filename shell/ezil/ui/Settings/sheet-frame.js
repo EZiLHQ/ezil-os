@@ -42,10 +42,14 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
         for ( let node = element; node && node !== doc.body; node = node.parentElement ) {
             const style = win.getComputedStyle(node);
             if ( node.hidden || node.getAttribute('aria-hidden') === 'true' || style.display === 'none'
-                || style.visibility === 'hidden' || style.visibility === 'collapse' ) return true;
+                || style.visibility === 'hidden' || style.visibility === 'collapse' || style.opacity === '0' ) return true;
         }
         return false;
     };
+    // Preloaded challenge frames can have a URL before they have a visible box.
+    // Only a rendered provider frame may take modal ownership from checkout.
+    const visibleProvider = iframe => ! hidden(iframe)
+        && [...iframe.getClientRects()].some(rect => rect.width > 0 && rect.height > 0);
     const focusable = () => [...dialog.querySelectorAll('button, input, select, textarea, summary, a[href], iframe, [tabindex]')]
         .filter(el => ! el.disabled && el.tabIndex >= 0 && ! el.dataset.focusEdge && ! el.closest('[hidden], [inert]')
             && ! [...dialog.querySelectorAll('details:not([open])')].some(details => details.contains(el) && el !== details.querySelector('summary')));
@@ -81,7 +85,7 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
                 if ( iframe ) {
                     provider.adopted.add(sibling);
                     releaseInert(sibling);
-                    if ( ! hidden(iframe) ) next.push({ root: sibling, iframe });
+                    if ( visibleProvider(iframe) ) next.push({ root: sibling, iframe });
                 } else if ( ! sibling.hasAttribute('inert') ) {
                     sibling.setAttribute('inert', '');
                     inert.add(sibling);
@@ -108,7 +112,7 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
         finishPendingClose();
     }
     const providerStillClosing = () => [...closingRoots].some(([root, iframe]) => root.isConnected && ! hidden(root)
-        && (! iframe.isConnected || ! hidden(iframe)));
+        && (! iframe.isConnected || visibleProvider(iframe)));
     function finishPendingClose () {
         if ( ! closePending || closeTimer !== null || portals.length || providerStillClosing() ) return;
         // Stripe restores scrolling in its hide routine and tab stops in queued
@@ -167,6 +171,10 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
     win.addEventListener('resize', refreshCompact);
     doc.addEventListener('keydown', onKey, true);
     doc.addEventListener('focusin', onFocus, true);
+    // A fade may start at opacity zero when its style mutation is delivered.
+    // Re-check ownership when CSS makes the provider visible without another mutation.
+    doc.addEventListener('transitionend', sync, true);
+    doc.addEventListener('animationend', sync, true);
     const observer = new win.MutationObserver(() => {
         if ( ! backdrop.isConnected || ! container.isConnected ) close();
         else sync();
@@ -196,6 +204,8 @@ export function openSheetFrame ({ container, title, role = 'billing-sheet', shee
         win.removeEventListener('resize', refreshCompact);
         doc.removeEventListener('keydown', onKey, true);
         doc.removeEventListener('focusin', onFocus, true);
+        doc.removeEventListener('transitionend', sync, true);
+        doc.removeEventListener('animationend', sync, true);
         provider = null;
         portals = [];
         try { dispose?.(); } finally {
