@@ -458,7 +458,7 @@ test('v3 plan picker: Free / Standard / Premium, Current plan disabled, ordered 
     assert.equal(current.textContent, 'Current plan'); assert.equal(current.disabled, true);
     assert.equal(current.closest('.ezil-billing-choice').dataset.plan, 'free_v3');
     const bullets = sku => [...h.doc.querySelectorAll(`.ezil-billing-choice[data-plan="${sku}"] li`)].map(li => li.textContent);
-    assert.deepEqual(bullets('free_v3'), ['Cloudflare computer · 2 vCPU · 6 GB memory', 'Your files saved with your computer', '100 AI credits to start', '5 hours of computer time each month']);
+    assert.deepEqual(bullets('free_v3'), ['Cloudflare computer · 2 vCPU · 6 GB memory', 'Your files saved with your computer', '10 AI credits to start', '5 hours of computer time each month']);
     assert.deepEqual(bullets('standard_monthly_v3'), ['Your own AWS computer · 2 vCPU · 8 GB', '50 GB disk for your projects', '200 AI credits every month', 'Your files are kept']);
     assert.match(h.q('.ezil-billing-choice[data-plan="premium_monthly_v3"]').textContent, /Everything in Standard, plus:/);
     assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] li').length, 12);

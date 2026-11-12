@@ -266,7 +266,7 @@ await check('Billing: three plan cards with configurations, storage and credits;
         assert.match(clean(current[0]), /Current plan/);
         assert.equal(current[0].querySelector('button, a.ezil-settings-btn'), null, 'no button on the current card');
         const [free, standard, premium] = cards.map(clean);
-        assert.match(free, /\$0/); assert.match(free, /2 vCPU · 6 GB/); assert.match(free, /Files saved between sessions/); assert.match(free, /100 AI credits to start/);
+        assert.match(free, /\$0/); assert.match(free, /2 vCPU · 6 GB/); assert.match(free, /Files saved between sessions/); assert.match(free, /10 AI credits to start/);
         assert.match(standard, /\$20/); assert.match(standard, /2 vCPU · 8 GB/); assert.match(standard, /50 GB disk/); assert.match(standard, /200 AI credits every month/);
         assert.match(premium, /\$100/); for ( const config of ['2 vCPU · 8 GB', '4 vCPU · 16 GB', '8 vCPU · 32 GB'] ) assert.ok(premium.includes(config), config);
         assert.match(premium, /100 GB disk/); assert.match(premium, /1,000 AI credits every month/);
