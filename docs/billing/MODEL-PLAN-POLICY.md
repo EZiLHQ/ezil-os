@@ -1,6 +1,6 @@
 # Model access by plan
 
-With billing metering enabled, Free keeps its three curated aliases. Standard (including paid legacy tiers) has the closed list in `app/src/shared/ai-model-policy.json`. Max/Premium includes all available Gateway models. The shared list also supplies the shell's exact model hints; a hint selects a dialog and never changes entitlement or confirms payment.
+With billing metering enabled, Free keeps its three curated aliases. Standard (including legacy Standard v2 and Pro v1) has the closed list in `app/src/shared/ai-model-policy.json`. Max/Premium includes all available Gateway models. The explicit legacy `compute_monthly_v2` SKU is Premium-equivalent in `v3/catalog.ts` and retains unrestricted model access while it has effective paid access; no entitlement is inferred from a price or arbitrary family. The shared list also supplies the shell's exact model hints; a hint selects a dialog and never changes entitlement or confirms payment.
 
 `gemini-4-argon` and `gpt-6-astra` require Max/Premium. The known future alias `gemini-4-carbon` is excluded from Standard without registering or enabling it. Claude Fable 5.2 has no confirmed alias in the reviewed source or staging catalogue, so this change does not invent one or substitute another Claude model. New aliases stay outside the closed Standard list until reviewed. An included alias does not enable a disabled Gateway registration.
 

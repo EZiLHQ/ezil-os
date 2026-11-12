@@ -13,9 +13,9 @@ export const FREE_AI_MODELS: readonly string[] = Object.freeze(['gemini-3.8-flas
 export const STANDARD_AI_MODELS: readonly string[] = Object.freeze([...modelPolicy.standardIncludedModels]);
 export const PREMIUM_ONLY_AI_MODELS: readonly string[] = Object.freeze([...modelPolicy.premiumOnlyModels]);
 
-/** The effective plan, including paid legacy tiers: only confirmed Max/Premium is unrestricted. */
+/** The effective plan: v3 Premium and its explicit legacy Compute equivalent are unrestricted. */
 export function aiIncludedModels(planSku: PlanSku | PlanSkuV3): readonly string[] | null {
-    if (planSku === 'premium_monthly_v3') return null;
+    if (planSku === 'premium_monthly_v3' || planSku === 'compute_monthly_v2') return null;
     if (planSku === 'standard_monthly_v3') return STANDARD_AI_MODELS;
     if (Object.hasOwn(CATALOG_V2, planSku)) return CATALOG_V2[planSku as PlanSku].family === 'free' ? FREE_AI_MODELS : STANDARD_AI_MODELS;
     return FREE_AI_MODELS;

@@ -63,13 +63,14 @@ describe('aiIncludedModels: Free includes a curated low-tier set (Flash first); 
         expect(new Set(FREE_AI_MODELS).size).toBe(FREE_AI_MODELS.length);
         for (const alias of FREE_AI_MODELS) expect(alias).toMatch(/^[a-z0-9][a-z0-9._-]{0,63}$/);
         for (const sku of ['free_v3', 'free_v2', 'free_v1_legacy'] as const) expect(aiIncludedModels(sku)).toBe(FREE_AI_MODELS);
-        for (const sku of ['standard_monthly_v3', 'standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1'] as const) {
+        for (const sku of ['standard_monthly_v3', 'standard_monthly_v2', 'pro_monthly_v1'] as const) {
             expect(aiIncludedModels(sku)).toBe(STANDARD_AI_MODELS);
         }
     });
 
     it('keeps Premium unrestricted and lower plans closed to protected and future aliases', () => {
         expect(aiIncludedModels('premium_monthly_v3')).toBeNull();
+        expect(aiIncludedModels('compute_monthly_v2')).toBeNull(); // exact v3/catalog.ts Premium equivalence, not price inference
         expect(aiIncludedModels('unknown' as Parameters<typeof aiIncludedModels>[0])).toBe(FREE_AI_MODELS);
         expect(STANDARD_AI_MODELS).toHaveLength(14);
         expect(new Set(STANDARD_AI_MODELS).size).toBe(14);
@@ -91,7 +92,9 @@ describe('aiIncludedModels: Free includes a curated low-tier set (Flash first); 
         ['Premium, paid this period', { subs: [subscription({ sku: 'premium_monthly_v3' })], grants: [grant({ amount: BigInt(1_800_000) })] }, null],
         ['operator-granted Standard (no Stripe)', { operator: [operatorGrant()] }, STANDARD_AI_MODELS],
         ['legacy Standard v2', { subs: [subscription({ sku: 'standard_monthly_v2' })], grants: [grant({ amount: BigInt(216_000) })] }, STANDARD_AI_MODELS],
-        ['legacy Compute v2', { subs: [subscription({ sku: 'compute_monthly_v2' })], grants: [grant({ amount: BigInt(216_000) })] }, STANDARD_AI_MODELS],
+        ['legacy Compute v2 (Premium equivalent)', { subs: [subscription({ sku: 'compute_monthly_v2' })], grants: [grant({ amount: BigInt(1_800_000) })] }, null],
+        ['legacy Compute cancelled (runs as Free)', { subs: [subscription({ sku: 'compute_monthly_v2', status: 'canceled' })] }, FREE_AI_MODELS],
+        ['legacy Compute past_due (runs as Free)', { subs: [subscription({ sku: 'compute_monthly_v2', status: 'past_due' })] }, FREE_AI_MODELS],
         ['legacy v2 past_due (runs as Free)', { subs: [subscription({ sku: 'standard_monthly_v2', status: 'past_due' })] }, FREE_AI_MODELS],
         ['Standard renewal unpaid, inside its seven-day grace', { subs: [renewal()], paymentIssues: [issue(ago(2 * DAY))] }, STANDARD_AI_MODELS],
         ['Standard renewal unpaid, grace ended (runs as Free)', { subs: [renewal()], paymentIssues: [issue(ago(7 * DAY))] }, FREE_AI_MODELS],
