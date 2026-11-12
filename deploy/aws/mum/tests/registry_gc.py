@@ -230,20 +230,20 @@ class RegistryGcTests(unittest.TestCase):
         self.refuse('identity absent')
 
     def test_invalid_registry(self):
-        # Thirty-one schema-valid records exceed the thirty-record capacity.
+        # Thirty-two schema-valid records exceed the thirty-one-record capacity.
         self.snapshot['deployment']['releases'] = self.records + [
-            dict(self.target, amiId='ami-' + format(n, '017x')) for n in range(100, 123)]
-        self.assertEqual(len(self.snapshot['deployment']['releases']), 31)
+            dict(self.target, amiId='ami-' + format(n, '017x')) for n in range(100, 124)]
+        self.assertEqual(len(self.snapshot['deployment']['releases']), 32)
         self.refuse('invalid registry')
 
-    def test_thirty_record_gc_removes_exactly_one_preserving_twenty_nine(self):
+    def test_thirty_one_record_gc_removes_exactly_one_preserving_thirty(self):
         self.records.extend([copy.deepcopy(self.target), *[
-            dict(self.target, amiId='ami-' + format(n, '017x')) for n in range(100, 121)]])
-        self.assertEqual(len(self.records), 30)
+            dict(self.target, amiId='ami-' + format(n, '017x')) for n in range(100, 122)]])
+        self.assertEqual(len(self.records), 31)
         self.evidence['registrySha256'] = gc.sha(self.records)
         before = copy.deepcopy(self.snapshot)
         after = self.prepare()
-        self.assertEqual(len(after['releases']), 29)
+        self.assertEqual(len(after['releases']), 30)
         self.assertEqual(after['releases'], self.records[:1] + self.records[2:])
         self.assertEqual(self.snapshot, before)
 

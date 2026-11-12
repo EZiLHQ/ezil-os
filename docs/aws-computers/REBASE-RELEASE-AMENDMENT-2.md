@@ -75,8 +75,8 @@ Every reviewed release (bake → plan → finalize → apply-* → promote → r
   The reverted Version resources may publish new version numbers. If so, the restored tuple must pin the version numbers that are actually published. That requires a new reviewed plan, not the old 1.0.5 plan, which B3 fences anyway.
 - After any 1.0.6 operation, every 1.0.5 plan operation refuses (B3), so the 1.0.5 rollback (app 279b2443, tuple 1.0.2) is unreachable.
 
-## B6. Thirty-record bounded registry capacity
+## B6. Thirty-one-record bounded registry capacity
 
-The app deployment reader and source resolver, secret editor and registry-GC reader accept at most 30 retained records. The 31st record fails closed before a secret write. Promotion and rollback retain all existing immutable records; this capacity change performs no garbage collection. The 65,536-byte deployment map and 24,000-byte public readback limits are unchanged.
+The app deployment reader and source resolver, secret editor and registry-GC reader accept at most 31 retained records. The 32nd record fails closed before a secret write. Promotion and rollback retain all existing immutable records; this capacity change performs no garbage collection. The 65,536-byte deployment map and 24,000-byte public readback limits are unchanged.
 
-A new normal target AMI adds a distinct `(lowerImageDigest, amiId)` record even when B1 reuses the deployed lower. Install the registry-compatible app through the reviewed `apply-app` receipt before promotion. A rollback retains that compatible app and all 30 records; an older 28- or 29-record app is not a valid binary fallback after the corresponding capacity is exceeded. Retained old AMIs, Lambda versions and workflow versions alone do not establish an operational fallback; the full identity and IAM tuple must also be reviewed.
+A new normal target AMI adds a distinct `(lowerImageDigest, amiId)` record even when B1 reuses the deployed lower. Install the registry-compatible app through the reviewed `apply-app` receipt before promotion. A rollback retains that compatible app and all 31 records; an older 30-record app is not a valid binary fallback after the corresponding capacity is exceeded. Retained old AMIs, Lambda versions and workflow versions alone do not establish an operational fallback; the full identity and IAM tuple must also be reviewed.
