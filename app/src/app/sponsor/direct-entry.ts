@@ -26,8 +26,11 @@ export async function directSponsorEntry(request: NextRequest, selection: Sponso
     if (request.method === 'GET') {
         const destination = request.headers.get('sec-fetch-dest');
         const mode = request.headers.get('sec-fetch-mode');
+        const purpose = `${request.headers.get('purpose') ?? ''};${request.headers.get('sec-purpose') ?? ''}`;
         // Public links are document navigations. Untrusted same-site previews cannot attribute via an image, frame or fetch.
-        if ((destination !== null ? destination !== 'document' : !(request.headers.get('accept') ?? '').includes('text/html'))
+        // Prerenders also claim document/navigate; never bind attribution or begin OAuth speculatively.
+        if (/\b(?:prefetch|prerender)\b/i.test(purpose)
+            || (destination !== null ? destination !== 'document' : !(request.headers.get('accept') ?? '').includes('text/html'))
             || (mode !== null && mode !== 'navigate')) return new NextResponse(null, { status: 403, headers: PRIVATE_HEADERS });
     }
     const origin = ownedPublicOrigin(request.headers, request.url);

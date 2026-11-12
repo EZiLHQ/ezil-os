@@ -67,3 +67,30 @@ it('native document navigation with real fetch metadata enters the direct flow',
     const r = await couponGet(new NextRequest(origin+'/sponsor/coupon?coupon=staging-qa', { headers: { 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate' } }));
     expect(r.status).toBe(303); expect(stub.authorize).toHaveBeenCalledWith({ origin, returnUrl: '/os?settings=billing', sponsorCoupon: 'staging-qa' });
 });
+
+
+it.each([
+    { 'sec-purpose': 'prefetch' }, { 'sec-purpose': 'prefetch;prerender' }, { 'sec-purpose': 'prerender' },
+    { purpose: 'prefetch' }, { purpose: 'PREFETCH' }, { purpose: 'prerender' },
+    { purpose: 'navigate', 'sec-purpose': 'prefetch;anonymous-client-ip' },
+] as Record<string, string>[])('speculative document request %j refuses both entry routes before every effect', async purpose => {
+    stub.user.mockResolvedValue({ data: { user: signedUser }, error: null });
+    const headers = { accept: 'text/html', 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate', ...purpose };
+    const coupon = await couponGet(new NextRequest(origin+'/sponsor/coupon?coupon=staging-qa', { headers }));
+    const opaque = await tokenGet(new NextRequest(origin+'/sponsor/'+token, { headers }), { params: Promise.resolve({ token }) });
+    expect(coupon.status).toBe(403); expect(opaque.status).toBe(403);
+    expect(stub.available).not.toHaveBeenCalled(); expect(stub.coupon).not.toHaveBeenCalled();
+    expect(stub.fromLink).not.toHaveBeenCalled(); expect(stub.fromCoupon).not.toHaveBeenCalled();
+    expect(stub.user).not.toHaveBeenCalled(); expect(stub.materialize).not.toHaveBeenCalled();
+    expect(stub.authorize).not.toHaveBeenCalled(); expect(stub.context).not.toHaveBeenCalled();
+    expect(coupon.headers.get('set-cookie')).toBeNull(); expect(opaque.headers.get('set-cookie')).toBeNull();
+});
+it('an ordinary signed-in user navigation still attributes once and keeps the existing account', async () => {
+    stub.user.mockResolvedValue({ data: { user: signedUser }, error: null });
+    const r = await couponGet(new NextRequest(origin+'/sponsor/coupon?coupon=staging-qa', { headers: {
+        accept: 'text/html', 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate', 'sec-fetch-user': '?1',
+    } }));
+    expect(r.status).toBe(303); expect(r.headers.get('location')).toBe(origin+'/os?settings=billing');
+    expect(stub.materialize).toHaveBeenCalledExactlyOnceWith({ userId: signedUser.id, verifiedSubject: 'auth0|fixture', metadata: signedUser.app_metadata, campaign });
+    expect(stub.authorize).not.toHaveBeenCalled();
+});
