@@ -186,6 +186,19 @@ async function interact(page, touch, src) {
     if ( touch ) await page.touchscreen.tap(box.x + box.width / 2, box.y + box.height / 2); else await frame.locator('#otp').click();
     return { frame, focused: await got(page, 'focus:otp') };
 }
+// The challenge removes its iframe in response to a physical Escape. Chromium
+// can leave that dispatch acknowledgment pending after the receiving frame dies.
+// Require the actual cancellation effect within the normal short timeout, then
+// release the key in the restored sheet; every focus/inert assertion still runs.
+async function escapeChallenge (page, id) {
+    let acknowledged = false;
+    const press = page.keyboard.press('Escape').then(() => { acknowledged = true; });
+    const removed = page.waitForFunction(() => !document.contains(window.__portal.root), null, { timeout: 2500 });
+    await Promise.race([press, removed]);
+    await removed;
+    if ( ! acknowledged ) await trace(id, 'escape-removal-observed-before-dispatch-ack');
+    await page.keyboard.up('Escape');
+}
 // BASELINE (the reproduction, run against the earlier source): ONE real challenge portal per viewport. The exact observed path, in a
 // dedicated body DIV preloaded hidden and then shown (Stripe's own sequence). The earlier source makes it inert, so it can never take
 // focus and a real click or tap cannot reach it. Every wait is explicit and short; this is not the fixed matrix.
@@ -252,7 +265,7 @@ try {
             assert.equal((await page.evaluate(() => window.snapshot())).active, 'portal', id + ': focus stays in the challenge while tabbing');
             // cancellation by Escape inside the challenge: the sheet stays open and everything is restored
             await trace(id, 'tabbed-before-escape');
-            await frame.locator('#otp').focus(); await trace(id, 'otp-focused'); await page.keyboard.press('Escape'); await trace(id, 'escape-pressed');
+            await frame.locator('#otp').focus(); await trace(id, 'otp-focused'); await escapeChallenge(page, id); await trace(id, 'escape-pressed');
             await page.waitForFunction(() => !document.contains(window.__portal.root));
             let restored = await page.evaluate(() => window.snapshot());
             assert.equal(restored.closed, false, id + ': Escape in the challenge did not close checkout');
