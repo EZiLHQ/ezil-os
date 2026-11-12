@@ -418,7 +418,8 @@ try {
             await until(() => hello.length === 1);
             const trusted = win.ezilFeedbackAppContext;
             assert.equal(trusted.computerId, A); assert.ok(Object.isFrozen(trusted));
-            assert.equal(listeners.size, before + 1);
+            // One feedback listener and one expired-auth recovery listener; both belong to this mint.
+            assert.equal(listeners.size, before + 2);
             assert.equal(hello[0].origin, 'https://mint-one.test');
             const post = (h, record, overrides = {}) => window.dispatchEvent(new window.MessageEvent('message', {
                 source: h.iframe.contentWindow, origin: h.origin,
@@ -430,7 +431,7 @@ try {
             minted = 'https://mint-two.test/bootstrap';
             window.dispatchEvent(new window.CustomEvent('ezil:desktop-restarted', { detail: { computerId: A } }));
             await until(() => hello.length === 2);
-            assert.equal(listeners.size, before + 1, 'old registration removed');
+            assert.equal(listeners.size, before + 2, 'both old mint registrations removed');
             assert.equal(win.ezilFeedbackAppContext, trusted, 'one session per window across mints');
             assert.equal(hello[1].origin, 'https://mint-two.test');
             assert.notEqual(hello[1].data.nonce, hello[0].data.nonce);
