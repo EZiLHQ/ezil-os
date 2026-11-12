@@ -824,7 +824,7 @@ async function load ($win, state) {
     // An Add credits request (the Usage tab's link, the Code recovery link) and a request from Code (a credit refusal
     // or a plan-locked model) are each consumed once, on whichever load first has a summary. A recovery
     // (`reason: insufficient_credits`, or a locked model) opens what this summary calls for: the Standard upgrade on
-    // Free, Add credits on a paid plan (`billingRecoveryAction`). A plain Add credits request opens the top-up dialog.
+    // Free, Max/Premium for a locked Premium-only model or Standard plan, and Add credits for paid credit exhaustion (`billingRecoveryAction`). A plain Add credits request opens the top-up dialog.
     // Either falls back to the AI credits row.
     const topup = state.summary ? state.openTopup : null;
     if ( topup ) state.openTopup = null;
@@ -890,7 +890,8 @@ function actionStatus ($win, copy) { $win.find('[data-role="billing-action-statu
 function recoveryRequest (value) {
     if ( ! value || typeof value !== 'object' || ! ['insufficient_credits', 'model_locked', 'window_limit'].includes(value.reason) ) return null;
     const requestId = typeof value.requestId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value.requestId) ? value.requestId : null;
-    if ( value.reason !== 'window_limit' ) return { reason: value.reason, requestId };
+    if ( value.reason !== 'window_limit' ) return { reason: value.reason, requestId,
+        ...(value.reason === 'model_locked' && typeof value.model === 'string' && /^[a-z0-9][a-z0-9._-]{0,63}$/.test(value.model) ? { model: value.model } : {}) };
     const resetsAt = typeof value.resetsAt === 'string' && /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$/.test(value.resetsAt) ? value.resetsAt : null;
     return { reason: value.reason, requestId, resetsAt };
 }
@@ -930,7 +931,7 @@ function openRecovery ($win, state, request) {
         windowLimitNote($win, request.resetsAt);
         return false;
     }
-    const choice = billingRecoveryAction(state.summary, request.reason);
+    const choice = billingRecoveryAction(state.summary, request.reason, request.model);
     // Correlation for support: Code's Gateway request id, never anything of the conversation.
     console.info('[billing] recovery', { reason: request.reason, requestId: request.requestId ?? null, action: choice?.action ?? null });
     if ( ! choice ) {

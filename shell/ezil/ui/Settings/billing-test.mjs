@@ -1491,9 +1491,8 @@ try {
     assert.equal(window.document.activeElement, q('#ai-credits h4'));
     pass('Add credits links (Usage, Code recovery deep link) open the top-up dialog directly, once, in this window');
 
-    // Founder 2026-11-09: Free includes Gemini 3.8 Flash only. Code's recovery (its link, or its request through the
-    // billing bridge) opens the Standard upgrade on Free and Add credits on a paid plan; a model refusal on a paid plan
-    // opens nothing. Each request opens once, never beside an open sheet, and Code's chat is never touched.
+    // Code recovery selects a live allowed plan offer: Standard for ordinary Free locks, Premium for known
+    // protected aliases and Standard locks, and Add credits for paid credit refusals. Each request opens once, never beside an open sheet, and Code's chat is never touched.
     {
         const freeWithTopup = () => { const s = summaryV3('free'); s.actions.topup = true; s.catalog.packs = packs; return s; };
         summary = freeWithTopup();
@@ -1507,9 +1506,10 @@ try {
             [() => { const s = summaryV3('premium'); s.actions.topup = true; s.catalog.packs = packs; return s; }, 'insufficient_credits', ['topup', undefined]],
             [() => { const s = summaryV3('premium'); s.actions.topup = true; s.catalog.packs = packs; return s; }, 'model_locked', null],
         ];
-        for ( const [make, reason, expected] of recoveryCases ) {
+        recoveryCases.push([() => summaryV3('standard'), 'model_locked', ['upgrade', undefined]], [freeWithTopup, 'model_locked', ['checkout', 'premium_monthly_v3'], 'gpt-6-astra']);
+        for ( const [make, reason, expected, model] of recoveryCases ) {
             summary = make(); before = sheets.length;
-            await open({ ...context, initialTab: 'billing', billingRecovery: { reason, requestId: '6f1d3a52-9b0e-4c1d-8a7b-2e5f4d3c2b1a' } });
+            await open({ ...context, initialTab: 'billing', billingRecovery: { reason, ...(model ? { model } : {}), requestId: '6f1d3a52-9b0e-4c1d-8a7b-2e5f4d3c2b1a' } });
             assert.equal(sheets.length - before, expected ? 1 : 0, `${summary.plan.sku} ${reason}`);
             if ( expected ) {
                 assert.deepEqual([sheets.at(-1).kind, sheets.at(-1).sku], expected, `${summary.plan.sku} ${reason}`);
@@ -1558,7 +1558,7 @@ try {
                 assert.ok(q('[data-pane="billing"] #ai-credits')?.contains(window.document.activeElement), `${at}: focus on the AI credits row`);
             }
         }
-        pass('Code recovery: Free gets the Standard upgrade, a paid plan Add credits, a paid model refusal nothing; once each, never doubled');
+        pass('Code recovery: Free gets the Standard upgrade, a paid plan Add credits, Premium model recovery opens the normal upgrade; once each, never doubled');
         pass('Code recovery: a used-up credit window opens no purchase on any plan; the AI credits row explains it, with its reset time');
     }
     // Round 5 (D6): no operator internals on the user surface, in any AI state.

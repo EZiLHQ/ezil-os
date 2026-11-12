@@ -1,0 +1,23 @@
+{
+  "premiumOnlyModels": [
+    "gemini-4-argon",
+    "gemini-4-carbon",
+    "gpt-6-astra"
+  ],
+  "standardIncludedModels": [
+    "gemini-3.8-flash",
+    "qwen.qwen3-coder-next",
+    "us.moonshotai.kimi-k3",
+    "claude-haiku-5-5",
+    "claude-opus-5-5",
+    "claude-sonnet-5-5",
+    "ezil-code",
+    "ezil-fast",
+    "gpt-6-luna",
+    "gpt-6-sol",
+    "gpt-6.1-sol",
+    "xai.grok-4.7",
+    "zai.glm-5",
+    "zai.glm-5.3"
+  ]
+}

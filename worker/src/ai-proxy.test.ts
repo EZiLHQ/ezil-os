@@ -5,6 +5,7 @@
  */
 
 import { describe, expect, it, spyOn } from 'bun:test';
+import modelPolicy from '../../app/src/shared/ai-model-policy.json';
 import {
   aiProxyBaseUrl,
   chooseAiCredential,
@@ -1471,4 +1472,36 @@ describe('signed receipt status is neither a grant nor wallet exhaustion', () =>
     expect(cancelled).toBe(true);
     expect(Date.now() - started).toBeLessThan(1000);
   });
+});
+
+it('the shared Standard policy replaces old all-model access and protected aliases stop before Gateway; Premium clears it', async () => {
+  const now = Date.now();
+  let clock = now;
+  let stored: { includedModels: readonly string[] | null; signedAt: number } = { includedModels: null, signedAt: now - 1000 };
+  let calls = 0;
+  const refresh = (models: readonly string[] | null | undefined) => {
+    const parsed = parsePushedModelAccess(models);
+    expect(parsed.ok).toBe(true);
+    if (parsed.ok && parsed.includedModels !== undefined) stored = { includedModels: parsed.includedModels, signedAt: now };
+  };
+  const infer = async (model: string) => handleAiProxyRequest(new Request(`${HOST}/ai/v1/messages`, {
+    method: 'POST', headers: { authorization: await proxyAuth(), 'content-type': 'application/json' },
+    body: JSON.stringify({ model, messages: [], max_tokens: 1 }),
+  }), await deps({ modelAccess: async () => currentModelAccess(stored, clock), now: () => clock,
+    fetch: async () => { calls++; return Response.json({ ok: true }); } }));
+  refresh(modelPolicy.standardIncludedModels);
+  for (const model of [...modelPolicy.premiumOnlyModels, 'unregistered-future-model']) {
+    const before = calls, result = await infer(model);
+    expect(result.status).toBe(403); expect((await result.json()).error.code).toBe('os_model_not_included'); expect(calls).toBe(before);
+  }
+  expect((await infer('gpt-6-sol')).status).toBe(200);
+  refresh(undefined); // a failed app plan read omits the update, never widening to null
+  expect((await infer('gpt-6-astra')).status).toBe(403);
+  refresh(null);
+  expect((await infer('gpt-6-astra')).status).toBe(200);
+  refresh(['gemini-3.8-flash', 'qwen.qwen3-coder-next', 'us.moonshotai.kimi-k3']);
+  for (const model of modelPolicy.premiumOnlyModels) expect((await infer(model)).status).toBe(403);
+  expect((await infer('gemini-3.8-flash')).status).toBe(200);
+  clock += AI_MODEL_ACCESS_MAX_AGE_MS + 1;
+  expect((await infer('gemini-3.8-flash')).status).toBe(503);
 });

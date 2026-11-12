@@ -34,7 +34,7 @@ await check('validate_billing_request: keeps exactly what the bridge posts for e
 await check('billing_recovery_context: a credit refusal asks for credits, a locked model for its plan, a credit window keeps its reset and never becomes a credit refusal', () => {
     const want = {
         credits_exhausted: e => ({ reason: 'insufficient_credits', ...(e.requestId ? { requestId: e.requestId } : {}) }),
-        model_locked: e => ({ reason: 'model_locked', ...(e.requestId ? { requestId: e.requestId } : {}) }),
+        model_locked: e => ({ reason: 'model_locked', ...(e.model ? { model: e.model } : {}), ...(e.requestId ? { requestId: e.requestId } : {}) }),
         window_limit: e => ({ reason: 'window_limit', ...(e.requestId ? { requestId: e.requestId } : {}), ...(e.resetsAt ? { resetsAt: e.resetsAt } : {}) }),
     };
     for (const { expect } of vectors.accept) assert.deepEqual(M.billing_recovery_context(expect), want[expect.reason](expect), JSON.stringify(expect));
@@ -116,4 +116,13 @@ try {
 } finally {
     window.close();
 }
+await check('Premium model hints are exact aliases and never subscription authority', () => {
+    for (const model of ['gemini-4-argon', 'gemini-4-carbon', 'gpt-6-astra']) {
+        assert.equal(M.modelRequiresPremium(model), true);
+        assert.deepEqual(M.billing_recovery_context({ reason: 'model_locked', model }), { reason: 'model_locked', model });
+    }
+    for (const model of ['claude-opus-5-5', 'gemini-3.8-flash', 'Fable5.2', 'GEMINI-4-ARGON', null]) assert.equal(M.modelRequiresPremium(model), false);
+    assert.deepEqual(M.billing_recovery_context({ reason: 'credits_exhausted', model: 'gpt-6-astra' }), { reason: 'insufficient_credits' });
+    assert.deepEqual(M.billing_recovery_context({ reason: 'model_locked', model: 'a/b' }), { reason: 'model_locked' });
+});
 console.log(`${checks}/${checks} billing recovery checks passed (synthetic)`);

@@ -414,6 +414,7 @@ test('v3 upgrade shows the round-3 bullets, prorated price, what happens next, e
     assert.match(h.text(), /RenewsNov 1, 2026, with the full monthly credits\./);
     assert.match(h.text(), /Due now \$12/); assert.doesNotMatch(h.text(), /standard-hour|\bcompute\b/i);
     assert.deepEqual(h.calls[0].input, { toSku: 'premium_monthly_v3' });
+    assert.deepEqual(h.calls.map(call => call.method), ['billing.previewUpgrade'], 'opening the paid Premium recovery only previews; confirmation requires the explicit button');
     assert.equal(h.doc.querySelectorAll('[data-role="sheet-body"] button').length, 1);
     h.click('[data-action="confirm"]'); await settle();
     assert.match(h.text(), /Payments are unavailable/); assert.equal(h.q('[data-action="confirm"]').disabled, false);
