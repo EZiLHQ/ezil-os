@@ -3,7 +3,7 @@ import 'server-only';
 import { createHmac, hkdfSync, randomBytes, timingSafeEqual } from 'node:crypto';
 import { cookies } from 'next/headers';
 
-import { loginSponsorContext, sponsorFromLink, sponsorFromTransaction } from './sponsor';
+import { loginSponsorContext, sponsorFromCoupon, sponsorFromLink, sponsorFromTransaction } from './sponsor';
 
 import { safeReturnUrl } from '@/utils/constants';
 
@@ -59,7 +59,7 @@ export const SILENT_LOGIN_FALLBACK_ERRORS: ReadonlySet<string> = new Set(['login
  * `prompt: 'none'` is the silent re-auth that refreshes the retained ID token (`./retained-identity.ts`) after it
  * expired or a restart emptied the vault. It rides on the id.ezil.work single sign-on session and shows no UI.
  */
-export async function buildAuthorizeUrl({ origin, returnUrl, prompt, sponsorToken }: { origin: string; returnUrl?: string | null; prompt?: 'none'; sponsorToken?: string }) {
+export async function buildAuthorizeUrl({ origin, returnUrl, prompt, sponsorToken, sponsorCoupon }: { origin: string; returnUrl?: string | null; prompt?: 'none'; sponsorToken?: string; sponsorCoupon?: string }) {
     const { clientId } = config();
     const transaction: Transaction = {
         state: randomBytes(32).toString('base64url'),
@@ -69,8 +69,9 @@ export async function buildAuthorizeUrl({ origin, returnUrl, prompt, sponsorToke
         expiresAt: Date.now() + TEN_MINUTES,
         ...(prompt === 'none' ? { silent: true as const } : {}),
     };
-    if (sponsorToken !== undefined) {
-        const campaign = sponsorFromLink(sponsorToken);
+    if (sponsorToken !== undefined && sponsorCoupon !== undefined) throw new Auth0Error('invalid_transaction');
+    if (sponsorToken !== undefined || sponsorCoupon !== undefined) {
+        const campaign = sponsorToken !== undefined ? sponsorFromLink(sponsorToken) : sponsorFromCoupon(sponsorCoupon);
         if (!campaign || prompt === 'none') throw new Auth0Error('invalid_transaction');
         transaction.sponsorOrigin = new URL(origin).origin;
         transaction.sponsor = loginSponsorContext(campaign, transaction.sponsorOrigin, transaction.state, transaction.nonce);

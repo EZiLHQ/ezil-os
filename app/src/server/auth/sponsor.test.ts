@@ -4,7 +4,7 @@ const stub = vi.hoisted(() => ({ record: vi.fn(), db: {} }));
 vi.mock('@/server/db', () => ({ db: stub.db }));
 vi.mock('./sponsor-attribution', () => ({ recordSponsorAttribution: stub.record }));
 import { hashSponsorToken, signSponsorRegistry } from '@/server/billing/v3/sponsor';
-import { loginSponsorContext, materializeSponsorAttribution, sponsorCreationHint, sponsorFromCreationHint, sponsorFromLink, sponsorFromTransaction, SPONSOR_CREATION_METADATA } from './sponsor';
+import { loginSponsorContext, materializeSponsorAttribution, sponsorCreationHint, sponsorFromCreationHint, sponsorFromCoupon, sponsorFromLink, sponsorFromTransaction, SPONSOR_CREATION_METADATA } from './sponsor';
 
 const key = 'synthetic-sponsor-key-'.repeat(3);
 const token = 't'.repeat(43), nonce = 'n'.repeat(43), origin = 'https://os-staging.ezil.work';
@@ -110,5 +110,28 @@ describe('sponsor auth authority', () => {
         await expect(materializeSponsorAttribution(input)).rejects.toThrow('SQL unavailable');
         await materializeSponsorAttribution(input);
         expect(stub.record.mock.calls[0][1]).toEqual(stub.record.mock.calls[1][1]);
+    });
+});
+
+describe('signed-registry public partner aliases', () => {
+    it('resolves the registered partner only, without recovering or exposing the opaque token', () => {
+        vi.stubEnv('BILLING_PUBLIC_STANDARD_TRIAL', '0');
+        expect(sponsorFromCoupon(entry.partnerId)).toEqual(sponsorFromLink(token));
+        for (const bad of [entry.campaignId, token, 'unregistered', 'FIXTURE-PARTNER', '../fixture-partner', 'x'.repeat(65), '', undefined]) expect(sponsorFromCoupon(bad)).toBeNull();
+    });
+    it('fails closed for disabled runtime, tampered registry, disabled, expired and not-yet-started campaigns', () => {
+        vi.stubEnv('SPONSOR_TRIALS_ENABLED', '0'); expect(sponsorFromCoupon(entry.partnerId)).toBeNull();
+        vi.stubEnv('SPONSOR_TRIALS_ENABLED', '1'); vi.stubEnv('SPONSOR_REGISTRY_SIG', 'bad'); expect(sponsorFromCoupon(entry.partnerId)).toBeNull();
+        registry({ ...entry, enabled: false }); expect(sponsorFromCoupon(entry.partnerId)).toBeNull();
+        registry({ ...entry, expiresAt: '2026-11-10T00:00:00Z' }); expect(sponsorFromCoupon(entry.partnerId)).toBeNull();
+        registry({ ...entry, startsAt: '2026-11-12T00:00:00Z' }); expect(sponsorFromCoupon(entry.partnerId)).toBeNull();
+    });
+    it('does not guess between two campaigns for the same partner, even if one is disabled', () => {
+        for (const enabled of [true, false]) {
+            const document = JSON.stringify({ v: 1, campaigns: [entry, { ...entry, campaignId: 'other-campaign', enabled, tokenSha256: hashSponsorToken('x'.repeat(43)) }] });
+            vi.stubEnv('SPONSOR_REGISTRY', document); vi.stubEnv('SPONSOR_REGISTRY_SIG', signSponsorRegistry(document, key));
+            expect(sponsorFromCoupon(entry.partnerId)).toBeNull();
+            expect(sponsorFromLink(token)?.campaignId).toBe(entry.campaignId);
+        }
     });
 });

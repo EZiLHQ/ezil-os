@@ -3,13 +3,20 @@ import 'server-only';
 import { randomBytes } from 'node:crypto';
 import type { SqlRunner } from '@/server/billing/v3/sponsor-store';
 import { readSponsorRuntime } from '@/server/billing/v3/sponsor-runtime';
-import { authorizeSponsorQuote, campaignActive, resolveByToken, signSponsorContext, verifySponsorContext, type SponsorCampaign } from '@/server/billing/v3/sponsor';
+import { authorizeSponsorQuote, campaignActive, resolveByPartnerId, resolveByToken, signSponsorContext, verifySponsorContext, type SponsorCampaign } from '@/server/billing/v3/sponsor';
 
 /** No token, signed context or provider identity is logged. */
 export function sponsorFromLink(token: string | undefined, now = new Date()): SponsorCampaign | null {
     if (!token || !/^[A-Za-z0-9_-]{43,128}$/.test(token)) return null;
     const runtime = readSponsorRuntime();
     const campaign = runtime.enabled ? resolveByToken(runtime.registry, token) : null;
+    return campaign && campaignActive(campaign, now) ? campaign : null;
+}
+/** A friendly alias is resolved from the signed registry; opaque token hashes are never reversed or disclosed. */
+export function sponsorFromCoupon(coupon: string | undefined, now = new Date()): SponsorCampaign | null {
+    if (!coupon || !/^[a-z0-9][a-z0-9_-]{2,63}$/.test(coupon)) return null;
+    const runtime = readSponsorRuntime();
+    const campaign = runtime.enabled ? resolveByPartnerId(runtime.registry, coupon) : null;
     return campaign && campaignActive(campaign, now) ? campaign : null;
 }
 export function loginSponsorContext(campaign: SponsorCampaign, origin: string, state: string, nonce: string): string {

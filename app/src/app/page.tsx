@@ -1,4 +1,5 @@
 import { redirect } from 'next/navigation';
+import { sponsorCouponEntryPath } from '@/server/auth/sponsor-entry-input';
 
 import { Routes } from '@/utils/constants';
 import { createClient } from '@/utils/supabase/server';
@@ -27,7 +28,9 @@ import { createClient } from '@/utils/supabase/server';
  * `/computers` remains reachable as the escape hatch from `/os` and
  * `/computer/[id]`, just no longer the default landing spot for `/`.
  */
-export default async function HomePage() {
+export default async function HomePage({ searchParams }: { searchParams?: Promise<Record<string, string | string[] | undefined>> } = {}) {
+    const params = await searchParams;
+    if (params && Object.prototype.hasOwnProperty.call(params, 'coupon')) redirect(sponsorCouponEntryPath(params.coupon, Object.prototype.hasOwnProperty.call(params, 'token')));
     const supabase = await createClient();
     const {
         data: { user },
