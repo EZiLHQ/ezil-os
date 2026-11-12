@@ -445,6 +445,8 @@ export interface StripePackApi {
 }
 
 export interface StripeApi extends StripePackApi {
+    /** Fresh Stripe Product control; no cache. Missing adapters fail closed, never enable from an env default. */
+    publicStandardTrialEnabled?(): Promise<boolean>;
     previewRenewal?(subscriptionId: string): Promise<{ at: Date; amountCents: number } | null>;
     resolvePrice(lookupKey: string): Promise<StripePrice>;
     previewUpgrade(input: { subscriptionId: string; toSku: 'compute_monthly_v2' | 'premium_monthly_v3'; prorationDate: number }): Promise<StripeUpgradePreview>;

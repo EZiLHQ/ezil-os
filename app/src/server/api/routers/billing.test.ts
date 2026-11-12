@@ -141,6 +141,7 @@ function fixture() {
         closeStaleIntervals: vi.fn(async () => 0),
     } satisfies BillingStore;
     const stripe = {
+        publicStandardTrialEnabled: vi.fn<NonNullable<StripeApi['publicStandardTrialEnabled']>>().mockResolvedValue(true),
         listProducts: vi.fn<StripeApi['listProducts']>().mockResolvedValue([packProduct]),
         retrieveProduct: vi.fn<StripeApi['retrieveProduct']>().mockResolvedValue(packProduct),
         retrievePackPrice: vi.fn<StripeApi['retrievePackPrice']>().mockResolvedValue(packPrice),
@@ -2199,6 +2200,30 @@ describe('Standard trial router', () => {
         expect(summary).toMatchObject({ enabled: true });
         expect((summary as { trialOffer?: unknown }).trialOffer).toBeNull();
     });
+    it('Stripe off withdraws an unstarted public quote at checkout; the old env cannot enable or disable it', async () => {
+        const f = trialFixture();
+        f.deps.sponsor = readSponsorRuntime({ BILLING_PUBLIC_STANDARD_TRIAL: '0' });
+        await expect(f.caller.quoteTrial()).resolves.toMatchObject({ sku });
+        expect(await f.caller.summary()).toMatchObject({ trialOffer: { eligible: true, source: 'public' } });
+        f.stripe.publicStandardTrialEnabled.mockResolvedValue(false);
+        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } })).rejects.toMatchObject({ message: 'trial_unavailable' });
+        expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        expect((await f.caller.summary() as { trialOffer?: unknown }).trialOffer).toBeUndefined();
+    });
+    it('unreadable or absent provider control never grants; summary stays truthful and checkout remains mutation-free', async () => {
+        const f = trialFixture({ own: quoted() });
+        f.stripe.publicStandardTrialEnabled.mockRejectedValue(new Error('Stripe unavailable'));
+        expect((await f.caller.summary() as { trialOffer?: unknown }).trialOffer).toBeNull();
+        await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'stripe_unavailable' });
+        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } })).rejects.toMatchObject({ message: 'stripe_unavailable' });
+        expect(f.trial.claimTrialQuote).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        const g = trialFixture();
+        Object.assign(g.stripe, { publicStandardTrialEnabled: undefined });
+        await expect(g.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_unavailable' });
+    });
+
 });
 
 
@@ -2218,9 +2243,10 @@ describe('Sponsor trial router (same Standard trial, never a second grant)', () 
     const quoted = (): Own => ({ id: TRIAL_ID, userId, authSubject: `supabase:${userId}`, emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted',
         quotedAt, trialEnd, checkoutSessionId: null, stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null, returnOrigin: 'https://os.ezil.work' });
     function build(options: { env?: Record<string, string | undefined> | null; attribution?: { campaignId: string } | null; linkage?: { campaignId: string; configSha256: string; claimed: boolean } | null;
-        own?: Own | null; withSponsorMethods?: boolean } = {}) {
+        own?: Own | null; withSponsorMethods?: boolean; publicTrialEnabled?: boolean } = {}) {
         const f = fixture();
         let own: Own | null = options.own ?? null;
+        f.stripe.publicStandardTrialEnabled.mockResolvedValue(options.publicTrialEnabled ?? true);
         const trial = {
             trialFacts: vi.fn(async () => ({ emailNormalized: 'fixture@example.org', emailVerified: true, authSubject: `supabase:${userId}`, own, claimedElsewhere: false, paidBefore: false })),
             claimTrialQuote: vi.fn(async (input: { quotedAt: Date; trialEnd: Date; authSubject: string; emailNormalized: string; returnOrigin: string }) => {
@@ -2240,8 +2266,26 @@ describe('Sponsor trial router (same Standard trial, never a second grant)', () 
     const co = (f: ReturnType<typeof build>) => f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } });
     const hashOf = (f: ReturnType<typeof build>) => f.deps.sponsor!.registry.get('test-campaign-a')!.configSha256;
 
+    it('a validated sponsor has priority with public ON and OFF, including clear ineligibility on an existing plan', async () => {
+        for (const publicTrialEnabled of [true, false]) {
+            const f = build({ publicTrialEnabled, env: runtimeEnv([campaign()]), attribution: { campaignId: 'test-campaign-a' } });
+            expect(await f.caller.summary()).toMatchObject({ trialOffer: { eligible: true, source: 'sponsor', partnerId: 'test-partner-a' } });
+            await f.caller.quoteTrial();
+            expect(f.trial.claimTrialQuote.mock.calls[0]![0]).toHaveProperty('sponsor');
+            expect(f.stripe.publicStandardTrialEnabled).not.toHaveBeenCalled();
+            f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'standard_monthly_v3' })]);
+            expect(await f.caller.summary()).toMatchObject({ trialOffer: { eligible: false, reason: 'not_free', source: 'sponsor', partnerId: 'test-partner-a' } });
+        }
+    });
+    it('a newly attributed promoter requires re-quoting an older public quote instead of losing its tracking under the same Stripe key', async () => {
+        const f = build({ env: runtimeEnv([campaign()]), attribution: { campaignId: 'test-campaign-a' }, own: quoted() });
+        await expect(co(f)).rejects.toMatchObject({ message: 'trial_quote_stale' });
+        expect(f.stripe.publicStandardTrialEnabled).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
     it('a valid sponsor works while the PUBLIC trial is off: the quote carries the server-derived campaign, never a client field', async () => {
-        const f = build({ env: runtimeEnv([campaign()], { BILLING_PUBLIC_STANDARD_TRIAL: '0' }), attribution: { campaignId: 'test-campaign-a' } });
+        const f = build({ publicTrialEnabled: false, env: runtimeEnv([campaign()], { BILLING_PUBLIC_STANDARD_TRIAL: '0' }), attribution: { campaignId: 'test-campaign-a' } });
         await expect(f.caller.quoteTrial()).resolves.toMatchObject({ sku, todayCents: 0 });
         const input = f.trial.claimTrialQuote.mock.calls[0]![0] as { sponsor?: Record<string, string>; publicSponsorMode?: string };
         expect(input.sponsor).toEqual({ accountKey: f.deps.sponsor!.accountKey(userId), campaignId: 'test-campaign-a', partnerId: 'test-partner-a', configSha256: hashOf(f) });
@@ -2250,15 +2294,15 @@ describe('Sponsor trial router (same Standard trial, never a second grant)', () 
         await expect(f.caller.quoteTrial({ sponsor: 'test-campaign-b' } as never)).rejects.toThrow();   // no client input is accepted
     });
 
-    it('with the public trial off and no valid sponsor, quote and checkout refuse before any claim or Stripe call, and the offer is absent', async () => {
-        for (const f of [build({ env: runtimeEnv([campaign()], { BILLING_PUBLIC_STANDARD_TRIAL: '0' }) }),
-            build({ env: runtimeEnv([campaign({ enabled: false })], { BILLING_PUBLIC_STANDARD_TRIAL: '0' }), attribution: { campaignId: 'test-campaign-a' } }),
-            build({ env: { BILLING_PUBLIC_STANDARD_TRIAL: '0' } })]) {
+    it('with the public trial off and no valid sponsor, quote and checkout refuse before any claim or Checkout mutation, and the offer is absent', async () => {
+        for (const f of [build({ publicTrialEnabled: false, env: runtimeEnv([campaign()], { BILLING_PUBLIC_STANDARD_TRIAL: '0' }) }),
+            build({ publicTrialEnabled: false, env: runtimeEnv([campaign({ enabled: false })], { BILLING_PUBLIC_STANDARD_TRIAL: '0' }), attribution: { campaignId: 'test-campaign-a' } }),
+            build({ publicTrialEnabled: false, env: { BILLING_PUBLIC_STANDARD_TRIAL: '0' } })]) {
             await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_unavailable' });
             expect(f.trial.claimTrialQuote).not.toHaveBeenCalled();
             expect((await f.caller.summary() as { trialOffer?: unknown }).trialOffer).toBeUndefined();
         }
-        const g = build({ env: { BILLING_PUBLIC_STANDARD_TRIAL: '0' }, own: quoted() });
+        const g = build({ publicTrialEnabled: false, env: { BILLING_PUBLIC_STANDARD_TRIAL: '0' }, own: quoted() });
         await expect(co(g)).rejects.toMatchObject({ message: 'trial_unavailable' });
         expect(g.stripe.createCheckoutSession).not.toHaveBeenCalled();
     });
@@ -2315,7 +2359,7 @@ describe('Sponsor trial router (same Standard trial, never a second grant)', () 
     });
 
     it('global checkout off is unchanged and independent: a valid sponsor does not turn checkout on', async () => {
-        const f = build({ env: runtimeEnv([campaign()], { BILLING_PUBLIC_STANDARD_TRIAL: '0' }), attribution: { campaignId: 'test-campaign-a' }, own: quoted() });
+        const f = build({ publicTrialEnabled: false, env: runtimeEnv([campaign()], { BILLING_PUBLIC_STANDARD_TRIAL: '0' }), attribution: { campaignId: 'test-campaign-a' }, own: quoted() });
         f.deps.stripe = null;
         await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'billing_not_configured' });
         expect(f.trial.claimTrialQuote).not.toHaveBeenCalled();

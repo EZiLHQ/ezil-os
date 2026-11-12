@@ -513,7 +513,8 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
             portal: enabled && !operator && input.hasCustomer,
             ezilId: enrollment === 'needs_ezil_id' ? input.enrollment?.ezilIdUrl ?? null : null },
         // Round 6 (R1-06): the Free offer says the hours this account gets on Free (legacy 8 h today).
-        ...(input.trialOffer !== undefined && enabled && plan.family === 'free' ? { trialOffer: input.trialOffer } : {}),
+        ...(input.trialOffer !== undefined && enabled && (plan.family === 'free'
+            || (input.trialOffer?.source === 'sponsor' && !input.trialOffer.eligible)) ? { trialOffer: input.trialOffer } : {}),
         catalog: { version: CATALOG_V3_VERSION, offers: publicOffers({ legacyFree: plan.legacyFree }),
             packs: (input.packs ?? []).filter(aiPackCheckoutEligible).map(({ sku, aiCredits, creditCents, discountPercent, totalCents }) => ({
                 sku, aiCredits, creditCents, discountPercent, totalCents, currency: 'usd' })),

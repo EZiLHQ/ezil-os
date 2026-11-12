@@ -1249,3 +1249,46 @@ it('never infers a v3 subscription from metadata without a v3 line', async () =>
         metadata: { sku: 'premium_monthly_v3' }, items: { data: [{ price: { id: 'price_unknown', lookup_key: 'unknown' } }] } });
     expect((await client.retrieveSubscription('sub_v3')).sku).toBeNull();
 });
+
+describe('fresh public Standard trial control', () => {
+    const controlPrice = (on: string | null, live = false) => ({ id: 'price_standard', lookup_key: 'ezil_standard_monthly_v3',
+        active: true, livemode: live, type: 'recurring', unit_amount: 2000, currency: 'usd', recurring: { interval: 'month', interval_count: 1 },
+        product: { id: 'prod_standard', active: true, livemode: live, metadata: on === null ? {} : { ezil_public_standard_trial: on } } });
+    const page = (on: string | null, live = false) => ({ data: [controlPrice(on, live)], has_more: false });
+    it('reads the canonical expanded Product on every call, independently of the merchant Price cache', async () => {
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json(page(null)))
+            .mockResolvedValueOnce(Response.json(page('true'))).mockResolvedValueOnce(Response.json(page('false')));
+        const client = createStripeClient({ secretKey, fetch: fetcher });
+        await client.resolvePrice('ezil_standard_monthly_v3');
+        expect(await client.publicStandardTrialEnabled!()).toBe(true);
+        expect(await client.publicStandardTrialEnabled!()).toBe(false);
+        expect(fetcher).toHaveBeenCalledTimes(3);
+        const url = new URL(String(fetcher.mock.calls[1]![0]));
+        expect(url.searchParams.get('lookup_keys[]')).toBe('ezil_standard_monthly_v3');
+        expect(url.searchParams.get('expand[]')).toBe('data.product');
+        expect(url.searchParams.get('limit')).toBe('2');
+        expect(fetcher.mock.calls.every(([, options]) => (options?.method ?? 'GET') === 'GET')).toBe(true);
+    });
+    it('never uses a last-good enabled value after a provider failure', async () => {
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json(page('true')))
+            .mockResolvedValueOnce(Response.json({ error: { message: 'unavailable' } }, { status: 503 }))
+            .mockResolvedValueOnce(Response.json(page('false')));
+        const client = createStripeClient({ secretKey, fetch: fetcher });
+        expect(await client.publicStandardTrialEnabled!()).toBe(true);
+        await expect(client.publicStandardTrialEnabled!()).rejects.toMatchObject({ status: 503 });
+        expect(await client.publicStandardTrialEnabled!()).toBe(false);
+    });
+    it.each(['sk_test_control', 'rk_test_control', 'sk_live_control', 'rk_live_control'])('binds %s mode and accepts restricted keys', async key => {
+        const live = key.includes('_live_');
+        const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json(page('true', live)))
+            .mockResolvedValueOnce(Response.json(page('true', !live)));
+        const client = createStripeClient({ secretKey: key, fetch: fetcher });
+        expect(await client.publicStandardTrialEnabled!()).toBe(true);
+        expect(await client.publicStandardTrialEnabled!()).toBe(false);
+    });
+    it('an unrecognized key cannot fabricate an offer or send a provider request', async () => {
+        const fetcher = vi.fn<typeof fetch>();
+        expect(await createStripeClient({ secretKey: 'not_a_key', fetch: fetcher }).publicStandardTrialEnabled!()).toBe(false);
+        expect(fetcher).not.toHaveBeenCalled();
+    });
+});

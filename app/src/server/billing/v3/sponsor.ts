@@ -83,7 +83,7 @@ export function signSponsorRegistry(document: string, key: string): string {
 }
 
 export const sponsorTrialsEnabled = (env: { SPONSOR_TRIALS_ENABLED?: string | undefined }): boolean => env.SPONSOR_TRIALS_ENABLED === '1';
-/** The public trial offer is its own gate. Absent = on, so today's behaviour is unchanged; only an explicit "0" turns it off. */
+/** @deprecated Legacy flag parser only. Billing offer authority is fresh Stripe Product metadata, not this value. */
 export const publicTrialEnabled = (env: { BILLING_PUBLIC_STANDARD_TRIAL?: string | undefined }): boolean => env.BILLING_PUBLIC_STANDARD_TRIAL !== '0';
 
 export function campaignActive(campaign: SponsorCampaign, now: Date): boolean {

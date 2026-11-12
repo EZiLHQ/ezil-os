@@ -155,19 +155,25 @@ async function sponsorEntryFor(store: TrialStore, deps: BillingDeps, userId: str
     const decision = authorizeSponsorQuote({ enabled: true, registry: runtime.registry, campaignId: attribution.campaignId, configSha256: null, now: deps.now() });
     return decision.ok ? { input: { accountKey, campaignId: decision.campaign.campaignId, partnerId: decision.campaign.partnerId, configSha256: decision.campaign.configSha256 } } : null;
 }
-/** The public trial gate (BILLING_PUBLIC_STANDARD_TRIAL, absent = on) is independent of a valid sponsor entry; neither one turns global checkout on or off. */
-const publicTrialOpen = (deps: BillingDeps): boolean => deps.sponsor?.publicTrial ?? true;
+/** Stripe Product metadata is authoritative; the legacy environment flag never overrides it. */
+async function publicTrialOpen(deps: BillingDeps): Promise<boolean> {
+    return deps.stripe?.publicStandardTrialEnabled ? deps.stripe.publicStandardTrialEnabled() : false;
+}
 
 async function trialOfferFor(deps: BillingDeps, userId: string, planFamily: string): Promise<BillingSummaryV3['trialOffer']> {
-    if (!hasTrials(deps.store) || planFamily !== 'free') return undefined;
-    if (!publicTrialOpen(deps) && !await sponsorEntryFor(deps.store, deps, userId).catch(() => null)) return undefined;
+    if (!hasTrials(deps.store)) return undefined;
     try {
+        // A validated account attribution wins even while the public Product switch is off or unreadable.
+        const sponsor = await sponsorEntryFor(deps.store, deps, userId);
+        if (!sponsor && planFamily !== 'free') return undefined;
+        if (!sponsor && !await publicTrialOpen(deps)) return undefined;
+        const selection = sponsor ? { source: 'sponsor' as const, partnerId: sponsor.input.partnerId } : { source: 'public' as const };
         const { decision } = await trialEligibilityFor(deps.store, deps, userId, planFamily);
-        if (!decision.eligible) return { eligible: false, reason: decision.reason };
+        if (!decision.eligible) return { eligible: false, reason: decision.reason, ...selection };
         const terms = trialTerms(deps.now());
-        return { eligible: true, sku: TRIAL_SKU, endsAt: isoSeconds(epochSeconds(terms.trialEnd)), amountCents: terms.amountCents, currency: 'usd' };
+        return { eligible: true, sku: TRIAL_SKU, endsAt: isoSeconds(epochSeconds(terms.trialEnd)), amountCents: terms.amountCents, currency: 'usd', ...selection };
     } catch {
-        // Billing stays readable without the trial tables (0021 not applied yet): no offer, never a guessed one.
+        // Missing tables or an unreadable provider are unknown, never a guessed public offer.
         console.error('Billing trial offer unavailable');
         return null;
     }
@@ -665,7 +671,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const { facts, decision } = await trialEligibilityFor(store, deps, ctx.user.id, plan.family);
             if (!decision.eligible || facts.emailNormalized === null) throw trialError('trial_unavailable');
             const sponsor = await sponsorEntryFor(store, deps, ctx.user.id);
-            if (!publicTrialOpen(deps) && !sponsor) throw trialError('trial_unavailable');
+            if (!sponsor && !await stripeCall(() => publicTrialOpen(deps))) throw trialError('trial_unavailable');
             if (facts.own?.status === 'checkout') await retireTrialCheckout(stripe, facts.own.checkoutSessionId);
             const terms = trialTerms(deps.now());
             const claim = await store.claimTrialQuote({ userId: ctx.user.id, authSubject: facts.authSubject,
@@ -711,7 +717,12 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                         configSha256: linkage.configSha256, now: deps.now() });
                     if (!authorized.ok) throw trialError(authorized.reason === 'config_changed' ? 'trial_quote_stale' : 'trial_unavailable');
                     sponsorTerms = { campaignId: linkage.campaignId, configSha256: linkage.configSha256 };
-                } else if (!publicTrialOpen(deps)) throw trialError('trial_unavailable');
+                } else {
+                    // A newly selected promoter cannot be silently ignored under an older public quote's
+                    // Stripe idempotency key. Re-quote once to persist its authoritative sponsor linkage.
+                    if (await sponsorEntryFor(store, deps, ctx.user.id)) throw trialError('trial_quote_stale');
+                    if (!await stripeCall(() => publicTrialOpen(deps))) throw trialError('trial_unavailable');
+                }
                 if (!row || !['quoted', 'checkout'].includes(row.status) || !quoteFresh(row, deps.now())
                     || epochSeconds(row.trialEnd) !== epochSeconds(input.trial.trialEndsAt)
                     // The quote must still claim the caller's CURRENT verified identity; a re-quote moves the claim.

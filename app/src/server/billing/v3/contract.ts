@@ -315,12 +315,13 @@ export interface BillingSummaryV3 {
             firstChargeAt: string | null; amountCents: number; currency: 'usd' };
     };
     /**
-     * Standard trial offer (additive; only while checkout is available and the viewer is on Free). `eligible` carries
+     * Standard trial offer (additive; checkout available, Free or an ineligible selected promoter). `eligible` carries
      * the server's preview of the end if a trial started now; the exact end is quoted by `billing.quoteTrial` and
      * disclosed before checkout. `eligible: false` names why (a trial used, an earlier paid plan, an unverified email).
      */
-    trialOffer?: { eligible: true; sku: 'standard_monthly_v3'; endsAt: string; amountCents: number; currency: 'usd' }
-        | { eligible: false; reason: 'not_free' | 'operator_plan' | 'no_email' | 'email_unverified' | 'trial_used' | 'paid_before' }
+    trialOffer?: ({ eligible: true; sku: 'standard_monthly_v3'; endsAt: string; amountCents: number; currency: 'usd' }
+        | { eligible: false; reason: 'not_free' | 'operator_plan' | 'no_email' | 'email_unverified' | 'trial_used' | 'paid_before' })
+        & { source?: 'public' | 'sponsor'; partnerId?: string }
         | null;
     computer: {
         /** The size the next session opens with (the chosen size on Premium). */
