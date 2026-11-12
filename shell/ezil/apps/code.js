@@ -1,3 +1,4 @@
+import { attachCodeAuthRecovery } from './code-auth-recovery.js';
 import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../native-runtime.js';
 // code.js — EZiL-authored. Not Puter code.
 //
@@ -651,6 +652,7 @@ export async function openCodeWindow (ctx = {}) {
     el_window.ezilFeedbackAppContext = appContext;
     let unregister_app_failures = () => {};
     let unregister_billing = () => {};
+    let unregister_auth_recovery = () => {};
     if ( getComputedStyle(el_body).position === 'static' ) el_body.style.position = 'relative';
 
     let tick_timer = null;
@@ -1102,6 +1104,14 @@ export async function openCodeWindow (ctx = {}) {
 
         unregister_app_failures();
         unregister_billing();
+        unregister_auth_recovery();
+        if (!nativeSurface) unregister_auth_recovery = attachCodeAuthRecovery({
+            iframe: el_iframe, frameUrl: code_preview_url,
+            current: () => !disposed && my_attempt === attempt,
+            desktopRunning: () => session.desktopRunning(computer.id),
+            onStopped: () => show_state('stopped'),
+            onUnknown: (retry) => { show_state('unknown'); return_probe_retry = retry; },
+        });
         el_iframe.src = code_preview_url;
         // Bind at mint handoff, before confirmation, so startup failures can answer the hello too.
         // The folder bridge below binds the same frame after the server confirms it.
@@ -1538,6 +1548,7 @@ export async function openCodeWindow (ctx = {}) {
         clearTimeout(route_timer); route_timer = null;
         clearTimeout(leaving_timer); leaving_timer = null;
         detachFolderBridge(el_iframe);
+        unregister_auth_recovery();
         unregister_app_failures();
         unregister_billing();
         folder_notice?.close();
