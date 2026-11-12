@@ -1,13 +1,15 @@
-// billing-recovery.js — EZiL-authored. Code's requests for the Billing dialogs (Free includes Gemini 3.8 Flash only):
+import modelPolicy from '../../../../app/src/shared/ai-model-policy.json' with { type: 'json' };
+// billing-recovery.js — EZiL-authored. Code's requests for the Billing dialogs (Free has a curated model set):
 // an EZiL AI credit refusal, a plan-locked model chosen in Code's picker, or a used-up EZiL AI credit window. The
 // Worker's billing bridge (worker/src/code-billing-bridge.ts) forwards `{ reason, requestId?, model?, resetsAt? }` after
 // a nonce handshake with this window (worker/copilot-chat/billing-intent-vectors.json). Billing then picks the dialog
 // from its own live summary (topup-sheet.js `billingRecoveryAction`): the Standard upgrade on Free, Add credits on a
-// paid plan. A credit window is a plan allowance no purchase lifts today, so it opens no dialog: Billing explains it.
+// paid plan. Known Premium-only picks ask for Max/Premium. A credit window is a plan allowance no purchase lifts today, so it opens no dialog: Billing explains it.
 // No listeners, storage or telemetry on import.
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const ALIAS = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 const ISO = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[.][0-9]{3}Z$/;
+export const modelRequiresPremium = model => typeof model === 'string' && modelPolicy.premiumOnlyModels.includes(model);
 const REASONS = new Set(['credits_exhausted', 'model_locked', 'window_limit']);
 /** A repeat of a request, or any request this soon after the last one, opens nothing: no dialog loops. */
 export const BILLING_REQUEST_GAP_MS = 5000;
@@ -33,6 +35,7 @@ export function validate_billing_request (value) {
 export function billing_recovery_context (request) {
     const reason = request?.reason === 'model_locked' || request?.reason === 'window_limit' ? request.reason : 'insufficient_credits';
     return { reason, ...(request?.requestId ? { requestId: request.requestId } : {}),
+        ...(reason === 'model_locked' && typeof request?.model === 'string' && ALIAS.test(request.model) ? { model: request.model } : {}),
         ...(reason === 'window_limit' && request?.resetsAt ? { resetsAt: request.resetsAt } : {}) };
 }
 

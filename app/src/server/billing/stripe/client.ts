@@ -5,6 +5,7 @@ import { aiPackCheckoutEligible, CUSTOM_TOPUP_SKU, customTopupPack, findPack, MA
 import type { StripeApi, StripeCheckoutSession, StripeInvoicePaymentState, StripePrice, StripeUpgradeResult, StripePackPrice, StripeProduct } from '../ports';
 import { billingOfferByLookupKey as offerByLookupKey, billingOfferBySku as offerBySku } from '../v3/catalog';
 import { readStripePacks, resetStripePackCachesForTests } from './packs';
+import { PUBLIC_STANDARD_TRIAL_LOOKUP_KEY, publicStandardTrialEnabledFromStripe } from './public-standard-trial';
 import { CATALOG_V3 } from '../v3/contract';
 import { CATALOG_V2 } from '../v2/contract';
 import { SPONSOR_CAMPAIGN_METADATA_KEY, SPONSOR_CONFIG_METADATA_KEY, TRIAL_METADATA_KEY, TRIAL_POLICY_VERSION } from '../v3/trial';
@@ -394,6 +395,15 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
 
     const client: StripeApi = {
         packCacheKey: scope,
+        async publicStandardTrialEnabled() {
+            const live = /^(sk|rk)_live_/.test(opts.secretKey) ? true : /^(sk|rk)_test_/.test(opts.secretKey) ? false : null;
+            if (live === null || PUBLIC_STANDARD_TRIAL_LOOKUP_KEY === null) return false;
+            // Deliberately bypass the ten-minute merchant-price cache. Product metadata changes govern the
+            // NEXT summary/quote/checkout request, including withdrawal of an unstarted public quote.
+            const query = new URLSearchParams({ 'lookup_keys[]': PUBLIC_STANDARD_TRIAL_LOOKUP_KEY,
+                active: 'true', limit: '2', 'expand[]': 'data.product' });
+            return publicStandardTrialEnabledFromStripe(await request<unknown>(`/prices?${query}`), live);
+        },
         async listProducts() { return (await listAll<ProductResponse>('/products', { active: 'true' })).map(packProduct); },
         async retrieveProduct(id) { return packProduct(await request<ProductResponse>(`/products/${encodeURIComponent(id)}`)); },
         async retrievePackPrice(id) { return packPrice(await request<Price>(`/prices/${encodeURIComponent(id)}`)); },

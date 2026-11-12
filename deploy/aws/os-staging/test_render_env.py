@@ -62,6 +62,55 @@ class RenderEnvTests(unittest.TestCase):
             with self.subTest(key=unknown), self.assertRaises(renderer.RenderError):
                 renderer.validate({**self.values, unknown: "0"})
 
+    def render_fixture(self, values):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            output = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                if os.geteuid() != 0:
+                    stack.enter_context(patch.object(renderer.os, "geteuid", return_value=0))
+                    stack.enter_context(patch.object(renderer.os, "chown"))
+                    stack.enter_context(patch.object(renderer.os, "fchown"))
+                with contextlib.redirect_stdout(output):
+                    renderer.render(values, Path(temporary))
+            return tuple((Path(temporary) / name).read_bytes() for name in ("app.env", "cron.env")), output.getvalue()
+
+    def test_admin_entitlement_sender_keys_absence_keeps_existing_output(self):
+        key = "EZIL_OS_ADMIN_ENTITLEMENT_SENDER_KEYS"
+        self.assertIn(key, renderer.OPTIONAL)
+        self.assertNotIn(key, renderer.REQUIRED)
+        with patch.object(renderer, "OPTIONAL", renderer.OPTIONAL - {key}):
+            before = self.render_fixture(self.values)
+        self.assertEqual(self.render_fixture(self.values), before)
+
+    def test_admin_entitlement_sender_keys_json_is_forwarded_verbatim(self):
+        key = "EZIL_OS_ADMIN_ENTITLEMENT_SENDER_KEYS"
+        public_map = {"synthetic-${NO_EXPAND}-#-quoted": {
+            "kty": "OKP", "crv": "Ed25519", "x": "A" * 43}}
+        raw = json.dumps(public_map, separators=(",", ":"))
+        values = {**self.values, key: raw}
+        (app, cron), names = self.render_fixture(values)
+        rendered = dict(line.split("=", 1) for line in app.decode().splitlines())
+        self.assertEqual(rendered, values)
+        self.assertEqual(rendered[key], raw)
+        self.assertEqual(json.loads(rendered[key]), public_map)
+        self.assertEqual(names.splitlines(), sorted(values))
+        self.assertNotIn(raw, names)
+        self.assertNotIn(key, cron.decode())
+
+    def test_admin_entitlement_nearby_or_private_key_names_remain_refused(self):
+        for key in ("EZIL_OS_ADMIN_ENTITLEMENT_SENDER_KEY",
+                    "EZIL_OS_ADMIN_ENTITLEMENT_SENDER_KEYS_EXTRA",
+                    "EZIL_OS_ADMIN_ENTITLEMENT_PRIVATE_KEYS",
+                    "EZIL_OS_ADMIN_ENTITLEMENT_SIGNING_KEY",
+                    "EZIL_GATEWAY_ADMIN_SENDER_KEYS"):
+            with self.subTest(key=key), self.assertRaises(renderer.RenderError):
+                renderer.validate({**self.values, key: "synthetic"})
+
+    def test_admin_entitlement_value_keeps_existing_string_validation(self):
+        for value in (None, False, 1, "", " padded ", "before\nafter", "before\0after"):
+            with self.subTest(value=repr(value)), self.assertRaises(renderer.RenderError):
+                renderer.validate({**self.values, "EZIL_OS_ADMIN_ENTITLEMENT_SENDER_KEYS": value})
+
     def sponsor_values(self):
         return {
             "SPONSOR_KEY": "synthetic-context-signing-key-1234567890",

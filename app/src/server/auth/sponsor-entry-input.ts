@@ -1,11 +1,12 @@
 /** Public aliases are existing signed-registry partner IDs, never Stripe coupons or redirect targets. */
 export const SPONSOR_COUPON_PATTERN = /^[a-z0-9][a-z0-9_-]{2,63}$/;
 export const SPONSOR_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43,128}$/;
+export const SPONSOR_BILLING_RETURN = '/os?settings=billing';
 export type SponsorEntryInput = { kind: 'token'; value: string } | { kind: 'coupon'; value: string };
 export function sponsorCouponValue(value: unknown): string | null {
     return typeof value === 'string' && SPONSOR_COUPON_PATTERN.test(value) ? value : null;
 }
-/** Preserve a root coupon before the ordinary OS/login redirect; invalid or duplicate input lands on the unavailable document. */
+/** Preserve a root coupon before the ordinary OS/login redirect; invalid or duplicate input reaches Billing with an unavailable status. */
 export function sponsorCouponEntryPath(value: unknown, hasOpaqueToken = false): string {
     const coupon = hasOpaqueToken ? null : sponsorCouponValue(value);
     return coupon === null ? '/sponsor/coupon' : `/sponsor/coupon?coupon=${encodeURIComponent(coupon)}`;

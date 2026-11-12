@@ -38,6 +38,7 @@ describe('signed sponsor OAuth transaction consumption', () => {
         expect(response.headers.get('location')).toBe(`${origin}/os?settings=billing`);
         expect(stub.bridge).toHaveBeenCalledWith({ sub: 'auth0|fixture', email: 'fixture@example.invalid' }, expect.objectContaining({ campaignId: 'fixture-campaign' }));
         expect(response.cookies.get(AUTH0_COOKIE)?.maxAge).toBe(0);
+        expect(response.cookies.get('__Host-ezil-sponsor-entry')?.maxAge).toBe(0);
         stub.exchange.mockClear(); stub.bridge.mockClear();
         await GET(request(response.cookies.get(AUTH0_COOKIE)!.value));
         expect(stub.exchange).not.toHaveBeenCalled(); expect(stub.bridge).not.toHaveBeenCalled();

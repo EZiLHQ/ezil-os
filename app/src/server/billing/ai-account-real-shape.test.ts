@@ -81,6 +81,8 @@ const periodStart = new Date('2026-10-21T08:04:45Z'), periodEnd = new Date('2026
 function receiptsA(): AiCreditReceipt[] {
     const plan = aiCreditEntitlement({ userId: USER_A, sku: 'standard_monthly_v3', subscriptionId, periodStart, periodEnd, invoiceId: 'in_e2eStandardFixture' });
     const starter = aiCreditEntitlement({ userId: USER_A, sku: 'free_v3', subscriptionId: null, periodStart: new Date('2026-10-21T00:00:00Z'), periodEnd: null, invoiceId: null });
+    // The captured2026 receipt is historical100; never regenerate its amount from today's starting policy.
+    starter.credits = 100;
     return [{ ...plan, deliveredAt: '2026-10-21T08:05:10.000Z' }, { ...starter, deliveredAt: '2026-10-21T00:00:05.000Z' }];
 }
 
@@ -205,10 +207,11 @@ describe('ai.account from the real e2e-standard /v1/me/balance shape', () => {
             window: { seconds: 7200, started_at: '2026-11-01T06:00:00+00:00', resets_at: '2026-11-01T08:00:00+00:00', budget_micro: '5000000', used_micro: '0', remaining_micro: '5000000' },
             grants: [{ source: 'entitlement', credits_micro: 100000000, remaining_micro: 37250000, live: true, expires_at: '2027-10-30T10:00:00Z', revoked_at: null }] };
         const starter = aiCreditEntitlement({ userId: USER_B, sku: 'free_v3', subscriptionId: null, periodStart: new Date('2026-10-30T10:00:00Z'), periodEnd: null, invoiceId: null });
+        starter.credits = 100; // Historical immutable receipt; the live account still owns100.
         const fetcher = gateway(balance, { '/v1/me/usage': { object: 'list', data: [] } });
         const b = await summaryOf(USER_B, 'free_v3', fetcher, async () => [{ ...starter, deliveredAt: '2026-10-30T10:00:05.000Z' }]);
         expect(b.ai.account).toEqual({ userId: USER_B, state: 'ok', asOf: '2026-11-01T07:00:00Z', totalMicro: '100000000', remainingMicro: '37250000',
-            heldMicro: '0', usedMicro: '62750000', planBaselineMicro: '100000000', labelled: true,
+            heldMicro: '0', usedMicro: '62750000', planBaselineMicro: '10000000', labelled: true,
             grants: [{ kind: 'starter', creditsMicro: '100000000', remainingMicro: '37250000', expiresAt: '2027-10-30T10:00:00.000Z' }] });
         for (const [, init] of fetcher.mock.calls) expect(init?.headers).toEqual({ Authorization: `Bearer token-${USER_B}` });
         pin('userB', b);

@@ -6,6 +6,7 @@ import {
 } from '@/server/auth/auth0';
 import { bridgeAuth0Identity, refuseSilentAccountSwitch } from '@/server/auth/bridge';
 import { sponsorFromTransaction } from '@/server/auth/sponsor';
+import { SPONSOR_ENTRY_COOKIE, SPONSOR_ENTRY_COOKIE_OPTIONS } from '@/server/auth/sponsor-entry-context';
 import { retainProjectIdentity } from '@/server/auth/retained-identity';
 import { Routes, safeReturnUrl } from '@/utils/constants';
 import { ownedPublicOrigin } from '@/utils/forwarded';
@@ -67,6 +68,7 @@ export async function GET(request: NextRequest) {
     }
     const response = NextResponse.redirect(new URL(destination, ownedPublicOrigin(request.headers, request.url)));
     response.cookies.set(AUTH0_COOKIE, '', { ...AUTH0_COOKIE_OPTIONS, maxAge: 0 });
+    if (signedIn) response.cookies.set(SPONSOR_ENTRY_COOKIE, '', { ...SPONSOR_ENTRY_COOKIE_OPTIONS, maxAge: 0 });
     // Signed in: the page a sign-out kept has been reached. A failed attempt keeps it for the retry (Back and refresh
     // included); it expires by itself after ten minutes.
     if (signedIn && request.cookies.has(LOGIN_RETURN_COOKIE)) {

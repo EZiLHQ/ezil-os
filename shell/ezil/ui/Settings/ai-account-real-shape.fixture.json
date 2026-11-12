@@ -93,8 +93,8 @@
           }
         ]
       },
-      "balanceMicro": "1263815391",
       "heldMicro": "17409094",
+      "balanceMicro": "1263815391",
       "balanceState": "ok",
       "spendingState": "available",
       "recentUsage": {
@@ -181,7 +181,7 @@
             "free-cf"
           ],
           "aiCredits": {
-            "amount": 100,
+            "amount": 10,
             "per": "once"
           },
           "bullets": [
@@ -394,8 +394,8 @@
           }
         ]
       },
-      "balanceMicro": "1263815391",
       "heldMicro": "17409094",
+      "balanceMicro": "1263815391",
       "balanceState": "ok",
       "spendingState": "available",
       "recentUsage": {
@@ -470,7 +470,7 @@
             "free-cf"
           ],
           "aiCredits": {
-            "amount": 100,
+            "amount": 10,
             "per": "once"
           },
           "bullets": [
@@ -616,8 +616,8 @@
         "labelled": false,
         "grants": []
       },
-      "balanceMicro": null,
       "heldMicro": null,
+      "balanceMicro": null,
       "balanceState": "unavailable",
       "spendingState": "unavailable",
       "recentUsage": null,
@@ -663,7 +663,7 @@
             "free-cf"
           ],
           "aiCredits": {
-            "amount": 100,
+            "amount": 10,
             "per": "once"
           },
           "bullets": [
@@ -781,7 +781,7 @@
     },
     "ai": {
       "grant": {
-        "amount": 100,
+        "amount": 10,
         "per": "once"
       },
       "balance": 37.25,
@@ -803,7 +803,7 @@
         "remainingMicro": "37250000",
         "heldMicro": "0",
         "usedMicro": "62750000",
-        "planBaselineMicro": "100000000",
+        "planBaselineMicro": "10000000",
         "labelled": true,
         "grants": [
           {
@@ -814,8 +814,8 @@
           }
         ]
       },
-      "balanceMicro": "37250000",
       "heldMicro": "0",
+      "balanceMicro": "37250000",
       "balanceState": "ok",
       "spendingState": "available",
       "recentUsage": {
@@ -882,7 +882,7 @@
             "free-cf"
           ],
           "aiCredits": {
-            "amount": 100,
+            "amount": 10,
             "per": "once"
           },
           "bullets": [
@@ -1046,7 +1046,7 @@
     },
     "ai": {
       "grant": {
-        "amount": 100,
+        "amount": 10,
         "per": "once"
       },
       "balance": null,
@@ -1066,12 +1066,12 @@
         "remainingMicro": null,
         "heldMicro": null,
         "usedMicro": null,
-        "planBaselineMicro": "100000000",
+        "planBaselineMicro": "10000000",
         "labelled": false,
         "grants": []
       },
-      "balanceMicro": null,
       "heldMicro": null,
+      "balanceMicro": null,
       "balanceState": "unavailable",
       "spendingState": "unavailable",
       "recentUsage": null,
@@ -1116,7 +1116,7 @@
             "free-cf"
           ],
           "aiCredits": {
-            "amount": 100,
+            "amount": 10,
             "per": "once"
           },
           "bullets": [

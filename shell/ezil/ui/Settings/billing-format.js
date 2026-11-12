@@ -52,7 +52,7 @@ const ERRORS = {
     stripe_unavailable: 'Payments are unavailable right now. Try again in a few minutes.',
     // Standard trial (billing.quoteTrial / createCheckout({ trial })).
     trial_unavailable: "The free month isn't available for this account.",
-    trial_quote_stale: "Your free month's end date changed. Check the new date before you continue.",
+    trial_quote_stale: "Your free month's dates changed. Try again to open a new checkout.",
     trial_checkout_complete: 'Your free month is already starting. Wait a moment, then refresh Billing.',
 };
 
@@ -107,12 +107,13 @@ export function trialOfferOf (summary) {
     return summary.catalog?.offers?.some(item => item.sku === TRIAL_SKU) ? offer : null;
 }
 
-/** The quiet line for an ineligible viewer, for the three reasons a person can act on or understand; '' otherwise. */
+/** Explain a server eligibility refusal, including an existing paid or assigned plan; '' for unknown reasons. */
 export function trialIneligibleCopy (summary) {
     const offer = summary?.trialOffer;
-    if ( summary?.version !== 3 || summary.actions?.checkout !== true || offer?.eligible !== false ) return '';
+    if ( summary?.version !== 3 || offer?.eligible !== false ) return '';
     return { trial_used: "You've already used your free month.", paid_before: 'The free month is for accounts without an earlier paid plan.',
-        email_unverified: 'Verify your email to start a free month.' }[offer.reason] ?? '';
+        email_unverified: 'Verify your email to start a free month.', no_email: 'Add and verify an email address to start a free month.',
+        not_free: 'The free month is for accounts on the Free plan.', operator_plan: 'Your account already has access assigned by EZiL.' }[offer.reason] ?? '';
 }
 
 /** `plan.trial` when the server reports one of the four states with a readable end; null otherwise. */

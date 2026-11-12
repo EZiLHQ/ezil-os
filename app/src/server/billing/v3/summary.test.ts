@@ -840,6 +840,8 @@ describe('Standard trial summary', () => {
         expect(buildSummaryV3({ ...input(), trialOffer: offer }).trialOffer).toEqual(offer);
         expect(buildSummaryV3({ ...input(), trialOffer: { eligible: false, reason: 'trial_used' } }).trialOffer).toEqual({ eligible: false, reason: 'trial_used' });
         expect('trialOffer' in buildSummaryV3({ ...input('standard_monthly_v3'), trialOffer: offer })).toBe(false);
+        const declinedSponsor = { eligible: false, reason: 'not_free', source: 'sponsor', partnerId: 'partner' } as const;
+        expect(buildSummaryV3({ ...input('standard_monthly_v3'), trialOffer: declinedSponsor }).trialOffer).toEqual(declinedSponsor);
         expect('trialOffer' in buildSummaryV3({ ...input(), stripeAvailable: false, trialOffer: offer })).toBe(false);
         expect('trialOffer' in buildSummaryV3(input())).toBe(false);
     });

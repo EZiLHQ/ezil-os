@@ -1,55 +1,96 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { NextRequest } from 'next/server';
-const stub = vi.hoisted(() => ({ available: vi.fn(), coupon: vi.fn(), authorize: vi.fn() }));
+const stub = vi.hoisted(() => ({ available: vi.fn(), coupon: vi.fn(), authorize: vi.fn(), fromLink: vi.fn(), fromCoupon: vi.fn(), materialize: vi.fn(), user: vi.fn(), context: vi.fn() }));
 vi.mock('@/server/auth/sponsor-entry', () => ({ sponsorEntryAvailable: stub.available, sponsorCouponEntryAvailable: stub.coupon }));
-vi.mock('@/server/auth/auth0', () => ({ AUTH0_ISSUER: 'https://id.ezil.work/', AUTH0_COOKIE: '__Host-ezil-auth0', AUTH0_COOKIE_OPTIONS: { httpOnly: true, secure: true, sameSite: 'lax', path: '/' }, buildAuthorizeUrl: stub.authorize }));
-import { GET } from './[token]/route';
-import { POST } from './continue/route';
-const origin = 'https://os-staging.ezil.work', token = 't'.repeat(43);
-beforeEach(() => { vi.resetAllMocks(); stub.available.mockResolvedValue(true); stub.coupon.mockResolvedValue(true); stub.authorize.mockResolvedValue(new URL('https://id.ezil.work/authorize?state=synthetic-state')); });
-function post(extra: Record<string,string> = {}) {
-    return new NextRequest(`${origin}/sponsor/continue`, { method: 'POST', headers: { origin, 'content-type': 'application/x-www-form-urlencoded', ...extra }, body: new URLSearchParams({ token }) });
-}
-describe('private sponsor entry document', () => {
-    it('shows card and paid renewal disclosure without scripts, analytics or external subresources', async () => {
-        const response = await GET(new NextRequest(`${origin}/sponsor/${token}`), { params: Promise.resolve({ token }) });
-        const html = await response.text();
-        expect(response.status).toBe(200);
-        expect(html).toContain('A card is required.'); expect(html).toContain('$20/month'); expect(html).toContain('unless you cancel');
-        expect(html).toContain('method="post" action="/sponsor/continue"');
-        expect(html).not.toMatch(/<script|analytics|src=|href="https:/i);
-        expect(response.headers.get('referrer-policy')).toBe('strict-origin');
-        expect(response.headers.get('cache-control')).toBe('no-store');
-        expect(response.headers.get('content-security-policy')).toContain("default-src 'none'");
-        expect(response.headers.get('content-security-policy')).toContain("form-action 'self' https://id.ezil.work;");
+vi.mock('@/server/auth/auth0', () => ({ AUTH0_COOKIE: '__Host-ezil-auth0', AUTH0_COOKIE_OPTIONS: { httpOnly: true, secure: true, sameSite: 'lax', path: '/' }, Auth0Error: class extends Error {}, buildAuthorizeUrl: stub.authorize }));
+vi.mock('@/server/auth/sponsor', () => ({ sponsorFromLink: stub.fromLink, sponsorFromCoupon: stub.fromCoupon, materializeSponsorAttribution: stub.materialize, sponsorSubjectSupported: (s: string) => /^[\x21-\x7e]{1,255}$/.test(s) }));
+vi.mock('@/server/auth/sponsor-entry-context', () => ({ SPONSOR_ENTRY_COOKIE: '__Host-ezil-sponsor-entry', SPONSOR_ENTRY_COOKIE_OPTIONS: { httpOnly: true, secure: true, sameSite: 'lax', path: '/' }, sponsorEntryContext: stub.context }));
+vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({ auth: { getUser: stub.user } }) }));
+import { GET as tokenGet } from './[token]/route';
+import { GET as couponGet } from './coupon/route';
+const origin = 'https://os-staging.ezil.work', token = 't'.repeat(43), campaign = { campaignId: 'fixture-campaign', partnerId: 'staging-qa' };
+const signedUser = { id: 'existing', app_metadata: { auth0_sub: 'auth0|fixture' } };
+function get(kind: 'coupon' | 'token', query = '') { return kind === 'coupon'
+    ? couponGet(new NextRequest(origin+'/sponsor/coupon?coupon=staging-qa'+query, { headers: { accept: 'text/html' } }))
+    : tokenGet(new NextRequest(origin+'/sponsor/'+token+query, { headers: { accept: 'text/html' } }), { params: Promise.resolve({ token }) }); }
+beforeEach(() => { vi.resetAllMocks(); stub.available.mockResolvedValue(true); stub.coupon.mockResolvedValue(true); stub.fromLink.mockReturnValue(campaign); stub.fromCoupon.mockReturnValue(campaign); stub.user.mockResolvedValue({ data: { user: null }, error: null }); stub.context.mockReturnValue('signed-campaign-only'); stub.authorize.mockResolvedValue(new URL('https://id.ezil.work/authorize?state=synthetic')); });
+describe('direct coupon and opaque invitations', () => {
+    it.each(['coupon', 'token'] as const)('anonymous %s goes to ordinary Auth0 without a separate landing or provider token', async kind => {
+        const r = await get(kind);
+        expect(r.status).toBe(303); expect(r.headers.get('location')).toBe('https://id.ezil.work/authorize?state=synthetic'); expect(await r.text()).toBe('');
+        expect(stub.authorize).toHaveBeenCalledExactlyOnceWith({ origin, returnUrl: '/os?settings=billing', ...(kind === 'coupon' ? { sponsorCoupon: 'staging-qa' } : { sponsorToken: token }) });
+        expect(r.headers.get('location')).not.toContain(token); expect(r.headers.get('referrer-policy')).toBe('no-referrer'); expect(r.headers.get('cache-control')).toBe('no-store');
+        expect(r.cookies.get('__Host-ezil-sponsor-entry')).toMatchObject({ value: 'signed-campaign-only', httpOnly: true, secure: true, sameSite: 'lax', path: '/', maxAge: 600 });
     });
-    it('unavailable invitation reveals no token or campaign in document and offers ordinary sign in', async () => {
-        stub.available.mockResolvedValue(false);
-        const response = await GET(new NextRequest(`${origin}/sponsor/${token}`), { params: Promise.resolve({ token }) });
-        const html = await response.text();
-        expect(response.status).toBe(404); expect(html).not.toContain(token); expect(html).toContain('href="/login"');
+    it.each(['coupon', 'token'] as const)('signed-in %s preserves account, attributes only, and opens Billing', async kind => {
+        stub.user.mockResolvedValue({ data: { user: signedUser }, error: null });
+        const r = await get(kind);
+        expect(r.headers.get('location')).toBe(origin+'/os?settings=billing'); expect(stub.authorize).not.toHaveBeenCalled();
+        expect(stub.materialize).toHaveBeenCalledExactlyOnceWith({ userId: signedUser.id, verifiedSubject: 'auth0|fixture', metadata: signedUser.app_metadata, campaign });
+        expect(r.cookies.get('__Host-ezil-sponsor-entry')?.maxAge).toBe(0);
     });
-    it('moves raw token only through same-origin body, never provider URL', async () => {
-        const response = await POST(post());
-        expect(stub.authorize).toHaveBeenCalledWith({ origin, sponsorToken: token });
-        expect(response.status).toBe(303);
-        expect(response.headers.get('location')).not.toContain(token);
-        expect(response.headers.get('referrer-policy')).toBe('no-referrer');
+    it('never accepts user-editable metadata as an Auth0 identity or switches an unlinked account', async () => {
+        stub.user.mockResolvedValue({ data: { user: { id: 'legacy', app_metadata: {}, user_metadata: { auth0_sub: 'forged' } } }, error: null });
+        const r = await get('coupon'); expect(r.headers.get('location')).toBe(origin+'/os?settings=billing&coupon_entry=identity_required');
+        expect(stub.materialize).not.toHaveBeenCalled(); expect(stub.authorize).not.toHaveBeenCalled();
     });
-    it.each(['https://evil.example', 'https://other.ezil.work', 'null', ''])('refuses another/missing origin %j before auth and DB', async badOrigin => {
-        const response = await POST(post({ origin: badOrigin }));
-        expect(response.status).toBe(403); expect(stub.available).not.toHaveBeenCalled(); expect(stub.authorize).not.toHaveBeenCalled();
+    it('SQL refusal stays in Billing with a safe reason and never falls back to another auth account', async () => {
+        stub.user.mockResolvedValue({ data: { user: signedUser }, error: null }); stub.materialize.mockRejectedValue(new Error('private SQL detail'));
+        const r = await get('coupon'); expect(r.headers.get('location')).toBe(origin+'/os?settings=billing&coupon_entry=unavailable'); expect(stub.authorize).not.toHaveBeenCalled(); expect(await r.text()).not.toContain('private');
     });
-    it('expired/disabled/schema-absent invitation does not start auth and clears prior transaction', async () => {
-        stub.available.mockResolvedValue(false);
-        const response = await POST(post());
-        expect(stub.authorize).not.toHaveBeenCalled();
-        expect(response.cookies.get('__Host-ezil-auth0')?.maxAge).toBe(0);
-        expect(response.headers.get('location')).toBe(`${origin}/login?error=sponsor_unavailable`);
+    it('a missing session is anonymous, but unavailable identity service cannot start an account switch', async () => {
+        stub.user.mockResolvedValueOnce({ data: { user: null }, error: { name: 'AuthSessionMissingError' } });
+        expect((await get('coupon')).headers.get('location')).toContain('id.ezil.work');
+        stub.authorize.mockClear(); stub.user.mockResolvedValueOnce({ data: { user: signedUser }, error: { name: 'AuthRetryableFetchError' } });
+        expect((await get('coupon')).headers.get('location')).toBe(origin+'/os?settings=billing&coupon_entry=unavailable'); expect(stub.authorize).not.toHaveBeenCalled(); expect(stub.materialize).not.toHaveBeenCalled();
+    });
+    it.each(['coupon', 'token'] as const)('inactive %s continues normal sign-in to a fixed unavailable Billing status', async kind => {
+        stub.available.mockResolvedValue(false); stub.coupon.mockResolvedValue(false);
+        const r = await get(kind); expect(stub.authorize).toHaveBeenCalledExactlyOnceWith({ origin, returnUrl: '/os?settings=billing&coupon_entry=unavailable' });
+        expect(stub.context).not.toHaveBeenCalled(); expect(stub.materialize).not.toHaveBeenCalled(); expect(r.cookies.get('__Host-ezil-sponsor-entry')?.maxAge).toBe(0);
+    });
+    it.each(['?coupon=staging-qa', '?token=another', '?%63oupon=staging-qa'])('opaque mixed selection %j cannot resolve or attribute', async query => {
+        await get('token', query); expect(stub.available).not.toHaveBeenCalled(); expect(stub.fromLink).not.toHaveBeenCalled(); expect(stub.materialize).not.toHaveBeenCalled();
+        expect(stub.authorize).toHaveBeenCalledWith({ origin, returnUrl: '/os?settings=billing&coupon_entry=unavailable' });
+    });
+    it('caller redirect and price inputs cannot alter the destination or campaign', async () => {
+        stub.user.mockResolvedValue({ data: { user: signedUser }, error: null });
+        expect((await get('coupon', '&returnUrl=https://evil.example&price=1')).headers.get('location')).toBe(origin+'/os?settings=billing');
     });
 });
 
-it.each(['?coupon=staging-qa', '?token=another', '?%63oupon=staging-qa'])('legacy opaque link refuses extra URL selection %j', async query => {
-    const r = await GET(new NextRequest(origin+'/sponsor/'+token+query), { params: Promise.resolve({ token }) });
-    expect(r.status).toBe(404); expect(stub.available).not.toHaveBeenCalled(); expect(stub.authorize).not.toHaveBeenCalled();
+it.each([{ 'sec-fetch-dest': 'image' }, { 'sec-fetch-dest': 'iframe' }, { 'sec-fetch-dest': 'empty', accept: 'text/html' }, { 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'cors' }, {}] as Record<string,string>[])('non-document request %j refuses before identity/attribution/OAuth', async headers => {
+    const r = await couponGet(new NextRequest(origin+'/sponsor/coupon?coupon=staging-qa', { headers }));
+    expect(r.status).toBe(403); expect(stub.user).not.toHaveBeenCalled(); expect(stub.coupon).not.toHaveBeenCalled(); expect(stub.authorize).not.toHaveBeenCalled(); expect(stub.materialize).not.toHaveBeenCalled();
+});
+it('native document navigation with real fetch metadata enters the direct flow', async () => {
+    const r = await couponGet(new NextRequest(origin+'/sponsor/coupon?coupon=staging-qa', { headers: { 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate' } }));
+    expect(r.status).toBe(303); expect(stub.authorize).toHaveBeenCalledWith({ origin, returnUrl: '/os?settings=billing', sponsorCoupon: 'staging-qa' });
+});
+
+
+it.each([
+    { 'sec-purpose': 'prefetch' }, { 'sec-purpose': 'prefetch;prerender' }, { 'sec-purpose': 'prerender' },
+    { purpose: 'prefetch' }, { purpose: 'PREFETCH' }, { purpose: 'prerender' },
+    { purpose: 'navigate', 'sec-purpose': 'prefetch;anonymous-client-ip' },
+] as Record<string, string>[])('speculative document request %j refuses both entry routes before every effect', async purpose => {
+    stub.user.mockResolvedValue({ data: { user: signedUser }, error: null });
+    const headers = { accept: 'text/html', 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate', ...purpose };
+    const coupon = await couponGet(new NextRequest(origin+'/sponsor/coupon?coupon=staging-qa', { headers }));
+    const opaque = await tokenGet(new NextRequest(origin+'/sponsor/'+token, { headers }), { params: Promise.resolve({ token }) });
+    expect(coupon.status).toBe(403); expect(opaque.status).toBe(403);
+    expect(stub.available).not.toHaveBeenCalled(); expect(stub.coupon).not.toHaveBeenCalled();
+    expect(stub.fromLink).not.toHaveBeenCalled(); expect(stub.fromCoupon).not.toHaveBeenCalled();
+    expect(stub.user).not.toHaveBeenCalled(); expect(stub.materialize).not.toHaveBeenCalled();
+    expect(stub.authorize).not.toHaveBeenCalled(); expect(stub.context).not.toHaveBeenCalled();
+    expect(coupon.headers.get('set-cookie')).toBeNull(); expect(opaque.headers.get('set-cookie')).toBeNull();
+});
+it('an ordinary signed-in user navigation still attributes once and keeps the existing account', async () => {
+    stub.user.mockResolvedValue({ data: { user: signedUser }, error: null });
+    const r = await couponGet(new NextRequest(origin+'/sponsor/coupon?coupon=staging-qa', { headers: {
+        accept: 'text/html', 'sec-fetch-dest': 'document', 'sec-fetch-mode': 'navigate', 'sec-fetch-user': '?1',
+    } }));
+    expect(r.status).toBe(303); expect(r.headers.get('location')).toBe(origin+'/os?settings=billing');
+    expect(stub.materialize).toHaveBeenCalledExactlyOnceWith({ userId: signedUser.id, verifiedSubject: 'auth0|fixture', metadata: signedUser.app_metadata, campaign });
+    expect(stub.authorize).not.toHaveBeenCalled();
 });

@@ -3,6 +3,7 @@
 // amount. Every price comes from the summary and is re-quoted by the server
 // (`billing.quoteTopup`) before payment; payment and fulfilment stay with
 // upgrade-sheet.js, which shows credits only once the server confirms them.
+import { modelRequiresPremium } from './billing-recovery.js';
 import { openSheetFrame } from './sheet-frame.js';
 import { dollars, errorCopy, creditsLabel, microOf, staleCreditsCopy, trialOfferOf } from './billing-format.js';
 
@@ -116,14 +117,24 @@ export function topupUpgrade (summary) {
  * Which existing dialog recovers an EZiL AI refusal (founder 2026-11-09: Free includes Gemini 3.8 Flash only).
  * `reason` is 'insufficient_credits' (Code's credit refusal or its recovery link) or 'model_locked' (a model the plan
  * does not include, chosen in Code's picker). From the live summary, the plan the computer runs under:
- *   - Free (no paid access, files held on AWS included): the Standard upgrade (its free month when offered) for both.
+ *   - Free (no paid access, files held on AWS included): Standard for ordinary locks and credit refusals; Premium for a known protected model.
  *     Without a Standard checkout here, a credit refusal falls back to Add credits.
- *   - Standard or Premium: Add credits for a credit refusal; nothing for a model refusal (every model is included).
- * Returns `{ action: 'trial' | 'checkout', sku }`, `{ action: 'topup' }` or null.
+ *   - Standard: Premium upgrade for a model lock; Premium: no further model purchase. Both retain Add credits for a credit refusal.
+ * Returns `{ action: 'trial' | 'checkout' | 'upgrade', sku }`, `{ action: 'topup' }` or null.
  */
-export function billingRecoveryAction (summary, reason) {
+export function billingRecoveryAction (summary, reason, model) {
     if ( summary?.enabled !== true || summary.version !== 3 || ! ['insufficient_credits', 'model_locked'].includes(reason) ) return null;
     const free = summary.plan?.sku === 'free_v3' || ['free', 'files_on_aws'].includes(summary.computer?.standing);
+    if ( reason === 'model_locked' ) {
+        const premium = summary.catalog?.offers?.find(offer => offer.sku === 'premium_monthly_v3');
+        // Model names choose the dialog only; server actions/catalog and the normal quote decide what can be bought.
+        if ( free && modelRequiresPremium(model) ) return summary.actions?.checkout === true && premium
+            ? { action: 'checkout', sku: premium.sku } : null;
+        if ( ! free ) {
+            const choice = topupUpgrade(summary);
+            return choice?.action === 'upgrade' && choice.sku === 'premium_monthly_v3' ? { action: choice.action, sku: choice.sku } : null;
+        }
+    }
     const upgrade = free ? topupUpgrade(summary) : null;
     if ( upgrade && ['trial', 'checkout'].includes(upgrade.action) ) return { action: upgrade.action, sku: upgrade.sku };
     return reason === 'insufficient_credits' && topupOffer(summary) ? { action: 'topup' } : null;

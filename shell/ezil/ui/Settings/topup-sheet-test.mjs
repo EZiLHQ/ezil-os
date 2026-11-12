@@ -297,7 +297,7 @@ test('keyboard: Escape closes when idle and returns focus to the opener; Tab sta
     assert.equal(h.q('#container').hasAttribute('inert'), false);
 });
 
-test('billingRecoveryAction: Free gets the Standard upgrade for both causes; a paid plan gets Add credits, and nothing for a locked model', async h => {
+test('billingRecoveryAction: credit refusals keep Add credits; protected model picks offer Premium without charging', async h => {
     const { billingRecoveryAction } = h.api;
     const free = fixture('free');
     assert.deepEqual(plain(billingRecoveryAction(free, 'insufficient_credits')), { action: 'checkout', sku: 'standard_monthly_v3' });
@@ -323,9 +323,17 @@ test('billingRecoveryAction: Free gets the Standard upgrade for both causes; a p
     assert.equal(billingRecoveryAction(noCheckout, 'model_locked'), null);
     for ( const tier of ['standard', 'premium'] ) {
         assert.deepEqual(plain(billingRecoveryAction(fixture(tier), 'insufficient_credits')), { action: 'topup' }, tier);
-        assert.equal(billingRecoveryAction(fixture(tier), 'model_locked'), null, tier);
+        assert.deepEqual(plain(billingRecoveryAction(fixture(tier), 'model_locked')), tier === 'standard' ? { action: 'upgrade', sku: 'premium_monthly_v3' } : null, tier);
         const cannotBuy = fixture(tier); cannotBuy.actions.topup = false;
         assert.equal(billingRecoveryAction(cannotBuy, 'insufficient_credits'), null, tier);
+    }
+    for ( const model of ['gemini-4-argon', 'gemini-4-carbon', 'gpt-6-astra'] ) {
+        assert.deepEqual(plain(billingRecoveryAction(offer, 'model_locked', model)), { action: 'checkout', sku: 'premium_monthly_v3' }, 'Standard trial cannot satisfy a Premium model');
+        assert.equal(billingRecoveryAction(noCheckout, 'model_locked', model), null, 'hint cannot enable checkout');
+        const noPremium = fixture('free'); noPremium.catalog.offers = noPremium.catalog.offers.filter(o => o.sku !== 'premium_monthly_v3');
+        assert.equal(billingRecoveryAction(noPremium, 'model_locked', model), null, 'no invented offer or Standard fallback');
+        const cannotUpgrade = fixture('standard'); cannotUpgrade.actions.upgrade = false;
+        assert.equal(billingRecoveryAction(cannotUpgrade, 'model_locked', model), null, 'hint cannot enable paid upgrade');
     }
     for ( const reason of [null, 'rate_limited', 'window_budget_reached', 'no_entitlement'] ) assert.equal(billingRecoveryAction(free, reason), null, String(reason));
     for ( const summary of [null, { ...free, enabled: false }, { ...free, version: 2 }] ) assert.equal(billingRecoveryAction(summary, 'insufficient_credits'), null);
