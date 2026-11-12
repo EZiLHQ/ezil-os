@@ -19,6 +19,7 @@ ACCOUNT = "452630323510"
 REGION = "ap-south-1"
 MACHINE = f"arn:aws:states:{REGION}:{ACCOUNT}:stateMachine:ezil-mum-lifecycle"
 KEY = "EZIL_AWS_LIFECYCLE_DEPLOYMENTS"
+RELEASE_REGISTRY_CAPACITY = 32
 SECRET = "ezil-os/billing-staging/app"
 BASE_ALLOWED = {"DesktopImageDigest", "DesktopImageId", "AgentSrcS3Uri"}
 PREVIOUS = {"PreviousDesktopImageDigest", "PreviousDesktopImageId"}
@@ -902,14 +903,14 @@ def edit_release_secret(envelope, before, after, records):
     """CAS the complete tuple and append immutable records; capacity fails closed.
 
     Retaining ALL records satisfies placement/job retention without racing the DB.
-    A separately reviewed garbage collector is required when all thirty-one slots are full.
+    A separately reviewed garbage collector is required when all thirty-two slots are full.
     """
     updated = edit_secret(envelope, before, after)
     raw = updated[KEY]
     deployments = release.loads(raw) if isinstance(raw, str) else copy.deepcopy(raw)
     d = deployments[REGION]
     retained = d.get("releases", [])
-    need(isinstance(retained, list) and len(retained) <= 31, "invalid release registry")
+    need(isinstance(retained, list) and len(retained) <= RELEASE_REGISTRY_CAPACITY, "invalid release registry")
     for record in retained:
         release.validate(record, source=True, repository=REPOSITORY)
         need(all(record[k] == d[k] for k in ("accountId", "region", "namespace", "launchTemplateId")), "foreign registry record")
@@ -921,7 +922,7 @@ def edit_release_secret(envelope, before, after, records):
         need(all(identity(r) != identity(record) or r == record for r in retained), "immutable release pair rewrite refused")
         if record not in retained:
             retained.append(copy.deepcopy(record))
-    need(1 <= len(retained) <= 31, "release registry full; retained placement/job evidence must never be dropped")
+    need(1 <= len(retained) <= RELEASE_REGISTRY_CAPACITY, "release registry full; retained placement/job evidence must never be dropped")
     retained.sort(key=lambda r: r["createdAt"])
     targets = [r for r in retained if all(r[k] == after.get(k) for k in release.PROMOTION)]
     # Legacy rollback remains a source-only deployment, never a rebase target.
@@ -933,6 +934,8 @@ def edit_release_secret(envelope, before, after, records):
     need(len(json.dumps(readback, separators=(",", ":")).encode("utf-8")) <= 24000,
          'release registry readback exceeds SSM 24000-byte limit')
     updated[KEY] = json.dumps(deployments, separators=(",", ":")) if isinstance(raw, str) else deployments
+    need(len(json.dumps(updated, separators=(",", ":")).encode("utf-8")) <= 65536,
+         "app SecretString exceeds Secrets Manager 65536-byte limit")
     return updated
 
 
