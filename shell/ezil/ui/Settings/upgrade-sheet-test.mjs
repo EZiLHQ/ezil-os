@@ -56,6 +56,8 @@ function harness () {
     });
     const { window } = dom;
     const document = window.document;
+    // jsdom has no rendered geometry; real boxes are covered by the browser fixture.
+    window.HTMLIFrameElement.prototype.getClientRects = () => [{ width: 300, height: 200 }];
     let time = 0;
     let nextId = 0;
     const timers = new Map();
