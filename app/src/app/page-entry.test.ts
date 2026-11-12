@@ -28,14 +28,14 @@ beforeEach(() => {
 describe('root entry routing: / is the OS or its login, never a marketing page', () => {
     it.each([false, true])('anonymous visitors always get the computer-like login, never a marketing home (flag: %s)', async enabled => {
         state.enabled = enabled;
-        await expect(HomePage()).rejects.toThrow('redirect:/login');
+        await expect(HomePage({})).rejects.toThrow('redirect:/login');
         expect(redirect).toHaveBeenCalledExactlyOnceWith('/login');
     });
 
     it.each([false, true])('signed-in visitors always enter /os (flag: %s)', async enabled => {
         state.enabled = enabled;
         state.user = { id: 'signed-in-user' };
-        await expect(HomePage()).rejects.toThrow('redirect:/os');
+        await expect(HomePage({})).rejects.toThrow('redirect:/os');
         expect(redirect).toHaveBeenCalledExactlyOnceWith('/os');
     });
 
