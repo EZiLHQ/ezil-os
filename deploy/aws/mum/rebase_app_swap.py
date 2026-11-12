@@ -36,7 +36,10 @@ SLUG = 'ezil-os-staging'
 SMALL = 1024 * 1024
 SECRET_DRIFT = 'app secret changed while pending; manual reconciliation required'
 RECEIPT_UNVERIFIED = 'archive receipt does not match the inspected artifacts; run app-archive-check'
-PROBE_KEYS = {'gitSha', 'killSwitch', 'deployment', 'imageId', 'tagImageId', 'composeTag', 'composeImageId', 'servedSha', 'timers', 'lockFree'}
+PROBE_KEYS = {'gitSha', 'killSwitch', 'deployment', 'imageId', 'tagImageId', 'composeTag', 'composeImageId', 'servedSha', 'timers', 'lockFree', 'imageStore'}
+STORE_SECONDS = 10
+INSTALL_SECONDS = 750
+# Two store reads + installer + existing Node (60s) total 830s under SSM900.
 METADATA = ('manifest.json', 'repositories', 'index.json')
 OCI_MANIFESTS = ('application/vnd.oci.image.manifest.v1+json', 'application/vnd.docker.distribution.manifest.v2+json')
 OCI_INDEXES = ('application/vnd.oci.image.index.v1+json', 'application/vnd.docker.distribution.manifest.list.v2+json')
@@ -47,22 +50,44 @@ RUNTIME = ('compose.yaml', 'Caddyfile', 'render-env.py',
 
 def load_plan(path):
     value = manifest.read(release.safe_path(path))
-    need(isinstance(value, dict) and set(value) == PLAN_KEYS and type(value['schemaVersion']) is int and value['schemaVersion'] == 1,
+    need(isinstance(value, dict) and type(value.get('schemaVersion')) is int and value['schemaVersion'] in (1, 2),
          'invalid app plan')
+    v2 = value['schemaVersion'] == 2
+    need(set(value) == PLAN_KEYS | ({'imageStore'} if v2 else set()), 'invalid app plan')
+    need(not v2 or value['imageStore'] in ('classic', 'containerd'), 'invalid app image store')
     need(value['operation'] in release.APP_OPERATIONS and type(value['ledgerGeneration']) is int and value['ledgerGeneration'] > 0 and
          manifest.matches(r'[0-9a-f]{40}', value['agentCommit']) and manifest.matches(r'[0-9a-f]{64}', value['installerSha256']),
          'invalid app plan')
     src, dst = value['from'], value['to']
-    need(isinstance(src, dict) and set(src) == {'tag', 'gitSha', 'imageId'} and isinstance(dst, dict) and
-         set(dst) == {'tag', 'gitSha', 'imageId', 'checksumSha256'}, 'invalid app plan identities')
+    extra = {'configId'} if v2 else set()
+    src_extra = {'checksumSha256', 'archivePath', 'checksumPath', 'runtimePath'} if v2 else set()
+    need(isinstance(src, dict) and set(src) == {'tag', 'gitSha', 'imageId'} | extra | src_extra and
+         isinstance(dst, dict) and set(dst) == {'tag', 'gitSha', 'imageId', 'checksumSha256'} | extra,
+         'invalid app plan identities')
     for side in (src, dst):
         need(manifest.matches(r'[0-9a-f]{40}', side['gitSha']) and manifest.matches(r'sha256:[0-9a-f]{64}', side['imageId']) and
              manifest.matches(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}', side['tag']), 'invalid app plan identities')
+        if v2:
+            need(manifest.matches(r'sha256:[0-9a-f]{64}', side['configId']) and
+                 ((side['imageId'] == side['configId']) == (value['imageStore'] == 'classic')), 'mixed app image store identities')
     need(manifest.matches(r'[0-9a-f]{64}', dst['checksumSha256']), 'invalid app artifact pin')
+    if v2:
+        need(manifest.matches(r'[0-9a-f]{64}', src['checksumSha256']) and all(
+            isinstance(src[k], str) and Path(src[k]).is_absolute() and not any(c in src[k] for c in ('\0', '\r', '\n'))
+            for k in ('archivePath', 'checksumPath', 'runtimePath')), 'invalid before app artifact pins')
     need(src['gitSha'] != dst['gitSha'] and src['imageId'] != dst['imageId'] and src['tag'] != dst['tag'], 'app plan must change the whole app')
     need(value['undoes'] is None if value['operation'] == 'app-swap' else manifest.matches(r'[0-9a-f]{64}', value['undoes']),
          'invalid restore link')
     return value
+
+
+def image_store(plan):
+    # A v1 plan's imageId has always meant the classic store's config digest.
+    return plan.get('imageStore', 'classic')
+
+
+def config_id(plan, side):
+    return side['configId'] if plan['schemaVersion'] == 2 else side['imageId']
 
 
 def git_file(source_repo, sha, path):
@@ -174,6 +199,96 @@ def index_config(members, descriptor, nested=False):
     return index_config(members, images[0], nested=True)
 
 
+
+def archive_identity(members, side, store):
+    """Bind one explicit runtime store ID to the archive's config, never accept either digest."""
+    config = side['configId']
+    if 'index.json' not in members:
+        need(store == 'classic' and side['imageId'] == config, 'containerd requires an OCI archive index')
+        return {'store': store, 'runtimeImageId': side['imageId'], 'configId': config, 'descriptorDigest': None}
+
+    def descriptor(item, nested=False):
+        need(isinstance(item, dict) and item.get('mediaType') in (*OCI_MANIFESTS, *OCI_INDEXES) and
+             manifest.matches(r'sha256:[0-9a-f]{64}', item.get('digest')), 'invalid archive identity descriptor')
+        blob = members.get('blobs/sha256/' + item['digest'].removeprefix('sha256:'))
+        need(blob is not None and 'sha256:' + hashlib.sha256(blob).hexdigest() == item['digest'] and
+             type(item.get('size')) is int and item['size'] == len(blob), 'archive identity descriptor hash/size mismatch')
+        annotations = item.get('annotations', {})
+        need(isinstance(annotations, dict) and
+             annotations.get('io.containerd.image.name', 'docker.io/library/' + SLUG + ':' + side['tag']) == 'docker.io/library/' + SLUG + ':' + side['tag'] and
+             annotations.get('org.opencontainers.image.ref.name', side['tag']) == side['tag'],
+             'archive identity unexpected tag')
+        platform = item.get('platform')
+        need(platform is None or platform == {'os': 'linux', 'architecture': 'amd64'}, 'archive identity platform mismatch')
+        doc = manifest.loads(blob.decode('utf-8'))
+        need(isinstance(doc, dict) and type(doc.get('schemaVersion')) is int and doc['schemaVersion'] == 2 and
+             doc.get('mediaType') == item['mediaType'], 'invalid archive identity manifest')
+        if item['mediaType'] in OCI_INDEXES:
+            items = doc.get('manifests')
+            need(not nested and isinstance(items, list) and items and all(isinstance(x, dict) and isinstance(x.get('annotations', {}), dict) for x in items),
+                 'ambiguous archive identity index')
+            images = [x for x in items if (x.get('annotations') or {}).get('vnd.docker.reference.type') != 'attestation-manifest']
+            need(len(images) == 1 and all(manifest.matches(r'sha256:[0-9a-f]{64}', x.get('digest')) for x in items) and
+                 len({x['digest'] for x in items}) == len(items),
+                 'ambiguous archive identity index')
+            selected = descriptor(images[0], nested=True)
+            for attestation in items:
+                if attestation is images[0]:
+                    continue
+                annotations = attestation.get('annotations')
+                need(isinstance(annotations, dict) and annotations.get('vnd.docker.reference.type') == 'attestation-manifest' and
+                     annotations.get('vnd.docker.reference.digest') == selected and
+                     not any(k in annotations for k in ('io.containerd.image.name', 'org.opencontainers.image.ref.name')) and
+                     attestation.get('platform') == {'os': 'unknown', 'architecture': 'unknown'} and
+                     attestation.get('mediaType') in OCI_MANIFESTS, 'invalid archive identity attestation')
+                digest = attestation.get('digest')
+                need(manifest.matches(r'sha256:[0-9a-f]{64}', digest), 'invalid archive identity attestation')
+                raw = members.get('blobs/sha256/' + digest.removeprefix('sha256:'))
+                need(raw is not None and 'sha256:' + hashlib.sha256(raw).hexdigest() == digest and
+                     type(attestation.get('size')) is int and attestation['size'] == len(raw),
+                     'archive attestation hash/size mismatch')
+                evidence = manifest.loads(raw.decode('utf-8'))
+                need(isinstance(evidence, dict) and type(evidence.get('schemaVersion')) is int and evidence['schemaVersion'] == 2 and
+                     evidence.get('mediaType') == attestation['mediaType'] and isinstance(evidence.get('config'), dict) and
+                     isinstance(evidence.get('layers'), list), 'invalid archive identity attestation')
+                need(evidence['config'].get('mediaType') in
+                     ('application/vnd.oci.image.config.v1+json', 'application/vnd.docker.container.image.v1+json') and
+                     all(isinstance(x, dict) and x.get('mediaType') == 'application/vnd.in-toto+json' for x in evidence['layers']),
+                     'invalid archive identity attestation')
+                for content in [evidence['config'], *evidence['layers']]:
+                    digest = content.get('digest')
+                    need(manifest.matches(r'sha256:[0-9a-f]{64}', digest), 'invalid archive identity attestation')
+                    raw = members.get('blobs/sha256/' + digest.removeprefix('sha256:'))
+                    need(raw is not None and 'sha256:' + hashlib.sha256(raw).hexdigest() == digest and
+                         type(content.get('size')) is int and content['size'] == len(raw),
+                         'archive attestation content hash/size mismatch')
+                    if content is evidence['config']:
+                        config_doc = manifest.loads(raw.decode('utf-8'))
+                        need(isinstance(config_doc, dict) and config_doc.get('os') == 'unknown' and
+                             config_doc.get('architecture') == 'unknown', 'archive attestation config platform mismatch')
+            return selected
+        cfg = doc.get('config')
+        need(isinstance(cfg, dict) and cfg.get('digest') == config and cfg.get('mediaType') in
+             ('application/vnd.oci.image.config.v1+json', 'application/vnd.docker.container.image.v1+json'),
+             'archive identity config link mismatch')
+        data = members.get('blobs/sha256/' + config.removeprefix('sha256:'), members.get(config.removeprefix('sha256:') + '.json'))
+        need(data is not None and 'sha256:' + hashlib.sha256(data).hexdigest() == config and
+             type(cfg.get('size')) is int and cfg['size'] == len(data), 'archive identity config hash/size mismatch')
+        parsed = manifest.loads(data.decode('utf-8'))
+        need(isinstance(parsed, dict) and parsed.get('os') == 'linux' and parsed.get('architecture') == 'amd64', 'archive identity platform mismatch')
+        return item['digest']
+
+    index = manifest.loads(members['index.json'].decode('utf-8'))
+    need(isinstance(index, dict) and type(index.get('schemaVersion')) is int and index['schemaVersion'] == 2 and
+         isinstance(index.get('manifests'), list) and len(index['manifests']) == 1, 'ambiguous archive identity index')
+    root = index['manifests'][0]
+    selected = descriptor(root)
+    runtime = root['digest'] if store == 'containerd' else config
+    need(side['imageId'] == runtime, 'runtime image ID differs from the explicit archive store identity')
+    return {'store': store, 'runtimeImageId': runtime, 'configId': config,
+            'descriptorDigest': root['digest'], 'manifestDigest': selected}
+
+
 def runtime_check(runtime, sha, plan, source_repo):
     """The runtime archive install-host.sh extracts must equal the baked commit's files, byte for byte."""
     digest, members, names = scan_archive(runtime)
@@ -188,9 +303,8 @@ def runtime_check(runtime, sha, plan, source_repo):
     return digest
 
 
-def inspect_artifacts(plan_path, plan, archive, checksum, runtime, source_repo):
+def inspect_side(plan_path, plan, dst, archive, checksum, runtime, source_repo):
     """Local preflight of the exact archive bytes the checksum marker pins, before any docker load."""
-    dst = plan['to']
     marker = release.safe_path(checksum).read_bytes()
     need(hashlib.sha256(marker).hexdigest() == dst['checksumSha256'], 'checksum marker differs from the plan pin')
     lines = marker.decode('utf-8').splitlines()
@@ -199,12 +313,24 @@ def inspect_artifacts(plan_path, plan, archive, checksum, runtime, source_repo):
     need(pinned is not None and runtime_pin is not None, 'invalid checksum marker')
     sha, members, names = scan_archive(archive)
     need(sha == pinned.group(1), 'image archive differs from the checksum marker')
-    public = archive_tags(members, names, dst['tag'], dst['imageId'], dst['gitSha'])
-    runtime_sha = runtime_check(runtime, runtime_pin.group(1), plan, source_repo)
+    public = archive_tags(members, names, dst['tag'], config_id(plan, dst), dst['gitSha'])
+    runtime_sha = runtime_check(runtime, runtime_pin.group(1), {**plan, 'to': dst}, source_repo)
     # Evidence for the operator: compare with the approved staging public configuration.
-    return {'planSha256': release.digest(plan_path), 'tag': dst['tag'], 'imageId': dst['imageId'],
+    result = {'planSha256': release.digest(plan_path), 'tag': dst['tag'], 'imageId': dst['imageId'],
             'checksumSha256': dst['checksumSha256'], 'archiveSha256': sha, 'runtimeSha256': runtime_sha, 'publicConfigSha256': public,
             'archivePath': str(archive), 'checksumPath': str(checksum), 'runtimePath': str(runtime)}
+    if plan['schemaVersion'] == 2:
+        result['identity'] = archive_identity(members, dst, image_store(plan))
+    return result
+
+
+def inspect_artifacts(plan_path, plan, archive, checksum, runtime, source_repo):
+    result = inspect_side(plan_path, plan, plan['to'], archive, checksum, runtime, source_repo)
+    if plan['schemaVersion'] == 2:
+        src = plan['from']
+        result['fromArtifact'] = inspect_side(plan_path, plan, src, *(src[k] for k in
+            ('archivePath', 'checksumPath', 'runtimePath')), source_repo)
+    return result
 
 
 def archive_check(plan_path, archive, checksum, runtime, source_repo, apply):
@@ -232,8 +358,55 @@ def require_receipt(plan_path, plan, source_repo):
     need(inspected == receipt, RECEIPT_UNVERIFIED)
 
 
+
+def store_probe_program():
+    return r'''    store=run('docker','info','--format','{"driver":{{json .Driver}},"status":{{json .DriverStatus}}}')
+    if store.returncode: raise RuntimeError()
+    info=json.loads(store.stdout)
+    driver,status=info.get('driver'),info.get('status')
+    if not isinstance(driver,str) or not driver or status is not None and not isinstance(status,list): raise RuntimeError()
+    status=[] if status is None else status
+    if not all(isinstance(x,list) and len(x)==2 and all(isinstance(v,str) for v in x) for x in status): raise RuntimeError()
+    kinds=[v for k,v in status if k=='driver-type']
+    if kinds==['io.containerd.snapshotter.v1']:
+        result['imageStore']='containerd'
+    elif not kinds and driver in ('overlay2','aufs','btrfs','devicemapper','zfs','vfs'):
+        result['imageStore']='classic'
+    else: raise RuntimeError()
+'''
+
+
+def probe_body(tag):
+    """Extend the existing read-only probe with the Engine's actual image-store kind."""
+    body = rebase_app.probe_body(tag)
+    anchor = "    result['imageId']=r.stdout.strip()"
+    need(body.count(anchor) == 1, 'staging app probe changed')
+    return body.replace(anchor, store_probe_program() + anchor)
+
+
+def install_body(installer, app, deployment, store):
+    """Assert the one explicit store before and after the unchanged one-shot installer."""
+    need(store in ('classic', 'containerd'), 'invalid app image store')
+    program = """import json, subprocess, sys
+def run(*command):
+    return subprocess.run(list(command),cwd='/opt/ezil-os-staging',text=True,stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=STORE_SECONDS)
+try:
+    result={}
+""" + store_probe_program() + """
+    if result['imageStore'] != EXPECTED_STORE: raise RuntimeError()
+except Exception:
+    print('staging image store refused',file=sys.stderr);sys.exit(1)
+"""
+    guard = "set -euo pipefail\nset +x\npython3 - <<'EZIL_APP_STORE_PY'\nEXPECTED_STORE = " + repr(store) + "\nSTORE_SECONDS = " + str(STORE_SECONDS) + "\n" + program + "\nEZIL_APP_STORE_PY\n"
+    body = rebase_app.body(installer, app, deployment)
+    # Change only the enclosing subprocess deadline, never the reviewed installer bytes.
+    need(body.count('timeout=840)') == 1, 'staging app command budget changed')
+    body = body.replace('timeout=840)', 'timeout=' + str(INSTALL_SECONDS) + ')')
+    return guard + body + guard
+
+
 def probe(plan_path, operation, tag):
-    result = rebase_ssm.run(Path(plan_path).parent, operation, rebase_app.probe_body(tag), True,
+    result = rebase_ssm.run(Path(plan_path).parent, operation, probe_body(tag), True,
                             release.aws, release.json_tool.write, fresh=True)
     need(isinstance(result, dict) and set(result) == PROBE_KEYS and isinstance(result['timers'], dict), 'invalid app probe readback')
     return result
@@ -249,12 +422,12 @@ def services_idle(observed):
     return all(t.get('service') in ('inactive', 'failed') for t in observed['timers'].values())
 
 
-def at(observed, side, deployment):
+def at(observed, side, deployment, store='classic'):
     # compose.env names the image a later restart or recreate would run; its tag must still resolve to
     # this side's image. Caddy must serve this side's SHA from /api/health.
     return (observed['gitSha'], observed['imageId'], observed['composeTag'], observed['composeImageId'], observed['servedSha'],
-            observed['killSwitch'], observed['deployment']) == \
-        (side['gitSha'], side['imageId'], side['tag'], side['imageId'], side['gitSha'], '1', deployment) and timers_running(observed)
+            observed['killSwitch'], observed['deployment'], observed['imageStore']) == \
+        (side['gitSha'], side['imageId'], side['tag'], side['imageId'], side['gitSha'], '1', deployment, store) and timers_running(observed)
 
 
 def other_in_flight():
@@ -287,7 +460,7 @@ def terminal(ledger_path, ledger, pending, state, envelope, d, side):
 
 def admit_before(plan_path, plan, generation, deployment):
     before = probe(plan_path, f'app-probe-g{generation}-before', plan['to']['tag'])
-    need(at(before, plan['from'], deployment), 'live app differs from the plan before-state')
+    need(at(before, plan['from'], deployment, image_store(plan)), 'live app differs from the plan before-state')
     need(before['lockFree'] and services_idle(before) and not other_in_flight(), 'staging host is not quiescent')
     # docker load would move an existing tag before any post-load inspection.
     need(before['tagImageId'] in (None, plan['to']['imageId']), 'candidate tag already names another image')
@@ -347,10 +520,10 @@ def swap(plan_path, source_repo, apply, ledger_path=None):
             # Nothing was sent yet; re-establish the before-state after any crash.
             admit_before(plan_path, plan, pending['generation'], deployment)
         app = {'tag': dst['tag'], 'gitSha': dst['gitSha'], 'checksumSha256': dst['checksumSha256']}
-        rebase_ssm.run(Path(plan_path).parent, operation, rebase_app.body(installer.decode('utf-8'), app, deployment), True,
+        rebase_ssm.run(Path(plan_path).parent, operation, install_body(installer.decode('utf-8'), app, deployment, image_store(plan)), True,
                        release.aws, release.json_tool.write, one_shot=True)
         after = probe(plan_path, f'app-probe-g{pending["generation"]}-after', dst['tag'])
-        need(at(after, dst, deployment), 'post-install state differs; run app-swap-reconcile')
+        need(at(after, dst, deployment, image_store(plan)), 'post-install state differs; run app-swap-reconcile')
         # As reconciliation: another install still queued or holding deploy.lock could replace the app after this row closes.
         need(after['lockFree'] and services_idle(after) and not other_in_flight(), 'staging host is not proven quiescent; retain the fence')
         check = read_secret(fd)
@@ -360,11 +533,15 @@ def swap(plan_path, source_repo, apply, ledger_path=None):
           'kill switch remains closed')
 
 
-def reconcile(plan_path, apply, ledger_path=None):
+def reconcile(plan_path, apply, ledger_path=None, source_repo=None):
     """Close this plan's pending entry only from two quiescent probes matching exactly before or expected."""
     ledger_path = Path(ledger_path or release.LEDGER_PATH)
     plan = load_plan(plan_path)
     src, dst = plan['from'], plan['to']
+    if plan['schemaVersion'] == 2:
+        need(source_repo is not None, 'v2 app-swap-reconcile requires --source-repo')
+        check_source(plan, source_repo)
+        require_receipt(plan_path, plan, source_repo)
     with release.json_tool.app_secret_lock() as fd:
         ledger = release.load_ledger(ledger_path)
         pending = ledger['entries'][-1]
@@ -384,7 +561,7 @@ def reconcile(plan_path, apply, ledger_path=None):
         second = probe(plan_path, f'app-probe-g{pending["generation"]}-reconcile-b', dst['tag'])
         need(first['lockFree'] and second['lockFree'] and (first['gitSha'], first['imageId']) == (second['gitSha'], second['imageId']) and
              services_idle(second) and not other_in_flight(), 'staging host is not proven quiescent; retain the fence')
-        side, state = (dst, 'completed') if at(second, dst, deployment) else (src, 'aborted') if at(second, src, deployment) else (None, None)
+        side, state = (dst, 'completed') if at(second, dst, deployment, image_store(plan)) else (src, 'aborted') if at(second, src, deployment, image_store(plan)) else (None, None)
         if side is None:
             # Nonsecret identities and timer names only.
             print(json.dumps({'gitSha': {'live': second['gitSha'], 'before': src['gitSha'], 'expected': dst['gitSha']},
@@ -412,4 +589,4 @@ def cli(args):
         need(args.source_repo is not None, 'app-swap requires --source-repo')
         swap(args.plan, args.source_repo, args.apply, args.ledger)
     else:
-        reconcile(args.plan, args.apply, args.ledger)
+        reconcile(args.plan, args.apply, args.ledger, args.source_repo)

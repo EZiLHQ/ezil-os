@@ -114,3 +114,71 @@ Use a new, empty, absolute release directory for this operation. `REPO` is a che
 - **After a completed swap:** run `rebase-release.sh app-swap --plan <restore plan> --source-repo <REPO> [--apply]`. It is the same one-send, probe and reconcile path. The ledger accepts it only as an undo of that exact swap, back to that swap's recorded before SHA and image ID. It uses the same installer, so it has the same restart and timer effects.
 - **If a restore itself aborts,** the ledger's latest app row is the aborted restore. It cannot be restored again; returning to 7fcc then needs a fresh reviewed `app-swap` plan from the candidate.
 - It restores the app image only. Environment files are re-rendered from the then-current secret. Secrets, the database schema, the Worker and the AMI tuple are not restored by it.
+
+
+## Explicit image-store identities (plan version 2)
+
+Version 1 is retained for classic Docker image stores: its imageId is the image
+config digest. It is refused on a containerd image store, even if a caller tries
+to substitute a config ID for the observed runtime ID. The operator reads
+Docker Engine's driver and driver-type status in every before, after and
+reconciliation probe. Unknown or ambiguous stores refuse.
+
+Use schemaVersion 2 for containerd, or for an explicitly bound classic-store
+plan. Add imageStore with exactly classic or containerd. Add configId to BOTH
+from and to. Existing imageId remains the runtime ID recorded by Docker's
+container/image inspection and by the ledger; it is never normalized:
+- classic: imageId must equal configId;
+- containerd: imageId must equal the digest of the archive index.json's single
+  tagged descriptor, and must differ from configId. The descriptor may identify
+  a manifest or one nested index containing exactly one runnable image.
+
+Version 2 additionally requires from.checksumSha256, from.archivePath,
+from.checksumPath and from.runtimePath. The three paths must be absolute and
+name the retained original app artifacts. These are evidence inputs only;
+neither app-swap nor app-restore rebuilds or rewrites them. app-archive-check
+checks the target artifacts supplied by the existing CLI arguments AND these
+from artifacts. Its receipt records both identities and both inspected archive
+sets; app-swap re-inspects all of them before any host admission or pending row.
+
+For each v2 archive, the existing exact tag, config/source/linux-amd64 and
+marker/runtime checks remain in force. The new identity check follows the
+tagged descriptor through hash- and size-checked content-addressed index,
+manifest and config blobs to exactly configId. Every declared runnable platform
+must be linux/amd64 and the config must agree. A nested index permits one
+runnable manifest and nonrunnable attestations only: their descriptor/content
+hashes and sizes, unknown/unknown descriptor/config platform and exact subject digest are checked,
+and they cannot introduce tags. Extra runnable manifests, deeper indexes,
+ambiguous descriptors, unexpected tags or links to another config refuse.
+The tagged descriptor digest, runnable manifest digest and config digest are
+recorded separately; an index digest is not called a config digest.
+
+Pre-stage the reverse v2 restore with the SAME imageStore, reversed exact
+runtime/config identities, the retained from archive pins/paths for its then
+current app, its original target marker and the exact forward plan hash in
+undoes. Ledger appImageId continues to mean the actual runtime image ID. The
+ledger's existing plan hash binds the richer identity and store fields; tuple,
+registry, gate, secret-version, source allowlist, runtime15, timer, lock,
+quiescence and one-shot journal rules are unchanged.
+
+For a v2 pending operation, app-swap-reconcile additionally requires
+--source-repo and rechecks both artifact sets before probing. Retain all
+recorded artifact paths until the operation is terminal. A different live store
+or a missing/changed artifact retains the pending fence. A restore cannot change
+stores, and changing the plan's image IDs alone is not an admission repair. The same
+store detector is asserted immediately before and after the unchanged installer
+inside its one-shot command; this does not add another install or submission.
+
+This change is in the operator only. The staging installer and every runtime
+archive member are unchanged. A reviewed newer operator can validate qualified
+S3/S4 app sources against the baked S3 agent without claiming that the operator
+source itself is the app or baked source. Actual host-store readback and normal
+release/lease/gate authorization are still required; offline tests and archive
+checks alone do not authorize a live swap.
+
+
+The one-shot command keeps SSM's 900-second execution limit. Each pre/post
+Docker info detector has a 10-second subprocess deadline, the enclosing
+installer subprocess has 750 seconds, and the existing Node readback has 60:
+830 seconds in total, leaving 70 seconds for command/process overhead. Only
+the enclosing deadline changes; install-host.sh bytes stay unchanged.
