@@ -1,3 +1,4 @@
+import { codeAuthRecovery } from './code-auth-recovery';
 /**
  * AWS computers: the Worker side of the gateway to an AWS host.
  *
@@ -410,7 +411,8 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
   }
 
   const cookieOk = await verifyPreviewCookie(readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME), secrets, sandboxId);
-  if (!cookieOk) return json({ ok: false, error: 'aws_preview_auth_required' }, 401);
+  if (!cookieOk) return (port === CODE_PREVIEW_PORT ? codeAuthRecovery(request, deps.codeShellOrigins) : null)
+    ?? json({ ok: false, error: 'aws_preview_auth_required' }, 401);
   if (!deps.zone) return unavailable();
   const record = await deps.lookup(sandboxId);
   if (!record || record.sandboxId !== sandboxId || !isAwsOriginFresh(record, deps.nowMs())) return unavailable();
