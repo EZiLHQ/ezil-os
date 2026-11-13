@@ -139,13 +139,13 @@ export async function handleCommand(deps: OperatorEntitlementDeps, body: Record<
                 // Tolerance accepts sender clock skew, never scheduling: the period begins at the server's now.
                 const startsAt = now;
                 // Server-authoritative period: an operator plan runs the plan's source-defined one calendar month
-                // (billing/v3/trial.ts addCalendarMonthUtc), anchored at the server's start. The operator never picks
-                // the end, until-revoked is not supported, and a forged end that is not this month is refused.
+                // (billing/v3/trial.ts addCalendarMonthUtc), anchored at the server's start, and only that computed end is
+                // stored. A well-formed ends_at on the frozen v1 wire is a non-authoritative hint: it is never compared
+                // with this end (a sender start across midnight or a late retry of an unsaved command would differ) and it
+                // can never extend access because it never determines the stored end. Until-revoked is not supported.
                 const validity = command.validity!;
                 if ('until_revoked' in validity) return refuse('invalid_command', 'An operator plan runs one calendar month; until-revoked is not supported.');
-                const endsAt = addCalendarMonthUtc(startsAt);
-                if (Math.abs(new Date(validity.ends_at).getTime() - endsAt.getTime()) > START_TOLERANCE_MS) return refuse('invalid_command', 'ends_at must be one calendar month after the start.');
-                if (stripe.paidAccess || stripe.checkoutOpen) return paidConflict();
+                const endsAt = addCalendarMonthUtc(startsAt);                if (stripe.paidAccess || stripe.checkoutOpen) return paidConflict();
                 const current = rows.find(live);
                 if (current && (current.endsAt === null || current.endsAt.getTime() > now.getTime())) return refuse('invalid_command', 'An operator assignment is already in effect for this account; change or end it.');
                 // A live grant that lapsed by its own end date is closed at that date before the new one starts.
