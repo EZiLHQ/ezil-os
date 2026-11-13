@@ -434,6 +434,18 @@ test(`transaction protocol (${process.env.PRODUCTION_MIGRATIONS_DOCKER === '1' ?
       assert.equal((await state()).digest, before.digest, 'Rollback restores the fingerprint');
     }
   });
+  await t.test('generated column versions do not drift on recreation but configured column options do', async () => {
+    await fixture();
+    const before = await state();
+    await db.exec('DROP TABLE app.existing; CREATE TABLE app.existing(id integer);');
+    assert.deepEqual(await state(), before, 'Identical definitions survive generated column-version changes');
+    for (const option of ['n_distinct=0.25', 'n_distinct_inherited=0.5']) {
+      const after = (await db.rolledBackRows('ALTER TABLE app.existing ALTER COLUMN id SET (' + option + ');', catalogSQL(['app'])))[0];
+      assert.notEqual(after.digest, before.digest, 'Configured ' + option + ' remains fingerprinted');
+      assert.equal(after.objects, before.objects);
+      assert.deepEqual(await state(), before, 'Rollback restores configured options and the fingerprint');
+    }
+  });
   await t.test('F9 accepted unique-index vectors are valid PostgreSQL and each changes the catalog', async () => {
     await db.exec(`ROLLBACK; DROP SCHEMA IF EXISTS ezil_ci CASCADE; DROP SCHEMA IF EXISTS app CASCADE; CREATE SCHEMA app; ${uniqueVectors.setup}`);
     const before = await state();
