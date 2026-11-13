@@ -9,10 +9,10 @@ const require = createRequire(path.join(process.env.PLAYWRIGHT_REQUIRE_DIR || '/
 let chromium;
 try { ({ chromium } = require('playwright')); } catch { console.log('SKIP playwright not resolvable'); process.exit(2); }
 const source = stripTypeScriptTypes(readFileSync(new URL('../../../worker/src/code-auth-recovery.ts', import.meta.url), 'utf8'));
-const { codeAuthRecovery } = await import(`data:text/javascript,${encodeURIComponent(source)}`);
+const { codeAuthRecovery, codeOriginRecovery } = await import(`data:text/javascript,${encodeURIComponent(source)}`);
 const assets = process.env.EZIL_SHELL_OUT_DIR || new URL('../../../app/public/os/', import.meta.url).pathname;
 const computerId = '11111111-1111-4111-8111-111111111111';
-let running = true, documents = 0, mints = 0, editorOrigin, oldShell = false, authExpired = false, editorHealthy = false;
+let running = true, documents = 0, mints = 0, editorOrigin, oldShell = false, authExpired = false, editorHealthy = false, originDown = false;
 const topPaths = [];
 const shell = createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -46,10 +46,11 @@ const editor = createServer(async (req, res) => {
     if (url.pathname === '/preview-bootstrap') {
         res.writeHead(302, { location: '/?folder=/workspace&ezil_mint=' + (url.searchParams.get('ezil_mint') ?? '') }); res.end(); return;
     }
-    if (editorHealthy && url.pathname === '/') {
+    if (editorHealthy && !originDown && url.pathname === '/') {
         res.setHeader('content-type','text/html'); res.end('<html><body><button onclick="location.reload()">Reload Code</button></body></html>'); return;
     }
-    const response = codeAuthRecovery(new Request(url, { headers: { 'sec-fetch-dest': 'iframe' } }), ['https://os-staging.ezil.work']);
+    // S13: the actual Worker's 502 document for an unavailable origin (tunnel absent/fenced/other epoch), never raw JSON.
+    const response = (originDown ? codeOriginRecovery : codeAuthRecovery)(new Request(url, { headers: { 'sec-fetch-dest': 'iframe' } }), ['https://os-staging.ezil.work']);
     if (!response) { res.writeHead(404); res.end(); return; }
     res.writeHead(response.status, Object.fromEntries(response.headers)); res.end(await response.text());
 });
@@ -60,8 +61,9 @@ editorOrigin = `http://127.0.0.1:${editor.address().port}`;
 const browser = await chromium.launch({ headless: true, args: ['--no-sandbox','--disable-dev-shm-usage'],
     ...(process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE ? { executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE } : {}) });
 try {
-    for (const scenario of ['running', 'stopped', 'old-shell', 'auth-expired']) {
-        running = scenario !== 'stopped'; oldShell = scenario === 'old-shell'; authExpired = false; editorHealthy = scenario === 'auth-expired';
+    for (const scenario of ['running', 'stopped', 'old-shell', 'auth-expired', 'origin-unavailable']) {
+        running = scenario !== 'stopped'; oldShell = scenario === 'old-shell'; authExpired = false; originDown = false;
+        editorHealthy = scenario === 'auth-expired' || scenario === 'origin-unavailable';
         documents = 0; mints = 0; topPaths.length = 0;
         const context = await browser.newContext();
         await context.addInitScript(({computerId, oldShell}) => {
@@ -92,6 +94,39 @@ try {
             await page.waitForURL('https://os-staging.ezil.work/app/code');
             assert.ok((await page.textContent('body')).includes('Authenticated OS rebootstrap fixture'));
             console.log('PASS old-shell absent-handler compatibility: real sandbox permits user-click fixed trusted OS top link');
+            await context.close(); continue;
+        }
+        if (scenario === 'origin-unavailable') {
+            // S13: a confirmed editor whose origin then goes away (a placement change, an idle stop). Code's own
+            // Reload inside the frame lands on the Worker's 502 document, never raw JSON; the shell reopens once
+            // through the mint, then says Code is unreachable until an explicit Try again; the OS never reloads.
+            const reloadCode = page.frameLocator('.window-app-iframe').getByRole('button',{name:'Reload Code'});
+            await reloadCode.waitFor({state:'visible'});
+            await page.waitForFunction(() => document.querySelector('.ezil-app-spinner')?.hidden === true);
+            assert.equal(mints,1);
+            originDown = true; await reloadCode.click();
+            const unavailable = page.locator('.ezil-code-unavailable');
+            await page.waitForFunction(() => document.querySelector('.ezil-code-unavailable')?.hidden === false);
+            assert.equal(mints,2,'one automatic reopen through the mint, then the guard holds');
+            assert.equal(documents,1,'the OS route never reloads for an unavailable origin');
+            assert.ok(topPaths.every(p=>p===target));
+            const frameText = await page.frameLocator('.window-app-iframe').locator('body').textContent();
+            assert.ok(frameText.includes("Code can't reach your computer"), 'the frame shows the recovery document, not JSON');
+            assert.ok(!frameText.includes('aws_origin_unavailable'));
+            await page.waitForTimeout(300); assert.equal(mints,2,'no reopen loop while the origin stays down');
+            // The explicit Try again is the same reopen; while the origin stays down it ends unreachable again.
+            await unavailable.getByRole('button',{name:'Try again'}).click();
+            await page.waitForFunction(() => document.querySelector('.ezil-app-spinner')?.hidden === false);
+            await page.waitForFunction(() => document.querySelector('.ezil-code-unavailable')?.hidden === false);
+            assert.equal(mints,3); assert.equal(documents,1);
+            // The origin comes back: Try again reopens the editor and the cover goes.
+            originDown = false;
+            await unavailable.getByRole('button',{name:'Try again'}).click();
+            await reloadCode.waitFor({state:'visible'});
+            await page.waitForFunction(() => document.querySelector('.ezil-app-spinner')?.hidden === true
+                && document.querySelector('.ezil-code-unavailable')?.hidden === true);
+            assert.equal(mints,4); assert.equal(documents,1);
+            console.log('PASS actual Code502 origin document: one guarded reopen, unreachable cover with Try again, recovery when the origin returns; never raw JSON, never an OS reload');
             await context.close(); continue;
         }
         if (scenario === 'auth-expired') {
