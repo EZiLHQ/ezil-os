@@ -179,9 +179,7 @@ describe('ezil-os commands: assign, change, end', () => {
         ['a stale catalog revision', { product: { ref: 'standard_monthly_v3', catalog_revision: 'v3.2026-11-04' } }, 'catalog_revision_mismatch'],
         ['a scheduled start', { starts_at: later(301_000).toISOString() }, 'invalid_command'],
         ['a back-dated start', { starts_at: later(-301_000).toISOString() }, 'invalid_command'],
-        ['an end in the past', { validity: { ends_at: later(-1000).toISOString() } }, 'invalid_command'],
         ['until-revoked', { validity: { until_revoked: true } }, 'invalid_command'],
-        ['a forged end that is not one calendar month', { validity: { ends_at: new Date(MONTH_END.getTime() + 3_600_000).toISOString() } }, 'invalid_command'],
         ['a malformed command', { quantity: 2 }, 'invalid_command'],
     ])('assign refuses %s without access writes', async (_name, over, code) => {
         const h = harness();
@@ -247,13 +245,67 @@ describe('ezil-os commands never replace Stripe', () => {
 describe('ezil-os operator plans run one source-defined calendar month', () => {
     const paid: StripeView = { paidAccess: true, computeActive: true, productRef: 'standard_monthly_v3', state: 'active', checkoutOpen: false };
 
-    it('stores the server-computed one-calendar-month end, not the sent end (a within-tolerance sent end is accepted)', async () => {
+    it.each([
+        ['a clock-skewed end', new Date(MONTH_END.getTime() + 200_000)],
+        ['an end in the past', later(-1000)],
+        ['a forged far-future end', new Date(MONTH_END.getTime() + 365 * DAY)],
+        ['a forged short end', later(DAY)],
+    ])('ignores %s on the frozen v1 wire and stores only the server-computed one-calendar-month end', async (_name, sent) => {
         const h = harness();
-        // The Gateway's disclosed end, 200 s off the server's computed end (clock skew), is accepted but never stored verbatim.
-        const skewed = new Date(MONTH_END.getTime() + 200_000).toISOString();
-        const r = await run(h, command({ validity: { ends_at: skewed } }));
+        const r = await run(h, command({ validity: { ends_at: sent.toISOString() } }));
         expect(r).toMatchObject({ outcome: 'applied', assignment: { starts_at: T0.toISOString(), ends_at: MONTH_END.toISOString() } });
         expect(h.rows[0]!.endsAt).toEqual(MONTH_END);
+    });
+
+    it.each([
+        // Sender start just before midnight, server start just after: the computed end follows the server, never the sender.
+        ['30 Jan 23:59:59.5 sender vs 31 Jan 00:00:00.4 server (→ 28 Feb)', '2026-01-30T23:59:59.500Z', '2026-01-31T00:00:00.400Z'],
+        ['28 Jan sender vs 29 Jan server, non-leap', '2026-01-28T23:59:59.500Z', '2026-01-29T00:00:00.400Z'],
+        ['30 Mar sender vs 31 Mar server (→ 30 Apr)', '2026-03-30T23:59:59.500Z', '2026-03-31T00:00:00.400Z'],
+    ])('a start across midnight applies (%s) and stores the clamped server end', async (_name, senderStart, serverNow) => {
+        const h = harness();
+        h.state.now = new Date(serverNow);
+        const senderEnd = addCalendarMonthUtc(new Date(senderStart));
+        const r = await run(h, command({ starts_at: senderStart, validity: { ends_at: senderEnd.toISOString() } }));
+        const canonical = addCalendarMonthUtc(new Date(serverNow));
+        expect(r).toMatchObject({ outcome: 'applied', assignment: { starts_at: new Date(serverNow).toISOString(), ends_at: canonical.toISOString() } });
+        expect(h.rows[0]!.endsAt).toEqual(canonical);
+    });
+
+    it('a first attempt that was never stored can be retried with the same frozen body more than 5 min later', async () => {
+        const h = harness();
+        const body = command();   // frozen at T0: starts_at null, ends_at = the sender's T0 + one month hint
+        // The first delivery was lost before the source stored anything; the identical body arrives 6 min later.
+        h.state.now = later(6 * 60_000);
+        expect(h.events.size).toBe(0);
+        const r = await run(h, body);
+        const canonical = addCalendarMonthUtc(h.state.now);
+        expect(r).toMatchObject({ outcome: 'applied', assignment: { starts_at: h.state.now.toISOString(), ends_at: canonical.toISOString() } });
+        expect(h.rows[0]!.endsAt).toEqual(canonical);
+        // That stored result then replays unchanged.
+        h.state.now = later(20 * 60_000);
+        expect(await run(h, body)).toEqual({ ...r, outcome: 'replayed' });
+    });
+
+    it('a stored refusal replays as that refusal, not as a fresh evaluation', async () => {
+        const h = harness({ stripe: { ...NO_STRIPE, state: 'incomplete', checkoutOpen: true } });
+        const body = command();
+        const first = await run(h, body);
+        expect(first).toMatchObject({ outcome: 'refused', refusal: { code: 'paid_subscription_conflict' } });
+        h.state.stripe = NO_STRIPE;
+        h.state.now = later(6 * 60_000);
+        expect(await run(h, body)).toEqual(first);
+        expect(h.rows).toHaveLength(0);
+    });
+
+    it('a stored result replays unchanged later, even across a month boundary', async () => {
+        const h = harness();
+        const body = command();
+        const first = await run(h, body);
+        h.state.now = new Date(MONTH_END.getTime() + 2 * DAY);
+        expect(await run(h, body)).toEqual({ ...first, outcome: 'replayed' });
+        expect(h.rows[0]!.endsAt).toEqual(MONTH_END);
+        expect(h.rows).toHaveLength(1);
     });
 
     it('clamps the one-calendar-month period to month end (31 Jan → 28 Feb)', async () => {
