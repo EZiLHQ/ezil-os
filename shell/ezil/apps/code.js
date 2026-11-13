@@ -1176,8 +1176,6 @@ export async function openCodeWindow (ctx = {}) {
                 });
                 // Per-tab folder continuity: bind THIS frame's editor (origin + source + per-hello nonce + mint id).
                 if ( ! nativeSurface ) {
-                    // S13: a confirmed editor ends the unavailable-origin episode (one automatic reopen per episode).
-                    resetOriginRecovery();
                     const bind = { userId: session.payload()?.user?.id, computerId: computer.id, project };
                     folder_notice?.close();
                     folder_notice = createFolderNotice(el_body, {
@@ -1195,7 +1193,13 @@ export async function openCodeWindow (ctx = {}) {
                     });
                     attachFolderBridge({
                         iframe: el_iframe, frameUrl: frame_url, bind, notice: folder_notice,
-                        onRoot: on_root, onOpen: on_open, onLeaving: on_leaving,
+                        // S13: only a GENUINE workbench document ends the unavailable-origin episode (one automatic
+                        // reopen per episode): the bridge hears a root only from this frame's window, at the minted
+                        // origin, answering this binding's hello nonce with this mint's id. The server's HTTP
+                        // confirmation above is not that (the 502 recovery page installs no bridge), so a probe that
+                        // answers while the frame still shows that page cannot re-arm the automatic reopen.
+                        onRoot: (root, how) => { resetOriginRecovery(); on_root(root, how); },
+                        onOpen: on_open, onLeaving: on_leaving,
                     });
                     if ( link_folder_problem ) { folder_notice.fallback(link_folder_problem, null); link_folder_problem = null; }
                 }
