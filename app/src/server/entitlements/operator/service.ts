@@ -14,6 +14,7 @@
  * - one live operator assignment per account; starts are never scheduled or back-dated; validity is explicit.
  */
 import { operatorGrantInEffect, isOperatorSku, type OperatorEntitlementRow, type OperatorSku } from '@/server/billing/v3/operator-access';
+import { addCalendarMonthUtc } from '@/server/billing/v3/trial';
 import {
     assignmentView, FORMATS, InvalidCommand, NO_ACCESS, parseCommand, payloadSha256, PRODUCER, refused, SCOPE, sourceCatalog,
     START_TOLERANCE_MS, type Command, type EffectiveAccess, type IndividualTarget, type Result,
@@ -117,7 +118,6 @@ export async function handleCommand(deps: OperatorEntitlementDeps, body: Record<
                 if (command.product!.catalog_revision !== catalogRevision) return refuse('catalog_revision_mismatch', 'The EZiL OS catalog changed; reload it and try again.');
                 return ref;
             };
-            const endOf = (validity: NonNullable<Command['validity']>): Date | null => 'until_revoked' in validity ? null : new Date(validity.ends_at);
             const write = async (row: OperatorEntitlementRow, apply: () => Promise<boolean>) => {
                 if (!await apply()) return refuse('stale_revision', 'The assignment changed meanwhile; reload it and try again.');
                 const next = rows.filter(other => other.ref !== row.ref).concat(row);
@@ -136,11 +136,15 @@ export async function handleCommand(deps: OperatorEntitlementDeps, body: Record<
                 if (typeof sku !== 'string') return sku;
                 const requestedStart = command.starts_at === null ? now : new Date(command.starts_at);
                 if (Math.abs(requestedStart.getTime() - now.getTime()) > START_TOLERANCE_MS) return refuse('invalid_command', 'starts_at must be now: scheduled and back-dated assignments are not supported.');
-                // Tolerance accepts sender clock skew, never scheduling: validity begins at the server's now.
+                // Tolerance accepts sender clock skew, never scheduling: the period begins at the server's now.
                 const startsAt = now;
-                const endsAt = endOf(command.validity!);
-                if (endsAt !== null && endsAt.getTime() <= now.getTime()) return refuse('invalid_command', 'ends_at must be in the future.');
-                if (endsAt !== null && endsAt.getTime() <= startsAt.getTime()) return refuse('invalid_command', 'ends_at must be after starts_at.');
+                // Server-authoritative period: an operator plan runs the plan's source-defined one calendar month
+                // (billing/v3/trial.ts addCalendarMonthUtc), anchored at the server's start. The operator never picks
+                // the end, until-revoked is not supported, and a forged end that is not this month is refused.
+                const validity = command.validity!;
+                if ('until_revoked' in validity) return refuse('invalid_command', 'An operator plan runs one calendar month; until-revoked is not supported.');
+                const endsAt = addCalendarMonthUtc(startsAt);
+                if (Math.abs(new Date(validity.ends_at).getTime() - endsAt.getTime()) > START_TOLERANCE_MS) return refuse('invalid_command', 'ends_at must be one calendar month after the start.');
                 if (stripe.paidAccess || stripe.checkoutOpen) return paidConflict();
                 const current = rows.find(live);
                 if (current && (current.endsAt === null || current.endsAt.getTime() > now.getTime())) return refuse('invalid_command', 'An operator assignment is already in effect for this account; change or end it.');
@@ -161,23 +165,21 @@ export async function handleCommand(deps: OperatorEntitlementDeps, body: Record<
                 return write(row, () => store.updateAssignment(target.ref, target.revision, row));
             }
 
-            // change: product and/or validity; the start may only be restated.
+            // change: product only (Standard <-> Premium). The one-calendar-month period is fixed at assign and is
+            // preserved across a product change; validity is never restated or extended here (use end to stop early).
+            // The start may only be restated.
+            if (command.validity !== null) return refuse('invalid_command', 'An operator plan runs one calendar month; validity cannot be changed — use end to stop access.');
             if (command.starts_at !== null && new Date(command.starts_at).getTime() !== target.startsAt.getTime()) {
                 return refuse('invalid_command', 'starts_at cannot move; restate the current start or send null.');
             }
-            let sku: OperatorSku = target.sku;
-            if (command.product !== null) {
-                const next = product();
-                if (typeof next !== 'string') return next;
-                sku = next;
-            }
-            const endsAt = command.validity === null ? target.endsAt : endOf(command.validity);
-            if (endsAt !== null && endsAt.getTime() <= now.getTime()) return refuse('invalid_command', 'ends_at must be in the future; use end to stop access now.');
-            if (sku === target.sku && (endsAt?.getTime() ?? null) === (target.endsAt?.getTime() ?? null)) return refuse('invalid_command', 'Nothing would change.');
-            const givesMore = RANK[sku] > RANK[target.sku] || (endsAt === null && target.endsAt !== null)
-                || (endsAt !== null && target.endsAt !== null && endsAt.getTime() > target.endsAt.getTime());
+            // The parser requires a product or a validity on change; with validity refused above, the product is present.
+            const sku = product();
+            if (typeof sku !== 'string') return sku;
+            if (sku === target.sku) return refuse('invalid_command', 'Nothing would change.');
+            // Only an upgrade gives more; the preserved period end never does.
+            const givesMore = RANK[sku] > RANK[target.sku];
             if (givesMore && (stripe.paidAccess || stripe.checkoutOpen)) return paidConflict();
-            const row = { ...target, revision: target.revision + 1, sku, endsAt };
+            const row = { ...target, revision: target.revision + 1, sku, endsAt: target.endsAt };
             return write(row, () => store.updateAssignment(target.ref, target.revision, row));
         });
         if (result.outcome === 'refused') {

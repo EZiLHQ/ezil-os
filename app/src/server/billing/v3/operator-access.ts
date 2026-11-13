@@ -44,7 +44,8 @@ export function operatorPlan(grant: OperatorEntitlementRow, free: ResolvedPlanV3
     const offer = CATALOG_V3[grant.sku];
     // The v2 family the v3 resolver maps each paid SKU to (catalog.ts planFromSubscriptions).
     const family = CATALOG_V2[grant.sku === 'standard_monthly_v3' ? 'standard_monthly_v2' : 'compute_monthly_v2'].family;
-    // The calendar-month window Free uses: there is no billing period, and paid usage is never capped by it.
+    // Usage is metered on the Free calendar-month window and paid usage is never capped by it; the grant's own
+    // one-calendar-month validity (startsAt..endsAt) governs access, not metering.
     return { sku: grant.sku, offer, legacy: null, legacyFree: free.legacyFree, sessionMaxSeconds: offer.sessionMaxSeconds, family,
         status: 'active', planActive: true, subscriptionId: null, window: free.window, renewsAt: null, cancelsAt: null, operator: grant };
 }
