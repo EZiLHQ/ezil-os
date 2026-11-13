@@ -1,4 +1,4 @@
-import { codeAuthRecovery } from './code-auth-recovery';
+import { codeAuthRecovery, codeOriginRecovery } from './code-auth-recovery';
 /**
  * AWS computers: the Worker side of the gateway to an AWS host.
  *
@@ -265,6 +265,15 @@ function json(body: unknown, status = 200, headers: Record<string, string> = {})
 
 const unavailable = (): Response => json({ ok: false, error: 'aws_origin_unavailable' }, 502);
 
+/**
+ * A forwarded answer that came from the path to the origin rather than from code-server: GW-1 answers 502 with
+ * no connector for the epoch, 503/504 while one is coming up or timing out. code-server's own answers for its
+ * workbench document are 2xx/3xx (or 401/403 for its auth), never these.
+ */
+export function isOriginGatewayFailure(status: number): boolean {
+  return status === 502 || status === 503 || status === 504;
+}
+
 function readCookie(header: string | null, name: string): string | undefined {
   for (const part of (header ?? '').split(';')) {
     const i = part.indexOf('=');
@@ -413,9 +422,14 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
   const cookieOk = await verifyPreviewCookie(readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME), secrets, sandboxId);
   if (!cookieOk) return (port === CODE_PREVIEW_PORT ? codeAuthRecovery(request, deps.codeShellOrigins) : null)
     ?? json({ ok: false, error: 'aws_preview_auth_required' }, 401);
-  if (!deps.zone) return unavailable();
+  // Code's workbench NAVIGATION never renders the JSON refusal: a tunnel that is absent, fenced or of another
+  // epoch (a placement change, an idle stop), or an origin that does not answer behind it, gets the recovery
+  // document (`./code-auth-recovery.ts` codeOriginRecovery), which the shell turns into a checked state.
+  // Everything else (fetch, assets, WebSockets, other ports) keeps the 502 JSON.
+  const originDown = (): Response => (port === CODE_PREVIEW_PORT ? codeOriginRecovery(request, deps.codeShellOrigins) : null) ?? unavailable();
+  if (!deps.zone) return originDown();
   const record = await deps.lookup(sandboxId);
-  if (!record || record.sandboxId !== sandboxId || !isAwsOriginFresh(record, deps.nowMs())) return unavailable();
+  if (!record || record.sandboxId !== sandboxId || !isAwsOriginFresh(record, deps.nowMs())) return originDown();
   if (port === AWS_DESKTOP_PORT && request.method === 'GET') {
     // Reuse CF's usr/pwd/embed auto-connect, but keep the real password
     // out of browser URLs, history and client-side WebSocket diagnostics.
@@ -447,8 +461,23 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
       }
     }
   }
-  const answered = await proxyToAwsOrigin(request, url, record, deps.zone, port, deps.fetch, Math.floor(deps.nowMs() / 1000));
+  let answered: Response;
+  try {
+    answered = await proxyToAwsOrigin(request, url, record, deps.zone, port, deps.fetch, Math.floor(deps.nowMs() / 1000));
+  } catch {
+    // A fetch exception may contain its URL: never propagate or log it. The document gets the recovery UI.
+    return originDown();
+  }
   if (port === CODE_PREVIEW_PORT && isWorkbenchDocumentRequest(request.method, url.pathname, request.headers.get('upgrade'))) {
+    if (isOriginGatewayFailure(answered.status)) {
+      // The tunnel's gateway (no connector for this epoch) or the host answered that code-server is not there.
+      // The origin's body is dropped unread: nothing of it is shown or reflected.
+      const recovery = codeOriginRecovery(request, deps.codeShellOrigins);
+      if (recovery) {
+        try { await answered.body?.cancel(); } catch { /* already consumed or absent */ }
+        return recovery;
+      }
+    }
     return withCodeFolderBridge(answered, deps.codeShellOrigins ?? []);
   }
   return answered;
