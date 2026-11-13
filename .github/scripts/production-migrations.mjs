@@ -237,6 +237,10 @@ export async function validate(root, manifestPath = '.github/production-migratio
 // OIDs are resolved to stable identities; physical/statistical state is excluded.
 export function catalogSQL(schemas, includeBody = false) {
   const selected = schemas.map(literal).join(',');
+  // Some PostgreSQL builds expose a generated column version in attoptions.
+  // It changes on identical DROP/CREATE and is not a schema definition. Keep
+  // every configured option (and its order/NULL/empty-array representation).
+  const columnOptions = "CASE WHEN EXISTS (SELECT 1 FROM unnest(a.attoptions) opt WHERE opt ~ '^pg_attver=[0-9]+$') THEN (SELECT array_agg(opt ORDER BY ord) FROM unnest(a.attoptions) WITH ORDINALITY options(opt,ord) WHERE opt IS NULL OR opt !~ '^pg_attver=[0-9]+$') ELSE a.attoptions END";
   const identity = (catalog, oid) => `(CASE WHEN ${oid}<>0 THEN (pg_identify_object('pg_${catalog}'::regclass,${oid},0)).identity END)`;
   return `WITH ns AS (SELECT * FROM pg_namespace WHERE nspname IN (${selected})), families AS (SELECT f.* FROM pg_opfamily f JOIN ns n ON n.oid=f.opfnamespace), addresses AS (
     SELECT d.classid,d.objid,d.objsubid FROM pg_depend d JOIN ns n ON d.refclassid='pg_namespace'::regclass AND d.refobjid=n.oid
@@ -246,7 +250,7 @@ export function catalogSQL(schemas, includeBody = false) {
   ), objects AS (
     SELECT 'schema' kind, nspname identity, jsonb_build_array(pg_get_userbyid(nspowner), nspacl::text) definition FROM ns
     UNION ALL SELECT 'relation', n.nspname||'.'||c.relname, jsonb_build_array(c.relkind,c.relpersistence,pg_get_userbyid(c.relowner),c.relacl::text,c.relrowsecurity,c.relforcerowsecurity,c.relreplident,c.reloptions,c.relispartition,pg_get_expr(c.relpartbound,c.oid),CASE WHEN c.relkind='p' THEN pg_get_partkeydef(c.oid) END,CASE WHEN c.relkind IN ('v','m') THEN pg_get_viewdef(c.oid,false) END) FROM pg_class c JOIN ns n ON n.oid=c.relnamespace
-    UNION ALL SELECT 'column', n.nspname||'.'||c.relname||'.'||a.attnum, jsonb_build_array(a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,a.attidentity,a.attgenerated,a.attisdropped,a.attacl::text,a.attoptions,cn.nspname,co.collname,pg_get_expr(d.adbin,d.adrelid)) FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN ns n ON n.oid=c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum LEFT JOIN pg_collation co ON co.oid=a.attcollation LEFT JOIN pg_namespace cn ON cn.oid=co.collnamespace WHERE a.attnum>0
+    UNION ALL SELECT 'column', n.nspname||'.'||c.relname||'.'||a.attnum, jsonb_build_array(a.attname,format_type(a.atttypid,a.atttypmod),a.attnotnull,a.attidentity,a.attgenerated,a.attisdropped,a.attacl::text,${columnOptions},cn.nspname,co.collname,pg_get_expr(d.adbin,d.adrelid)) FROM pg_attribute a JOIN pg_class c ON c.oid=a.attrelid JOIN ns n ON n.oid=c.relnamespace LEFT JOIN pg_attrdef d ON d.adrelid=c.oid AND d.adnum=a.attnum LEFT JOIN pg_collation co ON co.oid=a.attcollation LEFT JOIN pg_namespace cn ON cn.oid=co.collnamespace WHERE a.attnum>0
     UNION ALL SELECT 'constraint', n.nspname||'.'||COALESCE(c.relname,t.typname)||'.'||x.conname, jsonb_build_array(pg_get_constraintdef(x.oid,false),x.convalidated,x.condeferrable,x.condeferred) FROM pg_constraint x JOIN ns n ON n.oid=x.connamespace LEFT JOIN pg_class c ON c.oid=x.conrelid LEFT JOIN pg_type t ON t.oid=x.contypid
     UNION ALL SELECT 'index', n.nspname||'.'||c.relname, jsonb_build_array(pg_get_indexdef(x.indexrelid),x.indisvalid,x.indisready,x.indisreplident) FROM pg_index x JOIN pg_class c ON c.oid=x.indexrelid JOIN ns n ON n.oid=c.relnamespace
     UNION ALL SELECT 'routine', n.nspname||'.'||p.proname||'('||pg_get_function_identity_arguments(p.oid)||')', jsonb_build_array(CASE WHEN p.prokind<>'a' THEN pg_get_functiondef(p.oid) ELSE p.prosrc END,pg_get_userbyid(p.proowner),p.proacl::text,p.proconfig,p.prokind,p.provolatile,p.prosecdef) FROM pg_proc p JOIN ns n ON n.oid=p.pronamespace
