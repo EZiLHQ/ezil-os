@@ -317,6 +317,25 @@ describe('ezil-os operator plans run one source-defined calendar month', () => {
         expect(h.rows[0]!.endsAt).toEqual(new Date('2026-02-28T20:00:00.000Z'));
     });
 
+    it('clamps to 29 Feb in a leap year (31 Jan 2028 → 29 Feb 2028)', async () => {
+        const h = harness();
+        h.state.now = new Date('2028-01-31T20:00:00.000Z');
+        const r = await run(h, command({ validity: { ends_at: '2028-03-02T20:00:00.000Z' } }));
+        expect(r).toMatchObject({ outcome: 'applied', assignment: { ends_at: '2028-02-29T20:00:00.000Z' } });
+        expect(h.rows[0]!.endsAt).toEqual(new Date('2028-02-29T20:00:00.000Z'));
+    });
+
+    it('access holds until the exact stored end and stops at it (read-time expiry, no command needed)', async () => {
+        const h = harness();
+        await run(h, command());
+        const read = async () => (await readAssignments(h.deps, { kind: 'individual', os_user_id: USER, account_public_id: ACCOUNT }))!.effective_access;
+        h.state.now = new Date(MONTH_END.getTime() - 1);
+        expect(await read()).toMatchObject({ state: 'active', via: 'operator', product_ref: 'standard_monthly_v3' });
+        h.state.now = MONTH_END;
+        expect(await read()).toMatchObject({ state: 'none', via: null, product_ref: null });
+        expect(h.state.accessWrites).toBe(1);   // expiry is read-time: nothing was rewritten or deleted
+    });
+
     it('after the operator month expires, access recomputes to a covering Stripe plan (files untouched)', async () => {
         const h = harness();
         await run(h, command());
