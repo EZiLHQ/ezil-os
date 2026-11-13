@@ -1,4 +1,4 @@
-import { attachCodeAuthRecovery } from './code-auth-recovery.js';
+import { attachCodeAuthRecovery, resetOriginRecovery } from './code-auth-recovery.js';
 import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../native-runtime.js';
 // code.js — EZiL-authored. Not Puter code.
 //
@@ -1106,6 +1106,13 @@ export async function openCodeWindow (ctx = {}) {
             desktopRunning: () => session.desktopRunning(computer.id),
             onStopped: () => show_state('stopped'),
             onUnknown: (retry) => { show_state('unknown'); return_probe_retry = retry; },
+            // S13: the editor document says the computer's origin is not up (the Worker's 502 recovery page,
+            // never raw JSON). A running computer gets ONE automatic reopen through the mint, whose own wake
+            // clock waits for the origin truthfully; a second such document inside the guard window becomes
+            // "Code isn't reachable right now", whose Try again is this same reopen.
+            reopen: () => { void start_boot(); },
+            // Terminal for this attempt: a confirmation still in flight must not hide the panel again.
+            onUnreachable: () => { stop_timers(); show_unavailable(); },
         });
         el_iframe.src = code_preview_url;
         // Bind at mint handoff, before confirmation, so startup failures can answer the hello too.
@@ -1164,6 +1171,8 @@ export async function openCodeWindow (ctx = {}) {
                 });
                 // Per-tab folder continuity: bind THIS frame's editor (origin + source + per-hello nonce + mint id).
                 if ( ! nativeSurface ) {
+                    // S13: a confirmed editor ends the unavailable-origin episode (one automatic reopen per episode).
+                    resetOriginRecovery();
                     const bind = { userId: session.payload()?.user?.id, computerId: computer.id, project };
                     folder_notice?.close();
                     folder_notice = createFolderNotice(el_body, {
