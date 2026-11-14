@@ -1,0 +1,81 @@
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "R5 exception: SSM-agent-only role and instance profile for fresh lower-attestation maintenance hosts (account 452630323510, ap-south-1). Never attach to customer hosts.",
+  "Resources": {
+    "MaintenanceRole": {
+      "Type": "AWS::IAM::Role",
+      "DeletionPolicy": "Delete",
+      "UpdateReplacePolicy": "Delete",
+      "Properties": {
+        "RoleName": "ezil-attest-maintenance-host",
+        "Path": "/ezil/r5-attestation/",
+        "Description": "Fresh lower-attestation maintenance host only: SSM agent registration and channels. No managed policy, boundary or other rights.",
+        "MaxSessionDuration": 3600,
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {"Service": "ec2.amazonaws.com"},
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "Policies": [
+          {
+            "PolicyName": "ssm-agent-channels-only",
+            "PolicyDocument": {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "AgentRegistration",
+                  "Effect": "Allow",
+                  "Action": "ssm:UpdateInstanceInformation",
+                  "Resource": "arn:aws:ec2:ap-south-1:452630323510:instance/*",
+                  "Condition": {"StringEquals": {"aws:RequestedRegion": "ap-south-1"}}
+                },
+                {
+                  "Sid": "AgentChannels",
+                  "Effect": "Allow",
+                  "Action": [
+                    "ssmmessages:CreateControlChannel",
+                    "ssmmessages:CreateDataChannel",
+                    "ssmmessages:OpenControlChannel"
+                  ],
+                  "Resource": "*",
+                  "Condition": {"StringEquals": {"aws:RequestedRegion": "ap-south-1"}}
+                },
+                {
+                  "Sid": "AgentDataChannel",
+                  "Effect": "Allow",
+                  "Action": "ssmmessages:OpenDataChannel",
+                  "Resource": "arn:aws:ssm:ap-south-1:452630323510:session/*",
+                  "Condition": {"StringEquals": {"aws:RequestedRegion": "ap-south-1"}}
+                }
+              ]
+            }
+          }
+        ],
+        "Tags": [
+          {"Key": "ezil:purpose", "Value": "attest-maintenance-host"},
+          {"Key": "ezil:exception", "Value": "r5-fresh-attestation-host-only"},
+          {"Key": "ezil:attestation-namespace", "Value": "mum"}
+        ]
+      }
+    },
+    "MaintenanceInstanceProfile": {
+      "Type": "AWS::IAM::InstanceProfile",
+      "DeletionPolicy": "Delete",
+      "UpdateReplacePolicy": "Delete",
+      "Properties": {
+        "InstanceProfileName": "ezil-attest-maintenance-host",
+        "Path": "/ezil/r5-attestation/",
+        "Roles": [{"Ref": "MaintenanceRole"}]
+      }
+    }
+  },
+  "Outputs": {
+    "InstanceProfileArn": {"Value": {"Fn::GetAtt": ["MaintenanceInstanceProfile", "Arn"]}},
+    "RoleArn": {"Value": {"Fn::GetAtt": ["MaintenanceRole", "Arn"]}}
+  }
+}
