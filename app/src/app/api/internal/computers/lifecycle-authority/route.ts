@@ -65,8 +65,9 @@ export async function POST(req: Request): Promise<Response> {
             if (!await createImageJobStore(db).authority({ ...authority, imageJobId: authority.imageJobId, imageJobPhase: authority.imageJobPhase })) return refuse();
             return Response.json({ authorized: true, ...authority }, { status: 200, headers: NO_STORE });
         }
-        // Migration-aware: a computer moving to AWS is authorised for its hidden launch intent only.
-        const { record } = await readLifecyclePlacement(db, authority.computerId);
+        // Migration-aware: a computer moving to AWS is authorised for its hidden launch intent only,
+        // and a failed migration only for the recorded retire of its unreleased boot.
+        const { record } = await readLifecyclePlacement(db, authority.computerId, authority.jobId);
         if (!record || record.provider !== 'aws-ec2'
             || record.computerId !== authority.computerId
             || record.lifecycleJobId !== authority.jobId
