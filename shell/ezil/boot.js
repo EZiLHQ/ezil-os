@@ -963,11 +963,12 @@ async function build (payload) {
     if ( appLink?.id === 'settings' ) appHistory.consume(['upgrade']);
     if ( billingLink ) {
         billingDeepLinkHandled = true;
-        const { initialTab, openUpgrade, search } = billingLink;
+        const { initialTab, openUpgrade, search, couponAlias, couponInvalid } = billingLink;
         // Numbered (`route`): a click made while Settings opens that takes
         // the entry decides.
         const route = appHistory.route({ ...ctx, initialTab, historyMode: 'replace',
-            openUpgrade: payload.features?.billing === true ? openUpgrade : false });
+            openUpgrade: payload.features?.billing === true ? openUpgrade : false,
+            ...(couponAlias ? { couponAlias } : couponInvalid ? { couponInvalid: true } : {}) });
         try {
             await registry.launch('settings', route);
         } finally {

@@ -303,3 +303,38 @@ describe('Auth0 callback: Back after a successful sign-in (fd0 QA-SH-1)', () => 
         expect(stub.getUser).not.toHaveBeenCalled();
     });
 });
+
+describe('Auth0 callback carries a promoter Billing link (?coupon=<alias>) through sign-in', () => {
+    const billing = '/os?settings=billing&coupon=midhun';
+    async function transactionFor(returnUrl: string, prompt?: 'none') {
+        stub.set.mockClear();
+        const url = await buildAuthorizeUrl({ origin, returnUrl, ...(prompt ? { prompt } : {}) });
+        state = url.searchParams.get('state')!; cookie = stub.set.mock.calls[0][1];
+    }
+    beforeEach(() => { vi.spyOn(console, 'warn').mockImplementation(() => {}); });
+    it('a verified sign-in lands on Billing with the canonical alias, byte for byte', async () => {
+        await transactionFor(billing);
+        const response = await GET(request());
+        expect(response.headers.get('location')).toBe(`${origin}${billing}`);
+        expect(stub.bridge).toHaveBeenCalledOnce();
+    });
+    it('a silent attempt falls back to ONE interactive sign-in still headed for the same alias', async () => {
+        await transactionFor(billing, 'none');
+        const response = await GET(request({ error: 'login_required' }));
+        const location = new URL(response.headers.get('location')!);
+        expect(location.origin + location.pathname).toBe(`${origin}/auth/auth0/login`);
+        expect(location.searchParams.get('returnUrl')).toBe(billing);
+        expect(stub.exchangeCode).not.toHaveBeenCalled();
+    });
+    it('a failed sign-in keeps the alias for the retry and never turns it into another destination', async () => {
+        await transactionFor(billing);
+        stub.verifyIdToken.mockRejectedValue(new Auth0Error('email_unverified'));
+        const response = await GET(request());
+        expect(response.headers.get('location')).toBe(failed('email_unverified', billing));
+    });
+    it('an alias smuggled with a foreign destination is not widened: the callback ignores a query returnUrl', async () => {
+        await transactionFor(billing);
+        const response = await GET(request({ returnUrl: 'https://evil.example/?coupon=midhun' }));
+        expect(response.headers.get('location')).toBe(`${origin}${billing}`);
+    });
+});

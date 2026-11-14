@@ -59,3 +59,15 @@ describe('Auth0 login route: auth recovery', () => {
         },
     );
 });
+
+describe('Auth0 login route: promoter Billing link', () => {
+    it('keeps the Billing destination with its alias inside the signed transaction, not in the provider URL', async () => {
+        vi.stubEnv('AUTH0_CLIENT_ID', 'test-client'); vi.stubEnv('AUTH0_SECRET_ID', 'test-secret');
+        const returnUrl = '/os?settings=billing&coupon=midhun';
+        const response = await GET(new NextRequest(`https://os-staging.ezil.work/auth/auth0/login?${new URLSearchParams({ returnUrl })}`));
+        const url = new URL(response.headers.get('location')!);
+        expect(url.origin + url.pathname).toBe('https://id.ezil.work/authorize');
+        expect(url.search).not.toContain('midhun');
+        expect(set).toHaveBeenCalledOnce();
+    });
+});

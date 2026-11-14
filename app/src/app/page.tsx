@@ -1,7 +1,10 @@
 import { redirect } from 'next/navigation';
 
+import { auth0Enabled } from '@/server/auth/auth0';
 import { Routes } from '@/utils/constants';
 import { createClient } from '@/utils/supabase/server';
+
+import { couponBillingPath } from './coupon-entry';
 
 /**
  * `/` has no content of its own — this app has no marketing page or chat
@@ -27,11 +30,20 @@ import { createClient } from '@/utils/supabase/server';
  * `/computers` remains reachable as the escape hatch from `/os` and
  * `/computer/[id]`, just no longer the default landing spot for `/`.
  */
-export default async function HomePage() {
+export default async function HomePage({ searchParams }: { searchParams?: Promise<Record<string, string | string[] | undefined>> } = {}) {
     const supabase = await createClient();
     const {
         data: { user },
     } = await supabase.auth.getUser();
+
+    // A promoter link goes straight to Billing: signed in, there; signed out, through the normal EZiL ID sign-in
+    // that returns there, with no separate landing page. See `coupon-entry.ts`.
+    const billing = couponBillingPath(searchParams ? await searchParams : undefined);
+    if (billing !== null) {
+        if (user) redirect(billing);
+        const query = new URLSearchParams({ returnUrl: billing });
+        redirect(auth0Enabled() ? `/auth/auth0/login?${query}` : `${Routes.LOGIN}?${query}`);
+    }
 
     redirect(user ? Routes.OS : Routes.LOGIN);
 }
