@@ -103,8 +103,12 @@ def parse_sources(raw: bytes, mirrors: bytes | None):
             if token == LIST_URI:
                 need(mirrors is not None and len(mirrors) <= 4096, 'mirror_list')
                 lines = mirrors.decode('ascii').splitlines()
+                # The runner image's primary is Ubuntu's own Azure archive mirror or its regional EC2 archive mirror
+                # (e.g. us-east-2.ec2.archive.ubuntu.com); the two fallbacks are fixed. Signed Release verification is unchanged.
+                primary = lines[0] if lines else ''
+                regional = re.fullmatch(r'http://([a-z]{2}-[a-z]+-[1-9])\.ec2\.archive\.ubuntu\.com/ubuntu/\tpriority:1', primary)
                 expected = [
-                    'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1',
+                    primary if regional else 'http://azure.archive.ubuntu.com/ubuntu/\tpriority:1',
                     'https://archive.ubuntu.com/ubuntu/\tpriority:2',
                     'https://security.ubuntu.com/ubuntu/\tpriority:3',
                 ]
@@ -115,7 +119,7 @@ def parse_sources(raw: bytes, mirrors: bytes | None):
                             print('Ubuntu apt mirror: observed mirror_list line ' + repr(line), flush=True)
                     print('Ubuntu apt mirror: observed mirror_list lines=%d sha256=%s' % (len(lines), hashlib.sha256(mirrors).hexdigest()), flush=True)
                 need(lines == expected, 'mirror_list')
-                hosts.update(HOSTS)
+                hosts.update(HOSTS[1:] + ((regional.group(1) + '.ec2.archive.ubuntu.com') if regional else HOSTS[0],))
             else:
                 hosts.add(token.split('/')[2])
         for m in re.finditer(r'^URIs:[ \t]+([^\n]+)', block, re.M):
