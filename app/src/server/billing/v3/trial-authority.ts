@@ -142,7 +142,9 @@ export function selectTrialAuthority(input: TrialAuthorityInput): TrialAuthority
         && proofCampaign.campaignId === input.pendingLink.campaignId && !campaignActive(proofCampaign, input.now);
     const done = (authority: TrialAuthority): TrialAuthorityResult => {
         const pending = relation(authority);
-        return { ok: true, authority, pending, releasePending: pending === 'different' && pendingProvenInactive };
+        // Only an independent Product/public quote may conditionally release a proven-inactive link. A legacy campaign quote never releases
+        // (its explicit attribution/linkage rules stay), so a different legacy selection over any pending link is not releasable.
+        return { ok: true, authority, pending, releasePending: pending === 'different' && authority.source !== 'sponsor' && pendingProvenInactive };
     };
 
     // 1. A verified active context; an alias beside it must name the same campaign.

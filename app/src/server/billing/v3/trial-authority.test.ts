@@ -172,6 +172,14 @@ describe('pending quote-owned link and verified context', () => {
         expect(select({ legacy: disabled, pendingLink: link({ configSha256: disabledConfig, claimed: true }) })).toEqual({ ok: false, code: 'trial_unavailable' });
         // Revocation advances the live config hash (enabled is hashed): a link frozen under the earlier hash is still provably inactive.
         expect(select({ legacy: disabled, pendingLink: link() })).toMatchObject({ ok: true, pending: 'different', releasePending: true, authority: { source: 'public' } });
+        // The same for an EXPIRED or NOT-YET-STARTED record whose dates changed: the live hash differs from the OLD frozen one, release allowed.
+        for (const changed of [registry([{ campaignId: 'camp-acme', partnerId: 'acme', expiresAt: '2026-11-10T00:00:00.000Z' }]),
+            registry([{ campaignId: 'camp-acme', partnerId: 'acme', startsAt: '2026-11-20T00:00:00.000Z' }])]) {
+            const live = (changed as Extract<LegacyRegistryState, { state: 'verified' }>).registry.get('camp-acme')!.configSha256;
+            const frozen = acme().configSha256;   // frozen when the campaign was active (the original dates)
+            expect(live).not.toBe(frozen);
+            expect(select({ legacy: changed, pendingLink: link({ configSha256: frozen }) })).toMatchObject({ ok: true, pending: 'different', releasePending: true, authority: { source: 'public' } });
+        }
         // An ACTIVE campaign whose hash changed is stale, never released.
         expect(select({ legacy: LEGACY, pendingLink: link({ configSha256: 'f'.repeat(64) }) })).toEqual({ ok: false, code: 'trial_quote_stale' });
     });
@@ -183,6 +191,16 @@ describe('pending quote-owned link and verified context', () => {
             const promoter = select({ ...over, pendingLink: link(), alias: 'midhun' });
             if (promoter.ok) expect(promoter).toMatchObject({ pending: 'different', releasePending: false });
         }
+    });
+    it('a LEGACY selection of another campaign over a proven-inactive pending link is never releasable (only Product/public may release)', () => {
+        const both = registry([{ campaignId: 'camp-acme', partnerId: 'acme', enabled: false }, { campaignId: 'camp-bee', partnerId: 'bee' }]);
+        const bee = (both as Extract<LegacyRegistryState, { state: 'verified' }>).registry.get('camp-bee')!;
+        const frozenA = link();   // pending A, now disabled (provably inactive)
+        expect(select({ legacy: both, pendingLink: frozenA, alias: 'bee' })).toMatchObject({ ok: true, pending: 'different', releasePending: false, authority: { source: 'sponsor', via: 'alias' } });
+        expect(select({ legacy: both, pendingLink: frozenA, legacyContext: context('camp-bee', bee.configSha256) }))
+            .toMatchObject({ ok: true, pending: 'different', releasePending: false, authority: { source: 'sponsor', via: 'context' } });
+        // The same inactive link IS releasable for an independent Product promoter.
+        expect(select({ legacy: both, pendingLink: frozenA, alias: 'midhun' })).toMatchObject({ ok: true, pending: 'different', releasePending: true, authority: { source: 'promoter' } });
     });
     it('a new selection reports how it relates to the pending link; it is never silently retargeted', () => {
         expect(select({ legacy: LEGACY, pendingLink: link(), alias: 'acme' })).toMatchObject({ ok: true, pending: 'same', releasePending: false });

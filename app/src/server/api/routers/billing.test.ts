@@ -2530,7 +2530,8 @@ describe('Sponsor trial router (same Standard trial, never a second grant; Root 
             ['another origin', probe => carried(probe, { origin: 'https://os-staging.ezil.work' })],
             ['another key', probe => carried(probe, { key: 'x'.repeat(40) })],
             ['older than the entry window', probe => carried(probe, { issuedAt: new Date(now.getTime() - 601_000) })],
-            ['tampered', probe => carried(probe).replace(/.$/, c => (c === 'A' ? 'B' : 'A'))],
+            // Flip the MAC's FIRST character (six full bits); its last character also carries base64url padding bits.
+            ['tampered', probe => carried(probe).replace(/\.(.)/, (_, c: string) => `.${c === 'A' ? 'B' : 'A'}`)],
             ['two cookies', probe => `${carried(probe)}; ${carried(probe)}`],
             ['garbage', () => `${SPONSOR_BILLING_COOKIE}=not-a-context`],
         ];
@@ -2661,6 +2662,12 @@ describe('Sponsor trial router (same Standard trial, never a second grant; Root 
             await expect(unprovable.caller.quoteTrial({ coupon: 'midhun' })).rejects.toMatchObject({ message: 'trial_quote_stale' });
             expect(unprovable.trial.claimTrialQuote).not.toHaveBeenCalled();
         }
+        // A LEGACY alias for another campaign over the proven-inactive link: not releasable, so availability refuses before any quote.
+        const otherCampaign = campaign({ campaignId: 'test-campaign-b', partnerId: 'test-partner-b', tokenSha256: hashSponsorToken('token-b-0000000000000000') });
+        const legacyB = build({ env: runtimeEnv([campaign({ enabled: false }), otherCampaign]), own: quoted(), linkage: link });
+        await expect(legacyB.caller.trialOffer({ coupon: 'test-partner-b' })).rejects.toMatchObject({ message: 'trial_quote_stale' });
+        await expect(legacyB.caller.quoteTrial({ coupon: 'test-partner-b' })).rejects.toMatchObject({ message: 'trial_quote_stale' });
+        expect(legacyB.trial.claimTrialQuote).not.toHaveBeenCalled();
         // The store's own lock-time refusal (link changed or still active) is stale.
         const raced = build({ env: runtimeEnv([campaign({ enabled: false })]), own: quoted(), linkage: link });
         raced.trial.claimTrialQuote.mockResolvedValueOnce({ status: 'refused', reason: 'sponsor_pending' } as never);

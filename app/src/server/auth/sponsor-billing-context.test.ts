@@ -31,7 +31,8 @@ describe('sponsor Billing context', () => {
         const [body, mac] = value.split('.');
         const forged = Buffer.from(JSON.stringify([1, 'camp-other', 'c'.repeat(64), Math.floor(NOW.getTime() / 1000), 'n'.repeat(24)])).toString('base64url');
         expect(verify(`${forged}.${mac}`)).toBeNull();
-        expect(verify(`${body}.${mac!.slice(0, -1)}${mac!.endsWith('A') ? 'B' : 'A'}`)).toBeNull();
+        // The MAC's first character carries six full bits (its last one also carries base64url padding bits).
+        expect(verify(`${body}.${mac!.startsWith('A') ? 'B' : 'A'}${mac!.slice(1)}`)).toBeNull();
     });
     it('domain separation, both directions: entry/login/creation contexts are not Billing contexts, and a Billing context is not one of them', () => {
         for (const subject of [`sponsor-entry|${ORIGIN}`, `sponsor-billing|${ORIGIN}|${USER}`, `${ORIGIN}|state|nonce`, `${USER}|auth0|abc`]) {
