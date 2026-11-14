@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import fx from './aws-identity.fixtures.json';
 import { fixtureRebaseDeployments, fixtureRebaseRelease } from './aws-intent.test-support';
-import { buildAttestCommand, placementDigest, requestDigest, type AttestCommandInput, type LowerAttestation, type LowerAttestationObservations,
+import { buildAttestCommand, placementDigest, requestDigest, type AttestCommandInput, type LowerAttestationRecord, type LowerAttestationObservations,
     type LowerAttestationReserveRequest } from './aws-lower-attestation';
 import type { ImagePlacement } from './placement';
 
@@ -31,6 +31,9 @@ export const COMMAND_ID = '0b0b0b0b-0b0b-4b0b-8b0b-0b0b0b0b0b0b';
 /** Stand-in for the reviewed attest.py bytes; the pin is its sha256. */
 export const SOURCE = Buffer.from('# reviewed attest.py stand-in\n');
 export const PINNED = createHash('sha256').update(SOURCE).digest('hex');
+/** Stand-in for the reviewed AWS-RunShellScript document hash (ssm:DescribeDocument). */
+export const DOCUMENT_HASH = 'e'.repeat(64);
+export const PINS = { sourceSha256: PINNED, documentSha256: DOCUMENT_HASH };
 export const commandInput = (over: Partial<AttestCommandInput> = {}): AttestCommandInput => ({ sourceBase64: SOURCE.toString('base64'), sourceSha256: PINNED,
     attestationId: RESERVE.attestationId, computerId: RESERVE.computerId, originalVolumeId: RESERVE.sourceVolumeId, cloneVolumeId: CLONE, snapshotId: SNAPSHOT,
     fsUuid: RESERVE.fsUuid, instanceId: RESERVE.sourceInstanceId, generation: 1, leaseEpoch: 3, challenge: CHALLENGE, ...over });
@@ -42,10 +45,10 @@ export function placement(over: Partial<ImagePlacement> = {}): ImagePlacement {
         fenceToken: RESERVE.sourceFenceToken, lifecycleJobId: null, lifecycleDigest: null, lastError: null, updatedAt: new Date(CREATED),
         lowerImageDigest: null, lowerDigestObservedAt: null, imageUpgradeJobId: RESERVE.attestationId, ...over } as ImagePlacement;
 }
-export function reserved(over: Partial<LowerAttestation> = {}): LowerAttestation {
+export function reserved(over: Partial<LowerAttestationRecord> = {}): LowerAttestationRecord {
     const { operation: _op, schemaVersion: _v, ...t } = RESERVE;
     return { ...t, ownerUserId: OWNER, reservedRowSha256: placementDigest(placement()), requestSha256: requestDigest(RESERVE), challenge: CHALLENGE,
-        commandId: null, phase: 'reserved',
+        currentInstanceId: RESERVE.sourceInstanceId, commandId: null, phase: 'reserved',
         evidence: null, evidenceSha256: null, measuredDigest: null, measuredAt: null, markerSha256: null, snapshotId: null, cloneVolumeId: null,
         maintenanceInstanceId: null, maintenanceAmiId: null, sourceRelease: null, failureCode: null, createdAt: CREATED, updatedAt: CREATED, completedAt: null, ...over };
 }
@@ -73,8 +76,9 @@ const TAGS = { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': DEPLOYM
 /** Every observation as the adopting side reads it from AWS; `stdout` is the invocation output (the receipt line). */
 export function observations(over: Partial<LowerAttestationObservations> = {}, stdout = receipt() + '\n'): LowerAttestationObservations {
     return {
-        command: { commandId: COMMAND_ID, documentName: 'AWS-RunShellScript', instanceIds: [MAINTENANCE], commands: buildAttestCommand(commandInput()),
-            requestedAt: new Date('2026-10-22T11:20:00.000Z'), status: 'Success' },
+        command: { commandId: COMMAND_ID, documentName: 'AWS-RunShellScript', documentVersion: '1', instanceIds: [MAINTENANCE],
+            commands: buildAttestCommand(commandInput()), requestedAt: new Date('2026-10-22T11:20:00.000Z'), status: 'Success' },
+        document: { name: 'AWS-RunShellScript', documentVersion: '1', owner: 'Amazon', documentType: 'Command', status: 'Active', hashType: 'Sha256', hash: DOCUMENT_HASH },
         invocation: { commandId: COMMAND_ID, instanceId: MAINTENANCE, status: 'Success', responseCode: 0, standardOutput: stdout, standardError: '' },
         runInstances: [cloudTrail()],
         snapshot: { snapshotId: SNAPSHOT, ownerId: DEPLOYMENT.accountId, volumeId: RESERVE.sourceVolumeId, volumeGiB: 20, state: 'completed', encrypted: true,
