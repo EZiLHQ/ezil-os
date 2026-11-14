@@ -42,6 +42,23 @@ describe.each(['production', 'development', 'test'])('billing return origin in %
     );
 });
 
+describe('billing return origin on a PR preview slot', () => {
+    it('returns to the container\'s own slot and falls back to it, not to production', () => {
+        vi.stubEnv('EZIL_DEPLOY_ENV', 'pr-preview');
+        vi.stubEnv('EZIL_PR_PREVIEW_ORIGIN', 'https://os-pv1.ezil.work');
+        expect(billingReturnOrigin(headers('https://os-pv1.ezil.work'))).toBe('https://os-pv1.ezil.work');
+        expect(billingReturnOrigin(headers('https://os-pv2.ezil.work'))).toBe('https://os-pv1.ezil.work');
+        expect(billingReturnOrigin(headers('https://evil-app.ezil.work'))).toBe('https://os-pv1.ezil.work');
+        expect(billingReturnOrigin(headers('https://os-staging.ezil.work'))).toBe('https://os-staging.ezil.work');
+    });
+
+    it('treats a slot origin as unowned without the pr-preview deploy env', () => {
+        vi.stubEnv('EZIL_DEPLOY_ENV', 'staging');
+        vi.stubEnv('EZIL_PR_PREVIEW_ORIGIN', 'https://os-pv1.ezil.work');
+        expect(billingReturnOrigin(headers('https://os-pv1.ezil.work'))).toBe(fallback);
+    });
+});
+
 it('allows localhost when NODE_ENV is unset', () => {
     vi.stubEnv('NODE_ENV', undefined);
     expect(billingReturnOrigin(headers('http://localhost:3000'))).toBe('http://localhost:3000');
