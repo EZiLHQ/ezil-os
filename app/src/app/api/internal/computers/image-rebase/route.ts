@@ -12,6 +12,8 @@ import { ReconcileReplacementRequestSchema, reconcileReplacementWithHistoricalSo
 import { ReconcileReleaseRequestSchema, reconcileFailedRelease } from '@/server/lib/compute/aws-pool-release-recovery';
 import { ParkFailedReleaseRequestSchema, reserveParkedStop } from '@/server/lib/compute/aws-failed-release-park';
 import { createPoolDeps } from '@/server/lib/compute/aws-pool-runtime';
+import { adoptLowerAttestation, attestationBody, createLowerAttestationStore, LowerAttestationAdoptRequestSchema, LowerAttestationInspectRequestSchema,
+    LowerAttestationRefusal, lowerAttestationReaders, LowerAttestationRefuseRequestSchema, LowerAttestationReserveRequestSchema } from '@/server/lib/compute/aws-lower-attestation';
 import type { PlacementDb } from '@/server/lib/compute/placement';
 
 export const runtime = 'nodejs';
@@ -27,6 +29,7 @@ export async function POST(req: Request): Promise<Response> {
     if ((raw as { operation?: unknown } | null)?.operation === 'reconcile-replacement') return reconcileReplacement(raw);
     if ((raw as { operation?: unknown } | null)?.operation === 'reconcile-release') return reconcileRelease(raw);
     if ((raw as { operation?: unknown } | null)?.operation === 'park-failed-release') return parkFailedRelease(raw);
+    if (String((raw as { operation?: unknown } | null)?.operation).startsWith('attest-lower-')) return attestLower(raw);
     let input;
     try { input = ImageRebaseRequestSchema.parse(raw); }
     catch { return Response.json({ authorized: false }, { status: 403, headers }); }
@@ -105,6 +108,30 @@ async function parkFailedRelease(raw: unknown): Promise<Response> {
             { status: 200, headers });
     } catch (error) {
         return Response.json({ error: error instanceof ImageJobConflictError ? 'image_job_conflict' : 'park_unavailable' },
+            { status: error instanceof ImageJobConflictError ? 409 : 503, headers });
+    }
+}
+
+/** NULL recorded lower recovery (operator only): reserve, status, adopt by measured proof, or refuse (abort). Never a launch, rebind
+ * or provider write; adopt reads EC2 only and compare-and-sets the unchanged NULL row in one transaction. */
+async function attestLower(raw: unknown): Promise<Response> {
+    const schemas = { 'attest-lower-reserve': LowerAttestationReserveRequestSchema, 'attest-lower-adopt': LowerAttestationAdoptRequestSchema,
+        'attest-lower-refuse': LowerAttestationRefuseRequestSchema, 'attest-lower-inspect': LowerAttestationInspectRequestSchema } as const;
+    const schema = schemas[(raw as { operation: string }).operation as keyof typeof schemas];
+    const parsed = schema?.safeParse(raw);
+    if (!parsed?.success) return Response.json({ authorized: false }, { status: 403, headers });
+    const input = parsed.data, store = createLowerAttestationStore(db as unknown as PlacementDb), now = new Date();
+    try {
+        if (input.operation === 'attest-lower-inspect') return Response.json(attestationBody(await store.inspect(input.attestationId, input.computerId)), { status: 200, headers });
+        if (input.operation === 'attest-lower-reserve') return Response.json(attestationBody(await store.reserve(input, now)), { status: 200, headers });
+        if (input.operation === 'attest-lower-refuse') return Response.json(attestationBody(await store.refuse(input.attestationId, input.computerId, now)), { status: 200, headers });
+        // The shared verifier needs SSM and CloudTrail reads this app's collaborators do not provide: fail closed, never trust relayed proof.
+        const readers = lowerAttestationReaders(sharedAwsSdkCollaborators().describer);
+        if (!readers) return Response.json({ error: 'attest_readers_unavailable' }, { status: 503, headers });
+        return Response.json(attestationBody(await adoptLowerAttestation({ store, readers, env: process.env, now: () => new Date() }, input)), { status: 200, headers });
+    } catch (error) {
+        if (error instanceof LowerAttestationRefusal) return Response.json({ error: error.code }, { status: 409, headers });
+        return Response.json({ error: error instanceof ImageJobConflictError ? 'image_job_conflict' : 'attest_unavailable' },
             { status: error instanceof ImageJobConflictError ? 409 : 503, headers });
     }
 }
