@@ -3,6 +3,8 @@ import { LifecycleDeploymentSchema, SourceLifecycleDeploymentSchema, type Source
 import { AWS_REGION_PATTERN } from './aws-config';
 import { parseRebaseJson, RebaseDigest, RebaseTime } from './aws-rebase-json';
 
+/** The release registry's capacity, shared with the NULL-lower attestation reader. */
+export const REBASE_RELEASE_REGISTRY_CAPACITY = 26;
 const version = z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*$/);
 const ref = z.string().max(512).regex(/^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com\/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$/);
 const releaseObject = z.object({
@@ -54,7 +56,7 @@ export function rebaseReleaseCandidates(entry: unknown, lowerImageDigest: string
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('release_mismatch');
     const { releases, ...rawDeployment } = entry as Record<string, unknown>;
     const deployment = LifecycleDeploymentSchema.parse(rawDeployment);
-    const records = z.array(RebaseSourceReleaseSchema).min(1).max(26).parse(releases);
+    const records = z.array(RebaseSourceReleaseSchema).min(1).max(REBASE_RELEASE_REGISTRY_CAPACITY).parse(releases);
     if (records.some((r, i) => i > 0 && Date.parse(r.createdAt) < Date.parse(records[i - 1]!.createdAt))) throw new Error('release_mismatch');
     const targets = records.filter(r => TUPLE.every(k => r[k] === deployment[k]));
     const sources = records.filter(r => r.lowerImageDigest === lowerImageDigest);
