@@ -176,32 +176,22 @@ def collect(directory, candidate_name, context=None):
     gc.need(receipts['databaseSystemIdentifier'] == db['meta']['system_identifier'], 'E1 database export mismatch')
     snapshot = {'deployment': {'releases': records}}
 
-    def absence(instance):
-        events = [e for e in evidence['proof']['cloudTrail']
-                  if e.get('eventName') == 'TerminateInstances' and instance in gc.resource_ids(e)]
-        gc.need(len(events) == 1, 'missing/ambiguous raw CloudTrail TerminateInstances event: ' + instance)
-        e = events[0]
-        return {'inventorySha256': gc.sha(gc.inventory(evidence)),
-                'inventoryCapturedAt': evidence['proof']['inventoryCapturedAt'],
-                'terminationEventId': e['eventID'], 'terminationEventTime': e['eventTime'],
-                'terminationEventSha256': gc.sha(e)}
-
-    def disposition(resource):
-        for record in records:
-            if record == candidate:
-                continue
-            value = {'disposition': 'kept-record', 'record': gc.identity(record)}
-            try:
-                gc.kept_resource(evidence, snapshot, candidate, resource, value)
-                return value
-            except (ValueError, KeyError, TypeError):
-                pass
-        return {'disposition': 'attested', **absence(resource)}
-
+    # Resource disposition (kept record / R2 retained data volume / absent terminated instance) and
+    # absence selection now live in registry_gc as gc.resolve_resource / gc.absence, so the collector
+    # that builds an attestation and the R1 execution-history check resolve a resource identically.
     pending = []
+    shared_lower = 0
     for name in gc.SOURCES:
         for row in evidence['sources'][name]['rows']:
             if not gc.references(row, candidate):
+                continue
+            # R1 shared-lower: a row whose candidate digest sits only at typed allowlisted edges
+            # (r1_allowlisted) needs no attestation/binding when a retained record keeps the lower
+            # and the candidate AMI is not live. Emit no attestation and no unresolved entry.
+            if (gc.r1_allowlisted(name, row, candidate) and gc.shared_lower_kept(snapshot, candidate)
+                    and (name != 'executions' or gc.r1_execution_history_clean(evidence, snapshot, row, candidate))
+                    and not gc.candidate_ami_observable(evidence, candidate)):
+                shared_lower += 1
                 continue
             row_id = row.get('id', row.get('executionArn', row.get('computer_id', row.get('job_id'))))
             try:
@@ -216,12 +206,13 @@ def collect(directory, candidate_name, context=None):
                              instanceId=row['instance_id'], state=row['state'], dispatchStatus=row['dispatch_status'],
                              retireJobId=row['lifecycle_job_id'], lifecycleDigest=row['lifecycle_digest'],
                              executionStatus=d['status'], receiptSha256=gc.sha(gc.decoded(d.get('output'))),
-                             **absence(row['instance_id']))
+                             **gc.absence(evidence, row['instance_id']))
                 elif name == 'executions':
                     d = row
                     h = evidence['proof']['executions'][d['executionArn']]['history']
                     a.update(kind='execution_terminal', status=d['status'],
-                             resources={r: disposition(r) for r in sorted(gc.resource_ids([d, h]))})
+                             resources={r: gc.resolve_resource(evidence, snapshot, candidate, r)
+                                        for r in sorted(gc.resource_ids([d, h]))})
                 else:
                     if name in BINDABLE:
                         pending.append({'kind': BINDABLE[name], 'source': name, 'rowSha256': gc.sha(row), 'rowId': row_id})
@@ -265,7 +256,7 @@ def collect(directory, candidate_name, context=None):
         except (ValueError, KeyError, TypeError, AttributeError) as error:
             unresolved.append({'source': p['source'], 'rowId': p['rowId'], 'rowSha256': p['rowSha256'], 'reason': 'binding: ' + str(error)})
     evidence['collection'] = {**evidence['collection'], 'candidate': gc.identity(candidate), 'filesSha256': files,
-                              'unresolved': unresolved,
+                              'unresolved': unresolved, 'sharedLowerExempt': shared_lower,
                               'missingContext': not bool(context)}
     # The main checker sees collection gaps even if the remaining references
     # could otherwise be exempted. Sources retain every original canonical row.
@@ -287,6 +278,7 @@ def main():
     gc.immutable(args.output, evidence)
     print(json.dumps({'output': str(args.output), 'attestations': len(evidence['attestations']),
                       'unresolved': evidence['collection']['unresolved'],
+                      'sharedLowerExempt': evidence['collection']['sharedLowerExempt'],
                       'missingContext': evidence['collection']['missingContext']}, indent=2))
     return 2 if evidence['collection']['unresolved'] or evidence['collection']['missingContext'] else 0
 

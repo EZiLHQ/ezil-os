@@ -485,8 +485,54 @@ records referenced by placements or unfinished jobs. At fourteen records the too
 refuses a fifteenth; it never guesses whether a record can be collected. Registry
 identity is `(lowerImageDigest, amiId)`: duplicate pairs and changes to
 an existing pair refuse, including attempts to fill historical null fields.
-Different AMIs may share a lower. The app resolver still refuses ambiguous
-shared-lower source placements; source disambiguation by observed AMI is deferred.
+Different AMIs may share a lower. The app resolver disambiguates shared-lower
+sources: `resolveRebaseReleases` (aws-rebase-release.ts) selects a provisioned pool
+host by its full tuple, otherwise filters multiple aliases by the observed source
+AMI, and a unique lower needs no observation.
+
+`registry-gc` collects exactly one record against quiesced, fenced, hash-bound
+evidence. Rule R1 exempts a referencing row from attestation/binding by a single oracle:
+decode the row exactly as `references()` does (parsing embedded JSON strings, so a
+`\u`-escaped digest is seen and in-band `$json`/`$substr` markers cannot be forged by a
+data key), delete only the values at the typed allowlisted `(source, path)` edges — the
+pool-host and terminal-execution `lifecycle_input`/`input → document →
+deployment.previousLowerImageDigest`, the placement `lower_image_digest` column, and the
+terminal image-job release/document digest fields — and require that **no** reference to
+the candidate survives, **and** that a retained record keeps that lower digest **and** no
+non-terminated instance runs the candidate AMI. So a digest at any other source or field
+(a migration, a recovery blob, a bare column, a list-wrapped or escaped value), or a row
+that also references a non-digest identity token, is never exempt; `executions`/`imageJobs`
+rows must be terminal and pool hosts retired+settled. The non-digest/prefix rule checks
+only identity tokens longer than 12 characters, so an AMI or ARN hidden in a string
+prefix before embedded JSON is refused while a short `recipeVersion` in a prefix does not
+block. If a lower-only row is not exempt it keeps its ordinary attestation/binding, and
+the whole GC is refused when the candidate AMI is observably live. R1's soundness rests on
+the app's `resolveRebaseReleases` semantics above: a lower-only link resolves identically
+against any retained alias with the same lower. For an `executions` row, R1 additionally holds
+the separately-stored execution history to the describe's bar: the history must be the complete,
+terminal history bound to that describe (`execution_proof`), must link the candidate only through
+the shared lower at every decoding layer, and every resource named in the describe or the history
+must resolve the way `execution_terminal` would — a kept record's resource, an R2 retained data
+volume, or a terminated instance absent from the live inventory. A history that carries a candidate
+AMI/ARN or a resource that does not resolve keeps the row on the ordinary attestation path. Resource
+disposition and absence selection are one `resolve_resource`/`absence` shared by the collector and
+this check, so both resolve identically. Rule R2 gives an execution's retained data
+volume a `retained-data-volume` disposition only when the volume is a complete, typed,
+unattached (`SnapshotId == ''`, `Attachments == []`), available data volume with
+non-duplicate tags whose `ezil:computer-id` is its owner, owned by exactly one placement
+that is explicitly `STOPPED` (an allowlist, since the app's placement enum has many live
+states), whose exact lower column equals the candidate lower and resolves as a stopped
+computer (kept-alias rule), is the sole claimant across placements, pool hosts and image
+jobs, and has no open usage row — validated against inventory as strictly as every other
+disposition. A released-pool STOP never closes its usage row, so a released-pool owner
+with an open usage row cannot pass R2 (the real owner's usage is closed). Every resource-id scan
+(`resource_ids`) reads each raw string at every embedded-JSON layer, not only the serialized
+`canonical` form: `canonical` escapes a control character (a newline becomes `\n`), which would let
+the id regex's lookbehind miss an `i-`/`vol-` that starts a line of a multi-line `last_error`, so a
+conflicting claimant or an execution resource named after a newline is still seen. `begin_operation`'s
+registry-gc app pin is structural — the plan app tag is the first twelve hex of its app
+gitSha and the live gitSha equals the plan's — so it no longer pins a specific reviewed app
+build and GC runs under later plans.
 
 For A3, a maintenance bake keeps its maintenance source lower ID, changes the
 reviewed agent commit, clears both previous parameters, and records

@@ -124,6 +124,155 @@ def references(value, record):
     return False
 
 
+def non_digest_token_present(value, tokens):
+    """True when a long (>12 char) non-digest identity token appears as a substring of a string at
+    ANY embedded-JSON layer. The whole string is checked before references() would discard a
+    prefix, and embedded JSON is decoded first so an escaped token is seen too -- so the same
+    oracle covers every layer, including an AMI/ARN hidden in a nested string prefix."""
+    if isinstance(value, dict):
+        return any(non_digest_token_present(v, tokens) for v in value.values())
+    if isinstance(value, list):
+        return any(non_digest_token_present(v, tokens) for v in value)
+    if isinstance(value, str):
+        if any(token in value for token in tokens):
+            return True
+        start = min((value.find(c) for c in '{[' if c in value), default=-1)
+        if start >= 0:
+            try:
+                return non_digest_token_present(manifest.loads(value[start:]), tokens)
+            except (ValueError, TypeError):
+                return False
+    return False
+
+
+def references_only_lower(value, candidate):
+    """R1: value references the candidate solely through its lowerImageDigest token.
+
+    Re-running the same reference scan against a copy whose lowerImageDigest cannot
+    match isolates links that survive only via that one token (a pool host's
+    deployment.previousLowerImageDigest, a placement's shared lower, an image job's
+    from/to digest). If any non-digest identity token (AMI, state-machine/launch-
+    template/recipe version) also links the row, this is False and the row keeps its
+    ordinary attestation/binding requirement.
+
+    references() dives into the first embedded {/[ and never scans the surrounding string, so a
+    non-digest token hidden in a prefix -- at the top level or escaped inside a nested document --
+    is rejected here by non_digest_token_present, which checks every string at every decoding layer
+    using references()'s own >12-character threshold (so a short recipeVersion keeps exact match)."""
+    masked = dict(candidate, lowerImageDigest=None)
+    if not references(value, candidate) or references(value, masked):
+        return False
+    tokens = [masked[k] for k in IDENTITY_KEYS if k != 'launchTemplateVersion' and masked[k] and len(masked[k]) > 12]
+    return not non_digest_token_present(value, tokens)
+
+
+def shared_lower_kept(snapshot, candidate):
+    """R1(a): a retained record (after the one-record drop) keeps the candidate's lower."""
+    return any(identity(r) != identity(candidate) and r['lowerImageDigest'] == candidate['lowerImageDigest']
+               for r in snapshot['deployment']['releases'])
+
+
+def candidate_ami_observable(evidence, candidate):
+    """R1(b): a non-terminated instance runs the candidate AMI, so the alias is live."""
+    return any(instance.get('ImageId') == candidate['amiId']
+               and (instance.get('State') or {}).get('Name') != 'terminated'
+               for instance in evidence['sources']['instances']['rows'])
+
+
+# Terminal image-job phases, re-derived from the app's IMAGE_JOB_NEXT (aws-rebase-store.ts):
+# the phases with no outgoing transition. A non-terminal job may still change, so R1 never
+# exempts it.
+TERMINAL_IMAGE_JOB_PHASES = frozenset({'succeeded', 'recovered', 'cancelled'})
+
+# Typed (source, path-to-digest) edges where a digest-only link is acceptable, derived EXACTLY
+# from the edges the real-data exemptions use. A path is the key chain, into the row AFTER embedded
+# JSON strings are decoded (so no in-band '$json'/'$substr' markers that a literal data key could
+# forge); the ECR-ref edges name the whole ref string, which carries the digest. A digest at any
+# other source or path keeps its ordinary proof.
+R1_DIGEST_EDGES = {
+    'poolHosts': frozenset({('lifecycle_input', 'document', 'deployment', 'previousLowerImageDigest')}),
+    'executions': frozenset({('input', 'document', 'deployment', 'previousLowerImageDigest')}),
+    'placements': frozenset({('lower_image_digest',)}),
+    'imageJobs': frozenset({
+        ('from_digest',), ('to_digest',),
+        ('host_evidence', 'lowerImageDigest'),
+        ('launch_document', 'deployment', 'lowerImageDigest'),
+        ('launch_document', 'deployment', 'previousLowerImageDigest'),
+        ('preparation_document', 'deployment', 'lowerImageDigest'),
+        ('preparation_document', 'deployment', 'previousLowerImageDigest'),
+        ('preparation_document', 'fromDigest'), ('preparation_document', 'toDigest'),
+        ('preparation_document', 'sourceDeployment', 'lowerImageDigest'),
+        ('preparation_document', 'sourceDeployment', 'previousLowerImageDigest'),
+        ('snapshot_evidence', 'fromDigest'), ('snapshot_evidence', 'toDigest'),
+        ('source_release', 'lowerImageDigest'), ('source_release', 'previousLowerImageDigest'),
+        ('source_release', 'lowerImageRef'), ('source_release', 'previousLowerImageRef'),
+        ('target_release', 'lowerImageDigest'), ('target_release', 'previousLowerImageDigest'),
+        ('target_release', 'lowerImageRef'), ('target_release', 'previousLowerImageRef'),
+    }),
+}
+
+
+def r1_eligible(name, row):
+    """R1 exempts a row only when its own state proves it will not change: a terminal execution
+    or image job, or a retired+settled pool host. Placements pass (the live-AMI guard covers an
+    active placement whose instance is on the candidate AMI); unknown sources never pass."""
+    if not isinstance(row, dict):
+        return False
+    if name == 'executions':
+        return row.get('status') in TERMINAL
+    if name == 'imageJobs':
+        return row.get('phase') in TERMINAL_IMAGE_JOB_PHASES
+    if name == 'poolHosts':
+        return row.get('state') == 'retired' and row.get('dispatch_status') == 'settled'
+    return name in R1_DIGEST_EDGES
+
+
+def decode_embedded(value):
+    """Deep copy with embedded JSON strings parsed exactly as references() parses them (from the
+    first '{'/'['); an uninterpretable one is kept as a string so references() still flags it."""
+    if isinstance(value, dict):
+        return {k: decode_embedded(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [decode_embedded(v) for v in value]
+    if isinstance(value, str):
+        start = min((value.find(c) for c in '{[' if c in value), default=-1)
+        if start >= 0:
+            try:
+                return decode_embedded(manifest.loads(value[start:]))
+            except (ValueError, TypeError):
+                return value
+    return value
+
+
+def strip_edge(obj, path):
+    """Delete the string value at the typed edge `path` of a decoded row. Non-string values (a
+    list or object forged at an edge) are left in place so references() still sees the digest."""
+    for key in path[:-1]:
+        if not isinstance(obj, dict) or key not in obj:
+            return
+        obj = obj[key]
+    if isinstance(obj, dict) and isinstance(obj.get(path[-1]), str):
+        del obj[path[-1]]
+
+
+def r1_allowlisted(name, value, candidate):
+    """R1 exempts `value` only when it is eligible (r1_eligible) and links the candidate solely by
+    its lower digest at typed allowlisted edges. Single oracle: decode the row exactly as
+    references() does, delete only the values at the allowlisted edges, and require that NO
+    reference to the candidate survives -- so an escaped, list-wrapped or mislocated digest, or a
+    digest in any unknown source/field, is still seen and refused. references_only_lower adds the
+    non-digest/prefix rule over the original (references() ignores a string prefix)."""
+    if not (r1_eligible(name, value) and references_only_lower(value, candidate)):
+        return False
+    edges = R1_DIGEST_EDGES.get(name)
+    if edges is None:
+        return False
+    stripped = decode_embedded(value)
+    for path in edges:
+        strip_edge(stripped, path)
+    return not references(stripped, candidate)
+
+
 # Every exemption binds one whole canonical source row. Proof documents are
 # retained in evidence, so hashes are checked against data, never accepted alone.
 TERMINAL = {'SUCCEEDED': 'ExecutionSucceeded', 'FAILED': 'ExecutionFailed',
@@ -134,8 +283,35 @@ CLAIMS = ('leased_at', 'lease_token', 'leased_computer_id', 'leased_generation',
 
 def resource_ids(value):
     import re
-    return set(re.findall(r'(?<![A-Za-z0-9-])(?:i|vol)-[0-9a-f]{8,17}(?![0-9a-f])',
-                          canonical(value).decode()))
+    pattern = re.compile(r'(?<![A-Za-z0-9-])(?:i|vol)-[0-9a-f]{8,17}(?![0-9a-f])')
+    found = set(pattern.findall(canonical(value).decode()))
+    found |= raw_resource_ids(value, pattern)
+    return found
+
+
+def raw_resource_ids(value, pattern):
+    """Scan every raw string (and dict key) at every embedded-JSON layer BEFORE serialising.
+    canonical() escapes control characters (a newline becomes the two chars \\n), which lets the id
+    regex's lookbehind see a letter and miss an id that begins a line of a multi-line last_error or
+    log string -- so a conflicting vol-/i- claimant, or a resource named in an execution event,
+    could go unseen. The raw scan has no such blind spot and still descends into embedded documents
+    exactly as references()/decode_embedded parse them (from the first '{'/'[')."""
+    found = set()
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found |= set(pattern.findall(key)) | raw_resource_ids(item, pattern)
+    elif isinstance(value, list):
+        for item in value:
+            found |= raw_resource_ids(item, pattern)
+    elif isinstance(value, str):
+        found |= set(pattern.findall(value))
+        start = min((value.find(c) for c in '{[' if c in value), default=-1)
+        if start >= 0:
+            try:
+                found |= raw_resource_ids(manifest.loads(value[start:]), pattern)
+            except (ValueError, TypeError):
+                pass
+    return found
 
 
 def decoded(value):
@@ -178,6 +354,19 @@ def execution_proof(evidence, arn, describe_sha, history_sha):
     return d, h
 
 
+def closed_usage_row(row, captured):
+    """A usage row is permanent billing history, not a live resource, only when it is
+    closed: stopped_at parses to a timestamp (an open, missing or unparsable stopped_at
+    returns False and keeps the row live) that is not after capture.
+    """
+    stopped = row.get('stopped_at') if isinstance(row, dict) else None
+    try:
+        parsed = time_value(stopped)
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return False  # open or unparsable usage row is a live join
+    return parsed <= captured
+
+
 def absent_instance(evidence, instance, disposition):
     inv = inventory(evidence)
     need(disposition.get('inventorySha256') == sha(inv)
@@ -189,7 +378,12 @@ def absent_instance(evidence, instance, disposition):
         if row.get('instance_id') == instance:
             joins.update(row[k] for k in ('id', 'lifecycle_job_id', 'lifecycle_digest') if row.get(k))
             joins.update(resource_ids(row))
-    need(not any(token in canonical(rows).decode() for token in joins for rows in inv.values()),
+    captured = time_value(evidence['capturedAt'])
+    # Closed usage rows are permanent billing history, not a live resource; every other
+    # section keeps the any-mention rule, and an open/unparsable usage row still refuses.
+    live = {**{k: inv[k] for k in ('instances', 'volumes', 'snapshots', 'placements')},
+            'usage': [row for row in inv['usage'] if not closed_usage_row(row, captured)]}
+    need(not any(token in canonical(rows).decode() for token in joins for rows in live.values()),
          'GC live instance or volume/snapshot/usage/placement join')
     matches = [event for event in evidence['proof']['cloudTrail']
                if event.get('eventID') == disposition.get('terminationEventId')]
@@ -220,6 +414,121 @@ def kept_resource(evidence, snapshot, candidate, resource, disposition):
     joined = [i for i in instances if i.get('InstanceId') in ids]
     need(len(joined) == len(ids) and all(i.get('ImageId') == kept[0]['amiId'] for i in joined),
          'GC resource lacks exact kept AMI join')
+
+
+def retained_data_volume(evidence, snapshot, candidate, resource, disposition):
+    """R2: a vol- named by the candidate's terminal execution is an unattached data
+    volume (empty SnapshotId, not AMI/snapshot-derived) owned by exactly one placement
+    that links the candidate only by the shared lower. That placement is itself a
+    shared-lower reference, so check_attestations' R1 rule enforces that a retained
+    record keeps the lower and no live candidate-AMI instance exists before exempting it.
+    Every field is read from the hash-bound inventory; no caller-supplied claim is trusted and a
+    missing or wrongly typed field never reads as absent/empty.
+    """
+    need(set(disposition) == {'disposition'}, 'GC retained-data-volume unexpected disposition fields')
+    volumes = [v for v in evidence['sources']['volumes']['rows'] if v.get('VolumeId') == resource]
+    need(resource.startswith('vol-') and len(volumes) == 1, 'GC retained-data-volume missing/duplicate volume')
+    volume = volumes[0]
+    raw_tags = volume.get('Tags') if isinstance(volume.get('Tags'), list) else []
+    keys = [t['Key'] for t in raw_tags if isinstance(t, dict) and 'Key' in t]
+    need(type(volume.get('SnapshotId')) is str and volume['SnapshotId'] == ''
+         and type(volume.get('Attachments')) is list and volume['Attachments'] == []
+         and volume.get('State') == 'available' and bool(volume.get('VolumeType'))
+         and len(set(keys)) == len(keys),
+         'GC retained-data-volume not a complete unattached non-derived available data volume')
+    owners = [p for p in evidence['sources']['placements']['rows'] if p.get('volume_id') == resource]
+    need(len(owners) == 1, 'GC retained-data-volume not owned by exactly one placement')
+    owner = owners[0]
+    tags = {t['Key']: t.get('Value') for t in raw_tags if isinstance(t, dict) and 'Key' in t}
+    need(bool(owner.get('computer_id')) and tags.get('ezil:computer-id') == owner['computer_id'],
+         'GC retained-data-volume tag not bound to the owner computer')
+    # The owner's lower must be resolvable the way the app resolves a stopped computer: its exact
+    # lower column equals the candidate lower, it links the candidate only via the placement edge,
+    # and a retained alias keeps that lower (R1 kept-alias rule), re-checked here.
+    need(owner.get('lower_image_digest') == candidate['lowerImageDigest']
+         and r1_allowlisted('placements', owner, candidate) and shared_lower_kept(snapshot, candidate),
+         'GC retained-data-volume owner is not a supported shared-lower placement')
+    # Allowlist, not denylist: the app's placement enum has many live states (placement.ts), so
+    # only an explicitly STOPPED owner qualifies.
+    need(owner.get('state') == 'STOPPED', 'GC retained-data-volume owner placement is not STOPPED')
+    # resource_ids scans every raw string at every embedded-JSON layer, so a volume named only
+    # inside a document, behind an escaped prefix, or at the start of a line in a last_error (where
+    # canonical()'s \n escape would hide it) is still seen as a claimant.
+    claimants = [r for src in ('placements', 'poolHosts', 'imageJobs') for r in evidence['sources'][src]['rows']
+                 if r is not owner and resource in resource_ids(r)]
+    need(not claimants, 'GC retained-data-volume has a conflicting claimant')
+    captured = time_value(evidence['capturedAt'])
+    need(not any(u.get('computer_id') == owner['computer_id'] and not closed_usage_row(u, captured)
+                 for u in evidence['proof']['usage']), 'GC retained-data-volume owner has an open usage row')
+
+
+def absence(evidence, instance):
+    """Build the absence disposition for a terminated instance: exactly one raw CloudTrail
+    TerminateInstances event must name it. This only selects the event; absent_instance does the
+    full validation (the live-join refusal and event authenticity). Shared by the collector's
+    pool-host attestation and resolve_resource so both build absence the same way."""
+    events = [e for e in evidence['proof']['cloudTrail']
+              if e.get('eventName') == 'TerminateInstances' and instance in resource_ids(e)]
+    need(len(events) == 1, 'GC missing or ambiguous raw CloudTrail TerminateInstances event')
+    event = events[0]
+    return {'inventorySha256': sha(inventory(evidence)),
+            'inventoryCapturedAt': evidence['proof']['inventoryCapturedAt'],
+            'terminationEventId': event['eventID'], 'terminationEventTime': event['eventTime'],
+            'terminationEventSha256': sha(event)}
+
+
+def resolve_resource(evidence, snapshot, candidate, resource):
+    """Resolve one resource named by a candidate-referencing terminal execution the single way the
+    execution_terminal disposition does: a kept record's live resource (kept_resource), an R2
+    retained data volume (retained_data_volume), or a terminated instance absent from the live
+    inventory (absent_instance over a raw TerminateInstances event). Returns the disposition and
+    raises ValueError when the resource resolves to none of these. Shared by the collector's
+    attestation builder and the R1 execution-history check so both resolve identically."""
+    for record in snapshot['deployment']['releases']:
+        if record == candidate:
+            continue
+        value = {'disposition': 'kept-record', 'record': identity(record)}
+        try:
+            kept_resource(evidence, snapshot, candidate, resource, value)
+            return value
+        except (ValueError, KeyError, TypeError):
+            pass
+    if resource.startswith('vol-'):
+        value = {'disposition': 'retained-data-volume'}
+        try:
+            retained_data_volume(evidence, snapshot, candidate, resource, value)
+            return value
+        except (ValueError, KeyError, TypeError):
+            pass
+    value = {'disposition': 'attested', **absence(evidence, resource)}
+    absent_instance(evidence, resource, value)
+    return value
+
+
+def r1_execution_history_clean(evidence, snapshot, row, candidate):
+    """R1 exempts an execution on its describe row, but the execution history is a second document
+    kept separately in the proof and never seen by r1_allowlisted. Hold the history to the same bar:
+    it must be the complete, terminal history bound to THIS describe (execution_proof), it must link
+    the candidate only through the shared lower at every decoding layer (references_only_lower -- a
+    candidate AMI/ARN/version hidden in an event is refused), and every resource named in the
+    describe or the history must resolve the way execution_terminal resolves it (resolve_resource).
+    A history that carries an unresolved or candidate-dependent resource keeps the row on the
+    ordinary execution_terminal path. Fails closed on any missing/forged proof."""
+    arn = row.get('executionArn') if isinstance(row, dict) else None
+    if not arn:
+        return False
+    try:
+        bundle = evidence['proof']['executions'][arn]
+        describe, history = execution_proof(evidence, arn, sha(bundle['describe']), sha(bundle['history']))
+        if describe != row:
+            return False
+        if references(history, candidate) and not references_only_lower(history, candidate):
+            return False
+        for resource in resource_ids([row, history]):
+            resolve_resource(evidence, snapshot, candidate, resource)
+        return True
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return False
 
 
 def validate_attestation(a, row, evidence, snapshot, candidate):
@@ -272,11 +581,13 @@ def validate_attestation(a, row, evidence, snapshot, candidate):
         need(isinstance(dispositions, dict) and set(dispositions) == resource_ids([d, h]),
              'GC unresolved execution resources')
         for resource, disposition in dispositions.items():
-            need(isinstance(disposition, dict) and disposition.get('disposition') in ('attested', 'kept-record'),
-                 'GC invalid resource disposition')
+            need(isinstance(disposition, dict) and disposition.get('disposition')
+                 in ('attested', 'kept-record', 'retained-data-volume'), 'GC invalid resource disposition')
             if disposition['disposition'] == 'attested':
                 need(resource.startswith('i-'), 'GC absent volume cannot be attested')
                 absent_instance(evidence, resource, disposition)
+            elif disposition['disposition'] == 'retained-data-volume':
+                retained_data_volume(evidence, snapshot, candidate, resource, disposition)
             else:
                 kept_resource(evidence, snapshot, candidate, resource, disposition)
 
@@ -288,13 +599,26 @@ def check_attestations(evidence, snapshot, candidate, views=None):
     need(isinstance(attestations, list), 'GC attestations must be a list')
     refs = [(name, row) for name in SOURCES for row in evidence['sources'][name]['rows']
             if references(view(name, row), candidate)]
+    # R1 shared-lower: a row linked to the candidate only by its lower digest needs no
+    # attestation when a retained record keeps that lower (a) and the candidate AMI is
+    # not observably live (b). A non-terminated candidate-AMI instance would let the app
+    # resolver select the candidate by observed AMI, so the alias is not substitutable.
+    exempt = set()
+    if shared_lower_kept(snapshot, candidate):
+        shared = [(name, row) for name, row in refs if r1_allowlisted(name, view(name, row), candidate)
+                  and (name != 'executions' or r1_execution_history_clean(evidence, snapshot, view(name, row), candidate))]
+        if shared:
+            need(not candidate_ami_observable(evidence, candidate),
+                 'GC shared-lower alias observable on live candidate-AMI instance')
+            exempt = {(name, sha(row)) for name, row in shared}
+    required = [(name, row) for name, row in refs if (name, sha(row)) not in exempt]
     covered = set()
     for a in attestations:
         need(isinstance(a, dict) and a.get('kind') in ('pool_host_retired_settled', 'execution_terminal')
              and a.get('source') == {'pool_host_retired_settled': 'poolHosts',
                                     'execution_terminal': 'executions'}[a['kind']],
              'GC invalid attestation kind/source')
-        matches = [(n, r) for n, r in refs if n == a['source'] and sha(r) == a.get('rowSha256')]
+        matches = [(n, r) for n, r in required if n == a['source'] and sha(r) == a.get('rowSha256')]
         need(len(matches) == 1 and (a['source'], a['rowSha256']) not in covered,
              'GC spare/duplicate attestation or forged row hash')
         name, row = matches[0]
@@ -302,7 +626,7 @@ def check_attestations(evidence, snapshot, candidate, views=None):
         need(not ambiguous_lower(view(name, row), candidate), 'GC undisambiguated digest-only reference')
         validate_attestation(a, row, evidence, snapshot, candidate)
         covered.add((name, a['rowSha256']))
-    need(len(covered) == len(refs), 'GC referenced record: missing attestation or forbidden source')
+    need(len(covered) == len(required), 'GC referenced record: missing attestation or forbidden source')
 
 
 def ambiguous_lower(value, candidate):

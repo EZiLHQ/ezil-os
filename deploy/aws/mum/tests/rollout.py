@@ -1475,7 +1475,7 @@ class IntegrationTests(unittest.TestCase):
         import registry_gc as gc
         patch.object(gc, 'release', RELEASE).start()
         patch.object(gc, 'tool', RELEASE.json_tool).start()
-        rollout = manifest.read(self.rollout); rollout['app']['tag'] = '478c66b3559c'
+        rollout = manifest.read(self.rollout); rollout['app']['tag'] = rollout['app']['gitSha'][:12]
         TOOL.write(self.rollout, rollout)
         self.path.unlink(); RELEASE.make_plan(self.directory, self.config, self.identity, '1234567890123456789', self.rollout)
         outer = manifest.loads(self.envelope['SecretString']); d = outer[TOOL.KEY][TOOL.REGION]
