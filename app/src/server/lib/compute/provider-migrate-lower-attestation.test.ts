@@ -140,7 +140,9 @@ describe('a migrated volume keeps the lower its first host attested', () => {
         let clock = NOW;
         const mig = migration(), f = placements(mig), t = tunnels(true), deps = enrollDeps(f.db, t.client, () => clock);
         // 1. The ambiguous tunnel create leaves the consumed boot pending (retryable): the host keeps its nonce.
-        expect(await handleAwsEnrollment(deps, body(DIGEST))).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true } });
+        // main also returns its enrollment diagnostics (subject/tunnel); status and body stay exact.
+        const pending = await handleAwsEnrollment(deps, body(DIGEST));
+        expect({ status: pending.status, body: pending.body }).toEqual({ status: 503, body: { error: 'tunnel_unavailable', retryable: true } });
         expect(provisionFor(mig.get())!.placement).toMatchObject({ lastError: ENROLLMENT_PENDING, enrollNonceHash: null, instanceId: DOC.instanceId, volumeId: VOLUME });
         // 2. The host's retry of the SAME boot (a minute later) finishes on the tunnel the first attempt created.
         clock = new Date(NOW.getTime() + 60_000);
@@ -186,7 +188,8 @@ describe('a migrated volume keeps the lower its first host attested', () => {
         const mig = migration(), f = placements(mig), t = tunnels(true), deps = enrollDeps(f.db, t.client);
         expect((await handleAwsEnrollment(deps, body(DIGEST))).status).toBe(503);
         const before = structuredClone(mig.get());
-        expect(await handleAwsEnrollment(deps, body(OTHER))).toEqual({ status: 403, body: { error: 'host_digest_mismatch' } });
+        const mismatch = await handleAwsEnrollment(deps, body(OTHER));
+        expect({ status: mismatch.status, body: mismatch.body }).toEqual({ status: 403, body: { error: 'host_digest_mismatch' } });
         expect(mig.get()).toEqual(before);
         expect(t.calls).toHaveLength(1);
     });
