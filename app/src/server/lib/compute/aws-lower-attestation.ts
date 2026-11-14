@@ -463,6 +463,28 @@ export function createLowerAttestationStore(db: PlacementDb) {
             });
         },
         /**
+         * Dry run: the same locks, drift, expiry, provenance and proof as adopt, and no write of any kind. Returns what adopt
+         * would seal now (`adopted` with the measured digest, or the refusal code); a later adopt re-proves everything.
+         */
+        async preview(attestationId: string, computerId: string,
+            prove: (a: LowerAttestationRecord, p: ImagePlacement, provenance: InstanceProvenance) => LowerAttestationProof, now: Date)
+            : Promise<{ phase: LowerAttestationRecord['phase']; failureCode: LowerAttestationFailure | null; measuredDigest: string | null }> {
+            return withAdmission(db, async (tx, lock) => {
+                const p = await lockImagePlacement(tx, lock, computerId);
+                const a = await read(tx, attestationId);
+                if (!a || a.computerId !== computerId) throw new ImageJobConflictError();
+                if (a.phase !== 'reserved') return { phase: a.phase, failureCode: a.failureCode, measuredDigest: a.measuredDigest };
+                const refused = (failureCode: LowerAttestationFailure) => ({ phase: 'refused' as const, failureCode, measuredDigest: null });
+                if (!await unchanged(tx, p, a)) return refused('placement_changed');
+                if (now.getTime() - Date.parse(a.createdAt) > LOWER_ATTESTATION_TTL_MS) return refused('reservation_expired');
+                try { return { phase: 'adopted' as const, failureCode: null, measuredDigest: prove(a, p!, await provenance(tx, a)).measuredDigest }; }
+                catch (error) {
+                    if (!(error instanceof LowerAttestationRefusal)) throw error;
+                    return refused(error.code);
+                }
+            });
+        },
+        /**
          * One transaction under the placement lock: the proof is re-checked against the locked row, then the NULL row is
          * compare-and-set. Drift, expiry or a proof refusal seals `refused` and releases only this reservation (lower stays NULL).
          */
@@ -571,6 +593,19 @@ export async function adoptLowerAttestation(deps: { store: LowerAttestationStore
     const registry = (parseRebaseJson(deps.env[LIFECYCLE_DEPLOYMENTS_ENV] ?? '{}', 65536) as Record<string, unknown>)[a.region];
     const certificate = readIdentityCertificate(deps.env, a.region);
     const pins = { sourceSha256: deps.env[LOWER_ATTEST_SOURCE_SHA256_ENV] ?? null, documentSha256: deps.env[LOWER_ATTEST_DOCUMENT_SHA256_ENV] ?? null };
-    return deps.store.adopt(a.attestationId, a.computerId, (locked, p, provenance) =>
-        verifyLowerAttestation(locked, p, req.commandId, observations, registry, certificate, pins, deps.now(), provenance), deps.now());
+    const prove = (locked: LowerAttestationRecord, p: ImagePlacement, provenance: InstanceProvenance) =>
+        verifyLowerAttestation(locked, p, req.commandId, observations, registry, certificate, pins, deps.now(), provenance);
+    return deps.store.adopt(a.attestationId, a.computerId, prove, deps.now());
+}
+
+/** The operator runner's dry run: the same AWS reads and the same locked proof as adoptLowerAttestation, writing nothing. */
+export async function previewLowerAttestation(deps: { store: LowerAttestationStore; readers: LowerAttestationReaders; env: Env; now: () => Date },
+    input: LowerAttestationAdoptRequest) {
+    let preview: Awaited<ReturnType<LowerAttestationStore['preview']>> | null = null;
+    const store = { ...deps.store, adopt: (async (attestationId, computerId, prove, now) => {
+        preview = await deps.store.preview(attestationId, computerId, prove, now);
+        return deps.store.inspect(attestationId, computerId);
+    }) as LowerAttestationStore['adopt'] };
+    const sealed = await adoptLowerAttestation({ ...deps, store }, input);
+    return preview ?? { phase: sealed.phase, failureCode: sealed.failureCode, measuredDigest: sealed.measuredDigest };
 }
