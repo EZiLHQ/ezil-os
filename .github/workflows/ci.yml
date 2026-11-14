@@ -222,6 +222,8 @@ jobs:
                    shell/ezil/apps/relay-renewal-test.mjs \
                    shell/ezil/apps/viewer-evidence-test.mjs \
                    shell/ezil/apps/code-test.mjs \
+                   shell/ezil/apps/code-auth-recovery-test.mjs \
+                   shell/ezil/apps/code-return-check-test.mjs \
                    shell/ezil/apps/code-folder-test.mjs \
                    shell/ezil/apps/preview-focus-test.mjs \
                    shell/ezil/apps/frame-confirmation-test.mjs \
@@ -270,6 +272,7 @@ jobs:
                    shell/ezil/app-link-browser-test.mjs \
                    shell/ezil/browser-route-browser-test.mjs \
                    shell/ezil/apps/code-history-browser-test.mjs \
+                   shell/ezil/apps/code-auth-recovery-browser-test.mjs \
                    shell/ezil/launcher-toggle-browser-test.mjs \
                    shell/ezil/apps/app-store-browser-test.mjs \
                    shell/ezil/apps/os-chrome-browser-test.mjs \
@@ -284,7 +287,8 @@ jobs:
                    shell/ezil/ui/Settings/billing-trial-browser-test.mjs \
                    shell/ezil/ui/Settings/credits-real-shape-browser-test.mjs \
                    shell/ezil/ui/feedback-browser-test.mjs \
-                   shell/ezil/ui/feedback/capture-browser-test.mjs; do
+                   shell/ezil/ui/feedback/capture-browser-test.mjs \
+                   e2e/os-boot-watchdog-browser.mjs; do
             echo "── $t"
             node "$t"
           done
@@ -678,6 +682,8 @@ jobs:
         run: |
           node .github/scripts/production-migrations.mjs validate
           python3 -B .github/scripts/staging-lock.test.py
+      - name: Lower-attestation schema installer guards (offline)
+        run: python3 -B deploy/aws/mum/tests/lower_attestation_schema.py
       - name: Verify shared migration protocol on native PostgreSQL
         run: |
           docker pull postgres:16-alpine

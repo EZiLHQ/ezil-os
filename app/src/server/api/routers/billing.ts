@@ -23,6 +23,7 @@ import { deriveStanding, neverPaidTrial, operatorAccessFor } from '@/server/bill
 import {
     hasTrials, quoteFresh, TRIAL_CHECKOUT_TTL_SECONDS, TRIAL_SKU, trialEligibility, trialTerms, type TrialFacts, type TrialStore,
 } from '@/server/billing/v3/trial';
+import { selectTrialOffer, type TrialOfferRefusal, type TrialOfferSelection, type TrialPriceRead } from '@/server/billing/v3/trial-campaigns';
 import { buildUsageV3 } from '@/server/billing/v3/usage';
 import type { BillingSummaryV3, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
 import {
@@ -147,9 +148,14 @@ async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: stri
     return { plan, subscriptionId };
 }
 
-/** Trial refusals carry their own codes (the shell maps `trial_unavailable` / `trial_quote_stale` / `trial_checkout_complete`). */
-function trialError(code: 'trial_unavailable' | 'trial_quote_stale' | 'trial_checkout_complete'): TRPCError {
-    return new TRPCError({ code: code === 'trial_unavailable' ? 'PRECONDITION_FAILED' : 'CONFLICT', message: code });
+/**
+ * Trial refusals carry their own codes (the shell maps `trial_unavailable` / `trial_quote_stale` / `trial_checkout_complete`,
+ * and for campaign offers `trial_offer_invalid` (malformed or unknown coupon) / `trial_offer_unavailable` (disabled, expired,
+ * public offer off, or bad Stripe terms)).
+ */
+function trialError(code: 'trial_unavailable' | 'trial_quote_stale' | 'trial_checkout_complete' | TrialOfferRefusal): TRPCError {
+    return new TRPCError({ code: code === 'trial_offer_invalid' ? 'BAD_REQUEST'
+        : code === 'trial_unavailable' || code === 'trial_offer_unavailable' ? 'PRECONDITION_FAILED' : 'CONFLICT', message: code });
 }
 
 /**
@@ -167,6 +173,39 @@ async function trialCheckoutCall<T>(call: () => Promise<T>): Promise<T> {
     }
 }
 
+/**
+ * The Stripe-controlled trial offer for `coupon` (null = none), from a fresh read of the Standard price and Product
+ * (v3/trial-campaigns.ts). No reader or a failed read refuses `stripe_unavailable`; an unavailable offer refuses with its
+ * own code. Never a fallback offer.
+ */
+async function trialOfferNow(stripe: StripeApi, coupon: string | null, now: Date, timeoutMs = TRIAL_READ_TIMEOUT_MS): Promise<TrialOfferSelection> {
+    let read: TrialPriceRead;
+    try { read = await readTrialCampaignsBounded(stripe, timeoutMs); } catch { throw billingError('stripe_unavailable', 'INTERNAL_SERVER_ERROR'); }
+    const selected = selectTrialOffer(read, coupon, now);
+    if (!selected.ok) throw trialError(selected.code);
+    return selected.offer;
+}
+
+/** The query, quote and checkout bound; the summary's own (public-only, optional) read is tighter. */
+const TRIAL_READ_TIMEOUT_MS = 5_000;
+const SUMMARY_TRIAL_READ_TIMEOUT_MS = 750;
+/**
+ * One campaigns read, bounded: the request is aborted at the deadline, and the race settles at the deadline even if a
+ * reader ignores the signal. No reader rejects (fail closed).
+ */
+async function readTrialCampaignsBounded(stripe: StripeApi, timeoutMs: number): Promise<TrialPriceRead> {
+    if (!stripe.readTrialCampaigns) throw new Error('trial_reader_missing');
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([stripe.readTrialCampaigns(controller.signal), new Promise<never>((_, reject) => {
+            timer = setTimeout(() => { controller.abort(); reject(new Error('trial_reader_timeout')); }, timeoutMs);
+        })]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 /** The viewer's trial eligibility from server facts only (auth.users, trial rows, paid history, plan, operator grant). */
 async function trialEligibilityFor(store: TrialStore, deps: BillingDeps, userId: string, planFamily: string): Promise<{ facts: TrialFacts;
     decision: ReturnType<typeof trialEligibility> }> {
@@ -174,11 +213,19 @@ async function trialEligibilityFor(store: TrialStore, deps: BillingDeps, userId:
     return { facts, decision: trialEligibility({ facts, planFamily, operatorPlan: operatorGrantInEffect(grants, deps.now()) !== null }) };
 }
 
+/**
+ * The summary's trial field describes the PUBLIC offer only (a promoter's offer is `billing.trialOffer`). A paid or
+ * ineligible viewer keeps its reason without any Stripe call. An eligible Free viewer gets the offer only when a fresh,
+ * 750 ms-bounded read shows the public offer on; public off, bad terms or a provider outage answer null, and never fail
+ * the rest of the summary.
+ */
 async function trialOfferFor(deps: BillingDeps, userId: string, planFamily: string): Promise<BillingSummaryV3['trialOffer']> {
     if (!hasTrials(deps.store) || planFamily !== 'free') return undefined;
     try {
         const { decision } = await trialEligibilityFor(deps.store, deps, userId, planFamily);
         if (!decision.eligible) return { eligible: false, reason: decision.reason };
+        if (!deps.stripe || !checkoutAvailable(deps.config)) return null;
+        try { await trialOfferNow(deps.stripe, null, deps.now(), SUMMARY_TRIAL_READ_TIMEOUT_MS); } catch { return null; }
         const terms = trialTerms(deps.now());
         return { eligible: true, sku: TRIAL_SKU, endsAt: isoSeconds(epochSeconds(terms.trialEnd)), amountCents: terms.amountCents, currency: 'usd' };
     } catch {
@@ -651,7 +698,24 @@ export function createBillingRouter(getDeps: () => BillingDeps,
          * Standard trial: claim this person's trial and fix the exact end (the first $20 charge) that the confirmation
          * discloses. Eligibility is decided here from server facts; the client only echoes the end back to checkout.
          */
-        quoteTrial: protectedProcedure.input(z.object({}).strict().optional()).mutation(async ({ ctx }) => {
+        /**
+         * The Stripe-controlled trial offer for an optional coupon, read-only: the same fresh verifier as quoteTrial, but no
+         * claim, no retire, no store write, no customer and no grant. Combine with the summary's own trial eligibility.
+         */
+        trialOffer: protectedProcedure.input(z.object({ coupon: z.string().max(64).optional() }).strict().optional()).query(async ({ ctx, input }) => {
+            const deps = getDeps();
+            const stripe = configuredStripe(deps);
+            // This person first (read-only: plan, trial facts, identity, operator grant), then the fresh provider offer.
+            const store = deps.store;
+            if (!hasTrials(store)) throw trialError('trial_unavailable');
+            const { plan } = await currentPlan(deps, ctx.user.id);
+            const { facts, decision } = await trialEligibilityFor(store, deps, ctx.user.id, plan.family);
+            if (!decision.eligible || facts.emailNormalized === null) throw trialError('trial_unavailable');
+            const offer = await trialOfferNow(stripe, input?.coupon ?? null, deps.now());
+            return { available: true as const, eligible: true as const, offer: { coupon: offer.coupon, fingerprint: offer.fingerprint } };
+        }),
+
+        quoteTrial: protectedProcedure.input(z.object({ coupon: z.string().max(64).optional() }).strict().optional()).mutation(async ({ ctx, input }) => {
             const deps = getDeps();
             const stripe = configuredStripe(deps);
             const store = deps.store;
@@ -659,6 +723,8 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const { plan } = await currentPlan(deps, ctx.user.id);
             const { facts, decision } = await trialEligibilityFor(store, deps, ctx.user.id, plan.family);
             if (!decision.eligible || facts.emailNormalized === null) throw trialError('trial_unavailable');
+            // The Stripe-controlled offer, resolved before anything is claimed or retired: an unavailable one refuses.
+            const offer = await trialOfferNow(stripe, input?.coupon ?? null, deps.now());
             if (facts.own?.status === 'checkout') await retireTrialCheckout(stripe, facts.own.checkoutSessionId);
             const terms = trialTerms(deps.now());
             const claim = await store.claimTrialQuote({ userId: ctx.user.id, authSubject: facts.authSubject,
@@ -667,11 +733,14 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             if (claim.status === 'refused') throw trialError('trial_unavailable');
             return { sku: TRIAL_SKU, todayCents: 0, trialEndsAt: isoSeconds(epochSeconds(claim.trial.trialEnd)),
                 firstChargeAt: isoSeconds(epochSeconds(claim.trial.trialEnd)), amountCents: terms.amountCents, currency: 'usd' as const,
-                interval: 'month' as const, quoteExpiresAt: isoSeconds(epochSeconds(claim.trial.quotedAt) + 30 * 60) };
+                interval: 'month' as const, quoteExpiresAt: isoSeconds(epochSeconds(claim.trial.quotedAt) + 30 * 60),
+                offer: { coupon: offer.coupon, fingerprint: offer.fingerprint } };
         }),
 
         createCheckout: protectedProcedure.input(z.object({ sku: z.enum(['standard_monthly_v3', 'premium_monthly_v3']),
-            trial: z.object({ trialEndsAt: z.string().datetime({ offset: true }) }).strict().optional() })).mutation(async ({ ctx, input }): Promise<CheckoutStartDTO> => {
+            trial: z.object({ trialEndsAt: z.string().datetime({ offset: true }),
+                offer: z.object({ coupon: z.string().max(64).nullable(), fingerprint: z.string().regex(/^[0-9a-f]{64}$/) }).strict().optional(),
+            }).strict().optional() })).mutation(async ({ ctx, input }): Promise<CheckoutStartDTO> => {
             const deps = getDeps();
             const stripe = configuredStripe(deps);
             const { plan } = await currentPlan(deps, ctx.user.id);
@@ -682,7 +751,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 throw billingError('already_subscribed', 'CONFLICT');
             }
             // Standard trial: only the caller's own fresh stored quote, re-checked now, with the end they were shown.
-            let trial: { row: NonNullable<TrialFacts['own']>; store: TrialStore } | null = null;
+            let trial: { row: NonNullable<TrialFacts['own']>; store: TrialStore; offer: TrialOfferSelection } | null = null;
             if (input.trial) {
                 const store = deps.store;
                 if (input.sku !== TRIAL_SKU || !hasTrials(store)) throw trialError('trial_unavailable');
@@ -693,7 +762,11 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                     || epochSeconds(row.trialEnd) !== epochSeconds(input.trial.trialEndsAt)
                     // The quote must still claim the caller's CURRENT verified identity; a re-quote moves the claim.
                     || row.authSubject !== facts.authSubject || row.emailNormalized !== facts.emailNormalized) throw trialError('trial_quote_stale');
-                trial = { row, store };
+                // Re-resolve the exact offer selected at quote against a fresh Stripe read: unavailable refuses, changed terms
+                // (price, product, public state, coupon, expiry) are stale. Without `offer` only the current public offer applies.
+                const offer = await trialOfferNow(stripe, input.trial.offer?.coupon ?? null, deps.now());
+                if (input.trial.offer && input.trial.offer.fingerprint !== offer.fingerprint) throw trialError('trial_quote_stale');
+                trial = { row, store, offer };
             }
 
             let customerId = await deps.store.stripeCustomerFor(ctx.user.id);
@@ -730,7 +803,8 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                     : `checkout:${ctx.user.id}:${input.sku}:${crypto.randomUUID()}`,
                 ...(trial ? { trial: { trialId: trial.row.id, trialEnd: trial.row.trialEnd,
                     // Stripe idempotency compares every parameter: retries use the persisted quote's expiry too.
-                    expiresAt: new Date((epochSeconds(trial.row.quotedAt) + TRIAL_CHECKOUT_TTL_SECONDS) * 1000) } } : {}),
+                    expiresAt: new Date((epochSeconds(trial.row.quotedAt) + TRIAL_CHECKOUT_TTL_SECONDS) * 1000),
+                    offer: { coupon: trial.offer.coupon, fingerprint: trial.offer.fingerprint, priceId: trial.offer.priceId } } } : {}),
             }));
             if (trial) {
                 const attached = await trial.store.attachTrialCheckout({ trialId: trial.row.id, userId: ctx.user.id,

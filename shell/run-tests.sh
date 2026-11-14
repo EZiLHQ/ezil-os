@@ -337,6 +337,7 @@ PORTABLE_SUITES=(
     "shell/ezil/app-link-browser-test.mjs"
     "shell/ezil/browser-route-browser-test.mjs"
     "shell/ezil/apps/code-history-browser-test.mjs"
+    "shell/ezil/apps/code-auth-recovery-browser-test.mjs"
     "shell/ezil/launcher-toggle-browser-test.mjs"
     "shell/ezil/apps/app-store-browser-test.mjs"
     "shell/ezil/apps/os-chrome-browser-test.mjs"

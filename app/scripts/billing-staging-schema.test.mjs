@@ -567,7 +567,7 @@ test('reverse moves (0012) stay staging-only on production: baseline refused, an
 test('operator entitlements follow 0012, stay additive, server-only and a production snapshot only', () => {
     const file = 'app/drizzle/0019_operator_entitlements.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0012_compute_reverse_moves.sql') + 1);
-    assert.equal(EXPLICIT_FILES.at(-4), file);
+    assert.equal(EXPLICIT_FILES.at(-5), file);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     // New tables only: no existing (Stripe, billing or compute) table is altered or written.
     assert.match(sql, /CREATE TABLE IF NOT EXISTS public\.ezil_operator_entitlements \(/);
@@ -600,7 +600,7 @@ test('operator entitlements (0019) production baseline refuses: it must be appli
 test('operator refusal receipts follow immutable 0019 and are a production snapshot only', () => {
     const file = 'app/drizzle/0020_operator_refusal_receipts.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0019_operator_entitlements.sql') + 1);
-    assert.equal(EXPLICIT_FILES.at(-3), file);
+    assert.equal(EXPLICIT_FILES.at(-4), file);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     assert.match(sql, /ALTER COLUMN assignment_ref DROP NOT NULL/);
     assert.match(sql, /ALTER COLUMN revision DROP NOT NULL/);
@@ -626,7 +626,7 @@ test('operator refusal receipts (0020) production baseline refuses: it must be a
 test('the Standard trial follows 0020, stays additive and is a production snapshot only', () => {
     const file = 'app/drizzle/0021_standard_trial.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0020_operator_refusal_receipts.sql') + 1);
-    assert.equal(EXPLICIT_FILES.at(-2), file);
+    assert.equal(EXPLICIT_FILES.at(-3), file);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     assert.match(sql, /CREATE TABLE "ezil_billing_trials" \(/);
     // Review R4: every verified identity of a started trial, append-only, removed only with its trial.
@@ -683,7 +683,7 @@ test('Standard trial (0021) production baseline refuses: it must be applied, nev
 
 test('feedback notifications follow Standard trial, remain server-only and cannot baseline on production', () => {
     const file = 'app/drizzle/0022_feedback_notifications.sql';
-    assert.equal(EXPLICIT_FILES.at(-1), file);
+    assert.equal(EXPLICIT_FILES.at(-2), file);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     assert.match(sql, /CREATE TABLE public\.ezil_feedback_notifications/);
     assert.match(sql, /ENABLE ROW LEVEL SECURITY/);
@@ -692,4 +692,32 @@ test('feedback notifications follow Standard trial, remain server-only and canno
     const h = productionHarness();
     assert.equal(run(['baseline', '0022_feedback_notifications.sql', '--yes', ...productionArgs], h.options), 1);
     assert.equal(h.calls.length, 0);
+});
+
+// Issuing organization (0023): one nullable column and its CHECK on the operator table, after 0022; a snapshot only.
+test('the issuing organization follows 0022, stays additive and is a production snapshot only', () => {
+    const file = 'app/drizzle/0023_operator_issued_by.sql';
+    assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0022_feedback_notifications.sql') + 1);
+    assert.equal(EXPLICIT_FILES.at(-1), file);
+    const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
+    assert.match(sql, /ALTER TABLE public\.ezil_operator_entitlements ADD COLUMN IF NOT EXISTS issued_by text;/);
+    assert.match(sql, /ADD CONSTRAINT ezil_operator_entitlements_issued_by CHECK \(issued_by IS NULL OR/);
+    // No NUL in a PostgreSQL regex: text cannot hold it, and the control range starts at U+0001.
+    assert.doesNotMatch(sql, /\\u0000/);
+    // Escapes only: no raw invisible or non-ASCII character in the file, and the bidi/Arabic-mark/BOM ranges are present.
+    assert.doesNotMatch(sql, /[^\x09\x0a\x20-\x7e]/);
+    for (const escape of ['\\u061c', '\\u200b-\\u200f', '\\u2028-\\u202e', '\\u2060-\\u2069', '\\ufeff', '\\u0001-\\u001f', '\\u007f-\\u009f']) assert.ok(sql.includes(escape), escape);
+    assert.doesNotMatch(sql, /DROP |INSERT INTO|UPDATE public|DELETE FROM|TRUNCATE|GRANT |NOT NULL|DEFAULT /i);
+    const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../../.github/production-migrations.json', import.meta.url)), 'utf8'));
+    assert.deepEqual(manifest.sources.find(source => source.path === file), { path: file, sha256: sha256(sql), kind: 'snapshot' });
+    assert.equal((manifest.migrations ?? []).some(migration => migration.path === file), false);
+});
+
+test('issuing organization (0023) must be applied on production, never baselined', () => {
+    for (const name of ['0023_operator_issued_by.sql', './app/drizzle/0023_operator_issued_by.sql']) {
+        const h = productionHarness();
+        assert.equal(run(['baseline', name, '--yes', ...productionArgs], h.options), 1);
+        assert.equal(h.calls.length, 0);
+        assert.match(h.output.join('\n'), /never baselined/);
+    }
 });

@@ -112,12 +112,19 @@ function invoice (kind = 'subscription', created = '2026-10-14T12:00:00Z', statu
 let summary = v2(), history = [];
 let getSummary = () => reply(summary), getHistory = () => reply(history), getUsage = () => failure('unavailable');
 let mutation = () => reply({ url: 'https://billing.example.test/session' });
+// The read-only availability check (billing.trialOffer). `availableOffer` answers available+eligible for the asked offer.
+const OFFER_FINGERPRINT = 'a'.repeat(64);
+const availableOffer = call => reply({ available: true, eligible: true, offer: { coupon: call.input?.coupon ?? null, fingerprint: OFFER_FINGERPRINT } });
+// Default: the free month is not available (public switch off), so plain paid-path cases show only paid actions.
+let getTrialOffer = () => failure('trial_offer_unavailable');
 window.fetch = async (url, options = {}) => {
-    const call = { url: String(url), method: options.method, input: options.body ? JSON.parse(options.body).json : undefined };
+    const queryInput = new URL(String(url), 'https://example.test').searchParams.get('input');
+    const call = { url: String(url), method: options.method, input: options.body ? JSON.parse(options.body).json : queryInput ? JSON.parse(queryInput).json : undefined };
     calls.push(call);
     if ( call.url.includes('/api/trpc/billing.summary') ) return getSummary();
     if ( call.url.includes('/api/trpc/billing.history') ) return getHistory();
     if ( call.url.includes('/api/trpc/billing.usage') ) return getUsage();
+    if ( call.url.includes('/api/trpc/billing.trialOffer') ) return getTrialOffer(call);
     if ( call.url.includes('/api/trpc/billing.') ) return mutation(call);
     if ( call.url.includes('/api/trpc/computer.list') ) return reply([]);
     return failure('Stubbed endpoint');
@@ -975,11 +982,29 @@ try {
         summary.plan = { ...summary.plan, renewal: null, cancelsAt: null, access };
         summary.actions = { ...summary.actions, checkout: false, upgrade: false, downgrade: false, cancel: false };
         await refresh(); audit();
-        contains('[data-role="plan-card"]', 'Assigned by EZiL · no payment');
+        // An older server's access (no issuedBy) is EZiL's; the card never says "no payment".
+        contains('[data-role="plan-card"] .ezil-billing-plan-price', 'Assigned by EZiL');
+        assert.equal(q('[data-role="plan-card"] .ezil-billing-plan-price').textContent, 'Assigned by EZiL');
+        assert.doesNotMatch(q('[data-role="plan-card"]').textContent, /no payment/i);
         contains('[data-role="plan-card"]', line);
         assert.doesNotMatch(q('[data-role="plan-card"]').textContent, /Renews|\$20 \/ month|Cancel/);
     }
     pass('product entitlements v1: an operator-assigned plan shows as assigned access with its validity, never a price or renewal');
+
+    // Issuing organization: the name the server reports; EZiL when none, blank or not a string; always text, never markup.
+    for ( const [issuedBy, line] of [['Acme', 'Assigned by Acme'], ['EZiL', 'Assigned by EZiL'], ['', 'Assigned by EZiL'], ['   ', 'Assigned by EZiL'],
+        [null, 'Assigned by EZiL'], [42, 'Assigned by EZiL'], ['<img src=x onerror="window.__issuedByXss=1"> & Co', 'Assigned by <img src=x onerror="window.__issuedByXss=1"> & Co']] ) {
+        summary = summaryV3('standard');
+        summary.plan = { ...summary.plan, renewal: null, cancelsAt: null,
+            access: { source: 'operator', ref: 'osg-00000000-0000-4000-8000-000000000001', endsAt: '2026-12-04T12:00:00Z', untilRevoked: false, issuedBy } };
+        summary.actions = { ...summary.actions, checkout: false, upgrade: false, downgrade: false, cancel: false };
+        await refresh(); audit();
+        assert.equal(q('[data-role="plan-card"] .ezil-billing-plan-price').textContent, line);
+        assert.equal(q('[data-role="plan-card"] img'), null, 'an issuing organization name is never markup');
+        assert.doesNotMatch(q('[data-role="plan-card"]').textContent, /no payment|Renews|\$20 \/ month/i);
+        contains('[data-role="plan-card"]', 'Your access ends on Dec 4, 2026.');
+    }
+    pass('issuing organization: "Assigned by Acme"; omitted, blank or legacy access is "Assigned by EZiL"; the name is escaped text');
 
     // Identity credits (`ai.account`): every live grant in the total, exact microcredits, never the catalog.
     {
@@ -1298,7 +1323,7 @@ try {
 
     // Standard trial: every entry from Free opens the checkout sheet in its trial mode (it quotes and confirms the
     // exact end itself, billing-trial-test.mjs); ineligible keeps the paid Standard checkout; Premium is never a trial.
-    summary = trialSummaryV3('offer'); await open();
+    getTrialOffer = availableOffer; summary = trialSummaryV3('offer'); await open();
     assert.deepEqual(qa('[data-pane="billing"] .ezil-settings-btn-primary').map(button => button.textContent), ['Start your free month']);
     click(q('[data-role="plan-actions"] [data-action="trial"]'));
     assert.deepEqual([sheets.at(-1).kind, sheets.at(-1).sku, sheets.at(-1).trial], ['checkout', 'standard_monthly_v3', true]);
@@ -1312,7 +1337,7 @@ try {
     // The pricing page's Standard card advertises the free month: its deep link opens it when offered, else Standard.
     await open({ ...context, initialTab: 'billing', openUpgrade: 'standard_monthly_v3' });
     assert.deepEqual([sheets.at(-1).kind, sheets.at(-1).sku, sheets.at(-1).trial], ['checkout', 'standard_monthly_v3', true]); await closeSheet();
-    summary = trialSummaryV3('ineligible'); await open({ ...context, initialTab: 'billing', openUpgrade: 'standard_monthly_v3' });
+    getTrialOffer = () => failure('trial_unavailable'); summary = trialSummaryV3('ineligible'); await open({ ...context, initialTab: 'billing', openUpgrade: 'standard_monthly_v3' });
     assert.deepEqual([sheets.at(-1).kind, sheets.at(-1).sku, sheets.at(-1).trial], ['checkout', 'standard_monthly_v3', undefined]); await closeSheet();
     has('[data-action="trial"]', false);
     contains('[data-role="plan-offer"][data-sku="standard_monthly_v3"] [data-role="trial-ineligible"]', "You've already used your free month.");
@@ -1609,6 +1634,89 @@ try {
     audit();
     assert.ok(count() > 0); assert.deepEqual(errors, []);
     pass('feature flag/native/auth gates, lazy loading and reopened-window bindings');
+
+    // ── The free month: public and promoter link, gated by the server's read-only availability (billing.trialOffer) ──
+    {
+        const freeWith = (offer) => { const value = summaryV3('free'); if ( offer === null ) delete value.trialOffer; else value.trialOffer = offer;
+            return value; };
+        const previewOffer = { eligible: true, sku: 'standard_monthly_v3', endsAt: '2026-12-05T03:30:00Z', amountCents: 2000, currency: 'usd' };
+        const available = alias => reply({ available: true, eligible: true, offer: { coupon: alias, fingerprint: 'c'.repeat(64) } });
+        const asked = () => calls.filter(call => call.url.includes('/api/trpc/billing.trialOffer')).map(call => call.input);
+        const trialCtas = () => qa('[data-action="trial"]').length;
+        // Visiting a link, signing in and the first Billing render only READ availability: no quote, no checkout, no provider POST.
+        const noMutations = () => assert.deepEqual(calls.filter(call => /billing\.(quoteTrial|createCheckout|createTopupCheckout)/.test(call.url) || (call.method && call.method !== 'GET' && ! /billing\.(summary|history|usage)/.test(call.url))
+            ).map(call => call.url), [], 'only read-only calls before the person activates the CTA');
+        const savedTrialOffer = getTrialOffer;
+        const reset = () => { getTrialOffer = savedTrialOffer; calls.length = 0; sheets.length = 0; };
+        const link = (alias, extra = {}) => ({ ...context, initialTab: 'billing', ...(alias ? { couponAlias: alias } : {}), ...extra });
+
+        // Public, no link: the read asks for the public offer ({}), and only its available+eligible answer shows a free month.
+        reset(); getTrialOffer = call => available(call.input?.coupon ?? null);
+        summary = freeWith(previewOffer); await open(); noMutations();
+        assert.deepEqual(copy(asked()), [{}]);
+        assert.ok(trialCtas() > 0, 'public offer available'); has('[data-role="coupon-notice"]', false);
+        // Public switch off (the read refuses): the summary's preview alone promises nothing.
+        reset(); getTrialOffer = () => failure('trial_offer_unavailable');
+        summary = freeWith(previewOffer); await open(); noMutations();
+        assert.equal(trialCtas(), 0, 'public off: no free-month CTA'); has('[data-role="coupon-notice"]', false);
+        assert.ok(!/free month/i.test(q('[data-role="plan-offer"][data-sku="standard_monthly_v3"]').textContent), 'no free-month words either');
+        // Missing, false or malformed eligibility never enables.
+        for ( const bad of [{ available: true, offer: { coupon: null, fingerprint: 'c'.repeat(64) } }, { available: true, eligible: false, offer: { coupon: null, fingerprint: 'c'.repeat(64) } },
+            { available: false, eligible: true, offer: { coupon: null, fingerprint: 'c'.repeat(64) } }, { available: true, eligible: true, offer: { coupon: 'other', fingerprint: 'c'.repeat(64) } },
+            { available: true, eligible: true, offer: { coupon: null, fingerprint: 'nope' } }, { available: true, eligible: true }] ) {
+            reset(); getTrialOffer = () => reply(bad); summary = freeWith(previewOffer); await open(); noMutations();
+            assert.equal(trialCtas(), 0, JSON.stringify(bad));
+        }
+        // A used-trial person keeps the summary's own refusal copy; the availability never overrides it.
+        reset(); getTrialOffer = () => failure('trial_unavailable');
+        summary = freeWith({ eligible: false, reason: 'trial_used' }); await open(); noMutations();
+        assert.equal(trialCtas(), 0); contains('[data-role="plan-offer"][data-sku="standard_monthly_v3"]', "You've already used your free month.");
+
+        // A valid promoter link with a null summary offer: asked with ONLY the alias, CTA enabled, one activation opens one sheet carrying it.
+        reset(); getTrialOffer = call => available(call.input?.coupon ?? null);
+        summary = freeWith(null); await open(link('midhun')); noMutations();
+        assert.deepEqual(copy(asked()), [{ coupon: 'midhun' }], 'never also the public offer');
+        assert.ok(trialCtas() > 0); contains('[data-role="coupon-notice"]', 'Your free-month link is ready');
+        const cta = q('[data-action="trial"]'); click(cta); click(cta); await settle();
+        assert.equal(sheets.filter(sheet => sheet.kind === 'checkout').length, 1, 'a double click opens one sheet');
+        assert.equal(sheets.at(-1).coupon, 'midhun'); assert.equal(sheets.at(-1).trial, true); assert.equal(sheets.at(-1).sku, 'standard_monthly_v3');
+        await closeSheet();
+        // A public sheet carries no coupon.
+        reset(); getTrialOffer = call => available(call.input?.coupon ?? null);
+        summary = freeWith(previewOffer); await open(); noMutations(); click(q('[data-action="trial"]')); await settle();
+        assert.equal(sheets.at(-1).coupon, undefined); assert.equal(sheets.at(-1).trial, true); await closeSheet();
+
+        // Outage: no CTA, a Try again that asks the SAME alias again; unavailable/invalid/refused are explained and final.
+        reset(); getTrialOffer = () => failure('stripe_unavailable');
+        summary = freeWith(previewOffer); await open(link('midhun')); noMutations();
+        assert.equal(trialCtas(), 0); has('[data-role="coupon-notice"][data-state="error"]'); has('[data-action="coupon-retry"]');
+        getTrialOffer = call => available(call.input?.coupon ?? null); click(q('[data-action="coupon-retry"]')); await settle();
+        assert.deepEqual(copy(asked()), [{ coupon: 'midhun' }, { coupon: 'midhun' }]); assert.ok(trialCtas() > 0);
+        for ( const [code, state] of [['trial_offer_unavailable', 'unavailable'], ['trial_offer_invalid', 'invalid'], ['trial_unavailable', 'refused']] ) {
+            reset(); getTrialOffer = () => failure(code); summary = freeWith(previewOffer); await open(link('midhun')); noMutations();
+            assert.equal(trialCtas(), 0, code); has(`[data-role="coupon-notice"][data-state="${state}"]`); has('[data-action="coupon-retry"]', false);
+        }
+        // A malformed or repeated address asks nothing and never falls to the public offer.
+        reset(); getTrialOffer = () => available(null); summary = freeWith(previewOffer); await open(link(null, { couponInvalid: true })); noMutations();
+        assert.deepEqual(asked(), []); assert.equal(trialCtas(), 0); has('[data-role="coupon-notice"][data-state="invalid"]');
+
+        // Delayed availability across a user switch / link change: the late answer for the old context never lands.
+        reset(); let releaseOld; getTrialOffer = () => new Promise(resolve => { releaseOld = () => resolve(available('midhun')); });
+        summary = freeWith(null);
+        await open(link('midhun')); noMutations();
+        assert.ok(releaseOld, 'the first read is in flight'); has('[data-action="trial"]', false);
+        const $settings = window.$(q('.window[data-app="settings"]'));
+        // Another user and another link activate the same window before the first read answers.
+        getTrialOffer = call => available(call.input?.coupon ?? null);
+        window.billing.default.onActivate($settings, { ...link('other'), payload: { ...payload, user: { id: 'other-user', name: 'Other' } } }); await settle();
+        releaseOld(); await settle(); noMutations();
+        assert.deepEqual(copy(asked()), [{ coupon: 'midhun' }, { coupon: 'other' }]);
+        assert.equal(trialCtas() > 0, true, 'the new context shows its own link');
+        click(q('[data-action="trial"]')); await settle();
+        assert.equal(sheets.at(-1).coupon, 'other', 'never the old link'); assert.ok(!sheets.some(sheet => sheet.coupon === 'midhun'));
+        await closeSheet();
+        reset();
+    }
     console.log(`PASS Billing v2: ${groups} groups; ${audited} whole-pane copy/accessibility audits; 0 window errors`);
 } finally {
     dom.window.close();

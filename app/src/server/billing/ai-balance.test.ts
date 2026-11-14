@@ -119,7 +119,21 @@ describe('Free summary grant', () => {
         await enqueueFreeAiCredits(store, 'user', 'free_v3', new Date('2026-11-21Z'));
         expect(rows.size).toBe(1);
         expect([...rows.values()][0]).toMatchObject({ eventKey: 'ezil-os:v1:free-once:user:grant',
-            payload: { credits: 100, expiresAt: '2027-10-21T00:00:00.000Z' } });
+            payload: { credits: 10, expiresAt: '2027-10-21T00:00:00.000Z' } });
+    });
+    it('does not overwrite an existing 100 receipt or create a second identity when summaries now request 10', async () => {
+        const historical: OutboxInsert = { eventKey: 'ezil-os:v1:free-once:user:grant', userId: 'user', kind: 'ai_grant',
+            payload: { credits: 100, expiresAt: '2027-01-01T00:00:00.000Z', delivery: { outcome: 'already_granted' } } };
+        const rows = new Map([[historical.eventKey, historical]]);
+        const store = { enqueueOutbox: vi.fn(async (item: OutboxInsert) => {
+            if (rows.has(item.eventKey)) return 'duplicate' as const;
+            rows.set(item.eventKey, item); return 'queued' as const;
+        }) };
+        await Promise.all([enqueueFreeAiCredits(store, 'user', 'free_v3', new Date('2026-11-12Z')),
+            enqueueFreeAiCredits(store, 'user', 'free_v3', new Date('2026-11-13Z'))]);
+        expect(store.enqueueOutbox.mock.calls[0]![0].payload.credits).toBe(10);
+        expect([...rows.values()]).toEqual([historical]);
+        expect(rows.get(historical.eventKey)!.payload.credits).toBe(100);
     });
     it.each(['legacy', 'standard_monthly_v3', 'premium_monthly_v3'])('does not give %s a Free grant', async sku => {
         const store = { enqueueOutbox: vi.fn() };

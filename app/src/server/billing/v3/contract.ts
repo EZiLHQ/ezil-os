@@ -123,7 +123,7 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         size: 'free-cf', provider: 'cloudflare', vcpu: 2, memoryGiB: 6,
         sessionMaxSeconds: 1 * H, opening: 'standard', poolPriority: 0,
         fairUseSeconds: 5 * H, legacyFairUseSeconds: 8 * H,
-        highlighted: false, badge: null, machineChoice: ['free-cf'], aiCredits: { amount: 100, per: 'once' },
+        highlighted: false, badge: null, machineChoice: ['free-cf'], aiCredits: { amount: 10, per: 'once' },
         bullets: ['A real desktop in your browser', 'VS Code and a browser built in', '2 vCPU · 6 GB computer', 'Sessions up to 1 hour'],
         storageGiB: null,
     },
@@ -303,7 +303,11 @@ export interface BillingSummaryV3 {
          * Product entitlements v1 (additive, present only then): the plan was assigned by an EZiL operator. It is not a
          * payment: no renewal, checkout, upgrade, downgrade or cancel through Stripe, and no included AI credits.
          */
-        access?: { source: 'operator'; ref: string; endsAt: string | null; untilRevoked: boolean };
+        access?: {
+            source: 'operator'; ref: string; endsAt: string | null; untilRevoked: boolean;
+            /** The issuing organization's name the plan card shows ("Assigned by <issuedBy>"); EZiL when none was given. */
+            issuedBy: string;
+        };
         /**
          * Standard trial (additive, present only for a trial that has not converted): `trialing` = $0 so far, the first
          * charge of `amountCents` on `firstChargeAt` (= `endsAt`) unless cancelled; `ending` = cancelled, Standard until

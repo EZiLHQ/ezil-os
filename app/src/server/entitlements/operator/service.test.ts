@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { OperatorEntitlementRow } from '@/server/billing/v3/operator-access';
+import { addCalendarMonthUtc } from '@/server/billing/v3/trial';
 import { sourceCatalog } from './contract';
 import { handleCommand, readAssignments, type CommandStore, type IdentityCheck, type OperatorEntitlementDeps, type StripeView } from './service';
 
@@ -8,6 +9,8 @@ const ACCOUNT = '10000000-0000-4000-8000-0000000000a1';
 const T0 = new Date('2026-11-04T12:00:00.000Z');
 const later = (ms: number) => new Date(T0.getTime() + ms);
 const DAY = 86_400_000;
+// The server-computed one-calendar-month end from T0 (2026-12-04T12:00:00.000Z); equals later(30 * DAY) for November.
+const MONTH_END = addCalendarMonthUtc(T0);
 const REVISION = sourceCatalog().catalog_revision;
 const NO_STRIPE: StripeView = { paidAccess: false, computeActive: false, productRef: null, state: null, checkoutOpen: false };
 let ids = 0;
@@ -114,14 +117,22 @@ describe('ezil-os commands: assign, change, end', () => {
         expect(h.rows[0]).toMatchObject({ sku: 'premium_monthly_v3', revision: 2 });
     });
 
-    it('until_revoked, change to Premium with a later end, then end: revisions 1 → 2 → 3, access follows', async () => {
+    it('until-revoked is refused; a Standard→Premium change preserves the period end; then end stops access (rev 1 → 2 → 3)', async () => {
         const h = harness();
-        const a = await run(h, command({ validity: { until_revoked: true } }));
-        expect(a.assignment).toMatchObject({ ends_at: null, until_revoked: true, state: 'active' });
+        // until-revoked is no longer a supported validity: an operator plan runs one calendar month.
+        expect(await run(h, command({ validity: { until_revoked: true } }))).toMatchObject({ outcome: 'refused', refusal: { code: 'invalid_command' }, assignment: null });
+        expect(h.state.accessWrites).toBe(0);
+        // Positive control: a valid one-calendar-month assign applies and stores the computed end.
+        const a = await run(h, command());
+        expect(a.assignment).toMatchObject({ revision: 1, ends_at: MONTH_END.toISOString(), until_revoked: false, state: 'active' });
+        // A product change (Standard → Premium, no validity) preserves the one-month period end.
         const c = await run(h, command({ action: 'change', product: { ref: 'premium_monthly_v3', catalog_revision: REVISION },
-            validity: { ends_at: later(10 * DAY).toISOString() }, assignment: { ref: a.assignment!.ref, expected_revision: 1 } }));
-        expect(c).toMatchObject({ outcome: 'applied', assignment: { revision: 2, product_ref: 'premium_monthly_v3', ends_at: later(10 * DAY).toISOString() },
+            validity: null, assignment: { ref: a.assignment!.ref, expected_revision: 1 } }));
+        expect(c).toMatchObject({ outcome: 'applied', assignment: { revision: 2, product_ref: 'premium_monthly_v3', ends_at: MONTH_END.toISOString() },
             effective_access: { state: 'active', product_ref: 'premium_monthly_v3', via: 'operator' } });
+        // A change that carries any validity is refused: the period is fixed; use end to stop access early.
+        expect(await run(h, command({ action: 'change', product: null, validity: { ends_at: later(10 * DAY).toISOString() },
+            assignment: { ref: a.assignment!.ref, expected_revision: 2 } }))).toMatchObject({ outcome: 'refused', refusal: { code: 'invalid_command' } });
         h.state.now = later(DAY);
         const e = await run(h, command({ action: 'end', product: null, validity: null, assignment: { ref: a.assignment!.ref, expected_revision: 2 } }));
         expect(e).toMatchObject({ outcome: 'applied', assignment: { revision: 3, state: 'ended', ends_at: later(DAY).toISOString() },
@@ -143,14 +154,22 @@ describe('ezil-os commands: assign, change, end', () => {
         expect(await end({ assignment: { ref: a.assignment!.ref, expected_revision: 2 } })).toMatchObject({ refusal: { code: 'invalid_command' } });
     });
 
-    it('one live assignment per account; a lapsed one is closed at its end before a new assign', async () => {
+    it('one live assignment per account; after the month expires, access recomputes to Free and a reassign starts a fresh month (no auto-renew)', async () => {
         const h = harness();
-        const first = await run(h, command({ validity: { ends_at: later(DAY).toISOString() } }));
+        const first = await run(h, command());
+        expect(first.assignment).toMatchObject({ ends_at: MONTH_END.toISOString() });
+        // A second assign while the first is live is refused.
         expect(await run(h, command())).toMatchObject({ refusal: { code: 'invalid_command' } });
-        h.state.now = later(2 * DAY);
-        const second = await run(h, command({ validity: { ends_at: later(40 * DAY).toISOString() } }));
-        expect(second).toMatchObject({ outcome: 'applied', effective_access: { via: 'operator', product_ref: 'standard_monthly_v3' } });
-        expect(h.rows.find(r => r.ref === first.assignment!.ref)!.endedAt).toEqual(later(DAY));
+        // Advance past the one-calendar-month end: access recomputes to none (Free) with nothing deleted, no renewal.
+        h.state.now = new Date(MONTH_END.getTime() + DAY);
+        expect((await readAssignments(h.deps, { kind: 'individual', os_user_id: USER, account_public_id: ACCOUNT }))!.effective_access)
+            .toMatchObject({ state: 'none', product_ref: null, via: null });
+        // Reassigning starts a NEW one-calendar-month period and closes the lapsed grant at its own end.
+        const freshEnd = addCalendarMonthUtc(h.state.now);
+        const second = await run(h, command({ validity: { ends_at: freshEnd.toISOString() } }));
+        expect(second).toMatchObject({ outcome: 'applied', effective_access: { via: 'operator', product_ref: 'standard_monthly_v3' },
+            assignment: { ends_at: freshEnd.toISOString() } });
+        expect(h.rows.find(r => r.ref === first.assignment!.ref)!.endedAt).toEqual(MONTH_END);
         expect(h.rows.filter(r => r.endedAt === null)).toHaveLength(1);
     });
 
@@ -160,7 +179,7 @@ describe('ezil-os commands: assign, change, end', () => {
         ['a stale catalog revision', { product: { ref: 'standard_monthly_v3', catalog_revision: 'v3.2026-11-04' } }, 'catalog_revision_mismatch'],
         ['a scheduled start', { starts_at: later(301_000).toISOString() }, 'invalid_command'],
         ['a back-dated start', { starts_at: later(-301_000).toISOString() }, 'invalid_command'],
-        ['an end in the past', { validity: { ends_at: later(-1000).toISOString() } }, 'invalid_command'],
+        ['until-revoked', { validity: { until_revoked: true } }, 'invalid_command'],
         ['a malformed command', { quantity: 2 }, 'invalid_command'],
     ])('assign refuses %s without access writes', async (_name, over, code) => {
         const h = harness();
@@ -194,20 +213,20 @@ describe('ezil-os commands never replace Stripe', () => {
         const h = harness({ stripe: { ...NO_STRIPE, state: 'incomplete', checkoutOpen: true } });
         expect(await run(h, command())).toMatchObject({ refusal: { code: 'paid_subscription_conflict' }, effective_access: { state: 'none' } });
     });
-    it('once Stripe pays, a change that gives more is refused, but shortening and ending still work', async () => {
+    it('once Stripe pays, a product upgrade is refused; any validity change is refused; ending still works', async () => {
         const h = harness();
-        const a = await run(h, command({ validity: { ends_at: later(20 * DAY).toISOString() } }));
+        const a = await run(h, command());
         h.state.stripe = paid;
         const change = (over: Record<string, unknown>, revision: number) => run(h, command({ action: 'change', product: null, validity: null,
             assignment: { ref: a.assignment!.ref, expected_revision: revision }, ...over }));
-        expect(await change({ product: { ref: 'premium_monthly_v3', catalog_revision: REVISION } }, 1)).toMatchObject({ refusal: { code: 'paid_subscription_conflict' } });
-        expect(await change({ validity: { until_revoked: true } }, 1)).toMatchObject({ refusal: { code: 'paid_subscription_conflict' } });
-        expect(await change({ validity: { ends_at: later(30 * DAY).toISOString() } }, 1)).toMatchObject({ refusal: { code: 'paid_subscription_conflict' } });
-        // Paid wins in the answer while both exist.
-        const shorter = await change({ validity: { ends_at: later(5 * DAY).toISOString() } }, 1);
-        expect(shorter).toMatchObject({ outcome: 'applied', assignment: { revision: 2 }, effective_access: { via: 'stripe' } });
-        expect(await change({ validity: { ends_at: later(5 * DAY).toISOString() } }, 2)).toMatchObject({ refusal: { code: 'invalid_command' } });
-        expect(await run(h, command({ action: 'end', product: null, validity: null, assignment: { ref: a.assignment!.ref, expected_revision: 2 } })))
+        // A product upgrade gives more and is refused while Stripe covers the account; paid wins in the answer.
+        expect(await change({ product: { ref: 'premium_monthly_v3', catalog_revision: REVISION } }, 1)).toMatchObject({ refusal: { code: 'paid_subscription_conflict' },
+            effective_access: { via: 'stripe' } });
+        // Any validity in a change is refused outright (the period is fixed) — a structural refusal, before the paid conflict.
+        expect(await change({ validity: { ends_at: later(5 * DAY).toISOString() } }, 1)).toMatchObject({ refusal: { code: 'invalid_command' } });
+        expect(await change({ validity: { until_revoked: true } }, 1)).toMatchObject({ refusal: { code: 'invalid_command' } });
+        // Ending always works, even while paid.
+        expect(await run(h, command({ action: 'end', product: null, validity: null, assignment: { ref: a.assignment!.ref, expected_revision: 1 } })))
             .toMatchObject({ outcome: 'applied', assignment: { state: 'ended' } });
     });
     it('assignments shows the operator grant and the Stripe state side by side, paid winning', async () => {
@@ -220,5 +239,172 @@ describe('ezil-os commands never replace Stripe', () => {
         h.state.stripe = NO_STRIPE;
         expect(await readAssignments(h.deps, { kind: 'individual', os_user_id: USER, account_public_id: ACCOUNT }))
             .toMatchObject({ effective_access: { via: 'operator' }, stripe: null });
+    });
+});
+
+describe('ezil-os operator plans run one source-defined calendar month', () => {
+    const paid: StripeView = { paidAccess: true, computeActive: true, productRef: 'standard_monthly_v3', state: 'active', checkoutOpen: false };
+
+    it.each([
+        ['a clock-skewed end', new Date(MONTH_END.getTime() + 200_000)],
+        ['an end in the past', later(-1000)],
+        ['a forged far-future end', new Date(MONTH_END.getTime() + 365 * DAY)],
+        ['a forged short end', later(DAY)],
+    ])('ignores %s on the frozen v1 wire and stores only the server-computed one-calendar-month end', async (_name, sent) => {
+        const h = harness();
+        const r = await run(h, command({ validity: { ends_at: sent.toISOString() } }));
+        expect(r).toMatchObject({ outcome: 'applied', assignment: { starts_at: T0.toISOString(), ends_at: MONTH_END.toISOString() } });
+        expect(h.rows[0]!.endsAt).toEqual(MONTH_END);
+    });
+
+    it.each([
+        // Sender start just before midnight, server start just after: the computed end follows the server, never the sender.
+        ['30 Jan 23:59:59.5 sender vs 31 Jan 00:00:00.4 server (→ 28 Feb)', '2026-01-30T23:59:59.500Z', '2026-01-31T00:00:00.400Z'],
+        ['28 Jan sender vs 29 Jan server, non-leap', '2026-01-28T23:59:59.500Z', '2026-01-29T00:00:00.400Z'],
+        ['30 Mar sender vs 31 Mar server (→ 30 Apr)', '2026-03-30T23:59:59.500Z', '2026-03-31T00:00:00.400Z'],
+    ])('a start across midnight applies (%s) and stores the clamped server end', async (_name, senderStart, serverNow) => {
+        const h = harness();
+        h.state.now = new Date(serverNow);
+        const senderEnd = addCalendarMonthUtc(new Date(senderStart));
+        const r = await run(h, command({ starts_at: senderStart, validity: { ends_at: senderEnd.toISOString() } }));
+        const canonical = addCalendarMonthUtc(new Date(serverNow));
+        expect(r).toMatchObject({ outcome: 'applied', assignment: { starts_at: new Date(serverNow).toISOString(), ends_at: canonical.toISOString() } });
+        expect(h.rows[0]!.endsAt).toEqual(canonical);
+    });
+
+    it('a first attempt that was never stored can be retried with the same frozen body more than 5 min later', async () => {
+        const h = harness();
+        const body = command();   // frozen at T0: starts_at null, ends_at = the sender's T0 + one month hint
+        // The first delivery was lost before the source stored anything; the identical body arrives 6 min later.
+        h.state.now = later(6 * 60_000);
+        expect(h.events.size).toBe(0);
+        const r = await run(h, body);
+        const canonical = addCalendarMonthUtc(h.state.now);
+        expect(r).toMatchObject({ outcome: 'applied', assignment: { starts_at: h.state.now.toISOString(), ends_at: canonical.toISOString() } });
+        expect(h.rows[0]!.endsAt).toEqual(canonical);
+        // That stored result then replays unchanged.
+        h.state.now = later(20 * 60_000);
+        expect(await run(h, body)).toEqual({ ...r, outcome: 'replayed' });
+    });
+
+    it('a stored refusal replays as that refusal, not as a fresh evaluation', async () => {
+        const h = harness({ stripe: { ...NO_STRIPE, state: 'incomplete', checkoutOpen: true } });
+        const body = command();
+        const first = await run(h, body);
+        expect(first).toMatchObject({ outcome: 'refused', refusal: { code: 'paid_subscription_conflict' } });
+        h.state.stripe = NO_STRIPE;
+        h.state.now = later(6 * 60_000);
+        expect(await run(h, body)).toEqual(first);
+        expect(h.rows).toHaveLength(0);
+    });
+
+    it('a stored result replays unchanged later, even across a month boundary', async () => {
+        const h = harness();
+        const body = command();
+        const first = await run(h, body);
+        h.state.now = new Date(MONTH_END.getTime() + 2 * DAY);
+        expect(await run(h, body)).toEqual({ ...first, outcome: 'replayed' });
+        expect(h.rows[0]!.endsAt).toEqual(MONTH_END);
+        expect(h.rows).toHaveLength(1);
+    });
+
+    it('clamps the one-calendar-month period to month end (31 Jan → 28 Feb)', async () => {
+        const h = harness();
+        const jan31 = new Date('2026-01-31T20:00:00.000Z');
+        h.state.now = jan31;
+        const r = await run(h, command({ starts_at: jan31.toISOString(), validity: { ends_at: '2026-02-28T20:00:00.000Z' } }));
+        expect(r).toMatchObject({ outcome: 'applied', assignment: { starts_at: jan31.toISOString(), ends_at: '2026-02-28T20:00:00.000Z' } });
+        expect(h.rows[0]!.endsAt).toEqual(new Date('2026-02-28T20:00:00.000Z'));
+    });
+
+    it('clamps to 29 Feb in a leap year (31 Jan 2028 → 29 Feb 2028)', async () => {
+        const h = harness();
+        h.state.now = new Date('2028-01-31T20:00:00.000Z');
+        const r = await run(h, command({ validity: { ends_at: '2028-03-02T20:00:00.000Z' } }));
+        expect(r).toMatchObject({ outcome: 'applied', assignment: { ends_at: '2028-02-29T20:00:00.000Z' } });
+        expect(h.rows[0]!.endsAt).toEqual(new Date('2028-02-29T20:00:00.000Z'));
+    });
+
+    it('access holds until the exact stored end and stops at it (read-time expiry, no command needed)', async () => {
+        const h = harness();
+        await run(h, command());
+        const read = async () => (await readAssignments(h.deps, { kind: 'individual', os_user_id: USER, account_public_id: ACCOUNT }))!.effective_access;
+        h.state.now = new Date(MONTH_END.getTime() - 1);
+        expect(await read()).toMatchObject({ state: 'active', via: 'operator', product_ref: 'standard_monthly_v3' });
+        h.state.now = MONTH_END;
+        expect(await read()).toMatchObject({ state: 'none', via: null, product_ref: null });
+        expect(h.state.accessWrites).toBe(1);   // expiry is read-time: nothing was rewritten or deleted
+    });
+
+    it('after the operator month expires, access recomputes to a covering Stripe plan (files untouched)', async () => {
+        const h = harness();
+        await run(h, command());
+        h.state.now = new Date(MONTH_END.getTime() + DAY);   // the operator grant has expired
+        h.state.stripe = paid;
+        const view = await readAssignments(h.deps, { kind: 'individual', os_user_id: USER, account_public_id: ACCOUNT });
+        expect(view!.effective_access).toMatchObject({ state: 'active', product_ref: 'standard_monthly_v3', via: 'stripe' });
+    });
+
+    it('preserves a legacy until-revoked grant (null end): it stays in effect and readable', async () => {
+        const h = harness();
+        // A grant written under the old contract: until-revoked (null end), started long ago. No DB rewrite caps it.
+        h.rows.push({ ref: 'osg-legacy-1', revision: 1, userId: USER, accountPublicId: ACCOUNT, sku: 'premium_monthly_v3',
+            startsAt: new Date(T0.getTime() - 100 * DAY), endsAt: null, endedAt: null });
+        const view = await readAssignments(h.deps, { kind: 'individual', os_user_id: USER, account_public_id: ACCOUNT });
+        expect(view!.effective_access).toMatchObject({ state: 'active', product_ref: 'premium_monthly_v3', via: 'operator' });
+        expect(view!.assignments[0]).toMatchObject({ until_revoked: true, ends_at: null, state: 'active' });
+    });
+});
+
+describe('issued_by: the stored issuing organization of an assign', () => {
+    it('a named assign stores the name; an unnamed one stores none (read as EZiL); a replay does not rewrite it', async () => {
+        const h = harness();
+        const body = command({ issued_by: 'Acme Labs' });
+        const first = await run(h, body);
+        expect(first.outcome).toBe('applied');
+        expect(h.rows[0]).toMatchObject({ issuedBy: 'Acme Labs' });
+        expect(Object.keys(first).sort()).toEqual([...resultKeys].sort());
+        expect(JSON.stringify(first)).not.toContain('Acme Labs');
+        h.state.now = later(60_000);
+        expect(await run(h, body)).toEqual({ ...first, outcome: 'replayed' });
+        expect(h.rows).toHaveLength(1);
+        expect(h.rows[0]).toMatchObject({ issuedBy: 'Acme Labs' });
+
+        const plain = harness();
+        await run(plain, command());
+        expect(plain.rows[0]!.issuedBy).toBeNull();
+    });
+    it('the label is part of the payload: the same command id with another or no label is payload_mismatch', async () => {
+        const h = harness();
+        const body = command({ issued_by: 'Acme Labs' });
+        await run(h, body);
+        for (const other of [{ ...body, issued_by: 'Other Org' }, (({ issued_by: _drop, ...rest }) => rest)(body)]) {
+            expect(await run(h, other)).toMatchObject({ outcome: 'refused', refusal: { code: 'payload_mismatch' }, assignment: null });
+        }
+        expect(h.rows).toHaveLength(1);
+        expect(h.events.size).toBe(1);
+    });
+    it('change and end keep the stored label and never take one; the reason, Stripe and the month end are untouched', async () => {
+        const h = harness();
+        const assigned = await run(h, command({ issued_by: 'Acme Labs' }));
+        const ref = assigned.assignment!.ref;
+        const change = await run(h, command({ action: 'change', product: { ref: 'premium_monthly_v3', catalog_revision: REVISION }, starts_at: null, validity: null,
+            assignment: { ref, expected_revision: 1 } }));
+        expect(change.outcome).toBe('applied');
+        expect(h.rows[0]).toMatchObject({ issuedBy: 'Acme Labs', sku: 'premium_monthly_v3', endsAt: later(30 * DAY) });
+        // A label on a change or end is invalid before anything is read or written.
+        const writes = h.state.accessWrites, eventCount = h.events.size;
+        const labeledEnd = await run(h, command({ action: 'end', product: null, starts_at: null, validity: null, assignment: { ref, expected_revision: 2 }, issued_by: 'Other Org' }));
+        expect(labeledEnd).toMatchObject({ outcome: 'refused', assignment: null });
+        expect([h.state.accessWrites, h.events.size]).toEqual([writes, eventCount]);
+        const ended = await run(h, command({ action: 'end', product: null, starts_at: null, validity: null, assignment: { ref, expected_revision: 2 } }));
+        expect(ended.outcome).toBe('applied');
+        expect(h.rows[0]).toMatchObject({ issuedBy: 'Acme Labs' });
+    });
+    it('a refused assign (paid Stripe) stores no label and no grant', async () => {
+        const h = harness({ stripe: { paidAccess: true, computeActive: true, productRef: 'standard_monthly_v3', state: 'active', checkoutOpen: false } });
+        const result = await run(h, command({ issued_by: 'Acme Labs' }));
+        expect(result).toMatchObject({ outcome: 'refused', refusal: { code: 'paid_subscription_conflict' } });
+        expect(h.rows).toHaveLength(0);
     });
 });

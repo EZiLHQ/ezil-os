@@ -4,6 +4,7 @@ import { productResponse, priceResponse, couponResponse } from './packs.test-sup
 import { MANAGED_PAYMENTS_TAX_CODE } from '../catalog';
 import * as catalog from '../catalog';
 import type { CheckoutRequest } from '../ports';
+import { billingOfferBySku } from '../v3/catalog';
 import { BillingProviderError, createStripeClient, resetStripeCachesForTests, StripeRequestError, UPGRADE_PREVIEW_MAX_AGE_SECONDS } from './client';
 
 beforeEach(resetStripeCachesForTests);
@@ -32,6 +33,59 @@ describe('Stripe pack reads', () => {
             .mockResolvedValueOnce(Response.json({ error: {} }, { status: 503 }));
         expect(await client.retrieveCoupon('missing')).toBeNull();
         await expect(client.retrieveCoupon('unavailable')).rejects.toMatchObject({ status: 503 });
+    });
+    it('reads the Standard trial campaigns fresh with a read-only GET: the lookup key, active, at most two, product expanded', async () => {
+        const { client, fetcher } = fixture(null);
+        const lookupKey = billingOfferBySku('standard_monthly_v3')!.stripeLookupKey!;
+        const product = { id: 'prod_StandardV3', active: true, metadata: { ezil_standard_trial_campaigns: '{"version":1}' } };
+        const page = { has_more: false, data: [{ id: 'price_StandardV3Monthly', lookup_key: lookupKey, active: true, unit_amount: 2000,
+            currency: 'usd', recurring: { interval: 'month', interval_count: 1 }, product },
+            // Another key in the answer is ignored, never mistaken for the Standard price.
+            { id: 'price_Other', lookup_key: 'other_key', active: true, unit_amount: 1, currency: 'usd', recurring: null, product }] };
+        fetcher.mockResolvedValueOnce(Response.json(page)).mockResolvedValueOnce(Response.json({ ...page, has_more: true }));
+        expect(await client.readTrialCampaigns!()).toEqual({ hasMore: false, prices: [{ id: 'price_StandardV3Monthly', active: true, unitAmount: 2000,
+            currency: 'usd', interval: 'month', intervalCount: 1, product: { id: 'prod_StandardV3', active: true, metadata: product.metadata } }] });
+        // Never cached: a second call reads Stripe again.
+        expect((await client.readTrialCampaigns!()).hasMore).toBe(true);
+        const { url, init } = inspect(fetcher);
+        expect(init?.method).toBe('GET');
+        const query = new URL(String(url));
+        expect(query.pathname).toBe('/v1/prices');
+        expect(Object.fromEntries(query.searchParams)).toEqual({ 'lookup_keys[]': lookupKey, active: 'true', limit: '2', 'expand[]': 'data.product' });
+        expect(fetcher).toHaveBeenCalledTimes(2);
+        // Without a signal the request carries none, exactly like every legacy call.
+        expect(init).not.toHaveProperty('signal');
+    });
+    it('passes an abort signal to fetch only when the trial reader is given one; other calls never carry one', async () => {
+        const { client, fetcher } = fixture({ has_more: false, data: [] });
+        const controller = new AbortController();
+        await client.readTrialCampaigns!(controller.signal);
+        expect(inspect(fetcher, 0).init?.signal).toBe(controller.signal);
+        fetcher.mockResolvedValueOnce(Response.json({ error: {} }, { status: 404 }));
+        await client.retrieveCoupon('missing');
+        expect(inspect(fetcher, 1).init).not.toHaveProperty('signal');
+        controller.abort();
+        fetcher.mockImplementationOnce(async (_url, init) => { if (init?.signal?.aborted) throw new DOMException('aborted', 'AbortError'); return Response.json({}); });
+        await expect(client.readTrialCampaigns!(controller.signal)).rejects.toThrow('aborted');
+    });
+    it('a campaign trial checkout uses the exact verified price, binds the offer as metadata, and never discounts', async () => {
+        const { client, fetcher } = fixture({ id: 'cs_trial', url: 'https://checkout.stripe.com/trial', client_secret: null });
+        const trialEnd = new Date('2026-12-14T12:00:00.000Z');
+        const offer = { coupon: 'midhun', fingerprint: 'f'.repeat(64), priceId: 'price_StandardV3Monthly' };
+        await client.createCheckoutSession({ ...checkoutRequest, sku: 'standard_monthly_v3',
+            trial: { trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', trialEnd, expiresAt: new Date('2026-11-14T14:00:00.000Z'), offer } });
+        // One POST only: no lookup-key price read, so a cached or since-changed price can never be charged.
+        expect(fetcher).toHaveBeenCalledTimes(1);
+        const { url, body } = inspect(fetcher);
+        expect(String(url)).toBe('https://api.stripe.com/v1/checkout/sessions');
+        expect(body).toMatchObject({ mode: 'subscription', 'line_items[0][price]': 'price_StandardV3Monthly', payment_method_collection: 'always',
+            'subscription_data[trial_end]': String(trialEnd.getTime() / 1000), 'metadata[ezil_trial_offer]': 'midhun', 'metadata[ezil_trial_offer_fp]': offer.fingerprint,
+            'subscription_data[metadata][ezil_trial_offer]': 'midhun', 'subscription_data[metadata][ezil_trial_offer_fp]': offer.fingerprint,
+            'subscription_data[metadata][ezil_trial]': 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' });
+        expect(Object.keys(body).filter(key => /discount|coupon|promotion/.test(key))).toEqual([]);
+        await expect(client.createCheckoutSession({ ...checkoutRequest, sku: 'standard_monthly_v3',
+            trial: { trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', trialEnd, expiresAt: new Date('2026-11-14T14:00:00.000Z'), offer: { ...offer, priceId: 'plan_x' } } }))
+            .rejects.toThrow('invalid_trial_price');
     });
     it('reads pack ezil_credits without trusting the older custom metadata field', async () => {
         const { client } = fixture({ ...session, metadata: { sku: 'ai_pack_fixture', ezil_credits: '1000', credits: '9999' } });

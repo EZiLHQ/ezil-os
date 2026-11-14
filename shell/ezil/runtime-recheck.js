@@ -30,7 +30,7 @@ export const RECHECK_AFTER_AWAY_MS = 5 * 60_000;
  *           doc?: Document, win?: Window, now?: () => number }} opts
  * @returns {() => void} stop watching
  */
-export function watchRuntimeOnReturn ({ computerId, isLive, reboot, desktopRunning, doc = globalThis.document, win = globalThis.window, now = () => Date.now() }) {
+function watchLegacyRuntimeOnReturn ({ computerId, isLive, reboot, desktopRunning, doc = globalThis.document, win = globalThis.window, now = () => Date.now() }) {
     let away_since = null;
     let stopped = false;
     let checking = false;
@@ -64,6 +64,83 @@ export function watchRuntimeOnReturn ({ computerId, isLive, reboot, desktopRunni
         doc.removeEventListener('visibilitychange', on_change);
         win.removeEventListener('focus', on_change);
         win.removeEventListener('blur', on_change);
+    };
+}
+
+/**
+ * Code opts into one unknown-answer retry and truthful checking/unknown UI. Other callers retain the exact legacy
+ * return policy above. The generation getter binds a chain to its account and boot attempt. Only cheap GETs run;
+ * an in-flight GET keeps its existing timeout, but close/away/generation changes discard its answer and future retry.
+ */
+export function watchRuntimeOnReturn (options) {
+    if ( options.retryUnknownMs === undefined ) return watchLegacyRuntimeOnReturn(options);
+    const { computerId, isLive, reboot, desktopRunning, generation, onCheckState = () => {},
+        retryUnknownMs, doc = globalThis.document, win = globalThis.window, now = () => Date.now(),
+        schedule = setTimeout, cancel = clearTimeout, online = () => win.navigator?.onLine !== false } = options;
+    if ( ! Number.isInteger(retryUnknownMs) || retryUnknownMs < 0 || retryUnknownMs > 5000 || typeof generation !== 'function' ) {
+        throw new TypeError('A bounded retry and generation getter are required');
+    }
+    let awaySince = null, stopped = false, inFlight = false, chain = null, timer = null;
+    const present = () => doc.visibilityState === 'visible' && (typeof doc.hasFocus !== 'function' || doc.hasFocus());
+    const currentScope = scope => {
+        try { return !stopped && isLive() && generation() === scope; } catch { return false; }
+    };
+    const current = candidate => chain === candidate && currentScope(candidate.scope);
+    const clearTimer = () => { if (timer !== null) cancel(timer); timer = null; };
+    const retryFor = scope => () => {
+        if (currentScope(scope) && present()) begin(scope);
+    };
+    const notify = (candidate, state) => { if (current(candidate)) onCheckState(state, retryFor(candidate.scope)); };
+    const abandon = (showUnknown = false) => {
+        clearTimer();
+        if (chain && showUnknown) notify(chain, 'unknown');
+        chain = null;
+    };
+    async function probe (candidate) {
+        if (!current(candidate)) { if (chain === candidate) abandon(); return; }
+        if (!present() || !online()) { abandon(true); return; }
+        if (inFlight) return; // The old bounded GET's finally starts a queued current chain, never overlaps it.
+        inFlight = true;
+        let answer;
+        try { answer = await desktopRunning(computerId); } catch { answer = undefined; }
+        finally { inFlight = false; }
+        if (current(candidate)) {
+            if (!present() || !online()) abandon(true);
+            else if (answer === false) { chain = null; clearTimer(); reboot(); }
+            else if (answer === true) { notify(candidate, 'running'); chain = null; }
+            else if (candidate.retryLeft) {
+                candidate.retryLeft = false;
+                timer = schedule(() => { timer = null; void probe(candidate); }, retryUnknownMs);
+            } else abandon(true);
+        } else if (chain === candidate) abandon();
+        if (chain && chain !== candidate) void probe(chain);
+    }
+    function begin (scope) {
+        abandon();
+        const candidate = { scope, retryLeft: true }; chain = candidate;
+        if (!current(candidate)) { abandon(); return; }
+        if (!present() || !online()) { abandon(true); return; }
+        notify(candidate, 'checking');
+        void probe(candidate);
+    }
+    const change = () => {
+        if (stopped) return;
+        if (!present()) {
+            if (awaySince === null) awaySince = now();
+            abandon(true); return;
+        }
+        if (awaySince === null) return;
+        const elapsed = now() - awaySince; awaySince = null;
+        if (elapsed < RECHECK_AFTER_AWAY_MS || !isLive()) return;
+        begin(generation());
+    };
+    const offline = () => abandon(true);
+    doc.addEventListener('visibilitychange', change);
+    win.addEventListener('focus', change); win.addEventListener('blur', change); win.addEventListener('offline', offline);
+    return () => {
+        stopped = true; abandon();
+        doc.removeEventListener('visibilitychange', change);
+        win.removeEventListener('focus', change); win.removeEventListener('blur', change); win.removeEventListener('offline', offline);
     };
 }
 

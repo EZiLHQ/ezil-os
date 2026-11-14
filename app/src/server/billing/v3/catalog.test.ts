@@ -8,9 +8,9 @@ const sub = (sku: string, status = 'active'): SubscriptionRow => ({ sku, status,
     currentPeriodStart: new Date('2026-10-10Z'), currentPeriodEnd: new Date('2026-11-10Z'), cancelAtPeriodEnd: false });
 
 describe('v3 catalog', () => {
-    it('grants the paid plan price in credits at ten cents each and keeps Free unchanged', () => {
+    it('keeps paid plan grants unchanged and publishes10 starting Free credits once', () => {
         expect(publicOffers().map(offer => offer.aiCredits)).toEqual([
-            { amount: 100, per: 'once' }, { amount: 200, per: 'period' }, { amount: 1000, per: 'period' },
+            { amount: 10, per: 'once' }, { amount: 200, per: 'period' }, { amount: 1000, per: 'period' },
         ]);
     });
     it('round 5: plan storage on paid plans, copy without forbidden words, every other string kept', () => {

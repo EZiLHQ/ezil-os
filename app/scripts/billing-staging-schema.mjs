@@ -32,6 +32,7 @@ export const EXPLICIT_FILES = Object.freeze([
     'app/drizzle/0020_operator_refusal_receipts.sql',
     'app/drizzle/0021_standard_trial.sql',
     'app/drizzle/0022_feedback_notifications.sql',
+    'app/drizzle/0023_operator_issued_by.sql',
 ]);
 const TABLE = 'public.ezil_staging_schema_log';
 const HASH = /^[a-f0-9]{64}$/;
@@ -180,7 +181,7 @@ export function run(args = process.argv.slice(2), {
         // file. 0003-0011 are already applied there; 0019-0021 apply with THIS release. None of them may be baselined
         // (recorded as already present) on production — they must really run.
         if (target === 'aws-production' && mode === 'baseline' &&
-            requested.some(name => ['0003_pool_hosts_v2.sql.txt', '0008_pool_dispatch.sql', '0009_capacity_demands.sql', '0010_migration_restore_progress.sql', '0011_feedback.sql', '0019_operator_entitlements.sql', '0020_operator_refusal_receipts.sql', '0021_standard_trial.sql', '0022_feedback_notifications.sql'].includes(basename(name)))) {
+            requested.some(name => ['0003_pool_hosts_v2.sql.txt', '0008_pool_dispatch.sql', '0009_capacity_demands.sql', '0010_migration_restore_progress.sql', '0011_feedback.sql', '0019_operator_entitlements.sql', '0020_operator_refusal_receipts.sql', '0021_standard_trial.sql', '0022_feedback_notifications.sql', '0023_operator_issued_by.sql'].includes(basename(name)))) {
             refuse('Pool hosts v2, pool dispatch, capacity demand, migration restore progress, feedback, operator entitlements, operator refusal receipts and the Standard trial must be applied on production, never baselined.');
         }
         // 0012 (reverse moves) changes no pre-existing table and the app probes for it ("production today"): it stays

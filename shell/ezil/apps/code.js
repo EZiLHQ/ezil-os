@@ -1,3 +1,4 @@
+import { attachCodeAuthRecovery, resetOriginRecovery } from './code-auth-recovery.js';
 import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../native-runtime.js';
 // code.js — EZiL-authored. Not Puter code.
 //
@@ -654,6 +655,7 @@ export async function openCodeWindow (ctx = {}) {
     el_window.ezilFeedbackAppContext = appContext;
     let unregister_app_failures = () => {};
     let unregister_billing = () => {};
+    let unregister_auth_recovery = () => {};
     if ( getComputedStyle(el_body).position === 'static' ) el_body.style.position = 'relative';
 
     let tick_timer = null;
@@ -866,7 +868,7 @@ export async function openCodeWindow (ctx = {}) {
 
     // ── the "Reconnecting…" / "Computer stopped" state (lane A2) ─────────
     // An OS-level cover over the frame for the moments the shell KNOWS the
-    // computer is not there: a restart/switch transition in flight, or the
+    // computer needs checking or is not there: a restart/switch transition, or the
     // return-from-away check finding it stopped. Without it the frame keeps
     // code-server's own "Attempting to reconnect" dialog, which lives inside
     // the cross-origin iframe where this shell can neither see nor replace it.
@@ -892,11 +894,17 @@ export async function openCodeWindow (ctx = {}) {
     el_state_start.type = 'button';
     el_state_start.className = 'ezil-code-state-start';
     el_state_start.textContent = 'Start computer';
-    el_state_start.addEventListener('click', () => { void start_boot(); });
+    let return_probe_retry = null;
+    el_state_start.addEventListener('click', () => {
+        if (el_state.dataset.state === 'unknown') return_probe_retry?.();
+        else if (el_state.dataset.state === 'stopped') void start_boot();
+    });
     el_state.append(el_state_title, el_state_body, el_state_start);
     el_body.appendChild(el_state);
 
     const STATE_COPY = {
+        checking: ['Checking computer…', 'Checking whether your computer is still running.'],
+        unknown: ['Could not check computer', 'Try checking again. Your files are safe.'],
         reconnecting: ['Reconnecting…', 'Your computer is restarting or switching configuration. Code reopens here when it is back. Your files are safe.'],
         stopped: ['Computer stopped', "Your computer isn't running, so Code can't reach it. Your files are safe."],
     };
@@ -907,14 +915,20 @@ export async function openCodeWindow (ctx = {}) {
         clearInterval(stopped_timer); stopped_timer = null;
         el_state.hidden = true;
         delete el_state.dataset.state;
+        return_probe_retry = null;
+        el_iframe.inert = false;
+        el_iframe.removeAttribute('aria-hidden');
     };
     const show_state = (kind) => {
         if ( disposed ) return;
         hide_state();
         [el_state_title.textContent, el_state_body.textContent] = STATE_COPY[kind];
         el_state.dataset.state = kind;
-        el_state_start.hidden = kind !== 'stopped';
+        el_state_start.hidden = kind !== 'stopped' && kind !== 'unknown';
+        el_state_start.textContent = kind === 'unknown' ? 'Retry' : 'Start computer';
         el_state.hidden = false;
+        el_iframe.inert = true;
+        el_iframe.setAttribute('aria-hidden', 'true');
         if ( kind !== 'stopped' ) return;
         // Back to running by any other route (the Browser opened it, another
         // tab started it): re-mint the same Code URL through `start_boot()`.
@@ -1097,6 +1111,21 @@ export async function openCodeWindow (ctx = {}) {
 
         unregister_app_failures();
         unregister_billing();
+        unregister_auth_recovery();
+        if (!nativeSurface) unregister_auth_recovery = attachCodeAuthRecovery({
+            iframe: el_iframe, frameUrl: code_preview_url,
+            current: () => !disposed && my_attempt === attempt,
+            desktopRunning: () => session.desktopRunning(computer.id),
+            onStopped: () => show_state('stopped'),
+            onUnknown: (retry) => { show_state('unknown'); return_probe_retry = retry; },
+            // S13: the editor document says the computer's origin is not up (the Worker's 502 recovery page,
+            // never raw JSON). A running computer gets ONE automatic reopen through the mint, whose own wake
+            // clock waits for the origin truthfully; a second such document inside the guard window becomes
+            // "Code isn't reachable right now", whose Try again is this same reopen.
+            reopen: () => { void start_boot(); },
+            // Terminal for this attempt: a confirmation still in flight must not hide the panel again.
+            onUnreachable: () => { stop_timers(); show_unavailable(); },
+        });
         el_iframe.src = code_preview_url;
         // Bind at mint handoff, before confirmation, so startup failures can answer the hello too.
         // The folder bridge below binds the same frame after the server confirms it.
@@ -1171,7 +1200,13 @@ export async function openCodeWindow (ctx = {}) {
                     });
                     attachFolderBridge({
                         iframe: el_iframe, frameUrl: frame_url, bind, notice: folder_notice,
-                        onRoot: on_root, onOpen: on_open, onLeaving: on_leaving,
+                        // S13: only a GENUINE workbench document ends the unavailable-origin episode (one automatic
+                        // reopen per episode): the bridge hears a root only from this frame's window, at the minted
+                        // origin, answering this binding's hello nonce with this mint's id. The server's HTTP
+                        // confirmation above is not that (the 502 recovery page installs no bridge), so a probe that
+                        // answers while the frame still shows that page cannot re-arm the automatic reopen.
+                        onRoot: (root, how) => { resetOriginRecovery(); on_root(root, how); },
+                        onOpen: on_open, onLeaving: on_leaving,
                     });
                     if ( link_folder_problem ) { folder_notice.fallback(link_folder_problem, null); link_folder_problem = null; }
                 }
@@ -1318,6 +1353,19 @@ export async function openCodeWindow (ctx = {}) {
         isLive: () => !! el_iframe.getAttribute('src'),
         reboot: () => { show_state('stopped'); },
         desktopRunning: (id) => session.desktopRunning(id),
+        retryUnknownMs: 1000,
+        generation: () => `${session.payload()?.user?.id ?? ''}:${attempt}`,
+        onCheckState: (state, retry) => {
+            if (disposed) return;
+            if (state === 'running') {
+                // Status alone does not verify the existing frame URL or its runtime generation.
+                if (['checking', 'unknown'].includes(el_state.dataset.state)) hide_state();
+            } else if (el_state.dataset.state !== 'reconnecting') {
+                // A return check cannot retire an in-progress restart/switch cover.
+                show_state(state);
+                return_probe_retry = retry;
+            }
+        },
     });
 
     // A completed desktop restart restarts code-server too on an AWS host, and
@@ -1520,6 +1568,7 @@ export async function openCodeWindow (ctx = {}) {
         clearTimeout(route_timer); route_timer = null;
         clearTimeout(leaving_timer); leaving_timer = null;
         detachFolderBridge(el_iframe);
+        unregister_auth_recovery();
         unregister_app_failures();
         unregister_billing();
         folder_notice?.close();

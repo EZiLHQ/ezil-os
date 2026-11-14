@@ -1,0 +1,501 @@
+{
+  "after": {
+    "functions": [
+      {
+        "acl": [
+          [
+            "postgres",
+            "EXECUTE",
+            false
+          ]
+        ],
+        "args": "",
+        "clientExecute": {
+          "anon": false,
+          "authenticated": false,
+          "service_role": false
+        },
+        "config": "{\"search_path=\\\"\\\"\"}",
+        "lang": "plpgsql",
+        "owner": "postgres",
+        "returns": "trigger",
+        "secdef": false,
+        "srcSha256": "c35f6fdedd1a60b26a445974fcf43d473edee20347f9cf86e52121a23e36a4ef",
+        "volatility": "v"
+      }
+    ],
+    "table": {
+      "acl": [
+        [
+          "postgres",
+          "DELETE",
+          false
+        ],
+        [
+          "postgres",
+          "INSERT",
+          false
+        ],
+        [
+          "postgres",
+          "MAINTAIN",
+          false
+        ],
+        [
+          "postgres",
+          "REFERENCES",
+          false
+        ],
+        [
+          "postgres",
+          "SELECT",
+          false
+        ],
+        [
+          "postgres",
+          "TRIGGER",
+          false
+        ],
+        [
+          "postgres",
+          "TRUNCATE",
+          false
+        ],
+        [
+          "postgres",
+          "UPDATE",
+          false
+        ]
+      ],
+      "children": false,
+      "clientOwnerMember": {
+        "anon": false,
+        "authenticated": false,
+        "service_role": false
+      },
+      "clientTable": {
+        "anon": false,
+        "authenticated": false,
+        "service_role": false
+      },
+      "columns": [
+        [
+          "attestation_id",
+          "uuid",
+          true,
+          null,
+          "",
+          "",
+          1,
+          null
+        ],
+        [
+          "computer_id",
+          "uuid",
+          true,
+          null,
+          "",
+          "",
+          2,
+          null
+        ],
+        [
+          "owner_user_id",
+          "uuid",
+          true,
+          null,
+          "",
+          "",
+          3,
+          null
+        ],
+        [
+          "region",
+          "text",
+          true,
+          null,
+          "",
+          "",
+          4,
+          null
+        ],
+        [
+          "zone_id",
+          "text",
+          true,
+          null,
+          "",
+          "",
+          5,
+          null
+        ],
+        [
+          "source_instance_id",
+          "text",
+          true,
+          null,
+          "",
+          "",
+          6,
+          null
+        ],
+        [
+          "current_instance_id",
+          "text",
+          false,
+          null,
+          "",
+          "",
+          7,
+          null
+        ],
+        [
+          "source_volume_id",
+          "text",
+          true,
+          null,
+          "",
+          "",
+          8,
+          null
+        ],
+        [
+          "fs_uuid",
+          "uuid",
+          true,
+          null,
+          "",
+          "",
+          9,
+          null
+        ],
+        [
+          "source_generation",
+          "bigint",
+          true,
+          null,
+          "",
+          "",
+          10,
+          null
+        ],
+        [
+          "source_lease_epoch",
+          "bigint",
+          true,
+          null,
+          "",
+          "",
+          11,
+          null
+        ],
+        [
+          "source_fence_token",
+          "uuid",
+          true,
+          null,
+          "",
+          "",
+          12,
+          null
+        ],
+        [
+          "reserved_row_sha256",
+          "text",
+          true,
+          null,
+          "",
+          "",
+          13,
+          null
+        ],
+        [
+          "request_sha256",
+          "text",
+          true,
+          null,
+          "",
+          "",
+          14,
+          null
+        ],
+        [
+          "challenge",
+          "text",
+          true,
+          null,
+          "",
+          "",
+          15,
+          null
+        ],
+        [
+          "command_id",
+          "text",
+          false,
+          null,
+          "",
+          "",
+          16,
+          null
+        ],
+        [
+          "phase",
+          "text",
+          true,
+          null,
+          "",
+          "",
+          17,
+          null
+        ],
+        [
+          "evidence",
+          "jsonb",
+          false,
+          null,
+          "",
+          "",
+          18,
+          null
+        ],
+        [
+          "evidence_sha256",
+          "text",
+          false,
+          null,
+          "",
+          "",
+          19,
+          null
+        ],
+        [
+          "measured_digest",
+          "text",
+          false,
+          null,
+          "",
+          "",
+          20,
+          null
+        ],
+        [
+          "measured_at",
+          "timestamp with time zone",
+          false,
+          null,
+          "",
+          "",
+          21,
+          null
+        ],
+        [
+          "marker_sha256",
+          "text",
+          false,
+          null,
+          "",
+          "",
+          22,
+          null
+        ],
+        [
+          "snapshot_id",
+          "text",
+          false,
+          null,
+          "",
+          "",
+          23,
+          null
+        ],
+        [
+          "clone_volume_id",
+          "text",
+          false,
+          null,
+          "",
+          "",
+          24,
+          null
+        ],
+        [
+          "maintenance_instance_id",
+          "text",
+          false,
+          null,
+          "",
+          "",
+          25,
+          null
+        ],
+        [
+          "maintenance_ami_id",
+          "text",
+          false,
+          null,
+          "",
+          "",
+          26,
+          null
+        ],
+        [
+          "source_release",
+          "jsonb",
+          false,
+          null,
+          "",
+          "",
+          27,
+          null
+        ],
+        [
+          "failure_code",
+          "text",
+          false,
+          null,
+          "",
+          "",
+          28,
+          null
+        ],
+        [
+          "created_at",
+          "timestamp with time zone",
+          true,
+          null,
+          "",
+          "",
+          29,
+          null
+        ],
+        [
+          "updated_at",
+          "timestamp with time zone",
+          true,
+          null,
+          "",
+          "",
+          30,
+          null
+        ],
+        [
+          "completed_at",
+          "timestamp with time zone",
+          false,
+          null,
+          "",
+          "",
+          31,
+          null
+        ]
+      ],
+      "constraints": [
+        [
+          "ezil_computer_lower_attestations_failure_check",
+          "c",
+          "CHECK (((failure_code IS NULL) OR (failure_code = ANY (ARRAY['command_invalid'::text, 'source_not_pinned'::text, 'receipt_invalid'::text, 'marker_mismatch'::text, 'mount_not_readonly'::text, 'identity_invalid'::text, 'untrusted_ami'::text, 'snapshot_lineage_mismatch'::text, 'clone_lineage_mismatch'::text, 'original_not_fenced'::text, 'launch_tuple_invalid'::text, 'release_mismatch'::text, 'instance_provenance_missing'::text, 'placement_changed'::text, 'reservation_expired'::text, 'operator_abandoned'::text]))))",
+          true,
+          false
+        ],
+        [
+          "ezil_computer_lower_attestations_hash_check",
+          "c",
+          "CHECK (((reserved_row_sha256 ~ '^[0-9a-f]{64}$'::text) AND (request_sha256 ~ '^[0-9a-f]{64}$'::text) AND (challenge ~ '^[0-9a-f]{64}$'::text) AND ((evidence_sha256 IS NULL) OR (evidence_sha256 ~ '^[0-9a-f]{64}$'::text)) AND ((marker_sha256 IS NULL) OR (marker_sha256 ~ '^[0-9a-f]{64}$'::text)) AND ((measured_digest IS NULL) OR (measured_digest ~ '^sha256:[0-9a-f]{64}$'::text))))",
+          true,
+          false
+        ],
+        [
+          "ezil_computer_lower_attestations_phase_check",
+          "c",
+          "CHECK ((phase = ANY (ARRAY['reserved'::text, 'adopted'::text, 'refused'::text])))",
+          true,
+          false
+        ],
+        [
+          "ezil_computer_lower_attestations_pkey",
+          "p",
+          "PRIMARY KEY (attestation_id)",
+          true,
+          false
+        ],
+        [
+          "ezil_computer_lower_attestations_sealed_check",
+          "c",
+          "CHECK ((((phase = 'reserved'::text) AND (failure_code IS NULL) AND (completed_at IS NULL) AND (num_nonnulls(command_id, evidence, evidence_sha256, measured_digest, measured_at, marker_sha256, snapshot_id, clone_volume_id, maintenance_instance_id, maintenance_ami_id, source_release) = 0)) OR ((phase = 'adopted'::text) AND (failure_code IS NULL) AND (completed_at IS NOT NULL) AND (num_nulls(command_id, evidence, evidence_sha256, measured_digest, measured_at, marker_sha256, snapshot_id, clone_volume_id, maintenance_instance_id, maintenance_ami_id, source_release) = 0)) OR ((phase = 'refused'::text) AND (failure_code IS NOT NULL) AND (completed_at IS NOT NULL) AND (num_nonnulls(command_id, evidence, evidence_sha256, measured_digest, measured_at, marker_sha256, snapshot_id, clone_volume_id, maintenance_instance_id, maintenance_ami_id, source_release) = 0))))",
+          true,
+          false
+        ],
+        [
+          "ezil_computer_lower_attestations_time_check",
+          "c",
+          "CHECK (((updated_at >= created_at) AND ((completed_at IS NULL) OR ((completed_at >= created_at) AND (completed_at <= updated_at)))))",
+          true,
+          false
+        ]
+      ],
+      "forceRls": false,
+      "indexes": [
+        [
+          "ezil_computer_lower_attestations_computer_idx",
+          "CREATE INDEX ezil_computer_lower_attestations_computer_idx ON public.ezil_computer_lower_attestations USING btree (computer_id)",
+          true,
+          true,
+          true,
+          false,
+          false,
+          true,
+          "postgres"
+        ],
+        [
+          "ezil_computer_lower_attestations_pkey",
+          "CREATE UNIQUE INDEX ezil_computer_lower_attestations_pkey ON public.ezil_computer_lower_attestations USING btree (attestation_id)",
+          true,
+          true,
+          true,
+          true,
+          true,
+          true,
+          "postgres"
+        ],
+        [
+          "ezil_computer_lower_attestations_reserved_idx",
+          "CREATE UNIQUE INDEX ezil_computer_lower_attestations_reserved_idx ON public.ezil_computer_lower_attestations USING btree (computer_id) WHERE (phase = 'reserved'::text)",
+          true,
+          true,
+          true,
+          true,
+          false,
+          true,
+          "postgres"
+        ]
+      ],
+      "kind": "r",
+      "options": null,
+      "owner": "postgres",
+      "partition": false,
+      "persistence": "p",
+      "policies": 0,
+      "rls": true,
+      "rules": 0,
+      "triggers": [
+        [
+          "ezil_computer_lower_attestations_guard",
+          "CREATE TRIGGER ezil_computer_lower_attestations_guard BEFORE DELETE OR UPDATE ON public.ezil_computer_lower_attestations FOR EACH ROW EXECUTE FUNCTION ezil_computer_lower_attestations_guard()",
+          "O"
+        ],
+        [
+          "ezil_computer_lower_attestations_retain",
+          "CREATE TRIGGER ezil_computer_lower_attestations_retain BEFORE TRUNCATE ON public.ezil_computer_lower_attestations FOR EACH STATEMENT EXECUTE FUNCTION ezil_computer_lower_attestations_guard()",
+          "O"
+        ]
+      ]
+    }
+  },
+  "empty": {
+    "functions": [],
+    "table": null
+  },
+  "schemaVersion": 1,
+  "sqlSha256": "ab5fcfa6341fe89595b36591cded8ede1dea506ed84801cfafdc8701e179e313"
+}

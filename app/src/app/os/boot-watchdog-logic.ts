@@ -56,6 +56,11 @@ export const BOOT_STALL_MS = 10_000;
  */
 export const BOOT_LOAD_GRACE_MS = 4_000;
 
+/** A pending document may still deliver its deferred shell; do not wait indefinitely. */
+export const BOOT_DOCUMENT_LOAD_MAX_MS = 30_000;
+/** Stop polling after the bounded document wait and its existing hydration grace. */
+export const BOOT_RECOVERY_MAX_MS = BOOT_DOCUMENT_LOAD_MAX_MS + BOOT_LOAD_GRACE_MS;
+
 /** Why the page is telling the user the OS is not coming. */
 export type StallReason =
     /** Entered by client-side navigation, and the one reload is already spent. */

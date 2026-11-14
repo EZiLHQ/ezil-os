@@ -9,7 +9,7 @@ import { openConfirmSheet } from '../sheet-frame.js';
 import { billingRecoveryAction, openTopupSheet, topupOffer } from '../topup-sheet.js';
 import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines, heldClosedSize, heldClosedText,
     accountCredits, accountDetailsHtml, staleCreditsCopy, paidComputeUnmetered, TRIAL_SKU, trialOfferOf, trialIneligibleCopy, planTrialOf, trialAmount,
-    trialDayLabel, trialMomentLabel } from '../billing-format.js';
+    trialDayLabel, trialMomentLabel, withCouponView, couponFromSearch, isOfferFingerprint } from '../billing-format.js';
 import { settingsAliasSearch } from '../../../app-link.js';
 
 const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
@@ -553,8 +553,10 @@ function currentPlanV3 (summary, banner) {
     const status = { free: 'Free', active: 'Active', cancels: 'Ends soon', past_due: 'Past due', incomplete: 'Payment incomplete', upgrade_pending: 'Upgrade pending' }[plan.status] ?? 'Active';
     const offer = offerFor(summary, plan.sku);
     // Product entitlements v1: a plan an EZiL operator assigned is not a payment: no price, renewal or Stripe action.
+    // It names the issuing organization the server reports (EZiL when none was given, or from an older server).
     const assigned = plan.access?.source === 'operator' ? plan.access : null;
-    const price = assigned ? 'Assigned by EZiL · no payment' : plan.sku === 'free_v3' ? '$0' : offer ? `${dollars(offer.priceCents, { compact: true })} / month`
+    const issuedBy = typeof assigned?.issuedBy === 'string' && assigned.issuedBy.trim() ? assigned.issuedBy.trim() : 'EZiL';
+    const price = assigned ? `Assigned by ${issuedBy}` : plan.sku === 'free_v3' ? '$0' : offer ? `${dollars(offer.priceCents, { compact: true })} / month`
         : plan.renewal ? `${dollars(plan.renewal.amountCents, { compact: true })} / month` : '';
     const renewal = assigned ? assigned.untilRevoked || !assigned.endsAt ? 'Your access continues until EZiL ends it.' : `Your access ends on ${dateLabel(assigned.endsAt, true)}.`
         : plan.sku === 'free_v3' ? 'Free · no card on file'
@@ -665,6 +667,14 @@ function topupV3 (summary) {
         <div class="ezil-billing-actions">${actionHtml('topup', 'Add credits')}</div></section>`;
 }
 
+/** What the promoter link on this address means for this viewer, in one quiet line (`withCouponView`). */
+function couponNoticeHtml (summary) {
+    const view = summary.couponView;
+    if ( ! view ) return '';
+    const retry = view.retry ? ' <button type="button" class="ezil-settings-btn" data-action="coupon-retry">Try again</button>' : '';
+    return `<p class="ezil-billing-note ezil-billing-coupon" data-role="coupon-notice" data-state="${encode(view.state)}" role="status">${encode(view.copy)}${retry}</p>`;
+}
+
 /** `options`: `userId` (the signed-in user) and `lastAccount`, that user's last readable `ai.account` (kept across reloads of this pane). */
 export function summaryV3Html (summary, usage = null, options = {}) {
     const { plan, actions } = summary;
@@ -672,6 +682,7 @@ export function summaryV3Html (summary, usage = null, options = {}) {
     return `<header class="ezil-billing-header"><div><h3>Billing</h3><p class="ezil-settings-lead">Your plan, usage and payments.</p></div>
         ${actions.portal ? `<div class="ezil-billing-actions">${linkAction('portal', 'Manage payment')}</div>` : ''}</header>
         ${banner?.html ?? ''}
+        ${couponNoticeHtml(summary)}
         ${currentPlanV3(summary, banner)}
         ${usageCardV3(summary, usage, options)}
         ${plansV3(summary)}
@@ -750,6 +761,18 @@ function startCountdown ($win, state) {
     state.timer = setInterval(update, 30000);
 }
 
+/** The availability read's verdict (see `withCouponView`): every refusal or failure says which; none enables a CTA. */
+function couponStatus (result, alias) {
+    // Only the server's own `available && eligible` for this person and this offer enables a free month. The offer must
+    // be the one asked for (this alias, or the public offer) with a real fingerprint; a missing or false flag is not available.
+    if ( result?.ok === true ) {
+        const { available, eligible, offer } = result.data ?? {};
+        return available === true && eligible === true && offer && (offer.coupon ?? null) === alias && isOfferFingerprint(offer.fingerprint)
+            ? 'available' : 'error';
+    }
+    return { trial_offer_invalid: 'invalid', trial_offer_unavailable: 'unavailable', trial_unavailable: 'refused' }[result?.message] ?? 'error';
+}
+
 async function load ($win, state) {
     if ( state.loading || state.pending || state.sheet || state.closed ) return;
     stopCountdown(state);
@@ -760,6 +783,14 @@ async function load ($win, state) {
     const $body = $win.find('[data-role="billing-body"]');
     $body.attr('aria-busy', 'true').html(loadingHtml());
     const history = trpc.query('billing.history').catch(() => ({ ok: false }));
+    // The free month, public or from a promoter link, is promised only if the server's read-only availability check
+    // (`billing.trialOffer`, which claims nothing) says so. It runs beside the summary; the alias is the link's, if any.
+    const kept = state.coupon ?? null;
+    const link = kept ?? { alias: null };
+    const alias = link.alias ?? null;
+    const startUser = state.userId;
+    const availability = link.invalid ? null : trpc.query('billing.trialOffer', alias ? { coupon: alias } : {})
+        .then(result => couponStatus(result, alias), () => 'error');
     try {
         const result = await trpc.query('billing.summary');
         if ( request !== state.request || ! state.active || state.closed || ! $win.get(0).isConnected ) return;
@@ -774,8 +805,16 @@ async function load ($win, state) {
                 throw new Error('summary for another user');
             }
             if ( accountCredits(account, { userId }) !== null ) state.lastAccount = account;
-            $body.html(result.data.version === 3 ? summaryV3Html(result.data, null, { lastAccount: state.lastAccount, userId }) : summaryHtml(result.data));
-            state.summary = result.data;
+            let view = result.data;
+            if ( result.data.version === 3 ) {
+                const status = availability ? await availability : 'invalid';
+                // Across that await the window, the signed-in user or the link may have changed: drop this answer.
+                if ( request !== state.request || ! state.active || state.closed || ! $win.get(0).isConnected
+                    || state.userId !== startUser || (state.coupon ?? null) !== kept ) return;
+                view = withCouponView(result.data, { alias, status, invalid: link.invalid === true });
+            }
+            $body.html(result.data.version === 3 ? summaryV3Html(view, null, { lastAccount: state.lastAccount, userId }) : summaryHtml(result.data));
+            state.summary = view;
             state.loadedAt = Date.now();
             startCountdown($win, state);
             if ( result.data.version === 3 ) void loadUsage($win, state, request);
@@ -956,7 +995,7 @@ function openSheet ($win, state, action, sku, intent = null) {
             upgrade: choice => openSheet($win, state, choice.action, choice.sku) })
             : action === 'topup-checkout' ? upgradeSheetOpener({ ...options, sku: pack.sku, pack, summary, userId: state.userId,
                 onCancel: () => actionStatus($win, 'Checkout closed before payment finished. If you did pay, your credits appear here once the payment is confirmed.') })
-            : action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes, summary, ...(trial ? { trial: true } : {}) })
+            : action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes, summary, ...(trial ? { trial: true, ...(typeof summary.trialOffer?.coupon === 'string' ? { coupon: summary.trialOffer.coupon } : {}) } : {}) })
             : sheetOpeners[action]({ ...options, summary });
         // The v1 checkout sheet predates onClose. New billing sheets use the callback.
         const checkoutRoot = action === 'checkout' && container.ownerDocument.querySelector('[data-role="upgrade-sheet"]');
@@ -1081,7 +1120,7 @@ export default {
         $pane.on('click', 'button[data-action]', function () {
             if ( this.disabled ) return;
             const action = this.dataset.action;
-            if ( action === 'retry' ) void load($win, state);
+            if ( action === 'retry' || action === 'coupon-retry' ) void load($win, state);
             else if ( action === 'invoices' ) {
                 const heading = $pane.find('[data-role="invoices"] h3').get(0);
                 heading?.scrollIntoView?.({ block: 'start' });
@@ -1124,10 +1163,17 @@ export default {
         if ( state ) {
             state.active = true;
             state.openUpgrade ||= ctx.openUpgrade;
+            // The promoter link the address carried (`parseBillingDeepLink`). A different link replaces the kept one.
+            const next = ctx.couponAlias || ctx.couponInvalid ? { alias: ctx.couponAlias ?? null, ...(ctx.couponInvalid ? { invalid: true } : {}) } : null;
+            const linkChanged = !! next && (next.alias ?? null) !== (state.coupon?.alias ?? null) || !! next && !! next.invalid !== !! state.coupon?.invalid;
+            if ( linkChanged ) state.coupon = next;
             // The signed-in user the kept AI balance belongs to; another user's is dropped, never shown.
             const userId = ctx?.payload?.user?.id ?? bootPayload()?.user?.id ?? null;
-            if ( userId !== state.userId ) state.lastAccount = null;
+            const userChanged = userId !== state.userId;
+            if ( userChanged ) state.lastAccount = null;
             state.userId = userId;
+            // An answer still in flight for the previous user or link must not land: supersede it and read again.
+            if ( (userChanged || linkChanged) && state.loading ) { state.request++; state.loading = false; }
             // `/app/settings?tab=billing` is the same link as `/os?settings=billing`
             // (docs/APP-ROUTES.md); read both through the boot's own spelling.
             const params = new URLSearchParams(settingsAliasSearch(window.location));

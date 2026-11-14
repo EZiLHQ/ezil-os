@@ -54,6 +54,8 @@ const ERRORS = {
     trial_unavailable: "The free month isn't available for this account.",
     trial_quote_stale: "Your free month's end date changed. Check the new date before you continue.",
     trial_checkout_complete: 'Your free month is already starting. Wait a moment, then refresh Billing.',
+    trial_offer_invalid: "This free-month link isn't valid. Open the link again, or choose a plan in Billing.",
+    trial_offer_unavailable: "This free-month link isn't available right now. Nothing was charged.",
 };
 
 // Optional DTO ceiling lets the consent sheet keep cap errors catalog-driven.
@@ -79,7 +81,9 @@ function zoned (options, timeZone) {
 
 /** "Feb 27, 2027": the trial instant's calendar day in the viewer's zone, or '—'. */
 export function trialDayLabel (iso, { timeZone } = {}) {
-    const time = Date.parse(iso ?? '');
+    // A promoter-link offer has no previewed end before its quote: sentences read "from the end of your free month".
+    if ( iso === null || iso === undefined ) return 'the end of your free month';
+    const time = Date.parse(iso);
     return Number.isFinite(time) ? zoned({ year: 'numeric', month: 'short', day: 'numeric' }, timeZone).format(new Date(time)) : '—';
 }
 
@@ -103,7 +107,9 @@ export function trialMomentLabel (iso, { timeZone, full = false } = {}) {
 export function trialOfferOf (summary) {
     const offer = summary?.trialOffer;
     if ( summary?.version !== 3 || summary.actions?.checkout !== true || offer?.eligible !== true || offer.sku !== TRIAL_SKU ) return null;
-    if ( ! Number.isFinite(Date.parse(offer.endsAt ?? '')) || ! Number.isSafeInteger(offer.amountCents) || offer.amountCents <= 0 ) return null;
+    // An availability-verified offer (`withCouponView`) may have no previewed end: its exact end arrives with its quote.
+    const previewed = offer.verified === true && (offer.endsAt === null || offer.endsAt === undefined);
+    if ( ! previewed && ! Number.isFinite(Date.parse(offer.endsAt ?? '')) || ! Number.isSafeInteger(offer.amountCents) || offer.amountCents <= 0 ) return null;
     return summary.catalog?.offers?.some(item => item.sku === TRIAL_SKU) ? offer : null;
 }
 
@@ -377,4 +383,75 @@ export function hoursLeftLines (period, machineChoice = [], { monthly = false } 
         main,
         equivalents: others.length ? `Same as ${others.slice(0, -1).join(', ')}${others.length > 1 ? ' or ' : ''}${others.at(-1)}.` : null,
     };
+}
+
+// ── Promoter link (?coupon=<alias>) ──────────────────────────────────────────
+// The alias is a registered promoter's name that rides the address bar into Billing. It is never a price, a Stripe id or
+// a redirect. The server alone validates it (`billing.trialOffer`, read-only) and applies it (`billing.quoteTrial`); the
+// shell never marks a URL value eligible or applied by itself.
+
+// The backend's registered-promoter grammar (`PROMOTER_CODE_PATTERN`): 2-32 characters, lower-case letters, digits and hyphens.
+export const COUPON_PATTERN = /^[a-z0-9][a-z0-9-]{1,31}$/;
+
+/** The canonical alias for a URL value, or null for anything that is not one well-formed alias. */
+export function couponAlias (value) {
+    if ( typeof value !== 'string' ) return null;
+    const alias = value.trim().toLowerCase();
+    return COUPON_PATTERN.test(alias) ? alias : null;
+}
+
+/** The link in a query string: `{ alias }` for exactly one valid value, `{ invalid: true }` for a repeated or malformed one, `{}` for none. */
+export function couponFromSearch (search) {
+    const params = new URLSearchParams(search);
+    const values = params.getAll('coupon');
+    if ( ! values.length ) return params.get('coupon_entry') === 'invalid' ? { invalid: true } : {};
+    const alias = values.length === 1 ? couponAlias(values[0]) : null;
+    return alias ? { alias } : { invalid: true };
+}
+
+/** The 64-lowercase-hex fingerprint the server puts on every offer. */
+export const isOfferFingerprint = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+
+const COUPON_NOTICES = {
+    checking: 'Checking your free-month link…',
+    invalid: "This free-month link isn't valid. Open the link again, or choose a plan below.",
+    unavailable: "This free-month link isn't available right now. Nothing was charged.",
+    refused: "This account can't start a free month with this link.",
+    error: "We couldn't check your free-month link right now. Nothing was charged.",
+};
+const REFUSED_BY_REASON = {
+    trial_used: "You've already used your free month, so this link can't start another.",
+    paid_before: 'The free month is for accounts without an earlier paid plan.',
+    email_unverified: 'Verify your email to start a free month.',
+};
+
+/**
+ * The summary as the server's read-only availability check (`billing.trialOffer`) frames it. `link`: `{ alias, status }`,
+ * alias null for the public offer; status 'checking' | 'available' | 'invalid' | 'unavailable' | 'refused' | 'error';
+ * `invalid: true` marks a malformed address (nothing was asked).
+ * - 'available' is the server's own `available && eligible` for this person AND this offer. It alone enables the CTA, for
+ *   the public offer and for a promoter link alike. `summary.trialOffer` is only the PUBLIC offer's preview (null when the
+ *   public offer is off), so it neither gates a link nor enables a CTA by itself.
+ * - Checking, invalid, unavailable, refused and error promise no free month and never show another offer in its place.
+ * - An available offer with no previewed end is shown honestly ("from the end of your free month") until its quote.
+ * Other summaries pass through. `couponView` is display-only: nothing sent to the server comes from it but the alias.
+ */
+export function withCouponView (summary, link) {
+    if ( summary?.version !== 3 || summary.actions?.checkout !== true ) return summary;
+    const standard = summary.catalog?.offers?.find(item => item.sku === TRIAL_SKU);
+    if ( summary.plan?.sku !== 'free_v3' || ! standard || planTrialOf(summary) ) return summary;
+    const alias = link?.alias ?? null;
+    const status = link?.invalid ? 'invalid' : link?.status ?? 'checking';
+    const own = summary.trialOffer;
+    if ( status === 'available' ) {
+        const preview = own?.eligible === true ? own : null;
+        return { ...summary, trialOffer: { eligible: true, sku: TRIAL_SKU, amountCents: preview?.amountCents ?? standard.priceCents,
+            endsAt: preview?.endsAt ?? null, coupon: alias, verified: true },
+        ...(alias ? { couponView: { state: 'offer', alias, copy: 'Your free-month link is ready. $0 today; the exact end date is shown before you pay.' } } : {}) };
+    }
+    // No server proof: no free-month CTA. A refusal the summary itself reports (used, paid before, unverified) stays.
+    const hidden = own?.eligible === false ? summary : { ...summary, trialOffer: undefined };
+    if ( ! alias && ! link?.invalid ) return hidden;
+    const copy = status === 'refused' && own?.eligible === false && REFUSED_BY_REASON[own.reason] || COUPON_NOTICES[status] || COUPON_NOTICES.invalid;
+    return { ...hidden, couponView: { state: status, alias, copy, ...(status === 'error' ? { retry: true } : {}) } };
 }
