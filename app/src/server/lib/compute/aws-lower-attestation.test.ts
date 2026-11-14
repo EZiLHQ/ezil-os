@@ -1,11 +1,12 @@
 /** NULL-lower attestation proofs: every binding refuses on its own; the lower is measured, never inferred. */
 import { describe, expect, it } from 'vitest';
 import { buildAttestCommand, launchTupleOf, LowerAttestationReceiptSchema, LowerAttestationRefusal, parseAttestCommand, parseLowerAttestationRow,
-    verifyLowerAttestation, type InstanceProvenance, type LowerAttestationObservations } from './aws-lower-attestation';
-import { ALIAS_RELEASE, CERT, CLONE, cloudTrail, COMMAND_ID, commandInput, CREATED, DEPLOYMENT, DOCUMENT_HASH, MAINTENANCE, MARKER, MEASURED, NOW, observations,
-    PINNED, placement, receipt, registryEntry, reserved, RESERVE, SNAPSHOT, SOURCE_RELEASE, TARGET_RELEASE } from './aws-lower-attestation.test-support';
+    verifyLowerAttestation, type InstanceProvenance, type LowerAttestationObservations, type MigrationProvenance } from './aws-lower-attestation';
+import { ALIAS_RELEASE, CERT, CLONE, cloudTrail, COMMAND_ID, commandInput, CREATED, DEPLOYMENT, DOCUMENT_HASH, MAINTENANCE, maintenanceLaunch, MARKER, MEASURED,
+    NOW, observations, OWNER, PINNED, PINS, placement, receipt, registryEntry, reserved, RESERVE, SNAPSHOT, SOURCE_RELEASE, TARGET_RELEASE } from './aws-lower-attestation.test-support';
+import { createHash } from 'node:crypto';
 
-const LEGACY_MARKER = (({ instanceId: _i, ...m }) => m)(MARKER);
+const LEGACY_MARKER = Object.fromEntries(Object.entries(MARKER).filter(([k]) => k !== 'instanceId'));
 const OTHER = 'i-77777777777777777';
 const base = observations();
 const withCommand = (over: Partial<NonNullable<LowerAttestationObservations['command']>>) => observations({ command: { ...base.command!, ...over } });
@@ -18,13 +19,22 @@ const closed = (instanceId: string) => ({ instanceId, closed: true, tied: false 
  */
 const prove = (o: { receipt?: string; event?: string; obs?: LowerAttestationObservations; registry?: unknown; cert?: string | null; pin?: string | null;
     doc?: string | null; a?: ReturnType<typeof reserved>; now?: Date; released?: boolean; pool?: string | null; usage?: InstanceProvenance['usage'];
-    p?: ReturnType<typeof placement> } = {}) => {
-    const obs = o.obs ?? observations({}, (o.receipt ?? receipt()) + '\n');
+    p?: ReturnType<typeof placement>; migrations?: MigrationProvenance[]; pins?: Partial<typeof PINS>; host?: Partial<LowerAttestationObservations['host']> } = {}) => {
+    const obs0 = o.obs ?? observations({}, (o.receipt ?? receipt()) + '\n');
+    const obs = { ...obs0, host: { ...obs0.host, ...o.host }, ...(o.event ? { runInstances: [o.event] } : {}) };
     return verifyLowerAttestation(o.a ?? reserved(o.released ? { currentInstanceId: null } : {}), o.p ?? placement(o.released ? { instanceId: null } : {}),
-        COMMAND_ID, o.event ? { ...obs, runInstances: [o.event] } : obs, o.registry ?? registryEntry(), o.cert === undefined ? CERT : o.cert,
-        { sourceSha256: o.pin === undefined ? PINNED : o.pin, documentSha256: o.doc === undefined ? DOCUMENT_HASH : o.doc }, o.now ?? NOW,
-        { poolInstanceId: o.pool ?? null, usage: o.usage ?? null });
+        COMMAND_ID, obs, o.registry ?? registryEntry(), o.cert === undefined ? CERT : o.cert,
+        { ...PINS, sourceSha256: o.pin === undefined ? PINNED : o.pin, documentSha256: o.doc === undefined ? DOCUMENT_HASH : o.doc, ...o.pins }, o.now ?? NOW,
+        { poolInstanceId: o.pool ?? null, usage: o.usage ?? null, migrations: o.migrations ?? [] });
 };
+/** A committed CF→AWS row whose persisted `_awsProvision` is exactly the reserved allocation, launched from SOURCE_RELEASE. */
+const migration = (over: { placement?: Record<string, unknown>; deployment?: Record<string, unknown>; row?: Partial<MigrationProvenance>; released?: boolean } = {}): MigrationProvenance => ({
+    id: '9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a', userId: OWNER, fromProvider: 'cloudflare', toProvider: 'aws-ec2', ...over.row,
+    provision: { placement: { computerId: RESERVE.computerId, ownerUserId: OWNER, provider: 'aws-ec2', store: 'ebs', generation: 1, leaseEpoch: 3,
+        state: 'STARTING', region: 'ap-south-1', zoneId: 'aps1-az1', instanceId: RESERVE.sourceInstanceId, volumeId: RESERVE.sourceVolumeId,
+        fsUuid: RESERVE.fsUuid, fenceToken: RESERVE.sourceFenceToken, ...over.placement },
+    deployment: { ...DEPLOYMENT, amiId: SOURCE_RELEASE.amiId, launchTemplateId: SOURCE_RELEASE.launchTemplateId, launchTemplateVersion: SOURCE_RELEASE.launchTemplateVersion, ...over.deployment },
+    source: null, reservedAt: '2026-10-20T07:59:00.000Z', ...(over.released === undefined ? {} : { released: over.released }) } });
 const refusal = (fn: () => unknown) => {
     try { fn(); } catch (error) { if (error instanceof LowerAttestationRefusal) return error.code; throw error; }
     return 'accepted';
@@ -152,9 +162,90 @@ describe('verifyLowerAttestation', () => {
         expect(refusal(fn)).toBe(code);
     });
 
-    it('accepts a detached clone and a marker from an earlier epoch of the same generation', () => {
+    it('accepts a detached clone; a marker from any other epoch is not this allocation', () => {
         expect(prove({ obs: observations({ clone: { ...observations().clone!, state: 'available', attachments: [] } }) }).measuredDigest).toBe(MEASURED);
-        expect(prove({ receipt: receipt({}, { ...MARKER, leaseEpoch: 2 }) }).measuredDigest).toBe(MEASURED);
+        expect(refusal(() => prove({ receipt: receipt({}, { ...MARKER, leaseEpoch: 2 }) }))).toBe('marker_mismatch');
+    });
+
+    it('accepts no user-data at all in this scope: a bootstrap, even pinned, is refused', () => {
+        const bootstrap = Buffer.from('#cloud-config\n');
+        const pinned = createHash('sha256').update(bootstrap).digest('hex');
+        expect(refusal(() => prove({ host: { userData: bootstrap.toString('base64') }, pins: { userDataSha256: pinned } }))).toBe('source_not_pinned');
+        expect(refusal(() => prove({ host: { userData: bootstrap.toString('base64') } }))).toBe('untrusted_ami');
+    });
+
+    it.each([
+        ['no launch template (AMI only)', { launches: [maintenanceLaunch({}, null)] }],
+        ['another launch template', { launches: [maintenanceLaunch({}, { launchTemplateId: 'lt-22222222222222222' })] }],
+        ['another launch template version', { launches: [maintenanceLaunch({}, { version: '2' })] }],
+        ['`$Latest` instead of a numeric version', { launches: [maintenanceLaunch({}, { version: '$Latest' })] }],
+        ['a user-data override in the launch request', { launches: [maintenanceLaunch({ requestParameters: { userData: '<sensitiveDataRemoved>',
+            instancesSet: { items: [{ imageId: DEPLOYMENT.amiId }] }, launchTemplate: { launchTemplateId: DEPLOYMENT.launchTemplateId, version: DEPLOYMENT.launchTemplateVersion } } })] }],
+        ['another account', { launches: [maintenanceLaunch({ recipientAccountId: '210987654321' })] }],
+    ])('a maintenance launch with %s is not the target tuple', (_name, host) => {
+        expect(refusal(() => prove({ host }))).toMatch(/untrusted_ami|launch_tuple_invalid/);
+    });
+
+    it.each([['ezil:managed-by'], ['ezil:stage'], ['ezil:attestation-id']])('a maintenance host without %s is untrusted', tag => {
+        const tags = Object.fromEntries(Object.entries(base.maintenance!.tags).filter(([k]) => k !== tag));
+        expect(refusal(() => prove({ obs: observations({ maintenance: { ...base.maintenance!, tags } }) }))).toBe('untrusted_ami');
+    });
+
+    it('adopts the original QA shape: no claim row, one committed migration, current instance non-null but terminated, marker without instanceId', () => {
+        const proof = prove({ receipt: receipt({}, LEGACY_MARKER), migrations: [migration()] });
+        expect(proof.measuredDigest).toBe(MEASURED);
+        expect(proof.evidence).toMatchObject({ placementInstance: 'current', instanceProvenance: 'committed-migration', poolClaimNamesSource: false,
+            committedMigration: { id: '9a9a9a9a-9a9a-4a9a-8a9a-9a9a9a9a9a9a' } });
+        expect(prove({ released: true, receipt: receipt({}, LEGACY_MARKER), migrations: [migration()] }).evidence).toMatchObject({ placementInstance: 'released' });
+        // A committed migration of an earlier allocation, or a released provision, is no binding and no contradiction.
+        expect(prove({ migrations: [migration({ placement: { generation: 0 } }), migration({ row: { id: '9b9b9b9b-9b9b-4b9b-8b9b-9b9b9b9b9b9b' }, released: true })] }).measuredDigest).toBe(MEASURED);
+    });
+
+    it.each([
+        ['instance_provenance_missing', { migrations: [migration({ placement: { instanceId: OTHER } })] }],                      // contradiction, always
+        ['instance_provenance_missing', { migrations: [migration({ placement: { instanceId: OTHER } })], markerNamesInstance: true }],
+        ['instance_provenance_missing', { migrations: [migration(), migration({ row: { id: '9b9b9b9b-9b9b-4b9b-8b9b-9b9b9b9b9b9b' } })] }],   // ambiguous
+        ['instance_provenance_missing', { migrations: [migration({ row: { userId: '44444444-4444-4444-8444-444444444444' } })] }],
+        ['instance_provenance_missing', { migrations: [migration({ row: { fromProvider: 'aws-ec2' } })] }],
+        ['instance_provenance_missing', { migrations: [migration({ placement: { fsUuid: '55555555-5555-4555-8555-555555555555' } })] }],
+        ['instance_provenance_missing', { migrations: [migration({ placement: { fenceToken: '55555555-5555-4555-8555-555555555555' } })] }],
+        ['instance_provenance_missing', { migrations: [migration({ placement: { zoneId: 'aps1-az2' } })] }],
+        ['instance_provenance_missing', { migrations: [migration({ placement: { leaseEpoch: 2 } })] }],                          // exact epoch only
+        ['instance_provenance_missing', { migrations: [migration()], pool: OTHER }],                                              // pool contradicts
+        ['release_mismatch', { migrations: [migration({ deployment: { amiId: ALIAS_RELEASE.amiId } })] }],                       // persisted tuple ≠ CloudTrail
+        ['release_mismatch', { migrations: [migration({ deployment: { launchTemplateVersion: '2' } })] }],
+        ['release_mismatch', { migrations: [migration({ deployment: { namespace: 'other' } })] }],
+    ])('committed-migration binding refuses %s', (code, { markerNamesInstance, ...o }: Parameters<typeof prove>[0] & { markerNamesInstance?: boolean }) => {
+        expect(refusal(() => prove({ receipt: markerNamesInstance ? receipt() : receipt({}, LEGACY_MARKER), ...o }))).toBe(code);
+    });
+
+    it.each([
+        ['launched before the reservation', { launches: [maintenanceLaunch({ eventTime: '2026-10-22T10:59:00Z' })] }],
+        ['launched after the command', { launches: [maintenanceLaunch({ eventTime: '2026-10-22T11:21:00Z' })] }],
+        ['launched twice', { launches: [maintenanceLaunch(), maintenanceLaunch({ eventID: 'e3e3e3e3-0000-4000-8000-000000000000' })] }],
+        ['no launch record', { launches: [] }],
+        ['user-data present without a pin', { userData: Buffer.from('#!/bin/sh\n').toString('base64') }],
+        ['unreadable user-data', { userData: null }],
+    ])('a maintenance host %s is untrusted', (_name, host) => {
+        expect(refusal(() => prove({ host }))).toBe('untrusted_ami');
+    });
+
+    it.each([
+        ['another SSM command reached the host', { commandIds: [COMMAND_ID, '0c0c0c0c-0c0c-4c0c-8c0c-0c0c0c0c0c0c'] }],
+        ['an SSM session reached the host', { sessionIds: ['operator-0123456789abcdef0'] }],
+        ['the proof command is not in the host history', { commandIds: [] }],
+    ])('%s: refused', (_name, host) => {
+        expect(refusal(() => prove({ host }))).toBe('command_invalid');
+    });
+
+    it.each([
+        ['an AMI other than the pin', { pins: { maintenanceAmiId: 'ami-44444444444444444' } }],
+        ['a launch from another AMI', { host: { launches: [cloudTrail({ eventTime: '2026-10-22T11:10:00Z' }, { instanceId: MAINTENANCE, imageId: 'ami-44444444444444444' }, null)] } }],
+    ])('the maintenance host refuses %s', (_name, o) => {
+        expect(refusal(() => prove(o))).toBe('untrusted_ami');
+    });
+    it('refuses an unpinned maintenance AMI', () => {
+        expect(refusal(() => prove({ pins: { maintenanceAmiId: null } }))).toBe('source_not_pinned');
     });
 
     it('adopts a released placement (current NULL) whose retired claim row names the launched instance, with or without usage corroboration', () => {
