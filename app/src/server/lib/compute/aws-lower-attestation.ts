@@ -32,8 +32,8 @@ import type { RebaseSnapshotView } from './aws-rebase-evidence';
 import { parseRebaseJson, RebaseCounter, RebaseDigest, RebaseHash, RebaseSnapshot, RebaseTime, RebaseUuid, RebaseVolume } from './aws-rebase-json';
 import { REBASE_RELEASE_REGISTRY_CAPACITY, RebaseSourceReleaseSchema, type RebaseSourceRelease } from './aws-rebase-release';
 import type { Env } from './aws-config';
-import { assertNoImageReservation, ImageJobConflictError, lockImagePlacement, setImageReservation, withAdmission,
-    type ImagePlacement, type PlacementDb, type PlacementExecutor } from './placement';
+import { adoptAttestedLower, assertNoImageReservation, ImageJobConflictError, lockImagePlacement, lockLatestUsageSessions, releaseOwnAttestationReservation,
+    setImageReservation, withAdmission, type AdmissionLock, type ImagePlacement, type PlacementDb, type PlacementExecutor } from './placement';
 import { reverseMoveHolds } from './provider-reverse-store';
 
 export const LOWER_ATTESTATION_PHASES = ['reserved', 'adopted', 'refused'] as const;
@@ -481,15 +481,14 @@ export function createLowerAttestationStore(db: PlacementDb) {
         && p.imageUpgradeJobId === a.attestationId && p.ownerUserId === a.ownerUserId && await owner(tx, a.computerId) === a.ownerUserId
         && p.instanceId === a.currentInstanceId && p.lowerImageDigest === null && p.lowerDigestObservedAt === null && placementDigest(p) === a.reservedRowSha256;
     /** The claim row of exactly this allocation and the latest usage session, both locked (see InstanceProvenance). */
-    const provenance = async (tx: PlacementExecutor, t: { computerId: string; ownerUserId: string; region: string; zoneId: string;
+    const provenance = async (tx: PlacementExecutor, lock: AdmissionLock, t: { computerId: string; ownerUserId: string; region: string; zoneId: string;
         sourceGeneration: number; sourceLeaseEpoch: number; sourceFenceToken: string; sourceVolumeId: string }): Promise<InstanceProvenance> => {
         const claims = rowsOf(await tx.execute(sql`/* attest:pool-claim-provenance */ SELECT instance_id FROM public.ezil_compute_pool_hosts
             WHERE leased_computer_id = ${t.computerId}::uuid AND region = ${t.region} AND zone_id = ${t.zoneId}
               AND claim_generation = ${t.sourceGeneration} AND claim_lease_epoch = ${t.sourceLeaseEpoch} AND claim_fence = ${t.sourceFenceToken}
               AND claim_volume_serial = ${t.sourceVolumeId.replace('-', '')} AND state = 'retired' AND dispatch_status = 'settled'
               AND instance_id IS NOT NULL AND lifecycle_job_id IS NOT NULL AND lifecycle_digest IS NOT NULL LIMIT 2 FOR UPDATE`));
-        const usage = rowsOf(await tx.execute(sql`/* attest:usage-provenance */ SELECT instance_id, stopped_at, started_at FROM public.ezil_compute_usage
-            WHERE computer_id = ${t.computerId}::uuid AND user_id = ${t.ownerUserId}::uuid ORDER BY started_at DESC LIMIT 2 FOR UPDATE`));
+        const usage = rowsOf(await lockLatestUsageSessions(tx, lock, t.computerId, t.ownerUserId));
         const migrations = rowsOf(await tx.execute(sql`/* attest:migration-provenance */ SELECT id::text AS id, user_id::text AS user_id,
             from_provider, to_provider, workspace_head -> '_awsProvision' AS provision FROM public.ezil_compute_migrations
             WHERE computer_id = ${t.computerId}::uuid AND state = 'committed' ORDER BY created_at DESC, id LIMIT 8 FOR UPDATE`));
@@ -515,11 +514,9 @@ export function createLowerAttestationStore(db: PlacementDb) {
     const time = (a: LowerAttestationRecord, now: Date) => new Date(Math.max(now.getTime(), Date.parse(a.updatedAt) + 1)).toISOString();
     /** Terminal refusal under the lock: seal the row, clear ONLY this attestation's own reservation if it is still there
      * (whatever else drifted), and never write the lower. */
-    const terminate = async (tx: PlacementExecutor, a: LowerAttestationRecord, code: LowerAttestationFailure, now: Date) => {
+    const terminate = async (tx: PlacementExecutor, lock: AdmissionLock, a: LowerAttestationRecord, code: LowerAttestationFailure, now: Date) => {
         const sealed = await seal(tx, a, { ...a, phase: 'refused', failureCode: code, updatedAt: time(a, now), completedAt: time(a, now) });
-        await tx.execute(sql`/* attest:release-own */ UPDATE public.ezil_computer_placements SET image_upgrade_job_id = NULL,
-            updated_at = GREATEST(date_trunc('milliseconds', now()), date_trunc('milliseconds', updated_at) + interval '1 millisecond')
-            WHERE computer_id = ${a.computerId}::uuid AND image_upgrade_job_id = ${a.attestationId}::uuid RETURNING computer_id`);
+        await releaseOwnAttestationReservation(tx, lock, a.computerId, a.attestationId);
         return sealed;
     };
     return {
@@ -546,7 +543,7 @@ export function createLowerAttestationStore(db: PlacementDb) {
                 // A released placement (instance_id NULL) names its source only through the complete historical binding of exactly
                 // this allocation (claim row or committed migration); a current instance must be the source. Contradicting records
                 // or conflicting usage history refuse either way.
-                const history = await provenance(tx, { ...req, ownerUserId }), binding = historicalBinding({ ...req, ownerUserId }, history);
+                const history = await provenance(tx, lock, { ...req, ownerUserId }), binding = historicalBinding({ ...req, ownerUserId }, history);
                 if (binding.contradiction || (p.instanceId === null ? !binding.names : p.instanceId !== req.sourceInstanceId)
                     || (history.usage && (!history.usage.closed || history.usage.tied || history.usage.instanceId !== req.sourceInstanceId)))
                     throw new ImageJobConflictError();
@@ -584,7 +581,7 @@ export function createLowerAttestationStore(db: PlacementDb) {
                 const refused = (failureCode: LowerAttestationFailure) => ({ phase: 'refused' as const, failureCode, measuredDigest: null });
                 if (!await unchanged(tx, p, a)) return refused('placement_changed');
                 if (now.getTime() - Date.parse(a.createdAt) > LOWER_ATTESTATION_TTL_MS) return refused('reservation_expired');
-                try { return { phase: 'adopted' as const, failureCode: null, measuredDigest: prove(a, p!, await provenance(tx, a)).measuredDigest }; }
+                try { return { phase: 'adopted' as const, failureCode: null, measuredDigest: prove(a, p!, await provenance(tx, lock, a)).measuredDigest }; }
                 catch (error) {
                     if (!(error instanceof LowerAttestationRefusal)) throw error;
                     return refused(error.code);
@@ -602,30 +599,20 @@ export function createLowerAttestationStore(db: PlacementDb) {
                 const a = await read(tx, attestationId);
                 if (!a || a.computerId !== computerId) throw new ImageJobConflictError();
                 if (a.phase !== 'reserved') return a;               // exactly once: the sealed row answers a replay
-                if (!await unchanged(tx, p, a)) return terminate(tx, a, 'placement_changed', now);
-                if (now.getTime() - Date.parse(a.createdAt) > LOWER_ATTESTATION_TTL_MS) return terminate(tx, a, 'reservation_expired', now);
+                if (!await unchanged(tx, p, a)) return terminate(tx, lock, a, 'placement_changed', now);
+                if (now.getTime() - Date.parse(a.createdAt) > LOWER_ATTESTATION_TTL_MS) return terminate(tx, lock, a, 'reservation_expired', now);
                 let proof: LowerAttestationProof;
-                try { proof = prove(a, p!, await provenance(tx, a)); }
+                try { proof = prove(a, p!, await provenance(tx, lock, a)); }
                 catch (error) {
                     if (!(error instanceof LowerAttestationRefusal)) throw error;
-                    return terminate(tx, a, error.code, now);
+                    return terminate(tx, lock, a, error.code, now);
                 }
                 const sealed = await seal(tx, a, { ...a, phase: 'adopted', commandId: proof.commandId, evidence: proof.evidence, evidenceSha256: evidenceDigest(proof.evidence),
                     measuredDigest: proof.measuredDigest, measuredAt: proof.measuredAt, markerSha256: proof.markerSha256, snapshotId: proof.snapshotId,
                     cloneVolumeId: proof.cloneVolumeId, maintenanceInstanceId: proof.maintenanceInstanceId, maintenanceAmiId: proof.maintenanceAmiId,
                     sourceRelease: proof.sourceRelease, updatedAt: time(a, now), completedAt: time(a, now) });
-                // Only the two lower columns and the fence change, and only on the exact reserved, still-NULL row: instance_id is
-                // compared with the frozen current value (NULL for a released placement), never the historical source.
-                const rows = rowsOf(await tx.execute(sql`/* attest:adopt-cas */ UPDATE public.ezil_computer_placements
-                    SET lower_image_digest = ${proof.measuredDigest}::text, lower_digest_observed_at = ${proof.measuredAt}::timestamptz,
-                        image_upgrade_job_id = NULL,
-                        updated_at = GREATEST(date_trunc('milliseconds', now()), date_trunc('milliseconds', updated_at) + interval '1 millisecond')
-                    WHERE computer_id = ${a.computerId}::uuid AND owner_user_id = ${a.ownerUserId}::uuid AND provider = 'aws-ec2'
-                      AND workspace_store = 'ebs' AND state = 'STOPPED' AND generation = ${a.sourceGeneration} AND lease_epoch = ${a.sourceLeaseEpoch}
-                      AND fence_token = ${a.sourceFenceToken}::uuid AND instance_id IS NOT DISTINCT FROM ${a.currentInstanceId}::text AND volume_id = ${a.sourceVolumeId}
-                      AND fs_uuid = ${a.fsUuid}::uuid AND region = ${a.region} AND zone_id = ${a.zoneId} AND lifecycle_job_id IS NULL
-                      AND image_upgrade_job_id = ${a.attestationId}::uuid AND lower_image_digest IS NULL AND lower_digest_observed_at IS NULL
-                    RETURNING computer_id`));
+                // Only the two lower columns and the fence change, and only on the exact reserved, still-NULL row (placement.ts).
+                const rows = rowsOf(await adoptAttestedLower(tx, lock, a, proof.measuredDigest, proof.measuredAt));
                 if (rows.length !== 1) throw new ImageJobConflictError();
                 return sealed;
             });
@@ -636,7 +623,7 @@ export function createLowerAttestationStore(db: PlacementDb) {
                 await lockImagePlacement(tx, lock, computerId);
                 const a = await read(tx, attestationId);
                 if (!a || a.computerId !== computerId) throw new ImageJobConflictError();
-                return a.phase === 'reserved' ? terminate(tx, a, 'operator_abandoned', now) : a;
+                return a.phase === 'reserved' ? terminate(tx, lock, a, 'operator_abandoned', now) : a;
             });
         },
     };

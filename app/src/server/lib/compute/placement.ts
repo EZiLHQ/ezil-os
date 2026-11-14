@@ -501,6 +501,43 @@ export async function writeImagePlacement(tx: PlacementExecutor, lock: Admission
     if (fields.state !== undefined) await applyTransitionUsageInTx(tx, { ...p, ...fields });
 }
 
+// NULL-lower attestation (aws-lower-attestation.ts) statements: that store calls these only inside its withAdmission
+// transaction, under the admission, computer and placement locks it already holds. Each returns the raw result; the
+// caller keeps its own strict row checks.
+
+/** The two latest usage sessions of this computer and owner, locked: corroborating provenance only. */
+export async function lockLatestUsageSessions(tx: PlacementExecutor, lock: AdmissionLock, computerId: string, ownerUserId: string): Promise<unknown> {
+    assertAdmissionLock(tx, lock);
+    return tx.execute(sql`/* attest:usage-provenance */ SELECT instance_id, stopped_at, started_at FROM public.ezil_compute_usage
+            WHERE computer_id = ${computerId}::uuid AND user_id = ${ownerUserId}::uuid ORDER BY started_at DESC LIMIT 2 FOR UPDATE`);
+}
+
+/** Clears ONLY this attestation's own reservation, if it is still there; never writes the lower. */
+export async function releaseOwnAttestationReservation(tx: PlacementExecutor, lock: AdmissionLock, computerId: string, attestationId: string): Promise<unknown> {
+    assertAdmissionLock(tx, lock);
+    return tx.execute(sql`/* attest:release-own */ UPDATE public.ezil_computer_placements SET image_upgrade_job_id = NULL,
+            updated_at = GREATEST(date_trunc('milliseconds', now()), date_trunc('milliseconds', updated_at) + interval '1 millisecond')
+            WHERE computer_id = ${computerId}::uuid AND image_upgrade_job_id = ${attestationId}::uuid RETURNING computer_id`);
+}
+
+/** The adoption compare-and-set: only the two lower columns and the fence change, and only on the exact reserved, still-NULL
+ * row; instance_id is compared with the frozen current value (NULL for a released placement), never the historical source. */
+export async function adoptAttestedLower(tx: PlacementExecutor, lock: AdmissionLock, a: { computerId: string; ownerUserId: string;
+    sourceGeneration: number; sourceLeaseEpoch: number; sourceFenceToken: string; currentInstanceId: string | null; sourceVolumeId: string;
+    fsUuid: string; region: string; zoneId: string; attestationId: string }, measuredDigest: string, measuredAt: string): Promise<unknown> {
+    assertAdmissionLock(tx, lock);
+    return tx.execute(sql`/* attest:adopt-cas */ UPDATE public.ezil_computer_placements
+                    SET lower_image_digest = ${measuredDigest}::text, lower_digest_observed_at = ${measuredAt}::timestamptz,
+                        image_upgrade_job_id = NULL,
+                        updated_at = GREATEST(date_trunc('milliseconds', now()), date_trunc('milliseconds', updated_at) + interval '1 millisecond')
+                    WHERE computer_id = ${a.computerId}::uuid AND owner_user_id = ${a.ownerUserId}::uuid AND provider = 'aws-ec2'
+                      AND workspace_store = 'ebs' AND state = 'STOPPED' AND generation = ${a.sourceGeneration} AND lease_epoch = ${a.sourceLeaseEpoch}
+                      AND fence_token = ${a.sourceFenceToken}::uuid AND instance_id IS NOT DISTINCT FROM ${a.currentInstanceId}::text AND volume_id = ${a.sourceVolumeId}
+                      AND fs_uuid = ${a.fsUuid}::uuid AND region = ${a.region} AND zone_id = ${a.zoneId} AND lifecycle_job_id IS NULL
+                      AND image_upgrade_job_id = ${a.attestationId}::uuid AND lower_image_digest IS NULL AND lower_digest_observed_at IS NULL
+                    RETURNING computer_id`);
+}
+
 export async function findDuplicatePlacements(db: PlacementExecutor): Promise<{ computerId: string; rows: number }[]> {
     const rows = rowsOf(
         await db.execute(sql`/* placement:duplicates */ SELECT computer_id::text AS computer_id, count(*)::int AS rows
