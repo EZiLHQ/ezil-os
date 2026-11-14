@@ -4,6 +4,7 @@ from __future__ import annotations
 import datetime as dt
 import email.utils
 import errno
+import hashlib
 import ipaddress
 import os
 from pathlib import Path
@@ -107,6 +108,12 @@ def parse_sources(raw: bytes, mirrors: bytes | None):
                     'https://archive.ubuntu.com/ubuntu/\tpriority:2',
                     'https://security.ubuntu.com/ubuntu/\tpriority:3',
                 ]
+                if lines != expected:
+                    # Evidence for review: the runner's public mirror list (URL-shaped lines only). Still refused below.
+                    for line in lines[:8]:
+                        if re.fullmatch(r'https?://[A-Za-z0-9.-]+/[A-Za-z0-9._/-]*(\tpriority:[0-9]+)?', line):
+                            print('Ubuntu apt mirror: observed mirror_list line ' + repr(line), flush=True)
+                    print('Ubuntu apt mirror: observed mirror_list lines=%d sha256=%s' % (len(lines), hashlib.sha256(mirrors).hexdigest()), flush=True)
                 need(lines == expected, 'mirror_list')
                 hosts.update(HOSTS)
             else:
