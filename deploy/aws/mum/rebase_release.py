@@ -575,9 +575,9 @@ def static_deployment(plan,d):
 # the ed7da29a lower-attestation lane over agent 5127d85f: an added read-only `attest-lower` subcommand.
 HOST_AGENT='infra/host-agent'
 HOST_AGENT_EXCEPTION={
-    'lib/ezil_host/attest.py':(None,'100644 5303425e409ac15d25c70878f34523dab38038cd'),
+    'lib/ezil_host/attest.py':(None,'100644 a86a795c144f399567a0ae2a9d5c20c42d89e738'),
     'lib/ezil_host/cli.py':('100644 be52080df39b5fc598f88dd6db053a091a8b0d2b','100644 23d82c44207b9741f346edcca06cf2928aed94fa'),
-    'test/test_attest.py':(None,'100644 7d143480a33ba53448832ec0c9a57e3b3cf243fe'),
+    'test/test_attest.py':(None,'100644 372195faa9675b751ae7b52381dccf32225a17ca'),
 }
 
 

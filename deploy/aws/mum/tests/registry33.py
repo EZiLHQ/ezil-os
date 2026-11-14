@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Stage registry capacity 33 over the normal apply-app -> promote order: reader proofs and guards.
 
-Offline only: temporary git repositories, this checkout's own git objects (5127d85f -> ed7da29a host
-agent), the real Node probe with a fake fetch, and synthetic CLI results. No AWS, SSM or secret.
+Offline only: temporary git repositories, this checkout's own git objects (5127d85f -> the reviewed c7a5af66
+host agent), the real Node probe with a fake fetch, and synthetic CLI results. No AWS, SSM or secret.
 """
 import copy
 import json
@@ -26,6 +26,8 @@ import registry_gc as gc
 REPO = HERE.parents[3]
 AGENT_5127 = '5127d85f71af309dc7c47537a6be276a7de1eb9d'
 AGENT_ED7 = 'ed7da29a279915af36f5c3cfdb63c5627b269049'
+# The reviewed host agent the map describes: 5127d85f plus the lower-attestation lane as reviewed at c7a5af66 (attest.py and its test).
+AGENT_REVIEWED = 'c7a5af6667b6ddba5605b4fceaa5caaccbce91cc'
 SHA = '9' * 40
 TAG = 'stage-cap33'
 IMAGE = 'sha256:' + 'a' * 64
@@ -119,19 +121,22 @@ class RuntimeCapacityTests(unittest.TestCase):
 
 class HostAbiTests(unittest.TestCase):
     def test_reviewed_attestation_delta_is_exactly_three_files(self):
-        self.assertEqual(release.require_host_abi(AGENT_5127, AGENT_ED7, REPO), release.HOST_AGENT_EXCEPTION)
-        self.assertEqual(release.require_host_abi(AGENT_ED7, AGENT_ED7, REPO), {})
+        self.assertEqual(release.require_host_abi(AGENT_5127, AGENT_REVIEWED, REPO), release.HOST_AGENT_EXCEPTION)
+        self.assertEqual(release.require_host_abi(AGENT_REVIEWED, AGENT_REVIEWED, REPO), {})
         self.assertEqual(release.require_host_abi(AGENT_5127, AGENT_5127, REPO), {})
+        # The earlier ed7da29a attestation bytes are no longer the reviewed delta.
+        with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+            release.require_host_abi(AGENT_5127, AGENT_ED7, REPO)
 
     def test_other_deltas_refused(self):
         with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
-            release.require_host_abi(AGENT_ED7, AGENT_5127, REPO)  # removing the lane is not the reviewed delta
+            release.require_host_abi(AGENT_REVIEWED, AGENT_5127, REPO)  # removing the lane is not the reviewed delta
         for sha in ('f' * 40, 'not-a-sha'):
             with self.subTest(sha=sha), self.assertRaisesRegex(ValueError, 'host agent commit unavailable'):
                 release.require_host_abi(AGENT_5127, sha, REPO)
 
     def test_wider_or_different_blob_refused(self):
-        tree = release.host_agent_tree(AGENT_ED7, REPO)
+        tree = release.host_agent_tree(AGENT_REVIEWED, REPO)
         old = release.host_agent_tree(AGENT_5127, REPO)
         for mutate in (lambda t: t.update({'lib/ezil_host/extra.py': '100644 ' + '1' * 40}),
                        lambda t: t.update({'lib/ezil_host/attest.py': '100644 ' + '2' * 40}),
@@ -142,7 +147,7 @@ class HostAbiTests(unittest.TestCase):
             with self.subTest(changed=sorted(set(changed.items()) ^ set(tree.items()))), \
                     patch.object(release, 'host_agent_tree', side_effect=[old, changed]), \
                     self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
-                release.require_host_abi(AGENT_5127, AGENT_ED7, REPO)
+                release.require_host_abi(AGENT_5127, AGENT_REVIEWED, REPO)
 
 
 class PromotionGuardTests(unittest.TestCase):
