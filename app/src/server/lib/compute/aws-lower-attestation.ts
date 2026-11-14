@@ -190,11 +190,8 @@ const valueSql = (a: LowerAttestationRecord, key: keyof LowerAttestationRecord, 
 
 /** The reserved placement, canonically, minus the two columns the reservation itself writes. */
 export function placementDigest(p: ImagePlacement): string {
-    const { updatedAt: _updated, imageUpgradeJobId: _job, ...rest } = p;
-    const canonical = Object.fromEntries(Object.keys(rest).sort().map(k => {
-        const v = (rest as Record<string, unknown>)[k];
-        return [k, v instanceof Date ? v.toISOString() : v];
-    }));
+    const canonical = Object.fromEntries(Object.entries(p).filter(([k]) => k !== 'updatedAt' && k !== 'imageUpgradeJobId')
+        .sort(([x], [y]) => (x < y ? -1 : 1)).map(([k, v]) => [k, v instanceof Date ? v.toISOString() : v]));
     return sha256(JSON.stringify(canonical));
 }
 export function requestDigest(r: LowerAttestationReserveRequest): string {
@@ -214,6 +211,17 @@ export interface LowerAttestationObservations {
     command: SsmCommandView | null; document: SsmDocumentView | null; invocation: SsmInvocationView | null;
     /** cloudtrail:LookupEvents (ResourceName = the source instance), raw `CloudTrailEvent` strings. */
     runInstances: readonly string[];
+    /** The maintenance host's own history: its RunInstances records, its user-data, every SSM command and session that targeted it. */
+    host: MaintenanceHostObservations;
+}
+export interface MaintenanceHostObservations {
+    launches: readonly string[];
+    /** ec2:DescribeInstanceAttribute userData Value (base64), '' when none; null when unreadable. */
+    userData: string | null;
+    /** ssm:ListCommands --instance-id, every page. */
+    commandIds: readonly string[];
+    /** ssm:DescribeSessions Active and History with Target = the host, every page. */
+    sessionIds: readonly string[];
 }
 export interface LowerAttestationProof {
     commandId: string; measuredDigest: string; measuredAt: string; markerSha256: string; snapshotId: string; cloneVolumeId: string;
@@ -239,34 +247,113 @@ export function launchOf(rawEvents: readonly string[], a: Pick<LowerAttestationR
     return launchTupleOf(launches[0]!, a, accountId);
 }
 
-/** The raw CloudTrail RunInstances record of exactly the source instance: its immutable launch tuple. */
+/** The fields of a CloudTrail RunInstances record this proof reads; everything else passes through unread. */
+const RunInstancesEventSchema = z.object({ eventSource: z.literal('ec2.amazonaws.com'), eventName: z.literal('RunInstances'),
+    errorCode: z.undefined(), errorMessage: z.undefined(), awsRegion: z.string(), recipientAccountId: z.string(), eventID: z.string(),
+    eventTime: z.string().refine(t => Number.isFinite(Date.parse(t))),
+    // `$Latest`/`$Default` is not an immutable tuple; an absent template is recorded as absent.
+    requestParameters: z.object({ launchTemplate: z.object({ launchTemplateId: z.string().regex(/^lt-[0-9a-f]{17}$/),
+        version: z.string().regex(/^[1-9][0-9]{0,9}$/) }).passthrough().optional() }).passthrough(),
+    responseElements: z.object({ instancesSet: z.object({ items: z.array(z.object({ instanceId: instance,
+        imageId: z.string().regex(/^ami-[0-9a-f]{17}$/) }).passthrough()).length(1) }).passthrough() }).passthrough() }).passthrough();
+
+/** One raw CloudTrail RunInstances record that launched exactly `instanceId` in this account and region. */
+export function launchRecordOf(rawEvent: string, instanceId: string, region: string, accountId: string) {
+    let e: z.infer<typeof RunInstancesEventSchema>;
+    try { e = RunInstancesEventSchema.parse(parseRebaseJson(rawEvent, 65536)); } catch { return refuse('launch_tuple_invalid'); }
+    const item = e.responseElements.instancesSet.items[0]!, template = e.requestParameters.launchTemplate;
+    if (e.awsRegion !== region || e.recipientAccountId !== accountId || item.instanceId !== instanceId) refuse('launch_tuple_invalid');
+    return { eventId: e.eventID, eventTime: new Date(e.eventTime).toISOString(), eventSha256: sha256(rawEvent), raw: rawEvent,
+        // CloudTrail redacts user-data but records that the request carried it: any override is visible, its content never trusted.
+        userDataOverride: Object.prototype.hasOwnProperty.call(e.requestParameters, 'userData'),
+        tuple: { accountId, region, amiId: item.imageId, launchTemplateId: template?.launchTemplateId ?? null, launchTemplateVersion: template?.version ?? null } };
+}
+/** The source instance's launch: before the reservation, from an immutable launch template version. */
 export function launchTupleOf(rawEvent: string, a: Pick<LowerAttestationRecord, 'sourceInstanceId' | 'region' | 'createdAt'>, accountId: string) {
-    let e: Record<string, any>;
-    try { e = parseRebaseJson(rawEvent, 65536) as Record<string, any>; } catch { return refuse('launch_tuple_invalid'); }
-    const items = e?.responseElements?.instancesSet?.items, template = e?.requestParameters?.launchTemplate;
-    if (!e || e.eventSource !== 'ec2.amazonaws.com' || e.eventName !== 'RunInstances' || e.errorCode !== undefined || e.errorMessage !== undefined
-        || e.awsRegion !== a.region || e.recipientAccountId !== accountId || typeof e.eventID !== 'string' || typeof e.eventTime !== 'string'
-        || !Number.isFinite(Date.parse(e.eventTime)) || Date.parse(e.eventTime) > Date.parse(a.createdAt)
-        || !Array.isArray(items) || items.length !== 1 || items[0]?.instanceId !== a.sourceInstanceId
-        || typeof items[0]?.imageId !== 'string' || !/^ami-[0-9a-f]{17}$/.test(items[0].imageId)
-        || !template || typeof template.launchTemplateId !== 'string' || !/^lt-[0-9a-f]{17}$/.test(template.launchTemplateId)
-        // `$Latest`/`$Default` or an absent version is not an immutable tuple.
-        || typeof template.version !== 'string' || !/^[1-9][0-9]{0,9}$/.test(template.version)) refuse('launch_tuple_invalid');
-    return { eventId: e.eventID as string, eventTime: new Date(e.eventTime).toISOString(), eventSha256: sha256(rawEvent), raw: rawEvent,
-        tuple: { accountId, region: a.region, amiId: items[0].imageId as string, launchTemplateId: template.launchTemplateId as string, launchTemplateVersion: template.version as string } };
+    const r = launchRecordOf(rawEvent, a.sourceInstanceId, a.region, accountId);
+    if (Date.parse(r.eventTime) > Date.parse(a.createdAt) || r.tuple.launchTemplateId === null || r.tuple.launchTemplateVersion === null) refuse('launch_tuple_invalid');
+    return { ...r, tuple: { ...r.tuple, launchTemplateId: r.tuple.launchTemplateId!, launchTemplateVersion: r.tuple.launchTemplateVersion! } };
 }
 
 /**
- * Historical instance provenance, read under the lock. `poolInstanceId`: the ONE retired, settled pool claim row of exactly
- * this allocation (computer, region, zone, generation, lease epoch, fence, volume) — the complete binding a released placement
- * or a marker without instanceId needs. `usageInstanceId`: the latest closed usage session; corroborating only, a conflict refuses.
+ * Historical instance provenance, read under the lock. A released placement or a marker without instanceId needs one complete
+ * binding of exactly this allocation (computer, owner, region, zone, generation, lease epoch, fence, volume, fsUuid):
+ * - `poolInstanceId`: the ONE retired, settled pool claim row; or
+ * - `migrations`: the committed CF→AWS migration rows of this computer, whose `_awsProvision` placement must match the allocation
+ *   (migrationBinding). Its persisted deployment's launch tuple must also equal CloudTrail's, never the current config.
+ * `usage`: the latest usage session; corroborating only, a conflict refuses.
  */
+export interface MigrationProvenance { id: string; userId: string; fromProvider: string; toProvider: string; provision: unknown }
 export interface InstanceProvenance {
     poolInstanceId: string | null;
     usage: { instanceId: string | null; closed: boolean; tied: boolean } | null;
+    migrations?: readonly MigrationProvenance[];
+}
+const MigrationProvisionSchema = z.object({
+    placement: z.object({ computerId: RebaseUuid, ownerUserId: RebaseUuid, provider: z.literal('aws-ec2'), store: z.literal('ebs'), generation: counter,
+        leaseEpoch: counter, region: z.string(), zoneId: z.string(), instanceId: instance, volumeId: RebaseVolume, fsUuid: RebaseUuid, fenceToken: RebaseUuid }).passthrough(),
+    deployment: z.object({ accountId: z.string(), region: z.string(), namespace: z.string(), amiId: z.string(), launchTemplateId: z.string(),
+        launchTemplateVersion: z.string() }).passthrough(),
+    released: z.boolean().optional() }).passthrough();
+/** Committed CF→AWS rows whose persisted provision is exactly this allocation; each names an instance and its launch tuple. */
+export function migrationBinding(a: Pick<LowerAttestationRecord, 'computerId' | 'ownerUserId' | 'region' | 'zoneId' | 'sourceVolumeId' | 'fsUuid'
+    | 'sourceGeneration' | 'sourceLeaseEpoch' | 'sourceFenceToken'>, rows: readonly MigrationProvenance[]) {
+    return rows.flatMap(row => {
+        const parsed = MigrationProvisionSchema.safeParse(row.provision);
+        if (!parsed.success || row.userId !== a.ownerUserId || row.fromProvider !== 'cloudflare' || row.toProvider !== 'aws-ec2' || parsed.data.released === true) return [];
+        const pl = parsed.data.placement, d = parsed.data.deployment;
+        if (pl.computerId !== a.computerId || pl.ownerUserId !== a.ownerUserId || pl.volumeId !== a.sourceVolumeId || pl.fsUuid !== a.fsUuid
+            || pl.generation !== a.sourceGeneration || pl.leaseEpoch !== a.sourceLeaseEpoch || pl.fenceToken !== a.sourceFenceToken
+            || pl.region !== a.region || pl.zoneId !== a.zoneId) return [];
+        return [{ id: row.id, instanceId: pl.instanceId, provisionSha256: sha256(canonical(row.provision)), namespace: d.namespace,
+            tuple: { accountId: d.accountId, region: d.region, amiId: d.amiId, launchTemplateId: d.launchTemplateId, launchTemplateVersion: d.launchTemplateVersion } }];
+    });
+}
+/** The complete historical binding, or why not: a contradiction always refuses, an ambiguity refuses when the binding is needed. */
+export function historicalBinding(a: Parameters<typeof migrationBinding>[0] & { sourceInstanceId: string }, provenance: InstanceProvenance) {
+    const migrations = migrationBinding(a, provenance.migrations ?? []);
+    const contradiction = (provenance.poolInstanceId !== null && provenance.poolInstanceId !== a.sourceInstanceId)
+        || migrations.some(x => x.instanceId !== a.sourceInstanceId);
+    const migration = migrations.length === 1 ? migrations[0]! : null;
+    return { contradiction, migration, names: !contradiction && (provenance.poolInstanceId === a.sourceInstanceId || migration !== null) };
 }
 /** Reviewed pins: the attest.py sha256 and the exact AWS-RunShellScript document hash. Absent = nothing is adoptable. */
-export interface LowerAttestationPins { sourceSha256: string | null; documentSha256: string | null }
+export interface LowerAttestationPins {
+    sourceSha256: string | null; documentSha256: string | null;
+    /** The reviewed maintenance AMI (also the registry's current target). */
+    maintenanceAmiId: string | null;
+    /** Must be null in this scope: the maintenance host has no user-data at all; any bootstrap pin is refused. */
+    userDataSha256: string | null;
+}
+
+/**
+ * A FRESH maintenance host for exactly this job: launched once (one RunInstances, after the reservation and before `notAfter`)
+ * with the registry target's FULL immutable tuple (account, region, pinned AMI, launch template id and numeric version), no
+ * user-data override in the launch and no user-data on the instance (this scope accepts none: a later attribute hash cannot
+ * prove what booted), tagged managed-by/stage/job, and never reached by any SSM command or session other than
+ * `expectedCommandIds` (none before the measurement, exactly the proof command at adoption). Shared by the runner's
+ * pre-measurement check and the verifier.
+ */
+export function verifyFreshMaintenanceHost(a: Pick<LowerAttestationRecord, 'attestationId' | 'computerId' | 'region' | 'zoneId' | 'createdAt' | 'sourceInstanceId' | 'sourceVolumeId'>,
+    hostId: string, host: Ec2EnrollmentView | null, o: MaintenanceHostObservations, expectedCommandIds: readonly string[],
+    pins: Pick<LowerAttestationPins, 'maintenanceAmiId' | 'userDataSha256'>, target: Pick<LifecycleDeployment, 'accountId' | 'region' | 'namespace' | 'amiId'
+        | 'launchTemplateId' | 'launchTemplateVersion'>, notAfter: Date) {
+    if (!pins.maintenanceAmiId || pins.maintenanceAmiId !== target.amiId || pins.userDataSha256 !== null) refuse('source_not_pinned');
+    const launches = o.launches.map(raw => launchRecordOf(raw, hostId, a.region, target.accountId));
+    const launch = launches.length === 1 ? launches[0]! : refuse('untrusted_ami');
+    const launchedAt = Date.parse(launch.eventTime);
+    const userData = o.userData === null ? null : Buffer.from(o.userData, 'base64');
+    if (launchedAt < Date.parse(a.createdAt) || launchedAt > notAfter.getTime() || launch.userDataOverride || target.region !== a.region
+        || launch.tuple.amiId !== target.amiId || launch.tuple.launchTemplateId !== target.launchTemplateId || launch.tuple.launchTemplateVersion !== target.launchTemplateVersion
+        || !host || host.instanceId !== hostId || host.imageId !== target.amiId || host.state !== 'running' || host.availabilityZoneId !== a.zoneId
+        || host.tags['ezil:attestation-id'] !== a.attestationId || host.tags['ezil:computer-id'] !== a.computerId || host.tags['ezil:pool'] !== undefined
+        || host.tags['ezil:managed-by'] !== 'app-computer-platform' || host.tags['ezil:stage'] !== target.namespace
+        || host.volumes.some(x => x.volumeId === a.sourceVolumeId) || hostId === a.sourceInstanceId || userData === null || userData.length !== 0) refuse('untrusted_ami');
+    // No host reuse, no interactive access, no bootstrap command: the only SSM traffic is the one reviewed proof command.
+    if (o.sessionIds.length !== 0 || o.commandIds.length !== expectedCommandIds.length || o.commandIds.some(id => !expectedCommandIds.includes(id)))
+        refuse('command_invalid');
+    return launch;
+}
 
 /**
  * Pure: every proof, or a refusal. Every observation is the adopting side's own AWS read: the SSM command (pinned source, exact
@@ -278,7 +365,8 @@ export function verifyLowerAttestation(a: LowerAttestationRecord, p: ImagePlacem
     if (a.phase !== 'reserved') throw new ImageJobConflictError();
     const { deployment: d, releases } = attestationRegistry(registryEntry);
     const pinnedSourceSha256 = pins.sourceSha256;
-    if (!pinnedSourceSha256 || !/^[0-9a-f]{64}$/.test(pinnedSourceSha256) || !pins.documentSha256 || !/^[0-9a-f]{64}$/.test(pins.documentSha256)) refuse('source_not_pinned');
+    if (!pinnedSourceSha256 || !/^[0-9a-f]{64}$/.test(pinnedSourceSha256) || !pins.documentSha256 || !/^[0-9a-f]{64}$/.test(pins.documentSha256)
+        || !pins.maintenanceAmiId || pins.userDataSha256 !== null) refuse('source_not_pinned');
     const cmd = o.command, run = o.command ? parseAttestCommand(o.command.commands) : null, doc = o.document;
     // The document is AWS's own, at the explicit version the command ran, with the reviewed hash: never `$DEFAULT`/`$LATEST`.
     if (!cmd || !doc || doc.name !== 'AWS-RunShellScript' || doc.owner !== 'Amazon' || doc.documentType !== 'Command' || doc.status !== 'Active'
@@ -310,13 +398,14 @@ export function verifyLowerAttestation(a: LowerAttestationRecord, p: ImagePlacem
     let m: z.infer<typeof MarkerSchema>;
     try { m = MarkerSchema.parse(parseRebaseJson(raw.toString('utf8').trim(), 65536)); } catch { return refuse('marker_mismatch'); }
     if (m.computerId !== a.computerId || m.volumeId !== a.sourceVolumeId || m.fsUuid !== a.fsUuid
-        || (m.instanceId !== undefined && m.instanceId !== a.sourceInstanceId) || m.generation !== a.sourceGeneration || m.leaseEpoch > a.sourceLeaseEpoch
+        // The marker's writer is exactly the reserved allocation: same generation AND lease epoch, no older epoch accepted.
+        || (m.instanceId !== undefined && m.instanceId !== a.sourceInstanceId) || m.generation !== a.sourceGeneration || m.leaseEpoch !== a.sourceLeaseEpoch
         || m.lowerImageDigest !== r.lowerImageDigest) refuse('marker_mismatch');
     // Who wrote the marker. A present marker instanceId must be the source (above). A released placement (current NULL) or a
-    // marker without instanceId is accepted only with the complete historical binding: the one retired, settled claim row of
-    // exactly this allocation names the source. The usage ledger only corroborates: naming another instance refuses.
-    const historical = provenance.poolInstanceId === a.sourceInstanceId;
-    if (p.instanceId !== a.currentInstanceId || (a.currentInstanceId !== null && a.currentInstanceId !== a.sourceInstanceId)
+    // marker without instanceId is accepted only with the complete historical binding (pool claim row or committed migration of
+    // exactly this allocation). Any contradicting record refuses; the usage ledger only corroborates.
+    const binding = historicalBinding(a, provenance), historical = binding.names;
+    if (binding.contradiction || p.instanceId !== a.currentInstanceId || (a.currentInstanceId !== null && a.currentInstanceId !== a.sourceInstanceId)
         || ((a.currentInstanceId === null || m.instanceId === undefined) && !historical)
         || (provenance.usage && (!provenance.usage.closed || provenance.usage.tied || provenance.usage.instanceId !== a.sourceInstanceId)))
         refuse('instance_provenance_missing');
@@ -331,7 +420,9 @@ export function verifyLowerAttestation(a: LowerAttestationRecord, p: ImagePlacem
     if (id.imageId !== d.amiId || target.length !== 1 || !host || host.instanceId !== r.maintenanceInstanceId || host.imageId !== id.imageId
         || host.state !== 'running' || host.availabilityZoneId !== a.zoneId || host.tags['ezil:attestation-id'] !== a.attestationId
         || host.tags['ezil:computer-id'] !== a.computerId || host.tags['ezil:pool'] !== undefined
-        || host.volumes.some(x => x.volumeId === a.sourceVolumeId)) refuse('untrusted_ami');
+        || host.volumes.some(x => x.volumeId === a.sourceVolumeId) || pins.maintenanceAmiId !== d.amiId) refuse('untrusted_ami');
+    // Fresh for this job, launched before the command, and reached by exactly this one SSM command and no session.
+    const maintenanceLaunch = verifyFreshMaintenanceHost(a, maintenanceId, host, o.host, [commandId], pins, d, cmd!.requestedAt);
     const s = o.snapshot;
     if (!s || s.snapshotId !== r.snapshotId || s.volumeId !== a.sourceVolumeId || s.state !== 'completed' || s.ownerId !== d.accountId
         || !s.encrypted || s.kmsKeyId !== d.dataKeyArn || s.startedAt.getTime() < Date.parse(a.createdAt)
@@ -348,14 +439,22 @@ export function verifyLowerAttestation(a: LowerAttestationRecord, p: ImagePlacem
     const launch = launchOf(o.runInstances, a, d.accountId);
     const joined = releases.filter(x => LAUNCH_TUPLE.every(k => x[k] === launch.tuple[k]));
     if (joined.length !== 1 || joined[0]!.namespace !== d.namespace || joined[0]!.lowerImageDigest !== m.lowerImageDigest) refuse('release_mismatch');
+    // A committed migration of this allocation persisted the deployment it launched from: it must be the launch CloudTrail saw.
+    const migration = binding.migration;
+    if (migration && (migration.namespace !== d.namespace || LAUNCH_TUPLE.some(k => migration.tuple[k] !== launch.tuple[k]))) refuse('release_mismatch');
     // Raw proof stays backend-only: this row, never an API answer or operator stdout.
-    const evidence = { v: 1, trust: 'aws-read:ssm-command+invocation,ec2,cloudtrail', instanceProvenance: m.instanceId ? 'marker' : 'pool-claim',
-        placementInstance: a.currentInstanceId === null ? 'released' : 'current', poolClaimNamesSource: historical,
+    const poolNames = provenance.poolInstanceId === a.sourceInstanceId;
+    const evidence = { v: 1, trust: 'aws-read:ssm-command+invocation,ec2,cloudtrail',
+        instanceProvenance: m.instanceId ? 'marker' : poolNames ? 'pool-claim' : 'committed-migration',
+        placementInstance: a.currentInstanceId === null ? 'released' : 'current', poolClaimNamesSource: poolNames,
+        committedMigration: migration ? { id: migration.id, provisionSha256: migration.provisionSha256 } : null,
         usageLedger: provenance.usage === null ? 'none' : 'corroborates',
         command: { commandId, documentName: cmd!.documentName, documentVersion: cmd!.documentVersion, documentSha256: doc!.hash, requestedAt: cmd!.requestedAt.toISOString(), instanceId: maintenanceId,
             sourceSha256: pinnedSourceSha256, commandSha256: sha256(JSON.stringify(cmd!.commands)) },
         receiptSha256: sha256(receiptLine), receipt: receiptLine, marker: m,
         identity: { instanceId: id.instanceId, imageId: id.imageId, accountId: id.accountId, region: id.region },
+        maintenanceLaunch: { eventId: maintenanceLaunch.eventId, eventTime: maintenanceLaunch.eventTime, eventSha256: maintenanceLaunch.eventSha256,
+            ...maintenanceLaunch.tuple, userDataSha256: pins.userDataSha256, commandIds: [...o.host.commandIds], sessions: o.host.sessionIds.length },
         launch: { eventId: launch.eventId, eventTime: launch.eventTime, eventSha256: launch.eventSha256, raw: launch.raw, ...launch.tuple },
         snapshot: { snapshotId: s!.snapshotId, volumeId: s!.volumeId, startedAt: s!.startedAt.toISOString() },
         clone: { volumeId: c!.volumeId, snapshotId: c!.snapshotId, attachedTo: (c!.attachments ?? []).map(x => x.instanceId) },
@@ -391,10 +490,17 @@ export function createLowerAttestationStore(db: PlacementDb) {
               AND instance_id IS NOT NULL AND lifecycle_job_id IS NOT NULL AND lifecycle_digest IS NOT NULL LIMIT 2 FOR UPDATE`));
         const usage = rowsOf(await tx.execute(sql`/* attest:usage-provenance */ SELECT instance_id, stopped_at, started_at FROM public.ezil_compute_usage
             WHERE computer_id = ${t.computerId}::uuid AND user_id = ${t.ownerUserId}::uuid ORDER BY started_at DESC LIMIT 2 FOR UPDATE`));
+        const migrations = rowsOf(await tx.execute(sql`/* attest:migration-provenance */ SELECT id::text AS id, user_id::text AS user_id,
+            from_provider, to_provider, workspace_head -> '_awsProvision' AS provision FROM public.ezil_compute_migrations
+            WHERE computer_id = ${t.computerId}::uuid AND state = 'committed' ORDER BY created_at DESC, id LIMIT 8 FOR UPDATE`));
+        if (migrations.length > 7) throw new ImageJobConflictError();
         const [row, next] = usage;
-        return { poolInstanceId: claims.length === 1 && typeof claims[0]!.instance_id === 'string' ? claims[0]!.instance_id : null,
+        // Two claim rows for one allocation are a contradiction, never "no claim": the sentinel names no instance.
+        return { poolInstanceId: claims.length === 0 ? null : claims.length === 1 && typeof claims[0]!.instance_id === 'string' ? claims[0]!.instance_id : 'ambiguous',
             usage: row ? { instanceId: typeof row.instance_id === 'string' ? row.instance_id : null, closed: row.stopped_at !== null,
-                tied: !!next && iso(next.started_at) === iso(row.started_at) } : null };
+                tied: !!next && iso(next.started_at) === iso(row.started_at) } : null,
+            migrations: migrations.map(m => ({ id: String(m.id), userId: String(m.user_id), fromProvider: String(m.from_provider), toProvider: String(m.to_provider),
+                provision: typeof m.provision === 'string' ? JSON.parse(m.provision) : m.provision })) };
     };
     const seal = async (tx: PlacementExecutor, a: LowerAttestationRecord, next: LowerAttestationRecord) => {
         const parsed = parseLowerAttestationRow(Object.fromEntries(COLUMNS.map(([key, name]) => [name, next[key]])));
@@ -437,10 +543,11 @@ export function createLowerAttestationStore(db: PlacementDb) {
                     || p.enrollNonceHash !== null || p.volumeId !== req.sourceVolumeId || p.fsUuid !== req.fsUuid
                     || p.generation !== req.sourceGeneration || p.leaseEpoch !== req.sourceLeaseEpoch || p.fenceToken !== req.sourceFenceToken
                     || p.region !== req.region || p.zoneId !== req.zoneId) throw new ImageJobConflictError();
-                // A released placement (instance_id NULL) names its source only through the retired claim row of exactly this
-                // allocation; a current instance must be the source. Conflicting usage history refuses either way.
-                const history = await provenance(tx, { ...req, ownerUserId });
-                if ((p.instanceId === null ? history.poolInstanceId !== req.sourceInstanceId : p.instanceId !== req.sourceInstanceId)
+                // A released placement (instance_id NULL) names its source only through the complete historical binding of exactly
+                // this allocation (claim row or committed migration); a current instance must be the source. Contradicting records
+                // or conflicting usage history refuse either way.
+                const history = await provenance(tx, { ...req, ownerUserId }), binding = historicalBinding({ ...req, ownerUserId }, history);
+                if (binding.contradiction || (p.instanceId === null ? !binding.names : p.instanceId !== req.sourceInstanceId)
                     || (history.usage && (!history.usage.closed || history.usage.tied || history.usage.instanceId !== req.sourceInstanceId)))
                     throw new ImageJobConflictError();
                 await assertNoImageReservation(tx, req.computerId);
@@ -538,22 +645,31 @@ export type LowerAttestationStore = ReturnType<typeof createLowerAttestationStor
 
 /**
  * Every read the verifier needs. Least privilege for whoever adopts (the app role or the operator profile runner):
- * ec2:DescribeSnapshots, ec2:DescribeVolumes, ec2:DescribeInstances, ssm:ListCommands, ssm:DescribeDocument, ssm:GetCommandInvocation,
- * cloudtrail:LookupEvents. A missing reader fails closed (`attest_readers_unavailable`), never trusting relayed data instead.
- * lookupRunInstances must read every page; a partial listing throws rather than answering.
+ * ec2:DescribeSnapshots, ec2:DescribeVolumes, ec2:DescribeInstances, ec2:DescribeInstanceAttribute (userData), ssm:ListCommands,
+ * ssm:DescribeDocument, ssm:GetCommandInvocation, ssm:DescribeSessions, cloudtrail:LookupEvents. A missing reader fails closed
+ * (`attest_readers_unavailable`), never trusting relayed data instead. Listing readers read every page; a partial listing throws.
  */
 export interface LowerAttestationReaders {
     describeSnapshot(region: string, snapshotId: string): Promise<RebaseSnapshotView | null>;
     describeVolume(region: string, volumeId: string): Promise<Ec2VolumeView | null>;
     describeForEnrollment(region: string, instanceId: string): Promise<Ec2EnrollmentView | null>;
+    describeUserData(region: string, instanceId: string): Promise<string | null>;
     getCommand(region: string, commandId: string): Promise<SsmCommandView | null>;
     describeDocument(region: string, name: string, documentVersion: string): Promise<SsmDocumentView | null>;
     getCommandInvocation(region: string, commandId: string, instanceId: string): Promise<SsmInvocationView | null>;
+    listInstanceCommands(region: string, instanceId: string): Promise<string[]>;
+    listInstanceSessions(region: string, instanceId: string): Promise<string[]>;
     lookupRunInstances(region: string, instanceId: string): Promise<string[]>;
+}
+/** The maintenance host's own history, read in full (shared by the runner's pre-measurement check and adoption). */
+export async function maintenanceHostObservations(readers: LowerAttestationReaders, region: string, hostId: string): Promise<MaintenanceHostObservations> {
+    return { launches: await readers.lookupRunInstances(region, hostId), userData: await readers.describeUserData(region, hostId),
+        commandIds: await readers.listInstanceCommands(region, hostId), sessionIds: await readers.listInstanceSessions(region, hostId) };
 }
 /** Every reader from one collaborator object, or null: no partial reader set is ever used. */
 export function lowerAttestationReaders(source: Partial<LowerAttestationReaders> | null | undefined): LowerAttestationReaders | null {
-    const keys = ['describeSnapshot', 'describeVolume', 'describeForEnrollment', 'getCommand', 'describeDocument', 'getCommandInvocation', 'lookupRunInstances'] as const;
+    const keys = ['describeSnapshot', 'describeVolume', 'describeForEnrollment', 'describeUserData', 'getCommand', 'describeDocument', 'getCommandInvocation',
+        'listInstanceCommands', 'listInstanceSessions', 'lookupRunInstances'] as const;
     if (!source || keys.some(k => typeof source[k] !== 'function')) return null;
     return Object.fromEntries(keys.map(k => [k, (source[k] as (...args: never[]) => unknown).bind(source)])) as unknown as LowerAttestationReaders;
 }
@@ -561,6 +677,12 @@ export function lowerAttestationReaders(source: Partial<LowerAttestationReaders>
 export const LOWER_ATTEST_SOURCE_SHA256_ENV = 'EZIL_LOWER_ATTEST_SOURCE_SHA256';
 /** The reviewed AWS-RunShellScript document hash (ssm:DescribeDocument Hash, Sha256) for the version the command names. */
 export const LOWER_ATTEST_DOCUMENT_SHA256_ENV = 'EZIL_LOWER_ATTEST_SSM_DOCUMENT_SHA256';
+/** The reviewed maintenance AMI, and the reviewed bootstrap user-data sha256 (absent = the host must have no user-data). */
+export const LOWER_ATTEST_MAINTENANCE_AMI_ENV = 'EZIL_LOWER_ATTEST_MAINTENANCE_AMI';
+export const LOWER_ATTEST_USERDATA_SHA256_ENV = 'EZIL_LOWER_ATTEST_USERDATA_SHA256';
+export const lowerAttestationPins = (env: Env): LowerAttestationPins => ({ sourceSha256: env[LOWER_ATTEST_SOURCE_SHA256_ENV] ?? null,
+    documentSha256: env[LOWER_ATTEST_DOCUMENT_SHA256_ENV] ?? null, maintenanceAmiId: env[LOWER_ATTEST_MAINTENANCE_AMI_ENV] ?? null,
+    userDataSha256: env[LOWER_ATTEST_USERDATA_SHA256_ENV] ?? null });
 /** Operator answer: identifiers and phase only (raw proof and marker stay in the row). The challenge is returned while reserved. */
 export function attestationBody(a: LowerAttestationRecord | null) {
     return a ? { schemaVersion: 1, attestationId: a.attestationId, phase: a.phase, failureCode: a.failureCode,
@@ -589,10 +711,11 @@ export async function adoptLowerAttestation(deps: { store: LowerAttestationStore
         clone: ids.clone.success ? await deps.readers.describeVolume(a.region, ids.clone.data) : null,
         original: await deps.readers.describeVolume(a.region, a.sourceVolumeId),
         maintenance: ids.host.success ? await deps.readers.describeForEnrollment(a.region, ids.host.data) : null,
-        runInstances: await deps.readers.lookupRunInstances(a.region, a.sourceInstanceId) };
+        runInstances: await deps.readers.lookupRunInstances(a.region, a.sourceInstanceId),
+        host: ids.host.success ? await maintenanceHostObservations(deps.readers, a.region, ids.host.data) : { launches: [], userData: null, commandIds: [], sessionIds: [] } };
     const registry = (parseRebaseJson(deps.env[LIFECYCLE_DEPLOYMENTS_ENV] ?? '{}', 65536) as Record<string, unknown>)[a.region];
     const certificate = readIdentityCertificate(deps.env, a.region);
-    const pins = { sourceSha256: deps.env[LOWER_ATTEST_SOURCE_SHA256_ENV] ?? null, documentSha256: deps.env[LOWER_ATTEST_DOCUMENT_SHA256_ENV] ?? null };
+    const pins = lowerAttestationPins(deps.env);
     const prove = (locked: LowerAttestationRecord, p: ImagePlacement, provenance: InstanceProvenance) =>
         verifyLowerAttestation(locked, p, req.commandId, observations, registry, certificate, pins, deps.now(), provenance);
     return deps.store.adopt(a.attestationId, a.computerId, prove, deps.now());

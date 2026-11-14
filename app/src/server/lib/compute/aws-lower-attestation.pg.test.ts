@@ -12,7 +12,8 @@ import { rebaseEnv } from './aws-rebase.test-support';
 import { assertNoImageReservation, type PlacementDb, type PlacementExecutor } from './placement';
 import { buildAttestCommand, createLowerAttestationStore, LOWER_ATTESTATION_FAILURE_CODES, LOWER_ATTESTATION_TTL_MS, LowerAttestationRefusal,
     verifyLowerAttestation, type InstanceProvenance, type LowerAttestationRecord } from './aws-lower-attestation';
-import { CERT, COMMAND_ID, commandInput, CREATED, MARKER, MEASURED, NOW, observations, OWNER, PINS, receipt, registryEntry, RESERVE } from './aws-lower-attestation.test-support';
+import { CERT, COMMAND_ID, commandInput, CREATED, DEPLOYMENT, MARKER, MEASURED, NOW, observations, OWNER, PINS, receipt, registryEntry, RESERVE,
+    SOURCE_RELEASE } from './aws-lower-attestation.test-support';
 import type { ImagePlacement } from './placement';
 
 const PG = process.env.EZIL_PG_TEST_URL;
@@ -21,7 +22,7 @@ const repository = '123456789012.dkr.ecr.ap-south-1.amazonaws.com/desktop';
 const prep = fixtureRebasePreparation();
 const rebaseJob = () => newReservedImageJob({ preparation: prep, ownerUserId: OWNER,
     sourceRelease: fixtureRebaseRelease(prep.intent.sourceDeployment), targetRelease: fixtureRebaseRelease(prep.intent.deployment) });
-const LEGACY_MARKER = (({ instanceId: _i, ...m }) => m)(MARKER);
+const LEGACY_MARKER = Object.fromEntries(Object.entries(MARKER).filter(([k]) => k !== 'instanceId'));
 
 /** The verifier on observations built for this row's own challenge: the real proof, not a stub. */
 const realProof = (marker: Record<string, unknown> = MARKER) => (a: LowerAttestationRecord, p: ImagePlacement, provenance: InstanceProvenance) =>
@@ -53,7 +54,8 @@ describe.skipIf(!PG)('NULL-lower attestation on disposable PostgreSQL', () => {
         for (const file of ['0008_pool_dispatch.sql', '0009_capacity_demands.sql'])
             await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle', file), 'utf8')));
         await client!.unsafe(`CREATE TABLE ${schema}.ezil_computers (id uuid, user_id uuid, deleted_at timestamptz)`);
-        await client!.unsafe(`CREATE TABLE ${schema}.ezil_compute_migrations (id uuid, computer_id uuid, state text, user_id uuid, workspace_head jsonb)`);
+        // The real migration DDL (the committed-migration binding reads from_provider/to_provider/workspace_head under its CHECKs).
+        await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0006_compute_migrations.sql'), 'utf8')));
         await client!.unsafe(local(readFileSync(path.resolve(__dirname, '../../../../drizzle/0010_migration_restore_progress.sql'), 'utf8')));
     });
     beforeEach(async () => {
@@ -112,7 +114,8 @@ describe.skipIf(!PG)('NULL-lower attestation on disposable PostgreSQL', () => {
         ['a running placement', `UPDATE public.ezil_computer_placements SET state = 'RUNNING'`],
         ['another fence', `UPDATE public.ezil_computer_placements SET fence_token = gen_random_uuid()`],
         ['a lifecycle job', `UPDATE public.ezil_computer_placements SET lifecycle_job_id = gen_random_uuid()`],
-        ['an open migration', `INSERT INTO public.ezil_compute_migrations VALUES (gen_random_uuid(), '${RESERVE.computerId}', 'copying', '${OWNER}', NULL)`],
+        ['an open migration', `INSERT INTO public.ezil_compute_migrations (user_id, computer_id, from_provider, to_provider, to_size, state)
+            VALUES ('${OWNER}', '${RESERVE.computerId}', 'cloudflare', 'aws-ec2', 'standard', 'provisioning')`],
         ['a deleted computer', `UPDATE public.ezil_computers SET deleted_at = now()`],
     ])('reserve refuses %s and writes nothing', async (_name, mutation) => {
         await q(mutation);
@@ -227,7 +230,76 @@ describe.skipIf(!PG)('NULL-lower attestation on disposable PostgreSQL', () => {
         await expect(store.adopt(b.attestationId, b.computerId, as, NOW)).resolves.toMatchObject({ failureCode: null, phase: 'adopted', measuredDigest: MEASURED });
     });
 
-    describe('a released placement (instance_id NULL), the original QA shape', () => {
+    /** A committed CF→AWS row persisting exactly this allocation's provision (the actual QA and production incident shape). */
+    const committed = (over: { instanceId?: string; leaseEpoch?: number; state?: string } = {}) => q(`INSERT INTO public.ezil_compute_migrations
+        (user_id, computer_id, from_provider, to_provider, to_size, state, workspace_head) VALUES ($1, $2, 'cloudflare', 'aws-ec2', 'standard', $3, $4::text::jsonb)`,
+    [OWNER, RESERVE.computerId, over.state ?? 'committed', JSON.stringify({ _awsProvision: { placement: { computerId: RESERVE.computerId, ownerUserId: OWNER,
+        provider: 'aws-ec2', store: 'ebs', generation: RESERVE.sourceGeneration, leaseEpoch: over.leaseEpoch ?? RESERVE.sourceLeaseEpoch, state: 'STARTING',
+        region: RESERVE.region, zoneId: RESERVE.zoneId, instanceId: over.instanceId ?? RESERVE.sourceInstanceId, volumeId: RESERVE.sourceVolumeId,
+        fsUuid: RESERVE.fsUuid, fenceToken: RESERVE.sourceFenceToken }, deployment: { ...DEPLOYMENT, amiId: SOURCE_RELEASE.amiId,
+        launchTemplateId: SOURCE_RELEASE.launchTemplateId, launchTemplateVersion: SOURCE_RELEASE.launchTemplateVersion }, source: null, reservedAt: '2026-10-20T07:59:00.000Z' } })]);
+
+    describe('zero claim rows, one committed CF→AWS migration (the actual QA and production incident shape)', () => {
+        it('current instance non-null (terminated) and a marker without instanceId adopt through the committed migration', async () => {
+            await committed();
+            const before = await placementRow();
+            const a = await reserve();
+            const adopted = await store.adopt(a.attestationId, a.computerId, realProof(LEGACY_MARKER), NOW);
+            expect(adopted).toMatchObject({ phase: 'adopted', measuredDigest: MEASURED });
+            expect(adopted.evidence).toMatchObject({ instanceProvenance: 'committed-migration', placementInstance: 'current', poolClaimNamesSource: false });
+            expect((adopted.evidence as { committedMigration: { provisionSha256: string } }).committedMigration.provisionSha256).toMatch(/^[0-9a-f]{64}$/);
+            const after = await placementRow();
+            expect(without(after, 'lower_image_digest', 'lower_digest_observed_at', 'image_upgrade_job_id', 'updated_at'))
+                .toEqual(without(before, 'lower_image_digest', 'lower_digest_observed_at', 'image_upgrade_job_id', 'updated_at'));
+        });
+
+        it('a released placement reserves and adopts through the committed migration alone', async () => {
+            await q(`UPDATE public.ezil_computer_placements SET instance_id = NULL`);
+            await expect(reserve()).rejects.toThrow('image_job_conflict');
+            await committed();
+            const a = await reserve();
+            expect(await store.adopt(a.attestationId, a.computerId, realProof(LEGACY_MARKER), NOW)).toMatchObject({ phase: 'adopted', measuredDigest: MEASURED });
+        });
+
+        it('a migration naming another instance for this allocation is a contradiction: reserve refuses and writes nothing', async () => {
+            await committed({ instanceId: 'i-77777777777777777' });
+            const before = await placementRow();
+            await expect(reserve()).rejects.toThrow('image_job_conflict');
+            expect(await placementRow()).toEqual(before);
+        });
+
+        it.each([
+            ['is two rows for the same allocation (ambiguous)', async () => { await committed(); await committed(); }, 'instance_provenance_missing'],
+            ['is another lease epoch (not this allocation)', async () => { await committed({ leaseEpoch: RESERVE.sourceLeaseEpoch - 1 }); }, 'instance_provenance_missing'],
+        ])('a migration that %s never binds; the lower stays NULL', async (_name, history, code) => {
+            await history();
+            const a = await reserve();
+            expect(await store.adopt(a.attestationId, a.computerId, realProof(LEGACY_MARKER), NOW)).toMatchObject({ phase: 'refused', failureCode: code });
+            const p = await placementRow();
+            expect(p.lower_image_digest).toBeNull();
+            expect(p.image_upgrade_job_id).toBeNull();
+        });
+
+        it('a released placement refuses to reserve on a contradicting or ambiguous migration and writes nothing', async () => {
+            await q(`UPDATE public.ezil_computer_placements SET instance_id = NULL`);
+            for (const history of [() => committed({ instanceId: 'i-77777777777777777' }), () => committed()]) {
+                await history();
+                const before = await placementRow();
+                await expect(reserve()).rejects.toThrow('image_job_conflict');
+                expect(await placementRow()).toEqual(before);
+            }
+        });
+
+        it('lineage that changes after the reservation (a contradicting row appears) seals instance_provenance_missing', async () => {
+            await committed();
+            const a = await reserve();
+            await committed({ instanceId: 'i-77777777777777777' });
+            expect(await store.adopt(a.attestationId, a.computerId, realProof(LEGACY_MARKER), NOW)).toMatchObject({ phase: 'refused', failureCode: 'instance_provenance_missing' });
+            expect((await placementRow()).lower_image_digest).toBeNull();
+        });
+    });
+
+    describe('a released placement (instance_id NULL) with retired claim rows', () => {
         beforeEach(async () => { await q(`UPDATE public.ezil_computer_placements SET instance_id = NULL`); });
 
         it('reserves and adopts only through the claim row of exactly this allocation; the NULL instance is frozen, compared and kept', async () => {
