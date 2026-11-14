@@ -21,7 +21,7 @@ ORIGINAL = 'vol-' + '1' * 17
 CLONE = 'vol-' + '2' * 17
 ARGS = ['--attestation-id', '33333333-3333-4333-8333-333333333333', '--computer-id', COMPUTER,
         '--original-volume-id', ORIGINAL, '--clone-volume-id', CLONE, '--snapshot-id', 'snap-' + '4' * 17,
-        '--fs-uuid', FS, '--instance-id', SRC, '--generation', '3', '--lease-epoch', '7']
+        '--fs-uuid', FS, '--instance-id', SRC, '--generation', '3', '--lease-epoch', '7', '--challenge', 'c' * 64]
 MARKER = {'computerId': COMPUTER, 'volumeId': ORIGINAL, 'fsUuid': FS, 'generation': 3, 'leaseEpoch': 7,
           'lowerImageDigest': OLD, 'instanceId': SRC}
 
@@ -43,11 +43,15 @@ class Attest(unittest.TestCase):
         self.opts = 'ro,nosuid,nodev,noexec,norecovery'
         self.getro = '1'
         self.mounted_already = 1
+        self.features = 'Filesystem features:      has_journal ext_attr resize_inode dir_index filetype extent 64bit flex_bg sparse_super'
+        self.dumpe2fs_rc = 0
 
         def run(argv, **kw):
             self.calls.append(list(argv))
             if argv[:2] == ['findmnt', '-n'] and '--source' in argv:
                 return mock.Mock(returncode=0 if self.mounted_already == 0 else 1, stdout='')
+            if argv[:2] == ['dumpe2fs', '-h']:
+                return mock.Mock(returncode=self.dumpe2fs_rc, stdout='Filesystem volume name:   ezil-data\n' + self.features + '\n')
             if argv[:2] == ['blockdev', '--getro']:
                 return mock.Mock(returncode=0, stdout=self.getro + '\n')
             return mock.Mock(returncode=0, stdout='')
@@ -96,6 +100,14 @@ class Attest(unittest.TestCase):
         self.assertIn(['umount', str(self.mnt)], self.calls)
         self.assert_no_write_surface()
 
+    def test_marker_without_instance_is_reported_unchanged(self):
+        legacy = {k: v for k, v in MARKER.items() if k != 'instanceId'}
+        self.write_marker(legacy)
+        r = self.go()
+        self.assertEqual(json.loads(base64.b64decode(r['markerBase64'])), legacy)
+        self.assertEqual(r['markerSha256'], hashlib.sha256(self.raw).hexdigest())
+        self.assert_no_write_surface()
+
     def test_cli_prints_one_canonical_line(self):
         out = []
         with mock.patch.object(cli.config, 'load', return_value=self.cfg), \
@@ -132,7 +144,6 @@ class Attest(unittest.TestCase):
             ('fs_uuid_mismatch', dict(MARKER, fsUuid='55555555-5555-4555-8555-555555555555')),
             ('generation_ahead', dict(MARKER, generation=4)),
             ('epoch_ahead', dict(MARKER, leaseEpoch=8)),
-            ('marker_instance_unknown', {k: v for k, v in MARKER.items() if k != 'instanceId'}),
             ('instance_id_mismatch', dict(MARKER, instanceId='i-' + '8' * 17)),
             ('marker_malformed', dict(MARKER, lowerImageDigest='sha256:short')),
         ]
@@ -172,6 +183,17 @@ class Attest(unittest.TestCase):
         self.opts = 'ro,nosuid,nodev,noexec'  # journal replay not disabled
         self.calls.clear()
         self.refuses('not_readonly')
+
+    def test_journal_needing_replay_is_refused_before_mount(self):
+        self.features += ' needs_recovery'
+        self.refuses('needs_recovery', mounted=False)
+        self.assertFalse(any(c[0] == 'mount' for c in self.calls))
+        self.features, self.dumpe2fs_rc = self.features.replace(' needs_recovery', ''), 1
+        self.calls.clear()
+        self.refuses('fs_state_unknown', mounted=False)
+
+    def test_receipt_echoes_the_server_challenge(self):
+        self.assertEqual(self.go()['challenge'], 'c' * 64)
 
     def test_identity_and_argument_refusals(self):
         with mock.patch.object(guard, 'fs_uuid', return_value='55555555-5555-4555-8555-555555555555'):
