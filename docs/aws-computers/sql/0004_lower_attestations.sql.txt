@@ -1,0 +1,70 @@
+CREATE TABLE public.ezil_computer_lower_attestations (
+  attestation_id uuid NOT NULL,
+  computer_id uuid NOT NULL,
+  owner_user_id uuid NOT NULL,
+  region text NOT NULL,
+  zone_id text NOT NULL,
+  source_instance_id text NOT NULL,
+  source_volume_id text NOT NULL,
+  fs_uuid uuid NOT NULL,
+  source_generation bigint NOT NULL,
+  source_lease_epoch bigint NOT NULL,
+  source_fence_token uuid NOT NULL,
+  reserved_row_sha256 text NOT NULL,
+  request_sha256 text NOT NULL,
+  challenge text NOT NULL,
+  command_id text NULL,
+  phase text NOT NULL,
+  evidence jsonb NULL,
+  evidence_sha256 text NULL,
+  measured_digest text NULL,
+  measured_at timestamptz NULL,
+  marker_sha256 text NULL,
+  snapshot_id text NULL,
+  clone_volume_id text NULL,
+  maintenance_instance_id text NULL,
+  maintenance_ami_id text NULL,
+  source_release jsonb NULL,
+  failure_code text NULL,
+  created_at timestamptz NOT NULL,
+  updated_at timestamptz NOT NULL,
+  completed_at timestamptz NULL,
+  CONSTRAINT ezil_computer_lower_attestations_pkey PRIMARY KEY (attestation_id),
+  CONSTRAINT ezil_computer_lower_attestations_phase_check CHECK (phase IN ('reserved', 'adopted', 'refused')),
+  CONSTRAINT ezil_computer_lower_attestations_failure_check CHECK (failure_code IS NULL OR failure_code IN ('command_invalid', 'source_not_pinned',
+    'receipt_invalid', 'marker_mismatch', 'mount_not_readonly', 'identity_invalid', 'untrusted_ami', 'snapshot_lineage_mismatch', 'clone_lineage_mismatch',
+    'original_not_fenced', 'launch_tuple_invalid', 'release_mismatch', 'instance_provenance_missing', 'placement_changed', 'reservation_expired', 'operator_abandoned')),
+  CONSTRAINT ezil_computer_lower_attestations_hash_check CHECK (reserved_row_sha256 ~ '^[0-9a-f]{64}$' AND request_sha256 ~ '^[0-9a-f]{64}$'
+    AND challenge ~ '^[0-9a-f]{64}$' AND (evidence_sha256 IS NULL OR evidence_sha256 ~ '^[0-9a-f]{64}$')
+    AND (marker_sha256 IS NULL OR marker_sha256 ~ '^[0-9a-f]{64}$') AND (measured_digest IS NULL OR measured_digest ~ '^sha256:[0-9a-f]{64}$')),
+  CONSTRAINT ezil_computer_lower_attestations_sealed_check CHECK (
+    (phase = 'reserved' AND failure_code IS NULL AND completed_at IS NULL AND num_nonnulls(command_id, evidence, evidence_sha256, measured_digest,
+      measured_at, marker_sha256, snapshot_id, clone_volume_id, maintenance_instance_id, maintenance_ami_id, source_release) = 0)
+    OR (phase = 'adopted' AND failure_code IS NULL AND completed_at IS NOT NULL AND num_nulls(command_id, evidence, evidence_sha256, measured_digest,
+      measured_at, marker_sha256, snapshot_id, clone_volume_id, maintenance_instance_id, maintenance_ami_id, source_release) = 0)
+    OR (phase = 'refused' AND failure_code IS NOT NULL AND completed_at IS NOT NULL AND num_nonnulls(command_id, evidence, evidence_sha256, measured_digest,
+      measured_at, marker_sha256, snapshot_id, clone_volume_id, maintenance_instance_id, maintenance_ami_id, source_release) = 0)),
+  CONSTRAINT ezil_computer_lower_attestations_time_check CHECK (updated_at >= created_at
+    AND (completed_at IS NULL OR (completed_at >= created_at AND completed_at <= updated_at)))
+);
+CREATE UNIQUE INDEX ezil_computer_lower_attestations_reserved_idx ON public.ezil_computer_lower_attestations (computer_id) WHERE phase = 'reserved';
+CREATE INDEX ezil_computer_lower_attestations_computer_idx ON public.ezil_computer_lower_attestations (computer_id);
+CREATE FUNCTION public.ezil_computer_lower_attestations_guard() RETURNS trigger LANGUAGE plpgsql SET search_path = '' AS $guard$
+BEGIN
+  IF TG_OP IN ('DELETE', 'TRUNCATE') THEN RAISE EXCEPTION 'lower attestation audit rows are retained'; END IF;
+  IF OLD.phase <> 'reserved' THEN RAISE EXCEPTION 'sealed lower attestation is immutable'; END IF;
+  IF (NEW.attestation_id, NEW.computer_id, NEW.owner_user_id, NEW.region, NEW.zone_id, NEW.source_instance_id, NEW.source_volume_id, NEW.fs_uuid,
+      NEW.source_generation, NEW.source_lease_epoch, NEW.source_fence_token, NEW.reserved_row_sha256, NEW.request_sha256, NEW.challenge, NEW.created_at)
+     IS DISTINCT FROM (OLD.attestation_id, OLD.computer_id, OLD.owner_user_id, OLD.region, OLD.zone_id, OLD.source_instance_id, OLD.source_volume_id,
+      OLD.fs_uuid, OLD.source_generation, OLD.source_lease_epoch, OLD.source_fence_token, OLD.reserved_row_sha256, OLD.request_sha256, OLD.challenge,
+      OLD.created_at) THEN RAISE EXCEPTION 'lower attestation identity is immutable'; END IF;
+  RETURN NEW;
+END
+$guard$;
+CREATE TRIGGER ezil_computer_lower_attestations_guard BEFORE UPDATE OR DELETE ON public.ezil_computer_lower_attestations
+  FOR EACH ROW EXECUTE FUNCTION public.ezil_computer_lower_attestations_guard();
+CREATE TRIGGER ezil_computer_lower_attestations_retain BEFORE TRUNCATE ON public.ezil_computer_lower_attestations
+  FOR EACH STATEMENT EXECUTE FUNCTION public.ezil_computer_lower_attestations_guard();
+REVOKE ALL ON TABLE public.ezil_computer_lower_attestations FROM public, anon, authenticated, service_role;
+REVOKE ALL ON FUNCTION public.ezil_computer_lower_attestations_guard() FROM public, anon, authenticated, service_role;
+ALTER TABLE public.ezil_computer_lower_attestations ENABLE ROW LEVEL SECURITY;
