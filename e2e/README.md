@@ -18,9 +18,17 @@ Browser-free validation: `node --check e2e/live-check.mjs` and `node --test e2e/
 
 ## Signing in without the UI
 
-`/login` offers only "Continue with EZiL ID" (Auth0), which automation cannot drive, so every hosted harness signs in through `e2e/sign-in.mjs` instead. It performs the Supabase Auth password grant for `EZIL_E2E_EMAIL` (`POST $NEXT_PUBLIC_SUPABASE_URL/auth/v1/token?grant_type=password` with the anon key), writes the session into the browser context as the app's Supabase SSR auth cookie exactly as `@supabase/ssr` would (`__Host-ezil-os-auth`, split into `.0`, `.1`, … chunks when large, on HTTPS; `sb-<ref>-auth-token` on loopback HTTP), then loads the destination and fails if it lands on `/login`.
+`/login` offers only "Continue with EZiL ID" (Auth0). Most hosted harnesses skip that UI and sign in through `e2e/sign-in.mjs`; `prod-journeys.mjs` can drive the UI instead (next section). It performs the Supabase Auth password grant for `EZIL_E2E_EMAIL` (`POST $NEXT_PUBLIC_SUPABASE_URL/auth/v1/token?grant_type=password` with the anon key), writes the session into the browser context as the app's Supabase SSR auth cookie exactly as `@supabase/ssr` would (`__Host-ezil-os-auth`, split into `.0`, `.1`, … chunks when large, on HTTPS; `sb-<ref>-auth-token` on loopback HTTP), then loads the destination and fails if it lands on `/login`.
 
 `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY` are the target app's own public values (the anon key ships in every browser bundle). The test account needs an email/password identity on that Supabase project, and the project must allow the password grant. Failures are fixed messages (`refused (HTTP <status> <code>)`, `request failed`, `cookie was not accepted`, `did not reach its destination`) that never include credentials, cookies or tokens. Browser-free validation: `node --test e2e/sign-in.test.mjs`; its `@supabase/ssr` parity case runs where the app's dependencies are installed.
+
+## Signing in through EZiL ID (the login UI)
+
+`e2e/sign-in-ezilid.mjs` signs in the way a user does: `/login?returnUrl=/os` → **Continue with EZiL ID** → Auth0 Universal Login on `id.ezil.work` → `/auth/auth0/callback` → `/os`. It handles the tenant's identifier-first flow (email, then password), a combined form and a consent screen, always clicking the primary **Continue** (never "Continue with Google"). This path runs the app's Auth0 bridge, which creates the Supabase user on first sign-in and enrolls it in EZiL AI (`{"event":"ai-enroll","source":"auth0"}`). A user created directly in Supabase gets no AI account, so the `ezil-ai` journey needs this sign-in.
+
+The account is an Auth0 user on the `Username-Password-Authentication` connection with `email_verified: true` (the callback refuses an unverified address with `email_unverified`). Credentials are typed only on the HTTPS EZiL ID origin; any other host fails before anything is typed. Failures are fixed messages built only from allowlisted tokens: `refused by the app (<code>)` from `/login?error=<code>`, `refused the sign-in at the password screen (wrong_credentials | too_many_attempts | blocked | challenge | …)` from Auth0's alert (its text is never reported), `asked for a second factor (MFA)`, `unexpected screen (<name>)`, `unexpected host (<host>)`, `did not move on from the <screen>`, `timed out at the <screen>`. If a step fails on an EZiL ID screen, the screenshot masks the address.
+
+Browser-free validation: `node --test e2e/sign-in-ezilid.test.mjs`. With `PLAYWRIGHT_REQUIRE_DIR` set, one more test drives the whole flow in Chromium against routed fakes of `/login`, the identifier and password screens and the callback. These use reserved `.invalid` hosts behind a resolver that refuses every name, so nothing reaches a real host. A fulfilled 302 into a real host was measured escaping interception.
 
 ## Production user journeys
 
@@ -37,11 +45,20 @@ NEXT_PUBLIC_SUPABASE_URL=… NEXT_PUBLIC_SUPABASE_ANON_KEY=… PLAYWRIGHT_REQUIR
 EZIL_E2E_JOURNEYS=free-open-apps,feedback-diagnostics,billing-view node e2e/prod-journeys.mjs
 ```
 
+Through the real login UI with an EZiL ID account, checking EZiL AI in Code:
+
+```sh
+EZIL_E2E_APP=https://os-prod.ezil.work EZIL_E2E_SIGNIN=ezilid EZIL_E2E_EMAIL=… EZIL_E2E_PASSWORD=… \
+PLAYWRIGHT_REQUIRE_DIR=/path/with/playwright EZIL_E2E_JOURNEYS=ezil-ai node e2e/prod-journeys.mjs
+```
+
 | Variable | Meaning |
 | --- | --- |
 | `EZIL_E2E_APP` | Required, an HTTPS origin. There is no default: a run never lands on a host you did not name. |
-| `EZIL_E2E_EMAIL`, `EZIL_E2E_PASSWORD`, `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `PLAYWRIGHT_REQUIRE_DIR` | Required; sign-in is `e2e/sign-in.mjs` (see below). |
-| `EZIL_E2E_JOURNEYS` | Comma list of `free-open-apps`, `paid-aws-computer`, `feedback-diagnostics`, `billing-view`. Default: all but `paid-aws-computer`. Unknown names are an error. |
+| `EZIL_E2E_EMAIL`, `EZIL_E2E_PASSWORD`, `PLAYWRIGHT_REQUIRE_DIR` | Required. |
+| `EZIL_E2E_SIGNIN` | `supabase` (default): `e2e/sign-in.mjs`, which also requires `NEXT_PUBLIC_SUPABASE_URL` and `NEXT_PUBLIC_SUPABASE_ANON_KEY`. `ezilid`: `e2e/sign-in-ezilid.mjs`, the real login UI, with no Supabase inputs. |
+| `EZIL_E2E_JOURNEYS` | Comma list of `free-open-apps`, `ezil-ai`, `paid-aws-computer`, `feedback-diagnostics`, `billing-view`. Default: all but `paid-aws-computer` and `ezil-ai`. Unknown names are an error. |
+| `EZIL_E2E_AI_REPLY_TIMEOUT_MS` | `ezil-ai`: how long to wait for the chat reply (default 120000). |
 | `EZIL_E2E_OUT` | Evidence directory (default `<tmpdir>/ezil-prod-journeys`): `prod-journeys.json`, rewritten after every step, plus `<journey>-<step>.png`. |
 | `EZIL_E2E_APP_TIMEOUT_MS` | Code or Browser ready, per app (default 240000). |
 | `EZIL_E2E_AWS_TIMEOUT_MS`, `EZIL_E2E_AWS_WAKE_TIMEOUT_MS`, `EZIL_E2E_AWS_STOPPED_TIMEOUT_MS` | First-boot desktop (default 900000), wake (600000), and wait for `STOPPED` (300000). |
@@ -60,6 +77,7 @@ Journeys, in this order (each step is `{name, ok, ms, error?}`; time-to-ready is
 - `paid-aws-computer`: a paid account only. Checks `billing.summary` is not Free and that no other computer of the account already runs on AWS (the server refuses a second one), creates a **new** computer, makes it the shell's current computer, opens the Browser and waits for pixels (`timeToDesktopMs`), asserts `computer.progress` shows an EC2 placement, opens Code, stops it and waits for `STOPPED`, wakes it through the Browser and waits for pixels again, then stops it. The final stop runs even after a failure and prints the computer id (`{"event":"computer", …}`).
 - `feedback-diagnostics`: Settings → Feedback → send `[QA automated] …` with diagnostics, assert a 2xx and report what the request carried: field names only, whether `traceId` (the correlation id) and server error codes (`api_failure` events) were present. The description is never recorded.
 - `billing-view`: Settings → Billing, read only (no checkout, no `upgrade=` link): plan, AI credits, computer-time allowance, storage as the user sees them.
+- `ezil-ai` (opt-in: it spends a few AI credits and needs an account enrolled in EZiL AI, i.e. `EZIL_E2E_SIGNIN=ezilid`): opens **Code** and reads the status-bar item `EZiL AI · …` (`.statusbar-item[id$="ezil-models.aiStatus"]`), waiting while it says `Loading…`, then clicks it and reads its quick pick (`Available credits: …`, limits, `Recent usage …`). It passes only on a non-zero credit balance. `Credits unavailable` (how `os_ai_unavailable`, a timeout or a network error shows there), an attention label such as `Sign-in needed`, or `0 credits` fails it with the reason. The step is soft, so the chat still runs. It then sends `Reply with the single word: pong` in the Chat view with the default model and waits for a settled, non-error reply. Error copy is mapped back to its code (`EZiL OS could not reach EZiL AI` → `os_ai_unavailable`, `not available here yet` → `os_session_missing`, `Not enough AI credits` → `insufficient_credits`, …). Evidence: `ai.statusText`, `ai.status`, `ai.quickPick` (balance, entitlement, pause line, usage row COUNT), `chat.model`, `chat.modelIsDefault`, `chat.replyMs`, `chat.replyLength`, `chat.replyPreview` (40 characters) and `ezil-ai-chat-reply.png`. The extension's Gateway calls run on the computer, not in this browser, so the rendered copy is the only evidence. Both classifiers are pinned to the extension's source in the unit tests.
 
 Exit 0 when every selected journey passed, 1 when one failed, 2 when the inputs are unusable. A hard deadline (the sum of the selected journeys' budgets, plus the final-stop reserve) writes the report and exits 1.
 
@@ -71,5 +89,6 @@ Safety:
 - `free-open-apps` wakes whatever computer the account signs in to, so on a paid account it wakes the AWS computer and leaves it running until it idles out. Code and Browser are measured independently: a failed Code does not skip Browser, and in the paid journey a failed Code does not skip the stop and wake checks.
 - `PLAYWRIGHT_REQUIRE_DIR` must hold a Playwright whose browser is installed (`chromium_headless_shell` for the headless launch); otherwise every journey fails at `browser-launch`.
 - Nothing credential-like is printed or saved: emails are masked as `q***@domain`, and tokens, bearer values, auth cookies, the password and the anon key are scrubbed from every log line and report.
+- The EZiL ID QA account `ezil-os/production/e2e-qa-ezilid-003` (AWS Secrets Manager, `ap-south-1`; keys `email`, `password`, `auth0_user_id`) is for these runs. Load it into the environment without printing it, for example `export EZIL_E2E_EMAIL=$(aws … --query SecretString --output text | jq -r .email)` and the same for `.password`.
 
 Browser-free validation: `node --check e2e/prod-journeys.mjs` and `node --test e2e/prod-journeys.test.mjs`. With `PLAYWRIGHT_REQUIRE_DIR` set, extra tests drive the in-page overlay detection and the dock reveal in Chromium over markup mirroring the shell's (still offline); without it they are skipped.

@@ -18,6 +18,7 @@ import { awaitContainerRollout } from './await-container-rollout.mjs';
 import http from 'node:http';
 import { deployedTarget, configureAppContext, APP_FETCH_TIMEOUT_MS, APP_STOP_FETCH_TIMEOUT_MS, appFetchTimeout, appRequest } from './deployed-target.mjs';
 import './sign-in.test.mjs';
+import './sign-in-ezilid.test.mjs';
 import './code-picker.test.mjs';
 import { assertVercelDeployment, assertWorkerDeployment, verifyCloudDeployment } from './verify-cloud-deployment.mjs';
 import { outline, parseWorkflow } from '../.github/scripts/env-contract.mjs';
