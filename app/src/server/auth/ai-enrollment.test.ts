@@ -361,13 +361,13 @@ describe('AI enrollment with a bounded owned connection', () => {
         expect(logLines()).toEqual(refused('enroll', 'unknown_refusal'));
     });
 
-    it('queues the existing Free 100 receipt after both role scope and enrollment transaction end', async () => {
+    it('queues the Free 10 receipt (same v1 identity) after both role scope and enrollment transaction end', async () => {
         await enrollAiMember(userId, sub);
         expect([...receipts.values()]).toEqual([{
             userId, eventKey: `ezil-os:v1:free-once:${userId}:grant`, kind: 'ai_grant', payload: {
                 protocol: 'ezil-ai-credits-v1', policyVersion: 1, invoiceId: null,
                 entitlementId: `ezil-os:v1:free-once:${userId}`, eventId: `ezil-os:v1:free-once:${userId}:grant`,
-                action: 'grant', credits: 100, expiresAt: '2027-10-26T00:00:00.000Z',
+                action: 'grant', credits: 10, expiresAt: '2027-10-26T00:00:00.000Z',
             },
         }]);
         expect(effects.map(effect => effect.kind)).toEqual(['enrollment', 'kick', 'receipt']);

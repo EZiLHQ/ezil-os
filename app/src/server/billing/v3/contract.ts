@@ -123,7 +123,7 @@ export const CATALOG_V3: Readonly<Record<PlanSkuV3, PlanOfferV3>> = Object.freez
         size: 'free-cf', provider: 'cloudflare', vcpu: 2, memoryGiB: 6,
         sessionMaxSeconds: 1 * H, opening: 'standard', poolPriority: 0,
         fairUseSeconds: 5 * H, legacyFairUseSeconds: 8 * H,
-        highlighted: false, badge: null, machineChoice: ['free-cf'], aiCredits: { amount: 100, per: 'once' },
+        highlighted: false, badge: null, machineChoice: ['free-cf'], aiCredits: { amount: 10, per: 'once' },
         bullets: ['A real desktop in your browser', 'VS Code and a browser built in', '2 vCPU · 6 GB computer', 'Sessions up to 1 hour'],
         storageGiB: null,
     },
