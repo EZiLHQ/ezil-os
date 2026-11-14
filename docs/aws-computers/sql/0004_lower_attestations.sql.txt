@@ -5,6 +5,7 @@ CREATE TABLE public.ezil_computer_lower_attestations (
   region text NOT NULL,
   zone_id text NOT NULL,
   source_instance_id text NOT NULL,
+  current_instance_id text NULL,
   source_volume_id text NOT NULL,
   fs_uuid uuid NOT NULL,
   source_generation bigint NOT NULL,
@@ -53,11 +54,12 @@ CREATE FUNCTION public.ezil_computer_lower_attestations_guard() RETURNS trigger 
 BEGIN
   IF TG_OP IN ('DELETE', 'TRUNCATE') THEN RAISE EXCEPTION 'lower attestation audit rows are retained'; END IF;
   IF OLD.phase <> 'reserved' THEN RAISE EXCEPTION 'sealed lower attestation is immutable'; END IF;
-  IF (NEW.attestation_id, NEW.computer_id, NEW.owner_user_id, NEW.region, NEW.zone_id, NEW.source_instance_id, NEW.source_volume_id, NEW.fs_uuid,
-      NEW.source_generation, NEW.source_lease_epoch, NEW.source_fence_token, NEW.reserved_row_sha256, NEW.request_sha256, NEW.challenge, NEW.created_at)
-     IS DISTINCT FROM (OLD.attestation_id, OLD.computer_id, OLD.owner_user_id, OLD.region, OLD.zone_id, OLD.source_instance_id, OLD.source_volume_id,
-      OLD.fs_uuid, OLD.source_generation, OLD.source_lease_epoch, OLD.source_fence_token, OLD.reserved_row_sha256, OLD.request_sha256, OLD.challenge,
-      OLD.created_at) THEN RAISE EXCEPTION 'lower attestation identity is immutable'; END IF;
+  IF (NEW.attestation_id, NEW.computer_id, NEW.owner_user_id, NEW.region, NEW.zone_id, NEW.source_instance_id, NEW.current_instance_id,
+      NEW.source_volume_id, NEW.fs_uuid, NEW.source_generation, NEW.source_lease_epoch, NEW.source_fence_token, NEW.reserved_row_sha256,
+      NEW.request_sha256, NEW.challenge, NEW.created_at)
+     IS DISTINCT FROM (OLD.attestation_id, OLD.computer_id, OLD.owner_user_id, OLD.region, OLD.zone_id, OLD.source_instance_id,
+      OLD.current_instance_id, OLD.source_volume_id, OLD.fs_uuid, OLD.source_generation, OLD.source_lease_epoch, OLD.source_fence_token,
+      OLD.reserved_row_sha256, OLD.request_sha256, OLD.challenge, OLD.created_at) THEN RAISE EXCEPTION 'lower attestation identity is immutable'; END IF;
   RETURN NEW;
 END
 $guard$;

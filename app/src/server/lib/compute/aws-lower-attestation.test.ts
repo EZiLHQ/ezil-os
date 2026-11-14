@@ -1,20 +1,29 @@
 /** NULL-lower attestation proofs: every binding refuses on its own; the lower is measured, never inferred. */
 import { describe, expect, it } from 'vitest';
 import { buildAttestCommand, launchTupleOf, LowerAttestationReceiptSchema, LowerAttestationRefusal, parseAttestCommand, parseLowerAttestationRow,
-    verifyLowerAttestation, type LowerAttestationObservations } from './aws-lower-attestation';
-import { ALIAS_RELEASE, CERT, CLONE, cloudTrail, COMMAND_ID, commandInput, CREATED, DEPLOYMENT, MAINTENANCE, MARKER, MEASURED, NOW, observations, PINNED,
-    placement, receipt, registryEntry, reserved, RESERVE, SNAPSHOT, SOURCE_RELEASE, TARGET_RELEASE } from './aws-lower-attestation.test-support';
+    verifyLowerAttestation, type InstanceProvenance, type LowerAttestationObservations } from './aws-lower-attestation';
+import { ALIAS_RELEASE, CERT, CLONE, cloudTrail, COMMAND_ID, commandInput, CREATED, DEPLOYMENT, DOCUMENT_HASH, MAINTENANCE, MARKER, MEASURED, NOW, observations,
+    PINNED, placement, receipt, registryEntry, reserved, RESERVE, SNAPSHOT, SOURCE_RELEASE, TARGET_RELEASE } from './aws-lower-attestation.test-support';
 
 const LEGACY_MARKER = (({ instanceId: _i, ...m }) => m)(MARKER);
+const OTHER = 'i-77777777777777777';
 const base = observations();
 const withCommand = (over: Partial<NonNullable<LowerAttestationObservations['command']>>) => observations({ command: { ...base.command!, ...over } });
+const withDocument = (over: Partial<NonNullable<LowerAttestationObservations['document']>>) => observations({ document: { ...base.document!, ...over } });
 const withInvocation = (over: Partial<NonNullable<LowerAttestationObservations['invocation']>>) => observations({ invocation: { ...base.invocation!, ...over } });
-/** `receipt` is what the invocation printed and `event` what CloudTrail returned: both read from AWS, never relayed. */
+const closed = (instanceId: string) => ({ instanceId, closed: true, tied: false });
+/**
+ * `receipt` is what the invocation printed and `event` what CloudTrail returned: both read from AWS, never relayed.
+ * `released`: the placement's current instance_id is NULL (frozen NULL at reserve). `pool`: the retired claim row's instance.
+ */
 const prove = (o: { receipt?: string; event?: string; obs?: LowerAttestationObservations; registry?: unknown; cert?: string | null; pin?: string | null;
-    a?: ReturnType<typeof reserved>; now?: Date; usage?: string | null; p?: ReturnType<typeof placement> } = {}) => {
+    doc?: string | null; a?: ReturnType<typeof reserved>; now?: Date; released?: boolean; pool?: string | null; usage?: InstanceProvenance['usage'];
+    p?: ReturnType<typeof placement> } = {}) => {
     const obs = o.obs ?? observations({}, (o.receipt ?? receipt()) + '\n');
-    return verifyLowerAttestation(o.a ?? reserved(), o.p ?? placement(), COMMAND_ID, o.event ? { ...obs, runInstances: [o.event] } : obs,
-        o.registry ?? registryEntry(), o.cert === undefined ? CERT : o.cert, o.pin === undefined ? PINNED : o.pin, o.now ?? NOW, { usageInstanceId: o.usage ?? null });
+    return verifyLowerAttestation(o.a ?? reserved(o.released ? { currentInstanceId: null } : {}), o.p ?? placement(o.released ? { instanceId: null } : {}),
+        COMMAND_ID, o.event ? { ...obs, runInstances: [o.event] } : obs, o.registry ?? registryEntry(), o.cert === undefined ? CERT : o.cert,
+        { sourceSha256: o.pin === undefined ? PINNED : o.pin, documentSha256: o.doc === undefined ? DOCUMENT_HASH : o.doc }, o.now ?? NOW,
+        { poolInstanceId: o.pool ?? null, usage: o.usage ?? null });
 };
 const refusal = (fn: () => unknown) => {
     try { fn(); } catch (error) { if (error instanceof LowerAttestationRefusal) return error.code; throw error; }
@@ -41,6 +50,15 @@ describe('verifyLowerAttestation', () => {
         ['source_not_pinned', () => prove({ pin: 'f'.repeat(64) })],
         // The host-side check line names the pin, but the delivered bytes are something else.
         ['source_not_pinned', () => prove({ obs: withCommand({ commands: buildAttestCommand(commandInput({ sourceBase64: Buffer.from('import os\n').toString('base64') })) }) })],
+        ['source_not_pinned', () => prove({ doc: null })],
+        // Exact AWS document: AWS's own, the explicit version the command ran, the reviewed hash; never `$DEFAULT` or a look-alike.
+        ['command_invalid', () => prove({ doc: 'f'.repeat(64) })],
+        ['command_invalid', () => prove({ obs: observations({ document: null }) })],
+        ['command_invalid', () => prove({ obs: withDocument({ owner: '123456789012' }) })],
+        ['command_invalid', () => prove({ obs: withDocument({ documentVersion: '2' }) })],
+        ['command_invalid', () => prove({ obs: withDocument({ status: 'Updating' }) })],
+        ['command_invalid', () => prove({ obs: withDocument({ hashType: 'Sha1' }) })],
+        ['command_invalid', () => prove({ obs: observations({ command: { ...base.command!, documentVersion: '$DEFAULT' }, document: { ...base.document!, documentVersion: '$DEFAULT' } }) })],
         ['command_invalid', () => prove({ obs: observations({ command: null }) })],
         ['command_invalid', () => prove({ obs: withCommand({ commandId: '0c0c0c0c-0c0c-4c0c-8c0c-0c0c0c0c0c0c' }) })],
         ['command_invalid', () => prove({ obs: withCommand({ documentName: 'AWS-RunPowerShellScript' }) })],
@@ -83,9 +101,24 @@ describe('verifyLowerAttestation', () => {
         ['marker_mismatch', () => prove({ receipt: receipt({}, { ...MARKER, generation: 0 }) })],
         ['marker_mismatch', () => prove({ receipt: receipt({}, { ...MARKER, leaseEpoch: 4 }) })],
         ['marker_mismatch', () => prove({ receipt: receipt({}, { ...MARKER, instanceId: 'i-77777777777777777' }) })],
+        // A marker without instanceId needs the complete historical binding (the retired claim row of exactly this allocation).
         ['instance_provenance_missing', () => prove({ receipt: receipt({}, LEGACY_MARKER) })],
-        ['instance_provenance_missing', () => prove({ receipt: receipt({}, LEGACY_MARKER), usage: 'i-77777777777777777' })],
-        ['marker_mismatch', () => prove({ receipt: receipt({}, LEGACY_MARKER), usage: 'i-77777777777777777', p: placement({ instanceId: 'i-77777777777777777' }) })],
+        ['instance_provenance_missing', () => prove({ receipt: receipt({}, LEGACY_MARKER), usage: closed(RESERVE.sourceInstanceId) })],  // usage alone never binds
+        ['instance_provenance_missing', () => prove({ receipt: receipt({}, LEGACY_MARKER), pool: OTHER })],
+        // The current instance is frozen at reserve; drift or another instance refuses.
+        ['instance_provenance_missing', () => prove({ p: placement({ instanceId: OTHER }) })],
+        ['instance_provenance_missing', () => prove({ a: reserved({ currentInstanceId: OTHER }), p: placement({ instanceId: OTHER }), pool: RESERVE.sourceInstanceId })],
+        // Released placement (current NULL): only the claim row can name the source, never the request or usage alone.
+        ['instance_provenance_missing', () => prove({ released: true })],
+        ['instance_provenance_missing', () => prove({ released: true, usage: closed(RESERVE.sourceInstanceId) })],
+        ['instance_provenance_missing', () => prove({ released: true, pool: OTHER })],
+        ['instance_provenance_missing', () => prove({ released: true, receipt: receipt({}, LEGACY_MARKER), pool: OTHER })],
+        ['instance_provenance_missing', () => prove({ released: true, pool: RESERVE.sourceInstanceId, p: placement({ instanceId: RESERVE.sourceInstanceId }) })],
+        // Conflicting lineage: the usage ledger may only corroborate.
+        ['instance_provenance_missing', () => prove({ released: true, pool: RESERVE.sourceInstanceId, usage: closed(OTHER) })],
+        ['instance_provenance_missing', () => prove({ released: true, pool: RESERVE.sourceInstanceId, usage: { instanceId: RESERVE.sourceInstanceId, closed: false, tied: false } })],
+        ['instance_provenance_missing', () => prove({ released: true, pool: RESERVE.sourceInstanceId, usage: { instanceId: RESERVE.sourceInstanceId, closed: true, tied: true } })],
+        ['instance_provenance_missing', () => prove({ usage: closed(OTHER) })],
         ['marker_mismatch', () => prove({ receipt: receipt({ lowerImageDigest: TARGET_RELEASE.lowerImageDigest }) })],
         ['identity_invalid', () => prove({ receipt: receipt({ identityDocument: '{"instanceId":"i-22222222222222222"}' }) })],
         ['identity_invalid', () => prove({ cert: null })],
@@ -124,10 +157,18 @@ describe('verifyLowerAttestation', () => {
         expect(prove({ receipt: receipt({}, { ...MARKER, leaseEpoch: 2 }) }).measuredDigest).toBe(MEASURED);
     });
 
-    it('binds a marker without instanceId only through the closed usage session of the launched instance', () => {
-        const proof = prove({ receipt: receipt({}, LEGACY_MARKER), usage: RESERVE.sourceInstanceId });
+    it('adopts a released placement (current NULL) whose retired claim row names the launched instance, with or without usage corroboration', () => {
+        const proof = prove({ released: true, pool: RESERVE.sourceInstanceId });
         expect(proof.measuredDigest).toBe(MEASURED);
-        expect(proof.evidence).toMatchObject({ instanceProvenance: 'usage-ledger' });
+        expect(proof.evidence).toMatchObject({ placementInstance: 'released', poolClaimNamesSource: true, usageLedger: 'none', instanceProvenance: 'marker' });
+        expect(prove({ released: true, pool: RESERVE.sourceInstanceId, usage: closed(RESERVE.sourceInstanceId) }).evidence).toMatchObject({ usageLedger: 'corroborates' });
+    });
+
+    it('adopts released + current NULL + marker without instanceId only through the complete claim-row binding', () => {
+        const proof = prove({ released: true, pool: RESERVE.sourceInstanceId, receipt: receipt({}, LEGACY_MARKER) });
+        expect(proof.measuredDigest).toBe(MEASURED);
+        expect(proof.evidence).toMatchObject({ placementInstance: 'released', instanceProvenance: 'pool-claim' });
+        expect(prove({ receipt: receipt({}, LEGACY_MARKER), pool: RESERVE.sourceInstanceId }).evidence).toMatchObject({ placementInstance: 'current', instanceProvenance: 'pool-claim' });
         expect(prove().evidence).toMatchObject({ instanceProvenance: 'marker' });
     });
 
@@ -159,7 +200,7 @@ describe('row and receipt shapes', () => {
         const row = (a: ReturnType<typeof reserved>) => Object.fromEntries(Object.entries({ attestation_id: a.attestationId, computer_id: a.computerId,
             owner_user_id: a.ownerUserId, region: a.region, zone_id: a.zoneId, source_instance_id: a.sourceInstanceId, source_volume_id: a.sourceVolumeId,
             fs_uuid: a.fsUuid, source_generation: '3', source_lease_epoch: '7', source_fence_token: a.sourceFenceToken, reserved_row_sha256: a.reservedRowSha256,
-            request_sha256: a.requestSha256, challenge: a.challenge, command_id: a.commandId, phase: a.phase, evidence: a.evidence, evidence_sha256: a.evidenceSha256, measured_digest: a.measuredDigest,
+            request_sha256: a.requestSha256, challenge: a.challenge, command_id: a.commandId, current_instance_id: a.currentInstanceId, phase: a.phase, evidence: a.evidence, evidence_sha256: a.evidenceSha256, measured_digest: a.measuredDigest,
             measured_at: a.measuredAt, marker_sha256: a.markerSha256, snapshot_id: a.snapshotId, clone_volume_id: a.cloneVolumeId,
             maintenance_instance_id: a.maintenanceInstanceId, maintenance_ami_id: a.maintenanceAmiId, source_release: a.sourceRelease,
             failure_code: a.failureCode, created_at: new Date(a.createdAt), updated_at: new Date(a.updatedAt), completed_at: a.completedAt }));
