@@ -9,7 +9,7 @@ import { openConfirmSheet } from '../sheet-frame.js';
 import { billingRecoveryAction, openTopupSheet, topupOffer } from '../topup-sheet.js';
 import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines, heldClosedSize, heldClosedText,
     accountCredits, accountDetailsHtml, staleCreditsCopy, paidComputeUnmetered, TRIAL_SKU, trialOfferOf, trialIneligibleCopy, planTrialOf, trialAmount,
-    trialDayLabel, trialMomentLabel } from '../billing-format.js';
+    trialDayLabel, trialMomentLabel, withCouponView, couponFromSearch, offerOf } from '../billing-format.js';
 import { settingsAliasSearch } from '../../../app-link.js';
 
 const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
@@ -698,6 +698,14 @@ function topupV3 (summary) {
         <div class="ezil-billing-actions">${actionHtml('topup', 'Add credits')}</div></section>`;
 }
 
+/** What the promoter link on this address means for this viewer, in one quiet line (`withCouponView`). */
+function couponNoticeHtml (summary) {
+    const view = summary.couponView;
+    if ( ! view ) return '';
+    const retry = view.retry ? ' <button type="button" class="ezil-settings-btn" data-action="coupon-retry">Try again</button>' : '';
+    return `<p class="ezil-billing-note ezil-billing-coupon" data-role="coupon-notice" data-state="${encode(view.state)}" role="status">${encode(view.copy)}${retry}</p>`;
+}
+
 /** `options`: `userId` (the signed-in user) and `lastAccount`, that user's last readable `ai.account` (kept across reloads of this pane). */
 export function summaryV3Html (summary, usage = null, options = {}) {
     const { plan, actions } = summary;
@@ -706,6 +714,7 @@ export function summaryV3Html (summary, usage = null, options = {}) {
         ${actions.portal ? `<div class="ezil-billing-actions">${linkAction('portal', 'Manage payment')}</div>` : ''}</header>
         ${banner?.html ?? ''}
         ${couponOfferHtml(summary, options.couponEntry)}
+        ${couponNoticeHtml(summary)}
         ${currentPlanV3(summary, banner)}
         ${usageCardV3(summary, usage, options)}
         ${plansV3(summary)}
@@ -784,6 +793,22 @@ function startCountdown ($win, state) {
     state.timer = setInterval(update, 30000);
 }
 
+/** The availability read's verdict (see `withCouponView`): every refusal or failure says which; none enables a CTA. */
+function couponStatus (result, alias) {
+    // Only the server's own `available && eligible` for this person and this offer enables a free month, with a real
+    // fingerprint; a missing or false flag is not available. An alias must come back as that alias. With no alias, Stage's
+    // server may select an invite from its HttpOnly carrier: that exact offer is what is shown, quoted and echoed.
+    if ( result?.ok === true ) {
+        const { available, eligible } = result.data ?? {};
+        const offer = offerOf(result.data?.offer);
+        // With no alias the offer is the public one (no coupon) or the server's own invite selection (`source: 'sponsor'`).
+        const asked = alias === null ? offer && (offer.coupon === null || offer.source === 'sponsor') : offer?.coupon === alias;
+        return available === true && eligible === true && asked ? { status: 'available', offer } : { status: 'error' };
+    }
+    return { status: { trial_offer_invalid: 'invalid', trial_offer_unavailable: 'unavailable', trial_unavailable: 'refused',
+        trial_quote_stale: 'stale' }[result?.message] ?? 'error' };
+}
+
 async function load ($win, state) {
     if ( state.loading || state.pending || state.sheet || state.closed ) return;
     stopCountdown(state);
@@ -794,6 +819,14 @@ async function load ($win, state) {
     const $body = $win.find('[data-role="billing-body"]');
     $body.attr('aria-busy', 'true').html(loadingHtml());
     const history = trpc.query('billing.history').catch(() => ({ ok: false }));
+    // The free month, public or from a promoter link, is promised only if the server's read-only availability check
+    // (`billing.trialOffer`, which claims nothing) says so. It runs beside the summary; the alias is the link's, if any.
+    const kept = state.coupon ?? null;
+    const link = kept ?? { alias: null };
+    const alias = link.alias ?? null;
+    const startUser = state.userId;
+    const availability = link.invalid ? null : trpc.query('billing.trialOffer', alias ? { coupon: alias } : {})
+        .then(result => couponStatus(result, alias), () => ({ status: 'error' }));
     try {
         const result = await trpc.query('billing.summary');
         if ( request !== state.request || ! state.active || state.closed || ! $win.get(0).isConnected ) return;
@@ -808,8 +841,17 @@ async function load ($win, state) {
                 throw new Error('summary for another user');
             }
             if ( accountCredits(account, { userId }) !== null ) state.lastAccount = account;
-            $body.html(result.data.version === 3 ? summaryV3Html(result.data, null, { lastAccount: state.lastAccount, userId, couponEntry: state.couponEntry }) : summaryHtml(result.data));
-            state.summary = result.data;
+            let view = result.data;
+            if ( result.data.version === 3 ) {
+                const read = availability ? await availability : { status: 'invalid' };
+                // Across that await the window, the signed-in user or the link may have changed: drop this answer.
+                if ( request !== state.request || ! state.active || state.closed || ! $win.get(0).isConnected
+                    || state.userId !== startUser || (state.coupon ?? null) !== kept ) return;
+                view = withCouponView(result.data, { alias, status: read.status, offer: read.offer, invalid: link.invalid === true,
+                    hinted: ! alias && !! state.couponEntry });
+            }
+            $body.html(result.data.version === 3 ? summaryV3Html(view, null, { lastAccount: state.lastAccount, userId, couponEntry: state.couponEntry }) : summaryHtml(result.data));
+            state.summary = view;
             state.loadedAt = Date.now();
             startCountdown($win, state);
             if ( result.data.version === 3 ) void loadUsage($win, state, request);
@@ -991,7 +1033,11 @@ function openSheet ($win, state, action, sku, intent = null) {
             upgrade: choice => openSheet($win, state, choice.action, choice.sku) })
             : action === 'topup-checkout' ? upgradeSheetOpener({ ...options, sku: pack.sku, pack, userId: state.userId,
                 onCancel: () => actionStatus($win, 'Checkout closed before payment finished. If you did pay, your credits appear here once the payment is confirmed.') })
-            : action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes, ...(trial ? { trial: true } : {}) })
+            // The trial quotes with the same input the availability read used (the link's alias, or none for the public
+            // offer or the server's carrier) and must come back as the exact offer that read showed.
+            : action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes, ...(trial ? { trial: true,
+                ...(typeof summary.trialOffer?.request === 'string' ? { coupon: summary.trialOffer.request } : {}),
+                ...(summary.trialOffer?.offer ? { trialOffer: summary.trialOffer.offer } : {}) } : {}) })
             : sheetOpeners[action]({ ...options, summary });
         // The v1 checkout sheet predates onClose. New billing sheets use the callback.
         const checkoutRoot = action === 'checkout' && container.ownerDocument.querySelector('[data-role="upgrade-sheet"]');
@@ -1116,7 +1162,7 @@ export default {
         $pane.on('click', 'button[data-action]', function () {
             if ( this.disabled ) return;
             const action = this.dataset.action;
-            if ( action === 'retry' ) void load($win, state);
+            if ( action === 'retry' || action === 'coupon-retry' ) void load($win, state);
             else if ( action === 'invoices' ) {
                 const heading = $pane.find('[data-role="invoices"] h3').get(0);
                 heading?.scrollIntoView?.({ block: 'start' });
@@ -1159,10 +1205,17 @@ export default {
         if ( state ) {
             state.active = true;
             state.openUpgrade ||= ctx.openUpgrade;
+            // The promoter link the address carried (`parseBillingDeepLink`). A different link replaces the kept one.
+            const next = ctx.couponAlias || ctx.couponInvalid ? { alias: ctx.couponAlias ?? null, ...(ctx.couponInvalid ? { invalid: true } : {}) } : null;
+            const linkChanged = !! next && (next.alias ?? null) !== (state.coupon?.alias ?? null) || !! next && !! next.invalid !== !! state.coupon?.invalid;
+            if ( linkChanged ) state.coupon = next;
             // The signed-in user the kept AI balance belongs to; another user's is dropped, never shown.
             const userId = ctx?.payload?.user?.id ?? bootPayload()?.user?.id ?? null;
-            if ( userId !== state.userId ) state.lastAccount = null;
+            const userChanged = userId !== state.userId;
+            if ( userChanged ) state.lastAccount = null;
             state.userId = userId;
+            // An answer still in flight for the previous user or link must not land: supersede it and read again.
+            if ( (userChanged || linkChanged) && state.loading ) { state.request++; state.loading = false; }
             // `/app/settings?tab=billing` is the same link as `/os?settings=billing`
             // (docs/APP-ROUTES.md); read both through the boot's own spelling.
             const params = new URLSearchParams(settingsAliasSearch(window.location));

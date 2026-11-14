@@ -795,6 +795,25 @@ test('deep-link parsing consumes only billing intent and preserves other paramet
     assert.equal(parse('?settings=%62illing&upgrade=%70ro').openUpgrade, true);
 });
 
+test('promoter-link parsing carries one canonical alias, keeps it in the address bar, and marks a repeated or malformed one invalid', async h => {
+    const parse = search => JSON.parse(JSON.stringify(h.window.sheetApi.parseBillingDeepLink(search)));
+    assert.deepEqual(parse('?settings=billing&coupon=MidHun&view=files'), { initialTab: 'billing', openUpgrade: false, search: '?coupon=MidHun&view=files', couponAlias: 'midhun' });
+    assert.equal(parse('?settings=billing&coupon=ab').couponAlias, 'ab');
+    // Stage: a legacy partner alias (underscores, up to 64) is sent as typed; the server resolves the legacy registry first.
+    assert.equal(parse('?settings=billing&coupon=Acme_Partner').couponAlias, 'acme_partner');
+    assert.equal(parse(`?settings=billing&coupon=${'x'.repeat(64)}`).couponAlias, 'x'.repeat(64));
+    for ( const bad of ['?settings=billing&coupon=a&coupon=b', '?settings=billing&coupon=bad%20alias', '?settings=billing&coupon=', '?settings=billing&coupon=a', '?settings=billing&coupon=a_',
+        `?settings=billing&coupon=${'x'.repeat(65)}`, '?settings=billing&coupon=_acme', '?settings=billing&coupon_entry=invalid'] ) {
+        const parsed = parse(bad);
+        assert.equal(parsed.couponInvalid, true, bad);
+        assert.equal(parsed.couponAlias, undefined, bad);
+        assert.ok(!parsed.search.includes('coupon_entry'), 'the one-shot flag is consumed');
+    }
+    assert.equal(parse('?settings=billing').couponAlias, undefined);
+    assert.equal(parse('?settings=billing').couponInvalid, undefined);
+    assert.equal(parse('?coupon=midhun'), null, 'a coupon alone is not a billing link');
+});
+
 test('AI credits deep-link cleanup preserves unrelated query parameters', async h => {
     const parse = search => JSON.parse(JSON.stringify(h.window.sheetApi.parseBillingDeepLink(search)));
     assert.deepEqual(parse('?settings=billing&section=ai-credits&view=files&view=recent'), {
