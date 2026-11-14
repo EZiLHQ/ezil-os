@@ -11,8 +11,8 @@ import { fixtureRebasePreparation, fixtureRebaseRelease } from './aws-intent.tes
 import { rebaseEnv } from './aws-rebase.test-support';
 import { assertNoImageReservation, type PlacementDb, type PlacementExecutor } from './placement';
 import { buildAttestCommand, createLowerAttestationStore, LOWER_ATTESTATION_FAILURE_CODES, LOWER_ATTESTATION_TTL_MS, LowerAttestationRefusal,
-    verifyLowerAttestation, type InstanceProvenance, type LowerAttestation } from './aws-lower-attestation';
-import { CERT, COMMAND_ID, commandInput, CREATED, MARKER, MEASURED, NOW, observations, OWNER, PINNED, receipt, registryEntry, RESERVE } from './aws-lower-attestation.test-support';
+    verifyLowerAttestation, type InstanceProvenance, type LowerAttestationRecord } from './aws-lower-attestation';
+import { CERT, COMMAND_ID, commandInput, CREATED, MARKER, MEASURED, NOW, observations, OWNER, PINS, receipt, registryEntry, RESERVE } from './aws-lower-attestation.test-support';
 import type { ImagePlacement } from './placement';
 
 const PG = process.env.EZIL_PG_TEST_URL;
@@ -24,9 +24,9 @@ const rebaseJob = () => newReservedImageJob({ preparation: prep, ownerUserId: OW
 const LEGACY_MARKER = (({ instanceId: _i, ...m }) => m)(MARKER);
 
 /** The verifier on observations built for this row's own challenge: the real proof, not a stub. */
-const realProof = (marker: Record<string, unknown> = MARKER) => (a: LowerAttestation, p: ImagePlacement, provenance: InstanceProvenance) =>
+const realProof = (marker: Record<string, unknown> = MARKER) => (a: LowerAttestationRecord, p: ImagePlacement, provenance: InstanceProvenance) =>
     verifyLowerAttestation(a, p, COMMAND_ID, observations({ command: { ...observations().command!, commands: buildAttestCommand(commandInput({ challenge: a.challenge })) } },
-        receipt({ challenge: a.challenge }, marker) + '\n'), registryEntry(), CERT, PINNED, NOW, provenance);
+        receipt({ challenge: a.challenge }, marker) + '\n'), registryEntry(), CERT, PINS, NOW, provenance);
 
 describe.skipIf(!PG)('NULL-lower attestation on disposable PostgreSQL', () => {
     const client = PG ? postgres(PG, { max: 10, idle_timeout: 20, prepare: false, onnotice: () => {} }) : null;
@@ -202,16 +202,86 @@ describe.skipIf(!PG)('NULL-lower attestation on disposable PostgreSQL', () => {
         expect((await placementRow()).image_upgrade_job_id).toBe(other);
     });
 
-    it('a marker without instanceId adopts only through the closed usage session of the source instance', async () => {
-        // The fixture's AWS evidence names RESERVE.attestationId: the open-session attempt uses another id and must fail on provenance first.
-        const a = await reserve({ attestationId: '6a6a6a6a-6a6a-4a6a-8a6a-6a6a6a6a6a6a' });
-        await q(`INSERT INTO public.ezil_compute_usage (computer_id, user_id, instance_id, instance_type, started_at, stopped_at, observed_by, updated_at)
-            VALUES ($1,$2,$3,'m6i.large','2026-10-20T08:01:00Z',NULL,'test','2026-10-20T08:01:00Z')`, [RESERVE.computerId, OWNER, RESERVE.sourceInstanceId]);
-        const open = (x: LowerAttestation, p: ImagePlacement, provenance: InstanceProvenance) =>
+    /** The retired, settled claim row of exactly this allocation (computer, region, zone, generation, epoch, fence, volume). */
+    const claim = (over: Record<string, unknown> = {}) => {
+        const c = { instance: RESERVE.sourceInstanceId, generation: RESERVE.sourceGeneration, epoch: RESERVE.sourceLeaseEpoch, fence: RESERVE.sourceFenceToken,
+            volume: RESERVE.sourceVolumeId.replace('-', ''), state: 'retired', dispatch: 'settled', ...over };
+        return q(`INSERT INTO public.ezil_compute_pool_hosts (id, region, zone_id, instance_id, instance_type, state, health, generation, leased_computer_id,
+            created_at, updated_at, claim_generation, claim_lease_epoch, claim_fence, claim_volume_serial, lifecycle_job_id, lifecycle_digest, lifecycle_input, dispatch_status)
+            VALUES (gen_random_uuid(), $1, $2, $3, 'm6i.large', $4, 'unknown', 1, $5, now(), now(), $6, $7, $8, $9, gen_random_uuid(), $10, '{}', $11)`,
+        [RESERVE.region, RESERVE.zoneId, c.instance, c.state, RESERVE.computerId, c.generation, c.epoch, c.fence, c.volume, 'd'.repeat(64), c.dispatch]);
+    };
+    const session = (instance: string, started: string, stopped: string | null) => q(`INSERT INTO public.ezil_compute_usage
+        (computer_id, user_id, instance_id, instance_type, started_at, stopped_at, observed_by, updated_at) VALUES ($1,$2,$3,'m6i.large',$4,$5,'test',$4)`,
+    [RESERVE.computerId, OWNER, instance, started, stopped]);
+
+    it('a marker without instanceId on a current placement adopts only with the complete claim-row binding', async () => {
+        const a = await reserve();
+        expect(await store.adopt(a.attestationId, a.computerId, realProof(LEGACY_MARKER), NOW)).toMatchObject({ phase: 'refused', failureCode: 'instance_provenance_missing' });
+        expect((await placementRow()).lower_image_digest).toBeNull();
+        await claim();
+        // The fixture's AWS evidence names RESERVE.attestationId; a second reservation is proved as that one.
+        const b = await reserve({ attestationId: '6a6a6a6a-6a6a-4a6a-8a6a-6a6a6a6a6a6a' });
+        const as = (x: LowerAttestationRecord, p: ImagePlacement, provenance: InstanceProvenance) =>
             realProof(LEGACY_MARKER)({ ...x, attestationId: RESERVE.attestationId }, p, provenance);
-        expect(await store.adopt(a.attestationId, a.computerId, open, NOW)).toMatchObject({ phase: 'refused', failureCode: 'instance_provenance_missing' });
-        const b = await reserve();
-        await q(`UPDATE public.ezil_compute_usage SET stopped_at = '2026-10-21T00:00:00Z'`);
-        expect(await store.adopt(b.attestationId, b.computerId, realProof(LEGACY_MARKER), NOW)).toMatchObject({ failureCode: null, phase: 'adopted', measuredDigest: MEASURED });
+        await expect(store.adopt(b.attestationId, b.computerId, as, NOW)).resolves.toMatchObject({ failureCode: null, phase: 'adopted', measuredDigest: MEASURED });
+    });
+
+    describe('a released placement (instance_id NULL), the original QA shape', () => {
+        beforeEach(async () => { await q(`UPDATE public.ezil_computer_placements SET instance_id = NULL`); });
+
+        it('reserves and adopts only through the claim row of exactly this allocation; the NULL instance is frozen, compared and kept', async () => {
+            await expect(reserve()).rejects.toThrow('image_job_conflict');                    // no history: the request alone never names it
+            await session(RESERVE.sourceInstanceId, '2026-10-20T08:01:00Z', '2026-10-21T00:00:00Z');
+            await expect(reserve()).rejects.toThrow('image_job_conflict');                    // usage alone never binds
+            await claim();
+            const before = await placementRow();
+            const a = await reserve();
+            expect(a.currentInstanceId).toBeNull();
+            expect(a.sourceInstanceId).toBe(RESERVE.sourceInstanceId);
+            const adopted = await store.adopt(a.attestationId, a.computerId, realProof(LEGACY_MARKER), NOW);
+            expect(adopted).toMatchObject({ phase: 'adopted', measuredDigest: MEASURED });
+            expect(adopted.evidence).toMatchObject({ placementInstance: 'released', poolClaimNamesSource: true, instanceProvenance: 'pool-claim', usageLedger: 'corroborates' });
+            const after = await placementRow();
+            expect(after.instance_id).toBeNull();
+            expect(without(after, 'lower_image_digest', 'lower_digest_observed_at', 'image_upgrade_job_id', 'updated_at'))
+                .toEqual(without(before, 'lower_image_digest', 'lower_digest_observed_at', 'image_upgrade_job_id', 'updated_at'));
+        });
+
+        it.each([
+            ['a claim row for another instance', async () => { await claim({ instance: 'i-77777777777777777' }); }],
+            ['a claim row of another generation', async () => { await claim({ generation: RESERVE.sourceGeneration + 1 }); }],
+            ['a claim row of another fence', async () => { await claim({ fence: randomUUID() }); }],
+            ['a claim row of another volume', async () => { await claim({ volume: 'vol77777777777777777' }); }],
+            ['an unsettled claim row', async () => { await claim({ dispatch: 'pending' }); }],
+            ['a claim row still leased', async () => { await claim({ state: 'leased' }); }],
+            ['two claim rows', async () => { await claim(); await claim({ instance: 'i-77777777777777777' }); }],
+            ['conflicting usage', async () => { await claim(); await session('i-77777777777777777', '2026-10-20T08:01:00Z', '2026-10-21T00:00:00Z'); }],
+            ['an open usage session', async () => { await claim(); await session(RESERVE.sourceInstanceId, '2026-10-20T08:01:00Z', null); }],
+        ])('refuses to reserve with %s and writes nothing', async (_name, history) => {
+            await history();
+            const before = await placementRow();
+            await expect(reserve()).rejects.toThrow('image_job_conflict');
+            expect(await placementRow()).toEqual(before);
+        });
+
+        it('lineage that changes after the reservation seals instance_provenance_missing and clears only its own fence', async () => {
+            await claim();
+            const a = await reserve();
+            await session('i-77777777777777777', '2026-10-21T01:00:00Z', '2026-10-21T02:00:00Z');
+            expect(await store.adopt(a.attestationId, a.computerId, realProof(), NOW)).toMatchObject({ phase: 'refused', failureCode: 'instance_provenance_missing' });
+            const p = await placementRow();
+            expect(p.lower_image_digest).toBeNull();
+            expect(p.image_upgrade_job_id).toBeNull();
+            expect(p.instance_id).toBeNull();
+        });
+
+        it('a current instance appearing after the reservation seals placement_changed', async () => {
+            await claim();
+            const a = await reserve();
+            await q(`UPDATE public.ezil_computer_placements SET instance_id = $1`, [RESERVE.sourceInstanceId]);
+            expect(await store.adopt(a.attestationId, a.computerId, realProof(), NOW)).toMatchObject({ phase: 'refused', failureCode: 'placement_changed' });
+            expect((await placementRow()).lower_image_digest).toBeNull();
+        });
     });
 });
