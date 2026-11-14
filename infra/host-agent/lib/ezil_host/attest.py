@@ -63,7 +63,7 @@ def parse_args(argv):
 
 def check_marker(m, a):
     """The clone's marker names the ORIGINAL volume, this computer and fs, no other source
-    instance, and is not ahead of the reserved placement. An older marker without
+    instance, and exactly the reserved generation and lease epoch. An older marker without
     instanceId is reported as it is; the server then requires usage-ledger provenance."""
     if not isinstance(m, dict):
         raise Refused('marker_missing')
@@ -74,10 +74,11 @@ def check_marker(m, a):
             raise Refused(code)
     if m.get('instanceId') is not None and m['instanceId'] != a.instance_id:
         raise Refused('instance_id_mismatch')
-    if m['generation'] > a.generation:
-        raise Refused('generation_ahead')
-    if m['leaseEpoch'] > a.lease_epoch:
-        raise Refused('epoch_ahead')
+    # The marker's writer is exactly the reserved allocation: no older or newer generation or epoch.
+    if m['generation'] != a.generation:
+        raise Refused('generation_mismatch')
+    if m['leaseEpoch'] != a.lease_epoch:
+        raise Refused('epoch_mismatch')
     if not DIGEST_RE.fullmatch(m['lowerImageDigest']):
         raise Refused('marker_malformed', 'lowerImageDigest')
     return m
