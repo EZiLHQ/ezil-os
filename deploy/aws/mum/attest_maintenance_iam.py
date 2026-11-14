@@ -2,7 +2,8 @@
 
 Source only: this module makes no AWS call and runs no command. `plan` renders the
 pinned template's hashes and the exact AWS CLI argv for Root; `verify-changeset`,
-`verify-readback` and `verify-host` check the JSON that Root's commands saved.
+`verify-readback`, `verify-prelaunch` and `verify-host` check the JSON that Root's
+commands saved.
 Targets are fixed constants (no account/region/name overrides).
 
 The profile is for a FRESH lower-attestation maintenance host only, attached by the
@@ -47,6 +48,7 @@ SCOPED = {'ssm:updateinstanceinformation': f'arn:aws:ec2:{REGION}:{ACCOUNT}:inst
 ACTIONS = UNSCOPED | set(SCOPED)
 # First SSM Agent that takes Run Command over ssmmessages; older agents need ec2messages (not granted).
 MIN_AGENT = (3, 3, 40, 0)
+LIVE = ('pending', 'running', 'shutting-down', 'stopping', 'stopped')  # every state but terminated
 STACK_ARN = re.compile(rf'arn:aws:cloudformation:{REGION}:{ACCOUNT}:stack/{STACK}/[0-9a-f-]{{36}}')
 LIMIT = 1 << 20
 
@@ -152,6 +154,9 @@ def render_plan():
     stack = ['--stack-name', STACK]
     cs = [*stack, '--change-set-name', change_set]
     tool = ['python3', 'deploy/aws/mum/attest_maintenance_iam.py']
+    associations = aws('ssm', 'list-associations', '--output', 'json')
+    fleet = aws('ec2', 'describe-instances', '--filters', f'Name=iam-instance-profile.arn,Values={PROFILE_ARN}',
+                'Name=instance-state-name,Values=' + ','.join(LIVE), '--output', 'json')
     return {
         'schemaVersion': 1, 'account': ACCOUNT, 'region': REGION, 'namespace': NAMESPACE, 'stack': STACK, 'changeSet': change_set,
         'roleArn': ROLE_ARN, 'instanceProfileArn': PROFILE_ARN, 'policyName': POLICY_NAME, 'templatePath': TEMPLATE,
@@ -188,12 +193,16 @@ def render_plan():
                 'profile.json': aws('iam', 'get-instance-profile', '--instance-profile-name', NAME, '--output', 'json'),
                 'profiles-for-role.json': aws('iam', 'list-instance-profiles-for-role', '--role-name', NAME, '--output', 'json')},
              'argv': [[*tool, 'verify-readback', '--dir', 'DIR', '--plan-sha256', 'PLAN_SHA256']]},
-            {'name': 'host-ready', 'expect': 'per fresh host, read-only; associations.json also read before launch; never a bootstrap command',
+            {'name': 'pre-launch', 'expect': 'before every launch, after a fresh readback (own DIR); no profiled live instance, no association',
+             'saves': {'associations.json': associations, 'profile-fleet.json': fleet},
+             'argv': [[*tool, 'verify-prelaunch', '--dir', 'DIR']]},
+            {'name': 'host-ready', 'expect': 'per fresh host, read-only (own DIR); never a bootstrap command; fail closed',
              'saves': {
-                'associations.json': aws('ssm', 'list-associations', '--output', 'json'),
+                'associations.json': associations, 'profile-fleet.json': fleet,
+                'instance.json': aws('ec2', 'describe-instances', '--instance-ids', 'INSTANCE_ID', '--output', 'json'),
                 'instance-information.json': aws('ssm', 'describe-instance-information', '--filters', 'Key=InstanceIds,Values=INSTANCE_ID', '--output', 'json'),
                 'effective-associations.json': aws('ssm', 'describe-effective-instance-associations', '--instance-id', 'INSTANCE_ID', '--output', 'json')},
-             'argv': [[*tool, 'verify-host', '--dir', 'DIR', '--instance-id', 'INSTANCE_ID']]},
+             'argv': [[*tool, 'verify-host', '--dir', 'DIR', '--instance-id', 'INSTANCE_ID', '--instance-profile-id', 'READBACK_INSTANCE_PROFILE_ID']]},
         ]}
 
 
@@ -299,10 +308,36 @@ def verify_readback(d, pin):
             'instanceProfileId': profile['InstanceProfileId'], 'managedPolicies': 0, 'boundary': None, 'drift': status}
 
 
-def verify_host(d, instance_id):
-    need(isinstance(instance_id, str) and re.fullmatch(r'i-[0-9a-f]{17}', instance_id), 'invalid instance id')
+def instances(doc):
+    reservations = page(doc, 'Reservations')
+    need(isinstance(reservations, list) and all(isinstance(r, dict) and isinstance(r.get('Instances'), list) for r in reservations),
+         'invalid describe-instances read')
+    found = [i for r in reservations for i in r['Instances']]
+    need(all(isinstance(i, dict) for i in found), 'invalid describe-instances read')
+    return found
+
+
+def no_associations(d):
     need(page(read(d, 'associations.json'), 'Associations') == [],
          'State Manager associations exist in the region (could run on the host before the proof)')
+
+
+def verify_prelaunch(d):
+    no_associations(d)
+    need(instances(read(d, 'profile-fleet.json')) == [], 'a live instance already carries the maintenance profile')
+    return {'verified': 'pre-launch', 'instanceProfileArn': PROFILE_ARN, 'profiledLiveInstances': 0, 'associations': 0}
+
+
+def verify_host(d, instance_id, profile_id):
+    need(isinstance(instance_id, str) and re.fullmatch(r'i-[0-9a-f]{17}', instance_id), 'invalid instance id')
+    need(isinstance(profile_id, str) and re.fullmatch(r'AIPA[A-Z0-9]{16,}', profile_id), 'invalid instance profile id')
+    no_associations(d)
+    host = instances(read(d, 'instance.json'))
+    need(len(host) == 1 and host[0].get('InstanceId') == instance_id, 'instance read must name exactly the host')
+    # Id, not only ARN: a deleted and recreated same-name profile is a different profile.
+    need(host[0].get('IamInstanceProfile') == {'Arn': PROFILE_ARN, 'Id': profile_id}, 'host does not carry exactly the qualified profile')
+    need([i.get('InstanceId') for i in instances(read(d, 'profile-fleet.json'))] == [instance_id],
+         'maintenance profile is on another live instance')
     info = page(read(d, 'instance-information.json'), 'InstanceInformationList')
     need(isinstance(info, list) and len(info) == 1 and isinstance(info[0], dict) and info[0].get('InstanceId') == instance_id
          and info[0].get('ResourceType') == 'EC2Instance', 'host not registered exactly once')
@@ -311,7 +346,8 @@ def verify_host(d, instance_id):
     need(version is not None and tuple(map(int, version.groups())) >= MIN_AGENT,
          'SSM Agent older than 3.3.40.0 needs ec2messages: return to Root')
     need(page(read(d, 'effective-associations.json'), 'Associations') == [], 'effective association targets the host')
-    return {'verified': 'host-ready', 'instanceId': instance_id, 'agentVersion': info[0]['AgentVersion'], 'associations': 0}
+    return {'verified': 'host-ready', 'instanceId': instance_id, 'instanceProfileArn': PROFILE_ARN, 'instanceProfileId': profile_id,
+            'agentVersion': info[0]['AgentVersion'], 'associations': 0}
 
 
 def main(argv=None):
@@ -322,9 +358,11 @@ def main(argv=None):
         p = sub.add_parser(name)
         p.add_argument('--dir', required=True)
         p.add_argument('--plan-sha256', required=True)
+    sub.add_parser('verify-prelaunch').add_argument('--dir', required=True)
     p = sub.add_parser('verify-host')
     p.add_argument('--dir', required=True)
     p.add_argument('--instance-id', required=True)
+    p.add_argument('--instance-profile-id', required=True)
     args = parser.parse_args(argv)
     try:
         if args.command == 'plan':
@@ -334,8 +372,10 @@ def main(argv=None):
             result = verify_changeset(args.dir, args.plan_sha256)
         elif args.command == 'verify-readback':
             result = verify_readback(args.dir, args.plan_sha256)
+        elif args.command == 'verify-prelaunch':
+            result = verify_prelaunch(args.dir)
         else:
-            result = verify_host(args.dir, args.instance_id)
+            result = verify_host(args.dir, args.instance_id, args.instance_profile_id)
     except (ValueError, OSError) as error:
         print('REFUSE: ' + str(error), file=sys.stderr)
         return 2

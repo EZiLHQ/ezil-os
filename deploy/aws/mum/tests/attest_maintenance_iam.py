@@ -59,9 +59,20 @@ def readback_fixture():
     }
 
 
+def reservations(*ids, profile=True):
+    return {'Reservations': [{'Instances': [{'InstanceId': i, **({'IamInstanceProfile': {'Arn': m.PROFILE_ARN, 'Id': PROFILE_ID}} if profile else {})}]}
+                             for i in ids]}
+
+
+def prelaunch_fixture():
+    return {'associations.json': {'Associations': []}, 'profile-fleet.json': {'Reservations': []}}
+
+
 def host_fixture(version='3.3.1802.0'):
     return {
         'associations.json': {'Associations': []},
+        'instance.json': reservations(INSTANCE),
+        'profile-fleet.json': reservations(INSTANCE),
         'instance-information.json': {'InstanceInformationList': [{'InstanceId': INSTANCE, 'ResourceType': 'EC2Instance',
                                                                    'PingStatus': 'Online', 'AgentVersion': version}]},
         'effective-associations.json': {'Associations': []},
@@ -89,10 +100,12 @@ class Case(unittest.TestCase):
             return m.verify_changeset(self.dir, self.pin)
         if kind == 'readback':
             return m.verify_readback(self.dir, self.pin)
-        return m.verify_host(self.dir, INSTANCE)
+        if kind == 'prelaunch':
+            return m.verify_prelaunch(self.dir)
+        return m.verify_host(self.dir, INSTANCE, PROFILE_ID)
 
     def refuse(self, kind, mutate, message):
-        good = {'changeset': changeset_fixture, 'readback': readback_fixture, 'host': host_fixture}[kind]()
+        good = {'changeset': changeset_fixture, 'readback': readback_fixture, 'host': host_fixture, 'prelaunch': prelaunch_fixture}[kind]()
         self.assertTrue(self.run_kind(kind, good)['verified'])  # the base fixture passes
         bad = copy.deepcopy(good)
         mutate(bad)
@@ -309,6 +322,14 @@ class HostTests(Case):
              'State Manager associations exist'),
             (lambda f: f['effective-associations.json']['Associations'].append({'AssociationId': 'a'}), 'effective association targets the host'),
             (lambda f: f['instance-information.json'].update(NextToken='more'), 'incomplete paginated read'),
+            (lambda f: f.update({'instance.json': reservations(INSTANCE, profile=False)}), 'host does not carry exactly the qualified profile'),
+            (lambda f: f['instance.json']['Reservations'][0]['Instances'][0]['IamInstanceProfile'].update(
+                Arn='arn:aws:iam::452630323510:instance-profile/ezil/identity/ezil-mum-build'), 'host does not carry exactly the qualified profile'),
+            (lambda f: f['instance.json']['Reservations'][0]['Instances'][0]['IamInstanceProfile'].update(Id='AIPAEXAMPLEEXAMPLE0002'),
+             'host does not carry exactly the qualified profile'),
+            (lambda f: f.update({'instance.json': reservations(INSTANCE, 'i-0fedcba9876543210')}), 'instance read must name exactly the host'),
+            (lambda f: f.update({'profile-fleet.json': reservations(INSTANCE, 'i-0fedcba9876543210')}), 'maintenance profile is on another live instance'),
+            (lambda f: f.update({'profile-fleet.json': {'Reservations': []}}), 'maintenance profile is on another live instance'),
         ]
         for mutate, message in cases:
             with self.subTest(message=message):
@@ -317,10 +338,22 @@ class HostTests(Case):
     def test_minimum_agent_boundary_accepted(self):
         self.assertEqual(self.run_kind('host', host_fixture('3.3.40.0'))['agentVersion'], '3.3.40.0')
 
-    def test_invalid_instance_id_refused(self):
+    def test_invalid_instance_and_profile_ids_refused(self):
         self.write(host_fixture())
         with self.assertRaisesRegex(ValueError, 'invalid instance id'):
-            m.verify_host(self.dir, 'i-123')
+            m.verify_host(self.dir, 'i-123', PROFILE_ID)
+        with self.assertRaisesRegex(ValueError, 'invalid instance profile id'):
+            m.verify_host(self.dir, INSTANCE, m.PROFILE_ARN)
+
+    def test_prelaunch_mutations(self):
+        cases = [
+            (lambda f: f.update({'profile-fleet.json': reservations('i-0fedcba9876543210')}), 'a live instance already carries the maintenance profile'),
+            (lambda f: f['associations.json']['Associations'].append({'Name': 'AWS-UpdateSSMAgent'}), 'State Manager associations exist'),
+            (lambda f: f['profile-fleet.json'].update(NextToken='more'), 'incomplete paginated read'),
+        ]
+        for mutate, message in cases:
+            with self.subTest(message=message):
+                self.refuse('prelaunch', mutate, message)
 
 
 class PlanTests(unittest.TestCase):
@@ -340,13 +373,15 @@ class PlanTests(unittest.TestCase):
             text = ' '.join(argv)
             for forbidden in ('send-command', 'start-session', 'create-association', 'run-instances', 'put-role-policy', 'attach-role-policy',
                               'update-assume-role-policy', 'add-role-to-instance-profile', '--role-arn', '--import-existing-resources',
-                              '--parameters', '--tags', 'ec2messages', 'update-stack', 'delete-stack', 'ec2 '):
+                              '--parameters', '--tags', 'ec2messages', 'update-stack', 'delete-stack', 'associate-iam-instance-profile'):
                 self.assertNotIn(forbidden, text)
             if argv[0] == 'aws':
                 self.assertEqual(argv[1:7], ['--profile', 'ezil-admin', '--region', 'ap-south-1', '--no-cli-pager', argv[6]])
-                self.assertIn(argv[6], {'sts', 'iam', 'cloudformation', 'ssm'})
+                self.assertIn(argv[6], {'sts', 'iam', 'cloudformation', 'ssm', 'ec2'})
                 if argv[6] == 'ssm':
                     self.assertIn(argv[7], allowed_ssm)
+                if argv[6] == 'ec2':
+                    self.assertEqual(argv[7], 'describe-instances')
             else:
                 self.assertEqual(argv[:2], ['python3', 'deploy/aws/mum/attest_maintenance_iam.py'])
 

@@ -10,7 +10,10 @@ This document authorizes nothing. Root Native62 is the only writer: it runs ever
 - The attestation CLI, the verifier and the host measurement are unchanged.
 - **The verifier does not pin the IAM profile.**
   - `RunInstancesEventSchema` passes `requestParameters` through. `launchRecordOf` reads only `launchTemplate` and the presence of `userData` (`app/src/server/lib/compute/aws-lower-attestation.ts`, around line 250).
-  - So a profile on the launch is neither required nor refused by the proof. This contract and Root's launch gate are the only control on which profile a maintenance host carries.
+  - So a profile on the launch is neither required nor refused by the proof. This contract and Root's launch gate are the only control on which profile a maintenance host carries. `verify-host` checks the profile actually on the host, by ARN and by Id.
+  - **Guest side.** The host agent (`infra/host-agent`, including `attest.py`, `lease.py` and `http.py`) reads only these IMDS paths: `/latest/api/token`, `/latest/user-data` and `/latest/dynamic/instance-identity/document|pkcs7`.
+    - It does not read `iam/security-credentials` or `iam/info`, and it uses no AWS SDK or CLI. This was checked with a grep at `ed7da29a` for `security-credentials|iam/info|meta-data/iam|boto|instance-profile`; there were no matches.
+    - Credentials served by IMDS therefore do not change the measurement or the receipt.
 
 ## Exactly two resources
 `attest-maintenance-iam.template.json`, pinned by sha256 in `attest_maintenance_iam.py`:
@@ -84,7 +87,7 @@ This prints `planSha256` and every argv:
    - The stack is new (`REVIEW_IN_PROGRESS`, no outputs, no role).
    - The plan sha is current.
 4. **Execute (Root's specific GO):** `execute-change-set`, then wait for `stack-create-complete`.
-5. **Read back.**
+5. **Read back.** Every verify step uses its own new `--dir`, because the inspect and readback steps both save `stack.json`.
    - Run `detect-stack-drift` and wait for `DETECTION_COMPLETE`.
    - Save the readback files from the plan's argv.
    - Run `verify-readback --dir D --plan-sha256 P`. It requires:
@@ -104,13 +107,14 @@ This prints `planSha256` and every argv:
      - **Drift:** the role must be `IN_SYNC`. The profile may be `IN_SYNC`, or `NOT_CHECKED` because its binding is read back directly.
    - The receipt carries the template, trust, policy and plan hashes plus the role and profile ids.
 
-Rollback: delete the stack, but only once no instance carries the profile. Both resources use `DeletionPolicy: Delete`.
+Rollback: delete the stack, but only once `verify-prelaunch` shows that no live instance carries the profile. Both resources use `DeletionPolicy: Delete`.
 
 ## Launch gates for each fresh maintenance host
 These are additions to `docs/aws-computers/NULL-LOWER-ATTESTATION-RUNBOOK.md` step 4; everything in that step still applies.
 
-1. **Before launch.** `ssm list-associations` in ap-south-1 must be empty.
-   - Once the host registers, any State Manager association whose target matches would run userland on it before the proof. That includes Quick Setup, Inventory, patching, `AWS-UpdateSSMAgent`, and targets of `*` or a tag the host carries.
+1. **Before every launch.** IAM can change between qualification and `RunInstances`. Repeat step 5 with fresh files and a fresh drift detection, and keep its `instanceProfileId`. Then save the plan's `pre-launch` files and run `verify-prelaunch --dir D`, which requires both of these:
+   - **No State Manager association in ap-south-1.** Once the host registers, any association whose target matches would run userland on it before the proof. That includes Quick Setup, Inventory, patching, `AWS-UpdateSSMAgent`, and targets of `*` or a tag the host carries.
+   - **No live instance carries the profile.** Any state other than terminated counts. A profile on any other host, including a customer host via `AssociateIamInstanceProfile`, refuses.
    - **The verifier does not see association executions.** It reads only `ListCommands` and `DescribeSessions`.
 2. **The launching principal.**
    - It needs `iam:PassRole` on exactly the role ARN, with `iam:PassedToService = ec2.amazonaws.com`.
@@ -120,7 +124,9 @@ These are additions to `docs/aws-computers/NULL-LOWER-ATTESTATION-RUNBOOK.md` st
    - the registry launch template id and numeric version, and the pinned AMI;
    - IMDSv2;
    - the runbook tags.
-4. **Ready, read-only only.** Save `associations.json`, `instance-information.json` and `effective-associations.json` from the plan's `host-ready` argv, then run `verify-host --dir D --instance-id I`. It requires:
+4. **Ready, read-only only.** Save the plan's `host-ready` files, then run `verify-host --dir D --instance-id I --instance-profile-id <readback instanceProfileId>`. It requires:
+   - the host's `IamInstanceProfile` is exactly `{Arn: profile ARN, Id: the read-back id}`, so a recreated same-name profile refuses;
+   - the only live instance carrying the profile is this host;
    - account-wide associations empty;
    - exactly one registration, `EC2Instance`, `PingStatus` `Online`;
    - `AgentVersion` **at least 3.3.40.0**;
@@ -132,6 +138,11 @@ These are additions to `docs/aws-computers/NULL-LOWER-ATTESTATION-RUNBOOK.md` st
    - add user-data;
    - reuse the host.
    Readiness comes from Describe and Ping only. The plan contains no `send-command`, `start-session`, `create-association` or `run-instances`.
+
+   If the agent never registers, two causes are candidates:
+   - the network path (see Known limits);
+   - the `instance/*` resource scoping on `ssm:UpdateInstanceInformation` (AWS's own examples use `*`).
+   Return the diagnosis to Root; never widen the policy in place.
 
 ## Known limits
 - **AMI and agent.** The AMI's SSM Agent version and enablement are not baked into the AMI or asserted there. The parent image is Canonical Ubuntu 24.04, and the build never removes the agent, but that is not guest proof. Gate 4 is the only check.
