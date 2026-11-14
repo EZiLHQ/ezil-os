@@ -105,11 +105,22 @@ boot() { # boot <stage-dir>
   # The browser must see a secure context (crypto.subtle), as production's https host is: forward a
   # loopback port to the container's bridge address and browse http://127.0.0.1 instead.
   [[ -n "${FORWARD_PID:-}" ]] && kill "$FORWARD_PID" 2>/dev/null || true
+  # Never test someone else's server: on a shared host a port another run still holds made the forward fail
+  # (EADDRINUSE) while /healthz and the browser reached that other, older editor. Take the next free port, and
+  # require our own forward to be alive before and during the wait.
+  local tries=0
+  while (exec 3<>"/dev/tcp/127.0.0.1/${FORWARD_PORT}") 2>/dev/null; do
+    echo "[e2e] port ${FORWARD_PORT} is already in use on this host; trying $((FORWARD_PORT + 1))"
+    FORWARD_PORT=$((FORWARD_PORT + 1)); tries=$((tries + 1))
+    (( tries < 50 )) || { echo "[e2e] FAIL: no free forward port" >&2; return 1; }
+  done
   node -e 'const net=require("net");const [port,host]=process.argv.slice(1);net.createServer(c=>{const u=net.connect(8443,host);c.pipe(u).pipe(c);u.on("error",()=>c.destroy());c.on("error",()=>u.destroy())}).listen(+port,"127.0.0.1")' "$FORWARD_PORT" "$ip" &
   FORWARD_PID=$!
   CODE_URL="http://127.0.0.1:${FORWARD_PORT}"
+  sleep 0.5
   local i
   for i in $(seq 1 120); do
+    kill -0 "$FORWARD_PID" 2>/dev/null || { echo "[e2e] FAIL: the forward to the container on port ${FORWARD_PORT} exited" >&2; return 1; }
     if curl -fsS -o /dev/null "${CODE_URL}/healthz" 2>/dev/null; then
       echo "[e2e] code-server up after ~${i}s"; return 0
     fi
