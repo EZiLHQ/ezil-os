@@ -3,6 +3,8 @@ import 'server-only';
 import { randomBytes } from 'node:crypto';
 import type { SqlRunner } from '@/server/billing/v3/sponsor-store';
 import { readSponsorRuntime } from '@/server/billing/v3/sponsor-runtime';
+import { legacyAliasMatch } from '@/server/billing/v3/trial-authority';
+import { LEGACY_PARTNER_ID_PATTERN, SPONSOR_COUPON_PATTERN } from './sponsor-entry-input';
 import { authorizeSponsorQuote, campaignActive, resolveByPartnerId, resolveByToken, signSponsorContext, verifySponsorContext, type SponsorCampaign } from '@/server/billing/v3/sponsor';
 
 /** No token, signed context or provider identity is logged. */
@@ -12,12 +14,31 @@ export function sponsorFromLink(token: string | undefined, now = new Date()): Sp
     const campaign = runtime.enabled ? resolveByToken(runtime.registry, token) : null;
     return campaign && campaignActive(campaign, now) ? campaign : null;
 }
-/** A friendly alias is resolved from the signed registry; opaque token hashes are never reversed or disclosed. */
-export function sponsorFromCoupon(coupon: string | undefined, now = new Date()): SponsorCampaign | null {
-    if (!coupon || !/^[a-z0-9][a-z0-9_-]{2,63}$/.test(coupon)) return null;
+/**
+ * A friendly alias against the signed registry AS CONFIGURED (v3/trial-authority.ts), with the outcomes kept apart: `none` = no legacy entry
+ * names it (only then may it be a Stripe Product promoter); `active` = exactly one entry, enabled, in its window, runtime on; `denied` = a known
+ * alias that is disabled, expired, not started, duplicated, or runtime off, or a registry that does not verify; `invalid` = neither the legacy
+ * (3–64, underscores) nor the Product (2–32, no underscore) grammar. A Product-only alias (e.g. two characters) is `none`. Opaque token hashes
+ * are never reversed or disclosed.
+ */
+export function legacyCouponResolution(coupon: string | undefined, now = new Date()):
+    { kind: 'none' } | { kind: 'active'; campaign: SponsorCampaign } | { kind: 'denied' } | { kind: 'invalid' } {
+    // Neither grammar: invalid. Product grammar only (e.g. two characters): no legacy entry can be named, so `none` (a fresh Product lookup).
+    if (!coupon || !SPONSOR_COUPON_PATTERN.test(coupon)) return { kind: 'invalid' };
+    if (!LEGACY_PARTNER_ID_PATTERN.test(coupon)) return { kind: 'none' };
     const runtime = readSponsorRuntime();
-    const campaign = runtime.enabled ? resolveByPartnerId(runtime.registry, coupon) : null;
-    return campaign && campaignActive(campaign, now) ? campaign : null;
+    const legacy = runtime.legacy ?? (runtime.enabled ? { state: 'verified' as const, registry: runtime.registry } : { state: 'absent' as const });
+    const match = legacyAliasMatch(legacy, coupon);
+    if (match.kind === 'none') return { kind: 'none' };
+    if (match.kind !== 'exact' || !runtime.enabled || !campaignActive(match.campaign, now)) return { kind: 'denied' };
+    // The runtime's registry is the same verified document; resolveByPartnerId agrees for exactly one entry.
+    const campaign = resolveByPartnerId(runtime.registry, coupon);
+    return campaign && campaign.campaignId === match.campaign.campaignId ? { kind: 'active', campaign } : { kind: 'denied' };
+}
+/** The active legacy campaign an alias names, else null (unknown, denied and malformed alike: use legacyCouponResolution to tell them apart). */
+export function sponsorFromCoupon(coupon: string | undefined, now = new Date()): SponsorCampaign | null {
+    const resolution = legacyCouponResolution(coupon, now);
+    return resolution.kind === 'active' ? resolution.campaign : null;
 }
 export function loginSponsorContext(campaign: SponsorCampaign, origin: string, state: string, nonce: string): string {
     return signSponsorContext(process.env.SPONSOR_KEY!, { kind: 'login', campaignId: campaign.campaignId,

@@ -11,6 +11,7 @@
 import type { IntervalRow, SubscriptionRow } from './meters';
 import type { ComputeEpoch, EpochEndReason, GrantKindV2, GRANT_METER_COMPUTE, SizeCode } from './v2/contract';
 import type { OperatorEntitlementRow } from './v3/operator-access';
+import type { TrialPriceRead } from './v3/trial-campaigns';
 
 // ── Store (implemented by `store.ts` over drizzle) ───────────────────────────
 
@@ -379,7 +380,15 @@ export interface CheckoutRequest {
      * Standard trial (0021): the server-quoted trial end (the first charge) and the trial row id. Set only by the
      * router after its eligibility check; the session then collects a payment method with no charge today.
      */
-    trial?: { trialId: string; trialEnd: Date; expiresAt: Date; sponsor?: { campaignId: string; configSha256: string } };
+    trial?: { trialId: string; trialEnd: Date; expiresAt: Date;
+        /** A legacy signed-sponsor quote's frozen campaign (Stage): its metadata is compared with the persisted linkage at bind. */
+        sponsor?: { campaignId: string; configSha256: string };
+        /**
+         * The re-resolved trial authority's offer (v3/trial-authority.ts): attribution metadata only, never a discount, and the
+         * EXACT price verified by that read (used instead of the cached lookup-key price). A legacy quote carries `sponsor`
+         * metadata instead of the public/promoter offer keys; never both.
+         */
+        offer?: { coupon: string | null; fingerprint: string; priceId: string; source?: 'public' | 'promoter' | 'sponsor' } };
 }
 
 export interface CheckoutSessionCreated {
@@ -441,6 +450,11 @@ export interface StripePackApi {
     retrieveProduct(id: string): Promise<StripeProduct>;
     retrievePackPrice(id: string): Promise<StripePackPrice>;
     retrieveCoupon(id: string): Promise<StripeCoupon | null>;
+    /**
+     * Every active price of the Standard monthly v3 lookup key with its Product expanded (metadata included), read fresh:
+     * no cache. v3/trial-campaigns.ts decides validity. Throws on a provider error or abort; a missing reader offers no trial.
+     */
+    readTrialCampaigns?(signal?: AbortSignal): Promise<TrialPriceRead & { livemodeMatches?: boolean }>;
     retrieveCheckoutLineItems(sessionId: string): Promise<StripeCheckoutLineItem[]>;
 }
 

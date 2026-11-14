@@ -86,6 +86,20 @@ export async function linkageFor(db: SqlRunner, trialId: string): Promise<{ camp
         select campaign_id, config_sha256, claimed_at from public.ezil_sponsor_trial_claims where trial_id = ${trialId}::uuid`)];
     return rows[0] ? { campaignId: rows[0].campaign_id, configSha256: rows[0].config_sha256, claimed: rows[0].claimed_at !== null } : null;
 }
+/** The trial's current linkage, row-locked, inside the caller's transaction (product/public quote mode re-reads it under the quote lock). */
+export async function lockedLinkage(db: SqlRunner, trialId: string): Promise<{ campaignId: string; configSha256: string; claimed: boolean; quotedAt: Date } | null> {
+    const rows = [...await db.execute<{ campaign_id: string; config_sha256: string; claimed_at: string | null; quoted_at: string | Date }>(sql`
+        select campaign_id, config_sha256, claimed_at, quoted_at from public.ezil_sponsor_trial_claims where trial_id = ${trialId}::uuid for update`)];
+    const row = rows[0];
+    return row ? { campaignId: row.campaign_id, configSha256: row.config_sha256, claimed: row.claimed_at !== null, quotedAt: new Date(row.quoted_at) } : null;
+}
+/** Release exactly this UNCLAIMED linkage (compare-and-delete on campaign, config and quote time); 'stale' when anything differs. */
+export async function releaseExactUnclaimedLinkage(db: SqlRunner, input: { trialId: string; campaignId: string; configSha256: string; quotedAt: Date }): Promise<'released' | 'stale'> {
+    const rows = [...await db.execute<{ trial_id: string }>(sql`delete from public.ezil_sponsor_trial_claims where trial_id = ${input.trialId}::uuid
+        and claimed_at is null and campaign_id = ${input.campaignId} and config_sha256 = ${input.configSha256}
+        and quoted_at = ${input.quotedAt.toISOString()}::timestamptz returning trial_id::text as trial_id`)];
+    return rows.length === 1 ? 'released' : 'stale';
+}
 /** A public re-quote after the account's sponsor campaign ended: the UNCLAIMED linkage goes (the DB guard refuses a claimed one), the attribution stays. */
 export async function releaseUnclaimedLinkage(db: SqlRunner, trialId: string): Promise<void> {
     await db.execute(sql`delete from public.ezil_sponsor_trial_claims where trial_id = ${trialId}::uuid and claimed_at is null`);

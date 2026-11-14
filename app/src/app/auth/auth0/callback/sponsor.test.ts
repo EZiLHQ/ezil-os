@@ -10,6 +10,9 @@ vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({ auth: {
 import { AUTH0_COOKIE, buildAuthorizeUrl, readTransaction } from '@/server/auth/auth0';
 import { hashSponsorToken, signSponsorRegistry } from '@/server/billing/v3/sponsor';
 import { GET } from './route';
+import { sponsorFromLink } from '@/server/auth/sponsor';
+import { sponsorEntryContext } from '@/server/auth/sponsor-entry-context';
+import { SPONSOR_BILLING_COOKIE, verifySponsorBillingContext } from '@/server/auth/sponsor-billing-context';
 const token = 't'.repeat(43), origin = 'https://os-staging.ezil.work', key = 'synthetic-callback-key-'.repeat(3);
 let cookie: string, state: string;
 function registry(enabled = true) {
@@ -35,13 +38,41 @@ describe('signed sponsor OAuth transaction consumption', () => {
         const tx = readTransaction(cookie, state, origin);
         expect(tx.returnUrl).toBe('/os?settings=billing');
         const response = await GET(request());
-        expect(response.headers.get('location')).toBe(`${origin}/os?settings=billing`);
+        // No original entry cookie came back: nothing carried, so Billing opens with the non-authoritative unavailable hint (never bare).
+        expect(response.headers.get('location')).toBe(`${origin}/os?settings=billing&coupon_entry=unavailable`);
+        expect(response.cookies.get(SPONSOR_BILLING_COOKIE)?.maxAge).toBe(0);
         expect(stub.bridge).toHaveBeenCalledWith({ sub: 'auth0|fixture', email: 'fixture@example.invalid' }, expect.objectContaining({ campaignId: 'fixture-campaign' }));
         expect(response.cookies.get(AUTH0_COOKIE)?.maxAge).toBe(0);
         expect(response.cookies.get('__Host-ezil-sponsor-entry')?.maxAge).toBe(0);
         stub.exchange.mockClear(); stub.bridge.mockClear();
         await GET(request(response.cookies.get(AUTH0_COOKIE)!.value));
         expect(stub.exchange).not.toHaveBeenCalled(); expect(stub.bridge).not.toHaveBeenCalled();
+    });
+    it('mints the carried Billing context only from the ORIGINAL verified entry cookie matching the transaction, bound to the bridged user', async () => {
+        const campaign = sponsorFromLink(token)!;
+        const enteredAt = new Date('2026-11-11T11:57:00Z');   // three minutes before the callback (the fake clock)
+        const entry = (at: Date, c = campaign) => { vi.setSystemTime(at); const v = sponsorEntryContext(c, origin); vi.setSystemTime(new Date('2026-11-11T12:00:00Z')); return v; };
+        const withEntry = (value: string) => new NextRequest(`${origin}/auth/auth0/callback?state=${state}&code=synthetic-code`,
+            { headers: { cookie: `${AUTH0_COOKIE}=${cookie}; __Host-ezil-sponsor-entry=${value}` } });
+        stub.bridge.mockResolvedValue({ userId: 'bridged-user' });
+        const response = await GET(withEntry(entry(enteredAt)));
+        expect(response.headers.get('location')).toBe(`${origin}/os?settings=billing`);
+        const carried = response.cookies.get(SPONSOR_BILLING_COOKIE)!;
+        expect(carried.maxAge).toBe(420);                                         // original entry + 600 s, not the transaction's time
+        expect(carried).toMatchObject({ httpOnly: true, secure: true, sameSite: 'lax', path: '/' });
+        expect(verifySponsorBillingContext(key, carried.value, { origin, userId: 'bridged-user', now: new Date() })).toMatchObject({ campaignId: 'fixture-campaign', issuedAt: enteredAt });
+        expect(verifySponsorBillingContext(key, carried.value, { origin, userId: 'someone-else', now: new Date() })).toBeNull();
+        expect(response.cookies.get('__Host-ezil-sponsor-entry')?.maxAge).toBe(0);
+    });
+    it('an expired or mismatching entry cookie mints nothing and opens Billing with the unavailable hint', async () => {
+        stub.bridge.mockResolvedValue({ userId: 'bridged-user' });
+        vi.setSystemTime(new Date('2026-11-11T11:49:00Z'));
+        const old = sponsorEntryContext(sponsorFromLink(token)!, origin);
+        vi.setSystemTime(new Date('2026-11-11T12:00:00Z'));
+        const response = await GET(new NextRequest(`${origin}/auth/auth0/callback?state=${state}&code=synthetic-code`,
+            { headers: { cookie: `${AUTH0_COOKIE}=${cookie}; __Host-ezil-sponsor-entry=${old}` } }));
+        expect(response.headers.get('location')).toBe(`${origin}/os?settings=billing&coupon_entry=unavailable`);
+        expect(response.cookies.get(SPONSOR_BILLING_COOKIE)?.maxAge).toBe(0);
     });
     it.each(['tamper', 'expired', 'origin', 'revoked'])('refuses %s before token exchange and account attribution', async kind => {
         let value = cookie, host = origin;

@@ -31,7 +31,8 @@ import { SESSION_MAX_SECONDS, SIZES } from './v2/contract';
 import { epochSeconds, isoSeconds } from './v2/time';
 import { AI_CREDIT_PROTOCOL, planAiReversal, type AiReversalStore, type AiTopupReceiptStore } from './ai-credits';
 import { readOperatorEntitlements } from '@/server/entitlements/operator/store';
-import { attributionFor, claimLinkage, ensureAttribution, linkageFor, linkQuote, refreshLinkedQuote, releaseUnclaimedLinkage, sponsorSchemaReady, type SqlRunner } from './v3/sponsor-store';
+import { attributionFor, claimLinkage, ensureAttribution, linkageFor, linkQuote, lockedLinkage, releaseExactUnclaimedLinkage,
+    sponsorSchemaReady, type SqlRunner } from './v3/sponsor-store';
 import {
     authSubjectFor, mailboxDomains, normalizeEmail, UNBOUND_TRIAL_STATUSES, TRIAL_POLICY_VERSION, TRIAL_SKU, type TrialRow, type TrialStore,
 } from './v3/trial';
@@ -73,7 +74,8 @@ const uniqueViolation = (error: unknown) => (error as { code?: string; cause?: {
     || (error as { cause?: { code?: string } })?.cause?.code === '23505';
 
 /** Thrown inside a transaction to roll everything back and report a sponsor refusal. */
-class SponsorRollback extends Error { constructor(readonly outcome: 'sponsor_conflict' | 'sponsor_mismatch') { super(outcome); } }
+/** A refusal after a write inside a trial transaction: thrown so the whole transaction (cleanup, attribution, quote, linkage) rolls back. */
+class SponsorRollback extends Error { constructor(readonly outcome: 'sponsor_conflict' | 'sponsor_mismatch' | 'sponsor_pending' | 'trial_used') { super(outcome); } }
 
 const PAID_GRANT_KINDS = ['plan_period', 'upgrade_prorated', 'pro_period'] as const;
 const PAID_SUBSCRIPTION_SKUS = ['standard_monthly_v3', 'premium_monthly_v3', 'standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1'] as const;
@@ -179,11 +181,14 @@ export function createBillingStore(db: Database): BillingStore {
         async claimTrialQuote(input) {
             // Sponsor SQL exists only on a sponsor request or an enabled-runtime public quote, and only after a probe OUTSIDE the transaction says the
             // schema is applied. Legacy/off, or an unapplied schema, issues none (a failed statement would abort the transaction).
-            let sponsorSql = false;
-            if (input.sponsor !== undefined || input.publicSponsorMode !== undefined) {
-                sponsorSql = await sponsorSchemaReady(db as unknown as SqlRunner);
-                if (!sponsorSql && input.sponsor !== undefined) return { status: 'refused', reason: 'sponsor_unavailable' };
-            }
+            // `mode` is the trial authority's server-derived choice, required and exclusive. Both kinds probe (outside the transaction); a
+            // product/public quote with the schema applied only READS the current linkage, under the lock.
+            const mode = input.mode;
+            if (mode?.kind !== 'legacy' && mode?.kind !== 'product' && mode?.kind !== 'public') throw new TypeError('claimTrialQuote requires a mode');
+            const sponsor = mode.kind === 'legacy' ? mode.sponsor : undefined;
+            const independent = mode.kind === 'legacy' ? null : mode;
+            const sponsorSql = await sponsorSchemaReady(db as unknown as SqlRunner);
+            if (!sponsorSql && sponsor !== undefined) return { status: 'refused', reason: 'sponsor_unavailable' };
             try {
                 return await db.transaction(async tx => {
                     // One lock per key in a fixed order: same-account, same-subject and same-email claims serialize.
@@ -197,8 +202,21 @@ export function createBillingStore(db: Database): BillingStore {
                     if ((await otherTrialClaims(tx as unknown as Database, input.userId, input.authSubject, input.emailNormalized)).claimed) {
                         return { status: 'refused' as const, reason: 'trial_used' as const };
                     }
+                    // A product/public quote never retargets a pending legacy quote: any current linkage refuses (left intact), except exactly the
+                    // UNCLAIMED linkage a verified registry proved off/revoked/expired, compared here under the lock and deleted below only together
+                    // with a successful quote update (otherwise the transaction rolls back).
+                    let releaseLink: { campaignId: string; configSha256: string; quotedAt: Date } | null = null;
+                    if (sponsorSql && independent && existing) {
+                        const link = await lockedLinkage(tx as unknown as SqlRunner, existing.id);
+                        const proof = independent.releaseInactiveLink;
+                        if (link) {
+                            if (!proof || link.claimed || link.campaignId !== proof.campaignId || link.configSha256 !== proof.configSha256
+                                || link.quotedAt.getTime() !== proof.quotedAt.getTime()) throw new SponsorRollback('sponsor_pending');
+                            releaseLink = proof;
+                        }
+                    }
                     // Sponsor entry to this SAME trial: the account's first accepted campaign wins; a different one is refused, nothing written.
-                    if (sponsorSql && input.sponsor && await ensureAttribution(tx as unknown as SqlRunner, input.sponsor) === 'other_campaign') {
+                    if (sponsorSql && sponsor && await ensureAttribution(tx as unknown as SqlRunner, sponsor) === 'other_campaign') {
                         throw new SponsorRollback('sponsor_conflict');
                     }
                     // A deleted account's never-started quote on this subject or email gives way; a started one never does.
@@ -211,23 +229,28 @@ export function createBillingStore(db: Database): BillingStore {
                             authSubject: input.authSubject, emailNormalized: input.emailNormalized, returnOrigin: input.returnOrigin,
                             checkoutSessionId: null, policyVersion: TRIAL_POLICY_VERSION, updatedAt: sql`now()` })
                             .where(and(eq(billingTrials.id, existing.id), isNull(billingTrials.stripeSubscriptionId))).returning();
-                        if (!row) return { status: 'refused' as const, reason: 'trial_used' as const };
-                        // Freeze the campaign on this quote, or (a public re-quote) keep an existing linkage: it can never be stripped.
-                        if (sponsorSql) {
-                            if (input.sponsor) { if (await linkQuote(tx as unknown as SqlRunner, row.id, input.sponsor, input.quotedAt) === 'conflict') throw new SponsorRollback('sponsor_conflict'); }
-                            else if (input.publicSponsorMode === 'release') await releaseUnclaimedLinkage(tx as unknown as SqlRunner, row.id);
-                            else await refreshLinkedQuote(tx as unknown as SqlRunner, row.id, input.quotedAt);
+                        // Refused after the cleanup (and a legacy attribution): roll everything back, the linkage intact.
+                        if (!row) throw new SponsorRollback(releaseLink ? 'sponsor_pending' : 'trial_used');
+                        // The proven-inactive linkage goes with this successful update, or the whole quote rolls back.
+                        if (releaseLink && await releaseExactUnclaimedLinkage(tx as unknown as SqlRunner, { trialId: row.id, ...releaseLink }) !== 'released') {
+                            throw new SponsorRollback('sponsor_pending');
+                        }
+                        // Only a legacy quote writes linkage: freeze the campaign on this quote (a claimed or other-campaign linkage refuses).
+                        if (sponsorSql && sponsor && await linkQuote(tx as unknown as SqlRunner, row.id, sponsor, input.quotedAt) === 'conflict') {
+                            throw new SponsorRollback('sponsor_conflict');
                         }
                         return { status: 'quoted' as const, trial: trialRow(row), supersededCheckoutSessionId: existing.checkoutSessionId };
                     }
                     const [row] = await tx.insert(billingTrials).values({ userId: input.userId, authSubject: input.authSubject,
                         emailNormalized: input.emailNormalized, sku: TRIAL_SKU, policyVersion: TRIAL_POLICY_VERSION, status: 'quoted',
                         quotedAt: input.quotedAt, trialEnd: input.trialEnd, returnOrigin: input.returnOrigin }).returning();
-                    if (sponsorSql && input.sponsor && await linkQuote(tx as unknown as SqlRunner, row!.id, input.sponsor, input.quotedAt) === 'conflict') throw new SponsorRollback('sponsor_conflict');
+                    if (sponsorSql && sponsor && await linkQuote(tx as unknown as SqlRunner, row!.id, sponsor, input.quotedAt) === 'conflict') throw new SponsorRollback('sponsor_conflict');
                     return { status: 'quoted' as const, trial: trialRow(row!), supersededCheckoutSessionId: null };
                 });
             } catch (error) {
-                if (error instanceof SponsorRollback) return { status: 'refused', reason: 'sponsor_conflict' };
+                if (error instanceof SponsorRollback) {
+                    return { status: 'refused', reason: error.outcome === 'sponsor_pending' || error.outcome === 'trial_used' ? error.outcome : 'sponsor_conflict' };
+                }
                 // Another account holds this person's email or subject: the unique constraint decides a concurrent race.
                 if (uniqueViolation(error)) return { status: 'refused', reason: 'trial_used' };
                 throw error;

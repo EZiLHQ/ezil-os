@@ -39,7 +39,8 @@ export async function refuseSilentAccountSwitch(identity: Auth0Identity): Promis
 }
 
 /** The caller must first verify the Auth0 ID token, including verified email. */
-export async function bridgeAuth0Identity(identity: Auth0Identity, sponsor?: SponsorCampaign): Promise<void> {
+/** Returns the OS user the verified OTP session was minted for (the only account a carried Billing context may be bound to). */
+export async function bridgeAuth0Identity(identity: Auth0Identity, sponsor?: SponsorCampaign): Promise<{ userId: string }> {
     // Unsupported sponsor identities fail before Admin effects; ordinary public sign-in keeps its existing contract.
     if (sponsor && !sponsorSubjectSupported(identity.sub)) throw new Auth0Error('invalid_transaction');
     const admin = createAdminClient().auth.admin;
@@ -105,4 +106,5 @@ export async function bridgeAuth0Identity(identity: Auth0Identity, sponsor?: Spo
             metadata: result.data.user.app_metadata, ...(sponsor ? { campaign: sponsor } : {}) }); }
         catch { console.warn('[auth0] sponsor attribution unavailable'); }
     }
+    return { userId: user.id };
 }

@@ -4,9 +4,15 @@
  * "no sponsor". Public trial authorization is read fresh from Stripe by the billing router. Nothing here reads the database or Stripe.
  */
 import { accountKeyFor, parseSponsorRegistry, publicTrialEnabled, sponsorTrialsEnabled, EMPTY_REGISTRY, type SponsorRegistry } from './sponsor';
+import { inspectSponsorRegistry, type LegacyRegistryState } from './trial-authority';
 
 export interface SponsorRuntime {
     enabled: boolean;
+    /**
+     * The configured registry as the trial authority sees it, read whether or not the runtime is on (v3/trial-authority.ts): a known legacy
+     * alias stays known, and denied, while the runtime is off. Absent on older test runtimes: then derived from `enabled`/`registry`.
+     */
+    legacy?: LegacyRegistryState;
     /** @deprecated Legacy compatibility projection; billing authorization ignores this and reads Stripe Product metadata. */
     publicTrial: boolean;
     registry: SponsorRegistry;
@@ -20,5 +26,6 @@ export function readSponsorRuntime(env: Env = process.env): SponsorRuntime {
     const registry = sponsorTrialsEnabled(env) && key && key.length >= 32
         ? parseSponsorRegistry({ document: env.SPONSOR_REGISTRY, signature: env.SPONSOR_REGISTRY_SIG, key: env.SPONSOR_REGISTRY_KEY }) : EMPTY_REGISTRY;
     const enabled = registry.size > 0;
-    return { enabled, publicTrial: publicTrialEnabled(env), registry, accountKey: userId => (enabled && key ? accountKeyFor(userId, key) : null) };
+    const legacy = inspectSponsorRegistry({ document: env.SPONSOR_REGISTRY, signature: env.SPONSOR_REGISTRY_SIG, key: env.SPONSOR_REGISTRY_KEY });
+    return { enabled, legacy, publicTrial: publicTrialEnabled(env), registry, accountKey: userId => (enabled && key ? accountKeyFor(userId, key) : null) };
 }

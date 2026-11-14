@@ -3,12 +3,17 @@ import { NextRequest } from 'next/server';
 const stub = vi.hoisted(() => ({ available: vi.fn(), coupon: vi.fn(), authorize: vi.fn(), fromLink: vi.fn(), fromCoupon: vi.fn(), materialize: vi.fn(), user: vi.fn(), context: vi.fn() }));
 vi.mock('@/server/auth/sponsor-entry', () => ({ sponsorEntryAvailable: stub.available, sponsorCouponEntryAvailable: stub.coupon }));
 vi.mock('@/server/auth/auth0', () => ({ AUTH0_COOKIE: '__Host-ezil-auth0', AUTH0_COOKIE_OPTIONS: { httpOnly: true, secure: true, sameSite: 'lax', path: '/' }, Auth0Error: class extends Error {}, buildAuthorizeUrl: stub.authorize }));
-vi.mock('@/server/auth/sponsor', () => ({ sponsorFromLink: stub.fromLink, sponsorFromCoupon: stub.fromCoupon, materializeSponsorAttribution: stub.materialize, sponsorSubjectSupported: (s: string) => /^[\x21-\x7e]{1,255}$/.test(s) }));
+vi.mock('@/server/auth/sponsor', () => ({ sponsorFromLink: stub.fromLink, sponsorFromCoupon: stub.fromCoupon,
+    // The strict resolver as the fixture's registry answers it: the stubbed campaign is a known, active legacy alias; none = known but denied.
+    legacyCouponResolution: (coupon: string) => { const campaign = stub.fromCoupon(coupon); return campaign ? { kind: 'active', campaign } : { kind: 'denied' }; }, materializeSponsorAttribution: stub.materialize, sponsorSubjectSupported: (s: string) => /^[\x21-\x7e]{1,255}$/.test(s) }));
 vi.mock('@/server/auth/sponsor-entry-context', () => ({ SPONSOR_ENTRY_COOKIE: '__Host-ezil-sponsor-entry', SPONSOR_ENTRY_COOKIE_OPTIONS: { httpOnly: true, secure: true, sameSite: 'lax', path: '/' }, sponsorEntryContext: stub.context }));
 vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({ auth: { getUser: stub.user } }) }));
 import { GET as tokenGet } from './[token]/route';
 import { GET as couponGet } from './coupon/route';
-const origin = 'https://os-staging.ezil.work', token = 't'.repeat(43), campaign = { campaignId: 'fixture-campaign', partnerId: 'staging-qa' };
+const origin = 'https://os-staging.ezil.work', token = 't'.repeat(43), campaign = { campaignId: 'fixture-campaign', partnerId: 'staging-qa',
+    configSha256: 'c'.repeat(64), expiresAt: new Date('2099-01-01T00:00:00Z') };
+// The carried Billing context is minted with the deployment's sponsor key (a synthetic one here).
+beforeEach(() => { vi.stubEnv('SPONSOR_KEY', 'synthetic-entry-key-'.repeat(3)); });
 const signedUser = { id: 'existing', app_metadata: { auth0_sub: 'auth0|fixture' } };
 function get(kind: 'coupon' | 'token', query = '') { return kind === 'coupon'
     ? couponGet(new NextRequest(origin+'/sponsor/coupon?coupon=staging-qa'+query, { headers: { accept: 'text/html' } }))

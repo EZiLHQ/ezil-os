@@ -5,14 +5,17 @@
  *
  * In order:
  *  1. A VERIFIED active legacy sponsor context (a verified `SponsorContext`, never an attribution row). An alias beside it
- *     must name the same campaign.
+ *     must name the same campaign. An opaque-invitation context keeps legacy priority; an alias or unknown-provenance context
+ *     whose campaign alias is also a Product promoter is refused (alias: invalid, unknown: unavailable), re-checked every time.
  *  2. A promoter alias (`?coupon=`, an untrusted hint). A KNOWN legacy alias owns its resolution, deny included: a disabled,
  *     expired, revoked, duplicated or unverifiable legacy registry never falls through to the Product or public offer. An alias
  *     in BOTH authorities is ambiguous and refused. Only an alias unknown to a verified legacy registry may select the Stripe
  *     Product promoter terms (v3/trial-campaigns.ts).
  *  3. With no new selection, the caller's CURRENT pending quote-owned sponsor link (persisted with its own quote, status
- *     quoted/checkout) resumes under Stage's frozen rules: same campaign and config only; config changed = stale; off, revoked
- *     or expired = unavailable.
+ *     quoted/checkout) resumes under Stage's frozen rules: same campaign and config only; config changed = stale. Proven
+ *     disabled, expired or not started (its exact campaign id still known to a VERIFIED registry, runtime on), an unclaimed link
+ *     may give way to the public offer (Stage's explicit public re-quote, with `releasePending`). A removed campaign, runtime off,
+ *     or an absent/unverifiable registry proves nothing: it stays and refuses (unavailable).
  *  4. Otherwise the public offer, open only while BOTH public controls allow it: the Product's `ezil_public_standard_trial`
  *     (absent or "true", matching live/test mode) and the campaigns metadata `publicEnabled` (absent = on).
  * `pending` reports how a new selection relates to a pending link ('different' = it would retarget the frozen quote); the
@@ -77,8 +80,12 @@ export interface TrialAuthorityInput {
     alias: unknown;
     /** The caller's own quote's persisted link, ONLY while that quote is pending (quoted/checkout). */
     pendingLink: PendingSponsorLink | null;
-    /** A sponsor context the carrier has already verified (signature, subject, TTL); never built from a database row. */
-    legacyContext: SponsorContext | null;
+    /**
+     * A sponsor context the carrier has already verified (signature, subject, TTL); never built from a database row. `provenance` is how the
+     * original entry arrived, sealed by it: an `opaque` invitation keeps legacy priority; an `alias` (with its canonical alias) or an
+     * `unknown` (older) entry is re-checked against the Product promoters on every request and fails closed on a collision.
+     */
+    legacyContext: (SponsorContext & { provenance: 'opaque' | 'alias' | 'unknown'; alias: string | null }) | null;
     legacy: LegacyRegistryState;
     /** SPONSOR_TRIALS_ENABLED: off keeps known legacy aliases known, and denied. */
     legacyEnabled: boolean;
@@ -87,8 +94,13 @@ export interface TrialAuthorityInput {
     livemodeMatches: boolean;
     now: Date;
 }
+/**
+ * `pending`: how the selection relates to a pending link ('different' = it would retarget the frozen quote).
+ * `releasePending`: a fresh, verified legacy registry proves that pending link's campaign off, revoked or expired, so a
+ * public/promoter quote may conditionally release it (the store re-checks the exact unclaimed link under its lock).
+ */
 export type TrialAuthorityResult =
-    | { ok: true; authority: TrialAuthority; pending: 'none' | 'same' | 'different' }
+    | { ok: true; authority: TrialAuthority; pending: 'none' | 'same' | 'different'; releasePending: boolean }
     | { ok: false; code: TrialAuthorityRefusal };
 
 /** sha256 of a legacy selection's frozen terms: a non-secret retry binding, not an authorization. */
@@ -117,14 +129,37 @@ export function selectTrialAuthority(input: TrialAuthorityInput): TrialAuthority
     const relation = (authority: TrialAuthority): 'none' | 'same' | 'different' => !input.pendingLink ? 'none'
         : authority.source === 'sponsor' && authority.campaign.campaignId === input.pendingLink.campaignId
             && authority.campaign.configSha256 === input.pendingLink.configSha256 ? 'same' : 'different';
-    const done = (authority: TrialAuthority): TrialAuthorityResult => ({ ok: true, authority, pending: relation(authority) });
+    // The pending link's own standing under Stage's frozen rules. Only a verified registry can prove it off/revoked/expired.
+    const pendingAuthorization = input.pendingLink ? authorizeSponsorQuote({ enabled: input.legacyEnabled && input.legacy.state === 'verified', registry,
+        campaignId: input.pendingLink.campaignId, configSha256: input.pendingLink.configSha256, now: input.now }) : null;
+    // Release proof is an ALLOWLIST derived on its own, never "any other failure": a fresh VERIFIED registry still KNOWS the link's exact
+    // campaign id, the runtime is on, the link is unclaimed, and that campaign is explicitly inactive now (disabled, expired or not yet
+    // started). Its live config hash may differ from the link's frozen one (enabled and dates are hashed): the frozen hash belongs only in the
+    // store's compare-and-delete. A removed (unknown) campaign, runtime off, or an absent/unverifiable registry proves nothing: the link stays.
+    const proofCampaign = input.pendingLink && input.legacy.state === 'verified' ? input.legacy.registry.get(input.pendingLink.campaignId) ?? null : null;
+    const pendingProvenInactive = !!input.pendingLink && input.legacyEnabled && !input.pendingLink.claimed && proofCampaign !== null
+        && proofCampaign.campaignId === input.pendingLink.campaignId && !campaignActive(proofCampaign, input.now);
+    const done = (authority: TrialAuthority): TrialAuthorityResult => {
+        const pending = relation(authority);
+        return { ok: true, authority, pending, releasePending: pending === 'different' && pendingProvenInactive };
+    };
 
     // 1. A verified active context; an alias beside it must name the same campaign.
     if (input.legacyContext) {
         const authorized = authorizeSponsorQuote({ enabled: input.legacyEnabled && input.legacy.state === 'verified', registry,
             campaignId: input.legacyContext.campaignId, configSha256: input.legacyContext.configSha256, now: input.now });
         if (!authorized.ok) return { ok: false, code: 'trial_offer_unavailable' };
+        const context = input.legacyContext;
         if (alias !== null && authorized.campaign.partnerId !== alias) return { ok: false, code: 'trial_offer_invalid' };
+        if (context.provenance !== 'opaque') {
+            // An alias entry (or one whose provenance is unknown) names the campaign's public alias: fresh collision check, never a guess.
+            if (context.provenance === 'alias' && context.alias !== authorized.campaign.partnerId) return { ok: false, code: 'trial_offer_invalid' };
+            const partner = authorized.campaign.partnerId;
+            if (terms.campaigns === null) return { ok: false, code: 'trial_offer_unavailable' };
+            if (PROMOTER_CODE_PATTERN.test(partner) && Object.hasOwn(terms.campaigns.promoters, partner)) {
+                return { ok: false, code: context.provenance === 'alias' ? 'trial_offer_invalid' : 'trial_offer_unavailable' };
+            }
+        }
         return done(sponsor(authorized.campaign, 'context'));
     }
 
@@ -146,12 +181,12 @@ export function selectTrialAuthority(input: TrialAuthorityInput): TrialAuthority
         return selected.ok ? done({ source: 'promoter', offer: selected.offer }) : { ok: false, code: selected.code };
     }
 
-    // 3. No new selection: the pending link resumes under Stage's frozen rules.
-    if (input.pendingLink) {
-        const authorized = authorizeSponsorQuote({ enabled: input.legacyEnabled && input.legacy.state === 'verified', registry,
-            campaignId: input.pendingLink.campaignId, configSha256: input.pendingLink.configSha256, now: input.now });
-        if (!authorized.ok) return { ok: false, code: authorized.reason === 'config_changed' ? 'trial_quote_stale' : 'trial_unavailable' };
-        return done(sponsor(authorized.campaign, 'pending'));
+    // 3. No new selection: the pending link resumes under Stage's frozen rules. Proven off/revoked/expired by a verified
+    //    registry, it may give way to the public offer (Stage's explicit public re-quote); otherwise it stays and refuses.
+    if (input.pendingLink && pendingAuthorization) {
+        if (pendingAuthorization.ok) return done(sponsor(pendingAuthorization.campaign, 'pending'));
+        // Proven-inactive cleanup first: an active campaign whose hash changed stays stale; anything unproven stays and refuses.
+        if (!pendingProvenInactive) return { ok: false, code: pendingAuthorization.reason === 'config_changed' ? 'trial_quote_stale' : 'trial_unavailable' };
     }
 
     // 4. The public offer: both controls.

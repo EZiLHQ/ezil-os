@@ -25,9 +25,10 @@ const read = (campaignsRaw?: string, publicControl?: string) => standardTrialRea
     : { metadata: { ezil_plan: 'standard', ...(campaignsRaw === undefined ? {} : { ezil_standard_trial_campaigns: campaignsRaw }), [PUBLIC_STANDARD_TRIAL_METADATA_KEY]: publicControl } });
 const select = (over: Partial<TrialAuthorityInput> = {}) => selectTrialAuthority({ alias: null, pendingLink: null, legacyContext: null, legacy: ABSENT,
     legacyEnabled: true, read: read(CAMPAIGNS_ON), livemodeMatches: true, now: NOW, ...over });
-const context = (campaignId: string, configSha256: string): SponsorContext => {
+type Provenance = 'opaque' | 'alias' | 'unknown';
+const context = (campaignId: string, configSha256: string, provenance: Provenance = 'opaque', alias: string | null = null): SponsorContext & { provenance: Provenance; alias: string | null } => {
     const value = signSponsorContext(KEY, { kind: 'login', campaignId, configSha256, issuedAt: NOW, nonce: 'n'.repeat(24), subject: 'sponsor-billing|test' });
-    return verifySponsorContext(KEY, value, 'sponsor-billing|test', NOW)!;
+    return { ...verifySponsorContext(KEY, value, 'sponsor-billing|test', NOW)!, provenance, alias };
 };
 const acme = () => (LEGACY as Extract<LegacyRegistryState, { state: 'verified' }>).registry.get('camp-acme')!;
 
@@ -136,6 +137,11 @@ describe('aliases in both authorities, and unknown aliases', () => {
         expect(select({ alias: 'someone', legacy: LEGACY })).toEqual({ ok: false, code: 'trial_offer_invalid' });
         expect(select({ alias: 'midhun', read: read(campaigns({ promoters: { midhun: { enabled: false } } })) })).toEqual({ ok: false, code: 'trial_offer_unavailable' });
     });
+    it('a two-character Product alias (outside the legacy grammar) reaches the Product promoter; a malformed one is invalid', () => {
+        const r = read(campaigns({ promoters: { ab: { enabled: true } } }));
+        expect(select({ alias: 'AB', legacy: LEGACY, read: r })).toMatchObject({ ok: true, authority: { source: 'promoter', offer: { coupon: 'ab' } } });
+        for (const alias of ['a', 'a!', '-ab']) expect(select({ alias, legacy: LEGACY, read: r })).toEqual({ ok: false, code: 'trial_offer_invalid' });
+    });
     it('malformed or legacy-only-grammar unknown aliases are invalid, never public', () => {
         for (const alias of ['', 'a b', 'x', 42, 'has_underscore', 'a'.repeat(40)]) expect(select({ alias, legacy: LEGACY })).toEqual({ ok: false, code: 'trial_offer_invalid' });
         expect(normalizeTrialAlias(' Acme ')).toBe('acme');
@@ -148,14 +154,44 @@ describe('pending quote-owned link and verified context', () => {
         expect(select({ legacy: LEGACY, pendingLink: link(), read: read(campaigns({ publicEnabled: false }), 'false') }))
             .toMatchObject({ ok: true, pending: 'same', authority: { source: 'sponsor', via: 'pending', campaign: { campaignId: 'camp-acme' }, offer: { coupon: null } } });
         expect(select({ legacy: LEGACY, pendingLink: link({ configSha256: 'f'.repeat(64) }) })).toEqual({ ok: false, code: 'trial_quote_stale' });
-        expect(select({ legacy: registry([{ campaignId: 'camp-acme', partnerId: 'acme', enabled: false }]), pendingLink: link() })).toEqual({ ok: false, code: 'trial_unavailable' });
-        expect(select({ legacy: LEGACY, legacyEnabled: false, pendingLink: link() })).toEqual({ ok: false, code: 'trial_unavailable' });
-        // Never silently replaced by the public offer.
+        // An absent or unverifiable registry proves nothing: the link stays and refuses, never the public offer.
         expect(select({ legacy: ABSENT, pendingLink: link() })).toEqual({ ok: false, code: 'trial_unavailable' });
+        expect(select({ legacy: { state: 'invalid' }, pendingLink: link() })).toEqual({ ok: false, code: 'trial_unavailable' });
+    });
+    it('a pending link whose exact campaign a verified registry proves disabled/expired/not started may give way to the public offer, released conditionally', () => {
+        const disabled = registry([{ campaignId: 'camp-acme', partnerId: 'acme', enabled: false }]);
+        for (const legacy of [disabled, registry([{ campaignId: 'camp-acme', partnerId: 'acme', expiresAt: '2026-11-10T00:00:00.000Z' }]),
+            registry([{ campaignId: 'camp-acme', partnerId: 'acme', startsAt: '2026-11-20T00:00:00.000Z' }])]) {
+            const config = (legacy as Extract<LegacyRegistryState, { state: 'verified' }>).registry.get('camp-acme')!.configSha256;
+            expect(select({ legacy, pendingLink: link({ configSha256: config }) })).toMatchObject({ ok: true, pending: 'different', releasePending: true, authority: { source: 'public' } });
+            // Both public controls still apply; closed means refused, the link left in place.
+            expect(select({ legacy, pendingLink: link({ configSha256: config }), read: read(undefined, 'false') })).toEqual({ ok: false, code: 'trial_offer_unavailable' });
+        }
+        const disabledConfig = (disabled as Extract<LegacyRegistryState, { state: 'verified' }>).registry.get('camp-acme')!.configSha256;
+        // A claimed link is never released: it stays and refuses.
+        expect(select({ legacy: disabled, pendingLink: link({ configSha256: disabledConfig, claimed: true }) })).toEqual({ ok: false, code: 'trial_unavailable' });
+        // Revocation advances the live config hash (enabled is hashed): a link frozen under the earlier hash is still provably inactive.
+        expect(select({ legacy: disabled, pendingLink: link() })).toMatchObject({ ok: true, pending: 'different', releasePending: true, authority: { source: 'public' } });
+        // An ACTIVE campaign whose hash changed is stale, never released.
+        expect(select({ legacy: LEGACY, pendingLink: link({ configSha256: 'f'.repeat(64) }) })).toEqual({ ok: false, code: 'trial_quote_stale' });
+    });
+    it('negative: a removed (unknown) campaign, runtime off or an unverifiable registry is NOT proof; the link stays and the quote refuses', () => {
+        const removed = registry([{ campaignId: 'camp-other', partnerId: 'other' }]);
+        for (const over of [{ legacy: removed }, { legacy: LEGACY, legacyEnabled: false }, { legacy: ABSENT }, { legacy: { state: 'invalid' } as LegacyRegistryState }]) {
+            expect(select({ ...over, pendingLink: link() })).toEqual({ ok: false, code: 'trial_unavailable' });
+            // Nor does a promoter selection make it releasable.
+            const promoter = select({ ...over, pendingLink: link(), alias: 'midhun' });
+            if (promoter.ok) expect(promoter).toMatchObject({ pending: 'different', releasePending: false });
+        }
     });
     it('a new selection reports how it relates to the pending link; it is never silently retargeted', () => {
-        expect(select({ legacy: LEGACY, pendingLink: link(), alias: 'acme' })).toMatchObject({ ok: true, pending: 'same' });
-        expect(select({ legacy: LEGACY, pendingLink: link(), alias: 'midhun' })).toMatchObject({ ok: true, pending: 'different', authority: { source: 'promoter' } });
+        expect(select({ legacy: LEGACY, pendingLink: link(), alias: 'acme' })).toMatchObject({ ok: true, pending: 'same', releasePending: false });
+        // An ACTIVE pending link: a promoter selection is 'different' and not releasable (the caller refuses it as stale).
+        expect(select({ legacy: LEGACY, pendingLink: link(), alias: 'midhun' })).toMatchObject({ ok: true, pending: 'different', releasePending: false, authority: { source: 'promoter' } });
+        // An inactive one (its exact campaign and config, verified): releasable for the promoter quote.
+        const off = registry([{ campaignId: 'camp-acme', partnerId: 'acme', enabled: false }]);
+        const offConfig = (off as Extract<LegacyRegistryState, { state: 'verified' }>).registry.get('camp-acme')!.configSha256;
+        expect(select({ legacy: off, pendingLink: link({ configSha256: offConfig }), alias: 'midhun' })).toMatchObject({ ok: true, pending: 'different', releasePending: true });
     });
     it('a verified active context selects its campaign; inactive, changed or off contexts fail closed', () => {
         const ctx = context('camp-acme', acme().configSha256);
@@ -166,6 +202,23 @@ describe('pending quote-owned link and verified context', () => {
         expect(select({ legacy: LEGACY, legacyContext: context('camp-acme', 'f'.repeat(64)) })).toEqual({ ok: false, code: 'trial_offer_unavailable' });
         expect(select({ legacy: LEGACY, legacyEnabled: false, legacyContext: ctx })).toEqual({ ok: false, code: 'trial_offer_unavailable' });
         expect(select({ legacy: registry([{ campaignId: 'camp-acme', partnerId: 'acme', expiresAt: '2026-11-10T00:00:00.000Z' }]), legacyContext: ctx })).toEqual({ ok: false, code: 'trial_offer_unavailable' });
+    });
+    it('carried provenance: an opaque invitation keeps legacy priority over a colliding promoter; alias or unknown provenance fails closed, re-checked fresh', () => {
+        const midhunLegacy = registry([{ campaignId: 'camp-midhun', partnerId: 'midhun' }]);
+        const cfg = (midhunLegacy as Extract<LegacyRegistryState, { state: 'verified' }>).registry.get('camp-midhun')!.configSha256;
+        // `midhun` is ALSO a Product promoter in CAMPAIGNS_ON.
+        expect(select({ legacy: midhunLegacy, legacyContext: context('camp-midhun', cfg, 'opaque') })).toMatchObject({ ok: true, authority: { source: 'sponsor', via: 'context' } });
+        expect(select({ legacy: midhunLegacy, legacyContext: context('camp-midhun', cfg, 'alias', 'midhun') })).toEqual({ ok: false, code: 'trial_offer_invalid' });
+        expect(select({ legacy: midhunLegacy, legacyContext: context('camp-midhun', cfg, 'unknown') })).toEqual({ ok: false, code: 'trial_offer_unavailable' });
+        // Without the collision both work; malformed Product metadata cannot prove "no collision".
+        const noPromoter = read(campaigns({ promoters: {} }));
+        expect(select({ legacy: midhunLegacy, read: noPromoter, legacyContext: context('camp-midhun', cfg, 'alias', 'midhun') })).toMatchObject({ ok: true });
+        expect(select({ legacy: midhunLegacy, read: noPromoter, legacyContext: context('camp-midhun', cfg, 'unknown') })).toMatchObject({ ok: true });
+        expect(select({ legacy: midhunLegacy, read: read('{'), legacyContext: context('camp-midhun', cfg, 'unknown') })).toEqual({ ok: false, code: 'trial_offer_unavailable' });
+        // An opaque invitation never depends on the Product promoters.
+        expect(select({ legacy: midhunLegacy, read: read('{'), legacyContext: context('camp-midhun', cfg, 'opaque') })).toMatchObject({ ok: true, authority: { source: 'sponsor' } });
+        // An alias provenance must name the campaign's own canonical alias.
+        expect(select({ legacy: LEGACY, legacyContext: context('camp-acme', acme().configSha256, 'alias', 'other') })).toEqual({ ok: false, code: 'trial_offer_invalid' });
     });
     it('the input has no attribution-row field: a historical first touch cannot select, gate or retarget', () => {
         const keys = Object.keys({ alias: null, pendingLink: null, legacyContext: null, legacy: ABSENT, legacyEnabled: true, read: read(), livemodeMatches: true, now: NOW } satisfies TrialAuthorityInput);

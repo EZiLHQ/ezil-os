@@ -8,7 +8,7 @@ import { readStripePacks, resetStripePackCachesForTests } from './packs';
 import { PUBLIC_STANDARD_TRIAL_LOOKUP_KEY, publicStandardTrialEnabledFromStripe } from './public-standard-trial';
 import { CATALOG_V3 } from '../v3/contract';
 import { CATALOG_V2 } from '../v2/contract';
-import { SPONSOR_CAMPAIGN_METADATA_KEY, SPONSOR_CONFIG_METADATA_KEY, TRIAL_METADATA_KEY, TRIAL_POLICY_VERSION } from '../v3/trial';
+import { SPONSOR_CAMPAIGN_METADATA_KEY, SPONSOR_CONFIG_METADATA_KEY, TRIAL_METADATA_KEY, TRIAL_POLICY_VERSION, TRIAL_SKU } from '../v3/trial';
 
 const STRIPE_BASE_URL = 'https://api.stripe.com/v1';
 /** Pin the response schema independently of the Stripe account's default version. */
@@ -39,11 +39,15 @@ function cacheValue<T>(cache: Map<string, CacheEntry<T>>, key: string, value: T)
     cache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
 }
 
-function trialMetadata(trial: { trialId: string; trialEnd: Date; sponsor?: { campaignId: string; configSha256: string } }): Record<string, string> {
+type TrialMetadataInput = { trialId: string; trialEnd: Date; sponsor?: { campaignId: string; configSha256: string };
+    offer?: { coupon: string | null; fingerprint: string } };
+function trialMetadata(trial: TrialMetadataInput): Record<string, string> {
     return { [TRIAL_METADATA_KEY]: trial.trialId, ezil_trial_policy: String(TRIAL_POLICY_VERSION),
         ezil_trial_end: String(Math.floor(trial.trialEnd.getTime() / 1000)),
-        // Server-owned, deterministic for the quote (so the idempotency key stays valid); read back at bind and compared with the persisted linkage.
-        ...(trial.sponsor ? { [SPONSOR_CAMPAIGN_METADATA_KEY]: trial.sponsor.campaignId, [SPONSOR_CONFIG_METADATA_KEY]: trial.sponsor.configSha256 } : {}) };
+        // A legacy sponsor quote: server-owned, deterministic for the quote (so the idempotency key stays valid); read back at bind and compared
+        // with the persisted linkage. Otherwise the public/promoter offer's attribution, server-set, never a discount. Never both.
+        ...(trial.sponsor ? { [SPONSOR_CAMPAIGN_METADATA_KEY]: trial.sponsor.campaignId, [SPONSOR_CONFIG_METADATA_KEY]: trial.sponsor.configSha256 }
+            : trial.offer ? { ezil_trial_offer: trial.offer.coupon ?? 'public', ezil_trial_offer_fp: trial.offer.fingerprint } : {}) };
 }
 
 /**
@@ -51,7 +55,7 @@ function trialMetadata(trial: { trialId: string; trialEnd: Date; sponsor?: { cam
  * parameters, which the signed lifecycle suite reuses because a headless run cannot complete Checkout): the quoted
  * end as `trial_end`, a missing payment method cancels at the end, and the trial row id in metadata.
  */
-export function trialSubscriptionData(sku: string, trial: { trialId: string; trialEnd: Date; sponsor?: { campaignId: string; configSha256: string } }) {
+export function trialSubscriptionData(sku: string, trial: TrialMetadataInput) {
     return {
         metadata: { sku, ezil_catalog: sku.endsWith('_v3') ? 'v3' : 'v2', ...trialMetadata(trial) },
         trial_end: Math.floor(trial.trialEnd.getTime() / 1000),
@@ -258,7 +262,8 @@ export interface StripeClientOptions {
 export function createStripeRequest(opts: Pick<StripeClientOptions, 'secretKey' | 'fetch'>) {
     const fetcher = opts.fetch ?? globalThis.fetch;
 
-    async function request<T>(path: string, fields?: FormFields, idempotencyKey?: string): Promise<T> {
+    /** `signal` is optional and sent only when given, so every existing call is unchanged. */
+    async function request<T>(path: string, fields?: FormFields, idempotencyKey?: string, signal?: AbortSignal): Promise<T> {
         const headers = new Headers({
             Authorization: `Bearer ${opts.secretKey}`,
             'Stripe-Version': STRIPE_API_VERSION,
@@ -269,6 +274,7 @@ export function createStripeRequest(opts: Pick<StripeClientOptions, 'secretKey' 
             method: fields === undefined ? 'GET' : 'POST',
             headers,
             body: fields === undefined ? undefined : formBody(fields),
+            ...(signal ? { signal } : {}),
         });
         if (!response.ok) {
             // A non-JSON upstream failure still has a useful HTTP status. Never
@@ -407,6 +413,25 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
         async listProducts() { return (await listAll<ProductResponse>('/products', { active: 'true' })).map(packProduct); },
         async retrieveProduct(id) { return packProduct(await request<ProductResponse>(`/products/${encodeURIComponent(id)}`)); },
         async retrievePackPrice(id) { return packPrice(await request<Price>(`/prices/${encodeURIComponent(id)}`)); },
+        async readTrialCampaigns(signal) {
+            // Fresh on every call (no cache): a campaign or price change in Stripe applies at the next quote and checkout.
+            // limit=2 so a second active price for the key is seen (and refused) rather than silently skipped.
+            const lookupKey = offerBySku(TRIAL_SKU)!.stripeLookupKey!;
+            const query = new URLSearchParams({ 'lookup_keys[]': lookupKey, active: 'true', limit: '2', 'expand[]': 'data.product' });
+            type ExpandedPrice = Omit<Price, 'product'> & { livemode?: boolean; recurring?: { interval?: string; interval_count?: number } | null;
+                product?: { id: string; active?: boolean; livemode?: boolean; metadata?: Record<string, string> | null } | string | null };
+            const page = await request<{ data?: ExpandedPrice[]; has_more?: boolean }>(`/prices?${query}`, undefined, undefined, signal);
+            // Stage's public control also requires the read's live/test mode to be this deployment's (stripe/public-standard-trial.ts).
+            const live = /^(sk|rk)_live_/.test(opts.secretKey) ? true : /^(sk|rk)_test_/.test(opts.secretKey) ? false : null;
+            const rows = (page.data ?? []).filter(item => item.lookup_key === lookupKey);
+            const livemodeMatches = live !== null && rows.length > 0 && rows.every(item => item.livemode === live
+                && typeof item.product === 'object' && item.product !== null && item.product.livemode === live);
+            return { hasMore: page.has_more === true, livemodeMatches, prices: rows.map(item => ({
+                id: item.id, active: item.active === true, unitAmount: item.unit_amount ?? null, currency: item.currency ?? null,
+                interval: item.recurring?.interval ?? null, intervalCount: item.recurring?.interval_count ?? null,
+                product: item.product && typeof item.product === 'object'
+                    ? { id: item.product.id, active: item.product.active === true, metadata: item.product.metadata ?? {} } : null })) };
+        },
         async retrieveCoupon(id) {
             try {
                 const coupon = await request<{ id: string; valid: boolean; percent_off: number | null; amount_off: number | null }>(`/coupons/${encodeURIComponent(id)}`);
@@ -587,15 +612,18 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
                 }),
             };
             if (lookupKey) {
-                const price = await resolvePrice(lookupKey);
+                // A campaign trial uses the EXACT price its fresh read verified (v3/trial-campaigns.ts), never the cached one.
+                const verifiedPriceId = input.trial?.offer?.priceId ?? null;
+                if (verifiedPriceId !== null && !/^price_[A-Za-z0-9]+$/.test(verifiedPriceId)) throw new BillingProviderError('invalid_trial_price');
+                const price = verifiedPriceId === null ? await resolvePrice(lookupKey) : null;
                 fields.mode = 'subscription';
-                fields.line_items = [{ quantity: 1, price: price.id }];
+                fields.line_items = [{ quantity: 1, price: verifiedPriceId ?? price!.id }];
                 fields.subscription_data = { metadata: { sku: input.sku, ezil_catalog: input.sku.endsWith('_v3') ? 'v3' : 'v2' } };
                 if (input.trial) {
                     // Standard trial: $0 today, the quoted end as Stripe's trial end (never a fixed day count), a payment
                     // method always collected, and a trial without one cancelled rather than left unpaid.
-                    if (input.sku !== 'standard_monthly_v3' || price.unitAmount !== CATALOG_V3.standard_monthly_v3.priceCents
-                        || price.currency !== 'usd' || !price.recurring) throw new BillingProviderError('invalid_trial_price');
+                    if (input.sku !== 'standard_monthly_v3' || (price !== null && (price.unitAmount !== CATALOG_V3.standard_monthly_v3.priceCents
+                        || price.currency !== 'usd' || !price.recurring))) throw new BillingProviderError('invalid_trial_price');
                     const subscriptionData = trialSubscriptionData(input.sku, input.trial);
                     fields.metadata = { ...metadata, ...trialMetadata(input.trial) };
                     fields.payment_method_collection = 'always';
