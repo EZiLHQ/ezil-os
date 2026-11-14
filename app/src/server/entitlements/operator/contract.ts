@@ -7,7 +7,7 @@
  */
 import { createHash } from 'node:crypto';
 import { CATALOG_V3 } from '@/server/billing/v3/contract';
-import { OPERATOR_SKUS, type OperatorEntitlementRow, type OperatorSku } from '@/server/billing/v3/operator-access';
+import { isIssuedBy, OPERATOR_SKUS, type OperatorEntitlementRow, type OperatorSku } from '@/server/billing/v3/operator-access';
 
 export const PRODUCER = 'ezil-os';
 export const SCOPE = 'individual';
@@ -40,6 +40,8 @@ export interface Command {
     readonly validity: { readonly ends_at: string } | { readonly until_revoked: true } | null;
     readonly reason: string; readonly assignment: { readonly ref: string; readonly expected_revision: number } | null;
     readonly billing_effect: 'none'; readonly credit_option: 'none';
+    /** Optional, assign only: the issuing organization's name for the plan card. Absent = EZiL (and every v1 command). */
+    readonly issued_by?: string;
 }
 export interface Assignment {
     readonly ref: string; readonly revision: number; readonly producer: typeof PRODUCER; readonly scope: typeof SCOPE;
@@ -78,11 +80,16 @@ export function commandIdOf(body: unknown): string | null {
     return isRecord(body) && typeof body.command_id === 'string' && UUID.test(body.command_id) ? body.command_id : null;
 }
 
-/** Strict: every field, no extras, the ezil-os producer and individual scope only. Throws InvalidCommand. */
+/**
+ * Strict: every field, no extras, the ezil-os producer and individual scope only. Throws InvalidCommand. The one
+ * optional key, `issued_by`, is either absent (a v1 command, byte for byte) or a valid name on an assign: never null.
+ */
 export function parseCommand(v: unknown): Command {
     const c = rec(v, 'command');
+    const named = Object.hasOwn(c, 'issued_by');
     only(c, ['format', 'command_id', 'action', 'producer', 'scope', 'operator', 'product', 'target', 'quantity', 'starts_at', 'validity',
-        'reason', 'assignment', 'billing_effect', 'credit_option'], 'command fields');
+        'reason', 'assignment', 'billing_effect', 'credit_option', ...(named ? ['issued_by'] : [])], 'command fields');
+    if (named && (c.action !== 'assign' || !isIssuedBy(c.issued_by))) throw new InvalidCommand('issued_by');
     if (c.format !== FORMATS.command) throw new InvalidCommand('format');
     if (c.producer !== PRODUCER || c.scope !== SCOPE) throw new InvalidCommand('producer');
     if (c.billing_effect !== 'none' || c.credit_option !== 'none') throw new InvalidCommand('billing_effect');
@@ -118,7 +125,7 @@ export function parseCommand(v: unknown): Command {
     if (c.action === 'end' && (assignment === null || product !== null || validity !== null || startsAt !== null)) throw new InvalidCommand('end');
     return { format: FORMATS.command, command_id: str(c.command_id, UUID, 'command_id'), action: c.action, producer: PRODUCER, scope: SCOPE,
         operator, product, target, quantity: null, starts_at: startsAt, validity, reason: text(c.reason, 500, 'reason'), assignment,
-        billing_effect: 'none', credit_option: 'none' };
+        billing_effect: 'none', credit_option: 'none', ...(named ? { issued_by: c.issued_by as string } : {}) };
 }
 
 /** Canonical JSON: sorted keys, no whitespace; numbers are safe integers (the contract has no fractions). */

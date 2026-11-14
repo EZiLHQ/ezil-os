@@ -117,3 +117,44 @@ describe('EZIL-AE-V1 sender verification', () => {
         }
     });
 });
+
+describe('issued_by: the optional issuing-organization name of an assign', () => {
+    const named = (issued_by: unknown, over: Record<string, unknown> = {}) => ({ ...ASSIGN, issued_by, ...over });
+    const refused = (value: unknown, over: Record<string, unknown> = {}) => expect(() => parseCommand(named(value, over))).toThrow(InvalidCommand);
+
+    it('a v1 command without the key parses and hashes exactly as before; a named one adds exactly the key', () => {
+        expect(Object.hasOwn(parseCommand(ASSIGN), 'issued_by')).toBe(false);
+        expect(payloadSha256(parseCommand(ASSIGN) as unknown as Record<string, unknown>)).toBe(VECTOR.payloadSha256);
+        const parsed = parseCommand(named('Acme Labs'));
+        expect(parsed).toEqual({ ...ASSIGN, issued_by: 'Acme Labs' });
+        expect(canonicalJson(parsed as unknown as Record<string, unknown>)).toContain('"issued_by":"Acme Labs"');
+        expect(payloadSha256(parsed as unknown as Record<string, unknown>)).not.toBe(VECTOR.payloadSha256);
+    });
+    it.each([['one character', 'A'], ['80 characters', 'a'.repeat(80)], ['80 code points of astral text', '\u{1F600}'.repeat(80)],
+        ['inner spaces', 'Acme  Labs, Inc.'], ['non-Latin letters', 'Łódź 研究所']])('accepts %s', (_n, value) => {
+        expect(parseCommand(named(value)).issued_by).toBe(value);
+    });
+    it.each([['null', null], ['a number', 5], ['empty', ''], ['81 characters', 'a'.repeat(81)], ['81 astral code points', '\u{1F600}'.repeat(81)],
+        ['a leading space', ' Acme'], ['a trailing space', 'Acme '], ['a trailing newline', 'Acme\n'], ['a leading no-break space', '\u00a0Acme'],
+        ['a trailing ideographic space', 'Acme\u3000'], ['a trailing en space', 'Acme\u2003'],
+        ['NUL', 'Ac\u0000me'], ['a C0 control', 'Ac\u0007me'], ['a tab', 'Ac\tme'], ['DEL', 'Ac\u007fme'], ['a C1 control', 'Ac\u0085me'],
+        ['a zero-width space', 'Ac\u200bme'], ['a zero-width joiner', 'Ac\u200dme'], ['the Arabic letter mark', 'Ac\u061cme'],
+        ['a right-to-left override', 'Ac\u202eme'], ['a bidi isolate', 'Ac\u2066me'], ['a line separator', 'Ac\u2028me'],
+        ['a word joiner', 'Ac\u2060me'], ['a BOM', 'Ac\ufeffme'],
+        ['a lone high surrogate', 'Ac\ud800me'], ['a lone low surrogate', 'Ac\udc00me'], ['a trailing lone high surrogate', 'Acme\ud83d'],
+        ['reversed surrogates', '\ude00\ud83d'],
+    ])('refuses %s', (_n, value) => refused(value));
+    it('is for assign only: change and end commands carry no label, absent or not', () => {
+        const change = { ...END, action: 'change', product: { ref: 'premium_monthly_v3', catalog_revision: 'v3.2026-11-04' }, validity: null };
+        for (const base of [END, change]) {
+            expect(() => parseCommand({ ...base, issued_by: 'Acme Labs' })).toThrow(InvalidCommand);
+            expect(() => parseCommand({ ...base, issued_by: null })).toThrow(InvalidCommand);
+        }
+        expect(Object.hasOwn(parseCommand(END), 'issued_by')).toBe(false);
+    });
+    it('a pair of surrogates is a valid astral letter, and JSON of a lone surrogate never reaches canonical JSON', () => {
+        expect(parseCommand(named('\ud83d\ude00')).issued_by).toBe('\u{1F600}');
+        refused('\ud83d');
+        expect(() => canonicalJson(parseCommand(named('ok')) as unknown as Record<string, unknown>)).not.toThrow();
+    });
+});

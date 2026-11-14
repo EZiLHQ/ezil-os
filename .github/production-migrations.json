@@ -90,6 +90,11 @@
       "path": "app/drizzle/0022_feedback_notifications.sql",
       "sha256": "07696b64fb9f729ca2b54873cff294c192305c1cc3b70fc2d83c239fba36e974",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0023_operator_issued_by.sql",
+      "sha256": "7bae267c2e9a281c60d9e1e96cf8a64788e43dbfd51c65e44214182b6ead5c92",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {
