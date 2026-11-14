@@ -220,6 +220,15 @@ describe('pending quote-owned link and verified context', () => {
         // An alias provenance must name the campaign's own canonical alias.
         expect(select({ legacy: LEGACY, legacyContext: context('camp-acme', acme().configSha256, 'alias', 'other') })).toEqual({ ok: false, code: 'trial_offer_invalid' });
     });
+    it('a pending link has unknown provenance: a colliding Product alias fails closed (never guessed opaque); without a collision it resumes', () => {
+        const midhunLegacy = registry([{ campaignId: 'camp-midhun', partnerId: 'midhun' }]);
+        const cfg = (midhunLegacy as Extract<LegacyRegistryState, { state: 'verified' }>).registry.get('camp-midhun')!.configSha256;
+        const pending = { campaignId: 'camp-midhun', configSha256: cfg, claimed: false };
+        expect(select({ legacy: midhunLegacy, pendingLink: pending })).toEqual({ ok: false, code: 'trial_offer_unavailable' });   // midhun is a promoter
+        expect(select({ legacy: midhunLegacy, pendingLink: pending, read: read('{') })).toEqual({ ok: false, code: 'trial_offer_unavailable' });
+        expect(select({ legacy: midhunLegacy, pendingLink: pending, read: read(campaigns({ promoters: {} })) }))
+            .toMatchObject({ ok: true, pending: 'same', authority: { source: 'sponsor', via: 'pending' } });
+    });
     it('the input has no attribution-row field: a historical first touch cannot select, gate or retarget', () => {
         const keys = Object.keys({ alias: null, pendingLink: null, legacyContext: null, legacy: ABSENT, legacyEnabled: true, read: read(), livemodeMatches: true, now: NOW } satisfies TrialAuthorityInput);
         expect(keys.some(key => /attribution|firstTouch|row/i.test(key))).toBe(false);

@@ -12,7 +12,8 @@
  *     in BOTH authorities is ambiguous and refused. Only an alias unknown to a verified legacy registry may select the Stripe
  *     Product promoter terms (v3/trial-campaigns.ts).
  *  3. With no new selection, the caller's CURRENT pending quote-owned sponsor link (persisted with its own quote, status
- *     quoted/checkout) resumes under Stage's frozen rules: same campaign and config only; config changed = stale. Proven
+ *     quoted/checkout) resumes under Stage's frozen rules: same campaign and config only; config changed = stale. Its provenance
+ *     is unknown, so a campaign alias that is also a Product promoter fails closed (unavailable), the link left in place. Proven
  *     disabled, expired or not started (its exact campaign id still known to a VERIFIED registry, runtime on), an unclaimed link
  *     may give way to the public offer (Stage's explicit public re-quote, with `releasePending`). A removed campaign, runtime off,
  *     or an absent/unverifiable registry proves nothing: it stays and refuses (unavailable).
@@ -184,7 +185,15 @@ export function selectTrialAuthority(input: TrialAuthorityInput): TrialAuthority
     // 3. No new selection: the pending link resumes under Stage's frozen rules. Proven off/revoked/expired by a verified
     //    registry, it may give way to the public offer (Stage's explicit public re-quote); otherwise it stays and refuses.
     if (input.pendingLink && pendingAuthorization) {
-        if (pendingAuthorization.ok) return done(sponsor(pendingAuthorization.campaign, 'pending'));
+        if (pendingAuthorization.ok) {
+            // A pending link records no entry provenance: it binds the legacy campaign but cannot stand in for a lost opaque invitation, so a
+            // campaign alias that is also a Product promoter fails closed (re-checked fresh on every read, quote and checkout).
+            const partner = pendingAuthorization.campaign.partnerId;
+            if (terms.campaigns === null || (PROMOTER_CODE_PATTERN.test(partner) && Object.hasOwn(terms.campaigns.promoters, partner))) {
+                return { ok: false, code: 'trial_offer_unavailable' };
+            }
+            return done(sponsor(pendingAuthorization.campaign, 'pending'));
+        }
         // Proven-inactive cleanup first: an active campaign whose hash changed stays stale; anything unproven stays and refuses.
         if (!pendingProvenInactive) return { ok: false, code: pendingAuthorization.reason === 'config_changed' ? 'trial_quote_stale' : 'trial_unavailable' };
     }

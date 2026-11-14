@@ -2667,6 +2667,18 @@ describe('Sponsor trial router (same Standard trial, never a second grant; Root 
         await expect(raced.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_quote_stale' });
     });
 
+    it('a pending link has unknown provenance: when its campaign alias is also a Product promoter, quote and checkout fail closed, link intact', async () => {
+        const env = runtimeEnv([campaign({ partnerId: 'midhun' })]);   // midhun is a CAMPAIGNS_ON promoter
+        const probe = build({ env });
+        const linkage = { campaignId: 'test-campaign-a', configSha256: hashOf(probe), claimed: false };
+        const f = build({ env, own: quoted(), linkage });
+        await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+        await expect(co(f)).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+        expect((await f.caller.summary() as { trialOffer?: unknown }).trialOffer).toBeNull();
+        expect(f.trial.claimTrialQuote).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
     it('global checkout off is unchanged and independent: a valid carried context does not turn checkout on', async () => {
         const f = withCookie({ read: PUBLIC_OFF, env: runtimeEnv([campaign()]), own: quoted() }, probe => carried(probe));
         f.deps.stripe = null;
