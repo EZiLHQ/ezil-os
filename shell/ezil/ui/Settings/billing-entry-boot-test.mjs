@@ -117,9 +117,20 @@ for(const [label,entry,options] of [
  ['valueless coupon_entry (settings alias)','/app/settings?tab=billing&upgrade=standard&coupon_entry',{}],
  ['opaque invite, no coupon','/os?settings=billing&upgrade=standard',{invite:true,valid:null}],
  ['refused invite, no coupon','/os?settings=billing&upgrade=standard',{invite:true,refused:true}],
+ // The summary shows no offer, or only the public one, but the accepted fresh read selects the server's invite.
+ ['fresh invite read, summary offer null','/os?settings=billing&upgrade=standard',{fresh:true,summary:'null',valid:null}],
+ ['fresh invite read, summary offer public','/os?settings=billing&upgrade=standard',{fresh:true,summary:'public',valid:null}],
+ // The AI credits recovery link (Free: it would open the Standard upgrade) beside a coupon, hint or invite entry.
+ ['recovery link + valid alias','/os?settings=billing&section=ai-credits&reason=insufficient_credits&coupon=midhun',{}],
+ ['recovery link + malformed alias','/os?settings=billing&section=ai-credits&reason=insufficient_credits&coupon=bad%20alias',{}],
+ ['recovery link + unknown coupon_entry','/os?settings=billing&section=ai-credits&reason=insufficient_credits&coupon_entry=zzz',{}],
+ ['recovery link + fresh invite read','/os?settings=billing&section=ai-credits&reason=insufficient_credits',{fresh:true,summary:'public'}],
+ ['recovery link + valid alias (settings alias)','/app/settings?tab=billing&section=ai-credits&reason=insufficient_credits&coupon=midhun',{}],
 ]){
- const read=options.refused?{ok:false,code:'trial_offer_unavailable'}:options.invite?{available:true,eligible:true,offer:{coupon:null,fingerprint:FP,source:'sponsor'}}:linkOffer;
- const b=await boot(entry,options.invite?inviteSummary():trialSummaryV3('offer'),read);
+ const sponsor={available:true,eligible:true,offer:{coupon:null,fingerprint:FP,source:'sponsor'}};
+ const read=options.refused?{ok:false,code:'trial_offer_unavailable'}:options.invite||options.fresh?sponsor:linkOffer;
+ const summaryFor=()=>{if(options.invite)return inviteSummary();const s=trialSummaryV3('offer');if(options.summary==='null')delete s.trialOffer;return s;};
+ const b=await boot(entry,summaryFor(),read);
  try{
   await b.until(()=>b.calls.some(c=>c.method==='billing.summary'));await wait(150);
   assert.equal(b.calls.filter(c=>c.method==='billing.quoteTrial'||c.method==='billing.createCheckout').length,0,`${label}: page view only reads`);

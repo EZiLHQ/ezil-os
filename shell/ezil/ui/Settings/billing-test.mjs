@@ -1735,6 +1735,117 @@ try {
             await open({ ...context, initialTab: 'billing', openUpgrade: STANDARD }); noMutations();
             assert.equal(sheets.length, 0, 'an invite entry never auto-opens');
         }
+        // The accepted FRESH read selects the server's invite while the summary shows no offer or only the public one:
+        // still an invite entry. Read-only until the CTA, which then quotes with no coupon and binds that exact offer.
+        for ( const preview of [null, previewOffer] ) {
+            reset(); getTrialOffer = () => reply({ available: true, eligible: true, offer: invite }); summary = freeWith(preview);
+            await open({ ...context, initialTab: 'billing', openUpgrade: STANDARD }); noMutations();
+            assert.equal(sheets.length, 0, `fresh invite read, summary offer ${preview ? 'public' : 'null'}: no auto-open`);
+            click(q('[data-action="trial"]')); await settle();
+            assert.equal(sheets.length, 1); assert.equal(sheets.at(-1).coupon, undefined);
+            assert.deepEqual(copy(sheets.at(-1).trialOffer), invite);
+            await closeSheet();
+        }
+        // AI credits recovery (Free: it would open the Standard upgrade) beside a coupon, hint or invite entry: held too.
+        const recoveryLink = '/os?settings=billing&section=ai-credits&reason=insufficient_credits';
+        const freeWithTopup = preview => { const s = freeWith(preview); s.actions.topup = true; s.catalog.packs = packs; return s; };
+        for ( const [label, ctx, search, answer] of [
+            ['alias', link('midhun'), recoveryLink, call => available(call.input?.coupon ?? null)],
+            ['invalid link', link(null, { couponInvalid: true }), recoveryLink, () => available(null)],
+            ['any coupon_entry', link(null, { couponEntryPresent: true }), recoveryLink, () => available(null)],
+            ['hint in the address', { ...context, initialTab: 'billing' }, `${recoveryLink}&coupon_entry=unavailable`, () => available(null)],
+            ['fresh invite read', { ...context, initialTab: 'billing' }, recoveryLink, () => reply({ available: true, eligible: true, offer: invite })],
+        ] ) {
+            reset(); getTrialOffer = answer; summary = freeWithTopup(previewOffer);
+            window.history.replaceState(null, '', search); await open(ctx); noMutations();
+            assert.equal(sheets.length, 0, `recovery link + ${label}: nothing opens`);
+            window.history.replaceState(null, '', '/os');
+        }
+        // Only the summary reports the invite (the read refuses it): the recovery and top-up links still open nothing.
+        for ( const search of [recoveryLink, '/os?settings=billing&section=ai-credits'] ) {
+            reset(); getTrialOffer = () => failure('trial_offer_unavailable'); summary = freeWithTopup(sponsorPreview);
+            window.history.replaceState(null, '', search); await open(); noMutations();
+            assert.equal(sheets.length, 0, `${search} + summary invite: nothing opens`);
+            window.history.replaceState(null, '', '/os');
+        }
+        // Positive control, unchanged: the same recovery link with no coupon context opens the Standard upgrade.
+        reset(); getTrialOffer = () => failure('trial_offer_unavailable'); summary = freeWithTopup(previewOffer);
+        window.history.replaceState(null, '', recoveryLink); await open();
+        assert.deepEqual([sheets.length, sheets.at(-1)?.kind, sheets.at(-1)?.sku], [1, 'checkout', STANDARD], 'no-coupon recovery still opens');
+        await closeSheet(); window.history.replaceState(null, '', '/os');
+        // Explicit actions are never held: Code's recovery relaunch and the person's own Add credits click still open.
+        reset(); getTrialOffer = call => available(call.input?.coupon ?? null); summary = freeWithTopup(previewOffer);
+        await open(link('midhun')); noMutations();
+        await window.ezil.registry.launch('settings', { ...context, initialTab: 'billing', billingRecovery: { reason: 'insufficient_credits' } }); await settle();
+        assert.deepEqual([sheets.length, sheets.at(-1)?.kind], [1, 'checkout'], 'Code recovery relaunch is explicit');
+        await closeSheet();
+        window.$(q('.window[data-app="settings"]')).trigger('ezil:billing-topup', [{}]); await settle();
+        assert.equal(sheets.filter(sheet => sheet.kind === 'topup').length, 1, 'explicit Add credits is never held');
+        await closeSheet();
+
+        // A purchase flag from the address, armed on a no-coupon route whose summary failed, then a coupon transition on
+        // the SAME kept window: the flag is consumed with the transition and never fires, now or on a later reload.
+        {
+            reset(); getTrialOffer = () => available(null); summary = freeWithTopup(previewOffer); getSummary = () => failure('temporary');
+            window.history.replaceState(null, '', recoveryLink); await open(); noMutations();
+            assert.equal(sheets.length, 0, 'failed summary: nothing could open yet');
+            const $kept = window.$(q('.window[data-app="settings"]'));
+            getSummary = () => reply(summary); getTrialOffer = call => available(call.input?.coupon ?? null);
+            window.history.replaceState(null, '', '/os');
+            window.billing.default.onActivate($kept, link('midhun')); await settle(); noMutations();
+            assert.equal(sheets.length, 0, 'the armed recovery flag never fires after the coupon transition');
+            assert.ok(trialCtas() > 0, 'the free-month CTA is offered instead');
+            await refresh(); noMutations();
+            assert.equal(sheets.length, 0, 'nor on a later reload of the kept window');
+            getSummary = () => reply(summary);
+        }
+
+        // Root's kept-window invite case: the address armed a purchase, the fresh NO-INPUT read selects the server's invite,
+        // but the summary fails. The read alone holds the route; a later load that shows only a public summary and read
+        // never fires the armed purchase. Control: the same sequence with a public first read still recovers as before.
+        const publicRead = () => reply({ available: true, eligible: true, offer: { coupon: null, fingerprint: 'e'.repeat(64), source: 'public' } });
+        for ( const [label, url, ctx] of [['recovery link', recoveryLink, undefined],
+            ['upgrade intent', '/os', { ...context, initialTab: 'billing', openUpgrade: STANDARD }]] ) {
+            for ( const firstRead of ['invite', 'public'] ) {
+                reset(); getSummary = () => failure('temporary');
+                getTrialOffer = firstRead === 'invite' ? () => reply({ available: true, eligible: true, offer: invite }) : publicRead;
+                summary = freeWithTopup(previewOffer); window.history.replaceState(null, '', url);
+                await open(ctx); noMutations();
+                assert.equal(sheets.length, 0, `${label}: the failed summary opened nothing`);
+                window.history.replaceState(null, '', '/os');
+                getSummary = () => reply(summary); getTrialOffer = publicRead;
+                await refresh();
+                if ( firstRead === 'invite' ) {
+                    noMutations();
+                    assert.equal(sheets.length, 0, `${label}: held by the invite read; no automatic purchase on the later load`);
+                } else {
+                    assert.equal(sheets.length, 1, `${label}: control, a genuine no-coupon request still opens`);
+                    await closeSheet();
+                }
+            }
+        }
+        getSummary = () => reply(summary);
+
+        // A DELAYED fresh invite read for the previous identity lands after a user switch on the same window: it is
+        // dropped (request/user/link checks) and never marks the new context as an invite entry or binds its offer.
+        {
+            const publicOffer = { coupon: null, fingerprint: 'e'.repeat(64), source: 'public' };
+            reset(); let releaseOld; getTrialOffer = () => new Promise(resolve => { releaseOld = () => resolve(reply({ available: true, eligible: true, offer: invite })); });
+            summary = freeWith(previewOffer);
+            await open({ ...context, initialTab: 'billing', openUpgrade: STANDARD }); noMutations();
+            assert.ok(releaseOld, 'the first read is in flight'); assert.equal(sheets.length, 0);
+            const $kept = window.$(q('.window[data-app="settings"]'));
+            getTrialOffer = () => reply({ available: true, eligible: true, offer: publicOffer });
+            window.billing.default.onActivate($kept, { ...context, initialTab: 'billing', payload: { ...payload, user: { id: 'other-user', name: 'Other' } } });
+            await settle();
+            releaseOld(); await settle();
+            const opened = sheets.filter(sheet => sheet.kind === 'checkout');
+            // The new identity's own no-coupon intent behaves as before, bound to ITS public read; the stale invite never binds.
+            assert.equal(opened.length, 1, 'one sheet, for the new context only');
+            assert.deepEqual(copy(opened[0].trialOffer), publicOffer, 'the stale invite never binds');
+            assert.equal(opened[0].coupon, undefined);
+            await closeSheet();
+        }
 
         // Outage: no CTA, a Try again that asks the SAME alias again; unavailable/invalid/refused are explained and final.
         reset(); getTrialOffer = () => failure('stripe_unavailable');
