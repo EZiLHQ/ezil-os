@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import fx from './aws-identity.fixtures.json';
 import { fixtureRebaseDeployments, fixtureRebaseRelease } from './aws-intent.test-support';
-import { buildAttestCommand, placementDigest, requestDigest, type AttestCommandInput, type LowerAttestationRecord, type LowerAttestationObservations,
+import { buildAttestCommand, placementDigest, requestDigest, type AttestCommandInput, type LowerAttestationPins, type LowerAttestationRecord, type LowerAttestationObservations,
     type LowerAttestationReserveRequest } from './aws-lower-attestation';
 import type { ImagePlacement } from './placement';
 
@@ -33,7 +33,7 @@ export const SOURCE = Buffer.from('# reviewed attest.py stand-in\n');
 export const PINNED = createHash('sha256').update(SOURCE).digest('hex');
 /** Stand-in for the reviewed AWS-RunShellScript document hash (ssm:DescribeDocument). */
 export const DOCUMENT_HASH = 'e'.repeat(64);
-export const PINS = { sourceSha256: PINNED, documentSha256: DOCUMENT_HASH };
+export const PINS: LowerAttestationPins = { sourceSha256: PINNED, documentSha256: DOCUMENT_HASH, maintenanceAmiId: 'ami-11111111111111111', userDataSha256: null };
 export const commandInput = (over: Partial<AttestCommandInput> = {}): AttestCommandInput => ({ sourceBase64: SOURCE.toString('base64'), sourceSha256: PINNED,
     attestationId: RESERVE.attestationId, computerId: RESERVE.computerId, originalVolumeId: RESERVE.sourceVolumeId, cloneVolumeId: CLONE, snapshotId: SNAPSHOT,
     fsUuid: RESERVE.fsUuid, instanceId: RESERVE.sourceInstanceId, generation: 1, leaseEpoch: 3, challenge: CHALLENGE, ...over });
@@ -46,7 +46,9 @@ export function placement(over: Partial<ImagePlacement> = {}): ImagePlacement {
         lowerImageDigest: null, lowerDigestObservedAt: null, imageUpgradeJobId: RESERVE.attestationId, ...over } as ImagePlacement;
 }
 export function reserved(over: Partial<LowerAttestationRecord> = {}): LowerAttestationRecord {
-    const { operation: _op, schemaVersion: _v, ...t } = RESERVE;
+    const t = { attestationId: RESERVE.attestationId, computerId: RESERVE.computerId, sourceInstanceId: RESERVE.sourceInstanceId, sourceVolumeId: RESERVE.sourceVolumeId,
+        fsUuid: RESERVE.fsUuid, sourceGeneration: RESERVE.sourceGeneration, sourceLeaseEpoch: RESERVE.sourceLeaseEpoch, sourceFenceToken: RESERVE.sourceFenceToken,
+        region: RESERVE.region, zoneId: RESERVE.zoneId };
     return { ...t, ownerUserId: OWNER, reservedRowSha256: placementDigest(placement()), requestSha256: requestDigest(RESERVE), challenge: CHALLENGE,
         currentInstanceId: RESERVE.sourceInstanceId, commandId: null, phase: 'reserved',
         evidence: null, evidenceSha256: null, measuredDigest: null, measuredAt: null, markerSha256: null, snapshotId: null, cloneVolumeId: null,
@@ -72,6 +74,10 @@ export function cloudTrail(over: Record<string, unknown> = {}, item: Record<stri
             ...(template === null ? {} : { launchTemplate: { launchTemplateId: SOURCE_RELEASE.launchTemplateId, version: SOURCE_RELEASE.launchTemplateVersion, ...template } }) },
         responseElements: { instancesSet: { items: [{ instanceId: RESERVE.sourceInstanceId, imageId: SOURCE_RELEASE.amiId, ...item }] } }, ...over });
 }
+/** The maintenance host's own launch: after the reservation (11:00), before the command (11:20), the target's full tuple. */
+export const maintenanceLaunch = (over: Record<string, unknown> = {}, template: Record<string, unknown> | null = {}) => cloudTrail({ eventTime: '2026-10-22T11:10:00Z',
+    eventID: 'e2e2e2e2-0000-4000-8000-000000000000', ...over }, { instanceId: MAINTENANCE, imageId: DEPLOYMENT.amiId },
+template === null ? null : { launchTemplateId: DEPLOYMENT.launchTemplateId, version: DEPLOYMENT.launchTemplateVersion, ...template });
 const TAGS = { 'ezil:managed-by': 'app-computer-platform', 'ezil:stage': DEPLOYMENT.namespace, 'ezil:computer-id': RESERVE.computerId };
 /** Every observation as the adopting side reads it from AWS; `stdout` is the invocation output (the receipt line). */
 export function observations(over: Partial<LowerAttestationObservations> = {}, stdout = receipt() + '\n'): LowerAttestationObservations {
@@ -81,6 +87,7 @@ export function observations(over: Partial<LowerAttestationObservations> = {}, s
         document: { name: 'AWS-RunShellScript', documentVersion: '1', owner: 'Amazon', documentType: 'Command', status: 'Active', hashType: 'Sha256', hash: DOCUMENT_HASH },
         invocation: { commandId: COMMAND_ID, instanceId: MAINTENANCE, status: 'Success', responseCode: 0, standardOutput: stdout, standardError: '' },
         runInstances: [cloudTrail()],
+        host: { launches: [maintenanceLaunch()], userData: '', commandIds: [COMMAND_ID], sessionIds: [] },
         snapshot: { snapshotId: SNAPSHOT, ownerId: DEPLOYMENT.accountId, volumeId: RESERVE.sourceVolumeId, volumeGiB: 20, state: 'completed', encrypted: true,
             kmsKeyId: DEPLOYMENT.dataKeyArn, startedAt: new Date('2026-10-22T11:05:00.000Z'), tags: { ...TAGS, 'ezil:attestation-id': RESERVE.attestationId } },
         clone: { volumeId: CLONE, state: 'in-use', snapshotId: SNAPSHOT, encrypted: true, kmsKeyId: DEPLOYMENT.dataKeyArn, zoneId: 'aps1-az1', sizeGiB: 20,
@@ -88,7 +95,7 @@ export function observations(over: Partial<LowerAttestationObservations> = {}, s
         original: { volumeId: RESERVE.sourceVolumeId, state: 'available', attachments: [], encrypted: true, kmsKeyId: DEPLOYMENT.dataKeyArn,
             tags: { ...TAGS, 'ezil:backup': DEPLOYMENT.namespace, 'ezil:generation': '1', 'ezil:fence-token': RESERVE.sourceFenceToken } },
         maintenance: { instanceId: MAINTENANCE, imageId: DEPLOYMENT.amiId, state: 'running', availabilityZone: 'ap-south-1a', availabilityZoneId: 'aps1-az1',
-            publicIp: null, tags: { 'ezil:attestation-id': RESERVE.attestationId, 'ezil:computer-id': RESERVE.computerId }, volumes: [{ volumeId: 'vol-77777777777777777', deviceName: '/dev/sda1', deleteOnTermination: true, tags: {} },
+            publicIp: null, tags: { ...TAGS, 'ezil:attestation-id': RESERVE.attestationId }, volumes: [{ volumeId: 'vol-77777777777777777', deviceName: '/dev/sda1', deleteOnTermination: true, tags: {} },
                 { volumeId: CLONE, deviceName: '/dev/sdf', deleteOnTermination: false, tags: {} }] },
         ...over };
 }

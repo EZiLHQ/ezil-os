@@ -8,8 +8,9 @@
  * Never prints database URLs, keys, receipts, markers, or computer, owner or instance identifiers.
  */
 import { execFile } from 'node:child_process';
-import { closeSync, constants, openSync, readFileSync, writeSync } from 'node:fs';
+import { closeSync, constants, openSync, readFileSync, realpathSync, writeSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
@@ -18,6 +19,8 @@ import { OperatorPinsSchema, OperatorRefusal, runOperator } from '../src/server/
 import type { PlacementDb } from '../src/server/lib/compute/placement';
 
 const run = promisify(execFile);
+/** The repository this script (and the store and verifier it imports) was loaded from, never the process cwd. */
+const CODE_ROOT = realpathSync(fileURLToPath(new URL('../..', import.meta.url)));
 const exclusive = (path: string) => openSync(path, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600);
 
 async function main(argv: string[]) {
@@ -31,7 +34,8 @@ async function main(argv: string[]) {
         const db: PlacementDb = { execute: q => production.execute(q), transaction: fn => production.transaction(tx => fn(tx)) };
         await runOperator(argv, {
             aws: async args => (await run('aws', [...args, '--region', region, '--output', 'json'], { maxBuffer: 16 << 20 })).stdout,
-            git: async args => (await run('git', [...args], { encoding: 'buffer', maxBuffer: 1 << 20 })).stdout as Buffer,
+            codeRoot: CODE_ROOT,
+            git: async args => (await run('git', ['-C', CODE_ROOT, ...args], { encoding: 'buffer', maxBuffer: 1 << 20 })).stdout as Buffer,
             readFile: path => readFileSync(path, 'utf8'),
             createJournal: (dir, name) => {
                 const fd = exclusive(join(dir, name));
