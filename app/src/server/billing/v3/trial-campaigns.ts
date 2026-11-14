@@ -98,8 +98,11 @@ export function normalizePromoterCode(raw: unknown): string | null {
     return PROMOTER_CODE_PATTERN.test(code) ? code : null;
 }
 
-/** sha256 of the canonical selected terms. */
-export function trialOfferFingerprint(terms: Pick<TrialProductTerms, 'productId' | 'priceId'>, publicEnabled: boolean,
+/**
+ * sha256 of the canonical selected terms. `publicEnabled` binds only the public offer (true); a promoter's offer passes
+ * null, so toggling the public switch never stales a promoter quote (the promoter wins regardless of it).
+ */
+export function trialOfferFingerprint(terms: Pick<TrialProductTerms, 'productId' | 'priceId'>, publicEnabled: boolean | null,
     coupon: string | null, expiresAt: string | null): string {
     return createHash('sha256').update(JSON.stringify({ v: 1, policy: TRIAL_POLICY_VERSION, sku: TRIAL_SKU, productId: terms.productId,
         priceId: terms.priceId, unitAmount: CATALOG_V3[TRIAL_SKU].priceCents, currency: 'usd', interval: 'month', intervalCount: 1,
@@ -127,5 +130,5 @@ export function selectTrialOffer(read: TrialPriceRead, coupon: unknown, now: Dat
     const promoter = campaigns.promoters[code]!;
     if (!promoter.enabled || (promoter.expiresAt !== null && !(Date.parse(promoter.expiresAt) > now.getTime()))) return { ok: false, code: 'trial_offer_unavailable' };
     return { ok: true, offer: { coupon: code, expiresAt: promoter.expiresAt, priceId: terms.priceId,
-        fingerprint: trialOfferFingerprint(terms, campaigns.publicEnabled, code, promoter.expiresAt) } };
+        fingerprint: trialOfferFingerprint(terms, null, code, promoter.expiresAt) } };
 }

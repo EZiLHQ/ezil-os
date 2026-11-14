@@ -257,7 +257,8 @@ export interface StripeClientOptions {
 export function createStripeRequest(opts: Pick<StripeClientOptions, 'secretKey' | 'fetch'>) {
     const fetcher = opts.fetch ?? globalThis.fetch;
 
-    async function request<T>(path: string, fields?: FormFields, idempotencyKey?: string): Promise<T> {
+    /** `signal` is optional and sent only when given, so every existing call is unchanged. */
+    async function request<T>(path: string, fields?: FormFields, idempotencyKey?: string, signal?: AbortSignal): Promise<T> {
         const headers = new Headers({
             Authorization: `Bearer ${opts.secretKey}`,
             'Stripe-Version': STRIPE_API_VERSION,
@@ -268,6 +269,7 @@ export function createStripeRequest(opts: Pick<StripeClientOptions, 'secretKey' 
             method: fields === undefined ? 'GET' : 'POST',
             headers,
             body: fields === undefined ? undefined : formBody(fields),
+            ...(signal ? { signal } : {}),
         });
         if (!response.ok) {
             // A non-JSON upstream failure still has a useful HTTP status. Never
@@ -397,14 +399,14 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
         async listProducts() { return (await listAll<ProductResponse>('/products', { active: 'true' })).map(packProduct); },
         async retrieveProduct(id) { return packProduct(await request<ProductResponse>(`/products/${encodeURIComponent(id)}`)); },
         async retrievePackPrice(id) { return packPrice(await request<Price>(`/prices/${encodeURIComponent(id)}`)); },
-        async readTrialCampaigns() {
+        async readTrialCampaigns(signal) {
             // Fresh on every call (no cache): a campaign or price change in Stripe applies at the next quote and checkout.
             // limit=2 so a second active price for the key is seen (and refused) rather than silently skipped.
             const lookupKey = offerBySku(TRIAL_SKU)!.stripeLookupKey!;
             const query = new URLSearchParams({ 'lookup_keys[]': lookupKey, active: 'true', limit: '2', 'expand[]': 'data.product' });
             type ExpandedPrice = Omit<Price, 'product'> & { recurring?: { interval?: string; interval_count?: number } | null;
                 product?: { id: string; active?: boolean; metadata?: Record<string, string> | null } | string | null };
-            const page = await request<{ data?: ExpandedPrice[]; has_more?: boolean }>(`/prices?${query}`);
+            const page = await request<{ data?: ExpandedPrice[]; has_more?: boolean }>(`/prices?${query}`, undefined, undefined, signal);
             return { hasMore: page.has_more === true, prices: (page.data ?? []).filter(item => item.lookup_key === lookupKey).map(item => ({
                 id: item.id, active: item.active === true, unitAmount: item.unit_amount ?? null, currency: item.currency ?? null,
                 interval: item.recurring?.interval ?? null, intervalCount: item.recurring?.interval_count ?? null,

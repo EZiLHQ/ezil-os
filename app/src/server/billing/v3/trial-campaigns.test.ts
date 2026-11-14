@@ -70,7 +70,7 @@ describe('selectTrialOffer', () => {
         expect(selectTrialOffer(standardTrialRead(CAMPAIGNS_ON), null, NOW)).toEqual({ ok: true,
             offer: { coupon: null, expiresAt: null, priceId: STANDARD_PRICE_ID, fingerprint: trialOfferFingerprint(ids, true, null, null) } });
         expect(selectTrialOffer(standardTrialRead(CAMPAIGNS_ON), ' MIDHUN ', NOW)).toEqual({ ok: true,
-            offer: { coupon: 'midhun', expiresAt: null, priceId: STANDARD_PRICE_ID, fingerprint: trialOfferFingerprint(ids, true, 'midhun', null) } });
+            offer: { coupon: 'midhun', expiresAt: null, priceId: STANDARD_PRICE_ID, fingerprint: trialOfferFingerprint(ids, null, 'midhun', null) } });
         expect(selectTrialOffer(standardTrialRead(), null, NOW)).toMatchObject({ ok: true, offer: { coupon: null } });
     });
 
@@ -78,6 +78,15 @@ describe('selectTrialOffer', () => {
         const read = standardTrialRead(campaigns({ version: 1, publicEnabled: false, promoters: { midhun: { enabled: true, expiresAt: '2026-11-15T00:00:00.000Z' } } }));
         expect(selectTrialOffer(read, null, NOW)).toEqual({ ok: false, code: 'trial_offer_unavailable' });
         expect(selectTrialOffer(read, 'midhun', NOW)).toMatchObject({ ok: true, offer: { coupon: 'midhun', expiresAt: '2026-11-15T00:00:00.000Z' } });
+    });
+
+    it('M1: a promoter fingerprint is the same with the public switch on or off; the public one is bound to the switch', () => {
+        const on = selectTrialOffer(standardTrialRead(campaigns({ version: 1, publicEnabled: true, promoters: { midhun: { enabled: true } } })), 'midhun', NOW);
+        const off = selectTrialOffer(standardTrialRead(campaigns({ version: 1, publicEnabled: false, promoters: { midhun: { enabled: true } } })), 'midhun', NOW);
+        expect(on.ok && off.ok && on.offer.fingerprint === off.offer.fingerprint).toBe(true);
+        expect(on.ok && on.offer.fingerprint).toBe(trialOfferFingerprint(ids, null, 'midhun', null));
+        const pub = selectTrialOffer(standardTrialRead(CAMPAIGNS_ON), null, NOW);
+        expect(pub.ok && pub.offer.fingerprint).toBe(trialOfferFingerprint(ids, true, null, null));
     });
 
     it.each([
@@ -102,11 +111,12 @@ describe('selectTrialOffer', () => {
 
 describe('trialOfferFingerprint', () => {
     it('changes with every bound term and is 64 hex', () => {
-        const base = trialOfferFingerprint(ids, true, 'midhun', null);
+        const base = trialOfferFingerprint(ids, null, 'midhun', null);
         expect(base).toMatch(/^[0-9a-f]{64}$/);
-        for (const other of [trialOfferFingerprint({ ...ids, productId: 'prod_Other' }, true, 'midhun', null),
-            trialOfferFingerprint({ ...ids, priceId: 'price_Other' }, true, 'midhun', null), trialOfferFingerprint(ids, false, 'midhun', null),
-            trialOfferFingerprint(ids, true, null, null), trialOfferFingerprint(ids, true, 'midhun', '2026-12-31T00:00:00.000Z')]) expect(other).not.toBe(base);
+        for (const other of [trialOfferFingerprint({ ...ids, productId: 'prod_Other' }, null, 'midhun', null),
+            trialOfferFingerprint({ ...ids, priceId: 'price_Other' }, null, 'midhun', null), trialOfferFingerprint(ids, null, 'other', null),
+            trialOfferFingerprint(ids, true, null, null), trialOfferFingerprint(ids, null, 'midhun', '2026-12-31T00:00:00.000Z')]) expect(other).not.toBe(base);
+        expect(trialOfferFingerprint(ids, true, null, null)).not.toBe(trialOfferFingerprint(ids, false, null, null));
     });
     it('normalizes only plain codes', () => {
         expect(normalizePromoterCode(' Midhun ')).toBe('midhun');

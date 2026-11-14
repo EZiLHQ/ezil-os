@@ -53,6 +53,20 @@ describe('Stripe pack reads', () => {
         expect(query.pathname).toBe('/v1/prices');
         expect(Object.fromEntries(query.searchParams)).toEqual({ 'lookup_keys[]': lookupKey, active: 'true', limit: '2', 'expand[]': 'data.product' });
         expect(fetcher).toHaveBeenCalledTimes(2);
+        // Without a signal the request carries none, exactly like every legacy call.
+        expect(init).not.toHaveProperty('signal');
+    });
+    it('passes an abort signal to fetch only when the trial reader is given one; other calls never carry one', async () => {
+        const { client, fetcher } = fixture({ has_more: false, data: [] });
+        const controller = new AbortController();
+        await client.readTrialCampaigns!(controller.signal);
+        expect(inspect(fetcher, 0).init?.signal).toBe(controller.signal);
+        fetcher.mockResolvedValueOnce(Response.json({ error: {} }, { status: 404 }));
+        await client.retrieveCoupon('missing');
+        expect(inspect(fetcher, 1).init).not.toHaveProperty('signal');
+        controller.abort();
+        fetcher.mockImplementationOnce(async (_url, init) => { if (init?.signal?.aborted) throw new DOMException('aborted', 'AbortError'); return Response.json({}); });
+        await expect(client.readTrialCampaigns!(controller.signal)).rejects.toThrow('aborted');
     });
     it('a campaign trial checkout uses the exact verified price, binds the offer as metadata, and never discounts', async () => {
         const { client, fetcher } = fixture({ id: 'cs_trial', url: 'https://checkout.stripe.com/trial', client_secret: null });

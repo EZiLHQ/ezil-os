@@ -447,9 +447,9 @@ export interface StripePackApi {
     retrieveCoupon(id: string): Promise<StripeCoupon | null>;
     /**
      * Every active price of the Standard monthly v3 lookup key with its Product expanded (metadata included), read fresh:
-     * no cache. v3/trial-campaigns.ts decides validity. Throws on a provider error; a missing reader offers no trial.
+     * no cache. v3/trial-campaigns.ts decides validity. Throws on a provider error or abort; a missing reader offers no trial.
      */
-    readTrialCampaigns?(): Promise<TrialPriceRead>;
+    readTrialCampaigns?(signal?: AbortSignal): Promise<TrialPriceRead>;
     retrieveCheckoutLineItems(sessionId: string): Promise<StripeCheckoutLineItem[]>;
 }
 

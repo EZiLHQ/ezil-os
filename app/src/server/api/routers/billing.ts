@@ -178,13 +178,32 @@ async function trialCheckoutCall<T>(call: () => Promise<T>): Promise<T> {
  * (v3/trial-campaigns.ts). No reader or a failed read refuses `stripe_unavailable`; an unavailable offer refuses with its
  * own code. Never a fallback offer.
  */
-async function trialOfferNow(stripe: StripeApi, coupon: string | null, now: Date): Promise<TrialOfferSelection> {
-    if (!stripe.readTrialCampaigns) throw billingError('stripe_unavailable', 'INTERNAL_SERVER_ERROR');
+async function trialOfferNow(stripe: StripeApi, coupon: string | null, now: Date, timeoutMs = TRIAL_READ_TIMEOUT_MS): Promise<TrialOfferSelection> {
     let read: TrialPriceRead;
-    try { read = await stripe.readTrialCampaigns(); } catch { throw billingError('stripe_unavailable', 'INTERNAL_SERVER_ERROR'); }
+    try { read = await readTrialCampaignsBounded(stripe, timeoutMs); } catch { throw billingError('stripe_unavailable', 'INTERNAL_SERVER_ERROR'); }
     const selected = selectTrialOffer(read, coupon, now);
     if (!selected.ok) throw trialError(selected.code);
     return selected.offer;
+}
+
+/** The query, quote and checkout bound; the summary's own (public-only, optional) read is tighter. */
+const TRIAL_READ_TIMEOUT_MS = 5_000;
+const SUMMARY_TRIAL_READ_TIMEOUT_MS = 750;
+/**
+ * One campaigns read, bounded: the request is aborted at the deadline, and the race settles at the deadline even if a
+ * reader ignores the signal. No reader rejects (fail closed).
+ */
+async function readTrialCampaignsBounded(stripe: StripeApi, timeoutMs: number): Promise<TrialPriceRead> {
+    if (!stripe.readTrialCampaigns) throw new Error('trial_reader_missing');
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([stripe.readTrialCampaigns(controller.signal), new Promise<never>((_, reject) => {
+            timer = setTimeout(() => { controller.abort(); reject(new Error('trial_reader_timeout')); }, timeoutMs);
+        })]);
+    } finally {
+        clearTimeout(timer);
+    }
 }
 
 /** The viewer's trial eligibility from server facts only (auth.users, trial rows, paid history, plan, operator grant). */
@@ -194,11 +213,19 @@ async function trialEligibilityFor(store: TrialStore, deps: BillingDeps, userId:
     return { facts, decision: trialEligibility({ facts, planFamily, operatorPlan: operatorGrantInEffect(grants, deps.now()) !== null }) };
 }
 
+/**
+ * The summary's trial field describes the PUBLIC offer only (a promoter's offer is `billing.trialOffer`). A paid or
+ * ineligible viewer keeps its reason without any Stripe call. An eligible Free viewer gets the offer only when a fresh,
+ * 750 ms-bounded read shows the public offer on; public off, bad terms or a provider outage answer null, and never fail
+ * the rest of the summary.
+ */
 async function trialOfferFor(deps: BillingDeps, userId: string, planFamily: string): Promise<BillingSummaryV3['trialOffer']> {
     if (!hasTrials(deps.store) || planFamily !== 'free') return undefined;
     try {
         const { decision } = await trialEligibilityFor(deps.store, deps, userId, planFamily);
         if (!decision.eligible) return { eligible: false, reason: decision.reason };
+        if (!deps.stripe || !checkoutAvailable(deps.config)) return null;
+        try { await trialOfferNow(deps.stripe, null, deps.now(), SUMMARY_TRIAL_READ_TIMEOUT_MS); } catch { return null; }
         const terms = trialTerms(deps.now());
         return { eligible: true, sku: TRIAL_SKU, endsAt: isoSeconds(epochSeconds(terms.trialEnd)), amountCents: terms.amountCents, currency: 'usd' };
     } catch {
@@ -675,9 +702,17 @@ export function createBillingRouter(getDeps: () => BillingDeps,
          * The Stripe-controlled trial offer for an optional coupon, read-only: the same fresh verifier as quoteTrial, but no
          * claim, no retire, no store write, no customer and no grant. Combine with the summary's own trial eligibility.
          */
-        trialOffer: protectedProcedure.input(z.object({ coupon: z.string().max(64).optional() }).strict().optional()).query(async ({ input }) => {
-            const offer = await trialOfferNow(configuredStripe(getDeps()), input?.coupon ?? null, getDeps().now());
-            return { available: true as const, offer: { coupon: offer.coupon, fingerprint: offer.fingerprint } };
+        trialOffer: protectedProcedure.input(z.object({ coupon: z.string().max(64).optional() }).strict().optional()).query(async ({ ctx, input }) => {
+            const deps = getDeps();
+            const stripe = configuredStripe(deps);
+            // This person first (read-only: plan, trial facts, identity, operator grant), then the fresh provider offer.
+            const store = deps.store;
+            if (!hasTrials(store)) throw trialError('trial_unavailable');
+            const { plan } = await currentPlan(deps, ctx.user.id);
+            const { facts, decision } = await trialEligibilityFor(store, deps, ctx.user.id, plan.family);
+            if (!decision.eligible || facts.emailNormalized === null) throw trialError('trial_unavailable');
+            const offer = await trialOfferNow(stripe, input?.coupon ?? null, deps.now());
+            return { available: true as const, eligible: true as const, offer: { coupon: offer.coupon, fingerprint: offer.fingerprint } };
         }),
 
         quoteTrial: protectedProcedure.input(z.object({ coupon: z.string().max(64).optional() }).strict().optional()).mutation(async ({ ctx, input }) => {
