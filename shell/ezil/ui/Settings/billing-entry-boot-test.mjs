@@ -11,7 +11,9 @@ const assets=process.env.EZIL_SHELL_OUT_DIR||path.resolve(here,'../../../../app/
 const bundle=readFileSync(path.join(assets,'bundle.min.js'),'utf8'),icons=readFileSync(path.join(assets,'icons.js'),'utf8');
 const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 const end='2027-02-28T03:00:00Z';let groups=0;
-async function boot(entry,summary){
+// The server's read-only availability answer (billing.trialOffer) and the offer its activation quote carries.
+const FP='f'.repeat(64),PUBLIC={available:true,eligible:true,offer:{coupon:null,fingerprint:FP,source:'public'}};
+async function boot(entry,summary,trialOffer=PUBLIC){
  const dom=new JSDOM('<!doctype html><div id="ezil-os-root"></div>',{url:'https://os.example'+entry,runScripts:'outside-only',pretendToBeVisual:true});
  const w=dom.window,calls=[],observers=[];const Observer=w.MutationObserver;w.MutationObserver=class extends Observer{constructor(callback){super(callback);observers.push(this);}};w.matchMedia=()=>({matches:false,addEventListener(){},removeEventListener(){}});
  w.__EZIL_BOOT__={user:{id:'own-user',email:'test@example.test'},computer:{id:'11111111-1111-4111-8111-111111111111',name:'Own',slot:1},apps:[{id:'desktop'}],desktopState:{configured:false,provider:'cloudflare-guacamole'},features:{billing:true}};
@@ -20,7 +22,9 @@ async function boot(entry,summary){
   const method=String(url).split('/api/trpc/')[1]?.split('?')[0];calls.push({url:String(url),method,input:options.body?JSON.parse(options.body).json:undefined});
   if(method==='billing.summary')return reply(summary);
   if(method==='billing.history'||method==='computer.list')return reply([]);
-  if(method==='billing.quoteTrial')return reply({sku:'standard_monthly_v3',todayCents:0,trialEndsAt:end,firstChargeAt:end,amountCents:2000,currency:'usd',interval:'month'});
+  if(method==='billing.trialOffer')return trialOffer.ok===false?{ok:false,status:400,json:async()=>({error:{json:{message:trialOffer.code,data:{code:'BAD_REQUEST'}}}})}:reply(trialOffer);
+  if(method==='billing.quoteTrial')return reply({sku:'standard_monthly_v3',todayCents:0,trialEndsAt:end,firstChargeAt:end,amountCents:2000,currency:'usd',interval:'month',
+   offer:{coupon:trialOffer.offer?.coupon??null,fingerprint:FP,source:trialOffer.offer?.source??'public'}});
   if(method==='billing.createCheckout')return reply({mode:'embedded',sessionId:'cs_fake',clientSecret:'secret',publishableKey:'pk_test'});
   if(method==='billing.checkoutStatus')return reply({status:'open',paymentStatus:null});
   return {ok:false,status:404,json:async()=>({error:{json:{message:'fake unavailable'}}})};
@@ -49,15 +53,43 @@ for(const entry of ['primary','plan-card','deep-link','canonical-deep-link','AI-
  try{
   if(entry==='primary'||entry==='plan-card'){
    const selector=entry==='primary'?'[data-role="plan-actions"] [data-action="trial"]':'[data-role="plan-offer"][data-sku="standard_monthly_v3"] [data-action="trial"]';
-   const btn=b.w.document.querySelector(selector);assert.ok(btn);btn.click();btn.click();
+   const btn=b.w.document.querySelector(selector);assert.ok(btn);
+   assert.equal(b.calls.filter(c=>c.method==='billing.quoteTrial'||c.method==='billing.createCheckout').length,0,'page view only reads');
+   btn.click();btn.click();
   }
   await b.until(()=>b.w.document.querySelector('[data-role="fake-checkout"]'));
   assert.equal(b.calls.filter(c=>c.method==='billing.quoteTrial').length,1,entry);
   const creates=b.calls.filter(c=>c.method==='billing.createCheckout');assert.equal(creates.length,1,entry);
-  assert.equal(JSON.stringify(creates[0].input),JSON.stringify({sku:'standard_monthly_v3',trial:{trialEndsAt:end}}));
+  assert.equal(JSON.stringify(creates[0].input),JSON.stringify({sku:'standard_monthly_v3',trial:{trialEndsAt:end,offer:{coupon:null,fingerprint:FP}}}));
   assert.equal(b.w.document.querySelector('[data-action="trial-continue"]'),null);
   assert.equal(b.w.document.querySelectorAll('[data-role="upgrade-sheet"]').length,1);
   groups++;console.log('PASS actual entry one activation',entry);
+ }finally{b.close();}
+}
+// The summary's preview alone never shows a free month: a refused read leaves no trial CTA and sends no quote.
+for(const code of ['trial_offer_unavailable','trial_unavailable']){
+ const b=await boot('/os?settings=billing',trialSummaryV3('offer'),{ok:false,code});
+ try{
+  await b.until(()=>b.calls.some(c=>c.method==='billing.trialOffer'));await wait(50);
+  assert.equal(b.w.document.querySelector('[data-action="trial"]'),null,code);
+  assert.equal(b.calls.filter(c=>c.method==='billing.quoteTrial'||c.method==='billing.createCheckout').length,0);
+  groups++;console.log('PASS actual boot refused read shows no free month',code);
+ }finally{b.close();}
+}
+// Stage's verified opaque invite rides the server's HttpOnly cookie: no coupon in the address, none sent. The server's
+// sponsor selection is shown, quoted and echoed exactly.
+{
+ const summary=trialSummaryV3('offer');summary.trialOffer.source='sponsor';
+ const b=await boot('/os?settings=billing',summary,{available:true,eligible:true,offer:{coupon:null,fingerprint:FP,source:'sponsor'}});
+ try{
+  await b.until(()=>b.w.document.querySelector('[data-role="coupon-offer"]')&&b.w.document.querySelector('[data-action="trial"]'));
+  assert.equal(b.calls.filter(c=>c.method==='billing.quoteTrial'||c.method==='billing.createCheckout').length,0,'page view only reads');
+  b.w.document.querySelector('[data-role="plan-offer"][data-sku="standard_monthly_v3"] [data-action="trial"]').click();
+  await b.until(()=>b.w.document.querySelector('[data-role="fake-checkout"]'));
+  const quotes=b.calls.filter(c=>c.method==='billing.quoteTrial');assert.equal(quotes.length,1);assert.ok(!quotes[0].input||!('coupon' in quotes[0].input),'no coupon sent');
+  const creates=b.calls.filter(c=>c.method==='billing.createCheckout');assert.equal(creates.length,1);
+  assert.equal(JSON.stringify(creates[0].input),JSON.stringify({sku:'standard_monthly_v3',trial:{trialEndsAt:end,offer:{coupon:null,fingerprint:FP}}}));
+  groups++;console.log('PASS actual boot opaque invite: no coupon, one activation, exact echo');
  }finally{b.close();}
 }
 console.log(`${groups} actual boot/entry groups passed; all HTTP/Stripe doubled`);
