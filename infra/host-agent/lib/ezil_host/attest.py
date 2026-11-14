@@ -26,6 +26,7 @@ VOL_RE = re.compile(r'vol-[0-9a-f]{17}')
 SNAP_RE = re.compile(r'snap-[0-9a-f]{17}')
 IID_RE = re.compile(r'i-[0-9a-f]{17}')
 DIGEST_RE = re.compile(r'sha256:[0-9a-f]{64}')
+CHALLENGE_RE = re.compile(r'[0-9a-f]{64}')
 
 
 def _arg(pattern):
@@ -53,6 +54,7 @@ def parse_args(argv):
     p.add_argument('--instance-id', required=True, type=_arg(IID_RE))
     p.add_argument('--generation', required=True, type=_counter)
     p.add_argument('--lease-epoch', required=True, type=_counter)
+    p.add_argument('--challenge', required=True, type=_arg(CHALLENGE_RE))
     a = p.parse_args(argv)
     if a.clone_volume_id == a.original_volume_id:
         raise Refused('original_volume_named')
@@ -60,8 +62,9 @@ def parse_args(argv):
 
 
 def check_marker(m, a):
-    """The clone's marker names the ORIGINAL volume, this computer and fs, the source
-    instance that took its epoch, and is not ahead of the reserved placement."""
+    """The clone's marker names the ORIGINAL volume, this computer and fs, no other source
+    instance, and is not ahead of the reserved placement. An older marker without
+    instanceId is reported as it is; the server then requires usage-ledger provenance."""
     if not isinstance(m, dict):
         raise Refused('marker_missing')
     for key, value, code in (('computerId', a.computer_id, 'computer_id_mismatch'),
@@ -69,9 +72,7 @@ def check_marker(m, a):
                              ('fsUuid', a.fs_uuid, 'fs_uuid_mismatch')):
         if m[key] != value:
             raise Refused(code)
-    if m.get('instanceId') is None:
-        raise Refused('marker_instance_unknown')
-    if m['instanceId'] != a.instance_id:
+    if m.get('instanceId') is not None and m['instanceId'] != a.instance_id:
         raise Refused('instance_id_mismatch')
     if m['generation'] > a.generation:
         raise Refused('generation_ahead')
@@ -104,6 +105,13 @@ def _run(argv):
 def _require_readonly_device(dev):
     if _run(['findmnt', '-n', '--source', dev]).returncode == 0:
         raise Refused('clone_already_mounted')
+    # A journal that needs replay would be read past with noload: an inconsistent view is no measurement.
+    header = _run(['dumpe2fs', '-h', dev])
+    features = [line for line in header.stdout.splitlines() if line.startswith('Filesystem features:')]
+    if header.returncode != 0 or len(features) != 1:
+        raise Refused('fs_state_unknown')
+    if 'needs_recovery' in features[0].split(':', 1)[1].split():
+        raise Refused('needs_recovery')
     if _run(['blockdev', '--setro', dev]).returncode != 0 or _run(['blockdev', '--getro', dev]).stdout.strip() != '1':
         raise Refused('not_readonly', 'blockdev')
 
@@ -154,6 +162,7 @@ def attest(cfg, a, now=None):
     return {'v': 1, 'kind': RECEIPT_KIND, 'attestationId': a.attestation_id, 'computerId': a.computer_id,
             'originalVolumeId': a.original_volume_id, 'cloneVolumeId': a.clone_volume_id, 'snapshotId': a.snapshot_id,
             'fsUuid': a.fs_uuid, 'sourceInstanceId': a.instance_id, 'generation': a.generation, 'leaseEpoch': a.lease_epoch,
+            'challenge': a.challenge,
             'maintenanceInstanceId': maintenance_iid, 'identityDocument': document, 'identitySignature': signature,
             'mountOptions': opts, 'blockDeviceReadOnly': True,
             'markerBase64': base64.b64encode(raw).decode('ascii'), 'markerSha256': hashlib.sha256(raw).hexdigest(),
@@ -162,11 +171,16 @@ def attest(cfg, a, now=None):
 
 
 def main(cfg, argv):
-    """Prints exactly one canonical receipt line on success; REFUSE <code> otherwise."""
+    """Prints exactly one canonical receipt line on success (0); REFUSE <code> otherwise (2).
+    Self-contained: the pinned SSM delivery runs this module without the AMI's cli."""
     try:
-        a = parse_args(argv)
-    except SystemExit:
-        raise Refused('arguments_invalid')
-    receipt = attest(cfg, a)
+        try:
+            a = parse_args(argv)
+        except SystemExit:
+            raise Refused('arguments_invalid')
+        receipt = attest(cfg, a)
+    except Refused as e:
+        print(f'REFUSE {e.code}', flush=True)
+        return 2
     print(json.dumps(receipt, sort_keys=True, separators=(',', ':')), flush=True)
     return 0
