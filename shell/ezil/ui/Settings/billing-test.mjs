@@ -975,11 +975,29 @@ try {
         summary.plan = { ...summary.plan, renewal: null, cancelsAt: null, access };
         summary.actions = { ...summary.actions, checkout: false, upgrade: false, downgrade: false, cancel: false };
         await refresh(); audit();
-        contains('[data-role="plan-card"]', 'Assigned by EZiL · no payment');
+        // An older server's access (no issuedBy) is EZiL's; the card never says "no payment".
+        contains('[data-role="plan-card"] .ezil-billing-plan-price', 'Assigned by EZiL');
+        assert.equal(q('[data-role="plan-card"] .ezil-billing-plan-price').textContent, 'Assigned by EZiL');
+        assert.doesNotMatch(q('[data-role="plan-card"]').textContent, /no payment/i);
         contains('[data-role="plan-card"]', line);
         assert.doesNotMatch(q('[data-role="plan-card"]').textContent, /Renews|\$20 \/ month|Cancel/);
     }
     pass('product entitlements v1: an operator-assigned plan shows as assigned access with its validity, never a price or renewal');
+
+    // Issuing organization: the name the server reports; EZiL when none, blank or not a string; always text, never markup.
+    for ( const [issuedBy, line] of [['Acme', 'Assigned by Acme'], ['EZiL', 'Assigned by EZiL'], ['', 'Assigned by EZiL'], ['   ', 'Assigned by EZiL'],
+        [null, 'Assigned by EZiL'], [42, 'Assigned by EZiL'], ['<img src=x onerror="window.__issuedByXss=1"> & Co', 'Assigned by <img src=x onerror="window.__issuedByXss=1"> & Co']] ) {
+        summary = summaryV3('standard');
+        summary.plan = { ...summary.plan, renewal: null, cancelsAt: null,
+            access: { source: 'operator', ref: 'osg-00000000-0000-4000-8000-000000000001', endsAt: '2026-12-04T12:00:00Z', untilRevoked: false, issuedBy } };
+        summary.actions = { ...summary.actions, checkout: false, upgrade: false, downgrade: false, cancel: false };
+        await refresh(); audit();
+        assert.equal(q('[data-role="plan-card"] .ezil-billing-plan-price').textContent, line);
+        assert.equal(q('[data-role="plan-card"] img'), null, 'an issuing organization name is never markup');
+        assert.doesNotMatch(q('[data-role="plan-card"]').textContent, /no payment|Renews|\$20 \/ month/i);
+        contains('[data-role="plan-card"]', 'Your access ends on Dec 4, 2026.');
+    }
+    pass('issuing organization: "Assigned by Acme"; omitted, blank or legacy access is "Assigned by EZiL"; the name is escaped text');
 
     // Identity credits (`ai.account`): every live grant in the total, exact microcredits, never the catalog.
     {
