@@ -586,8 +586,10 @@ function currentPlanV3 (summary, banner) {
     const status = { free: 'Free', active: 'Active', cancels: 'Ends soon', past_due: 'Past due', incomplete: 'Payment incomplete', upgrade_pending: 'Upgrade pending' }[plan.status] ?? 'Active';
     const offer = offerFor(summary, plan.sku);
     // Product entitlements v1: a plan an EZiL operator assigned is not a payment: no price, renewal or Stripe action.
+    // It names the issuing organization the server reports (EZiL when none was given, or from an older server).
     const assigned = plan.access?.source === 'operator' ? plan.access : null;
-    const price = assigned ? 'Assigned by EZiL · no payment' : plan.sku === 'free_v3' ? '$0' : offer ? `${dollars(offer.priceCents, { compact: true })} / month`
+    const issuedBy = typeof assigned?.issuedBy === 'string' && assigned.issuedBy.trim() ? assigned.issuedBy.trim() : 'EZiL';
+    const price = assigned ? `Assigned by ${issuedBy}` : plan.sku === 'free_v3' ? '$0' : offer ? `${dollars(offer.priceCents, { compact: true })} / month`
         : plan.renewal ? `${dollars(plan.renewal.amountCents, { compact: true })} / month` : '';
     const renewal = assigned ? assigned.untilRevoked || !assigned.endsAt ? 'Your access continues until EZiL ends it.' : `Your access ends on ${dateLabel(assigned.endsAt, true)}.`
         : plan.sku === 'free_v3' ? 'Free · no card on file'
