@@ -653,26 +653,35 @@ def prospective_count(d,records):
     return registry_count(d)+len({key(r) for r in records}-retained)
 
 
-def require_reader_promotion(path,plan,count,apply,generation,deployed_agent):
-    """Promote past the legacy limit only over a proven reader: the plan-bound apply-app receipt, the
-    plan app's source, the reviewed host-agent delta, and a fresh protected probe of the running build."""
-    if count<=json_tool.RELEASE_REGISTRY_CAPACITY:return
+def probe_plan_app(path,plan,operation,count):
+    """The protected read-only host probe: the running build is the plan app (source, compose tag, one image)."""
     app=plan['rollout']['app']
-    need(app['gitSha']==plan['bake']['agentCommit'],'app and host must use the same reviewed integrated source commit')
-    require_host_abi(deployed_agent,plan['bake']['agentCommit'])
-    require_reader_capacity(count,app['gitSha'])
-    receipt=require_receipt(path,'apply-app')
-    need(type(receipt.get('readerCapacity')) is int and receipt['readerCapacity']>=count,
-         'apply-app receipt does not prove a reader for the larger registry')
-    if not apply:return
-    observed=rebase_ssm.run(Path(path).parent,'promote-reader-probe-g'+str(generation),rebase_app.probe_body(app['tag']),True,
-                            aws,json_tool.write,fresh=True)
+    observed=rebase_ssm.run(Path(path).parent,operation,rebase_app.probe_body(app['tag']),True,aws,json_tool.write,fresh=True)
     need(isinstance(observed,dict) and observed.get('killSwitch')=='1' and observed.get('lockFree') is True
          and observed.get('gitSha')==observed.get('servedSha')==app['gitSha'] and observed.get('composeTag')==app['tag']
          and manifest.matches(r'sha256:[0-9a-f]{64}',observed.get('imageId'))
          and observed['imageId']==observed.get('tagImageId')==observed.get('composeImageId'),
          'running app is not the plan-bound apply-app build')
     require_runtime_capacity(observed,count)
+    return observed
+
+
+def require_reader_promotion(path,plan,count,apply,generation,deployed_agent):
+    """Promote past the legacy limit only over a proven reader: the plan-bound apply-app receipt (which
+    recorded the image installed from the plan's checksum-pinned artifact), the plan app's source, the
+    reviewed host-agent delta, and a fresh protected probe showing that same image still running."""
+    if count<=json_tool.RELEASE_REGISTRY_CAPACITY:return
+    app=plan['rollout']['app']
+    need(app['gitSha']==plan['bake']['agentCommit'],'app and host must use the same reviewed integrated source commit')
+    require_host_abi(deployed_agent,plan['bake']['agentCommit'])
+    require_reader_capacity(count,app['gitSha'])
+    receipt=require_receipt(path,'apply-app')
+    need(type(receipt.get('readerCapacity')) is int and receipt['readerCapacity']>=count
+         and manifest.matches(r'sha256:[0-9a-f]{64}',receipt.get('imageId')),
+         'apply-app receipt does not prove a reader for the larger registry')
+    if not apply:return
+    observed=probe_plan_app(path,plan,'promote-reader-probe-g'+str(generation),count)
+    need(observed['imageId']==receipt['imageId'],'running image is not the image apply-app installed')
 
 
 def app_operation(path,plan,operation,apply,expected=None,install=True,generation=None):
@@ -749,9 +758,12 @@ def apply_app(manifest_path,apply,ledger_path=None):
         # could not parse the live registry before anything is written or installed.
         count=registry_count(d)
         require_reader_capacity(count,plan['rollout']['app']['gitSha'])
-        if prospective_count(d,[value])>json_tool.RELEASE_REGISTRY_CAPACITY:
-            # Its promotion will pass the legacy limit: the new app meets hosts on the deployed agent first.
+        future=prospective_count(d,[value])
+        if future>json_tool.RELEASE_REGISTRY_CAPACITY:
+            # Its promotion will pass the legacy limit: the new app meets hosts on the deployed agent first,
+            # and must parse the registry its promotion will write.
             require_host_abi(deployed['agentCommit'],plan['bake']['agentCommit'])
+            require_reader_capacity(future,plan['rollout']['app']['gitSha'])
         ledger,generation=begin_operation(ledger_path,ledger,path,plan,'apply-app',envelope,d,d,apply,fd)
         result=app_operation(path,plan,'apply-app',apply,rebase_app.public_deployment(d),generation=generation)
         check=json_tool.secret_aws(['get-secret-value','--secret-id',json_tool.SECRET,'--output','json'],lock_fd=fd)
@@ -759,6 +771,11 @@ def apply_app(manifest_path,apply,ledger_path=None):
         if apply:
             need(result is not None,'app verification missing')
             require_runtime_capacity(result,count)
+            if future>json_tool.RELEASE_REGISTRY_CAPACITY:
+                # Bind the image just installed from the plan's checksum-pinned artifact to this receipt;
+                # promote past the legacy limit requires that same image still running.
+                observed=probe_plan_app(path,plan,'apply-app-reader-probe-g'+str(generation),future)
+                result={**result,'imageId':observed['imageId']}
             write_receipt(path,'apply-app',result)
             append_ledger(ledger_path,ledger,path,plan,'apply-app',check,d,result['gitSha'])
     need(load_plan(path)==plan,'plan changed during app deployment')

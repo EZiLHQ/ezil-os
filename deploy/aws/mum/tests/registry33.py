@@ -148,7 +148,7 @@ class HostAbiTests(unittest.TestCase):
 class PromotionGuardTests(unittest.TestCase):
     def setUp(self):
         self.plan = {'rollout': {'app': {'tag': TAG, 'gitSha': SHA, 'checksumSha256': '0' * 64}}, 'bake': {'agentCommit': SHA}}
-        self.receipt = {'gitSha': SHA, 'killSwitch': '1', 'deployment': {}, 'readerCapacity': 33}
+        self.receipt = {'gitSha': SHA, 'killSwitch': '1', 'deployment': {}, 'readerCapacity': 33, 'imageId': IMAGE}
         self.observed = {'gitSha': SHA, 'servedSha': SHA, 'killSwitch': '1', 'composeTag': TAG, 'imageId': IMAGE,
                          'tagImageId': IMAGE, 'composeImageId': IMAGE, 'lockFree': True, 'readerCapacity': 33}
         self.calls = []
@@ -184,6 +184,10 @@ class PromotionGuardTests(unittest.TestCase):
         cases = [
             (dict(receipt={k: v for k, v in self.receipt.items() if k != 'readerCapacity'}), 'apply-app receipt does not prove'),
             (dict(receipt=dict(self.receipt, readerCapacity=32)), 'apply-app receipt does not prove'),
+            (dict(receipt={k: v for k, v in self.receipt.items() if k != 'imageId'}), 'apply-app receipt does not prove'),
+            (dict(receipt=dict(self.receipt, imageId='unavailable')), 'apply-app receipt does not prove'),
+            (dict(observed=dict(self.observed, imageId='sha256:' + 'c' * 64, tagImageId='sha256:' + 'c' * 64,
+                                composeImageId='sha256:' + 'c' * 64)), 'running image is not the image apply-app installed'),
             (dict(capacity=32), 'target app cannot read the live release registry'),
             (dict(count=34), 'target app cannot read the live release registry'),
             (dict(abi=lambda *a: (_ for _ in ()).throw(ValueError('host agent differs from the deployed agent beyond the reviewed delta'))),
@@ -247,9 +251,65 @@ globalThis.fetch = async (url, init) => {
                 self.assertIsNone(self.probe(mode)['readerCapacity'])
 
     def test_probe_is_bounded_and_fixed(self):
-        self.assertIn("fetch('http://127.0.0.1:3000/api/health',{signal:AbortSignal.timeout(5000),redirect:'error'", rebase_app.NODE)
+        self.assertIn("fetch('http://127.0.0.1:3000/api/health',{signal:AbortSignal.timeout(5000),redirect:'error'})", rebase_app.NODE)
         self.assertEqual(rebase_app.NODE.count('fetch('), 1)
+        self.assertNotIn('cache:', rebase_app.NODE)
         self.assertIn('readerCapacity', swap_ops.PROBE_KEYS)
+
+
+class RealHttpProbeTests(unittest.TestCase):
+    """The production NODE with only its port swapped, against a real HTTP server: real fetch, real redirect handling."""
+
+    def serve(self, status, body, location=None):
+        import http.server
+        import threading
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.server.paths.append(self.path)
+                self.send_response(status)
+                if location:
+                    self.send_header('Location', location)
+                payload = json.dumps(body).encode()
+                self.send_header('content-type', 'application/json')
+                self.send_header('content-length', str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+        server.paths = []
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def probe(self, server):
+        port = server.server_address[1]
+        node = rebase_app.NODE.replace('http://127.0.0.1:3000/api/health', f'http://127.0.0.1:{port}/api/health')
+        self.assertEqual(node.count(f'127.0.0.1:{port}'), 1)
+        environment = {'PATH': os.environ['PATH'], 'EZIL_GIT_SHA': SHA, 'EZIL_AWS_KILL_SWITCH': '1',
+                       'EZIL_AWS_LIFECYCLE_DEPLOYMENTS': json.dumps({TOOL.REGION: dict(release_record(), releases=[release_record()])})}
+        result = subprocess.run(['node', '-e', node], env=environment, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)['readerCapacity']
+
+    def test_real_fetch_reads_capacity_only_from_matching_health(self):
+        version = subprocess.run(['node', '--version'], capture_output=True, text=True, check=True).stdout.strip()
+        print(f'node {version}', file=sys.stderr)
+        ok = self.serve(200, {'ok': True, 'sha': SHA, 'registryCapacity': 33})
+        self.assertEqual(self.probe(ok), 33)
+        self.assertEqual(ok.paths, ['/api/health'])
+        for status, body, location in ((302, {'ok': True, 'sha': SHA, 'registryCapacity': 33}, '/elsewhere'),
+                                       (503, {'ok': True, 'sha': SHA, 'registryCapacity': 33}, None),
+                                       (200, {'ok': True, 'sha': 'e' * 40, 'registryCapacity': 33}, None),
+                                       (200, {'ok': True, 'sha': SHA}, None)):
+            with self.subTest(status=status, body=body):
+                server = self.serve(status, body, location)
+                self.assertIsNone(self.probe(server))
+                self.assertEqual(server.paths, ['/api/health'])  # never followed the redirect
 
 
 class LegacyGcParityTests(unittest.TestCase):

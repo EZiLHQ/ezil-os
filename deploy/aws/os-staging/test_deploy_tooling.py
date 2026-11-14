@@ -76,8 +76,6 @@ elif name == "docker":
         sys.stdout.write("image:" + args[1])
     elif args[:1] == ["load"]:
         (state / "loaded").write_bytes(sys.stdin.buffer.read())
-    elif args[:2] == ["image", "inspect"] and '--format' in args and after('--format') == '{{json .Config.Labels}}':
-        print(os.environ.get('FAKE_LABELS', 'null'))
     elif args[:2] == ["image", "inspect"]:
         if args[2] == 'sha256:' + '1' * 64:
             print('2' * 40)
@@ -109,7 +107,10 @@ elif name == "docker":
     elif "exec" in args:
         if os.environ.get('FAKE_EXEC_CONSUMES_STDIN'):  # real `compose exec -T` forwards stdin
             sys.stdin.buffer.read()
-        print(os.environ['FAKE_SHA'] if 'process.stdout.write' in args[-1] else "Deployed SHA: " + os.environ["FAKE_SHA"])
+        if 'registryCapacity' in args[-1]:  # the installer's post-recreate capacity read of the running app
+            sys.stdout.write(os.environ.get('FAKE_RUNNING_CAPACITY', 'unavailable'))
+        else:
+            print(os.environ['FAKE_SHA'] if 'process.stdout.write' in args[-1] else "Deployed SHA: " + os.environ["FAKE_SHA"])
 elif name == "curl":
     if args[-1] == 'http://169.254.169.254/latest/api/token':
         print('fixture-imds-token')

@@ -301,7 +301,10 @@ class VerifiedInstallTests(SandboxTestCase):
                 calls = self.box.calls()
                 enabled = {c[3] for c in calls if c[:3] == ['systemctl', 'enable', '--now']}
                 self.assertEqual(enabled, {f'ezil-os-staging-{j}.timer' for j in JOBS})
-                self.assertEqual(len([c for c in calls if c[0] == 'docker' and 'exec' in c]), 2)
+                execs = [c for c in calls if c[0] == 'docker' and 'exec' in c]
+                # The registry capacity read of the running app, then both source/SHA exec checks.
+                self.assertEqual(len(execs), 3)
+                self.assertIn('registryCapacity', execs[0][-1])
 
     def test_wrong_image_on_stdin_transport_still_fails_without_timer_restore(self):
         receipt = self.prepare(containerd=True)

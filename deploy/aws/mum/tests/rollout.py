@@ -1444,7 +1444,7 @@ class IntegrationTests(unittest.TestCase):
                 if cid not in self.command_results:
                     if '-apply-schema-' in comment:
                         result={'Status':'Success','ResponseCode':0,'StandardOutputContent':json.dumps(self.schema_receipt())}
-                    elif 'promote-reader-probe-g' in comment:
+                    elif 'reader-probe-g' in comment:
                         result={'Status':'Success','ResponseCode':0,'StandardOutputContent':json.dumps(self.reader_probe())}
                     else:
                         payload=next(body for key,body in self.payloads.items() if key.rsplit('/',1)[-1][:32] in comment)
@@ -1639,6 +1639,8 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(TOOL.pair({'settings':{'deployment':self.running_deployment}}),before)
         receipt=RELEASE.require_receipt(self.path,'apply-app')
         self.assertEqual(receipt['readerCapacity'],33)
+        self.assertEqual(receipt['imageId'],self.reader_probe()['imageId'])  # the image apply-app installed
+        self.assertTrue(any('apply-app-reader-probe-g' in c for c in self.commands.values()))
         RELEASE.promote(self.manifest,True)
         target=manifest.read(self.manifest)
         self.assertEqual(len(self.running_deployment['releases']),33)
@@ -1654,9 +1656,20 @@ class IntegrationTests(unittest.TestCase):
 
     def test_thirty_third_record_refused_without_a_proven_running_reader(self):
         self.reader_fixture(32)
-        self.through_app()  # the installed app's health reports no capacity: the legacy null ABI
-        self.assertIsNone(RELEASE.require_receipt(self.path,'apply-app')['readerCapacity'])
-        self.assert_no_promotion_write('apply-app receipt does not prove a reader')
+        self.through_ready()
+        # The installed app's health reports no capacity (the legacy null ABI): apply-app writes no receipt.
+        with self.assertRaisesRegex(ValueError,'running app reader capacity is below'):
+            RELEASE.apply_app(self.manifest,True)
+        self.assertFalse((self.directory/'apply-app-receipt.json').exists())
+        self.assertEqual(RELEASE.load_ledger(self.ledger)['entries'][-1]['state'],'pending')
+        self.assertNotIn(('secret','put-secret-value'),self.calls)
+
+    def test_thirty_third_record_refused_when_the_running_image_is_not_the_installed_one(self):
+        self.reader_fixture(32);self.health_capacity=33
+        self.through_app()
+        other='sha256:'+'c'*64
+        self.probe_override={'imageId':other,'tagImageId':other,'composeImageId':other}
+        self.assert_no_promotion_write('running image is not the image apply-app installed')
 
     def test_thirty_third_record_refused_when_the_running_build_is_not_the_plan_app(self):
         self.reader_fixture(32);self.health_capacity=33
@@ -1668,24 +1681,30 @@ class IntegrationTests(unittest.TestCase):
                 self.probe_override=override;self.command_results.clear()
                 self.assert_no_promotion_write(message)
 
-    def test_thirty_third_record_refused_for_a_thirty_two_source(self):
-        self.reader_fixture(32,capacity=32);self.health_capacity=33
-        self.through_app()
-        self.assert_no_promotion_write('target app cannot read the live release registry')
-
-    def test_full_thirty_three_record_registry_refuses_promotion_before_secret_write(self):
-        self.reader_fixture(33);self.health_capacity=33
-        self.through_app()
-        self.assert_no_promotion_write('registry full')
-
-    def test_apply_app_refuses_a_thirty_two_reader_once_thirty_three_records_are_live(self):
-        self.reader_fixture(33,capacity=32);self.health_capacity=33
+    def assert_apply_app_refused(self,message):
         self.through_ready()
         ledger=self.ledger.read_bytes();self.calls.clear()
-        with self.assertRaisesRegex(ValueError,'target app cannot read the live release registry'):
+        with self.assertRaisesRegex(ValueError,message):
             RELEASE.apply_app(self.manifest,True)
         self.assertEqual(self.ledger.read_bytes(),ledger)
         self.assertFalse(any(c[:2]==('ssm','send-command') for c in self.calls))
+        self.assertFalse((self.directory/'apply-app-receipt.json').exists())
+
+    def test_thirty_third_record_refused_for_a_thirty_two_source(self):
+        # Refused at apply-app, before any install: its promotion would write a registry this app cannot parse.
+        self.reader_fixture(32,capacity=32);self.health_capacity=33
+        self.assert_apply_app_refused('target app cannot read the live release registry')
+
+    def test_full_thirty_three_record_registry_refuses_a_thirty_fourth_before_install_or_secret_write(self):
+        self.reader_fixture(33);self.health_capacity=33
+        self.assert_apply_app_refused('target app cannot read the live release registry')
+        with self.assertRaisesRegex(ValueError,'registry full'):
+            TOOL.edit_release_secret(copy.deepcopy(self.envelope),TOOL.pair({'settings':{'deployment':self.running_deployment}}),
+                                     TOOL.pair({'settings':{'deployment':self.running_deployment}}),[dict(self.source,amiId='ami-'+'f'*17)])
+
+    def test_apply_app_refuses_a_thirty_two_reader_once_thirty_three_records_are_live(self):
+        self.reader_fixture(33,capacity=32);self.health_capacity=33
+        self.assert_apply_app_refused('target app cannot read the live release registry')
 
     def test_oversized_whole_secret_refuses_promotion_before_intent_or_provider_write(self):
         self.seed_registry(31);self.through_app()
