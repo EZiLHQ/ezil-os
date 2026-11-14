@@ -804,6 +804,11 @@ export interface FlipPlacementToAwsInput {
     pendingReady?: boolean;
     /** Receipt of the already admitted, restored AWS host. No new host is launched here. */
     fields: PlacementFields & { region: 'ap-south-1'; instanceId: string; volumeId: string; fsUuid: string };
+    /**
+     * The lower that host attested at its migration enrollment (provider-migrate-provision.ts). Published with the row,
+     * in the same transaction; absent for a boot that attested nothing, whose lower stays unrecorded (fail closed).
+     */
+    lowerAttestation?: LowerAttestation;
 }
 
 /** Retire/remove the old immutable row and publish the restored host atomically.
@@ -820,14 +825,19 @@ export function flipPlacementToAws(db: PlacementDb, input: FlipPlacementToAwsInp
         if (!migration || migration.state !== 'restored' || migration.user_id !== ownerUserId
             || migration.computer_id !== computerId || migration.to_provider !== 'aws-ec2'
             || String(migration.last_error ?? '').startsWith('recovery:')) throw new Error('migration_not_restored');
-        if (input.fields.region !== 'ap-south-1' || !input.fields.instanceId || !input.fields.volumeId || !input.fields.fsUuid) {
+        if (input.fields.region !== 'ap-south-1' || !input.fields.instanceId || !input.fields.volumeId || !input.fields.fsUuid
+            || (input.lowerAttestation !== undefined && !validLowerAttestation(input.lowerAttestation))) {
             throw new Error('migration_aws_receipt_invalid');
         }
         const current = (await readPlacement(tx, computerId)).record;
         if (current?.provider === 'aws-ec2' && current.ownerUserId === ownerUserId
             && current.instanceId === input.fields.instanceId && current.volumeId === input.fields.volumeId
             && current.fsUuid === input.fields.fsUuid && current.fenceToken === (input.fields.fenceToken ?? null)
-            && current.state === (input.pendingReady ? 'PROVISIONING' : 'RUNNING')) return current;
+            && current.state === (input.pendingReady ? 'PROVISIONING' : 'RUNNING')) {
+            // A repeated publication never writes a lower: it must find exactly the one it would have published.
+            if (await readRecordedLowerDigest(tx, computerId) !== (input.lowerAttestation?.lowerImageDigest ?? null)) throw new Error('migration_placement_conflict');
+            return current;
+        }
         if (current) {
             if (current.provider !== 'cloudflare' || current.ownerUserId !== ownerUserId) throw new Error('migration_source_mismatch');
             let retired = current;
@@ -846,6 +856,17 @@ export function flipPlacementToAws(db: PlacementDb, input: FlipPlacementToAwsInp
         }
         const created = await createInTx(tx, { computerId, ownerUserId, provider: 'aws-ec2', state: input.pendingReady ? 'PROVISIONING' : 'RUNNING', fields: input.fields }, true);
         if (!created.ok) throw new Error('migration_placement_conflict');
+        const a = input.lowerAttestation;
+        if (a) {
+            // The row this transaction created, and only while it has no lower: a failure rolls the publication back with it.
+            const p = created.placement;
+            const rows = rowsOf(await tx.execute(sql`/* placement:migration-lower */ UPDATE public.ezil_computer_placements
+                SET lower_image_digest = ${a.lowerImageDigest}, lower_digest_observed_at = ${a.observedAt}::timestamptz
+                WHERE computer_id = ${computerId}::uuid AND owner_user_id = ${ownerUserId}::uuid AND provider = 'aws-ec2'
+                  AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch} AND instance_id = ${input.fields.instanceId}
+                  AND lower_image_digest IS NULL AND image_upgrade_job_id IS NULL RETURNING computer_id`));
+            if (rows.length !== 1) throw new Error('migration_placement_conflict');
+        }
         return created.placement;
     });
 }
@@ -1676,6 +1697,17 @@ export async function checkEnrollmentDigest(db: PlacementExecutor, p: Placement,
         WHERE computer_id = ${p.computerId}::uuid AND generation = ${p.generation} AND lease_epoch = ${p.leaseEpoch}
           AND enroll_consumed_hash = ${p.enrollConsumedHash} AND image_upgrade_job_id IS NULL LIMIT 2`));
     return rows.length === 1 && rows[0]!.lower_image_digest === digest;
+}
+
+/** A host's authenticated lower (enroll.py `committed_digest`, accepted at enrollment) and the server's ISO time of that enrollment. */
+export interface LowerAttestation {
+    lowerImageDigest: string;
+    observedAt: string;
+}
+export function validLowerAttestation(a: unknown): a is LowerAttestation {
+    const v = a as Partial<LowerAttestation> | null;
+    return typeof v === 'object' && v !== null && typeof v.lowerImageDigest === 'string' && /^sha256:[0-9a-f]{64}$/.test(v.lowerImageDigest)
+        && typeof v.observedAt === 'string' && Number.isFinite(Date.parse(v.observedAt)) && new Date(v.observedAt).toISOString() === v.observedAt;
 }
 
 /** The lower this computer's volume last booted on (enrollment or image-job evidence); null when never recorded or unreadable. */
