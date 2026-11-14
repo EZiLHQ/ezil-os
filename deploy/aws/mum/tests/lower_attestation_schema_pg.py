@@ -32,6 +32,8 @@ DRIFTS = (('anon grant', 'GRANT SELECT ON public.ezil_computer_lower_attestation
           ('policy', 'CREATE POLICY p ON public.ezil_computer_lower_attestations USING (true);'),
           ('privilege via role membership', 'CREATE ROLE grp NOLOGIN; GRANT grp TO anon; GRANT SELECT ON public.ezil_computer_lower_attestations TO grp;'),
           ('column acl', 'GRANT SELECT (region) ON public.ezil_computer_lower_attestations TO authenticated;'),
+          ('invalid reserved unique index', "UPDATE pg_index SET indisvalid=false WHERE indexrelid='public.ezil_computer_lower_attestations_reserved_idx'::regclass;"),
+          ('not-ready index', "UPDATE pg_index SET indisready=false WHERE indexrelid='public.ezil_computer_lower_attestations_computer_idx'::regclass;"),
           ('disabled trigger', 'ALTER TABLE public.ezil_computer_lower_attestations DISABLE TRIGGER ezil_computer_lower_attestations_guard;'))
 
 
@@ -56,7 +58,9 @@ def main(argv):
                     '-e', 'POSTGRES_DB=postgres', IMAGE], check=True, capture_output=True, timeout=180)
     try:
         for _ in range(90):
-            if psql(ADMIN, 'SELECT 1;', check=False).returncode == 0:
+            logs = subprocess.run(['docker', 'logs', NAME], capture_output=True, text=True).stderr
+            # the image starts a temporary init server first; wait for the real one
+            if logs.count('ready to accept connections') >= 2 and psql(ADMIN, 'SELECT 1;', check=False).returncode == 0:
                 break
             subprocess.run(['sleep', '1'])
         psql(ADMIN, "CREATE ROLE anon NOLOGIN; CREATE ROLE authenticated NOLOGIN; CREATE ROLE service_role NOLOGIN;"
@@ -129,10 +133,15 @@ def production_script(sql, pins, system_id):
         (shim / 'curl').write_text('#!/bin/sh\ncase "$*" in *api/token*) echo SYNTHETICTOKEN;; *instance-id*) echo "${SHIM_INSTANCE:-' + target['host'] + '}";; esac\n')
         (shim / 'ip').write_text('#!/bin/sh\necho "2: eth0    inet ${SHIM_IP:-' + target['ip'] + '}/24 brd 10.63.20.255 scope global eth0"\n')
         # maps the approved container name onto the disposable one; refuses any other container
-        (shim / 'docker').write_text('#!/bin/bash\n[ "$1" = exec ] || exit 99\nshift; pre=()\nwhile [ "$1" != ' + target['container'] + ' ]; do pre+=("$1"); shift; [ $# -gt 0 ] || exit 98; done; shift\nexec ' + real + ' exec "${pre[@]}" ' + NAME + ' "$@"\n')
+        # Maps the approved container name onto the disposable one and logs psql arguments. Hostile
+        # container-inherited settings come FIRST so the script's own -e flags must override them.
+        (shim / 'docker').write_text('#!/bin/bash\n[ "$1" = exec ] || exit 99\nshift; pre=()\nwhile [ "$1" != ' + target['container'] + ' ]; do pre+=("$1"); shift; [ $# -gt 0 ] || exit 98; done; shift\n'
+                                     'case "$*" in *psql*) printf "%s\\n" "$*" >> "$SHIM_LOG";; esac\n'
+                                     'hostile=(-e PGHOST=evil.invalid -e PGPORT=1 -e PGHOSTADDR=203.0.113.9 -e PGSERVICE=evil -e "PGOPTIONS=-c default_transaction_read_only=on")\n'
+                                     'exec ' + real + ' exec "${hostile[@]}" "${pre[@]}" ' + NAME + ' "$@"\n')
         for tool in ('curl', 'ip', 'docker'):
             (shim / tool).chmod(0o755)
-        env = {'PATH': str(shim) + ':' + os.environ['PATH'], 'HOME': str(shim)}
+        env = {'PATH': str(shim) + ':' + os.environ['PATH'], 'HOME': str(shim), 'SHIM_LOG': str(shim / 'psql.log')}
         run = lambda body, **extra: subprocess.run(['bash', '-c', body], env={**env, **extra}, capture_output=True, text=True, timeout=120)
         for mode, expected in (('read', 'any'), ('apply', 'empty'), ('read', 'exact')):
             body = la.remote_body(la.build_transaction(sql, p, mode, expected), target, p['nonce'], mode)
@@ -143,6 +152,8 @@ def production_script(sql, pins, system_id):
             if mode == 'read' and expected == 'any':
                 assert run(body, SHIM_INSTANCE='i-00000000000000000').returncode == 71, 'wrong instance refused before the database'
                 assert run(body, SHIM_IP='10.0.0.9').returncode == 72, 'wrong local IP refused before the database'
+        logged = (shim / 'psql.log').read_text().splitlines()
+        assert logged and all('-h /var/run/postgresql -p 5432 -U postgres -d postgres' in line for line in logged), logged
         assert 'password' not in body.lower() and 'postgresql://' not in body and 's3://' not in body
 
 

@@ -183,7 +183,8 @@ ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -qx '@IP@' || exit 72
 f=$(mktemp); trap 'rm -f "$f"' EXIT
 printf '%s' '@PAYLOAD@' | base64 -d | gzip -dc > "$f"
 printf '%s  %s\n' @SHA@ "$f" | sha256sum --check --status
-docker exec -i @OPTS@ @CONTAINER@ psql -X -q -A -t -v ON_ERROR_STOP=1 -U @ROLE@ -d @DATABASE@ -f - < "$f"
+docker exec @CONTAINER@ test -S /var/run/postgresql/.s.PGSQL.5432 || exit 73
+docker exec -i -e PGHOST=/var/run/postgresql -e PGPORT=5432 -e PGSERVICEFILE=/dev/null -e PGSYSCONFDIR=/nonexistent -e PGPASSFILE=/dev/null @OPTS@ @CONTAINER@ env @UNSET@ psql -X -q -A -t -v ON_ERROR_STOP=1 -h /var/run/postgresql -p 5432 -U @ROLE@ -d @DATABASE@ -f - < "$f"
 '''
 
 
@@ -194,9 +195,11 @@ def remote_body(transaction, target, nonce, mode='apply'):
         prefix = '\n'.join(k + ' = ' + repr(v) for k, v in constants.items())
         return "set -euo pipefail\nset +x\numask 077\npython3 - <<'EZIL_LA_PY'\n" + prefix + URL_PROGRAM + "\nEZIL_LA_PY\n"
     payload = base64.b64encode(gzip.compress(transaction.encode(), 9, mtime=0)).decode()
+    # Container-inherited PGSERVICE/PGHOSTADDR/PGOPTIONS are unset inside the exec (an empty value is not "unset" to libpq).
     opts = "-e 'PGOPTIONS=-c default_transaction_read_only=on'" if mode == 'read' else ''
+    unset = '-u PGSERVICE -u PGHOSTADDR' + ('' if mode == 'read' else ' -u PGOPTIONS')
     script = EXEC_SCRIPT
-    for key, value in (('HOST', target['host']), ('IP', target['ip']), ('PAYLOAD', payload), ('SHA', sha(transaction.encode())), ('OPTS', opts),
+    for key, value in (('HOST', target['host']), ('IP', target['ip']), ('PAYLOAD', payload), ('SHA', sha(transaction.encode())), ('OPTS', opts), ('UNSET', unset),
                        ('CONTAINER', target['container']), ('ROLE', ROLE), ('DATABASE', DATABASE)):
         need(re.fullmatch(r'[A-Za-z0-9+/=_.:@ \'-]*', value) is not None, 'unsafe transport constant')
         script = script.replace('@' + key + '@', value)
@@ -278,9 +281,18 @@ def poll(path, state, target, aws, write, sleep=time.sleep):
         result = aws('ssm', 'get-command-invocation', '--command-id', state['commandId'], '--instance-id', target['host'])
         if result['Status'] in ('Pending', 'InProgress', 'Delayed'):
             sleep(5); continue
-        state['status'] = 'complete' if result['Status'] == 'Success' and result['ResponseCode'] == 0 else 'failed'; write(path, state)
-        need(state['status'] == 'complete', 'SSM operation failed; outcome unknown, reconcile read-only')
-        receipt = manifest.loads(result['StandardOutputContent'].strip())
+        # Retain the raw invocation privately and durably BEFORE any state change or parsing.
+        write(Path(str(path).replace('-ssm.json', '-invocation.json')), dict(commandId=state['commandId'], invocation={
+            k: result.get(k) for k in ('Status', 'ResponseCode', 'StandardOutputContent', 'StandardErrorContent')}))
+        ok, receipt = result['Status'] == 'Success' and result['ResponseCode'] == 0, None
+        if ok:
+            try:
+                receipt = manifest.loads(result['StandardOutputContent'].strip())
+                ok = isinstance(receipt, dict)
+            except Exception:
+                ok = False
+        state['status'] = 'complete' if ok else 'failed'; write(path, state)
+        need(ok, 'SSM operation failed; outcome unknown, reconcile read-only')
         if target['transport'] == 'url':
             aws('s3api', 'delete-object', '--bucket', target['bucket'], '--key', state['key'])
         return receipt
@@ -290,13 +302,13 @@ def poll(path, state, target, aws, write, sleep=time.sleep):
 def command_terminal(directory, label, expected_body, target, aws):
     """Reconcile requires the journal to bind exactly the expected command and that command to be terminal."""
     path = journal_path(directory, label)
-    if not path.exists():
-        return True  # intent without a journal: no send was ever attempted
+    # A missing journal is UNKNOWN (lost, deleted, or never durable): never proof that nothing was sent.
+    need(path.exists() and not path.is_symlink(), 'SSM journal binding mismatch')
     state = manifest.read(path)
     expected = expected_journal(label, expected_body, target)
     need(set(state) == set(expected) | {'status', 'commandId'} and all(state[k] == v for k, v in expected.items()) and state['status'] in ('uploading', 'submitting', 'complete', 'failed'), 'SSM journal binding mismatch')
     if state['status'] == 'uploading':
-        return True
+        return True  # the 'submitting' state is made durable before any send, so 'uploading' proves no send
     found = aws('ssm', 'list-commands', '--instance-id', target['host'], '--filters', json.dumps([{'key': 'DocumentName', 'value': 'AWS-RunShellScript'}]))
     need(not found.get('NextToken'), 'incomplete SSM reconciliation')
     matches = [c for c in found['Commands'] if c.get('Comment') == state['comment'] and c.get('InstanceIds') == [target['host']]]
@@ -315,16 +327,34 @@ def aws_cli(*args):
 
 
 # ---- operations ----
+def fsync_directory(path):
+    fd = os.open(os.path.dirname(os.path.abspath(path)), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_durable(path, value, flags):
+    """Private (0600 regardless of umask) and durable: file fsync, then parent-directory fsync."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | flags, 0o600)
+    with os.fdopen(fd, 'wb') as out:
+        os.fchmod(out.fileno(), 0o600)
+        out.write(canonical(value) + b'\n')
+        out.flush()
+        os.fsync(out.fileno())
+    fsync_directory(path)
+
+
 def write_json(path, value):
-    tmp = Path(str(path) + '.tmp')
-    tmp.write_bytes(canonical(value) + b'\n')
+    tmp = str(path) + '.tmp'
+    write_durable(tmp, value, os.O_TRUNC)
     os.replace(tmp, path)
+    fsync_directory(path)
 
 
 def create_exclusive(path, value):
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, 'wb') as out:
-        out.write(canonical(value) + b'\n')
+    write_durable(path, value, os.O_EXCL)
 
 
 def load_pinned(target_name, sql_path=SQL_PATH, catalog_path=CATALOG_PATH, pin=None):

@@ -69,13 +69,17 @@ class Fixture(unittest.TestCase):
         if "EZIL_LA_PY" in body:
             return self.run_url_program(body)
         self.assertIn('[ "$id" = "i-09012068d96166828" ]', body); self.assertIn("grep -qx '10.63.20.252'", body)
-        self.assertIn('docker exec -i', body); self.assertIn(' supabase-db psql ', body); self.assertIn('-U postgres -d postgres', body)
+        self.assertIn('docker exec -i', body); self.assertIn(' supabase-db env -u PGSERVICE -u PGHOSTADDR', body); self.assertIn('-U postgres -d postgres', body)
+        self.assertIn('-h /var/run/postgresql -p 5432 -U postgres -d postgres', body)
+        for pinned in ('-e PGHOST=/var/run/postgresql', '-e PGPORT=5432', ' env -u PGSERVICE -u PGHOSTADDR', '-e PGSERVICEFILE=/dev/null', '-e PGSYSCONFDIR=/nonexistent', 'test -S /var/run/postgresql/.s.PGSQL.5432 || exit 73'):
+            self.assertIn(pinned, body)
         for forbidden in ('postgresql://', 's3://', 'PGPASSWORD', 'password', 'ssh ', 'tunnel'):
             self.assertNotIn(forbidden, body)
         payload = re.search(r"printf '%s' '([A-Za-z0-9+/=]+)' \| base64 -d \| gzip -dc", body)[1]
         tx = gzip.decompress(base64.b64decode(payload)).decode()
         self.assertEqual(la.sha(tx.encode()), re.search(r"printf '%s  %s\\n' ([0-9a-f]{64}) ", body)[1])
-        self.assertEqual('read_only=on' in body, 'READ ONLY;' in tx.split('\n', 1)[0])
+        self.assertEqual('-e PGOPTIONS=-c default_transaction_read_only=on' in body.replace("'", ''), 'READ ONLY;' in tx.split('\n', 1)[0])
+        if 'READ ONLY;' not in tx.split('\n', 1)[0]: self.assertIn('env -u PGSERVICE -u PGHOSTADDR -u PGOPTIONS psql', body)  # inherited container options never apply
         self.transactions.append(tx)
         code, out = self.psql(tx)
         return {'Status': 'Success' if code == 0 else 'Failed', 'ResponseCode': code, 'StandardOutputContent': out}
@@ -369,6 +373,89 @@ class Flow(Fixture):
         with self.assertRaisesRegex(ValueError, 'not terminal'): la.reconcile(self.target_name, d, self.aws, **self.kw)
         self.pending = False
         la.reconcile(self.target_name, d, self.aws, **self.kw)
+
+    def test_missing_journal_is_unknown_and_never_permits_a_fresh_send(self):
+        for db in (la.EMPTY, AFTER):
+            with self.subTest(db=db):
+                self.state = copy.deepcopy(la.EMPTY)
+                d, p, psha = self.make_plan('m%d' % (db is AFTER)); self.lost_send = True; self.pending = True
+                with self.assertRaises(TimeoutError): self.do_apply(d, p, psha)
+                self.lost_send = False; self.state = copy.deepcopy(db)
+                (d / ('lower-attestation-schema-' + self.target_name + '-apply-ssm.json')).unlink()  # journal lost; original may still be pending
+                sends = len(self.sent)
+                with self.assertRaisesRegex(ValueError, 'journal binding'): la.reconcile(self.target_name, d, self.aws, **self.kw)
+                with self.assertRaisesRegex(ValueError, 'run reconcile'): self.do_apply(d, p, psha)
+                self.assertEqual(len(self.sent), sends); self.assertTrue(self.file(d, 'intent').exists()); self.assertFalse(list(d.glob('*.closed-*')))
+                self.pending = False
+
+    def test_state_files_are_private_and_durable(self):
+        old = __import__('os').umask(0)
+        self.addCleanup(__import__('os').umask, old)
+        os_ = __import__('os'); synced = []
+        real = os_.fsync
+        def record(fd):
+            synced.append('dir' if __import__('stat').S_ISDIR(os_.fstat(fd).st_mode) else 'file'); real(fd)
+        with patch('os.fsync', record):
+            la.write_json(self.dir / 'a.json', {'x': 1}); la.create_exclusive(self.dir / 'b.json', {'y': 2})
+        self.assertEqual(synced, ['file', 'dir', 'dir', 'file', 'dir'])  # tmp file, its dir, replace dir; exclusive file, its dir
+        for name in ('a.json', 'b.json'): self.assertEqual(os_.stat(self.dir / name).st_mode & 0o777, 0o600)
+        self.assertFalse((self.dir / 'a.json.tmp').exists())
+
+    def test_persistence_failure_blocks_send_and_submitted_state_precedes_send(self):
+        d, p, psha = self.make_plan(); planned = len(self.sent)
+        real = la.write_json
+        def failing(path, value):
+            if isinstance(value, dict) and value.get('status') == 'submitting': raise OSError('disk full')
+            real(path, value)
+        with patch.object(la, 'write_json', failing), self.assertRaises(OSError): self.do_apply(d, p, psha)
+        self.assertEqual(len(self.sent), planned); self.assertEqual(self.state, la.EMPTY)
+        d2, p2, h2 = self.make_plan('o2'); planned = len(self.sent)
+        with patch.object(la, 'create_exclusive', side_effect=OSError('disk full')), self.assertRaises(OSError): self.do_apply(d2, p2, h2)
+        self.assertEqual(len(self.sent), planned)
+        d3, p3, h3 = self.make_plan('o3'); seen = []
+        original = self.aws
+        def spy(*args):
+            if args[:2] == ('ssm', 'send-command'):
+                seen.append(json.loads(self.file(d3, 'intent').read_bytes())['state'])
+                seen.append(json.loads((d3 / ('lower-attestation-schema-' + self.target_name + '-apply-ssm.json')).read_bytes())['status'])
+            return original(*args)
+        with patch.object(self, 'aws', spy):
+            la.apply(self.target_name, d3, p3, h3, SQL_SHA, spy, True, **self.kw)
+        self.assertEqual(seen, ['submitting', 'submitting'])
+
+    def test_raw_invocation_retained_before_completion_and_parse(self):
+        d, p, psha = self.make_plan(); order = []
+        real = la.write_json
+        def spy(path, value):
+            order.append(Path(path).name.replace('lower-attestation-schema-' + self.target_name + '-', '') + ':' + str(value.get('status', '') if 'invocation' not in value else 'raw'))
+            real(path, value)
+        with patch.object(la, 'write_json', spy): self.do_apply(d, p, psha)
+        raw = d / ('lower-attestation-schema-' + self.target_name + '-apply-invocation.json')
+        self.assertLess(order.index('apply-invocation.json:raw'), order.index('apply-ssm.json:complete'))
+        self.assertEqual(raw.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads(raw.read_bytes())['invocation']['Status'], 'Success')
+        self.assertEqual(json.loads(json.loads(raw.read_bytes())['invocation']['StandardOutputContent'])['mode'], 'apply')
+
+    def test_malformed_or_failed_output_is_retained_privately_and_never_printed(self):
+        for label, output in (('bad', 'not json {"secret":"postgresql://u:pw@h"}'), ('trunc', '{"schemaVersion":1,'), ('arr', '[1]')):
+            with self.subTest(label=label):
+                self.state = copy.deepcopy(la.EMPTY)
+                d, p, psha = self.make_plan('x' + label)
+                real = self.aws
+                def aws(*args, _real=real, _out=output):
+                    result = _real(*args)
+                    return dict(result, StandardOutputContent=_out) if args[:2] == ('ssm', 'get-command-invocation') else result
+                with patch('sys.stderr', io.StringIO()) as err:
+                    with self.assertRaisesRegex(ValueError, 'outcome unknown') as caught: la.apply(self.target_name, d, p, psha, SQL_SHA, aws, True, **self.kw)
+                self.assertNotIn('pw@', str(caught.exception))
+                raw = d / ('lower-attestation-schema-' + self.target_name + '-apply-invocation.json')
+                self.assertEqual(json.loads(raw.read_bytes())['invocation']['StandardOutputContent'], output); self.assertEqual(raw.stat().st_mode & 0o777, 0o600)
+                self.assertEqual(manifest.read(d / ('lower-attestation-schema-' + self.target_name + '-apply-ssm.json'))['status'], 'failed')
+                sends = len(self.sent)
+                with self.assertRaisesRegex(ValueError, 'run reconcile'): self.do_apply(d, p, psha)
+                self.assertEqual(len(self.sent), sends)
+                la.reconcile(self.target_name, d, self.aws, **self.kw)  # read-only reconcile still works (DB did commit)
+                self.assertEqual(manifest.read(self.file(d, 'receipt'))['kind'], 'reconciled')
 
     def test_exclusive_intent_refuses_second_writer(self):
         d, p, psha = self.make_plan()
