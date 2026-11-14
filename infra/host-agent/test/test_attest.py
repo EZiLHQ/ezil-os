@@ -142,8 +142,10 @@ class Attest(unittest.TestCase):
             ('computer_id_mismatch', dict(MARKER, computerId='44444444-4444-4444-8444-444444444444')),
             ('volume_id_mismatch', dict(MARKER, volumeId=CLONE)),
             ('fs_uuid_mismatch', dict(MARKER, fsUuid='55555555-5555-4555-8555-555555555555')),
-            ('generation_ahead', dict(MARKER, generation=4)),
-            ('epoch_ahead', dict(MARKER, leaseEpoch=8)),
+            ('generation_mismatch', dict(MARKER, generation=4)),
+            ('generation_mismatch', dict(MARKER, generation=2)),
+            ('epoch_mismatch', dict(MARKER, leaseEpoch=8)),
+            ('epoch_mismatch', dict(MARKER, leaseEpoch=6)),
             ('instance_id_mismatch', dict(MARKER, instanceId='i-' + '8' * 17)),
             ('marker_malformed', dict(MARKER, lowerImageDigest='sha256:short')),
         ]
