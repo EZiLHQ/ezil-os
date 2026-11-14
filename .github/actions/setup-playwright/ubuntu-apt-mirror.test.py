@@ -82,6 +82,20 @@ class AptMirrorTests(unittest.TestCase):
             with self.assertRaises(m.Refused):
                 m.recover(SOURCE, value, lambda _: False, mock.Mock(), mock.Mock(), NOW)
 
+    def test_regional_ec2_primary_is_accepted_and_resolved_but_lookalikes_fail_closed(self):
+        ec2 = MIRRORS.replace(b'http://azure.archive.ubuntu.com/', b'http://us-east-2.ec2.archive.ubuntu.com/')
+        seen = []
+        m.recover(SOURCE, ec2, lambda host: seen.append(host) or True, None, None, NOW)
+        self.assertEqual(sorted(seen), ['archive.ubuntu.com', 'security.ubuntu.com', 'us-east-2.ec2.archive.ubuntu.com'])
+        for bad in [ec2.replace(b'priority:1', b'priority:2'),
+                    ec2.replace(b'us-east-2.ec2', b'us-east-2.ec2.evil'),
+                    ec2.replace(b'http://us-east-2.ec2.archive.ubuntu.com/', b'https://us-east-2.ec2.archive.ubuntu.com/'),
+                    ec2.replace(b'us-east-2', b'evil'),
+                    ec2.replace(b'http://us-east-2.ec2.archive.ubuntu.com/ubuntu/', b'http://us-east-2.ec2.archive.ubuntu.com/other/'),
+                    ec2 + b'https://evil.example/ubuntu/\tpriority:4\n']:
+            with self.subTest(bad=bad[:60]), self.assertRaises(m.Refused):
+                m.recover(SOURCE, bad, lambda _: True, None, None, NOW)
+
     def test_tampered_signature_download_failure_and_oversize_prevent_returned_rewrite(self):
         def rejected(_):
             raise m.Refused('release_signature')

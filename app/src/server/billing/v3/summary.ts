@@ -15,7 +15,7 @@ import {
 import { deriveStanding, operatorAccessFor, paidAccess } from './standing';
 import { fairUseAllowance, renewalGrantPending } from './funding';
 export { fairUseAllowance, renewalGrantPending, GRANT_PENDING_SECONDS } from './funding';
-import type { OperatorEntitlementRow } from './operator-access';
+import { issuedByOf, type OperatorEntitlementRow } from './operator-access';
 import {
     reverseHoldOpenable, reverseMoveView, reverseMoveVisible, reverseTryAgainForbidden, type ReverseMovePlacementView,
 } from '../../lib/compute/provider-reverse';
@@ -474,7 +474,7 @@ export function buildSummaryV3(input: Parameters<typeof buildSummaryV2>[0] & {
         scheduledChange, pendingUpgrade, paymentIssue, graceEndsAt: standing.graceEndsAt, planEndsAt: standing.planEndsAt,
         // Product entitlements v1: assigned by an EZiL operator, not paid (no renewal, no Stripe actions); key absent otherwise.
         ...(operator ? { access: { source: 'operator' as const, ref: operator.ref, endsAt: operator.endsAt === null ? null : iso(operator.endsAt),
-            untilRevoked: operator.endsAt === null } } : {}),
+            untilRevoked: operator.endsAt === null, issuedBy: issuedByOf(operator) } } : {}),
         ...(trial ? { trial } : {}) },
         computer: { size: size.code, vcpu: size.vcpu, memoryGiB: size.memoryGiB, sessionMaxSeconds: rated.sessionMaxSeconds,
             opening: rated.sku === 'legacy' ? 'standard' : rated.offer.opening, activeDeadline,
