@@ -1798,6 +1798,87 @@ try {
         assert.equal(sheets.at(-1)?.kind, 'upgrade'); await closeSheet();
         reset();
     }
+
+    // ── The same hold for every address-armed purchase (Add credits, recovery, upgrade), with the REAL address in the window ──
+    {
+        const paid = () => { const value = summaryV3('premium'); value.actions.topup = true; value.catalog.packs = packs; return value; };
+        const freeWith = () => { const value = summaryV3('free'); value.actions.topup = true; value.catalog.packs = packs; value.trialOffer = { eligible: true, sku: 'standard_monthly_v3', endsAt: '2026-12-05T03:30:00Z', amountCents: 2000, currency: 'usd' }; return value; };
+        const good = call => reply({ available: true, eligible: true, offer: { coupon: call.input?.coupon ?? null, fingerprint: 'c'.repeat(64) } });
+        const savedTrialOffer = getTrialOffer, savedSummary = getSummary;
+        const reset = () => { getTrialOffer = savedTrialOffer; getSummary = savedSummary; calls.length = 0; sheets.length = 0; window.history.replaceState({}, '', '/os'); };
+        const paidCalls = () => calls.filter(call => /billing\.(quoteTrial|createCheckout|createTopupCheckout)/.test(call.url)).length;
+        // As boot does: the address is in the window before Settings launches, and the ctx comes from the parsed link.
+        const at = (href) => {
+            window.history.replaceState({}, '', href);
+            const url = new URL(href, 'https://example.test');
+            const { initialTab, openUpgrade, couponAlias, couponInvalid } = window.linkApi.parseBillingDeepLink(window.linkApi.settingsAliasSearch(url));
+            return { ...context, initialTab, openUpgrade, ...(couponAlias ? { couponAlias } : couponInvalid ? { couponInvalid: true } : {}) };
+        };
+        const quiet = (label) => { assert.equal(sheets.length, 0, `${label}: no sheet`); assert.equal(paidCalls(), 0, `${label}: no quote or checkout`); };
+        const held = ['coupon=midhun', 'coupon=bad_alias', 'coupon=a&coupon=b', 'coupon=', 'coupon_entry=invalid', 'coupon_entry=unavailable', 'coupon_entry=unknown', 'coupon_entry=', 'coupon_entry=x&coupon_entry=y'];
+        const bases = ['/os?settings=billing&section=ai-credits&reason=insufficient_credits', '/os?settings=billing&section=ai-credits', '/os?settings=billing&section=ai-credits&reason=insufficient_credits&upgrade=standard',
+            '/app/settings?tab=billing&section=ai-credits&reason=insufficient_credits'];
+        for ( const make of [freeWith, () => paid()] ) {
+            for ( const base of bases ) for ( const hint of held ) {
+                const href = `${base}&${hint}`;
+                reset(); getTrialOffer = good; summary = make(); await open(at(href)); quiet(href);
+            }
+        }
+        // A kept window: the person is already on Billing, then the link arrives; and stale intent a plain address armed.
+        for ( const href of ['/os?settings=billing&section=ai-credits&reason=insufficient_credits&coupon=midhun', '/os?settings=billing&section=ai-credits&coupon_entry=unknown&upgrade=standard'] ) {
+            reset(); getTrialOffer = good; summary = freeWith(); await open(at('/os?settings=billing'));
+            window.billing.default.onActivate(window.$(q('.window[data-app="settings"]')), at(href)); await settle(); quiet(`kept ${href}`);
+            // Plain address armed (recovery + upgrade), the first summary failed, then the link arrives.
+            reset(); getTrialOffer = good; getSummary = () => failure('unavailable'); summary = freeWith();
+            await open(at('/os?settings=billing&section=ai-credits&reason=insufficient_credits&upgrade=standard'));
+            getSummary = savedSummary;
+            window.billing.default.onActivate(window.$(q('.window[data-app="settings"]')), at(href)); await settle(); quiet(`stale ${href}`);
+            // Delayed first summary for the plain address answers after the link arrived.
+            reset(); getTrialOffer = good; summary = freeWith(); let late;
+            getSummary = () => new Promise(resolve => { late = () => resolve(savedSummary()); });
+            await open(at('/os?settings=billing&section=ai-credits&reason=insufficient_credits&upgrade=standard'));
+            assert.ok(late, 'the first summary is in flight'); getSummary = savedSummary;
+            window.billing.default.onActivate(window.$(q('.window[data-app="settings"]')), at(href)); await settle();
+            late(); await settle(); quiet(`delayed ${href}`);
+        }
+
+        // The ctx may omit the link (the address bar still carries it): the actual address decides, cold and in a kept window.
+        const bare = (href) => ({ ...at(href), couponAlias: undefined, couponInvalid: undefined });
+        const asked = () => calls.filter(call => call.url.includes('/api/trpc/billing.trialOffer')).map(call => JSON.stringify(call.input));
+        for ( const hint of held ) {
+            const href = `/os?settings=billing&section=ai-credits&reason=insufficient_credits&upgrade=standard&${hint}`;
+            reset(); getTrialOffer = good; summary = freeWith(); await open(bare(href)); quiet(`bare ctx ${hint}`);
+            reset(); getTrialOffer = good; summary = freeWith(); await open(at('/os?settings=billing'));
+            window.billing.default.onActivate(window.$(q('.window[data-app="settings"]')), bare(href)); await settle(); quiet(`bare kept ${hint}`);
+        }
+        // A link in the address with no ctx shows and asks for its own offer, never the public one.
+        reset(); getTrialOffer = good; summary = freeWith(); await open(bare('/os?settings=billing&coupon=midhun'));
+        assert.deepEqual(asked(), ['{"coupon":"midhun"}'], 'the alias in the address is the offer asked for');
+        reset(); getTrialOffer = good; summary = freeWith(); await open(bare('/os?settings=billing&coupon_entry=unknown'));
+        assert.deepEqual(asked(), [], 'a failed hint never asks for the public offer'); has('[data-role="coupon-notice"][data-state="invalid"]');
+        // The selection is retained: a later route with no link in ctx or address (focus, another entry) still arms nothing.
+        for ( const first of ['/os?settings=billing&coupon=midhun', '/os?settings=billing&coupon_entry=unavailable'] ) {
+            reset(); getTrialOffer = good; summary = freeWith(); await open(at(first));
+            const $w = window.$(q('.window[data-app="settings"]'));
+            window.history.replaceState({}, '', '/os?settings=billing&section=ai-credits&reason=insufficient_credits&upgrade=standard');
+            window.billing.default.onActivate($w, { ...context, initialTab: 'billing', openUpgrade: 'standard_monthly_v3' }); await settle(); quiet(`retained ${first}`);
+        }
+        // No coupon, no hint: recovery and Add credits arm as before.
+        reset(); summary = freeWith(); getTrialOffer = good; await open(at('/os?settings=billing&section=ai-credits&reason=insufficient_credits'));
+        assert.equal(sheets.length, 1, 'plain recovery on Free opens its dialog'); await closeSheet();
+        reset(); getTrialOffer = good; summary = paid(); await open(at('/os?settings=billing&section=ai-credits&reason=insufficient_credits'));
+        assert.equal(sheets.at(-1)?.kind, 'topup'); await closeSheet();
+        reset(); getTrialOffer = good; summary = paid(); await open(at('/os?settings=billing&section=ai-credits'));
+        assert.equal(sheets.at(-1)?.kind, 'topup'); await closeSheet();
+        // Code's own request and the in-window Add credits link still open while a promoter link's context is retained.
+        reset(); getTrialOffer = good; summary = paid(); await open(at('/os?settings=billing&coupon=midhun')); quiet('retained link');
+        const $kept = window.$(q('.window[data-app="settings"]'));
+        window.billing.default.onRelaunch($kept, { billingRecovery: { reason: 'insufficient_credits' } }); await settle();
+        assert.equal(sheets.length, 1, 'Code recovery request opens with a link retained'); await closeSheet();
+        $kept.trigger('ezil:billing-topup', { reason: null }); await settle();
+        assert.equal(sheets.at(-1)?.kind, 'topup', 'the in-window Add credits link opens with a link retained'); await closeSheet();
+        reset();
+    }
     console.log(`PASS Billing v2: ${groups} groups; ${audited} whole-pane copy/accessibility audits; 0 window errors`);
 } finally {
     dom.window.close();

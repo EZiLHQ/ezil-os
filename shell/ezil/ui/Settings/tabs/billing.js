@@ -1153,6 +1153,7 @@ export default {
                 return;
             }
             state.openTopup = request;
+            state.topupFromUrl = false;
             tab.trigger('click');
         });
         $win.on('remove.billing', () => {
@@ -1169,9 +1170,17 @@ export default {
         const state = windows.get($win.get(0));
         if ( state ) {
             state.active = true;
-            state.openUpgrade ||= ctx.openUpgrade;
-            // The promoter link the address carried (`parseBillingDeepLink`). A different link replaces the kept one.
-            const next = ctx.couponAlias || ctx.couponInvalid ? { alias: ctx.couponAlias ?? null, ...(ctx.couponInvalid ? { invalid: true } : {}) } : null;
+            // The promoter link the route carried (`parseBillingDeepLink`), else the one the address bar itself holds (a
+            // route can omit it from ctx; the alias stays in the address). A different link replaces the kept one; a route
+            // with none keeps the selection.
+            // `/app/settings?tab=billing` is the same link as `/os?settings=billing` (docs/APP-ROUTES.md): read both via the boot's spelling.
+            const search = settingsAliasSearch(window.location);
+            const params = new URLSearchParams(search);
+            const urlLink = params.get('settings') === 'billing' ? couponFromSearch(search) : {};
+            const fromCtx = ctx.couponAlias || ctx.couponInvalid;
+            const alias = fromCtx ? ctx.couponAlias ?? null : urlLink.alias ?? null;
+            const invalid = fromCtx ? !! ctx.couponInvalid : !! urlLink.invalid;
+            const next = alias || invalid ? { alias, ...(invalid ? { invalid: true } : {}) } : null;
             const linkChanged = !! next && (next.alias ?? null) !== (state.coupon?.alias ?? null) || !! next && !! next.invalid !== !! state.coupon?.invalid;
             if ( linkChanged ) state.coupon = next;
             // The signed-in user the kept AI balance belongs to; another user's is dropped, never shown.
@@ -1181,12 +1190,21 @@ export default {
             state.userId = userId;
             // An answer still in flight for the previous user or link must not land: supersede it and read again.
             if ( (userChanged || linkChanged) && state.loading ) { state.request++; state.loading = false; }
-            // `/app/settings?tab=billing` is the same link as `/os?settings=billing`
-            // (docs/APP-ROUTES.md); read both through the boot's own spelling.
-            const params = new URLSearchParams(settingsAliasSearch(window.location));
-            // `reason=insufficient_credits` (Code's recovery link) frames the same dialog as exhaustion recovery.
-            if ( ! state.autoOpened && params.get('settings') === 'billing' && params.get('section') === 'ai-credits' ) {
-                state.openTopup = { reason: params.get('reason') === 'insufficient_credits' ? 'insufficient_credits' : null };
+            // A promoter selection (this route's, the address's, or one kept from an earlier route) only lands on Billing:
+            // nothing the ADDRESS asked for arms a purchase (the upgrade sheet, an Add credits or recovery dialog), and an
+            // intent an earlier address armed that is still waiting is dropped. Code's request (`billingRecovery`,
+            // `onRelaunch`) and the in-window Add credits link are the person's own and stay.
+            const held = !! (state.coupon?.alias || state.coupon?.invalid);
+            if ( held ) {
+                state.openUpgrade = false;
+                if ( state.topupFromUrl ) { state.openTopup = null; state.topupFromUrl = false; }
+            } else {
+                state.openUpgrade ||= ctx.openUpgrade;
+                // `reason=insufficient_credits` (Code's recovery link) frames the same dialog as exhaustion recovery.
+                if ( ! state.autoOpened && params.get('settings') === 'billing' && params.get('section') === 'ai-credits' ) {
+                    state.openTopup = { reason: params.get('reason') === 'insufficient_credits' ? 'insufficient_credits' : null };
+                    state.topupFromUrl = true;
+                }
             }
             void load($win, state);
         }
