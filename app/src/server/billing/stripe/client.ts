@@ -7,7 +7,7 @@ import { billingOfferByLookupKey as offerByLookupKey, billingOfferBySku as offer
 import { readStripePacks, resetStripePackCachesForTests } from './packs';
 import { CATALOG_V3 } from '../v3/contract';
 import { CATALOG_V2 } from '../v2/contract';
-import { TRIAL_METADATA_KEY, TRIAL_POLICY_VERSION } from '../v3/trial';
+import { TRIAL_METADATA_KEY, TRIAL_POLICY_VERSION, TRIAL_SKU } from '../v3/trial';
 
 const STRIPE_BASE_URL = 'https://api.stripe.com/v1';
 /** Pin the response schema independently of the Stripe account's default version. */
@@ -38,9 +38,11 @@ function cacheValue<T>(cache: Map<string, CacheEntry<T>>, key: string, value: T)
     cache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
 }
 
-function trialMetadata(trial: { trialId: string; trialEnd: Date }): Record<string, string> {
+function trialMetadata(trial: { trialId: string; trialEnd: Date; offer?: { coupon: string | null; fingerprint: string } }): Record<string, string> {
     return { [TRIAL_METADATA_KEY]: trial.trialId, ezil_trial_policy: String(TRIAL_POLICY_VERSION),
-        ezil_trial_end: String(Math.floor(trial.trialEnd.getTime() / 1000)) };
+        ezil_trial_end: String(Math.floor(trial.trialEnd.getTime() / 1000)),
+        // Attribution of the Stripe-controlled campaign offer that unlocked this trial; server-set, never a discount.
+        ...(trial.offer ? { ezil_trial_offer: trial.offer.coupon ?? 'public', ezil_trial_offer_fp: trial.offer.fingerprint } : {}) };
 }
 
 /**
@@ -48,7 +50,7 @@ function trialMetadata(trial: { trialId: string; trialEnd: Date }): Record<strin
  * parameters, which the signed lifecycle suite reuses because a headless run cannot complete Checkout): the quoted
  * end as `trial_end`, a missing payment method cancels at the end, and the trial row id in metadata.
  */
-export function trialSubscriptionData(sku: string, trial: { trialId: string; trialEnd: Date }) {
+export function trialSubscriptionData(sku: string, trial: { trialId: string; trialEnd: Date; offer?: { coupon: string | null; fingerprint: string } }) {
     return {
         metadata: { sku, ezil_catalog: sku.endsWith('_v3') ? 'v3' : 'v2', ...trialMetadata(trial) },
         trial_end: Math.floor(trial.trialEnd.getTime() / 1000),
@@ -395,6 +397,20 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
         async listProducts() { return (await listAll<ProductResponse>('/products', { active: 'true' })).map(packProduct); },
         async retrieveProduct(id) { return packProduct(await request<ProductResponse>(`/products/${encodeURIComponent(id)}`)); },
         async retrievePackPrice(id) { return packPrice(await request<Price>(`/prices/${encodeURIComponent(id)}`)); },
+        async readTrialCampaigns() {
+            // Fresh on every call (no cache): a campaign or price change in Stripe applies at the next quote and checkout.
+            // limit=2 so a second active price for the key is seen (and refused) rather than silently skipped.
+            const lookupKey = offerBySku(TRIAL_SKU)!.stripeLookupKey!;
+            const query = new URLSearchParams({ 'lookup_keys[]': lookupKey, active: 'true', limit: '2', 'expand[]': 'data.product' });
+            type ExpandedPrice = Omit<Price, 'product'> & { recurring?: { interval?: string; interval_count?: number } | null;
+                product?: { id: string; active?: boolean; metadata?: Record<string, string> | null } | string | null };
+            const page = await request<{ data?: ExpandedPrice[]; has_more?: boolean }>(`/prices?${query}`);
+            return { hasMore: page.has_more === true, prices: (page.data ?? []).filter(item => item.lookup_key === lookupKey).map(item => ({
+                id: item.id, active: item.active === true, unitAmount: item.unit_amount ?? null, currency: item.currency ?? null,
+                interval: item.recurring?.interval ?? null, intervalCount: item.recurring?.interval_count ?? null,
+                product: item.product && typeof item.product === 'object'
+                    ? { id: item.product.id, active: item.product.active === true, metadata: item.product.metadata ?? {} } : null })) };
+        },
         async retrieveCoupon(id) {
             try {
                 const coupon = await request<{ id: string; valid: boolean; percent_off: number | null; amount_off: number | null }>(`/coupons/${encodeURIComponent(id)}`);
@@ -575,15 +591,18 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
                 }),
             };
             if (lookupKey) {
-                const price = await resolvePrice(lookupKey);
+                // A campaign trial uses the EXACT price its fresh read verified (v3/trial-campaigns.ts), never the cached one.
+                const verifiedPriceId = input.trial?.offer?.priceId ?? null;
+                if (verifiedPriceId !== null && !/^price_[A-Za-z0-9]+$/.test(verifiedPriceId)) throw new BillingProviderError('invalid_trial_price');
+                const price = verifiedPriceId === null ? await resolvePrice(lookupKey) : null;
                 fields.mode = 'subscription';
-                fields.line_items = [{ quantity: 1, price: price.id }];
+                fields.line_items = [{ quantity: 1, price: verifiedPriceId ?? price!.id }];
                 fields.subscription_data = { metadata: { sku: input.sku, ezil_catalog: input.sku.endsWith('_v3') ? 'v3' : 'v2' } };
                 if (input.trial) {
                     // Standard trial: $0 today, the quoted end as Stripe's trial end (never a fixed day count), a payment
                     // method always collected, and a trial without one cancelled rather than left unpaid.
-                    if (input.sku !== 'standard_monthly_v3' || price.unitAmount !== CATALOG_V3.standard_monthly_v3.priceCents
-                        || price.currency !== 'usd' || !price.recurring) throw new BillingProviderError('invalid_trial_price');
+                    if (input.sku !== 'standard_monthly_v3' || (price !== null && (price.unitAmount !== CATALOG_V3.standard_monthly_v3.priceCents
+                        || price.currency !== 'usd' || !price.recurring))) throw new BillingProviderError('invalid_trial_price');
                     const subscriptionData = trialSubscriptionData(input.sku, input.trial);
                     fields.metadata = { ...metadata, ...trialMetadata(input.trial) };
                     fields.payment_method_collection = 'always';

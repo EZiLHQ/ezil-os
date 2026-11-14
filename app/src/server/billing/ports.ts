@@ -11,6 +11,7 @@
 import type { IntervalRow, SubscriptionRow } from './meters';
 import type { ComputeEpoch, EpochEndReason, GrantKindV2, GRANT_METER_COMPUTE, SizeCode } from './v2/contract';
 import type { OperatorEntitlementRow } from './v3/operator-access';
+import type { TrialPriceRead } from './v3/trial-campaigns';
 
 // ── Store (implemented by `store.ts` over drizzle) ───────────────────────────
 
@@ -377,7 +378,12 @@ export interface CheckoutRequest {
      * Standard trial (0021): the server-quoted trial end (the first charge) and the trial row id. Set only by the
      * router after its eligibility check; the session then collects a payment method with no charge today.
      */
-    trial?: { trialId: string; trialEnd: Date; expiresAt: Date };
+    trial?: { trialId: string; trialEnd: Date; expiresAt: Date;
+        /**
+         * The re-resolved Stripe-controlled campaign offer (v3/trial-campaigns.ts): attribution metadata only, never a
+         * discount, and the EXACT price verified by that read (used instead of the cached lookup-key price).
+         */
+        offer?: { coupon: string | null; fingerprint: string; priceId: string } };
 }
 
 export interface CheckoutSessionCreated {
@@ -439,6 +445,11 @@ export interface StripePackApi {
     retrieveProduct(id: string): Promise<StripeProduct>;
     retrievePackPrice(id: string): Promise<StripePackPrice>;
     retrieveCoupon(id: string): Promise<StripeCoupon | null>;
+    /**
+     * Every active price of the Standard monthly v3 lookup key with its Product expanded (metadata included), read fresh:
+     * no cache. v3/trial-campaigns.ts decides validity. Throws on a provider error; a missing reader offers no trial.
+     */
+    readTrialCampaigns?(): Promise<TrialPriceRead>;
     retrieveCheckoutLineItems(sessionId: string): Promise<StripeCheckoutLineItem[]>;
 }
 

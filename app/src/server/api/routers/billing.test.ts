@@ -12,6 +12,8 @@ import { CATALOG_V2, type BillingErrorCode, OVERAGE_TERMS_VERSION } from '@/serv
 import { BillingProviderError, createStripeClient, StripeRequestError } from '@/server/billing/stripe/client';
 import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
 import { upgradeGrantSeconds } from '@/server/billing/v3/catalog';
+import { selectTrialOffer, trialOfferFingerprint } from '@/server/billing/v3/trial-campaigns';
+import { CAMPAIGNS_ON, STANDARD_PRICE_ID, STANDARD_PRODUCT_ID, standardTrialRead } from '@/server/billing/v3/trial-campaigns.test-support';
 import type { createTRPCContext } from '../trpc';
 
 vi.mock('@/server/db', () => ({ db: {} }));
@@ -143,6 +145,8 @@ function fixture() {
         retrieveProduct: vi.fn<StripeApi['retrieveProduct']>().mockResolvedValue(packProduct),
         retrievePackPrice: vi.fn<StripeApi['retrievePackPrice']>().mockResolvedValue(packPrice),
         retrieveCoupon: vi.fn<StripeApi['retrieveCoupon']>().mockResolvedValue(packCoupon),
+        // One active Standard price whose Product has no campaigns key: the legacy public trial offer.
+        readTrialCampaigns: vi.fn<NonNullable<StripeApi['readTrialCampaigns']>>().mockResolvedValue(standardTrialRead()),
         retrieveCheckoutLineItems: vi.fn<StripeApi['retrieveCheckoutLineItems']>().mockResolvedValue([{ quantity: 1, price: packPrice }]),
         resolvePrice: vi.fn<StripeApi['resolvePrice']>(),
         previewUpgrade: vi.fn<StripeApi['previewUpgrade']>(async input => ({
@@ -2162,11 +2166,14 @@ describe('Standard trial router', () => {
     const quoted = (patch: Partial<Own> = {}): Own => ({ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, authSubject: `supabase:${userId}`,
         emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted', quotedAt, trialEnd, checkoutSessionId: null,
         stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null, returnOrigin: 'https://os.ezil.work', ...patch });
+    const PUBLIC_FP = trialOfferFingerprint({ productId: STANDARD_PRODUCT_ID, priceId: STANDARD_PRICE_ID }, true, null, null);
+    const MIDHUN_FP = trialOfferFingerprint({ productId: STANDARD_PRODUCT_ID, priceId: STANDARD_PRICE_ID }, true, 'midhun', null);
 
     it('quoteTrial fixes the exact end one calendar month after the server clock, $0 today and $20 then', async () => {
         const f = trialFixture();
         await expect(f.caller.quoteTrial()).resolves.toEqual({ sku, todayCents: 0, trialEndsAt: '2026-11-11T12:00:00Z',
-            firstChargeAt: '2026-11-11T12:00:00Z', amountCents: 2000, currency: 'usd', interval: 'month', quoteExpiresAt: '2026-10-11T12:30:00Z' });
+            firstChargeAt: '2026-11-11T12:00:00Z', amountCents: 2000, currency: 'usd', interval: 'month', quoteExpiresAt: '2026-10-11T12:30:00Z',
+            offer: { coupon: null, fingerprint: PUBLIC_FP } });
         expect(f.trial.claimTrialQuote).toHaveBeenCalledWith({ userId, authSubject: `supabase:${userId}`, emailNormalized: 'fixture@example.org',
             quotedAt, trialEnd, returnOrigin: 'https://os.ezil.work' });
     });
@@ -2198,7 +2205,8 @@ describe('Standard trial router', () => {
         const f = trialFixture({ own: quoted() });
         await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: '2026-11-11T12:00:00Z' } })).resolves.toMatchObject({ sessionId: session.id });
         expect(f.stripe.createCheckoutSession).toHaveBeenCalledWith(expect.objectContaining({ sku,
-            trial: { trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', trialEnd, expiresAt: new Date('2026-10-11T14:00:00Z') },
+            trial: { trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', trialEnd, expiresAt: new Date('2026-10-11T14:00:00Z'),
+                offer: { coupon: null, fingerprint: PUBLIC_FP, priceId: STANDARD_PRICE_ID } },
             idempotencyKey: `trial-checkout:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:${epochSeconds(quotedAt)}` }));
         expect(f.trial.attachTrialCheckout).toHaveBeenCalledWith({ trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, quotedAt,
             checkoutSessionId: session.id, customerId: 'cus_fixture' });
@@ -2287,6 +2295,111 @@ describe('Standard trial router', () => {
         g.store.stripeCustomerFor.mockResolvedValue('cus_fixture');
         g.stripe.retrieveSubscription.mockResolvedValue({ ...await g.stripe.retrieveSubscription('sub_fixture'), status: 'trialing' });
         await domainFailure(() => g.caller.previewUpgrade(toCompute), 'upgrade_not_allowed');
+    });
+
+    describe('Stripe-controlled campaign offers (?coupon=)', () => {
+        const PUBLIC_OFF = JSON.stringify({ version: 1, publicEnabled: false, promoters: { midhun: { enabled: true } } });
+        const noWrites = (f: ReturnType<typeof trialFixture>) => {
+            expect(f.trial.claimTrialQuote).not.toHaveBeenCalled();
+            expect(f.trial.attachTrialCheckout).not.toHaveBeenCalled();
+            expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+            expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+            expect(f.stripe.expireCheckoutSession).not.toHaveBeenCalled();
+        };
+
+        it('trialOffer answers the public and promoter offers read-only, and a promoter works with the public offer off', async () => {
+            const f = trialFixture();
+            f.stripe.readTrialCampaigns.mockResolvedValue(standardTrialRead(CAMPAIGNS_ON));
+            await expect(f.caller.trialOffer()).resolves.toEqual({ available: true, offer: { coupon: null, fingerprint: PUBLIC_FP } });
+            await expect(f.caller.trialOffer({ coupon: ' MIDHUN ' })).resolves.toEqual({ available: true, offer: { coupon: 'midhun', fingerprint: MIDHUN_FP } });
+            f.stripe.readTrialCampaigns.mockResolvedValue(standardTrialRead(PUBLIC_OFF));
+            await expect(f.caller.trialOffer()).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+            await expect(f.caller.trialOffer({ coupon: 'midhun' })).resolves.toMatchObject({ available: true, offer: { coupon: 'midhun' } });
+            noWrites(f);
+        });
+
+        it.each([
+            ['a malformed coupon', CAMPAIGNS_ON, 'mid hun', 'trial_offer_invalid'],
+            ['an unknown coupon', CAMPAIGNS_ON, 'someone', 'trial_offer_invalid'],
+            ['a disabled promoter', JSON.stringify({ version: 1, publicEnabled: true, promoters: { midhun: { enabled: false } } }), 'midhun', 'trial_offer_unavailable'],
+            ['an expired promoter', JSON.stringify({ version: 1, publicEnabled: true, promoters: { midhun: { enabled: true, expiresAt: '2026-10-11T12:00:00.000Z' } } }), 'midhun', 'trial_offer_unavailable'],
+            ['malformed campaigns metadata', '{"version":1', 'midhun', 'trial_offer_unavailable'],
+        ])('%s fails closed with no fallback, no claim and no Stripe write', async (_name, campaigns, coupon, message) => {
+            const f = trialFixture();
+            f.stripe.readTrialCampaigns.mockResolvedValue(standardTrialRead(campaigns));
+            await expect(f.caller.trialOffer({ coupon })).rejects.toMatchObject({ message });
+            await expect(f.caller.quoteTrial({ coupon })).rejects.toMatchObject({ message });
+            noWrites(f);
+        });
+
+        it.each([
+            ['a second active price', { ...standardTrialRead(CAMPAIGNS_ON), prices: [...standardTrialRead(CAMPAIGNS_ON).prices, { ...standardTrialRead(CAMPAIGNS_ON).prices[0]!, id: 'price_Other' }] }],
+            ['more prices than one page', { ...standardTrialRead(CAMPAIGNS_ON), hasMore: true }],
+            ['an inactive product', standardTrialRead(CAMPAIGNS_ON, {}, { active: false })],
+            ['another amount', standardTrialRead(CAMPAIGNS_ON, { unitAmount: 1900 })],
+            ['a yearly interval', standardTrialRead(CAMPAIGNS_ON, { interval: 'year' })],
+            ['a two-month interval', standardTrialRead(CAMPAIGNS_ON, { intervalCount: 2 })],
+        ])('Stripe terms with %s offer nothing (trial_offer_unavailable)', async (_name, read) => {
+            const f = trialFixture();
+            f.stripe.readTrialCampaigns.mockResolvedValue(read);
+            await expect(f.caller.trialOffer({ coupon: 'midhun' })).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+            await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+            noWrites(f);
+        });
+
+        it('a missing or failing Stripe reader is stripe_unavailable, never the public offer', async () => {
+            const f = trialFixture();
+            f.stripe.readTrialCampaigns.mockRejectedValue(new StripeRequestError(500, null, 'api_error'));
+            await expect(f.caller.trialOffer()).rejects.toMatchObject({ message: 'stripe_unavailable' });
+            await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'stripe_unavailable' });
+            const g = trialFixture({ own: quoted() });
+            delete (g.stripe as Partial<typeof g.stripe>).readTrialCampaigns;
+            await expect(g.caller.trialOffer()).rejects.toMatchObject({ message: 'stripe_unavailable' });
+            await expect(g.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } })).rejects.toMatchObject({ message: 'stripe_unavailable' });
+            noWrites(f);
+            expect(g.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        });
+
+        it('a promoter quote carries its offer; checkout re-reads Stripe and opens the EXISTING trial at the exact verified price', async () => {
+            const f = trialFixture();
+            f.stripe.readTrialCampaigns.mockResolvedValue(standardTrialRead(PUBLIC_OFF));
+            const quote = await f.caller.quoteTrial({ coupon: 'Midhun' });
+            const fingerprint = trialOfferFingerprint({ productId: STANDARD_PRODUCT_ID, priceId: STANDARD_PRICE_ID }, false, 'midhun', null);
+            expect(quote).toMatchObject({ todayCents: 0, amountCents: 2000, interval: 'month', offer: { coupon: 'midhun', fingerprint } });
+            await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: quote.trialEndsAt, offer: quote.offer } })).resolves.toMatchObject({ sessionId: session.id });
+            const [request] = f.stripe.createCheckoutSession.mock.calls[0]!;
+            expect(request.trial).toEqual({ trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', trialEnd: new Date(quote.trialEndsAt),
+                expiresAt: new Date('2026-10-11T14:00:00Z'), offer: { coupon: 'midhun', fingerprint, priceId: STANDARD_PRICE_ID } });
+            // The same quote key and the existing trial claim: one per person, no new grant path.
+            expect(request.idempotencyKey).toBe(`trial-checkout:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:${epochSeconds(quotedAt)}`);
+            expect(f.trial.claimTrialQuote).toHaveBeenCalledTimes(1);
+            expect(f.stripe.readTrialCampaigns).toHaveBeenCalledTimes(2);
+        });
+
+        it.each([
+            ['the promoter was disabled after the quote', JSON.stringify({ version: 1, publicEnabled: true, promoters: { midhun: { enabled: false } } }), {}, 'trial_offer_unavailable'],
+            ['the promoter was removed after the quote', JSON.stringify({ version: 1, publicEnabled: true, promoters: {} }), {}, 'trial_offer_invalid'],
+            ['the public switch changed after the quote', PUBLIC_OFF, {}, 'trial_quote_stale'],
+            ['the price changed after the quote', CAMPAIGNS_ON, { id: 'price_Repriced' }, 'trial_quote_stale'],
+        ])('checkout refuses when %s, before Stripe', async (_name, campaigns, priceOver, message) => {
+            const f = trialFixture({ own: quoted() });
+            f.stripe.readTrialCampaigns.mockResolvedValue(standardTrialRead(campaigns, priceOver));
+            await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString(), offer: { coupon: 'midhun', fingerprint: MIDHUN_FP } } }))
+                .rejects.toMatchObject({ message });
+            expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+            expect(f.trial.attachTrialCheckout).not.toHaveBeenCalled();
+        });
+
+        it('a forged fingerprint is stale, and a checkout without an offer gets only the current public offer', async () => {
+            const f = trialFixture({ own: quoted() });
+            f.stripe.readTrialCampaigns.mockResolvedValue(standardTrialRead(CAMPAIGNS_ON));
+            await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString(), offer: { coupon: 'midhun', fingerprint: PUBLIC_FP } } }))
+                .rejects.toMatchObject({ message: 'trial_quote_stale' });
+            f.stripe.readTrialCampaigns.mockResolvedValue(standardTrialRead(PUBLIC_OFF));
+            await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } })).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+            expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+            expect(selectTrialOffer(standardTrialRead(PUBLIC_OFF), null, quotedAt)).toEqual({ ok: false, code: 'trial_offer_unavailable' });
+        });
     });
 
     it('summary offers the trial to an eligible Free viewer with the server-computed end, and says why not otherwise', async () => {
