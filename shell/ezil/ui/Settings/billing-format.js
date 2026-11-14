@@ -400,11 +400,15 @@ export function couponAlias (value) {
     return COUPON_PATTERN.test(alias) ? alias : null;
 }
 
-/** The link in a query string: `{ alias }` for exactly one valid value, `{ invalid: true }` for a repeated or malformed one, `{}` for none. */
+/**
+ * The link in a query string: `{ alias }` for exactly one valid value, `{ invalid: true }` for a repeated or malformed
+ * one, `{}` for none. With no `coupon` value, the presence of any `coupon_entry` hint (the root entry's one-shot flag,
+ * whatever its value or repetition) is itself a failed link: it is never read as no link.
+ */
 export function couponFromSearch (search) {
     const params = new URLSearchParams(search);
     const values = params.getAll('coupon');
-    if ( ! values.length ) return params.get('coupon_entry') === 'invalid' ? { invalid: true } : {};
+    if ( ! values.length ) return params.has('coupon_entry') ? { invalid: true } : {};
     const alias = values.length === 1 ? couponAlias(values[0]) : null;
     return alias ? { alias } : { invalid: true };
 }

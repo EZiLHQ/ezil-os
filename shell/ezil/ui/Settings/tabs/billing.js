@@ -848,7 +848,14 @@ async function load ($win, state) {
         const sku = state.openUpgrade;
         // `upgrade=standard` (the pricing page's Standard card, which advertises the free month) opens the free month
         // when the server offers it to this viewer, and the ordinary Standard checkout otherwise.
-        if ( topup || recovery ) { /* The deep link's section, or Code, asked for billing recovery above. */ } else if ( sku === TRIAL_SKU && trialOfferOf(state.summary) ) openSheet($win, state, 'trial');
+        // A promoter link (a valid alias, or a malformed, repeated or failed one) only lands on Billing: the quote and the
+        // checkout wait for the person's own Billing button, even when the address also carried `upgrade=standard`. A
+        // plain `upgrade=` link, with no coupon at all, opens as before (`state.coupon` is null then).
+        const couponLink = state.coupon?.alias || state.coupon?.invalid;
+        if ( topup || recovery ) { /* The deep link's section, or Code, asked for billing recovery above. */ } else if ( couponLink ) {
+            // Focus the button the person can press, never press it.
+            $body.find('[data-action="trial"]').get(0)?.focus?.({ preventScroll: true });
+        } else if ( sku === TRIAL_SKU && trialOfferOf(state.summary) ) openSheet($win, state, 'trial');
         else if ( typeof sku === 'string' && offerFor(state.summary, sku) && state.summary.actions.checkout ) openSheet($win, state, 'checkout', sku);
         else if ( ['compute_monthly_v2', 'premium_monthly_v3'].includes(sku) && state.summary.actions.upgrade ) openSheet($win, state, 'upgrade');
         else if ( sku === true && state.summary.actions.checkout ) {
