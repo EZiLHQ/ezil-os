@@ -1602,6 +1602,87 @@ await settle(4);
 const offOrigin = calls.filter(c => /^https?:\/\//.test(c.url) && ! (new URL(c.url).hostname === 'ezil.local'));
 push('🔴 every request this shell MADE was same-origin', offOrigin.length === 0,
     JSON.stringify(offOrigin.map(c => c.url)));
+// ═══════════════════════════════════════════════════════════════════════════
+// 10. S13: AN UNAVAILABLE CODE ORIGIN (the Worker's 502 recovery document, never raw JSON) reopens Code ONCE per
+//    episode through the mint. The server's HTTP confirmation of a frame is NOT the end of the episode: only a
+//    genuine workbench root heard through the folder bridge (this frame's window, the minted origin, this hello's
+//    nonce, this mint's id) is. Through the BUILT bundle, in jsdom: messages are dispatched as the frame would.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    const EPISODE_KEY = 'ezil-os:code-origin-reopened';
+    const codeWin = () => q('.window[data-app="code"]');
+    const closeCode = async () => { if ( codeWin() ) { await window.$(codeWin()).close(); await settle(8); } };
+    const waitFor = async (cond, ms) => { for ( let t = 0; t < ms && ! cond(); t += 50 ) await tick(50); return cond(); };
+    const frame = () => codeWin()?.querySelector('.window-app-iframe');
+    const frameSrc = () => frame()?.getAttribute('src') ?? '';
+    const frameOrigin = () => new URL(frameSrc()).origin;
+    const mintIdOf = () => frameSrc().match(/[?&]ezil_mint=([A-Za-z0-9_-]{22})$/)?.[1] ?? null;
+    const fromFrame = (data, over = {}) => window.dispatchEvent(new window.MessageEvent('message',
+        { data, origin: frameOrigin(), source: frame().contentWindow, ...over }));
+    const unavailableShown = () => codeWin()?.querySelector('.ezil-code-unavailable')?.hidden === false;
+    const confirmed = () => waitFor(() => codeWin()?.querySelector('.ezil-app-spinner')?.hidden === true, 8000);
+    const launch = () => ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState, view: 'window' });
+    const documents = () => calls.filter(c => c.url.startsWith(ENDPOINTS.desktop) && ! c.url.includes('confirm=')).length;
+
+    await closeCode();
+    window.sessionStorage.removeItem(EPISODE_KEY);
+    confirmAnswer = true; guacRunning = true; codeMintAnswer = null; codePreviewUrlMode = 'ok';
+    let before = mintedUrls.length;
+    await launch();
+    await waitFor(() => mintedUrls.length > before && untag(frameSrc()) === mintedUrls.at(-1), 8000);
+    fireLoad(frame()); await confirmed();
+    push('10 a confirmed Code frame to start from', mintedUrls.length === before + 1 && ! unavailableShown(), `${mintedUrls.length - before} mint(s)`);
+
+    // (a) The origin goes away; Code's own Reload lands on the Worker's recovery document, which posts to the shell.
+    //     The computer runs: ONE automatic reopen through the mint, and the OS route never reloads.
+    before = mintedUrls.length; let probes = documents();
+    fromFrame({ type: 'ezil:code-origin-unavailable' });
+    await waitFor(() => mintedUrls.length > before && untag(frameSrc()) === mintedUrls.at(-1), 8000);
+    push('10a 🔴 the origin-unavailable document on a running computer reopens Code once through the mint, after one status check',
+        mintedUrls.length === before + 1 && untag(frameSrc()) === mintedUrls.at(-1) && documents() === probes + 1
+        && window.sessionStorage.getItem(EPISODE_KEY) === '1',
+        `${mintedUrls.length - before} mint(s), ${documents() - probes} status check(s)`);
+
+    // (b) The server's HTTP probe confirms the NEW frame, but that frame still shows the recovery document (no bridge
+    //     hello was answered). Its message earns no second automatic reopen: "Code isn't reachable" with Try again.
+    fireLoad(frame()); await confirmed();
+    before = mintedUrls.length;
+    fromFrame({ type: 'ezil:code-origin-unavailable' });
+    await settle(8);
+    push('10b 🔴 a probe-confirmed frame that still shows the recovery document gets NO second automatic reopen: terminal "isn\'t reachable" with Try again',
+        mintedUrls.length === before && unavailableShown() && window.sessionStorage.getItem(EPISODE_KEY) === '1',
+        `${mintedUrls.length - before} mint(s) unavailable=${unavailableShown()}`);
+
+    // (c) A root report with a stale nonce, a foreign origin or another window does not end the episode.
+    const captured = [];
+    frame().contentWindow.postMessage = (m) => { captured.push(m); };
+    fromFrame({ type: 'ezil.code.ready', v: 1 });
+    await settle(2);
+    const nonce = captured.find(m => m?.type === 'ezil.code.hello')?.nonce ?? null;
+    const root = { type: 'ezil.code.folder', v: 1, mint: mintIdOf(), kind: 'folder', path: '/workspace' };
+    fromFrame({ ...root, nonce: 'A'.repeat(22) });
+    fromFrame({ ...root, nonce }, { origin: 'https://wrong.example' });
+    fromFrame({ ...root, nonce }, { source: window });
+    await settle(2);
+    fromFrame({ type: 'ezil:code-origin-unavailable' });
+    await settle(8);
+    push('10c 🔴 a root with a stale nonce, a foreign origin or another window does not end the episode: still no reopen',
+        typeof nonce === 'string' && mintedUrls.length === before && unavailableShown() && window.sessionStorage.getItem(EPISODE_KEY) === '1',
+        `nonce=${typeof nonce} ${mintedUrls.length - before} mint(s)`);
+
+    // (d) A GENUINE root (this frame, the minted origin, this hello's nonce, this mint's id) ends the episode: the
+    //     next unavailable origin is reopened automatically once again.
+    fromFrame({ ...root, nonce });
+    await settle(2);
+    const reset = window.sessionStorage.getItem(EPISODE_KEY) === null;
+    fromFrame({ type: 'ezil:code-origin-unavailable' });
+    await waitFor(() => mintedUrls.length > before, 8000);
+    push('10d 🔴 a genuine workbench root ends the episode; the next unavailable origin reopens once again',
+        reset && mintedUrls.length === before + 1, `reset=${reset} ${mintedUrls.length - before} mint(s)`);
+    await closeCode();
+    window.sessionStorage.removeItem(EPISODE_KEY);
+}
+
 push('no puter.* or socket.io traffic', ! calls.some(c => /puter\.com|socket\.io/.test(c.url)));
 push('no uncaught page errors during the whole run', uncaught.length === 0,
     uncaught.slice(0, 2).join(' | '));

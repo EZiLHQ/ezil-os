@@ -25,10 +25,10 @@ function fixture(sku: 'free_v3' | 'standard_monthly_v3' = 'free_v3') {
 afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); vi.restoreAllMocks(); });
 
 describe('billing.summary AI wiring', () => {
-    it.each([0, 10, 11])('fills a Free live balance %s and queues the current user trial', async credits => {
+    it.each([0, 1, 10, 11])('fills a Free live balance %s and queues the current user trial', async credits => {
         const fetcher = gateway({ credits }); vi.stubGlobal('fetch', fetcher);
         const f = fixture();
-        expect(await f.caller.summary()).toMatchObject({ ai: { balance: credits, state: credits === 0 ? 'exhausted' : credits <= 10 ? 'low' : 'ok' } });
+        expect(await f.caller.summary()).toMatchObject({ ai: { balance: credits, state: credits === 0 ? 'exhausted' : credits <= 1 ? 'low' : 'ok' } });
         expect(f.store.enqueueOutbox).toHaveBeenCalledWith(expect.objectContaining({ userId: 'current-user', eventKey: 'ezil-os:v1:free-once:current-user:grant' }));
         expect(fetcher.mock.calls[0]![1]!.headers).toEqual({ Authorization: 'Bearer current-token' });
     });
@@ -168,7 +168,7 @@ describe('authenticated C6 AI read procedures', () => {
         vi.stubGlobal('fetch', gateway({ available_micro: '1000001' }, { '/v1/models': { killswitch: true, pause: 'reconciliation' },
             '/v1/me/usage': null }));
         expect(await fixture().caller.summary()).toMatchObject({ ai: { balanceMicro: '1000001', balance: 1.000001,
-            balanceState: 'low', spendingState: 'paused_reconciliation', state: 'unavailable', usageState: 'unavailable', limitsState: 'available' } });
+            balanceState: 'ok', spendingState: 'paused_reconciliation', state: 'unavailable', usageState: 'unavailable', limitsState: 'available' } });
     });
     it('returns unknown on Gateway refusals or malformed JSON rather than using privileged fallback credentials', async () => {
         const f = fixture();

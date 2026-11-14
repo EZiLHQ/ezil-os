@@ -730,6 +730,27 @@ describe('product entitlements v1: the summary of an operator-assigned plan', ()
     });
 });
 
+describe('product entitlements v1: who assigned the plan', () => {
+    const grant = (issuedBy?: string | null) => ({ ref: 'osg-00000000-0000-4000-8000-000000000001', revision: 1, userId: 'u',
+        accountPublicId: '10000000-0000-4000-8000-0000000000a1', sku: 'standard_monthly_v3' as const, startsAt: new Date(now.getTime() - 86_400_000),
+        endsAt: null, endedAt: null, ...(issuedBy === undefined ? {} : { issuedBy }) });
+    const issuedBy = (value?: string | null) => { const args = input(); args.operatorGrants = [grant(value)]; return buildSummaryV3(args).plan.access?.issuedBy; };
+    it('defaults to EZiL for no label (legacy rows, a missing column) and for anything unreadable; shows a stored name as stored', () => {
+        expect(issuedBy()).toBe('EZiL');
+        expect(issuedBy(null)).toBe('EZiL');
+        expect(issuedBy('')).toBe('EZiL');
+        expect(issuedBy(' padded ')).toBe('EZiL');
+        expect(issuedBy('Ac\u202eme')).toBe('EZiL');
+        expect(issuedBy('Acme Labs')).toBe('Acme Labs');
+        expect(issuedBy('<b>Acme</b>')).toBe('<b>Acme</b>');
+    });
+    it('the plan access object has the same keys plus issuedBy, and a non-operator plan has none', () => {
+        const args = input(); args.operatorGrants = [grant()];
+        expect(Object.keys(buildSummaryV3(args).plan.access!).sort()).toEqual(['endsAt', 'issuedBy', 'ref', 'source', 'untilRevoked']);
+        expect(buildSummaryV3(input()).plan.access).toBeUndefined();
+    });
+});
+
 
 describe('Standard trial summary', () => {
     const trialStart = new Date('2026-10-10T00:00:00Z'), trialEnd = new Date('2026-11-10T00:00:00Z');
