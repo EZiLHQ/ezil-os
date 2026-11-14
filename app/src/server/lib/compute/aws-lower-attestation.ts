@@ -81,7 +81,11 @@ const IdentitySchema = z.object({ instanceId: instance, imageId: z.string().rege
 /**
  * The one SSM delivery this verifier accepts (AWS-RunShellScript `commands`, element for element): the reviewed attest.py,
  * checked against its pinned sha256 on the host, loaded as `ezil_host.attest` beside the AMI's own agent library, run with
- * exactly the reservation's arguments and the server's challenge. deploy/aws/mum/attest_lower.py builds the same lines.
+ * exactly the reservation's arguments and the server's challenge.
+ *
+ * AWS-RunShellScript writes `commands` into a script that it runs with /bin/sh (dash on the maintenance AMI), which refuses
+ * `set -o pipefail`. So the six attestation lines are the body of ONE `/bin/bash -c '<body>'` element: the outer line is
+ * POSIX sh, the body runs under bash byte for byte, and bash's exit status is the command's.
  */
 export const ATTEST_SOURCE_PATH = '/run/ezil-attest/attest.py';
 const LOADER = 'import importlib.util,sys;sys.path.insert(0,"/opt/ezil-host/lib");import ezil_host;from ezil_host import config;'
@@ -91,7 +95,8 @@ export interface AttestCommandInput {
     sourceBase64: string; sourceSha256: string; attestationId: string; computerId: string; originalVolumeId: string; cloneVolumeId: string;
     snapshotId: string; fsUuid: string; instanceId: string; generation: number; leaseEpoch: number; challenge: string;
 }
-export function buildAttestCommand(c: AttestCommandInput): string[] {
+/** The six attestation lines, in order: the body bash runs. */
+export function attestScriptLines(c: AttestCommandInput): string[] {
     return ['set -euo pipefail', 'umask 077', 'install -d -m 700 /run/ezil-attest',
         `printf '%s' '${c.sourceBase64}' | base64 -d > ${ATTEST_SOURCE_PATH}`,
         `echo '${c.sourceSha256}  ${ATTEST_SOURCE_PATH}' | sha256sum -c --quiet -`,
@@ -99,11 +104,23 @@ export function buildAttestCommand(c: AttestCommandInput): string[] {
         + ` --clone-volume-id ${c.cloneVolumeId} --snapshot-id ${c.snapshotId} --fs-uuid ${c.fsUuid} --instance-id ${c.instanceId}`
         + ` --generation ${c.generation} --lease-epoch ${c.leaseEpoch} --challenge ${c.challenge}`];
 }
+const BASH_LAUNCHER = '/bin/bash -c ';
+/** One POSIX sh line that runs `script` under bash unchanged: the script single-quoted, each `'` written as `'\''`. */
+export function bashLauncher(script: string): string {
+    return `${BASH_LAUNCHER}'${script.replaceAll("'", "'\\''")}'`;
+}
+export function buildAttestCommand(c: AttestCommandInput): string[] {
+    return [bashLauncher(attestScriptLines(c).join('\n'))];
+}
 /** Recovers the variable parts, then requires the command to be byte-equal to its canonical rebuild. */
 export function parseAttestCommand(commands: readonly string[]): AttestCommandInput | null {
-    const src = /^printf '%s' '([A-Za-z0-9+/]+={0,2})' \| base64 -d > \/run\/ezil-attest\/attest\.py$/.exec(commands[3] ?? '');
-    const sha = /^echo '([0-9a-f]{64})  \/run\/ezil-attest\/attest\.py' \| sha256sum -c --quiet -$/.exec(commands[4] ?? '');
-    const args = / --attestation-id (\S+) --computer-id (\S+) --original-volume-id (\S+) --clone-volume-id (\S+) --snapshot-id (\S+) --fs-uuid (\S+) --instance-id (\S+) --generation ([0-9]{1,10}) --lease-epoch ([0-9]{1,10}) --challenge (\S+)$/.exec(commands[5] ?? '');
+    const launcher = commands.length === 1 ? commands[0]! : '';
+    if (!launcher.startsWith(`${BASH_LAUNCHER}'`) || !launcher.endsWith("'")) return null;
+    // Any other quoting fails the byte-equal rebuild below.
+    const lines = launcher.slice(BASH_LAUNCHER.length + 1, -1).replaceAll("'\\''", "'").split('\n');
+    const src = /^printf '%s' '([A-Za-z0-9+/]+={0,2})' \| base64 -d > \/run\/ezil-attest\/attest\.py$/.exec(lines[3] ?? '');
+    const sha = /^echo '([0-9a-f]{64})  \/run\/ezil-attest\/attest\.py' \| sha256sum -c --quiet -$/.exec(lines[4] ?? '');
+    const args = / --attestation-id (\S+) --computer-id (\S+) --original-volume-id (\S+) --clone-volume-id (\S+) --snapshot-id (\S+) --fs-uuid (\S+) --instance-id (\S+) --generation ([0-9]{1,10}) --lease-epoch ([0-9]{1,10}) --challenge (\S+)$/.exec(lines[5] ?? '');
     if (!src || !sha || !args) return null;
     const c: AttestCommandInput = { sourceBase64: src[1]!, sourceSha256: sha[1]!, attestationId: args[1]!, computerId: args[2]!, originalVolumeId: args[3]!,
         cloneVolumeId: args[4]!, snapshotId: args[5]!, fsUuid: args[6]!, instanceId: args[7]!, generation: Number(args[8]), leaseEpoch: Number(args[9]), challenge: args[10]! };

@@ -1,6 +1,6 @@
 /** NULL-lower attestation proofs: every binding refuses on its own; the lower is measured, never inferred. */
 import { describe, expect, it } from 'vitest';
-import { buildAttestCommand, launchTupleOf, LowerAttestationReceiptSchema, LowerAttestationRefusal, parseAttestCommand, parseLowerAttestationRow,
+import { attestScriptLines, bashLauncher, buildAttestCommand, launchTupleOf, LowerAttestationReceiptSchema, LowerAttestationRefusal, parseAttestCommand, parseLowerAttestationRow,
     verifyLowerAttestation, type InstanceProvenance, type LowerAttestationObservations, type MigrationProvenance } from './aws-lower-attestation';
 import { ALIAS_RELEASE, CERT, CLONE, cloudTrail, COMMAND_ID, commandInput, CREATED, DEPLOYMENT, DOCUMENT_HASH, MAINTENANCE, maintenanceLaunch, MARKER, MEASURED,
     NOW, observations, OWNER, PINNED, PINS, placement, receipt, registryEntry, reserved, RESERVE, SNAPSHOT, SOURCE_RELEASE, TARGET_RELEASE } from './aws-lower-attestation.test-support';
@@ -76,7 +76,7 @@ describe('verifyLowerAttestation', () => {
         ['command_invalid', () => prove({ obs: withCommand({ instanceIds: [MAINTENANCE, 'i-66666666666666666'] }) })],
         ['command_invalid', () => prove({ obs: withCommand({ requestedAt: new Date('2026-10-22T10:59:59.999Z') }) })],
         ['command_invalid', () => prove({ obs: withCommand({ commands: [...base.command!.commands, 'touch /tmp/x'] }) })],
-        ['command_invalid', () => prove({ obs: withCommand({ commands: base.command!.commands.map((l, i) => i === 1 ? 'umask 022' : l) }) })],
+        ['command_invalid', () => prove({ obs: withCommand({ commands: base.command!.commands.map(l => l.replace('\numask 077\n', '\numask 022\n')) }) })],
         ['command_invalid', () => prove({ obs: withCommand({ commands: buildAttestCommand(commandInput({ challenge: 'd'.repeat(64) })) }) })],
         ['command_invalid', () => prove({ obs: withCommand({ commands: buildAttestCommand(commandInput({ generation: 2 })) }) })],
         ['command_invalid', () => prove({ obs: withCommand({ commands: buildAttestCommand(commandInput({ originalVolumeId: CLONE })) }) })],
@@ -275,10 +275,20 @@ describe('verifyLowerAttestation', () => {
 describe('row and receipt shapes', () => {
     it('parses only the canonical SSM delivery, byte for byte', () => {
         expect(parseAttestCommand(buildAttestCommand(commandInput()))).toEqual(commandInput());
-        const lines = buildAttestCommand(commandInput());
-        expect(parseAttestCommand(lines.map((l, i) => i === 5 ? l + ' ; reboot' : l))).toBeNull();
-        expect(parseAttestCommand(lines.map((l, i) => i === 5 ? l.replace('python3 -I -c', 'python3 -c') : l))).toBeNull();
-        expect(parseAttestCommand(lines.slice(0, 5))).toBeNull();
+        const lines = attestScriptLines(commandInput());
+        const body = (edit: (l: string[]) => string[]) => parseAttestCommand([bashLauncher(edit([...lines]).join('\n'))]);
+        expect(body(l => l)).toEqual(commandInput());
+        expect(body(l => l.map((x, i) => i === 5 ? x + ' ; reboot' : x))).toBeNull();
+        expect(body(l => l.map((x, i) => i === 5 ? x.replace('python3 -I -c', 'python3 -c') : x))).toBeNull();
+        expect(body(l => l.slice(0, 5))).toBeNull();
+        expect(body(l => [...l, 'touch /tmp/x'])).toBeNull();
+        // The bare pre-launcher lines (which /bin/sh refuses), another interpreter, other quoting or an extra element: refused.
+        const [launcher] = buildAttestCommand(commandInput());
+        expect(parseAttestCommand(lines)).toBeNull();
+        expect(parseAttestCommand([launcher!.replace('/bin/bash -c ', '/bin/sh -c ')])).toBeNull();
+        expect(parseAttestCommand([launcher!.replace('/bin/bash -c ', 'bash -c ')])).toBeNull();
+        expect(parseAttestCommand([launcher!.replaceAll("'\\''", `'"'"'`)])).toBeNull();
+        expect(parseAttestCommand([launcher!, 'true'])).toBeNull();
     });
     it('reads the launch tuple only from an immutable RunInstances record of the source instance', () => {
         expect(launchTupleOf(cloudTrail(), { sourceInstanceId: RESERVE.sourceInstanceId, region: 'ap-south-1', createdAt: CREATED }, DEPLOYMENT.accountId).tuple)
