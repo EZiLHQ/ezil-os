@@ -71,6 +71,19 @@ lower-attestation-schema.sh reconcile --target T --release-dir D
   read-only evidence) and completes the intent so a normal `apply` replays; `empty` closes
   the intent and journal so a fresh apply is allowed; anything else refuses.
 
+## Durability and evidence
+
+Intent, journal, plan and receipt files are 0600 regardless of umask and durable
+(file `fsync`, then parent-directory `fsync`) for exclusive create and atomic replace; the
+`submitting` journal state is durable before any provider send, and a persistence failure
+stops before the send. The raw provider invocation (status, stdout, stderr) is retained
+privately (`*-apply-invocation.json`) before the journal state changes or stdout is parsed;
+malformed or truncated output is retained, never printed, and leaves the outcome unknown.
+A missing or lost apply journal is also unknown: reconcile refuses and no new send is made.
+Production psql is bound to `/var/run/postgresql` port 5432 with
+`PGSERVICE`/`PGHOSTADDR`/`PGOPTIONS` unset inside the exec (an empty value is not unset to
+libpq), `PGSERVICEFILE`/`PGSYSCONFDIR`/`PGPASSFILE` neutralised, and the socket required.
+
 ## Tests (no cloud, no live database)
 
 ```
