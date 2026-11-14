@@ -116,3 +116,34 @@ test('a budget replacement gets a fresh name the topic policy still admits', () 
     const policy = JSON.stringify(a.of('AWS::SNS::TopicPolicy'));
     assert.match(policy, /budget\/ezil-pilot-monthly\*/);
 });
+
+// Live 2026-10-16: ezil-pilot-ops runs the pre-forecast budget (rolled back on 2026-10-15).
+// existingBudgetName keeps it byte-for-byte, so the update only adds the two alarms.
+const LIVE_PILOT_BUDGET = {
+    Budget: { BudgetLimit: { Amount: 250, Unit: 'USD' }, BudgetName: 'ezil-pilot-monthly', BudgetType: 'COST', TimeUnit: 'MONTHLY' },
+    NotificationsWithSubscribers: [50, 80, 100].map(Threshold => ({
+        Notification: { ComparisonOperator: 'GREATER_THAN', NotificationType: 'ACTUAL', Threshold, ThresholdType: 'PERCENTAGE' },
+        Subscribers: [{ SubscriptionType: 'SNS', Address: { Ref: 'Alerts91F83244' } }],
+    })),
+};
+
+test('existingBudgetName keeps the live budget byte-for-byte and still adds both alarms', () => {
+    const o = ops({ monthlyBudgetUsd: 250, budgetEmails: [], existingBudgetName: 'ezil-pilot-monthly' });
+    assert.equal(o.topicId, 'Alerts91F83244', 'the topic keeps its live logical id');
+    assert.deepEqual(o.of('AWS::Budgets::Budget'), [LIVE_PILOT_BUDGET]);
+    assert.ok(alarm(o, 'ezil-pilot-vcpu-quota-high'));
+    assert.ok(alarm(o, 'ezil-pilot-computers-capacity-high'));
+    const policy = JSON.stringify(o.of('AWS::SNS::TopicPolicy'));
+    assert.match(policy, /budget\/ezil-pilot-monthly"/, 'the live budget keeps its exact publish grant');
+    assert.doesNotMatch(policy, /budget\/ezil-pilot-monthly\*/);
+});
+
+test('existingBudgetName refuses budget emails rather than replacing the live budget', () => {
+    assert.throws(() => ops({ budgetEmails: ['contact@ezil.work'], existingBudgetName: 'ezil-pilot-monthly' }), /would replace it/);
+});
+
+test('existingBudgetName must be an ezil-<ns>-monthly name', () => {
+    for (const name of ['ezil-pilot-monthly-1234abcd', 'other-budget', 'ezil-pilot-monthly ']) {
+        assert.throws(() => OpsConfigSchema.parse({ ...base, existingBudgetName: name }));
+    }
+});
