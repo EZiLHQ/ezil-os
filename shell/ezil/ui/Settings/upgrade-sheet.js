@@ -16,6 +16,9 @@ export function parseBillingDeepLink (search) {
     // A promoter link (`coupon=<alias>`, or `coupon_entry=invalid` from the root entry): `coupon` stays in the address
     // bar so a reload keeps it; `coupon_entry` is a one-shot flag.
     const link = couponFromSearch(search);
+    // ANY `coupon_entry` key (a known hint, empty, unknown or repeated) marks a coupon entry: Billing then never
+    // auto-opens a purchase for it. Presence only; the value is never trusted for anything else here.
+    const entryPresent = params.has('coupon_entry');
     params.delete('settings');
     params.delete('upgrade');
     // Display-only entry outcome; Billing reads it before normal boot adopts the clean address.
@@ -27,7 +30,8 @@ export function parseBillingDeepLink (search) {
     }
     const remaining = params.toString();
     return { initialTab: 'billing', openUpgrade, search: remaining ? `?${remaining}` : '',
-        ...(link.alias ? { couponAlias: link.alias } : link.invalid ? { couponInvalid: true } : {}) };
+        ...(link.alias ? { couponAlias: link.alias } : link.invalid ? { couponInvalid: true } : {}),
+        ...(entryPresent ? { couponEntryPresent: true } : {}) };
 }
 
 /** A failed download is evicted so Retry can reuse the existing payment session. */

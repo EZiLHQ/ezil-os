@@ -811,6 +811,16 @@ test('promoter-link parsing carries one canonical alias, keeps it in the address
     }
     assert.equal(parse('?settings=billing').couponAlias, undefined);
     assert.equal(parse('?settings=billing').couponInvalid, undefined);
+    // Presence, not value: ANY coupon_entry key marks a coupon entry (Billing never auto-opens a purchase for it).
+    for ( const entry of ['?settings=billing&upgrade=standard&coupon_entry=', '?settings=billing&upgrade=standard&coupon_entry=zzz',
+        '?settings=billing&upgrade=standard&coupon_entry=unavailable&coupon_entry=unavailable', '?settings=billing&upgrade=standard&coupon_entry=unavailable',
+        '?settings=billing&upgrade=standard&coupon_entry=identity_required', '?settings=billing&upgrade=standard&coupon_entry'] ) {
+        const parsed = parse(entry);
+        assert.equal(parsed.couponEntryPresent, true, entry);
+        assert.equal(parsed.openUpgrade, 'standard_monthly_v3', `${entry}: the intent is still parsed; Billing holds it`);
+        assert.ok(!parsed.search.includes('coupon_entry'), 'the one-shot flag is consumed');
+    }
+    assert.equal(parse('?settings=billing&upgrade=standard').couponEntryPresent, undefined, 'no key: no coupon entry');
     assert.equal(parse('?coupon=midhun'), null, 'a coupon alone is not a billing link');
 });
 

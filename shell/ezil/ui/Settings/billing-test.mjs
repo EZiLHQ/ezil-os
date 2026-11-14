@@ -1709,6 +1709,33 @@ try {
         summary = freeWith(sponsorPreview); await open(); noMutations();
         assert.equal(trialCtas(), 0);
 
+        // In-app: a coupon or invite entry stays read-only until the Billing CTA. An upgrade intent beside it (the pricing
+        // page's `upgrade=standard`, or the plan chooser) never auto-opens a quote, a checkout or a full-price fallback.
+        const STANDARD = 'standard_monthly_v3';
+        for ( const ctx of [link('midhun', { openUpgrade: STANDARD }), link('acme_partner', { openUpgrade: STANDARD }),
+            link(null, { couponInvalid: true, openUpgrade: STANDARD }), link('midhun', { openUpgrade: true }),
+            link(null, { couponEntryPresent: true, openUpgrade: STANDARD }), link(null, { couponEntryPresent: true, openUpgrade: true })] ) {
+            reset(); getTrialOffer = call => available(call.input?.coupon ?? null); summary = freeWith(previewOffer); await open(ctx); noMutations();
+            assert.equal(sheets.length, 0, `no auto-open: ${JSON.stringify(ctx)}`);
+        }
+        // Positive control, unchanged: with no coupon context the same intent still opens the free month.
+        reset(); getTrialOffer = call => available(call.input?.coupon ?? null); summary = freeWith(previewOffer);
+        await open({ ...context, initialTab: 'billing', openUpgrade: STANDARD });
+        assert.equal(sheets.filter(sheet => sheet.kind === 'checkout').length, 1, 'no-coupon pricing intent still auto-opens');
+        await closeSheet();
+        // Only the explicit CTA quotes, with the link's alias.
+        reset(); getTrialOffer = call => available(call.input?.coupon ?? null); summary = freeWith(previewOffer);
+        await open(link('midhun', { openUpgrade: STANDARD })); noMutations(); assert.equal(sheets.length, 0);
+        click(q('[data-action="trial"]')); await settle();
+        assert.equal(sheets.length, 1); assert.equal(sheets.at(-1).coupon, 'midhun'); assert.equal(sheets.at(-1).trial, true);
+        await closeSheet();
+        // The server's invite (no coupon in the context), accepted or refused: read-only, never a paid Standard checkout.
+        for ( const answer of [() => reply({ available: true, eligible: true, offer: invite }), () => failure('trial_offer_unavailable')] ) {
+            reset(); getTrialOffer = answer; summary = freeWith(sponsorPreview);
+            await open({ ...context, initialTab: 'billing', openUpgrade: STANDARD }); noMutations();
+            assert.equal(sheets.length, 0, 'an invite entry never auto-opens');
+        }
+
         // Outage: no CTA, a Try again that asks the SAME alias again; unavailable/invalid/refused are explained and final.
         reset(); getTrialOffer = () => failure('stripe_unavailable');
         summary = freeWith(previewOffer); await open(link('midhun')); noMutations();

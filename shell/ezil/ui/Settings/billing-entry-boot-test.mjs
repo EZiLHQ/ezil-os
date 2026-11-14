@@ -19,12 +19,17 @@ async function boot(entry,summary,trialOffer=PUBLIC){
  w.__EZIL_BOOT__={user:{id:'own-user',email:'test@example.test'},computer:{id:'11111111-1111-4111-8111-111111111111',name:'Own',slot:1},apps:[{id:'desktop'}],desktopState:{configured:false,provider:'cloudflare-guacamole'},features:{billing:true}};
  const reply=value=>({ok:true,status:200,json:async()=>({result:{data:{json:value}}})});
  w.fetch=async(url,options={})=>{
-  const method=String(url).split('/api/trpc/')[1]?.split('?')[0];calls.push({url:String(url),method,input:options.body?JSON.parse(options.body).json:undefined});
+  const method=String(url).split('/api/trpc/')[1]?.split('?')[0];
+  const query=new URL(String(url),'https://os.example').searchParams.get('input');
+  const input=options.body?JSON.parse(options.body).json:query?JSON.parse(query).json:undefined;
+  calls.push({url:String(url),method,input});
+  // `trialOffer` may answer per request input (a link's alias), as the server does.
+  const answer=typeof trialOffer==='function'?trialOffer(input):trialOffer;
   if(method==='billing.summary')return reply(summary);
   if(method==='billing.history'||method==='computer.list')return reply([]);
-  if(method==='billing.trialOffer')return trialOffer.ok===false?{ok:false,status:400,json:async()=>({error:{json:{message:trialOffer.code,data:{code:'BAD_REQUEST'}}}})}:reply(trialOffer);
+  if(method==='billing.trialOffer')return answer.ok===false?{ok:false,status:400,json:async()=>({error:{json:{message:answer.code,data:{code:'BAD_REQUEST'}}}})}:reply(answer);
   if(method==='billing.quoteTrial')return reply({sku:'standard_monthly_v3',todayCents:0,trialEndsAt:end,firstChargeAt:end,amountCents:2000,currency:'usd',interval:'month',
-   offer:{coupon:trialOffer.offer?.coupon??null,fingerprint:FP,source:trialOffer.offer?.source??'public'}});
+   offer:{coupon:answer.offer?.coupon??null,fingerprint:FP,source:answer.offer?.source??'public'}});
   if(method==='billing.createCheckout')return reply({mode:'embedded',sessionId:'cs_fake',clientSecret:'secret',publishableKey:'pk_test'});
   if(method==='billing.checkoutStatus')return reply({status:'open',paymentStatus:null});
   return {ok:false,status:404,json:async()=>({error:{json:{message:'fake unavailable'}}})};
@@ -90,6 +95,47 @@ for(const code of ['trial_offer_unavailable','trial_unavailable']){
   const creates=b.calls.filter(c=>c.method==='billing.createCheckout');assert.equal(creates.length,1);
   assert.equal(JSON.stringify(creates[0].input),JSON.stringify({sku:'standard_monthly_v3',trial:{trialEndsAt:end,offer:{coupon:null,fingerprint:FP}}}));
   groups++;console.log('PASS actual boot opaque invite: no coupon, one activation, exact echo');
+ }finally{b.close();}
+}
+// A coupon or invite entry stays read-only until the Billing CTA. Beside `upgrade=standard` (pricing-page intent), on
+// either spelling of the Billing address: no quote, no Checkout, no sheet on page view, and no full-price fallback.
+// Then only an explicit CTA on a VALID entry quotes and opens Checkout with the exact echo.
+const linkOffer=input=>input?.coupon?{available:true,eligible:true,offer:{coupon:input.coupon,fingerprint:FP,source:input.coupon.includes('_')?'sponsor':'promoter'}}
+ :{available:true,eligible:true,offer:{coupon:null,fingerprint:FP,source:'public'}};
+const inviteSummary=()=>{const s=trialSummaryV3('offer');s.trialOffer.source='sponsor';return s;};
+for(const [label,entry,options] of [
+ ['valid Product alias','/os?settings=billing&upgrade=standard&coupon=midhun',{valid:'midhun'}],
+ ['valid Product alias (settings alias)','/app/settings?tab=billing&upgrade=standard&coupon=midhun',{valid:'midhun'}],
+ ['valid legacy alias','/os?settings=billing&upgrade=standard&coupon=acme_partner',{valid:'acme_partner'}],
+ ['malformed alias','/os?settings=billing&upgrade=standard&coupon=bad%20alias',{}],
+ ['duplicate alias','/os?settings=billing&upgrade=standard&coupon=midhun&coupon=other',{}],
+ ['failed-entry hint','/os?settings=billing&upgrade=standard&coupon_entry=unavailable',{}],
+ ['failed-entry hint (settings alias)','/app/settings?tab=billing&upgrade=standard&coupon_entry=identity_required',{}],
+ ['empty coupon_entry','/os?settings=billing&upgrade=standard&coupon_entry=',{}],
+ ['unknown coupon_entry','/os?settings=billing&upgrade=standard&coupon_entry=zzz',{}],
+ ['repeated coupon_entry','/os?settings=billing&upgrade=standard&coupon_entry=unavailable&coupon_entry=unavailable',{}],
+ ['valueless coupon_entry (settings alias)','/app/settings?tab=billing&upgrade=standard&coupon_entry',{}],
+ ['opaque invite, no coupon','/os?settings=billing&upgrade=standard',{invite:true,valid:null}],
+ ['refused invite, no coupon','/os?settings=billing&upgrade=standard',{invite:true,refused:true}],
+]){
+ const read=options.refused?{ok:false,code:'trial_offer_unavailable'}:options.invite?{available:true,eligible:true,offer:{coupon:null,fingerprint:FP,source:'sponsor'}}:linkOffer;
+ const b=await boot(entry,options.invite?inviteSummary():trialSummaryV3('offer'),read);
+ try{
+  await b.until(()=>b.calls.some(c=>c.method==='billing.summary'));await wait(150);
+  assert.equal(b.calls.filter(c=>c.method==='billing.quoteTrial'||c.method==='billing.createCheckout').length,0,`${label}: page view only reads`);
+  assert.equal(b.w.document.querySelectorAll('[data-role="upgrade-sheet"]').length,0,`${label}: no sheet on page view`);
+  if('valid' in options){
+   const btn=b.w.document.querySelector('[data-role="plan-offer"][data-sku="standard_monthly_v3"] [data-action="trial"]');assert.ok(btn,`${label}: the CTA is there`);
+   btn.click();btn.click();
+   await b.until(()=>b.w.document.querySelector('[data-role="fake-checkout"]'));
+   const quotes=b.calls.filter(c=>c.method==='billing.quoteTrial');assert.equal(quotes.length,1,label);
+   assert.equal(quotes[0].input?.coupon??null,options.valid,`${label}: quoted with the entry's own input`);
+   const creates=b.calls.filter(c=>c.method==='billing.createCheckout');assert.equal(creates.length,1,label);
+   assert.equal(JSON.stringify(creates[0].input),JSON.stringify({sku:'standard_monthly_v3',trial:{trialEndsAt:end,offer:{coupon:options.valid,fingerprint:FP}}}),label);
+  }else{
+   assert.equal(b.calls.filter(c=>c.method==='billing.quoteTrial'||c.method==='billing.createCheckout').length,0,`${label}: nothing written`);
+  }
+  groups++;console.log('PASS actual boot coupon/invite entry with upgrade=standard stays read-only',label);
  }finally{b.close();}
 }
 console.log(`${groups} actual boot/entry groups passed; all HTTP/Stripe doubled`);

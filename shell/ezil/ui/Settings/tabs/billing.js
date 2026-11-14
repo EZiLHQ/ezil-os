@@ -793,6 +793,15 @@ function startCountdown ($win, state) {
     state.timer = setInterval(update, 30000);
 }
 
+/**
+ * A coupon or invite entry: the address or in-app context carried a link (valid or not), the root entry left a
+ * `coupon_entry` hint, or the server reports its own invite selection. Billing then stays read-only until the person
+ * presses its CTA: an `upgrade=` intent never auto-opens a quote, a checkout or a full-price fallback.
+ */
+function entryHeld (state) {
+    return !! state.coupon || state.couponEntryPresent === true || !! state.couponEntry || state.invite === true;
+}
+
 /** The availability read's verdict (see `withCouponView`): every refusal or failure says which; none enables a CTA. */
 function couponStatus (result, alias) {
     // Only the server's own `available && eligible` for this person and this offer enables a free month, with a real
@@ -842,6 +851,9 @@ async function load ($win, state) {
             }
             if ( accountCredits(account, { userId }) !== null ) state.lastAccount = account;
             let view = result.data;
+            // The server's own invite selection (its HttpOnly carrier), read from the summary before any availability
+            // verdict hides it: an invite entry stays read-only even when the read refuses it (`entryHeld`).
+            state.invite = result.data.trialOffer?.source === 'sponsor';
             if ( result.data.version === 3 ) {
                 const read = availability ? await availability : { status: 'invalid' };
                 // Across that await the window, the signed-in user or the link may have changed: drop this answer.
@@ -885,7 +897,11 @@ async function load ($win, state) {
         const sku = state.openUpgrade;
         // `upgrade=standard` (the pricing page's Standard card, which advertises the free month) opens the free month
         // when the server offers it to this viewer, and the ordinary Standard checkout otherwise.
-        if ( topup || recovery ) { /* The deep link's section, or Code, asked for billing recovery above. */ } else if ( sku === TRIAL_SKU && trialOfferOf(state.summary) ) openSheet($win, state, 'trial');
+        if ( topup || recovery ) { /* The deep link's section, or Code, asked for billing recovery above. */ } else if ( sku && entryHeld(state) ) {
+            // A coupon or invite entry is read-only until the CTA: consume the intent, point at the CTA, open nothing.
+            state.openUpgrade = false;
+            $body.find('[data-action="trial"]').get(0)?.focus({ preventScroll: true });
+        } else if ( sku === TRIAL_SKU && trialOfferOf(state.summary) ) openSheet($win, state, 'trial');
         else if ( typeof sku === 'string' && offerFor(state.summary, sku) && state.summary.actions.checkout ) openSheet($win, state, 'checkout', sku);
         else if ( ['compute_monthly_v2', 'premium_monthly_v3'].includes(sku) && state.summary.actions.upgrade ) openSheet($win, state, 'upgrade');
         else if ( sku === true && state.summary.actions.checkout ) {
@@ -1221,6 +1237,8 @@ export default {
             const params = new URLSearchParams(settingsAliasSearch(window.location));
             const couponEntry = params.get('coupon_entry');
             if ( ['unavailable', 'identity_required'].includes(couponEntry) ) state.couponEntry = couponEntry;
+            // Presence, not value: any `coupon_entry` key (from the entry projection or still in the address) holds auto-open.
+            if ( ctx.couponEntryPresent === true || params.has('coupon_entry') ) state.couponEntryPresent = true;
             // `reason=insufficient_credits` (Code's recovery link) frames the same dialog as exhaustion recovery.
             if ( ! state.autoOpened && params.get('settings') === 'billing' && params.get('section') === 'ai-credits' ) {
                 state.openTopup = { reason: params.get('reason') === 'insufficient_credits' ? 'insufficient_credits' : null };
