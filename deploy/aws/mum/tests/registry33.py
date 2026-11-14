@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Stage registry capacity 33 over the normal apply-app -> promote order: reader proofs and guards.
+
+Offline only: temporary git repositories, this checkout's own git objects (5127d85f -> ed7da29a host
+agent), the real Node probe with a fake fetch, and synthetic CLI results. No AWS, SSM or secret.
+"""
+import copy
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent))
+sys.path.insert(0, str(HERE))
+from rebase import TOOL, release_record
+import rebase_app
+import rebase_app_swap as swap_ops
+import rebase_release as release
+import registry_gc as gc
+
+REPO = HERE.parents[3]
+AGENT_5127 = '5127d85f71af309dc7c47537a6be276a7de1eb9d'
+AGENT_ED7 = 'ed7da29a279915af36f5c3cfdb63c5627b269049'
+SHA = '9' * 40
+TAG = 'stage-cap33'
+IMAGE = 'sha256:' + 'a' * 64
+
+
+def git(repo, *args):
+    return subprocess.run(['git', '-C', str(repo), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def source_repo(root, *declarations):
+    """One commit per declaration text (None: the file is absent). Returns the commit SHAs."""
+    repo = root / 'repo'
+    git(root, 'init', '-q', str(repo))
+    git(repo, 'config', 'user.email', 'test@example.invalid')
+    git(repo, 'config', 'user.name', 'test')
+    path = repo / release.CAPACITY_SOURCE
+    shas = []
+    for text in declarations:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if text is None:
+            path.unlink(missing_ok=True)
+            (repo / 'other.txt').write_text(str(len(shas)))
+        else:
+            path.write_text("import { z } from 'zod';\n" + text + '\n')
+        git(repo, 'add', '-A')
+        git(repo, 'commit', '-qm', str(len(shas)))
+        shas.append(git(repo, 'rev-parse', 'HEAD'))
+    return repo, shas
+
+
+class SourceCapacityTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.repo, (self.cap33, self.cap32, self.twice, self.absent) = source_repo(
+            Path(temporary.name),
+            'export const REBASE_RELEASE_REGISTRY_CAPACITY = 33;',
+            'export const REBASE_RELEASE_REGISTRY_CAPACITY = 32;',
+            'export const REBASE_RELEASE_REGISTRY_CAPACITY = 33;\nexport const REBASE_RELEASE_REGISTRY_CAPACITY = 34;',
+            None)
+
+    def test_source_constant_and_blob(self):
+        capacity, blob = release.source_reader_capacity(self.cap33, self.repo)
+        self.assertEqual(capacity, 33)
+        self.assertEqual(blob, git(self.repo, 'rev-parse', self.cap33 + ':' + release.CAPACITY_SOURCE))
+        self.assertEqual(release.source_reader_capacity(self.cap32, self.repo)[0], 32)
+
+    def test_unknown_capacity_refused(self):
+        for sha in (self.twice, self.absent, 'f' * 40, 'not-a-sha'):
+            with self.subTest(sha=sha), self.assertRaisesRegex(ValueError, '^target app reader capacity unknown$'):
+                release.source_reader_capacity(sha, self.repo)
+
+    def test_thirty_two_reader_allowed_until_thirty_three_records_exist(self):
+        # Before the append, rolling back to a thirty-two-record reader (or an unknown one) stays allowed.
+        for sha in (self.cap32, self.absent, 'f' * 40):
+            self.assertIsNone(release.require_reader_capacity(32, sha, self.repo))
+        self.assertEqual(release.require_reader_capacity(33, self.cap33, self.repo)['capacity'], 33)
+        for sha, message in ((self.cap32, 'cannot read the live release registry'), (self.absent, 'capacity unknown'),
+                             (self.twice, 'capacity unknown')):
+            with self.subTest(sha=sha), self.assertRaisesRegex(ValueError, message):
+                release.require_reader_capacity(33, sha, self.repo)
+        with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
+            release.require_reader_capacity(34, self.cap33, self.repo)
+
+    def test_this_checkout_declares_thirty_three_and_ed7_thirty_two(self):
+        text = (REPO / release.CAPACITY_SOURCE).read_text()
+        self.assertEqual(release.CAPACITY_DECLARATION.findall(text), ['33'])
+        self.assertEqual(release.source_reader_capacity(AGENT_ED7, REPO)[0], 32)
+        with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
+            release.require_reader_capacity(33, AGENT_ED7, REPO)
+
+
+class RuntimeCapacityTests(unittest.TestCase):
+    def test_runtime_capacity_only_binds_past_the_legacy_limit(self):
+        for legacy in ({}, {'readerCapacity': None}, {'readerCapacity': 32}, None):
+            release.require_runtime_capacity(legacy, 32)
+        release.require_runtime_capacity({'readerCapacity': 33}, 33)
+        for bad in ({}, {'readerCapacity': None}, {'readerCapacity': 32}, {'readerCapacity': '33'}, {'readerCapacity': True},
+                    {'readerCapacity': 33.0}, None):
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, 'running app reader capacity is below'):
+                release.require_runtime_capacity(bad, 33)
+        with self.assertRaisesRegex(ValueError, 'running app reader capacity is below'):
+            release.require_runtime_capacity({'readerCapacity': 33}, 34)
+
+    def test_prospective_count_counts_only_new_identities(self):
+        record = release_record()
+        d = {'releases': [record]}
+        self.assertEqual(release.prospective_count(d, [record]), 1)
+        self.assertEqual(release.prospective_count(d, [record, dict(record, amiId='ami-' + 'f' * 17)]), 2)
+
+
+class HostAbiTests(unittest.TestCase):
+    def test_reviewed_attestation_delta_is_exactly_three_files(self):
+        self.assertEqual(release.require_host_abi(AGENT_5127, AGENT_ED7, REPO), release.HOST_AGENT_EXCEPTION)
+        self.assertEqual(release.require_host_abi(AGENT_ED7, AGENT_ED7, REPO), {})
+        self.assertEqual(release.require_host_abi(AGENT_5127, AGENT_5127, REPO), {})
+
+    def test_other_deltas_refused(self):
+        with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+            release.require_host_abi(AGENT_ED7, AGENT_5127, REPO)  # removing the lane is not the reviewed delta
+        for sha in ('f' * 40, 'not-a-sha'):
+            with self.subTest(sha=sha), self.assertRaisesRegex(ValueError, 'host agent commit unavailable'):
+                release.require_host_abi(AGENT_5127, sha, REPO)
+
+    def test_wider_or_different_blob_refused(self):
+        tree = release.host_agent_tree(AGENT_ED7, REPO)
+        old = release.host_agent_tree(AGENT_5127, REPO)
+        for mutate in (lambda t: t.update({'lib/ezil_host/extra.py': '100644 ' + '1' * 40}),
+                       lambda t: t.update({'lib/ezil_host/attest.py': '100644 ' + '2' * 40}),
+                       lambda t: t.update({'lib/ezil_host/cli.py': '100755 ' + t['lib/ezil_host/cli.py'].split(' ')[1]}),
+                       lambda t: t.pop('test/test_attest.py')):
+            changed = copy.deepcopy(tree)
+            mutate(changed)
+            with self.subTest(changed=sorted(set(changed.items()) ^ set(tree.items()))), \
+                    patch.object(release, 'host_agent_tree', side_effect=[old, changed]), \
+                    self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+                release.require_host_abi(AGENT_5127, AGENT_ED7, REPO)
+
+
+class PromotionGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.plan = {'rollout': {'app': {'tag': TAG, 'gitSha': SHA, 'checksumSha256': '0' * 64}}, 'bake': {'agentCommit': SHA}}
+        self.receipt = {'gitSha': SHA, 'killSwitch': '1', 'deployment': {}, 'readerCapacity': 33}
+        self.observed = {'gitSha': SHA, 'servedSha': SHA, 'killSwitch': '1', 'composeTag': TAG, 'imageId': IMAGE,
+                         'tagImageId': IMAGE, 'composeImageId': IMAGE, 'lockFree': True, 'readerCapacity': 33}
+        self.calls = []
+
+    def run_guard(self, count=33, apply=True, receipt=None, observed=None, capacity=33, abi=None):
+        def ssm(directory, operation, body, run_apply, aws, write, fresh=False):
+            self.calls.append((operation, fresh))
+            self.assertEqual(body, rebase_app.probe_body(TAG))
+            return observed if observed is not None else copy.deepcopy(self.observed)
+        with patch.object(release, 'require_receipt', return_value=receipt if receipt is not None else copy.deepcopy(self.receipt)), \
+                patch.object(release, 'source_reader_capacity', return_value=(capacity, 'b' * 40)), \
+                patch.object(release, 'require_host_abi', side_effect=abi or (lambda old, new: {})), \
+                patch.object(release.rebase_ssm, 'run', side_effect=ssm):
+            return release.require_reader_promotion(Path('/nonexistent/plan.json'), self.plan, count, apply, 7, AGENT_5127)
+
+    def test_legacy_count_needs_nothing(self):
+        self.plan['bake']['agentCommit'] = 'e' * 40
+        self.assertIsNone(self.run_guard(count=32, receipt={}, observed={}, capacity=1,
+                                         abi=lambda *a: (_ for _ in ()).throw(ValueError('abi'))))
+        self.assertEqual(self.calls, [])
+
+    def test_proven_reader_passes_with_one_fresh_protected_probe(self):
+        self.run_guard()
+        self.assertEqual(self.calls, [('promote-reader-probe-g7', True)])
+
+    def test_dry_run_checks_receipt_source_and_abi_without_probe(self):
+        self.run_guard(apply=False)
+        self.assertEqual(self.calls, [])
+        with self.assertRaisesRegex(ValueError, 'apply-app receipt does not prove'):
+            self.run_guard(apply=False, receipt=dict(self.receipt, readerCapacity=None))
+
+    def test_refusals(self):
+        cases = [
+            (dict(receipt={k: v for k, v in self.receipt.items() if k != 'readerCapacity'}), 'apply-app receipt does not prove'),
+            (dict(receipt=dict(self.receipt, readerCapacity=32)), 'apply-app receipt does not prove'),
+            (dict(capacity=32), 'target app cannot read the live release registry'),
+            (dict(count=34), 'target app cannot read the live release registry'),
+            (dict(abi=lambda *a: (_ for _ in ()).throw(ValueError('host agent differs from the deployed agent beyond the reviewed delta'))),
+             'beyond the reviewed delta'),
+            (dict(observed=dict(self.observed, gitSha='e' * 40)), 'not the plan-bound apply-app build'),
+            (dict(observed=dict(self.observed, servedSha='e' * 40)), 'not the plan-bound apply-app build'),
+            (dict(observed=dict(self.observed, composeTag='old-app')), 'not the plan-bound apply-app build'),
+            (dict(observed=dict(self.observed, composeImageId='sha256:' + 'b' * 64)), 'not the plan-bound apply-app build'),
+            (dict(observed=dict(self.observed, tagImageId='sha256:' + 'b' * 64)), 'not the plan-bound apply-app build'),
+            (dict(observed=dict(self.observed, imageId='unavailable', tagImageId='unavailable', composeImageId='unavailable')),
+             'not the plan-bound apply-app build'),
+            (dict(observed=dict(self.observed, killSwitch='0')), 'not the plan-bound apply-app build'),
+            (dict(observed=dict(self.observed, lockFree=False)), 'not the plan-bound apply-app build'),
+            (dict(observed=dict(self.observed, readerCapacity=None)), 'running app reader capacity is below'),
+            (dict(observed=dict(self.observed, readerCapacity=32)), 'running app reader capacity is below'),
+        ]
+        for kwargs, message in cases:
+            self.calls.clear()
+            with self.subTest(message=message, kwargs=sorted(kwargs)), self.assertRaisesRegex(ValueError, message):
+                self.run_guard(**kwargs)
+
+    def test_app_and_bake_must_be_one_commit(self):
+        self.plan['bake']['agentCommit'] = 'e' * 40
+        with self.assertRaisesRegex(ValueError, 'same reviewed integrated source commit'):
+            self.run_guard()
+        self.assertEqual(self.calls, [])
+
+
+class ProbeTests(unittest.TestCase):
+    """The real NODE program under Node with fetch replaced; production bytes are unchanged."""
+    PRELOAD = r"""
+const mode = process.env.TEST_HEALTH_MODE;
+globalThis.fetch = async (url, init) => {
+  if (url !== 'http://127.0.0.1:3000/api/health' || init.redirect !== 'error' || !(init.signal instanceof AbortSignal)) throw new Error('bad request');
+  if (mode === 'throw') throw new Error('refused');
+  const body = mode === 'nocap' ? { ok: true, sha: process.env.EZIL_GIT_SHA }
+    : mode === 'othersha' ? { ok: true, sha: 'e'.repeat(40), registryCapacity: 33 }
+    : mode === 'string' ? { ok: true, sha: process.env.EZIL_GIT_SHA, registryCapacity: '33' }
+    : { ok: true, sha: process.env.EZIL_GIT_SHA, registryCapacity: 33 };
+  return { status: mode === 'status' ? 503 : 200, json: async () => body };
+};
+"""
+
+    def probe(self, mode):
+        with tempfile.TemporaryDirectory() as directory:
+            preload = Path(directory) / 'preload.cjs'
+            preload.write_text(self.PRELOAD)
+            environment = {'PATH': os.environ['PATH'], 'EZIL_GIT_SHA': SHA, 'EZIL_AWS_KILL_SWITCH': '1', 'TEST_HEALTH_MODE': mode,
+                           'EZIL_AWS_LIFECYCLE_DEPLOYMENTS': json.dumps({TOOL.REGION: dict(release_record(), releases=[release_record()])})}
+            result = subprocess.run(['node', '--require', str(preload), '-e', rebase_app.NODE], env=environment,
+                                    capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def test_capacity_only_from_own_health_with_matching_sha(self):
+        out = self.probe('ok')
+        self.assertEqual(out['readerCapacity'], 33)
+        self.assertEqual(set(out), {'gitSha', 'killSwitch', 'deployment', 'readerCapacity'})
+        for mode in ('nocap', 'othersha', 'string', 'status', 'throw'):
+            with self.subTest(mode=mode):
+                self.assertIsNone(self.probe(mode)['readerCapacity'])
+
+    def test_probe_is_bounded_and_fixed(self):
+        self.assertIn("fetch('http://127.0.0.1:3000/api/health',{signal:AbortSignal.timeout(5000),redirect:'error'", rebase_app.NODE)
+        self.assertEqual(rebase_app.NODE.count('fetch('), 1)
+        self.assertIn('readerCapacity', swap_ops.PROBE_KEYS)
+
+
+class LegacyGcParityTests(unittest.TestCase):
+    def test_frozen_gc_stays_a_thirty_two_record_tool(self):
+        self.assertEqual((TOOL.RELEASE_REGISTRY_CAPACITY, TOOL.ACTIVE_REGISTRY_CAPACITY), (32, 33))
+        self.assertEqual(gc.tool.RELEASE_REGISTRY_CAPACITY, 32)
+        target = release_record()
+        records = [dict(target, amiId='ami-' + format(n, '017x'), recipeVersion='1.0.' + str(n)) for n in range(100, 133)]
+        self.assertEqual(len(records), 33)
+        snapshot = {'VersionId': 'v1', 'deployment': dict(target, releases=records)}
+        drops = [{'lowerImageDigest': records[0]['lowerImageDigest'], 'amiId': records[0]['amiId']}]
+        with self.assertRaisesRegex(ValueError, '^GC invalid registry$'):
+            gc.prepare(snapshot, target, [], {}, drops, '0' * 64, None)
+
+
+class AppSwapGuardTests(unittest.TestCase):
+    def test_swap_checks_reader_before_ledger_or_install(self):
+        source = Path(swap_ops.__file__).read_text()
+        swap = source[source.index('def swap('):source.index('def reconcile(')]
+        guard = swap.index('release.require_reader_capacity(count, dst')
+        self.assertLess(guard, swap.index('release.write_ledger_append'))
+        self.assertLess(guard, swap.index('rebase_ssm.run'))
+        self.assertLess(swap.index("need(at(after, dst"), swap.index('release.require_runtime_capacity(after, count)'))
+        reconcile = source[source.index('def reconcile('):source.index('def cli(')]
+        self.assertLess(reconcile.index('release.require_runtime_capacity(second'), reconcile.index('terminal(ledger_path'))
+
+
+if __name__ == '__main__':
+    unittest.main()

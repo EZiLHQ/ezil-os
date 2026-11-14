@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { readLifecycleDeployments } from './aws-intent';
-import { parseRebaseRelease, parseRebaseSourceRelease, RebaseReleaseSchema, RebaseSourceReleaseSchema,
+import { attestationRegistry } from './aws-lower-attestation';
+import { parseRebaseRelease, parseRebaseSourceRelease, REBASE_RELEASE_REGISTRY_CAPACITY, RebaseReleaseSchema, RebaseSourceReleaseSchema,
     resolveRebaseReleases, sourceDeploymentFor } from './aws-rebase-release';
 import { fixtureReleaseRegistry106, fixtureReleaseRegistry16, fixtureReleaseRegistry32,fixtureSharedLowerSuccessor, LOWER_102, LOWER_105, PREMIUM_LOWER } from './aws-rebase-release-registry.test-support';
 
@@ -195,22 +196,40 @@ describe('sixteen-record registry capacity and rollback compatibility', () => {
         expect(f.retained.slice(0, 3)).toEqual(f.releases);
     });
 
-    it('accepts twenty-six through thirty-two records including maintenance and refuses thirty-three in both validators even when all identities are valid', () => {
+    it('accepts twenty-six through thirty-three records including maintenance and refuses thirty-four in all three app readers even when all identities are valid', () => {
         const f = fixtureReleaseRegistry32();
+        expect(REBASE_RELEASE_REGISTRY_CAPACITY).toBe(33);
         expect(f.release125).toMatchObject({ previousLowerImageDigest: null, previousLowerImageRef: null });
         expect(RebaseSourceReleaseSchema.parse(f.release125)).toEqual(f.release125);
-        for (const count of [26, 27, 28, 29, 30, 31, 32]) {
-            const full = { ...f.deployment118, releases: f.retained.slice(0, count) };
+        const thirtyThird = { ...f.release138, amiId: 'ami-fffffffffffffffff', recipeVersion: '1.0.39', createdAt: '2026-11-14T20:00:00.000Z' };
+        const all = [...f.retained, thirtyThird];
+        for (const count of [26, 27, 28, 29, 30, 31, 32, 33]) {
+            const full = { ...f.deployment118, releases: all.slice(0, count) };
             expect(full.releases).toHaveLength(count);
             expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ [full.region]: full }) }, [full.region]).ok).toBe(true);
             expect(() => resolveRebaseReleases(full, LOWER_102)).not.toThrow();
+            expect(attestationRegistry(full).releases).toEqual(full.releases);
         }
-        const entry = { ...f.deployment118, releases: [...f.retained, { ...f.release138, amiId: 'ami-fffffffffffffffff', recipeVersion: '1.0.39',
-            createdAt: '2026-11-14T20:00:00.000Z' }] };
-        expect(entry.releases).toHaveLength(33);
+        // All thirty-two retained records stay byte-identical when the thirty-third is appended.
+        expect(all.slice(0, 32)).toEqual(f.retained);
+        const entry = { ...f.deployment118, releases: [...all, { ...f.release138, amiId: 'ami-eeeeeeeeeeeeeeeee', recipeVersion: '1.0.40',
+            createdAt: '2026-11-14T21:00:00.000Z' }] };
+        expect(entry.releases).toHaveLength(34);
         entry.releases.forEach(r => expect(RebaseSourceReleaseSchema.safeParse(r).success).toBe(true));
         expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ [entry.region]: entry }) }, [entry.region]).ok).toBe(false);
         expect(() => resolveRebaseReleases(entry, LOWER_102)).toThrow();
+        expect(() => attestationRegistry(entry)).toThrow('release_mismatch');
+    });
+
+    it('keeps the 65,536-byte deployment-map ceiling at thirty-three records', () => {
+        const f = fixtureReleaseRegistry32();
+        const entry = { ...f.deployment118, releases: [...f.retained, { ...f.release138, amiId: 'ami-fffffffffffffffff', recipeVersion: '1.0.39',
+            createdAt: '2026-11-14T20:00:00.000Z' }] };
+        const raw = JSON.stringify({ [entry.region]: entry });
+        expect(Buffer.byteLength(raw)).toBeLessThan(65536);
+        const atLimit = raw + ' '.repeat(65536 - Buffer.byteLength(raw));
+        expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: atLimit }, [entry.region]).ok).toBe(true);
+        expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: atLimit + ' ' }, [entry.region]).ok).toBe(false);
     });
 
     it.each(['duplicate target', 'malformed record', 'out of order'])('still rejects %s at the thirty-two-record limit', kind => {

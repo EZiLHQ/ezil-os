@@ -87,6 +87,56 @@ if [[ -n $approved_source ]]; then
         [[ $previous_source =~ ^([0-9a-f]{40}|[0-9a-f]{64})$ ]] || previous_source=unavailable
     fi
 fi
+# Release registry: past the legacy thirty-two records, install only an image whose build-time
+# work.ezil.registry-capacity label (deploy.sh build, from the exact source constant) reads the live
+# registry. An unlabelled image is a thirty-two-record reader. This is pre-install provenance; the
+# operator's in-container probe proves the running capacity afterwards. Prints no secret value.
+image_labels=$(docker image inspect "$slug:$tag" --format '{{json .Config.Labels}}')
+registry_guard() {
+python3 - "$image_labels" "$1" <<'OS_REGISTRY_CAPACITY_PY'
+import json, os, re, subprocess, sys
+LEGACY = 32
+try:
+    labels, source = json.loads(sys.argv[1]) or {}, sys.argv[2]
+except ValueError:
+    raise SystemExit("Registry capacity guard could not read the image labels") from None
+if source == "secret":
+    # Same instance-role-only environment this script exported for its S3 downloads above.
+    if os.environ.get("AWS_SHARED_CREDENTIALS_FILE") != "/dev/null" or os.environ.get("AWS_CONFIG_FILE") != "/dev/null":
+        raise SystemExit("Registry capacity guard requires the instance-role-only AWS environment")
+    result = subprocess.run(["aws", "--region", "ap-south-1", "--no-cli-pager", "secretsmanager", "get-secret-value",
+                             "--secret-id", "ezil-os/billing-staging/app", "--output", "json"],
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False, timeout=60)
+    if result.returncode:
+        raise SystemExit("Registry capacity guard could not read the app secret")
+    try:
+        raw = json.loads(json.loads(result.stdout)["SecretString"]).get("EZIL_AWS_LIFECYCLE_DEPLOYMENTS")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise SystemExit("Registry capacity guard could not read the app secret") from None
+else:
+    try:
+        with open(source, encoding="utf-8") as rendered:
+            lines = [line[len("EZIL_AWS_LIFECYCLE_DEPLOYMENTS="):].rstrip("\n") for line in rendered
+                     if line.startswith("EZIL_AWS_LIFECYCLE_DEPLOYMENTS=")]
+    except OSError:
+        raise SystemExit("Invalid rendered environment") from None
+    if len(lines) > 1:
+        raise SystemExit("Invalid rendered environment")
+    raw = lines[0] if lines else None
+try:
+    deployments = json.loads(raw) if isinstance(raw, str) else {}
+except ValueError:
+    raise SystemExit("Invalid release registry") from None
+releases = (deployments.get("ap-south-1") or {}).get("releases", []) if isinstance(deployments, dict) else None
+if not isinstance(releases, list):
+    raise SystemExit("Invalid release registry")
+label = labels.get("work.ezil.registry-capacity") if isinstance(labels, dict) else None
+capacity = int(label) if isinstance(label, str) and re.fullmatch(r"[1-9][0-9]{0,3}", label) else LEGACY
+if len(releases) > LEGACY and capacity < len(releases):
+    raise SystemExit("Image cannot read the live release registry; refused before install")
+OS_REGISTRY_CAPACITY_PY
+}
+registry_guard secret
 # Extract only known ordinary files; reject links, traversal and extra members.
 python3 - "$temporary/$tag.runtime.tar.gz" <<'PY'
 import pathlib, tarfile, sys
@@ -113,6 +163,8 @@ done
 # The script arrives on bash's stdin (SSM heredoc), so any child that reads stdin would swallow the
 # unparsed rest of it (timer restore, footer) and still exit 0. Isolate stdin for every such child.
 python3 render-env.py </dev/null
+# Recheck against exactly what the new container will read; refused here, the old container keeps running.
+registry_guard /etc/ezil-os-staging/app.env
 printf 'OS_STAGING_TAG=%s\n' "$tag" >compose.env
 # D4: --force-recreate deletes the outgoing web container's json-file log. Keep a gzip copy first
 # (root-only, 7-day retention). Best effort: a snapshot problem never blocks the install.

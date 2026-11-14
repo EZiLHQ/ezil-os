@@ -40,6 +40,9 @@ if name == "aws":
         print("command-1")
     elif "get-command-invocation" in args:
         print("Success" if after("--query") == "Status" else os.environ.get("FAKE_SSM_STDOUT", ""))
+    elif "get-secret-value" in args:  # the installer's registry capacity guard; never a real secret
+        print(json.dumps({"SecretString": json.dumps({"EZIL_AWS_LIFECYCLE_DEPLOYMENTS":
+              os.environ.get("FAKE_DEPLOYMENTS", '{"ap-south-1":{"releases":[]}}')})}))
     elif args[3:5] == ["s3", "cp"]:
         bucket, key = args[5][len("s3://"):].split("/", 1)
         source = pathlib.Path(os.environ["FAKE_S3"], bucket, key)
@@ -73,6 +76,8 @@ elif name == "docker":
         sys.stdout.write("image:" + args[1])
     elif args[:1] == ["load"]:
         (state / "loaded").write_bytes(sys.stdin.buffer.read())
+    elif args[:2] == ["image", "inspect"] and '--format' in args and after('--format') == '{{json .Config.Labels}}':
+        print(os.environ.get('FAKE_LABELS', 'null'))
     elif args[:2] == ["image", "inspect"]:
         if args[2] == 'sha256:' + '1' * 64:
             print('2' * 40)
@@ -118,9 +123,13 @@ elif name == "curl":
                      .replace("%{remote_ip}", os.environ.get("FAKE_REMOTE_IP", "203.0.113.10")))
 '''
 
-RENDER_ENV_STUB = r'''import json, os, sys
+RENDER_ENV_STUB = r'''import json, os, pathlib, sys
 with open(os.path.join(os.environ["SHIM_STATE"], "log"), "a") as log:
     log.write(json.dumps(["render-env.py"] + sys.argv[1:]) + "\n")
+# As render-env.py does: write app.env (the installer's registry guard rereads it); <host>/opt/ezil-os-staging is the cwd.
+rendered = pathlib.Path.cwd().parents[1] / "etc/ezil-os-staging/app.env"
+rendered.parent.mkdir(parents=True, exist_ok=True)
+rendered.write_text("EZIL_AWS_LIFECYCLE_DEPLOYMENTS=" + os.environ.get("FAKE_DEPLOYMENTS", '{"ap-south-1":{"releases":[]}}') + "\n")
 print("\n".join(sorted(os.environ.get("FAKE_KEYS", "").split())))
 '''
 
