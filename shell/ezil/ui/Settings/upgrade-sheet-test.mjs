@@ -798,7 +798,8 @@ test('promoter-link parsing carries one canonical alias, keeps it in the address
     assert.deepEqual(parse('?settings=billing&coupon=MidHun&view=files'), { initialTab: 'billing', openUpgrade: false, search: '?coupon=MidHun&view=files', couponAlias: 'midhun' });
     assert.equal(parse('?settings=billing&coupon=ab').couponAlias, 'ab');
     for ( const bad of ['?settings=billing&coupon=a&coupon=b', '?settings=billing&coupon=bad%20alias', '?settings=billing&coupon=', '?settings=billing&coupon=a', '?settings=billing&coupon=mid_hun',
-        `?settings=billing&coupon=${'x'.repeat(33)}`, '?settings=billing&coupon_entry=invalid'] ) {
+        `?settings=billing&coupon=${'x'.repeat(33)}`, '?settings=billing&coupon_entry=invalid',
+        '?settings=billing&coupon_entry=unavailable', '?settings=billing&coupon_entry=unknown', '?settings=billing&coupon_entry=', '?settings=billing&coupon_entry', '?settings=billing&coupon_entry=invalid&coupon_entry=x'] ) {
         const parsed = parse(bad);
         assert.equal(parsed.couponInvalid, true, bad);
         assert.equal(parsed.couponAlias, undefined, bad);
