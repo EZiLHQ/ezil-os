@@ -3577,8 +3577,16 @@ describe('AI credential and code-host routes', () => {
         expect((await worker.fetch(req(auth, path), env)).status).toBe(404);
       }
       expect((await worker.fetch(req(auth, '/ai/v1/models', { method: 'POST' }), env)).status).toBe(404);
-      for (const headers of [{}, { 'content-length': '1' }]) {
-        expect((await worker.fetch(req(auth, '/ai/v1/messages', { method: 'POST', body: 'x'.repeat(160 * 1024 + 1), headers }), env)).status).toBe(413);
+      // The Messages transport contract permits 4 MiB, including imported projects above the former 160 KiB cap.
+      const admitted = JSON.stringify({ model: 'gemini-3.8-flash', max_tokens: 16, messages: [{ role: 'user', content: 'x'.repeat(160 * 1024 + 1) }] });
+      expect((await worker.fetch(req(auth, '/ai/v1/messages', { method: 'POST', body: admitted }), env)).status).toBe(200);
+      expect(await upstream[0]!.text()).toBe(admitted);
+      upstream.length = 0;
+      for (const headers of [{}, { 'content-length': '1' }, { 'content-length': String(4_194_304 + 1) }]) {
+        const refused = await worker.fetch(req(auth, '/ai/v1/messages', { method: 'POST', body: 'x'.repeat(4_194_304 + 1), headers }), env);
+        expect(refused.status).toBe(413);
+        expect(await refused.json()).toMatchObject({ error: { code: 'body_too_large', source: 'ezil-os-proxy' } });
+        expect(upstream).toHaveLength(0);
       }
       for (const over of [{ SANDBOX_AI_PROXY: 'off' }, { SANDBOX_AI_PROXY: 'false', EZIL_AI_GATEWAY_URL: 'invalid' }]) {
         const off = await worker.fetch(req(null), { ...env, ...over });
