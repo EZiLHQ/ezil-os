@@ -37,7 +37,9 @@ function produced(measured: boolean, count: number) {
 }
 
 it('checked source parity connects publisher, production command, injected Worker and shared consumers', () => {
-    expectTypeOf<import('./types').InferenceTrace>().toEqualTypeOf<import('../../../../extensions/ezil-models/src/inference-diagnostics').InferenceDiagnostic>();
+    // Expand intersections and mapped records before checking exact wire structure.
+    type WireShape<T> = T extends readonly (infer U)[] ? WireShape<U>[] : T extends object ? { [K in keyof T]: WireShape<T[K]> } : T;
+    expectTypeOf<WireShape<import('./types').InferenceTrace>>().toEqualTypeOf<WireShape<import('../../../../extensions/ezil-models/src/inference-diagnostics').InferenceDiagnostic>>();
     const source = readFileSync(new URL('../../../../extensions/ezil-models/src/trace-validator.js', import.meta.url), 'utf8').split('export ')[1]!.trim();
     expect(INFERENCE_VALIDATOR_SOURCE).toBe(source);
     expect(aiTraceCommandSnippet()).toBe(registrationSource);
