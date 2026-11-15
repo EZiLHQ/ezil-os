@@ -1,4 +1,5 @@
 import { attachCodeAuthRecovery, resetOriginRecovery } from './code-auth-recovery.js';
+import { createGitAccessRenewal } from './code-git-access.js';
 import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../native-runtime.js';
 // code.js — EZiL-authored. Not Puter code.
 //
@@ -660,6 +661,8 @@ export async function openCodeWindow (ctx = {}) {
     let attempt = 0;
     let running_signal;
     let disposed = false;
+    let git_access = null;
+    let git_access_notice = null;
     /** The current attempt's mint loop: aborted by the next attempt and by close (hotfix r5). */
     let mint_ctl = null;
     /** RETRY-118: the failure on screen, for an explicit user Retry only (`session.userRetry`). */
@@ -949,6 +952,8 @@ export async function openCodeWindow (ctx = {}) {
         last_failure = null;
         last_progress = null; generic_timeout = null;
         if ( disposed ) return;
+        git_access?.reset();
+        repository_folder = null;
         const my_attempt = ++attempt;
         stop_timers();
         show_panel();
@@ -1312,6 +1317,7 @@ export async function openCodeWindow (ctx = {}) {
         });
         if ( present || was_present ) last_present_at = performance.now();
         was_present = present;
+        if ( present ) void git_access?.tick();
     };
     const heartbeat_tick = () => {
         if ( disposed ) return;
@@ -1327,6 +1333,27 @@ export async function openCodeWindow (ctx = {}) {
         document.addEventListener('visibilitychange', sample_presence);
         sample_presence();
     }
+    // Git's short-lived capability is renewed only while this repository's editor is active.
+    // The authenticated endpoint refuses a stopped computer or an absent checkout; it cannot wake or clone one.
+    git_access = nativeSurface ? null : createGitAccessRenewal({
+        target: () => repository_folder && project?.repoUrl?.startsWith('https://github.ezil.work/')
+            ? { computerId: computer.id, repoUrl: project.repoUrl } : null,
+        eligible: () => ! disposed && el_state.hidden && progress.el.hidden && shouldHeartbeat({
+            visible: document.visibilityState === 'visible',
+            lastPresenceAgoMs: last_present_at === null ? NaN : performance.now() - last_present_at,
+        }),
+        notice: text => {
+            git_access_notice?.remove(); git_access_notice = null;
+            if ( ! text || disposed ) return;
+            const notice = document.createElement('div');
+            notice.className = 'ezil-code-git-access-notice';
+            notice.setAttribute('role', 'status');
+            notice.setAttribute('aria-live', 'polite');
+            notice.textContent = text;
+            el_body.appendChild(notice);
+            git_access_notice = notice;
+        },
+    });
     // Back after an absence long enough for an idle-stop: re-check before the
     // stale frame is used (`../runtime-recheck.js`).
     //
@@ -1548,6 +1575,8 @@ export async function openCodeWindow (ctx = {}) {
         progress.dispose();
         if (disposed) return;
         disposed = true;
+        git_access?.dispose();
+        git_access_notice?.remove(); git_access_notice = null;
         hide_state();
         restore_observer.disconnect();
         // A closed window stops asking: no ask after close can reach ensure() (hotfix r5).

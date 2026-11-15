@@ -23,10 +23,21 @@ def fresh():
 
 def output(r, **changes):
     p=r["privatePacket"]
-    return json.dumps({"canonicalUrl":p["repository"]["canonicalURL"],"folder":"/workspace/projects/"+RID+"/repository",
+    return json.dumps({"canonicalUrl":p["repository"]["canonicalURL"],"folder":"/workspace/projects/"+RID+"/fixture",
                        "repository":p["repository"],"identity":p["identity"],"status":"reused",**changes}).encode()
 
 class Packet(unittest.TestCase):
+    def test_optional_author_and_renewal_metadata_are_closed(self):
+        r={**fresh(),"gitAuthor":{"name":"Contact","email":"contact@ezil.work"},"refreshOnly":True}
+        self.assertTrue(sg.valid_request(r,NOW*1000))
+        for changes in ({"refreshOnly":False},{"gitAuthor":{"name":"Contact\nInjected","email":"contact@ezil.work"}},
+                        {"gitAuthor":{"name":"Contact","email":"bad email@example.org"}},
+                        {"gitAuthor":{"name":"Contact","email":"contact@ezil.work","extra":True}}):
+            self.assertFalse(sg.valid_request({**r,**changes},NOW*1000))
+        legacy=output(r,folder="/workspace/projects/"+RID+"/repository")
+        self.assertIsNotNone(sg.validate_output(legacy,r))
+        self.assertIsNone(sg.validate_output(legacy,fresh()))
+
     def test_native_read_write_and_closed_scope_identity_url_ref_expiry(self):
         r=fresh()
         for scope in ("read","write"):
@@ -66,10 +77,32 @@ class Packet(unittest.TestCase):
         for name in ("stage.py","supervise.py"):
             self.assertEqual((rt.ASSETS/name).read_bytes(),(root/"worker/repo-open"/name).read_bytes())
         pin,argv=rt.runtime_command()
-        self.assertEqual(pin["cliSha256"],"3b88146b48d73637274f9e4d42ed139cbc2d9b0b93f3bad6236fd23a66c919c4")
+        self.assertEqual(pin["cliSha256"],"a30361d38c0310912fbfd3c18284c78e66e0f6c474727081c19d09f9fb1a0a9b")
         self.assertNotIn(SECRET,repr(argv))
 
 class Runtime(unittest.TestCase):
+    def test_only_fd_bootstrap_is_decorated_not_the_gateway_packet(self):
+        r={**fresh(),"gitAuthor":{"name":"Contact","email":"contact@ezil.work"},"refreshOnly":True}
+        calls=[]
+        def run(cfg,argv,**kw):
+            calls.append((argv,kw))
+            return subprocess.CompletedProcess(argv,0,b"ezil-cli-bootstrap:ok\n" if len(calls)==1 else output(r))
+        with mock.patch.object(desktop,"exec_",side_effect=run):
+            result,uncertain=rt.execute(None,{},r,ready=lambda*a:True,clock=lambda:0,wall=lambda:NOW)
+        self.assertTrue(result["ok"]);self.assertFalse(uncertain)
+        self.assertEqual(json.loads(calls[1][1]["input"]),{**r["privatePacket"],"gitAccess":True,"gitAuthor":r["gitAuthor"],"refreshOnly":True})
+        self.assertNotIn("gitAuthor",r["privatePacket"])
+        self.assertNotIn("contact@ezil.work",repr(calls[1][0]))
+        self.assertIn("--repo-refresh",calls[1][0])
+
+    def test_supervisor_refusal_has_no_uncertain_writer_or_quarantine(self):
+        for reason in ("repo_open_workspace_unavailable","repo_open_folder_conflict"):
+            responses=[subprocess.CompletedProcess([],0,b"ezil-cli-bootstrap:ok"),
+                       subprocess.CompletedProcess([],0,("ezil-repo-open:error:"+reason+"\n").encode())]
+            with mock.patch.object(desktop,"exec_",side_effect=responses):
+                result,uncertain=rt.execute(None,{},fresh(),ready=lambda*a:True,clock=lambda:0,wall=lambda:NOW)
+            self.assertFalse(result["ok"]);self.assertFalse(uncertain)
+
     def test_only_private_stdin_has_packet_not_argv_environment_file(self):
         r=fresh();calls=[]
         def run(cfg,argv,**kw):
@@ -80,7 +113,7 @@ class Runtime(unittest.TestCase):
             result,uncertain=rt.execute(None,{},r,ready=lambda*a:True,clock=lambda:0,wall=lambda:NOW)
         self.assertTrue(result["ok"]);self.assertFalse(uncertain)
         self.assertIs(calls[0][1]["stdin"],subprocess.DEVNULL)
-        self.assertEqual(json.loads(calls[1][1]["input"]),r["privatePacket"])
+        self.assertEqual(json.loads(calls[1][1]["input"]),{**r["privatePacket"],"gitAccess":True})
 
     def test_unknown_cleanup_quarantines_but_confirmed_refusal_does_not(self):
         r=fresh()
@@ -160,7 +193,7 @@ class InstalledLayout(unittest.TestCase):
                            check=True,stdin=subprocess.DEVNULL,capture_output=True)
             public="import sys,json,hashlib,base64;sys.path.insert(0,sys.argv[1]);from ezil_host import standalone_git_runtime as r;p,a=r.runtime_command();print(json.dumps({'cli':p['cliSha256'],'stage':hashlib.sha256((r.ASSETS/'stage.py').read_bytes()).hexdigest(),'supervisor':hashlib.sha256(base64.b64decode(a[-1])).hexdigest()}))"
             got=json.loads(subprocess.check_output([sys.executable,"-I","-c",public,str(installed/"lib")],cwd=directory))
-            self.assertEqual(got["cli"],"3b88146b48d73637274f9e4d42ed139cbc2d9b0b93f3bad6236fd23a66c919c4")
+            self.assertEqual(got["cli"],"a30361d38c0310912fbfd3c18284c78e66e0f6c474727081c19d09f9fb1a0a9b")
             self.assertEqual(got["stage"],hashlib.sha256((root/"worker/repo-open/stage.py").read_bytes()).hexdigest())
             self.assertEqual(got["supervisor"],hashlib.sha256((root/"worker/repo-open/supervise.py").read_bytes()).hexdigest())
 

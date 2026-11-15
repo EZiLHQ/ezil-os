@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Linux-only CLI deadline. Reap the CLI and its adopted children, never remove files."""
 import ctypes
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -32,9 +34,33 @@ def checked_dir(path, create=False):
         raise RepoFailure('repo_open_workspace_unavailable')
 
 
+def repo_layout_lock(root, repository_id, run_dir='/run/ezil'):
+    """Serialize destination selection, CLI reuse and legacy rename as one operation."""
+    item = os.lstat(run_dir)
+    if (not stat.S_ISDIR(item.st_mode) or item.st_uid != os.geteuid()
+            or stat.S_IMODE(item.st_mode) != 0o700 or os.path.realpath(run_dir) != run_dir):
+        raise RepoFailure('repo_open_git_missing')
+    slot = hashlib.sha256((root + '\n' + repository_id).encode()).hexdigest()
+    fd = os.open(os.path.join(run_dir, '.repo-layout-' + slot + '.lock'),
+                 os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    try:
+        item = os.fstat(fd)
+        if (not stat.S_ISREG(item.st_mode) or item.st_uid != os.geteuid()
+                or stat.S_IMODE(item.st_mode) != 0o600):
+            raise RepoFailure('repo_open_git_missing')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RepoFailure('repo_open_busy')
+        return os.fdopen(fd, 'rb')  # Kept open until CLI completion and any layout migration.
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def repo_command(root, repository_id, url, hydrated, expected_sha, expected_version,
                  pin_path='/run/ezil/bin/cli-pin.json', cli_path='/run/ezil/bin/ezil',
-                 installed_pin_path='/run/ezil/bin/installed-pin.json', owner=0):
+                 installed_pin_path='/run/ezil/bin/installed-pin.json', owner=0, refresh_only=False):
     if (not root.startswith('/') or os.path.normpath(root) != root or root == '/'
             or not re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}', repository_id)
             or not re.fullmatch(r'https://github\.ezil\.work/[a-z0-9][a-z0-9-]{0,63}/[a-z0-9][a-z0-9._-]{0,99}\.git', url)
@@ -48,19 +74,25 @@ def repo_command(root, repository_id, url, hydrated, expected_sha, expected_vers
     if hydrated == '1' and not os.path.isfile(os.path.join(root, '.ezil-hydrated.json')):
         raise RepoFailure('repo_open_workspace_not_ready')
     projects = os.path.join(root, 'projects')
-    checked_dir(projects, True)
+    checked_dir(projects, not refresh_only)
     folder = os.path.join(projects, repository_id)
-    checked_dir(folder, True)
+    checked_dir(folder, not refresh_only)
     entries = set(os.listdir(folder))
     if '.git' in entries:
         raise RepoFailure('repo_open_folder_conflict')  # Code must never open the checkout as its workspace root.
-    if entries <= {'repository'}:
+    name = url.rsplit('/', 1)[1][:-4]
+    if entries <= {name}:
+        destination = os.path.join(folder, name)
+    elif entries == {'repository'}:
+        # Reopen and verify the earlier layout before moving its checkout.
         destination = os.path.join(folder, 'repository')
     else:
         raise RepoFailure('repo_open_folder_conflict')
     if os.path.lexists(destination):
         if not stat.S_ISDIR(os.lstat(destination).st_mode) or os.path.realpath(destination) != destination:
             raise RepoFailure('repo_open_folder_conflict')
+    elif refresh_only:
+        raise RepoFailure('repo_open_workspace_unavailable')
     try:
         with open(pin_path, encoding='utf8') as handle:
             pin = json.load(handle)
@@ -90,7 +122,54 @@ def repo_command(root, repository_id, url, hydrated, expected_sha, expected_vers
     return [cli_path, 'clone', url, '--directory', destination, '--json', '--grant-fd=3']
 
 
-def main():
+def readable_checkout(output, command):
+    """Rename only a successfully rebound legacy checkout; never touch its Git state."""
+    url, destination = command[2], command[4]
+    name = url.rsplit('/', 1)[1][:-4]
+    target = os.path.join(os.path.dirname(destination), name)
+    if target == destination:
+        return output
+    try:
+        value = json.loads(output)
+    except (ValueError, UnicodeError):
+        return output
+    if (not isinstance(value, dict) or set(value) != {'canonicalUrl', 'folder', 'repository', 'identity', 'status'}
+            or value['canonicalUrl'] != url or value['folder'] != destination
+            or not isinstance(value['repository'], dict) or value['repository'].get('canonicalURL') != url
+            or value['status'] not in ('cloned', 'reused')):
+        return output
+    checked_dir(os.path.dirname(destination))
+    checked_dir(destination)
+    checked_dir(os.path.join(destination, '.git'))
+    if set(os.listdir(os.path.dirname(destination))) != {'repository'} or os.path.lexists(target):
+        raise RepoFailure('repo_open_folder_conflict')
+    # A user-configured worktree can anchor Git to the old absolute path. Do not
+    # rewrite their intent or move a checkout that would stop being usable.
+    # Inspect without inherited Git settings, hooks, prompts or any grant FD.
+    try:
+        worktree = subprocess.run(
+            ['git', '-C', destination, 'config', '--local', '--includes', '--get-all', 'core.worktree'],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=2, check=False, close_fds=True,
+            env={'PATH': '/usr/local/bin:/usr/bin:/bin', 'HOME': '/run/ezil',
+                 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
+                 'GIT_TERMINAL_PROMPT': '0', 'GIT_CONFIG_COUNT': '3',
+                 'GIT_CONFIG_KEY_0': 'core.hooksPath', 'GIT_CONFIG_VALUE_0': '/dev/null',
+                 'GIT_CONFIG_KEY_1': 'core.fsmonitor', 'GIT_CONFIG_VALUE_1': 'false',
+                 'GIT_CONFIG_KEY_2': 'core.askPass', 'GIT_CONFIG_VALUE_2': ''})
+    except (OSError, subprocess.SubprocessError):
+        raise RepoFailure('repo_open_folder_conflict')
+    if worktree.returncode != 1:  # 1 means that no such setting exists; other errors refuse too.
+        raise RepoFailure('repo_open_folder_conflict')
+    # Linux renameat2 with NOREPLACE: even an empty foreign directory is never overwritten.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.renameat2(-100, os.fsencode(destination), -100, os.fsencode(target), 1) != 0:
+        raise RepoFailure('repo_open_folder_conflict')
+    value['folder'] = target
+    return (json.dumps(value, separators=(',', ':')) + '\n').encode()
+
+
+def supervise(resources):
     # Reparent orphaned Git/helper grandchildren here rather than container PID 1.
     if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
         return 125
@@ -170,11 +249,14 @@ def main():
     if stopping:
         return 124
     command = sys.argv[3:]
-    if command and command[0] == '--repo-open':
+    repo_open = command and command[0] in ('--repo-open', '--repo-refresh')
+    refresh_only = repo_open and command[0] == '--repo-refresh'
+    if repo_open:
         if len(command) != 7:
             return 125
         try:
-            command = repo_command(*command[1:])
+            resources.enter_context(repo_layout_lock(command[1], command[2]))
+            command = repo_command(*command[1:], refresh_only=refresh_only)
         except RepoFailure as error:
             sys.stdout.write('ezil-repo-open:error:' + error.code + '\n')
             return 0
@@ -261,8 +343,19 @@ def main():
     if stopping:
         # No stdout from an interrupted operation can masquerade as success.
         return 126 if forced or parent_code is None or parent_code < 0 else 124
+    if repo_open and not refresh_only and parent_code == 0 and output_valid:
+        try:
+            output = readable_checkout(output, command)
+        except RepoFailure as error:
+            sys.stdout.write('ezil-repo-open:error:' + error.code + '\n')
+            return 0
     sys.stdout.buffer.write(output)
     return parent_code if parent_code is not None and parent_code >= 0 else 1
+
+
+def main():
+    with contextlib.ExitStack() as resources:
+        return supervise(resources)
 
 
 if __name__ == '__main__':

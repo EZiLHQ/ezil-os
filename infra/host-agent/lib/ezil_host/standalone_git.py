@@ -42,12 +42,22 @@ def valid_ref(value):
 
 
 def valid_request(req, now_ms):
-    if (not isinstance(req, dict) or set(req) != {"v", "jobId", "repositoryId", "privatePacket", "timeoutMs"}
+    if (not isinstance(req, dict) or set(req) - {"gitAuthor", "refreshOnly"} != {"v", "jobId", "repositoryId", "privatePacket", "timeoutMs"}
             or type(req["v"]) is not int or req["v"] != 1
             or not isinstance(req["jobId"], str) or not HEX64.fullmatch(req["jobId"])
             or not isinstance(req["repositoryId"], str) or not UUID.fullmatch(req["repositoryId"])
             or type(req["timeoutMs"]) is not int or not MIN_MS <= req["timeoutMs"] <= MAX_MS):
         return False
+    if "refreshOnly" in req and req["refreshOnly"] is not True:
+        return False
+    if "gitAuthor" in req:
+        author = req["gitAuthor"]
+        if (not isinstance(author, dict) or set(author) != {"name", "email"}
+                or not isinstance(author["name"], str) or not 1 <= len(author["name"]) <= 128
+                or author["name"].strip() != author["name"] or re.search(r"[\x00-\x1f\x7f<>]", author["name"])
+                or not isinstance(author["email"], str) or len(author["email"]) > 254
+                or not re.fullmatch(r"[^\s@<>\x00-\x1f\x7f]+@[^\s@<>\x00-\x1f\x7f]+", author["email"])):
+            return False
     p = req["privatePacket"]
     if not isinstance(p, dict) or set(p) != {"version", "repository", "identity", "git"} or type(p["version"]) is not int or p["version"] != 2:
         return False
@@ -113,6 +123,10 @@ def host_ready(cfg, lease):
 
 def validate_output(raw, req):
     p = req["privatePacket"]
+    folder = "/workspace/projects/" + req["repositoryId"]
+    allowed = {folder + "/" + p["repository"]["canonicalURL"].rsplit("/", 1)[1][:-4]}
+    if req.get("refreshOnly"):
+        allowed.add(folder + "/repository")  # Refresh never moves an active editor's files.
     if not isinstance(raw, bytes) or len(raw) > MAX_OUTPUT or p["git"]["token"].encode() in raw:
         return None
     try:
@@ -122,7 +136,7 @@ def validate_output(raw, req):
     if (not isinstance(v, dict) or set(v) != {"canonicalUrl", "folder", "repository", "identity", "status"}
             or v["canonicalUrl"] != p["repository"]["canonicalURL"] or v["repository"] != p["repository"]
             or v["identity"] != p["identity"] or v["status"] not in ("cloned", "reused")
-            or v["folder"] != "/workspace/projects/" + req["repositoryId"] + "/repository"):
+            or v["folder"] not in allowed):
         return None
     return {"ok": True, "folder": "/workspace/projects/" + req["repositoryId"],
             "status": "fetched" if v["status"] == "reused" else "cloned"}

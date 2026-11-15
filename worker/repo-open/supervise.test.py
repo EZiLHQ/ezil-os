@@ -42,6 +42,124 @@ def process_start(pid):
 
 
 class SupervisorDescendants(unittest.TestCase):
+    def test_concurrent_legacy_layout_selection_is_serialized_until_rename(self):
+        spec = importlib.util.spec_from_file_location('ezil_repo_supervise', SUPERVISOR)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix='ezil-supervise-lock-') as directory:
+            os.chmod(directory, 0o700)
+            wrapper = Path(directory) / 'checkout'
+            subprocess.run(['git', 'init', '--quiet', '--template=', str(wrapper / 'repository')], check=True)
+            rid = '44444444-4444-8444-8444-444444444444'
+            with module.repo_layout_lock('/workspace', rid, directory):
+                # A second process cannot select the soon-to-be-renamed legacy destination.
+                probe = "import importlib.util,sys;s=importlib.util.spec_from_file_location('m',sys.argv[1]);m=importlib.util.module_from_spec(s);s.loader.exec_module(m)\ntry:m.repo_layout_lock('/workspace',sys.argv[2],sys.argv[3]);sys.exit(1)\nexcept m.RepoFailure as e:sys.exit(0 if e.code=='repo_open_busy' else 2)"
+                result = subprocess.run([sys.executable, '-I', '-c', probe, str(SUPERVISOR), rid, directory],
+                                        capture_output=True, timeout=3)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                url = 'https://github.ezil.work/default/site.git'
+                command = ['ezil', 'clone', url, '--directory', str(wrapper / 'repository')]
+                output = json.dumps({'canonicalUrl': url, 'folder': command[4], 'repository': {'canonicalURL': url},
+                                     'identity': {}, 'status': 'reused'}).encode()
+                module.readable_checkout(output, command)
+            with module.repo_layout_lock('/workspace', rid, directory):
+                self.assertEqual(os.listdir(wrapper), ['site'])
+
+    def test_refresh_of_missing_checkout_creates_no_directories(self):
+        spec = importlib.util.spec_from_file_location('ezil_repo_supervise', SUPERVISOR)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix='ezil-supervise-refresh-') as directory:
+            with self.assertRaises(module.RepoFailure):
+                module.repo_command(directory, '44444444-4444-4444-8444-444444444444',
+                                    'https://github.ezil.work/default/site.git', '0', 'a' * 64,
+                                    '0.3.0-standalone.20261110.0', refresh_only=True)
+            self.assertEqual(os.listdir(directory), [])
+    def test_successful_legacy_reopen_renames_checkout_without_touching_git_or_dirty_files(self):
+        spec = importlib.util.spec_from_file_location('ezil_repo_supervise', SUPERVISOR)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix='ezil-supervise-layout-') as directory:
+            wrapper = Path(directory) / '44444444-4444-8444-8444-444444444444'
+            checkout = wrapper / 'repository'
+            (checkout / '.git').mkdir(parents=True)
+            subprocess.run(['git', 'init', '--quiet', '--template=', str(checkout)], check=True)
+            (checkout / 'tracked.txt').write_text('staged content')
+            subprocess.run(['git', '-C', str(checkout), 'add', 'tracked.txt'], check=True)
+            (checkout / 'tracked.txt').write_text('unstaged content')
+            saved_config = (checkout / '.git' / 'config').read_bytes()
+            saved_index = (checkout / '.git' / 'index').read_bytes()
+            (checkout / 'dirty.txt').write_text('uncommitted work')
+            (checkout / '.vscode').mkdir()
+            (checkout / '.vscode' / 'settings.json').write_text('{"untrusted":"configuration"}')
+            url = 'https://github.ezil.work/default/site.git'
+            command = ['/run/ezil/bin/ezil', 'clone', url, '--directory', str(checkout), '--json', '--grant-fd=3']
+            result = {'canonicalUrl': url, 'folder': str(checkout), 'repository': {'canonicalURL': url},
+                      'identity': {'issuer': 'https://id.ezil.work/', 'subject': 'auth0|fixture'}, 'status': 'reused'}
+            wrong = {**result, 'folder': '/unbound/folder'}
+            self.assertEqual(module.readable_checkout(json.dumps(wrong).encode(), command), json.dumps(wrong).encode())
+            self.assertTrue(checkout.is_dir())
+            output = json.loads(module.readable_checkout(json.dumps(result).encode(), command))
+            target = wrapper / 'site'
+            self.assertEqual(output['folder'], str(target))
+            self.assertFalse(checkout.exists())
+            self.assertEqual((target / 'dirty.txt').read_text(), 'uncommitted work')
+            self.assertEqual((target / '.git' / 'index').read_bytes(), saved_index)
+            self.assertEqual((target / '.git' / 'config').read_bytes(), saved_config)
+            self.assertEqual((target / 'tracked.txt').read_text(), 'unstaged content')
+            self.assertEqual(subprocess.run(['git', '-C', str(target), 'status', '--porcelain'], capture_output=True).returncode, 0)
+            self.assertFalse((wrapper / '.vscode').exists())
+
+    def test_legacy_migration_refuses_anchored_worktree_and_preserves_usable_checkout(self):
+        spec = importlib.util.spec_from_file_location('ezil_repo_supervise', SUPERVISOR)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix='ezil-supervise-worktree-') as directory:
+            wrapper = Path(directory) / 'wrapper'
+            checkout = wrapper / 'repository'
+            subprocess.run(['git', 'init', '--quiet', '--template=', str(checkout)], check=True)
+            subprocess.run(['git', '-C', str(checkout), 'config', '--local', 'core.worktree', str(checkout)], check=True)
+            (checkout / 'dirty.txt').write_text('uncommitted work')
+            before = subprocess.run(['git', '-C', str(checkout), 'status', '--porcelain'], capture_output=True)
+            self.assertEqual(before.returncode, 0)
+            config = (checkout / '.git' / 'config').read_bytes()
+            url = 'https://github.ezil.work/default/site.git'
+            command = ['ezil', 'clone', url, '--directory', str(checkout)]
+            output = json.dumps({'canonicalUrl': url, 'folder': str(checkout), 'repository': {'canonicalURL': url},
+                                 'identity': {}, 'status': 'reused'}).encode()
+            with self.assertRaises(module.RepoFailure) as refusal:
+                module.readable_checkout(output, command)
+            self.assertEqual(refusal.exception.code, 'repo_open_folder_conflict')
+            self.assertTrue(checkout.is_dir()); self.assertFalse((wrapper / 'site').exists())
+            self.assertEqual((checkout / '.git' / 'config').read_bytes(), config)
+            self.assertEqual((checkout / 'dirty.txt').read_text(), 'uncommitted work')
+            after = subprocess.run(['git', '-C', str(checkout), 'status', '--porcelain'], capture_output=True)
+            self.assertEqual(after.returncode, 0); self.assertEqual(after.stdout, before.stdout)
+
+    def test_legacy_migration_refuses_collision_or_symlink(self):
+        spec = importlib.util.spec_from_file_location('ezil_repo_supervise', SUPERVISOR)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory(prefix='ezil-supervise-layout-') as directory:
+            wrapper = Path(directory) / 'wrapper'
+            checkout = wrapper / 'repository'
+            (checkout / '.git').mkdir(parents=True)
+            target = wrapper / 'site'
+            target.mkdir()
+            url = 'https://github.ezil.work/default/site.git'
+            command = ['ezil', 'clone', url, '--directory', str(checkout)]
+            output = json.dumps({'canonicalUrl': url, 'folder': str(checkout), 'repository': {'canonicalURL': url},
+                                 'identity': {}, 'status': 'reused'}).encode()
+            with self.assertRaises(module.RepoFailure):
+                module.readable_checkout(output, command)
+            self.assertTrue(checkout.is_dir()); self.assertTrue(target.is_dir())
+            target.rmdir()
+            (checkout / '.git').rmdir()
+            (checkout / '.git').symlink_to(directory, target_is_directory=True)
+            with self.assertRaises(module.RepoFailure):
+                module.readable_checkout(output, command)
+            self.assertTrue(checkout.is_dir()); self.assertFalse(target.exists())
+
     def test_isolated_python_ignores_unpinned_sibling_module(self):
         with tempfile.TemporaryDirectory(prefix='ezil-supervise-import-') as directory:
             script = Path(directory) / 'supervise.py'
@@ -91,6 +209,7 @@ class SupervisorDescendants(unittest.TestCase):
                 files = (str(bin_dir / 'cli-pin.json'), str(cli), str(bin_dir / 'installed-pin.json'))
                 command = module.repo_command(*args, sha, pin['version'], *files, owner=os.geteuid())
                 self.assertEqual(command[-1], '--grant-fd=3')
+                self.assertEqual(command[4], str(root / 'projects' / args[1] / 'site'))
                 for wrong_sha, wrong_version in (('0' * 64, pin['version']), (sha, '0.3.1')):
                     with self.assertRaises(module.RepoFailure) as refusal:
                         module.repo_command(*args, wrong_sha, wrong_version, *files, owner=os.geteuid())
