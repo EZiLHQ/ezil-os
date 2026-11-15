@@ -21,6 +21,7 @@ import type { ControlTarget } from './aws-control-auth';
 import type { ComputerRef } from './provider';
 import { deriveGuacamoleSandboxId } from '../cloudflare-guacamole-provider';
 import type { PrivateGitPacket } from '@/server/git/private-packet';
+import { isGitAuthor, type GitAuthor } from '@/server/git/author';
 
 export interface RepoOpenRequest {
     repositoryId: string;
@@ -33,6 +34,10 @@ export interface RepoOpenRequest {
     git: { token: string; expiresAt: string; scope?: 'read' | 'write' } | null;
     /** Standalone EZiL Git CLI v2 authorization. Its repository.id is the provider ID, not repositoryId. */
     privatePacket?: PrivateGitPacket;
+    /** Commit attribution from this session's verified EZiL ID claims; never part of the gateway grant packet. */
+    gitAuthor?: GitAuthor;
+    /** Reconnect this checkout's credentials and author without cloning/fetching or changing its files. */
+    refreshOnly?: true;
     /** The Worker's whole bound for this open, ms (`worker/src/repo-open.ts` REPO_OPEN_MIN/EXEC_TIMEOUT_MS). */
     timeoutMs: number;
 }
@@ -84,6 +89,8 @@ export async function requestRepoOpen(
     if (!Number.isInteger(request.timeoutMs) || request.timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS || request.timeoutMs > REPO_OPEN_MAX_TIMEOUT_MS) {
         return failed(null, 'timeout_out_of_range');
     }
+    if (request.gitAuthor !== undefined && (!request.privatePacket || !isGitAuthor(request.gitAuthor))) return failed(null, 'author_invalid');
+    if (request.refreshOnly !== undefined && (!request.privatePacket || request.refreshOnly !== true)) return failed(null, 'refresh_invalid');
     if (request.privatePacket && (request.privatePacket.repository.canonicalURL !== request.canonicalURL
         || request.privatePacket.repository.ref !== request.ref || request.privatePacket.git.token !== request.git?.token
         || request.privatePacket.git.expiresAt !== request.git.expiresAt)) return failed(null, 'packet_mismatch');
@@ -107,7 +114,9 @@ export async function requestRepoOpen(
         const endpoint = new URL(`/sandbox/${encodeURIComponent(target.sandboxName)}/repo-open`, workerUrl);
         // Fixed key order: the Worker re-reads exactly these fields from exactly this string.
         const body = request.privatePacket
-            ? JSON.stringify({ repositoryId: request.repositoryId, privatePacket: request.privatePacket, timeoutMs: request.timeoutMs })
+            ? JSON.stringify({ repositoryId: request.repositoryId, privatePacket: request.privatePacket,
+                ...(request.gitAuthor ? { gitAuthor: request.gitAuthor } : {}),
+                ...(request.refreshOnly ? { refreshOnly: true } : {}), timeoutMs: request.timeoutMs })
             : JSON.stringify({
                 repositoryId: request.repositoryId, canonicalURL: request.canonicalURL, ref: request.ref,
                 ...(request.git ? { git: { token: request.git.token, expiresAt: request.git.expiresAt, ...(request.git.scope ? { scope: request.git.scope } : {}) } } : {}),

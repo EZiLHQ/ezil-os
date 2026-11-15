@@ -21,6 +21,25 @@ const accepted = (): RepoOpenRequest => {
 };
 
 describe('standalone CLI v2 Worker open', () => {
+  it('carries verified commit identity and renewal only in the final private CLI handoff', () => {
+    const gitAuthor = { name: 'Contact', email: 'contact@ezil.work' };
+    const parsed = parseRepoOpenRequest({ ...body(), gitAuthor, refreshOnly: true }, NOW);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.request.privatePacket).toEqual(packet());
+    const prepared = repoOpenCliCommand(parsed.request, root);
+    expect(JSON.parse(prepared.packet)).toEqual({ ...packet(), gitAccess: true, gitAuthor, refreshOnly: true });
+    expect(prepared.command).not.toContain(gitAuthor.email);
+    expect(prepared.command).toContain('--repo-refresh');
+    const legacyOutput = JSON.stringify({ canonicalUrl: URL, folder: `/workspace/projects/${CHECKOUT}/repository`,
+      repository: packet().repository, identity: packet().identity, status: 'reused' });
+    expect(parsePrivateCliOutput(legacyOutput, parsed.request, root)?.ok).toBe(true);
+    expect(parsePrivateCliOutput(legacyOutput, accepted(), root)).toBeNull();
+    for (const extra of [{ refreshOnly: false }, { gitAuthor: { ...gitAuthor, name: 'Contact\nInjected' } },
+      { gitAuthor: { ...gitAuthor, email: 'bad@example.org\n' } }, { gitAuthor: { ...gitAuthor, extra: true } }]) {
+      expect(parseRepoOpenRequest({ ...body(), ...extra }, NOW)).toEqual({ ok: false, error: 'repo_open_invalid_request' });
+    }
+  });
   it('keeps the real Cloudflare repository ID separate from the OS checkout UUID', () => {
     const request = accepted();
     expect(request.repositoryId).toBe(CHECKOUT);
@@ -67,23 +86,23 @@ describe('standalone CLI v2 Worker open', () => {
     expect(prepared.command).toContain(STANDALONE_CLI_CANDIDATE.cliSha256);
     expect(prepared.command).toContain(STANDALONE_CLI_CANDIDATE.version);
     expect(prepared.command).not.toContain(TOKEN);
-    expect(JSON.parse(prepared.packet)).toEqual(packet());
-    const output = JSON.stringify({ canonicalUrl: URL, folder: `/workspace/projects/${CHECKOUT}/repository`,
+    expect(JSON.parse(prepared.packet)).toEqual({ ...packet(), gitAccess: true });
+    const output = JSON.stringify({ canonicalUrl: URL, folder: `/workspace/projects/${CHECKOUT}/os-code-url-20261110-a`,
       repository: packet().repository, identity: packet().identity, status: 'cloned' });
     expect(parsePrivateCliOutput(output, request, root)).toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'cloned' });
     let env: Record<string, string> | undefined;
     const result = await runRepoOpen(async (_command, options) => { env = options.env; return { exitCode: 0, stdout: output }; },
       request, root, async () => true, () => NOW);
     expect(result).toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'cloned' });
-    expect(env).toEqual({ EZIL_REPO_OPEN_CLI_PACKET: JSON.stringify(packet()) });
-    expect(parsePrivateCliOutput(output.replace('/repository', '/outside'), request, root)).toBeNull();
-    expect(parsePrivateCliOutput(output.replace(`/workspace/projects/${CHECKOUT}/repository`, `/workspace/projects/${CHECKOUT}`), request, root)).toBeNull();
+    expect(env).toEqual({ EZIL_REPO_OPEN_CLI_PACKET: JSON.stringify({ ...packet(), gitAccess: true }) });
+    expect(parsePrivateCliOutput(output.replace('/os-code-url-20261110-a', '/outside'), request, root)).toBeNull();
+    expect(parsePrivateCliOutput(output.replace(`/workspace/projects/${CHECKOUT}/os-code-url-20261110-a`, `/workspace/projects/${CHECKOUT}`), request, root)).toBeNull();
     expect(parsePrivateCliOutput(JSON.stringify({ ...JSON.parse(output), repository: { ...packet().repository, id: 'otherproviderid01' } }), request, root)).toBeNull();
     expect(parsePrivateCliOutput(JSON.stringify({ ...JSON.parse(output), repository: { ...packet().repository, ref: 'refs/heads/other' } }), request, root)).toBeNull();
   });
   it('stages the public release before handing the private packet to the CLI', async () => {
     let calls = 0;
-    const output = JSON.stringify({ canonicalUrl: URL, folder: `/workspace/projects/${CHECKOUT}/repository`,
+    const output = JSON.stringify({ canonicalUrl: URL, folder: `/workspace/projects/${CHECKOUT}/os-code-url-20261110-a`,
       repository: packet().repository, identity: packet().identity, status: 'cloned' });
     const answer = await runRepoOpen(async (command, options) => {
       calls += 1;
@@ -95,11 +114,37 @@ describe('standalone CLI v2 Worker open', () => {
       }
       expect(command).toContain('exec python3 -I /run/ezil/bin/supervise.py');
       expect(command).not.toContain(TOKEN);
-      expect(options.env).toEqual({ EZIL_REPO_OPEN_CLI_PACKET: JSON.stringify(packet()) });
+      expect(options.env).toEqual({ EZIL_REPO_OPEN_CLI_PACKET: JSON.stringify({ ...packet(), gitAccess: true }) });
       expect(options.timeout).toBe(59_000);
       return { exitCode: 0, stdout: output };
     }, accepted(), root, undefined, () => NOW);
     expect(answer).toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'cloned' });
+    expect(calls).toBe(2);
+  });
+  it('renews an existing checkout after the full staging allowance within the route budget', async () => {
+    // code-git-access gives the runtime 50 seconds: a 20-second bootstrap still leaves
+    // the Worker's minimum execution allowance plus its one-second accounting margin.
+    const parsed = parseRepoOpenRequest({ ...body(), refreshOnly: true, timeoutMs: 50_000 }, NOW);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    let clock = NOW;
+    let calls = 0;
+    const output = JSON.stringify({ canonicalUrl: URL, folder: `/workspace/projects/${CHECKOUT}/repository`,
+      repository: packet().repository, identity: packet().identity, status: 'reused' });
+    const answer = await runRepoOpen(async (command, options) => {
+      calls += 1;
+      if (calls === 1) {
+        expect(command).toBe(standaloneCliStageCommand(STANDALONE_CLI_CANDIDATE));
+        expect(options.env).toEqual({});
+        clock += 20_000;
+        return { exitCode: 0, stdout: 'ezil-cli-bootstrap:ok' };
+      }
+      expect(command).toContain('--repo-refresh');
+      expect(options.timeout).toBe(29_000);
+      expect(JSON.parse(options.env!.EZIL_REPO_OPEN_CLI_PACKET!)).toEqual({ ...packet(), gitAccess: true, refreshOnly: true });
+      return { exitCode: 0, stdout: output };
+    }, parsed.request, root, undefined, () => clock);
+    expect(answer).toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'fetched' });
     expect(calls).toBe(2);
   });
   it('fails closed before cloning when public runtime staging fails', async () => {
