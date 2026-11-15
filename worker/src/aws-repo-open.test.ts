@@ -28,6 +28,12 @@ function setup() {
  return { deps, calls, answers, run, lookups: () => lookups, setLookup: (v: typeof lookup) => { lookup = v; }, advance: (ms: number) => { clock += ms; } };
 }
 describe('AWS standalone repository operation', () => {
+ it('binds optional author and refresh-only metadata in the signed host body', async () => {
+   const f = setup(), gitAuthor = { name: 'Contact', email: 'contact@ezil.work' };
+   expect((await f.run({ ...raw(), gitAuthor, refreshOnly: true })).status).toBe(200);
+   expect(JSON.parse(String(f.calls[0]!.init.body))).toEqual({ v: 1, jobId: job, ...raw(), gitAuthor, refreshOnly: true });
+   expect(f.calls[0]!.url).not.toContain(gitAuthor.email);
+ });
  it('signs exact UTF8 admission digest, polls job only, and validates final current placement', async () => {
    const f = setup();
    const response = await f.run();

@@ -39,7 +39,7 @@ function fixture(answers = []) {
             schedule: (fn, delay) => { const id = ++seq; timers.set(id, { fn, delay }); return id; },
             cancel: id => timers.delete(id) }),
     });
-    vm.runInContext('let disposed=false, attempt=1, last_failure, last_progress, generic_timeout, running_signal;', context);
+    vm.runInContext('let disposed=false, attempt=1, last_failure, last_progress, generic_timeout, running_signal, git_access=null, repository_folder=null;', context);
     vm.runInContext(stateSource + bootPreflight + watcherSource
         + '\nglobalThis.api={state:el_state, button:el_state_start, frame:el_iframe, boot:start_boot, bootAttempts:()=>attempt-1, reconnecting:()=>show_state(\'reconnecting\'), stop:stop_runtime_recheck, close:()=>{disposed=true;stop_runtime_recheck();}};', context);
     const api = context.api;

@@ -69,7 +69,8 @@ vi.mock('@/server/auth/retained-identity', () => ({
     retainedIdentity: async (userId: string) => {
         s.order.push('identity');
         if (s.identity === 'missing' || userId !== USER) throw new Error('IDENTITY_REFRESH_REQUIRED');
-        return { token: ID_TOKEN, issuer: 'https://id.ezil.work/', subject: 'auth0|builder', expiresAt: Date.now() + 3_600_000, userId: USER, sessionId: s.sessionId };
+        return { token: ID_TOKEN, issuer: 'https://id.ezil.work/', subject: 'auth0|builder', expiresAt: Date.now() + 3_600_000, userId: USER, sessionId: s.sessionId,
+            gitAuthor: { name: 'contact', email: 'contact@ezil.work' } };
     },
     clearProjectIdentity: async () => { s.cleared += 1; },
 }));
@@ -325,6 +326,7 @@ describe('standalone EZiL Git URL open', () => {
         expect(new Headers(gateway.init.headers).get('authorization')).toBe(`Bearer ${ID_TOKEN}`);
         const worker = s.requests.find(r => r.url.origin === WORKER)!;
         expect(JSON.parse(String(worker.init.body))).toMatchObject({ repositoryId: checkout,
+            gitAuthor: { name: 'contact', email: 'contact@ezil.work' },
             privatePacket: { version: 2, repository: { id: 'fg1wtcrexaf7acl0', canonicalURL: EZIL_URL, ref: 'refs/heads/main' } } });
         expect(JSON.parse(String(worker.init.body)).repositoryId).not.toBe(JSON.parse(String(worker.init.body)).privatePacket.repository.id);
         await expectNoSecrets(response);

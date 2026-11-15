@@ -353,7 +353,7 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
         { userId: ctx.user.id, computerId }, { repositoryId, canonicalURL: parsed.canonicalURL,
             ref: privatePacket?.repository.ref ?? resolved!.ref,
             git: privatePacket ? { token: privatePacket.git.token, expiresAt: privatePacket.git.expiresAt, scope: privatePacket.git.scope } : null,
-            ...(privatePacket ? { privatePacket } : {}), timeoutMs },
+            ...(privatePacket ? { privatePacket, ...(identity?.gitAuthor ? { gitAuthor: identity.gitAuthor } : {}) } : {}), timeoutMs },
         { correlationId: newCorrelationId(), signal: deadline, awsStandaloneEnabled: awsStandaloneGitEnabled(),
             revalidateTarget: () => target(ctx, computerId) });
     if (!opened.ok) {

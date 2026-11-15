@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Stage registry capacity 33 over the normal apply-app -> promote order: reader proofs and guards.
 
-Offline only: temporary git repositories, this checkout's own git objects (5127d85f -> the reviewed c7a5af66
-host agent), the real Node probe with a fake fetch, and synthetic CLI results. No AWS, SSM or secret.
+Offline only: temporary git repositories, this checkout's own reviewed Git objects (attestation and
+standalone Git host deltas), the real Node probe with a fake fetch, and synthetic CLI results. No AWS, SSM or secret.
 """
 import copy
 import json
@@ -28,6 +28,7 @@ AGENT_5127 = '5127d85f71af309dc7c47537a6be276a7de1eb9d'
 AGENT_ED7 = 'ed7da29a279915af36f5c3cfdb63c5627b269049'
 # The reviewed host agent the map describes: 5127d85f plus the lower-attestation lane as reviewed at c7a5af66 (attest.py and its test).
 AGENT_REVIEWED = 'c7a5af6667b6ddba5605b4fceaa5caaccbce91cc'
+AGENT_COMBINED = '68dfb30aba6907b2c6813acc2a6a89281827c900'
 SHA = '9' * 40
 TAG = 'stage-cap33'
 IMAGE = 'sha256:' + 'a' * 64
@@ -148,6 +149,82 @@ class HostAbiTests(unittest.TestCase):
                     patch.object(release, 'host_agent_tree', side_effect=[old, changed]), \
                     self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
                 release.require_host_abi(AGENT_5127, AGENT_REVIEWED, REPO)
+
+
+class StandaloneHostAbiTests(unittest.TestCase):
+    """Real Git fixtures copy the reviewed blobs; mutations become actual commits."""
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.repo = Path(temporary.name) / 'repo'
+        git(Path(temporary.name), 'init', '-q', str(self.repo))
+        git(self.repo, 'config', 'user.name', 'Offline Fixture')
+        git(self.repo, 'config', 'user.email', 'fixture@example.invalid')
+        self.commits = []
+        for side in (0, 1):
+            if side == 1:
+                for name, pair in release.HOST_AGENT_EXCEPTION.items():
+                    self.install_blob(name, pair[1])
+                self.intermediate = self.commit('reviewed attestation')
+            for name, pair in release.HOST_AGENT_STANDALONE_EXCEPTION.items():
+                self.install_blob(name, pair[side])
+            self.commits.append(self.commit(str(side)))
+        self.old, self.new = self.commits
+
+    def install_blob(self, name, metadata):
+        path = self.repo / release.HOST_AGENT / name
+        if metadata is None:
+            path.unlink(missing_ok=True)
+            return
+        mode, blob = metadata.split(' ')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(subprocess.check_output(['git', '-C', str(REPO), 'cat-file', 'blob', blob]))
+        path.chmod(int(mode, 8) & 0o777)
+
+    def commit(self, message):
+        git(self.repo, 'add', '-A')
+        git(self.repo, 'commit', '-qm', message)
+        return git(self.repo, 'rev-parse', 'HEAD')
+
+    def test_exact_eight_file_fixture_and_checked_in_host_delta(self):
+        expected = release.HOST_AGENT_STANDALONE_EXCEPTION
+        self.assertEqual(len(expected), 8)
+        self.assertEqual(release.require_host_abi(self.old, self.new, self.repo), expected)
+        self.assertEqual(release.require_host_abi(self.old, self.intermediate, self.repo), release.HOST_AGENT_EXCEPTION)
+        self.assertEqual(release.require_host_abi(AGENT_5127, AGENT_COMBINED, REPO), expected)
+        self.assertEqual(release.require_host_abi(AGENT_5127, git(REPO, 'rev-parse', 'HEAD'), REPO), expected)
+        self.assertEqual(release.require_host_abi(AGENT_COMBINED, AGENT_COMBINED, REPO), {})
+
+    def test_every_missing_mutated_or_mode_changed_reviewed_file_refused(self):
+        for name in release.HOST_AGENT_STANDALONE_EXCEPTION:
+            for mutation in ('missing', 'content', 'mode'):
+                with self.subTest(path=name, mutation=mutation):
+                    git(self.repo, 'reset', '--hard', self.new)
+                    path = self.repo / release.HOST_AGENT / name
+                    if mutation == 'missing':
+                        path.unlink()
+                    elif mutation == 'content':
+                        path.write_bytes(path.read_bytes() + b'\n# unreviewed change\n')
+                    else:
+                        path.chmod(0o755)
+                    changed = self.commit(mutation)
+                    with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+                        release.require_host_abi(self.old, changed, self.repo)
+
+    def test_extra_file_wrong_preimage_and_reverse_refused(self):
+        extra = self.repo / release.HOST_AGENT / 'lib/ezil_host/unreviewed.py'
+        extra.write_text('unreviewed = True\n')
+        changed = self.commit('extra file')
+        with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+            release.require_host_abi(self.old, changed, self.repo)
+        git(self.repo, 'reset', '--hard', self.old)
+        path = self.repo / release.HOST_AGENT / 'lib/ezil_host/standalone_git.py'
+        path.write_bytes(path.read_bytes() + b'\n# different predecessor\n')
+        predecessor = self.commit('wrong preimage')
+        for old, new, repo in ((predecessor, self.new, self.repo), (self.new, self.old, self.repo),
+                              (self.intermediate, self.new, self.repo), (AGENT_COMBINED, AGENT_5127, REPO)):
+            with self.subTest(old=old, new=new), self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+                release.require_host_abi(old, new, repo)
 
 
 class PromotionGuardTests(unittest.TestCase):

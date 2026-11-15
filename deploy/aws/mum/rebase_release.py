@@ -571,13 +571,29 @@ def static_deployment(plan,d):
     need(all(d.get(k)==desired.get(k) for k in keys),'deployment network/storage/identity changed outside the promotion tuple')
 
 # apply_app runs the plan's new app against hosts still on the deployed AMI's agent. The baked agent is
-# `git archive <agentCommit>:infra/host-agent`, so tree identity is exact. The only reviewed difference is
-# the ed7da29a lower-attestation lane over agent 5127d85f: an added read-only `attest-lower` subcommand.
+# `git archive <agentCommit>:infra/host-agent`, so tree identity is exact. Reviewed exceptions
+# below bind complete old/new file modes and blobs; no path-only or feature-flag exception exists.
 HOST_AGENT='infra/host-agent'
 HOST_AGENT_EXCEPTION={
     'lib/ezil_host/attest.py':(None,'100644 a86a795c144f399567a0ae2a9d5c20c42d89e738'),
     'lib/ezil_host/cli.py':('100644 be52080df39b5fc598f88dd6db053a091a8b0d2b','100644 23d82c44207b9741f346edcca06cf2928aed94fa'),
     'test/test_attest.py':(None,'100644 372195faa9675b751ae7b52381dccf32225a17ca'),
+}
+
+
+# 5127d85f -> 68dfb30a host tree: the same reviewed attestation lane plus the closed
+# standalone Git protocol/runtime update. Older app requests remain accepted; new optional
+# metadata stays gated until the matching Worker and host are qualified. A later byte or
+# mode change requires another review, even in one of these files.
+HOST_AGENT_STANDALONE_EXCEPTION={
+    'lib/ezil_host/attest.py':(None,'100644 a86a795c144f399567a0ae2a9d5c20c42d89e738'),
+    'lib/ezil_host/cli.py':('100644 be52080df39b5fc598f88dd6db053a091a8b0d2b','100644 23d82c44207b9741f346edcca06cf2928aed94fa'),
+    'lib/ezil_host/standalone_git.py':('100644 037ceac62f11f3e8e712fff9b49aceacc18dc99a','100644 58ec9ab326c7b3734f4834402d2f766b3de863e7'),
+    'lib/ezil_host/standalone_git_assets/pin.json':('100644 957e402c703ff6d642d1f9164a5ce80e1c92aca3','100644 c167f33cf3cd6766898375ea6bdece74ddce7d55'),
+    'lib/ezil_host/standalone_git_assets/supervise.py':('100644 60ca19fea4c83848f376e63817fc3bf927be66de','100644 e578c8cd0df336409b609d6c4bf9df120ba913a1'),
+    'lib/ezil_host/standalone_git_runtime.py':('100644 55ca45da446bcee299579a22b858d46016fb56ee','100644 8591353fbdedb0569c844333af57c5f1a49c10ce'),
+    'test/test_attest.py':(None,'100644 372195faa9675b751ae7b52381dccf32225a17ca'),
+    'test/test_standalone_git.py':('100644 248e8e11e620c2b5150b5ee443cb590c8cc64d8c','100644 9a5ec1c5fbe57d72c0dbd0c3fb5fcd12b300e0bf'),
 }
 
 
@@ -596,10 +612,10 @@ def host_agent_tree(commit,repo=REPO):
 
 
 def require_host_abi(deployed_commit,bake_commit,repo=REPO):
-    """Byte-identical host agent, or exactly the reviewed attestation delta; never a wider claim."""
+    """Byte-identical host agent or one complete reviewed delta; never a wider claim."""
     old,new=host_agent_tree(deployed_commit,repo),host_agent_tree(bake_commit,repo)
     delta={name:(old.get(name),new.get(name)) for name in old.keys()|new.keys() if old.get(name)!=new.get(name)}
-    need(delta in ({},HOST_AGENT_EXCEPTION),'host agent differs from the deployed agent beyond the reviewed delta')
+    need(delta in ({},HOST_AGENT_EXCEPTION,HOST_AGENT_STANDALONE_EXCEPTION),'host agent differs from the deployed agent beyond the reviewed delta')
     return delta
 
 

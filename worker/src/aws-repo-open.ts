@@ -59,7 +59,8 @@ export async function openAwsStandaloneRepo(request: Request, claims: PreviewTok
   if (expiry > started + 300_000 || deadline < started + 20_000) return json('repo_open_token_expired', 409);
   const jobId = (deps.jobId ?? (() => hex(crypto.getRandomValues(new Uint8Array(32)))))();
   if (!/^[0-9a-f]{64}$/.test(jobId)) return json('repo_open_failed');
-  const body = JSON.stringify({ v: 1, jobId, repositoryId: op.repositoryId, privatePacket: op.privatePacket, timeoutMs: op.timeoutMs });
+  const body = JSON.stringify({ v: 1, jobId, repositoryId: op.repositoryId, privatePacket: op.privatePacket, timeoutMs: op.timeoutMs,
+    ...(op.gitAuthor ? { gitAuthor: op.gitAuthor } : {}), ...(op.refreshOnly ? { refreshOnly: true } : {}) });
   const encoded = new TextEncoder().encode(body);
   if (encoded.byteLength > 20_480) return json('repo_open_invalid_request', 400);
   const digest = hex(new Uint8Array(await crypto.subtle.digest('SHA-256', encoded)));
