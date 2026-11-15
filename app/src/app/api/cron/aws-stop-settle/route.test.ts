@@ -3,6 +3,7 @@ import path from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultAwsCollaborators } from '@/server/api/routers/compute-dispatch';
 import { db } from '@/server/db';
+import { createPoolDeps } from '@/server/lib/compute/aws-pool-runtime';
 import { runAwsStopSettlement } from '@/server/lib/compute/aws-receipts';
 import { GET, maxDuration } from './route';
 
@@ -10,6 +11,7 @@ const mockEnv = vi.hoisted(() => ({ CRON_SECRET: undefined as string | undefined
 vi.mock('@/env', () => ({ env: mockEnv }));
 vi.mock('@/server/db', () => ({ db: {} }));
 vi.mock('@/server/api/routers/compute-dispatch', () => ({ defaultAwsCollaborators: vi.fn() }));
+vi.mock('@/server/lib/compute/aws-pool-runtime', () => ({ createPoolDeps: vi.fn() }));
 vi.mock('@/server/lib/compute/aws-receipts', () => ({ runAwsStopSettlement: vi.fn() }));
 
 const request = (authorization?: string) => new Request('https://app.test/api/cron/aws-stop-settle', {
@@ -27,6 +29,7 @@ describe('GET /api/cron/aws-stop-settle', () => {
     it.each([undefined, 'Bearer wrong', 'Basic cron', 'bearer cron'])('rejects a missing or wrong bearer (%s)', async auth => {
         expect((await GET(request(auth))).status).toBe(404);
         expect(defaultAwsCollaborators).not.toHaveBeenCalled();
+        expect(createPoolDeps).not.toHaveBeenCalled();
         expect(runAwsStopSettlement).not.toHaveBeenCalled();
     });
 
@@ -34,6 +37,7 @@ describe('GET /api/cron/aws-stop-settle', () => {
         mockEnv.CRON_SECRET = undefined;
         expect((await GET(request('Bearer undefined'))).status).toBe(404);
         expect(defaultAwsCollaborators).not.toHaveBeenCalled();
+        expect(createPoolDeps).not.toHaveBeenCalled();
         expect(runAwsStopSettlement).not.toHaveBeenCalled();
     });
 
@@ -41,14 +45,17 @@ describe('GET /api/cron/aws-stop-settle', () => {
         const executions = { describe: vi.fn() };
         const tunnels = { createTunnel: vi.fn(), deleteTunnel: vi.fn() };
         const meter = { ready: vi.fn(), stopped: vi.fn(), heartbeat: vi.fn() };
+        const pool = { retireLease: vi.fn() };
+        vi.mocked(createPoolDeps).mockReturnValue(pool as never);
         vi.mocked(defaultAwsCollaborators).mockReturnValue({ executions, tunnels, meter, starter: { start: vi.fn() },
             describer: { describeForEnrollment: vi.fn() } });
         const response = await GET(request('Bearer cron'));
         expect(response.status).toBe(200);
         expect(await response.json()).toEqual({ ok: true, checked: 3, settled: 3 });
         expect(defaultAwsCollaborators).toHaveBeenCalledExactlyOnceWith(process.env);
+        expect(createPoolDeps).toHaveBeenCalledExactlyOnceWith(db, process.env);
         expect(runAwsStopSettlement).toHaveBeenCalledExactlyOnceWith(process.env, {
-            db, executions, tunnels, meter, signal: expect.any(AbortSignal),
+            db, executions, tunnels, meter, pool, signal: expect.any(AbortSignal),
         });
         expect(maxDuration).toBe(45);
     });
