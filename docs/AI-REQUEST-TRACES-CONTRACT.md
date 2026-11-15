@@ -71,6 +71,9 @@ message through shell POST, the authenticated route, native ingest/query and
 admin rendering. Only authentication context and database driver are mocked;
 query results come from the actual ingest SQL parameter. Private extra keys are
 rejected at each boundary. This is offline qualification, not live acceptance.
+`e2e/code-ai-trace-browser.mjs` is a local experimental real-Chromium harness: the built Code window, actual
+Worker injection, exact registration bytes and actual producer at separate local origins, with only a local
+cookie-gated trace endpoint intercepted. It is outside CI until intermittent local renderer loss is explained.
 
 The existing `ezil.code.diag.hello`/`ready` lifecycle supplies the rotating nonce.
 One narrow optional `onDiagnosticNonce` callback in `ui/feedback/app-failures.js`
