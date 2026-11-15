@@ -17,6 +17,7 @@ afterEach(() => vi.restoreAllMocks());
 import { createAwsEc2Provider, type LifecycleStarter } from './aws-ec2';
 import { handleAwsEnrollment, nonceHashOf, type Ec2EnrollmentView, type TunnelClient } from './aws-enroll';
 import { AWS_IDENTITY_CERTS_ENV } from './aws-identity';
+import { createPoolDeps } from './aws-pool-runtime';
 import { buildLifecycleWork, currentGenerationIntent, LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleIntent } from './aws-intent';
 import { fixtureDeployment } from './aws-intent.test-support';
 import fx from './aws-identity.fixtures.json';
@@ -66,7 +67,7 @@ const env = (over: Record<string, string> = {}) => ({
     ...over,
 });
 
-type Exec = { status: string; output?: string | null; error?: string | null; cause?: string | null; startDate?: Date | null; stopDate?: Date | null };
+type Exec = { status: string; input?: string; output?: string | null; error?: string | null; cause?: string | null; startDate?: Date | null; stopDate?: Date | null };
 
 function receiptOf(o: { jobId?: string; digest?: string; generation?: number; leaseEpoch?: number; fenceToken?: string; instanceId?: string; volumeId?: string; state?: string; instanceLost?: true } = {}) {
     return JSON.stringify({
@@ -145,6 +146,40 @@ describe('minute stop settlement', () => {
     const usage = () => [{ computer_id: C1, user_id: U1, instance_id: I_NEW, instance_type: 't3a.medium',
         started_at: new Date(NOW.getTime() - 3_600_000), stopped_at: null, egress_bytes: null, observed_by: 'receipt', updated_at: NOW }];
     const run = (s: ReturnType<typeof setup>) => runAwsStopSettlement(env(), { db: s.db, executions: s.executions, tunnels: s.tunnels });
+
+    it('retries pool lease retirement before clearing the release job, then leaves replays untouched', async () => {
+        const deployment = { ...D, namespace: 'mum', stateMachineVersionArn: D.stateMachineVersionArn.replace('pilot', 'mum') };
+        const s = setup([pending({ instance_type: 'm6i.large' })]);
+        const work = buildLifecycleWork({ ...currentGenerationIntent(
+            (await readPlacement(s.db, C1)).record!, 'stop', deployment,
+            { jobId: JOB, userData: null, leaseEpoch: 3 }), operation: 'release' });
+        s.placements[0]!.lifecycle_digest = work.digest;
+        s.executions.describe = vi.fn(async () => ({
+            ...success, input: work.input, output: receiptOf({ digest: work.digest, state: 'retired' }),
+        }));
+        const pool = createPoolDeps(s.db, env());
+        const lease = { state: 'leased' };
+        const retire = vi.fn<NonNullable<typeof pool.retireLease>>(async (db, placement) => {
+            expect(db).toBe(s.db);
+            expect(placement).toMatchObject({ computerId: C1, instanceId: I_NEW, generation: 2, leaseEpoch: 3 });
+            expect(s.placements[0]).toMatchObject({ state: 'STOPPING', lifecycle_job_id: JOB });
+            lease.state = 'retired';
+        });
+        pool.retireLease = retire;
+        const pass = () => runAwsStopSettlement(env({ [LIFECYCLE_DEPLOYMENTS_ENV]: JSON.stringify({ 'ap-south-1': deployment }) }),
+            { db: s.db, executions: s.executions, tunnels: s.tunnels, pool });
+        retire.mockRejectedValueOnce(new Error('lease retirement unavailable'));
+        await expect(pass()).rejects.toThrow('lease retirement unavailable');
+        expect(lease.state).toBe('leased');
+        expect(s.placements[0]).toMatchObject({ state: 'STOPPING', lifecycle_job_id: JOB, lifecycle_digest: work.digest });
+        expect(await pass()).toEqual({ ok: true, checked: 1, settled: 1 });
+        expect(lease.state).toBe('retired');
+        expect(s.placements[0]).toMatchObject({ state: 'STOPPED', lifecycle_job_id: null, lifecycle_digest: null });
+        expect(retire).toHaveBeenCalledTimes(2);
+        expect(await pass()).toEqual({ ok: true, checked: 0, settled: 0 });
+        expect(retire).toHaveBeenCalledTimes(2);
+        expect(s.starts).toEqual([]);
+    });
 
     it('settles a SUCCEEDED stop, fences the tunnel, clears the job, closes usage and meters the execution stop time exactly once', async () => {
         const meter = { ready: vi.fn(), stopped: vi.fn(), heartbeat: vi.fn() };

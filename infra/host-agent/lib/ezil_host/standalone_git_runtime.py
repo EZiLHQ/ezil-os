@@ -76,11 +76,13 @@ def execute(cfg, lease, req, ready=host_ready, clock=time.monotonic, wall=time.t
         return {"ok": False, "error": "repo_open_token_expired"}, False
     if not ready(cfg, lease):
         return {"ok": False, "error": "runtime_not_running"}, False
-    args = ["/usr/bin/python3", "-I", "-c", FD_ADAPTER, str(remaining - 3500), "3000", "--repo-open",
+    args = ["/usr/bin/python3", "-I", "-c", FD_ADAPTER, str(remaining - 3500), "3000", "--repo-refresh" if req.get("refreshOnly") else "--repo-open",
             "/workspace", req["repositoryId"], req["privatePacket"]["repository"]["canonicalURL"], "0",
             pin["cliSha256"], pin["version"]]
     try:
-        result = desktop.exec_(cfg, args, input=json.dumps(req["privatePacket"], separators=(",", ":")).encode(),
+        packet = {**req["privatePacket"], "gitAccess": True, **({"gitAuthor": req["gitAuthor"]} if "gitAuthor" in req else {}),
+                  **({"refreshOnly": True} if req.get("refreshOnly") else {})}
+        result = desktop.exec_(cfg, args, input=json.dumps(packet, separators=(",", ":")).encode(),
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=max(1, end - clock()))
     except (OSError, subprocess.SubprocessError):
         # Killing runc's launcher alone does not prove in-container cleanup.
@@ -89,6 +91,12 @@ def execute(cfg, lease, req, ready=host_ready, clock=time.monotonic, wall=time.t
         answer = validate_output(result.stdout, req)
         if answer is not None:
             return answer, False
+        # Reviewed supervisor preflight/migration refusals start no outstanding Git writer.
+        closed = {b"ezil-repo-open:error:" + code + b"\n" for code in (
+            b"repo_open_invalid_request", b"repo_open_workspace_unavailable", b"repo_open_workspace_not_ready",
+            b"repo_open_folder_conflict", b"repo_open_git_missing", b"repo_open_busy")}
+        if result.stdout in closed:
+            return {"ok": False, "error": "repo_open_git_missing" if b"repo_open_git_missing" in result.stdout else "repo_open_failed"}, False
     # The reviewed supervisor emits 126 for unconfirmed child cleanup. A normal
     # CLI refusal with a closed error object is completed, without deleting any
     # existing checkout or foreign lock. Only fixed codes leave this process.

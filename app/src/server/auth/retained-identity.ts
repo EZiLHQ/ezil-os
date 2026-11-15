@@ -23,7 +23,10 @@ export const IDENTITY_COOKIE = '__Host-ezil-project-identity';
 /** A token this close to expiry is refreshed first: Universe caps the Git token at the ID token's own expiry. */
 export const IDENTITY_MIN_VALIDITY_MS = 60_000;
 
-export interface RetainedIdentity { token: string; issuer: string; subject: string; expiresAt: number; userId: string; sessionId: string }
+export interface RetainedIdentity {
+    token: string; issuer: string; subject: string; expiresAt: number; userId: string; sessionId: string;
+    gitAuthor?: import('../git/author').GitAuthor;
+}
 
 export class IdentityRefreshRequired extends Error {
     constructor() { super('IDENTITY_REFRESH_REQUIRED'); }
@@ -58,7 +61,8 @@ export async function retainedIdentity(userId: string, now = Date.now): Promise<
         || record.expiresAt - now() < IDENTITY_MIN_VALIDITY_MS) throw new IdentityRefreshRequired();
     const checked = await verifyProjectIdToken(record.token).catch(() => { throw new IdentityRefreshRequired(); });
     if (checked.subject !== record.subject || checked.issuer !== record.issuer) throw new IdentityRefreshRequired();
-    return record;
+    // Recompute attribution from the token we just verified, including for vault records created before this field existed.
+    return { ...record, gitAuthor: checked.gitAuthor };
 }
 
 /** Sign-out, or Universe refusing the token: the next project open must refresh it. */

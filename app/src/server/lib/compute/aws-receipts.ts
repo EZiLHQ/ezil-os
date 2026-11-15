@@ -761,7 +761,7 @@ export const FLEET_RECONCILE_LIMIT = 20;
  */
 export async function runAwsStopSettlement(
     env: Env,
-    deps: Pick<ReceiptDeps, 'db' | 'executions' | 'tunnels' | 'meter' | 'now' | 'clock'> & { signal?: AbortSignal },
+    deps: Pick<ReceiptDeps, 'db' | 'executions' | 'tunnels' | 'meter' | 'now' | 'clock' | 'pool'> & { signal?: AbortSignal },
 ): Promise<{ ok: true; skipped: string } | { ok: true; checked: number; settled: number }> {
     if (!isAwsComputersEnabled(env)) return { ok: true, skipped: 'aws_disabled' };
     const regions = readAwsRegions(env);

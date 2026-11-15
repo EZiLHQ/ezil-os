@@ -9,7 +9,7 @@ import { parseRebaseJson, RebaseDigest, RebaseTime } from './aws-rebase-json';
  * `registryCapacity`, which the operator's in-container probe reads before it appends a record
  * past thirty-two (deploy/aws/mum/rebase_release.py, normal apply-app then promote).
  */
-export const REBASE_RELEASE_REGISTRY_CAPACITY = 33;
+export const REBASE_RELEASE_REGISTRY_CAPACITY = 34;
 
 const version = z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*$/);
 const ref = z.string().max(512).regex(/^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com\/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$/);
