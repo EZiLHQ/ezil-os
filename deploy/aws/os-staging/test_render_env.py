@@ -62,6 +62,29 @@ class RenderEnvTests(unittest.TestCase):
             with self.subTest(key=unknown), self.assertRaises(renderer.RenderError):
                 renderer.validate({**self.values, unknown: "0"})
 
+    def test_aws_standalone_git_gate_is_optional_and_reaches_app_environment(self):
+        key = "AWS_STANDALONE_REPO_OPEN_ENABLED"
+        # Existing installs remain unchanged; activation follows host qualification.
+        with patch.object(renderer, "OPTIONAL", renderer.OPTIONAL - {key}):
+            before = self.render_fixture(self.values)
+        self.assertEqual(self.render_fixture(self.values), before)
+        for flag in ("0", "1", "on", "true"):
+            with self.subTest(flag=flag):
+                values = {**self.values, key: flag}
+                (app, cron), names = self.render_fixture(values)
+                self.assertEqual(dict(line.split("=", 1) for line in app.decode().splitlines()), values)
+                self.assertEqual(names.splitlines(), sorted(values))
+                self.assertNotIn(key, cron.decode())
+
+    def test_aws_standalone_git_gate_keeps_exact_names_and_string_validation(self):
+        key = "AWS_STANDALONE_REPO_OPEN_ENABLED"
+        for unknown in ("AWS_STANDALONE_REPO_OPEN_ENABLE", key + "_EXTRA", "AWS_STANDALONE_ARBITRARY"):
+            with self.subTest(key=unknown), self.assertRaises(renderer.RenderError):
+                renderer.validate({**self.values, unknown: "1"})
+        for value in (None, False, 1, "", " padded ", "before\nafter", "before\rafter", "before\0after"):
+            with self.subTest(value=repr(value)), self.assertRaises(renderer.RenderError):
+                renderer.validate({**self.values, key: value})
+
     def render_fixture(self, values):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
             output = io.StringIO()
