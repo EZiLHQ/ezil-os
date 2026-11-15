@@ -1,5 +1,12 @@
-/** Public aliases are existing signed-registry partner IDs, never Stripe coupons or redirect targets. */
-export const SPONSOR_COUPON_PATTERN = /^[a-z0-9][a-z0-9_-]{2,63}$/;
+/** A signed-registry partner ID: 3–64 characters, underscores allowed. */
+export const LEGACY_PARTNER_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{2,63}$/;
+/** A Stripe Product promoter alias (v3/trial-campaigns.ts PROMOTER_CODE_PATTERN): 2–32 characters, no underscore. */
+const PRODUCT_PROMOTER_PATTERN = /^[a-z0-9][a-z0-9-]{1,31}$/;
+/**
+ * Public aliases are names, never Stripe coupon objects or redirect targets: the UNION of the two grammars, so neither authority's valid
+ * alias is blocked at entry. The legacy registry decides first; only an alias it does not know may be a Product promoter.
+ */
+export const SPONSOR_COUPON_PATTERN = new RegExp(`^(?:${LEGACY_PARTNER_ID_PATTERN.source.slice(1, -1)}|${PRODUCT_PROMOTER_PATTERN.source.slice(1, -1)})$`);
 export const SPONSOR_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43,128}$/;
 export const SPONSOR_BILLING_RETURN = '/os?settings=billing';
 export type SponsorEntryInput = { kind: 'token'; value: string } | { kind: 'coupon'; value: string };

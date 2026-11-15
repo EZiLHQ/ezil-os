@@ -482,6 +482,7 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
             case 'image-cas':
             case 'image-write':
             case 'enroll-digest':
+            case 'migration-lower':
             case 'cas': {
                 const m = text.match(/SET\s+([\s\S]*?)\s+WHERE\s+([\s\S]*?)\s+RETURNING/);
                 if (!m) throw new Error('fake db: unparsed update');

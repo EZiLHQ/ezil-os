@@ -677,6 +677,8 @@ jobs:
         run: |
           node .github/scripts/production-migrations.mjs validate
           python3 -B .github/scripts/staging-lock.test.py
+      - name: Lower-attestation schema installer guards (offline)
+        run: python3 -B deploy/aws/mum/tests/lower_attestation_schema.py
       - name: Verify shared migration protocol on native PostgreSQL
         run: |
           docker pull postgres:16-alpine

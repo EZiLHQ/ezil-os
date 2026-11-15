@@ -54,6 +54,8 @@ const ERRORS = {
     trial_unavailable: "The free month isn't available for this account.",
     trial_quote_stale: "Your free month's dates changed. Try again to open a new checkout.",
     trial_checkout_complete: 'Your free month is already starting. Wait a moment, then refresh Billing.',
+    trial_offer_invalid: "This free-month link isn't valid. Open the link again, or choose a plan in Billing.",
+    trial_offer_unavailable: "This free-month link isn't available right now. Nothing was charged.",
 };
 
 // Optional DTO ceiling lets the consent sheet keep cap errors catalog-driven.
@@ -79,7 +81,9 @@ function zoned (options, timeZone) {
 
 /** "Feb 27, 2027": the trial instant's calendar day in the viewer's zone, or '—'. */
 export function trialDayLabel (iso, { timeZone } = {}) {
-    const time = Date.parse(iso ?? '');
+    // A promoter-link offer has no previewed end before its quote: sentences read "from the end of your free month".
+    if ( iso === null || iso === undefined ) return 'the end of your free month';
+    const time = Date.parse(iso);
     return Number.isFinite(time) ? zoned({ year: 'numeric', month: 'short', day: 'numeric' }, timeZone).format(new Date(time)) : '—';
 }
 
@@ -103,7 +107,9 @@ export function trialMomentLabel (iso, { timeZone, full = false } = {}) {
 export function trialOfferOf (summary) {
     const offer = summary?.trialOffer;
     if ( summary?.version !== 3 || summary.actions?.checkout !== true || offer?.eligible !== true || offer.sku !== TRIAL_SKU ) return null;
-    if ( ! Number.isFinite(Date.parse(offer.endsAt ?? '')) || ! Number.isSafeInteger(offer.amountCents) || offer.amountCents <= 0 ) return null;
+    // An availability-verified offer (`withCouponView`) may have no previewed end: its exact end arrives with its quote.
+    const previewed = offer.verified === true && (offer.endsAt === null || offer.endsAt === undefined);
+    if ( ! previewed && ! Number.isFinite(Date.parse(offer.endsAt ?? '')) || ! Number.isSafeInteger(offer.amountCents) || offer.amountCents <= 0 ) return null;
     return summary.catalog?.offers?.some(item => item.sku === TRIAL_SKU) ? offer : null;
 }
 
@@ -387,4 +393,102 @@ export function hoursLeftLines (period, machineChoice = [], { monthly = false } 
         main,
         equivalents: others.length ? `Same as ${others.slice(0, -1).join(', ')}${others.length > 1 ? ' or ' : ''}${others.at(-1)}.` : null,
     };
+}
+
+// ── Promoter link (?coupon=<alias>) ──────────────────────────────────────────
+// The alias is a registered promoter's name that rides the address bar into Billing. It is never a price, a Stripe id or
+// a redirect. The server alone validates it (`billing.trialOffer`, read-only) and applies it (`billing.quoteTrial`); the
+// shell never marks a URL value eligible or applied by itself.
+
+// Stage accepts the union of the server's two grammars, which resolves the legacy registry first: a Product promoter
+// (`PROMOTER_CODE_PATTERN`, 2-32 characters, letters, digits, hyphens) or a legacy partner alias (`SPONSOR_COUPON_PATTERN`,
+// 3-64 characters, also underscores). Matching it only decides what is sent; the server decides what it means.
+export const COUPON_PATTERN = /^[a-z0-9][a-z0-9-]{1,31}$/;
+export const LEGACY_COUPON_PATTERN = /^[a-z0-9][a-z0-9_-]{2,63}$/;
+
+/** The canonical alias for a URL value, or null for anything that is not one well-formed alias. */
+export function couponAlias (value) {
+    if ( typeof value !== 'string' ) return null;
+    const alias = value.trim().toLowerCase();
+    return COUPON_PATTERN.test(alias) || LEGACY_COUPON_PATTERN.test(alias) ? alias : null;
+}
+
+/** The link in a query string: `{ alias }` for exactly one valid value, `{ invalid: true }` for a repeated or malformed one, `{}` for none. */
+export function couponFromSearch (search) {
+    const params = new URLSearchParams(search);
+    const values = params.getAll('coupon');
+    if ( ! values.length ) return params.get('coupon_entry') === 'invalid' ? { invalid: true } : {};
+    const alias = values.length === 1 ? couponAlias(values[0]) : null;
+    return alias ? { alias } : { invalid: true };
+}
+
+/** The 64-lowercase-hex fingerprint the server puts on every offer. */
+export const isOfferFingerprint = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+
+/** A server offer the shell may bind to and echo: `{ coupon: string | null, fingerprint, source? }`, nothing else trusted. */
+export function offerOf (value) {
+    if ( ! value || typeof value !== 'object' || ! isOfferFingerprint(value.fingerprint) ) return null;
+    if ( value.coupon !== null && typeof value.coupon !== 'string' ) return null;
+    const source = ['public', 'promoter', 'sponsor'].includes(value.source) ? value.source : null;
+    return { coupon: value.coupon, fingerprint: value.fingerprint, ...(source ? { source } : {}) };
+}
+
+/** True when two offers are the same server offer (coupon and fingerprint; `source` is display only). */
+export const sameOffer = (a, b) => !! a && !! b && (a.coupon ?? null) === (b.coupon ?? null) && a.fingerprint === b.fingerprint;
+
+const COUPON_NOTICES = {
+    checking: 'Checking your free-month link…',
+    stale: 'An earlier free-month checkout is still open. Try again for a fresh quote. Nothing was charged.',
+    invalid: "This free-month link isn't valid. Open the link again, or choose a plan below.",
+    unavailable: "This free-month link isn't available right now. Nothing was charged.",
+    refused: "This account can't start a free month with this link.",
+    error: "We couldn't check your free-month link right now. Nothing was charged.",
+};
+const REFUSED_BY_REASON = {
+    trial_used: "You've already used your free month, so this link can't start another.",
+    paid_before: 'The free month is for accounts without an earlier paid plan.',
+    email_unverified: 'Verify your email to start a free month.',
+};
+
+/**
+ * The summary as the server's read-only availability check (`billing.trialOffer`) frames it. `link`: `{ alias, status }`,
+ * alias null for the public offer; status 'checking' | 'available' | 'invalid' | 'unavailable' | 'refused' | 'error';
+ * `invalid: true` marks a malformed address (nothing was asked).
+ * - 'available' is the server's own `available && eligible` for this person AND this offer. It alone enables the CTA, for
+ *   the public offer and for a promoter link alike. `summary.trialOffer` is only the PUBLIC offer's preview (null when the
+ *   public offer is off), so it neither gates a link nor enables a CTA by itself.
+ * - Checking, invalid, unavailable, refused and error promise no free month and never show another offer in its place.
+ * - An available offer with no previewed end is shown honestly ("from the end of your free month") until its quote.
+ * Other summaries pass through. `couponView` is display-only: nothing sent to the server comes from it but the alias.
+ */
+export function withCouponView (summary, link) {
+    if ( summary?.version !== 3 || summary.actions?.checkout !== true ) return summary;
+    const standard = summary.catalog?.offers?.find(item => item.sku === TRIAL_SKU);
+    if ( summary.plan?.sku !== 'free_v3' || ! standard || planTrialOf(summary) ) return summary;
+    const alias = link?.alias ?? null;
+    const status = link?.invalid ? 'invalid' : link?.status ?? 'checking';
+    const own = summary.trialOffer;
+    // Stage: with no alias the server may still select an invite (its HttpOnly carrier, never seen here), so "no alias"
+    // is not "public". The read's exact offer is what is shown, quoted and echoed; the summary's preview only fills dates.
+    const read = status === 'available' ? offerOf(link?.offer) : null;
+    // `hinted`: the address carried a failed coupon entry (`coupon_entry`). Only the server's own invite selection may still
+    // show; a failed entry never falls back to the public offer, and Stage's entry card stays its one explanation.
+    const offer = link?.hinted && read?.source !== 'sponsor' ? null : read;
+    if ( offer ) {
+        const preview = own?.eligible === true && (own.source ?? null) === (offer.source ?? own.source ?? null) ? own : null;
+        return { ...summary, trialOffer: { eligible: true, sku: TRIAL_SKU, amountCents: preview?.amountCents ?? standard.priceCents,
+            endsAt: preview?.endsAt ?? null, coupon: offer.coupon, ...(offer.source ? { source: offer.source } : {}), ...(preview?.partnerId ? { partnerId: preview.partnerId } : {}),
+            verified: true, request: alias, offer },
+        // A sponsor offer keeps Stage's own coupon card; a Product promoter link gets the one quiet line.
+        ...(alias && offer.source !== 'sponsor' ? { couponView: { state: 'offer', alias, copy: 'Your free-month link is ready. $0 today; the exact end date is shown before you pay.' } } : {}) };
+    }
+    // No server proof: no free-month CTA. A refusal the summary itself reports (used, paid before, unverified) stays.
+    const hidden = own?.eligible === false ? summary : { ...summary, trialOffer: undefined };
+    if ( link?.hinted && ! alias && ! link?.invalid ) return hidden;
+    const shown = status === 'available' ? 'error' : status;
+    // A carrier the summary reports but the read refused (invalid, closed, unverifiable) fails closed, and says so.
+    const carrier = ! alias && ! link?.invalid && own?.source === 'sponsor' && ['unavailable', 'invalid', 'refused', 'error', 'stale'].includes(shown);
+    if ( ! alias && ! link?.invalid && ! carrier ) return hidden;
+    const copy = shown === 'refused' && own?.eligible === false && REFUSED_BY_REASON[own.reason] || COUPON_NOTICES[shown] || COUPON_NOTICES.invalid;
+    return { ...hidden, couponView: { state: shown, alias, copy, ...(['error', 'stale'].includes(shown) ? { retry: true } : {}) } };
 }

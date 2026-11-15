@@ -1,7 +1,7 @@
 // upgrade-sheet.js — EZiL-authored. Payment stays inside the desktop;
 // the server confirms payment, and only its summary confirms a purchased plan.
 import { openSheetFrame } from './sheet-frame.js';
-import { dollars, stdHoursLabel, sizeLabel, planName, errorCopy, planBullets, accountCredits, TRIAL_SKU, trialDayLabel, paidAccess } from './billing-format.js';
+import { dollars, stdHoursLabel, sizeLabel, planName, errorCopy, planBullets, accountCredits, TRIAL_SKU, trialDayLabel, paidAccess, couponFromSearch, offerOf, sameOffer } from './billing-format.js';
 
 let stripePromise = null;
 
@@ -13,6 +13,12 @@ export function parseBillingDeepLink (search) {
     const openUpgrade = upgrade === 'standard' ? 'standard_monthly_v3'
         : upgrade === 'premium' ? 'premium_monthly_v3'
         : upgrade === 'compute' ? 'compute_monthly_v2' : upgrade === 'pro';
+    // A promoter link (`coupon=<alias>`, or `coupon_entry=invalid` from the root entry): `coupon` stays in the address
+    // bar so a reload keeps it; `coupon_entry` is a one-shot flag.
+    const link = couponFromSearch(search);
+    // ANY `coupon_entry` key (a known hint, empty, unknown or repeated) marks a coupon entry: Billing then never
+    // auto-opens a purchase for it. Presence only; the value is never trusted for anything else here.
+    const entryPresent = params.has('coupon_entry');
     params.delete('settings');
     params.delete('upgrade');
     // Display-only entry outcome; Billing reads it before normal boot adopts the clean address.
@@ -23,7 +29,9 @@ export function parseBillingDeepLink (search) {
         if ( params.get('reason') === 'insufficient_credits' ) params.delete('reason');
     }
     const remaining = params.toString();
-    return { initialTab: 'billing', openUpgrade, search: remaining ? `?${remaining}` : '' };
+    return { initialTab: 'billing', openUpgrade, search: remaining ? `?${remaining}` : '',
+        ...(link.alias ? { couponAlias: link.alias } : link.invalid ? { couponInvalid: true } : {}),
+        ...(entryPresent ? { couponEntryPresent: true } : {}) };
 }
 
 /** A failed download is evicted so Retry can reuse the existing payment session. */
@@ -66,14 +74,24 @@ function unwrap (result) {
  * A `billing.quoteTrial` reply the sheet may disclose: Standard, $0 today, one readable end that is also the first
  * charge, a positive amount. Anything else is refused rather than shown, so no guessed date reaches the person.
  */
-function trialQuote (data) {
+function trialQuote (data, coupon = null, expected = null) {
     const ok = data && typeof data === 'object' && data.sku === TRIAL_SKU && data.todayCents === 0 && data.currency === 'usd'
         && data.interval === 'month' && Number.isSafeInteger(data.amountCents) && data.amountCents > 0
         && typeof data.trialEndsAt === 'string' && Number.isFinite(Date.parse(data.trialEndsAt))
         && Date.parse(data.firstChargeAt ?? '') === Date.parse(data.trialEndsAt);
-    return ok ? { trialEndsAt: data.trialEndsAt, firstChargeAt: data.firstChargeAt, amountCents: data.amountCents } : null;
+    if ( ! ok ) return null;
+    // The server's offer travels back to it unchanged. A promoter link must come back as that same link: another
+    // (or none) is refused, never shown, so a quote can't quietly turn into the public or a full-price offer. When Billing
+    // showed a server-read offer (`expected`: Stage's carrier invite or a link), the quote must be exactly that offer.
+    const offer = data.offer;
+    if ( offer === undefined ) return coupon || expected ? null : { trialEndsAt: data.trialEndsAt, firstChargeAt: data.firstChargeAt, amountCents: data.amountCents };
+    const bound = offerOf(offer);
+    const offerOk = bound && (expected ? sameOffer(bound, expected) : (bound.coupon ?? null) === (coupon ?? null));
+    return offerOk ? { trialEndsAt: data.trialEndsAt, firstChargeAt: data.firstChargeAt, amountCents: data.amountCents,
+        offer: { coupon: bound.coupon, fingerprint: bound.fingerprint } } : null;
 }
-const TRIAL_ERRORS = new Set(['trial_unavailable', 'trial_quote_stale', 'trial_checkout_complete']);
+const TRIAL_ERRORS = new Set(['trial_unavailable', 'trial_quote_stale', 'trial_checkout_complete', 'trial_offer_invalid', 'trial_offer_unavailable']);
+// `stripe_unavailable` is transient: it falls through to Retry, which asks again with the same link, never another offer.
 
 /**
  * One sheet per document also means one checkout on a double click. Closing
@@ -140,7 +158,7 @@ export function isStripeModalFrame (iframe) {
  * it beside the payment form, and immediately opens `billing.createCheckout({ sku,
  * trial: { trialEndsAt } })` with that same end. Payment then runs exactly as the Standard checkout does ($0 today).
  */
-export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, onDone, onClose, onCancel, userId = null, loadStripe = defaultLoadStripe, now = Date.now, trial = false, timeZone }) {
+export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, onDone, onClose, onCancel, userId = null, loadStripe = defaultLoadStripe, now = Date.now, trial = false, coupon = null, trialOffer = null, timeZone }) {
     container = container?.get?.(0) ?? container;
     const doc = container.ownerDocument;
     const win = doc.defaultView;
@@ -327,7 +345,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
         show(changed ? 'Checking the new date for your free month…' : 'Checking your free month…');
         let next = null, failure = null;
         try {
-            next = trialQuote(unwrap(await trpc.mutate('billing.quoteTrial')));
+            next = trialQuote(unwrap(await trpc.mutate('billing.quoteTrial', ...(coupon ? [{ coupon }] : []))), coupon, offerOf(trialOffer));
             if ( ! next ) failure = new Error(errorCopy('unavailable'));
         } catch (error) { failure = error; }
         finally { busy = false; }
@@ -339,7 +357,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
             return;
         }
         // Not this person's to start (or already starting): back to Billing, which re-reads the offer.
-        if ( failure?.code === 'trial_unavailable' || failure?.code === 'trial_checkout_complete' ) show(failure.message, 'Back to Billing', returnToBilling, 'return-to-billing');
+        if ( TRIAL_ERRORS.has(failure?.code) && failure.code !== 'trial_quote_stale' ) show(failure.message, 'Back to Billing', returnToBilling, 'return-to-billing');
         else show(failure?.message || errorCopy('unavailable'), 'Retry', () => { void requote(changed); });
     }
     function showConfirmation (timeout = false) {
@@ -526,7 +544,7 @@ export function openUpgradeSheet ({ container, sku, offer, pack, sizes, trpc, on
             // A quoted top-up sends exactly what was quoted (a preset or a custom amount, pinned to its total); a trial
             // echoes exactly the end it disclosed.
             session = unwrap(await trpc.mutate(pack ? 'billing.createTopupCheckout' : 'billing.createCheckout',
-                pack?.checkout ?? (trialMode ? { sku, trial: { trialEndsAt: quote.trialEndsAt } } : { sku })));
+                pack?.checkout ?? (trialMode ? { sku, trial: { trialEndsAt: quote.trialEndsAt, ...(quote.offer ? { offer: quote.offer } : {}) } } : { sku })));
             if ( closed ) return;
             if ( pack ) session = { ...session, mode: 'embedded' };
             if ( session.mode === 'redirect' ) {

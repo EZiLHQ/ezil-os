@@ -58,6 +58,7 @@ const css = fs.readFileSync(path.join(OS, 'bundle.min.css'), 'utf8');
 
 // The month-end quote: 31 Jan 2027 03:00 UTC + one calendar month = 28 Feb 2027 03:00 UTC (= 27 Feb in Los Angeles).
 const END = '2027-02-28T03:00:00Z';
+const FP = 'a'.repeat(64);   // the server's offer fingerprint on the activation quote
 const PRIMARY = { offer: 'Start your free month', ineligible: 'Upgrade to Standard', trialing: null, ending: 'Resume plan', payment_pending: null,
     payment_failed: 'Update payment method' };
 
@@ -142,13 +143,13 @@ try {
         await page.setContent(page_html(Math.min(760, viewport.width), 560));
         await page.addScriptTag({ content: renderers });
         const offer = trialSummaryV3('offer').catalog.offers.find(item => item.sku === 'standard_monthly_v3');
-        const t = await page.evaluate(async ({ offer, END }) => {
+        const t = await page.evaluate(async ({ offer, END, FP }) => {
             window.calls = [];
             const trpc = {
                 mutate: async (method, input) => {
                     window.calls.push({ method, input });
                     if ( method === 'billing.quoteTrial' ) return { ok: true, data: { sku: 'standard_monthly_v3', todayCents: 0, trialEndsAt: END, firstChargeAt: END,
-                        amountCents: 2000, currency: 'usd', interval: 'month', quoteExpiresAt: '2027-01-31T03:30:00Z' } };
+                        amountCents: 2000, currency: 'usd', interval: 'month', quoteExpiresAt: '2027-01-31T03:30:00Z', offer: { coupon: null, fingerprint: FP } } };
                     return { ok: true, data: { mode: 'embedded', sessionId: 'cs_test_trial', clientSecret: 'secret', publishableKey: 'pk_test' } };
                 },
                 query: async () => ({ ok: true, data: { status: 'open', paymentStatus: null } }),
@@ -156,6 +157,7 @@ try {
             const loadStripe = async () => ({ initEmbeddedCheckout: async () => ({ mount: selector => {
                 const frame = document.createElement('div'); frame.style.height = '320px'; frame.textContent = 'Secure payment form (fake)';
                 frame.dataset.role = 'fake-stripe'; document.querySelector(selector).append(frame); }, destroy: () => {} }) });
+            window.calls.length = 0;   // the calls below are only those made by the one explicit activation
             window.trial.openUpgradeSheet({ container: document.querySelector('.window-body'), sku: offer.sku, offer, trpc, trial: true, loadStripe });
             for ( let i = 0; i < 20; i++ ) await Promise.resolve();
             await new Promise(resolve => setTimeout(resolve, 50));
@@ -167,12 +169,14 @@ try {
                 cancel: dialog.querySelector('[data-role="trial-cancel-by"]')?.textContent ?? null,
                 inside: rect.left >= -0.5 && rect.right <= innerWidth + 0.5, overflow: dialog.scrollWidth - dialog.clientWidth,
                 continueCount: dialog.querySelectorAll('[data-action="trial-continue"]').length,
+                quotes: window.calls.filter(call => call.method === 'billing.quoteTrial').length,
                 checkouts: window.calls.filter(call => call.method === 'billing.createCheckout').map(call => call.input),
                 mounted: !!dialog.querySelector('[data-role="fake-stripe"]'),
             };
-        }, { offer, END });
-        push(`${label} · one activation: Checkout mounts without Continue`, t.mounted && t.continueCount === 0, JSON.stringify(t));
-        push(`${label} · quote: the exact end is echoed once`, JSON.stringify(t.checkouts) === JSON.stringify([{ sku: 'standard_monthly_v3', trial: { trialEndsAt: END } }]), JSON.stringify(t.checkouts));
+        }, { offer, END, FP });
+        push(`${label} · one activation: one quote, then Checkout mounts without Continue`, t.quotes === 1 && t.checkouts.length === 1 && t.mounted && t.continueCount === 0, JSON.stringify(t));
+        push(`${label} · quote: the exact end and the quote's own offer are echoed once`,
+            JSON.stringify(t.checkouts) === JSON.stringify([{ sku: 'standard_monthly_v3', trial: { trialEndsAt: END, offer: { coupon: null, fingerprint: FP } } }]), JSON.stringify(t.checkouts));
         push(`${label} · terms: $20/month from the browser's date`, t.then === 'Then $20.00/month from Feb 27, 2027 · USD · before applicable tax', t.then);
         push(`${label} · terms: card required, renewal and cancellation remain visible`, /A payment method is required/.test(t.charge) && /charged monthly/.test(t.charge) && /Cancel before Feb 27, 2027/.test(t.cancel), `${t.charge} | ${t.cancel}`);
         push(`${label} · layout: sheet inside viewport without horizontal overflow`, t.inside && t.overflow <= 0, JSON.stringify(t));

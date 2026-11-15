@@ -166,7 +166,7 @@ describe('round 5 D1: the bridge confirms an unconfirmed Supabase email that Aut
         stub.listUsers.mockResolvedValue({ data: { users: [{ ...user, email_confirmed_at: null }] }, error: null });
         if (failure === 'error') stub.updateUserById.mockResolvedValue({ data: { user: null }, error: { message: 'private provider detail' } });
         else stub.updateUserById.mockRejectedValue(new Error('private provider detail'));
-        await expect(bridgeAuth0Identity(identity)).resolves.toBeUndefined();
+        await expect(bridgeAuth0Identity(identity)).resolves.toEqual({ userId: user.id });
         expect(stub.enroll).toHaveBeenCalledOnce();
         expect(stub.verifyOtp).toHaveBeenCalledOnce();
         expect(warn.mock.calls).toEqual([['[auth0] email confirmation unavailable']]);

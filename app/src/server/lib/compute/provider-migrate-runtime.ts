@@ -148,10 +148,11 @@ export function createMigrationRuntime(db: PlacementDb, options: {
             return ready;
         },
         async flip(m) {
-            const current = (await store.readById(m.id))!, p = provisionFor(current)?.placement;
+            const current = (await store.readById(m.id))!, intent = provisionFor(current), p = intent?.placement;
             if (!p?.instanceId || !p.volumeId || !p.fsUuid) throw new MigrationStepError(false);
             await flipPlacementToAws(db, { computerId: m.computerId, ownerUserId: m.userId, migrationId: m.id,
-                pendingReady: true, fields: { ...p, lastError: `migration_pending:${m.id}`, region: 'ap-south-1', instanceId: p.instanceId, volumeId: p.volumeId, fsUuid: p.fsUuid } });
+                pendingReady: true, fields: { ...p, lastError: `migration_pending:${m.id}`, region: 'ap-south-1', instanceId: p.instanceId, volumeId: p.volumeId, fsUuid: p.fsUuid },
+                ...(intent?.lowerAttestation ? { lowerAttestation: intent.lowerAttestation } : {}) });
         },
         async rollback(m) {
             const intent = provisionFor(m);

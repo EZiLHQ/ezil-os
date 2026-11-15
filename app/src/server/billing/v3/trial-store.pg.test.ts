@@ -55,7 +55,7 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('Standard trial store wi
         const facts = await store.trialFacts(userId);
         const terms = trialTerms(now);
         return store.claimTrialQuote({ userId, authSubject: facts.authSubject, emailNormalized: facts.emailNormalized!,
-            quotedAt: terms.quotedAt, trialEnd: terms.trialEnd, returnOrigin: 'https://os-staging.ezil.work' });
+            quotedAt: terms.quotedAt, trialEnd: terms.trialEnd, returnOrigin: 'https://os-staging.ezil.work', mode: { kind: 'public' } });
     }
     async function start(userId: string, subscriptionId = `sub_${randomUUID().replace(/-/g, '')}`) {
         const facts = await store.trialFacts(userId);

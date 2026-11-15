@@ -23,7 +23,11 @@ import { deriveStanding, neverPaidTrial, operatorAccessFor } from '@/server/bill
 import {
     hasTrials, quoteFresh, TRIAL_CHECKOUT_TTL_SECONDS, TRIAL_SKU, trialEligibility, trialTerms, type SponsorQuoteInput, type TrialFacts, type TrialStore,
 } from '@/server/billing/v3/trial';
-import { authorizeSponsorQuote } from '@/server/billing/v3/sponsor';
+import { selectTrialAuthority, type LegacyRegistryState, type PendingSponsorLink, type TrialAuthority, type TrialAuthorityRefusal,
+    type TrialAuthorityResult } from '@/server/billing/v3/trial-authority';
+import type { TrialPriceRead } from '@/server/billing/v3/trial-campaigns';
+import { SPONSOR_BILLING_COOKIE, sponsorBillingCookie, verifySponsorBillingContext } from '@/server/auth/sponsor-billing-context';
+import { ownedPublicOrigin } from '@/utils/forwarded';
 import { buildUsageV3 } from '@/server/billing/v3/usage';
 import type { BillingSummaryV3, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
 import {
@@ -113,9 +117,14 @@ async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: stri
     return { plan, subscriptionId };
 }
 
-/** Trial refusals carry their own codes (the shell maps `trial_unavailable` / `trial_quote_stale` / `trial_checkout_complete`). */
-function trialError(code: 'trial_unavailable' | 'trial_quote_stale' | 'trial_checkout_complete'): TRPCError {
-    return new TRPCError({ code: code === 'trial_unavailable' ? 'PRECONDITION_FAILED' : 'CONFLICT', message: code });
+/**
+ * Trial refusals carry their own codes (the shell maps `trial_unavailable` / `trial_quote_stale` / `trial_checkout_complete`,
+ * and for campaign offers `trial_offer_invalid` (malformed or unknown coupon) / `trial_offer_unavailable` (disabled, expired,
+ * public offer off, or bad Stripe terms)).
+ */
+function trialError(code: 'trial_checkout_complete' | TrialAuthorityRefusal): TRPCError {
+    return new TRPCError({ code: code === 'trial_offer_invalid' ? 'BAD_REQUEST'
+        : code === 'trial_unavailable' || code === 'trial_offer_unavailable' ? 'PRECONDITION_FAILED' : 'CONFLICT', message: code });
 }
 
 /**
@@ -133,6 +142,66 @@ async function trialCheckoutCall<T>(call: () => Promise<T>): Promise<T> {
     }
 }
 
+/** The request's carried legacy context: none, verified claims, or a PRESENT cookie that does not verify for this user and origin. */
+function carriedSponsorContext(headers: Headers, userId: string, now: Date): { kind: 'none' } | { kind: 'invalid' } | { kind: 'verified'; context: NonNullable<ReturnType<typeof verifySponsorBillingContext>> } {
+    const value = sponsorBillingCookie(headers.get('cookie'));
+    if (value === undefined) return { kind: 'none' };
+    const context = verifySponsorBillingContext(process.env.SPONSOR_KEY, value, { origin: ownedPublicOrigin(headers, 'https://os.ezil.org'), userId, now });
+    return context ? { kind: 'verified', context } : { kind: 'invalid' };
+}
+
+/** The pending quote this viewer owns (quoted/checkout) and its persisted sponsor link, readiness-safe (null when the schema is not applied). */
+async function pendingSponsorLink(store: TrialStore, facts: TrialFacts): Promise<PendingSponsorLink | null> {
+    const own = facts.own;
+    if (!own || !['quoted', 'checkout'].includes(own.status) || !store.sponsorLinkageFor) return null;
+    return store.sponsorLinkageFor(own.id);
+}
+
+/**
+ * The ONE trial authority decision (v3/trial-authority.ts) for the summary, `trialOffer`, `quoteTrial` and `createCheckout`, from server
+ * facts plus the client's untrusted `alias`: a fresh bounded Stripe read, the signed legacy registry as configured, the carried legacy
+ * context (verified for this user and origin; a present but invalid one fails THIS request closed, never a public/promoter fallback) and the
+ * caller's pending quote link. The historical attribution row is not read. No reader or a failed read refuses `stripe_unavailable`.
+ */
+async function trialAuthorityNow(deps: BillingDeps, stripe: StripeApi, input: { userId: string; alias: string | null; facts: TrialFacts; headers: Headers;
+    timeoutMs?: number }): Promise<{ result: TrialAuthorityResult; pendingLink: PendingSponsorLink | null }> {
+    const now = deps.now();
+    const carried = carriedSponsorContext(input.headers, input.userId, now);
+    if (carried.kind === 'invalid') return { result: { ok: false, code: 'trial_offer_unavailable' }, pendingLink: null };
+    let read: TrialPriceRead & { livemodeMatches?: boolean };
+    try { read = await readTrialCampaignsBounded(stripe, input.timeoutMs ?? TRIAL_READ_TIMEOUT_MS); } catch { throw billingError('stripe_unavailable', 'INTERNAL_SERVER_ERROR'); }
+    const runtime = deps.sponsor;
+    const legacy: LegacyRegistryState = runtime?.legacy ?? (runtime?.enabled ? { state: 'verified', registry: runtime.registry } : { state: 'absent' });
+    const pendingLink = hasTrials(deps.store) ? await pendingSponsorLink(deps.store, input.facts) : null;
+    return { pendingLink, result: selectTrialAuthority({ alias: input.alias, pendingLink, legacyContext: carried.kind === 'verified' ? carried.context : null,
+        legacy, legacyEnabled: runtime?.enabled === true, read, livemodeMatches: read.livemodeMatches === true, now }) };
+}
+
+/** The offer as the client sees it: the alias it asked for (or null), the non-secret retry binding, and which authority answered. */
+function offerView(authority: TrialAuthority) {
+    return { coupon: authority.offer.coupon, fingerprint: authority.offer.fingerprint, source: authority.source };
+}
+
+/** The query, quote and checkout bound; the summary's own (public-only, optional) read is tighter. */
+const TRIAL_READ_TIMEOUT_MS = 5_000;
+const SUMMARY_TRIAL_READ_TIMEOUT_MS = 750;
+/**
+ * One campaigns read, bounded: the request is aborted at the deadline, and the race settles at the deadline even if a
+ * reader ignores the signal. No reader rejects (fail closed).
+ */
+async function readTrialCampaignsBounded(stripe: StripeApi, timeoutMs: number): Promise<TrialPriceRead & { livemodeMatches?: boolean }> {
+    if (!stripe.readTrialCampaigns) throw new Error('trial_reader_missing');
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+        return await Promise.race([stripe.readTrialCampaigns(controller.signal), new Promise<never>((_, reject) => {
+            timer = setTimeout(() => { controller.abort(); reject(new Error('trial_reader_timeout')); }, timeoutMs);
+        })]);
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
 /** The viewer's trial eligibility from server facts only (auth.users, trial rows, paid history, plan, operator grant). */
 async function trialEligibilityFor(store: TrialStore, deps: BillingDeps, userId: string, planFamily: string): Promise<{ facts: TrialFacts;
     decision: ReturnType<typeof trialEligibility> }> {
@@ -141,35 +210,24 @@ async function trialEligibilityFor(store: TrialStore, deps: BillingDeps, userId:
 }
 
 /**
- * The sponsor entry this viewer may use right now, from SERVER facts only: the sponsor runtime is on, the account holds an attribution row (written by the
- * authenticated sponsor handoff, never by a URL or client field), and that campaign is still in the signed registry, enabled and in its window. Runtime off
- * = no store read at all (legacy/off issues no sponsor SQL); the store reads answer "none" when the schema is not applied (a probe, never a caught error).
+ * The summary's trial field: the offer the shared trial authority gives this viewer with NO alias (a promoter link's offer is
+ * `billing.trialOffer`): a carried verified sponsor context or the viewer's pending sponsor quote (`source: 'sponsor'`), else the public offer
+ * under both public controls. The historical attribution row is analytics and never selects it. A paid or ineligible viewer keeps its reason
+ * without any Stripe call. Otherwise a fresh, 750 ms-bounded read decides; refused, bad terms or a provider outage answer null, and never fail
+ * the rest of the summary.
  */
-async function sponsorEntryFor(store: TrialStore, deps: BillingDeps, userId: string): Promise<{ input: SponsorQuoteInput } | null> {
-    const runtime = deps.sponsor;
-    if (!runtime?.enabled || !store.sponsorAttributionFor) return null;
-    const accountKey = runtime.accountKey(userId);
-    if (!accountKey) return null;
-    const attribution = await store.sponsorAttributionFor(accountKey);
-    if (!attribution) return null;
-    const decision = authorizeSponsorQuote({ enabled: true, registry: runtime.registry, campaignId: attribution.campaignId, configSha256: null, now: deps.now() });
-    return decision.ok ? { input: { accountKey, campaignId: decision.campaign.campaignId, partnerId: decision.campaign.partnerId, configSha256: decision.campaign.configSha256 } } : null;
-}
-/** Stripe Product metadata is authoritative; the legacy environment flag never overrides it. */
-async function publicTrialOpen(deps: BillingDeps): Promise<boolean> {
-    return deps.stripe?.publicStandardTrialEnabled ? deps.stripe.publicStandardTrialEnabled() : false;
-}
-
-async function trialOfferFor(deps: BillingDeps, userId: string, planFamily: string): Promise<BillingSummaryV3['trialOffer']> {
-    if (!hasTrials(deps.store)) return undefined;
+async function trialOfferFor(deps: BillingDeps, userId: string, planFamily: string, headers: Headers): Promise<BillingSummaryV3['trialOffer']> {
+    if (!hasTrials(deps.store) || planFamily !== 'free') return undefined;
     try {
-        // A validated account attribution wins even while the public Product switch is off or unreadable.
-        const sponsor = await sponsorEntryFor(deps.store, deps, userId);
-        if (!sponsor && planFamily !== 'free') return undefined;
-        if (!sponsor && !await publicTrialOpen(deps)) return undefined;
-        const selection = sponsor ? { source: 'sponsor' as const, partnerId: sponsor.input.partnerId } : { source: 'public' as const };
-        const { decision } = await trialEligibilityFor(deps.store, deps, userId, planFamily);
-        if (!decision.eligible) return { eligible: false, reason: decision.reason, ...selection };
+        const { facts, decision } = await trialEligibilityFor(deps.store, deps, userId, planFamily);
+        if (!decision.eligible) return { eligible: false, reason: decision.reason };
+        if (!deps.stripe || !checkoutAvailable(deps.config)) return null;
+        let decided: TrialAuthorityResult;
+        try { decided = (await trialAuthorityNow(deps, deps.stripe, { userId, alias: null, facts, headers, timeoutMs: SUMMARY_TRIAL_READ_TIMEOUT_MS })).result; }
+        catch { return null; }
+        if (!decided.ok) return null;
+        const authority = decided.authority;
+        const selection = authority.source === 'sponsor' ? { source: 'sponsor' as const, partnerId: authority.campaign.partnerId } : { source: 'public' as const };
         const terms = trialTerms(deps.now());
         return { eligible: true, sku: TRIAL_SKU, endsAt: isoSeconds(epochSeconds(terms.trialEnd)), amountCents: terms.amountCents, currency: 'usd', ...selection };
     } catch {
@@ -613,7 +671,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 enrollment: { state: enrollmentState, ezilIdUrl },
                 ...(reverseMove ? { reverseMove } : {}),
                 operatorGrants,
-                trialOffer: await trialOfferFor(deps, ctx.user.id, plan.family),
+                trialOffer: await trialOfferFor(deps, ctx.user.id, plan.family, ctx.headers),
             });
             // Round 3: low/exhausted against this period's plan credits (summary.ts aiCreditBuckets), not the catalog total.
             ai.balanceState = summary.ai.state;
@@ -662,7 +720,27 @@ export function createBillingRouter(getDeps: () => BillingDeps,
          * Standard trial: claim this person's trial and fix the exact end (the first $20 charge) that the confirmation
          * discloses. Eligibility is decided here from server facts; the client only echoes the end back to checkout.
          */
-        quoteTrial: protectedProcedure.input(z.object({}).strict().optional()).mutation(async ({ ctx }) => {
+        /**
+         * The Stripe-controlled trial offer for an optional coupon, read-only: the same fresh verifier as quoteTrial, but no
+         * claim, no retire, no store write, no customer and no grant. Combine with the summary's own trial eligibility.
+         */
+        trialOffer: protectedProcedure.input(z.object({ coupon: z.string().max(64).optional() }).strict().optional()).query(async ({ ctx, input }) => {
+            const deps = getDeps();
+            const stripe = configuredStripe(deps);
+            // This person first (read-only: plan, trial facts, identity, operator grant), then the fresh provider offer.
+            const store = deps.store;
+            if (!hasTrials(store)) throw trialError('trial_unavailable');
+            const { plan } = await currentPlan(deps, ctx.user.id);
+            const { facts, decision } = await trialEligibilityFor(store, deps, ctx.user.id, plan.family);
+            if (!decision.eligible || facts.emailNormalized === null) throw trialError('trial_unavailable');
+            const { result } = await trialAuthorityNow(deps, stripe, { userId: ctx.user.id, alias: input?.coupon ?? null, facts, headers: ctx.headers });
+            if (!result.ok) throw trialError(result.code);
+            // A selection that would retarget an ACTIVE pending quote is not available here (quoteTrial would refuse it as stale).
+            if (result.pending === 'different' && !result.releasePending) throw trialError('trial_quote_stale');
+            return { available: true as const, eligible: true as const, offer: offerView(result.authority) };
+        }),
+
+        quoteTrial: protectedProcedure.input(z.object({ coupon: z.string().max(64).optional() }).strict().optional()).mutation(async ({ ctx, input }) => {
             const deps = getDeps();
             const stripe = configuredStripe(deps);
             const store = deps.store;
@@ -670,24 +748,45 @@ export function createBillingRouter(getDeps: () => BillingDeps,
             const { plan } = await currentPlan(deps, ctx.user.id);
             const { facts, decision } = await trialEligibilityFor(store, deps, ctx.user.id, plan.family);
             if (!decision.eligible || facts.emailNormalized === null) throw trialError('trial_unavailable');
-            const sponsor = await sponsorEntryFor(store, deps, ctx.user.id);
-            if (!sponsor && !await stripeCall(() => publicTrialOpen(deps))) throw trialError('trial_unavailable');
+            // The shared trial authority, resolved before anything is claimed or retired: refused or unavailable stops here.
+            const { result, pendingLink } = await trialAuthorityNow(deps, stripe, { userId: ctx.user.id, alias: input?.coupon ?? null, facts, headers: ctx.headers });
+            if (!result.ok) throw trialError(result.code);
+            // Never silently retarget a pending quote: only a link a verified registry proved inactive may give way (re-checked by the store).
+            if (result.pending === 'different' && !result.releasePending) throw trialError('trial_quote_stale');
+            const authority = result.authority;
+            // The server-derived quote mode: a legacy campaign quote (attribution + linkage, unchanged), or a product/public quote that writes no
+            // sponsor data (the store re-reads the current linkage under its lock).
+            let mode: NonNullable<Parameters<TrialStore['claimTrialQuote']>[0]['mode']>;
+            if (authority.source === 'sponsor') {
+                const accountKey = deps.sponsor?.accountKey(ctx.user.id) ?? null;
+                if (!accountKey) throw trialError('trial_offer_unavailable');
+                mode = { kind: 'legacy', sponsor: { accountKey, campaignId: authority.campaign.campaignId, partnerId: authority.campaign.partnerId,
+                    configSha256: authority.campaign.configSha256 } };
+            } else {
+                mode = { kind: authority.source === 'promoter' ? 'product' : 'public',
+                    ...(result.releasePending && pendingLink && facts.own ? { releaseInactiveLink: { campaignId: pendingLink.campaignId,
+                        configSha256: pendingLink.configSha256, quotedAt: facts.own.quotedAt } } : {}) };
+            }
             if (facts.own?.status === 'checkout') await retireTrialCheckout(stripe, facts.own.checkoutSessionId);
             const terms = trialTerms(deps.now());
             const claim = await store.claimTrialQuote({ userId: ctx.user.id, authSubject: facts.authSubject,
                 emailNormalized: facts.emailNormalized, quotedAt: terms.quotedAt, trialEnd: terms.trialEnd,
-                returnOrigin: billingReturnOrigin(ctx.headers),
-                // A sponsor quote carries its campaign; a public quote asks the store to release an unclaimed linkage (the store probes the schema first, so an
-                // unapplied schema issues no sponsor SQL).
-                ...(sponsor ? { sponsor: sponsor.input } : { publicSponsorMode: 'release' as const }) });
-            if (claim.status === 'refused') throw trialError('trial_unavailable');
+                returnOrigin: billingReturnOrigin(ctx.headers), mode });
+            // sponsor_pending: the pending link changed or is still active under the lock (left intact). Every other refusal is Stage's
+            // (trial used; the account's first accepted campaign is another one; sponsor schema unavailable).
+            if (claim.status === 'refused') throw trialError(claim.reason === 'sponsor_pending' ? 'trial_quote_stale' : 'trial_unavailable');
             return { sku: TRIAL_SKU, todayCents: 0, trialEndsAt: isoSeconds(epochSeconds(claim.trial.trialEnd)),
                 firstChargeAt: isoSeconds(epochSeconds(claim.trial.trialEnd)), amountCents: terms.amountCents, currency: 'usd' as const,
-                interval: 'month' as const, quoteExpiresAt: isoSeconds(epochSeconds(claim.trial.quotedAt) + 30 * 60) };
+                interval: 'month' as const, quoteExpiresAt: isoSeconds(epochSeconds(claim.trial.quotedAt) + 30 * 60),
+                offer: offerView(authority) };
         }),
 
         createCheckout: protectedProcedure.input(z.object({ sku: z.enum(['standard_monthly_v3', 'premium_monthly_v3']),
-            trial: z.object({ trialEndsAt: z.string().datetime({ offset: true }) }).strict().optional() })).mutation(async ({ ctx, input }): Promise<CheckoutStartDTO> => {
+            trial: z.object({ trialEndsAt: z.string().datetime({ offset: true }),
+                // `source` may be echoed from the quote; the authority is always recomputed, so it is ignored.
+                offer: z.object({ coupon: z.string().max(64).nullable(), fingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+                    source: z.enum(['public', 'promoter', 'sponsor']).optional() }).strict().optional(),
+            }).strict().optional() })).mutation(async ({ ctx, input }): Promise<CheckoutStartDTO> => {
             const deps = getDeps();
             const stripe = configuredStripe(deps);
             const { plan } = await currentPlan(deps, ctx.user.id);
@@ -698,7 +797,7 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 throw billingError('already_subscribed', 'CONFLICT');
             }
             // Standard trial: only the caller's own fresh stored quote, re-checked now, with the end they were shown.
-            let trial: { row: NonNullable<TrialFacts['own']>; store: TrialStore } | null = null;
+            let trial: { row: NonNullable<TrialFacts['own']>; store: TrialStore; authority: TrialAuthority } | null = null;
             let sponsorTerms: { campaignId: string; configSha256: string } | null = null;
             if (input.trial) {
                 const store = deps.store;
@@ -706,28 +805,23 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 const { facts, decision } = await trialEligibilityFor(store, deps, ctx.user.id, plan.family);
                 if (!decision.eligible) throw trialError('trial_unavailable');
                 const row = facts.own;
-                // The PERSISTED linkage, never the client and never the runtime flag, classifies the quote: the lookup is readiness-safe (null when the schema is not
-                // applied, so a legacy public flow reads nothing). A linked quote may only continue as the SAME sponsor quote: runtime on, campaign enabled and in its
-                // window, same frozen config. Off, disabled, expired or a changed config REFUSES: it never silently becomes a public checkout (that would drop the
-                // metadata under the same Stripe idempotency key and bind unclaimed). The person starts over with an explicit public re-quote, which releases the
-                // unclaimed linkage atomically. An unlinked quote needs the public trial open.
-                const linkage = row && store.sponsorLinkageFor ? await store.sponsorLinkageFor(row.id) : null;
-                if (linkage) {
-                    const authorized = authorizeSponsorQuote({ enabled: deps.sponsor?.enabled === true, registry: deps.sponsor?.registry ?? new Map(), campaignId: linkage.campaignId,
-                        configSha256: linkage.configSha256, now: deps.now() });
-                    if (!authorized.ok) throw trialError(authorized.reason === 'config_changed' ? 'trial_quote_stale' : 'trial_unavailable');
-                    sponsorTerms = { campaignId: linkage.campaignId, configSha256: linkage.configSha256 };
-                } else {
-                    // A newly selected promoter cannot be silently ignored under an older public quote's
-                    // Stripe idempotency key. Re-quote once to persist its authoritative sponsor linkage.
-                    if (await sponsorEntryFor(store, deps, ctx.user.id)) throw trialError('trial_quote_stale');
-                    if (!await stripeCall(() => publicTrialOpen(deps))) throw trialError('trial_unavailable');
-                }
                 if (!row || !['quoted', 'checkout'].includes(row.status) || !quoteFresh(row, deps.now())
                     || epochSeconds(row.trialEnd) !== epochSeconds(input.trial.trialEndsAt)
                     // The quote must still claim the caller's CURRENT verified identity; a re-quote moves the claim.
                     || row.authSubject !== facts.authSubject || row.emailNormalized !== facts.emailNormalized) throw trialError('trial_quote_stale');
-                trial = { row, store };
+                // The same shared authority as the quote, against a fresh read. The PERSISTED linkage (readiness-safe: null when the schema is not
+                // applied) classifies the quote: a linked quote continues only as that SAME legacy campaign (exact Stage metadata, compared again at
+                // bind); a public/promoter echo against it is stale, and an off/revoked/expired one needs an explicit re-quote. A legacy selection
+                // without its link is stale. Changed terms (price, product, public state, coupon, expiry, campaign config) are stale.
+                const { result, pendingLink } = await trialAuthorityNow(deps, stripe, { userId: ctx.user.id, alias: input.trial.offer?.coupon ?? null, facts, headers: ctx.headers });
+                if (!result.ok) throw trialError(result.code);
+                const authority = result.authority;
+                if (pendingLink) {
+                    if (authority.source !== 'sponsor' || result.pending !== 'same') throw trialError('trial_quote_stale');
+                    sponsorTerms = { campaignId: pendingLink.campaignId, configSha256: pendingLink.configSha256 };
+                } else if (authority.source === 'sponsor') throw trialError('trial_quote_stale');
+                if (input.trial.offer && input.trial.offer.fingerprint !== authority.offer.fingerprint) throw trialError('trial_quote_stale');
+                trial = { row, store, authority };
             }
 
             let customerId = await deps.store.stripeCustomerFor(ctx.user.id);
@@ -762,6 +856,9 @@ export function createBillingRouter(getDeps: () => BillingDeps,
                 ...(trial ? { trial: { trialId: trial.row.id, trialEnd: trial.row.trialEnd,
                     // Stripe idempotency compares every parameter: retries use the persisted quote's expiry too.
                     expiresAt: new Date((epochSeconds(trial.row.quotedAt) + TRIAL_CHECKOUT_TTL_SECONDS) * 1000),
+                    // The verified price for every source; legacy metadata only for a linked legacy quote, the offer's otherwise (never both).
+                    offer: { coupon: trial.authority.offer.coupon, fingerprint: trial.authority.offer.fingerprint, priceId: trial.authority.offer.priceId,
+                        source: trial.authority.source },
                     ...(sponsorTerms ? { sponsor: sponsorTerms } : {}) } } : {}),
             }));
             if (trial) {

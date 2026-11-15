@@ -209,14 +209,19 @@ export interface TrialStore {
      * checkout session, if any, so the caller can expire it.
      */
     claimTrialQuote(input: { userId: string; authSubject: string; emailNormalized: string; quotedAt: Date; trialEnd: Date; returnOrigin: string;
-        /** Sponsor entry to the SAME trial (v3/sponsor.ts has already authorized the campaign). Absent = the public trial, and any existing sponsor linkage is kept. */
-        sponsor?: SponsorQuoteInput;
         /**
-         * Set ONLY when the sponsor runtime is on and the request is a PUBLIC quote: 'keep' follows an existing unclaimed linkage to the new quote time,
-         * 'release' drops it (its campaign is no longer active). Absent = legacy/off: no sponsor SQL of any kind is issued.
+         * The server-derived trial authority mode (v3/trial-authority.ts), required and exclusive.
+         *  - `legacy`: sponsor entry to the SAME trial (v3/sponsor.ts has already authorized the campaign): the account's first accepted campaign
+         *    wins (another one refuses `sponsor_conflict`), and the campaign is frozen on this quote (a claimed or other-campaign linkage refuses).
+         *  - `product`/`public`: no attribution, statistics or linkage is written. Under the lock the current linkage is re-read; any linkage
+         *    refuses `sponsor_pending` (left intact) unless `releaseInactiveLink` names exactly that UNCLAIMED linkage (campaign, config, quote
+         *    time) that a verified registry proved off/revoked/expired; it is then deleted only together with a successful quote update.
+         * With the sponsor schema not applied no sponsor SQL of any kind is issued (a legacy quote then refuses `sponsor_unavailable`).
          */
-        publicSponsorMode?: 'keep' | 'release' }):
-        Promise<{ status: 'quoted'; trial: TrialRow; supersededCheckoutSessionId: string | null } | { status: 'refused'; reason: 'trial_used' | 'sponsor_conflict' | 'sponsor_unavailable' }>;
+        mode: { kind: 'legacy'; sponsor: SponsorQuoteInput }
+            | { kind: 'product' | 'public'; releaseInactiveLink?: { campaignId: string; configSha256: string; quotedAt: Date } } }):
+        Promise<{ status: 'quoted'; trial: TrialRow; supersededCheckoutSessionId: string | null }
+            | { status: 'refused'; reason: 'trial_used' | 'sponsor_conflict' | 'sponsor_unavailable' | 'sponsor_pending' }>;
     /** Record the checkout opened for exactly this quote (CAS on quoted_at); 'stale' when the quote changed or bound. */
     attachTrialCheckout(input: { trialId: string; userId: string; quotedAt: Date; checkoutSessionId: string; customerId: string }):
         Promise<'attached' | 'stale'>;

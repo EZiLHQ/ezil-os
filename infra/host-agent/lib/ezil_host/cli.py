@@ -169,6 +169,9 @@ def main(argv=None):
     cfg = config.load()
     cmd = argv[0]
     try:
+        if cmd == "attest-lower":
+            from . import attest
+            return attest.main(cfg, argv[1:])  # read-only clone measurement; no lease or enrollment
         if cmd == "canary-desktop-started":
             canary.desktop_started(cfg)       # ExecStartPost; no lease or enrollment read
             return 0

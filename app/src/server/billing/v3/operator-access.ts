@@ -27,9 +27,36 @@ export interface OperatorEntitlementRow {
     endsAt: Date | null;
     /** Set by an `end` command (revoked early); null while not ended by an operator. */
     endedAt: Date | null;
+    /** The issuing organization's name shown on the plan card (0023); null/absent = EZiL (every pre-0023 row). */
+    issuedBy?: string | null;
 }
 
 export const isOperatorSku = (sku: string): sku is OperatorSku => (OPERATOR_SKUS as readonly string[]).includes(sku);
+
+/** The organization a grant without its own issuing-organization name is shown as assigned by. */
+export const DEFAULT_ISSUED_BY = 'EZiL';
+export const ISSUED_BY_MAX = 80;
+// Control (C0 except NUL, DEL, C1), Arabic letter mark, zero-width, line/paragraph separator, bidi embedding/override/
+// isolate and BOM characters. NUL is not listed: a Postgres text value cannot hold it, and the CHECK's range starts at U+0001.
+const ISSUED_BY_UNSAFE = /[\u0001-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/;
+const ISSUED_BY_NUL = /\u0000/;
+// A UTF-16 surrogate that is not half of a pair: not encodable as UTF-8, so it can never reach canonical JSON or JSONB.
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+
+/**
+ * An issuing-organization name as signed and stored: already trimmed, 1-80 code points, no control or invisible
+ * formatting character, no lone surrogate (the 0023 CHECK, which counts code points the same way). The Gateway trims
+ * before signing; this never trims, so stored = hashed.
+ */
+export const isIssuedBy = (v: unknown): v is string => {
+    if (typeof v !== 'string' || v.length < 1 || v.length > ISSUED_BY_MAX * 2) return false;
+    if (ISSUED_BY_NUL.test(v) || ISSUED_BY_UNSAFE.test(v) || LONE_SURROGATE.test(v)) return false;
+    const points = Array.from(v).length;
+    return points >= 1 && points <= ISSUED_BY_MAX && v === v.trim();
+};
+
+/** What the plan card says assigned a grant: its stored name, or EZiL for none (legacy) or anything unreadable. */
+export const issuedByOf = (grant: Pick<OperatorEntitlementRow, 'issuedBy'>): string => isIssuedBy(grant.issuedBy) ? grant.issuedBy : DEFAULT_ISSUED_BY;
 
 /** The grant in effect at `now`: started, not past its end, not ended by an operator. Newest start wins. */
 export function operatorGrantInEffect(rows: readonly OperatorEntitlementRow[] | null | undefined, now: Date): OperatorEntitlementRow | null {

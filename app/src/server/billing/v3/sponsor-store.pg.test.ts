@@ -48,9 +48,11 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('sponsor entry to the St
         if (!keys.has(userId)) keys.set(userId, randomUUID());
         return { accountKey: keys.get(userId)!, campaignId, partnerId: `partner-${campaignId}`, configSha256 };
     };
-    const quote = (userId: string, email: string, over: { sponsor?: SponsorQuoteInput; at?: Date } = {}) => store.claimTrialQuote({
+    type Mode = Parameters<TrialStore['claimTrialQuote']>[0]['mode'];
+    const quote = (userId: string, email: string, over: { sponsor?: SponsorQuoteInput; mode?: Mode; at?: Date } = {}, target: TrialStore = store) => target.claimTrialQuote({
         userId, authSubject: `supabase:${userId}`, emailNormalized: email, quotedAt: over.at ?? quotedAt, trialEnd, returnOrigin: 'https://os-staging.ezil.work',
-        ...(over.sponsor ? { sponsor: over.sponsor } : {}) });
+        mode: over.sponsor ? { kind: 'legacy', sponsor: over.sponsor } : over.mode ?? { kind: 'public' } });
+    const sponsorRows = async () => (await client`select (select count(*)::int from public.ezil_sponsor_attributions) as a, (select count(*)::int from public.ezil_sponsor_trial_claims) as c`)[0]!;
     const trialOf = async (userId: string) => (await client`select id::text, status, stripe_subscription_id, quoted_at from public.ezil_billing_trials where user_id = ${userId}::uuid`)[0]!;
     const linkOf = async (trialId: string) => (await client`select campaign_id, config_sha256, claimed_at, stripe_subscription_id, quoted_at from public.ezil_sponsor_trial_claims where trial_id = ${trialId}::uuid`)[0];
     const bind = (trialId: string, userId: string, subscriptionId: string, meta: { campaignId: string; configSha256: string } | null) =>
@@ -89,33 +91,106 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('sponsor entry to the St
         expect((await client`select campaign_id from public.ezil_sponsor_attributions where account_key = ${keys.get(u)!}::uuid`)[0]!.campaign_id).toBe('test-campaign-a');
     });
 
-    it('a public re-quote never strips an existing sponsor linkage: legacy mode leaves it untouched, keep mode follows the new quote time', async () => {
-        const u = await account(`sp3.${run}@example.com`);
-        await quote(u, `sp3.${run}@example.com`, { sponsor: sponsor(u) });
-        const later = new Date(quotedAt.getTime() + 120_000);
-        // legacy/off (no mode) issues no sponsor SQL and leaves the linkage exactly as it was; 'keep' follows the new quote time
-        expect((await quote(u, `sp3.${run}@example.com`, { at: later })).status).toBe('quoted');
-        expect(new Date((await linkOf((await trialOf(u)).id))!.quoted_at as string).getTime()).toBe(quotedAt.getTime());
-        expect((await store.claimTrialQuote({ userId: u, authSubject: `supabase:${u}`, emailNormalized: `sp3.${run}@example.com`, quotedAt: later, trialEnd,
-            returnOrigin: 'https://os-staging.ezil.work', publicSponsorMode: 'keep' })).status).toBe('quoted');
-        const link = await linkOf((await trialOf(u)).id);
-        expect(link).toMatchObject({ campaign_id: 'test-campaign-a', claimed_at: null });
-        expect(new Date(link!.quoted_at as string).getTime()).toBe(later.getTime());
+    it('the mode is required and exclusive: a quote without one is refused before any SQL', async () => {
+        const u = await account(`nomode.${run}@example.com`);
+        await expect(store.claimTrialQuote({ userId: u, authSubject: `supabase:${u}`, emailNormalized: `nomode.${run}@example.com`, quotedAt, trialEnd,
+            returnOrigin: 'https://os-staging.ezil.work' } as never)).rejects.toThrow('requires a mode');
+        expect((await client`select count(*)::int as n from public.ezil_billing_trials where user_id = ${u}::uuid`)[0]!.n).toBe(0);
     });
 
-    it('an explicit public re-quote with release drops the UNCLAIMED linkage atomically, keeps the attribution, and the trial then binds as a plain public trial', async () => {
+    it('a Product quote for an account whose history names another campaign is allowed and writes no sponsor data; a legacy one is refused', async () => {
+        const u = await account(`hist.${run}@example.com`);
+        const key = sponsor(u, 'test-campaign-b').accountKey;
+        await client`insert into public.ezil_sponsor_attributions (account_key, campaign_id, partner_id, config_sha256) values (${key}::uuid, 'test-campaign-b', 'partner-test-campaign-b', ${HASH_A})`;
+        const before = await sponsorRows();
+        expect((await quote(u, `hist.${run}@example.com`, { mode: { kind: 'product' } })).status).toBe('quoted');
+        expect(await sponsorRows()).toEqual(before);                                    // no attribution, statistics or linkage write
+        expect(await linkOf((await trialOf(u)).id)).toBeUndefined();
+        const refused = await quote(u, `hist.${run}@example.com`, { sponsor: sponsor(u, 'test-campaign-a'), at: new Date(quotedAt.getTime() + 30_000) });
+        expect(refused).toEqual({ status: 'refused', reason: 'sponsor_conflict' });   // the immutable first touch stays authoritative for legacy
+        expect(new Date((await trialOf(u)).quoted_at as string).getTime()).toBe(quotedAt.getTime());   // rolled back: nothing moved
+        expect(await sponsorRows()).toEqual(before);
+    });
+
+    it('a Product/public re-quote never retargets a pending legacy link: active (no proof) or mismatched proof refuses, everything intact', async () => {
+        const u = await account(`pend.${run}@example.com`);
+        await quote(u, `pend.${run}@example.com`, { sponsor: sponsor(u) });
+        const trial = await trialOf(u);
+        const later = new Date(quotedAt.getTime() + 120_000);
+        const proof = { campaignId: 'test-campaign-a', configSha256: HASH_A, quotedAt };
+        for (const mode of [{ kind: 'product' as const }, { kind: 'public' as const }, { kind: 'product' as const, releaseInactiveLink: { ...proof, configSha256: HASH_B } },
+            { kind: 'public' as const, releaseInactiveLink: { ...proof, quotedAt: later } }, { kind: 'public' as const, releaseInactiveLink: { ...proof, campaignId: 'test-campaign-b' } }]) {
+            expect(await quote(u, `pend.${run}@example.com`, { mode, at: later })).toEqual({ status: 'refused', reason: 'sponsor_pending' });
+            expect(new Date((await trialOf(u)).quoted_at as string).getTime()).toBe(quotedAt.getTime());
+            expect(await linkOf(trial.id)).toMatchObject({ campaign_id: 'test-campaign-a', config_sha256: HASH_A, claimed_at: null });
+            expect(new Date((await linkOf(trial.id))!.quoted_at as string).getTime()).toBe(quotedAt.getTime());
+        }
+    });
+
+    it('an exact proven-inactive UNCLAIMED link is released only with a successful quote update; the attribution stays and the trial binds as public', async () => {
         const u = await account(`rel.${run}@example.com`);
         const s = sponsor(u);
         await quote(u, `rel.${run}@example.com`, { sponsor: s });
         const trial = await trialOf(u);
-        expect(await linkOf(trial.id)).toBeDefined();
         const later = new Date(quotedAt.getTime() + 180_000);
-        expect((await store.claimTrialQuote({ userId: u, authSubject: `supabase:${u}`, emailNormalized: `rel.${run}@example.com`, quotedAt: later, trialEnd,
-            returnOrigin: 'https://os-staging.ezil.work', publicSponsorMode: 'release' })).status).toBe('quoted');
+        expect((await quote(u, `rel.${run}@example.com`, { mode: { kind: 'public', releaseInactiveLink: { campaignId: 'test-campaign-a', configSha256: HASH_A, quotedAt } }, at: later })).status).toBe('quoted');
         expect(await linkOf(trial.id)).toBeUndefined();
+        expect(new Date((await trialOf(u)).quoted_at as string).getTime()).toBe(later.getTime());
         expect((await client`select count(*)::int as n from public.ezil_sponsor_attributions where account_key = ${s.accountKey}::uuid`)[0]!.n).toBe(1);
         expect(await bind(trial.id, u, `sub_rel${run}`, null)).toBe('bound');
-        expect((await client`select count(*)::int as n from public.ezil_sponsor_trial_claims where account_key = ${s.accountKey}::uuid and claimed_at is not null`)[0]!.n).toBe(0);
+        // A claimed link is never released, whatever the proof.
+        const v = await account(`relc.${run}@example.com`);
+        await quote(v, `relc.${run}@example.com`, { sponsor: sponsor(v) });
+        const claimed = await trialOf(v);
+        await bind(claimed.id, v, `sub_relc${run}`, { campaignId: 'test-campaign-a', configSha256: HASH_A });
+        expect((await quote(v, `relc.${run}@example.com`, { mode: { kind: 'public', releaseInactiveLink: { campaignId: 'test-campaign-a', configSha256: HASH_A, quotedAt } }, at: later })).status).toBe('refused');
+        expect((await linkOf(claimed.id))!.claimed_at).not.toBeNull();
+    });
+
+    it('CAS under the lock: a release proof for a quote time a concurrent legacy re-quote already moved is refused; races keep one consistent link', async () => {
+        const u = await account(`cas.${run}@example.com`);
+        await quote(u, `cas.${run}@example.com`, { sponsor: sponsor(u) });
+        const trial = await trialOf(u);
+        const moved = new Date(quotedAt.getTime() + 60_000);
+        expect((await quote(u, `cas.${run}@example.com`, { sponsor: sponsor(u), at: moved })).status).toBe('quoted');   // the legacy re-quote refreshed the link
+        const stale = { campaignId: 'test-campaign-a', configSha256: HASH_A, quotedAt };
+        expect(await quote(u, `cas.${run}@example.com`, { mode: { kind: 'public', releaseInactiveLink: stale }, at: new Date(moved.getTime() + 60_000) }))
+            .toEqual({ status: 'refused', reason: 'sponsor_pending' });
+        expect(new Date((await linkOf(trial.id))!.quoted_at as string).getTime()).toBe(moved.getTime());
+        // Truly concurrent: a legacy re-quote and a release with the current proof. Whatever wins, there is one trial row and the link (if any)
+        // is campaign A frozen at the trial's own quote time.
+        const proof = { campaignId: 'test-campaign-a', configSha256: HASH_A, quotedAt: moved };
+        await Promise.all([quote(u, `cas.${run}@example.com`, { sponsor: sponsor(u), at: new Date(moved.getTime() + 120_000) }),
+            quote(u, `cas.${run}@example.com`, { mode: { kind: 'public', releaseInactiveLink: proof }, at: new Date(moved.getTime() + 180_000) })]);
+        const final = await trialOf(u), link = await linkOf(final.id);
+        expect((await client`select count(*)::int as n from public.ezil_billing_trials where user_id = ${u}::uuid`)[0]!.n).toBe(1);
+        if (link) {
+            expect(link.campaign_id).toBe('test-campaign-a');
+            expect(new Date(link.quoted_at as string).getTime()).toBe(new Date(final.quoted_at as string).getTime());
+        }
+    });
+
+    it('with the sponsor schema absent no sponsor SQL is issued: Product and public quotes work, a legacy quote refuses sponsor_unavailable', async () => {
+        const name = `nosponsor_${run}`;
+        await client.unsafe(`create database ${name}`);
+        const bare = new URL(process.env.BILLING_TEST_DATABASE_URL!); bare.pathname = `/${name}`;
+        let other: ReturnType<typeof postgres> | undefined;
+        try {
+            await bootstrapSponsorFixture(bare.toString(), { applySponsor: false });
+            other = postgres(bare.toString(), { max: 2, prepare: false, onnotice: () => undefined });
+            const plain = createBillingStore(drizzle(other, { schema }) as unknown as Database);
+            if (!hasTrials(plain)) throw new Error('the store must implement the trial port');
+            const id = randomUUID();
+            await other`insert into auth.users (id, email, email_confirmed_at, raw_app_meta_data) values (${id}::uuid, ${`bare.${run}@example.com`}, now(), '{}'::jsonb)`;
+            expect((await quote(id, `bare.${run}@example.com`, { mode: { kind: 'product' } }, plain)).status).toBe('quoted');
+            expect((await quote(id, `bare.${run}@example.com`, { mode: { kind: 'public', releaseInactiveLink: { campaignId: 'x-campaign', configSha256: HASH_A, quotedAt } },
+                at: new Date(quotedAt.getTime() + 1000) }, plain)).status).toBe('quoted');
+            expect(await quote(id, `bare.${run}@example.com`, { sponsor: sponsor(id) }, plain)).toEqual({ status: 'refused', reason: 'sponsor_unavailable' });
+            expect((await other`select to_regclass('public.ezil_sponsor_trial_claims') as t`)[0]!.t).toBeNull();
+        } finally {
+            await other?.end();
+            await client.unsafe(`drop database if exists ${name} with (force)`);
+        }
     });
 
     it('binding sets claimed_at and the subscription with the trial binding, once; a replay is idempotent; counts distinct claims', async () => {

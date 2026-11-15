@@ -355,3 +355,56 @@ describe('ezil-os operator plans run one source-defined calendar month', () => {
         expect(view!.assignments[0]).toMatchObject({ until_revoked: true, ends_at: null, state: 'active' });
     });
 });
+
+describe('issued_by: the stored issuing organization of an assign', () => {
+    it('a named assign stores the name; an unnamed one stores none (read as EZiL); a replay does not rewrite it', async () => {
+        const h = harness();
+        const body = command({ issued_by: 'Acme Labs' });
+        const first = await run(h, body);
+        expect(first.outcome).toBe('applied');
+        expect(h.rows[0]).toMatchObject({ issuedBy: 'Acme Labs' });
+        expect(Object.keys(first).sort()).toEqual([...resultKeys].sort());
+        expect(JSON.stringify(first)).not.toContain('Acme Labs');
+        h.state.now = later(60_000);
+        expect(await run(h, body)).toEqual({ ...first, outcome: 'replayed' });
+        expect(h.rows).toHaveLength(1);
+        expect(h.rows[0]).toMatchObject({ issuedBy: 'Acme Labs' });
+
+        const plain = harness();
+        await run(plain, command());
+        expect(plain.rows[0]!.issuedBy).toBeNull();
+    });
+    it('the label is part of the payload: the same command id with another or no label is payload_mismatch', async () => {
+        const h = harness();
+        const body = command({ issued_by: 'Acme Labs' });
+        await run(h, body);
+        for (const other of [{ ...body, issued_by: 'Other Org' }, (({ issued_by: _drop, ...rest }) => rest)(body)]) {
+            expect(await run(h, other)).toMatchObject({ outcome: 'refused', refusal: { code: 'payload_mismatch' }, assignment: null });
+        }
+        expect(h.rows).toHaveLength(1);
+        expect(h.events.size).toBe(1);
+    });
+    it('change and end keep the stored label and never take one; the reason, Stripe and the month end are untouched', async () => {
+        const h = harness();
+        const assigned = await run(h, command({ issued_by: 'Acme Labs' }));
+        const ref = assigned.assignment!.ref;
+        const change = await run(h, command({ action: 'change', product: { ref: 'premium_monthly_v3', catalog_revision: REVISION }, starts_at: null, validity: null,
+            assignment: { ref, expected_revision: 1 } }));
+        expect(change.outcome).toBe('applied');
+        expect(h.rows[0]).toMatchObject({ issuedBy: 'Acme Labs', sku: 'premium_monthly_v3', endsAt: later(30 * DAY) });
+        // A label on a change or end is invalid before anything is read or written.
+        const writes = h.state.accessWrites, eventCount = h.events.size;
+        const labeledEnd = await run(h, command({ action: 'end', product: null, starts_at: null, validity: null, assignment: { ref, expected_revision: 2 }, issued_by: 'Other Org' }));
+        expect(labeledEnd).toMatchObject({ outcome: 'refused', assignment: null });
+        expect([h.state.accessWrites, h.events.size]).toEqual([writes, eventCount]);
+        const ended = await run(h, command({ action: 'end', product: null, starts_at: null, validity: null, assignment: { ref, expected_revision: 2 } }));
+        expect(ended.outcome).toBe('applied');
+        expect(h.rows[0]).toMatchObject({ issuedBy: 'Acme Labs' });
+    });
+    it('a refused assign (paid Stripe) stores no label and no grant', async () => {
+        const h = harness({ stripe: { paidAccess: true, computeActive: true, productRef: 'standard_monthly_v3', state: 'active', checkoutOpen: false } });
+        const result = await run(h, command({ issued_by: 'Acme Labs' }));
+        expect(result).toMatchObject({ outcome: 'refused', refusal: { code: 'paid_subscription_conflict' } });
+        expect(h.rows).toHaveLength(0);
+    });
+});

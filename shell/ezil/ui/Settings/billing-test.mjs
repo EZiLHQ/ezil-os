@@ -113,12 +113,19 @@ function invoice (kind = 'subscription', created = '2026-10-14T12:00:00Z', statu
 let summary = v2(), history = [];
 let getSummary = () => reply(summary), getHistory = () => reply(history), getUsage = () => failure('unavailable');
 let mutation = () => reply({ url: 'https://billing.example.test/session' });
+// The read-only availability check (billing.trialOffer). `availableOffer` answers available+eligible for the asked offer.
+const OFFER_FINGERPRINT = 'a'.repeat(64);
+const availableOffer = call => reply({ available: true, eligible: true, offer: { coupon: call.input?.coupon ?? null, fingerprint: OFFER_FINGERPRINT } });
+// Default: the free month is not available (public switch off), so plain paid-path cases show only paid actions.
+let getTrialOffer = () => failure('trial_offer_unavailable');
 window.fetch = async (url, options = {}) => {
-    const call = { url: String(url), method: options.method, input: options.body ? JSON.parse(options.body).json : undefined };
+    const queryInput = new URL(String(url), 'https://example.test').searchParams.get('input');
+    const call = { url: String(url), method: options.method, input: options.body ? JSON.parse(options.body).json : queryInput ? JSON.parse(queryInput).json : undefined };
     calls.push(call);
     if ( call.url.includes('/api/trpc/billing.summary') ) return getSummary();
     if ( call.url.includes('/api/trpc/billing.history') ) return getHistory();
     if ( call.url.includes('/api/trpc/billing.usage') ) return getUsage();
+    if ( call.url.includes('/api/trpc/billing.trialOffer') ) return getTrialOffer(call);
     if ( call.url.includes('/api/trpc/billing.') ) return mutation(call);
     if ( call.url.includes('/api/trpc/computer.list') ) return reply([]);
     return failure('Stubbed endpoint');
@@ -975,11 +982,29 @@ try {
         summary.plan = { ...summary.plan, renewal: null, cancelsAt: null, access };
         summary.actions = { ...summary.actions, checkout: false, upgrade: false, downgrade: false, cancel: false };
         await refresh(); audit();
-        contains('[data-role="plan-card"]', 'Assigned by EZiL · no payment');
+        // An older server's access (no issuedBy) is EZiL's; the card never says "no payment".
+        contains('[data-role="plan-card"] .ezil-billing-plan-price', 'Assigned by EZiL');
+        assert.equal(q('[data-role="plan-card"] .ezil-billing-plan-price').textContent, 'Assigned by EZiL');
+        assert.doesNotMatch(q('[data-role="plan-card"]').textContent, /no payment/i);
         contains('[data-role="plan-card"]', line);
         assert.doesNotMatch(q('[data-role="plan-card"]').textContent, /Renews|\$20 \/ month|Cancel/);
     }
     pass('product entitlements v1: an operator-assigned plan shows as assigned access with its validity, never a price or renewal');
+
+    // Issuing organization: the name the server reports; EZiL when none, blank or not a string; always text, never markup.
+    for ( const [issuedBy, line] of [['Acme', 'Assigned by Acme'], ['EZiL', 'Assigned by EZiL'], ['', 'Assigned by EZiL'], ['   ', 'Assigned by EZiL'],
+        [null, 'Assigned by EZiL'], [42, 'Assigned by EZiL'], ['<img src=x onerror="window.__issuedByXss=1"> & Co', 'Assigned by <img src=x onerror="window.__issuedByXss=1"> & Co']] ) {
+        summary = summaryV3('standard');
+        summary.plan = { ...summary.plan, renewal: null, cancelsAt: null,
+            access: { source: 'operator', ref: 'osg-00000000-0000-4000-8000-000000000001', endsAt: '2026-12-04T12:00:00Z', untilRevoked: false, issuedBy } };
+        summary.actions = { ...summary.actions, checkout: false, upgrade: false, downgrade: false, cancel: false };
+        await refresh(); audit();
+        assert.equal(q('[data-role="plan-card"] .ezil-billing-plan-price').textContent, line);
+        assert.equal(q('[data-role="plan-card"] img'), null, 'an issuing organization name is never markup');
+        assert.doesNotMatch(q('[data-role="plan-card"]').textContent, /no payment|Renews|\$20 \/ month/i);
+        contains('[data-role="plan-card"]', 'Your access ends on Dec 4, 2026.');
+    }
+    pass('issuing organization: "Assigned by Acme"; omitted, blank or legacy access is "Assigned by EZiL"; the name is escaped text');
 
     // Identity credits (`ai.account`): every live grant in the total, exact microcredits, never the catalog.
     {
@@ -1298,7 +1323,7 @@ try {
 
     // Standard trial: every entry from Free opens the checkout sheet in its trial mode (it quotes and confirms the
     // exact end itself, billing-trial-test.mjs); ineligible keeps the paid Standard checkout; Premium is never a trial.
-    summary = trialSummaryV3('offer'); await open();
+    getTrialOffer = availableOffer; summary = trialSummaryV3('offer'); await open();
     assert.deepEqual(qa('[data-pane="billing"] .ezil-settings-btn-primary').map(button => button.textContent), ['Start your free month']);
     click(q('[data-role="plan-actions"] [data-action="trial"]'));
     assert.deepEqual([sheets.at(-1).kind, sheets.at(-1).sku, sheets.at(-1).trial], ['checkout', 'standard_monthly_v3', true]);
@@ -1312,7 +1337,7 @@ try {
     // The pricing page's Standard card advertises the free month: its deep link opens it when offered, else Standard.
     await open({ ...context, initialTab: 'billing', openUpgrade: 'standard_monthly_v3' });
     assert.deepEqual([sheets.at(-1).kind, sheets.at(-1).sku, sheets.at(-1).trial], ['checkout', 'standard_monthly_v3', true]); await closeSheet();
-    summary = trialSummaryV3('ineligible'); await open({ ...context, initialTab: 'billing', openUpgrade: 'standard_monthly_v3' });
+    getTrialOffer = () => failure('trial_unavailable'); summary = trialSummaryV3('ineligible'); await open({ ...context, initialTab: 'billing', openUpgrade: 'standard_monthly_v3' });
     assert.deepEqual([sheets.at(-1).kind, sheets.at(-1).sku, sheets.at(-1).trial], ['checkout', 'standard_monthly_v3', undefined]); await closeSheet();
     has('[data-action="trial"]', false);
     contains('[data-role="plan-offer"][data-sku="standard_monthly_v3"] [data-role="trial-ineligible"]', "You've already used your free month.");
@@ -1609,6 +1634,250 @@ try {
     audit();
     assert.ok(count() > 0); assert.deepEqual(errors, []);
     pass('feature flag/native/auth gates, lazy loading and reopened-window bindings');
+
+    // ── The free month: public and promoter link, gated by the server's read-only availability (billing.trialOffer) ──
+    {
+        const freeWith = (offer) => { const value = summaryV3('free'); if ( offer === null ) delete value.trialOffer; else value.trialOffer = offer;
+            return value; };
+        const previewOffer = { eligible: true, sku: 'standard_monthly_v3', endsAt: '2026-12-05T03:30:00Z', amountCents: 2000, currency: 'usd' };
+        const available = alias => reply({ available: true, eligible: true, offer: { coupon: alias, fingerprint: 'c'.repeat(64) } });
+        const asked = () => calls.filter(call => call.url.includes('/api/trpc/billing.trialOffer')).map(call => call.input);
+        const trialCtas = () => qa('[data-action="trial"]').length;
+        // Visiting a link, signing in and the first Billing render only READ availability: no quote, no checkout, no provider POST.
+        const noMutations = () => assert.deepEqual(calls.filter(call => /billing\.(quoteTrial|createCheckout|createTopupCheckout)/.test(call.url) || (call.method && call.method !== 'GET' && ! /billing\.(summary|history|usage)/.test(call.url))
+            ).map(call => call.url), [], 'only read-only calls before the person activates the CTA');
+        const savedTrialOffer = getTrialOffer;
+        const reset = () => { getTrialOffer = savedTrialOffer; calls.length = 0; sheets.length = 0; };
+        const link = (alias, extra = {}) => ({ ...context, initialTab: 'billing', ...(alias ? { couponAlias: alias } : {}), ...extra });
+
+        // Public, no link: the read asks for the public offer ({}), and only its available+eligible answer shows a free month.
+        reset(); getTrialOffer = call => available(call.input?.coupon ?? null);
+        summary = freeWith(previewOffer); await open(); noMutations();
+        assert.deepEqual(copy(asked()), [{}]);
+        assert.ok(trialCtas() > 0, 'public offer available'); has('[data-role="coupon-notice"]', false);
+        // Public switch off (the read refuses): the summary's preview alone promises nothing.
+        reset(); getTrialOffer = () => failure('trial_offer_unavailable');
+        summary = freeWith(previewOffer); await open(); noMutations();
+        assert.equal(trialCtas(), 0, 'public off: no free-month CTA'); has('[data-role="coupon-notice"]', false);
+        assert.ok(!/free month/i.test(q('[data-role="plan-offer"][data-sku="standard_monthly_v3"]').textContent), 'no free-month words either');
+        // Missing, false or malformed eligibility never enables.
+        for ( const bad of [{ available: true, offer: { coupon: null, fingerprint: 'c'.repeat(64) } }, { available: true, eligible: false, offer: { coupon: null, fingerprint: 'c'.repeat(64) } },
+            { available: false, eligible: true, offer: { coupon: null, fingerprint: 'c'.repeat(64) } }, { available: true, eligible: true, offer: { coupon: 'other', fingerprint: 'c'.repeat(64) } },
+            { available: true, eligible: true, offer: { coupon: null, fingerprint: 'nope' } }, { available: true, eligible: true }] ) {
+            reset(); getTrialOffer = () => reply(bad); summary = freeWith(previewOffer); await open(); noMutations();
+            assert.equal(trialCtas(), 0, JSON.stringify(bad));
+        }
+        // A used-trial person keeps the summary's own refusal copy; the availability never overrides it.
+        reset(); getTrialOffer = () => failure('trial_unavailable');
+        summary = freeWith({ eligible: false, reason: 'trial_used' }); await open(); noMutations();
+        assert.equal(trialCtas(), 0); contains('[data-role="plan-offer"][data-sku="standard_monthly_v3"]', "You've already used your free month.");
+
+        // A valid promoter link with a null summary offer: asked with ONLY the alias, CTA enabled, one activation opens one sheet carrying it.
+        reset(); getTrialOffer = call => available(call.input?.coupon ?? null);
+        summary = freeWith(null); await open(link('midhun')); noMutations();
+        assert.deepEqual(copy(asked()), [{ coupon: 'midhun' }], 'never also the public offer');
+        assert.ok(trialCtas() > 0); contains('[data-role="coupon-notice"]', 'Your free-month link is ready');
+        const cta = q('[data-action="trial"]'); click(cta); click(cta); await settle();
+        assert.equal(sheets.filter(sheet => sheet.kind === 'checkout').length, 1, 'a double click opens one sheet');
+        assert.equal(sheets.at(-1).coupon, 'midhun'); assert.equal(sheets.at(-1).trial, true); assert.equal(sheets.at(-1).sku, 'standard_monthly_v3');
+        await closeSheet();
+        // A public sheet carries no coupon.
+        reset(); getTrialOffer = call => available(call.input?.coupon ?? null);
+        summary = freeWith(previewOffer); await open(); noMutations(); click(q('[data-action="trial"]')); await settle();
+        assert.equal(sheets.at(-1).coupon, undefined); assert.equal(sheets.at(-1).trial, true); await closeSheet();
+
+        // Stage: the verified opaque invite rides the server's HttpOnly cookie (no coupon in the address). The read asks with
+        // nothing, the server selects the sponsor offer, and that exact offer is what the sheet quotes and echoes.
+        // Stable Stage DTO (96fb2fa3): the carrier-only legacy invite is `source: 'sponsor', coupon: null`.
+        const invite = { coupon: null, fingerprint: 'd'.repeat(64), source: 'sponsor' };
+        const sponsorPreview = { ...previewOffer, source: 'sponsor' };
+        reset(); getTrialOffer = () => reply({ available: true, eligible: true, offer: invite });
+        summary = freeWith(sponsorPreview); await open(); noMutations();
+        assert.deepEqual(copy(asked()), [{}], 'the read sends no coupon; the server reads its own carrier');
+        assert.ok(trialCtas() > 0); has('[data-role="coupon-offer"]'); has('[data-role="coupon-notice"]', false);
+        click(q('[data-action="trial"]')); await settle();
+        assert.equal(sheets.at(-1).coupon, undefined, 'no coupon is sent at activation either');
+        assert.deepEqual(copy(sheets.at(-1).trialOffer), invite, 'bound to the exact offer the read showed');
+        await closeSheet();
+        // A present invite the read refuses (closed, invalid or unverifiable carrier) fails closed and says so; never the public offer.
+        for ( const code of ['trial_offer_unavailable', 'trial_offer_invalid', 'trial_unavailable', 'stripe_unavailable'] ) {
+            reset(); getTrialOffer = () => failure(code); summary = freeWith(sponsorPreview); await open(); noMutations();
+            assert.equal(trialCtas(), 0, code); has('[data-role="coupon-offer"]', false); has('[data-role="coupon-notice"]');
+        }
+        // A public read naming a coupon without the server's sponsor source is not the invite: no free month.
+        reset(); getTrialOffer = () => reply({ available: true, eligible: true, offer: { coupon: 'acme_partner', fingerprint: 'd'.repeat(64) } });
+        summary = freeWith(sponsorPreview); await open(); noMutations();
+        assert.equal(trialCtas(), 0);
+
+        // In-app: a coupon or invite entry stays read-only until the Billing CTA. An upgrade intent beside it (the pricing
+        // page's `upgrade=standard`, or the plan chooser) never auto-opens a quote, a checkout or a full-price fallback.
+        const STANDARD = 'standard_monthly_v3';
+        for ( const ctx of [link('midhun', { openUpgrade: STANDARD }), link('acme_partner', { openUpgrade: STANDARD }),
+            link(null, { couponInvalid: true, openUpgrade: STANDARD }), link('midhun', { openUpgrade: true }),
+            link(null, { couponEntryPresent: true, openUpgrade: STANDARD }), link(null, { couponEntryPresent: true, openUpgrade: true })] ) {
+            reset(); getTrialOffer = call => available(call.input?.coupon ?? null); summary = freeWith(previewOffer); await open(ctx); noMutations();
+            assert.equal(sheets.length, 0, `no auto-open: ${JSON.stringify(ctx)}`);
+        }
+        // Positive control, unchanged: with no coupon context the same intent still opens the free month.
+        reset(); getTrialOffer = call => available(call.input?.coupon ?? null); summary = freeWith(previewOffer);
+        await open({ ...context, initialTab: 'billing', openUpgrade: STANDARD });
+        assert.equal(sheets.filter(sheet => sheet.kind === 'checkout').length, 1, 'no-coupon pricing intent still auto-opens');
+        await closeSheet();
+        // Only the explicit CTA quotes, with the link's alias.
+        reset(); getTrialOffer = call => available(call.input?.coupon ?? null); summary = freeWith(previewOffer);
+        await open(link('midhun', { openUpgrade: STANDARD })); noMutations(); assert.equal(sheets.length, 0);
+        click(q('[data-action="trial"]')); await settle();
+        assert.equal(sheets.length, 1); assert.equal(sheets.at(-1).coupon, 'midhun'); assert.equal(sheets.at(-1).trial, true);
+        await closeSheet();
+        // The server's invite (no coupon in the context), accepted or refused: read-only, never a paid Standard checkout.
+        for ( const answer of [() => reply({ available: true, eligible: true, offer: invite }), () => failure('trial_offer_unavailable')] ) {
+            reset(); getTrialOffer = answer; summary = freeWith(sponsorPreview);
+            await open({ ...context, initialTab: 'billing', openUpgrade: STANDARD }); noMutations();
+            assert.equal(sheets.length, 0, 'an invite entry never auto-opens');
+        }
+        // The accepted FRESH read selects the server's invite while the summary shows no offer or only the public one:
+        // still an invite entry. Read-only until the CTA, which then quotes with no coupon and binds that exact offer.
+        for ( const preview of [null, previewOffer] ) {
+            reset(); getTrialOffer = () => reply({ available: true, eligible: true, offer: invite }); summary = freeWith(preview);
+            await open({ ...context, initialTab: 'billing', openUpgrade: STANDARD }); noMutations();
+            assert.equal(sheets.length, 0, `fresh invite read, summary offer ${preview ? 'public' : 'null'}: no auto-open`);
+            click(q('[data-action="trial"]')); await settle();
+            assert.equal(sheets.length, 1); assert.equal(sheets.at(-1).coupon, undefined);
+            assert.deepEqual(copy(sheets.at(-1).trialOffer), invite);
+            await closeSheet();
+        }
+        // AI credits recovery (Free: it would open the Standard upgrade) beside a coupon, hint or invite entry: held too.
+        const recoveryLink = '/os?settings=billing&section=ai-credits&reason=insufficient_credits';
+        const freeWithTopup = preview => { const s = freeWith(preview); s.actions.topup = true; s.catalog.packs = packs; return s; };
+        for ( const [label, ctx, search, answer] of [
+            ['alias', link('midhun'), recoveryLink, call => available(call.input?.coupon ?? null)],
+            ['invalid link', link(null, { couponInvalid: true }), recoveryLink, () => available(null)],
+            ['any coupon_entry', link(null, { couponEntryPresent: true }), recoveryLink, () => available(null)],
+            ['hint in the address', { ...context, initialTab: 'billing' }, `${recoveryLink}&coupon_entry=unavailable`, () => available(null)],
+            ['fresh invite read', { ...context, initialTab: 'billing' }, recoveryLink, () => reply({ available: true, eligible: true, offer: invite })],
+        ] ) {
+            reset(); getTrialOffer = answer; summary = freeWithTopup(previewOffer);
+            window.history.replaceState(null, '', search); await open(ctx); noMutations();
+            assert.equal(sheets.length, 0, `recovery link + ${label}: nothing opens`);
+            window.history.replaceState(null, '', '/os');
+        }
+        // Only the summary reports the invite (the read refuses it): the recovery and top-up links still open nothing.
+        for ( const search of [recoveryLink, '/os?settings=billing&section=ai-credits'] ) {
+            reset(); getTrialOffer = () => failure('trial_offer_unavailable'); summary = freeWithTopup(sponsorPreview);
+            window.history.replaceState(null, '', search); await open(); noMutations();
+            assert.equal(sheets.length, 0, `${search} + summary invite: nothing opens`);
+            window.history.replaceState(null, '', '/os');
+        }
+        // Positive control, unchanged: the same recovery link with no coupon context opens the Standard upgrade.
+        reset(); getTrialOffer = () => failure('trial_offer_unavailable'); summary = freeWithTopup(previewOffer);
+        window.history.replaceState(null, '', recoveryLink); await open();
+        assert.deepEqual([sheets.length, sheets.at(-1)?.kind, sheets.at(-1)?.sku], [1, 'checkout', STANDARD], 'no-coupon recovery still opens');
+        await closeSheet(); window.history.replaceState(null, '', '/os');
+        // Explicit actions are never held: Code's recovery relaunch and the person's own Add credits click still open.
+        reset(); getTrialOffer = call => available(call.input?.coupon ?? null); summary = freeWithTopup(previewOffer);
+        await open(link('midhun')); noMutations();
+        await window.ezil.registry.launch('settings', { ...context, initialTab: 'billing', billingRecovery: { reason: 'insufficient_credits' } }); await settle();
+        assert.deepEqual([sheets.length, sheets.at(-1)?.kind], [1, 'checkout'], 'Code recovery relaunch is explicit');
+        await closeSheet();
+        window.$(q('.window[data-app="settings"]')).trigger('ezil:billing-topup', [{}]); await settle();
+        assert.equal(sheets.filter(sheet => sheet.kind === 'topup').length, 1, 'explicit Add credits is never held');
+        await closeSheet();
+
+        // A purchase flag from the address, armed on a no-coupon route whose summary failed, then a coupon transition on
+        // the SAME kept window: the flag is consumed with the transition and never fires, now or on a later reload.
+        {
+            reset(); getTrialOffer = () => available(null); summary = freeWithTopup(previewOffer); getSummary = () => failure('temporary');
+            window.history.replaceState(null, '', recoveryLink); await open(); noMutations();
+            assert.equal(sheets.length, 0, 'failed summary: nothing could open yet');
+            const $kept = window.$(q('.window[data-app="settings"]'));
+            getSummary = () => reply(summary); getTrialOffer = call => available(call.input?.coupon ?? null);
+            window.history.replaceState(null, '', '/os');
+            window.billing.default.onActivate($kept, link('midhun')); await settle(); noMutations();
+            assert.equal(sheets.length, 0, 'the armed recovery flag never fires after the coupon transition');
+            assert.ok(trialCtas() > 0, 'the free-month CTA is offered instead');
+            await refresh(); noMutations();
+            assert.equal(sheets.length, 0, 'nor on a later reload of the kept window');
+            getSummary = () => reply(summary);
+        }
+
+        // Root's kept-window invite case: the address armed a purchase, the fresh NO-INPUT read selects the server's invite,
+        // but the summary fails. The read alone holds the route; a later load that shows only a public summary and read
+        // never fires the armed purchase. Control: the same sequence with a public first read still recovers as before.
+        const publicRead = () => reply({ available: true, eligible: true, offer: { coupon: null, fingerprint: 'e'.repeat(64), source: 'public' } });
+        for ( const [label, url, ctx] of [['recovery link', recoveryLink, undefined],
+            ['upgrade intent', '/os', { ...context, initialTab: 'billing', openUpgrade: STANDARD }]] ) {
+            for ( const firstRead of ['invite', 'public'] ) {
+                reset(); getSummary = () => failure('temporary');
+                getTrialOffer = firstRead === 'invite' ? () => reply({ available: true, eligible: true, offer: invite }) : publicRead;
+                summary = freeWithTopup(previewOffer); window.history.replaceState(null, '', url);
+                await open(ctx); noMutations();
+                assert.equal(sheets.length, 0, `${label}: the failed summary opened nothing`);
+                window.history.replaceState(null, '', '/os');
+                getSummary = () => reply(summary); getTrialOffer = publicRead;
+                await refresh();
+                if ( firstRead === 'invite' ) {
+                    noMutations();
+                    assert.equal(sheets.length, 0, `${label}: held by the invite read; no automatic purchase on the later load`);
+                } else {
+                    assert.equal(sheets.length, 1, `${label}: control, a genuine no-coupon request still opens`);
+                    await closeSheet();
+                }
+            }
+        }
+        getSummary = () => reply(summary);
+
+        // A DELAYED fresh invite read for the previous identity lands after a user switch on the same window: it is
+        // dropped (request/user/link checks) and never marks the new context as an invite entry or binds its offer.
+        {
+            const publicOffer = { coupon: null, fingerprint: 'e'.repeat(64), source: 'public' };
+            reset(); let releaseOld; getTrialOffer = () => new Promise(resolve => { releaseOld = () => resolve(reply({ available: true, eligible: true, offer: invite })); });
+            summary = freeWith(previewOffer);
+            await open({ ...context, initialTab: 'billing', openUpgrade: STANDARD }); noMutations();
+            assert.ok(releaseOld, 'the first read is in flight'); assert.equal(sheets.length, 0);
+            const $kept = window.$(q('.window[data-app="settings"]'));
+            getTrialOffer = () => reply({ available: true, eligible: true, offer: publicOffer });
+            window.billing.default.onActivate($kept, { ...context, initialTab: 'billing', payload: { ...payload, user: { id: 'other-user', name: 'Other' } } });
+            await settle();
+            releaseOld(); await settle();
+            const opened = sheets.filter(sheet => sheet.kind === 'checkout');
+            // The new identity's own no-coupon intent behaves as before, bound to ITS public read; the stale invite never binds.
+            assert.equal(opened.length, 1, 'one sheet, for the new context only');
+            assert.deepEqual(copy(opened[0].trialOffer), publicOffer, 'the stale invite never binds');
+            assert.equal(opened[0].coupon, undefined);
+            await closeSheet();
+        }
+
+        // Outage: no CTA, a Try again that asks the SAME alias again; unavailable/invalid/refused are explained and final.
+        reset(); getTrialOffer = () => failure('stripe_unavailable');
+        summary = freeWith(previewOffer); await open(link('midhun')); noMutations();
+        assert.equal(trialCtas(), 0); has('[data-role="coupon-notice"][data-state="error"]'); has('[data-action="coupon-retry"]');
+        getTrialOffer = call => available(call.input?.coupon ?? null); click(q('[data-action="coupon-retry"]')); await settle();
+        assert.deepEqual(copy(asked()), [{ coupon: 'midhun' }, { coupon: 'midhun' }]); assert.ok(trialCtas() > 0);
+        for ( const [code, state] of [['trial_offer_unavailable', 'unavailable'], ['trial_offer_invalid', 'invalid'], ['trial_unavailable', 'refused']] ) {
+            reset(); getTrialOffer = () => failure(code); summary = freeWith(previewOffer); await open(link('midhun')); noMutations();
+            assert.equal(trialCtas(), 0, code); has(`[data-role="coupon-notice"][data-state="${state}"]`); has('[data-action="coupon-retry"]', false);
+        }
+        // A malformed or repeated address asks nothing and never falls to the public offer.
+        reset(); getTrialOffer = () => available(null); summary = freeWith(previewOffer); await open(link(null, { couponInvalid: true })); noMutations();
+        assert.deepEqual(asked(), []); assert.equal(trialCtas(), 0); has('[data-role="coupon-notice"][data-state="invalid"]');
+
+        // Delayed availability across a user switch / link change: the late answer for the old context never lands.
+        reset(); let releaseOld; getTrialOffer = () => new Promise(resolve => { releaseOld = () => resolve(available('midhun')); });
+        summary = freeWith(null);
+        await open(link('midhun')); noMutations();
+        assert.ok(releaseOld, 'the first read is in flight'); has('[data-action="trial"]', false);
+        const $settings = window.$(q('.window[data-app="settings"]'));
+        // Another user and another link activate the same window before the first read answers.
+        getTrialOffer = call => available(call.input?.coupon ?? null);
+        window.billing.default.onActivate($settings, { ...link('other'), payload: { ...payload, user: { id: 'other-user', name: 'Other' } } }); await settle();
+        releaseOld(); await settle(); noMutations();
+        assert.deepEqual(copy(asked()), [{ coupon: 'midhun' }, { coupon: 'other' }]);
+        assert.equal(trialCtas() > 0, true, 'the new context shows its own link');
+        click(q('[data-action="trial"]')); await settle();
+        assert.equal(sheets.at(-1).coupon, 'other', 'never the old link'); assert.ok(!sheets.some(sheet => sheet.coupon === 'midhun'));
+        await closeSheet();
+        reset();
+    }
     console.log(`PASS Billing v2: ${groups} groups; ${audited} whole-pane copy/accessibility audits; 0 window errors`);
 } finally {
     dom.window.close();

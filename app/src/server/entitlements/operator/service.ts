@@ -151,7 +151,7 @@ export async function handleCommand(deps: OperatorEntitlementDeps, body: Record<
                 // A live grant that lapsed by its own end date is closed at that date before the new one starts.
                 if (current) await store.closeLapsed(current.ref, now);
                 const row: OperatorEntitlementRow = { ref: `osg-${deps.newId()}`, revision: 1, userId, accountPublicId: command.target.account_public_id,
-                    sku, startsAt, endsAt, endedAt: null };
+                    sku, startsAt, endsAt, endedAt: null, issuedBy: command.issued_by ?? null };
                 return write(row, async () => { await store.insertAssignment(row); return true; });
             }
 

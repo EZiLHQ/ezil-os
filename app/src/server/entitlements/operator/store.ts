@@ -30,17 +30,28 @@ function missingRelation(error: unknown): boolean {
     return false;
 }
 
+/** Postgres 42703 (undefined_column) naming issued_by: the labeled insert ran before 0023 was applied. */
+function missingIssuedByColumn(error: unknown): boolean {
+    for (let e = error as { code?: string; message?: string; cause?: unknown } | undefined, depth = 0; e && depth < 5; e = e.cause as typeof e, depth++) {
+        if (e.code === '42703' && /issued_by/.test(String(e.message ?? ''))) return true;
+    }
+    return false;
+}
+
 const date = (value: unknown): Date | null => value === null || value === undefined ? null : new Date(value as string | Date);
 
 function toRow(r: Record<string, unknown>): OperatorEntitlementRow | null {
     const sku = String(r.sku);
     if (!isOperatorSku(sku)) return null;
     return { ref: String(r.ref), revision: Number(r.revision), userId: String(r.user_id), accountPublicId: String(r.account_public_id), sku,
-        startsAt: date(r.starts_at)!, endsAt: date(r.ends_at), endedAt: date(r.ended_at) };
+        startsAt: date(r.starts_at)!, endsAt: date(r.ends_at), endedAt: date(r.ended_at),
+        issuedBy: typeof r.issued_by === 'string' ? r.issued_by : null };
 }
 
-const SELECT = sql`SELECT ref, revision, user_id::text AS user_id, account_public_id::text AS account_public_id, sku, starts_at, ends_at, ended_at
-    FROM public.ezil_operator_entitlements`;
+// issued_by (0023) is read through to_jsonb so this reader works the same before and after that column exists (null).
+const SELECT = sql`SELECT ref, revision, user_id::text AS user_id, account_public_id::text AS account_public_id, sku, starts_at, ends_at, ended_at,
+    to_jsonb(e)->>'issued_by' AS issued_by
+    FROM public.ezil_operator_entitlements e`;
 
 /** Every operator assignment of one account, newest first (at most 50). [] until 0019 is applied. */
 export async function readOperatorEntitlements(db: Executor, userId: string): Promise<OperatorEntitlementRow[]> {
@@ -129,6 +140,20 @@ function commandStore(tx: Executor): CommandStore {
             return rows.map(toRow).filter((row): row is OperatorEntitlementRow => row !== null);
         },
         async insertAssignment(row) {
+            // A named grant needs 0023's column. Before it exists the insert fails with undefined_column, which is the
+            // same "source unavailable" as a missing table: the transaction rolls back (no grant, no receipt) and the
+            // same command applies once the SQL is in. An unnamed grant is the v1 insert and never touches the column.
+            if (row.issuedBy) {
+                try {
+                    await tx.execute(sql`INSERT INTO public.ezil_operator_entitlements (ref, user_id, account_public_id, sku, revision, starts_at, ends_at, ended_at, issued_by)
+                        VALUES (${row.ref}, ${row.userId}::uuid, ${row.accountPublicId}::uuid, ${row.sku}, ${row.revision}, ${row.startsAt.toISOString()}::timestamptz,
+                            ${row.endsAt?.toISOString() ?? null}::timestamptz, NULL, ${row.issuedBy})`);
+                } catch (error) {
+                    if (missingIssuedByColumn(error)) throw new SourceUnavailable('issued_by');
+                    throw error;
+                }
+                return;
+            }
             await tx.execute(sql`INSERT INTO public.ezil_operator_entitlements (ref, user_id, account_public_id, sku, revision, starts_at, ends_at, ended_at)
                 VALUES (${row.ref}, ${row.userId}::uuid, ${row.accountPublicId}::uuid, ${row.sku}, ${row.revision}, ${row.startsAt.toISOString()}::timestamptz,
                     ${row.endsAt?.toISOString() ?? null}::timestamptz, NULL)`);

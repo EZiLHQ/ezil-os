@@ -570,6 +570,120 @@ def static_deployment(plan,d):
     keys=(rebase_app.public_deployment(d).keys() | rebase_app.public_deployment(desired).keys()) - set(manifest.PROMOTION) - {'releases'}
     need(all(d.get(k)==desired.get(k) for k in keys),'deployment network/storage/identity changed outside the promotion tuple')
 
+# apply_app runs the plan's new app against hosts still on the deployed AMI's agent. The baked agent is
+# `git archive <agentCommit>:infra/host-agent`, so tree identity is exact. The only reviewed difference is
+# the ed7da29a lower-attestation lane over agent 5127d85f: an added read-only `attest-lower` subcommand.
+HOST_AGENT='infra/host-agent'
+HOST_AGENT_EXCEPTION={
+    'lib/ezil_host/attest.py':(None,'100644 a86a795c144f399567a0ae2a9d5c20c42d89e738'),
+    'lib/ezil_host/cli.py':('100644 be52080df39b5fc598f88dd6db053a091a8b0d2b','100644 23d82c44207b9741f346edcca06cf2928aed94fa'),
+    'test/test_attest.py':(None,'100644 372195faa9675b751ae7b52381dccf32225a17ca'),
+}
+
+
+def host_agent_tree(commit,repo=REPO):
+    need(manifest.matches(r'[0-9a-f]{40}',commit),'host agent commit unavailable')
+    result=subprocess.run(['git','-C',str(repo),'ls-tree','-r','-z',commit,'--',HOST_AGENT+'/'],
+                          stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=90,check=False)
+    need(result.returncode==0 and result.stdout,'host agent commit unavailable')
+    tree={}
+    for entry in result.stdout.decode('utf-8').split('\0')[:-1]:
+        meta,name=entry.split('\t',1)
+        mode,kind,blob=meta.split(' ')
+        need(kind=='blob' and name.startswith(HOST_AGENT+'/'),'host agent tree is not plain files')
+        tree[name[len(HOST_AGENT)+1:]]=mode+' '+blob
+    return tree
+
+
+def require_host_abi(deployed_commit,bake_commit,repo=REPO):
+    """Byte-identical host agent, or exactly the reviewed attestation delta; never a wider claim."""
+    old,new=host_agent_tree(deployed_commit,repo),host_agent_tree(bake_commit,repo)
+    delta={name:(old.get(name),new.get(name)) for name in old.keys()|new.keys() if old.get(name)!=new.get(name)}
+    need(delta in ({},HOST_AGENT_EXCEPTION),'host agent differs from the deployed agent beyond the reviewed delta')
+    return delta
+
+
+# Release-registry readers (app/src/server/lib/compute/aws-rebase-release.ts). The normal ordering already
+# separates the app from the registry: apply_app installs the plan's new app over the UNCHANGED tuple and
+# registry, and only promote appends. A registry past the legacy thirty-two must never meet an app that
+# cannot parse it: every install refuses such an app first, and promote proves the running reader first.
+CAPACITY_SOURCE='app/src/server/lib/compute/aws-rebase-release.ts'
+CAPACITY_DECLARATION=re.compile(r'^export const REBASE_RELEASE_REGISTRY_CAPACITY = ([1-9][0-9]{0,3});$',re.M)
+
+
+def registry_count(d):
+    records=d.get('releases',[])
+    need(isinstance(records,list),'invalid release registry')
+    return len(records)
+
+
+def source_reader_capacity(git_sha,repo=REPO):
+    """Pre-install evidence from the app's exact source commit. Not runtime proof (the probe's readerCapacity is)."""
+    need(manifest.matches(r'[0-9a-f]{40}',git_sha),'target app reader capacity unknown')
+    git=lambda *args:subprocess.run(['git','-C',str(repo),*args],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=90,check=False)
+    blob=git('rev-parse','--verify','--quiet',git_sha+':'+CAPACITY_SOURCE)
+    need(blob.returncode==0 and manifest.matches(r'[0-9a-f]{40}',blob.stdout.decode().strip()),'target app reader capacity unknown')
+    text=git('cat-file','blob',blob.stdout.decode().strip())
+    found=CAPACITY_DECLARATION.findall(text.stdout.decode('utf-8','replace')) if text.returncode==0 else []
+    need(len(found)==1,'target app reader capacity unknown')
+    return int(found[0]),blob.stdout.decode().strip()
+
+
+def require_reader_capacity(count,git_sha,repo=REPO):
+    """Before any install or registry write. At or below the legacy limit every app reads the registry,
+    so rollbacks to a thirty-two-record reader stay allowed until a thirty-third record exists."""
+    if count<=json_tool.RELEASE_REGISTRY_CAPACITY:return None
+    capacity,blob=source_reader_capacity(git_sha,repo)
+    need(capacity>=count,'target app cannot read the live release registry')
+    return {'capacity':capacity,'blob':blob}
+
+
+def require_runtime_capacity(result,count):
+    """After an install or readback: the running build's own /api/health capacity (rebase_app NODE).
+    A missing or null readerCapacity is the legacy ABI and is only accepted at or below the legacy limit."""
+    if count<=json_tool.RELEASE_REGISTRY_CAPACITY:return
+    capacity=result.get('readerCapacity') if isinstance(result,dict) else None
+    need(type(capacity) is int and capacity>=count,'running app reader capacity is below the live release registry')
+
+
+def prospective_count(d,records):
+    """Registry size after promote appends these records (edit_release_secret never drops one)."""
+    key=lambda r:(r['lowerImageDigest'],r['amiId'])
+    retained={key(r) for r in d.get('releases',[])}
+    return registry_count(d)+len({key(r) for r in records}-retained)
+
+
+def probe_plan_app(path,plan,operation,count):
+    """The protected read-only host probe: the running build is the plan app (source, compose tag, one image)."""
+    app=plan['rollout']['app']
+    observed=rebase_ssm.run(Path(path).parent,operation,rebase_app.probe_body(app['tag']),True,aws,json_tool.write,fresh=True)
+    need(isinstance(observed,dict) and observed.get('killSwitch')=='1' and observed.get('lockFree') is True
+         and observed.get('gitSha')==observed.get('servedSha')==app['gitSha'] and observed.get('composeTag')==app['tag']
+         and manifest.matches(r'sha256:[0-9a-f]{64}',observed.get('imageId'))
+         and observed['imageId']==observed.get('tagImageId')==observed.get('composeImageId'),
+         'running app is not the plan-bound apply-app build')
+    require_runtime_capacity(observed,count)
+    return observed
+
+
+def require_reader_promotion(path,plan,count,apply,generation,deployed_agent):
+    """Promote past the legacy limit only over a proven reader: the plan-bound apply-app receipt (which
+    recorded the image installed from the plan's checksum-pinned artifact), the plan app's source, the
+    reviewed host-agent delta, and a fresh protected probe showing that same image still running."""
+    if count<=json_tool.RELEASE_REGISTRY_CAPACITY:return
+    app=plan['rollout']['app']
+    need(app['gitSha']==plan['bake']['agentCommit'],'app and host must use the same reviewed integrated source commit')
+    require_host_abi(deployed_agent,plan['bake']['agentCommit'])
+    require_reader_capacity(count,app['gitSha'])
+    receipt=require_receipt(path,'apply-app')
+    need(type(receipt.get('readerCapacity')) is int and receipt['readerCapacity']>=count
+         and manifest.matches(r'sha256:[0-9a-f]{64}',receipt.get('imageId')),
+         'apply-app receipt does not prove a reader for the larger registry')
+    if not apply:return
+    observed=probe_plan_app(path,plan,'promote-reader-probe-g'+str(generation),count)
+    need(observed['imageId']==receipt['imageId'],'running image is not the image apply-app installed')
+
+
 def app_operation(path,plan,operation,apply,expected=None,install=True,generation=None):
     need(plan['rollout'] is not None,'plan requires --rollout with reviewed staged change sets and app artifact')
     body=rebase_app.body(safe_path(REPO/'deploy/aws/os-staging/install-host.sh').read_text(),plan['rollout']['app'],expected,install)
@@ -640,12 +754,28 @@ def apply_app(manifest_path,apply,ledger_path=None):
         latest=completed_entries(ledger)[-1]
         own_promoted=latest['planSha256']==digest(path) and latest['tuple']==ledger_tuple(value)
         manifest.promoted_release(d,value if own_promoted else deployed)
+        # The normal mixed phase: the plan's new app over the unchanged tuple and registry. Refuse an app that
+        # could not parse the live registry before anything is written or installed.
+        count=registry_count(d)
+        require_reader_capacity(count,plan['rollout']['app']['gitSha'])
+        future=prospective_count(d,[value])
+        if future>json_tool.RELEASE_REGISTRY_CAPACITY:
+            # Its promotion will pass the legacy limit: the new app meets hosts on the deployed agent first,
+            # and must parse the registry its promotion will write.
+            require_host_abi(deployed['agentCommit'],plan['bake']['agentCommit'])
+            require_reader_capacity(future,plan['rollout']['app']['gitSha'])
         ledger,generation=begin_operation(ledger_path,ledger,path,plan,'apply-app',envelope,d,d,apply,fd)
         result=app_operation(path,plan,'apply-app',apply,rebase_app.public_deployment(d),generation=generation)
         check=json_tool.secret_aws(['get-secret-value','--secret-id',json_tool.SECRET,'--output','json'],lock_fd=fd)
         need(check['VersionId']==envelope['VersionId'],'secret changed during app deployment')
         if apply:
             need(result is not None,'app verification missing')
+            require_runtime_capacity(result,count)
+            if future>json_tool.RELEASE_REGISTRY_CAPACITY:
+                # Bind the image just installed from the plan's checksum-pinned artifact to this receipt;
+                # promote past the legacy limit requires that same image still running.
+                observed=probe_plan_app(path,plan,'apply-app-reader-probe-g'+str(generation),future)
+                result={**result,'imageId':observed['imageId']}
             write_receipt(path,'apply-app',result)
             append_ledger(ledger_path,ledger,path,plan,'apply-app',check,d,result['gitSha'])
     need(load_plan(path)==plan,'plan changed during app deployment')
@@ -695,6 +825,10 @@ def promote(manifest_path,apply,rollback=False,ledger_path=None):
         need(current in (before,after),'complete deployment tuple drift')
         updated=json_tool.edit_release_secret(envelope,before,after,[source,predecessor,target])
         _,next_d=secret_deployment({'SecretString':json.dumps(updated)})
+        # Past the legacy limit only after apply-app proved the running reader (rollback keeps that same app).
+        count=registry_count(next_d)
+        # plan_roles returns (deployed, source): `source` here is the deployed release whose agent hosts still run.
+        require_reader_promotion(path,plan,count,apply,ledger['entries'][-1]['generation']+1,source['agentCommit'])
         journal['rollbackDeployment' if rollback else 'afterDeployment']=rebase_app.public_deployment(next_d)
         ledger,generation=begin_operation(ledger_path,ledger,path,plan,operation,envelope,d,next_d,apply,fd)
         if not apply:
@@ -712,6 +846,7 @@ def promote(manifest_path,apply,rollback=False,ledger_path=None):
         check=json_tool.secret_aws(['get-secret-value','--secret-id',json_tool.SECRET,'--output','json'],lock_fd=fd)
         need(check['VersionId']==envelope['VersionId'] and manifest.loads(check['SecretString'])==updated,'app secret drift after restart')
         need(app_result is not None,'app verification missing')
+        require_runtime_capacity(app_result,count)
         journal['status']='rolled-back' if rollback else 'promoted';json_tool.write(journal_path,journal)
         append_ledger(ledger_path,ledger,path,plan,operation,check,next_d,app_result['gitSha'])
     print('Full deployment tuple and registry verified; admission remains gated for the lead canary')
@@ -814,6 +949,8 @@ def ledger_adopt_app(git_sha, source_repo, apply=False, ledger_path=None):
         result = app_operation(ledger_path, plan, 'ledger-adopt-app-g' + str(generation) + '-' + git_sha[:12],
                                True, rebase_app.public_deployment(d), install=False)
         need(result is not None and result.get('gitSha') == git_sha, 'ledger-adopt-app live git SHA mismatch')
+        # Never adopt an out-of-band app that cannot parse the live registry.
+        require_runtime_capacity(result, registry_count(d))
         need(git_sha != latest['appGitSha'], 'ledger-adopt-app already recorded')
         ancestor = subprocess.run(['git', '-C', str(source_repo), 'merge-base', '--is-ancestor', latest['appGitSha'], git_sha],
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90, check=False)

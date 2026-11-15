@@ -61,6 +61,77 @@ for line, name in zip(lines, expected):
     if digest.hexdigest() != line[:64]:
         raise SystemExit("Checksum mismatch")
 PY
+# Release registry: past the legacy thirty-two records, install only an image whose build-time
+# work.ezil.registry-capacity label (deploy.sh build, from the exact source constant) reads the live
+# registry. The label is read from the checksum-verified archive's own image config, BEFORE load, retag,
+# runtime extraction or any timer change; an unlabelled image is a thirty-two-record reader. After the
+# recreate the running app's own /api/health capacity (sha-bound, bounded) must prove the same before timers
+# return. At or below thirty-two records nothing is read or required. Prints no secret value.
+running_capacity_probe='const s=process.env.EZIL_GIT_SHA;fetch("http://127.0.0.1:3000/api/health",{signal:AbortSignal.timeout(5000),redirect:"error"}).then(r=>r.status===200?r.json():null).then(h=>process.stdout.write(h&&h.ok===true&&typeof s==="string"&&h.sha===s&&Number.isSafeInteger(h.registryCapacity)&&h.registryCapacity>0?String(h.registryCapacity):"unavailable")).catch(()=>process.stdout.write("unavailable"))'
+registry_guard() {
+python3 - "$temporary/$tag.tar.gz" "$@" <<'OS_REGISTRY_CAPACITY_PY'
+import json, os, re, subprocess, sys, tarfile
+LEGACY = 32
+archive, source = sys.argv[1], sys.argv[2]
+running = sys.argv[3] if len(sys.argv) > 3 else None
+if source == "secret":
+    # Same instance-role-only environment this script exported for its S3 downloads above.
+    if os.environ.get("AWS_SHARED_CREDENTIALS_FILE") != "/dev/null" or os.environ.get("AWS_CONFIG_FILE") != "/dev/null":
+        raise SystemExit("Registry capacity guard requires the instance-role-only AWS environment")
+    result = subprocess.run(["aws", "--region", "ap-south-1", "--no-cli-pager", "secretsmanager", "get-secret-value",
+                             "--secret-id", "ezil-os/billing-staging/app", "--output", "json"],
+                            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False, timeout=60)
+    if result.returncode:
+        raise SystemExit("Registry capacity guard could not read the app secret")
+    try:
+        raw = json.loads(json.loads(result.stdout)["SecretString"]).get("EZIL_AWS_LIFECYCLE_DEPLOYMENTS")
+    except (ValueError, KeyError, TypeError, AttributeError):
+        raise SystemExit("Registry capacity guard could not read the app secret") from None
+else:
+    try:
+        with open(source, encoding="utf-8") as rendered:
+            lines = [line[len("EZIL_AWS_LIFECYCLE_DEPLOYMENTS="):].rstrip("\n") for line in rendered
+                     if line.startswith("EZIL_AWS_LIFECYCLE_DEPLOYMENTS=")]
+    except OSError:
+        raise SystemExit("Invalid rendered environment") from None
+    if len(lines) > 1:
+        raise SystemExit("Invalid rendered environment")
+    raw = lines[0] if lines else None
+try:
+    deployments = json.loads(raw) if isinstance(raw, str) else {}
+except ValueError:
+    raise SystemExit("Invalid release registry") from None
+releases = (deployments.get("ap-south-1") or {}).get("releases", []) if isinstance(deployments, dict) else None
+if not isinstance(releases, list):
+    raise SystemExit("Invalid release registry")
+if len(releases) <= LEGACY:
+    sys.exit(0)  # every app reads up to the legacy limit
+if running is not None:
+    capacity = int(running) if re.fullmatch(r"[1-9][0-9]{0,3}", running) else LEGACY
+    if capacity < len(releases):
+        raise SystemExit("Running app cannot read the live release registry. App replacement already ran; "
+                         "stopped timers remain stopped. No automatic rollback.")
+    sys.exit(0)
+# The checksum-verified archive's own image config (docker save: manifest.json -> Config), read before load.
+try:
+    small = {}
+    with tarfile.open(archive, "r|gz") as bundle:
+        for member in bundle:
+            if member.isfile() and member.size <= 1 << 20:
+                small[member.name] = bundle.extractfile(member).read()
+    entries = json.loads(small["manifest.json"])
+    if not isinstance(entries, list) or len(entries) != 1:
+        raise ValueError("one image required")
+    labels = (json.loads(small[entries[0]["Config"]]).get("config") or {}).get("Labels") or {}
+except (OSError, EOFError, ValueError, KeyError, TypeError, AttributeError, tarfile.TarError):
+    raise SystemExit("Registry capacity guard could not read the image labels") from None
+label = labels.get("work.ezil.registry-capacity") if isinstance(labels, dict) else None
+capacity = int(label) if isinstance(label, str) and re.fullmatch(r"[1-9][0-9]{0,3}", label) else LEGACY
+if capacity < len(releases):
+    raise SystemExit("Image cannot read the live release registry; refused before install")
+OS_REGISTRY_CAPACITY_PY
+}
+registry_guard secret
 gzip -dc "$temporary/$tag.tar.gz" | docker load >/dev/null
 docker image inspect "ezil-os-staging:$tag" --format '{{.Architecture}}' | \
     python3 -c 'import sys; sys.exit(0 if sys.stdin.read().strip() == "amd64" else 1)'
@@ -113,6 +184,8 @@ done
 # The script arrives on bash's stdin (SSM heredoc), so any child that reads stdin would swallow the
 # unparsed rest of it (timer restore, footer) and still exit 0. Isolate stdin for every such child.
 python3 render-env.py </dev/null
+# Recheck against exactly what the new container will read; refused here, the old container keeps running.
+registry_guard /etc/ezil-os-staging/app.env
 printf 'OS_STAGING_TAG=%s\n' "$tag" >compose.env
 # D4: --force-recreate deletes the outgoing web container's json-file log. Keep a gzip copy first
 # (root-only, 7-day retention). Best effort: a snapshot problem never blocks the install.
@@ -130,6 +203,10 @@ snapshot_web_log() {
 }
 snapshot_web_log
 docker compose --env-file compose.env up -d --force-recreate --wait --wait-timeout 120 </dev/null
+# Runtime proof for every install path (deploy.sh included): past thirty-two records the recreated app must
+# report from its own health that it parses them, before timers come back.
+running_capacity=$(docker compose --env-file compose.env exec -T web node -e "$running_capacity_probe" </dev/null) || running_capacity=unavailable
+registry_guard /etc/ezil-os-staging/app.env "$running_capacity"
 if [[ -n $approved_source ]]; then
     observed_source=$(docker compose --env-file compose.env exec -T web node -e 'process.stdout.write(process.env.EZIL_GIT_SHA || "")' </dev/null) || observed_source=unavailable
     observed_image=$(docker container inspect "$slug-web-1" --format '{{.Image}}') || observed_image=unavailable

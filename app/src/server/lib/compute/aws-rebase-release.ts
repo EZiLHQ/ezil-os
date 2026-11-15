@@ -3,8 +3,13 @@ import { LifecycleDeploymentSchema, SourceLifecycleDeploymentSchema, type Source
 import { AWS_REGION_PATTERN } from './aws-config';
 import { parseRebaseJson, RebaseDigest, RebaseTime } from './aws-rebase-json';
 
-/** Finite retained-history capacity; byte and evidence bounds remain independent. */
-export const REBASE_RELEASE_REGISTRY_CAPACITY = 32;
+/**
+ * Finite retained-history capacity; byte and evidence bounds remain independent. Shared by every
+ * app reader (aws-intent, this module, aws-lower-attestation) and reported by `/api/health` as
+ * `registryCapacity`, which the operator's in-container probe reads before it appends a record
+ * past thirty-two (deploy/aws/mum/rebase_release.py, normal apply-app then promote).
+ */
+export const REBASE_RELEASE_REGISTRY_CAPACITY = 33;
 
 const version = z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*$/);
 const ref = z.string().max(512).regex(/^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com\/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$/);

@@ -14,7 +14,16 @@ import { epochSeconds, isoSeconds } from '@/server/billing/v2/time';
 import { upgradeGrantSeconds } from '@/server/billing/v3/catalog';
 import { hashSponsorToken, signSponsorRegistry } from '@/server/billing/v3/sponsor';
 import { readSponsorRuntime } from '@/server/billing/v3/sponsor-runtime';
+import { selectTrialOffer, trialOfferFingerprint } from '@/server/billing/v3/trial-campaigns';
+import { CAMPAIGNS_ON, STANDARD_PRICE_ID, STANDARD_PRODUCT_ID, standardTrialRead } from '@/server/billing/v3/trial-campaigns.test-support';
 import type { createTRPCContext } from '../trpc';
+import { mintSponsorBillingContext, SPONSOR_BILLING_COOKIE } from '@/server/auth/sponsor-billing-context';
+
+/** The Standard trial read in this deployment's live/test mode (Stage's public control requires a matching mode). */
+const liveRead = (...args: Parameters<typeof standardTrialRead>) => ({ ...standardTrialRead(...args), livemodeMatches: true });
+/** Stage's public control on the Standard Product (`ezil_public_standard_trial`), alongside an optional campaigns value. */
+const stageControlRead = (control: string, campaignsRaw?: string) => ({ ...liveRead(campaignsRaw, {}, { metadata: { ezil_plan: 'standard',
+    ...(campaignsRaw === undefined ? {} : { ezil_standard_trial_campaigns: campaignsRaw }), ezil_public_standard_trial: control } }) });
 
 vi.mock('@/server/db', () => ({ db: {} }));
 const auth0 = vi.hoisted(() => ({ enabled: vi.fn(() => true) }));
@@ -146,6 +155,8 @@ function fixture() {
         retrieveProduct: vi.fn<StripeApi['retrieveProduct']>().mockResolvedValue(packProduct),
         retrievePackPrice: vi.fn<StripeApi['retrievePackPrice']>().mockResolvedValue(packPrice),
         retrieveCoupon: vi.fn<StripeApi['retrieveCoupon']>().mockResolvedValue(packCoupon),
+        // One active Standard price whose Product has no campaigns key: the legacy public trial offer.
+        readTrialCampaigns: vi.fn<NonNullable<StripeApi['readTrialCampaigns']>>().mockResolvedValue(liveRead()),
         retrieveCheckoutLineItems: vi.fn<StripeApi['retrieveCheckoutLineItems']>().mockResolvedValue([{ quantity: 1, price: packPrice }]),
         resolvePrice: vi.fn<StripeApi['resolvePrice']>(),
         previewUpgrade: vi.fn<StripeApi['previewUpgrade']>(async input => ({
@@ -2062,13 +2073,16 @@ describe('Standard trial router', () => {
     const quoted = (patch: Partial<Own> = {}): Own => ({ id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, authSubject: `supabase:${userId}`,
         emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted', quotedAt, trialEnd, checkoutSessionId: null,
         stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null, returnOrigin: 'https://os.ezil.work', ...patch });
+    const PUBLIC_FP = trialOfferFingerprint({ productId: STANDARD_PRODUCT_ID, priceId: STANDARD_PRICE_ID }, true, null, null);
+    const MIDHUN_FP = trialOfferFingerprint({ productId: STANDARD_PRODUCT_ID, priceId: STANDARD_PRICE_ID }, null, 'midhun', null);
 
     it('quoteTrial fixes the exact end one calendar month after the server clock, $0 today and $20 then', async () => {
         const f = trialFixture();
         await expect(f.caller.quoteTrial()).resolves.toEqual({ sku, todayCents: 0, trialEndsAt: '2026-11-11T12:00:00Z',
-            firstChargeAt: '2026-11-11T12:00:00Z', amountCents: 2000, currency: 'usd', interval: 'month', quoteExpiresAt: '2026-10-11T12:30:00Z' });
+            firstChargeAt: '2026-11-11T12:00:00Z', amountCents: 2000, currency: 'usd', interval: 'month', quoteExpiresAt: '2026-10-11T12:30:00Z',
+            offer: { coupon: null, fingerprint: PUBLIC_FP, source: 'public' } });
         expect(f.trial.claimTrialQuote).toHaveBeenCalledWith({ userId, authSubject: `supabase:${userId}`, emailNormalized: 'fixture@example.org',
-            quotedAt, trialEnd, returnOrigin: 'https://os.ezil.work', publicSponsorMode: 'release' });
+            quotedAt, trialEnd, returnOrigin: 'https://os.ezil.work', mode: { kind: 'public' } });
     });
 
     it.each([
@@ -2098,7 +2112,8 @@ describe('Standard trial router', () => {
         const f = trialFixture({ own: quoted() });
         await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: '2026-11-11T12:00:00Z' } })).resolves.toMatchObject({ sessionId: session.id });
         expect(f.stripe.createCheckoutSession).toHaveBeenCalledWith(expect.objectContaining({ sku,
-            trial: { trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', trialEnd, expiresAt: new Date('2026-10-11T14:00:00Z') },
+            trial: { trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', trialEnd, expiresAt: new Date('2026-10-11T14:00:00Z'),
+                offer: { coupon: null, fingerprint: PUBLIC_FP, priceId: STANDARD_PRICE_ID, source: 'public' } },
             idempotencyKey: `trial-checkout:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:${epochSeconds(quotedAt)}` }));
         expect(f.trial.attachTrialCheckout).toHaveBeenCalledWith({ trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', userId, quotedAt,
             checkoutSessionId: session.id, customerId: 'cus_fixture' });
@@ -2189,6 +2204,171 @@ describe('Standard trial router', () => {
         await domainFailure(() => g.caller.previewUpgrade(toCompute), 'upgrade_not_allowed');
     });
 
+    describe('Stripe-controlled campaign offers (?coupon=)', () => {
+        const PUBLIC_OFF = JSON.stringify({ version: 1, publicEnabled: false, promoters: { midhun: { enabled: true } } });
+        const noWrites = (f: ReturnType<typeof trialFixture>) => {
+            expect(f.trial.claimTrialQuote).not.toHaveBeenCalled();
+            expect(f.trial.attachTrialCheckout).not.toHaveBeenCalled();
+            expect(f.stripe.createCustomer).not.toHaveBeenCalled();
+            expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+            // Stage's fake Stripe has no expire call (the router then reads the session instead); when present it must stay unused.
+            if ('expireCheckoutSession' in f.stripe) expect((f.stripe as unknown as { expireCheckoutSession: ReturnType<typeof vi.fn> }).expireCheckoutSession).not.toHaveBeenCalled();
+        };
+
+        it('trialOffer answers the public and promoter offers read-only, and a promoter works with the public offer off', async () => {
+            const f = trialFixture();
+            f.stripe.readTrialCampaigns.mockResolvedValue(liveRead(CAMPAIGNS_ON));
+            await expect(f.caller.trialOffer()).resolves.toEqual({ available: true, eligible: true, offer: { coupon: null, fingerprint: PUBLIC_FP, source: 'public' } });
+            await expect(f.caller.trialOffer({ coupon: ' MIDHUN ' })).resolves.toEqual({ available: true, eligible: true, offer: { coupon: 'midhun', fingerprint: MIDHUN_FP, source: 'promoter' } });
+            f.stripe.readTrialCampaigns.mockResolvedValue(liveRead(PUBLIC_OFF));
+            await expect(f.caller.trialOffer()).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+            await expect(f.caller.trialOffer({ coupon: 'midhun' })).resolves.toMatchObject({ available: true, offer: { coupon: 'midhun' } });
+            noWrites(f);
+        });
+
+        it.each([
+            ['a malformed coupon', CAMPAIGNS_ON, 'mid hun', 'trial_offer_invalid'],
+            ['an unknown coupon', CAMPAIGNS_ON, 'someone', 'trial_offer_invalid'],
+            ['a disabled promoter', JSON.stringify({ version: 1, publicEnabled: true, promoters: { midhun: { enabled: false } } }), 'midhun', 'trial_offer_unavailable'],
+            ['an expired promoter', JSON.stringify({ version: 1, publicEnabled: true, promoters: { midhun: { enabled: true, expiresAt: '2026-10-11T12:00:00.000Z' } } }), 'midhun', 'trial_offer_unavailable'],
+            ['malformed campaigns metadata', '{"version":1', 'midhun', 'trial_offer_unavailable'],
+        ])('%s fails closed with no fallback, no claim and no Stripe write', async (_name, campaigns, coupon, message) => {
+            const f = trialFixture();
+            f.stripe.readTrialCampaigns.mockResolvedValue(liveRead(campaigns));
+            await expect(f.caller.trialOffer({ coupon })).rejects.toMatchObject({ message });
+            await expect(f.caller.quoteTrial({ coupon })).rejects.toMatchObject({ message });
+            noWrites(f);
+        });
+
+        it.each([
+            ['a second active price', { ...liveRead(CAMPAIGNS_ON), prices: [...liveRead(CAMPAIGNS_ON).prices, { ...liveRead(CAMPAIGNS_ON).prices[0]!, id: 'price_Other' }] }],
+            ['more prices than one page', { ...liveRead(CAMPAIGNS_ON), hasMore: true }],
+            ['an inactive product', liveRead(CAMPAIGNS_ON, {}, { active: false })],
+            ['another amount', liveRead(CAMPAIGNS_ON, { unitAmount: 1900 })],
+            ['a yearly interval', liveRead(CAMPAIGNS_ON, { interval: 'year' })],
+            ['a two-month interval', liveRead(CAMPAIGNS_ON, { intervalCount: 2 })],
+        ])('Stripe terms with %s offer nothing (trial_offer_unavailable)', async (_name, read) => {
+            const f = trialFixture();
+            f.stripe.readTrialCampaigns.mockResolvedValue(read);
+            await expect(f.caller.trialOffer({ coupon: 'midhun' })).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+            await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+            noWrites(f);
+        });
+
+        it('a missing or failing Stripe reader is stripe_unavailable, never the public offer', async () => {
+            const f = trialFixture();
+            f.stripe.readTrialCampaigns.mockRejectedValue(new StripeRequestError(500, null, 'api_error'));
+            await expect(f.caller.trialOffer()).rejects.toMatchObject({ message: 'stripe_unavailable' });
+            await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'stripe_unavailable' });
+            const g = trialFixture({ own: quoted() });
+            delete (g.stripe as Partial<typeof g.stripe>).readTrialCampaigns;
+            await expect(g.caller.trialOffer()).rejects.toMatchObject({ message: 'stripe_unavailable' });
+            await expect(g.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } })).rejects.toMatchObject({ message: 'stripe_unavailable' });
+            noWrites(f);
+            expect(g.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        });
+
+        it('a promoter quote carries its offer; checkout re-reads Stripe and opens the EXISTING trial at the exact verified price', async () => {
+            const f = trialFixture();
+            f.stripe.readTrialCampaigns.mockResolvedValue(liveRead(PUBLIC_OFF));
+            const quote = await f.caller.quoteTrial({ coupon: 'Midhun' });
+            const fingerprint = MIDHUN_FP;
+            expect(quote).toMatchObject({ todayCents: 0, amountCents: 2000, interval: 'month', offer: { coupon: 'midhun', fingerprint } });
+            await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: quote.trialEndsAt, offer: quote.offer } })).resolves.toMatchObject({ sessionId: session.id });
+            const [request] = f.stripe.createCheckoutSession.mock.calls[0]!;
+            expect(request.trial).toEqual({ trialId: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa', trialEnd: new Date(quote.trialEndsAt),
+                expiresAt: new Date('2026-10-11T14:00:00Z'), offer: { coupon: 'midhun', fingerprint, priceId: STANDARD_PRICE_ID, source: 'promoter' } });
+            // The same quote key and the existing trial claim: one per person, no new grant path.
+            expect(request.idempotencyKey).toBe(`trial-checkout:aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa:${epochSeconds(quotedAt)}`);
+            expect(f.trial.claimTrialQuote).toHaveBeenCalledTimes(1);
+            expect(f.stripe.readTrialCampaigns).toHaveBeenCalledTimes(2);
+        });
+
+        it.each([
+            ['the promoter was disabled after the quote', JSON.stringify({ version: 1, publicEnabled: true, promoters: { midhun: { enabled: false } } }), {}, 'trial_offer_unavailable'],
+            ['the promoter was removed after the quote', JSON.stringify({ version: 1, publicEnabled: true, promoters: {} }), {}, 'trial_offer_invalid'],
+            ['the price changed after the quote', CAMPAIGNS_ON, { id: 'price_Repriced' }, 'trial_quote_stale'],
+            ['an expiry was added after the quote', JSON.stringify({ version: 1, publicEnabled: true, promoters: { midhun: { enabled: true, expiresAt: '2026-12-01T00:00:00.000Z' } } }), {}, 'trial_quote_stale'],
+        ])('checkout refuses when %s, before Stripe', async (_name, campaigns, priceOver, message) => {
+            const f = trialFixture({ own: quoted() });
+            f.stripe.readTrialCampaigns.mockResolvedValue(liveRead(campaigns, priceOver));
+            await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString(), offer: { coupon: 'midhun', fingerprint: MIDHUN_FP } } }))
+                .rejects.toMatchObject({ message });
+            expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+            expect(f.trial.attachTrialCheckout).not.toHaveBeenCalled();
+        });
+
+        it.each([['ON then OFF', CAMPAIGNS_ON, PUBLIC_OFF], ['OFF then ON', PUBLIC_OFF, CAMPAIGNS_ON]])(
+            'M1: a promoter quote still checks out after the public switch toggled (%s)', async (_name, atQuote, atCheckout) => {
+                const f = trialFixture();
+                f.stripe.readTrialCampaigns.mockResolvedValue(liveRead(atQuote));
+                const quote = await f.caller.quoteTrial({ coupon: 'midhun' });
+                expect(quote.offer).toEqual({ coupon: 'midhun', fingerprint: MIDHUN_FP, source: 'promoter' });
+                f.stripe.readTrialCampaigns.mockResolvedValue(liveRead(atCheckout));
+                await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: quote.trialEndsAt, offer: quote.offer } })).resolves.toMatchObject({ sessionId: session.id });
+                expect(f.stripe.createCheckoutSession.mock.calls[0]![0].trial?.offer).toEqual({ coupon: 'midhun', fingerprint: MIDHUN_FP, priceId: STANDARD_PRICE_ID, source: 'promoter' });
+            });
+
+        it('a forged fingerprint is stale, and a checkout without an offer gets only the current public offer', async () => {
+            const f = trialFixture({ own: quoted() });
+            f.stripe.readTrialCampaigns.mockResolvedValue(liveRead(CAMPAIGNS_ON));
+            await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString(), offer: { coupon: 'midhun', fingerprint: PUBLIC_FP } } }))
+                .rejects.toMatchObject({ message: 'trial_quote_stale' });
+            f.stripe.readTrialCampaigns.mockResolvedValue(liveRead(PUBLIC_OFF));
+            await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } })).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+            expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+            expect(selectTrialOffer(liveRead(PUBLIC_OFF), null, quotedAt)).toEqual({ ok: false, code: 'trial_offer_unavailable' });
+        });
+
+        it('M2: trialOffer checks this person first (read-only) and refuses a used or ineligible one before Stripe', async () => {
+            for (const facts of [{ own: quoted({ status: 'trialing', stripeSubscriptionId: 'sub_x' }) }, { paidBefore: true }, { emailVerified: false }]) {
+                const f = trialFixture(facts);
+                await expect(f.caller.trialOffer({ coupon: 'midhun' })).rejects.toMatchObject({ message: 'trial_unavailable' });
+                expect(f.stripe.readTrialCampaigns).not.toHaveBeenCalled();
+                noWrites(f);
+            }
+            const g = trialFixture();
+            g.store.subscriptionsFor.mockResolvedValue([subscription({ currentPeriodEnd: new Date('2026-11-20T00:00:00Z') })]);
+            await expect(g.caller.trialOffer()).rejects.toMatchObject({ message: 'trial_unavailable' });
+            expect(g.stripe.readTrialCampaigns).not.toHaveBeenCalled();
+        });
+
+        it('M2: with the public offer off the summary promises no trial, while an eligible promoter is still offered', async () => {
+            const f = trialFixture();
+            f.stripe.readTrialCampaigns.mockResolvedValue(liveRead(PUBLIC_OFF));
+            const summary = await f.caller.summary();
+            expect(summary).toMatchObject({ enabled: true });
+            expect((summary as { trialOffer?: unknown }).trialOffer).toBeNull();
+            await expect(f.caller.trialOffer({ coupon: 'midhun' })).resolves.toEqual({ available: true, eligible: true, offer: { coupon: 'midhun', fingerprint: MIDHUN_FP, source: 'promoter' } });
+            noWrites(f);
+        });
+
+        it('M2: a provider outage leaves the summary readable with no trial field; paid and ineligible viewers never reach Stripe', async () => {
+            const f = trialFixture();
+            f.stripe.readTrialCampaigns.mockRejectedValue(new StripeRequestError(503, null, 'api_error'));
+            const summary = await f.caller.summary();
+            expect(summary).toMatchObject({ enabled: true });
+            expect((summary as { trialOffer?: unknown }).trialOffer).toBeNull();
+            const g = trialFixture({ paidBefore: true });
+            await expect(g.caller.summary()).resolves.toMatchObject({ trialOffer: { eligible: false, reason: 'paid_before' } });
+            expect(g.stripe.readTrialCampaigns).not.toHaveBeenCalled();
+        });
+
+        it('M2: a hung provider read (ignoring its abort signal) cannot stall the summary past its 750 ms bound', async () => {
+            const f = trialFixture();
+            let signal: AbortSignal | undefined;
+            f.stripe.readTrialCampaigns.mockImplementation(async received => { signal = received; return new Promise<never>(() => {}); });
+            const started = Date.now();
+            const summary = await f.caller.summary();
+            const elapsed = Date.now() - started;
+            expect((summary as { trialOffer?: unknown }).trialOffer).toBeNull();
+            expect(summary).toMatchObject({ enabled: true });
+            expect(signal?.aborted).toBe(true);
+            expect(elapsed).toBeGreaterThanOrEqual(700);
+            expect(elapsed).toBeLessThan(3_000);
+        });
+    });
+
     it('summary offers the trial to an eligible Free viewer with the server-computed end, and says why not otherwise', async () => {
         const f = trialFixture();
         await expect(f.caller.summary()).resolves.toMatchObject({ trialOffer: { eligible: true, sku, endsAt: '2026-11-11T12:00:00Z',
@@ -2200,38 +2380,53 @@ describe('Standard trial router', () => {
         expect(summary).toMatchObject({ enabled: true });
         expect((summary as { trialOffer?: unknown }).trialOffer).toBeNull();
     });
-    it('Stripe off withdraws an unstarted public quote at checkout; the old env cannot enable or disable it', async () => {
+    it('Stage control off (Product metadata) withdraws an unstarted public quote at checkout; the old env cannot enable or disable it', async () => {
         const f = trialFixture();
         f.deps.sponsor = readSponsorRuntime({ BILLING_PUBLIC_STANDARD_TRIAL: '0' });
         await expect(f.caller.quoteTrial()).resolves.toMatchObject({ sku });
         expect(await f.caller.summary()).toMatchObject({ trialOffer: { eligible: true, source: 'public' } });
-        f.stripe.publicStandardTrialEnabled.mockResolvedValue(false);
-        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } })).rejects.toMatchObject({ message: 'trial_unavailable' });
+        f.stripe.readTrialCampaigns.mockResolvedValue(stageControlRead('false'));
+        await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } })).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
         expect(f.stripe.createCustomer).not.toHaveBeenCalled();
         expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
-        expect((await f.caller.summary() as { trialOffer?: unknown }).trialOffer).toBeUndefined();
+        expect((await f.caller.summary() as { trialOffer?: unknown }).trialOffer).toBeNull();
+        // The legacy Stage provider reader is no longer consulted: the one campaigns read carries both public controls.
+        expect(f.stripe.publicStandardTrialEnabled).not.toHaveBeenCalled();
     });
-    it('unreadable or absent provider control never grants; summary stays truthful and checkout remains mutation-free', async () => {
+    it('both public controls: absent = open; either one closed, or a live/test mismatch, withdraws the public offer', async () => {
+        for (const [read, open] of [[liveRead(), true], [stageControlRead('true'), true], [stageControlRead('false'), false], [stageControlRead('yes'), false],
+            [liveRead(JSON.stringify({ version: 1, publicEnabled: false, promoters: {} })), false], [stageControlRead('false', CAMPAIGNS_ON), false],
+            [{ ...liveRead(), livemodeMatches: false }, false]] as const) {
+            const f = trialFixture();
+            f.stripe.readTrialCampaigns.mockResolvedValue(read);
+            if (open) await expect(f.caller.quoteTrial()).resolves.toMatchObject({ sku, offer: { coupon: null, source: 'public' } });
+            else await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+            if (!open) expect(f.trial.claimTrialQuote).not.toHaveBeenCalled();
+        }
+    });
+    it('an unreadable or absent provider read never grants; summary stays truthful and checkout remains mutation-free', async () => {
         const f = trialFixture({ own: quoted() });
-        f.stripe.publicStandardTrialEnabled.mockRejectedValue(new Error('Stripe unavailable'));
+        f.stripe.readTrialCampaigns.mockRejectedValue(new Error('Stripe unavailable'));
         expect((await f.caller.summary() as { trialOffer?: unknown }).trialOffer).toBeNull();
         await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'stripe_unavailable' });
         await expect(f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } })).rejects.toMatchObject({ message: 'stripe_unavailable' });
         expect(f.trial.claimTrialQuote).not.toHaveBeenCalled();
         expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
         const g = trialFixture();
-        Object.assign(g.stripe, { publicStandardTrialEnabled: undefined });
-        await expect(g.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_unavailable' });
+        Object.assign(g.stripe, { readTrialCampaigns: undefined });
+        await expect(g.caller.quoteTrial()).rejects.toMatchObject({ message: 'stripe_unavailable' });
     });
 
 });
 
 
-describe('Sponsor trial router (same Standard trial, never a second grant)', () => {
+describe('Sponsor trial router (same Standard trial, never a second grant; Root authority policy 2026-11-14)', () => {
     const quotedAt = new Date('2026-10-11T12:00:00Z');
     const trialEnd = new Date('2026-11-11T12:00:00Z');
     const TRIAL_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
     const KEY = 'k'.repeat(40), REG_KEY = 'r'.repeat(40);
+    const ORIGIN = 'https://os.ezil.org';   // the fixture's headers carry no host: the owned canonical origin
+    afterEach(() => vi.unstubAllEnvs());
     const campaign = (over: Record<string, unknown> = {}) => ({ campaignId: 'test-campaign-a', partnerId: 'test-partner-a', version: 1, enabled: true,
         startsAt: '2026-10-01T00:00:00Z', expiresAt: '2026-11-30T00:00:00Z', tokenSha256: hashSponsorToken('token-a-0000000000000000'), ...over });
     const runtimeEnv = (campaigns: unknown[], over: Record<string, string | undefined> = {}) => {
@@ -2242,11 +2437,13 @@ describe('Sponsor trial router (same Standard trial, never a second grant)', () 
         quotedAt: Date; trialEnd: Date; checkoutSessionId: string | null; stripeCustomerId: string | null; stripeSubscriptionId: string | null; trialStart: Date | null; returnOrigin: string };
     const quoted = (): Own => ({ id: TRIAL_ID, userId, authSubject: `supabase:${userId}`, emailNormalized: 'fixture@example.org', sku, policyVersion: 1, status: 'quoted',
         quotedAt, trialEnd, checkoutSessionId: null, stripeCustomerId: null, stripeSubscriptionId: null, trialStart: null, returnOrigin: 'https://os.ezil.work' });
+    const PUBLIC_OFF = stageControlRead('false', JSON.stringify({ version: 1, publicEnabled: false, promoters: { midhun: { enabled: true } } }));
     function build(options: { env?: Record<string, string | undefined> | null; attribution?: { campaignId: string } | null; linkage?: { campaignId: string; configSha256: string; claimed: boolean } | null;
-        own?: Own | null; withSponsorMethods?: boolean; publicTrialEnabled?: boolean } = {}) {
+        own?: Own | null; withSponsorMethods?: boolean; read?: ReturnType<typeof liveRead>; cookie?: string } = {}) {
         const f = fixture();
+        vi.stubEnv('SPONSOR_KEY', KEY);
         let own: Own | null = options.own ?? null;
-        f.stripe.publicStandardTrialEnabled.mockResolvedValue(options.publicTrialEnabled ?? true);
+        f.stripe.readTrialCampaigns.mockResolvedValue(options.read ?? liveRead(CAMPAIGNS_ON));
         const trial = {
             trialFacts: vi.fn(async () => ({ emailNormalized: 'fixture@example.org', emailVerified: true, authSubject: `supabase:${userId}`, own, claimedElsewhere: false, paidBefore: false })),
             claimTrialQuote: vi.fn(async (input: { quotedAt: Date; trialEnd: Date; authSubject: string; emailNormalized: string; returnOrigin: string }) => {
@@ -2261,88 +2458,164 @@ describe('Sponsor trial router (same Standard trial, never a second grant)', () 
         };
         Object.assign(f.store, trial);
         if (options.env !== null) f.deps.sponsor = readSponsorRuntime(options.env ?? {});
-        return { ...f, trial };
+        const ctx = { ...f.ctx, headers: new Headers({ origin: 'https://os.ezil.work', ...(options.cookie === undefined ? {} : { cookie: options.cookie }) }) };
+        return { ...f, trial, caller: f.router.createCaller(ctx) };
     }
-    const co = (f: ReturnType<typeof build>) => f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString() } });
+    const co = (f: ReturnType<typeof build>, offer?: { coupon: string | null; fingerprint: string }) =>
+        f.caller.createCheckout({ sku, trial: { trialEndsAt: trialEnd.toISOString(), ...(offer ? { offer } : {}) } });
     const hashOf = (f: ReturnType<typeof build>) => f.deps.sponsor!.registry.get('test-campaign-a')!.configSha256;
+    const modeOf = (f: ReturnType<typeof build>, call = 0) => (f.trial.claimTrialQuote.mock.calls[call]![0] as { mode?: unknown }).mode;
+    /** A carried billing context exactly as direct entry / the callback mints it (issuedAt = the original entry). */
+    const carried = (f: ReturnType<typeof build>, over: { userId?: string; origin?: string; issuedAt?: Date; configSha256?: string; key?: string;
+        provenance?: 'opaque' | 'alias' | 'unknown'; campaignId?: string } = {}) => {
+        const c = f.deps.sponsor!.registry.get(over.campaignId ?? 'test-campaign-a')!;
+        const provenance = over.provenance ?? 'opaque';
+        const minted = mintSponsorBillingContext(over.key ?? KEY, { campaign: { ...c, configSha256: over.configSha256 ?? c.configSha256 }, origin: over.origin ?? ORIGIN,
+            userId: over.userId ?? userId, issuedAt: over.issuedAt ?? now, now: over.issuedAt ?? now, provenance, alias: provenance === 'alias' ? c.partnerId : null })!;
+        return `${SPONSOR_BILLING_COOKIE}=${minted.value}`;
+    };
+    const withCookie = (options: Parameters<typeof build>[0], cookie: (f: ReturnType<typeof build>) => string) => {
+        const probe = build(options);
+        return build({ ...options, cookie: cookie(probe) });
+    };
 
-    it('a validated sponsor has priority with public ON and OFF, including clear ineligibility on an existing plan', async () => {
-        for (const publicTrialEnabled of [true, false]) {
-            const f = build({ publicTrialEnabled, env: runtimeEnv([campaign()]), attribution: { campaignId: 'test-campaign-a' } });
-            expect(await f.caller.summary()).toMatchObject({ trialOffer: { eligible: true, source: 'sponsor', partnerId: 'test-partner-a' } });
-            await f.caller.quoteTrial();
-            expect(f.trial.claimTrialQuote.mock.calls[0]![0]).toHaveProperty('sponsor');
-            expect(f.stripe.publicStandardTrialEnabled).not.toHaveBeenCalled();
-            f.store.subscriptionsFor.mockResolvedValue([subscription({ sku: 'standard_monthly_v3' })]);
-            expect(await f.caller.summary()).toMatchObject({ trialOffer: { eligible: false, reason: 'not_free', source: 'sponsor', partnerId: 'test-partner-a' } });
+    it('the historical first-touch attribution row is analytics: it never selects, gates or retargets an offer, and is not read', async () => {
+        const off = build({ read: PUBLIC_OFF, env: runtimeEnv([campaign()]), attribution: { campaignId: 'test-campaign-a' } });
+        expect((await off.caller.summary() as { trialOffer?: unknown }).trialOffer).toBeNull();
+        await expect(off.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+        expect(off.trial.claimTrialQuote).not.toHaveBeenCalled();
+        const on = build({ env: runtimeEnv([campaign()]), attribution: { campaignId: 'test-campaign-a' } });
+        expect(await on.caller.summary()).toMatchObject({ trialOffer: { eligible: true, source: 'public' } });
+        await expect(on.caller.quoteTrial()).resolves.toMatchObject({ offer: { coupon: null, source: 'public' } });
+        expect(modeOf(on)).toEqual({ kind: 'public' });
+        // An attributed account may take an independent Product promoter: no legacy write, no conflict.
+        await expect(on.caller.quoteTrial({ coupon: 'midhun' })).resolves.toMatchObject({ offer: { coupon: 'midhun', source: 'promoter' } });
+        expect(modeOf(on, 1)).toEqual({ kind: 'product' });
+        for (const f of [off, on]) expect(f.trial.sponsorAttributionFor).not.toHaveBeenCalled();
+    });
+
+    it('a carried verified context selects its legacy campaign even with both public controls off; the quote carries the server-derived campaign', async () => {
+        const f = withCookie({ read: PUBLIC_OFF, env: runtimeEnv([campaign()]) }, probe => carried(probe));
+        expect(await f.caller.summary()).toMatchObject({ trialOffer: { eligible: true, source: 'sponsor', partnerId: 'test-partner-a' } });
+        await expect(f.caller.quoteTrial()).resolves.toMatchObject({ sku, todayCents: 0, offer: { coupon: null, source: 'sponsor' } });
+        expect(modeOf(f)).toEqual({ kind: 'legacy', sponsor: { accountKey: f.deps.sponsor!.accountKey(userId), campaignId: 'test-campaign-a', partnerId: 'test-partner-a', configSha256: hashOf(f) } });
+        await expect(f.caller.quoteTrial({ sponsor: 'test-campaign-b' } as never)).rejects.toThrow();   // no client campaign input is accepted
+    });
+
+    it('carried provenance on every request: opaque keeps legacy priority over a colliding Product alias; alias or unknown provenance fails closed', async () => {
+        const env = runtimeEnv([campaign({ partnerId: 'midhun' })]);   // the legacy alias is ALSO a Product promoter (CAMPAIGNS_ON)
+        const opaque = withCookie({ read: PUBLIC_OFF, env }, probe => carried(probe, { provenance: 'opaque' }));
+        await expect(opaque.caller.quoteTrial()).resolves.toMatchObject({ offer: { source: 'sponsor' } });
+        expect(modeOf(opaque)).toMatchObject({ kind: 'legacy', sponsor: { campaignId: 'test-campaign-a' } });
+        for (const [provenance, code] of [['alias', 'trial_offer_invalid'], ['unknown', 'trial_offer_unavailable']] as const) {
+            const f = withCookie({ env }, probe => carried(probe, { provenance }));
+            await expect(f.caller.quoteTrial(), provenance).rejects.toMatchObject({ message: code });
+            await expect(f.caller.trialOffer(), provenance).rejects.toMatchObject({ message: code });
+            expect((await f.caller.summary() as { trialOffer?: unknown }).trialOffer, provenance).toBeNull();
+            expect(f.trial.claimTrialQuote, provenance).not.toHaveBeenCalled();
+            // Checkout re-checks too (third phase): nothing reaches Stripe.
+            const c = withCookie({ env, own: quoted() }, probe => carried(probe, { provenance }));
+            await expect(co(c), provenance).rejects.toMatchObject({ message: code });
+            expect(c.stripe.createCheckoutSession, provenance).not.toHaveBeenCalled();
         }
-    });
-    it('a newly attributed promoter requires re-quoting an older public quote instead of losing its tracking under the same Stripe key', async () => {
-        const f = build({ env: runtimeEnv([campaign()]), attribution: { campaignId: 'test-campaign-a' }, own: quoted() });
-        await expect(co(f)).rejects.toMatchObject({ message: 'trial_quote_stale' });
-        expect(f.stripe.publicStandardTrialEnabled).not.toHaveBeenCalled();
-        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        // The collision is read fresh: once the promoter is gone, the same alias-provenance context works.
+        const fresh = withCookie({ env, read: liveRead(JSON.stringify({ version: 1, publicEnabled: true, promoters: {} })) }, probe => carried(probe, { provenance: 'alias' }));
+        await expect(fresh.caller.quoteTrial()).resolves.toMatchObject({ offer: { source: 'sponsor' } });
     });
 
-    it('a valid sponsor works while the PUBLIC trial is off: the quote carries the server-derived campaign, never a client field', async () => {
-        const f = build({ publicTrialEnabled: false, env: runtimeEnv([campaign()], { BILLING_PUBLIC_STANDARD_TRIAL: '0' }), attribution: { campaignId: 'test-campaign-a' } });
-        await expect(f.caller.quoteTrial()).resolves.toMatchObject({ sku, todayCents: 0 });
-        const input = f.trial.claimTrialQuote.mock.calls[0]![0] as { sponsor?: Record<string, string>; publicSponsorMode?: string };
-        expect(input.sponsor).toEqual({ accountKey: f.deps.sponsor!.accountKey(userId), campaignId: 'test-campaign-a', partnerId: 'test-partner-a', configSha256: hashOf(f) });
-        expect(input.publicSponsorMode).toBeUndefined();
-        await expect(f.caller.summary()).resolves.toMatchObject({ trialOffer: { eligible: true } });
-        await expect(f.caller.quoteTrial({ sponsor: 'test-campaign-b' } as never)).rejects.toThrow();   // no client input is accepted
-    });
-
-    it('with the public trial off and no valid sponsor, quote and checkout refuse before any claim or Checkout mutation, and the offer is absent', async () => {
-        for (const f of [build({ publicTrialEnabled: false, env: runtimeEnv([campaign()], { BILLING_PUBLIC_STANDARD_TRIAL: '0' }) }),
-            build({ publicTrialEnabled: false, env: runtimeEnv([campaign({ enabled: false })], { BILLING_PUBLIC_STANDARD_TRIAL: '0' }), attribution: { campaignId: 'test-campaign-a' } }),
-            build({ publicTrialEnabled: false, env: { BILLING_PUBLIC_STANDARD_TRIAL: '0' } })]) {
-            await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_unavailable' });
+    it('a present carried context that does not verify fails the request closed: no public or promoter fallback (user, origin, key, age, config, duplicates)', async () => {
+        const env = runtimeEnv([campaign()]);
+        const cases: [string, (probe: ReturnType<typeof build>) => string][] = [
+            ['another user', probe => carried(probe, { userId: '22222222-2222-4222-8222-222222222222' })],
+            ['another origin', probe => carried(probe, { origin: 'https://os-staging.ezil.work' })],
+            ['another key', probe => carried(probe, { key: 'x'.repeat(40) })],
+            ['older than the entry window', probe => carried(probe, { issuedAt: new Date(now.getTime() - 601_000) })],
+            // Flip the MAC's FIRST character (six full bits); its last character also carries base64url padding bits.
+            ['tampered', probe => carried(probe).replace(/\.(.)/, (_, c: string) => `.${c === 'A' ? 'B' : 'A'}`)],
+            ['two cookies', probe => `${carried(probe)}; ${carried(probe)}`],
+            ['garbage', () => `${SPONSOR_BILLING_COOKIE}=not-a-context`],
+        ];
+        for (const [name, cookie] of cases) {
+            const f = withCookie({ env }, cookie);
+            await expect(f.caller.quoteTrial(), name).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+            await expect(f.caller.quoteTrial({ coupon: 'midhun' }), name).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+            expect((await f.caller.summary() as { trialOffer?: unknown }).trialOffer, name).toBeNull();
+            expect(f.trial.claimTrialQuote, name).not.toHaveBeenCalled();
+        }
+        // Verifies, but the live registry no longer matches (config changed / campaign disabled / runtime off): refused, never public.
+        for (const live of [runtimeEnv([campaign({ version: 2 })]), runtimeEnv([campaign({ enabled: false })]), runtimeEnv([campaign()], { SPONSOR_TRIALS_ENABLED: '0' })]) {
+            const f = withCookie({ env }, probe => carried(probe));
+            f.deps.sponsor = readSponsorRuntime(live);
+            await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
             expect(f.trial.claimTrialQuote).not.toHaveBeenCalled();
-            expect((await f.caller.summary() as { trialOffer?: unknown }).trialOffer).toBeUndefined();
         }
-        const g = build({ publicTrialEnabled: false, env: { BILLING_PUBLIC_STANDARD_TRIAL: '0' }, own: quoted() });
-        await expect(co(g)).rejects.toMatchObject({ message: 'trial_unavailable' });
-        expect(g.stripe.createCheckoutSession).not.toHaveBeenCalled();
     });
 
-    it('off by default or with a missing/invalid registry or key: the public trial is exactly today\'s flow plus an explicit release request, and no sponsor key is sent', async () => {
-        for (const env of [null, {}, runtimeEnv([campaign()], { SPONSOR_TRIALS_ENABLED: '0' }), runtimeEnv([campaign()], { SPONSOR_REGISTRY_SIG: 'bad' }), runtimeEnv([campaign()], { SPONSOR_KEY: 'short' })]) {
+    it('a known legacy alias owns its resolution, deny included; an alias in both authorities is ambiguous; an unknown one selects the Product promoter', async () => {
+        const active = build({ read: PUBLIC_OFF, env: runtimeEnv([campaign()]) });
+        await expect(active.caller.quoteTrial({ coupon: 'Test-Partner-A' })).resolves.toMatchObject({ offer: { coupon: 'test-partner-a', source: 'sponsor' } });
+        expect(modeOf(active)).toMatchObject({ kind: 'legacy', sponsor: { campaignId: 'test-campaign-a' } });
+        for (const env of [runtimeEnv([campaign({ enabled: false })]), runtimeEnv([campaign({ expiresAt: '2026-10-11T12:00:00Z' })]), runtimeEnv([campaign()], { SPONSOR_TRIALS_ENABLED: '0' })]) {
+            const f = build({ env });   // public open, promoters on: still denied
+            await expect(f.caller.trialOffer({ coupon: 'test-partner-a' })).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+            await expect(f.caller.quoteTrial({ coupon: 'test-partner-a' })).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+            expect(f.trial.claimTrialQuote).not.toHaveBeenCalled();
+        }
+        const invalid = build({ env: runtimeEnv([campaign()], { SPONSOR_REGISTRY_SIG: 'bad' }) });
+        await expect(invalid.caller.quoteTrial({ coupon: 'midhun' })).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+        const both = build({ env: runtimeEnv([campaign({ partnerId: 'midhun' })]) });
+        await expect(both.caller.quoteTrial({ coupon: 'midhun' })).rejects.toMatchObject({ message: 'trial_offer_invalid' });
+        const unknown = build({ read: PUBLIC_OFF, env: runtimeEnv([campaign()]), attribution: { campaignId: 'test-campaign-a' } });
+        await expect(unknown.caller.quoteTrial({ coupon: 'midhun' })).resolves.toMatchObject({ offer: { coupon: 'midhun', source: 'promoter' } });
+        expect(modeOf(unknown)).toEqual({ kind: 'product' });
+    });
+
+    it('off by default or with no registry: the public trial is today\'s flow with no sponsor data written or sent', async () => {
+        for (const env of [null, {}]) {
             const f = build({ env, attribution: { campaignId: 'test-campaign-a' }, own: quoted() });
             await expect(f.caller.quoteTrial()).resolves.toMatchObject({ sku });
-            const input = f.trial.claimTrialQuote.mock.calls[0]![0] as { sponsor?: unknown; publicSponsorMode?: string };
-            expect(input.sponsor).toBeUndefined(); expect(input.publicSponsorMode).toBe('release');
+            expect(modeOf(f)).toEqual({ kind: 'public' });
             await expect(co(f)).resolves.toMatchObject({ sessionId: session.id });
             const request = f.stripe.createCheckoutSession.mock.calls[0]![0];
-            expect(request.trial).toEqual({ trialId: TRIAL_ID, trialEnd, expiresAt: new Date('2026-10-11T14:00:00Z') });   // no sponsor metadata
+            expect(request.trial).toMatchObject({ trialId: TRIAL_ID, trialEnd, offer: { coupon: null, source: 'public' } });
+            expect(request.trial).not.toHaveProperty('sponsor');
         }
         const legacy = build({ env: null, withSponsorMethods: false, own: quoted() });   // a store without the sponsor reads at all
         await expect(legacy.caller.quoteTrial()).resolves.toMatchObject({ sku });
         await expect(co(legacy)).resolves.toMatchObject({ sessionId: session.id });
     });
 
-    it('a linked quote continues ONLY as the same sponsor quote: same key, sponsor metadata, frozen config', async () => {
-        const f = build({ env: runtimeEnv([campaign()]), own: quoted() });
+    it('a linked quote continues ONLY as the same legacy quote: same key, exact sponsor metadata, frozen config, identical retries', async () => {
+        const f = build({ read: PUBLIC_OFF, env: runtimeEnv([campaign()]), own: quoted() });
         f.trial.sponsorLinkageFor!.mockResolvedValue({ campaignId: 'test-campaign-a', configSha256: hashOf(f), claimed: false });
         await expect(co(f)).resolves.toMatchObject({ sessionId: session.id });
         const first = f.stripe.createCheckoutSession.mock.calls[0]![0];
-        expect(first.trial).toEqual({ trialId: TRIAL_ID, trialEnd, expiresAt: new Date('2026-10-11T14:00:00Z'), sponsor: { campaignId: 'test-campaign-a', configSha256: hashOf(f) } });
+        expect(first.trial).toMatchObject({ trialId: TRIAL_ID, trialEnd, expiresAt: new Date('2026-10-11T14:00:00Z'), sponsor: { campaignId: 'test-campaign-a', configSha256: hashOf(f) },
+            offer: { coupon: null, source: 'sponsor', priceId: STANDARD_PRICE_ID } });
         expect(first.idempotencyKey).toBe(`trial-checkout:${TRIAL_ID}:${epochSeconds(quotedAt)}`);
-        await co(f);   // a retry sends identical parameters
+        await co(f);
         expect(f.stripe.createCheckoutSession.mock.calls[1]![0]).toEqual(first);
+        // A public or promoter echo against the link is stale; nothing reaches Stripe.
+        for (const offer of [{ coupon: null, fingerprint: 'a'.repeat(64) }, { coupon: 'midhun', fingerprint: 'a'.repeat(64) }]) {
+            const g = build({ env: runtimeEnv([campaign()]), own: quoted(), linkage: { campaignId: 'test-campaign-a', configSha256: hashOf(f), claimed: false } });
+            await expect(co(g, offer)).rejects.toMatchObject({ message: 'trial_quote_stale' });
+            expect(g.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        }
     });
 
-    it('a linked quote never silently becomes public: runtime off, campaign disabled/expired/removed, or a changed config all refuse before Stripe (counts and params preserved)', async () => {
+    it('a linked quote never silently becomes public or a promoter: every changed or unprovable state refuses before Stripe', async () => {
         const live = build({ env: runtimeEnv([campaign()]), own: quoted() });
         const frozen = hashOf(live);
         const link = { campaignId: 'test-campaign-a', configSha256: frozen, claimed: false };
         const cases: [string, Record<string, string | undefined> | null, typeof link, string][] = [
-            ['runtime off', {}, link, 'trial_unavailable'],
+            ['no registry configured', {}, link, 'trial_unavailable'],
             ['invalid registry', runtimeEnv([campaign()], { SPONSOR_REGISTRY_SIG: 'bad' }), link, 'trial_unavailable'],
-            ['campaign disabled', runtimeEnv([campaign({ enabled: false })]), link, 'trial_unavailable'],
-            ['campaign expired', runtimeEnv([campaign({ expiresAt: '2026-10-11T12:00:00Z' })]), link, 'trial_unavailable'],
+            // Not release proof (removed or runtime off): the link stays and the request refuses.
+            ['runtime off (verified registry)', runtimeEnv([campaign()], { SPONSOR_TRIALS_ENABLED: '0' }), link, 'trial_unavailable'],
             ['campaign removed', runtimeEnv([campaign({ campaignId: 'test-campaign-z', tokenSha256: hashSponsorToken('token-z-0000000000000000') })]), link, 'trial_unavailable'],
+            // Known and explicitly inactive (revocation/expiry advances the live hash): provable, so only an explicit re-quote may release it.
+            ['campaign disabled (live hash advanced)', runtimeEnv([campaign({ enabled: false })]), link, 'trial_quote_stale'],
+            ['campaign expired (live hash advanced)', runtimeEnv([campaign({ expiresAt: '2026-10-11T12:00:00Z' })]), link, 'trial_quote_stale'],
             ['config changed', runtimeEnv([campaign({ version: 2 })]), link, 'trial_quote_stale'],
             ['stored hash differs', runtimeEnv([campaign()]), { ...link, configSha256: 'f'.repeat(64) }, 'trial_quote_stale'],
         ];
@@ -2352,14 +2625,69 @@ describe('Sponsor trial router (same Standard trial, never a second grant)', () 
             expect(f.stripe.createCheckoutSession, name).not.toHaveBeenCalled();
             expect(f.trial.attachTrialCheckout, name).not.toHaveBeenCalled();
         }
-        // the explicit public re-quote is the way out: it asks the store to release the unclaimed linkage atomically
-        const off = build({ env: {}, own: quoted(), linkage: link });
-        await expect(off.caller.quoteTrial()).resolves.toMatchObject({ sku });
-        expect((off.trial.claimTrialQuote.mock.calls[0]![0] as { publicSponsorMode?: string }).publicSponsorMode).toBe('release');
+        // Proven inactive with an unchanged hash too (known campaign, explicitly inactive): an explicit re-quote may release it, so checkout is stale.
+        for (const env of [runtimeEnv([campaign({ enabled: false })]), runtimeEnv([campaign({ expiresAt: '2026-10-11T12:00:00Z' })])]) {
+            const probe = build({ env });
+            const f = build({ env, own: quoted(), linkage: { campaignId: 'test-campaign-a', configSha256: hashOf(probe), claimed: false } });
+            await expect(co(f)).rejects.toMatchObject({ message: 'trial_quote_stale' });
+            expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+        }
+        // A legacy selection without its required link is stale too.
+        const unlinked = build({ env: runtimeEnv([campaign()]), own: quoted() });
+        await expect(co(unlinked, { coupon: 'test-partner-a', fingerprint: 'a'.repeat(64) })).rejects.toMatchObject({ message: 'trial_quote_stale' });
     });
 
-    it('global checkout off is unchanged and independent: a valid sponsor does not turn checkout on', async () => {
-        const f = build({ publicTrialEnabled: false, env: runtimeEnv([campaign()], { BILLING_PUBLIC_STANDARD_TRIAL: '0' }), attribution: { campaignId: 'test-campaign-a' }, own: quoted() });
+    it('re-quotes: an active link is never retargeted; only a link a verified registry proves inactive is named for exact conditional release', async () => {
+        const live = build({ env: runtimeEnv([campaign()]), own: quoted() });
+        const link = { campaignId: 'test-campaign-a', configSha256: hashOf(live), claimed: false };
+        const active = build({ env: runtimeEnv([campaign()]), own: quoted(), linkage: link });
+        await expect(active.caller.quoteTrial({ coupon: 'midhun' })).rejects.toMatchObject({ message: 'trial_quote_stale' });
+        await expect(active.caller.trialOffer({ coupon: 'midhun' })).rejects.toMatchObject({ message: 'trial_quote_stale' });
+        expect(active.trial.claimTrialQuote).not.toHaveBeenCalled();
+        // No new selection: the active link resumes as the same legacy quote.
+        await expect(active.caller.quoteTrial()).resolves.toMatchObject({ offer: { source: 'sponsor' } });
+        expect(modeOf(active)).toMatchObject({ kind: 'legacy', sponsor: { campaignId: 'test-campaign-a' } });
+        for (const [env, alias, kind] of [[runtimeEnv([campaign({ enabled: false })]), undefined, 'public'],
+            [runtimeEnv([campaign({ expiresAt: '2026-10-11T12:00:00Z' })]), 'midhun', 'product']] as const) {
+            // The link keeps its FROZEN hash (the live one advanced); the store's compare-and-delete gets exactly the frozen values.
+            const f = build({ env, own: quoted(), linkage: link });
+            await f.caller.quoteTrial(alias ? { coupon: alias } : undefined);
+            expect(modeOf(f)).toEqual({ kind, releaseInactiveLink: { campaignId: 'test-campaign-a', configSha256: link.configSha256, quotedAt } });
+        }
+        // Not proof (no registry, removed campaign, runtime off): the link stays; the quote refuses before any claim, a promoter included.
+        for (const env of [{}, runtimeEnv([campaign({ campaignId: 'test-campaign-z', tokenSha256: hashSponsorToken('token-z-0000000000000000') })]),
+            runtimeEnv([campaign()], { SPONSOR_TRIALS_ENABLED: '0' })]) {
+            const unprovable = build({ env, own: quoted(), linkage: link });
+            await expect(unprovable.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_unavailable' });
+            await expect(unprovable.caller.quoteTrial({ coupon: 'midhun' })).rejects.toMatchObject({ message: 'trial_quote_stale' });
+            expect(unprovable.trial.claimTrialQuote).not.toHaveBeenCalled();
+        }
+        // A LEGACY alias for another campaign over the proven-inactive link: not releasable, so availability refuses before any quote.
+        const otherCampaign = campaign({ campaignId: 'test-campaign-b', partnerId: 'test-partner-b', tokenSha256: hashSponsorToken('token-b-0000000000000000') });
+        const legacyB = build({ env: runtimeEnv([campaign({ enabled: false }), otherCampaign]), own: quoted(), linkage: link });
+        await expect(legacyB.caller.trialOffer({ coupon: 'test-partner-b' })).rejects.toMatchObject({ message: 'trial_quote_stale' });
+        await expect(legacyB.caller.quoteTrial({ coupon: 'test-partner-b' })).rejects.toMatchObject({ message: 'trial_quote_stale' });
+        expect(legacyB.trial.claimTrialQuote).not.toHaveBeenCalled();
+        // The store's own lock-time refusal (link changed or still active) is stale.
+        const raced = build({ env: runtimeEnv([campaign({ enabled: false })]), own: quoted(), linkage: link });
+        raced.trial.claimTrialQuote.mockResolvedValueOnce({ status: 'refused', reason: 'sponsor_pending' } as never);
+        await expect(raced.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_quote_stale' });
+    });
+
+    it('a pending link has unknown provenance: when its campaign alias is also a Product promoter, quote and checkout fail closed, link intact', async () => {
+        const env = runtimeEnv([campaign({ partnerId: 'midhun' })]);   // midhun is a CAMPAIGNS_ON promoter
+        const probe = build({ env });
+        const linkage = { campaignId: 'test-campaign-a', configSha256: hashOf(probe), claimed: false };
+        const f = build({ env, own: quoted(), linkage });
+        await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+        await expect(co(f)).rejects.toMatchObject({ message: 'trial_offer_unavailable' });
+        expect((await f.caller.summary() as { trialOffer?: unknown }).trialOffer).toBeNull();
+        expect(f.trial.claimTrialQuote).not.toHaveBeenCalled();
+        expect(f.stripe.createCheckoutSession).not.toHaveBeenCalled();
+    });
+
+    it('global checkout off is unchanged and independent: a valid carried context does not turn checkout on', async () => {
+        const f = withCookie({ read: PUBLIC_OFF, env: runtimeEnv([campaign()]), own: quoted() }, probe => carried(probe));
         f.deps.stripe = null;
         await expect(f.caller.quoteTrial()).rejects.toMatchObject({ message: 'billing_not_configured' });
         expect(f.trial.claimTrialQuote).not.toHaveBeenCalled();

@@ -48,7 +48,7 @@ describe('sponsor bridge signup authority', () => {
         await expect(bridgeAuth0Identity(unsupported, sponsorFromLink(token)!)).rejects.toThrow('invalid_transaction');
         expect(stub.listUsers).not.toHaveBeenCalled(); expect(stub.createUser).not.toHaveBeenCalled();
         expect(stub.materialize).not.toHaveBeenCalled();
-        await expect(bridgeAuth0Identity(unsupported)).resolves.toBeUndefined();
+        await expect(bridgeAuth0Identity(unsupported)).resolves.toEqual({ userId: 'existing-user' });
         expect(stub.createUser).toHaveBeenCalledWith({ email: identity.email, email_confirm: true, app_metadata: { auth0_sub: unsupported.sub } });
         expect(stub.verifyOtp).toHaveBeenCalledOnce(); expect(stub.materialize).not.toHaveBeenCalled();
     });

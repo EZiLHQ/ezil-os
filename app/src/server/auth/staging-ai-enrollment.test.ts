@@ -462,7 +462,7 @@ describe('staging AI enrollment with a bounded owned connection', () => {
         if (failure === 'throw') clients[0].end.mockImplementationOnce(() => { throw error; });
         else clients[0].end.mockRejectedValueOnce(error);
         releaseHeld();
-        await expect(signingIn).resolves.toBeUndefined();
+        await expect(signingIn).resolves.toEqual({ userId });
         expect(sockets[0].destroyed).toBe(true);
         expect(stub.verifyOtp).toHaveBeenCalledOnce();
         expect(warn).not.toHaveBeenCalled();
@@ -470,7 +470,7 @@ describe('staging AI enrollment with a bounded owned connection', () => {
 
     it.each(['role', 'probe', 'enroll', 'outbox'] as const)('still mints the normal Supabase session after %s failure', async stage => {
         failStage = stage;
-        await expect(mockSignIn()()).resolves.toBeUndefined();
+        await expect(mockSignIn()()).resolves.toEqual({ userId });
         expect(stub.generateLink).toHaveBeenCalledOnce();
         expect(stub.verifyOtp).toHaveBeenCalledExactlyOnceWith({ type: 'magiclink', token_hash: 'fixture-otp' });
         expect(clients[0].end.mock.invocationCallOrder[0]).toBeLessThan(stub.generateLink.mock.invocationCallOrder[0]);

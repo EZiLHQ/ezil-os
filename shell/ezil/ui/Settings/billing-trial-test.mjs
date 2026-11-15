@@ -573,6 +573,269 @@ test('usage during a trial: the same three rows; credits are the server\'s balan
     assert.doesNotMatch(billing, /trial/i);
 });
 
+
+// ── Promoter link (?coupon=<alias>) and the public free month, gated by the server's availability read ─────────────
+
+const FP = 'a'.repeat(64), FP2 = 'b'.repeat(64);
+// Stage: an 'available' read always carries the server's exact offer (the read's own answer, never inferred).
+const view = (h, summary, link) => h.api.format.withCouponView(summary, link?.status === 'available' && ! ('offer' in link)
+    ? { ...link, offer: { coupon: link.alias ?? null, fingerprint: FP, source: link.alias ? 'promoter' : 'public' } } : link);
+/** 1 when the page offers the free month anywhere (Billing shows it on more than one card), else 0. */
+const ctas = (h, summary) => h.fragment(h.api.summaryV3Html(summary)).querySelector('[data-action="trial"]') ? 1 : 0;
+const notice = (h, summary) => h.fragment(h.api.summaryV3Html(summary)).querySelector('[data-role="coupon-notice"]');
+/** A `billing.quoteTrial` reply that carries the server's offer. */
+const offered = (trialEndsAt, offer, quotedAt) => { const q = quote(trialEndsAt, quotedAt); return ok({ ...q.data, offer }); };
+const END = '2027-02-28T03:00:00Z';
+
+test('link: the alias is canonical, and a repeated or malformed one is invalid, never the public offer', async h => {
+    const f = h.api.format;
+    assert.equal(f.couponAlias(' MidHun '), 'midhun');
+    // Stage sends the union of the server's grammars (Product promoter 2-32, no underscore; legacy partner 3-64 with underscores).
+    for ( const bad of ['', 'a', 'x'.repeat(65), 'a_', '_midhun', 'bad alias', '-midhun', 'mid/hun', 'mid.hun', 'https://evil.example', null, undefined, 7] ) assert.equal(f.couponAlias(bad), null, String(bad));
+    for ( const good of ['ab', '9z', 'x'.repeat(32), 'mid-hun', 'mid_hun', 'x'.repeat(33), 'x'.repeat(64), 'acme_partner-1'] ) assert.equal(f.couponAlias(good), good, good);
+    assert.deepEqual(plain(f.couponFromSearch('?coupon=MIDHUN')), { alias: 'midhun' });
+    assert.deepEqual(plain(f.couponFromSearch('?settings=billing&coupon=midhun&coupon=other')), { invalid: true });
+    assert.deepEqual(plain(f.couponFromSearch('?coupon=bad%20alias')), { invalid: true });
+    assert.deepEqual(plain(f.couponFromSearch('?coupon=')), { invalid: true });
+    assert.deepEqual(plain(f.couponFromSearch('?coupon_entry=invalid')), { invalid: true });
+    assert.deepEqual(plain(f.couponFromSearch('?settings=billing')), {});
+});
+
+test('availability: only the server\'s available+eligible offer enables the CTA, public or promoter; summary alone never does', async h => {
+    const base = trialSummaryV3('offer', { endsAt: '2026-12-05T03:30:00Z' });
+    const nullPublic = summaryV3('free'); delete nullPublic.trialOffer;   // public switch off: summary.trialOffer is null
+    // Public: available enables, anything else hides the free month even when the summary previews one.
+    assert.equal(ctas(h, view(h, base, { alias: null, status: 'available' })), 1);
+    for ( const status of ['checking', 'unavailable', 'invalid', 'refused', 'error'] ) {
+        assert.equal(ctas(h, view(h, base, { alias: null, status })), 0, `public ${status}`);
+        assert.equal(view(h, base, { alias: null, status }).trialOffer, undefined);
+        assert.equal(notice(h, view(h, base, { alias: null, status })), null, 'no notice for the public offer');
+    }
+    assert.equal(ctas(h, view(h, nullPublic, { alias: null, status: 'unavailable' })), 0, 'public off: no free-month promise');
+    // Promoter with a null summary offer: the read query alone enables the CTA, with an honest preview.
+    const promo = view(h, nullPublic, { alias: 'midhun', status: 'available' });
+    assert.equal(ctas(h, promo), 1);
+    assert.equal(promo.trialOffer.coupon, 'midhun');
+    const card = h.fragment(h.api.summaryV3Html(promo)).querySelector('[data-role="trial-offer"]');
+    // Stage's own card copy, with the honest no-preview wording ("the end of your free month") until the quote.
+    assert.match(clean(card), /\$0 today \$20\/month from the end of your free month One calendar month\. Card required\. Cancel before the end of your free month and you pay nothing\./);
+    assert.match(clean(notice(h, promo)), /Your free-month link is ready/);
+    // A promoter that is not proven available never gets a CTA, even if the summary's public offer is eligible.
+    for ( const status of ['checking', 'invalid', 'unavailable', 'refused', 'error'] ) {
+        const v = view(h, base, { alias: 'midhun', status });
+        assert.equal(ctas(h, v), 0, `promoter ${status}`);
+        assert.equal(notice(h, v).dataset.state, status);
+    }
+    assert.equal(notice(h, view(h, base, { alias: 'midhun', status: 'error' })).querySelector('[data-action="coupon-retry"]') !== null, true, 'a transient failure offers Try again');
+    assert.equal(notice(h, view(h, base, { alias: 'midhun', status: 'unavailable' })).querySelector('button'), null);
+    // A malformed address never asks and never falls to the public offer.
+    const malformed = view(h, base, { alias: null, invalid: true });
+    assert.equal(ctas(h, malformed), 0);
+    assert.equal(notice(h, malformed).dataset.state, 'invalid');
+    // A used-trial person is told why, never enabled, and the paid Standard path stays.
+    const used = trialSummaryV3('ineligible', { reason: 'trial_used' });
+    const refused = view(h, used, { alias: 'midhun', status: 'refused' });
+    assert.equal(ctas(h, refused), 0);
+    assert.match(clean(notice(h, refused)), /already used your free month/);
+    assert.equal(view(h, used, { alias: 'midhun', status: 'available' }).trialOffer.coupon, 'midhun', 'only the server read can say a person is eligible');
+    // Not a Free viewer: unchanged.
+    const standard = summaryV3('standard');
+    assert.equal(view(h, standard, { alias: 'midhun', status: 'available' }), standard);
+});
+
+test('quote: a promoter link asks with its alias and echoes the ACTIVATION quote\'s offer and end, never an availability fingerprint', async h => {
+    h.replies['billing.quoteTrial'] = () => offered(END, { coupon: 'midhun', fingerprint: FP2 });
+    h.replies['billing.createCheckout'] = () => embedded;
+    h.openTrial({ coupon: 'midhun', timeZone: 'UTC' });
+    await settle();
+    assert.deepEqual(plain(h.calls.filter(c => c.method === 'billing.quoteTrial').map(c => c.input)), [{ coupon: 'midhun' }]);
+    assert.deepEqual(plain(h.calls.filter(c => c.method === 'billing.createCheckout').map(c => c.input)),
+        [{ sku: 'standard_monthly_v3', trial: { trialEndsAt: END, offer: { coupon: 'midhun', fingerprint: FP2 } } }]);
+    assert.equal(h.mounted, 1);
+    assert.equal(h.q('[data-action="trial-continue"]'), null);
+});
+
+test('quote: the public free month sends no coupon and echoes its own server offer', async h => {
+    h.replies['billing.quoteTrial'] = () => offered(END, { coupon: null, fingerprint: FP });
+    h.replies['billing.createCheckout'] = () => embedded;
+    h.openTrial({ timeZone: 'UTC' });
+    await settle();
+    assert.deepEqual(h.calls.filter(c => c.method === 'billing.quoteTrial').map(c => c.input), [undefined]);
+    assert.deepEqual(plain(h.calls.filter(c => c.method === 'billing.createCheckout').map(c => c.input)),
+        [{ sku: 'standard_monthly_v3', trial: { trialEndsAt: END, offer: { coupon: null, fingerprint: FP } } }]);
+});
+
+test('quote: a reply for another link, another offer or a bad fingerprint is refused, never shown, never a checkout', async h => {
+    const bad = [{ coupon: 'other', fingerprint: FP }, { coupon: null, fingerprint: FP }, { coupon: 'midhun', fingerprint: 'A'.repeat(64) },
+        { coupon: 'midhun', fingerprint: 'abc' }, { coupon: 'midhun' }, 'midhun', null];
+    for ( const offer of bad ) {
+        h.replies['billing.quoteTrial'] = () => offered(END, offer);
+        h.openTrial({ coupon: 'midhun' });
+        await settle();
+        assert.ok(h.q('[data-action="retry"]'), JSON.stringify(offer));
+        assert.equal(h.count('billing.createCheckout'), 0, JSON.stringify(offer));
+        h.handle.close();
+    }
+    // A promoter link whose reply has NO offer at all cannot fall back to the public terms.
+    h.replies['billing.quoteTrial'] = () => quote(END);
+    h.openTrial({ coupon: 'midhun' });
+    await settle();
+    assert.equal(h.count('billing.createCheckout'), 0);
+    assert.ok(h.q('[data-action="retry"]'));
+    h.handle.close();
+    // And a public quote must not carry a promoter offer.
+    h.replies['billing.quoteTrial'] = () => offered(END, { coupon: 'midhun', fingerprint: FP });
+    h.openTrial();
+    await settle();
+    assert.equal(h.count('billing.createCheckout'), 0);
+});
+
+test('stale: the re-quote keeps the SAME alias and only the new offer reaches checkout (Stage: no Continue step)', async h => {
+    const second = '2027-02-28T03:41:07Z';
+    let quotes = 0, creates = 0;
+    h.replies['billing.quoteTrial'] = () => quotes++ ? offered(second, { coupon: 'midhun', fingerprint: FP2 }) : offered(END, { coupon: 'midhun', fingerprint: FP });
+    h.replies['billing.createCheckout'] = () => creates++ ? embedded : fail('trial_quote_stale');
+    h.openTrial({ coupon: 'midhun', timeZone: 'UTC' });
+    await settle();
+    assert.deepEqual(plain(h.calls.filter(c => c.method === 'billing.quoteTrial').map(c => c.input)), [{ coupon: 'midhun' }, { coupon: 'midhun' }]);
+    assert.equal(h.q('[data-action="trial-continue"]'), null);
+    assert.deepEqual(plain(h.calls.filter(c => c.method === 'billing.createCheckout').map(c => c.input.trial)),
+        [{ trialEndsAt: END, offer: { coupon: 'midhun', fingerprint: FP } }, { trialEndsAt: second, offer: { coupon: 'midhun', fingerprint: FP2 } }]);
+    assert.equal(h.mounted, 1);
+});
+
+// ── Stage: the verified opaque invite carried by the server's HttpOnly cookie (no coupon in the address) ──────────
+
+const sponsorPreview = () => { const s = trialSummaryV3('offer', { endsAt: '2026-12-05T03:30:00Z' }); s.trialOffer.source = 'sponsor'; return s; };
+
+test('stage carrier: no alias, the server-selected sponsor offer is shown read-only with ONE CTA and bound to the read', async h => {
+    const sponsorSummary = sponsorPreview();
+    // Stable Stage DTO (96fb2fa3): a carrier-only legacy invite is `source: 'sponsor', coupon: null`.
+    const invite = { coupon: null, fingerprint: FP, source: 'sponsor' };
+    const v = view(h, sponsorSummary, { alias: null, status: 'available', offer: invite });
+    assert.equal(ctas(h, v), 1);
+    assert.equal(v.trialOffer.request, null, 'quoted with the same (empty) input the read used');
+    assert.deepEqual(plain(v.trialOffer.offer), invite, 'the exact server offer the read showed');
+    const html = h.fragment(h.api.summaryV3Html(v));
+    assert.match(clean(html.querySelector('[data-role="coupon-offer"]')), /Coupon offer unlocked/);
+    // Stage's existing layout offers the same activation from the plan header and the Standard card: one action, one SKU.
+    const buttons = [...html.querySelectorAll('[data-action="trial"]')];
+    assert.ok(buttons.length > 0);
+    assert.deepEqual([...new Set(buttons.map(button => `${button.dataset.action}:${button.dataset.sku}`))], ['trial:standard_monthly_v3'], 'one activation');
+    assert.equal(html.querySelector('[data-action="checkout"][data-sku="standard_monthly_v3"]'), null, 'no second, paid path in its place');
+    assert.equal(notice(h, v), null, 'the invite keeps Stage\'s own card, not a link notice');
+});
+
+test('stage carrier: a present invite the read refuses fails closed with an explanation, never the public offer', async h => {
+    const sponsorSummary = sponsorPreview();
+    for ( const status of ['unavailable', 'invalid', 'refused', 'error', 'stale'] ) {
+        const v = view(h, sponsorSummary, { alias: null, status });
+        assert.equal(ctas(h, v), 0, status);
+        assert.equal(v.trialOffer, undefined, `${status}: the summary's sponsor preview alone promises nothing`);
+        const n = notice(h, v);
+        assert.ok(n, `${status}: says so`);
+        assert.equal(n.dataset.state, status);
+        assert.equal(h.fragment(h.api.summaryV3Html(v)).querySelector('[data-role="coupon-offer"]'), null);
+        assert.equal(n.querySelector('[data-action="coupon-retry"]') !== null, ['error', 'stale'].includes(status));
+    }
+    // A summary that only previews a public offer and a refused read: hidden, no notice (MAIN's public rule).
+    const pub = view(h, trialSummaryV3('offer', { endsAt: '2026-12-05T03:30:00Z' }), { alias: null, status: 'unavailable' });
+    assert.equal(ctas(h, pub), 0);
+    assert.equal(notice(h, pub), null);
+});
+
+test('stage entry hint: a failed coupon entry never falls back to the public offer; only the server\'s invite may still show', async h => {
+    const publicOffer = trialSummaryV3('offer', { endsAt: '2026-12-05T03:30:00Z' });
+    for ( const entry of ['unavailable', 'identity_required'] ) {
+        const v = view(h, publicOffer, { alias: null, status: 'available', hinted: true });
+        const html = h.fragment(h.api.summaryV3Html(v, null, { couponEntry: entry }));
+        assert.equal(html.querySelector('[data-action="trial"]'), null, `${entry}: no public free month after a failed entry`);
+        assert.ok(html.querySelector('[data-role="coupon-entry"]'), `${entry}: Stage's entry card explains`);
+        assert.equal(html.querySelector('[data-role="coupon-notice"]'), null, 'one explanation, not two');
+    }
+    const invite = { coupon: null, fingerprint: FP, source: 'sponsor' };
+    const v = view(h, sponsorPreview(), { alias: null, status: 'available', offer: invite, hinted: true });
+    const html = h.fragment(h.api.summaryV3Html(v, null, { couponEntry: 'identity_required' }));
+    assert.ok(html.querySelector('[data-action="trial"]'), 'the server\'s own invite still shows');
+    assert.ok(html.querySelector('[data-role="coupon-offer"]'));
+    assert.equal(html.querySelector('[data-role="coupon-entry"]'), null);
+});
+
+test('stage carrier: the activation quote must be the exact shown invite, and Checkout echoes it; anything else stops', async h => {
+    const invite = { coupon: null, fingerprint: FP, source: 'sponsor' };
+    h.replies['billing.quoteTrial'] = () => offered(END, { coupon: null, fingerprint: FP, source: 'sponsor' });
+    h.replies['billing.createCheckout'] = () => embedded;
+    h.openTrial({ trialOffer: invite, timeZone: 'UTC' });
+    await settle();
+    assert.deepEqual(h.calls.filter(c => c.method === 'billing.quoteTrial').map(c => c.input), [undefined], 'no coupon sent: the server reads its own carrier');
+    assert.deepEqual(plain(h.calls.filter(c => c.method === 'billing.createCheckout').map(c => c.input)),
+        [{ sku: 'standard_monthly_v3', trial: { trialEndsAt: END, offer: { coupon: null, fingerprint: FP } } }]);
+    assert.equal(h.mounted, 1);
+    h.handle.close();
+    for ( const other of [{ coupon: null, fingerprint: FP2 }, { coupon: 'acme_partner', fingerprint: FP }, { coupon: 'other', fingerprint: FP }, undefined] ) {
+        h.calls.length = 0;
+        h.replies['billing.quoteTrial'] = () => other === undefined ? quote(END) : offered(END, other);
+        h.openTrial({ trialOffer: invite });
+        await settle();
+        assert.equal(h.count('billing.createCheckout'), 0, JSON.stringify(other));
+        assert.ok(h.q('[data-action="retry"]'), JSON.stringify(other));
+        h.handle.close();
+    }
+});
+
+for ( const [code, copy] of [['trial_offer_invalid', /free-month link isn't valid/], ['trial_offer_unavailable', /isn't available right now/], ['trial_unavailable', /isn't available for this account/]] ) {
+    test(`stop: ${code} explains in Billing, never a checkout, a second quote, or the public offer`, async h => {
+        h.replies['billing.quoteTrial'] = () => fail(code);
+        h.openTrial({ coupon: 'midhun' });
+        await settle();
+        assert.match(h.text(), copy);
+        assert.ok(h.q('[data-action="return-to-billing"]'));
+        assert.equal(h.q('[data-action="retry"]'), null);
+        assert.equal(h.count('billing.quoteTrial'), 1);
+        assert.equal(h.count('billing.createCheckout'), 0);
+        // The refusal can also arrive at checkout creation: still a stop, never another offer.
+        h.handle.close();
+        h.replies['billing.quoteTrial'] = () => offered(END, { coupon: 'midhun', fingerprint: FP });
+        h.replies['billing.createCheckout'] = () => fail(code);
+        h.openTrial({ coupon: 'midhun' });
+        await settle();
+        assert.match(h.text(), copy);
+        assert.ok(h.q('[data-action="return-to-billing"]'));
+        assert.equal(h.count('billing.createCheckout'), 1);
+    });
+}
+
+test('retry: a provider outage (stripe_unavailable) retries the SAME alias, at quote and at checkout, then proceeds', async h => {
+    let quotes = 0, creates = 0;
+    h.replies['billing.quoteTrial'] = () => quotes++ ? offered(END, { coupon: 'midhun', fingerprint: FP }) : fail('stripe_unavailable');
+    h.replies['billing.createCheckout'] = () => creates++ ? embedded : fail('stripe_unavailable');
+    h.openTrial({ coupon: 'midhun', timeZone: 'UTC' });
+    await settle();
+    assert.match(h.text(), /Payments are unavailable right now/);
+    h.click('[data-action="retry"]');
+    await settle();
+    assert.match(h.text(), /Payments are unavailable right now/, 'checkout creation failed once: Retry again with the same quote');
+    h.click('[data-action="retry"]');
+    await settle();
+    assert.deepEqual(plain(h.calls.filter(c => c.method === 'billing.quoteTrial').map(c => c.input)), [{ coupon: 'midhun' }, { coupon: 'midhun' }]);
+    assert.deepEqual(plain(h.calls.filter(c => c.method === 'billing.createCheckout').map(c => c.input.trial.offer)), [{ coupon: 'midhun', fingerprint: FP }, { coupon: 'midhun', fingerprint: FP }]);
+    assert.equal(h.mounted, 1);
+});
+
+test('late: a quote answered after the sheet closed never opens checkout; a second activation while one is busy sends nothing more', async h => {
+    let release;
+    h.replies['billing.quoteTrial'] = () => new Promise(resolve => { release = () => resolve(offered(END, { coupon: 'midhun', fingerprint: FP })); });
+    h.replies['billing.createCheckout'] = () => embedded;
+    h.openTrial({ coupon: 'midhun' });
+    await settle();
+    assert.equal(h.count('billing.quoteTrial'), 1);
+    h.handle.close();
+    release();
+    await settle();
+    assert.equal(h.count('billing.createCheckout'), 0, 'a late quote for a closed sheet is dropped');
+    assert.equal(h.mounted, 0);
+});
+
 let failed = 0, scanned = 0;
 for ( const { name, fn } of tests ) {
     const h = harness();

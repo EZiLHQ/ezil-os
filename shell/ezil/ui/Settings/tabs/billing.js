@@ -9,7 +9,7 @@ import { openConfirmSheet } from '../sheet-frame.js';
 import { billingRecoveryAction, openTopupSheet, topupOffer } from '../topup-sheet.js';
 import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, hoursLeftLines, heldClosedSize, heldClosedText,
     accountCredits, accountDetailsHtml, staleCreditsCopy, paidComputeUnmetered, TRIAL_SKU, trialOfferOf, trialIneligibleCopy, planTrialOf, trialAmount,
-    trialDayLabel, trialMomentLabel } from '../billing-format.js';
+    trialDayLabel, trialMomentLabel, withCouponView, couponFromSearch, offerOf } from '../billing-format.js';
 import { settingsAliasSearch } from '../../../app-link.js';
 
 const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
@@ -586,8 +586,10 @@ function currentPlanV3 (summary, banner) {
     const status = { free: 'Free', active: 'Active', cancels: 'Ends soon', past_due: 'Past due', incomplete: 'Payment incomplete', upgrade_pending: 'Upgrade pending' }[plan.status] ?? 'Active';
     const offer = offerFor(summary, plan.sku);
     // Product entitlements v1: a plan an EZiL operator assigned is not a payment: no price, renewal or Stripe action.
+    // It names the issuing organization the server reports (EZiL when none was given, or from an older server).
     const assigned = plan.access?.source === 'operator' ? plan.access : null;
-    const price = assigned ? 'Assigned by EZiL · no payment' : plan.sku === 'free_v3' ? '$0' : offer ? `${dollars(offer.priceCents, { compact: true })} / month`
+    const issuedBy = typeof assigned?.issuedBy === 'string' && assigned.issuedBy.trim() ? assigned.issuedBy.trim() : 'EZiL';
+    const price = assigned ? `Assigned by ${issuedBy}` : plan.sku === 'free_v3' ? '$0' : offer ? `${dollars(offer.priceCents, { compact: true })} / month`
         : plan.renewal ? `${dollars(plan.renewal.amountCents, { compact: true })} / month` : '';
     const renewal = assigned ? assigned.untilRevoked || !assigned.endsAt ? 'Your access continues until EZiL ends it.' : `Your access ends on ${dateLabel(assigned.endsAt, true)}.`
         : plan.sku === 'free_v3' ? 'Free · no card on file'
@@ -696,6 +698,14 @@ function topupV3 (summary) {
         <div class="ezil-billing-actions">${actionHtml('topup', 'Add credits')}</div></section>`;
 }
 
+/** What the promoter link on this address means for this viewer, in one quiet line (`withCouponView`). */
+function couponNoticeHtml (summary) {
+    const view = summary.couponView;
+    if ( ! view ) return '';
+    const retry = view.retry ? ' <button type="button" class="ezil-settings-btn" data-action="coupon-retry">Try again</button>' : '';
+    return `<p class="ezil-billing-note ezil-billing-coupon" data-role="coupon-notice" data-state="${encode(view.state)}" role="status">${encode(view.copy)}${retry}</p>`;
+}
+
 /** `options`: `userId` (the signed-in user) and `lastAccount`, that user's last readable `ai.account` (kept across reloads of this pane). */
 export function summaryV3Html (summary, usage = null, options = {}) {
     const { plan, actions } = summary;
@@ -704,6 +714,7 @@ export function summaryV3Html (summary, usage = null, options = {}) {
         ${actions.portal ? `<div class="ezil-billing-actions">${linkAction('portal', 'Manage payment')}</div>` : ''}</header>
         ${banner?.html ?? ''}
         ${couponOfferHtml(summary, options.couponEntry)}
+        ${couponNoticeHtml(summary)}
         ${currentPlanV3(summary, banner)}
         ${usageCardV3(summary, usage, options)}
         ${plansV3(summary)}
@@ -782,6 +793,41 @@ function startCountdown ($win, state) {
     state.timer = setInterval(update, 30000);
 }
 
+/**
+ * A coupon or invite entry: the address or in-app context carried a link (valid or not), the root entry left a
+ * `coupon_entry` hint, or the server reports its own invite selection. Billing then stays read-only until the person
+ * presses its CTA: an `upgrade=` intent never auto-opens a quote, a checkout or a full-price fallback.
+ */
+function entryHeld (state) {
+    return !! state.coupon || state.couponEntryPresent === true || !! state.couponEntry || state.invite === true;
+}
+
+/** Consume this route's automatic purchase intents (the address's credits/recovery top-up, an upgrade intent); the next
+ * successful load points at the Billing CTA instead. The person's own Add credits click and Code's relaunch are kept. */
+function holdRouteIntents (state) {
+    if ( state.openTopup && state.openTopupExplicit !== true ) { state.openTopup = null; state.heldIntent = true; }
+    if ( state.openUpgrade ) { state.openUpgrade = false; state.heldIntent = true; }
+    // The window's one automatic open is spent on this held route: a re-activation replaying the same route context
+    // (a tab switch, a relaunch with the original route) cannot re-arm it. Explicit actions do not depend on it.
+    state.autoOpened = true;
+}
+
+/** The availability read's verdict (see `withCouponView`): every refusal or failure says which; none enables a CTA. */
+function couponStatus (result, alias) {
+    // Only the server's own `available && eligible` for this person and this offer enables a free month, with a real
+    // fingerprint; a missing or false flag is not available. An alias must come back as that alias. With no alias, Stage's
+    // server may select an invite from its HttpOnly carrier: that exact offer is what is shown, quoted and echoed.
+    if ( result?.ok === true ) {
+        const { available, eligible } = result.data ?? {};
+        const offer = offerOf(result.data?.offer);
+        // With no alias the offer is the public one (no coupon) or the server's own invite selection (`source: 'sponsor'`).
+        const asked = alias === null ? offer && (offer.coupon === null || offer.source === 'sponsor') : offer?.coupon === alias;
+        return available === true && eligible === true && asked ? { status: 'available', offer } : { status: 'error' };
+    }
+    return { status: { trial_offer_invalid: 'invalid', trial_offer_unavailable: 'unavailable', trial_unavailable: 'refused',
+        trial_quote_stale: 'stale' }[result?.message] ?? 'error' };
+}
+
 async function load ($win, state) {
     if ( state.loading || state.pending || state.sheet || state.closed ) return;
     stopCountdown(state);
@@ -792,6 +838,23 @@ async function load ($win, state) {
     const $body = $win.find('[data-role="billing-body"]');
     $body.attr('aria-busy', 'true').html(loadingHtml());
     const history = trpc.query('billing.history').catch(() => ({ ok: false }));
+    // The free month, public or from a promoter link, is promised only if the server's read-only availability check
+    // (`billing.trialOffer`, which claims nothing) says so. It runs beside the summary; the alias is the link's, if any.
+    const kept = state.coupon ?? null;
+    const link = kept ?? { alias: null };
+    const alias = link.alias ?? null;
+    const startUser = state.userId;
+    const availability = link.invalid ? null : trpc.query('billing.trialOffer', alias ? { coupon: alias } : {})
+        .then(result => couponStatus(result, alias), () => ({ status: 'error' }));
+    // The fresh read alone can make this an invite entry (the server's own selection, no coupon): hold this route's
+    // purchase intents from the read itself, for exactly this request, user and link, whatever the summary then does
+    // (a failed summary on a kept window included). No earlier summary is trusted for it.
+    availability?.then(read => {
+        if ( read?.status !== 'available' || read.offer?.source !== 'sponsor' ) return;
+        if ( request !== state.request || state.closed || state.userId !== startUser || (state.coupon ?? null) !== kept ) return;
+        state.invite = true;
+        holdRouteIntents(state);
+    });
     try {
         const result = await trpc.query('billing.summary');
         if ( request !== state.request || ! state.active || state.closed || ! $win.get(0).isConnected ) return;
@@ -806,8 +869,21 @@ async function load ($win, state) {
                 throw new Error('summary for another user');
             }
             if ( accountCredits(account, { userId }) !== null ) state.lastAccount = account;
-            $body.html(result.data.version === 3 ? summaryV3Html(result.data, null, { lastAccount: state.lastAccount, userId, couponEntry: state.couponEntry }) : summaryHtml(result.data));
-            state.summary = result.data;
+            let view = result.data;
+            if ( result.data.version === 3 ) {
+                const read = availability ? await availability : { status: 'invalid' };
+                // Across that await the window, the signed-in user or the link may have changed: drop this answer.
+                if ( request !== state.request || ! state.active || state.closed || ! $win.get(0).isConnected
+                    || state.userId !== startUser || (state.coupon ?? null) !== kept ) return;
+                view = withCouponView(result.data, { alias, status: read.status, offer: read.offer, invalid: link.invalid === true,
+                    hinted: ! alias && !! state.couponEntry });
+            }
+            // The server's own invite selection (its HttpOnly carrier), set for THIS answer once its race checks passed and
+            // before any automatic purchase below: the summary reports it (kept even when the read refuses it), or the
+            // accepted fresh read selected it (`couponStatus` → `withCouponView`) while the summary showed none or public.
+            state.invite = result.data.trialOffer?.source === 'sponsor' || view?.trialOffer?.offer?.source === 'sponsor';
+            $body.html(result.data.version === 3 ? summaryV3Html(view, null, { lastAccount: state.lastAccount, userId, couponEntry: state.couponEntry }) : summaryHtml(result.data));
+            state.summary = view;
             state.loadedAt = Date.now();
             startCountdown($win, state);
             if ( result.data.version === 3 ) void loadUsage($win, state, request);
@@ -826,8 +902,19 @@ async function load ($win, state) {
     // (`reason: insufficient_credits`, or a locked model) opens what this summary calls for: the Standard upgrade on
     // Free, Max/Premium for a locked Premium-only model or Standard plan, and Add credits for paid credit exhaustion (`billingRecoveryAction`). A plain Add credits request opens the top-up dialog.
     // Either falls back to the AI credits row.
+    // A coupon, invite or failed-entry context (`entryHeld`) is read-only until the Billing CTA. Every automatic purchase
+    // from the address or route it would meet (the AI credits/recovery link's top-up, an upgrade intent) is consumed here,
+    // before any of them can open, and nothing opens; `onActivate` already consumed those it saw. The person's own
+    // Add credits click and Code's recovery relaunch are explicit and are not held. Without such a context, unchanged.
+    if ( state.summary && entryHeld(state) ) {
+        let held = state.heldIntent === true;
+        state.heldIntent = false;
+        if ( state.openTopup && state.openTopupExplicit !== true ) { state.openTopup = null; held = true; }
+        if ( ! state.autoOpened && state.openUpgrade ) { state.autoOpened = true; state.openUpgrade = false; held = true; }
+        if ( held ) $body.find('[data-action="trial"]').get(0)?.focus({ preventScroll: true });
+    }
     const topup = state.summary ? state.openTopup : null;
-    if ( topup ) state.openTopup = null;
+    if ( topup ) { state.openTopup = null; state.openTopupExplicit = false; }
     const recovery = state.summary ? state.openRecovery ?? (topup?.reason === 'insufficient_credits' ? topup : null) : null;
     if ( state.summary ) state.openRecovery = null;
     if ( recovery ? ! openRecovery($win, state, recovery) && recovery.reason === 'insufficient_credits'
@@ -841,7 +928,10 @@ async function load ($win, state) {
         const sku = state.openUpgrade;
         // `upgrade=standard` (the pricing page's Standard card, which advertises the free month) opens the free month
         // when the server offers it to this viewer, and the ordinary Standard checkout otherwise.
-        if ( topup || recovery ) { /* The deep link's section, or Code, asked for billing recovery above. */ } else if ( sku === TRIAL_SKU && trialOfferOf(state.summary) ) openSheet($win, state, 'trial');
+        if ( topup || recovery ) { /* The deep link's section, or Code, asked for billing recovery above. */ } else if ( sku && entryHeld(state) ) {
+            // Held above; kept so no later path can turn a coupon or invite entry into an automatic purchase.
+            state.openUpgrade = false;
+        } else if ( sku === TRIAL_SKU && trialOfferOf(state.summary) ) openSheet($win, state, 'trial');
         else if ( typeof sku === 'string' && offerFor(state.summary, sku) && state.summary.actions.checkout ) openSheet($win, state, 'checkout', sku);
         else if ( ['compute_monthly_v2', 'premium_monthly_v3'].includes(sku) && state.summary.actions.upgrade ) openSheet($win, state, 'upgrade');
         else if ( sku === true && state.summary.actions.checkout ) {
@@ -989,7 +1079,11 @@ function openSheet ($win, state, action, sku, intent = null) {
             upgrade: choice => openSheet($win, state, choice.action, choice.sku) })
             : action === 'topup-checkout' ? upgradeSheetOpener({ ...options, sku: pack.sku, pack, userId: state.userId,
                 onCancel: () => actionStatus($win, 'Checkout closed before payment finished. If you did pay, your credits appear here once the payment is confirmed.') })
-            : action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes, ...(trial ? { trial: true } : {}) })
+            // The trial quotes with the same input the availability read used (the link's alias, or none for the public
+            // offer or the server's carrier) and must come back as the exact offer that read showed.
+            : action === 'checkout' ? upgradeSheetOpener({ ...options, sku, offer, sizes: summary.catalog.sizes, ...(trial ? { trial: true,
+                ...(typeof summary.trialOffer?.request === 'string' ? { coupon: summary.trialOffer.request } : {}),
+                ...(summary.trialOffer?.offer ? { trialOffer: summary.trialOffer.offer } : {}) } : {}) })
             : sheetOpeners[action]({ ...options, summary });
         // The v1 checkout sheet predates onClose. New billing sheets use the callback.
         const checkoutRoot = action === 'checkout' && container.ownerDocument.querySelector('[data-role="upgrade-sheet"]');
@@ -1114,7 +1208,7 @@ export default {
         $pane.on('click', 'button[data-action]', function () {
             if ( this.disabled ) return;
             const action = this.dataset.action;
-            if ( action === 'retry' ) void load($win, state);
+            if ( action === 'retry' || action === 'coupon-retry' ) void load($win, state);
             else if ( action === 'invoices' ) {
                 const heading = $pane.find('[data-role="invoices"] h3').get(0);
                 heading?.scrollIntoView?.({ block: 'start' });
@@ -1140,6 +1234,7 @@ export default {
                 return;
             }
             state.openTopup = request;
+            state.openTopupExplicit = true;   // the person's own Add credits click: never held as an automatic purchase
             tab.trigger('click');
         });
         $win.on('remove.billing', () => {
@@ -1157,19 +1252,33 @@ export default {
         if ( state ) {
             state.active = true;
             state.openUpgrade ||= ctx.openUpgrade;
+            // The promoter link the address carried (`parseBillingDeepLink`). A different link replaces the kept one.
+            const next = ctx.couponAlias || ctx.couponInvalid ? { alias: ctx.couponAlias ?? null, ...(ctx.couponInvalid ? { invalid: true } : {}) } : null;
+            const linkChanged = !! next && (next.alias ?? null) !== (state.coupon?.alias ?? null) || !! next && !! next.invalid !== !! state.coupon?.invalid;
+            if ( linkChanged ) state.coupon = next;
             // The signed-in user the kept AI balance belongs to; another user's is dropped, never shown.
             const userId = ctx?.payload?.user?.id ?? bootPayload()?.user?.id ?? null;
-            if ( userId !== state.userId ) state.lastAccount = null;
+            const userChanged = userId !== state.userId;
+            if ( userChanged ) state.lastAccount = null;
             state.userId = userId;
+            // An answer still in flight for the previous user or link must not land: supersede it and read again.
+            if ( (userChanged || linkChanged) && state.loading ) { state.request++; state.loading = false; }
             // `/app/settings?tab=billing` is the same link as `/os?settings=billing`
             // (docs/APP-ROUTES.md); read both through the boot's own spelling.
             const params = new URLSearchParams(settingsAliasSearch(window.location));
             const couponEntry = params.get('coupon_entry');
             if ( ['unavailable', 'identity_required'].includes(couponEntry) ) state.couponEntry = couponEntry;
+            // Presence, not value: any `coupon_entry` key (from the entry projection or still in the address) holds auto-open.
+            if ( ctx.couponEntryPresent === true || params.has('coupon_entry') ) state.couponEntryPresent = true;
             // `reason=insufficient_credits` (Code's recovery link) frames the same dialog as exhaustion recovery.
             if ( ! state.autoOpened && params.get('settings') === 'billing' && params.get('section') === 'ai-credits' ) {
                 state.openTopup = { reason: params.get('reason') === 'insufficient_credits' ? 'insufficient_credits' : null };
+                state.openTopupExplicit = false;   // from the address, not a click: held for a coupon or invite entry
             }
+            // A coupon link, any coupon_entry or a hint on this route: consume the address/route purchase intents NOW (also
+            // those armed earlier on a no-coupon route of this kept window), so none can fire after a failed summary or a
+            // later route change. The next successful load points at the Billing CTA instead (`heldIntent`).
+            if ( state.coupon || state.couponEntryPresent === true || state.couponEntry ) holdRouteIntents(state);
             void load($win, state);
         }
     },

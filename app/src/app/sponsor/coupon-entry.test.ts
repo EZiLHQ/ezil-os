@@ -3,7 +3,8 @@ import { NextRequest } from 'next/server';
 const stub = vi.hoisted(() => ({ token: vi.fn(), coupon: vi.fn(), authorize: vi.fn(), user: vi.fn() }));
 vi.mock('@/server/auth/sponsor-entry', () => ({ sponsorEntryAvailable: stub.token, sponsorCouponEntryAvailable: stub.coupon }));
 vi.mock('@/server/auth/auth0', () => ({ AUTH0_COOKIE: '__Host-ezil-auth0', AUTH0_COOKIE_OPTIONS: { httpOnly: true, secure: true, sameSite: 'lax', path: '/' }, Auth0Error: class extends Error {}, buildAuthorizeUrl: stub.authorize }));
-vi.mock('@/server/auth/sponsor', () => ({ sponsorFromLink: () => ({ campaignId: 'fixture' }), sponsorFromCoupon: () => ({ campaignId: 'fixture' }), materializeSponsorAttribution: vi.fn(), sponsorSubjectSupported: () => true }));
+vi.mock('@/server/auth/sponsor', () => ({ sponsorFromLink: () => ({ campaignId: 'fixture' }), sponsorFromCoupon: () => ({ campaignId: 'fixture' }),
+    legacyCouponResolution: () => ({ kind: 'active', campaign: { campaignId: 'fixture' } }), materializeSponsorAttribution: vi.fn(), sponsorSubjectSupported: () => true }));
 vi.mock('@/server/auth/sponsor-entry-context', () => ({ SPONSOR_ENTRY_COOKIE: '__Host-ezil-sponsor-entry', SPONSOR_ENTRY_COOKIE_OPTIONS: { httpOnly: true, secure: true, sameSite: 'lax', path: '/' }, sponsorEntryContext: () => 'signed-campaign' }));
 vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({ auth: { getUser: stub.user } }) }));
 import { GET } from './coupon/route';
