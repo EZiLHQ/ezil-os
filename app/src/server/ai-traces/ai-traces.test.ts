@@ -7,7 +7,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import fixture from './fixture.json';
 import { parseBatch, validateInferenceTrace } from './schema';
 import { handleAiTracesPost } from './http-handler';
-import { ingestTraces, retainTraces } from './store';
+import { retainTraces } from './store';
 import { gatewayLink, queryTraces, tokenValue } from './admin';
 import { TraceTable } from '../../app/admin/ai-traces/view';
 const user = '30000000-0000-4000-8000-000000000001';
@@ -30,7 +30,10 @@ describe('strict Carbon metadata', () => {
     });
     it('rejects injections at every nested boundary, malformed enums, unsafe numerics and semantic claims', () => {
         for (const path of ['', 'offered', 'requested', 'results']) {
-            const bad: any = structuredClone(fixture); (path ? bad[path] : bad).prompt = 'RAW';
+            const bad: Record<string, unknown> = structuredClone(fixture);
+            const target = path ? bad[path] : bad;
+            if (typeof target !== 'object' || target === null || Array.isArray(target)) throw new Error('Invalid injection fixture');
+            Object.assign(target, { prompt: 'RAW' });
             expect(validateInferenceTrace(bad)).toBeNull();
         }
         for (const change of [{ userId: other }, { computerId: other }, { toolArguments: {} }, { error: 'secret' }, { verifiedFileChange: true },
