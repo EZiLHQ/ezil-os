@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage registry capacity 33 over the normal apply-app -> promote order: reader proofs and guards.
+"""Stage registry capacity 34 over the normal apply-app -> promote order; retain older-reader proofs.
 
 Offline only: temporary git repositories, this checkout's own reviewed Git objects (attestation and
 standalone Git host deltas), the real Node probe with a fake fetch, and synthetic CLI results. No AWS, SSM or secret.
@@ -63,8 +63,9 @@ class SourceCapacityTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.repo, (self.cap33, self.cap32, self.twice, self.absent) = source_repo(
+        self.repo, (self.cap34, self.cap33, self.cap32, self.twice, self.absent) = source_repo(
             Path(temporary.name),
+            'export const REBASE_RELEASE_REGISTRY_CAPACITY = 34;',
             'export const REBASE_RELEASE_REGISTRY_CAPACITY = 33;',
             'export const REBASE_RELEASE_REGISTRY_CAPACITY = 32;',
             'export const REBASE_RELEASE_REGISTRY_CAPACITY = 33;\nexport const REBASE_RELEASE_REGISTRY_CAPACITY = 34;',
@@ -93,12 +94,22 @@ class SourceCapacityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
             release.require_reader_capacity(34, self.cap33, self.repo)
 
-    def test_this_checkout_declares_thirty_three_and_ed7_thirty_two(self):
+    def test_this_checkout_declares_thirty_four_and_ed7_thirty_two(self):
         text = (REPO / release.CAPACITY_SOURCE).read_text()
-        self.assertEqual(release.CAPACITY_DECLARATION.findall(text), ['33'])
+        self.assertEqual(release.CAPACITY_DECLARATION.findall(text), ['34'])
         self.assertEqual(release.source_reader_capacity(AGENT_ED7, REPO)[0], 32)
         with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
             release.require_reader_capacity(33, AGENT_ED7, REPO)
+
+    def test_thirty_four_requires_a_matched_source_and_running_reader_and_refuses_thirty_five(self):
+        self.assertEqual(release.require_reader_capacity(34, self.cap34, self.repo)['capacity'], 34)
+        release.require_runtime_capacity({'readerCapacity': 34}, 34)
+        with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
+            release.require_reader_capacity(34, self.cap33, self.repo)
+        with self.assertRaisesRegex(ValueError, 'running app reader capacity is below'):
+            release.require_runtime_capacity({'readerCapacity': 33}, 34)
+        with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
+            release.require_reader_capacity(35, self.cap34, self.repo)
 
 
 class RuntimeCapacityTests(unittest.TestCase):
@@ -396,7 +407,7 @@ class RealHttpProbeTests(unittest.TestCase):
 
 class LegacyGcParityTests(unittest.TestCase):
     def test_frozen_gc_stays_a_thirty_two_record_tool(self):
-        self.assertEqual((TOOL.RELEASE_REGISTRY_CAPACITY, TOOL.ACTIVE_REGISTRY_CAPACITY), (32, 33))
+        self.assertEqual((TOOL.RELEASE_REGISTRY_CAPACITY, TOOL.ACTIVE_REGISTRY_CAPACITY), (32, 34))
         self.assertEqual(gc.tool.RELEASE_REGISTRY_CAPACITY, 32)
         target = release_record()
         records = [dict(target, amiId='ami-' + format(n, '017x'), recipeVersion='1.0.' + str(n)) for n in range(100, 133)]
