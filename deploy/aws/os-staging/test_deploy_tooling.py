@@ -19,7 +19,8 @@ import tempfile
 import unittest
 
 HERE = Path(__file__).parent
-SHA = "0123456789abcdef0123456789abcdef01234567"
+CAPACITY_SOURCE = "app/src/server/lib/compute/aws-rebase-release.ts"
+SHA ="0123456789abcdef0123456789abcdef01234567"
 JOBS = ("telemetry-maintenance", "sandbox-reap", "billing-session-sweep",
         "aws-stop-settle", "pool-replenish", "aws-reconcile")
 
@@ -144,6 +145,10 @@ class Sandbox:
         self.deploy = self.root / "repo/deploy/aws/os-staging"
         shutil.copytree(source, self.deploy, ignore=shutil.ignore_patterns("artifacts", "__pycache__"))
         (self.root / "repo/app").mkdir()
+        # deploy.sh build reads the registry capacity from this exact source; the fixture commits the real file.
+        capacity = self.root / "repo" / CAPACITY_SOURCE
+        capacity.parent.mkdir(parents=True)
+        shutil.copyfile(HERE.resolve().parents[2] / CAPACITY_SOURCE, capacity)
         (self.root / "repo/app/Dockerfile").write_text("FROM scratch\n")
         (self.root / "repo/app/.dockerignore").write_text("*\n")
         (self.root / "repo/.gitignore").write_text("app/ignored.txt\n")
@@ -309,6 +314,18 @@ class LegacyStagingTests(SandboxTestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn('targets staging only', result.stderr)
         self.assertEqual(self.box.calls(), [])
+
+    def test_build_refuses_missing_registry_capacity_source_before_docker(self):
+        repo = self.box.root / 'repo'
+        (repo / CAPACITY_SOURCE).unlink()
+        subprocess.run(['git', '-C', str(repo), '-c', 'user.name=Offline Fixture', '-c', 'user.email=fixture@example.invalid',
+                        'commit', '-qam', 'drop capacity source'], check=True)
+        self.box.sha = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+        result = self.box.deploy_sh('build', 'v1', NEXT_PUBLIC_SUPABASE_URL='https://example.invalid',
+                                    NEXT_PUBLIC_SUPABASE_ANON_KEY='fixture', NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY='pk_test_fixture')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('aws-rebase-release.ts', result.stderr)
+        self.assertFalse(any(c[0] in ('docker', 'aws') for c in self.box.calls()), self.box.calls())
 
 
 if __name__ == '__main__':
