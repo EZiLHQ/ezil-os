@@ -25,8 +25,24 @@ export const AI_PROXY_IDLE_TIMEOUT_MS = 30_000;
  * Streams keep the 30 s headers deadline.
  */
 export const AI_PROXY_COMPLETION_TIMEOUT_MS = 200_000;
-/** Local safety ceiling; gateway validation/413 responses below it pass through. */
-export const AI_PROXY_MAX_BODY_BYTES = 160 * 1024;
+/** Verified Gateway endpoint hard caps; model admission is still enforced upstream. */
+export const AI_PROXY_BODY_LIMITS = { '/v1/messages': 4_194_304, '/v1/responses': 262_144 } as const;
+export const AI_PROXY_MAX_BODY_BYTES = AI_PROXY_BODY_LIMITS['/v1/messages'];
+/** Only a verified upstream contract may advertise larger bodies to the editor. */
+export function effectiveTransport(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  if (raw.contract !== 'ezil.gateway.transport.v1' || raw.input_bound_method !== 'utf8_json_plus_framing'
+    || raw.token_limits_unit !== 'tokens' || !raw.max_request_bytes || typeof raw.max_request_bytes !== 'object') return undefined;
+  const limits = raw.max_request_bytes as Record<string, unknown>;
+  const caps: Record<string, number> = {};
+  for (const [path, hard] of Object.entries(AI_PROXY_BODY_LIMITS)) {
+    const cap = limits[path];
+    if (!Number.isSafeInteger(cap) || (cap as number) <= 0) return undefined;
+    caps[path] = Math.min(hard, cap as number);
+  }
+  return { contract: raw.contract, max_request_bytes: caps, input_bound_method: raw.input_bound_method, token_limits_unit: raw.token_limits_unit };
+}
 /** Error bodies are small JSON; read at most this much of one to log its `error.code`. */
 const MAX_ERROR_BODY_BYTES = 64 * 1024;
 /** A pushed token closer than this to `exp` is not used (the gateway allows 30 s leeway the other way). */
@@ -773,7 +789,7 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
 
   let body: Uint8Array | undefined;
   if (route.method === 'POST') {
-    const bytes = await readLimited(request.body, AI_PROXY_MAX_BODY_BYTES);
+    const bytes = await readLimited(request.body, AI_PROXY_BODY_LIMITS[route.upstreamPath as keyof typeof AI_PROXY_BODY_LIMITS] ?? AI_PROXY_MAX_BODY_BYTES);
     if (bytes === null) {
       log({ status: 413, code: 'body_too_large' });
       return proxyError(413, 'body_too_large', 'Request body is too large.');
@@ -906,6 +922,28 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
     } catch {
       cleanup();
       return proxyError(504, 'os_ai_unavailable', 'EZiL AI did not finish its error response. Retry the request.');
+    }
+  }
+
+  if (route.upstreamPath === '/v1/models') {
+    try {
+      const bytes = await readLimited(passThrough(upstream.body, deps.idleTimeoutMs ?? AI_PROXY_IDLE_TIMEOUT_MS,
+        false, () => {}, abort, false), AI_PROXY_MAX_BODY_BYTES);
+      if (bytes === null) throw new Error('catalog_size');
+      const catalog = JSON.parse(new TextDecoder().decode(bytes));
+      if (!catalog || typeof catalog !== 'object' || Array.isArray(catalog)) throw new Error('catalog_shape');
+      const transport = effectiveTransport(catalog.transport);
+      if (transport) catalog.transport = transport;
+      else delete catalog.transport;
+      cleanup();
+      outHeaders.set('content-type', 'application/json; charset=utf-8');
+      outHeaders.set('cache-control', 'no-store');
+      log({ status: upstream.status, code: null, request_id: requestId });
+      return new Response(JSON.stringify(catalog), { status: upstream.status, headers: outHeaders });
+    } catch {
+      abort.abort();
+      cleanup();
+      return proxyError(502, 'os_ai_unavailable', 'EZiL AI returned an unreadable catalog. Retry the request.');
     }
   }
 

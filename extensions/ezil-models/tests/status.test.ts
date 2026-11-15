@@ -68,7 +68,7 @@ describe('EZiL AI Gateway status', () => {
             expect(h.item.tooltip).toContain('The window limits how many credits you can use per period. It is not your balance.');
             expect(h.item.tooltip).toContain('Window used (held + settled): 7 credits');
             expect(h.item.tooltip).toContain(`Resets at ${reset} (local time)`);
-            expect(h.item.tooltip).toContain('Available credits: 12');
+            expect(h.item.tooltip).toContain('Available credits: 12.345678');
             expect(JSON.stringify(h.popover.mock.calls)).toContain('2-hour window');
         } finally { h.status.dispose(); }
     });
@@ -160,12 +160,12 @@ describe('EZiL AI Gateway status', () => {
             expect(h.item.text).toContain('Loading');
             await h.status.show();
             expect(h.item.text).toBe('EZiL AI · 12 credits');
-            expect(h.item.tooltip).toContain('Held credits: 1');
+            expect(h.item.tooltip).toContain('Pending holds: 1 credits (reserved, not final charges)');
             expect(h.item.tooltip).toContain('qwen.qwen3-coder-next · settled · 1.25 credits');
             expect(h.item.tooltip).toContain(AI_NOTICE);
             expect(h.item.tooltip).not.toContain('$');
             expect(h.item.command).toBe('ezil-models.showStatus');
-            expect(JSON.stringify(h.popover.mock.calls)).toContain('Available credits: 12');
+            expect(JSON.stringify(h.popover.mock.calls)).toContain('Available credits: 12.345678');
             expect(s.calls.map(c => c.url)).toEqual(['https://computer.test/ai/v1/me/balance', 'https://computer.test/ai/v1/me/usage?limit=5', 'https://computer.test/ai/v1/me/limits', 'https://computer.test/ai/v1/models']);
             for (const call of s.calls) expect(call.init).toMatchObject({ method: 'GET', redirect: 'error', cache: 'no-store', headers: { authorization: 'Bearer test-only' } });
         } finally { h.status.dispose(); }
@@ -277,7 +277,7 @@ describe('EZiL AI Gateway status', () => {
             const paused = await view({ ...limits, pauses: [{ scope }] });
             expect(paused.text).toBe('EZiL AI · Paused');
             expect(paused.lines).toContain(`AI paused: ${scope}`);
-            expect(paused.lines).toContain('Available credits: 12');
+            expect(paused.lines).toContain('Available credits: 12.345678');
         }
         const scoped = await view({ ...limits, pauses: [{ scope: 'model' }, { scope: 'client' }] });
         expect(scoped.text).toBe('EZiL AI · 12 credits');
@@ -353,13 +353,13 @@ describe('EZiL AI Gateway status', () => {
         } finally { timeout.mockRestore(); }
     });
 
-    test('microcredits 1, 999999 and 1000001 floor to whole credits in balance, window and held; the per-request charge stays exact', async () => {
+    test('microcredits 1, 999999 and 1000001 show exact balance and pending holds; the compact headline and window use whole credits', async () => {
         for (const [micro, whole, exact] of [[1, '0', '0.000001'], [999999, '0', '0.999999'], [1000001, '1', '1.000001']] as const) {
             const view = statusView(await readAIStatus(provider, server({ available_micro: micro, held_micro: micro,
                 window: { ...creditWindow, remaining_micro: String(micro) } }, { data: [{ ...row, cost_micro: micro + 1, uncollected_micro: 1 }] }).fetch));
             expect(view.text).toStartWith(`EZiL AI · ${whole} credits · 2-hour window ${whole} of 20 left`);
-            expect(view.lines).toContain(`Available credits: ${whole}`);
-            expect(view.lines).toContain(`Held credits: ${whole}`);
+            expect(view.lines).toContain(`Available credits: ${exact}`);
+            expect(view.lines).toContain(`Pending holds: ${exact} credits (reserved, not final charges)`);
             expect(view.lines.join('\n')).toContain(`settled · ${exact} credits`);
         }
         const large = '9007199254740993123456';
@@ -380,7 +380,7 @@ describe('EZiL AI Gateway status', () => {
                 await h.status.show();
                 expect(h.item.text).toBe(label);
                 expect(h.item.tooltip).toContain(detail);
-                expect(h.item.tooltip).toContain('Available credits: 12');
+                expect(h.item.tooltip).toContain('Available credits: 12.345678');
                 expect(JSON.stringify(h.popover.mock.calls)).toContain(detail);
             } finally { h.status.dispose(); }
         }
@@ -437,7 +437,7 @@ describe('EZiL AI Gateway status', () => {
             const rendered = view.lines.join('\n');
             expect(rendered).toContain(failed === '/me/limits' ? 'Limits unavailable.' : failed === '/models' ? 'Global AI availability unknown.'
                 : failed === '/me/balance' ? 'Credits unavailable.' : 'Usage unavailable.');
-            if (failed !== '/me/balance') expect(rendered).toContain('Available credits: 12');
+            if (failed !== '/me/balance') expect(rendered).toContain('Available credits: 12.345678');
             if (failed !== '/me/usage') expect(rendered).toContain('settled · 1.25 credits');
             expect(rendered).not.toMatch(/not_found|private upstream detail|unlimited/);
         }
@@ -466,7 +466,7 @@ describe('EZiL AI Gateway status', () => {
     test('held, window-used and budget-used states use exact server values, never a low-credit threshold', async () => {
         const held = statusView(await readAIStatus(provider, server({ available_micro: 0, held_micro: 1 }).fetch));
         expect(held.text).toBe('EZiL AI · Credits held');
-        expect(held.lines).toContain('Held credits: 0');
+        expect(held.lines).toContain('Pending holds: 0.000001 credits (reserved, not final charges)');
         const used = statusView(await readAIStatus(provider, server({ ...balance, window: { ...creditWindow, remaining_micro: '0' } }).fetch));
         expect(used.text).toStartWith('EZiL AI · 12 credits · 2-hour window used');
         expect(used.lines).toContain('This window’s AI credits are used up.');
@@ -516,5 +516,64 @@ describe('EZiL AI Gateway status', () => {
                 expect(h.item.text).toBe(configured ? 'EZiL AI · 12 credits' : 'EZiL AI · Not configured');
             } finally { h.status.dispose(); }
         }
+    });
+});
+
+describe('exact optional balance accounting', () => {
+    const accounting = (overrides: Record<string, unknown> = {}) => ({ contract: 'ezil.gateway.balance.v1',
+        snapshot_at: '2026-11-15T12:00:00.123456Z', ledger_cursor: '9007199254740993', available_micro: '9007199254740993',
+        held_micro: '3000001', reserved_micro: '2000000', pending_micro: '1000001', settled_debit_micro: '9007199254740995',
+        settled_scope: 'lifetime_ledger', credit_unit: { currency: 'USD', per_credit: '0.10' }, ...overrides });
+    test('exact strings supersede unsafe legacy numbers; whole headline and exact hover distinguish holds and final debits', async () => {
+        const state = await readAIStatus(provider, server({ available_micro: 9007199254740992, held_micro: 3000001, accounting: accounting() }).fetch);
+        expect(state.balance.value?.available_micro).toBe('9007199254740993');
+        const view = statusView(state);
+        expect(view.text).toBe('EZiL AI · 9,007,199,254 credits');
+        expect(view.lines).toContain('Available credits: 9,007,199,254.740993');
+        expect(view.lines).toContain('Reserved: 2 credits');
+        expect(view.lines).toContain('Pending settlement: 1.000001 credits');
+        expect(view.lines).toContain('Final ledger debits (lifetime): 9,007,199,254.740995 credits');
+        expect(view.lines).toContain('Lifetime ledger totals retain historical credit units; they are not cumulative USD provider spend.');
+        expect(view.lines.join()).not.toContain('9007199254740993'); // cursor is not UI content
+    });
+    test('malformed additive accounting falls back to safe legacy; unsafe legacy alone is rejected', async () => {
+        for (const bad of [{ contract: 'future' }, { held_micro: '3' }, { available_micro: '-1' }, { ledger_cursor: '1e10' },
+            { snapshot_at: '2026-02-30T12:00:00.000001Z' }, { snapshot_at: '2026-11-15T12:00:00.000001+05:00' },
+            { settled_scope: 'monthly' }, { credit_unit: { currency: 'SECRET\nvalue', per_credit: '0.10' } }]) {
+            const state = await readAIStatus(provider, server({ ...balance, accounting: accounting(bad) }).fetch);
+            expect(state.balance.value).toMatchObject(balance);
+            expect(state.balance.value?.accounting).toBeUndefined();
+            expect(statusView(state).lines.join()).not.toContain('SECRET');
+        }
+        expect((await readAIStatus(provider, server({ ...balance, available_micro: 9007199254740992 }).fetch)).balance.code).toBe('invalid_response');
+    });
+    test('status uses cursor first, then UTC microseconds; same-cursor expiry can change balance', async () => {
+        let current = accounting();
+        const doFetch = (async (url: string | URL | Request, init?: RequestInit) => server({ ...balance, accounting: current }).fetch(url, init)) as typeof fetch;
+        const h = harness(doFetch);
+        try {
+            await h.status.refresh();
+            current = accounting({ ledger_cursor: '9007199254740992', snapshot_at: '2026-11-15T12:01:00.000000Z', available_micro: '1000000' });
+            await h.status.refresh(); expect(h.item.text).toContain('9,007,199,254 credits');
+            current = accounting({ snapshot_at: '2026-11-15T12:00:00.123455Z', available_micro: '2000000' });
+            await h.status.refresh(); expect(h.item.text).toContain('9,007,199,254 credits');
+            current = accounting({ snapshot_at: '2026-11-15T12:00:00.123457+00:00', available_micro: '3000000' });
+            await h.status.refresh(); expect(h.item.text).toContain('3 credits');
+            current = accounting({ ledger_cursor: '9007199254740994', snapshot_at: '2026-11-15T11:59:00.000000Z', available_micro: '4000000' });
+            await h.status.refresh(); expect(h.item.text).toContain('4 credits');
+        } finally { h.status.dispose(); }
+    });
+    test('provider reset clears cursor ownership; legacy remains usable', async () => {
+        let owner = provider, current: unknown = { ...balance, accounting: accounting() };
+        const doFetch = (async (url: string | URL | Request, init?: RequestInit) => server(current).fetch(url, init)) as typeof fetch;
+        const h = harness(doFetch, () => owner);
+        try {
+            await h.status.refresh();
+            owner = { ...provider, apiKey: 'another-test-account' };
+            current = { ...balance, accounting: accounting({ ledger_cursor: '1', available_micro: '5000000' }) };
+            await h.status.refresh(); expect(h.item.text).toContain('5 credits');
+            current = balance;
+            await h.status.refresh(); expect(h.item.text).toContain('12 credits');
+        } finally { h.status.dispose(); }
     });
 });

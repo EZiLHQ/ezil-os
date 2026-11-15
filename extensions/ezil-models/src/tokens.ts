@@ -18,7 +18,7 @@ export function estimateTextTokens(text: string): number {
 export function estimatePartTokens(part: Part): number {
     switch (part.type) {
         case 'text': return estimateTextTokens(part.value);
-        case 'thinking': return estimateTextTokens(part.value) + estimateTextTokens(String(part.metadata?._completeThinking ?? ''));
+        case 'thinking': return estimateTextTokens(typeof part.metadata?._completeThinking === 'string' ? part.metadata._completeThinking : part.value);
         case 'tool_call': return estimateTextTokens(part.name) + estimateTextTokens(JSON.stringify(part.input ?? {})) + 8;
         case 'tool_result': return part.content.reduce((sum, inner) => sum + estimatePartTokens(inner), 8);
         case 'data':

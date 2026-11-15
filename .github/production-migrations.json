@@ -105,6 +105,16 @@
       "path": "app/migrations/sponsor/verify.sql",
       "sha256": "f849ad0bbe24d33ac06180d521d1f0e2cd71d5b676049f2d5b2fff0cd356df85",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0024_telemetry_alerts.sql",
+      "sha256": "05023bae8b6b38a17fec0e425baca20287b4858198d10e307eb003e1569f2456",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0025_ai_request_traces.sql",
+      "sha256": "b7c8f09b07e77b1abbec520aebd490c759e8deb50f48dd0f7af060457f1a0a87",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {

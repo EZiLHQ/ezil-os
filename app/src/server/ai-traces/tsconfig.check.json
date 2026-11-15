@@ -1,0 +1,6 @@
+{
+  "extends": "../../../tsconfig.json",
+  "compilerOptions": { "target": "ES2022", "incremental": false, "plugins": [] },
+  "include": [],
+  "files": ["schema.ts", "store.ts", "admin.ts", "http-handler.ts", "../../app/admin/ai-traces/view.tsx", "../../../../worker/src/code-diag-bridge.ts"]
+}

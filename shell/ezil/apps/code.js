@@ -1,3 +1,4 @@
+import { ai_trace_collector } from '../ui/ai-traces.js';
 import { attachCodeAuthRecovery, resetOriginRecovery } from './code-auth-recovery.js';
 import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../native-runtime.js';
 // code.js — EZiL-authored. Not Puter code.
@@ -651,6 +652,7 @@ export async function openCodeWindow (ctx = {}) {
     const appContext = Object.freeze({ computerId: computer.id, appSession: crypto.randomUUID() });
     el_window.ezilFeedbackAppContext = appContext;
     let unregister_app_failures = () => {};
+    let trace_registration = { dispose() {}, bindNonce() {} };
     let unregister_billing = () => {};
     let unregister_auth_recovery = () => {};
     if ( getComputedStyle(el_body).position === 'static' ) el_body.style.position = 'relative';
@@ -1103,6 +1105,7 @@ export async function openCodeWindow (ctx = {}) {
         tick_timer = setInterval(paint_handoff, TICK_MS);
 
         unregister_app_failures();
+        trace_registration.dispose();
         unregister_billing();
         unregister_auth_recovery();
         if (!nativeSurface) unregister_auth_recovery = attachCodeAuthRecovery({
@@ -1122,8 +1125,11 @@ export async function openCodeWindow (ctx = {}) {
         el_iframe.src = code_preview_url;
         // Bind at mint handoff, before confirmation, so startup failures can answer the hello too.
         // The folder bridge below binds the same frame after the server confirms it.
+        if (!nativeSurface) trace_registration = ai_trace_collector.register(el_iframe, { origin: new URL(code_preview_url).origin });
         if (!nativeSurface) unregister_app_failures = register_app_frame(el_iframe, {
             origin: new URL(code_preview_url).origin, ...appContext, app: 'code',
+            onDiagnosticNonce: nonce => trace_registration.bindNonce(nonce),
+            onTerminalFailure: event => telemetry.capture(event),
         });
         // Code asks this desktop for its billing dialogs (a credit refusal, a plan-locked model): Settings → Billing.
         if (!nativeSurface) unregister_billing = register_billing_frame(el_iframe, {
@@ -1563,6 +1569,7 @@ export async function openCodeWindow (ctx = {}) {
         detachFolderBridge(el_iframe);
         unregister_auth_recovery();
         unregister_app_failures();
+        trace_registration.dispose();
         unregister_billing();
         folder_notice?.close();
         stop_runtime_recheck?.();

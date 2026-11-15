@@ -354,7 +354,7 @@ describe('local refusals and error origin', () => {
         expect(logs).toHaveLength(1);
         expect(JSON.parse(logs[0]!)).toEqual({ request_id: null, model: KIMI, stream: false, hold: null, http_status: null,
             client_request_id: expect.stringMatching(/^[0-9a-f-]{36}$/), attempts: 0, partial: false, latency_ms: 0,
-            usage: { input: 0, output: 0, cache_read: 0, cache_write: 0 }, stop_reason: null, error_code: 'local_input_too_large', origin: 'local',
+            usage: {}, stop_reason: null, error_code: 'local_input_too_large', origin: 'local',
             body_bytes: bodyBytes, limit_bytes: 130_016, messages: 1, max_blocks: 1, tools: 1, tool_bytes: toolBytes });
         for (const text of [logs[0]!, error.message]) expect(text).not.toMatch(new RegExp(`${SENTINEL}|字|invalid_request`));
     });
@@ -454,4 +454,15 @@ describe('prompt cache from the catalog', () => {
         expect(limited.gatewayPromptCache).toBeUndefined();
         expect(limited.cache).toEqual(gw().cache);
     });
+});
+
+test('credits command uses exact accounting above 2^53 without a lossy numeric convenience field', async () => {
+    const accounting = { contract: 'ezil.gateway.balance.v1', snapshot_at: '2026-11-15T12:00:00.123456Z', ledger_cursor: '1',
+        available_micro: '9007199254999999', held_micro: '0', reserved_micro: '0', pending_micro: '0',
+        settled_debit_micro: '1', settled_scope: 'lifetime_ledger', credit_unit: null };
+    const s = server(c => json(c.url.endsWith('/models') ? catalog : { available_micro: 9007199255000000, held_micro: 0, grants: [], accounting }));
+    const result = await readCredits(gw().provider, gw().id, s.fetch);
+    expect(result.text).toBe('AI credits: 9,007,199,254 remaining');
+    expect(result.balance?.available_micro).toBe('9007199254999999');
+    expect(creditState(undefined, result.balance, '').credits).toBeUndefined();
 });

@@ -10,6 +10,7 @@ import { EZiLAIStatus } from './status';
 import { EZiLModelsProvider, type BillingIntent } from './provider';
 import { PARTICIPANT_ID, registerNoToolsParticipant } from './participant';
 import type { Usage } from './types';
+import { publishInferenceTrace } from './trace-publisher';
 
 export const DEFAULT_CONFIG_PATH = '/etc/ezil/models.json';
 export const CONFIG_ENV = 'EZIL_MODELS_CONFIG';
@@ -133,7 +134,10 @@ export class UsageTracker {
         const record = this.perModel.get(model.id) ?? { requests: 0, elapsedMs: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
         record.requests += 1; record.elapsedMs += elapsedMs;
         record.inputTokens += usage.inputTokens; record.outputTokens += usage.outputTokens;
-        record.cacheReadTokens += usage.cacheReadTokens; record.cacheWriteTokens += usage.cacheWriteTokens;
+        // A total is unknown if any constituent request did not report that counter.
+        for (const key of ['cacheReadTokens', 'cacheWriteTokens'] as const) {
+            record[key] = record[key] === undefined || usage[key] === undefined ? undefined : record[key] + usage[key];
+        }
         this.perModel.set(model.id, record);
         return record;
     }
@@ -141,7 +145,7 @@ export class UsageTracker {
         if (!this.perModel.size) return 'No requests yet.';
         const lines = ['model            requests   input   output  cache_read  cache_write   avg_ms'];
         for (const [id, record] of this.perModel) {
-            lines.push(`${id.padEnd(16)} ${String(record.requests).padStart(8)} ${String(record.inputTokens).padStart(7)} ${String(record.outputTokens).padStart(8)} ${String(record.cacheReadTokens).padStart(11)} ${String(record.cacheWriteTokens).padStart(12)} ${String(Math.round(record.elapsedMs / record.requests)).padStart(8)}`);
+            lines.push(`${id.padEnd(16)} ${String(record.requests).padStart(8)} ${String(record.inputTokens).padStart(7)} ${String(record.outputTokens).padStart(8)} ${String(record.cacheReadTokens ?? 'unknown').padStart(11)} ${String(record.cacheWriteTokens ?? 'unknown').padStart(12)} ${String(Math.round(record.elapsedMs / record.requests)).padStart(8)}`);
         }
         return lines.join('\n');
     }
@@ -257,6 +261,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         secrets: () => store.secrets(),
         logRequests: () => settings().get<boolean>('logRequests') === true,
         log,
+        inferenceDiagnostic: record => publishInferenceTrace(record, (command, clean) => vscode.commands.executeCommand(command, clean)),
         appFailure: sendAppFailure,
         billingIntent: sendBillingIntent,
         recordUsage: (model, used, elapsedMs) => {
@@ -340,6 +345,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         await picked?.action?.();
     };
     context.subscriptions.push(
+        vscode.commands.registerCommand('_ezil-models.inferenceDiagnostics', () => provider.inferenceTrace.snapshot()),
         vscode.commands.registerCommand('ezil-models.manage', manage),
         vscode.commands.registerCommand('ezil-models.reload', reload),
         vscode.commands.registerCommand('ezil-models.showCredits', showCredits),

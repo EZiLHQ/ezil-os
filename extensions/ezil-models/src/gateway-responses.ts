@@ -1,6 +1,6 @@
 // Gateway's stateless, text/function-only Responses subset. No direct provider URLs or state IDs.
 import type { ResolvedModel } from './config';
-import { escapeNonAscii, GATEWAY_INPUT_TOKENS, gatewayOutputTokens, isObject, LocalRequestError, samplingRefused } from './gateway-messages';
+import { escapeNonAscii, GATEWAY_INPUT_BYTES, gatewayRequestBytes, gatewayOutputTokens, isObject, LocalRequestError, samplingRefused } from './gateway-messages';
 import { gatewayBodyEvents, GatewayResponseError, responseFailure, streamErrorEvent } from './gateway-response';
 import type { SseEvent } from './sse';
 import { isCacheMarker, isStatefulMarker, type ChatRequest, type Part, type StreamEvent, type Usage } from './types';
@@ -13,7 +13,6 @@ type FunctionTool = { type: 'function'; name: string; description?: string; para
 export type GatewayResponsesBody = { model: string; input: Input[]; max_output_tokens: number; stream: boolean; store: false;
     tools?: FunctionTool[]; tool_choice?: 'auto'; temperature?: number; top_p?: number };
 const NAME = /^[A-Za-z0-9_-]{1,64}$/;
-const MAX_RESPONSES_BODY_BYTES = 256 * 1024;
 const REFERENCES = new Set(['$ref', '$defs', 'definitions', '$dynamicRef', '$recursiveRef', '$anchor']);
 
 /** Refuse lossy JSON and schema references before serialization, including deep or cyclic schemas. */
@@ -104,10 +103,11 @@ export function buildGatewayResponsesBody(model: ResolvedModel, request: ChatReq
     const definitions = JSON.stringify(tools);
     const escaped = escapeNonAscii(definitions);
     const bound = bytes.byteLength + Buffer.byteLength(escaped) - Buffer.byteLength(definitions) + 1024 + 32 * input.length + 128 * tools.length;
-    const limit = Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens);
+    const limit = model.gatewayMaxRequestBytes === undefined ? Math.min(GATEWAY_INPUT_BYTES, model.maxInputTokens) : model.maxInputTokens;
     // Sizes only. The counted size is the raw body for the 256 KiB cap, otherwise the bound above.
-    const raw = bytes.byteLength > MAX_RESPONSES_BODY_BYTES;
-    const counts = () => ({ bodyBytes: raw ? bytes.byteLength : bound, limitBytes: raw ? MAX_RESPONSES_BODY_BYTES : limit,
+    const endpointCap = gatewayRequestBytes(model);
+    const raw = bytes.byteLength > endpointCap;
+    const counts = () => ({ bodyBytes: raw ? bytes.byteLength : bound, limitBytes: raw ? endpointCap : limit,
         messages: input.length, maxBlocks: 1, tools: tools.length, toolBytes: tools.length ? Buffer.byteLength(escaped) : 0 });
     if (input.length > 512) throw new LocalRequestError('local_too_many_messages', counts());
     if (raw || bound > limit) throw new LocalRequestError('local_input_too_large', counts());
@@ -120,16 +120,19 @@ function count(value: unknown): number {
 }
 
 function responseUsage(raw: unknown): Usage {
-    if (!isObject(raw) || !isObject(raw.input_tokens_details)) throw new Error('Missing usage');
+    if (!isObject(raw) || (raw.input_tokens_details !== undefined && !isObject(raw.input_tokens_details))) throw new Error('Missing usage');
+    const details = isObject(raw.input_tokens_details) ? raw.input_tokens_details : {};
     const inputTokens = count(raw.input_tokens), outputTokens = count(raw.output_tokens);
-    const cacheReadTokens = count(raw.input_tokens_details.cached_tokens);
-    // Responses reports no cache writes on native OpenAI. These counters are display-only, never cost.
-    const cacheWriteTokens = raw.input_tokens_details.cache_write_tokens === undefined ? 0 : count(raw.input_tokens_details.cache_write_tokens);
-    if (cacheReadTokens + cacheWriteTokens > inputTokens || (raw.total_tokens !== undefined && count(raw.total_tokens) !== inputTokens + outputTokens)) throw new Error('Invalid usage');
+    const cacheReadTokens = details.cached_tokens === undefined ? undefined : count(details.cached_tokens);
+    // Optional counters are display-only, never a cost or a fabricated cache hit.
+    const cacheWriteTokens = details.cache_write_tokens === undefined ? undefined : count(details.cache_write_tokens);
+    if ((cacheReadTokens ?? 0) + (cacheWriteTokens ?? 0) > inputTokens || (raw.total_tokens !== undefined && count(raw.total_tokens) !== inputTokens + outputTokens)) throw new Error('Invalid usage');
     if (raw.output_tokens_details !== undefined && raw.output_tokens_details !== null) {
         if (!isObject(raw.output_tokens_details) || (raw.output_tokens_details.reasoning_tokens !== undefined && count(raw.output_tokens_details.reasoning_tokens) > outputTokens)) throw new Error('Invalid usage');
     }
-    return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens };
+    return { inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, inputIncludesCache: true,
+        ...(isObject(raw.output_tokens_details) && raw.output_tokens_details.reasoning_tokens !== undefined
+            ? { reasoningTokens: count(raw.output_tokens_details.reasoning_tokens) } : {}) };
 }
 
 type Output = { id: string; type: string; status?: string; texts: { type: string; value: string }[]; callId?: string; name?: string; arguments?: string; tool?: StreamEvent };

@@ -551,7 +551,7 @@ test('Standard trial production apply and baseline refuse before connecting', ()
 // Issuing organization (0023): one nullable column and its CHECK on the operator table, after 0021; a snapshot only.
 test('the issuing organization follows 0021, stays additive and is a production snapshot only', () => {
     const file = 'app/drizzle/0023_operator_issued_by.sql';
-    assert.equal(EXPLICIT_FILES.at(-1), file);
+    assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0021_standard_trial.sql') + 1);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     assert.match(sql, /ALTER TABLE public\.ezil_operator_entitlements ADD COLUMN IF NOT EXISTS issued_by text;/);
     assert.match(sql, /ADD CONSTRAINT ezil_operator_entitlements_issued_by CHECK \(issued_by IS NULL OR/);
@@ -573,4 +573,22 @@ test('issuing organization production apply and baseline refuse before connectin
         assert.equal(h.calls.length, 0);
         assert.match(h.output.join('\n'), /staging-only/);
     }
+});
+
+test('incident alerts 0024 is explicitly pending and cannot be baselined in production', () => {
+    const path = 'app/drizzle/0024_telemetry_alerts.sql';
+    assert.ok(EXPLICIT_FILES.includes(path));
+    assert.equal(buildPlan(files, []).find(row => row.file === path).status, 'pending');
+    const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost/ezil_alerts_test' });
+    assert.equal(run(['baseline', path, '--yes', '--target', 'aws-production', '--expect-system-id', '123'], h.options), 1);
+    assert.equal(h.calls.length, 0);
+});
+
+test('AI traces 0025 is explicitly pending and blocked from production baseline', () => {
+    const path = 'app/drizzle/0025_ai_request_traces.sql';
+    assert.ok(EXPLICIT_FILES.includes(path));
+    assert.equal(buildPlan(files, []).find(row => row.file === path).status, 'pending');
+    const h = harness([], { BILLING_STAGING_DATABASE_URL: 'postgres://postgres@localhost/ezil_ai_traces_test' });
+    assert.equal(run(['baseline', path, '--yes', '--target', 'aws-production', '--expect-system-id', '123'], h.options), 1);
+    assert.equal(h.calls.length, 0);
 });

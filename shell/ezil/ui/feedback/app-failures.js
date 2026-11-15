@@ -73,6 +73,8 @@ export function validate_failure (record) {
     return clean;
 }
 
+const TERMINAL_AI = Object.freeze({"provider_error": "ai_provider_error", "provider_overloaded": "ai_provider_overloaded", "model_unavailable": "ai_model_unavailable", "stream_interrupted": "ai_stream_interrupted", "first_token_timeout": "ai_first_token_timeout", "request_timeout": "ai_request_timeout", "app_start_failed": "ai_app_start_failed", "app_start_timeout": "ai_app_start_timeout", "chat_unavailable": "ai_chat_unavailable"});
+
 const TTL = 30 * 60_000;
 const bytes = value => new TextEncoder().encode(JSON.stringify(value)).length;
 function token () {
@@ -98,7 +100,7 @@ export function create_app_failure_store ({ now = () => Date.now() } = {}) {
         }
     }
 
-    function register_app_frame (iframe, { origin, computerId, appSession, app } = {}) {
+    function register_app_frame (iframe, { origin, computerId, appSession, app, onTerminalFailure, onDiagnosticNonce } = {}) {
         registrations.get(iframe)?.();
         try {
             const parsed = new URL(origin);
@@ -116,6 +118,7 @@ export function create_app_failure_store ({ now = () => Date.now() } = {}) {
         function unregister () {
             detached = true;
             nonce = null;
+            try { onDiagnosticNonce?.(null); } catch { /* optional operational receiver */ }
             host.removeEventListener('message', onMessage);
             iframe.removeEventListener('load', hello);
             frames.delete(context);
@@ -125,6 +128,7 @@ export function create_app_failure_store ({ now = () => Date.now() } = {}) {
             if (!live()) { unregister(); return; }
             context.responsive = false;
             nonce = token();
+            try { onDiagnosticNonce?.(nonce); } catch { /* optional operational receiver */ }
             try { iframe.contentWindow?.postMessage({ type: 'ezil.code.diag.hello', v: 1, nonce }, origin); } catch { /* gone */ }
         }
         function onMessage (event) {
@@ -152,6 +156,10 @@ export function create_app_failure_store ({ now = () => Date.now() } = {}) {
             ring.entries.push({ failure, app, receivedAt: at, sequence: ++sequence });
             ring.entries = ring.entries.slice(-50);
             rings.set(key, ring);
+            if (failure.outcome === 'failed' && Object.hasOwn(TERMINAL_AI, failure.code)) {
+                try { onTerminalFailure?.({ eventClass: 'api_failure', site: 'ezil-os:apps/code#aiRequest',
+                    code: TERMINAL_AI[failure.code], outcome: 'error' }); } catch { /* optional telemetry cannot break collection */ }
+            }
         }
         context.unregister = unregister;
         context.live = live;

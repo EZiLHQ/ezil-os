@@ -197,3 +197,8 @@ export const BROWSER_FIX_SITES = {
 } as const;
 
 export type BrowserFixSite = (typeof BROWSER_FIX_SITES)[keyof typeof BROWSER_FIX_SITES];
+
+/** Metadata-only Code terminal projection; mirror asserted by shell tests. */
+export const TERMINAL_AI_CODES = [
+    'ai_provider_error', 'ai_provider_overloaded', 'ai_model_unavailable', 'ai_stream_interrupted', 'ai_first_token_timeout', 'ai_request_timeout', 'ai_app_start_failed', 'ai_app_start_timeout', 'ai_chat_unavailable',
+] as const;
