@@ -3,7 +3,6 @@ import { AwsClientError } from './aws-errors';
 import { runPoolReplenish, withPoolReplenishLock, type PoolReplenishDeps } from './aws-pool-replenish';
 import { poolFixture, demandFixture, HOST, OTHER, NOW } from './aws-pool-test-support';
 import { fixtureDeployment } from './aws-intent.test-support';
-import type { PoolClass } from './ready-pool';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import type { PlacementExecutor } from './placement';
 function fixture() {
