@@ -1,0 +1,398 @@
+{
+  "simulatedProvider": true,
+  "actualStripeBankFlow": false,
+  "receipts": [
+    {
+      "viewport": {
+        "width": 691,
+        "height": 1536
+      },
+      "preexisting": false,
+      "initial": {
+        "osZ": 999999999,
+        "checkoutZ": 1000000000,
+        "checkoutTop": true,
+        "inViewport": true,
+        "bodyLocked": true,
+        "backgroundInert": true,
+        "compact": true,
+        "preloadHidden": true,
+        "preloadDoesNotClaimModality": true
+      },
+      "first": {
+        "providerZ": 2147483647,
+        "providerPrecedesCheckout": true,
+        "top": true,
+        "focused": true,
+        "escapeNotCaptured": true,
+        "modalRetained": true,
+        "checkoutIsNotActiveModal": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "second": {
+        "top": true,
+        "providerPrecedesCheckout": true,
+        "focused": true,
+        "modalRetained": true,
+        "backgroundInert": true,
+        "sameHandle": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "third": {
+        "top": true,
+        "visible": true,
+        "providerPrecedesCheckout": true,
+        "focused": true,
+        "escapeNotCaptured": true,
+        "modalRetained": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "recovered": {
+        "activeModal": true,
+        "checkoutFocusable": true,
+        "checkoutRetained": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "cardInputPreserved": true,
+      "closed": {
+        "absent": true,
+        "openerFocused": true,
+        "scrollRestored": true,
+        "backgroundRestored": true,
+        "priorInertRetained": true,
+        "preloadDestroyed": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 1,
+          "done": 0,
+          "closed": 1
+        }
+      },
+      "errors": []
+    },
+    {
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "preexisting": false,
+      "initial": {
+        "osZ": 999999999,
+        "checkoutZ": 1000000000,
+        "checkoutTop": true,
+        "inViewport": true,
+        "bodyLocked": true,
+        "backgroundInert": true,
+        "compact": false,
+        "preloadHidden": true,
+        "preloadDoesNotClaimModality": true
+      },
+      "first": {
+        "providerZ": 2147483647,
+        "providerPrecedesCheckout": true,
+        "top": true,
+        "focused": true,
+        "escapeNotCaptured": true,
+        "modalRetained": true,
+        "checkoutIsNotActiveModal": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "second": {
+        "top": true,
+        "providerPrecedesCheckout": true,
+        "focused": true,
+        "modalRetained": true,
+        "backgroundInert": true,
+        "sameHandle": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "third": {
+        "top": true,
+        "visible": true,
+        "providerPrecedesCheckout": true,
+        "focused": true,
+        "escapeNotCaptured": true,
+        "modalRetained": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "recovered": {
+        "activeModal": true,
+        "checkoutFocusable": true,
+        "checkoutRetained": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "cardInputPreserved": true,
+      "closed": {
+        "absent": true,
+        "openerFocused": true,
+        "scrollRestored": true,
+        "backgroundRestored": true,
+        "priorInertRetained": true,
+        "preloadDestroyed": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 1,
+          "done": 0,
+          "closed": 1
+        }
+      },
+      "errors": []
+    },
+    {
+      "viewport": {
+        "width": 691,
+        "height": 1536
+      },
+      "preexisting": true,
+      "initial": {
+        "osZ": 999999999,
+        "checkoutZ": 1000000000,
+        "checkoutTop": true,
+        "inViewport": true,
+        "bodyLocked": true,
+        "backgroundInert": true,
+        "compact": true,
+        "preloadHidden": true,
+        "preloadDoesNotClaimModality": true
+      },
+      "first": {
+        "providerZ": 2147483647,
+        "providerPrecedesCheckout": true,
+        "top": true,
+        "focused": true,
+        "escapeNotCaptured": true,
+        "modalRetained": true,
+        "checkoutIsNotActiveModal": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "second": {
+        "top": true,
+        "providerPrecedesCheckout": true,
+        "focused": true,
+        "modalRetained": true,
+        "backgroundInert": true,
+        "sameHandle": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "third": {
+        "top": true,
+        "visible": true,
+        "providerPrecedesCheckout": true,
+        "focused": true,
+        "escapeNotCaptured": true,
+        "modalRetained": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "recovered": {
+        "activeModal": true,
+        "checkoutFocusable": true,
+        "checkoutRetained": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "cardInputPreserved": true,
+      "closed": {
+        "absent": true,
+        "openerFocused": true,
+        "scrollRestored": true,
+        "backgroundRestored": true,
+        "priorInertRetained": true,
+        "preloadDestroyed": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 1,
+          "done": 0,
+          "closed": 1
+        }
+      },
+      "errors": []
+    },
+    {
+      "viewport": {
+        "width": 1440,
+        "height": 900
+      },
+      "preexisting": true,
+      "initial": {
+        "osZ": 999999999,
+        "checkoutZ": 1000000000,
+        "checkoutTop": true,
+        "inViewport": true,
+        "bodyLocked": true,
+        "backgroundInert": true,
+        "compact": false,
+        "preloadHidden": true,
+        "preloadDoesNotClaimModality": true
+      },
+      "first": {
+        "providerZ": 2147483647,
+        "providerPrecedesCheckout": true,
+        "top": true,
+        "focused": true,
+        "escapeNotCaptured": true,
+        "modalRetained": true,
+        "checkoutIsNotActiveModal": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "second": {
+        "top": true,
+        "providerPrecedesCheckout": true,
+        "focused": true,
+        "modalRetained": true,
+        "backgroundInert": true,
+        "sameHandle": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "third": {
+        "top": true,
+        "visible": true,
+        "providerPrecedesCheckout": true,
+        "focused": true,
+        "escapeNotCaptured": true,
+        "modalRetained": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "recovered": {
+        "activeModal": true,
+        "checkoutFocusable": true,
+        "checkoutRetained": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 0,
+          "done": 0,
+          "closed": 0
+        }
+      },
+      "cardInputPreserved": true,
+      "closed": {
+        "absent": true,
+        "openerFocused": true,
+        "scrollRestored": true,
+        "backgroundRestored": true,
+        "priorInertRetained": true,
+        "preloadDestroyed": true,
+        "counts": {
+          "sessions": 1,
+          "initialized": 1,
+          "mounted": 1,
+          "destroyed": 1,
+          "done": 0,
+          "closed": 1
+        }
+      },
+      "errors": []
+    }
+  ]
+}
