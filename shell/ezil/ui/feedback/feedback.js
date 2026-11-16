@@ -1,10 +1,11 @@
-// feedback.js — EZiL-authored. Optional description and explicit local image attachments.
+// feedback.js — EZiL-authored. Optional description, a masked screen snapshot and local image attachments.
 // Diagnostics and screenshots are selected by default; nothing uploads until Send.
 // Wire/API signatures are pinned in docs/FEEDBACK-CONTROLS-CONTRACT.md.
 import { app_failure_diagnostics_accepted, build_diagnostics } from './diagnostics.js';
 import { scan } from './secret-scan.js';
 import { encode_under_limit, open_redact_editor } from './redact-editor.js';
 import { uploaded_image_canvas } from './image-file.js';
+import { capture_shell_snapshot } from './capture.js';
 import { currentComputer } from '../../session.js';
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -19,6 +20,8 @@ const LEGACY_BUG_FIELDS = [['activity', 'What were you doing?'], ['steps', 'Step
 const DESCRIPTION_MAX = 4000;
 const IMAGE_BYTES_MAX = Math.floor(1.5 * 1024 * 1024);
 const IMAGE_SIDE_MAX = 4096;
+const SCREEN_CAPTURE_TIMEOUT_MS = 8000;
+const SCREEN_CAPTURE_UNAVAILABLE = 'Could not capture this screen. Attach an image to include what you saw.';
 const IMAGE_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
 // Keep in sync with app/src/server/feedback/types.ts FEEDBACK_LIMITS.imagesMax / imagesBytesTotal. The
 // server advertises its image count as `ui.feedbackScreenshotsMax`; a server that does not keeps one image.
@@ -501,10 +504,29 @@ function error_copy (status) {
     return 'Could not send feedback. Check your connection and try again.';
 }
 
+/** Context comes only from shell registration, never from text or producer messages. */
+function registered_app_context (opener, explicit) {
+    if (explicit !== undefined) return explicit;
+    try {
+        const owning = opener?.closest?.('.window[data-app]');
+        if (owning) return owning.ezilFeedbackAppContext;
+        // The global feedback control sits outside app windows. Choose the visible front app,
+        // including apps without registered context, rather than borrowing a background app's trace.
+        const windows = [...document.querySelectorAll('.window[data-app]:not(.window-alert):not(.window-filedialog)')]
+            .filter(el => el.getAttribute('data-app') && el.getAttribute('data-closing') !== '1'
+                && !['true', '1'].includes(el.getAttribute('data-is_minimized')) && shown(el));
+        const active = windows.find(el => el.classList.contains('window-active'));
+        const front = active ?? windows.reduce((best, el) => !best
+            || (Number.parseInt(window.getComputedStyle(el).zIndex, 10) || 0)
+                >= (Number.parseInt(window.getComputedStyle(best).zIndex, 10) || 0) ? el : best, null);
+        return front?.ezilFeedbackAppContext;
+    } catch { return undefined; }
+}
+
 /**
  * appContext is trusted shell registration context only (never producer message data).
  * It prefills the selection; opening never sends a report.
- * @param {{ source: 'chip'|'pill'|'troubleshoot'|'settings', errorCode?: string, appContext?: {computerId: string, appSession: string} }} [_opts]
+ * @param {{ source: 'chip'|'pill'|'troubleshoot'|'settings', errorCode?: string, appContext?: {computerId: string, appSession: string, traceId?: string} }} [_opts]
  */
 export function open_feedback_dialog (_opts) {
     if ( ! feedback_enabled() ) return;
@@ -521,12 +543,13 @@ export function open_feedback_dialog (_opts) {
     const waiting = read_outbox().filter(entry => entry.clientRequestId !== clientRequestId && !entry.paused && ! inflight.has(entry.clientRequestId)).length;
     // The canonical current computer (Settings switches never rewrite the boot
     // payload), snapshotted once: the frozen body keeps it through retries.
-    const trusted = _opts?.appContext;
+    const trusted = registered_app_context(opener, _opts?.appContext);
     const hasAppContext = typeof trusted?.computerId === 'string' && UUID.test(trusted.computerId)
         && typeof trusted.appSession === 'string' && trusted.appSession.length > 0;
     const computer = hasAppContext ? trusted.computerId : currentComputer()?.id;
     let computerId = typeof computer === 'string' && UUID.test(computer) ? computer : null;
-    const appContext = Object.freeze({ computerId, ...(hasAppContext ? { appSession: trusted.appSession } : {}) });
+    const appContext = Object.freeze({ computerId, ...(hasAppContext ? { appSession: trusted.appSession } : {}),
+        ...(hasAppContext && typeof trusted.traceId === 'string' && UUID.test(trusted.traceId) ? { traceId: trusted.traceId } : {}) });
     const queuedEntry = draft ? read_outbox().find(entry => entry.clientRequestId === clientRequestId) : null;
     const screenshotsAvailable = window.__EZIL_BOOT__?.desktopState?.ui?.feedbackScreenshots === true;
     const queuedBody = queuedEntry ? JSON.parse(queuedEntry.body) : null;
@@ -585,7 +608,7 @@ export function open_feedback_dialog (_opts) {
     const cancel = dialog.querySelector('[data-action="cancel"]');
     /**
      * Local images in preview order: `{ key, contentType, dataBase64, sha256, bytes, source }`.
-     * Only explicit file, paste or drop imports and queued images are attached.
+     * The masked shell snapshot, explicit file/paste/drop imports and queued images are attached.
      * They live only in this form (never in the draft) until Send freezes them into the request body.
      */
     let images = [];
@@ -744,7 +767,11 @@ export function open_feedback_dialog (_opts) {
 
     function render_scope () {
         if (form.elements.screenshotFile) form.elements.screenshotFile.disabled = capturing || !screenshotsAvailable || !can_add();
-        if (capture_note) capture_note.hidden = !capture_note.textContent;
+        if (capture_note) {
+            if (screenshotConsent?.checked && !capturing && !images.length && !capture_note.textContent)
+                capture_note.textContent = 'No screenshot attached. Attach an image to include what you saw.';
+            capture_note.hidden = !capture_note.textContent;
+        }
         dialog.querySelector('[data-role="server-context-preview-note"]').hidden = !diagnostics.checked;
     }
 
@@ -845,7 +872,7 @@ export function open_feedback_dialog (_opts) {
         render_images(); refresh();
         return { generation, signal: captureController.signal };
     }
-    async function finish_capture (capture, generation, signal, source, replaceKey = null, edit = false) {
+    async function finish_capture (capture, generation, signal, source, replaceKey = null, edit = false, captureInfo = null) {
         const current = () => !closed && generation === captureGeneration && !signal.aborted && screenshotConsent.checked;
         try {
             const canvas = await capture;
@@ -858,18 +885,40 @@ export function open_feedback_dialog (_opts) {
             if (edit && !encoded) { result.textContent = ''; return; }
             if (!blob || !IMAGE_TYPES.includes(blob.type) || !blob.size || blob.size > limit
                 || ![encoded?.width ?? canvas.width, encoded?.height ?? canvas.height].every(n => Number.isInteger(n) && n > 0 && n <= IMAGE_SIDE_MAX)) {
-                result.textContent = 'This image is too large. Try a smaller screenshot.'; return;
+                if (source === 'shell') capture_note.textContent = SCREEN_CAPTURE_UNAVAILABLE;
+                else result.textContent = 'This image is too large. Try a smaller screenshot.';
+                return;
             }
             const image = { contentType: blob.type, dataBase64: await read_blob(blob, signal), bytes: blob.size, source };
             image.sha256 = await screenshot_sha256(image);
             if (!current()) return;
             if (!put_image(image, replaceKey)) capture_note.textContent = 'This screenshot is already attached.';
+            else if (source === 'shell') capture_note.textContent = captureInfo?.frameCoverage > 0.1
+                ? 'Screenshot attached. Embedded app contents are hidden; attach an image if they are part of the issue.'
+                : 'Screenshot attached. Private fields are hidden.';
             result.textContent = '';
         } catch {
-            if (current()) result.textContent = 'Could not add this image. Try another screenshot.';
+            if (current()) {
+                if (source === 'shell') capture_note.textContent = SCREEN_CAPTURE_UNAVAILABLE;
+                else result.textContent = 'Could not add this image. Try another screenshot.';
+            }
         } finally {
             if (current()) { cancel_capture(); render_images(); refresh(); }
         }
+    }
+    function capture_screen () {
+        if (!screenshotsAvailable || !screenshotConsent?.checked || closed || sending || sent || capturing) return;
+        const { generation, signal } = begin_capture();
+        const info = {};
+        // A slow vendor import or browser rasterizer must not leave Send disabled indefinitely.
+        const timer = setTimeout(() => {
+            if (closed || generation !== captureGeneration || signal.aborted) return;
+            cancel_capture();
+            capture_note.textContent = SCREEN_CAPTURE_UNAVAILABLE;
+            refresh();
+        }, SCREEN_CAPTURE_TIMEOUT_MS);
+        void finish_capture(capture_shell_snapshot({ signal, info }), generation, signal, 'shell', null, false, info)
+            .finally(() => clearTimeout(timer));
     }
     async function import_files (files, source) {
         const run = ++importRun;
@@ -942,6 +991,7 @@ export function open_feedback_dialog (_opts) {
     document.addEventListener('drop', on_drop, true);
     screenshotConsent?.addEventListener('change', () => {
         if (!screenshotConsent.checked) { ++importRun; cancel_capture(); clear_screenshot(); capture_note.textContent = ''; }
+        else if (!images.length) capture_screen();
     });
     diagnostics.addEventListener('change', snapshot_diagnostics);
     function snapshot_diagnostics () {
@@ -1055,6 +1105,9 @@ export function open_feedback_dialog (_opts) {
     if ( waiting ) result.textContent = waiting === 1
         ? 'One earlier report is waiting to be sent. It will go when you are back online.'
         : `${waiting} earlier reports are waiting to be sent. They will go when you are back online.`;
+    // Take the masked shell view on a new report. The capture excludes this dialog and its UI;
+    // queued reports keep their original images and exact body, even if this screen has changed.
+    if (screenshotsAvailable && screenshotConsent?.checked && !restoredFromQueue) capture_screen();
     dialog.showModal();
     if ( touchPrimary ) dialog.querySelector('#ezil-feedback-heading').focus({ preventScroll: true });
     else description.focus();
