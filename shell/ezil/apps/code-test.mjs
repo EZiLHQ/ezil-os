@@ -1673,13 +1673,13 @@ await settle(4);
         await closeCode();
         await settle(8);
         push('10g closing the window leaves no renewal request and no Git notice behind',
-            gitAccess(from).length === 0 && ! document.querySelector('.ezil-code-git-access-notice'), `${gitAccess(from).length}`);
+            gitAccess(from).length === 0 && ! window.document.querySelector('.ezil-code-git-access-notice'), `${gitAccess(from).length}`);
         from = calls.length;
         void launch({ project: { repoUrl: EZ } });
         await closeCode();
         await settle(8);
         push('10g a close during the open (cancel) leaves no renewal request and no Git notice behind',
-            gitAccess(from).length === 0 && ! document.querySelector('.ezil-code-git-access-notice'), `${gitAccess(from).length}`);
+            gitAccess(from).length === 0 && ! window.document.querySelector('.ezil-code-git-access-notice'), `${gitAccess(from).length}`);
         codeMintAnswer = null;
     }
 

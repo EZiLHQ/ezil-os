@@ -199,24 +199,42 @@ class RuntimeCapacityTests(unittest.TestCase):
 
 
 class HostAbiTests(unittest.TestCase):
+    """The reviewed three-file attestation delta over real temporary commits rebuilt (git mktree --missing) from the
+    exact 5127d85f, ed7da29a and c7a5af66 host trees in host-abi-predecessors.json; those stage commits are not public."""
+    LEGACY = {'5127': 'ce761977561aa30699818f3922fa72ad60f1615e', 'ed7': '18fd016a606683e6f9a8eae581e0c7e946470fac',
+              'reviewed': '8ddd43d0f95a5a633669f7b2ccb6ed7440591d52'}
+
+    def setUp(self):
+        # Reuse the directed tests' private repository, strict loader and reconstruction machinery.
+        fixture = load_host_abi_fixture(HOST_ABI_FIXTURE.read_text())
+        builder = DirectedHostAbiTests('test_fixture_rebuilds_every_reviewed_predecessor_tree_exactly')
+        builder.setUp()
+        self.addCleanup(builder.doCleanups)
+        self.repo, commits = builder.repo, {}
+        for name, tree in self.LEGACY.items():
+            self.assertEqual(builder.tree(fixture[tree]), tree)
+            commits[name] = builder.commit(fixture[tree])
+            self.assertEqual(release.host_agent_tree_id(commits[name], self.repo), tree)
+        self.agent_5127, self.agent_ed7, self.agent_reviewed = commits['5127'], commits['ed7'], commits['reviewed']
+
     def test_reviewed_attestation_delta_is_exactly_three_files(self):
-        self.assertEqual(release.require_host_abi(AGENT_5127, AGENT_REVIEWED, REPO), release.HOST_AGENT_EXCEPTION)
-        self.assertEqual(release.require_host_abi(AGENT_REVIEWED, AGENT_REVIEWED, REPO), {})
-        self.assertEqual(release.require_host_abi(AGENT_5127, AGENT_5127, REPO), {})
+        self.assertEqual(release.require_host_abi(self.agent_5127, self.agent_reviewed, self.repo), release.HOST_AGENT_EXCEPTION)
+        self.assertEqual(release.require_host_abi(self.agent_reviewed, self.agent_reviewed, self.repo), {})
+        self.assertEqual(release.require_host_abi(self.agent_5127, self.agent_5127, self.repo), {})
         # The earlier ed7da29a attestation bytes are no longer the reviewed delta.
         with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
-            release.require_host_abi(AGENT_5127, AGENT_ED7, REPO)
+            release.require_host_abi(self.agent_5127, self.agent_ed7, self.repo)
 
     def test_other_deltas_refused(self):
         with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
-            release.require_host_abi(AGENT_REVIEWED, AGENT_5127, REPO)  # removing the lane is not the reviewed delta
+            release.require_host_abi(self.agent_reviewed, self.agent_5127, self.repo)  # removing the lane is not the reviewed delta
         for sha in ('f' * 40, 'not-a-sha'):
             with self.subTest(sha=sha), self.assertRaisesRegex(ValueError, 'host agent commit unavailable'):
-                release.require_host_abi(AGENT_5127, sha, REPO)
+                release.require_host_abi(self.agent_5127, sha, self.repo)
 
     def test_wider_or_different_blob_refused(self):
-        tree = release.host_agent_tree(AGENT_REVIEWED, REPO)
-        old = release.host_agent_tree(AGENT_5127, REPO)
+        tree = release.host_agent_tree(self.agent_reviewed, self.repo)
+        old = release.host_agent_tree(self.agent_5127, self.repo)
         for mutate in (lambda t: t.update({'lib/ezil_host/extra.py': '100644 ' + '1' * 40}),
                        lambda t: t.update({'lib/ezil_host/attest.py': '100644 ' + '2' * 40}),
                        lambda t: t.update({'lib/ezil_host/cli.py': '100755 ' + t['lib/ezil_host/cli.py'].split(' ')[1]}),
@@ -226,7 +244,7 @@ class HostAbiTests(unittest.TestCase):
             with self.subTest(changed=sorted(set(changed.items()) ^ set(tree.items()))), \
                     patch.object(release, 'host_agent_tree', side_effect=[old, changed]), \
                     self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
-                release.require_host_abi(AGENT_5127, AGENT_REVIEWED, REPO)
+                release.require_host_abi(self.agent_5127, self.agent_reviewed, self.repo)
 
 
 class StandaloneHostAbiTests(unittest.TestCase):
@@ -308,7 +326,7 @@ class StandaloneHostAbiTests(unittest.TestCase):
 
 
 HOST_ABI_FIXTURE = HERE / 'host-abi-predecessors.json'
-HOST_ABI_FIXTURE_TREES = 4
+HOST_ABI_FIXTURE_TREES = 7
 HOST_ABI_FIXTURE_MAX_FILES = 256
 HOST_ABI_PATH_PART = re.compile(r'[A-Za-z0-9._-]{1,128}')
 HOST_ABI_ENTRY = re.compile(r'(100644|100755) ([0-9a-f]{40})')
@@ -440,7 +458,7 @@ class DirectedHostAbiTests(unittest.TestCase):
         return [(source, target, delta) for source, target, delta in release.HOST_AGENT_DIRECTED_EXCEPTIONS]
 
     def test_fixture_rebuilds_every_reviewed_predecessor_tree_exactly(self):
-        self.assertEqual(set(self.fixture), set(self.PREDECESSORS))
+        self.assertEqual(set(self.fixture), {*self.PREDECESSORS, *HostAbiTests.LEGACY.values()})
         for tree, files in self.fixture.items():
             with self.subTest(tree=tree):
                 self.assertEqual(self.tree(files), tree)
@@ -560,7 +578,7 @@ class HostAbiFixtureTests(unittest.TestCase):
 
     def test_checked_in_fixture_parses(self):
         parsed = self.load(self.value)
-        self.assertEqual(set(parsed), set(DirectedHostAbiTests.PREDECESSORS))
+        self.assertEqual(set(parsed), {*DirectedHostAbiTests.PREDECESSORS, *HostAbiTests.LEGACY.values()})
         self.assertEqual(load_host_abi_fixture(HOST_ABI_FIXTURE.read_text()), parsed)
 
     def test_duplicate_keys_refused(self):
@@ -579,7 +597,7 @@ class HostAbiFixtureTests(unittest.TestCase):
     def test_shape_and_bounds_refused(self):
         cases = [{**copy.deepcopy(self.value), **change} for change in ({'schemaVersion': 2}, {'hostAgent': 'infra/other'}, {'extra': True})]
         cases.append({k: v for k, v in copy.deepcopy(self.value).items() if k != 'trees'})
-        for count in (3, 5):
+        for count in (HOST_ABI_FIXTURE_TREES - 1, HOST_ABI_FIXTURE_TREES + 1):
             value = copy.deepcopy(self.value)
             value['trees'] = (value['trees'] * 2)[:count]
             cases.append(value)
