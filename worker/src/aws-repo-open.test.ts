@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { openAwsStandaloneRepo, type AwsRepoOpenDeps } from './aws-repo-open';
+import { openAwsStandaloneRepo, REPO_OPEN_DIAGNOSTIC_REASONS, type AwsRepoOpenDeps } from './aws-repo-open';
 import { verifyGatewayHeader, decodeControlKey, type AwsTunnelRecord } from './aws-origin';
 import type { PreviewTokenV2Claims } from './hmac';
 const now = 1_794_405_600_000;
@@ -76,7 +76,7 @@ describe('AWS standalone repository operation', () => {
  it('rejects a completion that crosses deadline during final lookup', async () => {
    const f = setup(); let count = 0;
    f.setLookup(async () => { if (++count === 3) f.advance(60_001); return record; });
-   expect(await (await f.run()).json()).toEqual({ ok: false, error: 'repo_open_timeout' });
+   expect(await (await f.run()).json()).toEqual({ ok: false, error: 'repo_open_timeout', diagnosticReason: 'budget_exhausted' });
  });
  it('refuses unbound, extra-field, wrong-folder and unknown-status completions', async () => {
    for (const result of [{ ...success.result, folder: '/workspace' }, { ...success.result, status: 'created' },
@@ -84,6 +84,38 @@ describe('AWS standalone repository operation', () => {
      const f = setup(); f.answers[1] = Response.json({ ok: true, state: 'done', result });
      const res = await f.run(); expect(res.status).toBe(502); expect(await res.text()).not.toContain(token);
    }
+ });
+ it('forwards only closed host failure reasons while preserving legacy error-only replies', async () => {
+   for (const diagnosticReason of REPO_OPEN_DIAGNOSTIC_REASONS) {
+     const f = setup(); const result = { ok: false, error: 'repo_open_failed', diagnosticReason };
+     f.answers[1] = Response.json({ ok: true, state: 'done', result });
+     expect(await (await f.run()).json()).toEqual(result);
+   }
+   const old = setup(); old.answers[1] = Response.json({ ok: true, state: 'done', result: { ok: false, error: 'repo_open_failed' } });
+   expect(await (await old.run()).json()).toEqual({ ok: false, error: 'repo_open_failed' });
+ });
+ it('drops raw, unknown, nonstring and extra-field host diagnostics without weakening completion checks', async () => {
+   for (const change of [{ diagnosticReason: token }, { diagnosticReason: 'provider private detail' },
+     { diagnosticReason: null }, { diagnosticReason: ['clone_failed'] },
+     { diagnosticReason: 'clone_failed', privateDetail: token }]) {
+     const f = setup(); f.answers[1] = Response.json({ ok: true, state: 'done', result: { ok: false, error: 'repo_open_failed', ...change } });
+     const response = await f.run(); expect(response.status).toBe(502);
+     expect(await response.json()).toEqual({ ok: false, error: 'repo_open_failed', diagnosticReason: 'invalid_result' });
+   }
+   const successWithReason = setup();
+   successWithReason.answers[1] = Response.json({ ...success, result: { ...success.result, diagnosticReason: 'clone_failed' } });
+   expect(await (await successWithReason.run()).json()).toEqual({ ok: false, error: 'repo_open_failed', diagnosticReason: 'invalid_result' });
+ });
+ it('maps admission refusals without returning provider text or retrying a rejected job', async () => {
+   for (const [error, diagnosticReason] of [['workspace_busy', 'checkout_busy'], ['stopping', 'admission_stopping'],
+     ['runtime_not_running', 'runtime_not_running'], ['standalone_repo_invalid', 'admission_invalid'],
+     [token, 'admission_rejected']]) {
+     const f = setup(); f.answers[0] = Response.json({ ok: false, error }, { status: 409 });
+     expect(await (await f.run()).json()).toEqual({ ok: false, error: 'repo_open_failed', diagnosticReason });
+     expect(f.calls).toHaveLength(1);
+   }
+   const f = setup(); f.answers[0] = new Response(token, { status: 503 });
+   expect(await (await f.run()).json()).toEqual({ ok: false, error: 'repo_open_failed', diagnosticReason: 'admission_rejected' });
  });
  it('bounds grant lifetime, refuses public GitHub/legacy requests and handles old host without fallback', async () => {
    for (const body of [{ ...raw(), timeoutMs: 130_000, privatePacket: { ...raw().privatePacket,
@@ -100,7 +132,7 @@ describe('AWS standalone repository operation', () => {
    expect((await f.run(raw(), claims, c.signal)).status).toBe(502); expect(f.calls).toHaveLength(0);
    const g = setup(); g.answers[1] = Response.json({ ok: true, state: 'running' });
    g.deps.sleep = async () => { g.advance(60_001); };
-   expect(await (await g.run()).json()).toEqual({ ok: false, error: 'repo_open_timeout' });
+   expect(await (await g.run()).json()).toEqual({ ok: false, error: 'repo_open_timeout', diagnosticReason: 'budget_exhausted' });
    expect(g.calls).toHaveLength(2);
  });
 });

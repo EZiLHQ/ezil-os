@@ -2,7 +2,19 @@
 import { awsOriginHostname, decodeControlKey, isComputerId, signGatewayHeader, type AwsTunnelRecord, type FetchLike } from './aws-origin';
 import type { PreviewTokenV2Claims } from './hmac';
 import { parseRepoOpenRequest } from './repo-open';
-const json = (error: string, status = 502) => Response.json({ ok: false, error }, { status, headers: { 'cache-control': 'no-store' } });
+/** Only these fixed reasons may cross the host/Worker boundary; never provider text or CLI stderr. */
+export const REPO_OPEN_DIAGNOSTIC_REASONS = [
+  'bootstrap_unavailable', 'workspace_unavailable', 'workspace_not_ready', 'folder_conflict',
+  'checkout_busy', 'invalid_request', 'repository_not_authorized', 'ref_mismatch', 'clone_failed',
+  'cleanup_unconfirmed', 'token_expired', 'runtime_not_running', 'invalid_result',
+  'admission_rejected', 'admission_invalid', 'admission_stopping', 'status_unavailable',
+  'status_invalid', 'transport_unavailable', 'budget_exhausted',
+] as const;
+type DiagnosticReason = typeof REPO_OPEN_DIAGNOSTIC_REASONS[number];
+const diagnosticReasons = new Set<string>(REPO_OPEN_DIAGNOSTIC_REASONS);
+const json = (error: string, status = 502, diagnosticReason?: DiagnosticReason) => Response.json(
+  { ok: false, error, ...(diagnosticReason ? { diagnosticReason } : {}) },
+  { status, headers: { 'cache-control': 'no-store' } });
 const exact = (v: unknown, keys: string[]): v is Record<string, unknown> => !!v && typeof v === 'object' && !Array.isArray(v)
   && Object.keys(v).sort().join(',') === [...keys].sort().join(',');
 const failures = new Set(['repo_open_failed', 'repo_open_timeout', 'repo_open_git_missing', 'repo_open_token_expired', 'runtime_not_running']);
@@ -90,28 +102,48 @@ export async function openAwsStandaloneRepo(request: Request, claims: PreviewTok
   try {
     const admission = await call('POST', `/__ezil/control/standalone-repo-open/${digest}`, body);
     if (admission.status === 404) return json('repo_open_unsupported_provider', 409);
-    if (admission.status !== 202) return json('repo_open_failed');
+    if (admission.status !== 202) {
+      let reason: DiagnosticReason = 'admission_rejected';
+      try {
+        const refused = await readAnswer(admission);
+        if (exact(refused, ['ok', 'error']) && refused.ok === false) {
+          if (refused.error === 'workspace_busy') reason = 'checkout_busy';
+          else if (refused.error === 'stopping') reason = 'admission_stopping';
+          else if (refused.error === 'runtime_not_running') reason = 'runtime_not_running';
+          else if (refused.error === 'standalone_repo_invalid') reason = 'admission_invalid';
+        }
+      } catch { /* Untrusted or unavailable refusal bodies never become diagnostics. */ }
+      return json('repo_open_failed', 502, reason);
+    }
     const admitted = await readAnswer(admission);
     if (!exact(admitted, ['ok', 'state']) || admitted.ok !== true || !['running', 'done'].includes(admitted.state as string))
-      return json('repo_open_failed');
+      return json('repo_open_failed', 502, 'admission_invalid');
     for (;;) {
       const response = await call('GET', `/__ezil/control/standalone-repo-open-status/${jobId}`);
-      if (response.status !== 200) return json('repo_open_failed');
+      if (response.status !== 200) return json('repo_open_failed', 502, 'status_unavailable');
       const status = await readAnswer(response);
       if (exact(status, ['ok', 'state']) && status.ok === true && status.state === 'running') {
         await (deps.sleep ?? pause)(Math.min(500, Math.max(1, deadline - now())), signal);
         continue;
       }
-      if (!exact(status, ['ok', 'state', 'result']) || status.ok !== true || status.state !== 'done') return json('repo_open_failed');
+      if (!exact(status, ['ok', 'state', 'result']) || status.ok !== true || status.state !== 'done')
+        return json('repo_open_failed', 502, 'status_invalid');
       await current(); // Old placements cannot become Code URLs.
       const result = status.result;
       if (exact(result, ['ok', 'folder', 'status']) && result.ok === true
         && result.folder === `/workspace/projects/${op.repositoryId}` && (result.status === 'cloned' || result.status === 'fetched'))
         return Response.json(result, { headers: { 'cache-control': 'no-store' } });
-      if (exact(result, ['ok', 'error']) && result.ok === false && failures.has(result.error as string))
-        return json(result.error as string, result.error === 'runtime_not_running' ? 409 : 502);
-      return json('repo_open_failed');
+      if ((exact(result, ['ok', 'error']) || (exact(result, ['ok', 'error', 'diagnosticReason'])
+        && typeof result.diagnosticReason === 'string' && diagnosticReasons.has(result.diagnosticReason)))
+        && result.ok === false && failures.has(result.error as string))
+        return json(result.error as string, result.error === 'runtime_not_running' ? 409 : 502,
+          result.diagnosticReason as DiagnosticReason | undefined);
+      return json('repo_open_failed', 502, 'invalid_result');
     }
-  } catch { return json(signal.aborted || now() >= deadline ? 'repo_open_timeout' : 'repo_open_failed'); }
+  } catch {
+    const expired = signal.aborted || now() >= deadline;
+    return json(expired ? 'repo_open_timeout' : 'repo_open_failed', 502,
+      expired ? 'budget_exhausted' : 'transport_unavailable');
+  }
 }
 
