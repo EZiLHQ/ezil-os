@@ -1,0 +1,7 @@
+#!/bin/bash
+set -eu
+case "$1" in
+  tsc) shift; exec node /dev/shm/ezil-unified-20261026/os-api/app/node_modules/typescript/bin/tsc "$@" --incremental false ;;
+  vitest) shift; exec node /dev/shm/ezil-unified-20261026/os-api/app/node_modules/vitest/vitest.mjs "$@" --no-cache ;;
+  *) echo 'Only installed tsc and vitest are allowed by this task test launcher' >&2; exit 64 ;;
+esac

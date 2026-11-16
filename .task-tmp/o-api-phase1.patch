@@ -1,0 +1,926 @@
+diff --git a/app/src/server/api/routers/billing.ts b/app/src/server/api/routers/billing.ts
+index 26a96ac3..5d3d602d 100644
+--- a/app/src/server/api/routers/billing.ts
++++ b/app/src/server/api/routers/billing.ts
+@@ -2,7 +2,9 @@ import { TRPCError } from '@trpc/server';
+ import { z } from 'zod';
+ 
+ import { checkoutAvailable } from '@/server/billing/config';
+-import { aiBalanceState, enqueueFreeAiCredits, readAiBalance } from '@/server/billing/ai-balance';
++import { aiMicroBalanceState, enqueueFreeAiCredits, readAiAccount, type BillingSummaryWithAi } from '@/server/billing/ai-balance';
++import { readAiUsage } from '@/server/billing/ai-usage';
++import { readAiLimits } from '@/server/billing/ai-limits';
+ import { getBillingDeps } from '@/server/billing/deps';
+ import type { BillingDeps, StripeApi } from '@/server/billing/ports';
+ import { billingReturnOrigin } from '@/server/billing/return-origin';
+@@ -10,7 +12,7 @@ import { BillingProviderError } from '@/server/billing/stripe/client';
+ import { planFromSubscriptions as legacyPlanFromSubscriptions } from '@/server/billing/v2/catalog';
+ import { planFromSubscriptions, upgradeGrantSeconds } from '@/server/billing/v3/catalog';
+ import { buildSummaryV3 } from '@/server/billing/v3/summary';
+-import type { BillingSummaryV3Result, SelectMachineOutputV3 } from '@/server/billing/v3/contract';
++import type { SelectMachineOutputV3 } from '@/server/billing/v3/contract';
+ import {
+     CATALOG_V2, SIZES, OVERAGE_CENTS_PER_STD_HOUR, OVERAGE_MAX_CAP_CENTS, OVERAGE_TERMS_VERSION,
+     type SizeCode,
+@@ -86,10 +88,10 @@ async function upgradeContext(deps: BillingDeps, stripe: StripeApi, userId: stri
+ /** Injecting the ports keeps session authorization real while tests replace billing effects. */
+ export function createBillingRouter(getDeps: () => BillingDeps) {
+     return createTRPCRouter({
+-        summary: protectedProcedure.query(async ({ ctx }): Promise<BillingSummaryV3Result> => {
++        summary: protectedProcedure.query(async ({ ctx, signal }): Promise<BillingSummaryWithAi | { enabled: false }> => {
+             const deps = getDeps();
+             if (!deps.config.tabEnabled) return { enabled: false };
+-            const aiBalance = readAiBalance({ config: deps.config, userId: ctx.user.id, headers: ctx.headers });
++            const aiRead = readAiAccount({ config: deps.config, userId: ctx.user.id, headers: ctx.headers, signal });
+             const now = deps.now();
+             const [subs, userCreatedAt, planChanges] = await Promise.all([
+                 deps.store.subscriptionsFor(ctx.user.id),
+@@ -124,9 +126,26 @@ export function createBillingRouter(getDeps: () => BillingDeps) {
+                 storage, sizePreference, hasCustomer: customer !== null, overageInvoices, renewal,
+             });
+             await enqueueFreeAiCredits(deps.store, ctx.user.id, summary.plan.sku, now);
+-            summary.ai.balance = await aiBalance;
+-            summary.ai.state = aiBalanceState(summary.ai.balance, summary.ai.grant.amount);
+-            return summary;
++            const ai = await aiRead;
++            ai.balanceState = aiMicroBalanceState(ai.balanceMicro, summary.ai.grant.amount);
++            return { ...summary, ai: { ...summary.ai, ...ai,
++                // Older consumers cannot describe a pause. They must not call it healthy or exhausted.
++                state: ai.spendingState === 'available' ? ai.balanceState : 'unavailable' } };
++        }),
++
++        aiUsage: protectedProcedure.input(z.object({
++            limit: z.number().int().min(1).max(50).default(20),
++            before: z.string().datetime({ offset: true }).optional(),
++        }).strict().default({ limit: 20 })).query(async ({ ctx, input, signal }) => {
++            const deps = getDeps();
++            if (!deps.config.tabEnabled) return { state: 'unavailable' as const, recentUsage: null };
++            return readAiUsage({ config: deps.config, userId: ctx.user.id, headers: ctx.headers, signal }, input);
++        }),
++
++        aiLimits: protectedProcedure.query(async ({ ctx, signal }) => {
++            const deps = getDeps();
++            if (!deps.config.tabEnabled) return { state: 'unavailable' as const, limits: null };
++            return readAiLimits({ config: deps.config, userId: ctx.user.id, headers: ctx.headers, signal });
+         }),
+ 
+         createCheckout: protectedProcedure.input(z.object({ sku: z.enum(['standard_monthly_v3', 'premium_monthly_v3']) })).mutation(async ({ ctx, input }): Promise<CheckoutStartDTO> => {
+diff --git a/app/src/server/billing/ai-balance.test.ts b/app/src/server/billing/ai-balance.test.ts
+index cf68827f..d93f74f8 100644
+--- a/app/src/server/billing/ai-balance.test.ts
++++ b/app/src/server/billing/ai-balance.test.ts
+@@ -1,5 +1,5 @@
+ import { afterEach, describe, expect, it, vi } from 'vitest';
+-import { aiBalanceState, enqueueFreeAiCredits, parseAiBalance, readAiBalance } from './ai-balance';
++import { aiBalanceState, enqueueFreeAiCredits, parseAiBalance, parseAiBalanceMicro, aiMicroBalanceState, readAiBalance, readAiAccount } from './ai-balance';
+ import type { OutboxInsert } from './ports';
+ 
+ const input = { config: { fundingUrl: 'https://gateway.test/' }, userId: 'current-user', headers: new Headers(),
+@@ -10,9 +10,9 @@ describe('AI balance', () => {
+     it.each([[null, 500, 'unavailable'], [0, 500, 'exhausted'], [1, 500, 'low'], [50, 500, 'low'], [51, 500, 'ok'],
+         [400, 4000, 'low'], [401, 4000, 'ok'], [2000, 20000, 'low'], [2001, 20000, 'ok'], [1, 0, 'ok']] as const)
+     ('balance %s against grant %s is %s', (balance, grant, state) => expect(aiBalanceState(balance, grant)).toBe(state));
+-    it.each([[{ available_micro: '123456789' }, 123], [{ available_micro: 1_000_000 }, 1], [{ available_micro: '999999' }, 0],
++    it.each([[{ available_micro: '123456789' }, 123.456789], [{ available_micro: 1_000_000 }, 1], [{ available_micro: '999999' }, 0.999999],
+         [{ available_micro: '0' }, 0], [{ credits: 4000 }, 4000], [{ credits: 0 }, 0], [null, null], [{}, null],
+-        [{ credits: -1 }, null], [{ credits: 1.5 }, null], [{ credits: '1' }, null], [{ credits: Infinity }, null],
++        [{ credits: -1 }, null], [{ credits: 1.5 }, 1.5], [{ credits: '1' }, null], [{ credits: Infinity }, null],
+         [{ available_micro: '-1' }, null], [{ available_micro: 1.5 }, null], [{ available_micro: '1e6' }, null],
+         [{ available_micro: '9007199254740992000000' }, null], [{ available_micro: null }, null]] as const)
+     ('parses the isolated Gateway shape %j', (body, expected) => expect(parseAiBalance(body)).toBe(expected));
+@@ -104,3 +104,78 @@ describe('Free summary grant', () => {
+         expect(warn).toHaveBeenCalledExactlyOnceWith('[billing.ai] free grant enqueue unavailable');
+     });
+ });
++
++
++describe('exact AI account projection', () => {
++    it.each([['1', 0.000001], ['999999', 0.999999], ['1000001', 1.000001], ['0', 0],
++        ['9007199254740991', null], ['9007199254740991000000', Number.MAX_SAFE_INTEGER],
++        ['9007199254740992000000', null]] as const)('retains %s microcredits without silently rounding', (micro, number) => {
++        expect(parseAiBalanceMicro({ available_micro: micro })).toBe(micro);
++        expect(parseAiBalance({ available_micro: micro })).toBe(number);
++        expect(aiMicroBalanceState(micro, 500)).toBe(micro === '0' ? 'exhausted' : BigInt(micro) <= BigInt(50000000) ? 'low' : 'ok');
++    });
++    it('rejects unsafe JSON numbers and excess fractional precision but accepts exact decimal strings', () => {
++        expect(parseAiBalanceMicro({ available_micro: Number.MAX_SAFE_INTEGER + 1 })).toBeNull();
++        expect(parseAiBalanceMicro({ available_micro: String(Number.MAX_SAFE_INTEGER + 1) })).not.toBeNull();
++        expect(parseAiBalance({ credits: 0.0000001 })).toBeNull();
++    });
++    function fetcher(overrides: Record<string, unknown> = {}) {
++        const bodies: Record<string, unknown> = {
++            '/v1/me/balance': { available_micro: '1000001', held_micro: '20', state: 'ok' },
++            '/v1/models': { killswitch: false, pause: null },
++            '/v1/me/limits': { policy: { policy: {} }, pauses: [], entitlement: { required: false, basis: 'not_required' } },
++            '/v1/me/usage': { object: 'list', data: [] }, ...overrides,
++        };
++        return vi.fn<typeof fetch>(async url => Response.json(bodies[new URL(String(url)).pathname]));
++    }
++    it('captures one current-user credential for all four independently validated reads', async () => {
++        const session = vi.fn(input.session), fetch = fetcher();
++        expect(await readAiAccount({ ...input, session, fetch })).toMatchObject({ balanceMicro: '1000001', balance: 1.000001,
++            heldMicro: '20', spendingState: 'available', recentUsage: { rows: [] }, limitsState: 'available' });
++        expect(session).toHaveBeenCalledOnce(); expect(fetch).toHaveBeenCalledTimes(4);
++        for (const [, options] of fetch.mock.calls) expect(options).toMatchObject({ method: 'GET', redirect: 'error', cache: 'no-store',
++            headers: { Authorization: 'Bearer supabase-session-token' } });
++    });
++    it.each(['operations', 'reconciliation'] as const)('preserves global %s pause with a positive balance', async pause => {
++        const result = await readAiAccount({ ...input, fetch: fetcher({ '/v1/models': { killswitch: true, pause } }) });
++        expect(result).toMatchObject({ balance: 1.000001, balanceState: 'ok', spendingState: `paused_${pause}` });
++    });
++    it('finds the global pause even when an exhausted wallet hides it', async () => {
++        expect(await readAiAccount({ ...input, fetch: fetcher({ '/v1/me/balance': { available_micro: '0', state: 'exhausted' },
++            '/v1/models': { killswitch: true, pause: 'operations' } }) })).toMatchObject({ balanceState: 'exhausted', spendingState: 'paused_operations' });
++    });
++    it('keeps successful balance and usage reads when limits are unavailable', async () => {
++        expect(await readAiAccount({ ...input, fetch: fetcher({ '/v1/me/limits': null }) })).toMatchObject({ balance: 1.000001,
++            spendingState: 'unavailable', usageState: 'available', limitsState: 'unavailable', limits: null });
++    });
++    it('does not claim spending is available when the wallet is unknown', async () => {
++        expect(await readAiAccount({ ...input, fetch: fetcher({ '/v1/me/balance': null }) })).toMatchObject({ balance: null,
++            spendingState: 'unavailable', usageState: 'available', limitsState: 'available' });
++    });
++    it('keeps limits and their policy pause when balance and usage fail', async () => {
++        expect(await readAiAccount({ ...input, fetch: fetcher({ '/v1/me/balance': null, '/v1/me/usage': {},
++            '/v1/me/limits': { pauses: [{ scope: 'account', reason: 'private' }] } }) })).toMatchObject({ balance: null,
++            balanceState: 'unavailable', spendingState: 'paused_policy', usageState: 'unavailable', limits: { pauses: [{ scope: 'account' }] } });
++    });
++    it('does not treat a model/client pause as an account-wide pause', async () => {
++        expect(await readAiAccount({ ...input, fetch: fetcher({ '/v1/me/limits': { policy: { policy: {} }, pauses: [{ scope: 'model' }, { scope: 'client' }],
++            entitlement: { required: false, basis: 'not_required' } } }) })).toMatchObject({ spendingState: 'available' });
++    });
++    it('reports a required but missing entitlement as a policy pause with a positive balance', async () => {
++        expect(await readAiAccount({ ...input, fetch: fetcher({ '/v1/me/limits': { policy: { policy: {} }, pauses: [],
++            entitlement: { required: true, basis: null } } }) })).toMatchObject({ balance: 1.000001, spendingState: 'paused_policy' });
++    });
++    it('keeps an unreadable effective policy unknown rather than implying no limits', async () => {
++        expect(await readAiAccount({ ...input, fetch: fetcher({ '/v1/me/limits': { policy: {}, pauses: [],
++            entitlement: { required: false, basis: 'not_required' } } }) })).toMatchObject({ balance: 1.000001, spendingState: 'unavailable' });
++    });
++    it('cancels delayed requests immediately and clears deadline timers', async () => {
++        vi.useFakeTimers(); const controller = new AbortController();
++        const fetch = vi.fn<typeof globalThis.fetch>(() => new Promise(() => {}));
++        const pending = readAiAccount({ ...input, signal: controller.signal, fetch });
++        await vi.advanceTimersByTimeAsync(1); controller.abort();
++        expect(await pending).toMatchObject({ balance: null, spendingState: 'unavailable', recentUsage: null, limits: null });
++        expect(vi.getTimerCount()).toBe(0);
++        for (const [, options] of fetch.mock.calls) expect(options?.signal?.aborted).toBe(true);
++    });
++});
+diff --git a/app/src/server/billing/ai-balance.ts b/app/src/server/billing/ai-balance.ts
+index 670e85b5..301a88f6 100644
+--- a/app/src/server/billing/ai-balance.ts
++++ b/app/src/server/billing/ai-balance.ts
+@@ -1,56 +1,80 @@
+-import type { BillingConfig } from './config';
+ import type { BillingStore } from './ports';
+ import type { BillingSummaryV3 } from './v3/contract';
+ import { aiCreditEntitlement, aiCreditOutboxItem } from './ai-credits';
+-import { withAiTimeout } from './ai-gateway-client';
++import { createAiReader, creditNumber, microString, record, type AiReadInput } from './ai-read';
++import { readAiUsage, type AiUsagePage } from './ai-usage';
++import { readAiLimits, type AiLimits } from './ai-limits';
++
++/** Account/global pause status, not a promise that a particular model request will be admitted. */
++export type AiSpendingState = 'available' | 'paused_operations' | 'paused_reconciliation' | 'paused_policy' | 'unavailable';
++export interface AiAccountView {
++    balanceMicro: string | null;
++    heldMicro: string | null;
++    balance: number | null;
++    balanceState: BillingSummaryV3['ai']['state'];
++    spendingState: AiSpendingState;
++    recentUsage: AiUsagePage | null;
++    limits: AiLimits | null;
++    usageState: 'available' | 'unavailable';
++    limitsState: 'available' | 'unavailable';
++}
++export type BillingSummaryWithAi = BillingSummaryV3 & { ai: BillingSummaryV3['ai'] & AiAccountView };
++
++export function parseAiBalanceMicro(body: unknown): string | null {
++    const value = record(body);
++    if (!value) return null;
++    if ('available_micro' in value) return microString(value.available_micro);
++    // Retain the older credit-number response without rounding fractions to whole credits.
++    const credits = value.credits;
++    if (typeof credits !== 'number' || !Number.isFinite(credits) || credits < 0 || credits > Number.MAX_SAFE_INTEGER) return null;
++    const decimal = credits.toFixed(6);
++    return Number(decimal) === credits ? BigInt(decimal.replace('.', '')).toString() : null;
++}
+ 
+-/** Gateway test/app.test.ts exposes available_micro (1 credit = 1,000,000 microcredits). */
+ export function parseAiBalance(body: unknown): number | null {
+-    if (!body || typeof body !== 'object') return null;
+-    const value = body as Record<string, unknown>;
+-    if ('available_micro' in value) {
+-        const micro = value.available_micro;
+-        if (!(typeof micro === 'string' && /^\d+$/.test(micro))
+-            && !(typeof micro === 'number' && Number.isSafeInteger(micro) && micro >= 0)) return null;
+-        const credits = Number(BigInt(micro as string | number) / BigInt(1_000_000));
+-        return Number.isSafeInteger(credits) ? credits : null;
+-    }
+-    return typeof value.credits === 'number' && Number.isSafeInteger(value.credits) && value.credits >= 0 ? value.credits : null;
++    return creditNumber(parseAiBalanceMicro(body));
+ }
+ 
+ export function aiBalanceState(balance: number | null, grant: number): BillingSummaryV3['ai']['state'] {
+     return balance === null ? 'unavailable' : balance === 0 ? 'exhausted' : balance <= grant * 0.1 ? 'low' : 'ok';
+ }
+ 
+-type Session = { access_token: string; user: { id: string } } | null;
+-async function currentSession(): Promise<Session> {
+-    const { createClient } = await import('@/utils/supabase/server');
+-    const { data, error } = await (await createClient()).auth.getSession();
+-    return error ? null : data.session;
++export function aiMicroBalanceState(micro: string | null, grant: number): BillingSummaryV3['ai']['state'] {
++    if (micro === null) return 'unavailable';
++    const balance = BigInt(micro);
++    if (balance === BigInt(0)) return 'exhausted';
++    return Number.isSafeInteger(grant) && grant > 0 && balance <= BigInt(grant) * BigInt(100_000) ? 'low' : 'ok';
+ }
+ 
+-/** ctx.user has already been authenticated; a cookie session must still match that user. */
+-export async function readAiBalance(input: {
+-    config: Pick<BillingConfig, 'fundingUrl'>; userId: string; headers: Headers;
+-    session?: () => Promise<Session>; fetch?: typeof fetch;
+-}): Promise<number | null> {
+-    if (!input.config.fundingUrl) return null;
+-    try {
+-        return await withAiTimeout(3_000, async signal => {
+-            const authorization = input.headers.get('authorization');
+-            let token: string | undefined;
+-            if (authorization !== null) token = /^Bearer\s+(\S+)$/i.exec(authorization)?.[1];
+-            else {
+-                const session = await (input.session ?? currentSession)();
+-                if (session?.user.id === input.userId) token = session.access_token;
+-            }
+-            if (!token || signal.aborted) return null;
+-            const response = await (input.fetch ?? fetch)(`${input.config.fundingUrl!.replace(/\/$/, '')}/v1/me/balance`, {
+-                method: 'GET', redirect: 'error', signal, headers: { Authorization: `Bearer ${token}` }, cache: 'no-store',
+-            });
+-            return response.ok ? parseAiBalance(await response.json()) : null;
+-        });
+-    } catch { return null; }
++/** Caller authentication remains exclusively in the normal Supabase tRPC context. */
++export async function readAiBalance(input: AiReadInput): Promise<number | null> {
++    return parseAiBalance(await createAiReader(input)('/v1/me/balance'));
++}
++
++function spendingState(balance: unknown, models: unknown, limits: AiLimits | null): AiSpendingState {
++    const b = record(balance), m = record(models);
++    if (m?.killswitch === true) {
++        return m.pause === 'operations' ? 'paused_operations' : m.pause === 'reconciliation' ? 'paused_reconciliation' : 'unavailable';
++    }
++    if (b?.state === 'paused_operations' || b?.state === 'paused_reconciliation') return b.state;
++    if (limits?.pauses?.some(p => ['user', 'account', 'role'].includes(p.scope))
++        || (limits?.entitlement?.required === true && limits.entitlement.basis === null)) return 'paused_policy';
++    // An exhausted balance response hides the global pause: /models reports it independently.
++    const globalKnown = m?.killswitch === false || (b?.state === 'ok' && parseAiBalanceMicro(b) !== null);
++    return parseAiBalanceMicro(b) !== null && globalKnown && limits?.pauses !== null && limits?.pauses !== undefined
++        && limits.entitlement !== null && limits.policy !== null
++        ? 'available' : 'unavailable';
++}
++
++export async function readAiAccount(input: AiReadInput): Promise<AiAccountView> {
++    const read = createAiReader(input);
++    const [balanceBody, usage, limitsResult, models] = await Promise.all([
++        read('/v1/me/balance'), readAiUsage(input, { limit: 20 }, read), readAiLimits(input, read), read('/v1/models'),
++    ]);
++    const balanceMicro = parseAiBalanceMicro(balanceBody);
++    return { balanceMicro, heldMicro: microString(record(balanceBody)?.held_micro), balance: creditNumber(balanceMicro),
++        balanceState: aiMicroBalanceState(balanceMicro, 0), spendingState: spendingState(balanceBody, models, limitsResult.limits),
++        recentUsage: usage.recentUsage, limits: limitsResult.limits, usageState: usage.state, limitsState: limitsResult.state };
+ }
+ 
+ export async function enqueueFreeAiCredits(store: Pick<BillingStore, 'enqueueOutbox'>, userId: string, sku: string, now: Date): Promise<void> {
+diff --git a/app/src/server/billing/ai-summary.test.ts b/app/src/server/billing/ai-summary.test.ts
+index c31db24e..ed6c2a36 100644
+--- a/app/src/server/billing/ai-summary.test.ts
++++ b/app/src/server/billing/ai-summary.test.ts
+@@ -1,11 +1,12 @@
+ import { afterEach, describe, expect, it, vi } from 'vitest';
+ import { readBillingConfig } from './config';
+ import type { BillingDeps, BillingStore } from './ports';
+-import type { createTRPCContext } from '@/server/api/trpc';
++import { createTRPCContext } from '@/server/api/trpc';
+ import { createBillingRouter } from '@/server/api/routers/billing';
+ 
+ vi.mock('@/server/db', () => ({ db: {} }));
+-vi.mock('@/utils/supabase/server', () => ({ createClient: vi.fn() }));
++const auth = vi.hoisted(() => ({ getUser: vi.fn(), getSession: vi.fn() }));
++vi.mock('@/utils/supabase/server', () => ({ createClient: async () => ({ auth }) }));
+ vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn() }));
+ const now = new Date('2026-10-21Z');
+ function fixture(sku: 'free_v3' | 'standard_monthly_v3' = 'free_v3') {
+@@ -25,14 +26,14 @@ afterEach(() => { vi.unstubAllGlobals(); vi.useRealTimers(); vi.restoreAllMocks(
+ 
+ describe('billing.summary AI wiring', () => {
+     it.each([0, 50, 51])('fills a Free live balance %s and queues the current user trial', async credits => {
+-        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ credits })); vi.stubGlobal('fetch', fetcher);
++        const fetcher = gateway({ credits }); vi.stubGlobal('fetch', fetcher);
+         const f = fixture();
+         expect(await f.caller.summary()).toMatchObject({ ai: { balance: credits, state: credits === 0 ? 'exhausted' : credits <= 50 ? 'low' : 'ok' } });
+         expect(f.store.enqueueOutbox).toHaveBeenCalledWith(expect.objectContaining({ userId: 'current-user', eventKey: 'ezil-os:v1:free-once:current-user:grant' }));
+         expect(fetcher.mock.calls[0]![1]!.headers).toEqual({ Authorization: 'Bearer current-token' });
+     });
+     it('uses the paid plan threshold and never queues a Free trial for it', async () => {
+-        vi.stubGlobal('fetch', vi.fn<typeof fetch>().mockResolvedValue(Response.json({ available_micro: '400000000' })));
++        vi.stubGlobal('fetch', gateway({ available_micro: '400000000' }));
+         const f = fixture('standard_monthly_v3');
+         expect(await f.caller.summary()).toMatchObject({ ai: { grant: { amount: 4000 }, balance: 400, state: 'low' } });
+         expect(f.store.enqueueOutbox).not.toHaveBeenCalled();
+@@ -51,3 +52,100 @@ describe('billing.summary AI wiring', () => {
+         expect(fetcher).not.toHaveBeenCalled(); expect(f.store.enqueueOutbox).not.toHaveBeenCalled();
+     });
+ });
++
++
++function gateway(balance: unknown, overrides: Record<string, unknown> = {}) {
++    const bodies: Record<string, unknown> = { '/v1/me/balance': balance,
++        '/v1/models': { killswitch: false, pause: null }, '/v1/me/usage': { object: 'list', data: [] },
++        '/v1/me/limits': { policy: { policy: {} }, pauses: [], entitlement: { required: false, basis: 'not_required' } }, ...overrides };
++    return vi.fn<typeof fetch>(async url => Response.json(bodies[new URL(String(url)).pathname]));
++}
++
++describe('authenticated C6 AI read procedures', () => {
++    async function caller(headers = new Headers()) {
++        const f = fixture();
++        const ctx = await createTRPCContext({ headers });
++        return { ...f, caller: createBillingRouter(() => f.deps).createCaller(ctx) };
++    }
++    it('isolates users through the actual Supabase context and never enqueues credits on either read', async () => {
++        auth.getUser.mockImplementation(async token => ({ data: { user: { id: token === 'alice-token' ? 'alice' : 'bob' } }, error: null }));
++        const fetcher = vi.fn<typeof fetch>(async (url, options) => {
++            const token = new Headers(options?.headers).get('authorization');
++            return Response.json(String(url).includes('/usage?') ? { object: 'list', data: [{ created_at: '2026-10-26T01:00:00Z',
++                status: 'settled', hold_micro: 0, cost_micro: token === 'Bearer alice-token' ? '1' : '999999', uncollected_micro: 0 }] }
++                : { counters: { pending: token === 'Bearer alice-token' ? 1 : 2 } });
++        });
++        vi.stubGlobal('fetch', fetcher);
++        for (const [name, cost, pending] of [['alice', '1', 1], ['bob', '999999', 2]] as const) {
++            const f = await caller(new Headers({ authorization: `Bearer ${name}-token` }));
++            expect(await f.caller.aiUsage({ limit: 1 })).toMatchObject({ recentUsage: { rows: [{ chargedMicro: cost }] } });
++            expect(await f.caller.aiLimits()).toMatchObject({ limits: { counters: { pending } } });
++            expect(f.store.enqueueOutbox).not.toHaveBeenCalled();
++        }
++        expect(fetcher).toHaveBeenCalledTimes(4);
++        for (const [url, options] of fetcher.mock.calls) {
++            expect(String(url)).not.toMatch(/userId|payer|subject/);
++            expect(options).toMatchObject({ redirect: 'error', cache: 'no-store' });
++        }
++    });
++    it('uses only the matching cookie session credential and refuses a mismatched session', async () => {
++        auth.getUser.mockResolvedValue({ data: { user: { id: 'alice' } }, error: null });
++        auth.getSession.mockResolvedValue({ data: { session: { user: { id: 'alice' }, access_token: 'alice-cookie' } }, error: null });
++        const fetcher = gateway({ credits: 1 }); vi.stubGlobal('fetch', fetcher);
++        const f = await caller(); expect((await f.caller.aiUsage()).state).toBe('available');
++        expect(new Headers(fetcher.mock.calls[0][1]?.headers).get('authorization')).toBe('Bearer alice-cookie');
++        auth.getSession.mockResolvedValue({ data: { session: { user: { id: 'bob' }, access_token: 'bob-cookie' } }, error: null });
++        expect(await f.caller.aiLimits()).toEqual({ state: 'unavailable', limits: null });
++        expect(fetcher).toHaveBeenCalledOnce();
++    });
++    it.each(['Bearer invalid', 'Bearer ', 'Basic invalid', 'Bearer foreign-auth0-id-token'])('refuses %s without falling through to cookies', async header => {
++        auth.getUser.mockImplementation(async token => ({ data: { user: token === undefined ? { id: 'cookie-user' } : null }, error: null }));
++        const fetcher = vi.fn(); vi.stubGlobal('fetch', fetcher);
++        const f = await caller(new Headers({ authorization: header }));
++        await expect(f.caller.aiUsage()).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
++        await expect(f.caller.aiLimits()).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
++        expect(fetcher).not.toHaveBeenCalled(); expect(f.store.enqueueOutbox).not.toHaveBeenCalled();
++    });
++    it('rejects malformed cursors, out-of-bounds limits and payer selectors', async () => {
++        const f = fixture(), fetcher = vi.fn(); vi.stubGlobal('fetch', fetcher);
++        for (const input of [{ limit: 0 }, { limit: 51 }, { limit: 1.5 }, { before: 'tomorrow' }, { userId: 'other' }]) {
++            await expect(f.caller.aiUsage(input as { limit: number })).rejects.toMatchObject({ code: 'BAD_REQUEST' });
++        }
++        expect(fetcher).not.toHaveBeenCalled();
++    });
++    it('preserves a paused positive fractional balance without claiming healthy legacy state', async () => {
++        vi.stubGlobal('fetch', gateway({ available_micro: '1000001' }, { '/v1/models': { killswitch: true, pause: 'reconciliation' },
++            '/v1/me/usage': null }));
++        expect(await fixture().caller.summary()).toMatchObject({ ai: { balanceMicro: '1000001', balance: 1.000001,
++            balanceState: 'low', spendingState: 'paused_reconciliation', state: 'unavailable', usageState: 'unavailable', limitsState: 'available' } });
++    });
++    it('returns unknown on Gateway refusals or malformed JSON rather than using privileged fallback credentials', async () => {
++        const f = fixture();
++        for (const response of [Response.json({}, { status: 401 }), Response.json({}, { status: 503 }), new Response('not json')]) {
++            const fetcher = vi.fn<typeof fetch>(async () => response.clone()); vi.stubGlobal('fetch', fetcher);
++            expect(await f.caller.aiUsage()).toEqual({ state: 'unavailable', recentUsage: null });
++            expect(await f.caller.aiLimits()).toEqual({ state: 'unavailable', limits: null });
++            expect(fetcher).toHaveBeenCalledTimes(2);
++        }
++        expect(f.store.enqueueOutbox).not.toHaveBeenCalled();
++    });
++    it('does no reads or grants with billing disabled', async () => {
++        const f = fixture(); f.deps.config.tabEnabled = false;
++        const fetcher = vi.fn(); vi.stubGlobal('fetch', fetcher);
++        expect((await f.caller.aiUsage()).state).toBe('unavailable'); expect((await f.caller.aiLimits()).state).toBe('unavailable');
++        expect(fetcher).not.toHaveBeenCalled(); expect(f.store.enqueueOutbox).not.toHaveBeenCalled();
++    });
++    it('propagates caller cancellation through both real read procedures without leaving timers or grants', async () => {
++        vi.useFakeTimers();
++        const f = fixture(), controller = new AbortController();
++        const ctx = { user: { id: 'current-user' }, headers: new Headers({ authorization: 'Bearer current-token' }), db: {} } as Awaited<ReturnType<typeof createTRPCContext>>;
++        const caller = createBillingRouter(() => f.deps).createCaller(ctx, { signal: controller.signal });
++        const fetcher = vi.fn<typeof fetch>(() => new Promise(() => {})); vi.stubGlobal('fetch', fetcher);
++        const reads = Promise.all([caller.aiUsage(), caller.aiLimits()]);
++        await vi.advanceTimersByTimeAsync(1); expect(fetcher).toHaveBeenCalledTimes(2);
++        controller.abort();
++        expect(await reads).toEqual([{ state: 'unavailable', recentUsage: null }, { state: 'unavailable', limits: null }]);
++        expect(vi.getTimerCount()).toBe(0); expect(f.store.enqueueOutbox).not.toHaveBeenCalled();
++        for (const [, options] of fetcher.mock.calls) expect(options?.signal?.aborted).toBe(true);
++    });
++});
+diff --git a/shell/ezil/ui/Settings/billing-format.js b/shell/ezil/ui/Settings/billing-format.js
+index 6bffb5fc..36f30d0b 100644
+--- a/shell/ezil/ui/Settings/billing-format.js
++++ b/shell/ezil/ui/Settings/billing-format.js
+@@ -65,3 +65,15 @@ export function webUrl (value) {
+ }
+ 
+ export const BANNED_COPY = ['faster', 'instant', 'unlimited', 'priority', 'gpu', 'heavy use', 'gpt', 'claude', 'gemini', 'llama', 'memory is kept', 'memory survives', 'processes keep running', 'ai included', 'includes ai', 'compute hours', 'standard-hour'];
++
++/** Format the canonical microcredit string without passing it through Number. */
++export function creditsLabel (micro, balance = null) {
++    if ( typeof micro === 'string' && /^\d{1,100}$/.test(micro) ) {
++        const value = BigInt(micro);
++        const fraction = String(value % 1000000n).padStart(6, '0').replace(/0+$/, '');
++        return `${(value / 1000000n).toLocaleString('en-US')}${fraction ? `.${fraction}` : ''}`;
++    }
++    return typeof balance === 'number' && Number.isFinite(balance) && balance >= 0 && balance <= Number.MAX_SAFE_INTEGER
++        && Number(balance.toFixed(6)) === balance
++        ? balance.toLocaleString('en-US', { maximumFractionDigits: 6 }) : 'Not reported';
++}
+diff --git a/shell/ezil/ui/Settings/billing-test.mjs b/shell/ezil/ui/Settings/billing-test.mjs
+index c0df1ba8..124a0f9d 100644
+--- a/shell/ezil/ui/Settings/billing-test.mjs
++++ b/shell/ezil/ui/Settings/billing-test.mjs
+@@ -906,7 +906,7 @@ try {
+     }
+     pass('Premium machine picker labels, exact mutation, pending guard, rollback and keyboard navigation; other plans read-only');
+     summary = summaryV3(); await refresh();
+-    for ( const [status, copy] of [['near', 'Nearly at fair use'], ['paused', 'Paused until Nov 1 — upgrade to keep working']] ) {
++    for ( const [status, copy] of [['near', 'Nearly at fair use'], ['paused', 'Paused until Nov 1.']] ) {
+         summary.fairUse.status = status; await refresh(); contains('[data-role="fair-use"]', copy);
+     }
+     summary.plan.status = 'cancels'; summary.plan.cancelsAt = END; await refresh();
+@@ -934,6 +934,46 @@ try {
+     for ( const key of Object.keys(summary.actions) ) summary.actions[key] = false;
+     await refresh(); assert.equal(qa('[data-role="plan-actions"] button').length, 0); has('[data-action="portal"]', false);
+     pass('v3 DTO-only plans, fair-use states, cancellation/payment, invoices, actions, deep links, escaping and failure recovery');
++    summary = summaryV3(); await refresh();
++    contains('[data-role="ai-usage"]', 'Balance: 1.000001 credits');
++    contains('[data-role="ai-usage"]', 'Commitments include held credits');
++    contains('[data-role="ai-usage"]', 'not a billing-period total');
++    contains('[data-role="ai-limits"]', 'Not reported');
++    contains('[data-role="ai-recent"]', 'charged: Not reported');
++    for ( const [micro, expected] of [['1', '0.000001'], ['999999', '0.999999'], ['1000001', '1.000001'],
++        ['9007199254740991000001', '9,007,199,254,740,991.000001']] ) {
++        summary.ai.balanceMicro = micro; summary.ai.balance = null; await refresh();
++        contains('[data-role="ai-usage"]', `Balance: ${expected} credits`);
++    }
++    for ( const state of ['paused_operations', 'paused_reconciliation', 'paused_policy', 'unavailable'] ) {
++        summary.ai.spendingState = state; summary.ai.balanceMicro = '1000001'; await refresh();
++        const section = q('[data-role="ai-usage"]').textContent;
++        assert.doesNotMatch(section, /spending is available|No AI credits remain|upgrade|top.?up|add credits/i);
++        assert.equal(q('[data-role="ai-spending"]').dataset.state, state);
++    }
++    summary.ai.recentUsage = null; summary.ai.limits = null; summary.ai.balance = null; summary.ai.balanceMicro = null; await refresh();
++    contains('[data-role="ai-usage"]', 'Balance: Not reported');
++    contains('[data-role="ai-usage"]', 'AI limits are unavailable');
++    contains('[data-role="ai-usage"]', 'Recent AI usage is unavailable');
++    summary.ai.balanceMicro = '0'; summary.ai.balanceState = 'exhausted'; summary.ai.spendingState = 'available'; await refresh();
++    contains('[data-role="ai-usage"]', 'Balance: 0 credits'); contains('[data-role="ai-spending"]', 'No AI credits remain');
++    const old = summaryV3(); old.ai.balanceMicro = '123000000';
++    let releaseOld;
++    getSummary = () => new Promise(resolve => { releaseOld = resolve; });
++    click(q('[data-tab="account"]')); click(q('[data-tab="billing"]')); await settle();
++    click(q('[data-tab="account"]'));
++    summary = summaryV3(); summary.ai.balanceMicro = '7000000'; getSummary = () => reply(summary);
++    click(q('[data-tab="billing"]')); await settle();
++    releaseOld(reply(old)); await settle();
++    contains('[data-role="ai-usage"]', 'Balance: 7 credits');
++    assert.doesNotMatch(q('[data-role="ai-usage"]').textContent, /123 credits/);
++    let releaseClosed;
++    getSummary = () => new Promise(resolve => { releaseClosed = resolve; });
++    click(q('[data-tab="account"]')); click(q('[data-tab="billing"]')); await settle();
++    await window.$(q('.window[data-app="settings"]')).close(); await settle();
++    getSummary = () => reply(summary); await open(); releaseClosed(reply(old)); await settle();
++    contains('[data-role="ai-usage"]', 'Balance: 7 credits');
++    pass('AI fractions, exact large balances, partial unknowns, holds, pauses and canceled stale summaries');
+     summary = v2(); history = []; await refresh();
+ 
+     const billingRequests = () => calls.filter(call => call.url.includes('/billing.')).length;
+diff --git a/shell/ezil/ui/Settings/billing-v3-fixtures.mjs b/shell/ezil/ui/Settings/billing-v3-fixtures.mjs
+index 4c7e416c..6b392fca 100644
+--- a/shell/ezil/ui/Settings/billing-v3-fixtures.mjs
++++ b/shell/ezil/ui/Settings/billing-v3-fixtures.mjs
+@@ -16,6 +16,11 @@ export function summaryV3(tier = 'standard') {
+         enabled: true, version: 3,
+         plan: { sku: offer.sku, name: offer.name, status: free ? 'free' : 'active', renewal: free ? null : { at: '2026-11-01T00:00:00Z', amountCents: offer.priceCents }, cancelsAt: null, scheduledChange: null, pendingUpgrade: null, paymentIssue: null },
+         computer: { size: offer.machineChoice[0], machineChoice: free ? [{ size: 'free-cf', vcpu: 2, memoryGiB: 6, weight: 1, arch: 'x86_64' }] : machines.filter(machine => offer.machineChoice.includes(machine.size)), vcpu: offer.vcpu, memoryGiB: offer.memoryGiB, sessionMaxSeconds: offer.sessionMaxSeconds, opening: offer.opening, activeDeadline: null },
++        ai: { grant: offer.aiCredits, balance: 1.000001, balanceMicro: '1000001', heldMicro: '1', state: 'low', balanceState: 'low',
++            spendingState: 'available', usageState: 'available', limitsState: 'available',
++            recentUsage: { limit: 20, before: null, rows: [{ at: '2026-10-18T12:00:00Z', status: 'pending', heldMicro: '1', chargedMicro: null }] },
++            limits: { policy: { rpm: 20, concurrency: 2, dailyBudgetMicro: '100000000', monthlyBudgetMicro: null },
++                ceilings: { rpm: 30, concurrency: 4 }, counters: { inflight: 1, pending: 1, dayMicro: '2000001', monthMicro: '3000001' }, pauses: [] } },
+         fairUse: { status: 'ok', resetsAt: '2026-11-01T00:00:00Z' },
+         storage: { usedBytes: '100', capBytes: '2000000000', state: 'ok' },
+         actions: { checkout: free, upgrade: tier === 'standard', downgrade: tier === 'premium', cancel: !free, portal: !free },
+diff --git a/shell/ezil/ui/Settings/tabs/billing.js b/shell/ezil/ui/Settings/tabs/billing.js
+index 131a28c5..5db29f71 100644
+--- a/shell/ezil/ui/Settings/tabs/billing.js
++++ b/shell/ezil/ui/Settings/tabs/billing.js
+@@ -5,7 +5,7 @@ import { isNative } from '../../../native-runtime.js';
+ import trpc from '../trpc.js';
+ import { openUpgradeSheet } from '../upgrade-sheet.js';
+ import { openComputeUpgradeSheet, openDowngradeSheet, openCancelSheet, openOverageSheet, openPlanPickerSheet } from '../billing-sheets.js';
+-import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl } from '../billing-format.js';
++import { dollars, dateLabel, durationLabel, stdHoursLabel, sizeLabel, planName, errorCopy, webUrl, creditsLabel } from '../billing-format.js';
+ 
+ const BILLING_ICON = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"'
+     + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+@@ -196,11 +196,51 @@ function machineV3Html ({ plan, computer }) {
+         </label>`).join('')}</div><p data-role="machine-status" role="status" aria-live="polite"></p></fieldset>`;
+ }
+ 
++function aiV3Html (ai) {
++    const spending = ai?.spendingState ?? 'unavailable';
++    const copy = {
++        available: ai?.balanceState === 'exhausted' ? 'No AI credits remain.'
++            : ai?.balanceState === 'low' ? 'AI credits are running low.' : 'AI spending is not paused.',
++        paused_operations: 'AI spending is paused by operations.',
++        paused_reconciliation: 'AI spending is paused while pending requests are reconciled.',
++        paused_policy: 'AI spending is paused by an account policy.',
++        unavailable: 'AI spending status is unavailable.',
++    }[spending] ?? 'AI spending status is unavailable.';
++    const limits = ai?.limits, policy = limits?.policy, counters = limits?.counters;
++    const number = value => Number.isSafeInteger(value) && value >= 0 ? String(value) : 'Not reported';
++    const credits = value => value == null ? 'Not reported' : `${creditsLabel(value)} credits`;
++    const detail = (label, value) => `<div><dt>${encode(label)}</dt><dd>${encode(value)}</dd></div>`;
++    const recent = ai?.recentUsage;
++    return `<section class="ezil-billing-card" data-role="ai-usage" aria-label="AI credits and usage">
++        <h4>AI credits</h4>
++        ${paragraph(`Balance: ${ai?.balanceMicro != null || ai?.balance != null ? `${creditsLabel(ai.balanceMicro, ai.balance)} credits` : 'Not reported'}`, 'ezil-billing-usage')}
++        <p role="status" data-role="ai-spending" data-state="${encode(spending)}">${encode(copy)}</p>
++        ${paragraph(`Held for requests: ${credits(ai?.heldMicro)}`)}
++        ${limits?.pauses?.some(p => ['model', 'client'].includes(p.scope)) ? paragraph('Some models or clients are paused.') : ''}
++        <h4>AI limits</h4>
++        ${!limits ? paragraph('AI limits are unavailable.') : `<dl data-role="ai-limits">
++            ${detail('Requests per minute', `${number(policy?.rpm)} · service ceiling: ${number(limits.ceilings?.rpm)}`)}
++            ${detail('Concurrent requests', `${number(policy?.concurrency)} · service ceiling: ${number(limits.ceilings?.concurrency)}`)}
++            ${detail('Tokens per minute', number(policy?.tpm))}
++            ${detail('Output tokens per request', number(policy?.maxOutputTokens))}
++            ${detail('Daily commitment / budget', `${credits(counters?.dayMicro)} / ${credits(policy?.dailyBudgetMicro)}`)}
++            ${detail('Monthly commitment / budget', `${credits(counters?.monthMicro)} / ${credits(policy?.monthlyBudgetMicro)}`)}
++            ${detail('Open / pending requests', `${number(counters?.inflight)} / ${number(counters?.pending)}`)}
++        </dl>`}
++        ${paragraph('Commitments include held credits. Unreported limits are unknown.')}
++        <h4>Recent AI requests</h4>
++        ${!recent ? paragraph('Recent AI usage is unavailable.') : !recent.rows.length ? paragraph('No requests in this result.')
++            : `<ul data-role="ai-recent">${recent.rows.map(row => `<li>${encode(dateLabel(row.at, true))} · ${encode({ reserved: 'Reserved', pending: 'Pending', settled: 'Settled' }[row.status] ?? 'Unknown')}
++                · charged: ${encode(credits(row.chargedMicro))} · held: ${encode(credits(row.heldMicro))}</li>`).join('')}</ul>`}
++        ${paragraph(`Recent requests${recent ? ` (up to ${recent.limit})` : ''} are not a billing-period total.`)}
++    </section>`;
++}
++
+ export function summaryV3Html (summary) {
+     const { plan, computer, fairUse, actions } = summary;
+     const status = { free: 'Free', active: 'Active', cancels: 'Cancels', past_due: 'Past due', incomplete: 'Payment incomplete', upgrade_pending: 'Upgrade pending' }[plan.status];
+     const hours = computer.sessionMaxSeconds === null ? null : computer.sessionMaxSeconds / 3600;
+-    const fairCopy = { ok: 'Within fair use', near: 'Nearly at fair use', paused: `Paused until ${dateLabel(fairUse.resetsAt)} — upgrade to keep working` }[fairUse.status];
++    const fairCopy = { ok: 'Within fair use', near: 'Nearly at fair use', paused: `Paused until ${dateLabel(fairUse.resetsAt)}.` }[fairUse.status];
+     const changeAction = actions.downgrade ? actionHtml('downgrade', 'Change plan')
+         : actions.upgrade ? actionHtml('upgrade', 'Change plan') : actions.checkout ? actionHtml('choose', 'Change plan', true) : '';
+     return `<header class="ezil-billing-header"><div><h3>Billing</h3><p class="ezil-settings-lead">Your plan and payments.</p></div>
+@@ -221,6 +261,7 @@ export function summaryV3Html (summary) {
+             ${plan.sku !== 'free_v3' ? paragraph('Your own computer on AWS (India)') : ''}
+         </section>
+         <p class="ezil-billing-fair-use" data-role="fair-use" data-status="${encode(fairUse.status)}" role="status">${encode(fairCopy)}</p>
++        ${aiV3Html(summary.ai)}
+         <p class="ezil-billing-note">Prices before tax.</p>
+         <p class="ezil-billing-action-error" data-role="billing-action-error" role="alert"></p>
+         <section class="ezil-billing-invoices" data-role="invoices" aria-label="Invoices"><h3>Invoices</h3>
+@@ -301,7 +342,7 @@ async function load ($win, state) {
+     const history = trpc.query('billing.history').catch(() => ({ ok: false }));
+     try {
+         const result = await trpc.query('billing.summary');
+-        if ( state.closed || ! $win.get(0).isConnected ) return;
++        if ( request !== state.request || ! state.active || state.closed || ! $win.get(0).isConnected ) return;
+         if ( ! result.ok ) throw new Error('summary failed');
+         if ( result.data?.enabled === false || ! [2, 3].includes(result.data?.version) ) {
+             $body.html('<p>Billing isn\'t available yet.</p>');
+@@ -311,10 +352,13 @@ async function load ($win, state) {
+             startCountdown($win, state);
+         }
+     } catch {
++        if ( request !== state.request || ! state.active || state.closed ) return;
+         $body.html('<div class="ezil-billing-card ezil-settings-error" role="alert">Couldn\'t load billing. Try again. <button type="button" class="ezil-settings-btn" data-action="retry">Retry</button></div>');
+     } finally {
+-        state.loading = false;
+-        $body.attr('aria-busy', 'false');
++        if ( request === state.request ) {
++            state.loading = false;
++            $body.attr('aria-busy', 'false');
++        }
+     }
+     if ( state.summary && ! state.autoOpened ) {
+         state.autoOpened = true;
+@@ -497,6 +541,7 @@ export default {
+         });
+         $win.on('remove.billing', () => {
+             state.closed = true;
++            state.request++;
+             stopCountdown(state);
+             state.sheet?.handle?.close();
+             state.sheet?.cleanup?.();
+@@ -512,6 +557,6 @@ export default {
+     },
+     onDeactivate ($win) {
+         const state = $win && windows.get($win.get(0));
+-        if ( state ) { state.active = false; stopCountdown(state); }
++        if ( state ) { state.active = false; state.request++; state.loading = false; stopCountdown(state); }
+     },
+ };
+diff --git a/app/src/server/billing/ai-limits.test.ts b/app/src/server/billing/ai-limits.test.ts
+new file mode 100644
+index 00000000..4272e693
+--- /dev/null
++++ b/app/src/server/billing/ai-limits.test.ts
+@@ -0,0 +1,33 @@
++import { describe, expect, it } from 'vitest';
++import { parseAiLimits } from './ai-limits';
++
++describe('member limits projection', () => {
++    it('reads the actual nested effective policy, ceilings, counters and pauses without leaking reasons', () => {
++        const result = parseAiLimits({ account_public_id: 'private-id', policy: { policy: { rpm: 20, concurrency: 0,
++            daily_budget_micro: '9007199254740991000000', allowed_models: ['ezil-code'] }, sources: { rpm: 'user' } },
++        models: { 'ezil-code': { policy: { tpm: 500 } } }, ceilings: { rpm: 10, concurrency: 3 },
++        counters: { rpm: 0, tpm: 2, inflight: 2, pending: 1, open_micro: '1000001', day_micro: '1000002', month_micro: '2000002' },
++        pauses: [{ scope: 'user', reason: 'private operator reason', target: 'private-target' }],
++        entitlement: { required: true, basis: 'subscription', subscription: { id: 'private-subscription' } } });
++        expect(result).toMatchObject({ state: 'available', limits: { policy: { rpm: 20, concurrency: 0, dailyBudgetMicro: '9007199254740991000000' },
++            ceilings: { rpm: 10, concurrency: 3 }, counters: { rpm: 0, openMicro: '1000001', dayMicro: '1000002', monthMicro: '2000002' },
++            pauses: [{ scope: 'user' }], entitlement: { required: true, basis: 'subscription' }, models: { 'ezil-code': { tpm: 500 } } } });
++        expect(JSON.stringify(result)).not.toMatch(/private|sources|subscription_id/);
++    });
++    it('retains valid partial data; absent, malformed and zero limits stay distinct', () => {
++        expect(parseAiLimits(null)).toEqual({ state: 'unavailable', limits: null });
++        expect(parseAiLimits({})).toEqual({ state: 'unavailable', limits: null });
++        expect(parseAiLimits({ policy: { policy: { rpm: 0, concurrency: -1, monthly_budget_micro: 1.5 } },
++            counters: { inflight: 1 }, pauses: [{ scope: 'invented' }] })).toMatchObject({ state: 'available', limits: {
++            policy: { rpm: 0, concurrency: null, dailyBudgetMicro: null, monthlyBudgetMicro: null },
++            ceilings: null, counters: { inflight: 1, pending: null, dayMicro: null }, pauses: null, entitlement: null,
++        } });
++    });
++    it('does not treat an ambiguous policy as effective', () => {
++        expect(parseAiLimits({ policy: { ambiguous: true, policy: { rpm: 20 } }, pauses: [] })).toMatchObject({ limits: { policy: null, pauses: [] } });
++    });
++    it('rejects coerced pause scopes and entitlement bases', () => {
++        expect(parseAiLimits({ pauses: [{ scope: ['user'] }], entitlement: { required: true, basis: ['subscription'] } }))
++            .toEqual({ state: 'unavailable', limits: null });
++    });
++});
+diff --git a/app/src/server/billing/ai-limits.ts b/app/src/server/billing/ai-limits.ts
+new file mode 100644
+index 00000000..514a5afe
+--- /dev/null
++++ b/app/src/server/billing/ai-limits.ts
+@@ -0,0 +1,57 @@
++import { count, createAiReader, microString, record, type AiReadInput, type AiReader } from './ai-read';
++
++export interface AiPolicy {
++    rpm: number | null; tpm: number | null; concurrency: number | null; maxOutputTokens: number | null;
++    dailyBudgetMicro: string | null; monthlyBudgetMicro: string | null; allowedModels: string[] | null;
++}
++export type PauseScope = 'user' | 'account' | 'role' | 'model' | 'client';
++export interface AiLimits {
++    policy: AiPolicy | null;
++    models: Record<string, AiPolicy> | null;
++    ceilings: { rpm: number | null; concurrency: number | null } | null;
++    counters: { rpm: number | null; tpm: number | null; inflight: number | null; pending: number | null;
++        openMicro: string | null; dayMicro: string | null; monthMicro: string | null } | null;
++    pauses: { scope: PauseScope }[] | null;
++    entitlement: { required: boolean; basis: 'subscription' | 'entitlement_grant' | 'operations' | 'not_required' | null } | null;
++}
++export interface AiLimitsResult { state: 'available' | 'unavailable'; limits: AiLimits | null; }
++
++function policy(value: unknown): AiPolicy | null {
++    const wrapper = record(value), p = record(wrapper?.policy);
++    if (!p || wrapper?.ambiguous === true) return null;
++    return { rpm: count(p.rpm), tpm: count(p.tpm), concurrency: count(p.concurrency), maxOutputTokens: count(p.max_output_tokens),
++        dailyBudgetMicro: microString(p.daily_budget_micro), monthlyBudgetMicro: microString(p.monthly_budget_micro),
++        allowedModels: Array.isArray(p.allowed_models) && p.allowed_models.every(m => typeof m === 'string' && /^[\w.-]{1,128}$/.test(m))
++            ? p.allowed_models : null };
++}
++
++export function parseAiLimits(body: unknown): AiLimitsResult {
++    const b = record(body);
++    if (!b || !['policy', 'models', 'ceilings', 'counters', 'pauses', 'entitlement'].some(key => key in b)) {
++        return { state: 'unavailable', limits: null };
++    }
++    const ceilings = record(b.ceilings), counters = record(b.counters), entitlement = record(b.entitlement), models = record(b.models);
++    const modelPolicies: Record<string, AiPolicy> = Object.create(null);
++    if (models) for (const [name, value] of Object.entries(models)) {
++        const parsed = policy(value);
++        if (/^[\w.-]{1,128}$/.test(name) && parsed) modelPolicies[name] = parsed;
++    }
++    const limits: AiLimits = {
++        policy: policy(b.policy), models: models ? modelPolicies : null,
++        ceilings: ceilings ? { rpm: count(ceilings.rpm), concurrency: count(ceilings.concurrency) } : null,
++        counters: counters ? { rpm: count(counters.rpm), tpm: count(counters.tpm), inflight: count(counters.inflight), pending: count(counters.pending),
++            openMicro: microString(counters.open_micro), dayMicro: microString(counters.day_micro), monthMicro: microString(counters.month_micro) } : null,
++        pauses: Array.isArray(b.pauses) && b.pauses.every(p => typeof record(p)?.scope === 'string'
++            && ['user', 'account', 'role', 'model', 'client'].includes(record(p)!.scope as string))
++            ? b.pauses.map(p => ({ scope: (p as { scope: PauseScope }).scope })) : null,
++        entitlement: entitlement && typeof entitlement.required === 'boolean'
++            && (entitlement.basis === null || (typeof entitlement.basis === 'string'
++                && ['subscription', 'entitlement_grant', 'operations', 'not_required'].includes(entitlement.basis)))
++            ? { required: entitlement.required, basis: entitlement.basis as NonNullable<AiLimits['entitlement']>['basis'] } : null,
++    };
++    return Object.values(limits).some(v => v !== null) ? { state: 'available', limits } : { state: 'unavailable', limits: null };
++}
++
++export async function readAiLimits(input: AiReadInput, read: AiReader = createAiReader(input)): Promise<AiLimitsResult> {
++    return parseAiLimits(await read('/v1/me/limits'));
++}
+diff --git a/app/src/server/billing/ai-read.ts b/app/src/server/billing/ai-read.ts
+new file mode 100644
+index 00000000..6a787708
+--- /dev/null
++++ b/app/src/server/billing/ai-read.ts
+@@ -0,0 +1,90 @@
++import type { BillingConfig } from './config';
++import { withAiTimeout } from './ai-gateway-client';
++
++type Session = { access_token: string; user: { id: string } } | null;
++export interface AiReadInput {
++    config: Pick<BillingConfig, 'fundingUrl'>;
++    /** Already authenticated by the normal Supabase tRPC context. */
++    userId: string;
++    headers: Headers;
++    session?: () => Promise<Session>;
++    fetch?: typeof fetch;
++    signal?: AbortSignal;
++}
++export type AiReader = (path: string) => Promise<unknown>;
++
++export function record(value: unknown): Record<string, unknown> | null {
++    return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
++}
++
++export function count(value: unknown): number | null {
++    return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
++}
++
++/** JSON numbers must already be exact. Decimal strings retain all microcredits. */
++export function microString(value: unknown): string | null {
++    if (typeof value === 'number') return count(value) === null ? null : String(value);
++    return typeof value === 'string' && /^\d{1,100}$/.test(value) ? BigInt(value).toString() : null;
++}
++
++export function creditNumber(micro: string | null): number | null {
++    if (micro === null) return null;
++    const n = BigInt(micro);
++    const decimal = `${n / BigInt(1_000_000)}.${String(n % BigInt(1_000_000)).padStart(6, '0')}`;
++    const credits = Number(decimal);
++    // When a Number would lose a microcredit, the exact string remains usable.
++    return Number.isFinite(credits) && credits <= Number.MAX_SAFE_INTEGER && credits.toFixed(6) === decimal ? credits : null;
++}
++
++export function isoTimestamp(value: unknown): string | null {
++    return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T/.test(value) && Number.isFinite(Date.parse(value))
++        ? new Date(value).toISOString() : null;
++}
++
++async function currentSession(): Promise<Session> {
++    const { createClient } = await import('@/utils/supabase/server');
++    const { data, error } = await (await createClient()).auth.getSession();
++    return error ? null : data.session;
++}
++
++/** Request-local credential capture; never cache a user's token between requests. */
++export function createAiReader(input: AiReadInput): AiReader {
++    let token: Promise<string | null> | undefined;
++    const credential = () => token ??= (async () => {
++        const authorization = input.headers.get('authorization');
++        if (authorization !== null) return /^Bearer[ \t]+([^\s,]+)$/i.exec(authorization.trim())?.[1] ?? null;
++        const session = await (input.session ?? currentSession)();
++        return session?.user.id === input.userId ? session.access_token : null;
++    })();
++    return async path => {
++        if (!input.config.fundingUrl || input.signal?.aborted) return null;
++        const canceled = new AbortController();
++        let abort: (() => void) | undefined;
++        try {
++            const origin = new URL(input.config.fundingUrl);
++            if (origin.protocol !== 'https:' || origin.username || origin.password || origin.search || origin.hash) return null;
++            return await withAiTimeout(3_000, async timeout => {
++                const signal = AbortSignal.any([timeout, canceled.signal]);
++                const operation = (async () => {
++                    const bearer = await credential();
++                    if (!bearer || signal.aborted) return null;
++                    const response = await (input.fetch ?? fetch)(`${origin.href.replace(/\/$/, '')}${path}`, {
++                        method: 'GET', redirect: 'error', cache: 'no-store', signal,
++                        headers: { Authorization: `Bearer ${bearer}` },
++                    });
++                    return response.ok ? await response.json() : null;
++                })();
++                if (!input.signal) return await operation;
++                return await Promise.race([operation, new Promise<null>(resolve => {
++                    abort = () => { canceled.abort(); resolve(null); };
++                    input.signal!.addEventListener('abort', abort, { once: true });
++                    if (input.signal!.aborted) abort();
++                })]);
++            });
++        } catch { return null; }
++        finally {
++            canceled.abort();
++            if (abort) input.signal?.removeEventListener('abort', abort);
++        }
++    };
++}
+diff --git a/app/src/server/billing/ai-usage.test.ts b/app/src/server/billing/ai-usage.test.ts
+new file mode 100644
+index 00000000..9aa02aa3
+--- /dev/null
++++ b/app/src/server/billing/ai-usage.test.ts
+@@ -0,0 +1,35 @@
++import { describe, expect, it, vi } from 'vitest';
++import { parseAiUsage, readAiUsage } from './ai-usage';
++
++const row = { created_at: '2026-10-26T01:00:00Z', status: 'settled', cost_micro: '1000001', uncollected_micro: '1', hold_micro: '20',
++    id: 'private-id', prompt: 'private-prompt', pending_reason: 'private-reason', upstream_model: 'private-provider' };
++describe('member usage projection', () => {
++    it('reports actual collected charges separately from holds and strips private data', () => {
++        expect(parseAiUsage({ object: 'list', data: [row, { ...row, status: 'pending', cost_micro: null }] }, 20, null)).toEqual({
++            state: 'available', recentUsage: { limit: 20, before: null, rows: [
++                { at: '2026-10-26T01:00:00.000Z', status: 'settled', heldMicro: '0', chargedMicro: '1000000' },
++                { at: '2026-10-26T01:00:00.000Z', status: 'pending', heldMicro: '20', chargedMicro: null },
++            ] },
++        });
++    });
++    it('distinguishes an empty page from malformed data and unknown charge from zero', () => {
++        expect(parseAiUsage({ object: 'list', data: [] }, 20, null).state).toBe('available');
++        expect(parseAiUsage({}, 20, null).recentUsage).toBeNull();
++        const result = parseAiUsage({ object: 'list', data: [{ ...row, cost_micro: 0, uncollected_micro: 0 },
++            { ...row, uncollected_micro: null }] }, 20, null);
++        expect(result.recentUsage?.rows.map(r => r.chargedMicro)).toEqual(['0', null]);
++    });
++    it.each([{ status: 'unknown' }, { status: ['settled'] }, { created_at: 'tomorrow' }])('refuses a malformed page %j', bad => {
++        expect(parseAiUsage({ object: 'list', data: [{ ...row, ...bad }] }, 1, null).state).toBe('unavailable');
++    });
++    it('bounds the page and encodes a validated cursor without adding a payer selector', async () => {
++        const read = vi.fn().mockResolvedValue({ object: 'list', data: [row] });
++        const input = { config: { fundingUrl: undefined }, headers: new Headers(), userId: 'current' };
++        const result = await readAiUsage(input, { limit: 50, before: '2026-10-26T04:00:00+03:00' }, read);
++        expect(result.recentUsage?.before).toBe('2026-10-26T01:00:00.000Z');
++        expect(read).toHaveBeenCalledExactlyOnceWith('/v1/me/usage?limit=50&before=2026-10-26T01%3A00%3A00.000Z');
++        for (const limit of [0, 51, 1.5]) expect((await readAiUsage(input, { limit }, read)).state).toBe('unavailable');
++        expect(read).toHaveBeenCalledOnce();
++        expect(parseAiUsage({ object: 'list', data: [row, row] }, 1, null).state).toBe('unavailable');
++    });
++});
+diff --git a/app/src/server/billing/ai-usage.ts b/app/src/server/billing/ai-usage.ts
+new file mode 100644
+index 00000000..8e64c5d1
+--- /dev/null
++++ b/app/src/server/billing/ai-usage.ts
+@@ -0,0 +1,39 @@
++import { createAiReader, isoTimestamp, microString, record, type AiReadInput, type AiReader } from './ai-read';
++
++export interface AiUsageRow {
++    at: string;
++    status: 'reserved' | 'pending' | 'settled';
++    heldMicro: string | null;
++    chargedMicro: string | null;
++}
++export interface AiUsagePage { rows: AiUsageRow[]; limit: number; before: string | null; }
++export interface AiUsageResult { state: 'available' | 'unavailable'; recentUsage: AiUsagePage | null; }
++
++export function parseAiUsage(body: unknown, limit: number, before: string | null): AiUsageResult {
++    const data = record(body);
++    const unavailable: AiUsageResult = { state: 'unavailable', recentUsage: null };
++    if (data?.object !== 'list' || !Array.isArray(data.data) || data.data.length > limit) return unavailable;
++    const rows: AiUsageRow[] = [];
++    for (const value of data.data) {
++        const row = record(value), at = isoTimestamp(row?.created_at);
++        if (!row || !at || typeof row.status !== 'string' || !['reserved', 'pending', 'settled'].includes(row.status)) return unavailable;
++        const cost = microString(row.cost_micro), uncollected = microString(row.uncollected_micro);
++        const chargedMicro = row.status === 'settled' && cost !== null && uncollected !== null && BigInt(cost) >= BigInt(uncollected)
++            ? String(BigInt(cost) - BigInt(uncollected)) : null;
++        // A settled row retains its original reservation in hold_micro, but no longer holds it.
++        rows.push({ at, status: row.status as AiUsageRow['status'], heldMicro: row.status === 'settled' ? '0' : microString(row.hold_micro), chargedMicro });
++    }
++    return { state: 'available', recentUsage: { rows, limit, before } };
++}
++
++export async function readAiUsage(input: AiReadInput, options: { limit?: number; before?: string } = {},
++    read: AiReader = createAiReader(input)): Promise<AiUsageResult> {
++    const limit = options.limit ?? 20;
++    const before = options.before === undefined ? null : isoTimestamp(options.before);
++    if (!Number.isInteger(limit) || limit < 1 || limit > 50 || (options.before !== undefined && before === null)) {
++        return { state: 'unavailable', recentUsage: null };
++    }
++    const params = new URLSearchParams({ limit: String(limit) });
++    if (before) params.set('before', before);
++    return parseAiUsage(await read(`/v1/me/usage?${params}`), limit, before);
++}
