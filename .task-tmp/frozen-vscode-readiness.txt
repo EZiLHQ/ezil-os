@@ -1,0 +1,52 @@
+Reviewed source diff: VS Code unified Gateway status and exact limits route
+
+The patch changes exactly six owned files:
+- extensions/ezil-models/src/status-data.ts
+- extensions/ezil-models/src/status.ts
+- extensions/ezil-models/tests/status.test.ts
+- extensions/ezil-models/README.md
+- worker/src/ai-proxy.ts
+- worker/src/ai-proxy.test.ts
+
+Behavior reviewed:
+- Four concurrent GETs: /me/balance, /me/usage?limit=5, /me/limits, /models. Each uses the boot bearer, redirect:error, cache:no-store, a five-second timeout, and the refresh cancellation signal.
+- Status imports the existing pure creditState function for global reconciliation/operations pauses. It does not use or invalidate the five-minute model picker cache. Missing global pause fields remain unknown.
+- Only displayed limits fields are retained. Unreported limits stay unknown; scoped model/client pauses are conditional because the endpoint omits their targets. Effective account concurrency/RPM respect reported platform ceilings.
+- Sign-in, session expiry, connection, unavailable, pause, held, window-used and budget-used states use fixed UI copy. Raw error codes, error messages and credentials are not displayed. Other successful reads remain visible after partial failures.
+- BigInt formatting preserves 1 / 999999 / 1000001 microcredits and large decimal-string windows exactly. Reset times remain local. No low-credit threshold is invented.
+- Existing minute/request-completion/config refresh wiring remains. All four reads are cancelled on replacement/disposal, and captured provider identity is checked before publishing.
+- Worker production diff is precisely one GET /ai/v1/me/limits mapping with query:[]; no methods, header forwarding, credential lifecycle or dispatcher behavior changed.
+
+Validation commands (from this worktree; existing /root/.bun/bin/bun reports 1.3.14):
+
+1. TMPDIR="$PWD/.task-tmp" /root/.bun/bin/bun test extensions/ezil-models/tests/status.test.ts
+   PASS: 33 tests, 446 assertions, 0 failures.
+   Receipt: frozen-status-tests.log
+
+2. TMPDIR="$PWD/.task-tmp" /root/.bun/bin/bun extensions/ezil-models/node_modules/typescript/bin/tsc --noEmit -p extensions/ezil-models/tsconfig.json
+   PASS: exit 0.
+   Receipt: frozen-extension-types.log
+
+3. TMPDIR="$PWD/.task-tmp" PATH="/root/.bun/bin:$PATH" bash tools/test.sh worker src/ai-proxy.test.ts
+   PASS: Worker typecheck and 48 proxy tests, 271 assertions, 0 failures.
+   Receipt: frozen-worker-tests.log
+
+4. TMPDIR="$PWD/.task-tmp" EZIL_LIVE_TESTS=0 /root/.bun/bin/bun test extensions/ezil-models/tests
+   PASS: 240 tests, 1343 assertions, 0 failures. One explicit skip: live Foundry smoke (two turns; second reads prompt cache). This is offline validation, not a live smoke pass.
+   Receipt: frozen-extension-tests.log
+
+5. TMPDIR="$PWD/.task-tmp" /root/.bun/bin/bun build extensions/ezil-models/src/extension.ts --target=node --format=cjs --external=vscode --outfile=.task-tmp/frozen-extension.cjs
+   PASS: 15 modules bundled. Scratch artifact only; no VSIX was generated.
+
+6. TMPDIR="$PWD/.task-tmp" /root/.bun/bin/bun build extensions/ezil-models/src/status-data.ts --target=node --format=cjs --outfile=.task-tmp/frozen-status-data.cjs
+   PASS: 7 modules bundled. Node CJS smoke via stdin (exact assertion script in this session) also passed: four authenticated reads, shared pause classification, partial failure and exact microcredits. No network used by that probe.
+
+7. git diff --check
+   PASS. Reviewed final diff and asserted all changed paths are owned; untracked evidence is confined to .task-tmp.
+
+Readiness and remaining integration:
+- Ready for lead source review. Patch: frozen-vscode-status-limits.patch. The prior extra helper and docs/AI-GATEWAY.md edit were removed from the draft; parser is now inside the owned status-data.ts.
+- No shared source change is required. The existing gateway.ts import cycle was exercised by the full extension suite and the Node CJS probe.
+- Lead must regenerate/verify the tracked VSIX with worker/ezil-models/build-vsix.sh under Bun 1.3.14, integrate the exact proxy route, ship the matching image, and perform an authenticated live VS Code check.
+- Auth0/Supabase credential bridging remains the other lane's integration responsibility. This worker did not change it or verify a live sign-in.
+- No dependency installation in this fix pass, commits, pushes, deployments, compute changes, shared worktree changes or session contact. Source-only work is not deployed. Evidence stayed in this session and .task-tmp.
