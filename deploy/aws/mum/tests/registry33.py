@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage registry capacity 35 over the normal apply-app -> promote order; retain older-reader proofs.
+"""Stage registry capacity 36 over the normal apply-app -> promote order; retain older-reader proofs.
 
 Offline only: temporary git repositories, this checkout's own reviewed Git objects (attestation and
 standalone Git host deltas), the real Node probe with a fake fetch, and synthetic CLI results. No AWS, SSM or secret.
@@ -31,7 +31,7 @@ AGENT_REVIEWED = 'c7a5af6667b6ddba5605b4fceaa5caaccbce91cc'
 AGENT_COMBINED = '68dfb30aba6907b2c6813acc2a6a89281827c900'
 AGENT_SOURCE_C = '1f4712c4e0cbc4898439b4eb475a40a690cc6769'
 AGENT_ADAPTIVE = '6a187841856db9baaec2bacfe2c26a5c73eff045'
-AGENT_REPO_DIAGNOSTICS = '1c81b945b7338d5a03f2771b4caf31356fe46c12'
+AGENT_REPO_DIAGNOSTICS = '5f51b75d9996f4f4a4885a60f749dd0651ba5b15'
 SHA = '9' * 40
 TAG = 'stage-cap33'
 IMAGE = 'sha256:' + 'a' * 64
@@ -98,9 +98,9 @@ class SourceCapacityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
             release.require_reader_capacity(34, self.cap33, self.repo)
 
-    def test_this_checkout_declares_thirty_five_and_ed7_thirty_two(self):
+    def test_this_checkout_declares_thirty_six_and_ed7_thirty_two(self):
         text = (REPO / release.CAPACITY_SOURCE).read_text()
-        self.assertEqual(release.CAPACITY_DECLARATION.findall(text), ['35'])
+        self.assertEqual(release.CAPACITY_DECLARATION.findall(text), ['36'])
         self.assertEqual(release.source_reader_capacity(AGENT_ED7, REPO)[0], 32)
         with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
             release.require_reader_capacity(33, AGENT_ED7, REPO)
@@ -254,18 +254,22 @@ class StandaloneHostAbiTests(unittest.TestCase):
 
     def diagnostics_fixture(self):
         """Extend the reviewed standalone baseline, so CI runs all transition proofs."""
-        self.old = self.new
-        baseline = release.host_agent_tree(self.old, self.repo)
+        baseline = release.host_agent_tree(self.new, self.repo)
         for name, pair in release.HOST_AGENT_REPO_DIAGNOSTICS_EXCEPTION.items():
-            self.assertEqual(baseline[name], pair[0])
+            if name in baseline:
+                self.assertEqual(baseline[name], pair[0])
+            self.install_blob(name, pair[0])
+        self.old = self.commit('reviewed diagnostics predecessor')
+        for name, pair in release.HOST_AGENT_REPO_DIAGNOSTICS_EXCEPTION.items():
             self.install_blob(name, pair[1])
         self.new = self.commit('reviewed repository diagnostics')
 
-    def test_exact_three_file_delta_from_both_deployed_predecessors(self):
+    def test_exact_five_file_delta_from_both_deployed_predecessors(self):
         self.diagnostics_fixture()
         expected = release.HOST_AGENT_REPO_DIAGNOSTICS_EXCEPTION
-        self.assertEqual(set(expected), {'lib/ezil_host/standalone_git.py',
-            'lib/ezil_host/standalone_git_runtime.py', 'test/test_standalone_git.py'})
+        self.assertEqual(set(expected), {'lib/ezil_host/edge.py', 'lib/ezil_host/standalone_git.py',
+            'lib/ezil_host/standalone_git_runtime.py', 'test/test_standalone_git.py',
+            'test/test_standalone_git_edge.py'})
         self.assertEqual(release.host_agent_tree(AGENT_SOURCE_C, REPO),
                          release.host_agent_tree(AGENT_ADAPTIVE, REPO))
         self.assertEqual(release.require_host_abi(self.old, self.new, self.repo), expected)
@@ -494,7 +498,7 @@ class RealHttpProbeTests(unittest.TestCase):
 
 class LegacyGcParityTests(unittest.TestCase):
     def test_frozen_gc_stays_a_thirty_two_record_tool(self):
-        self.assertEqual((TOOL.RELEASE_REGISTRY_CAPACITY, TOOL.ACTIVE_REGISTRY_CAPACITY), (32, 35))
+        self.assertEqual((TOOL.RELEASE_REGISTRY_CAPACITY, TOOL.ACTIVE_REGISTRY_CAPACITY), (32, 36))
         self.assertEqual(gc.tool.RELEASE_REGISTRY_CAPACITY, 32)
         target = release_record()
         records = [dict(target, amiId='ami-' + format(n, '017x'), recipeVersion='1.0.' + str(n)) for n in range(100, 133)]

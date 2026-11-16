@@ -600,12 +600,15 @@ HOST_AGENT_STANDALONE_EXCEPTION={
 # The C/6a187841 host tree -> reviewed repository failure diagnostics. Existing
 # requests and successful responses stay compatible; optional failure metadata
 # uses a closed vocabulary, and supervisor_unavailable keeps the uncertain fence.
-# Bind the complete three-file mode/blob delta, including its tests. Later byte
+# The edge projects only those validated optional fields. Bind the complete
+# five-file mode/blob delta, including its tests. Later byte
 # changes, partial transitions and the reverse transition need another review.
 HOST_AGENT_REPO_DIAGNOSTICS_EXCEPTION={
+    'lib/ezil_host/edge.py':('100644 745147e6964ede7373367b6d25565d3aa758f335','100644 e621a7861f4f2dbaba2fe303e7222903b0173e5d'),
     'lib/ezil_host/standalone_git.py':('100644 58ec9ab326c7b3734f4834402d2f766b3de863e7','100644 e296b6166662e23e5c0df6c7a1209e81c5fb07d3'),
     'lib/ezil_host/standalone_git_runtime.py':('100644 8591353fbdedb0569c844333af57c5f1a49c10ce','100644 2996b5a7703b03bb4d73708ca169e422cf990965'),
     'test/test_standalone_git.py':('100644 9a5ec1c5fbe57d72c0dbd0c3fb5fcd12b300e0bf','100644 a406d07d8c9ddc30800bc7f001be1929bdc91beb'),
+    'test/test_standalone_git_edge.py':('100644 e25c9fa487d186cceaffb3d944d9dce3d20ef4a3','100644 1f5aeb0f84f1afe09393d710e4752d1fd4b00aa9'),
 }
 
 
