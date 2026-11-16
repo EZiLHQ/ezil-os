@@ -1,0 +1,84 @@
+{
+  "completed": [
+    "Verified and preserved the original Phase 1 checkpoint; archived the prior 713ce202 Phase 2 patches and receipts.",
+    "Fixed local impact once per original grant/root across all explicitly linked D/refund/restore receipts under the existing root locks.",
+    "Refund after suspension now appends zero local audit delta and a distinct terminal Gateway revoke with unchanged original whole credits and frozen payer.",
+    "631 focused cases pass; supplied ordinary reproductions both pass; final TypeScript and diff checks pass.",
+    "Both refreshed patch paths apply to isolated copies and reproduce all 20 final files byte-for-byte."
+  ],
+  "undone": [
+    "Current PostgreSQL cases: 27 skipped; no actual database calls performed.",
+    "Root independent recheck of the new delta logic and cross-cause store query; prior 643-case evidence excludes this repair.",
+    "Gateway G5 integration, authorized Stripe test-mode end-to-end QA, enrollment/deployment remain with the lead."
+  ],
+  "files": [
+    "app/src/server/billing/ai-credit-outbox-store.ts",
+    "app/src/server/billing/ai-credit-outbox.pg.test.ts",
+    "app/src/server/billing/ai-credit-outbox.test.ts",
+    "app/src/server/billing/ai-credit-outbox.ts",
+    "app/src/server/billing/ai-credits.test.ts",
+    "app/src/server/billing/ai-credits.ts",
+    "app/src/server/billing/ai-gateway-client.test.ts",
+    "app/src/server/billing/ai-gateway-client.ts",
+    "app/src/server/billing/ports.ts",
+    "app/src/server/billing/processor.test.ts",
+    "app/src/server/billing/processor.ts",
+    "app/src/server/billing/store.test.ts",
+    "app/src/server/billing/store.ts"
+  ],
+  "commands": [
+    {
+      "cmd": "env -u BILLING_TEST_DATABASE_URL -u DATABASE_URL TMPDIR=/dev/shm/ezil-unified-20261026/os-credits/.tmp NODE_DISABLE_COMPILE_CACHE=1 node node_modules/vitest/vitest.mjs run --config ../.task-tmp/vitest.config.mjs --configLoader runner --no-cache --reporter dot src/server/billing/ai-credits.test.ts src/server/billing/ai-credit-outbox.test.ts src/server/billing/ai-credit-outbox.pg.test.ts src/server/billing/ai-gateway-client.test.ts src/server/billing/processor.test.ts src/server/billing/store.test.ts src/server/billing/http/stripe-webhook.test.ts src/server/billing/__contract__/catalog.contract.test.ts src/server/billing/stripe/client.test.ts",
+      "exit": 0
+    },
+    {
+      "cmd": "env -u BILLING_TEST_DATABASE_URL -u DATABASE_URL TMPDIR=/dev/shm/ezil-unified-20261026/os-credits/.tmp NODE_DISABLE_COMPILE_CACHE=1 node node_modules/vitest/vitest.mjs run --config ../.task-tmp/local-delta-review-vitest.config.mjs --configLoader runner --no-cache --reporter dot --testNamePattern 'ordinary refund'",
+      "exit": 0
+    },
+    {
+      "cmd": "env -u BILLING_TEST_DATABASE_URL -u DATABASE_URL TMPDIR=/dev/shm/ezil-unified-20261026/os-credits/.tmp NODE_DISABLE_COMPILE_CACHE=1 node node_modules/typescript/bin/tsc --noEmit --incremental false --pretty false",
+      "exit": 0
+    },
+    {
+      "cmd": "git diff --check",
+      "exit": 0
+    },
+    {
+      "cmd": "python3 .task-tmp/package-phase2.py",
+      "exit": 0
+    }
+  ],
+  "issues": [
+    "Prior independently passing 643 cases were for the superseded 713ce202 patch and do not validate this repair.",
+    "Already-corrupt/unproven local history is explicitly reviewed; this patch performs no historical data correction, replay or compensating restore.",
+    "Legacy/compute-only restores without a canonical receipt remain manual review. Commercial pack/seat policies remain unset."
+  ],
+  "artifacts": {
+    "phase2_only": {
+      "path": ".task-tmp/o-credits-phase2-only.patch",
+      "sha256": "3771ae3d79a55f41cbba9c95c036de023f2ccc6467e665b09798f3b74c5c9d0d"
+    },
+    "full_final": {
+      "path": ".task-tmp/o-credits-full-final.patch",
+      "sha256": "a6d5ed97fa3dfd2485d1fe534cccbef0d26bc369209908bd49282dc6fec837cf"
+    },
+    "review_receipt": ".task-tmp/phase2-review-receipt.md",
+    "manifest": ".task-tmp/phase2-patch-manifest.json"
+  },
+  "phase1_checkpoint_sha256": "907afd5113eecf60cdc907918e06a51cda5975592f58745448a0c1fc73c48697",
+  "test_results": {
+    "focused_passed": 631,
+    "postgresql_skipped": 27,
+    "supplied_repro_passed": 2,
+    "repro_unrelated_filtered": 271,
+    "tsc_exit": 0
+  },
+  "command_workdir": "app/ for Vitest and TSC; worktree root for packaging/diff checks",
+  "repair_files": [
+    "app/src/server/billing/ai-credits.ts",
+    "app/src/server/billing/store.ts",
+    "app/src/server/billing/processor.test.ts",
+    "app/src/server/billing/store.test.ts"
+  ],
+  "supersedes_full_patch_sha256": "713ce202b0a815033fd5e74e7567de1ac3ef11ed81fddb20f92de53ec53cbc29"
+}

@@ -1,0 +1,45 @@
+{
+  "patch_sha256": "713ce202b0a815033fd5e74e7567de1ac3ef11ed81fddb20f92de53ec53cbc29",
+  "prior_ordinary_tests": {
+    "summary": "/dev/shm/ezil-osphase2-pgqa-4bdd87d398/qa-summary.json",
+    "passed": 643,
+    "failed": 0,
+    "skipped": 0,
+    "real_postgres_cases": 27,
+    "all20_source_hashes_still_match": true
+  },
+  "new_ordinary_review_result": "P2 blocks approval",
+  "finding": {
+    "title": "Full refund after dispute suspension deducts the same original local allowance twice",
+    "paths": [
+      "app/src/server/billing/ai-credits.ts:149",
+      "app/src/server/billing/store.ts:550",
+      "app/src/server/billing/v3/summary.ts:27"
+    ],
+    "repro1": {
+      "grant": 144000,
+      "suspend": -144000,
+      "refund": -144000,
+      "actual_net": -144000,
+      "expected_net": 0
+    },
+    "repro2": {
+      "other_paid_same_period_grant": 100000,
+      "actual_net": -44000,
+      "expected_net": 100000,
+      "impact": "Negative sum clamps to zero and removes an independently paid allowance"
+    },
+    "scope": "Gateway terminal refund outbox must still be emitted; local allowance impact must be computed once per original root, not full original amount per cause",
+    "test_file": "/dev/shm/ezil-unified-20261026/os-credits/.task-tmp/release-ordinary-review/local-refund.test.ts",
+    "logs": [
+      "result.log",
+      "overlap-result.log"
+    ]
+  },
+  "limitations": [
+    "No productsource changes",
+    "No live/vendor/database calls in this review",
+    "No security or ACL probes executed",
+    "No G5 chain/liveStripe/deployment approval"
+  ]
+}

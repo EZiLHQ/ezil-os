@@ -1,0 +1,1 @@
+export default {"root": "/dev/shm/ezil-unified-20261026/os-credits/app", "resolve": {"alias": {"@": "/dev/shm/ezil-unified-20261026/os-credits/app/src"}}, "test": {"environment": "node", "include": ["/dev/shm/ezil-unified-20261026/os-credits/.task-tmp/release-ordinary-review/local-refund.test.ts"], "maxWorkers": 1, "minWorkers": 1, "cache": false}};

@@ -1,14 +1,19 @@
 import type { BillingConfig } from './config';
-import { AI_CREDIT_PROTOCOL } from './ai-credits';
-import { AI_GATEWAY_TIMEOUT_MS, sendAiCreditEvent, type AiGatewayEvent, type AiLogger } from './ai-gateway-client';
+import { AI_CREDIT_PROTOCOL, parseAiCreditEventId } from './ai-credits';
+import { AI_GATEWAY_TIMEOUT_MS, sendAiCreditEvent, type AiGatewayEvent, type AiLogger, type AiRestoreOutcome } from './ai-gateway-client';
 
 export const AI_CREDIT_MAX_ATTEMPTS = 10;
 export const AI_CREDIT_LEASE_MS = 30_000;
 export interface AiCreditOutboxRow {
     id: string; eventKey: string; userId: string; kind: string; payload: Record<string, unknown>; attempts: number; exhausted?: boolean;
+    /** Completed account waits do not consume the delivery failure budget. */
+    dependencyWaits?: number;
+    restoreConflict?: boolean;
+    restoreDisposition?: 'terminal' | 'review' | null;
 }
 export interface AiCreditDelivery {
     status: 'done' | 'failed' | 'retry'; reason: string | null; nextAttemptAt?: number;
+    outcome?: AiRestoreOutcome; reviewRequired?: boolean;
 }
 export interface AiCreditOutboxStore {
     claim(now: number): Promise<AiCreditOutboxRow | null>;
@@ -17,13 +22,15 @@ export interface AiCreditOutboxStore {
     finish(row: AiCreditOutboxRow, result: AiCreditDelivery, now: number): Promise<void>;
 }
 export const aiCreditBackoffMs = (attempt: number) => Math.min(3_600_000, 60_000 * 2 ** Math.max(0, attempt - 1));
+export const isAiAccountDependency = (reason: string | null) => reason === 'no_ai_account' || reason === 'account_not_found';
 
-function plannedEvent(row: AiCreditOutboxRow): Omit<AiGatewayEvent, 'accountPublicId'> | null {
+export const isAiDeliveryDependency = (reason: string | null) => isAiAccountDependency(reason) || reason === 'restore_hold_pending';
+
+export function plannedAiCreditEvent(row: AiCreditOutboxRow): Omit<AiGatewayEvent, 'accountPublicId'> | null {
     const p = row.payload;
     if (p.protocol !== AI_CREDIT_PROTOCOL || typeof p.entitlementId !== 'string'
-        || !/^ezil-os:v1:[A-Za-z0-9._:-]+$/.test(p.entitlementId) || p.entitlementId.length > 193
-        || (p.action !== 'grant' && p.action !== 'revoke') || row.kind !== `ai_${p.action}`
-        || p.eventId !== `${p.entitlementId}:${p.action}` || row.eventKey !== p.eventId
+        || (p.action !== 'grant' && p.action !== 'revoke' && p.action !== 'restore') || row.kind !== `ai_${p.action}`
+        || typeof p.eventId !== 'string' || !parseAiCreditEventId(p.entitlementId, p.eventId, p.action) || row.eventKey !== p.eventId
         || typeof p.credits !== 'number' || !Number.isSafeInteger(p.credits) || p.credits < 1 || p.credits > 1_000_000
         || typeof p.expiresAt !== 'string' || !Number.isFinite(Date.parse(p.expiresAt))) return null;
     return { eventId: p.eventId, entitlementId: p.entitlementId, action: p.action, credits: p.credits, expiresAt: p.expiresAt };
@@ -51,31 +58,40 @@ export async function drainAiCreditOutbox(deps: {
         if (!row) break;
         counts.claimed++;
         let result: AiCreditDelivery;
-        const event = plannedEvent(row);
+        const event = plannedAiCreditEvent(row);
         if (row.exhausted) result = { status: 'failed', reason: 'attempts_exhausted' };
-        else if (!event) result = { status: 'failed', reason: 'invalid_payload' };
+        else if (!event) result = { status: 'failed', reason: 'invalid_payload', ...(row.kind === 'ai_restore' ? { reviewRequired: true } : {}) };
+        else if (row.restoreDisposition === 'terminal') result = { status: 'done', reason: null, outcome: 'restore_refused_terminal' };
+        else if (row.restoreDisposition === 'review') result = { status: 'failed', reason: 'restore_review_required', reviewRequired: true };
+        else if (row.restoreConflict) result = { status: 'failed', reason: 'restore_mismatch', reviewRequired: true };
         else if (event.action === 'grant' && Date.parse(event.expiresAt) <= clock()) result = { status: 'failed', reason: 'expired' };
         else {
             try {
                 const account = typeof row.payload.accountPublicId === 'string' ? row.payload.accountPublicId : await store.accountFor(row);
                 if (!account) {
-                    result = { status: 'failed', reason: 'no_ai_account' };
+                    result = { status: 'retry', reason: 'no_ai_account' };
                     counts.skipped++;
                 } else if (!hasTime() || !await store.pinAccount(row, account) || !hasTime()) {
                     result = { status: 'retry', reason: 'deadline_or_lease' };
                 } else {
                     const sent = await sendAiCreditEvent({ url: deps.config.fundingUrl, secret: deps.config.fundingHmacSecret,
                         event: { ...event, accountPublicId: account }, fetch: deps.fetch, now: clock, log });
-                    result = sent.status === 'ok' ? { status: 'done', reason: null }
-                        : { status: sent.status === 'retryable' ? 'retry' : 'failed', reason: sent.reason };
+                    result = sent.status === 'ok' ? { status: 'done', reason: null, ...(sent.outcome ? { outcome: sent.outcome } : {}) }
+                        : { status: sent.status === 'retryable' ? 'retry' : 'failed', reason: sent.reason,
+                            ...(sent.status === 'review' ? { reviewRequired: true } : {}) };
+                    if (sent.status === 'review') log('[billing.ai] restore review required', { entitlementId: event.entitlementId });
                 }
-            } catch {
+            } catch (error) {
                 // SQL/transport errors may contain URLs, credentials or tokens. Store only a fixed code.
-                result = { status: 'retry', reason: 'delivery_unavailable' };
+                result = error instanceof Error && error.message === 'ai_payer_conflict'
+                    ? { status: 'failed', reason: 'restore_mismatch', reviewRequired: true }
+                    : { status: 'retry', reason: 'delivery_unavailable' };
             }
         }
         if (result.status === 'retry') {
-            if (row.attempts >= AI_CREDIT_MAX_ATTEMPTS) result = { status: 'failed', reason: 'attempts_exhausted' };
+            if (!isAiDeliveryDependency(result.reason) && row.attempts - (row.dependencyWaits ?? 0) >= AI_CREDIT_MAX_ATTEMPTS) {
+                result = { status: 'failed', reason: 'attempts_exhausted' };
+            }
             else result.nextAttemptAt = clock() + aiCreditBackoffMs(row.attempts);
         }
         await store.finish(row, result, clock());

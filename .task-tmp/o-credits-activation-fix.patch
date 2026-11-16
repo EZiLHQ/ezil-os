@@ -1,0 +1,102 @@
+diff --git a/app/src/server/billing/stripe/client.test.ts b/app/src/server/billing/stripe/client.test.ts
+index 6beafbde..03fcf565 100644
+--- a/app/src/server/billing/stripe/client.test.ts
++++ b/app/src/server/billing/stripe/client.test.ts
+@@ -1,11 +1,12 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+ 
+ import { MANAGED_PAYMENTS_TAX_CODE } from '../catalog';
++import * as catalog from '../catalog';
+ import type { CheckoutRequest } from '../ports';
+ import { BillingProviderError, createStripeClient, resetStripeCachesForTests, StripeRequestError, UPGRADE_PREVIEW_MAX_AGE_SECONDS } from './client';
+ 
+ beforeEach(resetStripeCachesForTests);
+-afterEach(() => vi.useRealTimers());
++afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+ 
+ const secretKey = 'sk_test_client_fixture';
+ const start = 1_799_000_000;
+@@ -30,6 +31,14 @@ function fixture(payload: unknown, opts: { priceProMonthly?: string } = {}) {
+     return { client, fetcher };
+ }
+ 
++/** Explicit synthetic policy; never mutates the shipped null-credit packs. */
++function configurePackForTest(sku: string) {
++    const pack = catalog.AI_PACKS.find(value => value.sku === sku);
++    if (!pack) throw new Error('Unknown fixture pack');
++    vi.spyOn(catalog, 'findPack').mockImplementation(value => value === sku
++        ? { ...pack, aiCredits: 1234 } : catalog.AI_PACKS.find(candidate => candidate.sku === value));
++}
++
+ function inspect(fetcher: ReturnType<typeof fixture>['fetcher'], index = 0) {
+     const [url, init] = fetcher.mock.calls[index];
+     const body = new URLSearchParams(String(init?.body ?? ''));
+@@ -189,12 +198,27 @@ describe('createStripeClient requests', () => {
+         expect(await client.listInvoices('cus_fixture', 12)).toEqual([]);
+     });
+ 
++    it.each(catalog.AI_PACKS.flatMap(pack => (['hosted', 'embedded'] as const).flatMap(uiMode =>
++        [false, true].map(managedPayments => ({ sku: pack.sku, uiMode, managedPayments })))))(
++        'refuses null-policy $sku before any Stripe request (mode=$uiMode, managed=$managedPayments)', async input => {
++            const { client, fetcher } = fixture(checkoutResult);
++            expect(catalog.findPack(input.sku)?.aiCredits).toBeNull();
++            await expect(client.createCheckoutSession({ ...checkoutRequest, ...input })).rejects.toMatchObject({
++                name: 'TRPCError', code: 'PRECONDITION_FAILED', message: 'pack_credits_unset',
++            });
++            expect(fetcher).not.toHaveBeenCalled();
++        },
++    );
++
+     it.each([
+         { sku: 'ai_pack_10_v1', credit: '1000', fee: '84' },
+         { sku: 'ai_pack_25_v1', credit: '2500', fee: '161' },
+-    ])('encodes separate credits and service fee items for $sku', async ({ sku, credit, fee }) => {
++    ])('encodes separate credits and service fee items for explicitly configured $sku', async ({ sku, credit, fee }) => {
++        configurePackForTest(sku);
+         const { client, fetcher } = fixture(checkoutResult, { priceProMonthly: 'price_pro_fixture' });
+         expect(await client.createCheckoutSession({ ...checkoutRequest, sku })).toEqual(checkoutResult);
++        expect(fetcher).toHaveBeenCalledTimes(1);
++        expect(catalog.AI_PACKS.every(pack => pack.aiCredits === null)).toBe(true);
+         const expected = {
+             ...commonCheckout(sku),
+             mode: 'payment',
+@@ -446,6 +470,7 @@ describe.each(['hosted', 'embedded'] as const)('Managed Payments in %s checkout'
+         { sku: 'ai_pack_10_v1', mode: 'payment', amounts: ['1000', '84'], names: ['AI credits', 'Service fee'] },
+         { sku: 'ai_pack_25_v1', mode: 'payment', amounts: ['2500', '161'], names: ['AI credits', 'Service fee'] },
+     ])('sets eligible tax codes and excludes every incompatible field for $sku', async ({ sku, mode, amounts, names }) => {
++        if (sku.startsWith('ai_pack_')) configurePackForTest(sku);
+         const { client, fetcher } = fixture(checkoutResult);
+         const input = { ...checkoutRequest, sku, uiMode, automaticTax: true, adaptivePricing: true };
+         await client.createCheckoutSession({ ...input, managedPayments: false });
+@@ -1021,6 +1046,7 @@ describe('additional endive mappings', () => {
+     });
+ 
+     it.each(['standard_monthly_v2', 'compute_monthly_v2', 'pro_monthly_v1', 'ai_pack_10_v1', 'ai_pack_25_v1'])('never sends payment_method_types for %s with either merchant mode', async sku => {
++        if (sku.startsWith('ai_pack_')) configurePackForTest(sku);
+         const isV2 = sku.endsWith('_v2');
+         const price = sku === 'standard_monthly_v2' ? standardPrice : computePrice;
+         const { client, fetcher } = sequence(...(isV2 ? [{ data: [price] }] : []), checkoutResult, checkoutResult);
+diff --git a/app/src/server/billing/stripe/client.ts b/app/src/server/billing/stripe/client.ts
+index 6b47b0f8..0fd8ea0c 100644
+--- a/app/src/server/billing/stripe/client.ts
++++ b/app/src/server/billing/stripe/client.ts
+@@ -1,6 +1,7 @@
+ import { createHash } from 'node:crypto';
++import { TRPCError } from '@trpc/server';
+ 
+-import { findPack, MANAGED_PAYMENTS_TAX_CODE, PRO_PLAN } from '../catalog';
++import { aiPackCheckoutEligible, findPack, MANAGED_PAYMENTS_TAX_CODE, PRO_PLAN } from '../catalog';
+ import type { StripeApi, StripeCheckoutSession, StripeInvoicePaymentState, StripePrice, StripeUpgradeResult } from '../ports';
+ import { billingOfferByLookupKey as offerByLookupKey, billingOfferBySku as offerBySku } from '../v3/catalog';
+ import { CATALOG_V3 } from '../v3/contract';
+@@ -441,6 +442,10 @@ export function createStripeClient(opts: StripeClientOptions): StripeApi {
+ 
+         async createCheckoutSession(input) {
+             const pack = findPack(input.sku);
++            // Refuse purchases we cannot fund, before price lookup or any Stripe request.
++            if (pack !== undefined && !aiPackCheckoutEligible(pack)) {
++                throw new TRPCError({ code: 'PRECONDITION_FAILED', message: 'pack_credits_unset' });
++            }
+             const offer = offerBySku(input.sku);
+             const lookupKey = offer?.sellable ? offer.stripeLookupKey : null;
+             if (input.sku !== PRO_PLAN.sku && !lookupKey && pack === undefined) throw new Error('Unknown billing SKU');

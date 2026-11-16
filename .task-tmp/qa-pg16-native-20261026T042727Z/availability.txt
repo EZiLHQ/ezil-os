@@ -1,0 +1,24 @@
+Independent native PostgreSQL16 QA availability check
+UTC: 2026-10-26T04:27:27.955686+00:00
+Scope: disposable local test DB only; no source edits, network/provider calls, existing service/container use or database connections.
+
+PATH postgres: None
+PATH initdb: None
+PATH pg_ctl: None
+PATH psql: /usr/bin/psql
+PATH createdb: /usr/bin/createdb
+/usr/lib/postgresql/16/bin/postgres: ABSENT
+/usr/lib/postgresql/16/bin/initdb: ABSENT
+/usr/lib/postgresql/16/bin/pg_ctl: ABSENT
+/usr/lib/postgresql/16/bin/psql: exists
+/usr/lib/postgresql/16/bin/createdb: exists
+
+Package query command: dpkg-query -W -f=... postgresql-16 postgresql-client-16
+exit=0
+postgresql-16 unknown ok not-installed 
+postgresql-client-16 install ok installed 16.15-0ubuntu0.24.04.1
+
+
+Guards: store.test.ts:41 and ai-credit-outbox.pg.test.ts:24,143,188 require BILLING_TEST_DATABASE_URL; focused runner unsets BILLING_TEST_DATABASE_URL and DATABASE_URL.
+Result: BLOCKED. Native PostgreSQL server binaries unavailable. No PG process started; no DB URL provided; no tests run in this QA task. The prior 23 skipped cases remain UNVERIFIED, not passes.
+Cleanup: no PG process/data directory exists to stop or remove. Only this evidence directory was created.

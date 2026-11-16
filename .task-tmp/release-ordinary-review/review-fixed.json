@@ -1,0 +1,7 @@
+{
+  "supersedes_previous_review_patch_sha256": "713ce202b0a815033fd5e74e7567de1ac3ef11ed81fddb20f92de53ec53cbc29",
+  "verdict": "Previous P2 local double deduction independently closed on this new artifact; no additional ordinary accounting P1/P2 found",
+  "qa_summary": "/dev/shm/ezil-osphase2-fixed-pgqa-46942dd69d/qa-summary.json",
+  "patch_sha256": "a6d5ed97fa3dfd2485d1fe534cccbef0d26bc369209908bd49282dc6fec837cf",
+  "issues": []
+}

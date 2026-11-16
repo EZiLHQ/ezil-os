@@ -1,0 +1,53 @@
+{
+  "base": "25c1274b5215",
+  "phase1_checkpoint_sha256": "907afd5113eecf60cdc907918e06a51cda5975592f58745448a0c1fc73c48697",
+  "phase2_patch_sha256": "b8e3e34cb6d599daf189450f9a18c47f96154523070d8240cd955a3a5c58ff56",
+  "full_patch_sha256": "713ce202b0a815033fd5e74e7567de1ac3ef11ed81fddb20f92de53ec53cbc29",
+  "phase2_files": [
+    "app/src/server/billing/ai-credit-outbox-store.ts",
+    "app/src/server/billing/ai-credit-outbox.pg.test.ts",
+    "app/src/server/billing/ai-credit-outbox.test.ts",
+    "app/src/server/billing/ai-credit-outbox.ts",
+    "app/src/server/billing/ai-credits.test.ts",
+    "app/src/server/billing/ai-credits.ts",
+    "app/src/server/billing/ai-gateway-client.test.ts",
+    "app/src/server/billing/ai-gateway-client.ts",
+    "app/src/server/billing/ports.ts",
+    "app/src/server/billing/processor.test.ts",
+    "app/src/server/billing/processor.ts",
+    "app/src/server/billing/store.test.ts",
+    "app/src/server/billing/store.ts"
+  ],
+  "phase1_unchanged_files": [
+    "app/src/server/billing/__contract__/catalog.contract.test.ts",
+    "app/src/server/billing/catalog.ts",
+    "app/src/server/billing/http/stripe-webhook.test.ts",
+    "app/src/server/billing/http/stripe-webhook.ts",
+    "app/src/server/billing/stripe/client.test.ts",
+    "app/src/server/billing/stripe/client.ts",
+    "app/src/server/billing/types.ts"
+  ],
+  "final_file_sha256": {
+    "app/src/server/billing/__contract__/catalog.contract.test.ts": "494cf2e1121ad7b3baabfff5f3f3051180fa4f7d19a881fd77b12cbcee80d4dc",
+    "app/src/server/billing/ai-credit-outbox-store.ts": "ede607bd5a7675b47b0798f8ea88210e4ec0e5be23bcea523dd174249df02b35",
+    "app/src/server/billing/ai-credit-outbox.pg.test.ts": "b0dce4cbdbecf8d05cf44d61fc9ec6fb58ff94147454af6d5406605a077ad63e",
+    "app/src/server/billing/ai-credit-outbox.test.ts": "793502a8c9c9836ac294304fb9d2471100088215b364839e6c1d72530eac2f23",
+    "app/src/server/billing/ai-credit-outbox.ts": "661660fec7a5a402b562dac86ff558fdccd8717dd037eaf679df0b27073cd03d",
+    "app/src/server/billing/ai-credits.test.ts": "1a44e6dca9ce2f38ab697d37472d0816f7bae366f74e1e805dd243e64698e71c",
+    "app/src/server/billing/ai-credits.ts": "ca97ecf4068db9e5808ffadf3c53c307755e8ad5b1bddfa9cfb25cd74edf1ae4",
+    "app/src/server/billing/ai-gateway-client.test.ts": "28cb94078f784c598b6b13a91f5e6735a01ddcb83c8de8d6ef4f1fd899a5b85c",
+    "app/src/server/billing/ai-gateway-client.ts": "54e34966825afde4efb7ba34cf751db374ceddd3b015c61fb1dadaa95d863b93",
+    "app/src/server/billing/catalog.ts": "547774ae1fe3a79bd64a6c8aad351329b42e79a84fc613cc1d2283bfec0b65f1",
+    "app/src/server/billing/http/stripe-webhook.test.ts": "74fab060fc83e3b26a2f55066a01870faac4c6a879265ce0787e72073c97a66b",
+    "app/src/server/billing/http/stripe-webhook.ts": "9b57cf93e8f7c450854909c9e561bb2c4e44d4d128028ed1659d0ad7824eb7b2",
+    "app/src/server/billing/ports.ts": "e8619dcfeffe33d2429d59657911c69394f1b2157015f7557f04b273b3aa5af1",
+    "app/src/server/billing/processor.test.ts": "442e89dba8e53605e8c44b56114e2e49d4a5c486bd6d13e77c4336441923207e",
+    "app/src/server/billing/processor.ts": "7aaa99b703ec34456f6720c1f839a95f2f199638f6070a3b7eb58b6196b2d3fc",
+    "app/src/server/billing/store.test.ts": "5d8ce3f3f3a0144a260be64b6fc85d2689b120626dfd9ce178ece24275fafb31",
+    "app/src/server/billing/store.ts": "687fc913ee3a287b45485653970d5a7ef1dac2b2992f5c85e1eea5a7a2b4c99c",
+    "app/src/server/billing/stripe/client.test.ts": "9519e378d6731b96b16f1c4b2cc850a43fe57e507471fd5265d62a10f1b6bf3c",
+    "app/src/server/billing/stripe/client.ts": "d896aeaf91635bfcbf297499e9e7dc7d16d30e03308086cee3b2cddb03174838",
+    "app/src/server/billing/types.ts": "9fe6116440e6339bad5e4bd1dde12904724abbe661dc56df521813dafbaf38c1"
+  },
+  "verification": "Both patches applied to isolated copies and reproduced all 20 final files byte-for-byte."
+}

@@ -1,0 +1,74 @@
+{
+  "completed": [
+    "Saved and verified Phase 1 checkpoint before Phase 2.",
+    "Implemented canonical root causal revoke/restore semantics, atomic guarded local restore plus outbox, causal delivery gating, durable dependency waits, explicit review outcomes.",
+    "616 unique focused tests pass across the final runs; TypeScript and diff checks pass.",
+    "Both incremental and full patches apply to isolated copies and reproduce all 20 final files byte-for-byte."
+  ],
+  "undone": [
+    "Real PostgreSQL cases: 27 skipped; no database calls authorized this turn.",
+    "Independent Phase 2 review, G5 integration and end-to-end Stripe test-mode QA.",
+    "Enrollment bridge/deployment owned by lead; no live actions performed."
+  ],
+  "files": [
+    "app/src/server/billing/ai-credit-outbox-store.ts",
+    "app/src/server/billing/ai-credit-outbox.pg.test.ts",
+    "app/src/server/billing/ai-credit-outbox.test.ts",
+    "app/src/server/billing/ai-credit-outbox.ts",
+    "app/src/server/billing/ai-credits.test.ts",
+    "app/src/server/billing/ai-credits.ts",
+    "app/src/server/billing/ai-gateway-client.test.ts",
+    "app/src/server/billing/ai-gateway-client.ts",
+    "app/src/server/billing/ports.ts",
+    "app/src/server/billing/processor.test.ts",
+    "app/src/server/billing/processor.ts",
+    "app/src/server/billing/store.test.ts",
+    "app/src/server/billing/store.ts"
+  ],
+  "commands": [
+    {
+      "cmd": "env -u BILLING_TEST_DATABASE_URL -u DATABASE_URL TMPDIR=/dev/shm/ezil-unified-20261026/os-credits/.tmp NODE_DISABLE_COMPILE_CACHE=1 node node_modules/vitest/vitest.mjs run --config ../.task-tmp/vitest.config.mjs --configLoader runner --no-cache --reporter dot src/server/billing/ai-credits.test.ts src/server/billing/ai-credit-outbox.test.ts src/server/billing/ai-credit-outbox.pg.test.ts src/server/billing/ai-gateway-client.test.ts src/server/billing/processor.test.ts src/server/billing/store.test.ts src/server/billing/http/stripe-webhook.test.ts src/server/billing/__contract__/catalog.contract.test.ts src/server/billing/stripe/client.test.ts",
+      "exit": 0
+    },
+    {
+      "cmd": "env -u BILLING_TEST_DATABASE_URL -u DATABASE_URL TMPDIR=/dev/shm/ezil-unified-20261026/os-credits/.tmp NODE_DISABLE_COMPILE_CACHE=1 node node_modules/vitest/vitest.mjs run --config ../.task-tmp/vitest.config.mjs --configLoader runner --no-cache --reporter dot src/server/billing/processor.test.ts src/server/billing/ai-credit-outbox.pg.test.ts",
+      "exit": 0
+    },
+    {
+      "cmd": "env -u BILLING_TEST_DATABASE_URL -u DATABASE_URL TMPDIR=/dev/shm/ezil-unified-20261026/os-credits/.tmp NODE_DISABLE_COMPILE_CACHE=1 node node_modules/typescript/bin/tsc --noEmit --incremental false --pretty false",
+      "exit": 0
+    },
+    {
+      "cmd": "git diff --check",
+      "exit": 0
+    },
+    {
+      "cmd": "python3 .task-tmp/package-phase2.py",
+      "exit": 0
+    }
+  ],
+  "issues": [
+    "Do not treat Phase 1 independent PostgreSQL passes as Phase 2 SQL validation.",
+    "Legacy/compute-only restores without a canonical receipt remain explicit manual review; no positive restoration or v1 grant replay.",
+    "Top-up conversion and team allowances remain unapproved/unset. No live pack enabled."
+  ],
+  "artifacts": {
+    "phase2_only": {
+      "path": ".task-tmp/o-credits-phase2-only.patch",
+      "sha256": "b8e3e34cb6d599daf189450f9a18c47f96154523070d8240cd955a3a5c58ff56"
+    },
+    "full_final": {
+      "path": ".task-tmp/o-credits-full-final.patch",
+      "sha256": "713ce202b0a815033fd5e74e7567de1ac3ef11ed81fddb20f92de53ec53cbc29"
+    },
+    "review_receipt": ".task-tmp/phase2-review-receipt.md",
+    "manifest": ".task-tmp/phase2-patch-manifest.json"
+  },
+  "phase1_checkpoint_sha256": "907afd5113eecf60cdc907918e06a51cda5975592f58745448a0c1fc73c48697",
+  "test_results": {
+    "unique_passed": 616,
+    "postgresql_skipped": 27,
+    "tsc_exit": 0
+  },
+  "command_workdir": "app/ for Vitest and TSC; worktree root for packaging/diff checks"
+}

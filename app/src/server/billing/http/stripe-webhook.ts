@@ -77,23 +77,26 @@ export async function handleStripeWebhook(request: Request, deps: BillingDeps, p
     if (!deps.stripe) {
         return Response.json({ error: 'billing_not_configured' }, { status: 503 });
     }
+    let acceptedReceipt = false;
     try {
         const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(rawBody));
         const payloadSha256 = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
         const recorded = await deps.store.recordEvent({
             eventId: event.id, type: event.type, livemode: event.livemode, payloadSha256,
         });
+        if (recorded === 'conflict') return Response.json({ error: 'event_conflict' }, { status: 409 });
         if (recorded === 'processed') return Response.json({ received: true, duplicate: true });
+        acceptedReceipt = true;
         const outcome = await process(event, { store: deps.store, stripe: deps.stripe, now: deps.now });
         await deps.store.markEventProcessed(event.id, outcome);
         if (outcome.startsWith('failed:')) {
             return Response.json({ error: 'processing_failed' }, { status: 500 });
         }
         return Response.json({ received: true });
-    } catch (error) {
-        const message = (error instanceof Error ? error.message : 'processing failed').replace(/[\r\n\t]/g, ' ').slice(0, 160);
+    } catch {
         try {
-            await deps.store.markEventProcessed(event.id, `failed: ${message}`);
+            // An unaccepted or conflicting delivery must never change another receipt.
+            if (acceptedReceipt) await deps.store.markEventProcessed(event.id, 'failed:processing_unavailable');
         } catch {
             // A failed inbox write must also ask Stripe to retry.
         }

@@ -1,0 +1,1331 @@
+diff --git a/app/src/server/billing/ai-credit-outbox-store.ts b/app/src/server/billing/ai-credit-outbox-store.ts
+index 34d28f10..d9a1b426 100644
+--- a/app/src/server/billing/ai-credit-outbox-store.ts
++++ b/app/src/server/billing/ai-credit-outbox-store.ts
+@@ -1,7 +1,7 @@
+ import { randomUUID } from 'node:crypto';
+ import { sql } from 'drizzle-orm';
+ import { AI_CREDIT_PROTOCOL } from './ai-credits';
+-import { AI_CREDIT_LEASE_MS, AI_CREDIT_MAX_ATTEMPTS, isAiAccountDependency, plannedAiCreditEvent,
++import { AI_CREDIT_LEASE_MS, AI_CREDIT_MAX_ATTEMPTS, isAiAccountDependency, isAiDeliveryDependency, plannedAiCreditEvent,
+     type AiCreditOutboxRow, type AiCreditOutboxStore } from './ai-credit-outbox';
+ 
+ type Database = typeof import('@/server/db').db;
+@@ -37,17 +37,48 @@ export async function lookupAiAccount(db: Pick<Database, 'execute'>, userId: str
+ export function createAiCreditOutboxStore(db: Database): AiCreditOutboxStore {
+     return {
+         async claim(now) {
++            const restoreDisposition = sql`case when pending.kind = 'ai_restore' then case
++                when exists (select 1 from ezil_billing_outbox terminal
++                    where terminal.payload->>'protocol' = ${AI_CREDIT_PROTOCOL}
++                        and terminal.payload->>'entitlementId' = pending.payload->>'entitlementId'
++                        and terminal.kind = 'ai_revoke'
++                        and (terminal.event_key = (pending.payload->>'entitlementId') || ':revoke'
++                            or (left(terminal.event_key, length(pending.payload->>'entitlementId') + 1) = (pending.payload->>'entitlementId') || ':'
++                                and length(terminal.event_key) <= 200
++                                and substring(terminal.event_key from length(pending.payload->>'entitlementId') + 1)
++                                    ~ '^:revoke:refund:[A-Za-z0-9_-]+$'))) then 'terminal'
++                when exists (select 1 from ezil_billing_outbox overlap
++                    where overlap.payload->>'protocol' = ${AI_CREDIT_PROTOCOL}
++                        and overlap.payload->>'entitlementId' = pending.payload->>'entitlementId'
++                        and overlap.payload->>'overlappingDisputes' = 'true') then 'review'
++                end end`;
++            const restoreConflict = sql`pending.kind = 'ai_restore' and suspended.id is not null and (
++                suspended.kind is distinct from 'ai_revoke' or suspended.user_id is distinct from pending.user_id
++                or suspended.payload->>'protocol' is distinct from pending.payload->>'protocol'
++                or suspended.payload->>'action' is distinct from 'revoke'
++                or suspended.payload->>'entitlementId' is distinct from pending.payload->>'entitlementId'
++                or suspended.payload->>'accountPublicId' is distinct from pending.payload->>'accountPublicId'
++                or pending.payload->>'accountPublicId' is null
++                or suspended.payload->'credits' is distinct from pending.payload->'credits'
++                or suspended.payload->'expiresAt' is distinct from pending.payload->'expiresAt'
++                or suspended.payload->'reversal' is distinct from pending.payload->'reversal'
++                or pending.event_key is distinct from (pending.payload->>'entitlementId') || ':restore:' || (pending.payload->'reversal'->>'causeId'))`;
+             const rows = await db.execute<AiCreditOutboxRow & Record<string, unknown>>(sql`
+                 with candidate as (
+-                    select id, attempts, coalesce((payload->'delivery'->>'dependencyWaits')::integer, 0) as dependency_waits
+-                    from ezil_billing_outbox
+-                    where payload->>'protocol' = ${AI_CREDIT_PROTOCOL} and kind in ('ai_grant', 'ai_revoke')
+-                        and delivered_at is null
+-                        and coalesce(payload->'delivery'->>'status', 'pending') in ('pending', 'retry', 'processing')
+-                        and coalesce((payload->'delivery'->>'nextAttemptAt')::bigint, 0) <= ${now}
+-                        and (attempts - coalesce((payload->'delivery'->>'dependencyWaits')::integer, 0) < ${AI_CREDIT_MAX_ATTEMPTS}
+-                            or payload->'delivery'->>'status' = 'processing')
+-                    order by created_at, id for update skip locked limit 1
++                    select pending.id, pending.attempts,
++                        coalesce((pending.payload->'delivery'->>'dependencyWaits')::integer, 0) as dependency_waits,
++                        (${restoreConflict}) as restore_conflict, (${restoreDisposition}) as restore_disposition
++                    from ezil_billing_outbox pending
++                    left join ezil_billing_outbox suspended on pending.kind = 'ai_restore'
++                        and suspended.event_key = (pending.payload->>'entitlementId') || ':revoke:dispute:' || (pending.payload->'reversal'->>'causeId')
++                    where pending.payload->>'protocol' = ${AI_CREDIT_PROTOCOL} and pending.kind in ('ai_grant', 'ai_revoke', 'ai_restore')
++                        and (pending.kind <> 'ai_restore' or suspended.delivered_at is not null or (${restoreConflict}) or (${restoreDisposition}) is not null)
++                        and pending.delivered_at is null
++                        and coalesce(pending.payload->'delivery'->>'status', 'pending') in ('pending', 'retry', 'processing')
++                        and coalesce((pending.payload->'delivery'->>'nextAttemptAt')::bigint, 0) <= ${now}
++                        and (pending.attempts - coalesce((pending.payload->'delivery'->>'dependencyWaits')::integer, 0) < ${AI_CREDIT_MAX_ATTEMPTS}
++                            or pending.payload->'delivery'->>'status' = 'processing')
++                    order by pending.created_at, pending.id for update of pending skip locked limit 1
+                 )
+                 update ezil_billing_outbox o set attempts = case when c.attempts - c.dependency_waits >= ${AI_CREDIT_MAX_ATTEMPTS}
+                         then o.attempts else o.attempts + 1 end,
+@@ -56,7 +87,7 @@ export function createAiCreditOutboxStore(db: Database): AiCreditOutboxStore {
+                             then jsonb_build_object('dependencyWaits', c.dependency_waits) else '{}'::jsonb end)
+                 from candidate c where o.id = c.id
+                 returning o.id, o.event_key as "eventKey", o.user_id as "userId", o.kind, o.payload, o.attempts,
+-                    c.dependency_waits as "dependencyWaits", c.attempts - c.dependency_waits >= ${AI_CREDIT_MAX_ATTEMPTS} as exhausted
++                    c.dependency_waits as "dependencyWaits", c.restore_conflict as "restoreConflict", c.restore_disposition as "restoreDisposition", c.attempts - c.dependency_waits >= ${AI_CREDIT_MAX_ATTEMPTS} as exhausted
+             `);
+             return rows[0] ?? null;
+         },
+@@ -71,20 +102,31 @@ export function createAiCreditOutboxStore(db: Database): AiCreditOutboxStore {
+             return rows[0]?.account ?? lookupAiAccount(db, row.userId);
+         },
+         async pinAccount(row, account) {
+-            const rows = await db.execute(sql`
+-                update ezil_billing_outbox set payload = jsonb_set(payload, '{accountPublicId}', (${JSON.stringify(account)}::text)::jsonb)
+-                where id = ${row.id}::uuid and attempts = ${row.attempts} and delivered_at is null
+-                    and payload->'delivery' = (${JSON.stringify(row.payload.delivery)}::text)::jsonb
+-                    and (payload->>'accountPublicId' is null or payload->>'accountPublicId' = ${account}) returning id
+-            `);
+-            return rows.length > 0;
++            return db.transaction(async tx => {
++                const root = String(row.payload.entitlementId);
++                await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`billing:ai_root:${root}`}, 0))`);
++                const conflicts = await tx.execute(sql`select id from ezil_billing_outbox
++                    where payload->>'protocol' = ${AI_CREDIT_PROTOCOL} and payload->>'entitlementId' = ${root}
++                        and (user_id <> ${row.userId}::uuid or
++                            (payload->>'accountPublicId' is not null and payload->>'accountPublicId' <> ${account})) limit 1`);
++                if (conflicts.length) throw new Error('ai_payer_conflict');
++                const rows = await tx.execute(sql`
++                    update ezil_billing_outbox set payload = jsonb_set(payload, '{accountPublicId}', (${JSON.stringify(account)}::text)::jsonb)
++                    where id = ${row.id}::uuid and attempts = ${row.attempts} and delivered_at is null
++                        and payload->'delivery' = (${JSON.stringify(row.payload.delivery)}::text)::jsonb
++                        and (payload->>'accountPublicId' is null or payload->>'accountPublicId' = ${account}) returning id
++                `);
++                return rows.length > 0;
++            });
+         },
+         async finish(row, result, now) {
+-            const dependencyWaits = (row.dependencyWaits ?? 0) + Number(result.status === 'retry' && isAiAccountDependency(result.reason));
++            const dependencyWaits = (row.dependencyWaits ?? 0) + Number(result.status === 'retry' && isAiDeliveryDependency(result.reason));
+             await db.execute(sql`
+                 update ezil_billing_outbox set payload = jsonb_set(payload, '{delivery}', (${JSON.stringify({
+                     status: result.status, nextAttemptAt: result.nextAttemptAt ?? null,
+                     ...(dependencyWaits > 0 ? { dependencyWaits } : {}),
++                    ...(result.outcome ? { outcome: result.outcome } : {}),
++                    ...(result.reviewRequired ? { reviewRequired: true } : {}),
+                 })}::text)::jsonb), last_error = ${result.reason},
+                     delivered_at = ${result.status === 'done' ? new Date(now).toISOString() : null}::timestamptz
+                 where id = ${row.id}::uuid and attempts = ${row.attempts} and delivered_at is null
+@@ -122,6 +164,7 @@ export async function previewAiCreditRecovery(db: Pick<Database, 'execute'>, inp
+             reason = row.deliveredAt !== null ? 'already_delivered'
+                 : !event ? 'invalid_payload'
+                 : event.action === 'grant' && Date.parse(event.expiresAt) <= input.now ? 'expired'
++                : event.action === 'restore' ? 'restore_requires_review'
+                 : delivery?.status !== 'failed' ? 'not_failed'
+                 : !isAiAccountDependency(row.lastError) ? 'unproven_dependency_failure'
+                 : 'eligible_dependency_wait';
+diff --git a/app/src/server/billing/ai-credit-outbox.pg.test.ts b/app/src/server/billing/ai-credit-outbox.pg.test.ts
+index b156b82e..229d9bc8 100644
+--- a/app/src/server/billing/ai-credit-outbox.pg.test.ts
++++ b/app/src/server/billing/ai-credit-outbox.pg.test.ts
+@@ -5,7 +5,7 @@ import postgres from 'postgres';
+ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+ import * as schema from '@/server/db/schema';
+ import { authUsers, billingOutbox, billingGrants } from '@/server/db/schema';
+-import { aiCreditEntitlement, aiCreditOutboxItem, aiTopupOutboxItem, aiCreditRevokeItem, hasAiTopupReceipts } from './ai-credits';
++import { aiCreditEntitlement, aiCreditOutboxItem, aiTopupOutboxItem, aiCreditRevokeItem, hasAiTopupReceipts, hasAiReversals, aiCreditRestoreItem } from './ai-credits';
+ import { AI_PACKS } from './catalog';
+ import { createAiCreditOutboxStore } from './ai-credit-outbox-store';
+ import { drainAiCreditOutbox, type AiCreditOutboxStore } from './ai-credit-outbox';
+@@ -22,18 +22,95 @@ const start = new Date('2026-10-01Z'), end = new Date('2026-11-01Z');
+ 
+ /** A disposable migrated database only; every test rolls back, and no test opens a connection without opt-in. */
+ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('AI credit outbox with Postgres', () => {
+-    let client: ReturnType<typeof postgres>, db: Database, billing: BillingStore, store: AiCreditOutboxStore, userId: string;
++    let client: ReturnType<typeof postgres>, base: Database, db: Database, billing: BillingStore, store: AiCreditOutboxStore, userId: string;
++    let finishTest: () => void, transactionDone: Promise<void>;
++    const rollbackTest = Symbol('rollback billing test');
+     beforeAll(() => {
+         client = postgres(process.env.BILLING_TEST_DATABASE_URL!, { max: 1, prepare: false });
+-        db = drizzle(client, { schema }); billing = createBillingStore(db); store = createAiCreditOutboxStore(db);
++        base = drizzle(client, { schema });
+     });
+-    beforeEach(async () => { await client`begin`; userId = randomUUID(); await db.insert(authUsers).values({ id: userId }); });
+-    afterEach(async () => { await client`rollback`; });
++    beforeEach(async () => {
++        const finished = new Promise<void>(resolve => { finishTest = resolve; });
++        let ready!: () => void, failed!: (error: unknown) => void;
++        const started = new Promise<void>((resolve, reject) => { ready = resolve; failed = reject; });
++        transactionDone = base.transaction(async tx => {
++            // Store transactions are savepoints inside this rollback-only test transaction.
++            db = tx as unknown as Database; billing = createBillingStore(db); store = createAiCreditOutboxStore(db);
++            userId = randomUUID(); await db.insert(authUsers).values({ id: userId });
++            ready(); await finished; throw rollbackTest;
++        }).catch(error => { if (error !== rollbackTest) { failed(error); throw error; } });
++        await started;
++    });
++    afterEach(async () => { finishTest?.(); await transactionDone; });
+     afterAll(async () => { await client?.end(); });
+     const rows = () => db.select().from(billingOutbox).where(eq(billingOutbox.userId, userId));
+     const item = (action: 'grant' | 'revoke' = 'grant') => aiCreditOutboxItem(userId, aiCreditEntitlement({ userId,
+         sku: 'standard_monthly_v3', subscriptionId: `sub_${userId}`, periodStart: start, periodEnd: end, invoiceId: 'in' }), action, 'in');
+ 
++    async function restoreFixture() {
++        await billing.linkCustomer(userId, `cus_${userId}`);
++        const grant = item(); grant.payload.accountPublicId = 'frozen-payer';
++        await billing.insertGrant({ userId, subscriptionId: `sub_${userId}`, meter: 'compute_std_seconds', kind: 'plan_period',
++            amount: BigInt(144000), periodStart: start, periodEnd: end, sourceType: 'invoice', sourceId: 'in' });
++        await billing.enqueueOutbox(grant);
++        const first = (await store.claim(NOW))!;
++        await store.finish(first, { status: 'done', reason: null }, NOW);
++        const originals = await billing.grantsBySource('invoice', 'in');
++        const input = { action: 'suspend' as const, userId, customerId: `cus_${userId}`, chargeId: 'ch_test',
++            causeId: `dp_${userId}`, originals, receipts: [grant] };
++        if (!hasAiReversals(billing)) throw new Error('missing reversal port');
++        expect(await billing.recordAiReversal(input)).toBe('applied');
++        expect(await billing.recordAiReversal({ ...input, action: 'restore' })).toBe('applied');
++        return { grant, input, restoreKey: aiCreditRestoreItem(grant, input.causeId).eventKey };
++    }
++    it('claims restore only after its exact D revoke is delivered, ignoring creation timestamps', async () => {
++        const f = await restoreFixture();
++        await db.update(billingOutbox).set({ createdAt: new Date(NOW - 1000) }).where(eq(billingOutbox.eventKey, f.restoreKey));
++        const revoked = (await store.claim(NOW))!;
++        expect(revoked.kind).toBe('ai_revoke');
++        expect(await store.claim(NOW)).toBeNull();
++        expect((await rows()).find(r => r.eventKey === f.restoreKey)!.attempts).toBe(0);
++        await store.finish(revoked, { status: 'done', reason: null }, NOW);
++        const restore = (await store.claim(NOW))!;
++        expect(restore.eventKey).toBe(f.restoreKey);
++        expect(restore.restoreConflict).toBe(false);
++        await store.finish(restore, { status: 'done', reason: null, outcome: 'restore_expired' }, NOW);
++        expect((await rows()).find(r => r.eventKey === f.restoreKey)!.payload).toMatchObject({ delivery: { status: 'done', outcome: 'restore_expired' } });
++    });
++    it('persists hold waits beyond ten attempts and fences a replaced restore lease', async () => {
++        const f = await restoreFixture();
++        const revoked = (await store.claim(NOW))!;
++        await store.finish(revoked, { status: 'done', reason: null }, NOW);
++        for (let attempt = 1; attempt <= 12; attempt++) {
++            const at = NOW + attempt * 3_600_000;
++            const restore = (await store.claim(at))!;
++            expect(restore).toMatchObject({ eventKey: f.restoreKey, attempts: attempt, dependencyWaits: attempt - 1 });
++            await store.finish(restore, { status: 'retry', reason: 'restore_hold_pending', nextAttemptAt: at + 3_600_000 }, at);
++        }
++        const at = NOW + 13 * 3_600_000;
++        const stale = (await store.claim(at))!;
++        const current = (await store.claim(at + 30_000))!;
++        expect(await store.pinAccount(stale, 'frozen-payer')).toBe(false);
++        await store.finish(stale, { status: 'failed', reason: 'event_conflict' }, at + 30_000);
++        await store.finish(current, { status: 'done', reason: null, outcome: 'restored' }, at + 30_001);
++        expect((await rows()).find(r => r.eventKey === f.restoreKey)!.payload).toMatchObject({ delivery: { status: 'done', outcome: 'restored', dependencyWaits: 12 } });
++    });
++    it('claims a mismatched payer for explicit review without delivering it', async () => {
++        const f = await restoreFixture();
++        const revoked = (await store.claim(NOW))!;
++        await store.finish(revoked, { status: 'done', reason: null }, NOW);
++        const restore = (await rows()).find(r => r.eventKey === f.restoreKey)!;
++        await db.update(billingOutbox).set({ payload: { ...(restore.payload as object), accountPublicId: 'wrong' } }).where(eq(billingOutbox.id, restore.id));
++        expect(await store.claim(NOW)).toMatchObject({ eventKey: f.restoreKey, restoreConflict: true });
++    });
++    it('sees a queued terminal refund before sending an earlier queued restore', async () => {
++        const f = await restoreFixture();
++        if (!hasAiReversals(billing)) throw new Error('missing reversal port');
++        expect(await billing.recordAiReversal({ ...f.input, action: 'revoke', causeId: 're_final' })).toBe('applied');
++        await db.update(billingOutbox).set({ createdAt: new Date(NOW - 1000) }).where(eq(billingOutbox.eventKey, f.restoreKey));
++        expect(await store.claim(NOW)).toMatchObject({ eventKey: f.restoreKey, restoreDisposition: 'terminal' });
++    });
++
+     it('keeps one Free grant and its original expiry across later summaries', async () => {
+         await enqueueFreeAiCredits(billing, userId, 'free_v3', new Date(NOW));
+         await enqueueFreeAiCredits(billing, userId, 'free_v3', new Date(NOW + 86400000));
+diff --git a/app/src/server/billing/ai-credit-outbox.test.ts b/app/src/server/billing/ai-credit-outbox.test.ts
+index f4bbb468..19fc11c5 100644
+--- a/app/src/server/billing/ai-credit-outbox.test.ts
++++ b/app/src/server/billing/ai-credit-outbox.test.ts
+@@ -217,3 +217,52 @@ describe('explicit dry-run AI recovery', () => {
+         expect(execute).not.toHaveBeenCalled();
+     });
+ });
++
++describe('W0.3 restore delivery', () => {
++    function restore(overrides: Partial<AiCreditOutboxRow> = {}) {
++        const r = row(overrides);
++        r.kind = 'ai_restore';
++        r.eventKey = `${r.payload.entitlementId}:restore:dp_D`;
++        r.payload = { ...r.payload, eventId: r.eventKey, action: 'restore' };
++        return r;
++    }
++    it('keeps hold waits durable beyond ten attempts, then records the explicit result', async () => {
++        const r = restore({ attempts: 26, dependencyWaits: 25 });
++        const f = fixture([r]);
++        f.fetcher.mockResolvedValue(Response.json({ error: { code: 'restore_hold_pending' } }, { status: 409 }));
++        expect(await f.run()).toMatchObject({ retry: 1, failed: 0 });
++        expect(f.store.finish.mock.calls[0]![1]).toMatchObject({ status: 'retry', reason: 'restore_hold_pending', nextAttemptAt: NOW + 3_600_000 });
++        f.rows.push(restore({ attempts: 27, dependencyWaits: 26 }));
++        f.fetcher.mockResolvedValue(Response.json({ event_id: r.eventKey, outcome: 'restored' }));
++        expect(await f.run()).toMatchObject({ done: 1 });
++        expect(f.store.finish.mock.calls[1]![1]).toEqual({ status: 'done', reason: null, outcome: 'restored' });
++    });
++    it.each(['restore_expired', 'restore_nothing_forfeited', 'restore_refused_terminal'])('delivers expired restore requests to obtain %s', async outcome => {
++        const r = restore(); r.payload.expiresAt = new Date(NOW - 1).toISOString();
++        const f = fixture([r]);
++        f.fetcher.mockResolvedValue(Response.json({ event_id: r.eventKey, outcome }));
++        expect(await f.run()).toMatchObject({ done: 1, failed: 0 });
++        expect(f.store.finish.mock.calls[0]![1]).toEqual({ status: 'done', reason: null, outcome });
++    });
++    it.each(['restore_mismatch', 'restore_not_revoked', 'restore_review_required'])('persists manual review for %s without retrying', async code => {
++        const f = fixture([restore()]);
++        f.fetcher.mockResolvedValue(Response.json({ error: { code, message: 'private upstream text' } }, { status: 409 }));
++        expect(await f.run()).toMatchObject({ failed: 1, retry: 0 });
++        expect(f.store.finish.mock.calls[0]![1]).toEqual({ status: 'failed', reason: code, reviewRequired: true });
++        expect(JSON.stringify(f.log.mock.calls)).not.toContain('private upstream text');
++    });
++});
++
++describe('restore receipt conflicts after enqueue', () => {
++    it.each(['terminal', 'review', 'mismatch'] as const)('refuses %s without a funding request', async disposition => {
++        const r = row(); r.kind = 'ai_restore'; r.eventKey = `${r.payload.entitlementId}:restore:dp_D`;
++        r.payload = { ...r.payload, action: 'restore', eventId: r.eventKey };
++        if (disposition === 'mismatch') r.restoreConflict = true;
++        else r.restoreDisposition = disposition;
++        const f = fixture([r]); await f.run();
++        expect(f.fetcher).not.toHaveBeenCalled();
++        expect(f.store.finish.mock.calls[0]![1]).toEqual(disposition === 'terminal'
++            ? { status: 'done', reason: null, outcome: 'restore_refused_terminal' }
++            : { status: 'failed', reason: disposition === 'review' ? 'restore_review_required' : 'restore_mismatch', reviewRequired: true });
++    });
++});
+diff --git a/app/src/server/billing/ai-credit-outbox.ts b/app/src/server/billing/ai-credit-outbox.ts
+index f663ee78..dbde504d 100644
+--- a/app/src/server/billing/ai-credit-outbox.ts
++++ b/app/src/server/billing/ai-credit-outbox.ts
+@@ -1,6 +1,6 @@
+ import type { BillingConfig } from './config';
+-import { AI_CREDIT_PROTOCOL } from './ai-credits';
+-import { AI_GATEWAY_TIMEOUT_MS, sendAiCreditEvent, type AiGatewayEvent, type AiLogger } from './ai-gateway-client';
++import { AI_CREDIT_PROTOCOL, parseAiCreditEventId } from './ai-credits';
++import { AI_GATEWAY_TIMEOUT_MS, sendAiCreditEvent, type AiGatewayEvent, type AiLogger, type AiRestoreOutcome } from './ai-gateway-client';
+ 
+ export const AI_CREDIT_MAX_ATTEMPTS = 10;
+ export const AI_CREDIT_LEASE_MS = 30_000;
+@@ -8,9 +8,12 @@ export interface AiCreditOutboxRow {
+     id: string; eventKey: string; userId: string; kind: string; payload: Record<string, unknown>; attempts: number; exhausted?: boolean;
+     /** Completed account waits do not consume the delivery failure budget. */
+     dependencyWaits?: number;
++    restoreConflict?: boolean;
++    restoreDisposition?: 'terminal' | 'review' | null;
+ }
+ export interface AiCreditDelivery {
+     status: 'done' | 'failed' | 'retry'; reason: string | null; nextAttemptAt?: number;
++    outcome?: AiRestoreOutcome; reviewRequired?: boolean;
+ }
+ export interface AiCreditOutboxStore {
+     claim(now: number): Promise<AiCreditOutboxRow | null>;
+@@ -21,12 +24,13 @@ export interface AiCreditOutboxStore {
+ export const aiCreditBackoffMs = (attempt: number) => Math.min(3_600_000, 60_000 * 2 ** Math.max(0, attempt - 1));
+ export const isAiAccountDependency = (reason: string | null) => reason === 'no_ai_account' || reason === 'account_not_found';
+ 
++export const isAiDeliveryDependency = (reason: string | null) => isAiAccountDependency(reason) || reason === 'restore_hold_pending';
++
+ export function plannedAiCreditEvent(row: AiCreditOutboxRow): Omit<AiGatewayEvent, 'accountPublicId'> | null {
+     const p = row.payload;
+     if (p.protocol !== AI_CREDIT_PROTOCOL || typeof p.entitlementId !== 'string'
+-        || !/^ezil-os:v1:[A-Za-z0-9._:-]+$/.test(p.entitlementId) || p.entitlementId.length > 193
+-        || (p.action !== 'grant' && p.action !== 'revoke') || row.kind !== `ai_${p.action}`
+-        || p.eventId !== `${p.entitlementId}:${p.action}` || row.eventKey !== p.eventId
++        || (p.action !== 'grant' && p.action !== 'revoke' && p.action !== 'restore') || row.kind !== `ai_${p.action}`
++        || typeof p.eventId !== 'string' || !parseAiCreditEventId(p.entitlementId, p.eventId, p.action) || row.eventKey !== p.eventId
+         || typeof p.credits !== 'number' || !Number.isSafeInteger(p.credits) || p.credits < 1 || p.credits > 1_000_000
+         || typeof p.expiresAt !== 'string' || !Number.isFinite(Date.parse(p.expiresAt))) return null;
+     return { eventId: p.eventId, entitlementId: p.entitlementId, action: p.action, credits: p.credits, expiresAt: p.expiresAt };
+@@ -56,7 +60,10 @@ export async function drainAiCreditOutbox(deps: {
+         let result: AiCreditDelivery;
+         const event = plannedAiCreditEvent(row);
+         if (row.exhausted) result = { status: 'failed', reason: 'attempts_exhausted' };
+-        else if (!event) result = { status: 'failed', reason: 'invalid_payload' };
++        else if (!event) result = { status: 'failed', reason: 'invalid_payload', ...(row.kind === 'ai_restore' ? { reviewRequired: true } : {}) };
++        else if (row.restoreDisposition === 'terminal') result = { status: 'done', reason: null, outcome: 'restore_refused_terminal' };
++        else if (row.restoreDisposition === 'review') result = { status: 'failed', reason: 'restore_review_required', reviewRequired: true };
++        else if (row.restoreConflict) result = { status: 'failed', reason: 'restore_mismatch', reviewRequired: true };
+         else if (event.action === 'grant' && Date.parse(event.expiresAt) <= clock()) result = { status: 'failed', reason: 'expired' };
+         else {
+             try {
+@@ -69,16 +76,20 @@ export async function drainAiCreditOutbox(deps: {
+                 } else {
+                     const sent = await sendAiCreditEvent({ url: deps.config.fundingUrl, secret: deps.config.fundingHmacSecret,
+                         event: { ...event, accountPublicId: account }, fetch: deps.fetch, now: clock, log });
+-                    result = sent.status === 'ok' ? { status: 'done', reason: null }
+-                        : { status: sent.status === 'retryable' ? 'retry' : 'failed', reason: sent.reason };
++                    result = sent.status === 'ok' ? { status: 'done', reason: null, ...(sent.outcome ? { outcome: sent.outcome } : {}) }
++                        : { status: sent.status === 'retryable' ? 'retry' : 'failed', reason: sent.reason,
++                            ...(sent.status === 'review' ? { reviewRequired: true } : {}) };
++                    if (sent.status === 'review') log('[billing.ai] restore review required', { entitlementId: event.entitlementId });
+                 }
+-            } catch {
++            } catch (error) {
+                 // SQL/transport errors may contain URLs, credentials or tokens. Store only a fixed code.
+-                result = { status: 'retry', reason: 'delivery_unavailable' };
++                result = error instanceof Error && error.message === 'ai_payer_conflict'
++                    ? { status: 'failed', reason: 'restore_mismatch', reviewRequired: true }
++                    : { status: 'retry', reason: 'delivery_unavailable' };
+             }
+         }
+         if (result.status === 'retry') {
+-            if (!isAiAccountDependency(result.reason) && row.attempts - (row.dependencyWaits ?? 0) >= AI_CREDIT_MAX_ATTEMPTS) {
++            if (!isAiDeliveryDependency(result.reason) && row.attempts - (row.dependencyWaits ?? 0) >= AI_CREDIT_MAX_ATTEMPTS) {
+                 result = { status: 'failed', reason: 'attempts_exhausted' };
+             }
+             else result.nextAttemptAt = clock() + aiCreditBackoffMs(row.attempts);
+diff --git a/app/src/server/billing/ai-credits.test.ts b/app/src/server/billing/ai-credits.test.ts
+index 1f2233ab..b39ba241 100644
+--- a/app/src/server/billing/ai-credits.test.ts
++++ b/app/src/server/billing/ai-credits.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from 'vitest';
+-import { aiCreditEntitlement, aiCreditOutboxItem, aiCreditRevokeItem, aiTopupOutboxItem } from './ai-credits';
++import { aiCreditEntitlement, aiCreditOutboxItem, aiCreditRevokeItem, aiTopupOutboxItem, aiCreditRestoreItem, parseAiCreditEventId } from './ai-credits';
+ import { AI_PACKS } from './catalog';
+ 
+ const input = { userId: 'user', sku: 'standard_monthly_v3' as const, subscriptionId: 'sub',
+@@ -52,3 +52,29 @@ describe('AI credit planning', () => {
+         expect(() => aiCreditEntitlement({ ...input, ...change })).toThrow(TypeError);
+     });
+ });
++
++
++describe('W0.3 canonical root event grammar', () => {
++    const grant = aiTopupOutboxItem('user', { ...AI_PACKS[0]!, aiCredits: 1234 }, 'pi_test', new Date('2027-01-01Z'))!;
++    it('retains root terms and payer across dispute, refund, and restore events', () => {
++        grant.payload.accountPublicId = 'frozen-account';
++        for (const item of [aiCreditRevokeItem(grant, { type: 'dispute', id: 'dp_D' }),
++            aiCreditRevokeItem(grant, { type: 'refund', id: 're_R' }), aiCreditRestoreItem(grant, 'dp_D')]) {
++            expect(item.payload).toMatchObject({ entitlementId: grant.payload.entitlementId, credits: 1234,
++                expiresAt: grant.payload.expiresAt, accountPublicId: 'frozen-account' });
++            expect(parseAiCreditEventId(String(grant.payload.entitlementId), item.eventKey, String(item.payload.action))).not.toBeNull();
++        }
++        expect(aiCreditRestoreItem(grant, 'dp_D').eventKey).toBe(`${grant.payload.entitlementId}:restore:dp_D`);
++    });
++    it('requires the exact root and an exact single cause suffix; no substring or truncation', () => {
++        const root = String(grant.payload.entitlementId);
++        for (const key of [`other${root}:restore:dp_D`, `${root}x:restore:dp_D`, `${root}:restore:dp_D:extra`,
++            `${root}:restore:`, `${root}:restore:dp_D/`, `${root}:restore:dp_D\n`]) {
++            expect(parseAiCreditEventId(root, key, 'restore')).toBeNull();
++        }
++        const id = 'd'.repeat(200 - root.length - ':revoke:dispute:'.length);
++        expect(aiCreditRevokeItem(grant, { type: 'dispute', id }).eventKey).toHaveLength(200);
++        expect(() => aiCreditRevokeItem(grant, { type: 'dispute', id: id + 'x' })).toThrow();
++        expect(parseAiCreditEventId(root, `${root}:revoke`, 'revoke')).toEqual({ action: 'revoke' });
++    });
++});
+diff --git a/app/src/server/billing/ai-credits.ts b/app/src/server/billing/ai-credits.ts
+index fa48ca23..c5f15e41 100644
+--- a/app/src/server/billing/ai-credits.ts
++++ b/app/src/server/billing/ai-credits.ts
+@@ -1,4 +1,5 @@
+-import type { BillingStore, GrantInsert, OutboxInsert } from './ports';
++import { isDeepStrictEqual } from 'node:util';
++import type { BillingStore, GrantInsert, GrantRow, OutboxInsert } from './ports';
+ import type { CatalogPack } from './types';
+ import { aiPackCheckoutEligible } from './catalog';
+ import { AI_CREDIT_POLICY_VERSION, CATALOG_V3, type PlanSkuV3 } from './v3/contract';
+@@ -65,11 +66,12 @@ export function hasAiTopupReceipts(store: BillingStore): store is BillingStore &
+ }
+ 
+ /** Reverse the stored receipt, retaining its policy/amount if the catalog changes later. */
+-export function aiCreditRevokeItem(grant: OutboxInsert): OutboxInsert {
++export function aiCreditRevokeItem(grant: OutboxInsert, cause?: { type: 'dispute' | 'refund'; id: string }): OutboxInsert {
+     const p = grant.payload;
+     if (p.protocol !== AI_CREDIT_PROTOCOL || typeof p.entitlementId !== 'string' || typeof p.credits !== 'number'
+         || typeof p.expiresAt !== 'string' || p.action !== 'grant') throw new TypeError('Invalid AI credit receipt');
+-    const eventId = `${p.entitlementId}:revoke`;
++    const eventId = `${p.entitlementId}:revoke${cause ? `:${cause.type}:${cause.id}` : ''}`;
++    if (!parseAiCreditEventId(p.entitlementId, eventId, 'revoke')) throw new TypeError('invalid_ai_event_id');
+     return { userId: grant.userId, eventKey: eventId, kind: 'ai_revoke', payload: {
+         protocol: p.protocol, policyVersion: p.policyVersion, invoiceId: p.invoiceId,
+         entitlementId: p.entitlementId, credits: p.credits, expiresAt: p.expiresAt, eventId, action: 'revoke',
+@@ -77,3 +79,151 @@ export function aiCreditRevokeItem(grant: OutboxInsert): OutboxInsert {
+         ...(typeof p.accountPublicId === 'string' ? { accountPublicId: p.accountPublicId } : {}),
+     } };
+ }
++
++
++/** W0.3: parse only the suffix of the exact canonical root; never truncate IDs. */
++export function parseAiCreditEventId(root: string, eventId: string, action: string):
++    { action: 'grant' | 'revoke' | 'restore'; cause?: 'dispute' | 'refund'; causeId?: string } | null {
++    if (!/^ezil-os:v1:[A-Za-z0-9._:-]+$/.test(root) || root.length > 193
++        || eventId.length > 200 || !eventId.startsWith(root + ':')) return null;
++    const suffix = eventId.slice(root.length);
++    if (action === 'grant' && suffix === ':grant') return { action };
++    if (action === 'revoke' && suffix === ':revoke') return { action };
++    const revoke = /^:revoke:(dispute|refund):([A-Za-z0-9_-]+)$/.exec(suffix);
++    if (action === 'revoke' && revoke) return { action, cause: revoke[1] as 'dispute' | 'refund', causeId: revoke[2] };
++    const restore = /^:restore:([A-Za-z0-9_-]+)$/.exec(suffix);
++    return action === 'restore' && restore ? { action, cause: 'dispute', causeId: restore[1] } : null;
++}
++
++export function aiCreditRestoreItem(grant: OutboxInsert, disputeId: string): OutboxInsert {
++    const revoke = aiCreditRevokeItem(grant, { type: 'dispute', id: disputeId });
++    const eventId = `${grant.payload.entitlementId}:restore:${disputeId}`;
++    if (!parseAiCreditEventId(String(grant.payload.entitlementId), eventId, 'restore')) throw new TypeError('invalid_ai_event_id');
++    return { ...revoke, eventKey: eventId, kind: 'ai_restore', payload: { ...revoke.payload, eventId, action: 'restore' } };
++}
++
++export interface AiReversalInput {
++    action: 'suspend' | 'revoke' | 'restore'; causeId: string; chargeId: string; customerId: string; userId: string;
++    originals: GrantRow[]; receipts: OutboxInsert[];
++}
++export interface AiReversalStore {
++    /** Locks cause/root, rechecks receipts, then atomically inserts the local and AI effects. */
++    recordAiReversal(input: AiReversalInput): Promise<string>;
++}
++export function hasAiReversals(store: BillingStore): store is BillingStore & AiReversalStore {
++    return 'recordAiReversal' in store && typeof store.recordAiReversal === 'function';
++}
++export type AiReversalReceipt = OutboxInsert & { deliveredAt?: Date | null };
++
++function originalFacts(rows: GrantRow[]) {
++    return [...rows].sort((a, b) => a.id.localeCompare(b.id)).map(g => ({ id: g.id, userId: g.userId,
++        meter: g.meter, kind: g.kind, amount: g.amount.toString(), subscriptionId: g.subscriptionId,
++        sourceType: g.sourceType, sourceId: g.sourceId,
++        periodStart: g.periodStart?.toISOString() ?? null, periodEnd: g.periodEnd?.toISOString() ?? null }));
++}
++function sameLocalGrant(a: GrantInsert, b: GrantInsert) {
++    return a.userId === b.userId && a.meter === b.meter && a.kind === b.kind && a.amount === b.amount
++        && (a.subscriptionId ?? null) === (b.subscriptionId ?? null) && a.sourceType === b.sourceType && a.sourceId === b.sourceId
++        && a.periodStart?.getTime() === b.periodStart?.getTime() && a.periodEnd?.getTime() === b.periodEnd?.getTime();
++}
++const localKey = (g: GrantInsert) => `${g.sourceType}:${g.sourceId}:${g.meter}:${g.kind}`;
++const receiptTermsMatch = (a: OutboxInsert, b: OutboxInsert) => a.userId === b.userId
++    && a.payload.protocol === b.payload.protocol && a.payload.entitlementId === b.payload.entitlementId
++    && a.payload.credits === b.payload.credits && a.payload.expiresAt === b.payload.expiresAt
++    && a.payload.invoiceId === b.payload.invoiceId && a.payload.paymentIntentId === b.payload.paymentIntentId;
++const deliveredRestore = (r: AiReversalReceipt) => r.deliveredAt != null
++    && ['restored', 'already_restored'].includes(String((r.payload.delivery as { outcome?: string } | undefined)?.outcome));
++
++/** Pure financial guard, run against a fresh snapshot under the store's cause/root locks. */
++export function planAiReversal(input: AiReversalInput, snapshot: {
++    originals: GrantRow[]; corrections: GrantRow[]; receipts: AiReversalReceipt[];
++}): { outcome: string; grants: GrantInsert[]; outbox: OutboxInsert[] } {
++    const refuse = (outcome: string) => ({ outcome, grants: [], outbox: [] });
++    if (!input.receipts.length) return refuse('review:restore_receipt_missing');
++    if (!input.originals.length || input.originals.some(g => g.userId !== input.userId || g.amount <= BigInt(0)
++        || !['invoice', 'payment_intent'].includes(g.sourceType))
++        || !isDeepStrictEqual(originalFacts(input.originals), originalFacts(snapshot.originals))) return refuse('review:restore_mismatch');
++    const causeType = input.action === 'revoke' ? 'refund' : 'dispute';
++    const proof = { causeType, causeId: input.causeId, chargeId: input.chargeId, customerId: input.customerId,
++        originals: originalFacts(snapshot.originals) };
++    const grants: GrantInsert[] = snapshot.originals.map(g => ({ userId: input.userId, meter: g.meter,
++        subscriptionId: g.subscriptionId, kind: input.action, amount: input.action === 'restore' ? g.amount : -g.amount,
++        periodStart: g.periodStart, periodEnd: g.periodEnd, sourceType: causeType, sourceId: input.causeId }));
++    // The existing ledger key has one row per meter/cause. Never partially apply an ambiguous purchase.
++    if (new Set(grants.map(localKey)).size !== grants.length) return refuse('review:restore_mismatch');
++    const outbox: OutboxInsert[] = [];
++    for (const root of input.receipts) {
++        const p = root.payload;
++        if (root.userId !== input.userId || root.kind !== 'ai_grant' || p.protocol !== AI_CREDIT_PROTOCOL
++            || typeof p.entitlementId !== 'string' || typeof p.eventId !== 'string' || root.eventKey !== p.eventId
++            || !parseAiCreditEventId(p.entitlementId, p.eventId, 'grant') || p.action !== 'grant'
++            || !Number.isSafeInteger(p.credits) || Number(p.credits) < 1 || Number(p.credits) > 1_000_000
++            || typeof p.expiresAt !== 'string' || !Number.isFinite(Date.parse(p.expiresAt))) return refuse('review:restore_mismatch');
++        const matchesSource = snapshot.originals.some(g => g.sourceType === 'payment_intent'
++            ? p.paymentIntentId === g.sourceId && p.entitlementId === `ezil-os:v1:topup:${p.packSku}:${g.sourceId}`
++                && p.expiresAt === g.periodEnd?.toISOString()
++            : p.invoiceId === g.sourceId && g.kind === 'plan_period' && g.subscriptionId && g.periodStart
++                && ['standard_monthly_v3', 'premium_monthly_v3'].some(sku => p.entitlementId
++                    === `ezil-os:v1:${sku}:${g.subscriptionId}:${g.periodStart!.toISOString()}`));
++        if (!matchesSource) return refuse('review:restore_mismatch');
++        const family = snapshot.receipts.filter(r => r.payload.entitlementId === p.entitlementId);
++        if (family.some(r => !receiptTermsMatch(root, r))) return refuse('review:restore_mismatch');
++        const accounts = new Set([root, ...family].flatMap(r => typeof r.payload.accountPublicId === 'string'
++            && r.payload.accountPublicId ? [r.payload.accountPublicId] : []));
++        if (accounts.size > 1) return refuse('review:restore_mismatch');
++        const account = [...accounts][0];
++        let item: OutboxInsert;
++        try {
++            item = input.action === 'restore' ? aiCreditRestoreItem(root, input.causeId)
++                : aiCreditRevokeItem(root, { type: causeType, id: input.causeId });
++        } catch { return refuse('review:invalid_ai_event_id'); }
++        item.payload.reversal = proof;
++        if (account) item.payload.accountPublicId = account;
++        const previous = snapshot.receipts.find(r => r.eventKey === item.eventKey);
++        if (previous && (!receiptTermsMatch(item, previous) || previous.kind !== item.kind
++            || !isDeepStrictEqual(previous.payload.reversal, proof)
++            || previous.payload.accountPublicId !== item.payload.accountPublicId)) return refuse('review:restore_mismatch');
++        // All rows from this same D must belong to this exact purchase/owner, even on other roots.
++        if (snapshot.receipts.some(r => {
++            const metadata = r.payload.reversal as typeof proof | undefined;
++            return metadata?.causeType === causeType && metadata.causeId === input.causeId
++                && (!isDeepStrictEqual(metadata, proof) || r.userId !== input.userId
++                    || !input.receipts.some(x => x.payload.entitlementId === r.payload.entitlementId));
++        })) return refuse('review:restore_mismatch');
++        if (input.action === 'restore' && !previous) {
++            const suspend = family.find(r => r.eventKey === `${p.entitlementId}:revoke:dispute:${input.causeId}`);
++            if (!suspend) return refuse('failed:restore_suspend_pending');
++            if (suspend.kind !== 'ai_revoke' || suspend.payload.action !== 'revoke'
++                || !isDeepStrictEqual(suspend.payload.reversal, proof)) return refuse('review:restore_mismatch');
++            if (!account || suspend.payload.accountPublicId !== account) return refuse('failed:restore_account_pending');
++            if (family.some(r => {
++                const parsed = parseAiCreditEventId(p.entitlementId as string, r.eventKey, String(r.payload.action));
++                return parsed?.action === 'revoke' && parsed.cause !== 'dispute';
++            })) return refuse('review:restore_refused_terminal');
++            if (family.some(r => r.payload.overlappingDisputes === true || (() => {
++                const parsed = parseAiCreditEventId(p.entitlementId as string, r.eventKey, String(r.payload.action));
++                return parsed?.cause === 'dispute' && parsed.action === 'revoke' && parsed.causeId !== input.causeId
++                    && !family.some(done => done.eventKey === `${p.entitlementId}:restore:${parsed.causeId}` && deliveredRestore(done));
++            })())) return refuse('review:restore_review_required');
++            const suspended = snapshot.corrections.filter(g => g.sourceType === 'dispute' && g.sourceId === input.causeId && g.kind === 'suspend');
++            if (suspended.length !== grants.length || grants.some(g => !suspended.some(s => sameLocalGrant(s, { ...g, kind: 'suspend', amount: -g.amount })))) {
++                return refuse('review:restore_mismatch');
++            }
++        }
++        if (input.action === 'suspend' && !previous) {
++            item.payload.overlappingDisputes = family.some(r => {
++                const parsed = parseAiCreditEventId(p.entitlementId as string, r.eventKey, String(r.payload.action));
++                return parsed?.action === 'revoke' && parsed.cause === 'dispute' && parsed.causeId !== input.causeId
++                    && !family.some(done => done.eventKey === `${p.entitlementId}:restore:${parsed.causeId}` && deliveredRestore(done));
++            });
++        }
++        if (!previous) outbox.push(item);
++    }
++    if (new Set(input.receipts.map(r => r.payload.entitlementId)).size !== input.receipts.length) return refuse('review:restore_mismatch');
++    const missing = grants.filter(g => !snapshot.corrections.some(s => localKey(s) === localKey(g)));
++    if (grants.some(g => snapshot.corrections.some(s => localKey(s) === localKey(g) && !sameLocalGrant(s, g)))) return refuse('review:restore_mismatch');
++    // A legacy positive or partial write is not proof that a dispute was won safely.
++    if (input.action === 'restore' && ((outbox.length === 0) !== (missing.length === 0)
++        || (outbox.length > 0 && (outbox.length !== input.receipts.length || missing.length !== grants.length)))) return refuse('review:restore_mismatch');
++    return { outcome: 'applied', grants: missing, outbox };
++}
+diff --git a/app/src/server/billing/ai-gateway-client.test.ts b/app/src/server/billing/ai-gateway-client.test.ts
+index cd1da75e..fea5529a 100644
+--- a/app/src/server/billing/ai-gateway-client.test.ts
++++ b/app/src/server/billing/ai-gateway-client.test.ts
+@@ -66,3 +66,33 @@ describe('signed AI Gateway client', () => {
+         expect(log).not.toHaveBeenCalled();
+     });
+ });
++
++describe('W0.3 restore responses', () => {
++    const restore = { ...event, action: 'restore' as const, eventId: 'ent:restore:dp_D' };
++    it.each(['restored', 'already_restored', 'restore_refused_terminal', 'restore_expired', 'restore_nothing_forfeited'])(
++        'records %s as an explicit successful delivery', async outcome => {
++            const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ event_id: restore.eventId, outcome }));
++            expect(await sendAiCreditEvent({ ...options, event: restore, fetch: fetcher })).toEqual({ status: 'ok', outcome });
++            expect(JSON.parse(fetcher.mock.calls[0]![1]!.body as string)).toEqual(restore);
++        },
++    );
++    it.each(['restore_hold_pending', 'restore_not_revoked', 'restore_mismatch', 'restore_review_required'])(
++        'classifies %s explicitly', async code => {
++            const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ error: { code } }, { status: 409 }));
++            expect(await sendAiCreditEvent({ ...options, event: restore, fetch: fetcher })).toEqual({
++                status: code === 'restore_hold_pending' ? 'retryable' : 'review', reason: code });
++        },
++    );
++    it.each([null, { outcome: 'granted' }, { outcome: 'restored', event_id: 'another-event' }])('reviews an ambiguous success %j', async body => {
++        const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json(body));
++        expect(await sendAiCreditEvent({ ...options, event: restore, fetch: fetcher })).toEqual({ status: 'review', reason: 'restore_response_invalid' });
++    });
++    it('bounds a stalled restore success body within the existing timeout', async () => {
++        vi.useFakeTimers();
++        const fetcher = vi.fn<typeof fetch>().mockResolvedValue({ ok: true, json: () => new Promise(() => {}) } as Response);
++        const pending = sendAiCreditEvent({ ...options, event: restore, fetch: fetcher });
++        await vi.advanceTimersByTimeAsync(10_000);
++        expect(await pending).toEqual({ status: 'retryable', reason: 'transport_unavailable' });
++        expect(fetcher.mock.calls[0]![1]!.signal!.aborted).toBe(true);
++    });
++});
+diff --git a/app/src/server/billing/ai-gateway-client.ts b/app/src/server/billing/ai-gateway-client.ts
+index 4c878b58..371e94de 100644
+--- a/app/src/server/billing/ai-gateway-client.ts
++++ b/app/src/server/billing/ai-gateway-client.ts
+@@ -2,8 +2,10 @@ import { createHmac } from 'node:crypto';
+ import type { AiCreditEntitlement } from './ai-credits';
+ 
+ export const AI_GATEWAY_TIMEOUT_MS = 10_000;
+-export type AiGatewayEvent = AiCreditEntitlement & { eventId: string; accountPublicId: string; action: 'grant' | 'revoke' };
+-export type AiGatewayResult = { status: 'ok' } | { status: 'permanent' | 'retryable'; reason: string };
++export type AiGatewayEvent = AiCreditEntitlement & { eventId: string; accountPublicId: string; action: 'grant' | 'revoke' | 'restore' };
++export const AI_RESTORE_OUTCOMES = ['restored', 'already_restored', 'restore_refused_terminal', 'restore_expired', 'restore_nothing_forfeited'] as const;
++export type AiRestoreOutcome = typeof AI_RESTORE_OUTCOMES[number];
++export type AiGatewayResult = { status: 'ok'; outcome?: AiRestoreOutcome } | { status: 'permanent' | 'retryable' | 'review'; reason: string };
+ export type AiLogger = (message: string, fields?: { entitlementId: string }) => void;
+ 
+ export function signAiGatewayBody(secret: string, timestamp: string, rawBody: string): string {
+@@ -35,13 +37,26 @@ export async function sendAiCreditEvent(input: {
+                 method: 'POST', redirect: 'error', signal, headers: { 'Content-Type': 'application/json',
+                     'X-EZiL-Timestamp': timestamp, 'X-EZiL-Signature': signAiGatewayBody(input.secret, timestamp, rawBody) }, body: rawBody,
+             });
+-            if (response.ok) return { status: 'ok' };
++            if (response.ok) {
++                if (event.action !== 'restore') return { status: 'ok' };
++                const body = await response.json().catch(() => null);
++                if (body && body.ok !== false && AI_RESTORE_OUTCOMES.includes(body.outcome) && body.event_id === event.eventId) {
++                    return { status: 'ok', outcome: body.outcome as AiRestoreOutcome };
++                }
++                return { status: 'review', reason: 'restore_response_invalid' };
++            }
+             if (response.status === 409 || response.status === 404) {
+                 const body = await response.json().catch(() => null);
+                 const code = body?.error?.code ?? body?.code;
+                 if (response.status === 404 && code === 'account_not_found') {
+                     return { status: 'retryable', reason: 'account_not_found' };
+                 }
++                if (response.status === 409 && event.action === 'restore') {
++                    if (code === 'restore_hold_pending') return { status: 'retryable', reason: code };
++                    if (['restore_not_revoked', 'restore_mismatch', 'restore_review_required'].includes(code)) {
++                        return { status: 'review', reason: code };
++                    }
++                }
+                 if (response.status === 409 && code === 'event_conflict') {
+                     (input.log ?? console.warn)('[billing.ai] event_conflict', { entitlementId: event.entitlementId });
+                     return { status: 'permanent', reason: 'event_conflict' };
+diff --git a/app/src/server/billing/ports.ts b/app/src/server/billing/ports.ts
+index 956f9717..d8c716a8 100644
+--- a/app/src/server/billing/ports.ts
++++ b/app/src/server/billing/ports.ts
+@@ -58,7 +58,7 @@ export interface OutboxInsert {
+     /** Unique; the Gateway's idempotency key. */
+     eventKey: string;
+     userId: string;
+-    kind: 'ai_grant' | 'ai_revoke';
++    kind: 'ai_grant' | 'ai_revoke' | 'ai_restore';
+     payload: Record<string, unknown>;
+ }
+ 
+diff --git a/app/src/server/billing/processor.test.ts b/app/src/server/billing/processor.test.ts
+index ce6c8b7e..9891545d 100644
+--- a/app/src/server/billing/processor.test.ts
++++ b/app/src/server/billing/processor.test.ts
+@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+ 
+ import { PRO_PLAN } from './catalog';
+ import * as catalog from './catalog';
+-import type { AiTopupReceiptStore } from './ai-credits';
++import { planAiReversal, type AiReversalStore, type AiReversalReceipt, type AiTopupReceiptStore } from './ai-credits';
+ import { drainAiCreditOutbox, type AiCreditOutboxRow } from './ai-credit-outbox';
+ import type {
+     BillingStore, GrantInsert, GrantRow, GrantSource, OutboxInsert, ProcessorDeps,
+@@ -25,7 +25,7 @@ type Interval = {
+ };
+ 
+ /** Match the database's unique keys so replay tests exercise persisted effects. */
+-class MemoryStore implements BillingStore, AiTopupReceiptStore {
++class MemoryStore implements BillingStore, AiTopupReceiptStore, AiReversalStore {
+     epochs: StoredComputeEpoch[] = [];
+     grantsForPeriod: BillingStore['grantsForPeriod'] = async () => { throw new Error('Unused v2 store stub'); };
+     openEpoch: BillingStore['openEpoch'] = async input => {
+@@ -133,7 +133,7 @@ class MemoryStore implements BillingStore, AiTopupReceiptStore {
+     computers = new Map<string, string>([['computer_local', 'user_local']]);
+     subscriptions = new Map<string, SubscriptionUpsert>();
+     grants = new Map<string, GrantRow>();
+-    outbox = new Map<string, OutboxInsert>();
++    outbox = new Map<string, AiReversalReceipt>();
+     intervals: Interval[] = [];
+     samples: (StorageSample & { userId: string; source: string })[] = [];
+     writes: string[] = [];
+@@ -227,6 +227,29 @@ class MemoryStore implements BillingStore, AiTopupReceiptStore {
+         }
+         return 'applied';
+     };
++    private reversalQueue: Promise<unknown> = Promise.resolve();
++    recordAiReversal: AiReversalStore['recordAiReversal'] = input => {
++        const run = this.reversalQueue.then(async () => {
++            const first = input.originals[0]!;
++            const plan = planAiReversal(input, {
++                originals: [...this.grants.values()].filter(g => g.sourceType === first.sourceType && g.sourceId === first.sourceId),
++                corrections: [...this.grants.values()].filter(g => g.sourceType === (input.action === 'revoke' ? 'refund' : 'dispute') && g.sourceId === input.causeId),
++                receipts: [...this.outbox.values()],
++            });
++            if (plan.outcome !== 'applied') return plan.outcome;
++            const before = { grants: new Map(this.grants), outbox: new Map(this.outbox), writes: [...this.writes] };
++            try {
++                for (const grant of plan.grants) if (await this.insertGrant(grant) !== 'inserted') throw new Error('conflict');
++                for (const item of plan.outbox) if (await this.enqueueOutbox(item) !== 'queued') throw new Error('conflict');
++            } catch (error) {
++                this.grants = before.grants; this.outbox = before.outbox; this.writes = before.writes;
++                throw error;
++            }
++            return 'applied';
++        });
++        this.reversalQueue = run.catch(() => {});
++        return run;
++    };
+     async latestIntervalFor(computerId: string) {
+         return this.intervals.filter(row => row.computerId === computerId)
+             .sort((a, b) => b.startedAt.getTime() - a.startedAt.getTime())[0] ?? null;
+@@ -454,7 +477,8 @@ describe('processStripeEvent', () => {
+         'never attributes a foreign customer through payload metadata %#', async makeEvent => {
+             const good = fixture();
+             if (makeEvent().type.startsWith('charge.')) await seedTopup(good.store);
+-            expect(await processStripeEvent(makeEvent(), good.deps)).toBe('applied');
++            expect(await processStripeEvent(makeEvent(), good.deps)).toBe(makeEvent().type === 'charge.dispute.closed'
++                ? 'review:restore_refused_terminal' : 'applied');
+             expect(good.store.owners).toEqual(['cus_local']);
+             const bad = fixture();
+             await seedTopup(bad.store);
+@@ -538,13 +562,13 @@ describe('processStripeEvent', () => {
+         expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
+         expect(await processStripeEvent({ ...refund(), id: 'another-refund-event' }, f.deps)).toBe('applied');
+         const reversal = [...f.store.outbox.values()][1]!;
+-        expect(reversal).toMatchObject({ eventKey: `${receipt.payload.entitlementId}:revoke`,
++        expect(reversal).toMatchObject({ eventKey: `${receipt.payload.entitlementId}:revoke:refund:re_local`,
+             payload: { entitlementId: receipt.payload.entitlementId, credits: 1234,
+                 expiresAt: snapshot.payload.expiresAt, accountPublicId: 'original-account' } });
+         expect(await processStripeEvent(checkout(false), f.deps)).toBe('applied');
+         expect(f.store.outbox.size).toBe(2);
+         const beforeRestore = [...f.store.writes];
+-        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:ai_restore_unresolved');
++        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_refused_terminal');
+         expect(f.store.writes).toEqual(beforeRestore);
+     });
+     it('retries refund-before-purchase and delivers grant/revoke with one shared v1 entitlement in either order', async () => {
+@@ -564,7 +588,7 @@ describe('processStripeEvent', () => {
+             const bodies = fetcher.mock.calls.map(call => JSON.parse(call[1]!.body as string));
+             expect(bodies.map(body => body.action)).toEqual(order.map(item => item.payload.action));
+             expect(new Set(bodies.map(body => body.entitlementId))).toEqual(new Set(['ezil-os:v1:topup:ai_pack_10_v1:pi_local']));
+-            expect(bodies.every(body => body.eventId === `${body.entitlementId}:${body.action}` && body.credits === 1234)).toBe(true);
++            expect(bodies.every(body => body.eventId === `${body.entitlementId}:${body.action}${body.action === 'revoke' ? ':refund:re_local' : ''}` && body.credits === 1234)).toBe(true);
+         }
+     });
+     it('does not migrate an existing dollar-only topup on paid replay', async () => {
+@@ -604,7 +628,7 @@ describe('processStripeEvent', () => {
+         expect(bad.store.writes).toEqual([]);
+     });
+ 
+-    it.each([['revoke', refund], ['suspend', dispute], ['restore', () => dispute(true)]] as const)(
++    it.each([['revoke', refund], ['suspend', dispute]] as const)(
+         'appends %s with the original meter and period and queues its AI correction', async (kind, makeEvent) => {
+             const { store, stripe, deps } = fixture();
+             await seedTopup(store);
+@@ -612,13 +636,13 @@ describe('processStripeEvent', () => {
+             expect(stripe.reads).toEqual(['charge:ch_local']);
+             expect(store.sourceReads).toEqual(['payment_intent:pi_local']);
+             expect([...store.grants.values()][1]).toMatchObject({
+-                kind, meter: 'ai_usd_micro', amount: BigInt(kind === 'restore' ? 10_000_000 : -10_000_000),
++                kind, meter: 'ai_usd_micro', amount: BigInt(-10_000_000),
+                 periodStart, periodEnd, sourceType: kind === 'revoke' ? 'refund' : 'dispute',
+                 sourceId: kind === 'revoke' ? 're_local' : 'dp_local',
+             });
+             expect([...store.outbox.values()][0]).toMatchObject({
+                 eventKey: kind === 'revoke' ? 'refund:re_local:ai_revoke' : `dispute:dp_local:ai_${kind}`,
+-                kind: kind === 'restore' ? 'ai_grant' : 'ai_revoke', payload: { amountUsdMicro: '10000000' },
++                kind: 'ai_revoke', payload: { amountUsdMicro: '10000000' },
+             });
+         },
+     );
+@@ -658,6 +682,11 @@ describe('processStripeEvent', () => {
+         expect(await processStripeEvent(makeEvent(), deps)).toBe('review:customer_mismatch');
+         expect(store.writes).toEqual(before);
+         original.userId = 'user_local';
++        if (makeEvent().type === 'charge.dispute.closed') {
++            expect(await processStripeEvent(makeEvent(), deps)).toBe('review:restore_refused_terminal');
++            expect(store.grants.size).toBe(1);
++            return;
++        }
+         expect(await processStripeEvent(makeEvent(), deps)).toBe('applied');
+         expect(store.grants.size).toBe(2);
+     });
+@@ -667,6 +696,13 @@ describe('processStripeEvent', () => {
+             const { store, deps } = fixture();
+             const input = makeEvent();
+             if (input.type.startsWith('charge.')) await seedTopup(store);
++            if (input.type === 'charge.dispute.closed') {
++                const before = [...store.writes];
++                expect(await processStripeEvent(input, deps)).toBe('review:restore_refused_terminal');
++                expect(await processStripeEvent(input, deps)).toBe('review:restore_refused_terminal');
++                expect(store.writes).toEqual(before);
++                return;
++            }
+             expect(await processStripeEvent(input, deps)).toBe('applied');
+             expect(store.writes.length).toBeGreaterThan(0);
+             const writes = [...store.writes];
+@@ -675,9 +711,11 @@ describe('processStripeEvent', () => {
+         },
+     );
+ 
+-    it('records both suspend and restore for the same dispute id', async () => {
+-        const { store, deps } = fixture();
+-        await seedTopup(store);
++    it('records both suspend and restore for the same canonical dispute receipt', async () => {
++        const { store, stripe, deps } = fixture();
++        stripe.charge.refunded = false;
++        await processStripeEvent(checkout(false), deps);
++        [...store.outbox.values()][0]!.payload.accountPublicId = 'original-account';
+         expect(await processStripeEvent(dispute(), deps)).toBe('applied');
+         expect(await processStripeEvent(dispute(true), deps)).toBe('applied');
+         expect([...store.grants.values()].map(row => row.kind)).toEqual(['topup', 'suspend', 'restore']);
+@@ -1257,10 +1295,10 @@ describe('v2 webhook grants', () => {
+                 expect(store.writes).toEqual([]);
+                 expect(await processStripeEvent(scenario === 'top-up' ? checkout(false) : paidV2(), deps)).toBe('applied');
+                 const original = [...store.grants.values()][0];
+-                if (scenario === 'top-up' && kind === 'dispute restore') {
++                if (kind === 'dispute restore') {
+                     const before = [...store.writes];
+-                    expect(await processStripeEvent(makeEvent(), deps)).toBe('review:ai_restore_unresolved');
+-                    expect(await processStripeEvent(makeEvent(), deps)).toBe('review:ai_restore_unresolved');
++                    expect(await processStripeEvent(makeEvent(), deps)).toBe('review:restore_refused_terminal');
++                    expect(await processStripeEvent(makeEvent(), deps)).toBe('review:restore_refused_terminal');
+                     expect(store.writes).toEqual(before);
+                     return;
+                 }
+@@ -1271,7 +1309,7 @@ describe('v2 webhook grants', () => {
+                 expect([...store.grants.values()]).toEqual([original, expect.objectContaining({
+                     kind: kind === 'refund' ? 'revoke' : kind === 'dispute' ? 'suspend' : 'restore',
+                     meter: original.meter, subscriptionId: original.subscriptionId,
+-                    amount: kind === 'dispute restore' ? original.amount : -original.amount,
++                    amount: -original.amount,
+                     periodStart: original.periodStart, periodEnd: original.periodEnd,
+                 })]);
+             },
+@@ -1308,6 +1346,12 @@ describe('v2 webhook grants', () => {
+         f.stripe.charge.invoiceId = 'in_local';
+         expect(await processStripeEvent(dispute(restore), f.deps)).toBe('failed:no_grant_for_dispute');
+         await processStripeEvent(paidV2(), f.deps);
++        if (restore) {
++            f.stripe.charge.refunded = false;
++            expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_receipt_missing');
++            expect(f.store.grants.size).toBe(1);
++            return;
++        }
+         expect(await processStripeEvent(dispute(restore), f.deps)).toBe('applied');
+         expect([...f.store.grants.values()][1]).toMatchObject({ kind: restore ? 'restore' : 'suspend',
+             meter: 'compute_std_seconds', subscriptionId: 'sub_local', amount: BigInt(restore ? 216000 : -216000) });
+@@ -1614,8 +1658,8 @@ describe('v3 paid invoice grants', () => {
+         expect(await processStripeEvent(delivery, deps)).toBe('applied');
+         expect([...store.grants.values()].reduce((sum, grant) => sum + grant.amount, BigInt(0))).toBe(BigInt(0));
+         expect(store.outbox.size).toBe(2);
+-        expect(store.outbox.get(`${entitlementId}:revoke`)).toMatchObject({ kind: 'ai_revoke',
+-            payload: { eventId: `${entitlementId}:revoke`, entitlementId, action: 'revoke', credits: sku === 'standard_monthly_v3' ? 4000 : 20000 } });
++        expect(store.outbox.get(`${entitlementId}:revoke:refund:re_v3`)).toMatchObject({ kind: 'ai_revoke',
++            payload: { eventId: `${entitlementId}:revoke:refund:re_v3`, entitlementId, action: 'revoke', credits: sku === 'standard_monthly_v3' ? 4000 : 20000 } });
+         await processStripeEvent({ ...delivery, id: 'evt_refund_replayed' }, deps);
+         expect(store.outbox.size).toBe(2);
+     });
+@@ -1646,12 +1690,12 @@ describe('v3 paid invoice grants', () => {
+         await processStripeEvent({ ...paidV2(), id: 'evt_another' }, f.deps);
+         expect(f.store.grants.size).toBe(1); expect(f.store.outbox.size).toBe(1);
+     });
+-    it('revokes a disputed period once and a won dispute cannot grant an irrevocably revoked entitlement again', async () => {
++    it('keeps a refunded disputed period terminal without local restoration', async () => {
+         const f = v3Fixture(); await processStripeEvent(paidV2(), f.deps);
+         f.stripe.charge.invoiceId = f.stripe.invoice.id;
+         await processStripeEvent(dispute(), f.deps); await processStripeEvent(dispute(), f.deps);
+         expect([...f.store.outbox.values()].map(item => item.payload.action)).toEqual(['grant', 'revoke']);
+-        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:ai_restore_unresolved');
++        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_refused_terminal');
+         expect(f.store.outbox.size).toBe(2);
+     });
+     it('revokes the stored policy and account, even when the subscription and invoice adapter now report Premium', async () => {
+@@ -1714,3 +1758,159 @@ describe('v3 paid invoice grants', () => {
+         expect(f.store.subscriptions.get('sub_local')?.sku).toBe('premium_monthly_v3');
+     });
+ });
++
++describe('W0.3 dispute restore receipts', () => {
++    async function funded(v3 = false) {
++        const f = fixture();
++        f.stripe.charge.refunded = false;
++        if (v3) {
++            f.stripe.subscription.sku = 'standard_monthly_v3';
++            f.stripe.invoice.lines = [{ ...baseLine('standard_monthly_v2'), lookupKey: 'ezil_standard_monthly_v3' }];
++            f.stripe.charge.invoiceId = f.stripe.invoice.id;
++        }
++        expect(await processStripeEvent(v3 ? paidV2() : checkout(false), f.deps)).toBe('applied');
++        const root = [...f.store.outbox.values()][0]!;
++        root.payload.accountPublicId = 'original-payer';
++        return { ...f, root };
++    }
++    const d = (id: string, won = false) => event(won ? 'charge.dispute.closed' : 'charge.dispute.created',
++        { id, charge: 'ch_local', status: 'won' });
++    it.each([false, true])('restores a matching topup/V3 suspend exactly once with a constant root (V3=%s)', async v3 => {
++        const f = await funded(v3);
++        await processStripeEvent(dispute(), f.deps);
++        const before = [...f.store.writes];
++        expect(await Promise.all([processStripeEvent(dispute(true), f.deps), processStripeEvent(dispute(true), f.deps)])).toEqual(['applied', 'applied']);
++        const restored = f.store.outbox.get(`${f.root.payload.entitlementId}:restore:dp_local`)!;
++        expect(restored).toMatchObject({ kind: 'ai_restore', payload: { action: 'restore',
++            entitlementId: f.root.payload.entitlementId, credits: v3 ? 4000 : 1234, accountPublicId: 'original-payer',
++            expiresAt: f.root.payload.expiresAt } });
++        expect(f.store.writes.length - before.length).toBe(2);
++        expect([...f.store.grants.values()].map(g => g.kind)).toEqual([v3 ? 'plan_period' : 'topup', 'suspend', 'restore']);
++        expect([...f.store.grants.values()].reduce((total, g) => total + g.amount, BigInt(0))).toBe([...f.store.grants.values()][0]!.amount);
++        const after = [...f.store.writes];
++        expect(await processStripeEvent({ ...dispute(true), id: 'won_replayed' }, f.deps)).toBe('applied');
++        expect(f.store.writes).toEqual(after);
++    });
++    it('won before created waits without a local positive and can complete after its own suspend', async () => {
++        const f = await funded();
++        const before = [...f.store.writes];
++        expect(await processStripeEvent(dispute(true), f.deps)).toBe('failed:restore_suspend_pending');
++        expect(f.store.writes).toEqual(before);
++        await processStripeEvent(dispute(), f.deps);
++        expect(await processStripeEvent(d('dp_wrong', true), f.deps)).toBe('failed:restore_suspend_pending');
++        expect(await processStripeEvent(dispute(true), f.deps)).toBe('applied');
++    });
++    it.each(['local amount', 'local period', 'suspend missing', 'refund only', 'payer', 'root terms', 'charge', 'root owner'])(
++        'refuses mismatched %s before any positive effect', async defect => {
++            const f = await funded();
++            await processStripeEvent(dispute(), f.deps);
++            const suspended = [...f.store.grants.values()].find(g => g.kind === 'suspend')!;
++            const receipt = [...f.store.outbox.values()].find(r => r.kind === 'ai_revoke')!;
++            if (defect === 'local amount') suspended.amount += BigInt(1);
++            if (defect === 'local period') suspended.periodEnd = now;
++            if (defect === 'suspend missing') f.store.grants.delete(suspended.id);
++            if (defect === 'refund only') suspended.sourceType = 'refund';
++            if (defect === 'payer') receipt.payload.accountPublicId = 'different-payer';
++            if (defect === 'root terms') f.root.payload.credits = 777;
++            if (defect === 'charge') f.stripe.charge.id = 'ch_different';
++            if (defect === 'root owner') receipt.userId = 'other-user';
++            const before = [...f.store.writes];
++            expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_mismatch');
++            expect(f.store.writes).toEqual(before);
++        },
++    );
++    it('waits for the suspended payer to be pinned and never substitutes another account', async () => {
++        const f = await funded();
++        delete f.root.payload.accountPublicId;
++        await processStripeEvent(dispute(), f.deps);
++        const before = [...f.store.writes];
++        expect(await processStripeEvent(dispute(true), f.deps)).toBe('failed:restore_account_pending');
++        expect(f.store.writes).toEqual(before);
++        [...f.store.outbox.values()].find(r => r.kind === 'ai_revoke')!.payload.accountPublicId = 'late-payer';
++        expect(await processStripeEvent(dispute(true), f.deps)).toBe('applied');
++        expect([...f.store.outbox.values()].at(-1)!.payload.accountPublicId).toBe('late-payer');
++    });
++    it('rolls back a local positive when the atomic outbox insert fails, then retries cleanly', async () => {
++        const f = await funded();
++        await processStripeEvent(dispute(), f.deps);
++        const before = [...f.store.writes];
++        vi.spyOn(f.store, 'enqueueOutbox').mockRejectedValueOnce(new Error('transaction interrupted'));
++        await expect(processStripeEvent(dispute(true), f.deps)).rejects.toThrow('transaction interrupted');
++        expect(f.store.writes).toEqual(before);
++        expect([...f.store.grants.values()].some(g => g.kind === 'restore')).toBe(false);
++        expect(await processStripeEvent(dispute(true), f.deps)).toBe('applied');
++    });
++    it('emits a distinct terminal refund after a dispute, on the root and frozen payer', async () => {
++        const f = await funded();
++        await processStripeEvent(dispute(), f.deps);
++        f.stripe.charge.refunded = true;
++        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
++        expect(f.store.outbox.get(`${f.root.payload.entitlementId}:revoke:refund:re_local`)).toMatchObject({
++            kind: 'ai_revoke', payload: { entitlementId: f.root.payload.entitlementId, accountPublicId: 'original-payer' } });
++        // Even a later provider read that omits the refund cannot erase the terminal receipt.
++        f.stripe.charge.refunded = false;
++        const before = [...f.store.writes];
++        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_refused_terminal');
++        expect(f.store.writes).toEqual(before);
++    });
++    it('keeps a legacy root revoke terminal', async () => {
++        const f = await funded();
++        await processStripeEvent(dispute(), f.deps);
++        const { aiCreditRevokeItem } = await import('./ai-credits');
++        await f.store.enqueueOutbox(aiCreditRevokeItem(f.root));
++        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_refused_terminal');
++        expect([...f.store.grants.values()].some(g => g.kind === 'restore')).toBe(false);
++    });
++    it('marks overlapping disputes for review, regardless of which win arrives first', async () => {
++        const f = await funded();
++        await processStripeEvent(d('dp_A'), f.deps);
++        await processStripeEvent(d('dp_B'), f.deps);
++        const before = [...f.store.writes];
++        for (const id of ['dp_A', 'dp_B']) expect(await processStripeEvent(d(id, true), f.deps)).toBe('review:restore_review_required');
++        expect(f.store.writes).toEqual(before);
++    });
++    it('supports successive completed chains without using fractional restored-head values in the body', async () => {
++        const f = await funded();
++        for (const id of ['dp_A', 'dp_B', 'dp_C']) {
++            expect(await processStripeEvent(d(id), f.deps)).toBe('applied');
++            expect(await processStripeEvent(d(id, true), f.deps)).toBe('applied');
++            const r = f.store.outbox.get(`${f.root.payload.entitlementId}:restore:${id}`)!;
++            expect(r.payload).toMatchObject({ credits: 1234, entitlementId: f.root.payload.entitlementId });
++            r.deliveredAt = now;
++            r.payload.delivery = { status: 'done', outcome: 'restored' };
++        }
++        expect(f.store.outbox.size).toBe(7);
++        f.stripe.charge.refunded = true;
++        expect(await processStripeEvent(refund(), f.deps)).toBe('applied');
++        expect([...f.store.outbox.values()].at(-1)!.payload.entitlementId).toBe(f.root.payload.entitlementId);
++    });
++    it('cannot reuse a D suspend from another purchase with the same amount and payer', async () => {
++        const f = await funded();
++        await processStripeEvent(dispute(), f.deps);
++        f.stripe.session.paymentIntentId = 'pi_another';
++        f.stripe.charge.paymentIntentId = 'pi_another';
++        await processStripeEvent(checkout(false), f.deps);
++        [...f.store.outbox.values()].at(-1)!.payload.accountPublicId = 'original-payer';
++        const before = [...f.store.writes];
++        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_mismatch');
++        expect(f.store.writes).toEqual(before);
++    });
++    it('reviews oversize causal IDs before writing even a suspension', async () => {
++        const f = await funded();
++        const before = [...f.store.writes];
++        expect(await processStripeEvent(d('dp_' + 'x'.repeat(200)), f.deps)).toBe('review:invalid_ai_event_id');
++        expect(f.store.writes).toEqual(before);
++    });
++});
++
++describe('legacy restore refusal', () => {
++    it('does not credit legacy dollar-only rows even after a same-D negative entry', async () => {
++        const f = fixture(); f.stripe.charge.refunded = false;
++        await seedTopup(f.store);
++        await processStripeEvent(dispute(), f.deps);
++        const before = [...f.store.writes];
++        expect(await processStripeEvent(dispute(true), f.deps)).toBe('review:restore_receipt_missing');
++        expect(f.store.writes).toEqual(before);
++        expect([...f.store.grants.values()].some(g => g.kind === 'restore')).toBe(false);
++    });
++});
+diff --git a/app/src/server/billing/processor.ts b/app/src/server/billing/processor.ts
+index 41ef9733..9527c9a2 100644
+--- a/app/src/server/billing/processor.ts
++++ b/app/src/server/billing/processor.ts
+@@ -9,7 +9,7 @@ import type { BillingStore, ProcessorDeps, StripeInvoice, StripeSubscription, Us
+ import { planStripeEvent, type BillingAction, type StripeEventLike } from './stripe/events';
+ import { billingOfferBySku as offerBySku, paidBillingOffers, upgradeGrantSeconds } from './v3/catalog';
+ import { CATALOG_V3 } from './v3/contract';
+-import { aiCreditEntitlement, aiCreditOutboxItem, aiCreditRevokeItem, aiTopupOutboxItem, hasAiTopupReceipts } from './ai-credits';
++import { aiCreditEntitlement, aiCreditOutboxItem, aiTopupOutboxItem, hasAiTopupReceipts, hasAiReversals } from './ai-credits';
+ import { CATALOG_V2, GRANT_METER_COMPUTE, PERIOD_GRANT_BILLING_REASONS, UPGRADE_GRANT_BILLING_REASON } from './v2/contract';
+ import { upgradeGrantStdSeconds } from './v2/rating';
+ 
+@@ -296,39 +296,45 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps:
+             if (originals.some(grant => grant.userId !== userId)) return 'review:customer_mismatch';
+             const topupReceipt = charge.invoiceId === null && charge.paymentIntentId !== null && hasAiTopupReceipts(store)
+                 ? await store.aiTopupReceipt(userId, charge.paymentIntentId) : null;
+-            // v1 grants cannot reinstate a revoked entitlement. Leave its receipt intact.
+-            if (topupReceipt && action.type === 'restore') return 'review:ai_restore_unresolved';
+-            if (topupReceipt) await store.enqueueOutbox(aiCreditRevokeItem(topupReceipt));
+-            // Invoice lines retain the sold SKU even after an upgrade/downgrade.
+-            // Reconstructing also repairs a reversal arriving between ledger and outbox writes.
+-            if (action.type !== 'restore' && charge.invoiceId !== null && originals.some(grant => grant.kind === 'plan_period')) {
+-                const receipts = await store.aiCreditGrantsByInvoice?.(userId, charge.invoiceId) ?? [];
+-                for (const receipt of receipts) await store.enqueueOutbox(aiCreditRevokeItem(receipt));
+-                if (receipts.length === 0) {
+-                    const invoice = await stripe.retrieveInvoice(charge.invoiceId);
+-                    if (invoice.customer !== charge.customer) return 'review:customer_mismatch';
+-                    for (const original of originals.filter(grant => grant.kind === 'plan_period')) {
+-                        for (const sku of ['standard_monthly_v3', 'premium_monthly_v3'] as const) {
+-                            const line = invoice.lines.find(line => line.lookupKey === CATALOG_V3[sku].stripeLookupKey
+-                                && (line.subscriptionId === original.subscriptionId || line.subscriptionId === null)
+-                                && line.periodStart?.getTime() === original.periodStart?.getTime()
+-                                && line.periodEnd?.getTime() === original.periodEnd?.getTime());
+-                            if (line && original.subscriptionId && original.periodStart && original.periodEnd) {
+-                                await store.enqueueOutbox(aiCreditOutboxItem(userId, aiCreditEntitlement({
+-                                    userId, sku, subscriptionId: original.subscriptionId, periodStart: original.periodStart,
+-                                    periodEnd: original.periodEnd, invoiceId: invoice.id,
+-                                }), 'revoke', invoice.id));
+-                            }
++            const receipts = topupReceipt ? [topupReceipt]
++                : charge.invoiceId !== null ? await store.aiCreditGrantsByInvoice?.(userId, charge.invoiceId) ?? [] : [];
++            // A missing subscription outbox receipt can be reconstructed only for a reversal,
++            // from the sold line and immutable local grant. Never reconstruct restore evidence.
++            if (receipts.length === 0 && action.type !== 'restore' && charge.invoiceId !== null
++                && originals.some(grant => grant.kind === 'plan_period')) {
++                const invoice = await stripe.retrieveInvoice(charge.invoiceId);
++                if (invoice.customer !== charge.customer) return 'review:customer_mismatch';
++                for (const original of originals.filter(grant => grant.kind === 'plan_period')) {
++                    for (const sku of ['standard_monthly_v3', 'premium_monthly_v3'] as const) {
++                        const line = invoice.lines.find(line => line.lookupKey === CATALOG_V3[sku].stripeLookupKey
++                            && (line.subscriptionId === original.subscriptionId || line.subscriptionId === null)
++                            && line.periodStart?.getTime() === original.periodStart?.getTime()
++                            && line.periodEnd?.getTime() === original.periodEnd?.getTime());
++                        if (line && original.subscriptionId && original.periodStart && original.periodEnd) {
++                            receipts.push(aiCreditOutboxItem(userId, aiCreditEntitlement({
++                                userId, sku, subscriptionId: original.subscriptionId, periodStart: original.periodStart,
++                                periodEnd: original.periodEnd, invoiceId: invoice.id,
++                            }), 'grant', invoice.id));
+                         }
+                     }
+                 }
+             }
++            if (action.type === 'restore' && charge.refunded) return 'review:restore_refused_terminal';
++            if (receipts.length > 0) {
++                if (!hasAiReversals(store)) return 'failed:ai_reversal_receipts_unavailable';
++                return store.recordAiReversal({ action: action.type,
++                    causeId: action.type === 'revoke' ? action.refundId : action.disputeId,
++                    chargeId: charge.id, customerId: charge.customer, userId, originals, receipts });
++            }
++            // Legacy monetary rows have no canonical dispute/payer receipt. They cannot
++            // justify a positive correction or a replay of a v1 grant as a restore.
++            if (action.type === 'restore') return 'review:restore_receipt_missing';
+             const sourceType = action.type === 'revoke' ? 'refund' : 'dispute';
+             const sourceId = action.type === 'revoke' ? action.refundId : action.disputeId;
+             for (const original of originals) {
+                 await store.insertGrant({
+                     userId, subscriptionId: original.subscriptionId, meter: original.meter, kind: action.type,
+-                    amount: action.type === 'restore' ? original.amount : -original.amount,
++                    amount: -original.amount,
+                     periodStart: original.periodStart, periodEnd: original.periodEnd,
+                     sourceType, sourceId,
+                 });
+@@ -341,7 +347,7 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps:
+                 const amount = aiOriginal.meter === 'ai_usd_micro' ? aiOriginal.amount : PRO_PLAN.aiIncludedMicro;
+                 await store.enqueueOutbox({
+                     eventKey: `${sourceType}:${sourceId}:ai_${action.type}`,
+-                    userId, kind: action.type === 'restore' ? 'ai_grant' : 'ai_revoke',
++                    userId, kind: 'ai_revoke',
+                     payload: {
+                         amountUsdMicro: amount.toString(),
+                         bucket: aiOriginal.kind === 'pro_period' ? 'included' : 'purchased',
+@@ -352,11 +358,6 @@ async function applyAction(action: BillingAction, event: StripeEventLike, deps:
+                     },
+                 });
+             }
+-            if (action.type === 'restore' && charge.invoiceId !== null
+-                && (await store.aiCreditGrantsByInvoice?.(userId, charge.invoiceId) ?? []).length > 0) {
+-                // UNRESOLVED: V3 compute restoration above does not restore Gateway AI credits.
+-                return 'review:ai_restore_unresolved';
+-            }
+             return 'applied';
+         }
+     }
+diff --git a/app/src/server/billing/store.test.ts b/app/src/server/billing/store.test.ts
+index 1dca863c..c7a76703 100644
+--- a/app/src/server/billing/store.test.ts
++++ b/app/src/server/billing/store.test.ts
+@@ -16,6 +16,11 @@ import {
+ } from '@/server/db/schema';
+ import type { BillingStore, GrantInsert, SubscriptionUpsert } from './ports';
+ import { createBillingStore } from './store';
++import { PgDialect } from 'drizzle-orm/pg-core';
++import { aiTopupOutboxItem, hasAiReversals, planAiReversal } from './ai-credits';
++import { AI_PACKS } from './catalog';
++import { billingGrants } from '@/server/db/schema/billing';
++import type { GrantRow } from './ports';
+ 
+ type Database = typeof import('@/server/db').db;
+ const instant = (seconds: number) => new Date(Date.UTC(2026, 0, 1) + seconds * 1000);
+@@ -344,3 +349,59 @@ describe.skipIf(!process.env.BILLING_TEST_DATABASE_URL)('createBillingStore', ()
+         expect(history).toEqual(expect.arrayContaining([expect.objectContaining({ ...newest, source: 'storage' })]));
+     });
+ });
++
++
++describe('atomic canonical restore store without a database connection', () => {
++    function fixture() {
++        const original: GrantRow = { id: 'original', userId: 'user', subscriptionId: null, meter: 'ai_usd_micro', kind: 'topup',
++            amount: BigInt(10_000_000), sourceType: 'payment_intent', sourceId: 'pi_test',
++            periodStart: instant(0), periodEnd: instant(100), createdAt: instant(0) };
++        const root = aiTopupOutboxItem('user', { ...AI_PACKS[0]!, aiCredits: 1234 }, 'pi_test', original.periodEnd!)!;
++        root.payload.accountPublicId = 'payer';
++        const input = { action: 'restore' as const, userId: 'user', customerId: 'cus_test', chargeId: 'ch_test',
++            causeId: 'dp_test', originals: [original], receipts: [root] };
++        const suspend = planAiReversal({ ...input, action: 'suspend' }, { originals: [original], corrections: [], receipts: [root] });
++        const negative: GrantRow = { ...suspend.grants[0]!, subscriptionId: null, id: 'suspend', createdAt: instant(1) };
++        const selects: unknown[][] = [[{ userId: 'user' }], [original], [negative], [root, ...suspend.outbox]];
++        const applied: { table: unknown; value: unknown }[] = [];
++        const execute = vi.fn().mockResolvedValue([]);
++        const insert = vi.fn((table: unknown) => ({ values: (value: unknown) => ({ onConflictDoNothing: () => ({
++            returning: async () => { applied.push({ table, value }); return [{ id: 'inserted' }]; },
++        }) }) }));
++        const tx = { execute, select: () => ({ from: () => ({ where: async () => selects.shift() ?? [] }) }), insert };
++        const transaction = vi.fn(async (run: (tx: unknown) => Promise<unknown>) => {
++            const count = applied.length;
++            try { return await run(tx); } catch (error) { applied.splice(count); throw error; }
++        });
++        const db = { transaction, insert: vi.fn(() => { throw new Error('must use transaction'); }) } as unknown as Database;
++        const store = createBillingStore(db);
++        if (!hasAiReversals(store)) throw new Error('missing restore port');
++        return { input, store, selects, applied, transaction, execute, insert, db };
++    }
++    it('locks the dispute then root, revalidates in the transaction and inserts both effects there', async () => {
++        const f = fixture();
++        expect(await f.store.recordAiReversal(f.input)).toBe('applied');
++        expect(f.transaction).toHaveBeenCalledTimes(1);
++        expect(f.db.insert).not.toHaveBeenCalled();
++        const locks = f.execute.mock.calls.map(([query]) => new PgDialect().sqlToQuery(query));
++        expect(locks.map(q => q.params[0])).toEqual(['billing:ai_cause:dispute:dp_test', `billing:ai_root:${f.input.receipts[0]!.payload.entitlementId}`]);
++        expect(locks.every(q => q.sql.includes('pg_advisory_xact_lock'))).toBe(true);
++        expect(f.applied.map(a => a.table)).toEqual([billingGrants, billingOutbox]);
++        expect(f.applied[0]!.value).toMatchObject({ kind: 'restore', sourceId: 'dp_test', amount: BigInt(10_000_000) });
++        expect(f.applied[1]!.value).toMatchObject({ kind: 'ai_restore' });
++    });
++    it('rolls back when the outbox key conflicts after the local insert', async () => {
++        const f = fixture();
++        f.insert.mockImplementationOnce(table => ({ values: value => ({ onConflictDoNothing: () => ({
++            returning: async () => { f.applied.push({ table, value }); return [{ id: 'local' }]; },
++        }) }) })).mockImplementationOnce(() => ({ values: () => ({ onConflictDoNothing: () => ({ returning: async () => [] }) }) }));
++        await expect(f.store.recordAiReversal(f.input)).rejects.toThrow('ai_reversal_receipt_conflict');
++        expect(f.applied).toEqual([]);
++    });
++    it.each(['owner', 'suspend'])('performs no insert when the fresh %s check fails', async defect => {
++        const f = fixture();
++        f.selects[defect === 'owner' ? 0 : 2] = [];
++        expect(await f.store.recordAiReversal(f.input)).toBe(defect === 'owner' ? 'review:customer_mismatch' : 'review:restore_mismatch');
++        expect(f.insert).not.toHaveBeenCalled();
++    });
++});
+diff --git a/app/src/server/billing/store.ts b/app/src/server/billing/store.ts
+index f0b507ba..296f57e0 100644
+--- a/app/src/server/billing/store.ts
++++ b/app/src/server/billing/store.ts
+@@ -18,10 +18,10 @@ import {
+     billingUsageIntervals,
+ } from '@/server/db/schema/billing';
+ import { computers } from '@/server/db/schema/computers';
+-import type { BillingStore, GrantKind, GrantMeter, GrantSource, StoredComputeEpoch } from './ports';
++import type { BillingStore, GrantKind, GrantMeter, GrantSource, GrantRow, OutboxInsert, StoredComputeEpoch } from './ports';
+ import { SESSION_MAX_SECONDS, SIZES } from './v2/contract';
+ import { epochSeconds, isoSeconds } from './v2/time';
+-import { AI_CREDIT_PROTOCOL, type AiTopupReceiptStore } from './ai-credits';
++import { AI_CREDIT_PROTOCOL, planAiReversal, type AiReversalStore, type AiTopupReceiptStore } from './ai-credits';
+ 
+ type Database = typeof import('@/server/db').db;
+ 
+@@ -49,7 +49,7 @@ function computeEpoch(row: BillingComputeEpochRow): StoredComputeEpoch {
+  * SQL so concurrent deliveries obey the same rules as sequential retries.
+  */
+ export function createBillingStore(db: Database): BillingStore {
+-    const store: BillingStore & AiTopupReceiptStore = {
++    const store: BillingStore & AiTopupReceiptStore & AiReversalStore = {
+         async grantsForPeriod(userId, window, meters) {
+             if (meters.length === 0) return [];
+             const rows = await db.select().from(billingGrants).where(and(
+@@ -532,6 +532,46 @@ export function createBillingStore(db: Database): BillingStore {
+             });
+         },
+ 
++        async recordAiReversal(input) {
++            return db.transaction(async tx => {
++                const causeType = input.action === 'revoke' ? 'refund' : 'dispute';
++                await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`billing:ai_cause:${causeType}:${input.causeId}`}, 0))`);
++                const roots = [...new Set(input.receipts.map(r => String(r.payload.entitlementId)))].sort();
++                for (const root of roots) {
++                    await tx.execute(sql`select pg_advisory_xact_lock(hashtextextended(${`billing:ai_root:${root}`}, 0))`);
++                }
++                const [owner] = await tx.select().from(billingCustomers).where(eq(billingCustomers.stripeCustomerId, input.customerId));
++                if (owner?.userId !== input.userId) return 'review:customer_mismatch';
++                const original = input.originals[0];
++                if (!original || roots.length === 0) return 'review:restore_receipt_missing';
++                const originals = await tx.select().from(billingGrants).where(and(
++                    eq(billingGrants.sourceType, original.sourceType), eq(billingGrants.sourceId, original.sourceId),
++                ));
++                const corrections = await tx.select().from(billingGrants).where(and(
++                    eq(billingGrants.sourceType, causeType), eq(billingGrants.sourceId, input.causeId),
++                ));
++                // No user predicate: a conflicting owner/root/D must be seen and refused.
++                const receipts = await tx.select().from(billingOutbox).where(and(
++                    sql`${billingOutbox.payload}->>'protocol' = ${AI_CREDIT_PROTOCOL}`,
++                    or(sql`${billingOutbox.payload}->>'entitlementId' in (${sql.join(roots.map(root => sql`${root}`), sql`, `)})`,
++                        and(sql`${billingOutbox.payload}->'reversal'->>'causeType' = ${causeType}`,
++                            sql`${billingOutbox.payload}->'reversal'->>'causeId' = ${input.causeId}`)),
++                ));
++                const plan = planAiReversal(input, { originals: originals as GrantRow[], corrections: corrections as GrantRow[],
++                    receipts: receipts.map(r => ({ ...r, kind: r.kind as OutboxInsert['kind'], payload: r.payload as Record<string, unknown> })) });
++                if (plan.outcome !== 'applied') return plan.outcome;
++                for (const grant of plan.grants) {
++                    const inserted = await tx.insert(billingGrants).values(grant).onConflictDoNothing().returning({ id: billingGrants.id });
++                    if (inserted.length !== 1) throw new Error('ai_reversal_receipt_conflict');
++                }
++                for (const item of plan.outbox) {
++                    const inserted = await tx.insert(billingOutbox).values(item).onConflictDoNothing().returning({ id: billingOutbox.id });
++                    if (inserted.length !== 1) throw new Error('ai_reversal_receipt_conflict');
++                }
++                return 'applied';
++            });
++        },
++
+         async latestIntervalFor(computerId) {
+             const [row] = await db.select({ endedAt: billingUsageIntervals.endedAt })
+                 .from(billingUsageIntervals).where(eq(billingUsageIntervals.computerId, computerId))
