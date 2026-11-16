@@ -67,7 +67,7 @@ function os_family () {
 /** @returns {object} Matches diagnosticsSchema; absent information is omitted. */
 export function build_diagnostics (appContext) {
     const result = {};
-    const trace = feedbackTraceSnapshot();
+    const trace = feedbackTraceSnapshot(appContext?.traceId);
     const captured = Date.now();
     const expanded = globalThis.window?.__EZIL_BOOT__?.desktopState?.ui?.feedbackReportBundle === true;
     if (expanded) {

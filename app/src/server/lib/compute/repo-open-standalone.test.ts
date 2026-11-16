@@ -39,7 +39,7 @@ describe('standalone OS to Worker transport', () => {
         const fetcher = vi.fn(async () => Response.json({ ok: true, folder: `/workspace/projects/${CHECKOUT}` }));
         const deps = { fetch: fetcher as unknown as typeof fetch };
         expect(await requestRepoOpen('https://worker.example', 'secret', cloudflare, computer,
-            { ...request, canonicalURL: 'https://github.ezil.work/default/other.git' }, deps)).toEqual({ ok: false, errorCode: 'repo_open_failed' });
+            { ...request, canonicalURL: 'https://github.ezil.work/default/other.git' }, deps)).toMatchObject({ ok: false, errorCode: 'repo_open_failed' });
         expect(await requestRepoOpen('https://worker.example', 'secret', aws, computer, request, deps)).toEqual({ ok: false, errorCode: 'repo_open_unsupported_provider' });
         expect(fetcher).not.toHaveBeenCalled();
         expect(JSON.stringify(warn.mock.calls)).not.toContain(TOKEN);

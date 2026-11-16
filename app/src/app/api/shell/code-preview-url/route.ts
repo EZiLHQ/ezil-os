@@ -1,4 +1,5 @@
 import { TRPCError } from '@trpc/server';
+import { repoOpenFailureResponse } from '@/server/feedback/repo-open-failure';
 
 import { appRouter } from '@/server/api/root';
 import { createTRPCContext } from '@/server/api/trpc';
@@ -222,7 +223,7 @@ async function openProject(ctx: ProjectCtx, caller: ShellCaller, request: {
         }, { correlationId: newCorrelationId(), signal: deadline });
     if (!opened.ok) {
         if (opened.errorCode === 'repo_open_unsupported_provider') return unsupportedProvider();
-        return shellRefusal(502, 'repo_open_failed', "This project's files could not be opened. Try again.");
+        return repoOpenFailureResponse(ctx.db, ctx.user.id, computerId, opened, "This project's files could not be opened. Try again.");
     }
 
     const url = withRepositoryFolder(preview.codePreviewUrl, opened.folder);
@@ -358,7 +359,7 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
             revalidateTarget: () => target(ctx, computerId) });
     if (!opened.ok) {
         if (opened.errorCode === 'repo_open_unsupported_provider') return unsupportedProvider();
-        return shellRefusal(502, 'repo_open_failed', "This repository's files could not be opened. Try again.");
+        return repoOpenFailureResponse(ctx.db, ctx.user.id, computerId, opened, "This repository's files could not be opened. Try again.");
     }
     const url = withRepositoryFolder(preview.codePreviewUrl, opened.folder);
     return shellJson({ ...preview, codePreviewUrl: url, url, repository: { name: parsed.displayName, id: repositoryId } });

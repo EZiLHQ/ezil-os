@@ -109,9 +109,12 @@ export function newEventId () {
  * being what `ambientCorrelationId()` returns while a nested one is open. */
 let ambientTrace = null;
 let latestTrace = null;
+// Keep a bounded set of window traces: opening Settings must not replace Code's failure in its feedback.
+const feedbackTraces = new Map();
+const MAX_FEEDBACK_TRACES = 32;
 /** Detached, read-only phases of the current or most recent app open. */
-export function feedbackTraceSnapshot () {
-    const trace = ambientTrace || latestTrace;
+export function feedbackTraceSnapshot (traceId) {
+    const trace = traceId === undefined ? ambientTrace || latestTrace : feedbackTraces.get(traceId);
     if (!trace) return null;
     const apps = ['secure-browser', 'desktop', 'code', 'app-store', 'settings', 'preview'];
     return { id: trace.id, ...(apps.includes(trace.name) ? { app: trace.name } : {}), phases: trace.snapshot() };
@@ -175,6 +178,8 @@ export function beginTrace (name) {
 
     ambientTrace = trace;
     latestTrace = trace;
+    feedbackTraces.set(id, trace);
+    if (feedbackTraces.size > MAX_FEEDBACK_TRACES) feedbackTraces.delete(feedbackTraces.keys().next().value);
     return trace;
 }
 

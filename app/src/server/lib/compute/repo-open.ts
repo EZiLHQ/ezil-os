@@ -22,6 +22,7 @@ import type { ComputerRef } from './provider';
 import { deriveGuacamoleSandboxId } from '../cloudflare-guacamole-provider';
 import type { PrivateGitPacket } from '@/server/git/private-packet';
 import { isGitAuthor, type GitAuthor } from '@/server/git/author';
+import { isCorrelationId } from '@/server/feedback/failure-shapes';
 
 export interface RepoOpenRequest {
     repositoryId: string;
@@ -44,9 +45,31 @@ export interface RepoOpenRequest {
 
 export type RepoOpenResult =
     | { ok: true; folder: string; head?: string }
-    | { ok: false; errorCode: 'repo_open_unsupported_provider' | 'repo_open_failed' };
+    | { ok: false; errorCode: 'repo_open_unsupported_provider' | 'repo_open_failed';
+        refusalReason?: string; correlationId?: string; httpStatus?: number };
 
-const LOG_CODE = /^[a-z0-9_]{1,64}$/;
+// Mirrors Worker/host's closed diagnosticReason extension; never accept a free-form message.
+const HOST_DIAGNOSTIC_REASONS = new Set([
+    'bootstrap_unavailable', 'supervisor_unavailable', 'workspace_unavailable', 'workspace_not_ready', 'folder_conflict', 'checkout_busy',
+    'invalid_request', 'repository_not_authorized', 'ref_mismatch', 'clone_failed', 'cleanup_unconfirmed',
+    'token_expired', 'runtime_not_running', 'invalid_result', 'admission_rejected', 'admission_invalid',
+    'admission_stopping', 'status_unavailable', 'status_invalid', 'transport_unavailable', 'budget_exhausted',
+]);
+// Provider bodies are untrusted. A regex-shaped arbitrary string can still be a token or an id.
+const FAILURE_CODES = new Set([
+    'hmac_secret_not_configured', 'timeout_out_of_range', 'author_invalid', 'refresh_invalid', 'packet_mismatch',
+    'aws_target_invalid', 'aws_result_invalid', 'invalid_folder', 'timeout', 'aborted', 'transport',
+    'repo_open_failed', 'repo_open_timeout', 'repo_open_git_missing', 'repo_open_token_expired',
+    'repo_open_invalid_request', 'runtime_not_running', 'aws_origin_unavailable', 'unauthorized',
+    'hmac_invalid', 'hmac_expired', 'hmac_signature_mismatch',
+]);
+/** Rechecked at the response/persistence boundary; never accepts arbitrary provider text. */
+export function isRepoOpenFailureReason(value: unknown): value is string {
+    if (typeof value !== 'string') return false;
+    const match = /^repo_open:(transport|worker_http_[1-5][0-9]{2}):([a-z_]+)$/.exec(value);
+    return !!match && (match[2] === 'other' || FAILURE_CODES.has(match[2]!) || HOST_DIAGNOSTIC_REASONS.has(match[2]!));
+}
+
 const RESPONSE_MAX_BYTES = 16_384;
 /** The Worker's own bounds for `timeoutMs` (`worker/src/repo-open.ts`): it refuses anything outside them. */
 export const REPO_OPEN_MIN_TIMEOUT_MS = 20_000;
@@ -79,11 +102,15 @@ export async function requestRepoOpen(
 ): Promise<RepoOpenResult> {
     const aws = target.auth.kind === 'v2' && target.auth.claims.provider === 'aws-ec2';
     if (aws && (!deps.awsStandaloneEnabled || !request.privatePacket)) return { ok: false, errorCode: 'repo_open_unsupported_provider' };
-    const failed = (status: number | null, code: unknown) => {
-        console.warn('[repo-open] worker refused', {
-            correlationId: deps.correlationId ?? null, status, error: typeof code === 'string' && LOG_CODE.test(code) ? code : 'other',
-        });
-        return { ok: false as const, errorCode: 'repo_open_failed' as const };
+    const failed = (status: number | null, code: unknown, diagnosticReason?: unknown) => {
+        const error = typeof diagnosticReason === 'string' && HOST_DIAGNOSTIC_REASONS.has(diagnosticReason) ? diagnosticReason
+            : typeof code === 'string' && FAILURE_CODES.has(code) ? code : 'other';
+        const correlationId = isCorrelationId(deps.correlationId) ? deps.correlationId : undefined;
+        const httpStatus = status !== null && Number.isInteger(status) && status >= 100 && status <= 599 ? status : undefined;
+        const refusalReason = `repo_open:${httpStatus ? `worker_http_${httpStatus}` : 'transport'}:${error}`;
+        console.warn('[repo-open] worker refused', { correlationId: correlationId ?? null, status: httpStatus ?? null, error });
+        return { ok: false as const, errorCode: 'repo_open_failed' as const, refusalReason,
+            ...(correlationId ? { correlationId } : {}), ...(httpStatus ? { httpStatus } : {}) };
     };
     if (!hmacSecret.trim()) return failed(null, 'hmac_secret_not_configured');
     if (!Number.isInteger(request.timeoutMs) || request.timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS || request.timeoutMs > REPO_OPEN_MAX_TIMEOUT_MS) {
@@ -140,11 +167,11 @@ export async function requestRepoOpen(
                 ...(deps.correlationId ? { [CORRELATION_HEADER]: deps.correlationId } : {}) },
         });
         const text = await response.text();
-        let value: { ok?: unknown; folder?: unknown; head?: unknown; status?: unknown; error?: unknown; errorCode?: unknown } = {};
+        let value: { ok?: unknown; folder?: unknown; head?: unknown; status?: unknown; error?: unknown; errorCode?: unknown; diagnosticReason?: unknown } = {};
         try { if (text.length <= RESPONSE_MAX_BYTES) value = JSON.parse(text) ?? {}; } catch { /* not JSON: refused below */ }
         const code = value.errorCode ?? value.error;
         if (code === 'repo_open_unsupported_provider') return { ok: false, errorCode: 'repo_open_unsupported_provider' };
-        if (!response.ok || value.ok === false) return failed(response.status, code);
+        if (!response.ok || value.ok === false) return failed(response.status, code, value.diagnosticReason);
         if (aws && (Object.keys(value).sort().join(',') !== 'folder,ok,status' || value.ok !== true
             || (value.status !== 'cloned' && value.status !== 'fetched'))) return failed(response.status, 'aws_result_invalid');
         if (aws && (activeSignal.aborted || !(await current()) || activeSignal.aborted || Date.parse(request.privatePacket!.git.expiresAt) <= now() + 5000

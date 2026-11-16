@@ -138,7 +138,7 @@ import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../
 // refusal show "Sign in again" instead of leaving again, so it cannot loop;
 // that panel's Try again clears it. With no project, nothing here changes.
 
-import session, { DESKTOP_BOOT_TIMEOUT_MS } from '../session.js';
+import session, { DESKTOP_BOOT_TIMEOUT_MS, serverFailureOf } from '../session.js';
 import telemetry from '../telemetry.js';
 import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-heartbeat.js';
 import { watchRuntimeOnReturn } from '../runtime-recheck.js';
@@ -508,7 +508,7 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = nul
     // Lane O2: a refused project open, as an HTTP error or an `ok:false` answer. Read first, so a 403/409 refusal is
     // never flattened into `unknown`.
     const refusal = project ? projectRefusalOf(data) : null;
-    if ( refusal ) return { ok: false, errorCode: refusal };
+    if ( refusal ) return { ok: false, errorCode: refusal, ...serverFailureOf(data) };
 
     if ( ! res.ok ) {
         const code = data?.error?.code;
@@ -650,7 +650,7 @@ export async function openCodeWindow (ctx = {}) {
     const el_body = el_window.querySelector('.window-body');
     const el_iframe = el_window.querySelector('.window-app-iframe');
     // Trusted shell-only context for a future app Report problem entry; never read from a message.
-    const appContext = Object.freeze({ computerId: computer.id, appSession: crypto.randomUUID() });
+    const appContext = Object.freeze({ computerId: computer.id, appSession: crypto.randomUUID(), traceId: trace.id });
     el_window.ezilFeedbackAppContext = appContext;
     let unregister_app_failures = () => {};
     let trace_registration = { dispose() {}, bindNonce() {} };
@@ -1033,7 +1033,8 @@ export async function openCodeWindow (ctx = {}) {
                     return;
                 }
                 console.warn(`[${PHASE}] the project could not be opened: ${res.errorCode}`);
-                telemetry.capture({ eventClass: 'api_failure', site: 'ezil-os:apps/code#project', code: res.errorCode });
+                telemetry.capture({ eventClass: 'api_failure', site: 'ezil-os:apps/code#project', code: res.errorCode,
+                    reason: res.reason, serverCorrelationId: res.serverCorrelationId });
                 progress.render({
                     ...computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: res.errorCode }),
                     copy: PROJECT_FAILURE_COPY[res.errorCode],
