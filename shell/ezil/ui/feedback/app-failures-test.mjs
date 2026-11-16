@@ -458,7 +458,8 @@ try {
             },
         };
         const doubles = {
-            '../session.js': `export const DESKTOP_BOOT_TIMEOUT_MS = 60000; export default {
+            '../session.js': `export { serverFailureOf } from ${JSON.stringify(new URL('../../session.js', import.meta.url).href)};
+                export const DESKTOP_BOOT_TIMEOUT_MS = 60000; export default {
                 cancellableWake: () => globalThis.__codeFailureTest.mint(), observeFrame: () => new Promise(() => {}),
                 desktopRunning: async () => true, reportActivity() {}, payload: () => ({}) };`,
             '../native-runtime.js': 'export const selectRuntimeAdapter = () => null, watchNativeSurface = () => () => {}, editorFailureCopy = () => ({});',

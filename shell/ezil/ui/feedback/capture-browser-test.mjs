@@ -44,7 +44,8 @@ const PAGE = `<!doctype html><html><head><meta charset="utf-8"></head>
       </div>
     </div>
   </div>
-  <script>document.getElementById('scroller').scrollTop = 60;</script>
+  <dialog class="ezil-feedback-dialog" style="width:500px;height:400px;border:0;background:#ff0000;color:#ff0000">FEEDBACK_PRIVATE_TEXT</dialog>
+  <script>document.getElementById('scroller').scrollTop = 60; document.querySelector('dialog').showModal();</script>
 </body></html>`;
 
 const types = { '.js': 'text/javascript', '.mjs': 'text/javascript', '.html': 'text/html' };
@@ -84,7 +85,7 @@ try {
     const near = (actual, expected, label) => assert.ok(actual.every((v, i) => Math.abs(v - expected[i]) <= 24), `${label}: got rgb(${actual}), want about rgb(${expected})`);
 
     near(result.overlay, [0, 255, 0], 'the needs_operator overlay above the frame is visible');
-    checks++; console.log('PASS a shell overlay stacked above an embedded frame survives the capture');
+    checks++; console.log('PASS the visible error overlay survives while the open feedback dialog and its backdrop are excluded');
     near(result.frame, [128, 128, 128], 'the uncovered frame area is the grey mask');
     near(result.windowEdge, [255, 255, 0], 'the window around the frame is not covered by its mask');
     near(result.page, [0, 0, 255], 'the page outside the window is untouched');

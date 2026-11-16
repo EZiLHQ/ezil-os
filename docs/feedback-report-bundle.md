@@ -100,3 +100,13 @@ Signed-in staging acceptance: submit a non-sensitive image with diagnostics, ver
 screenshotAccepted and authorized readback, update status and refresh the reporter,
 then delete and check attachment removal. Verify consent-off and non-admin refusal
 on that deployed build. Local checks do not establish deployed behavior.
+
+### Repository-opening failures
+
+The app returns the existing plain repository failure message with a server request ID and a closed diagnostic reason. Code keeps that metadata in the local feedback event mirror; a consented report stores it through the existing `recentEvents.reason` and `correlationId` fields. The user-facing error copy stays unchanged.
+
+The app also schedules a bounded failure event through the existing telemetry writer after responding. It uses the existing rate and row-count guards, user hash, schema and retention. No new table or migration is required. A database or scheduling failure cannot change the repository response. The event's request ID joins it to feedback after an app restart or container log rotation.
+
+Reasons contain only a known transport/HTTP stage and a closed Worker/host code. An optional host `diagnosticReason` narrows bootstrap, checkout, layout and cleanup failures. Older hosts still produce a generic reason; arbitrary provider text, exceptions, credentials, repository URLs and author values are excluded.
+
+Feedback opened for a Code window uses that window's trace ID. Opening Settings afterward cannot replace the failed Code trace. The browser retains at most32 window traces; an unavailable explicit trace is omitted rather than replaced with another app's successful trace.

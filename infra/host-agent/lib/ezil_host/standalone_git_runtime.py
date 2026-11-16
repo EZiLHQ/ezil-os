@@ -7,7 +7,7 @@ import subprocess
 import time
 
 from . import desktop
-from .standalone_git import MIN_MS, host_ready, valid_request, validate_output
+from .standalone_git import MIN_MS, failure, host_ready, valid_request, validate_output
 from . import lease as leasemod
 
 ASSETS = Path(__file__).with_name("standalone_git_assets")
@@ -59,23 +59,23 @@ def execute(cfg, lease, req, ready=host_ready, clock=time.monotonic, wall=time.t
     """One monotonic budget covers public bootstrap, private open and kill grace."""
     end = clock() + req["timeoutMs"] / 1000
     if not ready(cfg, lease):
-        return {"ok": False, "error": "runtime_not_running"}, False
+        return failure("runtime_not_running", "runtime_not_running"), False
     try:
         pin, command = runtime_command()
         stage = desktop.exec_(cfg, command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                               stderr=subprocess.DEVNULL, timeout=min(20, end - clock()))
         if stage.returncode or stage.stdout.strip() != b"ezil-cli-bootstrap:ok":
-            return {"ok": False, "error": "repo_open_git_missing"}, False
+            return failure("repo_open_git_missing", "bootstrap_unavailable"), False
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
         # This command has no grant or checkout and cannot leave a Git writer.
-        return {"ok": False, "error": "repo_open_git_missing"}, False
+        return failure("repo_open_git_missing", "bootstrap_unavailable"), False
     remaining = int((end - clock()) * 1000) - 5000
     if remaining < MIN_MS:
-        return {"ok": False, "error": "repo_open_timeout"}, False
+        return failure("repo_open_timeout", "budget_exhausted"), False
     if not valid_request({**req, "timeoutMs": remaining}, wall() * 1000):
-        return {"ok": False, "error": "repo_open_token_expired"}, False
+        return failure("repo_open_token_expired", "token_expired"), False
     if not ready(cfg, lease):
-        return {"ok": False, "error": "runtime_not_running"}, False
+        return failure("runtime_not_running", "runtime_not_running"), False
     args = ["/usr/bin/python3", "-I", "-c", FD_ADAPTER, str(remaining - 3500), "3000", "--repo-refresh" if req.get("refreshOnly") else "--repo-open",
             "/workspace", req["repositoryId"], req["privatePacket"]["repository"]["canonicalURL"], "0",
             pin["cliSha256"], pin["version"]]
@@ -86,17 +86,21 @@ def execute(cfg, lease, req, ready=host_ready, clock=time.monotonic, wall=time.t
                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=max(1, end - clock()))
     except (OSError, subprocess.SubprocessError):
         # Killing runc's launcher alone does not prove in-container cleanup.
-        return {"ok": False, "error": "repo_open_timeout"}, True
+        return failure("repo_open_timeout", "cleanup_unconfirmed"), True
     if result.returncode == 0:
         answer = validate_output(result.stdout, req)
         if answer is not None:
             return answer, False
         # Reviewed supervisor preflight/migration refusals start no outstanding Git writer.
-        closed = {b"ezil-repo-open:error:" + code + b"\n" for code in (
-            b"repo_open_invalid_request", b"repo_open_workspace_unavailable", b"repo_open_workspace_not_ready",
-            b"repo_open_folder_conflict", b"repo_open_git_missing", b"repo_open_busy")}
+        reasons = {
+            "repo_open_invalid_request": "invalid_request", "repo_open_workspace_unavailable": "workspace_unavailable",
+            "repo_open_workspace_not_ready": "workspace_not_ready", "repo_open_folder_conflict": "folder_conflict",
+            "repo_open_git_missing": "bootstrap_unavailable", "repo_open_busy": "checkout_busy",
+        }
+        closed = {(b"ezil-repo-open:error:" + code.encode() + b"\n"): reason for code, reason in reasons.items()}
         if result.stdout in closed:
-            return {"ok": False, "error": "repo_open_git_missing" if b"repo_open_git_missing" in result.stdout else "repo_open_failed"}, False
+            return failure("repo_open_git_missing" if b"repo_open_git_missing" in result.stdout else "repo_open_failed",
+                           closed[result.stdout]), False
     # The reviewed supervisor emits 126 for unconfirmed child cleanup. A normal
     # CLI refusal with a closed error object is completed, without deleting any
     # existing checkout or foreign lock. Only fixed codes leave this process.
@@ -108,7 +112,15 @@ def execute(cfg, lease, req, ready=host_ready, clock=time.monotonic, wall=time.t
                     and isinstance(err["message"], str) and err["code"] in {
                         "invalid-repository", "invalid-arguments", "invalid-directory", "repository-not-authorized",
                         "destination-conflict", "destination-busy", "repository-ref-mismatch", "clone-failed"}):
-                return {"ok": False, "error": "repo_open_failed"}, False
+                reason = {"invalid-repository": "invalid_request", "invalid-arguments": "invalid_request",
+                          "invalid-directory": "workspace_unavailable", "repository-not-authorized": "repository_not_authorized",
+                          "destination-conflict": "folder_conflict", "destination-busy": "checkout_busy",
+                          "repository-ref-mismatch": "ref_mismatch", "clone-failed": "clone_failed"}[err["code"]]
+                return failure("repo_open_failed", reason), False
         except (UnicodeError, ValueError, TypeError, AttributeError):
             pass
-    return {"ok": False, "error": "repo_open_failed"}, True
+    # Exit125 means the reviewed supervisor could not complete its own setup/exec.
+    # It still does not prove that no writer survived; retain the same quarantine.
+    reason = "supervisor_unavailable" if result.returncode == 125 else (
+        "invalid_result" if result.returncode == 0 else "cleanup_unconfirmed")
+    return failure("repo_open_failed", reason), True

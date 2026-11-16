@@ -103,6 +103,61 @@ class Runtime(unittest.TestCase):
                 result,uncertain=rt.execute(None,{},fresh(),ready=lambda*a:True,clock=lambda:0,wall=lambda:NOW)
             self.assertFalse(result["ok"]);self.assertFalse(uncertain)
 
+    def test_closed_failure_diagnostics_preserve_cleanup_and_never_echo_messages(self):
+        supervisor = {
+            "repo_open_invalid_request": "invalid_request", "repo_open_workspace_unavailable": "workspace_unavailable",
+            "repo_open_workspace_not_ready": "workspace_not_ready", "repo_open_folder_conflict": "folder_conflict",
+            "repo_open_git_missing": "bootstrap_unavailable", "repo_open_busy": "checkout_busy",
+        }
+        cli = {
+            "invalid-repository": "invalid_request", "invalid-arguments": "invalid_request",
+            "invalid-directory": "workspace_unavailable", "repository-not-authorized": "repository_not_authorized",
+            "destination-conflict": "folder_conflict", "destination-busy": "checkout_busy",
+            "repository-ref-mismatch": "ref_mismatch", "clone-failed": "clone_failed",
+        }
+        poison = "provider detail https://private.invalid/not-for-feedback"
+        cases = [(0, ("ezil-repo-open:error:" + code + "\n").encode(), reason) for code, reason in supervisor.items()]
+        cases += [(2, json.dumps({"error": {"code": code, "message": poison}}).encode(), reason) for code, reason in cli.items()]
+        for code, raw, reason in cases:
+            with self.subTest(reason=reason, raw=raw):
+                responses = [subprocess.CompletedProcess([], 0, b"ezil-cli-bootstrap:ok"), subprocess.CompletedProcess([], code, raw)]
+                with mock.patch.object(desktop, "exec_", side_effect=responses):
+                    result, uncertain = rt.execute(None, {}, fresh(), ready=lambda *a: True, clock=lambda: 0, wall=lambda: NOW)
+                self.assertEqual(result["diagnosticReason"], reason)
+                self.assertFalse(uncertain)
+                self.assertEqual(set(result), {"ok", "error", "diagnosticReason"})
+                self.assertNotIn(poison, json.dumps(result)); self.assertNotIn(SECRET, json.dumps(result))
+
+    def test_unknown_output_and_private_timeout_keep_uncertain_writer_fence(self):
+        for code, raw, reason in [(0, b'{"unexpected":"private"}', "invalid_result"),
+                                  (126, b"private exception detail", "cleanup_unconfirmed"),
+                                  (125, b"private preflight exception", "supervisor_unavailable"),
+                                  (2, json.dumps({"error": {"code": "clone-failed", "message": SECRET}}).encode(), "cleanup_unconfirmed")]:
+            responses = [subprocess.CompletedProcess([], 0, b"ezil-cli-bootstrap:ok"), subprocess.CompletedProcess([], code, raw)]
+            with mock.patch.object(desktop, "exec_", side_effect=responses):
+                result, uncertain = rt.execute(None, {}, fresh(), ready=lambda *a: True, clock=lambda: 0, wall=lambda: NOW)
+            self.assertTrue(uncertain); self.assertEqual(result["diagnosticReason"], reason)
+            self.assertNotIn("private", json.dumps(result)); self.assertNotIn(SECRET, json.dumps(result))
+        with mock.patch.object(desktop, "exec_", side_effect=[subprocess.CompletedProcess([], 0, b"ezil-cli-bootstrap:ok"),
+                                                             subprocess.TimeoutExpired("private", 1)]):
+            result, uncertain = rt.execute(None, {}, fresh(), ready=lambda *a: True, clock=lambda: 0, wall=lambda: NOW)
+        self.assertTrue(uncertain); self.assertEqual(result["diagnosticReason"], "cleanup_unconfirmed")
+
+    def test_bootstrap_failure_is_closed_and_cannot_leave_a_git_writer(self):
+        for response in [OSError("private provider exception"), subprocess.CompletedProcess([], 1, SECRET.encode())]:
+            with mock.patch.object(desktop, "exec_", side_effect=[response]) as run:
+                result, uncertain = rt.execute(None, {}, fresh(), ready=lambda *a: True, clock=lambda: 0, wall=lambda: NOW)
+            self.assertEqual(result, {"ok": False, "error": "repo_open_git_missing", "diagnosticReason": "bootstrap_unavailable"})
+            self.assertFalse(uncertain); self.assertEqual(run.call_count, 1)
+
+    def test_failure_reason_allowlist_matches_worker_and_rejects_arbitrary_values(self):
+        import re
+        source = (HERE.parents[2] / "worker/src/aws-repo-open.ts").read_text()
+        values = re.search(r"REPO_OPEN_DIAGNOSTIC_REASONS = \[(.*?)\] as const", source, re.S).group(1)
+        self.assertEqual(set(re.findall(r"'([^']+)'", values)), sg.DIAGNOSTIC_REASONS)
+        for reason in [SECRET, "provider said failed", "https://private.invalid"]:
+            with self.assertRaises(ValueError): sg.failure("repo_open_failed", reason)
+
     def test_only_private_stdin_has_packet_not_argv_environment_file(self):
         r=fresh();calls=[]
         def run(cfg,argv,**kw):

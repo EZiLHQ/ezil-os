@@ -568,12 +568,22 @@ class Edge:
                          and re.fullmatch(r"/workspace/projects/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", item["folder"])
                          and item["status"] in ("cloned", "fetched"))
             elif valid:
-                valid = (set(item) == {"ok", "error"} and item.get("ok") is False
-                         and isinstance(item["error"], str) and item["error"] in {
+                keys = set(item)
+                reason = item.get("diagnosticReason")
+                valid = ((keys == {"ok", "error"} or (
+                            keys == {"ok", "error", "diagnosticReason"}
+                            and isinstance(reason, str) and reason in standalone_git.DIAGNOSTIC_REASONS))
+                         and item.get("ok") is False and isinstance(item.get("error"), str) and item["error"] in {
                              "repo_open_failed", "repo_open_timeout", "repo_open_git_missing",
                              "repo_open_token_expired", "runtime_not_running"})
             if valid:
-                answer["result"] = item
+                if item["ok"] is True:
+                    answer["result"] = {"ok": True, "folder": item["folder"], "status": item["status"]}
+                else:
+                    # Copy only validated primitives; do not forward the agent object or extra diagnostics.
+                    answer["result"] = {"ok": False, "error": item["error"]}
+                    if "diagnosticReason" in item:
+                        answer["result"]["diagnosticReason"] = item["diagnosticReason"]
         if not valid:
             _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
             return

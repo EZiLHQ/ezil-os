@@ -271,6 +271,10 @@ push('🔴 clicking Code in the Start menu opens a Code window', !! win);
 push('the Code window has an iframe to put code-server in',
     !! win?.querySelector('.window-app-iframe'));
 push('exactly one Code window (single_instance)', qa('.window[data-app="code"]').length === 1);
+const CODE_TRACE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const firstCodeTraceId = win?.ezilFeedbackAppContext?.traceId;
+push('Code feedback receives the registry trace as a canonical UUID',
+    CODE_TRACE_UUID.test(firstCodeTraceId ?? ''), String(firstCodeTraceId));
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4. 🔴 THE 5-MINUTE TTL — minted AT WINDOW-OPEN, never stashed.
@@ -317,6 +321,9 @@ await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, deskt
 await settle(20);
 const remintCalls = calls.slice(callsBeforeReopen).filter(c => c.url.startsWith(ENDPOINTS.codePreviewUrl));
 const win2 = q('.window[data-app="code"]');
+push('reopening Code registers its own fresh canonical trace instead of a stale window trace',
+    CODE_TRACE_UUID.test(win2?.ezilFeedbackAppContext?.traceId ?? '')
+        && win2.ezilFeedbackAppContext.traceId !== firstCodeTraceId, String(win2?.ezilFeedbackAppContext?.traceId));
 const iframe2 = win2?.querySelector('.window-app-iframe');
 push('🔴 re-opening mints a FRESH URL rather than reusing the stale one',
     remintCalls.length === 1 && iframe2?.getAttribute('src') !== firstUrl,
@@ -1564,6 +1571,29 @@ await settle(4);
                 `${spinnerKind(w)} "${spinnerTitle(w)}" asks=${mints(from).length} src=${frameSrc(w)} submits=${submits.length - submitted}`);
             await closeCode();
         }
+        // The generic user copy must keep the server's nonsecret cause and request id in consented feedback.
+        PAYLOAD.desktopState.endpoints.feedback = '/api/shell/feedback';
+        PAYLOAD.desktopState.ui = { feedbackEventDiagnostics: true };
+        window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
+        window.HTMLDialogElement.prototype.close = function () { this.open = false; this.dispatchEvent(new window.Event('close')); };
+        const failureId = 'c1b2c3d4-1234-4123-8123-123456789abc';
+        codeMintAnswer = () => ({ status: 502, payload: { error: { code: 'repo_open_failed', message: 'Not working.' },
+            refusalReason: 'repo_open:worker_http_502:clone_failed', correlationId: failureId } });
+        await launch({ project: { repoUrl: GH } });
+        await waitFor(() => spinnerKind(codeWin()) === 'failed', 4000);
+        click(codeWin().querySelector('.ezil-opening-feedback'));
+        await waitFor(() => !!window.document.querySelector('.ezil-feedback-dialog'), 2000);
+        const dialog = window.document.querySelector('.ezil-feedback-dialog');
+        const preview = dialog?.querySelector('details');
+        if (preview) { preview.open = true; preview.dispatchEvent(new window.Event('toggle')); }
+        const submittedDiagnostics = JSON.parse(dialog?.querySelector('pre')?.textContent || '{}').diagnostics;
+        push('10e repository refusal cause/request id survive the real Code parser and consented feedback builder',
+            submittedDiagnostics?.recentEvents?.some(event => event.site === 'ezil-os:apps/code#project'
+                && event.reason === 'repo_open:worker_http_502:clone_failed' && event.correlationId === failureId));
+        dialog?.querySelector('[data-action="cancel"]')?.click();
+        delete PAYLOAD.desktopState.endpoints.feedback; delete PAYLOAD.desktopState.ui;
+        await closeCode();
+
         // Standalone EZiL Git uses the shared ID session; one silent refresh is tied to this exact URL.
         const EZIL_GIT = 'https://github.ezil.work/default/os-code-url-20261110-a.git';
         const EZIL_GIT_2 = 'https://github.ezil.work/default/os-code-url-20261110-b.git';

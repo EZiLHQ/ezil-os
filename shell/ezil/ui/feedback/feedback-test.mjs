@@ -32,6 +32,8 @@ const iframe = document.createElement('iframe');
 iframe.src = 'https://HOST_SECRET.token.example.test/';
 document.body.append(iframe);
 
+const feedbackContexts = [];
+globalThis.__feedbackContexts = feedbackContexts;
 const captureCalls = [];
 const captureOptions = [];
 const editorOptions = [];
@@ -76,6 +78,9 @@ const imageFileUrl = new URL('./image-file.js', import.meta.url).href;
 const captureUrl = new URL('./capture.js', import.meta.url).href;
 const editorUrl = new URL('./redact-editor.js', import.meta.url).href;
 const hooks = registerHooks({ load (url, context, next) {
+    if (url === new URL('./diagnostics.js', import.meta.url).href) return { format: 'module', shortCircuit: true,
+        source: readFileSync(new URL('./diagnostics.js', import.meta.url), 'utf8').replace('export function build_diagnostics (appContext) {',
+            'export function build_diagnostics (appContext) { globalThis.__feedbackContexts.push(appContext);') };
     if ( url === captureUrl ) return { format: 'module', shortCircuit: true, source: `
         export const tab_capture_supported = () => globalThis.__feedbackCapture.supported();
         export const desktop_capture_supported = () => globalThis.__feedbackCapture.desktopSupported();
@@ -154,7 +159,7 @@ const setDescription = value => { form().elements.description.value = value; for
 const change = (name, checked) => { form().elements[name].checked = checked; form().elements[name].dispatchEvent(new window.Event('change', { bubbles: true })); };
 const send = () => form().dispatchEvent(new window.Event('submit', { bubbles: true, cancelable: true }));
 const close = () => current().querySelector('[data-action="cancel"]').click();
-const open = () => { document.querySelector('#opener').focus(); feedback.open_feedback_dialog({ source: 'pill' }); };
+const open = async () => { document.querySelector('#opener').focus(); feedback.open_feedback_dialog({ source: 'pill' }); await until(() => !status().includes('Preparing screenshot')); };
 const draftKey = `ezil:feedback:draft:v1:${accountId}`;
 const outboxKey = `ezil:feedback:outbox:v1:${accountId}`;
 const stored = key => JSON.parse(window.localStorage.getItem(key) ?? 'null');
@@ -344,7 +349,7 @@ try {
         await tick();
     });
     await check('one optional description, default attachments, live preview, no pre-submit request', async () => {
-        open();
+        await open();
         assert.equal(modalCalls, 1);
         assert.equal(current().getAttribute('aria-labelledby'), current().querySelector('h2').id);
         assert.equal(form().elements.description.required, false, 'no required question');
@@ -361,8 +366,9 @@ try {
         diagnosticsSchema.parse(payload().diagnostics);
         assert.equal(payload().screenshot, null, 'capture unavailable: the report carries no image and is not blocked');
         assert.equal(payload().computerId, computerId);
-        assert.equal(current().querySelector('[data-role="capture-note"]').hidden, true);
-        assert.equal(captureCalls.length, 0, 'opening feedback never captures the screen');
+        assert.equal(current().querySelector('[data-role="capture-note"]').hidden, false);
+        assert.match(current().querySelector('[data-role="capture-note"]').textContent, /Could not capture this screen/);
+        assert.equal(captureCalls.length, 0, 'the unavailable mock snapshot adds no image');
         assert.equal(current().querySelector('[type="submit"]').disabled, false);
         change('diagnostics', false);
         assert.equal(payload().diagnostics, null, 'the attachment can still be switched off');
@@ -408,11 +414,11 @@ try {
         close();
         assert.equal(document.activeElement.id, 'opener');
     });
-    await check('touch primary pointer: the first focus is the heading, never a text field (no keyboard over Send); a fine pointer keeps the description', () => {
+    await check('touch primary pointer: the first focus is the heading, never a text field (no keyboard over Send); a fine pointer keeps the description', async () => {
         const realMatchMedia = window.matchMedia;
         window.matchMedia = query => ({ matches: query === '(pointer: coarse)', addEventListener () {}, removeEventListener () {} });
         try {
-            open();
+            await open();
             const focused = document.activeElement;
             assert.equal(focused.id, 'ezil-feedback-heading');
             assert.ok(current().contains(focused));
@@ -422,16 +428,16 @@ try {
             assert.equal(current().querySelector('[type="submit"]').disabled, false, 'a blank report is sendable from the first screen');
             close();
         } finally { window.matchMedia = realMatchMedia; }
-        open();
+        await open();
         assert.equal(document.activeElement.id, 'ezil-feedback-description');
         assert.equal(form().elements.description.hasAttribute('autofocus'), true);
         close();
     });
-    await check('a draft saved by the earlier bug form keeps its text; the length limit still holds Send', () => {
+    await check('a draft saved by the earlier bug form keeps its text; the length limit still holds Send', async () => {
         const legacyId = '44444444-4444-4444-8444-444444444444';
         window.localStorage.setItem(draftKey, JSON.stringify({ clientRequestId: legacyId, category: 'idea', description: 'Cannot open the desktop',
             bug: { activity: 'Opening a project', steps: '1. Click Browser', expected: 'Desktop opens', actual: 'Spinner stays', reproducibility: 'Every time', impact: 'Blocked' } }));
-        open();
+        await open();
         assert.match(payload().description, /^Summary \/ context\nCannot open the desktop\n\nWhat were you doing\?\nOpening a project/);
         assert.match(payload().description, /Steps to reproduce\n1\. Click Browser/);
         assert.match(payload().description, /Impact\nBlocked$/);
@@ -448,10 +454,10 @@ try {
         assert.equal(current().querySelector('[type="submit"]').disabled, false, 'a blank report is sendable');
         close(); window.localStorage.removeItem(draftKey);
     });
-    await check('an overlong legacy draft is restored whole (never truncated); Send asks to shorten it', () => {
+    await check('an overlong legacy draft is restored whole (never truncated); Send asks to shorten it', async () => {
         window.localStorage.setItem(draftKey, JSON.stringify({ clientRequestId: '55555555-5555-4555-8555-555555555555', category: 'bug',
             description: 'Short summary', bug: { activity: 'a'.repeat(1500), steps: 'b'.repeat(1500), expected: 'c'.repeat(1500), actual: 'd'.repeat(1500), impact: 'TAIL_MARKER' } }));
-        open();
+        await open();
         const text = form().elements.description.value;
         assert.ok(text.length > 4000, 'the migrated text is longer than one report may be');
         assert.ok(text.endsWith('Impact\nTAIL_MARKER'), 'the tail of the saved text is not cut');
@@ -466,7 +472,7 @@ try {
 
 
 
-    await check('failure references require the upstream capability and remain bounded', () => {
+    await check('failure references require the upstream capability and remain bounded', async () => {
         const events = telemetry.recentEvents();
         const event = events.at(-1);
         event.reason = 'worker_http_401:hmac_signature_mismatch';
@@ -487,7 +493,7 @@ try {
 
 
     await check('editing an unconfirmed report forks its ID before an old receipt can discard edits', async () => {
-        open(); setDescription('Original unconfirmed report');
+        await open(); setDescription('Original unconfirmed report');
         const originalId = payload().clientRequestId;
         respond = async () => { throw new TypeError('Failed to fetch'); };
         send(); await until(() => stored(outboxKey)?.some(entry => entry.clientRequestId === originalId) && !current().querySelector('[type="submit"]').disabled);
@@ -499,7 +505,7 @@ try {
         close(); window.localStorage.removeItem(outboxKey); window.localStorage.removeItem(draftKey);
         respond = async () => ({ status: 201, json: async () => ({ id: reportId, screenshotAccepted: true }) });
     });
-    await check('completed app trace keeps matching ID, app and phases in the diagnostic bundle', () => {
+    await check('completed app trace keeps matching ID, app and phases in the diagnostic bundle', async () => {
         const completed = beginTrace('desktop'); completed.step('display'); completed.end('ok');
         window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle = true;
         const snapshot = build_diagnostics();
@@ -510,7 +516,7 @@ try {
         delete window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle;
     });
     await check('quota failure retains text and never claims an image report is saved for automatic retry', async () => {
-        open(); setDescription('Keep my report when storage fills');
+        await open(); setDescription('Keep my report when storage fills');
         const prototype = Object.getPrototypeOf(window.localStorage);
         const original = prototype.setItem;
         prototype.setItem = function (key, value) {
@@ -533,7 +539,7 @@ try {
 
 
     await check('warnings are advisory; 400/413/network errors preserve text; Escape restores focus', async () => {
-        open(); setDescription('Contact test@example.com or sk-example123');
+        await open(); setDescription('Contact test@example.com or sk-example123');
         assert.equal(current().querySelector('.ezil-feedback-warning').hidden, false);
         assert.equal(current().querySelector('[type="submit"]').disabled, false);
         for ( const code of [400, 413, 500] ) {
@@ -571,7 +577,7 @@ try {
         flushing = false;
     });
     await check('offline submit says so, keeps the open form, and completes it on reconnect', async () => {
-        open(); setDescription('Sent while offline');
+        await open(); setDescription('Sent while offline');
         const id = payload().clientRequestId;
         const body = current().querySelector('pre').textContent;
         setOnline(false);
@@ -617,7 +623,7 @@ try {
     const queuedReport = (id, description, base64 = null) => JSON.stringify({ v: 1, clientRequestId: id, category: 'bug', description,
         ...(base64 ? { screenshot: { contentType: 'image/png', dataBase64: base64 } } : {}) });
     await check('a send that never answers times out, says so truthfully, unlocks the form and re-sends the same id', async () => {
-        open(); setDescription('Stalled send');
+        await open(); setDescription('Stalled send');
         const id = payload().clientRequestId;
         const body = current().querySelector('pre').textContent;
         let signal;
@@ -747,7 +753,7 @@ try {
         } finally { timers.restore(); flushing = false; }
     });
     await check('a timeout with a full outbox says the report could not be saved', async () => {
-        open(); setDescription('Unqueued stalled report');
+        await open(); setDescription('Unqueued stalled report');
         const template = payload();
         const seeded = Array.from({ length: 10 }, () => {
             const clientRequestId = crypto.randomUUID();
@@ -771,7 +777,7 @@ try {
         const computerB = '55555555-5555-4555-8555-555555555555';
         const computerC = '66666666-6666-4666-8666-666666666666';
         setCurrentComputer({ id: computerB });
-        open(); setDescription('Filed on computer B');
+        await open(); setDescription('Filed on computer B');
         assert.equal(payload().computerId, computerB, 'preview names the current computer, not the boot one');
         const body = current().querySelector('pre').textContent;
         setOnline(false);
@@ -791,22 +797,22 @@ try {
         assert.equal(calls.length, count + 1);
         assert.equal(calls.at(-1).body, body, 'replay sends the frozen body unchanged');
         assert.equal(JSON.parse(calls.at(-1).body).computerId, computerB);
-        open();
+        await open();
         assert.equal(payload().computerId, computerC, 'a new report snapshots the computer current at open');
         close();
         setCurrentComputer(null);
         window.localStorage.removeItem(draftKey);
-        open();
+        await open();
         assert.equal(payload().computerId, computerId, 'cleared choice falls back to the boot computer');
         close();
     });
     await check('a definitive refusal is not retried and keeps the text for editing', async () => {
-        open(); setDescription('Refused report');
+        await open(); setDescription('Refused report');
         respond = async () => ({ status: 415 });
         send(); await until(() => ! current().querySelector('[type="submit"]').disabled);
         assert.equal(stored(outboxKey), null);
         close();
-        open();
+        await open();
         assert.equal(form().elements.description.value, 'Refused report');
         const count = calls.length;
         window.dispatchEvent(new window.Event('online')); await tick();
@@ -816,7 +822,7 @@ try {
         close();
     });
     await check('a full outbox keeps all 10 pending reports and retains the unqueued draft', async () => {
-        open(); setDescription('Queued report 10');
+        await open(); setDescription('Queued report 10');
         const template = payload();
         const seeded = Array.from({ length: 10 }, (_, i) => {
             const clientRequestId = crypto.randomUUID();
@@ -847,7 +853,7 @@ try {
         // Drop the icon mounted above (and its `online` listener) to exercise the resume on its own.
         window.dispatchEvent(new window.Event('ezil:teardown'));
         assert.equal(document.querySelector('.ezil-feedback-chip'), null);
-        open(); const template = payload(); close();
+        await open(); const template = payload(); close();
         const queue = description => {
             const clientRequestId = crypto.randomUUID();
             return { clientRequestId, body: JSON.stringify({ ...template, clientRequestId, description }) };
@@ -880,7 +886,7 @@ try {
     await check('a back/forward-cache restore runs two flushes (icon remount + restore listener) yet sends each report once', async () => {
         assert.equal(stored(outboxKey), null);
         feedback.mount_feedback_chip();
-        open(); const template = payload(); close();
+        await open(); const template = payload(); close();
         const queue = description => {
             const clientRequestId = crypto.randomUUID();
             return { clientRequestId, body: JSON.stringify({ ...template, clientRequestId, description }) };
@@ -909,10 +915,10 @@ try {
         flushing = false;
     });
     await check('the draft survives closing, keeps its id, is per account and never holds an email', async () => {
-        open(); setDescription('Half-written report'); change('diagnostics', false);
+        await open(); setDescription('Half-written report'); change('diagnostics', false);
         const id = payload().clientRequestId;
         close();
-        open();
+        await open();
         assert.equal(form().elements.description.value, 'Half-written report');
         assert.equal(payload().category, 'bug');
         assert.equal(payload().clientRequestId, id);
@@ -924,18 +930,18 @@ try {
         }
         const user = window.__EZIL_BOOT__.user;
         Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: { id: '44444444-4444-4444-8444-444444444444' } });
-        open();
+        await open();
         assert.equal(form().elements.description.value, '', 'another account on this browser sees nothing');
         assert.notEqual(payload().clientRequestId, id);
         close();
         Object.defineProperty(window.__EZIL_BOOT__, 'user', { configurable: true, value: user });
-        open(); setDescription(''); close();
+        await open(); setDescription(''); close();
     });
     await check('the opening screen error code is an observed fact outside the comment box: shown, sent as one final line, never duplicated, bounded and redacted', async () => {
-        const openWith = errorCode => { document.querySelector('#opener').focus(); feedback.open_feedback_dialog({ source: 'opening', errorCode }); };
+        const openWith = async errorCode => { document.querySelector('#opener').focus(); feedback.open_feedback_dialog({ source: 'opening', errorCode }); await until(() => !status().includes('Preparing screenshot')); };
         const line = () => current().querySelector('[data-role="context-line"]');
         window.localStorage.removeItem(draftKey);
-        openWith('billing_files_on_aws');
+        await openWith('billing_files_on_aws');
         assert.equal(form().elements.description.value, '', 'the optional comment stays empty');
         assert.match(line().textContent, /error code billing_files_on_aws/);
         assert.equal(payload().description, 'Error code: billing_files_on_aws', 'a blank comment still sends the code');
@@ -947,18 +953,18 @@ try {
         // An older draft that already holds the line is not duplicated.
         window.localStorage.setItem(draftKey, JSON.stringify({ clientRequestId: '77777777-7777-4777-8777-777777777777', category: 'bug',
             description: 'Old note\n\nError code: billing_files_on_aws' }));
-        openWith('billing_files_on_aws');
+        await openWith('billing_files_on_aws');
         assert.equal((payload().description.match(/Error code: billing_files_on_aws/g) ?? []).length, 1, 'once');
         close(); window.localStorage.removeItem(draftKey);
         // Invalid or secret-looking codes are neither shown nor sent.
         for ( const bad of ['not a code!', 'sk-proj-abc123', 'x'.repeat(65), 7, null, undefined] ) {
-            openWith(bad);
+            await openWith(bad);
             assert.doesNotMatch(line().textContent, /error code/, String(bad));
             assert.doesNotMatch(payload().description, /Error code/, `${String(bad)}: not sent`);
             close();
         }
         // The line counts toward the 4,000 limit, so a near-full comment cannot push the report over it silently.
-        openWith('billing_payment_issue');
+        await openWith('billing_payment_issue');
         setDescription('x'.repeat(3995));
         assert.equal(current().querySelector('[type="submit"]').disabled, true);
         assert.match(current().querySelector('#ezil-feedback-counter').textContent, /shorten the description/);
@@ -980,7 +986,7 @@ try {
             const first = calls.at(-1).body;
             assert.match(JSON.parse(first).description, /Queued with a code\n\nError code: billing_files_on_aws$/);
             close();
-            open();
+            await open();
             assert.equal(JSON.stringify(payload(), null, 2), first, 'the same body: the queued request keeps its error line');
             assert.equal(form().elements.description.value, 'Queued with a code', 'the comment box holds only the comment');
             close();
@@ -994,7 +1000,7 @@ try {
 
 
     await check('closing during submission is truthful and late success cannot change a new draft', async () => {
-        open(); setDescription('Submitted report');
+        await open(); setDescription('Submitted report');
         await tick(); // the default screenshot (unavailable here) has settled
         let finish;
         respond = () => new Promise(resolve => { finish = resolve; });
@@ -1004,7 +1010,7 @@ try {
         assert.equal(current().querySelector('[data-action="cancel"]').textContent, 'Close');
         assert.match(status(), /Closing this window does not cancel the report/);
         const sentId = JSON.parse(calls.at(-1).body).clientRequestId;
-        close(); open(); setDescription('New draft');
+        close(); await open(); setDescription('New draft');
         finish({ status: 201, json: async () => ({ id: reportId }) }); await tick();
         assert.equal(form().elements.description.value, 'New draft');
         assert.notEqual(payload().clientRequestId, sentId);
@@ -1062,9 +1068,101 @@ try {
     const stagedReply = async (url, options) => options.method === 'PUT'
         ? { status: 201, json: async () => ({ sha256: createHash('sha256').update(options.body).digest('hex'), finalized: false }) }
         : { status: 201, json: async () => ({ id: reportId, screenshotAccepted: true }) };
+    await check('error-button and global feedback use the visible app registration, not a background app context', async () => {
+        await multi(async () => {
+            const code = document.createElement('div'); code.className = 'window window-active'; code.dataset.app = 'code';
+            code.innerHTML = '<button>Send feedback</button>'; document.body.append(code);
+            const ctx = { computerId, appSession: 'code-session', traceId: '77777777-7777-4777-8777-777777777777' };
+            code.ezilFeedbackAppContext = ctx;
+            try {
+                code.querySelector('button').focus(); feedback.open_feedback_dialog({ source: 'opening', errorCode: 'repo_open_failed' });
+                await until(() => !status().includes('Preparing screenshot'));
+                assert.deepEqual(feedbackContexts.at(-1), ctx); close();
+                await open(); assert.deepEqual(feedbackContexts.at(-1), ctx); close();
+                const settings = document.createElement('div'); settings.className = 'window window-active'; settings.dataset.app = 'settings';
+                code.classList.remove('window-active'); document.body.append(settings);
+                try { await open(); assert.equal(feedbackContexts.at(-1).appSession, undefined, 'a front app without registration never borrows Code context'); close(); }
+                finally { settings.remove(); }
+                code.classList.add('window-active');
+                feedback.open_feedback_dialog({ source: 'opening', appContext: { ...ctx, traceId: 'https://private.invalid/' } });
+                await until(() => !status().includes('Preparing screenshot'));
+                assert.equal(feedbackContexts.at(-1).traceId, undefined, 'only a canonical UUID trace ID is retained'); close();
+            } finally { code.remove(); }
+        });
+    });
+    await check('new feedback attaches the masked screen locally, previews its exact image, and does not upload before Send', async () => {
+        await multi(async () => {
+            defaultCapture = true;
+            snapshotCoverage = 0.8;
+            const before = calls.length, editors = editorOptions.length;
+            try {
+                feedback.open_feedback_dialog({ source: 'pill' });
+                assert.equal(ready(), false, 'Send waits for the checked screenshot to finish');
+                await until(ready);
+                assert.equal(rows().length, 1, 'the visible shell screen is attached automatically');
+                assert.equal(captureCalls.at(-1), 'shell');
+                assert.equal(payload().screenshot.dataBase64, rows()[0].querySelector('img').src.split(',')[1]);
+                assert.match(current().querySelector('[data-role="capture-note"]').textContent, /Embedded app contents are hidden/);
+                assert.equal(editorOptions.length, editors, 'already masked shell pixels need no compulsory editor');
+                assert.equal(calls.length, before, 'capture and preview remain local');
+                change('screenshot', false);
+                assert.equal(rows().length, 0); assert.equal(payload().screenshot, null);
+                change('screenshot', true); await until(ready); assert.equal(rows().length, 1);
+            } finally { defaultCapture = false; snapshotCoverage = 0; }
+        });
+    });
+    await check('reopening a queued screenshot report never captures or replaces its original screen', async () => {
+        await multi(async () => {
+            defaultCapture = true;
+            try {
+                await open(); setDescription('The repository will not open');
+                const first = JSON.stringify(payload(), null, 2);
+                respond = async () => ({ status: 503 });
+                send(); await until(() => ready() && /Could not send feedback/.test(status()));
+                assert.equal(stored(outboxKey).at(-1).body, first);
+                const captures = captureCalls.length;
+                close();
+                nextCanvas = () => { throw new Error('A queued report must never recapture the current screen'); };
+                await open();
+                assert.equal(captureCalls.length, captures);
+                assert.equal(JSON.stringify(payload(), null, 2), first);
+            } finally { defaultCapture = false; }
+        });
+    });
+    await check('automatic capture failure is visible; a pending capture times out and opt-out discards late pixels', async () => {
+        await multi(async () => {
+            defaultCapture = true;
+            let resolveCapture;
+            nextCanvas = () => new Promise(resolve => { resolveCapture = resolve; });
+            const timers = [], realSet = globalThis.setTimeout, realClear = globalThis.clearTimeout;
+            globalThis.setTimeout = (fn, ms, ...args) => {
+                if (ms !== 8000) return realSet(fn, ms, ...args);
+                const timer = { fn, cleared: false }; timers.push(timer); return timer;
+            };
+            globalThis.clearTimeout = timer => { if (timers.includes(timer)) timer.cleared = true; else realClear(timer); };
+            try {
+                feedback.open_feedback_dialog({ source: 'pill' });
+                assert.equal(ready(), false); assert.equal(timers.length, 1);
+                const signal = captureOptions.at(-1).signal;
+                timers[0].fn();
+                assert.equal(ready(), true, 'an unavailable browser capture never blocks a text report');
+                assert.equal(signal.aborted, true);
+                assert.match(current().querySelector('[data-role="capture-note"]').textContent, /Could not capture this screen.*Attach an image/);
+                const c = document.createElement('canvas'); c.width = c.height = 1;
+                resolveCapture(c); await tick(); assert.equal(rows().length, 0);
+                close();
+                feedback.open_feedback_dialog({ source: 'pill' });
+                const secondSignal = captureOptions.at(-1).signal;
+                change('screenshot', false); assert.equal(secondSignal.aborted, true); assert.equal(ready(), true);
+                resolveCapture(c); await tick(); assert.equal(rows().length, 0); assert.equal(payload().screenshot, null);
+            } finally {
+                globalThis.setTimeout = realSet; globalThis.clearTimeout = realClear; defaultCapture = false;
+            }
+        });
+    });
     await check('compact form: paste/drop/attach preserve order locally, no capture controls or compulsory editor', async () => {
         await multi(async () => {
-            open(); const before = calls.length, editors = editorOptions.length;
+            await open(); const before = calls.length, editors = editorOptions.length;
             assert.equal(current().querySelector('.ezil-feedback-preview').open, false);
             assert.equal(current().querySelector('[data-capture], .ezil-feedback-capture-options, .ezil-feedback-details'), null);
             assert.equal(current().querySelector('[data-role="context-line"]').closest('details').open, false);
@@ -1090,7 +1188,7 @@ try {
     });
     await check('explicit Edit preserves order; duplicate/count/byte limits and screenshot opt-out hold', async () => {
         await multi(async () => {
-            open(); await attach([png('a.png'), png('b.png')]);
+            await open(); await attach([png('a.png'), png('b.png')]);
             const before = payload().screenshots.map(image => image.dataBase64);
             const realImage = window.Image, realContext = window.HTMLCanvasElement.prototype.getContext;
             window.Image = class { naturalWidth = 1; naturalHeight = 1; async decode () {} };
@@ -1103,7 +1201,7 @@ try {
             encodeResult = () => distinctResult().blob; await attach([png('c.png'), png('d.png'), png('e.png'), png('f.png')]);
             assert.equal(rows().length, 5); assert.equal(form().elements.screenshotFile.disabled, true);
             change('screenshot', false); assert.equal(rows().length, 0); assert.equal(payload().screenshot, null);
-            change('screenshot', true);
+            change('screenshot', true); await until(ready);
             const big = Math.floor(1.2 * 1024 * 1024); encodeResult = () => new window.Blob([Buffer.alloc(big)], { type: 'image/png' });
             await attach([png('big.png')]); assert.equal(rows().length, 1);
             await attach([png('too-big.png')]); assert.equal(rows().length, 1); assert.match(status(), /too large/);
@@ -1114,7 +1212,7 @@ try {
 
     await check('staged Send uploads preview pixels before ordered refs; failed PUT retains raw images and retry ticket', async () => {
         await multi(async () => {
-            ui.feedbackStagedUploads = true; open(); await attach([png('a.png'), png('b.png')]);
+            ui.feedbackStagedUploads = true; await open(); await attach([png('a.png'), png('b.png')]);
             showPreview(); const expected = current().querySelector('pre').textContent;
             assert.equal(JSON.parse(expected).screenshotRefs.length, 2); assert.doesNotMatch(expected, /dataBase64/);
             const images = rows().map(row => row.querySelector('img').src.split(',')[1]);
@@ -1136,12 +1234,12 @@ try {
     });
     await check('unknown finalize retains local image; reopened replay sends identical refs and original ticket', async () => {
         await multi(async () => {
-            ui.feedbackStagedUploads = true; open(); await attach([png('a.png')]);
+            ui.feedbackStagedUploads = true; await open(); await attach([png('a.png')]);
             let fail = true;
             respond = async (url, options) => { if (options.method === 'POST' && fail) throw new TypeError('lost response'); return stagedReply(url, options); };
             send(); await until(() => ready() && stored(outboxKey)?.length === 1);
             const queued = stored(outboxKey)[0], final = calls.at(-1).body;
-            close(); open(); await until(ready); showPreview();
+            close(); await open(); await until(ready); showPreview();
             assert.equal(rows().length, 1); assert.equal(current().querySelector('pre').textContent, final);
             fail = false; send(); await until(() => status().includes(reportId));
             assert.equal(calls.at(-1).body, final); assert.equal(stored(outboxKey), null);
@@ -1150,7 +1248,7 @@ try {
     });
     await check('account_changed stops before finalizing and preserves immutable original-account outbox', async () => {
         await multi(async () => {
-            ui.feedbackStagedUploads = true; open(); await attach([png('a.png'), png('b.png')]);
+            ui.feedbackStagedUploads = true; await open(); await attach([png('a.png'), png('b.png')]);
             const start = calls.length;
             respond = async () => ({ status: 409, json: async () => ({ error: 'account_changed' }) });
             send(); await until(() => /original account/.test(status()));
@@ -1161,7 +1259,7 @@ try {
     });
     await check('in-page account switch between PUTs blocks requests and never moves the draft to another account', async () => {
         await multi(async () => {
-            ui.feedbackStagedUploads = true; open(); await attach([png('a.png'), png('b.png')]);
+            ui.feedbackStagedUploads = true; await open(); await attach([png('a.png'), png('b.png')]);
             const originalUser = window.__EZIL_BOOT__.user, other = '77777777-7777-4777-8777-777777777777';
             const start = calls.length;
             respond = async (url, options) => {
@@ -1177,7 +1275,7 @@ try {
 
     await check('diagnostics stay frozen and a strict older server gets the compatibility downgrade', async () => {
         window.localStorage.removeItem(outboxKey); window.localStorage.removeItem(draftKey);
-        ui.feedbackReportBundle = true; open(); setDescription('Compatibility report');
+        ui.feedbackReportBundle = true; await open(); setDescription('Compatibility report');
         const initial = payload().diagnostics; assert.ok(initial.session);
         telemetry.capture({ eventClass: 'api_failure', site: 'later', code: 'later' }); setDescription('Compatibility report updated');
         assert.deepEqual(payload().diagnostics, initial);
@@ -1190,7 +1288,7 @@ try {
     await check('screenshot opt-out and modal close abort pending image imports and discard late results', async () => {
         await multi(async () => {
             let finish; nextCanvas = () => new Promise(resolve => { finish = resolve; });
-            open(); paste(current(), [png('pending.png')]); assert.equal(ready(), false);
+            await open(); paste(current(), [png('pending.png')]); assert.equal(ready(), false);
             change('screenshot', false); finish(Object.assign(document.createElement('canvas'), { width: 1, height: 1 }));
             await tick(); assert.equal(rows().length, 0); assert.equal(ready(), true);
             change('screenshot', true); paste(current(), [png('closing.png')]);
@@ -1201,7 +1299,7 @@ try {
 
     await check('staged 429 pauses raw images across reopen, never auto-retries, and explicit Send keeps the same ticket', async () => {
         await multi(async () => {
-            ui.feedbackStagedUploads = true; open(); await attach([png('a.png'), png('b.png')]);
+            ui.feedbackStagedUploads = true; await open(); await attach([png('a.png'), png('b.png')]);
             const id = payload().clientRequestId;
             respond = async () => ({ status: 429 }); send(); await until(() => ready() && /several reports/.test(status()));
             const frozen = stored(outboxKey)[0]; assert.equal(frozen.paused, true); assert.equal(JSON.parse(frozen.body).screenshots.length, 2);
@@ -1209,20 +1307,20 @@ try {
             try { await feedback.flush_feedback_outbox(); window.dispatchEvent(new window.Event('online')); await tick(); }
             finally { flushing = false; }
             assert.equal(calls.length, before, 'a definitive refusal never automatically resends');
-            close(); open(); await until(ready); assert.equal(rows().length, 2); assert.equal(payload().clientRequestId, id);
+            close(); await open(); await until(ready); assert.equal(rows().length, 2); assert.equal(payload().clientRequestId, id);
             respond = stagedReply; send(); await until(() => status().includes(reportId));
             assert.equal(JSON.parse(calls.at(-1).body).clientRequestId, id); assert.equal(stored(outboxKey), null);
         });
     });
     await check('paused staged refusal edits retain screenshots; opt-out removes raw local bytes and explicit Send forks the ticket', async () => {
         await multi(async () => {
-            ui.feedbackStagedUploads = true; open(); await attach([png('a.png')]); change('diagnostics', false);
+            ui.feedbackStagedUploads = true; await open(); await attach([png('a.png')]); change('diagnostics', false);
             const id = payload().clientRequestId;
             respond = async () => ({ status: 413 }); send(); await until(() => ready() && /too large/.test(status()));
-            close(); open(); await until(ready); assert.equal(rows().length, 1);
+            close(); await open(); await until(ready); assert.equal(rows().length, 1);
             setDescription('Updated report'); const editedId = payload().clientRequestId; assert.notEqual(editedId, id);
             assert.equal(stored(outboxKey).length, 1); assert.ok(JSON.parse(stored(outboxKey)[0].body).screenshot.dataBase64);
-            close(); open(); await until(ready); assert.equal(rows().length, 1); assert.equal(form().elements.description.value, 'Updated report');
+            close(); await open(); await until(ready); assert.equal(rows().length, 1); assert.equal(form().elements.description.value, 'Updated report');
             change('screenshot', false); const nextId = payload().clientRequestId; assert.notEqual(nextId, editedId);
             assert.equal(rows().length, 0); assert.doesNotMatch(stored(outboxKey)[0].body, /dataBase64/); assert.equal(stored(outboxKey)[0].paused, true);
             const before = calls.length; await feedback.flush_feedback_outbox(); assert.equal(calls.length, before);
@@ -1233,7 +1331,7 @@ try {
 
     await check('legacy text and inline POSTs keep expected account header when cross-tab cookies changed; rejection preserves original draft', async () => {
         for (const withImage of [false, true]) await multi(async () => {
-            delete ui.feedbackStagedUploads; open(); setDescription('Original account report');
+            delete ui.feedbackStagedUploads; await open(); setDescription('Original account report');
             if (withImage) await attach([png('legacy.png')]);
             const frozen = current().querySelector('pre'); showPreview(); const expected = frozen.textContent;
             const before = calls.length;
@@ -1251,12 +1349,12 @@ try {
 
     await check('paused image report survives capability-off reopen byte for byte until explicit removal', async () => {
         await multi(async () => {
-            ui.feedbackStagedUploads = true; open(); await attach([png('a.png'), png('b.png')]);
+            ui.feedbackStagedUploads = true; await open(); await attach([png('a.png'), png('b.png')]);
             respond = async () => ({ status: 429 }); send(); await until(() => ready() && /several reports/.test(status()));
             const original = stored(outboxKey)[0], id = payload().clientRequestId; close();
             ui.feedbackScreenshots = false; const before = calls.length;
             try {
-                open(); await until(() => rows().length === 2);
+                await open(); await until(() => rows().length === 2);
                 assert.equal(current().querySelector('input[type=file]'), null);
                 assert.equal(ready(), false); assert.equal(payload().clientRequestId, id);
                 assert.equal(stored(outboxKey)[0].body, original.body);
@@ -1374,7 +1472,7 @@ try {
         assert.equal(calls.at(-1).method, 'DELETE');
         assert.match(pane.textContent, /database backups expire on their own schedule/);
         // A send from the dialog refreshes the already-loaded list ("Your reports").
-        entry.click(); setDescription('Shows up in Your reports');
+        entry.click(); await until(() => !status().includes('Preparing screenshot')); setDescription('Shows up in Your reports');
         respond = async (url, options) => options.method === 'POST'
             ? { status: 201, json: async () => ({ id: reportId, screenshotAccepted: false }) }
             : { status: 200, ok: true, json: async () => ({ reports: [{ id: reportId, category: 'bug', createdAt: '2026-10-28',

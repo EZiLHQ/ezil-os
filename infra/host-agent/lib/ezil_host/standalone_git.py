@@ -23,6 +23,22 @@ TIME = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z")
 MESSAGE_KEYS = {"op", "seq", "ts", "leaseEpoch", "mac", "request"}
 STATUS_KEYS = {"op", "seq", "ts", "leaseEpoch", "mac", "jobId"}
 
+# Closed diagnostics only. No exception, CLI message, credential or path is exposed.
+DIAGNOSTIC_REASONS = frozenset({
+    "bootstrap_unavailable", "workspace_unavailable", "workspace_not_ready", "folder_conflict",
+    "checkout_busy", "invalid_request", "repository_not_authorized", "ref_mismatch", "clone_failed",
+    "cleanup_unconfirmed", "supervisor_unavailable", "token_expired", "runtime_not_running", "invalid_result",
+    "admission_rejected", "admission_invalid", "admission_stopping", "status_unavailable",
+    "status_invalid", "transport_unavailable", "budget_exhausted",
+})
+
+
+def failure(error, reason):
+    if error not in {"repo_open_failed", "repo_open_timeout", "repo_open_git_missing",
+                     "repo_open_token_expired", "runtime_not_running"} or reason not in DIAGNOSTIC_REASONS:
+        raise ValueError("invalid standalone diagnostic")
+    return {"ok": False, "error": error, "diagnosticReason": reason}
+
 
 def expiry(value):
     if not isinstance(value, str) or not TIME.fullmatch(value):
@@ -196,11 +212,11 @@ class Jobs:
         try:
             left = req["timeoutMs"] - int(max(0, time.monotonic() - admitted_at) * 1000)
             if left < MIN_MS:
-                result, uncertain = {"ok": False, "error": "repo_open_timeout"}, False
+                result, uncertain = failure("repo_open_timeout", "budget_exhausted"), False
             else:
                 result, uncertain = self.runner(self.cfg, self.lease, {**req, "timeoutMs": left})
         except Exception:
-            result, uncertain = {"ok": False, "error": "repo_open_failed"}, True
+            result, uncertain = failure("repo_open_failed", "cleanup_unconfirmed"), True
         with self.lock:
             self.jobs[req["jobId"]].update(state="done", result=result, finishedAt=self.clock())
             self.active_id = None

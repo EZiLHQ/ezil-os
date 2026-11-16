@@ -270,8 +270,9 @@ retries once without all these expanded fields; report text/image/ID are preserv
 The fallback replaces the queued body and visible preview. No new upload runs in
 the background beyond the existing explicitly submitted outbox retry.
 
-Screenshot consent, feature gates, cancellation and image limits remain. The current
-explicit paste/drop/file flow in §7 replaces the earlier automatic capture UI.
+Screenshot consent, feature gates, cancellation and image limits remain. As amended
+2026-11-16, a new report attaches a local masked shell snapshot while Screenshots is
+selected; explicit paste/drop/file imports in §7 remain available.
 Edit starts from the attached preview pixels, including any prior redactions.
 
 Admin status changes use the existing status column: new / investigating / resolved.
@@ -354,9 +355,15 @@ table: no DDL, no bucket, no URL, no image GET.
 The visible form contains one optional Description (`You can paste screenshots here too.`),
 short Diagnostics / Screenshots checkboxes selected by default, one Attach images / drop
 area, local thumbnails with Edit / Remove, a collapsed exact preview, and Send. Context
-and the short server-summary disclosure live inside the preview. There is no automatic
-shell capture, browser capture picker, capture-options disclosure, diagnostic essay or
-image-budget counter. Imported files appear immediately without a mandatory editor;
+and the short server-summary disclosure live inside the preview. The 2026-11-16
+amendment restores a local masked shell capture for new reports: the visible app error
+stays in the snapshot, while the feedback dialog, private fields and embedded frame
+contents are excluded. A thumbnail shows the actual attachment before Send. The user
+can remove it or turn Screenshots off; queued reports retain their original pixels and
+body rather than capturing a different screen. Capture stops after eight seconds and
+shows an attach-image fallback if no image is available. There is no browser capture
+picker, capture-options disclosure, diagnostic essay or image-budget counter.
+Imported files appear immediately without a mandatory editor;
 Edit opens the existing crop/redaction editor. Pixels are freshly rasterized with the
 existing encoder before the thumbnail is shown. Limits remain five images, 1.75 MiB
 total, 1.5 MiB per image. An older boot without the multi-image flag keeps one image.

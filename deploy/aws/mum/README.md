@@ -987,3 +987,13 @@ separate early install. Rollback retains that compatible app and every record.
 Legacy thirty-two-record GC, immutable record identity, byte ceilings, retention
 proofs and admission gates remain unchanged. Verify actual registry and secret
 sizes before promotion; this increment removes no history.
+
+### Thirty-six-record registry compatibility
+
+The active app readers and normal operator append accept thirty-six retained
+records and refuse a thirty-seventh. The release's plan-bound app must prove
+source and running `/api/health` reader capacity before normal promotion appends
+record thirty-six. A thirty-five-record source or runtime reader is refused.
+Rollback keeps the compatible app and every retained record. Legacy GC stays
+frozen at thirty-two; byte ceilings, immutable record identities and retention
+proofs remain unchanged. No history is pruned.

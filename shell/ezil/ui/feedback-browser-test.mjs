@@ -309,7 +309,9 @@ try {
             assert.equal(await page.locator('input[name="screenshot"]').isChecked(), true, 'the screenshot is selected by default');
             assert.equal(await page.locator('input[name="diagnostics"]').isChecked(), true, 'diagnostics are selected by default');
             await page.locator('input[name="diagnostics"]').uncheck();
-            assert.equal(await page.locator('.ezil-feedback-image').isVisible(), false, 'no automatic capture');
+            // This case edits an uploaded fixture. Opt out of the automatic shell capture first.
+            await page.locator('input[name="screenshot"]').uncheck();
+            assert.equal(await page.locator('.ezil-feedback-image').isVisible(), false, 'opting out clears automatic capture');
             const encoded = await page.evaluate(() => {
                 const c = document.createElement('canvas'); c.width = 120; c.height = 80;
                 const ctx = c.getContext('2d'); ctx.fillStyle = '#3366cc'; ctx.fillRect(0, 0, 120, 80);
@@ -318,6 +320,10 @@ try {
             const file = page.locator('input[name="screenshotFile"]');
             await file.setInputFiles({ name: 'test-private-name.png', mimeType: 'image/png', buffer: Buffer.from(encoded, 'base64') });
             await page.locator('.ezil-feedback-image').waitFor({ state: 'visible' });
+            assert.equal(await page.locator('input[name="screenshot"]').isChecked(), true, 'attaching a file selects screenshot consent');
+            assert.deepEqual(await page.locator('.ezil-feedback-image img').evaluate(async img => {
+                await img.decode(); return [img.naturalWidth, img.naturalHeight];
+            }), [120, 80], 'the editor receives the uploaded fixture');
             const editor = page.getByRole('dialog', { name: 'Edit screenshot' });
             assert.equal(await editor.count(), 0, 'files attach without a compulsory editor');
             assert.equal(posts.length, 0, 'selecting an image sends nothing');
@@ -358,12 +364,14 @@ try {
             await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = false; });
         });
 
-        await check(`${tag}: compact screenshots form fits initially without scroll or capture; blank Send works`, async () => {
+        await check(`${tag}: compact screenshots form fits with automatic capture; blank description Send includes the previewed image`, async () => {
             await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = true; });
             reply = () => ({ status: 201, body: { id: REPORT, screenshotAccepted: true } });
             posts.length = 0; await openByChip();
-            assert.equal(await page.locator('.ezil-feedback-image').isVisible(), false);
-            assert.equal(await page.locator('[data-capture], .ezil-feedback-capture-options, .ezil-feedback-details').count(), 0);
+            await page.locator('.ezil-feedback-image').waitFor({ state: 'visible' });
+            await page.waitForFunction(() => document.querySelector('[data-capture="edit"]')?.disabled === false);
+            assert.equal(await page.locator('[data-capture="edit"]').count(), 1);
+            assert.equal(await page.locator('.ezil-feedback-capture-options, .ezil-feedback-details').count(), 0);
             assert.equal(await page.locator('.ezil-feedback-preview').evaluate(el => el.open), false);
             assert.equal(await page.locator('input[name="screenshot"]').isChecked(), true);
             const fit = await page.evaluate(() => {
@@ -372,16 +380,23 @@ try {
                 return { width: r.width, height: r.height, scrollHeight: d.scrollHeight, clientHeight: d.clientHeight,
                     fits: r.top >= 0 && r.left >= 0 && r.bottom <= innerHeight && r.right <= innerWidth,
                     sendVisible: b.top >= r.top && b.bottom <= r.bottom && document.elementFromPoint(b.x + b.width / 2, b.y + b.height / 2) === send,
-                    sendHeight: b.height, visibleText: d.innerText.length };
+                    sendHeight: b.height, visibleText: d.innerText.length,
+                    captureNote: d.querySelector('[data-role="capture-note"]').innerText };
             });
             assert.equal(fit.fits, true, JSON.stringify(fit));
             assert.ok(fit.scrollHeight <= fit.clientHeight + 1, JSON.stringify(fit));
             assert.equal(fit.sendVisible, true); if (coarse) assert.ok(fit.sendHeight >= 44);
-            assert.ok(fit.visibleText < 240, `compact initial copy (${fit.visibleText})`);
+            assert.match(fit.captureNote, /^Screenshot attached\. (Private fields are hidden\.|Embedded app contents are hidden; attach an image if they are part of the issue\.)$/);
+            // Retain the form's copy budget separately from the new, bounded capture coverage status.
+            assert.ok(fit.visibleText - fit.captureNote.length < 240, `compact form copy (${fit.visibleText})`);
             console.log(`METRIC ${tag} minimal feedback ${JSON.stringify(fit)}`);
             assert.equal(posts.length, 0);
+            const shown = await preview();
+            assert.ok(JSON.parse(shown).screenshot, 'automatic screenshot is present in the preview');
             await page.locator('button[type="submit"]').click(); await status.filter({ hasText: 'Thanks — we got it' }).waitFor();
-            assert.equal(JSON.parse(posts[0].body).screenshot, null);
+            assert.equal(posts.length, 1);
+            assert.equal(posts[0].body, shown, 'automatic screenshot POST matches the preview');
+            assert.equal(JSON.parse(posts[0].body).description, '');
             await closeDialog(); posts.length = 0;
             await page.evaluate(() => { window.__EZIL_BOOT__.desktopState.ui.feedbackScreenshots = false; });
         });

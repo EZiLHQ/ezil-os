@@ -6,7 +6,7 @@ from unittest import mock
 
 HERE=Path(__file__).resolve().parent
 sys.path.insert(0,str(HERE.parent/"lib"));sys.path.insert(0,str(HERE))
-from ezil_host import standalone_git as sg, edge, agent, desktop
+from ezil_host import standalone_git as sg, standalone_git_runtime as rt, edge, agent, desktop
 from test_standalone_git import NOW, CID, SECRET, fresh
 
 class Head:
@@ -83,6 +83,45 @@ class HostGuard(unittest.TestCase):
                 for marker in (desktop.STOPPING,desktop.EXPORT_QUIESCE,"shutdown-pending"):
                     p=Path(cfg.runDir,marker);p.touch();self.assertFalse(sg.host_ready(cfg,lease));p.unlink()
 
+    def test_real_authenticated_agent_jobs_runtime_failure_survives_edge_projection(self):
+        # Actual agent authentication, job admission/thread completion, runtime error mapping and edge
+        # projection run together. Only the external runc process is replaced with its closed result.
+        for exit_code, stdout, reason, uncertain in [
+                (2, b'{"error":{"code":"clone-failed","message":"private provider detail"}}', "clone_failed", False),
+                (125, b"", "supervisor_unavailable", True)]:
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as d:
+                cfg, lease = host_fixture(Path(d))
+                a = agent.Agent(cfg, lease, clock=lambda: NOW, log=lambda *x: None)
+                def runner(c, l, req):
+                    return rt.execute(c, l, req, ready=lambda *x: True, clock=lambda: 0, wall=lambda: NOW)
+                a.standalone_git = sg.Jobs(cfg, lease, runner=runner, ready=lambda *x: True, clock=lambda: NOW)
+                sequence = 0
+                def send(op, **fields):
+                    nonlocal sequence
+                    sequence += 1
+                    msg = {"op": op, "seq": sequence, "ts": NOW, "leaseEpoch": lease["leaseEpoch"], **fields}
+                    msg["mac"] = agent.sign(a.key, msg)
+                    return a.handle(json.dumps(msg).encode())
+                e = object.__new__(edge.Edge); e.clock = lambda: NOW
+                e.seq = SimpleNamespace(send=send)
+                raw = json.dumps(fresh()).encode()
+                responses = [subprocess.CompletedProcess([], 0, b"ezil-cli-bootstrap:ok"),
+                             subprocess.CompletedProcess([], exit_code, stdout)]
+                with mock.patch.object(desktop, "exec_", side_effect=responses) as run, mock.patch.object(edge, "_reply") as reply:
+                    e._standalone_repo(None, Head(raw), hashlib.sha256(raw).hexdigest(), "", False)
+                    self.assertEqual(reply.call_args.args[1:], (202, {"ok": True, "state": "running"}))
+                    for _ in range(100):
+                        if a.standalone_git.status("b" * 64)["state"] == "done": break
+                        time.sleep(.01)
+                    e._standalone_repo(None, Head(headers={}, method="GET"), "b" * 64, "", True)
+                    code, value = reply.call_args.args[1:]
+                    self.assertEqual(code, 200)
+                    self.assertEqual(value, {"ok": True, "state": "done", "result": {
+                        "ok": False, "error": "repo_open_failed", "diagnosticReason": reason}})
+                    self.assertNotIn(SECRET, repr(value)); self.assertNotIn("private provider detail", repr(value))
+                    self.assertEqual(run.call_count, 2)
+                self.assertEqual(a.standalone_git.active(), uncertain)
+
     def test_actual_hung_runc_readiness_is_bounded_and_cannot_starve_stop(self):
         with tempfile.TemporaryDirectory() as d:
             root=Path(d);cfg,lease=host_fixture(root)
@@ -109,6 +148,31 @@ if __name__=="__main__":unittest.main()
 
 class ClosedReplies(unittest.TestCase):
     call=Framing.call
+    def test_status_accepts_only_exact_closed_diagnostic_and_preserves_legacy_failure(self):
+        for reason in [None, *sorted(sg.DIAGNOSTIC_REASONS)]:
+            item = {"ok": False, "error": "repo_open_failed"}
+            if reason is not None: item["diagnosticReason"] = reason
+            (code, value), _ = self.call(Head(headers={}, method="GET"), "b" * 64, status=True,
+                                       result={"ok": True, "state": "done", "result": item})
+            self.assertEqual((code, value), (200, {"ok": True, "state": "done", "result": item}))
+            self.assertIsNot(value["result"], item)
+
+    def test_status_drops_unknown_secret_wrong_type_or_extra_diagnostics(self):
+        for change in [{"diagnosticReason": "provider-private-detail"}, {"diagnosticReason": SECRET},
+                       {"diagnosticReason": None}, {"diagnosticReason": False}, {"diagnosticReason": 1},
+                       {"diagnosticReason": ["clone_failed"]}, {"diagnosticReason": {"reason": "clone_failed"}},
+                       {"diagnosticReason": "clone_failed", "debug": SECRET}]:
+            item = {"ok": False, "error": "repo_open_failed", **change}
+            (code, value), _ = self.call(Head(headers={}, method="GET"), "b" * 64, status=True,
+                                       result={"ok": True, "state": "done", "result": item})
+            self.assertEqual((code, value), (503, {"ok": False, "error": "agent_unavailable"}))
+            self.assertNotIn(SECRET, repr(value)); self.assertNotIn("provider-private-detail", repr(value))
+        item = {"ok": True, "folder": "/workspace/projects/" + fresh()["repositoryId"],
+                "status": "cloned", "diagnosticReason": "clone_failed"}
+        (code, value), _ = self.call(Head(headers={}, method="GET"), "b" * 64, status=True,
+                                   result={"ok": True, "state": "done", "result": item})
+        self.assertEqual((code, value), (503, {"ok": False, "error": "agent_unavailable"}))
+
     def test_arbitrary_agent_fields_cannot_echo_secret(self):
         h=Head(json.dumps(fresh()).encode())
         (code,value),_=self.call(h,result={"ok":True,"state":"running","debug":SECRET})

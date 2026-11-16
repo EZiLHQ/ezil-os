@@ -196,42 +196,45 @@ describe('sixteen-record registry capacity and rollback compatibility', () => {
         expect(f.retained.slice(0, 3)).toEqual(f.releases);
     });
 
-    it('accepts twenty-six through thirty-five records including maintenance and refuses thirty-six in all three app readers even when all identities are valid', () => {
+    it('accepts twenty-six through thirty-six records including maintenance and refuses thirty-seven in all three app readers even when all identities are valid', () => {
         const f = fixtureReleaseRegistry32();
-        expect(REBASE_RELEASE_REGISTRY_CAPACITY).toBe(35);
+        expect(REBASE_RELEASE_REGISTRY_CAPACITY).toBe(36);
         expect(f.release125).toMatchObject({ previousLowerImageDigest: null, previousLowerImageRef: null });
         expect(RebaseSourceReleaseSchema.parse(f.release125)).toEqual(f.release125);
         const thirtyThird = { ...f.release138, amiId: 'ami-fffffffffffffffff', recipeVersion: '1.0.39', createdAt: '2026-11-14T20:00:00.000Z' };
         const thirtyFourth = { ...f.release138, amiId: 'ami-eeeeeeeeeeeeeeeee', recipeVersion: '1.0.40', createdAt: '2026-11-14T21:00:00.000Z' };
         const thirtyFifth = { ...f.release138, amiId: 'ami-ddddddddddddddddd', recipeVersion: '1.0.41', createdAt: '2026-11-14T22:00:00.000Z' };
-        const all = [...f.retained, thirtyThird, thirtyFourth, thirtyFifth];
-        for (const count of [26, 27, 28, 29, 30, 31, 32, 33, 34, 35]) {
+        const thirtySixth = { ...f.release138, amiId: 'ami-ccccccccccccccccc', recipeVersion: '1.0.42', createdAt: '2026-11-14T23:00:00.000Z' };
+        const all = [...f.retained, thirtyThird, thirtyFourth, thirtyFifth, thirtySixth];
+        for (const count of [26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36]) {
             const full = { ...f.deployment118, releases: all.slice(0, count) };
             expect(full.releases).toHaveLength(count);
             expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ [full.region]: full }) }, [full.region]).ok).toBe(true);
             expect(() => resolveRebaseReleases(full, LOWER_102)).not.toThrow();
             expect(attestationRegistry(full).releases).toEqual(full.releases);
         }
-        // Every retained record stays byte-identical across all three appends.
+        // Every retained record stays byte-identical across all four appends.
         expect(all.slice(0, 32)).toEqual(f.retained);
         expect(all.slice(0, 33)).toEqual([...f.retained, thirtyThird]);
         expect(all.slice(0, 34)).toEqual([...f.retained, thirtyThird, thirtyFourth]);
-        const entry = { ...f.deployment118, releases: [...all, { ...f.release138, amiId: 'ami-ccccccccccccccccc', recipeVersion: '1.0.42',
-            createdAt: '2026-11-14T23:00:00.000Z' }] };
-        expect(entry.releases).toHaveLength(36);
+        expect(all.slice(0, 35)).toEqual([...f.retained, thirtyThird, thirtyFourth, thirtyFifth]);
+        const entry = { ...f.deployment118, releases: [...all, { ...f.release138, amiId: 'ami-bbbbbbbbbbbbbbbbb', recipeVersion: '1.0.43',
+            createdAt: '2026-11-15T00:00:00.000Z' }] };
+        expect(entry.releases).toHaveLength(37);
         entry.releases.forEach(r => expect(RebaseSourceReleaseSchema.safeParse(r).success).toBe(true));
         expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ [entry.region]: entry }) }, [entry.region]).ok).toBe(false);
         expect(() => resolveRebaseReleases(entry, LOWER_102)).toThrow();
         expect(() => attestationRegistry(entry)).toThrow('release_mismatch');
     });
 
-    it('keeps the 65,536-byte deployment-map ceiling at thirty-five records', () => {
+    it('keeps the 65,536-byte deployment-map ceiling at thirty-six records', () => {
         const f = fixtureReleaseRegistry32();
         const entry = { ...f.deployment118, releases: [...f.retained, { ...f.release138, amiId: 'ami-fffffffffffffffff', recipeVersion: '1.0.39',
             createdAt: '2026-11-14T20:00:00.000Z' }, { ...f.release138, amiId: 'ami-eeeeeeeeeeeeeeeee', recipeVersion: '1.0.40',
             createdAt: '2026-11-14T21:00:00.000Z' }, { ...f.release138, amiId: 'ami-ddddddddddddddddd', recipeVersion: '1.0.41',
-            createdAt: '2026-11-14T22:00:00.000Z' }] };
-        expect(entry.releases).toHaveLength(35);
+            createdAt: '2026-11-14T22:00:00.000Z' }, { ...f.release138, amiId: 'ami-ccccccccccccccccc', recipeVersion: '1.0.42',
+            createdAt: '2026-11-14T23:00:00.000Z' }] };
+        expect(entry.releases).toHaveLength(36);
         const raw = JSON.stringify({ [entry.region]: entry });
         expect(Buffer.byteLength(raw)).toBeLessThan(65536);
         const atLimit = raw + ' '.repeat(65536 - Buffer.byteLength(raw));

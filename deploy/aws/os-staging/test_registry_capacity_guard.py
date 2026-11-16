@@ -97,12 +97,12 @@ class GuardTests(unittest.TestCase):
     def test_past_thirty_two_requires_a_reading_image(self):
         self.assertIsNone(self.run_guard({'work.ezil.registry-capacity': '33'}, 33)[0])
         self.assertIsNone(self.run_guard({'work.ezil.registry-capacity': '33'}, 33, source='env')[0])
-        self.assertIsNone(self.run_guard({'work.ezil.registry-capacity': '35'}, 35)[0])
-        self.assertIsNone(self.run_guard({'work.ezil.registry-capacity': '35'}, 35, source='env')[0])
+        self.assertIsNone(self.run_guard({'work.ezil.registry-capacity': '36'}, 36)[0])
+        self.assertIsNone(self.run_guard({'work.ezil.registry-capacity': '36'}, 36, source='env')[0])
         for labels, count in ((None, 33), ({}, 33), ({'org.opencontainers.image.revision': 'e' * 40}, 33),
                               ({'work.ezil.registry-capacity': '32'}, 33), ({'work.ezil.registry-capacity': '033'}, 33),
                               ({'work.ezil.registry-capacity': '33'}, 34), ({'work.ezil.registry-capacity': ' 33'}, 33),
-                              ({'work.ezil.registry-capacity': '34'}, 35), ({'work.ezil.registry-capacity': '35'}, 36)):
+                              ({'work.ezil.registry-capacity': '34'}, 35), ({'work.ezil.registry-capacity': '35'}, 36), ({'work.ezil.registry-capacity': '36'}, 37)):
             for source in ('secret', 'env'):
                 with self.subTest(labels=labels, count=count, source=source):
                     outcome, _ = self.run_guard(labels, count, source=source)
@@ -213,7 +213,7 @@ class LabelTests(unittest.TestCase):
     def test_label_is_the_exact_source_constant(self):
         source = (HERE.parents[2] / 'app/src/server/lib/compute/aws-rebase-release.ts').read_text()
         result = self.capacity(source)
-        self.assertEqual((result.returncode, result.stdout), (0, '35\n'))
+        self.assertEqual((result.returncode, result.stdout), (0, '36\n'))
         self.assertIn('--label "work.ezil.registry-capacity=$registry_capacity"', DEPLOY)
         for bad in ('', 'export const REBASE_RELEASE_REGISTRY_CAPACITY = 33;\nexport const REBASE_RELEASE_REGISTRY_CAPACITY = 33;\n',
                     'const REBASE_RELEASE_REGISTRY_CAPACITY = 33;\n', 'export const REBASE_RELEASE_REGISTRY_CAPACITY = 0;\n'):
