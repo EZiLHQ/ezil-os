@@ -131,6 +131,7 @@ class Runtime(unittest.TestCase):
     def test_unknown_output_and_private_timeout_keep_uncertain_writer_fence(self):
         for code, raw, reason in [(0, b'{"unexpected":"private"}', "invalid_result"),
                                   (126, b"private exception detail", "cleanup_unconfirmed"),
+                                  (125, b"private preflight exception", "supervisor_unavailable"),
                                   (2, json.dumps({"error": {"code": "clone-failed", "message": SECRET}}).encode(), "cleanup_unconfirmed")]:
             responses = [subprocess.CompletedProcess([], 0, b"ezil-cli-bootstrap:ok"), subprocess.CompletedProcess([], code, raw)]
             with mock.patch.object(desktop, "exec_", side_effect=responses):

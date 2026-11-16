@@ -27,7 +27,7 @@ STATUS_KEYS = {"op", "seq", "ts", "leaseEpoch", "mac", "jobId"}
 DIAGNOSTIC_REASONS = frozenset({
     "bootstrap_unavailable", "workspace_unavailable", "workspace_not_ready", "folder_conflict",
     "checkout_busy", "invalid_request", "repository_not_authorized", "ref_mismatch", "clone_failed",
-    "cleanup_unconfirmed", "token_expired", "runtime_not_running", "invalid_result",
+    "cleanup_unconfirmed", "supervisor_unavailable", "token_expired", "runtime_not_running", "invalid_result",
     "admission_rejected", "admission_invalid", "admission_stopping", "status_unavailable",
     "status_invalid", "transport_unavailable", "budget_exhausted",
 })

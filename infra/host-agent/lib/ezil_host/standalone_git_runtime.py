@@ -119,4 +119,8 @@ def execute(cfg, lease, req, ready=host_ready, clock=time.monotonic, wall=time.t
                 return failure("repo_open_failed", reason), False
         except (UnicodeError, ValueError, TypeError, AttributeError):
             pass
-    return failure("repo_open_failed", "invalid_result" if result.returncode == 0 else "cleanup_unconfirmed"), True
+    # Exit125 means the reviewed supervisor could not complete its own setup/exec.
+    # It still does not prove that no writer survived; retain the same quarantine.
+    reason = "supervisor_unavailable" if result.returncode == 125 else (
+        "invalid_result" if result.returncode == 0 else "cleanup_unconfirmed")
+    return failure("repo_open_failed", reason), True
