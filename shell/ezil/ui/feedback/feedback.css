@@ -74,7 +74,7 @@
 .ezil-feedback-dialog :focus-visible { outline: 3px solid var(--fb-accent); outline-offset: 3px; }
 .ezil-feedback-dialog {
     box-sizing: border-box;
-    width: min(560px, calc(100vw - 24px));
+    width: min(480px, calc(100vw - 24px));
     max-height: calc(100dvh - 32px);
     margin: auto;
     padding: 24px;
@@ -225,3 +225,16 @@
 [data-role="capture-scope"] .ezil-feedback-link { display: inline; padding: 0; min-height: 0; border: 0; background: none; color: var(--fb-accent); text-decoration: underline; font: inherit; cursor: pointer; }
 .ezil-feedback-capture-options { margin: 8px 0; }
 .ezil-feedback-capture-options > summary { cursor: pointer; }
+
+/* Compact feedback: attachments are explicit and diagnostics stay in the preview. */
+.ezil-feedback-consents { display: flex; flex-wrap: wrap; gap: 4px 20px; margin: 8px 0; }
+.ezil-feedback-consents .ezil-feedback-consent { margin: 0; }
+.ezil-feedback-dropzone { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 10px; border: 1px dashed var(--fb-border); border-radius: 7px; }
+.ezil-feedback-dropzone .ezil-feedback-muted { margin: 0; }
+.ezil-feedback-upload { color: var(--fb-accent); text-decoration: underline; cursor: pointer; padding: 4px; }
+.ezil-feedback-dragging .ezil-feedback-dropzone { border-color: var(--fb-accent); background: var(--fb-field); }
+.ezil-feedback-images { margin-top: 8px; }
+.ezil-feedback-result:empty, #ezil-feedback-counter:empty { display: none; }
+.ezil-feedback-preview { margin-top: 12px; }
+.ezil-feedback-footer { margin-top: 8px; padding-bottom: 0; }
+@media (any-pointer: coarse) { .ezil-feedback-upload { min-height: 36px; display: inline-flex; align-items: center; } }

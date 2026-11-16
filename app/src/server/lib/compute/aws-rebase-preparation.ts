@@ -11,6 +11,11 @@ export const ReleasedPoolHostSchema = z.object({ poolHostId: RebaseUuid, lifecyc
  * omitted when absent, never together with `releasedPoolHost`; mirrors infra's RetiredSourceSchema. */
 export const RetiredSourceSchema = z.object({
     releaseExecutionArn: z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:execution:[A-Za-z0-9_-]{1,80}:computer-[0-9a-f-]{36}$/) }).strict();
+/** A STOPPED computer's dedicated (image-job launched) host, aged out of EC2. Used only when the source lower is shared in the
+ * registry: the archived launch proves the AMI. Last key, omitted when absent, never with another proof; mirrors infra's schema. */
+export const ReleasedDedicatedHostSchema = z.object({ imageJobId: RebaseUuid, provisionDigest: RebaseHash,
+    provisionExecutionArn: z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:execution:[A-Za-z0-9_-]{1,80}:computer-[0-9a-f-]{36}$/),
+    releaseExecutionArn: z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:execution:[A-Za-z0-9_-]{1,80}:computer-[0-9a-f-]{36}$/) }).strict();
 export const RebasePreparationSchema = z.object({
     schemaVersion: z.literal(1), jobId: RebaseUuid, computerId: RebaseUuid,
     sourceInstanceId: z.string().regex(/^i-[0-9a-f]{17}$/), sourceVolumeId: RebaseVolume, fsUuid: RebaseUuid,
@@ -19,6 +24,7 @@ export const RebasePreparationSchema = z.object({
     sourceDeployment: SourceLifecycleDeploymentSchema, deployment: LifecycleDeploymentSchema, createdAt: RebaseTime,
     releasedPoolHost: ReleasedPoolHostSchema.optional(),
     retiredSource: RetiredSourceSchema.optional(),
+    releasedDedicatedHost: ReleasedDedicatedHostSchema.optional(),
 }).strict().superRefine((p, ctx) => {
     const from = p.sourceDeployment, to = p.deployment;
     const machine = to.stateMachineVersionArn.replace(':stateMachine:', ':execution:').replace(/:[1-9][0-9]*$/, ':computer-');
@@ -27,9 +33,11 @@ export const RebasePreparationSchema = z.object({
         || ['accountId', 'region', 'namespace', 'zoneId', 'dataKeyArn'].some((key) => from[key as keyof typeof from] !== to[key as keyof typeof to])
         || p.volumeGiB < to.storage.dataMinGiB || p.volumeGiB > to.storage.dataMaxGiB
         // At most one retired-host proof; the release ran on this namespace's lifecycle machine, in this account and region.
-        || (p.releasedPoolHost && p.retiredSource)
+        || [p.releasedPoolHost, p.retiredSource, p.releasedDedicatedHost].filter(Boolean).length > 1
         || (p.releasedPoolHost && !p.releasedPoolHost.releaseExecutionArn.startsWith(machine))
-        || (p.retiredSource && !p.retiredSource.releaseExecutionArn.startsWith(machine)))
+        || (p.retiredSource && !p.retiredSource.releaseExecutionArn.startsWith(machine))
+        || (p.releasedDedicatedHost && (p.releasedDedicatedHost.provisionExecutionArn === p.releasedDedicatedHost.releaseExecutionArn
+            || !p.releasedDedicatedHost.provisionExecutionArn.startsWith(machine) || !p.releasedDedicatedHost.releaseExecutionArn.startsWith(machine))))
         ctx.addIssue({ code: 'custom', message: 'release_mismatch' });
 });
 export type RebasePreparation = z.infer<typeof RebasePreparationSchema>;

@@ -53,48 +53,23 @@ function refusal(run: () => unknown): LocalRequestError {
     throw new Error('expected a local refusal');
 }
 
-describe('string counting never under-counts a string in any protocol', () => {
-    const corpus = ['你好', 'a', 'name', 'quote"backslash\\', 'line\nbreak\ttab', '\u0001ctrl', '🌍', 'é', '\ud800', 'x'.repeat(100), '中文 and ascii', '</script>', ''];
-    test('Messages: the bytes of the text block it would be sent as, its JSON literal plus the 23-byte wrapper', () => {
-        expect(gatewayTokenCount('你好')).toBe(Buffer.byteLength('{"type":"text","text":"你好"}'));
-        for (const text of corpus) {
-            expect(gatewayTokenCount(text)).toBe(Buffer.byteLength(JSON.stringify(text)) + '{"type":"text","text":}'.length);
+describe('model token estimates are independent of wire bytes', () => {
+    test('short text has no repeated JSON-block tax; protocols share token units', () => {
+        for (const protocol of ['anthropic-messages', 'openai-responses'] as const) {
+            expect(gatewayTokenCount('hello world', protocol)).toBe(4);
+            expect(gatewayTokenCount('x'.repeat(3400), protocol)).toBe(1000);
+            expect(gatewayTokenCount(user('x'.repeat(3400)), protocol)).toBe(1004);
         }
     });
-    test('Responses: escaped non-ASCII as the Gateway bound counts it, plus the text-block margin', () => {
-        expect(gatewayTokenCount('你好', 'openai-responses')).toBe('{"type":"text","text":"\\u4f60\\u597d"}'.length);
-        for (const text of corpus) {
-            const inBound = escapeNonAscii(JSON.stringify(text)).length;
-            expect(gatewayTokenCount(text, 'openai-responses')).toBe(inBound + '{"type":"text","text":}'.length);
-            expect(gatewayTokenCount(text, 'openai-responses')).toBeGreaterThanOrEqual(gatewayTokenCount(text));
+    test('39 and 64 real tools leave room for history instead of consuming most of the model', () => {
+        // Budget estimates may differ from real tokenizers. They must not be inflated to cover HTTP bytes.
+        for (const [tools, bytes] of [[tools39, 53535], [tools64, 83921]] as const) {
+            expect(messagesToolBytes(qwen, tools)).toBe(bytes);
+            const tokens = copilotToolTokens(tools, gatewayTokenCount);
+            expect(tokens).toBeLessThan(30000);
+            expect(tokens).toBeGreaterThan(10000);
         }
-    });
-    test('message-level counts are unchanged: the serialized wire message, whatever the protocol', () => {
-        const message = user('你好 🌍\n"');
-        expect(gatewayTokenCount(message, 'openai-responses')).toBe(gatewayTokenCount(message));
-    });
-});
-
-describe('Copilot tool counting against real tool bytes (measured)', () => {
-    test('Messages, 39 and 64 agent tools: Copilot counts the text-block bytes, well over the real bytes', () => {
-        // Deliberately heavy (see gatewayTokenCount): this count is what starts Copilot's background compaction while
-        // its summary request still fits. A mock A/B on the image measured counting bare literals (57,539 here)
-        // leaving every growing chat refused at its 7th turn; do not "correct" it to the real bytes. 64 tools count
-        // over the 120,480 advertised input, as before 2 Nov 2026; Copilot's behaviour there is unmeasured.
-        for (const [tools, real, counted] of [[tools39, 53_535, 88_254], [tools64, 83_921, 139_882]] as const) {
-            for (const model of [kimi, qwen]) expect(messagesToolBytes(model, tools)).toBe(real);
-            const p = copilotToolTokens(tools, text => gatewayTokenCount(text));
-            expect(p).toBe(counted);
-            expect(p).toBeGreaterThan(Math.floor(real * 1.5));
-        }
-    });
-    test('Responses, 39 and 64 agent tools: the kept margin covers the bound (escaping and 128 per tool)', () => {
-        for (const [tools, bound, counted] of [[tools39, 59_199, 88_316], [tools64, 93_206, 139_968]] as const) {
-            expect(responsesToolBound(tools)).toBe(bound);
-            const p = copilotToolTokens(tools, text => gatewayTokenCount(text, 'openai-responses'));
-            expect(p).toBe(counted);
-            expect(p).toBeGreaterThanOrEqual(bound);
-        }
+        expect(responsesToolBound(tools39)).toBe(59199);
     });
 });
 

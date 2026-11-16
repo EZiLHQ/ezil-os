@@ -337,7 +337,7 @@ def prepare(snapshot, target, roles, evidence, drops, plan_sha, now, system_id=N
          and (d.get('accountId'), d.get('region'), d.get('namespace')) == (tool.ACCOUNT, tool.REGION, tool.NAMESPACE),
          'GC snapshot scope mismatch')
     records = d.get('releases')
-    need(isinstance(records, list) and 1 <= len(records) <= 26, 'GC invalid registry')
+    need(isinstance(records, list) and 1 <= len(records) <= tool.legacy_registry_capacity(), 'GC invalid registry')
     for record in records:
         manifest.validate(record, source=True, repository=tool.REPOSITORY)
         need(all(record[k] == d[k] for k in ('accountId', 'region', 'namespace', 'launchTemplateId')),

@@ -9,6 +9,9 @@ import {
   aiProxyBaseUrl,
   chooseAiCredential,
   currentModelAccess,
+  currentCreditsRelay,
+  parsePushedCreditsPending,
+  AI_CREDITS_PENDING_MAX_AGE_MS,
   deriveAiProxyToken,
   exactCacheEligible,
   exactCacheScope,
@@ -16,6 +19,9 @@ import {
   AI_PROXY_COMPLETION_TIMEOUT_MS,
   AI_PROXY_HEADERS_TIMEOUT_MS,
   AI_PROXY_STREAM_START_TIMEOUT_MS,
+  AI_PROXY_BODY_LIMITS,
+  effectiveTransport,
+  readLimited,
   handleAiProxyRequest,
   isAiProxyPath,
   isNonStreamBody,
@@ -498,7 +504,7 @@ describe('forwarding', () => {
   it('refuses an oversized request body locally without calling upstream', async () => {
     const gw = mockGateway(() => new Response('{}'));
     const res = await handleAiProxyRequest(
-      new Request(`${HOST}/ai/v1/messages`, { method: 'POST', headers: { authorization: await proxyAuth() }, body: 'x'.repeat(160 * 1024 + 1) }),
+      new Request(`${HOST}/ai/v1/messages`, { method: 'POST', headers: { authorization: await proxyAuth() }, body: 'x'.repeat(AI_PROXY_BODY_LIMITS['/v1/messages'] + 1) }),
       await deps({ fetch: gw.fetch }),
     );
     expect(res.status).toBe(413);
@@ -871,8 +877,8 @@ describe('v2 guards', () => {
     expect(gw.calls[0]!.url).toBe(`https://ai.ezil.work/v1/requests/${id}`);
   });
 
-  it('lets the gateway 413 win up to the inclusive 160 KiB local ceiling', async () => {
-    const raw = 'x'.repeat(160 * 1024);
+  it('lets the gateway 413 win up to the inclusive 4 MiB Messages local ceiling', async () => {
+    const raw = 'x'.repeat(AI_PROXY_BODY_LIMITS['/v1/messages']);
     const gw = mockGateway(() => new Response('{"error":{"code":"input_too_large"}}', { status: 413, headers: { 'x-ezil-request-id': 'size-id' } }));
     const res = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/messages`, { method: 'POST', headers: { authorization: await proxyAuth() }, body: raw }), await deps({ fetch: gw.fetch }));
     expect(res.status).toBe(413);
@@ -983,7 +989,7 @@ describe('production timeout budgets with fake timers', () => {
     let cancelled = false;
     const d = await deps({ fetch: async () => new Response(new ReadableStream({ cancel() { cancelled = true; } }),
       { headers: { 'content-type': 'text/event-stream' } }) });
-    const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }), d);
+    const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/messages`, { method: 'POST', body: '{"model":"x"}', headers: { authorization: await proxyAuth() } }), d);
     let fire!: () => void;
     const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, ms: number) => {
       expect(ms).toBe(30_000); fire = callback; return 0;
@@ -1494,4 +1500,139 @@ describe('plan model access (Free includes Gemini 3.8 Flash only)', () => {
     expect(requestModel(new TextEncoder().encode(`{"model":"${FLASH}"}`))).toBe(FLASH);
     expect(requestModel(new TextEncoder().encode('{"model":["x"]}'))).toBeNull();
   });
+});
+
+
+describe('signed receipt status is neither a grant nor wallet exhaustion', () => {
+  it('parses explicit unknown, preserves legacy omission, and ages both answers to unknown', () => {
+    for (const value of [undefined, null, true, false]) expect(parsePushedCreditsPending(value)).toEqual({ ok: true, creditsPending: value });
+    for (const value of [0, 1, 'false', {}, []]) expect(parsePushedCreditsPending(value).ok).toBe(false);
+    const now = Date.now();
+    expect(currentCreditsRelay(undefined, now)).toBe('legacy');
+    for (const [pending, expected] of [[true, 'pending'], [false, 'none'], [null, 'unknown']] as const) {
+      expect(currentCreditsRelay({ pending, signedAt: now }, now)).toBe(expected);
+      expect(currentCreditsRelay({ pending, signedAt: now - AI_CREDITS_PENDING_MAX_AGE_MS - 1 }, now)).toBe('unknown');
+    }
+    expect(currentCreditsRelay({ pending: false, signedAt: now + 1 }, now)).toBe('unknown');
+  });
+
+  for (const relay of ['pending', 'unknown', 'none', 'legacy'] as const) it(`${relay}: only unconfirmed zero becomes a nonbilling temporary error`, async () => {
+    const upstream = mockGateway(() => Response.json({ available_micro: 0, held_micro: 0 }));
+    const d = await deps({ fetch: upstream.fetch, creditsRelay: async () => relay });
+    const res = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/me/balance`, { headers: { authorization: await proxyAuth() } }), d);
+    expect(res.status).toBe(relay === 'pending' || relay === 'unknown' ? 503 : 200);
+    expect(await res.json()).toEqual(relay === 'pending' || relay === 'unknown'
+      ? { error: { code: 'os_credits_pending', message: 'Your AI credits are being confirmed. Please try again shortly.', source: 'ezil-os-proxy' } }
+      : { available_micro: 0, held_micro: 0 });
+    expect(upstream.calls).toHaveLength(1);
+    expect(d.dropped).toHaveLength(0);
+  });
+
+  it('storage read failure is unknown, while a positive wallet passes unchanged', async () => {
+    for (const available_micro of [0, 99999999]) {
+      const payload = JSON.stringify({ available_micro, held_micro: 0 });
+      const upstream = mockGateway(() => new Response(payload, { headers: { 'content-type': 'application/json', 'x-ezil-request-id': 'balance-1' } }));
+      const res = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/me/balance`, { headers: { authorization: await proxyAuth() } }),
+        await deps({ fetch: upstream.fetch, creditsRelay: async () => { throw new Error('storage unavailable'); } }));
+      expect(res.status).toBe(available_micro === 0 ? 503 : 200);
+      if (available_micro > 0) { expect(await res.text()).toBe(payload); expect(res.headers.get('x-ezil-request-id')).toBe('balance-1'); }
+    }
+  });
+
+  it('only zero/unstated credit refusals are temporary; positive request-size refusals remain real', async () => {
+    for (const available_micro of [undefined, 0, 7]) {
+      const upstream = mockGateway(() => Response.json({ error: { code: 'insufficient_credits', ...(available_micro === undefined ? {} : { available_micro }) } }, { status: 402 }));
+      const res = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/messages`, { method: 'POST', headers: { authorization: await proxyAuth() }, body: JSON.stringify({ model: 'ezil-fast' }) }),
+        await deps({ fetch: upstream.fetch, creditsRelay: async () => 'unknown' }));
+      expect(res.status).toBe(available_micro === 7 ? 402 : 503);
+      expect((await res.json() as { error: { code: string } }).error.code).toBe(available_micro === 7 ? 'insufficient_credits' : 'os_credits_pending');
+      expect(upstream.calls).toHaveLength(1);
+    }
+  });
+
+  it('bounds a stalled successful balance body and cancels it', async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode('{')); }, cancel() { cancelled = true; } });
+    const upstream = mockGateway(() => new Response(body, { headers: { 'content-type': 'application/json' } }));
+    const started = Date.now();
+    const res = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/me/balance`, { headers: { authorization: await proxyAuth() } }),
+      await deps({ fetch: upstream.fetch, creditsRelay: async () => 'pending', idleTimeoutMs: 10 }));
+    expect(res.status).toBe(504);
+    expect((await res.json() as { error: { code: string } }).error.code).toBe('os_ai_unavailable');
+    expect(cancelled).toBe(true);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+});
+
+// Endpoint readers count actual bytes, independent of token admission and Content-Length.
+describe('effective endpoint body contract', () => {
+  const transport = { contract: 'ezil.gateway.transport.v1', max_request_bytes: AI_PROXY_BODY_LIMITS,
+    input_bound_method: 'utf8_json_plus_framing', token_limits_unit: 'tokens' };
+  it('clamps advertised caps and never upgrades unknown contracts', async () => {
+    expect(effectiveTransport({ ...transport, max_request_bytes: { '/v1/messages': 99999999, '/v1/responses': 99999999 } })).toEqual(transport);
+    for (const value of [null, {}, { ...transport, contract: 'future' }, { ...transport, token_limits_unit: 'bytes' },
+      { ...transport, max_request_bytes: { '/v1/messages': -1, '/v1/responses': 262144 } }]) expect(effectiveTransport(value)).toBeUndefined();
+    const gw = mockGateway(() => Response.json({ data: [], transport: { ...transport, max_request_bytes: { '/v1/messages': 200000, '/v1/responses': 200000 } } }));
+    const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }), await deps({ fetch: gw.fetch }));
+    expect((await response.json()).transport.max_request_bytes).toEqual({ '/v1/messages': 200000, '/v1/responses': 200000 });
+  });
+  for (const [path, cap] of Object.entries(AI_PROXY_BODY_LIMITS)) {
+    it(`${path} inclusive cap passes once; cap+1 cancels without upstream`, async () => {
+      for (const extra of [0, 1]) {
+        let cancelled = false, reads = 0;
+        const body = new ReadableStream<Uint8Array>({ pull(controller) {
+          reads++;
+          if (reads === 1) controller.enqueue(new Uint8Array(cap));
+          else if (extra && reads === 2) controller.enqueue(new Uint8Array(1));
+          else controller.close();
+        }, cancel() { cancelled = true; } }, { highWaterMark: 0 });
+        const gw = mockGateway(() => Response.json({ ok: true }));
+        const response = await handleAiProxyRequest(new Request(`${HOST}/ai${path}`, {
+          method: 'POST', headers: { authorization: await proxyAuth(), 'content-length': '1' }, body, duplex: 'half',
+        } as RequestInit), await deps({ fetch: gw.fetch }));
+        expect(response.status).toBe(extra ? 413 : 200);
+        await response.text();
+        expect(gw.calls.length).toBe(extra ? 0 : 1);
+        expect(cancelled).toBe(!!extra);
+      }
+    });
+  }
+  it('reader counts multibyte UTF-8 and cancels the oversized stream', async () => {
+    let cancelled = false;
+    const body = new ReadableStream<Uint8Array>({ start(c) { c.enqueue(new TextEncoder().encode('字'.repeat(4))); }, cancel() { cancelled = true; } });
+    expect(await readLimited(body, 11)).toBeNull();
+    expect(cancelled).toBe(true);
+  });
+});
+
+it('qualified >160 KiB multi-turn request crosses extension and OS proxy exactly once', async () => {
+  const { gatewayChat, gatewayModels, withGatewayModelLimits } = await import('../../extensions/ezil-models/src/gateway');
+  const { gw: fixtureModel, ask, msg, txt } = await import('../../extensions/ezil-models/tests/fixtures/gateway');
+  const { messageJson } = await import('../../extensions/ezil-models/tests/fixtures/gateway-response');
+  const transport = { contract: 'ezil.gateway.transport.v1', max_request_bytes: { '/v1/messages': 200000, '/v1/responses': 200000 },
+    input_bound_method: 'utf8_json_plus_framing', token_limits_unit: 'tokens' };
+  const base = { ...fixtureModel(), maxInputTokens: 983040, stream: false };
+  const upstream = mockGateway(async request => {
+    if (new URL(request.url).pathname === '/v1/models') return Response.json({ transport, data: [{ id: base.model, enabled: true,
+      max_input_tokens: 983040, max_output_tokens: 8192, protocols: ['anthropic-messages'] }] });
+    const bytes = new Uint8Array(await request.arrayBuffer());
+    expect(bytes.byteLength).toBeGreaterThan(160 * 1024);
+    expect(bytes.byteLength).toBeLessThanOrEqual(200000);
+    expect(bytes.byteLength + 1056).toBeLessThanOrEqual(983040);
+    return Response.json(messageJson());
+  });
+  const d = await deps({ fetch: upstream.fetch });
+  const fetchProxy = (async (url: string | URL | Request, init?: RequestInit) => handleAiProxyRequest(new Request(url, init), d)) as typeof fetch;
+  const configured = { ...base, provider: { ...base.provider, baseUrl: `${HOST}/ai/v1`, apiKey: (await proxyAuth()).slice(7) } };
+  const catalog = await gatewayModels(configured.provider, fetchProxy);
+  const selected = withGatewayModelLimits(configured, catalog);
+  expect(selected.gatewayMaxRequestBytes).toBe(200000);
+  const history = [msg('system', txt('SYSTEM-SENTINEL'))];
+  for (let turn = 0; turn < 20; turn++) history.push(msg('user', txt('字'.repeat(2800))), msg('assistant', txt('ok')));
+  history.push(msg('user', txt('current turn')));
+  let compacted = false;
+  for await (const _ of gatewayChat(selected, ask(history), { signal: new AbortController().signal, fetch: fetchProxy, onCompact: () => { compacted = true; } })) {}
+  expect(upstream.calls.map(call => call.method)).toEqual(['GET', 'POST']);
+  expect(compacted).toBe(false);
+  expect(JSON.stringify(d.logs)).not.toContain('SYSTEM-SENTINEL');
 });

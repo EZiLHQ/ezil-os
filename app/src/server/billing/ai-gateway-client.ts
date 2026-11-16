@@ -2,6 +2,11 @@ import { createHmac } from 'node:crypto';
 import type { AiCreditEntitlement } from './ai-credits';
 
 export const AI_GATEWAY_TIMEOUT_MS = 10_000;
+/** A request budget must be finite, positive and at most the sweep's 10 s: a shorter one is for the sign-in attempt only. */
+export function aiRequestTimeoutMs(value: number): number {
+    if (!Number.isFinite(value) || value <= 0 || value > AI_GATEWAY_TIMEOUT_MS) throw new RangeError('invalid_ai_timeout');
+    return value;
+}
 export type AiGatewayEvent = AiCreditEntitlement & { eventId: string; accountPublicId: string; action: 'grant' | 'revoke' | 'restore' };
 export const AI_RESTORE_OUTCOMES = ['restored', 'already_restored', 'restore_refused_terminal', 'restore_expired', 'restore_nothing_forfeited'] as const;
 export type AiRestoreOutcome = typeof AI_RESTORE_OUTCOMES[number];
@@ -25,14 +30,17 @@ export async function withAiTimeout<T>(ms: number, operation: (signal: AbortSign
 
 export async function sendAiCreditEvent(input: {
     url: string; secret: string; event: AiGatewayEvent; now?: () => number; fetch?: typeof fetch; log?: AiLogger;
+    /** The whole request budget (default 10 s); the sign-in starter delivery passes a shorter one. */
+    timeoutMs?: number;
 }): Promise<AiGatewayResult> {
+    const timeoutMs = aiRequestTimeoutMs(input.timeoutMs ?? AI_GATEWAY_TIMEOUT_MS);
     const { event } = input;
     // Serialize exactly once. Neither delivery metadata nor credentials belong in the body.
     const rawBody = JSON.stringify({ eventId: event.eventId, entitlementId: event.entitlementId,
         accountPublicId: event.accountPublicId, action: event.action, credits: event.credits, expiresAt: event.expiresAt });
     const timestamp = String(Math.floor((input.now ?? Date.now)() / 1000));
     try {
-        return await withAiTimeout(AI_GATEWAY_TIMEOUT_MS, async signal => {
+        return await withAiTimeout(timeoutMs, async signal => {
             const response = await (input.fetch ?? fetch)(`${input.url.replace(/\/$/, '')}/v1/integrations/entitlements`, {
                 method: 'POST', redirect: 'error', signal, headers: { 'Content-Type': 'application/json',
                     'X-EZiL-Timestamp': timestamp, 'X-EZiL-Signature': signAiGatewayBody(input.secret, timestamp, rawBody) }, body: rawBody,

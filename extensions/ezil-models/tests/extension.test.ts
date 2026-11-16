@@ -9,7 +9,7 @@ import { fakeVscode } from './fixtures/fake-vscode';
 import { isAppFailure } from '../src/failure';
 
 mock.module('vscode', () => fakeVscode);
-const { activate, appStartFailure, CATALOG_RECOVERY_MS, CONFIG_ENV, ConfigStore, resolveConfigPath, settingsSnippet } = await import('../src/extension');
+const { activate, appStartFailure, CATALOG_RECOVERY_MS, CONFIG_ENV, ConfigStore, UsageTracker, resolveConfigPath, settingsSnippet } = await import('../src/extension');
 const { parseModelsConfig } = await import('../src/config');
 
 const VALID = JSON.stringify({ providers: { p: { type: 'openai', apiKey: 'sk-abc-12345' } }, models: [{ id: 'm', provider: 'p', model: 'gpt-5.5', roles: ['default', 'utility'] }] });
@@ -273,4 +273,15 @@ test('resolveConfigPath: env wins over the setting, the setting over the default
 test('settingsSnippet maps roles to the Copilot Chat settings, never chat.defaultModel (it would override a picked model)', () => {
     const config = parseModelsConfig(VALID);
     expect(settingsSnippet(config.models)).toEqual({ 'chat.allowAnonymousAccess': true, 'chat.byokUtilityModelDefault': 'mainAgent', 'chat.utilityModel': 'ezil/m' });
+});
+
+
+test('usage tracker never reports missing cache usage as a zero or a complete total', () => {
+    const tracker = new UsageTracker();
+    const model = parseModelsConfig(VALID).models[0]!;
+    tracker.record(model, { inputTokens: 100, outputTokens: 10, cacheReadTokens: 30, cacheWriteTokens: 0 }, 20);
+    tracker.record(model, { inputTokens: 200, outputTokens: 20 }, 30);
+    tracker.record(model, { inputTokens: 300, outputTokens: 30, cacheReadTokens: 50, cacheWriteTokens: 10 }, 40);
+    expect(tracker.perModel.get(model.id)).toMatchObject({ requests: 3, inputTokens: 600, outputTokens: 60, cacheReadTokens: undefined, cacheWriteTokens: undefined });
+    expect(tracker.report()).toContain('unknown');
 });

@@ -19,6 +19,17 @@ import rebase_manifest as release
 ACCOUNT = "452630323510"
 REGION = "ap-south-1"
 KEY = "EZIL_AWS_LIFECYCLE_DEPLOYMENTS"
+# Frozen legacy limits per namespace: each namespace's historical GC and the registry size every older app
+# of that namespace reads. mum (billing staging) stays a 32-record tool and refuses 33; prd stays a
+# 26-record tool and refuses 27. Never widened or shrunk; callers read legacy_registry_capacity().
+LEGACY_REGISTRY_CAPACITY = {"mum": 32, "prd": 26}
+# Compatibility name for the mum legacy limit only; every GC and proof threshold uses legacy_registry_capacity().
+RELEASE_REGISTRY_CAPACITY = LEGACY_REGISTRY_CAPACITY["mum"]
+# Every active operator reader and the normal append, in both namespaces. It equals the app's
+# REBASE_RELEASE_REGISTRY_CAPACITY (app/src/server/lib/compute/aws-rebase-release.ts); records past the
+# namespace legacy limit may only be appended once the running app proves it reads them (rebase_release.py,
+# normal apply-app then promote).
+ACTIVE_REGISTRY_CAPACITY = 37
 BASE_ALLOWED = {"DesktopImageDigest", "DesktopImageId", "AgentSrcS3Uri"}
 PREVIOUS = {"PreviousDesktopImageDigest", "PreviousDesktopImageId"}
 ALLOWED = BASE_ALLOWED | PREVIOUS
@@ -64,6 +75,14 @@ def need(ok, message):
 
 
 use_namespace("mum")
+
+
+def legacy_registry_capacity():
+    """The selected namespace's frozen legacy limit (GC and every pre-proof reader threshold)."""
+    need(NAMESPACE in PROFILES and NAMESPACE in LEGACY_REGISTRY_CAPACITY, "unknown operator namespace")
+    capacity = LEGACY_REGISTRY_CAPACITY[NAMESPACE]
+    need(1 <= capacity < ACTIVE_REGISTRY_CAPACITY, "legacy registry capacity must stay below the active capacity")
+    return capacity
 
 
 def read(path):
@@ -139,7 +158,7 @@ def pair(config):
 
 def validate_registry(d):
     records = d['releases']
-    need(isinstance(records, list) and len(records) <= 26, 'invalid release registry')
+    need(isinstance(records, list) and len(records) <= ACTIVE_REGISTRY_CAPACITY, 'invalid release registry')
     need(records or not set(release.TUPLE) & d.keys(), 'tuple requires a retained registry')
     for record in records:
         release.validate(record, source=True, repository=REPOSITORY)
@@ -989,14 +1008,14 @@ def edit_release_secret(envelope, before, after, records):
     """CAS the complete tuple and append immutable records; capacity fails closed.
 
     Retaining ALL records satisfies placement/job retention without racing the DB.
-    A separately reviewed garbage collector is required when all twenty-six slots are full.
+    All ACTIVE_REGISTRY_CAPACITY slots full needs a separately reviewed successor; nothing is ever dropped.
     """
     updated = edit_secret(envelope, before, after)
     raw = updated[KEY]
     deployments = release.loads(raw) if isinstance(raw, str) else copy.deepcopy(raw)
     d = deployments[REGION]
     retained = d.get("releases", [])
-    need(isinstance(retained, list) and len(retained) <= 26, "invalid release registry")
+    need(isinstance(retained, list) and len(retained) <= ACTIVE_REGISTRY_CAPACITY, "invalid release registry")
     for record in retained:
         release.validate(record, source=True, repository=REPOSITORY)
         need(all(record[k] == d[k] for k in ("accountId", "region", "namespace", "launchTemplateId")), "foreign registry record")
@@ -1008,7 +1027,7 @@ def edit_release_secret(envelope, before, after, records):
         need(all(identity(r) != identity(record) or r == record for r in retained), "immutable release pair rewrite refused")
         if record not in retained:
             retained.append(copy.deepcopy(record))
-    need(1 <= len(retained) <= 26, "release registry full; retained placement/job evidence must never be dropped")
+    need(1 <= len(retained) <= ACTIVE_REGISTRY_CAPACITY, "release registry full; retained placement/job evidence must never be dropped")
     retained.sort(key=lambda r: r["createdAt"])
     targets = [r for r in retained if all(r[k] == after.get(k) for k in release.PROMOTION)]
     # Legacy rollback remains a source-only deployment, never a rebase target.
@@ -1016,10 +1035,13 @@ def edit_release_secret(envelope, before, after, records):
         need(len(targets) == 1, "target release is not unique")
         release.validate(targets[0], repository=REPOSITORY)
     d["releases"] = retained
-    readback = {"gitSha": "0" * 40, "killSwitch": "1", "deployment": rebase_app.public_deployment(d)}
+    readback = {"gitSha": "0" * 40, "killSwitch": "1", "deployment": rebase_app.public_deployment(d),
+                "readerCapacity": ACTIVE_REGISTRY_CAPACITY}
     need(len(json.dumps(readback, separators=(",", ":")).encode("utf-8")) <= 24000,
          'release registry readback exceeds SSM 24000-byte limit')
     updated[KEY] = json.dumps(deployments, separators=(",", ":")) if isinstance(raw, str) else deployments
+    need(len(json.dumps(updated, separators=(",", ":")).encode("utf-8")) <= 65536,
+         "app SecretString exceeds Secrets Manager 65536-byte limit")
     return updated
 
 

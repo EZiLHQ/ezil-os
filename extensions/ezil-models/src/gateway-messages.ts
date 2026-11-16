@@ -1,3 +1,4 @@
+import { estimateTextTokens, estimateMessageTokens } from './tokens';
 // The Bedrock Converse subset of Anthropic Messages. Construct envelopes from an allowlist;
 // never forward Copilot's provider-specific options, cache markers or unsigned thinking.
 import { applyCacheBreakpoints } from './anthropic';
@@ -31,19 +32,36 @@ export const QWEN = 'qwen.qwen3-coder-next';
 export const KIMI = 'us.moonshotai.kimi-k3';
 /**
  * Gateway aliases that refuse `temperature`/`top_p` (EZiL AI Gateway src/providers/gemini-request.ts): Google ignores
- * sampling on gemini-3.8-flash and gemini-4-carbon, and gemini-4-argon's handling is unverified, so the Gateway refuses
- * the request rather than drop or forward them. They are never sent for these aliases, whatever Copilot or the config pass.
+ * sampling on gemini-3.8-flash and gemini-4-carbon, and gemini-4-argon's handling is unverified, so the Gateway refuses the request rather
+ * than drop or forward them. They are never sent for these aliases, whatever Copilot or the config pass.
  */
 export const SAMPLING_REFUSED: ReadonlySet<string> = new Set(['gemini-3.8-flash', 'gemini-4-argon', 'gemini-4-carbon']);
 export function samplingRefused(alias: string): boolean { return SAMPLING_REFUSED.has(alias.trim().toLowerCase()); }
-export const GATEWAY_INPUT_TOKENS = 131_072;
+/** Conservative HTTP fallback for servers without the transport contract. */
+export const GATEWAY_INPUT_BYTES = 131_072;
 export const INPUT_FRAMING = 1056;
-export const ENVELOPE_RESERVE = 1536;
-// Copilot 0.69 counts its tool definitions (38 tools, 54,221 bytes in Agent mode, image e2e
-// 2026-10-20) against maxInputTokens itself: a 60 KB reserve double-counted them and forced history
-// summarisation on a near-empty conversation. Keep only a margin for counting differences (Copilot
-// never counts schema numbers, booleans or punctuation); the byte bound in buildGatewayBody still
-// refuses anything over the gateway limit before sending (LocalRequestError, nothing sent).
+export const TRANSPORT_CONTRACT = 'ezil.gateway.transport.v1';
+export const ENDPOINT_MAX_BYTES = { '/v1/messages': 4_194_304, '/v1/responses': 262_144 } as const;
+export type GatewayTransport = { contract: typeof TRANSPORT_CONTRACT; max_request_bytes: Record<keyof typeof ENDPOINT_MAX_BYTES, number>;
+    input_bound_method: 'utf8_json_plus_framing'; token_limits_unit: 'tokens' };
+/** Unknown/malformed contracts never relax the fallback; advertised limits can only lower verified hard caps. */
+export function parseGatewayTransport(value: unknown): GatewayTransport | undefined {
+    if (!isObject(value) || value.contract !== TRANSPORT_CONTRACT || value.input_bound_method !== 'utf8_json_plus_framing'
+        || value.token_limits_unit !== 'tokens' || !isObject(value.max_request_bytes)) return undefined;
+    const caps = {} as GatewayTransport['max_request_bytes'];
+    for (const path of Object.keys(ENDPOINT_MAX_BYTES) as (keyof typeof ENDPOINT_MAX_BYTES)[]) {
+        const cap = value.max_request_bytes[path];
+        if (!Number.isSafeInteger(cap) || (cap as number) <= 0) return undefined;
+        caps[path] = Math.min(cap as number, ENDPOINT_MAX_BYTES[path]);
+    }
+    return { contract: TRANSPORT_CONTRACT, max_request_bytes: caps, input_bound_method: 'utf8_json_plus_framing', token_limits_unit: 'tokens' };
+}
+export function gatewayRequestBytes(model: Pick<ResolvedModel, 'gatewayProtocol' | 'gatewayMaxRequestBytes'>): number {
+    const hard = ENDPOINT_MAX_BYTES[model.gatewayProtocol === 'openai-responses' ? '/v1/responses' : '/v1/messages'];
+    const cap = model.gatewayMaxRequestBytes;
+    return Number.isSafeInteger(cap) && cap! > 0 ? Math.min(hard, cap!) : GATEWAY_INPUT_BYTES;
+}
+// Margin in model tokens for uncounted tool framing/schema, after counting the actual definitions.
 export const DEFAULT_TOOL_RESERVE = 8_000;
 const TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
 type ObjectValue = Record<string, unknown>;
@@ -113,7 +131,7 @@ export function gatewayTools(tools: readonly Tool[], log: (line: string) => void
 export const GEMINI_ALIASES: ReadonlySet<string> = new Set(['gemini-3.8-flash', 'gemini-3.1-pro-preview', 'gemini-4-argon', 'gemini-4-carbon']);
 export function geminiRoute(alias: string): boolean { return GEMINI_ALIASES.has(alias.trim().toLowerCase()); }
 /** The Gateway's GEMINI_SCHEMA_KEYWORDS, exactly. */
-const GEMINI_SCHEMA_KEYWORDS: ReadonlySet<string> = new Set([
+export const GEMINI_SCHEMA_KEYWORDS: ReadonlySet<string> = new Set([
     'type', 'properties', 'required', 'additionalProperties', 'enum', 'format', 'minimum', 'maximum',
     'items', 'prefixItems', 'minItems', 'maxItems', 'anyOf', '$ref', '$defs', 'title', 'description',
     '$schema', '$id', '$comment', 'default', 'examples',
@@ -243,27 +261,46 @@ function partText(part: Part): string {
     return '[tool call omitted]';
 }
 
-/**
- * The native-route boundary for replaying signed thinking: only the Gateway's native Anthropic routes (Claude through
- * the Anthropic API, `claude-…`, or Bedrock InvokeModel, `[geo.]anthropic.claude-…`: both forward the provider's own SSE
- * and accept its own signed thinking back) get prior
- * thinking blocks. Every other route drops them as before: Bedrock Converse (Kimi) rejects prior thinking blocks, and
- * other providers never issued a signature. Decided by the explicit Claude model id, never by `family` (it defaults
- * to `gpt`) or by the protocol (Converse models speak anthropic-messages too).
- */
+/** Native Claude routes replay their provider thinking. Exact Gemini aliases use
+ * ordered empty signature envelopes instead; all other routes discard thinking. */
 const NATIVE_ANTHROPIC_MODEL = /^(?:(?:[a-z]{2,6}\.)?anthropic\.)?claude-[a-z0-9.:-]+$/;
 export function replaysThinking(model: string): boolean {
-    return NATIVE_ANTHROPIC_MODEL.test(model);
+    return NATIVE_ANTHROPIC_MODEL.test(model) || geminiRoute(model);
+}
+
+export function geminiSignedPart(part: Part): boolean {
+    return part.type === 'thinking' && part.value === '' && part.metadata?._completeThinking === ''
+        && typeof part.metadata?.signature === 'string' && /^ezil-gemini-v1:[A-Za-z0-9+/=_-]{1,1048576}$/.test(part.metadata.signature)
+        && part.metadata.redactedData === undefined;
 }
 
 /** One message before conversation pairing, also used for byte counting (conservatively, with thinking). No synthetic history here. */
-export function gatewayMessage(message: Message, replayThinking = true): { role: Message['role']; content: Block[] } {
+export function gatewayMessage(message: Message, replayThinking: boolean | 'gemini' = true): { role: Message['role']; content: Block[] } {
     const content: Block[] = [];
     const thinking: ThinkingBlock[] = [];
+    if (replayThinking === 'gemini') {
+        // A signature belongs only to its immediate next original part. Never let a
+        // dropped/invalid part move it to another call. Logical turns merge before this conversion.
+        for (let i = 0; i < message.parts.length; i++) {
+            const part = message.parts[i]!;
+            if (part.type === 'thinking') continue;
+            const converted = gatewayMessage({ ...message, parts: [part] }, false).content;
+            const prior = message.parts[i - 1];
+            const validTarget = (part.type === 'text' && part.value !== '')
+                || (part.type === 'tool_call' && converted[0]?.type === 'tool_use');
+            if (message.role === 'assistant' && prior?.type === 'thinking' && geminiSignedPart(prior) && validTarget) {
+                content.push({ type: 'thinking', thinking: '', signature: prior.metadata!.signature as string });
+            }
+            if ((part.type === 'text' && !part.value) || isCacheMarker(part) || isStatefulMarker(part)) continue;
+            content.push(...converted);
+        }
+        return { role: message.role, content: content.length ? content : [text('(empty)')] };
+    }
     for (const part of message.parts) {
         if (part.type === 'thinking') {
             if (message.role !== 'assistant' || !replayThinking) continue;
             const meta = part.metadata ?? {};
+            if (typeof meta.signature === 'string' && meta.signature.startsWith('ezil-gemini-v1:')) continue;
             if (typeof meta.redactedData === 'string') thinking.push({ type: 'redacted_thinking', data: meta.redactedData });
             else if (typeof meta._completeThinking === 'string' && typeof meta.signature === 'string' && meta.signature) {
                 thinking.push({ type: 'thinking', thinking: meta._completeThinking, signature: meta.signature });
@@ -285,12 +322,21 @@ export function gatewayMessage(message: Message, replayThinking = true): { role:
 
 /** Adapted from #160's pairing repair. Merge roles first; preserve orphan output as plain text and
  * synthesize explicit failed results for cancelled calls. Never invent a successful tool result. */
-export function gatewayConversation(messages: readonly Message[], tools: readonly GatewayTool[], replayThinking = false): { system: TextBlock[]; messages: GatewayMessage[] } {
+export function gatewayConversation(messages: readonly Message[], tools: readonly GatewayTool[], replayThinking: boolean | 'gemini' = false): { system: TextBlock[]; messages: GatewayMessage[] } {
     const system: TextBlock[] = [];
     const turns: GatewayMessage[] = [];
     const names = new Set(tools.map(tool => tool.name));
     const seen = new Set<string>();
-    for (const message of messages) {
+    const source: Message[] = [];
+    if (replayThinking === 'gemini') {
+        source.push(...messages.filter(message => message.role === 'system'));
+        for (const message of messages.filter(message => message.role !== 'system')) {
+            const prior = source.at(-1);
+            if (prior?.role === message.role) prior.parts.push(...message.parts);
+            else source.push({ ...message, parts: [...message.parts] });
+        }
+    } else source.push(...messages);
+    for (const message of source) {
         if (message.role === 'system') {
             for (const part of message.parts) { const value = partText(part); if (value) system.push(text(value)); }
             continue;
@@ -302,6 +348,9 @@ export function gatewayConversation(messages: readonly Message[], tools: readonl
             seen.add(block.id);
             return block;
         });
+        if (replayThinking === 'gemini') for (let i = content.length - 2; i >= 0; i--) {
+            if (content[i]?.type === 'thinking' && converted.content[i + 1]?.type === 'tool_use' && content[i + 1]?.type !== 'tool_use') content.splice(i, 1);
+        }
         const previous = turns.at(-1);
         if (previous?.role === message.role) previous.content.push(...content);
         else turns.push({ role: message.role, content });
@@ -314,7 +363,7 @@ export function gatewayConversation(messages: readonly Message[], tools: readonl
         if (turn.role === 'assistant') {
             // Merging adjacent assistant messages must also keep signed/redacted thinking before ordinary content.
             const isThinking = (block: Block) => block.type === 'thinking' || block.type === 'redacted_thinking';
-            turn.content = [...turn.content.filter(isThinking), ...turn.content.filter(block => !isThinking(block))];
+            if (replayThinking !== 'gemini') turn.content = [...turn.content.filter(isThinking), ...turn.content.filter(block => !isThinking(block))];
             pending = new Set(turn.content.filter((block): block is ToolUse => block.type === 'tool_use').map(block => block.id));
             continue;
         }
@@ -335,8 +384,17 @@ export function gatewayOutputTokens(model: Pick<ResolvedModel, 'model' | 'maxOut
     return Math.max(16, Math.min(16_384, Math.floor(Number.isFinite(model.maxOutputTokens) ? model.maxOutputTokens : fallback)));
 }
 
-export function gatewayInputTokens(model: Pick<ResolvedModel, 'maxInputTokens' | 'toolReserve'>): number {
-    return Math.max(1, Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens) - INPUT_FRAMING - ENVELOPE_RESERVE - (model.toolReserve ?? DEFAULT_TOOL_RESERVE));
+/** Safe history budget in MODEL TOKENS, independent of the legacy HTTP byte bound.
+ * System/tool contents are counted by Copilot; these reserves cover uncounted framing/schema and summary growth. */
+export const SUMMARY_RESERVE_TOKENS = 8192;
+export const SYSTEM_RESERVE_TOKENS = 2048;
+export function gatewayInputTokens(model: Pick<ResolvedModel, 'maxInputTokens' | 'toolReserve'> & Partial<Pick<ResolvedModel, 'contextWindowTokens' | 'maxOutputTokens' | 'model' | 'gatewayMaxRequestBytes'>>): number {
+    const output = gatewayOutputTokens({ model: model.model ?? '', maxOutputTokens: model.maxOutputTokens ?? 8192 });
+    // All quantities here are TOKENS. Explicit local capacity can only tighten the input allowance.
+    // Legacy metadata has no combined context capacity: use a conservative local budget estimate.
+    const available = model.contextWindowTokens !== undefined ? Math.min(model.maxInputTokens, model.contextWindowTokens - output)
+        : model.gatewayMaxRequestBytes !== undefined ? model.maxInputTokens : Math.min(131_072, model.maxInputTokens) - output;
+    return Math.max(1, available - SUMMARY_RESERVE_TOKENS - SYSTEM_RESERVE_TOKENS - (model.toolReserve ?? DEFAULT_TOOL_RESERVE));
 }
 
 export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log?: (line: string) => void): { body: GatewayBody; bytes: Uint8Array<ArrayBuffer> } {
@@ -348,7 +406,7 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
             + 'features this model cannot take, or they are invalid; see the EZiL Models log). Nothing was sent or charged. Pick another model, '
             + 'or turn those tools off with Configure Tools', undefined, 'local_tools_unsupported', undefined, undefined, 'local');
     }
-    const conversation = gatewayConversation(request.messages, tools, replaysThinking(model.model));
+    const conversation = gatewayConversation(request.messages, tools, geminiRoute(model.model) ? 'gemini' : replaysThinking(model.model));
     const body: GatewayBody = {
         model: model.model, messages: conversation.messages, max_tokens: gatewayOutputTokens(model),
         stream: model.model !== KIMI && model.stream !== false,
@@ -369,38 +427,19 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
     const bytes = new TextEncoder().encode(JSON.stringify(body));
     // The Gateway's limits: 1024 messages, 1024 blocks in one message, body + framing within the input allowance.
     const counts = (): LocalRequestCounts => ({
-        bodyBytes: bytes.byteLength, limitBytes: Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens) - INPUT_FRAMING,
+        bodyBytes: bytes.byteLength, limitBytes: Math.min(gatewayRequestBytes(model) - (model.gatewayMaxRequestBytes === undefined ? INPUT_FRAMING : 0), model.maxInputTokens - INPUT_FRAMING),
         messages: body.messages.length, maxBlocks: body.messages.reduce((most, message) => Math.max(most, message.content.length), 0),
         tools: tools.length, toolBytes: tools.length ? Buffer.byteLength(JSON.stringify(tools), 'utf8') : 0,
     });
     if (body.messages.length > 1024) throw new LocalRequestError('local_too_many_messages', counts());
     if (body.messages.some(message => message.content.length > 1024)) throw new LocalRequestError('local_too_many_blocks', counts());
-    if (bytes.byteLength + INPUT_FRAMING > Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens)) throw new LocalRequestError('local_input_too_large', counts());
+    if (bytes.byteLength > gatewayRequestBytes(model) || bytes.byteLength + INPUT_FRAMING > model.maxInputTokens
+        || (model.gatewayMaxRequestBytes === undefined && bytes.byteLength + INPUT_FRAMING > GATEWAY_INPUT_BYTES)) throw new LocalRequestError('local_input_too_large', counts());
     return { body, bytes };
 }
 
-/**
- * Copilot 0.69 calls this for its own tool definitions against maxInputTokens (countToolTokens: one
- * countTokens(string) per schema key and string value; numbers, booleans and falsy entries are not passed; plus 8
- * per tool, 16, and 10%), for its tool budget arithmetic and for its text tool-result cap. Its prompt renderer
- * counts message text with its own o200k_base tokenizer, not this call. A string counts as the text block it would be
- * sent as, 23 bytes over its JSON literal for ASCII. Keep that: Copilot starts background compaction when message
- * plus tool tokens reach 0.78-0.82 of the advertised input, and this heavier tool count starts it while its summary
- * request still fits the byte bound. Measured with a mock on the image (38 agent tools, 53,066 wire bytes; Qwen, 10
- * turns of about 8.5 KB; 3 Nov 2026): this count (about 87,400) compacted and completed all 10 turns; bare literals
- * (about 57,100) delayed compaction until the summary itself was over the bound, and every chat was refused from its
- * 7th turn. 64 tools count over the advertised input (unmeasured). The Responses bound also escapes non-ASCII tool
- * text and adds 128 bytes per tool and 32 per item, so Responses strings count escaped. Messages count as their
- * serialized wire message.
- */
-export function gatewayTokenCount(value: string | Message, protocol: GatewayProtocol = 'anthropic-messages'): number {
-    if (typeof value === 'string') {
-        const block = JSON.stringify(text(value));
-        return protocol === 'openai-responses' ? escapeNonAscii(block).length : Buffer.byteLength(block, 'utf8');
-    }
-    if (value.role === 'system') {
-        const blocks = value.parts.map(partText).filter(Boolean).map(text);
-        return blocks.length ? Buffer.byteLength(JSON.stringify(blocks), 'utf8') : 0;
-    }
-    return Buffer.byteLength(JSON.stringify(gatewayMessage(value)), 'utf8');
+/** Cheap local token estimate. Transport limits are checked on the serialized body before dispatch;
+ * JSON punctuation/escaping is never deliberately inflated to provoke a paid background summary. */
+export function gatewayTokenCount(value: string | Message, _protocol: GatewayProtocol = 'anthropic-messages'): number {
+    return typeof value === 'string' ? estimateTextTokens(value) : estimateMessageTokens(value);
 }

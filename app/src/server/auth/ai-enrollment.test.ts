@@ -8,9 +8,11 @@ import type { OutboxInsert } from '@/server/billing/ports';
 vi.mock('server-only', () => ({}));
 const stub = vi.hoisted(() => ({
     config: vi.fn(), postgres: vi.fn(), socket: vi.fn(), sharedDb: vi.fn(),
-    listUsers: vi.fn(), createUser: vi.fn(), generateLink: vi.fn(), verifyOtp: vi.fn(),
+    listUsers: vi.fn(), createUser: vi.fn(), generateLink: vi.fn(), verifyOtp: vi.fn(), starter: vi.fn(),
 }));
 vi.mock('@/server/billing/config', () => ({ readBillingConfig: stub.config }));
+// The scoped starter delivery has its own suite (billing/ai-starter-delivery.test.ts); here only its call and outcome matter.
+vi.mock('@/server/billing/ai-starter-delivery', () => ({ deliverStarterCredits: stub.starter }));
 vi.mock('postgres', () => ({ default: stub.postgres }));
 vi.mock('node:net', () => ({ Socket: class { constructor() { return stub.socket(); } } }));
 vi.mock('@/server/db', () => { stub.sharedDb(); throw new Error('Shared pool must not be imported'); });
@@ -182,6 +184,7 @@ beforeEach(() => {
     holdStage = undefined; failStage = undefined;
     held = new Promise<void>(resolve => { releaseHeld = resolve; });
     stub.config.mockReturnValue({ fundingUrl: STAGING, fundingHmacSecret });
+    stub.starter.mockResolvedValue('queued');
     stub.socket.mockImplementation(() => { const socket = new FakeSocket(); sockets.push(socket); return socket; });
     stub.postgres.mockImplementation((_url: string, options: ClientOptions) => {
         const client = new FakeClient(options); clients.push(client); return client;
@@ -197,11 +200,11 @@ function logLines() {
         const text = call[0] as string;
         for (const secret of [userId, sub, fixtureUrl, STAGING, PRODUCTION, 'ai.ezil.work', fundingHmacSecret, 'private']) expect(text).not.toContain(secret);
         const line = JSON.parse(text);
-        expect(Object.keys(line)).toEqual(['event', 'source', 'stage', 'code']);
+        expect(Object.keys(line)).toEqual(line.starter === undefined ? ['event', 'source', 'stage', 'code'] : ['event', 'source', 'stage', 'code', 'starter']);
         return [level, line] as const;
     });
 }
-const enrolled = [['info', { event: 'ai-enroll', source: 'auth0', stage: 'done', code: null }]];
+const enrolled = [['info', { event: 'ai-enroll', source: 'auth0', stage: 'done', code: null, starter: 'queued' }]];
 const refused = (stage: string, code: string) => [['warn', { event: 'ai-enroll', source: 'auth0', stage, code }]];
 async function settleMicrotasks() { for (let i = 0; i < 40; i++) await Promise.resolve(); }
 
@@ -431,7 +434,7 @@ describe('AI enrollment with a bounded owned connection', () => {
         expect([...receipts.keys()]).toEqual([`ezil-os:v1:free-once:${userId}:grant`]);
         expect(clients[0].role).toBe('postgres');
         expect(warn).not.toHaveBeenCalled();
-        expect(info.mock.calls).toEqual([[JSON.stringify({ event: 'ai-enroll', source: 'auth0', stage: 'done', code: null })]]);
+        expect(info.mock.calls).toEqual([[JSON.stringify({ event: 'ai-enroll', source: 'auth0', stage: 'done', code: null, starter: 'queued' })]]);
     });
 
     it.each(['connect', 'begin'] as const)('logs connect_failed when the owned session cannot start (%s)', async failure => {
@@ -611,7 +614,8 @@ describe('AI enrollment with a bounded owned connection', () => {
 describe('round 5 D1: coded enrollment split (enrollAiMember)', () => {
     let info: ReturnType<typeof vi.spyOn>;
     beforeEach(() => { info = vi.spyOn(console, 'info').mockImplementation(() => {}); });
-    const line = (source: string, stage: string, code: string | null) => [JSON.stringify({ event: 'ai-enroll', source, stage, code })];
+    const line = (source: string, stage: string, code: string | null, starter?: string) =>
+        [JSON.stringify({ event: 'ai-enroll', source, stage, code, ...(starter ? { starter } : {}) })];
 
     it('pins the SQL refusal vocabulary of ezil_works.enroll_ai_member and ezil_ai.enroll_os_member', () => {
         // gw-ui scripts/os-staging/sql/20_enroll_members.sql (41cc53c :62-97) returns the first seven error codes;
@@ -704,6 +708,36 @@ describe('round 5 D1: coded enrollment split (enrollAiMember)', () => {
         expect(kick.statement).toMatch(/last_error in \('no_ai_account', 'account_not_found'\)/);
         expect(kick.statement).toMatch(/delivered_at is null/);
         expect(kick.statement).not.toMatch(/attempts/);
+        expect(info.mock.calls).toEqual([line('auth0', 'done', null, 'queued')]);
+    });
+
+    it('sign-in delivers the committed Free receipt once on the same owned client with the production funding config', async () => {
+        stub.config.mockReturnValue({ fundingUrl: PRODUCTION, fundingHmacSecret });
+        stub.starter.mockResolvedValueOnce('delivered');
+        await expect(enrollAiMember(userId, sub)).resolves.toEqual({ ok: true });
+        expect(stub.starter).toHaveBeenCalledTimes(1);
+        const [input] = stub.starter.mock.calls[0]!;
+        expect(input.client).toBe(clients[0]);
+        expect(input.userId).toBe(userId);
+        expect(input.config).toEqual({ fundingUrl: PRODUCTION, fundingHmacSecret });
+        // After the receipt's own transaction committed and the role was reset.
+        expect([...receipts.keys()]).toEqual([`ezil-os:v1:free-once:${userId}:grant`]);
+        expect(clients[0].role).toBe('postgres');
+        expect(info.mock.calls).toEqual([line('auth0', 'done', null, 'delivered')]);
+    });
+
+    it('drain enrollment never runs the starter delivery', async () => {
+        await expect(enrollAiMember(userId, sub, 'outbox')).resolves.toEqual({ ok: true });
+        expect(stub.starter).not.toHaveBeenCalled();
+    });
+
+    it('a deadline during the starter delivery still reports an enrolled member (not timeout), with the receipt kept', async () => {
+        stub.starter.mockReturnValueOnce(new Promise(() => {}));
+        const result = enrollAiMember(userId, sub);
+        await vi.advanceTimersByTimeAsync(5_000);
+        await expect(result).resolves.toEqual({ ok: true });
+        expect([...receipts.keys()]).toEqual([`ezil-os:v1:free-once:${userId}:grant`]);
+        expect(warn).not.toHaveBeenCalled();
         expect(info.mock.calls).toEqual([line('auth0', 'done', null)]);
     });
 

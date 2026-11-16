@@ -22,7 +22,7 @@
  * one proves the entrypoint starts; this one proves what it routes.
  */
 
-import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_MODEL_ACCESS_MAX_AGE_MS, AI_MODEL_ACCESS_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, exactCacheScope, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
+import { AI_CREDENTIAL_STORAGE_KEY, AI_CREDENTIAL_REVOKED_AT_STORAGE_KEY, AI_CREDITS_PENDING_STORAGE_KEY, AI_MODEL_ACCESS_MAX_AGE_MS, AI_MODEL_ACCESS_STORAGE_KEY, AI_PROXY_NONCE_STORAGE_KEY, chooseAiCredential, deriveAiProxyToken, exactCacheScope, mintAiCredentialSignature, usableAiCredential, type StoredAiCredential } from './ai-proxy';
 import { afterEach, beforeEach, describe, expect, it, mock, setSystemTime, spyOn } from 'bun:test';
 
 // Must be registered before `./index.ts` is imported (see module doc). The
@@ -3548,7 +3548,7 @@ describe('AI credential and code-host routes', () => {
     const { binding, calls } = fakeSandboxNamespace({});
     let nonce: string | null = 'aws-boot-one';
     let present = true;
-    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, AWS_ROUTING_ENABLED: 'on',
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, AWS_ROUTING_ENABLED: 'on', CF_CONTAINER_ADMISSION_PAUSED: '1',
       SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.org', AWS_ORIGIN_ZONE: 'origin.ezil.org', AWS_ORIGIN_ZONE_ALLOWLIST: 'origin.ezil.org',
       AWS_TUNNELS: { idFromName: (id: string) => id, get: (id: string) => ({ fetch: async () =>
         Response.json({ record: present ? { sandboxId: id, aiProxyNonce: nonce } : null }) }) } };
@@ -3577,8 +3577,16 @@ describe('AI credential and code-host routes', () => {
         expect((await worker.fetch(req(auth, path), env)).status).toBe(404);
       }
       expect((await worker.fetch(req(auth, '/ai/v1/models', { method: 'POST' }), env)).status).toBe(404);
-      for (const headers of [{}, { 'content-length': '1' }]) {
-        expect((await worker.fetch(req(auth, '/ai/v1/messages', { method: 'POST', body: 'x'.repeat(160 * 1024 + 1), headers }), env)).status).toBe(413);
+      // The Messages transport contract permits 4 MiB, including imported projects above the former 160 KiB cap.
+      const admitted = JSON.stringify({ model: 'gemini-3.8-flash', max_tokens: 16, messages: [{ role: 'user', content: 'x'.repeat(160 * 1024 + 1) }] });
+      expect((await worker.fetch(req(auth, '/ai/v1/messages', { method: 'POST', body: admitted }), env)).status).toBe(200);
+      expect(await upstream[0]!.text()).toBe(admitted);
+      upstream.length = 0;
+      for (const headers of [{}, { 'content-length': '1' }, { 'content-length': String(4_194_304 + 1) }]) {
+        const refused = await worker.fetch(req(auth, '/ai/v1/messages', { method: 'POST', body: 'x'.repeat(4_194_304 + 1), headers }), env);
+        expect(refused.status).toBe(413);
+        expect(await refused.json()).toMatchObject({ error: { code: 'body_too_large', source: 'ezil-os-proxy' } });
+        expect(upstream).toHaveLength(0);
       }
       for (const over of [{ SANDBOX_AI_PROXY: 'off' }, { SANDBOX_AI_PROXY: 'false', EZIL_AI_GATEWAY_URL: 'invalid' }]) {
         const off = await worker.fetch(req(null), { ...env, ...over });
@@ -3691,7 +3699,7 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     const stub = new Proxy({}, {
       get(_target, prop) {
         if (prop === 'then') return undefined;
-        if (prop === 'putAiCredential' || prop === 'dropAiCredential') return obj[prop].bind(obj);
+        if (prop === 'putAiCredential' || prop === 'putAiModelAccess' || prop === 'dropAiCredential') return obj[prop].bind(obj);
         return async () => undefined;
       },
     });
@@ -3699,8 +3707,8 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     return {
       ...state,
       recover: () => { obj = Object.assign(Object.create(Object.getPrototypeOf(obj)), { ctx: obj.ctx }); },
-      send: async (method: 'POST' | 'DELETE', signedAt: number, accessToken?: string) => {
-        const body = method === 'POST' ? JSON.stringify({ accessToken }) : '';
+      send: async (method: 'POST' | 'DELETE', signedAt: number, accessToken?: string, metadata: Record<string, unknown> = {}) => {
+        const body = method === 'POST' ? JSON.stringify({ accessToken, ...metadata }) : '';
         const response = await worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/ai-credential`, {
           method, body: body || undefined,
           headers: { 'x-ezil-signature': await mintAiCredentialSignature(SECRET, SANDBOX_NAME, new TextEncoder().encode(body), signedAt, method) },
@@ -3831,6 +3839,55 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     // Older than AI_MODEL_ACCESS_MAX_AGE_MS: unknown again, whatever it said.
     values.set(AI_MODEL_ACCESS_STORAGE_KEY, { includedModels: null, signedAt: Date.now() - AI_MODEL_ACCESS_MAX_AGE_MS - 1000 });
     expect(await obj.getAiModelAccess()).toEqual({ known: false });
+  });
+
+  it('a signed first credential push records unknown without inventing model access', async () => {
+    const { obj, values, send } = await credentialRoute();
+    const t = Date.now() - 1000;
+    const token = sessionToken('initial-unknown', t);
+    await send('POST', t, token, { creditsPending: null });
+    expect(values.get(AI_CREDITS_PENDING_STORAGE_KEY)).toEqual({ pending: null, signedAt: t });
+    expect(await obj.getAiCreditsRelay()).toBe('unknown');
+    expect(await obj.getAiModelAccess()).toEqual({ known: false });
+    expect(values.has(AI_MODEL_ACCESS_STORAGE_KEY)).toBe(false);
+    expect(await obj.getAiCredential()).toBe(token);
+  });
+
+  it('a signed server plan-only push carries receipt status without creating a credential', async () => {
+    const { obj, values, send } = await credentialRoute();
+    const t = Date.now() - 1000;
+    await send('POST', t, undefined, { includedModels: ['gemini-3.8-flash'], creditsPending: null });
+    expect(await obj.getAiModelAccess()).toEqual({ known: true, includedModels: ['gemini-3.8-flash'] });
+    expect(await obj.getAiCreditsRelay()).toBe('unknown');
+    expect(values.get(AI_CREDITS_PENDING_STORAGE_KEY)).toEqual({ pending: null, signedAt: t });
+    expect(await obj.getAiCredential()).toBeNull();
+  });
+
+  it('receipt CAS is independent from model timestamps and omitted pushes, including after DO recovery', async () => {
+    const { obj, values } = await object();
+    const t = Date.now() - 1000;
+    const expiresAt = Date.now() + 3600000;
+    const flash = ['gemini-3.8-flash'];
+    expect(await obj.getAiCreditsRelay()).toBe('legacy');
+    await obj.putAiModelAccess(flash, t + 200);
+    await obj.putAiCredential({ token: 'a', expiresAt }, t + 180, undefined, true);
+    expect(values.get(AI_MODEL_ACCESS_STORAGE_KEY)).toEqual({ includedModels: flash, signedAt: t + 200 });
+    expect(values.get(AI_CREDITS_PENDING_STORAGE_KEY)).toEqual({ pending: true, signedAt: t + 180 });
+    await obj.putAiModelAccess(flash, t + 300, true);
+    await obj.putAiModelAccess(null, t + 250, false);
+    expect(values.get(AI_CREDITS_PENDING_STORAGE_KEY)).toEqual({ pending: true, signedAt: t + 300 });
+    await obj.putAiModelAccess(flash, t + 400);
+    expect(values.get(AI_CREDITS_PENDING_STORAGE_KEY)).toEqual({ pending: true, signedAt: t + 300 });
+    const recovered = Object.assign(Object.create(Object.getPrototypeOf(obj)), { ctx: obj.ctx });
+    expect(await recovered.getAiCreditsRelay()).toBe('pending');
+    await obj.putAiModelAccess(null, t + 350, false);
+    expect(values.get(AI_MODEL_ACCESS_STORAGE_KEY)).toEqual({ includedModels: flash, signedAt: t + 400 });
+    expect(await recovered.getAiCreditsRelay()).toBe('none');
+    await obj.dropAiCredential(undefined, t + 500);
+    await obj.putAiCredential({ token: 'old', expiresAt }, t + 450, null, null);
+    expect(await obj.getAiCredential()).toBeNull();
+    expect(values.get(AI_MODEL_ACCESS_STORAGE_KEY)).toEqual({ includedModels: flash, signedAt: t + 400 });
+    expect(await recovered.getAiCreditsRelay()).toBe('unknown');
   });
 
   // Background work with the browser hidden or closed: one browser push, then only the server's plan-only pushes.
@@ -4048,6 +4105,19 @@ describe('AI Durable Object storage and boot lifecycle', () => {
 
 
 describe('Worker JSON error response boundary', () => {
+  it('returns a truthful retryable503 when a central CF start is admission-paused', async () => {
+    const logs = spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const { binding } = fakeSandboxNamespace({ restartThrows: new Error('computer_updating') });
+      const res = await worker.fetch(new Request(`https://api-desktop.ezil.org/sandbox/${SANDBOX_NAME}/restart`, { method: 'POST' }),
+        { Sandbox: binding, CF_CONTAINER_ADMISSION_PAUSED: '1' });
+      expect(res.status).toBe(503); expect(res.headers.get('retry-after')).toBe('10');
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      expect(await res.json()).toEqual({ ok: false, error: 'computer_updating',
+        notice: 'Computers are being updated. Please retry shortly.', retryAfterSeconds: 10 });
+    } finally { logs.mockRestore(); }
+  });
+
   it('keeps explicit route error codes when an exception names a different public code', async () => {
     const logs = spyOn(console, 'error').mockImplementation(() => {});
     try {

@@ -276,13 +276,20 @@ describe('a used-up credit window: window_limit, never a credit refusal', () => 
             const g = gateway(plan, windowRefusal({ budget_micro: '5000000', used_micro: '4800000', hold_micro: '400000', resets_at: reset }));
             await list(g.provider);
             await expect(send(g.provider, `ezil/${FLASH}`)).rejects.toThrow(
-                /used up\. Resets at .*Buying credits or changing plan does not lift this window right now\. A new chat or a smaller model uses fewer credits; 0\.20 credits are left in this window\./);
+                /used up\. Resets at .*Buying credits or changing plan does not lift this window right now\. A new chat or a smaller model uses fewer credits\. \(request/);   // 0.2 credits left floors to 0: no "0 credits are left" beside "used up"
             await expect(send(g.provider, `ezil/${FLASH}`)).rejects.toThrow();
             await Bun.sleep(0);
             expect(g.posts).toHaveLength(2);
             expect(g.intents).toEqual([{ reason: 'window_limit', requestId: REQUEST, resetsAt: reset }]);
             expect(warnings).not.toHaveBeenCalled();
         }
+    });
+
+    test('credits left in the window are whole and floored, and only named once at least one whole credit is left', async () => {
+        forgetGatewayModels();
+        const g = gateway(paid(), windowRefusal({ budget_micro: '5000000', used_micro: '2600000', hold_micro: '3000000', resets_at: resetsAt() }));
+        await list(g.provider);
+        await expect(send(g.provider, `ezil/${FLASH}`)).rejects.toThrow(/uses fewer credits; 2 credits are left in this window\./);
     });
 
     test('the reset as the OS proxy relays it (the Gateway database form) reaches the OS in toISOString form', async () => {

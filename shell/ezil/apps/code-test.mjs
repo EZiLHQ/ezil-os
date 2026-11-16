@@ -272,6 +272,10 @@ push('🔴 clicking Code in the Start menu opens a Code window', !! win);
 push('the Code window has an iframe to put code-server in',
     !! win?.querySelector('.window-app-iframe'));
 push('exactly one Code window (single_instance)', qa('.window[data-app="code"]').length === 1);
+const CODE_TRACE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const firstCodeTraceId = win?.ezilFeedbackAppContext?.traceId;
+push('Code feedback receives the registry trace as a canonical UUID',
+    CODE_TRACE_UUID.test(firstCodeTraceId ?? ''), String(firstCodeTraceId));
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4. 🔴 THE 5-MINUTE TTL — minted AT WINDOW-OPEN, never stashed.
@@ -318,6 +322,9 @@ await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, deskt
 await settle(20);
 const remintCalls = calls.slice(callsBeforeReopen).filter(c => c.url.startsWith(ENDPOINTS.codePreviewUrl));
 const win2 = q('.window[data-app="code"]');
+push('reopening Code registers its own fresh canonical trace instead of a stale window trace',
+    CODE_TRACE_UUID.test(win2?.ezilFeedbackAppContext?.traceId ?? '')
+        && win2.ezilFeedbackAppContext.traceId !== firstCodeTraceId, String(win2?.ezilFeedbackAppContext?.traceId));
 const iframe2 = win2?.querySelector('.window-app-iframe');
 push('🔴 re-opening mints a FRESH URL rather than reusing the stale one',
     remintCalls.length === 1 && iframe2?.getAttribute('src') !== firstUrl,
@@ -1576,6 +1583,46 @@ await settle(4);
                 `${spinnerKind(w)} "${spinnerTitle(w)}" asks=${mints(from).length} src=${frameSrc(w)} submits=${submits.length - submitted}`);
             await closeCode();
         }
+        // The generic user copy must keep the server's nonsecret cause and request id in consented feedback,
+        // and the window's own trace; a malformed or secret-shaped cause/id is dropped by the real parser.
+        ENDPOINTS.feedback = '/api/shell/feedback';
+        PAYLOAD.desktopState.ui = { feedbackEventDiagnostics: true };
+        window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
+        window.HTMLDialogElement.prototype.close = function () { this.open = false; this.dispatchEvent(new window.Event('close')); };
+        const failureId = 'c1b2c3d4-1234-4123-8123-123456789abc';
+        const refusedFeedback = async (refusalReason, correlationId) => {
+            codeMintAnswer = () => ({ status: 502, payload: { error: { code: 'repo_open_failed', message: 'Not working.' },
+                refusalReason, correlationId } });
+            await launch({ project: { repoUrl: GH } });
+            await waitFor(() => spinnerKind(codeWin()) === 'failed', 4000);
+            const traceId = codeWin().ezilFeedbackAppContext?.traceId;
+            click(codeWin().querySelector('.ezil-opening-feedback'));
+            await waitFor(() => !!window.document.querySelector('.ezil-feedback-dialog'), 2000);
+            const dialog = window.document.querySelector('.ezil-feedback-dialog');
+            const preview = dialog?.querySelector('details.ezil-feedback-preview') ?? dialog?.querySelector('details');
+            if (preview) { preview.open = true; preview.dispatchEvent(new window.Event('toggle')); }
+            const diagnostics = JSON.parse(dialog?.querySelector('pre')?.textContent || '{}').diagnostics;
+            dialog?.querySelector('[data-action="cancel"]')?.click();
+            await waitFor(() => !window.document.querySelector('.ezil-feedback-dialog'), 2000);
+            await closeCode();
+            return { traceId, diagnostics, event: diagnostics?.recentEvents?.findLast(e => e.site === 'ezil-os:apps/code#project') };
+        };
+        let refused = await refusedFeedback('repo_open:worker_http_502:clone_failed', failureId);
+        push('10d 🔴 repository refusal cause/request id survive the real Code parser and consented feedback builder',
+            refused.event?.code === 'repo_open_failed' && refused.event.reason === 'repo_open:worker_http_502:clone_failed'
+                && refused.event.correlationId === failureId, JSON.stringify(refused.event));
+        // This fixture's COMPUTER.id is not a UUID, so the dialog drops the context and this equality may come from the
+        // latest-trace fallback; app-failures-test and the browser test prove the trusted per-window chain.
+        push('10d 🔴 the refused window\'s feedback carries that window\'s canonical trace',
+            CODE_TRACE_UUID.test(refused.traceId ?? '') && refused.diagnostics?.traceId === refused.traceId,
+            `${refused.traceId} ${refused.diagnostics?.traceId}`);
+        refused = await refusedFeedback('https://private.test/?token=secret', 'Bearer private');
+        push('10d 🔴 a malformed or secret-shaped refusal cause/id is dropped, the refusal code kept',
+            refused.event?.code === 'repo_open_failed' && !('reason' in refused.event) && !('correlationId' in refused.event)
+                && !JSON.stringify(refused.diagnostics ?? {}).includes('private'), JSON.stringify(refused.event));
+        delete ENDPOINTS.feedback; delete PAYLOAD.desktopState.ui;
+        codeMintAnswer = null;
+
         // An address that is not one (a project-shaped object, an http URL) is not an address: plain Code, no repository asked.
         codeMintAnswer = null;
         from = calls.length;
@@ -1584,6 +1631,56 @@ await settle(4);
         push('10e an invalid address object opens plain Code with today\'s body', JSON.stringify(mints(from)[0]?.body) === JSON.stringify({ computerId: COMPUTER.id, intent: 'open' }),
             JSON.stringify(mints(from)[0]?.body));
         await closeCode();
+
+        // 10f. Identity refresh for an address: a generic one never leaves the tab (nothing is granted for it); only
+        // EZiL's own Git gateway, whose access the EZiL ID grants, leaves once per repository and never loops.
+        const EZ = 'https://github.ezil.work/ezil/demo.git';
+        store.removeItem(GUARD_KEY);
+        codeMintAnswer = () => ({ status: 409, payload: { error: { code: 'CONFLICT', message: 'IDENTITY_REFRESH_REQUIRED' } } });
+        const submitted = submits.length;
+        await launch({ project: { repoUrl: GH } });
+        await waitFor(() => spinnerKind(codeWin()) === 'failed', 4000);
+        await tick(500);
+        push('10f 🔴 a generic address refused for identity never leaves the tab and writes no guard',
+            submits.length === submitted && store.getItem(GUARD_KEY) === null, `submits=${submits.length - submitted} guard=${store.getItem(GUARD_KEY)}`);
+        await closeCode();
+        await launch({ project: { repoUrl: EZ } });
+        await waitFor(() => submits.length > submitted, 3000);
+        await tick(500);
+        const ezGuard = JSON.parse(store.getItem(GUARD_KEY) ?? 'null');
+        push('10f 🔴 an EZiL Git gateway address leaves ONCE for the silent sign-in, guarded by its repoUrl only',
+            submits.length === submitted + 1 && submits.at(-1)?.action === '/auth/auth0/login' && ezGuard?.repoUrl === EZ
+            && typeof ezGuard?.at === 'number' && ! ('projectId' in ezGuard), JSON.stringify(ezGuard));
+        await closeCode();
+        await launch({ project: { repoUrl: EZ } });
+        await waitFor(() => spinnerKind(codeWin()) === 'failed', 4000);
+        await tick(500);
+        push('10f 🔴 the same gateway address refused again inside the TTL does not leave again (no loop)',
+            submits.length === submitted + 1, `${submits.length - submitted}`);
+        await closeCode();
+        store.removeItem(GUARD_KEY);
+
+        // 10g. Git access renewal is never part of opening: no renewal request while a gateway repository opens, after a
+        // close mid-open (cancel), or after close, and no notice is left behind (timing/eligibility: code-git-access-test.mjs).
+        const gitAccess = (since) => calls.slice(since).filter(c => c.url.startsWith('/api/shell/code-git-access'));
+        codeMintAnswer = byUrl(ID, 'ezil/demo');
+        from = calls.length;
+        await launch({ project: { repoUrl: EZ } });
+        await waitFor(() => frameSrc(codeWin())?.endsWith(`folder=/workspace/projects/${ID}`), 3000);
+        await settle(8);
+        push('10g 🔴 opening a gateway repository mints once and asks for no Git renewal (renewal cannot wake, mint or clone)',
+            mints(from).length === 1 && gitAccess(from).length === 0, `mints=${mints(from).length} git=${gitAccess(from).length}`);
+        await closeCode();
+        await settle(8);
+        push('10g closing the window leaves no renewal request and no Git notice behind',
+            gitAccess(from).length === 0 && ! document.querySelector('.ezil-code-git-access-notice'), `${gitAccess(from).length}`);
+        from = calls.length;
+        void launch({ project: { repoUrl: EZ } });
+        await closeCode();
+        await settle(8);
+        push('10g a close during the open (cancel) leaves no renewal request and no Git notice behind',
+            gitAccess(from).length === 0 && ! document.querySelector('.ezil-code-git-access-notice'), `${gitAccess(from).length}`);
+        codeMintAnswer = null;
     }
 
     codeMintAnswer = null;

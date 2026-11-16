@@ -10,12 +10,13 @@ import { appFailure, failureId, type AppFailure, type AppFailureStage } from './
 import { redact, type GatewayProtocol, type ResolvedModel, type ResolvedProvider } from './config';
 import { sseEvents } from './sse';
 import { compactRequest, COMPACT_TARGET, type CompactionInfo } from './compact';
-import { buildGatewayBody, DEFAULT_TOOL_RESERVE, GATEWAY_INPUT_TOKENS, INPUT_FRAMING, KIMI, LocalRequestError, type LocalRequestCounts } from './gateway-messages';
+import { buildGatewayBody, DEFAULT_TOOL_RESERVE, gatewayRequestBytes, parseGatewayTransport, type GatewayTransport, INPUT_FRAMING, KIMI, LocalRequestError, type LocalRequestCounts } from './gateway-messages';
 import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-response';
 import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from './gateway-responses';
-import { emptyUsage } from './types';
-import { localResetTime } from './status-data';
-import { credits, creditsFloor2 } from './credits-format';
+import type { Usage } from './types';
+import { localResetTime, parseBalance } from './status-data';
+import { creditsWhole } from './credits-format';
+import { toolCategory, type Category } from './inference-diagnostics';
 import type { ChatRequest, StreamEvent } from './types';
 
 /** Only an early transport failure may be resent; inference may already be running after this. */
@@ -50,6 +51,7 @@ const MICRO_PER_CREDIT = 1_000_000;
 export { GatewayError, type GatewayErrorOrigin } from './gateway-error';
 
 export type GatewayOptions = {
+    onDiagnosticTransport?: (value: { clientRequestId?: string; gatewayRequestId?: string; wireBytes: number | null; totalWireBytes: number; offered: Record<Category, number>; attempts: number; replayed: boolean }) => void;
     signal: AbortSignal;
     fetch?: typeof fetch;
     /** Mints the per-turn key; injectable for tests. */
@@ -82,13 +84,13 @@ export type GatewayModel = { id: string; enabled: boolean; max_input_tokens: num
     availability?: GatewayAvailability; name?: string; capabilities?: GatewayCapabilities;
     /** Derived only from the complete raw reason list; unknown restriction reasons must not be lost. */
     globalPauseOnly?: true };
-export type GatewayModels = { killswitch: boolean; pause: 'operations' | 'reconciliation' | null; data: GatewayModel[];
+export type GatewayModels = { transport?: GatewayTransport; killswitch: boolean; pause: 'operations' | 'reconciliation' | null; data: GatewayModel[];
     /** v1 `default_model`: the Gateway's suggested first model for this caller (contract §2 rule 8); absent when null. */
     default_model?: string;
     /** The models the account's OS plan includes (`INCLUDED_MODELS_HEADER`); absent = every model. */
     included?: readonly string[] };
 export type GatewayGrant = { remaining_micro: number; live: boolean };
-export type GatewayBalance = { state?: string; available_micro: number; held_micro: number; grants: GatewayGrant[] };
+export type GatewayBalance = { state?: string; available_micro: number | string; held_micro: number | string; grants: GatewayGrant[] };
 
 // Only Bearer auth is sent by this transport. Equivalent resolved providers must share admission
 // and catalog state; neither their display name nor ignored custom headers change the identity.
@@ -229,6 +231,8 @@ export function parseGatewayModels(json: unknown): GatewayModels | undefined {
         return row;
     });
     const models: GatewayModels = { killswitch: raw.killswitch === true, pause: raw.pause === 'operations' || raw.pause === 'reconciliation' ? raw.pause : null, data };
+    const transport = parseGatewayTransport(raw.transport);
+    if (transport) models.transport = transport;
     if (v1 && typeof raw.default_model === 'string' && CATALOG_ALIAS.test(raw.default_model)) models.default_model = raw.default_model;
     return models;
 }
@@ -271,6 +275,7 @@ export function withGatewayModelLimits(model: ResolvedModel, catalog: GatewayMod
     const keep = gatewayPromptCache && capabilities?.prompt_cache === true ? { gatewayPromptCache } : {};
     return { ...rest, ...keep, ...cache, maxInputTokens: Math.min(model.maxInputTokens, entry.max_input_tokens),
         maxOutputTokens: Math.min(model.maxOutputTokens, entry.max_output_tokens),
+        gatewayMaxRequestBytes: catalog?.transport?.max_request_bytes[model.gatewayProtocol === 'openai-responses' ? '/v1/responses' : '/v1/messages'],
         capabilities: { toolCalling: capabilities?.tool_calling === false ? false : model.capabilities.toolCalling,
             imageInput: model.capabilities.imageInput && capabilities?.image_input !== false },
         stream: capabilities?.streaming === false ? false : model.stream };
@@ -321,6 +326,7 @@ export function gatewayCatalogModels(provider: ResolvedProvider, catalog: Gatewa
             id: catalogModelId(provider, entry.id), name: entry.name ?? entry.id, providerName: provider.name, provider, model: entry.id,
             ...protocol === 'openai-responses' ? { gatewayProtocol: protocol } : {},
             family: entry.id, version: '1',
+            gatewayMaxRequestBytes: catalog.transport?.max_request_bytes[protocol === 'openai-responses' ? '/v1/responses' : '/v1/messages'],
             maxInputTokens: entry.max_input_tokens, maxOutputTokens: Math.max(16, Math.min(16_384, entry.max_output_tokens)),
             capabilities: { toolCalling: entry.capabilities?.tool_calling === true, imageInput: false },
             // Cache markers only where the Gateway says its serving route carries them (native Anthropic, Bedrock InvokeModel
@@ -472,9 +478,10 @@ export async function gatewayBalance(provider: ResolvedProvider, doFetch: typeof
         const { status, json } = await getJson(provider, '/me/balance', doFetch, signal);
         if (status !== 200 || typeof json !== 'object' || json === null) return undefined;
         const raw = json as Record<string, unknown>;
-        if (!Number.isSafeInteger(raw.available_micro) || (raw.available_micro as number) < 0 || !Number.isSafeInteger(raw.held_micro) || (raw.held_micro as number) < 0 || !Array.isArray(raw.grants)
+        const balance = parseBalance(raw);
+        if (!balance || !Array.isArray(raw.grants)
             || raw.grants.some(grant => typeof grant !== 'object' || grant === null || typeof grant.live !== 'boolean')) return undefined;
-        return raw as unknown as GatewayBalance;
+        return { ...balance, grants: raw.grants as GatewayGrant[] };
     } catch {
         return undefined;
     }
@@ -499,17 +506,17 @@ export const CREDIT_STATE_TEXT: Record<CreditState, string> = {
 
 /** Contract §7 "Credit UX states", evaluated top to bottom. Either input may be unknown. */
 export function creditState(models: GatewayModels | undefined, balance: GatewayBalance | undefined, alias: string): { state: CreditState; text: string; credits?: number } {
-    // The text is the exact decimal (credits-format.ts), never a float's rendering; `credits` stays a number for callers.
-    const pick = (state: CreditState, micro?: number) => ({ state, text: state === 'ok' && micro !== undefined ? `AI credits: ${credits(micro)} remaining` : CREDIT_STATE_TEXT[state],
-        ...(micro === undefined ? {} : { credits: micro / MICRO_PER_CREDIT }) });
+    // Exact strings drive display. Legacy numeric convenience is returned only when safely representable.
+    const pick = (state: CreditState, micro?: number | string) => ({ state, text: state === 'ok' && micro !== undefined ? `AI credits: ${creditsWhole(micro)} remaining` : CREDIT_STATE_TEXT[state],
+        ...(micro === undefined || BigInt(micro) > BigInt(Number.MAX_SAFE_INTEGER) ? {} : { credits: Number(micro) / MICRO_PER_CREDIT }) });
     if (models?.killswitch) return pick(models.pause === 'reconciliation' ? 'paused_reconciliation' : 'paused_operations');
     if (models && models.data.find(entry => entry.id === alias)?.enabled === false) return pick('model_disabled');
     if (!balance) return pick('unknown');
-    if (balance.available_micro === 0 && balance.held_micro === 0) {
+    if (BigInt(balance.available_micro) === 0n && BigInt(balance.held_micro) === 0n) {
         if (balance.grants.some(grant => grant.live)) return pick('used');
         return pick(balance.grants.length ? 'expired' : 'not_included');
     }
-    if (balance.available_micro === 0 && balance.held_micro > 0) return pick('held');
+    if (BigInt(balance.available_micro) === 0n && BigInt(balance.held_micro) > 0n) return pick('held');
     return pick('ok', balance.available_micro);
 }
 
@@ -586,15 +593,16 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
             const head = oversized ? 'This request needs more EZiL AI credits than this window allows, so waiting will not make it fit.'
                 : `This window's EZiL AI credits are used up. ${reset ? `Resets at ${localResetTime(reset)} (local time).` : 'Check EZiL AI status for the reset time.'}`;
             const guide = oversized || (left ?? 0) > 0
-                ? ` A new chat or a smaller model uses fewer credits${!oversized && left ? `; ${creditsFloor2(left)} credits are left in this window` : ''}.` : '';
+                ? ` A new chat or a smaller model uses fewer credits${!oversized && left !== undefined && left >= MICRO_PER_CREDIT ? `; ${creditsWhole(left)} credits are left in this window` : ''}.` : '';
             return new GatewayError(`EZiL AI: ${head} Buying credits or changing plan does not lift this window right now.${guide}${ref}`,
                 status, code, requestId, seconds, origin, undefined, reset?.toISOString());
         }
         case 'insufficient_credits': case 'no_live_grant': {
             if (body.no_live_grant || code === 'no_live_grant') return make('You have no AI credits left. Add credits to continue.');
             const available = body.available_micro ?? balance?.available_micro;
-            // Floored: the balance is never shown as more than it is (the hold below is a requirement, so it keeps toFixed).
-            const credits = typeof available === 'number' && Number.isSafeInteger(available) && available >= 0 ? creditsFloor2(available) : 'Not measured';
+            // Whole and floored: the balance is never shown as more than it is (the hold below is a requirement, so it keeps toFixed).
+            const credits = (typeof available === 'number' && Number.isSafeInteger(available) && available >= 0)
+                || (typeof available === 'string' && /^[0-9]+$/.test(available)) ? creditsWhole(available!) : 'Not measured';
             const state = typeof body.hold_micro === 'number' && Number.isFinite(body.hold_micro)
                 && typeof available === 'number' && Number.isFinite(available) && body.hold_micro > available
                 ? `This request needs up to ${(body.hold_micro / MICRO_PER_CREDIT).toFixed(2)} credits, and you have ${credits}.`
@@ -613,6 +621,7 @@ export function describeGatewayError(alias: string, status: number, retryAfter: 
             if (body.reason === 'wrong_issuer') return make('EZiL AI does not accept this account’s sign-in (this OS environment is not connected to EZiL AI)');
             if (body.reason === 'bad_signature') return make('EZiL AI could not verify this account’s sign-in signature. Contact your administrator');
             return make('EZiL AI refused this account’s sign-in. Contact your administrator');
+        case 'os_credits_pending': return make('Your AI credits are being confirmed. Please try again shortly');
         case 'os_ai_unavailable': return make('Could not reach EZiL AI. Retry the request');
         case 'os_completion_timeout': return make(`No complete reply from EZiL AI within ${GATEWAY_COMPLETION_TIMEOUT_MS / 1000} seconds, so EZiL OS stopped waiting. `
             + 'The request may still be charged if the model finished, never more than EZiL AI settles for it. You can retry or switch to a streaming model');
@@ -810,6 +819,10 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     let localCounts: LocalRequestCounts | undefined;
     let compaction: CompactionInfo | undefined;
     let attempts = 0;
+    let wireBytes: number | null = null;
+    let totalWireBytes = 0;
+    const offered = { read: 0, search: 0, write: 0, other: 0 };
+    let replayed = false;
     let partial = false;
     let failure: GatewayError | GatewayResponseError | undefined;
     // Where the turn is (contract `stage`), and the last failure an automatic retry answered.
@@ -826,7 +839,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     const observe = (call: () => void) => { try { call(); } catch { /* observer only */ } };
     const responses = model.gatewayProtocol === 'openai-responses';
     let stream = (responses || model.model !== 'us.moonshotai.kimi-k3') && model.stream !== false;
-    let used = emptyUsage();
+    let used: Partial<Usage> = {};
     let attemptAbort = new AbortController();
     const cancelAttempt = () => attemptAbort.abort(options.signal.reason);
     options.signal.addEventListener('abort', cancelAttempt, { once: true });
@@ -841,7 +854,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         }
         // The protocol's own builder, with the input limit scaled for compaction's target.
         const builder = (limits: ResolvedModel) => (candidate: ChatRequest, scale: number) => {
-            const scaled = scale === 1 ? limits : { ...limits, maxInputTokens: Math.max(1, Math.floor(Math.min(GATEWAY_INPUT_TOKENS, limits.maxInputTokens) * scale)) };
+            const scaled = scale === 1 ? limits : { ...limits, maxInputTokens: Math.max(1, Math.floor(limits.maxInputTokens * scale)),
+                gatewayMaxRequestBytes: Math.max(1, Math.floor(gatewayRequestBytes(limits) * scale)) };
             return responses ? buildGatewayResponsesBody(scaled, candidate, log) : buildGatewayBody(scaled, candidate, log);
         };
         const compact = (first: LocalRequestError, limits: ResolvedModel, cause?: 'remote') => {
@@ -863,6 +877,9 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         // Snapshot the serialized request's tools before callbacks or network waits can mutate input.
         const offeredTools = new Set(built.body.tools?.map(tool => tool.name));
         stream = built.body.stream;
+        for (const tool of built.body.tools ?? []) offered[toolCategory(tool.name)]++;
+        wireBytes = built.bytes.byteLength;
+        replayed = !responses && (built as ReturnType<typeof buildGatewayBody>).body.messages.some(turn => turn.content.some(block => block.type === 'thinking' || block.type === 'redacted_thinking'));
         const url = `${provider.baseUrl}/${responses ? 'responses' : 'messages'}`;
         // Callback is for tests/integration, never used for gateway prompt logging.
         observe(() => options.onRequest?.(url, built, idempotencyKey));
@@ -911,7 +928,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 let response: Response;
                 try {
                     response = await timedResponse(doFetch, url, { method: 'POST', headers, body: built.bytes, redirect: 'error' }, attemptAbort, stream, sentAt,
-                        () => { attempts++; stage = 'request'; });
+                        () => { attempts++; totalWireBytes += built.bytes.byteLength; stage = 'request'; });
                 } catch (error) {
                     if (options.signal.aborted || attemptAbort.signal.reason instanceof GatewayError) throw error;
                     // A late failure may cut off inference already running. Never replay it merely because response headers have not arrived.
@@ -990,7 +1007,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                         throw resent && refusal.code === 'idempotency_replay' && refusal.origin === 'gateway' ? replayAfterResend(refusal) : refusal;
                     }
                     compactRetried = true;
-                    const limit = Math.min(GATEWAY_INPUT_TOKENS, model.maxInputTokens);
+                    const limit = Math.min(gatewayRequestBytes(model), model.maxInputTokens);
                     // The Gateway names its bound in tokens, but it is body bytes plus framing (messagesBounds), the bound
                     // the builders check against maxInputTokens: so it applies as is.
                     const reported = Number.isSafeInteger(body.max_input_tokens) && body.max_input_tokens! > 0 && body.max_input_tokens! < limit ? body.max_input_tokens! : undefined;
@@ -1007,6 +1024,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                     // The same bytes (nothing more to compact) would only be refused again.
                     if (Buffer.from(retry.built.bytes).equals(Buffer.from(refused))) throw refusal;
                     built = retry.built;
+                    wireBytes = built.bytes.byteLength;
+                    replayed = !responses && (built as ReturnType<typeof buildGatewayBody>).body.messages.some(turn => turn.content.some(block => block.type === 'thinking' || block.type === 'redacted_thinking'));
                     compaction = retry.info;
                     const info = compaction;
                     observe(() => options.onCompact?.(info));
@@ -1048,6 +1067,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         attemptAbort.abort();
         const cancelled = options.signal.aborted;
         const latencyMs = Math.max(0, now() - started);
+        observe(() => options.onDiagnosticTransport?.({ clientRequestId: idempotencyKey, gatewayRequestId: requestId, wireBytes, totalWireBytes, offered, attempts, replayed }));
         // Only the OUTER signal (the caller's cancellation) is a cancellation; an attempt controller's own cleanup abort never is.
         if (cancelled) report('cancelled', undefined, stage);
         else if (failure) report('failed', failure, stage);

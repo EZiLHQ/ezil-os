@@ -97,11 +97,18 @@ export function decodeScreenshot(input: NonNullable<FeedbackSubmit['screenshot']
     const bytes = Buffer.from(encoded, 'base64');
     if (bytes.length > FEEDBACK_LIMITS.imageBytesMax) throw new FeedbackImageError(413);
     if (bytes.toString('base64') !== encoded) invalid();
-    const size = input.contentType === 'image/png' ? pngSize(bytes)
-        : input.contentType === 'image/jpeg' ? jpegSize(bytes) : webpSize(bytes);
+    return inspectImage(input.contentType, bytes);
+}
+
+/** The same checks for raw bytes (an upload-first `PUT` body): the declared type must match the file's own header. */
+export function inspectImage(contentType: FeedbackImage['contentType'], bytes: Buffer): FeedbackImage {
+    if (bytes.length === 0) invalid();
+    if (bytes.length > FEEDBACK_LIMITS.imageBytesMax) throw new FeedbackImageError(413);
+    const size = contentType === 'image/png' ? pngSize(bytes)
+        : contentType === 'image/jpeg' ? jpegSize(bytes) : webpSize(bytes);
     checkSize(size);
     return {
-        contentType: input.contentType,
+        contentType,
         bytes,
         byteLength: bytes.length,
         sha256: createHash('sha256').update(bytes).digest('hex'),

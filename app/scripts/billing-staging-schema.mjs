@@ -33,6 +33,9 @@ export const EXPLICIT_FILES = Object.freeze([
     'app/drizzle/0021_standard_trial.sql',
     'app/drizzle/0022_feedback_notifications.sql',
     'app/drizzle/0023_operator_issued_by.sql',
+    // Incident alerts and AI request traces: the staging-released pair, applied for real on production after 0023.
+    'app/drizzle/0024_telemetry_alerts.sql',
+    'app/drizzle/0025_ai_request_traces.sql',
 ]);
 const TABLE = 'public.ezil_staging_schema_log';
 const HASH = /^[a-f0-9]{64}$/;
@@ -178,11 +181,12 @@ export function run(args = process.argv.slice(2), {
         const ordered = orderFiles(readdirSync(resolve(ROOT, 'app/drizzle')), readdirSync(resolve(ROOT, 'docs/aws-computers/sql')));
         // Production applies the reviewed list that belongs there (release plan §4.1-4.2) under the same guards as
         // preview: localhost:5432 host pin, pg_control system-id pin, SHA-256 re-check, one logged transaction per
-        // file. 0003-0011 are already applied there; 0019-0021 apply with THIS release. None of them may be baselined
-        // (recorded as already present) on production — they must really run.
+        // file. 0003-0011 are already applied there; 0019-0023 apply with their releases and 0024-0025 (incident alerts,
+        // AI request traces) with this one. None of them may be baselined (recorded as already present) on production —
+        // they must really run.
         if (target === 'aws-production' && mode === 'baseline' &&
-            requested.some(name => ['0003_pool_hosts_v2.sql.txt', '0008_pool_dispatch.sql', '0009_capacity_demands.sql', '0010_migration_restore_progress.sql', '0011_feedback.sql', '0019_operator_entitlements.sql', '0020_operator_refusal_receipts.sql', '0021_standard_trial.sql', '0022_feedback_notifications.sql', '0023_operator_issued_by.sql'].includes(basename(name)))) {
-            refuse('Pool hosts v2, pool dispatch, capacity demand, migration restore progress, feedback, operator entitlements, operator refusal receipts and the Standard trial must be applied on production, never baselined.');
+            requested.some(name => ['0003_pool_hosts_v2.sql.txt', '0008_pool_dispatch.sql', '0009_capacity_demands.sql', '0010_migration_restore_progress.sql', '0011_feedback.sql', '0019_operator_entitlements.sql', '0020_operator_refusal_receipts.sql', '0021_standard_trial.sql', '0022_feedback_notifications.sql', '0023_operator_issued_by.sql', '0024_telemetry_alerts.sql', '0025_ai_request_traces.sql'].includes(basename(name)))) {
+            refuse('Pool hosts v2, pool dispatch, capacity demand, migration restore progress, feedback, operator entitlements, operator refusal receipts, the Standard trial, feedback notifications, the issuing organization, incident alerts and AI request traces must be applied on production, never baselined.');
         }
         // 0012 (reverse moves) changes no pre-existing table and the app probes for it ("production today"): it stays
         // staging-only, never applied or baselined on production (it is skipped in the apply loop below, and any

@@ -353,7 +353,8 @@ const productionUrl = `postgres://postgres:${password}@localhost:5432/postgres`;
 const productionArgs = ['--target', 'aws-production', '--expect-system-id', productionId];
 const neverBaselined = ['docs/aws-computers/sql/0003_pool_hosts_v2.sql.txt', 'app/drizzle/0008_pool_dispatch.sql',
     'app/drizzle/0009_capacity_demands.sql', 'app/drizzle/0010_migration_restore_progress.sql', 'app/drizzle/0011_feedback.sql',
-    'app/drizzle/0019_operator_entitlements.sql', 'app/drizzle/0020_operator_refusal_receipts.sql', 'app/drizzle/0021_standard_trial.sql', 'app/drizzle/0022_feedback_notifications.sql'];
+    'app/drizzle/0019_operator_entitlements.sql', 'app/drizzle/0020_operator_refusal_receipts.sql', 'app/drizzle/0021_standard_trial.sql', 'app/drizzle/0022_feedback_notifications.sql',
+    'app/drizzle/0024_telemetry_alerts.sql', 'app/drizzle/0025_ai_request_traces.sql'];
 function productionHarness(logged = [], actual = productionId) {
     const h = harness(logged, { BILLING_STAGING_DATABASE_URL: productionUrl, PGHOSTADDR: '10.63.20.252', PGSERVICE: 'other' });
     const original = h.options.spawnSyncImpl;
@@ -567,7 +568,7 @@ test('reverse moves (0012) stay staging-only on production: baseline refused, an
 test('operator entitlements follow 0012, stay additive, server-only and a production snapshot only', () => {
     const file = 'app/drizzle/0019_operator_entitlements.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0012_compute_reverse_moves.sql') + 1);
-    assert.equal(EXPLICIT_FILES.at(-5), file);
+    assert.equal(EXPLICIT_FILES.indexOf('app/drizzle/0020_operator_refusal_receipts.sql'), EXPLICIT_FILES.indexOf(file) + 1);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     // New tables only: no existing (Stripe, billing or compute) table is altered or written.
     assert.match(sql, /CREATE TABLE IF NOT EXISTS public\.ezil_operator_entitlements \(/);
@@ -600,7 +601,7 @@ test('operator entitlements (0019) production baseline refuses: it must be appli
 test('operator refusal receipts follow immutable 0019 and are a production snapshot only', () => {
     const file = 'app/drizzle/0020_operator_refusal_receipts.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0019_operator_entitlements.sql') + 1);
-    assert.equal(EXPLICIT_FILES.at(-4), file);
+    assert.equal(EXPLICIT_FILES.indexOf('app/drizzle/0021_standard_trial.sql'), EXPLICIT_FILES.indexOf(file) + 1);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     assert.match(sql, /ALTER COLUMN assignment_ref DROP NOT NULL/);
     assert.match(sql, /ALTER COLUMN revision DROP NOT NULL/);
@@ -626,7 +627,7 @@ test('operator refusal receipts (0020) production baseline refuses: it must be a
 test('the Standard trial follows 0020, stays additive and is a production snapshot only', () => {
     const file = 'app/drizzle/0021_standard_trial.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0020_operator_refusal_receipts.sql') + 1);
-    assert.equal(EXPLICIT_FILES.at(-3), file);
+    assert.equal(EXPLICIT_FILES.indexOf('app/drizzle/0022_feedback_notifications.sql'), EXPLICIT_FILES.indexOf(file) + 1);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     assert.match(sql, /CREATE TABLE "ezil_billing_trials" \(/);
     // Review R4: every verified identity of a started trial, append-only, removed only with its trial.
@@ -683,7 +684,8 @@ test('Standard trial (0021) production baseline refuses: it must be applied, nev
 
 test('feedback notifications follow Standard trial, remain server-only and cannot baseline on production', () => {
     const file = 'app/drizzle/0022_feedback_notifications.sql';
-    assert.equal(EXPLICIT_FILES.at(-2), file);
+    assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0021_standard_trial.sql') + 1);
+    assert.equal(EXPLICIT_FILES.indexOf('app/drizzle/0023_operator_issued_by.sql'), EXPLICIT_FILES.indexOf(file) + 1);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     assert.match(sql, /CREATE TABLE public\.ezil_feedback_notifications/);
     assert.match(sql, /ENABLE ROW LEVEL SECURITY/);
@@ -698,7 +700,7 @@ test('feedback notifications follow Standard trial, remain server-only and canno
 test('the issuing organization follows 0022, stays additive and is a production snapshot only', () => {
     const file = 'app/drizzle/0023_operator_issued_by.sql';
     assert.equal(EXPLICIT_FILES.indexOf(file), EXPLICIT_FILES.indexOf('app/drizzle/0022_feedback_notifications.sql') + 1);
-    assert.equal(EXPLICIT_FILES.at(-1), file);
+    assert.equal(EXPLICIT_FILES.indexOf('app/drizzle/0024_telemetry_alerts.sql'), EXPLICIT_FILES.indexOf(file) + 1);
     const sql = readFileSync(fileURLToPath(new URL(`../../${file}`, import.meta.url)), 'utf8');
     assert.match(sql, /ALTER TABLE public\.ezil_operator_entitlements ADD COLUMN IF NOT EXISTS issued_by text;/);
     assert.match(sql, /ADD CONSTRAINT ezil_operator_entitlements_issued_by CHECK \(issued_by IS NULL OR/);
@@ -720,4 +722,63 @@ test('issuing organization (0023) must be applied on production, never baselined
         assert.equal(h.calls.length, 0);
         assert.match(h.output.join('\n'), /never baselined/);
     }
+});
+
+// Incident alerts (0024) and AI request traces (0025): the exact staging-released files, appended after 0023.
+const stageReleased = {
+    'app/drizzle/0024_telemetry_alerts.sql': '05023bae8b6b38a17fec0e425baca20287b4858198d10e307eb003e1569f2456',
+    'app/drizzle/0025_ai_request_traces.sql': 'b7c8f09b07e77b1abbec520aebd490c759e8deb50f48dd0f7af060457f1a0a87',
+};
+
+test('incident alerts and AI traces (0024, 0025) follow 0023 in order, at the end, with the exact released bytes', () => {
+    assert.deepEqual(EXPLICIT_FILES.slice(-3), ['app/drizzle/0023_operator_issued_by.sql', ...Object.keys(stageReleased)]);
+    for (const [file, digest] of Object.entries(stageReleased)) {
+        assert.equal(files.find(entry => entry.file === file).sha256, digest);
+        assert.equal(buildPlan(files, []).find(row => row.file === file).status, 'pending');
+    }
+});
+
+test('incident alerts and AI traces (0024, 0025) must be applied on production, never baselined', () => {
+    for (const file of Object.keys(stageReleased)) {
+        for (const name of [file.split('/').at(-1), file, `./${file}`]) {
+            const h = productionHarness();
+            assert.equal(run(['baseline', name, '--yes', ...productionArgs], h.options), 1);
+            assert.equal(h.calls.length, 0);
+            assert.match(h.output.join('\n'), /never baselined/);
+        }
+    }
+});
+
+test('production apply really runs 0024 and 0025 after 0023 and still skips 0012', () => {
+    const h = productionHarness();
+    assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 0);
+    const applied = h.calls.slice(3).map(({ args }) => EXPLICIT_FILES.find(file => args[args.indexOf('-f') + 1].endsWith(`/${file}`)));
+    assert.deepEqual(applied.slice(-3), ['app/drizzle/0023_operator_issued_by.sql', ...Object.keys(stageReleased)]);
+    assert.equal(applied.includes('app/drizzle/0012_compute_reverse_moves.sql'), false);
+    for (const file of Object.keys(stageReleased)) assert.ok(h.output.includes(`${file}: applied`));
+});
+
+test('the staging log (22 rows, without 0002_image_rebase and 0022) leaves only 0022 pending after the supported 0002 baseline', () => {
+    const imageRebase = 'docs/aws-computers/sql/0002_image_rebase.sql.txt';
+    const feedback = 'app/drizzle/0022_feedback_notifications.sql';
+    const logged = files.filter(({ file }) => file !== imageRebase && file !== feedback)
+        .map(({ file, sha256: digest }) => ({ file, sha256: digest, mode: 'apply' }));
+    assert.equal(logged.length, 22);
+    // Before the baseline both are genuinely pending; 0002 is never counted as applied by default.
+    assert.deepEqual(buildPlan(files, logged).filter(row => row.status === 'pending').map(row => row.file), [imageRebase, feedback]);
+    // The supported single-file baseline of 0002 (its catalog checked out of band by rebase_schema) logs only that file.
+    const h = harness(logged);
+    assert.equal(run(['baseline', '0002_image_rebase.sql.txt', '--yes'], h.options), 0);
+    const last = h.calls.at(-1).args.at(-1);
+    assert.ok(last.includes(imageRebase) && last.includes(files.find(({ file }) => file === imageRebase).sha256));
+    assert.match(last, /'baseline'\);$/);
+    assert.equal(h.calls.some(({ args }) => args.includes('-f')), false);
+    const baselined = [...logged, { file: imageRebase, sha256: files.find(({ file }) => file === imageRebase).sha256, mode: 'baseline' }];
+    const plan = buildPlan(files, baselined);
+    assert.deepEqual(plan.filter(row => row.status === 'pending').map(row => row.file), [feedback]);
+    assert.equal(plan.find(row => row.file === imageRebase).status, 'applied (baseline)');
+    for (const file of Object.keys(stageReleased)) assert.equal(plan.find(row => row.file === file).status, 'applied (apply)');
+    // A drifted 0024/0025 log hash is refused, never re-run or rebaselined.
+    const drifted = baselined.map(row => row.file === 'app/drizzle/0025_ai_request_traces.sql' ? { ...row, sha256: '0'.repeat(64) } : row);
+    assert.throws(() => buildPlan(files, drifted), /SHA-256 mismatch: app\/drizzle\/0025_ai_request_traces\.sql/);
 });

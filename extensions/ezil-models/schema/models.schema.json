@@ -252,7 +252,7 @@
         "maxInputTokens": {
           "type": "integer",
           "minimum": 1,
-          "description": "Gateway raw input cap (default 131072). Advertised allowance subtracts 1056 framing, 1536 envelope, and toolReserve."
+          "description": "Model input admission allowance in tokens; Gateway admission uses a conservative serialized-input bound. Separate from endpoint bytes and any explicit combined capacity."
         },
         "maxOutputTokens": {
           "type": "integer",
@@ -286,11 +286,16 @@
           "minimum": 0,
           "maximum": 128479,
           "default": 8000,
-          "description": "Gateway input allowance reserved for tool schemas, which Copilot does not count."
+          "description": "Model token reserve for uncounted tool schema/framing (default 8000). Separate from transport bounds."
         },
         "topP": {
           "type": "number",
           "description": "Gateway top_p; clamped to [0,1]."
+        },
+        "contextWindowTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional local combined-capacity cap in tokens, including output. Tightens input budgeting; never treated as verified full model capacity."
         }
       }
     },
@@ -350,7 +355,7 @@
           "type": "integer",
           "minimum": 1,
           "default": 200000,
-          "description": "Gateway raw input cap (default 131072). Advertised allowance subtracts 1056 framing, 1536 envelope, and toolReserve."
+          "description": "Model input admission allowance in tokens; Gateway admission uses a conservative serialized-input bound. Separate from endpoint bytes and any explicit combined capacity."
         },
         "maxOutputTokens": {
           "type": "integer",
@@ -402,11 +407,16 @@
           "minimum": 0,
           "maximum": 128479,
           "default": 8000,
-          "description": "Gateway input allowance reserved for tool schemas, which Copilot does not count."
+          "description": "Model token reserve for uncounted tool schema/framing (default 8000). Separate from transport bounds."
         },
         "topP": {
           "type": "number",
           "description": "Gateway top_p; clamped to [0,1]."
+        },
+        "contextWindowTokens": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Optional local combined-capacity cap in tokens, including output. Tightens input budgeting; never treated as verified full model capacity."
         }
       }
     }

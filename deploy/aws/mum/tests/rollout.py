@@ -26,6 +26,14 @@ import rebase_schema as schema
 import rebase_ssm as ssm
 
 
+# Test-only: stands in for the running app's own /api/health so the real NODE program reads a capacity.
+HEALTH_PRELOAD = """globalThis.fetch = async (url) => {
+  if (url !== 'http://127.0.0.1:3000/api/health') throw new Error('unexpected fetch');
+  return { status: 200, json: async () => ({ ok: true, sha: process.env.EZIL_GIT_SHA, registryCapacity: Number(process.env.EZIL_TEST_HEALTH_CAPACITY) }) };
+};
+"""
+
+
 def execute_app_payload(payload, install, environment):
     """Execute the generated Python guards and Node readback; fake only install/exec IO."""
     script = payload.split("<<'EZIL_APP_PY'\n", 1)[1].rsplit('\nEZIL_APP_PY', 1)[0]
@@ -38,8 +46,13 @@ def execute_app_payload(payload, install, environment):
             install(namespace['APP'])
             return subprocess.CompletedProcess(command, 0, stdout='', stderr='')
         assert command == ['docker', 'compose', '--env-file', 'compose.env', 'exec', '-T', 'web', 'node', '-e', namespace['NODE']]
-        return real_run(['node', '-e', namespace['NODE']], env={'PATH': os.environ['PATH'], **environment()},
-                        capture_output=True, text=True, timeout=10)
+        env = {'PATH': os.environ['PATH'], **environment()}
+        if 'EZIL_TEST_HEALTH_CAPACITY' not in env:
+            return real_run(['node', '-e', namespace['NODE']], env=env, capture_output=True, text=True, timeout=10)
+        with tempfile.TemporaryDirectory() as directory:
+            preload = Path(directory) / 'health.cjs'
+            preload.write_text(HEALTH_PRELOAD)
+            return real_run(['node', '--require', str(preload), '-e', namespace['NODE']], env=env, capture_output=True, text=True, timeout=10)
 
     with patch('subprocess.run', side_effect=run), patch('sys.stdout', new_callable=io.StringIO) as output, patch('sys.stderr', new_callable=io.StringIO):
         try:
@@ -88,8 +101,8 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(again,back)
 
     def test_registry_full_refuses_without_dropping_any_record(self):
-        records=[self.source,*[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,45)]]
-        self.assertEqual(len(records),26)
+        records=[self.source,*[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,56)]]
+        self.assertEqual(len(records),TOOL.ACTIVE_REGISTRY_CAPACITY)
         for record in records: manifest.validate(record, source=True, repository=TOOL.REPOSITORY)
         original=copy.deepcopy(records)
         envelope={'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:dict(self.source,releases=records)}})}
@@ -98,12 +111,12 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(records,original)
         self.assertEqual(envelope,frozen)
 
-    def test_twenty_five_to_twenty_six_maintenance_and_rollback_preserve_all_records(self):
-        extra=[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,44)]
+    def test_thirty_one_to_thirty_two_maintenance_and_rollback_preserve_all_records(self):
+        extra=[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,50)]
         records=[self.source,*extra]
         target=dict(self.target,previousLowerImageDigest=None,previousLowerImageRef=None)
         after=TOOL.pair({'settings':{'deployment':target}})
-        self.assertEqual(len(records),25)
+        self.assertEqual(len(records),31)
         for encoded in (True,False):
             d={TOOL.REGION:dict(self.source,releases=records),'other':{'keep':True}}
             envelope={'SecretString':json.dumps({'untouched':'synthetic',TOOL.KEY:json.dumps(d) if encoded else d})}
@@ -111,7 +124,7 @@ class RegistryTests(unittest.TestCase):
             forward=TOOL.edit_release_secret(envelope,self.old,after,[self.source,target])
             back=TOOL.edit_release_secret({'SecretString':json.dumps(forward)},after,self.old,[self.source])
             restored=json.loads(back[TOOL.KEY]) if encoded else back[TOOL.KEY]
-            self.assertEqual(len(restored[TOOL.REGION]['releases']),26)
+            self.assertEqual(len(restored[TOOL.REGION]['releases']),32)
             self.assertEqual(restored[TOOL.REGION]['releases'],[*records,target])
             self.assertTrue(all(r['previousLowerImageDigest'] is None and r['previousLowerImageRef'] is None
                                 for r in restored[TOOL.REGION]['releases']))
@@ -133,24 +146,49 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(isinstance(back[TOOL.KEY],str),encoded)
             self.assertEqual(envelope,frozen)
             self.assertEqual(TOOL.edit_release_secret({'SecretString':json.dumps(back)},self.old,self.old,[self.source]),back)
-            twenty_seventh=dict(target,amiId='ami-'+'f'*17)
-            full={'SecretString':json.dumps(back)};frozen_full=copy.deepcopy(full)
+            # Appending thirty-three through thirty-seven preserves every retained record; thirty-eight is refused.
+            thirty_third=dict(target,amiId='ami-'+'f'*17,createdAt='2026-12-31T00:00:00.000Z')
+            grown=TOOL.edit_release_secret({'SecretString':json.dumps(back)},self.old,self.old,[thirty_third])
+            grown_map=json.loads(grown[TOOL.KEY]) if encoded else grown[TOOL.KEY]
+            self.assertEqual(grown_map[TOOL.REGION]['releases'],[*records,target,thirty_third])
+            thirty_fourth=dict(target,amiId='ami-'+'e'*17,createdAt='2026-12-31T01:00:00.000Z')
+            grown_again=TOOL.edit_release_secret({'SecretString':json.dumps(grown)},self.old,self.old,[thirty_fourth])
+            grown_again_map=json.loads(grown_again[TOOL.KEY]) if encoded else grown_again[TOOL.KEY]
+            self.assertEqual(grown_again_map[TOOL.REGION]['releases'],[*records,target,thirty_third,thirty_fourth])
+            thirty_fifth=dict(target,amiId='ami-'+'d'*17,createdAt='2026-12-31T02:00:00.000Z')
+            grown_third=TOOL.edit_release_secret({'SecretString':json.dumps(grown_again)},self.old,self.old,[thirty_fifth])
+            grown_third_map=json.loads(grown_third[TOOL.KEY]) if encoded else grown_third[TOOL.KEY]
+            self.assertEqual(grown_third_map[TOOL.REGION]['releases'],[*records,target,thirty_third,thirty_fourth,thirty_fifth])
+            thirty_sixth=dict(target,amiId='ami-'+'c'*17,createdAt='2026-12-31T03:00:00.000Z')
+            grown_fourth=TOOL.edit_release_secret({'SecretString':json.dumps(grown_third)},self.old,self.old,[thirty_sixth])
+            grown_fourth_map=json.loads(grown_fourth[TOOL.KEY]) if encoded else grown_fourth[TOOL.KEY]
+            self.assertEqual(grown_fourth_map[TOOL.REGION]['releases'],[*records,target,thirty_third,thirty_fourth,thirty_fifth,thirty_sixth])
+            thirty_seventh=dict(target,amiId='ami-'+'b'*17,createdAt='2026-12-31T04:00:00.000Z')
+            grown_fifth=TOOL.edit_release_secret({'SecretString':json.dumps(grown_fourth)},self.old,self.old,[thirty_seventh])
+            grown_fifth_map=json.loads(grown_fifth[TOOL.KEY]) if encoded else grown_fifth[TOOL.KEY]
+            self.assertEqual(grown_fifth_map[TOOL.REGION]['releases'],[*records,target,thirty_third,thirty_fourth,thirty_fifth,thirty_sixth,thirty_seventh])
+            self.assertEqual({k:grown_fifth_map[TOOL.REGION][k] for k in self.old},self.old)
+            self.assertLessEqual(len(json.dumps(grown_fifth,separators=(',',':')).encode()),65536)
+            readback={'gitSha':'9'*40,'killSwitch':'1','deployment':app_ops.public_deployment(grown_fifth_map[TOOL.REGION])}
+            self.assertLessEqual(len(json.dumps(readback,separators=(',',':')).encode()),24000)
+            thirty_eighth=dict(target,amiId='ami-'+'a'*17,createdAt='2026-12-31T05:00:00.000Z')
+            full={'SecretString':json.dumps(grown_fifth)};frozen_full=copy.deepcopy(full)
             with self.assertRaisesRegex(ValueError,'registry full'):
-                TOOL.edit_release_secret(full,self.old,after,[twenty_seventh])
+                TOOL.edit_release_secret(full,self.old,self.old,[thirty_eighth])
             self.assertEqual(full,frozen_full)
-            oversized=dict(restored[TOOL.REGION],releases=[*records,target,twenty_seventh])
-            self.assertEqual(len(oversized['releases']),27)
+            oversized=dict(restored[TOOL.REGION],releases=[*records,target,thirty_third,thirty_fourth,thirty_fifth,thirty_sixth,thirty_seventh,thirty_eighth])
+            self.assertEqual(len(oversized['releases']),38)
             with self.assertRaisesRegex(ValueError,'invalid release registry'):
                 TOOL.edit_release_secret({'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:oversized}})},self.old,after,[])
 
-    def test_twenty_sixth_record_readback_limit_in_both_directions(self):
-        records=[self.target,*[dict(self.target,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,44)]]
-        self.assertEqual(len(records),25)
+    def test_thirty_second_record_readback_limit_in_both_directions(self):
+        records=[self.target,*[dict(self.target,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,50)]]
+        self.assertEqual(len(records),31)
         for maintenance in (True,False):
             target=dict(self.target,amiId='ami-'+'f'*17,recipeVersion='1.0.45')
             if maintenance: target.update(previousLowerImageDigest=None,previousLowerImageRef=None)
             retained=[*records,target]
-            self.assertEqual(len(retained),26)
+            self.assertEqual(len(retained),32)
             for record in retained: manifest.validate(record,source=True,repository=TOOL.REPOSITORY)
             after=TOOL.pair({'settings':{'deployment':target}})
             for encoded in (True,False):
@@ -172,28 +210,60 @@ class RegistryTests(unittest.TestCase):
                         self.assertEqual(deployments[TOOL.REGION]['releases'],retained)
                         self.assertEqual(envelope,frozen)
 
-    def test_twenty_six_and_twenty_seven_normal_records_fit_readback_but_count_stays_twenty_six(self):
-        records=[self.target,*[dict(self.target,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,46)]]
+    def test_thirty_one_through_thirty_seven_fit_readback_but_thirty_eight_refused(self):
+        records=[self.target,*[dict(self.target,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,57)]]
         for record in records:
             manifest.validate(record,source=True,repository=TOOL.REPOSITORY)
             self.assertIsNotNone(record['previousLowerImageDigest'])
             self.assertIsNotNone(record['previousLowerImageRef'])
-        for count in (26,27):
+        for count in (31,32,33,34,35,36,37,38):
             with self.subTest(count=count):
                 d=dict(self.target,releases=records[:count])
                 public=app_ops.public_deployment(d)
-                readback={'gitSha':'9'*40,'killSwitch':'1','deployment':public}
+                readback={'gitSha':'9'*40,'killSwitch':'1','deployment':public,'readerCapacity':37}
                 self.assertNotIn('releases',public)
                 self.assertRegex(public['releasesSha256'],r'^[0-9a-f]{64}$')
                 self.assertLessEqual(len(json.dumps(readback,separators=(',',':')).encode('utf-8')),24000)
                 before=dict(self.target,releases=records[:count-1])
                 envelope={'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:before}})}
-                if count==26:
+                if count<=TOOL.ACTIVE_REGISTRY_CAPACITY:
                     result=TOOL.edit_release_secret(envelope,self.new,self.new,[records[count-1]])
                     self.assertEqual(result[TOOL.KEY][TOOL.REGION]['releases'],records[:count])
                 else:
                     with self.assertRaisesRegex(ValueError,'registry full'):
                         TOOL.edit_release_secret(envelope,self.new,self.new,[records[count-1]])
+
+    def test_thirty_two_record_duplicate_and_immutable_conflicts_preserve_evidence(self):
+        records=[self.source,*[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,51)]]
+        self.assertEqual(len(records),32)
+        for kind in ('duplicate','rewrite'):
+            retained=copy.deepcopy(records);incoming=[]
+            if kind=='duplicate': retained[-1]=copy.deepcopy(retained[1])
+            else: incoming=[dict(retained[-1],recipeVersion='1.0.999')]
+            envelope={'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:dict(self.source,releases=retained)}})}
+            frozen=copy.deepcopy(envelope)
+            with self.assertRaisesRegex(ValueError,'duplicate release pair' if kind=='duplicate' else 'immutable release pair rewrite refused'):
+                TOOL.edit_release_secret(envelope,self.old,self.old,incoming)
+            self.assertEqual(envelope,frozen)
+
+    def test_whole_secret_65536_byte_limit_includes_unrelated_fields_and_encoding(self):
+        for encoded in (True,False):
+            for unit in ('x','é'):
+                d={TOOL.REGION:dict(self.source,releases=[self.source])}
+                outer={'unrelated':'',TOOL.KEY:json.dumps(d) if encoded else d}
+                envelope={'SecretString':json.dumps(outer)}
+                candidate=TOOL.edit_release_secret(envelope,self.old,self.old,[])
+                remaining=65536-len(json.dumps(candidate,separators=(',',':')).encode('utf-8'))
+                width=len(json.dumps(unit)[1:-1].encode('utf-8'))
+                count,tail=divmod(remaining,width)
+                outer['unrelated']=unit*count+'x'*tail
+                envelope={'SecretString':json.dumps(outer)};frozen=copy.deepcopy(envelope)
+                accepted=TOOL.edit_release_secret(envelope,self.old,self.old,[])
+                self.assertEqual(len(json.dumps(accepted,separators=(',',':')).encode('utf-8')),65536)
+                outer['unrelated']+='x'
+                with self.assertRaisesRegex(ValueError,'SecretString exceeds Secrets Manager 65536-byte limit'):
+                    TOOL.edit_release_secret({'SecretString':json.dumps(outer)},self.old,self.old,[])
+                self.assertEqual(envelope,frozen)
 
     def test_readback_byte_guard_still_refuses_oversized_public_fields(self):
         d=dict(self.target,releases=[self.target],storage={'padding':'x'*24000})
@@ -203,30 +273,40 @@ class RegistryTests(unittest.TestCase):
             TOOL.edit_release_secret(envelope,self.new,self.new,[])
         self.assertEqual(envelope,frozen)
 
-    def test_readback_byte_guard_refuses_the_twenty_sixth_append_unchanged(self):
-        records=[self.target,*[dict(self.target,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,44)]]
-        self.assertEqual(len(records),25)
+    def test_readback_byte_guard_refuses_the_twenty_seventh_append_unchanged(self):
+        records=[self.target,*[dict(self.target,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,45)]]
+        self.assertEqual(len(records),26)
         d=dict(self.target,releases=records,storage={'padding':'x'*24000})
         envelope={'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:d}})}
         frozen=copy.deepcopy(envelope)
-        twenty_sixth=dict(self.target,amiId='ami-'+'f'*17,recipeVersion='1.0.45')
+        twenty_seventh=dict(self.target,amiId='ami-'+'f'*17,recipeVersion='1.0.45')
         with self.assertRaisesRegex(ValueError,'^release registry readback exceeds SSM 24000-byte limit$'):
-            TOOL.edit_release_secret(envelope,self.new,self.new,[twenty_sixth])
+            TOOL.edit_release_secret(envelope,self.new,self.new,[twenty_seventh])
         self.assertEqual(envelope,frozen)
 
     def test_registry_cap_parity_with_app_source_and_manifest_contracts(self):
-        # The app cannot import operator tooling; pin all five independent guards.
+        # The app cannot import operator tooling; pin every independent guard. Active readers (three app
+        # parsers sharing one constant, and json-tool) are thirty-seven; the frozen legacy GC stays per namespace.
         root=HERE.parents[3]
-        for name in ('aws-intent.ts','aws-rebase-release.ts'):
+        for name in ('aws-intent.ts','aws-rebase-release.ts','aws-lower-attestation.ts'):
             source=(root/'app/src/server/lib/compute'/name).read_text()
-            self.assertEqual(re.findall(r'z\.array\(RebaseSourceReleaseSchema\)\.min\(1\)\.max\((\d+)\)',source),['26'])
-        for name, expected in (('json-tool.py',[26,26,26]),('registry_gc.py',[26])):
+            self.assertEqual(re.findall(r'z\.array\(RebaseSourceReleaseSchema\)\.min\(1\)\.max\((REBASE_RELEASE_REGISTRY_CAPACITY)\)',source),['REBASE_RELEASE_REGISTRY_CAPACITY'])
+        for name, expected in (('json-tool.py',['ACTIVE_REGISTRY_CAPACITY']*3),('registry_gc.py',['tool.legacy_registry_capacity()'])):
             tree=ast.parse((HERE.parent/name).read_text())
-            caps=[node.comparators[-1].value for node in ast.walk(tree) if isinstance(node,ast.Compare)
-                  and isinstance(node.comparators[-1],ast.Constant)
+            caps=[ast.unparse(node.comparators[-1]) for node in ast.walk(tree) if isinstance(node,ast.Compare)
+                  and isinstance(node.comparators[-1],(ast.Name,ast.Attribute,ast.Call))
                   and any(isinstance(op,ast.LtE) for op in node.ops)
                   and any(ast.unparse(value) in ('len(retained)','len(records)') for value in [node.left,*node.comparators])]
             self.assertEqual(caps,expected)
+        self.assertEqual(TOOL.RELEASE_REGISTRY_CAPACITY,32)
+        self.assertEqual(TOOL.LEGACY_REGISTRY_CAPACITY,{'mum':32,'prd':26})
+        self.assertEqual(TOOL.ACTIVE_REGISTRY_CAPACITY,37)
+        app_constant=(root/'app/src/server/lib/compute/aws-rebase-release.ts').read_text()
+        self.assertEqual(re.findall(r'^export const REBASE_RELEASE_REGISTRY_CAPACITY = ([0-9]+);$',app_constant,re.M),['37'])
+        self.assertEqual(RELEASE.CAPACITY_DECLARATION.findall(app_constant),['37'])
+        # The health route reports that same constant; it is not a configured value.
+        health=(root/'app/src/app/api/health/route.ts').read_text()
+        self.assertIn('registryCapacity: REBASE_RELEASE_REGISTRY_CAPACITY',health)
         # JSON manifests describe ONE record, including nullable legacy sources.
         records=[dict(self.target,amiId='ami-'+format(n,'017x')) for n in range(16)]
         records[0]=dict(self.source,preparationStateMachineVersionArn=None,recoveryStateMachineVersionArn=None)
@@ -1280,7 +1360,7 @@ class IntegrationTests(unittest.TestCase):
         self.delay_install=False;self.crash_poll=None;self.lost_send=None;self.lookup_page=False;self.lookup_submission_page=False
         self.fail_app=False;self.lost_put=False;self.lost_execute=False;self.bad_change=False;self.null_params=False
         self.identity_status='UPDATE_COMPLETE';self.identity_parameters=[];self.identity_live=None
-        self.generation=0
+        self.generation=0;self.health_capacity=None;self.probe_override={}
         self.envelope={'VersionId':'initial','SecretString':json.dumps({'keep':'synthetic','EZIL_AWS_KILL_SWITCH':'1',TOOL.KEY:{TOOL.REGION:dict(self.source,releases=[self.source]),'other':{'keep':True}}})}
         stage1.seed_ledger(self.ledger,self.envelope)
         self.outer_original=manifest.loads(self.envelope['SecretString'])
@@ -1318,6 +1398,13 @@ class IntegrationTests(unittest.TestCase):
             if self.lost_put:self.lost_put=False;raise TimeoutError('lost put')
             return {'VersionId':str(self.generation)}
         return copy.deepcopy(self.envelope)
+
+    def reader_probe(self):
+        """The protected read-only host probe (rebase_app.probe_body) as the running staging host would answer it."""
+        image='sha256:'+'a'*64;tag=manifest.read(self.path)['rollout']['app']['tag']
+        return {'gitSha':self.running_sha,'killSwitch':'1','deployment':app_ops.public_deployment(self.running_deployment),
+                'readerCapacity':self.health_capacity,'imageId':image,'tagImageId':image,'composeTag':tag,'composeImageId':image,
+                'servedSha':self.running_sha,'timers':{},'lockFree':True,**self.probe_override}
 
     def schema_receipt(self):
         sql=Path(manifest.read(self.path)['schemaPath']).read_bytes();shape=schema.expected_schema(sql.decode())
@@ -1378,6 +1465,8 @@ class IntegrationTests(unittest.TestCase):
                 if cid not in self.command_results:
                     if '-apply-schema-' in comment:
                         result={'Status':'Success','ResponseCode':0,'StandardOutputContent':json.dumps(self.schema_receipt())}
+                    elif 'reader-probe-g' in comment:
+                        result={'Status':'Success','ResponseCode':0,'StandardOutputContent':json.dumps(self.reader_probe())}
                     else:
                         payload=next(body for key,body in self.payloads.items() if key.rsplit('/',1)[-1][:32] in comment)
                         def install(app):
@@ -1388,7 +1477,8 @@ class IntegrationTests(unittest.TestCase):
                             self.running_sha='9'*40 if self.bad_install else app['gitSha']
                             if not self.stale_install:self.running_deployment=copy.deepcopy(ds[TOOL.REGION])
                         result=execute_app_payload(payload,install,lambda:{'EZIL_GIT_SHA':self.running_sha,'EZIL_AWS_KILL_SWITCH':'1',
-                                                   'EZIL_AWS_LIFECYCLE_DEPLOYMENTS':json.dumps({TOOL.REGION:self.running_deployment})})
+                                                   'EZIL_AWS_LIFECYCLE_DEPLOYMENTS':json.dumps({TOOL.REGION:self.running_deployment}),
+                                                   **({'EZIL_TEST_HEALTH_CAPACITY':str(self.health_capacity)} if self.health_capacity else {})})
                     self.command_results[cid]=copy.deepcopy(result)
                 return copy.deepcopy(self.command_results[cid])
         if service=='cloudformation':
@@ -1531,32 +1621,242 @@ class IntegrationTests(unittest.TestCase):
         self.restage(self.source)
         return extra
 
-    def test_twenty_five_to_twenty_six_rollback_retains_invoking_compatible_app(self):
-        extra=self.seed_registry(25)
+    def test_thirty_one_to_thirty_two_rollback_retains_invoking_compatible_app(self):
+        extra=self.seed_registry(31)
         before=TOOL.pair({'settings':{'deployment':self.running_deployment}})
         self.through_app();RELEASE.promote(self.manifest,True)
         target=manifest.read(self.manifest)
         self.assertNotEqual(target['agentCommit'],self.source['agentCommit'])
-        self.assertEqual(len(self.running_deployment['releases']),26)
+        self.assertEqual(len(self.running_deployment['releases']),32)
         RELEASE.promote(self.manifest,True,rollback=True)
-        self.assertEqual(len(self.running_deployment['releases']),26)
+        self.assertEqual(len(self.running_deployment['releases']),32)
         self.assertCountEqual(self.running_deployment['releases'],[self.source,*extra,target])
         self.assertEqual(TOOL.pair({'settings':{'deployment':self.running_deployment}}),before)
         self.assertEqual(self.running_sha,target['agentCommit'])
         self.assertEqual(RELEASE.load_ledger(self.ledger)['entries'][-1]['appGitSha'],target['agentCommit'])
 
-    def test_full_twenty_six_record_registry_refuses_promotion_before_secret_write(self):
-        self.seed_registry(26)
-        self.through_app()
+    def reader_fixture(self,count,capacity=33):
+        """Synthetic commits ('9'*40) are not in this checkout: stub only the git-backed source/ABI reads."""
+        extra=self.seed_registry(count)
+        patch.object(RELEASE,'source_reader_capacity',return_value=(capacity,'b'*40)).start()
+        self.abi=[];patch.object(RELEASE,'require_host_abi',side_effect=lambda old,new:self.abi.append((old,new)) or {}).start()
+        return extra
+
+    def assert_no_promotion_write(self,message):
         envelope=copy.deepcopy(self.envelope);ledger=self.ledger.read_bytes();self.calls.clear()
-        with self.assertRaisesRegex(ValueError,'registry full'):
+        with self.assertRaisesRegex(ValueError,message):
             RELEASE.promote(self.manifest,True)
         self.assertNotIn(('secret','put-secret-value'),self.calls)
         self.assertEqual(self.envelope,envelope)
         self.assertEqual(self.ledger.read_bytes(),ledger)
 
-    def test_twenty_sixth_record_requires_compatible_apply_app_receipt_before_secret_access(self):
-        self.seed_registry(25)
+    def test_thirty_second_to_thirty_third_record_over_proven_reader_and_rollback_keeps_it(self):
+        extra=self.reader_fixture(32);self.health_capacity=33
+        before=TOOL.pair({'settings':{'deployment':self.running_deployment}})
+        retained=copy.deepcopy(self.running_deployment['releases'])
+        # Normal mixed phase: the new app is installed over the UNCHANGED tuple and thirty-two records.
+        self.through_app()
+        self.assertEqual(self.running_deployment['releases'],retained)
+        self.assertEqual(TOOL.pair({'settings':{'deployment':self.running_deployment}}),before)
+        receipt=RELEASE.require_receipt(self.path,'apply-app')
+        self.assertEqual(receipt['readerCapacity'],33)
+        self.assertEqual(receipt['imageId'],self.reader_probe()['imageId'])  # the image apply-app installed
+        self.assertTrue(any('apply-app-reader-probe-g' in c for c in self.commands.values()))
+        RELEASE.promote(self.manifest,True)
+        target=manifest.read(self.manifest)
+        self.assertEqual(len(self.running_deployment['releases']),33)
+        self.assertEqual(self.running_deployment['releases'][:32],retained)
+        self.assertTrue(any('promote-reader-probe-g' in c for c in self.commands.values()))
+        self.assertEqual(self.abi[-1],(self.source['agentCommit'],target['agentCommit']))
+        # Rollback keeps the same thirty-three reader and every record.
+        RELEASE.promote(self.manifest,True,rollback=True)
+        self.assertEqual(len(self.running_deployment['releases']),33)
+        self.assertCountEqual(self.running_deployment['releases'],[self.source,*extra,target])
+        self.assertEqual(TOOL.pair({'settings':{'deployment':self.running_deployment}}),before)
+        self.assertEqual(self.running_sha,target['agentCommit'])
+
+    def test_thirty_third_record_refused_without_a_proven_running_reader(self):
+        self.reader_fixture(32)
+        self.through_ready()
+        # The installed app's health reports no capacity (the legacy null ABI): apply-app writes no receipt.
+        with self.assertRaisesRegex(ValueError,'running app reader capacity is below'):
+            RELEASE.apply_app(self.manifest,True)
+        self.assertFalse((self.directory/'apply-app-receipt.json').exists())
+        self.assertEqual(RELEASE.load_ledger(self.ledger)['entries'][-1]['state'],'pending')
+        self.assertNotIn(('secret','put-secret-value'),self.calls)
+
+    def test_thirty_third_to_thirty_fourth_record_requires_proven_reader_and_rollback_retains_all(self):
+        extra=self.reader_fixture(33,capacity=34);self.health_capacity=34
+        before=TOOL.pair({'settings':{'deployment':self.running_deployment}})
+        retained=copy.deepcopy(self.running_deployment['releases'])
+        self.through_app()
+        self.assertEqual(self.running_deployment['releases'],retained)
+        self.assertEqual(RELEASE.require_receipt(self.path,'apply-app')['readerCapacity'],34)
+        RELEASE.promote(self.manifest,True)
+        target=manifest.read(self.manifest)
+        self.assertEqual(len(self.running_deployment['releases']),34)
+        self.assertEqual(self.running_deployment['releases'][:33],retained)
+        RELEASE.promote(self.manifest,True,rollback=True)
+        self.assertEqual(len(self.running_deployment['releases']),34)
+        self.assertCountEqual(self.running_deployment['releases'],[self.source,*extra,target])
+        self.assertEqual(TOOL.pair({'settings':{'deployment':self.running_deployment}}),before)
+        self.assertEqual(self.running_sha,target['agentCommit'])
+
+    def test_thirty_fourth_record_refuses_thirty_three_source_before_install(self):
+        self.reader_fixture(33,capacity=33);self.health_capacity=34
+        self.assert_apply_app_refused('target app cannot read the live release registry')
+
+    def test_thirty_fourth_record_refuses_stale_thirty_three_runtime_before_receipt(self):
+        self.reader_fixture(33,capacity=34);self.health_capacity=33
+        self.through_ready()
+        with self.assertRaisesRegex(ValueError,'running app reader capacity is below'):
+            RELEASE.apply_app(self.manifest,True)
+        self.assertFalse((self.directory/'apply-app-receipt.json').exists())
+        self.assertNotIn(('secret','put-secret-value'),self.calls)
+
+    def test_thirty_fourth_to_thirty_fifth_record_requires_proven_reader_and_rollback_retains_all(self):
+        extra=self.reader_fixture(34,capacity=35);self.health_capacity=35
+        before=TOOL.pair({'settings':{'deployment':self.running_deployment}})
+        retained=copy.deepcopy(self.running_deployment['releases'])
+        self.through_app()
+        self.assertEqual(self.running_deployment['releases'],retained)
+        self.assertEqual(RELEASE.require_receipt(self.path,'apply-app')['readerCapacity'],35)
+        RELEASE.promote(self.manifest,True)
+        target=manifest.read(self.manifest)
+        self.assertEqual(len(self.running_deployment['releases']),35)
+        self.assertEqual(self.running_deployment['releases'][:34],retained)
+        RELEASE.promote(self.manifest,True,rollback=True)
+        self.assertEqual(len(self.running_deployment['releases']),35)
+        self.assertCountEqual(self.running_deployment['releases'],[self.source,*extra,target])
+        self.assertEqual(TOOL.pair({'settings':{'deployment':self.running_deployment}}),before)
+        self.assertEqual(self.running_sha,target['agentCommit'])
+
+    def test_thirty_fifth_record_refuses_thirty_four_source_before_install(self):
+        self.reader_fixture(34,capacity=34);self.health_capacity=35
+        self.assert_apply_app_refused('target app cannot read the live release registry')
+
+    def test_thirty_fifth_record_refuses_stale_thirty_four_runtime_before_receipt(self):
+        self.reader_fixture(34,capacity=35);self.health_capacity=34
+        self.through_ready()
+        with self.assertRaisesRegex(ValueError,'running app reader capacity is below'):
+            RELEASE.apply_app(self.manifest,True)
+        self.assertFalse((self.directory/'apply-app-receipt.json').exists())
+        self.assertNotIn(('secret','put-secret-value'),self.calls)
+
+    def test_thirty_fifth_to_thirty_sixth_record_requires_proven_reader_and_rollback_retains_all(self):
+        extra=self.reader_fixture(35,capacity=36);self.health_capacity=36
+        before=TOOL.pair({'settings':{'deployment':self.running_deployment}})
+        retained=copy.deepcopy(self.running_deployment['releases'])
+        self.through_app()
+        self.assertEqual(self.running_deployment['releases'],retained)
+        self.assertEqual(RELEASE.require_receipt(self.path,'apply-app')['readerCapacity'],36)
+        RELEASE.promote(self.manifest,True)
+        target=manifest.read(self.manifest)
+        self.assertEqual(len(self.running_deployment['releases']),36)
+        self.assertEqual(self.running_deployment['releases'][:35],retained)
+        RELEASE.promote(self.manifest,True,rollback=True)
+        self.assertEqual(len(self.running_deployment['releases']),36)
+        self.assertCountEqual(self.running_deployment['releases'],[self.source,*extra,target])
+        self.assertEqual(TOOL.pair({'settings':{'deployment':self.running_deployment}}),before)
+        self.assertEqual(self.running_sha,target['agentCommit'])
+
+    def test_thirty_sixth_record_refuses_thirty_five_source_before_install(self):
+        self.reader_fixture(35,capacity=35);self.health_capacity=36
+        self.assert_apply_app_refused('target app cannot read the live release registry')
+
+    def test_thirty_sixth_record_refuses_stale_thirty_five_runtime_before_receipt(self):
+        self.reader_fixture(35,capacity=36);self.health_capacity=35
+        self.through_ready()
+        with self.assertRaisesRegex(ValueError,'running app reader capacity is below'):
+            RELEASE.apply_app(self.manifest,True)
+        self.assertFalse((self.directory/'apply-app-receipt.json').exists())
+        self.assertNotIn(('secret','put-secret-value'),self.calls)
+
+    def test_thirty_sixth_to_thirty_seventh_record_requires_proven_reader_and_rollback_retains_all(self):
+        extra=self.reader_fixture(36,capacity=37);self.health_capacity=37
+        before=TOOL.pair({'settings':{'deployment':self.running_deployment}})
+        retained=copy.deepcopy(self.running_deployment['releases'])
+        self.through_app()
+        self.assertEqual(self.running_deployment['releases'],retained)
+        self.assertEqual(RELEASE.require_receipt(self.path,'apply-app')['readerCapacity'],37)
+        RELEASE.promote(self.manifest,True)
+        target=manifest.read(self.manifest)
+        self.assertEqual(len(self.running_deployment['releases']),37)
+        self.assertEqual(self.running_deployment['releases'][:36],retained)
+        RELEASE.promote(self.manifest,True,rollback=True)
+        self.assertEqual(len(self.running_deployment['releases']),37)
+        self.assertCountEqual(self.running_deployment['releases'],[self.source,*extra,target])
+        self.assertEqual(TOOL.pair({'settings':{'deployment':self.running_deployment}}),before)
+        self.assertEqual(self.running_sha,target['agentCommit'])
+
+    def test_thirty_seventh_record_refuses_thirty_six_source_before_install(self):
+        self.reader_fixture(36,capacity=36);self.health_capacity=37
+        self.assert_apply_app_refused('target app cannot read the live release registry')
+
+    def test_thirty_seventh_record_refuses_stale_thirty_six_runtime_before_receipt(self):
+        self.reader_fixture(36,capacity=37);self.health_capacity=36
+        self.through_ready()
+        with self.assertRaisesRegex(ValueError,'running app reader capacity is below'):
+            RELEASE.apply_app(self.manifest,True)
+        self.assertFalse((self.directory/'apply-app-receipt.json').exists())
+        self.assertNotIn(('secret','put-secret-value'),self.calls)
+
+    def test_thirty_third_record_refused_when_the_running_image_is_not_the_installed_one(self):
+        self.reader_fixture(32);self.health_capacity=33
+        self.through_app()
+        other='sha256:'+'c'*64
+        self.probe_override={'imageId':other,'tagImageId':other,'composeImageId':other}
+        self.assert_no_promotion_write('running image is not the image apply-app installed')
+
+    def test_thirty_third_record_refused_when_the_running_build_is_not_the_plan_app(self):
+        self.reader_fixture(32);self.health_capacity=33
+        self.through_app()
+        for override,message in (({'gitSha':'e'*40},'not the plan-bound apply-app build'),({'composeTag':'old-app'},'not the plan-bound apply-app build'),
+                                 ({'composeImageId':'sha256:'+'b'*64},'not the plan-bound apply-app build'),
+                                 ({'readerCapacity':32},'running app reader capacity is below')):
+            with self.subTest(override=override):
+                self.probe_override=override;self.command_results.clear()
+                self.assert_no_promotion_write(message)
+
+    def assert_apply_app_refused(self,message):
+        self.through_ready()
+        ledger=self.ledger.read_bytes();self.calls.clear()
+        with self.assertRaisesRegex(ValueError,message):
+            RELEASE.apply_app(self.manifest,True)
+        self.assertEqual(self.ledger.read_bytes(),ledger)
+        self.assertFalse(any(c[:2]==('ssm','send-command') for c in self.calls))
+        self.assertFalse((self.directory/'apply-app-receipt.json').exists())
+
+    def test_thirty_third_record_refused_for_a_thirty_two_source(self):
+        # Refused at apply-app, before any install: its promotion would write a registry this app cannot parse.
+        self.reader_fixture(32,capacity=32);self.health_capacity=33
+        self.assert_apply_app_refused('target app cannot read the live release registry')
+
+    def test_full_thirty_seven_record_registry_refuses_a_thirty_eighth_before_install_or_secret_write(self):
+        self.reader_fixture(37,capacity=37);self.health_capacity=37
+        self.assert_apply_app_refused('target app cannot read the live release registry')
+        with self.assertRaisesRegex(ValueError,'registry full'):
+            TOOL.edit_release_secret(copy.deepcopy(self.envelope),TOOL.pair({'settings':{'deployment':self.running_deployment}}),
+                                     TOOL.pair({'settings':{'deployment':self.running_deployment}}),[dict(self.source,amiId='ami-'+'f'*17)])
+
+    def test_apply_app_refuses_a_thirty_two_reader_once_thirty_three_records_are_live(self):
+        self.reader_fixture(33,capacity=32);self.health_capacity=33
+        self.assert_apply_app_refused('target app cannot read the live release registry')
+
+    def test_oversized_whole_secret_refuses_promotion_before_intent_or_provider_write(self):
+        self.seed_registry(31);self.through_app()
+        outer=manifest.loads(self.envelope['SecretString']);outer['unrelated']='x'*65536
+        self.envelope['SecretString']=json.dumps(outer)
+        envelope=copy.deepcopy(self.envelope);ledger=self.ledger.read_bytes();self.calls.clear()
+        with self.assertRaisesRegex(ValueError,'SecretString exceeds Secrets Manager 65536-byte limit'):
+            RELEASE.promote(self.manifest,True)
+        self.assertNotIn(('secret','put-secret-value'),self.calls)
+        self.assertEqual(self.envelope,envelope)
+        self.assertEqual(self.ledger.read_bytes(),ledger)
+        self.assertFalse((self.directory/'rebase-promotion.json').exists())
+
+    def test_thirty_second_record_requires_compatible_apply_app_receipt_before_secret_access(self):
+        self.seed_registry(31)
         self.through_ready()
         self.assertFalse((self.directory/'apply-app-receipt.json').exists())
         envelope=copy.deepcopy(self.envelope);ledger=self.ledger.read_bytes();self.calls.clear()
@@ -2919,7 +3219,8 @@ class AppPayloadTests(unittest.TestCase):
                                       env={'PATH':os.environ['PATH'],'EZIL_GIT_SHA':app['gitSha'],'EZIL_AWS_KILL_SWITCH':'1',
                                            'EZIL_AWS_LIFECYCLE_DEPLOYMENTS':json.dumps({TOOL.REGION:d})})
                 self.assertEqual(result.returncode,0,result.stderr)
-                self.assertEqual(json.loads(result.stdout),{'gitSha':app['gitSha'],'killSwitch':'1','deployment':expected})
+                # No app listens here, so the bounded loopback health read yields the legacy null capacity.
+                self.assertEqual(json.loads(result.stdout),{'gitSha':app['gitSha'],'killSwitch':'1','deployment':expected,'readerCapacity':None})
                 self.assertEqual(d,frozen)
         self.assertNotIn('releasesSha256',app_ops.public_deployment(target))
 

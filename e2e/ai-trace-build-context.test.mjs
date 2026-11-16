@@ -1,0 +1,24 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { resolve, join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { execFileSync } from 'node:child_process';
+test('AI trace validator works in an isolated application build context and matches publisher source', async t => {
+    const root = resolve(import.meta.dirname, '..');
+    execFileSync(process.execPath, [join(root, 'app/scripts/sync-ai-trace-contract.mjs'), '--check']);
+    const work = await mkdtemp(join(tmpdir(), 'ezil-ai-trace-context-'));
+    t.after(() => rm(work, { recursive: true, force: true }));
+    const source = await readFile(join(root, 'app/src/server/ai-traces/contract.js'), 'utf8');
+    assert.doesNotMatch(source, /\b(?:import|require)\s*(?:\(|[{'"])/);
+    const target = join(work, 'contract.mjs');
+    await writeFile(target, source);
+    const built = await import(pathToFileURL(target).href);
+    const canonical = await import(pathToFileURL(join(root, 'extensions/ezil-models/src/trace-validator.js')).href);
+    assert.equal(built.validateInferenceTrace.toString(), canonical.validateInferenceTrace.toString());
+    assert.equal(built.INFERENCE_VALIDATOR_SOURCE, canonical.validateInferenceTrace.toString());
+    const fixture = JSON.parse(await readFile(join(root, 'app/src/server/ai-traces/fixture.json'), 'utf8'));
+    assert.ok(built.validateInferenceTrace(fixture), 'actual current wire shape accepted without extension files');
+    assert.equal(built.validateInferenceTrace({ ...fixture, prompt: 'must never pass' }), null);
+});

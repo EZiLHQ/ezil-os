@@ -1,3 +1,5 @@
+import { INFERENCE_VALIDATOR_SOURCE } from '../../app/src/server/ai-traces/contract.js';
+
 /** Content-free app failures: a separate closure/channel from the folder bridge. Contract §1–§3:
  * docs/FEEDBACK-APP-FAILURES-CONTRACT.md. Origins come only from codeShellOriginsFor at the existing
  * workbench injection sites. No storage, logging or global names; one rate-limited ready per accepted hello. */
@@ -18,6 +20,21 @@ const now=Date.now();while(posts.length&&posts[0]<=now-60000)posts.shift();
 if(posts.length>=20)return;posts.push(now);
 window.parent.postMessage(envelope,target);return true;
 }catch{}};
+const validateTrace=${INFERENCE_VALIDATOR_SOURCE};
+const traceQueue=[],tracePosts=[],traceSeen=new Map();
+const sendTrace=trace=>{try{
+const now=Date.now();while(tracePosts.length&&tracePosts[0]<=now-60000)tracePosts.shift();
+for(const [id,time] of traceSeen)if(time<=now-60000)traceSeen.delete(id);
+if(tracePosts.length>=120||traceSeen.has(trace.requestId))return;
+const envelope={type:"ezil.code.aiTrace",v:1,nonce,trace};
+if(new TextEncoder().encode(JSON.stringify(envelope)).byteLength>4096)return;
+tracePosts.push(now);traceSeen.set(trace.requestId,now);window.parent.postMessage(envelope,origin);
+}catch{}};
+window.addEventListener("ezil-ai-request-trace",ev=>{try{
+if(typeof ev.detail!=="string"||ev.detail.length>4096||new TextEncoder().encode(ev.detail).byteLength>4096)return;
+const r=validateTrace(JSON.parse(ev.detail));if(!r)return;
+if(nonce){sendTrace(r);return}if(traceQueue.length===16)traceQueue.shift();traceQueue.push(r);
+}catch{}});
 const send=failure=>post({type:"ezil.code.failure",v:1,nonce,failure},origin);
 window.addEventListener("message",ev=>{try{
 const d=ev.data;
@@ -25,7 +42,7 @@ if(ev.source!==window.parent||!origins.includes(ev.origin)||!d||typeof d!=="obje
 if(Object.keys(d).length!==3||!Object.keys(d).every(k=>["type","v","nonce"].includes(k)))return;
 if(d.type!=="ezil.code.diag.hello"||d.v!==1||!matches(d.nonce,/^[A-Za-z0-9_-]{22}$/))return;
 if(!post({type:"ezil.code.diag.ready",v:1,nonce:d.nonce},ev.origin))return;
-nonce=d.nonce;origin=ev.origin;for(const r of queue.splice(0))send(r);
+nonce=d.nonce;origin=ev.origin;for(const r of queue.splice(0))send(r);for(const r of traceQueue.splice(0))sendTrace(r);
 }catch{}});
 window.addEventListener("ezil-app-failure",ev=>{try{
 if(typeof ev.detail!=="string")return;

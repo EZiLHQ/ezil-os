@@ -107,6 +107,43 @@ function frame (store, opts = options) {
 }
 
 try {
+    await check('terminal projection is closed, metadata only, validated, deduplicated and throwing-safe', () => {
+        const store = M.create_app_failure_store(); const seen = [];
+        const f = frame(store, { ...options, onTerminalFailure: e => { seen.push(e); throw Error('observer'); } });
+        const mapped = { provider_error: 'provider', provider_overloaded: 'provider', model_unavailable: 'provider',
+            stream_interrupted: 'interrupted', first_token_timeout: 'timeout', request_timeout: 'timeout',
+            app_start_failed: 'app_startup', app_start_timeout: 'app_startup', chat_unavailable: 'app_startup' };
+        let i = 10000;
+        for (const [code, category] of Object.entries(mapped)) {
+            const record = { ...failure(i++), code, category, outcome: 'failed', modelKey: 'openai/gpt-6', clientRequestId: uuid(777) };
+            f.send(record); f.send(record);
+            assert.deepEqual(seen.at(-1), { eventClass: 'api_failure', site: 'ezil-os:apps/code#aiRequest', code: 'ai_' + code, outcome: 'error' });
+        }
+        assert.equal(seen.length, 9);
+        assert.equal(store.app_failures_for(context).failures.length, 9, 'observer exceptions preserve consent records');
+        const types = readFileSync(new URL('../../../../app/src/server/telemetry/types.ts', import.meta.url), 'utf8');
+        for (const { code } of seen) assert.ok(types.includes(code));
+        store.clear_app_failures(); f.iframe.remove();
+    });
+    await check('projection rejects spoofed malformed recovery credit and flood input', () => {
+        let at = 0; const store = M.create_app_failure_store({ now: () => at }); const seen = [];
+        const f = frame(store, { ...options, onTerminalFailure: e => seen.push(e) });
+        const record = { ...failure(20000), category: 'provider', code: 'provider_error', outcome: 'failed' };
+        f.send(record, { origin: 'https://evil.test' }); f.send(record, { source: window });
+        for (const patch of [{ v: 2 }, { nonce: 'wrong' }, { extra: 'x' }, { failure: { ...record, prompt: 'secret' } },
+            { failure: { ...record, code: 'x'.repeat(2048) } }]) f.post({ type: 'ezil.code.failure', v: 1, nonce: f.nonce(), failure: record, ...patch });
+        for (const outcome of ['retrying', 'recovered']) f.send({ ...record, eventId: uuid(20001 + seen.length), outcome });
+        for (const [category, code] of [['credits', 'credits_exhausted'], ['entitlement', 'model_not_entitled'], ['provider', 'provider_refused'], ['cancellation', 'request_cancelled']]) {
+            f.send({ ...record, eventId: uuid(20100 + category.length), category, code,
+                ...(category === 'cancellation' ? { outcome: 'cancelled', cancellationSource: 'user_stop' } : {}) });
+        }
+        assert.equal(seen.length, 0);
+        at = 60001;
+        for (let n = 0; n < 100; n++) f.send({ ...record, eventId: uuid(21000 + n) });
+        assert.equal(seen.length, 20, '20 per minute accepted');
+        at += 60001; f.iframe.src = 'https://code.test/other'; f.send(record);
+        assert.equal(seen.length, 20, 'live src pinned'); store.clear_app_failures(); f.iframe.remove();
+    });
     await check('exact frame/source check rejects siblings and nested frames', () => {
         const store = M.create_app_failure_store(); const f = frame(store); const sibling = frame(store, { ...options, computerId: B });
         const doc = f.iframe.contentDocument;
@@ -238,6 +275,34 @@ try {
         store.clear_app_failures();
     });
 
+    await check('real telemetry sink retains gates/batching/cap and omits ambient identity for AI', async () => {
+        const savedBoot = window.__EZIL_BOOT__, savedFetch = globalThis.fetch;
+        const payloads = [];
+        globalThis.fetch = async (_url, opts) => { payloads.push(JSON.parse(opts.body)); return {}; };
+        const { beginTrace } = await import('../../trace.js'); const trace = beginTrace('code');
+        const input = { eventClass: 'api_failure', site: 'ezil-os:apps/code#aiRequest', code: 'ai_provider_error', outcome: 'error' };
+        try {
+            for (const [tag, boot] of [['signed-out', { desktopState: { endpoints: { telemetry: '/telemetry' } } }],
+                ['disabled', { user: { id: A }, desktopState: { endpoints: {} } }]]) {
+                window.__EZIL_BOOT__ = boot;
+                const sink = await import('../../telemetry.js?' + tag);
+                sink.capture(input); sink.flushNow(); assert.equal(payloads.length, 0);
+            }
+            window.__EZIL_BOOT__ = { user: { id: A }, computer: { id: B }, desktopState: { endpoints: { telemetry: '/telemetry' } } };
+            const sink = await import('../../telemetry.js?terminal-ai');
+            for (let i = 0; i < 50; i++) sink.capture(input);
+            assert.equal(payloads.length, 0, 'batched'); sink.flushNow();
+            assert.equal(payloads.length, 1); assert.equal(payloads[0].events.length, 3);
+            for (const event of payloads[0].events) {
+                assert.deepEqual(Object.keys(event).sort(), ['code', 'eventClass', 'eventId', 'occurredAt', 'outcome', 'schemaVersion', 'site', 'source']);
+                assert.notEqual(event.eventId, base.eventId);
+            }
+            sink.capture({ ...input, site: 'ezil-os:apps/code#mint' }); sink.flushNow();
+            assert.equal(payloads[1].events[0].computerId, B, 'ordinary telemetry unchanged');
+            assert.ok(payloads[1].events[0].correlationId);
+        } finally { trace.end(); globalThis.fetch = savedFetch; window.__EZIL_BOOT__ = savedBoot; }
+    });
+
     // Real feedback dialog, with only irrelevant capture modules stubbed as in feedback-test.mjs.
     window.HTMLDialogElement.prototype.showModal = function () { this.open = true; };
     window.HTMLDialogElement.prototype.close = function () { this.open = false; this.dispatchEvent(new window.Event('close')); };
@@ -251,7 +316,8 @@ try {
     const { setCurrentComputer } = await import('../../session.js');
     const { signOut } = await import('../../auth.js');
     const { default: telemetry } = await import('../../telemetry.js');
-    telemetry.capture = () => { throw new Error('app failure must never call telemetry.capture'); };
+    const projections = [];
+    telemetry.capture = event => projections.push(event);
     const account = '33333333-3333-4333-8333-333333333333';
     const report = '44444444-4444-4444-8444-444444444444';
     const ui = { feedbackAppFailures: true };
@@ -367,7 +433,7 @@ try {
         assert.deepEqual(M.app_failures_for(context), { available: false, failures: [] });
         assert.deepEqual(M.app_failures_for({ computerId: B }), { available: false, failures: [] });
     });
-    await check('Code source registers at mint with launch computer/session, replaces registration on remint, disposes on close', async () => {
+    await check('Code source registers at mint with launch computer/session/trace, replaces registration on remint, disposes on close', async () => {
         // Exercise actual code.js and the actual store. Doubles own only window chrome and server mint/confirmation.
         const codeUrl = new URL('../../apps/code.js', import.meta.url).href;
         const hello = [];
@@ -410,27 +476,37 @@ try {
         } });
         try {
             const { openCodeWindow } = await import(codeUrl);
+            // The registry's canonical trace, as `launchOnce` hands it to the app. Code still loads main's
+            // `failureFields` normalizer for real: the session double needs no extra export.
+            const { beginTrace, feedbackTraceSnapshot } = await import('../../trace.js');
+            const launched = code => ({ id: code.id, step: code.step, end: code.end });
+            const codeTrace = beginTrace('code'); codeTrace.step('launch_start');
             setCurrentComputer({ id: B });
             const before = listeners.size;
-            const win = await openCodeWindow({ computer: { id: A }, desktopState: { configured: true } });
+            const win = await openCodeWindow({ computer: { id: A }, desktopState: { configured: true }, trace: launched(codeTrace) });
             await until(() => hello.length === 1);
             const trusted = win.ezilFeedbackAppContext;
             assert.equal(trusted.computerId, A); assert.ok(Object.isFrozen(trusted));
-            // One feedback listener and one expired-auth recovery listener; both belong to this mint.
-            assert.equal(listeners.size, before + 2);
+            assert.equal(trusted.traceId, codeTrace.id, 'the window registers its own launch trace');
+            // Feedback, operational AI traces and expired-auth recovery each own one listener per mint.
+            assert.equal(listeners.size, before + 3);
             assert.equal(hello[0].origin, 'https://mint-one.test');
             const post = (h, record, overrides = {}) => window.dispatchEvent(new window.MessageEvent('message', {
                 source: h.iframe.contentWindow, origin: h.origin,
                 data: { type: 'ezil.code.failure', v: 1, nonce: h.data.nonce, failure: record }, ...overrides,
             }));
+            const beforeProjections = projections.length;
             post(hello[0], failure(501));
+            assert.equal(projections.length, beforeProjections + 1);
+            assert.deepEqual(projections.at(-1), { eventClass: 'api_failure', site: 'ezil-os:apps/code#aiRequest', code: 'ai_stream_interrupted', outcome: 'error' });
             assert.equal(M.app_failures_for(trusted).failures[0].eventId, uuid(501));
             assert.deepEqual(M.app_failures_for({ computerId: B }).failures, []);
             minted = 'https://mint-two.test/bootstrap';
             window.dispatchEvent(new window.CustomEvent('ezil:desktop-restarted', { detail: { computerId: A } }));
             await until(() => hello.length === 2);
-            assert.equal(listeners.size, before + 2, 'both old mint registrations removed');
+            assert.equal(listeners.size, before + 3, 'all old mint registrations removed');
             assert.equal(win.ezilFeedbackAppContext, trusted, 'one session per window across mints');
+            assert.equal(win.ezilFeedbackAppContext.traceId, codeTrace.id, 'a remint keeps the window trace');
             assert.equal(hello[1].origin, 'https://mint-two.test');
             assert.notEqual(hello[1].data.nonce, hello[0].data.nonce);
             post(hello[0], failure(502));
@@ -438,9 +514,18 @@ try {
             assert.equal(M.app_failures_for(trusted).failures.length, 1, 'stale mint rejected');
             post(hello[1], failure(504));
             assert.equal(M.app_failures_for(trusted).failures[0].eventId, uuid(504));
-            const second = await openCodeWindow({ computer: { id: A }, desktopState: { configured: true } });
+            const reopenTrace = beginTrace('code');
+            const second = await openCodeWindow({ computer: { id: A }, desktopState: { configured: true }, trace: launched(reopenTrace) });
             await until(() => hello.length === 3);
             assert.notEqual(second.ezilFeedbackAppContext.appSession, trusted.appSession);
+            assert.equal(second.ezilFeedbackAppContext.traceId, reopenTrace.id, 'a reopened window registers a fresh trace');
+            assert.notEqual(reopenTrace.id, codeTrace.id);
+            // A later Settings visit is the ambient trace; the first window's report keeps its own.
+            beginTrace('settings').end('ok');
+            assert.equal(feedbackTraceSnapshot().app, 'settings');
+            open(trusted); change(true);
+            assert.equal(payload().diagnostics.traceId, codeTrace.id, 'feedback from the window keeps its trace');
+            close();
             post(hello[2], failure(505));
             assert.equal(M.app_failures_for(trusted).failures[0].eventId, uuid(504), 'other session excluded');
             await win.on_before_exit(); await second.on_before_exit();
