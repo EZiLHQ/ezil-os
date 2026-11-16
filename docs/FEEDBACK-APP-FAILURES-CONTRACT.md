@@ -209,3 +209,23 @@ and `sourceDigest` remain unchanged. Any edit before application requires updati
 the source checksum. Promotion requires reviewed, actually observed before/after
 catalog hashes and an explicit release decision. No hosted migration, delivery
 or deployment is established by these local changes; production remains HOLD.
+
+
+## Repository failure evidence (2026-11-16)
+
+Code keeps its plain failure message. Repository-open refusals additionally carry a
+validated request ID and a closed reason of the form
+`repo_open:worker_http_<status>:<reason>` or `repo_open:transport:<reason>`.
+The allowed reasons identify bootstrap, supervisor availability, workspace/ref/clone
+refusal, transport, admission and unconfirmed cleanup. Provider text, URLs, grants,
+authors, request bodies and command stderr never become diagnostic values. Host
+replies pass an exact allowlist projection through the edge and Worker; legacy
+error-only replies remain supported. Success and cleanup fences are unchanged.
+
+The existing telemetry writer records the failure after the response, subject to
+its existing rate and row guards. Code also retains the reason and request ID in
+the local consented event ring, so a report remains useful after app log rotation.
+The feedback dialog uses its owning or visible front app's trusted registration;
+opening Settings must not replace a failed Code window's trace. The trace history
+is bounded to32 entries and unknown explicit trace IDs never fall back to another
+app. Diagnostic opt-out continues to omit optional client evidence.
