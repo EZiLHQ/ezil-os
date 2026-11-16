@@ -597,6 +597,18 @@ HOST_AGENT_STANDALONE_EXCEPTION={
 }
 
 
+# The C/6a187841 host tree -> reviewed repository failure diagnostics. Existing
+# requests and successful responses stay compatible; optional failure metadata
+# uses a closed vocabulary, and supervisor_unavailable keeps the uncertain fence.
+# Bind the complete three-file mode/blob delta, including its tests. Later byte
+# changes, partial transitions and the reverse transition need another review.
+HOST_AGENT_REPO_DIAGNOSTICS_EXCEPTION={
+    'lib/ezil_host/standalone_git.py':('100644 58ec9ab326c7b3734f4834402d2f766b3de863e7','100644 e296b6166662e23e5c0df6c7a1209e81c5fb07d3'),
+    'lib/ezil_host/standalone_git_runtime.py':('100644 8591353fbdedb0569c844333af57c5f1a49c10ce','100644 2996b5a7703b03bb4d73708ca169e422cf990965'),
+    'test/test_standalone_git.py':('100644 9a5ec1c5fbe57d72c0dbd0c3fb5fcd12b300e0bf','100644 a406d07d8c9ddc30800bc7f001be1929bdc91beb'),
+}
+
+
 def host_agent_tree(commit,repo=REPO):
     need(manifest.matches(r'[0-9a-f]{40}',commit),'host agent commit unavailable')
     result=subprocess.run(['git','-C',str(repo),'ls-tree','-r','-z',commit,'--',HOST_AGENT+'/'],
@@ -615,7 +627,7 @@ def require_host_abi(deployed_commit,bake_commit,repo=REPO):
     """Byte-identical host agent or one complete reviewed delta; never a wider claim."""
     old,new=host_agent_tree(deployed_commit,repo),host_agent_tree(bake_commit,repo)
     delta={name:(old.get(name),new.get(name)) for name in old.keys()|new.keys() if old.get(name)!=new.get(name)}
-    need(delta in ({},HOST_AGENT_EXCEPTION,HOST_AGENT_STANDALONE_EXCEPTION),'host agent differs from the deployed agent beyond the reviewed delta')
+    need(delta in ({},HOST_AGENT_EXCEPTION,HOST_AGENT_STANDALONE_EXCEPTION,HOST_AGENT_REPO_DIAGNOSTICS_EXCEPTION),'host agent differs from the deployed agent beyond the reviewed delta')
     return delta
 
 

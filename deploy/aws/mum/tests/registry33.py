@@ -29,6 +29,9 @@ AGENT_ED7 = 'ed7da29a279915af36f5c3cfdb63c5627b269049'
 # The reviewed host agent the map describes: 5127d85f plus the lower-attestation lane as reviewed at c7a5af66 (attest.py and its test).
 AGENT_REVIEWED = 'c7a5af6667b6ddba5605b4fceaa5caaccbce91cc'
 AGENT_COMBINED = '68dfb30aba6907b2c6813acc2a6a89281827c900'
+AGENT_SOURCE_C = '1f4712c4e0cbc4898439b4eb475a40a690cc6769'
+AGENT_ADAPTIVE = '6a187841856db9baaec2bacfe2c26a5c73eff045'
+AGENT_REPO_DIAGNOSTICS = '1c81b945b7338d5a03f2771b4caf31356fe46c12'
 SHA = '9' * 40
 TAG = 'stage-cap33'
 IMAGE = 'sha256:' + 'a' * 64
@@ -214,7 +217,7 @@ class StandaloneHostAbiTests(unittest.TestCase):
         self.assertEqual(release.require_host_abi(self.old, self.new, self.repo), expected)
         self.assertEqual(release.require_host_abi(self.old, self.intermediate, self.repo), release.HOST_AGENT_EXCEPTION)
         self.assertEqual(release.require_host_abi(AGENT_5127, AGENT_COMBINED, REPO), expected)
-        self.assertEqual(release.require_host_abi(AGENT_5127, git(REPO, 'rev-parse', 'HEAD'), REPO), expected)
+        self.assertEqual(release.require_host_abi(AGENT_5127, AGENT_SOURCE_C, REPO), expected)
         self.assertEqual(release.require_host_abi(AGENT_COMBINED, AGENT_COMBINED, REPO), {})
 
     def test_every_missing_mutated_or_mode_changed_reviewed_file_refused(self):
@@ -247,6 +250,79 @@ class StandaloneHostAbiTests(unittest.TestCase):
                               (self.intermediate, self.new, self.repo), (AGENT_COMBINED, AGENT_5127, REPO)):
             with self.subTest(old=old, new=new), self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
                 release.require_host_abi(old, new, repo)
+
+
+    def diagnostics_fixture(self):
+        """Extend the reviewed standalone baseline, so CI runs all transition proofs."""
+        self.old = self.new
+        baseline = release.host_agent_tree(self.old, self.repo)
+        for name, pair in release.HOST_AGENT_REPO_DIAGNOSTICS_EXCEPTION.items():
+            self.assertEqual(baseline[name], pair[0])
+            self.install_blob(name, pair[1])
+        self.new = self.commit('reviewed repository diagnostics')
+
+    def test_exact_three_file_delta_from_both_deployed_predecessors(self):
+        self.diagnostics_fixture()
+        expected = release.HOST_AGENT_REPO_DIAGNOSTICS_EXCEPTION
+        self.assertEqual(set(expected), {'lib/ezil_host/standalone_git.py',
+            'lib/ezil_host/standalone_git_runtime.py', 'test/test_standalone_git.py'})
+        self.assertEqual(release.host_agent_tree(AGENT_SOURCE_C, REPO),
+                         release.host_agent_tree(AGENT_ADAPTIVE, REPO))
+        self.assertEqual(release.require_host_abi(self.old, self.new, self.repo), expected)
+        for predecessor in (AGENT_SOURCE_C, AGENT_ADAPTIVE):
+            self.assertEqual(release.require_host_abi(predecessor, AGENT_REPO_DIAGNOSTICS, REPO), expected)
+            self.assertEqual(release.require_host_abi(predecessor, git(REPO, 'rev-parse', 'HEAD'), REPO), expected)
+        self.assertEqual(release.require_host_abi(self.new, self.new, self.repo), {})
+
+    def test_each_missing_changed_byte_or_mode_is_refused(self):
+        self.diagnostics_fixture()
+        for name in release.HOST_AGENT_REPO_DIAGNOSTICS_EXCEPTION:
+            for mutation in ('missing', 'content', 'mode'):
+                with self.subTest(path=name, mutation=mutation):
+                    git(self.repo, 'reset', '--hard', self.new)
+                    path = self.repo / release.HOST_AGENT / name
+                    if mutation == 'missing':
+                        path.unlink()
+                    elif mutation == 'content':
+                        path.write_bytes(path.read_bytes() + b'\n# unreviewed byte change\n')
+                    else:
+                        path.chmod(0o755)
+                    changed = self.commit(mutation)
+                    with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+                        release.require_host_abi(self.old, changed, self.repo)
+
+    def test_every_nonempty_partial_delta_is_refused(self):
+        self.diagnostics_fixture()
+        import itertools
+        names = tuple(release.HOST_AGENT_REPO_DIAGNOSTICS_EXCEPTION)
+        for count in range(1, len(names)):
+            for selected in itertools.combinations(names, count):
+                with self.subTest(selected=selected):
+                    git(self.repo, 'reset', '--hard', self.old)
+                    for name in selected:
+                        self.install_blob(name, release.HOST_AGENT_REPO_DIAGNOSTICS_EXCEPTION[name][1])
+                    changed = self.commit('partial diagnostics')
+                    with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+                        release.require_host_abi(self.old, changed, self.repo)
+
+    def test_added_path_wrong_preimages_reverse_and_composed_delta_are_refused(self):
+        self.diagnostics_fixture()
+        extra = self.repo / release.HOST_AGENT / 'lib/ezil_host/unreviewed.py'
+        extra.write_text('unreviewed = True\n')
+        changed = self.commit('extra path')
+        with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+            release.require_host_abi(self.old, changed, self.repo)
+        for name in release.HOST_AGENT_REPO_DIAGNOSTICS_EXCEPTION:
+            git(self.repo, 'reset', '--hard', self.old)
+            path = self.repo / release.HOST_AGENT / name
+            path.write_bytes(path.read_bytes() + b'\n# different predecessor\n')
+            predecessor = self.commit('wrong preimage')
+            with self.subTest(path=name), self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+                release.require_host_abi(predecessor, self.new, self.repo)
+        with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+            release.require_host_abi(self.new, self.old, self.repo)
+        with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+            release.require_host_abi(AGENT_5127, AGENT_REPO_DIAGNOSTICS, REPO)
 
 
 class PromotionGuardTests(unittest.TestCase):
