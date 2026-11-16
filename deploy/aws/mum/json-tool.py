@@ -24,7 +24,7 @@ RELEASE_REGISTRY_CAPACITY = 32
 # Every active operator reader and the normal append. It equals the app's REBASE_RELEASE_REGISTRY_CAPACITY
 # (app/src/server/lib/compute/aws-rebase-release.ts); records past RELEASE_REGISTRY_CAPACITY may only be
 # appended once the running app proves it reads them (rebase_release.py, normal apply-app then promote).
-ACTIVE_REGISTRY_CAPACITY = 34
+ACTIVE_REGISTRY_CAPACITY = 35
 SECRET = "ezil-os/billing-staging/app"
 BASE_ALLOWED = {"DesktopImageDigest", "DesktopImageId", "AgentSrcS3Uri"}
 PREVIOUS = {"PreviousDesktopImageDigest", "PreviousDesktopImageId"}

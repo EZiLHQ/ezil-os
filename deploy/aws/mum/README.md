@@ -976,3 +976,14 @@ proofs remain required. Rollback retains that compatible app and every record.
 Legacy thirty-two-record GC, immutable record identity, byte ceilings, retention
 proofs and admission gates remain unchanged. Verify actual registry and secret
 sizes before promotion; this increment removes no history.
+
+### Thirty-five-record registry compatibility
+
+The active app readers and normal operator append now accept thirty-five retained
+records and refuse a thirty-sixth. The matching thirty-five-compatible app is the
+release's own plan-bound app: `apply-app` installs it before `promote-canary`, and
+the source and running `/api/health` capacity proofs remain required. There is no
+separate early install. Rollback retains that compatible app and every record.
+Legacy thirty-two-record GC, immutable record identity, byte ceilings, retention
+proofs and admission gates remain unchanged. Verify actual registry and secret
+sizes before promotion; this increment removes no history.
