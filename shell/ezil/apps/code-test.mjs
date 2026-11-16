@@ -271,6 +271,10 @@ push('🔴 clicking Code in the Start menu opens a Code window', !! win);
 push('the Code window has an iframe to put code-server in',
     !! win?.querySelector('.window-app-iframe'));
 push('exactly one Code window (single_instance)', qa('.window[data-app="code"]').length === 1);
+const CODE_TRACE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const firstCodeTraceId = win?.ezilFeedbackAppContext?.traceId;
+push('Code feedback receives the registry trace as a canonical UUID',
+    CODE_TRACE_UUID.test(firstCodeTraceId ?? ''), String(firstCodeTraceId));
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 4. 🔴 THE 5-MINUTE TTL — minted AT WINDOW-OPEN, never stashed.
@@ -317,6 +321,9 @@ await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, deskt
 await settle(20);
 const remintCalls = calls.slice(callsBeforeReopen).filter(c => c.url.startsWith(ENDPOINTS.codePreviewUrl));
 const win2 = q('.window[data-app="code"]');
+push('reopening Code registers its own fresh canonical trace instead of a stale window trace',
+    CODE_TRACE_UUID.test(win2?.ezilFeedbackAppContext?.traceId ?? '')
+        && win2.ezilFeedbackAppContext.traceId !== firstCodeTraceId, String(win2?.ezilFeedbackAppContext?.traceId));
 const iframe2 = win2?.querySelector('.window-app-iframe');
 push('🔴 re-opening mints a FRESH URL rather than reusing the stale one',
     remintCalls.length === 1 && iframe2?.getAttribute('src') !== firstUrl,
