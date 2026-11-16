@@ -106,7 +106,7 @@ describe('automatic compaction before sending', () => {
         expectPairedMessages(body);
         const last = body.messages.at(-1)!.content.find(block => block.type === 'tool_result') as { tool_use_id: string; content: { text: string }[] };
         expect(last.tool_use_id).toBe('call_0');
-        expect(last.content[0]!.text).toMatch(/^file 0: L+\n\[… \d+ characters left out by EZiL to fit the model's input limit …\]\nL+$/);
+        expect(last.content[0]!.text).toMatch(/^file 0: L+\n\[… \d+ characters left out by EZiL to fit the request size limit …\]\nL+$/);
         expect(last.content[0]!.text.length).toBeLessThan(33_000);
         expect(wire(body)).toContain('Fix the failing build.');
     });

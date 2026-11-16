@@ -1,3 +1,4 @@
+import { drainIncidentAlerts } from '@/server/telemetry/incident-alerts';
 import type { SQL } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -19,6 +20,8 @@ import { refreshAiPlans } from '@/server/lib/ai-credential';
 import { GET, maxDuration } from './route';
 
 const mockEnv = vi.hoisted(() => ({ CRON_SECRET: undefined as string | undefined, CLOUDFLARE_GUACAMOLE_HMAC_SECRET: undefined as string | undefined }));
+vi.mock('@/server/telemetry/incident-alerts', () => ({ drainIncidentAlerts: vi.fn() }));
+vi.mock('@/server/telemetry/incident-alert-mail', () => ({ incidentAlertMailer: vi.fn(() => null) }));
 vi.mock('@/env', () => ({ env: mockEnv }));
 vi.mock('@/server/db', () => ({ db: {} }));
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn() }));
@@ -50,6 +53,7 @@ const request = (authorization?: string) => new Request('https://app.test/api/cr
 beforeEach(() => {
     vi.resetAllMocks();
     mockEnv.CRON_SECRET = 'cron';
+    vi.mocked(drainIncidentAlerts).mockResolvedValue({ enqueued: 0, accepted: 0, retry: 0, dropped: 0, skipped: true, silent: false, budget: false });
     vi.mocked(getBillingDeps).mockReturnValue(deps);
     vi.mocked(handleBillingSessionSweep).mockResolvedValue(counts);
     vi.mocked(isPlacementReadEnabled).mockReturnValue(true);
@@ -273,4 +277,28 @@ describe('GET /api/cron/billing-session-sweep', () => {
             provider: { status: vi.fn().mockRejectedValue(fail) } } as unknown as RoutedComputer);
         expect(await (await wiring()).isStillRunning(computer, closedAt)).toBe(false);
     });
+});
+
+
+describe('incident alert sweep wiring', () => {
+    it('does not run for unauthenticated cron requests', async () => {
+        expect((await GET(request('Bearer wrong'))).status).toBe(404);
+        expect(drainIncidentAlerts).not.toHaveBeenCalled();
+    });
+    it('runs before billing dependencies so a billing fault cannot strand alerts', async () => {
+        vi.mocked(getBillingDeps).mockImplementation(() => { throw new Error('billing unavailable'); });
+        await expect(GET(request('Bearer cron'))).rejects.toThrow('billing unavailable');
+        expect(drainIncidentAlerts).toHaveBeenCalledExactlyOnceWith(db, null);
+        expect(vi.mocked(drainIncidentAlerts).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(getBillingDeps).mock.invocationCallOrder[0]!);
+    });
+    it('an alert failure cannot interrupt billing work or expose its error', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        vi.mocked(drainIncidentAlerts).mockRejectedValue(new Error('secret-mail-key'));
+        try {
+            expect((await GET(request('Bearer cron'))).status).toBe(200);
+            expect(handleBillingSessionSweep).toHaveBeenCalledTimes(1);
+            expect(warn).toHaveBeenCalledExactlyOnceWith('[telemetry] incident alert sweep unavailable');
+        } finally { warn.mockRestore(); }
+    });
+
 });

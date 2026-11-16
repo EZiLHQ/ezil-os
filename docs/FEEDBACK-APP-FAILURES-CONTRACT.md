@@ -15,7 +15,7 @@ chain. The desktop-only telemetry bridge (`shell/ezil/telemetry.js`,
 `MOBILE_BRIDGE_CONTRACT`) deliberately drops detail, correlation and computer;
 it is NOT loosened. App failures travel on their own narrow message and are
 stored additively as `diagnostics.appFailures` in the existing feedback JSONB.
-No new table, no migration.
+The detailed feedback channel needs no new table or migration. The separate incident alert outbox in §6 uses the unapplied additive migration 0024.
 
 ## 1. Transport (Code window iframe → shell)
 
@@ -107,7 +107,7 @@ A code is valid only in its own category (or `unexpected_error` in any).
 
 ## 4. Shell store
 
-- In memory only, never `localStorage`, never `telemetry.capture()`.
+- Detailed records remain in memory only, never `localStorage`, and are never passed to `telemetry.capture()`. The separately authorized terminal metadata projection is specified in §6.
 - One ring per (computer, app session): newest 50, entries older than 30
   minutes dropped, duplicate `eventId` ignored, at most 20 accepted messages
   per frame per minute. Sign-out clears every ring.
@@ -143,3 +143,69 @@ A code is valid only in its own category (or `unexpected_error` in any).
   idempotency key, Gateway request id). The workbench id is optional and not
   guaranteed to be captured; no equivalence between the ids is claimed. Ids
   correlate logs; they are not authorization to look up another user's data.
+
+
+## 6. Authorized automatic terminal metadata projection (staging)
+
+The user authorizes automatic metadata-only terminal AI incident telemetry,
+independent of submitting feedback. Detailed `appFailures` records remain
+consent-only. The collector imports no telemetry module and installs no listeners
+on import. Code supplies an optional, throwing-safe `onTerminalFailure` observer.
+It runs only after source/contentWindow, exact origin, live src, v1, fresh nonce,
+exact envelope keys, 2048-byte bound, record validation, 20 messages/minute rate
+limit and eventId deduplication have accepted and stored the record.
+
+Only `outcome: failed` and the following closed mapping reach the observer:
+
+| Validated failure code | Telemetry code |
+| --- | --- |
+| provider_error | ai_provider_error |
+| provider_overloaded | ai_provider_overloaded |
+| model_unavailable | ai_model_unavailable |
+| stream_interrupted | ai_stream_interrupted |
+| first_token_timeout | ai_first_token_timeout |
+| request_timeout | ai_request_timeout |
+| app_start_failed | ai_app_start_failed |
+| app_start_timeout | ai_app_start_timeout |
+| chat_unavailable | ai_chat_unavailable |
+
+Every projection has exactly `eventClass: api_failure`,
+`site: ezil-os:apps/code#aiRequest`, the mapped `code`, and `outcome: error`.
+No request/event id from the detailed record, model, user/computer id, amount,
+prompt, error string, tool content or other detail is copied. The existing sink
+adds its own random event id, schema version, source and timestamp, but suppresses
+ambient correlation and computer ids for this site. The authenticated server
+continues deriving its existing user hash for distinct-user aggregation.
+Cancellation, retrying, recovered, credit/entitlement refusals, provider_refused,
+and unmapped codes do not project. Existing telemetry endpoint/sign-in gates,
+batching, per-key maximum of three events per page and transport limits apply.
+A producer must report a retry as `retrying` and reserve `failed` for terminal
+failure; a later recovered record cannot retract a previously terminal report.
+
+The nine mapped terminal codes and `computer_rebase_required` qualify for an
+incident at one real user. Warming polls and timing milestones do not gain a
+one-user policy. This change does not add a frame_not_answering policy because
+that code is also used outside this validated terminal channel.
+
+The cron runs the incident drain after authorization and before staging billing
+dependencies, with its own failure isolation. SMTP2GO uses the existing verified
+`invites@projects.ezil.work` sender, `contact@ezil.work` recipient and five-second
+timeout. Subjects identify staging and link to
+`https://os-staging.ezil.work/admin/telemetry`. Provider acceptance is not mailbox
+delivery. A crash/rollback after provider acceptance can resend; Message-ID helps
+identify duplicates but does not establish provider idempotency. Queue bounds,
+mutes, cooldowns, delivery budget and retries remain durable.
+
+A freshly observed empty event table establishes `first_observed_at`; silence
+requires six hours since that timestamp (or the latest event when present).
+A collection-silent notice is enqueued at most once per 24 hours. Collection
+silence is an absence-of-events signal, not proof of an ingestion outage.
+
+Migration `0024_telemetry_alerts.sql` is additive and unapplied. The staging runner
+explicitly inventories it. Production protocol v1 has no `draft` kind; its
+existing non-applying `snapshot` source pattern records the actual file checksum,
+with no entry in `migrations` or the Drizzle journal. Historical `initialCatalog`
+and `sourceDigest` remain unchanged. Any edit before application requires updating
+the source checksum. Promotion requires reviewed, actually observed before/after
+catalog hashes and an explicit release decision. No hosted migration, delivery
+or deployment is established by these local changes; production remains HOLD.

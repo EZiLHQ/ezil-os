@@ -70,6 +70,15 @@ describe('retained EZiL ID token', () => {
         expect((await retainedIdentity('os-user')).subject).toBe('auth0|a');
     });
 
+    it('derives commit attribution on re-verification even for an older vault entry', async () => {
+        await retainProjectIdentity(TOKEN);
+        const gitAuthor = { name: 'contact', email: 'contact@ezil.work' };
+        mocks.verify.mockResolvedValueOnce({ ...verified(), gitAuthor });
+        expect(await retainedIdentity('os-user')).toMatchObject({ gitAuthor });
+        // Never keep an older author if the freshly verified token no longer provides one.
+        expect((await retainedIdentity('os-user')).gitAuthor).toBeUndefined();
+    });
+
     it('a new sign-in replaces the earlier entry, and sign-out deletes it and expires the cookie', async () => {
         await retainProjectIdentity(TOKEN);
         const first = mocks.jar.get(IDENTITY_COOKIE)!.value;

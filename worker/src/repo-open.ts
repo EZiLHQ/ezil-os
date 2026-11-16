@@ -289,6 +289,10 @@ export interface RepoOpenRequest {
   scope?: 'read' | 'write';
   /** Standalone EZiL Git authorization, kept separate from the deterministic OS checkout folder ID. */
   privatePacket?: PrivateGitPacket;
+  /** Verified signed-in person's repository-local commit identity; separate from the gateway grant. */
+  gitAuthor?: { name: string; email: string };
+  /** Renew access for an already open checkout without cloning or fetching. */
+  refreshOnly?: true;
   /** Chosen from the URL's host by `parseRepoOpenRequest`, never by the caller. */
   auth: RepoOpenAuth;
   /** The whole open's bound, ms: the caller's `timeoutMs`, or `REPO_OPEN_EXEC_TIMEOUT_MS`. */
@@ -376,9 +380,17 @@ export function parseRepoOpenRequest(
   const invalid = { ok: false as const, error: 'repo_open_invalid_request' as const };
   if (!isPlainObject(body)) return invalid;
   if (Object.hasOwn(body, 'privatePacket')) {
-    if (Object.keys(body).filter(k => k !== 'timeoutMs').sort().join(',') !== 'privatePacket,repositoryId'
+    if (Object.keys(body).filter(k => !['timeoutMs', 'gitAuthor', 'refreshOnly'].includes(k)).sort().join(',') !== 'privatePacket,repositoryId'
       || typeof body.repositoryId !== 'string' || !UUID.test(body.repositoryId)
       || !isPlainObject(body.privatePacket)) return invalid;
+    if (Object.hasOwn(body, 'refreshOnly') && body.refreshOnly !== true) return invalid;
+    const author = body.gitAuthor;
+    if (Object.hasOwn(body, 'gitAuthor') && (!isPlainObject(author)
+      || Object.keys(author).sort().join(',') !== 'email,name'
+      || typeof author.name !== 'string' || author.name.length < 1 || author.name.length > 128
+      || author.name.trim() !== author.name || /[\x00-\x1f\x7f<>]/u.test(author.name)
+      || typeof author.email !== 'string' || author.email.length > 254
+      || !/^[^\s@<>\x00-\x1f\x7f]+@[^\s@<>\x00-\x1f\x7f]+$/u.test(author.email))) return invalid;
     const packet = body.privatePacket;
     if (Object.keys(packet).sort().join(',') !== 'git,identity,repository,version' || packet.version !== 2
       || !isPlainObject(packet.repository) || Object.keys(packet.repository).sort().join(',') !== 'canonicalURL,id,ref'
@@ -407,6 +419,8 @@ export function parseRepoOpenRequest(
       token: packet.git.token as string, expiresAt: packet.git.expiresAt as string,
       scope: packet.git.scope as 'read' | 'write', auth: 'basic', timeoutMs,
       privatePacket: packet as unknown as PrivateGitPacket,
+      ...(author ? { gitAuthor: author as { name: string; email: string } } : {}),
+      ...(body.refreshOnly === true ? { refreshOnly: true as const } : {}),
     } };
   }
   const keys = Object.keys(body).filter((k) => k !== 'timeoutMs').sort().join(',');
@@ -726,11 +740,12 @@ export function repoOpenCommand(params: {
 export const REPO_OPEN_CLI_PACKET_ENV = 'EZIL_REPO_OPEN_CLI_PACKET';
 export function repoOpenCliCommand(request: RepoOpenRequest, root: RepoOpenRoot): { command: string; packet: string } {
   if (!request.privatePacket || !EZIL_GIT_REPOSITORY_URL.test(request.canonicalURL)) throw new Error('invalid standalone CLI open');
-  const args = [String(request.timeoutMs - 5_000), '3000', '--repo-open', shq(root.path), shq(request.repositoryId),
+  const args = [String(request.timeoutMs - 5_000), '3000', request.refreshOnly ? '--repo-refresh' : '--repo-open', shq(root.path), shq(request.repositoryId),
     shq(request.canonicalURL), root.requireHydrated ? '1' : '0', STANDALONE_CLI_CANDIDATE.cliSha256,
     STANDALONE_CLI_CANDIDATE.version];
   return { command: `(p=$${REPO_OPEN_CLI_PACKET_ENV}; unset ${REPO_OPEN_CLI_PACKET_ENV}; exec python3 -I /run/ezil/bin/supervise.py ${args.join(' ')} 3<<<"$p")`,
-    packet: JSON.stringify(request.privatePacket) };
+    packet: JSON.stringify({ ...request.privatePacket, gitAccess: true, ...(request.gitAuthor ? { gitAuthor: request.gitAuthor } : {}),
+      ...(request.refreshOnly ? { refreshOnly: true } : {}) }) };
 }
 
 /** The script's result line (the last `ezil-repo-open:` line), or null when there is none or it is malformed. */
@@ -767,7 +782,8 @@ export function parsePrivateCliOutput(stdout: string, request: RepoOpenRequest, 
     || value.repository.ref !== packet.repository.ref
     || (value.status !== 'cloned' && value.status !== 'reused')) return null;
   const folder = `${root.path}/projects/${request.repositoryId}`;
-  if (value.folder !== `${folder}/${REPO_OPEN_NESTED_DIR}`) return null;
+  const name = request.canonicalURL.slice(request.canonicalURL.lastIndexOf('/') + 1, -4);
+  if (value.folder !== `${folder}/${name}` && !(request.refreshOnly && value.folder === `${folder}/${REPO_OPEN_NESTED_DIR}`)) return null;
   return { ok: true, folder, status: value.status === 'reused' ? 'fetched' : 'cloned' };
 }
 

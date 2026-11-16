@@ -54,51 +54,88 @@ Output caps clamp to 16–16384. `temperature` and `topP` in model configuration
 (or `temperature`/`top_p` in modelOptions) clamp to [0,1]. `stream` configures
 Qwen's response mode. Both models advertise `imageInput: false`.
 
-Token counting measures serialized UTF-8 bytes; a message counts as its
-serialized wire message. Copilot 0.69 uses this count for its own tool
-definitions against the advertised input, one count per schema key and string
-value (it never counts numbers, booleans or punctuation), for its tool budget and
-for its text tool-result cap. Its prompt renderer counts message text with its
-own o200k_base tokenizer instead. A string counts as the text block it would be
-sent as, its JSON literal plus 23 bytes. That is deliberate. Copilot starts
-background compaction (a summary request to the active model) when message plus
-tool tokens reach 0.78–0.82 of the advertised input (0.9 without a summarizer).
-A heavy tool count starts it while its summary still fits the byte bound.
+Token counts and transport bytes are separate. `provideTokenCount` uses the local
+text/message estimate in `tokens.ts`; it no longer charges a JSON text-block
+wrapper for every schema key. The pinned Copilot patch counts each complete tool
+schema once, including numeric and boolean constraints. Prompt text still uses
+Copilot's o200k_base renderer; estimates are not exact provider tokenization.
 
-This was measured with a mock on the image, with its 38 agent tools (53,066
-bytes on the wire), Qwen, and 10 turns of about 8.5 KB each, where the 39-tool
-test fixture counts 88,254 against 53,535. This count gave about 87,400 tool
-tokens and compacted every one to three turns; all 10 turns completed. Counting
-bare literals (about 57,100) delayed compaction until the summary request was
-itself over the byte bound, and every such chat was refused from its seventh
-turn on.
+The safe history budget uses token units throughout:
+`min(maxInputTokens, explicitLocalCapacity - outputReservation) - 8192 summary - 2048 system - toolReserve`.
+The capacity term applies only when `contextWindowTokens` is explicitly configured.
+Without it, a verified transport catalog uses its independent input allowance;
+legacy catalogs use the conservative local estimate `min(131072, maxInputTokens) - outputReservation` before reserves.
+With 131072 input, 262144 explicit capacity, 8192 output and 8000 tool reserve,
+the safe input budget is 112832, never 235712. Actual tool/system content is
+counted too. Copilot starts summarization at this reserved budget without the
+previous jitter or extra 10% reduction.
 
-With Kimi, whose summaries are JSON, summaries that took 45–90 seconds
-completed under the 200-second deadline. The base build abandoned them at 30
-seconds and ended with "Conversation too large or invalid". A chat can still
-outgrow the bound before a slow summary lands, when turns come faster than the
-summary. In the mock this happened with code-like content.
+The pinned workbench denominator adds the advertised safe input budget and
+output cap. That is a local budget, not verified full model capacity. The widget
+therefore labels EZiL percentages **budget**, with a hover explaining that full
+capacity is unknown, even when the usage numerator is measured. No unsupported
+`maxContextWindowTokens` metadata is passed through the serializer.
 
-Copilot never counts schema numbers or booleans, so tool sets dominated by
-them are under-counted. A large tool set (64 tools count 139,882, over the
-advertised input) leaves Copilot's history budget at its floor. That case is
-unmeasured. For `openai-responses` models a string also
-counts with non-ASCII escaped as `\uXXXX`, because the Gateway's Responses bound
-escapes tool text and adds 128 bytes per tool and 32 per item. Advertised input defaults to
-`131072 - 1056 - 1536 - 8000 = 120480`; `toolReserve` (default 8000) is only a
-margin for counting differences.
+### Staging usage and capacity compatibility
 
-The exact request is bounded before dispatch: `body bytes + 1056 <= 131072`, at
-most 1024 messages and 1024 blocks in one message (Responses: the escaped bound
-above, 512 items, 256 KiB). Copilot's own compaction often does not run before a
-chat reaches that bound: in Ask mode, with few tools, with a large tool output,
-or with Kimi's slow summaries (above).
+No new Gateway fields are required for usage propagation. Validated JSON/SSE
+usage travels on the existing request-local Copilot `LanguageModelDataPart`
+with MIME `usage`, including the configured output reserve (the pinned
+LanguageModelChat API does not expose that property). Final cumulative output is preferred; an output-only native
+Messages delta inherits input/cache counters from `message_start`. A complete
+final input report overrides preliminary counts; inconsistent partial
+restatements still fail. Metadata is never inserted in model content or saved
+as an assistant message. Cancellation suppresses later parts. No global
+"last usage" state can mix sessions or models.
+
+Messages `input_tokens` excludes cache-read and cache-creation tokens; the
+context total adds each reported bucket once. Responses `input_tokens` already
+includes cache tokens and is never increased by them. Reasoning tokens are a
+subset of output, not extra output. Cache counters are optional: absence remains
+unknown, including in logs and aggregated usage reports. Messages input with
+unknown cache coverage is a labelled estimate/lower bound. A Copilot response
+without provider usage uses a labelled local estimate, not zero. The context
+hover shows input, output, reported cache read/write, and reported reasoning;
+tiny nonzero occupancy displays `<1%` and estimates display `~`.
+
+The Gateway currently provides no combined provider context capacity. The
+unsupported `context_window_tokens` catalog field is ignored; input and output
+limits are never added to invent capacity. Local `contextWindowTokens` may
+only tighten budgeting and does not establish the widget's full model capacity.
+
+`GET /models` optionally advertises top-level `transport` with contract
+`ezil.gateway.transport.v1`, `input_bound_method: utf8_json_plus_framing`,
+`token_limits_unit: tokens`, and `max_request_bytes` keyed by `/v1/messages`
+and `/v1/responses`. The OS proxy and consumer clamp those byte caps to verified
+4 MiB Messages / 256 KiB Responses maxima. Unknown/malformed/absent contracts
+retain the conservative 128 KiB consumer fallback. The proxy reads each POST
+under its own endpoint cap and cancels oversized bodies before any upstream call.
+
+Both checks must pass: actual serialized UTF-8 bytes fit the effective endpoint
+cap, and conservative model admission fits `maxInputTokens`. Messages admission
+is full body bytes + 1056, with at most 1024 messages / blocks per message.
+Responses retains its escaped-schema, item and tool framing bound, with at most
+512 items. No bytes/4 estimate replaces admission. Local shaping makes no paid
+summary call; any existing remote 413 retry is only after a pre-admission refusal.
+A larger endpoint allowance cannot bypass a smaller model input allowance.
+
+Balance optionally reads `accounting.contract: ezil.gateway.balance.v1`.
+Validated decimal strings supersede legacy numeric money, including above 2^53;
+BigInt comparisons/formatting preserve exact values. The existing status refresh
+abort, controller identity, and provider ownership checks precede cursor ordering.
+A smaller ledger cursor is discarded; equal cursors compare UTC microseconds,
+so expiry and pending-state changes can update without a ledger append. Provider
+changes reset ordering. Old databases without accounting retain the legacy view.
+The whole-credit headline is intentional; hover separates available, reserved,
+pending and lifetime final ledger debits. Lifetime debits retain historical credit
+units and are not cumulative USD provider spend. Adjacent balance changes are
+not interpreted as refunds. Tariffs and backend money logic are unchanged.
 
 ### Automatic compaction (`src/compact.ts`)
 
 A request over a bound is compacted on the computer and sent, in the same chat.
 Only the copy that is sent changes. Copilot's saved conversation is not touched, so
-switching to a model with a larger limit sends more of it again. The compaction is
+switching to a route with a larger request size limit sends more of it again. The compaction is
 deterministic and makes no model call.
 
 What is kept verbatim:
@@ -114,8 +151,7 @@ What is shortened or folded, in order, until the request fits 80% of the limit:
 3. Only after that is the latest tool output cut below 32 KB.
 
 A cut never separates a tool call from its result. Every shortening is marked in
-the text the model reads. The title bar of the chat view shows "Conversation
-compacted to fit the model" (`ezil-models.compactionInfo`) while the turn runs
+the text the model reads. The title bar of the chat view shows "Older content shortened to fit request size" (`ezil-models.compactionInfo`) while the turn runs
 and for 10 seconds after, with a progress bar on the view. Nothing is added to
 the chat, because a note there would be saved and sent back on every later turn.
 
@@ -192,7 +228,7 @@ abandoned at that deadline fails with `completion_timeout`
 (`os_completion_timeout` from the proxy) and may still be charged if the model
 finished. Neither deadline adds a retry.
 
-Each call writes one redacted JSON telemetry line: request ID, model, stream,
+Each call writes one redacted JSON telemetry line (unreported usage fields are omitted, never zero-filled): request ID, model, stream,
 hold, HTTP status, latency, four usage buckets, stop reason, error code and
 error origin (`local`, `os_proxy`, `gateway`, `transport` or `response`). Local
 refusals add their sizes only: body and limit bytes, messages, largest message
@@ -379,3 +415,9 @@ and cache-option allowlist in turn and requires each focused test to fail.
 
 The package license is AGPL-3.0-only. See `ATTRIBUTIONS.md` and the MIT notice
 preserved in `src/anthropic.ts` for Microsoft Copilot converter attribution.
+
+The AI status hover and accessible popover label available credits separately
+from pending holds (reserved, not final charges), explain that available credits
+exclude holds, and retain the server's exact values. Recent settled usage stays
+separate from held-plus-settled budget counters. No balance smoothing or client
+pricing is performed.

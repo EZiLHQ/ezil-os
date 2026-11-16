@@ -51,6 +51,17 @@ test('inventory, source byte checksums, symlinks and malformed manifests fail cl
   await assert.rejects(validate(root), /Symlink/);
 });
 
+test('incident alerts 0024 remains an inventoried draft outside production apply', async () => {
+  const root = fileURLToPath(new URL('../', import.meta.url));
+  const loaded = await validate(root);
+  const path = 'app/drizzle/0024_telemetry_alerts.sql';
+  assert.equal(loaded.manifest.sources.find(row => row.path === path)?.kind, 'snapshot');
+  assert.equal(loaded.files.get(path)?.sha256, hash(await readFile(join(root, path))));
+  assert.equal(loaded.manifest.migrations.some(row => row.path === path), false);
+  assert.doesNotMatch(applySQL(loaded), /CREATE TABLE public.ezil_telemetry_alert/);
+  assert.equal(loaded.manifest.initialCatalog.sourceDigest, 'e884a81df52d591799e97b1ca59685fa7a70449d91de414c777866f5a26438f5');
+});
+
 test('checked-in sponsor SQL is fully inventoried but absent from automatic apply and ordered journal', async () => {
   const root = fileURLToPath(new URL('../', import.meta.url));
   const loaded = await validate(root);
@@ -796,4 +807,15 @@ test(`transaction protocol (${process.env.PRODUCTION_MIGRATIONS_DOCKER === '1' ?
       assert.equal((await db.rows('SELECT count(*)::integer n FROM ezil_ci.journal'))[0].n, 1);
     });
   }
+});
+
+test('AI request traces 0025 is an inventoried snapshot, never automatic production SQL', async () => {
+  const root = fileURLToPath(new URL('../', import.meta.url));
+  const loaded = await validate(root);
+  const path = 'app/drizzle/0025_ai_request_traces.sql';
+  assert.equal(loaded.manifest.sources.find(row => row.path === path)?.kind, 'snapshot');
+  assert.equal(loaded.files.get(path)?.sha256, hash(await readFile(join(root, path))));
+  assert.equal(loaded.manifest.migrations.some(row => row.path === path), false);
+  assert.doesNotMatch(applySQL(loaded), /CREATE TABLE public.ezil_ai_request_traces/);
+  assert.equal(loaded.manifest.initialCatalog.sourceDigest, 'e884a81df52d591799e97b1ca59685fa7a70449d91de414c777866f5a26438f5');
 });

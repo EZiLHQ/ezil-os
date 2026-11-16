@@ -165,7 +165,7 @@ describe('the three caches, one at a time', () => {
         forgetGatewayModels();
     });
 
-    test('2. provider prompt cache: no cache marker reaches the wire, and a reply must carry both cache counters', async () => fakeClock(async (advance, now) => {
+    test('2. provider prompt cache: no cache marker reaches the wire, and unreported cache counters stay unknown', async () => fakeClock(async (advance, now) => {
         const sent: string[] = [];
         let usage: Record<string, number> = finalUsage;
         const doFetch = (async (_url: string, init: RequestInit) => {
@@ -181,7 +181,9 @@ describe('the three caches, one at a time', () => {
         usage = { input_tokens: 100, output_tokens: 8, cache_read_input_tokens: 3 }; // the write counter is missing
         const bad = run(kimi(), withMarker, doFetch);
         await advance(0);
-        expect((await bad).error?.code).toBe('invalid_response');
+        const missing = await bad;
+        expect(missing.error).toBeUndefined();
+        expect(missing.events.find(e => e.type === 'usage')).toMatchObject({ usage: { cacheReadTokens: 3, cacheWriteTokens: undefined } });
         expect(now()).toBe(0);
     }));
 

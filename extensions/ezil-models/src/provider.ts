@@ -1,3 +1,5 @@
+import { InferenceTrace, InferenceRing, type InferenceDiagnostic } from './inference-diagnostics';
+import { copilotUsage } from './usage';
 // The VS Code LanguageModelChatProvider. Bridges VS Code's LanguageModel* classes to the neutral
 // shapes in types.ts, streams the provider response back as VS Code parts, and records usage.
 
@@ -5,7 +7,7 @@ import * as vscode from 'vscode';
 import type { CompactionInfo } from './compact';
 import { appFailure, type AppFailure } from './failure';
 import { CATALOG_REFUSALS, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModels, includedModelNames, knownGatewayModels, knownGatewayPlan, modelIncluded, parseCatalogModelId, withCatalogDefault, withDefaultModel, withGatewayModelLimits, withPlanLocks, type GatewayModels } from './gateway';
-import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
+import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, geminiRoute, geminiSignedPart, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
 import { redact, type ResolvedModel, type ResolvedProvider } from './config';
 import { estimateMessageTokens, estimateTextTokens } from './tokens';
@@ -25,6 +27,7 @@ export type ProviderHost = {
     requestFinished?(model: ResolvedModel): void;
     /** Content-free gateway outcomes; observer errors must never change a turn. */
     appFailure?(record: AppFailure): void;
+    inferenceDiagnostic?(record: InferenceDiagnostic): void;
     /** The request goes compacted (compact.ts); `finished` settles when its turn ends. */
     compacted?(model: ResolvedModel, info: CompactionInfo, finished: Promise<void>): void;
     /** Ask the EZiL OS window around Code to open its billing dialog; true only when it took the request. */
@@ -95,6 +98,25 @@ function continuationKey(secret: Buffer, connection: number, model: ResolvedMode
         calls.map(call => [call.callId, call.name, stableJson(call.input)])])).digest('hex');
 }
 
+/** Compare the complete visible assistant turn, allowing only transport text chunking differences. */
+function geminiVisibleShape(parts: readonly Part[]): string {
+    const visible: Part[] = [];
+    for (const part of parts) {
+        if (part.type === 'thinking' || isCacheMarker(part) || isStatefulMarker(part) || (part.type === 'text' && !part.value)) continue;
+        const prior = visible.at(-1);
+        if (part.type === 'text' && prior?.type === 'text') prior.value += part.value;
+        else visible.push(structuredClone(part));
+    }
+    return JSON.stringify(visible.map(canonicalPart));
+}
+function geminiReplayParts(parts: readonly Part[]): Part[] {
+    return parts.filter((part, i) => {
+        if (part.type !== 'thinking') return part.type !== 'text' || part.value !== '';
+        const next = parts[i + 1];
+        return geminiSignedPart(part) && (next?.type === 'tool_call' || (next?.type === 'text' && next.value !== ''));
+    }).map(part => structuredClone(part));
+}
+
 type TurnCall = { callId: string; name: string; input: unknown };
 function turnCalls(messages: readonly Message[]): TurnCall[] {
     return messages.flatMap(message => message.role !== 'assistant' ? [] : message.parts.flatMap(part => part.type === 'tool_call' ? [{ callId: part.callId, name: part.name, input: part.input }] : []));
@@ -133,7 +155,7 @@ export function toNeutralPart(part: unknown): Part | undefined {
     }
     if (isInstance(part, vscode.LanguageModelToolResultPart) || (typeof record.callId === 'string' && Array.isArray(record.content))) {
         const content = (record.content as unknown[]).map(toNeutralPart).filter((inner): inner is Part => !!inner);
-        return { type: 'tool_result', callId: record.callId as string, content, isError: record.isError === true };
+        return { type: 'tool_result', callId: record.callId as string, content, ...(typeof record.isError === 'boolean' ? { isError: record.isError } : {}) };
     }
     if (isInstance(part, vscode.LanguageModelDataPart) || (typeof record.mimeType === 'string' && record.data instanceof Uint8Array)) {
         return { type: 'data', mimeType: record.mimeType as string, data: record.data as Uint8Array };
@@ -244,7 +266,7 @@ function osBillingLink(query: string): vscode.Uri | undefined {
 
 /** A catalog as listed, for noticing that a later read changed it (ids, availability, caps, capabilities and the plan's limit). */
 function catalogSignature(catalog: GatewayModels | undefined): string {
-    return catalog ? JSON.stringify([catalog.default_model ?? null, catalog.included ?? null, catalog.data.map(entry => [entry.id, entry.enabled, entry.protocols, entry.availability?.state,
+    return catalog ? JSON.stringify([catalog.default_model ?? null, catalog.included ?? null, catalog.transport ?? null, catalog.data.map(entry => [entry.id, entry.enabled, entry.protocols, entry.availability?.state,
         entry.name, entry.max_input_tokens, entry.max_output_tokens, entry.capabilities])]) : 'unread';
 }
 
@@ -268,6 +290,10 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
      * only), so another conversation that reuses a call id, a changed input, or another model never receives them.
      * EZiL Gateway providers only (see respond). Bounded; lost on reload, when the request goes without them as before.
      */
+    readonly inferenceTrace = new InferenceRing();
+    private geminiThinking = new Map<string, { shape: string; parts: Part[]; token: string }>();
+    private geminiScope = '';
+    private geminiEpoch = randomBytes(16).toString('hex');
     private signedThinking = new Map<string, Part[]>();
     /** The HMAC key for continuationKey: random per provider instance, never exported, logged or persisted. */
     private readonly continuationSecret = randomBytes(32);
@@ -279,7 +305,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     constructor(private readonly host: ProviderHost) {}
 
     refresh(): void { this.changed.fire(); }
-    dispose(): void { this.changed.dispose(); this.modelIdentities.clear(); this.signedThinking.clear(); this.connectionIds.clear(); }
+    dispose(): void { this.changed.dispose(); this.modelIdentities.clear(); this.signedThinking.clear(); this.geminiThinking.clear(); this.connectionIds.clear(); }
 
     /** The same number for the same connection while it stays among the 16 most recent; another one for any change. */
     private connectionIdentity(provider: ResolvedProvider): number {
@@ -454,6 +480,10 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         if (token.isCancellationRequested) controller.abort();
         const started = Date.now();
         let resolved: ResolvedModel | undefined;
+        let sessionIdentity: string | null = null;
+        const correlate = (value: unknown) => createHmac('sha256', this.continuationSecret).update(JSON.stringify(value)).digest('hex');
+        let diagnostic = new InferenceTrace('unknown', { messages: [], tools: [], toolMode: 'auto', modelOptions: {} });
+        let diagnosticFailed = false;
         let chatStarted = false;
         let terminalOutcome = false;
         const onOutcome = (record: AppFailure) => {
@@ -461,7 +491,9 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             try { this.host.appFailure?.(record); } catch { /* Optional observer. */ }
         };
         try {
+            sessionIdentity = typeof options.modelOptions?._conversationId === 'string' ? options.modelOptions._conversationId : null;
             resolved = await this.resolve(model, controller.signal);
+            diagnostic.record.modelAlias = /^[a-zA-Z0-9_.:-]{1,128}$/.test(resolved.model) ? resolved.model : 'unknown';
             controller.signal.throwIfAborted();
             if (resolved.provider.type === 'ezil-gateway' && isUtilityRequest(options.modelOptions ?? {})) {
                 // Requests marked as titles or summaries (role or requestInitiator): Qwen on the named model's own provider
@@ -483,10 +515,41 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 }
             }
             const request = toNeutralRequest(messages, options);
+            diagnostic = new InferenceTrace(resolved.model, request, {
+                conversationId: sessionIdentity === null ? null : correlate(['session', sessionIdentity]),
+                identifyCall: call => correlate(['call', sessionIdentity, model.id, call]),
+            });
             // The signed-thinking fallback is for the EZiL Gateway only: its transport sends just its own Bearer credential
             // (custom headers are ignored), which continuationKey covers. A direct provider may authenticate through custom
             // header overrides, so it keeps its reviewed behaviour: no fallback.
-            const fallback = !thinkingCtor() && resolved.provider.type === 'ezil-gateway';
+            const gemini = resolved.provider.type === 'ezil-gateway' && geminiRoute(resolved.model);
+            const scope = `${this.connectionIdentity(resolved.provider)}:${resolved.model}`;
+            if (this.geminiScope !== scope) { this.geminiScope = scope; this.geminiEpoch = randomBytes(16).toString('hex'); this.geminiThinking.clear(); }
+            const geminiTurnToken = randomBytes(16).toString('hex');
+            const geminiOrigin = `${this.geminiEpoch}:${scope}`;
+            // A completed Gemini reply is restored as one ordered sequence only when its
+            // entire visible turn, history, connection, model and available session identity match.
+            const session = typeof options.modelOptions?._conversationId === 'string' ? options.modelOptions._conversationId : null;
+            const geminiKey = (history: readonly Message[], calls: readonly TurnCall[]) => createHmac('sha256', this.continuationSecret)
+                .update(JSON.stringify([geminiOrigin, session, continuationKey(this.continuationSecret, this.connectionIdentity(resolved!.provider), resolved!, request.messages, history, calls)]))
+                .digest('hex');
+            const fallback = !thinkingCtor() && resolved.provider.type === 'ezil-gateway' && !gemini;
+            if (gemini) for (let start = 0, end = 0; start < request.messages.length; start = Math.max(end, start + 1)) {
+                if (request.messages[start]!.role !== 'assistant') { end = start + 1; continue; }
+                end = assistantTurnEnd(request.messages, start);
+                const turn = request.messages.slice(start, end).filter(message => message.role === 'assistant');
+                const parts = turn.flatMap(message => message.parts);
+                const kept = this.geminiThinking.get(geminiKey(request.messages.slice(0, start), turnCalls(turn)));
+                // Foreign, incomplete or cancelled response metadata is never authority.
+                for (const message of turn) message.parts = message.parts.filter(part => part.type !== 'thinking');
+                // Caller-supplied conversation IDs scope correlation, never establish ownership.
+                const ownsTurn = kept && parts.some(part => part.type === 'thinking'
+                    && part.metadata?._ezilGeminiTurn === kept.token);
+                if (kept && ownsTurn && kept.shape === geminiVisibleShape(parts)) {
+                    turn[0]!.parts = structuredClone(kept.parts);
+                    for (const message of turn.slice(1)) message.parts = [];
+                }
+            }
             if (fallback) this.restoreSignedThinking(resolved, request);
             // The history this turn answers, for the fallback's key (fixed before anything below can change the request).
             const answered = request.messages.slice();
@@ -494,6 +557,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             let emittedText = false;
             // Completed signed/redacted thinking of this turn, kept only when the ThinkingPart API is missing.
             const signed: Part[] = [];
+            const geminiParts: Part[] = [];
             const calls: { callId: string; name: string; input: unknown }[] = [];
             let completed = false;
             if (resolved.provider.type === 'ezil-gateway') {
@@ -521,16 +585,23 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 }
             }
             const sending = resolved;
+            diagnostic.record.modelAlias = /^[a-zA-Z0-9_.:-]{1,128}$/.test(sending.model) ? sending.model : 'unknown';
             const events = chat(resolved, request, {
                 signal: controller.signal,
                 fetch: this.host.fetch,
                 gateway: {
-                    onCompact: info => this.host.compacted?.(sending, info, finished),
+                    onDiagnosticTransport: value => diagnostic.transport(value),
+                    onCompact: info => {
+                        diagnostic.record.compaction = { trigger: info.cause, count: (diagnostic.record.compaction?.count ?? 0) + 1, folded: info.folded, shortened: info.shortened };
+                        this.host.compacted?.(sending, info, finished);
+                    },
                     onOutcome,
                 },
                 log: line => this.host.log(redact(line, this.host.secrets())),
                 onRequest: (url, body) => {
                     if (sending.provider.type === 'ezil-gateway') return;
+                    diagnostic.record.wireBytes = Buffer.byteLength(JSON.stringify(body));
+                    diagnostic.record.totalWireBytes = diagnostic.record.wireBytes; diagnostic.record.attempts = 1;
                     this.host.log(`[request] ${sending.id} -> ${redact(url, this.host.secrets())} messages=${request.messages.length} tools=${request.tools.length} toolMode=${request.toolMode}${options.modelOptions?.requestInitiator ? ` initiator=${String(options.modelOptions.requestInitiator)}` : ''}`);
                     if (this.host.logRequests()) this.host.log(requestForLog(body, this.host.secrets()));
                 },
@@ -538,6 +609,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             chatStarted = true;
             for await (const event of events) {
                 if (token.isCancellationRequested) break;
+                diagnostic.event(event);
+                if (gemini && (event.type === 'text' || event.type === 'tool_call' || event.type === 'thinking')) geminiParts.push(event);
                 switch (event.type) {
                     case 'text':
                         emittedText = true;
@@ -548,13 +621,17 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                         progress.report(new vscode.LanguageModelToolCallPart(event.callId, event.name, (typeof event.input === 'object' && event.input !== null ? event.input : {}) as object));
                         break;
                     case 'thinking':
-                        if (Thinking) progress.report(new Thinking(event.value, event.id, event.metadata) as vscode.LanguageModelResponsePart);
+                        if (Thinking) progress.report(new Thinking(event.value, event.id, gemini
+                            ? { ...event.metadata, _ezilGeminiTurn: geminiTurnToken } : event.metadata) as vscode.LanguageModelResponsePart);
                         else if (typeof event.metadata?.redactedData === 'string'
                             || (typeof event.metadata?._completeThinking === 'string' && typeof event.metadata?.signature === 'string' && event.metadata.signature)) {
                             signed.push({ type: 'thinking', value: '', metadata: event.metadata });
                         }
                         break;
                     case 'usage':
+                        // Metadata travels on this request's own progress stream; late/cancelled replies cannot update another chat.
+                        if (resolved.provider.type === 'ezil-gateway') progress.report(new vscode.LanguageModelDataPart(
+                            new TextEncoder().encode(JSON.stringify(copilotUsage(event.usage, gatewayOutputTokens(resolved)))), 'usage'));
                         this.host.recordUsage(resolved, event.usage, Date.now() - started);
                         break;
                     case 'stop':
@@ -572,11 +649,21 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                         break;
                 }
             }
+            if (gemini && completed && !token.isCancellationRequested && trailingAssistantTurn(answered) === answered.length) {
+                const parts = geminiReplayParts(geminiParts);
+                if (parts.some(part => part.type === 'thinking')) {
+                    for (const part of parts) if (part.type === 'thinking') part.metadata = { ...part.metadata, _ezilGeminiTurn: geminiTurnToken };
+                    // Bound opaque signature/visible-reply retention as well as entry count.
+                    if (Buffer.byteLength(JSON.stringify(parts)) <= 262144) this.geminiThinking.set(geminiKey(answered, calls), { shape: geminiVisibleShape(parts), parts, token: geminiTurnToken });
+                    while (this.geminiThinking.size > 64) this.geminiThinking.delete(this.geminiThinking.keys().next().value!);
+                }
+            }
             // Only a turn that completed (not cancelled or cut off) and ended in tool calls is kept for its continuation.
             if (fallback && completed && signed.length && calls.length && !token.isCancellationRequested) {
                 this.storeSignedThinking(resolved, answered, calls, signed);
             }
         } catch (error) {
+            diagnosticFailed = true;
             const known = this.modelIdentities.get(model.id);
             const catalogId = parseCatalogModelId(model.id);
             const gateway = resolved ? resolved.provider.type === 'ezil-gateway'
@@ -631,7 +718,12 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             if (error instanceof ProviderError) throw new ProviderError(message, error.status, error.retryAfterSeconds, error.upstream && redact(error.upstream, this.host.secrets()));
             throw new Error(message.startsWith('EZiL Models') ? message : `EZiL Models: ${message}`);
         } finally {
+            const record = diagnostic.finish(controller.signal.aborted, diagnosticFailed);
+            record.durationMs = Math.max(0, Date.now() - started);
+            this.inferenceTrace.add(record);
+            try { this.host.inferenceDiagnostic?.(record); } catch { /* observer only */ }
             cancellation.dispose();
+            if (controller.signal.aborted) { this.geminiEpoch = randomBytes(16).toString('hex'); this.geminiThinking.clear(); }
             if (resolved) this.host.requestFinished?.(resolved);
         }
     }

@@ -8,7 +8,7 @@ import { parseModelsConfig, type ResolvedConfig } from '../src/config';
 import { CATALOG_STALE_MS, forgetGatewayModels, gatewayModels } from '../src/gateway';
 import { KIMI, QWEN } from '../src/gateway-messages';
 import { readAIStatus, statusView } from '../src/status-data';
-import { fakeVscode, TextPart, ThinkingPart, ToolCallPart, ToolResultPart } from './fixtures/fake-vscode';
+import { fakeVscode, TextPart, ThinkingPart, ToolCallPart, ToolResultPart, DataPart } from './fixtures/fake-vscode';
 
 mock.module('vscode', () => fakeVscode);
 const { EZiLModelsProvider } = await import('../src/provider');
@@ -82,7 +82,7 @@ describe('the picker lists what the Gateway says this caller can use', () => {
         expect(infos[0]).toMatchObject({ name: 'Qwen3 Coder Next', isDefault: true, capabilities: { toolCalling: true, imageInput: false } });
         expect(infos[1]).toMatchObject({ name: 'Kimi K3 (no streaming)', isDefault: false });
         expect(infos[2]).toEqual(expect.objectContaining({ id: 'ezil/synthetic-chat-a', name: 'Synthetic Chat A', family: 'synthetic-chat-a', isDefault: false,
-            isUserSelectable: true, maxInputTokens: 100_000 - 1056 - 1536 - 8000, maxOutputTokens: 16_384, capabilities: { toolCalling: false, imageInput: false } }));
+            isUserSelectable: true, maxInputTokens: 65376, maxOutputTokens: 16_384, capabilities: { toolCalling: false, imageInput: false } }));
         expect(infos[3]!.name).toBe('synthetic-chat-b');
         // Prices and upstream ids are not contract and never reach the picker.
         expect(JSON.stringify(infos)).not.toMatch(/synthetic-upstream|synthetic-pricing/);
@@ -463,7 +463,9 @@ describe('the frozen v1 contract as the Gateway serves it (CATALOG-3 1af1db9)', 
         const parts: unknown[] = [];
         await g.provider.provideLanguageModelChatResponse(gpt as never, history as never, { tools: [READ_FILE], modelOptions: {} } as never,
             { report: part => parts.push(part) }, token() as never);
-        expect(parts).toEqual([new ToolCallPart('call_9', 'read_file', { path: 'b.ts' })]);
+        expect(parts.filter(part => !(part instanceof DataPart && part.mimeType === 'usage'))).toEqual([new ToolCallPart('call_9', 'read_file', { path: 'b.ts' })]);
+        const metadata = parts.find((part): part is DataPart => part instanceof DataPart && part.mimeType === 'usage')!;
+        expect(JSON.parse(new TextDecoder().decode(metadata.data))).toMatchObject({ prompt_tokens: 100, completion_tokens: 12, total_tokens: 112 });
         await send(g.provider, infos[0]!, history, [READ_FILE]); // and back to Qwen
         const [gptPost, qwenPost] = g.posts;
         expect([new URL(gptPost!.url).pathname, gptPost!.body.model, gptPost!.body.stream, gptPost!.accept]).toEqual(['/ai/v1/responses', 'synthetic-gpt-shaped', true, 'text/event-stream']);

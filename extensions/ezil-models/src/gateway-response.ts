@@ -51,10 +51,10 @@ export async function* gatewayBodyEvents(events: AsyncIterable<SseEvent>, reques
     catch (error) { throw responseFailure(error, requestId, 'connection_reset'); }
 }
 
-/** A JSON reply's usage: all four counters, each a safe non-negative integer. */
+/** Input/output are required; optional cache counters stay unknown when absent. */
 function usage(value: unknown): Usage {
     const c = counters(value);
-    if (c.input_tokens === undefined || c.output_tokens === undefined || c.cache_read_input_tokens === undefined || c.cache_creation_input_tokens === undefined) throw new Error('Invalid usage');
+    if (c.input_tokens === undefined || c.output_tokens === undefined) throw new Error('Invalid usage');
     return { inputTokens: c.input_tokens, outputTokens: c.output_tokens, cacheReadTokens: c.cache_read_input_tokens, cacheWriteTokens: c.cache_creation_input_tokens };
 }
 
@@ -73,33 +73,20 @@ function counters(value: unknown): Counters {
     return out;
 }
 
-/**
- * A stream's final usage, with the authority rules of the Gateway's own usage tap (EZiL AI Gateway
- * src/protocols/anthropic/sse.ts). The final message_delta must carry the cumulative output count, never below
- * message_start's preliminary one, which is never used. Input and cache counters come from the final delta (the
- * Converse route reports them only there, all three together), else from message_start (the native route). A delta that
- * restates only some of them must restate them unchanged. A delta that carries all three is taken as the final input
- * authority even if it differs from message_start: the client cannot tell a Converse report from a native restatement,
- * and relies on the Gateway's native tap, which rejects such a contradiction and withholds the terminal event. A counter
- * neither event carries fails the stream: nothing is zero-filled.
- * Explicit zeros are valid. The cache counters are REQUIRED like input_tokens, with no default: the Gateway's tap needs
- * all four (parseAnthropicUsage) and keeps a reservation pending without them, so a reply missing one cannot settle.
- */
+/** Final cumulative counters override provisional message_start counts. Missing cache counters remain unknown.
+ * Native Anthropic output-only deltas inherit input/cache from message_start. No client settlement inference. */
 function streamUsage(start: Counters, final: unknown): Usage {
     const f = counters(final);
     if (f.output_tokens === undefined || (start.output_tokens !== undefined && f.output_tokens < start.output_tokens)) throw new Error('Invalid usage');
     const allInputs = f.input_tokens !== undefined && f.cache_read_input_tokens !== undefined && f.cache_creation_input_tokens !== undefined;
-    const input = (key: 'input_tokens' | 'cache_read_input_tokens' | 'cache_creation_input_tokens'): number => {
-        const final = f[key], initial = start[key];
-        if (final !== undefined) {
-            if (!allInputs && initial !== undefined && initial !== final) throw new Error('Invalid usage');
-            return final;
-        }
-        if (initial === undefined) throw new Error('Invalid usage');
-        return initial;
-    };
-    return { inputTokens: input('input_tokens'), outputTokens: f.output_tokens, cacheReadTokens: input('cache_read_input_tokens'),
-        cacheWriteTokens: input('cache_creation_input_tokens') };
+    // Inherit native start buckets only when a partial final restatement agrees. A complete final input report wins.
+    if (!allInputs) for (const key of ['input_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'] as const) {
+        if (f[key] !== undefined && start[key] !== undefined && f[key] !== start[key]) throw new Error('Invalid usage');
+    }
+    const c = { ...start, ...f };
+    if (c.input_tokens === undefined) throw new Error('Invalid usage');
+    return { inputTokens: c.input_tokens, outputTokens: f.output_tokens, cacheReadTokens: c.cache_read_input_tokens,
+        cacheWriteTokens: c.cache_creation_input_tokens };
 }
 
 type ThinkingBlock = { kind: 'thinking'; thinking: string; signature: string };

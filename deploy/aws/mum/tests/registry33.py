@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Stage registry capacity 33 over the normal apply-app -> promote order: reader proofs and guards.
+"""Stage registry capacity 35 over the normal apply-app -> promote order; retain older-reader proofs.
 
-Offline only: temporary git repositories, this checkout's own git objects (5127d85f -> the reviewed c7a5af66
-host agent), the real Node probe with a fake fetch, and synthetic CLI results. No AWS, SSM or secret.
+Offline only: temporary git repositories, this checkout's own reviewed Git objects (attestation and
+standalone Git host deltas), the real Node probe with a fake fetch, and synthetic CLI results. No AWS, SSM or secret.
 """
 import copy
 import json
@@ -28,6 +28,7 @@ AGENT_5127 = '5127d85f71af309dc7c47537a6be276a7de1eb9d'
 AGENT_ED7 = 'ed7da29a279915af36f5c3cfdb63c5627b269049'
 # The reviewed host agent the map describes: 5127d85f plus the lower-attestation lane as reviewed at c7a5af66 (attest.py and its test).
 AGENT_REVIEWED = 'c7a5af6667b6ddba5605b4fceaa5caaccbce91cc'
+AGENT_COMBINED = '68dfb30aba6907b2c6813acc2a6a89281827c900'
 SHA = '9' * 40
 TAG = 'stage-cap33'
 IMAGE = 'sha256:' + 'a' * 64
@@ -62,8 +63,10 @@ class SourceCapacityTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.repo, (self.cap33, self.cap32, self.twice, self.absent) = source_repo(
+        self.repo, (self.cap35, self.cap34, self.cap33, self.cap32, self.twice, self.absent) = source_repo(
             Path(temporary.name),
+            'export const REBASE_RELEASE_REGISTRY_CAPACITY = 35;',
+            'export const REBASE_RELEASE_REGISTRY_CAPACITY = 34;',
             'export const REBASE_RELEASE_REGISTRY_CAPACITY = 33;',
             'export const REBASE_RELEASE_REGISTRY_CAPACITY = 32;',
             'export const REBASE_RELEASE_REGISTRY_CAPACITY = 33;\nexport const REBASE_RELEASE_REGISTRY_CAPACITY = 34;',
@@ -92,12 +95,32 @@ class SourceCapacityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
             release.require_reader_capacity(34, self.cap33, self.repo)
 
-    def test_this_checkout_declares_thirty_three_and_ed7_thirty_two(self):
+    def test_this_checkout_declares_thirty_five_and_ed7_thirty_two(self):
         text = (REPO / release.CAPACITY_SOURCE).read_text()
-        self.assertEqual(release.CAPACITY_DECLARATION.findall(text), ['33'])
+        self.assertEqual(release.CAPACITY_DECLARATION.findall(text), ['35'])
         self.assertEqual(release.source_reader_capacity(AGENT_ED7, REPO)[0], 32)
         with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
             release.require_reader_capacity(33, AGENT_ED7, REPO)
+
+    def test_thirty_four_requires_a_matched_source_and_running_reader_and_refuses_thirty_five(self):
+        self.assertEqual(release.require_reader_capacity(34, self.cap34, self.repo)['capacity'], 34)
+        release.require_runtime_capacity({'readerCapacity': 34}, 34)
+        with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
+            release.require_reader_capacity(34, self.cap33, self.repo)
+        with self.assertRaisesRegex(ValueError, 'running app reader capacity is below'):
+            release.require_runtime_capacity({'readerCapacity': 33}, 34)
+        with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
+            release.require_reader_capacity(35, self.cap34, self.repo)
+
+    def test_thirty_five_requires_a_matched_source_and_running_reader_and_refuses_thirty_six(self):
+        self.assertEqual(release.require_reader_capacity(35, self.cap35, self.repo)['capacity'], 35)
+        release.require_runtime_capacity({'readerCapacity': 35}, 35)
+        with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
+            release.require_reader_capacity(35, self.cap34, self.repo)
+        with self.assertRaisesRegex(ValueError, 'running app reader capacity is below'):
+            release.require_runtime_capacity({'readerCapacity': 34}, 35)
+        with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
+            release.require_reader_capacity(36, self.cap35, self.repo)
 
 
 class RuntimeCapacityTests(unittest.TestCase):
@@ -148,6 +171,82 @@ class HostAbiTests(unittest.TestCase):
                     patch.object(release, 'host_agent_tree', side_effect=[old, changed]), \
                     self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
                 release.require_host_abi(AGENT_5127, AGENT_REVIEWED, REPO)
+
+
+class StandaloneHostAbiTests(unittest.TestCase):
+    """Real Git fixtures copy the reviewed blobs; mutations become actual commits."""
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.repo = Path(temporary.name) / 'repo'
+        git(Path(temporary.name), 'init', '-q', str(self.repo))
+        git(self.repo, 'config', 'user.name', 'Offline Fixture')
+        git(self.repo, 'config', 'user.email', 'fixture@example.invalid')
+        self.commits = []
+        for side in (0, 1):
+            if side == 1:
+                for name, pair in release.HOST_AGENT_EXCEPTION.items():
+                    self.install_blob(name, pair[1])
+                self.intermediate = self.commit('reviewed attestation')
+            for name, pair in release.HOST_AGENT_STANDALONE_EXCEPTION.items():
+                self.install_blob(name, pair[side])
+            self.commits.append(self.commit(str(side)))
+        self.old, self.new = self.commits
+
+    def install_blob(self, name, metadata):
+        path = self.repo / release.HOST_AGENT / name
+        if metadata is None:
+            path.unlink(missing_ok=True)
+            return
+        mode, blob = metadata.split(' ')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(subprocess.check_output(['git', '-C', str(REPO), 'cat-file', 'blob', blob]))
+        path.chmod(int(mode, 8) & 0o777)
+
+    def commit(self, message):
+        git(self.repo, 'add', '-A')
+        git(self.repo, 'commit', '-qm', message)
+        return git(self.repo, 'rev-parse', 'HEAD')
+
+    def test_exact_eight_file_fixture_and_checked_in_host_delta(self):
+        expected = release.HOST_AGENT_STANDALONE_EXCEPTION
+        self.assertEqual(len(expected), 8)
+        self.assertEqual(release.require_host_abi(self.old, self.new, self.repo), expected)
+        self.assertEqual(release.require_host_abi(self.old, self.intermediate, self.repo), release.HOST_AGENT_EXCEPTION)
+        self.assertEqual(release.require_host_abi(AGENT_5127, AGENT_COMBINED, REPO), expected)
+        self.assertEqual(release.require_host_abi(AGENT_5127, git(REPO, 'rev-parse', 'HEAD'), REPO), expected)
+        self.assertEqual(release.require_host_abi(AGENT_COMBINED, AGENT_COMBINED, REPO), {})
+
+    def test_every_missing_mutated_or_mode_changed_reviewed_file_refused(self):
+        for name in release.HOST_AGENT_STANDALONE_EXCEPTION:
+            for mutation in ('missing', 'content', 'mode'):
+                with self.subTest(path=name, mutation=mutation):
+                    git(self.repo, 'reset', '--hard', self.new)
+                    path = self.repo / release.HOST_AGENT / name
+                    if mutation == 'missing':
+                        path.unlink()
+                    elif mutation == 'content':
+                        path.write_bytes(path.read_bytes() + b'\n# unreviewed change\n')
+                    else:
+                        path.chmod(0o755)
+                    changed = self.commit(mutation)
+                    with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+                        release.require_host_abi(self.old, changed, self.repo)
+
+    def test_extra_file_wrong_preimage_and_reverse_refused(self):
+        extra = self.repo / release.HOST_AGENT / 'lib/ezil_host/unreviewed.py'
+        extra.write_text('unreviewed = True\n')
+        changed = self.commit('extra file')
+        with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+            release.require_host_abi(self.old, changed, self.repo)
+        git(self.repo, 'reset', '--hard', self.old)
+        path = self.repo / release.HOST_AGENT / 'lib/ezil_host/standalone_git.py'
+        path.write_bytes(path.read_bytes() + b'\n# different predecessor\n')
+        predecessor = self.commit('wrong preimage')
+        for old, new, repo in ((predecessor, self.new, self.repo), (self.new, self.old, self.repo),
+                              (self.intermediate, self.new, self.repo), (AGENT_COMBINED, AGENT_5127, REPO)):
+            with self.subTest(old=old, new=new), self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+                release.require_host_abi(old, new, repo)
 
 
 class PromotionGuardTests(unittest.TestCase):
@@ -319,7 +418,7 @@ class RealHttpProbeTests(unittest.TestCase):
 
 class LegacyGcParityTests(unittest.TestCase):
     def test_frozen_gc_stays_a_thirty_two_record_tool(self):
-        self.assertEqual((TOOL.RELEASE_REGISTRY_CAPACITY, TOOL.ACTIVE_REGISTRY_CAPACITY), (32, 33))
+        self.assertEqual((TOOL.RELEASE_REGISTRY_CAPACITY, TOOL.ACTIVE_REGISTRY_CAPACITY), (32, 35))
         self.assertEqual(gc.tool.RELEASE_REGISTRY_CAPACITY, 32)
         target = release_record()
         records = [dict(target, amiId='ami-' + format(n, '017x'), recipeVersion='1.0.' + str(n)) for n in range(100, 133)]

@@ -1,5 +1,5 @@
 // Automatic context compaction for EZiL Gateway requests. Copilot keeps the whole conversation in its saved chat session
-// and resends all of it on every turn. When that no longer fits the model's input limit, this shapes a COPY of the request
+// and resends all of it on every turn. When that no longer fits the request size limit, this shapes a COPY of the request
 // that does, and the same chat continues. The saved conversation is never changed, so a model with a larger limit still
 // gets everything. Local and deterministic: no model call, nothing sent, and the same conversation always compacts the
 // same way. Every shortening is marked in the text the model reads.
@@ -42,7 +42,7 @@ const PLANS: readonly Plan[] = [
     { lastResult: 512, fold: 'all', note: 'minimal' },
 ];
 
-const LIMIT_NOTE = "to fit the model's input limit";
+const LIMIT_NOTE = "to fit the request size limit";
 
 /** Head and tail of `text` within `cap` characters, with a marker saying how much was left out. */
 export function shorten(text: string, cap: number): string {

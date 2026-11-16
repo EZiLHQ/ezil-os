@@ -43,6 +43,7 @@
  * retention has finished. Feedback shares one 20-second budget across all
  * three stores, within the existing route's 300-second execution allowance.
  */
+import { retainTraces } from '../ai-traces/store';
 import { feedbackTablesPresent, runFeedbackRetention, type FeedbackRetentionResult } from '../feedback/retention';
 import { runTelemetryMaintenance, type MaintenanceResult, type RetentionDb } from './retention';
 import { runTelemetrySpoolDrain, type SpoolDrainEngineDeps, type SpoolDrainResult } from './spool-drain';
@@ -60,7 +61,7 @@ export interface MaintenanceHandlerDeps {
 }
 
 /** Which jobs threw. Absent when nothing did. */
-export type MaintenanceFailure = 'maintenance' | 'feedback' | 'drain';
+export type MaintenanceFailure = 'maintenance' | 'feedback' | 'drain' | 'aiTraces';
 
 export interface MaintenanceResponseBody {
     /** `true` only when every job that was asked to run finished without throwing. */
@@ -68,6 +69,7 @@ export interface MaintenanceResponseBody {
     result?: MaintenanceResult;
     feedback?: FeedbackRetentionResult;
     drain?: SpoolDrainResult;
+    aiTraces?: Awaited<ReturnType<typeof retainTraces>>;
     failed?: MaintenanceFailure[];
 }
 
@@ -95,6 +97,9 @@ export async function handleTelemetryMaintenance(req: Request, deps: Maintenance
         console.error('[feedback] retention run failed', { m: String((err as Error)?.message ?? err) });
         failed.push('feedback');
     }
+
+    try { body.aiTraces = await retainTraces(deps.db); }
+    catch { failed.push('aiTraces'); }
 
     if (deps.drain) {
         try {

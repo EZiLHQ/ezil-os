@@ -1,4 +1,6 @@
+import { ai_trace_collector } from '../ui/ai-traces.js';
 import { attachCodeAuthRecovery, resetOriginRecovery } from './code-auth-recovery.js';
+import { createGitAccessRenewal } from './code-git-access.js';
 import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../native-runtime.js';
 // code.js — EZiL-authored. Not Puter code.
 //
@@ -651,6 +653,7 @@ export async function openCodeWindow (ctx = {}) {
     const appContext = Object.freeze({ computerId: computer.id, appSession: crypto.randomUUID() });
     el_window.ezilFeedbackAppContext = appContext;
     let unregister_app_failures = () => {};
+    let trace_registration = { dispose() {}, bindNonce() {} };
     let unregister_billing = () => {};
     let unregister_auth_recovery = () => {};
     if ( getComputedStyle(el_body).position === 'static' ) el_body.style.position = 'relative';
@@ -660,6 +663,8 @@ export async function openCodeWindow (ctx = {}) {
     let attempt = 0;
     let running_signal;
     let disposed = false;
+    let git_access = null;
+    let git_access_notice = null;
     /** The current attempt's mint loop: aborted by the next attempt and by close (hotfix r5). */
     let mint_ctl = null;
     /** RETRY-118: the failure on screen, for an explicit user Retry only (`session.userRetry`). */
@@ -949,6 +954,8 @@ export async function openCodeWindow (ctx = {}) {
         last_failure = null;
         last_progress = null; generic_timeout = null;
         if ( disposed ) return;
+        git_access?.reset();
+        repository_folder = null;
         const my_attempt = ++attempt;
         stop_timers();
         show_panel();
@@ -1103,6 +1110,7 @@ export async function openCodeWindow (ctx = {}) {
         tick_timer = setInterval(paint_handoff, TICK_MS);
 
         unregister_app_failures();
+        trace_registration.dispose();
         unregister_billing();
         unregister_auth_recovery();
         if (!nativeSurface) unregister_auth_recovery = attachCodeAuthRecovery({
@@ -1122,8 +1130,11 @@ export async function openCodeWindow (ctx = {}) {
         el_iframe.src = code_preview_url;
         // Bind at mint handoff, before confirmation, so startup failures can answer the hello too.
         // The folder bridge below binds the same frame after the server confirms it.
+        if (!nativeSurface) trace_registration = ai_trace_collector.register(el_iframe, { origin: new URL(code_preview_url).origin });
         if (!nativeSurface) unregister_app_failures = register_app_frame(el_iframe, {
             origin: new URL(code_preview_url).origin, ...appContext, app: 'code',
+            onDiagnosticNonce: nonce => trace_registration.bindNonce(nonce),
+            onTerminalFailure: event => telemetry.capture(event),
         });
         // Code asks this desktop for its billing dialogs (a credit refusal, a plan-locked model): Settings → Billing.
         if (!nativeSurface) unregister_billing = register_billing_frame(el_iframe, {
@@ -1312,6 +1323,7 @@ export async function openCodeWindow (ctx = {}) {
         });
         if ( present || was_present ) last_present_at = performance.now();
         was_present = present;
+        if ( present ) void git_access?.tick();
     };
     const heartbeat_tick = () => {
         if ( disposed ) return;
@@ -1327,6 +1339,27 @@ export async function openCodeWindow (ctx = {}) {
         document.addEventListener('visibilitychange', sample_presence);
         sample_presence();
     }
+    // Git's short-lived capability is renewed only while this repository's editor is active.
+    // The authenticated endpoint refuses a stopped computer or an absent checkout; it cannot wake or clone one.
+    git_access = nativeSurface ? null : createGitAccessRenewal({
+        target: () => repository_folder && project?.repoUrl?.startsWith('https://github.ezil.work/')
+            ? { computerId: computer.id, repoUrl: project.repoUrl } : null,
+        eligible: () => ! disposed && el_state.hidden && progress.el.hidden && shouldHeartbeat({
+            visible: document.visibilityState === 'visible',
+            lastPresenceAgoMs: last_present_at === null ? NaN : performance.now() - last_present_at,
+        }),
+        notice: text => {
+            git_access_notice?.remove(); git_access_notice = null;
+            if ( ! text || disposed ) return;
+            const notice = document.createElement('div');
+            notice.className = 'ezil-code-git-access-notice';
+            notice.setAttribute('role', 'status');
+            notice.setAttribute('aria-live', 'polite');
+            notice.textContent = text;
+            el_body.appendChild(notice);
+            git_access_notice = notice;
+        },
+    });
     // Back after an absence long enough for an idle-stop: re-check before the
     // stale frame is used (`../runtime-recheck.js`).
     //
@@ -1548,6 +1581,8 @@ export async function openCodeWindow (ctx = {}) {
         progress.dispose();
         if (disposed) return;
         disposed = true;
+        git_access?.dispose();
+        git_access_notice?.remove(); git_access_notice = null;
         hide_state();
         restore_observer.disconnect();
         // A closed window stops asking: no ask after close can reach ensure() (hotfix r5).
@@ -1563,6 +1598,7 @@ export async function openCodeWindow (ctx = {}) {
         detachFolderBridge(el_iframe);
         unregister_auth_recovery();
         unregister_app_failures();
+        trace_registration.dispose();
         unregister_billing();
         folder_notice?.close();
         stop_runtime_recheck?.();

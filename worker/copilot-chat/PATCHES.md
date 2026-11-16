@@ -539,3 +539,70 @@ identity and provider contribution, and requires `defaultChatAgent`, the MIT
 license and original Microsoft headers. Compare LICENSE.txt with the original
 extraction when reviewing an update. The JSON and CSS modifications are
 recorded here; the three JS files carry inline modification notices.
+
+
+## Staging context, cache and compaction (15 November 2026)
+
+Pinned inputs remain code-server **4.141.0**, Copilot Chat **0.69.0**. Exact
+`A_*` and `R_*` literals in `patch-copilot-chat.sh` are the authoritative anchors.
+Each anchor below must occur once in the pristine bundle; every replacement
+must occur once after apply. The fallback embeds its original return prefix, and the cache-unknown replacement
+keeps the original expression for non-EZiL models, so those old anchors remain
+once; all other old anchors are gone.
+JavaScript parse, static-content ID, original Microsoft copyright and LICENSE
+checks remain required. No new dependency or service call.
+
+| Patch | Exact anchor identifier / location | Behavior |
+| --- | --- | --- |
+| `context-threshold` | `A_CONTEXT_THRESHOLD`, extension `if(a5n(he,re,this._thresholdRng)&&Ie)` | EZiL compares occupancy against the already reserved input budget. Other vendors retain upstream jitter. An active summary is not restarted. |
+| `context-render-budget` | `A_CONTEXT_RENDER_BUDGET`, extension `x=Math.max(1,Math.floor((h-p)*.9))` | EZiL subtracts actual tool tokens without an additional 10% reduction; model output/system/tool/summary reserves already live in the advertised budget. |
+| `context-output` | `A_CONTEXT_OUTPUT`, extension `ge.usage` outputBuffer assignment | Use the request-local EZiL output reserve (`ezil_usage.output_limit`) instead of always 8192. The pinned LanguageModelChat API does not expose maxOutputTokens; model information still does. |
+| `context-tool-count` | `A_CONTEXT_TOOL_COUNT`, extension `dft.countToolTokens` prefix | Count the complete serialized tool schema once for EZiL, including numbers and booleans; other vendors retain the upstream counter. |
+| `context-cache-unknown` | `A_CONTEXT_CACHE_UNKNOWN`, extension `rs.Usage` consumer | Preserve missing cache counters for EZiL instead of synthesizing `cached_tokens:0`. |
+| `context-fallback` | `A_CONTEXT_FALLBACK`, extension `Ok.makeChatRequest2` success return prefix | Prefer measured request-local usage. Missing usage gets a local input/tool/output estimate labelled `estimated`; cancellation cannot become a successful zero-usage reply. No network or resend. |
+| `context-usage-detail` | `A_CONTEXT_USAGE_DETAIL`, extension `ge.usage` prompt detail assignment | Carry a text-only `EZiL usage` row through the existing request-owned usage channel. It shows measured/estimated input, output, optional cache buckets and optional reasoning (included in output). No prompt, response, identity or credential content. |
+| `context-hover` | `A_CONTEXT_HOVER`, workbench `renderTokenDetails` prefix | Render that row using textContent outside percentage breakdowns; cache tokens are not another slice of context. |
+| `context-estimated-label` | `A_CONTEXT_ESTIMATED_LABEL`, workbench percentage-label assignment | Display `~` for usage estimates and `<1%` for small nonzero counts. EZiL percentages explicitly say `budget`; measured usage does not establish full model capacity. The hover labels local context budget utilization and unknown full capacity. |
+| `context-model-owner` | `A_CONTEXT_MODEL_OWNER`, workbench context-window resolution | A completed response retains the answering model's denominator when a different model is selected. |
+| `summary-owner` | `A_SUMMARY_OWNER`, extension `L7e.start` method | A summary promise can complete only for its original live cancellation token; late completion or failure after cancel/restart cannot replace another run. Existing session/model-keyed summarizers are retained. |
+
+The extension emits `usage` metadata only after validated final provider usage.
+Messages input excludes cache; Responses input includes cache. Optional cache
+counters are not invented; missing Messages cache coverage is labelled estimated.
+The context budget is distinct from the 128 KiB legacy transport bound, which
+can still require free local request compaction. Saved chats, paired tools,
+system/current user content, cancellation and idempotency behavior remain covered
+by the extension tests. No summary is dispatched just to update the widget.
+
+Offline tests: `node worker/copilot-chat/context-patch.test.cjs`. Set
+`COPILOT_TEST_ROOT` to a pristine local distribution and
+`COPILOT_PATCHED_TEST_ROOT` to a verified patched copy to also check every real
+anchor. The suite executes exact patch expressions, including threshold-minus-one,
+threshold equality, output reserves, no low-occupancy background summaries,
+cache/estimate display and cancelled-summary races. Run the patch's apply and
+`--verify` gates separately; the fixture suite does not download a distribution.
+
+
+## Operational inference trace command (15 November 2026)
+
+The separate `_ezil.aiRequestTrace` command is registered immediately before
+`qe.registerCommand("noop",()=>{});` (exactly once in pinned 4.141.0). Apply
+first preserves the existing app-failure replacement byte for byte, then inserts
+the trace function before noop. The trace validator is the exact self-contained
+`extensions/ezil-models/src/trace-validator.js` function, flattened into the
+`R_AI_REQUEST_TRACE` literal; source parity is tested. No extra runtime build file
+or Docker copy is needed. The closed current Carbon v1 schema includes bounded
+pseudonymous conversation/call observations, totalWireBytes and nullable usage.
+It rejects extra/private fields and accessors without reading getters, validates
+types/enums/UUIDs/bounds, normalizes optional non-UUID transport IDs to null and
+checks 4096 UTF-8 serialized bytes. It dispatches only
+`new CustomEvent("ezil-ai-request-trace", {detail: JSON.stringify(clean)})`.
+All exceptions are isolated; appFailure remains consent-only and byte-identical.
+
+Post-apply gates require one exact replacement and one command registration.
+Reapply performs verification only; missing/altered trace code fails closed.
+As before, do not upgrade partially patched images in place: prepare a compatible
+pristine pinned bundle and run all apply/verify/static-ID gates. Context tests
+with both COPILOT_TEST_ROOT and COPILOT_PATCHED_TEST_ROOT exercise real anchors
+and execute the actual inserted command. Root owns the downstream collector
+integration and live browser acceptance.

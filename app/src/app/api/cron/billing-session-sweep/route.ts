@@ -1,3 +1,5 @@
+import { drainIncidentAlerts } from '@/server/telemetry/incident-alerts';
+import { incidentAlertMailer } from '@/server/telemetry/incident-alert-mail';
 import { and, asc, gt, isNull } from 'drizzle-orm';
 import { env } from '@/env';
 import { routeComputer } from '@/server/api/routers/compute-dispatch';
@@ -84,6 +86,11 @@ function aiPlanRefresh(now: Date) {
 export async function GET(req: Request): Promise<Response> {
     if (!env.CRON_SECRET) return new Response(null, { status: 404 });
     if (req.headers.get('authorization') !== `Bearer ${env.CRON_SECRET}`) return new Response(null, { status: 404 });
+    // Independent of billing configuration; bounded mail timeout and isolated failure.
+    try {
+        const alerts = await drainIncidentAlerts(db, incidentAlertMailer(process.env.FEEDBACK_SMTP2GO_API_KEY));
+        if (alerts.enqueued || alerts.accepted || alerts.retry || alerts.dropped) console.info('[telemetry] incident alert sweep', alerts);
+    } catch { console.warn('[telemetry] incident alert sweep unavailable'); }
     let deps: ReturnType<typeof getBillingDeps>, now: Date;
     try {
         deps = getBillingDeps();

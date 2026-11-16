@@ -44,6 +44,30 @@ describe('standalone OS to Worker transport', () => {
         expect(fetcher).not.toHaveBeenCalled();
         expect(JSON.stringify(warn.mock.calls)).not.toContain(TOKEN);
     });
+    it('sends verified commit attribution beside the unchanged gateway packet', async () => {
+        const gitAuthor = { name: 'contact', email: 'contact@ezil.work' };
+        const fetcher = vi.fn(async (_url: URL, init: RequestInit) => {
+            expect(JSON.parse(String(init.body))).toEqual({ repositoryId: CHECKOUT, privatePacket: packet, gitAuthor, timeoutMs: 60_000 });
+            return Response.json({ ok: true, folder: `/workspace/projects/${CHECKOUT}` });
+        });
+        expect((await requestRepoOpen('https://worker.example', 'secret', cloudflare, computer, { ...request, gitAuthor },
+            { fetch: fetcher as unknown as typeof fetch })).ok).toBe(true);
+    });
+    it('refuses unsafe attribution before sending a signed request', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const fetcher = vi.fn();
+        expect((await requestRepoOpen('https://worker.example', 'secret', cloudflare, computer,
+            { ...request, gitAuthor: { name: 'Injected\nName', email: 'contact@ezil.work' } }, { fetch: fetcher })).ok).toBe(false);
+        expect(fetcher).not.toHaveBeenCalled();
+    });
+    it('signs a refresh-only credential renewal without changing the gateway packet', async () => {
+        const fetcher = vi.fn(async (_url: URL, init: RequestInit) => {
+            expect(JSON.parse(String(init.body))).toEqual({ repositoryId: CHECKOUT, privatePacket: packet, refreshOnly: true, timeoutMs: 60_000 });
+            return Response.json({ ok: true, folder: `/workspace/projects/${CHECKOUT}` });
+        });
+        expect((await requestRepoOpen('https://worker.example', 'secret', cloudflare, computer, { ...request, refreshOnly: true },
+            { fetch: fetcher as unknown as typeof fetch })).ok).toBe(true);
+    });
 });
 
 describe('AWS standalone OS transport capability', () => {

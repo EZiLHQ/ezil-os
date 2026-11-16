@@ -4,7 +4,10 @@ import { credits, creditsWhole } from './credits-format';
 
 type Result<T> = { value: T; code?: never; reason?: never } | { value?: never; code: string; reason?: string };
 export type CreditWindow = { seconds: number; budget_micro: string; used_micro: string; remaining_micro: string; started_at: string | null; resets_at: string | null };
-export type Balance = { available_micro: number; held_micro: number; window?: CreditWindow | null };
+export type BalanceAccounting = { contract: 'ezil.gateway.balance.v1'; snapshot_at: string; ledger_cursor: string;
+    available_micro: string; held_micro: string; reserved_micro: string; pending_micro: string; settled_debit_micro: string;
+    settled_scope: 'lifetime_ledger'; credit_unit: null | { currency: 'mixed' } | { currency: 'USD' | 'INR'; per_credit: string } };
+export type Balance = { available_micro: number | string; held_micro: number | string; window?: CreditWindow | null; accounting?: BalanceAccounting };
 export type UsageRow = { model: string; created_at: string; status: string; cost_micro: number | null; uncollected_micro: number | null };
 /** A catalog row that states its availability (`ezil.gateway.models.v1`); `selectable` = a protocol this client speaks. */
 export type ModelAvailability = { label: string; availability: GatewayAvailability; selectable: boolean };
@@ -99,14 +102,54 @@ const windowLength = (seconds: number): string => seconds % 3600 === 0 ? `${seco
 const decimalMicro = (value: unknown): value is string => typeof value === 'string' && /^\d+$/.test(value);
 const timestamp = (value: unknown): value is string | null => value === null || (typeof value === 'string' && Number.isFinite(Date.parse(value)));
 
-function parseBalance(value: unknown): Balance | undefined {
-    if (!record(value) || !micro(value.available_micro) || !micro(value.held_micro)) return undefined;
+/** UTC timestamps retain microseconds; Date alone would lose ordering inside one millisecond. */
+export function snapshotMicros(value: unknown): bigint | undefined {
+    if (typeof value !== 'string') return undefined;
+    const match = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(?:Z|\+00:00)$/.exec(value);
+    if (!match) return undefined;
+    const ms = Date.parse(`${match[1]}Z`);
+    if (!Number.isFinite(ms) || new Date(ms).toISOString().slice(0, 19) !== match[1]) return undefined;
+    return BigInt(ms) * 1000n + BigInt((match[2] ?? '').padEnd(6, '0'));
+}
+const exactMicro = (value: unknown): value is string => typeof value === 'string' && /^(0|[1-9][0-9]{0,39})$/.test(value);
+function parseAccounting(value: unknown): BalanceAccounting | undefined {
+    if (!record(value) || value.contract !== 'ezil.gateway.balance.v1' || value.settled_scope !== 'lifetime_ledger'
+        || snapshotMicros(value.snapshot_at) === undefined) return undefined;
+    for (const key of ['ledger_cursor', 'available_micro', 'held_micro', 'reserved_micro', 'pending_micro', 'settled_debit_micro'])
+        if (!exactMicro(value[key])) return undefined;
+    if (BigInt(value.held_micro as string) !== BigInt(value.reserved_micro as string) + BigInt(value.pending_micro as string)) return undefined;
+    const raw = value.credit_unit;
+    let unit: BalanceAccounting['credit_unit'];
+    if (raw === null) unit = null;
+    else if (record(raw) && raw.currency === 'mixed') unit = { currency: 'mixed' };
+    else if (record(raw) && (raw.currency === 'USD' || raw.currency === 'INR') && typeof raw.per_credit === 'string'
+        && /^(0|[1-9][0-9]{0,9})(?:\.[0-9]{1,6})?$/.test(raw.per_credit)) unit = { currency: raw.currency, per_credit: raw.per_credit };
+    else return undefined;
+    return { contract: 'ezil.gateway.balance.v1', snapshot_at: value.snapshot_at as string, ledger_cursor: value.ledger_cursor as string,
+        available_micro: value.available_micro as string, held_micro: value.held_micro as string, reserved_micro: value.reserved_micro as string,
+        pending_micro: value.pending_micro as string, settled_debit_micro: value.settled_debit_micro as string,
+        settled_scope: 'lifetime_ledger', credit_unit: unit };
+}
+/** Apply only within one provider/account identity and after the existing refresh ownership guard. */
+export function newestBalance(previous: Balance | undefined, incoming: Balance): Balance {
+    const old = previous?.accounting, next = incoming.accounting;
+    if (!old || !next) return incoming;
+    const cursor = BigInt(next.ledger_cursor), before = BigInt(old.ledger_cursor);
+    return cursor < before || (cursor === before && snapshotMicros(next.snapshot_at)! <= snapshotMicros(old.snapshot_at)!) ? previous! : incoming;
+}
+export function parseBalance(value: unknown): Balance | undefined {
+    if (!record(value)) return undefined;
+    const accounting = parseAccounting(value.accounting);
+    // Valid exact accounting supersedes lossy legacy JSON numbers, including amounts above 2^53.
+    if (!accounting && (!micro(value.available_micro) || !micro(value.held_micro))) return undefined;
     const window = value.window;
     if (window !== undefined && window !== null && (!record(window)
         || !Number.isInteger(window.seconds) || (window.seconds as number) < 600 || (window.seconds as number) > 86400
         || !decimalMicro(window.budget_micro) || !decimalMicro(window.used_micro) || !decimalMicro(window.remaining_micro)
         || !timestamp(window.started_at) || !timestamp(window.resets_at))) return undefined;
-    return { available_micro: value.available_micro, held_micro: value.held_micro, window: window as CreditWindow | null | undefined };
+    return { available_micro: accounting?.available_micro ?? value.available_micro as number,
+        held_micro: accounting?.held_micro ?? value.held_micro as number, window: window as CreditWindow | null | undefined,
+        ...(accounting ? { accounting } : {}) };
 }
 
 async function get<T>(provider: ResolvedProvider, path: string, parse: (value: unknown) => T | undefined, doFetch: typeof fetch, signal?: AbortSignal): Promise<Result<T>> {
@@ -264,14 +307,23 @@ export function statusView(state?: AIStatus): { text: string; lines: string[] } 
         if (window && BigInt(window.remaining_micro) === 0n) { /* the window segment already says "used" */ }
         else if (typeof limits?.policy.policy.daily_budget_micro === 'number' && limits.counters.day_micro >= limits.policy.policy.daily_budget_micro) text = 'EZiL AI · Daily credit budget used';
         else if (typeof limits?.policy.policy.monthly_budget_micro === 'number' && limits.counters.month_micro >= limits.policy.policy.monthly_budget_micro) text = 'EZiL AI · Monthly credit budget used';
-        else if (balance?.available_micro === 0 && balance.held_micro > 0) text = `EZiL AI · Credits held${windowPart}`;
+        else if (balance !== undefined && BigInt(balance.available_micro) === 0n && BigInt(balance.held_micro) > 0n) text = `EZiL AI · Credits held${windowPart}`;
         if (!limits) text += ' · limits unavailable';
         if (!state.models.value) text += ' · availability unknown';
         if (!state.usage.value) text += ' · usage unavailable';
     }
-    const lines = ['EZiL AI', balance ? `Available credits: ${creditsWhole(balance.available_micro)}` : `Credits unavailable. ${statusProblem(state.balance).detail}`];
-    if (balance) lines.push(`Held credits: ${creditsWhole(balance.held_micro)}`);
-    if (balance?.available_micro === 0) lines.push(balance.held_micro > 0 ? 'Your credits are held by requests in progress or being settled.' : 'No AI credits are available.');
+    const lines = ['EZiL AI', balance ? `Available credits: ${credits(balance.available_micro)}` : `Credits unavailable. ${statusProblem(state.balance).detail}`];
+    if (balance) lines.push('Available credits exclude pending holds; unspent reservations return after settlement.', `Pending holds: ${credits(balance.held_micro)} credits (reserved, not final charges)`);
+    if (balance !== undefined && BigInt(balance.available_micro) === 0n) lines.push(BigInt(balance.held_micro) > 0n ? 'Your credits are held by requests in progress or being settled.' : 'No AI credits are available.');
+    if (balance?.accounting) {
+        const a = balance.accounting;
+        lines.push(`Reserved: ${credits(a.reserved_micro)} credits`, `Pending settlement: ${credits(a.pending_micro)} credits`,
+            `Final ledger debits (lifetime): ${credits(a.settled_debit_micro)} credits`,
+            'Lifetime ledger totals retain historical credit units; they are not cumulative USD provider spend.',
+            'Changes in available credits alone do not establish a refund.');
+        if (a.credit_unit && a.credit_unit.currency !== 'mixed') lines.push(`Current credit unit: ${a.credit_unit.currency} ${a.credit_unit.per_credit} per credit`);
+        else lines.push('Current credit unit: unknown or mixed.');
+    }
     if (window) {
         lines.push(`${windowLength(window.seconds)} window: ${creditsWhole(window.remaining_micro)} credits left of ${creditsWhole(window.budget_micro)}`);
         lines.push('The window limits how many credits you can use per period. It is not your balance.');
