@@ -38,22 +38,43 @@ function load(code) {
         CustomEvent: class { constructor(type, o) { this.type = type; this.detail = o.detail; this.cancelable = o.cancelable === true; this.defaultPrevented = false; } },
         setTimeout: (fn, ms) => { const id = nextTimer++; timers.set(id, { fn, ms }); return id; },
         clearTimeout: id => timers.delete(id),
-        URL, JSON, Promise, Reflect, Object, Array, Set, Map, Number,
+        URL, JSON, Promise, Reflect, Object, Array, Set, Map, WeakSet, Number, String,
     };
     runInNewContext(`${code.slice(start, end)};this.ezilBindChatPane=ezilBindChatPane;`, sandbox);
     return { handlers, listeners, dispatched, timers, sandbox, take: v => { takes = v; } };
 }
 
-function pane(visible = true) {
-    const attachments = new Map(), log = [], disposables = [];
+/** A ChatViewPane-shaped fake whose widget follows the pinned 1.141 attachment model (addContext skips known ids,
+ * updateContext replaces in place) and switches sessions like setViewModel + input-state restore. */
+function pane(visible = true, session = 'vscode-chat-session://local/A') {
+    const attachments = new Map(), log = [], disposables = [], onModel = [], onChange = [];
+    const resource = s => ({ toString: () => s });
     const model = {
         get attachments() { return [...attachments.values()]; },
-        addContext: (...entries) => { for (const e of entries) if (!attachments.has(e.id)) { attachments.set(e.id, e); log.push(['add', e.id]); } },
+        addContext: (...entries) => {
+            const added = entries.filter(e => !attachments.has(e.id));
+            for (const e of added) { attachments.set(e.id, e); log.push(['add', e.id]); }
+            if (added.length) onChange.forEach(f => f({ added, deleted: [], updated: [] }));
+        },
         delete: (...ids) => { for (const id of ids) { attachments.delete(id); log.push(['delete', id]); } },
+        updateContext: (deleted, entries) => {
+            for (const id of deleted) attachments.delete(id);
+            for (const e of entries) { log.push([attachments.has(e.id) ? 'update' : 'add', e.id]); attachments.set(e.id, e); }
+        },
+        onDidChange: f => { onChange.push(f); return { dispose() {} }; },
     };
-    const widget = { attachmentModel: model, input: { value: 'unsent draft' }, refreshed: 0, refreshParsedInput() { this.refreshed++; },
+    const widget = { attachmentModel: model, viewModel: { sessionResource: resource(session) }, input: { value: 'unsent draft' },
+        refreshed: 0, refreshParsedInput() { this.refreshed++; },
+        onDidChangeViewModel: f => { onModel.push(f); return { dispose() {} }; },
         focusInput() { throw new Error('focus must not move'); }, acceptInput() { throw new Error('must not send'); } };
-    return { _widget: widget, isBodyVisible: () => visible, _register: d => disposables.push(d), attachments, log, disposables, widget };
+    // Restore order differs between a cached and a loaded session: cover both.
+    const switchTo = (s, restored = [], restoreFirst = false) => {
+        attachments.clear();
+        const restore = () => restored.length && model.addContext(...restored.map(e => ({ ...e })));
+        if (restoreFirst) { widget.viewModel = { sessionResource: resource(s) }; restore(); onModel.forEach(f => f({})); }
+        else { widget.viewModel = { sessionResource: resource(s) }; onModel.forEach(f => f({})); restore(); }
+    };
+    return { _widget: widget, isBodyVisible: () => visible, _register: d => disposables.push(d), attachments, log, disposables, widget, switchTo };
 }
 
 test('preview hooks: pinned anchors, apply, verify, idempotence and the actual patched functions',
@@ -105,10 +126,34 @@ test('preview hooks: pinned anchors, apply, verify, idempotence and the actual p
             assert.equal(p.widget.input.value, 'unsent draft'); assert.equal(p.widget.refreshed, 1);
             assert.equal(add(fresh), true); assert.equal(p.log.length, 1, 'same id twice adds once');
             assert.equal(add(stale), true);
-            assert.deepEqual(p.log, [['add', fresh.id], ['delete', fresh.id], ['add', fresh.id]]);
+            assert.deepEqual(p.log, [['add', fresh.id], ['update', fresh.id]], 'replaced in place, not re-added');
             assert.equal(p.attachments.get(fresh.id).name, `${fresh.name} (stale)`);
             assert.match(p.attachments.get(fresh.id).value, /^STALE: /);
             assert.equal(p.widget.input.value, 'unsent draft');
+        });
+
+        await t.test('stale marks the owner session only: A -> B -> stale -> A, both restore orders, removed chips stay gone', () => {
+            for (const restoreFirst of [false, true]) {
+                const { handlers, sandbox } = load(code);
+                const add = r => handlers.get('_ezil.chatAddContext')({}, r);
+                const p = pane(); sandbox.ezilBindChatPane(p);
+                const one = { ...vectors.attachment.accept[0], id: 'ezil-preview:AAAAAAAAAAAAAAAAAAAAAA' };
+                const two = { ...one, id: 'ezil-preview:BBBBBBBBBBBBBBBBBBBBBB' };
+                assert.equal(add(one), true); assert.equal(add(two), true);
+                const kept = p.attachments.get(one.id);
+                p.switchTo('vscode-chat-session://local/B');
+                assert.equal(add({ ...one, stale: true }), true, 'queued for A while B is shown');
+                assert.equal(add({ ...two, stale: true }), true);
+                assert.equal(p.attachments.size, 0, 'B never receives A attachments');
+                // Back on A; the person had removed `two` before switching away, so only `one` is restored.
+                p.switchTo('vscode-chat-session://local/A', [kept], restoreFirst);
+                assert.equal(p.attachments.get(one.id).name, `${one.name} (stale)`, `restoreFirst=${restoreFirst}`);
+                assert.equal(p.attachments.has(two.id), false, 'no resurrection');
+                assert.equal(p.widget.input.value, 'unsent draft');
+                // A later visit applies nothing twice.
+                const before = p.log.length; p.switchTo('vscode-chat-session://local/A', [p.attachments.get(one.id)], restoreFirst);
+                assert.equal(p.log.filter(([op]) => op === 'update').length, 1); assert.ok(p.log.length > before);
+            }
         });
 
         await t.test('the visible pane wins; a disposed pane is never a target', () => {

@@ -550,8 +550,14 @@ It inserts three renderer commands with fixed effects. No command id comes from 
   - `addContext` adds one `kind:"generic"` string attachment whose `modelDescription` says it is a DOM snapshot,
     not a source location.
   - The same id twice adds once, because upstream `addContext` skips existing ids.
-  - `stale:true` deletes and re-adds that id, with ` (stale)` on the name and a STALE notice on the value. It does so
-    only while the attachment is still there.
+  - Each added id records the chat session that owns it (`viewModel.sessionResource`), bounded to 64 ids.
+  - `stale:true` replaces that id in place with upstream `updateContext([], [entry])`: ` (stale)` goes on the name
+    and a STALE notice on the value. It does so only while the attachment is still there.
+  - If another session is showing, the stale update is queued for the owner session (at most 16 sessions × 32 ids)
+    and the call returns `true`.
+  - The hook subscribes once per widget to `onDidChangeViewModel` and to attachment `added` events. Queued updates
+    then apply when the owner session is back, whichever order VS Code restores its attachments in.
+  - A chip the person removed or sent is never brought back.
   - It never touches the input text, never sends, and never moves focus. It returns `true` or `false`.
 - `_ezil.previewMint({v:1, id})`
   - Allows at most 4 pending requests and refuses duplicate ids.
