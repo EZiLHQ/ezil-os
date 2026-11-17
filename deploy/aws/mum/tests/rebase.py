@@ -1363,6 +1363,48 @@ class HistoryContextTransitionTests(ObserverTransitionTests):
         with self.assertRaisesRegex(ValueError, 'must remain'):
             self.cfn.preserve_history_contexts(self.before, after)
 
+    def statements(self, template, name):
+        return template['Resources'][name]['Properties']['PolicyDocument']['Statement']
+
+    def rollover(self, name):
+        """Consecutive rollover: the R153-shaped before (current :46 beside the aged :45 transition row and a stable
+        unqualified scope) and an R154 candidate (:47 beside the :46 transition row; the :45 row aged out)."""
+        before = copy.deepcopy(self.after)
+        before['Resources'][self.cfn.LIFECYCLE_OBSERVER]['Properties']['Environment']['Variables']['EZIL_LIFECYCLE_SETTINGS'] = json.dumps({
+            **self.settings, 'deployment': {**self.settings['deployment'],
+                                            'stateMachineVersionArn': 'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:46'}})
+        stable = self.row('ezil-mum-lifecycle', [])
+        self.statements(before, name).append(stable)
+        after = copy.deepcopy(before)
+        aged = self.row('ezil-mum-lifecycle', [45])
+        self.assertIn(aged, self.statements(after, name))
+        self.statements(after, name)[:] = [s for s in self.statements(after, name) if s != aged]
+        self.statements(after, name).insert(0, self.row('ezil-mum-lifecycle', [47]))
+        self.assertEqual(self.cfn.transition_state_machine_versions(before)['lifecycle'],
+                         'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:46')
+        return before, after, stable
+
+    def test_consecutive_rollover_may_drop_the_aged_transition_row_but_not_the_current_or_unqualified_rows(self):
+        for name in (self.cfn.LIFECYCLE_OBSERVER_POLICY, 'AppCallerRoleDefaultPolicy61BE57D2'):
+            before, after, stable = self.rollover(name)
+            with self.subTest(policy=name, case='aged row dropped'):
+                self.assertNotIn(self.row('ezil-mum-lifecycle', [45]), self.statements(after, name))
+                self.cfn.preserve_history_contexts(before, after)
+            dropped = copy.deepcopy(after)
+            self.statements(dropped, name)[:] = [s for s in self.statements(dropped, name) if s != self.row('ezil-mum-lifecycle', [46])]
+            with self.subTest(policy=name, case='current row dropped'), self.assertRaisesRegex(ValueError, 'exact prior history-key context row'):
+                self.cfn.preserve_history_contexts(before, dropped)
+            dropped = copy.deepcopy(after)
+            self.statements(dropped, name)[:] = [s for s in self.statements(dropped, name) if s != stable]
+            with self.subTest(policy=name, case='unqualified scope dropped'), self.assertRaisesRegex(ValueError, 'exact prior history-key context row'):
+                self.cfn.preserve_history_contexts(before, dropped)
+
+    def test_non_literal_context_scope_is_refused(self):
+        before = copy.deepcopy(self.before)
+        self.statements(before, self.cfn.LIFECYCLE_OBSERVER_POLICY)[0]['Condition']['StringEquals'][self.cfn.HISTORY_CONTEXT] = [{'Ref': 'Machine'}]
+        with self.assertRaisesRegex(ValueError, 'literal state-machine ARNs'):
+            self.cfn.preserve_history_contexts(before, self.after)
+
 
 class AddedLambdaInvokeGuardTests(DependentVersionReviewTests):
     """validate_templates: an ADDED Lambda invoke Allow must name exactly one immutable version of the same template."""

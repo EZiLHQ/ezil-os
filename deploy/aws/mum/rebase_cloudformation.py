@@ -557,11 +557,24 @@ def _history_context_rows(resources, policy_logical):
             and action_set(s) == {'kms:decrypt'} and HISTORY_CONTEXT in (s.get('Condition') or {}).get('StringEquals', {})]
 
 
+def _qualified_context_arns(row):
+    """The version-qualified state-machine ARNs a history-context row names (unqualified machine scopes are not versions)."""
+    scope = row['Condition']['StringEquals'][HISTORY_CONTEXT]
+    values = scope if isinstance(scope, list) else [scope]
+    need(all(isinstance(v, str) for v in values), 'history-key context rows must name literal state-machine ARNs')
+    return {v for v in values if manifest.matches(r'arn:aws:states:[a-z0-9-]+:[0-9]{12}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*', v)}
+
+
 def preserve_history_contexts(before, after):
-    """Image-to-image: every exact prior history-key context row of the four policies is still present in the candidate
-    (the still-deployed versions' executions stay readable through the window); nothing wider is accepted here."""
-    if transition_state_machine_versions(before) is None or not _image_mode(after):
+    """Image-to-image: every exact BEFORE-CURRENT history-key context row of the four policies is still present in the
+    candidate (the still-deployed versions' executions stay readable through the window), and every row that names no
+    version at all (a stable unqualified machine scope) stays too. A prior row whose versions are older transition
+    grants (the previous rollover's `transitionStateMachineVersions`) may be dropped: the next rollover ages them out,
+    otherwise every rollover after the first would be refused. Nothing wider is accepted here."""
+    current = transition_state_machine_versions(before)
+    if current is None or not _image_mode(after):
         return
+    deployed = set(current.values())
     old, new = before['Resources'], after['Resources']
     for policy_logical in HISTORY_CONTEXT_POLICIES:
         if policy_logical not in old:
@@ -569,7 +582,8 @@ def preserve_history_contexts(before, after):
         need(policy_logical in new, f'{policy_logical} must remain')
         after_rows = _history_context_rows(new, policy_logical)
         for row in _history_context_rows(old, policy_logical):
-            need(row in after_rows, f'{policy_logical} loses an exact prior history-key context row')
+            if _qualified_context_arns(row) <= deployed:
+                need(row in after_rows, f'{policy_logical} loses an exact prior history-key context row')
 
 
 def transition_observer_versions(before):
