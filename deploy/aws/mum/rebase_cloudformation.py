@@ -487,6 +487,140 @@ def retained_lifecycle_source(before, admitted_source):
             'observerVersionLogicalId': prior['observerVersionLogicalId']}
 
 
+# Image-to-image observer version transition (incident 2026-11-17): the workflows change set executes BEFORE the app
+# promotes the new state-machine version, so the still-deployed previous version keeps invoking its own observer
+# version. Each execution role's default policy grants InvokeFunction only on the CURRENT observer version, so the
+# previous grant vanished with the change set. The candidate must keep each exact previous version resource and add
+# one narrow transition grant on it (infra lib/observer-transition.ts), derived here from the exact before template.
+TRANSITION_OBSERVERS = {
+    'lifecycle': (LIFECYCLE_CONTROLLER_POLICY, LIFECYCLE_OBSERVER, 'LifecycleObserverCurrentVersion'),
+    'preparation': ('LifecyclePreparationRebasePreparationRoleDefaultPolicy7D58F8B4', 'LifecyclePreparationObserver88DD5C3B',
+                    'LifecyclePreparationObserverCurrentVersion'),
+    'recovery': (LEGACY_RECOVERY_POLICY, 'RecoveryObserver1D350FD8', 'RecoveryObserverCurrentVersion'),
+}
+
+
+def _observer_version_grant(resources, policy_logical, function_logical, prefix):
+    """The single exact immutable observer version an execution role's default policy may invoke, or None."""
+    policy = resources.get(policy_logical, {})
+    if policy.get('Type') != 'AWS::IAM::Policy':
+        return None
+    invokes = [s for s in statements(policy) if s.get('Effect') == 'Allow' and action_set(s) == {'lambda:invokefunction'}]
+    need(len(invokes) == 1 and isinstance(invokes[0].get('Resource'), dict) and set(invokes[0]['Resource']) == {'Ref'},
+         f'one exact {prefix} reference required')
+    logical = invokes[0]['Resource']['Ref']
+    version = resources.get(logical, {})
+    need(manifest.matches(prefix + r'[0-9A-F]{8}[a-f0-9]{32}', logical) and version.get('Type') == 'AWS::Lambda::Version'
+         and version.get('Properties') == {'FunctionName': {'Ref': function_logical}}
+         and version.get('DeletionPolicy') == version.get('UpdateReplacePolicy') == 'Retain',
+         f'{prefix} must be the retained version of its own function')
+    return logical
+
+
+def _image_mode(template):
+    """Image mode (preparation workflow deployed) of a lifecycle template; False for a template without the lifecycle observer."""
+    function = template['Resources'].get(LIFECYCLE_OBSERVER)
+    if function is None:
+        return False
+    raw = function.get('Properties', {}).get('Environment', {}).get('Variables', {}).get('EZIL_LIFECYCLE_SETTINGS')
+    need(isinstance(raw, str), 'lifecycle observer settings required')
+    return bool(manifest.loads(raw)['deployment'].get('preparationStateMachineVersionArn'))
+
+
+HISTORY_CONTEXT = 'kms:EncryptionContext:aws:states:stateMachineArn'
+# Policies whose history-key Decrypt rows name state-machine version ARNs (the lifecycle observer, the app caller, the
+# preparation observer and the recovery observer). Their exact prior rows must survive the window.
+HISTORY_CONTEXT_POLICIES = (LIFECYCLE_OBSERVER_POLICY, 'AppCallerRoleDefaultPolicy61BE57D2',
+                            'LifecyclePreparationObserverRoleDefaultPolicyC60EE902', LEGACY_OBSERVER_POLICY)
+
+
+def _deployment_settings(template):
+    raw = template['Resources'][LIFECYCLE_OBSERVER]['Properties']['Environment']['Variables']['EZIL_LIFECYCLE_SETTINGS']
+    return manifest.loads(raw)['deployment']
+
+
+def transition_state_machine_versions(before):
+    """The three exact previous state-machine version ARNs of an image-mode before template (None for legacy mode):
+    the lifecycle config's `transitionStateMachineVersions`, never typed by an operator."""
+    if not _image_mode(before):
+        return None
+    d = _deployment_settings(before)
+    arns = {'lifecycle': d.get('stateMachineVersionArn'), 'preparation': d.get('preparationStateMachineVersionArn'),
+            'recovery': d.get('recoveryStateMachineVersionArn')}
+    need(all(manifest.matches(r'arn:aws:states:[a-z0-9-]+:[0-9]{12}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*', v or '') for v in arns.values()),
+         'three exact deployed state-machine version ARNs required')
+    return arns
+
+
+def _history_context_rows(resources, policy_logical):
+    return [s for s in statements(resources.get(policy_logical, {})) if s.get('Effect') == 'Allow'
+            and action_set(s) == {'kms:decrypt'} and HISTORY_CONTEXT in (s.get('Condition') or {}).get('StringEquals', {})]
+
+
+def _qualified_context_arns(row):
+    """The version-qualified state-machine ARNs a history-context row names (unqualified machine scopes are not versions)."""
+    scope = row['Condition']['StringEquals'][HISTORY_CONTEXT]
+    values = scope if isinstance(scope, list) else [scope]
+    need(all(isinstance(v, str) for v in values), 'history-key context rows must name literal state-machine ARNs')
+    return {v for v in values if manifest.matches(r'arn:aws:states:[a-z0-9-]+:[0-9]{12}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*', v)}
+
+
+def preserve_history_contexts(before, after):
+    """Image-to-image: every exact BEFORE-CURRENT history-key context row of the four policies is still present in the
+    candidate (the still-deployed versions' executions stay readable through the window), and every row that names no
+    version at all (a stable unqualified machine scope) stays too. A prior row whose versions are older transition
+    grants (the previous rollover's `transitionStateMachineVersions`) may be dropped: the next rollover ages them out,
+    otherwise every rollover after the first would be refused. Nothing wider is accepted here."""
+    current = transition_state_machine_versions(before)
+    if current is None or not _image_mode(after):
+        return
+    deployed = set(current.values())
+    old, new = before['Resources'], after['Resources']
+    for policy_logical in HISTORY_CONTEXT_POLICIES:
+        if policy_logical not in old:
+            continue
+        need(policy_logical in new, f'{policy_logical} must remain')
+        after_rows = _history_context_rows(new, policy_logical)
+        for row in _history_context_rows(old, policy_logical):
+            if _qualified_context_arns(row) <= deployed:
+                need(row in after_rows, f'{policy_logical} loses an exact prior history-key context row')
+
+
+def transition_observer_versions(before):
+    """The three exact previous observer version logical ids of an image-mode before template (None for legacy mode).
+    The lifecycle config's `transitionObserverVersions` is populated from this, never typed by an operator."""
+    if not _image_mode(before):
+        return None
+    resources = before['Resources']
+    return {key: _observer_version_grant(resources, policy, function, prefix)
+            for key, (policy, function, prefix) in TRANSITION_OBSERVERS.items()}
+
+
+def preserve_transition_versions(before, after):
+    """Image-to-image: for every observer whose current version changes, the candidate keeps the exact previous version
+    resource and adds exactly one transition policy on the same role granting only InvokeFunction on that version."""
+    previous = transition_observer_versions(before)
+    if previous is None or not _image_mode(after):
+        return
+    old, new = before['Resources'], after['Resources']
+    for key, (policy_logical, function_logical, prefix) in TRANSITION_OBSERVERS.items():
+        current = _observer_version_grant(new, policy_logical, function_logical, prefix)
+        role = new[policy_logical]['Properties'].get('Roles')
+        transitions = [(logical, resource) for logical, resource in new.items() if resource.get('Type') == 'AWS::IAM::Policy'
+                       and 'TransitionObserverPolicy' in logical and any(s.get('Resource') == {'Ref': previous[key]} for s in statements(resource))]
+        if current == previous[key]:
+            need(not transitions, f'{key} observer version unchanged: no transition grant may be added')
+            continue
+        need(new.get(previous[key]) == old[previous[key]], f'{key} previous observer version must be retained unchanged')
+        need(len(transitions) == 1, f'exactly one {key} observer transition grant required')
+        logical, resource = transitions[0]
+        rows = list(statements(resource))
+        need(resource['Properties'].get('Roles') == role and len(rows) == 1 and rows[0].get('Effect') == 'Allow'
+             and action_set(rows[0]) == {'lambda:invokefunction'} and rows[0].get('Resource') == {'Ref': previous[key]}
+             and 'Condition' not in rows[0] and 'NotAction' not in rows[0] and 'NotResource' not in rows[0],
+             f'{key} observer transition grant must be exactly InvokeFunction on the previous version for the same role')
+
+
 def preserve_legacy_lifecycle(before, after):
     prior = legacy_lifecycle_capabilities(before)
     if prior is None:
@@ -622,6 +756,12 @@ def validate_templates(phase, before, after, review, unchanged=False, pool_iam=N
                 own_key=own_key.get('Fn::GetAtt',[None])[0] if isinstance(own_key,dict) and list(own_key)==['Fn::GetAtt'] else None
                 kms_ok=lambda action: action in KMS_GRANT_WILDCARDS and own_key is not None and (right_resources.get(own_key) or {}).get('Type')=='AWS::KMS::Key'
                 need(not (added & (FORBIDDEN-reviewed_pool_actions)) and '*' not in added and not any('*' in action and not kms_ok(action) and not any(action in action_set(s) for s in old_allows) for action in added),'unreviewed destructive/wildcard IAM grants')
+                # Narrow guard: an added Lambda invoke grant names exactly one immutable observer version of this same
+                # template (never a function, alias, pattern or list), and nothing else in the same statement.
+                if 'lambda:invokefunction' in added:
+                    target=statement.get('Resource')
+                    target=target.get('Ref') if isinstance(target,dict) and list(target)==['Ref'] else None
+                    need(added=={'lambda:invokefunction'} and target is not None and (right_resources.get(target) or {}).get('Type')=='AWS::Lambda::Version','added Lambda invoke grant must name exactly one immutable version of this template')
     # A published Step Functions version whose own template is unchanged still changes when its
     # state machine changes: CloudFormation reports Modify StateMachineRevisionId (Dynamic,
     # ResourceAttribute). Only that exact dependent entry may be added to the template diff.
@@ -641,6 +781,8 @@ def validate_templates(phase, before, after, review, unchanged=False, pool_iam=N
     need(actual==review['changes'] and (bool(actual) or action_reorder),'review does not exactly enumerate template changes')
     if phase == 'workflows':
         preserve_legacy_lifecycle(before, after)
+        preserve_transition_versions(before, after)
+        preserve_history_contexts(before, after)
     return actual
 
 

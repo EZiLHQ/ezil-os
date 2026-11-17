@@ -1246,6 +1246,191 @@ class LegacyLifecycleCapabilityTests(unittest.TestCase):
         self.cfn.preserve_legacy_lifecycle(before, copy.deepcopy(before))
 
 
+class ObserverTransitionTests(unittest.TestCase):
+    """Incident 2026-11-17: the workflows change set revoked the deployed version's observer invoke grant before promotion."""
+    OLD = {'lifecycle': 'LifecycleObserverCurrentVersion3A1B23A0' + 'a' * 32, 'preparation': 'LifecyclePreparationObserverCurrentVersion54D5EE08' + 'b' * 32,
+           'recovery': 'RecoveryObserverCurrentVersion680AB0D7' + 'c' * 32}
+    NEW = {'lifecycle': 'LifecycleObserverCurrentVersion3A1B23A0' + 'd' * 32, 'preparation': 'LifecyclePreparationObserverCurrentVersion54D5EE08' + 'e' * 32,
+           'recovery': 'RecoveryObserverCurrentVersion680AB0D7' + 'f' * 32}
+    ROLES = {'lifecycle': 'LifecycleControllerRole1FB8E154', 'preparation': 'LifecyclePreparationRebasePreparationRole07C3BE8F', 'recovery': 'RecoveryRecoveryRole1B60FF4C'}
+
+    def setUp(self):
+        import rebase_cloudformation as cfn
+        self.cfn = cfn
+        cfn.use_namespace(TOOL.NAMESPACE)
+        self.settings = {'deployment': {'region': 'ap-south-1', 'amiId': 'ami-' + '1' * 17, 'preparationStateMachineVersionArn': 'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-rebase-preparation:37'}}
+        self.before = self.template(self.OLD)
+        self.after = self.template(self.NEW, transition=self.OLD)
+
+    def template(self, versions, transition=None):
+        resources = {cfn_observer: {'Type': 'AWS::Lambda::Function', 'Properties': {}} for cfn_observer in ('LifecyclePreparationObserver88DD5C3B', 'RecoveryObserver1D350FD8')}
+        resources['LifecycleObserver4909851D'] = {'Type': 'AWS::Lambda::Function', 'Properties': {'Environment': {'Variables': {'EZIL_LIFECYCLE_SETTINGS': json.dumps(self.settings)}}}}
+        for key, (policy, function, _prefix) in self.cfn.TRANSITION_OBSERVERS.items():
+            resources[versions[key]] = {'Type': 'AWS::Lambda::Version', 'DeletionPolicy': 'Retain', 'UpdateReplacePolicy': 'Retain', 'Properties': {'FunctionName': {'Ref': function}}}
+            resources[policy] = {'Type': 'AWS::IAM::Policy', 'Properties': {'PolicyName': policy, 'Roles': [{'Ref': self.ROLES[key]}], 'PolicyDocument': {'Statement': [
+                {'Effect': 'Allow', 'Action': 'lambda:InvokeFunction', 'Resource': {'Ref': versions[key]}},
+                {'Effect': 'Allow', 'Action': 'states:DescribeExecution', 'Resource': '*'}]}}}
+            if transition and transition[key] != versions[key]:
+                resources[transition[key]] = {'Type': 'AWS::Lambda::Version', 'DeletionPolicy': 'Retain', 'UpdateReplacePolicy': 'Retain', 'Properties': {'FunctionName': {'Ref': function}}}
+                resources[key.capitalize() + 'TransitionObserverPolicy' + '1' * 8] = {'Type': 'AWS::IAM::Policy', 'Properties': {'Roles': [{'Ref': self.ROLES[key]}],
+                    'PolicyDocument': {'Statement': [{'Effect': 'Allow', 'Action': 'lambda:InvokeFunction', 'Resource': {'Ref': transition[key]}}]}}}
+        return {'Resources': resources}
+
+    def test_derives_the_three_exact_previous_versions_from_the_before_template(self):
+        self.assertEqual(self.cfn.transition_observer_versions(self.before), self.OLD)
+        legacy = copy.deepcopy(self.before)
+        legacy['Resources']['LifecycleObserver4909851D']['Properties']['Environment']['Variables']['EZIL_LIFECYCLE_SETTINGS'] = json.dumps({'deployment': {'region': 'ap-south-1'}})
+        self.assertIsNone(self.cfn.transition_observer_versions(legacy))
+        self.assertIsNone(self.cfn.transition_observer_versions({'Resources': {}}))
+
+    def test_derivation_refuses_a_policy_that_names_anything_but_one_retained_version_of_its_function(self):
+        for change in ('wildcard', 'two', 'other_function', 'not_retained'):
+            before = copy.deepcopy(self.before)
+            policy = before['Resources'][self.cfn.LIFECYCLE_CONTROLLER_POLICY]['Properties']['PolicyDocument']['Statement']
+            if change == 'wildcard': policy[0]['Resource'] = 'arn:aws:lambda:ap-south-1:452630323510:function:*'
+            elif change == 'two': policy.append(dict(policy[0]))
+            elif change == 'other_function': before['Resources'][self.OLD['lifecycle']]['Properties'] = {'FunctionName': {'Ref': 'RecoveryObserver1D350FD8'}}
+            else: before['Resources'][self.OLD['lifecycle']]['DeletionPolicy'] = 'Delete'
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.cfn.transition_observer_versions(before)
+
+    def test_candidate_with_retained_previous_versions_and_exact_transition_grants_is_preserved(self):
+        self.cfn.preserve_transition_versions(self.before, self.after)
+        # Unchanged observer versions need (and may not carry) a transition grant.
+        same = self.template(self.OLD)
+        self.cfn.preserve_transition_versions(self.before, same)
+        with self.assertRaisesRegex(ValueError, 'unchanged'):
+            self.cfn.preserve_transition_versions(self.before, self.template(self.OLD, transition={**self.OLD, 'lifecycle': 'x'}) | {'Resources': {**same['Resources'],
+                'LifecycleTransitionObserverPolicy11111111': self.after['Resources']['LifecycleTransitionObserverPolicy11111111']}})
+
+    def test_candidate_that_drops_the_previous_version_or_its_exact_grant_is_refused(self):
+        cases = {}
+        a = copy.deepcopy(self.after); del a['Resources'][self.OLD['recovery']]; cases['dropped_version'] = (a, 'retained unchanged')
+        a = copy.deepcopy(self.after); del a['Resources']['RecoveryTransitionObserverPolicy11111111']; cases['missing_grant'] = (a, 'exactly one')
+        a = copy.deepcopy(self.after); a['Resources']['RecoveryTransitionObserverPolicy11111111']['Properties']['PolicyDocument']['Statement'][0]['Resource'] = 'arn:aws:lambda:ap-south-1:452630323510:function:*'; cases['wildcard'] = (a, 'exactly one')
+        a = copy.deepcopy(self.after); a['Resources']['RecoveryTransitionObserverPolicy11111111']['Properties']['Roles'] = [{'Ref': self.ROLES['lifecycle']}]; cases['other_role'] = (a, 'same role')
+        a = copy.deepcopy(self.after); a['Resources']['RecoveryTransitionObserverPolicy11111111']['Properties']['PolicyDocument']['Statement'].append({'Effect': 'Allow', 'Action': 'lambda:InvokeFunction', 'Resource': {'Ref': self.NEW['recovery']}}); cases['extra_statement'] = (a, 'same role')
+        a = copy.deepcopy(self.after); a['Resources'][self.OLD['recovery']]['Properties'] = {'FunctionName': {'Ref': 'LifecycleObserver4909851D'}}; cases['changed_version'] = (a, 'retained unchanged')
+        for name, (after, message) in cases.items():
+            with self.subTest(case=name), self.assertRaisesRegex(ValueError, message):
+                self.cfn.preserve_transition_versions(self.before, after)
+
+
+class HistoryContextTransitionTests(ObserverTransitionTests):
+    """Second cutover gap: exact prior history-key context rows must survive the workflows change set."""
+    def row(self, machine, versions):
+        return {'Effect': 'Allow', 'Action': 'kms:Decrypt', 'Resource': {'Fn::GetAtt': ['LifecycleHistoryKey897F7B53', 'Arn']},
+                'Condition': {'StringEquals': {'kms:ViaService': 'states.ap-south-1.amazonaws.com',
+                    'kms:EncryptionContext:aws:states:stateMachineArn': [f'arn:aws:states:ap-south-1:452630323510:stateMachine:{machine}'] +
+                        [f'arn:aws:states:ap-south-1:452630323510:stateMachine:{machine}:{v}' for v in versions]}}}
+
+    def setUp(self):
+        super().setUp()
+        self.settings['deployment'].update(stateMachineVersionArn='arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:45',
+                                           recoveryStateMachineVersionArn='arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-recovery:37')
+        self.before = self.template(self.OLD); self.after = self.template(self.NEW, transition=self.OLD)
+        for t, n in ((self.before, 45), (self.after, 46)):
+            t['Resources'][self.cfn.LIFECYCLE_OBSERVER_POLICY] = {'Type': 'AWS::IAM::Policy', 'Properties': {'Roles': [{'Ref': 'LifecycleObserverServiceRole'}],
+                'PolicyDocument': {'Statement': [self.row('ezil-mum-lifecycle', [n])]}}}
+            t['Resources']['AppCallerRoleDefaultPolicy61BE57D2'] = {'Type': 'AWS::IAM::Policy', 'Properties': {'Roles': [{'Ref': 'AppCallerRole'}],
+                'PolicyDocument': {'Statement': [self.row('ezil-mum-lifecycle', [n]), {'Effect': 'Allow', 'Action': 'states:DescribeExecution', 'Resource': '*'}]}}}
+        # The candidate keeps the exact prior rows beside the current ones.
+        for name in (self.cfn.LIFECYCLE_OBSERVER_POLICY, 'AppCallerRoleDefaultPolicy61BE57D2'):
+            self.after['Resources'][name]['Properties']['PolicyDocument']['Statement'].append(self.row('ezil-mum-lifecycle', [45]))
+
+    def test_derives_the_three_deployed_version_arns_from_the_before_template(self):
+        self.assertEqual(self.cfn.transition_state_machine_versions(self.before), {
+            'lifecycle': 'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:45',
+            'preparation': 'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-rebase-preparation:37',
+            'recovery': 'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-recovery:37'})
+        self.assertIsNone(self.cfn.transition_state_machine_versions({'Resources': {}}))
+
+    def test_candidate_keeping_every_exact_prior_row_is_preserved(self):
+        self.cfn.preserve_history_contexts(self.before, self.after)
+
+    def test_candidate_dropping_or_rewriting_a_prior_row_is_refused(self):
+        for name in (self.cfn.LIFECYCLE_OBSERVER_POLICY, 'AppCallerRoleDefaultPolicy61BE57D2'):
+            after = copy.deepcopy(self.after)
+            after['Resources'][name]['Properties']['PolicyDocument']['Statement'] = [s for s in after['Resources'][name]['Properties']['PolicyDocument']['Statement']
+                                                                               if ':45' not in json.dumps(s)]
+            with self.subTest(policy=name, case='dropped'), self.assertRaisesRegex(ValueError, 'exact prior history-key context row'):
+                self.cfn.preserve_history_contexts(self.before, after)
+            after = copy.deepcopy(self.after)
+            after['Resources'][name]['Properties']['PolicyDocument']['Statement'] = [self.row('ezil-mum-lifecycle', [46, 45])]
+            with self.subTest(policy=name, case='merged'), self.assertRaisesRegex(ValueError, 'exact prior history-key context row'):
+                self.cfn.preserve_history_contexts(self.before, after)
+        after = copy.deepcopy(self.after); del after['Resources']['AppCallerRoleDefaultPolicy61BE57D2']
+        with self.assertRaisesRegex(ValueError, 'must remain'):
+            self.cfn.preserve_history_contexts(self.before, after)
+
+    def statements(self, template, name):
+        return template['Resources'][name]['Properties']['PolicyDocument']['Statement']
+
+    def rollover(self, name):
+        """Consecutive rollover: the R153-shaped before (current :46 beside the aged :45 transition row and a stable
+        unqualified scope) and an R154 candidate (:47 beside the :46 transition row; the :45 row aged out)."""
+        before = copy.deepcopy(self.after)
+        before['Resources'][self.cfn.LIFECYCLE_OBSERVER]['Properties']['Environment']['Variables']['EZIL_LIFECYCLE_SETTINGS'] = json.dumps({
+            **self.settings, 'deployment': {**self.settings['deployment'],
+                                            'stateMachineVersionArn': 'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:46'}})
+        stable = self.row('ezil-mum-lifecycle', [])
+        self.statements(before, name).append(stable)
+        after = copy.deepcopy(before)
+        aged = self.row('ezil-mum-lifecycle', [45])
+        self.assertIn(aged, self.statements(after, name))
+        self.statements(after, name)[:] = [s for s in self.statements(after, name) if s != aged]
+        self.statements(after, name).insert(0, self.row('ezil-mum-lifecycle', [47]))
+        self.assertEqual(self.cfn.transition_state_machine_versions(before)['lifecycle'],
+                         'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:46')
+        return before, after, stable
+
+    def test_consecutive_rollover_may_drop_the_aged_transition_row_but_not_the_current_or_unqualified_rows(self):
+        for name in (self.cfn.LIFECYCLE_OBSERVER_POLICY, 'AppCallerRoleDefaultPolicy61BE57D2'):
+            before, after, stable = self.rollover(name)
+            with self.subTest(policy=name, case='aged row dropped'):
+                self.assertNotIn(self.row('ezil-mum-lifecycle', [45]), self.statements(after, name))
+                self.cfn.preserve_history_contexts(before, after)
+            dropped = copy.deepcopy(after)
+            self.statements(dropped, name)[:] = [s for s in self.statements(dropped, name) if s != self.row('ezil-mum-lifecycle', [46])]
+            with self.subTest(policy=name, case='current row dropped'), self.assertRaisesRegex(ValueError, 'exact prior history-key context row'):
+                self.cfn.preserve_history_contexts(before, dropped)
+            dropped = copy.deepcopy(after)
+            self.statements(dropped, name)[:] = [s for s in self.statements(dropped, name) if s != stable]
+            with self.subTest(policy=name, case='unqualified scope dropped'), self.assertRaisesRegex(ValueError, 'exact prior history-key context row'):
+                self.cfn.preserve_history_contexts(before, dropped)
+
+    def test_non_literal_context_scope_is_refused(self):
+        before = copy.deepcopy(self.before)
+        self.statements(before, self.cfn.LIFECYCLE_OBSERVER_POLICY)[0]['Condition']['StringEquals'][self.cfn.HISTORY_CONTEXT] = [{'Ref': 'Machine'}]
+        with self.assertRaisesRegex(ValueError, 'literal state-machine ARNs'):
+            self.cfn.preserve_history_contexts(before, self.after)
+
+
+class AddedLambdaInvokeGuardTests(DependentVersionReviewTests):
+    """validate_templates: an ADDED Lambda invoke Allow must name exactly one immutable version of the same template."""
+    def build(self, resource, with_version=True):
+        c, b, a, r = self.docs({})
+        if with_version:
+            a['Resources']['RecoveryObserverCurrentVersion680AB0D7' + '9' * 32] = {'Type': 'AWS::Lambda::Version', 'DeletionPolicy': 'Retain', 'UpdateReplacePolicy': 'Retain',
+                                                                                  'Properties': {'FunctionName': {'Ref': 'RecoveryObserver1D350FD8'}}}
+            r['changes']['RecoveryObserverCurrentVersion680AB0D7' + '9' * 32] = {'action': 'Add', 'properties': [], 'attributes': []}
+        a['Resources']['RecoveryRolePolicy1'] = {'Type': 'AWS::IAM::Policy', 'Properties': {'PolicyDocument': {'Statement': [
+            {'Effect': 'Allow', 'Action': 'lambda:InvokeFunction', 'Resource': resource}]}}}
+        r['changes']['RecoveryRolePolicy1'] = {'action': 'Add', 'properties': [], 'attributes': []}
+        return c, b, a, r
+
+    def test_exact_version_reference_is_accepted(self):
+        c, b, a, r = self.build({'Ref': 'RecoveryObserverCurrentVersion680AB0D7' + '9' * 32})
+        self.assertIn('RecoveryRolePolicy1', c.validate_templates('workflows', b, a, r))
+
+    def test_function_wildcard_arn_list_or_unknown_reference_is_refused(self):
+        for resource in ('arn:aws:lambda:ap-south-1:452630323510:function:*', '*', [{'Ref': 'RecoveryObserverCurrentVersion680AB0D7' + '9' * 32}],
+                         {'Ref': 'RecoveryObserver1D350FD8'}, {'Fn::GetAtt': ['RecoveryObserver1D350FD8', 'Arn']}):
+            c, b, a, r = self.build(resource)
+            with self.subTest(resource=str(resource)[:40]), self.assertRaisesRegex(ValueError, 'exactly one immutable version'):
+                c.validate_templates('workflows', b, a, r)
+
+
 class CloudFormationDetailTests(unittest.TestCase):
     def setUp(self):
         import rebase_cloudformation as cfn

@@ -52,6 +52,56 @@ function parse(text: string | undefined): unknown {
     try { return JSON.parse(text); } catch { return undefined; }
 }
 
+/** A pool release that FAILED before it acted at all (incident 2026-11-17: the deployed lifecycle version's initial observe
+ * was refused `lambda:InvokeFunction` during a rollout's version transition). Proven only from that failed execution's own
+ * complete history: the exact execution and immutable input of the failed release job, Init and `Observe-initial` as the only
+ * states ever entered, no provider task of any kind, no observe success, and the terminal Fail state. The host is then exactly
+ * as the release found it (running, its data volume attached), so the release may be replayed as itself. EC2 state alone is
+ * never evidence; a history that entered any other task state, scheduled any task, or saw an observe succeed proves nothing. */
+export function proveFailedReleaseNeverActed(e: Execution, events: readonly HistoryEvent[], work: LifecycleWork): boolean {
+    const i = work.intent, d = i.deployment;
+    if (i.operation !== 'release' || !i.providerInstanceId || !i.dataVolumeId) return false;
+    if (e.status !== 'FAILED' || e.redriveCount !== 0 || e.stateMachineAliasArn || typeof e.input !== 'string' || e.input !== work.input
+        || e.executionArn !== lifecycleExecutionArn(d, i.jobId) || e.stateMachineVersionArn !== work.stateMachineArn || !named(e.error)
+        || !(e.startDate instanceof Date) || !(e.stopDate instanceof Date)) return false;
+    const from = e.startDate.getTime(), to = e.stopDate.getTime();
+    if (!Number.isFinite(from) || !Number.isFinite(to) || from > to) return false;
+    const first = events[0], last = events.at(-1), failState = events.at(-2);
+    if (events.length < 4 || first?.type !== 'ExecutionStarted' || first.executionStartedEventDetails?.input !== e.input
+        || first.executionStartedEventDetails.stateMachineVersionArn !== work.stateMachineArn
+        || last?.type !== 'ExecutionFailed' || last.executionFailedEventDetails?.error !== e.error
+        || failState?.type !== 'FailStateEntered' || last.previousEventId !== failState.id) return false;
+    let observed = 0, scheduled = 0;
+    const byId = new Map(events.map(event => [event.id!, event]));
+    for (const [index, event] of events.entries()) {
+        const type = event.type ?? '';
+        // Linear, complete, time-ordered history inside the execution's own interval; every parent is an earlier event.
+        if (event.id !== index + 1 || !Number.isInteger(event.previousEventId) || (index === 0 && event.previousEventId !== 0)
+            || (index > 0 && (event.previousEventId! < 1 || event.previousEventId! >= event.id!))
+            || !(event.timestamp instanceof Date) || !Number.isFinite(event.timestamp.getTime())
+            || event.timestamp.getTime() < from || event.timestamp.getTime() > to
+            || (index > 0 && event.timestamp.getTime() < events[index - 1]!.timestamp!.getTime())
+            || !KNOWN.has(type) || truncated(event)) return false;
+        // Each observer schedule hangs off the single state entry or off its own retryable failure (the observe Retry), never more
+        // than the Retry budget; a start/outcome hangs off its schedule/start.
+        if (type === 'LambdaFunctionScheduled') {
+            const parent = byId.get(event.previousEventId!);
+            if (parent?.type !== 'TaskStateEntered' && !(parent?.type === 'LambdaFunctionFailed' && OBSERVE_RETRY_ERRORS.has(retryError(parent) ?? ''))) return false;
+            if (++scheduled > OBSERVE_MAX_RETRIES + 1) return false;
+        }
+        if (PARENT[type] && type !== 'LambdaFunctionScheduled' && byId.get(event.previousEventId!)?.type !== PARENT[type]) return false;
+        // Nothing that could act: no provider task event of any kind, no observe success (which would have continued the graph).
+        if (type.startsWith('Task') && type !== 'TaskStateEntered' && type !== 'TaskStateExited') return false;
+        if (type === 'LambdaFunctionSucceeded') return false;
+        if (type === 'TaskStateEntered') { if (event.stateEnteredEventDetails?.name !== 'Observe-initial') return false; observed++; }
+        if (type === 'TaskStateExited' && event.stateExitedEventDetails?.name !== 'Observe-initial') return false;
+        if (type === 'PassStateEntered' && event.stateEnteredEventDetails?.name !== 'Init') return false;
+        if (type.endsWith('StateEntered') && !type.startsWith('Pass') && !type.startsWith('Task') && !type.startsWith('Fail')) return false;
+        if (type === 'LambdaFunctionFailed' && !named(event.lambdaFunctionFailedEventDetails?.error)) return false;
+    }
+    return observed === 1;
+}
+
 export function proveFailedReleaseTermination(e: Execution, events: readonly HistoryEvent[], work: LifecycleWork): FailedReleaseTermination | null {
     const i = work.intent, d = i.deployment, instanceId = i.providerInstanceId, volumeId = i.dataVolumeId;
     if (i.operation !== 'release' || !instanceId || !volumeId) return null;
