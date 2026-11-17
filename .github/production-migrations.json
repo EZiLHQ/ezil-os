@@ -105,6 +105,11 @@
       "path": "app/drizzle/0025_ai_request_traces.sql",
       "sha256": "b7c8f09b07e77b1abbec520aebd490c759e8deb50f48dd0f7af060457f1a0a87",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0030_delegation_replay.sql",
+      "sha256": "50ff0b0a441ee539ca5d72302443315be1f1812e6b11e4afb2e1af3f575692a7",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {

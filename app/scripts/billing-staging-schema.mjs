@@ -36,7 +36,10 @@ export const EXPLICIT_FILES = Object.freeze([
     // Incident alerts and AI request traces: the staging-released pair, applied for real on production after 0023.
     'app/drizzle/0024_telemetry_alerts.sql',
     'app/drizzle/0025_ai_request_traces.sql',
+    // Delegation replay ledger (EZiL MCP delegated reads). Must really run on production; never baselined.
+    'app/drizzle/0030_delegation_replay.sql',
 ]);
+export const TARGETED_APPLY_FILE = 'app/drizzle/0030_delegation_replay.sql';
 const TABLE = 'public.ezil_staging_schema_log';
 const HASH = /^[a-f0-9]{64}$/;
 class Refusal extends Error {}
@@ -140,16 +143,17 @@ export function renderPlan(files, logged = null) {
 }
 
 export function parseArgs(args) {
-    let yes = false, target = 'ezil-os-awstest', expectSystemId;
+    let yes = false, target = 'ezil-os-awstest', expectSystemId, only;
     const positional = [], seen = new Set();
     for (let i = 0; i < args.length; i++) {
         const arg = args[i];
         if (arg === '--yes') { yes = true; continue; }
-        if (arg === '--target' || arg === '--expect-system-id') {
+        if (arg === '--target' || arg === '--expect-system-id' || arg === '--only') {
             if (seen.has(arg) || !args[i + 1] || args[i + 1].startsWith('--')) refuse(`Missing or duplicate ${arg}.`);
             seen.add(arg);
             const value = args[++i];
             if (arg === '--target') target = value;
+            else if (arg === '--only') only = value;
             else expectSystemId = value;
         } else if (arg.startsWith('--')) refuse('Unknown staging option.');
         else positional.push(arg);
@@ -158,10 +162,14 @@ export function parseArgs(args) {
     if (target.startsWith('aws-') && !/^[0-9]+$/.test(expectSystemId ?? '')) refuse(`${target} requires --expect-system-id <digits>.`);
     if (!target.startsWith('aws-') && expectSystemId !== undefined) refuse('--expect-system-id requires an aws-* target.');
     const mode = positional.shift() ?? 'plan';
-    if (!['plan', 'apply', 'baseline'].includes(mode)) refuse('Usage: billing-staging-schema.mjs [plan | apply --yes | baseline <file...> --yes] [--target ezil-os-awstest|aws-preview|aws-production] [--expect-system-id <digits>]');
+    if (!['plan', 'apply', 'baseline'].includes(mode)) refuse('Usage: billing-staging-schema.mjs [plan | apply [--only <file>] --yes | baseline <file...> --yes] [--target ezil-os-awstest|aws-preview|aws-production] [--expect-system-id <digits>]');
     if (mode !== 'plan' && !yes) refuse(`${mode} requires --yes.`);
     if (mode === 'baseline' ? positional.length === 0 : positional.length !== 0) refuse('Only baseline accepts file arguments; baseline needs at least one file.');
-    return { mode, files: positional, yes, target, expectSystemId };
+    // Targeted apply: exactly one named file (a second --only is refused above); the default apply still runs every pending file.
+    if (only !== undefined && mode !== 'apply') refuse('--only is accepted only by apply.');
+    // Only the delegation replay ledger is targetable, by its exact canonical path (no basename or ./ alias).
+    if (only !== undefined && only !== TARGETED_APPLY_FILE) refuse(`--only accepts only ${TARGETED_APPLY_FILE}.`);
+    return { mode, files: positional, yes, target, expectSystemId, only };
 }
 
 const literal = (value) => `E'${value.replaceAll('\\', '\\\\').replaceAll("'", "''")}'`;
@@ -175,18 +183,20 @@ export function run(args = process.argv.slice(2), {
     const databaseUrl = env.BILLING_STAGING_DATABASE_URL;
     const emit = (message) => write(redact(message, databaseUrl));
     try {
-        const { mode, files: requested, target, expectSystemId } = parseArgs(args);
+        const { mode, files: baselineFiles, target, expectSystemId, only } = parseArgs(args);
+        // The files this run may write: baseline's arguments or apply's single --only file; undefined for a full apply.
+        const requested = only === undefined ? baselineFiles : [only];
         const connection = databaseUrl ? validateDatabaseUrl(databaseUrl, target) : null;
         if (!connection && (mode !== 'plan' || target.startsWith('aws-'))) refuse('BILLING_STAGING_DATABASE_URL is required.');
         const ordered = orderFiles(readdirSync(resolve(ROOT, 'app/drizzle')), readdirSync(resolve(ROOT, 'docs/aws-computers/sql')));
         // Production applies the reviewed list that belongs there (release plan §4.1-4.2) under the same guards as
         // preview: localhost:5432 host pin, pg_control system-id pin, SHA-256 re-check, one logged transaction per
-        // file. 0003-0011 are already applied there; 0019-0023 apply with their releases and 0024-0025 (incident alerts,
-        // AI request traces) with this one. None of them may be baselined (recorded as already present) on production —
-        // they must really run.
+        // file. 0003-0011 are already applied there; 0019-0023 apply with their releases, 0024-0025 (incident alerts,
+        // AI request traces) and 0030 (delegation replay ledger) with this one. None of them may be baselined (recorded
+        // as already present) on production — they must really run.
         if (target === 'aws-production' && mode === 'baseline' &&
-            requested.some(name => ['0003_pool_hosts_v2.sql.txt', '0008_pool_dispatch.sql', '0009_capacity_demands.sql', '0010_migration_restore_progress.sql', '0011_feedback.sql', '0019_operator_entitlements.sql', '0020_operator_refusal_receipts.sql', '0021_standard_trial.sql', '0022_feedback_notifications.sql', '0023_operator_issued_by.sql', '0024_telemetry_alerts.sql', '0025_ai_request_traces.sql'].includes(basename(name)))) {
-            refuse('Pool hosts v2, pool dispatch, capacity demand, migration restore progress, feedback, operator entitlements, operator refusal receipts, the Standard trial, feedback notifications, the issuing organization, incident alerts and AI request traces must be applied on production, never baselined.');
+            requested.some(name => ['0003_pool_hosts_v2.sql.txt', '0008_pool_dispatch.sql', '0009_capacity_demands.sql', '0010_migration_restore_progress.sql', '0011_feedback.sql', '0019_operator_entitlements.sql', '0020_operator_refusal_receipts.sql', '0021_standard_trial.sql', '0022_feedback_notifications.sql', '0023_operator_issued_by.sql', '0024_telemetry_alerts.sql', '0025_ai_request_traces.sql', '0030_delegation_replay.sql'].includes(basename(name)))) {
+            refuse('Pool hosts v2, pool dispatch, capacity demand, migration restore progress, feedback, operator entitlements, operator refusal receipts, the Standard trial, feedback notifications, the issuing organization, incident alerts, AI request traces and the delegation replay ledger must be applied on production, never baselined.');
         }
         // 0012 (reverse moves) changes no pre-existing table and the app probes for it ("production today"): it stays
         // staging-only, never applied or baselined on production (it is skipped in the apply loop below, and any
@@ -255,7 +265,7 @@ export function run(args = process.argv.slice(2), {
             return 0;
         }
         for (const entry of plan) {
-            if (mode === 'baseline' && !selected.has(entry.file)) continue;
+            if ((mode === 'baseline' || only !== undefined) && !selected.has(entry.file)) continue;
             // 0012 (reverse moves) is staging-only on production: never applied or logged there (the app probes for it).
             if (target === 'aws-production' && basename(entry.file) === '0012_compute_reverse_moves.sql') {
                 emit(`${entry.file}: staging-only on production; skipped`);

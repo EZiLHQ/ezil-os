@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
-    STAGING_REF, EXPLICIT_FILES, validateDatabaseUrl, redact, orderFiles,
+    STAGING_REF, EXPLICIT_FILES, TARGETED_APPLY_FILE, validateDatabaseUrl, redact, orderFiles,
     sha256, buildPlan, renderPlan, parseArgs, run,
 } from './billing-staging-schema.mjs';
 
@@ -730,8 +730,8 @@ const stageReleased = {
     'app/drizzle/0025_ai_request_traces.sql': 'b7c8f09b07e77b1abbec520aebd490c759e8deb50f48dd0f7af060457f1a0a87',
 };
 
-test('incident alerts and AI traces (0024, 0025) follow 0023 in order, at the end, with the exact released bytes', () => {
-    assert.deepEqual(EXPLICIT_FILES.slice(-3), ['app/drizzle/0023_operator_issued_by.sql', ...Object.keys(stageReleased)]);
+test('incident alerts and AI traces (0024, 0025) follow 0023 in order, before 0030, with the exact released bytes', () => {
+    assert.deepEqual(EXPLICIT_FILES.slice(-4), ['app/drizzle/0023_operator_issued_by.sql', ...Object.keys(stageReleased), 'app/drizzle/0030_delegation_replay.sql']);
     for (const [file, digest] of Object.entries(stageReleased)) {
         assert.equal(files.find(entry => entry.file === file).sha256, digest);
         assert.equal(buildPlan(files, []).find(row => row.file === file).status, 'pending');
@@ -749,23 +749,24 @@ test('incident alerts and AI traces (0024, 0025) must be applied on production, 
     }
 });
 
-test('production apply really runs 0024 and 0025 after 0023 and still skips 0012', () => {
+test('production apply really runs 0024 and 0025 after 0023, then 0030, and still skips 0012', () => {
     const h = productionHarness();
     assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 0);
     const applied = h.calls.slice(3).map(({ args }) => EXPLICIT_FILES.find(file => args[args.indexOf('-f') + 1].endsWith(`/${file}`)));
-    assert.deepEqual(applied.slice(-3), ['app/drizzle/0023_operator_issued_by.sql', ...Object.keys(stageReleased)]);
+    assert.deepEqual(applied.slice(-4), ['app/drizzle/0023_operator_issued_by.sql', ...Object.keys(stageReleased), 'app/drizzle/0030_delegation_replay.sql']);
     assert.equal(applied.includes('app/drizzle/0012_compute_reverse_moves.sql'), false);
     for (const file of Object.keys(stageReleased)) assert.ok(h.output.includes(`${file}: applied`));
 });
 
-test('the staging log (22 rows, without 0002_image_rebase and 0022) leaves only 0022 pending after the supported 0002 baseline', () => {
+test('the staging log (22 rows, without 0002_image_rebase, 0022 and the new 0030) leaves 0022 and 0030 pending after the supported 0002 baseline', () => {
     const imageRebase = 'docs/aws-computers/sql/0002_image_rebase.sql.txt';
     const feedback = 'app/drizzle/0022_feedback_notifications.sql';
-    const logged = files.filter(({ file }) => file !== imageRebase && file !== feedback)
+    const replay = 'app/drizzle/0030_delegation_replay.sql';
+    const logged = files.filter(({ file }) => file !== imageRebase && file !== feedback && file !== replay)
         .map(({ file, sha256: digest }) => ({ file, sha256: digest, mode: 'apply' }));
     assert.equal(logged.length, 22);
-    // Before the baseline both are genuinely pending; 0002 is never counted as applied by default.
-    assert.deepEqual(buildPlan(files, logged).filter(row => row.status === 'pending').map(row => row.file), [imageRebase, feedback]);
+    // Before the baseline all three are genuinely pending; 0002 is never counted as applied by default.
+    assert.deepEqual(buildPlan(files, logged).filter(row => row.status === 'pending').map(row => row.file), [imageRebase, feedback, replay]);
     // The supported single-file baseline of 0002 (its catalog checked out of band by rebase_schema) logs only that file.
     const h = harness(logged);
     assert.equal(run(['baseline', '0002_image_rebase.sql.txt', '--yes'], h.options), 0);
@@ -775,10 +776,273 @@ test('the staging log (22 rows, without 0002_image_rebase and 0022) leaves only 
     assert.equal(h.calls.some(({ args }) => args.includes('-f')), false);
     const baselined = [...logged, { file: imageRebase, sha256: files.find(({ file }) => file === imageRebase).sha256, mode: 'baseline' }];
     const plan = buildPlan(files, baselined);
-    assert.deepEqual(plan.filter(row => row.status === 'pending').map(row => row.file), [feedback]);
+    assert.deepEqual(plan.filter(row => row.status === 'pending').map(row => row.file), [feedback, replay]);
     assert.equal(plan.find(row => row.file === imageRebase).status, 'applied (baseline)');
     for (const file of Object.keys(stageReleased)) assert.equal(plan.find(row => row.file === file).status, 'applied (apply)');
     // A drifted 0024/0025 log hash is refused, never re-run or rebaselined.
     const drifted = baselined.map(row => row.file === 'app/drizzle/0025_ai_request_traces.sql' ? { ...row, sha256: '0'.repeat(64) } : row);
     assert.throws(() => buildPlan(files, drifted), /SHA-256 mismatch: app\/drizzle\/0025_ai_request_traces\.sql/);
+});
+
+// Delegation replay ledger (0030): one new table, server-only, applied for real on production after 0025.
+const replayFile = 'app/drizzle/0030_delegation_replay.sql';
+const replayEntry = files.find(f => f.file === replayFile);
+const beforeReplay = () => files.filter(f => f.file !== replayFile && !f.file.endsWith('0012_compute_reverse_moves.sql')).map(f => ({ ...f, mode: 'apply' }));
+
+test('a logged 0030 is skipped while pending 0024 and 0025 still run, in order, in a full production apply', () => {
+    const logged = files.filter(f => !Object.keys(stageReleased).includes(f.file) && !f.file.endsWith('0012_compute_reverse_moves.sql')).map(f => ({ ...f, mode: 'apply' }));
+    assert.ok(logged.some(row => row.file === replayFile));
+    const h = productionHarness(logged);
+    assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 0);
+    const runs = h.calls.filter(({ args }) => args.includes('-f')).map(({ args }) => args[args.indexOf('-f') + 1]);
+    assert.equal(runs.length, 2);
+    Object.keys(stageReleased).forEach((file, i) => assert.ok(runs[i].endsWith(`/${file}`), file));
+    assert.equal(h.calls.filter(({ args }) => args.at(-1).includes('INSERT INTO')).length, 2);
+    assert.ok(h.output.includes(`${replayFile}: already logged; skipped`));
+    assert.equal(h.output.includes(`${replayFile}: applying`), false);
+});
+
+test('the delegation replay ledger is last, after 0025, additive, server-only and a production snapshot only', () => {
+    assert.equal(EXPLICIT_FILES.at(-1), replayFile);
+    assert.equal(EXPLICIT_FILES.indexOf(replayFile), EXPLICIT_FILES.indexOf('app/drizzle/0025_ai_request_traces.sql') + 1);
+    assert.equal(EXPLICIT_FILES.filter(file => file === replayFile).length, 1);
+    const sql = readFileSync(fileURLToPath(new URL(`../../${replayFile}`, import.meta.url)), 'utf8');
+    // A bare CREATE TABLE: a pre-existing table fails the apply (and rolls back) instead of being silently adopted.
+    assert.match(sql, /^CREATE TABLE public\.ezil_delegation_replay \(/m);
+    assert.match(sql, /CREATE UNIQUE INDEX ezil_delegation_replay_jti_key ON public\.ezil_delegation_replay \(jti\);/);
+    assert.match(sql, /ALTER TABLE public\.ezil_delegation_replay ENABLE ROW LEVEL SECURITY;/);
+    assert.match(sql, /REVOKE ALL ON TABLE public\.ezil_delegation_replay FROM public, anon, authenticated;/);
+    assert.doesNotMatch(sql, /GRANT |CREATE POLICY |DISABLE ROW LEVEL SECURITY|DROP |INSERT INTO|UPDATE |DELETE FROM|TRUNCATE|ALTER TABLE public\.(?!ezil_delegation_replay)/i);
+    const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../../.github/production-migrations.json', import.meta.url)), 'utf8'));
+    assert.deepEqual(manifest.sources.find(source => source.path === replayFile), { path: replayFile, sha256: sha256(sql), kind: 'snapshot' });
+    assert.equal(manifest.migrations.some(migration => migration.path === replayFile), false);
+    assert.equal(sha256(sql), replayEntry.sha256);
+});
+
+test('delegation replay ledger (0030) must be applied on production, never baselined, alone or mixed', () => {
+    for (const name of ['0030_delegation_replay.sql', replayFile, `./${replayFile}`]) {
+        for (const requested of [[name], [files[0].file, name]]) {
+            const h = productionHarness();
+            assert.equal(run(['baseline', ...requested, '--yes', ...productionArgs], h.options), 1);
+            assert.equal(h.calls.length, 0);
+            assert.match(h.output.join('\n'), /delegation replay ledger must be applied on production, never baselined/);
+        }
+    }
+    // Preview keeps its baseline path for files applied out of band.
+    assert.equal(run(['baseline', replayFile, '--yes', ...previewArgs], previewHarness().options), 0);
+});
+
+test('production apply with 0000-0025 logged runs only 0030: pinned, hash-checked, one transaction with its ledger row', () => {
+    const h = productionHarness(beforeReplay());
+    assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 0);
+    const migrations = h.calls.filter(({ args }) => args.includes('-f'));
+    assert.equal(migrations.length, 1);
+    const { args, settings } = migrations[0];
+    assert.ok(args[args.indexOf('-f') + 1].endsWith(`/${replayFile}`));
+    assert.ok(args.includes('--single-transaction'));
+    const pin = args.findIndex(arg => arg.startsWith('DO $pin$'));
+    assert.ok(pin >= 0 && args[pin].includes(productionId) && pin < args.indexOf('-f') && args.indexOf('-f') < args.lastIndexOf('-c'));
+    assert.match(args.at(-1), new RegExp(`INSERT INTO public\\.ezil_staging_schema_log .*${replayFile}.*${replayEntry.sha256}.*'apply'\\);$`));
+    assert.equal(settings.env.PGHOST, 'localhost');
+    assert.equal(settings.env.PGHOSTADDR, undefined);
+    // Ordered after the system-id probe, the log create and the log read; nothing else ran a schema file or an insert.
+    assert.equal(h.calls.findIndex(call => call === migrations[0]), 3);
+    assert.equal(h.calls.filter(({ args: a }) => a.at(-1).includes('INSERT INTO')).length, 1);
+    assert.deepEqual(h.output.filter(line => line.includes('0030')), [`${replayFile}: applying`, `${replayFile}: applied`]);
+    assert.equal(h.output.join('\n').includes(password), false);
+});
+
+test('production plan shows 0030 pending, and apply from an empty log runs it last after every earlier file', () => {
+    const plan = productionHarness(beforeReplay());
+    assert.equal(run(['plan', ...productionArgs], plan.options), 0);
+    assert.match(plan.output.join('\n'), new RegExp(`${replayFile}  ${replayEntry.sha256}  pending`));
+    assert.equal(plan.calls.some(({ args }) => args.includes('-f')), false);
+    const h = productionHarness();
+    assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 0);
+    const applied = h.calls.filter(({ args }) => args.includes('-f')).map(({ args }) => args[args.indexOf('-f') + 1]);
+    assert.ok(applied.at(-1).endsWith(`/${replayFile}`));
+    assert.equal(applied.length, EXPLICIT_FILES.length - 1);
+});
+
+test('a failed 0030 stops with no retry, never logs, and an already logged 0030 is skipped', () => {
+    const h = productionHarness(beforeReplay());
+    const original = h.options.spawnSyncImpl;
+    h.options.spawnSyncImpl = (command, args, settings) => {
+        const result = original(command, args, settings);
+        return args.includes('-f') ? { status: 3, stdout: '', stderr: `relation exists ${password}` } : result;
+    };
+    assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 1);
+    assert.equal(h.calls.filter(({ args }) => args.includes('-f')).length, 1);
+    assert.match(h.output.join('\n'), /psql failed; stopped without retry/);
+    assert.equal(h.output.join('\n').includes(password), false);
+    assert.equal(h.output.join('\n').includes('relation exists'), false);
+    const done = productionHarness([...beforeReplay(), { ...replayEntry, mode: 'apply' }]);
+    assert.equal(run(['apply', '--yes', ...productionArgs], done.options), 0);
+    assert.equal(done.calls.some(({ args }) => args.includes('-f')), false);
+    assert.match(done.output.join('\n'), new RegExp(`${replayFile}: already logged; skipped`));
+});
+
+test('a 0030 ledger row with a different checksum refuses before any schema write, in plan and apply', () => {
+    const logged = [...beforeReplay(), { file: replayFile, sha256: 'f'.repeat(64), mode: 'apply' }];
+    for (const mode of [['plan'], ['apply', '--yes']]) {
+        const h = productionHarness(logged);
+        assert.equal(run([...mode, ...productionArgs], h.options), 1);
+        assert.match(h.output.join('\n'), new RegExp(`SHA-256 mismatch: ${replayFile}`));
+        assert.equal(h.calls.some(({ args }) => args.includes('-f') || args.at(-1).includes('INSERT INTO')), false);
+    }
+});
+
+test('a system id mismatch or wrong host blocks 0030 before the ledger is even created', () => {
+    const wrongId = productionHarness(beforeReplay(), '1234');
+    assert.equal(run(['apply', '--yes', ...productionArgs], wrongId.options), 1);
+    assert.equal(wrongId.calls.length, 1);
+    const wrongHost = harness(beforeReplay(), { BILLING_STAGING_DATABASE_URL: `postgres://postgres:${password}@10.63.20.252:5432/postgres` });
+    assert.equal(run(['apply', '--yes', ...productionArgs], wrongHost.options), 1);
+    assert.equal(wrongHost.calls.length, 0);
+});
+
+test('0030 is a required explicit file: removing it from the directory refuses ordering', () => {
+    const drizzle = EXPLICIT_FILES.filter(f => f.startsWith('app/drizzle/')).map(f => f.split('/').at(-1));
+    const placement = EXPLICIT_FILES.filter(f => f.startsWith('docs/aws-computers/sql/')).map(f => f.split('/').at(-1));
+    assert.ok(orderFiles(drizzle, placement).includes(replayFile));
+    assert.throws(() => orderFiles(drizzle.filter(n => n !== '0030_delegation_replay.sql'), placement), new RegExp(`Required schema file missing: ${replayFile}`));
+});
+
+// Targeted apply (--only <file>): exactly one reviewed file; the default apply above still runs every pending file.
+const schemaRuns = h => h.calls.filter(({ args }) => args.includes('-f'));
+const insertsOf = h => h.calls.filter(({ args }) => args.at(-1).includes('INSERT INTO'));
+
+test('--only parses for apply only, once, with a value; plan and baseline refuse it', () => {
+    assert.equal(parseArgs(['apply', '--only', replayFile, '--yes', ...productionArgs]).only, replayFile);
+    assert.equal(parseArgs(['apply', '--yes', ...productionArgs]).only, undefined);
+    for (const bad of [['apply', '--only', '--yes'], ['apply', '--yes', '--only'], ['apply', '--only', 'a.sql', '--only', 'b.sql', '--yes'],
+        ['plan', '--only', replayFile], ['baseline', replayFile, '--only', replayFile, '--yes'], ['apply', replayFile, '--only', replayFile, '--yes']]) {
+        assert.throws(() => parseArgs([...bad, ...productionArgs]));
+    }
+    assert.throws(() => parseArgs(['apply', '--only', replayFile, ...productionArgs]), /requires --yes/);
+});
+
+test('production --only 0030 with every earlier file still pending runs exactly 0030 and no other SQL', () => {
+    for (const name of [replayFile]) {
+        const h = productionHarness();
+        assert.equal(run(['apply', '--only', name, '--yes', ...productionArgs], h.options), 0);
+        const runs = schemaRuns(h);
+        assert.equal(runs.length, 1);
+        assert.ok(runs[0].args[runs[0].args.indexOf('-f') + 1].endsWith(`/${replayFile}`));
+        // The only calls: system-id probe, log create, log read, then 0030 itself; one ledger insert, for 0030.
+        assert.equal(h.calls.length, 4);
+        assert.equal(h.calls[0].args.at(-1), 'SELECT system_identifier FROM pg_control_system();');
+        assert.equal(insertsOf(h).length, 1);
+        const { args, settings } = runs[0];
+        assert.ok(args.includes('--single-transaction'));
+        const pin = args.findIndex(arg => arg.startsWith('DO $pin$'));
+        assert.ok(pin >= 0 && args[pin].includes(productionId) && pin < args.indexOf('-f') && args.indexOf('-f') < args.lastIndexOf('-c'));
+        assert.match(args.at(-1), new RegExp(`${replayFile}.*${replayEntry.sha256}.*'apply'\\);$`));
+        assert.equal(settings.env.PGHOST, 'localhost');
+        assert.equal(settings.env.PGHOSTADDR, undefined);
+        // Unselected pending files: no SQL, no insert, no hash or name in any argument, no "applying" line.
+        for (const other of files.filter(f => f.file !== replayFile)) {
+            assert.equal(h.calls.some(({ args: a }) => a.some(arg => arg.includes(other.file) || arg.includes(other.sha256))), false, other.file);
+        }
+        assert.deepEqual(h.output.filter(line => line.endsWith(': applying') || line.endsWith(': applied')), [`${replayFile}: applying`, `${replayFile}: applied`]);
+        assert.equal(h.output.some(line => line.includes('staging-only on production')), false);
+    }
+});
+
+test('--only refuses unknown, outside-the-list, ambiguous and staging-only files before any psql call', () => {
+    for (const name of ['0031_nothing.sql', 'app/drizzle/0030_delegation_replay.sql.bak', '../app/drizzle/0030_delegation_replay.sql',
+        '/etc/passwd', 'app/drizzle/', '0030', '0003_pool_hosts_v2.sql.txt' + 'x']) {
+        const h = productionHarness();
+        assert.equal(run(['apply', '--only', name, '--yes', ...productionArgs], h.options), 1);
+        assert.equal(h.calls.length, 0, name);
+        assert.match(h.output.join('\n'), /--only accepts only app\/drizzle\/0030_delegation_replay\.sql/);
+    }
+    // 0012 is staging-only on production: even an explicit selection is refused.
+    for (const name of ['0012_compute_reverse_moves.sql', './app/drizzle/0012_compute_reverse_moves.sql']) {
+        const h = productionHarness();
+        assert.equal(run(['apply', '--only', name, '--yes', ...productionArgs], h.options), 1);
+        assert.equal(h.calls.length, 0);
+        assert.match(h.output.join('\n'), /--only accepts only app\/drizzle\/0030_delegation_replay\.sql/);
+    }
+    // Multiple files are not selectable by any spelling.
+    for (const argv of [['apply', '--only', replayFile, '--only', files[0].file, '--yes'], ['apply', '--only', `${replayFile},${files[0].file}`, '--yes'],
+        ['apply', '--only', replayFile, files[0].file, '--yes']]) {
+        const h = productionHarness();
+        assert.equal(run([...argv, ...productionArgs], h.options), 1);
+        assert.equal(h.calls.length, 0);
+    }
+});
+
+test('--only accepts ONLY the canonical 0030 path: every other reviewed file, alias or target makes no psql call', () => {
+    assert.equal(TARGETED_APPLY_FILE, replayFile);
+    const others = EXPLICIT_FILES.filter(file => file !== replayFile);
+    assert.equal(others.length, EXPLICIT_FILES.length - 1);
+    const harnesses = { production: [productionHarness, productionArgs], preview: [previewHarness, previewArgs] };
+    for (const [, [make, targetArgs]] of Object.entries(harnesses)) {
+        for (const file of others) {
+            for (const name of [file, `./${file}`, file.split('/').at(-1)]) {
+                const h = make();
+                assert.equal(run(['apply', '--only', name, '--yes', ...targetArgs], h.options), 1, name);
+                assert.equal(h.calls.length, 0, name);
+                assert.match(h.output.join('\n'), /--only accepts only app\/drizzle\/0030_delegation_replay\.sql/);
+            }
+        }
+        // Even the 0030 aliases are refused: only the exact canonical path is accepted.
+        for (const name of ['0030_delegation_replay.sql', `./${replayFile}`, `${replayFile}/`, replayFile.toUpperCase(), ` ${replayFile}`]) {
+            const h = make();
+            assert.equal(run(['apply', '--only', name, '--yes', ...targetArgs], h.options), 1, name);
+            assert.equal(h.calls.length, 0, name);
+        }
+    }
+    // The default staging target (URL pin only) refuses another file too.
+    const staging = harness();
+    assert.equal(run(['apply', '--only', files[0].file, '--yes'], staging.options), 1);
+    assert.equal(staging.calls.length, 0);
+    // The canonical path still works, and unrelated pending files stay unexecuted (re-proved on this exact spelling).
+    const ok = productionHarness();
+    assert.equal(run(['apply', '--only', replayFile, '--yes', ...productionArgs], ok.options), 0);
+    assert.equal(schemaRuns(ok).length, 1);
+    assert.equal(insertsOf(ok).length, 1);
+    assert.equal(ok.calls.length, 4);
+});
+
+test('--only keeps the pin, checksum, log and failure protections, and never baselines', () => {
+    // Wrong system id: only the probe runs.
+    const wrongId = productionHarness([], '1234');
+    assert.equal(run(['apply', '--only', replayFile, '--yes', ...productionArgs], wrongId.options), 1);
+    assert.equal(wrongId.calls.length, 1);
+    // A tampered ledger row for an UNSELECTED file still refuses the whole run before any write.
+    const tampered = productionHarness([{ ...files[0], sha256: 'f'.repeat(64), mode: 'apply' }]);
+    assert.equal(run(['apply', '--only', replayFile, '--yes', ...productionArgs], tampered.options), 1);
+    assert.match(tampered.output.join('\n'), new RegExp(`SHA-256 mismatch: ${files[0].file}`));
+    assert.equal(schemaRuns(tampered).length + insertsOf(tampered).length, 0);
+    // An already logged 0030 is skipped: no SQL at all beyond the log read.
+    const done = productionHarness([{ ...replayEntry, mode: 'apply' }]);
+    assert.equal(run(['apply', '--only', replayFile, '--yes', ...productionArgs], done.options), 0);
+    assert.equal(schemaRuns(done).length + insertsOf(done).length, 0);
+    assert.match(done.output.join('\n'), new RegExp(`${replayFile}: already logged; skipped`));
+    // A failing 0030 stops with suppressed diagnostics and no ledger insert of its own.
+    const failing = productionHarness();
+    const original = failing.options.spawnSyncImpl;
+    failing.options.spawnSyncImpl = (command, args, settings) => {
+        const result = original(command, args, settings);
+        return args.includes('-f') ? { status: 3, stdout: '', stderr: password } : result;
+    };
+    assert.equal(run(['apply', '--only', replayFile, '--yes', ...productionArgs], failing.options), 1);
+    assert.equal(schemaRuns(failing).length, 1);
+    assert.equal(failing.output.join('\n').includes(password), false);
+    // Production baseline of 0030 is still refused, with --only never reachable from baseline.
+    const baseline = productionHarness();
+    assert.equal(run(['baseline', replayFile, '--yes', ...productionArgs], baseline.options), 1);
+    assert.equal(baseline.calls.length, 0);
+});
+
+test('without --only a production apply still runs every pending file, and --only works on preview with the same pin', () => {
+    const full = productionHarness();
+    assert.equal(run(['apply', '--yes', ...productionArgs], full.options), 0);
+    assert.equal(schemaRuns(full).length, EXPLICIT_FILES.length - 1);
+    const preview = previewHarness();
+    assert.equal(run(['apply', '--only', replayFile, '--yes', ...previewArgs], preview.options), 0);
+    assert.equal(schemaRuns(preview).length, 1);
+    assert.ok(preview.calls.at(-1).args.some(arg => arg.startsWith('DO $pin$')));
 });
