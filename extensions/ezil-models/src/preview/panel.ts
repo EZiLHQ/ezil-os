@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import { record, validateDoc, validateMintReply } from './contract';
 import { SelectionContext } from './context';
 import { previewHtml } from './html';
-import { persistedState, safePath, safeUrl, viewport, type PreviewState } from './state';
+import { persistedState, safePath, transportUrl, viewport, type PreviewState } from './state';
 
 export const MINT_TIMEOUT_MS = 240_000;
 const token = () => randomBytes(16).toString('base64url');
@@ -97,18 +97,18 @@ export class PreviewPanel implements vscode.Disposable {
             case 'retry': case 'reload':
                 if (this.minting) return;
                 if (!this.ready || this.expiresAt <= Date.now() + 1000) await this.mint();
-                else { this.invalidate(); this.showStatus('Loading preview…'); this.post({ type: 'load', url: safeUrl(this.origin, this.state.path) }); }
+                else { this.invalidate(); this.showStatus('Loading preview…'); this.post({ type: 'load', url: transportUrl(this.origin, this.state.path) }); }
                 return;
             case 'history':
                 if (!this.origin || this.minting) return;
                 this.state.path = safePath(message.path);
                 if (this.expiresAt <= Date.now() + 1000 || !this.ready) await this.mint();
-                else { this.invalidate(); this.post({ type: 'load', url: safeUrl(this.origin, this.state.path) }); }
+                else { this.invalidate(); this.post({ type: 'load', url: transportUrl(this.origin, this.state.path) }); }
                 return;
             case 'copy': case 'external':
                 if (!this.origin) return;
                 try {
-                    const url = safeUrl(this.origin, this.state.path);
+                    const url = transportUrl(this.origin, this.state.path);
                     if (message.type === 'copy') { await vscode.env.clipboard.writeText(url); this.showStatus('Safe preview URL copied.'); }
                     else this.showStatus(await vscode.env.openExternal(vscode.Uri.parse(url)) ? 'Opened preview in browser.' : 'Could not open the preview in a browser.');
                 } catch { this.showStatus('Could not open or copy the safe preview URL.'); }

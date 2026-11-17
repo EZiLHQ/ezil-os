@@ -33,7 +33,7 @@ function browser(script = previewScript) {
     runInNewContext(script, {
         window, document: { getElementById: (id: string) => elements.get(id) },
         acquireVsCodeApi: () => ({ postMessage: (value: unknown) => posts.push(value), setState: (state: unknown) => states.push(state) }),
-        URL, crypto: webcrypto, Uint8Array, btoa,
+        URL, URLSearchParams, crypto: webcrypto, Uint8Array, btoa,
         setTimeout: (fn: () => void, ms: number) => { const timer = { fn, ms, cancelled: false }; timers.push(timer); return timer; },
         clearTimeout: (timer?: { cancelled: boolean }) => { if (timer) timer.cancelled = true; },
     });
@@ -62,6 +62,9 @@ test('browser persists only safe state and waits for ready after every load', ()
     b.send('navigate', { doc: { ...sel.doc, path: '/next' } });
     expect(b.states.at(-1)).toEqual({ open: true, path: '/next', viewport: '390x844' });
     b.elements.get('back')!.emit('click'); expect(b.posts.at(-1)).toEqual({ type: 'history', path: '/pricing' });
+    b.host({ type: 'load', url: `${origin}/preview/pricing` });
+    b.frame.emit('load'); b.send('ready', { doc: sel.doc });
+    b.elements.get('forward')!.emit('click'); expect(b.posts.at(-1)).toEqual({ type: 'history', path: '/next' });
 });
 
 test('browser forwards only valid frame messages in the current document and user-selected mode', () => {

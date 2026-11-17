@@ -15,6 +15,11 @@ version="$(bun -e 'process.stdout.write(JSON.parse(require("fs").readFileSync(pr
 out="$here/dist/ezil-models-${version}.vsix"
 tmp="$(mktemp -d "$here/.build-XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
+if [[ "$mode" == --check ]]; then
+  bun run "$src/src/preview/build-script.ts" --check
+else
+  bun run "$src/src/preview/build-script.ts"
+fi
 bun build "$src/src/extension.ts" --target=node --format=cjs --external=vscode --outfile="$tmp/extension.js"
 python3 "$here/package-vsix.py" "$src" "$tmp/extension.js" "$tmp/extension.vsix"
 if [[ "$mode" == --check ]]; then

@@ -19,6 +19,12 @@ export function persistedState(value: unknown): PreviewState {
 export function safeUrl(origin: string, path: unknown): string {
     return new URL(origin).origin + safePath(path);
 }
+/** Cookie-authenticated navigation/copy URL; the toolbar displays safeUrl instead. */
+export function transportUrl(origin: string, path: unknown): string {
+    const url = new URL(origin);
+    const prefix = /^3002-[a-z0-9-]{1,80}-app\./.test(url.hostname) ? '/preview' : '';
+    return url.origin + prefix + safePath(path);
+}
 
 /** Inspector paths are the source of truth for history; host loads reconcile with the requested entry. */
 export class PreviewHistory {

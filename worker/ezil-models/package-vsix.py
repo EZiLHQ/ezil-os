@@ -6,6 +6,7 @@ node_modules or build logs can enter the image.
 """
 import json
 from pathlib import Path
+import re
 import sys
 from xml.sax.saxutils import escape, quoteattr
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
@@ -13,6 +14,13 @@ from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 source, bundle, output = map(Path, sys.argv[1:])
 package = json.loads((source / "package.json").read_text())
 assert package["license"] == "AGPL-3.0-only"
+assert any(command["command"] == "ezil.preview.open" for command in package["contributes"]["commands"]), "missing preview command"
+bundle_bytes = bundle.read_bytes()
+bundle_text = bundle_bytes.decode()
+assert re.search(r'registerWebviewPanelSerializer\(\s*[\'"]ezil\.preview[\'"]', bundle_text), "missing preview runtime serializer"
+for message in ("hello", "mode", "ready", "navigate", "changed", "select", "state"):
+    # The embedded browser script is a JavaScript string, including its escaped quotes.
+    assert f"ezil.preview.{message}" in bundle_text, f"missing preview runtime message: {message}"
 properties = {
     "Microsoft.VisualStudio.Code.Engine": package["engines"]["vscode"],
     "Microsoft.VisualStudio.Code.ExtensionKind": ",".join(package["extensionKind"]),
@@ -40,7 +48,7 @@ types = '<?xml version="1.0" encoding="utf-8"?><Types xmlns="http://schemas.open
 for ext, mime in {"js": "application/javascript", "json": "application/json", "md": "text/markdown", "txt": "text/plain", "vsixmanifest": "text/xml"}.items():
     types += f'<Default Extension="{ext}" ContentType="{mime}"/>'
 types += '</Types>'
-files = {"extension.vsixmanifest": manifest.encode(), "[Content_Types].xml": types.encode(), "extension/dist/extension.js": bundle.read_bytes()}
+files = {"extension.vsixmanifest": manifest.encode(), "[Content_Types].xml": types.encode(), "extension/dist/extension.js": bundle_bytes}
 for src, dest in {"package.json": "package.json", "README.md": "readme.md", "LICENSE": "LICENSE.txt", "ATTRIBUTIONS.md": "ATTRIBUTIONS.md", "schema/models.schema.json": "schema/models.schema.json", "examples/models.example.json": "examples/models.example.json"}.items():
     files[f"extension/{dest}"] = (source / src).read_bytes()
 with ZipFile(output, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
