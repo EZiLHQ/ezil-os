@@ -3,6 +3,7 @@
 
 Usage: render-env.py [staging|production]; no argument means staging.
 """
+import base64
 import json
 import os
 from pathlib import Path
@@ -51,7 +52,23 @@ EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET AWS_REGIONS AWS_MAX_RUNNING
 BILLING_FUNDING_URL BILLING_FUNDING_HMAC_SECRET
 EZIL_OS_FEEDBACK EZIL_OS_FEEDBACK_SCREENSHOTS FEEDBACK_PILOT_EMAILS FEEDBACK_ADMIN_EMAILS FEEDBACK_SMTP2GO_API_KEY
 UNIVERSE_PROJECT_REPO_ORIGIN
+EZIL_DELEGATED_COMPUTER_READS EZIL_DELEGATION_ISSUER EZIL_DELEGATION_AUDIENCE
+EZIL_DELEGATION_PUBLIC_JWKS EZIL_DELEGATION_CLIENT_IDS
 """.split())
+# Delegated computer reads (app/src/server/api/delegation-core.ts): the receiver treats a missing or
+# unsafe pin as "not configured" and anything but the exact gate value "enabled" as off, so the
+# renderer refuses what the receiver would silently ignore. Off unless the gate is "enabled".
+DELEGATION_GATE = "EZIL_DELEGATED_COMPUTER_READS"
+DELEGATION_PINS = ("EZIL_DELEGATION_ISSUER", "EZIL_DELEGATION_AUDIENCE",
+                   "EZIL_DELEGATION_PUBLIC_JWKS", "EZIL_DELEGATION_CLIENT_IDS")
+# Caddy serves exactly these two names for production OS; the audience is the origin the MCP signs.
+PRODUCTION_OS_ORIGINS = ("https://os.ezil.work", "https://os-prod.ezil.work")
+BARE_HTTPS_ORIGIN = re.compile(
+    r"https://(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?::([1-9][0-9]{0,4}))?")
+JWK_MEMBERS = frozenset(("kty", "crv", "x", "y", "kid", "alg", "use"))
+MAX_PINNED_KEYS = 3
+P256_P = 2**256 - 2**224 + 2**192 + 2**96 - 1
+P256_B = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b
 # Exactly the two region-derived names used by aws-config.ts / aws-clients.ts.
 REGIONAL = re.compile(
     r"EZIL_AWS_(?:MAX_RUNNING|APP_CALLER_ROLE_ARN)_"
@@ -77,6 +94,7 @@ def validate(values, environment="staging"):
             raise RenderError("Newline or NUL refused")
     if len(values["CRON_SECRET"]) < 32:
         raise RenderError("CRON_SECRET requires at least 32 characters")
+    validate_delegation(values, environment)
     if environment == "production":
         validate_production(values)
     elif any(marker in value for value in values.values() for marker in PRODUCTION_MARKERS):
@@ -86,6 +104,80 @@ def validate(values, environment="staging"):
     elif "BILLING_FUNDING_URL" in values and values["BILLING_FUNDING_URL"] != STAGING_FUNDING_URL:
         raise RenderError("Staging BILLING_FUNDING_URL must be https://ai-staging.ezil.work")
     return values
+
+
+def bare_https_origin(value):
+    """Mirror bareHttpsOrigin(): https, lowercase host, optional non-default port, nothing else."""
+    match = BARE_HTTPS_ORIGIN.fullmatch(value)
+    return bool(match) and (match.group(1) is None or 0 < int(match.group(1)) < 65536 and match.group(1) != "443")
+
+
+def public_key_member(value):
+    """A canonical unpadded base64url string of exactly 32 bytes, as an integer."""
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", value):
+        raise RenderError("Delegation JWKS coordinates must be canonical base64url of 32 bytes")
+    raw = base64.urlsafe_b64decode(value + "=")
+    if base64.urlsafe_b64encode(raw).rstrip(b"=").decode() != value:
+        raise RenderError("Delegation JWKS coordinates must be canonical base64url of 32 bytes")
+    return int.from_bytes(raw, "big")
+
+
+def delegation_jwks(raw):
+    def no_duplicates(pairs):
+        names = [name for name, _ in pairs]
+        if len(set(names)) != len(names):
+            raise RenderError("Delegation JWKS refuses duplicate members")
+        return dict(pairs)
+
+    def no_constant(_):
+        raise RenderError("Delegation JWKS refuses non-JSON numbers")
+
+    try:
+        jwks = json.loads(raw, object_pairs_hook=no_duplicates, parse_constant=no_constant)
+    except (ValueError, RecursionError):
+        raise RenderError("EZIL_DELEGATION_PUBLIC_JWKS must be JSON")
+    keys = jwks.get("keys") if isinstance(jwks, dict) and set(jwks) == {"keys"} else None
+    if not isinstance(keys, list) or not 1 <= len(keys) <= MAX_PINNED_KEYS:
+        raise RenderError('EZIL_DELEGATION_PUBLIC_JWKS must be {"keys":[1 to 3 keys]}')
+    kids = set()
+    for jwk in keys:
+        # Public members only: a private member (`d`) means a secret was pasted into a public slot.
+        if not isinstance(jwk, dict) or not set(jwk) <= JWK_MEMBERS:
+            raise RenderError("Delegation JWKS accepts public key members only")
+        if jwk.get("kty") != "EC" or jwk.get("crv") != "P-256" or jwk.get("alg", "ES256") != "ES256" \
+                or jwk.get("use", "sig") != "sig":
+            raise RenderError("Delegation JWKS keys must be ES256 P-256 signing keys")
+        kid = jwk.get("kid")
+        if not isinstance(kid, str) or not 1 <= len(kid) <= 128 or kid in kids:
+            raise RenderError("Delegation JWKS needs unique kid values of 1 to 128 characters")
+        kids.add(kid)
+        x, y = public_key_member(jwk.get("x")), public_key_member(jwk.get("y"))
+        if x >= P256_P or y >= P256_P or (y * y - (x ** 3 - 3 * x + P256_B)) % P256_P:
+            raise RenderError("Delegation JWKS point is not on P-256")
+
+
+def validate_delegation(values, environment):
+    """All-or-nothing, strict, public-only; the gate defaults to off and never turns on by omission."""
+    gate = values.get(DELEGATION_GATE)
+    if gate not in (None, "enabled", "disabled"):
+        raise RenderError(f"{DELEGATION_GATE} must be exactly enabled or disabled")
+    present = [pin for pin in DELEGATION_PINS if pin in values]
+    if len(present) not in (0, len(DELEGATION_PINS)) or gate == "enabled" and not present:
+        raise RenderError("Delegation requires all four pins: issuer, audience, public JWKS and client IDs")
+    if not present:
+        return
+    issuer, audience = values["EZIL_DELEGATION_ISSUER"], values["EZIL_DELEGATION_AUDIENCE"]
+    if not bare_https_origin(issuer) or not bare_https_origin(audience) or issuer == audience:
+        raise RenderError("Delegation issuer and audience must be different bare https origins")
+    in_production = audience in PRODUCTION_OS_ORIGINS
+    if environment == "production" and not in_production:
+        raise RenderError("Production delegation audience must be a production OS origin")
+    if environment != "production" and in_production:
+        raise RenderError("Staging refuses a production delegation audience")
+    clients = [client for client in re.split(r"[\s,]+", values["EZIL_DELEGATION_CLIENT_IDS"]) if client]
+    if not clients or any(len(client) > 512 or client == "*" for client in clients):
+        raise RenderError("Delegation client IDs must be explicit, non-empty and not a wildcard")
+    delegation_jwks(values["EZIL_DELEGATION_PUBLIC_JWKS"])
 
 
 def validate_production(values):

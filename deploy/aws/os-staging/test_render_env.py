@@ -1,3 +1,4 @@
+import base64
 import contextlib
 import importlib.util
 import io
@@ -253,6 +254,164 @@ class ProductionEnvironmentTests(unittest.TestCase):
             self.assertNotIn("synthetic-password", output.getvalue())
             with self.assertRaises(renderer.RenderError):
                 renderer.render(self.values, Path(temporary), "staging")
+
+
+def b64url(number):
+    return base64.urlsafe_b64encode(number.to_bytes(32, "big")).rstrip(b"=").decode()
+
+
+# The published P-256 base point: a public constant, never live key material.
+P256_G = {"kty": "EC", "crv": "P-256", "alg": "ES256", "use": "sig", "kid": "synthetic-kid",
+          "x": b64url(0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296),
+          "y": b64url(0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5)}
+DELEGATION_GATE = "EZIL_DELEGATED_COMPUTER_READS"
+DELEGATION_NAMES = (DELEGATION_GATE, "EZIL_DELEGATION_ISSUER", "EZIL_DELEGATION_AUDIENCE",
+                    "EZIL_DELEGATION_PUBLIC_JWKS", "EZIL_DELEGATION_CLIENT_IDS")
+
+
+def delegation(keys=(P256_G,), **overrides):
+    values = {DELEGATION_GATE: "enabled", "EZIL_DELEGATION_ISSUER": "https://mcp.example.invalid",
+              "EZIL_DELEGATION_AUDIENCE": "https://os-prod.ezil.work",
+              "EZIL_DELEGATION_PUBLIC_JWKS": json.dumps({"keys": list(keys)}, separators=(",", ":")),
+              "EZIL_DELEGATION_CLIENT_IDS": "synthetic-client-a, synthetic-client-b"}
+    values.update(overrides)
+    return {name: value for name, value in values.items() if value is not None}
+
+
+class DelegationEnvironmentTests(unittest.TestCase):
+    """Config for the receiver in app/src/server/api/delegation-core.ts; its rejections fail rendering here."""
+
+    def setUp(self):
+        self.staging = {key: "synthetic-value-never-log-1234567890" for key in renderer.REQUIRED}
+        self.production = {**self.staging, "NEXT_PUBLIC_SUPABASE_URL": "https://db.ezil.work",
+                           "SUPABASE_DATABASE_URL": PRODUCTION_DB, "STRIPE_PUBLISHABLE_KEY": "pk_live_synthetic",
+                           "STRIPE_SECRET": "sk_live_synthetic"}
+
+    def refused(self, extra, environment="production"):
+        base = self.production if environment == "production" else self.staging
+        with self.assertRaises(renderer.RenderError):
+            renderer.validate({**base, **extra}, environment)
+
+    def test_names_are_optional_and_absence_changes_nothing(self):
+        self.assertTrue(set(DELEGATION_NAMES) <= renderer.OPTIONAL)
+        self.assertFalse(set(DELEGATION_NAMES) & renderer.REQUIRED)
+        for base, environment in ((self.staging, "staging"), (self.production, "production")):
+            self.assertEqual(renderer.validate(dict(base), environment), base)
+
+    def test_complete_set_is_accepted_in_production_with_either_origin(self):
+        for audience in renderer.PRODUCTION_OS_ORIGINS:
+            values = {**self.production, **delegation(EZIL_DELEGATION_AUDIENCE=audience)}
+            self.assertEqual(renderer.validate(dict(values), "production"), values)
+        two = delegation(keys=(P256_G, {**P256_G, "kid": "rotated"}))
+        renderer.validate({**self.production, **two}, "production")
+        bare = {key: value for key, value in P256_G.items() if key not in ("alg", "use")}
+        renderer.validate({**self.production, **delegation(keys=(bare,))}, "production")
+
+    def test_gate_is_exact_and_never_enabled_by_omission(self):
+        renderer.validate({**self.production, **delegation(**{DELEGATION_GATE: "disabled"})}, "production")
+        renderer.validate({**self.production, **delegation(**{DELEGATION_GATE: None})}, "production")
+        renderer.validate({**self.production, DELEGATION_GATE: "disabled"}, "production")
+        for gate in ("true", "1", "Enabled", "ENABLED", "on", "yes", "enabled "):
+            with self.subTest(gate=gate):
+                self.refused(delegation(**{DELEGATION_GATE: gate}))
+        self.refused({DELEGATION_GATE: "enabled"})
+
+    def test_pins_are_all_or_nothing(self):
+        for name in DELEGATION_NAMES[1:]:
+            with self.subTest(missing=name):
+                self.refused(delegation(**{name: None}))
+                self.refused(delegation(**{name: None, DELEGATION_GATE: "disabled"}))
+
+    def test_issuer_and_audience_are_one_bare_https_origin_each(self):
+        for key in ("EZIL_DELEGATION_ISSUER", "EZIL_DELEGATION_AUDIENCE"):
+            for bad in ("http://mcp.example.invalid", "https://mcp.example.invalid/", "https://mcp.example.invalid/x",
+                        "https://mcp.example.invalid?x=1", "https://mcp.example.invalid#x", "https://Mcp.example.invalid",
+                        "https://u:p@mcp.example.invalid", "https://mcp.example.invalid:443", "https://mcp.example.invalid:0",
+                        "https://mcp.example.invalid:99999", "https://a.invalid,https://b.invalid", "https://a.invalid https://b.invalid",
+                        "https://bad_host.invalid", "https://.invalid", "https://a..invalid", "mcp.example.invalid", "*"):
+                with self.subTest(key=key, bad=bad):
+                    self.refused(delegation(**{key: bad}))
+        renderer.validate({**self.production, **delegation(EZIL_DELEGATION_ISSUER="https://mcp.example.invalid:8443")}, "production")
+        self.refused(delegation(EZIL_DELEGATION_ISSUER="https://os-prod.ezil.work"))
+
+    def test_client_ids_are_explicit(self):
+        for bad in (" , ", "*", "synthetic-a *", "x" * 513):
+            with self.subTest(bad=bad):
+                self.refused(delegation(EZIL_DELEGATION_CLIENT_IDS=bad))
+        renderer.validate({**self.production, **delegation(EZIL_DELEGATION_CLIENT_IDS="x" * 512)}, "production")
+
+    def test_jwks_is_strict_and_public_only(self):
+        jwks = lambda *keys, **top: json.dumps({"keys": list(keys), **top})
+        bad = {
+            "not JSON": "keys", "NaN": '{"keys":[NaN]}', "array": "[]", "no keys": jwks(), "four keys": jwks(
+                *({**P256_G, "kid": f"k{n}"} for n in range(4))),
+            "extra top member": jwks(P256_G, jku="https://x.invalid"), "keys not a list": '{"keys":{}}',
+            "private member": jwks({**P256_G, "d": "A" * 43}), "extra member": jwks({**P256_G, "x5u": "https://x.invalid"}),
+            "key not object": jwks("k"), "wrong kty": jwks({**P256_G, "kty": "OKP"}), "wrong crv": jwks({**P256_G, "crv": "P-384"}),
+            "wrong alg": jwks({**P256_G, "alg": "RS256"}), "null alg": jwks({**P256_G, "alg": None}),
+            "wrong use": jwks({**P256_G, "use": "enc"}), "no kid": jwks({k: v for k, v in P256_G.items() if k != "kid"}),
+            "empty kid": jwks({**P256_G, "kid": ""}), "long kid": jwks({**P256_G, "kid": "k" * 129}),
+            "numeric kid": jwks({**P256_G, "kid": 1}), "duplicate kid": jwks(P256_G, P256_G),
+            "duplicate member": '{"keys":[%s],"keys":[%s]}' % (json.dumps(P256_G), json.dumps(P256_G)),
+            "padded x": jwks({**P256_G, "x": P256_G["x"] + "="}), "short y": jwks({**P256_G, "y": P256_G["y"][:-1]}),
+            "standard base64 x": jwks({**P256_G, "x": P256_G["x"][:-1] + "+"}),
+            "non canonical x": jwks({**P256_G, "x": P256_G["x"][:-1] + "B"}), "missing y": jwks(
+                {k: v for k, v in P256_G.items() if k != "y"}), "x not string": jwks({**P256_G, "x": 1}),
+            "off curve": jwks({**P256_G, "y": b64url(2)}), "x out of range": jwks({**P256_G, "x": b64url(2**256 - 1)}),
+        }
+        for name, raw in bad.items():
+            with self.subTest(name=name):
+                self.refused(delegation(EZIL_DELEGATION_PUBLIC_JWKS=raw))
+        self.refused(delegation(EZIL_DELEGATION_PUBLIC_JWKS="[" * 100000))
+
+    def test_errors_do_not_echo_values(self):
+        marker = "synthetic-secret-in-config"
+        # Any plain string is a valid client ID, so the client list is exercised with a wildcard instead.
+        for key, value in [(name, marker) for name in DELEGATION_NAMES[:-1]] + [
+                ("EZIL_DELEGATION_CLIENT_IDS", marker + " *")]:
+            with self.subTest(key=key):
+                with self.assertRaises(renderer.RenderError) as caught:
+                    renderer.validate({**self.production, **delegation(**{key: value})}, "production")
+                self.assertNotIn(marker, str(caught.exception))
+
+    def test_environments_stay_separate(self):
+        staging_values = delegation(EZIL_DELEGATION_AUDIENCE="https://os-staging.ezil.work")
+        renderer.validate({**self.staging, **staging_values}, "staging")
+        self.refused(staging_values)  # Production refuses a staging audience (and any staging host).
+        for audience in renderer.PRODUCTION_OS_ORIGINS:
+            self.refused(delegation(EZIL_DELEGATION_AUDIENCE=audience), "staging")
+        self.refused(delegation(EZIL_DELEGATION_AUDIENCE="https://os.ezil.org"))
+        self.refused(delegation(EZIL_DELEGATION_ISSUER="https://mcp.13-203-99-168.sslip.io"))
+        self.refused(delegation(EZIL_DELEGATION_CLIENT_IDS="https://ai-staging.ezil.work"))
+        # Disabled does not bypass the check: a leftover wrong-environment pin still fails closed.
+        self.refused(delegation(EZIL_DELEGATION_AUDIENCE="https://os-staging.ezil.work", **{DELEGATION_GATE: "disabled"}))
+
+    def test_nearby_or_private_names_remain_refused(self):
+        for key in ("EZIL_DELEGATION_PRIVATE_JWKS", "EZIL_DELEGATION_PRIVATE_KEY", "EZIL_DELEGATION_SIGNING_KEY",
+                    "EZIL_DELEGATION_JWKS", "EZIL_DELEGATION_PUBLIC_JWKS_URL", "EZIL_DELEGATED_COMPUTER_WRITES",
+                    "EZIL_DELEGATION_CLIENT_ID", "EZIL_DELEGATION_SECRET"):
+            with self.subTest(key=key):
+                self.refused({key: "synthetic"})
+
+    def test_render_forwards_verbatim_prints_names_only_and_keeps_cron_unchanged(self):
+        values = {**self.production, **delegation(EZIL_DELEGATION_CLIENT_IDS="synthetic-${NO_EXPAND}-#-client")}
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            output = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                if os.geteuid() != 0:
+                    stack.enter_context(patch.object(renderer.os, "geteuid", return_value=0))
+                    stack.enter_context(patch.object(renderer.os, "chown"))
+                    stack.enter_context(patch.object(renderer.os, "fchown"))
+                with contextlib.redirect_stdout(output):
+                    renderer.render(values, Path(temporary), "production")
+            rendered = dict(line.split("=", 1) for line in (Path(temporary) / "app.env").read_text().splitlines())
+            cron = (Path(temporary) / "cron.env").read_text()
+        self.assertEqual(rendered, values)
+        self.assertEqual(output.getvalue().splitlines(), sorted(values))
+        for name in ("EZIL_DELEGATION_PUBLIC_JWKS", "EZIL_DELEGATION_CLIENT_IDS", "EZIL_DELEGATION_ISSUER"):
+            self.assertNotIn(values[name], output.getvalue())
+        self.assertNotIn("DELEGAT", cron)
+        self.assertEqual(rendered[DELEGATION_GATE], "enabled")
 
 
 if __name__ == "__main__":
