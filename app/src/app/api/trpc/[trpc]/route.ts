@@ -14,12 +14,21 @@ import { createTRPCContext } from '@/server/api/trpc';
  */
 export const maxDuration = 300;
 
+/**
+ * Whether a request carries a body. A delegated read must not: its assertion binds the URL alone. Absent
+ * Content-Length (or "0") and Transfer-Encoding with no stream means none.
+ */
+const hasBody = (req: Request) => req.body !== null || req.headers.has('transfer-encoding')
+    || (req.headers.get('content-length') ?? '0') !== '0';
+
 const handler = (req: Request) =>
     fetchRequestHandler({
         endpoint: '/api/trpc',
         req,
         router: appRouter,
-        createContext: () => createTRPCContext({ headers: req.headers }),
+        // The actual request line, for an `EZiL-Delegation` request only to bind against (GET reads). It does not
+        // change cookie or Bearer handling.
+        createContext: () => createTRPCContext({ headers: req.headers, delegationRequest: { method: req.method, url: req.url, hasBody: hasBody(req) } }),
         onError:
             process.env.NODE_ENV === 'development'
                 ? ({ path, error }) => {
