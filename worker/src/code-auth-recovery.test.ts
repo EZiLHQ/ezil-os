@@ -96,7 +96,7 @@ describe('unavailable AWS Code origin', () => {
       const h = setup(), res = (await handleAwsBrowserHost(req, new URL(req.url), h.d))!;
       expect(res.status).toBe(502); expect(await res.json()).toEqual({ ok: false, error: 'aws_origin_unavailable' }); expect(h.counts()[1]).toBe(0);
     }
-    const other = new Request(base.replace('aws-8443-', 'aws-3002-') + '/', { headers: { 'sec-fetch-dest': 'iframe', cookie: `ezil_preview=${await mintPreviewCookie(secret, sid)}` } });
+    const other = new Request(base.replace('aws-8443-', 'aws-3002-') + '/', { headers: { 'sec-fetch-dest': 'iframe', cookie: `ezil_preview=${await mintPreviewCookie(secret, sid, undefined, 'app')}` } });
     const h = setup(), res = (await handleAwsBrowserHost(other, new URL(other.url), h.d))!;
     expect(res.status).toBe(503); const body = await res.text();
     expect(body).toContain('ezil.preview.state'); expect(body).not.toContain('ezil.preview.ready');

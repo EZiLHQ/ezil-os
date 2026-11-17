@@ -26,7 +26,7 @@ import {
   type FetchLike,
 } from './aws-origin';
 import { mintPreviewBootstrapToken, mintPreviewCookie, type PreviewTokenV2Claims } from './hmac';
-import { expectPreviewScriptsAllowed, previewPageScripts, previewExternalScriptAllowed, inspectorCspPolicies } from './code-preview-bridge-test-helpers';
+import { expectPreviewScriptsAllowed, previewPageScripts, previewExternalScriptAllowed, inspectorCspPolicies } from './code-preview-bridge-helpers.test';
 
 const KEY = decodeControlKey(vectors.controlKeyBase64)!;
 const SECRET = 'aws-origin-test-secret';
@@ -496,7 +496,7 @@ describe('AWS Code bootstrap: folder and ezil_mint (per-tab folder continuity)',
     expect(desk.headers.get('location')).toBe('/desk?x=1');
   });
   it('Code and every other browser port retain cookie-only bootstrap and request auth', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     for (const port of AWS_EDGE_PORTS.filter(p => p !== 3002)) {
       const res = await boot(port, '&path=%2Fdesk%3Fx%3D1');
       expect(res.status).toBe(302); expect(res.headers.get('location')).toBe('/desk?x=1');
@@ -529,7 +529,7 @@ describe('AWS app inspector v1', () => {
   async function app(path: string, options: { authenticated?: boolean; status?: number; type?: string; fail?: boolean; zoneRoot?: string; body?: string | null; csp?: string } = {}) {
     const zoneRoot = options.zoneRoot ?? 'ezil.org';
     const url = new URL(`https://aws-3002-${SID}-aws.${zoneRoot}${path}`);
-    const cookie = options.authenticated === false ? '' : await mintPreviewCookie(SECRET, SID);
+    const cookie = options.authenticated === false ? '' : await mintPreviewCookie(SECRET, SID, undefined, 'app');
     let fetched = 0;
     const forwarded: string[] = [];
     // A browser that drops a cookie omits it; an explicit empty credential is invalid.
@@ -583,7 +583,7 @@ describe('AWS app inspector v1', () => {
     }
   });
   for (const fallback of [false, true]) it(`loads the inspector through its real auth gate using ${fallback ? 'query fallback' : 'cookie'}`, async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const path = '/?keep=1' + (fallback ? '&ezil_pv=' + encodeURIComponent(cookie) : '');
     const page = await app(path, { authenticated: !fallback }); expect(page.response.status).toBe(200);
     expect(new URL(page.forwarded[0]).search).toBe('?keep=1');

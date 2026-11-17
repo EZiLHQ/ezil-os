@@ -24,7 +24,7 @@
 import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
-import { expectPreviewScriptsAllowed, previewPageScripts, previewExternalScriptAllowed, inspectorCspPolicies } from './code-preview-bridge-test-helpers';
+import { expectPreviewScriptsAllowed, previewPageScripts, previewExternalScriptAllowed, inspectorCspPolicies } from './code-preview-bridge-helpers.test';
 
 import {
   previewInspectorScript,
@@ -225,12 +225,12 @@ describe('ezil_preview cookie (mint/verify)', () => {
   });
 
   it('rejects the cookie against a different sandboxId', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     expect(await verifyPreviewCookie(cookie, [SECRET], SID2)).toBe(false);
   });
 
   it('rejects a tampered cookie (bit-flipped hmac)', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const tampered = cookie.slice(0, -1) + (cookie.endsWith('0') ? '1' : '0');
     expect(await verifyPreviewCookie(tampered, [SECRET], SID)).toBe(false);
   });
@@ -244,6 +244,16 @@ describe('ezil_preview cookie (mint/verify)', () => {
   it('rejects a missing/malformed cookie when a secret is configured', async () => {
     expect(await verifyPreviewCookie(undefined, [SECRET], SID)).toBe(false);
     expect(await verifyPreviewCookie('not-enough-parts', [SECRET], SID)).toBe(false);
+  });
+
+  it('🔴 an app value never verifies as a Code/desktop value of the same sandbox, nor the reverse', async () => {
+    const app = await mintPreviewCookie(SECRET, SID, undefined, 'app');
+    const code = await mintPreviewCookie(SECRET, SID);
+    expect(await verifyPreviewCookie(app, [SECRET], SID, 'app')).toBe(true);
+    expect(await verifyPreviewCookie(app, [SECRET], SID)).toBe(false);
+    expect(await verifyPreviewCookie(code, [SECRET], SID, 'app')).toBe(false);
+    // Same shape either way: nothing about the value tells project code which host it opens.
+    expect(app.split('.')).toHaveLength(3); expect(app.split('.')[0]).toBe(SID);
   });
 
   it('local dev: mints an unsigned placeholder and accepts anything when no secret configured', async () => {
@@ -1043,7 +1053,7 @@ describe('handlePreviewProxy', () => {
   });
 
   it('proxies through with a valid cookie and injects the shim into HTML', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const sandbox = fakeContainerFetcher((url) => {
       expect(url).toContain(`127.0.0.1:${APP_PREVIEW_PORT}/about`);
       return new Response('<html><head></head><body>hi</body></html>', {
@@ -1061,8 +1071,20 @@ describe('handlePreviewProxy', () => {
     expect(body).toContain('preview-inspector.js');
   });
 
+  it('🔴 never forwards client-chosen Code-bridge routing headers to the app container', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
+    let seen: Headers | undefined;
+    const sandbox = fakeContainerFetcher((_url, init) => { seen = new Headers(init?.headers); return new Response('ok'); });
+    const request = new Request(`https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/api`, { headers: {
+      cookie: `${PREVIEW_COOKIE_NAME}=${cookie}`, 'x-ezil-running-code': '1', 'cf-container-target-port': '8443', 'x-app': 'keep',
+    } });
+    expect((await handlePreviewProxy(request, sandbox, SID, [SECRET], '/api')).status).toBe(200);
+    expect(seen?.has('x-ezil-running-code')).toBe(false); expect(seen?.has('cf-container-target-port')).toBe(false);
+    expect(seen?.get('x-app')).toBe('keep');
+  });
+
   it('returns the diagnostic 503 page when the container connection fails', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const sandbox: ContainerFetcher = {
       async containerFetch() {
         throw new Error('connect ECONNREFUSED 127.0.0.1:3002');
@@ -1079,7 +1101,7 @@ describe('handlePreviewProxy', () => {
   });
 
   it('accepts a valid `ezil_pv` query param when the cookie is missing (Safari ITP fallback)', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const sandbox = fakeContainerFetcher(() => new Response('ok'));
     const request = new Request(
       `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview/?${PREVIEW_COOKIE_QUERY_PARAM}=${encodeURIComponent(cookie)}`,
@@ -1089,7 +1111,7 @@ describe('handlePreviewProxy', () => {
   });
 
   for (const status of [200, 201, 299, 301, 400, 404, 500, 502, 503, 504]) it(`app HTML status ${status} preserves the document and only 2xx can become ready`, async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const page = `https://3002-${SID}-app.ezil.org/preview/`;
     const html = '<html><head></head><body>Original upstream document</body></html>';
     const sandbox = fakeContainerFetcher(() => new Response(html, { status, headers: { 'content-type': 'text/html', 'content-security-policy': "script-src 'self'" } }));
@@ -1110,7 +1132,7 @@ describe('handlePreviewProxy', () => {
   });
 
   for (const fallback of [false, true]) it(`loads the inspector through its real auth gate using ${fallback ? 'query fallback' : 'cookie'}`, async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID), origin = `https://3002-${SID}-app.ezil.org`;
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app'), origin = `https://3002-${SID}-app.ezil.org`;
     const page = `${origin}/preview/${fallback ? '?ezil_pv=' + encodeURIComponent(cookie) : ''}`;
     const headers = fallback ? {} : { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` };
     const sandbox = fakeContainerFetcher(() => new Response('<html><head></head><body>App</body></html>', { headers: { 'content-type': 'text/html', 'content-security-policy': "default-src 'self'; script-src-elem 'self'" } }));
@@ -1125,7 +1147,7 @@ describe('handlePreviewProxy', () => {
     expect((await handlePreviewInspectorJs(new Request(`${origin}/preview-inspector.js`), SID, [SECRET])).status).toBe(401);
   });
   for (const csp of inspectorCspPolicies) it(`authorizes the actual external inspector narrowly under CSP: ${csp}`, async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID), origin = `https://3002-${SID}-app.ezil.org`;
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app'), origin = `https://3002-${SID}-app.ezil.org`;
     const page = `${origin}/preview/?ezil_pv=${encodeURIComponent(cookie)}`;
     const upstream = new Headers({ 'content-type': 'text/html', 'content-security-policy': csp });
     const sandbox = fakeContainerFetcher(() => new Response('<head></head><body>App</body>', { headers: upstream }));
@@ -1142,7 +1164,7 @@ describe('handlePreviewProxy', () => {
     expect(policy.split(',')).toHaveLength(csp.split(',').length);
   });
   it('preserves HTML statuses that cannot carry a response body', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const request = new Request(`https://3002-${SID}-app.ezil.org/preview/`, { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } });
     for (const status of [204, 205, 304]) {
       const sandbox = fakeContainerFetcher(() => new Response(null, { status, headers: { 'content-type': 'text/html' } }));
@@ -1152,7 +1174,7 @@ describe('handlePreviewProxy', () => {
   });
 
   it('strips the `ezil_pv` fallback param before forwarding upstream', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const sandbox = fakeContainerFetcher((url) => {
       expect(url).not.toContain(PREVIEW_COOKIE_QUERY_PARAM);
       expect(url).toContain('keep=1');
@@ -1203,7 +1225,7 @@ describe('handlePreviewProxy', () => {
     });
 
     it('still injects RUNTIME_SHIM for target: app (the default) — no regression', async () => {
-      const cookie = await mintPreviewCookie(SECRET, SID);
+      const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
       const sandbox = fakeContainerFetcher(
         () =>
           new Response('<html><head></head><body>app</body></html>', {
@@ -1441,7 +1463,7 @@ describe('handlePreviewWsProxy', () => {
   });
 
   it('defaults to APP_PREVIEW_PORT when no port is given', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const sandbox = fakeWsSandbox();
     const request = new Request(`https://${APP_HOST}/preview-ws/`, {
       headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` },
@@ -1459,7 +1481,7 @@ describe('handlePreviewWsProxy', () => {
   });
 
   it('accepts the `ezil_pv` query-param fallback when the cookie is missing', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const sandbox = fakeWsSandbox();
     const request = new Request(
       `https://${APP_HOST}/preview-ws/?${PREVIEW_COOKIE_QUERY_PARAM}=${encodeURIComponent(cookie)}`,
@@ -1563,7 +1585,7 @@ describe('handlePreviewWsProxy', () => {
   });
 
   it('keeps `preview.local` for target: app — the dev server never learns the bridge host', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const sandbox = fakeWsSandbox();
     const request = new Request(`https://${APP_HOST}/preview-ws/`, {
       headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` },
@@ -1571,6 +1593,17 @@ describe('handlePreviewWsProxy', () => {
     await handlePreviewWsProxy(request, sandbox, SID, [SECRET], '/');
     expect(sandbox.calls[0]?.headers['x-forwarded-host']).toBe(APP_FORWARDED_HOST);
     expect(sandbox.calls[0]?.headers['x-forwarded-host']).not.toContain(SID);
+  });
+
+  it('🔴 an app socket never forwards client-chosen Code-bridge routing headers to the sandbox', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
+    const sandbox = fakeWsSandbox();
+    const request = new Request(`https://${APP_HOST}/preview-ws/`, { headers: {
+      cookie: `${PREVIEW_COOKIE_NAME}=${cookie}`, 'x-ezil-running-code': '1', 'cf-container-target-port': String(CODE_PREVIEW_PORT),
+    } });
+    await handlePreviewWsProxy(request, sandbox, SID, [SECRET], '/');
+    expect(sandbox.calls[0]?.headers['x-ezil-running-code']).toBeUndefined();
+    expect(sandbox.calls[0]?.headers['cf-container-target-port']).toBeUndefined();
   });
 
   it('🔴 drops a client-supplied `Forwarded` header, which outranks x-forwarded-host', async () => {
@@ -1619,7 +1652,7 @@ describe('handlePreviewInspectorJs', () => {
   });
 
   it('serves the inspector script with a valid cookie', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const request = new Request(
       `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-inspector.js`,
       { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } },
@@ -1630,7 +1663,7 @@ describe('handlePreviewInspectorJs', () => {
   });
 
   it('accepts the `ezil_pv` query-param fallback when the cookie is missing', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const request = new Request(
       `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-inspector.js?${PREVIEW_COOKIE_QUERY_PARAM}=${encodeURIComponent(cookie)}`,
     );

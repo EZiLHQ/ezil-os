@@ -248,9 +248,20 @@ export const PREVIEW_COOKIE_NAME = 'ezil_preview';
 export const PREVIEW_COOKIE_TTL_S = 60 * 60;
 
 /**
+ * Who a preview cookie value is for. The user's own app (`'app'`, port 3002) runs project code that can read its
+ * `?ezil_pv=` fallback from `location`, so its value is signed over a separate `app:` domain and is refused by the
+ * Code/desktop hosts of the same sandbox, whose values keep the original payload (`'default'`).
+ */
+export type PreviewCookieAudience = 'app' | 'default';
+
+const previewCookiePayload = (sandboxId: string, ts: string | number, audience: PreviewCookieAudience) =>
+  audience === 'app' ? `app:${sandboxId}.${ts}` : `${sandboxId}.${ts}`;
+
+/**
  * Mint the `ezil_preview` cookie value: `<sandboxId>.<ts>.<hex_hmac>`,
  * `hmac = sha256(secret, "<sandboxId>.<ts>")` — same shape as Azure's
  * `<session_id>.<ts>.<hmac>`, with `sandboxId` standing in for `session_id`.
+ * An `'app'` value signs `"app:<sandboxId>.<ts>"` instead (same shape).
  * When no secret is configured (local dev), returns an unsigned placeholder
  * (`dev.<ts>.nohmac`) that `verifyPreviewCookie` also accepts in that mode.
  */
@@ -258,11 +269,12 @@ export async function mintPreviewCookie(
   secret: string | undefined,
   sandboxId: string,
   now: number = Date.now(),
+  audience: PreviewCookieAudience = 'default',
 ): Promise<string> {
   if (!secret || !secret.trim()) {
     return `dev.${now}.nohmac`;
   }
-  const payload = `${sandboxId}.${now}`;
+  const payload = previewCookiePayload(sandboxId, now, audience);
   const sig = await hmacSha256Hex(secret, payload);
   return `${sandboxId}.${now}.${sig}`;
 }
@@ -279,6 +291,7 @@ export async function verifyPreviewCookie(
   cookie: string | undefined,
   secrets: string[],
   sandboxId: string,
+  audience: PreviewCookieAudience = 'default',
 ): Promise<boolean> {
   const candidates = secrets.filter((s) => s && s.trim());
   if (candidates.length === 0) return true; // local dev: verification disabled
@@ -291,7 +304,7 @@ export async function verifyPreviewCookie(
   const ts = Number(tsRaw);
   if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > PREVIEW_COOKIE_TTL_S * 1000) return false;
 
-  const payload = `${cookieSandboxId}.${tsRaw}`;
+  const payload = previewCookiePayload(cookieSandboxId, tsRaw, audience);
   let matched = false;
   for (const candidate of candidates) {
     const expected = await hmacSha256Hex(candidate, payload);

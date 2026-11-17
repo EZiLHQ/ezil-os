@@ -741,15 +741,15 @@ export async function resolveAppPreviewAuth(
   if (!secrets.some(s => s && s.trim())) return true;
   const cookie = readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME);
   const direct = url.searchParams.getAll(PREVIEW_COOKIE_QUERY_PARAM);
-  if (cookie !== undefined && !await verifyPreviewCookie(cookie, secrets, sandboxId)) return false;
-  if (direct.length && (direct.length !== 1 || !await verifyPreviewCookie(direct[0], secrets, sandboxId))) return false;
+  if (cookie !== undefined && !await verifyPreviewCookie(cookie, secrets, sandboxId, 'app')) return false;
+  if (direct.length && (direct.length !== 1 || !await verifyPreviewCookie(direct[0], secrets, sandboxId, 'app'))) return false;
   if (cookie !== undefined || direct.length) return true;
 
   let referer: URL;
   try { referer = new URL(request.headers.get('referer') ?? ''); } catch { return false; }
   if (referer.origin !== url.origin || referer.username || referer.password) return false;
   const tokens = referer.searchParams.getAll(PREVIEW_COOKIE_QUERY_PARAM);
-  if (tokens.length !== 1 || !await verifyPreviewCookie(tokens[0], secrets, sandboxId)) return false;
+  if (tokens.length !== 1 || !await verifyPreviewCookie(tokens[0], secrets, sandboxId, 'app')) return false;
   const dest = new URL(url);
   dest.username = ''; dest.password = ''; dest.hash = '';
   // A path-only Location beginning // would redirect the bearer to another host.
@@ -769,6 +769,16 @@ export function stripPreviewReferer(headers: Headers): void {
     const credential = /^(ezil_pv|ezil_mint|token|access_token|id_token|refresh_token|code|state|session|sid|key|api_key|apikey|secret|password|pass|auth|authorization|signature|sig)$|_token$/i;
     if (url.username || url.password || [...url.searchParams.keys()].some(k => credential.test(k))) headers.delete('referer');
   } catch { headers.delete('referer'); }
+}
+
+/**
+ * Never let a client choose Worker-internal routing. The sandbox Durable Object treats `x-ezil-running-code: 1`
+ * plus a `cf-container-target-port` of the Code port as the authenticated Code bridge (index.ts); only the Code
+ * dispatcher may set the first, and the sandbox SDK sets the second. A browser on any bridge host sends neither.
+ */
+export function stripInternalRoutingHeaders(headers: Headers): void {
+  headers.delete('x-ezil-running-code');
+  headers.delete('cf-container-target-port');
 }
 
 /** Strip the `ezil_pv` fallback query param before forwarding a request upstream. */
@@ -916,7 +926,9 @@ export async function handlePreviewBootstrap(
   let destPath = url.searchParams.get('path') || '/';
   if (!destPath.startsWith('/')) destPath = `/${destPath}`;
 
-  const cookie = await mintPreviewCookie(cookieSecret, sandboxId);
+  // The app's value is readable by project code (`?ezil_pv=`), so it is minted for the app alone and can never
+  // open the same sandbox's code-server.
+  const cookie = await mintPreviewCookie(cookieSecret, sandboxId, Date.now(), target === 'app' ? 'app' : 'default');
   // `Partitioned` (CHIPS) is what lets Chrome/Edge actually send this
   // `SameSite=None` cookie back on a third-party-iframe request at all —
   // without it, current/upcoming Chrome versions block the cookie outright
@@ -1034,6 +1046,7 @@ export async function handlePreviewProxy(
 
   const forwardHeaders = new Headers(request.headers);
   if (target === 'app') stripPreviewReferer(forwardHeaders);
+  stripInternalRoutingHeaders(forwardHeaders);
   forwardHeaders.delete('host');
   forwardHeaders.delete('content-length');
   const strippedCookie = stripPreviewCookie(request.headers.get('cookie'));
@@ -1228,6 +1241,7 @@ export async function handlePreviewWsProxy(
 
   const forwardHeaders = new Headers(request.headers);
   if (target === 'app') stripPreviewReferer(forwardHeaders);
+  stripInternalRoutingHeaders(forwardHeaders);
   forwardHeaders.delete('host');
   const strippedCookie = stripPreviewCookie(request.headers.get('cookie'));
   if (strippedCookie) forwardHeaders.set('cookie', strippedCookie);

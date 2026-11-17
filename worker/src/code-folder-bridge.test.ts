@@ -414,7 +414,8 @@ describe('AWS code port (handleAwsBrowserHost)', () => {
   });
   const call = async (port: number, path: string, answer: Response, origins: string[] = [SHELL], init: RequestInit = {}) => {
     const fetch: FetchLike = async () => answer;
-    const cookie = `ezil_preview=${await mintPreviewCookie(SECRET, SID)}`;
+    // The app port's value is minted for the app alone (hmac.ts PreviewCookieAudience).
+    const cookie = `ezil_preview=${await mintPreviewCookie(SECRET, SID, undefined, port === 3002 ? 'app' : 'default')}`;
     const host = `aws-${port}-${SID}-aws.${ROOT}`;
     const headers = new Headers(init.headers);
     headers.set('cookie', cookie);

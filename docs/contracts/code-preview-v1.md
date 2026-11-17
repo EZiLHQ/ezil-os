@@ -93,6 +93,12 @@ ready-capable inspector. Any other HTML status gets the diagnostic responder, wh
 `<script src>` for the inspector must carry the same `ezil_pv` value. Without it, a browser that drops the preview
 cookie loads the page but gets a 401 for the inspector.
 
+**App credential audience.** Project code in the previewed app can read the app's `ezil_pv` value from `location`.
+The app host's cookie/fallback value is therefore signed for the app alone (`hmac.ts` `PreviewCookieAudience`,
+payload `app:<sandboxId>.<ts>`, on both providers), and the same sandbox's Code and desktop hosts refuse it as a cookie
+and as a query fallback. Neither bridge forwards client-supplied Worker-internal routing headers
+(`x-ezil-running-code`, `cf-container-target-port`) to a container.
+
 **Transport path vs displayed path.** `doc.path` is the in-app path that is displayed and copied. The Cloudflare bridge
 serves the app under `/preview/*`. Any host that navigates the frame itself (Back, Forward, Reload) must map the
 displayed path to the transport URL with `transportUrl(origin, path)`:

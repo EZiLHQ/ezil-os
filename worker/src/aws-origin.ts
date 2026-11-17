@@ -421,7 +421,7 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
       const mint = codeFolderMint(url.searchParams.get(CODE_FOLDER_MINT_PARAM));
       if (mint) dest.searchParams.set(CODE_FOLDER_MINT_PARAM, mint);
     }
-    const cookie = await mintPreviewCookie(secrets[0], sandboxId, deps.nowMs());
+    const cookie = await mintPreviewCookie(secrets[0], sandboxId, deps.nowMs(), port === APP_PREVIEW_PORT ? 'app' : 'default');
     // App previews alone accept fallback auth when an embedded browser drops the cookie.
     if (port === APP_PREVIEW_PORT) dest.searchParams.set(PREVIEW_COOKIE_QUERY_PARAM, cookie);
     const attrs = [`${PREVIEW_COOKIE_NAME}=${cookie}`, `Max-Age=${PREVIEW_COOKIE_TTL_S}`, 'HttpOnly', 'Secure', 'SameSite=None', 'Partitioned', 'Path=/'];

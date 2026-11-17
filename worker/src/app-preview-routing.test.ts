@@ -8,7 +8,7 @@ import { mintPreviewBootstrapToken, mintPreviewCookie } from './hmac';
 import * as preview from './preview-bridge';
 import { codeShellOriginsFor } from './code-folder-bridge';
 import { isAiProxyPath } from './ai-proxy';
-import { previewPageScripts } from './code-preview-bridge-test-helpers';
+import { previewPageScripts } from './code-preview-bridge-helpers.test';
 import vectors from './aws-gateway.vectors.json';
 
 // No SDK is installed in this lane. Transpile the two production dispatchers byte-for-byte;
@@ -240,7 +240,7 @@ for (const provider of ['cf', 'aws'] as const) describe(`${provider} ordinary ap
   });
 
   it('cookie auth still works; no-token HTML installs no request wrappers', async () => {
-    const f = await fixture(provider), cookie = await mintPreviewCookie(SECRET, SID);
+    const f = await fixture(provider), cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const response = await f.get('/', { headers: { cookie: `ezil_preview=${cookie}; app=keep`, referer: f.origin + '/plain' } });
     expect(response.status).toBe(200);
     const html = await response.text(), t = runTransport(html, new URL('/', f.origin));
@@ -264,8 +264,14 @@ describe('CF app routing segregation', () => {
     expect((await f.get('/preview-bootstrap?token=invalid', { headers: { referer: page.href } })).status).toBe(401);
     expect((await f.get('/preview-inspector.js?ezil_pv=' + encodeURIComponent(page.searchParams.get('ezil_pv')!))).headers.get('content-type')).toContain('javascript');
     const code = `https://8443-${SID}-code.${ROOT}`;
-    expect((await f.get(code + '/asset.js', { headers: { referer: code + '/?ezil_pv=' + page.searchParams.get('ezil_pv') } })).status).toBe(401);
-    expect((await f.get(code + '/asset.js', { headers: { cookie: `ezil_preview=${page.searchParams.get('ezil_pv')}` } })).status).toBe(200);
+    const appToken = page.searchParams.get('ezil_pv')!;
+    expect((await f.get(code + '/asset.js', { headers: { referer: code + '/?ezil_pv=' + appToken } })).status).toBe(401);
+    // The app's value is readable by project code (location.search), so it never opens this sandbox's code-server,
+    // as a cookie or as the Code query fallback; only Code's own value does.
+    expect((await f.get(code + '/asset.js', { headers: { cookie: `ezil_preview=${appToken}` } })).status).toBe(401);
+    expect((await f.get(code + '/asset.js?ezil_pv=' + encodeURIComponent(appToken))).status).toBe(401);
+    expect(f.calls).toHaveLength(0);
+    expect((await f.get(code + '/asset.js', { headers: { cookie: `ezil_preview=${await mintPreviewCookie(SECRET, SID)}` } })).status).toBe(200);
     expect(f.calls).toHaveLength(1); expect(f.calls[0].port).toBe(8443);
     expect(await f.get(`https://api-desktop.${ROOT}/src/main.js`, { headers: { referer: page.href } })).toBeNull();
     expect(f.calls).toHaveLength(1);

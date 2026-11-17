@@ -924,7 +924,8 @@ describe('GET /preview-status is no longer anonymous', () => {
   it('ACCEPTS the ezil_preview cookie minted by /preview-bootstrap', async () => {
     const { mintPreviewCookie } = await import('./hmac');
     const { binding, calls } = fakeSandboxNamespace({});
-    const cookie = await mintPreviewCookie(SECRET, SANDBOX_NAME);
+    // /preview-bootstrap mints the app host's value for the app alone (hmac.ts PreviewCookieAudience).
+    const cookie = await mintPreviewCookie(SECRET, SANDBOX_NAME, undefined, 'app');
     const res = await worker.fetch(
       new Request(`https://${APP_HOST}/preview-status`, { headers: { cookie: `ezil_preview=${cookie}` } }),
       { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
@@ -3046,7 +3047,7 @@ describe('code-server bridge host (8443-<id>-code.ezil.org)', () => {
     expect(calls.containerFetch).toHaveLength(0);
   });
 
-  it('leaves the APP host 404 contract untouched (no accidental catch-all there)', async () => {
+  it('routes an APP host root path to the fixed app port only, under the same cookie (code-preview-v1 transport)', async () => {
     const { binding, calls } = fakeSandboxNamespace({});
     const { mintPreviewBootstrapToken } = await import('./hmac');
     const token = await mintPreviewBootstrapToken(SECRET, SANDBOX_NAME);
@@ -3057,14 +3058,19 @@ describe('code-server bridge host (8443-<id>-code.ezil.org)', () => {
     const cookie = /ezil_preview=([^;]+)/.exec(boot.headers.get('set-cookie') ?? '')?.[1] ?? '';
     expect(cookie.length).toBeGreaterThan(0);
 
+    // Ordinary app assets are requested from the root (`/_next/...`, `/assets/...`); since the app-host routing change
+    // they reach the user's dev server on 3002 and nothing else. Without the cookie they still never leave the Worker.
+    const anonymous = await worker.fetch(new Request(`https://${APP_HOST}/_next/static/chunk.js`), { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET });
+    expect(anonymous.status).toBe(401);
+    expect(calls.containerFetch).toHaveLength(0);
     const res = await worker.fetch(
       new Request(`https://${APP_HOST}/_next/static/chunk.js`, {
         headers: { cookie: `ezil_preview=${cookie}` },
       }),
       { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
     );
-    expect(res.status).toBe(404);
-    expect(calls.containerFetch).toHaveLength(0);
+    expect(res.status).not.toBe(401);
+    expect(calls.containerFetch.map(c => [c.port, new URL(c.url).pathname])).toEqual([[3002, '/_next/static/chunk.js']]);
   });
 
   it('still injects RUNTIME_SHIM on the APP host (no cross-target regression)', async () => {
@@ -3082,8 +3088,9 @@ describe('code-server bridge host (8443-<id>-code.ezil.org)', () => {
       { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
     );
     const body = await res.text();
+    // The shim keeps original socket paths (the app host routes them itself) and loads the inspector.
     expect(body).toContain('window.WebSocket');
-    expect(body).toContain('/preview-ws');
+    expect(body).toContain('/preview-inspector.js');
   });
 
   it('the APP host HMR socket also crosses via wsConnect, still under `preview.local`', async () => {

@@ -7166,7 +7166,7 @@ async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<R
     // itself verifies. Local dev (no secret configured) is unaffected: both
     // verifiers short-circuit to "allowed" exactly as before.
     const cookie = readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME);
-    const cookieOk = await verifyPreviewCookie(cookie, secrets, sandboxId);
+    const cookieOk = await verifyPreviewCookie(cookie, secrets, sandboxId, 'app');
     if (!cookieOk) {
       const tokenAuth = await verifyPreviewBootstrapToken(
         url.searchParams.get('token') ?? undefined,
