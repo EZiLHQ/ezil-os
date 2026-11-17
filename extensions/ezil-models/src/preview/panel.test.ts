@@ -94,7 +94,7 @@ test('extension validates selections and generations, marks stale once, and invo
     const attachments = sent.filter(([id]) => id === '_ezil.chatAddContext').map(([, value]) => value);
     expect(attachments).toHaveLength(2); expect(attachments[0].id).toBe(attachments[1].id); expect(attachments[1].stale).toBe(true);
     await preview.receive({ type: 'copy', url: 'https://evil.test/?token=PRIVATE' }); await preview.receive({ type: 'external' });
-    expect(copied).toEqual([`${origin}/next?tab=2`]); expect(external).toEqual(copied);
+    expect(copied).toEqual([`${origin}/preview/next?tab=2`]); expect(external).toEqual(copied);
     expect(JSON.stringify(copied)).not.toMatch(/PRIVATE|token=/);
     expect(sent.every(([id]) => ['_ezil.previewMint', '_ezil.chatAddContext'].includes(id))).toBe(true);
     expect(panel.messages.some(message => message.text === 'Selection added to chat.')).toBe(true);
@@ -113,7 +113,7 @@ test('serializer re-mints and restores only the sanitized path and viewport', as
 test('a working frame reloads without minting; expiry only triggers mint when navigation is requested', async () => {
     const { panel, preview } = create(); await preview.start(); await preview.receive({ type: 'ready', doc });
     await preview.receive({ type: 'reload' });
-    expect(sent).toHaveLength(1); expect(panel.messages.at(-1)).toEqual({ type: 'load', url: `${origin}/pricing` });
+    expect(sent).toHaveLength(1); expect(panel.messages.at(-1)).toEqual({ type: 'load', url: `${origin}/preview/pricing` });
     await preview.receive({ type: 'ready', doc });
     const now = spyOn(Date, 'now').mockReturnValue(Date.now() + 120_000);
     try {
@@ -122,6 +122,25 @@ test('a working frame reloads without minting; expiry only triggers mint when na
         expect(sent).toHaveLength(2); expect(panel.messages.at(-1).url).toContain('/preview-bootstrap?token=PRIVATE');
     } finally { now.mockRestore(); }
 });
+
+for (const [host, prefix] of [[origin, '/preview'], ['https://aws-3002-guac-u1-c1-aws.ezil.org', '']]) {
+    test(`reload, back/forward, copy and external use credential-free transport URLs on ${host}`, async () => {
+        reply = () => ({ ...minted(), url: `${host}/preview-bootstrap?token=PRIVATE` });
+        const { panel, preview } = create(); await preview.start();
+        for (const path of ['/pricing?tab=2', '/', '/pricing?tab=2']) {
+            await preview.receive({ type: 'ready', doc });
+            await preview.receive({ type: 'history', path: `${path}${path.includes('?') ? '&' : '?'}ezil_pv=PRIVATE#/details?token=PRIVATE&tab=2` });
+            const safe = `${host}${prefix}${path}#/details?tab=2`;
+            expect(panel.messages.at(-1)).toEqual({ type: 'load', url: safe });
+            await preview.receive({ type: 'copy' }); await preview.receive({ type: 'external' });
+            expect(copied.at(-1)).toBe(safe); expect(external.at(-1)).toBe(safe);
+            await preview.receive({ type: 'ready', doc: { ...doc, path } });
+            await preview.receive({ type: 'reload' });
+            expect(panel.messages.at(-1)).toEqual({ type: 'load', url: `${host}${prefix}${path}` });
+        }
+        expect(sent.filter(([id]) => id === '_ezil.previewMint')).toHaveLength(1);
+    });
+}
 
 test('later origin changes are refused without changing CSP or navigating the frame', async () => {
     const { panel, preview } = create(); await preview.start();

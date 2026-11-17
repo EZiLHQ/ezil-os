@@ -1,4 +1,4 @@
-/** Frozen code-preview-v1 boundaries. Shared by the extension and the browser bundle. */
+/** Code-preview-v1 boundaries. Shared by the extension and the browser bundle. */
 export const TOKEN = /^[A-Za-z0-9_-]{22}$/;
 const CONTROLS = /[\u0000-\u001f\u007f-\u009f]/g;
 const SECRET_PARAM = /^(?:ezil_pv|ezil_mint|token|access_token|id_token|refresh_token|code|state|session|sid|key|api_key|apikey|secret|password|pass|auth|authorization|signature|sig)$|_token$/i;
@@ -52,6 +52,14 @@ export function sanitizeUrl(input: string, max = 512): string {
         if (!['https:', 'http:'].includes(url.protocol)) return '';
         url.username = ''; url.password = '';
         for (const key of [...url.searchParams.keys()]) if (SECRET_PARAM.test(key)) url.searchParams.delete(key);
+        const fragment = url.hash.slice(1);
+        const query = fragment.startsWith('/') ? fragment.indexOf('?') : -1;
+        if (query >= 0 || (!fragment.startsWith('/') && fragment.includes('='))) {
+            const params = new URLSearchParams(query >= 0 ? fragment.slice(query + 1) : fragment);
+            for (const key of [...params.keys()]) if (SECRET_PARAM.test(key)) params.delete(key);
+            const rest = params.toString();
+            url.hash = query >= 0 ? fragment.slice(0, query) + (rest ? `?${rest}` : '') : rest;
+        } else url.hash = fragment;
         return (absolute ? url.href : `${url.pathname}${url.search}${url.hash}`).slice(0, max);
     } catch { return ''; }
 }
@@ -71,6 +79,8 @@ function stringMap(value: unknown, allowed: string[], max: number): value is Rec
     return record(value) && keys(value, allowed) && Object.values(value).every(item => string(item, max));
 }
 export function validateSelection(value: unknown): value is Selection {
+    // Refuse oversized/unserializable records before inspecting any schema fields.
+    try { if ((JSON.stringify(value)?.length ?? Infinity) > 12000) return false; } catch { return false; }
     if (!record(value) || !keys(value, ['doc', 'viewport', 'el', 'ancestors']) || !validateDoc(value.doc)) return false;
     const { viewport, el, ancestors } = value;
     if (!record(viewport) || !keys(viewport, ['w', 'h', 'dpr']) || !integer(viewport.w, 1) || !integer(viewport.h, 1)
@@ -87,12 +97,20 @@ export function validateSelection(value: unknown): value is Selection {
     // contenteditable/autocomplete are deliberately absent from this schema: the inspector must exclude them.
     const excluded = ['input', 'textarea', 'select'].includes(el.tag as string) || (el.attrs as Record<string, string> | undefined)?.type?.toLowerCase() === 'password';
     if (excluded && (el.text !== '' || (el.attrs as Record<string, string> | undefined)?.placeholder !== undefined)) return false;
-    // v1 specifies no eid length limit. Rendering below caps the complete attachment.
-    if (el.source !== undefined && (!record(el.source) || !keys(el.source, ['eid']) || !string(el.source.eid, Number.MAX_SAFE_INTEGER))) return false;
+    if (el.source !== undefined && (!record(el.source) || !keys(el.source, ['eid']) || !string(el.source.eid, 200) || el.source.eid.length === 0)) return false;
     return Array.isArray(ancestors) && ancestors.length <= 6 && ancestors.every(item => record(item) && keys(item, ['tag', 'id', 'classes']) && identity(item));
 }
 
-function markdown(value: string): string { return value.replace(/[\\`*_{}\[\]()<>#+.!|~-]/g, '\\$&'); }
+/** Bound the input first, then fit whole escaped characters within the field's output budget. */
+function markdown(value: string, max: number): string {
+    let result = '';
+    for (const char of value.slice(0, max)) {
+        const escaped = char.replace(/[\\`*_{}\[\]()<>#+.!|~-]/g, '\\$&');
+        if (result.length + escaped.length > max) break;
+        result += escaped;
+    }
+    return result;
+}
 export function attachmentName(sel: Selection): string {
     return `<${sel.el.tag}>${sel.el.name ? ` "${sel.el.name}"` : ''} · ${sel.doc.path}`.slice(0, 80);
 }
@@ -100,17 +118,18 @@ export function renderSelectionContext(sel: Selection, options: { stale: boolean
     const { el, doc, viewport } = sel;
     const lines = [options.stale ? '**Stale snapshot: the live preview has changed since this selection.**\n' : '',
         'Selected element (DOM snapshot from the live preview; not a source location)',
-        `Page: ${markdown(doc.path)} — ${markdown(doc.title)}`,
-        `Element: ${markdown(`<${el.tag}>`)}${el.name ? ` — ${markdown(el.name)}` : ''}`,
-        `Identity: ${markdown(JSON.stringify({ id: el.id, classes: el.classes, role: el.role }))}`,
-        `Selector: ${markdown(el.selector)}`];
-    if (el.source) lines.push(`Explicit data-eid/data-oid: ${markdown(el.source.eid)}`);
-    lines.push(`Text: ${markdown(el.text)}`, `Viewport: ${viewport.w}×${viewport.h}, DPR ${viewport.dpr}`,
+        `Page: ${markdown(doc.path, 512)} — ${markdown(doc.title, 120)}`,
+        `Element: ${markdown(`<${el.tag}>`, 68)}${el.name ? ` — ${markdown(el.name, 120)}` : ''}`,
+        `Identity: ${markdown(JSON.stringify({ id: el.id, classes: el.classes, role: el.role }), 256)}`,
+        `Selector: ${markdown(el.selector, 512)}`];
+    if (el.source) lines.push(`Explicit data-eid/data-oid: ${markdown(el.source.eid, 200)}`);
+    lines.push(`Text: ${markdown(el.text, 300)}`, `Viewport: ${viewport.w}×${viewport.h}, DPR ${viewport.dpr}`,
         `Bounds: x=${el.rect.x}, y=${el.rect.y}, w=${el.rect.w}, h=${el.rect.h}`,
         `Document: ${doc.gen}, mutation ${doc.mut}`,
-        `Ancestors (nearest first): ${markdown(sel.ancestors.map(item => item.tag + (item.id ? `#${item.id}` : '') + item.classes.map(c => `.${c}`).join('')).join(' > '))}`,
-        `Attributes: ${markdown(JSON.stringify(el.attrs ?? {}))}`, `Styles: ${markdown(JSON.stringify(el.styles))}`);
-    return lines.filter(Boolean).join('\n\n').slice(0, 4000);
+        `Ancestors (nearest first): ${markdown(sel.ancestors.map(item => item.tag + (item.id ? `#${item.id}` : '') + item.classes.map(c => `.${c}`).join('')).join(' > '), 256)}`,
+        `Attributes: ${markdown(JSON.stringify(el.attrs ?? {}), 400)}`, `Styles: ${markdown(JSON.stringify(el.styles), 400)}`);
+    // Field budgets total 3144; fixed labels and validated numeric metadata leave the result below 4000.
+    return lines.filter(Boolean).join('\n\n');
 }
 export function validateAttachment(value: unknown): value is Attachment {
     return record(value) && keys(value, ['v', 'id', 'name', 'value', 'stale']) && value.v === 1

@@ -1,6 +1,6 @@
 import { attachmentName, renderSelectionContext, validateAttachment, validateDoc, validateSelection, type Attachment, type PreviewDoc, type Selection } from './contract';
 
-interface OpenSelection { sel: Selection; id: string; stale: boolean; added: boolean }
+interface OpenSelection { sel: Selection; id: string; added: boolean }
 /** Effects are serialized so a slow initial add can never overwrite its subsequent stale update. */
 export class SelectionContext {
     private doc: PreviewDoc | undefined;
@@ -19,8 +19,9 @@ export class SelectionContext {
         if (!validateDoc(value)) return Promise.resolve();
         this.doc = value;
         for (const entry of this.selections.values()) {
-            if (entry.stale || (entry.sel.doc.gen === value.gen && entry.sel.doc.mut === value.mut)) continue;
-            entry.stale = true;
+            if (entry.sel.doc.gen === value.gen && entry.sel.doc.mut === value.mut && entry.sel.doc.path === value.path) continue;
+            // Forget it before queueing: later revisions must never re-add a removed attachment.
+            this.selections.delete(entry.id);
             void this.enqueue(async () => { if (entry.added) await this.send(entry, true); });
         }
         return this.effects;
@@ -31,14 +32,14 @@ export class SelectionContext {
             this.status('Selection ignored: the preview document has changed.');
             return Promise.resolve();
         }
-        const entry: OpenSelection = { sel: value, id: `ezil-preview:${this.token()}`, stale: false, added: false };
+        const entry: OpenSelection = { sel: value, id: `ezil-preview:${this.token()}`, added: false };
         this.selections.set(entry.id, entry);
         const added = this.enqueue(async () => {
             entry.added = await this.send(entry, false);
             if (!entry.added) this.selections.delete(entry.id);
         });
         // A mutation may have reached the host before the click message from the same document.
-        if (value.doc.mut !== this.doc.mut) return this.observe(this.doc);
+        if (value.doc.mut !== this.doc.mut || value.doc.path !== this.doc.path) return this.observe(this.doc);
         return added;
     }
     private async send(entry: OpenSelection, stale: boolean): Promise<boolean> {
