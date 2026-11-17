@@ -41,8 +41,8 @@ import { injectCodeDiagBridge } from './code-diag-bridge';
 import { injectCodeBillingBridge } from './code-billing-bridge';
 import { injectCodePreviewBridge } from './code-preview-bridge';
 import {
-  allowPreviewInlineScripts, buildDiagnosticResponse, injectPreviewDiagnostic, PREVIEW_INSPECTOR_LOADER,
-  previewInspectorScript, resolvePreviewAuth, stripFrameAncestors, stripPreviewQueryParam,
+  allowPreviewInlineScripts, buildDiagnosticResponse, injectPreviewDiagnostic, injectRuntimeShim, RUNTIME_SHIM, PREVIEW_COOKIE_QUERY_PARAM,
+  APP_PREVIEW_RESOURCE_HEADERS, previewInspectorScript, resolveAppPreviewAuth, stripFrameAncestors, stripPreviewQueryParam, stripPreviewReferer,
 } from './preview-bridge';
 import {
   PREVIEW_COOKIE_NAME,
@@ -326,6 +326,7 @@ export async function proxyToAwsOrigin(
     return unavailable();
   }
   const headers = new Headers(request.headers);
+  if (port === APP_PREVIEW_PORT) stripPreviewReferer(headers);
   headers.delete(AWS_GATEWAY_HEADER);
   headers.delete('x-ezil-auth');
   headers.delete('host');
@@ -421,18 +422,22 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
       if (mint) dest.searchParams.set(CODE_FOLDER_MINT_PARAM, mint);
     }
     const cookie = await mintPreviewCookie(secrets[0], sandboxId, deps.nowMs());
+    // App previews alone accept fallback auth when an embedded browser drops the cookie.
+    if (port === APP_PREVIEW_PORT) dest.searchParams.set(PREVIEW_COOKIE_QUERY_PARAM, cookie);
     const attrs = [`${PREVIEW_COOKIE_NAME}=${cookie}`, `Max-Age=${PREVIEW_COOKIE_TTL_S}`, 'HttpOnly', 'Secure', 'SameSite=None', 'Partitioned', 'Path=/'];
-    return new Response(null, { status: 302, headers: { location: dest.pathname + dest.search, 'set-cookie': attrs.join('; ') } });
+    return new Response(null, { status: 302, headers: { location: dest.pathname + dest.search, 'set-cookie': attrs.join('; '),
+      ...(port === APP_PREVIEW_PORT ? APP_PREVIEW_RESOURCE_HEADERS : {}) } });
   }
 
-  const cookieOk = port === APP_PREVIEW_PORT ? await resolvePreviewAuth(request, url, secrets, sandboxId)
+  const cookieOk = port === APP_PREVIEW_PORT ? await resolveAppPreviewAuth(request, url, secrets, sandboxId)
     : await verifyPreviewCookie(readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME), secrets, sandboxId);
+  if (cookieOk instanceof Response) return cookieOk;
   if (!cookieOk) return (port === CODE_PREVIEW_PORT ? codeAuthRecovery(request, deps.codeShellOrigins) : null)
-    ?? json({ ok: false, error: 'aws_preview_auth_required' }, 401);
+    ?? json({ ok: false, error: 'aws_preview_auth_required' }, 401, port === APP_PREVIEW_PORT ? APP_PREVIEW_RESOURCE_HEADERS : {});
   const inspectorOrigins = [`https://aws-${CODE_PREVIEW_PORT}-${sandboxId}-aws.${deps.zoneRoot}`, ...codeShellOriginsFor(deps.zoneRoot)];
   if (port === APP_PREVIEW_PORT && request.method === 'GET' && url.pathname === '/preview-inspector.js') {
     return new Response(previewInspectorScript(inspectorOrigins), { headers: {
-      'content-type': 'application/javascript; charset=utf-8', 'cache-control': 'private, no-store',
+      'content-type': 'application/javascript; charset=utf-8', ...APP_PREVIEW_RESOURCE_HEADERS,
     } });
   }
   const appDocument = port === APP_PREVIEW_PORT && request.method === 'GET'
@@ -485,6 +490,11 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
     // A fetch exception may contain its URL: never propagate or log it. The document gets the recovery UI.
     return originDown();
   }
+  if (port === APP_PREVIEW_PORT && answered.status !== 101) {
+    const headers = new Headers(answered.headers);
+    for (const [key, value] of Object.entries(APP_PREVIEW_RESOURCE_HEADERS)) headers.set(key, value);
+    answered = new Response(answered.body, { status: answered.status, statusText: answered.statusText, headers });
+  }
   if (port === CODE_PREVIEW_PORT && isWorkbenchDocumentRequest(request.method, url.pathname, request.headers.get('upgrade'))) {
     if (isOriginGatewayFailure(answered.status)) {
       // The tunnel's gateway (no connector for this epoch) or the host answered that code-server is not there.
@@ -510,10 +520,11 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
     if (csp) { const kept = stripFrameAncestors(csp); if (kept) headers.set('content-security-policy', kept); else headers.delete('content-security-policy'); }
     headers.set('cache-control', 'no-cache, no-store');
     const injected = isHtmlDocument(answered.status, answered.headers.get('content-type'))
-      ? html.replace(/<head\b[^>]*>/i, head => head + PREVIEW_INSPECTOR_LOADER)
+      ? injectRuntimeShim(html)
       : injectPreviewDiagnostic(html, inspectorOrigins);
     await allowPreviewInlineScripts(headers, isHtmlDocument(answered.status, answered.headers.get('content-type'))
-      ? PREVIEW_INSPECTOR_LOADER : injectPreviewDiagnostic('', inspectorOrigins));
+      ? RUNTIME_SHIM : injectPreviewDiagnostic('', inspectorOrigins),
+      isHtmlDocument(answered.status, answered.headers.get('content-type')) ? url.origin : undefined);
     return new Response(injected, {
       status: answered.status, statusText: answered.statusText, headers,
     });

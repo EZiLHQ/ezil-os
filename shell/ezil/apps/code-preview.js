@@ -38,7 +38,15 @@ export function attachPreviewMintBridge ({ iframe, frameUrl, computerId, mint })
     const pending = new Map(), seen = new Set(), times = [];
     let nonce, ready = false, detached = false;
     const live = () => ! detached && iframe.isConnected && iframe.src === frameUrl;
-    const abort = () => { for ( const controller of pending.values() ) controller.abort(); pending.clear(); };
+    const forget = id => {
+        const request = pending.get(id);
+        if ( ! request ) return;
+        pending.delete(id);
+        host.clearTimeout(request.timer);
+        return request;
+    };
+    const cancel = id => { forget(id)?.controller.abort(); };
+    const abort = () => { for ( const id of pending.keys() ) cancel(id); };
     function detach () {
         detached = true;
         ready = false;
@@ -65,20 +73,25 @@ export function attachPreviewMintBridge ({ iframe, frameUrl, computerId, mint })
             ready = true;
             return;
         }
-        if ( ! ready || d.type !== 'ezil.code.preview.mint' || keys.length !== 4
-            || ! keys.every(k => ['type', 'v', 'nonce', 'id'].includes(k)) || ! token(d.id) || seen.has(d.id) ) return;
+        if ( ! ready || keys.length !== 4
+            || ! keys.every(k => ['type', 'v', 'nonce', 'id'].includes(k)) || ! token(d.id) ) return;
+        // Source, origin and the current handshake bind this id to this Code frame's own computer.
+        if ( d.type === 'ezil.code.preview.cancel' ) { cancel(d.id); return; }
+        if ( d.type !== 'ezil.code.preview.mint' || seen.has(d.id) ) return;
         const at = Date.now();
         while ( times.length && times[0] <= at - 60000 ) times.shift();
         if ( times.length >= 6 ) return;
         times.push(at);
         seen.add(d.id);
         const controller = new AbortController(), boundNonce = nonce, frame = iframe.contentWindow;
-        pending.set(d.id, controller);
+        const request = { controller, timer: null };
+        pending.set(d.id, request);
         const answer = reply => {
             if ( ! live() ) { detach(); return; }
-            if ( controller.signal.aborted || nonce !== boundNonce || iframe.contentWindow !== frame ) return;
+            if ( pending.get(d.id) !== request || controller.signal.aborted || nonce !== boundNonce || iframe.contentWindow !== frame ) return;
             try { frame.postMessage({ type: 'ezil.code.preview.url', v: 1, nonce: boundNonce, id: d.id, ...reply }, origin); } catch { /* gone */ }
         };
+        request.timer = host.setTimeout(() => { answer({ error: 'timeout' }); cancel(d.id); }, 240000);
         void (async () => {
             try {
                 const result = await mint(computerId, { signal: controller.signal });
@@ -88,7 +101,7 @@ export function attachPreviewMintBridge ({ iframe, frameUrl, computerId, mint })
                     answer({ error: errorCode(result?.errorCode) ? result.errorCode : 'app_preview_unavailable' });
                 }
             } catch { answer({ error: 'app_preview_unavailable' }); }
-            finally { if ( pending.get(d.id) === controller ) pending.delete(d.id); }
+            finally { if ( pending.get(d.id) === request ) forget(d.id); }
         })();
     }
     host.addEventListener('message', onMessage);

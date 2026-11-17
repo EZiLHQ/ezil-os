@@ -8,14 +8,17 @@ const vectors = JSON.parse(readFileSync(new URL('../../docs/contracts/code-previ
 const SHELL = 'https://os.ezil.work', NONCE = 'AAAAAAAAAAAAAAAAAAAAAA', ID = 'BBBBBBBBBBBBBBBBBBBBBB';
 const hello = { type: 'ezil.code.preview.hello', v: 1, nonce: NONCE };
 function run({ origins = [SHELL], framed = true, throws = false } = {}) {
-  let now = 0;
+  let now = 0, nextTimer = 0;
+  const timers = new Map<number, { at: number; fn: Function }>();
   const posted: any[] = [], replies: any[] = [], listeners: Record<string, Function[]> = {};
   const parent = { postMessage(message: any, origin: string) { if (throws) throw Error('gone'); posted.push({ message: structuredClone(message), origin }); } };
   const window: any = { parent, addEventListener(t: string, f: Function) { (listeners[t] ??= []).push(f); },
     dispatchEvent(ev: any) { for (const f of listeners[ev.type] ?? []) f(ev); } };
   if (!framed) window.parent = window;
   class CustomEvent { constructor(public type: string, public options: any) {} get detail() { return this.options.detail; } }
-  const context = { window, URL, Date: { now: () => now }, CustomEvent };
+  const context = { window, URL, Date: { now: () => now }, CustomEvent,
+    setTimeout: (fn: Function, ms: number) => { const id = ++nextTimer; timers.set(id, { at: now + ms, fn }); return id; },
+    clearTimeout: (id: number) => timers.delete(id) };
   const globals = Object.keys(context);
   runInNewContext(codePreviewBridgeScript(origins), context);
   expect(Object.keys(context)).toEqual(globals);
@@ -27,7 +30,9 @@ function run({ origins = [SHELL], framed = true, throws = false } = {}) {
     window.dispatchEvent(event); return event.defaultPrevented;
   };
   const answer = (record: any, over: any = {}) => message({ type: 'ezil.code.preview.url', v: 1, nonce: NONCE, id: ID, ...record }, over);
-  return { posted, replies, message, ask, answer, advance: (ms: number) => { now += ms; } };
+  const cancel = (record: any = { v: 1, id: ID }) => window.dispatchEvent({ type: 'ezil-preview-mint-cancel', detail: typeof record === 'string' ? record : JSON.stringify(record) });
+  return { posted, replies, message, ask, answer, cancel, timers, close: () => window.dispatchEvent({ type: 'pagehide' }),
+    advance: (ms: number) => { now += ms; for (const [id, timer] of timers) if (timer.at <= now) { timers.delete(id); timer.fn(); } } };
 }
 
 describe('Code preview mint bridge', () => {
@@ -85,6 +90,33 @@ describe('Code preview mint bridge', () => {
     for (let i = 0; i < 12; i++) if (b.ask({ v: 1, id: String(i).padStart(22, 'A') })) accepted++;
     expect(accepted).toBe(9); b.advance(60000); expect(b.ask()).toBe(true);
     const down = run({ throws: true }); down.message(); expect(down.ask()).toBe(false);
+  });
+  it('relays a same-ID cancel once, ignores late replies and allows close/reopen with a fresh ID', () => {
+    const b = run(); b.message(); b.ask(); b.cancel(); b.cancel();
+    expect(b.posted.at(-1)).toEqual({ origin: SHELL, message: { type: 'ezil.code.preview.cancel', v: 1, nonce: NONCE, id: ID } });
+    expect(b.posted).toHaveLength(3); expect(b.timers.size).toBe(0);
+    b.answer(vectors.mintReply.accept[0]); expect(b.replies).toEqual([]); expect(b.ask()).toBe(false);
+    expect(b.ask({ v: 1, id: NONCE })).toBe(true);
+    b.answer({ ...vectors.mintReply.accept[0], id: NONCE }); expect(b.replies).toHaveLength(1); expect(b.timers.size).toBe(0);
+  });
+  it('rejects malformed, unknown and stale-owner cancels without dropping a live request', () => {
+    const b = run(); b.message(); b.ask();
+    for (const r of [null, [], '{', { v: 2, id: ID }, { v: 1, id: 'short' }, { v: 1, id: NONCE },
+      { v: 1, id: ID, computerId: 'other' }, { v: 1, id: ID, nonce: NONCE }]) b.cancel(r);
+    expect(b.posted).toHaveLength(2); b.answer(vectors.mintReply.accept[0]); expect(b.replies).toHaveLength(1);
+    const stale = run(); stale.message(); stale.ask(); stale.message({ ...hello, nonce: ID });
+    const count = stale.posted.length; stale.cancel(); expect(stale.posted).toHaveLength(count); expect(stale.timers.size).toBe(0);
+  });
+  it('cancellation is not starved by the post budget and timeout/pagehide release bounded pending work', () => {
+    const b = run(); b.message();
+    for (let i = 0; i < 9; i++) b.ask({ v: 1, id: String(i).padStart(22, 'A') });
+    expect(b.timers.size).toBe(9);
+    b.cancel({ v: 1, id: '0'.padStart(22, 'A') });
+    expect(b.posted.at(-1).message.type).toBe('ezil.code.preview.cancel'); expect(b.timers.size).toBe(8);
+    b.advance(239999); expect(b.timers.size).toBe(8); b.advance(1); expect(b.timers.size).toBe(0);
+    expect(b.posted.filter(p => p.message.type === 'ezil.code.preview.cancel')).toHaveLength(9);
+    b.ask(); b.close(); expect(b.timers.size).toBe(0); b.answer(vectors.mintReply.accept[0]);
+    expect(b.replies.every(r => r.error === 'timeout')).toBe(true);
   });
 });
 

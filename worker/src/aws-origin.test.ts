@@ -26,7 +26,7 @@ import {
   type FetchLike,
 } from './aws-origin';
 import { mintPreviewBootstrapToken, mintPreviewCookie, type PreviewTokenV2Claims } from './hmac';
-import { expectPreviewScriptsAllowed, previewPageScripts } from './code-preview-bridge-test-helpers';
+import { expectPreviewScriptsAllowed, previewPageScripts, previewExternalScriptAllowed, inspectorCspPolicies } from './code-preview-bridge-test-helpers';
 
 const KEY = decodeControlKey(vectors.controlKeyBase64)!;
 const SECRET = 'aws-origin-test-secret';
@@ -486,12 +486,23 @@ describe('AWS Code bootstrap: folder and ezil_mint (per-tab folder continuity)',
     expect(res.headers.get('location')).toBe('/');
   });
 
-  it('desktop and app ports are unchanged: their path query is theirs, folder and ezil_mint are ignored', async () => {
+  it('app fallback preserves the app query; bootstrap folder and ezil_mint are ignored on app/desktop ports', async () => {
     const app = await boot(3002, `&path=${encodeURIComponent('/files?folder=a')}&folder=%2Fetc&ezil_mint=abcdefghijklmnopqrstu_`);
     expect(app.status).toBe(302);
-    expect(app.headers.get('location')).toBe('/files?folder=a');
+    const location = new URL(app.headers.get('location')!, 'https://x');
+    expect(location.pathname).toBe('/files'); expect(location.searchParams.get('folder')).toBe('a');
+    expect(location.searchParams.has('ezil_pv')).toBe(true); expect(location.searchParams.has('ezil_mint')).toBe(false);
     const desk = await boot(8181, '&path=%2Fdesk%3Fx%3D1&folder=%2Fetc');
     expect(desk.headers.get('location')).toBe('/desk?x=1');
+  });
+  it('Code and every other browser port retain cookie-only bootstrap and request auth', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    for (const port of AWS_EDGE_PORTS.filter(p => p !== 3002)) {
+      const res = await boot(port, '&path=%2Fdesk%3Fx%3D1');
+      expect(res.status).toBe(302); expect(res.headers.get('location')).toBe('/desk?x=1');
+      const u = `https://${at(port)}/?ezil_pv=${encodeURIComponent(cookie)}`;
+      expect((await handleAwsBrowserHost(new Request(u), new URL(u), d))!.status).toBe(401);
+    }
   });
 });
 
@@ -515,18 +526,19 @@ describe('sendAwsControl (GW-5 proposal)', () => {
 });
 
 describe('AWS app inspector v1', () => {
-  async function app(path: string, options: { authenticated?: boolean; status?: number; type?: string; fail?: boolean; zoneRoot?: string; body?: string | null } = {}) {
+  async function app(path: string, options: { authenticated?: boolean; status?: number; type?: string; fail?: boolean; zoneRoot?: string; body?: string | null; csp?: string } = {}) {
     const zoneRoot = options.zoneRoot ?? 'ezil.org';
     const url = new URL(`https://aws-3002-${SID}-aws.${zoneRoot}${path}`);
     const cookie = options.authenticated === false ? '' : await mintPreviewCookie(SECRET, SID);
     let fetched = 0;
     const forwarded: string[] = [];
-    const response = await handleAwsBrowserHost(new Request(url, { headers: { cookie: `ezil_preview=${cookie}`, 'sec-fetch-dest': 'iframe' } }), url, {
+    // A browser that drops a cookie omits it; an explicit empty credential is invalid.
+    const response = await handleAwsBrowserHost(new Request(url, { headers: { ...(cookie ? { cookie: `ezil_preview=${cookie}` } : {}), 'sec-fetch-dest': 'iframe' } }), url, {
       routingEnabled: true, zone: ZONE, secrets: [SECRET], zoneRoot, lookup: async () => record(), nowMs: () => Date.now(),
       fetch: async (input) => { fetched++; forwarded.push(input); if (options.fail) throw Error('origin unavailable');
         return new Response(options.body === undefined ? '<html><head><title>App</title></head><body>Hello</body></html>' : options.body, {
           status: options.status ?? 200, headers: { 'content-type': options.type ?? 'text/html', etag: 'old',
-            'x-frame-options': 'DENY', 'content-security-policy': "script-src 'self'; frame-ancestors 'none'" },
+            'x-frame-options': 'DENY', 'content-security-policy': options.csp ?? "script-src 'self'; frame-ancestors 'none'" },
         }); },
     });
     return { response: response!, fetched, forwarded, url, cookie };
@@ -577,11 +589,39 @@ describe('AWS app inspector v1', () => {
     expect(new URL(page.forwarded[0]).search).toBe('?keep=1');
     const html = await page.response.text(); expect(html).not.toContain(cookie); if (page.cookie) expect(html).not.toContain(page.cookie);
     await expectPreviewScriptsAllowed(html, page.response.headers);
-    const scripts = previewPageScripts(html, page.url.href); expect(scripts.urls).toHaveLength(1);
+    const scripts = previewPageScripts(html, page.url.href, page.response.headers); expect(scripts.urls).toHaveLength(1);
     const scriptUrl = scripts.urls[0]; expect(scriptUrl.pathname).toBe('/preview-inspector.js');
     expect(scriptUrl.searchParams.get('ezil_pv')).toBe(fallback ? cookie : null);
     const script = await app(scriptUrl.pathname + scriptUrl.search, { authenticated: !fallback });
     expect(script.response.status).toBe(200); expect(script.fetched).toBe(0);
+  });
+  it('real authenticated bootstrap survives dropped cookies through the emitted inspector request', async () => {
+    const token = await mintPreviewBootstrapToken(SECRET, SID);
+    const bootstrap = await app('/preview-bootstrap?token=' + encodeURIComponent(token) + '&path=' + encodeURIComponent('/demo?keep=1&ezil_pv=forged'), { authenticated: false });
+    expect(bootstrap.response.status).toBe(302); expect(bootstrap.fetched).toBe(0);
+    const redirect = new URL(bootstrap.response.headers.get('location')!, bootstrap.url);
+    const cookie = bootstrap.response.headers.get('set-cookie')!.split(';')[0].slice('ezil_preview='.length);
+    expect(redirect.searchParams.get('ezil_pv')).toBe(cookie);
+    expect(redirect.searchParams.get('token')).toBeNull();
+    const page = await app(redirect.pathname + redirect.search, { authenticated: false, csp: "script-src 'nonce-existing'" });
+    expect(page.response.status).toBe(200); expect(new URL(page.forwarded[0]).search).toBe('?keep=1');
+    const html = await page.response.text(); expect(html).not.toContain(cookie);
+    const scripts = previewPageScripts(html, page.url.href, page.response.headers); expect(scripts.urls).toHaveLength(1);
+    expect(scripts.urls[0].searchParams.get('ezil_pv')).toBe(cookie);
+    const inspector = await app(scripts.urls[0].pathname + scripts.urls[0].search, { authenticated: false });
+    expect(inspector.response.status).toBe(200); expect(inspector.fetched).toBe(0);
+    expect((await app('/preview-inspector.js', { authenticated: false })).response.status).toBe(401);
+  });
+  for (const csp of inspectorCspPolicies) it(`authorizes the actual AWS external inspector narrowly under CSP: ${csp}`, async () => {
+    const page = await app('/', { csp }), html = await page.response.text();
+    const scripts = previewPageScripts(html, page.url.href, page.response.headers);
+    expect(scripts.urls).toHaveLength(1);
+    const policy = page.response.headers.get('content-security-policy')!;
+    expect(policy).toContain(`${page.url.origin}/preview-inspector.js`);
+    expect(policy).not.toContain(page.cookie); expect(policy).not.toContain("'self'");
+    for (const url of [`${page.url.origin}/other.js`, `${page.url.origin}/preview-inspector.js/child`, 'https://other.test/preview-inspector.js'])
+      expect(previewExternalScriptAllowed(page.response.headers, page.url.href, url)).toBe(false);
+    expect(policy.split(',')).toHaveLength(csp.split(',').length);
   });
   it('refuses invalid and wrong-sandbox fallback tokens at the inspector gate', async () => {
     for (const token of ['invalid', await mintPreviewCookie(SECRET, 'guac-other-project')]) {
