@@ -7,7 +7,9 @@ const hash = createHash('sha256');
 for (const file of sources) hash.update(await readFile(new URL(file, import.meta.url)));
 // Bun's source comments use cwd; keep package builds and checks independent of the caller.
 process.chdir(import.meta.dir);
-const result = await Bun.build({ entrypoints: [new URL('webview.ts', import.meta.url).pathname], target: 'browser' });
+// IIFE, not ESM-as-classic-script: the webview inlines this as a classic <script>, where a top-level `var status` or
+// `var history` IS `window.status` (string-only) / `window.history` — observed in real Code: "status is not a function".
+const result = await Bun.build({ entrypoints: [new URL('webview.ts', import.meta.url).pathname], target: 'browser', format: 'iife' });
 if (!result.success) throw new Error('Could not build preview browser script');
 const script = await result.outputs[0]!.text();
 const output = new URL('script.generated.ts', import.meta.url);

@@ -168,14 +168,14 @@ try {
         await f.preview.receive({ type: 'external' });
         assert.equal(f.opened[0].status, 200, 'Open also bootstraps when the new tab drops cookies');
     }));
-    // Primary must change these expectations to 200 only after integrating the Worker E2 fixes.
-    await scenario('AWS blocked-cookie navigation requires Worker integration, then assertions must require 200', () => fixture(true, true, async f => {
-        assert.equal(f.first.status, 401, 'KNOWN BASELINE GAP, not acceptance: AWS bootstrap supplies only a cookie; require 200 after Worker integration');
+    // With the Worker's cookie-blocked carriage integrated, AWS behaves like Cloudflare: no remaining known gap.
+    await scenario('AWS blocked-cookie bootstrap and reload authenticate through the Worker fallback', () => fixture(true, true, async f => {
+        assert.equal(f.first.status, 200, 'AWS bootstrap must load when the embedded browser drops the cookie');
         await f.observe('/pricing'); await f.preview.receive({ type: 'reload' });
         const load = f.messages.findLast(message => message.type === 'load');
         assert.equal(new URL(load.url).pathname, '/preview-bootstrap', 'extension still requests a fresh bootstrap');
-        assert.equal((await f.browser.navigate(load.url, embedded)).status, 401, 'KNOWN BASELINE GAP, not acceptance: AWS reload needs Worker fallback; require 200 after integration');
-    }), true);
+        assert.equal((await f.browser.navigate(load.url, embedded)).status, 200, 'AWS reload must authenticate through the Worker fallback');
+    }));
     await scenario('real bootstrap verifier refuses invalid and cross-computer tokens', async () => {
         const { origin, serve } = server(false);
         for (const token of ['invalid', await mintPreviewBootstrapToken(secret, 'guac-other-computer'), await mintPreviewBootstrapToken(secret, sid, 1)]) {

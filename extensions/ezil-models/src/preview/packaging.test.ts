@@ -25,6 +25,38 @@ test('browser generator check rejects stale sources without rewriting the embedd
     } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('the shipped browser script runs as a classic <script> whose global has window.status and window.history', () => {
+    // A webview inlines previewScript as a classic script: any top-level `var` becomes a property of the real window,
+    // where `status` only stores strings and `history` cannot be replaced (real Code: "status is not a function").
+    const origin = 'https://3002-guac-0a0a-0b0b-app.ezil.work';
+    const minted = `${origin}/preview-bootstrap?token=t%3D1%2Cv1%3Da&path=%2F`;
+    const posted: unknown[] = [];
+    const elements = new Map<string, Record<string, any>>();
+    const element = (id: string) => {
+        if (!elements.has(id)) elements.set(id, { id, dataset: {}, style: {}, textContent: '', hidden: false, disabled: false, value: '', attrs: {} as Record<string, string>,
+            setAttribute(k: string, v: string) { this.attrs[k] = v; }, getAttribute(k: string) { return this.attrs[k] ?? null; },
+            hasAttribute(k: string) { return k in this.attrs; }, addEventListener() {}, contentWindow: { postMessage() {} } });
+        return elements.get(id)!;
+    };
+    const app = element('app');
+    Object.assign(app.dataset, { origin, url: minted, path: '/', viewport: 'responsive' });
+    Object.defineProperty(app, 'src', { get() { return this.attrs.src ?? ''; }, set(v: string) { this.attrs.src = v; } });
+    let statusText = '';
+    const realHistory = Object.freeze({ length: 1 });
+    const context: Record<string, unknown> = {
+        document: { getElementById: element }, addEventListener() {}, setTimeout, clearTimeout, URL, URLSearchParams, btoa, crypto,
+        acquireVsCodeApi: () => ({ postMessage: (m: unknown) => posted.push(m), setState() {} }),
+    };
+    Object.defineProperty(context, 'status', { get: () => statusText, set: (v: unknown) => { statusText = String(v); }, configurable: false });
+    Object.defineProperty(context, 'history', { value: realHistory, writable: false, configurable: false });
+    context.window = context;
+    expect(() => runInNewContext(previewScript, context)).not.toThrow();
+    expect(app.src).toBe(minted);
+    expect(element('status').textContent).toBe('Loading preview…');
+    expect(posted).toContainEqual({ type: 'loading' });
+    expect(statusText).toBe(''); expect(context.history).toBe(realHistory);
+});
+
 test('VSIX contains the complete embedded browser payload, serializer and command contribution', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ezil-preview-vsix-'));
     try {
