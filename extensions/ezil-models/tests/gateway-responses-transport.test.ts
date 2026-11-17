@@ -393,3 +393,78 @@ describe('Responses validates the complete tool batch before releasing any calls
         expect(new Headers(s.posts[0]!.init.headers).get('idempotency-key')).toBe('malformed-batch-operation');
     });
 });
+
+describe('the output budget a request asks for reaches the protocol field on the wire', () => {
+    const messagesReply = () => new Response(messagesFrames().join(''), { headers: {
+        'content-type': 'text/event-stream', 'x-ezil-request-id': 'messages-request', 'x-ezil-hold-micro': '420000',
+    } });
+    const sent = (call: Call) => JSON.parse(new TextDecoder().decode(call.init.body as Uint8Array)) as Record<string, unknown>;
+    const withOptions = (modelOptions: Record<string, unknown>, request = ask()): ChatRequest => ({ ...request, modelOptions });
+    async function messagesBudget(modelOptions: Record<string, unknown>, request = ask()) {
+        const s = server(() => messagesReply());
+        await run(s.fetch, {}, gw(), withOptions(modelOptions, request));
+        expect(s.posts).toHaveLength(1); expect(s.posts[0]!.url).toEndWith('/messages');
+        return sent(s.posts[0]!);
+    }
+    async function responsesBudget(modelOptions: Record<string, unknown>) {
+        const s = server(() => success());
+        await run(s.fetch, {}, responsesModel(), withOptions(modelOptions));
+        expect(s.posts).toHaveLength(1); expect(s.posts[0]!.url).toEndWith('/responses');
+        return sent(s.posts[0]!);
+    }
+
+    test('a smaller budget is sent as max_tokens (Messages) and max_output_tokens (Responses), under either option name', async () => {
+        expect((await messagesBudget({ maxTokens: 1000 })).max_tokens).toBe(1000);
+        expect((await messagesBudget({ max_tokens: 1000 })).max_tokens).toBe(1000);
+        expect((await responsesBudget({ maxTokens: 1000 })).max_output_tokens).toBe(1000);
+        expect((await responsesBudget({ max_tokens: 1000 })).max_output_tokens).toBe(1000);
+        // maxTokens wins over max_tokens, as on the direct providers; the protocols' minimum goes as is.
+        expect((await messagesBudget({ maxTokens: 500, max_tokens: 2000 })).max_tokens).toBe(500);
+        expect((await responsesBudget({ maxTokens: 500, max_tokens: 2000 })).max_output_tokens).toBe(500);
+        expect((await messagesBudget({ maxTokens: 16 })).max_tokens).toBe(16);
+        // Only the budget changes on the wire: unrelated hosted/stateful options are still ignored.
+        const body = await responsesBudget({ maxTokens: 1000, store: true, previous_response_id: 'resp_0', stream: false });
+        expect(body).toMatchObject({ store: false, stream: true }); expect(body.previous_response_id).toBeUndefined();
+    });
+
+    test('no budget, or a larger one, keeps the model and catalog limits', async () => {
+        // Messages: the model's 8192. Responses: the catalog's 4096 below the model's 8192.
+        for (const options of [{}, { maxTokens: null }, { maxTokens: undefined, max_tokens: null }]) {
+            expect((await messagesBudget(options)).max_tokens).toBe(8192);
+            expect((await responsesBudget(options)).max_output_tokens).toBe(4096);
+        }
+        for (const options of [{ maxTokens: 99_000 }, { max_tokens: 8193 }]) {
+            expect((await messagesBudget(options)).max_tokens).toBe(8192);
+            expect((await responsesBudget(options)).max_output_tokens).toBe(4096);
+        }
+    });
+
+    test('an unusable budget is refused locally: nothing is read, sent or held', async () => {
+        for (const value of [0, 15, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53, '1000', true, {}]) {
+            for (const [model, key] of [[gw(), 'maxTokens'], [gw(), 'max_tokens'], [responsesModel(), 'maxTokens'], [responsesModel(), 'max_tokens']] as const) {
+                const s = server(() => { throw new Error('Unexpected request'); });
+                let error: unknown;
+                try { await run(s.fetch, {}, model, withOptions({ [key]: value })); } catch (caught) { error = caught; }
+                expect(error).toMatchObject({ code: 'local_output_budget_invalid', origin: 'local', status: undefined });
+                expect(s.reads).toEqual([]); expect(s.posts).toEqual([]);
+            }
+        }
+        // maxTokens is read first: a malformed one is not replaced by a valid max_tokens.
+        const s = server(() => messagesReply());
+        let error: unknown;
+        try { await run(s.fetch, {}, gw(), withOptions({ maxTokens: '500', max_tokens: 500 })); } catch (caught) { error = caught; }
+        expect(error).toMatchObject({ code: 'local_output_budget_invalid' }); expect(s.posts).toEqual([]);
+    });
+
+    test('a smaller budget does not shrink the input allowance or compact a request that fits', async () => {
+        const large = ask([{ role: 'user', parts: [{ type: 'text', value: 'x'.repeat(120_000) }] }]);
+        const compacted: unknown[] = [];
+        const s = server(() => messagesReply());
+        await run(s.fetch, { onCompact: info => compacted.push(info) }, gw(), withOptions({ maxTokens: 1000 }, large));
+        const budget = sent(s.posts[0]!);
+        const unchanged = await messagesBudget({}, large);
+        expect(compacted).toEqual([]);
+        expect(budget.max_tokens).toBe(1000); expect(unchanged.max_tokens).toBe(8192);
+        expect(budget.messages).toEqual(unchanged.messages);
+    });
+});

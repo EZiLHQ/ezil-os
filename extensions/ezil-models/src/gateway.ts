@@ -10,7 +10,7 @@ import { appFailure, failureId, type AppFailure, type AppFailureStage } from './
 import { redact, type GatewayProtocol, type ResolvedModel, type ResolvedProvider } from './config';
 import { sseEvents } from './sse';
 import { compactRequest, COMPACT_TARGET, type CompactionInfo } from './compact';
-import { buildGatewayBody, DEFAULT_TOOL_RESERVE, gatewayRequestBytes, parseGatewayTransport, type GatewayTransport, INPUT_FRAMING, KIMI, LocalRequestError, type LocalRequestCounts } from './gateway-messages';
+import { buildGatewayBody, DEFAULT_TOOL_RESERVE, gatewayRequestBytes, gatewayRequestOutputTokens, parseGatewayTransport, type GatewayTransport, INPUT_FRAMING, KIMI, LocalRequestError, type LocalRequestCounts } from './gateway-messages';
 import { gatewayJson, gatewayStream, GatewayResponseError } from './gateway-response';
 import { buildGatewayResponsesBody, gatewayResponsesJson, gatewayResponsesStream } from './gateway-responses';
 import type { Usage } from './types';
@@ -845,6 +845,8 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     options.signal.addEventListener('abort', cancelAttempt, { once: true });
     try {
         options.signal.throwIfAborted();
+        // An unusable output budget fails before any Gateway request, the catalog read included.
+        gatewayRequestOutputTokens(model, request.modelOptions);
         // A direct client invocation must enforce the same opt-in as the model picker.
         if (responses) {
             const catalog = await gatewayModels(provider, doFetch, now(), options.signal);

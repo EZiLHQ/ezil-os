@@ -7,7 +7,7 @@ import * as vscode from 'vscode';
 import type { CompactionInfo } from './compact';
 import { appFailure, type AppFailure } from './failure';
 import { CATALOG_REFUSALS, CREDIT_STATE_TEXT, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModelListed, gatewayModels, includedModelNames, knownGatewayModels, knownGatewayPlan, modelIncluded, parseCatalogModelId, withCatalogDefault, withDefaultModel, withGatewayModelLimits, withPlanLocks, type GatewayModels } from './gateway';
-import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, geminiRoute, geminiSignedPart, QWEN } from './gateway-messages';
+import { gatewayInputTokens, gatewayOutputTokens, gatewayRequestOutputTokens, gatewayTokenCount, geminiRoute, geminiSignedPart, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
 import { redact, type ResolvedModel, type ResolvedProvider } from './config';
 import { estimateMessageTokens, estimateTextTokens } from './tokens';
@@ -646,7 +646,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                     case 'usage':
                         // Metadata travels on this request's own progress stream; late/cancelled replies cannot update another chat.
                         if (resolved.provider.type === 'ezil-gateway') progress.report(new vscode.LanguageModelDataPart(
-                            new TextEncoder().encode(JSON.stringify(copilotUsage(event.usage, gatewayOutputTokens(resolved)))), 'usage'));
+                            new TextEncoder().encode(JSON.stringify(copilotUsage(event.usage, gatewayRequestOutputTokens(resolved, request.modelOptions)))), 'usage'));
                         this.host.recordUsage(resolved, event.usage, Date.now() - started);
                         break;
                     case 'stop':

@@ -10,11 +10,13 @@ const build = (request = ask()) => buildGatewayBody(gw(), request).body;
 describe('gateway sanitizer', () => {
     test('only allowlisted top-level options; sampling only when passed', () => {
         expect(Object.keys(build()).sort()).toEqual(['max_tokens', 'messages', 'model', 'stream']);
-        const request = { ...ask(), modelOptions: { temperature: 3, top_p: -3, cache_control: {}, metadata: {}, thinking: {}, top_k: 2, output_config: {}, stream: false, max_tokens: 1, stop_sequences: ['x'] } };
+        const request = { ...ask(), modelOptions: { temperature: 3, top_p: -3, cache_control: {}, metadata: {}, thinking: {}, top_k: 2, output_config: {}, stream: false, max_tokens: 99_000, stop_sequences: ['x'] } };
         const body = build(request);
         expect(Object.keys(body).sort()).toEqual(['max_tokens', 'messages', 'model', 'stream', 'temperature', 'top_p']);
         expect(body.temperature).toBe(1); expect(body.top_p).toBe(0);
+        // An oversized budget is held to the model's limit; one below the protocols' minimum is refused, never raised.
         expect(body.max_tokens).toBe(8192);
+        expect(() => build({ ...request, modelOptions: { ...request.modelOptions, max_tokens: 1 } })).toThrow(GatewayError);
     });
     test('configured sampling is clamped; nonfinite sampling omitted', () => {
         const model = { ...gw(), temperature: -1, topP: 3 };

@@ -1,6 +1,6 @@
 // Gateway's stateless, text/function-only Responses subset. No direct provider URLs or state IDs.
 import type { ResolvedModel } from './config';
-import { escapeNonAscii, GATEWAY_INPUT_BYTES, gatewayRequestBytes, gatewayOutputTokens, isObject, LocalRequestError, samplingRefused } from './gateway-messages';
+import { escapeNonAscii, GATEWAY_INPUT_BYTES, gatewayRequestBytes, gatewayRequestOutputTokens, isObject, LocalRequestError, samplingRefused } from './gateway-messages';
 import { gatewayBodyEvents, GatewayResponseError, responseFailure, streamErrorEvent } from './gateway-response';
 import type { SseEvent } from './sse';
 import { isCacheMarker, isStatefulMarker, type ChatRequest, type Part, type StreamEvent, type Usage } from './types';
@@ -88,7 +88,7 @@ export function buildGatewayResponsesBody(model: ResolvedModel, request: ChatReq
     // Cancelled history has no recorded result. Never invent a successful result for such calls.
     for (const id of pending) input.push({ type: 'function_call_output', call_id: id, output: 'No result was recorded for this tool call.' });
     if (!input.length) throw new Error('Invalid conversation length');
-    const body: GatewayResponsesBody = { model: model.model, input, max_output_tokens: gatewayOutputTokens(model), stream: model.stream !== false, store: false };
+    const body: GatewayResponsesBody = { model: model.model, input, max_output_tokens: gatewayRequestOutputTokens(model, request.modelOptions), stream: model.stream !== false, store: false };
     if (tools.length) { body.tools = tools; body.tool_choice = 'auto'; }
     if (request.toolMode === 'required') log?.('[gateway] required tool choice mapped to auto');
     // As on Messages: aliases the Gateway refuses sampling for never get it, on either protocol.

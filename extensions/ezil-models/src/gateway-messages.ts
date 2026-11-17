@@ -384,6 +384,22 @@ export function gatewayOutputTokens(model: Pick<ResolvedModel, 'model' | 'maxOut
     return Math.max(16, Math.min(16_384, Math.floor(Number.isFinite(model.maxOutputTokens) ? model.maxOutputTokens : fallback)));
 }
 
+/** Both protocols' smallest output budget (Messages `max_tokens`, Responses `max_output_tokens`). */
+export const MIN_OUTPUT_TOKENS = 16;
+/** This request's output budget. A caller's own (`maxTokens`, else `max_tokens`, read as the direct providers read them)
+ * can only lower the model's: a larger one is held to the model's limit, and one that is not a safe integer of at least 16
+ * is refused here, before anything is sent or held, rather than silently replaced. None (or null) means the model's. */
+export function gatewayRequestOutputTokens(model: Pick<ResolvedModel, 'model' | 'maxOutputTokens'>, modelOptions: Record<string, unknown>): number {
+    const limit = gatewayOutputTokens(model);
+    const requested = modelOptions.maxTokens ?? modelOptions.max_tokens;
+    if (requested === undefined || requested === null) return limit;
+    if (typeof requested !== 'number' || !Number.isSafeInteger(requested) || requested < MIN_OUTPUT_TOKENS) {
+        throw new GatewayError(`EZiL Models: this request's output token limit must be a whole number of at least ${MIN_OUTPUT_TOKENS}. `
+            + 'Nothing was sent or charged', undefined, 'local_output_budget_invalid', undefined, undefined, 'local');
+    }
+    return Math.min(requested, limit);
+}
+
 /** Safe history budget in MODEL TOKENS, independent of the legacy HTTP byte bound.
  * System/tool contents are counted by Copilot; these reserves cover uncounted framing/schema and summary growth. */
 export const SUMMARY_RESERVE_TOKENS = 8192;
@@ -408,7 +424,7 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
     }
     const conversation = gatewayConversation(request.messages, tools, geminiRoute(model.model) ? 'gemini' : replaysThinking(model.model));
     const body: GatewayBody = {
-        model: model.model, messages: conversation.messages, max_tokens: gatewayOutputTokens(model),
+        model: model.model, messages: conversation.messages, max_tokens: gatewayRequestOutputTokens(model, request.modelOptions),
         stream: model.model !== KIMI && model.stream !== false,
     };
     if (conversation.system.length) body.system = conversation.system;

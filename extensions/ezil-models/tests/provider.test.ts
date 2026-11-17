@@ -280,19 +280,24 @@ describe('EZiL gateway VS Code bridge', () => {
     }
     test('final JSON/SSE metadata reaches the owning request, including out-of-order and cancelled replies', async () => {
         const pending = new Map<string, (response: Response) => void>();
+        const budgets = new Map<string, unknown>();
         const host = gatewayHost((async (_url: unknown, init?: RequestInit) => {
             const body = JSON.parse(new TextDecoder().decode(init!.body as Uint8Array));
+            budgets.set(body.model, body.max_tokens);
             return new Promise<Response>(resolve => pending.set(body.model, resolve));
         }) as typeof fetch);
         const p = new EZiLModelsProvider(host);
         const infos = await p.provideLanguageModelChatInformation({} as never, token() as never);
         for (const cancelFirst of [false, true]) {
-            pending.clear();
+            pending.clear(); budgets.clear();
             const parts: unknown[][] = [[], []]; const cancellation = [token(), token()];
+            // The first request asks for its own smaller output budget; the second keeps its model's default.
             const sends = infos.map((info, i) => p.provideLanguageModelChatResponse(info, [message(1, [new TextPart('q')])] as never,
-                { tools: [], modelOptions: { _conversationId: `session-${i}` } } as never, { report: part => { parts[i]!.push(part); } }, cancellation[i]! as never));
+                { tools: [], modelOptions: { _conversationId: `session-${i}`, ...(i === 0 ? { maxTokens: 1000 } : {}) } } as never,
+                { report: part => { parts[i]!.push(part); } }, cancellation[i]! as never));
             for (let i = 0; i < 100 && pending.size < 2; i++) await Bun.sleep(1);
             expect(pending.size).toBe(2);
+            expect(budgets.get(gw().model)).toBe(1000); expect(budgets.get(KIMI)).toBe(4096);
             pending.get(KIMI)!(Response.json({ ...messageJson(), usage: { input_tokens: 200, output_tokens: 40, cache_read_input_tokens: 90 } }));
             await sends[1];
             if (cancelFirst) cancellation[0]!.cancel();
@@ -304,7 +309,7 @@ describe('EZiL gateway VS Code bridge', () => {
                 prompt_tokens_details: { cached_tokens: 90 }, ezil_usage: { source: 'estimated', output_limit: 4096, cache_coverage: 'unknown' } }]);
             if (cancelFirst) expect(read(0)).toEqual([]);
             else expect(read(0)).toEqual([{ prompt_tokens: 107, completion_tokens: 8, total_tokens: 115,
-                prompt_tokens_details: { cached_tokens: 3, cache_creation_input_tokens: 4 }, ezil_usage: { source: 'measured', output_limit: 8192 } }]);
+                prompt_tokens_details: { cached_tokens: 3, cache_creation_input_tokens: 4 }, ezil_usage: { source: 'measured', output_limit: 1000 } }]);
         }
     });
     describe('credit refusal action', () => {
