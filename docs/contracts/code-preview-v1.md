@@ -76,8 +76,31 @@ Frame → parent (only to the bound origin, with the bound nonce):
     - text: `font-family`, `font-size`, `font-weight`, `line-height`, `text-align`
     - box: `display`, `position`, `margin`, `padding`, `border`, `border-radius`, `width`, `height`
     - layout: `gap`, `flex-direction`, `justify-content`, `align-items`
-  - `source?`: `{eid}` only when the element or an ancestor carries `data-eid` / `data-oid`. This is never inferred.
+  - `source?`: `{eid}` only when the element or an ancestor carries `data-eid` / `data-oid`. `eid` is a string of
+    1..200 chars with no control characters. It is never inferred.
 - `ancestors`: ≤6 entries of `{tag, id?, classes}`, nearest first.
+- The whole `sel` as JSON must be ≤12000 UTF-16 code units. Every hop refuses a larger record before doing any other
+  work.
+
+**Navigation is a revision.** Every `navigate` increments `doc.mut`, and so does every `changed`. Receivers also
+compare `doc.path`, so a selection is stale when its `gen`, `mut` or `path` differs from the current document.
+
+**Document status.** On the Cloudflare and AWS app bridges, only an HTML response with status 2xx gets the
+ready-capable inspector. Any other HTML status gets the diagnostic responder, which answers a hello with
+`ezil.preview.state` and `state: "upstream_error"`.
+
+**Inspector script on fallback auth.** When the page was reached through the `ezil_pv` query fallback, the injected
+`<script src>` for the inspector must carry the same `ezil_pv` value. Without it, a browser that drops the preview
+cookie loads the page but gets a 401 for the inspector.
+
+**Transport path vs displayed path.** `doc.path` is the in-app path that is displayed and copied. The Cloudflare bridge
+serves the app under `/preview/*`. Any host that navigates the frame itself (Back, Forward, Reload) must map the
+displayed path to the transport URL with `transportUrl(origin, path)`:
+- Cloudflare app host: `origin + "/preview" + path`.
+- AWS app host (`aws-3002-<id>-aws.<zone>`): `origin + path`. `aws-origin.ts` serves the app at the root.
+
+The copied/"open in browser" safe URL is also the transport URL (it works with the cookie), minus every credential
+parameter.
 
 Sanitization applies at every hop:
 
@@ -88,6 +111,9 @@ Sanitization applies at every hop:
   case-insensitively: `ezil_pv`, `ezil_mint`, `token`, `access_token`, `id_token`, `refresh_token`, `code`, `state`,
   `session`, `sid`, `key`, `api_key`, `apikey`, `secret`, `password`, `pass`, `auth`, `authorization`, `signature`,
   `sig`, and any name ending `_token`. `username:password@` userinfo is removed.
+- **Fragments.** The same rule applies to the fragment. A fragment of the form `#k=v&…` is parsed as a query, and a
+  hash-router fragment `#/route?k=v…` has its query part parsed the same way. Credential parameters are removed. A
+  fragment that is left empty (`#` or `#/route?`) is reduced to the route alone or dropped.
 - Control characters are removed, and strings are truncated after sanitizing.
 
 ## Hop 2: preview host → extension host → workbench hook

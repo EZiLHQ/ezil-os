@@ -7,7 +7,12 @@
     { "in": "/p?ezil_pv=t%3D1&tab=2", "out": "/p?tab=2" },
     { "in": "/p?Access_Token=a&csrf_token=b&q=shoes", "out": "/p?q=shoes" },
     { "in": "https://user:pw@cdn.example.com/a.png?sig=1&w=200", "out": "https://cdn.example.com/a.png?w=200" },
-    { "in": "/p?api_key=k&apikey=k&secret=s&password=p&pass=p&auth=a&authorization=a&session=s&sid=s&key=k&signature=s&ezil_mint=m&id_token=i&refresh_token=r&token=t", "out": "/p" }
+    { "in": "/p?api_key=k&apikey=k&secret=s&password=p&pass=p&auth=a&authorization=a&session=s&sid=s&key=k&signature=s&ezil_mint=m&id_token=i&refresh_token=r&token=t", "out": "/p" },
+    { "in": "/callback#access_token=abc&token_type=bearer&expires_in=3600", "out": "/callback#token_type=bearer&expires_in=3600" },
+    { "in": "/callback#access_token=abc", "out": "/callback" },
+    { "in": "/#/callback?token=abc&tab=2", "out": "/#/callback?tab=2" },
+    { "in": "/#/callback?code=abc", "out": "/#/callback" },
+    { "in": "/docs#install", "out": "/docs#install" }
   ],
   "selection": {
     "accept": [
@@ -47,6 +52,8 @@
       { "name": "negative mutation counter", "patch": { "doc.mut": -1 } },
       { "name": "attrs key outside the allow-list", "patch": { "el.attrs": { "onclick": "x()" } } },
       { "name": "source with a non-string eid", "patch": { "el.source": { "eid": 5 } } },
+      { "name": "eid over 200 chars", "patch": { "el.source": { "eid": "@repeat:x:201" } } },
+      { "name": "path with a fragment credential", "patch": { "doc.path": "/cb#access_token=abc" } },
       { "name": "path containing a credential parameter", "patch": { "doc.path": "/cb?token=abc" } },
       { "name": "array instead of object", "replace": [] }
     ]
