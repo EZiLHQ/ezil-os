@@ -4,7 +4,7 @@ import { reconcileAdoptRecovery } from './aws-pool-recovery';
 import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
 import { awsSandboxId } from './aws-enroll';
 import { isExecutionAbsent } from './aws-errors';
-import { proveFailedReleaseTermination } from './aws-failed-release-proof';
+import { proveFailedReleaseNeverActed, proveFailedReleaseTermination } from './aws-failed-release-proof';
 import { readReleasedPoolHostProof } from './aws-historical-source';
 import { buildLifecycleWork, currentGenerationIntent, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
 import { isPoolMode, lifecycleExecutionArn, LifecycleReceiptSchema, POOL_RELEASED, startLifecycleJob,
@@ -77,7 +77,8 @@ export function ownedTags(tags: Record<string, string> | undefined, p: Placement
         && Object.entries({ 'ezil:computer-id': p.computerId, 'ezil:computer': p.computerId,
             'ezil:fence-token': p.fenceToken, 'ezil:fence': p.fenceToken }).every(([k, v]) => tags[k] === undefined || tags[k] === v);
 }
-async function resourceEvidence(deps: ReceiptDeps, p: Placement, d: LifecycleDeployment, released: boolean, strictVolume = false): Promise<{ error: string | null; stoppedAt?: Date | null }> {
+async function resourceEvidence(deps: ReceiptDeps, p: Placement, d: LifecycleDeployment, released: boolean, strictVolume = false,
+    hostState: 'stopped' | 'running' = 'stopped'): Promise<{ error: string | null; stoppedAt?: Date | null }> {
     if (!deps.describer?.describeVolume) return { error: 'describer_missing' };
     const volume = await deps.describer.describeVolume(p.region!, p.volumeId!);
     if (!volume || volume.volumeId !== p.volumeId || !ownedTags(volume.tags, p, d)
@@ -90,7 +91,7 @@ async function resourceEvidence(deps: ReceiptDeps, p: Placement, d: LifecycleDep
     if (volume.state !== 'in-use' || volume.attachments?.length !== 1
         || volume.attachments[0].instanceId !== p.instanceId || volume.attachments[0].state !== 'attached') return { error: 'volume_attachment' };
     const host = await deps.describer.describeForEnrollment(p.region!, p.instanceId!);
-    if (!host || host.instanceId !== p.instanceId || host.state !== 'stopped' || host.instanceType !== p.instanceType
+    if (!host || host.instanceId !== p.instanceId || host.state !== hostState || host.instanceType !== p.instanceType
         || host.availabilityZoneId !== p.zoneId || !ownedTags(host.tags, p, d) || host.tags['ezil:pool'] !== undefined) return { error: 'instance_identity' };
     const rootName = d.storage.rootDeviceName ?? '/dev/sda1';
     const root = host.volumes.filter(v => v.deviceName === rootName && v.volumeId !== p.volumeId && v.deleteOnTermination);
@@ -267,6 +268,20 @@ export async function reconcilePoolReleaseRecovery(deps: ReceiptDeps, p: Placeme
         if (!retryTermination && !boundedTime(released.terminatedAt, e.startDate, e.stopDate && e.stopDate < now() ? e.stopDate : now())) return fail('termination_time_invalid');
         if (retryTermination && released.terminatedAt > e.startDate!) return fail('replay_identity');
         terminatedAt = released.terminatedAt;
+    } else if (evidence.error === 'instance_identity' && work.intent.operation === 'release' && !saved?.intent) {
+        // A release whose own history proves it never acted (its initial observe was refused: incident 2026-11-17) left the
+        // host exactly as it found it: RUNNING, identity intact, data volume attached. Replay the release as itself; the
+        // replay's own success time closes usage (`recovery_success`). EC2 state alone never qualifies; without the history
+        // reader, or with any other history, the stopped-host requirement stands.
+        if (!deps.executions.history) return fail(evidence.error);
+        let neverActed: boolean;
+        try { neverActed = proveFailedReleaseNeverActed(e, await deps.executions.history(p.region, e.executionArn!), work); }
+        catch { return fail('describe_unavailable'); }
+        if (!neverActed) return fail(evidence.error);
+        try { evidence = await resourceEvidence(deps, p, source, false, false, 'running'); }
+        catch { return fail('describe_unavailable'); }
+        if (evidence.error) return fail(evidence.error);
+        evidence = { error: null, stoppedAt: null };
     } else if (evidence.error) return fail(evidence.error);
     const sourceStartedAt = saved?.intent ? saved.sourceStartedAt : e.startDate!.toISOString();
     const proven = !terminatedAt && boundedTime(evidence.stoppedAt, sourceStartedAt ? new Date(sourceStartedAt) : null, now());
