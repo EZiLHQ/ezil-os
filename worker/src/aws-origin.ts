@@ -40,7 +40,10 @@ import { codeShellOriginsFor, injectCodeFolderBridge, isHtmlDocument, isWorkbenc
 import { injectCodeDiagBridge } from './code-diag-bridge';
 import { injectCodeBillingBridge } from './code-billing-bridge';
 import { injectCodePreviewBridge } from './code-preview-bridge';
-import { buildDiagnosticResponse, previewInspectorScript, stripFrameAncestors } from './preview-bridge';
+import {
+  allowPreviewInlineScripts, buildDiagnosticResponse, injectPreviewDiagnostic, PREVIEW_INSPECTOR_LOADER,
+  previewInspectorScript, resolvePreviewAuth, stripFrameAncestors, stripPreviewQueryParam,
+} from './preview-bridge';
 import {
   PREVIEW_COOKIE_NAME,
   PREVIEW_COOKIE_TTL_S,
@@ -336,7 +339,8 @@ export async function proxyToAwsOrigin(
   headers.set(AWS_GATEWAY_HEADER, signed);
   const init: RequestInit = { method, headers, redirect: 'manual' };
   if (method !== 'GET' && method !== 'HEAD') init.body = request.body;
-  return fetchFn(`https://${host}${originPath}${url.search}`, init);
+  const search = port === APP_PREVIEW_PORT ? stripPreviewQueryParam(url.search) : url.search;
+  return fetchFn(`https://${host}${originPath}${search}`, init);
 }
 
 export interface AwsBrowserDeps {
@@ -421,7 +425,8 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
     return new Response(null, { status: 302, headers: { location: dest.pathname + dest.search, 'set-cookie': attrs.join('; ') } });
   }
 
-  const cookieOk = await verifyPreviewCookie(readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME), secrets, sandboxId);
+  const cookieOk = port === APP_PREVIEW_PORT ? await resolvePreviewAuth(request, url, secrets, sandboxId)
+    : await verifyPreviewCookie(readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME), secrets, sandboxId);
   if (!cookieOk) return (port === CODE_PREVIEW_PORT ? codeAuthRecovery(request, deps.codeShellOrigins) : null)
     ?? json({ ok: false, error: 'aws_preview_auth_required' }, 401);
   const inspectorOrigins = [`https://aws-${CODE_PREVIEW_PORT}-${sandboxId}-aws.${deps.zoneRoot}`, ...codeShellOriginsFor(deps.zoneRoot)];
@@ -492,18 +497,24 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
     }
     return withCodeFolderBridge(answered, deps.codeShellOrigins ?? []);
   }
-  if (appDocument && isOriginGatewayFailure(answered.status)) {
+  const appHtml = port === APP_PREVIEW_PORT && /^\s*text\/html\b/i.test(answered.headers.get('content-type') ?? '');
+  if (appDocument && !appHtml && isOriginGatewayFailure(answered.status)) {
     try { await answered.body?.cancel(); } catch { /* already consumed */ }
     return buildDiagnosticResponse('port_not_listening', port, undefined, inspectorOrigins);
   }
-  if (port === APP_PREVIEW_PORT && isHtmlDocument(answered.status, answered.headers.get('content-type'))) {
+  if (appHtml && ![204, 205, 304].includes(answered.status)) {
     const html = await answered.text();
     const headers = new Headers(answered.headers);
     for (const name of ['content-length', 'etag', 'last-modified', 'x-frame-options']) headers.delete(name);
     const csp = headers.get('content-security-policy');
     if (csp) { const kept = stripFrameAncestors(csp); if (kept) headers.set('content-security-policy', kept); else headers.delete('content-security-policy'); }
     headers.set('cache-control', 'no-cache, no-store');
-    return new Response(html.replace(/<head(\s[^>]*)?>/i, '$&<script src="/preview-inspector.js" async></script>'), {
+    const injected = isHtmlDocument(answered.status, answered.headers.get('content-type'))
+      ? html.replace(/<head\b[^>]*>/i, head => head + PREVIEW_INSPECTOR_LOADER)
+      : injectPreviewDiagnostic(html, inspectorOrigins);
+    await allowPreviewInlineScripts(headers, isHtmlDocument(answered.status, answered.headers.get('content-type'))
+      ? PREVIEW_INSPECTOR_LOADER : injectPreviewDiagnostic('', inspectorOrigins));
+    return new Response(injected, {
       status: answered.status, statusText: answered.statusText, headers,
     });
   }

@@ -24,6 +24,7 @@
 import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
+import { expectPreviewScriptsAllowed, previewPageScripts } from './code-preview-bridge-test-helpers';
 
 import {
   previewInspectorScript,
@@ -34,6 +35,7 @@ import {
   rewriteSetCookie,
   stripFrameAncestors,
   injectRuntimeShim,
+  allowPreviewInlineScripts,
   readCookie,
   stripPreviewCookie,
   handlePreviewBootstrap,
@@ -355,6 +357,21 @@ describe('rewriteSetCookie', () => {
 // ── HTML shim injection ──────────────────────────────────────────────────────
 
 describe('injectRuntimeShim', () => {
+  it('keeps existing unrestricted inline CSP behavior and does not add a policy when absent', async () => {
+    for (const policy of [null, "script-src 'self' 'unsafe-inline'", "img-src 'none'"]) {
+      const headers = new Headers(policy ? { 'content-security-policy': policy } : {});
+      await allowPreviewInlineScripts(headers, injectRuntimeShim('<head></head>'));
+      expect(headers.get('content-security-policy')).toBe(policy);
+    }
+  });
+  it('adds only the injected script hashes to nonce/none policies, retaining unrelated restrictions', async () => {
+    const headers = new Headers({ 'content-security-policy': "default-src 'none'; script-src 'nonce-existing'; script-src-elem 'none'; img-src https://images.example" });
+    const html = injectRuntimeShim('<head></head>');
+    await allowPreviewInlineScripts(headers, html); await expectPreviewScriptsAllowed(html, headers);
+    const policy = headers.get('content-security-policy')!;
+    expect(policy).toContain("default-src 'none'"); expect(policy).toContain("script-src 'nonce-existing'");
+    expect(policy).toContain('img-src https://images.example'); expect(policy).not.toContain("script-src-elem 'none'");
+  });
   it('injects right after the opening <head> tag', () => {
     const html = '<html><head><title>x</title></head><body></body></html>';
     const out = injectRuntimeShim(html);
@@ -1071,6 +1088,51 @@ describe('handlePreviewProxy', () => {
     expect(res.status).toBe(200);
   });
 
+  for (const status of [200, 201, 299, 301, 400, 404, 500, 502, 503, 504]) it(`app HTML status ${status} preserves the document and only 2xx can become ready`, async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const page = `https://3002-${SID}-app.ezil.org/preview/`;
+    const html = '<html><head></head><body>Original upstream document</body></html>';
+    const sandbox = fakeContainerFetcher(() => new Response(html, { status, headers: { 'content-type': 'text/html', 'content-security-policy': "script-src 'self'" } }));
+    const res = await handlePreviewProxy(new Request(page, { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } }), sandbox, SID, [SECRET], '/');
+    expect(res.status).toBe(status);
+    const body = await res.text(); expect(body).toContain('<body>Original upstream document</body>');
+    await expectPreviewScriptsAllowed(body, res.headers);
+    const scripts = previewPageScripts(body, page);
+    if (status < 300) {
+      expect(scripts.urls.map(u => u.pathname)).toEqual(['/preview-inspector.js']);
+      expect(body).toContain("u.pathname = '/preview-ws' + u.pathname");
+    } else {
+      expect(scripts.urls).toEqual([]); expect(body).not.toContain('window.WebSocket');
+      const origin = `https://8443-${SID}-code.ezil.org`;
+      expect(scripts.hello(origin, INSPECTOR_NONCE)).toEqual([{ origin, data: { type: 'ezil.preview.state', v: 1, nonce: INSPECTOR_NONCE, state: 'upstream_error' } }]);
+    }
+  });
+
+  for (const fallback of [false, true]) it(`loads the inspector through its real auth gate using ${fallback ? 'query fallback' : 'cookie'}`, async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID), origin = `https://3002-${SID}-app.ezil.org`;
+    const page = `${origin}/preview/${fallback ? '?ezil_pv=' + encodeURIComponent(cookie) : ''}`;
+    const headers = fallback ? {} : { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` };
+    const sandbox = fakeContainerFetcher(() => new Response('<html><head></head><body>App</body></html>', { headers: { 'content-type': 'text/html', 'content-security-policy': "default-src 'self'; script-src-elem 'self'" } }));
+    const res = await handlePreviewProxy(new Request(page, { headers }), sandbox, SID, [SECRET], '/');
+    expect(res.status).toBe(200);
+    const html = await res.text(); expect(html).not.toContain(cookie);
+    await expectPreviewScriptsAllowed(html, res.headers);
+    const scripts = previewPageScripts(html, page); expect(scripts.urls).toHaveLength(1);
+    const scriptUrl = scripts.urls[0]; expect(scriptUrl.pathname).toBe('/preview-inspector.js');
+    expect(scriptUrl.searchParams.get('ezil_pv')).toBe(fallback ? cookie : null);
+    expect((await handlePreviewInspectorJs(new Request(scriptUrl, { headers }), SID, [SECRET])).status).toBe(200);
+    expect((await handlePreviewInspectorJs(new Request(`${origin}/preview-inspector.js`), SID, [SECRET])).status).toBe(401);
+  });
+  it('preserves HTML statuses that cannot carry a response body', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID);
+    const request = new Request(`https://3002-${SID}-app.ezil.org/preview/`, { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } });
+    for (const status of [204, 205, 304]) {
+      const sandbox = fakeContainerFetcher(() => new Response(null, { status, headers: { 'content-type': 'text/html' } }));
+      const res = await handlePreviewProxy(request, sandbox, SID, [SECRET], '/');
+      expect(res.status).toBe(status); expect(await res.text()).toBe('');
+    }
+  });
+
   it('strips the `ezil_pv` fallback param before forwarding upstream', async () => {
     const cookie = await mintPreviewCookie(SECRET, SID);
     const sandbox = fakeContainerFetcher((url) => {
@@ -1597,7 +1659,7 @@ function inspector(script = previewInspectorScript([INSPECTOR_PARENT]), capture?
   const location = new URL('https://3002-guac-u-c-app.ezil.org/preview/pricing?token=private&plan=pro#faq');
   const history = { pushState(_a: unknown, _b: unknown, path: string) { location.href = new URL(path, location).href; },
     replaceState(_a: unknown, _b: unknown, path: string) { location.href = new URL(path, location).href; } };
-  const context = { window, document, location, history, URL, crypto, Uint8Array, btoa, loadVite: async () => viteClient,
+  const context = { window, document, location, history, URL, URLSearchParams, crypto, Uint8Array, btoa, loadVite: async () => viteClient,
     getComputedStyle: (el: PreviewElement) => ({ ...el.style, getPropertyValue: (k: string) => el.style[k] ?? '' }),
     MutationObserver: class { constructor(fn: Function) { mutation = fn; } observe() {} },
     Date: { now: () => now }, setTimeout: (fn: Function, delay: number) => { timers.set(++counter, { at: now + delay, fn }); return counter; }, capture };
@@ -1687,20 +1749,37 @@ describe('strict preview inspector v1', () => {
     expect(s.el.rect).toEqual({ x: 1, y: -3, w: 120, h: 31 });
     el.attrs.href = 'javascript:alert(1)'; b.event('click', { target: el }, true); expect(b.selects().at(-1).el.attrs.href).toBe('');
   });
-  for (const vector of previewVectors.sanitizeUrl) it(`sanitizes URL vector ${vector.in}`, () => {
+  for (const vector of [...previewVectors.sanitizeUrl,
+    { in: '/cb#access_token=https://auth.example/?private=1&tab=2', out: '/cb#tab=2' },
+    { in: '/cb#Access_Token=private&csrf_token=private&tab=2', out: '/cb#tab=2' },
+    { in: '/#/cb?Access_Token=private&csrf_token=private&tab=2', out: '/#/cb?tab=2' },
+    { in: '/cb#%61ccess_token=private', out: '/cb' },
+    { in: '/cb#', out: '/cb' },
+    { in: '/#/cb?', out: '/#/cb' },
+  ]) it(`sanitizes URL vector ${vector.in}`, () => {
     let helpers: any; const b = inspector(undefined, h => { helpers = h; }); expect(helpers.sanitizeUrl(vector.in)).toBe(vector.out);
     const el = new PreviewElement('a', { href: vector.in, src: vector.in }); b.hello(); b.mode(); b.event('click', { target: el }, true);
     expect(b.selects()[0].el.attrs).toEqual({ href: vector.out, src: vector.out });
+    if (vector.in.startsWith('/')) {
+      b.location.href = new URL('/preview' + vector.in, b.location).href;
+      b.hello(); expect(b.messages.at(-1).data.doc.path).toBe(vector.out);
+      b.mode(); b.event('click', { target: el }, true); expect(b.selects().at(-1).doc.path).toBe(vector.out);
+    }
   });
   for (const vector of previewVectors.selection.accept) it(`accepts selection vector: ${vector.name}`, () => {
     let helpers: any; inspector(undefined, h => { helpers = h; }); expect(helpers.validSelection(vector.sel)).toBe(true);
   });
   for (const vector of previewVectors.selection.refuse) it(`refuses selection vector: ${vector.name}`, () => {
     let helpers: any; inspector(undefined, h => { helpers = h; }); const s = structuredClone(previewVectors.selection.accept[0].sel);
+    const expand = (value: any): any => {
+      const repeat = typeof value === 'string' && /^@repeat:(.):(\d+)$/.exec(value);
+      if (repeat) return repeat[1].repeat(Number(repeat[2]));
+      if (Array.isArray(value)) return value.map(expand);
+      return value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, expand(v)])) : value;
+    };
     for (const [path, raw] of Object.entries(vector.patch ?? {})) {
-      const parts = path.split('.'); let target = s; for (const part of parts.slice(0, -1)) target = target[part];
-      const repeat = typeof raw === 'string' && /^@repeat:(.):(\d+)$/.exec(raw);
-      target[parts.at(-1)!] = repeat ? repeat[1].repeat(Number(repeat[2])) : raw;
+      const parts = path.split('.'); let target = s; for (const part of parts.slice(0, -1)) target = target[part] ??= {};
+      target[parts.at(-1)!] = expand(raw);
     }
     expect(helpers.validSelection(vector.replace ?? s)).toBe(false);
   });
@@ -1711,6 +1790,38 @@ describe('strict preview inspector v1', () => {
     expect(b.selects()[0].el.selector).toBe('button#\\31 23');
     el.attrs.id = 'i'.repeat(65); b.event('click', { target: el }, true);
     expect(b.selects()[1].el.selector).toBe('button:nth-of-type(1)');
+  });
+  it('caps huge source ids and trims escaped class-heavy records to the whole-selection limit', () => {
+    const b = inspector(); b.hello(); b.mode();
+    const classes = Array.from({ length: 100 }, (_, i) => '"'.repeat(64) + i).join(' ');
+    let parent = new PreviewElement('main', { class: classes, id: '"'.repeat(64) });
+    for (let i = 0; i < 6; i++) { const child = new PreviewElement('section', { class: classes, id: '"'.repeat(64) }); parent.append(child); parent = child; }
+    const el = new PreviewElement('button', { class: classes, 'data-eid': '\u0001' + 'e'.repeat(50000) }).append('text '.repeat(100));
+    el.style = { color: '"'.repeat(120), 'font-family': '"'.repeat(120), margin: '"'.repeat(120), padding: '"'.repeat(120) };
+    parent.append(el); b.event('click', { target: el }, true);
+    expect(b.selects()).toHaveLength(1); const sel = b.selects()[0];
+    expect(sel.el.source.eid).toBe('e'.repeat(200));
+    expect(sel.el.classes).toHaveLength(12); expect(sel.el.classes.every((c: string) => c.length <= 64)).toBe(true);
+    expect(JSON.stringify(sel).length).toBeLessThanOrEqual(12000);
+    expect(sel.ancestors.length).toBeLessThan(6);
+    el.tagName = 'X-' + 'Y'.repeat(12000); b.event('click', { target: el }, true); expect(b.selects()).toHaveLength(1);
+  });
+  it('refuses oversized selections before traversing their fields', () => {
+    let helpers: any; inspector(undefined, h => { helpers = h; });
+    const sel = structuredClone(previewVectors.selection.accept[0].sel); sel.el.text = 'x'.repeat(12000);
+    Object.defineProperty(sel, 'doc', { enumerable: false, get() { throw Error('must size-check first'); } });
+    expect(helpers.validSelection(sel)).toBe(false);
+  });
+  it('makes hash-only navigation and every other navigation a document revision', () => {
+    const b = inspector(); b.hello(); b.mode(); const el = new PreviewElement();
+    b.event('click', { target: el }, true); const selected = b.selects()[0].doc;
+    b.location.hash = '#new'; b.event('hashchange'); b.advance(300);
+    expect(b.messages.at(-1).data.doc).toMatchObject({ gen: selected.gen, mut: selected.mut + 1, path: '/pricing?plan=pro#new' });
+    let mut = b.messages.at(-1).data.doc.mut;
+    for (const navigate of [() => b.history.pushState({}, '', '#push'), () => b.history.replaceState({}, '', '#replace'), () => b.event('popstate')]) {
+      navigate(); b.advance(300); expect(b.messages.at(-1).data.doc.mut).toBe(++mut);
+    }
+    b.mutate(); b.advance(300); expect(b.messages.at(-1).data.doc.mut).toBe(++mut);
   });
   it('subscribes to the existing Vite client hot event bus without import.meta.hot', async () => {
     let update: Function | undefined;

@@ -292,8 +292,21 @@ export const PREVIEW_COOKIE_QUERY_PARAM = 'ezil_pv';
 
 // ── HTML shim injection ──────────────────────────────────────────────────────
 
+/** Read fallback auth in the browser; no request token is embedded in the HTML. */
+export const PREVIEW_INSPECTOR_LOADER = `<script>
+(function () {
+  var src = new URL('/preview-inspector.js', window.location.href);
+  var fallback = new URLSearchParams(window.location.search).get(${JSON.stringify(PREVIEW_COOKIE_QUERY_PARAM)});
+  if (fallback) src.searchParams.set(${JSON.stringify(PREVIEW_COOKIE_QUERY_PARAM)}, fallback);
+  var script = document.createElement('script');
+  script.src = src.href;
+  script.async = true;
+  document.head.appendChild(script);
+})();
+</script>`;
+
 /**
- * Runtime shim injected into every HTML response. Rewrites the Next.js/Vite
+ * Runtime shim injected into successful HTML responses. Rewrites the Next.js/Vite
  * HMR WebSocket URL to flow through `/preview-ws/...`, loads the inspector
  * script, and — when the current page was reached via the `ezil_pv`
  * query-param fallback (see `PREVIEW_COOKIE_QUERY_PARAM`'s module doc in this
@@ -381,7 +394,7 @@ export const RUNTIME_SHIM = `
   window.WebSocket.CLOSED = origWS.CLOSED;
 })();
 </script>
-<script src="/preview-inspector.js" async></script>
+${PREVIEW_INSPECTOR_LOADER}
 `.trim();
 
 const HEAD_OPEN_RE = /<head\b[^>]*>/i;
@@ -392,6 +405,30 @@ export function injectRuntimeShim(html: string): string {
   if (!match) return html;
   const idx = match.index + match[0].length;
   return html.slice(0, idx) + RUNTIME_SHIM + html.slice(idx);
+}
+
+/** Permit only our injected inline code under an upstream CSP, keeping the app's other restrictions. */
+export async function allowPreviewInlineScripts(headers: Headers, markup: string): Promise<void> {
+  const csp = headers.get('content-security-policy');
+  if (!csp) return;
+  const directives = csp.split(';').map(d => d.trim().split(/\s+/)).filter(d => d[0]);
+  const hashes = await Promise.all([...markup.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(async match => {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(match[1]));
+    return `'sha256-${btoa(String.fromCharCode(...new Uint8Array(digest)))}'`;
+  }));
+  if (!hashes.length) return;
+  for (const name of ['script-src', 'script-src-elem']) {
+    let directive = directives.find(d => d[0].toLowerCase() === name);
+    if (!directive && name === 'script-src') {
+      const defaults = directives.find(d => d[0].toLowerCase() === 'default-src');
+      if (defaults) { directive = [name, ...defaults.slice(1)]; directives.push(directive); }
+    }
+    if (!directive) continue;
+    // Adding a hash disables unsafe-inline: preserve policies that already allow all inline code.
+    if (directive.includes("'unsafe-inline'") && !directive.some(s => /^'(nonce-|sha(?:256|384|512)-)/.test(s))) continue;
+    directive.splice(1, directive.length - 1, ...directive.slice(1).filter(s => s !== "'none'"), ...hashes);
+  }
+  headers.set('content-security-policy', directives.map(d => d.join(' ')).join('; '));
 }
 
 /** Parent origins for this app host only; a different sandbox's Code frame is never admitted. */
@@ -420,6 +457,12 @@ function sanitizeUrl(value,max=512){
     if(!['https:','http:'].includes(u.protocol))return '';
     u.username='';u.password='';
     for(const k of [...u.searchParams.keys()])if(SECRET.test(k))u.searchParams.delete(k);
+    const fragment=u.hash.slice(1),router=fragment.startsWith('/'),query=router?fragment.indexOf('?'):-1;
+    if(query>=0||!router&&fragment.includes('=')){
+      const route=query>=0?fragment.slice(0,query):'',params=new URLSearchParams(query>=0?fragment.slice(query+1):fragment);
+      for(const k of [...params.keys()])if(SECRET.test(k))params.delete(k);
+      const rest=params.toString();u.hash=route+(rest?(query>=0?'?':'')+rest:'');
+    }else if(!fragment)u.hash='';
     const absolute=/^[a-z][a-z0-9+.-]*:/i.test(s)||s.startsWith('//');
     return clean(absolute?u.href:u.pathname+u.search+u.hash,max);
   }catch{return ''}
@@ -430,6 +473,7 @@ const str=(v,n)=>typeof v==='string'&&v.length<=n&&clean(v,n)===v;
 const integer=v=>Number.isSafeInteger(v);
 const summary=v=>keys(v,['tag','id','classes'])&&TAG.test(v.tag)&&str(v.tag,32)&&(v.id===undefined||str(v.id,64))&&Array.isArray(v.classes)&&v.classes.length<=12&&v.classes.every(c=>str(c,64));
 function validSelection(s){
+  try{if(JSON.stringify(s).length>12000)return false}catch{return false}
   if(!keys(s,['doc','viewport','el','ancestors']))return false;
   const d=s.doc,v=s.viewport,e=s.el;
   if(!keys(d,['gen','mut','path','title'])||!str(d.gen,22)||!TOKEN.test(d.gen)||!integer(d.mut)||d.mut<0||d.mut>2147483648||!str(d.path,512)||sanitizeUrl(d.path)!==d.path||!str(d.title,120))return false;
@@ -439,7 +483,7 @@ function validSelection(s){
   if(!keys(e.rect,['x','y','w','h'])||!['x','y','w','h'].every(k=>integer(e.rect[k]))||e.rect.w<0||e.rect.h<0)return false;
   if(!keys(e.styles,STYLES)||!Object.values(e.styles).every(v=>str(v,120)))return false;
   if(e.attrs!==undefined&&(!keys(e.attrs,ATTRS)||!Object.entries(e.attrs).every(([k,v])=>str(v,200)&&(!['href','src'].includes(k)||v===''||sanitizeUrl(v,200)===v))))return false;
-  if(e.source!==undefined&&(!keys(e.source,['eid'])||!str(e.source.eid,200)))return false;
+  if(e.source!==undefined&&(!keys(e.source,['eid'])||!str(e.source.eid,200)||!e.source.eid))return false;
   return Array.isArray(s.ancestors)&&s.ancestors.length<=6&&s.ancestors.every(summary);
 }
 const gen=btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16)))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
@@ -493,10 +537,13 @@ function selection(el){
   e.attrs={};for(const k of ATTRS){const value=el.getAttribute(k);if(value!==null&&!(blocked&&k==='placeholder'))e.attrs[k]=['href','src'].includes(k)?sanitizeUrl(value,200):clean(value,200)}
   e.styles={};const styles=getComputedStyle(el);for(const k of STYLES){const value=styles.getPropertyValue(k);if(value)e.styles[k]=clean(value,120)}
   const ancestors=[];for(let p=el;p&&p.nodeType===1;p=p.parentElement){
-    const eid=p.getAttribute('data-eid')||p.getAttribute('data-oid');if(eid&&!e.source)e.source={eid:clean(eid,200)};
+    const eid=clean(p.getAttribute('data-eid')||p.getAttribute('data-oid'),200);if(eid&&!e.source)e.source={eid};
     if(p!==el&&ancestors.length<6)ancestors.push(basic(p));
   }
   const s={doc:doc(),viewport:{w:Math.round(window.innerWidth),h:Math.round(window.innerHeight),dpr:Math.min(8,Math.max(.5,window.devicePixelRatio||1))},el:e,ancestors};
+  if(JSON.stringify(s).length>12000)e.text='';
+  for(const k of Object.keys(e.styles)){if(JSON.stringify(s).length<=12000)break;delete e.styles[k]}
+  while(ancestors.length&&JSON.stringify(s).length>12000)ancestors.pop();
   return validSelection(s)?s:null;
 }
 let lastTouch=-Infinity;
@@ -514,8 +561,9 @@ document.addEventListener('keydown',select,true);
 document.addEventListener('touchend',select,{capture:true,passive:false});
 // Keep the latest document even during continuous mutation/HMR bursts, at most four posts per second.
 function limited(type){let timer,last=-Infinity;return ()=>{if(!nonce||timer!==undefined)return;timer=setTimeout(()=>{timer=undefined;last=Date.now();post(type,{doc:doc()})},Math.max(50,250-(Date.now()-last)))}}
-const changed=limited('changed'),navigate=limited('navigate');
-const bump=()=>{mut=Math.min(2147483648,mut+1);changed()};
+const changed=limited('changed'),navigated=limited('navigate');
+const revision=()=>{mut=Math.min(2147483648,mut+1)};
+const bump=()=>{revision();changed()},navigate=()=>{revision();navigated()};
 // The inspector is a classic script: reuse the app's existing Vite client to reach its hot event bus.
 let viteBound=false;
 function bindVite(){try{
@@ -539,6 +587,14 @@ function previewDiagnosticScript(origins: readonly string[], state: PreviewDiagn
 if(ev.source!==window.parent||window.parent===window||!origins.includes(ev.origin)||ev.origin==='*'||ev.origin==='null'||!d||typeof d!=='object'||Array.isArray(d)||Object.keys(d).length!==3||d.type!=='ezil.preview.hello'||d.v!==1||typeof d.nonce!=='string'||d.nonce.length!==22||!/^[A-Za-z0-9_-]{22}$/.test(d.nonce))return;
 window.parent.postMessage({type:'ezil.preview.state',v:1,nonce:d.nonce,state:${JSON.stringify(state)}},ev.origin);
 }catch{}})})();`;
+}
+
+/** Preserve an upstream error document, including headless HTML, and add only the state responder. */
+export function injectPreviewDiagnostic(html: string, origins: readonly string[]): string {
+  const script = `<script>${previewDiagnosticScript(origins, 'upstream_error')}</script>`;
+  const head = HEAD_OPEN_RE.exec(html);
+  const idx = head ? head.index + head[0].length : 0;
+  return html.slice(0, idx) + script + html.slice(idx);
 }
 
 // ── "Dev server not up" diagnostic page ──────────────────────────────────────
@@ -963,12 +1019,17 @@ export async function handlePreviewProxy(
   // `/preview` — pinning its cookies to `/preview` would silently drop them.
   const outHeaders = rewriteResponseHeaders(upstream.headers, target === 'code' ? '/' : '/preview');
 
-  if (contentType.includes('text/html')) {
+  if ([204, 205, 304].includes(upstream.status)) return new Response(null, { status: upstream.status, headers: outHeaders });
+  if (/^\s*text\/html\b/i.test(contentType)) {
     const bodyText = await upstream.text();
+    const appBody = target === 'app' ? (isHtmlDocument(upstream.status, contentType)
+      ? injectRuntimeShim(bodyText) : injectPreviewDiagnostic(bodyText, previewInspectorOrigins(url.hostname))) : bodyText;
     const workbench = target === 'code' && isHtmlDocument(upstream.status, contentType)
       && isWorkbenchDocumentRequest(request.method, targetPath, request.headers.get('upgrade'));
     const injected = target === 'code' ? (workbench ? injectCodePreviewBridge(injectCodeBillingBridge(injectCodeDiagBridge(injectCodeFolderBridge(bodyText, codeShellOrigins), codeShellOrigins), codeShellOrigins), codeShellOrigins) : bodyText)
-      : injectRuntimeShim(bodyText);
+      : appBody;
+    if (target === 'app') await allowPreviewInlineScripts(outHeaders, isHtmlDocument(upstream.status, contentType)
+      ? RUNTIME_SHIM : injectPreviewDiagnostic('', previewInspectorOrigins(url.hostname)));
     outHeaders.set('cache-control', 'no-cache, no-store');
     return new Response(injected, { status: upstream.status, headers: outHeaders });
   }
