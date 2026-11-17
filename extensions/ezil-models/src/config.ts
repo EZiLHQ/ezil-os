@@ -117,6 +117,8 @@ export type ResolvedModel = {
     toolReserve?: number;
     /** Listed for an upgrade only: the account's OS plan does not include it (gateway.ts `withPlanLocks`). Never sent. */
     locked?: boolean;
+    /** With `locked`: the plan is unknown, not limited (gateway.ts `withUnconfirmedPlan`). Never an upgrade, never sent. */
+    unconfirmed?: boolean;
 };
 
 export type ResolvedConfig = {

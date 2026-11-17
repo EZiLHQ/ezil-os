@@ -801,10 +801,12 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
 
   // The models the owner's plan includes (pushed with the token by the Next server). A request for any other model
   // is answered here: nothing reaches the Gateway, so nothing is held or charged. Only the body's `model` is read.
-  // An unknown plan (none pushed yet, or none fresh) is never "every model": inference waits for the next push, as a
-  // temporary failure that is no billing matter. Reads (models, balance, limits, usage) pass as before.
+  // An unknown plan (none pushed yet, or none fresh) is never "every model": inference and the model list wait for the
+  // next push, as a temporary failure that is no billing matter. A 200 /models without the header means a verified
+  // every-model plan (the Gateway never sets it), so unknown must not answer one: the extension keeps its last verified
+  // limit and lists no catalog-only row. Other reads (balance, limits, usage) pass as before.
   const access = route.method === 'POST' || route.upstreamPath === '/v1/models' ? await deps.modelAccess() : null;
-  if (route.method === 'POST' && access?.known !== true) {
+  if (access !== null && access.known !== true) {
     log({ status: 503, code: 'os_plan_unavailable' });
     return proxyError(503, 'os_plan_unavailable', 'EZiL OS could not confirm which models your plan includes yet. Nothing was sent. Try again in a minute.');
   }

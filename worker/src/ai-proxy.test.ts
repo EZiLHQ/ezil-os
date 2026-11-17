@@ -1396,8 +1396,8 @@ describe('plan model access (Free includes Gemini 3.8 Flash only)', () => {
     expect(gw.calls).toHaveLength(2);
   });
 
-  it('an unknown plan (none pushed, stale) refuses inference as a temporary, non-billing failure; reads pass', async () => {
-    const gw = mockGateway(() => Response.json({ object: 'list', data: [] }));
+  it('an unknown plan (none pushed, stale) refuses inference and the model list as a temporary, non-billing failure; other reads pass', async () => {
+    const gw = mockGateway(() => new Response('{"object":"list","data":[]}', { headers: { 'content-type': 'application/json', 'x-ezil-os-included-models': 'everything' } }));
     const d = await deps({ fetch: gw.fetch, modelAccess: async () => ({ known: false }) });
     for (const [path, model] of [['/messages', 'claude-opus-5-5'], ['/messages', FLASH], ['/responses', 'gpt-6-astra-code']] as const) {
       const response = await handleAiProxyRequest(await post(path, JSON.stringify({ model })), d);
@@ -1406,9 +1406,18 @@ describe('plan model access (Free includes Gemini 3.8 Flash only)', () => {
       expect(d.logs.at(-1)).toMatchObject({ status: 503, code: 'os_plan_unavailable' });
     }
     expect(gw.calls).toHaveLength(0);
-    const models = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/models`, { headers: { authorization: await proxyAuth() } }), d);
-    expect(models.status).toBe(200);
+    // Never a 200 without the header: that is a verified every-model plan, and clients would list and unlock every model.
+    const get = async (path: string) => handleAiProxyRequest(new Request(`${HOST}/ai/v1${path}`, { headers: { authorization: await proxyAuth() } }), d);
+    const models = await get('/models');
+    expect(models.status).toBe(503);
+    expect(await models.json()).toMatchObject({ error: { code: 'os_plan_unavailable', source: 'ezil-os-proxy' } });
     expect(models.headers.get('x-ezil-os-included-models')).toBeNull();
+    expect(d.logs.at(-1)).toMatchObject({ status: 503, code: 'os_plan_unavailable' });
+    expect(gw.calls).toHaveLength(0);
+    // Positive control: a read that is not the plan's passes through, and the upstream's header is still never relayed.
+    const balance = await get('/me/balance');
+    expect(balance.status).toBe(200);
+    expect(balance.headers.get('x-ezil-os-included-models')).toBeNull();
     expect(gw.calls).toHaveLength(1);
   });
 
