@@ -109,6 +109,12 @@ const modelsCache = new Map<string, { baseUrl: ResolvedProvider['baseUrl']; at: 
  */
 const accessHints = new Map<string, GatewayModels>();
 /**
+ * Per base URL + token: the last answered read was the EZiL OS proxy's `os_plan_unavailable` (it holds no fresh plan).
+ * Only that proxy sends it; a Gateway, an outage or another error never sets it. A verified catalog clears it, as does a
+ * reload. A remembered limit or catalog still decides which rows are listed, never that the plan is confirmed.
+ */
+const unconfirmedPlans = new Set<string>();
+/**
  * Per base URL + token: the `/v1/models` read under way. Every concurrent caller (the picker, a request, the credits
  * panel) shares it, so a cold or failing catalog costs one request at a time, not one per caller.
  */
@@ -133,7 +139,7 @@ export function forgetGatewayModels(baseUrl?: string): void {
         pending.stale = true;
         modelsReads.delete(key);
     }
-    if (baseUrl === undefined) { modelsCache.clear(); accessHints.clear(); return; }
+    if (baseUrl === undefined) { modelsCache.clear(); accessHints.clear(); unconfirmedPlans.clear(); return; }
     for (const [key, cached] of modelsCache) if (cached.baseUrl === baseUrl) modelsCache.delete(key);
 }
 
@@ -368,6 +374,16 @@ export function withPlanLocks(models: readonly ResolvedModel[], catalogs: Readon
         : { ...model, locked: true, default: false });
 }
 
+/**
+ * A provider whose plan is unconfirmed (`gatewayPlanUnconfirmed`): its models stay listed (the config, and the rows a
+ * remembered limit or catalog lists), but none is selectable or the default until a verified read. Choosing one re-reads
+ * the plan (lockedModelChosen); it never offers an upgrade or sends anything.
+ */
+export function withUnconfirmedPlan(models: readonly ResolvedModel[], unconfirmed: ReadonlySet<ResolvedProvider>): ResolvedModel[] {
+    return models.map(model => model.provider.type === 'ezil-gateway' && unconfirmed.has(model.provider)
+        ? { ...model, locked: true, unconfirmed: true, default: false } : model);
+}
+
 /** The model a new or unset chat starts on, on every plan, while it is available (founder decision 2026-11-09). */
 export const PREFERRED_DEFAULT_MODEL = 'gemini-3.8-flash';
 
@@ -431,6 +447,9 @@ async function readGatewayModels(provider: ResolvedProvider, key: string, doFetc
         // Forgotten meanwhile: only what was read since then (a later read's catalog, or none) answers.
         if (entry.stale) return modelsCache.get(key)?.models;
         const models = status === 200 ? parseGatewayModels(json) : undefined;
+        if (models) unconfirmedPlans.delete(key);
+        // Unknown now: the last catalog is not what anything goes by, only the remembered limit (accessHints) lists.
+        else if (status === 503 && proxyPlanUnavailable(json)) { unconfirmedPlans.add(key); modelsCache.delete(key); }
         const header = headers.get(INCLUDED_MODELS_HEADER);
         const included = parseIncludedModels(header);
         if (models && included) {
@@ -471,6 +490,33 @@ export function knownGatewayPlan(provider: ResolvedProvider, now: number = Date.
     const known = knownGatewayModels(provider, now);
     if (known) return known;
     return accessHints.get(providerIdentity(provider));
+}
+
+/** The EZiL OS proxy's own answer while it holds no fresh plan (worker/src/ai-proxy.ts). */
+function proxyPlanUnavailable(json: unknown): boolean {
+    const error = typeof json === 'object' && json !== null ? (json as { error?: unknown }).error : undefined;
+    return typeof error === 'object' && error !== null
+        && (error as Record<string, unknown>).code === 'os_plan_unavailable' && (error as Record<string, unknown>).source === 'ezil-os-proxy';
+}
+
+/**
+ * The proxy's latest word on this account's plan is that it is unknown: no model of it may be offered, sent or turned
+ * into an upgrade, whatever an earlier read (`knownGatewayPlan`) still lists, until a verified read.
+ */
+export function gatewayPlanUnconfirmed(provider: ResolvedProvider): boolean {
+    return unconfirmedPlans.has(providerIdentity(provider));
+}
+
+/**
+ * The proxy refused a request as `os_plan_unavailable`: this base URL + token is unconfirmed, as after such a `/models`
+ * read. Its catalog, and a read already under way (it answers for before), no longer count; its remembered limit stays.
+ */
+export function markGatewayPlanUnconfirmed(provider: ResolvedProvider): void {
+    const key = providerIdentity(provider);
+    unconfirmedPlans.add(key);
+    modelsCache.delete(key);
+    const pending = modelsReads.get(key);
+    if (pending) { pending.stale = true; modelsReads.delete(key); }
 }
 
 export async function gatewayBalance(provider: ResolvedProvider, doFetch: typeof fetch, signal?: AbortSignal): Promise<GatewayBalance | undefined> {

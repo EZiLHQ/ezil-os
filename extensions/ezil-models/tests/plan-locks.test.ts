@@ -30,6 +30,8 @@ const catalog = (data: Row[], over: Row = {}) => ({ object: 'list', contract: 'e
 const ROWS = [row(QWEN), row(KIMI), row(FLASH, 'available', { name: 'Gemini 3.8 Flash' }), row(PRO, 'available', { name: 'Synthetic Pro' })];
 const free = (data = ROWS, header = FLASH) => () => Response.json(catalog(data), { headers: { [INCLUDED_MODELS_HEADER]: header } });
 const paid = (data = ROWS) => () => Response.json(catalog(data));
+// The OS proxy's answer to /models while the plan is unknown (worker/src/ai-proxy.ts).
+const unknownPlan = () => Response.json({ error: { code: 'os_plan_unavailable', source: 'ezil-os-proxy' } }, { status: 503 });
 
 type Sent = { url: string; body: Record<string, unknown> };
 function gateway(models: () => Response, answer: (body: Record<string, unknown>) => Response = ok, ask: (intent: unknown) => Promise<boolean> = async () => true,
@@ -430,12 +432,12 @@ describe('sendBillingIntent: what crosses into the workbench', () => {
 // gets a model its plan refuses. The clock is the system clock; every response is a fixture.
 describe('the plan limit outlives the catalog', () => {
     const MIN = 60_000;
-    type Mode = 'free' | 'paid' | 'down' | 'unreadable';
+    type Mode = 'free' | 'paid' | 'down' | 'unreadable' | 'unknown';
     const account = (mode: Mode = 'free') => {
         const state = { mode };
         const models = () => state.mode === 'free' ? free()() : state.mode === 'paid' ? paid()()
             : state.mode === 'unreadable' ? Response.json(catalog(ROWS), { headers: { [INCLUDED_MODELS_HEADER]: 'not an alias' } })
-            : new Response('', { status: 503 });
+            : state.mode === 'unknown' ? unknownPlan() : new Response('', { status: 503 });
         return { state, models };
     };
     const at = (start: number, minutes: number) => setSystemTime(new Date(start + minutes * MIN));
@@ -543,17 +545,236 @@ describe('the plan limit outlives the catalog', () => {
         } finally { setSystemTime(); }
     });
 
-    test('choosing a locked model with the limit remembered and the re-read failing asks the OS with model_locked only', async () => {
+    test('choosing a locked model with the limit remembered and the re-read failing (an outage) asks nothing: the limit may predate an upgrade', async () => {
         const a = account(); const g = gateway(a.models); const start = Date.now();
         try {
             await list(g.provider);
             at(start, 31); a.state.mode = 'down';
             const before = g.gets();
-            expect(await g.provider.lockedModelChosen(QWEN)).toBe('asked');
+            expect(await g.provider.lockedModelChosen(QWEN)).toBe('unconfirmed');
             expect(g.gets()).toBe(before + 1);
+            expect(g.intents).toEqual([]);
+            expect(notices.mock.calls.map(call => call.length)).toEqual([1]);
+            expect(String(notices.mock.calls[0]![0])).toContain('could not confirm which models your plan includes');
+            // A plain outage is not the proxy's unknown: the remembered locks stay listed as they were.
+            expect(locked(await list(g.provider))).toEqual([QWEN, KIMI]);
+            // Positive control: once a read succeeds and still excludes it, the upgrade is asked for.
+            a.state.mode = 'free';
+            expect(await g.provider.lockedModelChosen(QWEN)).toBe('asked');
         } finally { setSystemTime(); }
         expect(g.intents).toEqual([{ reason: 'model_locked', model: QWEN }]);
+        expect(opened).toEqual([]);
         expect(g.posts).toHaveLength(0);
+    });
+
+    test('choosing a locked model while the proxy says the plan is unknown asks for no billing: a notice only, nothing selectable', async () => {
+        const a = account(); const g = gateway(a.models); const start = Date.now();
+        try {
+            await list(g.provider);
+            at(start, 31); a.state.mode = 'unknown';
+            const before = g.gets();
+            expect(await g.provider.lockedModelChosen(QWEN)).toBe('unconfirmed');
+            expect(g.gets()).toBe(before + 1);
+            // Neither an upgrade nor an unlock: the remembered limit's rows are listed, none selectable.
+            expect(locked(await list(g.provider))).toEqual([QWEN, KIMI, `ezil/${FLASH}`]);
+        } finally { setSystemTime(); }
+        expect(g.intents).toEqual([]);
+        expect(notices.mock.calls.map(call => call.length)).toEqual([1]);
+        expect(String(notices.mock.calls[0]![0])).toContain('could not confirm which models your plan includes');
+        expect(opened).toEqual([]);
+        expect(g.posts).toHaveLength(0);
+    });
+
+    // The OS proxy answers /models 503 os_plan_unavailable while the plan is unknown (worker/src/ai-proxy.ts), never a
+    // 200 without the header, which is a verified every-model plan.
+    test('unknown after a verified Free read lists exactly the authoritative aliases, none selectable, nothing sent or asked', async () => {
+        let plan: 'free' | 'unknown' | 'paid' = 'free';
+        const g = gateway(() => plan === 'free' ? free(ROWS, `${FLASH},${QWEN},${KIMI}`)() : plan === 'unknown' ? unknownPlan() : paid()());
+        let infos = await list(g.provider);
+        expect(locked(infos)).toEqual([`ezil/${PRO}`]);
+        expect(defaults(infos)).toEqual([`ezil/${FLASH}`]);
+        plan = 'unknown';
+        forgetGatewayModels(BASE);
+        infos = await list(g.provider);
+        // The retained limit decides only which rows are listed (exactly its aliases; the paid row not even as an
+        // upgrade). The plan is unconfirmed now, so none is selectable or the default.
+        expect(infos.map(info => info.id)).toEqual([QWEN, KIMI, `ezil/${FLASH}`]);
+        expect(locked(infos)).toEqual([QWEN, KIMI, `ezil/${FLASH}`]);
+        expect(defaults(infos)).toEqual([]);
+        expect(infos.every(info => info.statusIcon?.id === 'question')).toBe(true);
+        await expect(send(g.provider, QWEN)).rejects.toThrow(/could not confirm which models your plan includes/);
+        await expect(send(g.provider, KIMI, { requestInitiator: 'title' })).rejects.toThrow(/could not confirm which models your plan includes/);
+        await expect(send(g.provider, `ezil/${FLASH}`)).rejects.toThrow(/Could not load the model list/);
+        for (const id of [QWEN, `ezil/${FLASH}`, `ezil/${PRO}`]) expect(await g.provider.lockedModelChosen(id)).toBe('unconfirmed');
+        await Bun.sleep(0);
+        expect(g.posts).toHaveLength(0);
+        expect(g.intents).toEqual([]);
+        expect(opened).toEqual([]);
+        // A verified Free read restores the exact locks; a verified paid read clears them.
+        plan = 'free';
+        await g.provider.recoverCatalog();
+        infos = await list(g.provider);
+        expect(locked(infos)).toEqual([`ezil/${PRO}`]);
+        expect(defaults(infos)).toEqual([`ezil/${FLASH}`]);
+        plan = 'paid';
+        forgetGatewayModels(BASE);
+        expect(locked(await list(g.provider))).toEqual([]);
+        expect(g.intents).toEqual([]);
+        expect(g.posts).toHaveLength(0);
+    });
+
+    test('a first-ever unknown: configured models listed unconfirmed (nothing selectable, no default, no paid row), nothing sent or asked', async () => {
+        let plan: 'unknown' | 'free' = 'unknown';
+        const g = gateway(() => plan === 'unknown' ? unknownPlan() : free()());
+        const infos = await list(g.provider);
+        expect(infos.map(info => info.id)).toEqual([QWEN, KIMI]);
+        expect(locked(infos)).toEqual([QWEN, KIMI]);
+        expect(defaults(infos)).toEqual([]);
+        for (const info of infos) {
+            expect(info.statusIcon?.id).toBe('question');
+            expect(info.infoText).toEqual({ [LOCKED_MODEL_INFO_KEY]: 'Your plan could not be confirmed yet. Choose it to check again.' });
+        }
+        // A saved pick, a title or a catalog-only id is refused here as unknown: no POST, retryable, never billing.
+        await expect(send(g.provider, QWEN)).rejects.toThrow(/could not confirm which models your plan includes/);
+        await expect(send(g.provider, KIMI, { requestInitiator: 'title' })).rejects.toThrow(/could not confirm which models your plan includes/);
+        await expect(send(g.provider, `ezil/${PRO}`)).rejects.toThrow(/Could not load the model list/);
+        // Choosing one re-reads the plan: still unknown, a notice only.
+        expect(await g.provider.lockedModelChosen(QWEN)).toBe('unconfirmed');
+        await Bun.sleep(0);
+        expect(g.posts).toHaveLength(0);
+        expect(g.intents).toEqual([]);
+        expect(warnings).not.toHaveBeenCalled();
+        expect(opened).toEqual([]);
+        // Recoverable: the periodic re-read (recoverCatalog) of a verified Free plan re-lists with its real locks.
+        plan = 'free';
+        const changes = g.changes();
+        await g.provider.recoverCatalog();
+        expect(g.changes()).toBeGreaterThan(changes);
+        const known = await list(g.provider);
+        expect(locked(known)).toEqual([QWEN, KIMI, `ezil/${PRO}`]);
+        expect(defaults(known)).toEqual([`ezil/${FLASH}`]);
+        expect(known.every(info => info.statusIcon?.id !== 'question')).toBe(true);
+    });
+
+    test('unconfirmed is the proxy\'s word only: a plain outage or a direct Gateway error with no prior read keeps the configured models selectable', async () => {
+        for (const models of [() => new Response('', { status: 503 }), refusal(503, 'upstream_unavailable'),
+            () => Response.json({ error: { code: 'os_plan_unavailable' } }, { status: 503 })]) {
+            forgetGatewayModels();
+            const infos = await list(gateway(models).provider);
+            expect(infos.map(info => info.id)).toEqual([QWEN, KIMI]);
+            expect(locked(infos)).toEqual([]);
+        }
+    });
+
+    test('a verified paid read after an unconfirmed one unlocks everything; unknown again is never inferred paid from the last catalog', async () => {
+        const a = account('unknown'); const g = gateway(a.models); const start = Date.now();
+        try {
+            expect(locked(await list(g.provider))).toEqual([QWEN, KIMI]);
+            a.state.mode = 'paid';
+            expect(locked(await list(g.provider))).toEqual([]);
+            await send(g.provider, QWEN);
+            // Unknown drops the last paid catalog (a paid plan leaves no remembered limit): only the config is listed, none selectable.
+            at(start, 6); a.state.mode = 'unknown';
+            const infos = await list(g.provider);
+            expect(infos.map(info => info.id)).toEqual([QWEN, KIMI]);
+            expect(locked(infos)).toEqual([QWEN, KIMI]);
+            await expect(send(g.provider, KIMI)).rejects.toThrow(/could not confirm which models your plan includes/);
+        } finally { setSystemTime(); }
+        expect(g.posts.map(post => post.body.model)).toEqual([QWEN]);
+        expect(g.intents).toEqual([]);
+    });
+
+    test('an unknown /models read within the five minutes drops that token\'s cached paid catalog: the next plain read never answers paid', async () => {
+        const a = account('paid'); const g = gateway(a.models);
+        expect(locked(await list(g.provider))).toEqual([]);
+        a.state.mode = 'unknown';
+        // A fresh read (as the picker's re-check or the panel does) finds the plan unknown.
+        expect(await g.provider.lockedModelChosen(QWEN)).toBe('unconfirmed');
+        const gets = g.gets();
+        const infos = await list(g.provider);
+        expect(g.gets()).toBe(gets + 1);
+        expect(infos.map(info => info.id)).toEqual([QWEN, KIMI]);
+        expect(locked(infos)).toEqual([QWEN, KIMI]);
+        await expect(send(g.provider, QWEN)).rejects.toThrow(/could not confirm which models your plan includes/);
+        expect(g.posts).toHaveLength(0);
+        expect(g.intents).toEqual([]);
+    });
+
+    test('a proxy os_plan_unavailable refusal after a cached paid read makes that token unconfirmed and re-lists; another token is untouched', async () => {
+        const a = account('paid'); const g = gateway(a.models, refusal(503, 'os_plan_unavailable'));
+        const other = gateway(paid(), ok, async () => true, 'synthetic-other-token');
+        expect(locked(await list(g.provider))).toEqual([]);
+        expect(locked(await list(other.provider))).toEqual([]);
+        a.state.mode = 'unknown';
+        const changes = g.changes();
+        await expect(send(g.provider, QWEN)).rejects.toThrow(/could not confirm which models your plan includes/);
+        expect(g.changes()).toBeGreaterThan(changes);
+        // Nothing more is sent: the cached paid catalog no longer counts.
+        await expect(send(g.provider, KIMI)).rejects.toThrow(/could not confirm which models your plan includes/);
+        expect(g.posts.map(post => post.body.model)).toEqual([QWEN]);
+        expect(locked(await list(g.provider))).toEqual([QWEN, KIMI]);
+        expect(locked(await list(other.provider))).toEqual([]);
+        await send(other.provider, QWEN);
+        expect(other.posts.map(post => post.body.model)).toEqual([QWEN]);
+        await Bun.sleep(0);
+        expect(g.intents).toEqual([]);
+        expect(warnings).not.toHaveBeenCalled();
+    });
+
+    test.each([
+        ['a credit refusal', refusal(402, 'insufficient_credits', { available_micro: 0, hold_micro: 1200 }), { reason: 'credits_exhausted', requestId: REQUEST }],
+        ['a used-up window', refusal(429, 'window_budget_reached', { budget_micro: '5000000', used_micro: '5000000', hold_micro: '400000', resets_at: null }),
+            { reason: 'window_limit', requestId: REQUEST }],
+    ] as const)('%s for a request begun while confirmed, answered after a fresh read found the same account unknown: a notice, no billing ask', async (_name, answer, intent) => {
+        let release!: () => void;
+        const held = new Promise<void>(resolve => { release = resolve; });
+        const a = account('paid');
+        const g = gateway(a.models, (() => held.then(() => answer())) as unknown as () => Response);
+        const other = gateway(paid(), answer, async () => true, 'synthetic-other-token');
+        await list(g.provider); await list(other.provider);
+        const pending = send(g.provider, QWEN).then(() => undefined, (e: Error) => e);
+        for (let i = 0; i < 100 && !g.posts.length; i++) await Bun.sleep(1);
+        expect(g.posts).toHaveLength(1);
+        // Meanwhile a fresh read (here the picker's re-check) finds this account's plan unknown.
+        a.state.mode = 'unknown';
+        expect(await g.provider.lockedModelChosen(QWEN)).toBe('unconfirmed');
+        release();
+        expect(await pending).toBeInstanceOf(Error);
+        await Bun.sleep(0); await Bun.sleep(0);
+        expect(g.intents).toEqual([]);
+        // The refusal's own words still show, with no purchase action.
+        expect(warnings).toHaveBeenCalledTimes(1);
+        expect(warnings.mock.calls[0]).toHaveLength(1);
+        expect(opened).toEqual([]);
+        // Another account (another token) is confirmed: its refusal asks as before.
+        await expect(send(other.provider, QWEN)).rejects.toThrow();
+        await Bun.sleep(0);
+        expect(other.intents).toEqual([intent]);
+        // Positive control: confirmed again (a verified paid read), the same account's refusal asks, within the same minute.
+        a.state.mode = 'paid';
+        await expect(send(g.provider, QWEN)).rejects.toThrow();
+        await Bun.sleep(0);
+        expect(g.intents).toEqual([intent]);
+        expect(g.posts).toHaveLength(2);
+    });
+
+    test('unknown to confirmed re-lists even when the confirmed catalog is byte-identical to what the picker listed', async () => {
+        const exact = [row(QWEN), row(KIMI), row(FLASH, 'available', { name: 'Gemini 3.8 Flash' })];
+        let plan: 'free' | 'unknown' = 'free';
+        const g = gateway(() => plan === 'free'
+            ? Response.json(catalog(exact, { default_model: null }), { headers: { [INCLUDED_MODELS_HEADER]: `${FLASH},${QWEN},${KIMI}` } }) : unknownPlan());
+        expect(locked(await list(g.provider))).toEqual([]);
+        plan = 'unknown';
+        forgetGatewayModels(BASE);
+        // Listed from the remembered limit, whose rows are exactly the catalog's: only the confirmation differs.
+        expect(locked(await list(g.provider))).toEqual([QWEN, KIMI, `ezil/${FLASH}`]);
+        plan = 'free';
+        const changes = g.changes();
+        await g.provider.recoverCatalog();
+        expect(g.changes()).toBe(changes + 1);
+        const infos = await list(g.provider);
+        expect(locked(infos)).toEqual([]);
+        expect(defaults(infos)).toEqual([`ezil/${FLASH}`]);
     });
 
     test('a request-time read that shows the plan changed re-lists the picker, though no row changed', async () => {
