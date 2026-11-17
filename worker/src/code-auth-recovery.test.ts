@@ -90,7 +90,7 @@ describe('unavailable AWS Code origin', () => {
     const req = await authed('/');
     await expectRecovery((await handleAwsBrowserHost(req, new URL(req.url), h.d))!, h.counts(), 0);
   });
-  it('fetches, assets, WebSockets, POST and another port keep the strict 502 JSON refusal', async () => {
+  it('Code fetches, assets, WebSockets and POST keep JSON; app navigation gets a preview diagnostic', async () => {
     for (const req of [await authed('/', { 'sec-fetch-dest': 'empty', accept: '*/*' }), await authed('/api'), await authed('/asset.js'),
       await authed('/', { 'sec-fetch-dest': 'iframe' }, 'POST'), await authed('/', { upgrade: 'websocket', 'sec-fetch-dest': 'iframe' })]) {
       const h = setup(), res = (await handleAwsBrowserHost(req, new URL(req.url), h.d))!;
@@ -98,7 +98,8 @@ describe('unavailable AWS Code origin', () => {
     }
     const other = new Request(base.replace('aws-8443-', 'aws-3002-') + '/', { headers: { 'sec-fetch-dest': 'iframe', cookie: `ezil_preview=${await mintPreviewCookie(secret, sid)}` } });
     const h = setup(), res = (await handleAwsBrowserHost(other, new URL(other.url), h.d))!;
-    expect(res.status).toBe(502); expect(await res.json()).toEqual({ ok: false, error: 'aws_origin_unavailable' });
+    expect(res.status).toBe(503); const body = await res.text();
+    expect(body).toContain('ezil.preview.state'); expect(body).not.toContain('ezil.preview.ready');
   });
   it("a gateway 502/503/504 for the document becomes the recovery document; code-server's own answers and assets pass through", async () => {
     for (const status of [502, 503, 504]) {

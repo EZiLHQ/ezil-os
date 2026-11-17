@@ -442,7 +442,8 @@ describe('AWS code port (handleAwsBrowserHost)', () => {
   it('other ports, paths, methods and answers pass through untouched', async () => {
     expect(await (await call(CODE_PREVIEW_PORT, '/?folder=/workspace', html(), [])).text()).toBe(WORKBENCH);
     expect(await (await call(CODE_PREVIEW_PORT, '/stable-1/x.html', html())).text()).toBe(WORKBENCH);
-    expect(await (await call(3002, '/', html())).text()).toBe(WORKBENCH);
+    const app = await (await call(3002, '/', html())).text();
+    expect(app).toContain('preview-inspector.js'); expect(app).not.toContain('data-ezil-folder-bridge');
     const redirect = await call(CODE_PREVIEW_PORT, '/', new Response(null, { status: 302, headers: { location: './?folder=/workspace' } }));
     expect(redirect.status).toBe(302);
     expect(redirect.headers.get('location')).toBe('./?folder=/workspace');

@@ -36,9 +36,10 @@ import {
   settleCodeFolder,
   type CodeFolderOutcome,
 } from './code-folder';
-import { injectCodeFolderBridge, isHtmlDocument, isWorkbenchDocumentRequest } from './code-folder-bridge';
+import { codeShellOriginsFor, injectCodeFolderBridge, isHtmlDocument, isWorkbenchDocumentRequest } from './code-folder-bridge';
 import { injectCodeDiagBridge } from './code-diag-bridge';
 import { injectCodeBillingBridge } from './code-billing-bridge';
+import { buildDiagnosticResponse, previewInspectorScript, stripFrameAncestors } from './preview-bridge';
 import {
   PREVIEW_COOKIE_NAME,
   PREVIEW_COOKIE_TTL_S,
@@ -422,11 +423,21 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
   const cookieOk = await verifyPreviewCookie(readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME), secrets, sandboxId);
   if (!cookieOk) return (port === CODE_PREVIEW_PORT ? codeAuthRecovery(request, deps.codeShellOrigins) : null)
     ?? json({ ok: false, error: 'aws_preview_auth_required' }, 401);
+  const inspectorOrigins = [`https://aws-${CODE_PREVIEW_PORT}-${sandboxId}-aws.${deps.zoneRoot}`, ...codeShellOriginsFor(deps.zoneRoot)];
+  if (port === APP_PREVIEW_PORT && request.method === 'GET' && url.pathname === '/preview-inspector.js') {
+    return new Response(previewInspectorScript(inspectorOrigins), { headers: {
+      'content-type': 'application/javascript; charset=utf-8', 'cache-control': 'private, no-store',
+    } });
+  }
+  const appDocument = port === APP_PREVIEW_PORT && request.method === 'GET'
+    && (['document', 'iframe'].includes(request.headers.get('sec-fetch-dest') ?? '') || (request.headers.get('accept') ?? '').includes('text/html'));
   // Code's workbench NAVIGATION never renders the JSON refusal: a tunnel that is absent, fenced or of another
   // epoch (a placement change, an idle stop), or an origin that does not answer behind it, gets the recovery
   // document (`./code-auth-recovery.ts` codeOriginRecovery), which the shell turns into a checked state.
-  // Everything else (fetch, assets, WebSockets, other ports) keeps the 502 JSON.
-  const originDown = (): Response => (port === CODE_PREVIEW_PORT ? codeOriginRecovery(request, deps.codeShellOrigins) : null) ?? unavailable();
+  // App navigations get the preview state page; fetches, assets and WebSockets keep the 502 JSON.
+  const originDown = (): Response => appDocument
+    ? buildDiagnosticResponse('upstream_error', port, undefined, inspectorOrigins)
+    : (port === CODE_PREVIEW_PORT ? codeOriginRecovery(request, deps.codeShellOrigins) : null) ?? unavailable();
   if (!deps.zone) return originDown();
   const record = await deps.lookup(sandboxId);
   if (!record || record.sandboxId !== sandboxId || !isAwsOriginFresh(record, deps.nowMs())) return originDown();
@@ -479,6 +490,21 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
       }
     }
     return withCodeFolderBridge(answered, deps.codeShellOrigins ?? []);
+  }
+  if (appDocument && isOriginGatewayFailure(answered.status)) {
+    try { await answered.body?.cancel(); } catch { /* already consumed */ }
+    return buildDiagnosticResponse('port_not_listening', port, undefined, inspectorOrigins);
+  }
+  if (port === APP_PREVIEW_PORT && isHtmlDocument(answered.status, answered.headers.get('content-type'))) {
+    const html = await answered.text();
+    const headers = new Headers(answered.headers);
+    for (const name of ['content-length', 'etag', 'last-modified', 'x-frame-options']) headers.delete(name);
+    const csp = headers.get('content-security-policy');
+    if (csp) { const kept = stripFrameAncestors(csp); if (kept) headers.set('content-security-policy', kept); else headers.delete('content-security-policy'); }
+    headers.set('cache-control', 'no-cache, no-store');
+    return new Response(html.replace(/<head(\s[^>]*)?>/i, '$&<script src="/preview-inspector.js" async></script>'), {
+      status: answered.status, statusText: answered.statusText, headers,
+    });
   }
   return answered;
 }

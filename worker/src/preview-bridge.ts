@@ -40,8 +40,8 @@
  *       any path (see `handleCodeBridge` in `src/index.ts`).
  *
  *   GET /preview-inspector.js
- *       Cookie-gated static inspector script (element selection, click/hover
- *       postMessage bridge — ported verbatim from the Python daemon).
+ *       Cookie-gated inspector script (code-preview-v1, with parent origins
+ *       computed for this app hostname on every request).
  *
  *   GET /preview-status
  *       Unauthenticated JSON dev-server readiness probe. See the module doc
@@ -73,7 +73,7 @@ import {
 } from './hmac';
 import { APP_PREVIEW_PORT, APP_PREVIEW_TOKEN, CODE_PREVIEW_PORT, CODE_PREVIEW_TOKEN } from './desktop-mode';
 import { codeBootstrapPathProblem, CODE_FOLDER_MINT_PARAM, codeFolderMint, plainFolderPath } from './code-folder';
-import { injectCodeFolderBridge, isHtmlDocument, isWorkbenchDocumentRequest } from './code-folder-bridge';
+import { codeShellOriginsFor, injectCodeFolderBridge, isHtmlDocument, isWorkbenchDocumentRequest } from './code-folder-bridge';
 import { injectCodeDiagBridge } from './code-diag-bridge';
 import { injectCodeBillingBridge } from './code-billing-bridge';
 
@@ -393,139 +393,152 @@ export function injectRuntimeShim(html: string): string {
   return html.slice(0, idx) + RUNTIME_SHIM + html.slice(idx);
 }
 
-/**
- * Inspector script served at `/preview-inspector.js`. Ported verbatim from
- * `preview_bridge.py`'s `_INSPECTOR_JS` (element hover/click/select over
- * postMessage, EID/ORID `data-eid`/`data-oid` compatible).
- */
-export const INSPECTOR_JS = `
-(function () {
-  if (window.__ezilInspectorInstalled) return;
-  window.__ezilInspectorInstalled = true;
+/** Parent origins for this app host only; a different sandbox's Code frame is never admitted. */
+export function previewInspectorOrigins(hostname: string): string[] {
+  const route = parseBridgeHost(hostname);
+  const dot = hostname.indexOf('.');
+  if (!route || route.target !== 'app' || dot < 0) return [];
+  const zone = hostname.slice(dot + 1);
+  return [`https://${CODE_PREVIEW_PORT}-${route.sandboxId}-${CODE_PREVIEW_TOKEN}.${zone}`, ...codeShellOriginsFor(zone)];
+}
 
-  var parent = window.parent;
-  if (!parent || parent === window) return;
-
-  function postToParent(type, detail) {
-    try { parent.postMessage({ __ezil: true, type: type, detail: detail }, '*'); } catch (e) {}
+/** Hop 1 of code-preview-v1. All state is document-local; app DOM is an untrusted snapshot. */
+export function previewInspectorScript(origins: readonly string[]): string {
+  return String.raw`(()=>{try{
+const origins=${JSON.stringify(origins).replace(/</g, '\\u003c')};
+if(window.parent===window||!origins.length)return;
+const TOKEN=/^[A-Za-z0-9_-]{22}$/,TAG=/^[a-z][a-z0-9-]{0,31}$/;
+const ATTRS=['href','src','alt','type','placeholder','aria-label','data-testid'];
+const STYLES=['color','background-color','font-family','font-size','font-weight','line-height','text-align','display','position','margin','padding','border','border-radius','width','height','gap','flex-direction','justify-content','align-items'];
+const SECRET=/^(ezil_pv|ezil_mint|token|access_token|id_token|refresh_token|code|state|session|sid|key|api_key|apikey|secret|password|pass|auth|authorization|signature|sig)$|_token$/i;
+const clean=(s,n)=>String(s??'').replace(/[\x00-\x1f\x7f-\x9f]/g,'').slice(0,n);
+function sanitizeUrl(value,max=512){
+  const s=clean(value,Infinity);
+  try{
+    const u=new URL(s,location.href);
+    if(!['https:','http:'].includes(u.protocol))return '';
+    u.username='';u.password='';
+    for(const k of [...u.searchParams.keys()])if(SECRET.test(k))u.searchParams.delete(k);
+    const absolute=/^[a-z][a-z0-9+.-]*:/i.test(s)||s.startsWith('//');
+    return clean(absolute?u.href:u.pathname+u.search+u.hash,max);
+  }catch{return ''}
+}
+const object=v=>v!==null&&typeof v==='object'&&!Array.isArray(v);
+const keys=(v,allowed)=>object(v)&&Object.keys(v).every(k=>allowed.includes(k));
+const str=(v,n)=>typeof v==='string'&&v.length<=n&&clean(v,n)===v;
+const integer=v=>Number.isSafeInteger(v);
+const summary=v=>keys(v,['tag','id','classes'])&&TAG.test(v.tag)&&str(v.tag,32)&&(v.id===undefined||str(v.id,64))&&Array.isArray(v.classes)&&v.classes.length<=12&&v.classes.every(c=>str(c,64));
+function validSelection(s){
+  if(!keys(s,['doc','viewport','el','ancestors']))return false;
+  const d=s.doc,v=s.viewport,e=s.el;
+  if(!keys(d,['gen','mut','path','title'])||!str(d.gen,22)||!TOKEN.test(d.gen)||!integer(d.mut)||d.mut<0||d.mut>2147483648||!str(d.path,512)||sanitizeUrl(d.path)!==d.path||!str(d.title,120))return false;
+  if(!keys(v,['w','h','dpr'])||!integer(v.w)||v.w<0||!integer(v.h)||v.h<0||!Number.isFinite(v.dpr)||v.dpr<0.5||v.dpr>8)return false;
+  if(!keys(e,['tag','id','classes','role','name','text','selector','rect','attrs','styles','source'])||!summary({tag:e.tag,id:e.id,classes:e.classes}))return false;
+  if(!str(e.text,300)||!str(e.selector,512)||!e.selector||(e.role!==undefined&&!str(e.role,120))||(e.name!==undefined&&!str(e.name,120)))return false;
+  if(!keys(e.rect,['x','y','w','h'])||!['x','y','w','h'].every(k=>integer(e.rect[k]))||e.rect.w<0||e.rect.h<0)return false;
+  if(!keys(e.styles,STYLES)||!Object.values(e.styles).every(v=>str(v,120)))return false;
+  if(e.attrs!==undefined&&(!keys(e.attrs,ATTRS)||!Object.entries(e.attrs).every(([k,v])=>str(v,200)&&(!['href','src'].includes(k)||v===''||sanitizeUrl(v,200)===v))))return false;
+  if(e.source!==undefined&&(!keys(e.source,['eid'])||!str(e.source.eid,200)))return false;
+  return Array.isArray(s.ancestors)&&s.ancestors.length<=6&&s.ancestors.every(summary);
+}
+const gen=btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16)))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+let mut=0,nonce,origin,mode='interact';
+const doc=()=>{let p=location.pathname;if(!location.hostname.startsWith('aws-')){if(p==='/preview')p='/';else if(p.startsWith('/preview/'))p=p.slice(8);}return {gen,mut,path:sanitizeUrl(p+location.search+location.hash),title:clean(document.title,120)}};
+const post=(type,record)=>{if(!nonce)return;try{window.parent.postMessage({type:'ezil.preview.'+type,v:1,nonce,...record},origin)}catch{}};
+window.addEventListener('message',ev=>{try{
+  const d=ev.data;
+  if(ev.source!==window.parent||!origins.includes(ev.origin)||ev.origin==='*'||ev.origin==='null'||!object(d)||d.v!==1||typeof d.nonce!=='string'||d.nonce.length!==22||!TOKEN.test(d.nonce))return;
+  if(d.type==='ezil.preview.hello'&&keys(d,['type','v','nonce'])){nonce=d.nonce;origin=ev.origin;mode='interact';post('ready',{doc:doc()});return}
+  if(ev.origin===origin&&d.nonce===nonce&&d.type==='ezil.preview.mode'&&keys(d,['type','v','nonce','mode'])&&['interact','select'].includes(d.mode))mode=d.mode;
+}catch{}});
+function sensitive(el){
+  for(let p=el;p&&p.nodeType===1;p=p.parentElement){
+    const tag=p.tagName.toLowerCase(),ac=p.getAttribute('autocomplete')||'';
+    if(['input','textarea','select'].includes(tag)||p.getAttribute('type')?.toLowerCase()==='password'||p.isContentEditable||p.hasAttribute('contenteditable')&&p.getAttribute('contenteditable')!=='false'||/(?:username|password|one-time-code|cc-)/i.test(ac))return true;
+  }return false;
+}
+function visibleText(el){
+  let text='',visited=0;
+  function walk(node){
+    if(++visited>2000||text.length>=1200)return;
+    if(node.nodeType===3){text+=node.textContent+' ';return}
+    if(node.nodeType!==1||sensitive(node)||['script','style','template','noscript'].includes(node.tagName.toLowerCase())||node.hidden)return;
+    const style=getComputedStyle(node);if(style.display==='none'||style.visibility==='hidden'||style.visibility==='collapse')return;
+    for(const child of node.childNodes)walk(child);
   }
-
-  function inAppPath() {
-    var p = location.pathname || '/';
-    if (p.indexOf('/preview/') === 0) p = p.slice('/preview'.length) || '/';
-    else if (p === '/preview') p = '/';
-    return p + (location.search || '') + (location.hash || '');
+  walk(el);return clean(text.replace(/\s+/g,' ').trim(),300);
+}
+const basic=el=>{const r={tag:el.tagName.toLowerCase(),classes:Array.from(el.classList).slice(0,12).map(c=>clean(c,64))};if(el.id)r.id=clean(el.id,64);return r};
+const escape=s=>Array.from(s).map((c,i)=>/[a-zA-Z_]/.test(c)||i>0&&/[a-zA-Z0-9_-]/.test(c)?c:'\\'+c.codePointAt(0).toString(16)+' ').join('');
+function selector(el){
+  const parts=[];let length=0;
+  for(let p=el;p&&p.nodeType===1;p=p.parentElement){
+    let step=p.tagName.toLowerCase();if(!TAG.test(step))break;
+    const id=p.id&&p.id===clean(p.id,64)?p.id:'',cls=Array.from(p.classList).find(c=>c&&c===clean(c,64));
+    if(id)step+='#'+escape(id);
+    else if(cls)step+='.'+escape(cls);
+    else{let n=1;for(let s=p.previousElementSibling;s;s=s.previousElementSibling)if(s.tagName===p.tagName)n++;step+=':nth-of-type('+n+')'}
+    if(!parts.length&&step.length>512)step=p.tagName.toLowerCase();
+    if(length+step.length+(parts.length?3:0)>512)break;
+    parts.unshift(step);length+=step.length+(parts.length>1?3:0);if(id||parts.length>=12)break;
+  }return parts.join(' > ');
+}
+function selection(el){
+  const e=basic(el),blocked=sensitive(el),r=el.getBoundingClientRect();
+  e.text=blocked?'':visibleText(el);e.selector=selector(el);
+  e.rect={x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)};
+  const role=el.getAttribute('role');if(role)e.role=clean(role,120);
+  const name=blocked?'':el.getAttribute('aria-label')||el.getAttribute('alt')||e.text;if(name)e.name=clean(name,120);
+  e.attrs={};for(const k of ATTRS){const value=el.getAttribute(k);if(value!==null&&!(blocked&&k==='placeholder'))e.attrs[k]=['href','src'].includes(k)?sanitizeUrl(value,200):clean(value,200)}
+  e.styles={};const styles=getComputedStyle(el);for(const k of STYLES){const value=styles.getPropertyValue(k);if(value)e.styles[k]=clean(value,120)}
+  const ancestors=[];for(let p=el;p&&p.nodeType===1;p=p.parentElement){
+    const eid=p.getAttribute('data-eid')||p.getAttribute('data-oid');if(eid&&!e.source)e.source={eid:clean(eid,200)};
+    if(p!==el&&ancestors.length<6)ancestors.push(basic(p));
   }
+  const s={doc:doc(),viewport:{w:Math.round(window.innerWidth),h:Math.round(window.innerHeight),dpr:Math.min(8,Math.max(.5,window.devicePixelRatio||1))},el:e,ancestors};
+  return validSelection(s)?s:null;
+}
+let lastTouch=-Infinity;
+function select(ev){
+  if(mode!=='select'||!nonce)return;
+  if(ev.type==='keydown'&&(!['Enter',' ','Spacebar'].includes(ev.key)||ev.repeat))return;
+  const el=ev.target?.nodeType===1?ev.target:ev.target?.parentElement;if(!el)return;
+  ev.preventDefault();ev.stopPropagation();
+  if(ev.type==='click'&&Date.now()-lastTouch<750)return;
+  if(ev.type==='touchend')lastTouch=Date.now();
+  try{const sel=selection(el);if(sel)post('select',{sel})}catch{}
+}
+document.addEventListener('click',select,true);
+document.addEventListener('keydown',select,true);
+document.addEventListener('touchend',select,{capture:true,passive:false});
+// Keep the latest document even during continuous mutation/HMR bursts, at most four posts per second.
+function limited(type){let timer,last=-Infinity;return ()=>{if(!nonce||timer!==undefined)return;timer=setTimeout(()=>{timer=undefined;last=Date.now();post(type,{doc:doc()})},Math.max(50,250-(Date.now()-last)))}}
+const changed=limited('changed'),navigate=limited('navigate');
+const bump=()=>{mut=Math.min(2147483648,mut+1);changed()};
+// The inspector is a classic script: reuse the app's existing Vite client to reach its hot event bus.
+let viteBound=false;
+function bindVite(){try{
+  if(viteBound)return;
+  const script=document.querySelector('script[type="module"][src*="/@vite/client"]');if(!script)return;
+  const vite=new URL(script.src,location.href);if(vite.origin!==location.origin||!vite.pathname.endsWith('/@vite/client'))return;
+  viteBound=true;
+  import(vite.href).then(client=>{if(typeof client.createHotContext==='function')client.createHotContext('/preview-inspector.js').on('vite:afterUpdate',bump)}).catch(()=>{});
+}catch{}}
+new MutationObserver(()=>{bump();bindVite()}).observe(document,{subtree:true,childList:true,attributes:true,characterData:true});
+bindVite();
+window.addEventListener('vite:afterUpdate',bump);
+document.addEventListener('vite:afterUpdate',bump);
+for(const key of ['pushState','replaceState']){const original=history[key];history[key]=function(){const result=original.apply(this,arguments);navigate();return result}}
+window.addEventListener('popstate',navigate);window.addEventListener('hashchange',navigate);
+}catch{}})();`;
+}
 
-  function elementEid(el) {
-    if (!el || !el.getAttribute) return null;
-    return el.getAttribute('data-eid') || el.getAttribute('data-oid') || null;
-  }
-
-  function findEidTarget(node) {
-    var el = node;
-    while (el && el.nodeType === 1) {
-      if (elementEid(el)) return el;
-      el = el.parentElement;
-    }
-    return null;
-  }
-
-  function rectOf(el) {
-    var r = el.getBoundingClientRect();
-    return {
-      x: r.left, y: r.top, width: r.width, height: r.height,
-      vw: window.innerWidth, vh: window.innerHeight,
-    };
-  }
-
-  function describe(el) {
-    return {
-      oid: elementEid(el),
-      framework: el.hasAttribute('data-eid') ? 'eid' : 'orid',
-      tag: el.tagName.toLowerCase(),
-      id: el.id || undefined,
-      classes: el.className ? String(el.className).split(/\\s+/).filter(Boolean).slice(0, 20) : undefined,
-      rect: rectOf(el),
-      text: (el.innerText || '').slice(0, 200),
-    };
-  }
-
-  var hoverEl = null, rafHover = 0;
-  function onMove(e) {
-    if (rafHover) return;
-    rafHover = requestAnimationFrame(function () {
-      rafHover = 0;
-      var el = findEidTarget(e.target);
-      if (el !== hoverEl) {
-        hoverEl = el;
-        postToParent('hover', el ? describe(el) : null);
-      } else if (el) {
-        postToParent('hover', describe(el));
-      }
-    });
-  }
-  function onLeave() { hoverEl = null; postToParent('hover', null); }
-  document.addEventListener('mousemove', onMove, { passive: true });
-  document.addEventListener('mouseleave', onLeave, { passive: true });
-
-  var selectMode = false;
-  window.addEventListener('message', function (ev) {
-    var d = ev.data;
-    if (!d || !d.__ezil) return;
-    if (d.type === 'set-select-mode') selectMode = !!d.detail;
-    else if (d.type === 'get-tree') {
-      postToParent('tree', serializeTree(document.body, 8));
-    } else if (d.type === 'ping') {
-      postToParent('pong', { href: location.href, path: inAppPath(), title: document.title });
-    }
-  });
-
-  document.addEventListener('click', function (e) {
-    if (!selectMode) return;
-    var el = findEidTarget(e.target);
-    if (!el) return;
-    e.preventDefault();
-    e.stopPropagation();
-    postToParent('select', describe(el));
-  }, true);
-
-  function serializeTree(root, maxDepth) {
-    function visit(node, depth) {
-      if (!node || node.nodeType !== 1) return null;
-      var eid = elementEid(node);
-      var children = [];
-      if (depth < maxDepth) {
-        for (var i = 0; i < node.children.length; i++) {
-          var c = visit(node.children[i], depth + 1);
-          if (c) children.push(c);
-        }
-      }
-      return {
-        oid: eid,
-        framework: node.hasAttribute('data-eid') ? 'eid' : (node.hasAttribute('data-oid') ? 'orid' : null),
-        tag: node.tagName.toLowerCase(),
-        id: node.id || undefined,
-        rect: rectOf(node),
-        children: children,
-      };
-    }
-    return visit(root, 0);
-  }
-
-  postToParent('ready', { href: location.href, path: inAppPath(), title: document.title });
-
-  var origPush = history.pushState;
-  history.pushState = function () {
-    var r = origPush.apply(this, arguments);
-    postToParent('navigate', { href: location.href, path: inAppPath() });
-    return r;
-  };
-  window.addEventListener('popstate', function () {
-    postToParent('navigate', { href: location.href, path: inAppPath() });
-  });
-})();
-`.trimStart();
+function previewDiagnosticScript(origins: readonly string[], state: PreviewDiagnosticReason): string {
+  return `(()=>{const origins=${JSON.stringify(origins).replace(/</g, '\\u003c')};window.addEventListener('message',ev=>{try{const d=ev.data;
+if(ev.source!==window.parent||window.parent===window||!origins.includes(ev.origin)||ev.origin==='*'||ev.origin==='null'||!d||typeof d!=='object'||Array.isArray(d)||Object.keys(d).length!==3||d.type!=='ezil.preview.hello'||d.v!==1||typeof d.nonce!=='string'||d.nonce.length!==22||!/^[A-Za-z0-9_-]{22}$/.test(d.nonce))return;
+window.parent.postMessage({type:'ezil.preview.state',v:1,nonce:d.nonce,state:${JSON.stringify(state)}},ev.origin);
+}catch{}})})();`;
+}
 
 // ── "Dev server not up" diagnostic page ──────────────────────────────────────
 
@@ -552,7 +565,7 @@ export const INSPECTOR_JS = `
  */
 export type PreviewDiagnosticReason = 'no_package_json' | 'port_not_listening' | 'upstream_error';
 
-export function buildDiagnosticResponse(reason: PreviewDiagnosticReason, port: number, detail?: string): Response {
+export function buildDiagnosticResponse(reason: PreviewDiagnosticReason, port: number, detail?: string, origins: readonly string[] = []): Response {
   const label =
     reason === 'no_package_json'
       ? 'No project scaffolded yet'
@@ -563,6 +576,7 @@ export function buildDiagnosticResponse(reason: PreviewDiagnosticReason, port: n
   const body = `<!doctype html>
 <html><head><title>EZiL Preview — ${escapeHtml(label)}</title>
 <meta http-equiv="refresh" content="3">
+<script>${previewDiagnosticScript(origins, reason)}</script>
 <style>
 *{box-sizing:border-box}
 body{background:#1a1017;color:#f0d0d0;font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;padding:2rem}
@@ -940,7 +954,7 @@ export async function handlePreviewProxy(
     const message = err instanceof Error ? err.message : String(err);
     // Connection-refused / not-yet-listening is the common case — surface the
     // explicit "waiting for dev server" diagnostic rather than a hard 502.
-    return buildDiagnosticResponse('port_not_listening', port, message);
+    return buildDiagnosticResponse('port_not_listening', port, message, previewInspectorOrigins(url.hostname));
   }
 
   const contentType = upstream.headers.get('content-type') ?? '';
@@ -975,11 +989,11 @@ export async function handlePreviewInspectorJs(
       { status: 401, headers: { 'content-type': 'application/json' } },
     );
   }
-  return new Response(INSPECTOR_JS, {
+  return new Response(previewInspectorScript(previewInspectorOrigins(new URL(request.url).hostname)), {
     status: 200,
     headers: {
       'content-type': 'application/javascript; charset=utf-8',
-      'cache-control': 'public, max-age=60',
+      'cache-control': 'private, no-store',
     },
   });
 }

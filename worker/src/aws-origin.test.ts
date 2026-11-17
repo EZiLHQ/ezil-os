@@ -512,3 +512,45 @@ describe('sendAwsControl (GW-5 proposal)', () => {
     expect(f.calls.length).toBe(0);
   });
 });
+
+describe('AWS app inspector v1', () => {
+  async function app(path: string, options: { authenticated?: boolean; status?: number; type?: string; fail?: boolean; zoneRoot?: string; body?: string } = {}) {
+    const zoneRoot = options.zoneRoot ?? 'ezil.org';
+    const url = new URL(`https://aws-3002-${SID}-aws.${zoneRoot}${path}`);
+    const cookie = options.authenticated === false ? '' : await mintPreviewCookie(SECRET, SID);
+    let fetched = 0;
+    const response = await handleAwsBrowserHost(new Request(url, { headers: { cookie: `ezil_preview=${cookie}`, 'sec-fetch-dest': 'iframe' } }), url, {
+      routingEnabled: true, zone: ZONE, secrets: [SECRET], zoneRoot, lookup: async () => record(), nowMs: () => Date.now(),
+      fetch: async () => { fetched++; if (options.fail) throw Error('origin unavailable');
+        return new Response(options.body ?? '<html><head><title>App</title></head><body>Hello</body></html>', {
+          status: options.status ?? 200, headers: { 'content-type': options.type ?? 'text/html', etag: 'old',
+            'x-frame-options': 'DENY', 'content-security-policy': "script-src 'self'; frame-ancestors 'none'" },
+        }); },
+    });
+    return { response: response!, fetched };
+  }
+  it('serves a cookie-gated script with the same AWS sandbox Code origin and realm shell', async () => {
+    const denied = await app('/preview-inspector.js', { authenticated: false }); expect(denied.response.status).toBe(401); expect(denied.fetched).toBe(0);
+    for (const zoneRoot of ['ezil.org', 'ezil.work']) {
+      const { response, fetched } = await app('/preview-inspector.js', { zoneRoot }); expect(response.status).toBe(200); expect(fetched).toBe(0);
+      const script = await response.text(); expect(script).toContain(`https://aws-8443-${SID}-aws.${zoneRoot}`);
+      expect(script).toContain(zoneRoot === 'ezil.org' ? 'https://os.ezil.work' : 'https://os-staging.ezil.work');
+      expect(script).not.toContain('__ezil'); expect(response.headers.get('cache-control')).toBe('private, no-store');
+    }
+  });
+  it('injects the inspector into successful app HTML, preserving direct AWS URLs', async () => {
+    const { response } = await app('/'); const body = await response.text();
+    expect(body).toContain('<head><script src="/preview-inspector.js" async></script>'); expect(body).not.toContain('/preview-ws/');
+    expect(response.headers.get('etag')).toBeNull(); expect(response.headers.get('x-frame-options')).toBeNull();
+    expect(response.headers.get('content-security-policy')).toBe("script-src 'self'");
+    const asset = await app('/app.js', { type: 'application/javascript', body: 'const app=1;' }); expect(await asset.response.text()).toBe('const app=1;');
+    const error = await app('/missing', { status: 404 }); expect(await error.response.text()).not.toContain('preview-inspector.js');
+  });
+  it('returns state-only diagnostics when the app origin fails', async () => {
+    for (const options of [{ fail: true }, { status: 502 }, { status: 503 }, { status: 504 }]) {
+      const { response } = await app('/', options); expect(response.status).toBe(503); const body = await response.text();
+      expect(body).toContain('ezil.preview.state'); expect(body).not.toContain('ezil.preview.ready');
+      expect(body).toContain(`https://aws-8443-${SID}-aws.ezil.org`); expect(body).toContain('<meta http-equiv="refresh" content="3">');
+    }
+  });
+});
