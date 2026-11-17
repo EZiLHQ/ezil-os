@@ -101,7 +101,7 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(again,back)
 
     def test_registry_full_refuses_without_dropping_any_record(self):
-        records=[self.source,*[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,56)]]
+        records=[self.source,*[dict(self.source,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,57)]]
         self.assertEqual(len(records),TOOL.ACTIVE_REGISTRY_CAPACITY)
         for record in records: manifest.validate(record, source=True, repository=TOOL.REPOSITORY)
         original=copy.deepcopy(records)
@@ -210,17 +210,17 @@ class RegistryTests(unittest.TestCase):
                         self.assertEqual(deployments[TOOL.REGION]['releases'],retained)
                         self.assertEqual(envelope,frozen)
 
-    def test_thirty_one_through_thirty_seven_fit_readback_but_thirty_eight_refused(self):
-        records=[self.target,*[dict(self.target,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,57)]]
+    def test_thirty_one_through_thirty_eight_fit_readback_but_thirty_nine_refused(self):
+        records=[self.target,*[dict(self.target,amiId='ami-'+format(n,'017x'),recipeVersion='1.0.'+str(n)) for n in range(20,58)]]
         for record in records:
             manifest.validate(record,source=True,repository=TOOL.REPOSITORY)
             self.assertIsNotNone(record['previousLowerImageDigest'])
             self.assertIsNotNone(record['previousLowerImageRef'])
-        for count in (31,32,33,34,35,36,37,38):
+        for count in (31,32,33,34,35,36,37,38,39):
             with self.subTest(count=count):
                 d=dict(self.target,releases=records[:count])
                 public=app_ops.public_deployment(d)
-                readback={'gitSha':'9'*40,'killSwitch':'1','deployment':public,'readerCapacity':37}
+                readback={'gitSha':'9'*40,'killSwitch':'1','deployment':public,'readerCapacity':38}
                 self.assertNotIn('releases',public)
                 self.assertRegex(public['releasesSha256'],r'^[0-9a-f]{64}$')
                 self.assertLessEqual(len(json.dumps(readback,separators=(',',':')).encode('utf-8')),24000)
@@ -300,10 +300,10 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(caps,expected)
         self.assertEqual(TOOL.RELEASE_REGISTRY_CAPACITY,32)
         self.assertEqual(TOOL.LEGACY_REGISTRY_CAPACITY,{'mum':32,'prd':26})
-        self.assertEqual(TOOL.ACTIVE_REGISTRY_CAPACITY,37)
+        self.assertEqual(TOOL.ACTIVE_REGISTRY_CAPACITY,38)
         app_constant=(root/'app/src/server/lib/compute/aws-rebase-release.ts').read_text()
-        self.assertEqual(re.findall(r'^export const REBASE_RELEASE_REGISTRY_CAPACITY = ([0-9]+);$',app_constant,re.M),['37'])
-        self.assertEqual(RELEASE.CAPACITY_DECLARATION.findall(app_constant),['37'])
+        self.assertEqual(re.findall(r'^export const REBASE_RELEASE_REGISTRY_CAPACITY = ([0-9]+);$',app_constant,re.M),['38'])
+        self.assertEqual(RELEASE.CAPACITY_DECLARATION.findall(app_constant),['38'])
         # The health route reports that same constant; it is not a configured value.
         health=(root/'app/src/app/api/health/route.ts').read_text()
         self.assertIn('registryCapacity: REBASE_RELEASE_REGISTRY_CAPACITY',health)
@@ -1832,8 +1832,37 @@ class IntegrationTests(unittest.TestCase):
         self.reader_fixture(32,capacity=32);self.health_capacity=33
         self.assert_apply_app_refused('target app cannot read the live release registry')
 
-    def test_full_thirty_seven_record_registry_refuses_a_thirty_eighth_before_install_or_secret_write(self):
-        self.reader_fixture(37,capacity=37);self.health_capacity=37
+    def test_thirty_seventh_to_thirty_eighth_record_requires_proven_reader_and_rollback_retains_all(self):
+        extra=self.reader_fixture(37,capacity=38);self.health_capacity=38
+        before=TOOL.pair({'settings':{'deployment':self.running_deployment}})
+        retained=copy.deepcopy(self.running_deployment['releases'])
+        self.through_app()
+        self.assertEqual(self.running_deployment['releases'],retained)
+        self.assertEqual(RELEASE.require_receipt(self.path,'apply-app')['readerCapacity'],38)
+        RELEASE.promote(self.manifest,True)
+        target=manifest.read(self.manifest)
+        self.assertEqual(len(self.running_deployment['releases']),38)
+        self.assertEqual(self.running_deployment['releases'][:37],retained)
+        RELEASE.promote(self.manifest,True,rollback=True)
+        self.assertEqual(len(self.running_deployment['releases']),38)
+        self.assertCountEqual(self.running_deployment['releases'],[self.source,*extra,target])
+        self.assertEqual(TOOL.pair({'settings':{'deployment':self.running_deployment}}),before)
+        self.assertEqual(self.running_sha,target['agentCommit'])
+
+    def test_thirty_eighth_record_refuses_thirty_seven_source_before_install(self):
+        self.reader_fixture(37,capacity=37);self.health_capacity=38
+        self.assert_apply_app_refused('target app cannot read the live release registry')
+
+    def test_thirty_eighth_record_refuses_stale_thirty_seven_runtime_before_receipt(self):
+        self.reader_fixture(37,capacity=38);self.health_capacity=37
+        self.through_ready()
+        with self.assertRaisesRegex(ValueError,'running app reader capacity is below'):
+            RELEASE.apply_app(self.manifest,True)
+        self.assertFalse((self.directory/'apply-app-receipt.json').exists())
+        self.assertNotIn(('secret','put-secret-value'),self.calls)
+
+    def test_full_thirty_eight_record_registry_refuses_a_thirty_ninth_before_install_or_secret_write(self):
+        self.reader_fixture(38,capacity=38);self.health_capacity=38
         self.assert_apply_app_refused('target app cannot read the live release registry')
         with self.assertRaisesRegex(ValueError,'registry full'):
             TOOL.edit_release_secret(copy.deepcopy(self.envelope),TOOL.pair({'settings':{'deployment':self.running_deployment}}),

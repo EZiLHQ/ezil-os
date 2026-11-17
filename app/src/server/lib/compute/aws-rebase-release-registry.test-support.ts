@@ -228,3 +228,11 @@ export function fixtureReleaseRegistry37() {
     return { ...f, release143, retained: [...f.retained, release143],
         deployment143: { ...f.deployment142, amiId: release143.amiId } };
 }
+
+/** Synthetic thirty-eighth record appended after the thirty-seven; not actual release proof. */
+export function fixtureReleaseRegistry38() {
+    const f = fixtureReleaseRegistry37();
+    const release144 = { ...f.release143, amiId: 'ami-00000000000000038', recipeVersion: '1.0.44', createdAt: '2026-11-15T01:00:00.000Z' };
+    return { ...f, release144, retained: [...f.retained, release144],
+        deployment144: { ...f.deployment143, amiId: release144.amiId } };
+}
