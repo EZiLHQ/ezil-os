@@ -13,6 +13,7 @@ const doc = vectors.selection.accept[0]!.sel.doc;
 const sel = vectors.selection.accept[0]!.sel;
 
 class FakePanel {
+    disposed = false;
     messages: any[] = [];
     listeners: ((value: unknown) => unknown)[] = [];
     closes: (() => void)[] = [];
@@ -21,11 +22,11 @@ class FakePanel {
         html: '', cspSource: 'https://webview.test', options: {},
         asWebviewUri: (uri: URL) => uri,
         postMessage: async (value: unknown) => { this.messages.push(value); return true; },
-        onDidReceiveMessage: (listener: (value: unknown) => unknown) => { this.listeners.push(listener); return { dispose() {} }; },
+        onDidReceiveMessage: (listener: (value: unknown) => unknown) => { this.listeners.push(listener); return { dispose: () => { this.listeners = this.listeners.filter(value => value !== listener); } }; },
     };
-    onDidDispose = (listener: () => void) => { this.closes.push(listener); return { dispose() {} }; };
+    onDidDispose = (listener: () => void) => { this.closes.push(listener); return { dispose: () => { this.closes = this.closes.filter(value => value !== listener); } }; };
     reveal = (...args: unknown[]) => { this.reveals.push(args); };
-    dispose(): void { for (const listener of this.closes) listener(); }
+    dispose(): void { if (this.disposed) return; this.disposed = true; for (const listener of [...this.closes]) listener(); }
 }
 const window = fakeVscode.window as Record<string, any>;
 const commands = fakeVscode.commands as Record<string, any>;
@@ -43,7 +44,7 @@ beforeEach(() => {
     sent = []; copied = []; external = []; panels = []; creation = []; statuses = []; registered = new Map(); reply = minted;
     Object.assign(commands, {
         executeCommand: async (...args: any[]) => { sent.push(args); return args[0] === '_ezil.previewMint' ? await reply() : true; },
-        registerCommand: (id: string, handler: () => Promise<void>) => { registered.set(id, handler); return { dispose() {} }; },
+        registerCommand: (id: string, handler: () => Promise<void>) => { registered.set(id, handler); return { dispose: () => { registered.delete(id); } }; },
     });
     Object.assign(window, {
         createStatusBarItem: () => { const status = { show() {}, dispose() {} }; statuses.push(status); return status; },
@@ -64,6 +65,90 @@ function create(state?: unknown) {
     return { panel, preview };
 }
 function register() { registerPreview({ subscriptions, extensionUri: new URL('file:///extension') } as unknown as vscode.ExtensionContext); }
+
+for (const failure of ['command', 'serializer', 'status creation', 'status text', 'status tooltip', 'status command', 'status show']) {
+    test(`preview registration rolls back ${failure} without publishing partial resources`, async () => {
+        let serializerActive = false, statusDisposed = false;
+        let resumeLayout!: () => void;
+        const layout = new Promise<void>(resolve => { resumeLayout = resolve; });
+        commands.executeCommand = (...args: any[]) => { sent.push(args); return layout; };
+        const existing = { dispose: mock(() => {}) };
+        subscriptions.push(existing);
+        const assertPrivate = () => expect(subscriptions).toEqual([existing]);
+        const fail = () => { assertPrivate(); throw new Error('PRIVATE registration failure'); };
+        const restored = new FakePanel();
+        let restoring: PromiseLike<void> | undefined;
+        let opening: Promise<void> | undefined;
+        const registerCommand = commands.registerCommand;
+        commands.registerCommand = (...args: any[]) => {
+            assertPrivate();
+            if (failure === 'command') fail();
+            return registerCommand(...args);
+        };
+        window.registerWebviewPanelSerializer = (_: string, value: vscode.WebviewPanelSerializer) => {
+            assertPrivate();
+            opening = registered.get('ezil.preview.open')!();
+            restoring = value.deserializeWebviewPanel(restored as unknown as vscode.WebviewPanel, { path: '/saved' });
+            if (failure === 'serializer') fail();
+            serializerActive = true;
+            return { dispose: () => { serializerActive = false; } };
+        };
+        window.createStatusBarItem = () => {
+            assertPrivate();
+            if (failure === 'status creation') fail();
+            return {
+                set text(_: string) { if (failure === 'status text') fail(); },
+                set tooltip(_: string) { if (failure === 'status tooltip') fail(); },
+                set command(_: string) { if (failure === 'status command') fail(); },
+                show: () => { if (failure === 'status show') fail(); },
+                dispose: () => { statusDisposed = true; },
+            };
+        };
+        expect(register).toThrow('PRIVATE registration failure');
+        expect(subscriptions).toEqual([existing]); expect(existing.dispose).not.toHaveBeenCalled();
+        expect(registered.size).toBe(0); expect(serializerActive).toBe(false);
+        expect(statusDisposed).toBe(failure.startsWith('status ') && failure !== 'status creation');
+        if (failure !== 'command') expect(restored.disposed).toBe(true);
+        resumeLayout(); await restoring; await opening;
+        expect(panels).toHaveLength(0);
+        expect(sent.every(([id]) => id === 'workbench.action.restoreAuxiliaryBar')).toBe(true);
+        expect(restored.listeners).toHaveLength(0); expect(restored.closes).toHaveLength(0);
+    });
+}
+
+test('registration disposal closes the active panel, cancels mint and removes command and serializer', async () => {
+    let serializerActive = false;
+    window.registerWebviewPanelSerializer = (_: string, value: vscode.WebviewPanelSerializer) => { serializer = value; serializerActive = true; return { dispose: () => { serializerActive = false; } }; };
+    let finish!: (value: unknown) => void;
+    reply = () => new Promise(resolve => { finish = resolve; });
+    register(); const open = registered.get('ezil.preview.open')!;
+    const pending = open();
+    while (!panels.length) await Promise.resolve();
+    for (const subscription of subscriptions) subscription.dispose();
+    await pending;
+    const panel = panels[0]!, html = panel.webview.html, count = panel.messages.length;
+    finish(minted()); await open();
+    expect(panel.disposed).toBe(true); expect(registered.size).toBe(0); expect(serializerActive).toBe(false);
+    expect(panel.webview.html).toBe(html); expect(panel.messages).toHaveLength(count); expect(panels).toHaveLength(1);
+    expect(sent.filter(([id]) => id === '_ezil.previewMintCancel')).toEqual([['_ezil.previewMintCancel', sent[1]![1]]]);
+    const late = new FakePanel(), calls = [...sent];
+    await serializer.deserializeWebviewPanel(late as unknown as vscode.WebviewPanel, {});
+    expect(late.disposed).toBe(true); expect(sent).toEqual(calls);
+});
+
+test('rollback continues disposing resources if a disposer throws and preserves the setup error', () => {
+    const registerCommand = commands.registerCommand;
+    commands.registerCommand = (...args: any[]) => {
+        const command = registerCommand(...args);
+        return { dispose() { command.dispose(); throw new Error('PRIVATE disposal'); } };
+    };
+    const disposeSerializer = mock(() => {}), disposeStatus = mock(() => {});
+    window.registerWebviewPanelSerializer = () => ({ dispose: disposeSerializer });
+    window.createStatusBarItem = () => ({ show() { throw new Error('PRIVATE setup'); }, dispose: disposeStatus });
+    expect(register).toThrow('PRIVATE setup');
+    expect(registered.size).toBe(0); expect(subscriptions).toHaveLength(0);
+    expect(disposeSerializer).toHaveBeenCalledTimes(1); expect(disposeStatus).toHaveBeenCalledTimes(1);
+});
 
 test('command restores layout, preserves focus, retains context, and only explicit open recreates a closed panel', async () => {
     register();
@@ -94,7 +179,8 @@ test('extension validates selections and generations, marks stale once, and invo
     const attachments = sent.filter(([id]) => id === '_ezil.chatAddContext').map(([, value]) => value);
     expect(attachments).toHaveLength(2); expect(attachments[0].id).toBe(attachments[1].id); expect(attachments[1].stale).toBe(true);
     await preview.receive({ type: 'copy', url: 'https://evil.test/?token=PRIVATE' }); await preview.receive({ type: 'external' });
-    expect(copied).toEqual([`${origin}/preview/next?tab=2`]); expect(external).toEqual(copied);
+    expect(copied).toEqual([]); expect(new URL(external[0]!).searchParams.get('path')).toBe('/next?tab=2');
+    expect(new URL(external[0]!).pathname).toBe('/preview-bootstrap');
     expect(JSON.stringify(copied)).not.toMatch(/PRIVATE|token=/);
     expect(sent.every(([id]) => ['_ezil.previewMint', '_ezil.chatAddContext'].includes(id))).toBe(true);
     expect(panel.messages.some(message => message.text === 'Selection added to chat.')).toBe(true);
@@ -110,37 +196,79 @@ test('serializer re-mints and restores only the sanitized path and viewport', as
     expect(panel.webview.html).not.toContain('OLD');
 });
 
-test('a working frame reloads without minting; expiry only triggers mint when navigation is requested', async () => {
+test('each reload gets fresh authorization even while the previous mint is valid', async () => {
+    let generation = 0;
+    reply = () => ({ ...minted(), url: `${origin}/preview-bootstrap?token=PRIVATE${++generation}` });
     const { panel, preview } = create(); await preview.start(); await preview.receive({ type: 'ready', doc });
     await preview.receive({ type: 'reload' });
-    expect(sent).toHaveLength(1); expect(panel.messages.at(-1)).toEqual({ type: 'load', url: `${origin}/preview/pricing` });
-    await preview.receive({ type: 'ready', doc });
-    const now = spyOn(Date, 'now').mockReturnValue(Date.now() + 120_000);
-    try {
-        expect(sent).toHaveLength(1);
-        await preview.receive({ type: 'reload' });
-        expect(sent).toHaveLength(2); expect(panel.messages.at(-1).url).toContain('/preview-bootstrap?token=PRIVATE');
-    } finally { now.mockRestore(); }
+    expect(sent).toHaveLength(2);
+    expect(new URL(panel.messages.at(-1).url).searchParams.get('token')).toBe('PRIVATE2');
+    expect(new URL(panel.messages.at(-1).url).searchParams.get('path')).toBe('/pricing');
 });
 
-for (const [host, prefix] of [[origin, '/preview'], ['https://aws-3002-guac-u1-c1-aws.ezil.org', '']]) {
-    test(`reload, back/forward, copy and external use credential-free transport URLs on ${host}`, async () => {
+for (const host of [origin, 'https://aws-3002-guac-u1-c1-aws.ezil.org']) {
+    test(`reload, history and external rebootstrap; legacy copy has no authority on ${host}`, async () => {
         reply = () => ({ ...minted(), url: `${host}/preview-bootstrap?token=PRIVATE` });
         const { panel, preview } = create(); await preview.start();
         for (const path of ['/pricing?tab=2', '/', '/pricing?tab=2']) {
             await preview.receive({ type: 'ready', doc });
             await preview.receive({ type: 'history', path: `${path}${path.includes('?') ? '&' : '?'}ezil_pv=PRIVATE#/details?token=PRIVATE&tab=2` });
-            const safe = `${host}${prefix}${path}#/details?tab=2`;
-            expect(panel.messages.at(-1)).toEqual({ type: 'load', url: safe });
-            await preview.receive({ type: 'copy' }); await preview.receive({ type: 'external' });
-            expect(copied.at(-1)).toBe(safe); expect(external.at(-1)).toBe(safe);
+            const bootstrap = new URL(panel.messages.at(-1).url);
+            expect(bootstrap.origin).toBe(host); expect(bootstrap.pathname).toBe('/preview-bootstrap');
+            expect(bootstrap.searchParams.get('path')).toBe(path);
+            expect(bootstrap.hash).toBe('#/details?tab=2');
+            await preview.receive({ type: 'copy' }); await preview.receive({ type: 'external', url: 'https://evil.test', port: 9223 });
+            expect(copied).toEqual([]);
+            expect(external.at(-1)).toBe(bootstrap.href);
             await preview.receive({ type: 'ready', doc: { ...doc, path } });
             await preview.receive({ type: 'reload' });
-            expect(panel.messages.at(-1)).toEqual({ type: 'load', url: `${host}${prefix}${path}` });
+            expect(new URL(panel.messages.at(-1).url).searchParams.get('path')).toBe(path);
         }
-        expect(sent.filter(([id]) => id === '_ezil.previewMint')).toHaveLength(1);
+        expect(sent.filter(([id]) => id === '_ezil.previewMint')).toHaveLength(10);
+        expect(sent.every(([, request]) => Object.keys(request).sort().join() === 'id,v')).toBe(true);
     });
 }
+
+test('legacy copy messages cannot write the clipboard, mint, launch or change preview state', async () => {
+    const { panel, preview } = create();
+    for (const initialized of [false, true]) {
+        if (initialized) { await preview.start(); await preview.receive({ type: 'ready', doc }); }
+        const html = panel.webview.html, messages = [...panel.messages], calls = [...sent];
+        await preview.receive({ type: 'copy', url: 'https://evil.test/?token=PRIVATE', path: '/other', command: '_ezil.previewMint', port: 9223 });
+        expect(copied).toEqual([]); expect(external).toEqual([]); expect(sent).toEqual(calls);
+        expect(panel.webview.html).toBe(html); expect(panel.messages).toEqual(messages);
+    }
+});
+
+test('external mint preserves the displayed document and pending selection', async () => {
+    const { panel, preview } = create(); await preview.start();
+    await preview.receive({ type: 'mode', mode: 'select' }); await preview.receive({ type: 'ready', doc });
+    await preview.receive({ type: 'select', sel });
+    const html = panel.webview.html, count = panel.messages.length;
+    let finish!: (value: unknown) => void;
+    reply = () => new Promise(resolve => { finish = resolve; });
+    const pending = preview.receive({ type: 'external' });
+    await preview.receive({ type: 'navigate', doc: { ...doc, path: '/later', mut: doc.mut + 1 } });
+    await preview.receive({ type: 'external' }); // one mint/launch per gesture in flight
+    finish(minted()); await pending;
+    expect(new URL(external[0]!).searchParams.get('path')).toBe(doc.path);
+    expect(external).toHaveLength(1); expect(panel.webview.html).toBe(html);
+    expect(panel.messages.slice(count).every(message => !['load', 'invalidate'].includes(message.type))).toBe(true);
+    expect(sent.filter(([id]) => id === '_ezil.chatAddContext').at(-1)![1].stale).toBe(true);
+});
+
+for (const kind of ['expired', 'origin changed', 'not bootstrap', 'hook failure']) test(`external refuses ${kind} without copying or exposing authorization`, async () => {
+    const { panel, preview } = create(); await preview.start(); await preview.receive({ type: 'ready', doc });
+    const html = panel.webview.html;
+    reply = () => {
+        if (kind === 'hook failure') throw new Error('PRIVATE');
+        if (kind === 'expired') return { ...minted(), expiresAt: 1 };
+        return { ...minted(), url: kind === 'origin changed' ? 'https://3002-other-app.ezil.org/preview-bootstrap?token=PRIVATE' : `${origin}/preview/` };
+    };
+    await preview.receive({ type: 'external' });
+    expect(external).toHaveLength(0); expect(copied).toHaveLength(0);
+    expect(panel.webview.html).toBe(html); expect(JSON.stringify(panel.messages)).not.toContain('PRIVATE');
+});
 
 test('later origin changes are refused without changing CSP or navigating the frame', async () => {
     const { panel, preview } = create(); await preview.start();
@@ -166,6 +294,7 @@ for (const kind of ['cold', 'hook missing', 'invalid', 'expired', 'timeout']) te
     const { panel, preview } = create();
     try { await preview.start(); } finally { timer?.mockRestore(); }
     expect(panel.messages.at(-1).retry).toBe(true); expect(JSON.stringify(panel.messages)).not.toMatch(/PRIVATE|token=/);
+    if (kind === 'timeout') expect(sent.filter(([id]) => id === '_ezil.previewMintCancel')).toEqual([['_ezil.previewMintCancel', sent[0]![1]]]);
     reply = minted; await preview.receive({ type: 'retry' }); expect(panel.webview.html).toContain(origin);
 });
 
@@ -174,8 +303,9 @@ test('closing during a pending mint cancels panel work and never recreates it', 
     reply = () => new Promise(resolve => { finish = resolve; });
     const { panel, preview } = create();
     const pending = preview.start(); panel.dispose(); await pending;
-    const html = panel.webview.html; finish(minted()); await Promise.resolve();
-    expect(panel.webview.html).toBe(html);
+    const html = panel.webview.html, count = panel.messages.length; finish(minted()); await Promise.resolve();
+    expect(panel.webview.html).toBe(html); expect(panel.messages).toHaveLength(count);
+    expect(sent.filter(([id]) => id === '_ezil.previewMintCancel')).toEqual([['_ezil.previewMintCancel', sent[0]![1]]]);
 });
 
 test('CSP allows exactly the minted origin, and controls are accessible', () => {
@@ -185,4 +315,22 @@ test('CSP allows exactly the minted origin, and controls are accessible', () => 
     expect(csp).not.toMatch(/frame-src (?:https:;|\*)/); expect(csp).toContain('script-src &#39;nonce-AAAAAAAAAAAAAAAAAAAAAA&#39;');
     expect(html).toContain('role="status"'); expect(html).toContain('aria-pressed="false"'); expect(html).toContain('min-height:32px');
     expect(html).not.toContain('autofocus'); expect(html).not.toContain('allow-top-navigation');
+    expect(html).not.toContain('id="copy"'); expect(html).not.toContain('Copy safe URL');
+});
+
+for (const throws of [false, true]) test(`external disposal cancels the same renderer ID even when cancel throws: ${throws}`, async () => {
+    const { panel, preview } = create(); await preview.start();
+    let finish!: (value: unknown) => void;
+    reply = () => new Promise(resolve => { finish = resolve; });
+    if (throws) {
+        const execute = commands.executeCommand;
+        commands.executeCommand = (...args: any[]) => {
+            if (args[0] === '_ezil.previewMintCancel') { sent.push(args); throw new Error('PRIVATE'); }
+            return execute(...args);
+        };
+    }
+    const pending = preview.receive({ type: 'external' }); panel.dispose(); await pending;
+    finish(minted()); await Promise.resolve();
+    expect(external).toHaveLength(0);
+    expect(sent.filter(([id]) => id === '_ezil.previewMintCancel')).toEqual([['_ezil.previewMintCancel', sent[1]![1]]]);
 });

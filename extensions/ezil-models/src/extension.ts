@@ -249,7 +249,7 @@ export function appStartFailure(): AppFailure {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-    registerPreview(context);
+    try { registerPreview(context); } catch { /* Optional preview must never prevent model registration. */ }
     const output = vscode.window.createOutputChannel('EZiL Models');
     const log = (line: string) => output.appendLine(line.startsWith('{') ? line : `${new Date().toISOString()} ${line}`);
     const settings = () => vscode.workspace.getConfiguration('ezilModels');

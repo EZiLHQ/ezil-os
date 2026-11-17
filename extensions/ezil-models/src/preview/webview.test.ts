@@ -26,7 +26,7 @@ function browser(script = previewScript) {
         emit(type: string, event?: unknown) { this.listeners.get(type)?.(event); }
     }
     const elements = new Map<string, Element>();
-    for (const id of ['app', 'address', 'back', 'forward', 'reload', 'copy', 'external', 'retry', 'viewport', 'select', 'interact', 'status']) elements.set(id, new Element());
+    for (const id of ['app', 'address', 'back', 'forward', 'reload', 'external', 'retry', 'viewport', 'select', 'interact', 'status']) elements.set(id, new Element());
     const frame = elements.get('app')!;
     frame.dataset = { origin, url: `${origin}/preview-bootstrap?token=PRIVATE`, path: '/saved?token=OLD&tab=2', viewport: '390x844' };
     const window = new Element();
@@ -65,6 +65,14 @@ test('browser persists only safe state and waits for ready after every load', ()
     b.host({ type: 'load', url: `${origin}/preview/pricing` });
     b.frame.emit('load'); b.send('ready', { doc: sel.doc });
     b.elements.get('forward')!.emit('click'); expect(b.posts.at(-1)).toEqual({ type: 'history', path: '/next' });
+});
+
+for (const [name, script] of [['source', sourceScript], ['embedded', previewScript]]) test(`${name} toolbar retains Reload, Retry and Open without a Copy control`, () => {
+    const b = browser(script);
+    for (const type of ['reload', 'retry', 'external']) {
+        b.elements.get(type)!.emit('click'); expect(b.posts.at(-1)).toEqual({ type });
+    }
+    expect(b.posts.some(message => message.type === 'copy')).toBe(false);
 });
 
 test('browser forwards only valid frame messages in the current document and user-selected mode', () => {

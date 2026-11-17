@@ -25,7 +25,7 @@ iframe { border:0; background:white; flex-shrink:0; }
 <div class="toolbar" role="toolbar" aria-label="Preview controls">
 <button id="back" aria-label="Back" disabled>←</button><button id="forward" aria-label="Forward" disabled>→</button>
 <button id="reload">Reload</button><span id="address" aria-label="Preview address"></span>
-<button id="copy">Copy safe URL</button><button id="external">Open in browser</button>
+<button id="external">Open in browser</button>
 <label>Viewport <select id="viewport"><option value="responsive">Responsive</option><option value="390x844">390×844</option><option value="768x1024">768×1024</option><option value="1280x800">1280×800</option></select></label>
 <button id="interact" aria-pressed="true">Interact</button><button id="select" aria-pressed="false">Select</button>
 <button id="retry" hidden>Retry</button></div>
