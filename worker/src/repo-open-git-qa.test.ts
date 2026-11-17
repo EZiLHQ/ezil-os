@@ -288,8 +288,16 @@ describe('repoOpenRemotesFor: the personal route opts in on os-staging only (its
       expect(repoOpenAuthFor(GIT_QA_P, repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v }))).toBe('basic');
     }
   });
-  it('anything else fails closed: production, absent, empty, a path, a query, a fragment, http, userinfo, case, padding, look-alikes, non-strings', () => {
-    for (const v of [undefined, null, '', 'https://ai.ezil.work', 'https://ai.ezil.work/', 'https://ai-staging.ezil.work/v1', 'https://ai-staging.ezil.work//',
+  it('production: exactly its Gateway origin, with or without a bare /, opts in to public github.com only, never git-qa', () => {
+    for (const v of ['https://ai.ezil.work', 'https://ai.ezil.work/']) {
+      expect(repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v })).toEqual({ publicGitHub: true });
+      expect(repoOpenAuthFor(GIT_QA, repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v }))).toBeNull();
+      expect(repoOpenAuthFor(GIT_QA_P, repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v }))).toBeNull();
+    }
+  });
+  it('anything else fails closed: absent, empty, a path, a query, a fragment, http, userinfo, case, padding, look-alikes, non-strings', () => {
+    for (const v of [undefined, null, '', 'https://ai.ezil.work//', 'https://ai.ezil.work/v1', 'https://ai.ezil.work:443', ' https://ai.ezil.work',
+      'http://ai.ezil.work', 'https://AI.EZIL.WORK', 'https://ai.ezil.work.evil.com', 'https://ai-staging.ezil.work/v1', 'https://ai-staging.ezil.work//',
       'https://ai-staging.ezil.work?x', 'https://ai-staging.ezil.work#x', 'http://ai-staging.ezil.work', 'https://a@ai-staging.ezil.work',
       'https://AI-STAGING.EZIL.WORK', ' https://ai-staging.ezil.work', 'https://ai-staging.ezil.work ', 'https://ai-staging.ezil.work:443',
       'https://ai-staging.ezil.work.evil.com', 'https://evil.com/https://ai-staging.ezil.work', 'not a url', 42, ['https://ai-staging.ezil.work'],
@@ -327,7 +335,14 @@ describe('docs/contracts/os-builder-project-open-v1.vectors.json osWorker: the c
   });
   it('routeGate: accept opts in, refuse does not', () => {
     for (const v of C.osWorker.routeGate.accept) expect(repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v })).toEqual({ stagingGitQa: true, publicGitHub: true });
-    for (const v of C.osWorker.routeGate.refuse) expect({ v, got: repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v ?? undefined }) }).toEqual({ v, got: {} });
+    // The vectors predate the production public-github opt-in: production's own origin answers exactly
+    // { publicGitHub: true } (never staging Git QA); every other refused value still answers {}.
+    const production = new Set(['https://ai.ezil.work', 'https://ai.ezil.work/']);
+    for (const v of C.osWorker.routeGate.refuse) {
+      const got = repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: v ?? undefined });
+      expect({ v, got }).toEqual({ v, got: production.has(v ?? '') ? { publicGitHub: true } : {} });
+    }
+    expect(C.osWorker.routeGate.refuse.filter((v) => production.has(v ?? ''))).toEqual([...production]);
   });
   it('remotes: staging accepts as Basic only with the gate; the refused list is refused with and without it', () => {
     const staging = repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: C.osWorker.routeGate.accept[0] });

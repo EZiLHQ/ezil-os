@@ -5,10 +5,13 @@ import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observatio
 import { awsSandboxId } from './aws-enroll';
 import { isExecutionAbsent } from './aws-errors';
 import { proveFailedReleaseTermination } from './aws-failed-release-proof';
+import { readReleasedPoolHostProof } from './aws-historical-source';
 import { buildLifecycleWork, currentGenerationIntent, type LifecycleDeployment, type LifecycleWork } from './aws-intent';
 import { isPoolMode, lifecycleExecutionArn, LifecycleReceiptSchema, POOL_RELEASED, startLifecycleJob,
     USAGE_OBSERVER, type LifecycleExecutionReader, type ReceiptDeps } from './aws-receipts';
-import { assertNoImageReservation, readCanaryComputer, readPlacement, writeLivePoolRecovery, type Placement } from './placement';
+import { assertNoImageReservation, lockImagePlacement, readCanaryComputer, readPlacement, withAdmission, writeLivePoolRecovery, type Placement } from './placement';
+import { completedPoolWriterHolds, readCompletedPoolLease, retireCompletedPoolLease } from './ready-pool';
+import { forwardMoveBusy, reverseMoveHolds } from './provider-reverse-store';
 import { POOL_RELEASE_RECOVERY_PREFIX as PREFIX } from './release-heal';
 
 type Execution = Awaited<ReturnType<LifecycleExecutionReader['describe']>>;
@@ -31,12 +34,12 @@ function replay(p: Placement): Replay | null {
 }
 export const isPoolReleaseRecovering = (p: Placement): boolean => p.state === 'RECOVERING' && !!replay(p)?.intent;
 
-function boundedTime(at: Date | null | undefined, start: Date | null | undefined, now: Date): at is Date {
+export function boundedTime(at: Date | null | undefined, start: Date | null | undefined, now: Date): at is Date {
     return !!at && !!start && Number.isFinite(at.getTime()) && Number.isFinite(start.getTime())
         && at >= start && at <= now;
 }
 
-function executionWork(e: Execution): LifecycleWork | null {
+export function executionWork(e: Execution): LifecycleWork | null {
     try {
         const envelope = JSON.parse(e.input ?? '');
         const work = buildLifecycleWork(JSON.parse(envelope.document));
@@ -54,19 +57,19 @@ function matches(p: Placement, work: LifecycleWork): boolean {
 export { replay as poolReleaseReplay, matches as matchesPoolReleaseRecovery };
 /** The failed source release's identity for this placement (its job/digest are not the placement's after the reservation),
  * under the same deployment authority (account, namespace, region, zone, data key) as the recovery's own deployment. */
-function sameIdentity(p: Placement, work: LifecycleWork, d: LifecycleDeployment): boolean {
+export function sameIdentity(p: Placement, work: LifecycleWork, d: LifecycleDeployment): boolean {
     const i = work.intent;
     return i.operation === 'release' && i.computerId === p.computerId && i.targetGeneration === p.generation && i.leaseEpoch === p.leaseEpoch
         && i.fenceToken === p.fenceToken && i.providerInstanceId === p.instanceId && i.dataVolumeId === p.volumeId && i.instanceType === p.instanceType
         && i.deployment.region === p.region && i.deployment.zoneId === p.zoneId && i.deployment.accountId === d.accountId
         && i.deployment.namespace === d.namespace && i.deployment.region === d.region && i.deployment.dataKeyArn === d.dataKeyArn;
 }
-function executionMatches(e: Execution, work: LifecycleWork): boolean {
+export function executionMatches(e: Execution, work: LifecycleWork): boolean {
     return !e.stateMachineAliasArn && e.redriveCount === 0
         && e.executionArn === lifecycleExecutionArn(work.intent.deployment, work.intent.jobId)
         && e.stateMachineVersionArn === work.stateMachineArn;
 }
-function ownedTags(tags: Record<string, string> | undefined, p: Placement, d: LifecycleDeployment): boolean {
+export function ownedTags(tags: Record<string, string> | undefined, p: Placement, d: LifecycleDeployment): boolean {
     if (!tags || tags['ezil:managed-by'] !== 'app-computer-platform' || tags['ezil:stage'] !== d.namespace
         || tags['ezil:generation'] !== String(p.generation) || (tags['ezil:namespace'] !== undefined && tags['ezil:namespace'] !== d.namespace)) return false;
     return ((tags['ezil:computer-id'] === p.computerId && tags['ezil:fence-token'] === p.fenceToken)
@@ -74,11 +77,15 @@ function ownedTags(tags: Record<string, string> | undefined, p: Placement, d: Li
         && Object.entries({ 'ezil:computer-id': p.computerId, 'ezil:computer': p.computerId,
             'ezil:fence-token': p.fenceToken, 'ezil:fence': p.fenceToken }).every(([k, v]) => tags[k] === undefined || tags[k] === v);
 }
-async function resourceEvidence(deps: ReceiptDeps, p: Placement, d: LifecycleDeployment, released: boolean): Promise<{ error: string | null; stoppedAt?: Date | null }> {
+async function resourceEvidence(deps: ReceiptDeps, p: Placement, d: LifecycleDeployment, released: boolean, strictVolume = false): Promise<{ error: string | null; stoppedAt?: Date | null }> {
     if (!deps.describer?.describeVolume) return { error: 'describer_missing' };
     const volume = await deps.describer.describeVolume(p.region!, p.volumeId!);
     if (!volume || volume.volumeId !== p.volumeId || !ownedTags(volume.tags, p, d)
         || volume.encrypted !== true || volume.kmsKeyId !== d.dataKeyArn || volume.zoneId !== p.zoneId) return { error: 'volume_identity' };
+    if (strictVolume && (volume.volumeType !== 'gp3' || !Number.isInteger(volume.sizeGiB)
+        || volume.sizeGiB! < d.storage.dataMinGiB || volume.sizeGiB! > d.storage.dataMaxGiB
+        || volume.tags?.['ezil:computer-id'] !== p.computerId || volume.tags['ezil:fence-token'] !== p.fenceToken
+        || volume.tags['ezil:backup'] !== d.namespace || volume.tags['ezil:pool'] !== undefined)) return { error: 'volume_identity' };
     if (released) return { error: volume.state === 'available' && volume.attachments?.length === 0 ? null : 'volume_not_available' };
     if (volume.state !== 'in-use' || volume.attachments?.length !== 1
         || volume.attachments[0].instanceId !== p.instanceId || volume.attachments[0].state !== 'attached') return { error: 'volume_attachment' };
@@ -290,18 +297,61 @@ export async function reconcilePoolReleaseRecovery(deps: ReceiptDeps, p: Placeme
 }
 
 const Uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
-/** `reconcile-release` on the signed image-rebase operator route: run THIS recovery for one failed release. */
+/** `reconcile-release` on the signed image-rebase operator route: recover a failed release or finish its proven pool bookkeeping. */
 export const ReconcileReleaseRequestSchema = z.object({ schemaVersion: z.literal(1), operation: z.literal('reconcile-release'),
     computerId: Uuid, expectedJobId: Uuid, releaseExecutionArn: z.string().min(1).max(300) }).strict();
 export type ReconcileReleaseRequest = z.infer<typeof ReconcileReleaseRequestSchema>;
 export type ReconcileReleaseOutcome = 'settled' | 'recovering' | 'waiting' | 'unconfirmed' | 'not_applicable' | 'source_not_proven';
 export type ReconcileReleaseDeps = ReceiptDeps & { executions: LifecycleExecutionReader };
 
-/** Operator entry for a failed pool release named by `expectedJobId` (the placement's own current job: the failed
- * release, or this recovery's reserved replay). The hint must be exactly that job's execution; nothing in the request
- * is trusted beyond selecting it. Only reconcilePoolReleaseRecovery runs, with the normal reservation CAS, ordinary
- * release replay and retired-receipt settlement: never replacement or image recovery, delete recovery, or a manual
- * placement write. The outcome is read back from the placement afterwards. */
+const completedRelease = (p: Placement) => p.provider === 'aws-ec2' && p.store === 'ebs' && p.state === 'STOPPED'
+    && p.lastError === POOL_RELEASED && p.lifecycleJobId === null && p.lifecycleDigest === null
+    && p.enrollNonceHash === null && p.enrollConsumedHash === null && p.enrollExpiresAt === null
+    && !!p.instanceId && !!p.volumeId && !!p.fsUuid && !!p.fenceToken;
+
+/** Older stop-settlement polls could finish the placement without retiring its pool claim. The operator
+ * hint grants no authority: prove that claim's canonical provision and the exact successful retirement,
+ * a complete positive termination history, current EC2 absence and the untouched detached encrypted disk.
+ * Only the same claim is retired under normal admission locks; placement and provider state never change. */
+async function reconcileCompletedPoolRelease(deps: ReconcileReleaseDeps, d: LifecycleDeployment,
+    request: ReconcileReleaseRequest): Promise<{ outcome: ReconcileReleaseOutcome; error: string | null }> {
+    const result = (outcome: ReconcileReleaseOutcome, error: string | null = null) => ({ outcome, error });
+    if (request.releaseExecutionArn !== lifecycleExecutionArn(d, request.expectedJobId)) return result('source_not_proven');
+    const locked = async (tx: import('./placement').PlacementExecutor, lock: import('./placement').AdmissionLock) => {
+        const p = await lockImagePlacement(tx, lock, request.computerId);
+        const computer = await readCanaryComputer(tx, request.computerId);
+        await assertNoImageReservation(tx, request.computerId);
+        if (!p || !completedRelease(p) || !computer || computer.deleted || computer.userId !== p.ownerUserId
+            || p.region !== d.region || p.zoneId !== d.zoneId || await forwardMoveBusy(tx, p.computerId)
+            || await reverseMoveHolds(tx, p.computerId) || await completedPoolWriterHolds(tx, p.computerId)) return null;
+        const row = await readCompletedPoolLease(tx, p);
+        return row ? { p, row } : null;
+    };
+    const before = await withAdmission(deps.db, locked);
+    if (!before) return result('not_applicable');
+    const proof = await readReleasedPoolHostProof(deps.executions, before.p, d, before.row,
+        request.releaseExecutionArn, deps.now?.() ?? new Date());
+    if (!proof || proof.poolHostId !== before.row.id || proof.lifecycleDigest !== before.row.lifecycle_digest)
+        return result('source_not_proven');
+    if (!deps.describer || await deps.describer.describeForEnrollment(d.region, before.p.instanceId!) !== null)
+        return result('unconfirmed', 'source_instance_not_absent');
+    const disk = await resourceEvidence(deps, before.p, d, true, true);
+    if (disk.error) return result('unconfirmed', disk.error);
+    return withAdmission(deps.db, async (tx, lock) => {
+        const after = await locked(tx, lock);
+        // Full snapshots include placement/lower metadata and exact PostgreSQL claim timestamp (no millisecond truncation).
+        if (!after || JSON.stringify(after.p) !== JSON.stringify(before.p) || JSON.stringify(after.row) !== JSON.stringify(before.row))
+            return result('unconfirmed', 'allocation_changed');
+        if (after.row.state === 'retired') return result('settled');
+        return await retireCompletedPoolLease(tx, after.p, after.row)
+            ? result('settled') : result('unconfirmed', 'allocation_changed');
+    });
+}
+
+/** Operator entry for a failed release/recovery's current job, or an already settled release whose pool bookkeeping
+ * was missed. The hint must be exactly the expected job's execution; nothing in the request is trusted beyond lookup.
+ * Failed releases retain their normal reservation/replay/receipt path. Completed releases only burn the exact proven
+ * historical pool claim, without a placement write or provider action. Neither branch performs image/delete recovery. */
 export async function reconcileFailedRelease(deps: ReconcileReleaseDeps, deployments: Record<string, LifecycleDeployment>,
     request: ReconcileReleaseRequest): Promise<{ outcome: ReconcileReleaseOutcome; error: string | null }> {
     const none = (outcome: ReconcileReleaseOutcome, error: string | null = null) => ({ outcome, error });
@@ -310,8 +360,10 @@ export async function reconcileFailedRelease(deps: ReconcileReleaseDeps, deploym
     const p = (await readPlacement(deps.db, request.computerId)).record;
     const d = p?.region ? deployments[p.region] : undefined;
     if (!computer || computer.deleted || !p || !d || p.ownerUserId !== computer.userId || p.provider !== 'aws-ec2' || !isPoolMode(d)
-        || !['UNCONFIRMED', 'RECOVERING'].includes(p.state) || p.lifecycleJobId !== request.expectedJobId || !p.lifecycleDigest
         || !deps.executions.history) return none('not_applicable');
+    if (completedRelease(p)) return reconcileCompletedPoolRelease(deps, d, request);
+    if (!['UNCONFIRMED', 'RECOVERING'].includes(p.state) || p.lifecycleJobId !== request.expectedJobId || !p.lifecycleDigest)
+        return none('not_applicable');
     if (request.releaseExecutionArn !== lifecycleExecutionArn(d, request.expectedJobId)) return none('source_not_proven');
     const saved = replay(p);
     if (p.state === 'RECOVERING') {

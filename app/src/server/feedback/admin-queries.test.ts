@@ -193,7 +193,9 @@ describe('admin SQL scope and projection', () => {
         expect(statements[0]!.params).toEqual([id]);
         // The first image by default; several images per report are read in send order, one by position.
         expect(statements[1]!.params).toEqual([id, 0]);
-        expect(statements[1]!.sql).toMatch(/ORDER BY created_at, sha256 OFFSET \$2 LIMIT 1/);
+        expect(statements[1]!.sql).toMatch(/ORDER BY a\.created_at, a\.sha256 OFFSET \$2 LIMIT 1/);
+        // Staged (unsent) upload-first images have no report row and are never served.
+        expect(statements[1]!.sql).toMatch(/AND EXISTS \(SELECT 1 FROM ezil_feedback_reports r WHERE r\.id = a\.report_id\)/);
         await queries.findScreenshot(id, 3);
         expect(statements[2]!.params).toEqual([id, 3]);
     });

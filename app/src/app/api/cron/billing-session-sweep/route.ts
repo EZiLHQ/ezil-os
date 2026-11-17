@@ -1,11 +1,15 @@
 import { drainFeedbackNotifications } from '@/server/feedback/notifications';
 import { feedbackNotificationMailer } from '@/server/feedback/notification-mail';
+import { drainIncidentAlerts } from '@/server/telemetry/incident-alerts';
+import { incidentAlertMailer } from '@/server/telemetry/incident-alert-mail';
 import { and, asc, gt, isNull } from 'drizzle-orm';
 import { env } from '@/env';
 import { routeComputer } from '@/server/api/routers/compute-dispatch';
 import { getBillingDeps } from '@/server/billing/deps';
 import { runningAwsComputersAfterEpochs } from '@/server/billing/store';
 import { aiIncludedModelsFor } from '@/server/billing/v3/ai-models';
+import { aiCreditsPendingFor } from '@/server/billing/ai-credits-pending';
+import { aiMemberContract } from '@/server/billing/ai-member-contract';
 import { db } from '@/server/db';
 import { computers } from '@/server/db/schema';
 import { AI_PLAN_REFRESH_OPENED_WITHIN_MS, refreshAiPlans } from '@/server/lib/ai-credential';
@@ -78,6 +82,7 @@ function aiPlanRefresh(now: Date) {
             })).map(row => ({ userId: row.userId, computerId: row.id })),
         },
         includedModelsFor: userId => aiIncludedModelsFor(userId),
+        creditsPendingFor: userId => aiCreditsPendingFor(userId),
     });
 }
 
@@ -90,6 +95,13 @@ export async function GET(req: Request): Promise<Response> {
         const notices = await drainFeedbackNotifications(db, feedbackNotificationMailer(process.env.FEEDBACK_SMTP2GO_API_KEY));
         if (notices.accepted || notices.retry) console.info('[feedback] notification sweep', notices);
     } catch { console.warn('[feedback] notification sweep unavailable'); }
+    // Incident alerts: the same independence, in their own try (a feedback or billing fault never strands them). The mail's
+    // deployment label and link come only from the server's funding configuration, never from this request.
+    try {
+        const deployment = aiMemberContract(process.env.BILLING_FUNDING_URL);
+        const alerts = await drainIncidentAlerts(db, incidentAlertMailer(process.env.FEEDBACK_SMTP2GO_API_KEY, fetch, deployment));
+        if (alerts.enqueued || alerts.accepted || alerts.retry || alerts.dropped) console.info('[telemetry] incident alert sweep', alerts);
+    } catch { console.warn('[telemetry] incident alert sweep unavailable'); }
     let deps: ReturnType<typeof getBillingDeps>, now: Date;
     try {
         deps = getBillingDeps();

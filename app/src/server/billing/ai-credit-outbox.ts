@@ -1,6 +1,6 @@
 import type { BillingConfig } from './config';
 import { AI_CREDIT_PROTOCOL, parseAiCreditEventId } from './ai-credits';
-import { AI_GATEWAY_TIMEOUT_MS, sendAiCreditEvent, type AiGatewayEvent, type AiLogger, type AiRestoreOutcome } from './ai-gateway-client';
+import { AI_GATEWAY_TIMEOUT_MS, aiRequestTimeoutMs, sendAiCreditEvent, type AiGatewayEvent, type AiLogger, type AiRestoreOutcome } from './ai-gateway-client';
 
 export const AI_CREDIT_MAX_ATTEMPTS = 10;
 export const AI_CREDIT_LEASE_MS = 30_000;
@@ -39,8 +39,11 @@ export const AI_NEEDS_EZIL_ID_PARK_MS = 24 * 3_600_000;
  * `failed` (round 5 D1): delivery ended terminally (never "waiting"; an operator requeue clears it).
  */
 export interface AiCreditReceipt { entitlementId: string; credits: number; expiresAt: string; deliveredAt: string | null; failed?: true }
+/** One user's one grant event: exact user, exact event key, grants only. */
+export interface AiCreditClaimScope { userId: string; eventKey: string; kind: 'ai_grant' }
 export interface AiCreditOutboxStore {
-    claim(now: number): Promise<AiCreditOutboxRow | null>;
+    /** `scope` (sign-in starter delivery) restricts the one atomic SKIP LOCKED claim to that row; absent, the oldest due row of anyone (the sweep). */
+    claim(now: number, scope?: AiCreditClaimScope): Promise<AiCreditOutboxRow | null>;
     accountFor(row: AiCreditOutboxRow): Promise<string | null>;
     pinAccount(row: AiCreditOutboxRow, accountPublicId: string): Promise<boolean>;
     finish(row: AiCreditOutboxRow, result: AiCreditDelivery, now: number): Promise<void>;
@@ -104,7 +107,12 @@ let warnedDisabled = false;
 export async function drainAiCreditOutbox(deps: {
     config: Pick<BillingConfig, 'fundingUrl' | 'fundingHmacSecret'>;
     aiCredits?: AiCreditOutboxStore; clock?: () => number; fetch?: typeof fetch; log?: AiLogger;
-}, { limit, deadlineMs }: { limit: number; deadlineMs: number }) {
+}, { limit, deadlineMs, scope, requestTimeoutMs = AI_GATEWAY_TIMEOUT_MS }: {
+    limit: number; deadlineMs: number;
+    /** Sign-in starter delivery only: claim just this row and never enroll. The sweep passes neither option and keeps the 10 s request. */
+    scope?: AiCreditClaimScope; requestTimeoutMs?: number;
+}) {
+    const requestMs = aiRequestTimeoutMs(requestTimeoutMs);
     const counts = { claimed: 0, done: 0, failed: 0, retry: 0, skipped: 0 };
     const log = deps.log ?? console.warn;
     if (!deps.config.fundingUrl || !deps.config.fundingHmacSecret) {
@@ -114,13 +122,13 @@ export async function drainAiCreditOutbox(deps: {
     const store = deps.aiCredits;
     if (!store) return counts;
     const clock = deps.clock ?? Date.now;
-    const hasTime = () => deadlineMs - clock() >= AI_GATEWAY_TIMEOUT_MS + 1_000;
+    const hasTime = () => deadlineMs - clock() >= requestMs + 1_000;
     // Round 5 D1: one enrollment attempt per user per pass, at most AI_ENROLL_MAX_PER_PASS per pass.
     const enrolledThisPass = new Map<string, AiEnrollForResult>();
     const enrollOnce = async (userId: string): Promise<AiEnrollForResult | 'deferred'> => {
         const known = enrolledThisPass.get(userId);
         if (known) return known;
-        if (enrolledThisPass.size >= AI_ENROLL_MAX_PER_PASS
+        if (scope || enrolledThisPass.size >= AI_ENROLL_MAX_PER_PASS
             || deadlineMs - clock() < AI_GATEWAY_TIMEOUT_MS + 1_000 + AI_ENROLL_BUDGET_MS) return 'deferred';
         let result: AiEnrollForResult;
         try { result = await store.enrollFor!(userId); }
@@ -130,7 +138,7 @@ export async function drainAiCreditOutbox(deps: {
     };
     for (let i = 0; i < Math.min(200, Math.max(0, Math.floor(limit))); i++) {
         if (!hasTime()) break;
-        const row = await store.claim(clock());
+        const row = await store.claim(clock(), scope);
         if (!row) break;
         counts.claimed++;
         let result: AiCreditDelivery;
@@ -163,7 +171,7 @@ export async function drainAiCreditOutbox(deps: {
                     result = { status: 'retry', reason: 'deadline_or_lease' };
                 } else {
                     const sent = await sendAiCreditEvent({ url: deps.config.fundingUrl, secret: deps.config.fundingHmacSecret,
-                        event: { ...event, accountPublicId: account }, fetch: deps.fetch, now: clock, log });
+                        event: { ...event, accountPublicId: account }, fetch: deps.fetch, now: clock, log, timeoutMs: requestMs });
                     result = sent.status === 'ok' ? { status: 'done', reason: null, ...(sent.outcome ? { outcome: sent.outcome } : {}) }
                         : { status: sent.status === 'retryable' ? 'retry' : 'failed', reason: sent.reason,
                             ...(sent.status === 'review' ? { reviewRequired: true } : {}) };

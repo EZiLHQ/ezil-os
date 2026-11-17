@@ -225,8 +225,15 @@ describe('silent (prompt=none) transaction', () => {
 });
 
 describe('retained ID-token verification (ported from 1ac89c72)', () => {
-    it('accepts a single exact audience and returns issuer, subject and expiry, never the email', async () => {
-        expect(await verifyProjectIdToken(await token())).toEqual({ issuer: AUTH0_ISSUER, subject: 'auth0|one', expiresAt: (now + 300) * 1000 });
+    it('accepts a single exact audience and returns commit attribution from the verified token', async () => {
+        expect(await verifyProjectIdToken(await token())).toEqual({ issuer: AUTH0_ISSUER, subject: 'auth0|one', expiresAt: (now + 300) * 1000,
+            gitAuthor: { name: 'test', email: 'test@example.com' } });
+        expect(await verifyProjectIdToken(await token({ name: 'Test Person' }))).toMatchObject({ gitAuthor: { name: 'Test Person', email: 'test@example.com' } });
+    });
+    it('keeps old repository identity verification valid but never supplies an unverified commit email', async () => {
+        for (const claims of [{ email_verified: false }, { email_verified: 'true' }, { email: undefined }, { email: 'a@b\nInjected' }]) {
+            expect(await verifyProjectIdToken(await token(claims))).not.toHaveProperty('gitAuthor');
+        }
     });
     it.each([{ aud: 'foreign' }, { iss: 'https://other.invalid/' }, { azp: 'foreign' }, { aud: [clientId, 'another'] }, { aud: [clientId, '*'], azp: clientId },
         { exp: now - 1 }, { iat: now + 100 }, { gty: 'client-credentials' }, { sub: '' }, { sub: 'x'.repeat(256) }])('rejects %j', async claims => {

@@ -259,7 +259,9 @@ describe('buildShellBootPayload', () => {
         expect(toShellDesktopState(null).endpoints.feedback).toBeUndefined();
         const on = toShellDesktopState(null, { floatingControls: true, feedback: true, feedbackScreenshots: true });
         expect(on.endpoints.feedback).toBe('/api/shell/feedback');
-        expect(on.ui).toEqual({ floatingControls: true, feedbackScreenshots: true, feedbackEventDiagnostics: true, feedbackReportBundle: true, feedbackAppFailures: true, feedbackScreenshotsMax: 5 });
+        expect(on.ui).toEqual({ floatingControls: true, feedbackScreenshots: true, feedbackEventDiagnostics: true, feedbackReportBundle: true, feedbackAppFailures: true, feedbackScreenshotsMax: 5, feedbackStagedUploads: true });
+        // Upload-first is advertised only inside the existing screenshots gate: with screenshots off it is absent.
+        expect(toShellDesktopState(null, { floatingControls: true, feedback: true, feedbackScreenshots: false }).ui).not.toHaveProperty('feedbackStagedUploads');
         expect(toShellDesktopState(null, { floatingControls: false, feedback: false, feedbackScreenshots: false }).endpoints.feedback).toBeUndefined();
     });
 

@@ -107,7 +107,7 @@ describe('handleTelemetryMaintenance: retention AND the spool drain, isolated fr
         expect(res.status).toBe(500);
         const body = await res.json();
         expect(body.ok).toBe(false);
-        expect(body.failed).toEqual(['maintenance', 'feedback']);
+        expect(body.failed).toEqual(['maintenance', 'feedback', 'aiTraces']);
         expect(drain.drainPage).toHaveBeenCalled();
         expect(body.drain).toBeDefined();
         consoleSpy.mockRestore();
@@ -139,7 +139,7 @@ describe('handleTelemetryMaintenance: retention AND the spool drain, isolated fr
             drain: drainDeps({ drainPage: vi.fn().mockRejectedValue(new Error('worker exploded')) }),
         });
         expect(res.status).toBe(500);
-        expect((await res.json()).failed).toEqual(['maintenance', 'feedback', 'drain']);
+        expect((await res.json()).failed).toEqual(['maintenance', 'feedback', 'aiTraces', 'drain']);
         consoleSpy.mockRestore();
     });
 
@@ -187,7 +187,7 @@ describe('feedback retention shares the cron and isolates failures', () => {
         const order: string[] = [];
         const db: RetentionDb = { execute: vi.fn(async (q) => {
             const sql = new PgDialect().sqlToQuery(q).sql;
-            const job = sql.includes('ezil_feedback_') ? 'feedback' : 'telemetry';
+            const job = sql.includes('ezil_ai_') ? 'aiTraces' : sql.includes('ezil_feedback_') ? 'feedback' : 'telemetry';
             order.push(job);
             if (job === fail) throw new Error(`${job} unavailable`);
             // The presence probe (to_regclass) answers "all tables exist".
@@ -205,7 +205,7 @@ describe('feedback retention shares the cron and isolates failures', () => {
         }) });
         const res = await handleTelemetryMaintenance(req(`Bearer ${secret}`), { cronSecret: secret, db, drain });
         expect(res.status).toBe(200);
-        expect(order).toEqual(['telemetry', 'telemetry', 'telemetry', 'telemetry', 'feedback', 'feedback', 'feedback', 'feedback', 'drain']);
+        expect(order).toEqual(['telemetry', 'telemetry', 'telemetry', 'telemetry', 'feedback', 'feedback', 'feedback', 'feedback', 'aiTraces', 'drain']);
         expect(await res.json()).toMatchObject({ ok: true, result: { events: { deletedRows: 0 } }, feedback: {
             attachments: { deletedRows: 0, hitBudget: false },
             reports: { deletedRows: 0, hitBudget: false },

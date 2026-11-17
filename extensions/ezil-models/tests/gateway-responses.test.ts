@@ -277,7 +277,7 @@ describe('Responses completion parsing', () => {
         ]);
         expect(events).toEqual([
             { type: 'text', value: 'Hello ' }, { type: 'text', value: '你好' },
-            { type: 'usage', usage: { inputTokens: 100, outputTokens: 12, cacheReadTokens: 25, cacheWriteTokens: 0 } },
+            { type: 'usage', usage: { inputTokens: 100, outputTokens: 12, cacheReadTokens: 25, cacheWriteTokens: undefined, inputIncludesCache: true, reasoningTokens: 4 } },
             { type: 'stop', reason: 'end_turn', details: { requestId: 'req-responses' } },
         ]);
     });
@@ -335,7 +335,7 @@ describe('Responses completion parsing', () => {
     });
 
     test('only terminal authoritative usage is published; missing or inconsistent counters fail closed', async () => {
-        for (const bad of [undefined, null, {}, { input_tokens: 100, output_tokens: 12 }, { ...usage, output_tokens: -1 }, { ...usage, input_tokens: 1.5 }, { ...usage, input_tokens_details: { cached_tokens: 101 } }, { ...usage, total_tokens: 99 }]) {
+        for (const bad of [undefined, null, {}, { ...usage, output_tokens: -1 }, { ...usage, input_tokens: 1.5 }, { ...usage, input_tokens_details: { cached_tokens: 101 } }, { ...usage, total_tokens: 99 }]) {
             const value = response([message()], { usage: bad });
             expect(() => gatewayResponsesJson(value)).toThrow();
             const seen: StreamEvent[] = [];

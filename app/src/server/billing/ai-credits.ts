@@ -70,6 +70,15 @@ export function aiCreditOutboxItem(userId: string, entitlement: AiCreditEntitlem
     } };
 }
 
+/**
+ * The outbox event key of a user's one-time Free starter grant (`ezil-os:v<ver>:free-once:<userId>:grant`): the key
+ * the sign-in enrollment queues, so a scoped claim names exactly that row. A `once` key never contains the period start.
+ */
+export function aiFreeStarterEventKey(userId: string): string {
+    return aiCreditOutboxItem(userId, aiCreditEntitlement({ userId, sku: 'free_v3', subscriptionId: null,
+        periodStart: new Date(0), periodEnd: null, invoiceId: null }), 'grant', null).eventKey;
+}
+
 /** Only explicit whole-credit pack policy can create a deliverable top-up receipt. */
 export function aiTopupOutboxItem(userId: string, pack: CatalogPack, paymentIntentId: string, expiresAt: Date): OutboxInsert | null {
     if (!aiPackCheckoutEligible(pack)) return null;

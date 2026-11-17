@@ -1037,3 +1037,76 @@ readback and 65,536-byte secret limits, immutable records and GC proofs are
 unchanged. Synthetic tests are not release proof: verify the actual record count,
 secret and readback byte sizes before promotion. No cleanup or history removal is
 implied.
+
+### Twenty-seven-record registry compatibility
+The release owner reported twenty-six retained records after 1.0.38, so the next
+immutable image needs a twenty-seventh slot. The next matched app/host release
+permits twenty-seven retained records, refusing a twenty-eighth, in both app
+validators, both `json-tool.py` guards and the GC guard. Every earlier app accepts
+at most twenty-six and cannot read a twenty-seven-record registry. Install the
+compatible app with `apply-app` first: it reads back the running commit and
+deployment before writing its receipt, and `promote-canary` refuses without that
+receipt before reading the secret, so the twenty-seventh record is never appended
+under an older app. App and agent must still come from the same reviewed commit,
+which must contain both this change and the feature being released. Rollback must
+retain the invoking twenty-seven-compatible app while restoring the prior
+deployment tuple and all twenty-seven records; do not reinstall the older app. The
+24,000-byte readback and 65,536-byte secret limits, immutable records and GC proofs
+are unchanged. Synthetic tests are not release proof: verify the actual record
+count, secret and readback byte sizes before promotion. No cleanup or history
+removal is implied.
+
+### Twenty-eight-record registry compatibility
+The 1.0.39 release occupies the twenty-seventh slot, so the following immutable
+image needs a twenty-eighth. The next matched app/host release permits
+twenty-eight retained records, refusing a twenty-ninth, in both app validators,
+both `json-tool.py` guards and the GC guard. Every earlier app accepts at most
+twenty-seven and cannot read a twenty-eight-record registry. Install the
+compatible app with `apply-app` first: it reads back the running commit and
+deployment before writing its receipt, and `promote-canary` refuses without that
+receipt before reading the secret, so the twenty-eighth record is never appended
+under an older app. App and agent must still come from the same reviewed commit,
+which must contain both this change and the feature being released. Rollback must
+retain the invoking twenty-eight-compatible app while restoring the prior
+deployment tuple and all twenty-eight records; do not reinstall the older app. The
+24,000-byte readback and 65,536-byte secret limits, immutable records and GC proofs
+are unchanged. Synthetic tests are not release proof: verify the actual record
+count, secret and readback byte sizes before promotion. No cleanup or history
+removal is implied.
+
+### Thirty-four-record registry compatibility
+
+The active app readers and normal operator append now accept thirty-four retained
+records and refuse a thirty-fifth. Install the matching thirty-four-compatible app
+with `apply-app` before promotion; the source and running `/api/health` capacity
+proofs remain required. Rollback retains that compatible app and every record.
+Legacy thirty-two-record GC, immutable record identity, byte ceilings, retention
+proofs and admission gates remain unchanged. Verify actual registry and secret
+sizes before promotion; this increment removes no history.
+
+### Thirty-five-record registry compatibility
+
+The active app readers and normal operator append now accept thirty-five retained
+records and refuse a thirty-sixth. The matching thirty-five-compatible app is the
+release's own plan-bound app: `apply-app` installs it before `promote-canary`, and
+the source and running `/api/health` capacity proofs remain required. There is no
+separate early install. Rollback retains that compatible app and every record.
+Legacy thirty-two-record GC, immutable record identity, byte ceilings, retention
+proofs and admission gates remain unchanged. Verify actual registry and secret
+sizes before promotion; this increment removes no history.
+
+### Thirty-six-record registry compatibility and per-namespace legacy limits
+
+The active app readers and normal operator append now accept thirty-six retained
+records and refuse a thirty-seventh, in both namespaces. The legacy limits stay
+frozen per namespace and are read only through `json-tool.py`'s
+`legacy_registry_capacity()`: mum (billing staging) keeps its thirty-two-record GC
+and pre-proof threshold, and prd keeps its twenty-six-record GC and threshold. Past
+its namespace limit, every install refuses an app whose source cannot read the
+registry, and promotion requires the plan-bound apply-app receipt and a running
+`/api/health` reader of at least the new count. In prd that proof therefore starts
+at the twenty-seventh record. A thirty-five-capacity source or runtime refuses the
+thirty-sixth record. Rollback retains the compatible app and every record. GC is
+never widened, no history is removed, and the 24,000-byte readback and
+65,536-byte secret ceilings are unchanged. Verify the actual registry count and
+byte sizes of the target namespace before promotion.

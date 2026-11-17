@@ -13,6 +13,11 @@ export const ReleasedPoolHostSchema = z.object({ poolHostId: UUID, lifecycleDige
  * Last key, omitted when absent, never with `releasedPoolHost`; a helper without this field refuses such a document (strict). */
 export const RetiredSourceSchema = z.object({
     releaseExecutionArn: z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:execution:[A-Za-z0-9_-]{1,80}:computer-[0-9a-f-]{36}$/) }).strict();
+/** App dedicated source: a STOPPED computer's image-job launched host for a shared registry lower, its archived launch AMI and
+ * retirement proven by the app. Last key, omitted when absent, never with another proof; older helpers refuse it (strict). */
+export const ReleasedDedicatedHostSchema = z.object({ imageJobId: UUID, provisionDigest: HASH,
+    provisionExecutionArn: z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:execution:[A-Za-z0-9_-]{1,80}:computer-[0-9a-f-]{36}$/),
+    releaseExecutionArn: z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:execution:[A-Za-z0-9_-]{1,80}:computer-[0-9a-f-]{36}$/) }).strict();
 export const PreparationDocumentSchema = z.object({
     schemaVersion: z.literal(1), jobId: UUID, computerId: UUID, sourceInstanceId: INSTANCE,
     sourceVolumeId: VOL, fsUuid: UUID, sourceGeneration: COUNTER, sourceLeaseEpoch: COUNTER,
@@ -20,15 +25,18 @@ export const PreparationDocumentSchema = z.object({
     sourceDeployment: SourceLifecycleDeploymentSchema, deployment: LifecycleDeploymentSchema, createdAt: TIME,
     releasedPoolHost: ReleasedPoolHostSchema.optional(),
     retiredSource: RetiredSourceSchema.optional(),
+    releasedDedicatedHost: ReleasedDedicatedHostSchema.optional(),
 }).strict().superRefine((i, ctx) => {
     const d = i.deployment, s = i.sourceDeployment;
     const machine = d.stateMachineVersionArn.replace(':stateMachine:', ':execution:').replace(/:[1-9][0-9]*$/, ':computer-');
     if (i.fromDigest !== s.lowerImageDigest || i.fromDigest !== d.previousLowerImageDigest || i.toDigest !== d.lowerImageDigest
         || i.fromDigest === i.toDigest || i.volumeGiB < d.storage.dataMinGiB || i.volumeGiB > d.storage.dataMaxGiB
         || (['accountId', 'region', 'namespace', 'zoneId', 'dataKeyArn'] as const).some(k => s[k] !== d[k])
-        || (i.releasedPoolHost && i.retiredSource)
+        || [i.releasedPoolHost, i.retiredSource, i.releasedDedicatedHost].filter(Boolean).length > 1
         || (i.releasedPoolHost && !i.releasedPoolHost.releaseExecutionArn.startsWith(machine))
-        || (i.retiredSource && !i.retiredSource.releaseExecutionArn.startsWith(machine)))
+        || (i.retiredSource && !i.retiredSource.releaseExecutionArn.startsWith(machine))
+        || (i.releasedDedicatedHost && (i.releasedDedicatedHost.provisionExecutionArn === i.releasedDedicatedHost.releaseExecutionArn
+            || !i.releasedDedicatedHost.provisionExecutionArn.startsWith(machine) || !i.releasedDedicatedHost.releaseExecutionArn.startsWith(machine))))
         ctx.addIssue({ code: 'custom', message: 'release_mismatch' });
 });
 export type PreparationDocument = z.infer<typeof PreparationDocumentSchema>;

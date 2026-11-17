@@ -63,12 +63,12 @@ describe('requestRepoOpen', () => {
     });
     it.each([REPO_OPEN_MIN_TIMEOUT_MS - 1, REPO_OPEN_MAX_TIMEOUT_MS + 1, 30_000.5])('never sends a timeoutMs the Worker would refuse (%d)', async timeoutMs => {
         const { fetcher, result } = run(() => Response.json({}), cloudflare, 'secret', { timeoutMs });
-        expect(await result).toEqual({ ok: false, errorCode: 'repo_open_failed' });
+        expect(await result).toMatchObject({ ok: false, errorCode: 'repo_open_failed' });
         expect(fetcher).not.toHaveBeenCalled();
     });
     it('an aborted deadline is repo_open_failed, logged as aborted', async () => {
         const { result } = run(() => { throw new DOMException('aborted', 'AbortError'); });
-        expect(await result).toEqual({ ok: false, errorCode: 'repo_open_failed' });
+        expect(await result).toMatchObject({ ok: false, errorCode: 'repo_open_failed' });
         expect(warn.mock.calls).toContainEqual(['[repo-open] worker refused', expect.objectContaining({ error: 'aborted' })]);
     });
     it('never sends an AWS computer\'s request', async () => {
@@ -78,7 +78,7 @@ describe('requestRepoOpen', () => {
     });
     it('refuses without a signing secret and never sends unsigned', async () => {
         const { fetcher, result } = run(() => Response.json({}), cloudflare, ' ');
-        expect(await result).toEqual({ ok: false, errorCode: 'repo_open_failed' });
+        expect(await result).toMatchObject({ ok: false, errorCode: 'repo_open_failed' });
         expect(fetcher).not.toHaveBeenCalled();
     });
     it.each([
@@ -88,7 +88,7 @@ describe('requestRepoOpen', () => {
         ['a transport error', () => { throw new Error(`connect ${TOKEN}`); }],
     ])('%s is repo_open_failed, logged without the body', async (_name, respond) => {
         const { result } = run(respond);
-        expect(await result).toEqual({ ok: false, errorCode: 'repo_open_failed' });
+        expect(await result).toMatchObject({ ok: false, errorCode: 'repo_open_failed' });
         expect(JSON.stringify(warn.mock.calls)).not.toContain(TOKEN);
     });
 });

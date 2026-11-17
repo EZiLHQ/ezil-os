@@ -609,7 +609,9 @@ export function capture (input) {
         // trace is currently ambient (`registry.js`'s `launch()` opens one) —
         // the single change that groups every existing capture() call site
         // under one app-open's correlation id without editing any of them.
-        const correlationId = (typeof input.correlationId === 'string' && input.correlationId)
+        // The terminal AI-request projection carries no request/computer identity, ambient defaults included.
+        const terminalAi = site === 'ezil-os:apps/code#aiRequest';
+        const correlationId = terminalAi ? undefined : (typeof input.correlationId === 'string' && input.correlationId)
             ? input.correlationId
             : ambientCorrelationId();
         // 64 chars, per the wire contract (`TELEMETRY_LIMITS.MAX_CORRELATION_ID_LEN`).
@@ -623,7 +625,7 @@ export function capture (input) {
         const explicitComputerId = (typeof input.computerId === 'string' && UUID_RE.test(input.computerId))
             ? input.computerId
             : undefined;
-        const computerId = explicitComputerId ?? ambientComputerId();
+        const computerId = terminalAi ? undefined : explicitComputerId ?? ambientComputerId();
         if ( computerId ) event.computerId = computerId;
         if ( input.attrs && typeof input.attrs === 'object' ) {
             const attrs = {};

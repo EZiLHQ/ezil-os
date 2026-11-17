@@ -87,7 +87,7 @@ describe('Responses transport contract', () => {
         expect(model.maxOutputTokens).toBe(8192);
         expect(logs).toHaveLength(1);
         expect(JSON.parse(logs[0]!)).toEqual({ request_id: 'responses-request', model: 'reviewed-azure', stream: true, hold: '420000',
-            http_status: 200, client_request_id: null, attempts: 1, partial: false, latency_ms: 0, usage: { input: 123, output: 17, cache_read: 11, cache_write: 0 }, stop_reason: 'end_turn', error_code: null, origin: null });
+            http_status: 200, client_request_id: null, attempts: 1, partial: false, latency_ms: 0, usage: { input: 123, output: 17, cache_read: 11 }, stop_reason: 'end_turn', error_code: null, origin: null });
         expect(logs.join()).not.toMatch(/Hello|Visible answer|synthetic-proxy-token|ignored-key|ignored-beta/);
         expect(new Headers(s.reads[0]!.init.headers).get('authorization')).toBe('Bearer synthetic-proxy-token');
         await expect(run(s.fetch, {}, model, ask([{ role: 'user', parts: [{ type: 'text', value: '字'.repeat(11000) }] }]))).rejects.toThrow('(local_input_too_large)');
@@ -154,8 +154,8 @@ describe('Responses transport contract', () => {
             catch (caught) { error = caught; }
             expect(error).toMatchObject({ code: expectedCode }); expect(s.posts).toHaveLength(1);
             expect(events.filter(event => event.type === 'text')).toEqual([{ type: 'text', value: 'Visible answer' }]);
-            expect(events.filter(event => event.type === 'usage')).toEqual([{ type: 'usage', usage: { inputTokens: 123, outputTokens: 17, cacheReadTokens: 11, cacheWriteTokens: 0 } }]);
-            expect(JSON.parse(logs[0]!)).toMatchObject({ usage: { input: 123, output: 17, cache_read: 11, cache_write: 0 }, error_code: expectedCode });
+            expect(events.filter(event => event.type === 'usage')).toEqual([{ type: 'usage', usage: { inputTokens: 123, outputTokens: 17, cacheReadTokens: 11, cacheWriteTokens: undefined, inputIncludesCache: true } }]);
+            expect(JSON.parse(logs[0]!)).toMatchObject({ usage: { input: 123, output: 17, cache_read: 11 }, error_code: expectedCode });
             expect(logs.join()).not.toContain('private failure detail');
         });
     }

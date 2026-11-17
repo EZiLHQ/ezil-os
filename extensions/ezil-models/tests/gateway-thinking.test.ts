@@ -136,8 +136,8 @@ describe('Gateway extended thinking', () => {
 
     test('thinking bytes and blocks count toward limits; oversized historical thinking uses existing compaction', async () => {
         const assistant = msg('assistant', signed(), redacted, txt('answer'));
-        expect(gatewayTokenCount(assistant)).toBe(Buffer.byteLength(JSON.stringify(gatewayMessage(assistant))));
-        expect(gatewayTokenCount(assistant)).toBeGreaterThan(Buffer.byteLength(thought + signature + 'opaque-redacted-data'));
+        expect(gatewayTokenCount(assistant)).toBe(22); // estimated text/thinking tokens, no JSON byte tax
+        expect(gatewayTokenCount(assistant)).toBeLessThan(Buffer.byteLength(JSON.stringify(gatewayMessage(assistant))));
         expect(() => buildGatewayBody(gw(sonnet), ask([msg('user', txt('q')), msg('assistant', ...Array.from({ length: 1025 }, () => signed()))])))
             .toThrow(expect.objectContaining({ code: 'local_too_many_blocks' }));
         for (const part of [signed('字'.repeat(44_000)), { type: 'thinking', value: '', metadata: { redactedData: '字'.repeat(44_000) } } as Part]) {
@@ -226,10 +226,10 @@ describe('Gateway usage normalization', () => {
         expect(await usageOf([start(zeros), finish({ output_tokens: 0 }), stop()])).toEqual({ type: 'usage', usage: none });
         expect(await usageOf([start(zeros), finish(zeros), stop()])).toEqual({ type: 'usage', usage: none });
     });
-    test('cache counters are required like input_tokens: a missing one is not defaulted', async () => {
+    test('missing cache counters stay unknown; a complete final report is preferred', async () => {
         for (const key of ['cache_read_input_tokens', 'cache_creation_input_tokens']) {
             const { [key]: _gone, ...partial } = startUsage as Record<string, number>;
-            await malformed([start(partial), finish({ output_tokens: 22 }), stop()]);
+            expect(await usageOf([start(partial), finish({ output_tokens: 22 }), stop()])).toEqual({ type: 'usage', usage: { ...normalizedUsage, [key === 'cache_read_input_tokens' ? 'cacheReadTokens' : 'cacheWriteTokens']: undefined } });
             // Present in the final delta instead (Converse shape, all three inputs there): valid.
             expect(await usageOf([start(partial), finish({ ...startUsage, output_tokens: 22 }), stop()])).toEqual({ type: 'usage', usage: normalizedUsage });
         }
@@ -255,7 +255,7 @@ describe('Gateway usage normalization', () => {
         // No input authority anywhere: message_start without counters, or without usage at all.
         await malformed([start({}), finish({ output_tokens: 22 }), stop()]);
         await malformed([frame('message_start', { type: 'message_start', message: { role: 'assistant' } }), finish({ output_tokens: 22 }), stop()]);
-        await malformed([start({ input_tokens: 120, output_tokens: 1 }), finish({ output_tokens: 22 }), stop()]);
+        expect(await usageOf([start({ input_tokens: 120, output_tokens: 1 }), finish({ output_tokens: 22 }), stop()])).toEqual({ type: 'usage', usage: { inputTokens: 120, outputTokens: 22, cacheReadTokens: undefined, cacheWriteTokens: undefined } });
         // Empty final usage, with or without start usage.
         await malformed([start(), finish({}), stop()]);
         await malformed([frame('message_start', { type: 'message_start', message: { role: 'assistant' } }), finish({}), stop()]);

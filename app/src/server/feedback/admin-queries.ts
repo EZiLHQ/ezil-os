@@ -107,10 +107,12 @@ export function feedbackAdminQueries(db: FeedbackDb): FeedbackAdminQueries & Pic
         },
         async findScreenshot(id, n = 0) {
             // Ordered: with several images per report an unordered LIMIT 1 could return any of them.
+            // Only a stored report's images: upload-first images staged for an unsent report are never shown.
             return rowsOf<AdminScreenshot>(await db.execute(sql`
                 SELECT bytes, content_type AS "contentType"
-                FROM ezil_feedback_attachments WHERE report_id = ${id}
-                ORDER BY created_at, sha256 OFFSET ${n} LIMIT 1
+                FROM ezil_feedback_attachments a WHERE a.report_id = ${id}
+                    AND EXISTS (SELECT 1 FROM ezil_feedback_reports r WHERE r.id = a.report_id)
+                ORDER BY a.created_at, a.sha256 OFFSET ${n} LIMIT 1
             `))[0] ?? null;
         },
         async updateStatus(id, status) {

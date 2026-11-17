@@ -19,6 +19,7 @@ import tempfile
 import unittest
 
 HERE = Path(__file__).parent
+CAPACITY_SOURCE = "app/src/server/lib/compute/aws-rebase-release.ts"
 SHA = "0123456789abcdef0123456789abcdef01234567"
 PROD_BUCKET = "ezil-main-prod-artifacts-452630323510-aps1"
 HOST_IP = "203.0.113.10"
@@ -44,6 +45,11 @@ if name == "aws":
         print("command-1")
     elif "get-command-invocation" in args:
         print("Success" if after("--query") == "Status" else os.environ.get("FAKE_SSM_STDOUT", ""))
+    elif "get-secret-value" in args:  # the installer's registry capacity guard; never a real secret
+        with open(state / "secret_ids", "a") as ids:
+            ids.write(after("--secret-id") + "\n")
+        print(json.dumps({"SecretString": json.dumps({"EZIL_AWS_LIFECYCLE_DEPLOYMENTS":
+              os.environ.get("FAKE_DEPLOYMENTS", '{"ap-south-1":{"releases":[]}}')})}))
     elif args[3:5] == ["s3", "cp"]:
         bucket, key = args[5][len("s3://"):].split("/", 1)
         source = pathlib.Path(os.environ["FAKE_S3"], bucket, key)
@@ -84,7 +90,10 @@ elif name == "docker":
         with open(state / "log", "a") as log:
             log.write(json.dumps(["compose.env", pathlib.Path("compose.env").read_text()]) + "\n")
     elif "exec" in args:
-        print(os.environ['FAKE_SHA'] if 'process.stdout.write' in args[-1] else "Deployed SHA: " + os.environ["FAKE_SHA"])
+        if 'registryCapacity' in args[-1]:  # the installer's post-recreate capacity read of the running app
+            sys.stdout.write(os.environ.get('FAKE_RUNNING_CAPACITY', 'unavailable'))
+        else:
+            print(os.environ['FAKE_SHA'] if 'process.stdout.write' in args[-1] else "Deployed SHA: " + os.environ["FAKE_SHA"])
 elif name == "curl":
     if args[-1] == 'http://169.254.169.254/latest/api/token':
         print('fixture-imds-token')
@@ -98,9 +107,14 @@ elif name == "curl":
                      .replace("%{remote_ip}", os.environ.get("FAKE_REMOTE_IP", "203.0.113.10")))
 '''
 
-RENDER_ENV_STUB = r'''import json, os, sys
+RENDER_ENV_STUB = r'''import json, os, pathlib, sys
 with open(os.path.join(os.environ["SHIM_STATE"], "log"), "a") as log:
     log.write(json.dumps(["render-env.py"] + sys.argv[1:]) + "\n")
+# As render-env.py does: write the environment's app.env (the installer's registry guard rereads it);
+# <host>/opt/<slug> is the cwd, so <host>/etc/<slug>/app.env is the rendered file.
+rendered = pathlib.Path.cwd().parents[1] / "etc" / pathlib.Path.cwd().name / "app.env"
+rendered.parent.mkdir(parents=True, exist_ok=True)
+rendered.write_text("EZIL_AWS_LIFECYCLE_DEPLOYMENTS=" + os.environ.get("FAKE_DEPLOYMENTS", '{"ap-south-1":{"releases":[]}}') + "\n")
 print("\n".join(sorted(os.environ.get("FAKE_KEYS", "").split())))
 '''
 
@@ -114,6 +128,10 @@ class Sandbox:
         self.deploy = self.root / "repo/deploy/aws/os-staging"
         shutil.copytree(source, self.deploy, ignore=shutil.ignore_patterns("artifacts", "__pycache__"))
         (self.root / "repo/app").mkdir()
+        # deploy.sh build reads the registry capacity from this exact source; the fixture commits the real file.
+        capacity = self.root / "repo" / CAPACITY_SOURCE
+        capacity.parent.mkdir(parents=True)
+        shutil.copyfile(HERE.resolve().parents[2] / CAPACITY_SOURCE, capacity)
         (self.root / "repo/app/Dockerfile").write_text("FROM scratch\n")
         (self.root / "repo/app/.dockerignore").write_text("*\n")
         (self.root / "repo/.gitignore").write_text("app/ignored.txt\n")

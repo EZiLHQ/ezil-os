@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import type { ResolvedProvider } from './config';
-import { readAIStatus, statusView, type AIStatus } from './status-data';
+import { readAIStatus, statusView, newestBalance, type Balance, type AIStatus } from './status-data';
 
 /** Gateway status is refreshed at startup, on config changes, after requests, and once a minute. */
 export class EZiLAIStatus implements vscode.Disposable {
@@ -9,6 +9,8 @@ export class EZiLAIStatus implements vscode.Disposable {
     private state?: AIStatus;
     private request?: AbortController;
     private disposed = false;
+    private balanceOwner?: ResolvedProvider;
+    private orderedBalance?: Balance;
 
     constructor(private readonly provider: () => ResolvedProvider | undefined, private readonly doFetch: typeof fetch = fetch, private readonly ui: typeof vscode = vscode) {
         this.item = ui.window.createStatusBarItem('ezil-models.aiStatus', ui.StatusBarAlignment.Right, 101);
@@ -33,12 +35,21 @@ export class EZiLAIStatus implements vscode.Disposable {
         const request = this.request = new AbortController();
         const configured = this.provider();
         const provider = configured ? { ...configured } : undefined;
+        if (this.balanceOwner?.type !== provider?.type || this.balanceOwner?.baseUrl !== provider?.baseUrl || this.balanceOwner?.apiKey !== provider?.apiKey) {
+            this.orderedBalance = undefined;
+        }
+        this.balanceOwner = provider;
         this.state = undefined;
         this.render();
         const state = await readAIStatus(provider, this.doFetch, request.signal);
         if (this.disposed || this.request !== request) return;
         const current = this.provider();
         if (current?.type !== provider?.type || current?.baseUrl !== provider?.baseUrl || current?.apiKey !== provider?.apiKey) return;
+        if (state.balance.value) {
+            const balance = newestBalance(this.orderedBalance, state.balance.value);
+            state.balance = { value: balance };
+            if (balance.accounting) this.orderedBalance = balance;
+        }
         this.state = state;
         this.render();
     }

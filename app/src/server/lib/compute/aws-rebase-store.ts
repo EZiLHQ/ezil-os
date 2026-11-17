@@ -1,3 +1,4 @@
+import { dedicatedProvisionWork, type DedicatedProvisionRecord } from './aws-dedicated-source';
 import { buildImageRecovery, recoveryFor, verifyImageRestore, MaintenanceReportSchema } from './aws-rebase-recovery';
 import { decideAdmission } from './admission';
 import { readAwsAdmissionConfig, type Env } from './aws-config';
@@ -7,11 +8,11 @@ import type { Ec2EnrollmentView } from './aws-enroll';
 import type { Ec2VolumeView } from './aws-clients';
 import { sql } from 'drizzle-orm';
 import { z } from 'zod';
-import { buildLifecycleWork, type LifecycleWork } from './aws-intent';
+import { buildLifecycleWork, LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleWork } from './aws-intent';
 import { parseEnrollmentUserData } from './aws-rebase-lease';
 import { buildRebasePreparation, RebaseSnapshotReceiptSchema, validateRebaseSnapshotReceipt } from './aws-rebase-preparation';
 import { parseRebaseJson, RebaseCounter, RebaseDigest, RebaseHash, RebaseSnapshot, RebaseTime, RebaseUuid, RebaseVolume } from './aws-rebase-json';
-import { parseRebaseRelease, parseRebaseSourceRelease, RebaseSourceReleaseSchema, RebaseReleaseSchema } from './aws-rebase-release';
+import { parseRebaseRelease, parseRebaseSourceRelease, rebaseReleaseCandidates, RebaseSourceReleaseSchema, RebaseReleaseSchema } from './aws-rebase-release';
 import { ImageJobConflictError, lockImagePlacement, setImageReservation, writeImagePlacement, recordImageUsage, withAdmission, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, readImageAdmissionCounters, type ImagePlacement, type ImagePlacementFields, type AdmissionLock, type PlacementDb, type PlacementExecutor } from './placement';
 import { reverseMoveHolds } from './provider-reverse-store';
 
@@ -306,7 +307,7 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
         if (rows.length > 1) throw new ImageJobConflictError();
         return rows.length ? parseImageJobRow(rows[0]!) : null;
     };
-    const assertOwner = async (tx: PlacementExecutor, j: ImageJob) => {
+    const assertOwner = async (tx: PlacementExecutor, j: Pick<ImageJob, 'computerId' | 'ownerUserId'>) => {
         const rows = rowsOf(await tx.execute(sql`SELECT user_id::text AS user_id FROM public.ezil_computers
             WHERE id = ${j.computerId}::uuid AND deleted_at IS NULL FOR UPDATE`));
         if (rows.length !== 1 || rows[0]!.user_id !== j.ownerUserId) throw new ImageJobConflictError();
@@ -356,6 +357,40 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
         if (rows.length > 1) throw new ImageJobConflictError();
         return row ? { ...row, generation: Number(row.generation) } : null;
     };
+    /** Dedicated source (shared registry lower only): the archived image job whose own launch or rebind enrolled the placement's
+     * CURRENT instance (`host_evidence` is written only by that job's launch/maintenance enroll, never for a source host). The
+     * lookup is keyed on computer + instance alone: no row is "not dedicated"; any found row must be exactly one terminal
+     * succeeded/recovered job with every identity field equal, otherwise the source fails closed (never another proof kind).
+     * Its canonical launch remains a hint until SFN input/output and actual RunInstances ImageId are proven. */
+    const releasedDedicatedRow = async (tx: PlacementExecutor, p: ImagePlacement): Promise<DedicatedProvisionRecord | null> => {
+        if (!p.instanceId) return null;
+        const rows = rowsOf(await tx.execute(sql`/* image:released-dedicated-host */ SELECT ${columnNames}
+            FROM public.ezil_computer_image_jobs WHERE computer_id = ${p.computerId}::uuid
+              AND host_evidence->>'instanceId' = ${p.instanceId} LIMIT 2 FOR UPDATE`));
+        if (!rows.length) return null;
+        if (rows.length > 1) throw new Error('source_identity_mismatch');
+        const j = parseImageJobRow(rows[0]!), restored = j.phase === 'recovered';
+        const document = restored ? j.rebindDocument : j.launchDocument, digest = restored ? j.rebindDigest : j.launchDigest;
+        const arn = restored ? j.rebindExecutionArn : j.launchExecutionArn;
+        const generation = restored ? j.rebindGeneration : j.targetGeneration, epoch = restored ? j.rebindLeaseEpoch : j.targetLeaseEpoch;
+        const fence = restored ? j.rebindFenceToken : j.targetFenceToken, host = j.hostEvidence;
+        if (p.state !== 'STOPPED' || !p.volumeId || !p.fenceToken || !p.fsUuid || !p.region || !p.zoneId
+            || !['succeeded', 'recovered'].includes(j.phase) || j.computerId !== p.computerId || j.ownerUserId !== p.ownerUserId
+            || j.region !== p.region || j.zoneId !== p.zoneId || j.fsUuid !== p.fsUuid || !document || !digest || !arn
+            || generation !== p.generation || fence !== p.fenceToken || epoch === null || epoch > p.leaseEpoch || !host
+            || host.instanceId !== p.instanceId || host.volumeId !== p.volumeId || host.generation !== p.generation
+            || host.lowerImageDigest !== p.lowerImageDigest) throw new Error('source_identity_mismatch');
+        return { imageJobId: j.jobId, phase: restored ? 'recovered' : 'succeeded', computerId: j.computerId, ownerUserId: j.ownerUserId,
+            region: j.region, zoneId: j.zoneId, instanceId: host.instanceId, volumeId: host.volumeId, fsUuid: j.fsUuid,
+            generation, leaseEpoch: epoch, fenceToken: fence, lowerImageDigest: host.lowerImageDigest, document, digest, executionArn: arn };
+    };
+    /** The registry's source records for the placement's own lower: one => unique (DESIGN R2), more => shared (dedicated only). */
+    const registrySources = (p: ImagePlacement): number => {
+        try {
+            const map = parseRebaseJson(env[LIFECYCLE_DEPLOYMENTS_ENV] ?? '{}', 65536) as Record<string, unknown>;
+            return rebaseReleaseCandidates(map[p.region!], p.lowerImageDigest).sources.length;
+        } catch { throw new ImageJobConflictError(); }
+    };
     const time = (j: ImageJob, now: Date) => new Date(Math.max(now.getTime(), Date.parse(j.updatedAt) + 1)).toISOString();
     const store = {
         read: (jobId: string) => read(db, jobId),
@@ -364,6 +399,14 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
             return withAdmission(db, async (tx, lock) => {
                 const placement = await lockImagePlacement(tx, lock, RebaseUuid.parse(computerId));
                 return { placement, row: placement ? await releasedPoolRow(tx, placement) : null };
+            });
+        },
+        /** The placement and its dedicated archive under the admission lock. Read-only; shared-lower sources only. */
+        async releasedDedicatedHost(computerId: string) {
+            return withAdmission(db, async (tx, lock) => {
+                const placement = await lockImagePlacement(tx, lock, RebaseUuid.parse(computerId));
+                if (placement) await assertOwner(tx, placement);
+                return { placement, row: placement ? await releasedDedicatedRow(tx, placement) : null };
             });
         },
         async inspect(computerId: string) {
@@ -444,6 +487,19 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
                 }
                 // R2: a retired regular source likewise: still STOPPED, and still no claim row that would select DESIGN R.
                 if (prep.intent.retiredSource && (p.state !== 'STOPPED' || await releasedPoolRow(tx, p))) throw new ImageJobConflictError();
+                // The proof kind follows the registry's source count for this lower, re-read under the lock: R2 only for a
+                // unique lower, the dedicated archive only for a shared one. A changed registry or lower is a conflict.
+                if (prep.intent.retiredSource && registrySources(p) !== 1) throw new ImageJobConflictError();
+                const dedicated = prep.intent.releasedDedicatedHost;
+                if (dedicated) {
+                    if (p.state !== 'STOPPED' || await releasedPoolRow(tx, p) || registrySources(p) < 2) throw new ImageJobConflictError();
+                    const row = await releasedDedicatedRow(tx, p).catch(() => { throw new ImageJobConflictError(); });
+                    if (row?.imageJobId !== dedicated.imageJobId || row.digest !== dedicated.provisionDigest
+                        || row.executionArn !== dedicated.provisionExecutionArn) throw new ImageJobConflictError();
+                    const launched = dedicatedProvisionWork(p, prep.intent.deployment, row);
+                    if (!launched) throw new ImageJobConflictError();
+                    parseRebaseSourceRelease(j.sourceRelease, launched.intent.deployment, approvedRepositoryUri);
+                }
                 const inserted = rowsOf(await tx.execute(sql`INSERT INTO public.ezil_computer_image_jobs (${columnNames})
                     VALUES (${sql.join(columns.map(([key, , type]) => valueSql(j, key, type)), sql`, `)}) RETURNING ${columnNames}`));
                 if (inserted.length !== 1) throw new ImageJobConflictError();
@@ -631,6 +687,7 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
             const parent = JSON.parse(expected.preparationDocument);
             delete parent.releasedPoolHost;
             delete parent.retiredSource;
+            delete parent.releasedDedicatedHost;
             const preparation = buildRebasePreparation({ ...parent, jobId: childId,
                 sourceInstanceId: r.instanceId, sourceVolumeId: r.volumeId, sourceGeneration: r.generation, sourceLeaseEpoch: r.leaseEpoch,
                 sourceFenceToken: r.fenceToken, createdAt: now.toISOString() });

@@ -98,7 +98,7 @@ describe('VS Code bridge', () => {
         const assistant = toNeutralMessage(message(2, [new ThinkingPart('', undefined, { signature: 's', _completeThinking: 't' }), new TextPart('hi'), new ToolCallPart('c1', 'create_file', { a: 1 })]) as never);
         expect(assistant.parts).toEqual([{ type: 'thinking', value: '', id: undefined, metadata: { signature: 's', _completeThinking: 't' } }, { type: 'text', value: 'hi' }, { type: 'tool_call', callId: 'c1', name: 'create_file', input: { a: 1 } }]);
         const user = toNeutralMessage(message(1, [new ToolResultPart('c1', [new TextPart('ok'), new DataPart(new Uint8Array([1, 2]), 'image/png')])], 'tool') as never);
-        expect(user).toEqual({ role: 'user', name: 'tool', parts: [{ type: 'tool_result', callId: 'c1', content: [{ type: 'text', value: 'ok' }, { type: 'data', mimeType: 'image/png', data: new Uint8Array([1, 2]) }], isError: false }] });
+        expect(user).toEqual({ role: 'user', name: 'tool', parts: [{ type: 'tool_result', callId: 'c1', content: [{ type: 'text', value: 'ok' }, { type: 'data', mimeType: 'image/png', data: new Uint8Array([1, 2]) }] }] });
     });
 
     test('model information carries capabilities, limits and the default flag', async () => {
@@ -278,6 +278,35 @@ describe('EZiL gateway VS Code bridge', () => {
         return { models: () => models, configError: () => undefined, secrets: () => ['synthetic-proxy-token'], logRequests: () => true,
             log: (s: string) => lines.push(s), recordUsage: (_m: ResolvedModel, u: Usage) => usage.push(u), fetch, lines, usage };
     }
+    test('final JSON/SSE metadata reaches the owning request, including out-of-order and cancelled replies', async () => {
+        const pending = new Map<string, (response: Response) => void>();
+        const host = gatewayHost((async (_url: unknown, init?: RequestInit) => {
+            const body = JSON.parse(new TextDecoder().decode(init!.body as Uint8Array));
+            return new Promise<Response>(resolve => pending.set(body.model, resolve));
+        }) as typeof fetch);
+        const p = new EZiLModelsProvider(host);
+        const infos = await p.provideLanguageModelChatInformation({} as never, token() as never);
+        for (const cancelFirst of [false, true]) {
+            pending.clear();
+            const parts: unknown[][] = [[], []]; const cancellation = [token(), token()];
+            const sends = infos.map((info, i) => p.provideLanguageModelChatResponse(info, [message(1, [new TextPart('q')])] as never,
+                { tools: [], modelOptions: { _conversationId: `session-${i}` } } as never, { report: part => { parts[i]!.push(part); } }, cancellation[i]! as never));
+            for (let i = 0; i < 100 && pending.size < 2; i++) await Bun.sleep(1);
+            expect(pending.size).toBe(2);
+            pending.get(KIMI)!(Response.json({ ...messageJson(), usage: { input_tokens: 200, output_tokens: 40, cache_read_input_tokens: 90 } }));
+            await sends[1];
+            if (cancelFirst) cancellation[0]!.cancel();
+            pending.get(gw().model)!(new Response(frames().join(''), { headers: { 'content-type': 'text/event-stream' } }));
+            await sends[0];
+            const read = (i: number) => parts[i]!.filter((part): part is DataPart => part instanceof DataPart && part.mimeType === 'usage')
+                .map(part => JSON.parse(new TextDecoder().decode(part.data)));
+            expect(read(1)).toEqual([{ prompt_tokens: 290, completion_tokens: 40, total_tokens: 330,
+                prompt_tokens_details: { cached_tokens: 90 }, ezil_usage: { source: 'estimated', output_limit: 4096, cache_coverage: 'unknown' } }]);
+            if (cancelFirst) expect(read(0)).toEqual([]);
+            else expect(read(0)).toEqual([{ prompt_tokens: 107, completion_tokens: 8, total_tokens: 115,
+                prompt_tokens_details: { cached_tokens: 3, cache_creation_input_tokens: 4 }, ezil_usage: { source: 'measured', output_limit: 8192 } }]);
+        }
+    });
     describe('credit refusal action', () => {
         const baseUrl = process.env.EZIL_AI_BASE_URL;
         beforeEach(() => {
@@ -297,7 +326,7 @@ describe('EZiL gateway VS Code bridge', () => {
                 [message(1, [new TextPart('q')])] as never, { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never) };
         }
         for (const [code, extra, text] of [
-            ['insufficient_credits', {}, 'This request needs up to 80.00 credits, and you have 63.09.'],
+            ['insufficient_credits', {}, 'This request needs up to 80.00 credits, and you have 63.'],
             ['insufficient_credits', { no_live_grant: true }, 'You have no AI credits left. Add credits to continue.'],
             ['no_live_grant', {}, 'You have no AI credits left. Add credits to continue.'],
         ] as const) test(`${code} ${JSON.stringify(extra)} opens the OS billing card when chosen`, async () => {
@@ -336,7 +365,7 @@ describe('EZiL gateway VS Code bridge', () => {
                 else process.env.EZIL_AI_BASE_URL = value;
                 const h = refusal();
                 await expect(h.send()).rejects.toThrow('This request needs up to 80.00 credits');
-                expect(showCreditWarning).toHaveBeenCalledWith(expect.stringContaining('and you have 63.09.'));
+                expect(showCreditWarning).toHaveBeenCalledWith(expect.stringContaining('and you have 63.'));
                 expect(openExternal).not.toHaveBeenCalled();
             });
         }
@@ -378,7 +407,7 @@ describe('EZiL gateway VS Code bridge', () => {
         });
         const provider = new EZiLModelsProvider(host);
         const info = await provider.provideLanguageModelChatInformation({} as never, token() as never);
-        expect(info).toHaveLength(1); expect(info[0]).toMatchObject({ maxInputTokens: 104480, maxOutputTokens: 8192, capabilities: { imageInput: false }, isDefault: true });
+        expect(info).toHaveLength(1); expect(info[0]).toMatchObject({ maxInputTokens: 88640, maxOutputTokens: 8192, capabilities: { imageInput: false }, isDefault: true });
         const calls = gets;
         await provider.provideLanguageModelChatInformation({} as never, token() as never);
         expect(gets).toBe(calls);
@@ -416,7 +445,7 @@ describe('EZiL gateway VS Code bridge', () => {
             host.models()[0]!.maxInputTokens = configured;
             const provider = new EZiLModelsProvider(host);
             const infos = await provider.provideLanguageModelChatInformation({} as never, token() as never);
-            expect(infos[0]!.maxInputTokens).toBe(32768 - 1056 - 1536 - 24000);
+            expect(infos[0]!.maxInputTokens).toBe(1);
             const send = (text: string) => provider.provideLanguageModelChatResponse(infos[0]!, [message(1, [new TextPart(text)])] as never,
                 { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
             await send('字'.repeat(10000));
@@ -485,7 +514,7 @@ describe('EZiL gateway VS Code bridge', () => {
             }) as unknown as typeof fetch, () => { gets++; return Response.json(gets === 1 ? catalog() : catalog(32768, 4096)); });
             const provider = new EZiLModelsProvider(host);
             const infos = await provider.provideLanguageModelChatInformation({} as never, token() as never);
-            expect(infos[0]).toMatchObject({ maxInputTokens: 104480, maxOutputTokens: 8192 });
+            expect(infos[0]).toMatchObject({ maxInputTokens: 88640, maxOutputTokens: 8192 });
             const send = (text = 'q') => provider.provideLanguageModelChatResponse(infos[0]!, [message(1, [new TextPart(text)])] as never,
                 { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
             await expect(send()).rejects.toThrow(code === 'input_too_large' ? 'EZiL AI: This conversation is too large for qwen.qwen3-coder-next. EZiL AI refused it before the model ran' : code);
@@ -493,11 +522,34 @@ describe('EZiL gateway VS Code bridge', () => {
             await send(); // Still passes the old VS Code information object.
             expect(bodies.map(body => body.max_tokens)).toEqual([8192, 4096]); expect(gets).toBe(2);
             const refreshed = await provider.provideLanguageModelChatInformation({} as never, token() as never);
-            expect(refreshed[0]).toMatchObject({ maxInputTokens: 6176, maxOutputTokens: 4096 });
+            expect(refreshed[0]).toMatchObject({ maxInputTokens: 1, maxOutputTokens: 4096 });
             await expect(send('字'.repeat(11000))).rejects.toThrow('(local_input_too_large)');
             expect(bodies).toHaveLength(2); expect(gets).toBe(2);
         });
     }
+
+    test('pending credits finish the turn with an explicit retry and never open billing or charge recovery', async () => {
+        showRetryError.mockClear(); showCreditWarning.mockClear(); openExternal.mockClear(); retryCommand.mockClear();
+        let posts = 0;
+        const host = gatewayHost((async () => { posts++; return Response.json({ error: { code: 'os_credits_pending', source: 'ezil-os-proxy' } }, { status: 503 }); }) as unknown as typeof fetch);
+        const billingIntent = mock(async () => true);
+        const finished = mock(() => {});
+        const p = new EZiLModelsProvider({ ...host, billingIntent, requestFinished: finished });
+        const send = () => p.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
+            { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
+        await expect(send()).rejects.toThrow('Your AI credits are being confirmed');
+        await expect(send()).rejects.toThrow('Your AI credits are being confirmed');
+        for (let i = 0; i < 10; i++) await Promise.resolve();
+        expect(posts).toBe(2); // No automatic replay or transport retry.
+        expect(showRetryError).toHaveBeenCalledTimes(1); // Utility/title failures do not spam notices.
+        expect(showRetryError.mock.calls[0]![1]).toBe('Retry');
+        expect(showCreditWarning).not.toHaveBeenCalled();
+        expect(openExternal).not.toHaveBeenCalled();
+        expect(billingIntent).not.toHaveBeenCalled();
+        expect(retryCommand).not.toHaveBeenCalled();
+        expect(host.usage).toHaveLength(0);
+        expect(finished).toHaveBeenCalledTimes(2);
+    });
     test('recoverable gateway failure ends the turn and Retry resubmits only on user action', async () => {
         showRetryError.mockClear(); retryCommand.mockClear();
         showRetryError.mockImplementationOnce(async () => 'Retry');
@@ -556,7 +608,7 @@ describe('EZiL gateway VS Code bridge', () => {
         const host = gatewayHost((async () => Response.json(messageJson(), { headers: { 'x-ezil-request-id': 'bridge-json' } })) as unknown as typeof fetch);
         const provider = new EZiLModelsProvider(host); const parts: unknown[] = [];
         await provider.provideLanguageModelChatResponse(toInformation(host.models()[1]!), [message(1, [new TextPart('private question')])] as never,
-            { tools: [], modelOptions: {} } as never, { report: p => parts.push(p) }, token() as never);
+            { tools: [], modelOptions: {} } as never, { report: p => { if (!(p instanceof DataPart && p.mimeType === 'usage')) parts.push(p); } }, token() as never);
         expect(parts.map(p => (p as object).constructor)).toEqual([TextPart, ThinkingPart, ToolCallPart, TextPart]);
         expect(host.lines).toHaveLength(1); expect(host.lines[0]).not.toMatch(/private question|reasoning|synthetic-proxy-token/);
         expect(host.usage).toHaveLength(1);
@@ -603,7 +655,7 @@ describe('EZiL gateway VS Code bridge', () => {
             const host = gatewayHost((async () => Response.json(messageJson())) as unknown as typeof fetch);
             const provider = new Without(host); const parts: unknown[] = [];
             await provider.provideLanguageModelChatResponse(toInformation(host.models()[1]!), [message(1, [new TextPart('q')])] as never,
-                { tools: [], modelOptions: {} } as never, { report: p => parts.push(p) }, token() as never);
+                { tools: [], modelOptions: {} } as never, { report: p => { if (!(p instanceof DataPart && p.mimeType === 'usage')) parts.push(p); } }, token() as never);
             expect(parts.map(p => (p as object).constructor)).toEqual([TextPart, ToolCallPart, TextPart]);
         } finally { mock.module('vscode', () => fakeVscode); }
     });
@@ -638,7 +690,7 @@ describe('EZiL gateway VS Code bridge', () => {
             const ask = (provider: InstanceType<typeof Without>, history: unknown[], model = claude) => {
                 const parts: unknown[] = [];
                 return provider.provideLanguageModelChatResponse(toInformation(model), history as never, { tools: [CREATE_FILE], modelOptions: {} } as never,
-                    { report: p => parts.push(p) }, token() as never).then(() => parts);
+                    { report: p => { if (!(p instanceof DataPart && p.mimeType === 'usage')) parts.push(p); } }, token() as never).then(() => parts);
             };
             const first = make();
             const parts = await ask(first.provider, [message(1, [new TextPart('make a file')])]);
@@ -867,7 +919,7 @@ describe('Gateway Responses VS Code bridge', () => {
         report: (part: unknown) => void = () => {}, cancellation = token(), modelOptions = {}) {
         const provider = new EZiLModelsProvider(host);
         await provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), messages as never,
-            { tools, modelOptions } as never, { report }, cancellation as never);
+            { tools, modelOptions } as never, { report: part => { if (!(part instanceof DataPart && part.mimeType === 'usage')) report(part); } }, cancellation as never);
     }
 
     for (const catalogValue of [undefined, {}, { data: [] },
@@ -920,7 +972,7 @@ describe('Gateway Responses VS Code bridge', () => {
         expect(new Headers(request1!.init.headers).get('idempotency-key')).not.toBe(new Headers(request2!.init.headers).get('idempotency-key'));
         expect(host.reads).toHaveLength(1);
         expect(new Headers(host.reads[0]!.init.headers).get('authorization')).toBe('Bearer synthetic-proxy-token');
-        expect(host.usage).toEqual(Array(2).fill({ inputTokens: 100, outputTokens: 12, cacheReadTokens: 7, cacheWriteTokens: 0 }));
+        expect(host.usage).toEqual(Array(2).fill({ inputTokens: 100, outputTokens: 12, cacheReadTokens: 7, cacheWriteTokens: undefined, inputIncludesCache: true, reasoningTokens: 0 }));
         expect(host.requestFinished).toHaveBeenCalledTimes(2);
         expect(host.lines.join()).not.toMatch(/Create hello|File created|synthetic-proxy-token/);
     });

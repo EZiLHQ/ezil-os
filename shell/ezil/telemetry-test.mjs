@@ -66,6 +66,57 @@ try {
 push('capture() called 1000x with no browser globals at all: never throws', ! threw);
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 0a. 🔴 THE TERMINAL AI PROJECTION CARRIES NO IDENTITY ON THE WIRE.
+//
+//     `ezil-os:apps/code#aiRequest` is an authorized metadata-only projection:
+//     neither the ambient app-open trace and boot computer nor an explicit
+//     caller id may reach the wire with it, while every other site keeps the
+//     ids it always had. Exercised through the SOURCE module's real path
+//     (capture -> buffer -> flushNow -> HTTP), in an owned jsdom whose globals
+//     are restored afterwards, with a real ambient trace from `beginTrace()`.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    const COMPUTER = '4f7b1d2e-9c31-4a5f-8e60-1b2c3d4e5f60';
+    const OTHER = '5a8c2e3f-0d42-4b6a-9f71-2c3d4e5f6071';
+    const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'https://ezil.local/os', pretendToBeVisual: true });
+    const saved = { window: globalThis.window, document: globalThis.document, fetch: globalThis.fetch };
+    const bodies = [];
+    const sink = async (_url, opts) => { bodies.push(JSON.parse(String(opts?.body ?? 'null'))); return { ok: true, status: 202 }; };
+    globalThis.window = dom.window; globalThis.document = dom.window.document;
+    globalThis.fetch = sink; dom.window.fetch = sink;
+    dom.window.__EZIL_BOOT__ = { user: { id: 'u-telemetry-test' }, computer: { id: COMPUTER },
+        desktopState: { endpoints: { telemetry: 'https://ingest.invalid/api/shell/telemetry' } } };
+    let trace = null;
+    try {
+        const { beginTrace } = await import('./trace.js');
+        trace = beginTrace('code');
+        const wire = await import('./telemetry.js?terminal-ai-wire');
+        const ai = { eventClass: 'api_failure', site: 'ezil-os:apps/code#aiRequest', code: 'ai_provider_error', outcome: 'error' };
+        wire.capture(ai);
+        wire.capture({ ...ai, code: 'ai_stream_interrupted', correlationId: 'caller-trace-id', computerId: OTHER });
+        wire.capture({ eventClass: 'api_failure', site: 'ezil-os:apps/code#mint', code: 'fetch_failed', outcome: 'error' });
+        wire.flushNow();
+        const events = bodies.flatMap(b => b?.events ?? []);
+        const terminal = events.filter(e => e.site === ai.site);
+        const normal = events.find(e => e.site === 'ezil-os:apps/code#mint');
+        push('🔴 0a terminal AI events reach the real HTTP sink without correlationId or computerId (ambient or explicit)',
+            terminal.length === 2 && terminal.every(e => ! ('correlationId' in e) && ! ('computerId' in e)),
+            JSON.stringify(terminal.map(e => Object.keys(e).sort())));
+        push('0a …and an ordinary site still carries the ambient trace and boot computer',
+            normal?.computerId === COMPUTER && typeof normal?.correlationId === 'string' && normal.correlationId.length > 0,
+            JSON.stringify(normal && { computerId: normal.computerId, correlationId: normal.correlationId }));
+    } catch ( err ) {
+        push('🔴 0a terminal AI wire projection ran', false, String(err?.stack ?? err));
+    } finally {
+        trace?.end?.();
+        globalThis.window = saved.window; globalThis.document = saved.document; globalThis.fetch = saved.fetch;
+        if ( saved.window === undefined ) delete globalThis.window;
+        if ( saved.document === undefined ) delete globalThis.document;
+        dom.window.close();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 0b. eventId MUST be a real RFC-4122 v4 uuid in EVERY crypto environment.
 //
 //     🔴 The ingest route validates `eventId: z.string().uuid()` inside a

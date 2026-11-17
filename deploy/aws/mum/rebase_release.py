@@ -644,6 +644,231 @@ def static_deployment(plan,d):
     keys=(rebase_app.public_deployment(d).keys() | rebase_app.public_deployment(desired).keys()) - set(manifest.PROMOTION) - {'releases'}
     need(all(d.get(k)==desired.get(k) for k in keys),'deployment network/storage/identity changed outside the promotion tuple')
 
+# apply_app runs the plan's new app against hosts still on the deployed AMI's agent. The baked agent is
+# `git archive <agentCommit>:infra/host-agent`, so tree identity is exact. Reviewed exceptions
+# below bind complete old/new file modes and blobs; no path-only or feature-flag exception exists.
+HOST_AGENT='infra/host-agent'
+HOST_AGENT_EXCEPTION={
+    'lib/ezil_host/attest.py':(None,'100644 a86a795c144f399567a0ae2a9d5c20c42d89e738'),
+    'lib/ezil_host/cli.py':('100644 be52080df39b5fc598f88dd6db053a091a8b0d2b','100644 23d82c44207b9741f346edcca06cf2928aed94fa'),
+    'test/test_attest.py':(None,'100644 372195faa9675b751ae7b52381dccf32225a17ca'),
+}
+
+
+# 5127d85f -> 68dfb30a host tree: the same reviewed attestation lane plus the closed
+# standalone Git protocol/runtime update. Older app requests remain accepted; new optional
+# metadata stays gated until the matching Worker and host are qualified. A later byte or
+# mode change requires another review, even in one of these files.
+HOST_AGENT_STANDALONE_EXCEPTION={
+    'lib/ezil_host/attest.py':(None,'100644 a86a795c144f399567a0ae2a9d5c20c42d89e738'),
+    'lib/ezil_host/cli.py':('100644 be52080df39b5fc598f88dd6db053a091a8b0d2b','100644 23d82c44207b9741f346edcca06cf2928aed94fa'),
+    'lib/ezil_host/standalone_git.py':('100644 037ceac62f11f3e8e712fff9b49aceacc18dc99a','100644 58ec9ab326c7b3734f4834402d2f766b3de863e7'),
+    'lib/ezil_host/standalone_git_assets/pin.json':('100644 957e402c703ff6d642d1f9164a5ce80e1c92aca3','100644 c167f33cf3cd6766898375ea6bdece74ddce7d55'),
+    'lib/ezil_host/standalone_git_assets/supervise.py':('100644 60ca19fea4c83848f376e63817fc3bf927be66de','100644 e578c8cd0df336409b609d6c4bf9df120ba913a1'),
+    'lib/ezil_host/standalone_git_runtime.py':('100644 55ca45da446bcee299579a22b858d46016fb56ee','100644 8591353fbdedb0569c844333af57c5f1a49c10ce'),
+    'test/test_attest.py':(None,'100644 372195faa9675b751ae7b52381dccf32225a17ca'),
+    'test/test_standalone_git.py':('100644 248e8e11e620c2b5150b5ee443cb590c8cc64d8c','100644 9a5ec1c5fbe57d72c0dbd0c3fb5fcd12b300e0bf'),
+}
+
+
+# Directed transitions to the reviewed host tree 96ff8e22 (standalone Git edge/history/resilience update) and
+# to b7700d49 (96ff8e22 plus closed repository failure diagnostics; host_ready keeps the full committed-marker
+# binding, and supervisor_unavailable keeps the uncertain-writer fence). Each binds the EXACT deployed host tree, the EXACT baked host tree AND the complete mode/blob delta. Unlike the
+# delta-only exceptions above, any other file difference, including an unchanged extra file present on BOTH sides,
+# changes a tree id and is refused, and so is the reverse direction. Only these directions exist.
+HOST_AGENT_DIRECTED_EXCEPTIONS=(
+    # 1f4712c4 and 6a187841 (one host tree c87c304c) -> 96ff8e22: eight paths.
+    ('c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d','96ff8e224443e0d684cb99e808a903235f2def11',{
+        'README.md':('100644 911d6295f1cc8f68c7a388d6ea9002b7bb1b1a72','100644 ca1728be8a6bfb6dea9ae6846e6c47e568c5853e'),
+        'lib/ezil_host/agent.py':('100644 e87ac93fcb723021b758501d7359718c23f37ad4','100644 7d3e661a7cc6169df602bb2fe0085eec75f51abf'),
+        'lib/ezil_host/standalone_git.py':('100644 58ec9ab326c7b3734f4834402d2f766b3de863e7','100644 826a4c84c838f60b0cae9d4ef63426326b286421'),
+        'test/mutate.sh':('100755 6fc169ce8ab5015e2aaeafcc900d42d9ed7256dc','100755 dc163e4266cea435bff31c3f0cd3a03ffe4cc160'),
+        'test/test-units.sh':('100755 1ad3690a44c6a1fdd75f15933a49605e0c2d203b','100755 adedb61b4475977cb44fff69eb58add1c1faefa1'),
+        'test/test_history_stop.py':('100644 a7156588d88c2e10ce4ece5f02b78a4749111c33','100644 35adb455568ad48870c38e5e1f21b39fbc9ab9f0'),
+        'test/test_host_resilience.py':('100644 f30ffd16c5c15377068638388924725dfc1b69c0','100644 16c9c704597b3fd45b19f92827606c33d5986042'),
+        'test/test_standalone_git_edge.py':('100644 e25c9fa487d186cceaffb3d944d9dce3d20ef4a3','100644 68a62f9f6b1f3f0e9f73fde5be13514fb7dba196'),
+    }),
+    # main 9ca8b3c0 host tree 7a35e4c5 -> 96ff8e22: nine paths (a source comparison; not a claim about the deployed agent).
+    ('7a35e4c5ec543abe83b9bccc8c6e5af815e02247','96ff8e224443e0d684cb99e808a903235f2def11',{
+        'lib/ezil_host/agent.py':('100644 808dcd7993cd026bee8fc5c24078752ca2a00a69','100644 7d3e661a7cc6169df602bb2fe0085eec75f51abf'),
+        'lib/ezil_host/edge.py':('100644 ad563b171cefcce08fa86ec11ea8916a35c0ee34','100644 745147e6964ede7373367b6d25565d3aa758f335'),
+        'lib/ezil_host/standalone_git.py':(None,'100644 826a4c84c838f60b0cae9d4ef63426326b286421'),
+        'lib/ezil_host/standalone_git_assets/pin.json':(None,'100644 c167f33cf3cd6766898375ea6bdece74ddce7d55'),
+        'lib/ezil_host/standalone_git_assets/stage.py':(None,'100644 8efaa0cab42cfb4fce9310bb137146465cc523da'),
+        'lib/ezil_host/standalone_git_assets/supervise.py':(None,'100644 e578c8cd0df336409b609d6c4bf9df120ba913a1'),
+        'lib/ezil_host/standalone_git_runtime.py':(None,'100644 8591353fbdedb0569c844333af57c5f1a49c10ce'),
+        'test/test_standalone_git.py':(None,'100644 9a5ec1c5fbe57d72c0dbd0c3fb5fcd12b300e0bf'),
+        'test/test_standalone_git_edge.py':(None,'100644 68a62f9f6b1f3f0e9f73fde5be13514fb7dba196'),
+    }),
+    # S 0c113cb4 host tree 96ff8e22 -> b7700d49: the closed repository failure diagnostics, 5 paths.
+    ('96ff8e224443e0d684cb99e808a903235f2def11','b7700d49c946157cd75c862bce867caf7fd08810',{
+        'lib/ezil_host/edge.py':('100644 745147e6964ede7373367b6d25565d3aa758f335','100644 e621a7861f4f2dbaba2fe303e7222903b0173e5d'),
+        'lib/ezil_host/standalone_git.py':('100644 826a4c84c838f60b0cae9d4ef63426326b286421','100644 b54d07996810668b54e6aa007edbf00a89daad38'),
+        'lib/ezil_host/standalone_git_runtime.py':('100644 8591353fbdedb0569c844333af57c5f1a49c10ce','100644 2996b5a7703b03bb4d73708ca169e422cf990965'),
+        'test/test_standalone_git.py':('100644 9a5ec1c5fbe57d72c0dbd0c3fb5fcd12b300e0bf','100644 a406d07d8c9ddc30800bc7f001be1929bdc91beb'),
+        'test/test_standalone_git_edge.py':('100644 68a62f9f6b1f3f0e9f73fde5be13514fb7dba196','100644 1237865c01c065e419015c1813bd09ffec8751b0'),
+    }),
+    # 1f4712c4 and 6a187841 (host tree c87c304c) -> b7700d49: the reviewed 96ff8e22 update plus the diagnostics, 11 paths.
+    ('c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d','b7700d49c946157cd75c862bce867caf7fd08810',{
+        'README.md':('100644 911d6295f1cc8f68c7a388d6ea9002b7bb1b1a72','100644 ca1728be8a6bfb6dea9ae6846e6c47e568c5853e'),
+        'lib/ezil_host/agent.py':('100644 e87ac93fcb723021b758501d7359718c23f37ad4','100644 7d3e661a7cc6169df602bb2fe0085eec75f51abf'),
+        'lib/ezil_host/edge.py':('100644 745147e6964ede7373367b6d25565d3aa758f335','100644 e621a7861f4f2dbaba2fe303e7222903b0173e5d'),
+        'lib/ezil_host/standalone_git.py':('100644 58ec9ab326c7b3734f4834402d2f766b3de863e7','100644 b54d07996810668b54e6aa007edbf00a89daad38'),
+        'lib/ezil_host/standalone_git_runtime.py':('100644 8591353fbdedb0569c844333af57c5f1a49c10ce','100644 2996b5a7703b03bb4d73708ca169e422cf990965'),
+        'test/mutate.sh':('100755 6fc169ce8ab5015e2aaeafcc900d42d9ed7256dc','100755 dc163e4266cea435bff31c3f0cd3a03ffe4cc160'),
+        'test/test-units.sh':('100755 1ad3690a44c6a1fdd75f15933a49605e0c2d203b','100755 adedb61b4475977cb44fff69eb58add1c1faefa1'),
+        'test/test_history_stop.py':('100644 a7156588d88c2e10ce4ece5f02b78a4749111c33','100644 35adb455568ad48870c38e5e1f21b39fbc9ab9f0'),
+        'test/test_host_resilience.py':('100644 f30ffd16c5c15377068638388924725dfc1b69c0','100644 16c9c704597b3fd45b19f92827606c33d5986042'),
+        'test/test_standalone_git.py':('100644 9a5ec1c5fbe57d72c0dbd0c3fb5fcd12b300e0bf','100644 a406d07d8c9ddc30800bc7f001be1929bdc91beb'),
+        'test/test_standalone_git_edge.py':('100644 e25c9fa487d186cceaffb3d944d9dce3d20ef4a3','100644 1237865c01c065e419015c1813bd09ffec8751b0'),
+    }),
+    # main 9ca8b3c0 host tree 7a35e4c5 -> b7700d49: 9 paths (a source comparison; not a claim about the deployed agent).
+    ('7a35e4c5ec543abe83b9bccc8c6e5af815e02247','b7700d49c946157cd75c862bce867caf7fd08810',{
+        'lib/ezil_host/agent.py':('100644 808dcd7993cd026bee8fc5c24078752ca2a00a69','100644 7d3e661a7cc6169df602bb2fe0085eec75f51abf'),
+        'lib/ezil_host/edge.py':('100644 ad563b171cefcce08fa86ec11ea8916a35c0ee34','100644 e621a7861f4f2dbaba2fe303e7222903b0173e5d'),
+        'lib/ezil_host/standalone_git.py':(None,'100644 b54d07996810668b54e6aa007edbf00a89daad38'),
+        'lib/ezil_host/standalone_git_assets/pin.json':(None,'100644 c167f33cf3cd6766898375ea6bdece74ddce7d55'),
+        'lib/ezil_host/standalone_git_assets/stage.py':(None,'100644 8efaa0cab42cfb4fce9310bb137146465cc523da'),
+        'lib/ezil_host/standalone_git_assets/supervise.py':(None,'100644 e578c8cd0df336409b609d6c4bf9df120ba913a1'),
+        'lib/ezil_host/standalone_git_runtime.py':(None,'100644 2996b5a7703b03bb4d73708ca169e422cf990965'),
+        'test/test_standalone_git.py':(None,'100644 a406d07d8c9ddc30800bc7f001be1929bdc91beb'),
+        'test/test_standalone_git_edge.py':(None,'100644 1237865c01c065e419015c1813bd09ffec8751b0'),
+    }),
+    # f27ddff7 (deployed staging R151) diagnostics host tree f3a5a1ba -> b7700d49: 8 paths. The target keeps
+    # host_ready()'s full committed-marker binding; f3a5a1ba still compares an exact two-field stamp under 1024/4096 limits.
+    ('f3a5a1ba954c56ab31aa0c844cb5719c88905dfc','b7700d49c946157cd75c862bce867caf7fd08810',{
+        'README.md':('100644 911d6295f1cc8f68c7a388d6ea9002b7bb1b1a72','100644 ca1728be8a6bfb6dea9ae6846e6c47e568c5853e'),
+        'lib/ezil_host/agent.py':('100644 e87ac93fcb723021b758501d7359718c23f37ad4','100644 7d3e661a7cc6169df602bb2fe0085eec75f51abf'),
+        'lib/ezil_host/standalone_git.py':('100644 e296b6166662e23e5c0df6c7a1209e81c5fb07d3','100644 b54d07996810668b54e6aa007edbf00a89daad38'),
+        'test/mutate.sh':('100755 6fc169ce8ab5015e2aaeafcc900d42d9ed7256dc','100755 dc163e4266cea435bff31c3f0cd3a03ffe4cc160'),
+        'test/test-units.sh':('100755 1ad3690a44c6a1fdd75f15933a49605e0c2d203b','100755 adedb61b4475977cb44fff69eb58add1c1faefa1'),
+        'test/test_history_stop.py':('100644 a7156588d88c2e10ce4ece5f02b78a4749111c33','100644 35adb455568ad48870c38e5e1f21b39fbc9ab9f0'),
+        'test/test_host_resilience.py':('100644 f30ffd16c5c15377068638388924725dfc1b69c0','100644 16c9c704597b3fd45b19f92827606c33d5986042'),
+        'test/test_standalone_git_edge.py':('100644 1f5aeb0f84f1afe09393d710e4752d1fd4b00aa9','100644 1237865c01c065e419015c1813bd09ffec8751b0'),
+    }),
+)
+
+
+def host_agent_tree_id(commit,repo=REPO):
+    """The exact Git tree object of a commit's host agent (binds every file, mode and name, not just a delta)."""
+    need(manifest.matches(r'[0-9a-f]{40}',commit),'host agent commit unavailable')
+    git=lambda *args:subprocess.run(['git','-C',str(repo),*args],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=90,check=False)
+    result=git('rev-parse','--verify','--quiet',commit+':'+HOST_AGENT)
+    tree=result.stdout.decode().strip()
+    need(result.returncode==0 and manifest.matches(r'[0-9a-f]{40}',tree),'host agent commit unavailable')
+    kind=git('cat-file','-t',tree)
+    need(kind.returncode==0 and kind.stdout.decode().strip()=='tree','host agent tree is not plain files')
+    return tree
+
+
+def host_agent_tree(commit,repo=REPO):
+    need(manifest.matches(r'[0-9a-f]{40}',commit),'host agent commit unavailable')
+    result=subprocess.run(['git','-C',str(repo),'ls-tree','-r','-z',commit,'--',HOST_AGENT+'/'],
+                          stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=90,check=False)
+    need(result.returncode==0 and result.stdout,'host agent commit unavailable')
+    tree={}
+    for entry in result.stdout.decode('utf-8').split('\0')[:-1]:
+        meta,name=entry.split('\t',1)
+        mode,kind,blob=meta.split(' ')
+        need(kind=='blob' and name.startswith(HOST_AGENT+'/'),'host agent tree is not plain files')
+        tree[name[len(HOST_AGENT)+1:]]=mode+' '+blob
+    return tree
+
+
+def require_host_abi(deployed_commit,bake_commit,repo=REPO):
+    """Byte-identical host agent or one complete reviewed delta; never a wider claim."""
+    old,new=host_agent_tree(deployed_commit,repo),host_agent_tree(bake_commit,repo)
+    delta={name:(old.get(name),new.get(name)) for name in old.keys()|new.keys() if old.get(name)!=new.get(name)}
+    if delta in ({},HOST_AGENT_EXCEPTION,HOST_AGENT_STANDALONE_EXCEPTION):return delta
+    # A directed map admits only its exact source tree -> exact target tree with exactly its delta.
+    source,target=host_agent_tree_id(deployed_commit,repo),host_agent_tree_id(bake_commit,repo)
+    need(any(source==expected_source and target==expected_target and delta==expected_delta
+             for expected_source,expected_target,expected_delta in HOST_AGENT_DIRECTED_EXCEPTIONS),
+         'host agent differs from the deployed agent beyond the reviewed delta')
+    return delta
+
+
+# Release-registry readers (app/src/server/lib/compute/aws-rebase-release.ts). The normal ordering already
+# separates the app from the registry: apply_app installs the plan's new app over the UNCHANGED tuple and
+# registry, and only promote appends. A registry past the namespace legacy limit (mum 32, prd 26) must never meet an app that
+# cannot parse it: every install refuses such an app first, and promote proves the running reader first.
+CAPACITY_SOURCE='app/src/server/lib/compute/aws-rebase-release.ts'
+CAPACITY_DECLARATION=re.compile(r'^export const REBASE_RELEASE_REGISTRY_CAPACITY = ([1-9][0-9]{0,3});$',re.M)
+
+
+def registry_count(d):
+    records=d.get('releases',[])
+    need(isinstance(records,list),'invalid release registry')
+    return len(records)
+
+
+def source_reader_capacity(git_sha,repo=REPO):
+    """Pre-install evidence from the app's exact source commit. Not runtime proof (the probe's readerCapacity is)."""
+    need(manifest.matches(r'[0-9a-f]{40}',git_sha),'target app reader capacity unknown')
+    git=lambda *args:subprocess.run(['git','-C',str(repo),*args],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=90,check=False)
+    blob=git('rev-parse','--verify','--quiet',git_sha+':'+CAPACITY_SOURCE)
+    need(blob.returncode==0 and manifest.matches(r'[0-9a-f]{40}',blob.stdout.decode().strip()),'target app reader capacity unknown')
+    text=git('cat-file','blob',blob.stdout.decode().strip())
+    found=CAPACITY_DECLARATION.findall(text.stdout.decode('utf-8','replace')) if text.returncode==0 else []
+    need(len(found)==1,'target app reader capacity unknown')
+    return int(found[0]),blob.stdout.decode().strip()
+
+
+def require_reader_capacity(count,git_sha,repo=REPO):
+    """Before any install or registry write. At or below the legacy limit every app reads the registry,
+    so rollbacks to a legacy-limit reader stay allowed until the registry passes that namespace limit."""
+    if count<=json_tool.legacy_registry_capacity():return None
+    capacity,blob=source_reader_capacity(git_sha,repo)
+    need(capacity>=count,'target app cannot read the live release registry')
+    return {'capacity':capacity,'blob':blob}
+
+
+def require_runtime_capacity(result,count):
+    """After an install or readback: the running build's own /api/health capacity (rebase_app NODE).
+    A missing or null readerCapacity is the legacy ABI and is only accepted at or below the legacy limit."""
+    if count<=json_tool.legacy_registry_capacity():return
+    capacity=result.get('readerCapacity') if isinstance(result,dict) else None
+    need(type(capacity) is int and capacity>=count,'running app reader capacity is below the live release registry')
+
+
+def prospective_count(d,records):
+    """Registry size after promote appends these records (edit_release_secret never drops one)."""
+    key=lambda r:(r['lowerImageDigest'],r['amiId'])
+    retained={key(r) for r in d.get('releases',[])}
+    return registry_count(d)+len({key(r) for r in records}-retained)
+
+
+def probe_plan_app(path,plan,operation,count):
+    """The protected read-only host probe: the running build is the plan app (source, compose tag, one image)."""
+    app=plan['rollout']['app']
+    observed=rebase_ssm.run(Path(path).parent,operation,rebase_app.probe_body(app['tag']),True,aws,json_tool.write,fresh=True)
+    need(isinstance(observed,dict) and observed.get('killSwitch')=='1' and observed.get('lockFree') is True
+         and observed.get('gitSha')==observed.get('servedSha')==app['gitSha'] and observed.get('composeTag')==app['tag']
+         and manifest.matches(r'sha256:[0-9a-f]{64}',observed.get('imageId'))
+         and observed['imageId']==observed.get('tagImageId')==observed.get('composeImageId'),
+         'running app is not the plan-bound apply-app build')
+    require_runtime_capacity(observed,count)
+    return observed
+
+
+def require_reader_promotion(path,plan,count,apply,generation,deployed_agent):
+    """Promote past the legacy limit only over a proven reader: the plan-bound apply-app receipt (which
+    recorded the image installed from the plan's checksum-pinned artifact), the plan app's source, the
+    reviewed host-agent delta, and a fresh protected probe showing that same image still running."""
+    if count<=json_tool.legacy_registry_capacity():return
+    app=plan['rollout']['app']
+    need(app['gitSha']==plan['bake']['agentCommit'],'app and host must use the same reviewed integrated source commit')
+    require_host_abi(deployed_agent,plan['bake']['agentCommit'])
+    require_reader_capacity(count,app['gitSha'])
+    receipt=require_receipt(path,'apply-app')
+    need(type(receipt.get('readerCapacity')) is int and receipt['readerCapacity']>=count
+         and manifest.matches(r'sha256:[0-9a-f]{64}',receipt.get('imageId')),
+         'apply-app receipt does not prove a reader for the larger registry')
+    if not apply:return
+    observed=probe_plan_app(path,plan,'promote-reader-probe-g'+str(generation),count)
+    need(observed['imageId']==receipt['imageId'],'running image is not the image apply-app installed')
+
+
 def app_operation(path,plan,operation,apply,expected=None,install=True,generation=None):
     need(plan['rollout'] is not None,'plan requires --rollout with reviewed staged change sets and app artifact')
     body=rebase_app.body(safe_path(REPO/'deploy/aws/os-staging/install-host.sh').read_text(),plan['rollout']['app'],expected,install)
@@ -714,12 +939,28 @@ def apply_app(manifest_path,apply,ledger_path=None):
         latest=completed_entries(ledger)[-1]
         own_promoted=latest['planSha256']==digest(path) and latest['tuple']==ledger_tuple(value)
         manifest.promoted_release(d,value if own_promoted else deployed)
+        # The normal mixed phase: the plan's new app over the unchanged tuple and registry. Refuse an app that
+        # could not parse the live registry before anything is written or installed.
+        count=registry_count(d)
+        require_reader_capacity(count,plan['rollout']['app']['gitSha'])
+        future=prospective_count(d,[value])
+        if future>json_tool.legacy_registry_capacity():
+            # Its promotion will pass the legacy limit: the new app meets hosts on the deployed agent first,
+            # and must parse the registry its promotion will write.
+            require_host_abi(deployed['agentCommit'],plan['bake']['agentCommit'])
+            require_reader_capacity(future,plan['rollout']['app']['gitSha'])
         ledger,generation=begin_operation(ledger_path,ledger,path,plan,'apply-app',envelope,d,d,apply,fd)
         result=app_operation(path,plan,'apply-app',apply,rebase_app.public_deployment(d),generation=generation)
         check=json_tool.secret_aws(['get-secret-value','--secret-id',json_tool.SECRET,'--output','json'],lock_fd=fd)
         need(check['VersionId']==envelope['VersionId'],'secret changed during app deployment')
         if apply:
             need(result is not None,'app verification missing')
+            require_runtime_capacity(result,count)
+            if future>json_tool.legacy_registry_capacity():
+                # Bind the image just installed from the plan's checksum-pinned artifact to this receipt;
+                # promote past the legacy limit requires that same image still running.
+                observed=probe_plan_app(path,plan,'apply-app-reader-probe-g'+str(generation),future)
+                result={**result,'imageId':observed['imageId']}
             write_receipt(path,'apply-app',result)
             append_ledger(ledger_path,ledger,path,plan,'apply-app',check,d,result['gitSha'])
     need(load_plan(path)==plan,'plan changed during app deployment')
@@ -774,6 +1015,10 @@ def promote(manifest_path,apply,rollback=False,ledger_path=None):
         need(current in (before,after),'complete deployment tuple drift')
         updated=json_tool.edit_release_secret(envelope,before,after,[source,predecessor,target])
         _,next_d=secret_deployment({'SecretString':json.dumps(updated)})
+        # Past the legacy limit only after apply-app proved the running reader (rollback keeps that same app).
+        count=registry_count(next_d)
+        # plan_roles returns (deployed, source): `source` here is the deployed release whose agent hosts still run.
+        require_reader_promotion(path,plan,count,apply,ledger['entries'][-1]['generation']+1,source['agentCommit'])
         journal['rollbackDeployment' if rollback else 'afterDeployment']=rebase_app.public_deployment(next_d)
         ledger,generation=begin_operation(ledger_path,ledger,path,plan,operation,envelope,d,next_d,apply,fd)
         if not apply:
@@ -791,6 +1036,7 @@ def promote(manifest_path,apply,rollback=False,ledger_path=None):
         check=json_tool.secret_aws(['get-secret-value','--secret-id',json_tool.SECRET,'--output','json'],lock_fd=fd)
         need(check['VersionId']==envelope['VersionId'] and manifest.loads(check['SecretString'])==updated,'app secret drift after restart')
         need(app_result is not None,'app verification missing')
+        require_runtime_capacity(app_result,count)
         journal['status']='rolled-back' if rollback else 'promoted';json_tool.write(journal_path,journal)
         append_ledger(ledger_path,ledger,path,plan,operation,check,next_d,app_result['gitSha'])
     print('Full deployment tuple and registry verified; admission remains gated for the lead canary')
@@ -893,6 +1139,8 @@ def ledger_adopt_app(git_sha, source_repo, apply=False, ledger_path=None):
         result = app_operation(ledger_path, plan, 'ledger-adopt-app-g' + str(generation) + '-' + git_sha[:12],
                                True, rebase_app.public_deployment(d), install=False)
         need(result is not None and result.get('gitSha') == git_sha, 'ledger-adopt-app live git SHA mismatch')
+        # Never adopt an out-of-band app that cannot parse the live registry.
+        require_runtime_capacity(result, registry_count(d))
         need(git_sha != latest['appGitSha'], 'ledger-adopt-app already recorded')
         ancestor = subprocess.run(['git', '-C', str(source_repo), 'merge-base', '--is-ancestor', latest['appGitSha'], git_sha],
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90, check=False)

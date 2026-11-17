@@ -1,4 +1,5 @@
 import { drainFeedbackNotifications } from '@/server/feedback/notifications';
+import { drainIncidentAlerts } from '@/server/telemetry/incident-alerts';
 import type { SQL } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -15,11 +16,13 @@ import { stopComputerForPolicy } from '@/server/lib/compute/stop-policy';
 import { advanceReverseMoves } from '@/server/lib/compute/provider-reverse-runtime';
 import { handleBillingSessionSweep, reverseMoveInFlightFor } from './handler';
 import { aiIncludedModelsFor } from '@/server/billing/v3/ai-models';
+import { aiCreditsPendingFor } from '@/server/billing/ai-credits-pending';
 import { refreshAiPlans } from '@/server/lib/ai-credential';
 import { GET, maxDuration } from './route';
 
 const mockEnv = vi.hoisted(() => ({ CRON_SECRET: undefined as string | undefined, CLOUDFLARE_GUACAMOLE_HMAC_SECRET: undefined as string | undefined }));
 vi.mock('@/server/feedback/notifications', () => ({ drainFeedbackNotifications: vi.fn() }));
+vi.mock('@/server/telemetry/incident-alerts', () => ({ drainIncidentAlerts: vi.fn() }));
 vi.mock('@/env', () => ({ env: mockEnv }));
 vi.mock('@/server/db', () => ({ db: {} }));
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn() }));
@@ -32,6 +35,7 @@ vi.mock('@/server/lib/cloudflare-guacamole-provider', () => ({ newCorrelationId:
     resolveCloudflareGuacamoleConfig: () => ({ workerUrl: 'https://worker.test', hasHmacSecret: true, isConfigured: true }) }));
 vi.mock('@/server/lib/ai-credential', () => ({ refreshAiPlans: vi.fn(), AI_PLAN_REFRESH_LIMIT: 500, AI_PLAN_REFRESH_OPENED_WITHIN_MS: 3 * 3_600_000 }));
 vi.mock('@/server/billing/v3/ai-models', () => ({ aiIncludedModelsFor: vi.fn() }));
+vi.mock('@/server/billing/ai-credits-pending', () => ({ aiCreditsPendingFor: vi.fn() }));
 vi.mock('./handler', () => ({ handleBillingSessionSweep: vi.fn(), RUNNING_GRACE_MS: 120_000,
     reverseMoveInFlightFor: vi.fn((executor: unknown) => Object.assign(async () => false, { executor })) }));
 vi.mock('@/server/lib/compute/provider-reverse-runtime', () => ({ advanceReverseMoves: vi.fn() }));
@@ -51,6 +55,7 @@ beforeEach(() => {
     vi.resetAllMocks();
     mockEnv.CRON_SECRET = 'cron';
     vi.mocked(drainFeedbackNotifications).mockResolvedValue({ accepted: 0, retry: 0, skipped: true });
+    vi.mocked(drainIncidentAlerts).mockResolvedValue({ enqueued: 0, accepted: 0, retry: 0, dropped: 0, skipped: true, silent: false, budget: false });
     vi.mocked(getBillingDeps).mockReturnValue(deps);
     vi.mocked(handleBillingSessionSweep).mockResolvedValue(counts);
     vi.mocked(isPlacementReadEnabled).mockReturnValue(true);
@@ -106,7 +111,7 @@ describe('GET /api/cron/billing-session-sweep', () => {
         const params = vi.mocked(refreshAiPlans).mock.calls[0]![0];
         expect(params.hmacSecret).toBe('hmac');
         expect(params.config).toMatchObject({ workerUrl: 'https://worker.test', isConfigured: true });
-        expect(Object.keys(params).sort()).toEqual(['computers', 'config', 'hmacSecret', 'includedModelsFor', 'pass']);
+        expect(Object.keys(params).sort()).toEqual(['computers', 'config', 'creditsPendingFor', 'hmacSecret', 'includedModelsFor', 'pass']);
         expect(params.pass).toBe(Math.floor(now.getTime() / 60_000));
         // The window is measured from the sweep's own clock: deleted_at IS NULL and last_opened_at after now - 3 h.
         const window = { sql: '("ezil_computers"."deleted_at" is null and "ezil_computers"."last_opened_at" > $1)',
@@ -121,6 +126,9 @@ describe('GET /api/cron/billing-session-sweep', () => {
         expect(new PgDialect().sqlToQuery(query.orderBy as SQL).sql).toBe('"ezil_computers"."id" asc');
         expect(await params.includedModelsFor('u1')).toEqual(['gemini-3.8-flash']);
         expect(aiIncludedModelsFor).toHaveBeenCalledExactlyOnceWith('u1');
+        vi.mocked(aiCreditsPendingFor).mockResolvedValue(true);
+        expect(await params.creditsPendingFor!('u1')).toBe(true);
+        expect(aiCreditsPendingFor).toHaveBeenCalledExactlyOnceWith('u1');
         mockEnv.CLOUDFLARE_GUACAMOLE_HMAC_SECRET = undefined;
     });
 
@@ -293,5 +301,63 @@ describe('feedback notification retry wiring', () => {
             expect(handleBillingSessionSweep).toHaveBeenCalledTimes(1);
             expect(warn).toHaveBeenCalledExactlyOnceWith('[feedback] notification sweep unavailable');
         } finally { warn.mockRestore(); }
+    });
+});
+
+describe('incident alert sweep wiring', () => {
+    it('does not run for unauthenticated cron requests', async () => {
+        expect((await GET(request('Bearer wrong'))).status).toBe(404);
+        expect(drainIncidentAlerts).not.toHaveBeenCalled();
+    });
+    it('runs after the feedback drain and before billing dependencies, so neither fault strands alerts', async () => {
+        vi.mocked(drainFeedbackNotifications).mockRejectedValue(new Error('feedback unavailable'));
+        vi.mocked(getBillingDeps).mockImplementation(() => { throw new Error('billing unavailable'); });
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        try {
+            await expect(GET(request('Bearer cron'))).rejects.toThrow('billing unavailable');
+            expect(drainIncidentAlerts).toHaveBeenCalledExactlyOnceWith(db, null);
+            expect(vi.mocked(drainFeedbackNotifications).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(drainIncidentAlerts).mock.invocationCallOrder[0]!);
+            expect(vi.mocked(drainIncidentAlerts).mock.invocationCallOrder[0]).toBeLessThan(vi.mocked(getBillingDeps).mock.invocationCallOrder[0]!);
+        } finally { warn.mockRestore(); }
+    });
+    it('an alert failure cannot interrupt the feedback drain or billing work, or expose its error', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        vi.mocked(drainIncidentAlerts).mockRejectedValue(new Error('secret-mail-key'));
+        try {
+            expect((await GET(request('Bearer cron'))).status).toBe(200);
+            expect(drainFeedbackNotifications).toHaveBeenCalledTimes(1);
+            expect(handleBillingSessionSweep).toHaveBeenCalledTimes(1);
+            expect(warn).toHaveBeenCalledExactlyOnceWith('[telemetry] incident alert sweep unavailable');
+        } finally { warn.mockRestore(); }
+    });
+    it('labels and links the mail by the trusted funding configuration only, never the request origin, referrer or parameters', async () => {
+        const notice = { fingerprint: 'fp_0123456789abcdef', eventClass: 'crash', site: 'ezil-os:apps/code#mint', code: 'boot_failed', distinctUsers: 2, events: 3,
+            windowStart: '2026-10-18T05:50:00.000Z', windowEnd: '2026-10-18T05:59:00.000Z', createdAt: now.toISOString() };
+        // A request that claims staging every way a client could.
+        const hostile = () => new Request('https://os-staging.ezil.work/api/cron/billing-session-sweep?origin=https://os-staging.ezil.work&deployment=staging', {
+            headers: { authorization: 'Bearer cron', origin: 'https://os-staging.ezil.work', referer: 'https://os-staging.ezil.work/admin/telemetry',
+                'x-forwarded-host': 'os-staging.ezil.work' },
+        });
+        const mailed = async (fundingUrl: string) => {
+            vi.mocked(drainIncidentAlerts).mockClear();
+            const fetcher = vi.fn(async () => ({ ok: true, json: async () => ({ data: { succeeded: 1, failed: 0, email_id: 'id-1' } }) }) as Response);
+            vi.stubGlobal('fetch', fetcher);
+            vi.stubEnv('FEEDBACK_SMTP2GO_API_KEY', 'fixture-key');
+            vi.stubEnv('BILLING_FUNDING_URL', fundingUrl);
+            expect((await GET(hostile())).status).toBe(200);
+            const mailer = vi.mocked(drainIncidentAlerts).mock.calls[0]![1]!;
+            expect(await mailer(notice)).toEqual({ accepted: true, messageId: 'id-1' });
+            return JSON.parse((fetcher.mock.calls[0] as unknown as [string, { body: string }])[1].body) as { subject: string; text_body: string };
+        };
+        try {
+            const staging = await mailed('https://ai-staging.ezil.work/funding');
+            expect(staging.subject).toMatch(/^\[staging\] /);
+            expect(staging.text_body).toContain('Review telemetry: https://os-staging.ezil.work/admin/telemetry');
+            for (const fundingUrl of ['https://ai.ezil.work/funding', '', 'https://ai-staging.ezil.work.evil.test/', 'http://ai-staging.ezil.work', 'https://os-staging.ezil.work', 'not a url']) {
+                const body = await mailed(fundingUrl);
+                expect(`${body.subject}\n${body.text_body}`).not.toMatch(/staging/i);
+                expect(body.text_body).toContain('Review telemetry: https://os.ezil.work/admin/telemetry');
+            }
+        } finally { vi.unstubAllEnvs(); vi.unstubAllGlobals(); }
     });
 });

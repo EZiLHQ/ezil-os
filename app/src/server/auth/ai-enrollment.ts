@@ -7,6 +7,7 @@ import { AI_CREDIT_PROTOCOL, aiCreditEntitlement, aiCreditOutboxItem } from '@/s
 import { AI_CREDIT_KICK_SQL } from '@/server/billing/ai-credit-outbox-store';
 import { aiMemberContract } from '@/server/billing/ai-member-contract';
 import { readBillingConfig } from '@/server/billing/config';
+import { deliverStarterCredits, type AiStarterDelivery } from '@/server/billing/ai-starter-delivery';
 
 const WORK_MS = 5_000;
 const CLOSE_MS = 1_000;
@@ -44,7 +45,7 @@ export type AiEnrollCode = AiEnrollRefusal | typeof AI_ENROLL_UNAVAILABLE[number
 /** `auth0`: at sign-in, after the ID token was verified (also enqueues the Free receipt); `outbox`: the drain. */
 export type AiEnrollSource = 'auth0' | 'outbox';
 export type AiEnrollResult = { ok: true } | { ok: false; code: AiEnrollCode };
-type Stage = 'config' | 'connect' | 'role' | 'probe' | 'enroll' | 'kick' | 'enqueue' | 'done';
+type Stage = 'config' | 'connect' | 'role' | 'probe' | 'enroll' | 'kick' | 'enqueue' | 'deliver' | 'done';
 
 const SQL_REFUSALS: ReadonlySet<string> = new Set(AI_ENROLL_SQL_REFUSALS);
 export const isAiEnrollRefusal = (code: AiEnrollCode): code is AiEnrollRefusal => SQL_REFUSALS.has(code) || code === 'unknown_refusal';
@@ -85,6 +86,7 @@ export async function enrollAiMember(authUserId: string, sub: string, source: Ai
     let timedOut = false;
     let stage: Stage = 'config';
     let failedAt: Stage = 'done';
+    let starter: AiStarterDelivery | undefined;
     const sockets = new Set<Socket>();
     const deadline = performance.now() + WORK_MS;
     const unavailable = () => new Error('ai_enrollment_unavailable');
@@ -220,6 +222,13 @@ export async function enrollAiMember(authUserId: string, sub: string, source: Ai
                     values ($1, $2::uuid, $3, $4::jsonb) on conflict do nothing`,
                 [item.eventKey, item.userId, item.kind, item.payload as postgres.JSONValue]);
             });
+
+            // The enrollment and the receipt are committed: from here nothing, not even the deadline, can fail them.
+            // One bounded delivery attempt of exactly that grant on this owned client (see deliverStarterCredits), so
+            // Code usually opens on the credits. A miss is left to the sweep; the starter outcome is only logged.
+            stage = 'deliver';
+            starter = await deliverStarterCredits({ client: ownedClient, userId: authUserId,
+                deadlineAt: Date.now() + Math.max(0, deadline - performance.now()), config: { fundingUrl, fundingHmacSecret } });
         }
 
         const expired = new Promise<never>((_, reject) => {
@@ -233,9 +242,14 @@ export async function enrollAiMember(authUserId: string, sub: string, source: Ai
         await Promise.race([enroll(), expired]);
         result = { ok: true };
     } catch (error) {
-        // Never log database/provider detail, identity values or credentials: only a fixed code.
-        result = { ok: false, code: failureCode(error, stage, timedOut) };
-        failedAt = stage; // Frozen: a refused late continuation cannot relabel it.
+        // Past the committed receipt only the starter delivery remains: a deadline there never un-enrolls the member.
+        // (`stage` is assigned inside `enroll()`, which the compiler's narrowing at this catch does not see.)
+        if ((stage as Stage) === 'deliver') result = { ok: true };
+        else {
+            // Never log database/provider detail, identity values or credentials: only a fixed code.
+            result = { ok: false, code: failureCode(error, stage, timedOut) };
+            failedAt = stage; // Frozen: a refused late continuation cannot relabel it.
+        }
     } finally {
         stopped = true;
         clearTimeout(deadlineTimer);
@@ -257,7 +271,7 @@ export async function enrollAiMember(authUserId: string, sub: string, source: Ai
         }
     }
     // One line per attempt. Fixed codes only: never ids, the subject, DB/provider text or credentials.
-    const line = JSON.stringify({ event: 'ai-enroll', source, stage: failedAt, code: result.ok ? null : result.code });
+    const line = JSON.stringify({ event: 'ai-enroll', source, stage: failedAt, code: result.ok ? null : result.code, ...(starter ? { starter } : {}) });
     if (result.ok) console.info(line);
     else console.warn(line);
     return result;
