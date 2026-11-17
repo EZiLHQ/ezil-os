@@ -142,6 +142,15 @@ for (const [host, prefix] of [[origin, '/preview'], ['https://aws-3002-guac-u1-c
     });
 }
 
+test('closing the panel during a pending mint releases that exact renderer request', async () => {
+    reply = () => new Promise(() => {});
+    const { preview } = create(); const started = preview.start();
+    await Promise.resolve();
+    preview.dispose(); await started;
+    const [mint] = sent.filter(([id]) => id === '_ezil.previewMint');
+    expect(sent.filter(([id]) => id === '_ezil.previewMintCancel')).toEqual([['_ezil.previewMintCancel', { v: 1, id: mint![1].id }]]);
+});
+
 test('later origin changes are refused without changing CSP or navigating the frame', async () => {
     const { panel, preview } = create(); await preview.start();
     const html = panel.webview.html;

@@ -146,6 +146,7 @@ import { watchRuntimeOnReturn } from '../runtime-recheck.js';
 import { attachFolderBridge, createFolderNotice, detachFolderBridge, editorDocumentUrl, folderAskFor, forgetFolder, tagFolderMint } from './code-folder.js';
 import { register_app_frame } from '../ui/feedback/app-failures.js';
 import { register_billing_frame } from '../ui/Settings/billing-recovery.js';
+import { attachPreviewMintBridge } from './code-preview.js';
 import { computeBootUiState, FRAME_CONFIRM_DEADLINE_MS } from '../boot-phases.js';
 import AppSpinner from '../ui/app-spinner.js';
 import { TRANSITION_EVENT, watchComputerTransition } from '../ui/computer-progress.js';
@@ -666,6 +667,7 @@ export async function openCodeWindow (ctx = {}) {
     let unregister_app_failures = () => {};
     let trace_registration = { dispose() {}, bindNonce() {} };
     let unregister_billing = () => {};
+    let unregister_preview_mint = () => {};
     let unregister_auth_recovery = () => {};
     if ( getComputedStyle(el_body).position === 'static' ) el_body.style.position = 'relative';
 
@@ -1128,6 +1130,7 @@ export async function openCodeWindow (ctx = {}) {
         unregister_app_failures();
         trace_registration.dispose();
         unregister_billing();
+        unregister_preview_mint();
         unregister_auth_recovery();
         if (!nativeSurface) unregister_auth_recovery = attachCodeAuthRecovery({
             iframe: el_iframe, frameUrl: code_preview_url,
@@ -1155,6 +1158,11 @@ export async function openCodeWindow (ctx = {}) {
         // Code asks this desktop for its billing dialogs (a credit refusal, a plan-locked model): Settings → Billing.
         if (!nativeSurface) unregister_billing = register_billing_frame(el_iframe, {
             origin: new URL(code_preview_url).origin, open: ctx.openBilling,
+        });
+        // Code's App Preview panel asks this window for a preview URL of THIS computer only (code-preview-v1 Hop 3);
+        // the mint, its ownership check and its token stay where every other preview mint is.
+        if (!nativeSurface) unregister_preview_mint = attachPreviewMintBridge({
+            iframe: el_iframe, frameUrl: el_iframe.src, computerId: computer.id, mint: session.previewUrl,
         });
         trace.step('frame_nav');
         settle_frame(my_attempt);
@@ -1616,6 +1624,7 @@ export async function openCodeWindow (ctx = {}) {
         unregister_app_failures();
         trace_registration.dispose();
         unregister_billing();
+        unregister_preview_mint();
         folder_notice?.close();
         stop_runtime_recheck?.();
         if ( heartbeat_timer !== null ) {

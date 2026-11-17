@@ -44,12 +44,15 @@ export class PreviewPanel implements vscode.Disposable {
         this.invalidate();
         this.showStatus('Starting preview…');
         let timeout: ReturnType<typeof setTimeout> | undefined;
+        const id = token();
+        // The renderer holds one of a few pending slots per request until it answers; give it back on close or timeout.
+        const release = () => { void Promise.resolve(vscode.commands.executeCommand('_ezil.previewMintCancel', { v: 1, id })).catch(() => {}); };
         try {
             const expiry = new Promise<never>((_, reject) => {
-                timeout = setTimeout(() => reject(new Error('timeout')), MINT_TIMEOUT_MS);
-                this.cancelMint = () => reject(new Error('disposed'));
+                timeout = setTimeout(() => { release(); reject(new Error('timeout')); }, MINT_TIMEOUT_MS);
+                this.cancelMint = () => { release(); reject(new Error('disposed')); };
             });
-            const reply: unknown = await Promise.race([vscode.commands.executeCommand('_ezil.previewMint', { v: 1, id: token() }), expiry]);
+            const reply: unknown = await Promise.race([vscode.commands.executeCommand('_ezil.previewMint', { v: 1, id }), expiry]);
             if (this.disposed) return;
             if (!validateMintReply(reply)) { this.showStatus('Invalid preview mint reply.', true); return; }
             if ('error' in reply) { this.showStatus(reply.error, true); return; }

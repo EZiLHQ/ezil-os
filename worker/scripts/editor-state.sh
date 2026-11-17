@@ -45,6 +45,10 @@ CODESERVER_SETTINGS_JSON
 # code-server 4.141 (VS Code 1.141) the setting is application-scoped, which
 # the Machine layer cannot set, so the user settings are what decide; this
 # copy is kept for an editor that scopes it otherwise.
+# `workbench.secondarySideBar.defaultVisibility: "maximized"` opens EZiL Chat maximized, with its composer centred, only
+# when VS Code has no layout state for the workspace yet (1.141 `applyOverrides`, `isNew`). A returning layout,
+# including one where the person restored the aux bar beside files or the app preview, is kept; otherwise the
+# value behaves like "visible" (docs/contracts/code-preview-v1.md "Layout").
 seed_codeserver_machine_settings() {
   local dst="$1/Machine/settings.json" temporary
   mkdir -p "$(dirname "$dst")" || return 1
@@ -65,7 +69,7 @@ seed_codeserver_machine_settings() {
   "chat.viewSessions.enabled": true,
   "chat.viewSessions.orientation": "stacked",
   "github.copilot.chat.localIndex.enabled": false,
-  "workbench.secondarySideBar.defaultVisibility": "visible",
+  "workbench.secondarySideBar.defaultVisibility": "maximized",
   "telemetry.telemetryLevel": "off",
   "terminal.integrated.env.linux": {
     "EZIL_AI_PROXY_TOKEN": null,
