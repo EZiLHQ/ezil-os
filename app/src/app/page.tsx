@@ -30,7 +30,8 @@ import { couponBillingPath } from './coupon-entry';
  * `/computers` remains reachable as the escape hatch from `/os` and
  * `/computer/[id]`, just no longer the default landing spot for `/`.
  */
-export default async function HomePage({ searchParams }: { searchParams?: Promise<Record<string, string | string[] | undefined>> } = {}) {
+// No parameter default: Next's generated PageProps check refuses a props type that admits `undefined`.
+export default async function HomePage({ searchParams }: { searchParams?: Promise<Record<string, string | string[] | undefined>> }) {
     const supabase = await createClient();
     const {
         data: { user },
