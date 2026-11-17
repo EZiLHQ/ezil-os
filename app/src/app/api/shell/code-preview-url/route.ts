@@ -275,7 +275,8 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     await caller.computer.get({ id: computerId });
     if (isAws(await target(ctx, computerId)) && (parsed.host !== 'github.ezil.work' || !awsStandaloneGitEnabled())) return unsupportedProvider();
 
-    const resolved = parsed.host === 'github.com' ? await resolvePublicGitHub(parsed.canonicalURL, { signal: deadline }) : null;
+    // Only the parsed parts reach the resolver; it rebuilds the address on its literal github.com origin.
+    const resolved = parsed.host === 'github.com' ? await resolvePublicGitHub({ host: parsed.host, owner: parsed.owner, name: parsed.name }, { signal: deadline }) : null;
     if (resolved && !resolved.ok) {
         console.warn('[shell] code-preview-url repository refused', { code: resolved.reason });
         if (resolved.reason === 'not_found') return shellRefusal(404, 'repo_not_found', "This repository doesn't exist.");

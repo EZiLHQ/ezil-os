@@ -133,12 +133,28 @@ export function defaultRefOf(advertisement: Buffer): string | null {
  * One anonymous ref advertisement read of a public github.com repository: whether it exists (publicly) and its
  * default branch. 401/403/404 are `not_found` (a private repository answers the same); anything else that is not a
  * clean answer is `unavailable` (retryable), never a guess.
+ *
+ * The request is built from the parsed parts on a literal `https://github.com` origin: no caller string names the
+ * scheme, host, userinfo or port, and the parts are re-checked here against the grammar `parseRepositoryUrl` applies.
  */
-export async function resolvePublicGitHub(canonicalURL: string, deps: { fetch?: typeof fetch; signal?: AbortSignal } = {}): Promise<PublicGitHubResolution> {
+export type PublicGitHubRepository = { host: 'github.com'; owner: string; name: string };
+
+/** The advertisement URL for validated parts, or null when they are not a public GitHub route (nothing is fetched). */
+export function publicGitHubAdvertisementUrl(repo: PublicGitHubRepository): URL | null {
+    if (repo.host !== 'github.com' || !OWNER.test(repo.owner) || !NAME.test(repo.name) || repo.name.toLowerCase().endsWith('.git')) return null;
+    const url = new URL('https://github.com/');
+    url.pathname = `/${repo.owner.toLowerCase()}/${repo.name.toLowerCase()}.git/info/refs`;
+    url.search = 'service=git-upload-pack';
+    return url;
+}
+
+export async function resolvePublicGitHub(repo: PublicGitHubRepository, deps: { fetch?: typeof fetch; signal?: AbortSignal } = {}): Promise<PublicGitHubResolution> {
+    const url = publicGitHubAdvertisementUrl(repo);
+    if (!url) return { ok: false, reason: 'unavailable' };
     const timeout = AbortSignal.timeout(RESOLVE_TIMEOUT_MS);
     let response: Response;
     try {
-        response = await (deps.fetch ?? fetch)(new URL(`${canonicalURL}/info/refs?service=git-upload-pack`), {
+        response = await (deps.fetch ?? fetch)(url, {
             method: 'GET', redirect: 'manual', cache: 'no-store', signal: deps.signal ? AbortSignal.any([deps.signal, timeout]) : timeout,
             headers: { 'user-agent': 'git/2.43.0 (ezil-os repo-url)', accept: 'application/x-git-upload-pack-advertisement' },
         });

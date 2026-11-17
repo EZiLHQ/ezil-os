@@ -167,6 +167,9 @@ describe('opening a repository from its address in Code', () => {
         // GitHub: one anonymous read of the canonical remote's advertisement.
         const gh = s.requests.find(r => r.url.origin === 'https://github.com')!;
         expect(gh.url.toString()).toBe(`${CANONICAL}/info/refs?service=git-upload-pack`);
+        // Built on a literal origin from the parsed parts: nothing the caller typed names the scheme, host, userinfo or port.
+        expect([gh.url.protocol, gh.url.hostname, gh.url.username, gh.url.password, gh.url.port]).toEqual(['https:', 'github.com', '', '', '']);
+        expect(s.requests.filter(r => r.url.origin === 'https://github.com')).toHaveLength(1);
         expect(JSON.stringify(gh.init.headers).toLowerCase()).not.toContain('authorization');
         // The Worker: the canonical remote, the advertised branch, the stable folder id, and NO git object at all.
         const worker = s.requests.find(r => r.url.origin === WORKER)!;
@@ -361,6 +364,8 @@ describe('standalone EZiL Git URL open', () => {
         const response = await openUrl(EZIL_URL);
         expect(response.status).toBe(200);
         expect(s.order).toEqual(['computer.get', 'target', 'identity', 'gateway', 'identity', 'codePreviewUrl', 'identity', 'target', 'worker']);
+        // An EZiL Git address never reaches the public GitHub resolver.
+        expect(s.requests.some(r => r.url.origin === 'https://github.com')).toBe(false);
         const gateway = s.requests.find(r => r.url.origin === 'https://github.ezil.work')!;
         expect(gateway.url.toString()).toBe('https://github.ezil.work/v2/git/grant');
         expect(JSON.parse(String(gateway.init.body))).toEqual({ repoURL: EZIL_URL, scope: 'write' });

@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 
 vi.mock('server-only', () => ({}));
 
-import { defaultRefOf, parseRepositoryUrl, repositoryIdFor, resolvePublicGitHub } from './repo-url';
+import { defaultRefOf, parseRepositoryUrl, publicGitHubAdvertisementUrl, repositoryIdFor, resolvePublicGitHub } from './repo-url';
+import type { PublicGitHubRepository } from './repo-url';
 
 /** A git-upload-pack ref advertisement, as GitHub answers `info/refs?service=git-upload-pack`. */
 const pkt = (line: string) => `${(Buffer.byteLength(line) + 4).toString(16).padStart(4, '0')}${line}`;
@@ -73,26 +74,54 @@ describe('repositoryIdFor: the same folder on every reopen, never another reposi
 describe('resolvePublicGitHub: one anonymous ref advertisement read', () => {
     const answer = (status: number, body: BodyInit | null = null, type = 'application/x-git-upload-pack-advertisement', headers: Record<string, string> = {}) =>
         vi.fn(async () => new Response(body, { status, headers: { 'content-type': type, ...headers } }));
+    const EZIL_OS = { host: 'github.com' as const, owner: 'EZiLHQ', name: 'ezil-os' };
+    const AB = { host: 'github.com' as const, owner: 'a', name: 'b' };
     it('names the default branch from symref=HEAD:, sends no credential and follows no redirect', async () => {
         const fetcher = answer(200, advertisement('refs/heads/trunk', ['refs/heads/trunk', 'refs/heads/main']));
-        await expect(resolvePublicGitHub('https://github.com/ezilhq/ezil-os.git', { fetch: fetcher as unknown as typeof fetch })).resolves.toEqual({ ok: true, ref: 'refs/heads/trunk' });
+        await expect(resolvePublicGitHub(EZIL_OS, { fetch: fetcher as unknown as typeof fetch })).resolves.toEqual({ ok: true, ref: 'refs/heads/trunk' });
         const [url, init] = fetcher.mock.calls[0] as unknown as [URL, RequestInit];
         expect(String(url)).toBe('https://github.com/ezilhq/ezil-os.git/info/refs?service=git-upload-pack');
+        // The origin is literal: scheme, host, userinfo and port never come from the caller.
+        expect(url).toBeInstanceOf(URL);
+        expect([url.protocol, url.hostname, url.username, url.password, url.port, url.hash]).toEqual(['https:', 'github.com', '', '', '', '']);
+        expect(url.pathname).toBe('/ezilhq/ezil-os.git/info/refs');
+        expect(url.search).toBe('?service=git-upload-pack');
         expect(init).toMatchObject({ method: 'GET', redirect: 'manual', cache: 'no-store' });
         expect(Object.keys(init.headers as Record<string, string>).map(k => k.toLowerCase()).sort()).toEqual(['accept', 'user-agent']);
     });
+    it('the parsed github.com address is what the resolver takes: the same request the canonical URL names', () => {
+        const parsed = parseRepositoryUrl('https://github.com/EZiLHQ/ezil-os');
+        if (!parsed.ok || parsed.host !== 'github.com') throw new Error('parse');
+        expect(String(publicGitHubAdvertisementUrl(parsed))).toBe(`${parsed.canonicalURL}/info/refs?service=git-upload-pack`);
+    });
+    it('malformed parts, a .git name, or an EZiL route are refused without a fetch', async () => {
+        const gh = (owner: string, name: string) => ({ host: 'github.com' as const, owner, name });
+        const ezil = parseRepositoryUrl('https://github.ezil.work/default/os-code-url-20261110-a.git');
+        if (!ezil.ok) throw new Error('parse');
+        const bad = [gh('a/b', 'c'), gh('a@b', 'c'), gh('a', '..'), gh('a', 'b:1'), gh('a', 'b?x=1'), gh('a', 'b#f'), gh('a', 'b%2e%2e'),
+            gh('a', 'b.git'), gh('-a', 'b'), gh('a', '.b'), gh('evil.example/', 'b'), gh('a', 'b/../../c'),
+            ezil as unknown as PublicGitHubRepository];
+        for (const repo of bad) {
+            const fetcher = answer(200, advertisement('refs/heads/main'));
+            expect(publicGitHubAdvertisementUrl(repo)).toBeNull();
+            await expect(resolvePublicGitHub(repo, { fetch: fetcher as unknown as typeof fetch })).resolves.toEqual({ ok: false, reason: 'unavailable' });
+            expect(fetcher).not.toHaveBeenCalled();
+        }
+    });
     it.each([[401], [403], [404]])('%i (missing or private: indistinguishable on purpose) is not_found', async status => {
-        await expect(resolvePublicGitHub('https://github.com/a/b.git', { fetch: answer(status, 'nope', 'text/plain') as unknown as typeof fetch })).resolves.toEqual({ ok: false, reason: 'not_found' });
+        await expect(resolvePublicGitHub(AB, { fetch: answer(status, 'nope', 'text/plain') as unknown as typeof fetch })).resolves.toEqual({ ok: false, reason: 'not_found' });
     });
     it.each([[301], [302], [307], [308]])('%i (renamed or transferred) is moved, never followed', async status => {
-        await expect(resolvePublicGitHub('https://github.com/a/b.git', { fetch: answer(status, null, 'text/html', { location: 'https://github.com/a/c.git' }) as unknown as typeof fetch }))
+        const fetcher = answer(status, null, 'text/html', { location: 'https://github.com/a/c.git' });
+        await expect(resolvePublicGitHub(AB, { fetch: fetcher as unknown as typeof fetch }))
             .resolves.toEqual({ ok: false, reason: 'moved' });
+        expect(fetcher).toHaveBeenCalledTimes(1); // the Location is never requested
     });
     it('an empty repository (no HEAD symref) is empty; anything else unclean is unavailable, never a guessed ref', async () => {
-        await expect(resolvePublicGitHub('https://github.com/a/b.git', { fetch: answer(200, advertisement(null)) as unknown as typeof fetch })).resolves.toEqual({ ok: false, reason: 'empty' });
+        await expect(resolvePublicGitHub(AB, { fetch: answer(200, advertisement(null)) as unknown as typeof fetch })).resolves.toEqual({ ok: false, reason: 'empty' });
         for (const fetcher of [answer(500, 'x', 'text/plain'), answer(429, 'x', 'text/plain'), answer(200, advertisement('refs/heads/main'), 'text/html'),
             vi.fn(async () => { throw new TypeError('network'); })]) {
-            await expect(resolvePublicGitHub('https://github.com/a/b.git', { fetch: fetcher as unknown as typeof fetch })).resolves.toEqual({ ok: false, reason: 'unavailable' });
+            await expect(resolvePublicGitHub(AB, { fetch: fetcher as unknown as typeof fetch })).resolves.toEqual({ ok: false, reason: 'unavailable' });
         }
     });
     it('defaultRefOf refuses a ref git could read as an option or that the Worker refuses', () => {
