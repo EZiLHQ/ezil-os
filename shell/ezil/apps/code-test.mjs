@@ -29,6 +29,8 @@
 //   8. A project's repository (lane O2): the mint body, the relaunch re-mint,
 //      the repository title, and each refusal's copy — including the one
 //      silent EZiL ID refresh and the guard that stops it looping.
+//   9. Code's app-preview messages through the real window binding: handshake,
+//      window-owned mint, cancellation on close, and a fresh bridge on reopen.
 //
 // jsdom is not a browser: no layout, no real network, no cross-origin frames.
 // This proves construction, wiring, ordering and which URL was used. It
@@ -1778,6 +1780,196 @@ push('🔴 every request this shell MADE was same-origin', offOrigin.length === 
         reset && mintedUrls.length === before + 1, `reset=${reset} ${mintedUrls.length - before} mint(s)`);
     await closeCode();
     window.sessionStorage.removeItem(EPISODE_KEY);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 11. APP PREVIEW BRIDGE — exercise code.js's registration AND disposal in the
+//     built shell. No direct bridge import/call: registry launches real apps,
+//     jsdom supplies their real iframe windows, and only fetch/postMessage are
+//     observed. A missing attachPreviewMintBridge in code.js must fail here.
+// ═══════════════════════════════════════════════════════════════════════════
+{
+    const boundComputer = { ...COMPUTER, id: 'c-code-preview-bound' };
+    const ctx = { payload: PAYLOAD, computer: boundComputer, desktopState: PAYLOAD.desktopState, view: 'window' };
+    const codeWindow = () => q('.window[data-app="code"]');
+    const previewWindow = () => q('.window[data-app="preview"]');
+    const waitFor = async (cond) => {
+        for ( let i = 0; i < 100 && ! cond(); i++ ) await tick(10);
+        return cond();
+    };
+    const requests = [], aborted = [], restorePosts = [];
+    const originalFetch = window.fetch;
+    // Deliberately allow an aborted fetch to resolve later: the app must also
+    // suppress the reply, even if cancellation lost a race with the server.
+    window.fetch = (url, opts = {}) => {
+        if ( String(url) !== ENDPOINTS.previewUrl ) return originalFetch(url, opts);
+        const call = { url: String(url), method: opts.method ?? 'GET', body: JSON.parse(opts.body) };
+        calls.push(call);
+        let finish;
+        const pending = new Promise(resolve => { finish = resolve; });
+        const payload = {
+            ok: true,
+            appPreviewUrl: `https://3002-guac-u1-c1-app.ezil.org/preview-bootstrap?token=fixture-${requests.length}`,
+            expiresAt: Date.now() + 300_000,
+        };
+        const request = { ...call, signal: opts.signal, payload,
+            finish: () => finish({ ok: true, status: 200, json: async () => payload }) };
+        opts.signal?.addEventListener('abort', () => aborted.push(request), { once: true });
+        requests.push(request);
+        return pending;
+    };
+    const observe = (appWindow) => {
+        const frame = appWindow?.querySelector('.window-app-iframe');
+        const src = frame?.src, child = frame?.contentWindow;
+        const origin = src ? new URL(src).origin : null;
+        const outgoing = [];
+        if ( child ) {
+            const post = child.postMessage;
+            child.postMessage = (data, targetOrigin) => outgoing.push({ data, targetOrigin });
+            restorePosts.push(() => { child.postMessage = post; });
+        }
+        // Like the frame-honesty tests above, deliver the load jsdom does not
+        // perform. The installed listener must produce the actual hello.
+        fireLoad(frame);
+        const hellos = outgoing.filter(m => m.data?.type === 'ezil.code.preview.hello');
+        const nonce = hellos[0]?.data.nonce;
+        const send = (kind, id, over = {}) => window.dispatchEvent(new window.MessageEvent('message', {
+            source: child, origin,
+            data: { type: `ezil.code.preview.${kind}`, v: 1, nonce, ...(id ? { id } : {}) },
+            ...over,
+        }));
+        const replies = () => outgoing.filter(m => m.data?.type === 'ezil.code.preview.url');
+        const unchanged = () => appWindow?.querySelector('.window-app-iframe') === frame
+            && frame?.isConnected && frame.src === src && frame.contentWindow === child;
+        return { frame, src, child, origin, hellos, nonce, send, replies, unchanged };
+    };
+    const replyMatches = (reply, peer, id, request) => !! request && !! reply
+        && reply.targetOrigin === peer.origin && Object.keys(reply.data).length === 6
+        && reply.data.type === 'ezil.code.preview.url' && reply.data.v === 1
+        && reply.data.nonce === peer.nonce && reply.data.id === id
+        && reply.data.url === request.payload.appPreviewUrl && reply.data.expiresAt === request.payload.expiresAt;
+    try {
+        await ezil.registry.launch('code', ctx);
+        await settle(8);
+        const firstWindow = codeWindow(), first = observe(firstWindow);
+        push('11 preview bridge: registry opens Code for this window, distinct from the current computer',
+            firstWindow?.getAttribute('data-ezil-computer-id') === boundComputer.id
+            && ezil.session.currentComputer()?.id !== boundComputer.id && !! first.child);
+        push('11 preview bridge: actual Code iframe emits one hello to its exact minted origin',
+            first.hellos.length === 1 && first.hellos[0].targetOrigin === first.origin
+            && first.hellos[0].data.v === 1 && /^[A-Za-z0-9_-]{22}$/.test(first.nonce ?? '')
+            && Object.keys(first.hellos[0].data).length === 3);
+
+        const mintId = 'M'.repeat(22), pendingId = 'P'.repeat(22);
+        first.send('mint', mintId);
+        await settle(2, 10);
+        push('11 preview bridge: mint before matching ready cannot fetch', requests.length === 0);
+        const wrongNonce = first.nonce === 'Z'.repeat(22) ? 'Y'.repeat(22) : 'Z'.repeat(22);
+        for ( const [label, over] of [
+            ['source', { source: window }],
+            ['origin', { origin: 'https://foreign.example' }],
+            ['nonce', { data: { type: 'ezil.code.preview.ready', v: 1, nonce: wrongNonce } }],
+        ] ) {
+            first.send('ready', null, over);
+            first.send('mint', mintId);
+            await settle(2, 10);
+            push(`11 preview bridge: ready with wrong ${label} cannot authorize a mint`, requests.length === 0);
+        }
+        first.send('ready');
+        for ( const [label, over] of [
+            ['source', { source: window }],
+            ['origin', { origin: 'https://foreign.example' }],
+            ['nonce', { data: { type: 'ezil.code.preview.mint', v: 1, nonce: wrongNonce, id: mintId } }],
+        ] ) {
+            first.send('mint', mintId, over);
+            await settle(2, 10);
+            push(`11 preview bridge: mint with wrong ${label} cannot fetch`, requests.length === 0);
+        }
+        first.send('mint', mintId);
+        first.send('mint', mintId); // Duplicate child delivery must not double-mint.
+        await waitFor(() => requests.length > 0);
+        const completed = requests[0];
+        push('11 preview bridge: matching mint makes exactly one POST for THIS window computer',
+            requests.length === 1 && completed.method === 'POST'
+            && JSON.stringify(completed.body) === JSON.stringify({ computerId: boundComputer.id }));
+        completed?.finish();
+        await waitFor(() => first.replies().length > 0);
+        push('11 preview bridge: one reply preserves request id, nonce, URL, expiry and target origin',
+            first.replies().length === 1 && replyMatches(first.replies()[0], first, mintId, completed));
+        push('11 preview bridge: mint leaves the actual iframe element, src and contentWindow unchanged', first.unchanged());
+
+        // A second real app on the SAME computer has its own pending mint.
+        // Closing Code must not act like cancelComputerOpens(computerId).
+        const beforeSibling = requests.length;
+        await ezil.registry.launch('preview', ctx);
+        await waitFor(() => requests.length > beforeSibling);
+        const sibling = requests[beforeSibling];
+        const beforePending = requests.length;
+        first.send('mint', pendingId);
+        await waitFor(() => requests.length > beforePending);
+        const pending = requests[beforePending];
+        push('11 preview bridge: Code and Preview hold distinct live fetch signals on the same computer',
+            requests.length === 3 && sibling?.body.computerId === boundComputer.id
+            && pending?.body.computerId === boundComputer.id && !! sibling?.signal && !! pending?.signal
+            && sibling.signal !== pending.signal && ! sibling.signal.aborted && ! pending.signal.aborted
+            && !! previewWindow());
+        await window.$(firstWindow).close();
+        await settle(4);
+        push('11 preview bridge: real Code close removes its frame and aborts only its pending preview fetch',
+            ! codeWindow() && ! first.frame?.isConnected && pending?.signal?.aborted === true
+            && sibling?.signal?.aborted === false && completed?.signal?.aborted === false
+            && aborted.length === 1 && aborted[0] === pending && !! previewWindow());
+        const afterClose = requests.length;
+        first.send('ready');
+        first.send('mint', 'C'.repeat(22));
+        await settle(2, 10);
+        push('11 preview bridge: messages from the closed frame cannot mint', requests.length === afterClose);
+
+        await ezil.registry.launch('code', ctx);
+        await settle(8);
+        const reopenedWindow = codeWindow(), reopened = observe(reopenedWindow);
+        push('11 preview bridge: reopen binds a fresh iframe window and nonce at the minted origin',
+            reopenedWindow !== firstWindow && !! reopened.child && reopened.child !== first.child
+            && reopened.frame !== first.frame && reopened.src !== first.src
+            && reopened.hellos.length === 1 && reopened.hellos[0].targetOrigin === reopened.origin
+            && /^[A-Za-z0-9_-]{22}$/.test(reopened.nonce ?? '') && reopened.nonce !== first.nonce);
+        reopened.send('ready');
+        first.send('ready');
+        first.send('mint', 'O'.repeat(22));
+        reopened.send('mint', 'S'.repeat(22), { source: first.child }); // Even with the NEW nonce.
+        reopened.send('mint', 'N'.repeat(22), {
+            data: { type: 'ezil.code.preview.mint', v: 1, nonce: first.nonce, id: 'N'.repeat(22) },
+        });
+        await settle(2, 10);
+        push('11 preview bridge: old frame or old nonce cannot mint after reopen', requests.length === afterClose);
+        pending?.finish();
+        await settle(4, 10);
+        push('11 preview bridge: late closed-window completion sends no reply to either iframe',
+            first.replies().length === 1 && reopened.replies().length === 0 && requests.length === afterClose);
+
+        // Reusing the old request id is valid in the new window's handshake.
+        reopened.send('mint', mintId);
+        await waitFor(() => requests.length > afterClose);
+        const fresh = requests[afterClose];
+        fresh?.finish();
+        await waitFor(() => reopened.replies().length > 0);
+        push('11 preview bridge: reopened window mints once and replies with its fresh correlation',
+            requests.length === afterClose + 1 && fresh?.body.computerId === boundComputer.id
+            && reopened.replies().length === 1 && replyMatches(reopened.replies()[0], reopened, mintId, fresh)
+            && reopened.unchanged());
+        sibling?.finish();
+        await waitFor(() => previewWindow()?.querySelector('.window-app-iframe')?.src === sibling?.payload.appPreviewUrl);
+        push('11 preview bridge: the other app completes its original mint after Code closes and reopens',
+            sibling?.signal?.aborted === false
+            && previewWindow()?.querySelector('.window-app-iframe')?.src === sibling?.payload.appPreviewUrl
+            && aborted.length === 1 && aborted[0] === pending);
+    } finally {
+        for ( const appWindow of [codeWindow(), previewWindow()] ) if ( appWindow ) await window.$(appWindow).close();
+        for ( const request of requests ) request.finish();
+        await settle(2, 10);
+        for ( const restore of restorePosts ) restore();
+        window.fetch = originalFetch;
+    }
 }
 
 push('no puter.* or socket.io traffic', ! calls.some(c => /puter\.com|socket\.io/.test(c.url)));
