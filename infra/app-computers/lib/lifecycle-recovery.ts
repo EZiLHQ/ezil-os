@@ -11,12 +11,14 @@ import { GuardedTarget, ruleArn } from './guarded-target.js';
 import { historyReadStatement, imageWorkflowDenies } from './rebase-preparation.js';
 import { applyImageJobBoundary, recoveryRestoreStatements } from './image-job-boundary.js';
 import { startVersionStatements, registerImageWorkflow, registeredImageWorkflows } from './app-caller.js';
+import { priorVersion, transitionObserverGrant, type TransitionStateMachineVersions } from './observer-transition.js';
+export type { TransitionObserverVersions, TransitionStateMachineVersions } from './observer-transition.js';
 
 export class ComputerLifecycleRecovery extends Construct {
     readonly machine: states.CfnStateMachine;
     readonly historyKey: kms.IKey;
     readonly version: states.CfnStateMachineVersion;
-    constructor(scope: Construct, id: string, props: { settings: RecoverySettings; sourceHistoryKey: kms.IKey; enabled?: boolean; retainedObserverVersionLogicalId?: string }) {
+    constructor(scope: Construct, id: string, props: { settings: RecoverySettings; sourceHistoryKey: kms.IKey; enabled?: boolean; retainedObserverVersionLogicalId?: string; transitionObserverVersionLogicalId?: string; transitionStateMachineVersions?: TransitionStateMachineVersions }) {
         super(scope, id);
         const s = RecoverySettingsSchema.parse(props.settings), d = s.lifecycle.deployment, r = d.region;
         const originalMachine = machineArn(d.stateMachineVersionArn), recoveryMachine = machineArn(s.recoveryVersionArn);
@@ -52,6 +54,12 @@ export class ComputerLifecycleRecovery extends Construct {
             key.grantDecrypt(observer);
         }
         if (d.preparationStateMachineVersionArn) observer.addToRolePolicy(historyReadStatement(r, key.keyArn, [s.recoveryVersionArn]));
+        // Promotion window: exact prior history-context rows (previous recovery; previous preparation + lifecycle) stay beside the current ones.
+        const transition = props.transitionStateMachineVersions;
+        if (d.preparationStateMachineVersionArn && transition?.recovery) {
+            if (retained !== undefined) throw new Error('transition_conflicts_with_retained_source');
+            observer.addToRolePolicy(historyReadStatement(r, key.keyArn, priorVersion(s.recoveryVersionArn, transition.recovery)));
+        }
         if (d.preparationStateMachineVersionArn) {
             const registration = registeredImageWorkflows(this, d.stateMachineVersionArn).find(v => v.version === d.preparationStateMachineVersionArn);
             if (!registration?.authorityKeyArn) throw new Error('preparation_authority_wiring_missing');
@@ -61,10 +69,13 @@ export class ComputerLifecycleRecovery extends Construct {
                 machineArn(d.preparationStateMachineVersionArn).replace(':stateMachine:', ':execution:') + ':computer-*',
                 recoveryMachine.replace(':stateMachine:', ':execution:') + ':computer-*'] }));
             observer.addToRolePolicy(historyReadStatement(r, props.sourceHistoryKey.keyArn, [d.preparationStateMachineVersionArn, d.stateMachineVersionArn]));
+            if (transition?.preparation && transition.lifecycle)
+                observer.addToRolePolicy(historyReadStatement(r, props.sourceHistoryKey.keyArn, [...priorVersion(d.preparationStateMachineVersionArn, transition.preparation),
+                    ...priorVersion(d.stateMachineVersionArn, transition.lifecycle)]));
             observer.addToRolePolicy(new iam.PolicyStatement({ actions: ['secretsmanager:GetSecretValue'], resources: [s.lifecycle.authoritySecretArn] }));
             observer.addToRolePolicy(new iam.PolicyStatement({ actions: ['kms:Decrypt'], resources: [registration.authorityKeyArn], conditions: { StringEquals: {
                 'kms:ViaService': `secretsmanager.${r}.amazonaws.com`, 'kms:EncryptionContext:SecretARN': s.lifecycle.authoritySecretArn } } }));
-            registerImageWorkflow(this, d.stateMachineVersionArn, s.recoveryVersionArn, key.keyArn);
+            registerImageWorkflow(this, d.stateMachineVersionArn, s.recoveryVersionArn, key.keyArn, undefined, false, transition?.recovery);
         }
         // Only an explicitly retained legacy graph needs a separate image role.
         // Already image-enabled/fresh stacks preserve their existing fixed-role layout.
@@ -98,6 +109,11 @@ export class ComputerLifecycleRecovery extends Construct {
             role.addToPolicy(new iam.PolicyStatement({ actions: ['lambda:InvokeFunction'], resources: [legacy.ref] }));
         } else observer.currentVersion.grantInvoke(role);
         if (imageRole && imageRole !== role) observer.currentVersion.grantInvoke(imageRole);
+        // Promotion window: the still-deployed previous recovery version invokes its own observer version.
+        if (props.transitionObserverVersionLogicalId) {
+            if (retained !== undefined) throw new Error('transition_conflicts_with_retained_source');
+            transitionObserverGrant(this, observer, props.transitionObserverVersionLogicalId, imageRole ?? role);
+        }
         for (const executionRole of [role, ...(imageRole && imageRole !== role ? [imageRole] : [])]) {
             key.grantEncryptDecrypt(executionRole);
             executionRole.addToPolicy(new iam.PolicyStatement({ actions: ['ec2:StopInstances', 'ec2:TerminateInstances'],

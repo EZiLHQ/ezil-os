@@ -10,6 +10,7 @@ import { lifecycleDefinition } from './lifecycle/definition.js';
 import { GuardedTarget, ruleArn } from './guarded-target.js';
 import { RebasePreparation, historyReadStatement } from './rebase-preparation.js';
 import { registerImageWorkflow, registerImageHistoryReader } from './app-caller.js';
+import { priorVersion, transitionObserverGrant, type TransitionObserverVersions, type TransitionStateMachineVersions } from './observer-transition.js';
 
 export const RetainedLifecycleSourceSchema = z.object({
     amiId: z.string().regex(/^ami-[a-f0-9]{17}$/),
@@ -26,7 +27,7 @@ export class ComputerLifecycle extends Construct {
     readonly version:states.CfnStateMachineVersion;
     readonly historyKey:kms.IKey;
     readonly preparation?: RebasePreparation;
-    constructor(scope:Construct,id:string,props:{settings:Settings;authorityKeyArn:string;notificationsEnabled?:boolean;lambdaReservedConcurrency?:number|null;alertTopicArn?:string;recoveryVersionArn?:string;retainedSource?:RetainedLifecycleSource}){
+    constructor(scope:Construct,id:string,props:{settings:Settings;authorityKeyArn:string;notificationsEnabled?:boolean;lambdaReservedConcurrency?:number|null;alertTopicArn?:string;recoveryVersionArn?:string;retainedSource?:RetainedLifecycleSource;transitionObserverVersions?:Pick<TransitionObserverVersions,'lifecycle'|'preparation'>;transitionStateMachineVersions?:TransitionStateMachineVersions}){
         super(scope,id);const s=SettingsSchema.parse(props.settings),d=s.deployment,stack=Stack.of(this),r=d.region;
         const machineArn=d.stateMachineVersionArn.slice(0,d.stateMachineVersionArn.lastIndexOf(':'));
         const machineName=machineArn.split(':').at(-1)!;
@@ -42,8 +43,11 @@ export class ComputerLifecycle extends Construct {
         if (d.preparationStateMachineVersionArn) {
             if (props.recoveryVersionArn && props.recoveryVersionArn !== d.recoveryStateMachineVersionArn) throw new Error('recovery_version_mismatch');
             this.preparation = new RebasePreparation(this, 'Preparation', { settings: s, historyKey: key,
-                authorityKeyArn: props.authorityKeyArn, lambdaReservedConcurrency: props.lambdaReservedConcurrency });
-            registerImageWorkflow(this, d.stateMachineVersionArn, d.preparationStateMachineVersionArn, key.keyArn, props.authorityKeyArn, true);
+                authorityKeyArn: props.authorityKeyArn, lambdaReservedConcurrency: props.lambdaReservedConcurrency,
+                ...(props.transitionObserverVersions?.preparation ? { transitionObserverVersionLogicalId: props.transitionObserverVersions.preparation } : {}),
+                ...(props.transitionStateMachineVersions?.preparation ? { transitionPreparationVersionArn: props.transitionStateMachineVersions.preparation } : {}) });
+            registerImageWorkflow(this, d.stateMachineVersionArn, d.preparationStateMachineVersionArn, key.keyArn, props.authorityKeyArn, true,
+                props.transitionStateMachineVersions?.preparation);
         }
         key.addToResourcePolicy(new iam.PolicyStatement({principals:[new iam.ServicePrincipal(`logs.${r}.amazonaws.com`)],
             actions:['kms:Encrypt*','kms:Decrypt*','kms:ReEncrypt*','kms:GenerateDataKey*','kms:Describe*'],resources:['*'],
@@ -67,11 +71,22 @@ export class ComputerLifecycle extends Construct {
         helper.addToRolePolicy(new iam.PolicyStatement({actions:['kms:Decrypt'],resources:[props.authorityKeyArn],
             conditions:{StringEquals:{'kms:ViaService':`secretsmanager.${r}.amazonaws.com`,'kms:EncryptionContext:SecretARN':s.authoritySecretArn}}}));
         if (d.preparationStateMachineVersionArn) helper.addToRolePolicy(historyReadStatement(r, key.keyArn, [d.stateMachineVersionArn, d.preparationStateMachineVersionArn]));
+        // Promotion window: the EXACT prior history-context row (previous lifecycle + preparation versions) stays beside the current one.
+        if (d.preparationStateMachineVersionArn && props.transitionStateMachineVersions?.lifecycle && props.transitionStateMachineVersions.preparation) {
+            if (retained) throw new Error('transition_conflicts_with_retained_source');
+            helper.addToRolePolicy(historyReadStatement(r, key.keyArn, [...priorVersion(d.stateMachineVersionArn, props.transitionStateMachineVersions.lifecycle),
+                ...priorVersion(d.preparationStateMachineVersionArn, props.transitionStateMachineVersions.preparation)]));
+        }
         if (!d.preparationStateMachineVersionArn || retained) key.grantDecrypt(helper);
         const role=new iam.Role(this,'ControllerRole',{assumedBy:new iam.ServicePrincipal('states.amazonaws.com',{
             conditions:{StringEquals:{'aws:SourceAccount':d.accountId},ArnEquals:{'aws:SourceArn':machineArn}}})});
         helper.currentVersion.grantInvoke(role);key.grantEncryptDecrypt(role);
         for(const statement of controllerStatements(s))role.addToPolicy(statement);
+        // Image-to-image rollouts carry no retained source; the promotion window still needs the previous observer version.
+        if (props.transitionObserverVersions?.lifecycle) {
+            if (retained) throw new Error('transition_conflicts_with_retained_source');
+            transitionObserverGrant(this, helper, props.transitionObserverVersions.lifecycle, role);
+        }
         if (retained) {
             const current = helper.currentVersion.node.defaultChild as lambda.CfnVersion;
             const currentId = stack.resolve(current.logicalId) as string;
