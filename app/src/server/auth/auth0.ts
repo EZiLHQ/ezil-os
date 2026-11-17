@@ -5,7 +5,9 @@ import { cookies } from 'next/headers';
 
 import { safeReturnUrl } from '@/utils/constants';
 
-export const AUTH0_ISSUER = 'https://id.ezil.work/';
+import { AUTH0_ISSUER } from './issuer';
+
+export { AUTH0_ISSUER };
 export const AUTH0_COOKIE = '__Host-ezil-auth0';
 export const AUTH0_COOKIE_OPTIONS = { httpOnly: true, secure: true, sameSite: 'lax', path: '/' } as const;
 const TEN_MINUTES = 600_000;
