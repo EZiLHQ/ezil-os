@@ -567,6 +567,9 @@ It inserts three renderer commands with fixed effects. No command id comes from 
     Anything else is dropped.
 - `_ezil.previewMintCancel({v:1, id})` resolves that pending request with `{error:"cancelled"}` and frees its slot.
   The App Preview panel calls it when it closes or times out.
+  - A cancel or a renderer timeout also dispatches `ezil-preview-mint-cancel` (`detail` JSON `{v:1, id}`), so the OS
+    bridge can tell the shell to abort that mint.
+  - An answered request does not dispatch it.
 
 ### `chat-pane`
 

@@ -156,6 +156,10 @@ test('preview hooks: pinned anchors, apply, verify, idempotence and the actual p
             const [[timer, { fn, ms }]] = [...timers]; assert.equal(ms, 240000);
             timers.delete(timer); fn();
             assert.deepEqual(await slow, { error: 'timeout' });
+            // Cancel and timeout each tell the OS bridge once, so the shell can abort its mint; an answer does not.
+            const abandoned = dispatched.filter(e => e.type === 'ezil-preview-mint-cancel').map(e => JSON.parse(e.detail));
+            assert.deepEqual(abandoned, [{ v: 1, id: id(5) }, { v: 1, id: id(6) }]);
+            assert.ok(dispatched.filter(e => e.type === 'ezil-preview-mint-cancel').every(e => !e.cancelable));
 
             const four = [7, 8, 9, 10].map(n => mint({ v: 1, id: id(n) }));
             assert.deepEqual(await mint({ v: 1, id: id(11) }), { error: 'busy' });
