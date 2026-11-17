@@ -1,6 +1,6 @@
 import { FrameMessages } from './messages';
-import { persistedState, PreviewHistory, safeUrl, viewport } from './state';
-import { record, validateMintReply } from './contract';
+import { frameTarget, persistedState, PreviewHistory, safeUrl, viewport } from './state';
+import { record } from './contract';
 
 declare function acquireVsCodeApi(): { postMessage(message: unknown): void; setState(state: unknown): void };
 const vscode = acquireVsCodeApi();
@@ -36,11 +36,11 @@ function invalidate(): void {
     messages.invalidate(); nonce = ''; ready = false; diagnostic = false; clearTimeout(waiting); controls();
 }
 function load(url: string): void {
-    // Extension messages cannot expand the CSP or the origin pinned by the first mint.
-    if (!validateMintReply({ url, expiresAt: 1 }) || new URL(url).origin !== origin) return;
+    const target = frameTarget(url, origin);
+    if (!target) return;
     invalidate(); post({ type: 'loading' });
     status('Loading preview…');
-    frame.src = url;
+    frame.src = target;
 }
 function mode(select: boolean): void {
     messages.selecting = select;

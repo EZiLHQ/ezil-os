@@ -9,6 +9,7 @@ import * as preview from './preview-bridge';
 import { codeShellOriginsFor } from './code-folder-bridge';
 import { isAiProxyPath } from './ai-proxy';
 import { previewPageScripts } from './code-preview-bridge-helpers.test';
+import { inlineScriptBodies } from './inline-script';
 import vectors from './aws-gateway.vectors.json';
 
 // No SDK is installed in this lane. Transpile the two production dispatchers byte-for-byte;
@@ -86,7 +87,7 @@ function runTransport(html: string, page: URL) {
   const originalFetch = window.fetch, originalWS = window.WebSocket, originalOpen = XHR.prototype.open;
   const context = { window, location: page, document: { createElement: () => ({}), head: { appendChild() {} } },
     URL, URLSearchParams, Request, XMLHttpRequest: XHR };
-  for (const script of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) runInNewContext(script[1], context);
+  for (const body of inlineScriptBodies(html)) runInNewContext(body, context);
   return { window, XHR, fetches, xhrs, sockets, originalFetch, originalWS, originalOpen };
 }
 

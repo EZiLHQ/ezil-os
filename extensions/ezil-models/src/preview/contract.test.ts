@@ -1,7 +1,22 @@
 import { describe, expect, test } from 'bun:test';
 import vectors from '../../../../docs/contracts/code-preview-v1.vectors.json';
 import { attachmentName, renderSelectionContext, sanitizeUrl, validateAttachment, validateMintReply, validateSelection, type Selection } from './contract';
-import { persistedState, PreviewHistory, safeUrl, transportUrl } from './state';
+import { frameTarget, persistedState, PreviewHistory, safeUrl, transportUrl } from './state';
+
+describe('frameTarget', () => {
+    const pinned = 'https://3002-guac-u1-c1-app.ezil.org';
+    test('keeps an https URL on the pinned origin, rebuilt from its parts', () => {
+        expect(frameTarget(`${pinned}/preview-bootstrap?token=t%3D1&path=%2Fa#x`, pinned)).toBe(`${pinned}/preview-bootstrap?token=t%3D1&path=%2Fa#x`);
+        expect(frameTarget(`${pinned}/preview/pricing?tab=2`, pinned)).toBe(`${pinned}/preview/pricing?tab=2`);
+    });
+    test('refuses script schemes, other origins, userinfo, ports and garbage', () => {
+        for (const url of ['javascript:alert(1)', 'data:text/html,<script>1</script>', `http://3002-guac-u1-c1-app.ezil.org/`,
+            'https://3002-guac-u2-c9-app.ezil.org/', 'https://8443-guac-u1-c1-code.ezil.org/', `https://user:pw@3002-guac-u1-c1-app.ezil.org/`,
+            'https://3002-guac-u1-c1-app.ezil.org:444/', '//3002-guac-u1-c1-app.ezil.org/', 'not a url', '']) {
+            expect(frameTarget(url, pinned)).toBeUndefined();
+        }
+    });
+});
 
 function expand(value: unknown): any {
     if (typeof value === 'string' && value.startsWith('@repeat:')) { const [, text, count] = value.split(':'); return text!.repeat(Number(count)); }
@@ -20,7 +35,8 @@ describe('every frozen v1 vector', () => {
         expect(value).toContain('DOM snapshot from the live preview; not a source location');
         expect(value.length).toBeLessThanOrEqual(4000);
         expect(attachmentName(sel).length).toBeLessThanOrEqual(80);
-        if (sel.el.source) expect(value).toContain(sel.el.source.eid.replace(/[.]/g, '\\.'));
+        // The same Markdown escaping renderSelectionContext applies (backslash included), not a partial copy of it.
+        if (sel.el.source) expect(value).toContain(sel.el.source.eid.replace(/[\\`*_{}\[\]()<>#+.!|~-]/g, '\\$&'));
         else expect(value).not.toContain('data-eid');
     });
     for (const vector of vectors.selection.refuse) test(`refuse selection: ${vector.name}`, () => {

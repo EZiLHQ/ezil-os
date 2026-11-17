@@ -1,4 +1,17 @@
-import { record, sanitizeUrl, validPath } from './contract';
+import { record, sanitizeUrl, validateMintReply, validPath } from './contract';
+
+/**
+ * The frame address for `url`, rebuilt from its parsed parts on the pinned minted origin, or undefined. Extension
+ * messages cannot expand the CSP or move the frame off the origin pinned by the first mint, and never to a non-https
+ * or script scheme.
+ */
+export function frameTarget(url: string, pinned: string): string | undefined {
+    if (!validateMintReply({ url, expiresAt: 1 })) return undefined;
+    let target: URL;
+    try { target = new URL(url); } catch { return undefined; }
+    if (target.protocol !== 'https:' || target.username || target.password || target.origin !== pinned) return undefined;
+    return `${pinned}${target.pathname}${target.search}${target.hash}`;
+}
 
 export const VIEWPORTS = ['responsive', '390x844', '768x1024', '1280x800'] as const;
 export type Viewport = typeof VIEWPORTS[number];

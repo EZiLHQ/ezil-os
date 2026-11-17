@@ -25,6 +25,7 @@ import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { expectPreviewScriptsAllowed, previewPageScripts, previewExternalScriptAllowed, inspectorCspPolicies } from './code-preview-bridge-helpers.test';
+import { inlineScriptBodies } from './inline-script';
 
 import {
   previewInspectorScript,
@@ -1907,7 +1908,7 @@ describe('strict preview inspector v1', () => {
   for (const reason of ['no_package_json', 'port_not_listening', 'upstream_error'] as const) it(`diagnostic ${reason} answers state only and keeps meta refresh`, async () => {
     const html = await buildDiagnosticResponse(reason, 3002, undefined, [INSPECTOR_PARENT]).text();
     expect(html).toContain('<meta http-equiv="refresh" content="3">'); expect(html).not.toContain('ezil.preview.ready');
-    const b = inspector(/<script>([\s\S]*?)<\/script>/.exec(html)![1]);
+    const b = inspector(inlineScriptBodies(html)[0]!);
     b.message({ type: 'ezil.preview.hello', v: 1, nonce: INSPECTOR_NONCE }, { source: {} });
     b.message({ type: 'ezil.preview.hello', v: 1, nonce: INSPECTOR_NONCE }, { origin: 'https://evil.test' });
     expect(b.messages).toEqual([]); b.hello();

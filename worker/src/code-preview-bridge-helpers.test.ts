@@ -1,6 +1,23 @@
 import { runInNewContext } from 'node:vm';
 import { expect } from 'bun:test';
 import { createHash } from 'node:crypto';
+import { inlineScriptBodies } from './inline-script';
+
+/** `<script …>…</script>` elements of a served page, by linear scanning (attributes and body). */
+function scriptElements(html: string): Array<{ attrs: string; body: string }> {
+  const lower = html.toLowerCase(), out: Array<{ attrs: string; body: string }> = [];
+  for (let at = 0; ;) {
+    const start = lower.indexOf('<script', at);
+    if (start < 0) break;
+    const tagEnd = html.indexOf('>', start);
+    if (tagEnd < 0) break;
+    const end = lower.indexOf('</script>', tagEnd + 1);
+    if (end < 0) break;
+    out.push({ attrs: html.slice(start + '<script'.length, tagEnd), body: html.slice(tagEnd + 1, end) });
+    at = end + '</script>'.length;
+  }
+  return out;
+}
 
 export const inspectorCspPolicies = [
   "script-src 'nonce-existing'",
@@ -49,8 +66,8 @@ export function previewExternalScriptAllowed(headers: Headers, pageUrl: string, 
 
 /** Check that restrictive response CSPs permit the exact injected inline code. */
 export async function expectPreviewScriptsAllowed(html: string, headers: Headers) {
-  for (const match of html.matchAll(/<script>([\s\S]*?)<\/script>/g)) {
-    for (const sources of scriptPolicies(headers)) expect(inlineAllowed(sources, match[1])).toBe(true);
+  for (const body of inlineScriptBodies(html)) {
+    for (const sources of scriptPolicies(headers)) expect(inlineAllowed(sources, body)).toBe(true);
   }
 }
 
@@ -70,13 +87,13 @@ export function previewPageScripts(html: string, pageUrl: string, headers = new 
   const document = { createElement: () => ({ src: '', async: false }), head: {
     appendChild(script: { src: string }) { requestScript(script.src); },
   } };
-  for (const match of html.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)) {
-    const src = /\bsrc="([^"]*)"/.exec(match[1]);
+  for (const { attrs, body } of scriptElements(html)) {
+    const src = /\bsrc="([^"]*)"/.exec(attrs);
     if (src) requestScript(src[1]);
     else {
-      for (const sources of scriptPolicies(headers)) expect(inlineAllowed(sources, match[2])).toBe(true);
-      loader = match[2];
-      runInNewContext(match[2], { window, document, location, URL, URLSearchParams });
+      for (const sources of scriptPolicies(headers)) expect(inlineAllowed(sources, body)).toBe(true);
+      loader = body;
+      runInNewContext(body, { window, document, location, URL, URLSearchParams });
       loader = undefined;
     }
   }

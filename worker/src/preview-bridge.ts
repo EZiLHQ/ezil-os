@@ -77,6 +77,7 @@ import { codeShellOriginsFor, injectCodeFolderBridge, isHtmlDocument, isWorkbenc
 import { injectCodeDiagBridge } from './code-diag-bridge';
 import { injectCodeBillingBridge } from './code-billing-bridge';
 import { injectCodePreviewBridge } from './code-preview-bridge';
+import { inlineScriptBodies, scriptJson } from './inline-script';
 
 // ── Hostname parsing ─────────────────────────────────────────────────────────
 
@@ -298,8 +299,8 @@ export const PREVIEW_COOKIE_QUERY_PARAM = 'ezil_pv';
 export const PREVIEW_INSPECTOR_LOADER = `<script>
 (function () {
   var src = new URL('/preview-inspector.js', window.location.href);
-  var fallback = new URLSearchParams(window.location.search).get(${JSON.stringify(PREVIEW_COOKIE_QUERY_PARAM)});
-  if (fallback) src.searchParams.set(${JSON.stringify(PREVIEW_COOKIE_QUERY_PARAM)}, fallback);
+  var fallback = new URLSearchParams(window.location.search).get(${scriptJson(PREVIEW_COOKIE_QUERY_PARAM)});
+  if (fallback) src.searchParams.set(${scriptJson(PREVIEW_COOKIE_QUERY_PARAM)}, fallback);
   var script = document.createElement('script');
   script.src = src.href;
   script.async = true;
@@ -324,7 +325,7 @@ export const PREVIEW_INSPECTOR_LOADER = `<script>
 export const RUNTIME_SHIM = `
 <script>
 (function () {
-  var FALLBACK_PARAM = ${JSON.stringify(PREVIEW_COOKIE_QUERY_PARAM)};
+  var FALLBACK_PARAM = ${scriptJson(PREVIEW_COOKIE_QUERY_PARAM)};
   var fallbackValue = null;
   try {
     fallbackValue = new URLSearchParams(window.location.search).get(FALLBACK_PARAM);
@@ -403,8 +404,8 @@ export function injectRuntimeShim(html: string): string {
 export async function allowPreviewInlineScripts(headers: Headers, markup: string, inspectorOrigin?: string): Promise<void> {
   const csp = headers.get('content-security-policy');
   if (!csp) return;
-  const hashes = await Promise.all([...markup.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(async match => {
-    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(match[1]));
+  const hashes = await Promise.all(inlineScriptBodies(markup).map(async body => {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(body));
     return `'sha256-${btoa(String.fromCharCode(...new Uint8Array(digest)))}'`;
   }));
   if (!hashes.length) return;
@@ -443,7 +444,7 @@ export function previewInspectorOrigins(hostname: string): string[] {
 /** Hop 1 of code-preview-v1. All state is document-local; app DOM is an untrusted snapshot. */
 export function previewInspectorScript(origins: readonly string[]): string {
   return String.raw`(()=>{try{
-const origins=${JSON.stringify(origins).replace(/</g, '\\u003c')};
+const origins=${scriptJson(origins)};
 if(window.parent===window||!origins.length)return;
 const TOKEN=/^[A-Za-z0-9_-]{22}$/,TAG=/^[a-z][a-z0-9-]{0,31}$/;
 const ATTRS=['href','src','alt','type','placeholder','aria-label','data-testid'];
@@ -583,9 +584,9 @@ window.addEventListener('popstate',navigate);window.addEventListener('hashchange
 }
 
 function previewDiagnosticScript(origins: readonly string[], state: PreviewDiagnosticReason): string {
-  return `(()=>{const origins=${JSON.stringify(origins).replace(/</g, '\\u003c')};window.addEventListener('message',ev=>{try{const d=ev.data;
+  return `(()=>{const origins=${scriptJson(origins)};window.addEventListener('message',ev=>{try{const d=ev.data;
 if(ev.source!==window.parent||window.parent===window||!origins.includes(ev.origin)||ev.origin==='*'||ev.origin==='null'||!d||typeof d!=='object'||Array.isArray(d)||Object.keys(d).length!==3||d.type!=='ezil.preview.hello'||d.v!==1||typeof d.nonce!=='string'||d.nonce.length!==22||!/^[A-Za-z0-9_-]{22}$/.test(d.nonce))return;
-window.parent.postMessage({type:'ezil.preview.state',v:1,nonce:d.nonce,state:${JSON.stringify(state)}},ev.origin);
+window.parent.postMessage({type:'ezil.preview.state',v:1,nonce:d.nonce,state:${scriptJson(state)}},ev.origin);
 }catch{}})})();`;
 }
 

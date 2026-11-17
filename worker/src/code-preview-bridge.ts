@@ -1,10 +1,16 @@
 /** Code preview URL requests, Hop 3 of code-preview-v1. The renderer dispatches a cancelable JSON event;
  * only a nonce-bound shell may answer an id this document relayed. No storage, logging or global names. */
+import { scriptJson } from './inline-script';
+
+const isHttpsOrigin = (value: string): boolean => {
+  try { const u = new URL(value); return u.protocol === 'https:' && u.origin === value; } catch { return false; }
+};
+
 export const PREVIEW_BRIDGE_MARKER = 'data-ezil-preview-bridge';
 
 export function codePreviewBridgeScript(origins: readonly string[]): string {
   return String.raw`(()=>{try{
-const origins=${JSON.stringify(origins)};
+const origins=${scriptJson(origins)};
 if(window.parent===window||!origins.length)return;
 const object=v=>v!==null&&typeof v==='object'&&!Array.isArray(v);
 const token=v=>typeof v==='string'&&v.length===22&&/^[A-Za-z0-9_-]{22}$/.test(v);
@@ -66,6 +72,9 @@ window.addEventListener('pagehide',cancelAll);
 /** Same insertion point and CSP nonce rule as the billing bridge, with independent idempotence. */
 export function injectCodePreviewBridge(html: string, origins: readonly string[]): string {
   if (!origins.length || html.includes(PREVIEW_BRIDGE_MARKER)) return html;
+  // Each pinned origin must be exactly an https origin (codeShellOriginsFor's fixed values); anything else is refused
+  // outright rather than embedded, even though scriptJson would keep it inert.
+  if (!origins.every(isHttpsOrigin)) return html;
   const nonce = /<script\s+nonce="([^"]*)"/i.exec(html)?.[1];
   if (!nonce || !/^[A-Za-z0-9+/=_-]{8,128}$/.test(nonce)) return html;
   const head = /<head(\s[^>]*)?>/i.exec(html);

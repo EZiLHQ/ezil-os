@@ -27,6 +27,10 @@ import {
 } from './aws-origin';
 import { mintPreviewBootstrapToken, mintPreviewCookie, type PreviewTokenV2Claims } from './hmac';
 import { expectPreviewScriptsAllowed, previewPageScripts, previewExternalScriptAllowed, inspectorCspPolicies } from './code-preview-bridge-helpers.test';
+import { scriptJson } from './inline-script';
+
+/** An origin as the injected scripts embed it (scriptJson), without the surrounding quotes. */
+const embedded = (origin: string) => scriptJson(origin).slice(1, -1);
 
 const KEY = decodeControlKey(vectors.controlKeyBase64)!;
 const SECRET = 'aws-origin-test-secret';
@@ -547,8 +551,8 @@ describe('AWS app inspector v1', () => {
     const denied = await app('/preview-inspector.js', { authenticated: false }); expect(denied.response.status).toBe(401); expect(denied.fetched).toBe(0);
     for (const zoneRoot of ['ezil.org', 'ezil.work']) {
       const { response, fetched } = await app('/preview-inspector.js', { zoneRoot }); expect(response.status).toBe(200); expect(fetched).toBe(0);
-      const script = await response.text(); expect(script).toContain(`https://aws-8443-${SID}-aws.${zoneRoot}`);
-      expect(script).toContain(zoneRoot === 'ezil.org' ? 'https://os.ezil.work' : 'https://os-staging.ezil.work');
+      const script = await response.text(); expect(script).toContain(embedded(`https://aws-8443-${SID}-aws.${zoneRoot}`));
+      expect(script).toContain(embedded(zoneRoot === 'ezil.org' ? 'https://os.ezil.work' : 'https://os-staging.ezil.work'));
       expect(script).not.toContain('__ezil'); expect(response.headers.get('cache-control')).toBe('private, no-store');
     }
   });
@@ -566,7 +570,7 @@ describe('AWS app inspector v1', () => {
     for (const options of [{ fail: true }, { status: 502, type: 'application/json' }, { status: 503, type: 'application/json' }, { status: 504, type: 'application/json' }]) {
       const { response } = await app('/', options); expect(response.status).toBe(503); const body = await response.text();
       expect(body).toContain('ezil.preview.state'); expect(body).not.toContain('ezil.preview.ready');
-      expect(body).toContain(`https://aws-8443-${SID}-aws.ezil.org`); expect(body).toContain('<meta http-equiv="refresh" content="3">');
+      expect(body).toContain(embedded(`https://aws-8443-${SID}-aws.ezil.org`)); expect(body).toContain('<meta http-equiv="refresh" content="3">');
     }
   });
   for (const status of [200, 201, 299, 301, 400, 404, 500, 502, 503, 504]) it(`app HTML status ${status} preserves the document and only 2xx can become ready`, async () => {
