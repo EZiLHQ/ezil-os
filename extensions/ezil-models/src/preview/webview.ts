@@ -24,7 +24,7 @@ function controls(): void {
     element('address').textContent = origin ? safeUrl(origin, state.path) : '';
     button('back').disabled = !ready || !history.back;
     button('forward').disabled = !ready || !history.forward;
-    button('copy').disabled = button('external').disabled = !origin;
+    button('external').disabled = !origin;
 }
 function size(): void {
     const dimensions = state.viewport === 'responsive' ? undefined : state.viewport.split('x');
@@ -77,7 +77,7 @@ window.addEventListener('message', event => {
     else if (message.type === 'invalidate') invalidate();
     else if (message.type === 'status' && typeof message.text === 'string') status(message.text, message.retry === true);
 });
-for (const id of ['reload', 'retry', 'copy', 'external']) button(id).addEventListener('click', () => post({ type: id }));
+for (const id of ['reload', 'retry', 'external']) button(id).addEventListener('click', () => post({ type: id }));
 for (const [id, direction] of [['back', -1], ['forward', 1]] as const) button(id).addEventListener('click', () => {
     const path = history.move(direction);
     if (path !== undefined) { ready = false; post({ type: 'history', path }); controls(); }

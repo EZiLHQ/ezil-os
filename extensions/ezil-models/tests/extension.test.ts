@@ -87,6 +87,52 @@ test('activation schedules model-list recovery and disposal stops it', async () 
     }
 });
 
+for (const failedApi of ['registerCommand', 'registerWebviewPanelSerializer', 'createStatusBarItem', 'status.show']) test(`optional preview ${failedApi} failure cannot prevent model registration`, async () => {
+    const configPath = path.join(root, 'optional-preview.json');
+    fs.writeFileSync(configPath, VALID);
+    const previousPath = process.env[CONFIG_ENV];
+    process.env[CONFIG_ENV] = configPath;
+    const window = fakeVscode.window as Record<string, any>, commands = fakeVscode.commands as Record<string, any>;
+    const lm = fakeVscode.lm as Record<string, any>;
+    const savedWindow = { ...window }, savedCommands = { ...commands }, savedLm = { ...lm };
+    const context = { subscriptions: [] as { dispose(): void }[] }, models: unknown[][] = [], logs: string[] = [];
+    const registered = new Set<string>();
+    let serializerActive = false, statusDisposed = false, firstStatus = true;
+    Object.assign(window, {
+        createOutputChannel: () => ({ appendLine: (line: string) => logs.push(line), show() {}, dispose() {} }),
+        createStatusBarItem: () => {
+            const preview = firstStatus; firstStatus = false;
+            if (preview && failedApi === 'createStatusBarItem') throw new Error('PRIVATE');
+            return { show() { if (preview && failedApi === 'status.show') throw new Error('PRIVATE'); }, dispose() { if (preview) statusDisposed = true; } };
+        },
+        registerWebviewPanelSerializer: () => {
+            if (failedApi === 'registerWebviewPanelSerializer') throw new Error('PRIVATE');
+            serializerActive = true;
+            return { dispose() { serializerActive = false; } };
+        },
+    });
+    Object.assign(commands, { executeCommand: async () => {}, registerCommand: (id: string) => {
+        if (id === 'ezil.preview.open' && failedApi === 'registerCommand') throw new Error('PRIVATE');
+        registered.add(id);
+        return { dispose() { registered.delete(id); } };
+    } });
+    lm.registerLanguageModelChatProvider = (...args: unknown[]) => { models.push(args); return { dispose() {} }; };
+    try {
+        await activate(context as never);
+        expect(models).toHaveLength(1); expect(models[0]![0]).toBe('ezil');
+        expect(registered.has('ezil.preview.open')).toBe(false); expect(serializerActive).toBe(false);
+        expect(registered.has('ezil-models.reload')).toBe(true);
+        if (failedApi === 'status.show') expect(statusDisposed).toBe(true);
+        expect(logs.join('\n')).not.toContain('PRIVATE');
+    } finally {
+        for (const subscription of context.subscriptions) subscription.dispose();
+        for (const [target, saved] of [[window, savedWindow], [commands, savedCommands], [lm, savedLm]]) {
+            for (const key of Object.keys(target!)) delete target![key]; Object.assign(target!, saved);
+        }
+        if (previousPath === undefined) delete process.env[CONFIG_ENV]; else process.env[CONFIG_ENV] = previousPath;
+    }
+});
+
 async function until(predicate: () => boolean, ms = 4000): Promise<boolean> {
     const deadline = Date.now() + ms;
     while (Date.now() < deadline) { if (predicate()) return true; await Bun.sleep(50); }

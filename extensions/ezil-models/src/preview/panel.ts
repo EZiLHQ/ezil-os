@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import { record, validateDoc, validateMintReply } from './contract';
 import { SelectionContext } from './context';
 import { previewHtml } from './html';
-import { persistedState, safePath, transportUrl, viewport, type PreviewState } from './state';
+import { persistedState, safePath, viewport, type PreviewState } from './state';
 
 export const MINT_TIMEOUT_MS = 240_000;
 const token = () => randomBytes(16).toString('base64url');
@@ -11,7 +11,6 @@ const token = () => randomBytes(16).toString('base64url');
 export class PreviewPanel implements vscode.Disposable {
     private state: PreviewState;
     private origin = '';
-    private expiresAt = 0;
     private ready = false;
     private minting = false;
     private disposed = false;
@@ -38,21 +37,27 @@ export class PreviewPanel implements vscode.Disposable {
     private showStatus(text: string, retry = false): void { this.status = { type: 'status', text, retry }; this.post(this.status); }
     private invalidate(): void { this.ready = false; this.contexts.reset(); this.post({ type: 'invalidate' }); }
     async start(): Promise<void> { await this.mint(); }
-    private async mint(): Promise<void> {
+    private async mint(target: 'frame' | 'external' = 'frame'): Promise<void> {
         if (this.minting || this.disposed) return;
         this.minting = true;
-        this.invalidate();
-        this.showStatus('Starting preview…');
+        const path = this.state.path;
+        if (target === 'frame') this.invalidate();
+        this.showStatus(target === 'frame' ? 'Starting preview…' : 'Authorizing browser preview…');
         let timeout: ReturnType<typeof setTimeout> | undefined;
         const id = token();
-        // The renderer holds one of a few pending slots per request until it answers; give it back on close or timeout.
-        const release = () => { void Promise.resolve(vscode.commands.executeCommand('_ezil.previewMintCancel', { v: 1, id })).catch(() => {}); };
+        // Return the renderer's pending slot on disposal/timeout, including on older hosts lacking cancel.
+        const release = () => {
+            try { void Promise.resolve(vscode.commands.executeCommand('_ezil.previewMintCancel', { v: 1, id })).catch(() => {}); }
+            catch { /* Optional renderer hook; never strand the local cancellation. */ }
+        };
         try {
             const expiry = new Promise<never>((_, reject) => {
                 timeout = setTimeout(() => { release(); reject(new Error('timeout')); }, MINT_TIMEOUT_MS);
                 this.cancelMint = () => { release(); reject(new Error('disposed')); };
             });
             const reply: unknown = await Promise.race([vscode.commands.executeCommand('_ezil.previewMint', { v: 1, id }), expiry]);
+            clearTimeout(timeout);
+            this.cancelMint = undefined;
             if (this.disposed) return;
             if (!validateMintReply(reply)) { this.showStatus('Invalid preview mint reply.', true); return; }
             if ('error' in reply) { this.showStatus(reply.error, true); return; }
@@ -62,12 +67,24 @@ export class PreviewPanel implements vscode.Disposable {
                 this.showStatus('Preview origin changed. Close and reopen the preview to use it.', true);
                 return;
             }
+            // Only the fixed mint hook supplies authorization, never a frame message or persisted URL.
+            const minted = new URL(reply.url);
+            if (minted.pathname !== '/preview-bootstrap' || !minted.searchParams.get('token')) {
+                this.showStatus('Preview bootstrap unavailable.', true); return;
+            }
+            const url = new URL('/preview-bootstrap', origin);
+            url.searchParams.set('token', minted.searchParams.get('token')!);
+            // Both bridges omit fragments from Location; browsers inherit the bootstrap fragment on redirect.
+            const hash = path.indexOf('#');
+            url.searchParams.set('path', hash < 0 ? path : path.slice(0, hash));
+            url.hash = hash < 0 ? '' : path.slice(hash);
+            if (target === 'external') {
+                const opened = await vscode.env.openExternal(vscode.Uri.parse(url.href));
+                if (!this.disposed) this.showStatus(opened ? 'Opened preview in browser.' : 'Could not open the preview in a browser.');
+                return;
+            }
             const first = !this.origin;
             this.origin = origin;
-            this.expiresAt = reply.expiresAt;
-            const url = new URL(reply.url);
-            // Bootstrap authenticates the frame, then redirects to the restored, sanitized app path.
-            if (url.pathname === '/preview-bootstrap') url.searchParams.set('path', this.state.path);
             this.status = { type: 'status', text: 'Loading preview…', retry: false };
             if (first) this.html(url.href);
             else this.post({ type: 'load', url: url.href });
@@ -98,23 +115,15 @@ export class PreviewPanel implements vscode.Disposable {
                 if (typeof message.state !== 'string' || !/^[a-z_]{1,40}$/.test(message.state)) return;
                 this.ready = false; this.contexts.reset(); this.showStatus(message.state, true); return;
             case 'retry': case 'reload':
-                if (this.minting) return;
-                if (!this.ready || this.expiresAt <= Date.now() + 1000) await this.mint();
-                else { this.invalidate(); this.showStatus('Loading preview…'); this.post({ type: 'load', url: transportUrl(this.origin, this.state.path) }); }
+                await this.mint();
                 return;
             case 'history':
                 if (!this.origin || this.minting) return;
                 this.state.path = safePath(message.path);
-                if (this.expiresAt <= Date.now() + 1000 || !this.ready) await this.mint();
-                else { this.invalidate(); this.post({ type: 'load', url: transportUrl(this.origin, this.state.path) }); }
+                await this.mint();
                 return;
-            case 'copy': case 'external':
-                if (!this.origin) return;
-                try {
-                    const url = transportUrl(this.origin, this.state.path);
-                    if (message.type === 'copy') { await vscode.env.clipboard.writeText(url); this.showStatus('Safe preview URL copied.'); }
-                    else this.showStatus(await vscode.env.openExternal(vscode.Uri.parse(url)) ? 'Opened preview in browser.' : 'Could not open the preview in a browser.');
-                } catch { this.showStatus('Could not open or copy the safe preview URL.'); }
+            case 'external':
+                if (this.origin) await this.mint('external');
                 return;
         }
     }
@@ -130,36 +139,65 @@ export class PreviewPanel implements vscode.Disposable {
 export function registerPreview(context: vscode.ExtensionContext): void {
     let current: PreviewPanel | undefined;
     let opening: Promise<void> | undefined;
+    let disposed = false;
+    // Own panel cleanup before registering anything that can open or restore a panel.
+    const subscriptions: vscode.Disposable[] = [{ dispose: () => {
+        const preview = current;
+        current = undefined;
+        if (preview) {
+            try { preview.dispose(); } finally { preview.panel.dispose(); }
+        }
+    } }];
+    const dispose = () => {
+        if (disposed) return;
+        disposed = true;
+        for (const subscription of subscriptions.splice(0)) {
+            try { subscription.dispose(); } catch { /* Continue releasing the other optional preview resources. */ }
+        }
+    };
     const restoreLayout = async () => {
         // VS Code exposes no public extension API for reading the auxiliaryBarMaximized context key.
         try { await vscode.commands.executeCommand('workbench.action.restoreAuxiliaryBar'); } catch { /* Older hosts may lack it. */ }
     };
     const adopt = (panel: vscode.WebviewPanel, state?: unknown) => {
+        if (disposed) { panel.dispose(); return; }
         const preview = new PreviewPanel(panel, state);
         current = preview;
-        panel.onDidDispose(() => { if (current === preview) current = undefined; }, undefined, context.subscriptions);
+        subscriptions.push(panel.onDidDispose(() => { if (current === preview) current = undefined; }));
         return preview;
     };
-    context.subscriptions.push(vscode.commands.registerCommand('ezil.preview.open', () => {
-        if (opening) return opening;
-        opening = (async () => {
-            await restoreLayout();
-            if (current) { current.panel.reveal(vscode.ViewColumn.Active, true); return; }
-            const panel = vscode.window.createWebviewPanel('ezil.preview', 'App Preview', { viewColumn: vscode.ViewColumn.Active, preserveFocus: true }, { enableScripts: true, retainContextWhenHidden: true });
-            await adopt(panel).start();
-        })().finally(() => { opening = undefined; });
-        return opening;
-    }));
-    context.subscriptions.push(vscode.window.registerWebviewPanelSerializer('ezil.preview', {
-        async deserializeWebviewPanel(panel, state) {
-            await restoreLayout();
-            await adopt(panel, state).start();
-        },
-    }));
-    const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
-    status.text = '$(browser) App Preview';
-    status.tooltip = 'EZiL: Open App Preview';
-    status.command = 'ezil.preview.open';
-    status.show();
-    context.subscriptions.push(status, { dispose: () => current?.dispose() });
+    try {
+        subscriptions.push(vscode.commands.registerCommand('ezil.preview.open', () => {
+            if (disposed) return;
+            if (opening) return opening;
+            opening = (async () => {
+                await restoreLayout();
+                if (disposed) return;
+                if (current) { current.panel.reveal(vscode.ViewColumn.Active, true); return; }
+                const panel = vscode.window.createWebviewPanel('ezil.preview', 'App Preview', { viewColumn: vscode.ViewColumn.Active, preserveFocus: true }, { enableScripts: true, retainContextWhenHidden: true });
+                await adopt(panel)?.start();
+            })().finally(() => { opening = undefined; });
+            return opening;
+        }));
+        subscriptions.push(vscode.window.registerWebviewPanelSerializer('ezil.preview', {
+            async deserializeWebviewPanel(panel, state) {
+                // Take ownership before awaiting layout, including restores during registration.
+                const preview = adopt(panel, state);
+                if (!preview) return;
+                await restoreLayout();
+                await preview.start();
+            },
+        }));
+        const status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 90);
+        subscriptions.push(status);
+        status.text = '$(browser) App Preview';
+        status.tooltip = 'EZiL: Open App Preview';
+        status.command = 'ezil.preview.open';
+        status.show();
+        // Publish only the completed registration; the bag also owns later panel listeners.
+        context.subscriptions.push({ dispose });
+    } catch (error) {
+        dispose();
+        throw error;
+    }
 }
