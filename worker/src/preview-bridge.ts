@@ -76,6 +76,7 @@ import { codeBootstrapPathProblem, CODE_FOLDER_MINT_PARAM, codeFolderMint, plain
 import { codeShellOriginsFor, injectCodeFolderBridge, isHtmlDocument, isWorkbenchDocumentRequest } from './code-folder-bridge';
 import { injectCodeDiagBridge } from './code-diag-bridge';
 import { injectCodeBillingBridge } from './code-billing-bridge';
+import { injectCodePreviewBridge } from './code-preview-bridge';
 
 // ── Hostname parsing ─────────────────────────────────────────────────────────
 
@@ -966,7 +967,7 @@ export async function handlePreviewProxy(
     const bodyText = await upstream.text();
     const workbench = target === 'code' && isHtmlDocument(upstream.status, contentType)
       && isWorkbenchDocumentRequest(request.method, targetPath, request.headers.get('upgrade'));
-    const injected = target === 'code' ? (workbench ? injectCodeBillingBridge(injectCodeDiagBridge(injectCodeFolderBridge(bodyText, codeShellOrigins), codeShellOrigins), codeShellOrigins) : bodyText)
+    const injected = target === 'code' ? (workbench ? injectCodePreviewBridge(injectCodeBillingBridge(injectCodeDiagBridge(injectCodeFolderBridge(bodyText, codeShellOrigins), codeShellOrigins), codeShellOrigins), codeShellOrigins) : bodyText)
       : injectRuntimeShim(bodyText);
     outHeaders.set('cache-control', 'no-cache, no-store');
     return new Response(injected, { status: upstream.status, headers: outHeaders });
