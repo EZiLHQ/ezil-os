@@ -23,21 +23,21 @@
  *       plain absolute path (`./code-folder.ts`), else 400 `invalid_folder`;
  *       `ezil_mint` (code only, 22 base64url chars) is forwarded too.
  *
- *   * /preview/<path>
+ *   * /<path> (also legacy /preview/<path>)
  *       Cookie-gated HTTP reverse-proxy to the container's dev server
  *       (`APP_PREVIEW_PORT`, default 3002 — NOT 3000, which the
  *       `@cloudflare/sandbox` SDK reserves for its own control plane) via
  *       `sandbox.containerFetch()`.
  *       Strips `X-Frame-Options` / CSP `frame-ancestors`, rewrites
  *       `Set-Cookie` to the proxy's own path/SameSite/Secure, and injects the
- *       HMR-rewrite shim + inspector script tag into HTML responses.
+ *       fallback transport shim + inspector script tag into HTML responses.
  *
- *   GET/WS /preview-ws/<path>
+ *   GET/WS /<path> (also legacy /preview-ws/<path>)
  *       Cookie-gated WebSocket reverse-proxy (Next.js HMR / Vite client) via
  *       `sandbox.wsConnect()` — never `containerFetch()`, which cannot carry a
  *       101 back across its RPC boundary (see `ContainerWebSocketConnector`).
- *       On the code-server host the upgrade is detected by header instead, at
- *       any path (see `handleCodeBridge` in `src/index.ts`).
+ *       Upgrades are detected by header on both app and Code hosts; their
+ *       fixed ports and dispatch branches remain separate.
  *
  *   GET /preview-inspector.js
  *       Cookie-gated inspector script (code-preview-v1, with parent origins
@@ -219,12 +219,12 @@ export function rewriteSetCookie(value: string, cookiePath: string = '/preview')
  * stripping (the header should be dropped entirely).
  */
 export function stripFrameAncestors(value: string): string | null {
-  const parts = value
-    .split(';')
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0 && !p.toLowerCase().startsWith('frame-ancestors'));
+  // Headers may combine independently enforced policies with commas. Never merge their directives.
+  const parts = value.split(',').map(policy => policy.split(';')
+    .map(p => p.trim()).filter(p => p && p.split(/\s+/, 1)[0].toLowerCase() !== 'frame-ancestors')
+    .join('; ')).filter(Boolean);
   if (parts.length === 0) return null;
-  return parts.join('; ');
+  return parts.join(', ');
 }
 
 /**
@@ -276,7 +276,9 @@ export function rewriteResponseHeaders(upstream: Headers, cookiePath: string = '
 // cookie outright. `RUNTIME_SHIM` (below) then propagates it onto same-origin
 // `fetch`/`XMLHttpRequest`/HMR-`WebSocket` calls the previewed page makes
 // client-side, so SPA navigation/asset-fetching keeps working without a
-// cookie for the lifetime of that page load. It is verified with the exact
+// cookie for the lifetime of that page load. Parser/module/CSS requests use
+// the verified same-origin Referer-to-query redirect in `resolveAppPreviewAuth`.
+// It is verified with the exact
 // same `verifyPreviewCookie` the cookie itself uses — same value shape, same
 // HMAC, same sandboxId binding — so it carries no weaker guarantee than the
 // cookie it stands in for. Always stripped before forwarding to the upstream
@@ -306,8 +308,8 @@ export const PREVIEW_INSPECTOR_LOADER = `<script>
 </script>`;
 
 /**
- * Runtime shim injected into successful HTML responses. Rewrites the Next.js/Vite
- * HMR WebSocket URL to flow through `/preview-ws/...`, loads the inspector
+ * Provider-neutral runtime shim injected into successful HTML responses. Keeps
+ * original HTTP/WebSocket paths on both app hosts, loads the inspector
  * script, and — when the current page was reached via the `ezil_pv`
  * query-param fallback (see `PREVIEW_COOKIE_QUERY_PARAM`'s module doc in this
  * file: the `ezil_preview` cookie a browser dropped outright, e.g. Safari
@@ -316,9 +318,8 @@ export const PREVIEW_INSPECTOR_LOADER = `<script>
  * client-side navigation and asset/data fetching keep working for the
  * lifetime of that page load without ever needing the cookie. No-op (reads
  * `null`, patches nothing) when the page was reached normally with a working
- * cookie — this never changes behavior for the common case. Ported verbatim
- * (semantics-preserving) from `preview_bridge.py`'s `_RUNTIME_SHIM`, plus the
- * fallback-propagation addition.
+ * cookie. Root sockets reach each provider's authenticated app proxy directly;
+ * this shim never adds a provider-specific path prefix.
  */
 export const RUNTIME_SHIM = `
 <script>
@@ -329,14 +330,15 @@ export const RUNTIME_SHIM = `
     fallbackValue = new URLSearchParams(window.location.search).get(FALLBACK_PARAM);
   } catch (e) { fallbackValue = null; }
 
-  if (fallbackValue) {
+  if (!fallbackValue) return;
+  {
     var origFetch = window.fetch;
     if (origFetch) {
       window.fetch = function (input, init) {
         try {
           var reqUrl = (typeof Request !== 'undefined' && input instanceof Request) ? input.url : input;
           var u = new URL(reqUrl, window.location.href);
-          if (u.host === window.location.host && !u.searchParams.has(FALLBACK_PARAM)) {
+          if (u.origin === window.location.origin && !u.searchParams.has(FALLBACK_PARAM)) {
             u.searchParams.set(FALLBACK_PARAM, fallbackValue);
             input = (typeof Request !== 'undefined' && input instanceof Request) ? new Request(u.toString(), input) : u.toString();
           }
@@ -350,7 +352,7 @@ export const RUNTIME_SHIM = `
       XMLHttpRequest.prototype.open = function (method, reqUrl) {
         try {
           var u = new URL(reqUrl, window.location.href);
-          if (u.host === window.location.host && !u.searchParams.has(FALLBACK_PARAM)) {
+          if (u.origin === window.location.origin && !u.searchParams.has(FALLBACK_PARAM)) {
             u.searchParams.set(FALLBACK_PARAM, fallbackValue);
             reqUrl = u.toString();
           }
@@ -365,20 +367,10 @@ export const RUNTIME_SHIM = `
   window.WebSocket = function (url, protocols) {
     try {
       var u = new URL(url, window.location.href);
-      var sameOrigin = u.host === window.location.host;
+      var sameOrigin = u.host === window.location.host &&
+        (u.protocol === 'wss:' || u.protocol === 'https:' ? window.location.protocol === 'https:' :
+         u.protocol === 'ws:' || u.protocol === 'http:' ? window.location.protocol === 'http:' : false);
       var changed = false;
-      if (
-        sameOrigin &&
-        (u.pathname.indexOf('/_next/') === 0 ||
-         u.pathname.indexOf('/__nextjs') === 0 ||
-         u.pathname.indexOf('/_next/turbopack') === 0 ||
-         u.pathname.indexOf('/@vite/') === 0 ||
-         u.pathname.indexOf('/@hmr') === 0 ||
-         u.pathname.indexOf('/__webpack_hmr') === 0)
-      ) {
-        u.pathname = '/preview-ws' + u.pathname;
-        changed = true;
-      }
       if (fallbackValue && sameOrigin && !u.searchParams.has(FALLBACK_PARAM)) {
         u.searchParams.set(FALLBACK_PARAM, fallbackValue);
         changed = true;
@@ -407,28 +399,36 @@ export function injectRuntimeShim(html: string): string {
   return html.slice(0, idx) + RUNTIME_SHIM + html.slice(idx);
 }
 
-/** Permit only our injected inline code under an upstream CSP, keeping the app's other restrictions. */
-export async function allowPreviewInlineScripts(headers: Headers, markup: string): Promise<void> {
+/** Permit our inline code and, on successful app documents, the exact external inspector endpoint. */
+export async function allowPreviewInlineScripts(headers: Headers, markup: string, inspectorOrigin?: string): Promise<void> {
   const csp = headers.get('content-security-policy');
   if (!csp) return;
-  const directives = csp.split(';').map(d => d.trim().split(/\s+/)).filter(d => d[0]);
   const hashes = await Promise.all([...markup.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(async match => {
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(match[1]));
     return `'sha256-${btoa(String.fromCharCode(...new Uint8Array(digest)))}'`;
   }));
   if (!hashes.length) return;
-  for (const name of ['script-src', 'script-src-elem']) {
-    let directive = directives.find(d => d[0].toLowerCase() === name);
-    if (!directive && name === 'script-src') {
-      const defaults = directives.find(d => d[0].toLowerCase() === 'default-src');
-      if (defaults) { directive = [name, ...defaults.slice(1)]; directives.push(directive); }
+  // The CSP source has no credential query. A hash on the loader does not authorize an external
+  // script without integrity under nonce-only or hash-only policies lacking strict-dynamic.
+  const inspector = inspectorOrigin ? new URL('/preview-inspector.js', inspectorOrigin).href : undefined;
+  const policies = csp.split(',').map(policy => {
+    const directives = policy.split(';').map(d => d.trim().split(/\s+/)).filter(d => d[0]);
+    for (const name of ['script-src', 'script-src-elem']) {
+      let directive = directives.find(d => d[0].toLowerCase() === name);
+      if (!directive && name === 'script-src') {
+        const defaults = directives.find(d => d[0].toLowerCase() === 'default-src');
+        if (defaults) { directive = [name, ...defaults.slice(1)]; directives.push(directive); }
+      }
+      if (!directive) continue;
+      // Adding a hash disables unsafe-inline: preserve policies that already allow all inline code.
+      const unrestrictedInline = directive.includes("'unsafe-inline'") && !directive.some(s => /^'(nonce-|sha(?:256|384|512)-)/.test(s));
+      const additions = [...(unrestrictedInline ? [] : hashes), ...(inspector ? [inspector] : [])];
+      if (!additions.length) continue;
+      directive.splice(1, directive.length - 1, ...new Set([...directive.slice(1).filter(s => s !== "'none'"), ...additions]));
     }
-    if (!directive) continue;
-    // Adding a hash disables unsafe-inline: preserve policies that already allow all inline code.
-    if (directive.includes("'unsafe-inline'") && !directive.some(s => /^'(nonce-|sha(?:256|384|512)-)/.test(s))) continue;
-    directive.splice(1, directive.length - 1, ...directive.slice(1).filter(s => s !== "'none'"), ...hashes);
-  }
-  headers.set('content-security-policy', directives.map(d => d.join(' ')).join('; '));
+    return directives.map(d => d.join(' ')).join('; ');
+  });
+  headers.set('content-security-policy', policies.join(', '));
 }
 
 /** Parent origins for this app host only; a different sandbox's Code frame is never admitted. */
@@ -659,6 +659,7 @@ pre{background:#0d0508;border:1px solid #4a1515;border-radius:6px;padding:1rem;t
     headers: {
       'content-type': 'text/html; charset=utf-8',
       'cache-control': 'no-cache, no-store',
+      'referrer-policy': 'same-origin',
       'retry-after': '3',
     },
   });
@@ -702,7 +703,7 @@ export function stripPreviewCookie(cookieHeader: string | null): string | undefi
 // doc comment there for why, and for the full failure mode this closes).
 
 /**
- * Resolve preview auth from a request: the `ezil_preview` cookie if present
+ * Existing Code auth: the `ezil_preview` cookie if present
  * and valid, else the `?ezil_pv=` query-string fallback. Cookie takes
  * precedence when both are present and valid — the fallback exists only for
  * the browsers/paths that never had a cookie to begin with.
@@ -718,6 +719,56 @@ export async function resolvePreviewAuth(
   const fallback = url.searchParams.get(PREVIEW_COOKIE_QUERY_PARAM) ?? undefined;
   if (!fallback) return false;
   return verifyPreviewCookie(fallback, secrets, sandboxId);
+}
+
+/** App resources alone: do not cache bearer URLs or send them to other origins. */
+export const APP_PREVIEW_RESOURCE_HEADERS = {
+  'cache-control': 'private, no-store',
+  'referrer-policy': 'same-origin',
+};
+
+/**
+ * Parser/module/CSS requests bypass the runtime shim. With neither direct credential
+ * present, a SAME-origin Referer may carry the existing sandbox-bound signed token.
+ * Verify it, then redirect (307 preserves method/body) to this resource with that token;
+ * never proxy on Referer alone. The final URL can then carry auth to the next import.
+ * Explicit invalid credentials never fall back, and Code keeps its existing auth path.
+ */
+export async function resolveAppPreviewAuth(
+  request: Request, url: URL, secrets: string[], sandboxId: string,
+): Promise<boolean | Response> {
+  // Preserve the existing CF local-dev policy; AWS refuses absent secrets before this call.
+  if (!secrets.some(s => s && s.trim())) return true;
+  const cookie = readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME);
+  const direct = url.searchParams.getAll(PREVIEW_COOKIE_QUERY_PARAM);
+  if (cookie !== undefined && !await verifyPreviewCookie(cookie, secrets, sandboxId)) return false;
+  if (direct.length && (direct.length !== 1 || !await verifyPreviewCookie(direct[0], secrets, sandboxId))) return false;
+  if (cookie !== undefined || direct.length) return true;
+
+  let referer: URL;
+  try { referer = new URL(request.headers.get('referer') ?? ''); } catch { return false; }
+  if (referer.origin !== url.origin || referer.username || referer.password) return false;
+  const tokens = referer.searchParams.getAll(PREVIEW_COOKIE_QUERY_PARAM);
+  if (tokens.length !== 1 || !await verifyPreviewCookie(tokens[0], secrets, sandboxId)) return false;
+  const dest = new URL(url);
+  dest.username = ''; dest.password = ''; dest.hash = '';
+  // A path-only Location beginning // would redirect the bearer to another host.
+  if (dest.pathname.startsWith('//')) return false;
+  dest.searchParams.set(PREVIEW_COOKIE_QUERY_PARAM, tokens[0]);
+  return new Response(null, { status: 307, headers: {
+    ...APP_PREVIEW_RESOURCE_HEADERS, location: dest.pathname + dest.search,
+  } });
+}
+
+/** Drop credential-bearing Referer entirely before exposing headers to project code. */
+export function stripPreviewReferer(headers: Headers): void {
+  const value = headers.get('referer');
+  if (!value) return;
+  try {
+    const url = new URL(value);
+    const credential = /^(ezil_pv|ezil_mint|token|access_token|id_token|refresh_token|code|state|session|sid|key|api_key|apikey|secret|password|pass|auth|authorization|signature|sig)$|_token$/i;
+    if (url.username || url.password || [...url.searchParams.keys()].some(k => credential.test(k))) headers.delete('referer');
+  } catch { headers.delete('referer'); }
 }
 
 /** Strip the `ezil_pv` fallback query param before forwarding a request upstream. */
@@ -930,6 +981,7 @@ export async function handlePreviewBootstrap(
     headers: {
       Location: location,
       'Set-Cookie': cookieAttrs,
+      ...(target === 'app' ? APP_PREVIEW_RESOURCE_HEADERS : {}),
     },
   });
 }
@@ -947,14 +999,10 @@ export async function handlePreviewBootstrap(
  * `port`/`target` default to the original app-preview values so every
  * pre-existing call site (and its tests) keeps working unchanged.
  *
- * `target === 'code'` NEVER gets `RUNTIME_SHIM` injected, even for an
- * `text/html` response: the shim monkey-patches `window.WebSocket` to rewrite
- * Next.js/Vite HMR paths through `/preview-ws/...`, and code-server's own
- * WebSocket traffic (extension host, integrated terminal, editor sync) is NOT
- * an HMR channel — rewriting/wrapping it breaks the extension host
- * immediately and silently (it just never connects). This is a known, narrow
- * landmine: keep this check target-based, never port-based or content-type
- * heuristic-based, so it can't regress if the ports are ever renumbered.
+ * `target === 'code'` NEVER gets `RUNTIME_SHIM` injected, even for a
+ * `text/html` response. The app's fetch/XHR/WebSocket fallback wrapper must not
+ * touch code-server's extension host, integrated terminal or editor transport.
+ * Keep this check target-based rather than a content-type heuristic.
  *
  * `codeShellOrigins` (code target only): the EZiL OS shell origins the Code folder bridge may report to
  * (`./code-folder-bridge.ts`). The bridge goes into code-server's workbench document (a GET of `/`) and nothing
@@ -971,11 +1019,12 @@ export async function handlePreviewProxy(
   codeShellOrigins: readonly string[] = [],
 ): Promise<Response> {
   const url = new URL(request.url);
-  const authorized = await resolvePreviewAuth(request, url, secrets, sandboxId);
+  const authorized = await (target === 'app' ? resolveAppPreviewAuth : resolvePreviewAuth)(request, url, secrets, sandboxId);
+  if (authorized instanceof Response) return authorized;
   if (!authorized) {
     return new Response(
       JSON.stringify({ ok: false, error: 'preview_cookie_missing_or_invalid: re-fetch /preview-bootstrap' }),
-      { status: 401, headers: { 'content-type': 'application/json' } },
+      { status: 401, headers: { 'content-type': 'application/json', ...(target === 'app' ? APP_PREVIEW_RESOURCE_HEADERS : {}) } },
     );
   }
 
@@ -984,6 +1033,7 @@ export async function handlePreviewProxy(
   const targetUrl = `http://127.0.0.1:${port}${targetPath}${forwardSearch}`;
 
   const forwardHeaders = new Headers(request.headers);
+  if (target === 'app') stripPreviewReferer(forwardHeaders);
   forwardHeaders.delete('host');
   forwardHeaders.delete('content-length');
   const strippedCookie = stripPreviewCookie(request.headers.get('cookie'));
@@ -1018,6 +1068,7 @@ export async function handlePreviewProxy(
   // code-server is served from `/` on its own bridge host, not from
   // `/preview` — pinning its cookies to `/preview` would silently drop them.
   const outHeaders = rewriteResponseHeaders(upstream.headers, target === 'code' ? '/' : '/preview');
+  if (target === 'app') for (const [key, value] of Object.entries(APP_PREVIEW_RESOURCE_HEADERS)) outHeaders.set(key, value);
 
   if ([204, 205, 304].includes(upstream.status)) return new Response(null, { status: upstream.status, headers: outHeaders });
   if (/^\s*text\/html\b/i.test(contentType)) {
@@ -1029,7 +1080,8 @@ export async function handlePreviewProxy(
     const injected = target === 'code' ? (workbench ? injectCodePreviewBridge(injectCodeBillingBridge(injectCodeDiagBridge(injectCodeFolderBridge(bodyText, codeShellOrigins), codeShellOrigins), codeShellOrigins), codeShellOrigins) : bodyText)
       : appBody;
     if (target === 'app') await allowPreviewInlineScripts(outHeaders, isHtmlDocument(upstream.status, contentType)
-      ? RUNTIME_SHIM : injectPreviewDiagnostic('', previewInspectorOrigins(url.hostname)));
+      ? RUNTIME_SHIM : injectPreviewDiagnostic('', previewInspectorOrigins(url.hostname)),
+      isHtmlDocument(upstream.status, contentType) ? url.origin : undefined);
     outHeaders.set('cache-control', 'no-cache, no-store');
     return new Response(injected, { status: upstream.status, headers: outHeaders });
   }
@@ -1044,18 +1096,19 @@ export async function handlePreviewInspectorJs(
   sandboxId: string,
   secrets: string[],
 ): Promise<Response> {
-  const authorized = await resolvePreviewAuth(request, new URL(request.url), secrets, sandboxId);
+  const authorized = await resolveAppPreviewAuth(request, new URL(request.url), secrets, sandboxId);
+  if (authorized instanceof Response) return authorized;
   if (!authorized) {
     return new Response(
       JSON.stringify({ ok: false, error: 'preview_cookie_missing_or_invalid: re-fetch /preview-bootstrap' }),
-      { status: 401, headers: { 'content-type': 'application/json' } },
+      { status: 401, headers: { 'content-type': 'application/json', ...APP_PREVIEW_RESOURCE_HEADERS } },
     );
   }
   return new Response(previewInspectorScript(previewInspectorOrigins(new URL(request.url).hostname)), {
     status: 200,
     headers: {
       'content-type': 'application/javascript; charset=utf-8',
-      'cache-control': 'private, no-store',
+      ...APP_PREVIEW_RESOURCE_HEADERS,
     },
   });
 }
@@ -1163,9 +1216,10 @@ export async function handlePreviewWsProxy(
   target: BridgeTarget = 'app',
 ): Promise<Response> {
   const url = new URL(request.url);
-  const authorized = await resolvePreviewAuth(request, url, secrets, sandboxId);
+  const authorized = await (target === 'app' ? resolveAppPreviewAuth : resolvePreviewAuth)(request, url, secrets, sandboxId);
+  if (authorized instanceof Response) return authorized;
   if (!authorized) {
-    return new Response('invalid preview cookie', { status: 401 });
+    return new Response('invalid preview cookie', { status: 401, headers: target === 'app' ? APP_PREVIEW_RESOURCE_HEADERS : {} });
   }
 
   const targetPath = `/${appPath.replace(/^\/+/, '')}`;
@@ -1173,6 +1227,7 @@ export async function handlePreviewWsProxy(
   const targetUrl = `http://127.0.0.1:${port}${targetPath}${forwardSearch}`;
 
   const forwardHeaders = new Headers(request.headers);
+  if (target === 'app') stripPreviewReferer(forwardHeaders);
   forwardHeaders.delete('host');
   const strippedCookie = stripPreviewCookie(request.headers.get('cookie'));
   if (strippedCookie) forwardHeaders.set('cookie', strippedCookie);

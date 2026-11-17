@@ -18,7 +18,14 @@ function reply(r){
     return {url:r.url,expiresAt:r.expiresAt};
   }catch{return null}
 }
-let nonce,origin;const posts=[],pending=new Set(),seen=new Set();
+let nonce,origin;const posts=[],pending=new Map(),seen=new Set();
+function forget(id){const p=pending.get(id);if(!p)return;pending.delete(id);clearTimeout(p.timer);return p}
+function cancel(id){
+  const p=forget(id);if(!p)return;
+  // Only a previously relayed id can cancel. Do not let the mint/hello rate budget strand work.
+  try{window.parent.postMessage({type:'ezil.code.preview.cancel',v:1,nonce:p.nonce,id},p.origin)}catch{}
+}
+const cancelAll=()=>{for(const id of pending.keys())cancel(id)};
 const post=(envelope,target)=>{try{
   const now=Date.now();while(posts.length&&posts[0]<=now-60000)posts.shift();
   if(posts.length>=10)return false;posts.push(now);window.parent.postMessage(envelope,target);return true;
@@ -28,21 +35,31 @@ window.addEventListener('message',ev=>{try{
   if(ev.source!==window.parent||!origins.includes(ev.origin)||ev.origin==='*'||ev.origin==='null'||!object(d)||d.v!==1||!token(d.nonce))return;
   if(d.type==='ezil.code.preview.hello'&&keys(d,['type','v','nonce'])){
     if(!post({type:'ezil.code.preview.ready',v:1,nonce:d.nonce},ev.origin))return;
-    if(nonce!==d.nonce||origin!==ev.origin)pending.clear();nonce=d.nonce;origin=ev.origin;return;
+    if(nonce!==d.nonce||origin!==ev.origin)cancelAll();nonce=d.nonce;origin=ev.origin;return;
   }
   if(d.type!=='ezil.code.preview.url'||d.nonce!==nonce||ev.origin!==origin||!token(d.id)||!pending.has(d.id)||!keys(d,['type','v','nonce','id','url','expiresAt','error']))return;
   const r={};for(const k of ['url','expiresAt','error'])if(Object.hasOwn(d,k))r[k]=d[k];
   const kept=reply(r);if(!kept)return;
-  pending.delete(d.id);
+  forget(d.id);
   window.dispatchEvent(new CustomEvent('ezil-preview-mint-reply',{detail:JSON.stringify({v:1,id:d.id,...kept})}));
 }catch{}});
 window.addEventListener('ezil-preview-mint',ev=>{try{
   if(!nonce||!ev.cancelable||typeof ev.detail!=='string'||ev.detail.length>128)return;
   const d=JSON.parse(ev.detail);
   if(!keys(d,['v','id'])||d.v!==1||!token(d.id)||seen.has(d.id))return;
-  pending.add(d.id);
-  if(post({type:'ezil.code.preview.mint',v:1,nonce,id:d.id},origin)){seen.add(d.id);ev.preventDefault()}else pending.delete(d.id);
+  pending.set(d.id,{nonce,origin,timer:setTimeout(()=>{
+    cancel(d.id);
+    window.dispatchEvent(new CustomEvent('ezil-preview-mint-reply',{detail:JSON.stringify({v:1,id:d.id,error:'timeout'})}));
+  },240000)});
+  if(post({type:'ezil.code.preview.mint',v:1,nonce,id:d.id},origin)){seen.add(d.id);ev.preventDefault()}else forget(d.id);
 }catch{}});
+window.addEventListener('ezil-preview-mint-cancel',ev=>{try{
+  if(typeof ev.detail!=='string'||ev.detail.length>128)return;
+  const d=JSON.parse(ev.detail);
+  if(!keys(d,['v','id'])||d.v!==1||!token(d.id))return;
+  cancel(d.id);
+}catch{}});
+window.addEventListener('pagehide',cancelAll);
 }catch{}})();`;
 }
 

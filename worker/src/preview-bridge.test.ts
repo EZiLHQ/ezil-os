@@ -24,7 +24,7 @@
 import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
-import { expectPreviewScriptsAllowed, previewPageScripts } from './code-preview-bridge-test-helpers';
+import { expectPreviewScriptsAllowed, previewPageScripts, previewExternalScriptAllowed, inspectorCspPolicies } from './code-preview-bridge-test-helpers';
 
 import {
   previewInspectorScript,
@@ -406,9 +406,9 @@ describe('injectRuntimeShim', () => {
     expect(out).toContain('XMLHttpRequest.prototype.open = function');
   });
 
-  it('still rewrites the HMR WebSocket path (no regression from the fallback addition)', () => {
+  it('keeps original HMR paths for the provider-neutral app catchall', () => {
     const out = injectRuntimeShim('<html><head></head><body></body></html>');
-    expect(out).toContain("u.pathname = '/preview-ws' + u.pathname");
+    expect(out).not.toContain("u.pathname = '/preview-ws' + u.pathname");
   });
 });
 
@@ -1100,7 +1100,8 @@ describe('handlePreviewProxy', () => {
     const scripts = previewPageScripts(body, page);
     if (status < 300) {
       expect(scripts.urls.map(u => u.pathname)).toEqual(['/preview-inspector.js']);
-      expect(body).toContain("u.pathname = '/preview-ws' + u.pathname");
+      expect(body).toContain('window.WebSocket = function');
+      expect(body).not.toContain("u.pathname = '/preview-ws' + u.pathname");
     } else {
       expect(scripts.urls).toEqual([]); expect(body).not.toContain('window.WebSocket');
       const origin = `https://8443-${SID}-code.ezil.org`;
@@ -1117,11 +1118,28 @@ describe('handlePreviewProxy', () => {
     expect(res.status).toBe(200);
     const html = await res.text(); expect(html).not.toContain(cookie);
     await expectPreviewScriptsAllowed(html, res.headers);
-    const scripts = previewPageScripts(html, page); expect(scripts.urls).toHaveLength(1);
+    const scripts = previewPageScripts(html, page, res.headers); expect(scripts.urls).toHaveLength(1);
     const scriptUrl = scripts.urls[0]; expect(scriptUrl.pathname).toBe('/preview-inspector.js');
     expect(scriptUrl.searchParams.get('ezil_pv')).toBe(fallback ? cookie : null);
     expect((await handlePreviewInspectorJs(new Request(scriptUrl, { headers }), SID, [SECRET])).status).toBe(200);
     expect((await handlePreviewInspectorJs(new Request(`${origin}/preview-inspector.js`), SID, [SECRET])).status).toBe(401);
+  });
+  for (const csp of inspectorCspPolicies) it(`authorizes the actual external inspector narrowly under CSP: ${csp}`, async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID), origin = `https://3002-${SID}-app.ezil.org`;
+    const page = `${origin}/preview/?ezil_pv=${encodeURIComponent(cookie)}`;
+    const upstream = new Headers({ 'content-type': 'text/html', 'content-security-policy': csp });
+    const sandbox = fakeContainerFetcher(() => new Response('<head></head><body>App</body>', { headers: upstream }));
+    const res = await handlePreviewProxy(new Request(page), sandbox, SID, [SECRET], '/');
+    const scripts = previewPageScripts(await res.text(), page, res.headers);
+    expect(scripts.urls).toHaveLength(1);
+    expect((await handlePreviewInspectorJs(new Request(scripts.urls[0]), SID, [SECRET])).status).toBe(200);
+    const policy = res.headers.get('content-security-policy')!;
+    expect(policy).toContain(`${origin}/preview-inspector.js`);
+    expect(policy).not.toContain(cookie); expect(policy).not.toContain("'self'"); expect(policy).not.toContain('https: ');
+    for (const url of [`${origin}/other.js`, `${origin}/preview-inspector.js/child`, 'https://other.test/preview-inspector.js'])
+      expect(previewExternalScriptAllowed(res.headers, page, url)).toBe(false);
+    if (csp.includes('img-src')) expect(policy).toContain(csp.includes('images.example') ? 'img-src https://images.example' : "img-src 'none'");
+    expect(policy.split(',')).toHaveLength(csp.split(',').length);
   });
   it('preserves HTML statuses that cannot carry a response body', async () => {
     const cookie = await mintPreviewCookie(SECRET, SID);
