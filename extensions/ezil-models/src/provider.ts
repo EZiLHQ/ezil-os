@@ -537,6 +537,20 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 }
             }
             const request = toNeutralRequest(messages, options);
+            if (options.modelOptions?._ezilCompaction === true) {
+                // Tool history is useful to a summary, but its author must not be able to run new tools.
+                request.tools = [];
+                request.toolMode = 'auto';
+                for (const message of request.messages) message.parts = message.parts.flatMap((part): Part[] => {
+                    if (part.type === 'tool_call') return [{
+                        type: 'text', value: `[Earlier ${part.name} call ${part.callId}]\n${stableJson(part.input)}`,
+                    }];
+                    if (part.type === 'tool_result') return [{
+                        type: 'text', value: `[Earlier tool result ${part.callId}${part.isError ? ' (failed)' : ''}]`,
+                    }, ...part.content];
+                    return [part];
+                });
+            }
             diagnostic = new InferenceTrace(resolved.model, request, {
                 conversationId: sessionIdentity === null ? null : correlate(['session', sessionIdentity]),
                 identifyCall: call => correlate(['call', sessionIdentity, model.id, call]),

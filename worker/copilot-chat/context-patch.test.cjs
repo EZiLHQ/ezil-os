@@ -11,7 +11,7 @@ const literal = name => {
 const patched = process.env.COPILOT_PATCHED_TEST_ROOT;
 
 test('exact context anchors exist in pinned distribution and applied replacements', { skip: !process.env.COPILOT_TEST_ROOT }, () => {
-    for (const name of ['SUMMARY_OWNER', 'CONTEXT_THRESHOLD', 'CONTEXT_RENDER_BUDGET', 'CONTEXT_OUTPUT', 'CONTEXT_TOOL_COUNT',
+    for (const name of ['SUMMARY_OWNER', 'SUMMARY_BRIDGE', 'SUMMARY_FRONTIER', 'SUMMARY_TEXT', 'CONTEXT_THRESHOLD', 'CONTEXT_RENDER_BUDGET', 'CONTEXT_OUTPUT', 'CONTEXT_TOOL_COUNT',
         'CONTEXT_CACHE_UNKNOWN', 'CONTEXT_FALLBACK', 'CONTEXT_USAGE_DETAIL', 'CONTEXT_HOVER', 'CONTEXT_ESTIMATED_LABEL', 'CONTEXT_MODEL_OWNER']) {
         const file = ['CONTEXT_HOVER', 'CONTEXT_ESTIMATED_LABEL', 'CONTEXT_MODEL_OWNER'].includes(name)
             ? 'out/vs/code/browser/workbench/workbench.js' : 'extensions/copilot/dist/extension.js';

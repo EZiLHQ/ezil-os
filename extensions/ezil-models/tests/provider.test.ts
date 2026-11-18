@@ -1,6 +1,9 @@
 // Integration: the VS Code-facing provider against in-process mock Anthropic / OpenAI servers, with a
 // fake `vscode` module. Exercises the full Agent-mode tool-call round trip both ways.
 
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { runInNewContext } from 'node:vm';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test';
 import { parseModelsConfig, type ResolvedConfig, type ResolvedModel } from '../src/config';
 import { forgetGatewayModels } from '../src/gateway';
@@ -632,6 +635,135 @@ describe('EZiL gateway VS Code bridge', () => {
         expect(bodies.every(b => b.model === gw().model && b.stream === true)).toBe(true);
         expect(bodies.map(b => b.max_tokens)).toEqual([2048, 2048, 2048, 2048]);
     });
+    const baselineRoot = process.env.COPILOT_BASELINE_TEST_ROOT;
+    const patchedRoot = process.env.COPILOT_PATCHED_TEST_ROOT;
+    test.skipIf(!baselineRoot || !patchedRoot)('pinned Copilot compaction crosses the real provider once per failed history frontier', async () => {
+        const { frame } = await import('./fixtures/load');
+        const history = [
+            { role: 'user', content: [{ type: 'text', text: 'Keep AMBER-7 in the output' }] },
+            { role: 'assistant', content: [], toolCalls: [{ id: 'write_1', function: { name: CREATE_FILE.name, arguments: '{"filePath":"out.txt","content":"AMBER-7"}' } }] },
+            { role: 'tool', toolCallId: 'write_1', content: [{ type: 'text', text: 'Saved out.txt' }] },
+        ];
+        const prompt = { role: 'user', content: [{ type: 'text', text: 'Produce a wrapped summary' }] };
+        const tool = { type: 'function', function: { name: CREATE_FILE.name, description: CREATE_FILE.description, parameters: CREATE_FILE.inputSchema } };
+
+        function bundleParts(root: string) {
+            const bundle = readFileSync(join(root, 'extensions/copilot/dist/extension.js'), 'utf8');
+            const between = (start: string, end: string) => {
+                const begin = bundle.indexOf(start);
+                const finish = bundle.indexOf(end, begin + start.length);
+                if (begin < 0 || finish < 0) throw Error('Pinned Copilot anchor missing: ' + start);
+                return bundle.slice(begin, finish);
+            };
+            const bridge = between('async makeChatRequest2({debugName:e,messages:n,ignoreStatefulMarker:r,summarizedAtRoundId:o', 'createRequestBody(e){throw new Error("unreachable")}');
+            const dispatcher = between('_startBackgroundSummarization(n,r,o,a,s,c){', '_getOrCreateBackgroundSummarizer(n){');
+            const parser = between('function IMt(t){', 'var h_r=');
+            const converter = between('function Sgn(t,e={}){', 'cr();tt();We();var U7a=');
+            const controller = between('function s5n(t,e){', ';var JMt=');
+            return runInNewContext(controller + ';' + parser + converter + '({ Controller:L7e, bridge:({' + bridge
+                + '}).makeChatRequest2, start:({' + dispatcher + '})._startBackgroundSummarization })', {
+                dm: { ...fakeVscode, LanguageModelToolResultPart2: ToolResultPart },
+                xL: { Raw: { ChatRole: { System: 'system', User: 'user', Assistant: 'assistant', Tool: 'tool' }, ChatCompletionContentPartKind: { Text: 'text' } } },
+                rs: { Usage: 'usage', StatefulMarker: 'stateful_marker', ContextManagement: 'context_management' },
+                Si: class { token = token(); cancel() { this.token.cancel(); } dispose() {} },
+                ma: { stripInternalToolCallIds: (value: unknown) => value },
+                al: async () => ({ messages: [prompt] }), JHe: {},
+                rP: (family: unknown, tools: unknown) => tools,
+                u5e: () => false, vt: () => 'synthetic-request-id', O7a: () => undefined,
+                bBn: () => {}, x9: () => {}, Dre: class { constructor(public callback: unknown) {} }, _m: String,
+                Ixe: () => true, TextDecoder,
+                YHe: () => ({ numRounds: 2, numRoundsSinceLastSummarization: 2 }),
+                _l: (content: unknown[]) => content, EMt: (summary: string) => summary,
+            });
+        }
+
+        function connect(root: string, plan?: string) {
+            forgetGatewayModels();
+            const recorded: { model: string; tools?: unknown[]; messages: unknown[] }[] = [];
+            const replies: string[] = [];
+            const host = gatewayHost((async (_url: unknown, init?: RequestInit) => {
+                const body = JSON.parse(new TextDecoder().decode(init!.body as Uint8Array));
+                recorded.push(body);
+                const reply = replies.shift() ?? 'unwrapped response';
+                if (!body.stream) return Response.json({ ...messageJson(), content: [{ type: 'text', text: reply }] });
+                const stream = frames('end_turn');
+                return new Response([stream[0], frame('content_block_start', { type: 'content_block_start', index: 0,
+                    content_block: { type: 'text', text: reply } }), stream[3], ...stream.slice(-2)].join(''),
+                    { headers: { 'content-type': 'text/event-stream' } });
+            }) as unknown as typeof fetch, () => Response.json(catalog(), plan ? { headers: { 'x-ezil-os-included-models': plan } } : undefined));
+            const provider = new EZiLModelsProvider(host);
+            const info = toInformation(host.models()[1]!);
+            const parts = bundleParts(root);
+            const endpoint = {
+                model: KIMI, family: 'kimi', modelProvider: 'ezil',
+                languageModel: { id: KIMI, vendor: 'ezil', async sendRequest(input: never, options: never, cancellation: never) {
+                    const parts: unknown[] = [];
+                    await provider.provideLanguageModelChatResponse(info, input, options, { report: part => parts.push(part) }, cancellation);
+                    return { stream: (async function* () { yield* parts; })() };
+                } },
+                _otelService: { getActiveTraceContext: () => undefined },
+                makeChatRequest2: parts.bridge,
+            };
+            const agent = { endpoint, instantiationService: {}, _lastModelCapabilities: { enableThinking: true },
+                logService: { debug() {}, error() {}, warn() {} }, telemetryService: { sendMSFTTelemetryEvent() {} },
+                sessionTranscriptService: { getTranscriptPath() { return undefined; } } };
+            const controller = () => new parts.Controller(16000, KIMI);
+            async function compact(control: ReturnType<typeof controller>, rounds: string[], sessionId = 'chat-1') {
+                const context = { history: [], toolCallRounds: rounds.map(id => ({ id })),
+                    tools: { availableTools: [CREATE_FILE] },
+                    conversation: { sessionId, getLatestTurn: () => ({ id: 'turn-1' }) } };
+                parts.start.call(agent, control, history, context, {}, token(), 1);
+                await control.waitForCompletion();
+            }
+            async function normalTurn() {
+                await endpoint.makeChatRequest2({ debugName: 'agent', messages: [...history, prompt],
+                    requestOptions: { tools: [tool] }, conversationId: 'chat-1' }, token());
+            }
+            return { recorded, replies, controller, compact, normalTurn };
+        }
+
+        const baseline = connect(baselineRoot!);
+        const old = baseline.controller();
+        await baseline.compact(old, ['round-1']);
+        expect(old.state).toBe('Failed');
+        await baseline.compact(old, ['round-1']);
+        expect(baseline.recorded.map(call => [call.model, call.tools?.length])).toEqual([[KIMI, 1], [KIMI, 1]]);
+
+        const candidate = connect(patchedRoot!);
+        const current = candidate.controller();
+        candidate.replies.push('unwrapped response', '<summary>Keep AMBER-7.</summary>', '<summary>Other chat.</summary>');
+        await candidate.compact(current, ['round-1']);
+        expect(current.state).toBe('Failed');
+        await candidate.compact(current, ['round-1']);
+        expect(candidate.recorded).toHaveLength(1);
+        const summaryBody = candidate.recorded[0]!;
+        expect(summaryBody.model).toBe(gw().model);
+        expect(summaryBody.tools ?? []).toEqual([]);
+        expect(JSON.stringify(summaryBody.messages)).toContain('[Earlier create_file call write_1]');
+        expect(JSON.stringify(summaryBody.messages)).toContain('Saved out.txt');
+        expect(JSON.stringify(summaryBody.messages)).toContain('AMBER-7');
+        await candidate.compact(current, ['round-1', 'round-2']);
+        expect(current.consumeAndReset()).toMatchObject({ summary: 'Keep AMBER-7.', toolCallRoundId: 'round-1' });
+        const independent = candidate.controller();
+        await candidate.compact(independent, ['round-1'], 'chat-2');
+        expect(independent.consumeAndReset()).toMatchObject({ summary: 'Other chat.' });
+        await candidate.normalTurn();
+        expect(candidate.recorded.map(call => [call.model, call.tools?.length ?? 0])).toEqual([
+            [gw().model, 0], [gw().model, 0], [gw().model, 0], [KIMI, 1],
+        ]);
+
+        // A restricted plan keeps its eligible model when the usual utility model is excluded.
+        const limited = connect(patchedRoot!, KIMI);
+        const limitedControl = limited.controller();
+        limited.replies.push('<summary></summary>', '<summary>Free chat.</summary>');
+        await limited.compact(limitedControl, ['round-1']);
+        expect(limitedControl.state).toBe('Failed');
+        await limited.compact(limitedControl, ['round-1']);
+        await limited.compact(limitedControl, ['round-1', 'round-2']);
+        expect(limitedControl.consumeAndReset()).toMatchObject({ summary: 'Free chat.' });
+        expect(limited.recorded.map(call => [call.model, call.tools?.length ?? 0])).toEqual([[KIMI, 0], [KIMI, 0]]);
+    });
+
     test('cancellation before catalog lookup makes no requests', async () => {
         let gets = 0; let posts = 0;
         const host = gatewayHost((async () => { posts++; throw new Error('unexpected POST'); }) as unknown as typeof fetch,

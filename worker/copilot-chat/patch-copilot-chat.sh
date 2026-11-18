@@ -126,7 +126,16 @@ A_EMB_EXT='async fetchRemoteExtensionCache(n){let o=`${await this.getBaseExtensi
 R_EMB_EXT='async fetchRemoteExtensionCache(n){return{};let o=`${await this.getBaseExtensionCDNURL()}/${n}.json`;try{'
 
 A_SUMMARY_OWNER='start(e,n){if(this._state!=="Idle"&&this._state!=="Failed")return;this._state="InProgress",this._error=void 0,this._cts=new Si(n);let r=this._cts.token;this._promise=e(r).then(o=>{this._state==="InProgress"&&(this._result=o,this._state="Completed")},o=>{this._state==="InProgress"&&(this._error=o,this._state="Failed")})}'
-R_SUMMARY_OWNER='start(e,n){if(this._state!=="Idle"&&this._state!=="Failed")return;this._state="InProgress",this._error=void 0,this._cts=new Si(n);let r=this._cts.token;this._promise=e(r).then(o=>{this._cts?.token===r&&(r.isCancellationRequested?this.cancel():this._state==="InProgress"&&(this._result=o,this._state="Completed"))},o=>{this._cts?.token===r&&(r.isCancellationRequested?this.cancel():this._state==="InProgress"&&(this._error=o,this._state="Failed"))})}'
+R_SUMMARY_OWNER='start(e,n,t){if(this._state!=="Idle"&&this._state!=="Failed"||t!==void 0&&this._ezilFailedFrontiers?.has(t))return;this._state="InProgress",this._error=void 0,this._cts=new Si(n);let r=this._cts.token;this._promise=e(r).then(o=>{this._cts?.token===r&&(r.isCancellationRequested?this.cancel():this._state==="InProgress"&&(this._result=o,this._state="Completed"))},o=>{if(this._cts?.token!==r)return;if(r.isCancellationRequested){this.cancel();return}if(this._state==="InProgress"){this._error=o;this._state="Failed";if(t!==void 0){let a=this._ezilFailedFrontiers??=new Set;a.add(t);if(a.size>16)a.delete(a.values().next().value)}}})}'
+# Only the contributed EZiL bridge handles the internal compaction marker. The provider still
+# applies its own model and account checks. Other contributed providers keep upstream behavior.
+A_SUMMARY_BRIDGE='async makeChatRequest2({debugName:e,messages:n,ignoreStatefulMarker:r,summarizedAtRoundId:o,requestOptions:a,finishedCb:s,location:c,source:l,telemetryProperties:u,modelCapabilities:d,conversationId:p},m){let A=Sgn(n,{ignoreStatefulMarker:r,summarizedAtRoundId:o,emitCacheBreakpoints:u5e(this.languageModel.vendor)}),g=vt(),f=this._otelService.getActiveTraceContext(),h=O7a(u),y={includeEncryptedThinking:!0,tools:(a?.tools??[]).map(_=>({name:_.function.name,description:_.function.description,inputSchema:_.function.parameters})),modelOptions:{_capturingTokenCorrelationId:g,_otelTraceContext:f??null,...h!==void 0?{_telemetryTurn:h}:{},...d?.enableThinking!==void 0?{_enableThinking:d.enableThinking}:{},...p!==void 0?{_conversationId:p}:{}}}'
+R_SUMMARY_BRIDGE='async makeChatRequest2({debugName:e,messages:n,ignoreStatefulMarker:r,summarizedAtRoundId:o,requestOptions:a,finishedCb:s,location:c,source:l,telemetryProperties:u,modelCapabilities:d,conversationId:p,interactionTypeOverride:S},m){let summary=this.modelProvider==="ezil"&&S==="conversation-compaction",A=Sgn(n,{ignoreStatefulMarker:r,summarizedAtRoundId:o,emitCacheBreakpoints:u5e(this.languageModel.vendor)}),g=vt(),f=this._otelService.getActiveTraceContext(),h=O7a(u),y={includeEncryptedThinking:!0,tools:(summary?[]:a?.tools??[]).map(_=>({name:_.function.name,description:_.function.description,inputSchema:_.function.parameters})),modelOptions:{_capturingTokenCorrelationId:g,_otelTraceContext:f??null,...h!==void 0?{_telemetryTurn:h}:{},...summary?{role:"summary",_ezilCompaction:true,_enableThinking:!1}:d?.enableThinking!==void 0?{_enableThinking:d.enableThinking}:{},...p!==void 0?{_conversationId:p}:{}}}'
+# The last round can advance while the attachable summary round stays the same.
+A_SUMMARY_FRONTIER='}},s)}_getOrCreateBackgroundSummarizer(n){'
+R_SUMMARY_FRONTIER='}},s,this.endpoint.modelProvider==="ezil"?JSON.stringify([h,f,d,l.at(-1)?.id]):void 0)}_getOrCreateBackgroundSummarizer(n){'
+A_SUMMARY_TEXT='if(k===void 0)throw new Error("Background summarization: no <summary> tags found in response");'
+R_SUMMARY_TEXT='if(this.endpoint.modelProvider==="ezil"&&k==="")throw new Error("Background summarization: empty <summary> in response");if(k===void 0){throw new Error("Background summarization: no <summary> tags found in response")}'
 # Staging context/usage fixes; exact Copilot 0.69.0 anchors (PATCHES.md).
 A_CONTEXT_THRESHOLD='if(a5n(he,re,this._thresholdRng)&&Ie)'
 R_CONTEXT_THRESHOLD='if((this.endpoint.modelProvider==="ezil"?he>=1:a5n(he,re,this._thresholdRng))&&Ie)'
@@ -365,6 +374,9 @@ P_STATIC_WEBVIEW='webviewEndpoint:I+"/out/vs/workbench/contrib/webview/browser/p
 if [ "$VERIFY_ONLY" = 0 ] && [ "$(count "$WB" "$R_APP_FAILURE")" = 1 ]; then VERIFY_ONLY=1; fi
 if [ "$VERIFY_ONLY" = 0 ]; then
   patch summary-owner "$EXT" 1 "$A_SUMMARY_OWNER" "$R_SUMMARY_OWNER"
+  patch summary-bridge "$EXT" 1 "$A_SUMMARY_BRIDGE" "$R_SUMMARY_BRIDGE"
+  patch summary-frontier "$EXT" 1 "$A_SUMMARY_FRONTIER" "$R_SUMMARY_FRONTIER"
+  patch summary-text "$EXT" 1 "$A_SUMMARY_TEXT" "$R_SUMMARY_TEXT"
   patch context-threshold "$EXT" 1 "$A_CONTEXT_THRESHOLD" "$R_CONTEXT_THRESHOLD"
   patch context-render-budget "$EXT" 1 "$A_CONTEXT_RENDER_BUDGET" "$R_CONTEXT_RENDER_BUDGET"
   patch context-output "$EXT" 1 "$A_CONTEXT_OUTPUT" "$R_CONTEXT_OUTPUT"
@@ -463,6 +475,9 @@ gate picker-locked-pin "$WB" 0 "$A_PICKER_LOCKED_PIN"; gate picker-locked-pin "$
 gate picker-locked-select "$WB" 0 "$A_PICKER_LOCKED_SELECT"; gate picker-locked-select "$WB" 1 "$R_PICKER_LOCKED_SELECT"
 gate picker-locked-configure "$WB" 0 "$A_PICKER_LOCKED_CONFIGURE"; gate picker-locked-configure "$WB" 1 "$R_PICKER_LOCKED_CONFIGURE"
 gate summary-owner "$EXT" 0 "$A_SUMMARY_OWNER"; gate summary-owner "$EXT" 1 "$R_SUMMARY_OWNER"
+gate summary-bridge "$EXT" 0 "$A_SUMMARY_BRIDGE"; gate summary-bridge "$EXT" 1 "$R_SUMMARY_BRIDGE"
+gate summary-frontier "$EXT" 0 "$A_SUMMARY_FRONTIER"; gate summary-frontier "$EXT" 1 "$R_SUMMARY_FRONTIER"
+gate summary-text "$EXT" 0 "$A_SUMMARY_TEXT"; gate summary-text "$EXT" 1 "$R_SUMMARY_TEXT"
 gate context-threshold "$EXT" 0 "$A_CONTEXT_THRESHOLD"; gate context-threshold "$EXT" 1 "$R_CONTEXT_THRESHOLD"
 gate context-render-budget "$EXT" 0 "$A_CONTEXT_RENDER_BUDGET"; gate context-render-budget "$EXT" 1 "$R_CONTEXT_RENDER_BUDGET"
 gate context-output "$EXT" 0 "$A_CONTEXT_OUTPUT"; gate context-output "$EXT" 1 "$R_CONTEXT_OUTPUT"
