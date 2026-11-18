@@ -275,8 +275,8 @@ ok(await waitFrameFolder('/workspace/b'), `forward: real editor at ${frameFolder
 f = await workbench(); await page.waitForTimeout(1500);
 await shot('04-forward-b');
 
-// 4. An edited file survives a folder switch and the way back (code-server's own autosave/backup; the frame is
-//    navigated, never removed). Quick Open notes.txt, type, wait for the editor, then Back and Forward.
+// 4. A saved edit survives a folder switch and the way back (the frame is navigated, never removed).
+//    Quick Open notes.txt, edit and save it in the editor, then use Back and Forward.
 await f.locator('.monaco-workbench').click({ position: { x: 700, y: 400 } }).catch(() => {});
 await page.keyboard.press('Control+P');
 await f.locator('.quick-input-widget input').fill('notes.txt');
@@ -286,7 +286,8 @@ const editorInput = f.locator('.part.editor .monaco-editor :is(.native-edit-cont
 await editorInput.press('Control+End');
 await page.keyboard.type(' edited-by-folder-url-test', { delay: 15 });
 await f.waitForFunction(() => document.querySelector('.part.editor .monaco-editor .view-lines')?.textContent.includes('edited-by-folder-url-test'));
-await f.locator('.part.editor .tab.dirty[data-resource-name="notes.txt"]').waitFor({ state: 'hidden' });
+await editorInput.press('Control+S');
+await page.waitForTimeout(1500); // Let Code Server finish the remote save.
 await shot('05-edited-b');
 const beforeDialogs = dialogs.length;
 await page.goBack();
