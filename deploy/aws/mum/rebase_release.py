@@ -676,6 +676,7 @@ HOST_AGENT_STANDALONE_EXCEPTION={
 # binding, and supervisor_unavailable keeps the uncertain-writer fence). Each binds the EXACT deployed host tree, the EXACT baked host tree AND the complete mode/blob delta. Unlike the
 # delta-only exceptions above, any other file difference, including an unchanged extra file present on BOTH sides,
 # changes a tree id and is refused, and so is the reverse direction. Only these directions exist.
+# Native Host tree 82228b6e adds one supported forward direction from the cdd39dac baseline b7700d49.
 HOST_AGENT_DIRECTED_EXCEPTIONS=(
     # 1f4712c4 and 6a187841 (one host tree c87c304c) -> 96ff8e22: eight paths.
     ('c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d','96ff8e224443e0d684cb99e808a903235f2def11',{
@@ -745,6 +746,20 @@ HOST_AGENT_DIRECTED_EXCEPTIONS=(
         'test/test_history_stop.py':('100644 a7156588d88c2e10ce4ece5f02b78a4749111c33','100644 35adb455568ad48870c38e5e1f21b39fbc9ab9f0'),
         'test/test_host_resilience.py':('100644 f30ffd16c5c15377068638388924725dfc1b69c0','100644 16c9c704597b3fd45b19f92827606c33d5986042'),
         'test/test_standalone_git_edge.py':('100644 1f5aeb0f84f1afe09393d710e4752d1fd4b00aa9','100644 1237865c01c065e419015c1813bd09ffec8751b0'),
+    }),
+    # cdd39dac's reviewed standalone Git host -> a3a4df6f Native PreviewV2 host: 10 exact paths.
+    # This recognizes the Host source delta; live Native readiness still requires its deployment pins and witness.
+    ('b7700d49c946157cd75c862bce867caf7fd08810','82228b6e31dfcfedb116c3c6649ae78281b0d799',{
+        'lib/ezil_host/agent.py':('100644 7d3e661a7cc6169df602bb2fe0085eec75f51abf','100644 cc296c715eef56df2d26c500036d433212c22e70'),
+        'lib/ezil_host/edge.py':('100644 e621a7861f4f2dbaba2fe303e7222903b0173e5d','100644 9a95eff895d1f1f45e0944e1f5afcf2c998aa808'),
+        'lib/ezil_host/native_artifact.py':(None,'100644 a08cda7c9c3b087ed95bbb4406b447ac3fa9f4bc'),
+        'lib/ezil_host/native_authority.py':(None,'100644 e5a5871afc0a0e7b383fc83f2be384043cb795eb'),
+        'lib/ezil_host/native_driver.mjs':(None,'100644 b28f7d139e8f56a15ae1d45ade62314c82f94577'),
+        'lib/ezil_host/native_isolation.py':(None,'100644 a2ae9f841c5fdab4b222c31995731e6dfff0583f'),
+        'lib/ezil_host/native_qualification.py':(None,'100644 256908d285bf7111ae7da9191810bc259bf5b8cb'),
+        'lib/ezil_host/native_session.py':(None,'100644 aa804d96721492d5e08eee2abb9facf00b02bbba'),
+        'test/test_native_qualification.py':(None,'100644 b6186eebdc522e5cca856faad78a2586bc28785e'),
+        'test/test_native_session.py':(None,'100644 3fbea20af4b053119669b74d52d5209d3b93ca60'),
     }),
 )
 
