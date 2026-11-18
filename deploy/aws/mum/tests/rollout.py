@@ -146,38 +146,26 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(isinstance(back[TOOL.KEY],str),encoded)
             self.assertEqual(envelope,frozen)
             self.assertEqual(TOOL.edit_release_secret({'SecretString':json.dumps(back)},self.old,self.old,[self.source]),back)
-            # Appending thirty-three through thirty-seven preserves every retained record; thirty-eight is refused.
-            thirty_third=dict(target,amiId='ami-'+'f'*17,createdAt='2026-12-31T00:00:00.000Z')
-            grown=TOOL.edit_release_secret({'SecretString':json.dumps(back)},self.old,self.old,[thirty_third])
-            grown_map=json.loads(grown[TOOL.KEY]) if encoded else grown[TOOL.KEY]
-            self.assertEqual(grown_map[TOOL.REGION]['releases'],[*records,target,thirty_third])
-            thirty_fourth=dict(target,amiId='ami-'+'e'*17,createdAt='2026-12-31T01:00:00.000Z')
-            grown_again=TOOL.edit_release_secret({'SecretString':json.dumps(grown)},self.old,self.old,[thirty_fourth])
-            grown_again_map=json.loads(grown_again[TOOL.KEY]) if encoded else grown_again[TOOL.KEY]
-            self.assertEqual(grown_again_map[TOOL.REGION]['releases'],[*records,target,thirty_third,thirty_fourth])
-            thirty_fifth=dict(target,amiId='ami-'+'d'*17,createdAt='2026-12-31T02:00:00.000Z')
-            grown_third=TOOL.edit_release_secret({'SecretString':json.dumps(grown_again)},self.old,self.old,[thirty_fifth])
-            grown_third_map=json.loads(grown_third[TOOL.KEY]) if encoded else grown_third[TOOL.KEY]
-            self.assertEqual(grown_third_map[TOOL.REGION]['releases'],[*records,target,thirty_third,thirty_fourth,thirty_fifth])
-            thirty_sixth=dict(target,amiId='ami-'+'c'*17,createdAt='2026-12-31T03:00:00.000Z')
-            grown_fourth=TOOL.edit_release_secret({'SecretString':json.dumps(grown_third)},self.old,self.old,[thirty_sixth])
-            grown_fourth_map=json.loads(grown_fourth[TOOL.KEY]) if encoded else grown_fourth[TOOL.KEY]
-            self.assertEqual(grown_fourth_map[TOOL.REGION]['releases'],[*records,target,thirty_third,thirty_fourth,thirty_fifth,thirty_sixth])
-            thirty_seventh=dict(target,amiId='ami-'+'b'*17,createdAt='2026-12-31T04:00:00.000Z')
-            grown_fifth=TOOL.edit_release_secret({'SecretString':json.dumps(grown_fourth)},self.old,self.old,[thirty_seventh])
-            grown_fifth_map=json.loads(grown_fifth[TOOL.KEY]) if encoded else grown_fifth[TOOL.KEY]
-            self.assertEqual(grown_fifth_map[TOOL.REGION]['releases'],[*records,target,thirty_third,thirty_fourth,thirty_fifth,thirty_sixth,thirty_seventh])
-            self.assertEqual({k:grown_fifth_map[TOOL.REGION][k] for k in self.old},self.old)
-            self.assertLessEqual(len(json.dumps(grown_fifth,separators=(',',':')).encode()),65536)
-            readback={'gitSha':'9'*40,'killSwitch':'1','deployment':app_ops.public_deployment(grown_fifth_map[TOOL.REGION])}
+            # Extend the active registry one record at a time and preserve the rollback prefix.
+            expected = [*records, target]
+            grown = back
+            for size in range(33, TOOL.ACTIVE_REGISTRY_CAPACITY + 1):
+                new_record = dict(target, amiId='ami-'+format(size+100,'017x'), recipeVersion='1.1.'+str(size))
+                grown = TOOL.edit_release_secret({'SecretString':json.dumps(grown)}, self.old, self.old, [new_record])
+                grown_map = json.loads(grown[TOOL.KEY]) if encoded else grown[TOOL.KEY]
+                expected.append(new_record)
+                self.assertEqual(grown_map[TOOL.REGION]['releases'], expected)
+            self.assertEqual({key:grown_map[TOOL.REGION][key] for key in self.old}, self.old)
+            self.assertLessEqual(len(json.dumps(grown,separators=(',',':')).encode()),65536)
+            readback = {'gitSha':'9'*40,'killSwitch':'1','deployment':app_ops.public_deployment(grown_map[TOOL.REGION])}
             self.assertLessEqual(len(json.dumps(readback,separators=(',',':')).encode()),24000)
-            thirty_eighth=dict(target,amiId='ami-'+'a'*17,createdAt='2026-12-31T05:00:00.000Z')
-            full={'SecretString':json.dumps(grown_fifth)};frozen_full=copy.deepcopy(full)
+            excess = dict(target, amiId='ami-'+'f'*17, recipeVersion='1.2.0')
+            full = {'SecretString':json.dumps(grown)}
+            frozen_full = copy.deepcopy(full)
             with self.assertRaisesRegex(ValueError,'registry full'):
-                TOOL.edit_release_secret(full,self.old,self.old,[thirty_eighth])
+                TOOL.edit_release_secret(full,self.old,self.old,[excess])
             self.assertEqual(full,frozen_full)
-            oversized=dict(restored[TOOL.REGION],releases=[*records,target,thirty_third,thirty_fourth,thirty_fifth,thirty_sixth,thirty_seventh,thirty_eighth])
-            self.assertEqual(len(oversized['releases']),38)
+            oversized = dict(restored[TOOL.REGION], releases=[*expected, excess])
             with self.assertRaisesRegex(ValueError,'invalid release registry'):
                 TOOL.edit_release_secret({'SecretString':json.dumps({TOOL.KEY:{TOOL.REGION:oversized}})},self.old,after,[])
 
@@ -1138,6 +1126,16 @@ class PoolIamIncrementalTests(unittest.TestCase):
         self.assertEqual(self.artifact['stacks']['identity'],{})
         self.assertEqual(self.validate('workflows'),self.review['changes'])
         self.assertEqual(self.validate('identity'),{})
+
+    def test_projected_observer_grant_requires_its_own_version_reference(self):
+        for resource in ('*', {'Ref':'OtherVersion'}, {'Ref':'RecoveryObserverCurrentVersion680AB0D7'+'a'*32}):
+            self.setUp()
+            invoke = next(row for row in self.policy('workflows', self.controller)
+                          if cfn.action_set(row) == {'lambda:invokefunction'})
+            invoke['Resource'] = resource
+            self.repin('workflows')
+            with self.subTest(resource=resource), self.assertRaisesRegex(ValueError,'one immutable version'):
+                self.validate('workflows')
 
     def test_incremental_without_artifact_refused(self):
         with self.assertRaisesRegex(ValueError,'unreviewed destructive/wildcard IAM grants'):
