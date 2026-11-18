@@ -162,6 +162,10 @@ const titleBarLabels = f.locator('.part.titlebar .command-center .search-label, 
 await titleBarLabels.first().waitFor({ state: 'attached' });
 const titleBarUsesRepo = () => titleBarLabels.evaluateAll((nodes, repo) => nodes.length > 0 && nodes.every(node => node.textContent === repo), REPO_NAME);
 ok(await titleBarUsesRepo(), 'repo: the command center and agent status display the checkout folder name');
+// Some workbench layouts display the complete workspace title inside the visible label.
+const visibleTitleBarLabel = f.locator('.part.titlebar .command-center :is(.search-label, .agent-status-label):visible').first();
+await visibleTitleBarLabel.evaluate((node, id) => { node.textContent = 'Search — ' + id + ' — code-server'; }, REPO_ID);
+ok(await titleBarUsesRepo(), 'repo: the visible command center label also replaces the ID in a longer title');
 await readme.dblclick();
 await f.waitForFunction(repo => document.title === 'README.md - ' + repo + ' - code-server', REPO_NAME);
 ok(await titleBarUsesRepo(), 'repo: opening an editor preserves the checkout name in the title bar');
