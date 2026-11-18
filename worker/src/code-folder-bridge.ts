@@ -101,7 +101,7 @@ function focusRepository(folder, name) {
 
   const labelTitleBar = (bar) => {
     for (const node of bar.querySelectorAll(".command-center .search-label, .command-center .agent-status-label")) {
-      if (node.textContent === root) node.textContent = basename;
+      if (node.textContent?.includes(root)) node.textContent = basename;
     }
     const quickPick = bar.querySelector(".command-center-quick-pick");
     const description = quickPick?.getAttribute("aria-description");
