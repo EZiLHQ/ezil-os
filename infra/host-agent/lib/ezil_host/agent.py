@@ -61,13 +61,17 @@ import subprocess
 import threading
 import time
 
-from . import canary, desktop, export, guard, storage, terminal_work, tunnel
+from . import canary, desktop, export, guard, native_session, storage, terminal_work, tunnel
 from .fsops import DIR_FLAGS, Refused, open_dir_below, write_file_durable_at
 
 LOAD_RE = re.compile(r"^\d+(\.\d+)?$")
 MAX_PAST = 120        # seconds a request may be old
 MAX_FUTURE = 5        # seconds of clock skew tolerated ahead of this host
 MAX_WARN = 900        # a control-plane stop warns for at most 15 minutes
+CONTROL_LINE = 65536  # every control line except native-session (unchanged cap)
+NATIVE_LINE = 131072  # native-session only: the whole wrapper line, newline included
+NATIVE_KEYS = {"op", "seq", "ts", "leaseEpoch", "mac", "delivery"}
+NATIVE_STATUS_KEYS = {"op", "seq", "ts", "leaseEpoch", "mac", "operationId"}
 STOP_RANK = {"absent": 0, "clean": 1, "killed": 2}
 SHUTDOWN_PENDING = "shutdown-pending"      # runDir: a shutdown began; a restarted agent resumes it
 UNIT_STATES = ("active", "activating", "deactivating", "reloading", "inactive", "failed")
@@ -149,6 +153,12 @@ class Agent:
         self.restart_ids = []
         self._load_restart_requests()
         self.export_thread = None             # the one reverse-move export job (export.Job)
+        # Off unless agent.json enables it; every request re-checks the full gate (native_session.gate).
+        try:
+            self.native = native_session.from_config(cfg, lease, self.key, log)
+        except Exception as e:  # noqa: BLE001 — a bad native config disables native, never the agent
+            log(f"native: disabled ({type(e).__name__})")
+            self.native = None
         self.storage_stop = threading.Event()  # ends the periodic storage sampler (storage.Sampler)
 
     # ---------------------------------------------------------------- control
@@ -164,6 +174,8 @@ class Agent:
             return {"ok": False, "error": "bad_json"}
         if not isinstance(msg, dict):
             return {"ok": False, "error": "bad_json"}
+        if len(raw) > (NATIVE_LINE if msg.get("op") in ("native-session", "native-runtime") else CONTROL_LINE):
+            return {"ok": False, "error": "too_large"}
         mac = msg.get("mac", "")
         if not isinstance(mac, str) or not hmac.compare_digest(mac, sign(self.key, msg)):
             return {"ok": False, "error": "bad_mac"}
@@ -198,6 +210,19 @@ class Agent:
             if (set(msg) != export.MESSAGE_KEYS or not export.valid_id(msg.get("moveId"))
                     or not export.valid_id(msg.get("importGeneration"))):
                 return {"ok": False, "error": "export_invalid"}
+        elif op == "native-runtime":
+            if not isinstance(msg.get("request"), dict) or set(msg) != {"op", "request", "ts", "seq", "leaseEpoch", "mac"}:
+                return {"kind": "refused", "reason": "runtime_invalid"}
+        elif op == "native-readiness":
+            if not isinstance(msg.get("query"), dict) or set(msg) != {"op", "query", "ts", "seq", "leaseEpoch", "mac"}:
+                return {"ok": False, "kind": "refused"}
+        elif op == "native-session":
+            if set(msg) != NATIVE_KEYS or not isinstance(msg.get("delivery"), dict):
+                return {"ok": False, "error": "native_invalid"}
+        elif op == "native-session-status":
+            if set(msg) != NATIVE_STATUS_KEYS or not isinstance(msg.get("operationId"), str) \
+                    or not native_session.UUID.fullmatch(msg["operationId"]):
+                return {"ok": False, "error": "native_invalid"}
         elif op not in ("presence", "fence", "desktop_status"):
             return {"ok": False, "error": "unknown_op"}
         with self.lock:
@@ -215,6 +240,21 @@ class Agent:
                 return self._accept_restart(msg["requestId"], now)
             if op == "export":
                 return self._accept_export(msg["moveId"], msg["importGeneration"], now)
+            native = getattr(self, "native", None)
+            if op == "native-runtime":
+                return native.runtime_request(msg["request"]) if native else {"kind": "unavailable", "reason": "runtime_unavailable"}
+            if op == "native-readiness":
+                return native.readiness(msg["query"]) if native else {"ok": False, "kind": "refused"}
+            if op == "native-session-status":
+                # Pure read of the private ledger: never starts, retries or reconciles anything.
+                return native.status(msg["operationId"]) if native else {"ok": False, "error": "operation_unknown"}
+            if op == "native-session":
+                if native is None:
+                    return {"ok": False, "error": "native_unavailable"}
+                if (self._host_stopping() or self.restart_in_progress
+                        or self.export_thread is not None and self.export_thread.is_alive()):
+                    return {"ok": False, "error": "stopping"}
+                return native.admit(json.dumps(msg["delivery"], ensure_ascii=False).encode())
             if op == "stop":
                 self.stop_request = {"kind": "stop", "warn": warn, "reason": str(msg.get("reason", "control_plane"))[:64]}
                 return {"ok": True}
@@ -308,6 +348,11 @@ class Agent:
         runDir/export-quiesce (the desktop unit's Restart= then refuses, exit 2), stop the unit
         itself (bounded), and confirm both are down. Never runDir/stopping: that marker also
         refuses a restarted edge or cloudflared, which serve this export's chunks."""
+        native = getattr(self, "native", None)
+        if native is not None and not native.fence_all("export"):
+            # A runtime that is not provably gone may still write /workspace: no capture.
+            self.log("export: blocked, a native runtime is not fenced (quarantined)")
+            return False
         self._set_marker(desktop.EXPORT_QUIESCE)
         try:
             subprocess.run(list(DESKTOP_STOP_CMD), timeout=DESKTOP_STOP_TIMEOUT, check=False,
@@ -460,13 +505,14 @@ class Agent:
                 c.settimeout(5)
                 data = b""
                 try:
-                    while not data.endswith(b"\n") and len(data) < 65536:
+                    while not data.endswith(b"\n") and len(data) <= NATIVE_LINE:
                         chunk = c.recv(4096)
                         if not chunk:
                             break
                         data += chunk
                     try:
-                        resp = self.handle(data)
+                        # recv may overshoot: the exact line length is checked after reading.
+                        resp = {"ok": False, "error": "too_large"} if len(data) > NATIVE_LINE else self.handle(data)
                     except Exception as e:  # noqa: BLE001 — a bad request must never kill the channel
                         resp = {"ok": False, "error": "internal", "detail": type(e).__name__}
                     c.sendall((json.dumps(resp) + "\n").encode())
@@ -535,7 +581,8 @@ class Agent:
         # Ordered quiesce. Each step is attempted even if an earlier one failed: the OS
         # shutdown that follows must happen regardless (it also unmounts).
         quiesce_ok = True
-        for name, fn in (("desktop", lambda: self._note_stop(desktop.stop(self.cfg))),
+        for name, fn in (("native", lambda: self._native_fence(why)),     # relay revoked before the desktop/volume
+                         ("desktop", lambda: self._note_stop(desktop.stop(self.cfg))),
                          ("export", lambda: export.remove_container(self.cfg)),   # it binds /workspace
                          ("record", lambda: self.record_stop(why)),
                          ("overlay", lambda: desktop.overlay_umount(self.cfg)),
@@ -552,6 +599,12 @@ class Agent:
                 self.log(f"quiesce step {name} failed: {e}")
         canary.stopped(self.cfg, self.stop_outcome, source="agent", quiesce_ok=quiesce_ok)
         self.power_off()
+
+    def _native_fence(self, why):
+        """Fence every native runtime; raises (so the quiesce records it) if any is left quarantined."""
+        native = getattr(self, "native", None)
+        if native is not None and not native.fence_all(f"host:{str(why)[:48]}"):
+            raise RuntimeError("native runtime quarantined")
 
     def _storage_stop_sample(self):
         """The stop sample (storage.on_stop): at most storageStopBudgetSeconds of wall-clock time, and metering
@@ -646,6 +699,15 @@ class Agent:
         if held:
             self.log(f"idle stop held: export idle={int(now - self.last_presence)}s")
             return "held_export"
+        try:
+            native = getattr(self, "native", None)
+            held = native is not None and native.holds_idle(now)
+        except Exception:  # noqa: BLE001 — as for the export hold: unknown is no hold
+            held = False
+        if held:
+            # native_work: real model/tool activity under a fresh authority answer (<= 30 s, prompt <= 120 s).
+            self.log(f"idle stop held: native_work idle={int(now - self.last_presence)}s")
+            return "held_native"
         if self._terminal_hold(now - self.last_presence):
             return "held_terminal"
         # The probe can take up to 30 s; a user who came back meanwhile is present again.

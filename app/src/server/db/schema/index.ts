@@ -4,3 +4,6 @@ export * from './computers';
 export * from './os-access';
 export * from './telemetry';
 export * from './feedback';
+export * from './native-auth-intents';
+export * from './native-sessions';
+export * from './native-runtime';
