@@ -75,9 +75,11 @@ export function proveFailedReleaseNeverActed(e: Execution, events: readonly Hist
     const byId = new Map(events.map(event => [event.id!, event]));
     for (const [index, event] of events.entries()) {
         const type = event.type ?? '';
-        // Linear, complete, time-ordered history inside the execution's own interval; every parent is an earlier event.
-        if (event.id !== index + 1 || !Number.isInteger(event.previousEventId) || (index === 0 && event.previousEventId !== 0)
-            || (index > 0 && (event.previousEventId! < 1 || event.previousEventId! >= event.id!))
+        // Step Functions can record the initial Init entry with no parent, just like ExecutionStarted.
+        const initialState = index === 1 && type === 'PassStateEntered' && event.stateEnteredEventDetails?.name === 'Init';
+        const minimumParentId = index === 0 || initialState ? 0 : 1;
+        if (event.id !== index + 1 || !Number.isInteger(event.previousEventId)
+            || event.previousEventId! < minimumParentId || event.previousEventId! >= event.id!
             || !(event.timestamp instanceof Date) || !Number.isFinite(event.timestamp.getTime())
             || event.timestamp.getTime() < from || event.timestamp.getTime() > to
             || (index > 0 && event.timestamp.getTime() < events[index - 1]!.timestamp!.getTime())

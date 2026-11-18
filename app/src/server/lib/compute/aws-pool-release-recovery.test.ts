@@ -633,7 +633,8 @@ describe('failed release that never acted (initial observe refused): replayed on
             events.push({ id: n, previousEventId: n - 1, type, timestamp: new Date(at), ...details } as Ev); return n;
         };
         push('ExecutionStarted', { executionStartedEventDetails: { input: work.input, inputDetails: { truncated: false }, stateMachineVersionArn: work.stateMachineArn } });
-        push('PassStateEntered', { stateEnteredEventDetails: { name: 'Init' } }); push('PassStateExited', { stateExitedEventDetails: { name: 'Init' } });
+        push('PassStateEntered', { previousEventId: 0, stateEnteredEventDetails: { name: 'Init' } });
+        push('PassStateExited', { stateExitedEventDetails: { name: 'Init' } });
         push('TaskStateEntered', { stateEnteredEventDetails: { name: over.extraState ?? 'Observe-initial' } });
         for (let n = 0; n <= (over.retries ?? 3); n++) {
             push('LambdaFunctionScheduled', { lambdaFunctionScheduledEventDetails: { resource: 'arn:aws:lambda:ap-south-1:123456789012:function:observer:1', input: '{}' } });
@@ -677,11 +678,17 @@ describe('failed release that never acted (initial observe refused): replayed on
         ['a release that acted (stopInstances scheduled)', 'acted'],
         ['an observe that succeeded (the graph continued)', 'succeeded'],
         ['a task state other than Observe-initial', 'other'],
+        ['an observe entry without a parent', 'orphan'],
     ] as const)('keeps the stopped-host requirement for %s: no reservation, no start', async (_name, kind) => {
         const s = setup(); s.host.state = 'running';
         if (kind === 'acted') withHistory(s, neverActedHistory(s.original, { acted: true }));
         else if (kind === 'succeeded') withHistory(s, neverActedHistory(s.original, { observeSucceeded: true }));
         else if (kind === 'other') withHistory(s, neverActedHistory(s.original, { extraState: 'Observe-stopped' }));
+        else if (kind === 'orphan') {
+            const events = neverActedHistory(s.original);
+            events.find(event => event.type === 'TaskStateEntered')!.previousEventId = 0;
+            withHistory(s, events);
+        }
         else if (kind instanceof Error) withHistory(s, kind);
         await s.tick();
         const after = await s.current();
