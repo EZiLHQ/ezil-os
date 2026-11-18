@@ -520,6 +520,87 @@ acknowledged shell channel, it validates `detail` with the same rules, calls `pr
 alone, so Code shows its own notice. The shell opens the Standard upgrade on Free and Add credits on a paid plan,
 from its own billing summary.
 
+## App preview hooks (`chat-hooks`, `chat-pane`)
+
+These two patches back the agent-first Code layout and the App Preview panel. The full contract is in
+`docs/contracts/code-preview-v1.md`.
+
+Layout needs no patch:
+- EZiL Chat stays in the Secondary Side Bar. `editor-state.sh` sets `workbench.secondarySideBar.defaultVisibility`
+  to `maximized`, so a workspace with no layout state opens on the maximized chat.
+- Upstream CSS already centres it: `.interactive-session{max-width:950px;margin:auto}`.
+- Opening any editor, including the preview WebviewPanel, un-maximizes the aux bar. This is upstream
+  `registerLayoutListeners`, so the same chat widget moves to the right without a session move.
+
+### `chat-hooks`
+
+Anchor `},pe=new YLi;var XLi=class s{`, **one occurrence**. It sits at module level, right after the extension-point
+registry, and is touched by no other patch. The app-failure replacement still ends at `var YLi=` byte for byte, so
+its re-run detection is unchanged.
+
+It inserts three renderer commands with fixed effects. No command id comes from a caller, and nothing calls
+`executeCommand`:
+
+- `_ezil.chatAddContext({v:1, id, name, value, stale})`
+  - Accepts only own data properties.
+  - `id` must match `^ezil-preview:[A-Za-z0-9_-]{22}$`.
+  - `name` is 1–80 chars with no control characters. `value` is 1–4000 chars. `stale` is a boolean.
+  - The target is the widget of a registered ChatViewPane (the visible one wins). With no pane it returns `false`;
+    it never attaches to anything else.
+  - `addContext` adds one `kind:"generic"` string attachment whose `modelDescription` says it is a DOM snapshot,
+    not a source location.
+  - The same id twice adds once, because upstream `addContext` skips existing ids.
+  - Each added id records the chat session that owns it (`viewModel.sessionResource`), bounded to 64 ids.
+  - `stale:true` replaces that id in place with upstream `updateContext([], [entry])`: ` (stale)` goes on the name
+    and a STALE notice on the value. It does so only while the attachment is still there.
+  - If another session is showing, the stale update is queued for the owner session (at most 16 sessions × 32 ids)
+    and the call returns `true`.
+  - The hook subscribes once per widget to `onDidChangeViewModel` and to attachment `added` events. Queued updates
+    then apply when the owner session is back, whichever order VS Code restores its attachments in.
+  - A chip the person removed or sent is never brought back.
+  - It never touches the input text, never sends, and never moves focus. It returns `true` or `false`.
+- `_ezil.previewMint({v:1, id})`
+  - Allows at most 4 pending requests and refuses duplicate ids.
+  - Dispatches the cancelable `ezil-preview-mint` event. When nobody calls `preventDefault()` (no OS bridge), it
+    resolves `{error:"no_shell"}` at once.
+  - Otherwise it waits up to 240 s for `ezil-preview-mint-reply`. The reply listener is installed at load, before
+    any dispatch.
+  - A reply counts only when all of these hold:
+    - its id is pending;
+    - it is exactly `{error}` with `^[a-z_]{1,40}$`, or `{url, expiresAt}`;
+    - `url` is `https:`, has no userinfo and no port, and has an app host:
+      `3002-<id>-app.` or `aws-3002-<id>-aws.`.
+    Anything else is dropped.
+- `_ezil.previewMintCancel({v:1, id})` resolves that pending request with `{error:"cancelled"}` and frees its slot.
+  The App Preview panel calls it when it closes or times out.
+  - A cancel or a renderer timeout also dispatches `ezil-preview-mint-cancel` (`detail` JSON `{v:1, id}`), so the OS
+    bridge can tell the shell to abort that mint.
+  - An answered request does not dispatch it.
+
+### `chat-pane`
+
+Anchor `get widget(){return this._widget}createChatControl(e){let t=E(e,`, **one occurrence**. It calls
+`ezilBindChatPane(this)` before the widget is created. The pane's own `_register` removes it on dispose, so the hook
+looks the widget up lazily and never holds a disposed one.
+
+`--verify` requires zero old anchors and one replacement for each patch, plus each of the three registrations once.
+
+The offline suite applies the patch to a disposable copy of the pristine tree and checks verify and idempotence. It
+then runs the inserted code against the contract vectors:
+- refusals, the no-pane case, draft and focus untouched, same-id and stale replacement;
+- visible-pane choice and disposal;
+- the mint cases: no shell, accepted, refused, late and unknown replies, cancel, timeout, busy and duplicate.
+
+It also checks that verify fails when either hook is missing.
+
+```sh
+COPILOT_TEST_ROOT=/path/to/pristine/lib/vscode node --test worker/copilot-chat/preview-hooks-patch.test.cjs
+```
+
+Any extension in the editor can call these renderer commands, just as it can call `_ezil.billingIntent`. Their effects
+are limited to the above: a visible pending attachment, or a request the EZiL OS window answers only for its own
+computer.
+
 ## Re-deriving the 4.141.0 anchors
 
 The three moved anchors are `token` (`yGe.env.devDeviceId`), `accounts-menu`

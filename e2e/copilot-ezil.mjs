@@ -136,7 +136,6 @@ let capturedRequests = [];
 try {
   await page.goto(`${CODE_URL}/?folder=${encodeURIComponent(FOLDER)}`, { waitUntil: 'domcontentloaded' });
   await page.locator('.monaco-workbench').waitFor({ state: 'visible', timeout: T });
-  await page.locator('.part.sidebar, .part.auxiliarybar').first().waitFor({ state: 'visible', timeout: T });
   check('workbench renders', true);
 
   // 1. Secondary sidebar visible, Chat view active.
