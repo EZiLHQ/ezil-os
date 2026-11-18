@@ -63,6 +63,12 @@ try {
     try {
       await page.goto(`${CODE_URL}/?folder=${encodeURIComponent(FOLDER)}`, { waitUntil: 'domcontentloaded' });
       await ready(FLASH_NAME);
+      const center = await lines.evaluate(element => {
+        const composer = element.closest('.interactive-input-part').getBoundingClientRect();
+        const chat = element.closest('.voice-agent-controls-wrapper').getBoundingClientRect();
+        return Math.abs(composer.top + composer.height / 2 - chat.top - chat.height / 2);
+      });
+      check(`${at}: the empty chat composer starts in the center`, center < 24, `${Math.round(center)} px from center`);
       await page.screenshot({ path: join(OUT, `${v.name}-fresh.png`) });
       check(`${at}: a fresh profile starts on the Gateway's suggested ${FLASH_NAME}`, (await label()) === `Models, ${FLASH_NAME}`, await label());
       let turns = await sendTurn(`EZIL_E2E_KIMI ${v.name} flash`);

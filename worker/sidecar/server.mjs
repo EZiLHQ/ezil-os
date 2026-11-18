@@ -45,6 +45,7 @@ import { pathToFileURL } from 'node:url';
 import { ERROR_CODES } from './contract.mjs';
 import { VERBS } from './verbs.mjs';
 import { redactDeep } from './redact.mjs';
+import { startLocalBrowserSocket } from './local-browser.mjs';
 
 const PORT = Number.parseInt(process.env.EZIL_SIDECAR_PORT ?? '9223', 10) || 9223;
 const HOST = process.env.EZIL_SIDECAR_HOST ?? '0.0.0.0';
@@ -174,6 +175,9 @@ async function startServer () {
     const { BrowserSurface } = await import('./browser.mjs');
     const surface = new BrowserSurface(CDP_URL);
     const server = createSidecarServer(surface);
+    let localServer;
+    try { localServer = startLocalBrowserSocket(surface, process.env.XDG_RUNTIME_DIR); }
+    catch { console.warn('[ezil-sidecar] local browser socket unavailable'); }
     server.listen(PORT, HOST, () => {
         console.log(`[ezil-sidecar] listening on ${HOST}:${PORT}, CDP ${CDP_URL}`);
         console.log(`[ezil-sidecar] verbs: ${ROUTES.join(', ')}`);
@@ -197,6 +201,7 @@ async function startServer () {
     for (const signal of ['SIGTERM', 'SIGINT']) {
         process.on(signal, () => {
             console.log(`[ezil-sidecar] ${signal} — closing`);
+            localServer?.close();
             server.close(() => process.exit(0));
             setTimeout(() => process.exit(0), 2000).unref();
         });

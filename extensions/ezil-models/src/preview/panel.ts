@@ -1,12 +1,14 @@
 import { randomBytes } from 'node:crypto';
 import * as vscode from 'vscode';
-import { record, validateDoc, validateMintReply } from './contract';
+import { record, sameDoc, validToken, validateAgentResult, validateDoc, validateMintReply, type AgentAction, type AgentResult, type PreviewDoc } from './contract';
 import { SelectionContext } from './context';
 import { previewHtml } from './html';
 import { persistedState, safePath, viewport, type PreviewState } from './state';
 
 export const MINT_TIMEOUT_MS = 240_000;
 const token = () => randomBytes(16).toString('base64url');
+const AGENT_TIMEOUT_MS = 5_000;
+type AgentOutcome = AgentResult | { error: string };
 
 export class PreviewPanel implements vscode.Disposable {
     private state: PreviewState;
@@ -18,24 +20,97 @@ export class PreviewPanel implements vscode.Disposable {
     private readonly contexts: SelectionContext;
     private readonly subscriptions: vscode.Disposable[] = [];
     private cancelMint: (() => void) | undefined;
+    private agentDoc: PreviewDoc | undefined;
+    private shared = false;
+    private readonly agentRefs = new Set<string>();
+    private agentPending: { id: string; action: AgentAction['action']; doc: PreviewDoc; finish(result: AgentOutcome, cancel?: boolean): void } | undefined;
 
-    constructor(readonly panel: vscode.WebviewPanel, state?: unknown) {
+    constructor(readonly panel: vscode.WebviewPanel, state?: unknown,
+        private readonly canShare: () => boolean = () => false, private readonly sharingChanged: (shared: boolean) => void = () => {}) {
         this.state = persistedState(state);
         panel.webview.options = { enableScripts: true, localResourceRoots: [] };
         this.contexts = new SelectionContext(token, async attachment =>
             (await vscode.commands.executeCommand('_ezil.chatAddContext', attachment)) === true,
         text => this.showStatus(text));
         this.subscriptions.push(panel.webview.onDidReceiveMessage(message => { void this.receive(message); }), panel.onDidDispose(() => this.dispose()));
+        if (panel.onDidChangeViewState) this.subscriptions.push(panel.onDidChangeViewState(({ webviewPanel }) => {
+            if (!webviewPanel.visible) this.revokeAgent();
+        }));
         this.html();
     }
     private html(mintedUrl = ''): void {
-        this.panel.webview.html = previewHtml(this.panel.webview.cspSource, token(), this.state, this.origin, mintedUrl);
+        this.panel.webview.html = previewHtml(this.panel.webview.cspSource, token(), this.state, this.origin, mintedUrl, this.canShare());
     }
     private post(message: unknown): void {
         if (!this.disposed) void Promise.resolve(this.panel.webview.postMessage(message)).catch(() => {});
     }
     private showStatus(text: string, retry = false): void { this.status = { type: 'status', text, retry }; this.post(this.status); }
-    private invalidate(): void { this.ready = false; this.contexts.reset(); this.post({ type: 'invalidate' }); }
+    private invalidate(): void { this.ready = false; this.agentDoc = undefined; this.revokeAgent(); this.contexts.reset(); this.post({ type: 'invalidate' }); }
+    refreshAgentAvailability(): void { this.post({ type: 'agent-available', available: this.canShare() }); }
+    private clearAgentRequests(): void {
+        this.agentRefs.clear();
+        this.agentPending?.finish({ error: 'stale' }, true);
+    }
+    private revokeAgent(): void {
+        this.clearAgentRequests();
+        if (!this.shared) return;
+        this.shared = false;
+        this.sharingChanged(false);
+        this.post({ type: 'agent-share', enabled: false });
+    }
+    private receiveShare(message: Record<string, unknown>): void {
+        if (message.enabled === false) { this.revokeAgent(); return; }
+        if (message.enabled !== true || !validToken(message.id)) return;
+        if (Object.keys(message).length !== 4 || !this.ready || !this.origin || this.panel.visible === false || !this.canShare()
+            || !validateDoc(message.doc) || !sameDoc(this.agentDoc, message.doc)) {
+            this.revokeAgent();
+            this.post({ type: 'agent-share', enabled: false });
+            return;
+        }
+        this.shared = true;
+        this.sharingChanged(true);
+        this.post({ type: 'agent-share', enabled: true, id: message.id, doc: message.doc });
+    }
+    private receiveAgentResult(message: Record<string, unknown>): void {
+        const pending = this.agentPending;
+        if (!this.shared || !pending || Object.keys(message).length !== 4 || message.id !== pending.id || !validateDoc(message.doc)
+            || !sameDoc(this.agentDoc, message.doc) || !sameDoc(pending.doc, message.doc) || !validateAgentResult(message.result)) return;
+        const result = message.result;
+        if ('controls' in result) {
+            if (pending.action !== 'read') return;
+            for (const item of result.controls) this.agentRefs.add(item.ref);
+        } else if ('clicked' in result && pending.action !== 'click') return;
+        pending.finish(result);
+    }
+    runAgent(action: AgentAction, cancellationToken: vscode.CancellationToken): Promise<AgentOutcome> {
+        const doc = this.agentDoc;
+        if (this.disposed || !this.shared || !this.ready || !doc || this.panel.visible === false || !this.canShare()) {
+            return Promise.resolve({ error: 'Share the current App Preview with Agent first.' });
+        }
+        if (cancellationToken.isCancellationRequested) return Promise.resolve({ error: 'Cancelled.' });
+        if (this.agentPending) return Promise.resolve({ error: 'Another preview request is pending.' });
+        if (action.action === 'click' && !this.agentRefs.has(action.ref)) {
+            return Promise.resolve({ error: 'Read the current App Preview to get fresh control references.' });
+        }
+        this.agentRefs.clear();
+        const id = token();
+        return new Promise(resolve => {
+            let cancellation: vscode.Disposable | undefined;
+            const finish = (result: AgentOutcome, cancel = false) => {
+                if (this.agentPending?.id !== id) return;
+                this.agentPending = undefined;
+                clearTimeout(timeout);
+                cancellation?.dispose();
+                if (cancel) this.post({ type: 'agent-cancel', id });
+                resolve(result);
+            };
+            const timeout = setTimeout(() => finish({ error: 'Preview request timed out.' }, true), AGENT_TIMEOUT_MS);
+            this.agentPending = { id, doc, action: action.action, finish };
+            cancellation = cancellationToken.onCancellationRequested(() => finish({ error: 'Cancelled.' }, true));
+            if (cancellationToken.isCancellationRequested) finish({ error: 'Cancelled.' }, true);
+            else if (this.agentPending?.id === id) this.post({ type: 'agent', id, doc, ...action });
+        });
+    }
     async start(): Promise<void> { await this.mint(); }
     private async mint(target: 'frame' | 'external' = 'frame'): Promise<void> {
         if (this.minting || this.disposed) return;
@@ -102,18 +177,24 @@ export class PreviewPanel implements vscode.Disposable {
         switch (message.type) {
             case 'boot': this.post(this.status); return;
             case 'mode': this.contexts.selecting = message.mode === 'select'; return;
-            case 'loading': this.ready = false; this.contexts.reset(); return;
+            case 'loading': this.ready = false; this.agentDoc = undefined; this.revokeAgent(); this.contexts.reset(); return;
             case 'viewport': this.state.viewport = viewport(message.viewport); return;
+            case 'agent-share': this.receiveShare(message); return;
+            case 'agent-result': this.receiveAgentResult(message); return;
             case 'select': await this.contexts.select(message.sel); return;
             case 'ready': case 'changed': case 'navigate':
                 if (!validateDoc(message.doc) || (message.type !== 'ready' && !this.ready)) return;
+                if (message.type === 'navigate' || (this.agentDoc && (message.doc.gen !== this.agentDoc.gen || message.doc.path !== this.agentDoc.path))) {
+                    this.revokeAgent();
+                } else if (!sameDoc(this.agentDoc, message.doc)) this.clearAgentRequests();
+                this.agentDoc = message.doc;
                 this.state.path = message.doc.path;
                 if (message.type === 'ready') { this.ready = true; this.showStatus('Preview ready.'); }
                 await this.contexts.observe(message.doc);
                 return;
             case 'state':
                 if (typeof message.state !== 'string' || !/^[a-z_]{1,40}$/.test(message.state)) return;
-                this.ready = false; this.contexts.reset(); this.showStatus(message.state, true); return;
+                this.ready = false; this.agentDoc = undefined; this.revokeAgent(); this.contexts.reset(); this.showStatus(message.state, true); return;
             case 'retry': case 'reload':
                 await this.mint();
                 return;
@@ -130,6 +211,7 @@ export class PreviewPanel implements vscode.Disposable {
     dispose(): void {
         if (this.disposed) return;
         this.disposed = true;
+        this.revokeAgent();
         this.cancelMint?.();
         this.contexts.dispose();
         for (const subscription of this.subscriptions) subscription.dispose();
@@ -140,13 +222,18 @@ export function registerPreview(context: vscode.ExtensionContext): void {
     let current: PreviewPanel | undefined;
     let opening: Promise<void> | undefined;
     let disposed = false;
+    let toolsAvailable = false;
+    const canShare = () => toolsAvailable && vscode.workspace?.isTrusted === true;
+    const updateContext = (shared: boolean) => {
+        void Promise.resolve(vscode.commands.executeCommand('setContext', 'ezil.previewShared', shared)).catch(() => {});
+    };
     // Own panel cleanup before registering anything that can open or restore a panel.
     const subscriptions: vscode.Disposable[] = [{ dispose: () => {
         const preview = current;
-        current = undefined;
         if (preview) {
             try { preview.dispose(); } finally { preview.panel.dispose(); }
         }
+        current = undefined;
     } }];
     const dispose = () => {
         if (disposed) return;
@@ -161,7 +248,10 @@ export function registerPreview(context: vscode.ExtensionContext): void {
     };
     const adopt = (panel: vscode.WebviewPanel, state?: unknown) => {
         if (disposed) { panel.dispose(); return; }
-        const preview = new PreviewPanel(panel, state);
+        if (current) { current.dispose(); current.panel.dispose(); }
+        const preview = new PreviewPanel(panel, state, canShare, shared => {
+            if (current === preview) updateContext(shared);
+        });
         current = preview;
         subscriptions.push(panel.onDidDispose(() => { if (current === preview) current = undefined; }));
         return preview;
@@ -194,6 +284,28 @@ export function registerPreview(context: vscode.ExtensionContext): void {
         status.tooltip = 'EZiL: Open App Preview';
         status.command = 'ezil.preview.open';
         status.show();
+        if (typeof vscode.lm?.registerTool === 'function') {
+            const register = (name: string, parse: (input: unknown) => AgentAction | undefined) => vscode.lm.registerTool(name, {
+                async invoke(options, cancellationToken) {
+                    const action = parse(options.input);
+                    const preview = current;
+                    const result = !action ? { error: 'Invalid preview tool input.' } : preview
+                        ? await preview.runAgent(action, cancellationToken) : { error: 'Open App Preview and share it with Agent first.' };
+                    return new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(JSON.stringify(result))]);
+                },
+            });
+            let readTool: vscode.Disposable | undefined;
+            try {
+                readTool = register('ezil_preview_read', input => record(input) && Object.keys(input).length === 0 ? { action: 'read' } : undefined);
+                const clickTool = register('ezil_preview_click', input => record(input) && Object.keys(input).length === 1 && validToken(input.ref)
+                    ? { action: 'click', ref: input.ref } : undefined);
+                subscriptions.push(readTool, clickTool);
+                toolsAvailable = true;
+                updateContext(false);
+                current?.refreshAgentAvailability();
+            } catch { readTool?.dispose(); }
+            if (toolsAvailable) subscriptions.push(vscode.workspace.onDidGrantWorkspaceTrust(() => current?.refreshAgentAvailability()));
+        }
         // Publish only the completed registration; the bag also owns later panel listeners.
         context.subscriptions.push({ dispose });
     } catch (error) {

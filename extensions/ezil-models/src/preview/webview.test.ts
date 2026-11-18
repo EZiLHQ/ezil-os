@@ -26,10 +26,12 @@ function browser(script = previewScript) {
         emit(type: string, event?: unknown) { this.listeners.get(type)?.(event); }
     }
     const elements = new Map<string, Element>();
-    for (const id of ['app', 'address', 'back', 'forward', 'reload', 'external', 'retry', 'viewport', 'select', 'interact', 'status']) elements.set(id, new Element());
+    for (const id of ['app', 'address', 'back', 'forward', 'reload', 'external', 'retry', 'viewport', 'select', 'interact', 'share', 'status']) elements.set(id, new Element());
     const frame = elements.get('app')!;
     frame.dataset = { origin, url: `${origin}/preview-bootstrap?token=PRIVATE`, path: '/saved?token=OLD&tab=2', viewport: '390x844' };
-    const window = new Element();
+    const window = Object.assign(new Element(), { origin: 'https://webview.test' });
+    Object.assign(window, { parent: window, top: window }); // VS Code's preloader masks these getters.
+    const preloader = { frames: [window] };
     runInNewContext(script, {
         window, document: { getElementById: (id: string) => elements.get(id) },
         acquireVsCodeApi: () => ({ postMessage: (value: unknown) => posts.push(value), setState: (state: unknown) => states.push(state) }),
@@ -41,8 +43,8 @@ function browser(script = previewScript) {
         source: frame.contentWindow, origin,
         data: { type: `ezil.preview.${type}`, v: 1, nonce: hellos.filter(value => value.message.type === 'ezil.preview.hello').at(-1)?.message.nonce, ...payload }, ...overrides,
     });
-    const host = (message: unknown) => window.emit('message', { source: null, data: message });
-    return { posts, states, hellos, timers, elements, frame, send, host };
+    const host = (message: unknown, overrides = {}) => window.emit('message', { source: null, data: message, ...overrides });
+    return { posts, states, hellos, timers, elements, frame, send, host, preloader, webviewOrigin: window.origin };
 }
 
 test('browser persists only safe state and waits for ready after every load', () => {
@@ -97,6 +99,47 @@ test('browser forwards only valid frame messages in the current document and use
     for (const timer of b.timers) if (!timer.cancelled) timer.fn();
     expect(b.elements.get('status')!.textContent).toBe('upstream_error');
     b.host({ type: 'load', url: 'https://3002-other-app.ezil.org/' }); expect(b.frame.src).toBe(`${origin}/new`);
+});
+
+test('only the current shared frame can answer an agent request and navigation revokes the share', () => {
+    const b = browser(sourceScript);
+    const share = b.elements.get('share')!;
+    const id = 'CCCCCCCCCCCCCCCCCCCCCC';
+    const request = { type: 'agent', action: 'read', id, doc: sel.doc };
+    b.frame.emit('load');
+    b.send('ready', { doc: sel.doc });
+    b.host(request);
+    expect(b.hellos.some(value => value.message.type === 'ezil.preview.agent')).toBe(false);
+    share.emit('click', { isTrusted: false });
+    expect(b.posts.at(-1).type).not.toBe('agent-share');
+    share.emit('click', { isTrusted: true });
+    const consent = b.posts.at(-1);
+    expect(consent).toMatchObject({ type: 'agent-share', enabled: true, doc: sel.doc });
+    expect(share.attrs.get('aria-pressed')).toBe('false');
+    b.host(consent, { source: b.preloader, origin, isTrusted: true });
+    b.host(consent, { source: { frames: [{}] }, origin: b.webviewOrigin, isTrusted: true });
+    b.host(consent, { source: b.preloader, origin: b.webviewOrigin, isTrusted: false });
+    expect(share.attrs.get('aria-pressed')).toBe('false');
+    b.host(consent, { source: b.preloader, origin: b.webviewOrigin, isTrusted: true });
+    expect(share.attrs.get('aria-pressed')).toBe('true');
+    b.host(request);
+    expect(b.hellos.at(-1)).toMatchObject({ target: origin, message: { ...request, type: 'ezil.preview.agent', v: 1 } });
+    const reply = { id, doc: sel.doc, result: { controls: [{ ref: 'DDDDDDDDDDDDDDDDDDDDDD', kind: 'button', label: 'Save' }] } };
+    const before = b.posts.length;
+    b.send('agent-result', reply, { source: {} });
+    b.send('agent-result', reply, { origin: 'https://other.test' });
+    b.send('agent-result', { ...reply, nonce: 'BBBBBBBBBBBBBBBBBBBBBB' });
+    expect(b.posts).toHaveLength(before);
+    b.send('agent-result', reply);
+    expect(b.posts.at(-1)).toEqual({ type: 'agent-result', ...reply });
+    b.send('changed', { doc: { ...sel.doc, mut: sel.doc.mut + 1 } });
+    expect(share.attrs.get('aria-pressed')).toBe('true');
+    b.send('navigate', { doc: { ...sel.doc, path: '/next', mut: sel.doc.mut + 2 } });
+    expect(share.attrs.get('aria-pressed')).toBe('false');
+    expect(share.hidden).toBe(false);
+    expect(b.hellos.at(-1).message).toMatchObject({ type: 'ezil.preview.share', enabled: false });
+    b.host(consent);
+    expect(share.attrs.get('aria-pressed')).toBe('false');
 });
 
 

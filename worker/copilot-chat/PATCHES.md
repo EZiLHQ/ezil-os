@@ -525,10 +525,10 @@ from its own billing summary.
 These two patches back the agent-first Code layout and the App Preview panel. The full contract is in
 `docs/contracts/code-preview-v1.md`.
 
-Layout needs no patch:
+The layout keeps the same chat widget throughout:
 - EZiL Chat stays in the Secondary Side Bar. `editor-state.sh` sets `workbench.secondarySideBar.defaultVisibility`
   to `maximized`, so a workspace with no layout state opens on the maximized chat.
-- Upstream CSS already centres it: `.interactive-session{max-width:950px;margin:auto}`.
+- Upstream CSS constrains the chat width. The compact layout CSS also centers the composer vertically when the maximized chat has no conversation or history rows. The rows stay mounted so an incoming turn restores the regular layout.
 - Opening any editor, including the preview WebviewPanel, un-maximizes the aux bar. This is upstream
   `registerLayoutListeners`, so the same chat widget moves to the right without a session move.
 

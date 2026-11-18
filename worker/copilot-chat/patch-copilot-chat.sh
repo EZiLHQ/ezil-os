@@ -191,6 +191,10 @@ CSS="$ROOT/out/vs/code/browser/workbench/workbench.css"
 A_CSS='.chat-welcome-view .chat-welcome-view-message,.chat-welcome-view .chat-welcome-view-disclaimer,.chat-welcome-view .chat-welcome-view-tips{display:none}'
 # The previous build's notice under the input; must not come back.
 OLD_CSS_NOTICE='.interactive-input-part::after{content:"AI responses may be inaccurate.'
+# Center the existing composer only for an empty, maximized chat. Keep the
+# history and message lists laid out so a newly rendered row restores the
+# ordinary layout immediately without replacing the chat widget or its draft.
+P_EMPTY_CHAT='.monaco-workbench.nomaineditorarea .part.auxiliarybar .chat-viewpane.ezil-compact-chat:has(>.voice-agent-controls-wrapper>.chat-controls-container .chat-welcome-view-container:not(.hidden)):not(:has(.agent-sessions-viewer .monaco-list-row,.agent-sessions-empty-filter-message[aria-hidden="false"],.interactive-list .monaco-list-row))'
 R_CSS_LAYOUT="$(printf '%s' \
   '.chat-viewpane.ezil-compact-chat>.chat-view-title-container .chat-view-title-inner{flex-wrap:wrap;column-gap:2px;row-gap:2px;min-height:30px}' \
   '.chat-viewpane.ezil-compact-chat>.chat-view-title-container .chat-view-title-navigation-toolbar{flex:1 1 96px;min-width:64px}' \
@@ -202,7 +206,12 @@ R_CSS_LAYOUT="$(printf '%s' \
   '.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-toolbars{min-width:0!important}' \
   '.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-container{container:ezil-composer/inline-size}' \
   '@container ezil-composer (max-width:207px){.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-toolbars{flex-wrap:wrap;row-gap:4px}.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-toolbars>.chat-input-toolbar{flex:1 0 100%;min-width:0!important}.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-toolbars>.chat-input-toolbar .model-picker-item{min-width:56px!important}.chat-viewpane.ezil-compact-chat .interactive-session>.interactive-input-part .chat-input-toolbars>.chat-execute-toolbar{margin-left:auto}}' \
-  '.chat-viewpane .chat-getting-started-tip-container{display:none!important}')"
+  '.chat-viewpane .chat-getting-started-tip-container{display:none!important}' \
+  "${P_EMPTY_CHAT}>.chat-view-title-container,${P_EMPTY_CHAT} .agent-sessions-container{visibility:hidden}" \
+  "${P_EMPTY_CHAT}>.voice-agent-controls-wrapper{position:relative}" \
+  "${P_EMPTY_CHAT}>.voice-agent-controls-wrapper>.chat-controls-container{position:absolute;inset:0;z-index:1}" \
+  "${P_EMPTY_CHAT} .chat-controls-container>.interactive-session{justify-content:center}" \
+  "${P_EMPTY_CHAT} .chat-welcome-view-container{display:none}")"
 # workbench.js `chat-header`: ChatViewPane.createControls gains a call to a new method that moves the
 # input part's secondary toolbar node into the title row (see PATCHES.md for every name it relies on).
 A_CHAT_HEADER='createControls(e){let t=this.createSessionsControl(e),i=this.welcomeController=this._register(this.instantiationService.createInstance(P3e,e,this,"panel")),n=this.createChatControl(e);this.registerControlsListeners(t,n,i),this.updateSessionsControlVisibility()}'

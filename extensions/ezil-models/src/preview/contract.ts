@@ -16,6 +16,9 @@ const ATTRS = ['href', 'src', 'alt', 'type', 'placeholder', 'aria-label', 'data-
 const STYLES = ['color', 'background-color', 'font-family', 'font-size', 'font-weight', 'line-height', 'text-align', 'display', 'position', 'margin', 'padding', 'border', 'border-radius', 'width', 'height', 'gap', 'flex-direction', 'justify-content', 'align-items'];
 
 export interface PreviewDoc { gen: string; mut: number; path: string; title: string }
+export type AgentAction = { action: 'read' } | { action: 'click'; ref: string };
+export interface AgentControl { ref: string; kind: 'button' | 'link'; label: string }
+export type AgentResult = { controls: AgentControl[] } | { clicked: true } | { error: 'stale' | 'refused' };
 interface ElementIdentity { tag: string; id?: string; classes: string[] }
 export interface Selection {
     doc: PreviewDoc;
@@ -70,6 +73,27 @@ export function validPath(value: unknown): value is string {
 export function validateDoc(value: unknown): value is PreviewDoc {
     return record(value) && keys(value, ['gen', 'mut', 'path', 'title']) && typeof value.gen === 'string' && TOKEN.test(value.gen)
         && integer(value.mut, 0) && validPath(value.path) && string(value.title, 120);
+}
+export function sameDoc(first: PreviewDoc | undefined, second: PreviewDoc): boolean {
+    return !!first && first.gen === second.gen && first.mut === second.mut && first.path === second.path && first.title === second.title;
+}
+export function validToken(value: unknown): value is string {
+    return typeof value === 'string' && TOKEN.test(value);
+}
+export function validateAgentAction(value: Record<string, unknown>): value is Record<string, unknown> & AgentAction {
+    return (value.action === 'read' && !Object.hasOwn(value, 'ref')) || (value.action === 'click' && validToken(value.ref));
+}
+export function validateAgentResult(value: unknown): value is AgentResult {
+    if (!record(value) || Object.keys(value).length !== 1) return false;
+    if (value.error === 'stale' || value.error === 'refused' || value.clicked === true) return true;
+    if (!Array.isArray(value.controls) || value.controls.length > 24) return false;
+    const seen = new Set<string>();
+    return value.controls.every(control => {
+        if (!record(control) || !keys(control, ['ref', 'kind', 'label']) || !validToken(control.ref) || seen.has(control.ref)
+            || (control.kind !== 'button' && control.kind !== 'link') || !string(control.label, 80) || !control.label) return false;
+        seen.add(control.ref);
+        return true;
+    });
 }
 function identity(value: Record<string, unknown>): boolean {
     return typeof value.tag === 'string' && TAG.test(value.tag) && (value.id === undefined || string(value.id, 64))

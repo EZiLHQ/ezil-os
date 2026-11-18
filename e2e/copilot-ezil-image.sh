@@ -13,8 +13,8 @@ OUT="$(mkdir -p "${EZIL_COPILOT_E2E_OUT:-./ezil-e2e-out}" && cd "${EZIL_COPILOT_
 CODE_URL=""
 FORWARD_PORT="${EZIL_COPILOT_E2E_PORT:-18443}"
 FORWARD_PID=""
-# Passes to run, in order (default all): fresh returning history sessions compaction phone early subagent flash plan
-PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions compaction phone early subagent flash plan} "
+# Passes to run, in order (default all): fresh returning history sessions compaction phone early subagent flash plan local_browser
+PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions compaction phone early subagent flash plan local_browser} "
 MOCK_PORT=4142
 TEST_TOKEN=lanec-e2e-only
 CAPTURE_DIR=/tmp/copilot-ezil-mock
@@ -358,6 +358,21 @@ EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER=
   EZIL_E2E_OUT="$OUT/plan" node "$here/copilot-ezil-plan.mjs" || fail=1
 collect_logs plan
 network_checks plan || fail=1
+fi
+
+# ── Pass 10: Code reads and clicks the explicitly shared desktop Chrome tab ──
+if [[ "$PASSES" == *" local_browser "* ]]; then
+echo "[e2e] pass 10 — local browser: Gemini tool calls reach the shared native tab"
+ST11="$WORK/local-browser"; mkdir -p "$ST11/home/neko/project" "$ST11/etc/ezil"
+printf 'before\n' >"$ST11/home/neko/project/existing.txt"
+cp "$here/copilot-ezil-models.json" "$ST11/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$ST11"
+start_mock flash || fail=1
+EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" \
+  EZIL_E2E_OUT="$OUT/local-browser" node "$here/copilot-ezil-local-browser.mjs" || fail=1
+collect_logs local-browser
+network_checks local-browser || fail=1
 fi
 rm -rf "$WORK" 2>/dev/null || true
 if [[ $fail == 0 ]]; then echo "[e2e] ALL PASSED — artifacts in $OUT"; else echo "[e2e] FAILURES — see $OUT" >&2; fi

@@ -1680,6 +1680,8 @@ class PreviewElement {
   childNodes: any[] = [];
   hidden = false;
   isContentEditable = false;
+  isConnected = true;
+  clicks = 0;
   style: Record<string, string> = {};
   rect = { x: 1.4, y: -2.6, width: 120.2, height: 30.8 };
   constructor(public tagName = 'BUTTON', public attrs: Record<string, string> = {}) { this.tagName = tagName.toUpperCase(); }
@@ -1691,7 +1693,13 @@ class PreviewElement {
   }
   getAttribute(k: string) { return this.attrs[k] ?? null; }
   hasAttribute(k: string) { return Object.hasOwn(this.attrs, k); }
-  getBoundingClientRect() { return this.rect; }
+  getBoundingClientRect() {
+    return { ...this.rect, left: this.rect.x, top: this.rect.y, right: this.rect.x + this.rect.width, bottom: this.rect.y + this.rect.height };
+  }
+  matches() { return this.hasAttribute('disabled'); }
+  closest() { return this.hidden || this.hasAttribute('inert') || this.getAttribute('aria-hidden') === 'true' || this.getAttribute('aria-disabled') === 'true' ? this : this.parentElement?.closest(); }
+  contains(target: PreviewElement | null) { return !!target && (target === this || this.contains(target.parentElement)); }
+  click() { this.clicks++; }
   append(...nodes: Array<PreviewElement | string>) {
     for (const node of nodes) {
       const child = typeof node === 'string' ? { nodeType: 3, textContent: node, parentElement: this } : node;
@@ -1707,11 +1715,16 @@ function inspector(script = previewInspectorScript([INSPECTOR_PARENT]), capture?
   const messages: any[] = [], winListeners: Record<string, Function[]> = {}, docListeners: Record<string, Function[]> = {};
   const parent = { postMessage(data: any, origin: string) { messages.push({ data: structuredClone(data), origin }); } };
   const window = { parent, innerWidth: 1280, innerHeight: 800, devicePixelRatio: 2, addEventListener(t: string, fn: Function) { (winListeners[t] ??= []).push(fn); } };
-  const document = { title: 'Pricing', querySelector: () => viteClient ? { src: '/@vite/client' } : null, addEventListener(t: string, fn: Function) { (docListeners[t] ??= []).push(fn); } };
+  let controls: PreviewElement[] = [];
+  const document = { title: 'Pricing', body: {}, querySelector: () => viteClient ? { src: '/@vite/client' } : null,
+    createTreeWalker() { let index = 0; return { nextNode: () => controls[index++] }; },
+    elementFromPoint(x: number) { return controls.find(el => el.rect.x <= x && x <= el.rect.x + el.rect.width); },
+    addEventListener(t: string, fn: Function) { (docListeners[t] ??= []).push(fn); } };
   const location = new URL('https://3002-guac-u-c-app.ezil.org/preview/pricing?token=private&plan=pro#faq');
   const history = { pushState(_a: unknown, _b: unknown, path: string) { location.href = new URL(path, location).href; },
     replaceState(_a: unknown, _b: unknown, path: string) { location.href = new URL(path, location).href; } };
   const context = { window, document, location, history, URL, URLSearchParams, crypto, Uint8Array, btoa, loadVite: async () => viteClient,
+    NodeFilter: { SHOW_ELEMENT: 1 }, HTMLElement: PreviewElement,
     getComputedStyle: (el: PreviewElement) => ({ ...el.style, getPropertyValue: (k: string) => el.style[k] ?? '' }),
     MutationObserver: class { constructor(fn: Function) { mutation = fn; } observe() {} },
     Date: { now: () => now }, setTimeout: (fn: Function, delay: number) => { timers.set(++counter, { at: now + delay, fn }); return counter; }, capture };
@@ -1738,11 +1751,42 @@ function inspector(script = previewInspectorScript([INSPECTOR_PARENT]), capture?
     now = until;
   };
   const selects = () => messages.filter(m => m.data.type === 'ezil.preview.select').map(m => m.data.sel);
-  return { messages, message, hello, mode, event, advance, selects, history, location, document, mutate: () => mutation() };
+  return { messages, message, hello, mode, event, advance, selects, history, location, document, mutate: () => mutation(), controls: (list: PreviewElement[]) => { controls = list; } };
 }
 const previewVectors = JSON.parse(readFileSync(new URL('../../docs/contracts/code-preview-v1.vectors.json', import.meta.url), 'utf8'));
 
 describe('strict preview inspector v1', () => {
+  it('shares only bounded visible controls, accepts only fresh opaque refs and revokes on navigation', () => {
+    const b = inspector();
+    const labels = [new PreviewElement('button').append('Save'), new PreviewElement('a', { href: '/next' }).append('Next'),
+      new PreviewElement('a', { href: 'https://elsewhere.test/' }).append('External'),
+      new PreviewElement('button', { disabled: '' }).append('Disabled'),
+      new PreviewElement('input', { type: 'password' }).append('Never expose this')];
+    labels.forEach((el, i) => { el.rect.x = i * 200; });
+    b.controls(labels);
+    b.hello();
+    const document = b.messages[0].data.doc;
+    const share = { type: 'ezil.preview.share', v: 1, nonce: INSPECTOR_NONCE, enabled: true };
+    const read = { type: 'ezil.preview.agent', v: 1, nonce: INSPECTOR_NONCE, action: 'read', id: 'CCCCCCCCCCCCCCCCCCCCCC', doc: document };
+    b.message(read); expect(b.messages).toHaveLength(1);
+    b.message(share, { origin: 'https://other.test' });
+    b.message(share, { source: {} });
+    b.message(read); expect(b.messages).toHaveLength(1);
+    b.message(share);
+    b.message(read);
+    const { controls } = b.messages.at(-1).data.result;
+    expect(controls.map(({ kind, label }: any) => ({ kind, label }))).toEqual([{ kind: 'button', label: 'Save' }, { kind: 'link', label: 'Next' }]);
+    const click = { ...read, id: 'DDDDDDDDDDDDDDDDDDDDDD', action: 'click', ref: controls[0].ref };
+    b.message({ ...click, selector: 'button' }); expect(labels[0]!.clicks).toBe(0);
+    b.message(click); expect(labels[0]!.clicks).toBe(1); expect(b.messages.at(-1).data.result).toEqual({ clicked: true });
+    b.message(click); expect(labels[0]!.clicks).toBe(1); expect(b.messages.at(-1).data.result).toEqual({ error: 'refused' });
+    b.mutate(); b.message(read); expect(b.messages.at(-1).data.result).toEqual({ error: 'stale' });
+    b.advance(300); b.message({ ...read, doc: b.messages.at(-1).data.doc });
+    expect(b.messages.at(-1).data.result.controls).toHaveLength(2);
+    b.history.pushState({}, '', '/next');
+    const before = b.messages.length;
+    b.message(read); expect(b.messages).toHaveLength(before);
+  });
   it('requires the parent/origin/nonce handshake, never uses wildcard targets, and ignores selections in interact mode', () => {
     const b = inspector(), el = new PreviewElement().append('Sign up'), hello = { type: 'ezil.preview.hello', v: 1, nonce: INSPECTOR_NONCE };
     for (const over of [{ source: {} }, { origin: 'https://other.test' }, { origin: '*' }, { origin: 'null' }]) b.message(hello, over);

@@ -73,7 +73,11 @@ test('compact chat layout: CSS, Add Context move, header method', { skip: !sourc
       const rules = tail.trim().split('}').filter(Boolean);
       assert(rules.length >= 7, String(rules.length));
       // Every rule is scoped to the chat view, also inside the narrow-composer container query.
-      for (const r of rules) assert.match(r.trim().replace(/^@container ezil-composer \(max-width:207px\)\{/, ''), /^\.chat-viewpane[.\s]/, r);
+      for (const r of rules) {
+        const selector = r.trim().replace(/^@container ezil-composer \(max-width:207px\)\{/, '');
+        assert.match(selector, /^(?:\.monaco-workbench\.nomaineditorarea \.part\.auxiliarybar )?\.chat-viewpane[.\s]/, r);
+      }
+      assert(style.includes('.interactive-list .monaco-list-row)) .chat-controls-container>.interactive-session{justify-content:center}'));
       assert.equal(style.split('@container ezil-composer (max-width:207px){').length, 2);
       assert(style.includes('.chat-input-toolbars>.chat-input-toolbar .model-picker-item{min-width:56px!important}'));
       assert.equal(style.split('.chat-viewpane .chat-getting-started-tip-container{display:none!important}').length, 2);

@@ -6,9 +6,9 @@ Status: accepted for implementation, 2026-11-17 (task 41b7021e, agent-first Code
 
 - The bundled EZiL Chat stays in the Secondary Side Bar (aux bar) for its whole life. Nothing moves the chat widget,
   re-creates it, or opens it in an editor.
-- A new profile starts with `workbench.secondarySideBar.defaultVisibility: "maximized"` (editor-state.sh). This makes
-  the chat fill the workbench with a centred composer. VS Code applies that default to new profiles only, so a
-  returning user's own layout is kept.
+- A new profile starts with `workbench.secondarySideBar.defaultVisibility: "maximized"` (editor-state.sh). When the
+  maximized chat is empty, the composer is centered vertically. Conversation and history rows restore the regular
+  chat layout. VS Code preserves a returning user's layout.
 - Opening the preview runs `workbench.action.restoreAuxiliaryBar` when the aux bar is maximized, and opens the
   extension-owned WebviewPanel `ezil.preview` in the editor area with `preserveFocus: true`. The Explorer stays native
   on the left. The result is files left, preview centre and chat right, in the same widget.
@@ -27,6 +27,22 @@ those checks:
 3. The only effect of a valid selection is one visible pending attachment on the existing composer. Nothing is sent
    until the user presses Send.
 4. No message from any frame may run a command, start inference, write a file, change a port or reveal a credential.
+
+## Browser tools in Agent mode
+
+Choose **Share with Agent** in App Preview to let the Code Agent read the visible controls on that page and click a
+control. Sharing requires a trusted workspace. The tools accept only references issued by the latest read. Reload,
+navigation, closing or hiding the panel, and stopping sharing end access. DOM updates invalidate references while
+keeping the current page shared. **Select** still attaches an element to the draft so you can describe the edit.
+
+The **EZiL: Share Local Browser with Agent** command shares a chosen localhost tab in the running EZiL OS
+Chrome. Playwright attaches from inside the workspace and acts on the selected tab. The tab and origin stay
+bound to the grant. Access ends after ten minutes, on tab close, when the tab leaves that origin, or from
+**EZiL: Stop Sharing Local Browser**. The editor extension talks to the browser sidecar over a local Unix socket.
+
+Both paths are available to eligible EZiL AI models through normal Code Agent tool calls. The gateway catalog
+selects the initial model, and a user's eligible model choice persists. A browser click changes the running page.
+Use the usual Code Agent edit tools to change source files and read the preview again to verify the result.
 
 ## Hop 1: inspector (app frame) ↔ preview host (webview content document)
 

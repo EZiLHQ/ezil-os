@@ -58,13 +58,48 @@ afterEach(() => {
     for (const item of subscriptions.splice(0)) item.dispose();
     for (const [i, target] of [window, commands, env].entries()) { for (const key of Object.keys(target)) delete target[key]; Object.assign(target, saved[i]); }
 });
-function create(state?: unknown) {
+function create(state?: unknown, canShare?: () => boolean, sharingChanged?: (shared: boolean) => void) {
     const panel = new FakePanel();
-    const preview = new PreviewPanel(panel as unknown as vscode.WebviewPanel, state);
+    const preview = new PreviewPanel(panel as unknown as vscode.WebviewPanel, state, canShare, sharingChanged);
     extensions.push(preview);
     return { panel, preview };
 }
 function register() { registerPreview({ subscriptions, extensionUri: new URL('file:///extension') } as unknown as vscode.ExtensionContext); }
+
+test('agent tools require explicit trusted consent and only accept refs from the latest current document', async () => {
+    let trusted = false;
+    const states: boolean[] = [];
+    const { panel, preview } = create(undefined, () => trusted, shared => states.push(shared));
+    const cancel = { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) };
+    const consent = { type: 'agent-share', enabled: true, doc, id: 'AAAAAAAAAAAAAAAAAAAAAA' };
+    const controls = [{ ref: 'BBBBBBBBBBBBBBBBBBBBBB', kind: 'button' as const, label: 'Save' }];
+    const read = { action: 'read' } as const;
+    await preview.start();
+    await preview.receive({ type: 'ready', doc });
+    await preview.receive(consent);
+    expect(await preview.runAgent(read, cancel)).toHaveProperty('error');
+    expect(states).toEqual([]);
+    trusted = true;
+    await preview.receive(consent);
+    expect(states).toEqual([true]);
+    expect(await preview.runAgent({ action: 'click', ref: controls[0]!.ref }, cancel)).toHaveProperty('error');
+    const reply = (result: unknown) => preview.receive({ type: 'agent-result', id: panel.messages.at(-1).id, doc, result });
+    const pending = preview.runAgent(read, cancel);
+    await reply({ controls });
+    expect(await pending).toEqual({ controls });
+    const clicked = preview.runAgent({ action: 'click', ref: controls[0]!.ref }, cancel);
+    await reply({ clicked: true });
+    expect(await clicked).toEqual({ clicked: true });
+    expect(await preview.runAgent({ action: 'click', ref: controls[0]!.ref }, cancel)).toHaveProperty('error');
+    const stale = preview.runAgent(read, cancel);
+    const revision = { ...doc, mut: doc.mut + 1 };
+    await preview.receive({ type: 'changed', doc: revision });
+    expect(await stale).toEqual({ error: 'stale' });
+    expect(states).toEqual([true]);
+    await preview.receive({ type: 'navigate', doc: { ...revision, path: '/next' } });
+    expect(states).toEqual([true, false]);
+    expect(await preview.runAgent(read, cancel)).toHaveProperty('error');
+});
 
 for (const failure of ['command', 'serializer', 'status creation', 'status text', 'status tooltip', 'status command', 'status show']) {
     test(`preview registration rolls back ${failure} without publishing partial resources`, async () => {

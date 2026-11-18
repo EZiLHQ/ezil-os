@@ -73,13 +73,27 @@ function scriptedContent(body, folder) {
   const history = body.messages.flatMap(turn => Array.isArray(turn.content) ? turn.content : []);
   // The scenario is the newest user prompt that carries a marker: a chat may continue an earlier one.
   const turnText = turn => (typeof turn.content === 'string' ? [turn.content] : turn.content.filter(block => block.type === 'text').map(block => block.text)).join('\n');
-  const marked = body.messages.filter(turn => turn.role === 'user').map(turnText).reverse().find(t => /EZIL_E2E_(UNDO|AGENT|KIMI|SLOW|LONG|SUBAGENT|CHILD)/.test(t)) ?? '';
+  const marked = body.messages.filter(turn => turn.role === 'user').map(turnText).reverse().find(t => /EZIL_E2E_(UNDO|AGENT|KIMI|SLOW|LONG|SUBAGENT|CHILD|BROWSER)/.test(t)) ?? '';
   const userText = marked;
   const done = id => history.some(block => block.type === 'tool_result' && block.tool_use_id === id);
   const call = (id, name, input) => {
     if (!body.tools?.some(tool => tool.name === name)) throw new Error('script requires offered tool ' + name);
     return [{ type: 'tool_use', id, name, input }];
   };
+  const browser = /EZIL_E2E_BROWSER_(PREVIEW|LOCAL)/.exec(userText)?.[1];
+  if (browser && body.tools?.length) {
+    const prefix = browser === 'PREVIEW' ? 'ezil_preview' : 'ezil_local_browser';
+    const read = history.find(block => block.type === 'tool_result' && block.tool_use_id === 'ezil_browser_read');
+    if (!read) return call('ezil_browser_read', prefix + '_read', {});
+    const text = typeof read.content === 'string' ? read.content : read.content.map(block => block.text).join('\n');
+    const ref = /"ref"\s*:\s*"([a-zA-Z0-9_-]{8,64})"/.exec(text)?.[1];
+    if (!ref || read.is_error) throw new Error('browser read did not return a usable element reference');
+    if (!done('ezil_browser_click')) return call('ezil_browser_click', prefix + '_click', { ref });
+    if (!done('ezil_browser_edit')) {
+      return call('ezil_browser_edit', 'replace_string_in_file', { filePath: join(folder, 'existing.txt'), oldString: 'before\n', newString: 'after browser feedback\n' });
+    }
+    return [{ type: 'text', text: 'EZiL Chat: inspected the browser, clicked the control, and updated the app. EZIL_BROWSER_DONE' }];
+  }
   if (userText.includes('EZIL_E2E_KIMI')) return [{ type: 'text', text: 'EZiL Chat: Kimi JSON response. EZIL_KIMI_OK' }];
   // A subagent (VS Code's runSubagent tool) gets the CHILD prompt; the parent names its model as `model=[Name (vendor)]`.
   if (userText.includes('EZIL_E2E_CHILD')) return [{ type: 'text', text: 'EZiL Chat: child reply. EZIL_CHILD_OK' }];
