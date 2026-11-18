@@ -447,7 +447,7 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
                 return false;
             });
         },
-        async reserve(candidate: ImageJob, approvedRepositoryUri: string): Promise<ImageJob> {
+        async reserve(candidate: ImageJob, approvedRepositoryUri: string, stoppedOnly = false): Promise<ImageJob> {
             const j = validateImageJob(candidate);
             const prep = buildRebasePreparation(parseRebaseJson(j.preparationDocument) as Parameters<typeof buildRebasePreparation>[0]);
             parseRebaseSourceRelease(j.sourceRelease, prep.intent.sourceDeployment, approvedRepositoryUri);
@@ -464,7 +464,8 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
                     return existing;
                 }
                 if (p.imageUpgradeJobId || await read(tx, j.jobId) || p.provider !== 'aws-ec2' || p.lifecycleJobId
-                    || !['STOPPED', 'RUNNING'].includes(p.state) || p.lowerImageDigest !== j.fromDigest || !p.lowerDigestObservedAt
+                    || (p.state !== 'STOPPED' && (stoppedOnly || p.state !== 'RUNNING'))
+                    || p.lowerImageDigest !== j.fromDigest || !p.lowerDigestObservedAt
                     || p.generation !== j.sourceGeneration || p.leaseEpoch !== j.sourceLeaseEpoch || p.fenceToken !== j.sourceFenceToken
                     || p.instanceId !== j.sourceInstanceId || p.volumeId !== j.sourceVolumeId || p.fsUuid !== j.fsUuid
                     || p.region !== j.region || p.zoneId !== j.zoneId) throw new ImageJobConflictError();
