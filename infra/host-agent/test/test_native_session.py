@@ -757,3 +757,78 @@ finally:shutil.rmtree(root)
 """
         result=subprocess.run([sys.executable,"-I","-c",script,str(HERE.parent/"lib")],capture_output=True,text=True,timeout=15)
         self.assertEqual(result.returncode,0,result.stderr)
+
+
+@unittest.skipUnless(os.geteuid() == 0 and os.access("/run", os.W_OK), "requires root-owned test directories")
+class WitnessStorage(unittest.TestCase):
+    def setUp(self):
+        from unittest.mock import patch
+        temp = tempfile.TemporaryDirectory(dir="/run")
+        self.addCleanup(temp.cleanup)
+        self.state = Path(temp.name)
+        self.native = self.state / "native"
+        self.evidence = self.native / "evidence"
+        self.rootfs = self.state / "rootfs"
+        self.native.mkdir(mode=0o700)
+        self.evidence.mkdir(mode=0o700)
+        self.rootfs.mkdir(mode=0o700)
+        self.cfg = Config(stateDir=str(self.state), nativeRootfs=str(self.rootfs),
+                          nativeRuntimeRoot=str(self.state / "runtime"), runcBin="/fixture/runc",
+                          nativeGatewayCaPem="fixture CA", nativeGatewaySpkiSha256="a" * 64,
+                          nativeGatewayOrigin="https://fixture.invalid")
+        self.artifact = {"manifestSha256": "a" * 64, "rootfsTemplateSha256": "b" * 64}
+        placement = {"generation": "7", "leaseEpoch": "3", "instanceId": INSTANCE, "fenceToken": FENCE}
+        boot = ni.boot_id()
+        self.witness = {"v": 2, "bootId": boot, "kernel": os.uname().release, "runc": "test-runc",
+                        "manifestSha256": self.artifact["manifestSha256"], "placement": placement,
+                        "computerId": CMP, "hostEpoch": ni.derive_host_epoch(boot, CMP, placement),
+                        "observations": {}}
+        for name in ("artifact", "tls", "credentialPeer", "uidNamespaces", "cgroup", "devices", "egress",
+                     "workspace", "build", "rootfsTemplate", "childIdentity", "cliInitialize",
+                     "firstMessageAck", "fencingCleanup"):
+            values = {"fixture": name}
+            if name == "rootfsTemplate":
+                values["descriptorSha256"] = self.artifact["rootfsTemplateSha256"]
+            if name == "build":
+                values.update(exitCode=0, outputSha256="c" * 64)
+            if name == "tls":
+                values.update(caSha256=hashlib.sha256(b"fixture CA").hexdigest(),
+                              spkiSha256=self.cfg.nativeGatewaySpkiSha256, gatewayOrigin=self.cfg.nativeGatewayOrigin)
+            data = json.dumps(values).encode()
+            digest = hashlib.sha256(data).hexdigest()
+            record = self.evidence / (digest + ".json")
+            record.write_bytes(data)
+            record.chmod(0o600)
+            self.witness["observations"][name] = {"status": "observed", "evidenceSha256": digest, "observed": values}
+        self.enterContext(patch.object(art, "load", return_value=self.artifact))
+        self.enterContext(patch.object(ni.subprocess, "run", return_value=SimpleNamespace(stdout="test-runc\n")))
+
+    def test_invalid_replacement_leaves_valid_witness_readable(self):
+        from unittest.mock import patch
+        ni.write_witness(self.cfg, self.witness)
+        self.assertEqual(ni.read_witness(self.cfg, self.artifact), self.witness)
+        with self.assertRaisesRegex(Refused, "native_qualification_evidence_invalid"):
+            ni.write_witness(self.cfg, dict(self.witness, observations={}))
+        self.assertEqual(ni.read_witness(self.cfg, self.artifact), self.witness)
+        with patch.object(ni.os, "geteuid", return_value=299000):
+            with self.assertRaisesRegex(Refused, "native_qualification_storage_untrusted"):
+                ni.write_witness(self.cfg, self.witness)
+        self.assertEqual(ni.read_witness(self.cfg, self.artifact), self.witness)
+
+    def test_untrusted_witness_or_evidence_storage_cannot_allow(self):
+        ni.write_witness(self.cfg, self.witness)
+        evidence = next(self.evidence.iterdir())
+        witness = self.native / "witness.json"
+        for path, unsafe, safe in ((evidence, 0o644, 0o600), (witness, 0o644, 0o600),
+                                   (self.evidence, 0o755, 0o700), (self.native, 0o755, 0o700),
+                                   (self.state, 0o777, 0o700)):
+            with self.subTest(path=path):
+                path.chmod(unsafe)
+                try:
+                    self.assertIsNone(ni.read_witness(self.cfg, self.artifact))
+                finally:
+                    path.chmod(safe)
+        copy = self.native / "witness-copy.json"
+        witness.rename(copy)
+        witness.symlink_to(copy)
+        self.assertIsNone(ni.read_witness(self.cfg, self.artifact))

@@ -38,7 +38,7 @@ import threading
 import queue
 import time
 
-from .fsops import DIR_FLAGS, Refused, write_file_durable_at, empty_dir_fd
+from .fsops import DIR_FLAGS, FILE_FLAGS, Refused, write_file_durable_at, empty_dir_fd
 
 KEY = re.compile(r"[0-9a-f]{64}")
 CREDENTIAL = "credential"
@@ -727,43 +727,96 @@ class Launcher:
         return receipt
 
 
-def write_witness(cfg, witness):
-    """The qualification witness (written only by a real qualification run, root-only)."""
-    path = os.path.join(cfg.stateDir, "native")
-    os.makedirs(path, mode=0o700, exist_ok=True)
-    fd = os.open(path, DIR_FLAGS)
+def _open_private_directory(parent_fd, name):
+    fd = os.open(name, DIR_FLAGS, dir_fd=parent_fd)
+    st = os.fstat(fd)
+    if st.st_uid == 0 and stat.S_IMODE(st.st_mode) == 0o700:
+        return fd
+    os.close(fd)
+    raise Refused("native_qualification_storage_untrusted")
+
+
+def _open_witness_directory(cfg, *, create=False):
+    from .native_artifact import trusted_directory
+
+    state_fd = trusted_directory(cfg.stateDir)
     try:
-        write_file_durable_at(fd, "witness.json", json.dumps(witness, sort_keys=True).encode(), 0o600)
+        if create:
+            try:
+                os.mkdir("native", 0o700, dir_fd=state_fd)
+            except FileExistsError:
+                pass
+            else:
+                os.fsync(state_fd)
+        return _open_private_directory(state_fd, "native")
+    finally:
+        os.close(state_fd)
+
+
+def _read_private_record(directory_fd, name):
+    fd = os.open(name, FILE_FLAGS, dir_fd=directory_fd)
+    with os.fdopen(fd, "rb") as file:
+        st = os.fstat(file.fileno())
+        if (not stat.S_ISREG(st.st_mode) or st.st_uid != 0
+                or stat.S_IMODE(st.st_mode) != 0o600 or st.st_nlink > 1):
+            return None
+        raw = file.read(65537)
+        return raw if len(raw) <= 65536 else None
+
+
+def write_witness(cfg, witness):
+    """Persist a complete witness from a trusted root qualifier."""
+    from .native_artifact import load
+
+    if os.geteuid() != 0:
+        raise Refused("native_qualification_storage_untrusted")
+    artifact = load(cfg.nativeRuntimeRoot, cfg.get("nativeRuntimePin"))
+    fd = _open_witness_directory(cfg, create=True)
+    try:
+        # Serialize writers that share the durable writer's per-process temporary name.
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        raw = json.dumps(witness, sort_keys=True).encode()
+        if len(raw) > 65536 or _validate_witness(cfg, artifact, fd, raw) is None:
+            raise Refused("native_qualification_evidence_invalid")
+        write_file_durable_at(fd, "witness.json", raw, 0o600)
     finally:
         os.close(fd)
 
 
 def read_witness(cfg, artifact):
-    """The witness for THIS kernel release, runc version and artifact pin with every check true, or
-    None. A config boolean never substitutes for it."""
-    from .lease import strict_json
-    from .fsops import read_regular_at
+    """Find the root-owned witness for this boot, kernel, runc and artifact pin."""
     try:
-        fd = os.open(os.path.join(cfg.stateDir, "native"), DIR_FLAGS)
-    except OSError:
+        fd = _open_witness_directory(cfg)
+    except (OSError, Refused):
         return None
     try:
-        raw = read_regular_at(fd, "witness.json", limit=65536)
+        return _validate_witness(cfg, artifact, fd, _read_private_record(fd, "witness.json"))
+    except OSError:
+        return None
     finally:
         os.close(fd)
+
+
+def _validate_witness(cfg, artifact, directory_fd, raw):
+    from .lease import strict_json
+    from .native_artifact import trusted_directory
+
     if raw is None:
         return None
     try:
         w = strict_json(raw.decode("utf-8"))
-        runc = subprocess.run([cfg.runcBin, "--version"], capture_output=True, text=True, timeout=5).stdout.split("\n")[0]
-    except (ValueError, UnicodeError, OSError, subprocess.SubprocessError):
+        runc = subprocess.run([cfg.runcBin, "--version"], capture_output=True, text=True, timeout=5,
+                              check=True).stdout.splitlines()
+        if not runc:
+            return None
+    except (AttributeError, ValueError, OSError, subprocess.SubprocessError):
         return None
     required = {"artifact", "tls", "credentialPeer", "uidNamespaces", "cgroup", "devices", "egress",
                 "workspace", "build", "rootfsTemplate", "childIdentity", "cliInitialize", "firstMessageAck", "fencingCleanup"}
     if not isinstance(w, dict) or set(w) != {"v", "bootId", "kernel", "runc", "manifestSha256", "placement", "computerId", "hostEpoch", "observations"}:
         return None
     try:
-        if (w["v"] != 2 or w["bootId"] != boot_id() or w["kernel"] != os.uname().release or w["runc"] != runc
+        if (w["v"] != 2 or w["bootId"] != boot_id() or w["kernel"] != os.uname().release or w["runc"] != runc[0]
                 or w["manifestSha256"] != artifact.get("manifestSha256")
                 or w["hostEpoch"] != derive_host_epoch(w["bootId"], w["computerId"], w["placement"])):
             return None
@@ -779,14 +832,13 @@ def read_witness(cfg, artifact):
                 return None
         if observations["rootfsTemplate"]["observed"].get("descriptorSha256") != artifact.get("rootfsTemplateSha256"):
             return None
-        from .native_artifact import trusted_directory
         template_fd = trusted_directory(cfg.nativeRootfs)
         os.close(template_fd)
         # Each claimed observation is backed by the exact root-installed local evidence bytes.
-        evidence_fd = os.open(os.path.join(cfg.stateDir, "native", "evidence"), DIR_FLAGS)
+        evidence_fd = _open_private_directory(directory_fd, "evidence")
         try:
             for item in observations.values():
-                evidence = read_regular_at(evidence_fd, item["evidenceSha256"] + ".json", limit=65536)
+                evidence = _read_private_record(evidence_fd, item["evidenceSha256"] + ".json")
                 if evidence is None or hashlib.sha256(evidence).hexdigest() != item["evidenceSha256"]:
                     return None
                 if strict_json(evidence.decode("utf-8")) != item["observed"]:
@@ -801,6 +853,6 @@ def read_witness(cfg, artifact):
             return None
         if observations["build"]["observed"].get("exitCode") != 0 or not re.fullmatch(r"[0-9a-f]{64}", observations["build"]["observed"].get("outputSha256", "")):
             return None
-    except (ValueError, TypeError, KeyError, AttributeError, OSError, UnicodeError):
+    except (ValueError, TypeError, KeyError, AttributeError, OSError, UnicodeError, Refused):
         return None
     return w
