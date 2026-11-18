@@ -74,7 +74,7 @@ export const LEGACY_NOTICE_MARKER = 'data-ezil-legacy-notice';
  */
 export const LEGACY_NOTICE_HIDE_CSS = '.chat-viewpane .interactive-session>.interactive-input-part::after{content:none!important;display:none!important}';
 
-// Browser source for the nonce-bearing Code folder bridge. This changes Explorer's presentation only. The
+// Browser source for the nonce-bearing Code folder bridge. This changes the editor's displayed workspace name. The
 // workbench still opens the verified wrapper so settings inside the checkout are not workspace configuration.
 const REPOSITORY_FOCUS_SCRIPT = String.raw`
 function focusRepository(folder, name) {
@@ -83,43 +83,97 @@ function focusRepository(folder, name) {
       !/^[a-z0-9][a-z0-9-]{0,63}\/[a-z0-9][a-z0-9._-]{0,99}$/.test(name) ||
       name.includes("..") || name.endsWith(".") || name.endsWith(".git")) return false;
 
-  const checkout = folder + "/" + name.split("/")[1];
-  const update = () => {
-    const explorer = document.querySelector(".explorer-folders-view");
+  const basename = name.split("/")[1];
+  const checkout = folder + "/" + basename;
+  const labelWindowTitle = (text) => {
+    const segments = text.split(" - ");
+    const workspace = segments.lastIndexOf(root);
+    if (workspace === -1) return text;
+    segments[workspace] = basename;
+    return segments.join(" - ");
+  };
+  const labelText = (element, transform) => {
+    if (!element) return;
+    const text = element.textContent;
+    const updated = transform(text);
+    if (updated !== text) element.textContent = updated;
+  };
+
+  const labelTitleBar = (bar) => {
+    for (const node of bar.querySelectorAll(".command-center .search-label, .command-center .agent-status-label")) {
+      if (node.textContent === root) node.textContent = basename;
+    }
+    const quickPick = bar.querySelector(".command-center-quick-pick");
+    const description = quickPick?.getAttribute("aria-description");
+    if (description) {
+      const action = description.endsWith(" " + root)
+        ? description.slice(0, -root.length) + basename
+        : description.replace(" " + root + " — ", " " + basename + " — ");
+      const updated = labelWindowTitle(action);
+      if (updated !== description) quickPick.setAttribute("aria-description", updated);
+    }
+    // With Command Center disabled, the workbench renders a plain text title here.
+    const windowTitle = bar.querySelector(".window-title");
+    if (windowTitle?.childElementCount === 0) labelText(windowTitle, labelWindowTitle);
+  };
+
+  let revealed = false;
+  const labelExplorer = (part) => {
+    const explorer = part.querySelector(".explorer-folders-view");
     if (!explorer) return;
-    // VS Code displays the single workspace folder in the pane heading, or in the view container when merged.
-    // The checkout is a first-level tree row. Check the resource path so identically named files cannot match.
+    // VS Code uses the pane heading, or the view container's heading when merged.
+    const header = explorer.closest(".pane")?.querySelector(".pane-header");
+    const headings = [header?.querySelector("h3.title"), part.querySelector(".title-label h2")]
+      .filter((element) => element?.textContent === root);
+    if (revealed && headings.length === 0) return;
+    // The checkout is a first-level tree row. Match the exact path even with a file decoration.
     const row = [...explorer.querySelectorAll('[role="treeitem"][aria-level="1"][aria-expanded]')].find((item) => {
       const pathLabel = item.querySelector(".explorer-item")?.getAttribute("aria-label");
       return pathLabel === checkout || pathLabel?.startsWith(checkout + " • ");
     });
     if (!row) return;
-    const header = explorer.closest(".pane")?.querySelector(".pane-header");
-    const heading = [header?.querySelector("h3.title"), explorer.closest(".part")?.querySelector(".title-label h2")]
-      .find((element) => element?.textContent === root);
-    if (!heading) return;
 
-    heading.textContent = name;
-    for (const node of [header, heading, header?.querySelector(".icon"), header?.querySelector('[role="toolbar"]')]) {
+    for (const heading of headings) heading.textContent = basename;
+    for (const node of [header, ...headings, header?.querySelector(".icon"), header?.querySelector('[role="toolbar"]')]) {
       const label = node?.getAttribute("aria-label");
-      if (label?.includes(root)) node.setAttribute("aria-label", label.replace(root, name));
+      if (label?.includes(root)) node.setAttribute("aria-label", label.replace(root, basename));
     }
 
-    // Use the existing Explorer interactions once, without giving the tree keyboard focus. Keep restored selections.
-    const click = (element) => element?.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 }));
-    if (row.getAttribute("aria-expanded") === "false") {
+    // Use existing Explorer interactions once. Preserve restored selection and keyboard focus.
+    if (!revealed && row.getAttribute("aria-expanded") === "false") {
+      const click = (element) => element?.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 }));
       if (!explorer.querySelector('[aria-selected="true"]')) click(row.querySelector(".monaco-tl-contents"));
       if (row.getAttribute("aria-expanded") === "false") click(row.querySelector(".monaco-tl-twistie"));
     }
-    observer.disconnect();
-    clearTimeout(expiry);
+    revealed = true;
   };
-  const observer = new MutationObserver(update);
-  observer.observe(document.documentElement, {
-    subtree: true, childList: true, attributes: true, attributeFilter: ["aria-label", "aria-expanded"],
-  });
+
+  // Observe only these rendered surfaces after startup. Code recomputes the labels as editors and views change.
+  const pending = new Map([
+    ["head title", { update: (node) => labelText(node, labelWindowTitle) }],
+    [".part.titlebar", { update: labelTitleBar, attributes: ["aria-description"] }],
+    [".part.sidebar", { update: labelExplorer, attributes: ["aria-label", "aria-expanded"] }],
+  ]);
+  const discover = () => {
+    for (const [selector, { update, attributes }] of pending) {
+      const node = document.querySelector(selector);
+      if (!node) continue;
+      new MutationObserver(() => update(node)).observe(node, {
+        subtree: true, childList: true, characterData: true,
+        ...(attributes ? { attributeFilter: attributes } : {}),
+      });
+      pending.delete(selector);
+      update(node);
+    }
+    if (pending.size === 0) {
+      observer.disconnect();
+      clearTimeout(expiry);
+    }
+  };
+  const observer = new MutationObserver(discover);
+  observer.observe(document.documentElement, { subtree: true, childList: true });
   const expiry = setTimeout(() => observer.disconnect(), 45_000);
-  update();
+  discover();
   return true;
 }
 `;
