@@ -127,8 +127,9 @@ export function buildPlan(files, logged = null, receiptOnlyPins = {}) {
         for (const row of logged) {
             if (!row || typeof row.file !== 'string' || !HASH.test(row.sha256) ||
                 !['apply', 'baseline'].includes(row.mode) || rows.has(row.file)) refuse('Invalid staging schema log row.');
-            if (!files.some(({ file }) => file === row.file) &&
-                (!Object.hasOwn(receiptOnlyPins, row.file) || row.sha256 !== receiptOnlyPins[row.file] || row.mode !== 'apply')) {
+            const pinnedReceipt = Object.hasOwn(receiptOnlyPins, row.file);
+            if (pinnedReceipt ? row.sha256 !== receiptOnlyPins[row.file] || row.mode !== 'apply'
+                : !files.some(({ file }) => file === row.file)) {
                 refuse('Staging schema log contains a file outside the reviewed list.');
             }
             rows.set(row.file, row);

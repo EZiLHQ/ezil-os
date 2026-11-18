@@ -47,7 +47,7 @@ export function nativePreflight(expectRole, expectDatabase) {
 const REPLAY_FILE = 'app/drizzle/0030_delegation_replay.sql';
 export const NATIVE_PRODUCTION_FILES = Object.freeze(Object.keys(NATIVE_SQL_PINS).slice(2).filter(file => file !== REPLAY_FILE));
 export const PRODUCTION_RECEIPT_ONLY_PINS = Object.freeze({
-    // Already applied through the production operator path and absent from EXPLICIT_FILES.
+    // Exact historical apply receipt from the production operator path; current main also ships its SQL.
     'app/drizzle/0023_operator_issued_by.sql': '7bae267c2e9a281c60d9e1e96cf8a64788e43dbfd51c65e44214182b6ead5c92',
     ...Object.fromEntries(NATIVE_PRODUCTION_FILES.map(file => [file, NATIVE_SQL_PINS[file]])),
 });
@@ -91,7 +91,12 @@ const eventTriggerDigest = "SELECT encode(sha256(convert_to(COALESCE(jsonb_agg(j
 function receiptGuard(legacy, native) {
     const names = native.map(({ file }) => literal(file)).join(',');
     const receiptOnly = Object.entries(PRODUCTION_RECEIPT_ONLY_PINS).map(([file, sha256]) => ({ file, sha256 }));
-    const reviewed = new Map([...legacy, ...receiptOnly].map(entry => [entry.file, entry]));
+    const reviewed = new Map(legacy.map(entry => [entry.file, entry]));
+    for (const entry of receiptOnly) {
+        const canonical = reviewed.get(entry.file);
+        if (canonical && canonical.sha256 !== entry.sha256) throw new Error('Production receipt pin disagrees with source');
+        reviewed.set(entry.file, entry);
+    }
     const replay = reviewed.get(REPLAY_FILE);
     const filesThatMustApply = [...receiptOnly, replay];
     const prerequisites = Object.keys(NATIVE_SQL_PINS).slice(0, 2);

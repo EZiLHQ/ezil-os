@@ -10,6 +10,7 @@ const modeArgs = id => ['--native-production', '--target', 'aws-production', '--
 const pinOption = '--expect-event-trigger-sha256';
 const validPin = '0'.repeat(64);
 const legacyFiles = EXPLICIT_FILES.map(file => ({ file, sha256: sha256(readFileSync(new URL('../../' + file, import.meta.url))) }));
+const optionalCurrentMain = ['app/drizzle/0024_telemetry_alerts.sql', 'app/drizzle/0025_ai_request_traces.sql'];
 const nonce = '00000000-0000-4000-8000-000000000001';
 
 test('native production requires its own exact mode, target, and pins without changing the 0030 selector', () => {
@@ -31,7 +32,11 @@ test('native production requires its own exact mode, target, and pins without ch
 
 test('ordinary production receipt validation recognizes exact out-of-band apply receipts without selecting their SQL', () => {
     const receipts = Object.entries(PRODUCTION_RECEIPT_ONLY_PINS).map(([file, sha256]) => ({ file, sha256, mode: 'apply' }));
-    assert.equal(buildPlan(legacyFiles, receipts, PRODUCTION_RECEIPT_ONLY_PINS).length, legacyFiles.length);
+    const pendingFiles = legacyFiles.filter(({ file }) => !Object.hasOwn(PRODUCTION_RECEIPT_ONLY_PINS, file));
+    assert.equal(buildPlan(pendingFiles, receipts, PRODUCTION_RECEIPT_ONLY_PINS).length, pendingFiles.length);
+    const currentMainPlan = buildPlan(legacyFiles, receipts, PRODUCTION_RECEIPT_ONLY_PINS);
+    const issuer = currentMainPlan.filter(({ file }) => file === receipts[0].file);
+    assert.deepEqual(issuer, [{ file: receipts[0].file, sha256: receipts[0].sha256, status: 'applied (apply)' }]);
     assert.throws(() => buildPlan(legacyFiles, receipts), /outside the reviewed list/);
     assert.throws(() => buildPlan(legacyFiles, [{ ...receipts[0], mode: 'baseline' }], PRODUCTION_RECEIPT_ONLY_PINS), /outside the reviewed list/);
     assert.throws(() => buildPlan(legacyFiles, [{ ...receipts[1], sha256: validPin }], PRODUCTION_RECEIPT_ONLY_PINS), /outside the reviewed list/);
@@ -80,7 +85,8 @@ function setup() {
     }
     sql('CREATE TABLE public.ezil_staging_schema_log (file text PRIMARY KEY, sha256 text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now(), mode text NOT NULL);');
     const historical = Object.entries(PRODUCTION_RECEIPT_ONLY_PINS)[0];
-    const receipts = legacyFiles.filter(({ file }) => !file.includes('0012_compute_reverse_moves')).concat([{ file: historical[0], sha256: historical[1] }]);
+    const receipts = legacyFiles.filter(({ file }) => !file.includes('0012_compute_reverse_moves') &&
+        file !== historical[0] && !optionalCurrentMain.includes(file)).concat([{ file: historical[0], sha256: historical[1] }]);
     for (const { file, sha256: digest } of receipts) {
         sql("INSERT INTO public.ezil_staging_schema_log (file,sha256,mode) VALUES ('" + file + "','" + digest + "','apply');");
     }
@@ -102,6 +108,11 @@ const nativeTableCount = () => sql("SELECT count(*) FROM pg_class WHERE relnames
 
 test('real production-shaped batch preserves 0030 and all older receipts and is idempotent', { skip: !containerName }, () => {
     const { id, hash } = setup();
+    for (const { file, sha256: digest } of legacyFiles.filter(({ file }) => optionalCurrentMain.includes(file))) {
+        sql("INSERT INTO public.ezil_staging_schema_log (file,sha256,mode) VALUES ('" + file + "','" + digest + "','apply');");
+    }
+    const withCurrentMain = invoke(['plan', ...modeArgs(id)]);
+    assert.equal(withCurrentMain.rc, 0, [...withCurrentMain.output, ...withCurrentMain.diagnostics].join('\n'));
     const replayOid = sql("SELECT 'public.ezil_delegation_replay'::regclass::oid;");
     const legacyBefore = receiptSnapshot();
     const proof = apply(id, hash);
