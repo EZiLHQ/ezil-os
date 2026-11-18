@@ -65,8 +65,9 @@ class SourceCapacityTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.repo, (self.cap38, self.cap37, self.cap36, self.cap35, self.cap34, self.cap33, self.cap32, self.cap27, self.cap26, self.twice, self.absent) = source_repo(
+        self.repo, (self.cap39, self.cap38, self.cap37, self.cap36, self.cap35, self.cap34, self.cap33, self.cap32, self.cap27, self.cap26, self.twice, self.absent) = source_repo(
             Path(temporary.name),
+            'export const REBASE_RELEASE_REGISTRY_CAPACITY = 39;',
             'export const REBASE_RELEASE_REGISTRY_CAPACITY = 38;',
             'export const REBASE_RELEASE_REGISTRY_CAPACITY = 37;',
             'export const REBASE_RELEASE_REGISTRY_CAPACITY = 36;',
@@ -102,9 +103,9 @@ class SourceCapacityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
             release.require_reader_capacity(34, self.cap33, self.repo)
 
-    def test_this_checkout_declares_thirty_eight_and_ed7_thirty_two(self):
+    def test_this_checkout_declares_thirty_nine_and_ed7_thirty_two(self):
         text = (REPO / release.CAPACITY_SOURCE).read_text()
-        self.assertEqual(release.CAPACITY_DECLARATION.findall(text), ['38'])
+        self.assertEqual(release.CAPACITY_DECLARATION.findall(text), ['39'])
         self.assertEqual(release.source_reader_capacity(AGENT_ED7, REPO)[0], 32)
         with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
             release.require_reader_capacity(33, AGENT_ED7, REPO)
@@ -152,18 +153,15 @@ class SourceCapacityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'running app reader capacity is below'):
             release.require_runtime_capacity({'readerCapacity': 37}, 38)
 
-    def test_thirty_eight_requires_a_matched_source_and_running_reader_and_refuses_thirty_nine(self):
-        self.assertEqual(release.require_reader_capacity(38, self.cap38, self.repo)['capacity'], 38)
-        release.require_runtime_capacity({'readerCapacity': 38}, 38)
-        # A historical thirty-seven reader (source or running) still refuses the thirty-eighth record.
-        with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
-            release.require_reader_capacity(38, self.cap37, self.repo)
-        with self.assertRaisesRegex(ValueError, 'running app reader capacity is below'):
-            release.require_runtime_capacity({'readerCapacity': 37}, 38)
-        with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
-            release.require_reader_capacity(39, self.cap38, self.repo)
-        with self.assertRaisesRegex(ValueError, 'running app reader capacity is below'):
-            release.require_runtime_capacity({'readerCapacity': 38}, 39)
+    def test_thirty_nine_requires_a_matched_source_and_running_reader_and_refuses_forty(self):
+        self.assertEqual(release.require_reader_capacity(39, self.cap39, self.repo)['capacity'], 39)
+        release.require_runtime_capacity({'readerCapacity': 39}, 39)
+        for count, source, running in ((39, self.cap38, 38), (40, self.cap39, 39)):
+            with self.subTest(count=count):
+                with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
+                    release.require_reader_capacity(count, source, self.repo)
+                with self.assertRaisesRegex(ValueError, 'running app reader capacity is below'):
+                    release.require_runtime_capacity({'readerCapacity': running}, count)
 
     def test_production_namespace_proves_readers_past_its_own_legacy_twenty_six(self):
         try:
@@ -181,12 +179,11 @@ class SourceCapacityTests(unittest.TestCase):
             for result in ({'readerCapacity': None}, {'readerCapacity': 26}, {}):
                 with self.subTest(result=result), self.assertRaisesRegex(ValueError, 'running app reader capacity is below'):
                     release.require_runtime_capacity(result, 27)
-            # The same thirty-eight active ceiling applies in prd; a thirty-seven reader still refuses thirty-eight.
-            self.assertEqual(release.require_reader_capacity(38, self.cap38, self.repo)['capacity'], 38)
-            with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
-                release.require_reader_capacity(38, self.cap37, self.repo)
+            self.assertEqual(release.require_reader_capacity(39, self.cap39, self.repo)['capacity'], 39)
             with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
                 release.require_reader_capacity(39, self.cap38, self.repo)
+            with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
+                release.require_reader_capacity(40, self.cap39, self.repo)
         finally:
             release.json_tool.use_namespace('mum')
         # Switching back restores the frozen mum thirty-two: a thirty-two-record registry needs no proof.
@@ -842,7 +839,7 @@ class RealHttpProbeTests(unittest.TestCase):
 
 class LegacyGcParityTests(unittest.TestCase):
     def test_frozen_gc_stays_a_thirty_two_record_tool(self):
-        self.assertEqual((TOOL.RELEASE_REGISTRY_CAPACITY, TOOL.ACTIVE_REGISTRY_CAPACITY), (32, 38))
+        self.assertEqual((TOOL.RELEASE_REGISTRY_CAPACITY, TOOL.ACTIVE_REGISTRY_CAPACITY), (32, 39))
         self.assertEqual(TOOL.LEGACY_REGISTRY_CAPACITY, {'mum': 32, 'prd': 26})
         self.assertEqual(gc.tool.legacy_registry_capacity(), 32)
         self.assertEqual(gc.tool.RELEASE_REGISTRY_CAPACITY, 32)
