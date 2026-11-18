@@ -428,16 +428,21 @@ LIFECYCLE_HISTORY_KEY = 'LifecycleHistoryKey897F7B53'
 APP_CALLER_POLICY = 'AppCallerRoleDefaultPolicy61BE57D2'
 
 
+def is_pool_iam_projection(resources):
+    """Recognize reviewed pool IAM projections that omit the runtime resources."""
+    return (LIFECYCLE_OBSERVER not in resources
+            and all(r.get('Type') in {'AWS::IAM::Role', 'AWS::IAM::Policy', 'AWS::KMS::Key', 'AWS::CDK::Metadata'}
+                    for r in resources.values())
+            and existing_image_recovery_role(resources.get(LEGACY_RECOVERY_ROLE, {})))
+
+
 def legacy_lifecycle_capabilities(before):
     resources = before['Resources']
     if LIFECYCLE_CONTROLLER_POLICY not in resources:
         return None
     # Existing pool-IAM reviews may contain only the known image-role policy
     # projection. They carry no legacy runtime graph from which to retain refs.
-    if (LIFECYCLE_OBSERVER not in resources
-            and all(r.get('Type') in {'AWS::IAM::Role', 'AWS::IAM::Policy', 'AWS::KMS::Key', 'AWS::CDK::Metadata'}
-                    for r in resources.values())
-            and existing_image_recovery_role(resources.get(LEGACY_RECOVERY_ROLE, {}))):
+    if is_pool_iam_projection(resources):
         return None
     function = resources.get(LIFECYCLE_OBSERVER, {})
     raw = function.get('Properties', {}).get('Environment', {}).get('Variables', {}).get('EZIL_LIFECYCLE_SETTINGS')
@@ -498,6 +503,18 @@ TRANSITION_OBSERVERS = {
                     'LifecyclePreparationObserverCurrentVersion'),
     'recovery': (LEGACY_RECOVERY_POLICY, 'RecoveryObserver1D350FD8', 'RecoveryObserverCurrentVersion'),
 }
+
+
+def projected_observer_grant(logical, left, right, target):
+    """A projected current-version policy still names its own immutable observer version."""
+    if not left or left.get('Type') != right.get('Type') or right.get('Type') != 'AWS::IAM::Policy':
+        return False
+    prior = {key: value for key, value in left['Properties'].items() if key != 'PolicyDocument'}
+    candidate = {key: value for key, value in right['Properties'].items() if key != 'PolicyDocument'}
+    return prior == candidate and any(
+        logical == policy and manifest.matches(prefix + r'[0-9A-F]{8}[a-f0-9]{32}', target)
+        for policy, _, prefix in TRANSITION_OBSERVERS.values()
+    )
 
 
 def _observer_version_grant(resources, policy_logical, function_logical, prefix):
@@ -681,6 +698,8 @@ def validate_templates(phase, before, after, review, unchanged=False, pool_iam=N
         need(review['changes']==exact,'foundation review must contain only its parameter-forced AMI change')
         return exact
     old,new=before['Resources'],after['Resources'];actual={};right_resources=new
+    projected_pool = phase == 'workflows' and bool(pool_delta) and is_pool_iam_projection(old) and is_pool_iam_projection(new)
+    invalid_lambda_grant = False
     boundary=f'arn:aws:iam::452630323510:policy/ezil/{context.NAMESPACE}/ezil-{context.NAMESPACE}-image-job-boundary'
     if phase=='identity':
         policies=[v for v in new.values() if v['Type']=='AWS::IAM::ManagedPolicy' and v.get('Properties',{}).get('ManagedPolicyName')==f'ezil-{context.NAMESPACE}-image-job-boundary']
@@ -749,19 +768,26 @@ def validate_templates(phase, before, after, review, unchanged=False, pool_iam=N
             for statement in (s for s in statements(right) if s.get('Effect')=='Allow' and s not in old_allows):
                 need('NotAction' not in statement and 'NotResource' not in statement,'inverse IAM grants refused')
                 added=action_set(statement)
-                reviewed_pool_actions=POOL_ACTIONS if statement in pool_delta.get(logical,{}).get('added',[]) else set()
+                reviewed_pool_statement = statement in pool_delta.get(logical, {}).get('added', [])
+                reviewed_pool_actions = POOL_ACTIONS if reviewed_pool_statement else set()
                 # CDK's key grants emit kms:GenerateDataKey*/kms:ReEncrypt*; accept those two only when the
                 # statement targets exactly one KMS key defined in this same template (e.g. a history key).
                 own_key=statement.get('Resource')
                 own_key=own_key.get('Fn::GetAtt',[None])[0] if isinstance(own_key,dict) and list(own_key)==['Fn::GetAtt'] else None
                 kms_ok=lambda action: action in KMS_GRANT_WILDCARDS and own_key is not None and (right_resources.get(own_key) or {}).get('Type')=='AWS::KMS::Key'
                 need(not (added & (FORBIDDEN-reviewed_pool_actions)) and '*' not in added and not any('*' in action and not kms_ok(action) and not any(action in action_set(s) for s in old_allows) for action in added),'unreviewed destructive/wildcard IAM grants')
-                # Narrow guard: an added Lambda invoke grant names exactly one immutable observer version of this same
-                # template (never a function, alias, pattern or list), and nothing else in the same statement.
+                # Reviewed pool projections omit version resources. Admit only an unchanged observer policy
+                # attachment and its own generated version reference from the exact reviewed statement delta.
                 if 'lambda:invokefunction' in added:
-                    target=statement.get('Resource')
-                    target=target.get('Ref') if isinstance(target,dict) and list(target)==['Ref'] else None
-                    need(added=={'lambda:invokefunction'} and target is not None and (right_resources.get(target) or {}).get('Type')=='AWS::Lambda::Version','added Lambda invoke grant must name exactly one immutable version of this template')
+                    resource = statement.get('Resource')
+                    target = resource['Ref'] if isinstance(resource, dict) and set(resource) == {'Ref'} else None
+                    if added != {'lambda:invokefunction'} or not isinstance(target, str):
+                        invalid_lambda_grant = True
+                    elif (right_resources.get(target) or {}).get('Type') != 'AWS::Lambda::Version':
+                        if not (projected_pool and reviewed_pool_statement and target not in right_resources
+                                and projected_observer_grant(logical, left, right, target)):
+                            invalid_lambda_grant = True
+    need(not invalid_lambda_grant, 'added Lambda invoke grant must name exactly one immutable version of this template')
     # A published Step Functions version whose own template is unchanged still changes when its
     # state machine changes: CloudFormation reports Modify StateMachineRevisionId (Dynamic,
     # ResourceAttribute). Only that exact dependent entry may be added to the template diff.
