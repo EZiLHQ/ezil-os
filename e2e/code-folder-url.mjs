@@ -18,6 +18,8 @@ const REPO_NAME = 'os-code-url-20261110-a';
 const REPO_LABEL = `default/${REPO_NAME}`;
 const REPO_URL = `https://github.ezil.work/${REPO_LABEL}.git`;
 const REPO_WRAPPER = `/workspace/projects/${REPO_ID}`;
+const expectRepoProjection = process.env.EXPECT_REPO_PROJECTION === '1';
+const CREATED_FILE = 'repo-focus-created.txt';
 const TREE = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 const require = createRequire(path.join(process.env.PLAYWRIGHT_REQUIRE_DIR || '/opt/ezil-testkit', 'noop.js'));
 const { chromium } = require('playwright');
@@ -139,7 +141,7 @@ const explorerTitle = async () => (await frame().locator('.pane-header[aria-labe
 const shot = (name) => page.screenshot({ path: `${EVIDENCE}/${name}.png` });
 
 let f;
-// A direct repository link starts with the checkout expanded inside its isolated workspace.
+// A direct repository link keeps its isolated workspace with either Explorer presentation.
 await page.goto(`${shellOrigin}/app/code?repo=${encodeURIComponent(REPO_URL)}`);
 ok(await waitFrameFolder(REPO_WRAPPER, 120_000), 'repo: the minted Code workspace is the UUID wrapper');
 ok(repoAsks.length === 1 && repoAsks[0].repository.url === REPO_URL && !repoAsks[0].codeFolder,
@@ -151,11 +153,30 @@ const readableHeading = f.getByRole('heading', {
 await readableHeading.waitFor();
 ok(await readableHeading.isVisible(), 'repo: the real Explorer shows the repository name as its heading');
 const repoFiles = f.locator('.explorer-folders-view');
-const checkout = repoFiles.getByRole('treeitem', { name: REPO_NAME, exact: true, level: 1, expanded: true });
-await checkout.waitFor();
-const readme = repoFiles.getByRole('treeitem', { name: 'README.md', exact: true, level: 2 });
-await readme.waitFor();
-ok(await checkout.isVisible() && await readme.isVisible(), 'repo: the exact checkout is expanded and its root-only exclusion did not hide README');
+const checkout = repoFiles.getByRole('treeitem', { name: REPO_NAME, exact: true });
+const readme = repoFiles.getByRole('treeitem', { name: 'README.md', exact: true, level: expectRepoProjection ? 1 : 2 });
+if (expectRepoProjection) {
+  await readme.waitFor();
+  ok(await readme.isVisible() && await checkout.count() === 0,
+    'repo: README is top-level, the repo-local exclusion stayed inert, and no duplicate checkout row is visible');
+  const selectedRows = repoFiles.getByRole('treeitem', { selected: true });
+  ok(await selectedRows.count() === 0, 'repo: the fresh projected Explorer has no explicit row selection');
+  const newFile = f.getByRole('button', { name: /^New File(?:\.\.\.|…)?(?: \(.*\))?$/i }).first();
+  await readableHeading.hover();
+  await newFile.click();
+  const input = repoFiles.locator('input:visible');
+  await input.fill(CREATED_FILE);
+  await input.press('Enter');
+  const created = repoFiles.getByRole('treeitem', { name: CREATED_FILE, exact: true, level: 1 });
+  await created.waitFor();
+  ok(await created.isVisible(), 'repo: with no selected row, Explorer toolbar New File creates a top-level file');
+} else {
+  const expandedCheckout = repoFiles.getByRole('treeitem', { name: REPO_NAME, exact: true, level: 1, expanded: true });
+  await expandedCheckout.waitFor();
+  await readme.waitFor();
+  ok(await expandedCheckout.isVisible() && await readme.isVisible(),
+    'repo: the exact checkout is expanded and its root-only exclusion did not hide README');
+}
 ok(frameFolder() === REPO_WRAPPER && new URL(page.url()).searchParams.get('repo') === REPO_URL
   && !new URL(page.url()).searchParams.has('folder'), 'repo: presentation left the workspace and repository-only link unchanged');
 const titleBarLabels = f.locator('.part.titlebar .command-center .search-label, .part.titlebar .command-center .agent-status-label');

@@ -291,6 +291,7 @@ RUN node -e "const j=require('/usr/lib/code-server/lib/vscode/extensions/copilot
 # MIT upstream code; exact anchors, copyright and modification notices are
 # documented in copilot-chat/PATCHES.md. Statsbeat reads its switch at load time.
 COPY copilot-chat/patch-copilot-chat.sh /usr/local/lib/ezil/patch-copilot-chat.sh
+COPY copilot-chat/project-explorer.cjs /usr/local/lib/ezil/project-explorer.cjs
 COPY copilot-chat/PATCHES.md /usr/local/lib/ezil/PATCHES.md
 RUN chmod 0755 /usr/local/lib/ezil/patch-copilot-chat.sh \
   && /usr/local/lib/ezil/patch-copilot-chat.sh /usr/lib/code-server/lib/vscode \

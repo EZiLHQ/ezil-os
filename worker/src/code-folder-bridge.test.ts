@@ -217,10 +217,17 @@ function run(opts: { search?: string; pathname?: string; framed?: boolean; navig
   const timers: Array<{ fn: () => void; ms: number; cleared?: boolean }> = [];
   const listeners: Record<string, Array<(ev: unknown) => void>> = {};
   const navListeners: Array<(ev: unknown) => void> = [];
+  const documentAttributes = new Map<string, string>();
   const parent = { postMessage: (m: Record<string, unknown>, o: string) => posted.push({ m: structuredClone(m), o }) };
   const g: Record<string, unknown> = {
     URLSearchParams, URL, crypto, btoa, Uint8Array, Map, String, JSON,
-    document: { documentElement: {}, querySelector: () => null },
+    document: {
+      documentElement: {
+        setAttribute: (key: string, value: string) => documentAttributes.set(key, value),
+        getAttribute: (key: string) => documentAttributes.get(key) ?? null,
+      },
+      querySelector: () => null,
+    },
     MutationObserver: class {
       observe() {}
       disconnect() {}
@@ -244,7 +251,7 @@ function run(opts: { search?: string; pathname?: string; framed?: boolean; navig
   };
   const fire = () => { for (const t of timers.splice(0)) if (!t.cleared) t.fn(); };
   const unload = () => (listeners.beforeunload ?? []).forEach((fn) => fn({}));
-  return { posted, replaced, timers, message, navigate, fire, unload, parent, navListeners };
+  return { posted, replaced, timers, message, navigate, fire, unload, parent, navListeners, documentAttributes };
 }
 const NONCE = 'BBBBBBBBBBBBBBBBBBBBBB';
 
@@ -261,13 +268,16 @@ describe('the bridge script', () => {
     b.message({ ...hello, repositoryFocus: { ...repositoryFocus, folder: '/workspace/projects/other' } });
     b.message({ ...hello, repositoryFocus: { ...repositoryFocus, name: 'default/../other' } });
     expect(b.timers).toHaveLength(0);
+    expect(b.documentAttributes.size).toBe(0);
     b.message(hello);
     b.message(hello);
     expect(b.timers).toHaveLength(1);
+    expect(b.documentAttributes.get('data-ezil-repo-checkout')).toBe(folder + '/os-code-url-20261110-a');
 
     const later = run({ search: `?folder=${folder}` });
     later.message(hello);
     expect(later.timers).toHaveLength(0);
+    expect(later.documentAttributes.size).toBe(0);
   });
   it('does nothing at all when not framed', () => {
     const b = run({ framed: false });
