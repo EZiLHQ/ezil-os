@@ -99,7 +99,7 @@ describe('automatic AWS image update on Code open', () => {
 
         expect(await (await post({ computerId, intent: 'open' })).json()).toMatchObject({
             ok: false, error: 'computer_updating', errorCode: 'sandbox_starting',
-            computeProvider: 'aws-ec2', computePreparing: true,
+            computeProvider: 'aws-ec2', computeUpdating: true, computeLaunching: true,
         });
         expect(state.advance).toHaveBeenCalledExactlyOnceWith({}, computerId, userId, true);
     });

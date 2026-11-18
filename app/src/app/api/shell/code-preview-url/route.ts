@@ -142,7 +142,7 @@ type ShellCaller = Awaited<ReturnType<typeof shellCaller>>['caller'];
 
 function updatePending() {
     return shellJson({ ok: false, error: 'computer_updating', errorCode: 'sandbox_starting',
-        retryable: true, provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2', computePreparing: true });
+        retryable: true, provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2', computeUpdating: true, computeLaunching: true });
 }
 
 async function advanceUpdate(ctx: ProjectCtx, computerId: string, allowStart: boolean) {
