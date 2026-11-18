@@ -403,7 +403,9 @@ def build_cli_spec(*, rootfs, artifact_dir, workspace, state_leaves, uid_base, s
                           "devices": [{"allow": False, "access": "rwm"}]
                           + [{"allow": True, "type": "c", "major": 1, "minor": m, "access": "rwm"} for _, m in DEVICES]},
             **({"seccomp": seccomp} if seccomp else {}),
-            "maskedPaths": ["/proc/acpi", "/proc/kcore", "/proc/keys", "/proc/latency_stats", "/proc/timer_list",
+            # runc creates additional default /dev nodes even with explicit OCI devices.
+            # Mask its tty and full entries to the standard null device.
+            "maskedPaths": ["/dev/full", "/dev/tty", "/proc/acpi", "/proc/kcore", "/proc/keys", "/proc/latency_stats", "/proc/timer_list",
                             "/proc/sched_debug", "/proc/scsi", "/sys/firmware"],
             "readonlyPaths": ["/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"],
         },
