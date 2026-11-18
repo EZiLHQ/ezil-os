@@ -13,13 +13,14 @@ import { handleImageRebase, type ImageRebaseDeps, type ImageRebaseRequest } from
 import { AwsClientError } from './aws-errors';
 import type { Execution, RebaseSnapshotView } from './aws-rebase-evidence';
 import type { Ec2VolumeView } from './aws-clients';
+import type { UserHoursExemption } from './paid-compute-policy';
 import type { Ec2EnrollmentView } from './aws-enroll';
 
 export const rebaseEnv = { EZIL_AWS_COMPUTERS_ENABLED: '1', AWS_MAX_RUNNING: '20', EZIL_AWS_USER_MONTHLY_HOURS: '100',
     EZIL_AWS_GLOBAL_MONTHLY_HOURS: '600', EZIL_AWS_USER_MONTHLY_EGRESS_GB: '50', EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '200',
     AWS_REGIONS: 'ap-south-1', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '20', EZIL_AWS_ENROLL_URL: 'https://os.example.com/api/compute/aws/enroll',
     EZIL_AWS_BROWSER_ZONE: 'example.com' };
-export function rebaseSetup(externalDb?: PlacementDb) {
+export function rebaseSetup(externalDb?: PlacementDb, userHoursExemption: UserHoursExemption = async () => false) {
     const prep = fixtureRebasePreparation(), source = prep.intent, owner = '33333333-3333-4333-8333-333333333333';
     let clock = new Date('2026-10-22T12:00:00.000Z');
     const fake = createFakePlacementDb({ placements: [placementRow({ computer_id: source.computerId, owner_user_id: owner,
@@ -30,7 +31,7 @@ export function rebaseSetup(externalDb?: PlacementDb) {
         computers: [{ id: source.computerId, user_id: owner }] }, { clock: () => clock });
     const env = { ...rebaseEnv, EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ [source.deployment.region]: { ...source.deployment,
         releases: [fixtureRebaseRelease(source.sourceDeployment), fixtureRebaseRelease(source.deployment)] } }) };
-    const store = createImageJobStore(externalDb ?? fake.db, env);
+    const store = createImageJobStore(externalDb ?? fake.db, env, userHoursExemption);
     const executions = new Map<string, Execution>();
     const ids = ['11111111-1111-4111-8111-111111111111', '44444444-4444-4444-8444-444444444444', '55555555-5555-4555-8555-555555555555', '66666666-6666-4666-8666-666666666666',
         '77777777-7777-4777-8777-777777777777', '88888888-8888-4888-8888-888888888888', '99999999-9999-4999-8999-999999999999'];
