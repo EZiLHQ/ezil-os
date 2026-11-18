@@ -221,6 +221,9 @@ def install(source_dir, install_root, pin):
     return load(install_root, pin)
 
 
+NODE_ENTRY = "runtime/node"
+
+
 def load(install_root, pin):
     """Re-verify the installed tree for this pin. Returns a descriptor the manager uses verbatim."""
     validate_pin(pin)
@@ -264,10 +267,13 @@ def load(install_root, pin):
     descriptor = _read_descriptor(path)
     expected_descriptor = next(x["sha256"] for x in manifest["files"] if x["path"] == ROOTFS_DESCRIPTOR)
     if descriptor[1] != expected_descriptor: raise Refused("native_rootfs_descriptor_changed")
+    # The driver's Node is the pinned ELF executed DIRECTLY (never a loader or wrapper): only a listed,
+    # root-owned 0755 `runtime/node` qualifies; without one the launcher refuses.
+    node = next((x["path"] for x in manifest["files"] if x["path"] == NODE_ENTRY and x["mode"] == "0755"), None)
     return {"rootfsTemplate": descriptor[0], "rootfsTemplateSha256": descriptor[1],
             "dir": path, "manifestSha256": pin["manifestSha256"], "cliVersion": manifest["cliVersion"],
             "nodeAbi": manifest["nodeAbi"], "core": manifest["entrypoints"]["core"],
-            "cli": manifest["entrypoints"]["cli"]}
+            "cli": manifest["entrypoints"]["cli"], "node": node}
 
 
 def manifest_bytes(files, entrypoints, node_abi, cli_version=CLI_VERSION):

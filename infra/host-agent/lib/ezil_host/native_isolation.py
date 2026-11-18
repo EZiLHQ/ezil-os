@@ -37,6 +37,7 @@ import subprocess
 import threading
 import queue
 import time
+from contextlib import ExitStack
 
 from .fsops import DIR_FLAGS, FILE_FLAGS, Refused, write_file_durable_at, empty_dir_fd
 
@@ -503,6 +504,28 @@ class DriverChannel:
             pass
 
 
+def verify_direct_exe(proc, expected):
+    """The running process's kernel executable must be EXACTLY the pinned file (same path and inode),
+    so a dynamic loader, shell wrapper or any other binary is refused. Popen returns only after a
+    successful exec, so /proc/<pid>/exe is final. On mismatch the process is killed via its pidfd."""
+    try:
+        exe = os.readlink(f"/proc/{proc.pid}/exe")
+        want, got = os.stat(expected, follow_symlinks=False), os.stat(f"/proc/{proc.pid}/exe")
+        ok = exe == expected and (want.st_dev, want.st_ino) == (got.st_dev, got.st_ino)
+    except OSError:
+        ok = False
+    if not ok:
+        ident = identity(proc.pid)
+        if ident:
+            signal_identity(ident, signal.SIGKILL)
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        raise Refused("native_driver_exe_mismatch")
+    return True
+
+
 def spawn_driver(argv, child_sock, env, cgroup_path=None, netns_path=None, uid=None, gid=None, io_fds=None):
     """Start the driver with child_sock as FD 3 and /dev/null on 0-2; in production also as uid/gid
     (no supplementary groups) inside cgroup_path and the runtime netns, joined before exec.
@@ -553,7 +576,7 @@ def spawn_driver(argv, child_sock, env, cgroup_path=None, netns_path=None, uid=N
 class Launcher:
     """Starts, prepares and stops runtimes for native_session.Manager. agent.json (all required
     when native sessions are enabled): nativeCgroupRoot, nativeRootfs, nativeUidBase, nativeServiceUid,
-    nativeServiceGid, nativeNodeBin, nativeStateRoot, nativeGatewayOrigin; optional nativeResolver,
+    nativeServiceGid, nativeStateRoot, nativeGatewayOrigin; optional nativeResolver,
     nativeGrantRoot."""
 
     def __init__(self, cfg, lease, run=subprocess.run, host_epoch=None):
@@ -575,6 +598,9 @@ class Launcher:
         return os.path.join(self.cfg.nativeStateRoot, rec["sessionId"])
 
     def start_driver(self, rec, artifact, token, instruction, profile):
+        if not artifact.get("node"):
+            raise Refused("native_node_unpinned")
+        node = os.path.join(artifact["dir"], artifact["node"])
         n = self._names(rec)
         uid, gid = int(self.cfg.nativeServiceUid), int(self.cfg.nativeServiceGid)
         n["cgroup"].create(LIMITS, leaves=("driver", "cli"))
@@ -582,19 +608,26 @@ class Launcher:
         credential = write_credential(self.cfg, rec["resourceKey"], token, uid, gid)
         state_root = self._state_root(rec)
         os.close(_private_dir(state_root, uid, gid))
-        parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
-        cli_in, driver_in = os.pipe2(os.O_CLOEXEC)
-        driver_out, cli_out = os.pipe2(os.O_CLOEXEC)
-        driver_err, cli_err = os.pipe2(os.O_CLOEXEC)
-        try:
-            proc = spawn_driver([self.cfg.nativeNodeBin, "--disallow-code-generation-from-strings", self.driver_script],
+        with ExitStack() as retained, ExitStack() as inherited:
+            parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            retained.callback(parent.close)
+            inherited.callback(child.close)
+            cli_in, driver_in = os.pipe2(os.O_CLOEXEC)
+            retained.callback(os.close, cli_in)
+            inherited.callback(os.close, driver_in)
+            driver_out, cli_out = os.pipe2(os.O_CLOEXEC)
+            retained.callback(os.close, cli_out)
+            inherited.callback(os.close, driver_out)
+            driver_err, cli_err = os.pipe2(os.O_CLOEXEC)
+            retained.callback(os.close, cli_err)
+            inherited.callback(os.close, driver_err)
+            proc = spawn_driver([node, "--disallow-code-generation-from-strings", self.driver_script],
                                 child, {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"},
                                 cgroup_path=os.path.join(n["cgroup"].path, "driver"),
                                 netns_path=f"/var/run/netns/{n['plan']['netns']}", uid=uid, gid=gid,
                                 io_fds={4: driver_in, 5: driver_out, 6: driver_err})
-        finally:
-            child.close()
-            for fd in (driver_in, driver_out, driver_err): os.close(fd)
+            verify_direct_exe(proc, node)
+            retained.pop_all()   # the channel and runtime record now own these handles
         self.procs[rec["operationId"]] = {"driver": identity(proc.pid), "popen": proc,
             "cliIo": (cli_in, cli_out, cli_err), "artifactDir": artifact["dir"], "artifact": artifact}
         ch = DriverChannel(parent)
