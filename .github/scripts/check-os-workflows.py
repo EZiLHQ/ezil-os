@@ -86,13 +86,16 @@ triggers = preview.get('on', preview.get(True))
 assert set(triggers) == {'push', 'workflow_dispatch'}
 assert triggers['push'] == {'branches': ['preview', 'main'], 'tags': ['v*']}
 assert set(triggers['workflow_dispatch']) == {'inputs'}
-assert set(triggers['workflow_dispatch']['inputs']) == {'deploy_production', 'deploy_worker_only'}
+assert set(triggers['workflow_dispatch']['inputs']) == {'deploy_production', 'deploy_worker_only', 'native_worker_sha'}
 confirm = triggers['workflow_dispatch']['inputs']['deploy_production']
 assert confirm['type'] == 'boolean' and confirm['default'] is False and 'required' not in confirm
 worker_only = triggers['workflow_dispatch']['inputs']['deploy_worker_only']
 assert worker_only['type'] == 'boolean' and worker_only['default'] is False and 'required' not in worker_only
 # Each production job gate reads exactly its own boolean (github.event.inputs is a string).
-assert preview_text.count('inputs.deploy_production') == 1 and preview_text.count('inputs.deploy_worker_only') == 1 and 'github.event.inputs' not in preview_text
+native_worker_sha = triggers['workflow_dispatch']['inputs']['native_worker_sha']
+assert native_worker_sha['type'] == 'string' and native_worker_sha['default'] == ''
+assert preview_text.count('inputs.deploy_production') == 2 and preview_text.count('inputs.deploy_worker_only') == 2
+assert 'github.event.inputs' not in preview_text
 assert preview['permissions'] == {'contents': 'read'}
 assert preview['concurrency'] == {'group': 'os-live-${{ github.ref }}', 'cancel-in-progress': False}
 assert set(preview['jobs']) == {'changes', 'images', 'preview', 'production', 'worker-production'}
@@ -272,7 +275,8 @@ for job_name, branch, environment, url, deploy_name, check_id in (
     # merge to main can never satisfy it; tags only verify (asserted below).
     ref_condition = ("github.ref == 'refs/heads/preview'" if job_name == 'preview' else
                      "((github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && "
-                     "inputs.deploy_production == true) || startsWith(github.ref, 'refs/tags/v'))")
+                     "inputs.deploy_production == true && inputs.deploy_worker_only != true && inputs.native_worker_sha == '') || "
+                     "startsWith(github.ref, 'refs/tags/v'))")
     assert ' '.join(job['if'].split()) == (
         "${{ !cancelled() && " + ref_condition + " && "
         "needs.changes.result == 'success' && "
@@ -554,7 +558,7 @@ assert wonly['env']['EZIL_WORKER_NAME'] == 'ezil-os-worker' and wonly['env']['EZ
 assert wonly['env']['EZIL_E2E_WORKER'] == '${{ vars.OS_WORKER_URL }}'
 # Main dispatch plus its own confirmation only: never a push/merge, a tag, or the legacy input.
 assert ' '.join(wonly['if'].split()) == (
-    "${{ !cancelled() && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.deploy_worker_only == true && "
+    "${{ !cancelled() && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.deploy_worker_only == true && inputs.deploy_production != true && "
     "needs.changes.result == 'success' && "
     "(needs.images.result == 'success' || needs.images.result == 'skipped') }}")
 wsteps = wonly['steps']
@@ -614,7 +618,19 @@ assert 'gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq \'.object.sha\
 assert '[[ "$current_main" == "$EZIL_DEPLOY_SHA" ]] ||' in wworker['run']
 # Worker identity verification uses the Cloudflare-only mode; no Vercel or app URL.
 widentity = wby_id['identity']
-assert widentity['run'] == 'node e2e/verify-cloud-deployment.mjs worker > live-evidence/deployment-identity.json'
+assert 'node e2e/verify-cloud-deployment.mjs worker > live-evidence/deployment-identity.json' in widentity['run']
+assert 'node .github/scripts/release-state.mjs worker-native-verify > live-evidence/native-worker-bindings.json' in widentity['run']
+assert wonly['env']['NATIVE_WORKER_SHA'] == '${{ inputs.native_worker_sha }}'
+wnative = wby_name['Admit the reviewed Native Worker source']
+wmanifest = wby_name['Pin the existing production routing and binding manifest']
+assert wnative['if'] == wmanifest['if'] == "inputs.native_worker_sha != ''"
+assert wpos(wnative) < wpos(wby_id['production_lease'])
+assert '"$NATIVE_WORKER_SHA" == "$EZIL_DEPLOY_SHA"' in wnative['run']
+assert '"$IMAGE_CHANGED" == "false"' in wnative['run']
+assert wpos(wcapture) < wpos(wmanifest) < wpos(wworker)
+assert 'git diff --quiet "$previous" "$EZIL_DEPLOY_SHA" -- worker/wrangler.toml' in wmanifest['run']
+assert '[[ "$rollout" == none && "$NATIVE_WORKER_SHA" == "$EZIL_DEPLOY_SHA" ]]' in wworker['run']
+assert 'args+=(--keep-vars --experimental-auto-create=false --autoconfig=false --var AWS_NATIVE_SESSIONS_ENABLED:1)' in wworker['run']
 assert wpos(wworker) < wpos(wrollout) < wpos(widentity)
 # Ownership-guarded recovery: guard, Worker rollback to the captured version, container
 # restore when the image changed, bounded readback, then fail.

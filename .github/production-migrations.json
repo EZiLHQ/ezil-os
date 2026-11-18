@@ -110,6 +110,26 @@
       "path": "app/drizzle/0030_delegation_replay.sql",
       "sha256": "50ff0b0a441ee539ca5d72302443315be1f1812e6b11e4afb2e1af3f575692a7",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0029_native_session_operations.sql",
+      "sha256": "8b1b6295a753aee5097a6d181dd25c698d6a5c85a9e6a245c46a5409b08daf3c",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0031_native_auth_intents.sql",
+      "sha256": "0f98fe7c4eb3aff87fb0be8a145973590915d7fa49663c24df83305e7ca3534e",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0032_runtime_control.sql",
+      "sha256": "dc34110dc1fb6e005bd9a9abba99eac081a1b7fa3017b76bf50ce88358ac7e06",
+      "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0033_native_grant_outbox.sql",
+      "sha256": "8e2f6e97726d647903b284bd35856f8829ee3661d48d75e55c1645aa3226ad1e",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {

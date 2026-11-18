@@ -9,7 +9,7 @@
  */
 import { sql, type SQL } from 'drizzle-orm';
 
-import type { DelegatedAccount, DelegatedIdentity } from './delegation-auth';
+import type { DelegatedAccount, DelegatedIdentity } from './delegation-core';
 
 export interface SqlExecutor {
     execute(query: SQL): Promise<ArrayLike<Record<string, unknown>>>;

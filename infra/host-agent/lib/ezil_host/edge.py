@@ -86,6 +86,17 @@ FOLDER_CL_RE = re.compile(r"[1-9][0-9]{0,3}")
 MAX_FOLDER_BODY = 4096
 STANDALONE_REPO_RE = re.compile(r"^/__ezil/control/standalone-repo-open/([0-9a-f]{64})$")
 STANDALONE_STATUS_RE = re.compile(r"^/__ezil/control/standalone-repo-open-status/([0-9a-f]{64})$")
+# Native sessions (native_session.py): the body's sha256 is in the signed path. The POST is held at
+# most NATIVE_HOLD seconds (inside the broker's 10 s delivery bound) for the runtime's ACK; the GET
+# is a pure read of the exact operation's private status.
+NATIVE_RE = re.compile(r"^/__ezil/control/native-session/([0-9a-f]{64})$")
+NATIVE_STATUS_RE = re.compile(r"^/__ezil/control/native-session-status/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+NATIVE_CL_RE = re.compile(r"[1-9][0-9]{0,5}")
+NATIVE_WRAPPER_MAX = 131072
+NATIVE_HOLD = 8.0           # absolute, from the first control IO, every later IO included (broker bound 10 s)
+NATIVE_REFUSALS = frozenset({"native_unavailable", "native_invalid", "renew_unsupported", "placement_mismatch",
+                             "operation_conflict", "session_exists", "permits_exhausted", "stopping", "grant_invalid",
+                             "lease_expired"})
 
 STREAM_BLOCK = 65536
 # The agent's own refusals of an `export` message (agent.handle): 409 export_invalid. Any other
@@ -163,7 +174,7 @@ class Sequencer:
     def _send_once(self, msg):
         msg["mac"] = agentmod.sign(self.key, msg)
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(10)
+        s.settimeout(getattr(self, "call_timeout", 10))   # set per call by send(), under self.lock
         try:
             s.connect(os.path.join(self.cfg.runDir, "control.sock"))
             s.sendall((json.dumps(msg) + "\n").encode())
@@ -177,7 +188,7 @@ class Sequencer:
             s.close()
         return json.loads(data or b"{}")
 
-    def send(self, op, **fields):
+    def send(self, op, timeout=10, **fields):
         with self.lock:
             if op == "presence":
                 now = self.monotonic()
@@ -186,6 +197,7 @@ class Sequencer:
             for attempt in (1, 2):
                 self.seq = max(self.seq + 1, int(self.clock() * 1000))
                 msg = {"op": op, "leaseEpoch": self.lease["leaseEpoch"], "ts": self.clock(), "seq": self.seq, **fields}
+                self.call_timeout = timeout
                 try:
                     resp = self._send_once(msg)
                 finally:
@@ -378,6 +390,53 @@ class Edge:
         if not ok:
             _reply(client, 401, {"ok": False, "error": err})
             return
+        runtime_rpc = re.fullmatch(r"/__ezil/control/native-runtime/([0-9a-f]{64})", path)
+        if runtime_rpc:
+            cl = head.get("content-length")
+            if head.method != "POST" or query or head.get("transfer-encoding") or len(cl) != 1 or not cl[0].isdigit() or not 0 < int(cl[0]) <= 130000:
+                _reply(client, 400, {"kind": "refused", "reason": "runtime_invalid"})
+                return
+            try:
+                raw, trailing = _recv_exact(client, int(cl[0]), head.rest)
+                if trailing or hashlib.sha256(raw).hexdigest() != runtime_rpc.group(1): raise ValueError("digest")
+                request = json.loads(raw)
+                reply = self.seq.send("native-runtime", request=request, timeout=10)
+                if len(json.dumps(reply).encode()) > 131072: raise ValueError("large")
+                if reply.get("kind") == "ok":
+                    reply = {"v": "ezil-native-runtime-rpc/1", "outcome": "ok", "result": reply["result"]}
+                elif reply.get("kind") == "unknown":
+                    reply = {"v": "ezil-native-runtime-rpc/1", "outcome": "unknown",
+                        "reason": "host_timeout" if reply.get("reason") == "host_timeout" else "host_no_ack"}
+                else:
+                    reply = {"v": "ezil-native-runtime-rpc/1", "outcome": "refused", "reason": reply.get("reason", "runtime_unavailable")}
+                _reply(client, 200, reply)
+            except (ValueError, OSError, AttributeError):
+                _reply(client, 503, {"v": "ezil-native-runtime-rpc/1", "outcome": "unknown", "reason": "host_no_ack"})
+            return
+        ready = re.fullmatch(r"/__ezil/control/native-readiness/([A-Za-z0-9_-]{1,4096})", path)
+        if ready:
+            if head.method != "GET" or query or head.get("content-length") or head.get("transfer-encoding") or head.rest:
+                _reply(client, 400, {"ok": False, "kind": "refused"})
+                return
+            try:
+                encoded = ready.group(1)
+                q = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+                reply = self.seq.send("native-readiness", query=q, timeout=3.5)
+                _reply(client, 200 if reply.get("ok") is True else 409, reply)
+            except (ValueError, OSError, AttributeError):
+                _reply(client, 503, {"ok": False, "kind": "unknown"})
+            return
+        native = NATIVE_RE.fullmatch(path)
+        native_status = NATIVE_STATUS_RE.fullmatch(path)
+        if native or native_status:
+            # Not HUMAN presence: native delivery/status never extends idle or billing (native_work,
+            # owned by the runtime's real model/tool activity, is the only native idle hold).
+            self._native(client, head, query, native.group(1) if native else None,
+                         native_status.group(1) if native_status else None)
+            return
+        if path == DESKTOP_STATUS_PATH:
+            self._desktop_status(client, head, query)
+            return
         self.seq.presence()
         restart = RESTART_RE.fullmatch(path)
         if restart:
@@ -411,9 +470,6 @@ class Edge:
         m = ICE_RE.match(path)
         if m:
             self._ice(client, head, m.group(1), query)
-            return
-        if path == DESKTOP_STATUS_PATH:
-            self._desktop_status(client, head, query)
             return
         m = PROXY_RE.match(path)
         if not m or int(m.group(1)) not in self.ports:
@@ -588,6 +644,87 @@ class Edge:
             _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
             return
         _reply(client, 200 if status else 202, answer)
+
+    # ------------------------------------------------------------ native sessions
+    def _native(self, client, head, query, digest, operation_id):
+        """POST: exactly Content-Length bytes (1..131072, no chunking), hashed BEFORE parsing and equal
+        to the signed digest, then the strict closed parse. Answers 200 running (acknowledged), 202
+        starting (held: the broker records it unknown), 409 a closed refusal, 503 anything else.
+        GET status: never starts, retries or reconciles. The grant and instruction are never logged
+        or echoed."""
+        from . import native_session
+        cl, te = head.get("content-length"), head.get("transfer-encoding")
+        if operation_id is not None:
+            if head.method != "GET" or query or cl or te or head.rest:
+                _reply(client, 400, {"ok": False, "error": "native_invalid"})
+                return
+            try:
+                resp = self.seq.send("native-session-status", operationId=operation_id)
+            except (OSError, ValueError, AttributeError):
+                resp = None
+            self._native_answer(client, resp, status_only=True)
+            return
+        if head.method != "POST" or query or te or len(cl) != 1 or not NATIVE_CL_RE.fullmatch(cl[0]) \
+                or int(cl[0]) > native_session.MAX_BODY:
+            _reply(client, 400, {"ok": False, "error": "native_invalid"})
+            return
+        try:
+            body, trailing = _recv_exact(client, int(cl[0]), head.rest)
+        except (ValueError, OSError):
+            _reply(client, 400, {"ok": False, "error": "native_invalid"})
+            return
+        if trailing or not hmac.compare_digest(hashlib.sha256(body).hexdigest(), digest):
+            _reply(client, 400, {"ok": False, "error": "native_invalid"})
+            return
+        delivery = native_session.parse_delivery(body)
+        if delivery is None or len(json.dumps(delivery).encode()) + 512 > NATIVE_WRAPPER_MAX:
+            _reply(client, 400, {"ok": False, "error": "native_invalid"})
+            return
+        # One absolute deadline for the admission and every status read. A late or lost answer is
+        # 202/503 (unknown upstream); nothing is ever re-sent or respawned.
+        deadline = time.monotonic() + NATIVE_HOLD
+        left = lambda: deadline - time.monotonic()  # noqa: E731
+        resp = None             # a failed status read keeps the last answer (starting -> 202)
+        try:
+            resp = self.seq.send("native-session", timeout=max(0.05, min(5.0, left())), delivery=delivery)
+            while isinstance(resp, dict) and resp.get("ok") is True and resp.get("state") == "starting" and left() > 0.3:
+                time.sleep(min(0.25, max(0.0, left() - 0.25)))
+                status = self.seq.send("native-session-status", timeout=max(0.05, left()),
+                                       operationId=delivery["operationId"])
+                if not isinstance(status, dict):
+                    break
+                resp = status
+        except (OSError, ValueError, AttributeError):
+            pass
+        self._native_answer(client, resp, status_only=False)
+
+    def _native_answer(self, client, resp, status_only):
+        """Rebuild a closed answer; never forward arbitrary agent fields."""
+        if not isinstance(resp, dict):
+            _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
+            return
+        if resp.get("ok") is not True:
+            error = resp.get("error")
+            if error in NATIVE_REFUSALS or (status_only and error == "operation_unknown"):
+                _reply(client, 404 if error == "operation_unknown" else 409, {"ok": False, "error": error})
+            else:
+                _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
+            return
+        state, reason = resp.get("state"), resp.get("reason")
+        if state not in ("starting", "running", "stopping", "stopped", "quarantined", "refused"):
+            _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
+            return
+        answer = {"ok": True, "state": state}
+        if isinstance(reason, str) and re.fullmatch(r"[a-z][a-z0-9_]{0,63}", reason):
+            answer["reason"] = reason
+        if status_only:
+            _reply(client, 200, answer)
+        elif state == "running":
+            _reply(client, 200, answer)
+        elif state == "starting":
+            _reply(client, 202, answer)
+        else:
+            _reply(client, 409, {"ok": False, "error": "native_start_failed", **({"reason": answer["reason"]} if "reason" in answer else {})})
 
     # ------------------------------------------------------------ reverse move export (§2.2)
     def _export_post(self, client, head, digest, query):

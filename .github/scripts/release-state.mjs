@@ -1,6 +1,7 @@
 // Provider identity and bounded recovery. Never persist raw provider objects or configuration.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -87,11 +88,48 @@ export async function readState(env, fetchImpl = fetch) {
       digest:container.configuration.image.match(/@(sha256:[a-f0-9]{64})$/)?.[1] ?? null},
   };
 }
+const nativeGate = 'AWS_NATIVE_SESSIONS_ENABLED';
+const canonicalBindingKeys = value => {
+  if (Array.isArray(value)) return value.map(canonicalBindingKeys);
+  if (value === null || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.keys(value).sort().map(key => [key, canonicalBindingKeys(value[key])]));
+};
+
+// Cloudflare Versions API metadata for a specifically identified Worker version.
+// Never write or print provider config values; secret values are not comparable.
+export function nativeWorkerBindings(version) {
+  const bindings = version.resources?.bindings;
+  assert.ok(Array.isArray(bindings) && bindings.length > 0, 'Worker version bindings unavailable');
+  const named = new Map();
+  for (const binding of bindings) {
+    assert.ok(binding && typeof binding.name === 'string' && typeof binding.type === 'string'
+      && !named.has(binding.name), 'Worker binding identities unavailable or ambiguous');
+    named.set(binding.name, binding);
+  }
+  const plain = name => {
+    const binding = named.get(name);
+    if (!binding) return null;
+    assert.ok(binding.type === 'plain_text' && typeof binding.text === 'string', 'Expected plain Worker gate binding');
+    return binding.text;
+  };
+  assert.ok(/^(1|true|on|yes)$/i.test(plain('AWS_ROUTING_ENABLED')?.trim() ?? ''), 'Existing AWS routing is disabled');
+  assert.ok(plain('AWS_ORIGIN_ZONE') === 'ezil.org' && named.get('AWS_TUNNELS')?.type === 'durable_object_namespace',
+    'Existing production AWS tunnel bindings do not match');
+  assert.ok(['SANDBOX_HMAC_SECRET', 'CLOUDFLARE_GUACAMOLE_HMAC_SECRET']
+    .some(key => named.get(key)?.type === 'secret_text'), 'Existing PreviewV2 signing binding missing');
+  const unaffected = Array.from(named.keys()).filter(name => name !== nativeGate).sort().map(name => {
+    const binding = named.get(name);
+    return binding.type.startsWith('secret') ? {type: binding.type, name} : canonicalBindingKeys(binding);
+  });
+  return { native_gate: plain(nativeGate), preserved_bindings_sha256:
+    createHash('sha256').update(JSON.stringify(unaffected)).digest('hex') };
+}
+
 // Cloudflare-only identity for the Worker-only production path: the active Worker
 // version, its git source annotation, and the production container image. It reads
 // no Vercel, so a Worker-only deploy never asserts VERCEL_* or touches os.ezil.work.
 // Fetch order and keys mirror readState's Worker/container half exactly.
-export async function readWorkerState(env, fetchImpl = fetch) {
+export async function readWorkerState(env, fetchImpl = fetch, includeNativeBindings = false) {
   for (const key of ['CLOUDFLARE_ACCOUNT_ID','CLOUDFLARE_API_TOKEN']) assert.ok(env[key], `Missing ${key}`);
   const request = async (url, token) => {
     const r = await fetchImpl(url, {headers: {authorization: `Bearer ${token}`}, redirect:'error', signal:AbortSignal.timeout(15000)});
@@ -116,6 +154,7 @@ export async function readWorkerState(env, fetchImpl = fetch) {
     worker_version: active.versions[0].version_id,
     worker_deployment: active.id ?? null,
     worker_source: version.result.annotations?.['workers/message']?.match(/^git:([a-f0-9]{40})$/)?.[1] ?? null,
+    ...(includeNativeBindings ? {aws_native: nativeWorkerBindings(version.result)} : {}),
     cloudflare_container: {id:container.id, image:container.configuration.image,
       digest:container.configuration.image.match(/@(sha256:[a-f0-9]{64})$/)?.[1] ?? null},
   };
@@ -275,9 +314,23 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   } else if (mode === 'worker-capture') {
     // Worker-only pre-deploy snapshot: Worker version (also the rollback target) and
     // container image. No Vercel, so this never reads os.ezil.work or VERCEL_*.
-    const state = await readWorkerState(env);
+    const state = await readWorkerState(env, fetch, Boolean(env.NATIVE_WORKER_SHA));
+    if (env.NATIVE_WORKER_SHA) {
+      assert.ok([null, '', '0', 'off', 'false', 'no'].includes(state.aws_native.native_gate),
+        'Native Worker gate already active or state ambiguous; reconcile the existing deployment');
+    }
     fs.writeFileSync('previous-release.json', JSON.stringify(state, null, 2));
     if (env.GITHUB_OUTPUT) fs.appendFileSync(env.GITHUB_OUTPUT, `worker_version=${workerVersionId(state.worker_version)}\n`);
+  } else if (mode === 'worker-native-verify') {
+    const previous = JSON.parse(fs.readFileSync('previous-release.json', 'utf8'));
+    const current = await readWorkerState(env, fetch, true);
+    assert.equal(current.worker_source, env.NATIVE_WORKER_SHA, 'Unexpected Native Worker source');
+    assert.equal(current.aws_native.native_gate, '1', 'Native Worker gate not activated');
+    assert.equal(current.aws_native.preserved_bindings_sha256, previous.aws_native.preserved_bindings_sha256,
+      'Unrelated Worker bindings changed');
+    assert.deepEqual(current.cloudflare_container, previous.cloudflare_container, 'Worker container changed');
+    console.log(JSON.stringify({worker_version: current.worker_version, rollback_version: previous.worker_version,
+      source: current.worker_source, ...current.aws_native}));
   } else if (mode === 'worker-rollback-guard') {
     // Admit Worker recovery only while this release (or the untouched previous one)
     // still owns production; never clobber a third release that deployed meanwhile.

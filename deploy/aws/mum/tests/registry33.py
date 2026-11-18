@@ -337,7 +337,7 @@ class StandaloneHostAbiTests(unittest.TestCase):
 
 
 HOST_ABI_FIXTURE = HERE / 'host-abi-predecessors.json'
-HOST_ABI_FIXTURE_TREES = 7
+HOST_ABI_FIXTURE_TREES = 8
 HOST_ABI_FIXTURE_MAX_FILES = 256
 HOST_ABI_PATH_PART = re.compile(r'[A-Za-z0-9._-]{1,128}')
 HOST_ABI_ENTRY = re.compile(r'(100644|100755) ([0-9a-f]{40})')
@@ -391,8 +391,10 @@ class DirectedHostAbiTests(unittest.TestCase):
     commit history or blob payload is needed. The final tree is this checkout's actual HEAD host tree. The private
     repository borrows this checkout's objects through alternates (read-only) and writes its own fixture objects."""
     PREVIOUS = '96ff8e224443e0d684cb99e808a903235f2def11'
-    TARGET = 'b7700d49c946157cd75c862bce867caf7fd08810'
+    DIAGNOSTICS = 'b7700d49c946157cd75c862bce867caf7fd08810'
+    TARGET = '82228b6e31dfcfedb116c3c6649ae78281b0d799'
     PREDECESSORS = {PREVIOUS: 'S 0c113cb4 standalone Git edge/history/resilience host',
+                    DIAGNOSTICS: 'cdd39dac standalone Git diagnostics host',
                     'c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d': 'stage 1f4712c4 and 6a187841',
                     '7a35e4c5ec543abe83b9bccc8c6e5af815e02247': 'main 9ca8b3c0',
                     # The deployed staging predecessor (R151): the closed diagnostics without the full-marker host_ready.
@@ -480,10 +482,11 @@ class DirectedHostAbiTests(unittest.TestCase):
         self.assertEqual([(source, target, len(delta)) for source, target, delta in self.maps()],
                          [('c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d', self.PREVIOUS, 8),
                           ('7a35e4c5ec543abe83b9bccc8c6e5af815e02247', self.PREVIOUS, 9),
-                          (self.PREVIOUS, self.TARGET, 5),
-                          ('c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d', self.TARGET, 11),
-                          ('7a35e4c5ec543abe83b9bccc8c6e5af815e02247', self.TARGET, 9),
-                          ('f3a5a1ba954c56ab31aa0c844cb5719c88905dfc', self.TARGET, 8)])
+                          (self.PREVIOUS, self.DIAGNOSTICS, 5),
+                          ('c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d', self.DIAGNOSTICS, 11),
+                          ('7a35e4c5ec543abe83b9bccc8c6e5af815e02247', self.DIAGNOSTICS, 9),
+                          ('f3a5a1ba954c56ab31aa0c844cb5719c88905dfc', self.DIAGNOSTICS, 8),
+                          (self.DIAGNOSTICS, self.TARGET, 10)])
         for source, target, delta in self.maps():
             old, new = self.files(source), self.files(target)
             self.assertEqual({n: (old.get(n), new.get(n)) for n in old.keys() | new.keys() if old.get(n) != new.get(n)}, delta)
@@ -544,7 +547,7 @@ class DirectedHostAbiTests(unittest.TestCase):
                         release.require_host_abi(commits[old], commits[new], self.repo)
 
     def test_partial_and_regressed_diagnostics_targets_refused(self):
-        target = self.files(self.TARGET)
+        target = self.files(self.DIAGNOSTICS)
         # Partial: the 6a/1f4712c4 tree with ONLY the five diagnostics files moved (no 96ff8e22 history/resilience).
         partial = {**self.files('c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d'), **{name: target[name] for name in self.DIAGNOSTIC_PATHS}}
         # Regressed: the final tree with the deployed predecessor's two-field, 1024/4096 host_ready.
@@ -556,11 +559,11 @@ class DirectedHostAbiTests(unittest.TestCase):
                     release.require_host_abi(self.commit(self.files(source)), baked, self.repo)
 
     def test_checked_in_head_is_the_target_from_every_reviewed_predecessor(self):
-        # The actual HEAD host tree, rebuilt from its own ls-tree, is the final TARGET and is reached from every
-        # predecessor that has a map into it; the 96ff8e22 maps keep their own exact deltas.
+        # HEAD is reached only from the exact current baseline. Historical predecessors keep their exact targets.
         head = self.commit(self.head_files())
         self.assertEqual(release.host_agent_tree_id(head, self.repo), self.TARGET)
-        anchors = {self.PREVIOUS: self.commit(self.files(self.PREVIOUS)), self.TARGET: head}
+        anchors = {self.PREVIOUS: self.commit(self.files(self.PREVIOUS)),
+                   self.DIAGNOSTICS: self.commit(self.files(self.DIAGNOSTICS)), self.TARGET: head}
         for source, target, delta in self.maps():
             baked, deployed = anchors[target], self.commit(self.files(source))
             with self.subTest(source=source, target=target):

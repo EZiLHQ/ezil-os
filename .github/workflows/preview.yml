@@ -20,6 +20,10 @@ on:
         description: 'On main only - deploy ONLY the ezil-os-worker Cloudflare Worker (no Vercel, no migrations; AWS serves os.ezil.work)'
         type: boolean
         default: false
+      native_worker_sha:
+        description: 'Approved full main SHA for Native PreviewV2 activation (requires Worker-only, unchanged image and bindings)'
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -441,7 +445,7 @@ jobs:
     # A skipped image build must not skip deployments for app/Worker-only runs.
     # Main deploys only from a confirmed manual dispatch, never from a push or merge.
     if: >-
-      ${{ !cancelled() && ((github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.deploy_production == true) || startsWith(github.ref, 'refs/tags/v')) &&
+      ${{ !cancelled() && ((github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.deploy_production == true && inputs.deploy_worker_only != true && inputs.native_worker_sha == '') || startsWith(github.ref, 'refs/tags/v')) &&
           needs.changes.result == 'success' &&
           (needs.images.result == 'success' || needs.images.result == 'skipped') }}
     runs-on: ubuntu-latest
@@ -954,7 +958,7 @@ jobs:
     needs: [changes, images]
     # Main deploys only from a confirmed manual dispatch, never from a push or merge.
     if: >-
-      ${{ !cancelled() && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.deploy_worker_only == true &&
+      ${{ !cancelled() && github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && inputs.deploy_worker_only == true && inputs.deploy_production != true &&
           needs.changes.result == 'success' &&
           (needs.images.result == 'success' || needs.images.result == 'skipped') }}
     runs-on: ubuntu-latest
@@ -974,6 +978,7 @@ jobs:
       EZIL_DEPLOY_SHA: ${{ github.sha }}
       EZIL_E2E_WORKER: ${{ vars.OS_WORKER_URL }}
       EZIL_WORKER_NAME: ezil-os-worker
+      NATIVE_WORKER_SHA: ${{ inputs.native_worker_sha }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -995,6 +1000,16 @@ jobs:
           url = urlparse(os.environ['EZIL_E2E_WORKER'])
           assert url.scheme == 'https' and url.hostname == 'api-desktop.ezil.org' and not url.username and not url.password and not url.port and not url.query and not url.fragment and url.path in ('', '/'), 'OS_WORKER_URL must be the production api-desktop.ezil.org origin'
           PY
+      - name: Admit the reviewed Native Worker source
+        if: inputs.native_worker_sha != ''
+        env:
+          IMAGE_CHANGED: ${{ needs.changes.outputs.image_changed }}
+        run: |
+          set -euo pipefail
+          [[ "$NATIVE_WORKER_SHA" =~ ^[a-f0-9]{40}$ && "$NATIVE_WORKER_SHA" == "$EZIL_DEPLOY_SHA" ]]
+          [[ "$(git rev-parse HEAD)" == "$NATIVE_WORKER_SHA" && "$IMAGE_CHANGED" == "false" ]]
+          git grep -q -F 'AWS_NATIVE_SESSIONS_ENABLED' -- worker/src/index.ts
+          git grep -q -F 'readAwsNativeReadiness' -- worker/src/aws-native-session.ts
       - name: Reserve time for Worker deployment and recovery
         id: deadline
         # 45-minute deploy/rollout/recovery budget inside the 58-minute job timeout,
@@ -1074,6 +1089,15 @@ jobs:
           script: |
             const { data: ref } = await github.rest.git.getRef({ ...context.repo, ref: 'heads/main' });
             if (ref.object.sha !== process.env.EZIL_DEPLOY_SHA) core.setFailed('main moved; wait for its CI run');
+      - name: Pin the existing production routing and binding manifest
+        if: inputs.native_worker_sha != ''
+        run: |
+          set -euo pipefail
+          previous="$(jq -er '.worker_source | select(test("^[a-f0-9]{40}$"))' previous-release.json)"
+          git diff --quiet "$previous" "$EZIL_DEPLOY_SHA" -- worker/wrangler.toml || {
+            echo '::error::The production Worker routing and binding manifest changed; this dispatch cannot update it.'
+            exit 1
+          }
       - name: Prepare Dockerfile.release from the tested image
         if: needs.changes.outputs.image_changed == 'true'
         run: |
@@ -1103,6 +1127,10 @@ jobs:
           args=()
           rollout=none
           if [[ '${{ needs.changes.outputs.image_changed }}' == true ]]; then rollout=immediate; fi
+          if [[ -n "$NATIVE_WORKER_SHA" ]]; then
+            [[ "$rollout" == none && "$NATIVE_WORKER_SHA" == "$EZIL_DEPLOY_SHA" ]]
+            args+=(--keep-vars --experimental-auto-create=false --autoconfig=false --var AWS_NATIVE_SESSIONS_ENABLED:1)
+          fi
           remaining=$(( ${{ steps.deadline.outputs.at }} - $(date +%s) - 16 * 60 ))
           (( remaining > 0 )) || { echo '::error::Insufficient time to deploy and recover'; exit 1; }
           current_main="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
@@ -1132,7 +1160,12 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-        run: node e2e/verify-cloud-deployment.mjs worker > live-evidence/deployment-identity.json
+        run: |
+          set -euo pipefail
+          node e2e/verify-cloud-deployment.mjs worker > live-evidence/deployment-identity.json
+          if [[ -n "$NATIVE_WORKER_SHA" ]]; then
+            node .github/scripts/release-state.mjs worker-native-verify > live-evidence/native-worker-bindings.json
+          fi
       - name: Record successfully deployed image source
         if: steps.identity.outcome == 'success'
         env:

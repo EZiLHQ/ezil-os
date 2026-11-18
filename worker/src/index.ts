@@ -1,4 +1,5 @@
 import { openAwsStandaloneRepo } from './aws-repo-open';
+import { NATIVE_BODY_MAX_BYTES, deliverAwsNativeSession, readAwsNativeSessionStatus, readAwsNativeReadiness, callAwsNativeRuntime } from './aws-native-session';
 import { ACCEPTANCE_RESET_DELAY_MS } from './acceptance-config';
 import { relayExpiryFor, relayOperation, RelayFailure, relayFailureResult, remainingRelayBudget, type RelayState, type RelayResult } from './relay-refresh';
 import { bridgeCodeSocket } from './code-socket';
@@ -132,6 +133,8 @@ interface Env extends SandboxEnv {
   CF_CONTAINER_ADMISSION_PAUSED?: string;
   /** Narrow standalone Git host operation; off unless explicitly enabled. */
   AWS_STANDALONE_REPO_OPEN_ENABLED?: string;
+  /** Native session delivery hop (`./aws-native-session.ts`). Off unless exactly enabled. */
+  AWS_NATIVE_SESSIONS_ENABLED?: string;
   /** Origin zone for `c-<sandboxId>-g<gen>-e<epoch>.<zone>`; used only if also allowlisted. */
   AWS_ORIGIN_ZONE?: string;
   AWS_ORIGIN_ZONE_ALLOWLIST?: string;
@@ -5468,6 +5471,32 @@ function repoOpenRoot(env: Env): RepoOpenRoot | null {
 }
 
 /**
+ * POST /sandbox/:name/native-session and GET /sandbox/:name/native-session/:operationId — v2 ONLY
+ * (the body carries a short Gateway grant; `preauthorizeV2` verified these exact bytes and that the
+ * claims name THIS sandbox). AWS computers only; nothing is retried or reconciled here.
+ */
+async function handleNativeSession(request: Request, env: Env, sandboxName: string, operationId: string | null): Promise<Response> {
+  const v2 = verifiedV2Claims.get(request);
+  if (!v2) {
+    const error = request.headers.get(PREVIEW_TOKEN_V2_HEADER) !== null ? 'hmac_v2_unverified' : 'hmac_v2_required';
+    return json({ ok: false, error }, 401);
+  }
+  const registry = awsRegistryFor(env);
+  const deps = {
+    enabled: awsRoutingEnabled(env.AWS_ROUTING_ENABLED) && awsRoutingEnabled(env.AWS_NATIVE_SESSIONS_ENABLED),
+    zone: resolveAwsOriginZone(env),
+    lookup: (sid: string) => registry ? lookupAwsTunnel(registry, sid) : Promise.resolve(null),
+    fetch: (input: RequestInfo | URL, init?: RequestInit) => fetch(input, init),
+  };
+  if (operationId?.startsWith('readiness:')) return readAwsNativeReadiness(request, v2, sandboxName, operationId.slice(10), deps);
+  if (operationId !== null && operationId !== 'runtime') return readAwsNativeSessionStatus(request, v2, sandboxName, operationId, deps);
+  const read = await readBoundedBody(request, NATIVE_BODY_MAX_BYTES).catch(() => null);
+  if (read === null) return json({ ok: false, error: 'invalid_body' }, 400);
+  if (read === 'too_large') return json({ ok: false, error: 'request_too_large' }, 413);
+  return operationId === 'runtime' ? callAwsNativeRuntime(request, v2, sandboxName, read, deps) : deliverAwsNativeSession(request, v2, sandboxName, read, deps);
+}
+
+/**
  * POST /sandbox/:name/repo-open — see `./repo-open.ts` for the contract.
  *
  * v2 ONLY. The body carries a git credential, and a v1 token binds no
@@ -8038,6 +8067,18 @@ const worker = {
       // Clone or fetch one project repository into a running computer's
       // workspace. v2-signed only; see `handleRepoOpen` / `./repo-open.ts`.
       return handleRepoOpen(request, env, decodeURIComponent(repoOpenMatch[1]));
+    }
+
+    const nativeRuntimeMatch = path.match(/^\/sandbox\/([^/]+)\/native-runtime$/);
+    if (method === 'POST' && nativeRuntimeMatch) return handleNativeSession(request, env, decodeURIComponent(nativeRuntimeMatch[1]), 'runtime');
+
+    const nativeReadyMatch = path.match(/^\/sandbox\/([^/]+)\/native-readiness\/([A-Za-z0-9_-]{1,4096})$/);
+    if (method === 'GET' && nativeReadyMatch) return handleNativeSession(request, env, decodeURIComponent(nativeReadyMatch[1]), `readiness:${nativeReadyMatch[2]}`);
+
+    const nativeSessionMatch = path.match(/^\/sandbox\/([^/]+)\/native-session(?:\/([0-9a-f-]{36}))?$/);
+    if (nativeSessionMatch && (method === 'POST') === (nativeSessionMatch[2] === undefined) && (method === 'POST' || method === 'GET')) {
+      // Native session delivery / exact-operation status. v2-signed only; see `./aws-native-session.ts`.
+      return handleNativeSession(request, env, decodeURIComponent(nativeSessionMatch[1]), nativeSessionMatch[2] ?? null);
     }
 
     const repoGrantMatch = path.match(/^\/sandbox\/([^/]+)\/repo-grant$/);

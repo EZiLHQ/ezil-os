@@ -333,7 +333,33 @@ test('production requires both production aliases to resolve the exact returned 
 });
 
 const { imagePlan } = await import('../.github/scripts/image-plan.mjs');
-const { readState, readWorkerState, assertWorkerOwner, workerVersionId, pullCloudflareImage, restoreVercel, captureContainerVersion, candidateRolloutDigest } = await import('../.github/scripts/release-state.mjs');
+const { readState, readWorkerState, nativeWorkerBindings, assertWorkerOwner, workerVersionId, pullCloudflareImage, restoreVercel, captureContainerVersion, candidateRolloutDigest } = await import('../.github/scripts/release-state.mjs');
+
+test('Native Worker binding verification allows exactly an added Native gate', () => {
+  const bindings = [
+    { name: 'AWS_ROUTING_ENABLED', type: 'plain_text', text: 'on' },
+    { name: 'AWS_ORIGIN_ZONE', type: 'plain_text', text: 'ezil.org' },
+    { name: 'AWS_TUNNELS', type: 'durable_object_namespace', class_name: 'AwsTunnelRegistry' },
+    { name: 'SANDBOX_HMAC_SECRET', type: 'secret_text' },
+    { name: 'SANDBOX_WORKSPACE_R2_BUCKET', type: 'r2_bucket', bucket_name: 'ezil-sandbox-workspaces' },
+  ];
+  const read = next => nativeWorkerBindings({ resources: { bindings: next } });
+  const before = read(bindings);
+  const native = { type: 'plain_text', name: 'AWS_NATIVE_SESSIONS_ENABLED', text: '1' };
+  assert.equal(before.native_gate, null);
+  const after = read([...bindings.toReversed(), native]);
+  assert.equal(after.native_gate, '1');
+  assert.equal(before.preserved_bindings_sha256, after.preserved_bindings_sha256);
+  assert.notEqual(read([...bindings, { name: 'OTHER', type: 'plain_text', text: 'unrelated' }]).preserved_bindings_sha256,
+    before.preserved_bindings_sha256);
+  assert.notEqual(read(bindings.map(binding => binding.name === 'SANDBOX_WORKSPACE_R2_BUCKET'
+    ? { ...binding, bucket_name: 'wrong-bucket' } : binding)).preserved_bindings_sha256, before.preserved_bindings_sha256);
+  assert.throws(() => read([...bindings, native, native]), /ambiguous/);
+  assert.throws(() => read([...bindings, { name: native.name, type: 'secret_text' }]), /plain Worker gate/);
+  assert.throws(() => read(bindings.filter(binding => binding.name !== 'SANDBOX_HMAC_SECRET')), /signing binding missing/);
+  assert.throws(() => read(bindings.map(binding => binding.name === 'AWS_ROUTING_ENABLED'
+    ? { ...binding, text: 'off' } : binding)), /routing is disabled/);
+});
 
 test('image keys rebuild changed base and branding independently without changing local pins', () => {
   const tree = p => `${p}-original`;
@@ -876,7 +902,7 @@ test('deployment triggers are preview/main and version-tag pushes plus manual di
   assert.deepEqual(push.children.map(node => node.line), ['branches: [preview, main]', "tags: ['v*']"]);
   const dispatch = triggers.children.find(node => node.line === 'workflow_dispatch:');
   assert.deepEqual(dispatch.children.map(node => node.line), ['inputs:']);
-  assert.deepEqual(dispatch.children[0].children.map(node => node.line), ['deploy_production:', 'deploy_worker_only:']);
+  assert.deepEqual(dispatch.children[0].children.map(node => node.line), ['deploy_production:', 'deploy_worker_only:', 'native_worker_sha:']);
   assert.deepEqual(dispatch.children[0].children[0].children.map(node => node.line).filter(line => !line.startsWith('description:')),
     ['type: boolean', 'default: false']);
 });
@@ -889,35 +915,41 @@ test('a push or merge to main never deploys production; only a confirmed main di
     return new Function('github', 'inputs', 'needs', 'cancelled', 'startsWith',
       `return (${text.replace(/^\$\{\{|\}\}$/g, '').trim()})`);
   };
-  const [images, preview, production] = ['images', 'preview', 'production'].map(condition);
+  const [images, preview, production, worker] = ['images', 'preview', 'production', 'worker-production'].map(condition);
   const startsWith = (value, prefix) => value.startsWith(prefix);
   // [ref, event, inputs, staging deploys, production job runs]
-  for (const [ref, event_name, inputs, staging, prod] of [
+  for (const [ref, event_name, suppliedInputs, staging, prod, workerOnly = false] of [
     ['refs/heads/main', 'push', {}, false, false],
     // Pushes carry no inputs; the event check still refuses one if they ever did.
     ['refs/heads/main', 'push', { deploy_production: true }, false, false],
     ['refs/heads/main', 'workflow_dispatch', {}, false, false],
     ['refs/heads/main', 'workflow_dispatch', { deploy_production: false }, false, false],
     ['refs/heads/main', 'workflow_dispatch', { deploy_production: true }, false, true],
+    ['refs/heads/main', 'workflow_dispatch', { deploy_worker_only: true, native_worker_sha: sha }, false, false, true],
+    ['refs/heads/main', 'workflow_dispatch', { deploy_production: true, deploy_worker_only: true, native_worker_sha: sha }, false, false],
+    ['refs/heads/main', 'workflow_dispatch', { deploy_production: true, native_worker_sha: sha }, false, false],
+    ['refs/heads/main', 'push', { deploy_worker_only: true, native_worker_sha: sha }, false, false],
     ['refs/heads/preview', 'push', {}, true, false],
     ['refs/heads/preview', 'workflow_dispatch', { deploy_production: true }, true, false],
     ['refs/heads/feature', 'workflow_dispatch', { deploy_production: true }, false, false],
     ['refs/tags/v1.2.3', 'push', {}, false, true],
   ]) {
     const github = { ref, event_name };
+    const inputs = { deploy_production: false, deploy_worker_only: false, native_worker_sha: '', ...suppliedInputs };
     for (const imagesResult of ['success', 'skipped', 'failure']) {
       const needs = { changes: { result: 'success', outputs: { image_changed: 'true' } }, images: { result: imagesResult } };
       const admitted = imagesResult !== 'failure';
       const label = `${event_name} ${ref} ${JSON.stringify(inputs)} images=${imagesResult}`;
       assert.equal(preview(github, inputs, needs, () => false, startsWith), staging && admitted, `staging: ${label}`);
       assert.equal(production(github, inputs, needs, () => false, startsWith), prod && admitted, `production: ${label}`);
+      assert.equal(worker(github, inputs, needs, () => false, startsWith), workerOnly && admitted, `worker: ${label}`);
       assert.equal(production(github, inputs, needs, () => true, startsWith), false, `cancelled: ${label}`);
     }
     // Branch pushes and dispatches still build, test and sign changed images.
     const needs = { changes: { outputs: { image_changed: 'true' } } };
     assert.equal(images(github, inputs, needs, () => false, startsWith), /^refs\/heads\/(?:main|preview)$/.test(ref), `images: ${ref}`);
   }
-  assert.equal(workflowText.match(/inputs\.deploy_production/g).length, 1);
+  assert.equal(workflowText.match(/inputs\.deploy_production/g).length, 2);
 });
 
 test('both live-check steps require their environment isolated computer secret', () => {
