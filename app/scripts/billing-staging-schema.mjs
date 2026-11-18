@@ -6,6 +6,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { basename, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { PRODUCTION_RECEIPT_ONLY_PINS, runProductionNativeSchema } from './billing-production-native.mjs';
 
 export const STAGING_REF = 'yjnwyugyhfpalqpqrnnt';
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
@@ -115,14 +116,17 @@ export function orderFiles(drizzleNames, placementNames) {
 
 export const sha256 = (content) => createHash('sha256').update(content).digest('hex');
 
-export function buildPlan(files, logged = null) {
+export function buildPlan(files, logged = null, receiptOnlyPins = {}) {
     const rows = new Map();
     if (logged !== null) {
         if (!Array.isArray(logged)) refuse('Invalid staging schema log.');
         for (const row of logged) {
             if (!row || typeof row.file !== 'string' || !HASH.test(row.sha256) ||
                 !['apply', 'baseline'].includes(row.mode) || rows.has(row.file)) refuse('Invalid staging schema log row.');
-            if (!files.some(({ file }) => file === row.file)) refuse('Staging schema log contains a file outside the reviewed list.');
+            if (!files.some(({ file }) => file === row.file) &&
+                (!Object.hasOwn(receiptOnlyPins, row.file) || row.sha256 !== receiptOnlyPins[row.file] || row.mode !== 'apply')) {
+                refuse('Staging schema log contains a file outside the reviewed list.');
+            }
             rows.set(row.file, row);
         }
     }
@@ -133,24 +137,33 @@ export function buildPlan(files, logged = null) {
     });
 }
 
-export function renderPlan(files, logged = null) {
-    return buildPlan(files, logged).map(({ file, sha256: digest, status }) =>
+export function renderPlan(files, logged = null, receiptOnlyPins = {}) {
+    return buildPlan(files, logged, receiptOnlyPins).map(({ file, sha256: digest, status }) =>
         `${file}  ${digest}${status === null ? '' : `  ${status}`}`).join('\n');
 }
 
 export function parseArgs(args) {
     let yes = false, target = 'ezil-os-awstest', expectSystemId, only;
+    let nativeProduction = false, expectRole, expectDatabase, expectEventTriggerSha256;
     const positional = [], seen = new Set();
     for (let i = 0; i < args.length; i++) {
         const arg = args[i];
         if (arg === '--yes') { yes = true; continue; }
-        if (arg === '--target' || arg === '--expect-system-id' || arg === '--only') {
+        if (arg === '--native-production') {
+            if (nativeProduction) refuse('Duplicate --native-production.');
+            nativeProduction = true;
+            continue;
+        }
+        if (['--target', '--expect-system-id', '--only', '--expect-role', '--expect-database', '--expect-event-trigger-sha256'].includes(arg)) {
             if (seen.has(arg) || !args[i + 1] || args[i + 1].startsWith('--')) refuse(`Missing or duplicate ${arg}.`);
             seen.add(arg);
             const value = args[++i];
             if (arg === '--target') target = value;
             else if (arg === '--only') only = value;
-            else expectSystemId = value;
+            else if (arg === '--expect-system-id') expectSystemId = value;
+            else if (arg === '--expect-role') expectRole = value;
+            else if (arg === '--expect-database') expectDatabase = value;
+            else expectEventTriggerSha256 = value;
         } else if (arg.startsWith('--')) refuse('Unknown staging option.');
         else positional.push(arg);
     }
@@ -158,13 +171,31 @@ export function parseArgs(args) {
     if (target.startsWith('aws-') && !/^[0-9]+$/.test(expectSystemId ?? '')) refuse(`${target} requires --expect-system-id <digits>.`);
     if (!target.startsWith('aws-') && expectSystemId !== undefined) refuse('--expect-system-id requires an aws-* target.');
     const mode = positional.shift() ?? 'plan';
-    if (!['plan', 'apply', 'baseline'].includes(mode)) refuse('Usage: billing-staging-schema.mjs [plan | apply [--only <file>] --yes | baseline <file...> --yes] [--target ezil-os-awstest|aws-preview|aws-production] [--expect-system-id <digits>]');
+    if (!['plan', 'apply', 'baseline'].includes(mode)) refuse('Usage: billing-staging-schema.mjs [plan | apply [--only <file>] --yes | baseline <file...> --yes] [--target ezil-os-awstest|aws-preview|aws-production] [--expect-system-id <digits>] [--native-production --expect-role <role> --expect-database <name> [--expect-event-trigger-sha256 <digest>]]');
     if (mode !== 'plan' && !yes) refuse(`${mode} requires --yes.`);
     if (mode === 'baseline' ? positional.length === 0 : positional.length !== 0) refuse('Only baseline accepts file arguments; baseline needs at least one file.');
     // Targeted apply: exactly one named file (a second --only is refused above); the default apply still runs every pending file.
     if (only !== undefined && mode !== 'apply') refuse('--only is accepted only by apply.');
     // Only the delegation replay ledger is targetable, by its exact canonical path (no basename or ./ alias).
     if (only !== undefined && only !== TARGETED_APPLY_FILE) refuse(`--only accepts only ${TARGETED_APPLY_FILE}.`);
+    if (nativeProduction) {
+        if (target !== 'aws-production' || mode === 'baseline' || only !== undefined) {
+            refuse('--native-production requires plan or apply on aws-production without --only.');
+        }
+        if (!['postgres', 'supabase_admin'].includes(expectRole) || !/^[a-zA-Z0-9_]{1,63}$/.test(expectDatabase ?? '')) {
+            refuse('--native-production requires explicit --expect-role postgres|supabase_admin and --expect-database.');
+        }
+        if (mode === 'apply' && !HASH.test(expectEventTriggerSha256 ?? '')) {
+            refuse('Native production apply requires --expect-event-trigger-sha256 from the reviewed preflight.');
+        }
+        if (mode === 'plan' && expectEventTriggerSha256 !== undefined) {
+            refuse('The event trigger pin is accepted only by native production apply.');
+        }
+        return { mode, files: positional, yes, target, expectSystemId, only, nativeProduction, expectRole, expectDatabase, expectEventTriggerSha256 };
+    }
+    if ([expectRole, expectDatabase, expectEventTriggerSha256].some(value => value !== undefined)) {
+        refuse('Native production database and catalog pins require --native-production.');
+    }
     return { mode, files: positional, yes, target, expectSystemId, only };
 }
 
@@ -179,7 +210,8 @@ export function run(args = process.argv.slice(2), {
     const databaseUrl = env.BILLING_STAGING_DATABASE_URL;
     const emit = (message) => write(redact(message, databaseUrl));
     try {
-        const { mode, files: baselineFiles, target, expectSystemId, only } = parseArgs(args);
+        const { mode, files: baselineFiles, target, expectSystemId, only, nativeProduction, expectRole, expectDatabase, expectEventTriggerSha256 } = parseArgs(args);
+        const receiptOnlyPins = target === 'aws-production' ? PRODUCTION_RECEIPT_ONLY_PINS : {};
         // The files this run may write: baseline's arguments or apply's single --only file; undefined for a full apply.
         const requested = only === undefined ? baselineFiles : [only];
         const connection = databaseUrl ? validateDatabaseUrl(databaseUrl, target) : null;
@@ -227,10 +259,10 @@ export function run(args = process.argv.slice(2), {
             PGCONNECT_TIMEOUT: connection.searchParams.get('connect_timeout') || '15',
             PGPASSFILE: '/dev/null',
         });
-        const psql = (parameters) => {
+        const psql = (parameters, { readOnly = false } = {}) => {
             let result;
             try {
-                result = spawnSyncImpl('psql', ['-X', '--no-password', '-v', 'ON_ERROR_STOP=1', '-q', '-A', '-t', ...(target.startsWith('aws-') && !parameters.includes('SELECT system_identifier FROM pg_control_system();') ?
+                result = spawnSyncImpl('psql', ['-X', '--no-password', '-v', 'ON_ERROR_STOP=1', '-q', '-A', '-t', ...(readOnly ? ['-c', 'SET TRANSACTION READ ONLY;'] : []), ...(target.startsWith('aws-') && !parameters.includes('SELECT system_identifier FROM pg_control_system();') ?
                         ['-c', `DO $pin$ BEGIN IF (SELECT system_identifier::text FROM pg_control_system()) IS DISTINCT FROM ${literal(expectSystemId)} THEN RAISE EXCEPTION 'System identifier mismatch'; END IF; END; $pin$;`] : []), ...parameters], {
                     cwd: ROOT, env: childEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
                 });
@@ -238,6 +270,10 @@ export function run(args = process.argv.slice(2), {
             if (result.error || result.signal || result.status !== 0) refuse('psql failed; stopped without retry. Outcome may be unconfirmed; run plan before retrying. Diagnostics suppressed to protect credentials.');
             return result.stdout;
         };
+        if (nativeProduction) {
+            const legacyFiles = files.filter(({ file }) => EXPLICIT_FILES.includes(file) && basename(file) !== '0012_compute_reverse_moves.sql');
+            return runProductionNativeSchema({ mode, expectRole, expectDatabase, expectEventTriggerSha256, legacyFiles, psql, emit });
+        }
         // Verify before even creating the log. Each later psql call opens a new
         // connection, so repeat the pin inside that same session before its SQL.
         if (target.startsWith('aws-')) {
@@ -254,9 +290,9 @@ export function run(args = process.argv.slice(2), {
         }
         // Validate the whole log before printing a plan or changing any schema file.
         if (!Array.isArray(logged)) refuse('Invalid staging schema log.');
-        const plan = buildPlan(files, logged);
+        const plan = buildPlan(files, logged, receiptOnlyPins);
         if (mode === 'plan') {
-            emit(renderPlan(files, logged));
+            emit(renderPlan(files, logged, receiptOnlyPins));
             return 0;
         }
         for (const entry of plan) {
