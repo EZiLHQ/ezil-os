@@ -394,6 +394,12 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
     const time = (j: ImageJob, now: Date) => new Date(Math.max(now.getTime(), Date.parse(j.updatedAt) + 1)).toISOString();
     const store = {
         read: (jobId: string) => read(db, jobId),
+        async launchedForVerification() {
+            return rowsOf(await db.execute(sql`/* image:launched-for-verification */ SELECT ${columnNames} FROM public.ezil_computer_image_jobs
+                WHERE launch_document IS NOT NULL AND recovery_document IS NULL
+                  AND phase IN ('launch_pending', 'verifying', 'unconfirmed')
+                ORDER BY updated_at ASC, job_id ASC LIMIT 20`)).map(parseImageJobRow);
+        },
         /** The placement and its released-pool row under the admission lock. Read-only. */
         async releasedPoolHost(computerId: string) {
             return withAdmission(db, async (tx, lock) => {

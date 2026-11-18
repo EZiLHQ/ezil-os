@@ -177,6 +177,12 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
             return { rows: imageJobs.filter(r => r.computer_id === computer
                 && (r.host_evidence as Record<string, unknown> | null)?.instanceId === instance).slice(0, 2).map(r => ({ ...r })) };
         }
+        if (text.startsWith('/* image:launched-for-verification */')) {
+            return { rows: imageJobs.filter(r => r.launch_document != null && r.recovery_document == null
+                && ['launch_pending', 'verifying', 'unconfirmed'].includes(String(r.phase)))
+                .sort((a, b) => String(a.updated_at).localeCompare(String(b.updated_at)) || String(a.job_id).localeCompare(String(b.job_id)))
+                .slice(0, 20).map(r => ({ ...r })) };
+        }
         const imageTable = text.includes('public.ezil_computer_image_jobs') && !text.includes('UNION ALL');
         const writeRows = imageTable ? imageJobs : placements;
         const presentWrite = imageTable ? (r: Row) => ({ ...r }) : present;

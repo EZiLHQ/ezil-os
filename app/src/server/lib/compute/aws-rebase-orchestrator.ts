@@ -56,6 +56,10 @@ function automaticJobId(fields: Pick<ImageJob, 'computerId' | 'sourceGeneration'
     return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
 }
 
+export function isAutomaticImageJob(job: ImageJob) {
+    return job.jobId === automaticJobId(job, job.targetRelease.amiId);
+}
+
 export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, automatic?: AutomaticOpen): Promise<ImageRebaseResponse> {
     let input = ImageRebaseRequestSchema.parse(raw);
     let j: ImageJob | null = null;
@@ -80,11 +84,22 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, aut
                 || input.jobId !== null || input.sourceRetirementExecutionArn !== undefined) return reply(409, false);
             const job = inspected.job;
             if (job) {
-                if (job.jobId !== automaticJobId(job, job.targetRelease.amiId) || job.recoveryDocument
-                    || ['failed', 'unconfirmed'].includes(job.phase)) return reply(409, false);
-                if (job.phase === 'snapshot_ready' || job.launchDocument) input = { ...input, operation: 'launch' };
-            } else if (!automatic.allowStart || p.state !== 'STOPPED' || p.lifecycleJobId) return reply(409, false);
-            if (!await automatic.canBoot(p)) return reply(409, false);
+                if (!isAutomaticImageJob(job) || job.recoveryDocument || job.phase === 'failed') return reply(409, false);
+                if (job.launchDocument) {
+                    // Billing can prevent a new dispatch, but verification must settle an already launched computer.
+                    const canDispatch = job.phase !== 'unconfirmed' && await automatic.canBoot(p);
+                    input = { ...input, operation: canDispatch ? 'launch' : 'verify' };
+                } else {
+                    const canDispatch = job.phase !== 'unconfirmed' && await automatic.canBoot(p);
+                    if (job.phase === 'snapshot_ready') {
+                        if (!canDispatch) return reply(409, false);
+                        input = { ...input, operation: 'launch' };
+                    } else if (!canDispatch) input = { ...input, operation: 'verify' };
+                }
+            } else {
+                if (!automatic.allowStart || p.state !== 'STOPPED' || p.lifecycleJobId || !await automatic.canBoot(p))
+                    return reply(409, false);
+            }
         }
         if (input.operation !== 'recover') j = inspected.job;
         if (input.jobId && j?.jobId !== input.jobId) {
@@ -263,10 +278,13 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, aut
             j = await deps.store.admitLaunch(j, workLaunch, now);
         }
         const work = launchFor(j);
+        const permitExpiresAt = () => {
+            const lease = JSON.parse(Buffer.from(work.intent.userData!, 'base64').toString('utf8')) as { rebasePermit: { expiresAt: string } };
+            return Date.parse(lease.rebasePermit.expiresAt);
+        };
         let execution = await describe(work);
         if (!execution && input.operation === 'launch') {
-            const lease = JSON.parse(Buffer.from(work.intent.userData!, 'base64').toString('utf8')) as { rebasePermit: { expiresAt: string } };
-            if (Date.parse(lease.rebasePermit.expiresAt) - deps.now().getTime() <= 120000) {
+            if (permitExpiresAt() - deps.now().getTime() <= 120000) {
                 await failJob('enrollment_time_insufficient', true); return reply(200, false);
             }
             // Recheck the original execution AND the completed snapshot on every launch retry.
@@ -278,6 +296,10 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, aut
             execution = await describe(work);
         }
         if (execution && j.phase === 'unconfirmed' && ['RUNNING', 'SUCCEEDED'].includes(execution.status)) j = await deps.store.resumeLaunch(j, execution, 'launch', deps.now());
+        if (!execution && isAutomaticImageJob(j) && permitExpiresAt() <= deps.now().getTime()) {
+            if (j.phase !== 'unconfirmed') await failJob('enrollment_time_insufficient', true);
+            return reply(409, false);
+        }
         if (!execution || execution.status === 'RUNNING') return reply(202, true);
         if (execution.status !== 'SUCCEEDED') { await failJob('launch_failed'); return reply(200, false); }
         const receipt = ImageLaunchReceiptSchema.parse(parseRebaseJson(execution.output ?? '', 8192));
@@ -292,7 +314,13 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, aut
             }
             return reply(202, true, null);
         }
-        if (!await deps.desktopHealthy(fresh.placement)) return reply(202, false, 'desktop_unhealthy');
+        if (!await deps.desktopHealthy(fresh.placement)) {
+            // Failed automatic launches retain their snapshot and evidence for the existing recovery operator.
+            if (isAutomaticImageJob(j) && permitExpiresAt() <= deps.now().getTime()) {
+                await failJob('desktop_unhealthy'); return reply(200, false);
+            }
+            return reply(202, false, 'desktop_unhealthy');
+        }
         j = await deps.store.succeed(j, { ...evidence, desktopHealthy: true }, deps.now());
         const size = meteredSizeForInstanceType(fresh.placement.instanceType);
         if (size) await recordComputeMeter(() => deps.meter?.ready({ userId: j!.ownerUserId, computerId: j!.computerId,

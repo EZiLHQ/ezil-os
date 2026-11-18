@@ -4,24 +4,47 @@ import { billingComputeMeter } from '@/server/billing/v2/compute-meter';
 import { sharedAwsSdkCollaborators } from './aws-clients';
 import { instanceTypeForTier, readAwsAdmissionConfig, readAwsEnrollUrl } from './aws-config';
 import { imageDesktopHealthy } from './aws-rebase-health';
-import { handleImageRebase } from './aws-rebase-orchestrator';
+import { handleImageRebase, isAutomaticImageJob, type ImageRebaseDeps } from './aws-rebase-orchestrator';
 import { createImageJobStore } from './aws-rebase-store';
 import type { PlacementDb } from './placement';
 import { plusPlanIds, resolveEntitlement, tierForEntitlement } from './tier';
 
-export async function advanceStagingImageUpdate(db: PlacementDb, computerId: string, ownerUserId: string, allowStart: boolean) {
+const isStaging = () => readAwsEnrollUrl(process.env) === 'https://os-staging.ezil.work/api/compute/aws/enroll';
+
+function dependencies(db: PlacementDb): ImageRebaseDeps | null {
     const env = process.env;
-    if (env.EZIL_AWS_AUTO_REBASE !== '1' || readAwsEnrollUrl(env) !== 'https://os-staging.ezil.work/api/compute/aws/enroll') return false;
-    const admission = readAwsAdmissionConfig(env);
-    if (!admission.enabled || admission.killSwitch) return false;
     const { starter, executions, describer } = sharedAwsSdkCollaborators(env);
-    if (!starter || !executions || !describer?.describeSnapshot) return false;
-    const result = await handleImageRebase({
+    if (!starter || !executions || !describer?.describeSnapshot) return null;
+    return {
         store: createImageJobStore(db, env), env, starter, executions, now: () => new Date(), meter: billingComputeMeter(),
         describer: { describeSnapshot: describer.describeSnapshot.bind(describer), describeVolume: describer.describeVolume.bind(describer),
             describeForEnrollment: describer.describeForEnrollment.bind(describer) },
         desktopHealthy: p => imageDesktopHealthy(p, env),
-    }, { schemaVersion: 1, operation: 'prepare', computerId, jobId: null }, {
+    };
+}
+
+/** Verification can finish already dispatched jobs even after automatic starts are disabled. */
+export async function verifyLaunchedStagingImageUpdates(db: PlacementDb) {
+    if (!isStaging()) return;
+    const deps = dependencies(db);
+    if (!deps) return;
+    const jobs = (await deps.store.launchedForVerification()).filter(isAutomaticImageJob).slice(0, 3);
+    await Promise.all(jobs.map(async job => {
+        const result = await handleImageRebase(deps, { schemaVersion: 1, operation: 'verify',
+            computerId: job.computerId, jobId: job.jobId });
+        if (result.body.failureCode && result.body.failureCode !== 'desktop_unhealthy')
+            console.warn('[aws-auto-update] background verification', { phase: result.body.phase, reason: result.body.failureCode });
+    }));
+}
+
+export async function advanceStagingImageUpdate(db: PlacementDb, computerId: string, ownerUserId: string, allowStart: boolean) {
+    const env = process.env;
+    if (env.EZIL_AWS_AUTO_REBASE !== '1' || !isStaging()) return false;
+    const admission = readAwsAdmissionConfig(env);
+    if (!admission.enabled || admission.killSwitch) return false;
+    const engine = dependencies(db);
+    if (!engine) return false;
+    const result = await handleImageRebase(engine, { schemaVersion: 1, operation: 'prepare', computerId, jobId: null }, {
         ownerUserId, allowStart,
         canBoot: async p => {
             const deps = getBillingDeps();
@@ -33,5 +56,11 @@ export async function advanceStagingImageUpdate(db: PlacementDb, computerId: str
                 kind: 'aws-ec2', instanceType: p.instanceType, now: deps.now() })).allowed;
         },
     });
-    return result.body.jobId !== null && result.body.phase !== 'failed' && result.body.phase !== 'unconfirmed';
+    const { body } = result;
+    if (body.failureCode && body.failureCode !== 'desktop_unhealthy') {
+        console.warn('[aws-auto-update] Code open', { phase: body.phase, reason: body.failureCode });
+        if (allowStart && body.jobId === null && body.failureCode === 'image_job_conflict')
+            return advanceStagingImageUpdate(db, computerId, ownerUserId, false);
+    }
+    return body.jobId !== null && (body.eligible || (result.status === 202 && body.failureCode === 'desktop_unhealthy'));
 }
