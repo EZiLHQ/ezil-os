@@ -15,7 +15,8 @@ const matches = (b: { policyId: string; profileId: string }, pin: AcceptedNative
 export function createProductionNativeHostTransport(env: Env, request: typeof fetch = fetch): NativeHostTransport {
     const accepted = loadAcceptedNativeDeployment(env);
     if (accepted.state !== 'ready') return UNAVAILABLE_HOST_TRANSPORT;
-    return createAwsHostTransport({ env: { ...env }, fetch: request, expectedManifestSha256: accepted.deployment.artifactManifestSha256 });
+    return createAwsHostTransport({ env: { ...env }, fetch: request, expectedManifestSha256: accepted.deployment.artifactManifestSha256,
+        expectedGatewayOrigin: accepted.deployment.gatewayOrigin });
 }
 export function createProductionNativeAiPort(db: NativeAuthorityDb, env: Env): NativeAiAuthorityPort | null {
     const accepted = loadAcceptedNativeDeployment(env);

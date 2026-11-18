@@ -1,8 +1,8 @@
 /**
  * Native Gateway grant broker: exchanges the signed-in owner's current Supabase access token (the proof) for
- * a short EZiL Gateway grant at ONE fixed staging endpoint, using the sealed `ezs_` service credential.
+ * a short EZiL Gateway grant at the fixed endpoint for this deployment, using the sealed `ezs_` service credential.
  *
- * Wire (Gateway c9): `POST https://ai-staging.ezil.work/v1/token/exchange`, `Authorization: Bearer ezs_…`,
+ * Wire (Gateway c9): `POST /v1/token/exchange`, `Authorization: Bearer ezs_…`,
  * body exactly `{ policyId: <uuid>, proofKind: 'supabase', subjectToken }`; success is `201` with exactly
  * `{ token_type: 'Bearer', access_token: 'ezg_' + 43 base64url, grant_id: <uuid>, expires_at: <RFC 3339> }`,
  * where c9 forwards PostgreSQL's `timestamptz` rendering unchanged (for example `2026-11-16T17:30:00+00:00`).
@@ -26,7 +26,10 @@
 
 import { readAccessTokenClaims } from '@/server/lib/ai-credential';
 
-export const NATIVE_GATEWAY_EXCHANGE_URL = 'https://ai-staging.ezil.work/v1/token/exchange';
+import { isNativeGatewayOrigin, nativeGatewayTarget, STAGING_NATIVE_GATEWAY, type NativeGatewayOrigin } from './native-gateway-origin';
+
+const EXCHANGE_PATH = '/v1/token/exchange';
+export const NATIVE_GATEWAY_EXCHANGE_URL = STAGING_NATIVE_GATEWAY + EXCHANGE_PATH;
 export const NATIVE_GRANT_MAX_TTL_MS = 5 * 60_000;
 export const NATIVE_EXCHANGE_TIMEOUT_MS = 8_000;
 export const NATIVE_EXCHANGE_REQUEST_MAX_BYTES = 8_192;
@@ -64,9 +67,10 @@ export function parseRfc3339(value: unknown): Date | null {
     return Number.isFinite(at) ? new Date(at) : null;
 }
 
-/** The sealed exchange configuration. All three values come from deployment configuration, never a caller. */
+/** The sealed exchange configuration. Its values come from deployment configuration, never a caller. */
 export interface NativeExchangeConfig {
     readonly policyId: string;
+    readonly gatewayOrigin: NativeGatewayOrigin;
     readonly serviceCredential: string;
     readonly serviceExpiresAt: Date;
 }
@@ -77,13 +81,16 @@ export interface NativeExchangeConfig {
  * or expired: the caller reports blocked and sends nothing.
  */
 export function nativeExchangeConfig(env: Readonly<Record<string, string | undefined>>, now: number): NativeExchangeConfig | null {
+    const target = nativeGatewayTarget(env.EZIL_NATIVE_SESSIONS_ORIGIN);
+    if (!target || (env.EZIL_NATIVE_AUTHORIZATION_AUDIENCE !== undefined &&
+        env.EZIL_NATIVE_AUTHORIZATION_AUDIENCE !== target.gatewayOrigin)) return null;
     const policyId = env.EZIL_NATIVE_GATEWAY_POLICY_ID;
     const serviceCredential = env.EZIL_NATIVE_GATEWAY_SERVICE_CREDENTIAL;
     const serviceExpiresAt = parseRfc3339(env.EZIL_NATIVE_GATEWAY_SERVICE_EXPIRES_AT);
     if (typeof policyId !== 'string' || !UUID.test(policyId)) return null;
     if (typeof serviceCredential !== 'string' || !SERVICE_CREDENTIAL.test(serviceCredential)) return null;
     if (!serviceExpiresAt || serviceExpiresAt.getTime() <= now) return null;
-    return Object.freeze({ policyId: policyId.toLowerCase(), serviceCredential, serviceExpiresAt });
+    return Object.freeze({ policyId: policyId.toLowerCase(), gatewayOrigin: target.gatewayOrigin, serviceCredential, serviceExpiresAt });
 }
 
 /**
@@ -127,7 +134,7 @@ export interface NativeExchangeOptions {
  * moment of sending. Nothing reached the Gateway, so it is a definite refusal, never an unknown outcome.
  */
 export class NativeExchangePreconditionError extends Error {
-    constructor(readonly reason: 'proof_invalid' | 'service_expired' | 'request_too_large' | 'lease_boundary') {
+    constructor(readonly reason: 'proof_invalid' | 'service_expired' | 'request_too_large' | 'lease_boundary' | 'gateway_origin_invalid') {
         super(`native_exchange_${reason}`);
         this.name = 'NativeExchangePreconditionError';
     }
@@ -188,6 +195,7 @@ export async function exchangeNativeGrant(
     subjectToken: string,
     options: NativeExchangeOptions,
 ): Promise<NativeExchangeOutcome> {
+    if (!isNativeGatewayOrigin(config.gatewayOrigin)) throw new NativeExchangePreconditionError('gateway_origin_invalid');
     const now = options.now();
     const proofExpiresAt = nativeProofExpiry(subjectToken, now);
     if (!proofExpiresAt) throw new NativeExchangePreconditionError('proof_invalid');
@@ -206,7 +214,7 @@ export async function exchangeNativeGrant(
     const signal = AbortSignal.timeout(timeoutMs);
     let response: Response;
     try {
-        response = await options.fetchImpl(NATIVE_GATEWAY_EXCHANGE_URL, {
+        response = await options.fetchImpl(config.gatewayOrigin + EXCHANGE_PATH, {
             method: 'POST',
             redirect: 'error',
             cache: 'no-store',

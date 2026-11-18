@@ -22,6 +22,8 @@ import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER } from '@/server/lib/comput
 const COUNTER = /^[1-9]\d{0,9}$/;
 const HOST_COUNTER_MAX = 2_147_483_647;
 const ANSWER_MAX_BYTES = 4096;
+import { PRODUCTION_NATIVE_GATEWAY, type NativeGatewayOrigin } from './native-gateway-origin';
+
 export const NATIVE_DELIVERY_BODY_MAX_BYTES = 131_072;
 
 /** The Root-sealed delivery fields this channel carries (the shared NativeHostDelivery). */
@@ -53,6 +55,7 @@ export interface AwsHostTransportConfig {
     now?: () => number;
     /** Trusted deployment pin; production always supplies it. */
     expectedManifestSha256?: string;
+    expectedGatewayOrigin?: NativeGatewayOrigin;
 }
 
 function hostCounter(value: string): number | null {
@@ -124,7 +127,9 @@ export function createAwsHostTransport(config: AwsHostTransportConfig) {
         const generation = hostCounter(target.placement.generation), leaseEpoch = hostCounter(target.placement.leaseEpoch);
         if (generation === null || leaseEpoch === null) return { kind: 'refused' };
         const issuedAt = now(), expiresAt = new Date(issuedAt + 4500).toISOString();
-        const query = { computerId: target.computerId, expiresAt, issuedAt: new Date(issuedAt).toISOString(), kind: target.kind,
+        const query = { computerId: target.computerId, expiresAt,
+            ...(config.expectedGatewayOrigin === PRODUCTION_NATIVE_GATEWAY ? { gatewayOrigin: config.expectedGatewayOrigin } : {}),
+            issuedAt: new Date(issuedAt).toISOString(), kind: target.kind,
             nonce: randomBytes(32).toString('base64url'), ownerUserId: target.ownerUserId,
             placement: { fenceToken: target.placement.fenceToken, generation: target.placement.generation,
                 instanceId: target.placement.instanceId, leaseEpoch: target.placement.leaseEpoch }, profileId: target.profileId };

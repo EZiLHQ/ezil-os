@@ -22,9 +22,10 @@
 import { inspect } from 'node:util';
 
 import { parseRfc3339 } from './broker';
+import { nativeGatewayTarget, nativeGatewayTargetForIssuer, type NativeGatewayEnvironment, type NativeGatewayOrigin } from './native-gateway-origin';
 import type { NativeWrappingKey } from './native-authorization-candidate';
 import {
-    NATIVE_AUTHORIZATION_ENVIRONMENT, base64UrlDecode, ed25519NativeSigner, isNativeIssuer, isNativeKeyId, isNativeUuid,
+    base64UrlDecode, ed25519NativeSigner, isNativeIssuer, isNativeKeyId, isNativeUuid,
     nativeSignedBytes, type NativeAssertionSigner,
 } from './native-authorization-protocol';
 
@@ -43,7 +44,8 @@ export type NativeAuthorizationMisconfiguration = 'gate' | 'issuer' | 'audience'
 
 export class NativeAuthorizationConfig {
     readonly #serviceCredential: string;
-    readonly environment = NATIVE_AUTHORIZATION_ENVIRONMENT;
+    readonly environment: NativeGatewayEnvironment;
+    readonly gatewayOrigin: NativeGatewayOrigin;
 
     constructor(
         readonly issuer: string,
@@ -54,6 +56,10 @@ export class NativeAuthorizationConfig {
         readonly signer: NativeAssertionSigner,
         readonly wrapping: NativeWrappingKey,
     ) {
+        const target = nativeGatewayTargetForIssuer(issuer);
+        if (!target || target.gatewayOrigin !== audience) throw new Error('Native Gateway issuer and audience mismatch');
+        this.environment = target.environment;
+        this.gatewayOrigin = target.gatewayOrigin;
         this.#serviceCredential = serviceCredential;
         Object.freeze(this);
     }
@@ -127,9 +133,13 @@ export async function loadNativeAuthorizationConfig(env: Readonly<Record<string,
     const fail = (reason: NativeAuthorizationMisconfiguration) => ({ state: 'misconfigured' as const, reason });
     if (env.EZIL_NATIVE_AUTHORIZATION !== 'enabled') return fail('gate');
     const issuer = env.EZIL_NATIVE_AUTHORIZATION_ISSUER;
-    if (!isNativeIssuer(issuer)) return fail('issuer');
+    const osOrigin = env.EZIL_NATIVE_SESSIONS_ORIGIN;
+    const target = nativeGatewayTarget(osOrigin);
+    if (!target || !osOrigin || !isNativeIssuer(issuer) ||
+        (issuer !== osOrigin && !issuer.startsWith(osOrigin + '/')) ||
+        nativeGatewayTargetForIssuer(issuer)?.gatewayOrigin !== target.gatewayOrigin) return fail('issuer');
     const audience = env.EZIL_NATIVE_AUTHORIZATION_AUDIENCE;
-    if (typeof audience !== 'string' || audience.length === 0 || audience.length > 500 || !/^[\x21-\x7e]+$/.test(audience)) return fail('audience');
+    if (audience !== target.gatewayOrigin) return fail('audience');
     const policyId = env.EZIL_NATIVE_AUTHORIZATION_POLICY_ID;
     if (!isNativeUuid(policyId)) return fail('policy');
     const credential = env.EZIL_NATIVE_AUTHORIZATION_SERVICE_CREDENTIAL;

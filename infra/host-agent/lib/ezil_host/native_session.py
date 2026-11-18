@@ -171,10 +171,19 @@ def from_config(cfg, lease, key, log):
     constructed admits nothing: gate() is re-evaluated on every request."""
     if cfg.get("nativeSessions") != "enabled":
         return None
+    from urllib.parse import urlsplit
     from . import guard, native_artifact, native_isolation
     from .storage import endpoint
     origin = endpoint(cfg, lease)
     if origin is None:
+        return None
+    os_url = urlsplit(origin)
+    expected_gateway = {
+        "https://os-staging.ezil.work": "https://ai-staging.ezil.work",
+        "https://os.ezil.work": "https://ai.ezil.work",
+        "https://os-prod.ezil.work": "https://ai.ezil.work",
+    }.get(f"{os_url.scheme}://{os_url.netloc}")
+    if not expected_gateway or cfg.get("nativeGatewayOrigin") != expected_gateway:
         return None
     url = origin[: -len("/api/compute/aws/storage")] + nauth.PATH
     pin = cfg.get("nativeRuntimePin")
@@ -283,8 +292,14 @@ class Manager:
         """Authenticated target qualification only: no ledger mutation, admission, grant or process."""
         try:
             from .native_isolation import boot_id, derive_host_epoch
-            if set(query) != {"kind", "profileId", "ownerUserId", "computerId", "placement", "issuedAt", "expiresAt", "nonce"}:
+            keys = {"kind", "profileId", "ownerUserId", "computerId", "placement", "issuedAt", "expiresAt", "nonce"}
+            if set(query) not in (keys, keys | {"gatewayOrigin"}):
                 raise ValueError("shape")
+            # Original staging queries omitted the Gateway. Production must bind its expected origin
+            # in the authenticated challenge before OS can exchange a credential.
+            gateway = query.get("gatewayOrigin", "https://ai-staging.ezil.work")
+            if gateway not in ("https://ai-staging.ezil.work", "https://ai.ezil.work") or gateway != self.cfg.get("nativeGatewayOrigin"):
+                raise ValueError("gateway_origin")
             now = int(self.clock() * 1000)
             issued, expires = nauth.parse_ms(query["issuedAt"]), nauth.parse_ms(query["expiresAt"])
             p = query["placement"]

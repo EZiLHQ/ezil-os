@@ -1,6 +1,8 @@
 /** Trusted deployment configuration only. No caller input, observed runtime digest, or Core code imports. */
 import { createHash } from 'node:crypto';
 
+import { nativeGatewayTarget, type NativeGatewayOrigin } from './native-gateway-origin';
+
 export const NATIVE_DEPLOYMENT_ENV = ['EZIL_NATIVE_DEPLOYMENT_DESCRIPTOR', 'EZIL_NATIVE_DEPLOYMENT_DESCRIPTOR_SHA256',
     'EZIL_NATIVE_RUNTIME_MANIFEST_SHA256', 'EZIL_NATIVE_AUTHORIZATION_POLICY_ID'] as const;
 export const NATIVE_POLICY_REVISION = 'bare-cli2.1.310-r2';
@@ -55,7 +57,7 @@ function validArtifact(m: Record<string, unknown>): boolean {
 export interface AcceptedNativeDeployment {
     readonly policyRevision: typeof NATIVE_POLICY_REVISION; readonly profileId: 'ezil-native-claude-v1'; readonly policyId: string; readonly artifactManifestSha256: string;
     /** Core compiled-policy digest, raw64. Distinct from the Host profile digest. */
-    readonly corePolicyDigest: string; readonly hostPolicyDigest: string; readonly descriptorSha256: string;
+    readonly gatewayOrigin: NativeGatewayOrigin; readonly corePolicyDigest: string; readonly hostPolicyDigest: string; readonly descriptorSha256: string;
 }
 export type NativeDeploymentState = { state: 'off' } | { state: 'blocked'; reason: 'native_deployment_unqualified' }
     | { state: 'ready'; deployment: Readonly<AcceptedNativeDeployment> };
@@ -63,6 +65,8 @@ export type NativeDeploymentState = { state: 'off' } | { state: 'blocked'; reaso
 export function loadAcceptedNativeDeployment(env: Readonly<Record<string, string | undefined>>): NativeDeploymentState {
     if (NATIVE_DEPLOYMENT_ENV.slice(0, 3).every(k => !env[k])) return { state: 'off' };
     const refuse = (): NativeDeploymentState => ({ state: 'blocked', reason: 'native_deployment_unqualified' });
+    const target = nativeGatewayTarget(env.EZIL_NATIVE_SESSIONS_ORIGIN);
+    if (!target || env.EZIL_NATIVE_AUTHORIZATION_AUDIENCE !== target.gatewayOrigin) return refuse();
     const raw = env.EZIL_NATIVE_DEPLOYMENT_DESCRIPTOR, pin = env.EZIL_NATIVE_DEPLOYMENT_DESCRIPTOR_SHA256;
     const artifactPin = env.EZIL_NATIVE_RUNTIME_MANIFEST_SHA256, policyId = env.EZIL_NATIVE_AUTHORIZATION_POLICY_ID;
     if (!raw || Buffer.byteLength(raw, 'utf8') > 1048576 || !pin || !HEX.test(pin) || nativeDeploymentSha256(raw) !== pin
@@ -75,10 +79,10 @@ export function loadAcceptedNativeDeployment(env: Readonly<Record<string, string
         || !host || nativePolicyCanonical(host) !== nativePolicyCanonical(NATIVE_ACCEPTED_PROFILE)
         || !policy || !exact(policy, ['model', 'tools', 'limits', 'gatewayOrigin', 'caPem', 'spkiSha256'])
         || policy.model !== host.model || nativePolicyCanonical(policy.tools) !== nativePolicyCanonical(NATIVE_ACCEPTED_TOOLS)
-        || nativePolicyCanonical(policy.limits) !== nativePolicyCanonical(LIMITS) || policy.gatewayOrigin !== 'https://ai-staging.ezil.work'
+        || nativePolicyCanonical(policy.limits) !== nativePolicyCanonical(LIMITS) || policy.gatewayOrigin !== target.gatewayOrigin
         || !(typeof policy.caPem === 'string' && policy.caPem.length <= 32768 && policy.caPem.includes('-----BEGIN CERTIFICATE-----'))
         || !(typeof policy.spkiSha256 === 'string' && /^[A-Za-z0-9+/]{43}=$/.test(policy.spkiSha256))) return refuse();
     return { state: 'ready', deployment: Object.freeze({ policyRevision: NATIVE_POLICY_REVISION, profileId: 'ezil-native-claude-v1', policyId, artifactManifestSha256: artifactPin,
-        corePolicyDigest: nativeDeploymentSha256(String(descriptor.corePolicyBytes)),
+        gatewayOrigin: target.gatewayOrigin, corePolicyDigest: nativeDeploymentSha256(String(descriptor.corePolicyBytes)),
         hostPolicyDigest: 'sha256:' + nativeDeploymentSha256(String(descriptor.hostProfileBytes)), descriptorSha256: pin }) };
 }

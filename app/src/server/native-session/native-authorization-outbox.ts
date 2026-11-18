@@ -374,7 +374,7 @@ export async function prepareNativeRenewal(db: NativeAuthorityDb, deps: NativeOu
         if (!authorization) return { kind: 'refused', reason: 'binding_conflict' };
         if (authorization.revoke_operation_id !== null) return { kind: 'refused', reason: 'authorization_revoked' };
         if (await hasUnresolvedRenewal(tx, binding.authorizationId, null)) return { kind: 'refused', reason: 'unresolved_renewal' };
-        const semantic = nativeRenewSemantic(binding, operationId, leaseExpiresAt, tokenSha256);
+        const semantic = nativeRenewSemantic(binding, operationId, leaseExpiresAt, tokenSha256, deps.config.environment);
         const semanticDigest = nativeCanonicalDigest(semantic);
         const sealed = await sealNativeCandidate(deps.config.wrapping, candidate,
             { ownerUserId, operationId, authorizationId: binding.authorizationId, semanticDigest, tokenSha256 });
@@ -439,7 +439,7 @@ export async function prepareNativeRevoke(db: NativeAuthorityDb, deps: NativeOut
         // Clock read after every lock wait.
         const now = deps.now();
         if (deps.config.serviceExpiresAt.getTime() <= now) return { kind: 'refused', reason: 'service_expired' };
-        const semantic = nativeRevokeSemantic(binding, operationId);
+        const semantic = nativeRevokeSemantic(binding, operationId, deps.config.environment);
         await tx.execute(sql`/* native-authorization:mark-revoked */ UPDATE public.ezil_native_authorizations
             SET revoke_operation_id = ${operationId}::uuid, revoke_requested_at = ${at(now)}::timestamptz
             WHERE authorization_id = ${authorizationId}::uuid AND revoke_operation_id IS NULL`);

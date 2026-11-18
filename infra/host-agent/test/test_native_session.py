@@ -210,6 +210,26 @@ class Manager(unittest.TestCase):
     def ledger_text(self):
         return "".join(open(os.path.join(self.dir, "native", "ops", n)).read() for n in os.listdir(os.path.join(self.dir, "native", "ops")))
 
+    def test_readiness_binds_production_gateway_and_keeps_staging_challenge(self):
+        m = self.manager()
+        placement = delivery()["placement"]
+        m.witness_reader = lambda _: {"computerId": CMP, "placement": placement}
+        when = now_ms()
+        m.clock = lambda: when / 1000
+        q = {"kind": "create", "profileId": ns.PROFILE_ID, "ownerUserId": OWN, "computerId": CMP,
+             "placement": placement, "issuedAt": na.iso_ms(when - 1000),
+             "expiresAt": na.iso_ms(when + 3000), "nonce": "A" * 43}
+        main = dict(q, gatewayOrigin="https://ai.ezil.work")
+        self.cfg["nativeGatewayOrigin"] = "https://ai-staging.ezil.work"
+        self.assertEqual(m.readiness(q).get("kind"), "ready")
+        self.assertEqual(m.readiness(main).get("kind"), "refused")
+        self.cfg["nativeGatewayOrigin"] = "https://ai.ezil.work"
+        self.assertEqual(m.readiness(q).get("kind"), "refused")
+        self.assertEqual(m.readiness(dict(q, gatewayOrigin="https://foreign.example.test")).get("kind"), "refused")
+        result = m.readiness(main)
+        self.assertEqual(result.get("kind"), "ready")
+        self.assertEqual(result["targetDigest"], hashlib.sha256(na.canonical(main)).hexdigest())
+
     def test_gate_placement_overflow_renew_and_semantic_idempotency(self):
         self.assertEqual(self.manager(witness=False).admit(raw(delivery())), {"ok": False, "error": "native_unavailable"})
         m = self.manager()

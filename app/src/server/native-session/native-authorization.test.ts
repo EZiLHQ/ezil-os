@@ -235,6 +235,7 @@ describe('native authorization configuration', () => {
     const envFor = async () => {
         const keys = await fixtureKeys();
         return { keys, env: {
+            EZIL_NATIVE_SESSIONS_ORIGIN: 'https://os-staging.ezil.work',
             EZIL_NATIVE_AUTHORIZATION: 'enabled', EZIL_NATIVE_AUTHORIZATION_ISSUER: ISSUER, EZIL_NATIVE_AUTHORIZATION_AUDIENCE: AUDIENCE,
             EZIL_NATIVE_AUTHORIZATION_SIGNING_KEY_ID: SIGNING_KID,
             EZIL_NATIVE_AUTHORIZATION_SIGNING_KEY: JSON.stringify({ kty: 'OKP', crv: 'Ed25519', x: keys.privateJwk.x, d: keys.privateJwk.d }),
@@ -243,6 +244,39 @@ describe('native authorization configuration', () => {
             EZIL_NATIVE_GRANT_WRAPPING_KEY_ID: WRAPPING_KID, EZIL_NATIVE_GRANT_WRAPPING_KEY: Buffer.from(keys.wrappingRaw).toString('base64url'),
         } as Record<string, string | undefined> };
     };
+
+    it('signs and sends production authorizations only to the main Gateway', async () => {
+        const now = Date.now();
+        const { env } = await envFor();
+        const prod = { ...env, EZIL_NATIVE_SESSIONS_ORIGIN: 'https://os.ezil.work',
+            EZIL_NATIVE_AUTHORIZATION_ISSUER: 'https://os.ezil.work/native-authorization',
+            EZIL_NATIVE_AUTHORIZATION_AUDIENCE: 'https://ai.ezil.work' };
+        for (const invalid of [{ EZIL_NATIVE_AUTHORIZATION_AUDIENCE: AUDIENCE },
+            { EZIL_NATIVE_AUTHORIZATION_ISSUER: ISSUER }, { EZIL_NATIVE_SESSIONS_ORIGIN: 'https://foreign.example.test' }]) {
+            expect((await loadNativeAuthorizationConfig({ ...prod, ...invalid }, now)).state).toBe('misconfigured');
+        }
+        const loaded = await loadNativeAuthorizationConfig(prod, now);
+        expect(loaded.state).toBe('ready');
+        if (loaded.state !== 'ready') throw Error('missing production fixture');
+        const { config } = loaded;
+        const binding = nativeConsentBinding(approvedConsent(now))!;
+        const renewal = nativeRenewSemantic(binding, randomUUID(), lease(now), nativeTokenSha256(newNativeGrantCandidate()), config.environment);
+        const revoke = nativeRevokeSemantic(binding, randomUUID(), config.environment);
+        const options = { issuer: config.issuer, audience: config.audience, nowMs: now };
+        const assertion = await signNativeAssertion(config.signer, renewal, options);
+        const revocation = await signNativeAssertion(config.signer, revoke, options);
+        expect(JSON.parse(Buffer.from(assertion.token.split('.')[0]!, 'base64url').toString())).toMatchObject({
+            environment: 'production', audience: 'https://ai.ezil.work', issuer: config.issuer,
+        });
+        const fetch = recordingFetch(() => new Response(null, { status: 403 }));
+        const deps = { fetchImpl: fetch.fetchImpl, now: () => now };
+        await postNativeRenewal(config, renewal, assertion, deps);
+        await postNativeRevoke(config, revoke, revocation, deps);
+        expect(fetch.calls.map(call => call.url)).toEqual(['https://ai.ezil.work/v1/token/exchange',
+            'https://ai.ezil.work/v1/token/native-authorization/revoke']);
+        await expect(postNativeRenewal(config, { ...renewal, environment: 'staging' }, assertion, deps)).rejects.toThrow('gateway_origin_mismatch');
+        expect(fetch.calls).toHaveLength(2);
+    });
 
     it('is off with every pin absent, misconfigured with any one missing or invalid, and ready only when complete', async () => {
         const now = Date.now();

@@ -4,6 +4,18 @@ import { loadAcceptedNativeDeployment, nativePolicyCanonical as canonical, nativ
     NATIVE_ACCEPTED_PROFILE as profile } from './accepted-policy';
 const policyId = '11111111-1111-4111-8111-111111111111';
 describe('trusted native deployment policy producer', () => {
+    it('pairs the descriptor and consent audience with the exact configured OS origin', () => {
+        const main = fixture(undefined, 'https://os.ezil.work');
+        const stage = fixture();
+        expect(loadAcceptedNativeDeployment(main.env)).toMatchObject({ state: 'ready', deployment: { gatewayOrigin: 'https://ai.ezil.work' } });
+        expect(loadAcceptedNativeDeployment({ ...stage.env, EZIL_NATIVE_SESSIONS_ORIGIN: 'https://os.ezil.work',
+            EZIL_NATIVE_AUTHORIZATION_AUDIENCE: 'https://ai.ezil.work' })).toMatchObject({ state: 'blocked' });
+        expect(loadAcceptedNativeDeployment({ ...main.env, EZIL_NATIVE_AUTHORIZATION_AUDIENCE: 'https://ai-staging.ezil.work' }))
+            .toMatchObject({ state: 'blocked' });
+        expect(loadAcceptedNativeDeployment({ ...main.env, EZIL_NATIVE_SESSIONS_ORIGIN: 'https://foreign.example.test' }))
+            .toMatchObject({ state: 'blocked' });
+    });
+
     it('defaults off and blocks partial pins without any descriptor or runtime TOFU', () => {
         expect(loadAcceptedNativeDeployment({})).toEqual({ state: 'off' });
         expect(loadAcceptedNativeDeployment({ EZIL_NATIVE_RUNTIME_MANIFEST_SHA256: 'a'.repeat(64) })).toMatchObject({ state: 'blocked' });

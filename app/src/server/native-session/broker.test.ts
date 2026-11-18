@@ -16,7 +16,7 @@ const b64 = (value: unknown) => Buffer.from(JSON.stringify(value)).toString('bas
 const proof = (expSeconds = NOW / 1000 + 3600) => `${b64({ alg: 'HS256' })}.${b64({ sub: 'u', exp: expSeconds })}.sig`;
 const PROOF = proof();
 const config = (overrides: Partial<NativeExchangeConfig> = {}): NativeExchangeConfig =>
-    ({ policyId: POLICY, serviceCredential: SERVICE, serviceExpiresAt: new Date(NOW + 86_400_000), ...overrides });
+    ({ policyId: POLICY, gatewayOrigin: 'https://ai-staging.ezil.work', serviceCredential: SERVICE, serviceExpiresAt: new Date(NOW + 86_400_000), ...overrides });
 /** Render an instant as PostgreSQL does in JSON: seconds, explicit numeric offset. */
 const pgTimestamptz = (ms: number, offsetMinutes = 0) => {
     const local = new Date(ms + offsetMinutes * 60_000).toISOString().slice(0, 19);
@@ -64,10 +64,10 @@ describe('parseRfc3339', () => {
 });
 
 describe('nativeExchangeConfig', () => {
-    const env = { EZIL_NATIVE_GATEWAY_POLICY_ID: POLICY, EZIL_NATIVE_GATEWAY_SERVICE_CREDENTIAL: SERVICE,
+    const env = { EZIL_NATIVE_SESSIONS_ORIGIN: 'https://os-staging.ezil.work', EZIL_NATIVE_GATEWAY_POLICY_ID: POLICY, EZIL_NATIVE_GATEWAY_SERVICE_CREDENTIAL: SERVICE,
         EZIL_NATIVE_GATEWAY_SERVICE_EXPIRES_AT: '2026-11-17T00:00:00+00:00' };
     it('accepts only a complete, c9-shaped, unexpired sealed configuration', () => {
-        expect(nativeExchangeConfig(env, NOW)).toEqual({ policyId: POLICY, serviceCredential: SERVICE, serviceExpiresAt: new Date('2026-11-17T00:00:00Z') });
+        expect(nativeExchangeConfig(env, NOW)).toEqual({ policyId: POLICY, gatewayOrigin: 'https://ai-staging.ezil.work', serviceCredential: SERVICE, serviceExpiresAt: new Date('2026-11-17T00:00:00Z') });
         for (const broken of [{ EZIL_NATIVE_GATEWAY_POLICY_ID: undefined }, { EZIL_NATIVE_GATEWAY_SERVICE_CREDENTIAL: undefined },
             { EZIL_NATIVE_GATEWAY_SERVICE_EXPIRES_AT: undefined }, { EZIL_NATIVE_GATEWAY_POLICY_ID: 'native-staging-v1' },
             { EZIL_NATIVE_GATEWAY_SERVICE_CREDENTIAL: GRANT }, { EZIL_NATIVE_GATEWAY_SERVICE_CREDENTIAL: `ezs_${'S'.repeat(40)}` },
@@ -76,6 +76,18 @@ describe('nativeExchangeConfig', () => {
             { EZIL_NATIVE_GATEWAY_SERVICE_EXPIRES_AT: 'tomorrow' }]) {
             expect(nativeExchangeConfig({ ...env, ...broken }, NOW), JSON.stringify(broken)).toBeNull();
         }
+    });
+
+    it('uses the main Gateway only for a validated production OS origin', async () => {
+        const production = nativeExchangeConfig({ ...env, EZIL_NATIVE_SESSIONS_ORIGIN: 'https://os.ezil.work' }, NOW);
+        expect(production?.gatewayOrigin).toBe('https://ai.ezil.work');
+        expect(nativeExchangeConfig({ ...env, EZIL_NATIVE_SESSIONS_ORIGIN: 'https://other.example.test' }, NOW)).toBeNull();
+        expect(nativeExchangeConfig({ ...env, EZIL_NATIVE_AUTHORIZATION_AUDIENCE: 'https://ai.ezil.work' }, NOW)).toBeNull();
+        let destination;
+        const fetchImpl: typeof fetch = async (input) => { destination = String(input); return new Response(null, { status: 403 }); };
+        await expect(exchangeNativeGrant(production!, PROOF, { fetchImpl, now: () => NOW }))
+            .resolves.toEqual({ kind: 'refused', status: 403 });
+        expect(destination).toBe('https://ai.ezil.work/v1/token/exchange');
     });
 
     it('reports the latest grant c9 can issue: the whole exchange budget plus five minutes, capped by proof and service', () => {

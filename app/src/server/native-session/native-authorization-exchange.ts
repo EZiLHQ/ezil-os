@@ -1,12 +1,12 @@
 /**
- * One HTTP attempt to the Gateway's native authorization endpoints, at one fixed staging origin.
+ * One HTTP attempt to the Gateway's native authorization endpoints, at the fixed origin for the configured deployment.
  *
- * - Renew: `POST https://ai-staging.ezil.work/v1/token/exchange`, `Authorization: Bearer ezs_…` (the native service
+ * - Renew: `POST /v1/token/exchange`, `Authorization: Bearer ezs_…` (the native service
  *   credential), body exactly `{policyId, proofKind:"ezil_native_authorization", subjectToken}`. The Gateway answers
  *   `201` for a new grant or `200` for an equal replay, with exactly `{object:"native_authorization_grant", grant_id,
  *   expires_at, authorization_id, epoch, authorization_deadline, budget_micro, replayed}`. There is no access token:
  *   the OS already holds its candidate, and the candidate never travels on this wire.
- * - Revoke: `POST https://ai-staging.ezil.work/v1/token/native-authorization/revoke`, body exactly
+ * - Revoke: `POST /v1/token/native-authorization/revoke`, body exactly
  *   `{policyId, subjectToken}`; `200` with exactly `{object:"native_authorization_revocation", authorization_id,
  *   revoked_at, already_revoked}`.
  *
@@ -19,14 +19,16 @@
 
 import { parseRfc3339 } from './broker';
 import type { NativeAuthorizationConfig } from './native-authorization-config';
+import { isNativeGatewayOrigin, STAGING_NATIVE_GATEWAY } from './native-gateway-origin';
 import {
     NATIVE_AUTHORIZATION_PROOF_KIND, NATIVE_LEASE_MAX_MS, NATIVE_ASSERTION_CLOCK_SKEW_MS, type NativeAssertion,
     type NativeRenewSemantic, type NativeRevokeSemantic,
 } from './native-authorization-protocol';
 
-export const NATIVE_GATEWAY_ORIGIN = 'https://ai-staging.ezil.work';
-export const NATIVE_RENEW_URL = `${NATIVE_GATEWAY_ORIGIN}/v1/token/exchange`;
-export const NATIVE_REVOKE_URL = `${NATIVE_GATEWAY_ORIGIN}/v1/token/native-authorization/revoke`;
+const RENEW_PATH = '/v1/token/exchange';
+const REVOKE_PATH = '/v1/token/native-authorization/revoke';
+export const NATIVE_RENEW_URL = STAGING_NATIVE_GATEWAY + RENEW_PATH;
+export const NATIVE_REVOKE_URL = STAGING_NATIVE_GATEWAY + REVOKE_PATH;
 export const NATIVE_AUTHORIZATION_TIMEOUT_MS = 8_000;
 export const NATIVE_AUTHORIZATION_REQUEST_MAX_BYTES = 12_288;
 export const NATIVE_AUTHORIZATION_RESPONSE_MAX_BYTES = 4_096;
@@ -55,7 +57,7 @@ export interface NativeExchangeDeps {
 
 /** Thrown before any send: nothing reached the Gateway. */
 export class NativeAuthorizationSendError extends Error {
-    constructor(readonly reason: 'request_too_large' | 'service_expired') {
+    constructor(readonly reason: 'request_too_large' | 'service_expired' | 'gateway_origin_mismatch') {
         super(`native_authorization_${reason}`);
         this.name = 'NativeAuthorizationSendError';
     }
@@ -163,7 +165,10 @@ function parseRenewal(answer: Extract<Answer, { kind: 'body' }>, semantic: Nativ
 /** One renewal attempt carrying `assertion` (signed over `semantic`). */
 export async function postNativeRenewal(config: NativeAuthorizationConfig, semantic: NativeRenewSemantic, assertion: NativeAssertion,
     deps: NativeExchangeDeps): Promise<NativeRenewOutcome> {
-    const answer = await postOnce(NATIVE_RENEW_URL,
+    if (!isNativeGatewayOrigin(config.gatewayOrigin) || semantic.environment !== config.environment) {
+        throw new NativeAuthorizationSendError('gateway_origin_mismatch');
+    }
+    const answer = await postOnce(config.gatewayOrigin + RENEW_PATH,
         { policyId: config.policyId, proofKind: NATIVE_AUTHORIZATION_PROOF_KIND, subjectToken: assertion.token }, config, deps, [200, 201]);
     return answer.kind === 'body' ? parseRenewal(answer, semantic, config) : answer;
 }
@@ -171,7 +176,10 @@ export async function postNativeRenewal(config: NativeAuthorizationConfig, seman
 /** One revoke attempt carrying `assertion` (signed over `semantic`). */
 export async function postNativeRevoke(config: NativeAuthorizationConfig, semantic: NativeRevokeSemantic, assertion: NativeAssertion,
     deps: NativeExchangeDeps): Promise<NativeRevokeOutcome> {
-    const answer = await postOnce(NATIVE_REVOKE_URL, { policyId: config.policyId, subjectToken: assertion.token }, config, deps, [200]);
+    if (!isNativeGatewayOrigin(config.gatewayOrigin) || semantic.environment !== config.environment) {
+        throw new NativeAuthorizationSendError('gateway_origin_mismatch');
+    }
+    const answer = await postOnce(config.gatewayOrigin + REVOKE_PATH, { policyId: config.policyId, subjectToken: assertion.token }, config, deps, [200]);
     if (answer.kind !== 'body') return answer;
     const invalid = { kind: 'unknown', reason: 'gateway_invalid_response' } as const;
     const value = exactObject(answer.text, REVOCATION_KEYS);

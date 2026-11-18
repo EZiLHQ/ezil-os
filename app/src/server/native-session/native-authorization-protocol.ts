@@ -18,14 +18,17 @@ import { createHash } from 'node:crypto';
 
 import { NATIVE_PROFILE_ID } from './host-transport';
 
+import { nativeGatewayTargetForIssuer, type NativeGatewayEnvironment } from './native-gateway-origin';
+
 export const NATIVE_AUTHORIZATION_FORMAT = 'ezil.native-authorization.v1';
 export const NATIVE_AUTHORIZATION_PROOF_KIND = 'ezil_native_authorization';
 export const NATIVE_AUTHORIZATION_SIGNATURE_DOMAIN = 'ezil.native-authorization.v1:signature';
 export const NATIVE_AUTHORIZATION_ALG = 'Ed25519';
 /** The Gateway's reserved native service: it accepts only this proof kind. */
 export const NATIVE_SERVICE_ID = 'ezil-os-native';
-/** The only environment the fixed staging endpoint serves. */
+/** Default for existing staging callers; production passes its configured Gateway environment. */
 export const NATIVE_AUTHORIZATION_ENVIRONMENT = 'staging';
+export type NativeAuthorizationEnvironment = NativeGatewayEnvironment;
 export const NATIVE_ASSERTION_MAX_TTL_MS = 60_000;
 export const NATIVE_ASSERTION_DEFAULT_TTL_MS = 30_000;
 export const NATIVE_ASSERTION_CLOCK_SKEW_MS = 10_000;
@@ -97,7 +100,7 @@ export type NativeOperationKind = 'renew' | 'revoke';
 interface NativeSemanticBase extends NativeConsentBinding {
     readonly operation: NativeOperationKind;
     readonly operationId: string;
-    readonly environment: typeof NATIVE_AUTHORIZATION_ENVIRONMENT;
+    readonly environment: NativeAuthorizationEnvironment;
 }
 
 export interface NativeRevokeSemantic extends NativeSemanticBase {
@@ -227,7 +230,7 @@ export function isNativeSemantic(value: unknown): value is NativeSemantic {
     const renew = value.operation === 'renew';
     if (!renew && value.operation !== 'revoke') return false;
     if (!hasExactKeys(value, renew ? RENEW_KEYS : SEMANTIC_KEYS)) return false;
-    if (!isNativeUuid(value.operationId) || value.environment !== NATIVE_AUTHORIZATION_ENVIRONMENT || !bindingFieldsValid(value)) return false;
+    if (!isNativeUuid(value.operationId) || (value.environment !== 'staging' && value.environment !== 'production') || !bindingFieldsValid(value)) return false;
     return !renew || (isNativeInstant(value.leaseExpiresAt) && matches(value.tokenSha256, SHA256_HEX));
 }
 
@@ -240,15 +243,16 @@ function bindingPart(binding: NativeConsentBinding): NativeConsentBinding {
 }
 
 export function nativeRenewSemantic(binding: NativeConsentBinding, operationId: string, leaseExpiresAt: string,
-    tokenSha256: string): NativeRenewSemantic {
-    const semantic = { ...bindingPart(binding), operation: 'renew' as const, operationId, environment: NATIVE_AUTHORIZATION_ENVIRONMENT,
+    tokenSha256: string, environment: NativeAuthorizationEnvironment = NATIVE_AUTHORIZATION_ENVIRONMENT): NativeRenewSemantic {
+    const semantic = { ...bindingPart(binding), operation: 'renew' as const, operationId, environment,
         leaseExpiresAt, tokenSha256 };
     if (!isNativeSemantic(semantic)) throw new NativeAuthorizationProtocolError('the renew tuple is invalid');
     return semantic;
 }
 
-export function nativeRevokeSemantic(binding: NativeConsentBinding, operationId: string): NativeRevokeSemantic {
-    const semantic = { ...bindingPart(binding), operation: 'revoke' as const, operationId, environment: NATIVE_AUTHORIZATION_ENVIRONMENT };
+export function nativeRevokeSemantic(binding: NativeConsentBinding, operationId: string,
+    environment: NativeAuthorizationEnvironment = NATIVE_AUTHORIZATION_ENVIRONMENT): NativeRevokeSemantic {
+    const semantic = { ...bindingPart(binding), operation: 'revoke' as const, operationId, environment };
     if (!isNativeSemantic(semantic)) throw new NativeAuthorizationProtocolError('the revoke tuple is invalid');
     return semantic;
 }
@@ -312,8 +316,9 @@ export async function signNativeAssertion(signer: NativeAssertionSigner, semanti
     }
     if (!Number.isSafeInteger(options.nowMs)) throw new NativeAuthorizationProtocolError('invalid issue time');
     if (!isNativeSemantic(semantic)) throw new NativeAuthorizationProtocolError('invalid semantic tuple');
-    if (!matches(signer.keyId, KEY_ID) || !matches(options.issuer, ISSUER)
-        || typeof options.audience !== 'string' || options.audience.length === 0 || options.audience.length > 500) {
+    const target = typeof options.issuer === 'string' ? nativeGatewayTargetForIssuer(options.issuer) : null;
+    if (!matches(signer.keyId, KEY_ID) || !matches(options.issuer, ISSUER) || !target
+        || options.audience !== target.gatewayOrigin || semantic.environment !== target.environment) {
         throw new NativeAuthorizationProtocolError('invalid envelope configuration');
     }
     const issuedAt = new Date(options.nowMs).toISOString();
