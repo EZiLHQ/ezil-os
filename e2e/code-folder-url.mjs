@@ -146,7 +146,7 @@ ok(repoAsks.length === 1 && repoAsks[0].repository.url === REPO_URL && !repoAsks
   'repo: exactly one mint requested the canonical repo URL and no folder override');
 f = await workbench();
 const readableHeading = f.getByRole('heading', {
-  name: /^(?:Explorer Section: )?(?:default\/)?os-code-url-20261110-a$/i,
+  name: /^(?:Explorer Section: )?os-code-url-20261110-a$/i,
 }).first();
 await readableHeading.waitFor();
 ok(await readableHeading.isVisible(), 'repo: the real Explorer shows the repository name as its heading');
@@ -158,6 +158,13 @@ await readme.waitFor();
 ok(await checkout.isVisible() && await readme.isVisible(), 'repo: the exact checkout is expanded and its root-only exclusion did not hide README');
 ok(frameFolder() === REPO_WRAPPER && new URL(page.url()).searchParams.get('repo') === REPO_URL
   && !new URL(page.url()).searchParams.has('folder'), 'repo: presentation left the workspace and repository-only link unchanged');
+const titleBarLabels = f.locator('.part.titlebar .command-center .search-label, .part.titlebar .command-center .agent-status-label');
+await titleBarLabels.first().waitFor({ state: 'attached' });
+const titleBarUsesRepo = () => titleBarLabels.evaluateAll((nodes, repo) => nodes.length > 0 && nodes.every(node => node.textContent === repo), REPO_NAME);
+ok(await titleBarUsesRepo(), 'repo: the command center and agent status display the checkout folder name');
+await readme.dblclick();
+await f.waitForFunction(repo => document.title === 'README.md - ' + repo + ' - code-server', REPO_NAME);
+ok(await titleBarUsesRepo(), 'repo: opening an editor preserves the checkout name in the title bar');
 await shot('08-repo-focus');
 
 await openFolder('/workspace/b');
@@ -168,6 +175,8 @@ const notes = f.locator('.explorer-folders-view').getByRole('treeitem', { name: 
 await notes.waitFor();
 ok(await notes.isVisible() && !await f.getByRole('heading', { name: /os-code-url-20261110-a/i }).count(),
   'repo: after a manual switch, the normal folder Explorer shows its own files and heading');
+await f.waitForFunction(() => /(?:^| - )b - code-server$/.test(document.title));
+ok(!(await f.title()).includes(REPO_NAME), 'repo: the ordinary folder keeps its own Code title');
 await shot('09-repo-switch');
 
 // 1. The link opens A in real code-server.
@@ -273,11 +282,11 @@ await page.keyboard.press('Control+P');
 await f.locator('.quick-input-widget input').fill('notes.txt');
 await page.waitForTimeout(1000);
 await page.keyboard.press('Enter');
-await f.locator('.monaco-editor .view-lines').first().waitFor();
-await f.locator('.monaco-editor .view-lines').first().click();
-await page.keyboard.press('Control+End');
+const editorInput = f.locator('.part.editor .monaco-editor :is(.native-edit-context, .inputarea)').first();
+await editorInput.press('Control+End');
 await page.keyboard.type(' edited-by-folder-url-test', { delay: 15 });
-await page.waitForTimeout(3500); // past code-server's autosave delay / backup
+await f.waitForFunction(() => document.querySelector('.part.editor .monaco-editor .view-lines')?.textContent.includes('edited-by-folder-url-test'));
+await f.locator('.part.editor .tab.dirty[data-resource-name="notes.txt"]').waitFor({ state: 'hidden' });
 await shot('05-edited-b');
 const beforeDialogs = dialogs.length;
 await page.goBack();
@@ -292,9 +301,10 @@ await page.keyboard.press('Control+P');
 await f.locator('.quick-input-widget input').fill('notes.txt');
 await page.waitForTimeout(1000);
 await page.keyboard.press('Enter');
-await f.locator('.monaco-editor .view-lines').first().waitFor();
+const reopenedEditor = f.locator('.part.editor .monaco-editor .view-lines').first();
+await reopenedEditor.waitFor();
 await page.waitForTimeout(1500);
-const text = await f.locator('.monaco-editor .view-lines').first().innerText();
+const text = await reopenedEditor.innerText();
 ok(text.includes('edited-by-folder-url-test'), `edited: the edit is still there after Back and Forward [${JSON.stringify(text.slice(0, 120))}]`);
 await shot('06-edit-survived');
 
