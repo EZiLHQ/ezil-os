@@ -22,13 +22,21 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+import { readFileSync } from 'node:fs';
+import { runInNewContext } from 'node:vm';
+import { expectPreviewScriptsAllowed, previewPageScripts, previewExternalScriptAllowed, inspectorCspPolicies } from './code-preview-bridge-helpers.test';
+import { inlineScriptBodies } from './inline-script';
 
 import {
+  previewInspectorScript,
+  previewInspectorOrigins,
+  buildDiagnosticResponse,
   parseBridgeHost,
   rewriteResponseHeaders,
   rewriteSetCookie,
   stripFrameAncestors,
   injectRuntimeShim,
+  allowPreviewInlineScripts,
   readCookie,
   stripPreviewCookie,
   handlePreviewBootstrap,
@@ -218,12 +226,12 @@ describe('ezil_preview cookie (mint/verify)', () => {
   });
 
   it('rejects the cookie against a different sandboxId', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     expect(await verifyPreviewCookie(cookie, [SECRET], SID2)).toBe(false);
   });
 
   it('rejects a tampered cookie (bit-flipped hmac)', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const tampered = cookie.slice(0, -1) + (cookie.endsWith('0') ? '1' : '0');
     expect(await verifyPreviewCookie(tampered, [SECRET], SID)).toBe(false);
   });
@@ -237,6 +245,16 @@ describe('ezil_preview cookie (mint/verify)', () => {
   it('rejects a missing/malformed cookie when a secret is configured', async () => {
     expect(await verifyPreviewCookie(undefined, [SECRET], SID)).toBe(false);
     expect(await verifyPreviewCookie('not-enough-parts', [SECRET], SID)).toBe(false);
+  });
+
+  it('🔴 an app value never verifies as a Code/desktop value of the same sandbox, nor the reverse', async () => {
+    const app = await mintPreviewCookie(SECRET, SID, undefined, 'app');
+    const code = await mintPreviewCookie(SECRET, SID);
+    expect(await verifyPreviewCookie(app, [SECRET], SID, 'app')).toBe(true);
+    expect(await verifyPreviewCookie(app, [SECRET], SID)).toBe(false);
+    expect(await verifyPreviewCookie(code, [SECRET], SID, 'app')).toBe(false);
+    // Same shape either way: nothing about the value tells project code which host it opens.
+    expect(app.split('.')).toHaveLength(3); expect(app.split('.')[0]).toBe(SID);
   });
 
   it('local dev: mints an unsigned placeholder and accepts anything when no secret configured', async () => {
@@ -350,6 +368,21 @@ describe('rewriteSetCookie', () => {
 // ── HTML shim injection ──────────────────────────────────────────────────────
 
 describe('injectRuntimeShim', () => {
+  it('keeps existing unrestricted inline CSP behavior and does not add a policy when absent', async () => {
+    for (const policy of [null, "script-src 'self' 'unsafe-inline'", "img-src 'none'"]) {
+      const headers = new Headers(policy ? { 'content-security-policy': policy } : {});
+      await allowPreviewInlineScripts(headers, injectRuntimeShim('<head></head>'));
+      expect(headers.get('content-security-policy')).toBe(policy);
+    }
+  });
+  it('adds only the injected script hashes to nonce/none policies, retaining unrelated restrictions', async () => {
+    const headers = new Headers({ 'content-security-policy': "default-src 'none'; script-src 'nonce-existing'; script-src-elem 'none'; img-src https://images.example" });
+    const html = injectRuntimeShim('<head></head>');
+    await allowPreviewInlineScripts(headers, html); await expectPreviewScriptsAllowed(html, headers);
+    const policy = headers.get('content-security-policy')!;
+    expect(policy).toContain("default-src 'none'"); expect(policy).toContain("script-src 'nonce-existing'");
+    expect(policy).toContain('img-src https://images.example'); expect(policy).not.toContain("script-src-elem 'none'");
+  });
   it('injects right after the opening <head> tag', () => {
     const html = '<html><head><title>x</title></head><body></body></html>';
     const out = injectRuntimeShim(html);
@@ -384,9 +417,9 @@ describe('injectRuntimeShim', () => {
     expect(out).toContain('XMLHttpRequest.prototype.open = function');
   });
 
-  it('still rewrites the HMR WebSocket path (no regression from the fallback addition)', () => {
+  it('keeps original HMR paths for the provider-neutral app catchall', () => {
     const out = injectRuntimeShim('<html><head></head><body></body></html>');
-    expect(out).toContain("u.pathname = '/preview-ws' + u.pathname");
+    expect(out).not.toContain("u.pathname = '/preview-ws' + u.pathname");
   });
 });
 
@@ -1021,7 +1054,7 @@ describe('handlePreviewProxy', () => {
   });
 
   it('proxies through with a valid cookie and injects the shim into HTML', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const sandbox = fakeContainerFetcher((url) => {
       expect(url).toContain(`127.0.0.1:${APP_PREVIEW_PORT}/about`);
       return new Response('<html><head></head><body>hi</body></html>', {
@@ -1039,8 +1072,20 @@ describe('handlePreviewProxy', () => {
     expect(body).toContain('preview-inspector.js');
   });
 
+  it('🔴 never forwards client-chosen Code-bridge routing headers to the app container', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
+    let seen: Headers | undefined;
+    const sandbox = fakeContainerFetcher((_url, init) => { seen = new Headers(init?.headers); return new Response('ok'); });
+    const request = new Request(`https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/api`, { headers: {
+      cookie: `${PREVIEW_COOKIE_NAME}=${cookie}`, 'x-ezil-running-code': '1', 'cf-container-target-port': '8443', 'x-app': 'keep',
+    } });
+    expect((await handlePreviewProxy(request, sandbox, SID, [SECRET], '/api')).status).toBe(200);
+    expect(seen?.has('x-ezil-running-code')).toBe(false); expect(seen?.has('cf-container-target-port')).toBe(false);
+    expect(seen?.get('x-app')).toBe('keep');
+  });
+
   it('returns the diagnostic 503 page when the container connection fails', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const sandbox: ContainerFetcher = {
       async containerFetch() {
         throw new Error('connect ECONNREFUSED 127.0.0.1:3002');
@@ -1057,7 +1102,7 @@ describe('handlePreviewProxy', () => {
   });
 
   it('accepts a valid `ezil_pv` query param when the cookie is missing (Safari ITP fallback)', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const sandbox = fakeContainerFetcher(() => new Response('ok'));
     const request = new Request(
       `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview/?${PREVIEW_COOKIE_QUERY_PARAM}=${encodeURIComponent(cookie)}`,
@@ -1066,8 +1111,71 @@ describe('handlePreviewProxy', () => {
     expect(res.status).toBe(200);
   });
 
+  for (const status of [200, 201, 299, 301, 400, 404, 500, 502, 503, 504]) it(`app HTML status ${status} preserves the document and only 2xx can become ready`, async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
+    const page = `https://3002-${SID}-app.ezil.org/preview/`;
+    const html = '<html><head></head><body>Original upstream document</body></html>';
+    const sandbox = fakeContainerFetcher(() => new Response(html, { status, headers: { 'content-type': 'text/html', 'content-security-policy': "script-src 'self'" } }));
+    const res = await handlePreviewProxy(new Request(page, { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } }), sandbox, SID, [SECRET], '/');
+    expect(res.status).toBe(status);
+    const body = await res.text(); expect(body).toContain('<body>Original upstream document</body>');
+    await expectPreviewScriptsAllowed(body, res.headers);
+    const scripts = previewPageScripts(body, page);
+    if (status < 300) {
+      expect(scripts.urls.map(u => u.pathname)).toEqual(['/preview-inspector.js']);
+      expect(body).toContain('window.WebSocket = function');
+      expect(body).not.toContain("u.pathname = '/preview-ws' + u.pathname");
+    } else {
+      expect(scripts.urls).toEqual([]); expect(body).not.toContain('window.WebSocket');
+      const origin = `https://8443-${SID}-code.ezil.org`;
+      expect(scripts.hello(origin, INSPECTOR_NONCE)).toEqual([{ origin, data: { type: 'ezil.preview.state', v: 1, nonce: INSPECTOR_NONCE, state: 'upstream_error' } }]);
+    }
+  });
+
+  for (const fallback of [false, true]) it(`loads the inspector through its real auth gate using ${fallback ? 'query fallback' : 'cookie'}`, async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app'), origin = `https://3002-${SID}-app.ezil.org`;
+    const page = `${origin}/preview/${fallback ? '?ezil_pv=' + encodeURIComponent(cookie) : ''}`;
+    const headers = fallback ? {} : { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` };
+    const sandbox = fakeContainerFetcher(() => new Response('<html><head></head><body>App</body></html>', { headers: { 'content-type': 'text/html', 'content-security-policy': "default-src 'self'; script-src-elem 'self'" } }));
+    const res = await handlePreviewProxy(new Request(page, { headers }), sandbox, SID, [SECRET], '/');
+    expect(res.status).toBe(200);
+    const html = await res.text(); expect(html).not.toContain(cookie);
+    await expectPreviewScriptsAllowed(html, res.headers);
+    const scripts = previewPageScripts(html, page, res.headers); expect(scripts.urls).toHaveLength(1);
+    const scriptUrl = scripts.urls[0]; expect(scriptUrl.pathname).toBe('/preview-inspector.js');
+    expect(scriptUrl.searchParams.get('ezil_pv')).toBe(fallback ? cookie : null);
+    expect((await handlePreviewInspectorJs(new Request(scriptUrl, { headers }), SID, [SECRET])).status).toBe(200);
+    expect((await handlePreviewInspectorJs(new Request(`${origin}/preview-inspector.js`), SID, [SECRET])).status).toBe(401);
+  });
+  for (const csp of inspectorCspPolicies) it(`authorizes the actual external inspector narrowly under CSP: ${csp}`, async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app'), origin = `https://3002-${SID}-app.ezil.org`;
+    const page = `${origin}/preview/?ezil_pv=${encodeURIComponent(cookie)}`;
+    const upstream = new Headers({ 'content-type': 'text/html', 'content-security-policy': csp });
+    const sandbox = fakeContainerFetcher(() => new Response('<head></head><body>App</body>', { headers: upstream }));
+    const res = await handlePreviewProxy(new Request(page), sandbox, SID, [SECRET], '/');
+    const scripts = previewPageScripts(await res.text(), page, res.headers);
+    expect(scripts.urls).toHaveLength(1);
+    expect((await handlePreviewInspectorJs(new Request(scripts.urls[0]), SID, [SECRET])).status).toBe(200);
+    const policy = res.headers.get('content-security-policy')!;
+    expect(policy).toContain(`${origin}/preview-inspector.js`);
+    expect(policy).not.toContain(cookie); expect(policy).not.toContain("'self'"); expect(policy).not.toContain('https: ');
+    for (const url of [`${origin}/other.js`, `${origin}/preview-inspector.js/child`, 'https://other.test/preview-inspector.js'])
+      expect(previewExternalScriptAllowed(res.headers, page, url)).toBe(false);
+    if (csp.includes('img-src')) expect(policy).toContain(csp.includes('images.example') ? 'img-src https://images.example' : "img-src 'none'");
+    expect(policy.split(',')).toHaveLength(csp.split(',').length);
+  });
+  it('preserves HTML statuses that cannot carry a response body', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
+    const request = new Request(`https://3002-${SID}-app.ezil.org/preview/`, { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } });
+    for (const status of [204, 205, 304]) {
+      const sandbox = fakeContainerFetcher(() => new Response(null, { status, headers: { 'content-type': 'text/html' } }));
+      const res = await handlePreviewProxy(request, sandbox, SID, [SECRET], '/');
+      expect(res.status).toBe(status); expect(await res.text()).toBe('');
+    }
+  });
+
   it('strips the `ezil_pv` fallback param before forwarding upstream', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const sandbox = fakeContainerFetcher((url) => {
       expect(url).not.toContain(PREVIEW_COOKIE_QUERY_PARAM);
       expect(url).toContain('keep=1');
@@ -1118,7 +1226,7 @@ describe('handlePreviewProxy', () => {
     });
 
     it('still injects RUNTIME_SHIM for target: app (the default) — no regression', async () => {
-      const cookie = await mintPreviewCookie(SECRET, SID);
+      const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
       const sandbox = fakeContainerFetcher(
         () =>
           new Response('<html><head></head><body>app</body></html>', {
@@ -1356,7 +1464,7 @@ describe('handlePreviewWsProxy', () => {
   });
 
   it('defaults to APP_PREVIEW_PORT when no port is given', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const sandbox = fakeWsSandbox();
     const request = new Request(`https://${APP_HOST}/preview-ws/`, {
       headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` },
@@ -1374,7 +1482,7 @@ describe('handlePreviewWsProxy', () => {
   });
 
   it('accepts the `ezil_pv` query-param fallback when the cookie is missing', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const sandbox = fakeWsSandbox();
     const request = new Request(
       `https://${APP_HOST}/preview-ws/?${PREVIEW_COOKIE_QUERY_PARAM}=${encodeURIComponent(cookie)}`,
@@ -1478,7 +1586,7 @@ describe('handlePreviewWsProxy', () => {
   });
 
   it('keeps `preview.local` for target: app — the dev server never learns the bridge host', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const sandbox = fakeWsSandbox();
     const request = new Request(`https://${APP_HOST}/preview-ws/`, {
       headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` },
@@ -1486,6 +1594,17 @@ describe('handlePreviewWsProxy', () => {
     await handlePreviewWsProxy(request, sandbox, SID, [SECRET], '/');
     expect(sandbox.calls[0]?.headers['x-forwarded-host']).toBe(APP_FORWARDED_HOST);
     expect(sandbox.calls[0]?.headers['x-forwarded-host']).not.toContain(SID);
+  });
+
+  it('🔴 an app socket never forwards client-chosen Code-bridge routing headers to the sandbox', async () => {
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
+    const sandbox = fakeWsSandbox();
+    const request = new Request(`https://${APP_HOST}/preview-ws/`, { headers: {
+      cookie: `${PREVIEW_COOKIE_NAME}=${cookie}`, 'x-ezil-running-code': '1', 'cf-container-target-port': String(CODE_PREVIEW_PORT),
+    } });
+    await handlePreviewWsProxy(request, sandbox, SID, [SECRET], '/');
+    expect(sandbox.calls[0]?.headers['x-ezil-running-code']).toBeUndefined();
+    expect(sandbox.calls[0]?.headers['cf-container-target-port']).toBeUndefined();
   });
 
   it('🔴 drops a client-supplied `Forwarded` header, which outranks x-forwarded-host', async () => {
@@ -1534,7 +1653,7 @@ describe('handlePreviewInspectorJs', () => {
   });
 
   it('serves the inspector script with a valid cookie', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const request = new Request(
       `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-inspector.js`,
       { headers: { cookie: `${PREVIEW_COOKIE_NAME}=${cookie}` } },
@@ -1545,11 +1664,254 @@ describe('handlePreviewInspectorJs', () => {
   });
 
   it('accepts the `ezil_pv` query-param fallback when the cookie is missing', async () => {
-    const cookie = await mintPreviewCookie(SECRET, SID);
+    const cookie = await mintPreviewCookie(SECRET, SID, undefined, 'app');
     const request = new Request(
       `https://${APP_PREVIEW_PORT}-${SID}-${APP_PREVIEW_TOKEN}.ezil.org/preview-inspector.js?${PREVIEW_COOKIE_QUERY_PARAM}=${encodeURIComponent(cookie)}`,
     );
     const res = await handlePreviewInspectorJs(request, SID, [SECRET]);
     expect(res.status).toBe(200);
+  });
+});
+
+// Script-string harness, like code-billing-bridge.test.ts; no installed DOM dependency in worker/.
+class PreviewElement {
+  nodeType = 1;
+  parentElement: PreviewElement | null = null;
+  childNodes: any[] = [];
+  hidden = false;
+  isContentEditable = false;
+  style: Record<string, string> = {};
+  rect = { x: 1.4, y: -2.6, width: 120.2, height: 30.8 };
+  constructor(public tagName = 'BUTTON', public attrs: Record<string, string> = {}) { this.tagName = tagName.toUpperCase(); }
+  get id() { return this.attrs.id ?? ''; }
+  get classList() { return (this.attrs.class ?? '').split(/\s+/).filter(Boolean); }
+  get previousElementSibling(): PreviewElement | null {
+    const siblings = this.parentElement?.childNodes.filter(n => n.nodeType === 1) ?? [];
+    return siblings[siblings.indexOf(this) - 1] ?? null;
+  }
+  getAttribute(k: string) { return this.attrs[k] ?? null; }
+  hasAttribute(k: string) { return Object.hasOwn(this.attrs, k); }
+  getBoundingClientRect() { return this.rect; }
+  append(...nodes: Array<PreviewElement | string>) {
+    for (const node of nodes) {
+      const child = typeof node === 'string' ? { nodeType: 3, textContent: node, parentElement: this } : node;
+      child.parentElement = this; this.childNodes.push(child);
+    }
+    return this;
+  }
+}
+const INSPECTOR_PARENT = 'https://8443-guac-u-c-code.ezil.org', INSPECTOR_NONCE = 'AAAAAAAAAAAAAAAAAAAAAA';
+function inspector(script = previewInspectorScript([INSPECTOR_PARENT]), capture?: (helpers: any) => void, viteClient?: any) {
+  let now = 0, counter = 0, mutation: Function = () => {};
+  const timers = new Map<number, { at: number; fn: Function }>();
+  const messages: any[] = [], winListeners: Record<string, Function[]> = {}, docListeners: Record<string, Function[]> = {};
+  const parent = { postMessage(data: any, origin: string) { messages.push({ data: structuredClone(data), origin }); } };
+  const window = { parent, innerWidth: 1280, innerHeight: 800, devicePixelRatio: 2, addEventListener(t: string, fn: Function) { (winListeners[t] ??= []).push(fn); } };
+  const document = { title: 'Pricing', querySelector: () => viteClient ? { src: '/@vite/client' } : null, addEventListener(t: string, fn: Function) { (docListeners[t] ??= []).push(fn); } };
+  const location = new URL('https://3002-guac-u-c-app.ezil.org/preview/pricing?token=private&plan=pro#faq');
+  const history = { pushState(_a: unknown, _b: unknown, path: string) { location.href = new URL(path, location).href; },
+    replaceState(_a: unknown, _b: unknown, path: string) { location.href = new URL(path, location).href; } };
+  const context = { window, document, location, history, URL, URLSearchParams, crypto, Uint8Array, btoa, loadVite: async () => viteClient,
+    getComputedStyle: (el: PreviewElement) => ({ ...el.style, getPropertyValue: (k: string) => el.style[k] ?? '' }),
+    MutationObserver: class { constructor(fn: Function) { mutation = fn; } observe() {} },
+    Date: { now: () => now }, setTimeout: (fn: Function, delay: number) => { timers.set(++counter, { at: now + delay, fn }); return counter; }, capture };
+  const globals = Object.keys(context);
+  if (viteClient) script = script.replace('import(vite.href)', 'loadVite(vite.href)');
+  runInNewContext(capture ? script.replace('const gen=', 'capture({validSelection,sanitizeUrl});const gen=') : script, context);
+  expect(Object.keys(context)).toEqual(globals);
+  expect(Object.keys(window)).toEqual(['parent', 'innerWidth', 'innerHeight', 'devicePixelRatio', 'addEventListener']);
+  const event = (type: string, extra: any = {}, doc = false) => {
+    const ev = { type, defaultPrevented: false, preventDefault() { this.defaultPrevented = true; }, stopPropagation() {}, ...extra };
+    for (const fn of (doc ? docListeners : winListeners)[type] ?? []) fn(ev);
+    return ev;
+  };
+  const message = (data: any, over: any = {}) => event('message', { data, source: parent, origin: INSPECTOR_PARENT, ...over });
+  const hello = (nonce = INSPECTOR_NONCE) => message({ type: 'ezil.preview.hello', v: 1, nonce });
+  const mode = (mode = 'select', nonce = INSPECTOR_NONCE) => message({ type: 'ezil.preview.mode', v: 1, nonce, mode });
+  const advance = (ms: number) => {
+    const until = now + ms;
+    for (;;) {
+      const next = [...timers].filter(([, t]) => t.at <= until).sort((a, b) => a[1].at - b[1].at)[0];
+      if (!next) break;
+      now = next[1].at; timers.delete(next[0]); next[1].fn();
+    }
+    now = until;
+  };
+  const selects = () => messages.filter(m => m.data.type === 'ezil.preview.select').map(m => m.data.sel);
+  return { messages, message, hello, mode, event, advance, selects, history, location, document, mutate: () => mutation() };
+}
+const previewVectors = JSON.parse(readFileSync(new URL('../../docs/contracts/code-preview-v1.vectors.json', import.meta.url), 'utf8'));
+
+describe('strict preview inspector v1', () => {
+  it('requires the parent/origin/nonce handshake, never uses wildcard targets, and ignores selections in interact mode', () => {
+    const b = inspector(), el = new PreviewElement().append('Sign up'), hello = { type: 'ezil.preview.hello', v: 1, nonce: INSPECTOR_NONCE };
+    for (const over of [{ source: {} }, { origin: 'https://other.test' }, { origin: '*' }, { origin: 'null' }]) b.message(hello, over);
+    for (const nonce of ['short', INSPECTOR_NONCE + '\n', 22]) b.message({ ...hello, nonce });
+    b.message({ ...hello, extra: true }); b.message({ __ezil: true, type: 'set-select-mode', detail: true });
+    b.event('click', { target: el }, true); expect(b.messages).toEqual([]);
+    b.hello(); expect(b.messages).toHaveLength(1); expect(b.messages[0].data.type).toBe('ezil.preview.ready');
+    expect(b.messages[0].data.doc.gen).toMatch(/^[A-Za-z0-9_-]{22}$/); expect(b.messages[0].data.doc.path).toBe('/pricing?plan=pro#faq');
+    b.mode('select', 'BBBBBBBBBBBBBBBBBBBBBB'); b.event('click', { target: el }, true); expect(b.selects()).toEqual([]);
+    for (const over of [{ source: {} }, { origin: 'https://other.test' }]) b.message({ type: 'ezil.preview.mode', v: 1, nonce: INSPECTOR_NONCE, mode: 'select' }, over);
+    expect(b.event('click', { target: el }, true).defaultPrevented).toBe(false);
+    b.mode(); expect(b.event('click', { target: el }, true).defaultPrevented).toBe(true);
+    expect(b.selects()[0].el).toMatchObject({ tag: 'button', text: 'Sign up' }); expect(b.selects()[0].el.source).toBeUndefined();
+    b.hello('BBBBBBBBBBBBBBBBBBBBBB'); b.mode(); b.event('click', { target: el }, true); expect(b.selects()).toHaveLength(1);
+    expect(b.messages.every(m => m.origin === INSPECTOR_PARENT)).toBe(true); expect(previewInspectorScript([INSPECTOR_PARENT])).not.toContain('__ezil');
+  });
+  it('selects the ordinary target, using data-eid/data-oid only as explicit source metadata', () => {
+    const b = inspector(), parent = new PreviewElement('section', { 'data-oid': 'src/page.tsx:12' }), el = new PreviewElement('h1', { id: 'title' }).append('Welcome');
+    parent.append(el); b.hello(); b.mode(); b.event('click', { target: el }, true);
+    expect(b.selects()[0].el).toMatchObject({ tag: 'h1', id: 'title', source: { eid: 'src/page.tsx:12' }, selector: 'h1#title' });
+    expect(b.selects()[0].ancestors).toEqual([{ tag: 'section', classes: [] }]);
+    el.attrs['data-eid'] = 'own'; b.event('click', { target: el }, true); expect(b.selects()[1].el.source).toEqual({ eid: 'own' });
+  });
+  it('supports keyboard and touch while suppressing synthetic duplicate clicks', () => {
+    const b = inspector(), el = new PreviewElement().append('Go'); b.hello(); b.mode();
+    for (const key of ['Enter', ' ']) expect(b.event('keydown', { key, target: el }, true).defaultPrevented).toBe(true);
+    b.event('keydown', { key: 'Escape', target: el }, true); b.event('keydown', { key: 'Enter', repeat: true, target: el }, true);
+    b.event('touchend', { target: el }, true); b.event('click', { target: el }, true); expect(b.selects()).toHaveLength(3);
+    b.advance(751); b.event('click', { target: el }, true); expect(b.selects()).toHaveLength(4);
+  });
+  it('never reads/emits field values, editable text, credentials or hidden descendants', () => {
+    const b = inspector(); b.hello(); b.mode(); const parent = new PreviewElement('main').append('Visible');
+    for (const [tag, attrs] of [['input', {}], ['input', { type: 'password' }], ['textarea', {}], ['select', {}],
+      ['div', { contenteditable: '' }], ['span', { autocomplete: 'current-password' }]] as Array<[string, Record<string, string>]>) {
+      const field = new PreviewElement(tag, { ...attrs, placeholder: 'private-hint' }).append('private-value');
+      Object.defineProperty(field, 'value', { get() { throw Error('value must not be read'); } });
+      parent.append(field); b.event('click', { target: field }, true);
+      expect(b.selects().at(-1).el.text).toBe(''); expect(b.selects().at(-1).el.attrs.placeholder).toBeUndefined();
+      if (tag === 'div') { const child = new PreviewElement('span').append('nested-private'); field.append(child); b.event('click', { target: child }, true); expect(b.selects().at(-1).el.text).toBe(''); }
+    }
+    const hidden = new PreviewElement('span').append('hidden-private'); hidden.style.display = 'none'; parent.append(hidden);
+    b.event('click', { target: parent }, true); expect(b.selects().at(-1).el.text).toBe('Visible');
+    expect(JSON.stringify(b.selects())).not.toContain('private-value'); expect(JSON.stringify(b.selects())).not.toContain('private-hint');
+  });
+  it('bounds records, drops unknown attrs/styles and sanitizes links before truncation', () => {
+    const b = inspector(); b.hello(); b.mode(); let root = new PreviewElement('main');
+    for (let i = 0; i < 10; i++) { const child = new PreviewElement('section'); root.append(child); root = child; }
+    const el = new PreviewElement('a', { id: 'i'.repeat(100), class: Array.from({ length: 20 }, (_, i) => 'c'.repeat(80) + i).join(' '),
+      href: 'https://user:pw@cdn.example.com/p?token=private&q=ok', onclick: 'private()', value: 'private', placeholder: 'p'.repeat(220), 'aria-label': 'n'.repeat(150) }).append('word '.repeat(200));
+    el.style = { color: 'x'.repeat(150), content: 'private', 'background-image': 'private' }; root.append(el);
+    b.event('click', { target: el }, true); const s = b.selects()[0];
+    expect(s.el.id).toHaveLength(64); expect(s.el.classes).toHaveLength(12); expect(s.el.classes.every((c: string) => c.length <= 64)).toBe(true);
+    expect(s.el.text).toHaveLength(300); expect(s.el.name).toHaveLength(120); expect(s.el.selector.length).toBeLessThanOrEqual(512);
+    expect(s.el.styles).toEqual({ color: 'x'.repeat(120) }); expect(s.ancestors).toHaveLength(6);
+    expect(s.el.attrs.href).toBe('https://cdn.example.com/p?q=ok'); expect(s.el.attrs.onclick).toBeUndefined(); expect(s.el.attrs.value).toBeUndefined();
+    expect(s.el.rect).toEqual({ x: 1, y: -3, w: 120, h: 31 });
+    el.attrs.href = 'javascript:alert(1)'; b.event('click', { target: el }, true); expect(b.selects().at(-1).el.attrs.href).toBe('');
+  });
+  for (const vector of [...previewVectors.sanitizeUrl,
+    { in: '/cb#access_token=https://auth.example/?private=1&tab=2', out: '/cb#tab=2' },
+    { in: '/cb#Access_Token=private&csrf_token=private&tab=2', out: '/cb#tab=2' },
+    { in: '/#/cb?Access_Token=private&csrf_token=private&tab=2', out: '/#/cb?tab=2' },
+    { in: '/cb#%61ccess_token=private', out: '/cb' },
+    { in: '/cb#', out: '/cb' },
+    { in: '/#/cb?', out: '/#/cb' },
+  ]) it(`sanitizes URL vector ${vector.in}`, () => {
+    let helpers: any; const b = inspector(undefined, h => { helpers = h; }); expect(helpers.sanitizeUrl(vector.in)).toBe(vector.out);
+    const el = new PreviewElement('a', { href: vector.in, src: vector.in }); b.hello(); b.mode(); b.event('click', { target: el }, true);
+    expect(b.selects()[0].el.attrs).toEqual({ href: vector.out, src: vector.out });
+    if (vector.in.startsWith('/')) {
+      b.location.href = new URL('/preview' + vector.in, b.location).href;
+      b.hello(); expect(b.messages.at(-1).data.doc.path).toBe(vector.out);
+      b.mode(); b.event('click', { target: el }, true); expect(b.selects().at(-1).doc.path).toBe(vector.out);
+    }
+  });
+  for (const vector of previewVectors.selection.accept) it(`accepts selection vector: ${vector.name}`, () => {
+    let helpers: any; inspector(undefined, h => { helpers = h; }); expect(helpers.validSelection(vector.sel)).toBe(true);
+  });
+  for (const vector of previewVectors.selection.refuse) it(`refuses selection vector: ${vector.name}`, () => {
+    let helpers: any; inspector(undefined, h => { helpers = h; }); const s = structuredClone(previewVectors.selection.accept[0].sel);
+    const expand = (value: any): any => {
+      const repeat = typeof value === 'string' && /^@repeat:(.):(\d+)$/.exec(value);
+      if (repeat) return repeat[1].repeat(Number(repeat[2]));
+      if (Array.isArray(value)) return value.map(expand);
+      return value && typeof value === 'object' ? Object.fromEntries(Object.entries(value).map(([k, v]) => [k, expand(v)])) : value;
+    };
+    for (const [path, raw] of Object.entries(vector.patch ?? {})) {
+      const parts = path.split('.'); let target = s; for (const part of parts.slice(0, -1)) target = target[part] ??= {};
+      target[parts.at(-1)!] = expand(raw);
+    }
+    expect(helpers.validSelection(vector.replace ?? s)).toBe(false);
+  });
+  it('keeps AWS direct paths and escapes selectors without truncating DOM identifiers', () => {
+    const b = inspector(); b.location.hostname = 'aws-3002-guac-u-c-aws.ezil.org'; b.location.pathname = '/preview/demo';
+    b.hello(); expect(b.messages[0].data.doc.path).toBe('/preview/demo?plan=pro#faq'); b.mode();
+    const el = new PreviewElement('button', { id: '123' }); b.event('click', { target: el }, true);
+    expect(b.selects()[0].el.selector).toBe('button#\\31 23');
+    el.attrs.id = 'i'.repeat(65); b.event('click', { target: el }, true);
+    expect(b.selects()[1].el.selector).toBe('button:nth-of-type(1)');
+  });
+  it('caps huge source ids and trims escaped class-heavy records to the whole-selection limit', () => {
+    const b = inspector(); b.hello(); b.mode();
+    const classes = Array.from({ length: 100 }, (_, i) => '"'.repeat(64) + i).join(' ');
+    let parent = new PreviewElement('main', { class: classes, id: '"'.repeat(64) });
+    for (let i = 0; i < 6; i++) { const child = new PreviewElement('section', { class: classes, id: '"'.repeat(64) }); parent.append(child); parent = child; }
+    const el = new PreviewElement('button', { class: classes, 'data-eid': '\u0001' + 'e'.repeat(50000) }).append('text '.repeat(100));
+    el.style = { color: '"'.repeat(120), 'font-family': '"'.repeat(120), margin: '"'.repeat(120), padding: '"'.repeat(120) };
+    parent.append(el); b.event('click', { target: el }, true);
+    expect(b.selects()).toHaveLength(1); const sel = b.selects()[0];
+    expect(sel.el.source.eid).toBe('e'.repeat(200));
+    expect(sel.el.classes).toHaveLength(12); expect(sel.el.classes.every((c: string) => c.length <= 64)).toBe(true);
+    expect(JSON.stringify(sel).length).toBeLessThanOrEqual(12000);
+    expect(sel.ancestors.length).toBeLessThan(6);
+    el.tagName = 'X-' + 'Y'.repeat(12000); b.event('click', { target: el }, true); expect(b.selects()).toHaveLength(1);
+  });
+  it('refuses oversized selections before traversing their fields', () => {
+    let helpers: any; inspector(undefined, h => { helpers = h; });
+    const sel = structuredClone(previewVectors.selection.accept[0].sel); sel.el.text = 'x'.repeat(12000);
+    Object.defineProperty(sel, 'doc', { enumerable: false, get() { throw Error('must size-check first'); } });
+    expect(helpers.validSelection(sel)).toBe(false);
+  });
+  it('makes hash-only navigation and every other navigation a document revision', () => {
+    const b = inspector(); b.hello(); b.mode(); const el = new PreviewElement();
+    b.event('click', { target: el }, true); const selected = b.selects()[0].doc;
+    b.location.hash = '#new'; b.event('hashchange'); b.advance(300);
+    expect(b.messages.at(-1).data.doc).toMatchObject({ gen: selected.gen, mut: selected.mut + 1, path: '/pricing?plan=pro#new' });
+    let mut = b.messages.at(-1).data.doc.mut;
+    for (const navigate of [() => b.history.pushState({}, '', '#push'), () => b.history.replaceState({}, '', '#replace'), () => b.event('popstate')]) {
+      navigate(); b.advance(300); expect(b.messages.at(-1).data.doc.mut).toBe(++mut);
+    }
+    b.mutate(); b.advance(300); expect(b.messages.at(-1).data.doc.mut).toBe(++mut);
+  });
+  it('subscribes to the existing Vite client hot event bus without import.meta.hot', async () => {
+    let update: Function | undefined;
+    const b = inspector(undefined, undefined, { createHotContext: () => ({ on: (name: string, fn: Function) => {
+      expect(name).toBe('vite:afterUpdate'); update = fn;
+    } }) });
+    b.hello(); await Promise.resolve(); await Promise.resolve(); expect(update).toBeDefined();
+    update!(); b.advance(50); expect(b.messages.at(-1).data.type).toBe('ezil.preview.changed');
+    expect(b.messages.at(-1).data.doc.mut).toBe(1);
+  });
+  it('tracks document generations, DOM batches and HMR, rate-limiting changed/navigate', () => {
+    const b = inspector(); b.mutate(); b.hello(); const gen = b.messages[0].data.doc.gen; expect(b.messages[0].data.doc.mut).toBe(1);
+    for (let i = 0; i < 100; i++) b.mutate(); b.event('vite:afterUpdate'); b.event('vite:afterUpdate', {}, true);
+    b.advance(50); expect(b.messages.at(-1).data.doc.mut).toBe(103);
+    for (let i = 0; i < 100; i++) { b.mutate(); b.history.pushState({}, '', '/next?code=private&q=ok'); b.advance(10); }
+    const changed = b.messages.filter(m => m.data.type === 'ezil.preview.changed');
+    expect(changed.length).toBeLessThanOrEqual(5); expect(changed.every(m => m.data.doc.gen === gen)).toBe(true);
+    expect(b.messages.filter(m => m.data.type === 'ezil.preview.navigate').length).toBeLessThanOrEqual(4);
+    b.advance(300); b.history.replaceState({}, '', '/replaced?state=private'); b.advance(300); expect(b.messages.at(-1).data.doc.path).toBe('/replaced');
+    for (const type of ['popstate', 'hashchange']) { b.event(type); b.advance(300); expect(b.messages.at(-1).data.type).toBe('ezil.preview.navigate'); }
+    const next = inspector(); next.hello(); expect(next.messages[0].data.doc.gen).not.toBe(gen);
+  });
+  it('computes origins per Cloudflare request', async () => {
+    for (const zone of ['ezil.org', 'ezil.work']) {
+      const hostname = `3002-guac-u-c-app.${zone}`, origins = previewInspectorOrigins(hostname);
+      expect(origins).toEqual([`https://8443-guac-u-c-code.${zone}`, zone === 'ezil.org' ? 'https://os.ezil.work' : 'https://os-staging.ezil.work']);
+      const response = await handlePreviewInspectorJs(new Request(`https://${hostname}/preview-inspector.js`), 'guac-u-c', []);
+      expect(await response.text()).toBe(previewInspectorScript(origins)); expect(response.headers.get('cache-control')).toBe('private, no-store');
+    }
+    expect(previewInspectorOrigins('8443-guac-u-c-code.ezil.org')).toEqual([]);
+  });
+  for (const reason of ['no_package_json', 'port_not_listening', 'upstream_error'] as const) it(`diagnostic ${reason} answers state only and keeps meta refresh`, async () => {
+    const html = await buildDiagnosticResponse(reason, 3002, undefined, [INSPECTOR_PARENT]).text();
+    expect(html).toContain('<meta http-equiv="refresh" content="3">'); expect(html).not.toContain('ezil.preview.ready');
+    const b = inspector(inlineScriptBodies(html)[0]!);
+    b.message({ type: 'ezil.preview.hello', v: 1, nonce: INSPECTOR_NONCE }, { source: {} });
+    b.message({ type: 'ezil.preview.hello', v: 1, nonce: INSPECTOR_NONCE }, { origin: 'https://evil.test' });
+    expect(b.messages).toEqual([]); b.hello();
+    expect(b.messages).toEqual([{ data: { type: 'ezil.preview.state', v: 1, nonce: INSPECTOR_NONCE, state: reason }, origin: INSPECTOR_PARENT }]);
   });
 });

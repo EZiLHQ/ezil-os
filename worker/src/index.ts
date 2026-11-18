@@ -7166,7 +7166,7 @@ async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<R
     // itself verifies. Local dev (no secret configured) is unaffected: both
     // verifiers short-circuit to "allowed" exactly as before.
     const cookie = readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME);
-    const cookieOk = await verifyPreviewCookie(cookie, secrets, sandboxId);
+    const cookieOk = await verifyPreviewCookie(cookie, secrets, sandboxId, 'app');
     if (!cookieOk) {
       const tokenAuth = await verifyPreviewBootstrapToken(
         url.searchParams.get('token') ?? undefined,
@@ -7191,22 +7191,18 @@ async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<R
     return handlePreviewInspectorJs(request, sandboxId, secrets);
   }
 
-  if (path === '/preview-ws' || path.startsWith('/preview-ws/')) {
+  // Only the fixed-port app host reaches this point. Root-absolute resources and
+  // sockets use the same authenticated proxies as the legacy preview prefixes.
+  if ((request.headers.get('upgrade') ?? '').toLowerCase() === 'websocket') {
     const sandbox = openSandbox(env, sandboxId);
-    const appPath = path === '/preview-ws' ? '/' : path.slice('/preview-ws'.length);
+    const appPath = path === '/preview-ws' ? '/'
+      : path.startsWith('/preview-ws/') ? path.slice('/preview-ws'.length) : path;
     return handlePreviewWsProxy(request, sandbox, sandboxId, secrets, appPath, port, target);
   }
 
-  if (path === '/preview' || path.startsWith('/preview/')) {
-    const sandbox = openSandbox(env, sandboxId);
-    const appPath = path === '/preview' ? '/' : path.slice('/preview'.length);
-    return handlePreviewProxy(request, sandbox, sandboxId, secrets, appPath, port, target);
-  }
-
-  // Anything else on either bridge hostname is outside the Option D
-  // contract — deliberately 404, never falls through to a raw unauthenticated
-  // forward (see `fetch()`'s call site doc comment).
-  return json({ ok: false, error: `not_found: ${request.method} ${path}` }, 404);
+  const sandbox = openSandbox(env, sandboxId);
+  const appPath = path === '/preview' ? '/' : path.startsWith('/preview/') ? path.slice('/preview'.length) : path;
+  return handlePreviewProxy(request, sandbox, sandboxId, secrets, appPath, port, target);
 }
 
 // ── Project files storage proxy (`worker_proxy` ProjectFilesTransport backend) ─

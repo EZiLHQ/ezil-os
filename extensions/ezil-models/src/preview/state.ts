@@ -1,0 +1,66 @@
+import { record, sanitizeUrl, validateMintReply, validPath } from './contract';
+
+/**
+ * The frame address for `url`, rebuilt from its parsed parts on the pinned minted origin, or undefined. Extension
+ * messages cannot expand the CSP or move the frame off the origin pinned by the first mint, and never to a non-https
+ * or script scheme.
+ */
+export function frameTarget(url: string, pinned: string): string | undefined {
+    if (!validateMintReply({ url, expiresAt: 1 })) return undefined;
+    let target: URL;
+    try { target = new URL(url); } catch { return undefined; }
+    if (target.protocol !== 'https:' || target.username || target.password || target.origin !== pinned) return undefined;
+    return `${pinned}${target.pathname}${target.search}${target.hash}`;
+}
+
+export const VIEWPORTS = ['responsive', '390x844', '768x1024', '1280x800'] as const;
+export type Viewport = typeof VIEWPORTS[number];
+export interface PreviewState { open: true; path: string; viewport: Viewport }
+export function viewport(value: unknown): Viewport {
+    return VIEWPORTS.includes(value as Viewport) ? value as Viewport : 'responsive';
+}
+export function safePath(value: unknown): string {
+    if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//') || value.includes('\\')) return '/';
+    const path = sanitizeUrl(value);
+    return validPath(path) ? path : '/';
+}
+/** Construct a new record, never spread untrusted state (in particular URL/token fields). */
+export function persistedState(value: unknown): PreviewState {
+    const state = record(value) ? value : {};
+    return { open: true, path: safePath(state.path), viewport: viewport(state.viewport) };
+}
+export function safeUrl(origin: string, path: unknown): string {
+    return new URL(origin).origin + safePath(path);
+}
+/** Cookie-authenticated navigation/copy URL; the toolbar displays safeUrl instead. */
+export function transportUrl(origin: string, path: unknown): string {
+    const url = new URL(origin);
+    const prefix = /^3002-[a-z0-9-]{1,80}-app\./.test(url.hostname) ? '/preview' : '';
+    return url.origin + prefix + safePath(path);
+}
+
+/** Inspector paths are the source of truth for history; host loads reconcile with the requested entry. */
+export class PreviewHistory {
+    private entries: string[];
+    private index = 0;
+    private loading = false;
+    constructor(path: string) { this.entries = [safePath(path)]; }
+    get path(): string { return this.entries[this.index]!; }
+    get back(): boolean { return this.index > 0; }
+    get forward(): boolean { return this.index < this.entries.length - 1; }
+    observed(path: string): void {
+        path = safePath(path);
+        if (this.loading) { this.entries[this.index] = path; this.loading = false; return; }
+        if (this.path === path) return;
+        this.entries.splice(this.index + 1);
+        this.entries.push(path);
+        this.index++;
+        if (this.entries.length > 100) { this.entries.shift(); this.index--; }
+    }
+    move(direction: -1 | 1): string | undefined {
+        if (direction === -1 ? !this.back : !this.forward) return;
+        this.index += direction;
+        this.loading = true;
+        return this.path;
+    }
+}

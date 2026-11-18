@@ -36,9 +36,14 @@ import {
   settleCodeFolder,
   type CodeFolderOutcome,
 } from './code-folder';
-import { injectCodeFolderBridge, isHtmlDocument, isWorkbenchDocumentRequest } from './code-folder-bridge';
+import { codeShellOriginsFor, injectCodeFolderBridge, isHtmlDocument, isWorkbenchDocumentRequest } from './code-folder-bridge';
 import { injectCodeDiagBridge } from './code-diag-bridge';
 import { injectCodeBillingBridge } from './code-billing-bridge';
+import { injectCodePreviewBridge } from './code-preview-bridge';
+import {
+  allowPreviewInlineScripts, buildDiagnosticResponse, injectPreviewDiagnostic, injectRuntimeShim, RUNTIME_SHIM, PREVIEW_COOKIE_QUERY_PARAM,
+  APP_PREVIEW_RESOURCE_HEADERS, previewInspectorScript, resolveAppPreviewAuth, stripFrameAncestors, stripPreviewQueryParam, stripPreviewReferer,
+} from './preview-bridge';
 import {
   PREVIEW_COOKIE_NAME,
   PREVIEW_COOKIE_TTL_S,
@@ -321,6 +326,7 @@ export async function proxyToAwsOrigin(
     return unavailable();
   }
   const headers = new Headers(request.headers);
+  if (port === APP_PREVIEW_PORT) stripPreviewReferer(headers);
   headers.delete(AWS_GATEWAY_HEADER);
   headers.delete('x-ezil-auth');
   headers.delete('host');
@@ -334,7 +340,8 @@ export async function proxyToAwsOrigin(
   headers.set(AWS_GATEWAY_HEADER, signed);
   const init: RequestInit = { method, headers, redirect: 'manual' };
   if (method !== 'GET' && method !== 'HEAD') init.body = request.body;
-  return fetchFn(`https://${host}${originPath}${url.search}`, init);
+  const search = port === APP_PREVIEW_PORT ? stripPreviewQueryParam(url.search) : url.search;
+  return fetchFn(`https://${host}${originPath}${search}`, init);
 }
 
 export interface AwsBrowserDeps {
@@ -367,7 +374,7 @@ async function withCodeFolderBridge(res: Response, origins: readonly string[]): 
   // validators no longer hold (the runtime encodes it again from Content-Encoding), and it is never cached.
   for (const name of ['content-length', 'etag', 'last-modified']) headers.delete(name);
   headers.set('cache-control', 'no-cache, no-store');
-  return new Response(injectCodeBillingBridge(injectCodeDiagBridge(injectCodeFolderBridge(html, origins), origins), origins), { status: res.status, statusText: res.statusText, headers });
+  return new Response(injectCodePreviewBridge(injectCodeBillingBridge(injectCodeDiagBridge(injectCodeFolderBridge(html, origins), origins), origins), origins), { status: res.status, statusText: res.statusText, headers });
 }
 
 /**
@@ -414,19 +421,34 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
       const mint = codeFolderMint(url.searchParams.get(CODE_FOLDER_MINT_PARAM));
       if (mint) dest.searchParams.set(CODE_FOLDER_MINT_PARAM, mint);
     }
-    const cookie = await mintPreviewCookie(secrets[0], sandboxId, deps.nowMs());
+    const cookie = await mintPreviewCookie(secrets[0], sandboxId, deps.nowMs(), port === APP_PREVIEW_PORT ? 'app' : 'default');
+    // App previews alone accept fallback auth when an embedded browser drops the cookie.
+    if (port === APP_PREVIEW_PORT) dest.searchParams.set(PREVIEW_COOKIE_QUERY_PARAM, cookie);
     const attrs = [`${PREVIEW_COOKIE_NAME}=${cookie}`, `Max-Age=${PREVIEW_COOKIE_TTL_S}`, 'HttpOnly', 'Secure', 'SameSite=None', 'Partitioned', 'Path=/'];
-    return new Response(null, { status: 302, headers: { location: dest.pathname + dest.search, 'set-cookie': attrs.join('; ') } });
+    return new Response(null, { status: 302, headers: { location: dest.pathname + dest.search, 'set-cookie': attrs.join('; '),
+      ...(port === APP_PREVIEW_PORT ? APP_PREVIEW_RESOURCE_HEADERS : {}) } });
   }
 
-  const cookieOk = await verifyPreviewCookie(readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME), secrets, sandboxId);
+  const cookieOk = port === APP_PREVIEW_PORT ? await resolveAppPreviewAuth(request, url, secrets, sandboxId)
+    : await verifyPreviewCookie(readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME), secrets, sandboxId);
+  if (cookieOk instanceof Response) return cookieOk;
   if (!cookieOk) return (port === CODE_PREVIEW_PORT ? codeAuthRecovery(request, deps.codeShellOrigins) : null)
-    ?? json({ ok: false, error: 'aws_preview_auth_required' }, 401);
+    ?? json({ ok: false, error: 'aws_preview_auth_required' }, 401, port === APP_PREVIEW_PORT ? APP_PREVIEW_RESOURCE_HEADERS : {});
+  const inspectorOrigins = [`https://aws-${CODE_PREVIEW_PORT}-${sandboxId}-aws.${deps.zoneRoot}`, ...codeShellOriginsFor(deps.zoneRoot)];
+  if (port === APP_PREVIEW_PORT && request.method === 'GET' && url.pathname === '/preview-inspector.js') {
+    return new Response(previewInspectorScript(inspectorOrigins), { headers: {
+      'content-type': 'application/javascript; charset=utf-8', ...APP_PREVIEW_RESOURCE_HEADERS,
+    } });
+  }
+  const appDocument = port === APP_PREVIEW_PORT && request.method === 'GET'
+    && (['document', 'iframe'].includes(request.headers.get('sec-fetch-dest') ?? '') || (request.headers.get('accept') ?? '').includes('text/html'));
   // Code's workbench NAVIGATION never renders the JSON refusal: a tunnel that is absent, fenced or of another
   // epoch (a placement change, an idle stop), or an origin that does not answer behind it, gets the recovery
   // document (`./code-auth-recovery.ts` codeOriginRecovery), which the shell turns into a checked state.
-  // Everything else (fetch, assets, WebSockets, other ports) keeps the 502 JSON.
-  const originDown = (): Response => (port === CODE_PREVIEW_PORT ? codeOriginRecovery(request, deps.codeShellOrigins) : null) ?? unavailable();
+  // App navigations get the preview state page; fetches, assets and WebSockets keep the 502 JSON.
+  const originDown = (): Response => appDocument
+    ? buildDiagnosticResponse('upstream_error', port, undefined, inspectorOrigins)
+    : (port === CODE_PREVIEW_PORT ? codeOriginRecovery(request, deps.codeShellOrigins) : null) ?? unavailable();
   if (!deps.zone) return originDown();
   const record = await deps.lookup(sandboxId);
   if (!record || record.sandboxId !== sandboxId || !isAwsOriginFresh(record, deps.nowMs())) return originDown();
@@ -468,6 +490,11 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
     // A fetch exception may contain its URL: never propagate or log it. The document gets the recovery UI.
     return originDown();
   }
+  if (port === APP_PREVIEW_PORT && answered.status !== 101) {
+    const headers = new Headers(answered.headers);
+    for (const [key, value] of Object.entries(APP_PREVIEW_RESOURCE_HEADERS)) headers.set(key, value);
+    answered = new Response(answered.body, { status: answered.status, statusText: answered.statusText, headers });
+  }
   if (port === CODE_PREVIEW_PORT && isWorkbenchDocumentRequest(request.method, url.pathname, request.headers.get('upgrade'))) {
     if (isOriginGatewayFailure(answered.status)) {
       // The tunnel's gateway (no connector for this epoch) or the host answered that code-server is not there.
@@ -479,6 +506,28 @@ export async function handleAwsBrowserHost(request: Request, url: URL, deps: Aws
       }
     }
     return withCodeFolderBridge(answered, deps.codeShellOrigins ?? []);
+  }
+  const appHtml = port === APP_PREVIEW_PORT && /^\s*text\/html\b/i.test(answered.headers.get('content-type') ?? '');
+  if (appDocument && !appHtml && isOriginGatewayFailure(answered.status)) {
+    try { await answered.body?.cancel(); } catch { /* already consumed */ }
+    return buildDiagnosticResponse('port_not_listening', port, undefined, inspectorOrigins);
+  }
+  if (appHtml && ![204, 205, 304].includes(answered.status)) {
+    const html = await answered.text();
+    const headers = new Headers(answered.headers);
+    for (const name of ['content-length', 'etag', 'last-modified', 'x-frame-options']) headers.delete(name);
+    const csp = headers.get('content-security-policy');
+    if (csp) { const kept = stripFrameAncestors(csp); if (kept) headers.set('content-security-policy', kept); else headers.delete('content-security-policy'); }
+    headers.set('cache-control', 'no-cache, no-store');
+    const injected = isHtmlDocument(answered.status, answered.headers.get('content-type'))
+      ? injectRuntimeShim(html)
+      : injectPreviewDiagnostic(html, inspectorOrigins);
+    await allowPreviewInlineScripts(headers, isHtmlDocument(answered.status, answered.headers.get('content-type'))
+      ? RUNTIME_SHIM : injectPreviewDiagnostic('', inspectorOrigins),
+      isHtmlDocument(answered.status, answered.headers.get('content-type')) ? url.origin : undefined);
+    return new Response(injected, {
+      status: answered.status, statusText: answered.statusText, headers,
+    });
   }
   return answered;
 }

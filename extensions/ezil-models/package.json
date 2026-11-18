@@ -25,7 +25,8 @@
   "activationEvents": [
     "onLanguageModelChat:ezil",
     "onLanguageModelChatProvider:ezil",
-    "onStartupFinished"
+    "onStartupFinished",
+    "onWebviewPanel:ezil.preview"
   ],
   "enabledApiProposals": [
     "languageModelSystem",
@@ -55,6 +56,11 @@
       }
     ],
     "commands": [
+      {
+        "command": "ezil.preview.open",
+        "title": "Open App Preview",
+        "category": "EZiL"
+      },
       {
         "command": "ezil-models.showStatus",
         "title": "Show AI Status",
@@ -141,7 +147,7 @@
     }
   },
   "scripts": {
-    "build": "bun build src/extension.ts --target=node --format=cjs --external=vscode --outfile=dist/extension.js",
+    "build": "bun run src/preview/build-script.ts && bun build src/extension.ts --target=node --format=cjs --external=vscode --outfile=dist/extension.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "bun test",
     "package:vsix": "../../worker/ezil-models/build-vsix.sh"

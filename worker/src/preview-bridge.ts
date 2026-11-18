@@ -23,25 +23,25 @@
  *       plain absolute path (`./code-folder.ts`), else 400 `invalid_folder`;
  *       `ezil_mint` (code only, 22 base64url chars) is forwarded too.
  *
- *   * /preview/<path>
+ *   * /<path> (also legacy /preview/<path>)
  *       Cookie-gated HTTP reverse-proxy to the container's dev server
  *       (`APP_PREVIEW_PORT`, default 3002 — NOT 3000, which the
  *       `@cloudflare/sandbox` SDK reserves for its own control plane) via
  *       `sandbox.containerFetch()`.
  *       Strips `X-Frame-Options` / CSP `frame-ancestors`, rewrites
  *       `Set-Cookie` to the proxy's own path/SameSite/Secure, and injects the
- *       HMR-rewrite shim + inspector script tag into HTML responses.
+ *       fallback transport shim + inspector script tag into HTML responses.
  *
- *   GET/WS /preview-ws/<path>
+ *   GET/WS /<path> (also legacy /preview-ws/<path>)
  *       Cookie-gated WebSocket reverse-proxy (Next.js HMR / Vite client) via
  *       `sandbox.wsConnect()` — never `containerFetch()`, which cannot carry a
  *       101 back across its RPC boundary (see `ContainerWebSocketConnector`).
- *       On the code-server host the upgrade is detected by header instead, at
- *       any path (see `handleCodeBridge` in `src/index.ts`).
+ *       Upgrades are detected by header on both app and Code hosts; their
+ *       fixed ports and dispatch branches remain separate.
  *
  *   GET /preview-inspector.js
- *       Cookie-gated static inspector script (element selection, click/hover
- *       postMessage bridge — ported verbatim from the Python daemon).
+ *       Cookie-gated inspector script (code-preview-v1, with parent origins
+ *       computed for this app hostname on every request).
  *
  *   GET /preview-status
  *       Unauthenticated JSON dev-server readiness probe. See the module doc
@@ -73,9 +73,11 @@ import {
 } from './hmac';
 import { APP_PREVIEW_PORT, APP_PREVIEW_TOKEN, CODE_PREVIEW_PORT, CODE_PREVIEW_TOKEN } from './desktop-mode';
 import { codeBootstrapPathProblem, CODE_FOLDER_MINT_PARAM, codeFolderMint, plainFolderPath } from './code-folder';
-import { injectCodeFolderBridge, isHtmlDocument, isWorkbenchDocumentRequest } from './code-folder-bridge';
+import { codeShellOriginsFor, injectCodeFolderBridge, isHtmlDocument, isWorkbenchDocumentRequest } from './code-folder-bridge';
 import { injectCodeDiagBridge } from './code-diag-bridge';
 import { injectCodeBillingBridge } from './code-billing-bridge';
+import { injectCodePreviewBridge } from './code-preview-bridge';
+import { inlineScriptBodies, scriptJson } from './inline-script';
 
 // ── Hostname parsing ─────────────────────────────────────────────────────────
 
@@ -218,12 +220,12 @@ export function rewriteSetCookie(value: string, cookiePath: string = '/preview')
  * stripping (the header should be dropped entirely).
  */
 export function stripFrameAncestors(value: string): string | null {
-  const parts = value
-    .split(';')
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0 && !p.toLowerCase().startsWith('frame-ancestors'));
+  // Headers may combine independently enforced policies with commas. Never merge their directives.
+  const parts = value.split(',').map(policy => policy.split(';')
+    .map(p => p.trim()).filter(p => p && p.split(/\s+/, 1)[0].toLowerCase() !== 'frame-ancestors')
+    .join('; ')).filter(Boolean);
   if (parts.length === 0) return null;
-  return parts.join('; ');
+  return parts.join(', ');
 }
 
 /**
@@ -275,7 +277,9 @@ export function rewriteResponseHeaders(upstream: Headers, cookiePath: string = '
 // cookie outright. `RUNTIME_SHIM` (below) then propagates it onto same-origin
 // `fetch`/`XMLHttpRequest`/HMR-`WebSocket` calls the previewed page makes
 // client-side, so SPA navigation/asset-fetching keeps working without a
-// cookie for the lifetime of that page load. It is verified with the exact
+// cookie for the lifetime of that page load. Parser/module/CSS requests use
+// the verified same-origin Referer-to-query redirect in `resolveAppPreviewAuth`.
+// It is verified with the exact
 // same `verifyPreviewCookie` the cookie itself uses — same value shape, same
 // HMAC, same sandboxId binding — so it carries no weaker guarantee than the
 // cookie it stands in for. Always stripped before forwarding to the upstream
@@ -291,9 +295,22 @@ export const PREVIEW_COOKIE_QUERY_PARAM = 'ezil_pv';
 
 // ── HTML shim injection ──────────────────────────────────────────────────────
 
+/** Read fallback auth in the browser; no request token is embedded in the HTML. */
+export const PREVIEW_INSPECTOR_LOADER = `<script>
+(function () {
+  var src = new URL('/preview-inspector.js', window.location.href);
+  var fallback = new URLSearchParams(window.location.search).get(${scriptJson(PREVIEW_COOKIE_QUERY_PARAM)});
+  if (fallback) src.searchParams.set(${scriptJson(PREVIEW_COOKIE_QUERY_PARAM)}, fallback);
+  var script = document.createElement('script');
+  script.src = src.href;
+  script.async = true;
+  document.head.appendChild(script);
+})();
+</script>`;
+
 /**
- * Runtime shim injected into every HTML response. Rewrites the Next.js/Vite
- * HMR WebSocket URL to flow through `/preview-ws/...`, loads the inspector
+ * Provider-neutral runtime shim injected into successful HTML responses. Keeps
+ * original HTTP/WebSocket paths on both app hosts, loads the inspector
  * script, and — when the current page was reached via the `ezil_pv`
  * query-param fallback (see `PREVIEW_COOKIE_QUERY_PARAM`'s module doc in this
  * file: the `ezil_preview` cookie a browser dropped outright, e.g. Safari
@@ -302,27 +319,27 @@ export const PREVIEW_COOKIE_QUERY_PARAM = 'ezil_pv';
  * client-side navigation and asset/data fetching keep working for the
  * lifetime of that page load without ever needing the cookie. No-op (reads
  * `null`, patches nothing) when the page was reached normally with a working
- * cookie — this never changes behavior for the common case. Ported verbatim
- * (semantics-preserving) from `preview_bridge.py`'s `_RUNTIME_SHIM`, plus the
- * fallback-propagation addition.
+ * cookie. Root sockets reach each provider's authenticated app proxy directly;
+ * this shim never adds a provider-specific path prefix.
  */
 export const RUNTIME_SHIM = `
 <script>
 (function () {
-  var FALLBACK_PARAM = ${JSON.stringify(PREVIEW_COOKIE_QUERY_PARAM)};
+  var FALLBACK_PARAM = ${scriptJson(PREVIEW_COOKIE_QUERY_PARAM)};
   var fallbackValue = null;
   try {
     fallbackValue = new URLSearchParams(window.location.search).get(FALLBACK_PARAM);
   } catch (e) { fallbackValue = null; }
 
-  if (fallbackValue) {
+  if (!fallbackValue) return;
+  {
     var origFetch = window.fetch;
     if (origFetch) {
       window.fetch = function (input, init) {
         try {
           var reqUrl = (typeof Request !== 'undefined' && input instanceof Request) ? input.url : input;
           var u = new URL(reqUrl, window.location.href);
-          if (u.host === window.location.host && !u.searchParams.has(FALLBACK_PARAM)) {
+          if (u.origin === window.location.origin && !u.searchParams.has(FALLBACK_PARAM)) {
             u.searchParams.set(FALLBACK_PARAM, fallbackValue);
             input = (typeof Request !== 'undefined' && input instanceof Request) ? new Request(u.toString(), input) : u.toString();
           }
@@ -336,7 +353,7 @@ export const RUNTIME_SHIM = `
       XMLHttpRequest.prototype.open = function (method, reqUrl) {
         try {
           var u = new URL(reqUrl, window.location.href);
-          if (u.host === window.location.host && !u.searchParams.has(FALLBACK_PARAM)) {
+          if (u.origin === window.location.origin && !u.searchParams.has(FALLBACK_PARAM)) {
             u.searchParams.set(FALLBACK_PARAM, fallbackValue);
             reqUrl = u.toString();
           }
@@ -351,20 +368,10 @@ export const RUNTIME_SHIM = `
   window.WebSocket = function (url, protocols) {
     try {
       var u = new URL(url, window.location.href);
-      var sameOrigin = u.host === window.location.host;
+      var sameOrigin = u.host === window.location.host &&
+        (u.protocol === 'wss:' || u.protocol === 'https:' ? window.location.protocol === 'https:' :
+         u.protocol === 'ws:' || u.protocol === 'http:' ? window.location.protocol === 'http:' : false);
       var changed = false;
-      if (
-        sameOrigin &&
-        (u.pathname.indexOf('/_next/') === 0 ||
-         u.pathname.indexOf('/__nextjs') === 0 ||
-         u.pathname.indexOf('/_next/turbopack') === 0 ||
-         u.pathname.indexOf('/@vite/') === 0 ||
-         u.pathname.indexOf('/@hmr') === 0 ||
-         u.pathname.indexOf('/__webpack_hmr') === 0)
-      ) {
-        u.pathname = '/preview-ws' + u.pathname;
-        changed = true;
-      }
       if (fallbackValue && sameOrigin && !u.searchParams.has(FALLBACK_PARAM)) {
         u.searchParams.set(FALLBACK_PARAM, fallbackValue);
         changed = true;
@@ -380,7 +387,7 @@ export const RUNTIME_SHIM = `
   window.WebSocket.CLOSED = origWS.CLOSED;
 })();
 </script>
-<script src="/preview-inspector.js" async></script>
+${PREVIEW_INSPECTOR_LOADER}
 `.trim();
 
 const HEAD_OPEN_RE = /<head\b[^>]*>/i;
@@ -393,139 +400,203 @@ export function injectRuntimeShim(html: string): string {
   return html.slice(0, idx) + RUNTIME_SHIM + html.slice(idx);
 }
 
-/**
- * Inspector script served at `/preview-inspector.js`. Ported verbatim from
- * `preview_bridge.py`'s `_INSPECTOR_JS` (element hover/click/select over
- * postMessage, EID/ORID `data-eid`/`data-oid` compatible).
- */
-export const INSPECTOR_JS = `
-(function () {
-  if (window.__ezilInspectorInstalled) return;
-  window.__ezilInspectorInstalled = true;
-
-  var parent = window.parent;
-  if (!parent || parent === window) return;
-
-  function postToParent(type, detail) {
-    try { parent.postMessage({ __ezil: true, type: type, detail: detail }, '*'); } catch (e) {}
-  }
-
-  function inAppPath() {
-    var p = location.pathname || '/';
-    if (p.indexOf('/preview/') === 0) p = p.slice('/preview'.length) || '/';
-    else if (p === '/preview') p = '/';
-    return p + (location.search || '') + (location.hash || '');
-  }
-
-  function elementEid(el) {
-    if (!el || !el.getAttribute) return null;
-    return el.getAttribute('data-eid') || el.getAttribute('data-oid') || null;
-  }
-
-  function findEidTarget(node) {
-    var el = node;
-    while (el && el.nodeType === 1) {
-      if (elementEid(el)) return el;
-      el = el.parentElement;
-    }
-    return null;
-  }
-
-  function rectOf(el) {
-    var r = el.getBoundingClientRect();
-    return {
-      x: r.left, y: r.top, width: r.width, height: r.height,
-      vw: window.innerWidth, vh: window.innerHeight,
-    };
-  }
-
-  function describe(el) {
-    return {
-      oid: elementEid(el),
-      framework: el.hasAttribute('data-eid') ? 'eid' : 'orid',
-      tag: el.tagName.toLowerCase(),
-      id: el.id || undefined,
-      classes: el.className ? String(el.className).split(/\\s+/).filter(Boolean).slice(0, 20) : undefined,
-      rect: rectOf(el),
-      text: (el.innerText || '').slice(0, 200),
-    };
-  }
-
-  var hoverEl = null, rafHover = 0;
-  function onMove(e) {
-    if (rafHover) return;
-    rafHover = requestAnimationFrame(function () {
-      rafHover = 0;
-      var el = findEidTarget(e.target);
-      if (el !== hoverEl) {
-        hoverEl = el;
-        postToParent('hover', el ? describe(el) : null);
-      } else if (el) {
-        postToParent('hover', describe(el));
+/** Permit our inline code and, on successful app documents, the exact external inspector endpoint. */
+export async function allowPreviewInlineScripts(headers: Headers, markup: string, inspectorOrigin?: string): Promise<void> {
+  const csp = headers.get('content-security-policy');
+  if (!csp) return;
+  const hashes = await Promise.all(inlineScriptBodies(markup).map(async body => {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(body));
+    return `'sha256-${btoa(String.fromCharCode(...new Uint8Array(digest)))}'`;
+  }));
+  if (!hashes.length) return;
+  // The CSP source has no credential query. A hash on the loader does not authorize an external
+  // script without integrity under nonce-only or hash-only policies lacking strict-dynamic.
+  const inspector = inspectorOrigin ? new URL('/preview-inspector.js', inspectorOrigin).href : undefined;
+  const policies = csp.split(',').map(policy => {
+    const directives = policy.split(';').map(d => d.trim().split(/\s+/)).filter(d => d[0]);
+    for (const name of ['script-src', 'script-src-elem']) {
+      let directive = directives.find(d => d[0].toLowerCase() === name);
+      if (!directive && name === 'script-src') {
+        const defaults = directives.find(d => d[0].toLowerCase() === 'default-src');
+        if (defaults) { directive = [name, ...defaults.slice(1)]; directives.push(directive); }
       }
-    });
-  }
-  function onLeave() { hoverEl = null; postToParent('hover', null); }
-  document.addEventListener('mousemove', onMove, { passive: true });
-  document.addEventListener('mouseleave', onLeave, { passive: true });
-
-  var selectMode = false;
-  window.addEventListener('message', function (ev) {
-    var d = ev.data;
-    if (!d || !d.__ezil) return;
-    if (d.type === 'set-select-mode') selectMode = !!d.detail;
-    else if (d.type === 'get-tree') {
-      postToParent('tree', serializeTree(document.body, 8));
-    } else if (d.type === 'ping') {
-      postToParent('pong', { href: location.href, path: inAppPath(), title: document.title });
+      if (!directive) continue;
+      // Adding a hash disables unsafe-inline: preserve policies that already allow all inline code.
+      const unrestrictedInline = directive.includes("'unsafe-inline'") && !directive.some(s => /^'(nonce-|sha(?:256|384|512)-)/.test(s));
+      const additions = [...(unrestrictedInline ? [] : hashes), ...(inspector ? [inspector] : [])];
+      if (!additions.length) continue;
+      directive.splice(1, directive.length - 1, ...new Set([...directive.slice(1).filter(s => s !== "'none'"), ...additions]));
     }
+    return directives.map(d => d.join(' ')).join('; ');
   });
+  headers.set('content-security-policy', policies.join(', '));
+}
 
-  document.addEventListener('click', function (e) {
-    if (!selectMode) return;
-    var el = findEidTarget(e.target);
-    if (!el) return;
-    e.preventDefault();
-    e.stopPropagation();
-    postToParent('select', describe(el));
-  }, true);
+/** Parent origins for this app host only; a different sandbox's Code frame is never admitted. */
+export function previewInspectorOrigins(hostname: string): string[] {
+  const route = parseBridgeHost(hostname);
+  const dot = hostname.indexOf('.');
+  if (!route || route.target !== 'app' || dot < 0) return [];
+  const zone = hostname.slice(dot + 1);
+  return [`https://${CODE_PREVIEW_PORT}-${route.sandboxId}-${CODE_PREVIEW_TOKEN}.${zone}`, ...codeShellOriginsFor(zone)];
+}
 
-  function serializeTree(root, maxDepth) {
-    function visit(node, depth) {
-      if (!node || node.nodeType !== 1) return null;
-      var eid = elementEid(node);
-      var children = [];
-      if (depth < maxDepth) {
-        for (var i = 0; i < node.children.length; i++) {
-          var c = visit(node.children[i], depth + 1);
-          if (c) children.push(c);
-        }
-      }
-      return {
-        oid: eid,
-        framework: node.hasAttribute('data-eid') ? 'eid' : (node.hasAttribute('data-oid') ? 'orid' : null),
-        tag: node.tagName.toLowerCase(),
-        id: node.id || undefined,
-        rect: rectOf(node),
-        children: children,
-      };
-    }
-    return visit(root, 0);
+/** Hop 1 of code-preview-v1. All state is document-local; app DOM is an untrusted snapshot. */
+export function previewInspectorScript(origins: readonly string[]): string {
+  return String.raw`(()=>{try{
+const origins=${scriptJson(origins)};
+if(window.parent===window||!origins.length)return;
+const TOKEN=/^[A-Za-z0-9_-]{22}$/,TAG=/^[a-z][a-z0-9-]{0,31}$/;
+const ATTRS=['href','src','alt','type','placeholder','aria-label','data-testid'];
+const STYLES=['color','background-color','font-family','font-size','font-weight','line-height','text-align','display','position','margin','padding','border','border-radius','width','height','gap','flex-direction','justify-content','align-items'];
+const SECRET=/^(ezil_pv|ezil_mint|token|access_token|id_token|refresh_token|code|state|session|sid|key|api_key|apikey|secret|password|pass|auth|authorization|signature|sig)$|_token$/i;
+const clean=(s,n)=>String(s??'').replace(/[\x00-\x1f\x7f-\x9f]/g,'').slice(0,n);
+function sanitizeUrl(value,max=512){
+  const s=clean(value,Infinity);
+  try{
+    const u=new URL(s,location.href);
+    if(!['https:','http:'].includes(u.protocol))return '';
+    u.username='';u.password='';
+    for(const k of [...u.searchParams.keys()])if(SECRET.test(k))u.searchParams.delete(k);
+    const fragment=u.hash.slice(1),router=fragment.startsWith('/'),query=router?fragment.indexOf('?'):-1;
+    if(query>=0||!router&&fragment.includes('=')){
+      const route=query>=0?fragment.slice(0,query):'',params=new URLSearchParams(query>=0?fragment.slice(query+1):fragment);
+      for(const k of [...params.keys()])if(SECRET.test(k))params.delete(k);
+      const rest=params.toString();u.hash=route+(rest?(query>=0?'?':'')+rest:'');
+    }else if(!fragment)u.hash='';
+    const absolute=/^[a-z][a-z0-9+.-]*:/i.test(s)||s.startsWith('//');
+    return clean(absolute?u.href:u.pathname+u.search+u.hash,max);
+  }catch{return ''}
+}
+const object=v=>v!==null&&typeof v==='object'&&!Array.isArray(v);
+const keys=(v,allowed)=>object(v)&&Object.keys(v).every(k=>allowed.includes(k));
+const str=(v,n)=>typeof v==='string'&&v.length<=n&&clean(v,n)===v;
+const integer=v=>Number.isSafeInteger(v);
+const summary=v=>keys(v,['tag','id','classes'])&&TAG.test(v.tag)&&str(v.tag,32)&&(v.id===undefined||str(v.id,64))&&Array.isArray(v.classes)&&v.classes.length<=12&&v.classes.every(c=>str(c,64));
+function validSelection(s){
+  try{if(JSON.stringify(s).length>12000)return false}catch{return false}
+  if(!keys(s,['doc','viewport','el','ancestors']))return false;
+  const d=s.doc,v=s.viewport,e=s.el;
+  if(!keys(d,['gen','mut','path','title'])||!str(d.gen,22)||!TOKEN.test(d.gen)||!integer(d.mut)||d.mut<0||d.mut>2147483648||!str(d.path,512)||sanitizeUrl(d.path)!==d.path||!str(d.title,120))return false;
+  if(!keys(v,['w','h','dpr'])||!integer(v.w)||v.w<0||!integer(v.h)||v.h<0||!Number.isFinite(v.dpr)||v.dpr<0.5||v.dpr>8)return false;
+  if(!keys(e,['tag','id','classes','role','name','text','selector','rect','attrs','styles','source'])||!summary({tag:e.tag,id:e.id,classes:e.classes}))return false;
+  if(!str(e.text,300)||!str(e.selector,512)||!e.selector||(e.role!==undefined&&!str(e.role,120))||(e.name!==undefined&&!str(e.name,120)))return false;
+  if(!keys(e.rect,['x','y','w','h'])||!['x','y','w','h'].every(k=>integer(e.rect[k]))||e.rect.w<0||e.rect.h<0)return false;
+  if(!keys(e.styles,STYLES)||!Object.values(e.styles).every(v=>str(v,120)))return false;
+  if(e.attrs!==undefined&&(!keys(e.attrs,ATTRS)||!Object.entries(e.attrs).every(([k,v])=>str(v,200)&&(!['href','src'].includes(k)||v===''||sanitizeUrl(v,200)===v))))return false;
+  if(e.source!==undefined&&(!keys(e.source,['eid'])||!str(e.source.eid,200)||!e.source.eid))return false;
+  return Array.isArray(s.ancestors)&&s.ancestors.length<=6&&s.ancestors.every(summary);
+}
+const gen=btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16)))).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+let mut=0,nonce,origin,mode='interact';
+const doc=()=>{let p=location.pathname;if(!location.hostname.startsWith('aws-')){if(p==='/preview')p='/';else if(p.startsWith('/preview/'))p=p.slice(8);}return {gen,mut,path:sanitizeUrl(p+location.search+location.hash),title:clean(document.title,120)}};
+const post=(type,record)=>{if(!nonce)return;try{window.parent.postMessage({type:'ezil.preview.'+type,v:1,nonce,...record},origin)}catch{}};
+window.addEventListener('message',ev=>{try{
+  const d=ev.data;
+  if(ev.source!==window.parent||!origins.includes(ev.origin)||ev.origin==='*'||ev.origin==='null'||!object(d)||d.v!==1||typeof d.nonce!=='string'||d.nonce.length!==22||!TOKEN.test(d.nonce))return;
+  if(d.type==='ezil.preview.hello'&&keys(d,['type','v','nonce'])){nonce=d.nonce;origin=ev.origin;mode='interact';post('ready',{doc:doc()});return}
+  if(ev.origin===origin&&d.nonce===nonce&&d.type==='ezil.preview.mode'&&keys(d,['type','v','nonce','mode'])&&['interact','select'].includes(d.mode))mode=d.mode;
+}catch{}});
+function sensitive(el){
+  for(let p=el;p&&p.nodeType===1;p=p.parentElement){
+    const tag=p.tagName.toLowerCase(),ac=p.getAttribute('autocomplete')||'';
+    if(['input','textarea','select'].includes(tag)||p.getAttribute('type')?.toLowerCase()==='password'||p.isContentEditable||p.hasAttribute('contenteditable')&&p.getAttribute('contenteditable')!=='false'||/(?:username|password|one-time-code|cc-)/i.test(ac))return true;
+  }return false;
+}
+function visibleText(el){
+  let text='',visited=0;
+  function walk(node){
+    if(++visited>2000||text.length>=1200)return;
+    if(node.nodeType===3){text+=node.textContent+' ';return}
+    if(node.nodeType!==1||sensitive(node)||['script','style','template','noscript'].includes(node.tagName.toLowerCase())||node.hidden)return;
+    const style=getComputedStyle(node);if(style.display==='none'||style.visibility==='hidden'||style.visibility==='collapse')return;
+    for(const child of node.childNodes)walk(child);
   }
+  walk(el);return clean(text.replace(/\s+/g,' ').trim(),300);
+}
+const basic=el=>{const r={tag:el.tagName.toLowerCase(),classes:Array.from(el.classList).slice(0,12).map(c=>clean(c,64))};if(el.id)r.id=clean(el.id,64);return r};
+const escape=s=>Array.from(s).map((c,i)=>/[a-zA-Z_]/.test(c)||i>0&&/[a-zA-Z0-9_-]/.test(c)?c:'\\'+c.codePointAt(0).toString(16)+' ').join('');
+function selector(el){
+  const parts=[];let length=0;
+  for(let p=el;p&&p.nodeType===1;p=p.parentElement){
+    let step=p.tagName.toLowerCase();if(!TAG.test(step))break;
+    const id=p.id&&p.id===clean(p.id,64)?p.id:'',cls=Array.from(p.classList).find(c=>c&&c===clean(c,64));
+    if(id)step+='#'+escape(id);
+    else if(cls)step+='.'+escape(cls);
+    else{let n=1;for(let s=p.previousElementSibling;s;s=s.previousElementSibling)if(s.tagName===p.tagName)n++;step+=':nth-of-type('+n+')'}
+    if(!parts.length&&step.length>512)step=p.tagName.toLowerCase();
+    if(length+step.length+(parts.length?3:0)>512)break;
+    parts.unshift(step);length+=step.length+(parts.length>1?3:0);if(id||parts.length>=12)break;
+  }return parts.join(' > ');
+}
+function selection(el){
+  const e=basic(el),blocked=sensitive(el),r=el.getBoundingClientRect();
+  e.text=blocked?'':visibleText(el);e.selector=selector(el);
+  e.rect={x:Math.round(r.x),y:Math.round(r.y),w:Math.round(r.width),h:Math.round(r.height)};
+  const role=el.getAttribute('role');if(role)e.role=clean(role,120);
+  const name=blocked?'':el.getAttribute('aria-label')||el.getAttribute('alt')||e.text;if(name)e.name=clean(name,120);
+  e.attrs={};for(const k of ATTRS){const value=el.getAttribute(k);if(value!==null&&!(blocked&&k==='placeholder'))e.attrs[k]=['href','src'].includes(k)?sanitizeUrl(value,200):clean(value,200)}
+  e.styles={};const styles=getComputedStyle(el);for(const k of STYLES){const value=styles.getPropertyValue(k);if(value)e.styles[k]=clean(value,120)}
+  const ancestors=[];for(let p=el;p&&p.nodeType===1;p=p.parentElement){
+    const eid=clean(p.getAttribute('data-eid')||p.getAttribute('data-oid'),200);if(eid&&!e.source)e.source={eid};
+    if(p!==el&&ancestors.length<6)ancestors.push(basic(p));
+  }
+  const s={doc:doc(),viewport:{w:Math.round(window.innerWidth),h:Math.round(window.innerHeight),dpr:Math.min(8,Math.max(.5,window.devicePixelRatio||1))},el:e,ancestors};
+  if(JSON.stringify(s).length>12000)e.text='';
+  for(const k of Object.keys(e.styles)){if(JSON.stringify(s).length<=12000)break;delete e.styles[k]}
+  while(ancestors.length&&JSON.stringify(s).length>12000)ancestors.pop();
+  return validSelection(s)?s:null;
+}
+let lastTouch=-Infinity;
+function select(ev){
+  if(mode!=='select'||!nonce)return;
+  if(ev.type==='keydown'&&(!['Enter',' ','Spacebar'].includes(ev.key)||ev.repeat))return;
+  const el=ev.target?.nodeType===1?ev.target:ev.target?.parentElement;if(!el)return;
+  ev.preventDefault();ev.stopPropagation();
+  if(ev.type==='click'&&Date.now()-lastTouch<750)return;
+  if(ev.type==='touchend')lastTouch=Date.now();
+  try{const sel=selection(el);if(sel)post('select',{sel})}catch{}
+}
+document.addEventListener('click',select,true);
+document.addEventListener('keydown',select,true);
+document.addEventListener('touchend',select,{capture:true,passive:false});
+// Keep the latest document even during continuous mutation/HMR bursts, at most four posts per second.
+function limited(type){let timer,last=-Infinity;return ()=>{if(!nonce||timer!==undefined)return;timer=setTimeout(()=>{timer=undefined;last=Date.now();post(type,{doc:doc()})},Math.max(50,250-(Date.now()-last)))}}
+const changed=limited('changed'),navigated=limited('navigate');
+const revision=()=>{mut=Math.min(2147483648,mut+1)};
+const bump=()=>{revision();changed()},navigate=()=>{revision();navigated()};
+// The inspector is a classic script: reuse the app's existing Vite client to reach its hot event bus.
+let viteBound=false;
+function bindVite(){try{
+  if(viteBound)return;
+  const script=document.querySelector('script[type="module"][src*="/@vite/client"]');if(!script)return;
+  const vite=new URL(script.src,location.href);if(vite.origin!==location.origin||!vite.pathname.endsWith('/@vite/client'))return;
+  viteBound=true;
+  import(vite.href).then(client=>{if(typeof client.createHotContext==='function')client.createHotContext('/preview-inspector.js').on('vite:afterUpdate',bump)}).catch(()=>{});
+}catch{}}
+new MutationObserver(()=>{bump();bindVite()}).observe(document,{subtree:true,childList:true,attributes:true,characterData:true});
+bindVite();
+window.addEventListener('vite:afterUpdate',bump);
+document.addEventListener('vite:afterUpdate',bump);
+for(const key of ['pushState','replaceState']){const original=history[key];history[key]=function(){const result=original.apply(this,arguments);navigate();return result}}
+window.addEventListener('popstate',navigate);window.addEventListener('hashchange',navigate);
+}catch{}})();`;
+}
 
-  postToParent('ready', { href: location.href, path: inAppPath(), title: document.title });
+function previewDiagnosticScript(origins: readonly string[], state: PreviewDiagnosticReason): string {
+  return `(()=>{const origins=${scriptJson(origins)};window.addEventListener('message',ev=>{try{const d=ev.data;
+if(ev.source!==window.parent||window.parent===window||!origins.includes(ev.origin)||ev.origin==='*'||ev.origin==='null'||!d||typeof d!=='object'||Array.isArray(d)||Object.keys(d).length!==3||d.type!=='ezil.preview.hello'||d.v!==1||typeof d.nonce!=='string'||d.nonce.length!==22||!/^[A-Za-z0-9_-]{22}$/.test(d.nonce))return;
+window.parent.postMessage({type:'ezil.preview.state',v:1,nonce:d.nonce,state:${scriptJson(state)}},ev.origin);
+}catch{}})})();`;
+}
 
-  var origPush = history.pushState;
-  history.pushState = function () {
-    var r = origPush.apply(this, arguments);
-    postToParent('navigate', { href: location.href, path: inAppPath() });
-    return r;
-  };
-  window.addEventListener('popstate', function () {
-    postToParent('navigate', { href: location.href, path: inAppPath() });
-  });
-})();
-`.trimStart();
+/** Preserve an upstream error document, including headless HTML, and add only the state responder. */
+export function injectPreviewDiagnostic(html: string, origins: readonly string[]): string {
+  const script = `<script>${previewDiagnosticScript(origins, 'upstream_error')}</script>`;
+  const head = HEAD_OPEN_RE.exec(html);
+  const idx = head ? head.index + head[0].length : 0;
+  return html.slice(0, idx) + script + html.slice(idx);
+}
 
 // ── "Dev server not up" diagnostic page ──────────────────────────────────────
 
@@ -552,7 +623,7 @@ export const INSPECTOR_JS = `
  */
 export type PreviewDiagnosticReason = 'no_package_json' | 'port_not_listening' | 'upstream_error';
 
-export function buildDiagnosticResponse(reason: PreviewDiagnosticReason, port: number, detail?: string): Response {
+export function buildDiagnosticResponse(reason: PreviewDiagnosticReason, port: number, detail?: string, origins: readonly string[] = []): Response {
   const label =
     reason === 'no_package_json'
       ? 'No project scaffolded yet'
@@ -563,6 +634,7 @@ export function buildDiagnosticResponse(reason: PreviewDiagnosticReason, port: n
   const body = `<!doctype html>
 <html><head><title>EZiL Preview — ${escapeHtml(label)}</title>
 <meta http-equiv="refresh" content="3">
+<script>${previewDiagnosticScript(origins, reason)}</script>
 <style>
 *{box-sizing:border-box}
 body{background:#1a1017;color:#f0d0d0;font-family:system-ui,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;padding:2rem}
@@ -588,6 +660,7 @@ pre{background:#0d0508;border:1px solid #4a1515;border-radius:6px;padding:1rem;t
     headers: {
       'content-type': 'text/html; charset=utf-8',
       'cache-control': 'no-cache, no-store',
+      'referrer-policy': 'same-origin',
       'retry-after': '3',
     },
   });
@@ -631,7 +704,7 @@ export function stripPreviewCookie(cookieHeader: string | null): string | undefi
 // doc comment there for why, and for the full failure mode this closes).
 
 /**
- * Resolve preview auth from a request: the `ezil_preview` cookie if present
+ * Existing Code auth: the `ezil_preview` cookie if present
  * and valid, else the `?ezil_pv=` query-string fallback. Cookie takes
  * precedence when both are present and valid — the fallback exists only for
  * the browsers/paths that never had a cookie to begin with.
@@ -647,6 +720,66 @@ export async function resolvePreviewAuth(
   const fallback = url.searchParams.get(PREVIEW_COOKIE_QUERY_PARAM) ?? undefined;
   if (!fallback) return false;
   return verifyPreviewCookie(fallback, secrets, sandboxId);
+}
+
+/** App resources alone: do not cache bearer URLs or send them to other origins. */
+export const APP_PREVIEW_RESOURCE_HEADERS = {
+  'cache-control': 'private, no-store',
+  'referrer-policy': 'same-origin',
+};
+
+/**
+ * Parser/module/CSS requests bypass the runtime shim. With neither direct credential
+ * present, a SAME-origin Referer may carry the existing sandbox-bound signed token.
+ * Verify it, then redirect (307 preserves method/body) to this resource with that token;
+ * never proxy on Referer alone. The final URL can then carry auth to the next import.
+ * Explicit invalid credentials never fall back, and Code keeps its existing auth path.
+ */
+export async function resolveAppPreviewAuth(
+  request: Request, url: URL, secrets: string[], sandboxId: string,
+): Promise<boolean | Response> {
+  // Preserve the existing CF local-dev policy; AWS refuses absent secrets before this call.
+  if (!secrets.some(s => s && s.trim())) return true;
+  const cookie = readCookie(request.headers.get('cookie'), PREVIEW_COOKIE_NAME);
+  const direct = url.searchParams.getAll(PREVIEW_COOKIE_QUERY_PARAM);
+  if (cookie !== undefined && !await verifyPreviewCookie(cookie, secrets, sandboxId, 'app')) return false;
+  if (direct.length && (direct.length !== 1 || !await verifyPreviewCookie(direct[0], secrets, sandboxId, 'app'))) return false;
+  if (cookie !== undefined || direct.length) return true;
+
+  let referer: URL;
+  try { referer = new URL(request.headers.get('referer') ?? ''); } catch { return false; }
+  if (referer.origin !== url.origin || referer.username || referer.password) return false;
+  const tokens = referer.searchParams.getAll(PREVIEW_COOKIE_QUERY_PARAM);
+  if (tokens.length !== 1 || !await verifyPreviewCookie(tokens[0], secrets, sandboxId, 'app')) return false;
+  const dest = new URL(url);
+  dest.username = ''; dest.password = ''; dest.hash = '';
+  // A path-only Location beginning // would redirect the bearer to another host.
+  if (dest.pathname.startsWith('//')) return false;
+  dest.searchParams.set(PREVIEW_COOKIE_QUERY_PARAM, tokens[0]);
+  return new Response(null, { status: 307, headers: {
+    ...APP_PREVIEW_RESOURCE_HEADERS, location: dest.pathname + dest.search,
+  } });
+}
+
+/** Drop credential-bearing Referer entirely before exposing headers to project code. */
+export function stripPreviewReferer(headers: Headers): void {
+  const value = headers.get('referer');
+  if (!value) return;
+  try {
+    const url = new URL(value);
+    const credential = /^(ezil_pv|ezil_mint|token|access_token|id_token|refresh_token|code|state|session|sid|key|api_key|apikey|secret|password|pass|auth|authorization|signature|sig)$|_token$/i;
+    if (url.username || url.password || [...url.searchParams.keys()].some(k => credential.test(k))) headers.delete('referer');
+  } catch { headers.delete('referer'); }
+}
+
+/**
+ * Never let a client choose Worker-internal routing. The sandbox Durable Object treats `x-ezil-running-code: 1`
+ * plus a `cf-container-target-port` of the Code port as the authenticated Code bridge (index.ts); only the Code
+ * dispatcher may set the first, and the sandbox SDK sets the second. A browser on any bridge host sends neither.
+ */
+export function stripInternalRoutingHeaders(headers: Headers): void {
+  headers.delete('x-ezil-running-code');
+  headers.delete('cf-container-target-port');
 }
 
 /** Strip the `ezil_pv` fallback query param before forwarding a request upstream. */
@@ -794,7 +927,9 @@ export async function handlePreviewBootstrap(
   let destPath = url.searchParams.get('path') || '/';
   if (!destPath.startsWith('/')) destPath = `/${destPath}`;
 
-  const cookie = await mintPreviewCookie(cookieSecret, sandboxId);
+  // The app's value is readable by project code (`?ezil_pv=`), so it is minted for the app alone and can never
+  // open the same sandbox's code-server.
+  const cookie = await mintPreviewCookie(cookieSecret, sandboxId, Date.now(), target === 'app' ? 'app' : 'default');
   // `Partitioned` (CHIPS) is what lets Chrome/Edge actually send this
   // `SameSite=None` cookie back on a third-party-iframe request at all —
   // without it, current/upcoming Chrome versions block the cookie outright
@@ -859,6 +994,7 @@ export async function handlePreviewBootstrap(
     headers: {
       Location: location,
       'Set-Cookie': cookieAttrs,
+      ...(target === 'app' ? APP_PREVIEW_RESOURCE_HEADERS : {}),
     },
   });
 }
@@ -876,14 +1012,10 @@ export async function handlePreviewBootstrap(
  * `port`/`target` default to the original app-preview values so every
  * pre-existing call site (and its tests) keeps working unchanged.
  *
- * `target === 'code'` NEVER gets `RUNTIME_SHIM` injected, even for an
- * `text/html` response: the shim monkey-patches `window.WebSocket` to rewrite
- * Next.js/Vite HMR paths through `/preview-ws/...`, and code-server's own
- * WebSocket traffic (extension host, integrated terminal, editor sync) is NOT
- * an HMR channel — rewriting/wrapping it breaks the extension host
- * immediately and silently (it just never connects). This is a known, narrow
- * landmine: keep this check target-based, never port-based or content-type
- * heuristic-based, so it can't regress if the ports are ever renumbered.
+ * `target === 'code'` NEVER gets `RUNTIME_SHIM` injected, even for a
+ * `text/html` response. The app's fetch/XHR/WebSocket fallback wrapper must not
+ * touch code-server's extension host, integrated terminal or editor transport.
+ * Keep this check target-based rather than a content-type heuristic.
  *
  * `codeShellOrigins` (code target only): the EZiL OS shell origins the Code folder bridge may report to
  * (`./code-folder-bridge.ts`). The bridge goes into code-server's workbench document (a GET of `/`) and nothing
@@ -900,11 +1032,12 @@ export async function handlePreviewProxy(
   codeShellOrigins: readonly string[] = [],
 ): Promise<Response> {
   const url = new URL(request.url);
-  const authorized = await resolvePreviewAuth(request, url, secrets, sandboxId);
+  const authorized = await (target === 'app' ? resolveAppPreviewAuth : resolvePreviewAuth)(request, url, secrets, sandboxId);
+  if (authorized instanceof Response) return authorized;
   if (!authorized) {
     return new Response(
       JSON.stringify({ ok: false, error: 'preview_cookie_missing_or_invalid: re-fetch /preview-bootstrap' }),
-      { status: 401, headers: { 'content-type': 'application/json' } },
+      { status: 401, headers: { 'content-type': 'application/json', ...(target === 'app' ? APP_PREVIEW_RESOURCE_HEADERS : {}) } },
     );
   }
 
@@ -913,6 +1046,8 @@ export async function handlePreviewProxy(
   const targetUrl = `http://127.0.0.1:${port}${targetPath}${forwardSearch}`;
 
   const forwardHeaders = new Headers(request.headers);
+  if (target === 'app') stripPreviewReferer(forwardHeaders);
+  stripInternalRoutingHeaders(forwardHeaders);
   forwardHeaders.delete('host');
   forwardHeaders.delete('content-length');
   const strippedCookie = stripPreviewCookie(request.headers.get('cookie'));
@@ -940,20 +1075,27 @@ export async function handlePreviewProxy(
     const message = err instanceof Error ? err.message : String(err);
     // Connection-refused / not-yet-listening is the common case — surface the
     // explicit "waiting for dev server" diagnostic rather than a hard 502.
-    return buildDiagnosticResponse('port_not_listening', port, message);
+    return buildDiagnosticResponse('port_not_listening', port, message, previewInspectorOrigins(url.hostname));
   }
 
   const contentType = upstream.headers.get('content-type') ?? '';
   // code-server is served from `/` on its own bridge host, not from
   // `/preview` — pinning its cookies to `/preview` would silently drop them.
   const outHeaders = rewriteResponseHeaders(upstream.headers, target === 'code' ? '/' : '/preview');
+  if (target === 'app') for (const [key, value] of Object.entries(APP_PREVIEW_RESOURCE_HEADERS)) outHeaders.set(key, value);
 
-  if (contentType.includes('text/html')) {
+  if ([204, 205, 304].includes(upstream.status)) return new Response(null, { status: upstream.status, headers: outHeaders });
+  if (/^\s*text\/html\b/i.test(contentType)) {
     const bodyText = await upstream.text();
+    const appBody = target === 'app' ? (isHtmlDocument(upstream.status, contentType)
+      ? injectRuntimeShim(bodyText) : injectPreviewDiagnostic(bodyText, previewInspectorOrigins(url.hostname))) : bodyText;
     const workbench = target === 'code' && isHtmlDocument(upstream.status, contentType)
       && isWorkbenchDocumentRequest(request.method, targetPath, request.headers.get('upgrade'));
-    const injected = target === 'code' ? (workbench ? injectCodeBillingBridge(injectCodeDiagBridge(injectCodeFolderBridge(bodyText, codeShellOrigins), codeShellOrigins), codeShellOrigins) : bodyText)
-      : injectRuntimeShim(bodyText);
+    const injected = target === 'code' ? (workbench ? injectCodePreviewBridge(injectCodeBillingBridge(injectCodeDiagBridge(injectCodeFolderBridge(bodyText, codeShellOrigins), codeShellOrigins), codeShellOrigins), codeShellOrigins) : bodyText)
+      : appBody;
+    if (target === 'app') await allowPreviewInlineScripts(outHeaders, isHtmlDocument(upstream.status, contentType)
+      ? RUNTIME_SHIM : injectPreviewDiagnostic('', previewInspectorOrigins(url.hostname)),
+      isHtmlDocument(upstream.status, contentType) ? url.origin : undefined);
     outHeaders.set('cache-control', 'no-cache, no-store');
     return new Response(injected, { status: upstream.status, headers: outHeaders });
   }
@@ -968,18 +1110,19 @@ export async function handlePreviewInspectorJs(
   sandboxId: string,
   secrets: string[],
 ): Promise<Response> {
-  const authorized = await resolvePreviewAuth(request, new URL(request.url), secrets, sandboxId);
+  const authorized = await resolveAppPreviewAuth(request, new URL(request.url), secrets, sandboxId);
+  if (authorized instanceof Response) return authorized;
   if (!authorized) {
     return new Response(
       JSON.stringify({ ok: false, error: 'preview_cookie_missing_or_invalid: re-fetch /preview-bootstrap' }),
-      { status: 401, headers: { 'content-type': 'application/json' } },
+      { status: 401, headers: { 'content-type': 'application/json', ...APP_PREVIEW_RESOURCE_HEADERS } },
     );
   }
-  return new Response(INSPECTOR_JS, {
+  return new Response(previewInspectorScript(previewInspectorOrigins(new URL(request.url).hostname)), {
     status: 200,
     headers: {
       'content-type': 'application/javascript; charset=utf-8',
-      'cache-control': 'public, max-age=60',
+      ...APP_PREVIEW_RESOURCE_HEADERS,
     },
   });
 }
@@ -1087,9 +1230,10 @@ export async function handlePreviewWsProxy(
   target: BridgeTarget = 'app',
 ): Promise<Response> {
   const url = new URL(request.url);
-  const authorized = await resolvePreviewAuth(request, url, secrets, sandboxId);
+  const authorized = await (target === 'app' ? resolveAppPreviewAuth : resolvePreviewAuth)(request, url, secrets, sandboxId);
+  if (authorized instanceof Response) return authorized;
   if (!authorized) {
-    return new Response('invalid preview cookie', { status: 401 });
+    return new Response('invalid preview cookie', { status: 401, headers: target === 'app' ? APP_PREVIEW_RESOURCE_HEADERS : {} });
   }
 
   const targetPath = `/${appPath.replace(/^\/+/, '')}`;
@@ -1097,6 +1241,8 @@ export async function handlePreviewWsProxy(
   const targetUrl = `http://127.0.0.1:${port}${targetPath}${forwardSearch}`;
 
   const forwardHeaders = new Headers(request.headers);
+  if (target === 'app') stripPreviewReferer(forwardHeaders);
+  stripInternalRoutingHeaders(forwardHeaders);
   forwardHeaders.delete('host');
   const strippedCookie = stripPreviewCookie(request.headers.get('cookie'));
   if (strippedCookie) forwardHeaders.set('cookie', strippedCookie);

@@ -11,6 +11,7 @@ import { EZiLModelsProvider, type BillingIntent } from './provider';
 import { PARTICIPANT_ID, registerNoToolsParticipant } from './participant';
 import type { Usage } from './types';
 import { publishInferenceTrace } from './trace-publisher';
+import { registerPreview } from './preview/panel';
 
 export const DEFAULT_CONFIG_PATH = '/etc/ezil/models.json';
 export const CONFIG_ENV = 'EZIL_MODELS_CONFIG';
@@ -248,6 +249,7 @@ export function appStartFailure(): AppFailure {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
+    try { registerPreview(context); } catch { /* Optional preview must never prevent model registration. */ }
     const output = vscode.window.createOutputChannel('EZiL Models');
     const log = (line: string) => output.appendLine(line.startsWith('{') ? line : `${new Date().toISOString()} ${line}`);
     const settings = () => vscode.workspace.getConfiguration('ezilModels');
