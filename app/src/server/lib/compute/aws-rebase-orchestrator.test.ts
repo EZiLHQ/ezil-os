@@ -22,6 +22,23 @@ describe('image orchestration with the real locked store and provider doubles', 
             lease_epoch: j.targetLeaseEpoch, enroll_nonce_hash: nonceHashOf(lease.nonce), lifecycle_digest: j.launchDigest });
         await s.run('launch'); expect(s.started).toHaveLength(2);
     });
+    it.each([
+        { paid: true, fleetLimit: '600', phase: 'launch_pending', failureCode: null },
+        { paid: false, fleetLimit: '600', phase: 'snapshot_ready', failureCode: 'operator_required' },
+        { paid: true, fleetLimit: '1', phase: 'snapshot_ready', failureCode: 'operator_required' },
+    ])('applies the normal paid hours exemption without bypassing fleet limits ($paid/$fleetLimit)', async ({ paid, fleetLimit, phase, failureCode }) => {
+        const userHoursExemption = vi.fn(async () => paid);
+        const s = rebaseSetup(undefined, userHoursExemption);
+        s.env.EZIL_AWS_USER_MONTHLY_HOURS = '1';
+        s.env.EZIL_AWS_GLOBAL_MONTHLY_HOURS = fleetLimit;
+        s.fake.usage.push({ user_id: s.owner, computer_id: s.source.computerId, instance_type: 'm6i.large',
+            started_at: new Date('2026-10-22T08:00:00Z'), stopped_at: new Date('2026-10-22T10:00:00Z'), egress_bytes: 0 });
+        await s.run('prepare');
+        await s.completePreparation();
+        expect((await s.run('launch')).body).toMatchObject({ phase, failureCode });
+        expect(userHoursExemption).toHaveBeenCalledExactlyOnceWith(s.owner);
+        expect(s.started).toHaveLength(failureCode ? 1 : 2);
+    });
     it('completes only after target volume tags, host digest, enrollment and desktop health', async () => {
         const s = await launch(); await s.completeLaunch();
         expect((await s.run('verify')).body.phase).toBe('verifying');

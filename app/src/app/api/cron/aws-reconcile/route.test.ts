@@ -3,6 +3,7 @@ import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { defaultAwsCollaborators } from '@/server/api/routers/compute-dispatch';
 import { db } from '@/server/db';
+import { verifyLaunchedStagingImageUpdates } from '@/server/lib/compute/aws-auto-update';
 import { createPoolDeps } from '@/server/lib/compute/aws-pool-runtime';
 import { runAwsBackgroundReconcile } from '@/server/lib/compute/aws-receipts';
 import { GET, maxDuration } from './route';
@@ -11,6 +12,7 @@ const mockEnv = vi.hoisted(() => ({ CRON_SECRET: undefined as string | undefined
 vi.mock('@/env', () => ({ env: mockEnv }));
 vi.mock('@/server/db', () => ({ db: {} }));
 vi.mock('@/server/api/routers/compute-dispatch', () => ({ defaultAwsCollaborators: vi.fn() }));
+vi.mock('@/server/lib/compute/aws-auto-update', () => ({ verifyLaunchedStagingImageUpdates: vi.fn() }));
 vi.mock('@/server/lib/compute/aws-pool-runtime', () => ({ createPoolDeps: vi.fn() }));
 vi.mock('@/server/lib/compute/aws-receipts', () => ({ runAwsBackgroundReconcile: vi.fn() }));
 
@@ -21,6 +23,7 @@ const untouched = () => {
     expect(defaultAwsCollaborators).not.toHaveBeenCalled();
     expect(createPoolDeps).not.toHaveBeenCalled();
     expect(runAwsBackgroundReconcile).not.toHaveBeenCalled();
+    expect(verifyLaunchedStagingImageUpdates).not.toHaveBeenCalled();
 };
 
 beforeEach(() => {
@@ -78,6 +81,17 @@ describe('GET /api/cron/aws-reconcile', () => {
         expect(collaborators.starter.start).not.toHaveBeenCalled();
         expect(collaborators.executions.describe).not.toHaveBeenCalled();
         expect(maxDuration).toBe(50);
+    });
+
+    it('verifies dispatched updates only on staging, including after automatic starts are disabled', async () => {
+        vi.stubEnv('EZIL_AWS_ENROLL_URL', 'https://os.example/api/compute/aws/enroll');
+        await GET(request('Bearer cron'));
+        expect(verifyLaunchedStagingImageUpdates).not.toHaveBeenCalled();
+
+        vi.stubEnv('EZIL_AWS_ENROLL_URL', 'https://os-staging.ezil.work/api/compute/aws/enroll');
+        vi.stubEnv('EZIL_AWS_AUTO_REBASE', '0');
+        await GET(request('Bearer cron'));
+        expect(verifyLaunchedStagingImageUpdates).toHaveBeenCalledExactlyOnceWith(db);
     });
 
     it('propagates a failed pass so the timer client (curl -f) reports it', async () => {

@@ -441,7 +441,7 @@ const CODE_UNREACHABLE_COPY = {
  * @returns {Promise<{ok: true, url: string, expiresAt?: number, repository?: string|null, repositoryFolder?: string|null}
  *                  | {ok: false, errorCode: string, message?: string}>}
  */
-async function mintCodePreviewUrl (computerId, signal, project = null, folder = null) {
+async function mintCodePreviewUrl (computerId, signal, project = null, folder = null, onUpdate) {
     if ( ! computerId ) {
         return { ok: false, errorCode: 'bad_request', message: 'No computer to preview.' };
     }
@@ -457,7 +457,11 @@ async function mintCodePreviewUrl (computerId, signal, project = null, folder = 
     // asking after its window closed (Stop closes it first) and re-provisioned the
     // computer 0.23 s after the stop. `signal` is the window's, aborted on close;
     // Stop also reaches it through `session.cancelComputerOpens`.
-    return session.cancellableWake(computerId, 'codePreviewUrl', (s) => mintCodePreviewUrlOnce(computerId, s, project, folder), { signal });
+    return session.cancellableWake(computerId, 'codePreviewUrl', async (s) => {
+        const result = await mintCodePreviewUrlOnce(computerId, s, project, folder);
+        if (!s.aborted) onUpdate?.(result.computeUpdating === true);
+        return result;
+    }, { signal });
 }
 
 /** The request's signal: its timeout and, when given, the loop's cancel. */
@@ -543,7 +547,11 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = nul
         return { ok: false, errorCode: 'unknown', message: data?.error?.message ?? 'Something went wrong.', ...diagnostics };
     }
 
-    if ( data?.ok !== true ) return session.pendingOrRefused(data);
+    if ( data?.ok !== true ) {
+        const pending = session.pendingOrRefused(data);
+        return pending.errorCode === 'sandbox_starting' && pending.computeProvider === 'aws-ec2' && data?.computeUpdating === true
+            ? { ...pending, computeUpdating: true } : pending;
+    }
     if ( typeof data.codePreviewUrl !== 'string' || data.codePreviewUrl === '' ) {
         // Reported success with nothing to show. Loud, not silent — same rule
         // `session.js`'s `previewUrl()` follows for `appPreviewUrl`.
@@ -812,9 +820,11 @@ export async function openCodeWindow (ctx = {}) {
         clearInterval(poll_timer); poll_timer = null;
     };
 
+    let updating = false;
     const nativeFailureCopy = nativeSurface ? editorFailureCopy() : undefined;
     const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Code…', icon: ctx.icon, isMigrating: () => session.isComputeMigrating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
+        isUpdating: () => updating,
         // Round 6 (seam C): the first Code open after the computer starts waits for its config to apply.
         isPreparing: () => session.isComputePreparing(computer.id),
         onRetry: () => {
@@ -971,6 +981,7 @@ export async function openCodeWindow (ctx = {}) {
         stop_timers();
         show_panel();
         running_signal = undefined;
+        updating = false;
 
         if ( desktop_state.configured !== true ) {
             console.warn(`[${PHASE}] no desktop provider is configured`);
@@ -1012,7 +1023,10 @@ export async function openCodeWindow (ctx = {}) {
         mint_ctl?.abort();
         mint_ctl = new AbortController();
         const asked = project;
-        const res = await (nativeSurface ? nativeSurface.open(ctx.previewPort) : mintCodePreviewUrl(computer.id, mint_ctl.signal, asked, wanted_folder));
+        const res = await (nativeSurface ? nativeSurface.open(ctx.previewPort)
+            : mintCodePreviewUrl(computer.id, mint_ctl.signal, asked, wanted_folder, pending => {
+                if (my_attempt === attempt) updating = pending;
+            }));
 
         if ( disposed || my_attempt !== attempt ) return;
         stop_timers();
