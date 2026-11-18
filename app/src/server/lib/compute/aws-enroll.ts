@@ -17,10 +17,12 @@ export { ENROLL_NONCE_TTL_SECONDS, USER_DATA_MAX, REBASE_ENROLL_RESERVE_SECONDS,
  * 🔴 Never log a nonce, a control key or a tunnel token.
  */
 
-import { createHash, createHmac, randomBytes as nodeRandomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes as nodeRandomBytes, timingSafeEqual } from 'node:crypto';
 import { z } from 'zod';
 
 import { isAwsComputersEnabled, readAwsBrowserZone, type Env as AwsEnv } from './aws-config';
+import { deriveControlKey } from './aws-control-key';
+export { deriveControlKey } from './aws-control-key';
 import { boundedCode } from './aws-enroll-log';
 import { readIdentityCertificate, verifyIdentitySignature } from './aws-identity';
 import { readLifecycleDeployments } from './aws-intent';
@@ -317,25 +319,6 @@ export interface EnrollResponse {
 export type EnrollSubjectProof = Pick<Placement, 'computerId' | 'generation' | 'leaseEpoch'>;
 
 export type PoolRelayEnrollment = Pick<Placement, 'computerId' | 'ownerUserId' | 'generation' | 'leaseEpoch' | 'instanceId' | 'fenceToken'>;
-
-const CONTROL_KEY_INFO = 'ezil-aws-control-key-v1';
-
-/**
- * The epoch's GW-5 control key, DERIVED rather than random, so a host that retries an
- * enrollment whose 200 was lost gets the SAME key back:
- * HMAC-SHA256(secret, "ezil-aws-control-key-v1|computerId|generation|leaseEpoch|nonceHash").
- *
- * Nothing extra is stored for a replay. The only copies of the key stay where they already
- * were: the Worker's tunnel record (GW-1) and the host. A replay re-derives the key from the
- * nonce the host presents, and the Worker answers only when it equals the stored key exactly
- * (worker/src/aws-tunnels.ts `isExactReplay`), so a wrong nonce gets nothing. The secret is the
- * app↔Worker HMAC secret, whose holder can already sign Worker calls: no new exposure.
- */
-export function deriveControlKey(secret: string, input: { computerId: string; generation: number; leaseEpoch: number; nonceHash: string }): Buffer {
-    if (!secret.trim()) throw new Error('control_key_secret_not_configured');
-    const info = [CONTROL_KEY_INFO, input.computerId.toLowerCase(), input.generation, input.leaseEpoch, input.nonceHash].join('|');
-    return createHmac('sha256', secret).update(info).digest();
-}
 
 /** A completed enrollment may be replayed while its boot is still in flight or already running. */
 const REPLAYABLE_STATES: readonly PlacementState[] = [...ENROLLABLE_STATES, 'RUNNING'];

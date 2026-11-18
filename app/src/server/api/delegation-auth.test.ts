@@ -140,8 +140,8 @@ describe('assertion verification', () => {
     });
 
     it('refuses every wrong signature, key, header, claim, policy, binding or time with no ledger or account I/O', async () => {
-        const base = () => readClaims(USER, 'computer.get', getInput);
         const now = Math.floor(Date.now() / 1000);
+        const base = () => readClaims(USER, 'computer.get', getInput, { iat: now, exp: now + 60 });
         const cases: [string, Claims, Claims, SigningKey | null, string][] = [
             ['other key', base(), {}, other, 'signature'], ['unknown kid', base(), { kid: 'nope' }, null, 'unknown_key'],
             ['alg', base(), { alg: 'ES384' }, null, 'header'], ['typ', base(), { typ: 'JWT' }, null, 'header'], ['extra jose', base(), { jku: 'x' }, null, 'header'],
@@ -162,7 +162,7 @@ describe('assertion verification', () => {
             ['expired', { ...base(), iat: now - 61, exp: now - 1 }, {}, null, 'expired'],
         ];
         for (const [name, claims, header, signer, reason] of cases) {
-            const { outcome, consumeJti, findAccount } = await check(claims, {}, header, signer ?? key);
+            const { outcome, consumeJti, findAccount } = await check(claims, { now: () => now }, header, signer ?? key);
             expect(outcome, name).toEqual({ kind: 'rejected', reason });
             expect(consumeJti, name).not.toHaveBeenCalled();
             expect(findAccount, name).not.toHaveBeenCalled();

@@ -241,6 +241,23 @@ class ProductionEnvironmentTests(unittest.TestCase):
         renderer.validate({**self.values, "STRIPE_SECRET": "rk_live_synthetic",
                            "SUPABASE_DATABASE_URL": PRODUCTION_DB.replace("postgres://", "postgresql://")}, "production")
 
+    def test_native_keys_are_explicit_and_production_only(self):
+        native = {key: "synthetic-pin" for key in renderer.PRODUCTION_NATIVE}
+        native.update({key: "0" for key in renderer.NATIVE_SWITCHES})
+        native.update(EZIL_NATIVE_AUTHORIZATION="disabled", EZIL_NATIVE_SESSIONS_ORIGIN="https://os.ezil.work")
+        values = {**self.values, **native}
+        self.assertEqual(renderer.validate(values, "production"), values)
+        self.assertTrue(set(native).isdisjoint(renderer.REQUIRED))
+        self.assertRefused(values, "Unknown key", "staging")
+        self.assertRefused({**values, "EZIL_NATIVE_UNREVIEWED": "1"}, "Unknown key")
+
+    def test_native_gates_and_origin_use_the_exact_app_literals(self):
+        for key in renderer.NATIVE_SWITCHES:
+            self.assertRefused({**self.values, key: "true"}, "gates must be exactly")
+            renderer.validate({**self.values, key: "1"}, "production")
+        self.assertRefused({**self.values, "EZIL_NATIVE_AUTHORIZATION": "1"}, "must be exactly")
+        self.assertRefused({**self.values, "EZIL_NATIVE_SESSIONS_ORIGIN": "https://other.example.test"}, "production OS origin")
+
     def test_production_pins_api_url(self):
         for url in ("https://13-206-183-230.sslip.io", "https://db.ezil.work/", "http://db.ezil.work"):
             with self.subTest(url=url):

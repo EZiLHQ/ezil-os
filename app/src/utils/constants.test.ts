@@ -218,6 +218,26 @@ describe('safeReturnUrl — compatibility decisions (docs/APP-ROUTES.md §6)', (
     });
 });
 
+describe('safeReturnUrl — native consent (/native/authorize/<uuid>)', () => {
+    const OP = '9d5b0a1e-0000-4000-8000-000000000000';
+
+    it('keeps exactly the native consent page for a lowercase operation id', () => {
+        expect(safeReturnUrl(`/native/authorize/${OP}`)).toBe(`/native/authorize/${OP}`);
+        expect(safeReturnUrl(`${Routes.NATIVE_AUTHORIZE}/${OP}`)).toBe(`/native/authorize/${OP}`);
+    });
+
+    it('🔴 refuses every other native shape: no query, hash, case, encoding or extra segment', () => {
+        for (const url of [
+            '/native', '/native/', '/native/authorize', '/native/authorize/', `/native/authorize/${OP}/`, `/native/authorize/${OP}?x=1`,
+            `/native/authorize/${OP}?`, `/native/authorize/${OP}#top`, `/native/authorize/${OP.toUpperCase()}`, `/native/authorize/${OP}/x`,
+            `/native/authorize/${OP.slice(0, -1)}`, '/native/authorize/not-a-uuid', `/native/authorize%2f${OP}`, `/native/authorize/..%2f${OP}`,
+            `/native/authorize/../authorize/${OP}`, `/native/other/${OP}`, `/Native/authorize/${OP}`,
+        ]) {
+            expect(safeReturnUrl(url), url).toBe(Routes.COMPUTERS);
+        }
+    });
+});
+
 describe('the /app/<id> allowlist', () => {
     it('accepts exactly the registry ids and aliases', () => {
         for (const id of [...SHELL_APP_IDS, 'browser']) {

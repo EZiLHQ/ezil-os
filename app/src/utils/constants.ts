@@ -17,6 +17,8 @@ export const Routes = {
      * docs/APP-ROUTES.md). Build it with `shellAppRoute`.
      */
     APP: '/app',
+    /** `/native/authorize/<operationId>`: native authorization consent (see `server/native-auth/consent.ts`). */
+    NATIVE_AUTHORIZE: '/native/authorize',
 } as const;
 
 /**
@@ -144,6 +146,12 @@ export function safeReturnUrl(value: string | string[] | undefined | null): stri
     }
     const end = raw.search(/[?#]/);
     const path = end === -1 ? raw : raw.slice(0, end);
+    // Case 2b — the native consent page, `/native/authorize/<lowercase uuid>`, and nothing else: no query, no
+    // hash, no other case or segment. It is the only page a native authorization URL sends someone to, and it
+    // carries no data beyond the operation id. Anything else under `/native` is case 5.
+    if (path === Routes.NATIVE_AUTHORIZE || path.startsWith(`${Routes.NATIVE_AUTHORIZE}/`)) {
+        return raw === path && NATIVE_AUTHORIZE_UUID.test(path.slice(Routes.NATIVE_AUTHORIZE.length + 1)) ? raw : Routes.COMPUTERS;
+    }
     // Case 3 — one of this app's return pages: kept byte for byte, query and
     // hash included. The query is data: `path=src/main.ts` keeps its `/`
     // (see `returnUrlFor`) and `%2F` there is ordinary encoding.
@@ -160,6 +168,7 @@ export function safeReturnUrl(value: string | string[] | undefined | null): stri
 }
 
 const UUID_PATH = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const NATIVE_AUTHORIZE_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 /** The pages a sign-in may return to, matched as whole paths (so no dot
  * segment, encoded separator, trailing slash or extra segment can pass). */

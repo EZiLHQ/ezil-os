@@ -58,6 +58,22 @@ EZIL_OS_ADMIN_ENTITLEMENT_SENDER_KEYS
 EZIL_DELEGATED_COMPUTER_READS EZIL_DELEGATION_ISSUER EZIL_DELEGATION_AUDIENCE
 EZIL_DELEGATION_PUBLIC_JWKS EZIL_DELEGATION_CLIENT_IDS
 """.split())
+# Native consent and app-to-Host delivery are independently disabled by default.
+# Only the production app receives these explicit configuration names. The app
+# validates complete descriptors, signature keys, wrapping keys and service pins.
+PRODUCTION_NATIVE = frozenset("""
+EZIL_NATIVE_SESSIONS EZIL_NATIVE_SESSIONS_ORIGIN EZIL_NATIVE_AUTH_INTENTS
+EZIL_NATIVE_AUTH_CLIENT_IDS EZIL_NATIVE_HOST_TRANSPORT EZIL_NATIVE_RUNTIME_CONTROL
+EZIL_NATIVE_AUTHORIZATION EZIL_NATIVE_AUTHORIZATION_ISSUER EZIL_NATIVE_AUTHORIZATION_AUDIENCE
+EZIL_NATIVE_AUTHORIZATION_SIGNING_KEY_ID EZIL_NATIVE_AUTHORIZATION_SIGNING_KEY
+EZIL_NATIVE_AUTHORIZATION_POLICY_ID EZIL_NATIVE_AUTHORIZATION_SERVICE_CREDENTIAL
+EZIL_NATIVE_AUTHORIZATION_SERVICE_EXPIRES_AT EZIL_NATIVE_GRANT_WRAPPING_KEY_ID EZIL_NATIVE_GRANT_WRAPPING_KEY
+EZIL_NATIVE_CONSENT_BUDGET_MICRO EZIL_NATIVE_CONSENT_EPOCH EZIL_NATIVE_CONSENT_TTL_SECONDS
+EZIL_NATIVE_DEPLOYMENT_DESCRIPTOR EZIL_NATIVE_DEPLOYMENT_DESCRIPTOR_SHA256 EZIL_NATIVE_RUNTIME_MANIFEST_SHA256
+EZIL_NATIVE_GATEWAY_POLICY_ID EZIL_NATIVE_GATEWAY_SERVICE_CREDENTIAL EZIL_NATIVE_GATEWAY_SERVICE_EXPIRES_AT
+""".split())
+NATIVE_SWITCHES = ("EZIL_NATIVE_SESSIONS", "EZIL_NATIVE_AUTH_INTENTS",
+                   "EZIL_NATIVE_HOST_TRANSPORT", "EZIL_NATIVE_RUNTIME_CONTROL")
 # Delegated computer reads (app/src/server/api/delegation-core.ts): the receiver treats a missing or
 # unsafe pin as "not configured" and anything but the exact gate value "enabled" as off, so the
 # renderer refuses what the receiver would silently ignore. Off unless the gate is "enabled".
@@ -86,7 +102,8 @@ class RenderError(Exception):
 def validate(values, environment="staging"):
     if not isinstance(values, dict):
         raise RenderError("Expected a JSON object")
-    if any(key not in REQUIRED | OPTIONAL and not REGIONAL.fullmatch(key) for key in values):
+    allowed = REQUIRED | OPTIONAL | (PRODUCTION_NATIVE if environment == "production" else frozenset())
+    if any(key not in allowed and not REGIONAL.fullmatch(key) for key in values):
         raise RenderError("Unknown key refused")
     if REQUIRED - values.keys():
         raise RenderError("Missing required key")
@@ -185,6 +202,13 @@ def validate_delegation(values, environment):
 
 def validate_production(values):
     """Pin production to its own API, private database and live Stripe; refuse staging values."""
+    if any(values.get(name) not in (None, "0", "1") for name in NATIVE_SWITCHES):
+        raise RenderError("Native session, intent, transport and control gates must be exactly 0 or 1")
+    if values.get("EZIL_NATIVE_AUTHORIZATION") not in (None, "disabled", "enabled"):
+        raise RenderError("EZIL_NATIVE_AUTHORIZATION must be exactly enabled or disabled")
+    origin = values.get("EZIL_NATIVE_SESSIONS_ORIGIN")
+    if origin is not None and origin not in PRODUCTION_OS_ORIGINS:
+        raise RenderError("Native session origin must be a production OS origin")
     if any(marker in value for value in values.values() for marker in STAGING_MARKERS) \
             or any(STAGING_HOST.search(value) for value in values.values()):
         raise RenderError("Production refuses staging or preview values")
