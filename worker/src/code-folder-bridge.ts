@@ -74,6 +74,56 @@ export const LEGACY_NOTICE_MARKER = 'data-ezil-legacy-notice';
  */
 export const LEGACY_NOTICE_HIDE_CSS = '.chat-viewpane .interactive-session>.interactive-input-part::after{content:none!important;display:none!important}';
 
+// Browser source for the nonce-bearing Code folder bridge. This changes Explorer's presentation only. The
+// workbench still opens the verified wrapper so settings inside the checkout are not workspace configuration.
+const REPOSITORY_FOCUS_SCRIPT = String.raw`
+function focusRepository(folder, name) {
+  const root = /\/projects\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/.exec(folder)?.[1];
+  if (!root || typeof name !== "string" ||
+      !/^[a-z0-9][a-z0-9-]{0,63}\/[a-z0-9][a-z0-9._-]{0,99}$/.test(name) ||
+      name.includes("..") || name.endsWith(".") || name.endsWith(".git")) return false;
+
+  const checkout = folder + "/" + name.split("/")[1];
+  const update = () => {
+    const explorer = document.querySelector(".explorer-folders-view");
+    if (!explorer) return;
+    // VS Code displays the single workspace folder in the pane heading, or in the view container when merged.
+    // The checkout is a first-level tree row. Check the resource path so identically named files cannot match.
+    const row = [...explorer.querySelectorAll('[role="treeitem"][aria-level="1"][aria-expanded]')].find((item) => {
+      const pathLabel = item.querySelector(".explorer-item")?.getAttribute("aria-label");
+      return pathLabel === checkout || pathLabel?.startsWith(checkout + " • ");
+    });
+    if (!row) return;
+    const header = explorer.closest(".pane")?.querySelector(".pane-header");
+    const heading = [header?.querySelector("h3.title"), explorer.closest(".part")?.querySelector(".title-label h2")]
+      .find((element) => element?.textContent === root);
+    if (!heading) return;
+
+    heading.textContent = name;
+    for (const node of [header, heading, header?.querySelector(".icon"), header?.querySelector('[role="toolbar"]')]) {
+      const label = node?.getAttribute("aria-label");
+      if (label?.includes(root)) node.setAttribute("aria-label", label.replace(root, name));
+    }
+
+    // Use the existing Explorer interactions once, without giving the tree keyboard focus. Keep restored selections.
+    const click = (element) => element?.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 }));
+    if (row.getAttribute("aria-expanded") === "false") {
+      if (!explorer.querySelector('[aria-selected="true"]')) click(row.querySelector(".monaco-tl-contents"));
+      if (row.getAttribute("aria-expanded") === "false") click(row.querySelector(".monaco-tl-twistie"));
+    }
+    observer.disconnect();
+    clearTimeout(expiry);
+  };
+  const observer = new MutationObserver(update);
+  observer.observe(document.documentElement, {
+    subtree: true, childList: true, attributes: true, attributeFilter: ["aria-label", "aria-expanded"],
+  });
+  const expiry = setTimeout(() => observer.disconnect(), 45_000);
+  update();
+  return true;
+}
+`;
+
 const ORIGIN_RE = /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
 /** A CSP nonce as code-server writes it (a UUID today); anything else is not copied into an attribute. */
 const NONCE_RE = /^[A-Za-z0-9+/=_-]{8,128}$/;
@@ -112,9 +162,10 @@ export function codeFolderBridgeScript(origins: readonly string[]): string {
     + `const here=what(location.search);const base=String(location.pathname||"");if((here.kind==="folder"||here.kind==="empty")&&base.length<=256)here.base=base;`
     + `let mint=null;try{const m=new URLSearchParams(location.search).get("ezil_mint");mint=m&&T.test(m)?m:null}catch{}`
     + `const tell=(m)=>{for(const o of O){try{window.parent.postMessage(m,o)}catch{}}};`
-    + `const pending=new Map();`
+    + REPOSITORY_FOCUS_SCRIPT
+    + `let repositoryFocusStarted=false;const pending=new Map();`
     + `addEventListener("message",ev=>{try{const d=ev.data;if(ev.source!==window.parent||!O.includes(ev.origin)||!d||typeof d!=="object"||d.v!==1)return;`
-    + `if(d.type==="ezil.code.hello"&&typeof d.nonce==="string"&&T.test(d.nonce)){ev.source.postMessage({type:"ezil.code.folder",v:1,nonce:d.nonce,mint,...here},ev.origin);return}`
+    + `if(d.type==="ezil.code.hello"&&typeof d.nonce==="string"&&T.test(d.nonce)){ev.source.postMessage({type:"ezil.code.folder",v:1,nonce:d.nonce,mint,...here},ev.origin);if(!repositoryFocusStarted&&mint!==null&&d.mint===mint&&here.kind==="folder"&&d.repositoryFocus?.folder===here.path)repositoryFocusStarted=focusRepository(here.path,d.repositoryFocus.name);return}`
     + `if(d.type==="ezil.code.go"&&typeof d.id==="string"&&pending.has(d.id)){const p=pending.get(d.id);pending.delete(d.id);clearTimeout(p.t);location.replace(p.url)}}catch{}});`
     + `const nav=window.navigation;if(nav&&typeof nav.addEventListener==="function"){nav.addEventListener("navigate",e=>{try{`
     + `if(e.navigationType!=="push"||!e.cancelable||e.hashChange||e.downloadRequest)return;`
