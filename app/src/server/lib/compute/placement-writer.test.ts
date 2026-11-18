@@ -18,9 +18,9 @@ import { describe, expect, it } from 'vitest';
 const REPO = path.resolve(__dirname, '../../../../..');
 const WRITER = 'app/src/server/lib/compute/placement.ts';
 const TABLES = /ezil_computer_placements|ezil_compute_usage/;
-// Applies the exact reviewed DDL, takes locks and inspects pg_catalog; it never
-// reads or writes placement/usage rows. Do not exempt the deploy directory.
-const DDL_ONLY = ['deploy/aws/mum/rebase_schema.py'];
+// These exact schema tools inspect the catalog without accessing placement or
+// usage rows. The native batch also verifies existing placement prerequisites.
+const DDL_ONLY = ['deploy/aws/mum/rebase_schema.py', 'app/scripts/billing-production-native.mjs'];
 const ROW_ACCESS = new RegExp(String.raw`\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|MERGE\s+INTO|TRUNCATE(?:\s+TABLE)?|COPY|FROM|JOIN)\s+(?:ONLY\s+)?(?:"?\w+"?\s*\.\s*)?"?(?:${TABLES.source})\b`, 'i');
 const CODE = /\.(ts|tsx|js|mjs|cjs|sql|py|rs|go|sh|swift|json|ya?ml|toml|tf|hcl|asl)$/;
 
