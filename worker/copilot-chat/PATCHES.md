@@ -539,3 +539,14 @@ identity and provider contribution, and requires `defaultChatAgent`, the MIT
 license and original Microsoft headers. Compare LICENSE.txt with the original
 extraction when reviewing an update. The JSON and CSS modifications are
 recorded here; the three JS files carry inline modification notices.
+
+### Repository Explorer root
+
+The Code folder bridge can identify the exact checkout inside a private repository's
+workspace wrapper. The renderer patch in `project-explorer.cjs` verifies the minted
+single-folder workspace, confirms the checkout is a direct directory on the same
+file provider, and projects it as the Explorer root. Repository settings remain
+outside the workspace configuration. File actions, selection and filters use
+the projected root. A missing or replaced checkout restores the normal view.
+The patch is matched and checked against Code Server 4.141.0 before computing
+the workbench static content ID.

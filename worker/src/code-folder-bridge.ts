@@ -74,8 +74,8 @@ export const LEGACY_NOTICE_MARKER = 'data-ezil-legacy-notice';
  */
 export const LEGACY_NOTICE_HIDE_CSS = '.chat-viewpane .interactive-session>.interactive-input-part::after{content:none!important;display:none!important}';
 
-// Browser source for the nonce-bearing Code folder bridge. This changes the editor's displayed workspace name. The
-// workbench still opens the verified wrapper so settings inside the checkout are not workspace configuration.
+// Browser source for the nonce-bearing Code folder bridge. A supporting workbench uses the verified checkout as
+// the Explorer root and keeps the wrapper as the actual workspace. An older workbench still reveals the checkout.
 const REPOSITORY_FOCUS_SCRIPT = String.raw`
 function focusRepository(folder, name) {
   const root = /\/projects\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/.exec(folder)?.[1];
@@ -85,6 +85,9 @@ function focusRepository(folder, name) {
 
   const basename = name.split("/")[1];
   const checkout = folder + "/" + basename;
+  const html = document.documentElement;
+  const projectedAttribute = "data-ezil-repo-explorer-ready";
+  html.setAttribute("data-ezil-repo-checkout", checkout);
   const labelWindowTitle = (text) => {
     const segments = text.split(" - ");
     const workspace = segments.lastIndexOf(root);
@@ -126,12 +129,13 @@ function focusRepository(folder, name) {
     const headings = [header?.querySelector("h3.title"), part.querySelector(".title-label h2")]
       .filter((element) => element?.textContent === root);
     if (revealed && headings.length === 0) return;
-    // The checkout is a first-level tree row. Match the exact path even with a file decoration.
-    const row = [...explorer.querySelectorAll('[role="treeitem"][aria-level="1"][aria-expanded]')].find((item) => {
+    const projected = html.getAttribute(projectedAttribute) === checkout;
+    // Older images display the checkout as a tree row inside the wrapper.
+    const row = projected ? undefined : [...explorer.querySelectorAll('[role="treeitem"][aria-level="1"][aria-expanded]')].find((item) => {
       const pathLabel = item.querySelector(".explorer-item")?.getAttribute("aria-label");
       return pathLabel === checkout || pathLabel?.startsWith(checkout + " • ");
     });
-    if (!row) return;
+    if (!projected && !row) return;
 
     for (const heading of headings) heading.textContent = basename;
     for (const node of [header, ...headings, header?.querySelector(".icon"), header?.querySelector('[role="toolbar"]')]) {
@@ -140,7 +144,7 @@ function focusRepository(folder, name) {
     }
 
     // Use existing Explorer interactions once. Preserve restored selection and keyboard focus.
-    if (!revealed && row.getAttribute("aria-expanded") === "false") {
+    if (!revealed && row?.getAttribute("aria-expanded") === "false") {
       const click = (element) => element?.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 }));
       if (!explorer.querySelector('[aria-selected="true"]')) click(row.querySelector(".monaco-tl-contents"));
       if (row.getAttribute("aria-expanded") === "false") click(row.querySelector(".monaco-tl-twistie"));
@@ -158,10 +162,12 @@ function focusRepository(folder, name) {
     for (const [selector, { update, attributes }] of pending) {
       const node = document.querySelector(selector);
       if (!node) continue;
-      new MutationObserver(() => update(node)).observe(node, {
+      const surface = new MutationObserver(() => update(node));
+      surface.observe(node, {
         subtree: true, childList: true, characterData: true,
         ...(attributes ? { attributeFilter: attributes } : {}),
       });
+      if (update === labelExplorer) surface.observe(html, { attributeFilter: [projectedAttribute] });
       pending.delete(selector);
       update(node);
     }

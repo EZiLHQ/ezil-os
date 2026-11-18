@@ -6,6 +6,7 @@
 # TODO(app-failure-extension-host): coordinator runs a new VSIX + patched-workbench image for the host-command hop.
 #   PLAYWRIGHT_REQUIRE_DIR=/path/to/node_modules [IMAGE=<desktop image>] e2e/code-folder-url-image.sh <evidence dir>
 # Needs a built shell bundle (shell/build-shell.sh) and Playwright's Chromium, or PLAYWRIGHT_CHROMIUM_EXECUTABLE.
+# Set EXPECT_REPO_PROJECTION=1 for a desktop image with native single-root repository Explorer projection.
 set -u
 IMAGE="${IMAGE:-ezil-os-worker-staging-sandbox:81a397bf}" # the live Cloudflare image on 2026-11-05
 NET=ezil-folderurl-net-$$
@@ -40,6 +41,20 @@ done
 docker exec "$NAME" bash -c 'code-server --version | head -1; grep -c "" /tmp/code-server-data/User/settings.json; cat /tmp/code-server-data/User/settings.json' 2>/dev/null | head -30
 timeout 900 node "$HERE/code-folder-url.mjs" "$IP" "$EVIDENCE"
 rc=$?
+if [ "$rc" -eq 0 ] && [ "${EXPECT_REPO_PROJECTION:-0}" = 1 ]; then
+  docker exec "$NAME" bash -eu -c '
+    wrapper=/workspace/projects/44444444-4444-8444-8444-444444444444
+    checkout="$wrapper/os-code-url-20261110-a"
+    test ! -e "$wrapper/repo-focus-created.txt"
+    test -f "$checkout/repo-focus-created.txt"
+    test "$(git -C "$checkout" status --short -- repo-focus-created.txt)" = "?? repo-focus-created.txt"
+  ' || rc=1
+  if [ "$rc" -eq 0 ]; then
+    echo "[code-folder-url] PASS New File was written to the checkout and Git sees the new file"
+  else
+    echo "[code-folder-url] FAIL New File did not reach the expected repository worktree"
+  fi
+fi
 echo "[code-folder-url] notes.txt on disk now:"; docker exec "$NAME" cat /workspace/b/notes.txt
 echo "[code-folder-url] exit=$rc"
 exit $rc

@@ -35,6 +35,7 @@ EXT="$ROOT/extensions/copilot/dist/extension.js"
 NLS_JS="$ROOT/out/nls.messages.js"
 NLS_JSON="$ROOT/out/nls.messages.json"
 WB="$ROOT/out/vs/code/browser/workbench/workbench.js"
+PROJECTION="$(dirname -- "${BASH_SOURCE[0]}")/project-explorer.cjs"
 SERVER="$ROOT/out/server-main.js"
 NOTICE='/* Modified at build time by EZiL (worker/copilot-chat/patch-copilot-chat.sh, see PATCHES.md): GitHub service calls disabled, strings rebranded "EZiL Chat". Original work: Copyright (c) Microsoft Corporation, MIT License (LICENSE.txt). */'
 
@@ -459,6 +460,7 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   done
   # Last: the id hashes the files patched above.
   for p in "$P_STATIC_ROUTE" "$P_STATIC_BASE" "$P_STATIC_PAGE" "$P_STATIC_WEBVIEW"; do gate static-names "$SERVER" 1 "$p"; done
+  node "$PROJECTION" "$WB"
   STATIC_ID="$(static_id "$ROOT")"
   patch static-id "$SERVER" 1 "$A_STATIC" "IE=\"/static/$STATIC_ID\",Vq=\"/callback\""
 fi
@@ -548,6 +550,7 @@ node -e 'for(const f of process.argv.slice(1)){const j=JSON.parse(require("fs").
 for f in "$EXT" "$NLS_JS" "$WB" "$SERVER"; do gate notice "$f" 1 'Modified at build time by EZiL'; done
 for p in "$P_STATIC_ROUTE" "$P_STATIC_BASE" "$P_STATIC_PAGE" "$P_STATIC_WEBVIEW"; do gate static-names "$SERVER" 1 "$p"; done
 # Recomputed: a later edit to any hashed file (here or in a later Dockerfile step) leaves a stale id and fails.
+node "$PROJECTION" --verify "$WB"
 STATIC_ID="$(static_id "$ROOT")"
 gate static-id "$SERVER" 0 "$A_STATIC"; gate static-id "$SERVER" 1 'IE="/static/ezil-'
 gate static-id "$SERVER" 1 "IE=\"/static/$STATIC_ID\",Vq=\"/callback\""

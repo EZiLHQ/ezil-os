@@ -13,6 +13,7 @@ FAULT_VARIANT="${FAULT_VARIANT:-missing_terminal}"
 EVIDENCE="${1:?evidence directory}"
 VSIX="${VSIX:-$TREE/worker/ezil-models/dist/ezil-models-0.1.0.vsix}"
 PATCH_SCRIPT="$TREE/worker/copilot-chat/patch-copilot-chat.sh"
+PROJECTION_PATCH="$TREE/worker/copilot-chat/project-explorer.cjs"
 # A released image already carries the patches of its own commit, so this branch's script cannot apply on top of it.
 # PRISTINE_FILES names the eight files the script edits, unmodified from code-server 4.141.0 (same relative paths
 # under lib/vscode); they replace the image's copies before the branch patch runs. Empty: patch the image as is.
@@ -20,7 +21,7 @@ PRISTINE_FILES="${PRISTINE_FILES:-}"
 NET="ezil-appfailure-net-$$"
 NAME="ezil-appfailure-code-$$"
 case "$FAULT_VARIANT" in missing_terminal|settlement_pending) ;; *) echo 'FAIL unsupported variant'; exit 2;; esac
-[[ -s "$VSIX" && -s "$PATCH_SCRIPT" ]] || { echo 'FAIL branch VSIX or patch missing'; exit 1; }
+[[ -s "$VSIX" && -s "$PATCH_SCRIPT" && -s "$PROJECTION_PATCH" ]] || { echo 'FAIL branch VSIX or patch missing'; exit 1; }
 cleanup() {
   docker rm --force "$NAME" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
@@ -33,6 +34,7 @@ docker network create --internal "$NET" >/dev/null
 docker run --pull=never -d --name "$NAME" --network "$NET" --cpus=2 --memory=6g \
   --mount "type=bind,src=$VSIX,dst=/fixture/ezil-models.vsix,readonly" \
   --mount "type=bind,src=$PATCH_SCRIPT,dst=/fixture/patch-copilot-chat.sh,readonly" \
+  --mount "type=bind,src=$PROJECTION_PATCH,dst=/fixture/project-explorer.cjs,readonly" \
   --mount "type=bind,src=$HERE/code-app-failure-mock.mjs,dst=/fixture/mock.mjs,readonly" \
   ${PRISTINE_FILES:+--mount "type=bind,src=$PRISTINE_FILES,dst=/fixture/pristine,readonly"} \
   --env "FAULT_VARIANT=$FAULT_VARIANT" --env EZIL_MODELS_CONFIG=/tmp/app-failure-models.json \
