@@ -1,11 +1,13 @@
+import { InferenceTrace, InferenceRing, type InferenceDiagnostic } from './inference-diagnostics';
+import { copilotUsage } from './usage';
 // The VS Code LanguageModelChatProvider. Bridges VS Code's LanguageModel* classes to the neutral
 // shapes in types.ts, streams the provider response back as VS Code parts, and records usage.
 
 import * as vscode from 'vscode';
 import type { CompactionInfo } from './compact';
 import { appFailure, type AppFailure } from './failure';
-import { CATALOG_REFUSALS, CREDIT_STATE_TEXT, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModelListed, gatewayModels, includedModelNames, knownGatewayModels, knownGatewayPlan, modelIncluded, parseCatalogModelId, withCatalogDefault, withDefaultModel, withGatewayModelLimits, withPlanLocks, type GatewayModels } from './gateway';
-import { gatewayInputTokens, gatewayOutputTokens, gatewayTokenCount, QWEN } from './gateway-messages';
+import { CATALOG_REFUSALS, CREDIT_STATE_TEXT, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModelListed, gatewayModels, gatewayPlanUnconfirmed, includedModelNames, knownGatewayModels, knownGatewayPlan, markGatewayPlanUnconfirmed, modelIncluded, parseCatalogModelId, withCatalogDefault, withDefaultModel, withGatewayModelLimits, withPlanLocks, withUnconfirmedPlan, type GatewayModels } from './gateway';
+import { gatewayInputTokens, gatewayOutputTokens, gatewayRequestOutputTokens, gatewayTokenCount, geminiRoute, geminiSignedPart, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
 import { redact, type ResolvedModel, type ResolvedProvider } from './config';
 import { estimateMessageTokens, estimateTextTokens } from './tokens';
@@ -25,6 +27,7 @@ export type ProviderHost = {
     requestFinished?(model: ResolvedModel): void;
     /** Content-free gateway outcomes; observer errors must never change a turn. */
     appFailure?(record: AppFailure): void;
+    inferenceDiagnostic?(record: InferenceDiagnostic): void;
     /** The request goes compacted (compact.ts); `finished` settles when its turn ends. */
     compacted?(model: ResolvedModel, info: CompactionInfo, finished: Promise<void>): void;
     /** Ask the EZiL OS window around Code to open its billing dialog; true only when it took the request. */
@@ -95,6 +98,25 @@ function continuationKey(secret: Buffer, connection: number, model: ResolvedMode
         calls.map(call => [call.callId, call.name, stableJson(call.input)])])).digest('hex');
 }
 
+/** Compare the complete visible assistant turn, allowing only transport text chunking differences. */
+function geminiVisibleShape(parts: readonly Part[]): string {
+    const visible: Part[] = [];
+    for (const part of parts) {
+        if (part.type === 'thinking' || isCacheMarker(part) || isStatefulMarker(part) || (part.type === 'text' && !part.value)) continue;
+        const prior = visible.at(-1);
+        if (part.type === 'text' && prior?.type === 'text') prior.value += part.value;
+        else visible.push(structuredClone(part));
+    }
+    return JSON.stringify(visible.map(canonicalPart));
+}
+function geminiReplayParts(parts: readonly Part[]): Part[] {
+    return parts.filter((part, i) => {
+        if (part.type !== 'thinking') return part.type !== 'text' || part.value !== '';
+        const next = parts[i + 1];
+        return geminiSignedPart(part) && (next?.type === 'tool_call' || (next?.type === 'text' && next.value !== ''));
+    }).map(part => structuredClone(part));
+}
+
 type TurnCall = { callId: string; name: string; input: unknown };
 function turnCalls(messages: readonly Message[]): TurnCall[] {
     return messages.flatMap(message => message.role !== 'assistant' ? [] : message.parts.flatMap(part => part.type === 'tool_call' ? [{ callId: part.callId, name: part.name, input: part.input }] : []));
@@ -133,7 +155,7 @@ export function toNeutralPart(part: unknown): Part | undefined {
     }
     if (isInstance(part, vscode.LanguageModelToolResultPart) || (typeof record.callId === 'string' && Array.isArray(record.content))) {
         const content = (record.content as unknown[]).map(toNeutralPart).filter((inner): inner is Part => !!inner);
-        return { type: 'tool_result', callId: record.callId as string, content, isError: record.isError === true };
+        return { type: 'tool_result', callId: record.callId as string, content, ...(typeof record.isError === 'boolean' ? { isError: record.isError } : {}) };
     }
     if (isInstance(part, vscode.LanguageModelDataPart) || (typeof record.mimeType === 'string' && record.data instanceof Uint8Array)) {
         return { type: 'data', mimeType: record.mimeType as string, data: record.data as Uint8Array };
@@ -188,12 +210,14 @@ export function toInformation(model: ResolvedModel): vscode.LanguageModelChatInf
     info.isDefault = model.default;
     // A plan-locked model is never a chat model: VS Code never restores, defaults to or hands it to a subagent, so a saved
     // pick on Free falls back to the default with no dialog. The `picker-locked-list` patch still lists it (lock icon and this
-    // text) and turns choosing it into the upgrade offer.
+    // text) and turns choosing it into the upgrade offer. An unconfirmed plan's model is listed the same way, with its own
+    // icon and text: choosing it re-reads the plan and offers no upgrade (lockedModelChosen).
     info.isUserSelectable = !model.locked;
     if (model.locked) {
         const ThemeIcon = (vscode as unknown as Record<string, unknown>).ThemeIcon as (new (id: string) => unknown) | undefined;
-        if (ThemeIcon) info.statusIcon = new ThemeIcon('lock');
-        info.infoText = { [LOCKED_MODEL_INFO_KEY]: 'Not included in your plan. Choose it to see the upgrade.' };
+        if (ThemeIcon) info.statusIcon = new ThemeIcon(model.unconfirmed ? 'question' : 'lock');
+        info.infoText = { [LOCKED_MODEL_INFO_KEY]: model.unconfirmed ? 'Your plan could not be confirmed yet. Choose it to check again.'
+            : 'Not included in your plan. Choose it to see the upgrade.' };
     }
     return info;
 }
@@ -244,7 +268,7 @@ function osBillingLink(query: string): vscode.Uri | undefined {
 
 /** A catalog as listed, for noticing that a later read changed it (ids, availability, caps, capabilities and the plan's limit). */
 function catalogSignature(catalog: GatewayModels | undefined): string {
-    return catalog ? JSON.stringify([catalog.killswitch, catalog.pause, catalog.default_model ?? null, catalog.included ?? null, catalog.data.map(entry => [entry.id, entry.enabled, entry.protocols, entry.availability, entry.globalPauseOnly,
+    return catalog ? JSON.stringify([catalog.killswitch, catalog.pause, catalog.default_model ?? null, catalog.included ?? null, catalog.transport ?? null, catalog.data.map(entry => [entry.id, entry.enabled, entry.protocols, entry.availability, entry.globalPauseOnly,
         entry.name, entry.max_input_tokens, entry.max_output_tokens, entry.capabilities])]) : 'unread';
 }
 
@@ -255,6 +279,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     private lastWindowNoticeAt = -Infinity;
     /** Per configured Gateway provider: the catalog the picker was last given. */
     private listedCatalogs = new Map<ResolvedProvider, string>();
+    /** The providers the last listing showed unconfirmed (`withUnconfirmedPlan`). */
+    private unconfirmedListings = new Set<ResolvedProvider>();
     /** The Gateway providers whose catalog could not be read for the last listing (`recoverCatalog`). */
     private unreadListings = new Set<ResolvedProvider>();
     /** Valid paused catalogs must be re-read by the existing bounded recovery timer too. */
@@ -270,6 +296,10 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
      * only), so another conversation that reuses a call id, a changed input, or another model never receives them.
      * EZiL Gateway providers only (see respond). Bounded; lost on reload, when the request goes without them as before.
      */
+    readonly inferenceTrace = new InferenceRing();
+    private geminiThinking = new Map<string, { shape: string; parts: Part[]; token: string }>();
+    private geminiScope = '';
+    private geminiEpoch = randomBytes(16).toString('hex');
     private signedThinking = new Map<string, Part[]>();
     /** The HMAC key for continuationKey: random per provider instance, never exported, logged or persisted. */
     private readonly continuationSecret = randomBytes(32);
@@ -281,7 +311,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     constructor(private readonly host: ProviderHost) {}
 
     refresh(): void { this.changed.fire(); }
-    dispose(): void { this.changed.dispose(); this.modelIdentities.clear(); this.signedThinking.clear(); this.connectionIds.clear(); }
+    dispose(): void { this.changed.dispose(); this.modelIdentities.clear(); this.signedThinking.clear(); this.geminiThinking.clear(); this.connectionIds.clear(); }
 
     /** The same number for the same connection while it stays among the 16 most recent; another one for any change. */
     private connectionIdentity(provider: ResolvedProvider): number {
@@ -347,6 +377,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
      */
     refreshIfCatalogChanged(): void {
         for (const [provider, listed] of this.listedCatalogs) {
+            // Confirmed or unconfirmed since the listing, whatever the catalog's bytes.
+            if (this.unconfirmedListings.has(provider) !== gatewayPlanUnconfirmed(provider)) { this.refresh(); return; }
             const known = knownGatewayModels(provider);
             if (known && catalogSignature(known) !== listed) { this.refresh(); return; }
         }
@@ -365,8 +397,10 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         }
         const pending = [...new Set([...this.unreadListings, ...this.pausedListings])];
         if (!pending.length) return;
+        // An unconfirmed plan is read again now, even within the five minutes, and re-listed once confirmed.
+        const unconfirmed = pending.filter(provider => gatewayPlanUnconfirmed(provider));
         const read = await Promise.all(pending.map(provider => gatewayModels(provider, this.host.fetch ?? fetch,
-            Date.now(), undefined, this.pausedListings.has(provider))));
+            Date.now(), undefined, this.pausedListings.has(provider) || unconfirmed.includes(provider))));
         pending.forEach((provider, i) => {
             if (read[i]) {
                 this.unreadListings.delete(provider);
@@ -396,13 +430,16 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             const listed = providers.flatMap(provider => gatewayCatalogModels(provider, used.get(provider), models, true));
             // What the catalog-only rows came from: during an outage, the last catalog, so requests do not re-list each time.
             this.listedCatalogs = new Map(providers.map(provider => [provider, catalogSignature(used.get(provider))]));
-            this.unreadListings = new Set(providers.filter(provider => !catalog.get(provider)));
+            this.unreadListings = new Set(providers.filter(provider => !catalog.get(provider) || gatewayPlanUnconfirmed(provider)));
             this.pausedListings = new Set(providers.filter(provider => used.get(provider)?.killswitch === true));
             // The Gateway's suggested default counts only from this read: during an outage the configured default stays.
             // The OS plan's locks (Free: Gemini 3.8 Flash only) follow the same catalog as the rows they lock.
             const offered = [...models.filter(model => gatewayModelListed(model, catalog.get(model.provider))), ...listed]
                 .map(model => withGatewayModelLimits(model, catalog.get(model.provider)));
-            return this.rememberModels(withDefaultModel(withPlanLocks(withCatalogDefault(offered, catalog), used), used)).map(toInformation);
+            // The proxy cannot confirm the plan: that provider's models stay listed as the last read shows them, none offered.
+            const unconfirmed = this.unconfirmedListings = new Set(providers.filter(provider => gatewayPlanUnconfirmed(provider)));
+            return this.rememberModels(withDefaultModel(withUnconfirmedPlan(withPlanLocks(withCatalogDefault(offered, catalog), used), unconfirmed), used))
+                .map(toInformation);
         } finally { cancel.dispose(); }
     }
 
@@ -465,6 +502,10 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         if (token.isCancellationRequested) controller.abort();
         const started = Date.now();
         let resolved: ResolvedModel | undefined;
+        let sessionIdentity: string | null = null;
+        const correlate = (value: unknown) => createHmac('sha256', this.continuationSecret).update(JSON.stringify(value)).digest('hex');
+        let diagnostic = new InferenceTrace('unknown', { messages: [], tools: [], toolMode: 'auto', modelOptions: {} });
+        let diagnosticFailed = false;
         let chatStarted = false;
         let terminalOutcome = false;
         const onOutcome = (record: AppFailure) => {
@@ -472,7 +513,9 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             try { this.host.appFailure?.(record); } catch { /* Optional observer. */ }
         };
         try {
+            sessionIdentity = typeof options.modelOptions?._conversationId === 'string' ? options.modelOptions._conversationId : null;
             resolved = await this.resolve(model, controller.signal);
+            diagnostic.record.modelAlias = /^[a-zA-Z0-9_.:-]{1,128}$/.test(resolved.model) ? resolved.model : 'unknown';
             controller.signal.throwIfAborted();
             if (resolved.provider.type === 'ezil-gateway' && isUtilityRequest(options.modelOptions ?? {})) {
                 // Requests marked as titles or summaries (role or requestInitiator): Qwen on the named model's own provider
@@ -494,10 +537,55 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 }
             }
             const request = toNeutralRequest(messages, options);
+            if (options.modelOptions?._ezilCompaction === true) {
+                // Tool history is useful to a summary, but its author must not be able to run new tools.
+                request.tools = [];
+                request.toolMode = 'auto';
+                for (const message of request.messages) message.parts = message.parts.flatMap((part): Part[] => {
+                    if (part.type === 'tool_call') return [{
+                        type: 'text', value: `[Earlier ${part.name} call ${part.callId}]\n${stableJson(part.input)}`,
+                    }];
+                    if (part.type === 'tool_result') return [{
+                        type: 'text', value: `[Earlier tool result ${part.callId}${part.isError ? ' (failed)' : ''}]`,
+                    }, ...part.content];
+                    return [part];
+                });
+            }
+            diagnostic = new InferenceTrace(resolved.model, request, {
+                conversationId: sessionIdentity === null ? null : correlate(['session', sessionIdentity]),
+                identifyCall: call => correlate(['call', sessionIdentity, model.id, call]),
+            });
             // The signed-thinking fallback is for the EZiL Gateway only: its transport sends just its own Bearer credential
             // (custom headers are ignored), which continuationKey covers. A direct provider may authenticate through custom
             // header overrides, so it keeps its reviewed behaviour: no fallback.
-            const fallback = !thinkingCtor() && resolved.provider.type === 'ezil-gateway';
+            const gemini = resolved.provider.type === 'ezil-gateway' && geminiRoute(resolved.model);
+            const scope = `${this.connectionIdentity(resolved.provider)}:${resolved.model}`;
+            if (this.geminiScope !== scope) { this.geminiScope = scope; this.geminiEpoch = randomBytes(16).toString('hex'); this.geminiThinking.clear(); }
+            const geminiTurnToken = randomBytes(16).toString('hex');
+            const geminiOrigin = `${this.geminiEpoch}:${scope}`;
+            // A completed Gemini reply is restored as one ordered sequence only when its
+            // entire visible turn, history, connection, model and available session identity match.
+            const session = typeof options.modelOptions?._conversationId === 'string' ? options.modelOptions._conversationId : null;
+            const geminiKey = (history: readonly Message[], calls: readonly TurnCall[]) => createHmac('sha256', this.continuationSecret)
+                .update(JSON.stringify([geminiOrigin, session, continuationKey(this.continuationSecret, this.connectionIdentity(resolved!.provider), resolved!, request.messages, history, calls)]))
+                .digest('hex');
+            const fallback = !thinkingCtor() && resolved.provider.type === 'ezil-gateway' && !gemini;
+            if (gemini) for (let start = 0, end = 0; start < request.messages.length; start = Math.max(end, start + 1)) {
+                if (request.messages[start]!.role !== 'assistant') { end = start + 1; continue; }
+                end = assistantTurnEnd(request.messages, start);
+                const turn = request.messages.slice(start, end).filter(message => message.role === 'assistant');
+                const parts = turn.flatMap(message => message.parts);
+                const kept = this.geminiThinking.get(geminiKey(request.messages.slice(0, start), turnCalls(turn)));
+                // Foreign, incomplete or cancelled response metadata is never authority.
+                for (const message of turn) message.parts = message.parts.filter(part => part.type !== 'thinking');
+                // Caller-supplied conversation IDs scope correlation, never establish ownership.
+                const ownsTurn = kept && parts.some(part => part.type === 'thinking'
+                    && part.metadata?._ezilGeminiTurn === kept.token);
+                if (kept && ownsTurn && kept.shape === geminiVisibleShape(parts)) {
+                    turn[0]!.parts = structuredClone(kept.parts);
+                    for (const message of turn.slice(1)) message.parts = [];
+                }
+            }
             if (fallback) this.restoreSignedThinking(resolved, request);
             // The history this turn answers, for the fallback's key (fixed before anything below can change the request).
             const answered = request.messages.slice();
@@ -505,6 +593,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             let emittedText = false;
             // Completed signed/redacted thinking of this turn, kept only when the ThinkingPart API is missing.
             const signed: Part[] = [];
+            const geminiParts: Part[] = [];
             const calls: { callId: string; name: string; input: unknown }[] = [];
             let completed = false;
             if (resolved.provider.type === 'ezil-gateway') {
@@ -521,6 +610,10 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 // Not in the account's OS plan (Free: Gemini 3.8 Flash only): refused here, so nothing is sent, held or
                 // charged. No billing dialog either: a saved pick, an agent's or subagent's model choice or a stale
                 // picker reaches this, and only a pick in the picker offers the upgrade (lockedModelChosen).
+                if (gatewayPlanUnconfirmed(resolved.provider)) {
+                    throw new GatewayError('EZiL AI: EZiL OS could not confirm which models your plan includes yet. Nothing was sent or charged. Try again in a minute.',
+                        undefined, 'os_plan_unavailable', undefined, undefined, 'local');
+                }
                 const plan = catalog ?? knownGatewayPlan(resolved.provider);
                 if (!modelIncluded(plan, resolved.model)) {
                     throw new GatewayError(`EZiL AI: ${resolved.name} is not included in your plan. Nothing was sent or charged. Pick ${includedModelNames(plan)}, `
@@ -536,16 +629,23 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 }
             }
             const sending = resolved;
+            diagnostic.record.modelAlias = /^[a-zA-Z0-9_.:-]{1,128}$/.test(sending.model) ? sending.model : 'unknown';
             const events = chat(resolved, request, {
                 signal: controller.signal,
                 fetch: this.host.fetch,
                 gateway: {
-                    onCompact: info => this.host.compacted?.(sending, info, finished),
+                    onDiagnosticTransport: value => diagnostic.transport(value),
+                    onCompact: info => {
+                        diagnostic.record.compaction = { trigger: info.cause, count: (diagnostic.record.compaction?.count ?? 0) + 1, folded: info.folded, shortened: info.shortened };
+                        this.host.compacted?.(sending, info, finished);
+                    },
                     onOutcome,
                 },
                 log: line => this.host.log(redact(line, this.host.secrets())),
                 onRequest: (url, body) => {
                     if (sending.provider.type === 'ezil-gateway') return;
+                    diagnostic.record.wireBytes = Buffer.byteLength(JSON.stringify(body));
+                    diagnostic.record.totalWireBytes = diagnostic.record.wireBytes; diagnostic.record.attempts = 1;
                     this.host.log(`[request] ${sending.id} -> ${redact(url, this.host.secrets())} messages=${request.messages.length} tools=${request.tools.length} toolMode=${request.toolMode}${options.modelOptions?.requestInitiator ? ` initiator=${String(options.modelOptions.requestInitiator)}` : ''}`);
                     if (this.host.logRequests()) this.host.log(requestForLog(body, this.host.secrets()));
                 },
@@ -553,6 +653,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             chatStarted = true;
             for await (const event of events) {
                 if (token.isCancellationRequested) break;
+                diagnostic.event(event);
+                if (gemini && (event.type === 'text' || event.type === 'tool_call' || event.type === 'thinking')) geminiParts.push(event);
                 switch (event.type) {
                     case 'text':
                         emittedText = true;
@@ -563,13 +665,17 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                         progress.report(new vscode.LanguageModelToolCallPart(event.callId, event.name, (typeof event.input === 'object' && event.input !== null ? event.input : {}) as object));
                         break;
                     case 'thinking':
-                        if (Thinking) progress.report(new Thinking(event.value, event.id, event.metadata) as vscode.LanguageModelResponsePart);
+                        if (Thinking) progress.report(new Thinking(event.value, event.id, gemini
+                            ? { ...event.metadata, _ezilGeminiTurn: geminiTurnToken } : event.metadata) as vscode.LanguageModelResponsePart);
                         else if (typeof event.metadata?.redactedData === 'string'
                             || (typeof event.metadata?._completeThinking === 'string' && typeof event.metadata?.signature === 'string' && event.metadata.signature)) {
                             signed.push({ type: 'thinking', value: '', metadata: event.metadata });
                         }
                         break;
                     case 'usage':
+                        // Metadata travels on this request's own progress stream; late/cancelled replies cannot update another chat.
+                        if (resolved.provider.type === 'ezil-gateway') progress.report(new vscode.LanguageModelDataPart(
+                            new TextEncoder().encode(JSON.stringify(copilotUsage(event.usage, gatewayRequestOutputTokens(resolved, request.modelOptions)))), 'usage'));
                         this.host.recordUsage(resolved, event.usage, Date.now() - started);
                         break;
                     case 'stop':
@@ -587,11 +693,21 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                         break;
                 }
             }
+            if (gemini && completed && !token.isCancellationRequested && trailingAssistantTurn(answered) === answered.length) {
+                const parts = geminiReplayParts(geminiParts);
+                if (parts.some(part => part.type === 'thinking')) {
+                    for (const part of parts) if (part.type === 'thinking') part.metadata = { ...part.metadata, _ezilGeminiTurn: geminiTurnToken };
+                    // Bound opaque signature/visible-reply retention as well as entry count.
+                    if (Buffer.byteLength(JSON.stringify(parts)) <= 262144) this.geminiThinking.set(geminiKey(answered, calls), { shape: geminiVisibleShape(parts), parts, token: geminiTurnToken });
+                    while (this.geminiThinking.size > 64) this.geminiThinking.delete(this.geminiThinking.keys().next().value!);
+                }
+            }
             // Only a turn that completed (not cancelled or cut off) and ended in tool calls is kept for its continuation.
             if (fallback && completed && signed.length && calls.length && !token.isCancellationRequested) {
                 this.storeSignedThinking(resolved, answered, calls, signed);
             }
         } catch (error) {
+            diagnosticFailed = true;
             const known = this.modelIdentities.get(model.id);
             const catalogId = parseCatalogModelId(model.id);
             const gateway = resolved ? resolved.provider.type === 'ezil-gateway'
@@ -615,7 +731,13 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             // keeps the notice and its link. The turn is not retried: the conversation and input stay as they are. The ask
             // carries the first refusal's request id, which in a new chat can be Copilot's title request, sent just before
             // the turn (the OS only logs it and dedupes on it).
-            if (error instanceof GatewayError && CREDIT_REFUSALS.includes(error.code ?? '') && Date.now() - this.lastCreditWarningAt >= 60_000) {
+            // A refusal for a request begun while the plan was confirmed can arrive after a fresh read found this account's
+            // plan unknown: it is stale for billing. Its words still show, with no billing ask or purchase link, and it
+            // does not use up the once-a-minute ask a confirmed refusal gets.
+            const planUnconfirmed = resolved?.provider.type === 'ezil-gateway' && gatewayPlanUnconfirmed(resolved.provider);
+            const billingRefusal = error instanceof GatewayError && (CREDIT_REFUSALS.includes(error.code ?? '') || error.code === 'window_budget_reached');
+            if (billingRefusal && planUnconfirmed) void Promise.resolve(vscode.window.showWarningMessage(message)).catch(() => {});
+            else if (error instanceof GatewayError && CREDIT_REFUSALS.includes(error.code ?? '') && Date.now() - this.lastCreditWarningAt >= 60_000) {
                 this.lastCreditWarningAt = Date.now();
                 const link = aiCreditsLink();
                 void this.askBilling({ reason: 'credits_exhausted', requestId: error.requestId }).then(opened => opened ? undefined
@@ -626,16 +748,16 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             // A used-up credit window is a plan allowance, not the wallet: no purchase lifts it today, so it is never a credit
             // refusal. The OS window explains it on its AI credits row and opens nothing (`window_limit`), at most once a
             // minute; a Code outside one shows the same words, with no purchase link.
-            if (error instanceof GatewayError && error.code === 'window_budget_reached' && Date.now() - this.lastWindowNoticeAt >= 60_000) {
+            if (!planUnconfirmed && error instanceof GatewayError && error.code === 'window_budget_reached' && Date.now() - this.lastWindowNoticeAt >= 60_000) {
                 this.lastWindowNoticeAt = Date.now();
                 void this.askBilling({ reason: 'window_limit', requestId: error.requestId, ...error.resetsAt ? { resetsAt: error.resetsAt } : {} })
                     .then(opened => opened ? undefined : Promise.resolve(vscode.window.showWarningMessage(message)).then(() => undefined)).catch(() => {});
             }
-            // An unknown plan refuses a turn's title and progress requests too: its notice shows at most once a minute.
-            const planUnknown = error instanceof GatewayError && error.code === 'os_plan_unavailable';
-            if (error instanceof GatewayError && ['first_byte_timeout', 'stream_idle_timeout', 'os_unreachable', 'os_ai_unavailable', 'upstream_timeout', 'os_plan_unavailable'].includes(error.code ?? '')
-                && !(planUnknown && Date.now() - this.lastPlanNoticeAt < 60_000)) {
-                if (planUnknown) this.lastPlanNoticeAt = Date.now();
+            // Unconfirmed plans or credits refuse utility requests too: their retry notice appears at most once a minute.
+            const confirmationUnknown = error instanceof GatewayError && ['os_plan_unavailable', 'os_credits_pending'].includes(error.code ?? '');
+            if (error instanceof GatewayError && ['first_byte_timeout', 'stream_idle_timeout', 'os_unreachable', 'os_ai_unavailable', 'upstream_timeout', 'os_plan_unavailable', 'os_credits_pending'].includes(error.code ?? '')
+                && !(confirmationUnknown && Date.now() - this.lastPlanNoticeAt < 60_000)) {
+                if (confirmationUnknown) this.lastPlanNoticeAt = Date.now();
                 // Do not await a notification: the failed turn must leave Thinking immediately.
                 void Promise.resolve(vscode.window.showErrorMessage(message, 'Retry')).then(choice => {
                     if (choice === 'Retry') return vscode.commands.executeCommand('workbench.action.chat.retry');
@@ -643,10 +765,20 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             }
             // The picker still shows what the refusal says is gone or changed: list again from a fresh catalog.
             if (error instanceof GatewayError && CATALOG_REFUSALS.includes(error.code ?? '')) this.refresh();
+            // The proxy itself has no fresh plan for this account: nothing it lists is offered until a verified read.
+            else if (error instanceof GatewayError && error.origin === 'os_proxy' && error.code === 'os_plan_unavailable' && resolved?.provider.type === 'ezil-gateway') {
+                markGatewayPlanUnconfirmed(resolved.provider);
+                this.refresh();
+            }
             if (error instanceof ProviderError) throw new ProviderError(message, error.status, error.retryAfterSeconds, error.upstream && redact(error.upstream, this.host.secrets()));
             throw new Error(message.startsWith('EZiL Models') ? message : `EZiL Models: ${message}`);
         } finally {
+            const record = diagnostic.finish(controller.signal.aborted, diagnosticFailed);
+            record.durationMs = Math.max(0, Date.now() - started);
+            this.inferenceTrace.add(record);
+            try { this.host.inferenceDiagnostic?.(record); } catch { /* observer only */ }
             cancellation.dispose();
+            if (controller.signal.aborted) { this.geminiEpoch = randomBytes(16).toString('hex'); this.geminiThinking.clear(); }
             if (resolved) this.host.requestFinished?.(resolved);
         }
     }
@@ -659,10 +791,12 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
     /**
      * A plan-locked model was chosen in the picker (the workbench `picker-locked-select` patch runs `_ezil-models.lockedModel`
      * instead of selecting it, so the previous model stays selected). The plan is read again first: if it now includes
-     * the model (an upgrade just went through), the picker lists it again and nothing opens. Otherwise the OS window
-     * opens its upgrade; a Code outside one shows a notice with the Standard link. Nothing is ever sent to a model here.
+     * the model (an upgrade just went through), the picker lists it again and nothing opens. Only a read that succeeds now
+     * may open an upgrade: a remembered limit can predate one. A failed read (an outage, or the proxy's unknown plan) shows
+     * a notice, opens nothing and leaves the remembered locks as listed. Otherwise the OS window opens its upgrade; a Code
+     * outside one shows a notice with the Standard link. Nothing is ever sent to a model here.
      */
-    async lockedModelChosen(id: unknown): Promise<'listed' | 'asked' | 'ignored'> {
+    async lockedModelChosen(id: unknown): Promise<'listed' | 'asked' | 'unconfirmed' | 'ignored'> {
         if (typeof id !== 'string') return 'ignored';
         const configured = this.configuredModels().find(model => model.id === id);
         const catalogId = configured ? undefined : parseCatalogModelId(id);
@@ -670,13 +804,19 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         const alias = configured?.model ?? catalogId?.alias;
         if (!provider || provider.type !== 'ezil-gateway' || !alias) return 'ignored';
         const fresh = await gatewayModels(provider, this.host.fetch ?? fetch, Date.now(), undefined, true);
-        if (modelIncluded(fresh ?? knownGatewayPlan(provider), alias)) {
+        if (!fresh) {
+            if (gatewayPlanUnconfirmed(provider)) this.refresh();
+            void Promise.resolve(vscode.window.showInformationMessage('EZiL OS could not confirm which models your plan includes right now. Nothing was changed or charged. Try again in a minute.'))
+                .catch(() => {});
+            return 'unconfirmed';
+        }
+        if (modelIncluded(fresh, alias)) {
             this.refresh();
             return 'listed';
         }
         if (!await this.askBilling({ reason: 'model_locked', model: alias })) {
             const link = osBillingLink('upgrade=standard');
-            const name = configured?.name ?? (fresh ?? knownGatewayPlan(provider))?.data.find(row => row.id === alias)?.name ?? alias;
+            const name = configured?.name ?? fresh.data.find(row => row.id === alias)?.name ?? alias;
             void Promise.resolve(vscode.window.showInformationMessage(`${name} is not included in your plan.`, ...link ? ['Upgrade'] : []))
                 .then(choice => { if (choice === 'Upgrade' && link) return vscode.env.openExternal(link); }).catch(() => {});
         }

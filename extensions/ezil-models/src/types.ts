@@ -33,8 +33,12 @@ export const STATEFUL_MARKER_MIME = 'stateful_marker';
 export type Usage = {
     inputTokens: number;
     outputTokens: number;
-    cacheReadTokens: number;
-    cacheWriteTokens: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    /** Responses input already includes cached tokens; Messages input excludes them. */
+    inputIncludesCache?: boolean;
+    /** Subset of outputTokens, never added to output a second time. */
+    reasoningTokens?: number;
 };
 
 export type StreamEvent =

@@ -1224,9 +1224,23 @@ describe('reverse import: one queue per Durable Object (§4.1)', () => {
     const f = await fixture();
     await f.copied();
     await f.verify();
-    f.r2.timing.latencyMs = 2;
+    // A signed request authenticates before it reaches the DO, so call order is not arrival order.
+    // The commit is held at its first write, inside the queue, until the abort has been admitted.
+    let admitted!: () => void;
+    const abortAdmitted = new Promise<void>(resolve => { admitted = resolve; });
+    let entered!: () => void;
+    const commitHeld = new Promise<void>(resolve => { entered = resolve; });
+    const put = f.r2.bucket.put;
+    let held = false;
+    f.r2.bucket.put = async (key: string, value: Uint8Array | string, opts?: { onlyIf?: { etagMatches?: string; etagDoesNotMatch?: string } }) => {
+      if (!held) { held = true; entered(); await abortAdmitted; }
+      return put(key, value, opts);
+    };
     const commit = f.commit();
-    const abort = f.abort();
+    await Promise.race([commitHeld, commit.then(r => { throw new Error(`commit settled without a write: ${JSON.stringify(r)}`); })]);
+    // The DO admits an op to its queue synchronously on entry: the abort is queued behind the commit.
+    const abort = f.fake.reverseImport(parseImportRequest('abort', ids, NAME), NAME);
+    admitted();
     expect((await commit).status).toBe(200);
     expect(await abort).toEqual({ status: 409, body: { ok: false, error: 'already_imported' } });
     expect(f.r2.json(HEAD).generation).toBe(GEN);

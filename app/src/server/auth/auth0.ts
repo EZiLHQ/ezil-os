@@ -3,6 +3,8 @@ import 'server-only';
 import { createHmac, hkdfSync, randomBytes, timingSafeEqual } from 'node:crypto';
 import { cookies } from 'next/headers';
 
+import { gitAuthorFromVerifiedClaims, type GitAuthor } from '../git/author';
+
 import { safeReturnUrl } from '@/utils/constants';
 
 import { AUTH0_ISSUER } from './issuer';
@@ -186,9 +188,9 @@ export function logoutUrl(origin: string): URL {
 /**
  * Re-verify a retained ID token before it is handed to Universe 2.0 (ported from 1ac89c72). Independent of
  * `verifyIdToken`: no nonce (the login transaction is gone), no expiry leeway, an exact audience, and only the
- * issuer and subject come back, never the email.
+ * issuer, subject and optional commit attribution from verified email claims come back, never the token.
  */
-export async function verifyProjectIdToken(token: string): Promise<{ issuer: string; subject: string; expiresAt: number }> {
+export async function verifyProjectIdToken(token: string): Promise<{ issuer: string; subject: string; expiresAt: number; gitAuthor?: GitAuthor }> {
     const { clientId } = config();
     try {
         if (token.length > 16384) throw new Error();
@@ -212,6 +214,7 @@ export async function verifyProjectIdToken(token: string): Promise<{ issuer: str
             // No leeway on expiry. `iat` keeps the login verifier's 60 s, so a clock behind Auth0 cannot refuse a token
             // minted a moment ago and send the person round the silent re-auth for nothing.
             || !Number.isFinite(c.exp) || c.exp <= now || !Number.isFinite(c.iat) || c.iat > now + 60 || c.iat >= c.exp) throw new Error();
-        return { issuer: AUTH0_ISSUER, subject: c.sub as string, expiresAt: c.exp * 1000 };
+        const gitAuthor = gitAuthorFromVerifiedClaims(c);
+        return { issuer: AUTH0_ISSUER, subject: c.sub as string, expiresAt: c.exp * 1000, ...(gitAuthor ? { gitAuthor } : {}) };
     } catch { throw new Auth0Error('invalid_id_token'); }
 }

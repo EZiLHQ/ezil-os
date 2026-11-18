@@ -53,6 +53,46 @@ class RenderEnvTests(unittest.TestCase):
         with self.assertRaises(renderer.RenderError):
             renderer.validate({**self.values, "EZIL_OS_FEEDBACK": ""})
 
+    def test_telemetry_admin_emails_is_optional_and_forwarded_exactly(self):
+        # The telemetry and AI-trace admin pages read this exact key; off (no admin) unless set.
+        key = "TELEMETRY_ADMIN_EMAILS"
+        self.assertIn(key, renderer.OPTIONAL)
+        self.assertNotIn(key, renderer.REQUIRED)
+        raw = "contact@ezil.work,ops+alerts@example.invalid"
+        values = {**self.values, key: raw}
+        self.assertEqual(renderer.validate(values), values)
+        (app, cron), names = self.render_fixture(values)
+        rendered = dict(line.split("=", 1) for line in app.decode().splitlines())
+        self.assertEqual(rendered[key], raw)
+        self.assertEqual(names.splitlines(), sorted(values))
+        self.assertNotIn(raw, names)
+        self.assertNotIn(key, cron.decode())
+        renderer.validate(dict(self.values))  # absent stays valid
+        for unknown in ("TELEMETRY_ADMIN_EMAIL", "TELEMETRY_ADMIN_EMAILS_EXTRA", "AI_TRACES_GATEWAY_CONSOLE_ORIGIN"):
+            with self.subTest(key=unknown), self.assertRaisesRegex(renderer.RenderError, "Unknown key refused"):
+                renderer.validate({**self.values, unknown: raw})
+
+    def test_standalone_repo_open_flag_is_optional_and_forwarded_exactly(self):
+        # Both Git routes (app/src/server/git/staging.ts awsStandaloneGitEnabled) read this exact key; absent means off.
+        key = "AWS_STANDALONE_REPO_OPEN_ENABLED"
+        self.assertIn(key, renderer.OPTIONAL)
+        self.assertNotIn(key, renderer.REQUIRED)
+        values = {**self.values, key: "true"}
+        self.assertEqual(renderer.validate(values), values)
+        (app, cron), names = self.render_fixture(values)
+        rendered = dict(line.split("=", 1) for line in app.decode().splitlines())
+        self.assertEqual(rendered[key], "true")
+        self.assertEqual(names.splitlines(), sorted(values))
+        self.assertNotIn(key, cron.decode())
+        # Absent stays valid and is never synthesized, so the routes keep their disabled default.
+        (app, _), _ = self.render_fixture(dict(self.values))
+        self.assertNotIn(key, dict(line.split("=", 1) for line in app.decode().splitlines()))
+        for unknown in ("AWS_STANDALONE_REPO_OPEN", "AWS_STANDALONE_REPO_OPEN_ENABLED_EXTRA", "AWS_STANDALONE_GIT_ENABLED"):
+            with self.subTest(key=unknown), self.assertRaisesRegex(renderer.RenderError, "Unknown key refused"):
+                renderer.validate({**self.values, unknown: "true"})
+        with self.assertRaises(renderer.RenderError):
+            renderer.validate({**self.values, key: ""})  # the existing non-empty string rule still applies
+
     def render_fixture(self, values):
         with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
             output = io.StringIO()

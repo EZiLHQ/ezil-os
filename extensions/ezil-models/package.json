@@ -87,7 +87,7 @@
       },
       {
         "command": "ezil-models.compactionInfo",
-        "title": "Conversation compacted to fit the model",
+        "title": "Older content shortened to fit request size",
         "category": "EZiL AI",
         "icon": "$(fold)"
       }

@@ -230,10 +230,22 @@ class RegistryGcTests(unittest.TestCase):
         self.refuse('identity absent')
 
     def test_invalid_registry(self):
-        # 8 + 19 = 27 records: one beyond the twenty-six-record bound.
-        self.snapshot['deployment']['releases'] = self.records + [self.target, *[dict(self.target,amiId='ami-'+c*17) for c in 'bcdefa0123456789'], dict(self.target,amiId='ami-'+'9'*16+'a'), dict(self.target,amiId='ami-'+'9'*16+'b')]
-        self.assertEqual(len(self.snapshot['deployment']['releases']),27)
+        # Thirty-three schema-valid records exceed the thirty-two-record capacity.
+        self.snapshot['deployment']['releases'] = self.records + [
+            dict(self.target, amiId='ami-' + format(n, '017x')) for n in range(100, 125)]
+        self.assertEqual(len(self.snapshot['deployment']['releases']), 33)
         self.refuse('invalid registry')
+
+    def test_thirty_two_record_gc_removes_exactly_one_preserving_thirty_one(self):
+        self.records.extend([copy.deepcopy(self.target), *[
+            dict(self.target, amiId='ami-' + format(n, '017x')) for n in range(100, 123)]])
+        self.assertEqual(len(self.records), 32)
+        self.evidence['registrySha256'] = gc.sha(self.records)
+        before = copy.deepcopy(self.snapshot)
+        after = self.prepare()
+        self.assertEqual(len(after['releases']), 31)
+        self.assertEqual(after['releases'], self.records[:1] + self.records[2:])
+        self.assertEqual(self.snapshot, before)
 
     def test_twenty_four_record_gc_removes_exactly_one_preserving_twenty_three(self):
         self.records.extend([copy.deepcopy(self.target),*[dict(self.target,amiId='ami-'+c*17)
@@ -265,6 +277,18 @@ class RegistryGcTests(unittest.TestCase):
         before=copy.deepcopy(self.snapshot)
         after=self.prepare()
         self.assertEqual(len(after['releases']),25)
+        self.assertEqual(after['releases'],self.records[:1]+self.records[2:])
+        self.assertEqual(self.snapshot,before)
+
+    def test_twenty_seven_record_gc_removes_exactly_one_preserving_twenty_six(self):
+        self.records.extend([copy.deepcopy(self.target),*[dict(self.target,amiId='ami-'+c*17)
+                             for c in 'bcdefa0123456789'],dict(self.target,amiId='ami-'+'9'*16+'a'),
+                             dict(self.target,amiId='ami-'+'9'*16+'b')])
+        self.assertEqual(len(self.records),27)
+        self.evidence['registrySha256']=gc.sha(self.records)
+        before=copy.deepcopy(self.snapshot)
+        after=self.prepare()
+        self.assertEqual(len(after['releases']),26)
         self.assertEqual(after['releases'],self.records[:1]+self.records[2:])
         self.assertEqual(self.snapshot,before)
 
@@ -685,6 +709,34 @@ class RegistryGcTests(unittest.TestCase):
         for flag in ('--ami-id', '--lower-image-digest'):
             with self.assertRaisesRegex(ValueError, 'multiple CLI identities'):
                 gc.main([*args, flag, 'second'])
+
+
+class NamespaceLegacyCapacityTests(unittest.TestCase):
+    """GC stays frozen per namespace (mum 32, prd 26) while the active reader capacity is thirty-seven."""
+    def tearDown(self):
+        gc.tool.use_namespace('mum')
+
+    def refusal(self, count):
+        d = {'accountId': gc.tool.ACCOUNT, 'region': gc.tool.REGION, 'namespace': gc.tool.NAMESPACE,
+             'launchTemplateId': gc.tool.LAUNCH_TEMPLATE, 'releases': [{'record': n} for n in range(count)]}
+        drops = [{'lowerImageDigest': 'sha256:' + '0' * 64, 'amiId': 'ami-' + '0' * 17}]
+        with self.assertRaises(Exception) as caught:
+            gc.prepare({'VersionId': 'v1', 'deployment': d}, {}, [], {}, drops, '0' * 64, None)
+        return str(caught.exception)
+
+    def test_each_namespace_keeps_its_frozen_gc_limit(self):
+        self.assertEqual(gc.tool.ACTIVE_REGISTRY_CAPACITY, 39)
+        for namespace, legacy in (('mum', 32), ('prd', 26)):
+            with self.subTest(namespace=namespace):
+                gc.tool.use_namespace(namespace)
+                self.assertEqual(gc.tool.legacy_registry_capacity(), legacy)
+                self.assertEqual(self.refusal(legacy + 1), 'GC invalid registry')
+                # At the limit the count passes; the synthetic records are then refused by record validation.
+                self.assertNotEqual(self.refusal(legacy), 'GC invalid registry')
+        gc.tool.use_namespace('prd')
+        for count in (27, 32, 33, 36, 37, 38, 39):
+            with self.subTest(prd_count=count):
+                self.assertEqual(self.refusal(count), 'GC invalid registry')  # never widened to the mum or active limit
 
 
 class HistoricalAttestationTests(unittest.TestCase):

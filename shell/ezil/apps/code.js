@@ -1,4 +1,6 @@
+import { ai_trace_collector } from '../ui/ai-traces.js';
 import { attachCodeAuthRecovery, resetOriginRecovery } from './code-auth-recovery.js';
+import { createGitAccessRenewal } from './code-git-access.js';
 import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../native-runtime.js';
 // code.js — EZiL-authored. Not Puter code.
 //
@@ -172,11 +174,14 @@ export const LEAVING_SETTLE_MS = 3_000;
 const PROJECT_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /**
  * sessionStorage: the silent EZiL ID refresh this tab last made for a project,
- * `{projectId, repoId, at}`. Present (and younger than the TTL) for the same
- * project means the refresh already happened and did not help.
+ * `{projectId, repoId, at}`, or for an EZiL Git repository opened from its
+ * address, `{repoUrl, at}`. Present (and younger than the TTL) for the same
+ * project or repository means the refresh already happened and did not help.
  */
 export const IDENTITY_REFRESH_KEY = 'ezil-os:code.identity-refresh';
 const IDENTITY_REFRESH_TTL_MS = 10 * 60_000;
+/** EZiL's own Git gateway: the only repository address whose access the EZiL ID grants. */
+const EZIL_GIT_ORIGIN = 'https://github.ezil.work/';
 /** Where the silent sign-in starts (`app/src/app/auth/auth0/login/route.ts`). */
 const LOGIN_PATH = '/auth/auth0/login';
 /** The server's refusals of a project open, as it may spell them, to this window's error codes. */
@@ -324,16 +329,20 @@ function projectReturnUrl (project) {
  */
 function refreshIdentityOnce (project) {
     // A repository opened from its address asks for no EZiL ID (nothing is granted for it): never leave the tab for one.
-    if ( project.repoUrl ) return false;
+    // The one exception is EZiL's own Git gateway, whose access is granted by the EZiL ID: once per repository, as a project.
+    const gatewayRepo = typeof project.repoUrl === 'string' && project.repoUrl.startsWith(EZIL_GIT_ORIGIN);
+    if ( project.repoUrl && ! gatewayRepo ) return false;
     try {
         const seen = JSON.parse(sessionStorage.getItem(IDENTITY_REFRESH_KEY) ?? 'null');
-        if ( seen && seen.projectId === project.projectId && seen.repoId === project.repoId
+        if ( seen && (gatewayRepo ? seen.repoUrl === project.repoUrl : seen.projectId === project.projectId && seen.repoId === project.repoId)
              && Date.now() - seen.at < IDENTITY_REFRESH_TTL_MS ) return false;
     } catch ( err ) {
         if ( ! (err instanceof SyntaxError) ) return false;
     }
     try {
-        sessionStorage.setItem(IDENTITY_REFRESH_KEY, JSON.stringify({ projectId: project.projectId, repoId: project.repoId, at: Date.now() }));
+        sessionStorage.setItem(IDENTITY_REFRESH_KEY, JSON.stringify(gatewayRepo
+            ? { repoUrl: project.repoUrl, at: Date.now() }
+            : { projectId: project.projectId, repoId: project.repoId, at: Date.now() }));
     } catch {
         return false;
     }
@@ -507,7 +516,8 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = nul
     // Lane O2: a refused project open, as an HTTP error or an `ok:false` answer. Read first, so a 403/409 refusal is
     // never flattened into `unknown`.
     const refusal = project ? projectRefusalOf(data) : null;
-    if ( refusal ) return { ok: false, errorCode: refusal };
+    if ( refusal ) return { ok: false, errorCode: refusal,
+        ...failureFields({ reason: data?.refusalReason, correlationId: data?.correlationId }) };
 
     if ( ! res.ok ) {
         const code = data?.error?.code;
@@ -651,9 +661,10 @@ export async function openCodeWindow (ctx = {}) {
     const el_body = el_window.querySelector('.window-body');
     const el_iframe = el_window.querySelector('.window-app-iframe');
     // Trusted shell-only context for a future app Report problem entry; never read from a message.
-    const appContext = Object.freeze({ computerId: computer.id, appSession: crypto.randomUUID() });
+    const appContext = Object.freeze({ computerId: computer.id, appSession: crypto.randomUUID(), traceId: trace.id });
     el_window.ezilFeedbackAppContext = appContext;
     let unregister_app_failures = () => {};
+    let trace_registration = { dispose() {}, bindNonce() {} };
     let unregister_billing = () => {};
     let unregister_auth_recovery = () => {};
     if ( getComputedStyle(el_body).position === 'static' ) el_body.style.position = 'relative';
@@ -663,6 +674,8 @@ export async function openCodeWindow (ctx = {}) {
     let attempt = 0;
     let running_signal;
     let disposed = false;
+    let git_access = null;
+    let git_access_notice = null;
     /** The current attempt's mint loop: aborted by the next attempt and by close (hotfix r5). */
     let mint_ctl = null;
     /** RETRY-118: the failure on screen, for an explicit user Retry only (`session.userRetry`). */
@@ -952,6 +965,8 @@ export async function openCodeWindow (ctx = {}) {
         last_failure = null;
         last_progress = null; generic_timeout = null;
         if ( disposed ) return;
+        git_access?.reset();
+        repository_folder = null;
         const my_attempt = ++attempt;
         stop_timers();
         show_panel();
@@ -1031,7 +1046,8 @@ export async function openCodeWindow (ctx = {}) {
                     return;
                 }
                 console.warn(`[${PHASE}] the project could not be opened: ${res.errorCode}`);
-                telemetry.capture({ eventClass: 'api_failure', site: 'ezil-os:apps/code#project', code: res.errorCode });
+                telemetry.capture({ eventClass: 'api_failure', site: 'ezil-os:apps/code#project', code: res.errorCode,
+                    reason: res.reason, serverCorrelationId: res.correlationId });
                 progress.render({
                     ...computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: res.errorCode }),
                     copy: PROJECT_FAILURE_COPY[res.errorCode],
@@ -1110,6 +1126,7 @@ export async function openCodeWindow (ctx = {}) {
         tick_timer = setInterval(paint_handoff, TICK_MS);
 
         unregister_app_failures();
+        trace_registration.dispose();
         unregister_billing();
         unregister_auth_recovery();
         if (!nativeSurface) unregister_auth_recovery = attachCodeAuthRecovery({
@@ -1129,8 +1146,11 @@ export async function openCodeWindow (ctx = {}) {
         el_iframe.src = code_preview_url;
         // Bind at mint handoff, before confirmation, so startup failures can answer the hello too.
         // The folder bridge below binds the same frame after the server confirms it.
+        if (!nativeSurface) trace_registration = ai_trace_collector.register(el_iframe, { origin: new URL(code_preview_url).origin });
         if (!nativeSurface) unregister_app_failures = register_app_frame(el_iframe, {
             origin: new URL(code_preview_url).origin, ...appContext, app: 'code',
+            onDiagnosticNonce: nonce => trace_registration.bindNonce(nonce),
+            onTerminalFailure: event => telemetry.capture(event),
         });
         // Code asks this desktop for its billing dialogs (a credit refusal, a plan-locked model): Settings → Billing.
         if (!nativeSurface) unregister_billing = register_billing_frame(el_iframe, {
@@ -1319,6 +1339,7 @@ export async function openCodeWindow (ctx = {}) {
         });
         if ( present || was_present ) last_present_at = performance.now();
         was_present = present;
+        if ( present ) void git_access?.tick();
     };
     const heartbeat_tick = () => {
         if ( disposed ) return;
@@ -1334,6 +1355,27 @@ export async function openCodeWindow (ctx = {}) {
         document.addEventListener('visibilitychange', sample_presence);
         sample_presence();
     }
+    // Git's short-lived capability is renewed only while this repository's editor is active.
+    // The authenticated endpoint refuses a stopped computer or an absent checkout; it cannot wake or clone one.
+    git_access = nativeSurface ? null : createGitAccessRenewal({
+        target: () => repository_folder && project?.repoUrl?.startsWith(EZIL_GIT_ORIGIN)
+            ? { computerId: computer.id, repoUrl: project.repoUrl } : null,
+        eligible: () => ! disposed && el_state.hidden && progress.el.hidden && shouldHeartbeat({
+            visible: document.visibilityState === 'visible',
+            lastPresenceAgoMs: last_present_at === null ? NaN : performance.now() - last_present_at,
+        }),
+        notice: text => {
+            git_access_notice?.remove(); git_access_notice = null;
+            if ( ! text || disposed ) return;
+            const notice = document.createElement('div');
+            notice.className = 'ezil-code-git-access-notice';
+            notice.setAttribute('role', 'status');
+            notice.setAttribute('aria-live', 'polite');
+            notice.textContent = text;
+            el_body.appendChild(notice);
+            git_access_notice = notice;
+        },
+    });
     // Back after an absence long enough for an idle-stop: re-check before the
     // stale frame is used (`../runtime-recheck.js`).
     //
@@ -1555,6 +1597,8 @@ export async function openCodeWindow (ctx = {}) {
         progress.dispose();
         if (disposed) return;
         disposed = true;
+        git_access?.dispose();
+        git_access_notice?.remove(); git_access_notice = null;
         hide_state();
         restore_observer.disconnect();
         // A closed window stops asking: no ask after close can reach ensure() (hotfix r5).
@@ -1570,6 +1614,7 @@ export async function openCodeWindow (ctx = {}) {
         detachFolderBridge(el_iframe);
         unregister_auth_recovery();
         unregister_app_failures();
+        trace_registration.dispose();
         unregister_billing();
         folder_notice?.close();
         stop_runtime_recheck?.();

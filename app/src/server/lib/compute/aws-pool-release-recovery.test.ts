@@ -620,3 +620,95 @@ describe('round 5 D2: an intent-less recovery error is retried on the next pass,
         expect(await s.current()).toMatchObject({ state: 'RECOVERING' });
     });
 });
+
+// Incident 2026-11-17: a release whose initial observe was refused lambda:InvokeFunction (rollout version transition) FAILED
+// before any provider call. Its own history proves it never acted, so the still-RUNNING host with its attached data volume is
+// exactly what the release found; the release is replayed as itself. Anything else keeps the stopped-host requirement.
+describe('failed release that never acted (initial observe refused): replayed on the running host', () => {
+    type Ev = HistoryEvent & { id: number; previousEventId: number; timestamp: Date };
+    function neverActedHistory(work: LifecycleWork, over: { acted?: boolean; observeSucceeded?: boolean; extraState?: string; retries?: number } = {}): Ev[] {
+        const events: Ev[] = []; let at = START.getTime();
+        const push = (type: string, details: Record<string, unknown> = {}) => {
+            at = Math.min(at + 500, STOP.getTime()); const n = events.length + 1;
+            events.push({ id: n, previousEventId: n - 1, type, timestamp: new Date(at), ...details } as Ev); return n;
+        };
+        push('ExecutionStarted', { executionStartedEventDetails: { input: work.input, inputDetails: { truncated: false }, stateMachineVersionArn: work.stateMachineArn } });
+        push('PassStateEntered', { previousEventId: 0, stateEnteredEventDetails: { name: 'Init' } });
+        push('PassStateExited', { stateExitedEventDetails: { name: 'Init' } });
+        push('TaskStateEntered', { stateEnteredEventDetails: { name: over.extraState ?? 'Observe-initial' } });
+        for (let n = 0; n <= (over.retries ?? 3); n++) {
+            push('LambdaFunctionScheduled', { lambdaFunctionScheduledEventDetails: { resource: 'arn:aws:lambda:ap-south-1:123456789012:function:observer:1', input: '{}' } });
+            push('LambdaFunctionStarted');
+            if (over.observeSucceeded) { push('LambdaFunctionSucceeded', { lambdaFunctionSucceededEventDetails: { output: '{}', outputDetails: { truncated: false } } }); break; }
+            push('LambdaFunctionFailed', { lambdaFunctionFailedEventDetails: { error: 'Lambda.AWSLambdaException', cause: 'not authorized to perform: lambda:InvokeFunction' } });
+        }
+        if (over.acted) {
+            push('TaskStateExited', { stateExitedEventDetails: { name: 'Observe-initial' } });
+            push('TaskStateEntered', { stateEnteredEventDetails: { name: 'stopInstances' } });
+            push('TaskScheduled', { taskScheduledEventDetails: { resourceType: 'aws-sdk:ec2', resource: 'stopInstances', region: D.region, parameters: '{}', timeoutInSeconds: 30 } });
+            push('TaskFailed', { taskFailedEventDetails: { resourceType: 'aws-sdk:ec2', resource: 'stopInstances', error: 'AccessDenied', cause: '' } });
+        }
+        push('TaskStateExited', { stateExitedEventDetails: { name: over.extraState ?? 'Observe-initial' } });
+        push('FailStateEntered', { stateEnteredEventDetails: { name: 'Unconfirmed', input: '{}', inputDetails: { truncated: false } } });
+        push('ExecutionFailed', { executionFailedEventDetails: { error: 'LifecycleUnconfirmed', cause: 'observe' } });
+        return events;
+    }
+    const withHistory = (s: Fixture, events: Ev[] | Error) => {
+        s.deps.executions!.history = vi.fn(async () => { if (events instanceof Error) throw events; return events; });
+    };
+
+    it('reserves the replay (recovery_success basis, no stop proof), replays the release, and settles STOPPED on its success', async () => {
+        const s = setup(); s.host.state = 'running'; withHistory(s, neverActedHistory(s.original));
+        await s.tick();
+        expect(await s.current()).toMatchObject({ state: 'RECOVERING' });
+        expect(await recoveryContext(s)).toMatchObject({ basis: 'recovery_success', stoppedAt: null, sourceJobId: s.original.intent.jobId, error: null });
+        expect(s.starts).toHaveLength(1);
+        expect(s.starts[0]!.intent).toMatchObject({ operation: 'release', computerId: s.original.intent.computerId,
+            providerInstanceId: s.original.intent.providerInstanceId, dataVolumeId: s.original.intent.dataVolumeId });
+        expect(s.deps.executions!.history).toHaveBeenCalledExactlyOnceWith(D.region, s.originalExecution.executionArn);
+        const e = s.finish(); e.startDate = new Date(NOW.getTime() - 60000);
+        await s.tick();
+        expect(await s.current()).toMatchObject({ state: 'STOPPED', lastError: POOL_RELEASED, lifecycleJobId: null });
+        expect(s.meter.stopped).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ endedAt: NOW, reason: 'provider_stop' }));
+    });
+
+    it.each([
+        ['no history reader', undefined],
+        ['history unreadable', new Error('throttled')],
+        ['a release that acted (stopInstances scheduled)', 'acted'],
+        ['an observe that succeeded (the graph continued)', 'succeeded'],
+        ['a task state other than Observe-initial', 'other'],
+        ['an observe entry without a parent', 'orphan'],
+    ] as const)('keeps the stopped-host requirement for %s: no reservation, no start', async (_name, kind) => {
+        const s = setup(); s.host.state = 'running';
+        if (kind === 'acted') withHistory(s, neverActedHistory(s.original, { acted: true }));
+        else if (kind === 'succeeded') withHistory(s, neverActedHistory(s.original, { observeSucceeded: true }));
+        else if (kind === 'other') withHistory(s, neverActedHistory(s.original, { extraState: 'Observe-stopped' }));
+        else if (kind === 'orphan') {
+            const events = neverActedHistory(s.original);
+            events.find(event => event.type === 'TaskStateEntered')!.previousEventId = 0;
+            withHistory(s, events);
+        }
+        else if (kind instanceof Error) withHistory(s, kind);
+        await s.tick();
+        const after = await s.current();
+        expect(after.state).toBe('UNCONFIRMED');
+        expect(after.lastError).toContain(kind instanceof Error ? 'describe_unavailable' : 'instance_identity');
+        expect(s.starts).toHaveLength(0);
+    });
+
+    it('a failed STOP (not a release) never enters the never-acted branch', async () => {
+        const s = setup('stop'); s.host.state = 'running'; withHistory(s, neverActedHistory(s.original));
+        await s.tick();
+        expect(await s.current()).toMatchObject({ state: 'UNCONFIRMED', lastError: expect.stringContaining('instance_identity') });
+        expect(s.starts).toHaveLength(0);
+    });
+
+    it('a running host whose data volume is not attached to it is refused even with a never-acted history', async () => {
+        const s = setup(); s.host.state = 'running'; withHistory(s, neverActedHistory(s.original));
+        s.volume.attachments = [];
+        await s.tick();
+        expect(await s.current()).toMatchObject({ state: 'UNCONFIRMED', lastError: expect.stringContaining('volume_attachment') });
+        expect(s.starts).toHaveLength(0);
+    });
+});

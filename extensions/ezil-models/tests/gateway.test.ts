@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test } from 'bun:test';
 import { chat } from '../src/client';
 import { creditState, describeGatewayError, errorOrigin, forgetGatewayModels, gatewayCatalogModels, gatewayChat, GatewayError, gatewayModels, parseErrorBody, parseGatewayModels, readCredits, withGatewayModelLimits } from '../src/gateway';
-import { credits, creditsFloor2 } from '../src/credits-format';
+import { credits, creditsWhole } from '../src/credits-format';
 import { buildGatewayBody, KIMI } from '../src/gateway-messages';
 import type { StreamEvent } from '../src/types';
 import { ask, gw, msg, tool, txt } from './fixtures/gateway';
@@ -238,14 +238,14 @@ describe('gateway errors and credits', () => {
     });
     test('available credits and nested auth reason; raw messages never shown', () => {
         const e = describeGatewayError('qwen', 402, null, parseErrorBody('{"type":"error","error":{"code":"insufficient_credits","available_micro":1500000,"message":"secret"}}'), 'req');
-        expect(e.message).toContain('Available credits: 1.50.'); expect(e.message).not.toContain('secret');
+        expect(e.message).toContain('Available credits: 1.'); expect(e.message).not.toContain('secret');
         expect(describeGatewayError('', 401, null, { code: 'unauthorized', reason: 'no_ezil_role' }, 'req').message).toContain('no AI access yet');
     });
     for (const tokens of [undefined, null, 0, 512]) test(`credit refusal explains the full hold with affordable output ${tokens}`, () => {
         const body = parseErrorBody(JSON.stringify({ error: { code: 'insufficient_credits', available_micro: 63_092_750,
             hold_micro: 80_126_789, floor_hold_micro: 64_000_000, max_affordable_output_tokens: tokens, no_live_grant: false } }));
         const e = describeGatewayError('qwen', 402, null, body, 'req');
-        expect(e.message).toBe('EZiL AI: This request needs up to 80.13 credits, and you have 63.09. Add credits, or start a new chat or pick a smaller model to use less.'
+        expect(e.message).toBe('EZiL AI: This request needs up to 80.13 credits, and you have 63. Add credits, or start a new chat or pick a smaller model to use less.'
             + (tokens ? ' A shorter reply would fit; try again or reduce the conversation.' : '') + ' (request req)');
         expect(e.message).not.toContain('63.09275');
     });
@@ -256,12 +256,12 @@ describe('gateway errors and credits', () => {
             expect(e.message).toBe('EZiL AI: You have no AI credits left. Add credits to continue.');
         });
     }
-    test('legacy refusal uses the measured balance and displays exactly two decimals', () => {
+    test('legacy refusal uses the measured balance as whole floored credits', () => {
         const e = describeGatewayError('qwen', 402, null, { code: 'insufficient_credits' }, null,
             { available_micro: 63_092_750, held_micro: 0, grants: [] });
-        expect(e.message).toBe('EZiL AI: Not enough AI credits for this request. Available credits: 63.09. Add credits, or start a new chat or pick a smaller model to use less.');
+        expect(e.message).toBe('EZiL AI: Not enough AI credits for this request. Available credits: 63. Add credits, or start a new chat or pick a smaller model to use less.');
         expect(describeGatewayError('qwen', 402, null, { code: 'insufficient_credits', available_micro: 0, hold_micro: 1_000_000 }, null).message)
-            .toContain('up to 1.00 credits, and you have 0.00.');
+            .toContain('up to 1.00 credits, and you have 0.');
     });
     test('missing or null credit measurements are not invented', () => {
         for (const available_micro of [undefined, null]) {
@@ -306,25 +306,25 @@ describe('gateway errors and credits', () => {
         expect(creditState(undefined, { ...balance, grants: [{ remaining_micro: 0, live: true }] }, '').state).toBe('used');
         expect(creditState(undefined, { ...balance, held_micro: 1 }, '').state).toBe('held');
         const s = server(c => json(c.url.endsWith('/models') ? catalog : { ...balance, available_micro: 1250000 }));
-        expect((await readCredits(gw().provider, gw().id, s.fetch)).text).toContain('1.25');
+        expect((await readCredits(gw().provider, gw().id, s.fetch)).text).toContain('AI credits: 1 remaining');
         expect(s.calls.map(c => c.url.split('/ai/v1')[1]).sort()).toEqual(['/me/balance', '/models']);
         expect(s.posts()).toHaveLength(0);
     });
-    test('"Show AI credits" prints the exact decimal from integer microcredits, never a float rendering', () => {
+    test('"Show AI credits" prints whole floored credits from integer microcredits, never a float rendering or a fraction', () => {
         const ok = (available_micro: number) => creditState(undefined, { available_micro, held_micro: 0, grants: [{ remaining_micro: available_micro, live: true }] }, '');
-        for (const [micro, text] of [[1_246_750_000, '1,246.75'], [996_250_000, '996.25'], [1, '0.000001'], [1_000_000_000, '1,000'],
-            [300_000, '0.3'], [9_007_199_254_740_991, '9,007,199,254.740991']] as const) {
+        for (const [micro, text] of [[1_246_750_000, '1,246'], [996_250_000, '996'], [1, '0'], [1_000_000_000, '1,000'],
+            [300_000, '0'], [99_999_999, '99'], [9_007_199_254_740_991, '9,007,199,254']] as const) {
             expect(ok(micro).text).toBe(`AI credits: ${text} remaining`);
         }
-        // The float rendering was "1246.75" (no grouping, a Number's shortest text); the `credits` number field is unchanged.
-        expect(ok(1_246_750_000).text).not.toContain('1246.75');
+        // Never a float rendering ("1246.75", no grouping) and never a fraction; the `credits` number field keeps its precision.
+        expect(ok(1_246_750_000).text).not.toContain('.');
         expect(ok(300_000).credits).toBe(0.3);
     });
-    test('an available balance in an error is floored, never rounded up (the hold, a requirement, keeps two places)', () => {
+    test('an available balance in an error is whole and floored, never rounded up (the hold, a requirement, keeps two places)', () => {
         const message = (available_micro: number) => describeGatewayError('qwen', 402, null, { code: 'insufficient_credits', available_micro }, null).message;
-        expect(message(999_999)).toContain('Available credits: 0.99.');
-        expect(message(1_234_567_891)).toContain('Available credits: 1,234.56.');
-        expect(message(1_500_000)).toContain('Available credits: 1.50.');
+        expect(message(999_999)).toContain('Available credits: 0.');
+        expect(message(1_234_567_891)).toContain('Available credits: 1,234.');
+        expect(message(1_500_000)).toContain('Available credits: 1.');
         for (const odd of [-1, 1.5, Number.NaN]) expect(message(odd)).toContain('Available credits: Not measured.');
     });
 });
@@ -354,7 +354,7 @@ describe('local refusals and error origin', () => {
         expect(logs).toHaveLength(1);
         expect(JSON.parse(logs[0]!)).toEqual({ request_id: null, model: KIMI, stream: false, hold: null, http_status: null,
             client_request_id: expect.stringMatching(/^[0-9a-f-]{36}$/), attempts: 0, partial: false, latency_ms: 0,
-            usage: { input: 0, output: 0, cache_read: 0, cache_write: 0 }, stop_reason: null, error_code: 'local_input_too_large', origin: 'local',
+            usage: {}, stop_reason: null, error_code: 'local_input_too_large', origin: 'local',
             body_bytes: bodyBytes, limit_bytes: 130_016, messages: 1, max_blocks: 1, tools: 1, tool_bytes: toolBytes });
         for (const text of [logs[0]!, error.message]) expect(text).not.toMatch(new RegExp(`${SENTINEL}|字|invalid_request`));
     });
@@ -400,12 +400,14 @@ describe('local refusals and error origin', () => {
         expect(JSON.parse(logs[0]!).body_bytes).toBeUndefined();
     });
 });
-test('credits-format: the shared vectors (the OS shell pins the same ones for creditsDecimal)', () => {
-    for (const [micro, full, floor2] of [['0', '0', '0.00'], ['1', '0.000001', '0.00'], ['500000', '0.5', '0.50'], ['252750000', '252.75', '252.75'],
-        ['1246759999', '1,246.759999', '1,246.75'], ['1500000000', '1,500', '1,500.00'], ['9007199254740993123456', '9,007,199,254,740,993.123456', '9,007,199,254,740,993.12']] as const) {
+test('credits-format: the shared vectors (the OS shell pins the same ones for creditsDecimal and creditsWhole)', () => {
+    for (const [micro, full, whole] of [['0', '0', '0'], ['1', '0.000001', '0'], ['500000', '0.5', '0'], ['252750000', '252.75', '252'],
+        ['1246759999', '1,246.759999', '1,246'], ['1500000000', '1,500', '1,500'], ['99999999', '99.999999', '99'],
+        ['9007199254740993123456', '9,007,199,254,740,993.123456', '9,007,199,254,740,993']] as const) {
         expect(credits(micro)).toBe(full);
-        expect(creditsFloor2(micro)).toBe(floor2);
+        expect(creditsWhole(micro)).toBe(whole);
     }
+    expect(creditsWhole('-5')).toBe('0');   // clamped nonnegative, never a negative label
 });
 
 describe('prompt cache from the catalog', () => {
@@ -452,4 +454,15 @@ describe('prompt cache from the catalog', () => {
         expect(limited.gatewayPromptCache).toBeUndefined();
         expect(limited.cache).toEqual(gw().cache);
     });
+});
+
+test('credits command uses exact accounting above 2^53 without a lossy numeric convenience field', async () => {
+    const accounting = { contract: 'ezil.gateway.balance.v1', snapshot_at: '2026-11-15T12:00:00.123456Z', ledger_cursor: '1',
+        available_micro: '9007199254999999', held_micro: '0', reserved_micro: '0', pending_micro: '0',
+        settled_debit_micro: '1', settled_scope: 'lifetime_ledger', credit_unit: null };
+    const s = server(c => json(c.url.endsWith('/models') ? catalog : { available_micro: 9007199255000000, held_micro: 0, grants: [], accounting }));
+    const result = await readCredits(gw().provider, gw().id, s.fetch);
+    expect(result.text).toBe('AI credits: 9,007,199,254 remaining');
+    expect(result.balance?.available_micro).toBe('9007199254999999');
+    expect(creditState(undefined, result.balance, '').credits).toBeUndefined();
 });

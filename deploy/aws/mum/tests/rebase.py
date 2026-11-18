@@ -827,6 +827,231 @@ class ComputerTests(unittest.TestCase):
             COMPUTER.main()
         self.assertEqual(send.call_args.args[0], COMPUTER.cancel_request(self.computer, self.job, 'apply'))
         self.assertIs(send.call_args.args[2], COMPUTER.cancel_response)
+    park_job = '44444444-4444-4444-8444-444444444444'
+    snapshot = 'snap-0123456789abcdef0'
+
+    def park_reply(self, sent, **over):
+        return dict(dict(schemaVersion=1, computerId=sent['computerId'], sourceJobId=sent['expectedJobId'], parkJobId=sent['parkJobId'],
+                         parkDigest='d' * 64, outcome='reserved', error=None), **over)
+
+    def refused_reply(self, sent, error='snapshot_not_proven'):
+        return self.park_reply(sent, parkJobId=None, parkDigest=None, outcome='refused', error=error)
+
+    def park_sender(self, calls, reply=None):
+        """A sender that proves the journal already holds exactly the request about to leave (fsync before send)."""
+        def sender(sent, secret):
+            self.assertEqual(secret, self.secret)
+            self.assertEqual(manifest.read(self.journal)['pending'], sent)
+            calls.append(dict(sent))
+            return (reply or self.park_reply)(sent)
+        return sender
+
+    def test_park_request_is_exact_ordered_and_bound_to_the_failed_releases_own_execution(self):
+        own = self.source(self.job)
+        sent = COMPUTER.park_request(self.computer, self.job, own, self.snapshot, self.park_job)
+        self.assertEqual(list(sent), ['schemaVersion', 'operation', 'computerId', 'expectedJobId', 'parkJobId', 'releaseExecutionArn', 'snapshotId'])
+        self.assertEqual(sent['operation'], 'park-failed-release')
+        for args in ((None, self.job, own, self.snapshot, self.park_job), (self.computer, None, own, self.snapshot, self.park_job),
+                     ('not-a-uuid', self.job, own, self.snapshot, self.park_job), (self.computer, self.job, own, self.snapshot, 'not-a-uuid'),
+                     (self.computer, self.job, own, self.snapshot, None), (self.computer, self.job, own, self.snapshot, self.job),  # stop id = failed release id
+                     (self.computer, self.job, self.source(), self.snapshot, self.park_job),  # another job's execution
+                     (self.computer, self.job, own + 'x', self.snapshot, self.park_job),
+                     (self.computer, self.job, own.replace('ezil-mum-lifecycle', 'ezil-other-lifecycle'), self.snapshot, self.park_job),
+                     (self.computer, self.job, own.replace('452630323510', '123456789012'), self.snapshot, self.park_job),
+                     (self.computer, self.job, own.replace(':execution:', ':stateMachine:'), self.snapshot, self.park_job),
+                     (self.computer, self.job, None, self.snapshot, self.park_job),
+                     (self.computer, self.job, own, None, self.park_job), (self.computer, self.job, own, 'snap-xyz', self.park_job),
+                     (self.computer, self.job, own, 'snap-0123456', self.park_job), (self.computer, self.job, own, 'snap-0123456789abcdef012', self.park_job),
+                     (self.computer, self.job, own, 'SNAP-0123456789abcdef0', self.park_job), (self.computer, self.job, own, self.snapshot + '\n', self.park_job)):
+            with self.assertRaises(ValueError, msg=args):
+                COMPUTER.park_request(*args)
+
+    def test_park_response_accepts_only_the_exact_shape_for_the_same_work(self):
+        sent = COMPUTER.park_request(self.computer, self.job, self.source(self.job), self.snapshot, self.park_job)
+        for reply in (self.park_reply(sent), self.park_reply(sent, outcome='already_reserved'), self.park_reply(sent, error='start_unknown'),
+                      self.refused_reply(sent), self.refused_reply(sent, 'park_in_progress')):
+            self.assertEqual(COMPUTER.park_response(reply, sent), reply)
+        good = self.park_reply(sent)
+        old_shape = dict(schemaVersion=1, computerId=self.computer, jobId=self.job, outcome='reserved', error=None)  # the pre-park-id response
+        for bad in (old_shape, dict(good, extra=1), {k: v for k, v in good.items() if k != 'parkDigest'},
+                    dict(good, schemaVersion=True), dict(good, schemaVersion=2), dict(good, computerId=self.job), dict(good, sourceJobId=self.park_job),
+                    dict(good, parkJobId=self.job),  # the failed release's job offered as the stop
+                    dict(good, parkJobId='55555555-5555-4555-8555-555555555555'),  # another stop than the one the caller chose
+                    dict(good, parkJobId=None), dict(good, parkDigest=None), dict(good, parkDigest='D' * 64), dict(good, parkDigest='d' * 63),
+                    dict(good, outcome='settled'), dict(good, outcome='recovering'), dict(good, error='Not A Code'), dict(good, error='x' * 61), dict(good, error=3),
+                    dict(self.refused_reply(sent), parkJobId=self.park_job), dict(self.refused_reply(sent), parkDigest='d' * 64),
+                    dict(self.refused_reply(sent), error=None)):
+            with self.assertRaises(ValueError, msg=bad):
+                COMPUTER.park_response(bad, sent)
+
+    def test_park_dry_run_never_touches_the_network_or_creates_a_journal(self):
+        own = self.source(self.job)
+        calls = []
+        self.assertIsNone(COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, False, self.secret, lambda *a: calls.append(a)))
+        self.assertEqual(calls, []); self.assertFalse(self.journal.exists())
+        with patch.object(sys, 'argv', ['rebase_computer.py', 'park-failed-release', '--computer', self.computer, '--job', self.job,
+                                        '--source-execution-arn', own, '--snapshot-id', self.snapshot, '--journal', str(self.journal)]), \
+                patch.object(COMPUTER.http.client, 'HTTPSConnection') as connection:
+            COMPUTER.main()
+        connection.assert_not_called(); self.assertFalse(self.journal.exists())
+
+    def test_park_mints_the_stop_uuid_once_and_journals_it_before_the_request_leaves(self):
+        own = self.source(self.job); calls = []
+        minted = iter([self.park_job, '55555555-5555-4555-8555-555555555555'])
+        observed = COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret,
+                                                self.park_sender(calls), lambda: next(minted))
+        sent = COMPUTER.park_request(self.computer, self.job, own, self.snapshot, self.park_job)
+        self.assertEqual(calls, [sent]); self.assertEqual(observed['parkJobId'], self.park_job)
+        state = manifest.read(self.journal)
+        self.assertEqual(state, dict(schemaVersion=1, kind='park-failed-release', request=sent, pending=None, lastResponse=observed))
+        # A rerun resends the SAME request (the minter is never consulted again) and the server's replay answer is accepted.
+        again = COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret,
+                                             self.park_sender(calls, lambda s: self.park_reply(s, outcome='already_reserved')), lambda: next(minted))
+        self.assertEqual(calls, [sent, sent]); self.assertEqual(again['outcome'], 'already_reserved')
+
+    def test_park_unknown_response_keeps_the_journal_pending_and_resends_only_the_same_request(self):
+        own = self.source(self.job); calls = []
+        minted = iter([self.park_job])
+        for failure in (OSError('timeout'), ValueError('response fields mismatch'), COMPUTER.http.client.HTTPException('bad status line')):
+            def broken(sent, secret, failure=failure):
+                self.assertEqual(manifest.read(self.journal)['pending'], sent); calls.append(dict(sent)); raise failure
+            with self.assertRaises(Exception):
+                COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, broken, lambda: next(minted))
+            state = manifest.read(self.journal)
+            self.assertEqual(state['pending'], state['request']); self.assertEqual(state['request']['parkJobId'], self.park_job)
+            self.assertIsNone(state['lastResponse'])
+        self.assertEqual({json.dumps(c, sort_keys=True) for c in calls}, {json.dumps(calls[0], sort_keys=True)})
+        # The reconciling run uses the journaled request and clears `pending` only after a valid answer.
+        COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, self.park_sender(calls), lambda: self.fail('minted again'))
+        self.assertIsNone(manifest.read(self.journal)['pending']); self.assertEqual(calls[-1], calls[0])
+
+    def test_park_refusal_is_recorded_exits_nonzero_and_a_retry_keeps_the_same_uuid(self):
+        own = self.source(self.job); calls = []
+        with self.assertRaises(ValueError):
+            COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret,
+                                         self.park_sender(calls, self.refused_reply), lambda: self.park_job)
+        state = manifest.read(self.journal)
+        self.assertEqual(state['lastResponse']['outcome'], 'refused'); self.assertIsNone(state['pending'])
+        COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, self.park_sender(calls), lambda: self.fail('minted again'))
+        self.assertEqual([c['parkJobId'] for c in calls], [self.park_job, self.park_job])
+
+    def test_park_refuses_a_journal_for_other_work_and_a_malformed_journal(self):
+        own = self.source(self.job); calls = []
+        COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, self.park_sender(calls), lambda: self.park_job)
+        calls.clear()
+        for args in ((self.computer, self.job, own, 'snap-0fedcba9876543210'), ('33333333-3333-4333-8333-333333333333', self.job, own, self.snapshot),
+                     (self.computer, '55555555-5555-4555-8555-555555555555', self.source('55555555-5555-4555-8555-555555555555'), self.snapshot)):
+            with self.assertRaises(ValueError, msg=args):
+                COMPUTER.park_failed_release(*args, self.journal, True, self.secret, lambda *a: calls.append(a), lambda: self.park_job)
+        self.assertEqual(calls, [])
+        state = manifest.read(self.journal)
+        for tampered in (dict(state, kind='plan'), dict(state, extra=1), dict(state, pending=dict(state['request'], snapshotId='snap-0fedcba9876543210')),
+                         dict(state, request=dict(state['request'], parkJobId=self.job)), dict(state, lastResponse=dict(self.park_reply(state['request']), outcome='settled')),
+                         dict(state, schemaVersion=2)):
+            self.journal.write_text(json.dumps(tampered))
+            with self.assertRaises(ValueError, msg=tampered):
+                COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, lambda *a: calls.append(a), lambda: self.park_job)
+        self.assertEqual(calls, [])
+
+    def test_park_journal_root_follows_the_selected_namespace_and_refuses_the_other(self):
+        own = self.source(self.job); calls = []
+        try:
+            COMPUTER.use_namespace('prd')
+            self.assertEqual(COMPUTER.park_journal_dir(), Path('/root/ezil-aws-prd/park-failed-releases'))
+            # The execution hint must name the prd lifecycle machine once prd is selected.
+            self.assertIn('ezil-prd-lifecycle', COMPUTER.SOURCE_EXECUTION.replace('\\', ''))
+            foreign = Path('/root/ezil-aws-mum/park-failed-releases') / (self.computer + '.json')
+            with self.assertRaisesRegex(ValueError, 'foreign namespace operator path'):
+                COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, foreign, False, self.secret, lambda *a: calls.append(a), lambda: self.park_job)
+        finally:
+            COMPUTER.use_namespace('mum')
+        self.assertEqual(calls, [])
+
+    def test_cancel_preparation_refuses_a_snapshot_id(self):
+        with patch.object(sys, 'argv', ['rebase_computer.py', 'cancel-preparation', '--computer', self.computer, '--job', self.job,
+                                        '--snapshot-id', self.snapshot, '--check']), \
+                patch.object(COMPUTER, 'cancel') as cancel, self.assertRaisesRegex(ValueError, 'cancel-preparation takes only'):
+            COMPUTER.main()
+        cancel.assert_not_called()
+
+    def test_park_journal_never_collides_with_the_rebase_journal_of_the_same_computer(self):
+        own = self.source(self.job); calls = []
+        self.assertEqual(COMPUTER.park_journal_dir(), Path('/root/ezil-aws-mum/park-failed-releases'))
+        self.assertNotEqual(COMPUTER.park_journal_dir(), Path('/root/ezil-aws-mum/rebase-computers'))
+        COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, self.park_sender(calls), lambda: self.park_job)
+        # operate() refuses the park journal as its own (key sets are disjoint)...
+        with self.assertRaises(ValueError):
+            COMPUTER.operate('plan', self.computer, None, self.journal, False, '', lambda *a: calls.append(a))
+        # ...and park refuses the rebase journal.
+        rebase_journal = Path(self.temp.name) / 'rebase.json'
+        rebase_journal.write_text(json.dumps(dict(schemaVersion=1, computerId=self.computer, jobId=self.job, pending=None, lastResponse=None)))
+        with self.assertRaises(ValueError):
+            COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, rebase_journal, True, self.secret, lambda *a: calls.append(a))
+        self.assertEqual(len(calls), 1)
+
+    def test_park_apply_holds_one_exclusive_journal_lock_so_a_concurrent_run_never_mints_another_uuid(self):
+        import fcntl
+        own = self.source(self.job); calls = []; minted = []
+        def competing(sent, secret):
+            # A second --apply while the first is mid-request (its HTTP response not yet saved): refused before minting, journaling or sending.
+            def new_id():
+                minted.append(1); return '55555555-5555-4555-8555-555555555555'
+            with self.assertRaises(ValueError):
+                COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, lambda *a: calls.append(a), new_id)
+            self.assertEqual(minted, [])
+            self.assertEqual(manifest.read(self.journal)['request'], sent)
+            return self.park_reply(sent)
+        COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, competing, lambda: self.park_job)
+        self.assertEqual(calls, [])
+        self.assertEqual(manifest.read(self.journal)['request']['parkJobId'], self.park_job)
+        # The lock is released afterwards (the lock file stays): a later run reconciles with the journaled UUID.
+        lock = Path(str(self.journal) + '.lock'); self.assertTrue(lock.exists())
+        COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, self.park_sender(calls), lambda: self.fail('minted again'))
+        # An external holder blocks --apply entirely (nothing journaled or sent) but never a dry run.
+        other = Path(self.temp.name) / 'other.json'
+        fd = os.open(str(other) + '.lock', os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            sent_before = len(calls)
+            with self.assertRaises(ValueError):
+                COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, other, True, self.secret, lambda *a: calls.append(a), lambda: self.park_job)
+            self.assertFalse(other.exists()); self.assertEqual(len(calls), sent_before)
+            self.assertIsNone(COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, other, False, self.secret))
+        finally:
+            os.close(fd)
+
+    def test_park_crash_mid_request_releases_the_lock_and_the_rerun_reuses_the_same_uuid(self):
+        own = self.source(self.job); calls = []
+        def crash(sent, secret):
+            self.assertEqual(manifest.read(self.journal)['pending'], sent); calls.append(dict(sent)); raise KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):
+            COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, crash, lambda: self.park_job)
+        state = manifest.read(self.journal)
+        self.assertEqual(state['pending'], state['request']); self.assertEqual(state['request']['parkJobId'], self.park_job)
+        # The lock died with the process/exception: the rerun is not refused, mints nothing, and resends the identical request.
+        COMPUTER.park_failed_release(self.computer, self.job, own, self.snapshot, self.journal, True, self.secret, self.park_sender(calls), lambda: self.fail('minted again'))
+        self.assertEqual(calls, [state['request'], state['request']]); self.assertIsNone(manifest.read(self.journal)['pending'])
+
+    def test_park_cli_is_staging_only_strict_and_applies_through_the_park_validator(self):
+        own = self.source(self.job)
+        base = ['rebase_computer.py', 'park-failed-release', '--computer', self.computer, '--job', self.job, '--source-execution-arn', own,
+                '--snapshot-id', self.snapshot, '--journal', str(self.journal)]
+        for extra in (['--origin', 'https://os.ezil.work'], ['--source-retirement-execution-arn', own]):
+            with patch.object(sys, 'argv', base + extra), self.assertRaises(ValueError):
+                COMPUTER.main()
+        with patch.object(sys, 'argv', [a for a in base if a not in ('--snapshot-id', self.snapshot)]), self.assertRaises(ValueError):
+            COMPUTER.main()
+        for other in ('plan', 'reconcile-release', 'reconcile-replacement'):  # a snapshot id belongs to the park only
+            with patch.object(sys, 'argv', ['rebase_computer.py', other, '--computer', self.computer, '--job', self.job, '--source-execution-arn', own,
+                                            '--snapshot-id', self.snapshot]), self.assertRaises(ValueError):
+                COMPUTER.main()
+        with patch.object(sys, 'argv', base + ['--apply']), patch.dict(os.environ, {'EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET': self.secret}), \
+                patch.object(COMPUTER, 'send_reconcile', side_effect=lambda sent, secret, validate: validate(self.park_reply(sent), sent)) as send:
+            COMPUTER.main()
+        sent = send.call_args.args[0]
+        self.assertEqual(send.call_args.args[1], self.secret); self.assertIs(send.call_args.args[2], COMPUTER.park_response)
+        self.assertEqual(sent, manifest.read(self.journal)['request']); self.assertEqual(sent['operation'], 'park-failed-release')
+        self.assertTrue(COMPUTER.wire.matches(COMPUTER.UUID, sent['parkJobId'])); self.assertNotEqual(sent['parkJobId'], self.job)
 
     def test_staging_origin_refuses_btgq_and_curomaa_without_http(self):
         for origin in ('https://btgq.supabase.co', 'https://curomaa.example.com', 'https://os.ezil.work', COMPUTER.ORIGIN + '/extra'):
@@ -1019,6 +1244,191 @@ class LegacyLifecycleCapabilityTests(unittest.TestCase):
         before = copy.deepcopy(self.after)
         self.assertIsNone(self.cfn.retained_lifecycle_source(before, self.source))
         self.cfn.preserve_legacy_lifecycle(before, copy.deepcopy(before))
+
+
+class ObserverTransitionTests(unittest.TestCase):
+    """Incident 2026-11-17: the workflows change set revoked the deployed version's observer invoke grant before promotion."""
+    OLD = {'lifecycle': 'LifecycleObserverCurrentVersion3A1B23A0' + 'a' * 32, 'preparation': 'LifecyclePreparationObserverCurrentVersion54D5EE08' + 'b' * 32,
+           'recovery': 'RecoveryObserverCurrentVersion680AB0D7' + 'c' * 32}
+    NEW = {'lifecycle': 'LifecycleObserverCurrentVersion3A1B23A0' + 'd' * 32, 'preparation': 'LifecyclePreparationObserverCurrentVersion54D5EE08' + 'e' * 32,
+           'recovery': 'RecoveryObserverCurrentVersion680AB0D7' + 'f' * 32}
+    ROLES = {'lifecycle': 'LifecycleControllerRole1FB8E154', 'preparation': 'LifecyclePreparationRebasePreparationRole07C3BE8F', 'recovery': 'RecoveryRecoveryRole1B60FF4C'}
+
+    def setUp(self):
+        import rebase_cloudformation as cfn
+        self.cfn = cfn
+        cfn.use_namespace(TOOL.NAMESPACE)
+        self.settings = {'deployment': {'region': 'ap-south-1', 'amiId': 'ami-' + '1' * 17, 'preparationStateMachineVersionArn': 'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-rebase-preparation:37'}}
+        self.before = self.template(self.OLD)
+        self.after = self.template(self.NEW, transition=self.OLD)
+
+    def template(self, versions, transition=None):
+        resources = {cfn_observer: {'Type': 'AWS::Lambda::Function', 'Properties': {}} for cfn_observer in ('LifecyclePreparationObserver88DD5C3B', 'RecoveryObserver1D350FD8')}
+        resources['LifecycleObserver4909851D'] = {'Type': 'AWS::Lambda::Function', 'Properties': {'Environment': {'Variables': {'EZIL_LIFECYCLE_SETTINGS': json.dumps(self.settings)}}}}
+        for key, (policy, function, _prefix) in self.cfn.TRANSITION_OBSERVERS.items():
+            resources[versions[key]] = {'Type': 'AWS::Lambda::Version', 'DeletionPolicy': 'Retain', 'UpdateReplacePolicy': 'Retain', 'Properties': {'FunctionName': {'Ref': function}}}
+            resources[policy] = {'Type': 'AWS::IAM::Policy', 'Properties': {'PolicyName': policy, 'Roles': [{'Ref': self.ROLES[key]}], 'PolicyDocument': {'Statement': [
+                {'Effect': 'Allow', 'Action': 'lambda:InvokeFunction', 'Resource': {'Ref': versions[key]}},
+                {'Effect': 'Allow', 'Action': 'states:DescribeExecution', 'Resource': '*'}]}}}
+            if transition and transition[key] != versions[key]:
+                resources[transition[key]] = {'Type': 'AWS::Lambda::Version', 'DeletionPolicy': 'Retain', 'UpdateReplacePolicy': 'Retain', 'Properties': {'FunctionName': {'Ref': function}}}
+                resources[key.capitalize() + 'TransitionObserverPolicy' + '1' * 8] = {'Type': 'AWS::IAM::Policy', 'Properties': {'Roles': [{'Ref': self.ROLES[key]}],
+                    'PolicyDocument': {'Statement': [{'Effect': 'Allow', 'Action': 'lambda:InvokeFunction', 'Resource': {'Ref': transition[key]}}]}}}
+        return {'Resources': resources}
+
+    def test_derives_the_three_exact_previous_versions_from_the_before_template(self):
+        self.assertEqual(self.cfn.transition_observer_versions(self.before), self.OLD)
+        legacy = copy.deepcopy(self.before)
+        legacy['Resources']['LifecycleObserver4909851D']['Properties']['Environment']['Variables']['EZIL_LIFECYCLE_SETTINGS'] = json.dumps({'deployment': {'region': 'ap-south-1'}})
+        self.assertIsNone(self.cfn.transition_observer_versions(legacy))
+        self.assertIsNone(self.cfn.transition_observer_versions({'Resources': {}}))
+
+    def test_derivation_refuses_a_policy_that_names_anything_but_one_retained_version_of_its_function(self):
+        for change in ('wildcard', 'two', 'other_function', 'not_retained'):
+            before = copy.deepcopy(self.before)
+            policy = before['Resources'][self.cfn.LIFECYCLE_CONTROLLER_POLICY]['Properties']['PolicyDocument']['Statement']
+            if change == 'wildcard': policy[0]['Resource'] = 'arn:aws:lambda:ap-south-1:452630323510:function:*'
+            elif change == 'two': policy.append(dict(policy[0]))
+            elif change == 'other_function': before['Resources'][self.OLD['lifecycle']]['Properties'] = {'FunctionName': {'Ref': 'RecoveryObserver1D350FD8'}}
+            else: before['Resources'][self.OLD['lifecycle']]['DeletionPolicy'] = 'Delete'
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.cfn.transition_observer_versions(before)
+
+    def test_candidate_with_retained_previous_versions_and_exact_transition_grants_is_preserved(self):
+        self.cfn.preserve_transition_versions(self.before, self.after)
+        # Unchanged observer versions need (and may not carry) a transition grant.
+        same = self.template(self.OLD)
+        self.cfn.preserve_transition_versions(self.before, same)
+        with self.assertRaisesRegex(ValueError, 'unchanged'):
+            self.cfn.preserve_transition_versions(self.before, self.template(self.OLD, transition={**self.OLD, 'lifecycle': 'x'}) | {'Resources': {**same['Resources'],
+                'LifecycleTransitionObserverPolicy11111111': self.after['Resources']['LifecycleTransitionObserverPolicy11111111']}})
+
+    def test_candidate_that_drops_the_previous_version_or_its_exact_grant_is_refused(self):
+        cases = {}
+        a = copy.deepcopy(self.after); del a['Resources'][self.OLD['recovery']]; cases['dropped_version'] = (a, 'retained unchanged')
+        a = copy.deepcopy(self.after); del a['Resources']['RecoveryTransitionObserverPolicy11111111']; cases['missing_grant'] = (a, 'exactly one')
+        a = copy.deepcopy(self.after); a['Resources']['RecoveryTransitionObserverPolicy11111111']['Properties']['PolicyDocument']['Statement'][0]['Resource'] = 'arn:aws:lambda:ap-south-1:452630323510:function:*'; cases['wildcard'] = (a, 'exactly one')
+        a = copy.deepcopy(self.after); a['Resources']['RecoveryTransitionObserverPolicy11111111']['Properties']['Roles'] = [{'Ref': self.ROLES['lifecycle']}]; cases['other_role'] = (a, 'same role')
+        a = copy.deepcopy(self.after); a['Resources']['RecoveryTransitionObserverPolicy11111111']['Properties']['PolicyDocument']['Statement'].append({'Effect': 'Allow', 'Action': 'lambda:InvokeFunction', 'Resource': {'Ref': self.NEW['recovery']}}); cases['extra_statement'] = (a, 'same role')
+        a = copy.deepcopy(self.after); a['Resources'][self.OLD['recovery']]['Properties'] = {'FunctionName': {'Ref': 'LifecycleObserver4909851D'}}; cases['changed_version'] = (a, 'retained unchanged')
+        for name, (after, message) in cases.items():
+            with self.subTest(case=name), self.assertRaisesRegex(ValueError, message):
+                self.cfn.preserve_transition_versions(self.before, after)
+
+
+class HistoryContextTransitionTests(ObserverTransitionTests):
+    """Second cutover gap: exact prior history-key context rows must survive the workflows change set."""
+    def row(self, machine, versions):
+        return {'Effect': 'Allow', 'Action': 'kms:Decrypt', 'Resource': {'Fn::GetAtt': ['LifecycleHistoryKey897F7B53', 'Arn']},
+                'Condition': {'StringEquals': {'kms:ViaService': 'states.ap-south-1.amazonaws.com',
+                    'kms:EncryptionContext:aws:states:stateMachineArn': [f'arn:aws:states:ap-south-1:452630323510:stateMachine:{machine}'] +
+                        [f'arn:aws:states:ap-south-1:452630323510:stateMachine:{machine}:{v}' for v in versions]}}}
+
+    def setUp(self):
+        super().setUp()
+        self.settings['deployment'].update(stateMachineVersionArn='arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:45',
+                                           recoveryStateMachineVersionArn='arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-recovery:37')
+        self.before = self.template(self.OLD); self.after = self.template(self.NEW, transition=self.OLD)
+        for t, n in ((self.before, 45), (self.after, 46)):
+            t['Resources'][self.cfn.LIFECYCLE_OBSERVER_POLICY] = {'Type': 'AWS::IAM::Policy', 'Properties': {'Roles': [{'Ref': 'LifecycleObserverServiceRole'}],
+                'PolicyDocument': {'Statement': [self.row('ezil-mum-lifecycle', [n])]}}}
+            t['Resources']['AppCallerRoleDefaultPolicy61BE57D2'] = {'Type': 'AWS::IAM::Policy', 'Properties': {'Roles': [{'Ref': 'AppCallerRole'}],
+                'PolicyDocument': {'Statement': [self.row('ezil-mum-lifecycle', [n]), {'Effect': 'Allow', 'Action': 'states:DescribeExecution', 'Resource': '*'}]}}}
+        # The candidate keeps the exact prior rows beside the current ones.
+        for name in (self.cfn.LIFECYCLE_OBSERVER_POLICY, 'AppCallerRoleDefaultPolicy61BE57D2'):
+            self.after['Resources'][name]['Properties']['PolicyDocument']['Statement'].append(self.row('ezil-mum-lifecycle', [45]))
+
+    def test_derives_the_three_deployed_version_arns_from_the_before_template(self):
+        self.assertEqual(self.cfn.transition_state_machine_versions(self.before), {
+            'lifecycle': 'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:45',
+            'preparation': 'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-rebase-preparation:37',
+            'recovery': 'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-recovery:37'})
+        self.assertIsNone(self.cfn.transition_state_machine_versions({'Resources': {}}))
+
+    def test_candidate_keeping_every_exact_prior_row_is_preserved(self):
+        self.cfn.preserve_history_contexts(self.before, self.after)
+
+    def test_candidate_dropping_or_rewriting_a_prior_row_is_refused(self):
+        for name in (self.cfn.LIFECYCLE_OBSERVER_POLICY, 'AppCallerRoleDefaultPolicy61BE57D2'):
+            after = copy.deepcopy(self.after)
+            after['Resources'][name]['Properties']['PolicyDocument']['Statement'] = [s for s in after['Resources'][name]['Properties']['PolicyDocument']['Statement']
+                                                                               if ':45' not in json.dumps(s)]
+            with self.subTest(policy=name, case='dropped'), self.assertRaisesRegex(ValueError, 'exact prior history-key context row'):
+                self.cfn.preserve_history_contexts(self.before, after)
+            after = copy.deepcopy(self.after)
+            after['Resources'][name]['Properties']['PolicyDocument']['Statement'] = [self.row('ezil-mum-lifecycle', [46, 45])]
+            with self.subTest(policy=name, case='merged'), self.assertRaisesRegex(ValueError, 'exact prior history-key context row'):
+                self.cfn.preserve_history_contexts(self.before, after)
+        after = copy.deepcopy(self.after); del after['Resources']['AppCallerRoleDefaultPolicy61BE57D2']
+        with self.assertRaisesRegex(ValueError, 'must remain'):
+            self.cfn.preserve_history_contexts(self.before, after)
+
+    def statements(self, template, name):
+        return template['Resources'][name]['Properties']['PolicyDocument']['Statement']
+
+    def rollover(self, name):
+        """Consecutive rollover: the R153-shaped before (current :46 beside the aged :45 transition row and a stable
+        unqualified scope) and an R154 candidate (:47 beside the :46 transition row; the :45 row aged out)."""
+        before = copy.deepcopy(self.after)
+        before['Resources'][self.cfn.LIFECYCLE_OBSERVER]['Properties']['Environment']['Variables']['EZIL_LIFECYCLE_SETTINGS'] = json.dumps({
+            **self.settings, 'deployment': {**self.settings['deployment'],
+                                            'stateMachineVersionArn': 'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:46'}})
+        stable = self.row('ezil-mum-lifecycle', [])
+        self.statements(before, name).append(stable)
+        after = copy.deepcopy(before)
+        aged = self.row('ezil-mum-lifecycle', [45])
+        self.assertIn(aged, self.statements(after, name))
+        self.statements(after, name)[:] = [s for s in self.statements(after, name) if s != aged]
+        self.statements(after, name).insert(0, self.row('ezil-mum-lifecycle', [47]))
+        self.assertEqual(self.cfn.transition_state_machine_versions(before)['lifecycle'],
+                         'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-mum-lifecycle:46')
+        return before, after, stable
+
+    def test_consecutive_rollover_may_drop_the_aged_transition_row_but_not_the_current_or_unqualified_rows(self):
+        for name in (self.cfn.LIFECYCLE_OBSERVER_POLICY, 'AppCallerRoleDefaultPolicy61BE57D2'):
+            before, after, stable = self.rollover(name)
+            with self.subTest(policy=name, case='aged row dropped'):
+                self.assertNotIn(self.row('ezil-mum-lifecycle', [45]), self.statements(after, name))
+                self.cfn.preserve_history_contexts(before, after)
+            dropped = copy.deepcopy(after)
+            self.statements(dropped, name)[:] = [s for s in self.statements(dropped, name) if s != self.row('ezil-mum-lifecycle', [46])]
+            with self.subTest(policy=name, case='current row dropped'), self.assertRaisesRegex(ValueError, 'exact prior history-key context row'):
+                self.cfn.preserve_history_contexts(before, dropped)
+            dropped = copy.deepcopy(after)
+            self.statements(dropped, name)[:] = [s for s in self.statements(dropped, name) if s != stable]
+            with self.subTest(policy=name, case='unqualified scope dropped'), self.assertRaisesRegex(ValueError, 'exact prior history-key context row'):
+                self.cfn.preserve_history_contexts(before, dropped)
+
+    def test_non_literal_context_scope_is_refused(self):
+        before = copy.deepcopy(self.before)
+        self.statements(before, self.cfn.LIFECYCLE_OBSERVER_POLICY)[0]['Condition']['StringEquals'][self.cfn.HISTORY_CONTEXT] = [{'Ref': 'Machine'}]
+        with self.assertRaisesRegex(ValueError, 'literal state-machine ARNs'):
+            self.cfn.preserve_history_contexts(before, self.after)
+
+
+class AddedLambdaInvokeGuardTests(DependentVersionReviewTests):
+    """validate_templates: an ADDED Lambda invoke Allow must name exactly one immutable version of the same template."""
+    def build(self, resource, with_version=True):
+        c, b, a, r = self.docs({})
+        if with_version:
+            a['Resources']['RecoveryObserverCurrentVersion680AB0D7' + '9' * 32] = {'Type': 'AWS::Lambda::Version', 'DeletionPolicy': 'Retain', 'UpdateReplacePolicy': 'Retain',
+                                                                                  'Properties': {'FunctionName': {'Ref': 'RecoveryObserver1D350FD8'}}}
+            r['changes']['RecoveryObserverCurrentVersion680AB0D7' + '9' * 32] = {'action': 'Add', 'properties': [], 'attributes': []}
+        a['Resources']['RecoveryRolePolicy1'] = {'Type': 'AWS::IAM::Policy', 'Properties': {'PolicyDocument': {'Statement': [
+            {'Effect': 'Allow', 'Action': 'lambda:InvokeFunction', 'Resource': resource}]}}}
+        r['changes']['RecoveryRolePolicy1'] = {'action': 'Add', 'properties': [], 'attributes': []}
+        return c, b, a, r
+
+    def test_exact_version_reference_is_accepted(self):
+        c, b, a, r = self.build({'Ref': 'RecoveryObserverCurrentVersion680AB0D7' + '9' * 32})
+        self.assertIn('RecoveryRolePolicy1', c.validate_templates('workflows', b, a, r))
+
+    def test_function_wildcard_arn_list_or_unknown_reference_is_refused(self):
+        for resource in ('arn:aws:lambda:ap-south-1:452630323510:function:*', '*', [{'Ref': 'RecoveryObserverCurrentVersion680AB0D7' + '9' * 32}],
+                         {'Ref': 'RecoveryObserver1D350FD8'}, {'Fn::GetAtt': ['RecoveryObserver1D350FD8', 'Arn']}):
+            c, b, a, r = self.build(resource)
+            with self.subTest(resource=str(resource)[:40]), self.assertRaisesRegex(ValueError, 'exactly one immutable version'):
+                c.validate_templates('workflows', b, a, r)
 
 
 class CloudFormationDetailTests(unittest.TestCase):

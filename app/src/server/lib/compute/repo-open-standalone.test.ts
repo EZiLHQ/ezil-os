@@ -1,0 +1,128 @@
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('server-only', () => ({}));
+
+import { requestRepoOpen } from './repo-open';
+import type { ControlTarget } from './aws-control-auth';
+import type { PrivateGitPacket } from '@/server/git/private-packet';
+
+const CHECKOUT = '44444444-4444-4444-8444-444444444444';
+const URL = 'https://github.ezil.work/default/os-code-url-20261110-a.git';
+const TOKEN = 'opaque-gateway-credential';
+const packet: PrivateGitPacket = { version: 2, repository: { id: 'fg1wtcrexaf7acl0', canonicalURL: URL, ref: 'refs/heads/main' },
+    identity: { issuer: 'https://id.ezil.work/', subject: 'auth0|fixture' },
+    git: { username: 'ezil', token: TOKEN, expiresAt: '2026-11-10T17:10:00.000Z', scope: 'read' } };
+const computer = { userId: '11111111-1111-4111-8111-111111111111', computerId: '22222222-2222-4222-8222-222222222222' };
+const cloudflare: ControlTarget = { sandboxName: 'guac-a-b', auth: { kind: 'v1' } };
+const aws: ControlTarget = { sandboxName: 'guac-a-b', auth: { kind: 'v2', claims: { sandboxId: 'guac-a-b', computerId: computer.computerId,
+    userId: computer.userId, provider: 'aws-ec2', store: '', generation: 2, leaseEpoch: 4 } } };
+const request = { repositoryId: CHECKOUT, canonicalURL: URL, ref: packet.repository.ref,
+    git: { token: TOKEN, expiresAt: packet.git.expiresAt, scope: packet.git.scope }, privatePacket: packet, timeoutMs: 60_000 };
+
+afterEach(() => vi.restoreAllMocks());
+
+describe('standalone OS to Worker transport', () => {
+    it('signs and sends only the v2 packet and checkout UUID, and accepts only its wrapper folder', async () => {
+        const fetcher = vi.fn(async (_url: URL, init: RequestInit) => {
+            expect(JSON.parse(String(init.body))).toEqual({ repositoryId: CHECKOUT, privatePacket: packet, timeoutMs: 60_000 });
+            expect(String(_url)).not.toContain(TOKEN);
+            expect(String(_url)).toContain(`/sandbox/${cloudflare.sandboxName}/repo-open`);
+            expect(Object.keys(Object.fromEntries(new Headers(init.headers))).some(key => key.toLowerCase() === 'x-ezil-auth')).toBe(true);
+            return Response.json({ ok: true, folder: `/workspace/projects/${CHECKOUT}` });
+        });
+        expect(await requestRepoOpen('https://worker.example', 'secret', cloudflare, computer, request,
+            { fetch: fetcher as unknown as typeof fetch })).toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}` });
+        expect(fetcher).toHaveBeenCalledOnce();
+    });
+    it('does not send a mismatched packet or an AWS target', async () => {
+        const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const fetcher = vi.fn(async () => Response.json({ ok: true, folder: `/workspace/projects/${CHECKOUT}` }));
+        const deps = { fetch: fetcher as unknown as typeof fetch };
+        expect(await requestRepoOpen('https://worker.example', 'secret', cloudflare, computer,
+            { ...request, canonicalURL: 'https://github.ezil.work/default/other.git' }, deps)).toMatchObject({ ok: false, errorCode: 'repo_open_failed' });
+        expect(await requestRepoOpen('https://worker.example', 'secret', aws, computer, request, deps)).toEqual({ ok: false, errorCode: 'repo_open_unsupported_provider' });
+        expect(fetcher).not.toHaveBeenCalled();
+        expect(JSON.stringify(warn.mock.calls)).not.toContain(TOKEN);
+    });
+    it('sends verified commit attribution beside the unchanged gateway packet', async () => {
+        const gitAuthor = { name: 'contact', email: 'contact@ezil.work' };
+        const fetcher = vi.fn(async (_url: URL, init: RequestInit) => {
+            expect(JSON.parse(String(init.body))).toEqual({ repositoryId: CHECKOUT, privatePacket: packet, gitAuthor, timeoutMs: 60_000 });
+            return Response.json({ ok: true, folder: `/workspace/projects/${CHECKOUT}` });
+        });
+        expect((await requestRepoOpen('https://worker.example', 'secret', cloudflare, computer, { ...request, gitAuthor },
+            { fetch: fetcher as unknown as typeof fetch })).ok).toBe(true);
+    });
+    it('refuses unsafe attribution before sending a signed request', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const fetcher = vi.fn();
+        expect((await requestRepoOpen('https://worker.example', 'secret', cloudflare, computer,
+            { ...request, gitAuthor: { name: 'Injected\nName', email: 'contact@ezil.work' } }, { fetch: fetcher })).ok).toBe(false);
+        expect(fetcher).not.toHaveBeenCalled();
+    });
+    it('signs a refresh-only credential renewal without changing the gateway packet', async () => {
+        const fetcher = vi.fn(async (_url: URL, init: RequestInit) => {
+            expect(JSON.parse(String(init.body))).toEqual({ repositoryId: CHECKOUT, privatePacket: packet, refreshOnly: true, timeoutMs: 60_000 });
+            return Response.json({ ok: true, folder: `/workspace/projects/${CHECKOUT}` });
+        });
+        expect((await requestRepoOpen('https://worker.example', 'secret', cloudflare, computer, { ...request, refreshOnly: true },
+            { fetch: fetcher as unknown as typeof fetch })).ok).toBe(true);
+    });
+});
+
+describe('AWS standalone OS transport capability', () => {
+    const sandboxName = 'guac-1111111111114111-2222222222224222';
+    const target: ControlTarget = { sandboxName, auth: { kind: 'v2', claims: {
+        sandboxId: sandboxName, computerId: computer.computerId, userId: computer.userId,
+        provider: 'aws-ec2', store: '', generation: 2, leaseEpoch: 4,
+    } } };
+    const now = Date.parse('2026-11-11T12:00:00Z');
+    const currentRequest = () => {
+        const privatePacket = { ...packet, git: { ...packet.git, expiresAt: new Date(now + 240_000).toISOString() } };
+        return { ...request, privatePacket, git: { ...request.git, expiresAt: privatePacket.git.expiresAt } };
+    };
+    it('sends the exact signed packet to AWS only when enabled and revalidates before and after', async () => {
+        const revalidateTarget = vi.fn(async () => target);
+        const fetcher = vi.fn(async (_url: URL, init: RequestInit) => {
+            expect(JSON.parse(String(init.body))).toEqual({ repositoryId: CHECKOUT, privatePacket: currentRequest().privatePacket, timeoutMs: 60_000 });
+            expect(new Headers(init.headers).get('x-ezil-auth')).toMatch(/^v2\./);
+            return Response.json({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'cloned' });
+        });
+        expect(await requestRepoOpen('https://worker.example', 'secret', target, computer, currentRequest(),
+            { fetch: fetcher as unknown as typeof fetch, now: () => now, awsStandaloneEnabled: true, revalidateTarget }))
+            .toEqual({ ok: true, folder: `/workspace/projects/${CHECKOUT}` });
+        expect(revalidateTarget).toHaveBeenCalledTimes(2);
+        expect(fetcher).toHaveBeenCalledOnce();
+    });
+    it('refuses cancellation that arrives during final placement revalidation', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const abort = new AbortController();
+        let checks = 0;
+        const result = await requestRepoOpen('https://worker.example', 'secret', target, computer, currentRequest(), {
+            now: () => now, awsStandaloneEnabled: true, signal: abort.signal,
+            revalidateTarget: async () => { if (++checks === 2) abort.abort(); return target; },
+            fetch: (async () => Response.json({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'cloned' })) as typeof fetch,
+        });
+        expect(result.ok).toBe(false);
+    });
+    it('rejects missing capability, missing revalidation, moved placement, and nonclosed results', async () => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const fetcher = vi.fn(async () => Response.json({ ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'cloned' }));
+        const deps = { fetch: fetcher as unknown as typeof fetch, now: () => now, awsStandaloneEnabled: true };
+        expect((await requestRepoOpen('https://worker.example', 'secret', target, computer, currentRequest(),
+            { ...deps, awsStandaloneEnabled: false })).ok).toBe(false);
+        expect((await requestRepoOpen('https://worker.example', 'secret', target, computer, currentRequest(), deps)).ok).toBe(false);
+        expect(fetcher).not.toHaveBeenCalled();
+        let count = 0;
+        const moved = { ...target, auth: { kind: 'v2' as const, claims: { ...(target.auth.kind === 'v2' ? target.auth.claims : {}), leaseEpoch: 5 } } } as ControlTarget;
+        expect((await requestRepoOpen('https://worker.example', 'secret', target, computer, currentRequest(), {
+            ...deps, revalidateTarget: async () => ++count === 1 ? target : moved,
+        })).ok).toBe(false);
+        for (const result of [{ ok: true, folder: `/workspace/projects/${CHECKOUT}` },
+            { ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'created' },
+            { ok: true, folder: `/workspace/projects/${CHECKOUT}`, status: 'cloned', token: TOKEN }]) {
+            expect((await requestRepoOpen('https://worker.example', 'secret', target, computer, currentRequest(),
+                { ...deps, revalidateTarget: async () => target, fetch: (async () => Response.json(result)) as typeof fetch })).ok).toBe(false);
+        }
+    });
+});

@@ -12,11 +12,12 @@ export const NOTICE_LINGER_MS = 10_000;
 const bytes = (value: number) => value.toLocaleString('en-US');
 
 export function compactionText(model: string, info: CompactionInfo): string {
-    const what = [info.folded ? `${info.folded} earlier messages summarized` : '', info.shortened ? `${info.shortened} long outputs or replies shortened` : '']
+    const what = [info.folded ? `${info.folded} earlier messages folded into a local note` : '', info.shortened ? `${info.shortened} long outputs or replies shortened` : '']
         .filter(Boolean).join(', ');
     const why = info.cause === 'remote' ? ' after EZiL AI refused its size' : '';
-    return `EZiL compacted this conversation to fit ${model}${why}${what ? `: ${what}` : ''} (${bytes(info.toBytes)} bytes sent, `
-        + `${bytes(info.fromBytes)} before, limit ${bytes(info.limitBytes)}). The full conversation is still saved in this chat, and a model with a larger input limit gets more of it.`;
+    return `EZiL shortened older content locally for ${model} to fit the request size limit${why}${what ? `: ${what}` : ''} (${bytes(info.toBytes)} bytes sent, `
+        + `${bytes(info.fromBytes)} before, limit ${bytes(info.limitBytes)}). The full conversation is still saved in this chat, and a route with a larger request size limit can receive more of it. No summary model request was made. `
+        + 'This request size limit is separate from the model context budget, which may still have space.';
 }
 
 export class CompactionNotice implements vscode.Disposable {
@@ -33,7 +34,7 @@ export class CompactionNotice implements vscode.Disposable {
         this.log(`[compact] ${model}: ${JSON.stringify(info)}`);
         void Promise.resolve(vscode.commands.executeCommand('setContext', COMPACTING_CONTEXT, true)).catch(() => {});
         // A view that is not open (or not registered) refuses view progress: the title-bar icon still shows.
-        void Promise.resolve(vscode.window.withProgress({ location: { viewId: CHAT_VIEW }, title: `Compacting the conversation for ${model}` }, () => finished)).catch(() => {});
+        void Promise.resolve(vscode.window.withProgress({ location: { viewId: CHAT_VIEW }, title: `Shortening older content locally for ${model}` }, () => finished)).catch(() => {});
         void finished.then(() => {
             if (generation !== this.generation) return;
             this.timer = setTimeout(() => {

@@ -32,7 +32,7 @@ test('a compacted turn shows the title-bar item and view progress on the chat vi
     notice.show('Kimi K3', info, turn.promise);
     await tick();
     expect(context).toEqual([true]);
-    expect(progress).toEqual([{ location: { viewId: CHAT_VIEW }, title: 'Compacting the conversation for Kimi K3' }]);
+    expect(progress).toEqual([{ location: { viewId: CHAT_VIEW }, title: 'Shortening older content locally for Kimi K3' }]);
     turn.done(); await tick(20);
     expect(context).toEqual([true, false]);
     // Sizes and counts only.
@@ -68,8 +68,9 @@ test('the item explains what was compacted and that the conversation is kept, an
     notice.show('Kimi K3', info, Promise.resolve());
     await notice.explain();
     expect(shown[1]).toBe(compactionText('Kimi K3', info));
-    expect(shown[1]).toBe('EZiL compacted this conversation to fit Kimi K3: 12 earlier messages summarized, 4 long outputs or replies shortened '
-        + '(93,594 bytes sent, 170,762 before, limit 130,016). The full conversation is still saved in this chat, and a model with a larger input limit gets more of it.');
+    expect(shown[1]).toBe('EZiL shortened older content locally for Kimi K3 to fit the request size limit: 12 earlier messages folded into a local note, 4 long outputs or replies shortened '
+        + '(93,594 bytes sent, 170,762 before, limit 130,016). The full conversation is still saved in this chat, and a route with a larger request size limit can receive more of it. No summary model request was made. '
+        + 'This request size limit is separate from the model context budget, which may still have space.');
     expect(ran).toEqual(['ezil-models.showStatus', 'ezil-models.showStatus']);
     expect(compactionText('Kimi K3', { ...info, cause: 'remote', folded: 0 })).toContain('after EZiL AI refused its size: 4 long outputs');
 });

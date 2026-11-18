@@ -14,6 +14,7 @@ import { buildRebasePreparation, validateRebaseSnapshotReceipt } from './aws-reb
 import { parseRebaseJson, RebaseUuid } from './aws-rebase-json';
 import { rebaseReleaseCandidates, resolveRebaseReleases, sourceDeploymentFor } from './aws-rebase-release';
 import { readReleasedPoolHostProof, readRetiredSourceProof } from './aws-historical-source';
+import { readReleasedDedicatedHostProof } from './aws-dedicated-source';
 import { createImageJobStore, IMAGE_JOB_FAILURE_CODES, isTerminalImageJob, newReservedImageJob, type ImageJob } from './aws-rebase-store';
 import { assertImageExecution, preparationFor, launchFor, verifyImageSnapshot, ImageLaunchReceiptSchema, type RebaseSnapshotDescriber, type Execution } from './aws-rebase-evidence';
 import { isDefiniteAwsRefusal, isExecutionAbsent, toAwsClientError } from './aws-errors';
@@ -107,16 +108,36 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
             if (fresh.row || !isDeepStrictEqual(p, fresh.placement)) throw new ImageJobConflictError();
             return proof;
         };
+        /** Dedicated source, chosen ONLY for a shared registry lower (a release is no AMI evidence there; a unique lower stays
+         * R2 whatever archive exists). A listed host keeps the existing AMI observation. Otherwise the archived job whose own
+         * launch/rebind enrolled this exact instance must be strict (any partial, duplicate or nonterminal archive fails closed
+         * in the store) and its launch AMI and retirement proven; never R2 after a failure. No archive: MAIN's shared refusal. */
+        const dedicatedSource = async (d: LifecycleDeployment) => {
+            if (!p.instanceId || await observe()) return null;
+            const found = await deps.store.releasedDedicatedHost(p.computerId);
+            if (!isDeepStrictEqual(p, found.placement)) throw new ImageJobConflictError();
+            if (!found.row) return null;
+            const proof = await readReleasedDedicatedHostProof(deps.executions, p, d, found.row, input.sourceRetirementExecutionArn, deps.now());
+            if (!proof) throw new Error('source_identity_mismatch');
+            // Observations are outside the lock: still the same placement and archive, and still no claim row.
+            if (!isDeepStrictEqual(found, await deps.store.releasedDedicatedHost(p.computerId))
+                || (await deps.store.releasedPoolHost(p.computerId)).row) throw new ImageJobConflictError();
+            return proof;
+        };
         const resolve = async () => {
             const map = parseRebaseJson(deps.env[LIFECYCLE_DEPLOYMENTS_ENV] ?? '{}', 65536) as Record<string, unknown>;
             const entry = map[p.region!];
             let candidates: ReturnType<typeof rebaseReleaseCandidates>;
             try { candidates = rebaseReleaseCandidates(entry, p.lowerImageDigest); }
             catch (error) { throw new Error(failure(error) ?? 'release_mismatch'); }
+            // Proof kind from trusted inputs only, before any kind-specific proof: a pool claim row, else the registry's source
+            // count for the placement's recorded lower (unique => R2 only; shared => dedicated only). The request hint never selects it.
+            const shared = candidates.sources.length > 1;
             const released = await releasedSource(candidates.deployment);
-            const retired = released ? null : await retiredSource(candidates.deployment, candidates.sources.length > 1);
+            const dedicated = released || !shared ? null : await dedicatedSource(candidates.deployment);
+            const retired = released || shared ? null : await retiredSource(candidates.deployment, false);
             let imageId: string | undefined;
-            if (!released && !retired && candidates.sources.length > 1) {
+            if (!released && !dedicated && !retired && shared) {
                 if (!p.instanceId) throw new Error('source_identity_mismatch');
                 const host = await observe();
                 // Observation is outside the lock. Never use it for a placement that changed meanwhile.
@@ -130,7 +151,7 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
                     throw new Error('source_identity_mismatch');
                 imageId = host.imageId;
             }
-            try { return { ...resolveRebaseReleases(entry, p.lowerImageDigest, imageId, released?.provisioned), released, retired }; }
+            try { return { ...resolveRebaseReleases(entry, p.lowerImageDigest, imageId, (released ?? dedicated)?.provisioned), released, dedicated, retired }; }
             catch (error) { throw new Error(failure(error) ?? 'release_mismatch'); }
         };
         if (input.operation === 'plan') {
@@ -152,7 +173,9 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
                 toDigest: r.target.lowerImageDigest, volumeGiB: volume.sizeGiB, sourceDeployment: sourceDeploymentFor(r.deployment, r.source),
                 deployment: r.deployment, createdAt: deps.now().toISOString(), ...(r.released ? { releasedPoolHost: { poolHostId: r.released.poolHostId,
                     lifecycleDigest: r.released.lifecycleDigest, releaseExecutionArn: r.released.releaseExecutionArn } }
-                    : r.retired ? { retiredSource: { releaseExecutionArn: r.retired.releaseExecutionArn } } : {}) });
+                    : r.retired ? { retiredSource: { releaseExecutionArn: r.retired.releaseExecutionArn } }
+                    : r.dedicated ? { releasedDedicatedHost: { imageJobId: r.dedicated.imageJobId, provisionDigest: r.dedicated.provisionDigest,
+                        provisionExecutionArn: r.dedicated.provisionExecutionArn, releaseExecutionArn: r.dedicated.releaseExecutionArn } } : {}) });
             j = await deps.store.reserve(newReservedImageJob({ preparation: prep, ownerUserId: p.ownerUserId,
                 sourceRelease: r.source, targetRelease: r.target }), r.repository);
         }

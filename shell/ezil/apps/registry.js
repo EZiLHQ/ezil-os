@@ -796,12 +796,13 @@ async function launchOnce (id, ctx = {}) {
         // image from the dock tile the user just clicked. `trace` rides along
         // too: an `owns_boot_trace` app reaches back into it (`.step()` for
         // its own mint/confirm/display checkpoints, `.end()` at its own
-        // terminal state) without this file importing anything of theirs.
+        // terminal state) without this file importing anything of theirs. Its canonical ID
+        // also binds each window's feedback to this trace after another app opens.
         // `historyMode` describes THIS launch only. Apps keep their ctx and
         // spread it into launches of their own (Settings opening a computer,
         // the spinner's way to Settings), which are clicks and must push.
         const { historyMode: _historyMode, ...openCtx } = ctx;
-        const el_window = await app.open({ ...openCtx, icon: app.icon, appName: app.name, trace: { step: trace.step, end: finishTrace } });
+        const el_window = await app.open({ ...openCtx, icon: app.icon, appName: app.name, trace: { id: trace.id, step: trace.step, end: finishTrace } });
         trace.step('open_resolved');
 
         // An `owns_boot_trace` app that actually kicked off its async boot

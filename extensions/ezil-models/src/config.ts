@@ -60,7 +60,9 @@ export type ModelConfig = {
     version?: string;
     tooltip?: string;
     detail?: string;
+    /** Model admission allowance in tokens; Gateway uses a conservative serialized-input bound. */
     maxInputTokens?: number;
+    contextWindowTokens?: number;
     maxOutputTokens?: number;
     capabilities?: { toolCalling?: boolean | number; imageInput?: boolean };
     thinking?: ThinkingConfig;
@@ -93,11 +95,15 @@ export type ResolvedModel = {
     gatewayProtocol?: GatewayProtocol;
     /** Set only from a Gateway catalog row advertising capabilities.prompt_cache; config never sets it. */
     gatewayPromptCache?: true;
+    /** Verified endpoint byte cap from ezil.gateway.transport.v1, never inferred from token limits. */
+    gatewayMaxRequestBytes?: number;
     family: string;
     version: string;
     tooltip?: string;
     detail?: string;
     maxInputTokens: number;
+    /** Optional local combined-capacity cap in tokens, including output; not verified widget capacity. */
+    contextWindowTokens?: number;
     maxOutputTokens: number;
     capabilities: { toolCalling: boolean | number; imageInput: boolean };
     thinking?: ThinkingConfig;
@@ -111,6 +117,8 @@ export type ResolvedModel = {
     toolReserve?: number;
     /** Listed for an upgrade only: the account's OS plan does not include it (gateway.ts `withPlanLocks`). Never sent. */
     locked?: boolean;
+    /** With `locked`: the plan is unknown, not limited (gateway.ts `withUnconfirmedPlan`). Never an upgrade, never sent. */
+    unconfirmed?: boolean;
 };
 
 export type ResolvedConfig = {
@@ -387,6 +395,7 @@ export function resolveModelsConfig(raw: unknown, options: LoadOptions = {}): Re
                 version: typeof merged.version === 'string' ? merged.version : '1',
                 tooltip: typeof merged.tooltip === 'string' ? merged.tooltip : undefined,
                 detail: typeof merged.detail === 'string' ? merged.detail : undefined,
+                contextWindowTokens: merged.contextWindowTokens === undefined ? undefined : positiveInt(merged.contextWindowTokens, 'contextWindowTokens', 131_072),
                 maxInputTokens: positiveInt(merged.maxInputTokens, 'maxInputTokens', provider.type === 'ezil-gateway' ? 131_072 : 200_000),
                 maxOutputTokens: provider.type === 'ezil-gateway' ? gatewayOutput() : positiveInt(merged.maxOutputTokens, 'maxOutputTokens', isAnthropic(provider.type) ? 64_000 : 32_768),
                 capabilities: { toolCalling: toolCalling as boolean | number, imageInput: provider.type === 'ezil-gateway' ? false : imageInput as boolean },

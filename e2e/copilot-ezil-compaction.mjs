@@ -5,7 +5,7 @@
  * - every turn is answered in the same chat, with no refusal, stack or "start a new chat";
  * - every chat request is within the byte bound; the ones over it as Copilot built them were compacted (the
  *   extension's metadata line), mark what they left out, and keep every user prompt Copilot sent;
- * - the chat view's title bar shows "Conversation compacted to fit the model";
+ * - the chat view's title bar shows "Older content shortened to fit request size";
  * - the saved conversation in <workspace>/.ezil/chat still holds the first answer whole.
  * Exit 2 means not run.
  */
@@ -31,7 +31,7 @@ const KIMI = 'us.moonshotai.kimi-k3';
 const KIMI_NAME = 'Kimi K3';
 const BOUND = 131072 - 1056;
 const CODEWORD = 'AMBER-7';
-const COMPACTED = 'Conversation compacted to fit the model';
+const COMPACTED = 'Older content shortened to fit request size';
 if (!CONTAINER) { console.error('SKIP: set EZIL_E2E_CONTAINER'); process.exit(2); }
 mkdirSync(OUT, { recursive: true });
 
@@ -107,7 +107,7 @@ try {
     if (!answered || refused) break;
   }
   await page.screenshot({ path: join(OUT, 'compaction-final.png') });
-  check('the chat view title bar showed "Conversation compacted to fit the model"', compactedSeen);
+  check('the chat view title bar showed "Older content shortened to fit request size"', compactedSeen);
 
   // Chat turns only (Agent mode, so they carry tools): Copilot's title and progress utility calls quote the prompt but go
   // to Qwen without tools by design (provider.ts isUtilityRequest).

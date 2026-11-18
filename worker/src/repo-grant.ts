@@ -136,6 +136,8 @@ export function parseRepoGrantRequest(
  * open itself is unaffected; the app's refresh installs the grant later).
  */
 export function grantRequestFromOpen(request: RepoOpenRequest, now: number = Date.now()): RepoGrantRequest | null {
+  // The standalone CLI owns its gateway credential. Never install the legacy computer grant helper for it.
+  if (request.privatePacket) return null;
   if (request.auth !== 'basic' || ARTIFACTS_REPOSITORY_URL.test(request.canonicalURL)) return null;
   if (request.scope !== 'read' && request.scope !== 'write') return null;
   if (!EGG.test(request.token)) return null;

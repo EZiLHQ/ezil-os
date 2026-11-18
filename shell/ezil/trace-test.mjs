@@ -133,5 +133,17 @@ push('no trace is ambient before beginTrace() is called', ambientCorrelationId()
         && snapshot.phases[0].code === 'display');
 }
 
+{
+    const code = beginTrace('code'); code.step('project_refused'); code.end('error');
+    const settings = beginTrace('settings'); settings.step('open_resolved'); settings.end('ok');
+    const failed = feedbackTraceSnapshot(code.id);
+    push('Code feedback keeps its failed window trace after Settings succeeds', failed.id === code.id
+        && failed.app === 'code' && failed.phases[0].code === 'project_refused'
+        && feedbackTraceSnapshot().app === 'settings');
+    push('unknown explicit window trace never falls back to an unrelated app', feedbackTraceSnapshot('missing') === null);
+    for (let i = 0; i < 32; i++) beginTrace('settings').end('ok');
+    push('retained window traces are bounded', feedbackTraceSnapshot(code.id) === null);
+}
+
 console.log(`\n${checks.filter((c) => c.pass).length}/${checks.length} checks passed`);
 if ( checks.some((c) => ! c.pass) ) process.exit(1);

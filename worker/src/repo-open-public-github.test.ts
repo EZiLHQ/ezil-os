@@ -1,6 +1,6 @@
 /**
  * A public github.com repository opened from a direct URL (`/app/code?repo=<https URL>`, founder 547ed35a): the
- * Worker accepts it only on os-staging (`repoOpenRemotesFor`), fetches it anonymously (`auth: 'none'`), and the body
+ * Worker accepts it only on os-staging and production (`repoOpenRemotesFor`), fetches it anonymously (`auth: 'none'`), and the body
  * carries no grant at all. The real-git behaviour (no credential sent, reopen keeps work) is in repo-open.git.test.ts.
  */
 import { describe, expect, it } from 'bun:test';
@@ -14,11 +14,28 @@ const body = (over: Record<string, unknown> = {}) => ({ repositoryId: REPO, cano
 const grant = { token: `egg_${'1'.repeat(64)}`, expiresAt: new Date(Date.now() + 240_000).toISOString() };
 
 describe('public github.com remote (anonymous, os-staging only)', () => {
-  it('os-staging opts in to both staging remotes; production and anything else to neither', () => {
+  it('os-staging opts in to both staging remotes; production to public github.com only; anything else to neither', () => {
     expect(staging).toEqual({ stagingGitQa: true, publicGitHub: true });
-    for (const value of ['https://ai.ezil.work', undefined, '', 'https://ai-staging.ezil.work//', ' https://ai-staging.ezil.work']) {
+    for (const value of ['https://ai.ezil.work', 'https://ai.ezil.work/']) expect(repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: value })).toEqual({ publicGitHub: true });
+    for (const value of [undefined, '', 'https://ai-staging.ezil.work//', ' https://ai-staging.ezil.work', 'https://ai.ezil.work//', ' https://ai.ezil.work',
+      'https://ai.ezil.work ', 'https://ai.ezil.work:443', 'http://ai.ezil.work', 'https://AI.EZIL.WORK', 'https://ai.ezil.work.evil.com']) {
       expect(repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: value })).toEqual({});
     }
+  });
+
+  it('production accepts it anonymously with no git object, refuses it with a grant, and never accepts git-qa', () => {
+    const production = repoOpenRemotesFor({ EZIL_AI_GATEWAY_URL: 'https://ai.ezil.work' });
+    expect(parseRepoOpenRequest(body(), Date.now(), production)).toEqual({ ok: true, request: { repositoryId: REPO, canonicalURL: URL_OK, ref: 'refs/heads/main',
+      branch: 'main', token: '', expiresAt: '', auth: 'none', timeoutMs: expect.any(Number) } });
+    expect(parseRepoOpenRequest(body({ git: grant }), Date.now(), production)).toEqual({ ok: false, error: 'repo_open_invalid_request' });
+    expect(repoOpenAuthFor('https://git-qa.ezil.work/acme-qa/site.git', production)).toBeNull();
+    expect(parseRepoOpenRequest(body({ canonicalURL: 'https://git-qa.ezil.work/acme-qa/site.git', git: grant }), Date.now(), production))
+      .toEqual({ ok: false, error: 'repo_open_invalid_request' });
+    // The private github.ezil.work remote is unchanged: Basic with its grant, refused without one.
+    expect(parseRepoOpenRequest(body({ canonicalURL: 'https://github.ezil.work/acme/site.git', git: grant }), Date.now(), production))
+      .toMatchObject({ ok: true, request: { auth: 'basic' } });
+    expect(parseRepoOpenRequest(body({ canonicalURL: 'https://github.ezil.work/acme/site.git' }), Date.now(), production))
+      .toEqual({ ok: false, error: 'repo_open_invalid_request' });
   });
 
   it('is accepted with no git object on os-staging, and is anonymous', () => {

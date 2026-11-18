@@ -10,11 +10,13 @@ const build = (request = ask()) => buildGatewayBody(gw(), request).body;
 describe('gateway sanitizer', () => {
     test('only allowlisted top-level options; sampling only when passed', () => {
         expect(Object.keys(build()).sort()).toEqual(['max_tokens', 'messages', 'model', 'stream']);
-        const request = { ...ask(), modelOptions: { temperature: 3, top_p: -3, cache_control: {}, metadata: {}, thinking: {}, top_k: 2, output_config: {}, stream: false, max_tokens: 1, stop_sequences: ['x'] } };
+        const request = { ...ask(), modelOptions: { temperature: 3, top_p: -3, cache_control: {}, metadata: {}, thinking: {}, top_k: 2, output_config: {}, stream: false, max_tokens: 99_000, stop_sequences: ['x'] } };
         const body = build(request);
         expect(Object.keys(body).sort()).toEqual(['max_tokens', 'messages', 'model', 'stream', 'temperature', 'top_p']);
         expect(body.temperature).toBe(1); expect(body.top_p).toBe(0);
+        // An oversized budget is held to the model's limit; one below the protocols' minimum is refused, never raised.
         expect(body.max_tokens).toBe(8192);
+        expect(() => build({ ...request, modelOptions: { ...request.modelOptions, max_tokens: 1 } })).toThrow(GatewayError);
     });
     test('configured sampling is clamped; nonfinite sampling omitted', () => {
         const model = { ...gw(), temperature: -1, topP: 3 };
@@ -65,9 +67,9 @@ describe('gateway sanitizer', () => {
             expect(JSON.stringify(body)).not.toMatch(/thinking|hidden|"sig"/);
         }
     });
-    test('the native route is decided by the explicit Claude model id only', () => {
-        for (const id of ['claude-sonnet-5-5', 'anthropic.claude-sonnet-5-5', 'us.anthropic.claude-sonnet-5-5']) expect(replaysThinking(id)).toBe(true);
-        for (const id of [gw().model, KIMI, 'gemini-3.8-flash', 'gpt-6.1-sol', 'claude', 'x.claude-sonnet-5-5', 'us.anthropic.claude-sonnet-5-5\n']) expect(replaysThinking(id)).toBe(false);
+    test('signed replay routes use explicit Claude and exact Gemini model ids', () => {
+        for (const id of ['claude-sonnet-5-5', 'anthropic.claude-sonnet-5-5', 'us.anthropic.claude-sonnet-5-5', 'gemini-3.8-flash', 'gemini-4-carbon']) expect(replaysThinking(id)).toBe(true);
+        for (const id of [gw().model, KIMI, 'gpt-6.1-sol', 'claude', 'x.claude-sonnet-5-5', 'us.anthropic.claude-sonnet-5-5\n']) expect(replaysThinking(id)).toBe(false);
     });
     test('signed thinking and redacted thinking are replayed on the native Anthropic route', () => {
         const body = buildGatewayBody(gw('us.anthropic.claude-sonnet-5-5'), ask([msg('user', txt('q')), msg('assistant', thinking, { ...thinking, metadata: { redactedData: 'hidden' } }, txt('answer')), msg('user', txt('next'))])).body;
@@ -129,16 +131,12 @@ describe('gateway sanitizer', () => {
         expect(buildGatewayBody({ ...gw(), stream: false }, ask()).body.stream).toBe(false);
         expect(build().stream).toBe(true);
     });
-    test('byte count matches serialized UTF-8 wire messages and text parts', () => {
-        const message = msg('user', txt('你好 🌍\n"'));
-        expect(gatewayTokenCount(message)).toBe(Buffer.byteLength(JSON.stringify(gatewayMessage(message))));
-        // A string counts as the text block it would be sent as (gateway-budget.test.ts says why).
-        expect(gatewayTokenCount('你好')).toBe(Buffer.byteLength(JSON.stringify({ type: 'text', text: '你好' })));
-        expect(gatewayTokenCount(msg('system', thinking))).toBe(0);
-        expect(gatewayInputTokens(gw())).toBe(104480);
-        expect(gatewayInputTokens({ ...gw(), toolReserve: 1000 })).toBe(127480);
-        // Copilot counts its own tools; the default reserve is only a counting margin.
-        expect(gatewayInputTokens({ maxInputTokens: 131072 })).toBe(131072 - 1056 - 1536 - 8000);
+    test('token estimates and reserved capacity are independent of serialized UTF-8 bytes', () => {
+        expect(gatewayTokenCount(msg('user', txt('hello world')))).toBe(8);
+        expect(gatewayTokenCount('hello world')).toBe(4);
+        expect(gatewayInputTokens(gw())).toBe(88640); // fixture reserves 24000 for tools
+        expect(gatewayInputTokens({ ...gw(), toolReserve: 1000 })).toBe(111640);
+        expect(gatewayInputTokens({ maxInputTokens: 131072 })).toBe(104640);
     });
     test('actual body bytes plus 1056 are bounded before sending', () => {
         expect(() => build(ask([msg('user', txt('字'.repeat(44000)))]))).toThrow(LocalRequestError);

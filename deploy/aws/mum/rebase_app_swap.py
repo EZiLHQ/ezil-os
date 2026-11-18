@@ -36,7 +36,7 @@ SLUG = 'ezil-os-staging'
 SMALL = 1024 * 1024
 SECRET_DRIFT = 'app secret changed while pending; manual reconciliation required'
 RECEIPT_UNVERIFIED = 'archive receipt does not match the inspected artifacts; run app-archive-check'
-PROBE_KEYS = {'gitSha', 'killSwitch', 'deployment', 'imageId', 'tagImageId', 'composeTag', 'composeImageId', 'servedSha', 'timers', 'lockFree'}
+PROBE_KEYS = {'gitSha', 'killSwitch', 'deployment', 'readerCapacity', 'imageId', 'tagImageId', 'composeTag', 'composeImageId', 'servedSha', 'timers', 'lockFree'}
 METADATA = ('manifest.json', 'repositories', 'index.json')
 OCI_MANIFESTS = ('application/vnd.oci.image.manifest.v1+json', 'application/vnd.docker.distribution.manifest.v2+json')
 OCI_INDEXES = ('application/vnd.oci.image.index.v1+json', 'application/vnd.docker.distribution.manifest.list.v2+json')
@@ -307,6 +307,9 @@ def swap(plan_path, source_repo, apply, ledger_path=None):
         envelope = read_secret(fd)
         _, d = release.secret_deployment(envelope)
         deployment = rebase_app.public_deployment(d)
+        # Swap and restore may not install a source that cannot read the current immutable registry.
+        count = release.registry_count(d)
+        release.require_reader_capacity(count, dst['gitSha'], source_repo)
         ledger = release.load_ledger(ledger_path)
         latest = ledger['entries'][-1]
         admitted = False
@@ -351,6 +354,7 @@ def swap(plan_path, source_repo, apply, ledger_path=None):
                        release.aws, release.json_tool.write, one_shot=True)
         after = probe(plan_path, f'app-probe-g{pending["generation"]}-after', dst['tag'])
         need(at(after, dst, deployment), 'post-install state differs; run app-swap-reconcile')
+        release.require_runtime_capacity(after, count)
         # As reconciliation: another install still queued or holding deploy.lock could replace the app after this row closes.
         need(after['lockFree'] and services_idle(after) and not other_in_flight(), 'staging host is not proven quiescent; retain the fence')
         check = read_secret(fd)
@@ -396,6 +400,8 @@ def reconcile(plan_path, apply, ledger_path=None):
                               'timersNotRunning': sorted(k for k, t in second['timers'].items()
                                                          if t.get('enabled') != 'enabled' or t.get('active') != 'active')}, sort_keys=True))
             need(False, 'manual reconciliation required')
+        # Neither side may be recorded as live while its running reader rejects this registry.
+        release.require_runtime_capacity(second, release.registry_count(d))
         check = read_secret(fd)
         need(check['VersionId'] == envelope['VersionId'], 'app secret changed during reconciliation')
         terminal(ledger_path, ledger, pending, state, check, d, side)

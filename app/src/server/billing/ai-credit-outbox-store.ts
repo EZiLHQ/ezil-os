@@ -141,7 +141,7 @@ export const AI_CREDIT_KICK_SQL = `update public.ezil_billing_outbox
  */
 export function createAiCreditOutboxStore(db: Database, fundingUrl?: string): AiCreditOutboxStore {
     return {
-        async claim(now) {
+        async claim(now, scope) {
             const restoreDisposition = sql`case when pending.kind = 'ai_restore' then case
                 when exists (select 1 from ezil_billing_outbox terminal
                     where terminal.payload->>'protocol' = ${AI_CREDIT_PROTOCOL}
@@ -179,6 +179,7 @@ export function createAiCreditOutboxStore(db: Database, fundingUrl?: string): Ai
                     where pending.payload->>'protocol' = ${AI_CREDIT_PROTOCOL} and pending.kind in ('ai_grant', 'ai_revoke', 'ai_restore')
                         and (pending.kind <> 'ai_restore' or suspended.delivered_at is not null or (${restoreConflict}) or (${restoreDisposition}) is not null)
                         and pending.delivered_at is null
+                        ${scope ? sql`and pending.user_id = ${scope.userId}::uuid and pending.event_key = ${scope.eventKey} and pending.kind = ${scope.kind}` : sql``}
                         and coalesce(pending.payload->'delivery'->>'status', 'pending') in ('pending', 'retry', 'processing')
                         and coalesce((pending.payload->'delivery'->>'nextAttemptAt')::bigint, 0) <= ${now}
                         and (pending.attempts - coalesce((pending.payload->'delivery'->>'dependencyWaits')::integer, 0) < ${AI_CREDIT_MAX_ATTEMPTS}

@@ -234,3 +234,28 @@ describe('diagnostic script injection', () => {
     expect(injectCodeDiagBridge(html, ['</script>'])).toBe(html);
   });
 });
+
+// Operational metadata is a different event/channel, sharing only the diagnostic hello nonce.
+// The stage app fixture (app/src/server/ai-traces/fixture.json), inlined: synthetic, content-free metadata only.
+const traceFixture = {"contract":"ezil.inference.v1","adapterVersion":"0.1.0+carbon-progress.1","requestId":"10000000-0000-4000-8000-000000000001","turnId":"20000000-0000-4000-8000-000000000001","modelAlias":"ezil-code","clientRequestId":null,"gatewayRequestId":null,"offered":{"read":1,"search":1,"write":1,"other":0},"requested":{"read":1,"search":0,"write":0,"other":0},"results":{"matched":0,"error":0,"reportedSuccess":0,"unknown":0,"unmatched":0},"writeRequested":false,"toolReportedSuccess":false,"verifiedFileChange":null,"usage":null,"usageSource":"unknown","estimatedInputTokens":100,"wireBytes":null,"attempts":1,"compaction":null,"finishReason":"tool_use","durationMs":30,"cancelled":false,"outcome":"completed","thought_signature_replayed":false,"readHeavyWithoutVerifiedEdit":true,"conversationId":null,"toolCalls":[{"call":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","category":"read"}],"toolResults":[],"observationsTruncated":false,"totalWireBytes":0};
+describe('AI request trace operational channel', () => {
+  it('queues a synthetic event until hello, deduplicates, rejects injected data and rotates nonce', () => {
+    const b = run();
+    const send = (trace: unknown) => b.window.dispatchEvent({ type: 'ezil-ai-request-trace', detail: JSON.stringify(trace) });
+    send(traceFixture); expect(b.posted).toHaveLength(0); b.message();
+    const traces = () => b.posted.filter(p => p.message.type === 'ezil.code.aiTrace');
+    expect(traces()).toHaveLength(1); expect(traces()[0]!.message.nonce).toBe(NONCE);
+    send(traceFixture); send({ ...traceFixture, prompt: 'SECRET' }); expect(traces()).toHaveLength(1);
+    const next = 'BBBBBBBBBBBBBBBBBBBBBB'; b.message({ ...hello, nonce: next });
+    send({ ...traceFixture, requestId: '10000000-0000-4000-8000-000000000002' });
+    expect(traces()[1]!.message.nonce).toBe(next); expect(b.failures()).toHaveLength(0);
+  });
+  it('caps trace flood independently from failure/ready traffic and rejects bytes', () => {
+    const b = run(); b.message();
+    for (let i = 0; i < 140; i++) b.window.dispatchEvent({ type: 'ezil-ai-request-trace', detail: JSON.stringify({ ...traceFixture, requestId: `10000000-0000-4000-8000-${i.toString().padStart(12, '0')}` }) });
+    expect(b.posted.filter(p => p.message.type === 'ezil.code.aiTrace')).toHaveLength(120);
+    b.failure(); expect(b.failures()).toHaveLength(1);
+    const big = run({ encodedSize: 4097 }); big.message(); big.window.dispatchEvent({ type: 'ezil-ai-request-trace', detail: JSON.stringify(traceFixture) });
+    expect(big.posted).toHaveLength(0);
+  });
+});

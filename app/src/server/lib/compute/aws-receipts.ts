@@ -1,3 +1,4 @@
+import { reconcileParkedStop } from './aws-failed-release-park';
 import { reconcilePoolReleaseRecovery } from './aws-pool-release-recovery';
 import { failStalledPoolAdopt, reconcileStalledPoolAdopt, replaceStalledPoolAdopt } from './aws-pool-adopt-stall';
 import { replacementNeverLaunched, replacementWorkFromExecution, settleReplacementGeneration } from './aws-rebase-generation';
@@ -270,6 +271,9 @@ export async function isReverseExportBoot(db: PlacementExecutor, p: Placement): 
  */
 export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, deployment: LifecycleDeployment, options: { terminalOnly?: boolean } = {}): Promise<void> {
     if (!options.terminalOnly && await reconcileStalledPoolAdopt(deps, p0, deployment)) return;
+    // A parked failed release owns its RECOVERING row (its own durable prefix and saved STOP intent): it runs BEFORE the pool
+    // release recovery, which would otherwise reject the stop document and could never build anything but a release.
+    if (!options.terminalOnly && deps.executions && await reconcileParkedStop({ ...deps, executions: deps.executions }, p0, deployment)) return;
     if (!options.terminalOnly && await reconcilePoolReleaseRecovery(deps, p0, deployment)) return;
     // Migration provision receipts restore a host, but cannot open a normal epoch before commit.
     let migrationCommitted = false;
@@ -764,7 +768,7 @@ export const FLEET_RECONCILE_LIMIT = 20;
  */
 export async function runAwsStopSettlement(
     env: Env,
-    deps: Pick<ReceiptDeps, 'db' | 'executions' | 'tunnels' | 'meter' | 'now' | 'clock'> & { signal?: AbortSignal },
+    deps: Pick<ReceiptDeps, 'db' | 'executions' | 'tunnels' | 'meter' | 'now' | 'clock' | 'pool'> & { signal?: AbortSignal },
 ): Promise<{ ok: true; skipped: string } | { ok: true; checked: number; settled: number }> {
     if (!isAwsComputersEnabled(env)) return { ok: true, skipped: 'aws_disabled' };
     const regions = readAwsRegions(env);

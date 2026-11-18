@@ -390,6 +390,52 @@ export async function retirePoolLease(db: PlacementExecutor, p: { computerId: st
             AND claim_generation = ${p.generation} AND claim_lease_epoch = ${p.leaseEpoch}`);
 }
 
+/** A settled placement's historical claim is a lookup only; provider retirement is proven separately.
+ * Call inside admission -> computer -> placement locks. Never select an unrelated or unpublished claim. */
+export async function readCompletedPoolLease(tx: PlacementExecutor, p: Placement): Promise<Record<string, unknown> | null> {
+    if (!p.instanceId || !p.volumeId || !p.fenceToken) return null;
+    const rows = rowsOf(await tx.execute(sql`/* pool:completed-release-read */
+        SELECT id::text AS id, generation, region, zone_id, instance_type, instance_id, state,
+            leased_computer_id::text AS leased_computer_id, leased_generation, leased_at::text AS leased_at,
+            lease_token::text AS allocation_token, claim_generation, claim_lease_epoch, claim_fence, claim_volume_serial,
+            lifecycle_job_id::text AS lifecycle_job_id, lifecycle_digest, lifecycle_input, updated_at::text AS claim_updated_at
+        FROM public.ezil_compute_pool_hosts
+        WHERE leased_computer_id = ${p.computerId}::uuid AND instance_id = ${p.instanceId}
+            AND region = ${p.region} AND zone_id = ${p.zoneId} AND instance_type = ${p.instanceType}
+            AND generation = leased_generation AND lease_token IS NOT NULL
+            AND claim_generation = ${p.generation} AND claim_lease_epoch = ${p.leaseEpoch}
+            AND claim_fence = ${p.fenceToken} AND claim_volume_serial = ${p.volumeId.replace('-', '')}
+            AND state IN ('leased', 'retired') AND dispatch_status = 'settled'
+            AND lifecycle_job_id IS NOT NULL AND lifecycle_digest IS NOT NULL AND lifecycle_input IS NOT NULL
+        LIMIT 2 FOR UPDATE`));
+    if (rows.length > 1) throw new Error('pool_completed_release_conflict');
+    return rows[0] ? { ...rows[0], generation: Number(rows[0].generation) } : null;
+}
+
+/** No active writer lease may outlive the release being repaired. A missing optional table has no leases. */
+export async function completedPoolWriterHolds(tx: PlacementExecutor, computerId: string): Promise<boolean> {
+    const present = rowsOf(await tx.execute(sql`SELECT to_regclass('public.ezil_compute_writer_leases') IS NOT NULL AS present`));
+    return present[0]?.present === true && rowsOf(await tx.execute(sql`/* pool:completed-release-writer */
+        SELECT 1 AS held FROM public.ezil_compute_writer_leases WHERE computer_id = ${computerId}::uuid LIMIT 1`)).length > 0;
+}
+
+/** Burn only the same proven single-use allocation. The placement is deliberately not written. */
+export async function retireCompletedPoolLease(tx: PlacementExecutor, p: Placement, row: Record<string, unknown>): Promise<boolean> {
+    if (row.state !== 'leased' || !p.volumeId) return false;
+    const changed = rowsOf(await tx.execute(sql`/* pool:completed-release-retire */
+        UPDATE public.ezil_compute_pool_hosts SET state = 'retired', updated_at = now()
+        WHERE id = ${row.id}::uuid AND state = 'leased' AND dispatch_status = 'settled'
+            AND generation = ${row.generation} AND generation = leased_generation AND lease_token = ${row.allocation_token}::uuid
+            AND leased_computer_id = ${p.computerId}::uuid AND instance_id = ${p.instanceId}
+            AND region = ${p.region} AND zone_id = ${p.zoneId} AND instance_type = ${p.instanceType}
+            AND claim_generation = ${p.generation} AND claim_lease_epoch = ${p.leaseEpoch}
+            AND claim_fence = ${p.fenceToken} AND claim_volume_serial = ${p.volumeId.replace('-', '')}
+            AND lifecycle_job_id = ${row.lifecycle_job_id}::uuid AND lifecycle_digest = ${row.lifecycle_digest}
+            AND lifecycle_input = ${row.lifecycle_input} AND updated_at = ${row.claim_updated_at}::timestamptz
+        RETURNING id`));
+    return changed.length === 1;
+}
+
 /** leased_at is the immutable claim time; enrollment and repeated receipt polls cannot extend it. */
 export async function isStalledPoolLease(db: PlacementExecutor, poolHostId: string, p: Placement,
     now: Date, stallMs: number, lock = false): Promise<boolean> {
