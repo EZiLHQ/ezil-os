@@ -564,11 +564,15 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = nul
     }
     // The iframe gets the minted URL plus `ezil_mint=<id>`: it rides into this mint's FIRST editor document only, which
     // is how the window tells this mint's editor from one the person navigated to (`./code-folder.js`).
-    const url = tagFolderMint(data.codePreviewUrl, { asked: folder_ask, answer: data.codeFolder });
     // A project's folder as the server fixed it (opensRepository checked it): the window keeps it out of the address
     // bar, which names a folder only when it is not the one the project link opens anyway.
     const repositoryFolder = project ? new URL(data.codePreviewUrl).searchParams.get('folder') : null;
-    return { ok: true, url, expiresAt: data.expiresAt, ...(project ? { repository: repositoryNameOf(data), repositoryFolder } : {}) };
+    const repository = project ? repositoryNameOf(data) : null;
+    // Standalone EZiL Git clones have a child named after the repo. Keep the verified parent as the workbench folder.
+    const repositoryFocus = project?.repoUrl?.startsWith('https://github.ezil.work/') && repository && repositoryFolder
+        ? { name: repository, folder: repositoryFolder } : undefined;
+    const url = tagFolderMint(data.codePreviewUrl, { asked: folder_ask, answer: data.codeFolder, repositoryFocus });
+    return { ok: true, url, expiresAt: data.expiresAt, ...(project ? { repository, repositoryFolder } : {}) };
 }
 
 /**
