@@ -220,6 +220,11 @@ function run(opts: { search?: string; pathname?: string; framed?: boolean; navig
   const parent = { postMessage: (m: Record<string, unknown>, o: string) => posted.push({ m: structuredClone(m), o }) };
   const g: Record<string, unknown> = {
     URLSearchParams, URL, crypto, btoa, Uint8Array, Map, String, JSON,
+    document: { documentElement: {}, querySelector: () => null },
+    MutationObserver: class {
+      observe() {}
+      disconnect() {}
+    },
     location: { search, pathname, origin: EDITOR, replace: (u: string) => replaced.push(u) },
     setTimeout: (fn: () => void, ms: number) => timers.push({ fn, ms }),
     clearTimeout: (id: number) => { const t = timers[id - 1]; if (t) t.cleared = true; },
@@ -244,6 +249,26 @@ function run(opts: { search?: string; pathname?: string; framed?: boolean; navig
 const NONCE = 'BBBBBBBBBBBBBBBBBBBBBB';
 
 describe('the bridge script', () => {
+  it('starts repository presentation once, only on the matching private checkout mint and folder', () => {
+    const folder = '/workspace/projects/16e75a93-1dec-82a8-81db-5463a37115c1';
+    const mint = 'AAAAAAAAAAAAAAAAAAAAAA';
+    const repositoryFocus = { name: 'default/os-code-url-20261110-a', folder };
+    const hello = { type: 'ezil.code.hello', v: 1, nonce: NONCE, mint, repositoryFocus };
+    const b = run({ search: `?folder=${folder}&ezil_mint=${mint}` });
+    b.message(hello, { source: {} });
+    b.message(hello, { origin: PROD_SHELL });
+    b.message({ ...hello, mint: NONCE });
+    b.message({ ...hello, repositoryFocus: { ...repositoryFocus, folder: '/workspace/projects/other' } });
+    b.message({ ...hello, repositoryFocus: { ...repositoryFocus, name: 'default/../other' } });
+    expect(b.timers).toHaveLength(0);
+    b.message(hello);
+    b.message(hello);
+    expect(b.timers).toHaveLength(1);
+
+    const later = run({ search: `?folder=${folder}` });
+    later.message(hello);
+    expect(later.timers).toHaveLength(0);
+  });
   it('does nothing at all when not framed', () => {
     const b = run({ framed: false });
     expect(b.posted).toEqual([]);
