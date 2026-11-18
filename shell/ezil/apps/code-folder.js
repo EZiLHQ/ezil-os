@@ -172,8 +172,7 @@ function token () {
     return btoa(String.fromCharCode(...b)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-// mint id -> what was asked and what the server answered (codes only). Read
-// once, by the binding of that mint; bounded.
+// mint id -> folder ask, outcome and optional repo presentation. Read once, by the binding of that mint.
 const mints = new Map();
 
 /**
@@ -181,10 +180,10 @@ const mints = new Map();
  * `ezil_mint=<id>`), remembering what was asked and answered for it. A server
  * that answered no outcome to an ask is an older one (`unsupported_server`).
  */
-export function tagFolderMint (url, { asked, answer } = {}) {
+export function tagFolderMint (url, { asked, answer, repositoryFocus } = {}) {
     const id = token();
     const outcome = typeof answer?.outcome === 'string' && OUTCOME_RE.test(answer.outcome) ? answer.outcome : null;
-    mints.set(id, { asked: asked?.path ?? null, outcome: asked && ! outcome ? 'unsupported_server' : outcome });
+    mints.set(id, { asked: asked?.path ?? null, outcome: asked && ! outcome ? 'unsupported_server' : outcome, repositoryFocus });
     while ( mints.size > 8 ) mints.delete(mints.keys().next().value);
     try {
         const u = new URL(url);
@@ -299,7 +298,9 @@ export function attachFolderBridge ({ iframe, frameUrl, bind, notice, onUserFold
     const hello = () => {
         if ( ! live() ) { detach(); return; }
         nonce = token();
-        try { iframe.contentWindow?.postMessage({ type: 'ezil.code.hello', v: 1, nonce }, origin); } catch { /* gone */ }
+        // Only the document with this mint and folder can apply the presentation hint.
+        const focus = mint.repositoryFocus ? { mint: mintId, repositoryFocus: mint.repositoryFocus } : {};
+        try { iframe.contentWindow?.postMessage({ type: 'ezil.code.hello', v: 1, nonce, ...focus }, origin); } catch { /* gone */ }
     };
     // What a report or an open request says the editor shows (or will): a plain folder, the empty window, or
     // anything Code cannot name in an address (a workspace, another scheme, a path the grammar refuses).
