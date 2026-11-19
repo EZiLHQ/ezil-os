@@ -24,9 +24,52 @@ const fixtureNode = (source, ...args) => execFileSync(container ? 'docker' : pro
   [...container ? ['exec', container, 'node'] : [], '-e', source, ...args], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
 const records = () => JSON.parse(fixtureNode("try{process.stdout.write(require('node:fs').readFileSync(process.argv[1]))}catch(e){if(e.code!=='ENOENT')throw e;process.stdout.write('[]')}", join(capture, 'captured.json')));
 const release = marker => fixtureNode("require('node:fs').writeFileSync(process.argv[1],'')", join(capture, marker + '.release'));
-const savedPrompt = (directory, marker) => fixtureNode(
-  "const f=require('node:fs');const p=require('node:path');const [folder,marker]=process.argv.slice(1);process.stdout.write(f.readdirSync(folder).filter(n=>n.endsWith('.jsonl')).some(n=>f.readFileSync(p.join(folder,n),'utf8').includes(marker))?'yes':'no')",
-  directory, marker) === 'yes';
+const savedTranscript = (directory, marker) => fixtureNode(`
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const [folder, marker] = process.argv.slice(1);
+  const matches = [];
+  for (const name of fs.readdirSync(folder).filter(name => name.endsWith('.jsonl'))) {
+    try {
+      const data = fs.readFileSync(path.join(folder, name), 'utf8');
+      if (data.includes(marker)) matches.push({ name, data });
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+  if (matches.length === 1) process.stdout.write(JSON.stringify(matches[0]));
+`, directory, marker);
+
+function savedTurn(directory, marker) {
+  const raw = savedTranscript(directory, marker);
+  if (!raw) return;
+  try {
+    const { name, data } = JSON.parse(raw);
+    const [initial, ...changes] = data.trim().split('\n').map(line => JSON.parse(line));
+    const sessionId = initial.v?.sessionId;
+    if (name !== sessionId + '.jsonl') return;
+    let requests = initial.v?.requests ?? [];
+    for (const change of changes) {
+      const key = change.k?.join('/');
+      if (key === 'requests') {
+        if (change.kind === 1) requests = change.v;
+        if (change.kind === 2) requests = [...requests.slice(0, change.i ?? requests.length), ...change.v];
+      } else if (key === 'requests/0/modelState' && change.kind === 1) {
+        requests[0].modelState = change.v;
+      } else if (key === 'requests/0/response') {
+        if (change.kind === 1) requests[0].response = change.v ?? [];
+        if (change.kind === 2) {
+          const response = requests[0].response ?? [];
+          requests[0].response = [...response.slice(0, change.i ?? response.length), ...change.v];
+        }
+      }
+    }
+    if (requests.length === 1 && requests[0].message?.text === marker) return { sessionId, ...requests[0] };
+  } catch (error) {
+    // The last line can be in the middle of an append.
+    if (!(error instanceof SyntaxError)) throw error;
+  }
+}
 
 async function waitFor(read, description, timeout = 30_000) {
   const deadline = Date.now() + timeout;
@@ -44,19 +87,16 @@ async function send(frame, marker) {
   // affect whether the lifecycle action races a currently pending JSON reply.
   await waitFor(async () => /Kimi K3/.test(await model.getAttribute('aria-label', { timeout: 1500 }).catch(() => '')), 'Kimi active in Code', 60_000);
   const input = frame.locator('.part.auxiliarybar .chat-input-container .monaco-editor').first();
+  const lines = input.locator('.view-lines').first();
   const page = frame.page();
   await page.bringToFront();
-  for (let attempt = 0; attempt < 3; attempt++) {
-    await input.locator('.view-lines').first().click({ force: true });
-    await page.keyboard.press('Control+A');
-    await page.keyboard.press('Delete');
-    await page.keyboard.type(marker, { delay: 4 });
-    if ((await input.innerText()).replace(/\s/g, '').includes(marker)) {
-      await page.keyboard.press('Enter');
-      return;
-    }
-  }
-  assert.fail('synthetic prompt did not reach the Code editor input');
+  await lines.click();
+  await page.keyboard.press('Control+A');
+  await page.keyboard.insertText(marker);
+  // Monaco's rendered lines can wrap and include zero-width layout characters.
+  await waitFor(async () => (await lines.textContent()).replace(/[\s\u200b\ufeff]/g, '') === marker,
+    'synthetic prompt did not reach the Code editor input', 10_000);
+  await page.keyboard.press('Enter');
 }
 
 const transcript = frame => frame.locator('.part.auxiliarybar .interactive-list').first();
@@ -64,6 +104,35 @@ const messageCount = async (frame, marker) =>
   (await transcript(frame).innerText({ timeout: 1500 }).catch(() => '')).replace(/\s/g, '').split(marker).length - 1;
 const markerInLatestMessage = (r, marker) => r.method === 'POST' && r.path === '/ai/v1/messages'
   && r.body?.model === KIMI && r.body.tools?.length && JSON.stringify(r.body.messages?.at(-1)).includes(marker);
+
+async function reopenSavedChat(frame, marker) {
+  const aux = frame.locator('.part.auxiliarybar');
+  await frame.locator('.monaco-workbench').waitFor({ timeout: 60_000 });
+  await aux.locator('.chat-input-container').first().waitFor({ timeout: 60_000 });
+  if (await messageCount(frame, marker)) return 'restored-view';
+
+  // The Sessions panel can be collapsed, and the prior view can reopen on an empty chat.
+  // The normal Chat history picker explicitly resolves the local session provider on open.
+  await aux.locator('.chat-view-title-container.visible .chat-view-title-action-item').first().click();
+  const picker = frame.locator('.quick-input-widget:visible');
+  const rows = picker.locator('.monaco-list-row:visible');
+  const entry = await waitFor(async () => {
+    // The editor may restore the chat while its history picker is opening.
+    if (await messageCount(frame, marker)) return 'restored-view';
+    const titled = rows.filter({ hasText: marker });
+    if (await titled.count() === 1) return titled;
+    // Some incomplete chats are still indexed by their generic title. This
+    // isolated workspace has exactly one saved turn with the fixture marker.
+    const generic = rows.filter({ hasText: 'EZiL Chat' });
+    if (await rows.count() === 1 && await generic.count() === 1) return generic;
+  }, 'the pending conversation reopens or is listed in Chat history');
+  if (entry === 'restored-view') {
+    if (await picker.isVisible()) await frame.page().keyboard.press('Escape');
+    return entry;
+  }
+  await entry.click();
+  return 'chat-history';
+}
 
 const results = [];
 const browser = await chromium.launch({
@@ -83,6 +152,9 @@ try {
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     let released = false;
     let backgroundVisibility;
+    let replyEvidence;
+    let reloadEvidence;
+    let page;
     try {
       await context.route('**/*', route => {
         const url = route.request().url();
@@ -93,7 +165,7 @@ try {
         if (url === otherUrl) return route.fulfill({ contentType: 'text/html', body: '<title>Other browser tab</title>' });
         return new URL(url).origin === origin ? route.continue() : route.abort();
       });
-      const page = await context.newPage();
+      page = await context.newPage();
       await page.goto(mode === 'hidden-frame' ? shell : workbench, { waitUntil: 'domcontentloaded' });
       const frame = mode === 'hidden-frame'
         ? await waitFor(() => page.frames().find(child => child.url() === workbench), 'Code iframe loaded') : page.mainFrame();
@@ -140,31 +212,50 @@ try {
         await page.locator('#show').click();
         await frame.locator('.part.auxiliarybar .chat-input-container .monaco-editor .view-lines').first().click({ force: true });
       } else {
-        await waitFor(() => savedPrompt(chat, marker), 'workbench must save the pending prompt before the explicit reload', 100_000);
+        const pending = await waitFor(() => {
+          const turn = savedTurn(chat, marker);
+          return [0, 4].includes(turn?.modelState?.value) ? turn : null;
+        }, 'workbench must persist the exact prompt as a pending request before reload', 100_000);
+        assert.equal(calls()[0].jsonReply, 'held', 'the original Kimi response is still held when reloading');
         await page.reload({ waitUntil: 'domcontentloaded' });
         assert.equal(await frame.evaluate(() => window.ezilLifecycleFixtureDocument), undefined, 'reload replaces the workbench document');
-        const session = frame.locator('.part.auxiliarybar .agent-sessions-control-container .monaco-list-row').first();
-        const state = await waitFor(async () => {
-          if (await messageCount(frame, marker)) return 'opened';
-          if (await session.isVisible()) return 'listed';
-          return null;
-        }, 'saved chat must reopen or appear in Sessions');
-        if (state === 'listed') await session.click();
-        await waitFor(() => messageCount(frame, marker), 'original prompt appears in restored chat');
-        await transcript(frame).getByText('This response was interrupted before it finished. Review any changes before retrying.').waitFor();
+        const restoredVia = await reopenSavedChat(frame, marker);
+        assert.equal(await waitFor(() => messageCount(frame, marker), 'original prompt appears in restored chat'), 1);
+        await transcript(frame).getByText('This response was interrupted before it finished. Review any changes before retrying.', { exact: true }).waitFor();
+        reloadEvidence = { sessionId: pending.sessionId, pendingState: pending.modelState.value, documentReplaced: true, restoredVia };
         release(marker);
         released = true;
       }
 
       if (mode !== 'full-reload') {
         assert.equal(await frame.evaluate(() => window.ezilLifecycleFixtureDocument), stamp);
-        await waitFor(() => messageCount(frame, KIMI_LIFECYCLE_REPLY), 'one unbroken JSON reply appears in Code');
-        assert.equal(await messageCount(frame, KIMI_LIFECYCLE_REPLY), 1);
+        replyEvidence = await waitFor(async () => {
+          const error = transcript(frame).locator('.chat-notification-widget:has(.chat-error-codicon)').first();
+          assert.equal(await error.isVisible(), false, 'the retained chat must not display a reply error');
+          const visible = await messageCount(frame, KIMI_LIFECYCLE_REPLY);
+          if (visible) {
+            assert.equal(visible, 1);
+            return 'workbench';
+          }
+          // A zero-sized iframe can leave the list virtualized after showing it.
+          // The matched, completed workbench JSONL proves the response still arrived.
+          const turn = mode === 'hidden-frame' ? savedTurn(chat, marker) : null;
+          if (turn?.modelState?.value !== 1) return null;
+          // Ignore copies in the stored model result or trace metadata.
+          const saved = JSON.stringify(turn.response ?? []).split(KIMI_LIFECYCLE_REPLY).length - 1;
+          assert.equal(saved, 1);
+          return 'saved-transcript';
+        }, 'one unbroken JSON reply reaches the retained Code workbench', 50_000);
       }
       await sleep(1600); // Copilot's retry delay is one second; keep the fixture observable after release.
       assert.equal(calls().length, 1, 'no duplicate Kimi inference');
-      results.push({ mode, calls: calls().length, jsonReply: calls()[0].jsonReply, backgroundVisibility });
-      console.log('PASS', mode, 'one Kimi JSON inference', mode === 'full-reload' ? 'saved interruption' : 'one rendered reply');
+      results.push({ mode, calls: calls().length, jsonReply: calls()[0].jsonReply, backgroundVisibility, replyEvidence, reloadEvidence });
+      console.log('PASS', mode, 'one Kimi JSON inference',
+        mode === 'full-reload' ? 'saved interruption' : 'one reply via ' + replyEvidence);
+    } catch (error) {
+      mkdirSync(out, { recursive: true });
+      await page?.screenshot({ path: join(out, mode + '-failure.png'), timeout: 5000 }).catch(() => {});
+      throw error;
     } finally {
       if (!released) release(marker);
       await context.close();

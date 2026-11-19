@@ -1,3 +1,46 @@
+## Version-gated staging evidence
+
+Run this after the staging scheduler has promoted the reviewed app, Worker, and
+desktop image. Supply the expected full Git SHAs from the release record. The
+runner compares them with the canonical OS staging and Gateway health endpoints
+before opening a browser, then rechecks them after the evidence lanes finish.
+
+```sh
+EZIL_STAGING_EXPECT_APP_SHA="$reviewed_app_sha" \
+EZIL_STAGING_EXPECT_GATEWAY_SHA="$reviewed_gateway_sha" \
+EZIL_STAGING_EVIDENCE_OUT="$new_private_evidence_dir" \
+PLAYWRIGHT_REQUIRE_DIR="$playwright_dir" \
+node e2e/staging-deployed-evidence.mjs
+```
+
+The default `public` run verifies in Chromium that signed-out access reaches
+EZiL ID sign-in and preserves the exact assignment repository in the return URL.
+Use `EZIL_STAGING_EVIDENCE_MODE=assignment` for the authenticated lanes below.
+Use an isolated QA computer, account, and repository. Prepare Playwright storage
+state through normal EZiL ID sign-in. Store it outside Git and test artifacts.
+
+| Setting | Evidence |
+| --- | --- |
+| `EZIL_STAGING_QA_REPO` | Canonical private `https://github.ezil.work/<owner>/<repo>.git` fixture. |
+| `EZIL_STAGING_QA_STORAGE_STATE` | Playwright state file for the dedicated EZiL ID identity with access to the fixture. |
+| `EZIL_STAGING_QA_EXPECTED_FILE` and optional `EZIL_STAGING_QA_EXPECTED_TEXT` | Fixture marker that confirms the checkout in Code after opening and reopening. |
+| `EZIL_STAGING_QA_RUNTIME_READER` | Absolute path to the operator's read-only executable. Given `before` or `after`, it prints one live observation with `appSha`, `workerVersion`, `imageDigest`, `computerId`, `runtimeId` (running boot or placement identity), and UTC ISO `observedAt` recorded during that invocation. Use active Worker and selected desktop readbacks. |
+| `EZIL_STAGING_QA_COMPUTER_ID` | Expected dedicated test computer. The live reader and browser must agree on it. |
+| `EZIL_STAGING_EXPECT_CODE_IMAGE` and `EZIL_STAGING_EXPECT_WORKER_VERSION` | Immutable desktop digest and active Worker version from the reviewed release. The reader must match both and identify the same QA computer before and after. |
+| `EZIL_STAGING_QA_AGENT=1` and `EZIL_STAGING_QA_MODEL` | Opt into a synthetic read-only Ask response and tab-switch check on the named model. Use the separate image E2E for controlled pending-turn reload and provider request counts. |
+| `EZIL_STAGING_QA_GIT_REF` and `EZIL_STAGING_EXPECT_SUBMITTED_SHA` | Optional read-only Git lane for the submitted SHA and exact `refs/heads/…` ref. The runner uses existing Git credentials. |
+
+The release checks precede the parallel signed-out browser, authenticated Code,
+and Git lanes. The authenticated browser checks the isolated fixture before agent
+actions. The JSON report includes observed timestamps and individual `pass`,
+`fail`, `blocked`, or `skip` statuses. Exit codes are 0 for passed selected
+checks, 1 for a failure, and 2 for a blocked check or invalid input. Reports omit
+cookies, signed preview URLs, and raw browser diagnostics. A confirmed Git SHA
+proves branch state at readback time. Pair it with an authorized assignment chat
+or Gateway export when reviewing how the change was made.
+
+Browser-free validation: `node --test e2e/staging-deployed-evidence.test.mjs`.
+
 ## Fast live deployment check
 
 With `EZIL_E2E_EMAIL`, `EZIL_E2E_PASSWORD`, `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, and `PLAYWRIGHT_REQUIRE_DIR` already set in the environment, run:
