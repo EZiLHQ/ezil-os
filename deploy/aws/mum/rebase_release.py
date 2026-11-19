@@ -312,13 +312,46 @@ def live_app(path, plan, operation, envelope, fd, expected=None):
     return result
 
 
-def begin_operation(ledger_path, ledger, path, plan, operation, envelope, d, expected_d, apply, fd):
+def probe_compaction_app(path, plan, operation, count):
+    receipt = require_receipt(path, 'apply-app')
+    need(type(receipt.get('readerCapacity')) is int and receipt['readerCapacity'] >= count
+         and manifest.matches(r'sha256:[0-9a-f]{64}', receipt.get('imageId')),
+         'GC compaction requires the plan-bound apply-app image and reader receipt')
+    observed = probe_plan_app(path, plan, operation, count)
+    need(observed['imageId'] == receipt['imageId'],
+         'GC compaction running image differs from the plan-bound apply-app receipt')
+    timers = observed.get('timers')
+    need(isinstance(timers, dict) and set(timers) == set(rebase_app.JOBS)
+         and all(isinstance(job, dict) and job.get('active') == job.get('service') == 'inactive'
+                 for job in timers.values()),
+         'GC compaction requires inactive staging timer and writer service units')
+
+
+def begin_operation(ledger_path, ledger, path, plan, operation, envelope, d, expected_d, apply, fd, *,
+                    staging_compaction_app=None, save_gc_backup=None):
+    if staging_compaction_app is not None:
+        need(operation == 'registry-gc' and json_tool.NAMESPACE == 'mum' and 'ledgerGeneration' in plan
+             and manifest.matches(r'[0-9a-f]{40}', staging_compaction_app)
+             and plan['rollout']['app']['gitSha'] == staging_compaction_app
+             and (not apply or callable(save_gc_backup)),
+             'invalid staging compaction operation or app plan')
     latest = ledger['entries'][-1]
+    if staging_compaction_app is not None:
+        count = registry_count(d)
+        capacity, _ = source_reader_capacity(staging_compaction_app)
+        need(capacity >= count, 'GC compaction source cannot read the current registry')
+        probe_compaction_app(path, plan, 'registry-gc-artifact-g' + str(latest['generation']), count)
     result = live_app(path, plan, ('registry-gc-check-g' if operation == 'registry-gc' else 'ledger-check-g') + str(latest['generation']), envelope, fd,
                       rebase_app.public_deployment(d) if operation == 'registry-gc' else None)
     if operation == 'registry-gc':
-        need(plan['rollout']['app']['tag'] == '478c66b3559c' and
-             result['gitSha'] == plan['rollout']['app']['gitSha'], 'registry-gc requires the same frozen app')
+        if staging_compaction_app is None:
+            need(plan['rollout']['app']['tag'] == '478c66b3559c' and
+                 result['gitSha'] == plan['rollout']['app']['gitSha'], 'registry-gc requires the same frozen app')
+        else:
+            need(result['gitSha'] == staging_compaction_app
+                 and result.get('killSwitch') == '1' and type(result.get('readerCapacity')) is int
+                 and result['readerCapacity'] >= len(d['releases']),
+                 'GC compaction requires the exact gated staging app and current registry reader')
     ledger_drift(ledger, envelope, d, result['gitSha'])
     expected = release_state(expected_d, plan['rollout']['app']['gitSha'])
     if latest.get('state') == 'pending':
@@ -328,6 +361,8 @@ def begin_operation(ledger_path, ledger, path, plan, operation, envelope, d, exp
     entry = {'generation': generation, 'planSha256': digest(path), 'operation': operation, 'state': 'pending',
              'before': observed_state(envelope, d, result['gitSha']), 'expected': expected}
     if apply:
+        if staging_compaction_app is not None:
+            save_gc_backup()
         ledger = write_ledger_entry(ledger_path, ledger, path, plan, entry)
     return ledger, generation
 
@@ -869,9 +904,10 @@ def require_reader_promotion(path,plan,count,apply,generation,deployed_agent):
     need(observed['imageId']==receipt['imageId'],'running image is not the image apply-app installed')
 
 
-def app_operation(path,plan,operation,apply,expected=None,install=True,generation=None):
+def app_operation(path,plan,operation,apply,expected=None,install=True,generation=None,*,keep_timers_stopped=False):
     need(plan['rollout'] is not None,'plan requires --rollout with reviewed staged change sets and app artifact')
-    body=rebase_app.body(safe_path(REPO/'deploy/aws/os-staging/install-host.sh').read_text(),plan['rollout']['app'],expected,install)
+    body=rebase_app.body(safe_path(REPO/'deploy/aws/os-staging/install-host.sh').read_text(),
+                        plan['rollout']['app'],expected,install,keep_timers_stopped=keep_timers_stopped)
     if generation is not None:
         legacy_path = Path(path).parent / (operation + '-ssm.json')
         operation += '-g' + str(generation)
