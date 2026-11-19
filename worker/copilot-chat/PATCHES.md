@@ -258,6 +258,28 @@ Copilot Chat 0.69 also keeps conversation text of its own: `github.copilot.chat.
 `workspaceStorage/<id>/GitHub.copilot-chat/transcripts/<session>.jsonl`, which deleting a chat does
 not remove; the profile keeps it (AWS) or the restart drops it (Cloudflare).
 
+### Interrupted local replies
+
+The bundled `ToolCallingLoop` displays “Recovered from a request error” before
+its automatic retry. The `request-retry` patch updates both the auto-approve
+and Autopilot progress strings in `extension.js` to say that a retry was
+scheduled. The retry policy and timing are unchanged.
+
+The workbench JSONL format stores the response's actual state. When a new
+workbench loads a saved local turn whose last stored state is Pending or
+NeedsInput, `ChatModel._deserializeRequest` already cancels it because the
+original invocation isn't attached to that document. `history-interrupted`
+adds an explanatory result when that saved response has no prior error.
+`history-interrupted-render` shows it beside the saved prompt and any
+partial response. The patch leaves live turns, explicit stops, completed
+turns, prior errors and queue behavior alone.
+
+Recovery requires a saved transcript. A browser or computer that is gone
+before the session file is written can still lose the latest turn, and old
+flat JSON that already stored an unfinished response as Cancelled lacks the
+state needed for this message. The restored turn does not resume or resend
+its request. Each patch requires one anchor and verifies one replacement.
+
 Offline test against the pristine bundle (patches a copy, runs the patched store on real files
 in the folder `editor-state.sh` prepares):
 

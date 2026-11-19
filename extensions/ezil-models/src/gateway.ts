@@ -876,7 +876,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     let retriedAfter: { error: GatewayError; stage: AppFailureStage } | undefined;
     const report = (outcome: AppFailure['outcome'], error: unknown, at: AppFailureStage) => {
         try {
-            options.onOutcome?.(appFailure({ outcome, error, stage: at, model: model.model, clientRequestId: idempotencyKey, gatewayRequestId: requestId,
+            options.onOutcome?.(appFailure({ outcome, error, stage: at, model: model.model, clientRequestId: idempotencyKey, gatewayRequestId: requestId, httpStatus: status,
                 attempts, durationMs: Math.max(0, now() - started), ...(outcome === 'cancelled' ? { cancellationSource: 'caller' as const } : {}) }));
         } catch { /* An observer never changes the turn or its telemetry. */ }
     };

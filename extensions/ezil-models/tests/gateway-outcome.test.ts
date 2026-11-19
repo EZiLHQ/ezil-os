@@ -45,7 +45,7 @@ for (const protocol of ['Messages', 'Responses'] as const) describe(`${protocol}
             reason: 'stream_error_event', upstream_type: 'overloaded_error', error_code: 'stream_interrupted', origin: 'response' });
         expect(records).toHaveLength(1);
         expect(records[0]).toMatchObject({ source: 'ezil_chat', operation: 'chat_request', category: 'provider', code: 'provider_overloaded', stage: 'stream',
-            outcome: 'failed', clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID, attempt: 1, retryable: true });
+            outcome: 'failed', clientRequestId: CLIENT_ID, gatewayRequestId: GATEWAY_ID, attempt: 1, retryable: true, httpStatus: 200 });
         valid(records);
         expect(JSON.stringify(records)).not.toContain('PRIVATE'); expect(logs.join()).not.toContain('PRIVATE');
     });
@@ -59,7 +59,8 @@ for (const protocol of ['Messages', 'Responses'] as const) describe(`${protocol}
         const records: AppFailure[] = [];
         const s = server(() => new Response(new ReadableStream({ pull(c) { c.error(new TypeError(SENTINEL)); } }), { headers: headers() }));
         expect(await failureOf(turn(s.fetch, { onOutcome: record => records.push(record) }))).toMatchObject({ reason: 'connection_reset' });
-        expect(records).toEqual([expect.objectContaining({ category: 'interrupted', streamReason: 'eof', stage: 'stream' })]);
+        expect(records).toEqual([expect.objectContaining({ category: 'interrupted', streamReason: 'eof', stage: 'stream',
+            gatewayRequestId: GATEWAY_ID, httpStatus: 200 })]);
     });
     test('a rate-limit retry then success: retrying (attempt 1, its own Gateway ID) then recovered (attempt 2, the new ID); same client key', async () => {
         const records: AppFailure[] = [];
