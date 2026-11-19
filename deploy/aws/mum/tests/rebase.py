@@ -682,6 +682,72 @@ class ComputerTests(unittest.TestCase):
                 COMPUTER.main()
             connection.assert_not_called()
 
+    def test_retained_target_requires_exact_staging_plan_or_prepare_with_retirement(self):
+        hint, digest = self.source(), 'b' * 64
+        self.assertNotIn('retainedTargetManifestSha256', COMPUTER.request('plan', self.computer, None, hint))
+        for operation in ('plan', 'prepare'):
+            sent = COMPUTER.request(operation, self.computer, None, hint, digest)
+            self.assertEqual(sent, dict(schemaVersion=1, operation=operation, computerId=self.computer, jobId=None,
+                                        sourceRetirementExecutionArn=hint, retainedTargetManifestSha256=digest))
+        for invalid in ('', 'A' * 64, 'b' * 63, 'sha256:' + digest, digest + '\n'):
+            with self.assertRaises(ValueError):
+                COMPUTER.request('prepare', self.computer, None, hint, invalid)
+        for operation in ('launch', 'verify', 'recover'):
+            with self.assertRaises(ValueError):
+                COMPUTER.request(operation, self.computer, self.job, None, digest)
+        with self.assertRaises(ValueError):
+            COMPUTER.request('plan', self.computer, None, None, digest)
+        self.addCleanup(COMPUTER.use_namespace, 'mum')
+        COMPUTER.use_namespace('prd')
+        with self.assertRaises(ValueError):
+            COMPUTER.request('plan', self.computer, None, self.source(), digest)
+
+    def test_retained_target_replays_exact_pending_prepare_and_rejects_changed_selector(self):
+        hint, digest = self.source(), 'b' * 64
+
+        def lost(sent, _):
+            self.assertEqual(manifest.read(self.journal)['pending'], sent)
+            raise TimeoutError()
+
+        with self.assertRaises(TimeoutError):
+            COMPUTER.operate('prepare', self.computer, None, self.journal, True, self.secret, lost, hint, digest)
+
+        pending = manifest.read(self.journal)
+        self.assertEqual(pending['pending']['retainedTargetManifestSha256'], digest)
+        calls = []
+
+        def found(sent, _):
+            calls.append(sent.copy())
+            return 200, self.reply(sent)
+
+        for changed_hint, changed_target in ((hint, None), (hint, 'c' * 64), (self.source(self.job), digest)):
+            with self.assertRaisesRegex(ValueError, 'pending retained target'):
+                COMPUTER.operate('prepare', self.computer, None, self.journal, True, self.secret, found,
+                                 changed_hint, changed_target)
+        self.assertEqual(calls, [])
+        self.assertEqual(manifest.read(self.journal), pending)
+
+        COMPUTER.operate('prepare', self.computer, None, self.journal, True, self.secret, found, hint, digest)
+        self.assertEqual(calls, [COMPUTER.request('plan', self.computer, None, hint, digest),
+                                 COMPUTER.request('prepare', self.computer, self.job, hint, digest)])
+        self.assertIsNone(manifest.read(self.journal)['pending'])
+
+    def test_retained_target_cli_dry_run_and_refuses_other_operations(self):
+        flag, digest = '--retained-target-manifest-sha256', 'b' * 64
+        arguments = ['--computer', self.computer, flag, digest, '--journal', str(self.journal)]
+        with patch.object(sys, 'argv', ['rebase_computer.py', 'prepare', *arguments,
+                          '--source-retirement-execution-arn', self.source()]), \
+                patch.object(COMPUTER.http.client, 'HTTPSConnection') as connection:
+            COMPUTER.main()
+            connection.assert_not_called()
+            self.assertIn('"retainedTargetManifestSha256":"' + digest + '"', sys.stdout.getvalue())
+        self.assertFalse(self.journal.exists())
+        for operation in ('prepare', 'launch', 'cancel-preparation', 'reconcile-release', 'park-failed-release'):
+            with patch.object(sys, 'argv', ['rebase_computer.py', operation, *arguments]), \
+                    patch.object(COMPUTER.http.client, 'HTTPSConnection') as connection, self.assertRaises(ValueError):
+                COMPUTER.main()
+            connection.assert_not_called()
+
     def source(self, job='33333333-3333-4333-8333-333333333333'):
         return COMPUTER.json_tool.MACHINE.replace(':stateMachine:', ':execution:') + ':computer-' + job
 

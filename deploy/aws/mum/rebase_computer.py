@@ -51,7 +51,7 @@ def use_namespace(name):
     SOURCE_EXECUTION = re.escape(json_tool.MACHINE.replace(':stateMachine:', ':execution:') + ':computer-') + UUID
 
 
-def request(operation, computer, job, retirement=None):
+def request(operation, computer, job, retirement=None, retained_target=None):
     need(operation in OPERATIONS, 'invalid operation')
     need(wire.matches(UUID, computer) or operation == 'recover' and computer is None, 'invalid computer UUID')
     need(job is None or wire.matches(UUID, job), 'invalid job UUID')
@@ -61,6 +61,11 @@ def request(operation, computer, job, retirement=None):
     if retirement is not None:
         need(operation in ('plan', 'prepare') and wire.matches(SOURCE_EXECUTION, retirement), 'retirement hint is only an exact selected namespace lifecycle execution on plan/prepare')
         sent['sourceRetirementExecutionArn'] = retirement
+    if retained_target is not None:
+        need(context.ENVIRONMENT == 'staging' and operation in ('plan', 'prepare') and retirement is not None
+             and wire.matches(r'[0-9a-f]{64}', retained_target),
+             'retained target requires an exact lowercase SHA-256 and a staging plan/prepare retirement hint')
+        sent['retainedTargetManifestSha256'] = retained_target
     return sent
 
 
@@ -302,8 +307,8 @@ def park_under_lock(computer, job, execution, snapshot, journal, apply, secret, 
     return observed
 
 
-def operate(operation, computer, job, journal, apply, secret, sender=send, retirement=None):
-    sent = request(operation, computer, job, retirement)
+def operate(operation, computer, job, journal, apply, secret, sender=send, retirement=None, retained_target=None):
+    sent = request(operation, computer, job, retirement, retained_target)
     journal = context.path(journal)
     need(journal.is_absolute() and not journal.is_symlink(), 'absolute non-symlink journal required')
     state = wire.read(journal, 16384) if journal.exists() else None
@@ -317,7 +322,13 @@ def operate(operation, computer, job, journal, apply, secret, sender=send, retir
         need(state['jobId'] is None or wire.matches(UUID, state['jobId']), 'journal job mismatch')
         if state['pending'] is not None:
             pending = state['pending']
-            need(request(pending['operation'], pending['computerId'], pending['jobId'], pending.get('sourceRetirementExecutionArn')) == pending, 'pending request mismatch')
+            pending_retirement = pending.get('sourceRetirementExecutionArn')
+            pending_target = pending.get('retainedTargetManifestSha256')
+            need(request(pending['operation'], pending['computerId'], pending['jobId'], pending_retirement, pending_target) == pending,
+                 'pending request mismatch')
+            if (operation == 'prepare' and pending_target is not None) or retained_target is not None:
+                need((retirement, retained_target) == (pending_retirement, pending_target),
+                     'pending retained target or retirement hint differs from requested work')
         if state['lastResponse'] is not None:
             response(state['lastResponse'], request('plan', state['computerId'], state['jobId']))
         sent['jobId'] = state['jobId']
@@ -330,7 +341,7 @@ def operate(operation, computer, job, journal, apply, secret, sender=send, retir
     # A lost create result is reconciled with plan; never issue a second unbound prepare.
     if state['pending'] is not None and state['jobId'] is None:
         need(state['computerId'] is not None, 'uncertain request needs explicit job')
-        status, observed = sender(request('plan', state['computerId'], None, state['pending'].get('sourceRetirementExecutionArn')), secret)
+        status, observed = sender(request('plan', state['computerId'], None, pending_retirement, pending_target), secret)
         need(status == 200 and observed['jobId'] is not None, 'unconfirmed prepare; keep journal and reconcile server job')
         state.update(jobId=observed['jobId'], lastResponse=observed, pending=None)
         sent['jobId'] = observed['jobId']
@@ -361,6 +372,7 @@ def main():
     parser.add_argument('--source-execution-arn')
     parser.add_argument('--snapshot-id')
     parser.add_argument('--source-retirement-execution-arn')
+    parser.add_argument('--retained-target-manifest-sha256')
     parser.add_argument('--journal', type=Path)
     parser.add_argument('--namespace', choices=('mum', 'prd'), default='mum')
     parser.add_argument('--origin')
@@ -370,6 +382,8 @@ def main():
     use_namespace(args.namespace)
     need(args.origin in (None, ORIGIN), 'namespace authority origin mismatch')
     need(not args.check or args.operation == CANCEL, '--check is only for cancel-preparation')
+    need(args.retained_target_manifest_sha256 is None or args.operation in ('plan', 'prepare'),
+         'retained target is only for plan or prepare')
     if args.operation == CANCEL:
         need(args.source_execution_arn is None and args.source_retirement_execution_arn is None and args.journal is None
              and args.snapshot_id is None, 'cancel-preparation takes only --computer, --job and --check or --apply')
@@ -393,11 +407,12 @@ def main():
         reconcile_release(args.computer, args.job, args.source_execution_arn, args.apply, os.environ.get('EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET', ''))
         return
     need(args.source_execution_arn is None, 'source hint is only for reconcile-replacement or reconcile-release')
-    request(args.operation, args.computer, args.job, args.source_retirement_execution_arn)
+    request(args.operation, args.computer, args.job, args.source_retirement_execution_arn, args.retained_target_manifest_sha256)
     journal = args.journal or Path(f'/root/ezil-aws-{json_tool.NAMESPACE}/rebase-computers') / ((args.computer or args.job) + '.json')
     # Use only the existing environment name; never a credential file, CLI argument or log.
     secret = os.environ.get('EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET', '')
-    operate(args.operation, args.computer, args.job, journal, args.apply, secret, retirement=args.source_retirement_execution_arn)
+    operate(args.operation, args.computer, args.job, journal, args.apply, secret,
+            retirement=args.source_retirement_execution_arn, retained_target=args.retained_target_manifest_sha256)
 
 
 if __name__ == '__main__':

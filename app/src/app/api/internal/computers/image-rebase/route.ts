@@ -39,6 +39,7 @@ export async function POST(req: Request): Promise<Response> {
         const { starter, executions, describer } = sharedAwsSdkCollaborators();
         if (!starter || !executions || !describer?.describeSnapshot) return Response.json({ error: 'image_rebase_unavailable' }, { status: 503, headers });
         const result = await handleImageRebase({ store: createImageJobStore(db), env: process.env, now: () => new Date(), starter, executions, meter: billingComputeMeter(),
+            allowRetainedTarget: true,
             describer: { describeSnapshot: describer.describeSnapshot.bind(describer), describeVolume: describer.describeVolume.bind(describer),
                 describeForEnrollment: describer.describeForEnrollment.bind(describer) }, desktopHealthy: p => imageDesktopHealthy(p, process.env) }, input);
         return Response.json(result.body, { status: result.status, headers });

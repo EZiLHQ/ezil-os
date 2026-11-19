@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { z } from 'zod';
 import { LifecycleDeploymentSchema, SourceLifecycleDeploymentSchema, type SourceLifecycleDeployment, type LifecycleDeployment } from './aws-intent';
 import { AWS_REGION_PATTERN } from './aws-config';
@@ -50,8 +51,33 @@ export function parseRebaseRelease(raw: unknown, deployment: LifecycleDeployment
 const BOOT_TUPLE = ['accountId', 'region', 'namespace', 'amiId', 'launchTemplateId', 'launchTemplateVersion', 'stateMachineVersionArn'] as const;
 const IMAGE_TUPLE = ['lowerImageDigest', 'previousLowerImageDigest', 'preparationStateMachineVersionArn', 'recoveryStateMachineVersionArn'] as const;
 const TUPLE = [...BOOT_TUPLE, ...IMAGE_TUPLE] as const;
+export interface RetainedRebaseManifestPins {
+    activeManifestSha256: string;
+    retainedManifestSha256: string;
+    interveningManifestSha256?: string;
+}
+
+/** Release records are flat and ASCII. Canonicalize named fields independently of registry key order. */
+export function rebaseManifestSha256(release: RebaseRelease): string {
+    const checked = RebaseReleaseSchema.parse(release);
+    const canonical = JSON.stringify(Object.fromEntries(Object.keys(checked).sort().map(key => [key, checked[key as keyof RebaseRelease]])));
+    return createHash('sha256').update(canonical).digest('hex');
+}
+
+function pinnedManifest(records: RebaseSourceRelease[], sha256: string): RebaseRelease {
+    const matches = records.flatMap(record => {
+        const full = RebaseReleaseSchema.safeParse(record);
+        return full.success && rebaseManifestSha256(full.data) === sha256 ? [full.data] : [];
+    });
+    if (matches.length !== 1) throw new Error('release_mismatch');
+    return matches[0]!;
+}
+
+const linksTo = (previous: RebaseRelease, next: RebaseRelease) =>
+    next.previousLowerImageDigest === previous.lowerImageDigest && next.previousLowerImageRef === previous.lowerImageRef;
+
 /** Validate registry evidence before deciding whether the source needs an EC2 observation. */
-export function rebaseReleaseCandidates(entry: unknown, lowerImageDigest: string | null) {
+export function rebaseReleaseCandidates(entry: unknown, lowerImageDigest: string | null, pins?: RetainedRebaseManifestPins) {
     if (lowerImageDigest === null) throw new Error('source_digest_unknown');
     if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('release_mismatch');
     const { releases, ...rawDeployment } = entry as Record<string, unknown>;
@@ -63,13 +89,29 @@ export function rebaseReleaseCandidates(entry: unknown, lowerImageDigest: string
     if (targets.length !== 1 || sources.length === 0) throw new Error('release_mismatch');
     const target = RebaseReleaseSchema.parse(targets[0]);
     const repository = target.lowerImageRef.split('@')[0]!;
-    return { sources, target, deployment, repository };
+    if (!pins) return { sources, target, deployment, repository };
+
+    if (rebaseManifestSha256(target) !== pins.activeManifestSha256) throw new Error('release_mismatch');
+    const retained = pinnedManifest(records, pins.retainedManifestSha256);
+    const intervening = pins.interveningManifestSha256 ? pinnedManifest(records, pins.interveningManifestSha256) : null;
+    const chain = intervening ? [retained, intervening, target] : [retained, target];
+    if (new Set(chain.map(release => release.lowerImageDigest)).size !== chain.length
+        || chain.some(release => !(['accountId', 'region', 'namespace', 'launchTemplateId'] as const).every(key => release[key] === target[key])
+            || release.lowerImageRef !== `${repository}@${release.lowerImageDigest}`
+            || release.previousLowerImageRef !== `${repository}@${release.previousLowerImageDigest}`)) {
+        throw new Error('release_mismatch');
+    }
+    if (retained.previousLowerImageDigest !== lowerImageDigest
+        || (intervening ? !linksTo(retained, intervening) || !linksTo(intervening, target) : !linksTo(retained, target))) {
+        throw new Error('unsupported_predecessor');
+    }
+    return { sources, target: retained, deployment: LifecycleDeploymentSchema.parse(sourceDeploymentFor(deployment, retained)), repository };
 }
 
 /** A1/B2: an AMI is provider evidence, never HTTP input; a unique lower needs no observation.
  * R2: a released pool host's proven launch tuple selects its record exactly, never an alias by lower or AMI alone. */
-export function resolveRebaseReleases(entry: unknown, lowerImageDigest: string | null, observedSourceAmiId?: string, provisioned?: LifecycleDeployment) {
-    const { sources, target, deployment, repository } = rebaseReleaseCandidates(entry, lowerImageDigest);
+export function resolveRebaseReleases(entry: unknown, lowerImageDigest: string | null, observedSourceAmiId?: string, provisioned?: LifecycleDeployment, pins?: RetainedRebaseManifestPins) {
+    const { sources, target, deployment, repository } = rebaseReleaseCandidates(entry, lowerImageDigest, pins);
     // Legacy provision documents omitted the whole image group. Validate their original shape; never fill it from a registry record.
     const legacyProvisioned = provisioned && IMAGE_TUPLE.every(k => !Object.prototype.hasOwnProperty.call(provisioned, k));
     if (legacyProvisioned) LifecycleDeploymentSchema.parse(provisioned);
@@ -82,7 +124,10 @@ export function resolveRebaseReleases(entry: unknown, lowerImageDigest: string |
     const source = matches[0]!;
     if (source.accountId !== target.accountId || source.region !== target.region || source.namespace !== target.namespace
         || source.lowerImageRef.split('@')[0] !== repository) throw new Error('release_mismatch');
-    if (target.previousLowerImageDigest !== lowerImageDigest) throw new Error('unsupported_predecessor');
+    if (target.previousLowerImageDigest !== lowerImageDigest
+        || (pins && (source.launchTemplateId !== target.launchTemplateId || target.previousLowerImageRef !== source.lowerImageRef))) {
+        throw new Error('unsupported_predecessor');
+    }
     return { source, target, deployment, repository };
 }
 

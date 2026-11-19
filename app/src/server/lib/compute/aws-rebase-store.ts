@@ -16,6 +16,7 @@ import { parseRebaseRelease, parseRebaseSourceRelease, rebaseReleaseCandidates, 
 import { ImageJobConflictError, lockImagePlacement, setImageReservation, writeImagePlacement, recordImageUsage, withAdmission, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, readImageAdmissionCounters, type ImagePlacement, type ImagePlacementFields, type AdmissionLock, type PlacementDb, type PlacementExecutor } from './placement';
 import { reverseMoveHolds } from './provider-reverse-store';
 import { paidUserHoursExemption, type UserHoursExemption } from './paid-compute-policy';
+import { isRetainedRebaseJob, readRetainedRebaseApproval, retainedRebaseJobId } from './aws-retained-rebase';
 
 export const IMAGE_JOB_PHASES = ['reserved', 'fencing', 'snapshot_pending', 'snapshot_ready', 'launch_pending', 'verifying', 'failed', 'unconfirmed', 'recovery_pending', 'restore_pending', 'rebind_pending', 'succeeded', 'recovered', 'cancelled'] as const;
 export type ImageJobPhase = typeof IMAGE_JOB_PHASES[number];
@@ -454,8 +455,9 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env, use
                 return false;
             });
         },
-        async reserve(candidate: ImageJob, approvedRepositoryUri: string, stoppedOnly = false): Promise<ImageJob> {
+        async reserve(candidate: ImageJob, approvedRepositoryUri: string, stoppedOnly = false, retainedPin?: string): Promise<ImageJob> {
             const j = validateImageJob(candidate);
+            if (isRetainedRebaseJob(j) !== Boolean(retainedPin)) throw new ImageJobConflictError();
             const prep = buildRebasePreparation(parseRebaseJson(j.preparationDocument) as Parameters<typeof buildRebasePreparation>[0]);
             parseRebaseSourceRelease(j.sourceRelease, prep.intent.sourceDeployment, approvedRepositoryUri);
             parseRebaseRelease(j.targetRelease, prep.intent.deployment, approvedRepositoryUri);
@@ -466,6 +468,19 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env, use
                 await assertOwner(tx, j);
                 const existing = await active(tx, j.computerId);
                 if (!p || p.ownerUserId !== j.ownerUserId) throw new ImageJobConflictError();
+                if (retainedPin) {
+                    const retirement = prep.intent.releasedPoolHost ?? prep.intent.retiredSource ?? prep.intent.releasedDedicatedHost;
+                    if (stoppedOnly || !retirement || retainedRebaseJobId(j, retainedPin) !== j.jobId) throw new ImageJobConflictError();
+                    try {
+                        const approval = readRetainedRebaseApproval(env, p, retainedPin);
+                        const map = parseRebaseJson(env[LIFECYCLE_DEPLOYMENTS_ENV] ?? '{}', 65536) as Record<string, unknown>;
+                        const retained = rebaseReleaseCandidates(map[p.region!], p.lowerImageDigest, approval);
+                        if (!equal(retained.target, j.targetRelease) || !equal(retained.deployment, prep.intent.deployment)
+                            || j.sourceRelease.launchTemplateId !== retained.target.launchTemplateId
+                            || j.sourceRelease.lowerImageRef !== retained.target.previousLowerImageRef
+                            || !retained.sources.some(source => equal(source, j.sourceRelease))) throw new ImageJobConflictError();
+                    } catch { throw new ImageJobConflictError(); }
+                }
                 if (existing) {
                     if (p.imageUpgradeJobId !== existing.jobId || !equal(existing, j)) throw new ImageJobConflictError();
                     return existing;

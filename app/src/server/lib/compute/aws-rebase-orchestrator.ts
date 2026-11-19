@@ -11,21 +11,24 @@ import type { LifecycleStarter } from './aws-ec2';
 import type { LifecycleExecutionReader } from './aws-receipts';
 import { buildLifecycleWork, LIFECYCLE_DEPLOYMENTS_ENV, type LifecycleDeployment } from './aws-intent';
 import { buildRebasePreparation, validateRebaseSnapshotReceipt } from './aws-rebase-preparation';
-import { parseRebaseJson, RebaseUuid } from './aws-rebase-json';
-import { rebaseReleaseCandidates, resolveRebaseReleases, sourceDeploymentFor } from './aws-rebase-release';
+import { parseRebaseJson, RebaseHash, RebaseUuid } from './aws-rebase-json';
+import { rebaseManifestSha256, rebaseReleaseCandidates, resolveRebaseReleases, sourceDeploymentFor } from './aws-rebase-release';
 import { readReleasedPoolHostProof, readRetiredSourceProof } from './aws-historical-source';
 import { readReleasedDedicatedHostProof } from './aws-dedicated-source';
 import { createImageJobStore, IMAGE_JOB_FAILURE_CODES, isTerminalImageJob, newReservedImageJob, type ImageJob } from './aws-rebase-store';
 import { assertImageExecution, preparationFor, launchFor, verifyImageSnapshot, ImageLaunchReceiptSchema, type RebaseSnapshotDescriber, type Execution } from './aws-rebase-evidence';
 import { isDefiniteAwsRefusal, isExecutionAbsent, toAwsClientError } from './aws-errors';
 import { ImageJobConflictError, type ImagePlacement } from './placement';
+import { isRetainedRebaseJob, readRetainedRebaseApproval, retainedRebaseJobId } from './aws-retained-rebase';
 
 /** `sourceRetirementExecutionArn`: plan/prepare only, a lookup hint for the release of a released pool host (DESIGN R, a) or of
  * an aged-out regular host (R2); nothing in it is trusted (aws-historical-source readReleasedPoolHostProof/readRetiredSourceProof). */
 export const ImageRebaseRequestSchema = z.object({ schemaVersion: z.literal(1), operation: z.enum(['plan', 'prepare', 'launch', 'verify', 'recover']),
-    computerId: RebaseUuid.nullable(), jobId: RebaseUuid.nullable(), sourceRetirementExecutionArn: z.string().min(1).max(300).optional() }).strict()
+    computerId: RebaseUuid.nullable(), jobId: RebaseUuid.nullable(), sourceRetirementExecutionArn: z.string().min(1).max(300).optional(),
+    retainedTargetManifestSha256: RebaseHash.optional() }).strict()
     .refine(r => (r.operation === 'recover' ? r.jobId !== null : r.computerId !== null)
-        && (r.sourceRetirementExecutionArn === undefined || ['plan', 'prepare'].includes(r.operation)));
+        && (r.sourceRetirementExecutionArn === undefined || ['plan', 'prepare'].includes(r.operation))
+        && (r.retainedTargetManifestSha256 === undefined || r.sourceRetirementExecutionArn !== undefined));
 export type ImageRebaseRequest = z.infer<typeof ImageRebaseRequestSchema>;
 export interface ImageRebaseDeps {
     store: ReturnType<typeof createImageJobStore>; env: Env; now: () => Date;
@@ -34,6 +37,8 @@ export interface ImageRebaseDeps {
     desktopHealthy: (p: ImagePlacement) => Promise<boolean>;
     newId?: () => string;
     meter?: ComputeMeter;
+    /** Set only by the authenticated workflow operator route. */
+    allowRetainedTarget?: true;
 }
 type Code = typeof IMAGE_JOB_FAILURE_CODES[number];
 export type ImageRebaseResponse = { status: number; body: { schemaVersion: 1; computerId: string; jobId: string | null;
@@ -79,6 +84,10 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, aut
         const inspected = await deps.store.inspect(computerId!);
         const p = inspected.placement;
         if (!p || p.provider !== 'aws-ec2' || !p.region) return reply(409, false, 'source_identity_mismatch');
+        const retainedPin = input.retainedTargetManifestSha256;
+        if (retainedPin && (automatic || !deps.allowRetainedTarget)) return reply(409, false, 'operator_required');
+        const approval = retainedPin ? readRetainedRebaseApproval(deps.env, p, retainedPin) : undefined;
+        const deploymentEntry = () => (parseRebaseJson(deps.env[LIFECYCLE_DEPLOYMENTS_ENV] ?? '{}', 65536) as Record<string, unknown>)[p.region!];
         if (automatic) {
             if (p.ownerUserId !== automatic.ownerUserId || input.operation !== 'prepare'
                 || input.jobId !== null || input.sourceRetirementExecutionArn !== undefined) return reply(409, false);
@@ -104,10 +113,26 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, aut
         if (input.operation !== 'recover') j = inspected.job;
         if (input.jobId && j?.jobId !== input.jobId) {
             const terminal = await deps.store.read(input.jobId);
-            if (terminal?.computerId === computerId && isTerminalImageJob(terminal.phase) && ['plan', 'verify'].includes(input.operation)) {
+            if (terminal?.computerId === computerId && isTerminalImageJob(terminal.phase) && ['plan', 'verify'].includes(input.operation)
+                && !retainedPin && (deps.allowRetainedTarget || !isRetainedRebaseJob(terminal))) {
                 j = terminal; return reply(200, terminal.phase === 'succeeded', terminal.failureCode);
             }
             throw new ImageJobConflictError();
+        }
+        if (j) {
+            const retainedJob = isRetainedRebaseJob(j);
+            if (retainedJob || approval) {
+                if (!retainedJob || !deps.allowRetainedTarget) throw new ImageJobConflictError();
+                if (input.operation === 'plan' || input.operation === 'prepare') {
+                    const intent = preparationFor(j).intent;
+                    const proof = intent.releasedPoolHost ?? intent.retiredSource ?? intent.releasedDedicatedHost;
+                    if (!approval || rebaseManifestSha256(j.targetRelease) !== retainedPin
+                        || proof?.releaseExecutionArn !== input.sourceRetirementExecutionArn
+                        || !isDeepStrictEqual(rebaseReleaseCandidates(deploymentEntry(), p.lowerImageDigest, approval).deployment, intent.deployment)) {
+                        throw new ImageJobConflictError();
+                    }
+                } else if (input.jobId !== j.jobId) throw new ImageJobConflictError();
+            }
         }
         if (!isAwsComputersEnabled(deps.env)) return reply(503, false, 'operator_required');
         if (input.operation === 'recover') {
@@ -168,10 +193,9 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, aut
             return proof;
         };
         const resolve = async () => {
-            const map = parseRebaseJson(deps.env[LIFECYCLE_DEPLOYMENTS_ENV] ?? '{}', 65536) as Record<string, unknown>;
-            const entry = map[p.region!];
+            const entry = deploymentEntry();
             let candidates: ReturnType<typeof rebaseReleaseCandidates>;
-            try { candidates = rebaseReleaseCandidates(entry, p.lowerImageDigest); }
+            try { candidates = rebaseReleaseCandidates(entry, p.lowerImageDigest, approval); }
             catch (error) { throw new Error(failure(error) ?? 'release_mismatch'); }
             // Proof kind from trusted inputs only, before any kind-specific proof: a pool claim row, else the registry's source
             // count for the placement's recorded lower (unique => R2 only; shared => dedicated only). The request hint never selects it.
@@ -179,6 +203,7 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, aut
             const released = await releasedSource(candidates.deployment);
             const dedicated = released || !shared ? null : await dedicatedSource(candidates.deployment);
             const retired = released || shared ? null : await retiredSource(candidates.deployment, false);
+            if (approval && !released && !retired && !dedicated) throw new Error('source_identity_mismatch');
             let imageId: string | undefined;
             if (!released && !dedicated && !retired && shared) {
                 if (!p.instanceId) throw new Error('source_identity_mismatch');
@@ -194,7 +219,7 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, aut
                     throw new Error('source_identity_mismatch');
                 imageId = host.imageId;
             }
-            try { return { ...resolveRebaseReleases(entry, p.lowerImageDigest, imageId, (released ?? dedicated)?.provisioned), released, dedicated, retired }; }
+            try { return { ...resolveRebaseReleases(entry, p.lowerImageDigest, imageId, (released ?? dedicated)?.provisioned, approval), released, dedicated, retired }; }
             catch (error) { throw new Error(failure(error) ?? 'release_mismatch'); }
         };
         if (input.operation === 'plan') {
@@ -210,8 +235,10 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, aut
             if (!p.instanceId || !p.volumeId || !p.fsUuid || !p.fenceToken || !p.instanceType) return reply(409, false, 'source_identity_mismatch');
             const volume = await deps.describer.describeVolume(p.region, p.volumeId);
             if (!volume || !volume.sizeGiB) return reply(503, false, 'volume_not_available');
-            const id = automatic ? automaticJobId({ computerId: p.computerId, sourceGeneration: p.generation,
-                sourceLeaseEpoch: p.leaseEpoch }, r.target.amiId) : (deps.newId ?? randomUUID)();
+            const allocation = { computerId: p.computerId, sourceGeneration: p.generation,
+                sourceLeaseEpoch: p.leaseEpoch, sourceFenceToken: p.fenceToken };
+            const id = retainedPin ? retainedRebaseJobId(allocation, retainedPin)
+                : automatic ? automaticJobId(allocation, r.target.amiId) : (deps.newId ?? randomUUID)();
             const prep = buildRebasePreparation({ schemaVersion: 1, jobId: id, computerId: p.computerId,
                 sourceInstanceId: p.instanceId, sourceVolumeId: p.volumeId, fsUuid: p.fsUuid, sourceGeneration: p.generation,
                 sourceLeaseEpoch: p.leaseEpoch, sourceFenceToken: p.fenceToken, fromDigest: r.source.lowerImageDigest,
@@ -222,7 +249,7 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, aut
                     : r.dedicated ? { releasedDedicatedHost: { imageJobId: r.dedicated.imageJobId, provisionDigest: r.dedicated.provisionDigest,
                         provisionExecutionArn: r.dedicated.provisionExecutionArn, releaseExecutionArn: r.dedicated.releaseExecutionArn } } : {}) });
             j = await deps.store.reserve(newReservedImageJob({ preparation: prep, ownerUserId: p.ownerUserId,
-                sourceRelease: r.source, targetRelease: r.target }), r.repository, Boolean(automatic));
+                sourceRelease: r.source, targetRelease: r.target }), r.repository, Boolean(automatic), retainedPin);
         }
         if (isTerminalImageJob(j.phase)) return reply(200, j.phase === 'succeeded');
         if (j.recoveryDocument) {
