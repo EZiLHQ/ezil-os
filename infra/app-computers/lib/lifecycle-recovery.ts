@@ -11,6 +11,7 @@ import { GuardedTarget, ruleArn } from './guarded-target.js';
 import { historyReadStatement, imageWorkflowDenies } from './rebase-preparation.js';
 import { applyImageJobBoundary, recoveryRestoreStatements } from './image-job-boundary.js';
 import { startVersionStatements, registerImageWorkflow, registeredImageWorkflows } from './app-caller.js';
+import type { RetainedRebaseBridge } from './retained-rebase-bridge.js';
 import { priorVersion, transitionObserverGrant, type TransitionStateMachineVersions } from './observer-transition.js';
 export type { TransitionObserverVersions, TransitionStateMachineVersions } from './observer-transition.js';
 
@@ -18,11 +19,13 @@ export class ComputerLifecycleRecovery extends Construct {
     readonly machine: states.CfnStateMachine;
     readonly historyKey: kms.IKey;
     readonly version: states.CfnStateMachineVersion;
-    constructor(scope: Construct, id: string, props: { settings: RecoverySettings; sourceHistoryKey: kms.IKey; enabled?: boolean; retainedObserverVersionLogicalId?: string; transitionObserverVersionLogicalId?: string; transitionStateMachineVersions?: TransitionStateMachineVersions }) {
+    constructor(scope: Construct, id: string, props: { settings: RecoverySettings; sourceHistoryKey: kms.IKey; enabled?: boolean; retainedObserverVersionLogicalId?: string; transitionObserverVersionLogicalId?: string; transitionStateMachineVersions?: TransitionStateMachineVersions; retainedBridge?: RetainedRebaseBridge }) {
         super(scope, id);
         const s = RecoverySettingsSchema.parse(props.settings), d = s.lifecycle.deployment, r = d.region;
         const originalMachine = machineArn(d.stateMachineVersionArn), recoveryMachine = machineArn(s.recoveryVersionArn);
         const retained = props.retainedObserverVersionLogicalId;
+        const bridge = props.retainedBridge;
+        if (bridge && (retained || d.namespace !== 'mum')) throw new Error('invalid_retained_rebase_bridge');
         const key = new kms.Key(this, 'HistoryKey', { enableKeyRotation: true, removalPolicy: RemovalPolicy.RETAIN });
         this.historyKey = key;
         Tags.of(key).add('ezil:namespace', d.namespace);
@@ -60,6 +63,7 @@ export class ComputerLifecycleRecovery extends Construct {
             if (retained !== undefined) throw new Error('transition_conflicts_with_retained_source');
             observer.addToRolePolicy(historyReadStatement(r, key.keyArn, priorVersion(s.recoveryVersionArn, transition.recovery)));
         }
+        if (bridge) observer.addToRolePolicy(historyReadStatement(r, key.keyArn, [bridge.versions.recovery]));
         if (d.preparationStateMachineVersionArn) {
             const registration = registeredImageWorkflows(this, d.stateMachineVersionArn).find(v => v.version === d.preparationStateMachineVersionArn);
             if (!registration?.authorityKeyArn) throw new Error('preparation_authority_wiring_missing');
@@ -72,10 +76,12 @@ export class ComputerLifecycleRecovery extends Construct {
             if (transition?.preparation && transition.lifecycle)
                 observer.addToRolePolicy(historyReadStatement(r, props.sourceHistoryKey.keyArn, [...priorVersion(d.preparationStateMachineVersionArn, transition.preparation),
                     ...priorVersion(d.stateMachineVersionArn, transition.lifecycle)]));
+            if (bridge)
+                observer.addToRolePolicy(historyReadStatement(r, props.sourceHistoryKey.keyArn, [bridge.versions.preparation, bridge.versions.lifecycle]));
             observer.addToRolePolicy(new iam.PolicyStatement({ actions: ['secretsmanager:GetSecretValue'], resources: [s.lifecycle.authoritySecretArn] }));
             observer.addToRolePolicy(new iam.PolicyStatement({ actions: ['kms:Decrypt'], resources: [registration.authorityKeyArn], conditions: { StringEquals: {
                 'kms:ViaService': `secretsmanager.${r}.amazonaws.com`, 'kms:EncryptionContext:SecretARN': s.lifecycle.authoritySecretArn } } }));
-            registerImageWorkflow(this, d.stateMachineVersionArn, s.recoveryVersionArn, key.keyArn, undefined, false, transition?.recovery);
+            registerImageWorkflow(this, d.stateMachineVersionArn, s.recoveryVersionArn, key.keyArn, undefined, false, transition?.recovery, bridge?.versions.recovery);
         }
         // Only an explicitly retained legacy graph needs a separate image role.
         // Already image-enabled/fresh stacks preserve their existing fixed-role layout.
@@ -114,6 +120,7 @@ export class ComputerLifecycleRecovery extends Construct {
             if (retained !== undefined) throw new Error('transition_conflicts_with_retained_source');
             transitionObserverGrant(this, observer, props.transitionObserverVersionLogicalId, imageRole ?? role);
         }
+        if (bridge) transitionObserverGrant(this, observer, bridge.observers.recovery, imageRole ?? role, 'RetainedBridge');
         for (const executionRole of [role, ...(imageRole && imageRole !== role ? [imageRole] : [])]) {
             key.grantEncryptDecrypt(executionRole);
             executionRole.addToPolicy(new iam.PolicyStatement({ actions: ['ec2:StopInstances', 'ec2:TerminateInstances'],

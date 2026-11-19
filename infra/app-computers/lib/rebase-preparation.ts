@@ -2,6 +2,7 @@ import { join } from 'node:path';
 import { CfnOutput, Duration, RemovalPolicy, Tags, aws_iam as iam, aws_kms as kms, aws_lambda as lambda,
     aws_lambda_nodejs as nodejs, aws_logs as logs, aws_stepfunctions as states } from 'aws-cdk-lib';
 import { applyImageJobBoundary } from './image-job-boundary.js';
+import type { RetainedRebaseBridge } from './retained-rebase-bridge.js';
 import { priorVersion, transitionObserverGrant } from './observer-transition.js';
 import { Construct } from 'constructs';
 import type { Settings } from './lifecycle/contract.js';
@@ -51,7 +52,7 @@ export function preparationStatements(settings: Settings): iam.PolicyStatement[]
 export class RebasePreparation extends Construct {
     readonly machine: states.CfnStateMachine;
     readonly version: states.CfnStateMachineVersion;
-    constructor(scope: Construct, id: string, props: { settings: Settings; historyKey: kms.IKey; authorityKeyArn: string; lambdaReservedConcurrency?: number | null; transitionObserverVersionLogicalId?: string; transitionPreparationVersionArn?: string }) {
+    constructor(scope: Construct, id: string, props: { settings: Settings; historyKey: kms.IKey; authorityKeyArn: string; lambdaReservedConcurrency?: number | null; transitionObserverVersionLogicalId?: string; transitionPreparationVersionArn?: string; retainedBridge?: RetainedRebaseBridge }) {
         super(scope, id);
         const s = props.settings, d = s.deployment, name = `ezil-${d.namespace}-rebase-preparation`;
         const machineArn = `arn:aws:states:${d.region}:${d.accountId}:stateMachine:${name}`;
@@ -78,11 +79,14 @@ export class RebasePreparation extends Construct {
         // Promotion window: the exact prior preparation history-context row stays beside the current one.
         if (props.transitionPreparationVersionArn)
             observer.addToRolePolicy(historyReadStatement(d.region, props.historyKey.keyArn, priorVersion(d.preparationStateMachineVersionArn, props.transitionPreparationVersionArn)));
+        if (props.retainedBridge)
+            observer.addToRolePolicy(historyReadStatement(d.region, props.historyKey.keyArn, [props.retainedBridge.versions.preparation]));
         const role = new iam.Role(this, 'RebasePreparationRole', { roleName: name, path: `/ezil/${d.namespace}/`,
             assumedBy: new iam.ServicePrincipal('states.amazonaws.com', { conditions: { StringEquals: { 'aws:SourceAccount': d.accountId }, ArnEquals: { 'aws:SourceArn': machineArn } } }) });
         applyImageJobBoundary(role, d);
         role.addToPolicy(new iam.PolicyStatement({ actions: ['lambda:InvokeFunction'], resources: [observer.currentVersion.functionArn] }));
         if (props.transitionObserverVersionLogicalId) transitionObserverGrant(this, observer, props.transitionObserverVersionLogicalId, role);
+        if (props.retainedBridge) transitionObserverGrant(this, observer, props.retainedBridge.observers.preparation, role, 'RetainedBridge');
         role.addToPolicy(new iam.PolicyStatement({ actions: ['kms:Encrypt', 'kms:Decrypt', 'kms:GenerateDataKey'], resources: [props.historyKey.keyArn] }));
         for (const statement of preparationStatements(s)) role.addToPolicy(statement);
         role.addToPolicy(new iam.PolicyStatement({ actions: workflowLogActions, resources: ['*'] }));

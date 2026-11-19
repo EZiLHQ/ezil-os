@@ -2,12 +2,13 @@ import { CfnOutput, Stack, aws_iam as iam } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import { z } from 'zod';
 import { historyReadStatement } from './rebase-preparation.js';
+import type { RetainedRebaseBridge } from './retained-rebase-bridge.js';
 import { priorVersion, type TransitionStateMachineVersions } from './observer-transition.js';
 
 /** Owned constructs register their exact grants before the existing bin
  * creates AppCaller. No bin edit or guessed history key is needed. */
 /** `previousVersion`: the still-deployed earlier version of this workflow (promotion window): its exact prior history row is kept. */
-type ImageWorkflow = { version: string; historyKeyArn: string; authorityKeyArn?: string; appHistoryRead?: boolean; previousVersion?: string };
+type ImageWorkflow = { version: string; historyKeyArn: string; authorityKeyArn?: string; appHistoryRead?: boolean; previousVersion?: string; retainedVersion?: string };
 const imageReaders = new WeakMap<Stack, Map<string, iam.Role[]>>();
 export function registerImageHistoryReader(scope: Construct, lifecycleVersion: string, role: iam.Role) {
     const stack = Stack.of(scope), groups = imageReaders.get(stack) ?? new Map<string, iam.Role[]>();
@@ -19,17 +20,20 @@ function grantImageRead(role: iam.Role, item: ImageWorkflow) {
     role.addToPolicy(new iam.PolicyStatement({ actions: ['states:DescribeExecution'], resources: [
         item.version.replace(/:[1-9][0-9]*$/, '').replace(':stateMachine:', ':execution:') + ':computer-*'] }));
     role.addToPolicy(historyReadStatement(region, item.historyKeyArn, [item.version]));
-    if (item.previousVersion) role.addToPolicy(historyReadStatement(region, item.historyKeyArn, priorVersion(item.version, item.previousVersion)));
+    for (const version of [item.previousVersion, item.retainedVersion])
+        if (version) role.addToPolicy(historyReadStatement(region, item.historyKeyArn, priorVersion(item.version, version)));
 }
 const imageWorkflows = new WeakMap<Stack, Map<string, ImageWorkflow[]>>();
 /** `appHistoryRead`: the app caller may also read this workflow's execution history (opt-in, preparation only). */
 export function registerImageWorkflow(scope: Construct, lifecycleVersion: string, version: string, historyKeyArn: string, authorityKeyArn?: string,
-    appHistoryRead = false, previousVersion?: string) {
+    appHistoryRead = false, previousVersion?: string, retainedVersion?: string) {
     const stack = Stack.of(scope), groups = imageWorkflows.get(stack) ?? new Map<string, ImageWorkflow[]>();
     const list = groups.get(lifecycleVersion) ?? [];
     if (!list.some(v => v.version === version)) {
         if (previousVersion) priorVersion(version, previousVersion);
-        const item = { version, historyKeyArn, authorityKeyArn, appHistoryRead, ...(previousVersion ? { previousVersion } : {}) }; list.push(item);
+        if (retainedVersion) priorVersion(previousVersion ?? version, retainedVersion);
+        const item = { version, historyKeyArn, authorityKeyArn, appHistoryRead, ...(previousVersion ? { previousVersion } : {}),
+            ...(retainedVersion ? { retainedVersion } : {}) }; list.push(item);
         for (const role of imageReaders.get(stack)?.get(lifecycleVersion) ?? []) grantImageRead(role, item);
     }
     groups.set(lifecycleVersion, list); imageWorkflows.set(stack, groups);
@@ -159,7 +163,7 @@ export function appCallerTrust(p: z.infer<typeof ProviderSchema>): iam.PolicySta
 export class AppCaller extends Construct {
     readonly role: iam.Role;
     constructor(scope: Construct, id: string, props: { config: z.input<typeof AppCallerConfigSchema>; region: string; versionArns: string[]; historyKeyArn: string; ec2CallerRoleArns?: string[]; retainedLifecycleVersionArn?: string;
-        transitionStateMachineVersions?: TransitionStateMachineVersions }) {
+        transitionStateMachineVersions?: TransitionStateMachineVersions; retainedBridge?: RetainedRebaseBridge }) {
         super(scope, id);
         const config = AppCallerConfigSchema.parse({ ...props.config,
             ec2CallerRoleArns: props.ec2CallerRoleArns ?? props.config.ec2CallerRoleArns });
@@ -194,6 +198,13 @@ export class AppCaller extends Construct {
             if (!current) throw new Error('invalid_transition_state_machine_version');
             if (transition.lifecycle) this.role.addToPolicy(historyReadStatement(props.region, props.historyKeyArn, priorVersion(current, transition.lifecycle)));
         }
+        // StartExecution is already authorized on the same unqualified machine. The retained
+        // lifecycle version additionally needs its exact execution-history encryption context.
+        if (props.retainedBridge) {
+            this.role.addToPolicy(historyReadStatement(props.region, props.historyKeyArn, [props.retainedBridge.versions.lifecycle]));
+            // The app proves the fenced, retired source by reading its exact lifecycle history.
+            this.role.addToPolicy(historyReadStatement(props.region, props.historyKeyArn, [props.retainedBridge.sourceLifecycleVersion]));
+        }
         const added = props.versionArns.flatMap(v => registeredImageWorkflows(this, v));
         if (added.length) {
             const versions = [...new Set(added.map(v => v.version))];
@@ -207,8 +218,8 @@ export class AppCaller extends Construct {
                 v.replace(/:[1-9][0-9]*$/, '').replace(':stateMachine:', ':execution:') + ':computer-*') }));
             for (const key of new Set(added.map(v => v.historyKeyArn))) this.role.addToPolicy(historyReadStatement(props.region, key, added.filter(v => v.historyKeyArn === key).map(v => v.version)));
             // Promotion window: each registered workflow's exact prior history row (its still-deployed previous version).
-            for (const item of added) if (item.previousVersion)
-                this.role.addToPolicy(historyReadStatement(props.region, item.historyKeyArn, priorVersion(item.version, item.previousVersion)));
+            for (const item of added) for (const version of [item.previousVersion, item.retainedVersion])
+                if (version) this.role.addToPolicy(historyReadStatement(props.region, item.historyKeyArn, priorVersion(item.version, version)));
             this.role.addToPolicy(new iam.PolicyStatement({ actions: ['ec2:DescribeSnapshots'], resources: ['*'], conditions: { StringEquals: { 'aws:RequestedRegion': props.region } } }));
         }
         new CfnOutput(this, 'RoleArn', { value: this.role.roleArn });

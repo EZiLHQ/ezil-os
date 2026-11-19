@@ -5,7 +5,7 @@ import { DIGEST, TIME, strictJson } from './strict-json.js';
 const version = z.string().max(300).regex(/^arn:aws:states:[a-z0-9-]+:[0-9]{12}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*$/);
 const ref = z.string().max(512).regex(/^[0-9]{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com\/[a-z0-9][a-z0-9._/-]*@sha256:[0-9a-f]{64}$/);
 export const RELEASE_WORKFLOW_KEYS = ['stateMachineVersionArn', 'preparationStateMachineVersionArn', 'recoveryStateMachineVersionArn'] as const;
-const schema = z.object({
+export const ReleaseManifestSchema = z.object({
     schemaVersion: z.literal(1), accountId: z.string().regex(/^[0-9]{12}$/), region: z.string().regex(REGION_PATTERN), namespace: NamespaceSchema,
     amiId: z.string().regex(/^ami-[0-9a-f]{17}$/), recipeVersion: z.string().regex(/^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/)
         .refine(v => v.split('.').every(n => Number(n) <= 1073741823)),
@@ -14,14 +14,14 @@ const schema = z.object({
     preparationStateMachineVersionArn: version.nullable(), recoveryStateMachineVersionArn: version.nullable(),
     launchTemplateId: z.string().regex(/^lt-[0-9a-f]{17}$/), launchTemplateVersion: z.string().regex(/^[1-9][0-9]{0,9}$/), createdAt: TIME,
 }).strict();
-export type ReleaseManifest = z.infer<typeof schema>;
+export type ReleaseManifest = z.infer<typeof ReleaseManifestSchema>;
 
 /** Source-only null workflow references are amendment A1 legacy records. They
  * can never authorize maintenance or a target. Registry digests intentionally
  * need not equal baked lower IDs (classic and containerd stores differ). */
 export function parseReleaseManifest(raw: string, deployment: LifecycleDeployment | SourceLifecycleDeployment, approvedRepositoryUri: string,
     mode: 'target' | 'source' | 'maintenance' = 'target'): ReleaseManifest {
-    const r = schema.parse(strictJson(raw, 16384)), d = (mode === 'source' ? SourceLifecycleDeploymentSchema : LifecycleDeploymentSchema).parse(deployment);
+    const r = ReleaseManifestSchema.parse(strictJson(raw, 16384)), d = (mode === 'source' ? SourceLifecycleDeploymentSchema : LifecycleDeploymentSchema).parse(deployment);
     const fail = (): never => { throw new Error('release_mismatch'); };
     const repository = r.lowerImageRef.split('@')[0]!;
     if (repository !== approvedRepositoryUri || !repository.startsWith(`${r.accountId}.dkr.ecr.${r.region}.amazonaws.com/`)

@@ -27,20 +27,20 @@ export function priorVersion(current: string, previous: string | undefined): str
  * No wildcards: the only admitted resources are the two exact version Refs. The next rollout names the
  * then-previous version instead, and the older one is removed under its Retain policy.
  */
-export function transitionObserverGrant(scope: Construct, observer: lambda.Function, previousLogicalId: string, role: iam.IRole): lambda.CfnVersion {
+export function transitionObserverGrant(scope: Construct, observer: lambda.Function, previousLogicalId: string, role: iam.IRole, kind: 'Transition' | 'RetainedBridge' = 'Transition'): lambda.CfnVersion {
     const current = observer.currentVersion.node.defaultChild as lambda.CfnVersion;
     const currentId = Stack.of(scope).resolve(current.logicalId) as string;
     // Same construct (the 8-hex construct hash) but a different published version (the 32-hex asset hash).
     if (!LOGICAL_ID.test(previousLogicalId) || previousLogicalId.slice(0, -32) !== currentId.slice(0, -32) || previousLogicalId === currentId)
         throw new Error('invalid_transition_observer_version');
-    const previous = new lambda.CfnVersion(scope, 'TransitionObserverVersion', { functionName: observer.functionName });
+    const previous = new lambda.CfnVersion(scope, `${kind}ObserverVersion`, { functionName: observer.functionName });
     previous.overrideLogicalId(previousLogicalId);
     previous.applyRemovalPolicy(RemovalPolicy.RETAIN);
     if (previous.node.tryGetContext(PATH_METADATA_ENABLE_CONTEXT))
         previous.addMetadata('aws:cdk:path', observer.currentVersion.node.path + '/Resource');
     previous.addMetadata('aws:cdk:do-not-refactor', true);
     // A separate attachment keeps the default policy's exact current-version row unchanged.
-    new iam.Policy(scope, 'TransitionObserverPolicy', { roles: [role as iam.Role],
+    new iam.Policy(scope, `${kind}ObserverPolicy`, { roles: [role as iam.Role],
         statements: [new iam.PolicyStatement({ actions: ['lambda:InvokeFunction'], resources: [previous.ref] })] });
     return previous;
 }

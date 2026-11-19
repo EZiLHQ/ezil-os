@@ -10,6 +10,7 @@ import { lifecycleDefinition } from './lifecycle/definition.js';
 import { GuardedTarget, ruleArn } from './guarded-target.js';
 import { RebasePreparation, historyReadStatement } from './rebase-preparation.js';
 import { registerImageWorkflow, registerImageHistoryReader } from './app-caller.js';
+import type { RetainedRebaseBridge } from './retained-rebase-bridge.js';
 import { priorVersion, transitionObserverGrant, type TransitionObserverVersions, type TransitionStateMachineVersions } from './observer-transition.js';
 
 export const RetainedLifecycleSourceSchema = z.object({
@@ -27,11 +28,13 @@ export class ComputerLifecycle extends Construct {
     readonly version:states.CfnStateMachineVersion;
     readonly historyKey:kms.IKey;
     readonly preparation?: RebasePreparation;
-    constructor(scope:Construct,id:string,props:{settings:Settings;authorityKeyArn:string;notificationsEnabled?:boolean;lambdaReservedConcurrency?:number|null;alertTopicArn?:string;recoveryVersionArn?:string;retainedSource?:RetainedLifecycleSource;transitionObserverVersions?:Pick<TransitionObserverVersions,'lifecycle'|'preparation'>;transitionStateMachineVersions?:TransitionStateMachineVersions}){
+    constructor(scope:Construct,id:string,props:{settings:Settings;authorityKeyArn:string;notificationsEnabled?:boolean;lambdaReservedConcurrency?:number|null;alertTopicArn?:string;recoveryVersionArn?:string;retainedSource?:RetainedLifecycleSource;transitionObserverVersions?:Pick<TransitionObserverVersions,'lifecycle'|'preparation'>;transitionStateMachineVersions?:TransitionStateMachineVersions;retainedBridge?:RetainedRebaseBridge}){
         super(scope,id);const s=SettingsSchema.parse(props.settings),d=s.deployment,stack=Stack.of(this),r=d.region;
         const machineArn=d.stateMachineVersionArn.slice(0,d.stateMachineVersionArn.lastIndexOf(':'));
         const machineName=machineArn.split(':').at(-1)!;
+        const bridge = props.retainedBridge;
         const retained = props.retainedSource && RetainedLifecycleSourceSchema.parse(props.retainedSource);
+        if (bridge && (retained || d.namespace !== 'mum')) throw new Error('invalid_retained_rebase_bridge');
         if (retained && (!d.preparationStateMachineVersionArn || retained.amiId === d.amiId
             || retained.stateMachineVersionArn === d.stateMachineVersionArn
             || retained.stateMachineVersionArn.replace(/:[1-9][0-9]*$/, '') !== machineArn))
@@ -44,10 +47,11 @@ export class ComputerLifecycle extends Construct {
             if (props.recoveryVersionArn && props.recoveryVersionArn !== d.recoveryStateMachineVersionArn) throw new Error('recovery_version_mismatch');
             this.preparation = new RebasePreparation(this, 'Preparation', { settings: s, historyKey: key,
                 authorityKeyArn: props.authorityKeyArn, lambdaReservedConcurrency: props.lambdaReservedConcurrency,
+                retainedBridge: bridge,
                 ...(props.transitionObserverVersions?.preparation ? { transitionObserverVersionLogicalId: props.transitionObserverVersions.preparation } : {}),
                 ...(props.transitionStateMachineVersions?.preparation ? { transitionPreparationVersionArn: props.transitionStateMachineVersions.preparation } : {}) });
             registerImageWorkflow(this, d.stateMachineVersionArn, d.preparationStateMachineVersionArn, key.keyArn, props.authorityKeyArn, true,
-                props.transitionStateMachineVersions?.preparation);
+                props.transitionStateMachineVersions?.preparation, bridge?.versions.preparation);
         }
         key.addToResourcePolicy(new iam.PolicyStatement({principals:[new iam.ServicePrincipal(`logs.${r}.amazonaws.com`)],
             actions:['kms:Encrypt*','kms:Decrypt*','kms:ReEncrypt*','kms:GenerateDataKey*','kms:Describe*'],resources:['*'],
@@ -77,12 +81,24 @@ export class ComputerLifecycle extends Construct {
             helper.addToRolePolicy(historyReadStatement(r, key.keyArn, [...priorVersion(d.stateMachineVersionArn, props.transitionStateMachineVersions.lifecycle),
                 ...priorVersion(d.preparationStateMachineVersionArn, props.transitionStateMachineVersions.preparation)]));
         }
+        if (bridge) helper.addToRolePolicy(historyReadStatement(r, key.keyArn, [bridge.versions.lifecycle]));
         if (!d.preparationStateMachineVersionArn || retained) key.grantDecrypt(helper);
         const role=new iam.Role(this,'ControllerRole',{assumedBy:new iam.ServicePrincipal('states.amazonaws.com',{
             conditions:{StringEquals:{'aws:SourceAccount':d.accountId},ArnEquals:{'aws:SourceArn':machineArn}}})});
         helper.currentVersion.grantInvoke(role);key.grantEncryptDecrypt(role);
         for(const statement of controllerStatements(s))role.addToPolicy(statement);
-        // Image-to-image rollouts carry no retained source; the promotion window still needs the previous observer version.
+        if (bridge) {
+            transitionObserverGrant(this, helper, bridge.observers.lifecycle, role, 'RetainedBridge');
+            const image = `arn:aws:ec2:${r}::image/${bridge.amiId}`;
+            const launch = controllerStatements({ ...s, deployment: { ...d, amiId: bridge.amiId } })
+                .find(statement => statement.actions.includes('ec2:RunInstances') && statement.resources.includes(image));
+            if (!launch) throw new Error('retained_lifecycle_launch_scope_missing');
+            // Other RunInstances resources still need the current controller's existing guards.
+            new iam.Policy(this, 'RetainedBridgeLaunchPolicy', { roles: [role], statements: [
+                new iam.PolicyStatement({ actions: ['ec2:RunInstances'], resources: [image], conditions: launch.conditions }),
+            ] });
+        }
+        // Image-to-image rollouts carry no retained legacy source; the promotion window still needs the previous observer version.
         if (props.transitionObserverVersions?.lifecycle) {
             if (retained) throw new Error('transition_conflicts_with_retained_source');
             transitionObserverGrant(this, helper, props.transitionObserverVersions.lifecycle, role);

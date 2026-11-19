@@ -6,6 +6,7 @@ import { ComputerLifecycle, RetainedLifecycleSourceSchema } from '../lib/compute
 import { ComputerLifecycleRecovery } from '../lib/lifecycle-recovery.js';
 import { SettingsSchema } from '../lib/lifecycle/contract.js';
 import { AppCaller, AppCallerConfigSchema } from '../lib/app-caller.js';
+import { RetainedRebaseBridgeConfigSchema, resolveRetainedRebaseBridge } from '../lib/retained-rebase-bridge.js';
 try {
     const path=process.env.EZIL_LIFECYCLE_CONFIG;if(!path)throw new Error();
     const bytes=readFileSync(path);if(bytes.length>16384)throw new Error();
@@ -22,25 +23,31 @@ try {
         transitionStateMachineVersions:z.object({lifecycle:z.string().regex(/^arn:aws:states:[a-z0-9-]+:\d{12}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*$/).optional(),
             preparation:z.string().regex(/^arn:aws:states:[a-z0-9-]+:\d{12}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*$/).optional(),
             recovery:z.string().regex(/^arn:aws:states:[a-z0-9-]+:\d{12}:stateMachine:[A-Za-z0-9_-]{1,80}:[1-9][0-9]*$/).optional()}).strict().optional(),
+        retainedRebaseBridge:RetainedRebaseBridgeConfigSchema.optional(),
         appCaller:AppCallerConfigSchema.default({}),deploy:WorkloadDeploySchema.optional(),
         // null omits the reservation: a new account's whole Lambda pool is 10, and any reservation then breaks the 10-unreserved minimum.
         lambdaReservedConcurrency:z.number().int().min(1).max(100).nullable().default(2)}).strict().parse(JSON.parse(bytes.toString()));
     const app=new App(),d=config.settings.deployment;
+    if (config.retainedRebaseBridge && (!config.appCaller.enabled || config.appCaller.ec2CallerEnv !== 'billing-staging'
+        || !config.recoveryEnabled || !config.recoveryVersionArn || config.retainedLifecycleSource
+        || config.retainedRecoveryObserverVersionLogicalId)) throw new Error('invalid_retained_rebase_bridge');
+    const retainedBridge = config.retainedRebaseBridge && resolveRetainedRebaseBridge(config.retainedRebaseBridge,
+        config.settings, config.transitionStateMachineVersions, config.transitionObserverVersions);
     // With `deploy`, the stack deploys under the I5 identity: roles under the
     // workload path with the boundary, assets in the identity bucket, no bootstrap.
     const stack=new Stack(app,workloadStackName(d.namespace,'lifecycle'),{env:{account:d.accountId,region:d.region},terminationProtection:true,
         ...(config.deploy?{synthesizer:workloadSynthesizer(config.deploy)}:{})});
     if(config.deploy)applyWorkloadIdentity(stack,d.accountId,d.namespace);
-    const lifecycle=new ComputerLifecycle(stack,'Lifecycle',{...config,...(config.retainedLifecycleSource?{retainedSource:config.retainedLifecycleSource}:{}),
+    const lifecycle=new ComputerLifecycle(stack,'Lifecycle',{...config,retainedBridge,...(config.retainedLifecycleSource?{retainedSource:config.retainedLifecycleSource}:{}),
         ...(config.transitionStateMachineVersions?{transitionStateMachineVersions:config.transitionStateMachineVersions}:{})});
     if(config.recoveryEnabled&&!config.recoveryVersionArn)throw new Error();
     const recovery=config.recoveryVersionArn?new ComputerLifecycleRecovery(stack,'Recovery',{
         settings:{lifecycle:config.settings,recoveryVersionArn:config.recoveryVersionArn},
-        sourceHistoryKey:lifecycle.historyKey,enabled:config.recoveryEnabled,
+        sourceHistoryKey:lifecycle.historyKey,enabled:config.recoveryEnabled,retainedBridge,
         ...(config.retainedRecoveryObserverVersionLogicalId ? {retainedObserverVersionLogicalId:config.retainedRecoveryObserverVersionLogicalId}:{}),
         ...(config.transitionObserverVersions?.recovery ? {transitionObserverVersionLogicalId:config.transitionObserverVersions.recovery}:{}),
         ...(config.transitionStateMachineVersions ? {transitionStateMachineVersions:config.transitionStateMachineVersions}:{})}):undefined;
     // appCaller includes optional ec2CallerRoleArns; an absent/empty list keeps OIDC-only trust.
-    if(config.appCaller.enabled)new AppCaller(stack,'AppCaller',{config:config.appCaller,ec2CallerRoleArns:config.appCaller.ec2CallerRoleArns,region:d.region,versionArns:[d.stateMachineVersionArn],historyKeyArn:lifecycle.historyKey.keyArn,...(config.retainedLifecycleSource?{retainedLifecycleVersionArn:config.retainedLifecycleSource.stateMachineVersionArn}:{}),
+    if(config.appCaller.enabled)new AppCaller(stack,'AppCaller',{config:config.appCaller,ec2CallerRoleArns:config.appCaller.ec2CallerRoleArns,region:d.region,versionArns:[d.stateMachineVersionArn],historyKeyArn:lifecycle.historyKey.keyArn,retainedBridge,...(config.retainedLifecycleSource?{retainedLifecycleVersionArn:config.retainedLifecycleSource.stateMachineVersionArn}:{}),
         ...(config.transitionStateMachineVersions?{transitionStateMachineVersions:config.transitionStateMachineVersions}:{})});
 }catch(cause){throw new Error("EZIL_LIFECYCLE_CONFIG is missing or invalid; supply reviewed references without credentials",{cause})}
