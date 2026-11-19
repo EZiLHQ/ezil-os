@@ -337,7 +337,7 @@ class StandaloneHostAbiTests(unittest.TestCase):
 
 
 HOST_ABI_FIXTURE = HERE / 'host-abi-predecessors.json'
-HOST_ABI_FIXTURE_TREES = 8
+HOST_ABI_FIXTURE_TREES = 9
 HOST_ABI_FIXTURE_MAX_FILES = 256
 HOST_ABI_PATH_PART = re.compile(r'[A-Za-z0-9._-]{1,128}')
 HOST_ABI_ENTRY = re.compile(r'(100644|100755) ([0-9a-f]{40})')
@@ -392,9 +392,11 @@ class DirectedHostAbiTests(unittest.TestCase):
     repository borrows this checkout's objects through alternates (read-only) and writes its own fixture objects."""
     PREVIOUS = '96ff8e224443e0d684cb99e808a903235f2def11'
     DIAGNOSTICS = 'b7700d49c946157cd75c862bce867caf7fd08810'
-    TARGET = '82228b6e31dfcfedb116c3c6649ae78281b0d799'
+    NATIVE_BASE = '82228b6e31dfcfedb116c3c6649ae78281b0d799'
+    TARGET = '907dc8767841c32dab510b222785e661b10a4e7f'
     PREDECESSORS = {PREVIOUS: 'S 0c113cb4 standalone Git edge/history/resilience host',
                     DIAGNOSTICS: 'cdd39dac standalone Git diagnostics host',
+                    NATIVE_BASE: '230e261f protected Native PreviewV2 Host source',
                     'c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d': 'stage 1f4712c4 and 6a187841',
                     '7a35e4c5ec543abe83b9bccc8c6e5af815e02247': 'main 9ca8b3c0',
                     # The deployed staging predecessor (R151): the closed diagnostics without the full-marker host_ready.
@@ -486,7 +488,9 @@ class DirectedHostAbiTests(unittest.TestCase):
                           ('c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d', self.DIAGNOSTICS, 11),
                           ('7a35e4c5ec543abe83b9bccc8c6e5af815e02247', self.DIAGNOSTICS, 9),
                           ('f3a5a1ba954c56ab31aa0c844cb5719c88905dfc', self.DIAGNOSTICS, 8),
-                          (self.DIAGNOSTICS, self.TARGET, 10)])
+                          (self.DIAGNOSTICS, self.NATIVE_BASE, 10),
+                          (self.DIAGNOSTICS, self.TARGET, 16),
+                          (self.NATIVE_BASE, self.TARGET, 8)])
         for source, target, delta in self.maps():
             old, new = self.files(source), self.files(target)
             self.assertEqual({n: (old.get(n), new.get(n)) for n in old.keys() | new.keys() if old.get(n) != new.get(n)}, delta)
@@ -559,11 +563,12 @@ class DirectedHostAbiTests(unittest.TestCase):
                     release.require_host_abi(self.commit(self.files(source)), baked, self.repo)
 
     def test_checked_in_head_is_the_target_from_every_reviewed_predecessor(self):
-        # HEAD is reached only from the exact current baseline. Historical predecessors keep their exact targets.
+        # HEAD is reached only through explicit forward maps. Historical predecessor targets keep their pins.
         head = self.commit(self.head_files())
         self.assertEqual(release.host_agent_tree_id(head, self.repo), self.TARGET)
         anchors = {self.PREVIOUS: self.commit(self.files(self.PREVIOUS)),
-                   self.DIAGNOSTICS: self.commit(self.files(self.DIAGNOSTICS)), self.TARGET: head}
+                   self.DIAGNOSTICS: self.commit(self.files(self.DIAGNOSTICS)),
+                   self.NATIVE_BASE: self.commit(self.files(self.NATIVE_BASE)), self.TARGET: head}
         for source, target, delta in self.maps():
             baked, deployed = anchors[target], self.commit(self.files(source))
             with self.subTest(source=source, target=target):

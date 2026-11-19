@@ -1,0 +1,44 @@
+# Optional, separate component for a reviewed native candidate recipe.
+# Add it only after the normal Host build. Existing recipes remain base-only.
+name: ezil-private-native-candidate
+schemaVersion: 1.0
+parameters:
+  - NativePayloadS3Uri: {type: string, description: "Private immutable object approved for the exact candidate build role"}
+phases:
+  - name: build
+    steps:
+      - name: ProtectStaging
+        action: ExecuteBash
+        inputs:
+          commands:
+            - 'umask 077; test -f /opt/ezil-host/install-native-payload.py && mkdir -m 0700 /var/lib/ezil-host/native-image-input'
+      - name: FetchPrivatePayload
+        action: S3Download
+        inputs:
+          - source: '{{ NativePayloadS3Uri }}'
+            destination: /var/lib/ezil-host/native-image-input/payload.tgz
+      - name: InstallOff
+        action: ExecuteBash
+        inputs:
+          commands:
+            - |
+              set -euo pipefail
+              trap 'rm -f /var/lib/ezil-host/native-image-input/payload.tgz; rmdir /var/lib/ezil-host/native-image-input' EXIT
+              /usr/bin/python3 -I /opt/ezil-host/install-native-payload.py install \
+                --archive /var/lib/ezil-host/native-image-input/payload.tgz \
+                --agent-config /etc/ezil-host/agent.json
+  - name: validate
+    steps:
+      - name: ValidateInstalledBytes
+        action: ExecuteBash
+        inputs:
+          commands:
+            - /usr/bin/python3 -I /opt/ezil-host/install-native-payload.py verify
+            - 'test ! -e /var/lib/ezil-host/native-image-input && test ! -e /var/lib/ezil-host/native/witness.json'
+            - >-
+              jq -e --slurpfile receipt /opt/ezil-native/candidate-install.json
+              '.nativeSessions == "disabled" and
+              .nativeRuntimeRoot == $receipt[0].hostConfiguration.nativeRuntimeRoot and
+              .nativeRuntimePin == $receipt[0].hostConfiguration.nativeRuntimePin and
+              .nativeRootfs == $receipt[0].hostConfiguration.nativeRootfs'
+              /etc/ezil-host/agent.json >/dev/null

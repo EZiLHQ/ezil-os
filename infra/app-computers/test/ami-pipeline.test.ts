@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
 import { App, BootstraplessSynthesizer, assertions } from 'aws-cdk-lib';
-import { AmiConfigSchema, AmiPipelineStack, type AmiConfig } from '../lib/ami-pipeline.js';
+import { AmiConfigSchema, AmiPipelineStack, NATIVE_PAYLOAD_OBJECT, type AmiConfig } from '../lib/ami-pipeline.js';
 import { DEFAULT_STORAGE, LifecycleDeploymentSchema } from '../lib/lifecycle/deployment.js';
 import { FoundationConfigSchema } from '../lib/foundation.js';
 
@@ -164,7 +164,10 @@ test('AMI inputs reject unpinned images, foreign repositories, broad tarball pat
 
 test('AMI config requires matching explicit account/region and a bounded immutable version', () => {
     for (const bad of [{ namespace: 'identity' }, { accountId: '123' }, { region: 'somewhere' },
-        { version: 'latest' }, { version: '1.0.1073741824' }, { version: '01.0.0' }]) {
+        { version: 'latest' }, { version: '1.0.1073741824' }, { version: '01.0.0' },
+        { nativeCandidate: true }, { nativeCandidateParentAmi: 'ami-0123456789abcdef0' },
+        { nativeCandidate: false, nativeCandidateParentAmi: 'ami-0123456789abcdef0' },
+        { nativeCandidate: true, nativeCandidateParentAmi: '/aws/service/canonical/ubuntu' }]) {
         assert.equal(AmiConfigSchema.safeParse({ ...config, ...bad }).success, false);
     }
     for (const env of [{ account: '210987654321', region: config.region }, { account: config.accountId, region: 'eu-west-2' }]) {
@@ -201,4 +204,48 @@ test('previous lower inputs are paired, optional, distinct and use the approved 
         { 'Fn::Equals': [{ Ref: 'PreviousDesktopImageId' }, ''] },
         { 'Fn::Not': [{ 'Fn::Equals': [{ Ref: 'PreviousDesktopImageId' }, { Ref: 'DesktopImageId' }] }] },
     ] });
+});
+
+test('native candidate synthesizes a separate private recipe and only one extra exact object read', () => {
+    const ordinary = template().toJSON();
+    const c = { ...config, nativeCandidate: true, nativeCandidateParentAmi: 'ami-0123456789abcdef0' };
+    const t = assertions.Template.fromStack(new AmiPipelineStack(new App(), 'ezil-pilot-ami-native-candidate', {
+        config: c, env: { account: c.accountId, region: c.region },
+        synthesizer: new BootstraplessSynthesizer(), terminationProtection: true,
+    })).toJSON();
+    const r = t.Resources;
+    assert.equal(ordinary.Resources.NativeCandidateComponent, undefined);
+    assert.equal(r.BuildRole.Properties.RoleName, 'ezil-pilot-native-candidate-ami-build');
+    assert.equal(r.BuildProfile.Properties.InstanceProfileName, 'ezil-pilot-native-candidate-ami-build');
+    assert.deepEqual(t.Parameters.AssetBucketName.AllowedValues, ['ezil-pilot-deploy-assets-123456789012']);
+    assert.equal(t.Parameters.NativePayloadS3Uri, undefined);
+    assert.equal(t.Parameters.UbuntuAmiId, undefined);
+    assert.equal(r.Recipe.Properties.ParentImage, 'ami-0123456789abcdef0');
+    assert.deepEqual(ordinary.Resources.Recipe.Properties.ParentImage, { Ref: 'UbuntuAmiId' });
+    const statements = r.BuildRole.Properties.Policies[0].PolicyDocument.Statement;
+    assert.deepEqual(statements.filter((s: { Action: unknown }) => s.Action === 's3:GetObject'), [
+        ordinary.Resources.BuildRole.Properties.Policies[0].PolicyDocument.Statement[0],
+        { Effect: 'Allow', Action: 's3:GetObject', Resource: { 'Fn::Sub': [
+            'arn:${AWS::Partition}:s3:::${Bucket}/' + NATIVE_PAYLOAD_OBJECT, { Bucket: { Ref: 'AssetBucketName' } },
+        ] } },
+    ]);
+    assert.deepEqual(statements.filter((s: { Action: unknown }) => s.Action !== 's3:GetObject'),
+        ordinary.Resources.BuildRole.Properties.Policies[0].PolicyDocument.Statement.slice(1));
+    assert.equal(r.NativeCandidateComponent.Properties.Data,
+        readFileSync(join(__dirname, '../../host-agent/ami/imagebuilder-native-component.yaml'), 'utf8'));
+    assert.deepEqual(r.Recipe.Properties.Components, [
+        ordinary.Resources.Recipe.Properties.Components[0],
+        { ComponentArn: { Ref: 'NativeCandidateComponent' }, Parameters: [{
+            Name: 'NativePayloadS3Uri',
+            Value: [{ 'Fn::Sub': ['s3://${Bucket}/' + NATIVE_PAYLOAD_OBJECT, { Bucket: { Ref: 'AssetBucketName' } }] }],
+        }] },
+    ]);
+    assert.equal(r.Recipe.Properties.Name, 'ezil-host-pilot-native-candidate');
+    assert.equal(r.Pipeline.Properties.Name, 'ezil-host-pilot-native-candidate');
+    assert.equal(r.Pipeline.Properties.Schedule, undefined);
+    assert.deepEqual(r.Distribution.Properties.Distributions, [{ Region: 'ap-south-1',
+        AmiDistributionConfiguration: { Name: 'ezil-host-pilot-native-candidate-{{imagebuilder:buildDate}}', AmiTags: tags } }]);
+    assert.equal(Object.values(r).some((v: any) => v.Type === 'AWS::ImageBuilder::Image' || v.Type === 'AWS::SSM::Parameter'), false);
+    const installer = readFileSync(join(__dirname, '../../host-agent/ami/install-native-payload.py'), 'utf8');
+    assert.ok(installer.includes('ARCHIVE_SHA = "' + NATIVE_PAYLOAD_OBJECT.match(/[a-f0-9]{64}/)![0] + '"'));
 });
