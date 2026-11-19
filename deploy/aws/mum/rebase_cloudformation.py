@@ -696,7 +696,8 @@ def transition_observer_versions(before):
 
 def preserve_transition_versions(before, after):
     """Image-to-image: for every observer whose current version changes, the candidate keeps the exact previous version
-    resource and adds exactly one transition policy on the same role granting only InvokeFunction on that version."""
+    resource and exact InvokeFunction grant on the same role. The split PRD lifecycle controller carries the grant
+    in its existing inline policy to avoid an IAM quota breach during concurrent CloudFormation writes."""
     previous = transition_observer_versions(before)
     if previous is None or not _image_mode(after):
         return
@@ -708,9 +709,10 @@ def preserve_transition_versions(before, after):
             policy_logical = IMAGE_RECOVERY_POLICY
         deployed = _production_observer_definition(new, key, policy_logical, prefix) if split else None
         current = _observer_version_grant(new, policy_logical, function_logical, prefix, deployed)
+        atomic = split and key == 'lifecycle'
         if split:
             old_archives = _production_archived_observer_rows(old, policy_logical, previous[key], current)
-            new_archives = _production_archived_observer_rows(new, policy_logical, current, current)
+            new_archives = _production_archived_observer_rows(new, policy_logical, previous[key] if atomic else current, current)
             need(Counter(map(statement_key, old_archives)) == Counter(map(statement_key, new_archives)),
                  f'{key} must preserve only its exact historical observer grants')
         role = new[policy_logical]['Properties'].get('Roles')
@@ -720,6 +722,17 @@ def preserve_transition_versions(before, after):
             need(not transitions, f'{key} observer version unchanged: no transition grant may be added')
             continue
         need(new.get(previous[key]) == old[previous[key]], f'{key} previous observer version must be retained unchanged')
+        if atomic:
+            before_attachment = {k: v for k, v in old[policy_logical]['Properties'].items() if k != 'PolicyDocument'}
+            after_attachment = {k: v for k, v in new[policy_logical]['Properties'].items() if k != 'PolicyDocument'}
+            need(before_attachment == after_attachment and before_attachment.get('PolicyName') == LIFECYCLE_CONTROLLER_POLICY
+                 and not transitions and PRODUCTION_LIFECYCLE_TRANSITION_POLICY not in new,
+                 'production lifecycle transition must update the existing default policy only')
+            old_row = _production_observer_row(old, policy_logical, previous[key])
+            new_row = _production_observer_row(new, policy_logical, previous[key])
+            need(old_row is not None and statement_key(old_row) == statement_key(new_row),
+                 'production lifecycle default policy must keep the exact previous observer grant')
+            continue
         need(len(transitions) == 1, f'exactly one {key} observer transition grant required')
         logical, resource = transitions[0]
         rows = list(statements(resource))
@@ -730,6 +743,12 @@ def preserve_transition_versions(before, after):
 
 
 PRODUCTION_LIFECYCLE_RETAINED_POLICY = 'LifecycleRetainedSourcePolicyC4C9E044'
+PRODUCTION_LIFECYCLE_TRANSITION_POLICY = 'LifecycleTransitionObserverPolicy2B2FB860'
+
+
+def _production_observer_row(resources, policy, logical):
+    return next((row for row in _observer_invoke_rows(resources[policy])
+                 if row['Resource'] == {'Ref': logical}), None)
 
 
 def _production_archived_observer_rows(resources, policy, previous, current):
@@ -783,6 +802,21 @@ def carry_production_predecessor(before, synthesized):
             policy = IMAGE_RECOVERY_POLICY
         current = _production_observer_definition(new, key, policy, prefix)
         rows = new[policy]['Properties']['PolicyDocument']['Statement']
+        if key == 'lifecycle' and current != previous[key]:
+            # Creating a second inline policy before CloudFormation updates the default policy can exceed the
+            # role's aggregate quota. Replace the existing document once, carrying the exact old grant.
+            previous_row = _production_observer_row(old, policy, previous[key])
+            need(previous_row is not None, 'production lifecycle predecessor grant is required')
+            standalone = new.pop(PRODUCTION_LIFECYCLE_TRANSITION_POLICY, None)
+            if standalone is not None:
+                properties = standalone.get('Properties', {})
+                need(standalone.get('Type') == 'AWS::IAM::Policy'
+                     and properties.get('Roles') == [{'Ref': LIFECYCLE_CONTROLLER}]
+                     and properties.get('PolicyName') == PRODUCTION_LIFECYCLE_TRANSITION_POLICY
+                     and list(map(statement_key, statements(standalone))) == [statement_key(previous_row)],
+                     'production lifecycle standalone grant does not match the exact predecessor')
+            if previous_row not in rows:
+                rows.append(deepcopy(previous_row))
         for row in _production_archived_observer_rows(old, policy, previous[key], current):
             carry_resource(row['Resource']['Ref'])
             if row not in rows:
