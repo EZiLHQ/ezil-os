@@ -71,6 +71,7 @@ EZIL_NATIVE_AUTHORIZATION_SERVICE_EXPIRES_AT EZIL_NATIVE_GRANT_WRAPPING_KEY_ID E
 EZIL_NATIVE_CONSENT_BUDGET_MICRO EZIL_NATIVE_CONSENT_EPOCH EZIL_NATIVE_CONSENT_TTL_SECONDS
 EZIL_NATIVE_DEPLOYMENT_DESCRIPTOR EZIL_NATIVE_DEPLOYMENT_DESCRIPTOR_SHA256 EZIL_NATIVE_RUNTIME_MANIFEST_SHA256
 EZIL_NATIVE_GATEWAY_POLICY_ID EZIL_NATIVE_GATEWAY_SERVICE_CREDENTIAL EZIL_NATIVE_GATEWAY_SERVICE_EXPIRES_AT
+EZIL_NATIVE_QUALIFICATION_TARGET
 """.split())
 NATIVE_SWITCHES = ("EZIL_NATIVE_SESSIONS", "EZIL_NATIVE_AUTH_INTENTS",
                    "EZIL_NATIVE_HOST_TRANSPORT", "EZIL_NATIVE_RUNTIME_CONTROL")
@@ -206,6 +207,10 @@ def validate_production(values):
         raise RenderError("Native session, intent, transport and control gates must be exactly 0 or 1")
     if values.get("EZIL_NATIVE_AUTHORIZATION") not in (None, "disabled", "enabled"):
         raise RenderError("EZIL_NATIVE_AUTHORIZATION must be exactly enabled or disabled")
+    target = values.get("EZIL_NATIVE_QUALIFICATION_TARGET")
+    uuid = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+    if target is not None and not re.fullmatch(rf"{uuid}/{uuid}/i-[0-9a-f]{{8,17}}", target):
+        raise RenderError("Native qualification target must pin the computer, owner and instance")
     origin = values.get("EZIL_NATIVE_SESSIONS_ORIGIN")
     if origin is not None and origin not in PRODUCTION_OS_ORIGINS:
         raise RenderError("Native session origin must be a production OS origin")

@@ -245,6 +245,9 @@ class ProductionEnvironmentTests(unittest.TestCase):
         native = {key: "synthetic-pin" for key in renderer.PRODUCTION_NATIVE}
         native.update({key: "0" for key in renderer.NATIVE_SWITCHES})
         native.update(EZIL_NATIVE_AUTHORIZATION="disabled", EZIL_NATIVE_SESSIONS_ORIGIN="https://os.ezil.work")
+        native["EZIL_NATIVE_QUALIFICATION_TARGET"] = (
+            "a0000000-0000-4000-8000-000000000001/b0000000-0000-4000-8000-000000000002/i-0123456789abcdef0"
+        )
         values = {**self.values, **native}
         self.assertEqual(renderer.validate(values, "production"), values)
         self.assertTrue(set(native).isdisjoint(renderer.REQUIRED))
@@ -257,6 +260,13 @@ class ProductionEnvironmentTests(unittest.TestCase):
             renderer.validate({**self.values, key: "1"}, "production")
         self.assertRefused({**self.values, "EZIL_NATIVE_AUTHORIZATION": "1"}, "must be exactly")
         self.assertRefused({**self.values, "EZIL_NATIVE_SESSIONS_ORIGIN": "https://other.example.test"}, "production OS origin")
+
+    def test_refuses_unpinned_native_qualification_targets(self):
+        key = "EZIL_NATIVE_QUALIFICATION_TARGET"
+        target = "a0000000-0000-4000-8000-000000000001/b0000000-0000-4000-8000-000000000002/i-0123456789abcdef0"
+        self.assertRefused({**self.values, key: ""}, "nonempty strings")
+        for value in ("*", target.upper(), target.rsplit("/", 1)[0], target + "," + target):
+            self.assertRefused({**self.values, key: value}, "qualification target")
 
     def test_production_pins_api_url(self):
         for url in ("https://13-206-183-230.sslip.io", "https://db.ezil.work/", "http://db.ezil.work"):
