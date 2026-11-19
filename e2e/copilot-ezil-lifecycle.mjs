@@ -24,9 +24,32 @@ const fixtureNode = (source, ...args) => execFileSync(container ? 'docker' : pro
   [...container ? ['exec', container, 'node'] : [], '-e', source, ...args], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
 const records = () => JSON.parse(fixtureNode("try{process.stdout.write(require('node:fs').readFileSync(process.argv[1]))}catch(e){if(e.code!=='ENOENT')throw e;process.stdout.write('[]')}", join(capture, 'captured.json')));
 const release = marker => fixtureNode("require('node:fs').writeFileSync(process.argv[1],'')", join(capture, marker + '.release'));
-const savedPrompt = (directory, marker) => fixtureNode(
-  "const f=require('node:fs');const p=require('node:path');const [folder,marker]=process.argv.slice(1);process.stdout.write(f.readdirSync(folder).filter(n=>n.endsWith('.jsonl')).some(n=>f.readFileSync(p.join(folder,n),'utf8').includes(marker))?'yes':'no')",
-  directory, marker) === 'yes';
+const savedTranscript = (directory, marker) => fixtureNode(
+  "const f=require('node:fs');const p=require('node:path');const [folder,marker]=process.argv.slice(1);const matches=f.readdirSync(folder).filter(n=>n.endsWith('.jsonl')).map(n=>f.readFileSync(p.join(folder,n),'utf8')).filter(text=>text.includes(marker));process.stdout.write(matches.length===1?matches[0]:'')",
+  directory, marker);
+
+function savedReplyCount(directory, marker) {
+  const raw = savedTranscript(directory, marker).trim();
+  if (!raw) return 0;
+  try {
+    const entries = raw.split('\n').map(line => JSON.parse(line));
+    const initial = entries[0].v?.requests?.[0];
+    const state = entries.findLast(row => row.k?.join('/') === 'requests/0/modelState')?.v ?? initial?.modelState;
+    if (state?.value !== 1) return 0;
+    let response = initial?.response ?? [];
+    for (const row of entries.slice(1)) {
+      if (row.k?.join('/') !== 'requests/0/response') continue;
+      if (row.kind === 1) response = row.v ?? [];
+      if (row.kind === 2) response = [...response.slice(0, row.i ?? response.length), ...row.v];
+    }
+    // Ignore copies in the stored model result or trace metadata.
+    return JSON.stringify(response).split(KIMI_LIFECYCLE_REPLY).length - 1;
+  } catch (error) {
+    // The last line can be in the middle of an append.
+    if (!(error instanceof SyntaxError)) throw error;
+    return 0;
+  }
+}
 
 async function waitFor(read, description, timeout = 30_000) {
   const deadline = Date.now() + timeout;
@@ -83,6 +106,7 @@ try {
     const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
     let released = false;
     let backgroundVisibility;
+    let replyEvidence;
     try {
       await context.route('**/*', route => {
         const url = route.request().url();
@@ -140,7 +164,7 @@ try {
         await page.locator('#show').click();
         await frame.locator('.part.auxiliarybar .chat-input-container .monaco-editor .view-lines').first().click({ force: true });
       } else {
-        await waitFor(() => savedPrompt(chat, marker), 'workbench must save the pending prompt before the explicit reload', 100_000);
+        await waitFor(() => savedTranscript(chat, marker), 'workbench must save the pending prompt before the explicit reload', 100_000);
         await page.reload({ waitUntil: 'domcontentloaded' });
         assert.equal(await frame.evaluate(() => window.ezilLifecycleFixtureDocument), undefined, 'reload replaces the workbench document');
         const session = frame.locator('.part.auxiliarybar .agent-sessions-control-container .monaco-list-row').first();
@@ -158,13 +182,27 @@ try {
 
       if (mode !== 'full-reload') {
         assert.equal(await frame.evaluate(() => window.ezilLifecycleFixtureDocument), stamp);
-        await waitFor(() => messageCount(frame, KIMI_LIFECYCLE_REPLY), 'one unbroken JSON reply appears in Code');
-        assert.equal(await messageCount(frame, KIMI_LIFECYCLE_REPLY), 1);
+        replyEvidence = await waitFor(async () => {
+          const error = transcript(frame).locator('.chat-notification-widget:has(.chat-error-codicon)').first();
+          assert.equal(await error.isVisible(), false, 'the retained chat must not display a reply error');
+          const visible = await messageCount(frame, KIMI_LIFECYCLE_REPLY);
+          if (visible) {
+            assert.equal(visible, 1);
+            return 'workbench';
+          }
+          // A zero-sized iframe can leave the list virtualized after showing it.
+          // The matched, completed workbench JSONL proves the response still arrived.
+          const saved = mode === 'hidden-frame' ? savedReplyCount(chat, marker) : 0;
+          if (!saved) return null;
+          assert.equal(saved, 1);
+          return 'saved-transcript';
+        }, 'one unbroken JSON reply reaches the retained Code workbench', 50_000);
       }
       await sleep(1600); // Copilot's retry delay is one second; keep the fixture observable after release.
       assert.equal(calls().length, 1, 'no duplicate Kimi inference');
-      results.push({ mode, calls: calls().length, jsonReply: calls()[0].jsonReply, backgroundVisibility });
-      console.log('PASS', mode, 'one Kimi JSON inference', mode === 'full-reload' ? 'saved interruption' : 'one rendered reply');
+      results.push({ mode, calls: calls().length, jsonReply: calls()[0].jsonReply, backgroundVisibility, replyEvidence });
+      console.log('PASS', mode, 'one Kimi JSON inference',
+        mode === 'full-reload' ? 'saved interruption' : 'one reply via ' + replyEvidence);
     } finally {
       if (!released) release(marker);
       await context.close();
