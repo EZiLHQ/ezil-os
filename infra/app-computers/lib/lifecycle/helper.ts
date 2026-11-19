@@ -121,7 +121,23 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         if(!volumeId(v.VolumeId)||v.VolumeType!=='gp3'||!dataSizeValid(v.Size,d)||v.Encrypted!==true||v.KmsKeyId!==d.dataKeyArn
             ||v.AvailabilityZoneId!==d.zoneId||v.MultiAttachEnabled!==false||!Array.isArray(v.Attachments))return fail('lifecycle_volume_invalid');
         const previousTags=i.operation==='replace'?tagsFor(i,i.previousGeneration!,i.previousFenceToken!):tags;
-        if(!tagged(v.Tags,tags)&&!(i.operation==='replace'&&tagged(v.Tags,previousTags)))return fail('lifecycle_volume_invalid');
+        const hasTargetVolumeTags=tagged(v.Tags,tags);
+        if(!hasTargetVolumeTags&&!(i.operation==='replace'&&tagged(v.Tags,previousTags)))return fail('lifecycle_volume_invalid');
+        const hasClaimFence=i.operation==='replace'&&v.Tags?.some(t=>t.Key==='ezil:fence');
+        if(i.operation==='replace'){
+            const computerAlias={'ezil:computer':i.computerId};
+            if(!matchingPresentTags(v.Tags,computerAlias))return fail('lifecycle_volume_invalid');
+            if(hasClaimFence){
+                const expectedFence=hasTargetVolumeTags?i.fenceToken:i.previousFenceToken!;
+                if(!tagged(v.Tags,{...computerAlias,'ezil:fence':expectedFence})){
+                    // After retag, a mixed Describe view can reflect either of these two fences. Do not
+                    // attach or repeat the write until the canonical and claim fences agree again.
+                    const otherFence=hasTargetVolumeTags?i.previousFenceToken!:i.fenceToken;
+                    if(['tagged','attached'].includes(phase)&&tagged(v.Tags,{...computerAlias,'ezil:fence':otherFence}))return wait(phase);
+                    return fail('lifecycle_volume_invalid');
+                }
+            }
+        }
         if(i.dataVolumeId&&v.VolumeId!==i.dataVolumeId)return fail();
         if(i.operation==='provision'&&!tagged(v.Tags,initialVolumeTags(i,envelope.digest)))return fail();
         // Bind historical source identity to its retained deployment, including
@@ -215,12 +231,13 @@ export function createLifecycleHelper(settings:Settings,deps:Dependencies) {
         const targetId=target.InstanceId;
         if(newInstance){
             if(!['pending','running'].includes(target.State?.Name??''))return fail();
-            if(!tagged(v.Tags,tags)){
+            if(!hasTargetVolumeTags){
                 if(v.State!=='available'||v.Attachments.length)return fail();
                 if(['tagged','attached'].includes(phase))return wait(phase);
-                // Only generation and fence move; identity tags were set at creation.
-                if(!tagged(v.Tags,{...tags,...{'ezil:generation':String(i.previousGeneration),'ezil:fence-token':i.previousFenceToken!}}))return fail('lifecycle_volume_invalid');
-                return action('createTags',{Resources:[v.VolumeId],Tags:tagList(retagsFor(i))});
+                // Only generation and fence move. Repeat the proven computer alias to select the existing
+                // IAM claim-tag permission when this retained volume has a pool fence to advance as well.
+                const retags=hasClaimFence?{...retagsFor(i),...claimTagsFor(i)}:retagsFor(i);
+                return action('createTags',{Resources:[v.VolumeId],Tags:tagList(retags)});
             }
             // §9: this branch is reached only after DescribeVolumes above has
             // observed BOTH target tag values. A CreateTags API response or
