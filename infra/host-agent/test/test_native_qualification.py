@@ -1,6 +1,7 @@
 """Offline cross-language qualification receipt vectors. No host admission."""
 import copy
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -9,12 +10,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from ezil_host import native_authority as authority
 from ezil_host import native_qualification as qualification
 from ezil_host import native_isolation as isolation
-from ezil_host.config import Config
+from ezil_host.config import Config, DEFAULTS
 from ezil_host.fsops import Refused
 
 
 class QualificationReceipt(unittest.TestCase):
     def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.paths = {**DEFAULTS, "runDir": temporary.name, "stateDir": temporary.name}
         prefix = "00000000-0000-4000-8000-00000000000"
         placement = {"generation": "11", "leaseEpoch": "29", "instanceId": "i-0123456789abcdef0"}
         self.target = {"v": 1, "computerId": prefix + "1", "bootId": prefix + "3", "placement": placement,
@@ -51,10 +55,10 @@ class QualificationReceipt(unittest.TestCase):
                 self.verify(**overrides)
 
     def test_scoped_transport_uses_only_enrollment_origin_and_validates_the_receipt(self):
-        cfg = Config(nativeQualificationComputerId=self.challenge["computerId"],
-                     enrollUrl="https://os.example/api/internal/computers/enroll", caFile=None)
+        cfg = Config(self.paths, nativeQualificationComputerId=self.challenge["computerId"],
+                     enrollUrl="https://os.example/api/compute/aws/enroll", caFile=None)
         with patch.object(qualification.http, "request", return_value=(200, authority.canonical(self.envelope))) as request:
-            proof = qualification.request_placement_receipt(cfg, self.challenge, self.key)
+            proof = qualification.request_placement_receipt(cfg, {}, self.challenge, self.key)
         method, uri = request.call_args.args
         self.assertEqual((method, uri), ("POST", "https://os.example/api/compute/aws/native-qualification"))
         self.assertEqual(request.call_args.kwargs["body"], authority.canonical(self.challenge))
@@ -62,8 +66,19 @@ class QualificationReceipt(unittest.TestCase):
                          "v1=577b3fbde130ac5a30588218c7b98f6d2e8a53e6e2c137d5aac89555ac4d4a4e")
         self.assertEqual(self.verify(envelope=proof), self.receipt)
 
+    def test_claimed_pool_uses_its_recorded_app_origin(self):
+        lease = {"computerId": self.target["computerId"], "generation": 11, "leaseEpoch": 29}
+        cfg = Config(self.paths, nativeQualificationComputerId=self.target["computerId"],
+                     enrollUrl="https://build.example/api/compute/aws/enroll", caFile=None)
+        record = {"appOrigin": "https://os-prod.ezil.work", "claim": lease}
+        with patch.object(qualification.storage.pool, "read_record", return_value=record), patch.object(
+            qualification.http, "request", return_value=(200, authority.canonical(self.envelope))
+        ) as request:
+            qualification.request_placement_receipt(cfg, lease, self.challenge, self.key)
+        self.assertEqual(request.call_args.args[1], "https://os-prod.ezil.work/api/compute/aws/native-qualification")
+
     def test_foreign_target_and_untrusted_origins_refuse_before_network(self):
-        path = "/api/internal/computers/enroll"
+        path = "/api/compute/aws/enroll"
         for uri, computer in (
             ("https://os.example" + path, self.target["bootId"]),
             ("http://os.example" + path, self.challenge["computerId"]),
@@ -71,19 +86,19 @@ class QualificationReceipt(unittest.TestCase):
             ("https://os.example:8443" + path, self.challenge["computerId"]),
             ("https://os.example" + path + "?q=1", self.challenge["computerId"]),
         ):
-            cfg = Config(nativeQualificationComputerId=computer, enrollUrl=uri, caFile=None)
+            cfg = Config(self.paths, nativeQualificationComputerId=computer, enrollUrl=uri, caFile=None)
             with self.subTest(uri=uri), patch.object(qualification.http, "request") as request:
                 with self.assertRaises(Refused):
-                    qualification.request_placement_receipt(cfg, self.challenge, self.key)
+                    qualification.request_placement_receipt(cfg, {}, self.challenge, self.key)
                 request.assert_not_called()
 
     def test_refusal_and_transport_timeout_are_bounded(self):
-        cfg = Config(nativeQualificationComputerId=self.challenge["computerId"],
-                     enrollUrl="https://os.example/api/internal/computers/enroll", caFile=None)
+        cfg = Config(self.paths, nativeQualificationComputerId=self.challenge["computerId"],
+                     enrollUrl="https://os.example/api/compute/aws/enroll", caFile=None)
         for result, error in (((404, b"{}"), None), ((200, b"x" * 4097), None), (None, TimeoutError())):
             with patch.object(qualification.http, "request", return_value=result, side_effect=error) as request:
                 with self.assertRaises(Refused):
-                    qualification.request_placement_receipt(cfg, self.challenge, self.key)
+                    qualification.request_placement_receipt(cfg, {}, self.challenge, self.key)
                 self.assertEqual(request.call_count, 1)
 
 

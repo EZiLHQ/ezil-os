@@ -512,14 +512,13 @@ def new_challenge(target):
                 expiresAt=authority.iso_ms(issued + MAX_AGE_MS))
 
 
-def request_placement_receipt(cfg, challenge, key):
+def request_placement_receipt(cfg, lease, challenge, key):
     """Only the root-configured canary may ask its verified enrollment origin for a proof."""
     require(cfg.get("nativeQualificationComputerId") == challenge["computerId"],
             "native_qualification_target_changed")
-    uri = urlsplit(cfg.enrollUrl or "")
+    uri = urlsplit(storage.endpoint(cfg, lease) or "")
     require(uri.scheme == "https" and uri.hostname and uri.netloc in (uri.hostname, uri.hostname + ":443")
-            and uri.path == "/api/internal/computers/enroll" and not uri.query and not uri.fragment,
-            "native_qualification_origin_invalid")
+            and uri.path == storage.PATH and not uri.query and not uri.fragment, "native_qualification_origin_invalid")
     url = "https://" + uri.netloc + "/api/compute/aws/native-qualification"
     raw = authority.canonical(challenge)
     signature = "v1=" + hmac.new(key, REQUEST_DOMAIN + digest(raw).encode("ascii"), hashlib.sha256).hexdigest()
@@ -562,7 +561,7 @@ def main():
             key = read_control_key(cfg, target["placement"])
             if args.step == "qualify-via-os":
                 challenge = new_challenge(target)
-                envelope = request_placement_receipt(cfg, challenge, key)
+                envelope = request_placement_receipt(cfg, lease, challenge, key)
             else:
                 challenge = private_json(directory_fd, CHALLENGE)
                 envelope = private_json(directory_fd, RECEIPT)
