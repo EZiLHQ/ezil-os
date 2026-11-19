@@ -18,6 +18,7 @@ export const AmiConfigSchema = z.object({
     region: z.string().regex(REGION_PATTERN),
     nativeCandidate: z.boolean().optional(),
     nativeCandidateParentAmi: z.string().regex(/^ami-[0-9a-f]{8,17}$/).optional(),
+    nativeCandidateUbuntuSnapshot: z.string().regex(/^[0-9]{8}T[0-9]{6}Z$/).optional(),
     // Image Builder components and recipes are immutable. Bump for each update,
     // including changed component parameter values or a new parent AMI.
     version: z.string().regex(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/)
@@ -25,8 +26,44 @@ export const AmiConfigSchema = z.object({
 }).strict().refine(c => Boolean(c.nativeCandidate) === (c.nativeCandidateParentAmi !== undefined), {
     message: 'Only a native candidate supplies an independently verified literal parent AMI',
     path: ['nativeCandidateParentAmi'],
+}).refine(c => c.nativeCandidateUbuntuSnapshot === undefined || (c.nativeCandidate === true && c.region === 'ap-south-1'), {
+    message: 'Only an ap-south-1 native candidate can select a literal Ubuntu archive snapshot',
+    path: ['nativeCandidateUbuntuSnapshot'],
 });
 export type AmiConfig = z.infer<typeof AmiConfigSchema>;
+
+function withUbuntuSnapshot(component: string, timestamp: string): string {
+    const python = readFileSync(join(__dirname, 'candidate-ubuntu-snapshot.py'), 'utf8').trimEnd();
+    const stage = [
+        '      - name: UseCanonicalUbuntuSnapshot',
+        '        action: ExecuteBash',
+        '        inputs:',
+        '          commands:',
+        '            - |',
+        `              python3 - '${timestamp}' <<'EZIL_UBUNTU_SNAPSHOT'`,
+        ...python.split('\n').map(line => '              ' + line),
+        '              EZIL_UBUNTU_SNAPSHOT',
+        '',
+    ].join('\n');
+    const restore = [
+        '      - name: RestoreCanonicalUbuntuSources',
+        '        action: ExecuteBash',
+        '        inputs:',
+        '          commands:',
+        '            - |',
+        '              set -euo pipefail',
+        '              test -d /run/ezil-native-candidate-apt/sources.list.d',
+        '              cp -r -- /run/ezil-native-candidate-apt/. /etc/apt/',
+        '              rm -r -- /run/ezil-native-candidate-apt',
+        '',
+    ].join('\n');
+    const build = '      - name: Build\n';
+    const validate = '  - name: validate\n';
+    if (component.split(build).length !== 2 || component.split(validate).length !== 2) {
+        throw new Error('Cannot locate the reviewed Host build and validation steps');
+    }
+    return component.replace(build, stage + build).replace(validate, restore + validate);
+}
 
 /** Founder change sets only: the workload boundary deliberately cannot grant
  * Image Builder's managed policies or create an EC2 instance profile. */
@@ -137,9 +174,10 @@ export class AmiPipelineStack extends Stack {
             instanceProfileName: buildPrefix + '-ami-build',
             path: workloadPath(c.namespace), roles: [role.ref],
         });
+        const hostComponent = readFileSync(join(__dirname, '../../host-agent/ami/imagebuilder-component.yaml'), 'utf8');
         const component = new imagebuilder.CfnComponent(this, 'Component', {
             name, platform: 'Linux', version: c.version, tags,
-            data: readFileSync(join(__dirname, '../../host-agent/ami/imagebuilder-component.yaml'), 'utf8'),
+            data: c.nativeCandidateUbuntuSnapshot ? withUbuntuSnapshot(hostComponent, c.nativeCandidateUbuntuSnapshot) : hostComponent,
         });
         const components: imagebuilder.CfnImageRecipe.ComponentConfigurationProperty[] = [{ componentArn: component.ref, parameters }];
         if (c.nativeCandidate) {
