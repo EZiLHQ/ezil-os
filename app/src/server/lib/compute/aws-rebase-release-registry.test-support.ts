@@ -250,3 +250,10 @@ export function fixtureReleaseRegistry40() {
     const release146 = { ...f.release145, amiId: 'ami-00000000000000040', recipeVersion: '1.0.46', createdAt: '2026-11-15T03:00:00.000Z' };
     return { ...f, release146, retained: [...f.retained, release146] };
 }
+
+/** Synthetic forty-first record extending the existing prefix. */
+export function fixtureReleaseRegistry41() {
+    const f = fixtureReleaseRegistry40();
+    const release147 = { ...f.release146, amiId: 'ami-00000000000000041', recipeVersion: '1.0.47', createdAt: '2026-11-15T04:00:00.000Z' };
+    return { ...f, release147, retained: [...f.retained, release147] };
+}
