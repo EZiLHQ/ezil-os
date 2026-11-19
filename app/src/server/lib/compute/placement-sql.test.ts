@@ -44,6 +44,13 @@ describe('offline ready-pool SQL registration contract', () => {
 });
 
 describe('placement SQL is inside the hosted additive grammar', () => {
+    it('accepts the nullable retirement hint without registering a production migration', async () => {
+        const pathToHint = path.join(REPO, 'docs/aws-computers/sql/0005_retired_host_release.sql.txt');
+        const hint = readFileSync(pathToHint, 'utf8');
+        const { additiveSQL } = await engine();
+        expect(additiveSQL(hint, ['public'])).toBe(hint);
+    });
+
     it('parses with the engine additiveSQL for the manifest schema', async () => {
         const { additiveSQL } = await engine();
         expect(additiveSQL(sql, ['public'])).toBe(sql);

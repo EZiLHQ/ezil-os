@@ -11,8 +11,8 @@ import { fixtureRebaseRelease } from './aws-intent.test-support';
 import { handleImageRebase } from './aws-rebase-orchestrator';
 const RELEASE_JOB = 'd3d3d3d3-d3d3-4d3d-8d3d-d3d3d3d3d3d3';
 /** Build an archived successful image job through the real enrollment/store path, then release its dedicated host. */
-export async function dedicatedSetup() {
-    const s = rebaseSetup();
+export async function dedicatedSetup(retiredReleaseColumn = false) {
+    const s = rebaseSetup(undefined, undefined, retiredReleaseColumn);
     await s.run('prepare'); await s.completePreparation(); await s.run('launch'); await s.completeLaunch();
     let j = await s.current(); const lease = parseEnrollmentUserData(JSON.parse(j.launchDocument!).userData);
     const tunnels = { createTunnel: vi.fn(async () => ({ ok: true as const, tunnelToken: 'test-token' })), deleteTunnel: vi.fn() };

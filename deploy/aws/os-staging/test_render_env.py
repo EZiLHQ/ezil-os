@@ -241,6 +241,13 @@ class ProductionEnvironmentTests(unittest.TestCase):
         renderer.validate({**self.values, "STRIPE_SECRET": "rk_live_synthetic",
                            "SUPABASE_DATABASE_URL": PRODUCTION_DB.replace("postgres://", "postgresql://")}, "production")
 
+    def test_auto_update_requires_no_new_value_to_render_production(self):
+        cohort = {"EZIL_AWS_AUTO_REBASE": "1",
+                  "EZIL_AWS_AUTO_REBASE_COMPUTER_IDS": "22222222-2222-4222-8222-222222222222"}
+        self.assertTrue(cohort.keys() <= renderer.OPTIONAL)
+        self.assertTrue(cohort.keys().isdisjoint(renderer.REQUIRED))
+        self.assertEqual(renderer.validate({**self.values, **cohort}, "production"), {**self.values, **cohort})
+
     def test_native_keys_are_explicit_and_production_only(self):
         native = {key: "synthetic-pin" for key in renderer.PRODUCTION_NATIVE}
         native.update({key: "0" for key in renderer.NATIVE_SWITCHES})
