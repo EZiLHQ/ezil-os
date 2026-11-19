@@ -5,7 +5,7 @@ import { appRouter } from '@/server/api/root';
 import { createTRPCContext } from '@/server/api/trpc';
 import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
 import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-control-auth';
-import { PlacementOwnerError, type PlacementExecutor } from '@/server/lib/compute/placement';
+import { ImageJobConflictError, PlacementOwnerError, type PlacementDb, type PlacementExecutor } from '@/server/lib/compute/placement';
 import {
     REPO_OPEN_MAX_TIMEOUT_MS, REPO_OPEN_MIN_TIMEOUT_MS, REPO_OPEN_TRANSPORT_MARGIN_MS, requestRepoOpen, withRepositoryFolder,
 } from '@/server/lib/compute/repo-open';
@@ -31,8 +31,7 @@ import {
  * `SANDBOX_COLD_START_TIMEOUT_MS` = 210s client budget). 300s matches every
  * other route on this cold-boot path for the same reason.
  *
- * Like `../preview-url/route.ts` this is a TRANSPORT only. Ownership is
- * checked exactly once, inside `cloudflareGuacamole.codePreviewUrl`, which
+ * The Code mint checks ownership inside `cloudflareGuacamole.codePreviewUrl`, which
  * derives the sandbox id from the AUTHENTICATED user id plus an
  * ownership-verified computer id. The Worker URL and HMAC secret never leave
  * the server; the browser receives only the opaque, short-lived code-preview
@@ -108,16 +107,31 @@ export async function POST(req: Request) {
         const hasRepository = repository !== undefined && repository !== null;
         // One target per open: a project and a repository address together is a malformed link, never a guess.
         if (hasProject && hasRepository) return shellRefusal(400, 'repo_url_invalid', "This link names two repositories. Open one at a time.");
-        if (hasProject) {
-            return await openProject(ctx as ProjectCtx, caller, { computerId, intent, project, startedAt, signal: req.signal });
+        let response: Response;
+        try {
+            if (hasProject) {
+                response = await openProject(ctx as ProjectCtx, caller, { computerId, intent, project, startedAt, signal: req.signal });
+            } else if (hasRepository) {
+                response = await openRepositoryUrl(ctx as ProjectCtx, caller, { computerId, intent, repository, startedAt, signal: req.signal });
+            } else {
+                const preview = await caller.cloudflareGuacamole.codePreviewUrl({
+                    computerId, intent, ...(codeFolder !== undefined ? { codeFolder } : {}),
+                });
+                response = shellJson(preview);
+            }
+        } catch (error) {
+            // tRPC wraps placement errors from its procedures. Control lookups can throw the original.
+            const cause = error instanceof TRPCError ? error.cause : error;
+            if (intent === 'open' && cause instanceof ImageJobConflictError
+                && await advanceUpdate(ctx as ProjectCtx, computerId, false)) return updatePending();
+            throw error;
         }
-        if (hasRepository) {
-            return await openRepositoryUrl(ctx as ProjectCtx, caller, { computerId, intent, repository, startedAt, signal: req.signal });
+        if (intent === 'open' && process.env.EZIL_AWS_AUTO_REBASE === '1') {
+            const result = await response.clone().json().catch(() => null);
+            if (result?.ok === false && result.errorCode === 'computer_rebase_required'
+                && await advanceUpdate(ctx as ProjectCtx, computerId, true)) return updatePending();
         }
-
-        const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent, ...(codeFolder !== undefined ? { codeFolder } : {}) });
-
-        return shellJson(preview);
+        return response;
     } catch (err) {
         return shellErrorResponse(err, 'POST /api/shell/code-preview-url');
     }
@@ -125,6 +139,22 @@ export async function POST(req: Request) {
 
 type ProjectCtx = Awaited<ReturnType<typeof createTRPCContext>> & { user: { id: string } };
 type ShellCaller = Awaited<ReturnType<typeof shellCaller>>['caller'];
+
+function updatePending() {
+    return shellJson({ ok: false, error: 'computer_updating', errorCode: 'sandbox_starting',
+        retryable: true, provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2', computeUpdating: true, computeLaunching: true });
+}
+
+async function advanceUpdate(ctx: ProjectCtx, computerId: string, allowStart: boolean) {
+    if (process.env.EZIL_AWS_AUTO_REBASE !== '1') return false;
+    try {
+        const { advanceStagingImageUpdate } = await import('@/server/lib/compute/aws-auto-update');
+        return await advanceStagingImageUpdate(ctx.db as unknown as PlacementDb, computerId, ctx.user.id, allowStart);
+    } catch {
+        // Preserve the existing refusal when a request cannot safely advance an update.
+        return false;
+    }
+}
 
 /**
  * One deadline for a whole project open, from the moment the request arrived: under the shell's 215 s for one Code

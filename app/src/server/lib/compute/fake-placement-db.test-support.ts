@@ -79,6 +79,7 @@ export interface FakeSeed {
 }
 
 export interface FakeOptions {
+    retiredReleaseColumn?: boolean;
     clock?: () => Date;
     /** Fake-timer polling tests may replace the database's event-loop yield. */
     yield?: () => Promise<void>;
@@ -168,6 +169,7 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
         // The writer-lease table exists only where the ready-pool SQL is registered (production: it is not), and the park
         // reservation's blocker probe (pool-host lease or uncommitted migration) finds nothing unless a test wraps this executor.
         if (/^SELECT to_regclass\('public\.ezil_compute_writer_leases'\) IS NOT NULL AS present$/.test(text)) return { rows: [{ present: false }] };
+        if (text.startsWith('/* placement:retirement-column */')) return { rows: [{ present: options.retiredReleaseColumn ?? false }] };
         if (text.startsWith('/* placement:park-blockers */')) return { rows: [] };
         // `SELECT ... FOR UPDATE` row lock of the park reservation: the fake serializes through its advisory-lock mutexes already.
         if (text.startsWith('/* placement:park-row-lock */')) return { rows: placements.filter(r => uuidEq(r.computer_id, params[0])).map(r => ({ computer_id: r.computer_id })) };
@@ -176,6 +178,12 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
             const [computer, instance] = params;
             return { rows: imageJobs.filter(r => r.computer_id === computer
                 && (r.host_evidence as Record<string, unknown> | null)?.instanceId === instance).slice(0, 2).map(r => ({ ...r })) };
+        }
+        if (text.startsWith('/* image:launched-for-verification */')) {
+            return { rows: imageJobs.filter(r => r.launch_document != null && r.recovery_document == null
+                && ['launch_pending', 'verifying', 'unconfirmed'].includes(String(r.phase)))
+                .sort((a, b) => String(a.updated_at).localeCompare(String(b.updated_at)) || String(a.job_id).localeCompare(String(b.job_id)))
+                .slice(0, 20).map(r => ({ ...r })) };
         }
         const imageTable = text.includes('public.ezil_computer_image_jobs') && !text.includes('UNION ALL');
         const writeRows = imageTable ? imageJobs : placements;
@@ -294,7 +302,8 @@ export function createFakePlacementDb(seed: FakeSeed = {}, options: FakeOptions 
             }
             case 'image-read':
                 return { rows: placements.filter(r => uuidEq(r.computer_id, params[0])).slice(0, 2).map(r => present({
-                    lower_image_digest: null, lower_digest_observed_at: null, image_upgrade_job_id: null, ...r })) };
+                    lower_image_digest: null, lower_digest_observed_at: null, image_upgrade_job_id: null, ...r,
+                    retired_host_release: r.retired_host_release == null ? null : JSON.stringify(r.retired_host_release) })) };
             case 'read':
                 return { rows: placements.filter((r) => uuidEq(r.computer_id, params[0])).slice(0, 2).map(present) };
             case 'duplicates': {

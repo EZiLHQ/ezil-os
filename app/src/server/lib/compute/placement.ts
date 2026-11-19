@@ -438,10 +438,15 @@ export async function assertNoImageReservation(db: PlacementExecutor, computerId
     if (rows.length) throw new ImageJobConflictError();
 }
 
+type RetirementAllocation = Pick<Placement, 'computerId' | 'ownerUserId' | 'generation' | 'leaseEpoch' |
+    'region' | 'zoneId' | 'instanceId' | 'volumeId' | 'fenceToken'>;
+
 export interface ImagePlacement extends Placement {
     lowerImageDigest: string | null;
     lowerDigestObservedAt: Date | null;
     imageUpgradeJobId: string | null;
+    /** Trusted lookup only, bound to this stopped allocation. AWS history must still prove the release. */
+    retiredHostReleaseArn?: string;
 }
 
 /** Image store only, inside global admission -> computer -> row locks. */
@@ -449,7 +454,8 @@ export async function lockImagePlacement(tx: PlacementExecutor, lock: AdmissionL
     assertAdmissionLock(tx, lock);
     await lockComputer(tx, canonicalId(computerId));
     const rows = rowsOf(await tx.execute(sql`/* placement:image-read */ SELECT ${SELECT_COLUMNS}, lower_image_digest,
-        lower_digest_observed_at, image_upgrade_job_id::text AS image_upgrade_job_id
+        lower_digest_observed_at, image_upgrade_job_id::text AS image_upgrade_job_id,
+        to_jsonb(ezil_computer_placements)->>'retired_host_release' AS retired_host_release
         FROM public.ezil_computer_placements WHERE computer_id = ${canonicalId(computerId)}::uuid FOR UPDATE`));
     if (!rows.length) return null;
     if (rows.length !== 1) throw new ImageJobConflictError();
@@ -457,7 +463,10 @@ export async function lockImagePlacement(tx: PlacementExecutor, lock: AdmissionL
     const digest = nullableText(r.lower_image_digest), observed = timestamp(r.lower_digest_observed_at), jobId = nullableText(r.image_upgrade_job_id);
     if (digest === undefined || observed === undefined || jobId === undefined || (digest === null) !== (observed === null)
         || (digest !== null && !/^sha256:[0-9a-f]{64}$/.test(digest)) || (jobId !== null && !UUID.test(jobId))) throw new ImageJobConflictError();
-    return { ...p, lowerImageDigest: digest, lowerDigestObservedAt: observed, imageUpgradeJobId: jobId };
+    const hint = typeof r.retired_host_release === 'string'
+        ? (await import('./aws-historical-source')).retiredReleaseHintFor(p, r.retired_host_release) : undefined;
+    return { ...p, lowerImageDigest: digest, lowerDigestObservedAt: observed, imageUpgradeJobId: jobId,
+        ...(hint ? { retiredHostReleaseArn: hint } : {}) };
 }
 
 /** Only the image store calls this under its reservation lock; exactly one placement changes. */
@@ -1056,6 +1065,7 @@ async function casInTx(
         instanceId?: string | null; lastError?: string | null; nonceConsumed?: boolean;
         confirmedGeneration?: number; lifecycleJobId?: string; lifecycleDigest?: string;
         fenceToken?: string; volumeId?: string; updatedAt?: Date;
+        retiredHostRelease?: string; region?: string; zoneId?: string;
         /** Timestamp fields written as GREATEST(current, new): concurrent writers can never move them back. */
         monotonic?: readonly ('presenceAt' | 'leaseUntil')[];
     } = {},
@@ -1080,6 +1090,7 @@ async function casInTx(
                     ? sql`${col} = GREATEST(${col}, ${valueSql(k, fields[k] ?? null)})`
                     : sql`${col} = ${valueSql(k, fields[k] ?? null)}`;
             }),
+        ...(guard.retiredHostRelease === undefined ? [] : [sql`retired_host_release = ${guard.retiredHostRelease}::text::jsonb`]),
         sql`updated_at = ${PLACEMENT_UPDATE_TIME}`,
     ];
     const rows = rowsOf(
@@ -1089,6 +1100,8 @@ async function casInTx(
                 AND image_upgrade_job_id IS NULL
                 AND ${guard.states ? sql`state IN (${sql.join(guard.states.map((s) => sql`${s}`), sql`, `)})` : sql`state = ${expected.state}`}
                 ${guard.provider ? sql` AND provider = ${guard.provider}` : sql``}
+                ${guard.region ? sql` AND region = ${guard.region}` : sql``}
+                ${guard.zoneId ? sql` AND zone_id = ${guard.zoneId}` : sql``}
                 ${guard.ownerUserId !== undefined ? sql` AND owner_user_id = ${canonicalId(guard.ownerUserId)}::uuid` : sql``}
                 ${guard.enrollNonceHash !== undefined ? sql` AND enroll_nonce_hash = ${guard.enrollNonceHash}` : sql``}
                 ${guard.enrollUnexpired ? sql` AND enroll_expires_at > now()` : sql``}
@@ -1254,6 +1267,8 @@ export async function transitionPlacementAsReconciler(
         expected: CasExpectation & Partial<Pick<Placement, 'instanceId' | 'lastError'>>;
         to: PlacementState;
         fields?: PlacementFields;
+        /** Only a validated successful normal release can set a lookup hint. */
+        retirement?: { allocation: RetirementAllocation; jobId: string; digest: string; hint: string };
         /** Usage-ledger write tied to THIS transition: same transaction, only when the CAS won. */
         usage?: UsageEffect;
     },
@@ -1261,9 +1276,26 @@ export async function transitionPlacementAsReconciler(
     const from = input.expected.state;
     if (!PLACEMENT_TRANSITIONS[from]?.includes(input.to) && !RECONCILER_TRANSITIONS[from]?.includes(input.to)) return { ok: false, reason: 'illegal_transition' };
     return db.transaction(async (tx) => {
-        const r = await casInTx(tx, input.computerId, input.expected, input.to, { generation: 0, leaseEpoch: 0 }, input.fields ?? {},
-            { instanceId: input.expected.instanceId, lastError: input.expected.lastError }, input.usage);
-        return r;
+        const { retirement, expected, fields } = input;
+        const guard = { instanceId: expected.instanceId, lastError: expected.lastError };
+        if (!retirement) return casInTx(tx, input.computerId, expected, input.to, { generation: 0, leaseEpoch: 0 },
+            fields ?? {}, guard, input.usage);
+        const { allocation, jobId, digest, hint } = retirement;
+        if (from !== 'STOPPING' || input.to !== 'STOPPED' || fields?.lifecycleJobId !== null || fields.lifecycleDigest !== null
+            || input.computerId !== allocation.computerId || expected.generation !== allocation.generation
+            || expected.leaseEpoch !== allocation.leaseEpoch || expected.instanceId !== allocation.instanceId
+            || !allocation.region || !allocation.zoneId || !allocation.instanceId || !allocation.volumeId || !allocation.fenceToken
+            || !UUID.test(jobId) || !/^[a-f0-9]{64}$/.test(digest)) return { ok: false, reason: 'illegal_transition' };
+        // Hosted schemas gain this nullable column before automatic updates are enabled. Older schemas can still stop.
+        const available = rowsOf(await tx.execute(sql`/* placement:retirement-column */ SELECT EXISTS (
+            SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid = 'public.ezil_computer_placements'::regclass
+                AND attname = 'retired_host_release' AND NOT attisdropped) AS present`));
+        return casInTx(tx, input.computerId, expected, input.to, { generation: 0, leaseEpoch: 0 }, fields,
+            { ...guard, provider: 'aws-ec2', ownerUserId: allocation.ownerUserId, volumeId: allocation.volumeId,
+                region: allocation.region, zoneId: allocation.zoneId, fenceToken: allocation.fenceToken,
+                lifecycleJobId: jobId, lifecycleDigest: digest,
+                ...(available[0]?.present === true ? { retiredHostRelease: hint } : {}) },
+            input.usage);
     });
 }
 
