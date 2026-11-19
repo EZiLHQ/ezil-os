@@ -42,7 +42,7 @@ const input = (observers: ObserverIds) => RetainedRebaseBridgeConfigSchema.parse
 test('explicit staging bridge requires an older immutable tuple linked through the normal predecessor', () => {
     const config = input(sample(2));
     assert.deepEqual(resolveRetainedRebaseBridge(config, settings(4), versions(3), sample(3)),
-        { amiId: config.release.amiId, sourceLifecycleVersion: versions(1).lifecycle, versions: versions(2), observers: sample(2) });
+        { amiIds: [config.release.amiId, config.interveningRelease.amiId], sourceLifecycleVersion: versions(1).lifecycle, versions: versions(2), observers: sample(2) });
     for (const delta of [{ namespace: 'prd' }, { amiId: config.interveningRelease.amiId }, { lowerImageDigest: digest(4) },
         { launchTemplateId: 'lt-' + 'a'.repeat(17) }, { launchTemplateVersion: '8' }, { stateMachineVersionArn: arn('lifecycle', 4) }]) {
         assert.throws(() => resolveRetainedRebaseBridge({ ...config, release: { ...config.release, ...delta } }, settings(4), versions(3), sample(3)));
