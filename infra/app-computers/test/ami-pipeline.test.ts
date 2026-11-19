@@ -249,3 +249,33 @@ test('native candidate synthesizes a separate private recipe and only one extra 
     const installer = readFileSync(join(__dirname, '../../host-agent/ami/install-native-payload.py'), 'utf8');
     assert.ok(installer.includes('ARCHIVE_SHA = "' + NATIVE_PAYLOAD_OBJECT.match(/[a-f0-9]{64}/)![0] + '"'));
 });
+
+test('the literal Ubuntu snapshot is confined to an opt-in ap-south-1 native candidate build', () => {
+    const candidate = { ...config, nativeCandidate: true, nativeCandidateParentAmi: 'ami-0123456789abcdef0' };
+    const nativeCandidateUbuntuSnapshot = '20261119T062000Z';
+    for (const invalid of [
+        { ...config, nativeCandidateUbuntuSnapshot },
+        { ...candidate, region: 'eu-west-2', nativeCandidateUbuntuSnapshot },
+        { ...candidate, nativeCandidateUbuntuSnapshot: 'https://mirror.example.com/noble' },
+        { ...candidate, nativeCandidateUbuntuSnapshot: "20261119T062000Z'; evil" },
+    ]) assert.equal(AmiConfigSchema.safeParse(invalid).success, false);
+    const synth = (config: AmiConfig) => assertions.Template.fromStack(new AmiPipelineStack(
+        new App(), 'ezil-pilot-ami-native-candidate', {
+            config, env: { account: config.accountId, region: config.region },
+            synthesizer: new BootstraplessSynthesizer(), terminationProtection: true,
+        })).toJSON();
+    const baseline = synth(candidate);
+    const pinned = synth({ ...candidate, nativeCandidateUbuntuSnapshot });
+    const data: string = pinned.Resources.Component.Properties.Data;
+    assert.ok(data.includes("python3 - '20261119T062000Z'"));
+    assert.ok(data.includes('https://snapshot.ubuntu.com/ubuntu/'));
+    assert.ok(data.indexOf('name: FetchAgent') < data.indexOf('name: UseCanonicalUbuntuSnapshot'));
+    assert.ok(data.indexOf('name: UseCanonicalUbuntuSnapshot') < data.indexOf('name: Build'));
+    assert.ok(data.indexOf('name: Build') < data.indexOf('name: RestoreCanonicalUbuntuSources'));
+    assert.ok(data.indexOf('name: RestoreCanonicalUbuntuSources') < data.indexOf('name: validate'));
+    assert.doesNotMatch(data, /Check-Valid-Until|allow-insecure|trusted=yes/);
+    assert.equal(template().toJSON().Resources.Component.Properties.Data,
+        readFileSync(join(__dirname, '../../host-agent/ami/imagebuilder-component.yaml'), 'utf8'));
+    pinned.Resources.Component.Properties.Data = baseline.Resources.Component.Properties.Data;
+    assert.deepEqual(pinned, baseline);
+});
