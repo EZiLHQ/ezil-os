@@ -499,6 +499,10 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env, use
                 // unique lower, the dedicated archive only for a shared one. A changed registry or lower is a conflict.
                 if (prep.intent.retiredSource && registrySources(p) !== 1) throw new ImageJobConflictError();
                 const dedicated = prep.intent.releasedDedicatedHost;
+                const retirement = released ?? prep.intent.retiredSource ?? dedicated;
+                if (stoppedOnly && retirement && retirement.releaseExecutionArn !== p.retiredHostReleaseArn) {
+                    throw new ImageJobConflictError();
+                }
                 if (dedicated) {
                     if (p.state !== 'STOPPED' || await releasedPoolRow(tx, p) || registrySources(p) < 2) throw new ImageJobConflictError();
                     const row = await releasedDedicatedRow(tx, p).catch(() => { throw new ImageJobConflictError(); });

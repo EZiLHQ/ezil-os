@@ -117,6 +117,8 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, aut
             if (result.child) await handleImageRebase(deps, { schemaVersion: 1, operation: 'prepare', computerId, jobId: result.child.jobId });
             return reply(isTerminalImageJob(j.phase) || j.phase === 'failed' ? 200 : 202, j.failureCode === null);
         }
+        // Automatic open accepts no client hint. Its trusted allocation record is only a lookup.
+        const retirementHint = automatic ? p.retiredHostReleaseArn : input.sourceRetirementExecutionArn;
         /** DESIGN R: a STOPPED computer's released warm-pool host. Its retired claim row switches the source evidence to the
          * provision (b) and release (a) proofs; no row, no change. EC2 must no longer list the host: launch, recovery and
          * maintenance accept an absent source but refuse a listed claim, after the snapshot. Retry once it ages out. */
@@ -124,7 +126,7 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, aut
             const found = await deps.store.releasedPoolHost(p.computerId);
             if (!found.row) return null;
             if (!isDeepStrictEqual(p, found.placement)) throw new ImageJobConflictError();
-            const proof = await readReleasedPoolHostProof(deps.executions, p, d, found.row, input.sourceRetirementExecutionArn, deps.now());
+            const proof = await readReleasedPoolHostProof(deps.executions, p, d, found.row, retirementHint, deps.now());
             if (!proof || await deps.describer.describeForEnrollment(p.region!, p.instanceId!)) throw new Error('source_identity_mismatch');
             // Observations are outside the lock: never use them for a placement or row that changed meanwhile.
             if (!isDeepStrictEqual(found, await deps.store.releasedPoolHost(p.computerId))) throw new ImageJobConflictError();
@@ -142,7 +144,7 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, aut
             if (!p.instanceId || await observe()) return null;
             // Only a STOPPED placement can have a retired source; any other unlisted source is never reserved blind.
             if (p.state !== 'STOPPED' || shared) throw new Error('source_identity_mismatch');
-            const proof = await readRetiredSourceProof(deps.executions, p, d, input.sourceRetirementExecutionArn, deps.now());
+            const proof = await readRetiredSourceProof(deps.executions, p, d, retirementHint, deps.now());
             if (!proof) throw new Error('source_identity_mismatch');
             // Observations are outside the lock: still the same placement, and still no claim row.
             const fresh = await deps.store.releasedPoolHost(p.computerId);
@@ -158,7 +160,7 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, aut
             const found = await deps.store.releasedDedicatedHost(p.computerId);
             if (!isDeepStrictEqual(p, found.placement)) throw new ImageJobConflictError();
             if (!found.row) return null;
-            const proof = await readReleasedDedicatedHostProof(deps.executions, p, d, found.row, input.sourceRetirementExecutionArn, deps.now());
+            const proof = await readReleasedDedicatedHostProof(deps.executions, p, d, found.row, retirementHint, deps.now());
             if (!proof) throw new Error('source_identity_mismatch');
             // Observations are outside the lock: still the same placement and archive, and still no claim row.
             if (!isDeepStrictEqual(found, await deps.store.releasedDedicatedHost(p.computerId))

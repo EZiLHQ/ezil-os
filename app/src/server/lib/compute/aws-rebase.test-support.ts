@@ -20,7 +20,7 @@ export const rebaseEnv = { EZIL_AWS_COMPUTERS_ENABLED: '1', AWS_MAX_RUNNING: '20
     EZIL_AWS_GLOBAL_MONTHLY_HOURS: '600', EZIL_AWS_USER_MONTHLY_EGRESS_GB: '50', EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB: '200',
     AWS_REGIONS: 'ap-south-1', EZIL_AWS_MAX_RUNNING_AP_SOUTH_1: '20', EZIL_AWS_ENROLL_URL: 'https://os.example.com/api/compute/aws/enroll',
     EZIL_AWS_BROWSER_ZONE: 'example.com' };
-export function rebaseSetup(externalDb?: PlacementDb, userHoursExemption: UserHoursExemption = async () => false) {
+export function rebaseSetup(externalDb?: PlacementDb, userHoursExemption: UserHoursExemption = async () => false, retiredReleaseColumn = false) {
     const prep = fixtureRebasePreparation(), source = prep.intent, owner = '33333333-3333-4333-8333-333333333333';
     let clock = new Date('2026-10-22T12:00:00.000Z');
     const fake = createFakePlacementDb({ placements: [placementRow({ computer_id: source.computerId, owner_user_id: owner,
@@ -28,7 +28,7 @@ export function rebaseSetup(externalDb?: PlacementDb, userHoursExemption: UserHo
         region: source.deployment.region, zone_id: source.deployment.zoneId, instance_id: source.sourceInstanceId, instance_type: 'm6i.large',
         volume_id: source.sourceVolumeId, fs_uuid: source.fsUuid, lower_image_digest: source.fromDigest,
         lower_digest_observed_at: new Date(source.createdAt), image_upgrade_job_id: null })],
-        computers: [{ id: source.computerId, user_id: owner }] }, { clock: () => clock });
+        computers: [{ id: source.computerId, user_id: owner }] }, { clock: () => clock, retiredReleaseColumn });
     const env = { ...rebaseEnv, EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ [source.deployment.region]: { ...source.deployment,
         releases: [fixtureRebaseRelease(source.sourceDeployment), fixtureRebaseRelease(source.deployment)] } }) };
     const store = createImageJobStore(externalDb ?? fake.db, env, userHoursExemption);
@@ -119,8 +119,8 @@ const PROVISION_JOB = 'b1b1b1b1-b1b1-4b1b-8b1b-b1b1b1b1b1b1', RELEASE_JOB = 'd3d
 type ReleaseIntent = LifecycleWork['intent'];
 /** DESIGN R: the placement's warm-pool host was released and aged out of EC2. Synthetic retired claim row, SUCCEEDED provision and
  * release executions with a Code-48 termination history. `shared`: 34ac-like lower whose 1.0.5/1.0.6 records share it. */
-export function releasedPoolSetup(options: { shared?: boolean; db?: PlacementDb } = {}) {
-    const s = rebaseSetup(options.db), src = s.source, f = fixtureSharedLowerSuccessor();
+export function releasedPoolSetup(options: { shared?: boolean; db?: PlacementDb; retiredReleaseColumn?: boolean } = {}) {
+    const s = rebaseSetup(options.db, undefined, options.retiredReleaseColumn), src = s.source, f = fixtureSharedLowerSuccessor();
     s.provider.sourceListed = false;
     if (options.shared) { s.env.EZIL_AWS_LIFECYCLE_DEPLOYMENTS = JSON.stringify({ [f.entry.region]: f.entry }); s.fake.placements[0]!.lower_image_digest = LOWER_105; }
     const provisioned = options.shared ? f.deployment105 : LifecycleDeploymentSchema.parse(src.sourceDeployment);

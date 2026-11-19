@@ -2,7 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { handleImageRebase, isAutomaticImageJob } from './aws-rebase-orchestrator';
 import { nonceHashOf } from './aws-enroll';
 import { parseEnrollmentUserData } from './aws-rebase-lease';
-import { rebaseSetup } from './aws-rebase.test-support';
+import { rebaseSetup, releasedPoolSetup } from './aws-rebase.test-support';
+import { applyLifecycleReceipt } from './aws-receipts';
+import { readPlacement } from './placement';
 
 function setup() {
     const s = rebaseSetup();
@@ -11,6 +13,93 @@ function setup() {
             { ownerUserId: s.owner, allowStart: true, canBoot: async () => true, ...overrides });
     return { ...s, advanceClock: s.advance, advance };
 }
+
+describe('automatic image updates using a saved retirement', () => {
+    function released(retiredReleaseColumn = true) {
+        const s = releasedPoolSetup({ shared: true, retiredReleaseColumn });
+        const row = s.fake.placements[0]!;
+        const settle = async () => {
+            Object.assign(row, { state: 'STOPPING', lifecycle_job_id: s.release().intent.jobId, lifecycle_digest: s.release().digest });
+            const { record } = await readPlacement(s.fake.db, s.source.computerId);
+            await applyLifecycleReceipt({ db: s.fake.db, executions: s.deps.executions, now: s.deps.now }, record!, s.provisioned);
+        };
+        const advance = () => handleImageRebase(s.deps,
+            { schemaVersion: 1, operation: 'prepare', computerId: s.source.computerId, jobId: null },
+            { ownerUserId: s.owner, allowStart: true, canBoot: async () => true });
+        return { ...s, row, settle, advance };
+    }
+
+    it('records the normal retirement in the STOPPED transaction and reuses one verified image job across opens', async () => {
+        const s = released();
+        await s.settle();
+        expect(s.row).toMatchObject({ state: 'STOPPED', lifecycle_job_id: null, lifecycle_digest: null,
+            retired_host_release: { executionArn: s.releaseArn } });
+        const first = await s.advance();
+        expect(first.body).toMatchObject({ eligible: true, phase: 'fencing' });
+        expect(first.body.jobId).not.toBeNull();
+        expect(JSON.parse((await s.current()).preparationDocument).releasedPoolHost.releaseExecutionArn).toBe(s.releaseArn);
+        expect(s.deps.executions.history).toHaveBeenCalledWith('ap-south-1', s.releaseArn);
+        const historyReads = vi.mocked(s.deps.executions.history!).mock.calls.length;
+        expect((await s.advance()).body.jobId).toBe(first.body.jobId);
+        expect(s.deps.executions.history).toHaveBeenCalledTimes(historyReads);
+        expect(s.started).toHaveLength(1);
+        expect(s.fake.imageJobs).toHaveLength(1);
+    });
+
+    it.each(['failed', 'ambiguous', 'mismatched'] as const)('does not save an automatic hint for a %s release', async fault => {
+        const s = released();
+        const execution = s.executions.get(s.releaseArn)!;
+        if (fault === 'failed') execution.status = 'FAILED';
+        if (fault === 'ambiguous') execution.redriveCount = 1;
+        if (fault === 'mismatched') execution.stateMachineVersionArn = s.provisioned.stateMachineVersionArn.replace(/:[0-9]+$/, ':99');
+        await s.settle();
+        expect(s.row.retired_host_release).toBeUndefined();
+        expect((await s.advance()).body.jobId).toBeNull();
+        expect(s.started).toHaveLength(0);
+    });
+
+    it('still settles a normal release on older schemas and accepts an independently proven manual hint', async () => {
+        const s = released(false);
+        await s.settle();
+        expect(s.row).toMatchObject({ state: 'STOPPED', lifecycle_job_id: null });
+        expect(s.row.retired_host_release).toBeUndefined();
+        expect((await s.advance()).body).toMatchObject({ jobId: null, failureCode: 'source_identity_mismatch' });
+        expect(s.deps.executions.history).not.toHaveBeenCalled();
+        expect((await s.request('plan')).body).toMatchObject({ eligible: true, jobId: null });
+        expect(s.started).toHaveLength(0);
+    });
+
+    it('ignores a persisted hint after a different allocation', async () => {
+        const s = released();
+        await s.settle();
+        s.row.lease_epoch = Number(s.row.lease_epoch) + 1;
+        expect((await s.store.inspect(s.source.computerId)).placement?.retiredHostReleaseArn).toBeUndefined();
+        expect((await s.advance()).body.jobId).toBeNull();
+        expect(s.deps.executions.history).not.toHaveBeenCalled();
+    });
+
+    it('rechecks the retained hint under the reservation lock', async () => {
+        const s = released();
+        await s.settle();
+        const describeVolume = s.deps.describer.describeVolume;
+        s.deps.describer.describeVolume = vi.fn(async (region, volumeId) => {
+            s.row.retired_host_release = null;
+            return describeVolume(region, volumeId);
+        });
+        expect((await s.advance()).body).toMatchObject({ jobId: null, failureCode: 'image_job_conflict' });
+        expect(s.deps.executions.history).toHaveBeenCalledWith('ap-south-1', s.releaseArn);
+        expect(s.started).toHaveLength(0);
+    });
+
+    it('does not substitute the saved hint for positive termination history', async () => {
+        const s = released();
+        s.setRelease({}, {}, { Code: 32, Name: 'shutting-down' });
+        await s.settle();
+        expect(s.row.retired_host_release).toBeDefined();
+        expect((await s.advance()).body).toMatchObject({ jobId: null, failureCode: 'source_identity_mismatch' });
+        expect(s.started).toHaveLength(0);
+    });
+});
 
 describe('automatic image updates on owner open', () => {
     it('reuses one job across opens and waits for the verified snapshot before launch', async () => {
