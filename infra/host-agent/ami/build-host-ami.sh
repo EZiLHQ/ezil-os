@@ -58,6 +58,7 @@ rm -rf "$tmp"
 # 3. agent, security profiles, units, config template (no secrets)
 install -d -m 0755 /opt/ezil-host /etc/ezil-host
 install -m 0644 "$AGENT_SRC/ami/validate-lowers.py" /opt/ezil-host/validate-lowers.py
+install -m 0644 "$AGENT_SRC/ami/install-native-payload.py" /opt/ezil-host/install-native-payload.py
 cp -a "$AGENT_SRC/bin" "$AGENT_SRC/lib" /opt/ezil-host/
 find /opt/ezil-host -name __pycache__ -prune -exec rm -rf {} +
 install -m 0644 "$AGENT_SRC/security/seccomp.json" /etc/ezil-host/seccomp.json
