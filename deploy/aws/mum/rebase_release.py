@@ -762,7 +762,7 @@ HOST_AGENT_DIRECTED_EXCEPTIONS=(
         'test/test_native_session.py':(None,'100644 3fbea20af4b053119669b74d52d5209d3b93ca60'),
     }),
     # Exact forward candidate only; runtime admission still uses placement and a real target witness.
-    ('b7700d49c946157cd75c862bce867caf7fd08810','dc8c874d609702d36bcfbe2967834450284a3058',{
+    ('b7700d49c946157cd75c862bce867caf7fd08810','907dc8767841c32dab510b222785e661b10a4e7f',{
         'ami/NATIVE-CANDIDATE.md':(None,'100644 086f6458d91b9fc6d4b8852f0192a25fd475a5b0'),
         'ami/build-host-ami.sh':('100755 d4ddd6b0a9ae36372e8a082c2da4f888194eadf7','100755 5a2c385f6316406bbda32492c79b96b42a6aae7d'),
         'ami/imagebuilder-native-component.yaml':(None,'100644 5ec83c3e5b7c3762a62cb9e717228509ba7b4d9d'),
@@ -775,19 +775,19 @@ HOST_AGENT_DIRECTED_EXCEPTIONS=(
         'lib/ezil_host/native_isolation.py':(None,'100644 a2ae9f841c5fdab4b222c31995731e6dfff0583f'),
         'lib/ezil_host/native_qualification.py':(None,'100644 acb7f125002fbd84dec82a393c44a1657dc1f36c'),
         'lib/ezil_host/native_session.py':(None,'100644 aa804d96721492d5e08eee2abb9facf00b02bbba'),
-        'systemd/ezil-native-qualification.service':(None,'100644 3d3e4ee8190c35c545345ca1183d11ad4d0d50a9'),
+        'systemd/ezil-native-qualification.service':(None,'100644 24f6ab07d1578f62ee967e14aa3dd2fdbeb047c8'),
         'systemd/ezil-native-qualification.timer':(None,'100644 aae2bf71edf5af025cc852fcdbe559e12c4dc8f7'),
         'test/test_native_qualification.py':(None,'100644 ce6a5791e45fcd8172d8c517647b9b405995f410'),
         'test/test_native_session.py':(None,'100644 3fbea20af4b053119669b74d52d5209d3b93ca60'),
     }),
     # Exact forward candidate only; runtime admission still uses placement and a real target witness.
-    ('82228b6e31dfcfedb116c3c6649ae78281b0d799','dc8c874d609702d36bcfbe2967834450284a3058',{
+    ('82228b6e31dfcfedb116c3c6649ae78281b0d799','907dc8767841c32dab510b222785e661b10a4e7f',{
         'ami/NATIVE-CANDIDATE.md':(None,'100644 086f6458d91b9fc6d4b8852f0192a25fd475a5b0'),
         'ami/build-host-ami.sh':('100755 d4ddd6b0a9ae36372e8a082c2da4f888194eadf7','100755 5a2c385f6316406bbda32492c79b96b42a6aae7d'),
         'ami/imagebuilder-native-component.yaml':(None,'100644 5ec83c3e5b7c3762a62cb9e717228509ba7b4d9d'),
         'ami/install-native-payload.py':(None,'100644 1d3a1112cba3fe92ad3c1402aeaa5bec82b9e54d'),
         'lib/ezil_host/native_qualification.py':('100644 256908d285bf7111ae7da9191810bc259bf5b8cb','100644 acb7f125002fbd84dec82a393c44a1657dc1f36c'),
-        'systemd/ezil-native-qualification.service':(None,'100644 3d3e4ee8190c35c545345ca1183d11ad4d0d50a9'),
+        'systemd/ezil-native-qualification.service':(None,'100644 24f6ab07d1578f62ee967e14aa3dd2fdbeb047c8'),
         'systemd/ezil-native-qualification.timer':(None,'100644 aae2bf71edf5af025cc852fcdbe559e12c4dc8f7'),
         'test/test_native_qualification.py':('100644 b6186eebdc522e5cca856faad78a2586bc28785e','100644 ce6a5791e45fcd8172d8c517647b9b405995f410'),
     }),

@@ -393,7 +393,7 @@ class DirectedHostAbiTests(unittest.TestCase):
     PREVIOUS = '96ff8e224443e0d684cb99e808a903235f2def11'
     DIAGNOSTICS = 'b7700d49c946157cd75c862bce867caf7fd08810'
     NATIVE_BASE = '82228b6e31dfcfedb116c3c6649ae78281b0d799'
-    TARGET = 'dc8c874d609702d36bcfbe2967834450284a3058'
+    TARGET = '907dc8767841c32dab510b222785e661b10a4e7f'
     PREDECESSORS = {PREVIOUS: 'S 0c113cb4 standalone Git edge/history/resilience host',
                     DIAGNOSTICS: 'cdd39dac standalone Git diagnostics host',
                     NATIVE_BASE: '230e261f protected Native PreviewV2 Host source',
