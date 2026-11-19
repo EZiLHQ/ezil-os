@@ -2,7 +2,7 @@ import { getBillingDeps } from '@/server/billing/deps';
 import { billingV2EntitlementReader, gateComputerStart } from '@/server/billing/v2/compute-access';
 import { billingComputeMeter } from '@/server/billing/v2/compute-meter';
 import { sharedAwsSdkCollaborators } from './aws-clients';
-import { instanceTypeForTier, readAwsAdmissionConfig, readAwsEnrollUrl } from './aws-config';
+import { automaticImageUpdateCohortIncludes, instanceTypeForTier, readAwsAdmissionConfig, readAwsEnrollUrl } from './aws-config';
 import { imageDesktopHealthy } from './aws-rebase-health';
 import { handleImageRebase, isAutomaticImageJob, type ImageRebaseDeps } from './aws-rebase-orchestrator';
 import { createImageJobStore } from './aws-rebase-store';
@@ -39,7 +39,7 @@ export async function verifyLaunchedStagingImageUpdates(db: PlacementDb) {
 
 export async function advanceStagingImageUpdate(db: PlacementDb, computerId: string, ownerUserId: string, allowStart: boolean) {
     const env = process.env;
-    if (env.EZIL_AWS_AUTO_REBASE !== '1' || !isStaging()) return false;
+    if (env.EZIL_AWS_AUTO_REBASE !== '1' || !isStaging() || !automaticImageUpdateCohortIncludes(computerId, env)) return false;
     const admission = readAwsAdmissionConfig(env);
     if (!admission.enabled || admission.killSwitch) return false;
     const engine = dependencies(db);

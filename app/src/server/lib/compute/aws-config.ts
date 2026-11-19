@@ -295,6 +295,13 @@ export function readAwsEnrollUrl(env: Env): string | null {
     return `https://${url.hostname}${AWS_ENROLL_PATH}`;
 }
 
+const AUTO_UPDATE_COMPUTER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function automaticImageUpdateCohortIncludes(computerId: string, env: Env = process.env): boolean {
+    const cohort = env.EZIL_AWS_AUTO_REBASE_COMPUTER_IDS?.split(',').map(id => id.trim().toLowerCase());
+    return Boolean(cohort?.every(id => AUTO_UPDATE_COMPUTER_ID.test(id)) && cohort.includes(computerId.toLowerCase()));
+}
+
 /**
  * How a STOPPED computer wakes.
  * - `replace` (default): a NEW instance boots on the retained data volume

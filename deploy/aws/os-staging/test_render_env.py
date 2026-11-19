@@ -39,6 +39,14 @@ class RenderEnvTests(unittest.TestCase):
         with self.assertRaisesRegex(renderer.RenderError, "byte limit"):
             renderer.validate({**self.values, key: "x" * 4097}, "staging")
 
+    def test_auto_update_cohort_is_optional_and_preserves_retained_bridge_key(self):
+        cohort = {"EZIL_AWS_AUTO_REBASE": "1",
+                  "EZIL_AWS_AUTO_REBASE_COMPUTER_IDS": "22222222-2222-4222-8222-222222222222"}
+        self.assertTrue(cohort.keys() <= renderer.OPTIONAL)
+        self.assertTrue(cohort.keys().isdisjoint(renderer.REQUIRED))
+        self.assertIn("EZIL_AWS_RETAINED_REBASE_APPROVAL", renderer.OPTIONAL)
+        self.assertEqual(renderer.validate({**self.values, **cohort}), {**self.values, **cohort})
+
     def test_universe_project_repo_origin_is_optional(self):
         # Opening a Universe project in Code (app/src/server/works/project-repo.ts): off unless set.
         universe = {"UNIVERSE_PROJECT_REPO_ORIGIN": "https://universe-staging.example.invalid"}

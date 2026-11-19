@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import {
-    STAGING_REF, EXPLICIT_FILES, TARGETED_APPLY_FILE, validateDatabaseUrl, redact, orderFiles,
+    STAGING_REF, EXPLICIT_FILES, TARGETED_APPLY_FILE, RETIRED_HOST_RELEASE_FILE, validateDatabaseUrl, redact, orderFiles,
     sha256, buildPlan, renderPlan, parseArgs, run,
 } from './billing-staging-schema.mjs';
 
@@ -731,7 +731,7 @@ const stageReleased = {
 };
 
 test('incident alerts and AI traces (0024, 0025) follow 0023 in order, before 0030, with the exact released bytes', () => {
-    assert.deepEqual(EXPLICIT_FILES.slice(-4), ['app/drizzle/0023_operator_issued_by.sql', ...Object.keys(stageReleased), 'app/drizzle/0030_delegation_replay.sql']);
+    assert.deepEqual(EXPLICIT_FILES.slice(-5), ['app/drizzle/0023_operator_issued_by.sql', ...Object.keys(stageReleased), 'app/drizzle/0030_delegation_replay.sql', RETIRED_HOST_RELEASE_FILE]);
     for (const [file, digest] of Object.entries(stageReleased)) {
         assert.equal(files.find(entry => entry.file === file).sha256, digest);
         assert.equal(buildPlan(files, []).find(row => row.file === file).status, 'pending');
@@ -753,20 +753,20 @@ test('production apply really runs 0024 and 0025 after 0023, then 0030, and stil
     const h = productionHarness();
     assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 0);
     const applied = h.calls.slice(3).map(({ args }) => EXPLICIT_FILES.find(file => args[args.indexOf('-f') + 1].endsWith(`/${file}`)));
-    assert.deepEqual(applied.slice(-4), ['app/drizzle/0023_operator_issued_by.sql', ...Object.keys(stageReleased), 'app/drizzle/0030_delegation_replay.sql']);
+    assert.deepEqual(applied.slice(-5), ['app/drizzle/0023_operator_issued_by.sql', ...Object.keys(stageReleased), 'app/drizzle/0030_delegation_replay.sql', RETIRED_HOST_RELEASE_FILE]);
     assert.equal(applied.includes('app/drizzle/0012_compute_reverse_moves.sql'), false);
     for (const file of Object.keys(stageReleased)) assert.ok(h.output.includes(`${file}: applied`));
 });
 
-test('the staging log (22 rows, without 0002_image_rebase, 0022 and the new 0030) leaves 0022 and 0030 pending after the supported 0002 baseline', () => {
+test('the staging log (22 rows, without the later migrations) leaves 0022, 0030 and 0005 pending after the supported 0002 baseline', () => {
     const imageRebase = 'docs/aws-computers/sql/0002_image_rebase.sql.txt';
     const feedback = 'app/drizzle/0022_feedback_notifications.sql';
     const replay = 'app/drizzle/0030_delegation_replay.sql';
-    const logged = files.filter(({ file }) => file !== imageRebase && file !== feedback && file !== replay)
+    const logged = files.filter(({ file }) => ![imageRebase, feedback, replay, RETIRED_HOST_RELEASE_FILE].includes(file))
         .map(({ file, sha256: digest }) => ({ file, sha256: digest, mode: 'apply' }));
     assert.equal(logged.length, 22);
-    // Before the baseline all three are genuinely pending; 0002 is never counted as applied by default.
-    assert.deepEqual(buildPlan(files, logged).filter(row => row.status === 'pending').map(row => row.file), [imageRebase, feedback, replay]);
+    // Before the baseline all four are genuinely pending; 0002 is never counted as applied by default.
+    assert.deepEqual(buildPlan(files, logged).filter(row => row.status === 'pending').map(row => row.file), [imageRebase, feedback, replay, RETIRED_HOST_RELEASE_FILE]);
     // The supported single-file baseline of 0002 (its catalog checked out of band by rebase_schema) logs only that file.
     const h = harness(logged);
     assert.equal(run(['baseline', '0002_image_rebase.sql.txt', '--yes'], h.options), 0);
@@ -776,7 +776,7 @@ test('the staging log (22 rows, without 0002_image_rebase, 0022 and the new 0030
     assert.equal(h.calls.some(({ args }) => args.includes('-f')), false);
     const baselined = [...logged, { file: imageRebase, sha256: files.find(({ file }) => file === imageRebase).sha256, mode: 'baseline' }];
     const plan = buildPlan(files, baselined);
-    assert.deepEqual(plan.filter(row => row.status === 'pending').map(row => row.file), [feedback, replay]);
+    assert.deepEqual(plan.filter(row => row.status === 'pending').map(row => row.file), [feedback, replay, RETIRED_HOST_RELEASE_FILE]);
     assert.equal(plan.find(row => row.file === imageRebase).status, 'applied (baseline)');
     for (const file of Object.keys(stageReleased)) assert.equal(plan.find(row => row.file === file).status, 'applied (apply)');
     // A drifted 0024/0025 log hash is refused, never re-run or rebaselined.
@@ -802,8 +802,7 @@ test('a logged 0030 is skipped while pending 0024 and 0025 still run, in order, 
     assert.equal(h.output.includes(`${replayFile}: applying`), false);
 });
 
-test('the delegation replay ledger is last, after 0025, additive, server-only and a production snapshot only', () => {
-    assert.equal(EXPLICIT_FILES.at(-1), replayFile);
+test('the delegation replay ledger follows 0025 and is additive, server-only and a production snapshot only', () => {
     assert.equal(EXPLICIT_FILES.indexOf(replayFile), EXPLICIT_FILES.indexOf('app/drizzle/0025_ai_request_traces.sql') + 1);
     assert.equal(EXPLICIT_FILES.filter(file => file === replayFile).length, 1);
     const sql = readFileSync(fileURLToPath(new URL(`../../${replayFile}`, import.meta.url)), 'utf8');
@@ -852,7 +851,7 @@ test('production apply with 0000-0025 logged runs only 0030: pinned, hash-checke
     assert.equal(h.output.join('\n').includes(password), false);
 });
 
-test('production plan shows 0030 pending, and apply from an empty log runs it last after every earlier file', () => {
+test('production plan shows 0030 pending and applies it before the retirement hint', () => {
     const plan = productionHarness(beforeReplay());
     assert.equal(run(['plan', ...productionArgs], plan.options), 0);
     assert.match(plan.output.join('\n'), new RegExp(`${replayFile}  ${replayEntry.sha256}  pending`));
@@ -860,7 +859,8 @@ test('production plan shows 0030 pending, and apply from an empty log runs it la
     const h = productionHarness();
     assert.equal(run(['apply', '--yes', ...productionArgs], h.options), 0);
     const applied = h.calls.filter(({ args }) => args.includes('-f')).map(({ args }) => args[args.indexOf('-f') + 1]);
-    assert.ok(applied.at(-1).endsWith(`/${replayFile}`));
+    assert.ok(applied.at(-2).endsWith(`/${replayFile}`));
+    assert.ok(applied.at(-1).endsWith(`/${RETIRED_HOST_RELEASE_FILE}`));
     assert.equal(applied.length, EXPLICIT_FILES.length - 1);
 });
 
@@ -973,10 +973,10 @@ test('--only refuses unknown, outside-the-list, ambiguous and staging-only files
     }
 });
 
-test('--only accepts ONLY the canonical 0030 path: every other reviewed file, alias or target makes no psql call', () => {
+test('--only refuses other reviewed paths and aliases', () => {
     assert.equal(TARGETED_APPLY_FILE, replayFile);
-    const others = EXPLICIT_FILES.filter(file => file !== replayFile);
-    assert.equal(others.length, EXPLICIT_FILES.length - 1);
+    const others = EXPLICIT_FILES.filter(file => ![replayFile, RETIRED_HOST_RELEASE_FILE].includes(file));
+    assert.equal(others.length, EXPLICIT_FILES.length - 2);
     const harnesses = { production: [productionHarness, productionArgs], preview: [previewHarness, previewArgs] };
     for (const [, [make, targetArgs]] of Object.entries(harnesses)) {
         for (const file of others) {
@@ -1045,4 +1045,27 @@ test('without --only a production apply still runs every pending file, and --onl
     assert.equal(run(['apply', '--only', replayFile, '--yes', ...previewArgs], preview.options), 0);
     assert.equal(schemaRuns(preview).length, 1);
     assert.ok(preview.calls.at(-1).args.some(arg => arg.startsWith('DO $pin$')));
+});
+
+
+test('retirement hint can only target the exact AWS staging ledger path and never baseline it', () => {
+    assert.ok(EXPLICIT_FILES.includes(RETIRED_HOST_RELEASE_FILE));
+    const production = productionHarness();
+    assert.equal(run(['apply', '--only', RETIRED_HOST_RELEASE_FILE, '--yes', ...productionArgs], production.options), 1);
+    assert.equal(production.calls.length, 0);
+    const legacy = harness();
+    assert.equal(run(['apply', '--only', RETIRED_HOST_RELEASE_FILE, '--yes'], legacy.options), 1);
+    assert.equal(legacy.calls.length, 0);
+    const stagingBaseline = previewHarness();
+    assert.equal(run(['baseline', RETIRED_HOST_RELEASE_FILE, '--yes', ...previewArgs], stagingBaseline.options), 1);
+    assert.match(stagingBaseline.output.join('\n'), /retirement hint column must be applied, never baselined/);
+    assert.equal(stagingBaseline.calls.length, 0);
+    const staging = previewHarness();
+    assert.equal(run(['apply', '--only', RETIRED_HOST_RELEASE_FILE, '--yes', ...previewArgs], staging.options), 0);
+    const calls = staging.calls.filter(({ args }) => args.includes('-f'));
+    assert.equal(calls.length, 1);
+    const { args } = calls[0];
+    assert.ok(args.includes('--single-transaction'));
+    assert.ok(args[args.indexOf('-f') + 1].endsWith('/' + RETIRED_HOST_RELEASE_FILE));
+    assert.ok(args.at(-1).includes(files.find(({ file }) => file === RETIRED_HOST_RELEASE_FILE).sha256));
 });

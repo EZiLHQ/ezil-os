@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import { handleImageRebase, isAutomaticImageJob } from './aws-rebase-orchestrator';
+import { automaticImageUpdateCohortIncludes } from './aws-config';
 import { nonceHashOf } from './aws-enroll';
 import { parseEnrollmentUserData } from './aws-rebase-lease';
 import { rebaseSetup, releasedPoolSetup } from './aws-rebase.test-support';
@@ -182,5 +183,19 @@ describe('automatic image updates on owner open', () => {
         s.provider.sourceListed = false;
         expect((await s.advance()).body).toMatchObject({ jobId: null, failureCode: 'source_identity_mismatch' });
         expect(s.started).toHaveLength(0);
+    });
+});
+
+
+describe('automatic image update cohort', () => {
+    const computerId = '22222222-2222-4222-8222-222222222222';
+    const otherId = '33333333-3333-4333-8333-333333333333';
+
+    it('requires a valid list explicitly naming the owned computer', () => {
+        expect(automaticImageUpdateCohortIncludes(computerId, {})).toBe(false);
+        for (const cohort of ['', otherId, computerId + ',invalid', computerId + ',']) {
+            expect(automaticImageUpdateCohortIncludes(computerId, { EZIL_AWS_AUTO_REBASE_COMPUTER_IDS: cohort })).toBe(false);
+        }
+        expect(automaticImageUpdateCohortIncludes(computerId, { EZIL_AWS_AUTO_REBASE_COMPUTER_IDS: otherId + ', ' + computerId })).toBe(true);
     });
 });
