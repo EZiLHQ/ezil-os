@@ -712,7 +712,7 @@ class RegistryGcTests(unittest.TestCase):
 
 
 class NamespaceLegacyCapacityTests(unittest.TestCase):
-    """GC stays frozen per namespace (mum 32, prd 26) while the active reader capacity is thirty-seven."""
+    """GC stays frozen per namespace (mum 32, prd 26) as the active reader capacity advances."""
     def tearDown(self):
         gc.tool.use_namespace('mum')
 
@@ -725,12 +725,13 @@ class NamespaceLegacyCapacityTests(unittest.TestCase):
         return str(caught.exception)
 
     def test_each_namespace_keeps_its_frozen_gc_limit(self):
-        self.assertEqual(gc.tool.ACTIVE_REGISTRY_CAPACITY, 39)
+        self.assertEqual(gc.tool.ACTIVE_REGISTRY_CAPACITY, 40)
         for namespace, legacy in (('mum', 32), ('prd', 26)):
             with self.subTest(namespace=namespace):
                 gc.tool.use_namespace(namespace)
                 self.assertEqual(gc.tool.legacy_registry_capacity(), legacy)
                 self.assertEqual(self.refusal(legacy + 1), 'GC invalid registry')
+                self.assertEqual(self.refusal(40), 'GC invalid registry')
                 # At the limit the count passes; the synthetic records are then refused by record validation.
                 self.assertNotEqual(self.refusal(legacy), 'GC invalid registry')
         gc.tool.use_namespace('prd')
