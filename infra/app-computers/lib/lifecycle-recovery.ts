@@ -57,7 +57,7 @@ export class ComputerLifecycleRecovery extends Construct {
         // Promotion window: exact prior history-context rows (previous recovery; previous preparation + lifecycle) stay beside the current ones.
         const transition = props.transitionStateMachineVersions;
         if (d.preparationStateMachineVersionArn && transition?.recovery) {
-            if (retained !== undefined) throw new Error('transition_conflicts_with_retained_source');
+            if (retained !== undefined && d.namespace !== 'prd') throw new Error('transition_conflicts_with_retained_source');
             observer.addToRolePolicy(historyReadStatement(r, key.keyArn, priorVersion(s.recoveryVersionArn, transition.recovery)));
         }
         if (d.preparationStateMachineVersionArn) {
@@ -111,7 +111,8 @@ export class ComputerLifecycleRecovery extends Construct {
         if (imageRole && imageRole !== role) observer.currentVersion.grantInvoke(imageRole);
         // Promotion window: the still-deployed previous recovery version invokes its own observer version.
         if (props.transitionObserverVersionLogicalId) {
-            if (retained !== undefined) throw new Error('transition_conflicts_with_retained_source');
+            if (retained !== undefined && (d.namespace !== 'prd' || retained === props.transitionObserverVersionLogicalId))
+                throw new Error('transition_conflicts_with_retained_source');
             transitionObserverGrant(this, observer, props.transitionObserverVersionLogicalId, imageRole ?? role);
         }
         for (const executionRole of [role, ...(imageRole && imageRole !== role ? [imageRole] : [])]) {

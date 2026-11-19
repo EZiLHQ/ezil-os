@@ -1316,6 +1316,120 @@ class ObserverTransitionTests(unittest.TestCase):
                 self.cfn.preserve_transition_versions(self.before, after)
 
 
+class ProductionObserverTransitionTests(unittest.TestCase):
+    def setUp(self):
+        self.fixture = ObserverTransitionTests()
+        self.fixture.setUp()
+        self.cfn = self.fixture.cfn
+        self.cfn.use_namespace('prd')
+        self.addCleanup(self.cfn.use_namespace, TOOL.NAMESPACE)
+        self.older = {key: version[:-32] + digit * 32
+                      for (key, version), digit in zip(self.fixture.OLD.items(), '123')}
+        self.before = self.split_template(self.fixture.OLD, older=self.older)
+        self.after = self.split_template(self.fixture.NEW, transition=self.fixture.OLD)
+        old = self.before['Resources']
+        self.retained_version = self.fixture.OLD['lifecycle'][:-32] + '0' * 32
+        old[self.retained_version] = copy.deepcopy(old[self.fixture.OLD['lifecycle']])
+        policy = self.cfn.PRODUCTION_LIFECYCLE_RETAINED_POLICY
+        old[policy] = {'Type': 'AWS::IAM::Policy', 'Properties': {
+            'PolicyName': policy, 'Roles': [{'Ref': self.fixture.ROLES['lifecycle']}],
+            'PolicyDocument': {'Statement': [{'Effect': 'Allow', 'Action': 'lambda:InvokeFunction',
+                                               'Resource': {'Ref': self.retained_version}}]}}}
+
+    def split_template(self, versions, older=None, transition=None):
+        template = self.fixture.template(versions, transition=transition)
+        resources = template['Resources']
+        cfn = self.cfn
+        account = '452630323510'
+        resources[cfn.IMAGE_RECOVERY_ROLE] = {'Type': 'AWS::IAM::Role', 'Properties': {
+            'RoleName': 'ezil-prd-recovery', 'Path': '/ezil/prd/',
+            'PermissionsBoundary': 'arn:aws:iam::' + account + ':policy/ezil/prd/ezil-prd-image-job-boundary',
+            'AssumeRolePolicyDocument': {'Version': '2012-10-17', 'Statement': [{
+                'Action': 'sts:AssumeRole', 'Effect': 'Allow', 'Principal': {'Service': 'states.amazonaws.com'},
+                'Condition': {'StringEquals': {'aws:SourceAccount': account}, 'ArnEquals': {
+                    'aws:SourceArn': 'arn:aws:states:ap-south-1:' + account + ':stateMachine:ezil-prd-recovery'}}}]}}}
+        resources[cfn.IMAGE_RECOVERY_POLICY] = copy.deepcopy(resources[cfn.LEGACY_RECOVERY_POLICY])
+        resources[cfn.IMAGE_RECOVERY_POLICY]['Properties']['Roles'] = [{'Ref': cfn.IMAGE_RECOVERY_ROLE}]
+        legacy_version = versions['recovery'][:-32] + '0' * 32
+        resources[legacy_version] = copy.deepcopy(resources[versions['recovery']])
+        resources[cfn.LEGACY_RECOVERY_POLICY]['Properties']['PolicyDocument']['Statement'][0]['Resource'] = {
+            'Ref': legacy_version}
+        if transition:
+            resources['RecoveryTransitionObserverPolicy11111111']['Properties']['Roles'] = [
+                {'Ref': cfn.IMAGE_RECOVERY_ROLE}]
+        for key, (logical, name, role) in cfn.PRODUCTION_OBSERVER_WORKFLOWS.items():
+            definition = ['{"States":{"Observe-initial":{"Type":"Task","Resource":"',
+                          {'Ref': versions[key]}, '"}}}']
+            resources[logical] = {'Type': 'AWS::StepFunctions::StateMachine', 'Properties': {
+                'StateMachineName': name, 'RoleArn': {'Fn::GetAtt': [role, 'Arn']},
+                'DefinitionString': {'Fn::Join': ['', definition]}}}
+            if older:
+                resources[older[key]] = copy.deepcopy(resources[versions[key]])
+                policy, _, _ = cfn.TRANSITION_OBSERVERS[key]
+                if key == 'recovery':
+                    policy = cfn.IMAGE_RECOVERY_POLICY
+                rows = resources[policy]['Properties']['PolicyDocument']['Statement']
+                rows.insert(0, {'Effect': 'Allow', 'Action': 'lambda:InvokeFunction',
+                                'Resource': {'Ref': older[key]}})
+        return template
+
+    def test_selects_the_workflow_observer_and_keeps_both_recovery_roles(self):
+        self.assertEqual(self.cfn.transition_observer_versions(self.before), self.fixture.OLD)
+        carried = self.cfn.carry_production_predecessor(self.before, self.after)
+        self.assertEqual(carried, self.cfn.carry_production_predecessor(self.before, carried))
+        for logical in [self.cfn.PRODUCTION_LIFECYCLE_RETAINED_POLICY, self.retained_version, *self.older.values()]:
+            self.assertEqual(carried['Resources'][logical], self.before['Resources'][logical])
+        self.assertEqual(carried['Resources'][self.cfn.IMAGE_RECOVERY_ROLE],
+                         self.before['Resources'][self.cfn.IMAGE_RECOVERY_ROLE])
+        self.cfn.preserve_transition_versions(self.before, carried)
+        with self.assertRaisesRegex(ValueError, 'exact historical observer grants'):
+            self.cfn.preserve_transition_versions(self.before, self.after)
+
+    def test_refuses_ambiguous_observer_and_invalid_predecessor_grants(self):
+        for change in ('ambiguous', 'wildcard', 'other_function', 'missing_current', 'legacy_role'):
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                before = copy.deepcopy(self.before)
+                resources = before['Resources']
+                policy = resources[self.cfn.IMAGE_RECOVERY_POLICY]['Properties']['PolicyDocument']['Statement']
+                workflow = resources['RecoveryWorkflow6633EEE8']['Properties']
+                if change == 'ambiguous':
+                    workflow['DefinitionString']['Fn::Join'][1][-1:] = [
+                        '"},"ImageObserve-initial":{"Type":"Task","Resource":"',
+                        {'Ref': self.older['recovery']}, '"}}}']
+                elif change == 'wildcard':
+                    policy[0]['Resource'] = '*'
+                elif change == 'other_function':
+                    resources[self.older['recovery']]['Properties']['FunctionName']['Ref'] = 'LifecycleObserver4909851D'
+                elif change == 'missing_current':
+                    del policy[1]
+                else:
+                    workflow['RoleArn'] = {'Fn::GetAtt': [self.cfn.LEGACY_RECOVERY_ROLE, 'Arn']}
+                self.cfn.transition_observer_versions(before)
+
+    def test_candidate_transition_requires_the_active_recovery_role(self):
+        after = self.cfn.carry_production_predecessor(self.before, self.after)
+        policy = after['Resources']['RecoveryTransitionObserverPolicy11111111']['Properties']
+        policy['Roles'] = [{'Ref': self.cfn.LEGACY_RECOVERY_ROLE}]
+        with self.assertRaisesRegex(ValueError, 'same role'):
+            self.cfn.preserve_transition_versions(self.before, after)
+
+    def test_historical_context_carry_keeps_the_existing_execution_role(self):
+        logical = self.cfn.LEGACY_OBSERVER_POLICY
+        history = {'Effect': 'Allow', 'Action': 'kms:Decrypt', 'Resource': {'Fn::GetAtt': ['RecoveryHistoryKey', 'Arn']},
+                   'Condition': {'StringEquals': {self.cfn.HISTORY_CONTEXT:
+                       'arn:aws:states:ap-south-1:452630323510:stateMachine:ezil-prd-recovery:2'}}}
+        policy = {'Type': 'AWS::IAM::Policy', 'Properties': {'Roles': [{'Ref': self.cfn.LEGACY_OBSERVER_ROLE}],
+                  'PolicyDocument': {'Statement': []}}}
+        self.before['Resources'][logical] = copy.deepcopy(policy)
+        self.before['Resources'][logical]['Properties']['PolicyDocument']['Statement'].append(history)
+        self.after['Resources'][logical] = policy
+        after = self.cfn.carry_production_predecessor(self.before, self.after)
+        self.assertEqual(after['Resources'][logical], self.before['Resources'][logical])
+        policy['Properties']['Roles'] = [{'Ref': self.cfn.IMAGE_RECOVERY_ROLE}]
+        with self.assertRaisesRegex(ValueError, 'exact predecessor history role'):
+            self.cfn.carry_production_predecessor(self.before, self.after)
+
+
 class HistoryContextTransitionTests(ObserverTransitionTests):
     """Second cutover gap: exact prior history-key context rows must survive the workflows change set."""
     def row(self, machine, versions):

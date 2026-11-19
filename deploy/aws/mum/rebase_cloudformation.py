@@ -345,6 +345,8 @@ LEGACY_RECOVERY_ROLE = 'RecoveryRecoveryRole1B60FF4C'
 LEGACY_RECOVERY_POLICY = 'RecoveryRecoveryRoleDefaultPolicy2A415109'
 LEGACY_OBSERVER_ROLE = 'RecoveryObserverServiceRole86BC9AF2'
 LEGACY_OBSERVER_POLICY = 'RecoveryObserverServiceRoleDefaultPolicyA036F4CB'
+IMAGE_RECOVERY_ROLE = 'RecoveryImageRecoveryRole9D9A3190'
+IMAGE_RECOVERY_POLICY = 'RecoveryImageRecoveryRoleDefaultPolicyD1E40F4B'
 
 
 def existing_image_recovery_role(resource):
@@ -416,6 +418,9 @@ def preserve_legacy_recovery(before, after, boundary):
          and {k: v for k, v in prior.get('Properties', {}).items() if k != 'PolicyDocument'} ==
              {k: v for k, v in candidate.get('Properties', {}).items() if k != 'PolicyDocument'},
          'legacy observer policy attachment changed')
+    if _image_mode(before) and _production_split_recovery(old):
+        need(new.get(IMAGE_RECOVERY_ROLE) == old[IMAGE_RECOVERY_ROLE],
+             'active image recovery role identity must remain unchanged')
     need(not (Counter(statement_key(s) for s in statements(prior)) -
               Counter(statement_key(s) for s in statements(candidate))),
          'retained legacy observer loses an existing permission')
@@ -505,6 +510,61 @@ TRANSITION_OBSERVERS = {
 }
 
 
+PRODUCTION_OBSERVER_WORKFLOWS = {
+    'lifecycle': ('LifecycleWorkflowA358E0E1', 'ezil-prd-lifecycle', LIFECYCLE_CONTROLLER),
+    'preparation': ('LifecyclePreparationWorkflow9314E8EA', 'ezil-prd-rebase-preparation',
+                    'LifecyclePreparationRebasePreparationRole07C3BE8F'),
+    'recovery': ('RecoveryWorkflow6633EEE8', 'ezil-prd-recovery', IMAGE_RECOVERY_ROLE),
+}
+
+
+def _production_split_recovery(resources):
+    if context.NAMESPACE != 'prd' or IMAGE_RECOVERY_ROLE not in resources:
+        return False
+    need(existing_image_recovery_role(resources[IMAGE_RECOVERY_ROLE]), 'active image recovery role identity mismatch')
+    return True
+
+
+def _production_observer_definition(resources, key, policy_logical, prefix):
+    workflow_logical, name, role = PRODUCTION_OBSERVER_WORKFLOWS[key]
+    workflow = resources.get(workflow_logical, {})
+    properties = workflow.get('Properties', {})
+    policy = resources.get(policy_logical, {})
+    need(workflow.get('Type') == 'AWS::StepFunctions::StateMachine'
+         and properties.get('StateMachineName') == name
+         and properties.get('RoleArn') == {'Fn::GetAtt': [role, 'Arn']}
+         and policy.get('Type') == 'AWS::IAM::Policy'
+         and policy.get('Properties', {}).get('Roles') == [{'Ref': role}],
+         f'{key} workflow and execution policy must use the same exact role')
+
+    definition = properties.get('DefinitionString', {})
+    join = definition.get('Fn::Join') if isinstance(definition, dict) else None
+    need(isinstance(join, list) and len(join) == 2 and join[0] == ''
+         and isinstance(join[1], list), f'{key} must have an exact workflow definition')
+    token_prefix = '__EZIL_CFN_PART_'
+    refs = {}
+    parts = []
+    for index, part in enumerate(join[1]):
+        if isinstance(part, str):
+            need(token_prefix not in part, f'{key} workflow uses a reserved definition token')
+            parts.append(part)
+        else:
+            token = f'{token_prefix}{index}__'
+            parts.append(token)
+            if isinstance(part, dict) and set(part) == {'Ref'} and isinstance(part['Ref'], str):
+                refs[token] = part['Ref']
+    parsed = manifest.loads(''.join(parts))
+    states = parsed.get('States', {})
+    observers = [state for name, state in states.items() if name.startswith(('Observe-', 'ImageObserve-'))]
+    versions = {refs.get(state.get('Resource')) for state in observers if state.get('Type') == 'Task'}
+    need(bool(observers) and all(state.get('Type') == 'Task' for state in observers)
+         and len(versions) == 1, f'{key} must invoke one exact observer version in its workflow definition')
+    version = next(iter(versions))
+    need(isinstance(version, str) and manifest.matches(prefix + r'[0-9A-F]{8}[a-f0-9]{32}', version),
+         f'{key} must invoke its own immutable observer version in the workflow definition')
+    return version
+
+
 def projected_observer_grant(logical, left, right, target):
     """A projected current-version policy still names its own immutable observer version."""
     if not left or left.get('Type') != right.get('Type') or right.get('Type') != 'AWS::IAM::Policy':
@@ -517,21 +577,36 @@ def projected_observer_grant(logical, left, right, target):
     )
 
 
-def _observer_version_grant(resources, policy_logical, function_logical, prefix):
-    """The single exact immutable observer version an execution role's default policy may invoke, or None."""
+def _observer_invoke_rows(policy):
+    return [row for row in statements(policy) if row.get('Effect') == 'Allow' and 'lambda:invokefunction' in action_set(row)]
+
+
+def _observer_version_grant(resources, policy_logical, function_logical, prefix, deployed=None):
+    """Validate exact immutable observer grants and pick the version the deployed workflow invokes."""
     policy = resources.get(policy_logical, {})
     if policy.get('Type') != 'AWS::IAM::Policy':
         return None
-    invokes = [s for s in statements(policy) if s.get('Effect') == 'Allow' and action_set(s) == {'lambda:invokefunction'}]
-    need(len(invokes) == 1 and isinstance(invokes[0].get('Resource'), dict) and set(invokes[0]['Resource']) == {'Ref'},
-         f'one exact {prefix} reference required')
-    logical = invokes[0]['Resource']['Ref']
-    version = resources.get(logical, {})
-    need(manifest.matches(prefix + r'[0-9A-F]{8}[a-f0-9]{32}', logical) and version.get('Type') == 'AWS::Lambda::Version'
-         and version.get('Properties') == {'FunctionName': {'Ref': function_logical}}
-         and version.get('DeletionPolicy') == version.get('UpdateReplacePolicy') == 'Retain',
-         f'{prefix} must be the retained version of its own function')
-    return logical
+    invokes = _observer_invoke_rows(policy)
+    need(bool(invokes) and (deployed is not None or len(invokes) == 1), f'one exact {prefix} reference required')
+    version_ids = []
+    for grant in invokes:
+        target = grant.get('Resource')
+        need(action_set(grant) == {'lambda:invokefunction'} and isinstance(target, dict) and set(target) == {'Ref'}
+             and isinstance(target['Ref'], str) and not (grant.keys() & {'Condition', 'NotAction', 'NotResource'}),
+             f'one exact {prefix} reference required')
+        logical = target['Ref']
+        version = resources.get(logical, {})
+        need(manifest.matches(prefix + r'[0-9A-F]{8}[a-f0-9]{32}', logical)
+             and version.get('Type') == 'AWS::Lambda::Version'
+             and version.get('Properties') == {'FunctionName': {'Ref': function_logical}}
+             and version.get('DeletionPolicy') == version.get('UpdateReplacePolicy') == 'Retain',
+             f'{prefix} must be the retained version of its own function')
+        version_ids.append(logical)
+    need(len(set(version_ids)) == len(version_ids), f'duplicate {prefix} grant refused')
+    if deployed is None:
+        return version_ids[0]
+    need(deployed in version_ids, f'{prefix} deployed workflow observer grant required')
+    return deployed
 
 
 def _image_mode(template):
@@ -609,8 +684,14 @@ def transition_observer_versions(before):
     if not _image_mode(before):
         return None
     resources = before['Resources']
-    return {key: _observer_version_grant(resources, policy, function, prefix)
-            for key, (policy, function, prefix) in TRANSITION_OBSERVERS.items()}
+    previous = {}
+    split = _production_split_recovery(resources)
+    for key, (policy, function, prefix) in TRANSITION_OBSERVERS.items():
+        if split and key == 'recovery':
+            policy = IMAGE_RECOVERY_POLICY
+        deployed = _production_observer_definition(resources, key, policy, prefix) if split else None
+        previous[key] = _observer_version_grant(resources, policy, function, prefix, deployed)
+    return previous
 
 
 def preserve_transition_versions(before, after):
@@ -620,8 +701,18 @@ def preserve_transition_versions(before, after):
     if previous is None or not _image_mode(after):
         return
     old, new = before['Resources'], after['Resources']
+    split = _production_split_recovery(old)
+    need(not split or _production_split_recovery(new), 'active image recovery role must remain')
     for key, (policy_logical, function_logical, prefix) in TRANSITION_OBSERVERS.items():
-        current = _observer_version_grant(new, policy_logical, function_logical, prefix)
+        if split and key == 'recovery':
+            policy_logical = IMAGE_RECOVERY_POLICY
+        deployed = _production_observer_definition(new, key, policy_logical, prefix) if split else None
+        current = _observer_version_grant(new, policy_logical, function_logical, prefix, deployed)
+        if split:
+            old_archives = _production_archived_observer_rows(old, policy_logical, previous[key], current)
+            new_archives = _production_archived_observer_rows(new, policy_logical, current, current)
+            need(Counter(map(statement_key, old_archives)) == Counter(map(statement_key, new_archives)),
+                 f'{key} must preserve only its exact historical observer grants')
         role = new[policy_logical]['Properties'].get('Roles')
         transitions = [(logical, resource) for logical, resource in new.items() if resource.get('Type') == 'AWS::IAM::Policy'
                        and 'TransitionObserverPolicy' in logical and any(s.get('Resource') == {'Ref': previous[key]} for s in statements(resource))]
@@ -636,6 +727,81 @@ def preserve_transition_versions(before, after):
              and action_set(rows[0]) == {'lambda:invokefunction'} and rows[0].get('Resource') == {'Ref': previous[key]}
              and 'Condition' not in rows[0] and 'NotAction' not in rows[0] and 'NotResource' not in rows[0],
              f'{key} observer transition grant must be exactly InvokeFunction on the previous version for the same role')
+
+
+PRODUCTION_LIFECYCLE_RETAINED_POLICY = 'LifecycleRetainedSourcePolicyC4C9E044'
+
+
+def _production_archived_observer_rows(resources, policy, previous, current):
+    return [row for row in _observer_invoke_rows(resources[policy])
+            if row['Resource'] not in ({'Ref': previous}, {'Ref': current})]
+
+
+def carry_production_predecessor(before, synthesized):
+    """Carry the already-deployed exact PRD split rollback resources into a local CDK template."""
+    old = before['Resources']
+    if not _image_mode(before) or not _production_split_recovery(old):
+        return synthesized
+    from copy import deepcopy
+
+    need(_image_mode(synthesized) and _production_split_recovery(synthesized['Resources']),
+         'production split recovery graph must survive synthesis')
+    candidate = deepcopy(synthesized)
+    new = candidate['Resources']
+
+    def carry_resource(logical):
+        need(logical in old and (logical not in new or new[logical] == old[logical]),
+             f'{logical} must be carried unchanged')
+        new[logical] = deepcopy(old[logical])
+
+    legacy = old.get(PRODUCTION_LIFECYCLE_RETAINED_POLICY, {})
+    legacy_properties = legacy.get('Properties', {})
+    legacy_rows = list(statements(legacy))
+    need(legacy.get('Type') == 'AWS::IAM::Policy'
+         and legacy_properties.get('PolicyName') == PRODUCTION_LIFECYCLE_RETAINED_POLICY
+         and legacy_properties.get('Roles') == [{'Ref': LIFECYCLE_CONTROLLER}]
+         and bool(legacy_rows), 'production retained lifecycle policy identity mismatch')
+    for row in legacy_rows:
+        target = row.get('Resource')
+        need(set(row) == {'Action', 'Effect', 'Resource'} and row.get('Effect') == 'Allow'
+             and action_set(row) == {'lambda:invokefunction'} and isinstance(target, dict)
+             and set(target) == {'Ref'} and isinstance(target['Ref'], str),
+             'retained lifecycle policy must use exact immutable observer grants')
+        logical = target['Ref']
+        version = old.get(logical, {})
+        need(manifest.matches(r'LifecycleObserverCurrentVersion[0-9A-F]{8}[a-f0-9]{32}', logical)
+             and version.get('Type') == 'AWS::Lambda::Version'
+             and version.get('Properties') == {'FunctionName': {'Ref': LIFECYCLE_OBSERVER}}
+             and version.get('DeletionPolicy') == version.get('UpdateReplacePolicy') == 'Retain',
+             'retained lifecycle policy must invoke its own retained observer version')
+        carry_resource(logical)
+    carry_resource(PRODUCTION_LIFECYCLE_RETAINED_POLICY)
+
+    previous = transition_observer_versions(before)
+    for key, (policy, _, prefix) in TRANSITION_OBSERVERS.items():
+        if key == 'recovery':
+            policy = IMAGE_RECOVERY_POLICY
+        current = _production_observer_definition(new, key, policy, prefix)
+        rows = new[policy]['Properties']['PolicyDocument']['Statement']
+        for row in _production_archived_observer_rows(old, policy, previous[key], current):
+            carry_resource(row['Resource']['Ref'])
+            if row not in rows:
+                rows.append(deepcopy(row))
+
+    for policy in HISTORY_CONTEXT_POLICIES:
+        retained_history = _history_context_rows(old, policy)
+        if not retained_history:
+            continue
+        old_properties = old[policy]['Properties']
+        new_properties = new.get(policy, {}).get('Properties', {})
+        need(new_properties.get('Roles') == old_properties.get('Roles')
+             and isinstance(new_properties.get('Roles'), list),
+             f'{policy} must preserve the exact predecessor history role')
+        rows = new_properties['PolicyDocument']['Statement']
+        for row in retained_history:
+            if row not in rows:
+                rows.append(deepcopy(row))
+    return candidate
 
 
 def preserve_legacy_lifecycle(before, after):
@@ -806,6 +972,8 @@ def validate_templates(phase, before, after, review, unchanged=False, pool_iam=N
             actual[logical]=entry
     need(actual==review['changes'] and (bool(actual) or action_reorder),'review does not exactly enumerate template changes')
     if phase == 'workflows':
+        need(carry_production_predecessor(before, after) == after,
+             'candidate omits an exact production predecessor grant')
         preserve_legacy_lifecycle(before, after)
         preserve_transition_versions(before, after)
         preserve_history_contexts(before, after)
