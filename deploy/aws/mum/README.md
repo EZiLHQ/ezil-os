@@ -1106,7 +1106,31 @@ its namespace limit, every install refuses an app whose source cannot read the
 registry, and promotion requires the plan-bound apply-app receipt and a running
 `/api/health` reader of at least the new count. In prd that proof therefore starts
 at the twenty-seventh record. A thirty-five-capacity source or runtime refuses the
-thirty-sixth record. Rollback retains the compatible app and every record. GC is
-never widened, no history is removed, and the 24,000-byte readback and
-65,536-byte secret ceilings are unchanged. Verify the actual registry count and
+thirty-sixth record. Rollback retains the compatible app and every record.
+Promotion preserves registry history, the legacy GC limits, and the 24,000-byte
+readback and 65,536-byte secret ceilings. Verify the actual registry count and
 byte sizes of the target namespace before promotion.
+
+### Staging registry compaction
+
+Pass `--staging-compaction-app <live-app-git-sha>` to `registry-gc.sh` for a
+single removal from the active staging registry. Use the reviewed plan and final
+manifest that promoted the current release. The completed promotion ledger must
+still match that release and app commit. The running image must match the plan's
+`apply-app` receipt and report the supplied commit, an active admission gate and
+capacity for the current registry.
+
+Hold the existing staging lease and quiesce the app, pool, workflow and operator
+writers before capturing a fresh registry snapshot and the full candidate-bound
+inventory. The command preserves the newest ten releases and any timestamp ties
+at that cutoff, the live tuple and its predecessor, the reviewed release roles,
+and references protected by the existing evidence validator.
+
+Run without `--apply` to preview the exact removal. Keep the fence through the
+secret compare-and-set, same-app refresh and completed ledger readback. The
+staging timer and service units must be inactive before the write and after
+refresh. The refresh leaves their start state alone for the operator to restore
+after the fence is released. Reconcile any pending operation before retrying.
+Reuse the same active promotion plan and app receipt, and recapture
+candidate-specific evidence against the new secret version for each subsequent
+removal. The historical GC limits remain 32 for staging and 26 for production.

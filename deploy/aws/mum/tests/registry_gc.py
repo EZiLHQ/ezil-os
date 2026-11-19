@@ -711,6 +711,243 @@ class RegistryGcTests(unittest.TestCase):
                 gc.main([*args, flag, 'second'])
 
 
+class StagingCompactionTests(unittest.TestCase):
+    envelope = RegistryGcTests.envelope
+    rows = RegistryGcTests.rows
+    tearDown = RegistryGcTests.tearDown
+
+    def setUp(self):
+        RegistryGcTests.setUp(self)
+        self.record_template = self.records[1]
+        self.records = [self.record(sequence) for sequence in range(1, 41)]
+        self.snapshot['deployment'] = dict(self.records[-1], releases=self.records)
+        self.target = self.records[-1]
+        self.roles = [self.records[-2], self.records[0]]
+        self.plan.update(amiId=self.target['amiId'], bake={key: self.target[key] for key in gc.release.BAKE_KEYS})
+        app = self.plan['rollout']['app']
+        app['tag'] = 'current-qualified-stage-build'
+        self.path.write_text(json.dumps(self.plan))
+        self.plan_sha = gc.release.digest(self.path)
+        self.capture(self.records[3])
+        self.live = self.envelope()
+        self.running = gc.release.rebase_app.public_deployment(self.snapshot['deployment'])
+        self.reader_capacity = self.source_capacity = gc.tool.ACTIVE_REGISTRY_CAPACITY
+        image = 'sha256:' + 'a' * 64
+        self.probe = {**dict.fromkeys(('imageId', 'tagImageId', 'composeImageId'), image),
+                      'gitSha': self.running_sha, 'servedSha': self.running_sha, 'lockFree': True, 'killSwitch': '1',
+                      'composeTag': app['tag'], 'readerCapacity': self.reader_capacity,
+                      'timers': {job: {'active': 'inactive', 'service': 'inactive'} for job in gc.release.rebase_app.JOBS}}
+        self.restart_writer_during_refresh = False
+        gc.release.write_receipt(self.path, 'apply-app', self.probe)
+
+        active = self.snapshot['deployment']
+        prior = dict(self.roles[0], releases=self.records[:-1])
+        baseline = {'VersionId': 'synthetic-version-0'}
+        initial = gc.release.ledger_entry(self.path, 'apply-app', baseline, prior, self.running_sha, 1)
+        pending = {'generation': 2, 'planSha256': self.plan_sha, 'operation': 'promote-canary', 'state': 'pending',
+                   'before': gc.release.observed_state(baseline, prior, self.running_sha),
+                   'expected': gc.release.release_state(active, self.running_sha)}
+        completed = gc.release.ledger_entry(self.path, 'promote-canary', self.live, active, self.running_sha, 3)
+        gc.tool.write(self.ledger, {'schemaVersion': 1, 'entries': [initial, pending, {**completed, 'state': 'completed'}]})
+        self.directory = gc.operation_directory(self.path, 4)
+
+    def capture(self, candidate):
+        self.candidate = candidate
+        self.drops = [gc.identity(candidate)]
+        self.evidence.update(planSha256=self.plan_sha, registrySha256=gc.sha(self.records),
+                             secretVersionId=self.snapshot['VersionId'])
+        synthetic_e1(self.evidence, self.path.read_text())
+        self.evidence['collection']['candidate'] = self.drops[0]
+
+    def record(self, sequence):
+        lower = 'sha256:' + format(sequence, '064x')
+        repository = self.record_template['lowerImageRef'].split('@', 1)[0]
+        return dict(self.record_template, amiId='ami-' + format(sequence, '017x'),
+                    recipeVersion=f'1.0.{sequence}', lowerImageDigest=lower, lowerImageRef=f'{repository}@{lower}',
+                    createdAt=f'2026-10-24T00:{sequence:02d}:00.000Z', launchTemplateVersion=str(sequence))
+
+    @contextlib.contextmanager
+    def context(self):
+        with RegistryGcTests.context(self), \
+             patch.object(gc.release, 'source_reader_capacity', return_value=(self.source_capacity, 'a' * 40)), \
+             patch.object(gc.release.rebase_ssm, 'run', return_value=self.probe) as self.probe_app:
+            yield
+
+    def transport(self, op, value=None):
+        result = RegistryGcTests.transport(self, op, value)
+        if op == 'put':
+            self.live['VersionId'] = result['VersionId'] = f"synthetic-version-{self.calls.count('put') + 1}"
+        return result
+
+    def app_operation(self, *args, **kwargs):
+        keep_stopped = kwargs.pop('keep_timers_stopped', False)
+        result = RegistryGcTests.app_operation(self, *args, **kwargs)
+        if args[2] == 'registry-gc-app':
+            self.assertTrue(keep_stopped)
+            if self.restart_writer_during_refresh:
+                self.probe['timers']['aws-reconcile']['service'] = 'active'
+        return {**result, 'readerCapacity': self.reader_capacity}
+
+    def prepare(self, staging_compaction=True):
+        return gc.prepare(self.snapshot, self.target, self.roles, self.evidence, self.drops, self.plan_sha,
+                          self.now, SYSTEM_ID, staging_compaction=staging_compaction)
+
+    def commit(self, app_sha=None):
+        with self.context(), gc.tool.app_secret_lock() as fd:
+            return gc.commit(self.directory, self.snapshot, self.prepare(), self.plan_sha, gc.sha(self.evidence),
+                             self.transport, self.ledger, lambda: None, path=self.path, plan=self.plan, fd=fd,
+                             staging_compaction_app=app_sha or self.running_sha, target=self.target)
+
+    def test_forty_record_registry_only_with_stage_opt_in(self):
+        with self.assertRaisesRegex(ValueError, 'GC invalid registry'):
+            self.prepare(staging_compaction=False)
+        before = copy.deepcopy(self.snapshot)
+        after = self.prepare()
+        self.assertEqual(self.snapshot, before)
+        self.assertEqual(len(after['releases']), 39)
+        self.assertEqual(after['releases'], [record for record in self.records if record != self.candidate])
+        self.assertEqual(dict(after, releases=self.records), self.snapshot['deployment'])
+
+    def test_forty_one_records_are_refused_without_mutation(self):
+        self.records.append(self.record(41))
+        self.evidence['registrySha256'] = gc.sha(self.records)
+        before = copy.deepcopy(self.snapshot)
+        with self.assertRaisesRegex(ValueError, 'invalid release registry'):
+            self.prepare()
+        self.assertEqual(self.snapshot, before)
+
+    def test_keep_newest_ten_by_parsed_time_including_ties(self):
+        self.records[0], self.records[-1] = self.records[-1], self.records[0]
+        self.candidate['createdAt'] = sorted(r['createdAt'] for r in self.records)[-10]
+        with self.assertRaisesRegex(ValueError, 'newest-ten'):
+            self.prepare()
+
+    def test_keep_active_predecessor_even_outside_ten_and_plan_roles(self):
+        for item in (self.target, self.snapshot['deployment']):
+            item['previousLowerImageDigest'] = self.candidate['lowerImageDigest']
+            item['previousLowerImageRef'] = self.candidate['lowerImageRef']
+        with self.assertRaisesRegex(ValueError, 'active predecessor'):
+            self.prepare()
+
+    def test_refuses_wrong_candidate_binding_and_any_unresolved_reference(self):
+        self.evidence['collection']['candidate'] = gc.identity(self.records[2])
+        with self.assertRaisesRegex(ValueError, 'not bound to the candidate'):
+            self.prepare()
+        self.rows('runtimeConfigs', [{'previousLowerImageDigest': self.candidate['lowerImageDigest']}])
+        self.evidence['collection']['candidate'] = self.drops[0]
+        with self.assertRaisesRegex(ValueError, 'referenced record'):
+            self.prepare()
+
+    def test_production_is_refused_before_reading_artifacts(self):
+        with patch.object(gc.release, 'load_plan', side_effect=AssertionError('artifact read forbidden')):
+            with self.assertRaisesRegex(ValueError, 'staging-only'):
+                gc.main(['--namespace', 'prd', '--staging-compaction-app', self.running_sha,
+                         '--plan', '/unused', '--manifest', '/unused', '--snapshot', '/unused', '--evidence', '/unused',
+                         '--lower-image-digest', self.candidate['lowerImageDigest'], '--ami-id', self.candidate['amiId']])
+
+    def test_exact_live_app_and_reader_required_before_pending_or_put(self):
+        for reader in (39, True, None):
+            with self.subTest(reader=reader):
+                self.reader_capacity = reader
+                with self.assertRaisesRegex(ValueError, 'exact gated staging app and current registry reader'):
+                    self.commit()
+        self.reader_capacity = 40
+        with self.assertRaisesRegex(ValueError, 'ledger-bound plan for the exact running app'):
+            self.commit(app_sha='d' * 40)
+        self.source_capacity = 39
+        with self.assertRaisesRegex(ValueError, 'source cannot read the current registry'):
+            self.commit()
+        self.probe_app.assert_not_called()
+        self.assertNotIn('put', self.calls)
+        self.assertEqual(len(gc.release.load_ledger(self.ledger)['entries']), 3)
+
+    def test_plan_must_have_promoted_exact_current_manifest(self):
+        self.target = self.records[-2]
+        with self.assertRaisesRegex(ValueError, 'manifest must be the current retained release'):
+            self.prepare()
+        self.target = self.records[-1]
+        before = gc.release.ledger_entry(self.path, 'apply-app', self.live, self.snapshot['deployment'], self.running_sha, 1)
+        gc.tool.write(self.ledger, {'schemaVersion': 1, 'entries': [before]})
+        with self.assertRaisesRegex(ValueError, 'own completed promotion of the active release'):
+            self.commit()
+        self.probe_app.assert_not_called()
+        self.assertNotIn('put', self.calls)
+
+    def test_compose_and_apply_app_receipt_bind_the_actual_image(self):
+        approved = dict(self.probe)
+        self.probe['composeTag'] = 'other-build'
+        with self.assertRaisesRegex(ValueError, 'running app is not the plan-bound apply-app build'):
+            self.commit()
+        self.probe.update(approved)
+        self.probe.update(dict.fromkeys(('imageId', 'tagImageId', 'composeImageId'), 'sha256:' + 'b' * 64))
+        with self.assertRaisesRegex(ValueError, 'running image differs from the plan-bound apply-app receipt'):
+            self.commit()
+        self.probe.update(approved)
+        gc.release.write_receipt(self.path, 'apply-app', {**approved, 'readerCapacity': 39})
+        with self.assertRaisesRegex(ValueError, 'plan-bound apply-app image and reader receipt'):
+            self.commit()
+        self.probe_app.assert_not_called()
+        self.assertNotIn('put', self.calls)
+        self.assertEqual(len(gc.release.load_ledger(self.ledger)['entries']), 3)
+
+    def test_live_writer_units_prevent_the_write_and_completion(self):
+        self.probe['timers']['pool-replenish']['active'] = 'active'
+        with self.assertRaisesRegex(ValueError, 'inactive staging timer and writer service'):
+            self.commit()
+        self.assertNotIn('put', self.calls)
+        self.assertFalse(self.directory.exists())
+        self.assertEqual(len(gc.release.load_ledger(self.ledger)['entries']), 3)
+
+        self.probe['timers']['pool-replenish']['active'] = 'inactive'
+        self.restart_writer_during_refresh = True
+        with self.assertRaisesRegex(ValueError, 'inactive staging timer and writer service'):
+            self.commit()
+        self.assertEqual(self.calls.count('put'), 1)
+        self.assertEqual(gc.release.load_ledger(self.ledger)['entries'][-1]['state'], 'pending')
+
+    def test_staging_refresh_keeps_pinned_installer_checks_and_skips_timer_restart(self):
+        script = (gc.release.REPO / 'deploy/aws/os-staging/install-host.sh').read_text()
+        app = self.plan['rollout']['app']
+        regular = gc.release.rebase_app.body(script, app)
+        fenced = gc.release.rebase_app.body(script, app, keep_timers_stopped=True)
+        self.assertIn('systemctl enable --now', regular)
+        self.assertNotIn('systemctl enable --now', fenced)
+        self.assertIn('systemctl stop', fenced)
+        self.assertIn('systemctl daemon-reload', fenced)
+        self.assertIn('sha256sum --check --status', fenced)
+        self.assertIn('registry_guard', fenced)
+
+    def test_reuses_existing_ledger_reconciliation_and_promotion_for_later_drops(self):
+        result = self.commit()
+        ledger = gc.release.load_ledger(self.ledger)
+        self.assertEqual([r['state'] for r in ledger['entries'][3:]], ['pending', 'completed'])
+        self.assertEqual(result['operation'], 'registry-gc')
+        self.assertEqual(self.calls.count('put'), 1)
+        self.assertEqual([call.args[1] for call in self.probe_app.call_args_list],
+                         ['registry-gc-artifact-g3', 'registry-gc-refresh-g4'])
+        self.assertTrue(all(call.kwargs['fresh'] for call in self.probe_app.call_args_list))
+        gc.verify_reconciliation(self.path, ledger['entries'][-2], self.prepare(), {'deployment': self.running})
+
+        _, deployment = gc.release.secret_deployment(self.live)
+        self.snapshot = {'VersionId': self.live['VersionId'], 'deployment': deployment}
+        self.records = deployment['releases']
+        next_candidate = self.records[3]
+        self.drops = [gc.identity(next_candidate)]
+        self.evidence['collection']['candidate'] = self.drops[0]
+        with self.assertRaisesRegex(ValueError, 'stale evidence'):
+            self.prepare()
+        self.capture(next_candidate)
+        self.directory = gc.operation_directory(self.path, 6)
+        self.commit()
+        ledger = gc.release.load_ledger(self.ledger)
+        self.assertEqual([r['state'] for r in ledger['entries'][3:]], ['pending', 'completed'] * 2)
+        self.assertEqual([r['planSha256'] for r in ledger['entries'][3:]], [self.plan_sha] * 4)
+        self.assertEqual(self.calls.count('put'), 2)
+        self.assertEqual([call.args[1] for call in self.probe_app.call_args_list],
+                         ['registry-gc-artifact-g5', 'registry-gc-refresh-g6'])
+        self.assertEqual(len(gc.release.secret_deployment(self.live)[1]['releases']), 38)
+
+
 class NamespaceLegacyCapacityTests(unittest.TestCase):
     """GC stays frozen per namespace (mum 32, prd 26) as the active reader capacity advances."""
     def tearDown(self):

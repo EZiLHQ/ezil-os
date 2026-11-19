@@ -58,7 +58,20 @@ def gate(outer):
     need(outer.get('EZIL_AWS_KILL_SWITCH')=='1','admission must remain gated by the existing kill switch')
 
 
-def body(install_script, app, deployment=None, install=True):
+def body(install_script, app, deployment=None, install=True, *, keep_timers_stopped=False):
+    if keep_timers_stopped:
+        need(context.NAMESPACE == 'mum' and install, 'timer-preserving refresh is staging-only')
+        resume_timers = '''
+for job in "${jobs[@]}"; do
+    if [[ " ${enabled[*]} " == *" $job "* ]]; then
+        systemctl enable --now "$slug-$job.timer"
+    else
+        systemctl disable --now "$slug-$job.timer"
+    fi
+done
+'''
+        need(install_script.count(resume_timers) == 1, 'staging installer timer resume code changed')
+        install_script = install_script.replace(resume_timers, '\n')
     need(manifest.matches(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}',app['tag']) and manifest.matches(r'[0-9a-f]{40}',app['gitSha']) and manifest.matches(r'[0-9a-f]{64}',app['checksumSha256']),'invalid reviewed app artifact')
     anchor='python3 - "$temporary" "$tag" <<\'PY\''
     need(install_script.count(anchor)==1,'staging installer changed; review integration')

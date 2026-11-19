@@ -328,7 +328,9 @@ def ambiguous_lower(value, candidate):
     return False
 
 
-def prepare(snapshot, target, roles, evidence, drops, plan_sha, now, system_id=None):
+def prepare(snapshot, target, roles, evidence, drops, plan_sha, now, system_id=None, *, staging_compaction=False):
+    if staging_compaction:
+        need(tool.NAMESPACE == 'mum', 'registry compaction is staging-only')
     need(isinstance(drops, list) and len(drops) == 1 and isinstance(drops[0], dict)
          and set(drops[0]) == {'lowerImageDigest', 'amiId'}, 'GC requires exactly one exact identity')
     d = snapshot['deployment']
@@ -337,12 +339,16 @@ def prepare(snapshot, target, roles, evidence, drops, plan_sha, now, system_id=N
          and (d.get('accountId'), d.get('region'), d.get('namespace')) == (tool.ACCOUNT, tool.REGION, tool.NAMESPACE),
          'GC snapshot scope mismatch')
     records = d.get('releases')
-    need(isinstance(records, list) and 1 <= len(records) <= tool.legacy_registry_capacity(), 'GC invalid registry')
-    for record in records:
-        manifest.validate(record, source=True, repository=tool.REPOSITORY)
-        need(all(record[k] == d[k] for k in ('accountId', 'region', 'namespace', 'launchTemplateId')),
-             'GC foreign registry record')
-    need(len({(r['lowerImageDigest'], r['amiId']) for r in records}) == len(records), 'GC duplicate identity')
+    if staging_compaction:
+        need(isinstance(records, list) and bool(records), 'GC invalid registry')
+        tool.validate_registry(d)
+    else:
+        need(isinstance(records, list) and 1 <= len(records) <= tool.legacy_registry_capacity(), 'GC invalid registry')
+        for record in records:
+            manifest.validate(record, source=True, repository=tool.REPOSITORY)
+            need(all(record[k] == d[k] for k in ('accountId', 'region', 'namespace', 'launchTemplateId')),
+                 'GC foreign registry record')
+        need(len({(r['lowerImageDigest'], r['amiId']) for r in records}) == len(records), 'GC duplicate identity')
     matches = [r for r in records if identity(r) == drops[0]]
     need(len(matches) == 1, 'GC identity absent or ambiguous')
     current = [r for r in records if all(r[k] == d.get(k) for k in manifest.PROMOTION)]
@@ -353,6 +359,16 @@ def prepare(snapshot, target, roles, evidence, drops, plan_sha, now, system_id=N
     keep = [current[0], target, *roles]
     need(candidate['recipeVersion'] not in ('1.0.2', '1.0.11', '1.0.12')
          and identity(candidate) not in [identity(r) for r in keep], 'GC keep-set record')
+    if staging_compaction:
+        need(target == current[0], 'GC compaction manifest must be the current retained release')
+        # Keep every release tied at the cutoff. Use timestamps rather than input order.
+        ordered_times = sorted(time_value(record['createdAt']) for record in records)
+        need(len(records) > 10 and time_value(candidate['createdAt']) < ordered_times[-10],
+             'GC newest-ten keep-set record')
+        need(candidate['lowerImageDigest'] != d.get('previousLowerImageDigest'),
+             'GC active predecessor keep-set record')
+        need(evidence.get('collection', {}).get('candidate') == identity(candidate),
+             'GC compaction evidence is not bound to the candidate')
     check_evidence(evidence, snapshot, plan_sha, candidate, now, target, system_id)
     after = copy.deepcopy(d)
     after['releases'] = [copy.deepcopy(r) for r in records if identity(r) != drops[0]]
@@ -414,7 +430,7 @@ def operation_directory(path, generation):
 
 
 def commit(directory, snapshot, after, plan_sha, evidence_sha, transport, ledger_path, recheck,
-           *, path, plan, fd):
+           *, path, plan, fd, staging_compaction_app=None, target=None):
     """Caller holds app-secret.lock; failures retain the main pending fence.
 
     The deterministic generation directory contains immutable backup/audit evidence.
@@ -422,18 +438,28 @@ def commit(directory, snapshot, after, plan_sha, evidence_sha, transport, ledger
     """
     ledger = release.load_ledger(ledger_path)
     admit_apply(directory, ledger)
-    verify_backup(directory, snapshot)
+    if staging_compaction_app is None:
+        verify_backup(directory, snapshot)
     before = transport('get')
     updated = edit(before, snapshot, after)
     d = snapshot['deployment']
     release.static_deployment(plan, d)
-    release.live_roles(path, plan, d)
+    if staging_compaction_app is None:
+        release.live_roles(path, plan, d)
     ledger = release.ledger_admit(ledger_path, path, plan, before, d, 'registry-gc')
+    if staging_compaction_app is not None:
+        admit_staging_promotion(path, plan, ledger, d, target, staging_compaction_app)
     need(plan_sha == release.digest(path) and directory == operation_directory(path, ledger['entries'][-1]['generation'] + 1),
          'GC operation identity mismatch')
+    def save_gc_backup():
+        directory.mkdir(mode=0o700)
+        backup_registry(directory, snapshot)
+
     recheck()
     ledger, generation = release.begin_operation(ledger_path, ledger, path, plan, 'registry-gc',
-                                                before, d, after, True, fd)
+                                                before, d, after, True, fd,
+                                                staging_compaction_app=staging_compaction_app,
+                                                save_gc_backup=save_gc_backup)
     entry = {'operation': 'registry-gc', 'mainPending': ledger['entries'][-1],
              'snapshot': snapshot, 'afterDeployment': after, 'evidenceSha256': evidence_sha}
     immutable(directory / 'ledger-pending.json', entry)
@@ -446,10 +472,13 @@ def commit(directory, snapshot, after, plan_sha, evidence_sha, transport, ledger
     observed = transport('get')
     need(observed['VersionId'] == written['VersionId']
          and manifest.loads(observed['SecretString']) == updated, 'GC readback mismatch')
+    refresh_options = {'keep_timers_stopped': True} if staging_compaction_app is not None else {}
     result = release.app_operation(path, plan, 'registry-gc-app', True,
-                                   release.rebase_app.public_deployment(after), generation=generation)
+                                   release.rebase_app.public_deployment(after), generation=generation, **refresh_options)
     need(result is not None and result.get('gitSha') == plan['rollout']['app']['gitSha'] and
          result.get('deployment') == release.rebase_app.public_deployment(after), 'GC app refresh readback mismatch')
+    if staging_compaction_app is not None:
+        release.probe_compaction_app(path, plan, 'registry-gc-refresh-g' + str(generation), len(after['releases']))
     check = transport('get')
     need(check == observed, 'GC secret changed during app refresh')
     verify_backup(directory, snapshot)
@@ -493,6 +522,26 @@ def check_target(target, plan):
          for k in release.BAKE_KEYS if k in target), 'GC target does not match plan')
 
 
+def staging_compaction_plan(plan, app_sha):
+    need(tool.NAMESPACE == 'mum', 'registry compaction is staging-only')
+    need(manifest.matches(r'[0-9a-f]{40}', app_sha) and 'ledgerGeneration' in plan
+         and isinstance(plan.get('rollout'), dict) and plan['rollout']['app']['gitSha'] == app_sha,
+         'GC compaction requires a ledger-bound plan for the exact running app')
+
+
+def admit_staging_promotion(path, plan, ledger, deployment, target, app_sha):
+    staging_compaction_plan(plan, app_sha)
+    check_target(target, plan)
+    manifest.promoted_release(deployment, target)
+    manifest.retained_release(deployment, target)
+    release.live_roles(path, plan, deployment, deployed=False)
+    plan_sha = release.digest(path)
+    need(any(entry['operation'] == 'promote-canary' and entry['planSha256'] == plan_sha
+             and entry['appGitSha'] == app_sha and entry['tuple'] == release.ledger_tuple(deployment)
+             for entry in release.completed_entries(ledger)),
+         'GC compaction requires its own completed promotion of the active release')
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--namespace', choices=('mum', 'prd'), default='mum')
@@ -501,14 +550,20 @@ def main(argv=None):
     parser.add_argument('--lower-image-digest', action='append', required=True)
     parser.add_argument('--ami-id', action='append', required=True)
     parser.add_argument('--apply', action='store_true')
+    parser.add_argument('--staging-compaction-app', metavar='APP_GIT_SHA',
+                        help='Stage only: use this exact running app and protect the newest ten records')
     parser.add_argument('--operation-dir', type=Path)
     args = parser.parse_args(argv)
+    staging_compaction = args.staging_compaction_app is not None
+    need(not staging_compaction or args.namespace == 'mum', 'registry compaction is staging-only')
     release.use_namespace(args.namespace)
     for key in ('plan', 'manifest', 'snapshot', 'evidence', 'operation_dir'):
         if getattr(args, key): release.context.path(getattr(args, key))
     need(len(args.lower_image_digest) == len(args.ami_id) == 1, 'GC multiple CLI identities refused')
     path = Path(args.plan).resolve()
     plan = release.load_plan(path)
+    if staging_compaction:
+        staging_compaction_plan(plan, args.staging_compaction_app)
     target = manifest.load(args.manifest, target=True, repository=tool.REPOSITORY)
     check_target(target, plan)
     roles = release.plan_roles(path, plan)
@@ -517,7 +572,11 @@ def main(argv=None):
     plan_sha = release.digest(path)
     drops = [{'lowerImageDigest': args.lower_image_digest[0], 'amiId': args.ami_id[0]}]
     system_id = plan['databaseSystemIdentifier']
-    after = prepare(snapshot, target, roles, evidence, drops, plan_sha, datetime.now(timezone.utc), system_id)
+    def checked_deployment():
+        return prepare(snapshot, target, roles, evidence, drops, plan_sha, datetime.now(timezone.utc), system_id,
+                       staging_compaction=staging_compaction)
+
+    after = checked_deployment()
     if not args.apply:
         print(json.dumps({'before': [identity(r) for r in snapshot['deployment']['releases']],
                           'after': [identity(r) for r in after['releases']], 'evidenceCheck': 'passed'}, indent=2))
@@ -537,12 +596,13 @@ def main(argv=None):
         edit(live, snapshot, after)
         def recheck():
             verify_inputs(path, plan, args.evidence, evidence)
-            check_evidence(evidence, snapshot, plan_sha, next(r for r in snapshot['deployment']['releases'] if identity(r) == drops[0]), datetime.now(timezone.utc), target, system_id)
+            need(checked_deployment() == after, 'GC reviewed removal changed')
         recheck()
-        directory.mkdir(mode=0o700)  # existing/pending directories refuse
-        backup_registry(directory, snapshot)
+        if not staging_compaction:
+            directory.mkdir(mode=0o700)  # existing/pending directories refuse
+            backup_registry(directory, snapshot)
         commit(directory, snapshot, after, plan_sha, sha(evidence), transport, release.LEDGER_PATH, recheck,
-               path=path, plan=plan, fd=fd)
+               path=path, plan=plan, fd=fd, staging_compaction_app=args.staging_compaction_app, target=target)
 
 
 if __name__ == '__main__':
