@@ -131,6 +131,7 @@ function viewComputerStatus () {
  * @param {() => void} [opts.onViewStatus] Called by "View computer status" (default: Settings → Computer).
  * @param {() => boolean} [opts.isMigrating] Reads this computer's observed migration state.
  * @param {() => boolean} [opts.isLaunching] Reads this computer's observed fresh launch state.
+ * @param {() => boolean} [opts.isUpdating] Reads whether this open is advancing a computer update.
  * @param {() => boolean} [opts.isPreparing] Round 6 (seam C): the server said this computer's desktop is taking its
  *   config (or code-server is starting after it). Seen once, the open shows that wait to its end.
  * @param {() => boolean} [opts.isMoving] Phase B: the server answered THIS caller's own open `computeMoving` (its files
@@ -139,7 +140,7 @@ function viewComputerStatus () {
  * @param {{title: string, body: string}} [opts.failureCopy] Static app-specific failure guidance.
  */
 export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…', appName, icon, className, onRetry, onViewStatus,
-    failureCopy, isMigrating = () => false, isLaunching = () => false, isPreparing = () => false, isMoving = () => false } = {}) {
+    failureCopy, isMigrating = () => false, isLaunching = () => false, isPreparing = () => false, isMoving = () => false, isUpdating = () => false } = {}) {
     const root = document.createElement('div');
     root.className = 'ezil-app-spinner';
     if (typeof className === 'string' && className) root.classList.add(...className.split(/\s+/).filter(Boolean));
@@ -450,6 +451,12 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         }
         // Phase B: a move first (§6.4).
         if (pending && paintMove(state, observation?.updated ? `Last recorded update: ${observation.updated}` : null)) return;
+        if (progressing && !runningLong && isUpdating()) {
+            const t = elapsedOf();
+            paint({ state: 'opening', title: 'Updating your computer', status: 'Code will open when the update is ready.',
+                meta: t >= META_AFTER_S ? formatElapsed(t) : '', bar: 'indeterminate' });
+            return;
+        }
         const view = observation ?? (progressing && open && !open.ended ? open.view : null);
         const details = view?.updated ? `Last recorded update: ${view.updated}` : null;
 

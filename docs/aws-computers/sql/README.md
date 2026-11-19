@@ -14,6 +14,19 @@ region/type/state/health, supplies generation 1 on insert, and guards lease
 consistency and generations in its atomic statements; `aws-migrate.ts` validates
 writer region/generation. Direct SQL writers must uphold these application invariants.
 
+## Retirement hint for automatic updates
+
+[0005_retired_host_release.sql.txt](0005_retired_host_release.sql.txt) adds a nullable
+lookup hint to the existing private placement table. A normal successful release
+records it while settling the placement to STOPPED. The app still verifies the
+release and its termination history before starting an image update.
+
+Apply the registered additive migration through the self-hosted schema ledger before enabling automatic updates. Older
+schemas can settle stops. Computers already stopped without a recorded hint use
+the signed manual update path with a verified release execution. For an owned
+canary, set `EZIL_AWS_AUTO_REBASE=1` and list its exact computer UUID in
+`EZIL_AWS_AUTO_REBASE_COMPUTER_IDS`. A missing or invalid list starts no jobs.
+
 ## Why `.sql.txt` and why here
 
 `node .github/scripts/production-migrations.mjs validate` inventories every tracked

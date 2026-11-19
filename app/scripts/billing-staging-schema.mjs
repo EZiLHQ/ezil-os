@@ -10,6 +10,7 @@ import { PRODUCTION_RECEIPT_ONLY_PINS, runProductionNativeSchema } from './billi
 
 export const STAGING_REF = 'yjnwyugyhfpalqpqrnnt';
 const ROOT = fileURLToPath(new URL('../../', import.meta.url));
+export const RETIRED_HOST_RELEASE_FILE = 'docs/aws-computers/sql/0005_retired_host_release.sql.txt';
 export const EXPLICIT_FILES = Object.freeze([
     'app/drizzle/0000_massive_mole_man.sql',
     'app/drizzle/0001_telemetry.sql',
@@ -39,6 +40,7 @@ export const EXPLICIT_FILES = Object.freeze([
     'app/drizzle/0025_ai_request_traces.sql',
     // Delegation replay ledger (EZiL MCP delegated reads). Must really run on production; never baselined.
     'app/drizzle/0030_delegation_replay.sql',
+    RETIRED_HOST_RELEASE_FILE,
 ]);
 export const TARGETED_APPLY_FILE = 'app/drizzle/0030_delegation_replay.sql';
 const TABLE = 'public.ezil_staging_schema_log';
@@ -188,7 +190,9 @@ export function parseArgs(args) {
     // Targeted apply: exactly one named file (a second --only is refused above); the default apply still runs every pending file.
     if (only !== undefined && mode !== 'apply') refuse('--only is accepted only by apply.');
     // Only the delegation replay ledger is targetable, by its exact canonical path (no basename or ./ alias).
-    if (only !== undefined && only !== TARGETED_APPLY_FILE) refuse(`--only accepts only ${TARGETED_APPLY_FILE}.`);
+    if (only !== undefined && ![TARGETED_APPLY_FILE, RETIRED_HOST_RELEASE_FILE].includes(only)) {
+        refuse(`--only accepts only ${TARGETED_APPLY_FILE} or ${RETIRED_HOST_RELEASE_FILE}.`);
+    }
     if (nativeProduction) {
         if (target !== 'aws-production' || mode === 'baseline' || only !== undefined) {
             refuse('--native-production requires plan or apply on aws-production without --only.');
@@ -244,6 +248,10 @@ export function run(args = process.argv.slice(2), {
         if (target === 'aws-production' && mode === 'baseline' &&
             requested.some(name => ['0003_pool_hosts_v2.sql.txt', '0008_pool_dispatch.sql', '0009_capacity_demands.sql', '0010_migration_restore_progress.sql', '0011_feedback.sql', '0019_operator_entitlements.sql', '0020_operator_refusal_receipts.sql', '0021_standard_trial.sql', '0022_feedback_notifications.sql', '0023_operator_issued_by.sql', '0024_telemetry_alerts.sql', '0025_ai_request_traces.sql', '0030_delegation_replay.sql'].includes(basename(name)))) {
             refuse('Pool hosts v2, pool dispatch, capacity demand, migration restore progress, feedback, operator entitlements, operator refusal receipts, the Standard trial, feedback notifications, the issuing organization, incident alerts, AI request traces and the delegation replay ledger must be applied on production, never baselined.');
+        }
+        if (target === 'aws-production' && mode === 'baseline' &&
+            requested.some(name => basename(name) === basename(RETIRED_HOST_RELEASE_FILE))) {
+            refuse('The retirement hint column must be applied on production, never baselined.');
         }
         // 0012 (reverse moves) changes no pre-existing table and the app probes for it ("production today"): it stays
         // staging-only, never applied or baselined on production (it is skipped in the apply loop below, and any
