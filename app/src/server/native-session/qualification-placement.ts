@@ -1,4 +1,4 @@
-import { createHmac } from 'node:crypto';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 
 import { deriveControlKey } from '@/server/lib/compute/aws-control-key';
 import { readPlacement, type PlacementExecutor } from '@/server/lib/compute/placement';
@@ -8,6 +8,8 @@ import { nativeComputerOwnedNow } from './authority';
 export const NATIVE_QUALIFICATION_MAX_MS = 300_000;
 const CLOCK_SKEW_MS = 5_000;
 const QUALIFICATION_DOMAIN = 'ezil-native-qualification-placement-v1';
+const REQUEST_DOMAIN = 'ezil-native-qualification-request-v1';
+const REQUEST_SIGNATURE = /^v1=[0-9a-f]{64}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const HEX = /^[0-9a-f]{64}$/;
 const PROFILE_DIGEST = /^sha256:[0-9a-f]{64}$/;
@@ -71,6 +73,7 @@ interface SignOptions {
     db: PlacementExecutor;
     now: () => Date;
     controlSecret: string;
+    requestSignature?: string;
     target: { computerId: string; ownerUserId: string; instanceId: string };
     deployment: { hostPolicyDigest: string; artifactManifestSha256: string };
 }
@@ -117,8 +120,61 @@ export async function signNativeQualificationPlacement(bytes: string, options: S
         computerId: p.computerId, generation: p.generation, leaseEpoch: p.leaseEpoch, nonceHash: p.enrollConsumedHash,
     });
     try {
+        if (options.requestSignature !== undefined) {
+            const material = REQUEST_DOMAIN + '|' + nativeDeploymentSha256(bytes);
+            const expected = 'v1=' + createHmac('sha256', key).update(material, 'ascii').digest('hex');
+            if (!matches(options.requestSignature, REQUEST_SIGNATURE)
+                || !timingSafeEqual(Buffer.from(expected), Buffer.from(options.requestSignature))) {
+                throw new Error('qualification_request_refused');
+            }
+        }
         const digest = nativeDeploymentSha256(nativePolicyCanonical(receipt));
         const signature = 'v1=' + createHmac('sha256', key).update(QUALIFICATION_DOMAIN + '|' + digest, 'ascii').digest('hex');
         return { receipt, signature };
     } finally { key.fill(0); }
+}
+
+interface QualificationHttpDeps {
+    target: string | undefined;
+    controlSecret: string | undefined;
+    deployment: SignOptions['deployment'] | null;
+    sign(bytes: string, options: Omit<SignOptions, 'db' | 'now'>): ReturnType<typeof signNativeQualificationPlacement>;
+}
+
+const denied = () => Response.json({ error: 'qualification_unavailable' }, {
+    status: 404, headers: { 'cache-control': 'no-store' },
+});
+
+/** The configured computer, owner and instance are independent of the signed request. */
+export async function handleNativeQualification(request: Request, deps: QualificationHttpDeps): Promise<Response> {
+    const parts = deps.target?.split('/');
+    if (parts?.length !== 3 || !matches(parts[0], UUID) || !matches(parts[1], UUID) || !matches(parts[2], INSTANCE)
+        || !deps.controlSecret?.trim() || !deps.deployment) return denied();
+    const signature = request.headers.get('x-ezil-signature');
+    if (!matches(signature, REQUEST_SIGNATURE) || !request.body || request.headers.get('content-type') !== 'application/json') {
+        return denied();
+    }
+    const reader = request.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    try {
+        for (;;) {
+            const result = await reader.read();
+            if (result.done) break;
+            size += result.value.byteLength;
+            if (size > 4096) return denied();
+            chunks.push(result.value);
+        }
+        const bytes = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks));
+        const proof = await deps.sign(bytes, {
+            target: { computerId: parts[0], ownerUserId: parts[1], instanceId: parts[2] },
+            requestSignature: signature, controlSecret: deps.controlSecret, deployment: deps.deployment,
+        });
+        return Response.json(proof, { headers: { 'cache-control': 'no-store' } });
+    } catch {
+        return denied();
+    } finally {
+        await reader.cancel().catch(() => {});
+        reader.releaseLock();
+    }
 }
