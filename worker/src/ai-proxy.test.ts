@@ -434,6 +434,43 @@ describe('forwarding', () => {
     expect(d.logs.at(-1)).toMatchObject({ event: 'ai_proxy', route: 'POST /v1/messages', status: 429, code: 'rate_limited', request_id: 'req-9', idempotency_key: 'turn-0123456789' });
   });
 
+  it('records an unreadable Gateway error body with the upstream status and request ID', async () => {
+    const id = '1b4e28ba-2fa1-11d2-883f-0016d3cca427';
+    const gw = mockGateway(() => new Response(new ReadableStream({}), { status: 503, headers: { 'x-ezil-request-id': id } }));
+    const d = await deps({ fetch: gw.fetch, idleTimeoutMs: 10 });
+    const response = await handleAiProxyRequest(new Request(`${HOST}/ai/v1/messages`, {
+      method: 'POST', headers: { authorization: await proxyAuth(), 'idempotency-key': 'turn-0123456789' },
+      body: '{"model":"us.moonshotai.kimi-k3","stream":false,"message":"synthetic-private-prompt"}',
+    }), d);
+    expect(response.status).toBe(504);
+    expect(response.headers.get('x-ezil-request-id')).toBe(id);
+    expect(await response.json()).toMatchObject({ error: { code: 'os_ai_unavailable', source: 'ezil-os-proxy' } });
+    expect(gw.calls).toHaveLength(1);
+    expect(d.logs).toEqual([expect.objectContaining({ event: 'ai_proxy', idempotency_key: 'turn-0123456789',
+      code: 'os_ai_unavailable', status: 504, upstream_status: 503, request_id: id, outcome: 'idle_timeout' })]);
+    expect(JSON.stringify(d.logs)).not.toContain('synthetic-private-prompt');
+  });
+
+  it('keeps a downstream disconnect after Gateway error headers distinct from an idle timeout', async () => {
+    const client = new AbortController();
+    const id = '1b4e28ba-2fa1-11d2-883f-0016d3cca427';
+    const gw = mockGateway(request => new Response(new ReadableStream({
+      pull(controller) {
+        client.abort();
+        expect(request.signal.aborted).toBe(true);
+        controller.error(new TypeError('synthetic-private-error-detail'));
+      },
+    }, { highWaterMark: 0 }), { status: 502, headers: { 'x-ezil-request-id': id } }));
+    const d = await deps({ fetch: gw.fetch });
+    await handleAiProxyRequest(new Request(`${HOST}/ai/v1/messages`, {
+      method: 'POST', signal: client.signal, headers: { authorization: await proxyAuth() }, body: '{"stream":false}',
+    }), d);
+    expect(gw.calls).toHaveLength(1);
+    expect(d.logs).toEqual([expect.objectContaining({ status: 504, upstream_status: 502, request_id: id,
+      outcome: 'client_cancelled', detail: 'client_disconnected' })]);
+    expect(JSON.stringify(d.logs)).not.toContain('synthetic-private-error-detail');
+  });
+
   it('passes routing and entitlement refusals through by code, so the editor can re-list', async () => {
     for (const [status, code] of [[503, 'model_unavailable'], [402, 'no_entitlement'], [403, 'model_not_allowed'],
       [502, 'upstream_error'], [502, 'upstream_unavailable']] as const) {

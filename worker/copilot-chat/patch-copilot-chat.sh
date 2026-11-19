@@ -329,6 +329,11 @@ A_AI_PLAN='"Copilot Free"'; R_AI_PLAN='"EZiL AI"'
 A_AI_QUOTA='"Chat messages"'; R_AI_QUOTA='"Gateway usage"'
 A_AI_LIMIT='"Limited"'; R_AI_LIMIT='"View EZiL AI status"'
 
+# ToolCallingLoop displays the settled progress label before the next request is
+# sent. Say that a retry was scheduled, without implying that it succeeded.
+A_REQUEST_RETRY='this.options.request.permissionLevel==="autopilot"?this.showAutopilotProgress(n,wl.t("Autopilot: recovering from a request error\u2026"),wl.t("Autopilot recovered from a request error")):this.showAutopilotProgress(n,wl.t("Recovering from a request error\u2026"),wl.t("Recovered from a request error"))'
+R_REQUEST_RETRY='this.options.request.permissionLevel==="autopilot"?this.showAutopilotProgress(n,wl.t("Autopilot: request failed. Retrying\u2026"),wl.t("Autopilot scheduled a retry after a request error")):this.showAutopilotProgress(n,wl.t("Request failed. Retrying\u2026"),wl.t("Retry scheduled after a request error"))'
+
 # Part 3 — EZiL Chat history (workbench.js). Upstream the ChatSessionStore keeps sessions in
 # <user-data>/User/workspaceStorage/<id>/chatSessions, where the id hashes
 # vscode-remote://<browser host><folder> (code-server sets remoteAuthority to location.host),
@@ -354,6 +359,15 @@ P_HISTORY_CAP='var zSn=400,HTt="chat.ChatSessionStore.index"'
 P_HISTORY_READ='return this.readSessionFromLocation(t.flat,t.log,e)})}async readSessionFromLocation(e,t,i){'
 P_HISTORY_LOCATION='getStorageLocation(e){return{flat:ywe(this.storageRoot,e,".json"),log:'
 P_HISTORY_NOTFOUND='ba(r)!==1&&this.reportError("sessionDelete","Error deleting chat session",r)'
+# JSONL can store Pending (0) or NeedsInput (4). On restore the workbench
+# cancels those already disconnected requests. Keep the cancellation and saved
+# response content, but explain it for a Local chat when no prior error exists.
+A_HISTORY_INTERRUPTED='if((l.value===0||l.value===4)&&(l={value:2,completedAt:Date.now()}),e.response)for(let u of e.response)'
+R_HISTORY_INTERRUPTED='if(l.value===0||l.value===4){l={value:2,completedAt:Date.now()};if(Ws.parseLocalSessionId(this.sessionResource)&&!c?.errorDetails)c={...c,errorDetails:{code:"ezil_turn_interrupted",message:"This response was interrupted before it finished. Review any changes before retrying."}}}if(e.response)for(let u of e.response)'
+# The stock renderer suppresses error banners on cancellations. This one
+# persisted marker is allowed through; an explicit Stop keeps its normal UI.
+A_HISTORY_INTERRUPTED_RENDER='e.model.response===e.model.entireResponse&&!e.isCanceled&&e.errorDetails?.message&&e.errorDetails.message!==O$'
+R_HISTORY_INTERRUPTED_RENDER='e.model.response===e.model.entireResponse&&(!e.isCanceled||e.errorDetails?.code==="ezil_turn_interrupted")&&e.errorDetails?.message&&e.errorDetails.message!==O$'
 # The chat title (whose click opens the session picker) rendered only once the current chat had a
 # title. Always render it; an empty chat reads "Chat history".
 A_HISTORY_ENTRY='shouldRender(){return!!this.model?.title}'
@@ -390,6 +404,7 @@ P_STATIC_WEBVIEW='webviewEndpoint:I+"/out/vs/workbench/contrib/webview/browser/p
 # A partial or altered patch still fails the gates; it is never silently repaired.
 if [ "$VERIFY_ONLY" = 0 ] && [ "$(count "$WB" "$R_APP_FAILURE")" = 1 ]; then VERIFY_ONLY=1; fi
 if [ "$VERIFY_ONLY" = 0 ]; then
+  patch request-retry "$EXT" 1 "$A_REQUEST_RETRY" "$R_REQUEST_RETRY"
   patch summary-owner "$EXT" 1 "$A_SUMMARY_OWNER" "$R_SUMMARY_OWNER"
   patch summary-bridge "$EXT" 1 "$A_SUMMARY_BRIDGE" "$R_SUMMARY_BRIDGE"
   patch summary-frontier "$EXT" 1 "$A_SUMMARY_FRONTIER" "$R_SUMMARY_FRONTIER"
@@ -452,6 +467,8 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   done
   patch history-root   "$WB"  1  "$A_HISTORY_ROOT" "$R_HISTORY_ROOT"
   patch history-index  "$WB"  1  "$A_HISTORY_INDEX" "$R_HISTORY_INDEX"
+  patch history-interrupted "$WB" 1 "$A_HISTORY_INTERRUPTED" "$R_HISTORY_INTERRUPTED"
+  patch history-interrupted-render "$WB" 1 "$A_HISTORY_INTERRUPTED_RENDER" "$R_HISTORY_INTERRUPTED_RENDER"
   patch history-entry  "$WB"  1  "$A_HISTORY_ENTRY" "$R_HISTORY_ENTRY"
   patch history-label  "$WB"  1  "$A_HISTORY_LABEL" "$R_HISTORY_LABEL"
   patch history-empty-title "$WB" 2 "$A_HISTORY_EMPTY_TITLE" "$R_HISTORY_EMPTY_TITLE"
@@ -499,6 +516,8 @@ gate picker-locked-list "$WB" 0 "$A_PICKER_LOCKED_LIST"; gate picker-locked-list
 gate picker-locked-pin "$WB" 0 "$A_PICKER_LOCKED_PIN"; gate picker-locked-pin "$WB" 1 "$R_PICKER_LOCKED_PIN"
 gate picker-locked-select "$WB" 0 "$A_PICKER_LOCKED_SELECT"; gate picker-locked-select "$WB" 1 "$R_PICKER_LOCKED_SELECT"
 gate picker-locked-configure "$WB" 0 "$A_PICKER_LOCKED_CONFIGURE"; gate picker-locked-configure "$WB" 1 "$R_PICKER_LOCKED_CONFIGURE"
+gate request-retry "$EXT" 0 "$A_REQUEST_RETRY"; gate request-retry "$EXT" 1 "$R_REQUEST_RETRY"
+gate request-retry "$EXT" 0 'Recovered from a request error'; gate request-retry "$EXT" 0 'Autopilot recovered from a request error'
 gate summary-owner "$EXT" 0 "$A_SUMMARY_OWNER"; gate summary-owner "$EXT" 1 "$R_SUMMARY_OWNER"
 gate summary-bridge "$EXT" 0 "$A_SUMMARY_BRIDGE"; gate summary-bridge "$EXT" 1 "$R_SUMMARY_BRIDGE"
 gate summary-frontier "$EXT" 0 "$A_SUMMARY_FRONTIER"; gate summary-frontier "$EXT" 1 "$R_SUMMARY_FRONTIER"
@@ -553,6 +572,8 @@ for p in "$P_HISTORY_KSN" "$P_HISTORY_TITLE" "$P_HISTORY_CAP" "$P_HISTORY_READ" 
 done
 gate history-root     "$WB"  0  "$A_HISTORY_ROOT";  gate history-root     "$WB"  1  "$R_HISTORY_ROOT"
 gate history-index    "$WB"  0  "$A_HISTORY_INDEX"; gate history-index    "$WB"  1  "$R_HISTORY_INDEX"
+gate history-interrupted "$WB" 0 "$A_HISTORY_INTERRUPTED"; gate history-interrupted "$WB" 1 "$R_HISTORY_INTERRUPTED"
+gate history-interrupted-render "$WB" 0 "$A_HISTORY_INTERRUPTED_RENDER"; gate history-interrupted-render "$WB" 1 "$R_HISTORY_INTERRUPTED_RENDER"
 gate history-entry    "$WB"  0  "$A_HISTORY_ENTRY"; gate history-entry    "$WB"  1  "$R_HISTORY_ENTRY"
 gate history-label    "$WB"  0  "$A_HISTORY_LABEL"; gate history-label    "$WB"  1  "$R_HISTORY_LABEL"
 gate history-empty-title "$WB" 0 "$A_HISTORY_EMPTY_TITLE"; gate history-empty-title "$WB" 2 "$R_HISTORY_EMPTY_TITLE"
