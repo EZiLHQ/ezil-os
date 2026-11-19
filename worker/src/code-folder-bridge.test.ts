@@ -217,9 +217,21 @@ function run(opts: { search?: string; pathname?: string; framed?: boolean; navig
   const timers: Array<{ fn: () => void; ms: number; cleared?: boolean }> = [];
   const listeners: Record<string, Array<(ev: unknown) => void>> = {};
   const navListeners: Array<(ev: unknown) => void> = [];
+  const documentAttributes = new Map<string, string>();
   const parent = { postMessage: (m: Record<string, unknown>, o: string) => posted.push({ m: structuredClone(m), o }) };
   const g: Record<string, unknown> = {
     URLSearchParams, URL, crypto, btoa, Uint8Array, Map, String, JSON,
+    document: {
+      documentElement: {
+        setAttribute: (key: string, value: string) => documentAttributes.set(key, value),
+        getAttribute: (key: string) => documentAttributes.get(key) ?? null,
+      },
+      querySelector: () => null,
+    },
+    MutationObserver: class {
+      observe() {}
+      disconnect() {}
+    },
     location: { search, pathname, origin: EDITOR, replace: (u: string) => replaced.push(u) },
     setTimeout: (fn: () => void, ms: number) => timers.push({ fn, ms }),
     clearTimeout: (id: number) => { const t = timers[id - 1]; if (t) t.cleared = true; },
@@ -239,11 +251,34 @@ function run(opts: { search?: string; pathname?: string; framed?: boolean; navig
   };
   const fire = () => { for (const t of timers.splice(0)) if (!t.cleared) t.fn(); };
   const unload = () => (listeners.beforeunload ?? []).forEach((fn) => fn({}));
-  return { posted, replaced, timers, message, navigate, fire, unload, parent, navListeners };
+  return { posted, replaced, timers, message, navigate, fire, unload, parent, navListeners, documentAttributes };
 }
 const NONCE = 'BBBBBBBBBBBBBBBBBBBBBB';
 
 describe('the bridge script', () => {
+  it('starts repository presentation once, only on the matching private checkout mint and folder', () => {
+    const folder = '/workspace/projects/16e75a93-1dec-82a8-81db-5463a37115c1';
+    const mint = 'AAAAAAAAAAAAAAAAAAAAAA';
+    const repositoryFocus = { name: 'default/os-code-url-20261110-a', folder };
+    const hello = { type: 'ezil.code.hello', v: 1, nonce: NONCE, mint, repositoryFocus };
+    const b = run({ search: `?folder=${folder}&ezil_mint=${mint}` });
+    b.message(hello, { source: {} });
+    b.message(hello, { origin: PROD_SHELL });
+    b.message({ ...hello, mint: NONCE });
+    b.message({ ...hello, repositoryFocus: { ...repositoryFocus, folder: '/workspace/projects/other' } });
+    b.message({ ...hello, repositoryFocus: { ...repositoryFocus, name: 'default/../other' } });
+    expect(b.timers).toHaveLength(0);
+    expect(b.documentAttributes.size).toBe(0);
+    b.message(hello);
+    b.message(hello);
+    expect(b.timers).toHaveLength(1);
+    expect(b.documentAttributes.get('data-ezil-repo-checkout')).toBe(folder + '/os-code-url-20261110-a');
+
+    const later = run({ search: `?folder=${folder}` });
+    later.message(hello);
+    expect(later.timers).toHaveLength(0);
+    expect(later.documentAttributes.size).toBe(0);
+  });
   it('does nothing at all when not framed', () => {
     const b = run({ framed: false });
     expect(b.posted).toEqual([]);

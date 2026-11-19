@@ -3,7 +3,7 @@
 // injects the REAL bridge (worker/src/code-folder-bridge.ts) into the workbench document, framed by the REAL shell
 // bundle. Drives VS Code's own File > Open Folder, Back/Forward, an edited file across switches, and a reload.
 // Started by code-folder-url-image.sh (no network egress; no staging contact).
-// Also exercises the diagnostic event -> real Worker bridge -> real shell parent transport without model traffic.
+// Also exercises direct repository presentation and the diagnostic event -> shell transport without model traffic.
 // Args: <code-server ip> <evidence dir>
 import assert from 'node:assert/strict';
 import { createServer, request as httpRequest } from 'node:http';
@@ -13,6 +13,13 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 
 const [CS_IP, EVIDENCE] = process.argv.slice(2);
+const REPO_ID = '44444444-4444-8444-8444-444444444444';
+const REPO_NAME = 'os-code-url-20261110-a';
+const REPO_LABEL = `default/${REPO_NAME}`;
+const REPO_URL = `https://github.ezil.work/${REPO_LABEL}.git`;
+const REPO_WRAPPER = `/workspace/projects/${REPO_ID}`;
+const expectRepoProjection = process.env.EXPECT_REPO_PROJECTION === '1';
+const CREATED_FILE = 'repo-focus-created.txt';
 const TREE = new URL('..', import.meta.url).pathname.replace(/\/$/, '');
 const require = createRequire(path.join(process.env.PLAYWRIGHT_REQUIRE_DIR || '/opt/ezil-testkit', 'noop.js'));
 const { chromium } = require('playwright');
@@ -27,6 +34,7 @@ const ok = (cond, msg) => { log(`${cond ? 'PASS' : 'FAIL'}  ${msg}`); if (cond) 
 
 let shellOrigin = '', editorOrigin = '';
 const asks = [];
+const repoAsks = [];
 const TYPES = { '.js': 'application/javascript', '.css': 'text/css', '.png': 'image/png', '.svg': 'image/svg+xml' };
 const shell = createServer((req, res) => {
   const url = new URL(req.url, 'http://x');
@@ -39,6 +47,17 @@ const shell = createServer((req, res) => {
   if (url.pathname === '/api/shell/code-preview-url') {
     let raw = ''; req.on('data', (c) => { raw += c; }); req.on('end', () => {
       const body = JSON.parse(raw || '{}');
+      if (body.repository) {
+        repoAsks.push(body);
+        if (body.repository.url !== REPO_URL || body.codeFolder) {
+          res.statusCode = 400;
+          json({ ok: false });
+          return;
+        }
+        const codePreviewUrl = `${editorOrigin}/preview-bootstrap?token=T&path=%2F&folder=${encodeURIComponent(REPO_WRAPPER)}`;
+        json({ ok: true, codePreviewUrl, url: codePreviewUrl, repository: { name: REPO_LABEL, id: REPO_ID } });
+        return;
+      }
       asks.push(body.codeFolder ?? null);
       const folder = body.codeFolder?.path ?? '/workspace';
       // As the Worker after its walk (every seeded folder exists): the asked folder, else the default.
@@ -95,7 +114,10 @@ await new Promise((r) => editor.listen(0, '127.0.0.1', r));
 shellOrigin = `http://127.0.0.1:${shell.address().port}`;
 editorOrigin = `http://localhost:${editor.address().port}`;
 
-const browser = await chromium.launch({ args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+const browser = await chromium.launch({
+  executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined,
+  args: ['--no-sandbox', '--disable-dev-shm-usage'],
+});
 const context = await browser.newContext({ viewport: { width: 1440, height: 900 } });
 await context.addInitScript(() => {
   window.__EZIL_BOOT__ = { user: { id: '33333333-3333-4333-8333-333333333333', email: 'fixture@example.test' },
@@ -118,10 +140,74 @@ const workbench = async () => { const f = frame(); await f.locator('.monaco-work
 const explorerTitle = async () => (await frame().locator('.pane-header[aria-label*="Explorer"], .explorer-folders-view').first().getAttribute('aria-label').catch(() => null)) ?? '';
 const shot = (name) => page.screenshot({ path: `${EVIDENCE}/${name}.png` });
 
+let f;
+// A direct repository link keeps its isolated workspace with either Explorer presentation.
+await page.goto(`${shellOrigin}/app/code?repo=${encodeURIComponent(REPO_URL)}`);
+ok(await waitFrameFolder(REPO_WRAPPER, 120_000), 'repo: the minted Code workspace is the UUID wrapper');
+ok(repoAsks.length === 1 && repoAsks[0].repository.url === REPO_URL && !repoAsks[0].codeFolder,
+  'repo: exactly one mint requested the canonical repo URL and no folder override');
+f = await workbench();
+const readableHeading = f.getByRole('heading', {
+  name: /^(?:Explorer Section: )?os-code-url-20261110-a$/i,
+}).first();
+await readableHeading.waitFor();
+ok(await readableHeading.isVisible(), 'repo: the real Explorer shows the repository name as its heading');
+const repoFiles = f.locator('.explorer-folders-view');
+const checkout = repoFiles.getByRole('treeitem', { name: REPO_NAME, exact: true });
+const readme = repoFiles.getByRole('treeitem', { name: 'README.md', exact: true, level: expectRepoProjection ? 1 : 2 });
+if (expectRepoProjection) {
+  await readme.waitFor();
+  ok(await readme.isVisible() && await checkout.count() === 0,
+    'repo: README is top-level, the repo-local exclusion stayed inert, and no duplicate checkout row is visible');
+  const selectedRows = repoFiles.getByRole('treeitem', { selected: true });
+  ok(await selectedRows.count() === 0, 'repo: the fresh projected Explorer has no explicit row selection');
+  const newFile = f.getByRole('button', { name: /^New File(?:\.\.\.|…)?(?: \(.*\))?$/i }).first();
+  await readableHeading.hover();
+  await newFile.click();
+  const input = repoFiles.locator('input:visible');
+  await input.fill(CREATED_FILE);
+  await input.press('Enter');
+  const created = repoFiles.getByRole('treeitem', { name: CREATED_FILE, exact: true, level: 1 });
+  await created.waitFor();
+  ok(await created.isVisible(), 'repo: with no selected row, Explorer toolbar New File creates a top-level file');
+} else {
+  const expandedCheckout = repoFiles.getByRole('treeitem', { name: REPO_NAME, exact: true, level: 1, expanded: true });
+  await expandedCheckout.waitFor();
+  await readme.waitFor();
+  ok(await expandedCheckout.isVisible() && await readme.isVisible(),
+    'repo: the exact checkout is expanded and its root-only exclusion did not hide README');
+}
+ok(frameFolder() === REPO_WRAPPER && new URL(page.url()).searchParams.get('repo') === REPO_URL
+  && !new URL(page.url()).searchParams.has('folder'), 'repo: presentation left the workspace and repository-only link unchanged');
+const titleBarLabels = f.locator('.part.titlebar .command-center .search-label, .part.titlebar .command-center .agent-status-label');
+await titleBarLabels.first().waitFor({ state: 'attached' });
+const titleBarUsesRepo = () => titleBarLabels.evaluateAll((nodes, repo) => nodes.length > 0 && nodes.every(node => node.textContent === repo), REPO_NAME);
+ok(await titleBarUsesRepo(), 'repo: the command center and agent status display the checkout folder name');
+// Some workbench layouts display the complete workspace title inside the visible label.
+const visibleTitleBarLabel = f.locator('.part.titlebar .command-center :is(.search-label, .agent-status-label):visible').first();
+await visibleTitleBarLabel.evaluate((node, id) => { node.textContent = 'Search — ' + id + ' — code-server'; }, REPO_ID);
+ok(await titleBarUsesRepo(), 'repo: the visible command center label also replaces the ID in a longer title');
+await readme.dblclick();
+await f.waitForFunction(repo => document.title === 'README.md - ' + repo + ' - code-server', REPO_NAME);
+ok(await titleBarUsesRepo(), 'repo: opening an editor preserves the checkout name in the title bar');
+await shot('08-repo-focus');
+
+await openFolder('/workspace/b');
+ok(await waitFrameFolder('/workspace/b'), 'repo: manually switching folders still opens the selected folder');
+await page.waitForFunction(() => new URLSearchParams(location.search).get('folder') === '/workspace/b');
+f = await workbench();
+const notes = f.locator('.explorer-folders-view').getByRole('treeitem', { name: 'notes.txt', exact: true, level: 1 });
+await notes.waitFor();
+ok(await notes.isVisible() && !await f.getByRole('heading', { name: /os-code-url-20261110-a/i }).count(),
+  'repo: after a manual switch, the normal folder Explorer shows its own files and heading');
+await f.waitForFunction(() => /(?:^| - )b - code-server$/.test(document.title));
+ok(!(await f.title()).includes(REPO_NAME), 'repo: the ordinary folder keeps its own Code title');
+await shot('09-repo-switch');
+
 // 1. The link opens A in real code-server.
 await page.goto(`${shellOrigin}/app/code?folder=${encodeURIComponent('/workspace/a')}`);
 ok(await waitFrameFolder('/workspace/a', 120_000), 'link: real code-server opened /workspace/a');
-let f = await workbench();
+f = await workbench();
 ok(injected >= 1, `the workbench document carried the bridge (${injected} injected)`);
 ok(await waitAddress('/app/code?folder=/workspace/a'), `link: address ${await address()}`);
 await page.waitForTimeout(2000);
@@ -214,18 +300,19 @@ ok(await waitFrameFolder('/workspace/b'), `forward: real editor at ${frameFolder
 f = await workbench(); await page.waitForTimeout(1500);
 await shot('04-forward-b');
 
-// 4. An edited file survives a folder switch and the way back (code-server's own autosave/backup; the frame is
-//    navigated, never removed). Quick Open notes.txt, type, wait for the editor, then Back and Forward.
+// 4. A saved edit survives a folder switch and the way back (the frame is navigated, never removed).
+//    Quick Open notes.txt, edit and save it in the editor, then use Back and Forward.
 await f.locator('.monaco-workbench').click({ position: { x: 700, y: 400 } }).catch(() => {});
 await page.keyboard.press('Control+P');
 await f.locator('.quick-input-widget input').fill('notes.txt');
 await page.waitForTimeout(1000);
 await page.keyboard.press('Enter');
-await f.locator('.monaco-editor .view-lines').first().waitFor();
-await f.locator('.monaco-editor .view-lines').first().click();
-await page.keyboard.press('Control+End');
+const editorInput = f.locator('.part.editor .monaco-editor :is(.native-edit-context, .inputarea)').first();
+await editorInput.press('Control+End');
 await page.keyboard.type(' edited-by-folder-url-test', { delay: 15 });
-await page.waitForTimeout(3500); // past code-server's autosave delay / backup
+await f.waitForFunction(() => document.querySelector('.part.editor .monaco-editor .view-lines')?.textContent.includes('edited-by-folder-url-test'));
+await editorInput.press('Control+S');
+await page.waitForTimeout(1500); // Let Code Server finish the remote save.
 await shot('05-edited-b');
 const beforeDialogs = dialogs.length;
 await page.goBack();
@@ -240,9 +327,10 @@ await page.keyboard.press('Control+P');
 await f.locator('.quick-input-widget input').fill('notes.txt');
 await page.waitForTimeout(1000);
 await page.keyboard.press('Enter');
-await f.locator('.monaco-editor .view-lines').first().waitFor();
+const reopenedEditor = f.locator('.part.editor .monaco-editor .view-lines').first();
+await reopenedEditor.waitFor();
 await page.waitForTimeout(1500);
-const text = await f.locator('.monaco-editor .view-lines').first().innerText();
+const text = await reopenedEditor.innerText();
 ok(text.includes('edited-by-folder-url-test'), `edited: the edit is still there after Back and Forward [${JSON.stringify(text.slice(0, 120))}]`);
 await shot('06-edit-survived');
 
@@ -253,6 +341,7 @@ ok(await waitFrameFolder('/workspace/b', 120_000), 'reload: real code-server reo
 ok(asks.length === asksBefore + 1 && asks.at(-1)?.path === '/workspace/b', `reload: the mint asked for /workspace/b [${JSON.stringify(asks.at(-1))}]`);
 await workbench(); await page.waitForTimeout(1500);
 await shot('07-reload-b');
+
 ok(errors.length === 0, `no uncaught shell page errors [${errors.join(' | ')}]`);
 log(`PASS ${checks} checks: real code-server 4.141 (live image) + Worker bridge + real shell bundle`);
 writeFileSync(`${EVIDENCE}/code-folder-url.log`, lines.join('\n'));

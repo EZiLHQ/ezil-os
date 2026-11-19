@@ -74,6 +74,116 @@ export const LEGACY_NOTICE_MARKER = 'data-ezil-legacy-notice';
  */
 export const LEGACY_NOTICE_HIDE_CSS = '.chat-viewpane .interactive-session>.interactive-input-part::after{content:none!important;display:none!important}';
 
+// Browser source for the nonce-bearing Code folder bridge. A supporting workbench uses the verified checkout as
+// the Explorer root and keeps the wrapper as the actual workspace. An older workbench still reveals the checkout.
+const REPOSITORY_FOCUS_SCRIPT = String.raw`
+function focusRepository(folder, name) {
+  const root = /\/projects\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/.exec(folder)?.[1];
+  if (!root || typeof name !== "string" ||
+      !/^[a-z0-9][a-z0-9-]{0,63}\/[a-z0-9][a-z0-9._-]{0,99}$/.test(name) ||
+      name.includes("..") || name.endsWith(".") || name.endsWith(".git")) return false;
+
+  const basename = name.split("/")[1];
+  const checkout = folder + "/" + basename;
+  const html = document.documentElement;
+  const projectedAttribute = "data-ezil-repo-explorer-ready";
+  html.setAttribute("data-ezil-repo-checkout", checkout);
+  const labelWindowTitle = (text) => {
+    const segments = text.split(" - ");
+    const workspace = segments.lastIndexOf(root);
+    if (workspace === -1) return text;
+    segments[workspace] = basename;
+    return segments.join(" - ");
+  };
+  const labelText = (element, transform) => {
+    if (!element) return;
+    const text = element.textContent;
+    const updated = transform(text);
+    if (updated !== text) element.textContent = updated;
+  };
+
+  const labelTitleBar = (bar) => {
+    for (const node of bar.querySelectorAll(".command-center .search-label, .command-center .agent-status-label")) {
+      if (node.textContent?.includes(root)) node.textContent = basename;
+    }
+    const quickPick = bar.querySelector(".command-center-quick-pick");
+    const description = quickPick?.getAttribute("aria-description");
+    if (description) {
+      const action = description.endsWith(" " + root)
+        ? description.slice(0, -root.length) + basename
+        : description.replace(" " + root + " — ", " " + basename + " — ");
+      const updated = labelWindowTitle(action);
+      if (updated !== description) quickPick.setAttribute("aria-description", updated);
+    }
+    // With Command Center disabled, the workbench renders a plain text title here.
+    const windowTitle = bar.querySelector(".window-title");
+    if (windowTitle?.childElementCount === 0) labelText(windowTitle, labelWindowTitle);
+  };
+
+  let revealed = false;
+  const labelExplorer = (part) => {
+    const explorer = part.querySelector(".explorer-folders-view");
+    if (!explorer) return;
+    // VS Code uses the pane heading, or the view container's heading when merged.
+    const header = explorer.closest(".pane")?.querySelector(".pane-header");
+    const headings = [header?.querySelector("h3.title"), part.querySelector(".title-label h2")]
+      .filter((element) => element?.textContent === root);
+    if (revealed && headings.length === 0) return;
+    const projected = html.getAttribute(projectedAttribute) === checkout;
+    // Older images display the checkout as a tree row inside the wrapper.
+    const row = projected ? undefined : [...explorer.querySelectorAll('[role="treeitem"][aria-level="1"][aria-expanded]')].find((item) => {
+      const pathLabel = item.querySelector(".explorer-item")?.getAttribute("aria-label");
+      return pathLabel === checkout || pathLabel?.startsWith(checkout + " • ");
+    });
+    if (!projected && !row) return;
+
+    for (const heading of headings) heading.textContent = basename;
+    for (const node of [header, ...headings, header?.querySelector(".icon"), header?.querySelector('[role="toolbar"]')]) {
+      const label = node?.getAttribute("aria-label");
+      if (label?.includes(root)) node.setAttribute("aria-label", label.replace(root, basename));
+    }
+
+    // Use existing Explorer interactions once. Preserve restored selection and keyboard focus.
+    if (!revealed && row?.getAttribute("aria-expanded") === "false") {
+      const click = (element) => element?.dispatchEvent(new MouseEvent("click", { bubbles: true, detail: 1 }));
+      if (!explorer.querySelector('[aria-selected="true"]')) click(row.querySelector(".monaco-tl-contents"));
+      if (row.getAttribute("aria-expanded") === "false") click(row.querySelector(".monaco-tl-twistie"));
+    }
+    revealed = true;
+  };
+
+  // Observe only these rendered surfaces after startup. Code recomputes the labels as editors and views change.
+  const pending = new Map([
+    ["head title", { update: (node) => labelText(node, labelWindowTitle) }],
+    [".part.titlebar", { update: labelTitleBar, attributes: ["aria-description"] }],
+    [".part.sidebar", { update: labelExplorer, attributes: ["aria-label", "aria-expanded"] }],
+  ]);
+  const discover = () => {
+    for (const [selector, { update, attributes }] of pending) {
+      const node = document.querySelector(selector);
+      if (!node) continue;
+      const surface = new MutationObserver(() => update(node));
+      surface.observe(node, {
+        subtree: true, childList: true, characterData: true,
+        ...(attributes ? { attributeFilter: attributes } : {}),
+      });
+      if (update === labelExplorer) surface.observe(html, { attributeFilter: [projectedAttribute] });
+      pending.delete(selector);
+      update(node);
+    }
+    if (pending.size === 0) {
+      observer.disconnect();
+      clearTimeout(expiry);
+    }
+  };
+  const observer = new MutationObserver(discover);
+  observer.observe(document.documentElement, { subtree: true, childList: true });
+  const expiry = setTimeout(() => observer.disconnect(), 45_000);
+  discover();
+  return true;
+}
+`;
+
 const ORIGIN_RE = /^https:\/\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
 /** A CSP nonce as code-server writes it (a UUID today); anything else is not copied into an attribute. */
 const NONCE_RE = /^[A-Za-z0-9+/=_-]{8,128}$/;
@@ -112,9 +222,10 @@ export function codeFolderBridgeScript(origins: readonly string[]): string {
     + `const here=what(location.search);const base=String(location.pathname||"");if((here.kind==="folder"||here.kind==="empty")&&base.length<=256)here.base=base;`
     + `let mint=null;try{const m=new URLSearchParams(location.search).get("ezil_mint");mint=m&&T.test(m)?m:null}catch{}`
     + `const tell=(m)=>{for(const o of O){try{window.parent.postMessage(m,o)}catch{}}};`
-    + `const pending=new Map();`
+    + REPOSITORY_FOCUS_SCRIPT
+    + `let repositoryFocusStarted=false;const pending=new Map();`
     + `addEventListener("message",ev=>{try{const d=ev.data;if(ev.source!==window.parent||!O.includes(ev.origin)||!d||typeof d!=="object"||d.v!==1)return;`
-    + `if(d.type==="ezil.code.hello"&&typeof d.nonce==="string"&&T.test(d.nonce)){ev.source.postMessage({type:"ezil.code.folder",v:1,nonce:d.nonce,mint,...here},ev.origin);return}`
+    + `if(d.type==="ezil.code.hello"&&typeof d.nonce==="string"&&T.test(d.nonce)){ev.source.postMessage({type:"ezil.code.folder",v:1,nonce:d.nonce,mint,...here},ev.origin);if(!repositoryFocusStarted&&mint!==null&&d.mint===mint&&here.kind==="folder"&&d.repositoryFocus?.folder===here.path)repositoryFocusStarted=focusRepository(here.path,d.repositoryFocus.name);return}`
     + `if(d.type==="ezil.code.go"&&typeof d.id==="string"&&pending.has(d.id)){const p=pending.get(d.id);pending.delete(d.id);clearTimeout(p.t);location.replace(p.url)}}catch{}});`
     + `const nav=window.navigation;if(nav&&typeof nav.addEventListener==="function"){nav.addEventListener("navigate",e=>{try{`
     + `if(e.navigationType!=="push"||!e.cancelable||e.hashChange||e.downloadRequest)return;`
