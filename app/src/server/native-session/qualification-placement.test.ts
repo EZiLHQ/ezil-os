@@ -1,6 +1,6 @@
 import { createHmac } from 'node:crypto';
 import { PgDialect } from 'drizzle-orm/pg-core';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { deriveControlKey } from '@/server/lib/compute/aws-control-key';
 import type { PlacementExecutor } from '@/server/lib/compute/placement';
@@ -148,6 +148,27 @@ describe('scoped Host qualification transport', () => {
             const deps = setup();
             expect((await handleNativeQualification(request, { ...deps, ...override })).status).toBe(404);
             expect(deps.queries).toHaveLength(0);
+        }
+    });
+
+
+    it('closes a stalled request before attempting to sign', async () => {
+        const deps = setup();
+        const cancel = vi.fn();
+        const stream = new ReadableStream<Uint8Array>({ cancel });
+        const request = new Request('https://os.example/api', {
+            method: 'POST', body: stream, headers: { 'content-type': 'application/json', 'x-ezil-signature': signature },
+            duplex: 'half',
+        } as RequestInit & { duplex: 'half' });
+        vi.useFakeTimers();
+        try {
+            const response = handleNativeQualification(request, deps);
+            await vi.advanceTimersByTimeAsync(3000);
+            expect((await response).status).toBe(404);
+            expect(cancel).toHaveBeenCalledOnce();
+            expect(deps.queries).toHaveLength(0);
+        } finally {
+            vi.useRealTimers();
         }
     });
 

@@ -157,6 +157,11 @@ export async function handleNativeQualification(request: Request, deps: Qualific
     const reader = request.body.getReader();
     const chunks: Uint8Array[] = [];
     let size = 0;
+    let bodyTimedOut = false;
+    const deadline = setTimeout(() => {
+        bodyTimedOut = true;
+        void reader.cancel().catch(() => {});
+    }, 3000);
     try {
         for (;;) {
             const result = await reader.read();
@@ -165,6 +170,8 @@ export async function handleNativeQualification(request: Request, deps: Qualific
             if (size > 4096) return denied();
             chunks.push(result.value);
         }
+        if (bodyTimedOut) return denied();
+        clearTimeout(deadline);
         const bytes = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks));
         const proof = await deps.sign(bytes, {
             target: { computerId: parts[0], ownerUserId: parts[1], instanceId: parts[2] },
@@ -174,7 +181,8 @@ export async function handleNativeQualification(request: Request, deps: Qualific
     } catch {
         return denied();
     } finally {
-        await reader.cancel().catch(() => {});
+        clearTimeout(deadline);
+        void reader.cancel().catch(() => {});
         reader.releaseLock();
     }
 }
