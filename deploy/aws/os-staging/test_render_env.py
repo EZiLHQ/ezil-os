@@ -25,6 +25,20 @@ class RenderEnvTests(unittest.TestCase):
         with self.assertRaises(renderer.RenderError):
             renderer.validate({**self.values, "EZIL_AWS_ARBITRARY": "synthetic"})
 
+    def test_retained_rebase_approval_is_private_and_staging_only(self):
+        key = "EZIL_AWS_RETAINED_REBASE_APPROVAL"
+        raw = '{"v":1,"syntheticPin":"fixture-only"}'
+        values = {**self.values, key: raw}
+        self.assertEqual(renderer.validate(values, "staging"), values)
+        (app, cron), names = self.render_fixture(values)
+        self.assertIn(f"{key}={raw}", app.decode().splitlines())
+        self.assertNotIn(raw, names)
+        self.assertNotIn(key, cron.decode())
+        with self.assertRaisesRegex(renderer.RenderError, "staging-only"):
+            renderer.validate(values, "production")
+        with self.assertRaisesRegex(renderer.RenderError, "byte limit"):
+            renderer.validate({**self.values, key: "x" * 4097}, "staging")
+
     def test_universe_project_repo_origin_is_optional(self):
         # Opening a Universe project in Code (app/src/server/works/project-repo.ts): off unless set.
         universe = {"UNIVERSE_PROJECT_REPO_ORIGIN": "https://universe-staging.example.invalid"}

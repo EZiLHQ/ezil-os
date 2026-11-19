@@ -46,7 +46,7 @@ BILLING_TAB_ENABLED PRICING_PAGE_ENABLED CHECKOUT_ENABLED BILLING_ENFORCEMENT
 EZIL_AWS_COMPUTERS_ENABLED EZIL_AWS_CANARY_USER_IDS EZIL_AWS_CANARY_SINCE
 EZIL_AWS_USER_MONTHLY_HOURS EZIL_AWS_GLOBAL_MONTHLY_HOURS
 EZIL_AWS_USER_MONTHLY_EGRESS_GB EZIL_AWS_GLOBAL_MONTHLY_EGRESS_GB
-EZIL_AWS_KILL_SWITCH EZIL_AWS_ENROLL_URL EZIL_AWS_WAKE_MODE EZIL_AWS_AUTO_REBASE
+EZIL_AWS_KILL_SWITCH EZIL_AWS_ENROLL_URL EZIL_AWS_WAKE_MODE EZIL_AWS_AUTO_REBASE EZIL_AWS_RETAINED_REBASE_APPROVAL
 EZIL_AWS_LIFECYCLE_USERDATA_NONCE EZIL_AWS_BROWSER_ZONE
 EZIL_AWS_IDENTITY_CERTS EZIL_AWS_PLUS_PLAN_IDS EZIL_AWS_LIFECYCLE_DEPLOYMENTS
 EZIL_AWS_LIFECYCLE_AUTHORITY_SECRET AWS_REGIONS AWS_MAX_RUNNING
@@ -97,6 +97,12 @@ def validate(values, environment="staging"):
             raise RenderError("Newline or NUL refused")
     if len(values["CRON_SECRET"]) < 32:
         raise RenderError("CRON_SECRET requires at least 32 characters")
+    bridge_approval = values.get("EZIL_AWS_RETAINED_REBASE_APPROVAL")
+    if bridge_approval is not None:
+        if environment != "staging":
+            raise RenderError("Retained rebase approval is staging-only")
+        if len(bridge_approval.encode("utf-8")) > 4096:
+            raise RenderError("Retained rebase approval exceeds its byte limit")
     validate_delegation(values, environment)
     if environment == "production":
         validate_production(values)
