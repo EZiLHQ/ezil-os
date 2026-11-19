@@ -86,16 +86,18 @@ export class ComputerLifecycle extends Construct {
         const role=new iam.Role(this,'ControllerRole',{assumedBy:new iam.ServicePrincipal('states.amazonaws.com',{
             conditions:{StringEquals:{'aws:SourceAccount':d.accountId},ArnEquals:{'aws:SourceArn':machineArn}}})});
         helper.currentVersion.grantInvoke(role);key.grantEncryptDecrypt(role);
-        for(const statement of controllerStatements(s))role.addToPolicy(statement);
+        const controller = controllerStatements(s);
+        for(const statement of controller)role.addToPolicy(statement);
         if (bridge) {
             transitionObserverGrant(this, helper, bridge.observers.lifecycle, role, 'RetainedBridge');
-            const image = `arn:aws:ec2:${r}::image/${bridge.amiId}`;
-            const launch = controllerStatements({ ...s, deployment: { ...d, amiId: bridge.amiId } })
-                .find(statement => statement.actions.includes('ec2:RunInstances') && statement.resources.includes(image));
+            const activeImage = `arn:aws:ec2:${r}::image/${d.amiId}`;
+            const images = bridge.amiIds.map(amiId => `arn:aws:ec2:${r}::image/${amiId}`);
+            const launch = controller.find(statement => statement.actions.includes('ec2:RunInstances') &&
+                statement.resources.includes(activeImage));
             if (!launch) throw new Error('retained_lifecycle_launch_scope_missing');
             // Other RunInstances resources still need the current controller's existing guards.
             new iam.Policy(this, 'RetainedBridgeLaunchPolicy', { roles: [role], statements: [
-                new iam.PolicyStatement({ actions: ['ec2:RunInstances'], resources: [image], conditions: launch.conditions }),
+                new iam.PolicyStatement({ actions: ['ec2:RunInstances'], resources: images, conditions: launch.conditions }),
             ] });
         }
         // Image-to-image rollouts carry no retained legacy source; the promotion window still needs the previous observer version.

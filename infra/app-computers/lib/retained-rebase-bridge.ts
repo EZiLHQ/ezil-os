@@ -18,7 +18,7 @@ export const RetainedRebaseBridgeConfigSchema = z.object({
 }).strict();
 
 export type RetainedRebaseBridge = Readonly<{
-    amiId: string;
+    amiIds: readonly [string, string];
     sourceLifecycleVersion: string;
     versions: Readonly<Required<TransitionStateMachineVersions>>;
     observers: Readonly<Required<TransitionObserverVersions>>;
@@ -80,5 +80,5 @@ export function resolveRetainedRebaseBridge(
         priorVersion(intervening[key], versions[key]);
     }
     priorVersion(versions.lifecycle, sourceRelease.stateMachineVersionArn);
-    return { amiId: release.amiId, sourceLifecycleVersion: sourceRelease.stateMachineVersionArn, versions, observers };
+    return { amiIds: [release.amiId, interveningRelease.amiId], sourceLifecycleVersion: sourceRelease.stateMachineVersionArn, versions, observers };
 }

@@ -92,7 +92,7 @@ test('retained IAM adds only the older AMI and exact prior version grants', () =
     const launch = Object.entries(active).filter(([id]) => id.startsWith('LifecycleRetainedBridgeLaunchPolicy'));
     assert.equal(launch.length, 1);
     assert.deepEqual(launch[0]![1].Properties.PolicyDocument.Statement, [{
-        Action: 'ec2:RunInstances', Effect: 'Allow', Resource: `arn:aws:ec2:${base.region}::image/${bridge.amiId}`,
+        Action: 'ec2:RunInstances', Effect: 'Allow', Resource: bridge.amiIds.map(amiId => `arn:aws:ec2:${base.region}::image/${amiId}`),
         Condition: { StringEquals: { 'aws:RequestedRegion': base.region },
             ArnEquals: { 'ec2:LaunchTemplate': `arn:aws:ec2:${base.region}:${base.accountId}:launch-template/${base.launchTemplateId}` } },
     }]);
