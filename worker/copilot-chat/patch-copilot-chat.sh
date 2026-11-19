@@ -158,6 +158,22 @@ R_CONTEXT_ESTIMATED_LABEL='this.percentageLabel.textContent=`${e.promptTokenDeta
 A_CONTEXT_MODEL_OWNER='r=this.resolveContextWindow(this._selectedModelId)??this.resolveContextWindow(n)'
 R_CONTEXT_MODEL_OWNER='r=this.resolveContextWindow(n)??this.resolveContextWindow(this._selectedModelId)'
 
+# Keep native billing math intact, but do not use its restored default zeros as usage or persist them.
+A_SAVED_CONTEXT_RESTORE='r.response.shouldBeRemovedOnSend=e.isHidden?{requestId:e.requestId}:e.shouldBeRemovedOnSend,(typeof e.completionTokens=="number"||typeof e.promptTokens=="number"||typeof e.copilotCredits=="number"||typeof e.sessionCopilotCredits=="number")&&r.response.setUsage'
+R_SAVED_CONTEXT_RESTORE='r.response.shouldBeRemovedOnSend=e.isHidden?{requestId:e.requestId}:e.shouldBeRemovedOnSend;const ezilDetail=Array.isArray(e.promptTokenDetails)?e.promptTokenDetails.find(v=>v?.category==="EZiL usage"&&typeof v.label==="string"):void 0,ezilSaved=(typeof e.modelId==="string"&&e.modelId.startsWith("ezil:"))||!!ezilDetail,ezilWindow=ezilSaved&&Number.isFinite(e.contextUsage?.currentTokens)&&e.contextUsage.currentTokens>=0&&Number.isFinite(e.contextUsage?.tokenLimit)&&e.contextUsage.tokenLimit>0,ezilCompleted=l.value===1&&Array.isArray(e.response)&&e.response.length>0&&!c?.errorDetails&&!e.isHidden&&!e.hiddenFromTranscript&&!e.requestHiddenFromTranscript&&!e.isSystemInitiated,ezilMissing=!Number.isFinite(e.promptTokens)&&!Number.isFinite(e.completionTokens),ezilUnverifiedZero=e.promptTokens===0&&e.completionTokens===0&&!ezilDetail?.label.startsWith("Local context budget utilization; full model capacity unknown; usage measured;");r.response.ezilSavedContextWindow=ezilWindow,r.response.ezilSavedTokenFieldsMissing=ezilSaved&&ezilCompleted&&!ezilWindow&&ezilMissing,r.response.ezilSavedUsageUnavailable=ezilSaved&&ezilCompleted&&!ezilWindow&&(ezilMissing||ezilUnverifiedZero),(typeof e.completionTokens=="number"||typeof e.promptTokens=="number"||typeof e.copilotCredits=="number"||typeof e.sessionCopilotCredits=="number"||ezilWindow)&&r.response.setUsage'
+A_SAVED_CONTEXT_EXPORT='promptTokens:this.usage?.promptTokens,completionTokens:this.completionTokenCount,outputBuffer:this.usage?.outputBuffer'
+R_SAVED_CONTEXT_EXPORT='promptTokens:this.ezilSavedTokenFieldsMissing?void 0:this.usage?.promptTokens,completionTokens:this.ezilSavedTokenFieldsMissing?void 0:this.completionTokenCount,outputBuffer:this.usage?.outputBuffer'
+A_SAVED_CONTEXT_JSONL='completionTokens:Za(s=>s.response?.completionTokenCount),promptTokens:Za(s=>s.response?.usage?.promptTokens)'
+R_SAVED_CONTEXT_JSONL='completionTokens:Za(s=>s.response?.ezilSavedTokenFieldsMissing?void 0:s.response?.completionTokenCount),promptTokens:Za(s=>s.response?.ezilSavedTokenFieldsMissing?void 0:s.response?.usage?.promptTokens)'
+A_SAVED_CONTEXT_UPDATE='if(!e.response||!e.modelId){this._currentData.get()||this.hide();return}'
+R_SAVED_CONTEXT_UPDATE='if(!e.response||!e.modelId&&!e.response.ezilSavedUsageUnavailable&&!e.response.ezilSavedContextWindow){this._currentData.get()||this.hide();return}'
+A_SAVED_CONTEXT_DATA='updateFromResponse(e,t){let i=e.usage,n=i?.actualModelId??t'
+R_SAVED_CONTEXT_DATA='updateFromResponse(e,t){if(e.ezilSavedUsageUnavailable){this.render({ezilSavedUsageUnavailable:!0,sessionCost:e.session.sessionCost}),this.show();return}let i=e.usage,n=i?.actualModelId??t'
+A_SAVED_CONTEXT_RENDER='render(e){this._currentData.set(e,void 0),this.progressIndicator.setProgress(e.percentage);let t=Math.min(100,Math.round(e.percentage));'
+R_SAVED_CONTEXT_RENDER='render(e){this._currentData.set(e,void 0);if(e.ezilSavedUsageUnavailable){this.progressIndicator.domNode.style.display="none",this.percentageLabel.textContent="Usage unavailable",this.domNode.setAttribute("aria-label","Context usage unavailable"),this.domNode.classList.remove("warning","error");return}this.progressIndicator.domNode.style.display="",this.progressIndicator.setProgress(e.percentage);let t=Math.min(100,Math.round(e.percentage));'
+A_SAVED_CONTEXT_DETAILS='this.sessionCostSection.style.display="none",this.tokenCountLabel.textContent=d(12359,null,this.formatTokenCount(i,1),this.formatTokenCount(n,0))'
+R_SAVED_CONTEXT_DETAILS='this.sessionCostSection.style.display="none";if(e.ezilSavedUsageUnavailable){this.quotaItem.style.display="none",this.warningMessage.style.display="none",this.renderTokenDetails([{category:"EZiL usage",label:"Token counts were not saved for this chat.",percentageOfPrompt:0}],0);return}this.quotaItem.style.display="",this.tokenCountLabel.textContent=d(12359,null,this.formatTokenCount(i,1),this.formatTokenCount(n,0))'
+
 # Part 2 — compact chat layout (workbench.css + two workbench.js anchors, PATCHES.md "Compact chat
 # layout"). The chat view's bottom held a tip, the composer with the Agent/model row, a Local +
 # permissions row and a two-line notice. The `chat-header` anchor moves the Local/permissions/
@@ -387,6 +403,13 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch context-hover "$WB" 1 "$A_CONTEXT_HOVER" "$R_CONTEXT_HOVER"
   patch context-estimated-label "$WB" 1 "$A_CONTEXT_ESTIMATED_LABEL" "$R_CONTEXT_ESTIMATED_LABEL"
   patch context-model-owner "$WB" 1 "$A_CONTEXT_MODEL_OWNER" "$R_CONTEXT_MODEL_OWNER"
+  patch saved-context-restore "$WB" 1 "$A_SAVED_CONTEXT_RESTORE" "$R_SAVED_CONTEXT_RESTORE"
+  patch saved-context-export "$WB" 1 "$A_SAVED_CONTEXT_EXPORT" "$R_SAVED_CONTEXT_EXPORT"
+  patch saved-context-jsonl "$WB" 1 "$A_SAVED_CONTEXT_JSONL" "$R_SAVED_CONTEXT_JSONL"
+  patch saved-context-update "$WB" 1 "$A_SAVED_CONTEXT_UPDATE" "$R_SAVED_CONTEXT_UPDATE"
+  patch saved-context-data "$WB" 1 "$A_SAVED_CONTEXT_DATA" "$R_SAVED_CONTEXT_DATA"
+  patch saved-context-render "$WB" 1 "$A_SAVED_CONTEXT_RENDER" "$R_SAVED_CONTEXT_RENDER"
+  patch saved-context-details "$WB" 1 "$A_SAVED_CONTEXT_DETAILS" "$R_SAVED_CONTEXT_DETAILS"
   patch ai-dashboard "$WB" 1 "$A_AI_DASHBOARD" "$R_AI_DASHBOARD"
   patch app-failure "$WB" 1 "$A_APP_FAILURE" "$R_APP_FAILURE"
   patch ai-request-trace "$WB" 1 "$A_AI_REQUEST_TRACE" "$R_AI_REQUEST_TRACE"
@@ -488,6 +511,13 @@ gate context-usage-detail "$EXT" 0 "$A_CONTEXT_USAGE_DETAIL"; gate context-usage
 gate context-hover "$WB" 0 "$A_CONTEXT_HOVER"; gate context-hover "$WB" 1 "$R_CONTEXT_HOVER"
 gate context-estimated-label "$WB" 0 "$A_CONTEXT_ESTIMATED_LABEL"; gate context-estimated-label "$WB" 1 "$R_CONTEXT_ESTIMATED_LABEL"
 gate context-model-owner "$WB" 0 "$A_CONTEXT_MODEL_OWNER"; gate context-model-owner "$WB" 1 "$R_CONTEXT_MODEL_OWNER"
+gate saved-context-restore "$WB" 0 "$A_SAVED_CONTEXT_RESTORE"; gate saved-context-restore "$WB" 1 "$R_SAVED_CONTEXT_RESTORE"
+gate saved-context-export "$WB" 0 "$A_SAVED_CONTEXT_EXPORT"; gate saved-context-export "$WB" 1 "$R_SAVED_CONTEXT_EXPORT"
+gate saved-context-jsonl "$WB" 0 "$A_SAVED_CONTEXT_JSONL"; gate saved-context-jsonl "$WB" 1 "$R_SAVED_CONTEXT_JSONL"
+gate saved-context-update "$WB" 0 "$A_SAVED_CONTEXT_UPDATE"; gate saved-context-update "$WB" 1 "$R_SAVED_CONTEXT_UPDATE"
+gate saved-context-data "$WB" 0 "$A_SAVED_CONTEXT_DATA"; gate saved-context-data "$WB" 1 "$R_SAVED_CONTEXT_DATA"
+gate saved-context-render "$WB" 0 "$A_SAVED_CONTEXT_RENDER"; gate saved-context-render "$WB" 1 "$R_SAVED_CONTEXT_RENDER"
+gate saved-context-details "$WB" 0 "$A_SAVED_CONTEXT_DETAILS"; gate saved-context-details "$WB" 1 "$R_SAVED_CONTEXT_DETAILS"
 gate ai-dashboard "$WB" 0 "$A_AI_DASHBOARD"; gate ai-dashboard "$WB" 1 "$R_AI_DASHBOARD"
 gate ai-entry "$WB" 0 "$A_AI_ENTRY"; gate ai-entry "$WB" 1 "$R_AI_ENTRY"
 gate token            "$EXT" 0  "$A_TOKEN";        gate token            "$EXT" 1  "$R_TOKEN"

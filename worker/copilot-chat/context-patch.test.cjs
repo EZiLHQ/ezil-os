@@ -12,8 +12,10 @@ const patched = process.env.COPILOT_PATCHED_TEST_ROOT;
 
 test('exact context anchors exist in pinned distribution and applied replacements', { skip: !process.env.COPILOT_TEST_ROOT }, () => {
     for (const name of ['SUMMARY_OWNER', 'SUMMARY_BRIDGE', 'SUMMARY_FRONTIER', 'SUMMARY_TEXT', 'CONTEXT_THRESHOLD', 'CONTEXT_RENDER_BUDGET', 'CONTEXT_OUTPUT', 'CONTEXT_TOOL_COUNT',
-        'CONTEXT_CACHE_UNKNOWN', 'CONTEXT_FALLBACK', 'CONTEXT_USAGE_DETAIL', 'CONTEXT_HOVER', 'CONTEXT_ESTIMATED_LABEL', 'CONTEXT_MODEL_OWNER']) {
-        const file = ['CONTEXT_HOVER', 'CONTEXT_ESTIMATED_LABEL', 'CONTEXT_MODEL_OWNER'].includes(name)
+        'CONTEXT_CACHE_UNKNOWN', 'CONTEXT_FALLBACK', 'CONTEXT_USAGE_DETAIL', 'CONTEXT_HOVER', 'CONTEXT_ESTIMATED_LABEL', 'CONTEXT_MODEL_OWNER',
+        'SAVED_CONTEXT_RESTORE', 'SAVED_CONTEXT_EXPORT', 'SAVED_CONTEXT_JSONL', 'SAVED_CONTEXT_UPDATE', 'SAVED_CONTEXT_DATA',
+        'SAVED_CONTEXT_RENDER', 'SAVED_CONTEXT_DETAILS']) {
+        const file = name.startsWith('SAVED_CONTEXT_') || ['CONTEXT_HOVER', 'CONTEXT_ESTIMATED_LABEL', 'CONTEXT_MODEL_OWNER'].includes(name)
             ? 'out/vs/code/browser/workbench/workbench.js' : 'extensions/copilot/dist/extension.js';
         const pristine = fs.readFileSync(path.join(process.env.COPILOT_TEST_ROOT, file), 'utf8');
         assert.equal(pristine.split(literal('A_' + name)).length - 1, 1, name);
@@ -150,4 +152,149 @@ test('trace command: real pristine anchor and applied registration dispatch vali
     for (const bad of [{ ...record, prompt: 'private' }, { ...record, outcome: 'stalled' }, { ...record, verifiedFileChange: true }, { ...record, requestId: 'bad' }, { ...record, usageSource: 'provider_reported' }]) send(bad);
     assert.equal(events.length, 1);
     window.dispatchEvent = () => { throw Error('observer unavailable'); }; assert.doesNotThrow(() => send(record));
+});
+
+test('saved EZiL billing survives reopening without fabricating token usage', { skip: !patched }, () => {
+    const { runInNewContext } = require('node:vm');
+    const bundle = fs.readFileSync(path.join(patched, 'out/vs/code/browser/workbench/workbench.js'), 'utf8');
+    const method = (start, next, from = 0) => {
+        const i = bundle.indexOf(start, from);
+        const j = bundle.indexOf(next, i + start.length);
+        assert(i >= 0 && j > i, start);
+        return bundle.slice(i, j);
+    };
+    const resolve = bundle.indexOf('resolveContextWindow(e){');
+    const deserialize = '_deserializeRequest(e){';
+    const update = 'update(e){if(this._lastRequestDisposable.clear()';
+    const data = 'updateFromResponse(e,t){';
+    const gaugeRender = 'render(e){this._currentData.set(e,void 0)';
+    const hoverRender = '_render(e){let{percentage:t,usedTokens:i,totalContextWindow:n';
+    const methods = runInNewContext('({' + [
+        method(deserialize, 'reviveVariableData(e){'),
+        method(update, 'updateSessionCost(e){'),
+        method(data, gaugeRender, resolve),
+        method(gaugeRender, 'show(){this._enabled', resolve),
+        method(hoverRender, 'formatTokenCount(e,t){'),
+    ].join(',') + '})', {
+        yH: class {
+            constructor(props) {
+                Object.assign(this, props, { shouldBeBlocked: { get: () => false } });
+            }
+        },
+        oUe: class {
+            constructor({ session }) { this.session = session; }
+            setUsage(usage) { this.usage = usage; this.completionTokenCount = usage.completionTokens; }
+            onDidChange() { return undefined; }
+        },
+        A4i: () => undefined,
+        h8o: () => undefined,
+        Yi: () => false,
+        d: (_, __, ...args) => args.join('/'),
+        kwe: String,
+    });
+
+    const state = { sessionCost: 2, getParsedRequestFromString: text => ({ text }), reviveVariableData: value => value };
+    const modelId = 'ezil:us.openai.gpt-6.2-sol';
+    const detail = (input, output, cacheRead) => ({
+        category: 'EZiL usage',
+        label: `Local context budget utilization; full model capacity unknown; usage measured; input ${input}; output ${output}; cache read ${cacheRead}; cache write 0`,
+        percentageOfPrompt: 0,
+    });
+    const hoverDetail = detail(6400, 300, 700);
+    const saved = { message: 'Synthetic saved QA turn', response: [{ kind: 'markdownContent', content: 'Synthetic response' }], modelId };
+    const revive = metadata => methods._deserializeRequest.call(state, { ...saved, ...metadata });
+    const attrs = {};
+    const element = () => ({ style: {}, textContent: '' });
+    const classes = { add() {}, remove() {} };
+    let current, visible;
+    const widget = {
+        ...methods,
+        _currentData: { get: () => current, set: value => { current = value; } },
+        _lastRequestDisposable: { clear() {} },
+        resolveContextWindow: id => id ? { totalContextWindow: 134000, maxOutputTokens: 16384 } : undefined,
+        progressIndicator: { setProgress() {}, domNode: element() },
+        percentageLabel: element(),
+        domNode: { setAttribute: (key, value) => { attrs[key] = value; }, classList: classes },
+        show() { visible = true; },
+        hide() { visible = false; },
+    };
+    const measured = revive({ promptTokens: 6400, completionTokens: 300, promptTokenDetails: [hoverDetail] });
+    widget.update(measured);
+    assert.equal(widget.percentageLabel.textContent, '5% budget');
+    assert.equal(current.promptTokenDetails[0], hoverDetail);
+
+    const legacy = revive({ copilotCredits: 2, sessionCopilotCredits: 2 });
+    assert.equal(legacy.response.usage.copilotCredits, 2);
+    widget.update(legacy);
+    assert.equal(visible, true);
+    assert.equal(widget.percentageLabel.textContent, 'Usage unavailable');
+    assert.equal(attrs['aria-label'], 'Context usage unavailable');
+    assert.equal(widget.progressIndicator.domNode.style.display, 'none');
+
+    const details = {
+        formatTokenCount: String, sessionCostValue: element(), sessionCostSection: element(),
+        tokenCountLabel: element(), percentageLabel: element(), outputBufferLegend: element(),
+        outputBufferFill: element(), progressFill: element(), quotaItem: { ...element(), classList: classes },
+        warningMessage: element(), renderTokenDetails(details) { this.details = details; },
+    };
+    methods._render.call(details, current);
+    assert.equal(details.sessionCostSection.style.display, '');
+    assert.equal(details.sessionCostValue.textContent, '2');
+    assert.equal(details.quotaItem.style.display, 'none');
+    assert.match(details.details[0].label, /Token counts were not saved/);
+
+    const fields = (prefix, ending) => {
+        const start = bundle.indexOf(prefix);
+        const end = bundle.indexOf(ending, start);
+        assert(start >= 0 && end > start, prefix);
+        return bundle.slice(start + prefix.length, end);
+    };
+    const exported = runInNewContext('(function(){return {' +
+        fields('this._timeSpentWaitingAccumulator,', ',outputBuffer:this.usage?.outputBuffer') + '}})');
+    const jsonl = runInNewContext('({' +
+        fields('timeSpentWaiting:Za(s=>s.response?.timestamp),', ',outputBuffer:Za(s=>s.response?.usage?.outputBuffer)') + '})', { Za: fn => fn });
+    for (const source of [
+        exported.call(legacy.response),
+        { promptTokens: jsonl.promptTokens(legacy), completionTokens: jsonl.completionTokens(legacy) },
+    ]) {
+        assert.equal(source.promptTokens, undefined);
+        assert.equal(source.completionTokens, undefined);
+        widget.update(revive({ ...source, copilotCredits: 2 }));
+        assert.equal(widget.percentageLabel.textContent, 'Usage unavailable');
+    }
+    assert.equal(exported.call(measured.response).promptTokens, 6400);
+    assert.equal(jsonl.completionTokens(measured), 300);
+
+    const resaved = revive({ promptTokens: 0, completionTokens: 0, copilotCredits: 2 });
+    widget.update(resaved);
+    assert.equal(widget.percentageLabel.textContent, 'Usage unavailable');
+    assert.equal(exported.call(resaved.response).promptTokens, 0);
+    assert.equal(jsonl.completionTokens(resaved), 0);
+
+    const measuredZero = revive({ promptTokens: 0, completionTokens: 0, promptTokenDetails: [detail(0, 0, 0)] });
+    widget.update(measuredZero);
+    assert.equal(widget.percentageLabel.textContent, '0% budget');
+    assert.equal(widget.progressIndicator.domNode.style.display, '');
+    methods._render.call(details, current);
+    assert.equal(details.quotaItem.style.display, '');
+
+    const savedWindowZero = revive({ contextUsage: { currentTokens: 0, tokenLimit: 134000 } });
+    widget.update(savedWindowZero);
+    assert.equal(widget.percentageLabel.textContent, '0%');
+
+    const pending = revive({ modelState: { value: 0 }, response: [], copilotCredits: 2 });
+    pending.response.setUsage({ kind: 'usage', promptTokens: 6400, completionTokens: 300 });
+    widget.update(pending);
+    assert.equal(widget.percentageLabel.textContent, '5%');
+    assert.equal(jsonl.promptTokens(pending), 6400);
+
+    widget.update(revive({ modelId: undefined, promptTokenDetails: [hoverDetail], contextUsage: { currentTokens: 6700, tokenLimit: 134000 } }));
+    assert.equal(widget.percentageLabel.textContent, '5% budget');
+    assert.equal(current.promptTokenDetails[0], hoverDetail);
+
+    widget.update(revive({ modelId: 'other:fixture', copilotCredits: 2 }));
+    assert.equal(widget.percentageLabel.textContent, '0%');
+    widget.update(undefined);
+    widget.update(revive({ modelId: undefined, copilotCredits: 2 }));
+    assert.equal(visible, false);
 });
