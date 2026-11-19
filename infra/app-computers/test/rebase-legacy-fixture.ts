@@ -35,8 +35,10 @@ export function legacyRecoveryFixture() {
     return imageRecoveryFixture(preparationFixture(f), rebind);
 }
 
-export async function legacyMaintenanceFixture() {
-    const f = await runImageRecovery({}, legacyRecoveryFixture());
+export const legacyMaintenanceFixture = () => maintenanceFixtureAfterRestore(legacyRecoveryFixture());
+
+export async function maintenanceFixtureAfterRestore(fixture: ReturnType<typeof imageRecoveryFixture>) {
+    const f = await runImageRecovery({}, fixture);
     if (f.result.output?.state !== 'restore_volume_ready') throw new Error(JSON.stringify(f.result));
     Object.assign(f.f.state.executions[f.executionArn]!, { status: 'SUCCEEDED', output: JSON.stringify(f.result.output), stopDate: new Date(f.f.state.now) });
     const i = f.rebind.intent, machine = machineArn(i.deployment.stateMachineVersionArn);

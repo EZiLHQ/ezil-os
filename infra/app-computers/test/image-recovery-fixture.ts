@@ -12,7 +12,7 @@ import { createRecoveryHelper } from '../lib/lifecycle/recovery-helper.js';
 import { preparationFixture } from './preparation-fixture.js';
 import { envelopeFor, rebindFixture } from './rebase-fixture.js';
 
-export function imageRecoveryFixture(f = preparationFixture(), rebind = rebindFixture()) {
+export function imageRecoveryFixture(f = preparationFixture(), rebind = rebindFixture(), documentVersion: 1 | 2 = 1) {
     const p = f.preparation;
     f.state.now = Date.parse('2026-10-22T11:05:00.000Z');
     const snapshot = f.snapshot(); f.state.snapshots.push(snapshot);
@@ -37,7 +37,7 @@ export function imageRecoveryFixture(f = preparationFixture(), rebind = rebindFi
     f.state.instances.push(writer);
     f.volume.Tags = tagList({ ...tagsFor(launch), 'ezil:backup': p.deployment.namespace });
     f.volume.Attachments = [{ InstanceId: writer.InstanceId, VolumeId: f.volume.VolumeId, Device: '/dev/sdf', State: 'attached', DeleteOnTermination: false }];
-    const document = ImageRecoveryDocumentSchema.parse({ schemaVersion: 1, jobId: rebind.lease.ebsRestore.recoveryJobId,
+    const document = ImageRecoveryDocumentSchema.parse({ schemaVersion: documentVersion, jobId: rebind.lease.ebsRestore.recoveryJobId,
         imageJobId: p.jobId, sourceExecutionArn, rebasePreparation: f.reference, computerId: p.computerId,
         originalVolumeId: p.sourceVolumeId, fsUuid: p.fsUuid, sourceGeneration: p.sourceGeneration,
         sourceLeaseEpoch: p.sourceLeaseEpoch, sourceFenceToken: p.sourceFenceToken, fromDigest: p.fromDigest,

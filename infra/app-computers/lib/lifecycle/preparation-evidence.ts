@@ -1,6 +1,7 @@
-import { recoveryDeploymentFor, type LifecycleDeployment } from './deployment.js';
+import { recoveryBridgeDeploymentFor, recoveryDeploymentFor, type LifecycleDeployment } from './deployment.js';
 import { equal } from './contract.js';
 import { parseLease } from './lease.js';
+import { machineArn, parseImageRecoveryInput } from './recovery-contract.js';
 import type { LifecycleIntent } from './intent.js';
 import type { Snapshot } from '@aws-sdk/client-ec2';
 import type { Dependencies } from './aws.js';
@@ -71,8 +72,26 @@ export function preparationReceipt(i: PreparationDocument, digest: string, snaps
 export async function matchesLifecycleDeployment(i: LifecycleIntent, configured: LifecycleDeployment,
     deps: Pick<Dependencies, 'execution' | 'snapshots' | 'now'>): Promise<boolean> {
     if (equal(i.deployment, configured)) return true;
-    if (!i.rebasePreparation || !i.userData || !parseLease(i.userData).ebsRestore || !configured.preparationStateMachineVersionArn
+    if (!i.rebasePreparation || !i.userData || !configured.preparationStateMachineVersionArn
         || i.deployment.stateMachineVersionArn !== configured.stateMachineVersionArn) return false;
+    const permit = parseLease(i.userData).ebsRestore;
+    if (!permit) return false;
     const { document: p } = await verifyPreparation(i.rebasePreparation, configured.preparationStateMachineVersionArn, deps);
-    return equal(p.deployment, configured) && equal(i.deployment, recoveryDeploymentFor(p.sourceDeployment, p.deployment));
+    if (!equal(p.deployment, configured)) return false;
+    if (equal(i.deployment, recoveryDeploymentFor(p.sourceDeployment, p.deployment))) return true;
+    if (!i.deployment.recoveryStateMachineVersionArn
+        || !equal(i.deployment, recoveryBridgeDeploymentFor(p.sourceDeployment, p.deployment))) return false;
+
+    // A bridge rebind cannot be admitted by shape. Its actual successful V2 recovery must bind the same preparation.
+    const version = i.deployment.recoveryStateMachineVersionArn, machine = machineArn(version);
+    const name = 'computer-' + permit.recoveryJobId;
+    const arn = machine.replace(':stateMachine:', ':execution:') + ':' + name;
+    const recovery = await deps.execution(arn);
+    if (recovery.executionArn !== arn || recovery.stateMachineArn !== machine || recovery.stateMachineVersionArn !== version
+        || recovery.stateMachineAliasArn || recovery.redriveCount !== 0 || recovery.name !== name
+        || recovery.status !== 'SUCCEEDED' || !recovery.input) return false;
+    const { document } = parseImageRecoveryInput(recovery.input);
+    return document.schemaVersion === 2 && document.jobId === permit.recoveryJobId
+        && document.computerId === i.computerId && equal(document.deployment, i.deployment)
+        && equal(document.rebasePreparation, i.rebasePreparation);
 }

@@ -36,7 +36,7 @@ export interface RecoveryReceipt {
 }
 
 export const ImageRecoveryDocumentSchema = z.object({
-    schemaVersion: z.literal(1), jobId: UUID, imageJobId: UUID, sourceExecutionArn: z.string().max(300),
+    schemaVersion: z.union([z.literal(1), z.literal(2)]), jobId: UUID, imageJobId: UUID, sourceExecutionArn: z.string().max(300),
     rebasePreparation: PreparationReferenceSchema, computerId: UUID, originalVolumeId: VOL, fsUuid: UUID,
     sourceGeneration: COUNTER, sourceLeaseEpoch: COUNTER, sourceFenceToken: UUID, fromDigest: DIGEST,
     snapshotId: SNAP, deployment: LifecycleDeploymentSchema, createdAt: TIME,
