@@ -456,6 +456,40 @@ test('replace with a vanished previous instance relaunches onto the free retaine
     assert.deepEqual(r.calls.map(c=>c.action),['runInstances','createTags','attachVolume']);
     assert.equal(r.receipt.volumeId,r.f.state.volumes[0]!.VolumeId);
 });
+test('replace advances an existing pool claim fence with the canonical volume fence before attaching', async () => {
+    const f = lostPrevious(), volume = f.state.volumes[0]!;
+    volume.Tags!.push({ Key: 'ezil:computer', Value: f.i.computerId }, { Key: 'ezil:fence', Value: f.i.previousFenceToken! });
+    const describe = f.deps.volumes;
+    let sawMixedRetag = false;
+    f.deps.volumes = async selector => {
+        const rows = await describe(selector);
+        const tags = rows[0]?.Tags;
+        if (!sawMixedRetag && tags?.some(t => t.Key === 'ezil:fence-token' && t.Value === f.i.fenceToken)
+            && tags.some(t => t.Key === 'ezil:fence' && t.Value === f.i.fenceToken)) {
+            tags.find(t => t.Key === 'ezil:fence')!.Value = f.i.previousFenceToken!;
+            sawMixedRetag = true;
+        }
+        return rows;
+    };
+    const r = await run('replace', { fixture: f });
+    assert.equal(r.error, undefined, r.cause);
+    assert.deepEqual(r.calls.map(c => c.action), ['runInstances', 'createTags', 'attachVolume']);
+    assert.deepEqual(Object.fromEntries(r.calls[1]!.parameters.Tags.map((t: { Key: string; Value: string }) => [t.Key, t.Value])), {
+        'ezil:computer': f.i.computerId, 'ezil:generation': String(f.i.targetGeneration),
+        'ezil:fence': f.i.fenceToken, 'ezil:fence-token': f.i.fenceToken,
+    });
+    assert.ok(sawMixedRetag);
+    assert.ok(r.visited.includes('Wait'));
+});
+test('replace fails before provider mutations if a retained claim names a different source fence', async () => {
+    const f = lostPrevious();
+    f.state.volumes[0]!.Tags!.push({ Key: 'ezil:computer', Value: f.i.computerId },
+        { Key: 'ezil:fence', Value: '00000000-0000-4000-8000-000000000000' });
+    const r = await run('replace', { fixture: f });
+    assert.equal(r.error, 'LifecycleUnconfirmed');
+    assert.match(r.cause!, /lifecycle_volume_invalid/);
+    assert.deepEqual(r.calls, []);
+});
 test('replace with a vanished previous instance refuses a volume attached elsewhere',async()=>{
     const f=lostPrevious(),v=f.state.volumes[0]!;v.State='in-use';
     v.Attachments=[{InstanceId:'i-99999999999999999',VolumeId:v.VolumeId,State:'attached',Device:'/dev/sdf',DeleteOnTermination:false}];
