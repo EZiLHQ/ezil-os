@@ -1,4 +1,4 @@
-import { recoveryDeploymentFor } from './deployment.js';
+import { recoveryBridgeDeploymentFor, recoveryDeploymentFor } from './deployment.js';
 import type { Volume } from '@aws-sdk/client-ec2';
 import type { Dependencies } from './aws.js';
 import { EnvelopeSchema, equal, tagsFor } from './contract.js';
@@ -12,7 +12,10 @@ import { strictJson } from './strict-json.js';
 export async function verifyImageRecoverySource(i: ImageRecoveryDocument, deps: Pick<Dependencies, 'execution' | 'snapshots' | 'now'>) {
     const preparation = await verifyPreparation(i.rebasePreparation, i.deployment.preparationStateMachineVersionArn!, deps);
     const p = preparation.document, receipt = preparation.receipt;
-    if (!equal(i.deployment, recoveryDeploymentFor(p.sourceDeployment, p.deployment))
+    const restoreDeployment = i.schemaVersion === 2
+        ? recoveryBridgeDeploymentFor(p.sourceDeployment, p.deployment)
+        : recoveryDeploymentFor(p.sourceDeployment, p.deployment);
+    if (!equal(i.deployment, restoreDeployment)
         || i.imageJobId !== p.jobId || i.computerId !== p.computerId || i.originalVolumeId !== p.sourceVolumeId
         || i.fsUuid !== p.fsUuid || i.sourceGeneration !== p.sourceGeneration || i.sourceLeaseEpoch !== p.sourceLeaseEpoch
         || i.sourceFenceToken !== p.sourceFenceToken || i.fromDigest !== p.fromDigest || i.snapshotId !== receipt.snapshotId

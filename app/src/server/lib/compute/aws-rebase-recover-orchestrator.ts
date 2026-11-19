@@ -4,7 +4,7 @@ import { buildEnrollmentUserData, issueEnrollmentNonce } from './aws-enroll';
 import { parseEnrollmentUserData } from './aws-rebase-lease';
 import { readAwsEnrollUrl } from './aws-config';
 import { assertImageExecution, preparationFor, launchFor, verifyImageSnapshot, ImageLaunchReceiptSchema } from './aws-rebase-evidence';
-import { buildImageRecovery, recoveryFor, ImageRestoreReceiptSchema } from './aws-rebase-recovery';
+import { buildImageRecovery, recoveryBridgeDeploymentFor, recoveryFor, ImageRestoreReceiptSchema } from './aws-rebase-recovery';
 import { isDefiniteAwsRefusal, isExecutionAbsent, toAwsClientError } from './aws-errors';
 import { parseRebaseJson } from './aws-rebase-json';
 import type { ImageJob } from './aws-rebase-store';
@@ -38,17 +38,24 @@ export async function resumeImageRecovery(deps: ImageRebaseDeps, initial: ImageJ
     if (!j.recoveryDocument) {
         if (!mutate || !j.launchDocument || j.hostEvidence || !['failed', 'unconfirmed'].includes(j.phase)) throw new Error('operator_required');
         // Nullable legacy source records cannot authorize recovery or maintenance rebind (A1/A3).
-        const source = LifecycleDeploymentSchema.safeParse(preparationFor(j).intent.sourceDeployment);
+        const preparation = preparationFor(j).intent;
+        const source = LifecycleDeploymentSchema.safeParse(preparation.sourceDeployment);
         if (!source.success || !source.data.recoveryStateMachineVersionArn || !source.data.preparationStateMachineVersionArn
             || j.sourceRelease.agentCommit !== j.targetRelease.agentCommit) throw new Error('operator_required');
+        const target = preparation.deployment;
+        const bridgePin = deps.env.EZIL_AWS_IMAGE_RECOVERY_BRIDGE_V2, jobPrefix = j.jobId + ':';
+        // Existing jobs default to V1. An explicitly selected job requires the exact preparation digest.
+        const bridge = bridgePin?.startsWith(jobPrefix);
+        if (bridge && bridgePin !== jobPrefix + j.preparationDigest) throw new Error('operator_required');
+        const deployment = bridge ? recoveryBridgeDeploymentFor(source.data, target) : source.data;
         await checkpoint();
         const failed = await describe(launchFor(j));
         if (!failed || failed.status === 'RUNNING') throw new Error('writer_not_fenced');
-        const work = buildImageRecovery({ schemaVersion: 1, jobId: (deps.newId ?? randomUUID)(), imageJobId: j.jobId,
+        const work = buildImageRecovery({ schemaVersion: bridge ? 2 : 1, jobId: (deps.newId ?? randomUUID)(), imageJobId: j.jobId,
             sourceExecutionArn: j.launchExecutionArn!, rebasePreparation: { v: 1, preparationJobId: j.jobId,
                 executionArn: j.preparationExecutionArn!, digest: j.preparationDigest }, computerId: j.computerId,
             originalVolumeId: j.sourceVolumeId, fsUuid: j.fsUuid, sourceGeneration: j.sourceGeneration, sourceLeaseEpoch: j.sourceLeaseEpoch,
-            sourceFenceToken: j.sourceFenceToken, fromDigest: j.fromDigest, snapshotId: j.snapshotId!, deployment: source.data, createdAt: now().toISOString() });
+            sourceFenceToken: j.sourceFenceToken, fromDigest: j.fromDigest, snapshotId: j.snapshotId!, deployment, createdAt: now().toISOString() });
         j = await deps.store.admitRecovery(j, work, failed, now());
     }
     if (!j.rebindDocument) {

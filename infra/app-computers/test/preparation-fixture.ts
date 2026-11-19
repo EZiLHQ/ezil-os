@@ -19,7 +19,7 @@ export function preparationFixture(f = rebaseFixture()) {
         Attachments: [{ InstanceId: i.sourceInstanceId, VolumeId: i.sourceVolumeId, Device: '/dev/sdf', State: 'attached', DeleteOnTermination: false }] };
     state.instances.push(instance); state.volumes.push(volume);
     state.executions[f.reference.executionArn] = { executionArn: f.reference.executionArn,
-        stateMachineArn: d.preparationStateMachineVersionArn!.replace(/:1$/, ''), stateMachineVersionArn: d.preparationStateMachineVersionArn,
+        stateMachineArn: d.preparationStateMachineVersionArn!.replace(/:[1-9][0-9]*$/, ''), stateMachineVersionArn: d.preparationStateMachineVersionArn,
         name: 'computer-' + i.jobId, status: 'RUNNING', startDate: new Date(state.now), redriveCount: 0, input: JSON.stringify(f.preparationEnvelope) };
     const settings = SettingsSchema.parse({ deployment: d, authorityOrigin: 'https://control.example',
         authoritySecretArn: 'arn:aws:secretsmanager:ap-south-1:123456789012:secret:ezil/pilot/lifecycle-key-abcdef' });
