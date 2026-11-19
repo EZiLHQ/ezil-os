@@ -1,13 +1,69 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { HistoryEvent } from '@aws-sdk/client-sfn';
-import { proveHistoricalSource, reconcileReplacementWithHistoricalSource, terminationWitnessed } from './aws-historical-source';
+import { findRetiredSourceProof, proveHistoricalSource, reconcileReplacementWithHistoricalSource, terminationWitnessed } from './aws-historical-source';
 import { historicalSourceSetup, releaseHistory, REPLACE_JOB } from './aws-historical-source.test-support';
+import { buildAdoptRecoveryWork } from './aws-pool-recovery';
+import { lifecycleExecutionArn } from './aws-receipts';
 import { ImageJobConflictError } from './placement';
 
 type Setup = Awaited<ReturnType<typeof historicalSourceSetup>>;
 const run = (s: Setup) => reconcileReplacementWithHistoricalSource(s.deps, s.deployments, s.request);
 const untouched = (s: Setup) => expect(s.placements[0]).toMatchObject({ state: 'UNCONFIRMED', generation: s.replace.intent.targetGeneration,
     lease_epoch: s.replace.intent.leaseEpoch, lifecycle_job_id: REPLACE_JOB, instance_id: null });
+
+describe('automatic historical release discovery', () => {
+    async function discovery() {
+        const s = await historicalSourceSetup();
+        const stopped = { ...s.stopped, updatedAt: s.releaseExecution.stopDate! };
+        const listSucceeded = vi.fn(async (): Promise<readonly string[] | null> => [s.releaseArn]);
+        const executions = { ...s.executions, listSucceeded };
+        const oldVersion = s.release.stateMachineArn;
+        const active = { ...s.deployment, stateMachineVersionArn: `${oldVersion.slice(0, oldVersion.lastIndexOf(':'))}:99` };
+        const find = (versions: readonly string[] = [oldVersion], now = s.deps.now!()) =>
+            findRetiredSourceProof(executions, stopped, active, versions, now);
+        return { ...s, stopped, listSucceeded, executions, oldVersion, active, find };
+    }
+
+    it('proves one retained release by exact placement and full history', async () => {
+        const s = await discovery();
+        expect(await s.find()).toEqual({ releaseExecutionArn: s.releaseArn });
+        expect(s.listSucceeded).toHaveBeenCalledExactlyOnceWith(s.active.region, s.oldVersion.slice(0, s.oldVersion.lastIndexOf(':')), {
+            oldest: new Date(s.stopped.updatedAt.getTime() - 3_600_000), newest: s.deps.now!(),
+        });
+        expect(s.executions.describe).toHaveBeenCalledExactlyOnceWith(s.active.region, s.releaseArn);
+        expect(s.executions.history).toHaveBeenCalledExactlyOnceWith(s.active.region, s.releaseArn);
+    });
+
+    it('does not infer retirement when the exact version is absent or the termination witness is missing', async () => {
+        const s = await discovery();
+        expect(await s.find([])).toBeNull();
+        expect(s.executions.history).not.toHaveBeenCalled();
+        s.histories.set(s.releaseArn, s.histories.get(s.releaseArn)!.slice(0, -1));
+        expect(await s.find()).toBeNull();
+        expect(s.executions.history).toHaveBeenCalledExactlyOnceWith(s.active.region, s.releaseArn);
+    });
+
+    it('refuses two canonically bound release candidates before reading history', async () => {
+        const s = await discovery();
+        const second = buildAdoptRecoveryWork({ ...s.release.intent, jobId: '11111111-1111-4111-8111-111111111111' });
+        const arn = lifecycleExecutionArn(s.active, second.intent.jobId);
+        s.executionMap.set(arn, { ...s.releaseExecution, executionArn: arn, input: second.input,
+            output: JSON.stringify({ ...JSON.parse(s.releaseExecution.output!), jobId: second.intent.jobId, digest: second.digest }) });
+        s.listSucceeded.mockResolvedValueOnce([s.releaseArn, arn]);
+        expect(await s.find()).toBeNull();
+        expect(s.executions.describe).toHaveBeenCalledTimes(2);
+        expect(s.executions.history).not.toHaveBeenCalled();
+    });
+
+    it('fails closed on an incomplete scan or a placement outside the retention window', async () => {
+        const s = await discovery();
+        s.listSucceeded.mockResolvedValueOnce(null);
+        expect(await s.find()).toBeNull();
+        expect(await s.find([s.oldVersion], new Date(s.stopped.updatedAt.getTime() + 90 * 86_400_000))).toBeNull();
+        expect(s.listSucceeded).toHaveBeenCalledOnce();
+        expect(s.executions.describe).not.toHaveBeenCalled();
+    });
+});
 
 describe('reconcile-replacement with an authenticated historical source (1.0.16 canary shape)', () => {
     it('settles the vanished released source to its proven generation, keeps the epoch, revokes job authority, fences the tunnel, starts nothing', async () => {

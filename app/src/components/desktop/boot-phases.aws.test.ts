@@ -69,9 +69,8 @@ describe.each([['app', app], ['shell', shell]] as const)('%s stop-hold copy', (_
     });
 });
 
-// Acceptance 1.0.34: the server refuses an open whose volume is on another lower (`computer_rebase_required`)
-// instead of spending a host that refuses it. The answer is the same on every re-ask until an operator update,
-// so it is never retried silently, and the copy names the real route (Send feedback), never a button or a retry.
+// When an on-open image update is unavailable, the terminal response keeps the
+// workspace and gives the user a way to report the reason.
 describe.each([['app', app], ['shell', shell]] as const)('%s computer update copy', (_name, boot) => {
     it('computer_rebase_required is terminal, keeps files and names the update route', () => {
         expect(boot.computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: 'computer_rebase_required' }))
@@ -80,8 +79,8 @@ describe.each([['app', app], ['shell', shell]] as const)('%s computer update cop
         const copy = boot.BOOT_FAILURE_COPY.computer_update_required;
         expect(copy.title).toBe('Your computer needs an update before it can start');
         expect(copy.body).toContain('Your files are kept.');
+        expect(copy.body).toContain("Automatic update isn't available for this computer.");
         expect(copy.body).toContain('Send feedback');
-        expect(copy.body).toContain('Try again only checks');
         expect(copy.body).not.toMatch(/retrying usually fixes|something went wrong|upgrade your plan|buy more/i);
     });
 });

@@ -1,16 +1,24 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { defaultAwsCollaborators } from '@/server/api/routers/compute-dispatch';
+import { defaultAwsCollaborators, imageRebaseDependencies, imageUpdateTier } from '@/server/api/routers/compute-dispatch';
+import { getBillingDeps } from '@/server/billing/deps';
+import { gateComputerStart } from '@/server/billing/v2/compute-access';
 import { db } from '@/server/db';
 import { createPoolDeps } from '@/server/lib/compute/aws-pool-runtime';
 import { runAwsBackgroundReconcile } from '@/server/lib/compute/aws-receipts';
+import { advanceAutomaticImageRebase, listAutomaticImageRebaseCandidates, loadAutomaticImageRebase } from '@/server/lib/compute/aws-auto-image-rebase';
 import { GET, maxDuration } from './route';
 
 const mockEnv = vi.hoisted(() => ({ CRON_SECRET: undefined as string | undefined }));
 vi.mock('@/env', () => ({ env: mockEnv }));
 vi.mock('@/server/db', () => ({ db: {} }));
-vi.mock('@/server/api/routers/compute-dispatch', () => ({ defaultAwsCollaborators: vi.fn() }));
+vi.mock('@/server/api/routers/compute-dispatch', () => ({ defaultAwsCollaborators: vi.fn(), imageRebaseDependencies: vi.fn(), imageUpdateTier: vi.fn() }));
+vi.mock('@/server/billing/deps', () => ({ getBillingDeps: vi.fn() }));
+vi.mock('@/server/billing/v2/compute-access', () => ({ gateComputerStart: vi.fn() }));
+vi.mock('@/server/lib/compute/aws-auto-image-rebase', () => ({
+    advanceAutomaticImageRebase: vi.fn(), listAutomaticImageRebaseCandidates: vi.fn(), loadAutomaticImageRebase: vi.fn(),
+}));
 vi.mock('@/server/lib/compute/aws-pool-runtime', () => ({ createPoolDeps: vi.fn() }));
 vi.mock('@/server/lib/compute/aws-receipts', () => ({ runAwsBackgroundReconcile: vi.fn() }));
 
@@ -21,6 +29,7 @@ const untouched = () => {
     expect(defaultAwsCollaborators).not.toHaveBeenCalled();
     expect(createPoolDeps).not.toHaveBeenCalled();
     expect(runAwsBackgroundReconcile).not.toHaveBeenCalled();
+    expect(listAutomaticImageRebaseCandidates).not.toHaveBeenCalled();
 };
 
 beforeEach(() => {
@@ -28,6 +37,7 @@ beforeEach(() => {
     mockEnv.CRON_SECRET = 'cron';
     vi.stubEnv('EZIL_AWS_COMPUTERS_ENABLED', '1');
     vi.mocked(defaultAwsCollaborators).mockReturnValue({});
+    vi.mocked(imageRebaseDependencies).mockReturnValue(null);
     vi.mocked(runAwsBackgroundReconcile).mockResolvedValue({ ok: true,
         deleted: { checked: 0, retiresStarted: 0, retired: 0, stuck: 0 }, fleet: { checked: 2, stopsStarted: 1, limitStops: 0, hostRetires: 0 } });
 });
@@ -83,6 +93,27 @@ describe('GET /api/cron/aws-reconcile', () => {
     it('propagates a failed pass so the timer client (curl -f) reports it', async () => {
         vi.mocked(runAwsBackgroundReconcile).mockRejectedValue(new Error('db unavailable'));
         await expect(GET(request('Bearer cron'))).rejects.toThrow('db unavailable');
+    });
+
+    it('advances only an already-reserved, billed image job with the same identity', async () => {
+        const deps = {};
+        const billing = { now: () => new Date('2026-11-19') };
+        const candidate = (id: string) => ({ computerId: id, ownerUserId: 'owner', jobId: id });
+        const active = { computerId: 'owned', instanceType: 't3a.medium', phase: 'snapshot_ready', authority: { jobId: 'owned' } };
+        vi.mocked(imageRebaseDependencies).mockReturnValue(deps as never);
+        vi.mocked(getBillingDeps).mockReturnValue(billing as never);
+        vi.mocked(listAutomaticImageRebaseCandidates).mockResolvedValue(['fresh', 'other', 'blocked', 'denied', 'owned'].map(candidate));
+        vi.mocked(loadAutomaticImageRebase).mockImplementation(async (_deps, computer) => ({
+            ...active, computerId: computer.id, authority: { jobId: computer.id === 'other' ? 'different' : computer.id },
+            phase: computer.id === 'fresh' ? null : computer.id === 'blocked' ? 'blocked' : active.phase,
+        } as never));
+        vi.mocked(gateComputerStart).mockImplementation(async input =>
+            input.computerId === 'denied' ? { allowed: false, reason: 'billing_unavailable' } : { allowed: true });
+        vi.mocked(imageUpdateTier).mockResolvedValue('ready');
+        vi.mocked(advanceAutomaticImageRebase).mockResolvedValue('pending');
+        const res = await GET(request('Bearer cron'));
+        expect(await res.json()).toMatchObject({ imageUpdates: { checked: 5, errors: 0 } });
+        expect(advanceAutomaticImageRebase).toHaveBeenCalledExactlyOnceWith(deps, active);
     });
 });
 

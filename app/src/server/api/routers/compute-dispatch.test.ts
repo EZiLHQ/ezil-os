@@ -363,6 +363,16 @@ describe('shell-facing AWS answers', () => {
         expect(awsStatusAnswer({ ok: true, error: 'computer_migrating' })).not.toHaveProperty('computeMigrating');
     });
 
+    it('an automatic image update waits without a preview, pool preparation or provider-migration flag', async () => {
+        const preview = vi.fn(), prepare = vi.fn();
+        await expect(awsPreviewAnswer({ ok: false, error: 'computer_image_updating', errorCode: 'computer_image_updating', retryable: true }, preview, prepare))
+            .resolves.toMatchObject({ ok: false, errorCode: 'sandbox_starting', computeUpdating: true, computeProvider: 'aws-ec2' });
+        const refusal = await awsPreviewAnswer({ ok: false, error: 'computer_rebase_required', errorCode: 'computer_rebase_required', retryable: false }, preview, prepare);
+        expect(refusal).not.toHaveProperty('computeUpdating');
+        expect(preview).not.toHaveBeenCalled();
+        expect(prepare).not.toHaveBeenCalled();
+    });
+
     it('a deterministic refusal keeps its own code (capacity is never dressed up as waking)', async () => {
         expect(shellCodeForAwsEnsure({ ok: false, error: 'region_capacity', errorCode: 'capacity_unavailable', retryable: false })).toBe('capacity_unavailable');
         expect(shellCodeForAwsEnsure({ ok: false, error: 'x', errorCode: 'computer_starting', retryable: false })).toBe('computer_starting');

@@ -126,6 +126,7 @@ test('item 9: app caller can only start the exact lifecycle version, read its co
     assert.deepEqual(json(appCallerStatements(R, [VERSION], HISTORY_KEY)), [
         // Step Functions authorizes a version start on the unqualified machine ARN only (measured live).
         { Effect: 'Allow', Action: 'states:StartExecution', Resource: `arn:aws:states:${R}:${A}:stateMachine:ezil-pilot-lifecycle` },
+        { Effect: 'Allow', Action: 'states:ListExecutions', Resource: `arn:aws:states:${R}:${A}:stateMachine:ezil-pilot-lifecycle` },
         { Effect: 'Allow', Action: 'states:DescribeExecution', Resource: `arn:aws:states:${R}:${A}:execution:ezil-pilot-lifecycle:computer-*` },
         { Effect: 'Allow', Action: 'states:GetExecutionHistory', Resource: `arn:aws:states:${R}:${A}:execution:ezil-pilot-lifecycle:computer-*` },
         // DescribeExecution on a CMK-encrypted machine needs the caller's kms:Decrypt (Step Functions docs).

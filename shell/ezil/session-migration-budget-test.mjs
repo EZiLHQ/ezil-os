@@ -2,11 +2,12 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { JSDOM } from 'jsdom';
 import { openDesktop, previewUrl, withWakeAndOneRetry, pendingOrRefused,
-    isComputeMigrating, MIGRATION_DEADLINE_MS } from './session.js';
+    isComputeMigrating, isComputeUpdating, MIGRATION_DEADLINE_MS } from './session.js';
 import { AppSpinner } from './ui/app-spinner.js';
 
 const pending = { ok: false, errorCode: 'sandbox_starting', computeProvider: 'aws-ec2' };
 const moving = { ...pending, computeMigrating: true };
+const updating = { ...pending, error: 'computer_image_updating', computeUpdating: true };
 const ready = { ok: true, guacamoleUrl: 'https://desktop.example/', appPreviewUrl: 'https://app.example/' };
 
 async function run(t, { answer = () => moving, open = openDesktop, requestMs = 0, frozen = false, onWait } = {}) {
@@ -38,6 +39,20 @@ for (const [name, open] of [['Desktop', openDesktop], ['Preview', previewUrl],
         assert.equal(out.result.computeMigrating, true);
         assert.equal(isComputeMigrating('migration-computer'), false);
     });
+    test(`${name}: an image update gets the full ten-minute budget without reporting a paid migration`, async t => {
+        let observed = false;
+        const out = await run(t, { open, answer: () => updating, onWait: () => {
+            if (isComputeUpdating('migration-computer')) observed = true;
+            assert.equal(isComputeMigrating('migration-computer'), false);
+            assert.equal(isComputeUpdating('other-computer'), false);
+        } });
+        assert.equal(observed, true);
+        assert.equal(out.elapsed, 600_000);
+        assert.equal(out.asks, 401);
+        assert.equal(out.result.errorCode, 'sandbox_starting');
+        assert.equal(out.result.computeUpdating, true);
+        assert.equal(isComputeUpdating('migration-computer'), false);
+    });
 }
 
 test('migration clock starts at the first flagged answer, not at window open', async t => {
@@ -61,6 +76,13 @@ test('migration plus first boot can succeed beyond the old 215s cutoff', async t
     assert.equal(out.elapsed, 390_000);
 });
 
+test('image update can arrive late and returns to a full wake budget when it finishes', async t => {
+    const out = await run(t, { answer: ({ now }) => now < 90_000 ? pending : now < 678_000 ? updating : now < 870_000 ? pending : ready });
+    assert.equal(out.result.ok, true);
+    assert.equal(out.elapsed, 870_000);
+    assert.equal(isComputeUpdating('migration-computer'), false);
+});
+
 test('repeated flags cannot restart the migration or resumed wake deadlines', async t => {
     const out = await run(t, { answer: ({ now }) => now === 300_000 || now === 450_000 ? pending : moving });
     assert.equal(out.elapsed, 516_000);
@@ -79,6 +101,7 @@ for (const [name, answer, cap] of [
     ['unlabelled', () => ({ ...pending, computeProvider: undefined }), 40],
     ['ordinary AWS', () => pending, 146],
     ['migration', () => moving, 402],
+    ['image update', () => updating, 402],
     ['resumed AWS', ({ asks }) => asks <= 300 ? moving : pending, 446],
 ]) {
     test(`${name}: frozen clock still stops at the deadline-derived issue cap (${cap})`, async t => {
@@ -102,6 +125,17 @@ test('migration flag alone cannot relabel another provider or retry a terminal r
     assert.equal(out.asks, 40);
     const refused = await withWakeAndOneRetry(async () => ({ ...moving, errorCode: 'code_preview_unavailable' }), 'refused');
     assert.equal(refused.errorCode, 'code_preview_unavailable');
+});
+
+test('the update signal cannot relabel another provider or a terminal refusal', async t => {
+    const out = await run(t, { answer: () => ({ ...updating, computeProvider: 'cloudflare' }) });
+    assert.equal(out.asks, 40);
+    let asks = 0;
+    const refused = await withWakeAndOneRetry(async () => { asks++; return { ...updating, errorCode: 'computer_rebase_required' }; },
+        'refused', 'migration-computer');
+    assert.equal(refused.errorCode, 'computer_rebase_required');
+    assert.equal(asks, 1);
+    assert.equal(isComputeUpdating('migration-computer'), false);
 });
 
 test('migration preserves the one automatic retry for a genuine post-move failure', async t => {

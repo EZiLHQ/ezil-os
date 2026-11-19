@@ -21,6 +21,7 @@ const copies = {
     unavailable: ['Opening', ''],
     paused: ['Computer startup is temporarily paused', 'Check this view later for an update.'],
     moving: ['Getting your AWS computer'],
+    updating: ['Updating your computer', 'Your workspace files are kept. This can take several minutes.'],
     launching: ['A machine is ready and starting up.'],
     both: ['Getting your AWS computer'],
 };
@@ -49,14 +50,15 @@ async function open(t, app, initialMode = 'moving') {
         const path = String(raw);
         let body = { ok: true };
         if (path.includes('/api/trpc/computer.progress')) {
-            const stage = mode === 'attention' ? 'needs_operator' : mode === 'unavailable' ? 'unavailable' : mode === 'paused' ? 'operations_paused' : ['moving','both'].includes(mode) ? 'provisioning' : mode === 'waking' ? 'mounting' : 'starting';
-            body = {result:{data:{json:{version:1,computerId:'computer-1',stage,recordedStage:mode==='attention'?'unconfirmed':'provisioning',operationsPaused:mode==='paused',active:mode!=='paused',operation:['moving','both','paused'].includes(mode)?'migration':'opening',durable:['moving','both','paused'].includes(mode),resumePolicy:'saved_workspace_only',bytes:{transferred:null,total:null},percent:null,etaSeconds:null}}}};
+            const stage = mode === 'attention' ? 'needs_operator' : mode === 'unavailable' ? 'unavailable' : mode === 'paused' ? 'operations_paused' : ['moving','both'].includes(mode) ? 'provisioning' : mode === 'waking' ? 'mounting' : mode === 'updating' ? 'stopped' : 'starting';
+            body = {result:{data:{json:{version:1,computerId:'computer-1',stage,recordedStage:mode==='attention'?'unconfirmed':'provisioning',operationsPaused:mode==='paused',active:!['paused','updating'].includes(mode),operation:['moving','both','paused'].includes(mode)?'migration':'opening',durable:['moving','both','paused'].includes(mode),resumePolicy:'saved_workspace_only',bytes:{transferred:null,total:null},percent:null,etaSeconds:null}}}};
         } else if (['/api/shell/desktop', '/api/shell/code-preview-url', '/api/shell/preview-url'].includes(path) && init.method === 'POST') {
             asks[path.includes('code') ? 'code' : path.includes('preview') ? 'preview' : 'desktop']++;
             body = mode === 'ready'
                 ? { ok: true, guacamoleUrl: 'https://viewer.example/?embed=1', codePreviewUrl: 'https://code.example/', appPreviewUrl: 'https://preview.example/', frame: { confirmed: true } }
                 : { ok: false, errorCode: mode === 'attention' ? 'computer_recovering' : 'sandbox_starting', computeProvider: 'aws-ec2',
                     ...(['moving', 'both'].includes(mode) ? { computeMigrating: true } : {}),
+                    ...(mode === 'updating' ? { error: 'computer_image_updating', retryable: true, computeUpdating: true } : {}),
                     ...(['launching', 'both'].includes(mode) ? { computeLaunching: true } : {}) };
         } else if (path.includes('confirm=frame')) { if (frameGate) await frameGate; body = { ok: true, confirmed: true, status: 200 }; }
         else if (path.startsWith('/api/shell/desktop')) body = { ok: true, guacamoleRunning: false };
@@ -77,7 +79,7 @@ async function open(t, app, initialMode = 'moving') {
     const win = await until(() => w.document.querySelector(`.window[data-app="${app}"]`));
     const spinner = win.querySelector('.ezil-app-spinner');
     await until(() => initialMode === 'unavailable' ? label(spinner).startsWith('Opening ') && spinner.dataset.progress === 'unavailable'
-        : ['attention', 'paused'].includes(initialMode) ? label(spinner) === copies[initialMode][0]
+        : ['attention', 'paused', 'updating'].includes(initialMode) ? label(spinner) === copies[initialMode][0]
         : label(spinner) === TITLES[app] && line(spinner).textContent === copies[initialMode][0]);
     const holdFrame = () => { let release; frameGate = new Promise(r => { release = r; }); return () => { frameGate = null; release(); }; };
     return { w, win, spinner, asks, holdFrame, setMode: m => { mode = m; }, setNow: ms => { now = ms; } };
@@ -113,6 +115,32 @@ for (const app of ['code', 'desktop', 'preview']) {
         assert.equal(h.spinner.querySelector('ol'), null);
         assert.equal(h.spinner.querySelector('.ezil-app-spinner-sub').textContent, copies.paused[1]);
         assert.doesNotMatch(h.spinner.textContent, /Moving your computer|\d+%/);
+    });
+    test(`${app}: image update has its own copy and a fresh wake budget after completion`, async t => {
+        const h = await open(t, app, 'updating');
+        assert.equal(line(h.spinner).textContent, copies.updating[1]);
+        assert.equal(h.spinner.querySelector('.ezil-opening-bar').dataset.indeterminate, 'true');
+        assert.equal(h.spinner.querySelector('.ezil-boot-actions').hidden, true);
+        assert.doesNotMatch(h.spinner.textContent, /Moving your computer|Getting your AWS computer/);
+        h.setNow(570_000);
+        await wait(20);
+        assert.equal(label(h.spinner), copies.updating[0]);
+        h.setMode('waking');
+        await until(() => label(h.spinner) === TITLES[app] && line(h.spinner).textContent === 'Your files are attached. The desktop is starting.');
+        h.setNow(760_000);
+        h.setMode('ready');
+        await until(() => h.win.querySelector('.window-app-iframe')?.src?.startsWith('https://'));
+        assert.ok(h.asks[app] > 1);
+    });
+    test(`${app}: an image update that uses its whole wait keeps its own retry copy`, async t => {
+        const h = await open(t, app, 'updating');
+        h.setNow(600_000);
+        await until(() => label(h.spinner) === 'Your computer update is taking longer');
+        assert.equal(h.spinner.querySelector('.ezil-boot-actions').hidden, false);
+        assert.match(line(h.spinner).textContent, /Your workspace files are kept/);
+        const asks = h.asks[app];
+        await wait(30);
+        assert.equal(h.asks[app], asks, 'a spent image update budget did not produce another mint loop');
     });
     for (const mode of ['moving', 'launching']) {
         test(`${app}: built loader shows ${mode} copy, then ordinary progress and a ready frame beyond the old deadline`, async t => {

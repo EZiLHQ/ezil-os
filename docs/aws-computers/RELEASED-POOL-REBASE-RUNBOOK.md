@@ -2,6 +2,19 @@
 
 This covers a STOPPED computer whose warm-pool host was released: the pool row is `retired` and the EC2 instance has been terminated and aged out. Design R; rationale is in the PR. This document authorizes nothing. Each real run needs its own approved window, lease and gate.
 
+## On-open image updates
+
+Enable `EZIL_AWS_AUTO_IMAGE_REBASE=1` on a deployment after staging has qualified its active image and pinned
+workflows together. A normal Code or Desktop open can then reserve an update for the owner's stopped AWS
+computer when its measured lower matches the active release's retained predecessor. The app reuses the
+snapshot, writer-fence, enrollment, and health checks below. The browser reports update progress, and the
+AWS reconcile timer can advance an already-reserved update after the browser closes.
+
+For an aged-out source, the app can look up the completed release on the regional lifecycle machine. The
+bounded lookup must find one exact retained execution and pass the same history checks as an operator
+hint. Ambiguous or expired history leaves the workspace held. An unknown recorded lower still requires
+[measured attestation](NULL-LOWER-ATTESTATION-RUNBOOK.md).
+
 ## When this path applies
 `plan`/`prepare` switch to the released-pool source only when the server finds, under the admission lock, the retired claim row of exactly this allocation:
 - the computer, instance, region and zone;

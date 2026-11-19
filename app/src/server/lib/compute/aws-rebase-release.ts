@@ -63,7 +63,7 @@ export function rebaseReleaseCandidates(entry: unknown, lowerImageDigest: string
     if (targets.length !== 1 || sources.length === 0) throw new Error('release_mismatch');
     const target = RebaseReleaseSchema.parse(targets[0]);
     const repository = target.lowerImageRef.split('@')[0]!;
-    return { sources, target, deployment, repository };
+    return { sources, target, deployment, repository, records };
 }
 
 /** A1/B2: an AMI is provider evidence, never HTTP input; a unique lower needs no observation.

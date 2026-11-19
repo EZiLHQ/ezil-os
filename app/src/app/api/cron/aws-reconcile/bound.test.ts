@@ -21,7 +21,7 @@ vi.mock('@/server/api/routers/compute-dispatch', () => ({ defaultAwsCollaborator
     starter: { start: forbidden.start }, executions: { describe: forbidden.describe },
     tunnels: { createTunnel: forbidden.createTunnel, deleteTunnel: forbidden.deleteTunnel },
     describer: { describeForEnrollment: forbidden.describeForEnrollment },
-    meter: { ready: forbidden.ready, stopped: forbidden.stopped, heartbeat: forbidden.heartbeat } }) }));
+    meter: { ready: forbidden.ready, stopped: forbidden.stopped, heartbeat: forbidden.heartbeat } }), imageRebaseDependencies: () => null }));
 vi.mock('@/server/lib/compute/aws-pool-runtime', () => ({ createPoolDeps: () => ({}) }));
 vi.mock('@/server/lib/compute/placement', async (original) => ({
     ...(await original<typeof import('@/server/lib/compute/placement')>()),

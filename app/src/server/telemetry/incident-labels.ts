@@ -30,7 +30,7 @@ export const KNOWN_CODES: ReadonlySet<string> = new Set([
     'aws_desktop_unreachable', 'aws_error', 'aws_throttled', 'aws_unavailable', 'bc', 'body_too_large',
     'boot_refused', 'c', 'capabilities_require_same_origin', 'card_declined', 'cf_api_403', 'code',
     'code_preview_url_missing', 'collapse_threw', 'commit_in_progress', 'commit_unavailable', 'computer_moving',
-    'computer_rebase_required', 'confirm_ok', 'connect_failed', 'container_running', 'credentials_unavailable',
+    'computer_image_updating', 'computer_rebase_required', 'confirm_ok', 'connect_failed', 'container_running', 'credentials_unavailable',
     'custom', 'deadline', 'decor_still_present', 'disabled', 'display', 'display_live', 'drawer_attach_failed',
     'drawer_handler_threw', 'enqueue_failed', 'error', 'event_conflict', 'export_failed', 'export_head_invalid',
     'export_host_mismatch', 'export_refused', 'failed', 'frame_not_answering', 'gateway_error', 'ghp_', 'head_moved',

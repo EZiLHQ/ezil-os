@@ -63,6 +63,8 @@ import { usageFor, utcMonthStart, type MonthUsage } from './usage';
 
 /** Read-only `DescribeExecution` in the placement's region (Step Functions). */
 export interface LifecycleExecutionReader {
+    /** Discovery only. Null means the bounded result is incomplete or untrustworthy. */
+    listSucceeded?(region: string, stateMachineArn: string, window: { oldest: Date; newest: Date }): Promise<readonly string[] | null>;
     /** Complete, bounded execution history, read with the same regional caller. */
     history?(region: string, executionArn: string): Promise<import("@aws-sdk/client-sfn").HistoryEvent[]>;
     describe(

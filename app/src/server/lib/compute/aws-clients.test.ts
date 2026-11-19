@@ -185,6 +185,43 @@ describe('Step Functions starter', () => {
 });
 
 describe('Step Functions execution reader', () => {
+    const machine = VERSION.slice(0, VERSION.lastIndexOf(':'));
+    const at = (minutes: number) => new Date(NOW.getTime() + minutes * 60_000);
+    const window = { oldest: at(-60), newest: NOW };
+    const item = (start: number, stop: number, arn = EXECUTION) => ({ executionArn: arn, stateMachineArn: machine,
+        status: 'SUCCEEDED', startDate: at(start), stopDate: at(stop) });
+
+    it('lists only bounded successful executions of the one lifecycle machine', async () => {
+        const sfn = fakeSender(c => input(c).nextToken
+            ? { executions: [item(-10, -9), item(-61, -60)], nextToken: 'past-window' }
+            : { executions: [item(1, 2), item(-1, 1)], nextToken: 'second' });
+        expect(await createSfnExecutionReader(regional(sfn)).listSucceeded!(R, machine, window)).toEqual([EXECUTION]);
+        expect(sfn.calls.map(cmdName)).toEqual(['ListExecutionsCommand', 'ListExecutionsCommand']);
+        expect(sfn.calls.map(input)).toEqual([undefined, 'second'].map(nextToken => ({ stateMachineArn: machine,
+            statusFilter: 'SUCCEEDED', maxResults: 100, nextToken })));
+    });
+
+    it('rejects non-lifecycle machines and cross-account or cross-region list requests before sending', async () => {
+        const sfn = fakeSender(() => ({}));
+        const list = createSfnExecutionReader(regional(sfn)).listSucceeded!;
+        await expect(list(R, VERSION, window)).rejects.toMatchObject({ awsName: 'LifecycleMachineArnInvalid' });
+        await expect(list(R, machine.replace('-lifecycle', '-recovery'), window)).rejects.toMatchObject({ awsName: 'LifecycleMachineArnInvalid' });
+        await expect(list('ap-south-1', machine, window)).rejects.toMatchObject({ awsName: 'LifecycleMachineArnInvalid' });
+        await expect(list(R, machine.replace(A, '999999999999'), window)).rejects.toMatchObject({ awsName: 'ExecutionAccountMismatch' });
+        expect(sfn.calls).toHaveLength(0);
+    });
+
+    it('fails closed if five pages cannot reach the window, or there are too many matching names', async () => {
+        let page = 0;
+        const newer = fakeSender(() => ({ executions: [item(10 - page, 11 - page)], nextToken: String(++page) }));
+        expect(await createSfnExecutionReader(regional(newer)).listSucceeded!(R, machine, window)).toBeNull();
+        expect(newer.calls).toHaveLength(5);
+        const crowded = fakeSender(() => ({ executions: Array.from({ length: 21 }, (_, n) =>
+            item(-10 - n, -9 - n, EXECUTION.slice(0, -2) + n.toString(16).padStart(2, '0'))) }));
+        expect(await createSfnExecutionReader(regional(crowded)).listSucceeded!(R, machine, window)).toBeNull();
+        expect(crowded.calls).toHaveLength(1);
+    });
+
     it('passes valid execution stopDate through and drops invalid or absent times', async () => {
         for (const [stopDate, expected] of [[NOW, NOW], [new Date('nope'), null], ['2026-10-14', null], [undefined, null]] as const) {
             const sfn = fakeSender(() => ({ status: 'SUCCEEDED', stopDate }));

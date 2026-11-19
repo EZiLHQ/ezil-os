@@ -241,8 +241,8 @@ const MAX_ISSUES = 40;
 // AWS pending responses return immediately, unlike Cloudflare's held wake
 // requests. Allow the full existing 215s deadline at the 1.5s polling cadence.
 const AWS_MAX_ISSUES = Math.ceil(WAKE_DEADLINE_MS / WAKE_REASK_MS) + 2;
-// A paid upgrade includes host provisioning and workspace/system restore.
-// Count from the first migration answer, then allow a full ordinary AWS wake.
+// A paid upgrade or an image update may restore the workspace before the computer can start.
+// Count from the first migration/update answer, then allow a full ordinary AWS wake.
 export const MIGRATION_DEADLINE_MS = 10 * 60_000;
 // A replacement AMI boot gets one bounded budget, retained after enrollment. Both match the
 // loader's 10-minute calm ceiling; a stalled pool adoption self-recovers well inside it.
@@ -288,6 +288,7 @@ const TRPC_ENDPOINT = '/api/trpc';
 // Per-request observations let a window show a warm request's progress too.
 // Concurrent opens cannot clear one another's still-active migration signal.
 const migratingRequests = new Map();
+const updatingRequests = new Map();
 const launchingRequests = new Map();
 /**
  * Phase B: in-flight asks whose last answer said the computer's files are moving (`computeMoving`), each with the
@@ -309,6 +310,9 @@ export function isComputePreparing (computerId) {
 }
 export function isComputeMigrating (computerId) {
     return !!computerId && [...migratingRequests.values()].includes(computerId);
+}
+export function isComputeUpdating (computerId) {
+    return !!computerId && [...updatingRequests.values()].includes(computerId);
 }
 /**
  * Phase B. `owner`: the signal a caller passed `openDesktop` (or `cancellableWake`); only that caller's own loop then
@@ -445,7 +449,7 @@ const TERMINAL_ERROR_CODES = [
  *      socket for three minutes" (see `SANDBOX_WAKE_ANSWER_BUDGET_MS` in
  *      `app/src/server/lib/cloudflare-guacamole-provider.ts`). The honest
  *      response is to ask again, which is what this does, until
- *      `WAKE_DEADLINE_MS`. A flagged migration first gets its own bounded
+ *      `WAKE_DEADLINE_MS`. A flagged migration or image update gets its own bounded
  *      deadline, then a fresh wake budget when the flag drops; a flagged launch
  *      gets its own; the first preparing answer extends it once, to the
  *      Worker's verdict (`PREPARE_DEADLINE_MS`). The caller's boot panel is on a `setInterval` of its
@@ -516,6 +520,7 @@ async function withWakeAndOneRetry (issue, what, computerId, signal, { owner = s
     // ten-minute stop, a close) must not leave this loop asking behind its back.
     const cancelled = () => {
         migratingRequests.delete(progressKey);
+        updatingRequests.delete(progressKey);
         launchingRequests.delete(progressKey);
         preparingRequests.delete(progressKey);
         movingRequests.delete(progressKey);
@@ -566,6 +571,7 @@ async function withWakeAndOneRetry (issue, what, computerId, signal, { owner = s
             }
             if ( res.ok !== true && res.computeMoving === true ) {
                 migratingRequests.delete(progressKey);
+                updatingRequests.delete(progressKey);
                 launchingRequests.delete(progressKey);
                 preparingRequests.delete(progressKey);
                 if ( computerId ) movingRequests.set(progressKey, { computerId, owner });
@@ -637,26 +643,25 @@ async function withWakeAndOneRetry (issue, what, computerId, signal, { owner = s
                 prepareStartedAt = null;
                 launchStartedAt = null;
             }
-            const migrating = res.ok !== true && res.errorCode === 'sandbox_starting'
-                && res.computeProvider === 'aws-ec2' && res.computeMigrating === true;
-            if (migrating) {
-                if (computerId) migratingRequests.set(progressKey, computerId);
+            const awsPending = res.ok !== true && res.errorCode === 'sandbox_starting' && res.computeProvider === 'aws-ec2';
+            const updating = awsPending && res.computeUpdating === true;
+            const migrating = awsPending && !updating && res.computeMigrating === true;
+            if (computerId && updating) updatingRequests.set(progressKey, computerId);
+            else updatingRequests.delete(progressKey);
+            if (computerId && migrating) migratingRequests.set(progressKey, computerId);
+            else migratingRequests.delete(progressKey);
+            if (migrating || updating) {
                 if (migrationStartedAt === null) {
                     migrationStartedAt = now;
                     deadline = migrationStartedAt + MIGRATION_DEADLINE_MS;
                     maxIssues = asks - 1 + MIGRATION_MAX_ISSUES;
                 }
-            } else {
-                migratingRequests.delete(progressKey);
-                if (migrationStartedAt !== null && !wakeResumed) {
-                    wakeResumed = true;
-                    deadline = now + WAKE_DEADLINE_MS;
-                    maxIssues = asks - 1 + AWS_MAX_ISSUES;
-                }
+            } else if (migrationStartedAt !== null && !wakeResumed) {
+                wakeResumed = true;
+                deadline = now + WAKE_DEADLINE_MS;
+                maxIssues = asks - 1 + AWS_MAX_ISSUES;
             }
-            const launching = res.ok !== true && res.errorCode === 'sandbox_starting'
-                && res.computeProvider === 'aws-ec2' && res.computeLaunching === true;
-            if (launching && !migrating) {
+            if (awsPending && res.computeLaunching === true && !migrating && !updating) {
                 if (computerId) launchingRequests.set(progressKey, computerId);
                 if (launchStartedAt === null) {
                     launchStartedAt = now;
@@ -670,9 +675,7 @@ async function withWakeAndOneRetry (issue, what, computerId, signal, { owner = s
             // it). Round 6a (C2): the FIRST such answer also bounds the wait by the Worker's own verdict
             // (PREPARE_DEADLINE_MS from now), once per loop, never shortening it and never past the ten-minute
             // ceiling. The deadline is the loop's whatever the caller; only the surface's flag needs the id.
-            const preparing = res.ok !== true && res.errorCode === 'sandbox_starting'
-                && res.computeProvider === 'aws-ec2' && res.computePreparing === true;
-            if (preparing) {
+            if (awsPending && res.computePreparing === true && !updating) {
                 if (computerId) preparingRequests.set(progressKey, computerId);
                 if (prepareStartedAt === null) {
                     prepareStartedAt = now;
@@ -728,6 +731,7 @@ async function withWakeAndOneRetry (issue, what, computerId, signal, { owner = s
         }
     } finally {
         migratingRequests.delete(progressKey);
+        updatingRequests.delete(progressKey);
         launchingRequests.delete(progressKey);
         preparingRequests.delete(progressKey);
         movingRequests.delete(progressKey);
@@ -968,6 +972,7 @@ async function openDesktopOnce (computerId, screen, signal, intent) {
             errorCode: data.errorCode ?? 'unknown',
             computeProvider: data.computeProvider,
             ...(data.computeMigrating === true ? { computeMigrating: true } : {}),
+            ...(data.computeUpdating === true ? { computeUpdating: true } : {}),
             ...(data.computeLaunching === true ? { computeLaunching: true } : {}),
             // Phase B (§6.4 rule 1): `previewUrl` is where the next-open move starts; its answers carry the move.
             ...(data.computeMoving === true ? { computeMoving: true } : {}),
@@ -1039,12 +1044,13 @@ async function openDesktopOnce (computerId, screen, signal, intent) {
  */
 /**
  * A not-ok preview body for the wake loop. Preserve the provider and explicit
- * migration or fresh-launch signal so fast AWS replies receive the appropriate bounded budget.
+ * migration, image update or fresh-launch signal so fast AWS replies receive the appropriate bounded budget.
  * Phase B: and the move flags, so Code's mint (`apps/code.js`) and Preview wait on a move as the desktop does.
  */
 export function pendingOrRefused (data) {
     return { ok: false, errorCode: data?.errorCode ?? 'unknown', computeProvider: data?.computeProvider,
         ...(data?.computeMigrating === true ? { computeMigrating: true } : {}),
+        ...(data?.computeUpdating === true ? { computeUpdating: true } : {}),
         ...(data?.computeLaunching === true ? { computeLaunching: true } : {}),
         ...(data?.computePreparing === true ? { computePreparing: true } : {}),
         ...(data?.computeMoving === true ? { computeMoving: true } : {}),
@@ -1777,7 +1783,7 @@ export default {
     capacityRetryEndpoint, retryCapacityAttempt, readCapacityResetReply, userRetry,
     activityEndpoint, reportActivity, releaseDesktop,
     screenEndpoint, setScreen, getScreen, getSystemInfo,
-    withWakeAndOneRetry, isComputeMigrating, isComputeLaunching, isComputePreparing, isComputeMoving,
+    withWakeAndOneRetry, isComputeMigrating, isComputeUpdating, isComputeLaunching, isComputePreparing, isComputeMoving,
     ENDPOINTS,
     DESKTOP_BOOT_TIMEOUT_MS,
 };

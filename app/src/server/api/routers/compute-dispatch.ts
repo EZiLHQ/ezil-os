@@ -24,7 +24,7 @@ import { randomUUID } from 'node:crypto';
 import { TRPCError } from '@trpc/server';
 import { after } from 'next/server';
 
-import { billingV2EntitlementReader, gateComputerStart } from '@/server/billing/v2/compute-access';
+import { billingV2EntitlementReader, computeGrantPending, gateComputerStart } from '@/server/billing/v2/compute-access';
 import type { BillingDeps } from '@/server/billing/ports';
 import { SIZES, type SizeCode } from '@/server/billing/v2/contract';
 import { planFromSubscriptions } from '@/server/billing/v3/catalog';
@@ -32,7 +32,7 @@ import type {
     ComputerMoveRefusalV3, ComputerMoveStartOutputV3, SwitchConfigurationOutputV3, SwitchHealReasonV3, SwitchPhaseV3,
 } from '@/server/billing/v3/contract';
 import { deriveStanding, operatorAccessFor } from '@/server/billing/v3/standing';
-import { meteredSizeForInstanceType } from '@/server/lib/compute/aws-config';
+import { instanceTypeForTier, meteredSizeForInstanceType } from '@/server/lib/compute/aws-config';
 import { failureFields, failureReason, leadingCode } from '@/server/lib/failure-diagnostics';
 import { preflightSwitchCapacity, type SwitchCapacity } from '@/server/lib/compute/aws-pool-runtime';
 import { recordComputeTiming } from '@/server/lib/compute/aws-pool-timing';
@@ -54,7 +54,11 @@ import type { CloudflareComputeProvider } from '@/server/lib/compute/cloudflare'
 import {
     ImageJobConflictError, PlacementOwnerError, readLastUsageStop, readPlacement, readPlacementProvider, type PlacementExecutor,
 } from '@/server/lib/compute/placement';
-import type { AwsComputeStatus, AwsProviderDeps } from '@/server/lib/compute/aws-ec2';
+import { createAwsEc2Provider, type AwsComputeStatus, type AwsProviderDeps } from '@/server/lib/compute/aws-ec2';
+import { advanceAutomaticImageRebase, loadAutomaticImageRebase, type AutomaticImageRebasePlan } from '@/server/lib/compute/aws-auto-image-rebase';
+import type { ImageRebaseDeps } from '@/server/lib/compute/aws-rebase-orchestrator';
+import { imageDesktopHealthy } from '@/server/lib/compute/aws-rebase-health';
+import { createImageJobStore } from '@/server/lib/compute/aws-rebase-store';
 import type { ReleaseHeal } from '@/server/lib/compute/release-heal';
 import type { ComputeCtx, ComputeProvider, ComputeStatus, ComputerRef, EnsureResult, StopResult } from '@/server/lib/compute/provider';
 import { resolveComputeProvider, selectComputeProvider } from '@/server/lib/compute/select';
@@ -104,6 +108,8 @@ export interface RouteOptions {
     aws?: Pick<AwsProviderDeps, 'starter' | 'executions' | 'tunnels' | 'describer' | 'meter' | 'randomBytes' | 'now' | 'newId' | 'leaseSeconds'>;
     /** The caller starts a sandbox: pin a no-row Cloudflare computer first (select.ts `ResolveOptions`). */
     pinCloudflare?: boolean;
+    /** Only a real, owned Code or Desktop open can begin an image update. */
+    imageUpdateOnOpen?: boolean;
 }
 
 /** The AWS provider deps the routers supply: the collaborators plus the tier source. */
@@ -117,10 +123,53 @@ export function awsDepsFor(env: Env, entitlement: EntitlementRecord | null | und
     };
 }
 
+export function imageRebaseDependencies(db: PlacementDb, env: Env, { starter, executions, describer, meter, now }: NonNullable<RouteOptions['aws']>): ImageRebaseDeps | null {
+    if (!starter || !executions || !describer?.describeVolume || !describer.describeSnapshot) return null;
+    return { store: createImageJobStore(db, env), env, starter, executions, meter, now: now ?? (() => new Date()),
+        describer: { describeVolume: describer.describeVolume.bind(describer), describeSnapshot: describer.describeSnapshot.bind(describer),
+            describeForEnrollment: describer.describeForEnrollment.bind(describer) },
+        desktopHealthy: placement => imageDesktopHealthy(placement, env) };
+}
+
+const IMAGE_UPDATING = 'computer_image_updating';
+
+export async function imageUpdateTier(userId: string, plan: AutomaticImageRebasePlan, env: Env,
+    entitlement = () => resolveEntitlement(userId, billingV2EntitlementReader())): Promise<'ready' | 'waiting' | 'resize'> {
+    const tier = tierForEntitlement(await entitlement(), plusPlanIds(env));
+    if (tier === 'free') return await computeGrantPending(userId) ? 'waiting' : 'ready';
+    // The image workflow keeps the source instance size. Normal opens resize a paid tier before boot.
+    return instanceTypeForTier(tier) === plan.instanceType ? 'ready' : 'resize';
+}
+
+function withImageUpdateOnOpen(provider: ComputeProvider, deps: ImageRebaseDeps, owner: ComputerRef, entitlement: () => Promise<EntitlementRecord | null>,
+    active?: AutomaticImageRebasePlan): ComputeProvider {
+    return { ...provider, async ensure(ctx, computer, options) {
+        if (computer.computerId !== owner.computerId || computer.userId !== owner.userId) throw new ImageJobConflictError();
+        let original: EnsureResult = { ok: false, error: 'computer_rebase_required', errorCode: 'computer_rebase_required', retryable: false };
+        if (!active) {
+            try {
+                original = await provider.ensure(ctx, computer, options);
+                if (original.ok || original.errorCode !== 'computer_rebase_required') return original;
+            } catch (error) {
+                if (!(error instanceof ImageJobConflictError)) throw error;
+                const raced = await loadAutomaticImageRebase(deps, { id: owner.computerId, userId: owner.userId });
+                if (!raced) throw error;
+                active = raced;
+            }
+        }
+        const plan = active ?? await loadAutomaticImageRebase(deps, { id: owner.computerId, userId: owner.userId });
+        if (!plan || plan.phase === 'blocked') return original;
+        const tier = await imageUpdateTier(owner.userId, plan, deps.env, entitlement);
+        if (tier === 'resize' || (tier === 'ready' && await advanceAutomaticImageRebase(deps, plan) === 'blocked')) return original;
+        return { ok: false, error: IMAGE_UPDATING, errorCode: IMAGE_UPDATING, retryable: true };
+    } };
+}
+
 export async function routeComputer(
     db: unknown,
     computer: ComputerRef,
-    { env = process.env, entitlements = billingV2EntitlementReader(), aws = defaultAwsCollaborators(env), pinCloudflare = false }: RouteOptions = {},
+    { env = process.env, entitlements = billingV2EntitlementReader(), aws = defaultAwsCollaborators(env), pinCloudflare = false,
+        imageUpdateOnOpen = false }: RouteOptions = {},
 ): Promise<RoutedComputer> {
     // Flag off: no database read at all — the pre-P3 call, unchanged.
     if (!isPlacementReadEnabled(env)) return { kind: 'cloudflare', provider: selectComputeProvider(computer) };
@@ -129,6 +178,7 @@ export async function routeComputer(
     let reverse: 'moving' | 'blocked' | null = null;
     let entitlement: Promise<EntitlementRecord | null> | undefined;
     const getEntitlement = () => entitlement ??= resolveEntitlement(computer.userId, entitlements);
+    const imageDeps = imageUpdateOnOpen ? imageRebaseDependencies(db as PlacementDb, env, aws) : null;
     try {
         // Gate routing with the authenticated owner before any reservation read.
         // The resolver repeats this check for its own fresh placement read.
@@ -143,10 +193,18 @@ export async function routeComputer(
             // NOT_FOUND, never FORBIDDEN — a foreign computer must look absent.
             throw new TRPCError({ code: 'NOT_FOUND', message: 'Computer not found' });
         }
+        if (imageDeps && err instanceof ImageJobConflictError) {
+            const active = await loadAutomaticImageRebase(imageDeps, { id: computer.computerId, userId: computer.userId });
+            if (active) {
+                const fenced = createAwsEc2Provider({ db: db as PlacementDb, env: () => env, ...awsDepsFor(env, getEntitlement, aws) });
+                return { kind: 'aws-ec2', provider: withImageUpdateOnOpen(fenced, imageDeps, computer, getEntitlement, active), instanceType: active.instanceType };
+            }
+        }
         throw err; // duplicate/unknown placement, missing table: fail closed, never Cloudflare.
     }
     // A cloudflare placement keeps the exact pre-P3 adapter (and its richer result type).
     if (provider.kind === 'cloudflare') return { kind: 'cloudflare', provider: selectComputeProvider(computer) };
+    if (imageDeps && !reverse) provider = withImageUpdateOnOpen(provider, imageDeps, computer, getEntitlement);
     return reverse ? { kind: 'aws-ec2', provider, instanceType, reverse } : { kind: 'aws-ec2', provider, instanceType };
 }
 
@@ -157,7 +215,7 @@ export async function routeComputer(
  * "Waking your machine". Mapping to that EXISTING code is what gives an AWS
  * cold boot a visible state without a shell change.
  */
-const AWS_WAKING_CODES: ReadonlySet<string> = new Set(['computer_starting', 'computer_stopping']);
+const AWS_WAKING_CODES: ReadonlySet<string> = new Set(['computer_starting', 'computer_stopping', IMAGE_UPDATING]);
 
 /** The shell-facing error code for a not-ready AWS `ensure`. */
 export function shellCodeForAwsEnsure(result: Extract<EnsureResult, { ok: false }>): string {
@@ -290,6 +348,7 @@ export async function awsPreviewAnswer(result: EnsureResult, preview: () => Prom
             ...(reason ? { reason } : {}),
             ...awsMigrationAnswer(result),
             ...awsMoveAnswer(result),
+            ...(result.errorCode === IMAGE_UPDATING && result.retryable ? { computeUpdating: true as const } : {}),
             // RETRY-118: the expired attempt an explicit user Retry may reset; nothing else carries it.
             ...(result.errorCode === 'capacity_attempt_expired' && result.capacityAttemptId
                 ? { capacityAttemptId: result.capacityAttemptId } : {}),

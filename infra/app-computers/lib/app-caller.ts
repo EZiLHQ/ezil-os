@@ -122,23 +122,28 @@ export function startVersionStatements(versionArns: string[]): iam.PolicyStateme
 
 /** The policy of the app caller, exported for exact-equality tests:
  * - start only the exact lifecycle VERSION(s), all in `region`;
+ * - list only the configured lifecycle STATE MACHINE, for bounded ownership-checked release lookup;
  * - describe only the `computer-*` executions of those state machines, and decrypt
  *   their execution data with the lifecycle history key, via Step Functions only;
  * - read-only EC2 describes for enrollment's live check, in `region` only
  *   (DescribeInstances/Volumes/AvailabilityZones support no resource scoping). */
 export function appCallerStatements(region: string, versionArns: string[], historyKeyArn: string): iam.PolicyStatement[] {
     const executions: string[] = [], machines: string[] = [];
+    const lifecycleMachines = new Set<string>();
     for (const v of versionArns) {
         const m = /^arn:aws:states:([a-z0-9-]+):(\d{12}):stateMachine:([A-Za-z0-9_-]{1,80}):[1-9][0-9]*$/.exec(v);
         if (!m) throw new Error('invalid_version_arn');
         if (m[1] !== region) throw new Error('version_arn_region');
         const execution = `arn:aws:states:${m[1]}:${m[2]}:execution:${m[3]}:computer-*`;
         if (!executions.includes(execution)) executions.push(execution);
+        const machineArn = `arn:aws:states:${m[1]}:${m[2]}:stateMachine:${m[3]}`;
+        if (/^ezil-[a-z][a-z0-9]{0,20}-lifecycle$/.test(m[3]!)) lifecycleMachines.add(machineArn);
         // The encryption context names the state machine; list the version too so either form matches.
-        for (const machine of [`arn:aws:states:${m[1]}:${m[2]}:stateMachine:${m[3]}`, v]) if (!machines.includes(machine)) machines.push(machine);
+        for (const machine of [machineArn, v]) if (!machines.includes(machine)) machines.push(machine);
     }
     return [
         ...startVersionStatements(versionArns),
+        ...(lifecycleMachines.size ? [new iam.PolicyStatement({ actions: ['states:ListExecutions'], resources: [...lifecycleMachines] })] : []),
         new iam.PolicyStatement({ actions: ['states:DescribeExecution'], resources: executions }),
         new iam.PolicyStatement({ actions: ['states:GetExecutionHistory'], resources: executions }),
         // The lifecycle machine encrypts execution data with its customer-managed history key, and

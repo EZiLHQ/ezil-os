@@ -1229,6 +1229,7 @@ export async function openDesktopWindow (ctx = {}) {
         appName: ctx.appName || title,
         icon: ctx.icon,
         isMigrating: () => session.isComputeMigrating(computer.id),
+        isUpdating: () => session.isComputeUpdating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
         // Phase B: this window's own open only (its signal), never another surface's loop for the same computer.
         isMoving: () => !! own_open && session.isComputeMoving(computer.id, own_open.signal),
@@ -1251,7 +1252,9 @@ export async function openDesktopWindow (ctx = {}) {
      * while this window says it stopped.
      */
     function check_aws_wait () {
-        if ( ! aws_stop_wait ) return;
+        // The disk may remain stopped while its system image is being updated.
+        // This wait belongs to the session's update clock, not the boot watchdog.
+        if ( ! aws_stop_wait || session.isComputeUpdating(computer.id) ) return;
         const { t0, resolve, clock } = aws_stop_wait;
         const verdict = awsBootWaitVerdict({ observation: aws_observation, bootElapsedMs: performance.now() - t0, clock });
         if ( verdict === 'wait' ) return;
@@ -1463,8 +1466,8 @@ export async function openDesktopWindow (ctx = {}) {
             const reason = computeBootUiState({ requestStatus: 'error', elapsedMs: 0, errorCode: res.errorCode }).reason;
             const verdict = awsBootTimeoutVerdict({
                 reason, observation: aws_observation, bootElapsedMs: performance.now() - t0, reopens: aws_reopens,
-                // The wake loop gave up on its own ten-minute launch/migration clock.
-                sessionClockSpent: res.computeLaunching === true || res.computeMigrating === true,
+                // The wake loop gave up on its own ten-minute launch, migration or update clock.
+                sessionClockSpent: res.computeLaunching === true || res.computeMigrating === true || res.computeUpdating === true,
                 moving: res.computeMoving === true || res.computeMoveNeedsAttention === true,
             });
             if ( verdict === 'move' ) {
@@ -1559,7 +1562,7 @@ export async function openDesktopWindow (ctx = {}) {
             });
             // The spinner keeps an active AWS timeout on progress; tell it the
             // window's budget is spent so it shows Try again.
-            render_both(aws_budget_spent ? { ...failed, observedBudgetSpent: true } : failed);
+            render_both({ ...failed, observedBudgetSpent: aws_budget_spent, imageUpdatePending: res.computeUpdating === true });
             // Terminal: the mint itself failed, so there is no URL to
             // navigate to and nothing further will run on this attempt.
             trace.step('mint_error');

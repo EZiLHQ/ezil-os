@@ -814,6 +814,7 @@ export async function openCodeWindow (ctx = {}) {
 
     const nativeFailureCopy = nativeSurface ? editorFailureCopy() : undefined;
     const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Code…', icon: ctx.icon, isMigrating: () => session.isComputeMigrating(computer.id),
+        isUpdating: () => session.isComputeUpdating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
         // Round 6 (seam C): the first Code open after the computer starts waits for its config to apply.
         isPreparing: () => session.isComputePreparing(computer.id),
@@ -1069,10 +1070,10 @@ export async function openCodeWindow (ctx = {}) {
                 errorCode: res.errorCode,
             });
             // A give-up over a computer last seen running (and opening nothing) is Code's, not the computer's.
-            const timed_out = failed.kind === 'failed' && failed.reason === 'timeout';
+            const timed_out = failed.kind === 'failed' && failed.reason === 'timeout' && res.computeUpdating !== true;
             const shown = timed_out ? code_timeout(failed) : failed;
             generic_timeout = timed_out && ! shown.copy ? failed : null;
-            progress.render(shown);
+            progress.render(res.computeUpdating === true ? { ...shown, imageUpdatePending: true } : shown);
             // Terminal: the mint failed for real.
             trace.step('mint_error');
             trace.end('error');

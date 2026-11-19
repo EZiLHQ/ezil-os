@@ -167,3 +167,16 @@ Every `--apply` needs `--journal <private dir>`. The intent file is created O_EX
 - The internal route's adopt stays fail-closed until the app role has every read above. The operator runner is the supported path.
 - The pool claim binding reads the staging-only 0003 and 0008 pool columns.
 - `.pg.test.ts` suites skip without `EZIL_PG_TEST_URL`. Run them against a disposable PostgreSQL.
+
+## Automatic attestation
+
+An automatic open needs a durable attestation workflow before it can handle this case. An authenticated,
+eligible open should request one job for the exact stopped allocation and resume startup after the existing
+verifier records the measured lower. A later open should join that job while it is active.
+
+Use a separate AWS execution role for the snapshot and clone, the tagged maintenance host, and its one
+canonical SSM command. Keep the app's role limited to requesting and checking that pinned execution. The
+verifier needs independent SSM and CloudTrail reads and must still validate the launch tuple, the read-only
+clone, and the reservation before recording the lower. Hold the original workspace when provenance or
+measurement is missing or ambiguous. Qualify the workflow on an owned staging computer before enabling
+it for other accounts.

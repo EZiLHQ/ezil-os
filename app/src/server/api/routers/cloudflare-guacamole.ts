@@ -291,7 +291,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
                 if (triggered === REVERSE_WARM_HELD) return computerStoppedAnswer();
             }
             // P3: the provider THIS computer lives on (Cloudflare unless its placement says otherwise).
-            const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true, imageUpdateOnOpen: input.intent === 'open' });
             // 🔴 Phase B (§5.3): a computer in a move answers the move right after routing: before the billing gate (a held
             // Free user's gate would refuse it as `billing_*` and break the move overlay), the credential sync and any Worker call.
             if (routed.kind === 'aws-ec2' && routed.reverse) return awsAnswered(routed.kind, 'desktop', input.computerId,
@@ -837,7 +837,7 @@ export const cloudflareGuacamoleRouter = createTRPCRouter({
             if (input.intent === 'open') {
                 await reverseMoveOnOpen(ctx.db as unknown as PlacementDb, computer, ctx.user, {}, { stopCooldown: true });
             }
-            const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true }); // starts a sandbox: pin a no-row Cloudflare computer first
+            const routed = await routeComputer(ctx.db, computer, { pinCloudflare: true, imageUpdateOnOpen: input.intent === 'open' });
             // 🔴 Phase B (§5.3): the move's answer first (before the gate, the stop hold, the credential sync and the AWS preview).
             if (routed.kind === 'aws-ec2' && routed.reverse) return awsAnswered(routed.kind, 'code', input.computerId,
                 await reverseRouteAnswer(routed.provider, correlationId, computer), startedAt);

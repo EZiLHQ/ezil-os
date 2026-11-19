@@ -40,6 +40,10 @@ const MIGRATION_COPY = {
     title: 'Moving your computer to AWS (India)',
     body: 'This first start takes a few minutes. Your files come with you.',
 };
+const IMAGE_UPDATE_COPY = {
+    title: 'Updating your computer',
+    body: 'Your workspace files are kept. This can take several minutes.',
+};
 
 /** Copy owned by this surface. */
 export const OPEN_COPY = {
@@ -130,6 +134,7 @@ function viewComputerStatus () {
  *   the action was [Open my AWS computer] on a move's failed outcome.
  * @param {() => void} [opts.onViewStatus] Called by "View computer status" (default: Settings → Computer).
  * @param {() => boolean} [opts.isMigrating] Reads this computer's observed migration state.
+ * @param {() => boolean} [opts.isUpdating] Reads this computer's observed system image update.
  * @param {() => boolean} [opts.isLaunching] Reads this computer's observed fresh launch state.
  * @param {() => boolean} [opts.isPreparing] Round 6 (seam C): the server said this computer's desktop is taking its
  *   config (or code-server is starting after it). Seen once, the open shows that wait to its end.
@@ -139,7 +144,7 @@ function viewComputerStatus () {
  * @param {{title: string, body: string}} [opts.failureCopy] Static app-specific failure guidance.
  */
 export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…', appName, icon, className, onRetry, onViewStatus,
-    failureCopy, isMigrating = () => false, isLaunching = () => false, isPreparing = () => false, isMoving = () => false } = {}) {
+    failureCopy, isMigrating = () => false, isUpdating = () => false, isLaunching = () => false, isPreparing = () => false, isMoving = () => false } = {}) {
     const root = document.createElement('div');
     root.className = 'ezil-app-spinner';
     if (typeof className === 'string' && className) root.classList.add(...className.split(/\s+/).filter(Boolean));
@@ -404,6 +409,7 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
      *   re-asking because the AWS observation said the computer is still opening.
      *   `state.move` (Phase B, the desktop window): 'moving' (its open handed back a moving answer) or
      *   'needs_attention' (the open was answered `computeMoveNeedsAttention`).
+     *   `state.imageUpdatePending`: the open's update budget expired with the server still reporting an update.
      */
     function render (state, extra = {}) {
         latestState = state; latestExtra = extra ?? {};
@@ -411,13 +417,21 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         if (!pending) { observer?.stop(); observation = null; observedMove = observedMoveAt = undefined; progressChecked = false; }
         // Round 4: the raw server code (e.g. `billing_files_on_aws`), not the classified reason.
         failureCode = state.kind === 'failed' ? state.errorCode ?? state.reason : observation?.stage === 'needs_operator' ? 'needs_operator' : undefined;
-        const activeTimeout = state.kind === 'failed' && state.reason === 'timeout' && observation?.activeAws;
+        const updating = state.kind === 'progress' && client < URL_RECEIVED && isUpdating() === true;
+        const updateTimedOut = state.kind === 'failed' && state.reason === 'timeout' && state.imageUpdatePending === true;
+        const activeTimeout = state.kind === 'failed' && state.reason === 'timeout' && !updateTimedOut && observation?.activeAws;
+        // The update and the wake get separate budgets. Once the update stops, start
+        // timing the wake afresh while retaining the bar's high-water mark.
+        if (open && open.updateStartedAt !== null && !updating) {
+            if (state.kind === 'progress') { open.t0 = Date.now(); open.prepare = null; }
+            open.updateStartedAt = null;
+        }
         // The ten-minute stop reads the longer of the clock the user sees (this live open's) and the
         // server's; `observedBudgetSpent`: the desktop window's own ten-minute clock ran out first.
         // An open the ten-minute stop ended keeps its clock (`hold`) until Try again, so the stop
         // never flips back to a fresh 0:00 open on the next tick.
         const clientT = open && (!open.ended || open.hold) ? elapsedOf() : 0;
-        const runningLong = (state.kind === 'progress' || activeTimeout) && observation?.activeAws
+        const runningLong = !updating && (state.kind === 'progress' || activeTimeout) && observation?.activeAws
             && (Math.max(clientT, observation.elapsed) >= 600 || state.observedBudgetSpent === true);
         root.setAttribute('data-kind', activeTimeout ? 'progress' : state.kind);
         // The caller's estimate and its one real signal, as data for diagnostics; never drawn.
@@ -430,7 +444,7 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         if (progressing && !runningLong && (!open || open.ended)) {
             // A fresh open reads afresh: no earlier open's move outcome is ever painted as this one's.
             if (open && observer) { observer.stop(); observer = makeObserver(); observation = null; observedMove = observedMoveAt = undefined; progressChecked = false; }
-            open = { t0: Date.now(), high: 0, view: null, T: null, ended: false, hold: false, connect: null, prepare: null,
+            open = { t0: Date.now(), high: 0, view: null, T: null, ended: false, hold: false, connect: null, prepare: null, updateStartedAt: null,
                 moving: false, moveView: null, moveHigh: 0, moveKey: null, committedAt: null, moveDone: false, blockedAnswer: false };
             client = 0;
         }
@@ -450,10 +464,24 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         }
         // Phase B: a move first (§6.4).
         if (pending && paintMove(state, observation?.updated ? `Last recorded update: ${observation.updated}` : null)) return;
+        if (updating && open) {
+            open.updateStartedAt ??= Date.now();
+            const t = Math.max(0, (Date.now() - open.updateStartedAt) / 1000);
+            paint({ state: 'opening', title: IMAGE_UPDATE_COPY.title, status: IMAGE_UPDATE_COPY.body,
+                meta: t >= META_AFTER_S ? formatElapsed(t) : '', bar: frozen() ?? 'indeterminate' });
+            return;
+        }
+        if (updateTimedOut) {
+            endOpen();
+            paint({ state: 'attention', title: 'Your computer update is taking longer',
+                status: 'The update did not finish during this wait. Your workspace files are kept.',
+                bar: frozen(), retry: true, feedback: true });
+            return;
+        }
         const view = observation ?? (progressing && open && !open.ended ? open.view : null);
         const details = view?.updated ? `Last recorded update: ${view.updated}` : null;
 
-        const showObservation = pending && view && (progressing
+        const showObservation = pending && state.reason !== 'computer_update_required' && view && (progressing
             || ['operations_paused', 'needs_operator', 'queued', 'failed_reopened'].includes(view.stage));
         if (showObservation) {
             const stage = view.stage;

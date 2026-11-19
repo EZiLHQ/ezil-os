@@ -72,6 +72,7 @@ import { plusPlanIds, tierForEntitlement, type EntitlementRecord } from './tier'
 import { requestAwsRestart } from './aws-restart';
 import { poolPriorityForEntitlement } from './select';
 import { releaseHealOf } from './release-heal';
+import type { RebaseSnapshotDescriber } from './aws-rebase-evidence';
 
 export const AWS_DISABLED = 'aws_disabled';
 
@@ -166,7 +167,8 @@ export interface AwsProviderDeps {
      * Read-only EC2 describe (the enrollment describer). Catches a guest-initiated idle
      * stop (R9), which no lifecycle job reports. Without it such a stop is never seen.
      */
-    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber> & Partial<Ec2ComputerResourceFinder & Ec2ReplacementDescriber>;
+    describer?: Pick<Ec2EnrollmentDescriber, 'describeForEnrollment'> & Partial<Ec2VolumeDescriber & RebaseSnapshotDescriber>
+        & Partial<Ec2ComputerResourceFinder & Ec2ReplacementDescriber>;
     /** Lease length: set at provision and at every wake, renewed by the owner's presence. */
     leaseSeconds?: number;
     /** Backoff between StartExecution attempts whose answer was lost; tests inject an instant one. */

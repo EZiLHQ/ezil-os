@@ -208,6 +208,7 @@ export async function openPreviewWindow (ctx = {}) {
     };
 
     const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Preview…', icon: ctx.icon, isMigrating: () => session.isComputeMigrating(computer.id),
+        isUpdating: () => session.isComputeUpdating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id), isPreparing: () => session.isComputePreparing(computer.id), onRetry: () => { void session.userRetry(computer.id, last_failure, reopen_after_retry); },
         failureCopy: nativeSurface ? { title: 'Preview is unavailable', body: 'Start your development server in Code, register its port in Settings, then try again.' } : undefined });
     el_body.appendChild(progress.el);
@@ -333,11 +334,12 @@ export async function openPreviewWindow (ctx = {}) {
                 // FEEDBACK-DIAG: into the local mirror only (`diagnostics.js`).
                 reason: res.reason, serverCorrelationId: res.correlationId,
             });
-            progress.render(computeBootUiState({
+            const failed = computeBootUiState({
                 requestStatus: 'error',
                 elapsedMs: performance.now() - t0,
                 errorCode: res.errorCode,
-            }));
+            });
+            progress.render(res.computeUpdating === true ? { ...failed, imageUpdatePending: true } : failed);
             // Terminal: the mint failed for real, so there is no URL to
             // navigate to.
             trace.step('mint_error');

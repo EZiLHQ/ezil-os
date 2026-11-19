@@ -28,7 +28,7 @@ import { readFileSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 
 import { DescribeSnapshotsCommand, DescribeAvailabilityZonesCommand, DescribeInstancesCommand, DescribeVolumesCommand, EC2Client } from '@aws-sdk/client-ec2';
-import { DescribeExecutionCommand, GetExecutionHistoryCommand, type GetExecutionHistoryCommandOutput, type HistoryEvent, SFNClient, StartExecutionCommand } from '@aws-sdk/client-sfn';
+import { DescribeExecutionCommand, GetExecutionHistoryCommand, type GetExecutionHistoryCommandOutput, type HistoryEvent, ListExecutionsCommand, type ListExecutionsCommandOutput, SFNClient, StartExecutionCommand } from '@aws-sdk/client-sfn';
 import { AssumeRoleCommand, AssumeRoleWithWebIdentityCommand, STSClient } from '@aws-sdk/client-sts';
 
 import { AWS_REGION_PATTERN, isAwsComputersEnabled, readAwsRegions, type Env } from './aws-config';
@@ -208,6 +208,7 @@ function logCredentialSource(source: 'vercel-oidc' | 'ec2-instance-role'): void 
 // ── ARN pinning ─────────────────────────────────────────────────────────
 
 const VERSION_ARN = /^arn:aws:states:([a-z0-9-]+):(\d{12}):stateMachine:([A-Za-z0-9_-]{1,80}):([1-9][0-9]*)$/;
+const LIFECYCLE_MACHINE_ARN = /^arn:aws:states:([a-z0-9-]+):(\d{12}):stateMachine:(ezil-[a-z][a-z0-9]{0,20}-lifecycle)$/;
 const EXECUTION_ARN = /^arn:aws:states:([a-z0-9-]+):(\d{12}):execution:([A-Za-z0-9_-]{1,80}):(computer-[0-9a-f-]{36})$/;
 const EXECUTION_NAME = /^computer-[0-9a-f-]{36}$/;
 const INSTANCE_ID = /^i-[a-f0-9]{8,17}$/;
@@ -253,6 +254,50 @@ export function createSfnLifecycleStarter(sfnFor: (region: string) => RegionalCl
 /** `DescribeExecution` of one computer job, in `region`, under the caller role's account. */
 export function createSfnExecutionReader(sfnFor: (region: string) => RegionalClient): LifecycleExecutionReader {
     return {
+        async listSucceeded(region, stateMachineArn, { oldest, newest }) {
+            assertRegion(region);
+            const machine = LIFECYCLE_MACHINE_ARN.exec(stateMachineArn);
+            if (!machine || machine[1] !== region) throw new AwsClientError('aws_config', false, 'LifecycleMachineArnInvalid');
+            const { client, account } = sfnFor(region);
+            if (machine[2] !== account) throw new AwsClientError('aws_config', false, 'ExecutionAccountMismatch');
+            const from = oldest.getTime(), to = newest.getTime();
+            if (!Number.isFinite(from) || !Number.isFinite(to) || from > to || to - from > 62 * 60_000) return null;
+
+            // AWS lists newest starts first and supplies no time filter. A scan that never reaches the
+            // recorded window cannot establish uniqueness, even when it happened to see one candidate.
+            const candidates: string[] = [], seen = new Set<string>(), tokens = new Set<string>();
+            let nextToken: string | undefined, previous = Number.POSITIVE_INFINITY;
+            for (let page = 0; page < 5; page++) {
+                let out: ListExecutionsCommandOutput;
+                try {
+                    out = await client.send(new ListExecutionsCommand({ stateMachineArn, statusFilter: 'SUCCEEDED',
+                        maxResults: 100, nextToken })) as ListExecutionsCommandOutput;
+                } catch (error) { throw toAwsClientError(error); }
+                if (!Array.isArray(out.executions) || out.executions.length > 100) return null;
+                let reachedOldest = false;
+                for (const entry of out.executions) {
+                    const started = entry?.startDate instanceof Date ? entry.startDate.getTime() : NaN;
+                    const stopped = entry?.stopDate instanceof Date ? entry.stopDate.getTime() : NaN;
+                    if (!Number.isFinite(started) || !Number.isFinite(stopped) || started > stopped
+                        || started > previous || entry.status !== 'SUCCEEDED' || entry.stateMachineArn !== stateMachineArn) return null;
+                    previous = started;
+                    if (started < from) { reachedOldest = true; continue; }
+                    if (started > to || stopped > to) continue;
+                    const arn = entry.executionArn;
+                    const identity = typeof arn === 'string' ? EXECUTION_ARN.exec(arn) : null;
+                    if (!arn || !identity || identity[1] !== region || identity[2] !== account || identity[3] !== machine[3]
+                        || seen.has(arn) || candidates.length === 20) return null;
+                    seen.add(arn);
+                    candidates.push(arn);
+                }
+                if (reachedOldest || out.nextToken === undefined) return candidates;
+                if (typeof out.nextToken !== 'string' || !out.nextToken || out.nextToken.length > 4096 || tokens.has(out.nextToken)
+                    || !out.executions.length) return null;
+                tokens.add(out.nextToken);
+                nextToken = out.nextToken;
+            }
+            return null;
+        },
         async history(region, executionArn) {
             assertRegion(region);
             const m = EXECUTION_ARN.exec(executionArn);
