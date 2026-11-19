@@ -1,0 +1,12 @@
+[Unit]
+Description=EZiL: qualify the enrolled native-session canary
+Requisite=ezil-enroll.service
+After=ezil-enroll.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+UMask=0077
+Environment=PYTHONPATH=/opt/ezil-host/lib
+ExecStart=/usr/bin/python3 -m ezil_host.native_qualification qualify-via-os
+TimeoutStartSec=300

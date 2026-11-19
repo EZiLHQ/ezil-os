@@ -1,4 +1,9 @@
-"""Root-only, one-shot qualification of the installed native Host on its AWS lease."""
+"""Root-only qualification of the installed native Host on its AWS lease.
+
+The manual challenge and qualify commands exchange local root-only files with the
+operator. For a provisioned pilot, qualify-via-os uses the existing enrollment
+origin and epoch key. Only enable the optional timer on the configured computer.
+"""
 import argparse
 import fcntl
 import hashlib
@@ -19,7 +24,10 @@ import uuid
 from contextlib import ExitStack
 from pathlib import Path
 
-from . import config, enroll, guard, native_artifact, native_authority as authority
+from http.client import HTTPException
+from urllib.parse import urlsplit
+
+from . import config, enroll, guard, http, native_artifact, native_authority as authority
 from . import native_isolation as isolation, native_session, storage
 from .fsops import Refused, unlink_durable_at, write_file_durable_at
 from .lease import strict_json
@@ -27,6 +35,7 @@ from .lease import strict_json
 CHALLENGE = "qualification-challenge.json"
 RECEIPT = "qualification-receipt.json"
 DOMAIN = b"ezil-native-qualification-placement-v1|"
+REQUEST_DOMAIN = b"ezil-native-qualification-request-v1|"
 MAX_AGE_MS = 300_000
 FUTURE_SKEW_MS = 5_000
 CONFIG_PATH = "/etc/ezil-host/agent.json"
@@ -497,9 +506,36 @@ def stop_on_signal(signum, frame):
     raise Refused("native_qualification_interrupted")
 
 
+def new_challenge(target):
+    issued = now_ms()
+    return dict(target, nonce=secrets.token_urlsafe(32), issuedAt=authority.iso_ms(issued),
+                expiresAt=authority.iso_ms(issued + MAX_AGE_MS))
+
+
+def request_placement_receipt(cfg, challenge, key):
+    """Only the root-configured canary may ask its verified enrollment origin for a proof."""
+    require(cfg.get("nativeQualificationComputerId") == challenge["computerId"],
+            "native_qualification_target_changed")
+    uri = urlsplit(cfg.enrollUrl or "")
+    require(uri.scheme == "https" and uri.hostname and uri.netloc in (uri.hostname, uri.hostname + ":443")
+            and uri.path == "/api/internal/computers/enroll" and not uri.query and not uri.fragment,
+            "native_qualification_origin_invalid")
+    url = "https://" + uri.netloc + "/api/compute/aws/native-qualification"
+    raw = authority.canonical(challenge)
+    signature = "v1=" + hmac.new(key, REQUEST_DOMAIN + digest(raw).encode("ascii"), hashlib.sha256).hexdigest()
+    try:
+        status, body = http.request("POST", url, body=raw,
+                                    headers={"Content-Type": "application/json", "X-Ezil-Signature": signature},
+                                    timeout=8, ca_file=cfg.caFile, response_limit=4097)
+        require(status == 200 and 0 < len(body) <= 4096, "native_qualification_receipt_unavailable")
+        return strict_json(body.decode("utf-8"))
+    except (OSError, ValueError, HTTPException) as error:
+        raise Refused("native_qualification_receipt_unavailable") from error
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("step", choices=("challenge", "qualify"))
+    parser.add_argument("step", choices=("challenge", "qualify", "qualify-via-os"))
     args = parser.parse_args()
     try:
         require(os.geteuid() == 0, "native_qualification_root_required")
@@ -519,19 +555,21 @@ def main():
                     and stat.S_IMODE(st.st_mode) == 0o600, "native_qualification_storage_untrusted")
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             if args.step == "challenge":
-                issued = now_ms()
-                data = dict(target, nonce=secrets.token_urlsafe(32), issuedAt=authority.iso_ms(issued),
-                            expiresAt=authority.iso_ms(issued + MAX_AGE_MS))
-                raw = authority.canonical(data)
+                raw = authority.canonical(new_challenge(target))
                 write_file_durable_at(directory_fd, CHALLENGE, raw, 0o600)
                 print(raw.decode())
                 return 0
-            challenge = private_json(directory_fd, CHALLENGE)
-            envelope = private_json(directory_fd, RECEIPT)
             key = read_control_key(cfg, target["placement"])
+            if args.step == "qualify-via-os":
+                challenge = new_challenge(target)
+                envelope = request_placement_receipt(cfg, challenge, key)
+            else:
+                challenge = private_json(directory_fd, CHALLENGE)
+                envelope = private_json(directory_fd, RECEIPT)
             receipt = validate_receipt(envelope, challenge, target, key, now_ms())
-            unlink_durable_at(directory_fd, CHALLENGE)
-            unlink_durable_at(directory_fd, RECEIPT)
+            if args.step == "qualify":
+                unlink_durable_at(directory_fd, CHALLENGE)
+                unlink_durable_at(directory_fd, RECEIPT)
             observed = run_measurements(cfg, lease, receipt, artifact)
 
             def recheck():

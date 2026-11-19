@@ -1,9 +1,11 @@
+import { createHmac } from 'node:crypto';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { describe, expect, it } from 'vitest';
 
+import { deriveControlKey } from '@/server/lib/compute/aws-control-key';
 import type { PlacementExecutor } from '@/server/lib/compute/placement';
 import { nativeDeploymentSha256, nativePolicyCanonical } from './accepted-policy';
-import { signNativeQualificationPlacement, type QualificationPlacementChallenge } from './qualification-placement';
+import { handleNativeQualification, signNativeQualificationPlacement, type QualificationPlacementChallenge } from './qualification-placement';
 
 const id = (digit: number) => '00000000-0000-4000-8000-00000000000' + digit;
 const initial = new Date('2026-11-19T00:00:00.000Z');
@@ -106,5 +108,57 @@ describe('native qualification placement signer', () => {
         await expect(sign(challenge, fixture({ owned: false }))).rejects.toThrow('qualification_owner_mismatch');
         await expect(sign(challenge, fixture({ row: { owner_user_id: id(9) } }))).rejects.toThrow('placement_not_owned');
         await expect(sign(challenge, fixture({ reservation: true }))).rejects.toThrow('image_job_conflict');
+    });
+});
+
+describe('scoped Host qualification transport', () => {
+    const key = deriveControlKey(secret, { computerId: target.computerId, generation: 11, leaseEpoch: 29, nonceHash: 'c'.repeat(64) });
+    const raw = nativePolicyCanonical(challenge);
+    const signature = 'v1=' + createHmac('sha256', key)
+        .update('ezil-native-qualification-request-v1|' + nativeDeploymentSha256(raw), 'ascii').digest('hex');
+    const input = (body = raw, mac: string | null = signature, type = 'application/json') => new Request('https://os.example/api', {
+        method: 'POST', body, headers: { 'content-type': type, ...(mac === null ? {} : { 'x-ezil-signature': mac }) },
+    });
+    const setup = () => {
+        const parts = fixture();
+        return {
+            ...parts,
+            target: [target.computerId, target.ownerUserId, target.instanceId].join('/'),
+            sign: (body: string, pins: Parameters<Parameters<typeof handleNativeQualification>[1]['sign']>[1]) =>
+                signNativeQualificationPlacement(body, { ...parts, ...pins }),
+        };
+    };
+
+    it('requests the existing signed receipt with the correct epoch control key', async () => {
+        expect(signature).toBe('v1=577b3fbde130ac5a30588218c7b98f6d2e8a53e6e2c137d5aac89555ac4d4a4e');
+        const deps = setup();
+        const response = await handleNativeQualification(input(), deps);
+        expect(response.status).toBe(200);
+        expect(response.headers.get('cache-control')).toBe('no-store');
+        expect(await response.json()).toEqual(await sign());
+    });
+
+    it('refuses disabled routes, invalid framing, a missing signature and a wrong pinned instance', async () => {
+        for (const [request, override] of [
+            [input(), { target: undefined }], [input(), { target: '' }],
+            [input(raw, null), {}], [input(raw, 'bad'), {}], [input(raw, signature, 'text/plain'), {}],
+            [input(' '.repeat(4097)), {}],
+            [input(), { target: [target.computerId, target.ownerUserId, 'i-00000000'].join('/') }],
+        ] as const) {
+            const deps = setup();
+            expect((await handleNativeQualification(request, { ...deps, ...override })).status).toBe(404);
+            expect(deps.queries).toHaveLength(0);
+        }
+    });
+
+    it('refuses altered challenge bytes and signatures from other purposes or epochs', async () => {
+        const proof = await sign();
+        const other = deriveControlKey(secret, { computerId: target.computerId, generation: 11, leaseEpoch: 28, nonceHash: 'c'.repeat(64) });
+        const stale = 'v1=' + createHmac('sha256', other)
+            .update('ezil-native-qualification-request-v1|' + nativeDeploymentSha256(raw), 'ascii').digest('hex');
+        const edited = nativePolicyCanonical({ ...challenge, expiresAt: at(180).toISOString() });
+        for (const request of [input(edited), input(raw, proof.signature), input(raw, stale), input('\ufeff' + raw)]) {
+            expect((await handleNativeQualification(request, setup())).status).toBe(404);
+        }
     });
 });
