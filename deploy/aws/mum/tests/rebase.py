@@ -1355,6 +1355,9 @@ class ProductionObserverTransitionTests(unittest.TestCase):
         resources[cfn.LEGACY_RECOVERY_POLICY]['Properties']['PolicyDocument']['Statement'][0]['Resource'] = {
             'Ref': legacy_version}
         if transition:
+            lifecycle_policy = resources.pop('LifecycleTransitionObserverPolicy11111111')
+            lifecycle_policy['Properties']['PolicyName'] = cfn.PRODUCTION_LIFECYCLE_TRANSITION_POLICY
+            resources[cfn.PRODUCTION_LIFECYCLE_TRANSITION_POLICY] = lifecycle_policy
             resources['RecoveryTransitionObserverPolicy11111111']['Properties']['Roles'] = [
                 {'Ref': cfn.IMAGE_RECOVERY_ROLE}]
         for key, (logical, name, role) in cfn.PRODUCTION_OBSERVER_WORKFLOWS.items():
@@ -1384,6 +1387,34 @@ class ProductionObserverTransitionTests(unittest.TestCase):
         self.cfn.preserve_transition_versions(self.before, carried)
         with self.assertRaisesRegex(ValueError, 'exact historical observer grants'):
             self.cfn.preserve_transition_versions(self.before, self.after)
+
+    def test_lifecycle_policy_atomically_keeps_exact_predecessor_on_existing_attachment(self):
+        after = self.cfn.carry_production_predecessor(self.before, self.after)
+        resources = after['Resources']
+        logical = self.cfn.LIFECYCLE_CONTROLLER_POLICY
+        old = self.before['Resources'][logical]
+        self.assertNotIn(self.cfn.PRODUCTION_LIFECYCLE_TRANSITION_POLICY, resources)
+        self.assertIn('PreparationTransitionObserverPolicy11111111', resources)
+        self.assertIn('RecoveryTransitionObserverPolicy11111111', resources)
+        old_invokes = self.cfn._observer_invoke_rows(old)
+        live = self.fixture.OLD['lifecycle']
+        active = self.fixture.NEW['lifecycle']
+        new_invokes = self.cfn._observer_invoke_rows(resources[logical])
+        self.assertEqual({row['Resource']['Ref'] for row in new_invokes},
+                         {row['Resource']['Ref'] for row in old_invokes} | {active})
+        for row in old_invokes:
+            self.assertIn(row, new_invokes)
+        self.cfn.preserve_transition_versions(self.before, after)
+        previous_row = next(row for row in new_invokes if row['Resource'] == {'Ref': live})
+        resources[logical]['Properties']['PolicyDocument']['Statement'].remove(previous_row)
+        with self.assertRaisesRegex(ValueError, 'exact previous observer grant'):
+            self.cfn.preserve_transition_versions(self.before, after)
+
+    def test_lifecycle_rejects_unreviewed_standalone_attachment(self):
+        planned = self.after['Resources'][self.cfn.PRODUCTION_LIFECYCLE_TRANSITION_POLICY]
+        planned['Properties']['Roles'] = [{'Ref': self.cfn.IMAGE_RECOVERY_ROLE}]
+        with self.assertRaisesRegex(ValueError, 'standalone grant does not match'):
+            self.cfn.carry_production_predecessor(self.before, self.after)
 
     def test_refuses_ambiguous_observer_and_invalid_predecessor_grants(self):
         for change in ('ambiguous', 'wildcard', 'other_function', 'missing_current', 'legacy_role'):
