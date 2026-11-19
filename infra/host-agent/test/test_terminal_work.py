@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import ExitStack
 from unittest import mock
@@ -34,19 +35,19 @@ def scratch(test):
 
 class Parse(unittest.TestCase):
     def test_counts(self):
-        for stdout, want in (("0 0", (0, 0)), ("2 1\n", (2, 1)), (" 3 0 ", (3, 0))):
+        for stdout, want in (("0 0", (0, 0)), ("2 1\n", (2, 1)), (" 3 0 ", (3, 0)), ("0 0 2", (0, 0, 2))):
             with self.subTest(stdout=stdout):
                 self.assertEqual(terminal_work.parse(stdout), want)
 
     def test_malformed_counts(self):
-        for stdout in ("", "1", "1 2 3", "-1 0", "a b", "1  2", "١ 0", "0 ١", "1\t2", "1\n2", None):
+        for stdout in ("", "1", "1 2 3 4", "-1 0", "a b", "1  2", "١ 0", "0 ١", "1\t2", "1\n2", None):
             with self.subTest(stdout=stdout):
                 self.assertIsNone(terminal_work.parse(stdout))
 
     def test_safe_integer_limit_on_both_counts(self):
         cap = 2**53 - 1
         self.assertEqual(terminal_work.parse(f"{cap} {cap}"), (cap, cap))
-        for stdout in (f"{cap + 1} 0", f"0 {cap + 1}", "9" * 5000 + " 0"):
+        for stdout in (f"{cap + 1} 0", f"0 {cap + 1}", f"0 0 {cap + 1}", "9" * 5000 + " 0"):
             with self.subTest(length=len(stdout)):
                 self.assertIsNone(terminal_work.parse(stdout))
 
@@ -65,6 +66,8 @@ class Verdict(unittest.TestCase):
             ((0, "1 0"), (True, (1, 0), "live_tmux_sessions")),
             ((0, "0 2"), (True, (0, 2), "running_terminal_jobs")),
             ((0, "3 1"), (True, (3, 1), "live_tmux_sessions")),
+            ((0, "0 0 2"), (True, (0, 0, 2), "active_code_inference")),
+            ((0, "1 1 2"), (True, (1, 1, 2), "active_code_inference")),
         )
         for probe, want in cases:
             with self.subTest(probe=probe):
@@ -76,6 +79,8 @@ class Verdict(unittest.TestCase):
         self.assertEqual(terminal_work.verdict((0, "3 1"), cap - 1), (True, (3, 1), "live_tmux_sessions"))
         self.assertEqual(terminal_work.verdict((0, "3 1"), cap),
                          (False, (3, 1), "terminal_keepalive_expired"))
+        self.assertEqual(terminal_work.verdict((0, "0 0 1"), cap),
+                         (False, (0, 0, 1), "terminal_keepalive_expired"))
 
     def test_nonfinite_idle_age_does_not_hold(self):
         for idle in (float("nan"), float("inf")):
@@ -108,10 +113,13 @@ class ScriptSemantics(unittest.TestCase):
     def setUp(self):
         self.bin = tempfile.mkdtemp(prefix="ezil-terminal-path-")
         self.addCleanup(shutil.rmtree, self.bin, True)
-        for name in ("awk", "wc", "timeout"):
+        for name in ("awk", "wc", "timeout", "python3"):
             real = shutil.which(name)
             self.assertIsNotNone(real, f"{name} required for shell semantics test")
             os.symlink(real, os.path.join(self.bin, name))
+        self.markers = os.path.join(self.bin, "markers")
+        os.mkdir(self.markers, 0o700)
+        self.script = terminal_work.SCRIPT.replace('"/tmp/ezil-code-ai-activity"', json.dumps(self.markers))
 
     def run_probe(self, lines=(), rc=0):
         path = os.path.join(self.bin, "ps")
@@ -121,7 +129,7 @@ class ScriptSemantics(unittest.TestCase):
                 f.write("printf '%s\\n' " + " ".join(shlex.quote(line) for line in lines) + "\n")
             f.write(f"exit {rc}\n")
         os.chmod(path, 0o700)
-        result = subprocess.run(["/bin/sh", "-c", terminal_work.SCRIPT], env={"PATH": self.bin},
+        result = subprocess.run(["/bin/sh", "-c", self.script], env={"PATH": self.bin},
                                 capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout
@@ -138,12 +146,31 @@ class ScriptSemantics(unittest.TestCase):
         )
         for line, count in cases:
             with self.subTest(line=line):
-                self.assertEqual(self.run_probe([line]), f"0 {count}\n")
+                self.assertEqual(self.run_probe([line]), f"0 {count} 0\n")
         lines = [line for line, _ in cases] + ["800 800 800 801 pts/5"]
-        self.assertEqual(self.run_probe(lines), "0 2\n")
+        self.assertEqual(self.run_probe(lines), "0 2 0\n")
 
     def test_ps_failure_counts_as_no_jobs(self):
-        self.assertEqual(self.run_probe(rc=1), "0 0\n")
+        self.assertEqual(self.run_probe(rc=1), "0 0 0\n")
+
+    def test_only_fresh_regular_private_markers_with_live_pids_hold(self):
+        def marker(index, pid=os.getpid(), mode=0o600):
+            path = os.path.join(self.markers, f"{pid}-12345678-abcd-4abc-8abc-{index:012d}")
+            os.close(os.open(path, os.O_CREAT | os.O_WRONLY, mode))
+            os.chmod(path, mode)
+            return path
+
+        fresh = marker(1)
+        marker(2, pid=9999999)
+        marker(3, mode=0o644)
+        now = time.time()
+        for index, stamp in ((4, now - 75), (5, now + 75)):
+            os.utime(marker(index), (stamp, stamp))
+        os.symlink(fresh, os.path.join(self.markers, f"{os.getpid()}-12345678-abcd-4abc-8abc-000000000006"))
+        os.link(marker(7), os.path.join(self.markers, f"{os.getpid()}-12345678-abcd-4abc-8abc-000000000008"))
+        self.assertEqual(self.run_probe(), "0 0 1\n")
+        os.unlink(fresh)
+        self.assertEqual(self.run_probe(), "0 0 0\n")
 
 
 class Probe(unittest.TestCase):
@@ -187,15 +214,16 @@ class AgentTick(unittest.TestCase):
         argv = ["/bin/sh", "-c", terminal_work.SCRIPT]
         self.execute.return_value = subprocess.CompletedProcess(argv, rc, stdout, "")
 
-    def assert_held(self, counts, reason):
-        self.assertEqual(self.a.tick(), "held_terminal")
+    def assert_held(self, counts, reason, code_inferences=0):
+        self.assertEqual(self.a.tick(), "held_code_inference" if code_inferences else "held_terminal")
         self.execute.assert_called_once()
         self.load.assert_not_called()
         self.flush.assert_not_called()
         self.shutdown.assert_not_called()
         self.assertFalse(os.path.exists(self.stopping))
         idle = int(self.now - self.a.last_presence)
-        self.assertEqual(self.logs, [f"idle stop held: tmuxSessions/terminalJobs={counts} reason={reason} idle={idle}s"])
+        self.assertEqual(self.logs, [f"idle stop held: tmuxSessions/terminalJobs={counts} "
+                                     f"activeCodeInferences={code_inferences} reason={reason} idle={idle}s"])
 
     def assert_stopped(self, reason=None, counts="unknown"):
         self.assertEqual(self.a.tick(), "stopped")
@@ -204,7 +232,8 @@ class AgentTick(unittest.TestCase):
         self.shutdown.assert_called_once_with("idle")
         self.assertTrue(os.path.exists(self.stopping))
         if reason:
-            self.assertEqual(self.logs, [f"terminal hold: none (tmuxSessions/terminalJobs={counts} reason={reason})"])
+            self.assertEqual(self.logs, [f"terminal hold: none (tmuxSessions/terminalJobs={counts} "
+                                         f"activeCodeInferences=0 reason={reason})"])
 
     def test_tmux_session_holds_idle_stop(self):
         self.output("1 0")
@@ -213,6 +242,10 @@ class AgentTick(unittest.TestCase):
     def test_foreground_terminal_jobs_hold_idle_stop(self):
         self.output("0 2")
         self.assert_held("0/2", "running_terminal_jobs")
+
+    def test_code_inference_holds_idle_stop_as_its_own_source(self):
+        self.output("0 0 1")
+        self.assert_held("0/0", "active_code_inference", code_inferences=1)
 
     def test_terminal_hold_precedes_busy_load(self):
         self.output("1 0")
@@ -312,7 +345,7 @@ class AgentTick(unittest.TestCase):
 
     def test_control_plane_stop_does_not_probe(self):
         self.a.stop_request = {"kind": "stop", "warn": 0, "reason": "cap"}
-        self.output("1 0")
+        self.output("1 0 1")
         self.assertEqual(self.a.tick(), "stopped")
         self.state.assert_not_called()
         self.execute.assert_not_called()

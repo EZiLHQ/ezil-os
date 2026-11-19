@@ -48,3 +48,18 @@ last real visible+focused moment).
 
 Quiet foreground reading and active work are not stopped by this pass. Aligning guest presence with terminal
 holds (a new hold signal) is deliberately not part of 1.0.18.
+
+## Hosted Code model work
+
+The Code workspace extension marks in-flight model requests through the computer's
+EZiL proxy. The AWS guest and Cloudflare sandbox inspect fresh markers when an idle
+stop is due. Foreground commands continue to use the existing terminal-work check.
+A hidden tab can therefore have active model or terminal work even after its human
+presence heartbeat stops.
+
+A marker identifies a local process and a single in-flight request. It is refreshed
+only while that request is running, is removed on completion or cancellation, and
+expires if the process exits or stops refreshing it. Explicit stops, fencing, compute
+caps, and the existing terminal-work time limit still apply. This signal affects the
+idle decision. Model request duration remains available in inference diagnostics, and
+human elapsed time and compute billing retain their existing measurements.

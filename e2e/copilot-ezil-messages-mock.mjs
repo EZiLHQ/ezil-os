@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 // Deterministic EZiL gateway double. No model service or credentials required.
 import http from 'node:http';
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 
 export const QWEN = 'qwen.qwen3-coder-next';
 export const KIMI = 'us.moonshotai.kimi-k3';
+export const KIMI_LIFECYCLE_REPLY = 'EZIL_KIMI_LIFECYCLE_REPLY';
 // Opt-in (flash: true, env EZIL_MOCK_FLASH=1): a v1 catalog that lists Gemini 3.8 Flash for this caller and names it
 // `default_model`, as the Gateway does when the route is available; like the Gateway, it refuses sampling for Flash.
 export const FLASH = 'gemini-3.8-flash';
@@ -69,10 +71,11 @@ export function validateBody(body, bytes = Buffer.byteLength(JSON.stringify(body
   return null;
 }
 
+const turnText = turn => (typeof turn.content === 'string' ? [turn.content] : turn.content.filter(block => block.type === 'text').map(block => block.text)).join('\n');
+
 function scriptedContent(body, folder) {
   const history = body.messages.flatMap(turn => Array.isArray(turn.content) ? turn.content : []);
   // The scenario is the newest user prompt that carries a marker: a chat may continue an earlier one.
-  const turnText = turn => (typeof turn.content === 'string' ? [turn.content] : turn.content.filter(block => block.type === 'text').map(block => block.text)).join('\n');
   const marked = body.messages.filter(turn => turn.role === 'user').map(turnText).reverse().find(t => /EZIL_E2E_(UNDO|AGENT|KIMI|SLOW|LONG|SUBAGENT|CHILD)/.test(t)) ?? '';
   const userText = marked;
   const done = id => history.some(block => block.type === 'tool_result' && block.tool_use_id === id);
@@ -176,6 +179,24 @@ export function createMock({ token, folder, captureDir, slow: { parts = 20, ms =
     }
     const invalid = validateBody(body, raw.length, flash ? [QWEN, KIMI, FLASH] : [QWEN, KIMI]);
     if (invalid) return error(invalid.status, invalid.code, invalid.message);
+    const lifecycle = body.model === KIMI && body.tools?.length
+      ? /\bEZIL_E2E_KIMI_LIFECYCLE_[0-9a-f]{32}\b/.exec(turnText(body.messages.at(-1)))?.[0] : null;
+    if (lifecycle) {
+      // Keep the entire JSON response unwritten until the browser has switched
+      // tabs or reloaded. A marker-specific release makes concurrency and timing deterministic.
+      const release = join(captureDir, lifecycle + '.release');
+      record.lifecycle = lifecycle;
+      record.jsonReply = 'held';
+      save();
+      const deadline = Date.now() + 150_000;
+      while (!res.destroyed && !existsSync(release) && Date.now() < deadline) await sleep(25);
+      if (res.destroyed) { record.jsonReply = 'disconnected'; save(); return; }
+      if (!existsSync(release)) { record.jsonReply = 'expired'; save(); return error(504, 'mock_gate_expired', 'Synthetic JSON reply was not released'); }
+      record.jsonReply = 'sent';
+      save();
+      return json(200, { id: 'msg_e2e_' + n, type: 'message', role: 'assistant', model: body.model,
+        content: [{ type: 'text', text: KIMI_LIFECYCLE_REPLY }], stop_reason: 'end_turn', stop_sequence: null, usage });
+    }
     let scripted;
     try { scripted = scriptedContent(body, folder); } catch (err) { return error(500, 'e2e_missing_tool', err.message); }
     // A slow block streams its numbered parts, then SLOW_DONE: long enough to leave a chat while its

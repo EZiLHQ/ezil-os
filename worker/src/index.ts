@@ -3392,8 +3392,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       ? await this.probeTerminalKeepAlive(now - lastActivityAt)
       : null;
     if (terminalHold?.keepAlive) {
+      const hold = terminalHold.codeInference ? 'idle_hold_code_inference' : 'idle_hold_terminal';
       bootLog('workspace_flush', 'start', {
-        detail: `idle_hold_terminal,${terminalHold.detail},idleMs=${now - lastActivityAt}`,
+        detail: `${hold},${terminalHold.detail},idleMs=${now - lastActivityAt}`,
       });
     } else if (isIdleStopDue({ lastActivityAt, now })) {
       // 🔴 SIGNAL B — "no work" is the OTHER half of the owner requirement.
@@ -4056,7 +4057,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
    * the idle branch after `containerIsRunning()`, so it cannot start a
    * container. An exec error becomes `null`, which means NO hold.
    */
-  private async probeTerminalKeepAlive(idleMs: number): Promise<{ keepAlive: boolean; detail: string }> {
+  private async probeTerminalKeepAlive(idleMs: number): Promise<{ keepAlive: boolean; codeInference: boolean; detail: string }> {
     let probe: { exitCode: number; stdout: string } | null = null;
     try {
       const res = await this.exec(TERMINAL_WORK_PROBE_COMMAND, { origin: 'internal' });
@@ -4070,7 +4071,8 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     const work = verdict.work === null ? 'unknown' : `${verdict.work.tmuxSessions}/${verdict.work.runningTerminalJobs}`;
     return {
       keepAlive: verdict.keepAlive,
-      detail: `tmuxSessions/terminalJobs=${work},terminalReason=${verdict.reason}`,
+      codeInference: verdict.reason === 'active_code_inference',
+      detail: `tmuxSessions/terminalJobs=${work},activeCodeInferences=${verdict.work?.activeCodeInferences ?? 0},terminalReason=${verdict.reason}`,
     };
   }
 
