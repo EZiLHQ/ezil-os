@@ -41,3 +41,13 @@ Host configuration. The matching OS app scope requires that computer UUID,
 the canonical owner UUID and the new exact EC2 instance ID observed in
 current placement. The regular Host build and this payload component do
 not enable the timer.
+
+The isolated candidate synth uses the existing AMI config shape with
+`"nativeCandidate": true` as an explicit opt-in. Supply a reviewed absolute
+config to `EZIL_AMI_CONFIG` and run `npm run synth:ami` from
+`infra/app-computers`. Synthesis uses offline inputs. The result names a
+separate `-native-candidate` stack, build role/profile, component recipe,
+pipeline and private image distribution. It derives the exact runtime key in
+the namespace-owned asset bucket and grants that candidate build role
+`s3:GetObject` only for that additional object. The ordinary AgentSrc and ECR
+inputs keep their existing rules. Asset custody is a separate approval.

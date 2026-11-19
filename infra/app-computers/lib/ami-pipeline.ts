@@ -10,10 +10,13 @@ import { NAMESPACE_TAG } from './identity.js';
 import { NamespaceSchema, REGION_PATTERN } from './lifecycle/deployment.js';
 import { workloadPath } from './workload-identity.js';
 
+export const NATIVE_PAYLOAD_OBJECT = 'ami/native-private/native-runtime-cc81f370de328f59520d5198fd49e4853c898530541e0df989f6e33fe1523114.tgz';
+
 export const AmiConfigSchema = z.object({
     namespace: NamespaceSchema,
     accountId: z.string().regex(/^\d{12}$/),
     region: z.string().regex(REGION_PATTERN),
+    nativeCandidate: z.boolean().optional(),
     // Image Builder components and recipes are immutable. Bump for each update,
     // including changed component parameter values or a new parent AMI.
     version: z.string().regex(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/)
@@ -28,10 +31,13 @@ export class AmiPipelineStack extends Stack {
         super(scope, id, props);
         const c = AmiConfigSchema.parse(props.config);
         if (props.env?.region !== c.region || props.env?.account !== c.accountId) throw new Error('stack env must equal the AMI config');
-        const name = `ezil-host-${c.namespace}`, tags = { [NAMESPACE_TAG]: c.namespace };
+        const name = 'ezil-host-' + c.namespace + (c.nativeCandidate ? '-native-candidate' : '');
+        const tags = { [NAMESPACE_TAG]: c.namespace };
+        const buildPrefix = 'ezil-' + c.namespace + (c.nativeCandidate ? '-native-candidate' : '');
         const bucket = new CfnParameter(this, 'AssetBucketName', {
             type: 'String', allowedPattern: '[a-z0-9][a-z0-9-]{1,61}[a-z0-9]',
             description: 'AssetBucketName output of the deploy identity stack',
+            ...(c.nativeCandidate ? { allowedValues: ['ezil-' + c.namespace + '-deploy-assets-' + c.accountId] } : {}),
         });
         const repository = new CfnParameter(this, 'ApplicationImageRepositoryUri', {
             type: 'String',
@@ -103,7 +109,7 @@ export class AmiPipelineStack extends Stack {
         parameters.push({ name: 'PreviousDesktopImageId', value: [previousId.valueAsString] });
 
         const role = new iam.CfnRole(this, 'BuildRole', {
-            roleName: `ezil-${c.namespace}-ami-build`, path: workloadPath(c.namespace),
+            roleName: buildPrefix + '-ami-build', path: workloadPath(c.namespace),
             assumeRolePolicyDocument: { Version: '2012-10-17', Statement: [
                 { Effect: 'Allow', Action: 'sts:AssumeRole', Principal: { Service: 'ec2.amazonaws.com' } },
             ] },
@@ -114,6 +120,8 @@ export class AmiPipelineStack extends Stack {
             policies: [{ policyName: 'BuildInputs', policyDocument: { Version: '2012-10-17', Statement: [
                 { Effect: 'Allow', Action: 's3:GetObject',
                     Resource: Fn.sub('arn:${AWS::Partition}:s3:::${Bucket}/ami/host-agent-*.tgz', { Bucket: bucket.valueAsString }) },
+                ...(c.nativeCandidate ? [{ Effect: 'Allow', Action: 's3:GetObject',
+                    Resource: Fn.sub('arn:${AWS::Partition}:s3:::${Bucket}/' + NATIVE_PAYLOAD_OBJECT, { Bucket: bucket.valueAsString }) }] : []),
                 { Effect: 'Allow', Action: 'ecr:GetAuthorizationToken', Resource: '*' },
                 { Effect: 'Allow', Action: ['ecr:BatchGetImage', 'ecr:GetDownloadUrlForLayer', 'ecr:BatchCheckLayerAvailability'],
                     Resource: repositoryArn },
@@ -121,16 +129,26 @@ export class AmiPipelineStack extends Stack {
             tags: [{ key: NAMESPACE_TAG, value: c.namespace }],
         });
         const profile = new iam.CfnInstanceProfile(this, 'BuildProfile', {
-            instanceProfileName: `ezil-${c.namespace}-ami-build`,
+            instanceProfileName: buildPrefix + '-ami-build',
             path: workloadPath(c.namespace), roles: [role.ref],
         });
         const component = new imagebuilder.CfnComponent(this, 'Component', {
             name, platform: 'Linux', version: c.version, tags,
             data: readFileSync(join(__dirname, '../../host-agent/ami/imagebuilder-component.yaml'), 'utf8'),
         });
+        const components: imagebuilder.CfnImageRecipe.ComponentConfigurationProperty[] = [{ componentArn: component.ref, parameters }];
+        if (c.nativeCandidate) {
+            const native = new imagebuilder.CfnComponent(this, 'NativeCandidateComponent', {
+                name: name + '-payload', platform: 'Linux', version: c.version, tags,
+                data: readFileSync(join(__dirname, '../../host-agent/ami/imagebuilder-native-component.yaml'), 'utf8'),
+            });
+            components.push({ componentArn: native.ref, parameters: [{
+                name: 'NativePayloadS3Uri',
+                value: [Fn.sub('s3://${Bucket}/' + NATIVE_PAYLOAD_OBJECT, { Bucket: bucket.valueAsString })],
+            }] });
+        }
         const recipe = new imagebuilder.CfnImageRecipe(this, 'Recipe', {
-            name, version: c.version, parentImage: parent.valueAsString, tags,
-            components: [{ componentArn: component.ref, parameters }],
+            name, version: c.version, parentImage: parent.valueAsString, tags, components,
             // Canonical's root device is /dev/sda1, including on Nitro instances.
             blockDeviceMappings: [{ deviceName: '/dev/sda1',
                 ebs: { volumeType: 'gp3', volumeSize: 30, encrypted: true, deleteOnTermination: true } }],
