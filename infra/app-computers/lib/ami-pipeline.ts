@@ -17,11 +17,15 @@ export const AmiConfigSchema = z.object({
     accountId: z.string().regex(/^\d{12}$/),
     region: z.string().regex(REGION_PATTERN),
     nativeCandidate: z.boolean().optional(),
+    nativeCandidateParentAmi: z.string().regex(/^ami-[0-9a-f]{8,17}$/).optional(),
     // Image Builder components and recipes are immutable. Bump for each update,
     // including changed component parameter values or a new parent AMI.
     version: z.string().regex(/^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/)
         .refine(v => v.split('.').every(n => Number(n) <= 1073741823)),
-}).strict();
+}).strict().refine(c => Boolean(c.nativeCandidate) === (c.nativeCandidateParentAmi !== undefined), {
+    message: 'Only a native candidate supplies an independently verified literal parent AMI',
+    path: ['nativeCandidateParentAmi'],
+});
 export type AmiConfig = z.infer<typeof AmiConfigSchema>;
 
 /** Founder change sets only: the workload boundary deliberately cannot grant
@@ -60,13 +64,14 @@ export class AmiPipelineStack extends Stack {
         const securityGroup = new CfnParameter(this, 'SecurityGroupId', {
             type: 'AWS::EC2::SecurityGroup::Id', description: 'Foundation SecurityGroupId',
         });
-        const parent = new CfnParameter(this, 'UbuntuAmiId', {
+        // A separate candidate keeps its reviewed base byte-identifiable even as Canonical's SSM alias moves.
+        const parentImage = c.nativeCandidateParentAmi ?? new CfnParameter(this, 'UbuntuAmiId', {
             type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>',
             default: '/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id',
             // Validate the SSM key, not just the image ID that it resolves to.
             allowedValues: ['/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id'],
             description: 'Canonical Ubuntu 24.04 amd64 public SSM parameter; resolved by CloudFormation',
-        });
+        }).valueAsString;
         // Restrict shell-interpolated component inputs to their expected formats.
         const inputs = {
             AgentSrcS3Uri: 's3://[a-z0-9][a-z0-9-]{1,61}[a-z0-9]/ami/host-agent-[a-f0-9]{40}\\.tgz',
@@ -148,7 +153,7 @@ export class AmiPipelineStack extends Stack {
             }] });
         }
         const recipe = new imagebuilder.CfnImageRecipe(this, 'Recipe', {
-            name, version: c.version, parentImage: parent.valueAsString, tags, components,
+            name, version: c.version, parentImage, tags, components,
             // Canonical's root device is /dev/sda1, including on Nitro instances.
             blockDeviceMappings: [{ deviceName: '/dev/sda1',
                 ebs: { volumeType: 'gp3', volumeSize: 30, encrypted: true, deleteOnTermination: true } }],

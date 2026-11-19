@@ -164,7 +164,10 @@ test('AMI inputs reject unpinned images, foreign repositories, broad tarball pat
 
 test('AMI config requires matching explicit account/region and a bounded immutable version', () => {
     for (const bad of [{ namespace: 'identity' }, { accountId: '123' }, { region: 'somewhere' },
-        { version: 'latest' }, { version: '1.0.1073741824' }, { version: '01.0.0' }]) {
+        { version: 'latest' }, { version: '1.0.1073741824' }, { version: '01.0.0' },
+        { nativeCandidate: true }, { nativeCandidateParentAmi: 'ami-0123456789abcdef0' },
+        { nativeCandidate: false, nativeCandidateParentAmi: 'ami-0123456789abcdef0' },
+        { nativeCandidate: true, nativeCandidateParentAmi: '/aws/service/canonical/ubuntu' }]) {
         assert.equal(AmiConfigSchema.safeParse({ ...config, ...bad }).success, false);
     }
     for (const env of [{ account: '210987654321', region: config.region }, { account: config.accountId, region: 'eu-west-2' }]) {
@@ -205,7 +208,7 @@ test('previous lower inputs are paired, optional, distinct and use the approved 
 
 test('native candidate synthesizes a separate private recipe and only one extra exact object read', () => {
     const ordinary = template().toJSON();
-    const c = { ...config, nativeCandidate: true };
+    const c = { ...config, nativeCandidate: true, nativeCandidateParentAmi: 'ami-0123456789abcdef0' };
     const t = assertions.Template.fromStack(new AmiPipelineStack(new App(), 'ezil-pilot-ami-native-candidate', {
         config: c, env: { account: c.accountId, region: c.region },
         synthesizer: new BootstraplessSynthesizer(), terminationProtection: true,
@@ -216,6 +219,9 @@ test('native candidate synthesizes a separate private recipe and only one extra 
     assert.equal(r.BuildProfile.Properties.InstanceProfileName, 'ezil-pilot-native-candidate-ami-build');
     assert.deepEqual(t.Parameters.AssetBucketName.AllowedValues, ['ezil-pilot-deploy-assets-123456789012']);
     assert.equal(t.Parameters.NativePayloadS3Uri, undefined);
+    assert.equal(t.Parameters.UbuntuAmiId, undefined);
+    assert.equal(r.Recipe.Properties.ParentImage, 'ami-0123456789abcdef0');
+    assert.deepEqual(ordinary.Resources.Recipe.Properties.ParentImage, { Ref: 'UbuntuAmiId' });
     const statements = r.BuildRole.Properties.Policies[0].PolicyDocument.Statement;
     assert.deepEqual(statements.filter((s: { Action: unknown }) => s.Action === 's3:GetObject'), [
         ordinary.Resources.BuildRole.Properties.Policies[0].PolicyDocument.Statement[0],
