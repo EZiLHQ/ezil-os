@@ -11,6 +11,7 @@ import { EZiLModelsProvider, type BillingIntent } from './provider';
 import { PARTICIPANT_ID, registerNoToolsParticipant } from './participant';
 import type { Usage } from './types';
 import { publishInferenceTrace } from './trace-publisher';
+import { hostedInferenceActivity } from './inference-activity';
 
 export const DEFAULT_CONFIG_PATH = '/etc/ezil/models.json';
 export const CONFIG_ENV = 'EZIL_MODELS_CONFIG';
@@ -262,6 +263,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         logRequests: () => settings().get<boolean>('logRequests') === true,
         log,
         inferenceDiagnostic: record => publishInferenceTrace(record, (command, clean) => vscode.commands.executeCommand(command, clean)),
+        beginInferenceActivity: hostedInferenceActivity,
         appFailure: sendAppFailure,
         billingIntent: sendBillingIntent,
         recordUsage: (model, used, elapsedMs) => {

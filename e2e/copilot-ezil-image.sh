@@ -13,8 +13,8 @@ OUT="$(mkdir -p "${EZIL_COPILOT_E2E_OUT:-./ezil-e2e-out}" && cd "${EZIL_COPILOT_
 CODE_URL=""
 FORWARD_PORT="${EZIL_COPILOT_E2E_PORT:-18443}"
 FORWARD_PID=""
-# Passes to run, in order (default all): fresh returning history sessions compaction phone early subagent flash plan
-PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions compaction phone early subagent flash plan} "
+# Passes to run, in order (default all): fresh returning history sessions lifecycle compaction phone early subagent flash plan
+PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions lifecycle compaction phone early subagent flash plan} "
 MOCK_PORT=4142
 TEST_TOKEN=lanec-e2e-only
 CAPTURE_DIR=/tmp/copilot-ezil-mock
@@ -276,6 +276,23 @@ start_mock || fail=1
 run_history sessions "$OUT/sessions" || fail=1
 collect_logs sessions
 network_checks sessions || fail=1
+fi
+
+if [[ "$PASSES" == *" lifecycle "* ]]; then
+echo "[e2e] lifecycle — Kimi JSON across a tab switch, iframe hide, and full reload"
+STL="$WORK/lifecycle"; mkdir -p "$STL/home/neko/project" "$STL/etc/ezil"
+node -e 'const cfg=require(process.argv[1]);for(const m of cfg.models){m.default=m.id==="us.moonshotai.kimi-k3";m.roles=m.roles?.filter(role=>role!=="default")}process.stdout.write(JSON.stringify(cfg))' \
+  "$here/copilot-ezil-models.json" >"$STL/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+previous_token="$TEST_TOKEN"
+printf -v TEST_TOKEN '%064d' 1 # Synthetic boot-token shape for the standalone extension.
+boot "$STL"
+start_mock || fail=1
+EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" \
+  EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" EZIL_E2E_OUT="$OUT/lifecycle" node "$here/copilot-ezil-lifecycle.mjs" || fail=1
+collect_logs lifecycle
+network_checks lifecycle || fail=1
+TEST_TOKEN="$previous_token"
 fi
 
 # ── Pass 5: a long Kimi chat outgrows the input bound and continues, compacted (founder 75e327c8) ──

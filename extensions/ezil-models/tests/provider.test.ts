@@ -627,13 +627,22 @@ describe('EZiL gateway VS Code bridge', () => {
             bodies.push(JSON.parse(new TextDecoder().decode(init!.body as Uint8Array)));
             return new Response(frames().join(''), { headers: { 'content-type': 'text/event-stream' } });
         }) as unknown as typeof fetch, () => Response.json(catalog(131072, 2048)));
-        const provider = new EZiLModelsProvider(host);
+        const stopActivity = mock(() => {});
+        const beginInferenceActivity = mock(() => stopActivity);
+        const provider = new EZiLModelsProvider({ ...host, beginInferenceActivity });
         for (const requestInitiator of ['title', 'copilot.summary', 'progress', 'utilitySmall']) {
             await provider.provideLanguageModelChatResponse(toInformation(host.models()[1]!), [message(1, [new TextPart('q')])] as never,
                 { tools: [], modelOptions: { requestInitiator } } as never, { report: () => {} }, token() as never);
         }
         expect(bodies.every(b => b.model === gw().model && b.stream === true)).toBe(true);
         expect(bodies.map(b => b.max_tokens)).toEqual([2048, 2048, 2048, 2048]);
+        await provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
+            { tools: [], modelOptions: { _ezilCompaction: true } } as never, { report: () => {} }, token() as never);
+        expect(beginInferenceActivity).not.toHaveBeenCalled();
+        await provider.provideLanguageModelChatResponse(toInformation(host.models()[0]!), [message(1, [new TextPart('q')])] as never,
+            { tools: [], modelOptions: {} } as never, { report: () => {} }, token() as never);
+        expect(beginInferenceActivity).toHaveBeenCalledTimes(1);
+        expect(stopActivity).toHaveBeenCalledTimes(1);
     });
     const baselineRoot = process.env.COPILOT_BASELINE_TEST_ROOT;
     const patchedRoot = process.env.COPILOT_PATCHED_TEST_ROOT;
