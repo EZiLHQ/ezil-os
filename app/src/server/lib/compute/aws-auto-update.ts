@@ -1,6 +1,7 @@
 import { getBillingDeps } from '@/server/billing/deps';
 import { billingV2EntitlementReader, gateComputerStart } from '@/server/billing/v2/compute-access';
 import { billingComputeMeter } from '@/server/billing/v2/compute-meter';
+import { automaticImageUpdateWait, type AutomaticImageUpdateWait } from './aws-auto-update-progress';
 import { sharedAwsSdkCollaborators } from './aws-clients';
 import { automaticImageUpdateCohortIncludes, instanceTypeForTier, readAwsAdmissionConfig, readAwsEnrollUrl } from './aws-config';
 import { imageDesktopHealthy } from './aws-rebase-health';
@@ -37,13 +38,14 @@ export async function verifyLaunchedStagingImageUpdates(db: PlacementDb) {
     }));
 }
 
-export async function advanceStagingImageUpdate(db: PlacementDb, computerId: string, ownerUserId: string, allowStart: boolean) {
+export async function advanceStagingImageUpdate(db: PlacementDb, computerId: string, ownerUserId: string,
+    allowStart: boolean): Promise<AutomaticImageUpdateWait | null> {
     const env = process.env;
-    if (env.EZIL_AWS_AUTO_REBASE !== '1' || !isStaging() || !automaticImageUpdateCohortIncludes(computerId, env)) return false;
+    if (env.EZIL_AWS_AUTO_REBASE !== '1' || !isStaging() || !automaticImageUpdateCohortIncludes(computerId, env)) return null;
     const admission = readAwsAdmissionConfig(env);
-    if (!admission.enabled || admission.killSwitch) return false;
+    if (!admission.enabled || admission.killSwitch) return null;
     const engine = dependencies(db);
-    if (!engine) return false;
+    if (!engine) return null;
     const result = await handleImageRebase(engine, { schemaVersion: 1, operation: 'prepare', computerId, jobId: null }, {
         ownerUserId, allowStart,
         canBoot: async p => {
@@ -62,5 +64,5 @@ export async function advanceStagingImageUpdate(db: PlacementDb, computerId: str
         if (allowStart && body.jobId === null && body.failureCode === 'image_job_conflict')
             return advanceStagingImageUpdate(db, computerId, ownerUserId, false);
     }
-    return body.jobId !== null && (body.eligible || (result.status === 202 && body.failureCode === 'desktop_unhealthy'));
+    return automaticImageUpdateWait(result);
 }

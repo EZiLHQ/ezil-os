@@ -11,7 +11,7 @@ import { ImageJobConflictError } from '@/server/lib/compute/placement';
 
 const state = vi.hoisted(() => ({
     signedIn: true, seen: [] as unknown[], answer: { ok: true } as unknown,
-    error: null as Error | null, advance: vi.fn().mockResolvedValue(false),
+    error: null as Error | null, advance: vi.fn().mockResolvedValue(null),
 }));
 const userId = '11111111-1111-4111-8111-111111111111';
 const computerId = '22222222-2222-4222-8222-222222222222';
@@ -35,7 +35,7 @@ const post = (body: unknown) => POST(new Request('https://app.example/api/shell/
 
 beforeEach(() => {
     state.signedIn = true; state.seen = []; state.answer = { ok: true }; state.error = null;
-    state.advance.mockReset().mockResolvedValue(false);
+    state.advance.mockReset().mockResolvedValue(null);
     vi.spyOn(console, 'warn').mockImplementation(() => {});
 });
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
@@ -90,7 +90,7 @@ describe('automatic AWS image update on Code open', () => {
 
     it('starts only on an opted-in owner open and answers with a bounded AWS wake state', async () => {
         state.answer = rebaseRequired;
-        state.advance.mockResolvedValue(true);
+        state.advance.mockResolvedValue({ milestone: { percent: 20, stage: 'saving_files' } });
         vi.stubEnv('EZIL_AWS_AUTO_REBASE', '0');
         expect(await (await post({ computerId, intent: 'open' })).json()).toEqual(rebaseRequired);
         vi.stubEnv('EZIL_AWS_AUTO_REBASE', '1');
@@ -100,6 +100,7 @@ describe('automatic AWS image update on Code open', () => {
         expect(await (await post({ computerId, intent: 'open' })).json()).toMatchObject({
             ok: false, error: 'computer_updating', errorCode: 'sandbox_starting',
             computeProvider: 'aws-ec2', computeUpdating: true, computeLaunching: true,
+            computeUpdatePercent: 20, computeUpdateStage: 'saving_files',
         });
         expect(state.advance).toHaveBeenCalledExactlyOnceWith({}, computerId, userId, true);
     });
@@ -107,11 +108,29 @@ describe('automatic AWS image update on Code open', () => {
     it('continues an existing automatic job when tRPC wraps the placement fence', async () => {
         vi.stubEnv('EZIL_AWS_AUTO_REBASE', '1');
         state.error = new TRPCError({ code: 'INTERNAL_SERVER_ERROR', cause: new ImageJobConflictError() });
-        state.advance.mockResolvedValue(true);
+        state.advance.mockResolvedValue({ milestone: { percent: 60, stage: 'checking_computer' } });
         expect(await (await post({ computerId, intent: 'open' })).json()).toMatchObject({
             ok: false, error: 'computer_updating', errorCode: 'sandbox_starting',
+            computeUpdatePercent: 60, computeUpdateStage: 'checking_computer',
         });
         expect(state.advance).toHaveBeenCalledExactlyOnceWith({}, computerId, userId, false);
+    });
+
+    it('keeps an unproved update phase indeterminate and omits internal evidence', async () => {
+        vi.stubEnv('EZIL_AWS_AUTO_REBASE', '1');
+        state.answer = rebaseRequired;
+        state.advance.mockResolvedValue({});
+        expect(await (await post({ computerId, intent: 'open' })).json()).toEqual({
+            ok: false, error: 'computer_updating', errorCode: 'sandbox_starting', retryable: true,
+            provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2', computeUpdating: true, computeLaunching: true,
+        });
+    });
+
+    it('does not attach update progress to an ordinary Code mint', async () => {
+        vi.stubEnv('EZIL_AWS_AUTO_REBASE', '1');
+        state.answer = { ok: true, codePreviewUrl: 'https://x/preview-bootstrap?token=t' };
+        expect(await (await post({ computerId, intent: 'open' })).json()).toEqual(state.answer);
+        expect(state.advance).not.toHaveBeenCalled();
     });
 
     it('preserves the existing refusal if the update is ineligible', async () => {

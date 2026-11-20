@@ -148,7 +148,7 @@ import { attachFolderBridge, createFolderNotice, detachFolderBridge, editorDocum
 import { register_app_frame } from '../ui/feedback/app-failures.js';
 import { register_billing_frame } from '../ui/Settings/billing-recovery.js';
 import { computeBootUiState, FRAME_CONFIRM_DEADLINE_MS } from '../boot-phases.js';
-import AppSpinner from '../ui/app-spinner.js';
+import AppSpinner, { computerUpdateMilestone } from '../ui/app-spinner.js';
 import { TRANSITION_EVENT, watchComputerTransition } from '../ui/computer-progress.js';
 import attach_app_drawer from '../ui/app-drawer.js';
 import { createFullView } from '../ui/full-view.js';
@@ -460,7 +460,7 @@ async function mintCodePreviewUrl (computerId, signal, project = null, folder = 
     // Stop also reaches it through `session.cancelComputerOpens`.
     return session.cancellableWake(computerId, 'codePreviewUrl', async (s) => {
         const result = await mintCodePreviewUrlOnce(computerId, s, project, folder);
-        if (!s.aborted) onUpdate?.(result.computeUpdating === true);
+        if (!s.aborted && result.computeUpdating === true) onUpdate?.(result.updateMilestone);
         return result;
     }, { signal });
 }
@@ -551,7 +551,8 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = nul
     if ( data?.ok !== true ) {
         const pending = session.pendingOrRefused(data);
         return pending.errorCode === 'sandbox_starting' && pending.computeProvider === 'aws-ec2' && data?.computeUpdating === true
-            ? { ...pending, computeUpdating: true } : pending;
+            ? { ...pending, computeUpdating: true,
+                updateMilestone: computerUpdateMilestone(data.computeUpdateStage, data.computeUpdatePercent) } : pending;
     }
     if ( typeof data.codePreviewUrl !== 'string' || data.codePreviewUrl === '' ) {
         // Reported success with nothing to show. Loud, not silent — same rule
@@ -832,10 +833,11 @@ export async function openCodeWindow (ctx = {}) {
     };
 
     let updating = false;
+    let updateMilestone = null;
     const nativeFailureCopy = nativeSurface ? editorFailureCopy() : undefined;
     const progress = AppSpinner({ computerId: nativeSurface ? undefined : computer.id, label: 'Opening Code…', icon: ctx.icon, isMigrating: () => session.isComputeMigrating(computer.id),
         isLaunching: () => session.isComputeLaunching(computer.id),
-        isUpdating: () => updating,
+        isUpdating: () => updating, getUpdateMilestone: () => updateMilestone,
         // Round 6 (seam C): the first Code open after the computer starts waits for its config to apply.
         isPreparing: () => session.isComputePreparing(computer.id),
         onRetry: () => {
@@ -993,6 +995,7 @@ export async function openCodeWindow (ctx = {}) {
         show_panel();
         running_signal = undefined;
         updating = false;
+        updateMilestone = null;
 
         if ( desktop_state.configured !== true ) {
             console.warn(`[${PHASE}] no desktop provider is configured`);
@@ -1035,11 +1038,16 @@ export async function openCodeWindow (ctx = {}) {
         mint_ctl = new AbortController();
         const asked = project;
         const res = await (nativeSurface ? nativeSurface.open(ctx.previewPort)
-            : mintCodePreviewUrl(computer.id, mint_ctl.signal, asked, wanted_folder, pending => {
-                if (my_attempt === attempt) updating = pending;
+            : mintCodePreviewUrl(computer.id, mint_ctl.signal, asked, wanted_folder, milestone => {
+                if (my_attempt !== attempt) return;
+                updating = true;
+                // A transient wake response or an older milestone must not reset this open's progress.
+                if (milestone && (!updateMilestone || milestone.percent > updateMilestone.percent)) updateMilestone = milestone;
             }));
 
         if ( disposed || my_attempt !== attempt ) return;
+        updating = false;
+        updateMilestone = null;
         stop_timers();
 
         if ( ! res.ok ) {

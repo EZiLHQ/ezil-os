@@ -911,6 +911,61 @@ await settle(4);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// 6. The real Code wake loop carries a verified image-update milestone across
+//    an ordinary AWS pending reply, invalid DTOs and out-of-order milestones.
+{
+    let asks = 0;
+    let answer = null;
+    const pending = { ok: false, errorCode: 'sandbox_starting', computeProvider: 'aws-ec2', computeLaunching: true };
+    const updating = { ...pending, computeUpdating: true };
+    const waitFor = async condition => {
+        for (let n = 0; n < 100 && !condition(); n++) await tick(50);
+        return condition();
+    };
+    answer = updating;
+    codeMintAnswer = () => { asks++; return { payload: answer }; };
+    await ezil.registry.launch('code', { payload: PAYLOAD, computer: COMPUTER, desktopState: PAYLOAD.desktopState });
+    const w = q('.window[data-app="code"]');
+    const spinner = w?.querySelector('.ezil-app-spinner');
+    const bar = spinner?.querySelector('.ezil-opening-bar');
+    const title = () => spinner?.querySelector('.ezil-opening-title')?.textContent;
+    const status = () => spinner?.querySelector('.ezil-opening-status')?.textContent;
+    const next = async payload => {
+        const previous = asks;
+        answer = payload;
+        await waitFor(() => asks > previous);
+        // Let the Code window's existing paint tick present the new response.
+        await settle(12);
+    };
+    await waitFor(() => title() === 'Updating your computer');
+    push('the built Code updater accepts older pending responses without guessing progress',
+        title() === 'Updating your computer' && bar?.dataset.indeterminate === 'true');
+    await next({ ...updating, computeUpdateStage: 'starting_computer', computeUpdatePercent: 20 });
+    push('a mismatched milestone stays indeterminate in the built Code window',
+        title() === 'Updating your computer' && bar?.dataset.indeterminate === 'true');
+    await next({ ...updating, computeUpdateStage: 'starting_computer', computeUpdatePercent: 40 });
+    push('Code displays the trusted start milestone',
+        status() === 'Starting your computer · 40%' && bar?.getAttribute('aria-valuenow') === '40');
+    await next(pending);
+    push('an ordinary wake retry retains the last verified update milestone and percent',
+        title() === 'Updating your computer' && status() === 'Starting your computer · 40%' && bar?.dataset.percent === '40');
+    await next({ ...updating, computeUpdateStage: 'saving_files', computeUpdatePercent: 20 });
+    push('a stale update answer cannot regress the displayed milestone',
+        status() === 'Starting your computer · 40%' && bar?.dataset.percent === '40');
+    await next({ ...updating, computeUpdateStage: 'opening_code', computeUpdatePercent: 80 });
+    push('Code shows the verified handoff milestone before the editor mint',
+        title() === 'Updating your computer' && status() === 'Opening Code · 80%' && bar?.dataset.percent === '80');
+    const before = mintedUrls.length;
+    codeMintAnswer = null;
+    await waitFor(() => mintedUrls.length > before && title() !== 'Updating your computer');
+    push('a successful mint leaves the updater and hands the verified frame to Code',
+        mintedUrls.length > before && title() !== 'Updating your computer'
+        && untag(w?.querySelector('.window-app-iframe')?.getAttribute('src')) === mintedUrls.at(-1));
+    await window.$(w).close();
+    await settle(4);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // 7. FULL VIEW, ITS STRIP AND TRAY, RELAUNCH, AND "RECONNECTING…" /
 //    "COMPUTER STOPPED" (app-code lane A2, 2026-10-30; the strip reshaped by
 //    gate G3, 2026-10-31; docs/APP-CODE-FULL-VIEW.md).

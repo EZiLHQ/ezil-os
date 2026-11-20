@@ -53,6 +53,20 @@ export const OPEN_COPY = {
     details: 'Details',
 };
 
+const UPDATE_PROGRESS = {
+    saving_files: { percent: 20, status: 'Saving your files' },
+    starting_computer: { percent: 40, status: 'Starting your computer' },
+    checking_computer: { percent: 60, status: 'Checking your computer' },
+    opening_code: { percent: 80, status: 'Opening Code' },
+};
+
+/** One verified server milestone. An unrecognized pair has no position on the bar. */
+export function computerUpdateMilestone (stage, percent) {
+    if (typeof stage !== 'string' || !Object.hasOwn(UPDATE_PROGRESS, stage)) return null;
+    const milestone = UPDATE_PROGRESS[stage];
+    return milestone.percent === percent ? milestone : null;
+}
+
 const CURVE_MAX = 0.88;
 const CURVE_RATE = 2.2;
 /** Stage floors by server milestone index (requested … desktop_ready, then the client's url_received). */
@@ -132,6 +146,7 @@ function viewComputerStatus () {
  * @param {() => boolean} [opts.isMigrating] Reads this computer's observed migration state.
  * @param {() => boolean} [opts.isLaunching] Reads this computer's observed fresh launch state.
  * @param {() => boolean} [opts.isUpdating] Reads whether this open is advancing a computer update.
+ * @param {() => ({percent: number, status: string}|null)} [opts.getUpdateMilestone] Latest verified milestone for this open.
  * @param {() => boolean} [opts.isPreparing] Round 6 (seam C): the server said this computer's desktop is taking its
  *   config (or code-server is starting after it). Seen once, the open shows that wait to its end.
  * @param {() => boolean} [opts.isMoving] Phase B: the server answered THIS caller's own open `computeMoving` (its files
@@ -140,7 +155,8 @@ function viewComputerStatus () {
  * @param {{title: string, body: string}} [opts.failureCopy] Static app-specific failure guidance.
  */
 export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…', appName, icon, className, onRetry, onViewStatus,
-    failureCopy, isMigrating = () => false, isLaunching = () => false, isPreparing = () => false, isMoving = () => false, isUpdating = () => false } = {}) {
+    failureCopy, isMigrating = () => false, isLaunching = () => false, isPreparing = () => false, isMoving = () => false,
+    isUpdating = () => false, getUpdateMilestone = () => null } = {}) {
     const root = document.createElement('div');
     root.className = 'ezil-app-spinner';
     if (typeof className === 'string' && className) root.classList.add(...className.split(/\s+/).filter(Boolean));
@@ -453,8 +469,10 @@ export function AppSpinner ({ computerId, onProgressChange, label = 'Opening…'
         if (pending && paintMove(state, observation?.updated ? `Last recorded update: ${observation.updated}` : null)) return;
         if (progressing && !runningLong && isUpdating()) {
             const t = elapsedOf();
-            paint({ state: 'opening', title: 'Updating your computer', status: 'Code will open when the update is ready.',
-                meta: t >= META_AFTER_S ? formatElapsed(t) : '', bar: 'indeterminate' });
+            const milestone = getUpdateMilestone();
+            const status = milestone ? `${milestone.status} · ${milestone.percent}%` : 'Code will open when the update is ready.';
+            paint({ state: 'opening', title: 'Updating your computer', status,
+                meta: t >= META_AFTER_S ? formatElapsed(t) : '', bar: milestone ? milestone.percent / 100 : 'indeterminate' });
             return;
         }
         const view = observation ?? (progressing && open && !open.ended ? open.view : null);

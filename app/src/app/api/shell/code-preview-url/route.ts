@@ -4,6 +4,7 @@ import { repoOpenFailureResponse } from '@/server/feedback/repo-open-failure';
 import { appRouter } from '@/server/api/root';
 import { createTRPCContext } from '@/server/api/trpc';
 import { newCorrelationId, resolveCloudflareGuacamoleConfig } from '@/server/lib/cloudflare-guacamole-provider';
+import type { AutomaticImageUpdateWait } from '@/server/lib/compute/aws-auto-update-progress';
 import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-control-auth';
 import { ImageJobConflictError, PlacementOwnerError, type PlacementDb, type PlacementExecutor } from '@/server/lib/compute/placement';
 import {
@@ -122,14 +123,18 @@ export async function POST(req: Request) {
         } catch (error) {
             // tRPC wraps placement errors from its procedures. Control lookups can throw the original.
             const cause = error instanceof TRPCError ? error.cause : error;
-            if (intent === 'open' && cause instanceof ImageJobConflictError
-                && await advanceUpdate(ctx as ProjectCtx, computerId, false)) return updatePending();
+            if (intent === 'open' && cause instanceof ImageJobConflictError) {
+                const update = await advanceUpdate(ctx as ProjectCtx, computerId, false);
+                if (update) return updatePending(update);
+            }
             throw error;
         }
         if (intent === 'open' && process.env.EZIL_AWS_AUTO_REBASE === '1') {
             const result = await response.clone().json().catch(() => null);
-            if (result?.ok === false && result.errorCode === 'computer_rebase_required'
-                && await advanceUpdate(ctx as ProjectCtx, computerId, true)) return updatePending();
+            if (result?.ok === false && result.errorCode === 'computer_rebase_required') {
+                const update = await advanceUpdate(ctx as ProjectCtx, computerId, true);
+                if (update) return updatePending(update);
+            }
         }
         return response;
     } catch (err) {
@@ -140,19 +145,20 @@ export async function POST(req: Request) {
 type ProjectCtx = Awaited<ReturnType<typeof createTRPCContext>> & { user: { id: string } };
 type ShellCaller = Awaited<ReturnType<typeof shellCaller>>['caller'];
 
-function updatePending() {
+function updatePending({ milestone }: AutomaticImageUpdateWait) {
     return shellJson({ ok: false, error: 'computer_updating', errorCode: 'sandbox_starting',
-        retryable: true, provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2', computeUpdating: true, computeLaunching: true });
+        retryable: true, provider: 'cloudflare-guacamole', computeProvider: 'aws-ec2', computeUpdating: true, computeLaunching: true,
+        ...(milestone ? { computeUpdatePercent: milestone.percent, computeUpdateStage: milestone.stage } : {}) });
 }
 
-async function advanceUpdate(ctx: ProjectCtx, computerId: string, allowStart: boolean) {
-    if (process.env.EZIL_AWS_AUTO_REBASE !== '1') return false;
+async function advanceUpdate(ctx: ProjectCtx, computerId: string, allowStart: boolean): Promise<AutomaticImageUpdateWait | null> {
+    if (process.env.EZIL_AWS_AUTO_REBASE !== '1') return null;
     try {
         const { advanceStagingImageUpdate } = await import('@/server/lib/compute/aws-auto-update');
         return await advanceStagingImageUpdate(ctx.db as unknown as PlacementDb, computerId, ctx.user.id, allowStart);
     } catch {
         // Preserve the existing refusal when a request cannot safely advance an update.
-        return false;
+        return null;
     }
 }
 

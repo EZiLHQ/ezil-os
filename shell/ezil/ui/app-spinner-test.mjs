@@ -47,7 +47,7 @@ globalThis.HTMLElement = dom.window.HTMLElement;
 const originalNow = Date.now;
 let now = 0; Date.now = () => now;
 
-const { AppSpinner, openingFill } = await import('./app-spinner.js');
+const { AppSpinner, computerUpdateMilestone, openingFill } = await import('./app-spinner.js');
 const $ = (s, sel) => s.el.querySelector(sel);
 const titleOf = s => $(s, '.ezil-app-spinner-label')?.textContent;
 const statusOf = s => $(s, '.ezil-app-spinner-sub');
@@ -658,15 +658,37 @@ try {
     now = 0;
     {
         let updating = true;
+        let milestone = null;
         await observe(runningNow, async spinner => {
-            push('a confirmed computer update shows its own Code progress without guessing a percentage',
+            const bar = barEl(spinner);
+            now = 10_000;
+            spinner.render({ kind: 'progress' });
+            push('an update without a verified milestone shows elapsed time with an indeterminate bar',
                 titleOf(spinner) === 'Updating your computer'
                 && statusOf(spinner).textContent === 'Code will open when the update is ready.'
-                && barEl(spinner).dataset.indeterminate === 'true');
+                && bar.dataset.indeterminate === 'true' && !bar.hasAttribute('aria-valuenow')
+                && metaOf(spinner).textContent === '0:10');
+            for (const [stage, percent, label] of [
+                ['saving_files', 20, 'Saving your files'],
+                ['starting_computer', 40, 'Starting your computer'],
+                ['checking_computer', 60, 'Checking your computer'],
+                ['opening_code', 80, 'Opening Code'],
+            ]) {
+                milestone = computerUpdateMilestone(stage, percent);
+                spinner.render({ kind: 'progress' });
+                const status = `${label} · ${percent}%`;
+                push(`the ${stage} milestone renders one accessible determinate bar at ${percent}%`,
+                    statusOf(spinner).textContent === status && bar.dataset.indeterminate === undefined
+                    && bar.dataset.percent === String(percent) && bar.getAttribute('aria-valuenow') === String(percent)
+                    && bar.getAttribute('aria-valuetext') === status && metaOf(spinner).textContent === '0:10');
+            }
+            push('unknown, malformed or finished-looking server pairs have no update percentage',
+                [['saving_files', 40], ['opening_code', 100], ['opening_code', '80'], ['constructor', 80], [null, 80]]
+                    .every(([stage, percent]) => computerUpdateMilestone(stage, percent) === null));
             updating = false;
             spinner.render({ kind: 'progress' });
-            push('Code returns to ordinary loading when the update answer clears', titleOf(spinner) === 'Opening Browser…');
-        }, { isUpdating: () => updating });
+            push('Code returns to ordinary loading after the update open ends', titleOf(spinner) === 'Opening Browser…');
+        }, { isUpdating: () => updating, getUpdateMilestone: () => milestone });
     }
     now = 0;
     {
