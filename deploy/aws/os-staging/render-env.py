@@ -73,6 +73,13 @@ EZIL_NATIVE_DEPLOYMENT_DESCRIPTOR EZIL_NATIVE_DEPLOYMENT_DESCRIPTOR_SHA256 EZIL_
 EZIL_NATIVE_GATEWAY_POLICY_ID EZIL_NATIVE_GATEWAY_SERVICE_CREDENTIAL EZIL_NATIVE_GATEWAY_SERVICE_EXPIRES_AT
 EZIL_NATIVE_QUALIFICATION_TARGET
 """.split())
+PRODUCTION_BROWSER_GATE = "EZIL_DELEGATED_BROWSER_PROD_CANARY"
+PRODUCTION_BROWSER_PINS = (
+    "EZIL_BROWSER_PROD_CANARY_USER_ID", "EZIL_BROWSER_PROD_CANARY_COMPUTER_ID",
+    "EZIL_BROWSER_PROD_CANARY_TEST_ORIGIN",
+)
+PRODUCTION_BROWSER = frozenset((PRODUCTION_BROWSER_GATE, *PRODUCTION_BROWSER_PINS))
+PRODUCTION_BROWSER_UUID = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 NATIVE_SWITCHES = ("EZIL_NATIVE_SESSIONS", "EZIL_NATIVE_AUTH_INTENTS",
                    "EZIL_NATIVE_HOST_TRANSPORT", "EZIL_NATIVE_RUNTIME_CONTROL")
 # Delegated computer reads (app/src/server/api/delegation-core.ts): the receiver treats a missing or
@@ -103,7 +110,7 @@ class RenderError(Exception):
 def validate(values, environment="staging"):
     if not isinstance(values, dict):
         raise RenderError("Expected a JSON object")
-    allowed = REQUIRED | OPTIONAL | (PRODUCTION_NATIVE if environment == "production" else frozenset())
+    allowed = REQUIRED | OPTIONAL | ((PRODUCTION_NATIVE | PRODUCTION_BROWSER) if environment == "production" else frozenset())
     if any(key not in allowed and not REGIONAL.fullmatch(key) for key in values):
         raise RenderError("Unknown key refused")
     if REQUIRED - values.keys():
@@ -201,8 +208,32 @@ def validate_delegation(values, environment):
     delegation_jwks(values["EZIL_DELEGATION_PUBLIC_JWKS"])
 
 
+def validate_production_browser(values):
+    gate = values.get(PRODUCTION_BROWSER_GATE)
+    if gate not in (None, "enabled", "disabled"):
+        raise RenderError("Production Browser canary gate must be exactly enabled or disabled")
+    pins = tuple(values.get(name) for name in PRODUCTION_BROWSER_PINS)
+    if gate == "enabled" or any(pin is not None for pin in pins):
+        if not all(pins):
+            raise RenderError("Production Browser canary requires the user, computer and test origin pins")
+        user, computer, origin = pins
+        host = urlsplit(origin).hostname if bare_https_origin(origin) else None
+        if not PRODUCTION_BROWSER_UUID.fullmatch(user) or not PRODUCTION_BROWSER_UUID.fullmatch(computer) \
+                or not host or "." not in host or not re.search(r"[a-z]", host) or host.endswith(".localhost"):
+            raise RenderError("Production Browser canary requires exact UUIDs and a canonical HTTPS DNS test origin")
+    if gate == "enabled" and (
+        values.get(DELEGATION_GATE) != "enabled"
+        or values.get("EZIL_DELEGATION_ISSUER") != "https://connect.ezil.work"
+        or values.get("EZIL_DELEGATION_AUDIENCE") != "https://os.ezil.work"
+        or values.get("CLOUDFLARE_GUACAMOLE_WORKER_URL", "").removesuffix("/") != "https://api-desktop.ezil.org"
+        or not values.get("CLOUDFLARE_GUACAMOLE_HMAC_SECRET")
+    ):
+        raise RenderError("Production Browser canary requires the canonical connector, OS and Cloudflare Worker pins")
+
+
 def validate_production(values):
     """Pin production to its own API, private database and live Stripe; refuse staging values."""
+    validate_production_browser(values)
     if any(values.get(name) not in (None, "0", "1") for name in NATIVE_SWITCHES):
         raise RenderError("Native session, intent, transport and control gates must be exactly 0 or 1")
     if values.get("EZIL_NATIVE_AUTHORIZATION") not in (None, "disabled", "enabled"):

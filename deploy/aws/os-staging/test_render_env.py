@@ -408,6 +408,28 @@ class DelegationEnvironmentTests(unittest.TestCase):
         with self.assertRaises(renderer.RenderError):
             renderer.validate({**base, **extra}, environment)
 
+    def test_production_browser_canary_is_default_off_and_pins_one_exact_https_target(self):
+        names = renderer.PRODUCTION_BROWSER_PINS
+        pins = {names[0]: "12ac8d12-78cf-4850-8c11-23f874204eda",
+                names[1]: "87fc8cee-4b15-4e17-a204-6d039a98a9c2", names[2]: "https://browser.fixture.example"}
+        values = {
+            **self.production,
+            **delegation(EZIL_DELEGATION_ISSUER="https://connect.ezil.work", EZIL_DELEGATION_AUDIENCE="https://os.ezil.work"),
+            "CLOUDFLARE_GUACAMOLE_WORKER_URL": "https://api-desktop.ezil.org",
+            "CLOUDFLARE_GUACAMOLE_HMAC_SECRET": "fixture-only",
+            renderer.PRODUCTION_BROWSER_GATE: "enabled", **pins,
+        }
+        self.assertEqual(renderer.validate(values, "production"), values)
+        with self.assertRaises(renderer.RenderError):
+            renderer.validate({**self.staging, **pins}, "staging")
+        for bad in ("http://127.0.0.1:44880", "https://127.0.0.1:44880", "https://browser.fixture.example/",
+                    "https://browser.fixture.example/subpath", "https://browser.fixture.example,https://other.example"):
+            with self.subTest(origin=bad), self.assertRaises(renderer.RenderError):
+                renderer.validate({**values, names[2]: bad}, "production")
+        for name in (*names, "CLOUDFLARE_GUACAMOLE_HMAC_SECRET", "CLOUDFLARE_GUACAMOLE_WORKER_URL"):
+            with self.subTest(missing=name), self.assertRaises(renderer.RenderError):
+                renderer.validate({key: value for key, value in values.items() if key != name}, "production")
+
     def test_names_are_optional_and_absence_changes_nothing(self):
         self.assertTrue(set(DELEGATION_NAMES) <= renderer.OPTIONAL)
         self.assertFalse(set(DELEGATION_NAMES) & renderer.REQUIRED)

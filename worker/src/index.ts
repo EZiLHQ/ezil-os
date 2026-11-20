@@ -295,6 +295,11 @@ interface Env extends SandboxEnv {
    * starts at all. This one closes the door from the Worker side, which is
    * the one an operator can turn without redeploying an image.
    */
+  /** Independent, default-off Browser MCP pilot for one production Cloudflare computer. */
+  SANDBOX_MCP_BROWSER_PROD_CANARY?: string;
+  EZIL_BROWSER_PROD_CANARY_USER_ID?: string;
+  EZIL_BROWSER_PROD_CANARY_COMPUTER_ID?: string;
+  EZIL_BROWSER_PROD_CANARY_TEST_ORIGIN?: string;
   SANDBOX_BROWSER?: string;
   /** Explicit isolated staging computer only; absent in production. */
   EZIL_ACCEPTANCE_ENV?: string;
@@ -433,6 +438,10 @@ import {
 // by `exposePort()` (which would publish an unauthenticated hostname that can
 // drive the user's logged-in browser) or by `preview-bridge.ts` (whose
 // two-port narrowness is load-bearing).
+import {
+  BROWSER_CANARY_READY_BODY, BROWSER_CANARY_UUID, BROWSER_CANARY_WORKER_ORIGIN,
+  browserCanaryPin, canaryBrowserDestination, productionBrowserBootToken,
+} from './browser-open-canary';
 import {
   BROWSER_SIDECAR_MAX_RESPONSE_BYTES,
   BROWSER_SIDECAR_PORT,
@@ -963,6 +972,9 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
  * not a new transport.
  */
 interface EzilWorkspacePersistRpc {
+  openBrowserUrl(body: string, deadline: number, sandboxId: string, cancelKey: string): Promise<Response>;
+  browserOpenCapabilities(body: string, deadline: number, sandboxId: string, cancelKey: string): Promise<Response>;
+  cancelBrowserOpen(cancelKey: string): Promise<void>;
   getImageId(): Promise<string | null>;
   runningContainerFetch(url: string, init?: RequestInit, port?: number): Promise<Response>;
   stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport>;
@@ -2748,6 +2760,63 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       this.runtimeTransitionsInFlight--;
     }
   }
+  private browserOpenCancellations?: Map<string, AbortController>;
+
+  /** The signed control may use an existing desktop but cannot start or renew it. */
+  async openBrowserUrl(body: string, deadline: number, sandboxId: string, cancelKey: string): Promise<Response> {
+    return this.browserOpenSidecar('open-url', body, deadline, sandboxId, cancelKey);
+  }
+
+  async browserOpenCapabilities(body: string, deadline: number, sandboxId: string, cancelKey: string): Promise<Response> {
+    return this.browserOpenSidecar('open-capabilities', body, deadline, sandboxId, cancelKey);
+  }
+
+  private async browserOpenSidecar(operation: 'open-url' | 'open-capabilities', body: string, deadline: number,
+      sandboxId: string, cancelKey: string): Promise<Response> {
+    const active = this.browserOpenCancellations ??= new Map();
+    const abort = new AbortController();
+    active.set(cancelKey, abort);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // Capture and dispatch against the running container under the lifecycle
+      // lock. Release the lock before waiting on browser network traffic.
+      const dispatch = await this.withRuntimeMutation(async () => {
+        if (!this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)
+          || await this.migrationStartBlocked()) return null;
+        const nonce = await this.ctx.storage.get<string>(AI_PROXY_NONCE_STORAGE_KEY);
+        const pin = browserCanaryPin(this.env);
+        if (!pin || !nonce || deriveSandboxId(pin.userId, pin.computerId) !== sandboxId) return null;
+        const capability = await productionBrowserBootToken(this.env, sandboxId, nonce);
+        const remaining = deadline - Date.now();
+        if (!capability || remaining <= 0 || abort.signal.aborted) return null;
+        timer = setTimeout(() => abort.abort(), remaining);
+        const result = this.ctx.container!.getTcpPort(BROWSER_SIDECAR_PORT).fetch(
+          'http://127.0.0.1:9223/internal/mcp-browser-' + operation,
+          { method: 'POST', body, headers: {
+            'content-type': 'application/json', authorization: 'Bearer ' + capability,
+          }, signal: abort.signal },
+        );
+        void result.catch(() => undefined);
+        return { result, nonce };
+      });
+      if (!dispatch) return json({ ok: false }, 409);
+      const response = await dispatch.result;
+      if (!this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)
+        || await this.migrationStartBlocked() || dispatch.nonce !== await this.ctx.storage.get<string>(AI_PROXY_NONCE_STORAGE_KEY)) {
+        await response.body?.cancel().catch(() => undefined);
+        return json({ ok: false }, 409);
+      }
+      return response;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      active.delete(cancelKey);
+    }
+  }
+
+  async cancelBrowserOpen(cancelKey: string): Promise<void> {
+    this.browserOpenCancellations?.get(cancelKey)?.abort();
+  }
+
   async desktopReachable(): Promise<boolean> {
     try {
       const response = await this.runningContainerFetch('http://127.0.0.1:8181/', {}, 8181, 1000);
@@ -3920,7 +3989,17 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       if (launcher) return launcher.id;
     }
     const aiEnv = await this.aiProxyBootEnv(hostname, sandboxId);
-    const process = await this.startProcess(command, { env: { ...env, ...aiEnv } });
+    const browserPin = browserCanaryPin(this.env);
+    let browserEnv: Record<string, string> = {};
+    if (browserPin && sandboxId === deriveSandboxId(browserPin.userId, browserPin.computerId)) {
+      const nonce = await this.ctx.storage.get<string>(AI_PROXY_NONCE_STORAGE_KEY);
+      const capability = nonce ? await productionBrowserBootToken(this.env, sandboxId, nonce) : null;
+      if (capability) browserEnv = {
+        EZIL_WORKER_BROWSER_MCP_TOKEN: capability,
+        EZIL_BROWSER_PROD_CANARY_TEST_ORIGIN: browserPin.origin,
+      };
+    }
+    const process = await this.startProcess(command, { env: { ...env, ...aiEnv, ...browserEnv } });
     return process.id;
   }
 
@@ -7310,7 +7389,7 @@ function sandboxIdFromPath(path: string): string | null {
 /** No signed route accepts a larger body (project-files put is the largest); refused before buffering. */
 const V2_MAX_BODY_BYTES = PROJECT_FILES_MAX_PUT_REQUEST_BYTES;
 
-async function readBoundedBody(request: Request, maxBytes: number): Promise<Uint8Array | 'too_large'> {
+async function readBoundedBody(request: Request | Response, maxBytes: number): Promise<Uint8Array | 'too_large'> {
   const declared = request.headers.get('content-length');
   if (declared !== null && !(Number(declared) <= maxBytes)) return 'too_large';
   const stream = request.clone().body;
@@ -7760,6 +7839,89 @@ async function aiProxyBootEnv(env: Env, hostname: string, sandboxId: string, non
   };
 }
 
+async function handleProductionBrowserCanary(
+  request: Request, env: Env, url: URL, sandboxId: string, readiness: boolean,
+): Promise<Response> {
+  const unavailable = () => json({ ok: false, error: 'browser_unavailable' }, 404);
+  const pin = browserCanaryPin(env);
+  if (!pin || url.origin !== BROWSER_CANARY_WORKER_ORIGIN || deriveSandboxId(pin.userId, pin.computerId) !== sandboxId) {
+    return unavailable();
+  }
+  const claims = verifiedV2Claims.get(request);
+  const now = Date.now();
+  if (!claims || claims.provider !== 'cloudflare' || claims.sandboxId !== sandboxId
+      || claims.userId !== pin.userId || claims.computerId !== pin.computerId
+      || claims.generation !== 0 || claims.leaseEpoch !== 0 || claims.store !== ''
+      || claims.ts < now - 30_000 || claims.ts > now + 10_000) return unavailable();
+
+  let body: string;
+  let runId: string | undefined;
+  let budget = 2_500;
+  try {
+    const bytes = await readBoundedBody(request, readiness ? 64 : 4096);
+    if (bytes === 'too_large') return unavailable();
+    body = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+    if (readiness) {
+      if (body !== BROWSER_CANARY_READY_BODY) return unavailable();
+    } else {
+      const input = JSON.parse(body);
+      if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 4
+          || typeof input.binding !== 'string' || !/^[0-9a-f]{64}$/.test(input.binding)
+          || typeof input.requestId !== 'string' || !BROWSER_CANARY_UUID.test(input.requestId)
+          || typeof input.url !== 'string' || !Number.isInteger(input.timeoutMs) || input.timeoutMs < 1000 || input.timeoutMs > 30_000) {
+        return unavailable();
+      }
+      runId = input.requestId;
+      if (!canaryBrowserDestination(input.url, pin.origin)) {
+        return json({ ok: false, runId, error: 'destination_denied', stage: 'destination', retryable: false });
+      }
+      budget = input.timeoutMs + 3_000;
+    }
+  } catch {
+    return unavailable();
+  }
+
+  const failure = (error: string) => runId
+    ? json({ ok: false, runId, error, stage: 'runtime', retryable: false })
+    : unavailable();
+  try {
+    if (await awsControlTarget(env, request, sandboxId, 'browser_prod_canary')) return unavailable();
+    if (request.signal.aborted) return failure('cancelled');
+    // getSandbox() configures the SDK stub. This canary only calls its
+    // existing Durable Object lease and must not write boot configuration.
+    const sandbox = env.Sandbox.get(env.Sandbox.idFromName(sandboxId)) as unknown as
+      Pick<EzilWorkspacePersistRpc, 'browserOpenCapabilities' | 'openBrowserUrl' | 'cancelBrowserOpen'>;
+    const cancelKey = crypto.randomUUID();
+    const onAbort = () => { void sandbox.cancelBrowserOpen(cancelKey).catch(() => undefined); };
+    request.signal.addEventListener('abort', onAbort, { once: true });
+    const deadline = Date.now() + budget;
+    try {
+      const call = readiness
+        ? sandbox.browserOpenCapabilities(body, deadline, sandboxId, cancelKey)
+        : sandbox.openBrowserUrl(body, deadline, sandboxId, cancelKey);
+      const upstream = await withDeadline(call, budget, 'browser.production.canary');
+      if (request.signal.aborted) return failure('cancelled');
+      if (!upstream.ok) return failure('browser_unavailable');
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return failure('navigation_timeout');
+      const bytes = await withDeadline(readBoundedBody(upstream, readiness ? 128 : 4096), remaining, 'browser.production.canary.body');
+      if (bytes === 'too_large') return failure('browser_unavailable');
+      if (readiness) {
+        const proof = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes));
+        if (!proof || Object.keys(proof).length !== 2 || proof.ok !== true || proof.capability !== 'browser_open_url') return unavailable();
+        return json({ ok: true, capability: 'browser_open_url' });
+      }
+      return new Response(bytes, { status: 200, headers: {
+        'content-type': 'application/json', 'cache-control': 'no-store',
+      } });
+    } finally {
+      request.signal.removeEventListener('abort', onAbort);
+    }
+  } catch {
+    return request.signal.aborted ? failure('cancelled') : failure('connection_lost');
+  }
+}
+
 async function handleAiProxy(request: Request, env: Env, sandboxId: string, awsNonce?: string | null): Promise<Response> {
   const disabled = aiProxyDisabled(env.SANDBOX_AI_PROXY);
   let gatewayUrl: string;
@@ -8085,6 +8247,11 @@ const worker = {
     if (method === 'POST' && repoGrantMatch) {
       // Refresh push access for a repository repo-open placed. v2-signed only; see `handleRepoGrant` / `./repo-grant.ts`.
       return handleRepoGrant(request, env, decodeURIComponent(repoGrantMatch[1]));
+    }
+
+    const browserCanary = path.match(/^\/sandbox\/(guac-[a-z0-9]{16}-[a-z0-9]{16})\/(browser-open-url|browser-open-capabilities)$/);
+    if (method === 'POST' && browserCanary) {
+      return handleProductionBrowserCanary(request, env, url, browserCanary[1]!, browserCanary[2] === 'browser-open-capabilities');
     }
 
     const browserMatch = path.match(/^\/sandbox\/([^/]+)\/browser\/([a-z_]+)$/);
