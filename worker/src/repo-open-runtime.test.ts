@@ -38,15 +38,15 @@ describe('ephemeral standalone CLI source pin', () => {
     expect(command).toContain(STANDALONE_CLI_CANDIDATE.cliSha256);
     expect(command).toContain(REPO_OPEN_SUPERVISOR_B64);
   });
-  it('enables only the verified public .1 release pins', () => {
+  it('enables only the verified public standalone release pins', () => {
     expect(STANDALONE_CLI_RELEASE_READY).toBe(true);
     expect(STANDALONE_CLI_CANDIDATE).toEqual({
-      url: 'https://github.com/EZiLHQ/ezil-cli/releases/download/standalone-20261115.1/ezil-cli-0.3.0-standalone.20261115.1.tar.gz',
-      archiveSha256: '610b2c6fae4e5c4ea1db45b9d53a028de421ceaad927abb49be45339f9f1b7a4',
-      cliSha256: 'a30361d38c0310912fbfd3c18284c78e66e0f6c474727081c19d09f9fb1a0a9b',
+      url: 'https://github.com/EZiLHQ/ezil-cli/releases/download/standalone-20261120.1/ezil-cli-0.3.0-standalone.20261120.1.tar.gz',
+      archiveSha256: 'dd757a2f04e3dfe2b8e3b731af0dfbd1123157de687b69b9a2a718a2b8ab6bc0',
+      cliSha256: '6d160f821577ee4e51fb0771fe5fa56f36a40a7b8c59b16d424fc12b7e7d3225',
       supervisorSha256: REPO_OPEN_SUPERVISOR_SHA256,
-      sourceCommit: '90765278ed1dc83251f23f709b270804d8802a6f',
-      version: '0.3.0-standalone.20261115.1',
+      sourceCommit: '96478c69f684f4f054b5bb5792abc85c74d709dc',
+      version: '0.3.0-standalone.20261120.1',
     });
   });
   it('stages the pinned release in one bounded credential-free exec', async () => {

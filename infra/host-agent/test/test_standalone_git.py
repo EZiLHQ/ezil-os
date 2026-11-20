@@ -77,7 +77,7 @@ class Packet(unittest.TestCase):
         for name in ("stage.py","supervise.py"):
             self.assertEqual((rt.ASSETS/name).read_bytes(),(root/"worker/repo-open"/name).read_bytes())
         pin,argv=rt.runtime_command()
-        self.assertEqual(pin["cliSha256"],"a30361d38c0310912fbfd3c18284c78e66e0f6c474727081c19d09f9fb1a0a9b")
+        self.assertEqual(pin["cliSha256"],"6d160f821577ee4e51fb0771fe5fa56f36a40a7b8c59b16d424fc12b7e7d3225")
         self.assertNotIn(SECRET,repr(argv))
 
 class Runtime(unittest.TestCase):
@@ -248,7 +248,7 @@ class InstalledLayout(unittest.TestCase):
                            check=True,stdin=subprocess.DEVNULL,capture_output=True)
             public="import sys,json,hashlib,base64;sys.path.insert(0,sys.argv[1]);from ezil_host import standalone_git_runtime as r;p,a=r.runtime_command();print(json.dumps({'cli':p['cliSha256'],'stage':hashlib.sha256((r.ASSETS/'stage.py').read_bytes()).hexdigest(),'supervisor':hashlib.sha256(base64.b64decode(a[-1])).hexdigest()}))"
             got=json.loads(subprocess.check_output([sys.executable,"-I","-c",public,str(installed/"lib")],cwd=directory))
-            self.assertEqual(got["cli"],"a30361d38c0310912fbfd3c18284c78e66e0f6c474727081c19d09f9fb1a0a9b")
+            self.assertEqual(got["cli"],"6d160f821577ee4e51fb0771fe5fa56f36a40a7b8c59b16d424fc12b7e7d3225")
             self.assertEqual(got["stage"],hashlib.sha256((root/"worker/repo-open/stage.py").read_bytes()).hexdigest())
             self.assertEqual(got["supervisor"],hashlib.sha256((root/"worker/repo-open/supervise.py").read_bytes()).hexdigest())
 
