@@ -28,8 +28,11 @@ const env = { EZIL_AWS_COMPUTERS_ENABLED: '1', EZIL_DELEGATED_BROWSER_OBSERVE_AW
 const updatedAt = new Date('2026-11-20T00:00:00.000Z');
 const running = (over: Record<string, unknown> = {}) => ({
     computerId: computer, ownerUserId: principal.userId, provider: 'aws-ec2', store: 'ebs',
-    generation: 3, leaseEpoch: 7, state: 'RUNNING', updatedAt, ...over,
+    generation: 3, leaseEpoch: 7, state: 'RUNNING', instanceId: 'i-0abc', tunnelId: 'tunnel-one',
+    leaseUntil: new Date(Date.now() + 600_000), presenceAt: updatedAt, updatedAt, ...over,
 });
+/** What placement.ts renewPlacementLease moves on the owner's presence (and the row's update time). */
+const renewed = () => running({ leaseUntil: new Date(Date.now() + 3_600_000), presenceAt: new Date(), updatedAt: new Date() });
 
 beforeEach(() => {
     fixture.owned = [{ owned: 1 }];
@@ -55,7 +58,7 @@ describe('stage-only AWS Browser observation target', () => {
         expect(target).toEqual({
             sandboxId, provider: 'aws-ec2', generation: 3, leaseEpoch: 7,
             binding: createHash('sha256').update(JSON.stringify(['ezil-browser-observe-v1', principal.userId, principal.clientId,
-                computer, sandboxId, 'aws-ec2', 3, 7, updatedAt.toISOString()])).digest('hex'),
+                computer, sandboxId, 'aws-ec2', 3, 7, 'i-0abc', 'tunnel-one'])).digest('hex'),
         });
         expect(browserTargetClaims(target!)).toEqual({ provider: 'aws-ec2', store: '', generation: 3, leaseEpoch: 7 });
         const token = mintPreviewTokenV2('secret', { ts: 1, sandboxId, computerId: computer, userId: principal.userId,
@@ -63,11 +66,24 @@ describe('stage-only AWS Browser observation target', () => {
         expect(JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString())).toMatchObject({
             provider: 'aws-ec2', store: '', generation: 3, leaseEpoch: 7, sandboxId, computerId: computer,
         });
-        // Any lease movement changes the binding the receiver compares after the observation.
-        for (const over of [{ leaseEpoch: 8 }, { generation: 4 }, { updatedAt: new Date(updatedAt.getTime() + 1) }]) {
+        // A lease move or a replacement (new instance or tunnel) changes the binding the receiver compares after.
+        for (const over of [{ leaseEpoch: 8 }, { generation: 4 }, { instanceId: 'i-0def' }, { tunnelId: 'tunnel-two' }]) {
             fixture.placement = running(over);
             expect((await resolveAwsBrowserTarget(principal, computer, 'ezil-browser-observe-v1', env))?.binding).not.toBe(target!.binding);
         }
+        // The owner's normal presence renewal (leaseUntil, presenceAt, updatedAt) keeps it.
+        fixture.placement = renewed();
+        expect(await resolveAwsBrowserTarget(principal, computer, 'ezil-browser-observe-v1', env)).toEqual(target);
+    });
+
+    it('requires a still-current lease on every read: expired, lapsing exactly now, or absent is refused', async () => {
+        const at = new Date('2026-11-20T00:10:00.000Z');
+        for (const leaseUntil of [null, new Date(at.getTime() - 1), at]) {
+            fixture.placement = running({ leaseUntil });
+            expect(await resolveAwsBrowserTarget(principal, computer, 'ezil-browser-observe-v1', env, () => at)).toBeNull();
+        }
+        fixture.placement = running({ leaseUntil: new Date(at.getTime() + 1) });
+        expect(await resolveAwsBrowserTarget(principal, computer, 'ezil-browser-observe-v1', env, () => at)).not.toBeNull();
     });
 
     it('fails closed when unlisted, disabled, killed, not owned, foreign, not RUNNING, or not on a real lease', async () => {
@@ -83,7 +99,7 @@ describe('stage-only AWS Browser observation target', () => {
         expect(await resolveAwsBrowserTarget(principal, computer, 'ezil-browser-observe-v1', env)).toBeNull();
         fixture.foreign = false;
         for (const over of [{ provider: 'cloudflare' }, { state: 'STOPPED' }, { state: 'STOPPING' }, { state: 'LEASED' },
-            { generation: 0 }, { leaseEpoch: 0 }]) {
+            { generation: 0 }, { leaseEpoch: 0 }, { instanceId: null }, { tunnelId: null }]) {
             fixture.placement = running(over);
             expect(await resolveAwsBrowserTarget(principal, computer, 'ezil-browser-observe-v1', env)).toBeNull();
         }
@@ -103,12 +119,12 @@ describe('stage-only AWS Browser observation target', () => {
         expect(await resolveCloudflareBrowserTarget(principal, computer, 'ezil-browser-observe-v1')).toBeNull();
     });
 
-    it('answers nothing observed when the AWS lease moves during the observation', async () => {
+    async function observeWhile(during: () => unknown) {
         const path = '/api/mcp/browser-sessions/' + computer + '/observe';
-        const now = Date.parse('2026-11-20T00:00:00.000Z');
+        const now = Date.now();
         const observed = { ok: true, browserSessionId: 'a'.repeat(43), expiresAt: new Date(now + 60_000).toISOString(),
             observed: 'profile_builder', profileHeadingVisible: true, universeIdentity: 'unverified' };
-        const observe = vi.fn(async () => { fixture.placement = running({ leaseEpoch: 8 }); return observed; });
+        const observe = vi.fn(async () => { fixture.placement = during(); return observed; });
         const response = await handleBrowserObserve(new Request('https://os-staging.ezil.work' + path, {
             method: 'POST', body: '{}', headers: { 'content-type': 'application/json' },
         }), {
@@ -116,6 +132,20 @@ describe('stage-only AWS Browser observation target', () => {
             target: (p, id) => resolveAwsBrowserTarget(p, id, 'ezil-browser-observe-v1', env),
         });
         expect(observe).toHaveBeenCalledWith(principal, computer, expect.objectContaining({ provider: 'aws-ec2', leaseEpoch: 7 }), {});
-        expect([response.status, await response.json()]).toEqual([409, { ok: false, error: 'browser_session_stale' }]);
+        return [response.status, await response.json()];
+    }
+
+    it('answers nothing observed when the lease moves, expires or the computer is replaced during the observation', async () => {
+        for (const during of [() => running({ leaseEpoch: 8 }), () => running({ leaseUntil: new Date(Date.now() - 1) }),
+            () => running({ instanceId: 'i-0def' }), () => running({ tunnelId: 'tunnel-two' })]) {
+            fixture.placement = running();
+            expect(await observeWhile(during)).toEqual([409, { ok: false, error: 'browser_session_stale' }]);
+        }
+    });
+
+    it('keeps the observation through the owner\'s normal presence renewal', async () => {
+        const [status, body] = await observeWhile(renewed);
+        expect(status).toBe(200);
+        expect(body).toMatchObject({ ok: true, browserSessionId: 'a'.repeat(43) });
     });
 });

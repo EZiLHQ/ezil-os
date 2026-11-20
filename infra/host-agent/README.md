@@ -136,6 +136,35 @@ Without an existing stop record, `lastStop` is null; its durable writer remains 
 Run the unprivileged tests with
 `python3 -m unittest discover -s infra/host-agent/test -p test_canary.py`.
 
+## Delegated Browser observation (default off, staging only)
+
+`edgeBrowserObserve` (default `false`; only JSON boolean `true` enables it) turns on the
+edge's `POST /__ezil/control/browser-observe/<sha256>` and the agent's edge-local
+`browser-desktop-instance`. With it off both answer exactly as before (404 and
+`unknown_op`) and `desktop_status` keeps its shape and cost. It is never a fleet default:
+`config.DEFAULTS`, provisioning, the AMI and enrollment do not set it.
+
+There is no supported live switch. Today's Image Builder and enrollment do not supply this
+flag, and an existing AWS host's config is baked into its image: editing a running host's
+`/etc/ezil-host/agent.json` or restarting its units is not a supported way to turn it on.
+Staging activation precondition:
+
+- a future reviewed staging host release supplies target-scoped activation (this flag for
+  the admitted staging computer only) in the sealed host config, and the edge and agent units
+  both receive that same sealed config;
+- that release's host-agent build contains this edge route and agent op;
+- the host is not a pool host (a pool session epoch file makes the instance check answer
+  none, so every observation is refused);
+- its desktop image runs the sidecar on `0.0.0.0:9223` inside the container with
+  `/internal/mcp-browser-observe`; 9222 stays loopback and 9222/9223 are never in
+  `edgePorts` (the edge drops and refuses them regardless);
+- the Worker lists that computer in `SANDBOX_MCP_BROWSER_OBSERVE_AWS_TARGETS` and the app in
+  `EZIL_DELEGATED_BROWSER_OBSERVE_AWS_TARGETS` (both `aws-ec2:<computerId>`), on staging only.
+
+The route reads the running container's identity (runc `created|pid`) before and after one
+fixed sidecar call inside one 7 s deadline, answers only the closed observation envelope and
+is not presence: it never renews the lease.
+
 ## Threat model
 
 **Guest root controls every byte of the data volume** (R5, §3a). The marker, the upper

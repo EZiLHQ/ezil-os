@@ -52,14 +52,18 @@ export function awsBrowserTargetAdmitted(raw: string | undefined, computerId: st
 
 /**
  * Stage-only AWS leg of the observer: an explicitly admitted computer, owned now, whose placement is
- * RUNNING on a real lease. The binding covers provider, generation, lease epoch and the placement's
- * update time, so the receiver's after-check refuses any lease movement.
+ * RUNNING on a still-current lease (`leaseUntil` after now, the same rule as aws-receipts.ts
+ * `sessionLimitFor`). The binding covers provider, generation, lease epoch and the exact instance and
+ * tunnel, never `updatedAt`: the owner's presence renews `leaseUntil`/`presenceAt` (placement.ts
+ * `renewPlacementLease`) without moving any of them, so a renewal keeps a session and a replacement
+ * or expiry refuses it.
  */
 export async function resolveAwsBrowserTarget(
     { userId, clientId }: { userId: string; clientId: string },
     computerId: string,
     purpose: 'ezil-browser-observe-v1',
     env: Env = process.env,
+    now: () => Date = () => new Date(),
 ): Promise<AwsBrowserTarget | null> {
     if (!awsBrowserTargetAdmitted(env.EZIL_DELEGATED_BROWSER_OBSERVE_AWS_TARGETS, computerId) || !isAwsComputersEnabled(env)
         || (env.EZIL_AWS_KILL_SWITCH !== undefined && env.EZIL_AWS_KILL_SWITCH !== '0')) return null;
@@ -73,12 +77,14 @@ export async function resolveAwsBrowserTarget(
         const { record } = await readPlacement(db, computerId, userId);
         if (!record || record.provider !== 'aws-ec2' || record.state !== 'RUNNING'
             || !Number.isSafeInteger(record.generation) || record.generation < 1
-            || !Number.isSafeInteger(record.leaseEpoch) || record.leaseEpoch < 1) return null;
+            || !Number.isSafeInteger(record.leaseEpoch) || record.leaseEpoch < 1
+            || !record.leaseUntil || record.leaseUntil.getTime() <= now().getTime()
+            || !record.instanceId || !record.tunnelId) return null;
 
         const sandboxId = deriveGuacamoleSandboxId(userId, computerId);
         const binding = createHash('sha256').update(JSON.stringify([
             purpose, userId, clientId, computerId, sandboxId, 'aws-ec2', record.generation, record.leaseEpoch,
-            record.updatedAt.toISOString(),
+            record.instanceId, record.tunnelId,
         ])).digest('hex');
         return { sandboxId, binding, provider: 'aws-ec2', generation: record.generation, leaseEpoch: record.leaseEpoch };
     } catch (error) {
