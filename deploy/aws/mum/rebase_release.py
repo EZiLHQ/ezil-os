@@ -746,6 +746,12 @@ HOST_AGENT_DIRECTED_EXCEPTIONS=(
         'test/test_host_resilience.py':('100644 f30ffd16c5c15377068638388924725dfc1b69c0','100644 16c9c704597b3fd45b19f92827606c33d5986042'),
         'test/test_standalone_git_edge.py':('100644 1f5aeb0f84f1afe09393d710e4752d1fd4b00aa9','100644 1237865c01c065e419015c1813bd09ffec8751b0'),
     }),
+    # Pending staging release-custody review: R157 20a02206 to fd39133a, Code inference idle hold.
+    ('b7700d49c946157cd75c862bce867caf7fd08810','fed9ba92a6bdf6fd956e1cf172d550d9fc4a67a7',{
+        'lib/ezil_host/agent.py':('100644 7d3e661a7cc6169df602bb2fe0085eec75f51abf','100644 64d6d21edeca13abe8a41e8b9b95c706bf6b0489'),
+        'lib/ezil_host/terminal_work.py':('100644 fd03bb7d3466fe0fa59fc1ca10ce7239c8d3b7c4','100644 97774533318c9d96179b59186fa728d770f3692a'),
+        'test/test_terminal_work.py':('100644 d1806bda80bba506ce4f667580502c2c4e75bd6f','100644 225b514cfb73742eb39727181ef13af29feadc2d'),
+    }),
 )
 
 

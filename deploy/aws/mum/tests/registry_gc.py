@@ -725,7 +725,7 @@ class NamespaceLegacyCapacityTests(unittest.TestCase):
         return str(caught.exception)
 
     def test_each_namespace_keeps_its_frozen_gc_limit(self):
-        self.assertEqual(gc.tool.ACTIVE_REGISTRY_CAPACITY, 42)
+        self.assertEqual(gc.tool.ACTIVE_REGISTRY_CAPACITY, 43)
         for namespace, legacy in (('mum', 32), ('prd', 26)):
             with self.subTest(namespace=namespace):
                 gc.tool.use_namespace(namespace)
@@ -734,6 +734,7 @@ class NamespaceLegacyCapacityTests(unittest.TestCase):
                 self.assertEqual(self.refusal(40), 'GC invalid registry')
                 self.assertEqual(self.refusal(41), 'GC invalid registry')
                 self.assertEqual(self.refusal(42), 'GC invalid registry')
+                self.assertEqual(self.refusal(43), 'GC invalid registry')
                 # At the limit the count passes; the synthetic records are then refused by record validation.
                 self.assertNotEqual(self.refusal(legacy), 'GC invalid registry')
         gc.tool.use_namespace('prd')

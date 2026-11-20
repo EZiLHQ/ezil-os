@@ -6,6 +6,7 @@ Offline only: temporary git repositories, this checkout's own reviewed Git objec
 standalone Git host deltas), the real Node probe with a fake fetch, and synthetic CLI results. No AWS, SSM or secret.
 """
 import copy
+from itertools import combinations
 import json
 import os
 import re
@@ -65,8 +66,9 @@ class SourceCapacityTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
-        self.repo, (self.cap42, self.cap41, self.cap40, self.cap39, self.cap38, self.cap37, self.cap36, self.cap35, self.cap34, self.cap33, self.cap32, self.cap27, self.cap26, self.twice, self.absent) = source_repo(
+        self.repo, (self.cap43, self.cap42, self.cap41, self.cap40, self.cap39, self.cap38, self.cap37, self.cap36, self.cap35, self.cap34, self.cap33, self.cap32, self.cap27, self.cap26, self.twice, self.absent) = source_repo(
             Path(temporary.name),
+            'export const REBASE_RELEASE_REGISTRY_CAPACITY = 43;',
             'export const REBASE_RELEASE_REGISTRY_CAPACITY = 42;',
             'export const REBASE_RELEASE_REGISTRY_CAPACITY = 41;',
             'export const REBASE_RELEASE_REGISTRY_CAPACITY = 40;',
@@ -106,9 +108,9 @@ class SourceCapacityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
             release.require_reader_capacity(34, self.cap33, self.repo)
 
-    def test_this_checkout_declares_forty_two_and_ed7_thirty_two(self):
+    def test_this_checkout_declares_forty_three_and_ed7_thirty_two(self):
         text = (REPO / release.CAPACITY_SOURCE).read_text()
-        self.assertEqual(release.CAPACITY_DECLARATION.findall(text), ['42'])
+        self.assertEqual(release.CAPACITY_DECLARATION.findall(text), ['43'])
         self.assertEqual(release.source_reader_capacity(AGENT_ED7, REPO)[0], 32)
         with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
             release.require_reader_capacity(33, AGENT_ED7, REPO)
@@ -156,10 +158,10 @@ class SourceCapacityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'running app reader capacity is below'):
             release.require_runtime_capacity({'readerCapacity': 37}, 38)
 
-    def test_forty_two_requires_a_matched_source_and_running_reader_and_refuses_forty_three(self):
-        self.assertEqual(release.require_reader_capacity(42, self.cap42, self.repo)['capacity'], 42)
-        release.require_runtime_capacity({'readerCapacity': 42}, 42)
-        for count, source, running in ((39, self.cap38, 38), (40, self.cap39, 39), (41, self.cap40, 40), (42, self.cap41, 41), (43, self.cap42, 42)):
+    def test_forty_three_requires_a_matched_source_and_running_reader_and_refuses_forty_four(self):
+        self.assertEqual(release.require_reader_capacity(43, self.cap43, self.repo)['capacity'], 43)
+        release.require_runtime_capacity({'readerCapacity': 43}, 43)
+        for count, source, running in ((39, self.cap38, 38), (40, self.cap39, 39), (41, self.cap40, 40), (42, self.cap41, 41), (43, self.cap42, 42), (44, self.cap43, 43)):
             with self.subTest(count=count):
                 with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
                     release.require_reader_capacity(count, source, self.repo)
@@ -185,6 +187,7 @@ class SourceCapacityTests(unittest.TestCase):
             self.assertEqual(release.require_reader_capacity(40, self.cap40, self.repo)['capacity'], 40)
             self.assertEqual(release.require_reader_capacity(41, self.cap41, self.repo)['capacity'], 41)
             self.assertEqual(release.require_reader_capacity(42, self.cap42, self.repo)['capacity'], 42)
+            self.assertEqual(release.require_reader_capacity(43, self.cap43, self.repo)['capacity'], 43)
             with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
                 release.require_reader_capacity(39, self.cap38, self.repo)
             with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
@@ -195,6 +198,8 @@ class SourceCapacityTests(unittest.TestCase):
                 release.require_reader_capacity(42, self.cap41, self.repo)
             with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
                 release.require_reader_capacity(43, self.cap42, self.repo)
+            with self.assertRaisesRegex(ValueError, 'cannot read the live release registry'):
+                release.require_reader_capacity(44, self.cap43, self.repo)
         finally:
             release.json_tool.use_namespace('mum')
         # Switching back restores the frozen mum thirty-two: a thirty-two-record registry needs no proof.
@@ -348,7 +353,7 @@ class StandaloneHostAbiTests(unittest.TestCase):
 
 
 HOST_ABI_FIXTURE = HERE / 'host-abi-predecessors.json'
-HOST_ABI_FIXTURE_TREES = 7
+HOST_ABI_FIXTURE_TREES = 8
 HOST_ABI_FIXTURE_MAX_FILES = 256
 HOST_ABI_PATH_PART = re.compile(r'[A-Za-z0-9._-]{1,128}')
 HOST_ABI_ENTRY = re.compile(r'(100644|100755) ([0-9a-f]{40})')
@@ -395,17 +400,19 @@ def load_host_abi_fixture(text):
 
 
 class DirectedHostAbiTests(unittest.TestCase):
-    """The directed maps into host trees 96ff8e22 and b7700d49, exercised on Git commits rebuilt from reviewed trees.
+    """The exact forward maps, exercised on Git commits rebuilt from pinned host trees.
 
     The predecessor host trees come from host-abi-predecessors.json (exact path/mode/blob manifests), rebuilt with
     `git mktree --missing` in a private bare repository and checked against their known tree ids, so no private
     commit history or blob payload is needed. The final tree is this checkout's actual HEAD host tree. The private
     repository borrows this checkout's objects through alternates (read-only) and writes its own fixture objects."""
     PREVIOUS = '96ff8e224443e0d684cb99e808a903235f2def11'
-    TARGET = 'b7700d49c946157cd75c862bce867caf7fd08810'
+    DEPLOYED_R157 = 'b7700d49c946157cd75c862bce867caf7fd08810'
+    TARGET = 'fed9ba92a6bdf6fd956e1cf172d550d9fc4a67a7'
     PREDECESSORS = {PREVIOUS: 'S 0c113cb4 standalone Git edge/history/resilience host',
                     'c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d': 'stage 1f4712c4 and 6a187841',
                     '7a35e4c5ec543abe83b9bccc8c6e5af815e02247': 'main 9ca8b3c0',
+                    DEPLOYED_R157: '20a02206, deployed staging R157',
                     # The deployed staging predecessor (R151): the closed diagnostics without the full-marker host_ready.
                     'f3a5a1ba954c56ab31aa0c844cb5719c88905dfc': 'f27ddff7 deployed staging R151'}
     # The deployed predecessor's standalone_git.py (two-field guard stamp, 1024/4096 read limits).
@@ -491,10 +498,11 @@ class DirectedHostAbiTests(unittest.TestCase):
         self.assertEqual([(source, target, len(delta)) for source, target, delta in self.maps()],
                          [('c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d', self.PREVIOUS, 8),
                           ('7a35e4c5ec543abe83b9bccc8c6e5af815e02247', self.PREVIOUS, 9),
-                          (self.PREVIOUS, self.TARGET, 5),
-                          ('c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d', self.TARGET, 11),
-                          ('7a35e4c5ec543abe83b9bccc8c6e5af815e02247', self.TARGET, 9),
-                          ('f3a5a1ba954c56ab31aa0c844cb5719c88905dfc', self.TARGET, 8)])
+                          (self.PREVIOUS, self.DEPLOYED_R157, 5),
+                          ('c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d', self.DEPLOYED_R157, 11),
+                          ('7a35e4c5ec543abe83b9bccc8c6e5af815e02247', self.DEPLOYED_R157, 9),
+                          ('f3a5a1ba954c56ab31aa0c844cb5719c88905dfc', self.DEPLOYED_R157, 8),
+                          (self.DEPLOYED_R157, self.TARGET, 3)])
         for source, target, delta in self.maps():
             old, new = self.files(source), self.files(target)
             self.assertEqual({n: (old.get(n), new.get(n)) for n in old.keys() | new.keys() if old.get(n) != new.get(n)}, delta)
@@ -555,7 +563,7 @@ class DirectedHostAbiTests(unittest.TestCase):
                         release.require_host_abi(commits[old], commits[new], self.repo)
 
     def test_partial_and_regressed_diagnostics_targets_refused(self):
-        target = self.files(self.TARGET)
+        target = self.files(self.DEPLOYED_R157)
         # Partial: the 6a/1f4712c4 tree with ONLY the five diagnostics files moved (no 96ff8e22 history/resilience).
         partial = {**self.files('c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d'), **{name: target[name] for name in self.DIAGNOSTIC_PATHS}}
         # Regressed: the final tree with the deployed predecessor's two-field, 1024/4096 host_ready.
@@ -567,17 +575,27 @@ class DirectedHostAbiTests(unittest.TestCase):
                     release.require_host_abi(self.commit(self.files(source)), baked, self.repo)
 
     def test_checked_in_head_is_the_target_from_every_reviewed_predecessor(self):
-        # The actual HEAD host tree, rebuilt from its own ls-tree, is the final TARGET and is reached from every
-        # predecessor that has a map into it; the 96ff8e22 maps keep their own exact deltas.
+        # HEAD is the exact candidate; historical targets retain their own pinned trees and edges.
         head = self.commit(self.head_files())
         self.assertEqual(release.host_agent_tree_id(head, self.repo), self.TARGET)
-        anchors = {self.PREVIOUS: self.commit(self.files(self.PREVIOUS)), self.TARGET: head}
+        anchors = {self.PREVIOUS: self.commit(self.files(self.PREVIOUS)),
+                   self.DEPLOYED_R157: self.commit(self.files(self.DEPLOYED_R157)), self.TARGET: head}
         for source, target, delta in self.maps():
             baked, deployed = anchors[target], self.commit(self.files(source))
             with self.subTest(source=source, target=target):
                 self.assertEqual(release.require_host_abi(deployed, baked, self.repo), delta)
                 with self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
                     release.require_host_abi(baked, deployed, self.repo)
+
+    def test_r157_code_inference_refuses_every_partial_forward_update(self):
+        deployed_files, candidate_files = self.files(self.DEPLOYED_R157), self.head_files()
+        deployed = self.commit(deployed_files)
+        paths = ('lib/ezil_host/agent.py', 'lib/ezil_host/terminal_work.py', 'test/test_terminal_work.py')
+        for size in range(1, len(paths)):
+            for selection in combinations(paths, size):
+                partial = {**deployed_files, **{path: candidate_files[path] for path in selection}}
+                with self.subTest(selection=selection), self.assertRaisesRegex(ValueError, 'beyond the reviewed delta'):
+                    release.require_host_abi(deployed, self.commit(partial), self.repo)
 
     def test_delta_only_exceptions_are_unchanged(self):
         # Historical behavior is untouched: the empty delta and both delta-only maps admit without any tree pin.
@@ -850,7 +868,7 @@ class RealHttpProbeTests(unittest.TestCase):
 
 class LegacyGcParityTests(unittest.TestCase):
     def test_frozen_gc_stays_a_thirty_two_record_tool(self):
-        self.assertEqual((TOOL.RELEASE_REGISTRY_CAPACITY, TOOL.ACTIVE_REGISTRY_CAPACITY), (32, 42))
+        self.assertEqual((TOOL.RELEASE_REGISTRY_CAPACITY, TOOL.ACTIVE_REGISTRY_CAPACITY), (32, 43))
         self.assertEqual(TOOL.LEGACY_REGISTRY_CAPACITY, {'mum': 32, 'prd': 26})
         self.assertEqual(gc.tool.legacy_registry_capacity(), 32)
         self.assertEqual(gc.tool.RELEASE_REGISTRY_CAPACITY, 32)
