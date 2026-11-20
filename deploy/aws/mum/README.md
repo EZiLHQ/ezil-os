@@ -995,6 +995,27 @@ Reconciliation also covers a successful secret write followed by failed ledger
 completion. It does not verify the canary or open admission. The app secret and
 app reader gain no new fields.
 
+### Verified production tuple adoption
+
+Production can record an observed return to the immediately preceding promoted
+tuple after a completed rollback. This is a separate recovery event. Preserve
+both entries and the original release journal. The registry and running app
+must match the historical promotion and rollback. Confirm the exact Secrets
+Manager versions, CloudTrail events and terminal SSM install and readback in a
+sealed operator manifest. The current release owner must ratify the observed
+baseline and record that authority in the manifest before appending.
+
+```bash
+bash deploy/aws/mum/rebase-release.sh tuple-adopt --namespace prd   --recovery "$sealed_recovery" --expect-recovery-sha256 "$sealed_sha256"   --fresh-readback
+```
+
+The preview never appends. An authorized apply uses the same manifest and digest,
+with `--apply --lease-owner "$production_lease_owner"`. The operator must hold the
+shared production lease. The operation independently verifies the fresh
+running app and takes the app-secret lock for its checks and atomic ledger
+append. It does not change the app, settings, or infrastructure. After success,
+prepare a fresh plan from the new completed ledger generation.
+
 ### 1.0.20 registry compatibility
 The next matched app/host release permits fourteen retained records, refusing a
 fifteenth. All immutable records, GC proofs, 24,000-byte map/readback limits and

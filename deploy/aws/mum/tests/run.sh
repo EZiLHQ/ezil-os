@@ -279,4 +279,5 @@ PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/registry_gc.py"
 PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/test_app_swap.py"
 
 PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/prd_rebase.py"
+PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/prd_tuple_adopt.py"
 PYTHONDONTWRITEBYTECODE=1 python3 -B "$here/prd_paths.py"
