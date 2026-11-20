@@ -5,6 +5,8 @@
  */
 import { randomUUID } from 'node:crypto';
 import { sql, type SQL } from 'drizzle-orm';
+import { lookupAiAccount } from '@/server/billing/ai-credit-outbox-store';
+import { aiMemberContract } from '@/server/billing/ai-member-contract';
 import { isOperatorSku, type OperatorEntitlementRow } from '@/server/billing/v3/operator-access';
 import type { BillingDeps } from '@/server/billing/ports';
 import { planFromSubscriptions } from '@/server/billing/v3/catalog';
@@ -67,16 +69,26 @@ export async function readOperatorEntitlements(db: Executor, userId: string): Pr
 export { operatorEntitlementsInstalled, resetOperatorEntitlementsInstalled } from './installed';
 
 /**
- * The OS user must be live (not deleted, banned or anonymous) and linked to exactly this Gateway account through the
- * Gateway member table the AI credits already use (`ezil_works.ai_members`). A missing member view is unavailable.
+ * The OS user must be live (not deleted, banned or anonymous) and linked to exactly this Gateway account.
+ * Production uses the native membership lookup. The Works view still checks both sides for ambiguous links.
  */
-export async function verifyIdentity(db: Executor, osUserId: string, accountPublicId: string, now: Date): Promise<IdentityCheck> {
+export async function verifyIdentity(db: TransactionalExecutor, osUserId: string, accountPublicId: string, now: Date,
+    fundingUrl?: string): Promise<IdentityCheck> {
     try {
         const users = rowsOf(await db.execute(sql`SELECT to_jsonb(u)->>'deleted_at' AS deleted_at, to_jsonb(u)->>'banned_until' AS banned_until,
             to_jsonb(u)->>'is_anonymous' AS is_anonymous FROM auth.users u WHERE u.id = ${osUserId}::uuid`));
         const user = users[0];
         if (!user || user.deleted_at || user.is_anonymous === 'true'
             || (user.banned_until && Date.parse(String(user.banned_until)) > now.getTime())) return 'identity_not_found';
+        if (aiMemberContract(fundingUrl) === 'production') {
+            try {
+                const member = await lookupAiAccount(db as Parameters<typeof lookupAiAccount>[0], osUserId, fundingUrl, { strict: true });
+                return member === accountPublicId ? 'ok' : 'identity_not_found';
+            } catch {
+                throw new SourceUnavailable('identity');
+            }
+        }
+
         const members = rowsOf(await db.execute(sql`SELECT lower(auth_user_id::text) AS auth_user_id, lower(public_id::text) AS public_id
             FROM ezil_works.ai_members WHERE auth_user_id = ${osUserId}::uuid OR public_id::text = ${accountPublicId}`));
         const ofUser = members.filter(m => m.auth_user_id === osUserId);
@@ -182,7 +194,7 @@ export function createOperatorEntitlementDeps(db: TransactionalExecutor, billing
     return {
         now: clock,
         newId: () => randomUUID(),
-        identity: target => verifyIdentity(db, target.os_user_id, target.account_public_id, clock()),
+        identity: target => verifyIdentity(db, target.os_user_id, target.account_public_id, clock(), billing.config.fundingUrl),
         stripe: userId => stripeView(billing, userId, clock()),
         async readAssignments(userId) {
             try {
