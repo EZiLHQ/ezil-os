@@ -796,6 +796,11 @@ HOST_AGENT_DIRECTED_EXCEPTIONS=(
         'lib/ezil_host/standalone_git_assets/pin.json':('100644 c167f33cf3cd6766898375ea6bdece74ddce7d55','100644 f0d65d9c9230ba306c2a2347d5a8b61170863bfc'),
         'test/test_standalone_git.py':('100644 a406d07d8c9ddc30800bc7f001be1929bdc91beb','100644 05658a372afc228071e13bdb3682ec80011bad96'),
     }),
+    # R156 production host to the reviewed empty-open and branch-independent renewal CLI pin.
+    ('907dc8767841c32dab510b222785e661b10a4e7f','d791b9946e6b417d6cce45d7ce6d2706e536d4e5',{
+        'lib/ezil_host/standalone_git_assets/pin.json':('100644 c167f33cf3cd6766898375ea6bdece74ddce7d55','100644 8236bc9b2fe01e5c5b43a3a692efe1e96e6c4b50'),
+        'test/test_standalone_git.py':('100644 a406d07d8c9ddc30800bc7f001be1929bdc91beb','100644 365d1111fff10a3429d9d42e6cec25739e7cb6e0'),
+    }),
 )
 
 
