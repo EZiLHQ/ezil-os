@@ -7,12 +7,12 @@ import {
 
 type Principal = { userId: string; clientId: string };
 type BrowserTarget = { sandboxId: string; binding: string };
-type Dependencies = {
+type Dependencies<T extends BrowserTarget> = {
     enabled: boolean;
     controlEnabled?: boolean;
     verify: (headers: Headers, input: string, procedure: string, scope: string) => Promise<Principal | null>;
-    target: (principal: Principal, computerId: string) => Promise<BrowserTarget | null>;
-    observe: (principal: Principal, computerId: string, target: BrowserTarget, input: BrowserSessionRequest) => Promise<unknown>;
+    target: (principal: Principal, computerId: string) => Promise<T | null>;
+    observe: (principal: Principal, computerId: string, target: T, input: BrowserSessionRequest) => Promise<unknown>;
     now: () => number;
 };
 
@@ -48,7 +48,7 @@ function fail(error: string, status: number) {
     return reply({ ok: false, error }, status);
 }
 
-export async function handleBrowserObserve(request: Request, deps: Dependencies): Promise<Response> {
+export async function handleBrowserObserve<T extends BrowserTarget>(request: Request, deps: Dependencies<T>): Promise<Response> {
     if (!deps.enabled && !deps.controlEnabled) return fail('browser_unavailable', 404);
     const url = new URL(request.url);
     const computerId = BROWSER_OBSERVE_PATH.exec(url.pathname)?.[1];

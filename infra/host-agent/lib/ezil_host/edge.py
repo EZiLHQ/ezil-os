@@ -18,7 +18,10 @@ Routing is by the signed path only:
                                        then the job's status from disk;
   GET /__ezil/control/export/{status,head,chunk/<i>} -> served by the edge FROM DISK
                                        (export.py's state and staged chunks), never the agent.
-Anything else is 404.
+  POST /__ezil/control/browser-observe/<sha256(body)> -> only with edgeBrowserObserve: the desktop
+                                       sidecar's fixed POST /internal/mcp-browser-observe on 9223,
+                                       answered with the closed observation envelope only.
+Anything else is 404. The sidecar (9223) and CDP (9222) ports are never in the generic proxy.
 
 One request per connection (the upstream gets `Connection: close`), so a second request on
 a kept-alive client connection can never ride through unverified. A WebSocket upgrade that
@@ -86,6 +89,20 @@ FOLDER_CL_RE = re.compile(r"[1-9][0-9]{0,3}")
 MAX_FOLDER_BODY = 4096
 STANDALONE_REPO_RE = re.compile(r"^/__ezil/control/standalone-repo-open/([0-9a-f]{64})$")
 STANDALONE_STATUS_RE = re.compile(r"^/__ezil/control/standalone-repo-open-status/([0-9a-f]{64})$")
+# Delegated Browser observation (worker/src/aws-origin.ts observeAwsBrowser). The body's sha256 is in the
+# signed path; the desktop sidecar's fixed route is the only destination. Not presence: like the Cloudflare
+# observer, it reads a running desktop without renewing it.
+BROWSER_OBSERVE_RE = re.compile(r"^/__ezil/control/browser-observe/([0-9a-f]{64})$")
+BROWSER_OBSERVE_CL_RE = re.compile(r"[1-9][0-9]{0,3}")
+MAX_BROWSER_OBSERVE_BODY = 1024
+MAX_BROWSER_OBSERVE_REPLY = 2048
+BROWSER_OBSERVE_DEADLINE = 7.0          # below the Worker's 8 s
+BROWSER_SIDECAR_PORT = 9223
+BROWSER_SIDECAR_PATH = "/internal/mcp-browser-observe"
+BROWSER_SESSION_RE = re.compile(r"[A-Za-z0-9_-]{43}")
+BROWSER_EXPIRES_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z")
+MAX_SIDECAR_HEAD = 4096
+BROWSER_FAILURES = ("browser_invalid_request", "browser_session_stale", "browser_page_unavailable", "browser_unavailable")
 
 STREAM_BLOCK = 65536
 # The agent's own refusals of an `export` message (agent.handle): 409 export_invalid. Any other
@@ -323,6 +340,107 @@ def _forward_body(client, upstream, head):
     return pending
 
 
+def browser_observe_request(body):
+    """The observe body: {"binding": <64 hex>} plus an optional 43-char browserSessionId, nothing else."""
+    try:
+        req = json.loads(body.decode("utf-8", "strict"))
+    except ValueError:
+        return None
+    if not isinstance(req, dict) or "binding" not in req or not set(req) <= {"binding", "browserSessionId"}:
+        return None
+    if not isinstance(req["binding"], str) or not re.fullmatch(r"[0-9a-f]{64}", req["binding"]):
+        return None
+    if "browserSessionId" in req and (not isinstance(req["browserSessionId"], str)
+                                      or not BROWSER_SESSION_RE.fullmatch(req["browserSessionId"])):
+        return None
+    return req
+
+
+def observation_payload(value):
+    """The sidecar's closed envelope (worker/sidecar/mcp-observation.mjs observationPayload), rebuilt
+    from validated primitives; None for anything else."""
+    if not isinstance(value, dict):
+        return None
+    if value.get("ok") is False and set(value) == {"ok", "error"} and value["error"] in BROWSER_FAILURES:
+        return {"ok": False, "error": value["error"]}
+    if value.get("ok") is not True or set(value) != {"ok", "browserSessionId", "expiresAt", "observed",
+                                                       "profileHeadingVisible", "universeIdentity"}:
+        return None
+    sid, expires, observed, heading = (value["browserSessionId"], value["expiresAt"], value["observed"],
+                                       value["profileHeadingVisible"])
+    if (not isinstance(sid, str) or not BROWSER_SESSION_RE.fullmatch(sid)
+            or not isinstance(expires, str) or not BROWSER_EXPIRES_RE.fullmatch(expires)
+            or observed not in ("profile_builder", "interactive_sign_in_required") or not isinstance(heading, bool)
+            or (observed != "profile_builder" and heading) or value["universeIdentity"] != "unverified"):
+        return None
+    return {"ok": True, "browserSessionId": sid, "expiresAt": expires, "observed": observed,
+            "profileHeadingVisible": heading, "universeIdentity": "unverified"}
+
+
+def _sidecar_reply(buf):
+    """A complete `HTTP/1.1 200` with exactly one Content-Length equal to the bytes that follow
+    (at most MAX_BROWSER_OBSERVE_REPLY) and no Transfer-Encoding; its JSON as the closed envelope."""
+    if b"\r\n\r\n" not in buf:
+        return None
+    raw_head, rest = buf.split(b"\r\n\r\n", 1)
+    if len(raw_head) > MAX_SIDECAR_HEAD:
+        return None
+    lines = raw_head.decode("latin-1").split("\r\n")
+    status = lines[0].split(" ", 2)
+    if len(status) < 2 or status[0] != "HTTP/1.1" or status[1] != "200":
+        return None                         # a redirect or any other status is a failure, never followed
+    lengths = []
+    for line in lines[1:]:
+        k, sep, v = line.partition(":")
+        if not sep:
+            return None
+        k = k.strip().lower()
+        if k == "transfer-encoding":
+            return None
+        if k == "content-length":
+            lengths.append(v.strip())
+    if (len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,4}", lengths[0]) or int(lengths[0]) != len(rest)
+            or len(rest) > MAX_BROWSER_OBSERVE_REPLY):
+        return None
+    try:
+        return observation_payload(json.loads(rest.decode("utf-8", "strict")))
+    except ValueError:
+        return None
+
+
+def sidecar_observe(host, body, deadline):
+    """One fixed POST of the verified bytes to the desktop sidecar's observe route, within `deadline`
+    (time.monotonic). No client header is forwarded. The closed envelope, or None."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return None
+    try:
+        s = socket.create_connection((host, BROWSER_SIDECAR_PORT), timeout=remaining)
+    except OSError:
+        return None
+    buf = b""
+    try:
+        s.sendall(("\r\n".join([f"POST {BROWSER_SIDECAR_PATH} HTTP/1.1", f"Host: 127.0.0.1:{BROWSER_SIDECAR_PORT}",
+                                "Content-Type: application/json", f"Content-Length: {len(body)}",
+                                "Connection: close"]) + "\r\n\r\n").encode() + body)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            s.settimeout(remaining)
+            data = s.recv(4096)
+            if not data:
+                break
+            buf += data
+            if len(buf) > MAX_SIDECAR_HEAD + MAX_BROWSER_OBSERVE_REPLY:
+                return None
+    except OSError:
+        return None
+    finally:
+        s.close()
+    return _sidecar_reply(buf)
+
+
 def _pipe(a, b, stop):
     try:
         while not stop.is_set():
@@ -377,6 +495,10 @@ class Edge:
                             head.method, path, int(self.clock()))
         if not ok:
             _reply(client, 401, {"ok": False, "error": err})
+            return
+        observe = BROWSER_OBSERVE_RE.fullmatch(path)
+        if observe:
+            self._browser_observe(client, head, observe.group(1), query)
             return
         self.seq.presence()
         restart = RESTART_RE.fullmatch(path)
@@ -588,6 +710,51 @@ class Edge:
             _reply(client, 503, {"ok": False, "error": "agent_unavailable"})
             return
         _reply(client, 200 if status else 202, answer)
+
+    # ------------------------------------------------------------ delegated Browser observation
+    def _browser_observe(self, client, head, digest, query):
+        """POST /__ezil/control/browser-observe/<sha256>: 404 unless edgeBrowserObserve is true. Exactly
+        Content-Length bytes (1..1024, no chunking, nothing after them), hashed BEFORE parsing and
+        compared with the signed digest, then checked as the closed request. This lease's desktop must
+        be running (agent desktop_status) before and after the one sidecar call, all inside one
+        deadline. Answers the rebuilt closed envelope only; never the sidecar's bytes. No presence."""
+        if self.cfg.get("edgeBrowserObserve") is not True or head.method != "POST" or query:
+            _reply(client, 404, {"ok": False, "error": "not_found"})
+            return
+        cl, te = head.get("content-length"), head.get("transfer-encoding")
+        if (te or len(cl) != 1 or not BROWSER_OBSERVE_CL_RE.fullmatch(cl[0])
+                or int(cl[0]) > MAX_BROWSER_OBSERVE_BODY):
+            _reply(client, 400, {"ok": False, "error": "browser_invalid_request"})
+            return
+        try:
+            body, trailing = _recv_exact(client, int(cl[0]), head.rest)
+        except (ValueError, OSError):
+            _reply(client, 400, {"ok": False, "error": "browser_invalid_request"})
+            return
+        if (trailing or not hmac.compare_digest(hashlib.sha256(body).hexdigest(), digest)
+                or browser_observe_request(body) is None):
+            _reply(client, 400, {"ok": False, "error": "browser_invalid_request"})
+            return
+        deadline = time.monotonic() + BROWSER_OBSERVE_DEADLINE
+        if not self._desktop_running():
+            _reply(client, 409, {"ok": False, "error": "browser_unavailable"})
+            return
+        answer = sidecar_observe(self.upstream_host, body, deadline)
+        if answer is None:
+            _reply(client, 503, {"ok": False, "error": "browser_unavailable"})
+            return
+        if not self._desktop_running() or time.monotonic() >= deadline:
+            _reply(client, 409, {"ok": False, "error": "browser_unavailable"})
+            return
+        _reply(client, 200, answer)
+
+    def _desktop_running(self):
+        """The agent answers for this lease's epoch (wrong_epoch otherwise) and its desktop runs."""
+        try:
+            resp = self.seq.send("desktop_status")
+        except (OSError, ValueError, AttributeError):
+            return False
+        return isinstance(resp, dict) and resp.get("ok") is True and resp.get("desktop") == "running"
 
     # ------------------------------------------------------------ reverse move export (§2.2)
     def _export_post(self, client, head, digest, query):

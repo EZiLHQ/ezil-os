@@ -54,6 +54,9 @@ DEFAULTS = {
     "edgePort": 18080,
     "edgeUpstreamHost": "10.200.0.2",
     "edgePorts": [8181, 8080, 3002, 8443],
+    # Delegated Browser observation through the edge's fixed sidecar route (edge._browser_observe).
+    # Off unless a reviewed host config sets it; 9222/9223 never join edgePorts.
+    "edgeBrowserObserve": False,
     # Streamed-desktop WebRTC (worker/src/aws-ice.ts). "relay" (the AWS AMI): the desktop
     # waits up to iceWaitSeconds for the Worker's per-epoch relay config (GW-5 `ice`), then
     # starts with it, or without it (ice_missing; the next push restarts it with

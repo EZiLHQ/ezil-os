@@ -5,7 +5,10 @@ import { consumeDelegationJti, findDelegatedAccount } from '@/server/api/delegat
 import { mintPreviewTokenV2, PREVIEW_TOKEN_V2_HEADER } from '@/server/lib/compute/preview-token-v2';
 import { BROWSER_CONTROL_PROCEDURE, BROWSER_PAGE_PROCEDURE, BROWSER_STAGING_MCP, BROWSER_STAGING_OS, BROWSER_STAGING_WORKER, BROWSER_UI_RESULT_MAX_BYTES } from '@/server/browser-observe/contract';
 import { handleBrowserObserve, readSmallBody } from '@/server/browser-observe/receiver';
-import { resolveCloudflareBrowserTarget } from '@/server/browser-observe/target';
+import {
+    awsBrowserTargetAdmitted, browserTargetClaims, resolveAwsBrowserTarget, resolveCloudflareBrowserTarget,
+    type AwsBrowserTarget, type CloudflareBrowserTarget,
+} from '@/server/browser-observe/target';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -16,7 +19,7 @@ export async function POST(request: Request): Promise<Response> {
             && process.env.EZIL_DELEGATION_AUDIENCE === BROWSER_STAGING_OS
             && process.env.CLOUDFLARE_GUACAMOLE_WORKER_URL?.replace(/\/$/, '') === BROWSER_STAGING_WORKER
             && Boolean(secret);
-    return handleBrowserObserve(request, {
+    return handleBrowserObserve<CloudflareBrowserTarget | AwsBrowserTarget>(request, {
         enabled: stagingConfigured && process.env.EZIL_DELEGATED_BROWSER_OBSERVE === 'enabled',
         controlEnabled: stagingConfigured && process.env.EZIL_DELEGATED_BROWSER_CONTROL === 'enabled',
         now: Date.now,
@@ -41,13 +44,15 @@ export async function POST(request: Request): Promise<Response> {
             const { userId, clientId } = result.call;
             return { userId, clientId };
         },
-        target: (principal, computerId) => resolveCloudflareBrowserTarget(principal, computerId, 'ezil-browser-observe-v1'),
+        // Only an explicitly admitted AWS computer takes the AWS leg; every other computer keeps the Cloudflare one.
+        target: (principal, computerId) => awsBrowserTargetAdmitted(process.env.EZIL_DELEGATED_BROWSER_OBSERVE_AWS_TARGETS, computerId)
+            ? resolveAwsBrowserTarget(principal, computerId, 'ezil-browser-observe-v1')
+            : resolveCloudflareBrowserTarget(principal, computerId, 'ezil-browser-observe-v1'),
         async observe({ userId }, computerId, target, input) {
             const endpoint = new URL('/sandbox/' + target.sandboxId + '/browser-observe', BROWSER_STAGING_WORKER);
             const body = JSON.stringify({ binding: target.binding, ...input });
             const signature = mintPreviewTokenV2(secret!, {
-                ts: Date.now(), sandboxId: target.sandboxId, computerId, userId,
-                provider: 'cloudflare', store: '', generation: 0, leaseEpoch: 0,
+                ts: Date.now(), sandboxId: target.sandboxId, computerId, userId, ...browserTargetClaims(target),
             }, { method: 'POST', path: endpoint.pathname, body });
             const response = await fetch(endpoint, {
                 method: 'POST', body, signal: AbortSignal.timeout(10_000), redirect: 'error', cache: 'no-store',

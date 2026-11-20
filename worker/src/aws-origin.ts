@@ -668,6 +668,33 @@ export async function startAwsExport(
   });
 }
 
+/**
+ * Delegated Browser observation: the host edge's fixed sidecar route (infra/host-agent edge.py
+ * `_browser_observe`). The signature covers the path only, so the sha256 of the EXACT bytes sent
+ * travels in the signed path; the caller hands over the bytes it read and they are never re-encoded.
+ */
+export const BROWSER_OBSERVE_CONTROL_PATH = '/__ezil/control/browser-observe';
+export async function observeAwsBrowser(
+  record: AwsTunnelRecord,
+  zone: string,
+  body: Uint8Array,
+  fetchFn: FetchLike,
+  nowSeconds: number,
+  timeoutMs: number,
+): Promise<Response> {
+  if (body.byteLength < 1 || body.byteLength > 1024) throw new Error('gw_invalid_control_op');
+  // One copy: these exact bytes are both hashed and sent.
+  const bytes = Uint8Array.from(body);
+  const { host, key } = exportOrigin(record, zone);
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+  const path = `${BROWSER_OBSERVE_CONTROL_PATH}/${[...digest].map((x) => x.toString(16).padStart(2, '0')).join('')}`;
+  const header = await signGatewayHeader(key, record, 'POST', path, nowSeconds);
+  return fetchFn(`https://${host}${path}`, {
+    method: 'POST', headers: { [AWS_GATEWAY_HEADER]: header, 'content-type': 'application/json' }, body: bytes,
+    redirect: 'manual', signal: AbortSignal.timeout(timeoutMs),
+  });
+}
+
 /** What the import reads from the host edge: served from disk, never through the agent socket. */
 export type AwsExportRead = 'status' | 'head' | { chunk: number };
 

@@ -35,6 +35,8 @@ mock.module('cloudflare:workers', () => ({
   env: {},
 }));
 
+import { createHash } from 'node:crypto';
+import { decodeControlKey, signGatewayHeader } from './aws-origin';
 import { deriveEditorBridgeToken } from './editor-bridge';
 import { hmacSha256Hex, mintPreviewTokenV2, PREVIEW_TOKEN_PAYLOAD, TOKEN_MAX_AGE_MS, type PreviewTokenV2Claims } from './hmac';
 import { SCREEN_MODES } from './screen-modes';
@@ -1672,6 +1674,123 @@ describe('delegated Browser observation Worker route', () => {
     expect((await worker.fetch(await signed(), { ...env, SANDBOX_MCP_BROWSER_OBSERVE: 'off' })).status).toBe(404);
     expect(calls.browserObservations).toHaveLength(0);
     expect(calls.exposePort).toHaveLength(0);
+  });
+
+  describe('an explicitly admitted AWS computer', () => {
+    const aws = { provider: 'aws-ec2' as const, generation: 3, leaseEpoch: 7 };
+    const controlKey = Buffer.alloc(32, 5).toString('base64');
+    const reply = {
+      ok: true, browserSessionId: 'b'.repeat(43), expiresAt: '2026-11-20T00:02:00.000Z',
+      observed: 'profile_builder', profileHeadingVisible: true, universeIdentity: 'unverified',
+    };
+    function rig(answer: () => Response = () => Response.json(reply)) {
+      const { binding, calls } = fakeSandboxNamespace({});
+      const state = { record: { computerId: claims.computerId, sandboxId: SANDBOX_NAME, generation: 3, leaseEpoch: 7,
+        controlKey, originVerified: true } as Record<string, unknown> | null, lookups: 0, after: null as null | (() => void) };
+      const env = {
+        ...environment(binding), AWS_ROUTING_ENABLED: 'on', AWS_ORIGIN_ZONE: 'origin.ezil.org', AWS_ORIGIN_ZONE_ALLOWLIST: 'origin.ezil.org',
+        SANDBOX_MCP_BROWSER_OBSERVE_AWS_TARGETS: 'aws-ec2:' + claims.computerId,
+        AWS_TUNNELS: { idFromName: (id: string) => id, get: () => ({ fetch: async () => {
+          state.lookups++;
+          return Response.json({ record: state.record });
+        } }) },
+      };
+      const sent: Request[] = [];
+      const real = globalThis.fetch;
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        sent.push(new Request(input, init));
+        state.after?.();
+        return answer();
+      }) as typeof fetch;
+      return { env, calls, state, sent, restore: () => { globalThis.fetch = real; } };
+    }
+
+    it('sends the exact signed bytes, digest-bound and gw1-signed, to the edge\'s one fixed route', async () => {
+      const r = rig();
+      try {
+        const answer = await worker.fetch(await signed(aws), r.env);
+        expect(answer.status).toBe(200);
+        expect(answer.headers.get('cache-control')).toBe('no-store');
+        expect(await answer.json()).toEqual(reply);
+        expect(r.sent).toHaveLength(1);
+        const sent = r.sent[0]!;
+        const url = new URL(sent.url);
+        const digest = createHash('sha256').update(body).digest('hex');
+        expect([sent.method, url.protocol, url.pathname, url.search]).toEqual(['POST', 'https:', '/__ezil/control/browser-observe/' + digest, '']);
+        expect(url.hostname.endsWith('.origin.ezil.org')).toBe(true);
+        expect(sent.redirect).toBe('manual');
+        expect(await sent.text()).toBe(body);
+        const header = sent.headers.get('x-ezil-gw')!;
+        const ts = Number(/^gw1\.(\d+)\./.exec(header)![1]);
+        expect(header).toBe(await signGatewayHeader(decodeControlKey(controlKey)!,
+          r.state.record as never, 'POST', url.pathname, ts));
+        expect(sent.headers.get('x-ezil-auth')).toBeNull();
+        expect(r.state.lookups).toBe(2);
+        expect(r.calls.browserObservations).toHaveLength(0);
+        expect(r.calls.startProcess).toHaveLength(0);
+        expect(r.calls.containerFetch).toHaveLength(0);
+      } finally { r.restore(); }
+    });
+
+    it('refuses an unlisted, foreign, store-claimed or cross-epoch AWS claim before any host call', async () => {
+      const r = rig();
+      try {
+        const env = r.env;
+        for (const [input, over] of [
+          [aws, { SANDBOX_MCP_BROWSER_OBSERVE_AWS_TARGETS: undefined }],
+          [aws, { SANDBOX_MCP_BROWSER_OBSERVE_AWS_TARGETS: 'cloudflare:' + claims.computerId }],
+          [aws, { SANDBOX_MCP_BROWSER_OBSERVE_AWS_TARGETS: 'aws-ec2:' + claims.computerId + ',bogus' }],
+          [{ ...aws, userId: '11111111-1111-4111-8111-111111111111' }, {}],
+          [{ ...aws, store: 'r2' as const }, {}],
+          [{ ...aws, generation: 0, leaseEpoch: 0 }, {}],
+        ] as const) {
+          expect((await worker.fetch(await signed(input), { ...env, ...over })).status).toBe(401);
+        }
+        expect(r.state.lookups).toBe(0);
+        // The claim names an epoch the registry no longer holds, or AWS routing is off: refused, never a Cloudflare wake.
+        expect((await worker.fetch(await signed({ ...aws, leaseEpoch: 8 }), env)).status).toBe(409);
+        expect((await worker.fetch(await signed(aws), { ...env, AWS_ROUTING_ENABLED: 'off' })).status).toBe(409);
+        r.state.record = { ...r.state.record!, originVerified: false };
+        expect((await worker.fetch(await signed(aws), env)).status).toBe(409);
+        r.state.record = { ...r.state.record!, originVerified: true };
+        expect((await worker.fetch(await signed(aws, 'x'.repeat(1025)), env)).status).toBe(413);
+        // The budget starts at the signed time: an expired one never looks up or dispatches,
+        // and a hung tunnel lookup is cut at what is left of it.
+        const lookups = r.state.lookups;
+        expect((await worker.fetch(await signed({ ...aws, ts: Date.now() - 8_500 }), env)).status).toBe(503);
+        expect(r.state.lookups).toBe(lookups);
+        const hung = { ...env, AWS_TUNNELS: { idFromName: (id: string) => id, get: () => ({ fetch: () => new Promise<Response>(() => {}) }) } };
+        const started = Date.now();
+        expect((await worker.fetch(await signed({ ...aws, ts: Date.now() - 7_700 }), hung)).status).toBe(503);
+        expect(Date.now() - started).toBeLessThan(2_000);
+        expect(r.sent).toHaveLength(0);
+        expect(r.calls.browserObservations).toHaveLength(0);
+        expect(r.calls.startProcess).toHaveLength(0);
+      } finally { r.restore(); }
+    });
+
+    it('answers nothing observed across a lease move, an edge refusal, a redirect or an oversized reply', async () => {
+      let answer = () => Response.json(reply);
+      const r = rig(() => answer());
+      try {
+        r.state.after = () => { r.state.record = { ...r.state.record!, leaseEpoch: 8 }; };
+        const moved = await worker.fetch(await signed(aws), r.env);
+        // Worker-made browser codes leave through the public vocabulary (as on Cloudflare); the app maps any non-OK.
+        expect([moved.status, await moved.json()]).toEqual([409, { ok: false, error: 'internal_error' }]);
+        r.state.after = null;
+        r.state.record = { ...r.state.record!, leaseEpoch: 7 };
+        for (const next of [
+          () => Response.json({ ok: false, error: 'browser_unavailable' }, { status: 409 }),
+          () => new Response(null, { status: 302, headers: { location: 'http://127.0.0.1:9222/json' } }),
+          () => new Response('x'.repeat(2049), { status: 200 }),
+        ]) {
+          answer = next;
+          const refused = await worker.fetch(await signed(aws), r.env);
+          expect([refused.status, await refused.json()]).toEqual([503, { ok: false, error: 'internal_error' }]);
+        }
+        expect(r.sent).toHaveLength(4);
+      } finally { r.restore(); }
+    });
   });
 });
 

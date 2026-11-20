@@ -280,6 +280,59 @@ class Upstream:
         self.s.close()
 
 
+class Sidecar:
+    """A stub desktop sidecar: records each raw request, answers `reply` verbatim (HANG: never answers)."""
+    HANG = object()
+
+    @staticmethod
+    def json(value):
+        data = json.dumps(value).encode()
+        return b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: %d\r\nConnection: close\r\n\r\n" % len(data) + data
+
+    def __init__(self, reply):
+        self.reply, self.requests = reply, []
+        self.s = socket.socket()
+        self.s.bind(("127.0.0.1", 0))
+        self.s.listen(8)
+        self.port = self.s.getsockname()[1]
+        self.stop = threading.Event()
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        self.s.settimeout(0.2)
+        while not self.stop.is_set():
+            try:
+                c, _ = self.s.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=self._one, args=(c,), daemon=True).start()
+
+    def _one(self, c):
+        c.settimeout(2)
+        buf = b""
+        try:
+            while b"\r\n\r\n" not in buf:
+                buf += c.recv(4096)
+            n = int(buf.lower().split(b"content-length:", 1)[1].split(b"\r\n", 1)[0])
+            while len(buf.split(b"\r\n\r\n", 1)[1]) < n:
+                buf += c.recv(4096)
+            self.requests.append(buf)
+            if self.reply is Sidecar.HANG:
+                self.stop.wait(3)
+            else:
+                c.sendall(self.reply)
+        except (OSError, ValueError, IndexError):
+            pass
+        finally:
+            c.close()
+
+    def close(self):
+        self.stop.set()
+        self.s.close()
+
+
 def raw(port, data, timeout=3, keep_open=False):
     s = socket.create_connection(("127.0.0.1", port), timeout=timeout)
     s.sendall(data)
@@ -395,7 +448,7 @@ class EdgeE2E(unittest.TestCase):
         self.assertEqual(self.agent.last_seq, 0)
 
     def test_unknown_port_or_path_is_404(self):
-        for p in ("/__p/9223/x", "/other", f"/__p/{self.desk.port}x"):
+        for p in ("/__p/9223/x", "/__p/9222/json", "/other", f"/__p/{self.desk.port}x"):
             self.assertTrue(raw(self.port, self.req("GET", p)).startswith(b"HTTP/1.1 404"), p)
         self.assertEqual(self.desk.conns, 0)
 
@@ -605,6 +658,116 @@ class EdgeE2E(unittest.TestCase):
         self.assertFalse(self.stored())
         for s in ICE_SECRETS:
             self.assertNotIn(s.encode(), out)
+
+    # ------------------------------------------------- delegated Browser observation (aws-origin.ts)
+    OBSERVED = {"ok": True, "browserSessionId": "s" * 43, "expiresAt": "2026-11-20T00:02:00.000Z",
+                "observed": "profile_builder", "profileHeadingVisible": True, "universeIdentity": "unverified"}
+
+    def observe_rig(self, reply=None, desktop="running"):
+        """The flag on, a stub sidecar on an ephemeral port standing in for 9223, the agent's desktop state."""
+        self.cfg["edgeBrowserObserve"] = True
+        side = Sidecar(reply if reply is not None else Sidecar.json(self.OBSERVED))
+        self.addCleanup(side.close)
+        patch = mock.patch.object(edge, "BROWSER_SIDECAR_PORT", side.port)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.agent._desktop_state = lambda: desktop if isinstance(desktop, str) else desktop()
+        return side
+
+    def observe_req(self, body, digest=None, extra=None, gw=True, method="POST", query=""):
+        digest = hashlib.sha256(body).hexdigest() if digest is None else digest
+        headers = [f"Content-Length: {len(body)}"] if extra is None else extra
+        return self.req(method, f"/__ezil/control/browser-observe/{digest}{query}", headers=headers, body=body, gw=gw)
+
+    def test_browser_observe_relays_exact_bytes_to_the_fixed_sidecar_route_without_presence(self):
+        side = self.observe_rig()
+        body = b'{ "binding":"' + b"a" * 64 + b'" }'
+        out = raw(self.port, self.observe_req(body))
+        self.assertTrue(out.startswith(b"HTTP/1.1 200"), out)
+        self.assertEqual(json.loads(out.split(b"\r\n\r\n", 1)[1]), self.OBSERVED)
+        self.assertEqual(len(side.requests), 1)
+        head, sent = side.requests[0].split(b"\r\n\r\n", 1)
+        self.assertEqual(sent, body)
+        lines = head.decode().split("\r\n")
+        self.assertEqual(lines[0], "POST /internal/mcp-browser-observe HTTP/1.1")
+        self.assertEqual(sorted(h.split(":")[0].lower() for h in lines[1:]),
+                         ["connection", "content-length", "content-type", "host"], "no client header is forwarded")
+        self.assertEqual(self.agent.last_presence, self.boot_presence, "an observation never renews the host")
+        self.assertEqual(self.desk.conns + self.code.conns, 0)
+
+    def test_browser_observe_is_off_by_default_and_refuses_bad_framing_digest_or_input(self):
+        body = b'{"binding":"' + b"a" * 64 + b'"}'
+        self.assertTrue(raw(self.port, self.observe_req(body)).startswith(b"HTTP/1.1 404"), "default off")
+        side = self.observe_rig()
+        d = hashlib.sha256(body).hexdigest()
+        cases = [
+            (self.observe_req(body, gw=False), b"401"),
+            (self.observe_req(body, gw=gw_header("POST", "/__ezil/control/browser-observe/" + "0" * 64)), b"401"),
+            (self.observe_req(body, method="GET"), b"404"),
+            (self.observe_req(body, query="?x=1"), b"404"),
+            (self.observe_req(body, digest=hashlib.sha256(body + b" ").hexdigest()), b"400"),
+            (self.observe_req(body, extra=["Transfer-Encoding: chunked"]), b"400"),
+            (self.observe_req(body, extra=[f"Content-Length: {len(body)}"] * 2), b"400"),
+            (self.observe_req(b"", extra=["Content-Length: 0"]), b"400"),
+            (self.observe_req(b" " * 1025), b"400"),
+            (self.req("POST", f"/__ezil/control/browser-observe/{d}", headers=[f"Content-Length: {len(body)}"],
+                      body=body + b"GET / HTTP/1.1\r\n\r\n"), b"400"),
+            (self.observe_req(b'{"binding":"' + b"a" * 64 + b'","selector":"input"}'), b"400"),
+            (self.observe_req(b'{"binding":"' + b"A" * 64 + b'"}'), b"400"),
+            (self.observe_req(b'{"binding":"' + b"a" * 64 + b'","browserSessionId":"short"}'), b"400"),
+            (self.observe_req(b'["binding"]'), b"400"),
+        ]
+        for data, code in cases:
+            out = raw(self.port, data)
+            self.assertTrue(out.startswith(b"HTTP/1.1 " + code), (code, out[:80]))
+        self.assertEqual(side.requests, [])
+        self.assertEqual(self.agent.last_presence, self.boot_presence)
+
+    def test_browser_observe_requires_a_running_desktop_before_and_after(self):
+        body = b'{"binding":"' + b"a" * 64 + b'"}'
+        side = self.observe_rig(desktop="stopped")
+        out = raw(self.port, self.observe_req(body))
+        self.assertTrue(out.startswith(b"HTTP/1.1 409") and b"browser_unavailable" in out, out)
+        self.assertEqual(side.requests, [])
+        states = iter(["running", "stopped"])
+        self.agent._desktop_state = lambda: next(states)
+        out = raw(self.port, self.observe_req(body))
+        self.assertTrue(out.startswith(b"HTTP/1.1 409"), out)
+        self.assertEqual(len(side.requests), 1)
+        self.assertNotIn(b"sssss", out, "nothing observed while the desktop moved is answered")
+
+    def test_browser_observe_answers_only_the_closed_envelope(self):
+        body = b'{"binding":"' + b"a" * 64 + b'"}'
+        bad = [
+            Sidecar.json({**self.OBSERVED, "title": "synthetic secret"}),
+            Sidecar.json({**self.OBSERVED, "observed": "interactive_sign_in_required"}),
+            Sidecar.json({"ok": False, "error": "chrome_unreachable"}),
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9222/json\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}extra",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 3000\r\n\r\n" + b" " * 3000,
+            b"",
+        ]
+        for reply in bad:
+            with self.subTest(reply=reply[:40]):
+                self.observe_rig(reply=reply)
+                out = raw(self.port, self.observe_req(body))
+                self.assertTrue(out.startswith(b"HTTP/1.1 503") and b"browser_unavailable" in out, out)
+                self.assertNotIn(b"synthetic", out)
+                self.assertNotIn(b"9222", out)
+        self.observe_rig(reply=Sidecar.json({"ok": False, "error": "browser_session_stale"}))
+        out = raw(self.port, self.observe_req(body))
+        self.assertTrue(out.startswith(b"HTTP/1.1 200"), out)
+        self.assertEqual(json.loads(out.split(b"\r\n\r\n", 1)[1]), {"ok": False, "error": "browser_session_stale"})
+
+    def test_browser_observe_is_bounded_by_one_deadline(self):
+        body = b'{"binding":"' + b"a" * 64 + b'"}'
+        self.observe_rig(reply=Sidecar.HANG)
+        with mock.patch.object(edge, "BROWSER_OBSERVE_DEADLINE", 0.3):
+            started = time.monotonic()
+            out = raw(self.port, self.observe_req(body))
+        self.assertTrue(out.startswith(b"HTTP/1.1 503"), out)
+        self.assertLess(time.monotonic() - started, 2)
 
     def test_seq_recovers_from_a_higher_persisted_mark(self):
         # Recover the persisted mark immediately, but throttle the presence retry.

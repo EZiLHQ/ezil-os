@@ -73,7 +73,7 @@ import { assertAcceptanceScope, parseAcceptanceFault, activeAcceptanceFault, fai
 import { getSandbox, proxyToSandbox, type Sandbox, type SandboxEnv } from '@cloudflare/sandbox';
 // AWS computers (GATEWAY-CONTRACT-v1). All logic lives in these two modules; this file only
 // dispatches to them, behind AWS_ROUTING_ENABLED (default off). See ./aws-origin.ts.
-import { awsPreviewSurface, awsRoutingEnabled, handleAwsBrowserHost, handleAwsPreview, parseAwsBrowserHost, resolveAwsOriginZone, type AwsTunnelRecord } from './aws-origin';
+import { awsPreviewSurface, awsRoutingEnabled, handleAwsBrowserHost, handleAwsPreview, observeAwsBrowser, parseAwsBrowserHost, resolveAwsOriginZone, type AwsTunnelRecord } from './aws-origin';
 import { AwsTunnelRegistry, lookupAwsTunnel, lookupAwsTunnelForBrowser, routeAwsTunnels, verifyAwsTunnelOrigin, REGISTRY_PATHS, type RegistryFor } from './aws-tunnels';
 // The streamed desktop's TURN relay on an AWS host (no inbound rule): config push + in-place renewal.
 import { awsCodeServerAnswers, awsRelayRefresh, awsScreenDesktop, ensureAwsDesktop, ensureAwsDesktopConfig, type RelayMint, type ScreenDesktop } from './aws-ice';
@@ -297,6 +297,8 @@ interface Env extends SandboxEnv {
   SANDBOX_MCP_BROWSER_OBSERVE?: string;
   /** Stage-only owner-bound page reads and controls on an already active browser. */
   SANDBOX_MCP_BROWSER_CONTROL?: string;
+  /** Explicit `aws-ec2:<computerId>` list admitted to that observation through the host edge; unset admits none. */
+  SANDBOX_MCP_BROWSER_OBSERVE_AWS_TARGETS?: string;
   /** Opt-in signed external Browser MCP on the staging Worker. */
   SANDBOX_MCP_BROWSER_OPEN?: string;
   /** Independently opt-in built-in Browser MCP in the running Code App. */
@@ -4700,6 +4702,48 @@ async function awsControlTarget(env: Env, request: Request, name: string, prefix
   return { record, zone };
 }
 
+/**
+ * The AWS leg of the delegated Browser observer: only an explicitly admitted `aws-ec2:<computerId>`,
+ * this epoch's verified tunnel before and after, and the host edge's fixed sidecar route carrying the
+ * exact signed bytes (aws-origin.ts observeAwsBrowser). It never wakes, starts or renews the host.
+ */
+async function handleAwsBrowserObserve(request: Request, env: Env, claims: PreviewTokenV2Claims, target: string): Promise<Response> {
+  if (!editorBridgeTargetAllowed(env.SANDBOX_MCP_BROWSER_OBSERVE_AWS_TARGETS, 'aws-ec2', claims.computerId)
+    || claims.sandboxId !== target || target !== deriveSandboxId(claims.userId, claims.computerId)
+    || claims.store !== '' || claims.generation < 1 || claims.leaseEpoch < 1) {
+    return json({ ok: false, error: 'browser_unauthorized' }, 401);
+  }
+  // One budget from entry: both tunnel lookups, the dispatch and the reply all fit inside it.
+  const deadline = Math.min(claims.ts + 8_000, Date.now() + 8_000);
+  const remaining = () => deadline - Date.now();
+  try {
+    if (remaining() <= 0) return json({ ok: false, error: 'browser_unavailable' }, 503);
+    const before = await withDeadline(awsControlTarget(env, request, target, 'browser_observe'), remaining(), 'browser.observe.aws');
+    if (!before || before instanceof Response) return json({ ok: false, error: 'browser_unavailable' }, 409);
+    const input = await readBoundedBody(request, 1024);
+    if (input === 'too_large') return json({ ok: false, error: 'browser_invalid_request' }, 413);
+    if (remaining() <= 0) return json({ ok: false, error: 'browser_unavailable' }, 503);
+    const upstream = await observeAwsBrowser(before.record, before.zone, input, (url, init) => fetch(url, init),
+      Math.floor(Date.now() / 1000), remaining());
+    if (upstream.status !== 200 || remaining() <= 0) {
+      await upstream.body?.cancel().catch(() => undefined);
+      return json({ ok: false, error: 'browser_unavailable' }, 503);
+    }
+    const bytes = await withDeadline(readBoundedBody(upstream, 2048), remaining(), 'browser.observe.body');
+    if (bytes === 'too_large') throw new Error('browser_oversized');
+    if (remaining() <= 0) return json({ ok: false, error: 'browser_unavailable' }, 503);
+    const after = await withDeadline(awsControlTarget(env, request, target, 'browser_observe'), remaining(), 'browser.observe.aws');
+    if (!after || after instanceof Response || after.record.computerId !== before.record.computerId
+      || after.record.sandboxId !== before.record.sandboxId || after.record.generation !== before.record.generation
+      || after.record.leaseEpoch !== before.record.leaseEpoch || Date.now() >= deadline) {
+      return json({ ok: false, error: 'browser_unavailable' }, 409);
+    }
+    return new Response(bytes, { status: 200, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
+  } catch {
+    return json({ ok: false, error: 'browser_unavailable' }, 503);
+  }
+}
+
 /** Same boot-bound Chat identity for preview bootstrap and an in-place restart. */
 function awsDesktopAiConfig(env: Env, record: AwsTunnelRecord) {
   const registry = awsRegistryFor(env);
@@ -8341,6 +8385,7 @@ const worker = {
       }
       const claims = verifiedV2Claims.get(request);
       const target = observation[1]!;
+      if (claims?.provider === 'aws-ec2') return handleAwsBrowserObserve(request, env, claims, target);
       if (!claims || claims.provider !== 'cloudflare' || claims.sandboxId !== target
         || target !== deriveSandboxId(claims.userId, claims.computerId)
         || claims.generation !== 0 || claims.leaseEpoch !== 0 || claims.store !== '') {
