@@ -577,8 +577,29 @@ def projected_observer_grant(logical, left, right, target):
     )
 
 
-def _observer_invoke_rows(policy):
-    return [row for row in statements(policy) if row.get('Effect') == 'Allow' and 'lambda:invokefunction' in action_set(row)]
+def _groups_observer_grants(policy_logical):
+    """Only the PRD lifecycle controller default policy may group its exact observer grants (aggregate role quota)."""
+    return context.NAMESPACE == 'prd' and policy_logical == LIFECYCLE_CONTROLLER_POLICY
+
+
+def _grouped_observer_refs(row):
+    """The one compact form: an unconditional InvokeFunction Allow on two or more distinct exact Ref targets."""
+    resource = row.get('Resource')
+    need(set(row) == {'Action', 'Effect', 'Resource'} and row.get('Effect') == 'Allow'
+         and action_set(row) == {'lambda:invokefunction'} and isinstance(resource, list) and len(resource) >= 2
+         and all(isinstance(item, dict) and set(item) == {'Ref'} and isinstance(item['Ref'], str) for item in resource)
+         and len({item['Ref'] for item in resource}) == len(resource),
+         'grouped observer grant must be exact distinct immutable version references')
+    return [item['Ref'] for item in resource]
+
+
+def _observer_invoke_rows(policy, policy_logical=None):
+    """Observer invoke rows; the PRD controller's grouped row reads as its exact per-target flat rows."""
+    rows = [row for row in statements(policy) if row.get('Effect') == 'Allow' and 'lambda:invokefunction' in action_set(row)]
+    if not _groups_observer_grants(policy_logical) or not any(isinstance(row.get('Resource'), list) for row in rows):
+        return rows
+    need(len(rows) == 1, 'grouped observer grant must be the only observer grant')
+    return [{**rows[0], 'Resource': {'Ref': logical}} for logical in _grouped_observer_refs(rows[0])]
 
 
 def _observer_version_grant(resources, policy_logical, function_logical, prefix, deployed=None):
@@ -586,7 +607,7 @@ def _observer_version_grant(resources, policy_logical, function_logical, prefix,
     policy = resources.get(policy_logical, {})
     if policy.get('Type') != 'AWS::IAM::Policy':
         return None
-    invokes = _observer_invoke_rows(policy)
+    invokes = _observer_invoke_rows(policy, policy_logical)
     need(bool(invokes) and (deployed is not None or len(invokes) == 1), f'one exact {prefix} reference required')
     version_ids = []
     for grant in invokes:
@@ -697,7 +718,8 @@ def transition_observer_versions(before):
 def preserve_transition_versions(before, after):
     """Image-to-image: for every observer whose current version changes, the candidate keeps the exact previous version
     resource and exact InvokeFunction grant on the same role. The split PRD lifecycle controller carries the grant
-    in its existing inline policy to avoid an IAM quota breach during concurrent CloudFormation writes."""
+    in its existing inline policy to avoid an IAM quota breach during concurrent CloudFormation writes, either as flat
+    rows or as one exact grouped Resource array (read per target, so both forms grant exactly the same)."""
     previous = transition_observer_versions(before)
     if previous is None or not _image_mode(after):
         return
@@ -747,17 +769,21 @@ PRODUCTION_LIFECYCLE_TRANSITION_POLICY = 'LifecycleTransitionObserverPolicy2B2FB
 
 
 def _production_observer_row(resources, policy, logical):
-    return next((row for row in _observer_invoke_rows(resources[policy])
+    return next((row for row in _observer_invoke_rows(resources[policy], policy)
                  if row['Resource'] == {'Ref': logical}), None)
 
 
 def _production_archived_observer_rows(resources, policy, previous, current):
-    return [row for row in _observer_invoke_rows(resources[policy])
+    return [row for row in _observer_invoke_rows(resources[policy], policy)
             if row['Resource'] not in ({'Ref': previous}, {'Ref': current})]
 
 
-def carry_production_predecessor(before, synthesized):
-    """Carry the already-deployed exact PRD split rollback resources into a local CDK template."""
+def carry_production_predecessor(before, synthesized, *, compact_observer_grants=False):
+    """Carry the exact PRD split rollback resources into a local CDK template.
+
+    Prepare a compact controller policy when requested. Validation keeps the
+    representation of an existing reviewed template, including the flat form.
+    """
     old = before['Resources']
     if not _image_mode(before) or not _production_split_recovery(old):
         return synthesized
@@ -772,6 +798,18 @@ def carry_production_predecessor(before, synthesized):
         need(logical in old and (logical not in new or new[logical] == old[logical]),
              f'{logical} must be carried unchanged')
         new[logical] = deepcopy(old[logical])
+
+    def carry_grant(policy, rows, row):
+        # Membership is per exact target, so a grouped candidate already carrying the grant is unchanged.
+        if row in _observer_invoke_rows(new[policy], policy):
+            return
+        invokes = _observer_invoke_rows(new[policy])
+        if _groups_observer_grants(policy) and len(invokes) == 1 and isinstance(invokes[0].get('Resource'), list):
+            need({**invokes[0], 'Resource': row['Resource']} == row,
+                 'grouped observer grant cannot carry a differently shaped predecessor grant')
+            invokes[0]['Resource'].append(deepcopy(row['Resource']))
+        else:
+            rows.append(deepcopy(row))
 
     legacy = old.get(PRODUCTION_LIFECYCLE_RETAINED_POLICY, {})
     legacy_properties = legacy.get('Properties', {})
@@ -797,7 +835,7 @@ def carry_production_predecessor(before, synthesized):
     carry_resource(PRODUCTION_LIFECYCLE_RETAINED_POLICY)
 
     previous = transition_observer_versions(before)
-    for key, (policy, _, prefix) in TRANSITION_OBSERVERS.items():
+    for key, (policy, function, prefix) in TRANSITION_OBSERVERS.items():
         if key == 'recovery':
             policy = IMAGE_RECOVERY_POLICY
         current = _production_observer_definition(new, key, policy, prefix)
@@ -815,12 +853,22 @@ def carry_production_predecessor(before, synthesized):
                      and properties.get('PolicyName') == PRODUCTION_LIFECYCLE_TRANSITION_POLICY
                      and list(map(statement_key, statements(standalone))) == [statement_key(previous_row)],
                      'production lifecycle standalone grant does not match the exact predecessor')
-            if previous_row not in rows:
-                rows.append(deepcopy(previous_row))
+            carry_grant(policy, rows, previous_row)
         for row in _production_archived_observer_rows(old, policy, previous[key], current):
             carry_resource(row['Resource']['Ref'])
-            if row not in rows:
-                rows.append(deepcopy(row))
+            carry_grant(policy, rows, row)
+        if compact_observer_grants and key == 'lifecycle':
+            invokes = _observer_invoke_rows(new[policy], policy)
+            if len(invokes) > 1:
+                grant_shape = {k: v for k, v in invokes[0].items() if k != 'Resource'}
+                need(all(statement_key({k: v for k, v in row.items() if k != 'Resource'})
+                         == statement_key(grant_shape) for row in invokes),
+                     'compaction requires identical unconditional observer grants')
+                grouped = {**grant_shape, 'Resource': [row['Resource'] for row in invokes]}
+                _grouped_observer_refs(grouped)
+                original = _observer_invoke_rows(new[policy])
+                rows[:] = [row for row in rows if row not in original] + [grouped]
+                _observer_version_grant(new, policy, function, prefix, current)
 
     for policy in HISTORY_CONTEXT_POLICIES:
         retained_history = _history_context_rows(old, policy)
@@ -981,7 +1029,15 @@ def validate_templates(phase, before, after, review, unchanged=False, pool_iam=N
                 if 'lambda:invokefunction' in added:
                     resource = statement.get('Resource')
                     target = resource['Ref'] if isinstance(resource, dict) and set(resource) == {'Ref'} else None
-                    if added != {'lambda:invokefunction'} or not isinstance(target, str):
+                    if isinstance(resource, list) and _groups_observer_grants(logical):
+                        # The split image-to-image transition below checks the controller role,
+                        # retained same-function versions and exact current and historical grants.
+                        if (phase != 'workflows' or not _image_mode(before) or not _image_mode(after)
+                                or not _production_split_recovery(old) or not _production_split_recovery(right_resources)
+                                or any((right_resources.get(ref) or {}).get('Type') != 'AWS::Lambda::Version'
+                                       for ref in _grouped_observer_refs(statement))):
+                            invalid_lambda_grant = True
+                    elif added != {'lambda:invokefunction'} or not isinstance(target, str):
                         invalid_lambda_grant = True
                     elif (right_resources.get(target) or {}).get('Type') != 'AWS::Lambda::Version':
                         if not (projected_pool and reviewed_pool_statement and target not in right_resources
