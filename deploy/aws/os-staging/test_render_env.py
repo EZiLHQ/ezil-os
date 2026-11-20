@@ -583,6 +583,37 @@ class DelegationEnvironmentTests(unittest.TestCase):
         self.assertEqual(renderer.validate(combined, "staging"), combined)
         self.assertNotIn(renderer.STAGING_BROWSER_OBSERVE, combined)
 
+    def test_browser_observe_targets_are_staging_only_strict_and_default_off(self):
+        key = renderer.STAGING_BROWSER_OBSERVE_TARGETS
+        self.assertNotIn(key, renderer.OPTIONAL | renderer.REQUIRED)
+        a, b = "11111111-1111-4111-8111-111111111111", "abcdef01-2345-4678-89ab-cdef01234567"
+        for good in (f"aws-ec2:{a}", f"cloudflare:{b}", f"aws-ec2:{a},cloudflare:{b}", f"aws-ec2:{a}, aws-ec2:{b}"):
+            with self.subTest(good=good):
+                values = {**self.staging, key: good}
+                self.assertEqual(renderer.validate(values, "staging"), values)
+        for bad in (a, "*", f"aws-ec2:*", f"aws:{a}", f"AWS-EC2:{a}", f"aws-ec2:{b.upper()}", f"aws-ec2:{a[:-1]}",
+                    f"aws-ec2:{a}:x", f"aws-ec2:{a},", f",aws-ec2:{a}", f"aws-ec2:{a},,cloudflare:{b}", "aws-ec2:",
+                    f":{a}", f"aws-ec2:{a} cloudflare:{b}", f"aws-ec2:{a};cloudflare:{b}", f"aws-ec2:{a}\n", f"aws-ec2:{a.replace('-', '')}",
+                    f"gcp:{a}", f"aws-ec2:{a}-"):
+            with self.subTest(bad=bad):
+                self.refused({key: bad}, "staging")
+        self.refused({key: f"aws-ec2:{a}"}, "production")
+        self.refused({key + "_EXTRA": f"aws-ec2:{a}"}, "staging")
+        self.refused({"EZIL_DELEGATED_BROWSER_OBSERVE_TARGETS": f"aws-ec2:{a}"}, "staging")
+        # Absent: nothing is validated, synthesized or rendered.
+        self.assertEqual(renderer.validate(dict(self.staging), "staging"), self.staging)
+        values = {**self.staging, key: f"aws-ec2:{a},cloudflare:{b}"}
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            with contextlib.ExitStack() as stack, contextlib.redirect_stdout(io.StringIO()):
+                if os.geteuid() != 0:
+                    stack.enter_context(patch.object(renderer.os, "geteuid", return_value=0))
+                    stack.enter_context(patch.object(renderer.os, "chown"))
+                    stack.enter_context(patch.object(renderer.os, "fchown"))
+                renderer.render(values, Path(temporary), "staging")
+            rendered = dict(line.split("=", 1) for line in (Path(temporary) / "app.env").read_text().splitlines())
+            self.assertNotIn(key, (Path(temporary) / "cron.env").read_text())
+        self.assertEqual(rendered[key], values[key])
+
     def test_nearby_or_private_names_remain_refused(self):
         for key in ("EZIL_DELEGATION_PRIVATE_JWKS", "EZIL_DELEGATION_PRIVATE_KEY", "EZIL_DELEGATION_SIGNING_KEY",
                     "EZIL_DELEGATION_JWKS", "EZIL_DELEGATION_PUBLIC_JWKS_URL", "EZIL_DELEGATED_COMPUTER_WRITES",

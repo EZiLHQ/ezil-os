@@ -70,6 +70,11 @@ STAGING_BROWSER_OPEN = "EZIL_DELEGATED_BROWSER_OPEN_URL"
 STAGING_BROWSER_CONTROL = "EZIL_DELEGATED_BROWSER_CONTROL"
 STAGING_BROWSER_ORIGINS = "EZIL_BROWSER_TEST_ALLOWED_ORIGINS"
 STAGING_PREVIEW_TOKEN_V2 = "EZIL_PREVIEW_TOKEN_V2"
+# Provider-aware observation targets (App contract): comma-separated <aws-ec2|cloudflare>:<canonical lowercase UUID>;
+# only aws-ec2 entries activate the AWS branch. Staging-only and off when absent.
+STAGING_BROWSER_OBSERVE_TARGETS = "EZIL_DELEGATED_BROWSER_OBSERVE_AWS_TARGETS"
+BROWSER_OBSERVE_TARGET = re.compile(
+    r"(?:aws-ec2|cloudflare):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 BROWSER_LOCAL_CONTROL_PORTS = frozenset((3000, 3002, 4243, 8080, 8181, 8443, 9090, 9222, 9223))
 DELEGATION_PINS = ("EZIL_DELEGATION_ISSUER", "EZIL_DELEGATION_AUDIENCE",
                    "EZIL_DELEGATION_PUBLIC_JWKS", "EZIL_DELEGATION_CLIENT_IDS")
@@ -97,7 +102,7 @@ def validate(values, environment="staging"):
         raise RenderError("Expected a JSON object")
     staging_keys = frozenset((
         STAGING_BROWSER_OBSERVE, STAGING_BROWSER_OPEN, STAGING_BROWSER_CONTROL, STAGING_BROWSER_ORIGINS,
-        STAGING_PREVIEW_TOKEN_V2, STAGING_ONBOARDING,
+        STAGING_PREVIEW_TOKEN_V2, STAGING_ONBOARDING, STAGING_BROWSER_OBSERVE_TARGETS,
     ))
     allowed = REQUIRED | OPTIONAL | (staging_keys if environment == "staging" else frozenset())
     if any(key not in allowed and not REGIONAL.fullmatch(key) for key in values):
@@ -146,6 +151,9 @@ def validate(values, environment="staging"):
             or not values.get("CLOUDFLARE_GUACAMOLE_HMAC_SECRET")
         ):
             raise RenderError(f"{feature} requires the stage OS, Worker and complete delegation pins")
+    targets = values.get(STAGING_BROWSER_OBSERVE_TARGETS)
+    if targets is not None and not all(BROWSER_OBSERVE_TARGET.fullmatch(entry.strip()) for entry in targets.split(",")):
+        raise RenderError("Browser observation targets must be comma-separated aws-ec2 or cloudflare canonical UUIDs")
     origins = values.get(STAGING_BROWSER_ORIGINS)
     if origins is not None or values.get(STAGING_BROWSER_OPEN) == "enabled":
         entries = [value for value in re.split(r"[\s,]+", origins or "") if value]
