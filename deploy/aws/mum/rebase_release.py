@@ -791,6 +791,11 @@ HOST_AGENT_DIRECTED_EXCEPTIONS=(
         'systemd/ezil-native-qualification.timer':(None,'100644 aae2bf71edf5af025cc852fcdbe559e12c4dc8f7'),
         'test/test_native_qualification.py':('100644 b6186eebdc522e5cca856faad78a2586bc28785e','100644 ce6a5791e45fcd8172d8c517647b9b405995f410'),
     }),
+    # R156 production host to the reviewed standalone CLI update for opening empty repositories.
+    ('907dc8767841c32dab510b222785e661b10a4e7f','7e7bfa751e8e45d918f085a218f6ad731b08c21f',{
+        'lib/ezil_host/standalone_git_assets/pin.json':('100644 c167f33cf3cd6766898375ea6bdece74ddce7d55','100644 f0d65d9c9230ba306c2a2347d5a8b61170863bfc'),
+        'test/test_standalone_git.py':('100644 a406d07d8c9ddc30800bc7f001be1929bdc91beb','100644 05658a372afc228071e13bdb3682ec80011bad96'),
+    }),
 )
 
 

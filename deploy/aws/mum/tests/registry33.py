@@ -337,7 +337,7 @@ class StandaloneHostAbiTests(unittest.TestCase):
 
 
 HOST_ABI_FIXTURE = HERE / 'host-abi-predecessors.json'
-HOST_ABI_FIXTURE_TREES = 9
+HOST_ABI_FIXTURE_TREES = 10
 HOST_ABI_FIXTURE_MAX_FILES = 256
 HOST_ABI_PATH_PART = re.compile(r'[A-Za-z0-9._-]{1,128}')
 HOST_ABI_ENTRY = re.compile(r'(100644|100755) ([0-9a-f]{40})')
@@ -384,7 +384,7 @@ def load_host_abi_fixture(text):
 
 
 class DirectedHostAbiTests(unittest.TestCase):
-    """The directed maps into host trees 96ff8e22 and b7700d49, exercised on Git commits rebuilt from reviewed trees.
+    """The directed maps exercised on Git commits rebuilt from reviewed host trees.
 
     The predecessor host trees come from host-abi-predecessors.json (exact path/mode/blob manifests), rebuilt with
     `git mktree --missing` in a private bare repository and checked against their known tree ids, so no private
@@ -393,10 +393,12 @@ class DirectedHostAbiTests(unittest.TestCase):
     PREVIOUS = '96ff8e224443e0d684cb99e808a903235f2def11'
     DIAGNOSTICS = 'b7700d49c946157cd75c862bce867caf7fd08810'
     NATIVE_BASE = '82228b6e31dfcfedb116c3c6649ae78281b0d799'
-    TARGET = '907dc8767841c32dab510b222785e661b10a4e7f'
+    PRODUCTION_R156 = '907dc8767841c32dab510b222785e661b10a4e7f'
+    TARGET = '7e7bfa751e8e45d918f085a218f6ad731b08c21f'
     PREDECESSORS = {PREVIOUS: 'S 0c113cb4 standalone Git edge/history/resilience host',
                     DIAGNOSTICS: 'cdd39dac standalone Git diagnostics host',
                     NATIVE_BASE: '230e261f protected Native PreviewV2 Host source',
+                    PRODUCTION_R156: 'd8373b37 deployed R156 production host',
                     'c87c304c42e1ce02164f5e3ea8d0e6f0eee24a9d': 'stage 1f4712c4 and 6a187841',
                     '7a35e4c5ec543abe83b9bccc8c6e5af815e02247': 'main 9ca8b3c0',
                     # The deployed staging predecessor (R151): the closed diagnostics without the full-marker host_ready.
@@ -489,8 +491,9 @@ class DirectedHostAbiTests(unittest.TestCase):
                           ('7a35e4c5ec543abe83b9bccc8c6e5af815e02247', self.DIAGNOSTICS, 9),
                           ('f3a5a1ba954c56ab31aa0c844cb5719c88905dfc', self.DIAGNOSTICS, 8),
                           (self.DIAGNOSTICS, self.NATIVE_BASE, 10),
-                          (self.DIAGNOSTICS, self.TARGET, 16),
-                          (self.NATIVE_BASE, self.TARGET, 8)])
+                          (self.DIAGNOSTICS, self.PRODUCTION_R156, 16),
+                          (self.NATIVE_BASE, self.PRODUCTION_R156, 8),
+                          (self.PRODUCTION_R156, self.TARGET, 2)])
         for source, target, delta in self.maps():
             old, new = self.files(source), self.files(target)
             self.assertEqual({n: (old.get(n), new.get(n)) for n in old.keys() | new.keys() if old.get(n) != new.get(n)}, delta)
@@ -568,7 +571,8 @@ class DirectedHostAbiTests(unittest.TestCase):
         self.assertEqual(release.host_agent_tree_id(head, self.repo), self.TARGET)
         anchors = {self.PREVIOUS: self.commit(self.files(self.PREVIOUS)),
                    self.DIAGNOSTICS: self.commit(self.files(self.DIAGNOSTICS)),
-                   self.NATIVE_BASE: self.commit(self.files(self.NATIVE_BASE)), self.TARGET: head}
+                   self.NATIVE_BASE: self.commit(self.files(self.NATIVE_BASE)),
+                   self.PRODUCTION_R156: self.commit(self.files(self.PRODUCTION_R156)), self.TARGET: head}
         for source, target, delta in self.maps():
             baked, deployed = anchors[target], self.commit(self.files(source))
             with self.subTest(source=source, target=target):
