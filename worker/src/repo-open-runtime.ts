@@ -11,14 +11,14 @@ export interface StandaloneCliPin {
   version: string;
 }
 
-/** Public CLI .1 release; the release owner verified the published archive and entry bytes. */
+/** Public standalone CLI release; the release owner verified the published archive and entry bytes. */
 export const STANDALONE_CLI_CANDIDATE: StandaloneCliPin = {
-  url: 'https://github.com/EZiLHQ/ezil-cli/releases/download/standalone-20261115.1/ezil-cli-0.3.0-standalone.20261115.1.tar.gz',
-  archiveSha256: '610b2c6fae4e5c4ea1db45b9d53a028de421ceaad927abb49be45339f9f1b7a4',
-  cliSha256: 'a30361d38c0310912fbfd3c18284c78e66e0f6c474727081c19d09f9fb1a0a9b',
+  url: 'https://github.com/EZiLHQ/ezil-cli/releases/download/standalone-20261120.1/ezil-cli-0.3.0-standalone.20261120.1.tar.gz',
+  archiveSha256: 'dd757a2f04e3dfe2b8e3b731af0dfbd1123157de687b69b9a2a718a2b8ab6bc0',
+  cliSha256: '6d160f821577ee4e51fb0771fe5fa56f36a40a7b8c59b16d424fc12b7e7d3225',
   supervisorSha256: REPO_OPEN_SUPERVISOR_SHA256,
-  sourceCommit: '90765278ed1dc83251f23f709b270804d8802a6f',
-  version: '0.3.0-standalone.20261115.1',
+  sourceCommit: '96478c69f684f4f054b5bb5792abc85c74d709dc',
+  version: '0.3.0-standalone.20261120.1',
 };
 
 /** Enabled after release-owner verification of the public download against the exact pins above. */
