@@ -1344,6 +1344,147 @@ class PoolIamPremiumTests(unittest.TestCase):
                 with self.assertRaises(ValueError):self.validate('workflows')
 
 
+class ProductionObserverGroupingTests(unittest.TestCase):
+    """The PRD lifecycle controller may carry its exact immutable observer grants in one Resource array."""
+    machines='arn:aws:states:ap-south-1:452630323510:stateMachine:'
+    controller=cfn.LIFECYCLE_CONTROLLER_POLICY
+
+    def setUp(self):
+        cfn.use_namespace('prd');self.addCleanup(cfn.use_namespace,'mum')
+        self.before=self.template(4,[4,2,3],range(1,5))
+        self.flat=self.template(5,[5,4,2,3],range(1,6))
+        self.after=self.grouped(copy.deepcopy(self.flat))
+
+    def v(self,key,n):
+        return cfn.TRANSITION_OBSERVERS[key][2]+format(n,'08X')+format(n,'032x')
+
+    @staticmethod
+    def grant(logical):
+        return {'Action':'lambda:InvokeFunction','Effect':'Allow','Resource':{'Ref':logical}}
+
+    def template(self,current,grants,versions):
+        r={};boundary='arn:aws:iam::452630323510:policy/ezil/prd/ezil-prd-image-job-boundary'
+        deployment={'stateMachineVersionArn':self.machines+'ezil-prd-lifecycle:7',
+                    'preparationStateMachineVersionArn':self.machines+'ezil-prd-rebase-preparation:7',
+                    'recoveryStateMachineVersionArn':self.machines+'ezil-prd-recovery:7'}
+        r[cfn.IMAGE_RECOVERY_ROLE]={'Type':'AWS::IAM::Role','Properties':{'RoleName':'ezil-prd-recovery','Path':'/ezil/prd/',
+            'PermissionsBoundary':boundary,'AssumeRolePolicyDocument':{'Version':'2012-10-17','Statement':[{
+                'Action':'sts:AssumeRole','Effect':'Allow','Principal':{'Service':'states.amazonaws.com'},
+                'Condition':{'StringEquals':{'aws:SourceAccount':'452630323510'},
+                             'ArnEquals':{'aws:SourceArn':self.machines+'ezil-prd-recovery'}}}]}}}
+        r[cfn.PRODUCTION_OBSERVER_WORKFLOWS['preparation'][2]]={'Type':'AWS::IAM::Role','Properties':{'PermissionsBoundary':boundary}}
+        for key,(policy,function,_) in cfn.TRANSITION_OBSERVERS.items():
+            if key=='recovery':policy=cfn.IMAGE_RECOVERY_POLICY
+            workflow,name,role=cfn.PRODUCTION_OBSERVER_WORKFLOWS[key]
+            invoked=self.v(key,current if key=='lifecycle' else 1)
+            r[function]={'Type':'AWS::Lambda::Function','Properties':{'Code':{'S3Key':key+'.zip'}}}
+            for n in (versions if key=='lifecycle' else [1]):
+                r[self.v(key,n)]={'Type':'AWS::Lambda::Version','Properties':{'FunctionName':{'Ref':function}},
+                                  'DeletionPolicy':'Retain','UpdateReplacePolicy':'Retain'}
+            r[workflow]={'Type':'AWS::StepFunctions::StateMachine','Properties':{'StateMachineName':name,
+                'RoleArn':{'Fn::GetAtt':[role,'Arn']},'DefinitionString':{'Fn::Join':['',[
+                    '{"StartAt":"Observe-State","States":{"Observe-State":{"Type":"Task","Resource":"',
+                    {'Ref':invoked},'","End":true}}}']]}}}
+            rows=[self.grant(self.v(key,n)) for n in grants] if key=='lifecycle' else [self.grant(invoked)]
+            r[policy]={'Type':'AWS::IAM::Policy','Properties':{'PolicyName':policy,'Roles':[{'Ref':role}],
+                'PolicyDocument':{'Version':'2012-10-17','Statement':rows}}}
+        r[cfn.LIFECYCLE_OBSERVER]['Properties']['Environment']={'Variables':{
+            'EZIL_LIFECYCLE_SETTINGS':json.dumps({'deployment':deployment})}}
+        r[cfn.PRODUCTION_LIFECYCLE_RETAINED_POLICY]={'Type':'AWS::IAM::Policy','Properties':{
+            'PolicyName':cfn.PRODUCTION_LIFECYCLE_RETAINED_POLICY,'Roles':[{'Ref':cfn.LIFECYCLE_CONTROLLER}],
+            'PolicyDocument':{'Version':'2012-10-17','Statement':[self.grant(self.v('lifecycle',1))]}}}
+        return {'Resources':r}
+
+    def rows(self,template,policy=None):
+        return template['Resources'][policy or self.controller]['Properties']['PolicyDocument']['Statement']
+
+    def grouped(self,template,order=None):
+        rows=self.rows(template);refs=[row['Resource'] for row in rows]
+        rows[:]=[{'Action':'lambda:InvokeFunction','Effect':'Allow','Resource':[refs[i] for i in (order or range(len(refs)))]}]
+        return template
+
+    def validate(self,before,after):
+        review=PoolIamTests.exact_review(before,after)
+        self.assertEqual(cfn.validate_templates('workflows',before,after,review),review['changes'])
+        return review['changes']
+
+    def test_exact_grouping_is_the_same_permissions_and_accepted(self):
+        flat,group=self.rows(self.flat),self.rows(self.after)
+        self.assertEqual(cfn._observer_invoke_rows(self.after['Resources'][self.controller],self.controller),flat)
+        self.assertLess(len(json.dumps(group,separators=(',',':'))),len(json.dumps(flat,separators=(',',':'))))
+        self.assertEqual(set(self.validate(self.before,self.after)),{self.v('lifecycle',5),'LifecycleWorkflowA358E0E1',self.controller})
+        self.validate(self.before,self.flat)  # Existing ungrouped production form.
+        self.validate(self.before,self.grouped(copy.deepcopy(self.flat),[2,0,3,1]))
+        self.assertEqual(cfn.transition_observer_versions(self.after)['lifecycle'],self.v('lifecycle',5))
+        # The next rollover reads a grouped predecessor, in either candidate form.
+        flat_next=self.template(6,[6,5,4,2,3],range(1,7))
+        self.validate(self.after,flat_next)
+        self.validate(self.after,self.grouped(copy.deepcopy(flat_next)))
+
+    def test_carry_keeps_each_candidate_form(self):
+        synthesized=copy.deepcopy(self.flat);self.rows(synthesized)[1:]=[]
+        for n in (2,3):del synthesized['Resources'][self.v('lifecycle',n)]
+        self.assertEqual(cfn.carry_production_predecessor(self.before,synthesized),self.flat)
+        compact = cfn.carry_production_predecessor(self.before, synthesized, compact_observer_grants=True)
+        self.assertEqual(compact, self.after)
+        self.validate(self.before, compact)
+        synthesized=copy.deepcopy(self.after);self.rows(synthesized)[0]['Resource'][2:]=[]
+        for n in (2,3):del synthesized['Resources'][self.v('lifecycle',n)]
+        self.assertEqual(cfn.carry_production_predecessor(self.before,synthesized),self.after)
+        self.assertEqual(cfn.carry_production_predecessor(self.before,self.after),self.after)
+
+    def test_malformed_or_changed_grouping_refused(self):
+        L=lambda n:{'Ref':self.v('lifecycle',n)}
+        def add_version(template,logical,function):
+            template['Resources'][logical]={'Type':'AWS::Lambda::Version','Properties':{'FunctionName':{'Ref':function}},
+                                            'DeletionPolicy':'Retain','UpdateReplacePolicy':'Retain'}
+        def second_group(t):
+            rows=self.rows(t);refs=rows[0]['Resource'];rows[:]=[dict(rows[0],Resource=refs[:2]),dict(rows[0],Resource=refs[2:])]
+        def one_item(t):
+            rows=self.rows(t);refs=rows[0]['Resource'];rows[:]=[dict(rows[0],Resource=refs[:1]),*[self.grant(r['Ref']) for r in refs[1:]]]
+        def wrong_prefix(t):
+            add_version(t,'LifecycleObserverOtherVersion',cfn.LIFECYCLE_OBSERVER);refs(t).append({'Ref':'LifecycleObserverOtherVersion'})
+        def preparation_group(t):
+            logical=self.v('preparation',2);add_version(t,logical,cfn.TRANSITION_OBSERVERS['preparation'][1])
+            row=self.rows(t,cfn.TRANSITION_OBSERVERS['preparation'][0])[0];row['Resource']=[row['Resource'],{'Ref':logical}]
+        row=lambda t:self.rows(t)[0]
+        refs=lambda t:row(t)['Resource']
+        cases={
+            'missing-previous':lambda t:refs(t).remove(L(4)),
+            'missing-archive':lambda t:refs(t).remove(L(2)),
+            'unknown-ref':lambda t:refs(t).append(L(9)),
+            'foreign-function':lambda t:refs(t).append({'Ref':self.v('preparation',1)}),
+            'wrong-prefix':wrong_prefix,
+            'duplicate':lambda t:refs(t).append(L(2)),
+            'grouped-and-flat':lambda t:(refs(t).remove(L(3)),self.rows(t).append(self.grant(self.v('lifecycle',3)))),
+            'second-group':second_group,
+            'one-item':one_item,
+            'wildcard':lambda t:refs(t).append('*'),
+            'arn':lambda t:refs(t).append('arn:aws:lambda:ap-south-1:452630323510:function:ezil-prd-observer:1'),
+            'getatt':lambda t:refs(t).append({'Fn::GetAtt':[cfn.LIFECYCLE_OBSERVER,'Arn']}),
+            'extra-key':lambda t:refs(t)[0].update(Extra=True),
+            'condition':lambda t:row(t).update(Condition={'StringEquals':{'aws:RequestedRegion':'ap-south-1'}}),
+            'not-resource':lambda t:row(t).update(NotResource=row(t).pop('Resource')),
+            'sid':lambda t:row(t).update(Sid='Grouped'),
+            'extra-action':lambda t:row(t).update(Action=['lambda:InvokeFunction','lambda:GetFunction']),
+            'wildcard-action':lambda t:row(t).update(Action='lambda:*'),
+            'effect':lambda t:row(t).update(Effect='Deny'),
+            'role':lambda t:t['Resources'][self.controller]['Properties'].update(Roles=[{'Ref':'OtherRole'}]),
+            'policy-name':lambda t:t['Resources'][self.controller]['Properties'].update(PolicyName='Other'),
+            'preparation-group':preparation_group,
+        }
+        for case,mutate in cases.items():
+            bad=copy.deepcopy(self.after);mutate(bad)
+            with self.subTest(case=case),self.assertRaises(ValueError):self.validate(self.before,bad)
+        with self.assertRaisesRegex(ValueError,'exact distinct immutable version references'):
+            cfn._grouped_observer_refs({'Action':'lambda:InvokeFunction','Effect':'Allow','Resource':[L(5)]})
+        # Staging keeps the flat-only reader.
+        cfn.use_namespace('mum')
+        with self.assertRaisesRegex(ValueError,'one exact'):
+            cfn._observer_version_grant(self.after['Resources'],self.controller,cfn.LIFECYCLE_OBSERVER,
+                                        cfn.TRANSITION_OBSERVERS['lifecycle'][2],self.v('lifecycle',5))
+
+
 class IntegrationTests(unittest.TestCase):
     cli=stage1.ReleaseTests.cli
 
