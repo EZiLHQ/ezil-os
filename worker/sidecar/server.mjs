@@ -40,11 +40,15 @@
  * that only ever reads the body still gets a usable answer.
  */
 
+import { timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { ERROR_CODES } from './contract.mjs';
 import { VERBS } from './verbs.mjs';
 import { redactDeep } from './redact.mjs';
+import {
+    BROWSER_OPEN_PATH, BROWSER_OPEN_CAPABILITIES_PATH, browserOpenFailure, browserOpenOrigins, createMcpBrowserOpen,
+} from './mcp-browser-open.mjs';
 
 const PORT = Number.parseInt(process.env.EZIL_SIDECAR_PORT ?? '9223', 10) || 9223;
 const HOST = process.env.EZIL_SIDECAR_HOST ?? '0.0.0.0';
@@ -54,12 +58,27 @@ const CDP_URL = process.env.EZIL_CDP_URL ?? `http://127.0.0.1:${CDP_PORT}`;
 /** Request bodies are small by construction; anything larger is a mistake or
  *  an attempt to wedge the process. */
 const MAX_BODY_BYTES = 256 * 1024;
+const CAPABILITY_BODY = '{"capability":"browser_open_url"}';
+const BOOT_CAPABILITY = /^[A-Za-z0-9_-]{43}$/;
+
+function validBrowserOpenAuthorization (header, capability) {
+    if (typeof capability !== 'string' || !BOOT_CAPABILITY.test(capability)
+        || typeof header !== 'string' || header.length !== 50 || !header.startsWith('Bearer ')) return false;
+    const value = header.slice(7);
+    return BOOT_CAPABILITY.test(value) && timingSafeEqual(Buffer.from(value), Buffer.from(capability));
+}
 
 /** The complete set of routes. `VERBS` keys are `"<METHOD> <path>"`. */
 export const ROUTES = Object.keys(VERBS);
 
 /** Construct without binding or connecting, so the HTTP boundary can be tested offline. */
-export function createSidecarServer (surface) {
+export function createSidecarServer (surface, {
+    allowedBrowserOpenOrigins = process.env.EZIL_BROWSER_PROD_CANARY_TEST_ORIGIN,
+    browserOpen = createMcpBrowserOpen(surface, { allowedOrigins: allowedBrowserOpenOrigins }),
+    workerBrowserOpenToken = process.env.EZIL_WORKER_BROWSER_MCP_TOKEN,
+} = {}) {
+    const canaryOrigin = browserOpenOrigins(allowedBrowserOpenOrigins);
+    const configured = canaryOrigin.has(allowedBrowserOpenOrigins) && allowedBrowserOpenOrigins.startsWith('https://');
     /**
      * Serialise, REDACT, and write. Nothing else in this process writes a body.
      *
@@ -68,9 +87,13 @@ export function createSidecarServer (surface) {
      * this to still happen — `surface.allSecrets()` falls back to the values this
      * process has typed when the page can no longer be read at all.
      */
-    async function respond (res, status, payload) {
-        const secrets = await surface.allSecrets();
-        const safe = redactDeep(payload, secrets);
+    async function respond (res, status, payload, closedBrowserReceipt = false) {
+        // The new routes are closed metadata and must never read the desktop user's existing tabs.
+        let safe = payload;
+        if (!closedBrowserReceipt) {
+            const secrets = await surface.allSecrets();
+            safe = redactDeep(payload, secrets);
+        }
         const body = Buffer.from(JSON.stringify(safe), 'utf8');
         res.writeHead(status, {
             'content-type': 'application/json; charset=utf-8',
@@ -89,13 +112,13 @@ export function createSidecarServer (surface) {
         return { ok: false, error: safeCode, detail };
     }
 
-    function readBody (req) {
+    function readBody (req, limit = MAX_BODY_BYTES) {
         return new Promise((resolve, reject) => {
             const chunks = [];
             let size = 0;
             req.on('data', (chunk) => {
                 size += chunk.length;
-                if (size > MAX_BODY_BYTES) {
+                if (size > limit) {
                     reject(Object.assign(new Error('request body too large'), { httpStatus: 413, code: 'bad_request' }));
                     req.destroy();
                     return;
@@ -123,6 +146,9 @@ export function createSidecarServer (surface) {
         const path = (req.url || '/').split('?')[0].replace(/\/+$/, '') || '/';
         const key = `${method} ${path}`;
 
+        if (path === BROWSER_OPEN_PATH || path === BROWSER_OPEN_CAPABILITIES_PATH) {
+            return handleBrowserCanary(req, res, method, path);
+        }
         const handler = VERBS[key];
         if (!handler) {
             // A path that exists under another method is a 405, so a caller that
@@ -164,6 +190,34 @@ export function createSidecarServer (surface) {
         } catch (err) {
             console.error('[ezil-sidecar] verb failed:', err);
             return respond(res, 200, errorPayload(err?.code));
+        }
+    }
+
+    async function handleBrowserCanary (req, res, method, path) {
+        const fail = (status, error, stage) => respond(res, status, browserOpenFailure(null, error, stage), true);
+        if (req.url !== path || method !== 'POST' || !configured) return fail(404, 'browser_unavailable', 'runtime');
+        if (req.headers.origin !== undefined || !validBrowserOpenAuthorization(req.headers.authorization, workerBrowserOpenToken)) {
+            return fail(401, 'browser_unavailable', 'authorization');
+        }
+        const readiness = path === BROWSER_OPEN_CAPABILITIES_PATH;
+        const disconnect = new AbortController();
+        const onDisconnect = () => disconnect.abort();
+        res.once('close', onDisconnect);
+        req.once('aborted', onDisconnect);
+        try {
+            const bytes = await readBody(req, readiness ? 64 : 4096);
+            const raw = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+            if (readiness) {
+                if (raw !== CAPABILITY_BODY || !surface.isConnected()) return fail(404, 'browser_unavailable', 'runtime');
+                return respond(res, 200, { ok: true, capability: 'browser_open_url' }, true);
+            }
+            const result = await browserOpen(JSON.parse(raw), disconnect.signal);
+            if (!res.destroyed) return respond(res, 200, result, true);
+        } catch (error) {
+            if (!res.destroyed) return fail(error?.httpStatus ?? 400, 'destination_denied', 'request');
+        } finally {
+            req.off('aborted', onDisconnect);
+            res.off('close', onDisconnect);
         }
     }
 

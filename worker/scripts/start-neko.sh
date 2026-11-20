@@ -50,6 +50,10 @@
 # case the pixel/desktop stream stays gated exactly as before.
 set -uo pipefail
 
+unset SIDECAR_WORKER_BROWSER_MCP_TOKEN
+SIDECAR_WORKER_BROWSER_MCP_TOKEN="\${EZIL_WORKER_BROWSER_MCP_TOKEN:-}"
+unset EZIL_WORKER_BROWSER_MCP_TOKEN
+
 LOG=/tmp/neko.log
 
 # ── Boot-phase observability (always on, cheap, no exec route into prod) ─────
@@ -1051,6 +1055,7 @@ case "$(printf '%s' "${EZIL_BROWSER_SIDECAR:-on}" | tr '[:upper:]' '[:lower:]' |
   # reach $LOG about the sidecar is this script's own `log` lines: start,
   # skip, and failure — names and integers, never page data.
   log "starting browser sidecar (node $EZIL_SIDECAR_ENTRY) on 0.0.0.0:${EZIL_SIDECAR_PORT}, CDP 127.0.0.1:${EZIL_CDP_PORT:-9222} — log $EZIL_SIDECAR_LOG"
+  EZIL_WORKER_BROWSER_MCP_TOKEN="$SIDECAR_WORKER_BROWSER_MCP_TOKEN" \
   EZIL_SIDECAR_PORT="$EZIL_SIDECAR_PORT" \
   EZIL_CDP_PORT="${EZIL_CDP_PORT:-9222}" \
     node "$EZIL_SIDECAR_ENTRY" >>"$EZIL_SIDECAR_LOG" 2>&1 9>&- &
