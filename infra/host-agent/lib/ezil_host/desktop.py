@@ -752,6 +752,23 @@ def state(cfg):
     return json.loads(r.stdout).get("status", "unknown")
 
 
+def instance(cfg, timeout=5):
+    """This container instance's identity while it runs: runc state's `<created>|<pid>`, else None.
+    Any desktop restart (its unit, or restart-desktop) creates a new container, so a new value;
+    the host's bootId does not change. Read only by the edge (never answered to the Worker)."""
+    r = runc(cfg, "state", cfg.containerId, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        return None
+    s = json.loads(r.stdout)
+    if not isinstance(s, dict) or s.get("status") != "running":
+        return None
+    created, pid = s.get("created"), s.get("pid")
+    if (not isinstance(created, str) or not re.fullmatch(r"[0-9][0-9TZ:.+-]{9,63}", created)
+            or not isinstance(pid, int) or isinstance(pid, bool) or pid < 1):
+        return None
+    return f"{created}|{pid}"
+
+
 def run(cfg, detach=False, log=None):
     """Foreground under systemd (Type=simple); detached in tests."""
     bundle = os.path.join(cfg.runDir, "bundle")

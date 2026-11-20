@@ -96,8 +96,11 @@ BROWSER_OBSERVE_RE = re.compile(r"^/__ezil/control/browser-observe/([0-9a-f]{64}
 BROWSER_OBSERVE_CL_RE = re.compile(r"[1-9][0-9]{0,3}")
 MAX_BROWSER_OBSERVE_BODY = 1024
 MAX_BROWSER_OBSERVE_REPLY = 2048
-BROWSER_OBSERVE_DEADLINE = 7.0          # below the Worker's 8 s
+BROWSER_OBSERVE_DEADLINE = 7.0          # below the Worker's 8 s; from route entry, absolute
+BROWSER_OBSERVE_AFTER_RESERVE = 1.5     # of it, held back for the after-check
 BROWSER_SIDECAR_PORT = 9223
+# Never reachable through /__p/, whatever edgePorts says: the sidecar and Chrome's CDP.
+DENIED_PROXY_PORTS = frozenset({9222, 9223})
 BROWSER_SIDECAR_PATH = "/internal/mcp-browser-observe"
 BROWSER_SESSION_RE = re.compile(r"[A-Za-z0-9_-]{43}")
 BROWSER_EXPIRES_RE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z")
@@ -177,15 +180,27 @@ class Sequencer:
             pass
         return 0
 
-    def _send_once(self, msg):
+    def _send_once(self, msg, deadline=None):
         msg["mac"] = agentmod.sign(self.key, msg)
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(10)
+
+        def bound():
+            # 10 s per step, or what is left of an absolute deadline (time.monotonic).
+            if deadline is not None:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise socket.timeout("deadline")
+                s.settimeout(min(10, left))
+            else:
+                s.settimeout(10)
         try:
+            bound()
             s.connect(os.path.join(self.cfg.runDir, "control.sock"))
+            bound()
             s.sendall((json.dumps(msg) + "\n").encode())
             data = b""
             while not data.endswith(b"\n") and len(data) < 65536:
+                bound()
                 chunk = s.recv(4096)
                 if not chunk:
                     break
@@ -194,26 +209,37 @@ class Sequencer:
             s.close()
         return json.loads(data or b"{}")
 
-    def send(self, op, **fields):
-        with self.lock:
-            if op == "presence":
-                now = self.monotonic()
-                if self.last_presence is not None and now - self.last_presence < PRESENCE_MIN_INTERVAL:
-                    return None
-            for attempt in (1, 2):
-                self.seq = max(self.seq + 1, int(self.clock() * 1000))
-                msg = {"op": op, "leaseEpoch": self.lease["leaseEpoch"], "ts": self.clock(), "seq": self.seq, **fields}
-                try:
-                    resp = self._send_once(msg)
-                finally:
-                    if op == "presence":
-                        # Include delivery time and failures in the shared throttle.
-                        self.last_presence = self.monotonic()
-                if resp.get("error") == "replayed" and attempt == 1:
-                    self.seq = max(self.seq, self._persisted_seq())
-                    if op != "presence":
-                        continue   # presence retries must wait for the shared throttle
-                return resp
+    def send(self, op, *, deadline=None, **fields):
+        """`deadline` (time.monotonic) bounds the lock wait and every socket step; past it this
+        raises socket.timeout (an OSError) and nothing more is sent."""
+        if deadline is None:
+            self.lock.acquire()
+        elif not self.lock.acquire(timeout=max(0, deadline - time.monotonic())):
+            raise socket.timeout("deadline")
+        try:
+            return self._send_locked(op, deadline, fields)
+        finally:
+            self.lock.release()
+
+    def _send_locked(self, op, deadline, fields):
+        if op == "presence":
+            now = self.monotonic()
+            if self.last_presence is not None and now - self.last_presence < PRESENCE_MIN_INTERVAL:
+                return None
+        for attempt in (1, 2):
+            self.seq = max(self.seq + 1, int(self.clock() * 1000))
+            msg = {"op": op, "leaseEpoch": self.lease["leaseEpoch"], "ts": self.clock(), "seq": self.seq, **fields}
+            try:
+                resp = self._send_once(msg) if deadline is None else self._send_once(msg, deadline)
+            finally:
+                if op == "presence":
+                    # Include delivery time and failures in the shared throttle.
+                    self.last_presence = self.monotonic()
+            if resp.get("error") == "replayed" and attempt == 1:
+                self.seq = max(self.seq, self._persisted_seq())
+                if op != "presence":
+                    continue   # presence retries must wait for the shared throttle
+            return resp
         return {"ok": False, "error": "replayed"}
 
     def presence(self):
@@ -287,6 +313,25 @@ def _recv_exact(sock, n, pending):
     out, buf = [], pending
     while n > 0:
         if not buf:
+            buf = sock.recv(min(65536, n))
+            if not buf:
+                raise ValueError("eof")
+        take, buf = buf[:n], buf[n:]
+        out.append(take)
+        n -= len(take)
+    return b"".join(out), buf
+
+
+def _recv_by(sock, n, pending, deadline):
+    """Exactly n bytes (with what `pending` already holds) before `deadline` (time.monotonic): the
+    socket timeout is reset to what is left before every recv, so a dripped body cannot outlast it."""
+    out, buf = [], pending
+    while n > 0:
+        if not buf:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise ValueError("deadline")
+            sock.settimeout(left)
             buf = sock.recv(min(65536, n))
             if not buf:
                 raise ValueError("eof")
@@ -464,7 +509,7 @@ class Edge:
         self.cfg, self.lease, self.key, self.clock, self.log = cfg, lease, key, clock, log
         self.seq = sequencer or Sequencer(cfg, lease, key, clock, log)
         self.upstream_host = cfg.get("edgeUpstreamHost") or desktop.CT_IP
-        self.ports = tuple(int(p) for p in (cfg.get("edgePorts") or PORTS))
+        self.ports = tuple(int(p) for p in (cfg.get("edgePorts") or PORTS) if int(p) not in DENIED_PROXY_PORTS)
         self.binding = {"computerId": lease["computerId"], "generation": lease["generation"],
                         "leaseEpoch": lease["leaseEpoch"]}
         sandbox_id = cfg.get("sandboxId") or lease.get("sandboxId")
@@ -538,7 +583,7 @@ class Edge:
             self._desktop_status(client, head, query)
             return
         m = PROXY_RE.match(path)
-        if not m or int(m.group(1)) not in self.ports:
+        if not m or int(m.group(1)) not in self.ports or int(m.group(1)) in DENIED_PROXY_PORTS:
             _reply(client, 404, {"ok": False, "error": "not_found"})
             return
         self._proxy(client, head, int(m.group(1)), (m.group(2) or "/") + query)
@@ -716,8 +761,11 @@ class Edge:
         """POST /__ezil/control/browser-observe/<sha256>: 404 unless edgeBrowserObserve is true. Exactly
         Content-Length bytes (1..1024, no chunking, nothing after them), hashed BEFORE parsing and
         compared with the signed digest, then checked as the closed request. This lease's desktop must
-        be running (agent desktop_status) before and after the one sidecar call, all inside one
-        deadline. Answers the rebuilt closed envelope only; never the sidecar's bytes. No presence."""
+        be running as the SAME container instance (agent browser-desktop-instance) before and after the one
+        sidecar call. One absolute deadline from here bounds the body read, both agent checks (lock
+        and socket) and the sidecar call. Answers the rebuilt closed envelope only; never the
+        sidecar's bytes. No presence."""
+        deadline = time.monotonic() + BROWSER_OBSERVE_DEADLINE
         if self.cfg.get("edgeBrowserObserve") is not True or head.method != "POST" or query:
             _reply(client, 404, {"ok": False, "error": "not_found"})
             return
@@ -727,7 +775,7 @@ class Edge:
             _reply(client, 400, {"ok": False, "error": "browser_invalid_request"})
             return
         try:
-            body, trailing = _recv_exact(client, int(cl[0]), head.rest)
+            body, trailing = _recv_by(client, int(cl[0]), head.rest, deadline)
         except (ValueError, OSError):
             _reply(client, 400, {"ok": False, "error": "browser_invalid_request"})
             return
@@ -735,26 +783,32 @@ class Edge:
                 or browser_observe_request(body) is None):
             _reply(client, 400, {"ok": False, "error": "browser_invalid_request"})
             return
-        deadline = time.monotonic() + BROWSER_OBSERVE_DEADLINE
-        if not self._desktop_running():
+        before = self._desktop_instance(deadline)
+        if before is None:
             _reply(client, 409, {"ok": False, "error": "browser_unavailable"})
             return
-        answer = sidecar_observe(self.upstream_host, body, deadline)
+        # Keep time for the after-check: a slow sidecar cannot spend the whole budget.
+        answer = sidecar_observe(self.upstream_host, body, deadline - BROWSER_OBSERVE_AFTER_RESERVE)
         if answer is None:
             _reply(client, 503, {"ok": False, "error": "browser_unavailable"})
             return
-        if not self._desktop_running() or time.monotonic() >= deadline:
+        if self._desktop_instance(deadline) != before or time.monotonic() >= deadline:
             _reply(client, 409, {"ok": False, "error": "browser_unavailable"})
             return
         _reply(client, 200, answer)
 
-    def _desktop_running(self):
-        """The agent answers for this lease's epoch (wrong_epoch otherwise) and its desktop runs."""
+    def _desktop_instance(self, deadline):
+        """The running desktop's container instance for this lease's epoch (wrong_epoch otherwise),
+        from the agent's edge-local `browser-desktop-instance`; None when not running, on a pool host,
+        with the agent unreachable or refusing, or past `deadline`."""
         try:
-            resp = self.seq.send("desktop_status")
+            resp = self.seq.send("browser-desktop-instance", deadline=deadline)
         except (OSError, ValueError, AttributeError):
-            return False
-        return isinstance(resp, dict) and resp.get("ok") is True and resp.get("desktop") == "running"
+            return None
+        if not isinstance(resp, dict) or resp.get("ok") is not True:
+            return None
+        stamp = resp.get("instance")
+        return stamp if isinstance(stamp, str) and stamp else None
 
     # ------------------------------------------------------------ reverse move export (§2.2)
     def _export_post(self, client, head, digest, query):

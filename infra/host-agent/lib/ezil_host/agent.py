@@ -71,6 +71,10 @@ MAX_WARN = 900        # a control-plane stop warns for at most 15 minutes
 STOP_RANK = {"absent": 0, "clean": 1, "killed": 2}
 SHUTDOWN_PENDING = "shutdown-pending"      # runDir: a shutdown began; a restarted agent resumes it
 UNIT_STATES = ("active", "activating", "deactivating", "reloading", "inactive", "failed")
+# Edge-local Browser observation check (edge._browser_observe): a closed envelope, a runc read
+# capped inside the edge's 1.5 s after-check reserve.
+BROWSER_INSTANCE_KEYS = frozenset({"op", "leaseEpoch", "ts", "seq", "mac"})
+BROWSER_INSTANCE_RUNC_TIMEOUT = 1.0
 STALLED_UNIT_STATES = ("inactive", "failed")   # exited after running, or failed: nothing will start it
 # An export stops the desktop UNIT, not only its container: on an export boot no relay config ever
 # arrives (§4.1), so the desktop step may still sit in its bounded relay wait, which no
@@ -206,6 +210,10 @@ class Agent:
             if (set(msg) != standalone_git.STATUS_KEYS or not isinstance(msg.get("jobId"), str)
                     or not standalone_git.HEX64.fullmatch(msg["jobId"])):
                 return {"ok": False, "error": "standalone_repo_invalid"}
+        elif op == "browser-desktop-instance":
+            # Edge-local, only with the Browser opt-in; no fields beyond the envelope.
+            if self.cfg.get("edgeBrowserObserve") is not True or set(msg) != BROWSER_INSTANCE_KEYS:
+                return {"ok": False, "error": "unknown_op"}
         elif op not in ("presence", "fence", "desktop_status"):
             return {"ok": False, "error": "unknown_op"}
         with self.lock:
@@ -219,6 +227,8 @@ class Agent:
                 return self._accept_relay(relay_config)
             if op == "desktop_status":
                 return self._desktop_status(now)
+            if op == "browser-desktop-instance":
+                return {"ok": True, "instance": self._desktop_instance()}
             if op == "restart-desktop":
                 return self._accept_restart(msg["requestId"], now)
             if op == "export":
@@ -344,6 +354,18 @@ class Agent:
             return desktop.state(self.cfg)
         except (OSError, ValueError, subprocess.SubprocessError):
             return "unknown"
+
+    def _desktop_instance(self):
+        """`browser-desktop-instance` (lock held): the running container's identity, or None. A pool
+        host (its session epoch file) is out of this slice and answers None. runc is capped well inside
+        the edge's after-check reserve, so the lock is never held past a caller that gave up."""
+        from . import pool
+        if os.path.lexists(os.path.join(self.cfg.stateDir, pool.EPOCH_FILE)):
+            return None
+        try:
+            return desktop.instance(self.cfg, timeout=BROWSER_INSTANCE_RUNC_TIMEOUT)
+        except (OSError, ValueError, subprocess.SubprocessError):
+            return None
 
     def _desktop_unit(self):
         """The desktop unit's systemd state: active | activating | deactivating | reloading |

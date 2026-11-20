@@ -188,6 +188,38 @@ class HostBinding(unittest.TestCase):
                 self.assertNotIn(b"x-forwarded-host", sent.lower())
 
 
+class DesktopInstance(unittest.TestCase):
+    """desktop.instance: runc state's `<created>|<pid>` only for a running container (a stub runc)."""
+
+    def setUp(self):
+        from ezil_host import desktop
+        self.desktop = desktop
+        self.tmp = tempfile.mkdtemp(prefix="ezil-instance-")
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+        self.runc = os.path.join(self.tmp, "runc")
+        with open(self.runc, "w") as f:
+            f.write(f"#!/bin/sh\ncat '{self.tmp}/state.json'\nexit $(cat '{self.tmp}/code')\n")
+        os.chmod(self.runc, 0o700)
+        self.cfg = config.Config(json.loads(json.dumps(config.DEFAULTS)))
+        self.cfg.update(runcBin=self.runc, runDir=self.tmp, containerId="ezil-desktop")
+
+    def stamp(self, state, code=0):
+        with open(os.path.join(self.tmp, "state.json"), "w") as f:
+            f.write(state if isinstance(state, str) else json.dumps(state))
+        with open(os.path.join(self.tmp, "code"), "w") as f:
+            f.write(str(code))
+        return self.desktop.instance(self.cfg)
+
+    def test_running_container_identity_and_refusals(self):
+        live = {"id": "ezil-desktop", "pid": 4242, "status": "running", "created": "2026-11-20T00:00:00.123456789Z"}
+        self.assertEqual(self.stamp(live), "2026-11-20T00:00:00.123456789Z|4242")
+        self.assertNotEqual(self.stamp({**live, "pid": 4243}), self.stamp(live), "a new container is a new stamp")
+        for bad in ({**live, "status": "stopped"}, {**live, "pid": 0}, {**live, "pid": True}, {**live, "pid": "4242"},
+                    {k: v for k, v in live.items() if k != "created"}, {**live, "created": "x|y"}, [live]):
+            self.assertIsNone(self.stamp(bad), bad)
+        self.assertIsNone(self.stamp(live, code=1))
+
+
 class BodyFraming(unittest.TestCase):
     def test_all_trailers_are_rejected_before_the_final_chunk_is_forwarded(self):
         for trailer in (b"x-ezil-gw: injected\r\n", b"X-Ezil-Other: injected\r\n",
@@ -663,15 +695,19 @@ class EdgeE2E(unittest.TestCase):
     OBSERVED = {"ok": True, "browserSessionId": "s" * 43, "expiresAt": "2026-11-20T00:02:00.000Z",
                 "observed": "profile_builder", "profileHeadingVisible": True, "universeIdentity": "unverified"}
 
-    def observe_rig(self, reply=None, desktop="running"):
-        """The flag on, a stub sidecar on an ephemeral port standing in for 9223, the agent's desktop state."""
+    STAMP = "2026-11-20T00:00:00.123456789Z|4242"
+
+    def observe_rig(self, reply=None, instance=STAMP):
+        """The flag on, a stub sidecar on an ephemeral port standing in for 9223, and the running
+        container's instance as the agent reads it (a value, None = not running, or a callable read
+        on each browser-desktop-instance)."""
         self.cfg["edgeBrowserObserve"] = True
         side = Sidecar(reply if reply is not None else Sidecar.json(self.OBSERVED))
         self.addCleanup(side.close)
         patch = mock.patch.object(edge, "BROWSER_SIDECAR_PORT", side.port)
         patch.start()
         self.addCleanup(patch.stop)
-        self.agent._desktop_state = lambda: desktop if isinstance(desktop, str) else desktop()
+        self.agent._desktop_instance = lambda: instance() if callable(instance) else instance
         return side
 
     def observe_req(self, body, digest=None, extra=None, gw=True, method="POST", query=""):
@@ -725,12 +761,12 @@ class EdgeE2E(unittest.TestCase):
 
     def test_browser_observe_requires_a_running_desktop_before_and_after(self):
         body = b'{"binding":"' + b"a" * 64 + b'"}'
-        side = self.observe_rig(desktop="stopped")
+        side = self.observe_rig(instance=None)
         out = raw(self.port, self.observe_req(body))
         self.assertTrue(out.startswith(b"HTTP/1.1 409") and b"browser_unavailable" in out, out)
         self.assertEqual(side.requests, [])
-        states = iter(["running", "stopped"])
-        self.agent._desktop_state = lambda: next(states)
+        states = iter([self.STAMP, None])
+        self.agent._desktop_instance = lambda: next(states)
         out = raw(self.port, self.observe_req(body))
         self.assertTrue(out.startswith(b"HTTP/1.1 409"), out)
         self.assertEqual(len(side.requests), 1)
@@ -763,11 +799,99 @@ class EdgeE2E(unittest.TestCase):
     def test_browser_observe_is_bounded_by_one_deadline(self):
         body = b'{"binding":"' + b"a" * 64 + b'"}'
         self.observe_rig(reply=Sidecar.HANG)
-        with mock.patch.object(edge, "BROWSER_OBSERVE_DEADLINE", 0.3):
+        with mock.patch.object(edge, "BROWSER_OBSERVE_DEADLINE", 2.0), \
+                mock.patch.object(edge, "BROWSER_OBSERVE_AFTER_RESERVE", 1.7):
             started = time.monotonic()
             out = raw(self.port, self.observe_req(body))
         self.assertTrue(out.startswith(b"HTTP/1.1 503"), out)
-        self.assertLess(time.monotonic() - started, 2)
+        self.assertLess(time.monotonic() - started, 1.5, "the sidecar gets the budget minus the after-check's reserve")
+
+    def test_browser_observe_refuses_a_restarted_desktop_in_the_same_epoch(self):
+        body = b'{"binding":"' + b"a" * 64 + b'"}'
+        stamps = iter([self.STAMP, "2026-11-20T00:00:05.000000001Z|4243"])
+        side = self.observe_rig(instance=lambda: next(stamps))
+        out = raw(self.port, self.observe_req(body))
+        self.assertTrue(out.startswith(b"HTTP/1.1 409") and b"browser_unavailable" in out, out)
+        self.assertEqual(len(side.requests), 1, "running -> running, but another container: nothing answered")
+        self.assertNotIn(b"sssss", out)
+        side = self.observe_rig(instance=None)
+        out = raw(self.port, self.observe_req(body))
+        self.assertTrue(out.startswith(b"HTTP/1.1 409"), out)
+        self.assertEqual(side.requests, [], "no instance stamp while running: refused before the sidecar")
+
+    def test_browser_observe_deadline_covers_a_dripped_body_and_both_agent_checks(self):
+        body = b'{"binding":"' + b"a" * 64 + b'"}'
+        side = self.observe_rig()
+        with mock.patch.object(edge, "BROWSER_OBSERVE_DEADLINE", 0.6):
+            # The body stops arriving: refused at the deadline, never the 30 s socket timeout.
+            s = raw(self.port, self.observe_req(body)[:-10], keep_open=True)
+            s.settimeout(5)
+            started = time.monotonic()
+            out = s.recv(4096)
+            s.close()
+            self.assertTrue(out.startswith(b"HTTP/1.1 400"), out)
+            self.assertLess(time.monotonic() - started, 2)
+            # The agent is slow before, then after: both within the one budget.
+            self.agent._desktop_instance = lambda: (time.sleep(1.5), self.STAMP)[1]
+            started = time.monotonic()
+            out = raw(self.port, self.observe_req(body), timeout=5)
+            self.assertTrue(out.startswith(b"HTTP/1.1 409"), out)
+            self.assertLess(time.monotonic() - started, 1.3)
+            self.assertEqual(side.requests, [])
+        time.sleep(1.2)                       # the slow agent call drains
+        calls = iter([0, 1.5])
+        self.agent._desktop_instance = lambda: (time.sleep(next(calls)), self.STAMP)[1]
+        with mock.patch.object(edge, "BROWSER_OBSERVE_DEADLINE", 1.0), \
+                mock.patch.object(edge, "BROWSER_OBSERVE_AFTER_RESERVE", 0.5):
+            started = time.monotonic()
+            out = raw(self.port, self.observe_req(body), timeout=5)
+        self.assertTrue(out.startswith(b"HTTP/1.1 409"), out)
+        self.assertLess(time.monotonic() - started, 1.4)
+        self.assertEqual(len(side.requests), 1)
+        self.assertNotIn(b"sssss", out)
+        time.sleep(1.2)
+
+    def test_browser_observe_does_not_wait_past_the_deadline_for_the_sequencer_lock(self):
+        body = b'{"binding":"' + b"a" * 64 + b'"}'
+        side = self.observe_rig()
+        self.edge.seq.lock.acquire()
+        try:
+            with mock.patch.object(edge, "BROWSER_OBSERVE_DEADLINE", 0.5):
+                started = time.monotonic()
+                out = raw(self.port, self.observe_req(body), timeout=5)
+            self.assertTrue(out.startswith(b"HTTP/1.1 409"), out)
+            self.assertLess(time.monotonic() - started, 1.5)
+        finally:
+            self.edge.seq.lock.release()
+        self.assertEqual(side.requests, [])
+
+    def test_default_off_keeps_the_legacy_desktop_status_shape_and_cost(self):
+        from ezil_host import desktop
+        with mock.patch.object(desktop, "instance", side_effect=AssertionError("runc instance read")) as read:
+            out = raw(self.port, self.req("GET", "/__ezil/control/desktop"))
+            self.assertTrue(out.startswith(b"HTTP/1.1 200"), out)
+            self.assertNotIn(b"instance", out)
+            status = self.edge.seq.send("desktop_status")
+            self.assertNotIn("instance", status)
+            seq = self.agent.last_seq
+            # Browser off (the default): the edge-local op is unknown and costs no seq or runc read.
+            self.assertEqual(self.edge.seq.send("browser-desktop-instance"), {"ok": False, "error": "unknown_op"})
+            self.assertEqual(self.agent.last_seq, seq)
+            self.cfg["edgeBrowserObserve"] = True
+            self.assertEqual(self.edge.seq.send("browser-desktop-instance", extra=1), {"ok": False, "error": "unknown_op"})
+            self.assertEqual(read.call_count, 0)
+        self.agent._desktop_instance = lambda: self.STAMP
+        self.assertEqual(self.edge.seq.send("browser-desktop-instance"), {"ok": True, "instance": self.STAMP})
+        out = raw(self.port, self.req("GET", "/__ezil/control/desktop"))
+        self.assertNotIn(b"4242", out, "the stamp never reaches the Worker")
+
+    def test_sidecar_and_cdp_ports_are_never_proxied_even_if_configured(self):
+        self.assertEqual(edge.Edge(self.cfg | {"edgePorts": [9222, 9223, 8181]}, LEASE, KEY, sequencer=self.edge.seq).ports, (8181,))
+        self.edge.ports = (9222, 9223, self.desk.port)         # a misconfiguration that bypassed the filter
+        with mock.patch.object(edge, "DENIED_PROXY_PORTS", frozenset({9222, 9223, self.desk.port})):
+            for p in ("/__p/9222/json/version", "/__p/9223/internal/mcp-browser-observe", f"/__p/{self.desk.port}/x"):
+                self.assertTrue(raw(self.port, self.req("GET", p)).startswith(b"HTTP/1.1 404"), p)
+        self.assertEqual(self.desk.conns, 0)
 
     def test_seq_recovers_from_a_higher_persisted_mark(self):
         # Recover the persisted mark immediately, but throttle the presence retry.

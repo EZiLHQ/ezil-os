@@ -91,7 +91,7 @@ def main():
         cfg.update(stateDir=state, runDir=run, edgePort=port, edgeBind="127.0.0.1", edgeUpstreamHost="127.0.0.1",
                    edgeBrowserObserve=spec.get("enabled", True))
         edge.BROWSER_SIDECAR_PORT = sidecar(stop)
-        agentmod.Agent._desktop_state = lambda agent_self: "running"
+        agentmod.Agent._desktop_instance = lambda agent_self: "2026-11-20T00:00:00.123456789Z|4242"
         agent = agentmod.Agent(cfg, lease, log=lambda m: None)
         threading.Thread(target=agent.serve, args=(stop,), daemon=True).start()
         for _ in range(100):
