@@ -1,8 +1,8 @@
 {
-  "archiveSha256": "dd757a2f04e3dfe2b8e3b731af0dfbd1123157de687b69b9a2a718a2b8ab6bc0",
-  "cliSha256": "6d160f821577ee4e51fb0771fe5fa56f36a40a7b8c59b16d424fc12b7e7d3225",
-  "sourceCommit": "96478c69f684f4f054b5bb5792abc85c74d709dc",
+  "archiveSha256": "8668d5e06b6cd35140a2853c26f4e96bcd2b8b40b353ddc4d98161f1488d9b33",
+  "cliSha256": "add3f83cef4b35e8a65f43af3d4ad8ed745c5fa25b6d728b21ad8f0500d63049",
+  "sourceCommit": "542c127493179e0075f755d72a2dbd04710c75b9",
   "supervisorSha256": "29c9d0a4f2b688f3de76727db05d330cdc162fe46547636f2823927271609046",
-  "url": "https://github.com/EZiLHQ/ezil-cli/releases/download/standalone-20261120.1/ezil-cli-0.3.0-standalone.20261120.1.tar.gz",
-  "version": "0.3.0-standalone.20261120.1"
+  "url": "https://github.com/EZiLHQ/ezil-cli/releases/download/standalone-20261120.2/ezil-cli-0.3.0-standalone.20261120.2.tar.gz",
+  "version": "0.3.0-standalone.20261120.2"
 }
