@@ -120,8 +120,11 @@ def validate_ledger(value):
         if isinstance(entry, dict) and 'state' in entry:
             fields.add('state')
         adopt = isinstance(entry, dict) and entry.get('operation') == 'app-adopt'
+        tuple_adopt = isinstance(entry, dict) and entry.get('operation') == 'tuple-adopt'
         if adopt:
             fields |= {'state', 'before', 'expected', 'registrySha256'}
+        if tuple_adopt:
+            fields |= {'state', 'before', 'expected', 'basisGeneration', 'registrySha256'}
         app_op = isinstance(entry, dict) and entry.get('operation') in APP_OPERATIONS
         if app_op:
             fields |= {'state'} | (set() if state == 'pending' else {'registrySha256', 'appImageId'})
@@ -135,7 +138,7 @@ def validate_ledger(value):
         elif state == 'pending':
             need(isinstance(entry['before'], dict) and set(entry['before']) - {'registrySha256'} == {'secretVersionId', 'tuple', 'appGitSha'} and
                  isinstance(entry['expected'], dict) and set(entry['expected']) - {'registrySha256'} == {'tuple', 'appGitSha'}, 'invalid pending snapshots')
-        if adopt:
+        if adopt or tuple_adopt:
             need(state == 'completed' and all(isinstance(entry[k], dict) and
                  set(entry[k]) == {'secretVersionId', 'tuple', 'registrySha256', 'appGitSha'} for k in ('before', 'expected')),
                  'invalid app-adopt snapshots')
@@ -148,7 +151,7 @@ def validate_ledger(value):
                  (entry['planSha256'] == 'app-adopt:' + entry['appGitSha'] if adopt else manifest.matches(r'[0-9a-f]{64}', entry['planSha256'])),
                  'invalid ledger source pin')
             need(not app_op or manifest.matches(r'sha256:[0-9a-f]{64}', snapshot['appImageId']), 'invalid ledger app image ID')
-            need(entry['operation'] in ('source-init', 'apply-app', 'promote-canary', 'rollback', 'registry-gc', 'app-adopt', *APP_OPERATIONS) and
+            need(entry['operation'] in ('source-init', 'apply-app', 'promote-canary', 'rollback', 'registry-gc', 'app-adopt', 'tuple-adopt', *APP_OPERATIONS) and
                  isinstance(snapshot.get('secretVersionId', 'expected'), str) and bool(snapshot.get('secretVersionId', 'expected')), 'invalid ledger operation/version')
             need(isinstance(snapshot['tuple'], dict) and set(snapshot['tuple']) == set(manifest.PROMOTION), 'invalid ledger tuple')
             scope = dict(accountId=json_tool.ACCOUNT, region=json_tool.REGION, namespace=json_tool.NAMESPACE, launchTemplateId=json_tool.LAUNCH_TEMPLATE)
@@ -184,6 +187,23 @@ def validate_ledger(value):
                  entry['expected'] == {k: entry[k] for k in entry['expected']} and
                  entry['before'] == {**entry['expected'], 'appGitSha': prior['appGitSha']} and
                  entry['appGitSha'] != prior['appGitSha'], 'app-adopt must change only app identity')
+        elif tuple_adopt:
+            basis_generation = entry['basisGeneration']
+            need(json_tool.NAMESPACE == 'prd' and generation >= 4 and type(basis_generation) is int
+                 and basis_generation == generation - 3, 'invalid tuple-adopt historical anchor')
+            basis = entries[basis_generation - 1]
+            keys = ('secretVersionId', 'tuple', 'registrySha256', 'appGitSha')
+            need(prior['state'] == basis['state'] == 'completed'
+                 and prior['operation'] == 'rollback' and basis['operation'] == 'promote-canary'
+                 and prior['planSha256'] == basis['planSha256']
+                 and entry['before'] == {key: prior[key] for key in keys}
+                 and entry['expected'] == {key: entry[key] for key in keys}
+                 and state_matches(entry['expected'], basis)
+                 and entry['tuple'] != prior['tuple']
+                 and entry['appGitSha'] == prior['appGitSha']
+                 and entry['registrySha256'] == prior['registrySha256']
+                 and entry['secretVersionId'] not in (prior['secretVersionId'], basis['secretVersionId']),
+                 'tuple-adopt must record only the independently verified historical tuple')
         elif prior and prior.get('state') == 'pending':
             need(state in ('completed', 'aborted') and entry['planSha256'] == prior['planSha256'] and entry['operation'] == prior['operation'], 'unresolved pending ledger entry')
             need(state_matches(entry, prior['expected' if state == 'completed' else 'before']), 'terminal state mismatch')
@@ -275,13 +295,16 @@ def write_ledger_entry(ledger_path, ledger, path, plan, entry):
     return write_ledger_append(ledger_path, ledger, entry)
 
 
-def write_ledger_append(ledger_path, ledger, entry):
-    need(load_ledger(ledger_path) == ledger, 'ledger changed during operation')
+def write_ledger_append(ledger_path, ledger, entry, expected_sha256=None):
+    raw_bytes = safe_path(ledger_path).read_bytes()
+    need(expected_sha256 is None or hashlib.sha256(raw_bytes).hexdigest() == expected_sha256,
+         'ledger bytes changed during operation')
+    raw = raw_bytes.decode('utf-8')
+    need(validate_ledger(manifest.loads(raw)) == ledger, 'ledger changed during operation')
     # json_tool.write uses temp + fsync + rename + directory fsync. Caller holds app-secret.lock.
     updated = {**ledger, 'entries': [*ledger['entries'], entry]}
     validate_ledger(updated)
     # Preserve every historical entry's original bytes, including whitespace/key order.
-    raw = safe_path(ledger_path).read_bytes().decode('utf-8')
     decoder = json.JSONDecoder()
     pos = raw.index('{') + 1
     while True:
@@ -627,9 +650,10 @@ def require_receipt(path,phase):
     return evidence
 
 
-def secret_deployment(envelope):
+def secret_deployment(envelope, *, require_gate=True):
     outer=manifest.loads(envelope['SecretString'])
-    rebase_app.gate(outer)
+    if require_gate:
+        rebase_app.gate(outer)
     ds=manifest.loads(outer[json_tool.KEY]) if isinstance(outer[json_tool.KEY],str) else outer[json_tool.KEY]
     d=ds[json_tool.REGION]
     need((d['accountId'],d['region'],d['namespace'],d['launchTemplateId'])==(json_tool.ACCOUNT,json_tool.REGION,json_tool.NAMESPACE,json_tool.LAUNCH_TEMPLATE),'secret deployment identity mismatch')
@@ -1214,7 +1238,7 @@ def ledger_adopt_app(git_sha, source_repo, apply=False, ledger_path=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('operation', choices=('plan', 'finalize', 'apply-schema', 'apply-identity', 'apply-workflows', 'apply-app', 'promote-canary', 'rollback', 'ledger-init', 'ledger-reconcile', 'ledger-adopt-app', 'source-init',
-                                              'app-swap', 'app-swap-reconcile', 'app-archive-check'))
+                                              'app-swap', 'app-swap-reconcile', 'app-archive-check', 'tuple-adopt'))
     parser.add_argument('--release-dir', type=Path)
     parser.add_argument('--plan', type=Path)
     parser.add_argument('--manifest', type=Path)
@@ -1232,6 +1256,10 @@ def main():
     parser.add_argument('--archive', type=Path)
     parser.add_argument('--checksum', type=Path)
     parser.add_argument('--runtime', type=Path)
+    parser.add_argument('--recovery', type=Path)
+    parser.add_argument('--expect-recovery-sha256')
+    parser.add_argument('--lease-owner')
+    parser.add_argument('--fresh-readback', action='store_true')
     parser.add_argument('--apply', action='store_true')
     args = parser.parse_args()
     use_namespace(args.namespace)
@@ -1240,6 +1268,17 @@ def main():
     args.ledger = args.ledger or LEDGER_PATH
     for value in vars(args).values():
         if isinstance(value, Path): context.path(value)
+    if args.operation == 'tuple-adopt':
+        import rebase_tuple_adopt
+        need(args.namespace == 'prd' and args.recovery is not None and args.expect_recovery_sha256 is not None
+             and args.ledger == LEDGER_PATH and args.plan is None and args.manifest is None,
+             'tuple-adopt requires the production canonical ledger and a sealed recovery')
+        rebase_tuple_adopt.run(sys.modules[__name__], args.recovery, args.expect_recovery_sha256,
+                              args.lease_owner, args.apply, args.fresh_readback)
+        return
+    need(args.recovery is None and args.expect_recovery_sha256 is None and args.lease_owner is None
+         and not args.fresh_readback,
+         'recovery arguments require tuple-adopt')
     if args.operation == 'source-init':
         import rebase_source
         need(args.manifest is not None and args.build_arn is not None and args.app_artifact is not None, 'source-init requires manifest, build ARN and app artifact')
