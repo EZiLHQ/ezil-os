@@ -28,6 +28,7 @@ test('missing authorization or a non-fixture repository stops before creating a 
         assert.equal(names(report).fixture_configuration, 'blocked');
         assert.equal(names(report).private_repo_checkout, 'blocked');
         assert.equal(names(report).code_background_agent, 'skip');
+        assert.equal(names(report).code_chat_history_after_reload, 'skip');
         assert.equal(created, 0);
     }
 });
@@ -43,7 +44,7 @@ test('browser setup errors do not expose the provided storage state', async () =
 });
 
 const requireDir = process.env.PLAYWRIGHT_REQUIRE_DIR;
-test('loopback Chromium observes private Code checkout, full reload and a single background reply', {
+test('loopback Chromium requires the single background reply to reopen from Chat history after full reload', {
     skip: !requireDir && 'Set PLAYWRIGHT_REQUIRE_DIR for the Chromium loopback test',
 }, async t => {
     const { chromium } = createRequire(join(requireDir, 'staging-code-journey-test.js'))('playwright');
@@ -52,6 +53,7 @@ test('loopback Chromium observes private Code checkout, full reload and a single
     let boot = COMPUTER;
     let session = COMPUTER;
     let desktopLoads = 0;
+    let showSavedChat = true;
     const server = createServer(async (request, response) => {
         const app = 'http://' + request.headers.host;
         const url = new URL(request.url, app);
@@ -94,6 +96,8 @@ test('loopback Chromium observes private Code checkout, full reload and a single
                 '<div class="part editor"><div class="tabs"></div><div class="editor-instance">' +
                 '<div class="monaco-editor"><div class="view-lines"></div></div></div></div>' +
                 '<div class="part auxiliarybar"><button onclick="chat.replaceChildren()">New Chat</button>' +
+                '<div class="chat-view-title-container visible"><button class="chat-view-title-action-item" onclick="showHistory()">Chat history</button></div>' +
+                '<div class="quick-input-widget" style="min-height:20px" hidden></div>' +
                 '<button class="action-label" aria-label="Models, ' + MODEL + '">Model</button>' +
                 '<div class="chat-input-toolbar"><span class="action-item chat-input-picker-item"><button class="action-label">Ask</button></span></div>' +
                 '<div class="interactive-list" id="chat"></div><div class="chat-input-container">' +
@@ -102,6 +106,10 @@ test('loopback Chromium observes private Code checkout, full reload and a single
                 'function openFixture(){document.querySelector(".tabs").innerHTML=' + JSON.stringify('<div class="tab">README.md</div>') + ';' +
                 'document.querySelector(".editor-instance .view-lines").textContent=' + JSON.stringify(MARKER) + ';' +
                 'sessionStorage.setItem("opened","yes")}if(sessionStorage.getItem("opened"))openFixture();' +
+                'function showHistory(){const picker=document.querySelector(".quick-input-widget");picker.hidden=false;' +
+                'const saved=' + JSON.stringify(showSavedChat) + ' && JSON.parse(sessionStorage.getItem("savedChat"));' +
+                'if(!saved)return;const row=document.createElement("button");row.className="monaco-list-row";' +
+                'row.textContent=saved.marker;row.onclick=()=>{picker.hidden=true;chat.innerHTML=saved.transcript};picker.append(row);}' +
                 'input.addEventListener("keydown",event=>{if(event.key!=="Enter")return;event.preventDefault();' +
                 'const text=input.textContent;input.textContent="";const marker=text.match(/EZILQAPROBE[a-z0-9]+/)?.[0];' +
                 'if(!marker)return;fetch("/fixture-prompt",{method:"POST",body:marker});' +
@@ -109,7 +117,8 @@ test('loopback Chromium observes private Code checkout, full reload and a single
                 'const response=document.createElement("div");response.className="interactive-response chat-response-loading";' +
                 'response.textContent="Thinking";chat.append(response);setTimeout(()=>{' +
                 'response.classList.remove("chat-response-loading");const m=document.createElement("div");m.className="rendered-markdown";' +
-                'm.textContent=marker;response.replaceChildren(m);},2500);});</script>');
+                'm.textContent=marker;response.replaceChildren(m);' +
+                'sessionStorage.setItem("savedChat",JSON.stringify({marker,transcript:chat.innerHTML}));},2500);});</script>');
         }
         if (url.pathname === '/fixture-prompt') {
             const chunks = [];
@@ -153,8 +162,9 @@ test('loopback Chromium observes private Code checkout, full reload and a single
         fixture_configuration: 'pass',
         authenticated_isolated_computer: 'pass',
         private_repo_checkout: 'pass',
-        code_full_reload: 'pass',
         code_background_agent: 'pass',
+        code_full_reload: 'pass',
+        code_chat_history_after_reload: 'pass',
     }, JSON.stringify(report));
     assert.equal(mints.length, 2);
     assert(mints.every(body => body.computerId === COMPUTER && body.repository.url === REPO));
@@ -162,7 +172,20 @@ test('loopback Chromium observes private Code checkout, full reload and a single
     assert.equal(report.checks.find(check => check.name === 'code_full_reload').evidence.editorTabRestored, true);
     assert.equal(report.checks.find(check => check.name === 'code_background_agent').evidence.mode, 'ask');
     assert.equal(report.checks.find(check => check.name === 'code_background_agent').evidence.sameBrowserWindow, true);
+    assert.deepEqual(report.checks.find(check => check.name === 'code_chat_history_after_reload').evidence,
+        { historyPickerOpened: true, promptsRestored: 1, repliesRestored: 1 });
     assert(!JSON.stringify(report).includes(REPO));
     assert(!JSON.stringify(report).includes(REPO_ID));
     assert(!JSON.stringify(report).includes(prompts[0]));
+
+    showSavedChat = false;
+    const missing = await runCodeJourney({ browser, target, repo: { ...repo, allowAgent: true, modelName: MODEL },
+        storageState, evidence: { timeoutMs: 5_000 } });
+    assert.equal(names(missing).code_background_agent, 'pass', JSON.stringify(missing));
+    assert.equal(names(missing).code_full_reload, 'pass', JSON.stringify(missing));
+    const missingHistory = missing.checks.find(check => check.name === 'code_chat_history_after_reload');
+    assert.equal(missingHistory.status, 'fail');
+    assert.match(missingHistory.detail, /did not list exactly one matching saved conversation/);
+    assert.equal(prompts.length, 2);
+    assert(!JSON.stringify(missing).includes(prompts[1]));
 });

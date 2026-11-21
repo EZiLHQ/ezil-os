@@ -27,7 +27,7 @@ state through normal EZiL ID sign-in. Store it outside Git and test artifacts.
 | `EZIL_STAGING_QA_RUNTIME_READER` | Absolute path to the operator's read-only executable. Given `before` or `after`, it prints one live observation with `appSha`, `workerVersion`, `imageDigest`, `computerId`, `runtimeId` (running boot or placement identity), and UTC ISO `observedAt` recorded during that invocation. Use active Worker and selected desktop readbacks. |
 | `EZIL_STAGING_QA_COMPUTER_ID` | Expected dedicated test computer. The live reader and browser must agree on it. |
 | `EZIL_STAGING_EXPECT_CODE_IMAGE` and `EZIL_STAGING_EXPECT_WORKER_VERSION` | Immutable desktop digest and active Worker version from the reviewed release. The reader must match both and identify the same QA computer before and after. |
-| `EZIL_STAGING_QA_AGENT=1` and `EZIL_STAGING_QA_MODEL` | Opt into a synthetic read-only Ask response and tab-switch check on the named model. Use the separate image E2E for controlled pending-turn reload and provider request counts. |
+| `EZIL_STAGING_QA_AGENT=1` and `EZIL_STAGING_QA_MODEL` | Opt into one synthetic read-only Ask response on the named model. Requires the response to complete during a tab switch and the finished conversation to reopen from Chat history after full OS reload. The separate image E2E covers controlled pending-turn reload and provider request counts. |
 | `EZIL_STAGING_QA_GIT_REF` and `EZIL_STAGING_EXPECT_SUBMITTED_SHA` | Optional read-only Git lane for the submitted SHA and exact `refs/heads/…` ref. The runner uses existing Git credentials. |
 
 The release checks precede the parallel signed-out browser, authenticated Code,

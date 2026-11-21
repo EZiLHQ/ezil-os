@@ -14,6 +14,8 @@ const BOOT_TIMEOUT = 230_000;
 const AUTH_TIMEOUT = 20_000;
 const CODE_ERROR = /^[A-Za-z][A-Za-z0-9_]{0,47}$/;
 const now = () => new Date().toISOString();
+// Keep the marker visible even if the default history title is truncated.
+const syntheticPrompt = marker => marker + ' is the exact text to reply with. Do not use tools or change any files.';
 
 class CheckError extends Error {
     constructor(status, message, evidence = {}) {
@@ -280,8 +282,8 @@ async function runBackgroundAgent(page, frame, repo, timeLimit) {
     }
     const side = frame.locator('.part.auxiliarybar');
     const newChat = side.getByRole('button', { name: /^New Chat(?:\b|$)/i }).first();
-    if (!await newChat.isVisible().catch(() => false)) throw blocked('A fresh synthetic chat could not be established');
-    await newChat.click();
+    try { await newChat.click({ timeout: Math.min(timeLimit, AUTH_TIMEOUT) }); }
+    catch { throw blocked('A fresh synthetic chat could not be established'); }
     // A text instruction alone cannot prevent file-changing tools. Keep the
     // live probe in the workbench's read-only Ask mode or send nothing.
     const mode = side.locator('.chat-input-toolbar .action-item.chat-input-picker-item:not(.model-picker-item) .action-label').first();
@@ -302,7 +304,7 @@ async function runBackgroundAgent(page, frame, repo, timeLimit) {
     if (await chat.locator('.interactive-request').count()) throw blocked('The synthetic chat was not empty');
     const input = side.locator('.chat-input-container .monaco-editor').first();
     const marker = 'EZILQAPROBE' + randomUUID().replaceAll('-', '').slice(0, 12);
-    const instruction = 'Reply with exactly ' + marker + '. Do not use tools or change any files.';
+    const instruction = syntheticPrompt(marker);
     const other = await prepareSameWindowTab(page);
     try {
         const stamp = await frame.evaluate(() => window.ezilQaFixtureDocument = crypto.randomUUID());
@@ -335,17 +337,53 @@ async function runBackgroundAgent(page, frame, repo, timeLimit) {
         if (await frame.evaluate(() => window.ezilQaFixtureDocument).catch(() => null) !== stamp) {
             throw failed('The Code document changed during a browser tab switch');
         }
-        await until(() => replies.first().isVisible(), Math.min(timeLimit, 5000),
-            () => failed('The synthetic reply was not visible on return'));
+        await until(async () => await replies.first().isVisible() && !await pending.isVisible(), timeLimit,
+            () => failed('The synthetic reply did not complete after returning to Code'));
         if (await replies.count() !== 1 || await chat.locator('.interactive-request').count() !== 1) {
             throw failed('The fixture did not show exactly one submitted prompt and one reply');
         }
-        return { mode: 'ask', submissionsObserved: 1, repliesObserved: 1, pendingWhenBackgrounded: true, backgroundVisibility,
-            sameBrowserWindow: true, sameCodeDocument: true };
+        return { marker, evidence: { mode: 'ask', submissionsObserved: 1, repliesObserved: 1, pendingWhenBackgrounded: true,
+            backgroundVisibility, sameBrowserWindow: true, sameCodeDocument: true } };
     } finally {
         await page.bringToFront().catch(() => {});
         await other.close().catch(() => {});
     }
+}
+
+async function verifySavedChat(frame, marker, timeLimit) {
+    const side = frame.locator('.part.auxiliarybar');
+    const chat = side.locator('.interactive-list').first();
+    const newChat = side.getByRole('button', { name: /^New Chat(?:\b|$)/i }).first();
+    try {
+        await newChat.click({ timeout: timeLimit });
+        await side.locator('.chat-input-container').first().waitFor({ state: 'visible', timeout: timeLimit });
+    } catch { throw failed('A fresh chat could not be opened after reloading Code'); }
+    await until(async () => await chat.locator('.interactive-request').count() === 0, timeLimit,
+        () => failed('The reloaded Code editor did not open an empty chat'));
+
+    // Use the native Chat history picker. Selecting a known entry tests that
+    // the session was indexed and can be reopened, even if Code had restored it.
+    const history = side.locator('.chat-view-title-container.visible .chat-view-title-action-item').first();
+    const picker = frame.locator('.quick-input-widget:visible');
+    try {
+        await history.click({ timeout: timeLimit });
+        await picker.waitFor({ state: 'visible', timeout: timeLimit });
+    } catch { throw failed('Chat history could not be opened after reloading Code'); }
+    const entry = picker.locator('.monaco-list-row:visible').filter({ hasText: marker });
+    await until(async () => await entry.count() === 1, timeLimit,
+        () => failed('Chat history did not list exactly one matching saved conversation'));
+    await entry.click({ timeout: timeLimit });
+
+    const prompts = chat.locator('.interactive-request').filter({ hasText: syntheticPrompt(marker) });
+    const replies = chat.locator('.interactive-response .rendered-markdown').getByText(marker, { exact: true });
+    await until(async () => await prompts.count() === 1 && await replies.count() === 1
+        && await prompts.first().isVisible() && await replies.first().isVisible()
+        && !await chat.locator('.interactive-response.chat-response-loading').first().isVisible(), timeLimit,
+            () => failed('The saved conversation did not reopen with its complete prompt and reply'));
+    if (await chat.locator('.interactive-request').count() !== 1) {
+        throw failed('The saved conversation reopened with extra prompts');
+    }
+    return { historyPickerOpened: true, promptsRestored: 1, repliesRestored: 1 };
 }
 
 /**
@@ -354,7 +392,8 @@ async function runBackgroundAgent(page, frame, repo, timeLimit) {
  */
 export async function runCodeJourney({ browser, target, repo, storageState, evidence = {} }) {
     const checks = createChecks();
-    let inputs, context, page, fence, mints, initial, reopened;
+    let inputs, context, page, fence, mints, initial, reopened, probe;
+    const agentSelected = repo?.allowAgent === true;
     const timeLimit = Number.isFinite(evidence.timeoutMs) ? Math.min(BOOT_TIMEOUT, Math.max(1_000, evidence.timeoutMs)) : BOOT_TIMEOUT;
     const fileTimeLimit = Math.min(30_000, timeLimit);
     const configured = await checks.run('fixture_configuration', () => {
@@ -392,6 +431,11 @@ export async function runCodeJourney({ browser, target, repo, storageState, evid
             return { serverMintMatched: true, editorWorkspaceMatched: true,
                 ...await verifyKnownFile(initial.frame, inputs.expectedFile, repo.expectedText, fileTimeLimit) };
         }, !authenticated && 'The fixture computer was not verified');
+        const answered = await checks.run('code_background_agent', async () => {
+            probe = await runBackgroundAgent(page, initial.frame, repo, timeLimit);
+            return probe.evidence;
+        }, agentSelected && !checkout && 'The private checkout was not verified',
+            !agentSelected && 'The optional synthetic agent scenario was not selected');
         const reloaded = await checks.run('code_full_reload', async () => {
             if (!page) throw failed('The initial Code page was unavailable');
             const priorMintCount = mints.length;
@@ -407,9 +451,9 @@ export async function runCodeJourney({ browser, target, repo, storageState, evid
             return { sameWorkspace: true, newCodeDocument: true,
                 ...await verifyKnownFile(reopened.frame, inputs.expectedFile, repo.expectedText, fileTimeLimit, { reopen: true }) };
         }, !checkout && 'The private checkout was not verified');
-        await checks.run('code_background_agent', () => runBackgroundAgent(page, reopened.frame, repo, timeLimit),
-            repo?.allowAgent === true && !reloaded && 'The reloaded private workspace was not verified',
-            repo?.allowAgent !== true && 'The optional synthetic agent scenario was not selected');
+        await checks.run('code_chat_history_after_reload', () => verifySavedChat(reopened.frame, probe.marker, fileTimeLimit),
+            agentSelected && (!reloaded || !answered) && 'The completed synthetic reply and reloaded private workspace were not both verified',
+            !agentSelected && 'The optional synthetic agent scenario was not selected');
     } finally {
         await context?.close().catch(() => {});
     }

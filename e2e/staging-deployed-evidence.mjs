@@ -166,13 +166,17 @@ export async function collectEvidence(config, { fetcher = fetch, runLanes }) {
         try { lanes = await runLanes(); }
         catch { lanes = [check('browser-and-git', 'fail', 'Evidence collection ended unexpectedly')]; }
         const required = ['signed-out-assignment-link'];
-        if (config.mode === 'assignment' && !lanes.some(item => item.name === 'authenticated-code' || item.name === 'running-code-image')) {
+        if (config.mode === 'assignment' && !lanes.some(item =>
+            ['authenticated-code', 'running-code-image'].includes(item.name) && ['blocked', 'fail'].includes(item.status))) {
             required.push('running-code-image-before', 'authenticated_isolated_computer', 'private_repo_checkout',
                 'code_full_reload', 'running-code-image-after');
-            if (config.agent) required.push('code_background_agent');
+            if (config.agent) required.push('code_background_agent', 'code_chat_history_after_reload');
         }
         if (config.gitRef) required.push('submitted-git-sha');
-        if (required.some(name => !lanes.some(item => item.name === name && item.status !== 'skip'))) {
+        const history = lanes.find(item => item.name === 'code_chat_history_after_reload' && item.status === 'pass');
+        const missingHistoryEvidence = config.agent && history && (history.evidence?.historyPickerOpened !== true
+            || history.evidence?.promptsRestored !== 1 || history.evidence?.repliesRestored !== 1);
+        if (missingHistoryEvidence || required.some(name => !lanes.some(item => item.name === name && item.status !== 'skip'))) {
             lanes.push(check('required-lane-evidence', 'blocked', 'One or more selected checks did not produce evidence'));
         }
         report.checks.push(...lanes, ...await verifyRelease(config, 'after', fetcher));

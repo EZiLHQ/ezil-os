@@ -66,15 +66,41 @@ test('an empty browser result cannot mark the live version as tested', async () 
     assert.equal(result.checks.find(item => item.name === 'required-lane-evidence').status, 'blocked');
 });
 
+const assignmentChecks = () => ['signed-out-assignment-link', 'running-code-image-before',
+    'authenticated_isolated_computer', 'private_repo_checkout', 'code_full_reload',
+    'running-code-image-after'].map(name => ({ name, status: 'pass' }));
+
 test('a requested background probe cannot be silently skipped', async () => {
-    const lanes = ['signed-out-assignment-link', 'running-code-image-before', 'authenticated_isolated_computer',
-        'private_repo_checkout', 'code_full_reload', 'running-code-image-after'].map(name => ({ name, status: 'pass' }));
-    lanes.push({ name: 'code_background_agent', status: 'skip' });
+    const lanes = assignmentChecks();
+    lanes.push({ name: 'code_background_agent', status: 'skip' },
+        { name: 'code_chat_history_after_reload', status: 'pass',
+            evidence: { historyPickerOpened: true, promptsRestored: 1, repliesRestored: 1 } });
     const result = await collectEvidence({ mode: 'assignment', appSha, gatewaySha, agent: true }, {
         fetcher: health, runLanes: async () => lanes,
     });
     assert.equal(result.status, 'blocked');
     assert.equal(result.checks.find(item => item.name === 'required-lane-evidence').status, 'blocked');
+});
+
+test('an opted-in agent journey requires observed Chat history evidence', async () => {
+    const name = 'code_chat_history_after_reload';
+    const evidence = { historyPickerOpened: true, promptsRestored: 1, repliesRestored: 1 };
+    const config = { mode: 'assignment', appSha, gatewaySha, agent: true };
+    for (const history of [[], [{ name, status: 'skip' }], [{ name, status: 'pass' }],
+        [{ name, status: 'pass', evidence: { ...evidence, repliesRestored: 0 } }]]) {
+        const result = await collectEvidence(config, {
+            fetcher: health,
+            runLanes: async () => [...assignmentChecks(), { name: 'code_background_agent', status: 'pass' }, ...history],
+        });
+        assert.equal(result.status, 'blocked');
+        assert.equal(result.checks.find(item => item.name === 'required-lane-evidence').status, 'blocked');
+    }
+    const valid = await collectEvidence(config, {
+        fetcher: health,
+        runLanes: async () => [...assignmentChecks(), { name: 'code_background_agent', status: 'pass' },
+            { name, status: 'pass', evidence }],
+    });
+    assert.equal(valid.status, 'pass');
 });
 
 test('live runtime observations must match app, image and Worker and be recent', () => {
