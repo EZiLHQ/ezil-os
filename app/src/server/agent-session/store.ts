@@ -100,6 +100,20 @@ export interface SessionEvent {
     status?: OpStatus;
 }
 
+/**
+ * The computer's own private workbench (worker/scripts/start-unattended-workbench.sh, docs/UNATTENDED-CODE.md) syncs
+ * with an owner id under this prefix; every other owner is a window a person opened. A person's window may take the
+ * bridge from a live private workbench; the private workbench never takes it from a live window, so instructions run in
+ * the window the person is looking at whenever there is one. Whatever the displaced owner held becomes `uncertain`
+ * (`owner_changed`), exactly as for any owner change: never redelivered, never finished twice.
+ */
+export const UNATTENDED_OWNER_PREFIX = 'unattended.';
+export const isUnattendedOwner = (ownerId: string): boolean => ownerId.startsWith(UNATTENDED_OWNER_PREFIX);
+/** True only when a person's window is syncing while the private workbench holds the live lease. */
+export function attendedPreempts(currentOwnerId: string, incomingOwnerId: string): boolean {
+    return currentOwnerId !== incomingOwnerId && isUnattendedOwner(currentOwnerId) && !isUnattendedOwner(incomingOwnerId);
+}
+
 export class SessionStoreError extends Error {
     /** `reason` is a short code a caller may show (a definite refusal such as `effort_not_per_session`); never free text. */
     constructor(readonly code: 'NOT_FOUND' | 'CONFLICT' | 'BAD_REQUEST', readonly reason?: string) {
@@ -501,7 +515,7 @@ export async function syncEditor(db: SessionDb, computer: { id: string; userId: 
         const live = clock[0]!.live === true;
         const reowned = String(row.user_id) !== computer.userId;
         const same = !reowned && live && row.owner_id === body.ownerId;
-        if (!same && live && !reowned) return { owner: 'other', pollMs: OTHER_OWNER_POLL_MS };
+        if (!same && live && !reowned && !attendedPreempts(String(row.owner_id), body.ownerId)) return { owner: 'other', pollMs: OTHER_OWNER_POLL_MS };
         if (same && body.seq <= Number(row.last_seq)) return { owner: 'replayed' };
         const epoch = same ? Number(row.epoch) : Number(row.epoch) + 1;
         await tx.execute(sql`/* agent-session:owner-take */

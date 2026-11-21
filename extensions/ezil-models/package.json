@@ -107,7 +107,13 @@
         "ezil.chatBridge.enabled": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Let EZiL OS (and the EZiL app in ChatGPT, for you) send instructions to an EZiL Chat session you have open here. An instruction runs with that pane's current mode, model and tool approvals, including auto-approve. Off by default.",
+          "markdownDescription": "Let EZiL OS (and the EZiL app in ChatGPT, for you) send instructions to an EZiL Chat session you have open here. An instruction runs with that pane's current mode, model and tool approvals, including auto-approve. Off by default. On its own this needs a Code window of yours to be open; see `ezil.chatBridge.unattended`.",
+          "scope": "machine"
+        },
+        "ezil.chatBridge.unattended": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "With `ezil.chatBridge.enabled`, also keep a private Code workbench running inside this computer while it is up, so instructions sent through EZiL OS run even when none of your Code windows is open. It is a separate headless window on its own throwaway profile: it never touches your browser, your desktop or a window you have open, and a window you open takes precedence. The computer still stops when idle. Off by default; turning it off stops the private workbench.",
           "scope": "machine"
         },
         "ezilModels.logRequests": {

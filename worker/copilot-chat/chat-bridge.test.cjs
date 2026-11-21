@@ -15,7 +15,7 @@ const submit = (w, n, extra = {}) => w.bridge.handle({ op: 'submit', ownerId: 'o
 
 test('hello and sessions describe this workbench and each open session\'s selected model', async () => {
     const w = world();
-    assert.deepEqual(await w.bridge.handle({ op: 'hello' }), { ok: true, protocol: 2, owner: null, workspaceFolders: ['vscode-remote://remote/workspace'] });
+    assert.deepEqual(await w.bridge.handle({ op: 'hello' }), { ok: true, protocol: 2, owner: null, workspaceFolders: ['vscode-remote://remote/workspace'], unattended: false });
     assert.deepEqual(await w.bridge.handle({ op: 'sessions' }), { ok: false, error: 'no_owner' });
     await claimed(w);
     const listed = await w.bridge.handle({ op: 'sessions', ...OWNER });
@@ -505,4 +505,14 @@ test('setModel cannot mutate after disposal during an awaited open', async () =>
     release.resolve();
     assert.deepEqual(await pending, { ok: false, error: 'disconnected' });
     assert.equal(w.calls.switched.length, 0);
+});
+
+test('hello names the private unattended workbench by its headless user agent, and nothing else', async () => {
+    const headless = world({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36' });
+    assert.equal((await headless.bridge.handle({ op: 'hello' })).unattended, true);
+    for (const userAgent of ['Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36', '', 'HeadlessChromeless/1']) {
+        assert.equal((await world({ userAgent }).bridge.handle({ op: 'hello' })).unattended, false, userAgent);
+    }
+    // The fence is the same in both: a headless window is not a licence to act without a claim.
+    assert.deepEqual(await headless.bridge.handle({ op: 'sessions' }), { ok: false, error: 'no_owner' });
 });

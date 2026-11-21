@@ -3129,6 +3129,46 @@ launch_devserver
 # `wait` is what makes a container SIGTERM in this window interruptible.
 launch_browser_sidecar
 
+# ── Private unattended Code workbench — same call-site reasoning as above ────
+# docs/UNATTENDED-CODE.md. After the readiness verdict, after the sidecar: it
+# can never gate the desktop, and every refusal inside it is non-fatal. The
+# launcher itself fails closed (boot-specific editor-bridge token, the owner's
+# explicit consent in their own settings, an operator switch) and keeps its
+# window private: headless, no DISPLAY, its own throwaway profile, no debugging
+# port, scrubbed environment. It reports no presence and holds nothing open:
+# idle stop and the sleep timer are unchanged. Tracked in SESSION_PID so a
+# restart or teardown ends it; it also stops itself on $NEKO_SHUTDOWN_FLAG.
+# Its own log, NOT $LOG: what reaches $LOG is this script's `log` lines only
+# (a decision word and nothing else).
+EZIL_UNATTENDED_WORKBENCH_ENTRY="${EZIL_UNATTENDED_WORKBENCH_ENTRY:-/usr/local/bin/start-unattended-workbench.sh}"
+launch_unattended_workbench() {
+  phase_start unattended_workbench
+  if [ ! -x "$EZIL_UNATTENDED_WORKBENCH_ENTRY" ]; then
+    log "unattended workbench launcher not present — skipping"
+    phase_end unattended_workbench skipped
+    return 0
+  fi
+  local decision
+  decision="$(CODE_SERVER_PORT="$CODE_SERVER_PORT" CODE_SERVER_USER_DATA_DIR="$CODE_SERVER_USER_DATA_DIR" \
+    EZIL_WORKSPACE_ROOT="$WORKSPACE_ROOT" bash "$EZIL_UNATTENDED_WORKBENCH_ENTRY" check 2>/dev/null)" || true
+  case "$decision" in
+    authorized) ;;
+    *)
+      log "unattended workbench not started: ${decision:-check_failed}"
+      phase_end unattended_workbench skipped
+      return 0
+      ;;
+  esac
+  CODE_SERVER_PORT="$CODE_SERVER_PORT" CODE_SERVER_USER_DATA_DIR="$CODE_SERVER_USER_DATA_DIR" \
+  EZIL_WORKSPACE_ROOT="$WORKSPACE_ROOT" NEKO_SHUTDOWN_FLAG="$NEKO_SHUTDOWN_FLAG" \
+    bash "$EZIL_UNATTENDED_WORKBENCH_ENTRY" run >/dev/null 2>&1 9>&- &
+  SESSION_PID+=("$!")
+  log "unattended workbench supervisor started (private headless window on 127.0.0.1:${CODE_SERVER_PORT})"
+  phase_end unattended_workbench ok
+  return 0
+}
+launch_unattended_workbench
+
 # ── Fatal-failure watch (contract: dead mandatory app => unhealthy desktop) ───
 # Keep the startProcess-managed process alive for the lifetime of the desktop,
 # but also watch for a PERMANENT mandatory-app failure. If a supervised app

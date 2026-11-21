@@ -391,6 +391,9 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             // Which of its own picker models the EZiL Gateway allows this computer's account to use, from a fresh
             // `/v1/models` read with the computer's AI token (never the static config, an older read or the request).
             availableIds: (ids) => accountAvailableIds(store.models(), ids, fetch),
+            // Consent to the private unattended workbench (docs/UNATTENDED-CODE.md), read on every round so withdrawing it takes
+            // effect in that window at once; a window a person opened never consults it.
+            unattendedAllowed: () => vscode.workspace.getConfiguration('ezil').get('chatBridge.unattended') === true,
             // The effort this extension really sends for its own model (none through the Gateway), read-only.
             effortOf: (modelId) => {
                 const model = store.models().find((candidate) => candidate.id === modelId);

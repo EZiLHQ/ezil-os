@@ -578,7 +578,9 @@ which reads the same setting.
   - the command id does not occur yet.
 - **Operations.** There is a fixed set: `hello`, `claim`, `sessions`, `submit`, `cancel`, `command`
   and `read`, plus, in protocol 2, `models`, `create` and `setModel`. Requests and results are plain JSON,
-  and the caller never supplies a command name.
+  and the caller never supplies a command name. `hello` also answers `unattended: true` in the computer's
+  private headless workbench (`docs/UNATTENDED-CODE.md`; read from the window's own user agent), so the
+  extension syncs as that window and OS lets a window a person opens take precedence.
   `sessions` lists each session's resource, title, whether it is open in this window, and, for an
   open session whose model this window already has loaded, whether it is `idle` or `running`
   (otherwise `unknown`; it never loads a model just to look), its selected model (open sessions only)

@@ -3,7 +3,7 @@
 
 import { describe, expect, test } from 'bun:test';
 
-import { ChatBridgeClient, controlReport, submitReport, syncUrlFrom } from '../src/chat-bridge-client';
+import { ChatBridgeClient, controlReport, ownerIdFor, submitReport, syncUrlFrom } from '../src/chat-bridge-client';
 
 const OP = '00000000-0000-4000-8000-000000000001';
 const ATTEMPT = '00000000-0000-4000-8000-0000000000aa';
@@ -276,5 +276,70 @@ describe('catalog availability: only the Gateway evidence the extension read for
         const { client, bodies } = harness([self(1), self(1), self(1)], undefined, async () => { asked += 1; return new Set(['qwen']); });
         await client.tick(); await client.tick(); await client.tick();
         expect([asked, bodies.some((b) => 'catalog' in b)]).toEqual([0, false]);
+    });
+});
+
+describe('the private unattended workbench (docs/UNATTENDED-CODE.md)', () => {
+    const hello = (unattended: boolean) => ({ ok: true, protocol: 2, owner: null, workspaceFolders: [], unattended });
+    const deps = (unattended: boolean, extra: Partial<ConstructorParameters<typeof ChatBridgeClient>[0]> = {}) => {
+        const bodies: Record<string, unknown>[] = [];
+        const client = new ChatBridgeClient({
+            syncUrl: 'https://h/editor-bridge/v1/sync', token: 'a'.repeat(64), ownerId: 'ext.one', log: () => {},
+            execute: async (request) => (request.op === 'hello' ? hello(unattended) : { ok: true, owner: { id: request.ownerId, epoch: request.epoch } }),
+            fetch: async (_url, init) => { bodies.push(JSON.parse(String(init.body))); return Response.json({ ok: true, protocol: 2, owner: 'self', epoch: 1, pollMs: 2000, deliver: [] }); },
+            ...extra,
+        });
+        return { client, bodies };
+    };
+
+    test('ownerIdFor keeps a person\'s window as configured and renames the headless one under OS\'s prefix', () => {
+        expect(ownerIdFor('ext.abc', false)).toBe('ext.abc');
+        expect(ownerIdFor('ext.abc', true)).toBe('unattended.abc');
+        expect(ownerIdFor('abc', true)).toBe('unattended.abc');
+        expect(ownerIdFor(`ext.${'x'.repeat(200)}`, true)).toHaveLength(128);
+    });
+
+    test('a window a person opened syncs as itself, whatever the consent setting says', async () => {
+        const { client, bodies } = deps(false, { unattendedAllowed: () => false });
+        await client.tick();
+        expect(bodies.map((b) => b.ownerId)).toEqual(['ext.one']);
+        expect(client.syncOwnerId).toBe('ext.one');
+    });
+
+    test('the headless workbench syncs as unattended.<id>, and only with the owner\'s explicit consent', async () => {
+        const fetched = { count: 0 };
+        let allowed = false;
+        const { client, bodies } = deps(true, { unattendedAllowed: () => allowed });
+        expect(await client.tick()).toBeGreaterThan(1000);
+        expect(bodies).toEqual([]);
+        expect(client.syncOwnerId).toBe('unattended.one');
+        allowed = true;
+        await client.tick();
+        expect(bodies.map((b) => b.ownerId)).toEqual(['unattended.one']);
+        // Consent withdrawn mid-life: the next round sends nothing more.
+        allowed = false;
+        await client.tick();
+        expect(bodies).toHaveLength(1);
+        void fetched;
+    });
+
+    test('no consent callback at all is no consent', async () => {
+        const { client, bodies } = deps(true);
+        await client.tick();
+        expect(bodies).toEqual([]);
+    });
+
+    test('the owner id is fixed by the first hello: a later change of answer never re-keys a live lease', async () => {
+        let unattended = false;
+        const bodies: Record<string, unknown>[] = [];
+        const client = new ChatBridgeClient({
+            syncUrl: 'https://h/editor-bridge/v1/sync', token: 'a'.repeat(64), ownerId: 'ext.two', log: () => {},
+            execute: async (request) => (request.op === 'hello' ? hello(unattended) : { ok: true, owner: { id: request.ownerId, epoch: request.epoch } }),
+            fetch: async (_url, init) => { bodies.push(JSON.parse(String(init.body))); return Response.json({ ok: true, protocol: 2, owner: 'self', epoch: 1, pollMs: 2000, deliver: [] }); },
+        });
+        await client.tick();
+        unattended = true;
+        await client.tick();
+        expect(bodies.map((b) => b.ownerId)).toEqual(['ext.two', 'ext.two']);
     });
 });

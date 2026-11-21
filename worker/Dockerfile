@@ -179,8 +179,11 @@ COPY scripts/start-devserver.sh /usr/local/bin/start-devserver.sh
 # utility for on-demand/manual relaunch.
 COPY scripts/start-codeserver.sh /usr/local/bin/start-codeserver.sh
 COPY scripts/editor-state.sh /usr/local/bin/editor-state.sh
+# The private unattended Code workbench (docs/UNATTENDED-CODE.md): launched by
+# start-neko.sh after the readiness verdict, fail-closed, never part of boot.
+COPY scripts/start-unattended-workbench.sh /usr/local/bin/start-unattended-workbench.sh
 COPY scripts/ezil-restore-deps.sh /usr/local/bin/ezil-restore-deps.sh
-RUN chmod +x /usr/local/bin/start-desktop.sh /usr/local/bin/start-neko.sh /usr/local/bin/start-devserver.sh /usr/local/bin/start-codeserver.sh /usr/local/bin/ezil-restore-deps.sh
+RUN chmod +x /usr/local/bin/start-desktop.sh /usr/local/bin/start-neko.sh /usr/local/bin/start-devserver.sh /usr/local/bin/start-codeserver.sh /usr/local/bin/ezil-restore-deps.sh /usr/local/bin/start-unattended-workbench.sh
 # ── Alternate `neko` desktop mode (Phase 1, opt-in via desktopMode) ──────────
 # Guacamole above remains the default/rollback path — nothing above this
 # comment is changed by Neko's presence. The pinned Neko + VS Code runtime
