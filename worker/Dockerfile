@@ -411,7 +411,28 @@ RUN cd /opt/ezil-sidecar \
   && node --check /opt/ezil-sidecar/browser.mjs \
   && node --check /opt/ezil-sidecar/redact.mjs \
   && node --check /opt/ezil-sidecar/page-scripts.mjs \
-  && node -e "import('/opt/ezil-sidecar/verbs.mjs').then(m=>{const n=Object.keys(m.VERBS).length;if(n!==10)throw new Error('expected 10 verbs, got '+n);console.log('sidecar verbs ok:',n)})"
+  && node -e "import('/opt/ezil-sidecar/verbs.mjs').then(m=>{const n=Object.keys(m.VERBS).length;if(n!==14)throw new Error('expected 14 verbs, got '+n);console.log('sidecar verbs ok:',n)})"
+
+# ezil-toolsd: the staging computer-tools and terminal-job daemon (ezil-mcp
+# docs/STAGING-COMPUTER-TOOLS-MCP.md, `worker/toolsd/README.md`). It serves
+# 0.0.0.0:9224 (EXPOSE below) and refuses every request without this boot's MAC,
+# which only the Worker's staging-pinned `POST /sandbox/:name/computer-tools`
+# route can compute. Launched by start-neko.sh's `launch_toolsd`.
+#
+# 🔴 Jobs never run as root. toolsd spawns every tool and terminal process as
+#    `ezil-run` (uid/gid 7001, created here) with an environment built from
+#    scratch, so no EZIL_*_TOKEN reaches a job and the 0600 root socket of the
+#    `ezil` CLI stays out of its reach. No dependencies: nothing is installed.
+RUN useradd --system --uid 7001 --user-group --create-home --home-dir /home/ezil-run --shell /usr/sbin/nologin ezil-run \
+  && test "$(id -u ezil-run)" = 7001 && test "$(id -g ezil-run)" = 7001
+COPY toolsd /opt/ezil-toolsd
+RUN test -f /opt/ezil-toolsd/server.mjs \
+  && for f in /opt/ezil-toolsd/*.mjs; do node --check "$f" || exit 1; done \
+  && node -e "import('/opt/ezil-toolsd/manifest.mjs').then(m=>{for(const k of ['validateManifest','scanCatalog'])if(typeof m[k]!=='function')throw new Error('toolsd manifest export missing: '+k);console.log('toolsd ok')})"
+# The in-computer `ezil` CLI (`ezil chat …`, `ezil tool validate`); it talks to
+# the ezil-models extension over a root-only Unix socket.
+COPY scripts/ezil /usr/local/bin/ezil
+RUN chmod 0755 /usr/local/bin/ezil && /usr/local/bin/ezil --help >/dev/null
 
 # Bake opencode into the system image before the npm inventory and manifest:
 # user installs exceed the per-computer system-layer save limit. Use the
@@ -475,3 +496,10 @@ EXPOSE 8443
 #    (Chromium M113+ pins it there regardless of flags) and the sidecar is the
 #    only thing that talks to it.
 EXPOSE 9223
+
+# ezil-toolsd (see the COPY above). Reached only by `sandbox.containerFetch`
+# from the Worker's staging-pinned `POST /sandbox/:name/computer-tools` route,
+# never `exposePort()`d and never carried by `src/preview-bridge.ts`. It binds
+# 0.0.0.0 because the platform reaches container ports through 10.0.0.1, so
+# authority is the per-boot MAC plus the exact Host check, not the bind address.
+EXPOSE 9224

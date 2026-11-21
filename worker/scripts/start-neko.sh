@@ -1087,6 +1087,72 @@ case "$(printf '%s' "${EZIL_BROWSER_SIDECAR:-on}" | tr '[:upper:]' '[:lower:]' |
   return 0
 }
 
+# ── Computer tools daemon (ezil-toolsd, staging computer tools + terminal jobs) ──
+# A small Node service (`worker/toolsd/`, installed at /opt/ezil-toolsd) that
+# serves 0.0.0.0:9224 for the Worker's staging-pinned
+# `POST /sandbox/:name/computer-tools` route (ezil-mcp
+# docs/STAGING-COMPUTER-TOOLS-MCP.md). Every request needs a MAC keyed from this
+# boot's AI proxy token, which only the Worker can re-derive, and jobs run as the
+# non-root `ezil-run` user with an environment built from scratch.
+#
+# Same call-site reasoning and the same non-fatal contract as
+# launch_browser_sidecar: after the readiness verdict, every failure path is a
+# `log` + `phase_end ... skipped/error` and a `return 0`. The `[ -f ]` guard keeps
+# it inert in the stubbed-binary suites, where /opt/ezil-toolsd does not exist.
+# toolsd starts from `env -i`: it receives only the seed it derives its key from
+# (and then drops), never Code's bridge token or anything else in this script's
+# environment.
+EZIL_TOOLSD_ENTRY="${EZIL_TOOLSD_ENTRY:-/opt/ezil-toolsd/server.mjs}"
+EZIL_TOOLSD_PORT="${EZIL_TOOLSD_PORT:-9224}"
+EZIL_TOOLSD_LOG="${EZIL_TOOLSD_LOG:-/tmp/ezil-toolsd.log}"
+launch_toolsd() {
+  phase_start toolsd_launch
+  case "$(printf '%s' "${EZIL_TOOLSD:-on}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')" in
+    off|false|0|disabled|no)
+      log "computer tools daemon disabled by EZIL_TOOLSD — nothing on ${EZIL_TOOLSD_PORT} this session"
+      phase_end toolsd_launch skipped
+      return 0
+      ;;
+  esac
+  if [ ! -f "$EZIL_TOOLSD_ENTRY" ]; then
+    log "computer tools daemon entry $EZIL_TOOLSD_ENTRY not present — skipping"
+    phase_end toolsd_launch skipped
+    return 0
+  fi
+  if [ -z "${EZIL_AI_PROXY_TOKEN:-}" ]; then
+    log "computer tools daemon has no boot key this session (no AI proxy token) — skipping"
+    phase_end toolsd_launch skipped
+    return 0
+  fi
+  if ! command -v node >/dev/null 2>&1; then
+    log "warning: node not on PATH — computer tools daemon cannot start"
+    phase_end toolsd_launch skipped
+    return 0
+  fi
+  # Its own log file, NOT $LOG (see launch_browser_sidecar): toolsd logs request
+  # outcomes, never commands, output or keys.
+  log "starting computer tools daemon (node $EZIL_TOOLSD_ENTRY) on 0.0.0.0:${EZIL_TOOLSD_PORT} — log $EZIL_TOOLSD_LOG"
+  env -i \
+    PATH=/usr/local/bin:/usr/bin:/bin \
+    HOME=/root \
+    LANG=C.UTF-8 \
+    EZIL_TOOLSD_SEED="$EZIL_AI_PROXY_TOKEN" \
+    EZIL_TOOLSD_WORKSPACE="$WORKSPACE_ROOT" \
+    EZIL_TOOLSD_PORT="$EZIL_TOOLSD_PORT" \
+    "$(command -v node)" "$EZIL_TOOLSD_ENTRY" >>"$EZIL_TOOLSD_LOG" 2>&1 9>&- &
+  local toolsd_pid=$!
+  # Tracked so teardown stops it with everything else this boot started.
+  SESSION_PID+=("$toolsd_pid")
+  if wait_tcp 127.0.0.1 "$EZIL_TOOLSD_PORT" 20; then
+    log "computer tools daemon is serving on ${EZIL_TOOLSD_PORT}"
+    phase_end toolsd_launch ok
+  else
+    log "warning: computer tools daemon did not open ${EZIL_TOOLSD_PORT} within timeout (non-fatal — see $EZIL_TOOLSD_LOG)"
+    phase_end toolsd_launch error
+  fi
+  return 0
+}
+
 # ── X display ────────────────────────────────────────────────────────────────
 # Neko's desktop manager connects to $DISPLAY at startup and panics if it is
 # unavailable, so the X server MUST be up before `neko serve` launches. Keyed
@@ -3120,6 +3186,11 @@ fi
 # both branches — the preview is worth having even on a boot where neko never
 # came up, and by this point it cannot influence that outcome either way.
 launch_devserver
+
+# ── Computer tools daemon — same call-site reasoning as launch_devserver ──────
+# Non-fatal like the sidecar below; started before it so neither waits on the
+# other's slower failure path for long (its own wait is 20 s).
+launch_toolsd
 
 # ── Browser sidecar — same call-site reasoning as launch_devserver above ─────
 # After the readiness verdict, after the neko bind. See launch_browser_sidecar's
