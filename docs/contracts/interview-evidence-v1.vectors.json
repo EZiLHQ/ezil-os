@@ -1,0 +1,1405 @@
+{
+  "contract": "ezil.interview.evidence.v1",
+  "version": "1.0.0",
+  "status": "Frozen 2026-11-21 for RUN-1121 WS1 by the lead. Staging only.",
+  "doc": "docs/contracts/interview-evidence-v1.md",
+  "schema": "docs/contracts/interview-evidence-v1.schema.json",
+  "notice": {
+    "version": 1,
+    "encoding": "utf-8",
+    "lineEnding": "LF",
+    "bytes": 1972,
+    "sha256": "a73e2521409a299375aeac8dfb21d95a7daab7e788405d6dda4e4a064f0e7336",
+    "text": "EZiL interview recording notice (version 1)\n\nThis is a recorded interview on EZiL OS staging. Read what is recorded before your computer opens. Nothing is recorded before you accept, and recording stops when the interviewer finishes the interview.\n\nWhat is recorded:\n- Which EZiL ID, EZiL OS account and EZiL Works account you use for this interview.\n- When this interview repository was created and prepared, and each time Git access to it is renewed. Renewals happen only while you are active in Code, so they do not show how long the repository was open.\n- Your commits and pushes to this repository: branch, commit IDs, messages, authors and times. Your pushes are not run on any test runner.\n- Every AI request made from your EZiL OS account during the interview: the model, timing, token counts, and the full prompt and response, including any code or file content sent with it (up to 2 MB per request).\n- Whether this browser tab is visible or hidden, whether this window has focus, which EZiL OS app is focused, and how long since Code was last visible and focused, in buckets: under 15 seconds, 15 to 60 seconds, 1 to 5 minutes, over 5 minutes.\n- When each AI agent request in Code starts and ends, with the number of tool calls it made of each kind: read, search, write, other.\n\nWhat is not recorded: camera, microphone, face data, screenshots, keystrokes, clipboard, the web addresses you visit, or anything outside this staging account.\n\nWhat cannot be known from this record: where you were or what you did while this tab was hidden; other devices or monitors; whether you were reading or away while the tab was visible but idle. A gap in the record means unknown, not away.\n\nRetention: AI prompts and responses are kept for 14 days and activity records for 30 days. The interviewer keeps the exported timeline. This record is not scored, and no attention or cheating judgement is made from it.\n\nAfter the interview is finished, this repository is read-only.\n"
+  },
+  "types": {
+    "closed": [
+      "repo.created",
+      "repo.seeded",
+      "git.grant_issued",
+      "git.push",
+      "repo.frozen",
+      "consent.accepted",
+      "interview.started",
+      "computer.opened",
+      "tab.visibility",
+      "window.focus",
+      "app.focus",
+      "presence.idle",
+      "session.heartbeat",
+      "agent.turn_start",
+      "agent.turn_end",
+      "interview.finished",
+      "model.request",
+      "prompt.captured"
+    ],
+    "bySource": {
+      "works": [
+        "repo.created",
+        "repo.seeded",
+        "git.grant_issued",
+        "git.push",
+        "repo.frozen"
+      ],
+      "os": [
+        "consent.accepted",
+        "interview.started",
+        "computer.opened",
+        "tab.visibility",
+        "window.focus",
+        "app.focus",
+        "presence.idle",
+        "session.heartbeat",
+        "agent.turn_start",
+        "agent.turn_end",
+        "interview.finished"
+      ],
+      "gateway": [
+        "model.request",
+        "prompt.captured"
+      ]
+    },
+    "osClientReported": [
+      "tab.visibility",
+      "window.focus",
+      "app.focus",
+      "presence.idle",
+      "session.heartbeat",
+      "agent.turn_end"
+    ],
+    "osServerOnly": [
+      "consent.accepted",
+      "interview.started",
+      "computer.opened",
+      "agent.turn_start",
+      "interview.finished"
+    ],
+    "tieBreakOrder": [
+      "repo.created",
+      "repo.seeded",
+      "git.grant_issued",
+      "git.push",
+      "repo.frozen",
+      "consent.accepted",
+      "interview.started",
+      "computer.opened",
+      "tab.visibility",
+      "window.focus",
+      "app.focus",
+      "presence.idle",
+      "session.heartbeat",
+      "agent.turn_start",
+      "agent.turn_end",
+      "interview.finished",
+      "model.request",
+      "prompt.captured"
+    ]
+  },
+  "identityExample": {
+    "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+    "repositoryId": "4211",
+    "canonicalURL": "https://git-qa.ezil.work/candidate-a/interview-1121.git",
+    "osUserId": "3b9e2a71-0c4d-4f5e-8a6b-1d2c3e4f5a6b",
+    "ezilIdSubject": "auth0|65f0c1d2e3a4b5c6d7e8f901",
+    "worksAccountId": "1187"
+  },
+  "ordering": {
+    "timeline": "sort by (at, source works<os<gateway, seq)",
+    "sourceOrder": [
+      "works",
+      "os",
+      "gateway"
+    ],
+    "seq": "1-based, gapless per (interviewId, source); OS stores it at insert, Works and gateway assign it per evidence response in (at, tieBreakOrder, natural row id) order"
+  },
+  "presenceIdleBuckets": [
+    {
+      "lastPresenceAgoMs": 0,
+      "bucket": "<15s"
+    },
+    {
+      "lastPresenceAgoMs": 14999,
+      "bucket": "<15s"
+    },
+    {
+      "lastPresenceAgoMs": 15000,
+      "bucket": "15-60s"
+    },
+    {
+      "lastPresenceAgoMs": 59999,
+      "bucket": "15-60s"
+    },
+    {
+      "lastPresenceAgoMs": 60000,
+      "bucket": "1-5m"
+    },
+    {
+      "lastPresenceAgoMs": 299999,
+      "bucket": "1-5m"
+    },
+    {
+      "lastPresenceAgoMs": 300000,
+      "bucket": ">5m"
+    }
+  ],
+  "turnStartDerivation": {
+    "turnEnd": {
+      "at": "2026-11-22T09:08:04.000Z",
+      "durationMs": 6000
+    },
+    "turnStart": {
+      "at": "2026-11-22T09:07:58.000Z",
+      "derived": true
+    },
+    "rule": "turn_start.at = turn_end.at - durationMs, both server time; the server writes turn_start immediately before turn_end (seq n, n+1)"
+  },
+  "stateMachine": {
+    "states": [
+      "registered",
+      "consented",
+      "started",
+      "finished"
+    ],
+    "allowed": [
+      [
+        "registered",
+        "consented"
+      ],
+      [
+        "consented",
+        "started"
+      ],
+      [
+        "registered",
+        "finished"
+      ],
+      [
+        "consented",
+        "finished"
+      ],
+      [
+        "started",
+        "finished"
+      ]
+    ],
+    "refused": [
+      [
+        "consented",
+        "registered"
+      ],
+      [
+        "started",
+        "consented"
+      ],
+      [
+        "finished",
+        "started"
+      ],
+      [
+        "registered",
+        "started"
+      ]
+    ],
+    "eventWritesAllowedIn": {
+      "consent.accepted": "the transaction moving registered->consented",
+      "interview.finished": "the transaction moving consented|started->finished",
+      "*": "started only"
+    }
+  },
+  "refusals": {
+    "gateOff": {
+      "works": [
+        404,
+        "not_found"
+      ],
+      "osShell": [
+        404,
+        "not_found"
+      ],
+      "osAdmin": [
+        404,
+        "not_found"
+      ],
+      "gateway": [
+        404,
+        "not_found"
+      ]
+    },
+    "works": {
+      "notQaAutomation": [
+        403,
+        "qa_automation_required"
+      ],
+      "pushTestsOn": [
+        409,
+        "push_tests_enabled"
+      ],
+      "noBuilderAccount": [
+        422,
+        "candidate_not_builder"
+      ],
+      "idempotencyConflict": [
+        409,
+        "idempotency_conflict"
+      ],
+      "seededTwiceDifferentSha": [
+        409,
+        "already_seeded"
+      ],
+      "seededAfterFinish": [
+        409,
+        "interview_finished"
+      ],
+      "unknownInterview": [
+        404,
+        "not_found"
+      ]
+    },
+    "osConsent": {
+      "notCandidate": [
+        404,
+        "repo_not_found"
+      ],
+      "noEzilIdSubject": [
+        409,
+        "IDENTITY_REFRESH_REQUIRED"
+      ],
+      "noticeMismatch": [
+        409,
+        "notice_mismatch"
+      ],
+      "wrongState": [
+        409,
+        "interview_state"
+      ]
+    },
+    "osEvents": {
+      "notCandidateOrNotStarted": [
+        404,
+        "not_found"
+      ],
+      "disallowedTypeOrBadData": [
+        400,
+        "invalid_event"
+      ],
+      "over120PerMinute": [
+        429,
+        "rate_limited"
+      ],
+      "batchOver20": [
+        400,
+        "invalid_event"
+      ]
+    },
+    "osAdmin": {
+      "noBearer": [
+        401,
+        "unauthorized"
+      ],
+      "notTelemetryAdmin": [
+        403,
+        "forbidden"
+      ],
+      "startNotConsented": [
+        409,
+        "interview_state"
+      ],
+      "registerConflict": [
+        409,
+        "conflict"
+      ]
+    },
+    "osOpenGate": {
+      "notCandidate": [
+        404,
+        "repo_not_found"
+      ],
+      "registeredOrConsented": [
+        409,
+        "interview_not_started"
+      ],
+      "finished": [
+        409,
+        "interview_finished"
+      ]
+    },
+    "gateway": {
+      "retentionNot14": [
+        400,
+        "invalid_request"
+      ],
+      "otherActiveConsentForMember": [
+        409,
+        "consent_active"
+      ],
+      "noConsentForInterview": [
+        404,
+        "not_found"
+      ]
+    }
+  },
+  "openGateCases": [
+    {
+      "case": "gate off",
+      "result": {
+        "kind": "none"
+      }
+    },
+    {
+      "case": "no interview for the URL",
+      "result": {
+        "kind": "none"
+      }
+    },
+    {
+      "case": "registered, caller is the candidate",
+      "result": {
+        "kind": "refuse",
+        "status": 409,
+        "code": "interview_not_started"
+      }
+    },
+    {
+      "case": "consented, caller is the candidate",
+      "result": {
+        "kind": "refuse",
+        "status": 409,
+        "code": "interview_not_started"
+      }
+    },
+    {
+      "case": "started, caller is the candidate, purpose open",
+      "result": {
+        "kind": "allow",
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13"
+      },
+      "writes": [
+        "computer.opened"
+      ]
+    },
+    {
+      "case": "started, caller is the candidate, purpose renew",
+      "result": {
+        "kind": "allow",
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13"
+      },
+      "writes": []
+    },
+    {
+      "case": "any state, caller is another EZiL ID",
+      "result": {
+        "kind": "refuse",
+        "status": 404,
+        "code": "repo_not_found"
+      },
+      "writes": []
+    },
+    {
+      "case": "finished, caller is the candidate",
+      "result": {
+        "kind": "refuse",
+        "status": 409,
+        "code": "interview_finished"
+      },
+      "writes": []
+    }
+  ],
+  "retention": {
+    "gatewayCaptureDays": 14,
+    "osActivityDays": 30,
+    "worksSeedTokenMaxSeconds": 300,
+    "ownerGrantMaxSeconds": 300
+  },
+  "cannotBeKnown": [
+    "Where the candidate was or what they did while the tab was hidden.",
+    "Other devices or monitors.",
+    "Whether the candidate was reading or away while the tab was visible but idle.",
+    "A gap in the record, including a heartbeat gap, means unknown, not away."
+  ],
+  "observationRule": "an observation is an [agent.turn_start.at, agent.turn_end.at] span (same requestId) that overlaps a span where tab.visibility is hidden (agent_turn_while_hidden), window.focus is false (agent_turn_while_blurred) or presence.idle is >5m (agent_turn_while_idle_over_5m); from/to are the overlap, refs the requestId, label 'observation'",
+  "envelope": {
+    "valid": [
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "works",
+        "seq": 1,
+        "type": "repo.created",
+        "at": "2026-11-22T09:00:00.000Z",
+        "data": {
+          "repositoryId": "4211",
+          "canonicalURL": "https://git-qa.ezil.work/candidate-a/interview-1121.git",
+          "handle": "candidate-a",
+          "name": "interview-1121"
+        }
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "works",
+        "seq": 2,
+        "type": "repo.seeded",
+        "at": "2026-11-22T09:00:20.000Z",
+        "data": {
+          "headSha": "1111111111111111111111111111111111111111"
+        }
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "os",
+        "seq": 1,
+        "type": "consent.accepted",
+        "at": "2026-11-22T09:05:00.000Z",
+        "data": {
+          "noticeVersion": 1,
+          "noticeSha256": "a73e2521409a299375aeac8dfb21d95a7daab7e788405d6dda4e4a064f0e7336"
+        }
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "os",
+        "seq": 2,
+        "type": "interview.started",
+        "at": "2026-11-22T09:06:00.000Z",
+        "data": {}
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "os",
+        "seq": 3,
+        "type": "computer.opened",
+        "at": "2026-11-22T09:06:30.000Z",
+        "data": {
+          "computerId": "cmp_8f2a1c"
+        }
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "works",
+        "seq": 3,
+        "type": "git.grant_issued",
+        "at": "2026-11-22T09:06:31.000Z",
+        "data": {
+          "scope": "write",
+          "reason": "selfserve_owner",
+          "expiresAt": "2026-11-22T09:11:31.000Z",
+          "presenceGated": true
+        }
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "os",
+        "seq": 4,
+        "type": "tab.visibility",
+        "at": "2026-11-22T09:06:40.000Z",
+        "data": {
+          "state": "visible"
+        },
+        "clientAt": "2026-11-22T09:06:39.512Z"
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "os",
+        "seq": 5,
+        "type": "window.focus",
+        "at": "2026-11-22T09:06:40.000Z",
+        "data": {
+          "focused": true
+        },
+        "clientAt": "2026-11-22T09:06:39.512Z"
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "os",
+        "seq": 6,
+        "type": "app.focus",
+        "at": "2026-11-22T09:06:40.000Z",
+        "data": {
+          "app": "code"
+        },
+        "clientAt": "2026-11-22T09:06:39.512Z"
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "os",
+        "seq": 7,
+        "type": "presence.idle",
+        "at": "2026-11-22T09:06:40.000Z",
+        "data": {
+          "bucket": "<15s"
+        },
+        "clientAt": "2026-11-22T09:06:39.512Z"
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "os",
+        "seq": 8,
+        "type": "session.heartbeat",
+        "at": "2026-11-22T09:07:40.000Z",
+        "data": {},
+        "clientAt": "2026-11-22T09:07:39.600Z"
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "os",
+        "seq": 9,
+        "type": "agent.turn_start",
+        "at": "2026-11-22T09:07:58.000Z",
+        "data": {
+          "requestId": "9d8e7f60-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+          "derived": true
+        }
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "gateway",
+        "seq": 1,
+        "type": "model.request",
+        "at": "2026-11-22T09:08:00.000Z",
+        "data": {
+          "requestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+          "modelAlias": "claude-sonnet",
+          "upstreamModel": "anthropic.claude-sonnet-5-5",
+          "outcome": "ok",
+          "tokens": {
+            "input": 1200,
+            "cachedInput": 0,
+            "cacheWrite": 0,
+            "output": 300,
+            "reasoning": null
+          },
+          "ttftMs": 900,
+          "totalMs": 4000,
+          "attribution": "subject_window"
+        }
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "gateway",
+        "seq": 2,
+        "type": "prompt.captured",
+        "at": "2026-11-22T09:08:00.000Z",
+        "data": {
+          "requestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+          "endpoint": "messages",
+          "truncated": false,
+          "reqBytes": 5120,
+          "respBytes": 2048,
+          "purged": false,
+          "content": {
+            "request": {
+              "messages": [
+                {
+                  "role": "user",
+                  "content": "Add a test for parse()"
+                }
+              ]
+            },
+            "response": "event: message_start\n..."
+          }
+        }
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "os",
+        "seq": 10,
+        "type": "agent.turn_end",
+        "at": "2026-11-22T09:08:04.000Z",
+        "data": {
+          "requestId": "9d8e7f60-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+          "gatewayRequestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+          "modelAlias": "claude-sonnet",
+          "durationMs": 6000,
+          "outcome": "completed",
+          "toolCalls": {
+            "read": 2,
+            "search": 1,
+            "write": 1,
+            "other": 0
+          }
+        },
+        "clientAt": "2026-11-22T09:08:03.900Z"
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "os",
+        "seq": 11,
+        "type": "tab.visibility",
+        "at": "2026-11-22T09:20:00.000Z",
+        "data": {
+          "state": "hidden"
+        },
+        "clientAt": "2026-11-22T09:19:59.950Z"
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "works",
+        "seq": 4,
+        "type": "git.push",
+        "at": "2026-11-22T09:30:00.000Z",
+        "data": {
+          "ref": "refs/heads/main",
+          "before": "1111111111111111111111111111111111111111",
+          "after": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "commits": [
+            {
+              "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+              "message": "Add parse test",
+              "messageTruncated": false,
+              "author": "Candidate A <a@example.com>",
+              "committedAt": "2026-11-22T09:29:40.000Z"
+            }
+          ],
+          "truncated": false
+        }
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "os",
+        "seq": 12,
+        "type": "interview.finished",
+        "at": "2026-11-22T09:45:00.000Z",
+        "data": {}
+      },
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "works",
+        "seq": 5,
+        "type": "repo.frozen",
+        "at": "2026-11-22T09:45:02.000Z",
+        "data": {}
+      }
+    ],
+    "invalid": [
+      {
+        "why": "unknown type",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 10,
+          "type": "input.idle",
+          "at": "2026-11-22T09:08:04.000Z",
+          "data": {
+            "requestId": "9d8e7f60-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+            "gatewayRequestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "modelAlias": "claude-sonnet",
+            "durationMs": 6000,
+            "outcome": "completed",
+            "toolCalls": {
+              "read": 2,
+              "search": 1,
+              "write": 1,
+              "other": 0
+            }
+          },
+          "clientAt": "2026-11-22T09:08:03.900Z"
+        }
+      },
+      {
+        "why": "server-only type from the wrong source",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 5,
+          "type": "repo.frozen",
+          "at": "2026-11-22T09:45:02.000Z",
+          "data": {}
+        }
+      },
+      {
+        "why": "extra envelope key",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 10,
+          "type": "agent.turn_end",
+          "at": "2026-11-22T09:08:04.000Z",
+          "data": {
+            "requestId": "9d8e7f60-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+            "gatewayRequestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "modelAlias": "claude-sonnet",
+            "durationMs": 6000,
+            "outcome": "completed",
+            "toolCalls": {
+              "read": 2,
+              "search": 1,
+              "write": 1,
+              "other": 0
+            }
+          },
+          "clientAt": "2026-11-22T09:08:03.900Z",
+          "extra": 1
+        }
+      },
+      {
+        "why": "extra data key",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 10,
+          "type": "agent.turn_end",
+          "at": "2026-11-22T09:08:04.000Z",
+          "data": {
+            "requestId": "9d8e7f60-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+            "gatewayRequestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "modelAlias": "claude-sonnet",
+            "durationMs": 6000,
+            "outcome": "completed",
+            "toolCalls": {
+              "read": 2,
+              "search": 1,
+              "write": 1,
+              "other": 0
+            },
+            "keystrokes": 3
+          },
+          "clientAt": "2026-11-22T09:08:03.900Z"
+        }
+      },
+      {
+        "why": "missing data key",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 10,
+          "type": "agent.turn_end",
+          "at": "2026-11-22T09:08:04.000Z",
+          "data": {
+            "requestId": "9d8e7f60-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+            "gatewayRequestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "modelAlias": "claude-sonnet",
+            "durationMs": 6000,
+            "outcome": "completed"
+          },
+          "clientAt": "2026-11-22T09:08:03.900Z"
+        }
+      },
+      {
+        "why": "seq 0",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 0,
+          "type": "agent.turn_end",
+          "at": "2026-11-22T09:08:04.000Z",
+          "data": {
+            "requestId": "9d8e7f60-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+            "gatewayRequestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "modelAlias": "claude-sonnet",
+            "durationMs": 6000,
+            "outcome": "completed",
+            "toolCalls": {
+              "read": 2,
+              "search": 1,
+              "write": 1,
+              "other": 0
+            }
+          },
+          "clientAt": "2026-11-22T09:08:03.900Z"
+        }
+      },
+      {
+        "why": "at without milliseconds",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 10,
+          "type": "agent.turn_end",
+          "at": "2026-11-22T09:08:04Z",
+          "data": {
+            "requestId": "9d8e7f60-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+            "gatewayRequestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "modelAlias": "claude-sonnet",
+            "durationMs": 6000,
+            "outcome": "completed",
+            "toolCalls": {
+              "read": 2,
+              "search": 1,
+              "write": 1,
+              "other": 0
+            }
+          },
+          "clientAt": "2026-11-22T09:08:03.900Z"
+        }
+      },
+      {
+        "why": "at not UTC",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 10,
+          "type": "agent.turn_end",
+          "at": "2026-11-22T09:08:04.000+05:30",
+          "data": {
+            "requestId": "9d8e7f60-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+            "gatewayRequestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "modelAlias": "claude-sonnet",
+            "durationMs": 6000,
+            "outcome": "completed",
+            "toolCalls": {
+              "read": 2,
+              "search": 1,
+              "write": 1,
+              "other": 0
+            }
+          },
+          "clientAt": "2026-11-22T09:08:03.900Z"
+        }
+      },
+      {
+        "why": "uppercase interviewId",
+        "event": {
+          "v": 1,
+          "interviewId": "7C1F3F0E-5B8A-4C2D-9E41-0A6B2D9F8E13",
+          "source": "os",
+          "seq": 10,
+          "type": "agent.turn_end",
+          "at": "2026-11-22T09:08:04.000Z",
+          "data": {
+            "requestId": "9d8e7f60-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+            "gatewayRequestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "modelAlias": "claude-sonnet",
+            "durationMs": 6000,
+            "outcome": "completed",
+            "toolCalls": {
+              "read": 2,
+              "search": 1,
+              "write": 1,
+              "other": 0
+            }
+          },
+          "clientAt": "2026-11-22T09:08:03.900Z"
+        }
+      },
+      {
+        "why": "v 2",
+        "event": {
+          "v": 2,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 10,
+          "type": "agent.turn_end",
+          "at": "2026-11-22T09:08:04.000Z",
+          "data": {
+            "requestId": "9d8e7f60-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+            "gatewayRequestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "modelAlias": "claude-sonnet",
+            "durationMs": 6000,
+            "outcome": "completed",
+            "toolCalls": {
+              "read": 2,
+              "search": 1,
+              "write": 1,
+              "other": 0
+            }
+          },
+          "clientAt": "2026-11-22T09:08:03.900Z"
+        }
+      },
+      {
+        "why": "clientAt on a server type",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 2,
+          "type": "interview.started",
+          "at": "2026-11-22T09:06:00.000Z",
+          "data": {},
+          "clientAt": "2026-11-22T09:06:00.000Z"
+        }
+      },
+      {
+        "why": "turn_start not derived",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 9,
+          "type": "agent.turn_start",
+          "at": "2026-11-22T09:07:58.000Z",
+          "data": {
+            "requestId": "9d8e7f60-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+            "derived": false
+          }
+        }
+      },
+      {
+        "why": "idle bucket outside the list",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 7,
+          "type": "presence.idle",
+          "at": "2026-11-22T09:06:40.000Z",
+          "data": {
+            "bucket": "5-15m"
+          },
+          "clientAt": "2026-11-22T09:06:39.512Z"
+        }
+      },
+      {
+        "why": "notice sha mismatch",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 1,
+          "type": "consent.accepted",
+          "at": "2026-11-22T09:05:00.000Z",
+          "data": {
+            "noticeVersion": 1,
+            "noticeSha256": "0000000000000000000000000000000000000000000000000000000000000000"
+          }
+        }
+      },
+      {
+        "why": "grant not presence-gated",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "works",
+          "seq": 3,
+          "type": "git.grant_issued",
+          "at": "2026-11-22T09:06:31.000Z",
+          "data": {
+            "scope": "write",
+            "reason": "selfserve_owner",
+            "expiresAt": "2026-11-22T09:11:31.000Z",
+            "presenceGated": false
+          }
+        }
+      },
+      {
+        "why": "purged capture with content",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "gateway",
+          "seq": 2,
+          "type": "prompt.captured",
+          "at": "2026-11-22T09:08:00.000Z",
+          "data": {
+            "requestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "endpoint": "messages",
+            "truncated": false,
+            "reqBytes": 5120,
+            "respBytes": 2048,
+            "purged": true,
+            "content": {
+              "request": {
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "Add a test for parse()"
+                  }
+                ]
+              },
+              "response": "event: message_start\n..."
+            }
+          }
+        }
+      },
+      {
+        "why": "attribution assignment (dropped in this slice)",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "gateway",
+          "seq": 1,
+          "type": "model.request",
+          "at": "2026-11-22T09:08:00.000Z",
+          "data": {
+            "requestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "modelAlias": "claude-sonnet",
+            "upstreamModel": "anthropic.claude-sonnet-5-5",
+            "outcome": "ok",
+            "tokens": {
+              "input": 1200,
+              "cachedInput": 0,
+              "cacheWrite": 0,
+              "output": 300,
+              "reasoning": null
+            },
+            "ttftMs": 900,
+            "totalMs": 4000,
+            "attribution": "assignment"
+          }
+        }
+      }
+    ]
+  },
+  "timeline": {
+    "valid": {
+      "kind": "ezil.interview.timeline.v1",
+      "v": 1,
+      "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+      "identity": {
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "repositoryId": "4211",
+        "canonicalURL": "https://git-qa.ezil.work/candidate-a/interview-1121.git",
+        "osUserId": "3b9e2a71-0c4d-4f5e-8a6b-1d2c3e4f5a6b",
+        "ezilIdSubject": "auth0|65f0c1d2e3a4b5c6d7e8f901",
+        "worksAccountId": "1187"
+      },
+      "generatedAt": "2026-11-22T10:00:00.000Z",
+      "noticeSha256": "a73e2521409a299375aeac8dfb21d95a7daab7e788405d6dda4e4a064f0e7336",
+      "sources": {
+        "works": {
+          "count": 5,
+          "pushTestRuns": 0
+        },
+        "os": {
+          "count": 12
+        },
+        "gateway": {
+          "count": 2
+        }
+      },
+      "cannotBeKnown": [
+        "Where the candidate was or what they did while the tab was hidden.",
+        "Other devices or monitors.",
+        "Whether the candidate was reading or away while the tab was visible but idle.",
+        "A gap in the record, including a heartbeat gap, means unknown, not away."
+      ],
+      "observations": [],
+      "events": [
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "works",
+          "seq": 1,
+          "type": "repo.created",
+          "at": "2026-11-22T09:00:00.000Z",
+          "data": {
+            "repositoryId": "4211",
+            "canonicalURL": "https://git-qa.ezil.work/candidate-a/interview-1121.git",
+            "handle": "candidate-a",
+            "name": "interview-1121"
+          }
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "works",
+          "seq": 2,
+          "type": "repo.seeded",
+          "at": "2026-11-22T09:00:20.000Z",
+          "data": {
+            "headSha": "1111111111111111111111111111111111111111"
+          }
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 1,
+          "type": "consent.accepted",
+          "at": "2026-11-22T09:05:00.000Z",
+          "data": {
+            "noticeVersion": 1,
+            "noticeSha256": "a73e2521409a299375aeac8dfb21d95a7daab7e788405d6dda4e4a064f0e7336"
+          }
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 2,
+          "type": "interview.started",
+          "at": "2026-11-22T09:06:00.000Z",
+          "data": {}
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 3,
+          "type": "computer.opened",
+          "at": "2026-11-22T09:06:30.000Z",
+          "data": {
+            "computerId": "cmp_8f2a1c"
+          }
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "works",
+          "seq": 3,
+          "type": "git.grant_issued",
+          "at": "2026-11-22T09:06:31.000Z",
+          "data": {
+            "scope": "write",
+            "reason": "selfserve_owner",
+            "expiresAt": "2026-11-22T09:11:31.000Z",
+            "presenceGated": true
+          }
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 4,
+          "type": "tab.visibility",
+          "at": "2026-11-22T09:06:40.000Z",
+          "data": {
+            "state": "visible"
+          },
+          "clientAt": "2026-11-22T09:06:39.512Z"
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 5,
+          "type": "window.focus",
+          "at": "2026-11-22T09:06:40.000Z",
+          "data": {
+            "focused": true
+          },
+          "clientAt": "2026-11-22T09:06:39.512Z"
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 6,
+          "type": "app.focus",
+          "at": "2026-11-22T09:06:40.000Z",
+          "data": {
+            "app": "code"
+          },
+          "clientAt": "2026-11-22T09:06:39.512Z"
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 7,
+          "type": "presence.idle",
+          "at": "2026-11-22T09:06:40.000Z",
+          "data": {
+            "bucket": "<15s"
+          },
+          "clientAt": "2026-11-22T09:06:39.512Z"
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 8,
+          "type": "session.heartbeat",
+          "at": "2026-11-22T09:07:40.000Z",
+          "data": {},
+          "clientAt": "2026-11-22T09:07:39.600Z"
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 9,
+          "type": "agent.turn_start",
+          "at": "2026-11-22T09:07:58.000Z",
+          "data": {
+            "requestId": "9d8e7f60-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+            "derived": true
+          }
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "gateway",
+          "seq": 1,
+          "type": "model.request",
+          "at": "2026-11-22T09:08:00.000Z",
+          "data": {
+            "requestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "modelAlias": "claude-sonnet",
+            "upstreamModel": "anthropic.claude-sonnet-5-5",
+            "outcome": "ok",
+            "tokens": {
+              "input": 1200,
+              "cachedInput": 0,
+              "cacheWrite": 0,
+              "output": 300,
+              "reasoning": null
+            },
+            "ttftMs": 900,
+            "totalMs": 4000,
+            "attribution": "subject_window"
+          }
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "gateway",
+          "seq": 2,
+          "type": "prompt.captured",
+          "at": "2026-11-22T09:08:00.000Z",
+          "data": {
+            "requestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "endpoint": "messages",
+            "truncated": false,
+            "reqBytes": 5120,
+            "respBytes": 2048,
+            "purged": false,
+            "content": {
+              "request": {
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "Add a test for parse()"
+                  }
+                ]
+              },
+              "response": "event: message_start\n..."
+            }
+          }
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 10,
+          "type": "agent.turn_end",
+          "at": "2026-11-22T09:08:04.000Z",
+          "data": {
+            "requestId": "9d8e7f60-1a2b-4c3d-8e9f-a0b1c2d3e4f5",
+            "gatewayRequestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "modelAlias": "claude-sonnet",
+            "durationMs": 6000,
+            "outcome": "completed",
+            "toolCalls": {
+              "read": 2,
+              "search": 1,
+              "write": 1,
+              "other": 0
+            }
+          },
+          "clientAt": "2026-11-22T09:08:03.900Z"
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 11,
+          "type": "tab.visibility",
+          "at": "2026-11-22T09:20:00.000Z",
+          "data": {
+            "state": "hidden"
+          },
+          "clientAt": "2026-11-22T09:19:59.950Z"
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "works",
+          "seq": 4,
+          "type": "git.push",
+          "at": "2026-11-22T09:30:00.000Z",
+          "data": {
+            "ref": "refs/heads/main",
+            "before": "1111111111111111111111111111111111111111",
+            "after": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "commits": [
+              {
+                "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "message": "Add parse test",
+                "messageTruncated": false,
+                "author": "Candidate A <a@example.com>",
+                "committedAt": "2026-11-22T09:29:40.000Z"
+              }
+            ],
+            "truncated": false
+          }
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "os",
+          "seq": 12,
+          "type": "interview.finished",
+          "at": "2026-11-22T09:45:00.000Z",
+          "data": {}
+        },
+        {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "works",
+          "seq": 5,
+          "type": "repo.frozen",
+          "at": "2026-11-22T09:45:02.000Z",
+          "data": {}
+        }
+      ]
+    },
+    "invalidCrossRecord": [
+      {
+        "why": "seq gap in os",
+        "patch": "remove the os event with seq 5"
+      },
+      {
+        "why": "events out of order",
+        "patch": "swap the first two events"
+      },
+      {
+        "why": "interviewId disagrees",
+        "patch": "set events[0].interviewId to another UUID"
+      },
+      {
+        "why": "pushTestRuns 1",
+        "patch": "set sources.works.pushTestRuns to 1"
+      },
+      {
+        "why": "source count disagrees",
+        "patch": "set sources.gateway.count to 3"
+      }
+    ]
+  },
+  "acceptanceTypes": [
+    "repo.created",
+    "repo.seeded",
+    "git.grant_issued",
+    "git.push",
+    "repo.frozen",
+    "consent.accepted",
+    "interview.started",
+    "computer.opened",
+    "tab.visibility",
+    "window.focus",
+    "app.focus",
+    "presence.idle",
+    "session.heartbeat",
+    "agent.turn_start",
+    "agent.turn_end",
+    "interview.finished",
+    "model.request",
+    "prompt.captured"
+  ]
+}

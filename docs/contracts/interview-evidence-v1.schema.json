@@ -1,0 +1,1476 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ezil.work/contracts/interview-evidence-v1.schema.json",
+  "title": "ezil.interview.event.v1 and ezil.interview.timeline.v1",
+  "description": "Frozen for RUN-1121 WS1. Validate an event against #/$defs/event and a timeline against #/$defs/timeline. Cross-record rules (gapless seq per source, ordering, interviewId agreement) are in interview-evidence-v1.md §2/§9 and the vectors; JSON Schema cannot express them.",
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "anyUuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^(?:[0-9a-f]{40}|[0-9a-f]{64})$"
+    },
+    "bigint": {
+      "type": "string",
+      "pattern": "^[1-9][0-9]{0,18}$"
+    },
+    "canonicalURL": {
+      "type": "string",
+      "pattern": "^https://git-qa\\.ezil\\.work/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?/[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?\\.git$",
+      "maxLength": 256
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "interviewId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "repositoryId": {
+          "$ref": "#/$defs/bigint"
+        },
+        "canonicalURL": {
+          "$ref": "#/$defs/canonicalURL"
+        },
+        "osUserId": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/anyUuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "ezilIdSubject": {
+          "type": "string",
+          "maxLength": 255,
+          "minLength": 1
+        },
+        "worksAccountId": {
+          "$ref": "#/$defs/bigint"
+        }
+      },
+      "required": [
+        "canonicalURL",
+        "ezilIdSubject",
+        "interviewId",
+        "osUserId",
+        "repositoryId",
+        "worksAccountId"
+      ]
+    },
+    "data:repo.created": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "repositoryId": {
+          "$ref": "#/$defs/bigint"
+        },
+        "canonicalURL": {
+          "$ref": "#/$defs/canonicalURL"
+        },
+        "handle": {
+          "type": "string",
+          "maxLength": 100,
+          "minLength": 1
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 100,
+          "minLength": 1
+        }
+      },
+      "required": [
+        "canonicalURL",
+        "handle",
+        "name",
+        "repositoryId"
+      ]
+    },
+    "data:repo.seeded": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "headSha": {
+          "$ref": "#/$defs/sha"
+        }
+      },
+      "required": [
+        "headSha"
+      ]
+    },
+    "data:git.grant_issued": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scope": {
+          "enum": [
+            "read",
+            "write"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "pattern": "^[a-z][a-z_]{0,63}$"
+        },
+        "expiresAt": {
+          "$ref": "#/$defs/at"
+        },
+        "presenceGated": {
+          "const": true
+        }
+      },
+      "required": [
+        "expiresAt",
+        "presenceGated",
+        "reason",
+        "scope"
+      ]
+    },
+    "data:git.push": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "ref": {
+          "type": "string",
+          "pattern": "^refs/heads/[A-Za-z0-9._/-]{1,240}$"
+        },
+        "before": {
+          "$ref": "#/$defs/sha"
+        },
+        "after": {
+          "$ref": "#/$defs/sha"
+        },
+        "commits": {
+          "type": "array",
+          "maxItems": 2048,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "sha": {
+                "$ref": "#/$defs/sha"
+              },
+              "message": {
+                "type": "string",
+                "maxLength": 65536
+              },
+              "messageTruncated": {
+                "type": "boolean"
+              },
+              "author": {
+                "type": "string",
+                "maxLength": 512
+              },
+              "committedAt": {
+                "$ref": "#/$defs/at"
+              }
+            },
+            "required": [
+              "author",
+              "committedAt",
+              "message",
+              "messageTruncated",
+              "sha"
+            ]
+          }
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "after",
+        "before",
+        "commits",
+        "ref",
+        "truncated"
+      ]
+    },
+    "data:repo.frozen": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "required": []
+    },
+    "data:consent.accepted": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "noticeVersion": {
+          "const": 1
+        },
+        "noticeSha256": {
+          "const": "a73e2521409a299375aeac8dfb21d95a7daab7e788405d6dda4e4a064f0e7336"
+        }
+      },
+      "required": [
+        "noticeSha256",
+        "noticeVersion"
+      ]
+    },
+    "data:interview.started": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "required": []
+    },
+    "data:computer.opened": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "computerId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{1,128}$"
+        }
+      },
+      "required": [
+        "computerId"
+      ]
+    },
+    "data:tab.visibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "state": {
+          "enum": [
+            "visible",
+            "hidden"
+          ]
+        }
+      },
+      "required": [
+        "state"
+      ]
+    },
+    "data:window.focus": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "focused": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "focused"
+      ]
+    },
+    "data:app.focus": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "app": {
+          "type": "string",
+          "pattern": "^(?:unknown|[a-z0-9][a-z0-9._-]{0,63})$"
+        }
+      },
+      "required": [
+        "app"
+      ]
+    },
+    "data:presence.idle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bucket": {
+          "enum": [
+            "<15s",
+            "15-60s",
+            "1-5m",
+            ">5m"
+          ]
+        }
+      },
+      "required": [
+        "bucket"
+      ]
+    },
+    "data:session.heartbeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "required": []
+    },
+    "data:agent.turn_start": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "$ref": "#/$defs/anyUuid"
+        },
+        "derived": {
+          "const": true
+        }
+      },
+      "required": [
+        "derived",
+        "requestId"
+      ]
+    },
+    "data:agent.turn_end": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "$ref": "#/$defs/anyUuid"
+        },
+        "gatewayRequestId": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/anyUuid"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "modelAlias": {
+          "type": "string",
+          "pattern": "^(?:unknown|[A-Za-z][A-Za-z0-9_.:-]{0,127})$"
+        },
+        "durationMs": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "outcome": {
+          "enum": [
+            "completed",
+            "failed",
+            "cancelled"
+          ]
+        },
+        "toolCalls": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "read": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "search": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "write": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "other": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "other",
+            "read",
+            "search",
+            "write"
+          ]
+        }
+      },
+      "required": [
+        "durationMs",
+        "gatewayRequestId",
+        "modelAlias",
+        "outcome",
+        "requestId",
+        "toolCalls"
+      ]
+    },
+    "data:interview.finished": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {},
+      "required": []
+    },
+    "data:model.request": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "$ref": "#/$defs/anyUuid"
+        },
+        "modelAlias": {
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1
+        },
+        "upstreamModel": {
+          "oneOf": [
+            {
+              "type": "string",
+              "maxLength": 256,
+              "minLength": 1
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "outcome": {
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 1
+        },
+        "tokens": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "input": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "cachedInput": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "cacheWrite": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "output": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "reasoning": {
+              "oneOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "cacheWrite",
+            "cachedInput",
+            "input",
+            "output",
+            "reasoning"
+          ]
+        },
+        "ttftMs": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "totalMs": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "attribution": {
+          "const": "subject_window"
+        }
+      },
+      "required": [
+        "attribution",
+        "modelAlias",
+        "outcome",
+        "requestId",
+        "tokens",
+        "totalMs",
+        "ttftMs",
+        "upstreamModel"
+      ]
+    },
+    "data:prompt.captured": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "requestId": {
+          "$ref": "#/$defs/anyUuid"
+        },
+        "endpoint": {
+          "enum": [
+            "messages",
+            "responses"
+          ]
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "reqBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "respBytes": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "purged": {
+          "type": "boolean"
+        },
+        "content": {
+          "oneOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "request": {},
+                "response": {}
+              },
+              "required": [
+                "request",
+                "response"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "content",
+        "endpoint",
+        "purged",
+        "reqBytes",
+        "requestId",
+        "respBytes",
+        "truncated"
+      ],
+      "if": {
+        "properties": {
+          "purged": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "content": {
+            "type": "null"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "content": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "event": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "works"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "repo.created"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:repo.created"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "works"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "repo.seeded"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:repo.seeded"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "works"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "git.grant_issued"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:git.grant_issued"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "works"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "git.push"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:git.push"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "works"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "repo.frozen"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:repo.frozen"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "os"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "consent.accepted"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:consent.accepted"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "os"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "interview.started"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:interview.started"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "os"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "computer.opened"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:computer.opened"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "os"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "tab.visibility"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:tab.visibility"
+            },
+            "clientAt": {
+              "$ref": "#/$defs/at"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "os"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "window.focus"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:window.focus"
+            },
+            "clientAt": {
+              "$ref": "#/$defs/at"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "os"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "app.focus"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:app.focus"
+            },
+            "clientAt": {
+              "$ref": "#/$defs/at"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "os"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "presence.idle"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:presence.idle"
+            },
+            "clientAt": {
+              "$ref": "#/$defs/at"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "os"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "session.heartbeat"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:session.heartbeat"
+            },
+            "clientAt": {
+              "$ref": "#/$defs/at"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "os"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "agent.turn_start"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:agent.turn_start"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "os"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "agent.turn_end"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:agent.turn_end"
+            },
+            "clientAt": {
+              "$ref": "#/$defs/at"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "os"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "interview.finished"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:interview.finished"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "gateway"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "model.request"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:model.request"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "v": {
+              "const": 1
+            },
+            "interviewId": {
+              "$ref": "#/$defs/uuid"
+            },
+            "source": {
+              "const": "gateway"
+            },
+            "seq": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "type": {
+              "const": "prompt.captured"
+            },
+            "at": {
+              "$ref": "#/$defs/at"
+            },
+            "data": {
+              "$ref": "#/$defs/data:prompt.captured"
+            }
+          },
+          "required": [
+            "v",
+            "interviewId",
+            "source",
+            "seq",
+            "type",
+            "at",
+            "data"
+          ]
+        }
+      ]
+    },
+    "timeline": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "ezil.interview.timeline.v1"
+        },
+        "v": {
+          "const": 1
+        },
+        "interviewId": {
+          "$ref": "#/$defs/uuid"
+        },
+        "identity": {
+          "$ref": "#/$defs/identity"
+        },
+        "generatedAt": {
+          "$ref": "#/$defs/at"
+        },
+        "noticeSha256": {
+          "const": "a73e2521409a299375aeac8dfb21d95a7daab7e788405d6dda4e4a064f0e7336"
+        },
+        "sources": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "works": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "count": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "pushTestRuns": {
+                  "const": 0
+                }
+              },
+              "required": [
+                "count",
+                "pushTestRuns"
+              ]
+            },
+            "os": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "count": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "count"
+              ]
+            },
+            "gateway": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "count": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                }
+              },
+              "required": [
+                "count"
+              ]
+            }
+          },
+          "required": [
+            "gateway",
+            "os",
+            "works"
+          ]
+        },
+        "cannotBeKnown": {
+          "type": "array",
+          "minItems": 4,
+          "maxItems": 4,
+          "items": {
+            "type": "string"
+          }
+        },
+        "observations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "kind": {
+                "enum": [
+                  "agent_turn_while_hidden",
+                  "agent_turn_while_blurred",
+                  "agent_turn_while_idle_over_5m"
+                ]
+              },
+              "from": {
+                "$ref": "#/$defs/at"
+              },
+              "to": {
+                "$ref": "#/$defs/at"
+              },
+              "label": {
+                "const": "observation"
+              },
+              "refs": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "$ref": "#/$defs/anyUuid"
+                }
+              }
+            },
+            "required": [
+              "from",
+              "kind",
+              "label",
+              "refs",
+              "to"
+            ]
+          }
+        },
+        "events": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/event"
+          }
+        }
+      },
+      "required": [
+        "cannotBeKnown",
+        "events",
+        "generatedAt",
+        "identity",
+        "interviewId",
+        "kind",
+        "noticeSha256",
+        "observations",
+        "sources",
+        "v"
+      ]
+    }
+  }
+}
