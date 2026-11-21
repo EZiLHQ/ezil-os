@@ -206,6 +206,16 @@ every launch and moves history already in a profile's `workspaceStorage/*/chatSe
 never overwriting. The patches below make the store use that folder and the list follow the files,
 so the one copy rides on checkpoints, restore and moves.
 
+A managed Git link opens `<workspace>/projects/<repository UUID>` in Code. The wrapper stays
+checkout-only. Chat stores its files in `<workspace>/.ezil/repo-chat/<repository UUID>` so the
+same checkout can reopen them across browser origins. On the first read, the workbench moves
+session files from its matching browser profile directory into that repository's history.
+If the same session ID is already stored there, the profile file is preserved in a
+`.legacy-<profile ID>` subdirectory. At startup, the editor can also restore profiles with
+matching workspace metadata, including a marker recorded by the repository view if durable
+storage was temporarily unavailable. Repository ownership is never inferred from files
+already imported into the default workspace.
+
 Keeping it out of user Git: the running editor recreates `.ezil/chat` on its next write if
 `.ezil` is removed (`FileService.writeFile` creates missing parents), for example by
 `git clean -x`/`-X` or a workspace replaced under it, and that write would not recreate the
@@ -230,7 +240,7 @@ rejected: it would remove conversations the user never deleted.
 
 | id | file / anchor | replacement / gate |
 |---|---|---|
-| `history-root` | workbench.js, end of the `ChatSessionStore` constructor: `this.storeTask&&S.join(this.storeTask,{id:"join.chatSessionStore",label:d(12652,null)})}))}async handleWorkspaceTransition(e,t){` | For a window with exactly one folder and no workspace file, queue as the store's first task: `stat(<folder>/.ezil/chat)`; a directory becomes `storageRoot`. Every read of `storageRoot` (`getStorageLocation`, reconcile, migration) runs in a later queued task; the only synchronous accessor, `getChatStorageFolder()`, has no caller. Not-found keeps the upstream location (any other folder); another error retries 5 times (1 s … 5 s), then keeps upstream and logs an error. Anchor 0, replacement 1. |
+| `history-root` | workbench.js, end of the `ChatSessionStore` constructor: `this.storeTask&&S.join(this.storeTask,{id:"join.chatSessionStore",label:d(12652,null)})}))}async handleWorkspaceTransition(e,t){` | For a window with exactly one folder and no workspace file, queue as the store's first task: `stat(<folder>/.ezil/chat)`; a directory becomes `storageRoot`. A managed repository wrapper with an existing parent workspace state uses its repository-specific durable folder and migrates only its matching profile. Every read of `storageRoot` (`getStorageLocation`, reconcile, migration) runs in a later queued task; the only synchronous accessor, `getChatStorageFolder()`, has no caller. For other folders, not-found keeps the upstream location. Another error retries 5 times (1 s … 5 s), then keeps upstream and logs an error. Anchor 0, replacement 1. |
 | `history-index` | workbench.js `ChatSessionStore.getIndex`: `async getIndex(){return this.storeQueue.queue(async()=>this.internalGetIndex().entries)}` | On the first read in a window, inside the store queue: list the `chatSessions` directory; drop non-external index entries with neither `.json` nor `.jsonl`; read files missing from the index (newest first, never older than the oldest entry of a full 400-entry index) with the store's own `readSessionFromLocation` and `KSn` metadata, titled like `ChatModel.getDefaultTitle` when there is no custom title; then `trimEntries` and `flushIndex`. A listing error other than not-found changes nothing and is retried on the next read; not-found ends it for the window. Anchor 0, replacement 1. |
 | `history-names` | `KSn`, `sC.getDefaultTitle`, `zSn=400`, `readSessionFromLocation`, `getStorageLocation`, `ba(...)!==1` (not-found), the constructor's `f` (workspace) and `Ve` (joinPath), `cn.Local`, the picker's `agentSessionsService` | Checked, never patched: each exact definition occurs once, so the replacement's minified names mean the same thing. |
 | `history-entry` | workbench.js `ChatViewTitleControl.shouldRender(){return!!this.model?.title}` | `shouldRender(){return!0}`: the title, whose click opens the session picker (`workbench.action.chat.pickAgentSession`), also shows on an empty chat. Anchor 0, replacement 1. |

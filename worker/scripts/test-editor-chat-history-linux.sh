@@ -55,6 +55,26 @@ ezil_editor_prepare "$aws" "$workspace"
 [ "$(cat "$chat/s2.jsonl")" = 'old history' ] || fail "saved session overwritten"
 [ "$(cat "$workspace/.ezil/chat-conflicts/"*/s2.jsonl)" = 'diverged' ] || fail "conflicting copy lost"
 
+# Managed Git profiles are recognized by their recorded workspace, never by
+# their placement in the profile listing. Both metadata forms can be recovered.
+repo1=8b70ec91-3fcc-4efa-834c-c2bf44c45ca3
+repo2=96ab99e4-a6ed-4d53-94eb-5fd65ded182f
+mkdir -p "$workspace/projects/$repo1/checkout" "$workspace/projects/$repo2/checkout" \
+  "$(profile "$aws" repo-one)" "$(profile "$aws" repo-two)" "$(profile "$aws" repo-unavailable)"
+for spec in "repo-one/$repo1/workspace.json" "repo-two/$repo2/ezil-repository-chat.json" \
+  "repo-unavailable/83ebcac9-543e-4659-af3b-289633918afa/ezil-repository-chat.json"; do
+  IFS=/ read -r profile_id repo metadata <<< "$spec"
+  profile_chat="$(profile "$aws" "$profile_id")"
+  printf '{"folder":"vscode-remote://before-host%s/projects/%s"}\n' "$workspace" "$repo" >"${profile_chat%/*}/$metadata"
+  printf '%s\n' "$profile_id" >"$profile_chat/$profile_id.jsonl"
+done
+ezil_editor_prepare "$aws" "$workspace"
+[ "$(cat "$workspace/.ezil/repo-chat/$repo1/repo-one.jsonl")" = repo-one ] || fail "VS Code repo metadata not routed"
+[ "$(cat "$workspace/.ezil/repo-chat/$repo2/repo-two.jsonl")" = repo-two ] || fail "fallback repo marker not routed"
+[ ! -e "$chat/repo-one.jsonl" ] && [ ! -e "$chat/repo-two.jsonl" ] || fail "repo history spilled into default workspace"
+[ -f "$(profile "$aws" repo-unavailable)/repo-unavailable.jsonl" ] || fail "history moved for an unavailable repo wrapper"
+[ "$(find "$workspace/projects/$repo1" -mindepth 1 -maxdepth 1 -printf '%f\n')" = checkout ] || fail "repo wrapper changed"
+
 # 3. Odd entries are moved aside, never followed.
 outside="$root/outside"
 mkdir -p "$outside"

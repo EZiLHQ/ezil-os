@@ -61,6 +61,10 @@ function harness(code) {
   const uri = p => ({ path: p, fsPath: p, scheme: 'vscode-remote', toString: () => `vscode-remote://remote${p}` });
   const Wn = { joinPath: (u, ...parts) => uri(path.posix.join(u.path, ...parts)), isEqual: (a, b) => a.path === b.path, dirname: u => uri(path.posix.dirname(u.path)) };
   const notFound = () => Object.assign(new Error('not found'), { fileOperationResult: 1 });
+  const localStat = p => {
+    const st = fs.lstatSync(p);
+    return { isDirectory: st.isDirectory(), isSymbolicLink: st.isSymbolicLink(), isFile: st.isFile(), mtime: st.mtimeMs };
+  };
   const body = [
     between(code, 'var Umi=class{', 'var QNr=s=>'),
     between(code, 'function y7t(s){', 'function O4i(s){'),
@@ -97,7 +101,7 @@ function harness(code) {
           calls.resolve++;
           if (listing) return listing(u);
           let names; try { names = fs.readdirSync(fsPath(u)); } catch { throw notFound(); }
-          return { children: names.map(name => { const st = fs.statSync(path.join(fsPath(u), name)); return { name, isDirectory: st.isDirectory(), mtime: st.mtimeMs }; }) };
+          return { children: names.map(name => ({ name, ...localStat(path.join(fsPath(u), name)) })) };
         },
         async readFile(u) { calls.read++; calls.readPaths.push(u.path); try { return { value: new Ue(fs.readFileSync(fsPath(u))) }; } catch { throw notFound(); } },
         async del(u) { calls.del.push(u.path); try { fs.unlinkSync(fsPath(u)); } catch { throw notFound(); } },
@@ -105,8 +109,21 @@ function harness(code) {
         async stat(u) {
           calls.stat++;
           if (stat) return stat(u, calls.stat);
-          let st; try { st = fs.statSync(fsPath(u)); } catch { throw notFound(); }
-          return { isDirectory: st.isDirectory() };
+          try { return localStat(fsPath(u)); } catch { throw notFound(); }
+        },
+        async createFolder(u) {
+          fs.mkdirSync(fsPath(u), { recursive: true });
+          return localStat(fsPath(u));
+        },
+        async move(source, target, overwrite) {
+          assert.equal(overwrite, false);
+          if (!fs.existsSync(fsPath(source))) throw notFound();
+          assert(!fs.existsSync(fsPath(target)), 'must not overwrite a migrated file');
+          fs.renameSync(fsPath(source), fsPath(target));
+        },
+        async createFile(u, contents, { overwrite }) {
+          assert.equal(overwrite, false);
+          fs.writeFileSync(fsPath(u), contents.toString(), { flag: 'wx' });
         },
         async writeFile() { throw new Error('unexpected write'); },
       };
@@ -177,10 +194,66 @@ const log = (id, { title, location = 'panel', requests = [request('Fix the login
       assert.equal(multi.calls.stat, 0);
     });
 
+    await t.test('managed Git history uses one durable repository scope and recovers only that profile', async () => {
+      const ids = ['8b70ec91-3fcc-4efa-834c-c2bf44c45ca3', '96ab99e4-a6ed-4d53-94eb-5fd65ded182f'];
+      const folders = ids.map(id => path.join(workspace, 'projects', id));
+      for (const folder of folders) fs.mkdirSync(path.join(folder, 'checkout'), { recursive: true });
+      const legacy = path.join(wsHome, '31384936', 'chatSessions');
+      const foreign = path.join(wsHome, 'abcdef', 'chatSessions');
+      fs.mkdirSync(legacy, { recursive: true });
+      fs.mkdirSync(foreign, { recursive: true });
+      fs.writeFileSync(path.join(legacy, 'old-turn.jsonl'), log('old-turn', { title: 'Saved turn before upgrade' }));
+      fs.writeFileSync(path.join(foreign, 'foreign-turn.jsonl'), log('foreign-turn', { title: 'A different project session' }));
+
+      const first = h.create({ folder: folders[0], wsHome, id: '31384936' });
+      const scoped = path.join(workspace, '.ezil', 'repo-chat', ids[0]);
+      assert.equal(await first.ready(), scoped);
+      assert.equal((await first.store.getIndex())['old-turn'].title, 'Saved turn before upgrade');
+      assert.equal(fs.existsSync(path.join(legacy, 'old-turn.jsonl')), false);
+      assert.equal(fs.existsSync(path.join(foreign, 'foreign-turn.jsonl')), true);
+      assert.deepEqual(fs.readdirSync(folders[0]), ['checkout']);
+
+      const reloaded = h.create({ folder: folders[0], wsHome, id: '-2ec3769a' });
+      const other = h.create({ folder: folders[1], wsHome, id: 'f' });
+      assert.equal(await reloaded.ready(), scoped);
+      assert.equal((await reloaded.store.getIndex())['old-turn'].title, 'Saved turn before upgrade');
+      assert.deepEqual(Object.keys(await other.store.getIndex()), []);
+      assert.equal((await make().store.getIndex())['old-turn'], undefined);
+
+      fs.writeFileSync(path.join(legacy, 'old-turn.json'), log('old-turn', { title: 'Conflicting profile copy' }));
+      const conflict = h.create({ folder: folders[0], wsHome, id: '31384936' });
+      assert.equal((await conflict.store.getIndex())['old-turn'].title, 'Saved turn before upgrade');
+      assert.equal(fs.readFileSync(path.join(scoped, '.legacy-31384936', 'old-turn.json'), 'utf8'),
+        log('old-turn', { title: 'Conflicting profile copy' }));
+
+      fs.writeFileSync(path.join(legacy, 'old-turn.json'), log('old-turn', { title: 'Second conflicting profile copy' }));
+      const repeated = h.create({ folder: folders[0], wsHome, id: '31384936' });
+      assert.equal(await repeated.ready(), scoped);
+      assert.equal((await repeated.store.getIndex())['old-turn'].title, 'Saved turn before upgrade');
+      assert.equal(fs.readdirSync(path.join(scoped, '.legacy-31384936')).length, 2);
+
+      const blocked = path.join(workspace, '.ezil', 'repo-chat', ids[1]);
+      fs.rmdirSync(blocked);
+      fs.symlinkSync(scoped, blocked);
+      const fallback = h.create({ folder: folders[1], wsHome, id: 'abc91' });
+      const profilePath = path.join(wsHome, 'abc91');
+      assert.equal(await fallback.ready(), path.join(profilePath, 'chatSessions'));
+      const marker = JSON.parse(fs.readFileSync(path.join(profilePath, 'ezil-repository-chat.json'), 'utf8'));
+      assert.equal(marker.folder, 'vscode-remote://remote' + folders[1]);
+    });
+
+    await t.test('a lookalike project outside a managed workspace keeps profile storage', async () => {
+      const folder = path.join(tmp, 'other-enclosing', 'projects', '8b70ec91-3fcc-4efa-834c-c2bf44c45ca3');
+      fs.mkdirSync(folder, { recursive: true });
+      const legacy = h.create({ folder, wsHome, id: 'plain' });
+      assert.equal(await legacy.ready(), path.join(wsHome, 'plain', 'chatSessions'));
+      assert.equal(fs.existsSync(path.join(tmp, 'other-enclosing', '.ezil')), false);
+    });
+
     await t.test('a transient error is retried; a lasting one keeps upstream and is logged as an error', async () => {
       const flaky = make({ stat: (u, n) => { if (n < 3) throw new Error('remote not connected'); return { isDirectory: true }; } });
       assert.equal(await flaky.ready(), chat);
-      assert.equal(flaky.calls.stat, 3);
+      assert.equal(flaky.calls.stat, 4);
       const down = make({ id: 'down', stat: () => { throw new Error('remote not connected'); } });
       assert.equal(await down.ready(), path.join(wsHome, 'down', 'chatSessions'));
       assert.equal(down.calls.stat, 6);

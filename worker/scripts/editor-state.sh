@@ -299,6 +299,29 @@ ezil_editor_ignore_state() {
   printf '# EZiL editor state and chat history (managed by EZiL)\n/.ezil/\n' >>"$exclude" 2>/dev/null || true
 }
 
+# Recover a repository's profile before the editor starts when its exact folder
+# was recorded by the workbench fallback or VS Code's own workspace storage.
+ezil_editor_repository_chat_scope() {
+  local profile="$1" workspace="$2" marker
+  for marker in "$profile/ezil-repository-chat.json" "$profile/workspace.json"; do
+    [ -f "$marker" ] && [ ! -L "$marker" ] || continue
+    node - "$marker" "$workspace" <<'JS'
+const fs = require('node:fs');
+const [file, workspace] = process.argv.slice(2);
+try {
+  if (fs.statSync(file).size > 4096) process.exit(0);
+  const url = new URL(JSON.parse(fs.readFileSync(file, 'utf8')).folder);
+  if (!['file:', 'vscode-remote:'].includes(url.protocol) || url.search || url.hash) process.exit(0);
+  const prefix = workspace.replace(/\/$/, '') + '/projects/';
+  const folder = decodeURIComponent(url.pathname);
+  const id = folder.startsWith(prefix) ? folder.slice(prefix.length) : '';
+  if (/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(id)) process.stdout.write(id);
+} catch {}
+JS
+    return
+  done
+}
+
 # EZiL Chat history lives in the workspace: <workspace>/.ezil/chat/<session>.jsonl, one
 # copy that checkpoints, restore, reverse move and Cloudflare restarts carry like any
 # project file. The patched editor (copilot-chat/PATCHES.md, history-root) writes there
@@ -306,12 +329,12 @@ ezil_editor_ignore_state() {
 # <user-data>/User/workspaceStorage/<id>/chatSessions, with an id that hashes the browser
 # host, so it changes with the computer's address. Idempotent; runs before every launch,
 # including warm AWS profiles that already carry .ezil-state-ready. History already in a
-# profile moves into the workspace, never overwriting a saved session (all such
-# directories: in EZiL the editor opens one folder). Odd entries are moved aside, never
-# followed or deleted.
+# profile moves into the workspace, never overwriting a saved session. When profile
+# metadata proves the managed repository folder, route it to that repository.
+# Odd entries are moved aside, never followed or deleted.
 ezil_editor_prepare_chat() (
-  local user_data="$1" workspace="$2" state_dir chat dir entry name stamp
-  state_dir="${EZIL_EDITOR_STATE_DIR:-$workspace/.ezil}"
+  local user_data="$1" workspace="$2" state_dir chat dir entry name stamp repo projects profile profile_chat profile_conflicts
+  state_dir="${EZIL_EDITOR_STATE_DIR:-${workspace%/}/.ezil}"
   chat="$state_dir/chat"
   stamp="$(date +%s)-$BASHPID-$RANDOM"
   ezil_editor_ignore_state "$workspace" "$state_dir" || exit 1
@@ -321,17 +344,38 @@ ezil_editor_prepare_chat() (
   fi
   mkdir -p "$chat" || exit 1
   for dir in "$user_data"/User/workspaceStorage/*/chatSessions; do
-    [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+    profile="${dir%/*}"
+    [ -d "$dir" ] && [ ! -L "$dir" ] && [ ! -L "$profile" ] || continue
+    profile_chat="$chat"
+    profile_conflicts="$state_dir/chat-conflicts/$stamp-${profile##*/}"
+    repo="$(ezil_editor_repository_chat_scope "$profile" "$workspace")"
+    if [ -n "$repo" ]; then
+      [ "$state_dir" = "${workspace%/}/.ezil" ] || continue
+      projects="${workspace%/}/projects"
+      [ -d "$projects/$repo" ] && [ ! -L "$projects" ] && [ ! -L "$projects/$repo" ] || continue
+      profile_chat="$state_dir/repo-chat/$repo"
+      [ ! -L "$state_dir" ] && [ ! -L "$state_dir/repo-chat" ] && [ ! -L "$profile_chat" ] || continue
+      mkdir -p "$profile_chat" || continue
+      profile_conflicts="$profile_chat/.legacy-$stamp-${profile##*/}"
+    fi
     for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
       [ -e "$entry" ] || [ -L "$entry" ] || continue
       name="${entry##*/}"
-      if [ ! -e "$chat/$name" ] && [ ! -L "$chat/$name" ]; then
-        mv -T -- "$entry" "$chat/$name" || exit 1
-      elif [ -f "$entry" ] && [ ! -L "$entry" ] && cmp -s -- "$entry" "$chat/$name"; then
+      if [ -n "$repo" ]; then
+        [ -f "$entry" ] && [ ! -L "$entry" ] || continue
+        case "$name" in
+          .*) continue ;;
+          *.json | *.jsonl) ;;
+          *) continue ;;
+        esac
+      fi
+      if [ ! -e "$profile_chat/$name" ] && [ ! -L "$profile_chat/$name" ]; then
+        mv -T -- "$entry" "$profile_chat/$name" || exit 1
+      elif [ -f "$entry" ] && [ ! -L "$entry" ] && cmp -s -- "$entry" "$profile_chat/$name"; then
         rm -f -- "$entry" || exit 1
       else
-        mkdir -p "$state_dir/chat-conflicts/$stamp" || exit 1
-        mv -T -- "$entry" "$state_dir/chat-conflicts/$stamp/$name" || exit 1
+        mkdir -p "$profile_conflicts" || exit 1
+        mv -T -- "$entry" "$profile_conflicts/$name" || exit 1
       fi
     done
     rmdir -- "$dir" 2>/dev/null || true

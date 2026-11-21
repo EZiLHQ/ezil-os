@@ -337,12 +337,113 @@ R_REQUEST_RETRY='this.options.request.permissionLevel==="autopilot"?this.showAut
 # Part 3 — EZiL Chat history (workbench.js). Upstream the ChatSessionStore keeps sessions in
 # <user-data>/User/workspaceStorage/<id>/chatSessions, where the id hashes
 # vscode-remote://<browser host><folder> (code-server sets remoteAuthority to location.host),
-# so it changes with the computer's address. For a single-folder window whose folder has
-# .ezil/chat (editor-state.sh creates it in the EZiL workspace), the store uses that folder
-# instead; it is decided as the store's first queued task, before any session file is read
-# or written. Not-found keeps the upstream location; other errors retry, then log loudly.
+# so it changes with the computer's address. A single-folder window uses its existing
+# .ezil/chat. Managed repository wrappers are intentionally checkout-only, so their
+# sessions live under the enclosing workspace state, keyed by the repository UUID.
+# The first queued task selects the storage root and migrates the current profile's
+# matching history before the workbench reads or writes a session.
 A_HISTORY_ROOT='this.storeTask&&S.join(this.storeTask,{id:"join.chatSessionStore",label:d(12652,null)})}))}async handleWorkspaceTransition(e,t){'
-R_HISTORY_ROOT='this.storeTask&&S.join(this.storeTask,{id:"join.chatSessionStore",label:d(12652,null)})})),!f.configuration&&f.folders.length===1&&this.storeQueue.queue(()=>this._ezilUseWorkspaceChat(f.folders[0].uri))}async _ezilUseWorkspaceChat(e){let t=Ve(e,".ezil","chat");for(let i=0;;i++)try{let n=await this.fileService.stat(t);n.isDirectory&&(this.storageRoot=t,this.logService.info(`EZiL: chat history in ${t.toString()}`));return}catch(n){if(ba(n)===1)return;if(i>=5){this.logService.error(`EZiL: chat history folder ${t.toString()} unreadable, using ${this.storageRoot.toString()}`,n);return}await new Promise(r=>setTimeout(r,1e3*(i+1)))}}async handleWorkspaceTransition(e,t){'
+R_HISTORY_ROOT="$(cat <<'JS'
+this.storeTask&&S.join(this.storeTask,{id:"join.chatSessionStore",label:d(12652,null)})})),
+  !f.configuration&&f.folders.length===1&&this.storeQueue.queue(()=>this._ezilUseWorkspaceChat(f.folders[0].uri))
+}
+async _ezilUseWorkspaceChat(folder) {
+  const localChat = Ve(folder, ".ezil", "chat");
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const local = await this._ezilChatDirectory(localChat) && await this._ezilChatDirectory(Ve(folder, ".ezil"));
+      const location = local ? localChat : await this._ezilOpenRepositoryChat(folder);
+      if (location) {
+        this.storageRoot = location;
+        this.logService.info("EZiL: chat history in " + location.toString());
+      } else if (this._ezilRepositoryScope) {
+        await this._ezilMarkLegacyRepositoryChat(folder);
+      }
+      return;
+    } catch (error) {
+      if (attempt >= 5) {
+        this.logService.error("EZiL: chat history folder " + localChat.toString() + " unreadable, using " + this.storageRoot.toString(), error);
+        if (this._ezilRepositoryScope) await this._ezilMarkLegacyRepositoryChat(folder);
+        return;
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+    }
+  }
+}
+async _ezilChatDirectory(location, create = false) {
+  let stat;
+  try {
+    stat = await this.fileService.stat(location);
+  } catch (error) {
+    if (ba(error) !== 1) throw error;
+    if (!create) return false;
+    stat = await this.fileService.createFolder(location);
+  }
+  return stat.isDirectory && !stat.isSymbolicLink;
+}
+async _ezilOpenRepositoryChat(folder) {
+  const id = folder.scheme === "vscode-remote" &&
+    /^(?:\/[^/]+)*\/projects\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/.exec(folder.path)?.[1];
+  if (!id) return;
+  const workspace = Wn.dirname(Wn.dirname(folder));
+  const state = Ve(workspace, ".ezil");
+  if (!await this._ezilChatDirectory(state) || !await this._ezilChatDirectory(Ve(state, "chat"))) return;
+  this._ezilRepositoryScope = true;
+  const repositories = Ve(state, "repo-chat");
+  if (!await this._ezilChatDirectory(repositories, true)) return;
+  const location = Ve(repositories, id);
+  if (!await this._ezilChatDirectory(location, true)) return;
+  try {
+    await this._ezilMoveRepositoryChat(this.storageRoot, location);
+  } catch (error) {
+    this.logService.error("EZiL: unable to import the repository chat profile", error);
+  }
+  return location;
+}
+async _ezilMarkLegacyRepositoryChat(folder) {
+  const profile = Wn.dirname(this.storageRoot);
+  try {
+    if (!await this._ezilChatDirectory(profile, true)) return;
+    const marker = Ve(profile, "ezil-repository-chat.json");
+    if (!await this.fileService.exists(marker)) {
+      await this.fileService.createFile(marker, Ue.fromString(JSON.stringify({ folder: folder.toString() })), { overwrite: false });
+    }
+  } catch (error) {
+    this.logService.error("EZiL: unable to record the repository chat profile scope", error);
+  }
+}
+async _ezilMoveRepositoryChat(legacy, destination) {
+  if (!await this._ezilChatDirectory(legacy)) return;
+  const sessionId = file => file.isFile && !file.isSymbolicLink && /^([^.\/][^\/]*)\.jsonl?$/.exec(file.name)?.[1];
+  const list = async location => (await this.fileService.resolve(location)).children ?? [];
+  const occupied = new Set((await list(destination)).map(sessionId).filter(Boolean));
+  const profile = Wn.dirname(legacy).path.split("/").at(-1);
+  const conflicts = Ve(destination, ".legacy-" + profile);
+  // The reader prefers JSONL when both formats exist. Move that file first
+  // so the same version wins even if migration is interrupted between files.
+  const files = (await list(legacy)).sort((a, b) => Number(b.name.endsWith(".jsonl")) - Number(a.name.endsWith(".jsonl")));
+  for (const file of files) {
+    const id = sessionId(file);
+    if (!id) continue;
+    const source = Ve(legacy, file.name);
+    try {
+      if (occupied.has(id)) {
+        if (!await this._ezilChatDirectory(conflicts, true)) throw new Error("Invalid chat conflict directory");
+        let archive = Ve(conflicts, file.name);
+        if (await this.fileService.exists(archive)) archive = Ve(conflicts, file.name + "." + globalThis.crypto.randomUUID());
+        await this.fileService.move(source, archive, false);
+      } else {
+        await this.fileService.move(source, Ve(destination, file.name), false);
+      }
+    } catch (error) {
+      if (ba(error) !== 1) this.logService.error("EZiL: unable to import a repository chat file", error);
+    }
+  }
+}
+async handleWorkspaceTransition(e,t){
+JS
+)"
+
 P_HISTORY_WORKSPACE='let f=this.workspaceContextService.getWorkspace(),v=!f.configuration&&f.folders.length===0,b=this.workspaceContextService.getWorkspace().id;this.storageRoot=v?Ve(this.userDataProfilesService.defaultProfile.globalStorageHome,"emptyWindowChatSessions"):Ve(this.environmentService.workspaceStorageHome,b,"chatSessions"),'
 # The ChatSessionStore lists history only from
 # its index (storage key chat.ChatSessionStore.index, workspace scope = browser IndexedDB
