@@ -67,6 +67,7 @@ export function create_ai_trace_collector ({ fetchImpl = (...args) => fetch(...a
                 seen.set(trace.requestId, at);
                 if (queue.length >= 64) queue.shift();
                 queue.push(trace); schedule();
+                host.dispatchEvent(new host.CustomEvent('ezil:interview-ai-trace', { detail: trace })); // interview-activity.js listens (no-op unless an interview is recording)
             } catch { /* Hostile input and disappearing frames are optional telemetry. */ }
         }
         registrations.set(iframe, registration); active.add(registration);
