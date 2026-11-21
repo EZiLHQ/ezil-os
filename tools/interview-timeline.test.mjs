@@ -607,6 +607,9 @@ describe("interview.mjs create", () => {
 		assert.equal(push.env.GIT_CONFIG_VALUE_0, `Authorization: Bearer ${SEED_TOKEN}`);
 		assert.equal(push.env.GIT_CONFIG_KEY_1, "http.followRedirects");
 		assert.equal(push.env.GIT_TERMINAL_PROMPT, "0");
+		for (const [name, value] of Object.entries(push.env)) {
+			if (name !== "GIT_CONFIG_VALUE_0") assert.ok(!String(value).includes(SEED_TOKEN), `${name} must not carry the seed token`);
+		}
 		// Only the push carries it; the other git steps have no header.
 		for (const call of git.calls.slice(0, -1)) assert.equal(call.env.GIT_CONFIG_COUNT, undefined);
 		// The child gets an explicit environment: none of the three credentials leak into it.
