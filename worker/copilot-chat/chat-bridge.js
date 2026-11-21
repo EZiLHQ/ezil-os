@@ -158,12 +158,13 @@
     // this model only and confirm that its exact request reached disk. The
     // native store logs write failures internally, so awaiting a write alone
     // would give the caller a false success receipt.
-    async function checkpointTurn(model, requestId) {
-        if (!requestId || !chat._saveModelsEnabled || !chat.shouldStoreSession(model)) return false;
+    async function checkpointTurn(model, response) {
+        const finalState = response?.stateT?.value;
+        if (!response?.requestId || ![1, 2, 3].includes(finalState) || !chat._saveModelsEnabled || !chat.shouldStoreSession(model)) return false;
         const store = chat._chatSessionStore;
         await store.storeSessions([model]);
         const saved = await store.readSession(model.sessionId);
-        return saved?.value?.requests?.some(request => request.requestId === requestId) === true;
+        return saved?.value?.requests?.some(request => request.requestId === response.requestId && request.modelState?.value === finalState) === true;
     }
 
     /**
@@ -249,7 +250,7 @@
         }
         complete.then(async () => {
             try {
-                if (unattended) record.checkpoint = await checkpointTurn(ref.object, record.requestId) ? 'stored' : 'unverified';
+                if (unattended) record.checkpoint = await checkpointTurn(ref.object, record.response) ? 'stored' : 'unverified';
             } catch {
                 record.checkpoint = 'unverified';
             } finally {

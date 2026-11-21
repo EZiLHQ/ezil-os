@@ -94,6 +94,16 @@ try {
     state.sessionsAt > state.owners.at(-1).at && receipts.every(receipt =>
       state.sessions.some(row => row.resource === receipt.session)) && state, 120000);
   assert.equal(rejoined.ops.filter(op => op.kind === 'send' && op.status === 'completed').length, 2);
+  // Read only the two synthetic workspace journals. Each must still contain
+  // its own terminal assistant reply after the original window is gone.
+  for (const receipt of receipts) {
+    const id = Buffer.from(new URL(receipt.session).pathname.slice(1), 'base64url').toString('utf8');
+    assert.match(id, /^[0-9a-f-]{36}$/);
+    const check = `const fs=require('fs'); const [id, request, result]=process.argv.slice(1);
+      const journal=fs.readFileSync('/home/neko/project/.ezil/chat/'+id+'.jsonl','utf8');
+      if (!journal.includes(request) || !journal.includes(result)) process.exit(1);`;
+    execFileSync('docker', ['exec', container, 'node', '-e', check, id, receipt.request, receipt.result]);
+  }
   console.log(JSON.stringify({ status: 'passed', fixture: 'offline', externalCodeWorkbenches: 0, receipts }));
 } finally {
   const state = fixture('bridge-state');
