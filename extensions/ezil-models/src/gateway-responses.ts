@@ -1,6 +1,6 @@
 // Gateway's stateless, text/function-only Responses subset. No direct provider URLs or state IDs.
 import type { ResolvedModel } from './config';
-import { escapeNonAscii, GATEWAY_INPUT_BYTES, gatewayRequestBytes, gatewayRequestOutputTokens, isObject, LocalRequestError, samplingRefused } from './gateway-messages';
+import { currentUserIndex, escapeNonAscii, isImagePart, GATEWAY_INPUT_BYTES, gatewayRequestBytes, gatewayRequestOutputTokens, isObject, LocalRequestError, readTextAttachment, samplingRefused } from './gateway-messages';
 import { gatewayBodyEvents, GatewayResponseError, responseFailure, streamErrorEvent } from './gateway-response';
 import type { SseEvent } from './sse';
 import { isCacheMarker, isStatefulMarker, type ChatRequest, type Part, type StreamEvent, type Usage } from './types';
@@ -38,12 +38,15 @@ function textPart(part: Part): string {
     if (part.type === 'text' && typeof part.value === 'string') return part.value;
     if (part.type === 'thinking' || isCacheMarker(part) || isStatefulMarker(part)) return '';
     // Text data (an attached or tool-returned text/* file) is text, inlined as on Messages (gateway-messages.ts partText).
-    if (part.type === 'data' && part.mimeType.startsWith('text/')) return Buffer.from(part.data).toString('utf8');
+    if (part.type === 'data') {
+        const text = readTextAttachment(part);
+        if (text !== undefined) return text;
+    }
     // Even tool results must be text. Do not silently send an image/file/audio as a successful result.
     throw new Error('Responses supports text and function tools only; images, files and audio are not supported');
 }
 
-export function buildGatewayResponsesBody(model: ResolvedModel, request: ChatRequest, log?: (line: string) => void): { body: GatewayResponsesBody; bytes: Uint8Array<ArrayBuffer> } {
+export function buildGatewayResponsesBody(model: ResolvedModel, request: ChatRequest, log?: (line: string) => void, imagesAsNotes = false): { body: GatewayResponsesBody; bytes: Uint8Array<ArrayBuffer> } {
     const names = new Set<string>();
     if (request.tools.length > 64) throw new Error('Too many tools');
     const tools: FunctionTool[] = request.tools.map(tool => {
@@ -59,7 +62,10 @@ export function buildGatewayResponsesBody(model: ResolvedModel, request: ChatReq
     const input: Input[] = [];
     const calls = new Set<string>();
     const pending = new Set<string>();
-    for (const message of request.messages) {
+    // An earlier message's attached image is a marked note, as on Messages; the current message's still refuses (the
+    // provider refuses it first, with its reason).
+    const current = currentUserIndex(request.messages);
+    for (const [index, message] of request.messages.entries()) {
         let content = '';
         const flush = () => { if (content) input.push({ type: 'message', role: message.role, content }); content = ''; };
         for (const part of message.parts) {
@@ -81,7 +87,8 @@ export function buildGatewayResponsesBody(model: ResolvedModel, request: ChatReq
                 const output = part.content.map(textPart).join('\n') || '(no output)';
                 if (pending.delete(id)) input.push({ type: 'function_call_output', call_id: id, output });
                 else input.push({ type: 'message', role: 'user', content: `[Earlier tool output]\n${output}` });
-            } else content += textPart(part);
+            } else if (message.role === 'user' && (imagesAsNotes || index !== current) && isImagePart(part)) content += '[image omitted: not supported by this model]';
+            else content += textPart(part);
         }
         flush();
     }

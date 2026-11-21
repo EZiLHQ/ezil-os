@@ -7,7 +7,7 @@ import * as vscode from 'vscode';
 import type { CompactionInfo } from './compact';
 import { appFailure, type AppFailure } from './failure';
 import { CATALOG_REFUSALS, CREDIT_STATE_TEXT, GatewayError, gatewayCatalogModels, gatewayModelAvailable, gatewayModelListed, gatewayModels, gatewayPlanUnconfirmed, includedModelNames, knownGatewayModels, knownGatewayPlan, markGatewayPlanUnconfirmed, modelIncluded, parseCatalogModelId, withCatalogDefault, withDefaultModel, withGatewayModelLimits, withPlanLocks, withUnconfirmedPlan, type GatewayModels } from './gateway';
-import { gatewayInputTokens, gatewayOutputTokens, gatewayRequestOutputTokens, gatewayTokenCount, geminiRoute, geminiSignedPart, QWEN } from './gateway-messages';
+import { currentAttachmentRefusal, gatewayInputTokens, gatewayOutputTokens, gatewayRequestOutputTokens, gatewayTokenCount, geminiRoute, geminiSignedPart, QWEN } from './gateway-messages';
 import { chat, ProviderError } from './client';
 import { redact, type ResolvedModel, type ResolvedProvider } from './config';
 import { estimateMessageTokens, estimateTextTokens } from './tokens';
@@ -204,7 +204,8 @@ export function toInformation(model: ResolvedModel): vscode.LanguageModelChatInf
         detail: model.detail ?? model.providerName,
         maxInputTokens: model.provider.type === 'ezil-gateway' ? gatewayInputTokens(model) : model.maxInputTokens,
         maxOutputTokens: model.provider.type === 'ezil-gateway' ? gatewayOutputTokens(model) : model.maxOutputTokens,
-        capabilities: { toolCalling: model.capabilities.toolCalling, imageInput: model.provider.type === 'ezil-gateway' ? false : model.capabilities.imageInput },
+        // A Gateway model's image input is already gated by its config and the catalog (withGatewayModelLimits).
+        capabilities: { toolCalling: model.capabilities.toolCalling, imageInput: model.capabilities.imageInput },
     };
     // Proposed `chatProvider` fields. code-server 4.141's extension host accepts them without the proposal enabled, and
     // `isDefault` is what makes the config's default model the first one in Chat (no chat.defaultModel is configured).
@@ -621,6 +622,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                     throw new GatewayError(`EZiL AI: ${resolved.name} is not included in your plan. Nothing was sent or charged. Pick ${includedModelNames(plan)}, `
                         + 'or upgrade in Settings → Billing.', undefined, 'os_model_not_included', undefined, undefined, 'local');
                 }
+                const optedIn = resolved.capabilities.imageInput;
                 resolved = withGatewayModelLimits(resolved, catalog);
                 // Never send tools to a model without tool calling: leave them out, as Copilot 0.69 does for its own
                 // endpoints without tool calls (interceptBody), and earlier tool calls go as text. A picker entry from
@@ -628,6 +630,13 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 if (request.tools.length && !resolved.capabilities.toolCalling) {
                     request.tools = [];
                     if ((model.capabilities as { toolCalling?: unknown } | undefined)?.toolCalling) this.refresh();
+                }
+                // The user's own image goes intact or the turn fails here, before anything is sent; never a silent note.
+                // Title, summary and progress requests send what they can (their images as notes).
+                const refusal = isUtilityRequest(options.modelOptions ?? {}) ? undefined : currentAttachmentRefusal(request, resolved, optedIn && !catalog);
+                if (refusal) {
+                    if ((model.capabilities as { imageInput?: unknown } | undefined)?.imageInput && !resolved.capabilities.imageInput) this.refresh();
+                    throw new GatewayError(`EZiL AI: ${refusal.message} Nothing was sent or charged.`, undefined, refusal.code, undefined, undefined, 'local');
                 }
             }
             const sending = resolved;
@@ -644,6 +653,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                         this.host.compacted?.(sending, info, finished);
                     },
                     onOutcome,
+                    imagesAsNotes: utilityRequest,
                 },
                 log: line => this.host.log(redact(line, this.host.secrets())),
                 onRequest: (url, body) => {
@@ -768,7 +778,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 }).catch(() => {});
             }
             // The picker still shows what the refusal says is gone or changed: list again from a fresh catalog.
-            if (error instanceof GatewayError && CATALOG_REFUSALS.includes(error.code ?? '')) this.refresh();
+            if (error instanceof GatewayError && (CATALOG_REFUSALS.includes(error.code ?? '') || error.code === 'unsupported_parameter')) this.refresh();
             // The proxy itself has no fresh plan for this account: nothing it lists is offered until a verified read.
             else if (error instanceof GatewayError && error.origin === 'os_proxy' && error.code === 'os_plan_unavailable' && resolved?.provider.type === 'ezil-gateway') {
                 markGatewayPlanUnconfirmed(resolved.provider);
@@ -838,7 +848,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             const message = typeof value === 'string' ? value : toNeutralMessage(value);
             return Math.max(gatewayTokenCount(message, 'anthropic-messages'), gatewayTokenCount(message, 'openai-responses'));
         }
-        if (resolved.provider.type === 'ezil-gateway') return gatewayTokenCount(typeof value === 'string' ? value : toNeutralMessage(value), resolved.gatewayProtocol);
+        if (resolved.provider.type === 'ezil-gateway') return gatewayTokenCount(typeof value === 'string' ? value : toNeutralMessage(value), resolved.gatewayProtocol,
+            withGatewayModelLimits(resolved, knownGatewayModels(resolved.provider)).capabilities.imageInput);
         if (typeof value === 'string') return estimateTextTokens(value);
         return estimateMessageTokens(toNeutralMessage(value));
     }

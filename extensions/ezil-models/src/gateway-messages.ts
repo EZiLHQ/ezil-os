@@ -4,7 +4,7 @@ import { estimateTextTokens, estimateMessageTokens } from './tokens';
 import { applyCacheBreakpoints } from './anthropic';
 import type { GatewayProtocol, ResolvedModel } from './config';
 import { GatewayError } from './gateway-error';
-import { isCacheMarker, isStatefulMarker, type ChatRequest, type Message, type Part, type Tool } from './types';
+import { base64, isCacheMarker, isStatefulMarker, type ChatRequest, type DataPart, type Message, type Part, type Tool } from './types';
 
 export type LocalRequestCode = 'local_input_too_large' | 'local_too_many_messages' | 'local_too_many_blocks';
 /** Sizes only, never payload text. `bodyBytes` is the size checked against `limitBytes`. */
@@ -63,13 +63,22 @@ export function gatewayRequestBytes(model: Pick<ResolvedModel, 'gatewayProtocol'
 }
 // Margin in model tokens for uncounted tool framing/schema, after counting the actual definitions.
 export const DEFAULT_TOOL_RESERVE = 8_000;
+// User images, as the Gateway's default-off Claude image candidate accepts them (EZiL AI Gateway
+// src/protocols/anthropic/validate.ts at 8e28cfe4, feat/gw-claude-image-20261106): base64 PNG blocks in user messages only, at most 4 per request,
+// each at most 1 MiB decoded and 1-8000 px a side. Its input bound counts each image as CLAUDE_IMAGE_TOKENS in place of
+// its base64 bytes. The Gateway validates every chunk and CRC; this checks only what it can say clearly before sending.
+export const MAX_IMAGE_BYTES = 1024 * 1024;
+export const MAX_IMAGE_DIMENSION = 8000;
+export const MAX_REQUEST_IMAGES = 4;
+export const CLAUDE_IMAGE_TOKENS = 4784;
 const TOOL_NAME = /^[a-zA-Z0-9_-]{1,64}$/;
 type ObjectValue = Record<string, unknown>;
 export type TextBlock = { type: 'text'; text: string };
 export type ToolUse = { type: 'tool_use'; id: string; name: string; input: ObjectValue };
 export type ToolResult = { type: 'tool_result'; tool_use_id: string; content: TextBlock[]; is_error?: boolean };
 export type ThinkingBlock = { type: 'thinking'; thinking: string; signature: string } | { type: 'redacted_thinking'; data: string };
-export type Block = TextBlock | ToolUse | ToolResult | ThinkingBlock;
+export type ImageBlock = { type: 'image'; source: { type: 'base64'; media_type: 'image/png'; data: string } };
+export type Block = TextBlock | ImageBlock | ToolUse | ToolResult | ThinkingBlock;
 export type GatewayMessage = { role: 'user' | 'assistant'; content: Block[] };
 export type GatewayTool = { name: string; input_schema: ObjectValue; description?: string };
 export type GatewayBody = {
@@ -95,6 +104,199 @@ function jsonValue(value: unknown, seen = new Set<unknown>(), depth = 0): boolea
 }
 
 const text = (value: string): TextBlock => ({ type: 'text', text: value });
+
+/** An image the user attached: a data part directly in a user message (not inside a tool result, not a marker). */
+export function isImagePart(part: Part): part is DataPart {
+    return part.type === 'data' && part.mimeType.startsWith('image/');
+}
+
+const PNG_SIGNATURE = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+const PNG_DEPTHS: Record<number, readonly number[]> = { 0: [1, 2, 4, 8, 16], 2: [8, 16], 3: [1, 2, 4, 8], 4: [8, 16], 6: [8, 16] };
+const PNG_CHANNELS: Record<number, number> = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 };
+const MAX_REQUEST_PNG_SCANLINES = 8 * 1024 * 1024;
+const PNG_PROFILE_RESERVE = 1024 * 1024;
+const CRC_TABLE = Uint32Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let bit = 0; bit < 8; bit++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+});
+function crc32(data: Uint8Array, start: number, end: number): number {
+    let crc = 0xffffffff;
+    for (let index = start; index < end; index++) crc = (CRC_TABLE[(crc ^ data[index]!) & 255]! ^ (crc >>> 8)) >>> 0;
+    return (crc ^ 0xffffffff) >>> 0;
+}
+
+/** Checks the PNG envelope and counts decoded scanlines and the color-profile reserve. */
+function inspectPng(data: Uint8Array): number | string {
+    const invalid = 'the image is not a valid PNG';
+    if (data.byteLength < 8 || !PNG_SIGNATURE.every((byte, index) => data[index] === byte)) return invalid;
+    const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+    let pos = 8, chunks = 0, decodedBytes = 0, profile = false, header = false, idat = false, afterIdat = false, idatBytes = 0, color = -1, palette = false;
+    while (pos + 12 <= data.byteLength && ++chunks <= 4096) {
+        const size = view.getUint32(pos), end = pos + 12 + size;
+        if (end > data.byteLength) return invalid;
+        const type = String.fromCharCode(...data.subarray(pos + 4, pos + 8));
+        if (!/^[A-Za-z]{4}$/.test(type) || crc32(data, pos + 4, pos + 8 + size) !== view.getUint32(pos + 8 + size)) return invalid;
+        if (!header) {
+            if (type !== 'IHDR' || size !== 13) return invalid;
+            const width = view.getUint32(pos + 8), height = view.getUint32(pos + 12);
+            if (!width || !height || width > MAX_IMAGE_DIMENSION || height > MAX_IMAGE_DIMENSION) return `the image is ${width}×${height} px; each side must be 1 to ${MAX_IMAGE_DIMENSION}`;
+            color = data[pos + 17]!;
+            const depth = data[pos + 16]!;
+            if (!PNG_DEPTHS[color]?.includes(depth) || data[pos + 18] !== 0 || data[pos + 19] !== 0) return invalid;
+            if (data[pos + 20] !== 0) return 'interlaced PNGs are not supported';
+            decodedBytes = height * (1 + Math.ceil(width * PNG_CHANNELS[color]! * depth / 8));
+            header = true;
+        } else if (type === 'acTL' || type === 'fcTL' || type === 'fdAT') {
+            return 'animated PNGs are not supported';
+        } else if (type === 'IHDR') {
+            return invalid;
+        } else if (type === 'PLTE') {
+            if (palette || idat || size === 0 || size > 768 || size % 3 !== 0) return invalid;
+            palette = true;
+        } else if (type === 'IDAT') {
+            if (afterIdat || (color === 3 && !palette)) return invalid;
+            idat = true;
+            idatBytes += size;
+        } else if (type === 'IEND') {
+            return size === 0 && idat && idatBytes > 0 && end === data.byteLength ? decodedBytes + (profile ? PNG_PROFILE_RESERVE : 0) : invalid;
+        } else {
+            if (idat) afterIdat = true;
+            if (type === 'iCCP') profile = true;
+            if (data[pos + 4]! < 97) return invalid; // an unknown critical chunk
+        }
+        pos = end;
+    }
+    return invalid;
+}
+
+/** Why EZiL AI would refuse this image, or undefined. Never logs the bytes. */
+// Copilot's parts are reused across builds (compaction tries many), so each image is checked and encoded once.
+const inspected = new WeakMap<DataPart, number | string>();
+const encoded = new WeakMap<DataPart, string>();
+
+function inspectImage(part: DataPart): number | string {
+    const previous = inspected.get(part);
+    if (previous !== undefined) return previous;
+    const result = part.mimeType !== 'image/png' ? `${part.mimeType} images are not supported; only PNG is`
+        : part.data.byteLength > MAX_IMAGE_BYTES ? 'the image is larger than 1 MiB' : inspectPng(part.data);
+    const checked = typeof result === 'number' && result > MAX_REQUEST_PNG_SCANLINES
+        ? 'the image exceeds the 8 MiB decoded limit; reduce its dimensions' : result;
+    inspected.set(part, checked);
+    return checked;
+}
+
+export function imageProblem(part: DataPart): string | undefined {
+    const result = inspectImage(part);
+    return typeof result === 'string' ? result : undefined;
+}
+
+/**
+ * The request's current user message, as compaction keeps it (compact.ts `typed`): the last user message with typed text
+ * or an attachment, not only tool results; else the last user message.
+ */
+export function currentUserIndex(messages: readonly Message[]): number {
+    let fallback = -1;
+    for (let index = messages.length - 1; index >= 0; index--) {
+        const message = messages[index]!;
+        if (message.role !== 'user') continue;
+        if (fallback < 0) fallback = index;
+        if (message.parts.some(part => (part.type === 'text' && part.value.trim() !== '') || (part.type === 'data' && !isCacheMarker(part) && !isStatefulMarker(part)))) return index;
+    }
+    return fallback;
+}
+
+/**
+ * Why the images the user attached to the current request cannot go to this Gateway model as they are, or undefined.
+ * Earlier messages' images never refuse a turn: they go as marked notes when they cannot be sent (gateway-messages.ts).
+ */
+export function imageRefusal(request: ChatRequest, model: ResolvedModel, unchecked = false): string | undefined {
+    const current = request.messages[currentUserIndex(request.messages)];
+    const images = current?.parts.filter(isImagePart) ?? [];
+    if (!images.length) return undefined;
+    // `unchecked`: the config opts this model in, but the model list could not be read to confirm it now.
+    if (unchecked) return `Could not load the model list, so whether ${model.name} accepts images cannot be checked right now. Try again.`;
+    if (!model.capabilities.imageInput) return `${model.name} does not accept images through EZiL AI right now. Remove the image or pick a model that accepts images.`;
+    if (images.length > MAX_REQUEST_IMAGES) return `This message has ${images.length} images; EZiL AI accepts at most ${MAX_REQUEST_IMAGES}.`;
+    let decodedBytes = 0;
+    for (const [index, image] of images.entries()) {
+        const problem = inspectImage(image);
+        if (typeof problem === 'string') return `Image ${index + 1} cannot be sent: ${problem}.`;
+        decodedBytes += problem;
+    }
+    if (decodedBytes > MAX_REQUEST_PNG_SCANLINES) return 'The images exceed the 8 MiB decoded request limit. Attach fewer or smaller PNGs.';
+    // Base64 is 4 bytes per 3; the whole request must also fit the code host's cap.
+    const encoded = images.reduce((sum, image) => sum + Math.ceil(image.data.byteLength / 3) * 4, 0);
+    const cap = gatewayRequestBytes(model);
+    if (encoded > cap) return `The attached images are too large to send: ${encoded} bytes encoded, over the ${cap}-byte request limit. Attach a smaller PNG.`;
+    return undefined;
+}
+
+const utf8Attachment = new TextDecoder('utf-8', { fatal: true });
+
+export function readTextAttachment(part: DataPart): string | undefined {
+    const mime = part.mimeType.toLowerCase();
+    if (!mime.startsWith('text/') && mime !== 'application/json') return undefined;
+    try {
+        const value = utf8Attachment.decode(part.data);
+        return value.includes('\0') ? undefined : value;
+    } catch { return undefined; }
+}
+
+export function currentAttachmentRefusal(request: ChatRequest, model: ResolvedModel, unchecked = false):
+    { code: 'image_input_unsupported' | 'file_input_unsupported'; message: string } | undefined {
+    const image = imageRefusal(request, model, unchecked);
+    if (image) return { code: 'image_input_unsupported', message: image };
+    const current = request.messages[currentUserIndex(request.messages)];
+    for (const part of current?.parts ?? []) {
+        if (part.type !== 'data' || part.mimeType.startsWith('image/') || isCacheMarker(part) || isStatefulMarker(part)) continue;
+        if (part.data.byteLength > gatewayRequestBytes(model) || readTextAttachment(part) === undefined) {
+            return { code: 'file_input_unsupported',
+                message: 'This file cannot be sent to the selected Gateway model. Attach a UTF-8 text or JSON file within the request limit.' };
+        }
+    }
+    return undefined;
+}
+
+/**
+ * The images sent as image blocks: valid user images, newest first, up to MAX_REQUEST_IMAGES (Copilot resends the
+ * whole chat each turn, and the Gateway counts every image in it). Every other image goes as a marked text note.
+ */
+export function sendableImages(messages: readonly Message[], imageInput: boolean, from = 0, required: ReadonlySet<DataPart> = new Set()): Set<Part> {
+    const chosen = new Set<Part>();
+    if (!imageInput) return chosen;
+    let decodedBytesLeft = MAX_REQUEST_PNG_SCANLINES;
+    const addImage = (part: DataPart) => {
+        if (chosen.size >= MAX_REQUEST_IMAGES || chosen.has(part)) return;
+        const result = inspectImage(part);
+        if (typeof result !== 'number' || result > decodedBytesLeft) return;
+        chosen.add(part);
+        decodedBytesLeft -= result;
+    };
+    // Prioritize current attachments even when compaction moved them.
+    for (const part of required) addImage(part);
+    for (let index = messages.length - 1; index >= from && chosen.size < MAX_REQUEST_IMAGES; index--) {
+        if (messages[index]!.role !== 'user') continue;
+        const images = messages[index]!.parts.filter(isImagePart);
+        for (let at = images.length - 1; at >= 0 && chosen.size < MAX_REQUEST_IMAGES; at--) addImage(images[at]!);
+    }
+    return chosen;
+}
+
+function imageBlock(part: DataPart): ImageBlock {
+    let data = encoded.get(part);
+    if (data === undefined) encoded.set(part, data = base64(part.data));
+    return { type: 'image', source: { type: 'base64', media_type: 'image/png', data } };
+}
+
+const RECENT_NOTE = `only the ${MAX_REQUEST_IMAGES} most recent images are sent`;
+const SIZE_NOTE = "earlier images are left out to fit EZiL AI's request size limit";
+type MessageImages = { images: ReadonlySet<Part>; enabled: boolean; note?: string; sent: Set<Part> };
+
+function omittedImage(part: DataPart, imageInput: boolean, note = RECENT_NOTE): string {
+    if (!imageInput) return '[image omitted: not supported by this model]';
+    return `[image omitted: ${imageProblem(part) ?? note}]`;
+}
 
 export function gatewayTools(tools: readonly Tool[], log: (line: string) => void = () => {}, gemini = false): GatewayTool[] {
     const names = new Set<string>();
@@ -254,8 +456,7 @@ function partText(part: Part): string {
     if (part.type === 'text') return part.value;
     if (part.type === 'thinking' || isCacheMarker(part) || isStatefulMarker(part)) return '';
     if (part.type === 'data') {
-        if (part.mimeType.startsWith('text/')) return Buffer.from(part.data).toString('utf8');
-        return `[${part.mimeType.startsWith('image/') ? 'image' : 'document'} omitted: not supported by this model]`;
+        return readTextAttachment(part) ?? `[${part.mimeType.startsWith('image/') ? 'image' : 'document'} omitted: not supported by this model]`;
     }
     if (part.type === 'tool_result') return part.content.map(partText).filter(Boolean).join('\n');
     return '[tool call omitted]';
@@ -275,7 +476,7 @@ export function geminiSignedPart(part: Part): boolean {
 }
 
 /** One message before conversation pairing, also used for byte counting (conservatively, with thinking). No synthetic history here. */
-export function gatewayMessage(message: Message, replayThinking: boolean | 'gemini' = true): { role: Message['role']; content: Block[] } {
+export function gatewayMessage(message: Message, replayThinking: boolean | 'gemini' = true, attachments?: MessageImages): { role: Message['role']; content: Block[] } {
     const content: Block[] = [];
     const thinking: ThinkingBlock[] = [];
     if (replayThinking === 'gemini') {
@@ -284,7 +485,7 @@ export function gatewayMessage(message: Message, replayThinking: boolean | 'gemi
         for (let i = 0; i < message.parts.length; i++) {
             const part = message.parts[i]!;
             if (part.type === 'thinking') continue;
-            const converted = gatewayMessage({ ...message, parts: [part] }, false).content;
+            const converted = gatewayMessage({ ...message, parts: [part] }, false, attachments).content;
             const prior = message.parts[i - 1];
             const validTarget = (part.type === 'text' && part.value !== '')
                 || (part.type === 'tool_call' && converted[0]?.type === 'tool_use');
@@ -305,6 +506,10 @@ export function gatewayMessage(message: Message, replayThinking: boolean | 'gemi
             else if (typeof meta._completeThinking === 'string' && typeof meta.signature === 'string' && meta.signature) {
                 thinking.push({ type: 'thinking', thinking: meta._completeThinking, signature: meta.signature });
             }
+        } else if (message.role === 'user' && isImagePart(part)) {
+            const selected = attachments?.images.has(part) === true;
+            if (selected) attachments?.sent.add(part);
+            content.push(selected ? imageBlock(part) : text(omittedImage(part, attachments?.enabled === true, attachments?.note)));
         } else if (message.role === 'assistant' && part.type === 'tool_call') {
             if (typeof part.callId === 'string' && typeof part.name === 'string' && TOOL_NAME.test(part.callId) && TOOL_NAME.test(part.name) && isObject(part.input) && jsonValue(part.input)) {
                 content.push({ type: 'tool_use', id: part.callId, name: part.name, input: part.input });
@@ -322,7 +527,7 @@ export function gatewayMessage(message: Message, replayThinking: boolean | 'gemi
 
 /** Adapted from #160's pairing repair. Merge roles first; preserve orphan output as plain text and
  * synthesize explicit failed results for cancelled calls. Never invent a successful tool result. */
-export function gatewayConversation(messages: readonly Message[], tools: readonly GatewayTool[], replayThinking: boolean | 'gemini' = false): { system: TextBlock[]; messages: GatewayMessage[] } {
+export function gatewayConversation(messages: readonly Message[], tools: readonly GatewayTool[], replayThinking: boolean | 'gemini' = false, attachments?: MessageImages): { system: TextBlock[]; messages: GatewayMessage[] } {
     const system: TextBlock[] = [];
     const turns: GatewayMessage[] = [];
     const names = new Set(tools.map(tool => tool.name));
@@ -341,7 +546,7 @@ export function gatewayConversation(messages: readonly Message[], tools: readonl
             for (const part of message.parts) { const value = partText(part); if (value) system.push(text(value)); }
             continue;
         }
-        const converted = gatewayMessage(message, replayThinking);
+        const converted = gatewayMessage(message, replayThinking, attachments);
         const content = converted.content.map(block => {
             if (block.type !== 'tool_use') return block;
             if (!names.has(block.name) || seen.has(block.id)) return text('[tool call omitted: unavailable tool or duplicate identifier]');
@@ -413,7 +618,7 @@ export function gatewayInputTokens(model: Pick<ResolvedModel, 'maxInputTokens' |
     return Math.max(1, available - SUMMARY_RESERVE_TOKENS - SYSTEM_RESERVE_TOKENS - (model.toolReserve ?? DEFAULT_TOOL_RESERVE));
 }
 
-export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log?: (line: string) => void): { body: GatewayBody; bytes: Uint8Array<ArrayBuffer> } {
+export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log?: (line: string) => void, required: ReadonlySet<DataPart> = new Set(), imagesAsNotes = false): { body: GatewayBody; bytes: Uint8Array<ArrayBuffer> } {
     const tools = gatewayTools(request.tools, log, geminiRoute(model.model));
     // Never a silent chat without its tools: when Copilot offered tools and none of them can be sent to this model,
     // refuse here (nothing sent, nothing charged) with what to do, rather than answer as if no tools existed.
@@ -422,40 +627,64 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
             + 'features this model cannot take, or they are invalid; see the EZiL Models log). Nothing was sent or charged. Pick another model, '
             + 'or turn those tools off with Configure Tools', undefined, 'local_tools_unsupported', undefined, undefined, 'local');
     }
-    const conversation = gatewayConversation(request.messages, tools, geminiRoute(model.model) ? 'gemini' : replaysThinking(model.model));
-    const body: GatewayBody = {
-        model: model.model, messages: conversation.messages, max_tokens: gatewayRequestOutputTokens(model, request.modelOptions),
-        stream: model.model !== KIMI && model.stream !== false,
+    const imageInput = !imagesAsNotes && model.capabilities.imageInput && (model.gatewayProtocol ?? 'anthropic-messages') === 'anthropic-messages';
+    const rawLimit = gatewayRequestBytes(model);
+    const boundLimit = model.gatewayMaxRequestBytes === undefined ? Math.min(GATEWAY_INPUT_BYTES, model.maxInputTokens) : model.maxInputTokens;
+    const serialize = (currentOnly: boolean) => {
+        const sent = new Set<Part>();
+        const images = sendableImages(request.messages, imageInput, currentOnly ? Math.max(0, currentUserIndex(request.messages)) : 0, required);
+        const conversation = gatewayConversation(request.messages, tools, geminiRoute(model.model) ? 'gemini' : replaysThinking(model.model),
+            { images, enabled: imageInput, ...(currentOnly ? { note: SIZE_NOTE } : {}), sent });
+        if ([...required].some(part => !sent.has(part))) {
+            throw new GatewayError("EZiL AI: The attached image could not be kept in the request. Nothing was sent or charged.",
+                undefined, 'image_input_unsupported', undefined, undefined, 'local');
+        }
+        const body: GatewayBody = {
+            model: model.model, messages: conversation.messages, max_tokens: gatewayRequestOutputTokens(model, request.modelOptions),
+            stream: model.model !== KIMI && model.stream !== false,
+        };
+        if (conversation.system.length) body.system = conversation.system;
+        if (tools.length) { body.tools = tools; body.tool_choice = { type: 'auto' }; }
+        if (request.toolMode === 'required') log?.('[gateway] required tool choice mapped to auto');
+        if (samplingRefused(model.model)) {
+            if (['temperature', 'top_p'].some(key => request.modelOptions[key] !== undefined) || model.temperature !== undefined || model.topP !== undefined) log?.(`[gateway] temperature/top_p not sent: ${model.model} refuses sampling options`);
+        } else for (const [key, configured] of [['temperature', model.temperature], ['top_p', model.topP]] as const) {
+            const value = request.modelOptions[key] ?? configured;
+            if (typeof value === 'number' && Number.isFinite(value)) body[key] = Math.max(0, Math.min(1, value));
+        }
+        // Prompt-cache breakpoints only for a catalog row advertising prompt_cache (Claude routes); a configured cache flag never
+        // adds them. Never on a Gemini body:
+        // the Gateway's Gemini adapter refuses cache_control on any block. Placed before the byte bound so it counts them.
+        if (model.gatewayPromptCache === true && images.size === 0 && !geminiRoute(model.model)) applyCacheBreakpoints(body as unknown as Parameters<typeof applyCacheBreakpoints>[0], '5m');
+        const bytes = new TextEncoder().encode(JSON.stringify(body));
+        let imageBytes = 0, imageCount = 0;
+        for (const message of body.messages) for (const block of message.content) {
+            if (block.type === 'image') { imageCount++; imageBytes += block.source.data.length; }
+        }
+        return { body, bytes, bound: bytes.byteLength - imageBytes + imageCount * CLAUDE_IMAGE_TOKENS };
     };
-    if (conversation.system.length) body.system = conversation.system;
-    if (tools.length) { body.tools = tools; body.tool_choice = { type: 'auto' }; }
-    if (request.toolMode === 'required') log?.('[gateway] required tool choice mapped to auto');
-    if (samplingRefused(model.model)) {
-        if (['temperature', 'top_p'].some(key => request.modelOptions[key] !== undefined) || model.temperature !== undefined || model.topP !== undefined) log?.(`[gateway] temperature/top_p not sent: ${model.model} refuses sampling options`);
-    } else for (const [key, configured] of [['temperature', model.temperature], ['top_p', model.topP]] as const) {
-        const value = request.modelOptions[key] ?? configured;
-        if (typeof value === 'number' && Number.isFinite(value)) body[key] = Math.max(0, Math.min(1, value));
-    }
-    // Prompt-cache breakpoints only for a catalog row advertising prompt_cache (Claude routes); a configured cache flag never
-    // adds them. Never on a Gemini body:
-    // the Gateway's Gemini adapter refuses cache_control on any block. Placed before the byte bound so it counts them.
-    if (model.gatewayPromptCache === true && !geminiRoute(model.model)) applyCacheBreakpoints(body as unknown as Parameters<typeof applyCacheBreakpoints>[0], '5m');
-    const bytes = new TextEncoder().encode(JSON.stringify(body));
-    // The Gateway's limits: 1024 messages, 1024 blocks in one message, body + framing within the input allowance.
+    let { body, bytes, bound } = serialize(false);
+    if (imageInput && (bytes.byteLength > rawLimit || bound + INPUT_FRAMING > boundLimit)) ({ body, bytes, bound } = serialize(true));
+    const effectiveLimit = imageInput ? boundLimit - INPUT_FRAMING
+        : Math.min(rawLimit - (model.gatewayMaxRequestBytes === undefined ? INPUT_FRAMING : 0), boundLimit - INPUT_FRAMING);
     const counts = (): LocalRequestCounts => ({
-        bodyBytes: bytes.byteLength, limitBytes: Math.min(gatewayRequestBytes(model) - (model.gatewayMaxRequestBytes === undefined ? INPUT_FRAMING : 0), model.maxInputTokens - INPUT_FRAMING),
+        bodyBytes: bytes.byteLength > rawLimit ? bytes.byteLength : bound,
+        limitBytes: bytes.byteLength > rawLimit && imageInput ? rawLimit : effectiveLimit,
         messages: body.messages.length, maxBlocks: body.messages.reduce((most, message) => Math.max(most, message.content.length), 0),
         tools: tools.length, toolBytes: tools.length ? Buffer.byteLength(JSON.stringify(tools), 'utf8') : 0,
     });
     if (body.messages.length > 1024) throw new LocalRequestError('local_too_many_messages', counts());
     if (body.messages.some(message => message.content.length > 1024)) throw new LocalRequestError('local_too_many_blocks', counts());
-    if (bytes.byteLength > gatewayRequestBytes(model) || bytes.byteLength + INPUT_FRAMING > model.maxInputTokens
-        || (model.gatewayMaxRequestBytes === undefined && bytes.byteLength + INPUT_FRAMING > GATEWAY_INPUT_BYTES)) throw new LocalRequestError('local_input_too_large', counts());
+    if (bytes.byteLength > rawLimit || bound + INPUT_FRAMING > boundLimit) throw new LocalRequestError('local_input_too_large', counts());
     return { body, bytes };
 }
 
 /** Cheap local token estimate. Transport limits are checked on the serialized body before dispatch;
  * JSON punctuation/escaping is never deliberately inflated to provoke a paid background summary. */
-export function gatewayTokenCount(value: string | Message, _protocol: GatewayProtocol = 'anthropic-messages'): number {
-    return typeof value === 'string' ? estimateTextTokens(value) : estimateMessageTokens(value);
+export function gatewayTokenCount(value: string | Message, protocol: GatewayProtocol = 'anthropic-messages', imageInput = false): number {
+    if (typeof value === 'string') return estimateTextTokens(value);
+    if (value.role !== 'user' || !value.parts.some(isImagePart)) return estimateMessageTokens(value);
+    const images = sendableImages([value], protocol === 'anthropic-messages' && imageInput);
+    const text = estimateMessageTokens({ ...value, parts: value.parts.filter(part => !isImagePart(part)) });
+    return text + images.size * CLAUDE_IMAGE_TOKENS + (value.parts.filter(isImagePart).length - images.size) * 12;
 }
