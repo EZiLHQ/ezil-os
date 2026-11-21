@@ -64,6 +64,7 @@ EZIL_DELEGATED_EDITOR_SESSIONS EZIL_EDITOR_BRIDGE EZIL_EDITOR_BRIDGE_CONTROLS
 # renderer refuses what the receiver would silently ignore. Off unless the gate is "enabled".
 DELEGATION_GATE = "EZIL_DELEGATED_COMPUTER_READS"
 STAGING_EDITOR_SWITCHES = ("EZIL_DELEGATED_EDITOR_SESSIONS", "EZIL_EDITOR_BRIDGE", "EZIL_EDITOR_BRIDGE_CONTROLS")
+STAGING_ONBOARDING = "EZIL_DELEGATED_ONBOARDING"
 STAGING_BROWSER_OBSERVE = "EZIL_DELEGATED_BROWSER_OBSERVE"
 STAGING_BROWSER_OPEN = "EZIL_DELEGATED_BROWSER_OPEN_URL"
 STAGING_BROWSER_ORIGINS = "EZIL_BROWSER_TEST_ALLOWED_ORIGINS"
@@ -93,7 +94,8 @@ def validate(values, environment="staging"):
     if not isinstance(values, dict):
         raise RenderError("Expected a JSON object")
     staging_browser_keys = frozenset((STAGING_BROWSER_OBSERVE, STAGING_BROWSER_OPEN, STAGING_BROWSER_ORIGINS))
-    allowed = REQUIRED | OPTIONAL | (staging_browser_keys if environment == "staging" else frozenset())
+    staging_keys = staging_browser_keys | {STAGING_ONBOARDING}
+    allowed = REQUIRED | OPTIONAL | (staging_keys if environment == "staging" else frozenset())
     if any(key not in allowed and not REGIONAL.fullmatch(key) for key in values):
         raise RenderError("Unknown key refused")
     if REQUIRED - values.keys():
@@ -113,6 +115,15 @@ def validate(values, environment="staging"):
             raise RenderError("Retained rebase approval exceeds its byte limit")
     validate_delegation(values, environment)
     validate_staging_editor(values, environment)
+    onboarding = values.get(STAGING_ONBOARDING)
+    if onboarding not in (None, "enabled", "disabled"):
+        raise RenderError("Onboarding must be exactly enabled or disabled")
+    if onboarding == "enabled" and (
+        not all(pin in values for pin in DELEGATION_PINS)
+        or values["EZIL_DELEGATION_ISSUER"] != "https://connect-staging.ezil.work"
+        or values["EZIL_DELEGATION_AUDIENCE"] != "https://os-staging.ezil.work"
+    ):
+        raise RenderError("Staging onboarding requires the canonical staging delegation origins and complete pins")
     for key, feature in ((STAGING_BROWSER_OBSERVE, "Browser observation"), (STAGING_BROWSER_OPEN, "Browser navigation")):
         setting = values.get(key)
         if setting not in (None, "enabled", "disabled"):

@@ -409,6 +409,18 @@ class DelegationEnvironmentTests(unittest.TestCase):
         for base, environment in ((self.staging, "staging"), (self.production, "production")):
             self.assertEqual(renderer.validate(dict(base), environment), base)
 
+    def test_onboarding_is_separately_stage_gated_by_complete_canonical_delegation_pins(self):
+        key = "EZIL_DELEGATED_ONBOARDING"
+        complete = delegation(EZIL_DELEGATION_ISSUER="https://connect-staging.ezil.work",
+                              EZIL_DELEGATION_AUDIENCE="https://os-staging.ezil.work")
+        self.assertNotIn(key, renderer.validate(self.staging))
+        renderer.validate({**self.staging, key: "disabled"})
+        renderer.validate({**self.staging, **complete, key: "enabled"})
+        self.refused({key: "enabled"}, "staging")
+        self.refused({**complete, key: "true"}, "staging")
+        self.refused({**complete, key: "enabled", "EZIL_DELEGATION_ISSUER": "https://other.example.invalid"}, "staging")
+        self.refused({key: "disabled"}, "production")
+
     def test_editor_switches_are_default_off_and_staging_only(self):
         first, second, controls = renderer.STAGING_EDITOR_SWITCHES
         origins = delegation(EZIL_DELEGATION_ISSUER="https://connect-staging.ezil.work",

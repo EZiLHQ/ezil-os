@@ -30,6 +30,9 @@ import { verifyDelegation } from './delegation-core';
 import {
     EDITOR_DELEGATION_POLICY, editorDelegationBinding, editorDelegationEnabled, type TrpcDelegationRequest,
 } from './editor-delegation';
+import {
+    ONBOARDING_DELEGATION_POLICY, onboardingDelegationBinding, onboardingDelegationEnabled,
+} from './onboarding-delegation';
 
 
 /**
@@ -64,10 +67,14 @@ async function delegatedContext(headers: Headers, request: TrpcDelegationRequest
         reason = 'transport';
     } else {
         const editor = editorDelegationEnabled(process.env) ? editorDelegationBinding(request) : undefined;
+        const onboarding = onboardingDelegationEnabled(process.env) ? onboardingDelegationBinding(request) : undefined;
+        const scoped = editor
+            ? { binding: editor, policy: EDITOR_DELEGATION_POLICY }
+            : onboarding ? { binding: onboarding, policy: ONBOARDING_DELEGATION_POLICY } : undefined;
         const computer = delegatedReadsEnabled(process.env.EZIL_DELEGATED_COMPUTER_READS);
         // Read per request from process.env, not `@/env`: the pins are optional and absent ones only reject.
         const verifier = {
-            config: editor || computer ? await delegationConfig({
+            config: scoped || computer ? await delegationConfig({
                 EZIL_DELEGATION_ISSUER: process.env.EZIL_DELEGATION_ISSUER,
                 EZIL_DELEGATION_AUDIENCE: process.env.EZIL_DELEGATION_AUDIENCE,
                 EZIL_DELEGATION_PUBLIC_JWKS: process.env.EZIL_DELEGATION_PUBLIC_JWKS,
@@ -78,13 +85,11 @@ async function delegatedContext(headers: Headers, request: TrpcDelegationRequest
             consumeJti: (jti: string, expiresAt: number) => consumeDelegationJti(db, jti, expiresAt),
             findAccount: (identity: Parameters<typeof findDelegatedAccount>[1]) => findDelegatedAccount(db, identity),
         };
-        if (editor) {
-            const outcome = await verifyDelegation(headers, {
-                ...verifier, enabled: true, binding: editor, policy: EDITOR_DELEGATION_POLICY,
-            });
+        if (scoped) {
+            const outcome = await verifyDelegation(headers, { ...verifier, ...scoped, enabled: true });
             if (outcome.kind === 'accepted') return {
                 db, user: delegatedUser(outcome.account), headers,
-                delegation: { status: 'accepted', call: outcome.caller, type: editor.type },
+                delegation: { status: 'accepted', call: outcome.caller, type: scoped.binding.type },
             };
             reason = outcome.kind === 'rejected' ? outcome.reason : 'malformed';
         } else {
