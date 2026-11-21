@@ -2,7 +2,8 @@ import type { ChatRequest, Message, Part } from '../../src/types';
 import { KIMI, QWEN } from '../../src/gateway-messages';
 import { model } from './load';
 
-export const gw = (id = QWEN) => model({ id, model: id, name: id, stream: id !== KIMI, maxInputTokens: 131072, maxOutputTokens: id === KIMI ? 4096 : 8192, toolReserve: 24000 },
+export const gw = (id = QWEN) => model({ id, model: id, name: id, stream: id !== KIMI, maxInputTokens: 131072, maxOutputTokens: id === KIMI ? 4096 : 8192, toolReserve: 24000,
+    capabilities: { toolCalling: true, imageInput: false } },
     { type: 'ezil-gateway', name: 'ezil', baseUrl: 'https://proxy.invalid/ai/v1', apiKey: 'synthetic-proxy-token' });
 export const txt = (value: string): Part => ({ type: 'text', value });
 export const msg = (role: Message['role'], ...parts: Part[]): Message => ({ role, parts });

@@ -96,7 +96,7 @@ describe('Responses request subset', () => {
         expect(buildGatewayResponsesBody(model(), options).body).toMatchObject({ temperature: 0.2, top_p: 0.9 });
     });
 
-    for (const mimeType of ['text/plain', 'text/markdown']) test(`inlines ${mimeType} data in messages and nested tool results, as on Messages`, () => {
+    for (const mimeType of ['text/plain', 'text/markdown', 'application/json']) test(`inlines ${mimeType} data in messages and nested tool results, as on Messages`, () => {
         const data = { ...image, mimeType, data: new TextEncoder().encode('line one\nline two') };
         expect(build(ask([msg('user', txt('Inspect this '), data)])).body.input).toEqual([
             { type: 'message', role: 'user', content: 'Inspect this line one\nline two' }]);
@@ -111,7 +111,7 @@ describe('Responses request subset', () => {
         expect(build(ask([msg('user', data)])).body.input).toEqual([{ type: 'message', role: 'user', content: 'héllo 🌍 日本語' }]);
     });
 
-    for (const mimeType of ['image/png', 'application/pdf', 'audio/wav', 'application/json']) test(`refuses ${mimeType} in messages and nested tool results`, () => {
+    for (const mimeType of ['image/png', 'application/pdf', 'audio/wav']) test(`refuses ${mimeType} in messages and nested tool results`, () => {
         const data = { ...image, mimeType };
         expect(() => build(ask([msg('user', txt('Inspect this'), data)]))).toThrow('text and function tools only');
         expect(() => build(ask([msg('assistant', call('call_1')), msg('user', result('call_1', [txt('Result:'), data]))]))).toThrow('text and function tools only');

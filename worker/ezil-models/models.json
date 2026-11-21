@@ -3,6 +3,7 @@
     "ezil": {
       "type": "ezil-gateway",
       "baseUrl": "{env:EZIL_AI_BASE_URL}",
+      "catalogImageInput": true,
       "apiKey": "{env:EZIL_AI_PROXY_TOKEN}"
     }
   },
