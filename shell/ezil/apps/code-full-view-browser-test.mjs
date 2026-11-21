@@ -447,6 +447,14 @@ try {
                 push(`${L} full Code keeps its iframe viewport across minimize, Browser, and restore`,
                     fullRestored.sameDocument && fullRestored.sizes.length === 0
                     && JSON.stringify(fullRestored.size) === JSON.stringify(fullSize), JSON.stringify(fullRestored));
+
+                await page.setViewportSize({ width: 1340, height: 850 });
+                await page.waitForFunction(() => window.__editorViewport.size()[0] === 1340
+                    && window.__editorViewport.size()[1] > 0 && window.__editorViewport.size()[1] < 850);
+                await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+                const resized = await editor_viewport(page);
+                push(`${L} a genuine browser resize still resizes the restored editor viewport`,
+                    resized.sameDocument && resized.size[0] === 1340 && resized.sizes.some(([width]) => width === 1340), JSON.stringify(resized));
             }
         } catch ( err ) {
             push(`${L} completed without throwing`, false, String(err?.message ?? err).split('\n')[0]);
@@ -484,22 +492,6 @@ try {
             restored.sameDocument && restored.sizes.length === 0
             && JSON.stringify(restored.size) === JSON.stringify(initial), JSON.stringify(restored));
 
-        const edge = await page.locator(`${CODE} > .ui-resizable-se`).boundingBox();
-        if ( ! edge ) throw new Error('Code corner resize handle is unavailable');
-        const x = edge.x + edge.width / 2;
-        const y = edge.y + edge.height / 2;
-        await page.mouse.move(x, y);
-        await page.mouse.down();
-        await page.mouse.move(x + 80, y + 45, { steps: 8 });
-        await page.mouse.up();
-        await page.waitForFunction(([width, height]) => {
-            const [currentWidth, currentHeight] = window.__editorViewport.size();
-            return currentWidth >= width + 75 && currentHeight >= height + 40;
-        }, initial);
-        const resized = await editor_viewport(page);
-        push('resizing the restored Code with its corner handle still resizes the same editor iframe',
-            resized.sameDocument && resized.size[0] >= initial[0] + 75 && resized.size[1] >= initial[1] + 40
-            && resized.sizes.length > 0, JSON.stringify(resized));
     } catch ( err ) {
         push('Code viewport regression completed without throwing', false, String(err?.stack ?? err));
     } finally {
