@@ -45,7 +45,8 @@ const sh = command => execFileSync('docker', ['exec', CONTAINER, 'bash', '-c', c
 const GIT = "git -c safe.directory='*'";
 const quote = value => "'" + value.replaceAll("'", "'\\''") + "'";
 const clean = s => s.replace(/\s+/g, ' ').trim();
-const CHAT = join(FOLDER, '.ezil', 'chat');
+const REPO_CHAT = process.env.EZIL_E2E_REPO_CHAT_DIR;
+const CHAT = REPO_CHAT || join(FOLDER, '.ezil', 'chat');
 // Session files that mention the prompt: in the workspace, and anywhere in the editor profile.
 const filesWith = text => sh(`grep -l -F ${quote(text)} ${quote(CHAT)}/*.jsonl ${quote(CHAT)}/*.json 2>/dev/null || true`).split('\n').filter(Boolean);
 const sessionFiles = () => filesWith(PROMPT);
@@ -96,7 +97,9 @@ const until = async (predicate, label, ms = T) => {
 
 try {
   await openWorkbench();
-  check('the history folder exists before the editor starts', sh(`test -d ${quote(CHAT)} && ! test -L ${quote(CHAT)} && echo yes || echo no`).trim() === 'yes');
+  const chatFolderExists = () => sh("test -d " + quote(CHAT) + " && ! test -L " + quote(CHAT) + " && echo yes || echo no").trim() === 'yes';
+  check('the expected chat history folder is available',
+    REPO_CHAT ? await until(chatFolderExists, 'managed repository chat folder', 15_000) : chatFolderExists());
 
   if (PHASE === 'create') {
     check('prompt sent', await sendPrompt(PROMPT));
@@ -104,12 +107,16 @@ try {
     // The store writes on its storage flush; give it time, then require exactly one file.
     await until(async () => sessionFiles().length > 0, 'session file in the workspace', 90_000);
     const files = sessionFiles();
-    check('the conversation is saved once, in <workspace>/.ezil/chat', files.length === 1, JSON.stringify(files));
+    check('the conversation is saved once in the expected history folder', files.length === 1, JSON.stringify(files));
     const copies = profileCopies();
     check('no chat session copy in the editor profile', !copies.some(c => c.includes('/chatSessions/')), JSON.stringify(copies));
     info('other editor-profile files that contain the prompt (Copilot traces/transcripts; not removed by a delete)', JSON.stringify(copies));
-    const initStatus = sh(`cd ${quote(FOLDER)} && ${GIT} init -q && ${GIT} status --porcelain --untracked-files=all`).split('\n').filter(Boolean);
-    check('.ezil is ignored by Git', !initStatus.some(l => l.includes('.ezil')), JSON.stringify(initStatus.slice(0, 8)));
+    if (REPO_CHAT) {
+      check('the repo wrapper still contains only the checkout', sh("ls -A " + quote(FOLDER)).trim() === 'checkout');
+    } else {
+      const initStatus = sh(`cd ${quote(FOLDER)} && ${GIT} init -q && ${GIT} status --porcelain --untracked-files=all`).split('\n').filter(Boolean);
+      check('.ezil is ignored by Git', !initStatus.some(l => l.includes('.ezil')), JSON.stringify(initStatus.slice(0, 8)));
+    }
   } else if (PHASE === 'verify') {
     check('the saved conversation survived the restart', sessionFiles().length === 1, JSON.stringify(sessionFiles()));
     info('browser address (a different host:port than the create phase means a different workspace-storage id)', new URL(CODE_URL).host);
@@ -150,18 +157,20 @@ try {
       }
       await page.keyboard.press('Escape').catch(() => {});
     }
-    // The create phase ran `git init`, so this launch found a repository at the root. `git clean -X`
-    // removes the ignored .ezil under the running editor, whose next write recreates .ezil/chat
-    // (simulated here; FileService creates missing parents) without .ezil/.gitignore.
-    const exclude = join(FOLDER, '.git', 'info', 'exclude');
-    check('launch added /.ezil/ to the repository\'s local exclude', sh(`grep -qxF /.ezil/ ${quote(exclude)} && echo yes || echo no`).trim() === 'yes');
-    const ezilStatus = () => sh(`cd ${quote(FOLDER)} && ${GIT} status --porcelain --untracked-files=all`).split('\n').filter(Boolean);
-    sh(`cd ${quote(FOLDER)} && ${GIT} clean -fdXq && mkdir -p .ezil/chat && echo '{}' > .ezil/chat/after-clean.jsonl && echo x > after-clean.txt`);
-    const status = ezilStatus();
-    check('after git clean -X, a recreated .ezil/chat stays out of Git before any capture (a normal file is listed)',
-      status.some(l => l.includes('after-clean.txt')) && !status.some(l => l.includes('.ezil')), JSON.stringify(status));
-    sh(`bash /usr/local/bin/editor-state.sh capture ${quote(FOLDER)}`);
-    check('the next capture restores .ezil/.gitignore', sh(`tail -n 1 ${quote(join(FOLDER, '.ezil', '.gitignore'))} 2>/dev/null || true`).trim() === '*');
+    if (!REPO_CHAT) {
+      // The create phase ran `git init`, so this launch found a repository at the root. `git clean -X`
+      // removes the ignored .ezil under the running editor, whose next write recreates .ezil/chat
+      // (simulated here; FileService creates missing parents) without .ezil/.gitignore.
+      const exclude = join(FOLDER, '.git', 'info', 'exclude');
+      check('launch added /.ezil/ to the repository\'s local exclude', sh(`grep -qxF /.ezil/ ${quote(exclude)} && echo yes || echo no`).trim() === 'yes');
+      const ezilStatus = () => sh(`cd ${quote(FOLDER)} && ${GIT} status --porcelain --untracked-files=all`).split('\n').filter(Boolean);
+      sh(`cd ${quote(FOLDER)} && ${GIT} clean -fdXq && mkdir -p .ezil/chat && echo '{}' > .ezil/chat/after-clean.jsonl && echo x > after-clean.txt`);
+      const status = ezilStatus();
+      check('after git clean -X, a recreated .ezil/chat stays out of Git before any capture (a normal file is listed)',
+        status.some(l => l.includes('after-clean.txt')) && !status.some(l => l.includes('.ezil')), JSON.stringify(status));
+      sh(`bash /usr/local/bin/editor-state.sh capture ${quote(FOLDER)}`);
+      check('the next capture restores .ezil/.gitignore', sh(`tail -n 1 ${quote(join(FOLDER, '.ezil', '.gitignore'))} 2>/dev/null || true`).trim() === '*');
+    }
   } else {
     // The founder's report: send, press Go Back while the answer streams, and the running chat is
     // gone from view. Upstream Go Back starts a new chat and leaves the old one running; the Sessions

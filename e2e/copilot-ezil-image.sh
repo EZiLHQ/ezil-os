@@ -13,8 +13,8 @@ OUT="$(mkdir -p "${EZIL_COPILOT_E2E_OUT:-./ezil-e2e-out}" && cd "${EZIL_COPILOT_
 CODE_URL=""
 FORWARD_PORT="${EZIL_COPILOT_E2E_PORT:-18443}"
 FORWARD_PID=""
-# Passes to run, in order (default all): fresh returning history sessions lifecycle compaction phone early subagent flash plan
-PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history sessions lifecycle compaction phone early subagent flash plan} "
+# Passes to run, in order (default all): fresh returning history repo-history sessions lifecycle compaction phone early subagent flash plan
+PASSES=" ${EZIL_COPILOT_E2E_PASSES:-fresh returning history repo-history sessions lifecycle compaction phone early subagent flash plan} "
 MOCK_PORT=4142
 TEST_TOKEN=lanec-e2e-only
 CAPTURE_DIR=/tmp/copilot-ezil-mock
@@ -177,9 +177,9 @@ run_compaction() { # run_compaction <outdir>
   EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" \
   EZIL_E2E_CAPTURE_DIR="$CAPTURE_DIR" EZIL_E2E_OUT="$1" node "$here/copilot-ezil-compaction.mjs"
 }
-run_history() { # run_history <create|verify|sessions> <outdir>
-  EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER=/home/neko/project EZIL_E2E_CONTAINER="$NAME" \
-  EZIL_E2E_PHASE="$1" EZIL_E2E_OUT="$2" node "$here/copilot-ezil-history.mjs"
+run_history() { # run_history <create|verify|sessions> <outdir> [folder] [repo-chat-dir]
+  EZIL_CODE_URL="$CODE_URL" EZIL_E2E_FOLDER="${3:-/home/neko/project}" EZIL_E2E_CONTAINER="$NAME" \
+  EZIL_E2E_PHASE="$1" EZIL_E2E_OUT="$2" EZIL_E2E_REPO_CHAT_DIR="${4:-}" node "$here/copilot-ezil-history.mjs"
 }
 
 collect_logs() { # collect_logs <prefix>
@@ -262,6 +262,36 @@ boot "$ST4"
 start_mock || fail=1
 run_history verify "$OUT/history-verify" || fail=1
 collect_logs history-verify
+reset_sink_logs
+fi
+
+# A direct repository link opens a managed checkout-only wrapper under the workspace.
+if [[ "$PASSES" == *" repo-history "* ]]; then
+echo "[e2e] repo history — reopen a conversation from a managed repository link in a new container"
+REPO_ID=5833e60e-4196-4f4f-8f96-192e0f3c6c76
+REPO_FOLDER="/home/neko/project/projects/$REPO_ID"
+REPO_CHAT="/home/neko/project/.ezil/repo-chat/$REPO_ID"
+STR="$WORK/repo-history"
+mkdir -p "$STR$REPO_FOLDER/checkout" "$STR/etc/ezil"
+git -C "$STR$REPO_FOLDER/checkout" init -q
+cp "$here/copilot-ezil-models.json" "$STR/etc/ezil/models.e2e.json"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$STR"
+start_mock || fail=1
+run_history create "$OUT/repo-history-create" "$REPO_FOLDER" "$REPO_CHAT" || fail=1
+collect_logs repo-history-create
+network_checks repo-history-create || fail=1
+reset_sink_logs
+STR2="$WORK/repo-history-restart"
+mkdir -p "$STR2/home/neko" "$STR2/etc/ezil"
+cp "$here/copilot-ezil-models.json" "$STR2/etc/ezil/models.e2e.json"
+docker cp "$NAME:/home/neko/project" "$STR2/home/neko/"
+FORWARD_PORT=$((FORWARD_PORT + 1))
+boot "$STR2"
+start_mock || fail=1
+run_history verify "$OUT/repo-history-verify" "$REPO_FOLDER" "$REPO_CHAT" || fail=1
+collect_logs repo-history-verify
+network_checks repo-history-verify || fail=1
 reset_sink_logs
 fi
 
