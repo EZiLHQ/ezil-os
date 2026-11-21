@@ -323,6 +323,18 @@ describe('the private unattended workbench (docs/UNATTENDED-CODE.md)', () => {
         void fetched;
     });
 
+    test('withdrawal of the main bridge preference during a sync prevents dispatch even in an open window', async () => {
+        let allowed = true;
+        const calls: unknown[] = [];
+        const { client } = deps(false, { bridgeEnabled: () => allowed,
+            execute: async request => { calls.push(request.op); return hello(false); },
+            fetch: async () => { allowed = false; return Response.json({ok:true, protocol:2, owner:'self', epoch:1,
+                pollMs:1000, deliver:[{kind:'send', operationId:OP, attemptId:ATTEMPT, sessionResource:'ignored'}]}); },
+        });
+        await client.tick();
+        expect(calls).toEqual(['hello']);
+    });
+
     test('no consent callback at all is no consent', async () => {
         const { client, bodies } = deps(true);
         await client.tick();
