@@ -114,16 +114,23 @@ describe('capabilities: never more than the row says', () => {
         expect(g.posts[0]!.body.tools).toBeUndefined();
     });
 
-    test('capabilities turn tools and streaming on for a catalog-only row (images never); Kimi stays JSON whatever its row says', async () => {
+    test('capabilities turn tools and streaming on for a catalog-only row (including opted-in PNG); Kimi stays JSON whatever its row says', async () => {
         const g = gateway(load(), () => Response.json(v1([row(KIMI, 'available', { capabilities: { streaming: true } }),
-            row('synthetic-chat-a', 'available', { capabilities: { tool_calling: true, streaming: true, image_input: true, unknown_flag: true } })])));
+            row('synthetic-chat-a', 'available', { capabilities: { tool_calling: true, streaming: true, image_input: true, image_input_mime_types: ['image/png'], unknown_flag: true } })])));
         const infos = await list(g.provider);
-        expect(infos[2]!.capabilities).toEqual({ toolCalling: true, imageInput: false });
+        expect(infos[2]!.capabilities).toEqual({ toolCalling: true, imageInput: true });
         await send(g.provider, infos[2]!, undefined, [READ_FILE]);
         await send(g.provider, infos[1]!);
         expect(g.posts.map(post => [post.body.model, post.body.stream, post.accept])).toEqual([
             ['synthetic-chat-a', true, 'text/event-stream'], [KIMI, false, 'application/json']]);
         expect((g.posts[0]!.body.tools as { name: string }[]).map(tool => tool.name)).toEqual(['read_file']);
+    });
+
+    test('a discovered Messages model with a non-PNG MIME declaration stays text-only', async () => {
+        const g = gateway(load(), () => Response.json(v1([row('synthetic-jpeg', 'available', {
+            capabilities: { image_input: true, image_input_mime_types: ['image/jpeg'] },
+        })])));
+        expect((await list(g.provider)).find(info => info.id === 'ezil/synthetic-jpeg')?.capabilities.imageInput).toBe(false);
     });
 
     test('the catalog lowers a configured model: Qwen without streaming goes as JSON, and without tool calling never gets tools', async () => {

@@ -54,6 +54,28 @@ Output caps clamp to 16–16384. `temperature` and `topP` in model configuration
 (or `temperature`/`top_p` in modelOptions) clamp to [0,1]. `stream` configures
 Qwen's response mode. Both models advertise `imageInput: false`.
 
+### Gateway attachments
+
+Image availability comes from the authenticated model catalog. The built-in
+Gateway provider opts in to model discovery with `catalogImageInput`.
+Per-model configuration can still disable images. A model must advertise
+`image_input: true` on its selected Anthropic Messages route and, when the
+catalog supplies a MIME list, include `image/png`. Custom providers can
+opt in per model. The client requires the catalog before sending images.
+
+The Gateway accepts up to four non-interlaced PNGs, each up to 1 MiB and
+8,000 px per side, with an 8 MiB total decoded budget. The serialized request
+must fit the negotiated proxy limit. The client preserves PNG bytes and their
+order in the current user message. Older images can become text notes to fit
+the request budget before compaction folds text. Current attachments remain
+across compaction or the turn fails with an explanation. Title and summary
+requests can describe attachments without sending their bytes.
+
+UTF-8 text and JSON data parts go as text context on both Gateway protocols.
+Unsupported current binary attachments fail before a request is sent.
+The suite exercises the Code proxy handler with compacted Agent-mode history
+and checks that the provider receives the original PNG bytes.
+
 Token counting measures serialized UTF-8 bytes; a message counts as its
 serialized wire message. Copilot 0.69 uses this count for its own tool
 definitions against the advertised input, one count per schema key and string
