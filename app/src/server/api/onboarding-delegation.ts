@@ -7,12 +7,13 @@ import type { TRPCContext } from './trpc';
 export const ACCOUNT_SETTINGS_PROCEDURE = 'account.mcpSettings';
 export const NAMED_COMPUTER_PROCEDURE = 'computer.createNamed';
 const reads = new Set([ACCOUNT_SETTINGS_PROCEDURE]);
-const writes = new Set([NAMED_COMPUTER_PROCEDURE]);
+const writes = new Set([NAMED_COMPUTER_PROCEDURE, 'account.mcpSetSetting']);
 
 export const ONBOARDING_DELEGATION_POLICY = {
     scopeByProcedure: new Map([
         [ACCOUNT_SETTINGS_PROCEDURE, 'ezil:settings:read'],
         [NAMED_COMPUTER_PROCEDURE, 'ezil:computers:create'],
+        ['account.mcpSetSetting', 'ezil:settings:write'],
     ]),
 } satisfies DelegationPolicy;
 
@@ -37,7 +38,7 @@ export function onboardingDelegationBinding(request: TrpcDelegationRequest) {
 
 export function requireOnboardingCaller(
     ctx: Pick<TRPCContext, 'delegation' | 'user'>,
-    procedure: typeof ACCOUNT_SETTINGS_PROCEDURE | typeof NAMED_COMPUTER_PROCEDURE,
+    procedure: typeof ACCOUNT_SETTINGS_PROCEDURE | typeof NAMED_COMPUTER_PROCEDURE | 'account.mcpSetSetting',
 ) {
     const delegation = ctx.delegation;
     if (!onboardingDelegationEnabled(process.env) || delegation?.status !== 'accepted'

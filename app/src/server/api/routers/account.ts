@@ -2,18 +2,47 @@ import { asc } from 'drizzle-orm';
 import { z } from 'zod';
 
 import { getBillingDeps } from '@/server/billing/deps';
+import type { SizeCode } from '@/server/billing/v2/contract';
 import { loadComputeBillingState } from '@/server/billing/v2/compute-access';
 import { waitingCredits } from '@/server/billing/v3/summary';
 import { computers } from '@/server/db/schema';
+import type { PlacementDb } from '@/server/lib/compute/placement';
 
 import { ACCOUNT_SETTINGS_PROCEDURE, requireOnboardingCaller } from '../onboarding-delegation';
 import { completeMcpConnection, mcpIdentityProof } from '../mcp-identity-bootstrap';
+import {
+    allowedComputerSizes, applySetting, requireSettingsWriteCaller, SETTINGS_WRITE_PROCEDURE, settingsWriteInput,
+} from '../settings-write-delegation';
+import { controlCall } from '../control-call';
 import { createTRPCRouter, protectedProcedure, publicProcedure } from '../trpc';
 import { readSettingsAiBalance } from './account-ai-balance';
 import { liveComputersOf, MAX_COMPUTERS_PER_USER } from './computer-store';
 
 export const accountRouter = createTRPCRouter({
     completeMcpConnection: publicProcedure.input(mcpIdentityProof).mutation(({ ctx, input }) => completeMcpConnection(ctx, input)),
+    /**
+     * The EZiL MCP `set_setting` (`ezil:settings:write`): a rename, a size within the allowed sizes, or the link that
+     * confirms a plan change. The gate runs before the input is read; billing is never previewed, confirmed or written.
+     */
+    mcpSetSetting: protectedProcedure
+        .use(({ ctx, next }) => {
+            requireSettingsWriteCaller(ctx);
+            return next();
+        })
+        .input(settingsWriteInput)
+        .mutation(({ ctx, input }) => controlCall(ctx, SETTINGS_WRITE_PROCEDURE, input.idempotencyKey, () => applySetting({
+            db: ctx.db,
+            allowedSizes: async () => {
+                const deps = getBillingDeps();
+                return allowedComputerSizes(await loadComputeBillingState(deps, ctx.user.id, deps.now()).catch(() => null));
+            },
+            switchSize: async (computerId, size, requestId) => {
+                // Loaded on use: dispatch pulls in the providers, which validate the server env at import.
+                const { switchComputerConfiguration } = await import('./compute-dispatch');
+                return switchComputerConfiguration(ctx.db as unknown as PlacementDb, { userId: ctx.user.id, computerId },
+                    { size: size as SizeCode, requestId });
+            },
+        }, ctx.user.id, input))),
     mcpSettings: protectedProcedure.input(z.object({}).strict()).query(async ({ ctx, signal }) => {
         requireOnboardingCaller(ctx, ACCOUNT_SETTINGS_PROCEDURE);
         const userId = ctx.user.id;
@@ -38,9 +67,7 @@ export const accountRouter = createTRPCRouter({
             computers: owned,
             entitlements: {
                 planSku: billing?.planSku ?? null,
-                allowedComputerSizes: !billing ? null
-                    : billing.summary.version === 3 ? billing.summary.computer.machineChoice.map(option => option.size)
-                    : [billing.entitledSize],
+                allowedComputerSizes: allowedComputerSizes(billing),
             },
             usage: {
                 compute: billing && {
