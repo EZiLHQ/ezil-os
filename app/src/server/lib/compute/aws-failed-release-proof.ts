@@ -59,8 +59,14 @@ function parse(text: string | undefined): unknown {
  * as the release found it (running, its data volume attached), so the release may be replayed as itself. EC2 state alone is
  * never evidence; a history that entered any other task state, scheduled any task, or saw an observe succeed proves nothing. */
 export function proveFailedReleaseNeverActed(e: Execution, events: readonly HistoryEvent[], work: LifecycleWork): boolean {
+    const i = work.intent;
+    return i.operation === 'release' && !!i.providerInstanceId && !!i.dataVolumeId
+        && proveFailedBeforeObservation(e, events, work);
+}
+
+/** The validated immutable workflow stopped in its first, read-only observer without any provider task. */
+export function proveFailedBeforeObservation(e: Execution, events: readonly HistoryEvent[], work: LifecycleWork): boolean {
     const i = work.intent, d = i.deployment;
-    if (i.operation !== 'release' || !i.providerInstanceId || !i.dataVolumeId) return false;
     if (e.status !== 'FAILED' || e.redriveCount !== 0 || e.stateMachineAliasArn || typeof e.input !== 'string' || e.input !== work.input
         || e.executionArn !== lifecycleExecutionArn(d, i.jobId) || e.stateMachineVersionArn !== work.stateMachineArn || !named(e.error)
         || !(e.startDate instanceof Date) || !(e.stopDate instanceof Date)) return false;

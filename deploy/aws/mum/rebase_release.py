@@ -413,7 +413,7 @@ def make_plan(directory, config_path, identity_path, system_id=None, rollout_pat
     evidence = {name: digest(directory / name) for name in ('bake-inputs.json', 'build-arn.txt', 'build.json', 'image.json', source_name, 'deployed-release.json')}
     deployed, source = release_roles(directory, maintenance)
     lineage(bake, source, maintenance)
-    rollout = pin_rollout(rollout_path, bake) if rollout_path else None
+    rollout = pin_rollout(rollout_path, bake, launch_transition=(deployed['amiId'], ami)) if rollout_path else None
     if json_tool.NAMESPACE == 'prd': need(rollout is not None, 'production requires reviewed rollout and app artifact')
     with json_tool.app_secret_lock() as fd:
         envelope = json_tool.secret_aws(['get-secret-value', '--secret-id', json_tool.SECRET, '--output', 'json'], lock_fd=fd)
@@ -465,14 +465,14 @@ def load_plan(path):
         need(digest(path.parent / name) == expected, 'bake evidence changed')
     bake, ami, build_arn = bake_evidence(path.parent)
     need(plan['bake'] == bake and plan['amiId'] == ami and plan['buildArn'] == build_arn, 'plan bake mismatch')
-    _, source = plan_roles(path, plan)
+    deployed, source = plan_roles(path, plan)
     lineage(bake, source, plan['maintenance'])
     deployment = staging(manifest.read(plan['configPath']))
     if json_tool.NAMESPACE == 'prd':
         json_tool.namespace_config('identity', plan['identityConfigPath'])
         need(manifest.read(plan['identityConfigPath']).get('imageJobDeployment') == deployment, 'identity boundary and deployment tuple disagree')
     if plan['rollout'] is not None:
-        verify_rollout(plan['rollout'])
+        verify_rollout(plan['rollout'], launch_transition=(deployed['amiId'], ami))
     return plan
 
 
@@ -575,10 +575,13 @@ def apply_schema(path, apply):
 
 
 
-def pin_rollout(path, bake):
+def pin_rollout(path, bake, *, launch_transition=None):
     value=manifest.read(safe_path(path))
     need(set(value) in ({'schemaVersion','stacks','app'},{'schemaVersion','stacks','app','poolIam'}) and type(value['schemaVersion']) is int and value['schemaVersion']==1,'invalid rollout review')
     need(set(value['stacks'])==set(cfn.STACKS),'all three stack reviews required')
+    if json_tool.NAMESPACE == 'prd':
+        need(launch_transition is not None, 'production launch transition pins required')
+        value['schemaVersion'] = 2
     if 'poolIam' in value:
         value['poolIam']=str(safe_path(value['poolIam']))
         value['poolIamSha256']=digest(value['poolIam'])
@@ -591,7 +594,8 @@ def pin_rollout(path, bake):
             spec[name+'Path']=str(safe_path(spec[name+'Path']))
             spec[name+'Sha256']=digest(spec[name+'Path'])
         need(spec['roleArn'] == (None if phase == 'identity' else cfn.ROLE), 'rollout execution role mismatch')
-        validate_stack_review(phase,spec,pool_iam)
+        validate_stack_review(phase,spec,pool_iam,
+                              launch_transition=launch_transition if value['schemaVersion'] == 2 else None)
     app=value['app']
     need(set(app)=={'tag','gitSha','checksumSha256'},'invalid app review fields')
     need(app['gitSha']==bake['agentCommit'],'app and host must use the same reviewed integrated source commit')
@@ -601,22 +605,31 @@ def pin_rollout(path, bake):
     return value
 
 
-def validate_stack_review(phase,spec,pool_iam=None):
+def validate_stack_review(phase,spec,pool_iam=None, *, launch_transition=None):
     if 'beforeParameters' in spec:
         need(phase=='identity' and spec['changeSetArn'] is None,'beforeParameters requires unchanged identity')
         cfn.parameters(spec['beforeParameters'])
-    cfn.validate_templates(phase,manifest.read(spec['beforeTemplatePath']),manifest.read(spec['candidateTemplatePath']),
-                           manifest.read(spec['reviewPath']),unchanged=spec['changeSetArn'] is None,pool_iam=pool_iam)
+    before = manifest.read(spec['beforeTemplatePath'])
+    after = manifest.read(spec['candidateTemplatePath'])
+    if phase == 'workflows' and launch_transition is not None:
+        cfn.bind_production_launch_images(before, after, *launch_transition)
+    cfn.validate_templates(phase, before, after, manifest.read(spec['reviewPath']), unchanged=spec['changeSetArn'] is None,
+                           pool_iam=pool_iam, retain_launch_image=launch_transition is not None)
 
 
-def verify_rollout(value):
+def verify_rollout(value, *, launch_transition=None):
+    version = value['schemaVersion']
+    need(type(version) is int and version in (1, 2), 'unsupported sealed rollout version')
+    need(version == 1 or (json_tool.NAMESPACE == 'prd' and launch_transition is not None),
+         'production launch transition pins required')
     pool_iam=cfn.load_pool_iam(value,digest)
     for phase,spec in value['stacks'].items():
         for name in ('beforeTemplate','candidateTemplate','review'):
             need(digest(spec[name+'Path'])==spec[name+'Sha256'],'rollout artifact changed')
         need(spec['stackName'] == cfn.STACKS[phase], 'rollout stack namespace mismatch')
         need(spec['roleArn'] == (None if phase == 'identity' else cfn.ROLE), 'rollout execution role mismatch')
-        validate_stack_review(phase,spec,pool_iam)
+        validate_stack_review(phase,spec,pool_iam,
+                              launch_transition=launch_transition if value['schemaVersion'] == 2 else None)
     need(digest(REPO/'deploy/aws/os-staging/install-host.sh')==value['installerSha256'],'staging installer changed')
 
 

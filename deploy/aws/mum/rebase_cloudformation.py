@@ -9,6 +9,7 @@ import fnmatch
 from collections import Counter
 import hashlib
 import json
+from fnmatch import fnmatchcase
 from pathlib import Path
 import time
 
@@ -778,7 +779,78 @@ def _production_archived_observer_rows(resources, policy, previous, current):
             if row['Resource'] not in ({'Ref': previous}, {'Ref': current})]
 
 
-def carry_production_predecessor(before, synthesized, *, compact_observer_grants=False):
+def production_launch_image(resources, deployment):
+    """Read the controller's exact AMI-scoped RunInstances row and its literal images."""
+    context.scope(deployment)
+    for field, prefix in (('amiId', 'ami'), ('subnetId', 'subnet'), ('securityGroupId', 'sg'),
+                          ('launchTemplateId', 'lt')):
+        need(manifest.matches(rf'{prefix}-[0-9a-f]{{17}}', deployment.get(field, '')),
+             'invalid production launch scope')
+    region, account = deployment['region'], deployment['accountId']
+    ec2 = f'arn:aws:ec2:{region}:{account}:'
+    image = f'arn:aws:ec2:{region}::image/'
+    current_image = image + deployment['amiId']
+    template = ec2 + 'launch-template/' + deployment['launchTemplateId']
+    required = {ec2 + 'subnet/' + deployment['subnetId'], ec2 + 'security-group/' + deployment['securityGroupId'],
+                template, ec2 + 'network-interface/*'}
+    controller = resources.get(LIFECYCLE_CONTROLLER_POLICY, {})
+    properties = controller.get('Properties', {})
+    role = {'Ref': LIFECYCLE_CONTROLLER}
+    need(controller.get('Type') == 'AWS::IAM::Policy'
+         and properties.get('Roles') == [role] and properties.get('PolicyName') == LIFECYCLE_CONTROLLER_POLICY,
+         'production launch controller policy attachment mismatch')
+    matches = []
+    for name, policy in resources.items():
+        if policy.get('Type') != 'AWS::IAM::Policy' or role not in policy.get('Properties', {}).get('Roles', []):
+            continue
+        for row in statements(policy):
+            actions = action_set(row)
+            if row.get('Effect') != 'Allow' or not any(fnmatchcase('ec2:runinstances', action) for action in actions):
+                continue
+            targets = row.get('Resource')
+            if isinstance(targets, str):
+                targets = [targets]
+            literal = isinstance(targets, list) and bool(targets) and all(isinstance(t, str) for t in targets)
+            if literal and set(targets) <= {ec2 + 'instance/*', ec2 + 'volume/*'} and actions == {'ec2:runinstances'}:
+                continue
+            need(name == LIFECYCLE_CONTROLLER_POLICY and literal and actions == {'ec2:runinstances'}
+                 and set(row) == {'Effect', 'Action', 'Resource', 'Condition'} and isinstance(row['Resource'], list)
+                 and row['Condition'] == {'StringEquals': {'aws:RequestedRegion': region},
+                                          'ArnEquals': {'ec2:LaunchTemplate': template}},
+                 'production launch image row scope changed')
+            images = {t for t in targets if manifest.matches(image + r'ami-[0-9a-f]{17}', t)}
+            need(current_image in images and len(images) in (1, 2) and len(set(targets)) == len(targets)
+                 and set(targets) - images == required, 'production launch image resources changed')
+            matches.append((row, current_image, images))
+    need(len(matches) == 1, 'exactly one production launch image row required')
+    return matches[0]
+
+
+def carry_production_launch_image(before, candidate):
+    old_deployment, new_deployment = _deployment_settings(before), _deployment_settings(candidate)
+    old_role = before['Resources'].get(LIFECYCLE_CONTROLLER, {})
+    need(old_role.get('Type') == 'AWS::IAM::Role' and old_role == candidate['Resources'].get(LIFECYCLE_CONTROLLER),
+         'production launch controller role changed')
+    old_row, old_image, old_images = production_launch_image(before['Resources'], old_deployment)
+    new_row, new_image, new_images = production_launch_image(candidate['Resources'], new_deployment)
+    old_scope = {k: v for k, v in old_row.items() if k not in ('Action', 'Resource')}
+    new_scope = {k: v for k, v in new_row.items() if k not in ('Action', 'Resource')}
+    need(old_scope == new_scope and set(old_row['Resource']) - old_images == set(new_row['Resource']) - new_images,
+         'production launch permissions changed outside the AMI')
+    required_images = old_images if old_image == new_image else {old_image, new_image}
+    need(new_images <= required_images, 'production launch grants an unexpected image')
+    new_row['Resource'].extend(sorted(required_images - new_images))
+
+
+def bind_production_launch_images(before, after, source_ami, candidate_ami):
+    if _image_mode(before) and _production_split_recovery(before['Resources']):
+        need(all(manifest.matches(r'ami-[0-9a-f]{17}', image) for image in (source_ami, candidate_ami))
+             and _deployment_settings(before).get('amiId') == source_ami
+             and _deployment_settings(after).get('amiId') == candidate_ami,
+             'production launch images disagree with the admitted source and candidate')
+
+
+def carry_production_predecessor(before, synthesized, *, compact_observer_grants=False, retain_launch_image=True):
     """Carry the exact PRD split rollback resources into a local CDK template.
 
     Prepare a compact controller policy when requested. Validation keeps the
@@ -793,6 +865,8 @@ def carry_production_predecessor(before, synthesized, *, compact_observer_grants
          'production split recovery graph must survive synthesis')
     candidate = deepcopy(synthesized)
     new = candidate['Resources']
+    if retain_launch_image:
+        carry_production_launch_image(before, candidate)
 
     def carry_resource(logical):
         need(logical in old and (logical not in new or new[logical] == old[logical]),
@@ -919,7 +993,7 @@ def preserve_legacy_lifecycle(before, after):
              'retained lifecycle reader loses an admitted history capability')
 
 
-def validate_templates(phase, before, after, review, unchanged=False, pool_iam=None):
+def validate_templates(phase, before, after, review, unchanged=False, pool_iam=None, *, retain_launch_image=True):
     context.identities(before)
     context.identities(after)
     need(set(review)=={'schemaVersion','changes'} and type(review['schemaVersion']) is int and review['schemaVersion']==1,'invalid exact template review')
@@ -1062,7 +1136,7 @@ def validate_templates(phase, before, after, review, unchanged=False, pool_iam=N
             actual[logical]=entry
     need(actual==review['changes'] and (bool(actual) or action_reorder),'review does not exactly enumerate template changes')
     if phase == 'workflows':
-        need(carry_production_predecessor(before, after) == after,
+        need(carry_production_predecessor(before, after, retain_launch_image=retain_launch_image) == after,
              'candidate omits an exact production predecessor grant')
         preserve_legacy_lifecycle(before, after)
         preserve_transition_versions(before, after)
@@ -1142,12 +1216,18 @@ def execute(phase, spec, directory, apply, aws, write, digest, sleep=time.sleep,
     before=manifest.read(spec['beforeTemplatePath']);after=manifest.read(spec['candidateTemplatePath']);review=manifest.read(spec['reviewPath'])
     for name in ('beforeTemplate','candidateTemplate','review'):
         need(digest(spec[name+'Path'])==spec[name+'Sha256'],'reviewed CloudFormation artifact changed')
+    review_iam = load_pool_iam(pool_iam, digest)
+    retain_launch_image = (pool_iam or {}).get('schemaVersion') == 2
     allowed=validate_templates(phase,before,after,review,unchanged=spec['changeSetArn'] is None,
-                               pool_iam=load_pool_iam(pool_iam,digest))
+                               pool_iam=review_iam,retain_launch_image=retain_launch_image)
     if spec['changeSetArn'] is None:
         return unchanged_identity(spec,after,apply,aws)
     cs=aws('cloudformation','describe-change-set','--stack-name',spec['stackName'],'--change-set-name',spec['changeSetArn'],'--include-property-values')
     need(cs['ChangeSetId']==spec['changeSetArn'] and cs['StackName']==spec['stackName'] and not cs.get('NextToken'),'change-set identity/pagination mismatch')
+    if phase == 'workflows' and context.NAMESPACE == 'prd' and (retain_launch_image or cs['ExecutionStatus'] == 'AVAILABLE'):
+        bind_production_launch_images(before, after, spec.get('sourceAmiId'), spec.get('amiId'))
+        if not retain_launch_image:
+            validate_templates(phase, before, after, review, pool_iam=review_iam)
     submitted=template_body(aws('cloudformation','get-template','--stack-name',spec['stackName'],'--change-set-name',spec['changeSetArn'],'--template-stage','Original'))
     need(submitted==after,'submitted template differs from reviewed candidate')
     stacks=aws('cloudformation','describe-stacks','--stack-name',spec['stackName'])['Stacks'];need(len(stacks)==1,'one stack required');stack=stacks[0]

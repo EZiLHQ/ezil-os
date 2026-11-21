@@ -1405,7 +1405,7 @@ class ProductionObserverGroupingTests(unittest.TestCase):
 
     def validate(self,before,after):
         review=PoolIamTests.exact_review(before,after)
-        self.assertEqual(cfn.validate_templates('workflows',before,after,review),review['changes'])
+        self.assertEqual(cfn.validate_templates('workflows',before,after,review,retain_launch_image=False),review['changes'])
         return review['changes']
 
     def test_exact_grouping_is_the_same_permissions_and_accepted(self):
@@ -1424,14 +1424,107 @@ class ProductionObserverGroupingTests(unittest.TestCase):
     def test_carry_keeps_each_candidate_form(self):
         synthesized=copy.deepcopy(self.flat);self.rows(synthesized)[1:]=[]
         for n in (2,3):del synthesized['Resources'][self.v('lifecycle',n)]
-        self.assertEqual(cfn.carry_production_predecessor(self.before,synthesized),self.flat)
-        compact = cfn.carry_production_predecessor(self.before, synthesized, compact_observer_grants=True)
+        self.assertEqual(cfn.carry_production_predecessor(self.before,synthesized,retain_launch_image=False),self.flat)
+        compact = cfn.carry_production_predecessor(self.before, synthesized, compact_observer_grants=True, retain_launch_image=False)
         self.assertEqual(compact, self.after)
         self.validate(self.before, compact)
         synthesized=copy.deepcopy(self.after);self.rows(synthesized)[0]['Resource'][2:]=[]
         for n in (2,3):del synthesized['Resources'][self.v('lifecycle',n)]
-        self.assertEqual(cfn.carry_production_predecessor(self.before,synthesized),self.after)
-        self.assertEqual(cfn.carry_production_predecessor(self.before,self.after),self.after)
+        self.assertEqual(cfn.carry_production_predecessor(self.before,synthesized,retain_launch_image=False),self.after)
+        self.assertEqual(cfn.carry_production_predecessor(self.before,self.after,retain_launch_image=False),self.after)
+
+    @staticmethod
+    def image_id(digit):
+        return 'ami-' + digit * 17
+
+    def with_launch_image(self, template, current, previous=None):
+        template = copy.deepcopy(template)
+        template['Resources'][cfn.LIFECYCLE_CONTROLLER] = {'Type': 'AWS::IAM::Role', 'Properties': {}}
+        region, account = 'ap-south-1', '452630323510'
+        subnet, group, launch_template = 'subnet-' + '1' * 17, 'sg-' + '2' * 17, 'lt-' + '3' * 17
+        ec2 = f'arn:aws:ec2:{region}:{account}:'
+        image = f'arn:aws:ec2:{region}::image/'
+        launch_arn = ec2 + 'launch-template/' + launch_template
+        variables = template['Resources'][cfn.LIFECYCLE_OBSERVER]['Properties']['Environment']['Variables']
+        settings = json.loads(variables['EZIL_LIFECYCLE_SETTINGS'])
+        settings['deployment'].update(amiId=self.image_id(current), accountId=account, region=region, namespace='prd',
+                                      launchTemplateId=launch_template, subnetId=subnet, securityGroupId=group)
+        variables['EZIL_LIFECYCLE_SETTINGS'] = json.dumps(settings)
+        images = [image + self.image_id(d) for d in (current, previous) if d is not None]
+        self.rows(template).append({
+            'Action': 'ec2:RunInstances', 'Effect': 'Allow',
+            'Resource': images + [ec2 + 'subnet/' + subnet, ec2 + 'security-group/' + group, launch_arn,
+                                  ec2 + 'network-interface/*'],
+            'Condition': {'ArnEquals': {'ec2:LaunchTemplate': launch_arn}, 'StringEquals': {'aws:RequestedRegion': region}},
+        })
+        return template
+
+    def validate_image_transition(self, before, after):
+        review = PoolIamTests.exact_review(before, after)
+        return cfn.validate_templates('workflows', before, after, review)
+
+    def test_launch_image_carry_is_exact_idempotent_and_prunes_the_previous_window(self):
+        before = self.with_launch_image(self.before, '6', '4')
+        synthesized = self.with_launch_image(self.after, '7')
+        with self.assertRaisesRegex(ValueError, 'omits an exact production predecessor grant'):
+            self.validate_image_transition(before, synthesized)
+        candidate = cfn.carry_production_predecessor(before, synthesized)
+        self.assertEqual(set(self.rows(candidate)[-1]['Resource']),
+                         set(self.rows(self.with_launch_image(self.after, '7', '6'))[-1]['Resource']))
+        self.assertEqual(self.rows(synthesized)[-1]['Resource'][0], 'arn:aws:ec2:ap-south-1::image/' + self.image_id('7'))
+        self.assertEqual(cfn.carry_production_predecessor(before, candidate), candidate)
+        cfn.bind_production_launch_images(before, candidate, self.image_id('6'), self.image_id('7'))
+        self.validate_image_transition(before, candidate)
+        for old, new in (('4', '7'), ('6', '8')):
+            with self.subTest(deployed=old, candidate=new), self.assertRaisesRegex(ValueError, 'admitted source'):
+                cfn.bind_production_launch_images(before, candidate, self.image_id(old), self.image_id(new))
+
+    def test_same_launch_image_keeps_only_the_existing_rollback_window(self):
+        before = self.with_launch_image(self.before, '7', '6')
+        synthesized = self.with_launch_image(self.after, '7')
+        candidate = cfn.carry_production_predecessor(before, synthesized)
+        self.assertEqual(set(self.rows(candidate)[-1]['Resource']), set(self.rows(before)[-1]['Resource']))
+        self.validate_image_transition(before, candidate)
+
+    def test_launch_image_scope_refuses_malformed_or_extra_iam_even_if_reviewed(self):
+        before = self.with_launch_image(self.before, '6', '4')
+        valid = self.with_launch_image(self.after, '7', '6')
+        arn = 'arn:aws:ec2:ap-south-1::image/'
+        cases = {
+            'wrong-current': lambda r: r['Resource'].__setitem__(0, arn + self.image_id('8')),
+            'wrong-old': lambda r: r['Resource'].__setitem__(1, arn + self.image_id('4')),
+            'extra-image': lambda r: r['Resource'].append(arn + self.image_id('4')),
+            'duplicate-image': lambda r: r['Resource'].append(r['Resource'][1]),
+            'wildcard': lambda r: r['Resource'].__setitem__(1, arn + '*'),
+            'unscoped-region': lambda r: r['Condition'].pop('StringEquals'),
+            'wrong-template': lambda r: r['Condition']['ArnEquals'].update({'ec2:LaunchTemplate': '*'}),
+            'exact-subnet-removed': lambda r: r['Resource'].pop(2),
+            'extra-action': lambda r: r.update(Action=['ec2:RunInstances', 'ec2:StartInstances']),
+            'wildcard-action': lambda r: r.update(Action='ec2:RunInstance?'),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(change=name), self.assertRaises(ValueError):
+                candidate = copy.deepcopy(valid)
+                mutate(self.rows(candidate)[-1])
+                self.validate_image_transition(before, candidate)
+        for side in ('before', 'after'):
+            with self.subTest(side=side), self.assertRaisesRegex(ValueError, 'exactly one production launch image row'):
+                old, new = copy.deepcopy(before), copy.deepcopy(valid)
+                rows = self.rows(old if side == 'before' else new)
+                rows.append(copy.deepcopy(rows[-1]))
+                self.validate_image_transition(old, new)
+        candidate = copy.deepcopy(valid)
+        controller = candidate['Resources'][self.controller]
+        extra = copy.deepcopy(controller)
+        extra['Properties']['PolicyName'] = 'OtherControllerPolicy'
+        extra['Properties']['PolicyDocument']['Statement'] = [self.rows(candidate)[-1]]
+        candidate['Resources']['OtherControllerPolicy'] = extra
+        with self.assertRaises(ValueError):
+            self.validate_image_transition(before, candidate)
+        candidate = copy.deepcopy(valid)
+        candidate['Resources'][cfn.LIFECYCLE_CONTROLLER]['Properties']['Path'] = '/changed/'
+        with self.assertRaisesRegex(ValueError, 'controller role changed'):
+            self.validate_image_transition(before, candidate)
 
     def test_malformed_or_changed_grouping_refused(self):
         L=lambda n:{'Ref':self.v('lifecycle',n)}

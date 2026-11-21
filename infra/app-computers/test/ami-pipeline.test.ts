@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import test from 'node:test';
+import { gunzipSync } from 'node:zlib';
 import { App, BootstraplessSynthesizer, assertions } from 'aws-cdk-lib';
 import { AmiConfigSchema, AmiPipelineStack, NATIVE_PAYLOAD_OBJECT, type AmiConfig } from '../lib/ami-pipeline.js';
 import { DEFAULT_STORAGE, LifecycleDeploymentSchema } from '../lib/lifecycle/deployment.js';
@@ -9,11 +10,11 @@ import { FoundationConfigSchema } from '../lib/foundation.js';
 
 const config: AmiConfig = { namespace: 'pilot', accountId: '123456789012', region: 'ap-south-1', version: '1.0.0' };
 const tags = { 'ezil:namespace': 'pilot' };
-function template() {
+function template(candidate: AmiConfig = config) {
     return assertions.Template.fromStack(new AmiPipelineStack(new App({ context: {
         '@aws-cdk/core:validateAgainstDefaultRules': true,
-    } }), 'ezil-pilot-ami', {
-        config, env: { account: config.accountId, region: config.region },
+    } }), 'ezil-' + candidate.namespace + '-ami', {
+        config: candidate, env: { account: candidate.accountId, region: candidate.region },
         synthesizer: new BootstraplessSynthesizer(), terminationProtection: true,
     }));
 }
@@ -101,6 +102,33 @@ test('AMI component embeds the checked-in YAML; recipe resolves Ubuntu via SSM a
         BlockDeviceMappings: [{ DeviceName: '/dev/sda1',
             Ebs: { VolumeType: 'gp3', VolumeSize: 30, Encrypted: true, DeleteOnTermination: true } }],
     });
+});
+
+test('production AMI adds the exact standalone Git probe only in the existing component test phase', () => {
+    const production = template({ ...config, namespace: 'prd' }).toJSON();
+    const base = readFileSync(join(__dirname, '../../host-agent/ami/imagebuilder-component.yaml'), 'utf8').trimEnd();
+    const data: string = production.Resources.Component.Properties.Data;
+    assert(data.startsWith(base + '\n'));
+    assert(Buffer.byteLength(data) <= 16_000);
+
+    const phase = data.slice(base.length + 1);
+    assert.match(phase, /^  - name: test\n    steps:\n      - name: QualifyStandaloneGit\n/);
+    assert.match(phase, /\/usr\/bin\/unshare --mount --propagation private -- \/usr\/bin\/python3 -I -B -c/);
+    assert.match(phase, /'\{\{ DesktopImageId \}\}' '\{\{ AgentSrcS3Uri \}\}' <<'EZIL_STANDALONE_GIT_TEST'/);
+    const payload = phase.match(/\n                ([A-Za-z0-9+/=]+)\n                EZIL_STANDALONE_GIT_TEST\n$/);
+    assert(payload);
+    assert.deepEqual(gunzipSync(Buffer.from(payload[1]!, 'base64')),
+        readFileSync(join(__dirname, '../lib/standalone-git-imagebuilder.py')));
+
+    const pilot = template().toJSON();
+    assert.deepEqual(Object.keys(production.Resources).sort(), Object.keys(pilot.Resources).sort());
+    assert.deepEqual(production.Resources.Recipe.Properties.Components, pilot.Resources.Recipe.Properties.Components);
+    assert.deepEqual(production.Resources.BuildRole.Properties.ManagedPolicyArns, pilot.Resources.BuildRole.Properties.ManagedPolicyArns);
+    assert.deepEqual(production.Resources.BuildRole.Properties.Policies, pilot.Resources.BuildRole.Properties.Policies);
+    const infrastructure = production.Resources.Infrastructure.Properties;
+    assert.equal(infrastructure.TerminateInstanceOnFailure, true);
+    assert.deepEqual(infrastructure.InstanceMetadataOptions, { HttpTokens: 'required', HttpPutResponseHopLimit: 1 });
+    assert.equal(Object.hasOwn(infrastructure, 'KeyPair'), false);
 });
 
 test('Ubuntu recipe root fits lifecycle and foundation defaults and example configurations', () => {

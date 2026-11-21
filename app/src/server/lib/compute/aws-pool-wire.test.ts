@@ -1,4 +1,6 @@
 import { readFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import type { HistoryEvent } from '@aws-sdk/client-sfn';
 import path from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
@@ -20,6 +22,8 @@ afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 // paid standing/funding now precede `effective`. Keep fault injection on this same query.
 const isPoolDemandQuery = (query: string) => /\bAS opens,/.test(query)
     && /\bAS idle_ready,/.test(query) && /\bAS booting,/.test(query);
+const unboundPoolFields = ['instance_id', 'enrolled_at', 'ready_at', 'editor_ready_at', 'session_ready_at', 'leased_computer_id', 'leased_generation',
+    'lease_token', 'leased_at', 'claim_generation', 'claim_lease_epoch', 'claim_fence', 'claim_volume_serial'];
 function harness() {
     vi.stubEnv('AWS_REGIONS', 'ap-south-1'); vi.stubEnv('EZIL_AWS_MAX_RUNNING_AP_SOUTH_1', '5'); vi.stubEnv('EZIL_AWS_KILL_SWITCH', '0');
     const f = poolFixture(); const c = { region: f.row.region, zoneId: f.row.zoneId, instanceType: 'm6i.large' as const };
@@ -75,6 +79,16 @@ function harness() {
             if (row.id === p[1] && row.lifecycle_job_id === p[2] && row.lifecycle_digest === p[3] && row.leased_computer_id === null) {
                 row.state = p[0]; row.dispatch_status = 'settled';
             }
+            return [];
+        }
+        if (q.sql.includes("state = 'failed' AND dispatch_status = 'settled'")) {
+            for (const column of unboundPoolFields) expect(q.sql).toContain(`${column} IS NULL`);
+            const stillUnbound = row.state === 'failed' && row.dispatch_status === 'settled'
+                && unboundPoolFields.every(column => row[column] == null);
+            if (q.sql.includes('SELECT *')) return stillUnbound && row.lifecycle_input ? [{ ...row }] : [];
+            const same = [row.id, row.generation, row.region, row.zone_id, row.instance_type,
+                row.lifecycle_job_id, row.lifecycle_digest, row.lifecycle_input].every((value, index) => value === p[index]);
+            if (stillUnbound && same) row.state = 'retired';
             return [];
         }
         if (q.sql.includes('SELECT * FROM public.ezil_compute_pool_hosts')) {
@@ -148,6 +162,166 @@ it.each([['stopped more than the retry window ago', new Date(Date.now() - 16 * 6
         await h.store.reconcile!();
         expect(h.row).toMatchObject({ state: 'failed', dispatch_status: 'settled' });
     });
+async function settledFailedProvision() {
+    const h = await failedProvision();
+    Object.assign(h.row, { state: 'failed', dispatch_status: 'settled' });
+    const execution = { ...h.execution(h.w), status: 'FAILED', error: 'LifecycleUnconfirmed', output: undefined, redriveCount: 0,
+        startDate: NOW, stopDate: new Date(NOW.getTime() + 1000) };
+    const history = failedReplaceHistory(h.w.input, NOW);
+    history[0]!.executionStartedEventDetails!.stateMachineVersionArn = h.w.stateMachineArn;
+    h.sdk.executions.describe.mockResolvedValue(execution);
+    h.sdk.executions.history.mockResolvedValue(history);
+    return { ...h, execution, history };
+}
+it('reclaims a settled failed pool provision only after the immutable history proves it never launched', async () => {
+    const h = await settledFailedProvision();
+    await h.store.reconcileSettledFailures!(new Date(), 8_000);
+    await h.store.reconcileSettledFailures!(new Date(), 8_000);
+    expect(h.row).toMatchObject({ state: 'retired', dispatch_status: 'settled', lifecycle_input: h.w.input, lifecycle_digest: h.w.digest });
+    expect(h.sdk.executions.describe).toHaveBeenCalledOnce();
+    expect(h.sdk.executions.history).toHaveBeenCalledExactlyOnceWith(h.c.region, lifecycleExecutionArn(h.f.deployment, h.w.intent.jobId), expect.any(AbortSignal));
+    expect(h.sdk.starter.start).not.toHaveBeenCalled();
+});
+it.each(['missing', 'unreadable', 'wrong execution', 'redriven', 'truncated history', 'entered launch',
+    'bound host', 'previous session', 'lease', 'changed job', 'changed input'] as const)('preserves a settled reservation when %s', async fault => {
+    const h = await settledFailedProvision();
+    switch (fault) {
+        case 'missing': h.sdk.executions.describe.mockRejectedValue(new AwsClientError('aws_config', false, 'ExecutionDoesNotExist')); break;
+        case 'unreadable': h.sdk.executions.history.mockRejectedValue(new Error('history unavailable')); break;
+        case 'wrong execution': h.execution.stateMachineVersionArn += ':wrong'; break;
+        case 'redriven': h.execution.redriveCount = 1; break;
+        case 'truncated history': h.history.shift(); break;
+        case 'entered launch': h.history.find(event => event.type === 'TaskStateEntered')!.stateEnteredEventDetails!.name = 'runInstances'; break;
+        case 'bound host': h.row.instance_id = h.f.row.instanceId; break;
+        case 'previous session': h.row.session_ready_at = NOW; break;
+        case 'lease': h.row.claim_generation = 1; break;
+        case 'changed job':
+        case 'changed input':
+            h.sdk.executions.history.mockImplementation(async () => {
+                h.row[fault === 'changed job' ? 'lifecycle_job_id' : 'lifecycle_input'] = 'changed during proof';
+                return h.history;
+            });
+            break;
+    }
+    await h.store.reconcileSettledFailures!(new Date(), 8_000);
+    expect(h.row).toMatchObject({ state: 'failed', dispatch_status: 'settled' });
+    expect(h.sdk.starter.start).not.toHaveBeenCalled();
+});
+
+async function settledAuthorizationDeniedProvision() {
+    const h = await settledFailedProvision();
+    const { deployment: d } = h.w.intent;
+    const controller = 'ezil-fixture-lifecycle-controller';
+    const observer = 'arn:aws:lambda:' + d.region + ':' + d.accountId + ':function:ezil-fixture-lifecycle-observer:1';
+    const scheduled = { resourceType: 'aws-sdk:ec2', resource: 'runInstances', region: d.region,
+        parameters: JSON.stringify({ ImageId: d.amiId, InstanceType: h.w.intent.instanceType, MinCount: 1, MaxCount: 1,
+            LaunchTemplate: { LaunchTemplateId: d.launchTemplateId, Version: d.launchTemplateVersion },
+            ClientToken: createHash('sha256').update('ezil-lifecycle-v1\ninstance\n' + h.w.digest).digest('hex') }) };
+    const action = { resourceType: scheduled.resourceType, resource: scheduled.resource };
+    const reason = [
+        'You are not authorized to perform this operation. User: ',
+        'arn:aws:sts::' + d.accountId + ':assumed-role/' + controller + '/synthetic-session',
+        ' is not authorized to perform: ec2:RunInstances on resource: arn:aws:ec2:' + d.region + '::image/' + d.amiId,
+        ' because no identity-based policy allows the ec2:RunInstances action. ',
+        'Go to https://' + d.region + '.console.aws.amazon.com/iam/home?region=' + d.region + '#synthetic-details',
+        ' for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: synthetic-id. ',
+        'Encoded authorization failure message: SYNTHETIC_PLACEHOLDER ',
+        '(Service: Ec2, Status Code: 403, Request ID: 11111111-1111-4111-8111-111111111111) (SDK Attempt Count: 1)',
+    ].join('');
+    const enter = (type: HistoryEvent['type'], name: string) => ({ type, stateEnteredEventDetails: { name } });
+    const exit = (type: HistoryEvent['type'], name: string) => ({ type, stateExitedEventDetails: { name } });
+    const observe = (name: string) => [enter('TaskStateEntered', name),
+        { type: 'LambdaFunctionScheduled', lambdaFunctionScheduledEventDetails: { resource: observer } },
+        { type: 'LambdaFunctionStarted' }, { type: 'LambdaFunctionSucceeded' }, exit('TaskStateExited', name),
+        enter('ChoiceStateEntered', 'Decide'), exit('ChoiceStateExited', 'Decide')];
+    const terminal = 'synthetic terminal reason';
+    const history = [
+        { type: 'ExecutionStarted', executionStartedEventDetails: { input: h.w.input,
+            roleArn: 'arn:aws:iam::' + d.accountId + ':role/' + controller,
+            stateMachineVersionArn: h.w.stateMachineArn, inputDetails: { truncated: false } } },
+        enter('PassStateEntered', 'Init'), exit('PassStateExited', 'Init'),
+        ...observe('Observe-initial'),
+        enter('TaskStateEntered', 'runInstances'), { type: 'TaskScheduled', taskScheduledEventDetails: scheduled },
+        { type: 'TaskStarted', taskStartedEventDetails: action },
+        { type: 'TaskFailed', taskFailedEventDetails: { ...action, error: 'Ec2.Ec2Exception', cause: reason } },
+        exit('TaskStateExited', 'runInstances'), enter('WaitStateEntered', 'After-runInstances'), exit('WaitStateExited', 'After-runInstances'),
+        ...observe('Observe-instance'), enter('FailStateEntered', 'Rejected'),
+        { type: 'ExecutionFailed', executionFailedEventDetails: { error: 'LifecycleUnconfirmed', cause: terminal } },
+    ].map((event, index) => ({ ...event, id: index + 1, previousEventId: index === 1 ? 0 : index,
+        timestamp: new Date(NOW.getTime() + index * 10) })) as HistoryEvent[];
+    const execution = { ...h.execution, cause: terminal };
+    h.sdk.executions.describe.mockResolvedValue(execution);
+    h.sdk.executions.history.mockResolvedValue(history);
+    return { ...h, execution, history };
+}
+
+it('reclaims the settled provision whose only EC2 attempt was definitively denied authorization', async () => {
+    const h = await settledAuthorizationDeniedProvision();
+    await h.store.reconcileSettledFailures!(new Date(), 8_000);
+    expect(h.row).toMatchObject({ state: 'retired', dispatch_status: 'settled', instance_id: null, lifecycle_input: h.w.input });
+    expect(h.sdk.starter.start).not.toHaveBeenCalled();
+});
+
+it.each(['arbitrary 403', 'unknown transport', 'timed out task', 'successful task', 'extra state', 'second SDK attempt',
+    'different role', 'different AMI', 'different request token', 'different task link', 'redriven', 'terminal drift', 'claimed during proof'] as const)(
+    'retains the settled provision for %s even when the history resembles a denial', async fault => {
+        const h = await settledAuthorizationDeniedProvision();
+        const failure = h.history[13]!;
+        switch (fault) {
+            case 'arbitrary 403': failure.taskFailedEventDetails!.cause = '(Service: Ec2, Status Code: 403)'; break;
+            case 'unknown transport': failure.taskFailedEventDetails!.cause = 'connection reset while reading response'; break;
+            case 'timed out task': failure.type = 'TaskTimedOut'; break;
+            case 'successful task': failure.type = 'TaskSucceeded'; break;
+            case 'extra state': h.history.splice(15, 0, { ...h.history[14]!, type: 'TaskStateEntered' }); break;
+            case 'second SDK attempt': failure.taskFailedEventDetails!.cause = failure.taskFailedEventDetails!.cause!.replace('Attempt Count: 1', 'Attempt Count: 2'); break;
+            case 'different role': h.history[0]!.executionStartedEventDetails!.roleArn += '-other'; break;
+            case 'different AMI': failure.taskFailedEventDetails!.cause = failure.taskFailedEventDetails!.cause!.replace(h.w.intent.deployment.amiId, 'ami-99999999999999999'); break;
+            case 'different request token':
+                h.history[11]!.taskScheduledEventDetails!.parameters = h.history[11]!.taskScheduledEventDetails!.parameters!.replace(/"ClientToken":"[^"]+"/, '"ClientToken":"different"');
+                break;
+            case 'different task link': failure.previousEventId = 12; break;
+            case 'redriven': h.execution.redriveCount = 1; break;
+            case 'terminal drift': h.execution.cause += '-changed'; break;
+            case 'claimed during proof':
+                h.sdk.executions.history.mockImplementation(async () => { h.row.leased_computer_id = h.f.p.computerId; return h.history; });
+                break;
+        }
+        await h.store.reconcileSettledFailures!(new Date(), 8_000);
+        expect(h.row).toMatchObject({ state: 'failed', dispatch_status: 'settled', lifecycle_input: h.w.input });
+        expect(h.sdk.starter.start).not.toHaveBeenCalled();
+    });
+
+it('cancels a stalled historical read and continues to the next bounded candidate', async () => {
+    const h = await settledAuthorizationDeniedProvision();
+    const stalledHost = '1aaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+    const stalledJob = '1bbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+    const work = buildLifecycleWork({ ...h.w.intent, computerId: stalledHost, poolHostId: stalledHost, jobId: stalledJob });
+    vi.mocked(h.db.execute).mockResolvedValueOnce([
+        { ...h.row, id: stalledHost, lifecycle_job_id: stalledJob, lifecycle_input: work.input, lifecycle_digest: work.digest },
+        { ...h.row },
+    ]);
+    const arn = lifecycleExecutionArn(h.f.deployment, stalledJob);
+    h.sdk.executions.describe.mockImplementation(async (_region, requested) => requested === arn
+        ? { ...h.execution, executionArn: arn, input: work.input } : h.execution);
+    let stopped = false;
+    h.sdk.executions.history.mockImplementation(async (_region, requested, signal: AbortSignal) => {
+        if (requested !== arn) return h.history;
+        return new Promise<HistoryEvent[]>((_resolve, reject) => signal.addEventListener('abort', () => {
+            stopped = true;
+            reject(signal.reason);
+        }, { once: true }));
+    });
+    vi.useFakeTimers();
+    try {
+        const reconcile = h.store.reconcileSettledFailures!(new Date(), 8_000);
+        await vi.advanceTimersByTimeAsync(2_100);
+        await reconcile;
+        expect(stopped).toBe(true);
+        expect(h.row.state).toBe('retired');
+        expect(h.sdk.starter.start).not.toHaveBeenCalled();
+    } finally { vi.useRealTimers(); }
+});
+
 it('pins the deployed graph premises the never-launched proof relies on (infra lifecycle definition, contract, helper)', () => {
     const infra = (file: string) => readFileSync(path.resolve(__dirname, '../../../../../infra/app-computers/lib/lifecycle', file), 'utf8');
     const definition = infra('definition.ts'), contract = infra('contract.ts'), helper = infra('helper.ts');

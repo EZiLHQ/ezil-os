@@ -19,6 +19,7 @@ export interface PoolDispatchStore {
     prepare(tx: PlacementExecutor, c: PoolClass, operation: 'pool-provision' | 'pool-retire',
         build: (host: PoolHostRow) => LifecycleWork, host?: PoolHostRow): Promise<LifecycleWork>;
     reconcile?(): Promise<void>;
+    reconcileSettledFailures?(before: Date, budgetMs: number): Promise<void>;
     canRetire?(tx: PlacementExecutor, id: string): Promise<boolean>;
     retirementCandidates?(tx: PlacementExecutor, c: PoolClass, state: 'failed' | 'retiring'): Promise<string[]>;
     outcome(work: LifecycleWork, outcome: 'started' | 'refused' | 'unknown'): Promise<void>;
