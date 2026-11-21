@@ -29,6 +29,7 @@ const OUT = process.env.EZIL_E2E_OUT ?? './ezil-e2e-out';
 const CONTAINER = process.env.EZIL_E2E_CONTAINER ?? '';
 const PHASE = process.env.EZIL_E2E_PHASE ?? '';
 const PROMPT = 'EZIL_E2E_HISTORY: remember this conversation';
+const REPLY = 'EZIL_HISTORY_OK';
 // The mock streams this answer in numbered parts a second apart, then EZIL_SLOW_DONE.
 const SLOW = 'EZIL_E2E_SLOW: keep answering while I look away';
 const NOTICE = 'AI responses may be inaccurate. Review changes before applying them.';
@@ -50,6 +51,7 @@ const CHAT = REPO_CHAT || join(FOLDER, '.ezil', 'chat');
 // Session files that mention the prompt: in the workspace, and anywhere in the editor profile.
 const filesWith = text => sh(`grep -l -F ${quote(text)} ${quote(CHAT)}/*.jsonl ${quote(CHAT)}/*.json 2>/dev/null || true`).split('\n').filter(Boolean);
 const sessionFiles = () => filesWith(PROMPT);
+const completeFiles = () => filesWith(REPLY);
 const profileCopies = () => sh(`grep -rl -F ${quote(PROMPT)} /tmp/code-server-data/User 2>/dev/null || true`).split('\n').filter(Boolean);
 
 const browser = await chromium.launch({ executablePath: process.env.PLAYWRIGHT_CHROMIUM_EXECUTABLE || undefined });
@@ -103,11 +105,12 @@ try {
 
   if (PHASE === 'create') {
     check('prompt sent', await sendPrompt(PROMPT));
-    check('the gateway answered in the chat', await until(async () => (await transcript()).includes('EZiL Chat'), 'response'), (await transcript()).slice(0, 160));
+    check('the gateway answered in the chat', await until(async () => (await transcript()).includes(REPLY), 'complete response'), (await transcript()).slice(0, 160));
     // The store writes on its storage flush; give it time, then require exactly one file.
-    await until(async () => sessionFiles().length > 0, 'session file in the workspace', 90_000);
+    await until(() => completeFiles().length === 1, 'complete session file in the workspace', 90_000);
     const files = sessionFiles();
-    check('the conversation is saved once in the expected history folder', files.length === 1, JSON.stringify(files));
+    check('the complete conversation is saved once in the expected history folder',
+      files.length === 1 && completeFiles().includes(files[0]), JSON.stringify(files));
     const copies = profileCopies();
     check('no chat session copy in the editor profile', !copies.some(c => c.includes('/chatSessions/')), JSON.stringify(copies));
     info('other editor-profile files that contain the prompt (Copilot traces/transcripts; not removed by a delete)', JSON.stringify(copies));
@@ -118,7 +121,9 @@ try {
       check('.ezil is ignored by Git', !initStatus.some(l => l.includes('.ezil')), JSON.stringify(initStatus.slice(0, 8)));
     }
   } else if (PHASE === 'verify') {
-    check('the saved conversation survived the restart', sessionFiles().length === 1, JSON.stringify(sessionFiles()));
+    const files = sessionFiles();
+    check('the complete saved conversation survived the restart',
+      files.length === 1 && completeFiles().includes(files[0]), JSON.stringify(files));
     info('browser address (a different host:port than the create phase means a different workspace-storage id)', new URL(CODE_URL).host);
     const title = aux.locator('.chat-view-title-container.visible .chat-view-title-label').first();
     const shown = await until(async () => (await title.isVisible().catch(() => false)), '"Chat history" title', 30_000);
@@ -128,17 +133,20 @@ try {
     await page.screenshot({ path: join(OUT, 'history-empty-chat.png') });
     await aux.locator('.chat-view-title-container.visible .chat-view-title-action-item').first().click();
     await page.locator('.quick-input-widget').waitFor({ state: 'visible', timeout: 15_000 }).catch(() => {});
-    await until(async () => (await rows()).some(r => r.includes('EZIL_E2E_HISTORY') || /EZiL Chat/.test(r)), 'history rows', 30_000);
+    // The row can use the prompt, the model-generated title, or the product default.
+    const titleTokens = ['EZIL_E2E_HISTORY', REPLY, 'EZiL Chat'];
+    const historyTitle = titles => titleTokens.find(token => titles.some(title => title.includes(token)));
+    await until(async () => Boolean(historyTitle(await rows())), 'history rows', 30_000);
     const listed = await rows();
     await page.screenshot({ path: join(OUT, 'history-picker.png') });
-    const row = listed.find(r => r.includes('EZIL_E2E_HISTORY')) ?? listed.find(r => /EZiL Chat/.test(r));
-    check('a new browser lists the conversation from before the restart', Boolean(row), JSON.stringify(listed.slice(0, 6)));
-    if (row) {
-      // Match a stable token, not the row's joined text: the row also carries its group label ("Today") and a
-      // relative time, and the title is the default "EZiL Chat" when no title was generated.
-      const rowText = row.includes('EZIL_E2E_HISTORY') ? 'EZIL_E2E_HISTORY' : /EZiL Chat/;
+    const rowText = historyTitle(listed);
+    check('a new browser lists the conversation from before the restart', Boolean(rowText), JSON.stringify(listed.slice(0, 6)));
+    if (rowText) {
       await page.locator('.quick-input-widget .monaco-list-row').filter({ hasText: rowText }).first().click();
-      check('choosing it reopens the conversation', await until(async () => (await transcript()).includes(PROMPT), 'reopened transcript', 30_000), (await transcript()).slice(0, 160));
+      check('choosing it reopens the complete conversation', await until(async () => {
+        const text = await transcript();
+        return text.includes(PROMPT) && text.includes(REPLY);
+      }, 'reopened prompt and reply', 30_000), (await transcript()).slice(0, 220));
       await page.screenshot({ path: join(OUT, 'history-reopened.png') });
       // Delete from the picker: the row's own delete button, then the file must be gone.
       await aux.locator('.chat-view-title-container.visible .chat-view-title-action-item').first().click();

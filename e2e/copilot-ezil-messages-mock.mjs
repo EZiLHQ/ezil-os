@@ -76,7 +76,7 @@ const turnText = turn => (typeof turn.content === 'string' ? [turn.content] : tu
 function scriptedContent(body, folder) {
   const history = body.messages.flatMap(turn => Array.isArray(turn.content) ? turn.content : []);
   // The scenario is the newest user prompt that carries a marker: a chat may continue an earlier one.
-  const marked = body.messages.filter(turn => turn.role === 'user').map(turnText).reverse().find(t => /EZIL_E2E_(UNDO|AGENT|KIMI|SLOW|LONG|SUBAGENT|CHILD)/.test(t)) ?? '';
+  const marked = body.messages.filter(turn => turn.role === 'user').map(turnText).reverse().find(t => /EZIL_E2E_(UNDO|AGENT|KIMI|SLOW|LONG|SUBAGENT|CHILD|HISTORY)/.test(t)) ?? '';
   const userText = marked;
   const done = id => history.some(block => block.type === 'tool_result' && block.tool_use_id === id);
   const call = (id, name, input) => {
@@ -98,6 +98,7 @@ function scriptedContent(body, folder) {
     const filler = 'The quick brown fox jumps over the lazy dog. '.repeat(260);
     return [{ type: 'text', text: `EZiL Chat: long answer for turn ${turn}. ${filler}EZIL_LONG_BODY_${turn} ${filler}EZIL_LONG_OK_${turn}` }];
   }
+  if (userText.includes('EZIL_E2E_HISTORY')) return [{ type: 'text', text: 'EZIL_HISTORY_OK' }];
   if (userText.includes('EZIL_E2E_SLOW')) return [{ type: 'text', text: 'EZiL Chat: slow reply.', slow: true }];
   if (userText.includes('EZIL_E2E_UNDO')) {
     if (!done('ezil_undo')) return call('ezil_undo', 'replace_string_in_file', { filePath: join(folder, 'existing.txt'), oldString: 'after\n', newString: 'undo candidate\n' });
