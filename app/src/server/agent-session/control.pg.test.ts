@@ -710,6 +710,17 @@ describe.skipIf(!URL_)('EZiL MCP session controls on Postgres', () => {
         const created = (d: Delivery, resource: string, model: string | null = d.model ?? 'ezil/qwen3') =>
             applied(d, { sessionResource: resource, model, requestCount: 0 });
 
+        it('lets the private owner finish a dispatched create before a newly opened Code window takes the lease', async () => {
+            const { owner, epoch } = await connect('idle', 'unattended.private', 2);
+            await p2(owner, epoch, { catalog: catalogOf(attestedRow('ezil/qwen3')) });
+            const op = await control.createSession(h.db as never, caller, { computerId: ids.a1, model: 'ezil/qwen3', idempotencyKey: randomUUID() }, fast);
+            const { delivery } = await untilDelivered(owner, epoch, 'create');
+            expect((await p2('ext.person', 0)).owner).toBe('other');
+            await p2(owner, epoch, { reports: [created(delivery, resourceOf())] });
+            expect((await controlRow(op.id)).status).toBe('applied');
+            expect((await p2('ext.person', 0)).owner).toBe('self');
+        });
+
         it('the longest a control request can hold its caller stays under the MCP\'s 10 s call timeout, so it never reports uncertain for a change OS then stores', async () => {
             const sync = await import('./control-sync');
             const worstConfigure = sync.CONFIGURE_WAIT_MS + sync.CONFIGURE_REPORT_GRACE_MS + 1_000;
