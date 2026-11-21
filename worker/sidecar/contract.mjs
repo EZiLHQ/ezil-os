@@ -202,7 +202,11 @@ export const PRESS_KEYS = [
 /**
  * Tier origins come ONLY from these two variables: comma-separated bare https
  * origins (`https://host`, no path, no port unless explicit, no wildcard). A
- * malformed entry empties that tier (fail closed) and is logged once at boot.
+ * malformed entry in EITHER variable makes the whole policy broken: every URL
+ * is then `idp_transit` (transit only, for every caller) until the variable is
+ * fixed, and the fault is logged once at boot. Emptying just that tier would
+ * fail OPEN (a broken IdP list would make the IdP `other`). Unset variables are
+ * not malformed: an unset tier is empty.
  * `EZIL_BROWSER_TEST_ALLOWED_ORIGINS` is not a tier source and never will be.
  */
 export const ORIGIN_TIER_ENV = {
