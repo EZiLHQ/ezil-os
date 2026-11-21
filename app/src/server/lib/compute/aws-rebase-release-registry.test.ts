@@ -3,7 +3,7 @@ import { readLifecycleDeployments } from './aws-intent';
 import { attestationRegistry } from './aws-lower-attestation';
 import { parseRebaseRelease, parseRebaseSourceRelease, REBASE_RELEASE_REGISTRY_CAPACITY, RebaseReleaseSchema, RebaseSourceReleaseSchema,
     resolveRebaseReleases, sourceDeploymentFor } from './aws-rebase-release';
-import { fixtureReleaseRegistry106, fixtureReleaseRegistry16, fixtureReleaseRegistry26, fixtureReleaseRegistry32, fixtureReleaseRegistry36, fixtureReleaseRegistry37, fixtureReleaseRegistry38, fixtureReleaseRegistry39, fixtureReleaseRegistry40, fixtureReleaseRegistry41, fixtureReleaseRegistry42, fixtureReleaseRegistry43, fixtureReleaseRegistry44, fixtureSharedLowerSuccessor, LOWER_102, LOWER_105, PREMIUM_LOWER } from './aws-rebase-release-registry.test-support';
+import { fixtureReleaseRegistry106, fixtureReleaseRegistry16, fixtureReleaseRegistry26, fixtureReleaseRegistry32, fixtureReleaseRegistry36, fixtureReleaseRegistry37, fixtureReleaseRegistry38, fixtureReleaseRegistry39, fixtureReleaseRegistry40, fixtureReleaseRegistry41, fixtureReleaseRegistry42, fixtureReleaseRegistry43, fixtureReleaseRegistry44, fixtureReleaseRegistry45, fixtureSharedLowerSuccessor, LOWER_102, LOWER_105, PREMIUM_LOWER } from './aws-rebase-release-registry.test-support';
 
 describe('B2/B4/B5 retained 1.0.6 release registry', () => {
     it('resolves 8dbc to 1.0.6 while preserving the entire legacy 1.0.2 source deployment', () => {
@@ -196,14 +196,14 @@ describe('sixteen-record registry capacity and rollback compatibility', () => {
         expect(f.retained.slice(0, 3)).toEqual(f.releases);
     });
 
-    it('accepts twenty-five through forty-four records including maintenance and refuses forty-five in all three app readers even when all identities are valid', () => {
-        const f = fixtureReleaseRegistry44();
-        expect(REBASE_RELEASE_REGISTRY_CAPACITY).toBe(44);
+    it('accepts twenty-five through forty-five records including maintenance and refuses forty-six in all three app readers even when all identities are valid', () => {
+        const f = fixtureReleaseRegistry45();
+        expect(REBASE_RELEASE_REGISTRY_CAPACITY).toBe(45);
         expect(f.release125).toMatchObject({ previousLowerImageDigest: null, previousLowerImageRef: null });
         expect(RebaseSourceReleaseSchema.parse(f.release125)).toEqual(f.release125);
         const all = f.retained;
-        expect(all).toHaveLength(44);
-        for (let count = 25; count <= 44; count++) {
+        expect(all).toHaveLength(45);
+        for (let count = 25; count <= 45; count++) {
             const full = { ...f.deployment118, releases: all.slice(0, count) };
             expect(full.releases).toHaveLength(count);
             expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ [full.region]: full }) }, [full.region]).ok).toBe(true);
@@ -221,16 +221,17 @@ describe('sixteen-record registry capacity and rollback compatibility', () => {
         expect(JSON.stringify(all.slice(0, 41))).toBe(JSON.stringify(fixtureReleaseRegistry41().retained));
         expect(JSON.stringify(all.slice(0, 42))).toBe(JSON.stringify(fixtureReleaseRegistry42().retained));
         expect(JSON.stringify(all.slice(0, 43))).toBe(JSON.stringify(fixtureReleaseRegistry43().retained));
+        expect(JSON.stringify(all.slice(0, 44))).toBe(JSON.stringify(fixtureReleaseRegistry44().retained));
         // Every append preserves earlier records and the deployed tuple's lookup for rollback.
-        for (let count = 36; count <= 44; count++) {
+        for (let count = 36; count <= 45; count++) {
             const prior = { ...f.deployment118, releases: all.slice(0, count - 1) };
             const next = { ...f.deployment118, releases: all.slice(0, count) };
             expect(next.releases.slice(0, -1)).toEqual(prior.releases);
             expect(resolveRebaseReleases(next, LOWER_102)).toEqual(resolveRebaseReleases(prior, LOWER_102));
         }
-        const entry = { ...f.deployment118, releases: [...all, { ...f.release150, amiId: 'ami-ccccccccccccccccc', recipeVersion: '1.0.51',
-            createdAt: '2026-11-15T08:00:00.000Z' }] };
-        expect(entry.releases).toHaveLength(45);
+        const entry = { ...f.deployment118, releases: [...all, { ...f.release151, amiId: 'ami-ccccccccccccccccc', recipeVersion: '1.0.52',
+            createdAt: '2026-11-15T09:00:00.000Z' }] };
+        expect(entry.releases).toHaveLength(46);
         entry.releases.forEach(r => expect(RebaseSourceReleaseSchema.safeParse(r).success).toBe(true));
         expect(readLifecycleDeployments({ EZIL_AWS_LIFECYCLE_DEPLOYMENTS: JSON.stringify({ [entry.region]: entry }) }, [entry.region]).ok).toBe(false);
         expect(() => resolveRebaseReleases(entry, LOWER_102)).toThrow();
@@ -257,10 +258,10 @@ describe('sixteen-record registry capacity and rollback compatibility', () => {
         expect(() => resolveRebaseReleases({ ...f.deployment118, releases }, LOWER_102)).toThrow();
     });
 
-    it('keeps the 65,536-byte deployment-map ceiling at forty-four records', () => {
-        const f = fixtureReleaseRegistry44();
+    it('keeps the 65,536-byte deployment-map ceiling at forty-five records', () => {
+        const f = fixtureReleaseRegistry45();
         const entry = { ...f.deployment118, releases: f.retained };
-        expect(entry.releases).toHaveLength(44);
+        expect(entry.releases).toHaveLength(45);
         const raw = JSON.stringify({ [entry.region]: entry });
         expect(Buffer.byteLength(raw)).toBeLessThan(65536);
         const atLimit = raw + ' '.repeat(65536 - Buffer.byteLength(raw));

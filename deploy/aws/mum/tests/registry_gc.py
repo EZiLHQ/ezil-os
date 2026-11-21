@@ -725,7 +725,7 @@ class NamespaceLegacyCapacityTests(unittest.TestCase):
         return str(caught.exception)
 
     def test_each_namespace_keeps_its_frozen_gc_limit(self):
-        self.assertEqual(gc.tool.ACTIVE_REGISTRY_CAPACITY, 44)
+        self.assertEqual(gc.tool.ACTIVE_REGISTRY_CAPACITY, 45)
         for namespace, legacy in (('mum', 32), ('prd', 26)):
             with self.subTest(namespace=namespace):
                 gc.tool.use_namespace(namespace)
