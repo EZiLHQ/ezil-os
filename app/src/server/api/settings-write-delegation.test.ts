@@ -186,6 +186,19 @@ describe('computer.name', () => {
         expect(rows[0]!.name).toBe('x');
     });
 
+    it('does not write a row that stopped being live and owned between the lookup and the update', async () => {
+        fakeDb.query.computers.findFirst.mockImplementationOnce(async ({ where }: { where: never }) => {
+            const found = { ...matching(where)[0]! };
+            rows[0]!.deletedAt = new Date('2026-11-21T00:00:00Z');
+            return found;
+        });
+        expect(await caller().mcpSetSetting(write('computer.name', 'Late', mine))).toEqual(refusedAs('computer.name', 'computer_not_found'));
+        expect(rows[0]!.name).toBe('Desktop');
+        rows[0]!.deletedAt = null;
+        expect(await caller().mcpSetSetting(write('computer.name', 'Late', mine))).toMatchObject({ status: 'applied' });
+        expect(rows[0]!.name).toBe('Late');
+    });
+
     it('refuses a foreign, soft-deleted, unknown or unaddressed computer without writing', async () => {
         for (const computerId of [theirs, gone, '77777777-7777-4777-8777-777777777777']) {
             expect(await caller().mcpSetSetting(write('computer.name', 'Taken', computerId))).toEqual(refusedAs('computer.name', 'computer_not_found'));
