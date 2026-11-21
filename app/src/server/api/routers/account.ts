@@ -8,10 +8,11 @@ import { computers } from '@/server/db/schema';
 
 import { ACCOUNT_SETTINGS_PROCEDURE, requireOnboardingCaller } from '../onboarding-delegation';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
+import { readSettingsAiBalance } from './account-ai-balance';
 import { liveComputersOf, MAX_COMPUTERS_PER_USER } from './computer-store';
 
 export const accountRouter = createTRPCRouter({
-    mcpSettings: protectedProcedure.input(z.object({}).strict()).query(async ({ ctx }) => {
+    mcpSettings: protectedProcedure.input(z.object({}).strict()).query(async ({ ctx, signal }) => {
         requireOnboardingCaller(ctx, ACCOUNT_SETTINGS_PROCEDURE);
         const userId = ctx.user.id;
         const deps = getBillingDeps();
@@ -26,6 +27,10 @@ export const accountRouter = createTRPCRouter({
             loadComputeBillingState(deps, userId, now).catch(() => null),
             deps.aiCredits?.receiptsFor?.(userId).catch(() => null) ?? null,
         ]);
+        const pendingDeliveryCredits = receipts === null ? null : waitingCredits(receipts, now)?.credits ?? 0;
+        const observedBalance = await readSettingsAiBalance(ctx.db, userId, owned.map(computer => computer.id), signal);
+        const balance = observedBalance?.balanceMicro === '0' && (pendingDeliveryCredits ?? 0) > 0
+            ? null : observedBalance;
         return {
             account: { id: userId },
             computers: owned,
@@ -44,13 +49,11 @@ export const accountRouter = createTRPCRouter({
                     remainingStandardSeconds: Math.max(0, billing.allowanceStdSeconds - billing.usedStdSeconds),
                 },
             },
-            // The OS assertion is scoped to OS. The Gateway balance reader requires
-            // the owner's Gateway credential, which this delegation does not carry.
             credits: {
-                state: 'unavailable' as const,
-                balanceMicro: null,
-                heldMicro: null,
-                pendingDeliveryCredits: receipts === null ? null : waitingCredits(receipts, now)?.credits ?? 0,
+                state: balance ? 'available' as const : 'unavailable' as const,
+                balanceMicro: balance?.balanceMicro ?? null,
+                heldMicro: balance?.heldMicro ?? null,
+                pendingDeliveryCredits,
             },
         };
     }),
