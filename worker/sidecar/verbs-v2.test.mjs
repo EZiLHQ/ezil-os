@@ -302,6 +302,45 @@ describe('idp_transit: transit only', () => {
     });
 });
 
+// ── a broken policy: every page is transit-only, for every caller ───────────
+
+describe('a broken origin policy (a malformed tier entry) makes EVERY page idp_transit', () => {
+    const BROKEN = loadOriginPolicy({
+        [ORIGIN_TIER_ENV.owner_app]: 'https://universe-staging.ezil.work',
+        [ORIGIN_TIER_ENV.idp_transit]: 'https://id.ezil.work/', // trailing slash: malformed
+    });
+    const REFUSED = Object.keys(SIDECAR_WIRE).filter((r) => !['GET /health', 'POST /navigate', 'POST /wait_for'].includes(r));
+
+    for (const url of [OTHER_PAGE, OWNER_PAGE, 'http://127.0.0.1:3000/preview', 'about:blank']) {
+        it(`a page at ${url}: every non-transit route is origin_read_only and nothing is touched`, async () => {
+            expect(BROKEN.broken).toBe(true);
+            const page = new FakePage(url);
+            const surface = surfaceOver([page], { policy: BROKEN });
+            mintRefs(surface, page);
+            for (const route of REFUSED) {
+                expect({ route, code: await codeOf(VERBS[route](surface, BODY[route])) }).toEqual({ route, code: 'origin_read_only' });
+            }
+            expect(await codeOf(VERBS['POST /wait_for'](surface, { text: 'Builder' }))).toBe('origin_read_only');
+            expect(page.actions).toEqual([]);
+            expect(page.filled).toEqual([]);
+            // Transit still works, and what it returns is the transit form.
+            expect(await codeOf(VERBS['GET /health'](surface, {}))).toBe('ok');
+            expect(await codeOf(VERBS['POST /wait_for'](surface, { time: 0.05 }))).toBe('ok');
+            const nav = await VERBS['POST /navigate'](surface, { url: 'https://example.com/next?page=2#top' });
+            expect(nav.url).toBe('https://example.com/next');
+        });
+    }
+
+    it('positive control: the same page under the well-formed policy is `other` and fully usable', async () => {
+        const page = new FakePage(OTHER_PAGE);
+        const surface = surfaceOver([page], { policy: STAGING });
+        mintRefs(surface, page);
+        for (const route of REFUSED) {
+            expect({ route, code: await codeOf(VERBS[route](surface, BODY[route])) }).toEqual({ route, code: 'ok' });
+        }
+    });
+});
+
 // ── the Code loopback: opts.denyTiers ───────────────────────────────────────
 
 describe('opts.denyTiers (the Code loopback passes owner_app + idp_transit)', () => {
@@ -784,17 +823,27 @@ describe('/screenshot masks password fields', () => {
 // ── the surface's own policy wiring ─────────────────────────────────────────
 
 describe('BrowserSurface loads its policy once, at creation', () => {
-    it('reads process.env when none is injected, and logs a malformed tier entry then', () => {
+    it('reads process.env when none is injected, and logs a broken policy ONCE then', () => {
         const saved = { ...process.env };
         const warn = spyOn(console, 'warn').mockImplementation(() => {});
         try {
             process.env[ORIGIN_TIER_ENV.owner_app] = 'https://universe-staging.ezil.work';
             process.env[ORIGIN_TIER_ENV.idp_transit] = 'https://id.ezil.work/';
             const surface = new BrowserSurface('http://127.0.0.1:9222');
-            expect(surface.originPolicy.owner_app).toEqual(['https://universe-staging.ezil.work']);
+            expect(surface.originPolicy.broken).toBe(true);
+            expect(surface.originPolicy.owner_app).toEqual([]);
             expect(surface.originPolicy.idp_transit).toEqual([]);
             expect(warn).toHaveBeenCalledTimes(1);
-            expect(String(warn.mock.calls[0][0])).toContain(ORIGIN_TIER_ENV.idp_transit);
+            expect(String(warn.mock.calls[0][0])).toContain('origin policy BROKEN');
+            expect(String(warn.mock.calls[0][0])).toContain(`${ORIGIN_TIER_ENV.idp_transit} entry #1`);
+            // …and well-formed values are read as tiers, logging nothing.
+            warn.mockClear();
+            process.env[ORIGIN_TIER_ENV.idp_transit] = 'https://id.ezil.work';
+            const sound = new BrowserSurface('http://127.0.0.1:9222');
+            expect(sound.originPolicy.broken).toBe(false);
+            expect(sound.originPolicy.owner_app).toEqual(['https://universe-staging.ezil.work']);
+            expect(sound.originPolicy.idp_transit).toEqual(['https://id.ezil.work']);
+            expect(warn).toHaveBeenCalledTimes(0);
             // An injected policy is used as given, and logs nothing.
             warn.mockClear();
             expect(new BrowserSurface('x', { originPolicy: STAGING }).originPolicy).toBe(STAGING);
