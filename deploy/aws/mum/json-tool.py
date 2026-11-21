@@ -29,7 +29,7 @@ RELEASE_REGISTRY_CAPACITY = LEGACY_REGISTRY_CAPACITY["mum"]
 # REBASE_RELEASE_REGISTRY_CAPACITY (app/src/server/lib/compute/aws-rebase-release.ts); records past the
 # namespace legacy limit may only be appended once the running app proves it reads them (rebase_release.py,
 # normal apply-app then promote).
-ACTIVE_REGISTRY_CAPACITY = 44
+ACTIVE_REGISTRY_CAPACITY = 45
 BASE_ALLOWED = {"DesktopImageDigest", "DesktopImageId", "AgentSrcS3Uri"}
 PREVIOUS = {"PreviousDesktopImageDigest", "PreviousDesktopImageId"}
 ALLOWED = BASE_ALLOWED | PREVIOUS
