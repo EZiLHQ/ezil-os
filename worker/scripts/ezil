@@ -34,7 +34,8 @@ Options:
   --json     print exactly the documented JSON object (errors go to stderr as {"error":{"code","message"}})
   --help     print this help and exit 0
 
-Exit codes: 0 ok, 2 usage, 69 unavailable (no socket, bridge off), 75 pending, 77 refused.
+Exit codes: 0 ok, 2 usage, 69 unavailable (no socket, bridge off), 75 pending (queued, waiting for the editor
+to reconnect), 77 refused (also: an invalid tool).
 Environment: EZIL_CLI_SOCKET (default ${SOCKET}), EZIL_TOOLSD_MANIFEST (default ${MANIFEST}),
 EZIL_WORKSPACE_ROOT (default ${WORKSPACE}).
 `;
@@ -167,8 +168,14 @@ function print(out, json, human) {
 
 const ack = (o) => `sessionId: ${o.sessionId}\noperationId: ${o.operationId ?? ''}\nstatus: ${o.status ?? ''}\n`;
 
+// Operation statuses (app/src/server/agent-session/store.ts OP_STATUSES). An accepted request exits 0 whether it is
+// queued, accepted or running; one that waits for a disconnected editor is pending (75); one OS turned away is refused.
+const PENDING_STATUSES = ['queued_disconnected'];
+const REFUSED_STATUSES = ['rejected', 'refused_allowance', 'expired', 'failed', 'cancelled'];
+
 function exitOf(out) {
-    return out.status === 'pending' ? PENDING : OK;
+    if (PENDING_STATUSES.includes(out.status)) return PENDING;
+    return REFUSED_STATUSES.includes(out.status) ? REFUSED : OK;
 }
 
 async function chatNew({ flags, positional }) {
@@ -235,8 +242,11 @@ async function toolValidate({ positional }) {
         throw new CliError(UNAVAILABLE, 'validator_unavailable', `${manifestPath} does not export validateManifest and scanCatalog`);
     }
     const catalog = await manifest.scanCatalog(process.env.EZIL_WORKSPACE_ROOT || WORKSPACE);
-    let tools = Array.isArray(catalog?.tools) ? catalog.tools : [];
-    let invalid = Array.isArray(catalog?.invalid) ? catalog.invalid : [];
+    // Never read a result of another shape as "no tools": that would report success for a validator we do not understand.
+    if (!Array.isArray(catalog?.tools) || !Array.isArray(catalog?.invalid)) {
+        throw new CliError(UNAVAILABLE, 'validator_unavailable', `${manifestPath} returned a catalog without tools and invalid lists`);
+    }
+    let { tools, invalid } = catalog;
     if (name !== undefined) {
         tools = tools.filter((t) => t?.name === name);
         invalid = invalid.filter((i) => i?.dir === name);

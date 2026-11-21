@@ -227,14 +227,29 @@ test('exit codes follow the error code: 2 usage, 69 unavailable, 77 refused', as
     }
 });
 
-test('exit 75 when the operation is still pending (the object is printed)', async () => {
-    await withBridge(() => ok({ ...ACK, status: 'pending' }), async (_bridge, ezil) => {
+test('exit 75 when the operation is queued for a disconnected editor (the object is still printed)', async () => {
+    await withBridge(() => ok({ ...ACK, status: 'queued_disconnected' }), async (_bridge, ezil) => {
         for (const args of [['chat', 'new', '--json'], ['chat', 'send', 'sess-1', 'x', '--json']]) {
             const { code, stdout } = await ezil(args);
             assert.equal(code, 75, args.join(' '));
-            assert.equal(JSON.parse(stdout).status, 'pending');
+            assert.equal(JSON.parse(stdout).status, 'queued_disconnected');
         }
     });
+});
+
+test('an accepted operation exits 0 whatever stage it is at; a turned-away one exits 77 with the object printed', async () => {
+    for (const status of ['queued', 'accepted', 'running', 'completed', 'finished_unverified', 'cancel_requested', 'uncertain']) {
+        await withBridge(() => ok({ ...ACK, status }), async (_bridge, ezil) => {
+            assert.equal((await ezil(['chat', 'send', 'sess-1', 'x', '--json'])).code, 0, status);
+        });
+    }
+    for (const status of ['rejected', 'refused_allowance', 'expired', 'failed', 'cancelled']) {
+        await withBridge(() => ok({ ...ACK, status }), async (_bridge, ezil) => {
+            const { code, stdout } = await ezil(['chat', 'send', 'sess-1', 'x', '--json']);
+            assert.equal(code, 77, status);
+            assert.equal(JSON.parse(stdout).status, status);
+        });
+    }
 });
 
 test('exit 2 for usage mistakes, with nothing sent', async () => {
@@ -348,6 +363,13 @@ test('tool validate with no tools says so; a missing or unusable validator is 69
     const unusable = await run(['tool', 'validate', '--json'], { env: { EZIL_TOOLSD_MANIFEST: wrong } });
     assert.equal(unusable.code, 69);
     assert.equal(JSON.parse(unusable.stderr).error.code, 'validator_unavailable');
+    // A validator whose result is not {tools, invalid} must not read as "no tools, all fine".
+    for (const catalog of [{}, { tools: [] }, { invalid: [] }, { tools: {}, invalid: [] }, { entries: [], problems: [] }]) {
+        const odd = await run(['tool', 'validate', '--json'], { env: { EZIL_TOOLSD_MANIFEST: fakeManifest(catalog) } });
+        assert.equal(odd.code, 69, JSON.stringify(catalog));
+        assert.equal(JSON.parse(odd.stderr).error.code, 'validator_unavailable');
+        assert.equal(odd.stdout, '');
+    }
 });
 
 test('tool validate never needs the chat socket', async () => {

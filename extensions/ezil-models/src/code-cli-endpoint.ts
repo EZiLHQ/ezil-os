@@ -38,6 +38,8 @@ export interface CliServerDeps {
     token: string;
     fetch: (url: string, init: RequestInit) => Promise<Response>;
     log: (line: string) => void;
+    /** Read at every request: turning ezil.chatBridge.enabled off stops relaying without a restart. Default: on. */
+    enabled?: () => boolean;
     timeoutMs?: number;
     idleMs?: number;
 }
@@ -202,6 +204,7 @@ function handle(deps: CliServerDeps, socket: net.Socket): void {
         if (newline === -1) return;
         accepted = true;
         socket.setTimeout(0);
+        if (deps.enabled && !deps.enabled()) return refuse('cli_unavailable', 'the chat bridge is off on this computer');
         const parsed = parseRequest(Buffer.concat(chunks).toString('utf8'));
         if (!parsed.ok) return finish(parsed);
         void forward(deps, parsed).then((outcome) => finish(outcome, parsed.op));
@@ -254,7 +257,8 @@ export function registerCodeCli(context: vscode.ExtensionContext, log: (line: st
     const env = overrides.env ?? process.env;
     const token = env.EZIL_EDITOR_BRIDGE_TOKEN ?? '';
     const cliUrl = cliUrlFrom(env.EZIL_AI_BASE_URL);
-    const enabled = vscode.workspace.getConfiguration('ezil').get('chatBridge.enabled') === true;
+    const bridgeOn = () => vscode.workspace.getConfiguration('ezil').get('chatBridge.enabled') === true;
+    const enabled = bridgeOn();
     const missing = [enabled ? '' : 'ezil.chatBridge.enabled', TOKEN.test(token) ? '' : 'bridge token', cliUrl ? '' : 'code origin'].filter(Boolean);
     if (missing.length || !cliUrl) {
         log(`[code-cli] off: ${missing.join(', ')}`);
@@ -267,6 +271,7 @@ export function registerCodeCli(context: vscode.ExtensionContext, log: (line: st
             token,
             fetch: overrides.fetch ?? ((url, init) => fetch(url, init)),
             log,
+            enabled: bridgeOn,
             timeoutMs: overrides.timeoutMs,
             idleMs: overrides.idleMs,
         });

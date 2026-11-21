@@ -104,6 +104,23 @@ describe('the gate', () => {
         expect(logs.join('\n')).not.toContain(TOKEN);
     });
 
+    test('turning the setting off at runtime stops relaying (cli_unavailable) and turning it on resumes', async () => {
+        setBridge(true);
+        const dir = freshDir();
+        const ctx = context();
+        let fetched = 0;
+        registerCodeCli(ctx as never, () => {}, { env, socketDir: dir, fetch: async () => { fetched++; return jsonResponse({ ok: true, result: { sessions: [] } }); } });
+        cleanups.push(() => ctx.subscriptions.forEach((d) => d.dispose()));
+        const socketPath = path.join(dir, 'ezil.sock');
+        expect((await ask(socketPath, { v: 1, op: 'chat.list', args: {} })).ok).toBe(true);
+        setBridge(false);
+        expect(await ask(socketPath, { v: 1, op: 'chat.list', args: {} })).toEqual({ v: 1, ok: false, error: { code: 'cli_unavailable', message: expect.any(String) } });
+        expect(fetched).toBe(1);
+        setBridge(true);
+        expect((await ask(socketPath, { v: 1, op: 'chat.list', args: {} })).ok).toBe(true);
+        expect(fetched).toBe(2);
+    });
+
     test('the code origin comes from the sync derivation (https, or http for localhost)', () => {
         expect(cliUrlFrom(BASE)).toBe(CLI_URL);
         expect(cliUrlFrom('http://8443-x.localhost:8787/ai/v1')).toBe('http://8443-x.localhost:8787/editor-bridge/v1/cli');
