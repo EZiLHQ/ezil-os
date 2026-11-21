@@ -1,9 +1,9 @@
 {
   "taskId": "ws3-sidecar",
   "runId": "run-1121",
-  "status": "running",
+  "status": "done",
   "doneRung": "sidecar-verbs-v2-and-origin-tiers-unit-green-mutation-proved",
-  "evidence": "Baseline at 4452459f before any edit: worker/sidecar bun test 38 pass / 6 fail / 1 error, exit 1 (contract.mjs v2 frozen ahead of verbs.mjs; load-time route assertion throws). worker typecheck exit 0; browser-sidecar-contract.test.ts with EZIL_BROWSER_SIDECAR_CONTRACT set 8 pass / 2 fail, exit 1. mcp typecheck exit 0; mcp bun test 33 pass / 0 fail, exit 0.",
+  "evidence": "Baseline at 4452459f: sidecar bun test 38 pass / 6 fail / 1 error (exit 1); worker contract test 8 pass / 2 fail (exit 1); mcp 33 pass / 0 fail. Final (commits cefb7478..51d7a87f): worker/sidecar bun test 210 pass / 0 fail / 0 skip, 5 files, exit 0. worker typecheck exit 0 + browser-sidecar-contract.test.ts with EZIL_BROWSER_SIDECAR_CONTRACT set 14 pass / 0 fail / 0 skip, exit 0. mcp typecheck exit 0 + bun test 38 pass / 1 fail, exit 1: the fail is mcp/src/server.protocol.test.ts:87 pinning 10 tools (now 13 with the three aliases), a file outside this lane -> hand-off. Mutation proofs (full sidecar suite, 210 tests, each restored with git checkout -> 210/0): tier gate no-throw -> 36 red; idp route table allows all -> 25 red; sanitizeUrl identity -> 24 red; ref tab binding removed -> 2 red; ref origin binding removed -> 1 red. Worker allowlist drops press -> 1 red, adds evaluate -> 2 red; explicit missing contract path -> 1 red (not a skip). MCP alias copies annotations -> 1 red. Ad-hoc real Chrome 149 headless over connectOverCDP (not committed): 43 pass / 0 fail incl. fill_form/select/scroll/every PRESS_KEYS key on real DOM, real idp gate on https://example.com, masked PNG sha identical for 4 vs 33 char passwords with unmasked control differing. Hand-offs: worker/Dockerfile:413 n!==10 -> 14; mcp/src/server.protocol.test.ts:87 toBe(10) -> 13; mcp/README.md:14 'Ten tools'.",
   "startedAt": "2026-11-21T20:30:00Z",
-  "updatedAt": "2026-11-21T20:30:00Z"
+  "updatedAt": "2026-11-21T21:50:00Z"
 }
