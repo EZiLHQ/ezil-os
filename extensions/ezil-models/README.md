@@ -382,3 +382,37 @@ and cache-option allowlist in turn and requires each focused test to fail.
 
 The package license is AGPL-3.0-only. See `ATTRIBUTIONS.md` and the MIT notice
 preserved in `src/anthropic.ts` for Microsoft Copilot converter attribution.
+
+## Workspace MCP attach (owner-granted, default zero)
+
+The extension contributes one MCP definition provider, `ezil-browser`. It serves
+the **EZiL Browser** tool when the sandbox launched Code with that capability,
+and the **EZiL Workspace** tool only after the owner runs **EZiL Models: Attach
+Workspace MCP (this window)** and confirms the modal naming the single trusted
+local folder. Nothing is served before that; **EZiL Models: Detach Workspace
+MCP** ends it.
+
+Bound scope of the attach:
+
+- One packaged tool, `workspace_info`, read-only: the folder's name, path and
+  up to 64 top-level entry names (dotfiles excluded). No file contents, no
+  writes, no arguments.
+- No repository configuration is read (`.vscode/mcp.json` and similar stay
+  inert) and no workspace program is ever executed. The ordinary terminal is
+  unchanged.
+- The grant is in memory for this window only. It is never persisted: a new
+  window, a reload or a restart starts at zero again. A change to the workspace
+  folders detaches.
+- While granted, the extension owns a private Unix socket (0700 directory, 0600
+  socket) that serves the MCP protocol. The packaged `dist/workspace-mcp-server.js`
+  adapter only relays stdio to that socket; the socket path is its sole argument
+  and no capability enters the definition.
+- Every `tools/call` re-checks the grant and that the folder is still the same
+  real directory (device, inode and owner uid). Revoke, dispose or restart
+  closes the socket and removes its directory, so a definition Code still has
+  cached cannot serve afterwards: the adapter exits and a new one fails to
+  connect.
+
+`tests/workspace-mcp.test.ts` is the proof: the real adapter process reaches the
+granted tool over the socket, is refused at call time after revoke, exits when
+the endpoint closes, and cannot reconnect to the stale path.

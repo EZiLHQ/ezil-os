@@ -11,7 +11,7 @@ import { CompactionNotice } from './compaction-notice';
 import { EZiLAIStatus } from './status';
 import { EZiLModelsProvider, type BillingIntent } from './provider';
 import { PARTICIPANT_ID, registerNoToolsParticipant } from './participant';
-import { registerBrowserMcp } from './browser-mcp';
+import { registerCodeMcp } from './code-mcp';
 import type { Usage } from './types';
 import { publishInferenceTrace } from './trace-publisher';
 import { hostedInferenceActivity } from './inference-activity';
@@ -252,7 +252,7 @@ export function appStartFailure(): AppFailure {
 }
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
-    registerBrowserMcp(context);
+    registerCodeMcp(context);
     const output = vscode.window.createOutputChannel('EZiL Models');
     const log = (line: string) => output.appendLine(line.startsWith('{') ? line : `${new Date().toISOString()} ${line}`);
     const settings = () => vscode.workspace.getConfiguration('ezilModels');

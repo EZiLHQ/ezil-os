@@ -15,6 +15,7 @@ export class ChatRequestTurn { constructor(public prompt: string, public partici
 export class ChatResponseMarkdownPart { value: { value: string }; constructor(value: string) { this.value = { value }; } }
 export class ChatResponseTurn { constructor(public response: unknown[], public participant: string) {} }
 export class ThemeIcon { constructor(public id: string) {} }
+export class McpStdioServerDefinition { constructor(public label: string, public command: string, public args: string[] = [], public env?: Record<string, string | number | null>, public version?: string) {} }
 export class EventEmitter<T> { private listeners: ((value: T) => void)[] = []; event = (listener: (value: T) => void) => { this.listeners.push(listener); return { dispose: () => {} }; }; fire(value: T) { for (const listener of this.listeners) listener(value); } dispose() {} }
 
 export const fakeVscode: Record<string, unknown> = {
@@ -32,6 +33,7 @@ export const fakeVscode: Record<string, unknown> = {
     chat: { createChatParticipant: (id: string, handler: unknown) => ({ id, handler, dispose() {} }) },
     EventEmitter,
     ThemeIcon,
+    McpStdioServerDefinition,
     StatusBarAlignment: { Right: 2 },
     workspace: { getConfiguration: () => ({ get: () => undefined }), onDidChangeConfiguration: () => ({ dispose() {} }) },
     lm: { registerLanguageModelChatProvider: () => ({ dispose() {} }) },
