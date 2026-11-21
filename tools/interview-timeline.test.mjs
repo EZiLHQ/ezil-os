@@ -10,6 +10,7 @@
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createServer } from "node:http";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -646,6 +647,28 @@ describe("interview.mjs create", () => {
 			assert.equal(r.code, 1, remote);
 			assert.match(r.stderr, /seed remote must be an https URL without credentials/);
 			assert.equal(git.calls.length, 0);
+		}
+	});
+
+	test("real git sends the URL-scoped Authorization header over HTTP, and the token is not in the URL", async () => {
+		const seen = [];
+		const server = createServer((req, res) => {
+			seen.push({ url: req.url, authorization: req.headers.authorization });
+			res.writeHead(403).end();
+		});
+		await new Promise((done) => server.listen(0, "127.0.0.1", done));
+		try {
+			const remote = `http://127.0.0.1:${server.address().port}/r.git`;
+			await assert.rejects(
+				pushTemplate({ templateDir: template, remote, token: SEED_TOKEN, pathEnv: process.env.PATH }),
+				(err) => /git push failed/.test(err.message),
+			);
+			assert.ok(seen.length > 0, "git reached the server");
+			assert.equal(seen[0].url, "/r.git/info/refs?service=git-receive-pack");
+			assert.equal(seen[0].authorization, `Bearer ${SEED_TOKEN}`);
+			assert.ok(seen.every((r) => !r.url.includes(SEED_TOKEN)));
+		} finally {
+			await new Promise((done) => server.close(done));
 		}
 	});
 
