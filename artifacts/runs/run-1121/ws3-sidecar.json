@@ -1,0 +1,9 @@
+{
+  "taskId": "ws3-sidecar",
+  "runId": "run-1121",
+  "status": "running",
+  "doneRung": "sidecar-verbs-v2-and-origin-tiers-unit-green-mutation-proved",
+  "evidence": "Baseline at 4452459f before any edit: worker/sidecar bun test 38 pass / 6 fail / 1 error, exit 1 (contract.mjs v2 frozen ahead of verbs.mjs; load-time route assertion throws). worker typecheck exit 0; browser-sidecar-contract.test.ts with EZIL_BROWSER_SIDECAR_CONTRACT set 8 pass / 2 fail, exit 1. mcp typecheck exit 0; mcp bun test 33 pass / 0 fail, exit 0.",
+  "startedAt": "2026-11-21T20:30:00Z",
+  "updatedAt": "2026-11-21T20:30:00Z"
+}
