@@ -262,14 +262,51 @@ describe.skipIf(!fixture.url)('delegated computer reads through the real /api/tr
             return body + '.' + Buffer.from(sig).toString('base64url');
         };
     }
-    async function bootstrapRequest(subject: string, token: string, extras: Record<string, unknown> = {}) {
-        const body = mcpInput({ idToken: token, nonce });
+    async function bootstrapDecision(subject: string, input: unknown, extras: Record<string, unknown> = {}) {
+        const body = mcpInput(input);
         const proof = await signAssertion(key, readClaims(subject, 'computer.list', body, {
             iss: connector, aud: stageOs, idp_iss: issuer, proc: procedure, scope: 'ezil:account:bootstrap', ...extras,
         }));
         return () => route.POST(new Request(readUrl(procedure, undefined, stageOs), { method: 'POST', body,
             headers: { authorization: 'EZiL-Delegation ' + proof, 'content-type': 'application/json' } }));
     }
+
+    function bootstrapRequest(subject: string, token: string, extras: Record<string, unknown> = {}) {
+        return bootstrapDecision(subject, { decision: 'allow', idToken: token, nonce }, extras);
+    }
+
+    it('records the exact consent-only denial through the whole replay window and refuses a stale Allow without identity I/O', async () => {
+        const oidc = await bootstrapSetup();
+        const jti = randomUUID();
+        const subject = 'auth0|' + randomUUID();
+        const email = 'denied-owner@example.test';
+        const denied = await bootstrapDecision('mcp-consent|' + jti, { decision: 'deny' }, { jti });
+        const allow = await bootstrapRequest(subject, await oidc(subject, email), { jti });
+        const receipt = await denied();
+        expect(receipt.status).toBe(200);
+        expect(await receipt.json()).toMatchObject({ result: { data: { json: { denied: true } } } });
+        expect((await allow()).status).toBe(401);
+        expect((await denied()).status).toBe(401);
+        const [replay] = await admin!.unsafe(`SELECT extract(epoch FROM expires_at-now())::int AS remaining
+            FROM ${s}.ezil_delegation_replay WHERE jti=$1`, [jti]);
+        expect(replay!.remaining).toBeGreaterThanOrEqual(590);
+        expect(gotrue.createUser).not.toHaveBeenCalled();
+        expect(fetch).not.toHaveBeenCalled();
+        expect(createClient).not.toHaveBeenCalled();
+    });
+
+    it('rejects any Deny with an upstream identity subject or proof fields', async () => {
+        await bootstrapSetup();
+        const subject = 'auth0|' + randomUUID();
+        expect((await (await bootstrapDecision(subject, { decision: 'deny' }))()).status).toBe(401);
+        const jti = randomUUID();
+        const extraneous = await bootstrapDecision('mcp-consent|' + jti, {
+            decision: 'deny', idToken: 'private.fixture.proof', nonce,
+        }, { jti });
+        expect((await extraneous()).status).toBe(400);
+        expect(fetch).not.toHaveBeenCalled();
+        expect(gotrue.createUser).not.toHaveBeenCalled();
+    });
 
     it('registers an authenticated first-use owner once and returns zero through actual delegated discovery', async () => {
         const oidc = await bootstrapSetup();

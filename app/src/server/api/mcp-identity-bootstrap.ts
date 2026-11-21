@@ -26,20 +26,31 @@ export function mcpIdentityBootstrapBinding(request: TrpcDelegationRequest) {
     return bindTrpcDelegation(request, new Set(), paths);
 }
 
-export const mcpIdentityProof = z.object({
-    idToken: z.string().max(8192).regex(/^[\w-]+\.[\w-]+\.[\w-]+$/),
-    nonce: z.string().regex(/^[\w-]{43}$/),
-}).strict();
+export const mcpIdentityProof = z.discriminatedUnion('decision', [
+    z.object({
+        decision: z.literal('allow'),
+        idToken: z.string().max(8192).regex(/^[\w-]+\.[\w-]+\.[\w-]+$/),
+        nonce: z.string().regex(/^[\w-]{43}$/),
+    }).strict(),
+    z.object({ decision: z.literal('deny') }).strict(),
+]);
 
 export async function completeMcpConnection(
     ctx: Pick<TRPCContext, 'delegation' | 'db' | 'user'>,
     input: z.infer<typeof mcpIdentityProof>,
-): Promise<{ ready: true }> {
+): Promise<{ ready: true } | { denied: true }> {
     const clientId = mcpIdentityBootstrapAudience(process.env);
     const delegation = ctx.delegation;
     if (!clientId || ctx.user || delegation?.status !== 'bootstrap' || delegation.call.procedure !== MCP_IDENTITY_BOOTSTRAP) {
         throw new TRPCError({ code: 'UNAUTHORIZED' });
     }
+    // The tRPC transport already consumed this consent's shared replay key.
+    // A denial identifies only that key and never reads or creates an account.
+    if (input.decision === 'deny') {
+        if (delegation.call.subject !== 'mcp-consent|' + delegation.call.jti) throw new TRPCError({ code: 'UNAUTHORIZED' });
+        return { denied: true };
+    }
+    if (delegation.call.subject.startsWith('mcp-consent|')) throw new TRPCError({ code: 'UNAUTHORIZED' });
     const identity = await verifyIdTokenForAudience(input.idToken, {
         clientId, nonce: input.nonce, maxAgeSeconds: MCP_IDENTITY_CONSENT_SECONDS,
     }).catch(() => null);
