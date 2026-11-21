@@ -27,7 +27,7 @@ const PICKER = [
 ];
 
 function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, now = () => 1700000000000, acquireDelay = null, listDelay = null, openDelay = null, used = true,
-    picker = PICKER, startThrows = false, openFails = false, sticky = true, listEmpty = true, userAgent = undefined, href = undefined } = {}) {
+    picker = PICKER, startThrows = false, openFails = false, sticky = true, listEmpty = true, userAgent = undefined, href = undefined, checkpoint = undefined } = {}) {
     const models = new Map();
     const loaded = new Map();
     const calls = { send: [], cancel: [], acquire: 0, disposed: 0, started: 0, opened: [], switched: [] };
@@ -35,7 +35,7 @@ function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, no
         const listeners = new Set();
         models.set(id, {
             // One earlier, finished exchange, as in a chat the person has used.
-            sessionResource: uri(id), requests: used ? [{ id: `earlier-${id}`, message: { text: 'earlier' }, response: { isComplete: true, isCanceled: false, entireResponse: { getMarkdown: () => 'earlier answer' } } }] : [], pending: [],
+            sessionId: id, sessionResource: uri(id), requests: used ? [{ id: `earlier-${id}`, message: { text: 'earlier' }, response: { isComplete: true, isCanceled: false, entireResponse: { getMarkdown: () => 'earlier answer' } } }] : [], pending: [],
             requestInProgress: obs(false), requestNeedsInput: obs(false), isInputBlocked: obs(false), isReadOnly: obs(false),
             getRequests() { return this.requests; }, getPendingRequests() { return this.pending; },
             get lastRequest() { return this.requests.at(-1); },
@@ -49,6 +49,9 @@ function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, no
     for (const id of open) if (models.has(id)) loaded.set(id, 1);
     let nextSend = null;
     const chatService = {
+        _saveModelsEnabled: true,
+        shouldStoreSession: model => models.has(model.sessionId),
+        _chatSessionStore: checkpoint,
         // listEmpty: false models a runtime that lists a chat only once it has a request.
         async getLiveSessionItems() { if (listDelay) await listDelay(); return [...loaded.keys()].filter((id) => listEmpty || models.get(id).requests.length).map((id) => ({ sessionResource: uri(id), title: `Live ${id}` })); },
         async getHistorySessionItems() { return sessions.filter((id) => !loaded.has(id)).map((id) => ({ sessionResource: uri(id), title: `Saved ${id}` })); },

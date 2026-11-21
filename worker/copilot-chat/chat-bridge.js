@@ -141,6 +141,8 @@
             status = response && response.isCanceled ? 'cancelled'
                 // The response model's own failed state (4.141.0 ChatResponseModel.state: an errorDetails other than "canceled").
                 : response && response.isComplete && error && error.code !== 'canceled' ? 'failed'
+                : response && response.isComplete && record.checkpoint === 'pending' ? 'in_progress'
+                : response && response.isComplete && record.checkpoint === 'unverified' ? 'finished_unverified'
                 : response && response.isComplete ? 'completed'
                 : !response && record.settled ? 'finished_unverified'
                 : record.cancelRequested ? 'cancel_requested' : 'in_progress';
@@ -149,6 +151,19 @@
             ok: true, status, commandId: record.commandId, sessionResource: record.key,
             requestId: record.requestId, mode: record.mode, selectedModelId: record.selectedModelId, acceptedAt: record.acceptedAt,
         }, extra || {});
+    }
+
+    // A private window can close immediately after returning its result. Code's
+    // normal, delayed save may not have run. Use its native queued store for
+    // this model only and confirm that its exact request reached disk. The
+    // native store logs write failures internally, so awaiting a write alone
+    // would give the caller a false success receipt.
+    async function checkpointTurn(model, requestId) {
+        if (!requestId || !chat._saveModelsEnabled || !chat.shouldStoreSession(model)) return false;
+        const store = chat._chatSessionStore;
+        await store.storeSessions([model]);
+        const saved = await store.readSession(model.sessionId);
+        return saved?.value?.requests?.some(request => request.requestId === requestId) === true;
     }
 
     /**
@@ -220,8 +235,8 @@
         record.status = 'accepted';
         remember(record);
         held.add(ref);
-        const release = () => { record.settled = true; if (held.delete(ref)) ref.dispose(); };
-        Promise.resolve(result.data.responseCompletePromise).then(release, release);
+        if (unattended) record.checkpoint = 'pending';
+        const complete = Promise.resolve(result.data.responseCompletePromise).then(() => {}, () => {});
         let timer;
         const created = await Promise.race([
             Promise.resolve(result.data.responseCreatedPromise).catch(() => undefined),
@@ -232,6 +247,16 @@
             record.response = created;
             record.requestId = typeof created.requestId === 'string' ? created.requestId : null;
         }
+        complete.then(async () => {
+            try {
+                if (unattended) record.checkpoint = await checkpointTurn(ref.object, record.requestId) ? 'stored' : 'unverified';
+            } catch {
+                record.checkpoint = 'unverified';
+            } finally {
+                record.settled = true;
+                if (held.delete(ref)) ref.dispose();
+            }
+        });
         log('submit accepted');
         return commandView(record);
     }
