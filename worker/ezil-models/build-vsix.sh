@@ -17,7 +17,8 @@ tmp="$(mktemp -d "$here/.build-XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 bun build "$src/src/extension.ts" --target=node --format=cjs --external=vscode --outfile="$tmp/extension.js"
 bun build "$src/src/browser-mcp-server.ts" --target=node --format=cjs --outfile="$tmp/browser-mcp-server.js"
-python3 "$here/package-vsix.py" "$src" "$tmp/extension.js" "$tmp/browser-mcp-server.js" "$tmp/extension.vsix"
+bun build "$src/src/workspace-mcp-server.ts" --target=node --format=cjs --outfile="$tmp/workspace-mcp-server.js"
+python3 "$here/package-vsix.py" "$src" "$tmp/extension.js" "$tmp/browser-mcp-server.js" "$tmp/workspace-mcp-server.js" "$tmp/extension.vsix"
 if [[ "$mode" == --check ]]; then
   if [[ -f "$out" ]] && cmp -s "$out" "$tmp/extension.vsix"; then
     echo '[build-vsix] OK: committed VSIX matches source'

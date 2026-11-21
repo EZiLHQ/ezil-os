@@ -34,7 +34,7 @@
   "capabilities": {
     "untrustedWorkspaces": {
       "supported": true,
-      "description": "The provider reads only its own config file and talks to the configured model endpoints; it never reads workspace files."
+      "description": "The provider reads only its own config file and talks to the configured model endpoints; it never reads workspace files. The owner-granted Workspace MCP attach is available only in a trusted window."
     },
     "virtualWorkspaces": true
   },
@@ -86,6 +86,16 @@
       {
         "command": "ezil-models.showCredits",
         "title": "EZiL Models: Show AI Credits",
+        "category": "EZiL Models"
+      },
+      {
+        "command": "ezil-models.grantWorkspaceMcp",
+        "title": "EZiL Models: Attach Workspace MCP (this window)",
+        "category": "EZiL Models"
+      },
+      {
+        "command": "ezil-models.revokeWorkspaceMcp",
+        "title": "EZiL Models: Detach Workspace MCP",
         "category": "EZiL Models"
       },
       {
@@ -150,7 +160,7 @@
     }
   },
   "scripts": {
-    "build": "bun build src/extension.ts src/browser-mcp-server.ts --target=node --format=cjs --external=vscode --outdir=dist",
+    "build": "bun build src/extension.ts src/browser-mcp-server.ts src/workspace-mcp-server.ts --target=node --format=cjs --external=vscode --outdir=dist",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "bun test",
     "package:vsix": "../../worker/ezil-models/build-vsix.sh"

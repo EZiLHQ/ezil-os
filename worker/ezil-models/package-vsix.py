@@ -10,7 +10,7 @@ import sys
 from xml.sax.saxutils import escape, quoteattr
 from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
-source, bundle, browser, output = map(Path, sys.argv[1:])
+source, bundle, browser, workspace, output = map(Path, sys.argv[1:])
 package = json.loads((source / "package.json").read_text())
 assert package["license"] == "AGPL-3.0-only"
 properties = {
@@ -41,7 +41,8 @@ for ext, mime in {"js": "application/javascript", "json": "application/json", "m
     types += f'<Default Extension="{ext}" ContentType="{mime}"/>'
 types += '</Types>'
 files = {"extension.vsixmanifest": manifest.encode(), "[Content_Types].xml": types.encode(), "extension/dist/extension.js": bundle.read_bytes(),
-         "extension/dist/browser-mcp-server.js": browser.read_bytes()}
+         "extension/dist/browser-mcp-server.js": browser.read_bytes(),
+         "extension/dist/workspace-mcp-server.js": workspace.read_bytes()}
 for src, dest in {"package.json": "package.json", "README.md": "readme.md", "LICENSE": "LICENSE.txt", "ATTRIBUTIONS.md": "ATTRIBUTIONS.md", "schema/models.schema.json": "schema/models.schema.json", "examples/models.example.json": "examples/models.example.json"}.items():
     files[f"extension/{dest}"] = (source / src).read_bytes()
 with ZipFile(output, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
