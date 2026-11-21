@@ -1,9 +1,11 @@
 import 'server-only';
 
+import { mcpIdentityBootstrapAudience } from '@/server/api/onboarding-delegation';
 import { createClient } from '@/utils/supabase/server';
 
 import { Auth0Error, type Auth0Identity } from './auth0';
 import { enrollAiMember } from './ai-enrollment';
+import { createVerifiedAuth0Account, withBrowserAuth0AccountLock } from './auth0-account';
 import { createAdminClient } from './supabase-admin';
 
 /**
@@ -34,9 +36,7 @@ export async function refuseSilentAccountSwitch(identity: Auth0Identity): Promis
     if (typeof claims.email !== 'string' || claims.email.toLowerCase() !== identity.email.toLowerCase()) throw new Auth0Error('account_conflict');
 }
 
-/** The caller must first verify the Auth0 ID token, including verified email. */
-export async function bridgeAuth0Identity(identity: Auth0Identity): Promise<void> {
-    const admin = createAdminClient().auth.admin;
+async function resolveBrowserAuth0Account(admin: ReturnType<typeof createAdminClient>['auth']['admin'], identity: Auth0Identity) {
     const email = identity.email.toLowerCase();
     let user;
     // Supabase admin has no email lookup API. Do not silently search only page 1.
@@ -48,9 +48,7 @@ export async function bridgeAuth0Identity(identity: Auth0Identity): Promise<void
         if (user || data.users.length < perPage) break;
     }
     if (!user) {
-        const { data, error } = await admin.createUser({ email, email_confirm: true, app_metadata: { auth0_sub: identity.sub } });
-        if (error || !data.user) throw new Auth0Error('session_failed');
-        user = data.user;
+        user = await createVerifiedAuth0Account(admin, identity);
     } else {
         const subject = user.app_metadata.auth0_sub;
         if (subject !== undefined && subject !== null && subject !== identity.sub) throw new Auth0Error('account_conflict');
@@ -72,6 +70,17 @@ export async function bridgeAuth0Identity(identity: Auth0Identity): Promise<void
             }
         }
     }
+    return user;
+}
+
+/** The caller must first verify the Auth0 ID token, including verified email. */
+export async function bridgeAuth0Identity(identity: Auth0Identity): Promise<void> {
+    const admin = createAdminClient().auth.admin;
+    const resolve = () => resolveBrowserAuth0Account(admin, identity);
+    const user = mcpIdentityBootstrapAudience(process.env)
+        ? await withBrowserAuth0AccountLock((await import('@/server/db')).db, identity, resolve)
+        : await resolve();
+    const email = identity.email.toLowerCase();
     // The guarded SQL updates JWT app metadata before GoTrue mints the session.
     // Enrollment is best effort (coded `ai-enroll` log); it never replaces the link or OTP
     // checks below. On success it also wakes this user's outbox rows waiting on the account.

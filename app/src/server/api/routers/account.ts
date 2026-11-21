@@ -7,11 +7,13 @@ import { waitingCredits } from '@/server/billing/v3/summary';
 import { computers } from '@/server/db/schema';
 
 import { ACCOUNT_SETTINGS_PROCEDURE, requireOnboardingCaller } from '../onboarding-delegation';
-import { createTRPCRouter, protectedProcedure } from '../trpc';
+import { completeMcpConnection, mcpIdentityProof } from '../mcp-identity-bootstrap';
+import { createTRPCRouter, protectedProcedure, publicProcedure } from '../trpc';
 import { readSettingsAiBalance } from './account-ai-balance';
 import { liveComputersOf, MAX_COMPUTERS_PER_USER } from './computer-store';
 
 export const accountRouter = createTRPCRouter({
+    completeMcpConnection: publicProcedure.input(mcpIdentityProof).mutation(({ ctx, input }) => completeMcpConnection(ctx, input)),
     mcpSettings: protectedProcedure.input(z.object({}).strict()).query(async ({ ctx, signal }) => {
         requireOnboardingCaller(ctx, ACCOUNT_SETTINGS_PROCEDURE);
         const userId = ctx.user.id;

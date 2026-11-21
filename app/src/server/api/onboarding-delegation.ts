@@ -22,6 +22,11 @@ export function onboardingDelegationEnabled(env: Record<string, string | undefin
         && env.EZIL_DELEGATION_AUDIENCE === 'https://os-staging.ezil.work';
 }
 
+export function mcpIdentityBootstrapAudience(env: Record<string, string | undefined>): string | undefined {
+    const audience = env.EZIL_MCP_IDENTITY_BOOTSTRAP_AUTH0_CLIENT_ID;
+    return onboardingDelegationEnabled(env) && audience && /^[A-Za-z0-9_-]{16,128}$/.test(audience) ? audience : undefined;
+}
+
 export function onboardingMutationPath(url: URL): boolean {
     return trpcMutationPath(url, writes);
 }

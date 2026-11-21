@@ -109,6 +109,13 @@ export type DelegationCoreOutcome =
     | { kind: 'rejected'; reason: DelegationRejection }
     | { kind: 'accepted'; caller: VerifiedDelegatedCaller; account: DelegatedAccount };
 
+type VerifiedIdentity = {
+    kind: 'verified';
+    identity: DelegatedIdentity;
+    caller: Omit<VerifiedDelegatedCaller, 'userId'>;
+};
+type VerifiedIdentityOutcome = Exclude<DelegationCoreOutcome, { kind: 'accepted' }> | VerifiedIdentity;
+
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 /** `<connection>|<id>` (the id may itself contain `|`), at most 255 chars, no whitespace or control characters. */
 const AUTH0_SUBJECT = /^(?=.{3,255}$)[^|\s\x00-\x1f\x7f]+\|[^\s\x00-\x1f\x7f]+$/;
@@ -221,8 +228,10 @@ export async function parseDelegationConfig(env: DelegationEnv, auth0Issuer: str
     return { issuer, audience, supabaseIssuer, auth0Issuer, clientIds: new Set(clientIds), keys };
 }
 
-/** Verify a delegation against the wrapper's own binding and fixed policy. */
-export async function verifyDelegation(headers: Headers, deps: DelegationCoreDeps): Promise<DelegationCoreOutcome> {
+/** Verify a delegation and consume its replay key before resolving the OS account. */
+export async function verifyDelegatedIdentity(
+    headers: Headers, deps: Omit<DelegationCoreDeps, 'findAccount'>,
+): Promise<VerifiedIdentityOutcome> {
     const header = headers.get('authorization');
     if (!isDelegationHeader(header)) return { kind: 'none' };
     const reject = (reason: DelegationRejection) => ({ kind: 'rejected', reason }) as const;
@@ -288,17 +297,30 @@ export async function verifyDelegation(headers: Headers, deps: DelegationCoreDep
     }
     if (!first) return reject('replayed');
 
+    return {
+        kind: 'verified', identity,
+        caller: { idpIssuer: idp_iss, subject: sub, clientId: client_id, scope, procedure: proc, jti },
+    };
+}
+
+/** Every ordinary delegated tool still requires an existing, active OS owner. */
+export async function verifyDelegation(headers: Headers, deps: DelegationCoreDeps): Promise<DelegationCoreOutcome> {
+    const outcome = await verifyDelegatedIdentity(headers, deps);
+    if (outcome.kind !== 'verified') return outcome;
     let account: DelegatedAccount | null;
     try {
-        account = await deps.findAccount(identity);
+        account = await deps.findAccount(outcome.identity);
     } catch {
         account = null;
     }
-    if (!account || !UUID.test(account.id) || (identity.issuer === 'supabase' && account.id !== sub)) return reject('unknown_account');
+    if (!account || !UUID.test(account.id)
+        || (outcome.identity.issuer === 'supabase' && account.id !== outcome.identity.subject)) {
+        return { kind: 'rejected', reason: 'unknown_account' };
+    }
 
     return {
         kind: 'accepted',
-        caller: { userId: account.id, idpIssuer: idp_iss, subject: sub, clientId: client_id, scope, procedure: proc, jti },
+        caller: { userId: account.id, ...outcome.caller },
         account,
     };
 }
