@@ -47,7 +47,7 @@ if [[ "${EZIL_E2E_SUITE:-}" == unattended ]]; then
   # Installed extension availability depends on the owner's workspace trust policy.
   . "$here/../worker/scripts/editor-state.sh"
   seed_codeserver_user_settings "$WORK/user-seed"
-  node -e 'const fs=require("fs"); const settings=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); settings["ezil.chatBridge.enabled"]=true; fs.writeFileSync(process.argv[2],JSON.stringify(settings))' "$WORK/user-seed/User/settings.json" "$ST/home/neko/project/.ezil/settings.json"
+  node -e 'const fs=require("fs"); const settings=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); settings["ezil.chatBridge.enabled"]=true; settings["ezil.chatBridge.unattended"]=true; fs.writeFileSync(process.argv[2],JSON.stringify(settings))' "$WORK/user-seed/User/settings.json" "$ST/home/neko/project/.ezil/settings.json"
 else
   cp "$WORKBENCH" "$ST$VS/out/vs/code/browser/workbench/workbench.js"
   cp "$EXT/package.json" "$ST$VS/extensions/ezil.ezil-models/package.json"
