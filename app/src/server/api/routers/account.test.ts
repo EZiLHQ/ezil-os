@@ -5,11 +5,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const h = vi.hoisted(() => ({ getDeps: vi.fn(), billing: vi.fn(), receipts: vi.fn(), findMany: vi.fn(), balance: vi.fn() }));
 
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: h.getDeps }));
+vi.mock('../mcp-identity-bootstrap', async () => {
+    const { z } = await import('zod');
+    return { mcpIdentityProof: z.object({}), completeMcpConnection: vi.fn() };
+});
 vi.mock('./account-ai-balance', () => ({ readSettingsAiBalance: h.balance }));
 vi.mock('@/server/billing/v2/compute-access', () => ({ loadComputeBillingState: h.billing }));
 vi.mock('../trpc', () => {
     const t = initTRPC.context<{ user: { id: string }; db: unknown }>().create();
-    return { createTRPCRouter: t.router, protectedProcedure: t.procedure };
+    return { createTRPCRouter: t.router, protectedProcedure: t.procedure, publicProcedure: t.procedure };
 });
 
 import { accountRouter } from './account';

@@ -2,8 +2,9 @@ import { fetchRequestHandler } from '@trpc/server/adapters/fetch';
 
 import { isDelegationHeader } from '@/server/api/delegation-auth';
 import { editorDelegationEnabled, editorMutationPath, MAX_EDITOR_DELEGATION_BYTES, type TrpcDelegationRequest } from '@/server/api/editor-delegation';
-import { onboardingDelegationEnabled, onboardingMutationPath } from '@/server/api/onboarding-delegation';
+import { mcpIdentityBootstrapAudience, onboardingDelegationEnabled, onboardingMutationPath } from '@/server/api/onboarding-delegation';
 import { appRouter } from '@/server/api/root';
+import { mcpIdentityBootstrapPath } from '@/server/api/mcp-identity-bootstrap';
 import { createTRPCContext } from '@/server/api/trpc';
 
 /**
@@ -65,7 +66,8 @@ const handler = async (req: Request) => {
     if (req.method !== 'POST' || !isDelegationHeader(req.headers.get('authorization'))) return route(req, line);
     const url = new URL(req.url);
     const signedMutation = (editorDelegationEnabled(process.env) && editorMutationPath(url))
-        || (onboardingDelegationEnabled(process.env) && onboardingMutationPath(url));
+        || (onboardingDelegationEnabled(process.env) && onboardingMutationPath(url))
+        || (mcpIdentityBootstrapAudience(process.env) && mcpIdentityBootstrapPath(url));
     if (!signedMutation) return route(req, line);
     if (!/^application\/json(?:;\s*charset=utf-8)?$/i.test(req.headers.get('content-type') ?? '')) {
         return Response.json({ error: { code: 'UNSUPPORTED_MEDIA_TYPE' } }, { status: 415 });

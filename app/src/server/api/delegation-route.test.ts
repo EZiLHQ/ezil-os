@@ -2,7 +2,7 @@
  * The real `/api/trpc` route, context and procedure gate for delegated computer reads, on disposable PostgreSQL
  * (`EZIL_PG_TEST_URL`). Only the Supabase cookie/Bearer client is mocked, so a cookie fallback is observable.
  */
-import { randomUUID } from 'node:crypto';
+import { randomUUID, webcrypto } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -28,9 +28,13 @@ vi.mock('@/server/db', async () => {
     const scoped = (q: InstanceType<typeof SQL>): InstanceType<typeof SQL> => sql.join(q.queryChunks.map(chunk => chunk instanceof StringChunk
         ? sql.raw(local(chunk.value.join(''))) : chunk instanceof SQL ? scoped(chunk) : chunk), sql.empty());
     const db = new Proxy(real, { get: (target, key, receiver) => key === 'execute'
-        ? (q: InstanceType<typeof SQL>) => target.execute(scoped(q)) : Reflect.get(target, key, receiver) });
+        ? (q: InstanceType<typeof SQL>) => target.execute(scoped(q)) : key === 'transaction' ? (operation: (tx: { execute: (q: InstanceType<typeof SQL>) => unknown }) => Promise<unknown>) =>
+            target.transaction(tx => operation({ execute: q => tx.execute(scoped(q)) })) : Reflect.get(target, key, receiver) });
     return { db, __client: client };
 });
+const gotrue = vi.hoisted(() => ({ createUser: vi.fn() }));
+vi.mock('@/server/auth/supabase-admin', () => ({ createAdminClient: () => ({ auth: { admin: gotrue } }) }));
+
 const createClient = vi.fn(async () => ({
     auth: {
         getUser: async (jwt?: string) => jwt === undefined
@@ -84,6 +88,14 @@ describe.skipIf(!fixture.url)('delegated computer reads through the real /api/tr
         finally { await admin?.end(); await dbModule.__client.end(); }
     });
     beforeEach(() => {
+        vi.unstubAllGlobals();
+        gotrue.createUser.mockReset();
+        gotrue.createUser.mockImplementation(async ({ email, app_metadata }) => {
+            const id = randomUUID();
+            await admin!.unsafe(`INSERT INTO ${s}.auth_users (id,email,email_confirmed_at,raw_app_meta_data) VALUES ($1,$2,now(),$3::text::jsonb)`,
+                [id, email, JSON.stringify(app_metadata)]);
+            return { data: { user: { id } }, error: null };
+        });
         createClient.mockClear();
         fixture.cookieUser.current = null;
         fixture.bearerUser.current = null;
@@ -219,6 +231,96 @@ describe.skipIf(!fixture.url)('delegated computer reads through the real /api/tr
         await expect(appRouter.createCaller(ctx).computer.list()).rejects.toMatchObject({ code: 'UNAUTHORIZED' });
         expect(await ledger()).toBe(before);
         expect(createClient).not.toHaveBeenCalled();
+    });
+
+    const connector = 'https://connect-staging.ezil.work';
+    const stageOs = 'https://os-staging.ezil.work';
+    const audience = 'staging-connector-auth0-client';
+    const issuer = 'https://id.ezil.work/';
+    const procedure = 'account.completeMcpConnection';
+    const nonce = 'a'.repeat(43);
+    async function bootstrapSetup() {
+        vi.stubEnv('EZIL_DELEGATION_ISSUER', connector);
+        vi.stubEnv('EZIL_DELEGATION_AUDIENCE', stageOs);
+        vi.stubEnv('EZIL_DELEGATED_ONBOARDING', 'enabled');
+        vi.stubEnv('EZIL_MCP_IDENTITY_BOOTSTRAP_AUTH0_CLIENT_ID', audience);
+        const alg = { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' };
+        const keys = await webcrypto.subtle.generateKey(alg, true, ['sign', 'verify']);
+        const jwk = await webcrypto.subtle.exportKey('jwk', keys.publicKey);
+        const id = randomUUID();
+        vi.stubGlobal('fetch', vi.fn(async url => {
+            expect(new URL(String(url)).href).toBe(issuer + '.well-known/jwks.json');
+            return Response.json({ keys: [{ ...jwk, kid: id }] });
+        }));
+        return async (sub: string, email: string, extras: Record<string, unknown> = {}) => {
+            const t = Math.floor(Date.now() / 1000);
+            const b64 = (v: unknown) => Buffer.from(JSON.stringify(v)).toString('base64url');
+            const body = b64({ alg: 'RS256', kid: id }) + '.' + b64({
+                iss: issuer, aud: audience, sub, email, email_verified: true, nonce, iat: t, exp: t + 300, ...extras,
+            });
+            const sig = await webcrypto.subtle.sign(alg, keys.privateKey, Buffer.from(body));
+            return body + '.' + Buffer.from(sig).toString('base64url');
+        };
+    }
+    async function bootstrapRequest(subject: string, token: string, extras: Record<string, unknown> = {}) {
+        const body = mcpInput({ idToken: token, nonce });
+        const proof = await signAssertion(key, readClaims(subject, 'computer.list', body, {
+            iss: connector, aud: stageOs, idp_iss: issuer, proc: procedure, scope: 'ezil:account:bootstrap', ...extras,
+        }));
+        return () => route.POST(new Request(readUrl(procedure, undefined, stageOs), { method: 'POST', body,
+            headers: { authorization: 'EZiL-Delegation ' + proof, 'content-type': 'application/json' } }));
+    }
+
+    it('registers an authenticated first-use owner once and returns zero through actual delegated discovery', async () => {
+        const oidc = await bootstrapSetup();
+        const subject = 'auth0|' + randomUUID();
+        const email = 'First-owner@example.test';
+        const send = await bootstrapRequest(subject, await oidc(subject, email));
+        expect(await call(readUrl('computer.list', undefined, stageOs), await list(subject, {
+            iss: connector, aud: stageOs, idp_iss: issuer,
+        }))).toMatchObject({ status: 401 });
+        const outcomes = await Promise.all([send(), send()]);
+        expect(outcomes.map(r => r.status).sort()).toEqual([200, 401]);
+        expect(await outcomes.find(r => r.ok)!.json()).toMatchObject({ result: { data: { json: { ready: true } } } });
+        expect(gotrue.createUser).toHaveBeenCalledExactlyOnceWith({
+            email: email.toLowerCase(), email_confirm: true, app_metadata: { auth0_sub: subject },
+        });
+        const signed = await list(subject, { iss: connector, aud: stageOs, idp_iss: issuer });
+        expect(await call(readUrl('computer.list', undefined, stageOs), signed)).toMatchObject({
+            status: 200, body: { result: { data: { json: [] } } },
+        });
+        expect(createClient).not.toHaveBeenCalled();
+    });
+
+    it('refuses wrong audience, subject, unverified email, unapproved client, and same-email unlinked account', async () => {
+        const oidc = await bootstrapSetup();
+        const subject = 'auth0|' + randomUUID();
+        const email = 'existing-unlinked@example.test';
+        const blocked = randomUUID();
+        await admin!.unsafe(`INSERT INTO ${s}.auth_users (id,email,email_confirmed_at,raw_app_meta_data) VALUES ($1,$2,now(),'{}')`, [blocked, email]);
+        for (const [proof, claims] of [
+            [await oidc(subject, email, { aud: 'wrong-auth0-app' }), {}],
+            [await oidc('auth0|wrong', email), {}],
+            [await oidc(subject, email, { email_verified: false }), {}],
+            [await oidc(subject, email), { client_id: 'unapproved-connector' }],
+        ] as const) expect((await (await bootstrapRequest(subject, proof, claims))()).status).toBe(401);
+        expect((await (await bootstrapRequest(subject, await oidc(subject, email)))()).status).toBe(409);
+        expect(gotrue.createUser).not.toHaveBeenCalled();
+        expect(await admin!.unsafe(`SELECT raw_app_meta_data FROM ${s}.auth_users WHERE id=$1`, [blocked])).toEqual([{ raw_app_meta_data: {} }]);
+    });
+
+    it('serializes separately approved assertions and recovers an ambiguous provider create only by verified linked subject', async () => {
+        const oidc = await bootstrapSetup();
+        const subject = 'auth0|' + randomUUID();
+        const provision = gotrue.createUser.getMockImplementation()!;
+        gotrue.createUser.mockImplementation(async (body) => {
+            await provision(body);
+            throw new Error('synthetic lost provider response');
+        });
+        const one = await bootstrapRequest(subject, await oidc(subject, 'one@example.test'));
+        const two = await bootstrapRequest(subject, await oidc(subject, 'two@example.test'));
+        expect((await Promise.all([one(), two()])).map(r => r.status)).toEqual([200, 200]);
+        expect(gotrue.createUser).toHaveBeenCalledOnce();
     });
 
     it('keeps ordinary cookie and Bearer behaviour', async () => {

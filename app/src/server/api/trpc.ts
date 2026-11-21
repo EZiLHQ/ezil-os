@@ -26,20 +26,25 @@ import {
     type DelegatedAccount, type DelegatedCall, type DelegationRejection,
 } from './delegation-auth';
 import { consumeDelegationJti, findDelegatedAccount } from './delegation-store';
-import { verifyDelegation } from './delegation-core';
+import { verifyDelegatedIdentity, verifyDelegation, type VerifiedDelegatedCaller } from './delegation-core';
 import {
     EDITOR_DELEGATION_POLICY, editorDelegationBinding, editorDelegationEnabled, type TrpcDelegationRequest,
 } from './editor-delegation';
 import {
-    ONBOARDING_DELEGATION_POLICY, onboardingDelegationBinding, onboardingDelegationEnabled,
+    ONBOARDING_DELEGATION_POLICY, mcpIdentityBootstrapAudience, onboardingDelegationBinding, onboardingDelegationEnabled,
 } from './onboarding-delegation';
+import {
+    MCP_IDENTITY_BOOTSTRAP_POLICY, MCP_IDENTITY_CONSENT_SECONDS, mcpIdentityBootstrapBinding,
+} from './mcp-identity-bootstrap';
 
 
 /**
  * Set for every request that presented `Authorization: EZiL-Delegation`. `rejected` keeps the request marked
  * so the procedure gate refuses everything, public procedures included.
  */
-export type DelegationState = { status: 'accepted'; call: DelegatedCall; type?: 'query' | 'mutation' } | { status: 'rejected' };
+export type DelegationState = { status: 'accepted'; call: DelegatedCall; type?: 'query' | 'mutation' }
+    | { status: 'bootstrap'; call: Omit<VerifiedDelegatedCaller, 'userId'>; type: 'mutation' }
+    | { status: 'rejected' };
 
 export interface TRPCContext {
     db: typeof db;
@@ -66,6 +71,7 @@ async function delegatedContext(headers: Headers, request: TrpcDelegationRequest
         // A caller that did not hand over the actual request line (any other transport) cannot be bound.
         reason = 'transport';
     } else {
+        const bootstrap = mcpIdentityBootstrapAudience(process.env) ? mcpIdentityBootstrapBinding(request) : undefined;
         const editor = editorDelegationEnabled(process.env) ? editorDelegationBinding(request) : undefined;
         const onboarding = onboardingDelegationEnabled(process.env) ? onboardingDelegationBinding(request) : undefined;
         const scoped = editor
@@ -74,7 +80,7 @@ async function delegatedContext(headers: Headers, request: TrpcDelegationRequest
         const computer = delegatedReadsEnabled(process.env.EZIL_DELEGATED_COMPUTER_READS);
         // Read per request from process.env, not `@/env`: the pins are optional and absent ones only reject.
         const verifier = {
-            config: scoped || computer ? await delegationConfig({
+            config: bootstrap || scoped || computer ? await delegationConfig({
                 EZIL_DELEGATION_ISSUER: process.env.EZIL_DELEGATION_ISSUER,
                 EZIL_DELEGATION_AUDIENCE: process.env.EZIL_DELEGATION_AUDIENCE,
                 EZIL_DELEGATION_PUBLIC_JWKS: process.env.EZIL_DELEGATION_PUBLIC_JWKS,
@@ -85,7 +91,19 @@ async function delegatedContext(headers: Headers, request: TrpcDelegationRequest
             consumeJti: (jti: string, expiresAt: number) => consumeDelegationJti(db, jti, expiresAt),
             findAccount: (identity: Parameters<typeof findDelegatedAccount>[1]) => findDelegatedAccount(db, identity),
         };
-        if (scoped) {
+        if (bootstrap) {
+            const outcome = await verifyDelegatedIdentity(headers, {
+                ...verifier, binding: bootstrap, policy: MCP_IDENTITY_BOOTSTRAP_POLICY, enabled: true,
+                // The connector uses the same jti for this consent across signer retries.
+                consumeJti: (jti, expiresAt) => consumeDelegationJti(db, jti,
+                    Math.max(expiresAt, verifier.now() + MCP_IDENTITY_CONSENT_SECONDS)),
+            });
+            if (outcome.kind === 'verified' && outcome.identity.issuer === 'auth0') return {
+                db, user: null, headers,
+                delegation: { status: 'bootstrap', call: outcome.caller, type: 'mutation' },
+            };
+            reason = outcome.kind === 'rejected' ? outcome.reason : 'identity_issuer';
+        } else if (scoped) {
             const outcome = await verifyDelegation(headers, { ...verifier, ...scoped, enabled: true });
             if (outcome.kind === 'accepted') return {
                 db, user: delegatedUser(outcome.account), headers,
@@ -174,7 +192,7 @@ const timingMiddleware = t.middleware(async ({ next, path }) => {
 const delegationGate = t.middleware(async ({ ctx, path, type, next }) => {
     const delegation = ctx.delegation;
     if (!delegation) return next();
-    if (delegation.status !== 'accepted') {
+    if (delegation.status === 'rejected') {
         auditDelegation(path, 'refused:rejected_assertion');
         throw new TRPCError({ code: 'UNAUTHORIZED' });
     }
