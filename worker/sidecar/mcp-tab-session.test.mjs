@@ -23,6 +23,38 @@ test('the existing owned Browser allows only reviewed public and exact fixture d
     ]) assert.equal(permit(url), null, url);
 });
 
+test('stock Browser home is neutral and every other local file remains outside the view', async () => {
+    let visibilityChecks = 0;
+    let privateReads = 0;
+    const stock = {
+        isClosed: () => false,
+        url: () => 'file:///usr/local/share/ezil/browser-home.html',
+        on: () => {},
+        evaluate: async check => {
+            assert.match(String(check), /document\.visibilityState/);
+            visibilityChecks += 1;
+            return true;
+        },
+    };
+    const foreign = {
+        ...stock, url: () => 'file:///usr/local/share/ezil/other.html',
+        evaluate: async () => { privateReads += 1; return true; },
+    };
+    const observe = createMcpObservation({
+        connect: async () => ({ contexts: () => [{ pages: () => [foreign, stock] }] }),
+    });
+    const result = await observe({ binding: BINDING, action: { kind: 'read', includeFrame: true } });
+    assert.equal(result.observed, 'browser_ready');
+    assert.equal(result.pageUrl, null);
+    assert.equal(result.pageTitle, null);
+    assert.deepEqual(result.elements, []);
+    assert.equal(result.viewerFrame, null);
+    assert.ok(visibilityChecks > 0);
+    assert.equal(privateReads, 0);
+    assert.equal(browserTabPolicy()(stock.url()), null);
+    assert.equal(browserTabPolicy()('file:///tmp/other.html'), null);
+});
+
 test('real Chromium keeps control, receipts and viewer pixels on the one approved tab', { skip: !CHROME }, async () => {
     const fixture = await readFile(new URL('../../app/public/browser-mcp-fixture.html', import.meta.url), 'utf8');
     const document = fixture.replace('</main>', '<label>Test credential<input type="password" value="secret-only"></label>'

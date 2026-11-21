@@ -65,7 +65,10 @@ export function browserTabPolicy ({ allowedOrigins, fixtureOrigin = QA_ORIGIN, a
 }
 
 export function neutralTab (value) {
-    return value === 'about:blank' || value === 'chrome://newtab/' || value === 'chrome://new-tab-page/';
+    // start-neko.sh boots this exact shipped landing asset. It can anchor an
+    // owner-approved HTTPS navigation, but never supplies page data or pixels.
+    return value === 'file:///usr/local/share/ezil/browser-home.html' || value === 'about:blank'
+        || value === 'chrome://newtab/' || value === 'chrome://new-tab-page/';
 }
 
 export async function pageVisibility (page, targetUrl) {
