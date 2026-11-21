@@ -28,6 +28,10 @@ class CheckError extends Error {
 const blocked = message => new CheckError('blocked', message);
 const failed = (message, evidence) => new CheckError('fail', message, evidence);
 
+export function repositoryCheckoutCheck(publicRead = false) {
+    return publicRead ? 'public_read_repo_checkout' : 'private_repo_checkout';
+}
+
 function fixtureInput(target, repo, storageState) {
     const value = target instanceof URL ? target : target?.app ?? target?.origin ?? target;
     let app;
@@ -40,7 +44,7 @@ function fixtureInput(target, repo, storageState) {
     if (!storageState) throw blocked('An authorized staging storage state is required');
     if (!repo || typeof repo.url !== 'string' || !REPOSITORY.test(repo.url)
         || repo.url.includes('..') || repo.url.endsWith('.git.git') || repo.url !== repo.fixtureUrl) {
-        throw blocked('An explicitly fenced private Git fixture is required');
+        throw blocked('An explicitly fenced Git fixture is required');
     }
     if (!UUID.test(repo.computerId ?? '')) throw blocked('An explicit fixture computer is required');
     const expectedFile = repo.expectedFile ?? 'README.md';
@@ -176,9 +180,9 @@ function observeMints(page, fence, loopback) {
 function mintTimeout(mints) {
     const last = mints.at(-1);
     if (last?.code === 'IDENTITY_REFRESH_REQUIRED' || last?.status === 401) {
-        return blocked('The staging session has no retained identity for the private fixture');
+        return blocked('The staging session has no retained identity for the fixture repository');
     }
-    return failed('The private repository did not mint a matching Code checkout',
+    return failed('The fixture repository did not mint a matching Code checkout',
         last ? { httpStatus: last.status, ...(last.code && { code: last.code }) } : {});
 }
 
@@ -435,7 +439,7 @@ export async function runCodeJourney({ browser, target, repo, storageState, evid
             fence.enable();
             return { readOnlySessionMatched: true, bootComputerMatched: true };
         }, !configured && 'Fixture configuration was blocked');
-        const checkout = await checks.run('private_repo_checkout', async () => {
+        const checkout = await checks.run(repositoryCheckoutCheck(repo?.publicRead), async () => {
             const route = new URL('/app/code', inputs.app);
             route.searchParams.set('repo', repo.url);
             route.searchParams.set('computer', repo.computerId);
@@ -449,7 +453,7 @@ export async function runCodeJourney({ browser, target, repo, storageState, evid
         const answered = await checks.run('code_background_agent', async () => {
             probe = await runBackgroundAgent(page, initial.frame, repo, timeLimit);
             return probe.evidence;
-        }, agentSelected && !checkout && 'The private checkout was not verified',
+        }, agentSelected && !checkout && 'The fenced repository checkout was not verified',
             !agentSelected && 'The optional synthetic agent scenario was not selected');
         const reloaded = await checks.run('code_full_reload', async () => {
             if (!page) throw failed('The initial Code page was unavailable');
@@ -465,9 +469,9 @@ export async function runCodeJourney({ browser, target, repo, storageState, evid
             }
             return { sameWorkspace: true, newCodeDocument: true,
                 ...await verifyKnownFile(reopened.frame, inputs.expectedFile, repo.expectedText, fileTimeLimit, { reopen: true }) };
-        }, !checkout && 'The private checkout was not verified');
+        }, !checkout && 'The fenced repository checkout was not verified');
         await checks.run('code_chat_history_after_reload', () => verifySavedChat(reopened.frame, probe.marker, fileTimeLimit),
-            agentSelected && (!reloaded || !answered) && 'The completed synthetic reply and reloaded private workspace were not both verified',
+            agentSelected && (!reloaded || !answered) && 'The completed synthetic reply and reloaded fixture workspace were not both verified',
             !agentSelected && 'The optional synthetic agent scenario was not selected');
     } finally {
         await context?.close().catch(() => {});

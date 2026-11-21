@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { isAbsolute, join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
-import { runCodeJourney } from './staging-code-journey.mjs';
+import { repositoryCheckoutCheck, runCodeJourney } from './staging-code-journey.mjs';
 
 export const STAGING = 'https://os-staging.ezil.work';
 const gateway = 'https://ai-staging.ezil.work';
@@ -29,7 +29,7 @@ export function fixtureUrl(value) {
     const url = new URL(value);
     if (url.origin !== 'https://github.ezil.work' || url.username || url.password || url.search || url.hash ||
         !/^\/[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*\.git$/.test(url.pathname)) {
-        throw new Error('Expected a canonical private Git fixture URL');
+        throw new Error('Expected a canonical Git fixture URL');
     }
     return url.href;
 }
@@ -82,7 +82,8 @@ function configFrom(env) {
         requireMatch(ref, gitRef, 'EZIL_STAGING_QA_GIT_REF');
         if (!repo || mode !== 'assignment') throw new Error('Git readback requires an assignment fixture');
     }
-    return { mode, appSha, gatewaySha, repo, sha, gitRef, agent: mode === 'assignment' && env.EZIL_STAGING_QA_AGENT === '1' };
+    return { mode, appSha, gatewaySha, repo, sha, gitRef, publicRead: env.EZIL_STAGING_QA_PUBLIC_READ_REPO === '1',
+        agent: mode === 'assignment' && env.EZIL_STAGING_QA_AGENT === '1' };
 }
 
 /** One independently captured, recent observation must bind the QA computer to the expected runtime. */
@@ -147,7 +148,7 @@ async function authenticated(browser, config, env, directory) {
     const runtime = await readRuntime(config, env, 'before');
     if (!runtime) return [check('running-code-image', 'blocked', 'Requires a recent live identity observation for the QA computer')];
     const result = await runCodeJourney({ browser, target: STAGING, storageState: env.EZIL_STAGING_QA_STORAGE_STATE,
-        repo: { url: config.repo, fixtureUrl: config.repo, computerId: runtime.computerId,
+        repo: { url: config.repo, fixtureUrl: config.repo, computerId: runtime.computerId, publicRead: config.publicRead,
             expectedFile: env.EZIL_STAGING_QA_EXPECTED_FILE, expectedText: env.EZIL_STAGING_QA_EXPECTED_TEXT,
             allowAgent: config.agent, modelName: env.EZIL_STAGING_QA_MODEL }, evidence: { directory } });
     const after = await readRuntime(config, env, 'after');
@@ -168,7 +169,7 @@ export async function collectEvidence(config, { fetcher = fetch, runLanes }) {
         const required = ['signed-out-assignment-link'];
         if (config.mode === 'assignment' && !lanes.some(item =>
             ['authenticated-code', 'running-code-image'].includes(item.name) && ['blocked', 'fail'].includes(item.status))) {
-            required.push('running-code-image-before', 'authenticated_isolated_computer', 'private_repo_checkout',
+            required.push('running-code-image-before', 'authenticated_isolated_computer', repositoryCheckoutCheck(config.publicRead),
                 'code_full_reload', 'running-code-image-after');
             if (config.agent) required.push('code_background_agent', 'code_chat_history_after_reload');
         }

@@ -200,4 +200,10 @@ test('loopback Chromium requires the single background reply to reopen from Chat
     assert.match(unsafe.checks.find(check => check.name === 'code_background_agent').detail, /contained a draft/);
     assert.equal(prompts.length, 2);
     assert(!JSON.stringify(unsafe).includes(draft));
+
+    const publicRead = await runCodeJourney({ browser, target, repo: { ...repo, publicRead: true },
+        storageState, evidence: { timeoutMs: 5_000 } });
+    assert.equal(names(publicRead).public_read_repo_checkout, 'pass', JSON.stringify(publicRead));
+    assert.equal(names(publicRead).private_repo_checkout, undefined);
+    assert.equal(prompts.length, 2);
 });

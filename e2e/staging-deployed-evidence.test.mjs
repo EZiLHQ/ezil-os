@@ -70,6 +70,17 @@ const assignmentChecks = () => ['signed-out-assignment-link', 'running-code-imag
     'authenticated_isolated_computer', 'private_repo_checkout', 'code_full_reload',
     'running-code-image-after'].map(name => ({ name, status: 'pass' }));
 
+test('an explicitly public-read fixture requires its own checkout evidence label', async () => {
+    const config = { mode: 'assignment', appSha, gatewaySha, publicRead: true };
+    const privateLane = assignmentChecks();
+    const missing = await collectEvidence(config, { fetcher: health, runLanes: async () => privateLane });
+    assert.equal(missing.status, 'blocked');
+    const publicLane = assignmentChecks().map(item => item.name === 'private_repo_checkout'
+        ? { ...item, name: 'public_read_repo_checkout' } : item);
+    const proved = await collectEvidence(config, { fetcher: health, runLanes: async () => publicLane });
+    assert.equal(proved.status, 'pass');
+});
+
 test('a requested background probe cannot be silently skipped', async () => {
     const lanes = assignmentChecks();
     lanes.push({ name: 'code_background_agent', status: 'skip' },

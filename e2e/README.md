@@ -21,7 +21,8 @@ state through normal EZiL ID sign-in. Store it outside Git and test artifacts.
 
 | Setting | Evidence |
 | --- | --- |
-| `EZIL_STAGING_QA_REPO` | Canonical private `https://github.ezil.work/<owner>/<repo>.git` fixture. |
+| `EZIL_STAGING_QA_REPO` | Canonical `https://github.ezil.work/<owner>/<repo>.git` fixture. |
+| `EZIL_STAGING_QA_PUBLIC_READ_REPO=1` | Label checkout evidence as public-read when the approved fixture has a verified public read ACL. |
 | `EZIL_STAGING_QA_STORAGE_STATE` | Playwright state file for the dedicated EZiL ID identity with access to the fixture. |
 | `EZIL_STAGING_QA_EXPECTED_FILE` and optional `EZIL_STAGING_QA_EXPECTED_TEXT` | Fixture marker that confirms the checkout in Code after opening and reopening. |
 | `EZIL_STAGING_QA_RUNTIME_READER` | Absolute path to the operator's read-only executable. Given `before` or `after`, it prints one live observation with `appSha`, `workerVersion`, `imageDigest`, `computerId`, `runtimeId` (running boot or placement identity), and UTC ISO `observedAt` recorded during that invocation. Use active Worker and selected desktop readbacks. |
