@@ -508,8 +508,11 @@ test('setModel cannot mutate after disposal during an awaited open', async () =>
 });
 
 test('hello names the private unattended workbench by its headless user agent, and nothing else', async () => {
-    const headless = world({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36' });
+    const headless = world({ href:'http://127.0.0.1:8443/?ezilPrivateCode=1', userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/158.0.0.0 Safari/537.36' });
     assert.equal((await headless.bridge.handle({ op: 'hello' })).unattended, true);
+    for (const href of ['https://8443-example-code.ezil.work/?ezilPrivateCode=1', 'http://127.0.0.1:8443/']) {
+        assert.equal((await world({ userAgent: 'HeadlessChrome/158.0', href }).bridge.handle({ op: 'hello' })).unattended, false);
+    }
     for (const userAgent of ['Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/158.0.0.0 Safari/537.36', '', 'HeadlessChromeless/1']) {
         assert.equal((await world({ userAgent }).bridge.handle({ op: 'hello' })).unattended, false, userAgent);
     }

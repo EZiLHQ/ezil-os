@@ -39,6 +39,7 @@ try {
     state => state.catalog?.models?.filter(model => model.availability === 'available').length >= 2 &&
       state.protocols['2'] > 0 && state, Number(process.env.EZIL_UNATTENDED_READY_MS || 120000));
   assert.equal(first.refused.length, 0);
+  assert.match(first.owner, /^unattended\.[a-f0-9-]{36}$/, 'the executing workbench must be the private loopback client');
   assert.equal(first.upstream.filter(request => request.path.endsWith('/messages')).length, 0,
     'cold-start readiness must not generate a synthetic user turn');
   const markers = ['ALPHA', 'BRAVO'];

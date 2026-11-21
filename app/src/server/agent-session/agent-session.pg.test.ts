@@ -320,7 +320,7 @@ describe.skipIf(!URL_)('EZiL Chat sessions through the editor bridge on Postgres
             expect(b2.owner === 'self' && b2.applied).toBe(0);
         });
 
-        it('a person\'s window takes the lease from the live private unattended workbench at once; the workbench never takes it from a live window', async () => {
+        it('a person\'s window takes the lease from the live private unattended workbench after active work completes; the workbench never takes it from a live window', async () => {
             // The private workbench (docs/UNATTENDED-CODE.md) holds the lease and has work in flight.
             const u = await connect('unattended.private');
             const op = await data<Op>(await write('agentSession.send', { sessionId: u.sessions[0], text: 'while nobody looks', idempotencyKey: randomUUID() }));
@@ -328,15 +328,12 @@ describe.skipIf(!URL_)('EZiL Chat sessions through the editor bridge on Postgres
             await sync({ ownerId: 'unattended.private', epoch: u.epoch, reports: [{ operationId: op.id, status: 'running' }] });
             expect((await data<Op>(await read('agentSession.operation', { operationId: op.id }))).status).toBe('running');
 
-            // The person opens Code: their window is the owner immediately, within the live lease.
+            // Opening the app while a task is running preserves its existing lease and outcome.
+            expect((await sync({ ownerId: 'ext.person', epoch: 0 })).owner).toBe('other');
+            await sync({ ownerId: 'unattended.private', epoch: u.epoch, reports: [{ operationId: op.id, status: 'completed' }] });
+            expect((await data<Op>(await read('agentSession.operation', { operationId: op.id }))).status).toBe('completed');
             const w = await sync({ ownerId: 'ext.person', epoch: 0 });
             expect(w.owner === 'self' && w.epoch).toBe(u.epoch + 1);
-            // What the displaced workbench held is uncertain, never redelivered, and its late report is refused.
-            const [row] = await client`SELECT status, reason FROM public.ezil_agent_operations WHERE id = ${op.id}::uuid`;
-            expect(row).toMatchObject({ status: 'uncertain', reason: 'owner_changed' });
-            const late = await sync({ ownerId: 'unattended.private', epoch: u.epoch, reports: [{ operationId: op.id, status: 'completed' }] });
-            expect(late.owner).toBe('other');
-            expect((await data<Op>(await read('agentSession.operation', { operationId: op.id }))).status).toBe('uncertain');
 
             // The reverse never happens: while the person's window is live, the workbench waits.
             const again = await sync({ ownerId: 'unattended.private', epoch: 0 });

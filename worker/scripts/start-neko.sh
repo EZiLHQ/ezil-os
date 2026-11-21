@@ -3152,7 +3152,7 @@ launch_unattended_workbench() {
   decision="$(CODE_SERVER_PORT="$CODE_SERVER_PORT" CODE_SERVER_USER_DATA_DIR="$CODE_SERVER_USER_DATA_DIR" \
     EZIL_WORKSPACE_ROOT="$WORKSPACE_ROOT" bash "$EZIL_UNATTENDED_WORKBENCH_ENTRY" check 2>/dev/null)" || true
   case "$decision" in
-    authorized) ;;
+    authorized|not_opted_in) ;;
     *)
       log "unattended workbench not started: ${decision:-check_failed}"
       phase_end unattended_workbench skipped

@@ -18,7 +18,7 @@
  */
 import { afterEach, describe, expect, it } from 'bun:test';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, chownSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createServer, type Server } from 'node:net';
@@ -63,6 +63,7 @@ async function listen(): Promise<{ server: Server; port: number }> {
 async function fixture(opts: { editorUp?: boolean } = {}): Promise<Fixture> {
     const root = mkdtempSync(join(tmpdir(), 'unattended-workbench-'));
     roots.push(root);
+    if (process.getuid?.() === 0) chownSync(root, 65534, 65534);
     const bin = join(root, 'bin');
     mkdirSync(bin, { recursive: true });
     const userData = join(root, 'user-data');
@@ -198,8 +199,12 @@ describeIf('start-unattended-workbench.sh keeps the window private', () => {
         expect(child.out().trim()).toBe('authorized');
         const argv = readFileSync(f.argvFile, 'utf8').split('\n').filter(Boolean);
         expect(argv).toContain('--headless=new');
-        expect(argv).toContain(`--user-data-dir=${join(f.root, 'profile')}`);
-        expect(argv.at(-1)).toBe(`http://127.0.0.1:${f.port}/?folder=/home/neko/project`);
+        const profile = argv.find(arg => arg.startsWith('--user-data-dir='))?.slice('--user-data-dir='.length);
+        expect(profile?.startsWith(join(f.root, 'profile', 'window.'))).toBe(true);
+        const target = new URL(argv.at(-1)!);
+        expect(target.origin).toBe(`http://127.0.0.1:${f.port}`);
+        expect(target.searchParams.get('folder')).toBe('/home/neko/project');
+        expect(target.searchParams.get('ezilPrivateCode')).toBe('1');
         expect(argv.filter((a) => a.startsWith('http'))).toHaveLength(1);
         expect(argv.some((a) => a.startsWith('--remote-debugging'))).toBe(false);
         expect(argv).toContain('--disable-extensions');
@@ -208,7 +213,7 @@ describeIf('start-unattended-workbench.sh keeps the window private', () => {
         expect(env).not.toContain('b'.repeat(64));
         expect(env).not.toMatch(/^DISPLAY=/m);
         expect(env).not.toMatch(/^EZIL_/m);
-        expect(env).toMatch(new RegExp(`^HOME=${join(f.root, 'profile')}$`, 'm'));
+        expect(env).toMatch(new RegExp(`^HOME=${profile}$`, 'm'));
         expect(existsSync(join(f.root, 'profile'))).toBe(true);
         child.kill('SIGTERM');
         expect(await exited(child)).toBe(0);
@@ -247,9 +252,12 @@ describeIf('start-unattended-workbench.sh is supervised and stays out of the lif
         const child = start(f);
         expect(await until(() => browserPids(f).length === 1)).toBe(true);
         f.settings('{"ezil.chatBridge.enabled": true, "ezil.chatBridge.unattended": false}');
-        expect(await exited(child)).toBe(0);
         expect(await until(() => browserPids(f).length === 0)).toBe(true);
         expect(readFileSync(join(f.root, 'workbench.log'), 'utf8')).toContain('no longer authorized (not_opted_in)');
+        f.settings(CONSENT);
+        expect(await until(() => browserPids(f).length === 1)).toBe(true);
+        child.kill('SIGTERM');
+        expect(await exited(child)).toBe(0);
         // The stub editor listener (code-server's stand-in) was never touched.
         expect(servers[0]!.listening).toBe(true);
     });

@@ -40,7 +40,13 @@
     // take precedence. A window a person opens is never headless.
     const userAgent = typeof deps.userAgent === 'string' ? deps.userAgent
         : (typeof navigator === 'object' && navigator && typeof navigator.userAgent === 'string' ? navigator.userAgent : '');
-    const unattended = /\bHeadlessChrome\//.test(userAgent);
+    const href = deps.href || (typeof location === 'object' ? location.href : '');
+    let unattended = false;
+    try {
+        const url = new URL(href);
+        unattended = /\bHeadlessChrome\//.test(userAgent) && url.hostname === '127.0.0.1'
+            && url.protocol === 'http:' && url.port === '8443' && url.searchParams.get('ezilPrivateCode') === '1';
+    } catch { /* A normal workbench may have no web location. */ }
 
     let owner = null;
     let disposed = false;

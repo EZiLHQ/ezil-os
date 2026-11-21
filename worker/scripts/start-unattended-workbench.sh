@@ -63,14 +63,14 @@ MODE="${1:-run}"
 CODE_SERVER_PORT="${CODE_SERVER_PORT:-8443}"
 WORKSPACE_ROOT="${EZIL_WORKSPACE_ROOT:-${WORKSPACE_ROOT:-/home/neko/project}}"
 USER_DATA_DIR="${CODE_SERVER_USER_DATA_DIR:-/tmp/code-server-data}"
-PROFILE_DIR="${EZIL_UNATTENDED_WORKBENCH_DIR:-/tmp/ezil-unattended-workbench}"
-LOG_FILE="${EZIL_UNATTENDED_WORKBENCH_LOG:-/tmp/ezil-unattended-workbench.log}"
+PROFILE_DIR="${EZIL_UNATTENDED_WORKBENCH_DIR:-/run/ezil-unattended-workbench}"
+LOG_FILE="${EZIL_UNATTENDED_WORKBENCH_LOG:-$PROFILE_DIR/supervisor.log}"
 SHUTDOWN_FLAG="${NEKO_SHUTDOWN_FLAG:-/tmp/neko-shutdown}"
 MAX_RESTARTS="${EZIL_UNATTENDED_WORKBENCH_MAX_RESTARTS:-5}"
 CONSENT_RECHECK_S="${EZIL_UNATTENDED_WORKBENCH_RECHECK_S:-15}"
 EDITOR_WAIT_TRIES="${EZIL_UNATTENDED_WORKBENCH_EDITOR_TRIES:-240}"
 WINDOW_SIZE="${EZIL_UNATTENDED_WORKBENCH_WINDOW:-1280,800}"
-LOCK_FILE="${PROFILE_DIR}.lock"
+WINDOW_DIR=""
 
 log() { echo "[ezil-boot][unattended-workbench] $(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >>"$LOG_FILE"; }
 
@@ -149,12 +149,18 @@ stop_window() {
 on_signal() { log "stopping: signalled"; stop_window; exit 0; }
 
 launch_window() {
-  rm -rf "$PROFILE_DIR"
-  mkdir -p "$PROFILE_DIR" || return 1
+  WINDOW_DIR="$(mktemp -d -- "$PROFILE_DIR/window.XXXXXX")" || return 1
+  local -a identity=()
+  if [ "$(id -u)" = 0 ]; then
+    chown nobody:nogroup "$WINDOW_DIR" || return 1
+    identity=(setpriv --reuid=nobody --regid=nogroup --clear-groups --no-new-privs)
+  fi
+  local url
+  url="$("$NODE_BIN" -e 'const u=new URL("http://127.0.0.1:"+process.argv[1]);u.searchParams.set("folder",process.argv[2]);u.searchParams.set("ezilPrivateCode","1");process.stdout.write(u.href)' "$CODE_SERVER_PORT" "$WORKSPACE_ROOT")" || return 1
   # `env -i`: the window inherits nothing — not the bridge token, not the AI
   # proxy token, not DISPLAY. `setsid`: its own process group, so every Chrome
   # child goes with it on stop.
-  setsid env -i PATH="/usr/local/bin:/usr/bin:/bin" HOME="$PROFILE_DIR" TMPDIR="$PROFILE_DIR" \
+  setsid env -i PATH="/usr/local/bin:/usr/bin:/bin" HOME="$WINDOW_DIR" TMPDIR="$WINDOW_DIR" "${identity[@]}" \
     "$BROWSER_BIN" \
       --headless=new \
       --no-sandbox \
@@ -169,24 +175,34 @@ launch_window() {
       --disable-default-apps \
       --disable-background-timer-throttling \
       --no-pings \
-      --user-data-dir="$PROFILE_DIR" \
+      --user-data-dir="$WINDOW_DIR" \
       --window-size="$WINDOW_SIZE" \
-      "http://127.0.0.1:${CODE_SERVER_PORT}/?folder=${WORKSPACE_ROOT}" \
-    >>"$LOG_FILE" 2>&1 &
+      "$url" \
+    7<&- >/dev/null 2>&1 &
   WINDOW_PGID=$!
 }
 
 run() {
-  exec 7>"$LOCK_FILE" || exit 1
+  umask 077
+  if [ ! -d "$PROFILE_DIR" ]; then mkdir -m 0711 -- "$PROFILE_DIR" || exit 1; fi
+  [ ! -L "$PROFILE_DIR" ] && [ -O "$PROFILE_DIR" ] || exit 1
+  exec 7<"$PROFILE_DIR" || exit 1
   if ! flock -n 7; then echo already_running; exit 0; fi
   decide || true
   echo "$DECISION"
-  [ "$DECISION" = authorized ] || exit 1
+  case "$DECISION" in authorized|not_opted_in) ;; *) exit 1 ;; esac
+  trap 'if [ -n "$WINDOW_DIR" ]; then rm -rf -- "$WINDOW_DIR"; fi' EXIT
   trap on_signal TERM INT HUP
   log "starting (browser $(basename "$BROWSER_BIN"), profile $PROFILE_DIR, editor 127.0.0.1:${CODE_SERVER_PORT})"
   local attempt=0 tries
   while true; do
     [ -f "$SHUTDOWN_FLAG" ] && { log "stopping: desktop shutdown"; exit 0; }
+    if ! decide; then
+      [ "$DECISION" = not_opted_in ] || exit 1
+      sleep "$CONSENT_RECHECK_S" &
+      wait $! 2>/dev/null
+      continue
+    fi
     tries=0
     until port_up; do
       tries=$((tries + 1))
@@ -199,14 +215,17 @@ run() {
     local started_s rc
     started_s="$(date +%s)"
     # Supervise: stop on the shutdown flag, on withdrawn consent, or when the window exits.
-    while kill -0 -- "-$WINDOW_PGID" 2>/dev/null; do
+    while kill -0 "$WINDOW_PGID" 2>/dev/null; do
       sleep "$CONSENT_RECHECK_S" &
       wait $! 2>/dev/null
       [ -f "$SHUTDOWN_FLAG" ] && { log "stopping: desktop shutdown"; stop_window; exit 0; }
-      if ! decide; then log "stopping: no longer authorized ($DECISION)"; stop_window; exit 0; fi
+      if ! decide; then log "stopping: no longer authorized ($DECISION)"; stop_window; break; fi
     done
-    wait "$WINDOW_PGID" 2>/dev/null; rc=$?
+    if [ -n "$WINDOW_PGID" ]; then wait "$WINDOW_PGID" 2>/dev/null; rc=$?; else rc=0; fi
     WINDOW_PGID=""
+    rm -rf -- "$WINDOW_DIR"
+    WINDOW_DIR=""
+    [ "$DECISION" = authorized ] || continue
     [ -f "$SHUTDOWN_FLAG" ] && { log "stopping: desktop shutdown"; exit 0; }
     # A window that ran for a while is restarted without charge; a quick exit burns the budget.
     if [ $(( $(date +%s) - started_s )) -ge 60 ]; then attempt=0; else attempt=$((attempt + 1)); fi
