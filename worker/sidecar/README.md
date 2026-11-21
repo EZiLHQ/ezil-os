@@ -28,15 +28,24 @@ arbitrary script execution wearing a URL.
 
 ## The wire is pinned, not described
 
-`EZiL-Works: apps/api/src/routes/mcp/browser-sidecar.contract.json`.
+v1 (the first ten verbs below) is pinned by
+`EZiL-Works: apps/api/src/routes/mcp/browser-sidecar.contract.json`. v2 is
+additive and is declared by `contract.mjs` plus
+`docs/contracts/browser-verbs-v2.md`; every v1 route, member and error code is
+unchanged.
 
-That file is the contract. This README is commentary. The producer lives here,
-the consumer lives in the other repository, and neither describes the wire in
-prose — both assert their own types against the same JSON, because the failure
-this prevents (a client and a server agreeing on nothing, with a fully green
-client suite) is on the record in the legacy Universe MCP.
+Those files are the contract. This README is commentary. The producer lives
+here, the consumer lives in the other repository, and neither describes the wire
+in prose — both assert their own types against the same declaration, because
+the failure this prevents (a client and a server agreeing on nothing, with a
+fully green client suite) is on the record in the legacy Universe MCP.
 
-`worker/src/browser-sidecar-contract.test.ts` is this side's assertion.
+`worker/src/browser-sidecar-contract.test.ts` is this side's assertion: the
+pinned v1 JSON is contained in `contract.mjs` route for route and member for
+member, `SIDECAR_WIRE` is exactly `V1_ROUTES` + `V2_ROUTES`, and the Worker's
+allowlist (`worker/src/browser-sidecar.ts`) is exactly the route verbs. Run it
+with `EZIL_BROWSER_SIDECAR_CONTRACT=<path to the JSON>` so it runs rather than
+skips; a path that is set but missing fails.
 
 ## Verbs
 
@@ -52,9 +61,78 @@ client suite) is on the record in the legacy Universe MCP.
 | `POST /console` | `level?` | `ok, entries` |
 | `POST /network` | `filter?` | `ok, requests` |
 | `POST /wait_for` | `text?, time?` | `ok, matched` |
+| `POST /fill_form` (v2) | `fields` | `ok, url, filled, redacted` |
+| `POST /select` (v2) | `ref, values` | `ok, url, selected` |
+| `POST /scroll` (v2) | `ref?, dy?` | `ok, url, scrollY` |
+| `POST /press` (v2) | `ref?, key` | `ok, url` |
+
+The v2 rules (bounds live in `contract.mjs`):
+
+- **`/fill_form`**: 1–20 `{ref, value}`, each `value` a string of at most 4000
+  characters. Every ref is resolved, and every element checked to be fillable
+  (not a button, checkbox, `<select>`, disabled or readonly control), BEFORE
+  any field is filled: one bad, stale or unfillable ref fills nothing. Password
+  fields register their value as a secret before the first fill, exactly like
+  `/type`; `redacted` counts them, and no value is ever echoed.
+- **`/select`**: 1–20 option labels or values. The ref must be a combobox or
+  listbox and a real `<select>`, else `bad_ref`; a value that matches no option
+  is `bad_request` at once rather than a timeout. `selected` is the option
+  values now selected.
+- **`/scroll`**: exactly one of `ref` (scroll it into view) or `dy` (an integer,
+  `|dy| ≤ 5000`, scrolls the window). `scrollY` is the window offset after.
+- **`/press`**: `key` exactly one of Enter, Tab, Shift+Tab, Escape, Backspace,
+  Delete, Space, ArrowUp/Down/Left/Right, Home, End, PageUp, PageDown. Shift+Tab
+  is the only chord, there are no character keys (text goes through `/type`),
+  and the key that reaches Playwright is the list's constant, never the
+  request's string.
 
 Errors are `{ok:false, error, detail?}` with `error` one of `chrome_unreachable`,
-`bad_ref`, `stale_ref`, `navigation_failed`, `timeout`, `bad_request`.
+`bad_ref`, `stale_ref`, `navigation_failed`, `timeout`, `bad_request`, and (v2)
+`origin_read_only`.
+
+## Origin tiers (v2)
+
+`origin-policy.mjs` puts the page a verb acts on into one of three tiers. The
+tier origins come ONLY from `EZIL_BROWSER_OWNER_APP_ORIGINS` and
+`EZIL_BROWSER_IDP_ORIGINS`: comma lists of bare https origins (staging:
+`https://universe-staging.ezil.work` and `https://id.ezil.work`), read once when
+the surface is created. A malformed entry empties that tier and is logged at
+boot by position, never by value; an origin in both lists is `idp_transit`.
+`EZIL_BROWSER_TEST_ALLOWED_ORIGINS` is never a tier source.
+
+| Tier | Routes |
+|---|---|
+| `owner_app` | all |
+| `idp_transit` | `GET /health`, `POST /navigate`, `POST /wait_for` with `time` only |
+| `other` | all (v1 behaviour plus the v2 verbs) |
+
+Everything else on an `idp_transit` page — snapshot, refs, typing, text,
+screenshots, console, network, `wait_for{text}` — answers `origin_read_only`.
+The tier is read immediately before acting, and reads (`snapshot`, `get_text`,
+`screenshot`, `wait_for{text}`) check again after reading, so a page that
+navigated onto the IdP mid-read yields nothing. A verb that navigates may land
+on any tier; it returns the sanitised `url`.
+
+Handlers are `(surface, body, opts = {})`. `opts.denyTiers` (a `Set` of tier
+names) refuses those tiers as well: the Code loopback passes
+`new Set(['owner_app', 'idp_transit'])`. That is agent policy, not confinement
+(`docs/contracts/browser-verbs-v2.md` §8: anything in the computer can reach
+CDP on 9222 directly).
+
+**URL sanitising.** `sanitizeUrl` reduces an `idp_transit` URL to origin + path,
+and strips the whole query and fragment from any URL whose query or fragment
+names `code`, `state`, `id_token`, `access_token`, `refresh_token`, `token`,
+`session_transfer_token`, `nonce`, `ticket` or `code_verifier`. Every other
+URL is returned as the same string. It is applied at the source: console and
+network entries as they are recorded (including URLs inside console text and
+`location`), and every `url` member of every response.
+
+**Page scope.** `console` and `network` return only entries recorded from the
+active tab (entries carry an internal page tag; the public entry shape is
+unchanged). Console text recorded while that tab was on an `idp_transit` origin
+is not returned after it leaves; the IdP hops stay visible, sanitised, in
+`network`. Page text that is not a URL member (`snapshot`, `get_text` markdown,
+titles) is not URL-sanitised.
 
 A verb-level failure answers **HTTP 200** with `ok:false` — the contract makes
 `ok` the channel, and folding verb failure into transport failure is how a
@@ -71,14 +149,17 @@ guesses a selector. `/screenshot` is the escape hatch for genuinely visual
 questions, not the default way to look at a page.
 
 **Refs are valid only within the snapshot that produced them, and they reset on
-navigation.** The sidecar remembers which refs it issued and under which
-generation, so:
+navigation.** The sidecar remembers which refs it issued, under which
+generation, and (v2) on which tab and origin, so:
 
 - a ref it never issued → `bad_ref` — you guessed;
 - a ref from an earlier snapshot, or one whose element has gone → `stale_ref` —
-  re-snapshot.
+  re-snapshot;
+- a ref used on another tab, or after its tab's origin changed → `stale_ref`,
+  checked before the DOM is queried, so a leftover `data-ezil-ref` on another
+  tab never matches.
 
-Collapsing those two would make a recoverable state look like a mistake.
+Collapsing those would make a recoverable state look like a mistake.
 
 ## Redaction
 
@@ -116,7 +197,22 @@ Screenshot guard: the container suite
 with a 4-character and a 20-character password in the field and asserts the two
 PNGs are **byte identical** — a masked box is the same box, unmasked dots are
 not. Remove `mask` from the screenshot options in `verbs.mjs` and that test goes
-red.
+red. (`verbs-v2.test.mjs` asserts the same identity offline, against a fake that
+renders the dots when unmasked; only the container suite proves the pixels.)
+
+### v2 guards: mutation procedure
+
+`verbs-v2.test.mjs` drives the real `BrowserSurface` over a fake browser;
+`origin-policy.test.mjs` covers the pure policy. Break each guard, run
+`bun test` (all suites), expect red, restore with `git checkout <file>`:
+
+| Guard | Mutation | Recorded (2026-11-21, 210 tests) |
+|---|---|---|
+| tier gate (`verbs.mjs` `assertTierAllows`) | `if (!routeAllowedOnTier(…) \|\| deny.has(tier))` → `if (false)` | 36 fail |
+| idp route table (`origin-policy.mjs` `routeAllowedOnTier`) | `if (tier !== 'idp_transit') return true;` → `return true;` | 25 fail |
+| `sanitizeUrl` | return `url` unchanged before parsing | 24 fail |
+| ref tab binding (`browser.mjs` `resolveRef`) | the `pageKey` check → `if (false)` | 2 fail |
+| ref origin binding (`browser.mjs` `resolveRef`) | the `origin` check → `if (false)` | 1 fail |
 
 ## Running it by hand
 
