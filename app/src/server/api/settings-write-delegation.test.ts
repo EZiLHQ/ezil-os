@@ -171,7 +171,7 @@ describe('computer.name', () => {
     it('renames a live owned computer and the next account.mcpSettings read returns that name', async () => {
         expect((await mcpSettings()).computers).toEqual([{ id: mine, name: 'Desktop', slot: 1 }]);
         expect(await caller().mcpSetSetting(write('computer.name', '  Studio  ', mine)))
-            .toEqual({ id: 'computer.name', status: 'applied', value: 'Studio', reason: null, confirmUrl: null });
+            .toEqual({ id: 'computer.name', status: 'applied', value: '  Studio  ', reason: null, confirmUrl: null });
         expect(h.update).toHaveBeenCalledWith({ name: 'Studio' });
         expect((await mcpSettings()).computers).toEqual([{ id: mine, name: 'Studio', slot: 1 }]);
         expect(rows.find(row => row.id === theirs)!.name).toBe('Theirs');
@@ -180,7 +180,7 @@ describe('computer.name', () => {
     it('returns unchanged without a write for the same name, after the trim', async () => {
         for (const value of ['Desktop', ' Desktop ']) {
             expect(await caller().mcpSetSetting(write('computer.name', value, mine)))
-                .toEqual({ id: 'computer.name', status: 'unchanged', value: 'Desktop', reason: null, confirmUrl: null });
+                .toEqual({ id: 'computer.name', status: 'unchanged', value, reason: null, confirmUrl: null });
         }
         expect(h.update).not.toHaveBeenCalled();
         expect(await caller().mcpSetSetting(write('computer.name', 'Desktop 2', mine))).toMatchObject({ status: 'applied' });
@@ -189,7 +189,7 @@ describe('computer.name', () => {
 
     it('keeps the 1 to 200 character rule of computer.rename, counted after the trim', async () => {
         const longest = 'n'.repeat(200);
-        expect(await caller().mcpSetSetting(write('computer.name', ` ${longest} `, mine))).toMatchObject({ status: 'applied', value: longest });
+        expect(await caller().mcpSetSetting(write('computer.name', ` ${longest} `, mine))).toMatchObject({ status: 'applied', value: ` ${longest} ` });
         for (const value of ['', '   ', '\n\t', 'n'.repeat(201)]) {
             expect(await caller().mcpSetSetting(write('computer.name', value, mine))).toEqual(refusedAs('computer.name', 'invalid_value'));
         }
@@ -335,6 +335,84 @@ describe('plan.sku', () => {
         expect(await caller({ db: untouchedDb }).mcpSetSetting(write('plan.sku', 'pro', mine))).toEqual(refusedAs('plan.sku', 'invalid_value'));
         expect(h.touched).not.toHaveBeenCalled();
         expect(await caller({ db: untouchedDb }).mcpSetSetting(write('plan.sku', 'pro'))).toMatchObject({ status: 'confirmation_required' });
+    });
+});
+
+describe('reply coherence the MCP set_setting tool enforces', () => {
+    type Reply = { id: string; status: string; value: string | null; reason: string | null; confirmUrl: string | null };
+    /** Every rule, applied to one reply; returns the rules it breaks. */
+    function broken(sent: { id: string; value: string }, reply: Reply) {
+        const rules: string[] = [];
+        const echoes = ['applied', 'unchanged', 'pending'].includes(reply.status);
+        if (reply.id !== sent.id) rules.push('id echoed');
+        if (reply.status === 'refused' && reply.value !== null) rules.push('refused carries value:null');
+        if (echoes && reply.value !== sent.value) rules.push('applied/unchanged/pending echo the value sent');
+        if (sent.id === 'plan.sku' && !['confirmation_required', 'refused'].includes(reply.status)) rules.push('plan.sku answers only confirmation_required');
+        if (reply.status === 'confirmation_required' && sent.id !== 'plan.sku') rules.push('confirmation_required is plan.sku only');
+        if (reply.status === 'pending' && sent.id !== 'computer.size') rules.push('pending only for computer.size');
+        if (sent.id === 'computer.name' && reply.reason === 'size_not_allowed') rules.push('computer.name never size_not_allowed');
+        if ((reply.reason !== null) !== (reply.status === 'refused')) rules.push('reason non-null only on refused (and always there)');
+        if ((reply.confirmUrl !== null) !== (reply.status === 'confirmation_required')) rules.push('confirmUrl non-null only on confirmation_required');
+        if (reply.status === 'confirmation_required' && reply.confirmUrl !== `https://os-staging.ezil.work/os?settings=billing&upgrade=${sent.value}`) {
+            rules.push('confirmUrl exact');
+        }
+        return rules;
+    }
+
+    it('holds for every reply the three settings can give, and the checker itself catches each breach', async () => {
+        const outcomes: [string, string, string | undefined][] = [
+            ['computer.name', 'Studio', mine], ['computer.name', 'Studio', mine], ['computer.name', 'Desktop', mine],
+            ['computer.name', '', mine], ['computer.name', 'Studio', theirs], ['computer.name', 'Studio', undefined],
+            ['computer.size', 'std-2', mine], ['computer.size', 'cmp-8', mine], ['computer.size', 'gpu', mine],
+            ['computer.size', 'std-2', theirs], ['computer.size', 'std-2', undefined],
+            ['plan.sku', 'standard', undefined], ['plan.sku', 'premium', undefined], ['plan.sku', 'compute', undefined],
+            ['plan.sku', 'pro', undefined], ['plan.sku', 'free', undefined], ['plan.sku', 'pro', mine],
+        ];
+        const statuses = new Set<string>();
+        const switches = [
+            { ok: true, effective: 'switching', current: 'free-cf', target: 'std-2', transitionId: 't' },
+            { ok: true, effective: 'next_start', current: 'free-cf', target: 'std-2', transitionId: 't' },
+            { ok: true, effective: 'next_start', current: 'std-2', target: 'std-2', transitionId: 't' },
+            { ok: false, reason: 'computer_busy' },
+        ];
+        for (const switched of switches) {
+            for (const [id, value, computerId] of outcomes) {
+                h.switchSize.mockResolvedValue(switched);
+                rows[0]!.name = 'Desktop';
+                const reply = await caller().mcpSetSetting(write(id, value, computerId)) as Reply;
+                expect(broken({ id, value }, reply), JSON.stringify({ id, value, reply })).toEqual([]);
+                statuses.add(`${id}:${reply.status}`);
+            }
+        }
+        // Positive control: the matrix really reached every kind of reply.
+        expect([...statuses].sort()).toEqual([
+            'computer.name:applied', 'computer.name:refused', 'computer.name:unchanged',
+            'computer.size:applied', 'computer.size:pending', 'computer.size:refused', 'computer.size:unchanged',
+            'plan.sku:confirmation_required', 'plan.sku:refused',
+        ]);
+        const sent = { id: 'computer.name', value: 'Studio' };
+        const ok: Reply = { id: 'computer.name', status: 'applied', value: 'Studio', reason: null, confirmUrl: null };
+        expect(broken(sent, ok)).toEqual([]);
+        for (const [rule, reply, from] of [
+            ['refused carries value:null', { ...ok, status: 'refused', reason: 'invalid_value', value: 'Studio' }, sent],
+            ['applied/unchanged/pending echo the value sent', { ...ok, value: 'Other' }, sent],
+            ['pending only for computer.size', { ...ok, status: 'pending' }, sent],
+            ['computer.name never size_not_allowed', { ...ok, status: 'refused', value: null, reason: 'size_not_allowed' }, sent],
+            ['reason non-null only on refused (and always there)', { ...ok, reason: 'invalid_value' }, sent],
+            ['confirmUrl non-null only on confirmation_required', { ...ok, confirmUrl: 'https://os-staging.ezil.work/os' }, sent],
+            ['plan.sku answers only confirmation_required', { ...ok, id: 'plan.sku', status: 'applied' }, { id: 'plan.sku', value: 'Studio' }],
+            ['confirmUrl exact', { ...ok, id: 'plan.sku', status: 'confirmation_required', confirmUrl: 'https://os-staging.ezil.work/os?settings=billing&upgrade=pro' },
+                { id: 'plan.sku', value: 'standard' }],
+        ] as [string, Reply, typeof sent][]) expect(broken(from, reply)).toContain(rule);
+    });
+
+    it('echoes a computer.name exactly as received, trimmed or not, while storing it trimmed', async () => {
+        for (const value of ['Studio', 'Studio 2']) {
+            expect(await caller().mcpSetSetting(write('computer.name', value, mine))).toMatchObject({ status: 'applied', value });
+            expect(rows[0]!.name).toBe(value);
+        }
+        expect(await caller().mcpSetSetting(write('computer.name', ' Padded ', mine))).toMatchObject({ status: 'applied', value: ' Padded ' });
+        expect(rows[0]!.name).toBe('Padded');
     });
 });
 

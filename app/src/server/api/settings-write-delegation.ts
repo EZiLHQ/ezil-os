@@ -63,6 +63,7 @@ export interface SettingsWriteDeps {
     switchSize(computerId: string, size: string, requestId: string): Promise<SwitchConfigurationOutputV3>;
 }
 
+/** Replies echo the value as received: the name is stored trimmed, the reply is not rewritten. */
 const refused = (id: SettingsWriteInput['id'], reason: SettingRefusal): SettingsWriteOutput =>
     ({ id, status: 'refused', value: null, reason, confirmUrl: null });
 const done = (id: SettingsWriteInput['id'], status: 'applied' | 'unchanged' | 'pending', value: string): SettingsWriteOutput =>
@@ -93,9 +94,9 @@ export async function applySetting(deps: SettingsWriteDeps, userId: string, inpu
     if (!owned) return refused(id, 'computer_not_found');
 
     if (id === 'computer.name') {
-        if (owned.name === name) return done(id, 'unchanged', name);
+        if (owned.name === name) return done(id, 'unchanged', input.value);
         const [updated] = await deps.db.update(computers).set({ name }).where(liveOwnedComputer(userId, computerId)).returning();
-        return updated ? done(id, 'applied', name) : refused(id, 'computer_not_found');
+        return updated ? done(id, 'applied', input.value) : refused(id, 'computer_not_found');
     }
 
     if (!(await deps.allowedSizes())?.includes(input.value)) return refused(id, 'size_not_allowed');
