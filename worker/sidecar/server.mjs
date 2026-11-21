@@ -47,6 +47,7 @@ import { ERROR_CODES } from './contract.mjs';
 import { VERBS } from './verbs.mjs';
 import { redactDeep } from './redact.mjs';
 import { createMcpObservation, observationPayload, OBSERVE_PATH } from './mcp-observation.mjs';
+import { browserUiPayload } from './mcp-observation-payload.mjs';
 import { BROWSER_OPEN_PATH, CODE_BROWSER_OPEN_PATH, browserOpenFailure, createMcpBrowserOpen } from './mcp-browser-open.mjs';
 
 const PORT = Number.parseInt(process.env.EZIL_SIDECAR_PORT ?? '9223', 10) || 9223;
@@ -72,9 +73,10 @@ export const ROUTES = Object.keys(VERBS);
 
 /** Construct without binding or connecting, so the HTTP boundary can be tested offline. */
 export function createSidecarServer (surface, {
-    observe = createMcpObservation(surface),
+    observe = createMcpObservation(surface, { allowedOrigins: process.env.EZIL_BROWSER_TEST_ALLOWED_ORIGINS }),
     browserOpen = createMcpBrowserOpen(surface, { allowedOrigins: process.env.EZIL_BROWSER_TEST_ALLOWED_ORIGINS }),
     workerBrowserOpenToken = process.env.EZIL_WORKER_BROWSER_MCP_TOKEN,
+    workerBrowserControl = process.env.EZIL_WORKER_BROWSER_CONTROL === 'on',
     codeBrowserOpenToken = process.env.EZIL_CODE_BROWSER_MCP_TOKEN,
 } = {}) {
     const codeBinding = typeof codeBrowserOpenToken === 'string' && BOOT_CAPABILITY.test(codeBrowserOpenToken)
@@ -93,6 +95,7 @@ export function createSidecarServer (surface, {
         // inspect passwords to redact a response.
         let safe;
         if (kind === 'observation') safe = observationPayload(payload);
+        else if (kind === 'browser-ui') safe = browserUiPayload(payload);
         // The open receipt is constructed from closed fields in the private
         // handler and must not inspect the desktop user's existing pages.
         else if (kind === 'browser-open') safe = payload;
@@ -158,11 +161,26 @@ export function createSidecarServer (surface, {
         }
         if (req.url === OBSERVE_PATH && method === 'POST') {
             let outcome = { ok: false, error: 'browser_invalid_request' };
+            let modern = false;
             try {
-                const raw = await readBody(req, 1024);
-                outcome = await observe(JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(raw)));
+                const raw = await readBody(req, 4096);
+                const input = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(raw));
+                modern = input !== null && typeof input === 'object' && Object.hasOwn(input, 'action');
+                if (modern && (!workerBrowserControl || !validBrowserOpenAuthorization(req.headers.authorization, workerBrowserOpenToken))) {
+                    return respond(res, 401, { ok: false, error: 'browser_unavailable' }, 'browser-ui');
+                }
+                if (modern || raw.byteLength <= 1024) {
+                    const cancel = new AbortController();
+                    const disconnect = () => cancel.abort();
+                    res.once('close', disconnect);
+                    try {
+                        outcome = await observe(input, cancel.signal);
+                    } finally {
+                        res.off('close', disconnect);
+                    }
+                }
             } catch { /* The closed error contains no input or provider data. */ }
-            return respond(res, 200, outcome, 'observation');
+            return respond(res, 200, outcome, modern ? 'browser-ui' : 'observation');
         }
 
         const handler = VERBS[key];

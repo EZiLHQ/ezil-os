@@ -80,7 +80,7 @@ interface CallLog {
    * field, so a test that reads anything else is testing a paraphrase.
    */
   startProcess: Array<{ command: string; env: Record<string, string> }>;
-  browserObservations: Array<{ body: string; deadline: number }>;
+  browserObservations: Array<{ body: string; deadline: number; hasCapability?: boolean }>;
   browserOpens: Array<{ body: string; deadline: number; sandboxId: string }>;
 }
 
@@ -234,8 +234,9 @@ function fakeSandboxNamespace(options: {
     },
     getProcess: async () => processResult,
     desktopReachable: async () => true,
-    observeExistingBrowser: async (body, deadline) => {
-      calls.browserObservations.push({ body: String(body), deadline: Number(deadline) });
+    observeExistingBrowser: async (body, deadline, capability) => {
+      calls.browserObservations.push({ body: String(body), deadline: Number(deadline),
+        ...(typeof capability === 'string' && { hasCapability: /^[A-Za-z0-9_-]{43}$/.test(capability) }) });
       return options.containerResponse?.() ?? Response.json({ ok: false, error: 'browser_page_unavailable' });
     },
     openBrowserUrl: async (body, deadline, sandboxId) => {
@@ -1639,6 +1640,19 @@ describe('delegated Browser observation Worker route', () => {
     expect(calls.browserObservations[0]?.body).toBe(body);
     expect(calls.startProcess).toHaveLength(0);
     expect(calls.containerFetch).toHaveLength(0);
+    expect(calls.exposePort).toHaveLength(0);
+  });
+
+  it('modern reads need a distinct stage gate and private sidecar capability', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const env = environment(binding);
+    const modern = JSON.stringify({ binding: 'b'.repeat(64), action: { kind: 'read', includeFrame: true } });
+    expect((await worker.fetch(await signed({}, modern), env)).status).toBe(404);
+    expect(calls.browserObservations).toHaveLength(0);
+    const approved = await worker.fetch(await signed({}, modern), { ...env, SANDBOX_MCP_BROWSER_CONTROL: 'on' });
+    expect(approved.status).toBe(200);
+    expect(calls.browserObservations).toEqual([{ body: modern, deadline: expect.any(Number), hasCapability: true }]);
+    expect(calls.startProcess).toHaveLength(0);
     expect(calls.exposePort).toHaveLength(0);
   });
 

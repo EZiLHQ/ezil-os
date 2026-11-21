@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <title>EZiL Browser QA fixture</title>
+    <style>
+        body { margin: 0 auto; max-width: 42rem; padding: 2rem; font: 1rem/1.5 system-ui, sans-serif; }
+        label, output { display: block; margin-top: 1rem; }
+        input, button { font: inherit; padding: .5rem; }
+        output { padding: 1rem; background: #edf4ff; color: #172f67; min-height: 1.5rem; }
+    </style>
+</head>
+<body>
+    <main>
+        <h1>EZiL Browser QA fixture</h1>
+        <label for="test-message">Test message</label>
+        <input id="test-message" type="text" maxlength="80" autocomplete="off">
+        <button type="button" id="show-message">Show message</button>
+        <output id="browser-acknowledgment" for="test-message" role="status" data-testid="browser-acknowledgment">Ready</output>
+    </main>
+    <script>
+        const message = document.querySelector('#test-message');
+        const acknowledgment = document.querySelector('#browser-acknowledgment');
+        document.querySelector('#show-message').addEventListener('click', () => {
+            acknowledgment.textContent = message.value ? 'Shown: ' + message.value : 'No message entered';
+        });
+    </script>
+</body>
+</html>

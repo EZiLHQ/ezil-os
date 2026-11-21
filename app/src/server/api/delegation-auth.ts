@@ -260,6 +260,17 @@ export function authenticateBrowserDelegation(headers: Headers, deps: Delegation
     return authenticateBoundDelegation(headers, deps, 'ezil:browser:read', BROWSER_PROCEDURES);
 }
 
+const BROWSER_PAGE_PROCEDURES: ReadonlySet<string> = new Set(['browserSession.readPage']);
+const BROWSER_CONTROL_PROCEDURES: ReadonlySet<string> = new Set(['browserSession.control']);
+
+export function authenticateBrowserPageDelegation(headers: Headers, deps: DelegationDeps): Promise<DelegationOutcome> {
+    return authenticateBoundDelegation(headers, deps, 'ezil:browser:page:read', BROWSER_PAGE_PROCEDURES);
+}
+
+export function authenticateBrowserControlDelegation(headers: Headers, deps: DelegationDeps): Promise<DelegationOutcome> {
+    return authenticateBoundDelegation(headers, deps, 'ezil:browser:control', BROWSER_CONTROL_PROCEDURES);
+}
+
 const BROWSER_OPEN_PROCEDURES: ReadonlySet<string> = new Set(['browserSession.openUrl']);
 
 /** Separately scoped authority for staging project browser navigation. */
