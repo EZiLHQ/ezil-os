@@ -32,11 +32,14 @@ export function registerCodeMcp(context: vscode.ExtensionContext, open: (grant: 
     // Bumped by every detach. A grant command that awaited the modal or the endpoint across a detach discards its result.
     let generation = 0;
     const changed = new vscode.EventEmitter<void>();
-    const detach = async () => {
-        generation++;
+    const closeActive = async () => {
         const closing = active; active = undefined;
         closing?.grant.revoke();
         await closing?.endpoint.close();
+    };
+    const detach = () => {
+        generation++;
+        return closeActive();
     };
     context.subscriptions.push(vscode.lm.registerMcpServerDefinitionProvider('ezil-browser', {
         onDidChangeMcpServerDefinitions: changed.event,
@@ -63,15 +66,16 @@ export function registerCodeMcp(context: vscode.ExtensionContext, open: (grant: 
         vscode.commands.registerCommand(GRANT_COMMAND, async () => {
             const folder = grantableFolder();
             if (!folder) { void vscode.window.showInformationMessage('EZiL Workspace MCP: attach needs one trusted local workspace folder.'); return false; }
+            const mine = ++generation;
+            const grant = new WorkspaceMcpGrant();
+            if (!grant.grant(folder)) { void vscode.window.showInformationMessage('EZiL Workspace MCP: attach needs a folder you own.'); return false; }
             const choice = await vscode.window.showWarningMessage(
                 `Attach the read-only EZiL Workspace tool to ${folder} for this Code window?`,
                 { modal: true, detail: 'Chat tools can then read this folder\'s name, path and top-level entry names (no file contents). Nothing from the repository is run or read as configuration. The attach ends when you revoke it, close the window or restart Code.' },
                 GRANT_CHOICE);
-            if (choice !== GRANT_CHOICE) return false;
-            await detach();
-            const mine = generation;
-            const grant = new WorkspaceMcpGrant();
-            if (!grant.grant(folder)) { void vscode.window.showInformationMessage('EZiL Workspace MCP: the folder is not a directory you own.'); return false; }
+            if (choice !== GRANT_CHOICE || generation !== mine || grantableFolder() !== folder || !grant.live()) return false;
+            await closeActive();
+            if (generation !== mine) return false;
             let endpoint: WorkspaceMcpEndpoint;
             try { endpoint = await open(grant); }
             catch { grant.revoke(); void vscode.window.showInformationMessage('EZiL Workspace MCP: could not open the local endpoint.'); return false; }

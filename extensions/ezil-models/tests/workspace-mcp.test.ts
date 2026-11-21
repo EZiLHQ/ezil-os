@@ -16,7 +16,7 @@ mock.module('vscode', () => fakeVscode);
 const { GRANT_CHOICE, GRANT_COMMAND, REVOKE_COMMAND, registerCodeMcp } = await import('../src/code-mcp');
 
 /** The provider test's fake window: mutated in place, restored by `restoreWindow`. */
-function fakeWindow(root: string, choice: () => string | undefined) {
+function fakeWindow(root: string, choice: () => string | undefined | Promise<string>) {
     const workspace = fakeVscode.workspace as Record<string, unknown>;
     const window = fakeVscode.window as Record<string, unknown>;
     const commands = fakeVscode.commands as Record<string, unknown>;
@@ -352,6 +352,31 @@ describe('Code MCP provider', () => {
             }
             if (previousEnv.on !== undefined) process.env.EZIL_CODE_BROWSER_MCP = previousEnv.on;
             if (previousEnv.token !== undefined) process.env.EZIL_CODE_BROWSER_MCP_TOKEN = previousEnv.token;
+        }
+    });
+
+    test('a detached window or a replaced directory invalidates an open confirmation', async () => {
+        const root = folder();
+        let choose!: (answer: string) => void;
+        const fake = fakeWindow(root, () => new Promise<string>(resolve => { choose = resolve; }));
+        const context = { subscriptions: [] as { dispose(): void }[], extensionPath: '/ext' };
+        try {
+            registerCodeMcp(context as never);
+            const approve = fake.registered.get(GRANT_COMMAND)!;
+            const first = approve();
+            await fake.registered.get(REVOKE_COMMAND)!();
+            choose(GRANT_CHOICE);
+            expect(await first).toBe(false);
+            const second = approve();
+            fs.renameSync(root, root + '-old');
+            roots.push(root + '-old');
+            fs.mkdirSync(root);
+            choose(GRANT_CHOICE);
+            expect(await second).toBe(false);
+            expect(fake.providers.get('ezil-browser')!.provideMcpServerDefinitions()).toEqual([]);
+        } finally {
+            for (const subscription of context.subscriptions) subscription.dispose();
+            fake.restore();
         }
     });
 
