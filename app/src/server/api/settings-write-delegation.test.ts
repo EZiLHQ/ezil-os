@@ -2,7 +2,16 @@ import { initTRPC } from '@trpc/server';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const h = vi.hoisted(() => ({ getDeps: vi.fn(), billing: vi.fn(), balance: vi.fn(), switchSize: vi.fn(), update: vi.fn(), touched: vi.fn() }));
+const h = vi.hoisted(() => {
+    const previewUpgrade = vi.fn(), confirmUpgrade = vi.fn();
+    const stripe = { previewUpgrade, confirmUpgrade };
+    return {
+        getDeps: vi.fn(), billing: vi.fn(), balance: vi.fn(), switchSize: vi.fn(), update: vi.fn(), touched: vi.fn(),
+        previewUpgrade, confirmUpgrade, stripe,
+        createStripeClient: vi.fn(() => stripe), createStripeRequest: vi.fn(() => vi.fn()),
+        billingCaller: vi.fn(() => stripe),
+    };
+});
 
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: h.getDeps }));
 vi.mock('./mcp-identity-bootstrap', async () => {
@@ -11,6 +20,8 @@ vi.mock('./mcp-identity-bootstrap', async () => {
 });
 vi.mock('./routers/account-ai-balance', () => ({ readSettingsAiBalance: h.balance }));
 vi.mock('@/server/billing/v2/compute-access', () => ({ loadComputeBillingState: h.billing }));
+vi.mock('@/server/billing/stripe/client', () => ({ createStripeClient: h.createStripeClient, createStripeRequest: h.createStripeRequest }));
+vi.mock('./routers/billing', () => ({ billingRouter: { createCaller: h.billingCaller }, createBillingRouter: h.billingCaller }));
 vi.mock('./routers/compute-dispatch', () => ({ switchComputerConfiguration: h.switchSize }));
 vi.mock('./trpc', () => {
     const t = initTRPC.context<{ user: { id: string }; db: unknown }>().create();
@@ -86,7 +97,8 @@ beforeEach(() => {
         window: { start: '2026-11-01T00:00:00Z', end: '2026-12-01T00:00:00Z' },
         usedStdSeconds: 0, allowanceStdSeconds: 100,
     });
-    h.getDeps.mockReset().mockReturnValue({ now: () => new Date('2026-11-21T00:00:00Z'), aiCredits: { receiptsFor: async () => [] } });
+    h.getDeps.mockReset().mockReturnValue({ now: () => new Date('2026-11-21T00:00:00Z'), aiCredits: { receiptsFor: async () => [] }, stripe: h.stripe });
+    for (const spy of [h.previewUpgrade, h.confirmUpgrade, h.createStripeClient, h.createStripeRequest, h.billingCaller]) spy.mockClear();
     h.switchSize.mockReset().mockResolvedValue({ ok: true, effective: 'switching', current: 'free-cf', target: 'std-2', transitionId: 't1' });
 });
 afterEach(() => {
@@ -303,6 +315,10 @@ describe('plan.sku', () => {
         expect(h.switchSize).not.toHaveBeenCalled();
         expect(h.touched).not.toHaveBeenCalled();
         expect(h.update).not.toHaveBeenCalled();
+        // Neither Stripe's upgrade preview or confirmation, nor a client or billing procedure that could reach them.
+        for (const spy of [h.previewUpgrade, h.confirmUpgrade, h.createStripeClient, h.createStripeRequest, h.billingCaller]) {
+            expect(spy).not.toHaveBeenCalled();
+        }
         // Positive control: the spies are live, the size write on the same setup does reach them.
         await caller().mcpSetSetting(write('computer.size', 'std-2', mine));
         expect(h.getDeps).toHaveBeenCalled();
