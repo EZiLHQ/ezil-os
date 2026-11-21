@@ -522,7 +522,10 @@ export async function syncEditor(db: SessionDb, computer: { id: string; userId: 
             // The owner row lock also serializes handouts and incoming reports.
             const held = await tx.execute(sql`/* agent-session:active-before-handoff */
                 SELECT 1 FROM public.ezil_agent_operations WHERE computer_id = ${computer.id}::uuid
-                AND user_id = ${computer.userId}::uuid AND status IN ('delivered', 'running', 'cancel_requested') LIMIT 1`);
+                AND user_id = ${computer.userId}::uuid AND status IN ('delivered', 'running', 'cancel_requested')
+                ${controls ? sql`UNION ALL SELECT 1 FROM public.ezil_control_operations WHERE computer_id = ${computer.id}::uuid
+                    AND user_id = ${computer.userId}::uuid AND status = 'delivered'` : sql``}
+                LIMIT 1`);
             if (held.length > 0) return wait;
         }
         if (same && body.seq <= Number(row.last_seq)) return { owner: 'replayed' };
