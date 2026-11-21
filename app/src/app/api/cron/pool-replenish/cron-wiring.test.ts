@@ -18,14 +18,23 @@ it('the real authenticated GET drives demand, planner, lock and lifecycle dispat
     const f = poolFixture();
     f.deps.data.readPoolDemand = vi.fn(async () => demandFixture());
     f.deps.data.planPool = vi.fn(() => ({ target: 1, provision: 1, retire: [], fail: [] }));
+    const order: string[] = [];
     const deps: PoolReplenishDeps = { db: f.deps.db, data: f.deps.data, classes: [{ region: f.row.region, zoneId: f.row.zoneId, instanceType: 'm6i.large' }],
         deployments: { [f.row.region]: f.deployment }, now: () => new Date(), withLock: vi.fn(async fn => fn()), log: vi.fn(),
-        starter: { start: vi.fn(async () => {}) }, store: {
+        starter: { start: vi.fn(async () => { order.push('launch'); }) }, store: {
+            reconcile: vi.fn(async () => { order.push('pending'); }),
+            reconcileSettledFailures: vi.fn(async (before, budget) => {
+                expect(before).toBeInstanceOf(Date);
+                expect(budget).toBeGreaterThan(0);
+                expect(budget).toBeLessThanOrEqual(8_000);
+                order.push('historical');
+            }),
             prepare: vi.fn(async (_tx, _c, _op, build) => build({ ...f.row, instanceId: null })), outcome: vi.fn(async () => {}) } };
     mocks.runtime.mockReturnValue(deps);
     const response = await GET(new Request('https://test', { headers: { authorization: 'Bearer correct' } }));
     expect(response.status).toBe(200); expect(deps.starter.start).toHaveBeenCalledOnce();
     expect(deps.withLock).toHaveBeenCalledOnce(); expect(deps.log).toHaveBeenCalledOnce();
+    expect(order).toEqual(['pending', 'launch', 'historical']);
 });
 it('returns a retryable failure while durable pool dispatch integration is unavailable', async () => {
     vi.stubEnv('CRON_SECRET', 'correct'); mocks.runtime.mockImplementation(() => { throw new Error('unwired'); });

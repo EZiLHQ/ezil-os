@@ -95,7 +95,7 @@ export interface AwsCredentials {
     expiration: Date;
 }
 export interface Sender {
-    send(command: unknown): Promise<unknown>;
+    send(command: unknown, options?: { abortSignal: AbortSignal }): Promise<unknown>;
 }
 
 /** Credentials are refreshed this long before they expire. */
@@ -253,7 +253,7 @@ export function createSfnLifecycleStarter(sfnFor: (region: string) => RegionalCl
 /** `DescribeExecution` of one computer job, in `region`, under the caller role's account. */
 export function createSfnExecutionReader(sfnFor: (region: string) => RegionalClient): LifecycleExecutionReader {
     return {
-        async history(region, executionArn) {
+        async history(region, executionArn, signal) {
             assertRegion(region);
             const m = EXECUTION_ARN.exec(executionArn);
             if (!m) throw new AwsClientError('aws_config', false, 'ExecutionArnInvalid');
@@ -265,8 +265,10 @@ export function createSfnExecutionReader(sfnFor: (region: string) => RegionalCli
             for (let page = 0; page < 100; page++) {
                 let out: GetExecutionHistoryCommandOutput;
                 try {
-                    out = await client.send(new GetExecutionHistoryCommand({ executionArn, nextToken,
-                        maxResults: 1000, reverseOrder: false, includeExecutionData: true })) as GetExecutionHistoryCommandOutput;
+                    signal?.throwIfAborted();
+                    const command = new GetExecutionHistoryCommand({ executionArn, nextToken,
+                        maxResults: 1000, reverseOrder: false, includeExecutionData: true });
+                    out = await (signal ? client.send(command, { abortSignal: signal }) : client.send(command)) as GetExecutionHistoryCommandOutput;
                 } catch (error) { throw toAwsClientError(error); }
                 bytes += Buffer.byteLength(JSON.stringify(out));
                 if (!Array.isArray(out.events) || events.length + out.events.length > 10000 || bytes > 8 * 1024 * 1024)
@@ -279,7 +281,7 @@ export function createSfnExecutionReader(sfnFor: (region: string) => RegionalCli
             }
             throw new AwsClientError('aws_error', true, 'ExecutionHistoryBound');
         },
-        async describe(region, executionArn) {
+        async describe(region, executionArn, signal) {
             assertRegion(region);
             const m = EXECUTION_ARN.exec(executionArn);
             if (!m) throw new AwsClientError('aws_config', false, 'ExecutionArnInvalid');
@@ -288,7 +290,9 @@ export function createSfnExecutionReader(sfnFor: (region: string) => RegionalCli
             if (m[2] !== account) throw new AwsClientError('aws_config', false, 'ExecutionAccountMismatch');
             let out: { status?: string; output?: string; error?: string; cause?: string; startDate?: Date; stopDate?: Date; input?: string; executionArn?: string; stateMachineVersionArn?: string; stateMachineAliasArn?: string; redriveCount?: number };
             try {
-                out = (await client.send(new DescribeExecutionCommand({ executionArn }))) as typeof out;
+                signal?.throwIfAborted();
+                const command = new DescribeExecutionCommand({ executionArn });
+                out = await (signal ? client.send(command, { abortSignal: signal }) : client.send(command)) as typeof out;
             } catch (error) {
                 throw toAwsClientError(error);
             }

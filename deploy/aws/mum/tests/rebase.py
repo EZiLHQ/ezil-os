@@ -1378,8 +1378,8 @@ class ProductionObserverTransitionTests(unittest.TestCase):
 
     def test_selects_the_workflow_observer_and_keeps_both_recovery_roles(self):
         self.assertEqual(self.cfn.transition_observer_versions(self.before), self.fixture.OLD)
-        carried = self.cfn.carry_production_predecessor(self.before, self.after)
-        self.assertEqual(carried, self.cfn.carry_production_predecessor(self.before, carried))
+        carried = self.cfn.carry_production_predecessor(self.before, self.after, retain_launch_image=False)
+        self.assertEqual(carried, self.cfn.carry_production_predecessor(self.before, carried, retain_launch_image=False))
         for logical in [self.cfn.PRODUCTION_LIFECYCLE_RETAINED_POLICY, self.retained_version, *self.older.values()]:
             self.assertEqual(carried['Resources'][logical], self.before['Resources'][logical])
         self.assertEqual(carried['Resources'][self.cfn.IMAGE_RECOVERY_ROLE],
@@ -1389,7 +1389,7 @@ class ProductionObserverTransitionTests(unittest.TestCase):
             self.cfn.preserve_transition_versions(self.before, self.after)
 
     def test_lifecycle_policy_atomically_keeps_exact_predecessor_on_existing_attachment(self):
-        after = self.cfn.carry_production_predecessor(self.before, self.after)
+        after = self.cfn.carry_production_predecessor(self.before, self.after, retain_launch_image=False)
         resources = after['Resources']
         logical = self.cfn.LIFECYCLE_CONTROLLER_POLICY
         old = self.before['Resources'][logical]
@@ -1414,7 +1414,7 @@ class ProductionObserverTransitionTests(unittest.TestCase):
         planned = self.after['Resources'][self.cfn.PRODUCTION_LIFECYCLE_TRANSITION_POLICY]
         planned['Properties']['Roles'] = [{'Ref': self.cfn.IMAGE_RECOVERY_ROLE}]
         with self.assertRaisesRegex(ValueError, 'standalone grant does not match'):
-            self.cfn.carry_production_predecessor(self.before, self.after)
+            self.cfn.carry_production_predecessor(self.before, self.after, retain_launch_image=False)
 
     def test_refuses_ambiguous_observer_and_invalid_predecessor_grants(self):
         for change in ('ambiguous', 'wildcard', 'other_function', 'missing_current', 'legacy_role'):
@@ -1438,7 +1438,7 @@ class ProductionObserverTransitionTests(unittest.TestCase):
                 self.cfn.transition_observer_versions(before)
 
     def test_candidate_transition_requires_the_active_recovery_role(self):
-        after = self.cfn.carry_production_predecessor(self.before, self.after)
+        after = self.cfn.carry_production_predecessor(self.before, self.after, retain_launch_image=False)
         policy = after['Resources']['RecoveryTransitionObserverPolicy11111111']['Properties']
         policy['Roles'] = [{'Ref': self.cfn.LEGACY_RECOVERY_ROLE}]
         with self.assertRaisesRegex(ValueError, 'same role'):
@@ -1454,11 +1454,11 @@ class ProductionObserverTransitionTests(unittest.TestCase):
         self.before['Resources'][logical] = copy.deepcopy(policy)
         self.before['Resources'][logical]['Properties']['PolicyDocument']['Statement'].append(history)
         self.after['Resources'][logical] = policy
-        after = self.cfn.carry_production_predecessor(self.before, self.after)
+        after = self.cfn.carry_production_predecessor(self.before, self.after, retain_launch_image=False)
         self.assertEqual(after['Resources'][logical], self.before['Resources'][logical])
         policy['Properties']['Roles'] = [{'Ref': self.cfn.IMAGE_RECOVERY_ROLE}]
         with self.assertRaisesRegex(ValueError, 'exact predecessor history role'):
-            self.cfn.carry_production_predecessor(self.before, self.after)
+            self.cfn.carry_production_predecessor(self.before, self.after, retain_launch_image=False)
 
 
 class HistoryContextTransitionTests(ObserverTransitionTests):

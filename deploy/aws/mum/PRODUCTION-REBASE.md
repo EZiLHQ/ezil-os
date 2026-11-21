@@ -95,6 +95,12 @@ against a live provider in developing this contribution.
    exact admitted source manifest with `retained_lifecycle_source`. Preserve
    the old AMI/LT-scoped launch, immutable observer invocation and history-read
    capabilities: full-tuple rollback does not restore CloudFormation IAM.
+   For an image-to-image release, apply `carry_production_predecessor` to the
+   exact before and synthesized workflow templates before generating the IAM
+   review and change set. The existing lifecycle controller policy must keep
+   `ec2:RunInstances` on both the currently deployed AMI and the candidate AMI,
+   under the same region and launch-template conditions. Planning and apply
+   verify those image IDs against the reviewed release tuple.
    The scheduled reconciler is current-version-only; use the normal signed
    `reconcile-release` operation for an old failed release under its matching
    old tuple, rather than claiming an extra ListExecutions grant reconciles it.

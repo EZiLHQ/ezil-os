@@ -578,8 +578,8 @@ def projected_observer_grant(logical, left, right, target):
 
 
 def _groups_observer_grants(policy_logical):
-    """Only the PRD lifecycle controller default policy may group its exact observer grants (aggregate role quota)."""
-    return context.NAMESPACE == 'prd' and policy_logical == LIFECYCLE_CONTROLLER_POLICY
+    """Both exact production controller attachments can group their own immutable observer grants."""
+    return context.NAMESPACE == 'prd' and policy_logical in (LIFECYCLE_CONTROLLER_POLICY, PRODUCTION_LIFECYCLE_RETAINED_POLICY)
 
 
 def _grouped_observer_refs(row):
@@ -778,7 +778,124 @@ def _production_archived_observer_rows(resources, policy, previous, current):
             if row['Resource'] not in ({'Ref': previous}, {'Ref': current})]
 
 
-def carry_production_predecessor(before, synthesized, *, compact_observer_grants=False):
+def production_launch_image(resources, deployment):
+    """Read the controller's exact AMI-scoped RunInstances row and its literal images."""
+    context.scope(deployment)
+    for field, prefix in (('amiId', 'ami'), ('subnetId', 'subnet'), ('securityGroupId', 'sg'),
+                          ('launchTemplateId', 'lt')):
+        need(manifest.matches(rf'{prefix}-[0-9a-f]{{17}}', deployment.get(field, '')),
+             'invalid production launch scope')
+    region, account = deployment['region'], deployment['accountId']
+    ec2 = f'arn:aws:ec2:{region}:{account}:'
+    image = f'arn:aws:ec2:{region}::image/'
+    current_image = image + deployment['amiId']
+    template = ec2 + 'launch-template/' + deployment['launchTemplateId']
+    required = {ec2 + 'subnet/' + deployment['subnetId'], ec2 + 'security-group/' + deployment['securityGroupId'],
+                template, ec2 + 'network-interface/*'}
+    controller = resources.get(LIFECYCLE_CONTROLLER_POLICY, {})
+    properties = controller.get('Properties', {})
+    role = {'Ref': LIFECYCLE_CONTROLLER}
+    need(controller.get('Type') == 'AWS::IAM::Policy'
+         and properties.get('Roles') == [role] and properties.get('PolicyName') == LIFECYCLE_CONTROLLER_POLICY,
+         'production launch controller policy attachment mismatch')
+    matches = []
+    for name, policy in resources.items():
+        if policy.get('Type') != 'AWS::IAM::Policy' or role not in policy.get('Properties', {}).get('Roles', []):
+            continue
+        for row in statements(policy):
+            actions = action_set(row)
+            if row.get('Effect') != 'Allow' or not any(fnmatch.fnmatchcase('ec2:runinstances', action) for action in actions):
+                continue
+            targets = row.get('Resource')
+            if isinstance(targets, str):
+                targets = [targets]
+            literal = isinstance(targets, list) and bool(targets) and all(isinstance(t, str) for t in targets)
+            if literal and set(targets) <= {ec2 + 'instance/*', ec2 + 'volume/*'} and actions == {'ec2:runinstances'}:
+                continue
+            need(name == LIFECYCLE_CONTROLLER_POLICY and literal and actions == {'ec2:runinstances'}
+                 and set(row) == {'Effect', 'Action', 'Resource', 'Condition'} and isinstance(row['Resource'], list)
+                 and row['Condition'] == {'StringEquals': {'aws:RequestedRegion': region},
+                                          'ArnEquals': {'ec2:LaunchTemplate': template}},
+                 'production launch image row scope changed')
+            images = {t for t in targets if manifest.matches(image + r'ami-[0-9a-f]{17}', t)}
+            need(current_image in images and len(images) in (1, 2) and len(set(targets)) == len(targets)
+                 and set(targets) - images == required, 'production launch image resources changed')
+            matches.append((row, current_image, images))
+    need(len(matches) == 1, 'exactly one production launch image row required')
+    return matches[0]
+
+
+def carry_production_launch_image(before, candidate):
+    old_deployment, new_deployment = _deployment_settings(before), _deployment_settings(candidate)
+    old_role = before['Resources'].get(LIFECYCLE_CONTROLLER, {})
+    need(old_role.get('Type') == 'AWS::IAM::Role' and old_role == candidate['Resources'].get(LIFECYCLE_CONTROLLER),
+         'production launch controller role changed')
+    old_row, old_image, old_images = production_launch_image(before['Resources'], old_deployment)
+    new_row, new_image, new_images = production_launch_image(candidate['Resources'], new_deployment)
+    old_scope = {k: v for k, v in old_row.items() if k not in ('Action', 'Resource')}
+    new_scope = {k: v for k, v in new_row.items() if k not in ('Action', 'Resource')}
+    need(old_scope == new_scope and set(old_row['Resource']) - old_images == set(new_row['Resource']) - new_images,
+         'production launch permissions changed outside the AMI')
+    required_images = old_images if old_image == new_image else {old_image, new_image}
+    need(new_images <= required_images, 'production launch grants an unexpected image')
+    new_row['Resource'].extend(sorted(required_images - new_images))
+
+
+def bind_production_launch_images(before, after, source_ami, candidate_ami):
+    if _image_mode(before) and _production_split_recovery(before['Resources']):
+        need(all(manifest.matches(r'ami-[0-9a-f]{17}', image) for image in (source_ami, candidate_ami))
+             and _deployment_settings(before).get('amiId') == source_ami
+             and _deployment_settings(after).get('amiId') == candidate_ami,
+             'production launch images disagree with the admitted source and candidate')
+
+
+def retained_lifecycle_observer_rows(resources):
+    legacy = resources.get(PRODUCTION_LIFECYCLE_RETAINED_POLICY, {})
+    legacy_properties = legacy.get('Properties', {})
+    raw = list(statements(legacy))
+    legacy_rows = _observer_invoke_rows(legacy, PRODUCTION_LIFECYCLE_RETAINED_POLICY)
+    need(raw == legacy_rows or (len(raw) == 1 and len(legacy_rows) >= 2 and isinstance(raw[0].get('Resource'), list)),
+         'retained lifecycle policy must contain only exact immutable observer grants')
+    need(legacy.get('Type') == 'AWS::IAM::Policy'
+         and legacy_properties.get('PolicyName') == PRODUCTION_LIFECYCLE_RETAINED_POLICY
+         and legacy_properties.get('Roles') == [{'Ref': LIFECYCLE_CONTROLLER}]
+         and bool(legacy_rows), 'production retained lifecycle policy identity mismatch')
+    for row in legacy_rows:
+        target = row.get('Resource')
+        need(set(row) == {'Action', 'Effect', 'Resource'} and row.get('Effect') == 'Allow'
+             and action_set(row) == {'lambda:invokefunction'} and isinstance(target, dict)
+             and set(target) == {'Ref'} and isinstance(target['Ref'], str),
+             'retained lifecycle policy must use exact immutable observer grants')
+        logical = target['Ref']
+        version = resources.get(logical, {})
+        need(manifest.matches(r'LifecycleObserverCurrentVersion[0-9A-F]{8}[a-f0-9]{32}', logical)
+             and version.get('Type') == 'AWS::Lambda::Version'
+             and version.get('Properties') == {'FunctionName': {'Ref': LIFECYCLE_OBSERVER}}
+             and version.get('DeletionPolicy') == version.get('UpdateReplacePolicy') == 'Retain',
+             'retained lifecycle policy must invoke its own retained observer version')
+    need(len({row['Resource']['Ref'] for row in legacy_rows}) == len(legacy_rows),
+         'duplicate retained lifecycle observer grant')
+    return legacy_rows
+
+
+def compact_retained_lifecycle_grants(template):
+    """Make a preparatory policy-only template with the same exact retained grants."""
+    from copy import deepcopy
+
+    resources = template['Resources']
+    need(_image_mode(template) and _production_split_recovery(resources),
+         'retained grant compaction requires the production image-mode graph')
+    grants = retained_lifecycle_observer_rows(resources)
+    compacted = deepcopy(template)
+    if len(grants) > 1:
+        view = compacted['Resources'][PRODUCTION_LIFECYCLE_RETAINED_POLICY]['Properties']['PolicyDocument']
+        group = {**grants[0], 'Resource': [row['Resource'] for row in grants]}
+        _grouped_observer_refs(group)
+        view['Statement'] = [group]
+    return compacted
+
+
+def carry_production_predecessor(before, synthesized, *, compact_observer_grants=False, retain_launch_image=True):
     """Carry the exact PRD split rollback resources into a local CDK template.
 
     Prepare a compact controller policy when requested. Validation keeps the
@@ -793,6 +910,8 @@ def carry_production_predecessor(before, synthesized, *, compact_observer_grants
          'production split recovery graph must survive synthesis')
     candidate = deepcopy(synthesized)
     new = candidate['Resources']
+    if retain_launch_image:
+        carry_production_launch_image(before, candidate)
 
     def carry_resource(logical):
         need(logical in old and (logical not in new or new[logical] == old[logical]),
@@ -811,28 +930,16 @@ def carry_production_predecessor(before, synthesized, *, compact_observer_grants
         else:
             rows.append(deepcopy(row))
 
-    legacy = old.get(PRODUCTION_LIFECYCLE_RETAINED_POLICY, {})
-    legacy_properties = legacy.get('Properties', {})
-    legacy_rows = list(statements(legacy))
-    need(legacy.get('Type') == 'AWS::IAM::Policy'
-         and legacy_properties.get('PolicyName') == PRODUCTION_LIFECYCLE_RETAINED_POLICY
-         and legacy_properties.get('Roles') == [{'Ref': LIFECYCLE_CONTROLLER}]
-         and bool(legacy_rows), 'production retained lifecycle policy identity mismatch')
-    for row in legacy_rows:
-        target = row.get('Resource')
-        need(set(row) == {'Action', 'Effect', 'Resource'} and row.get('Effect') == 'Allow'
-             and action_set(row) == {'lambda:invokefunction'} and isinstance(target, dict)
-             and set(target) == {'Ref'} and isinstance(target['Ref'], str),
-             'retained lifecycle policy must use exact immutable observer grants')
-        logical = target['Ref']
-        version = old.get(logical, {})
-        need(manifest.matches(r'LifecycleObserverCurrentVersion[0-9A-F]{8}[a-f0-9]{32}', logical)
-             and version.get('Type') == 'AWS::Lambda::Version'
-             and version.get('Properties') == {'FunctionName': {'Ref': LIFECYCLE_OBSERVER}}
-             and version.get('DeletionPolicy') == version.get('UpdateReplacePolicy') == 'Retain',
-             'retained lifecycle policy must invoke its own retained observer version')
-        carry_resource(logical)
-    carry_resource(PRODUCTION_LIFECYCLE_RETAINED_POLICY)
+    legacy = PRODUCTION_LIFECYCLE_RETAINED_POLICY
+    for row in retained_lifecycle_observer_rows(old):
+        carry_resource(row['Resource']['Ref'])
+    if legacy in new and new[legacy] != old[legacy]:
+        # Free quota before a later changeset expands the default policy. A
+        # different action/resource or concurrent resize is refused.
+        need(retain_launch_image and candidate == compact_retained_lifecycle_grants(before),
+             'retained grant compaction must be an exact preparatory change')
+    else:
+        carry_resource(legacy)
 
     previous = transition_observer_versions(before)
     for key, (policy, function, prefix) in TRANSITION_OBSERVERS.items():
@@ -919,7 +1026,7 @@ def preserve_legacy_lifecycle(before, after):
              'retained lifecycle reader loses an admitted history capability')
 
 
-def validate_templates(phase, before, after, review, unchanged=False, pool_iam=None):
+def validate_templates(phase, before, after, review, unchanged=False, pool_iam=None, *, retain_launch_image=True):
     context.identities(before)
     context.identities(after)
     need(set(review)=={'schemaVersion','changes'} and type(review['schemaVersion']) is int and review['schemaVersion']==1,'invalid exact template review')
@@ -1062,7 +1169,7 @@ def validate_templates(phase, before, after, review, unchanged=False, pool_iam=N
             actual[logical]=entry
     need(actual==review['changes'] and (bool(actual) or action_reorder),'review does not exactly enumerate template changes')
     if phase == 'workflows':
-        need(carry_production_predecessor(before, after) == after,
+        need(carry_production_predecessor(before, after, retain_launch_image=retain_launch_image) == after,
              'candidate omits an exact production predecessor grant')
         preserve_legacy_lifecycle(before, after)
         preserve_transition_versions(before, after)
@@ -1142,12 +1249,18 @@ def execute(phase, spec, directory, apply, aws, write, digest, sleep=time.sleep,
     before=manifest.read(spec['beforeTemplatePath']);after=manifest.read(spec['candidateTemplatePath']);review=manifest.read(spec['reviewPath'])
     for name in ('beforeTemplate','candidateTemplate','review'):
         need(digest(spec[name+'Path'])==spec[name+'Sha256'],'reviewed CloudFormation artifact changed')
+    review_iam = load_pool_iam(pool_iam, digest)
+    retain_launch_image = (pool_iam or {}).get('schemaVersion') == 2
     allowed=validate_templates(phase,before,after,review,unchanged=spec['changeSetArn'] is None,
-                               pool_iam=load_pool_iam(pool_iam,digest))
+                               pool_iam=review_iam,retain_launch_image=retain_launch_image)
     if spec['changeSetArn'] is None:
         return unchanged_identity(spec,after,apply,aws)
     cs=aws('cloudformation','describe-change-set','--stack-name',spec['stackName'],'--change-set-name',spec['changeSetArn'],'--include-property-values')
     need(cs['ChangeSetId']==spec['changeSetArn'] and cs['StackName']==spec['stackName'] and not cs.get('NextToken'),'change-set identity/pagination mismatch')
+    if phase == 'workflows' and context.NAMESPACE == 'prd' and (retain_launch_image or cs['ExecutionStatus'] == 'AVAILABLE'):
+        bind_production_launch_images(before, after, spec.get('sourceAmiId'), spec.get('amiId'))
+        if not retain_launch_image:
+            validate_templates(phase, before, after, review, pool_iam=review_iam)
     submitted=template_body(aws('cloudformation','get-template','--stack-name',spec['stackName'],'--change-set-name',spec['changeSetArn'],'--template-stage','Original'))
     need(submitted==after,'submitted template differs from reviewed candidate')
     stacks=aws('cloudformation','describe-stacks','--stack-name',spec['stackName'])['Stacks'];need(len(stacks)==1,'one stack required');stack=stacks[0]

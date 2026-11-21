@@ -64,10 +64,11 @@ import { usageFor, utcMonthStart, type MonthUsage } from './usage';
 /** Read-only `DescribeExecution` in the placement's region (Step Functions). */
 export interface LifecycleExecutionReader {
     /** Complete, bounded execution history, read with the same regional caller. */
-    history?(region: string, executionArn: string): Promise<import("@aws-sdk/client-sfn").HistoryEvent[]>;
+    history?(region: string, executionArn: string, signal?: AbortSignal): Promise<import("@aws-sdk/client-sfn").HistoryEvent[]>;
     describe(
         region: string,
         executionArn: string,
+        signal?: AbortSignal,
     ): Promise<{ status: string; output?: string | null; error?: string | null; cause?: string | null; startDate?: Date | null; stopDate?: Date | null; input?: string; executionArn?: string; stateMachineVersionArn?: string; stateMachineAliasArn?: string; redriveCount?: number }>;
 }
 

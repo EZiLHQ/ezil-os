@@ -664,6 +664,19 @@ describe('bounded provider execution history', () => {
         expect(sender.calls.map(input)).toEqual([undefined, 'next'].map(nextToken => ({ executionArn: EXECUTION, nextToken,
             maxResults: 1000, reverseOrder: false, includeExecutionData: true })));
     });
+    it('cancels both versioned provider reads and stops history pagination after an abort', async () => {
+        const stop = new AbortController();
+        const send = vi.fn(async (command: unknown, options?: { abortSignal: AbortSignal }) => {
+            expect(options?.abortSignal).toBe(stop.signal);
+            if (cmdName(command) === 'DescribeExecutionCommand') return { status: 'FAILED' };
+            stop.abort();
+            return { events: [], nextToken: 'must-not-read' };
+        });
+        const reader = createSfnExecutionReader(regional({ send }));
+        await expect(reader.describe(R, EXECUTION, stop.signal)).resolves.toMatchObject({ status: 'FAILED' });
+        await expect(reader.history!(R, EXECUTION, stop.signal)).rejects.toThrow();
+        expect(send.mock.calls.map(([command]) => cmdName(command))).toEqual(['DescribeExecutionCommand', 'GetExecutionHistoryCommand']);
+    });
     it.each(['region', 'account', 'name'])('refuses invalid %s before a history request', async fault => {
         const sender = fakeSender(() => ({ events: [] }));
         await expect(createSfnExecutionReader(regional(sender, fault === 'account' ? '999999999999' : A)).history!(fault === 'region' ? 'ap-south-1' : R,

@@ -11,6 +11,9 @@ import { readPoolDemand, poolHostFromRow, POOL_TYPES } from './ready-pool';
 import type { PoolDispatchStore } from './aws-pool-replenish';
 import { poolGuard } from './aws-pool-errors';
 import { parseRebaseJson } from './aws-rebase-json';
+import { proveFailedBeforeObservation } from './aws-failed-release-proof';
+import { provePoolLaunchDenied } from './aws-pool-provision-failure-proof';
+import { PollDeadline } from './poll-wait';
 const rows = (r: unknown): Record<string, unknown>[] => Array.isArray(r) ? r : (r as { rows: Record<string, unknown>[] }).rows;
 export function storedPoolWork(row: Record<string, unknown>): LifecycleWork {
     const envelope = parseRebaseJson(String(row.lifecycle_input), 20000) as { document: string; digest: string };
@@ -70,6 +73,62 @@ export async function neverLaunched(executions: LifecycleExecutionReader, region
     return failed.executionFailedEventDetails?.error === 'LifecycleRefused' && entered.length === 3
         && entered[0] === 'Observe-initial' && LAUNCH_STATES.has(entered[1] ?? '') && entered[2] === 'Observe-instance'
         ? 'proven' : 'unproven';
+}
+
+// Both the inventory and the final CAS exclude any instance, enrollment or lease evidence.
+const UNBOUND_FAILED_PROVISION = sql`state = 'failed' AND dispatch_status = 'settled'
+    AND instance_id IS NULL AND enrolled_at IS NULL AND ready_at IS NULL AND editor_ready_at IS NULL AND session_ready_at IS NULL
+    AND leased_computer_id IS NULL AND leased_generation IS NULL AND lease_token IS NULL AND leased_at IS NULL
+    AND claim_generation IS NULL AND claim_lease_epoch IS NULL AND claim_fence IS NULL AND claim_volume_serial IS NULL`;
+
+const SETTLED_PROOF_ATTEMPT_MS = 2_000;
+async function retireUnlaunchedSettledProvisions(db: PlacementDb, executions: LifecycleExecutionReader, before: string,
+    deadline: PollDeadline): Promise<void> {
+    const readHistory = executions.history;
+    if (!readHistory) return;
+    // Give later rows a chance even if some histories are permanently unreadable. Newly settled work waits for the next pass.
+    let failed;
+    try {
+        failed = rows(await deadline.read(() => db.execute(sql`SELECT * FROM public.ezil_compute_pool_hosts
+            WHERE ${UNBOUND_FAILED_PROVISION} AND updated_at < ${before}::timestamptz
+                AND lifecycle_job_id IS NOT NULL AND lifecycle_digest IS NOT NULL AND lifecycle_input IS NOT NULL
+            ORDER BY random() LIMIT 8`)));
+    } catch { return; }
+    for (const row of failed) {
+        const budget = Math.min(deadline.remaining(), SETTLED_PROOF_ATTEMPT_MS);
+        if (budget <= 0) break;
+        // The SDK receives cancellation as well as the caller's hard elapsed deadline.
+        const abort = new AbortController();
+        const attempt = new PollDeadline(budget, abort.signal);
+        const timer = setTimeout(() => abort.abort(), budget);
+        let work: LifecycleWork;
+        try {
+            work = storedPoolWork(row);
+            const i = work.intent;
+            if (i.operation !== 'pool-provision' || i.providerInstanceId !== null || i.dataVolumeId !== null) continue;
+            const region = i.deployment.region;
+            const arn = lifecycleExecutionArn(i.deployment, i.jobId);
+            const execution = await attempt.read(() => executions.describe(region, arn, abort.signal));
+            if (execution.status !== 'FAILED' || execution.executionArn !== arn || execution.input !== work.input
+                || execution.stateMachineVersionArn !== work.stateMachineArn || execution.stateMachineAliasArn
+                || execution.redriveCount !== 0) continue;
+            const history = await attempt.read(() => readHistory.call(executions, region, arn, abort.signal));
+            if (!proveFailedBeforeObservation(execution, history, work) && !provePoolLaunchDenied(execution, history, work)) continue;
+            deadline.check();
+        } catch {
+            // A missing execution, malformed stored work or incomplete provider read does not release capacity.
+            continue;
+        } finally {
+            clearTimeout(timer);
+            abort.abort();
+        }
+        const i = work.intent;
+        await db.execute(sql`UPDATE public.ezil_compute_pool_hosts SET state = 'retired', updated_at = now()
+            WHERE id = ${i.poolHostId}::uuid AND generation = ${i.poolGeneration}
+                AND region = ${i.deployment.region} AND zone_id = ${i.deployment.zoneId} AND instance_type = ${i.instanceType}
+                AND lifecycle_job_id = ${i.jobId}::uuid AND lifecycle_digest = ${work.digest} AND lifecycle_input = ${work.input}
+                AND ${UNBOUND_FAILED_PROVISION}`);
+    }
 }
 
 export function createPoolDispatchStore(db: PlacementDb, env: Env,
@@ -164,6 +223,11 @@ export function createPoolDispatchStore(db: PlacementDb, env: Env,
                         WHERE id = ${i.poolHostId}::uuid AND lifecycle_job_id = ${i.jobId}::uuid AND lifecycle_digest = ${work.digest}
                         AND leased_computer_id IS NULL`);
                 }
+            }
+        },
+        async reconcileSettledFailures(before, budget) {
+            if (sdk.executions && budget > 0) {
+                await retireUnlaunchedSettledProvisions(db, sdk.executions, before.toISOString(), new PollDeadline(budget));
             }
         },
         async canRetire(tx, id) {

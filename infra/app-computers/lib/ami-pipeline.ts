@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { gzipSync } from 'node:zlib';
 import {
     CfnCondition, CfnOutput, CfnParameter, CfnRule, Fn, Stack, type StackProps,
     aws_iam as iam, aws_imagebuilder as imagebuilder,
@@ -27,6 +28,39 @@ export const AmiConfigSchema = z.object({
     path: ['nativeCandidateParentAmi'],
 });
 export type AmiConfig = z.infer<typeof AmiConfigSchema>;
+
+function hostComponentData(config: AmiConfig): string {
+    const base = readFileSync(join(__dirname, '../../host-agent/ami/imagebuilder-component.yaml'), 'utf8');
+    if (config.namespace !== 'prd' || config.nativeCandidate) return base;
+
+    // Keep the test source readable in Git while respecting Image Builder's
+    // 16,000-byte inline component limit. The payload contains no credentials.
+    const source = readFileSync(join(__dirname, 'standalone-git-imagebuilder.py'));
+    const encoded = gzipSync(source).toString('base64');
+    const bootstrap = [
+        'import base64, gzip, sys',
+        'source = gzip.decompress(base64.b64decode(sys.stdin.read().strip(), validate=True))',
+        'exec(compile(source, "standalone-git-imagebuilder.py", "exec"))',
+    ].join('; ');
+    const phase = [
+        '  - name: test',
+        '    steps:',
+        '      - name: QualifyStandaloneGit',
+        '        action: ExecuteBash',
+        '        timeoutSeconds: 150',
+        '        inputs:',
+        '          commands:',
+        '            - |',
+        '                /usr/bin/unshare --mount --propagation private -- /usr/bin/python3 -I -B -c \'' +
+            bootstrap + '\' \'{{ DesktopImageId }}\' \'{{ AgentSrcS3Uri }}\' <<\'EZIL_STANDALONE_GIT_TEST\'',
+        '                ' + encoded,
+        '                EZIL_STANDALONE_GIT_TEST',
+        '',
+    ].join('\n');
+    const data = base.trimEnd() + '\n' + phase;
+    if (Buffer.byteLength(data) > 16_000) throw new Error('AMI qualification component exceeds Image Builder inline data limit');
+    return data;
+}
 
 /** Founder change sets only: the workload boundary deliberately cannot grant
  * Image Builder's managed policies or create an EC2 instance profile. */
@@ -139,7 +173,7 @@ export class AmiPipelineStack extends Stack {
         });
         const component = new imagebuilder.CfnComponent(this, 'Component', {
             name, platform: 'Linux', version: c.version, tags,
-            data: readFileSync(join(__dirname, '../../host-agent/ami/imagebuilder-component.yaml'), 'utf8'),
+            data: hostComponentData(c),
         });
         const components: imagebuilder.CfnImageRecipe.ComponentConfigurationProperty[] = [{ componentArn: component.ref, parameters }];
         if (c.nativeCandidate) {

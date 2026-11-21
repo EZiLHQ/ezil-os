@@ -16,7 +16,7 @@ with tempfile.TemporaryDirectory(prefix='ezil-regcap2-suite.') as temp:
     root = Path(temp)
     shutil.copytree(ROOT / 'deploy/aws', root / 'deploy/aws', ignore=shutil.ignore_patterns('__pycache__'))
     # Cap parity reads the real app validators from this isolated fixture root.
-    for name in ('aws-intent.ts', 'aws-rebase-release.ts'):
+    for name in ('aws-intent.ts', 'aws-rebase-release.ts', 'aws-lower-attestation.ts'):
         relative = Path('app/src/server/lib/compute') / name
         (root / relative).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / relative, root / relative)
