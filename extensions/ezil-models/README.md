@@ -400,9 +400,16 @@ Bound scope of the attach:
 - No repository configuration is read (`.vscode/mcp.json` and similar stay
   inert) and no workspace program is ever executed. The ordinary terminal is
   unchanged.
+- The owner's modal gesture is the gate, per window and per folder. VS Code
+  workspace trust is not relied on: the image disables it
+  (`security.workspace.trust.enabled: false`), so the `isTrusted` check only
+  narrows and never grants.
 - The grant is in memory for this window only. It is never persisted: a new
   window, a reload or a restart starts at zero again. A change to the workspace
   folders detaches.
+- The extension host inherits the sandbox boot bearer secrets. No workspace
+  code is started with that environment, or at all: the only child Code spawns
+  is the packaged relay, and the extension-side server is in-process.
 - While granted, the extension owns a private Unix socket (0700 directory, 0600
   socket) that serves the MCP protocol. The packaged `dist/workspace-mcp-server.js`
   adapter only relays stdio to that socket; the socket path is its sole argument

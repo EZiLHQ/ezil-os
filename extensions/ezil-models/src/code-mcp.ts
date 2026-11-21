@@ -13,7 +13,11 @@ function localFolders(): string[] {
     return (vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri.scheme === 'file' && !folder.uri.authority ? folder.uri.fsPath : '');
 }
 
-/** The single trusted local folder a grant may name, or undefined. */
+/**
+ * The single local folder a grant may name, or undefined. The owner's modal gesture in this window is the gate:
+ * the hosted image disables VS Code workspace trust (editor-state.sh), so `isTrusted` is always true there and
+ * only ever narrows (a window with trust enabled and withheld cannot grant). It never widens anything.
+ */
 export function grantableFolder(): string | undefined {
     const folders = localFolders();
     return vscode.workspace.isTrusted && folders.length === 1 && folders[0] && path.isAbsolute(folders[0]) ? folders[0] : undefined;
