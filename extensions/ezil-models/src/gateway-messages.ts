@@ -618,7 +618,7 @@ export function gatewayInputTokens(model: Pick<ResolvedModel, 'maxInputTokens' |
     return Math.max(1, available - SUMMARY_RESERVE_TOKENS - SYSTEM_RESERVE_TOKENS - (model.toolReserve ?? DEFAULT_TOOL_RESERVE));
 }
 
-export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log?: (line: string) => void, required: ReadonlySet<DataPart> = new Set()): { body: GatewayBody; bytes: Uint8Array<ArrayBuffer> } {
+export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log?: (line: string) => void, required: ReadonlySet<DataPart> = new Set(), imagesAsNotes = false): { body: GatewayBody; bytes: Uint8Array<ArrayBuffer> } {
     const tools = gatewayTools(request.tools, log, geminiRoute(model.model));
     // Never a silent chat without its tools: when Copilot offered tools and none of them can be sent to this model,
     // refuse here (nothing sent, nothing charged) with what to do, rather than answer as if no tools existed.
@@ -627,7 +627,7 @@ export function buildGatewayBody(model: ResolvedModel, request: ChatRequest, log
             + 'features this model cannot take, or they are invalid; see the EZiL Models log). Nothing was sent or charged. Pick another model, '
             + 'or turn those tools off with Configure Tools', undefined, 'local_tools_unsupported', undefined, undefined, 'local');
     }
-    const imageInput = model.capabilities.imageInput && (model.gatewayProtocol ?? 'anthropic-messages') === 'anthropic-messages';
+    const imageInput = !imagesAsNotes && model.capabilities.imageInput && (model.gatewayProtocol ?? 'anthropic-messages') === 'anthropic-messages';
     const rawLimit = gatewayRequestBytes(model);
     const boundLimit = model.gatewayMaxRequestBytes === undefined ? Math.min(GATEWAY_INPUT_BYTES, model.maxInputTokens) : model.maxInputTokens;
     const serialize = (currentOnly: boolean) => {

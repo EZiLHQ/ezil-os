@@ -297,6 +297,21 @@ describe('provider: the user\'s image goes intact or the turn fails before sendi
         expect(JSON.stringify(h.posts[1])).toContain('[image omitted: not supported by this model]');
     });
 
+    test('a utility request on a vision model never forwards the image bytes', async () => {
+        const h = harness(config(true), true);
+        const model = config(true).models.find(row => row.model === SONNET)!;
+        const fetch = (async (input: string | URL | Request, init: RequestInit = {}) => {
+            if (String(input).endsWith('/models')) return Response.json(catalog(true));
+            h.posts.push(JSON.parse(new TextDecoder().decode(init.body as Uint8Array)));
+            return new Response(frames('end_turn').join(''), { headers: { 'content-type': 'text/event-stream' } });
+        }) as typeof globalThis.fetch;
+        const request = ask([msg('user', txt('Look at this'), image())]);
+        for await (const _ of gatewayChat(model, request, { signal: new AbortController().signal, fetch, imagesAsNotes: true })) { /* drain */ }
+        expect(h.posts).toHaveLength(1);
+        expect(JSON.stringify(h.posts[0])).toContain('[image omitted:');
+        expect(JSON.stringify(h.posts[0])).not.toContain(Buffer.from(SMALL).toString('base64'));
+    });
+
     test('an earlier message\'s image does not fail a later turn on a model without images', async () => {
         const h = harness(config(true), false);
         await send(h.provider, SONNET, [user(new TextPart('look'), new VsDataPart(SMALL, 'image/png')), { role: 2, content: [new TextPart('A chart.')] }, user(new TextPart('thanks'))]);

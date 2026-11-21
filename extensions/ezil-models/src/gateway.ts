@@ -70,7 +70,7 @@ export type GatewayOptions = {
      * observer cannot change the turn. */
     onOutcome?: (record: AppFailure) => void;
     /**
-     * Title, summary and progress calls only: an image that cannot go is a marked note. Otherwise (the default, fail
+     * Title, summary and progress calls only: all images are replaced with marked notes. Otherwise (the default, fail
      * closed) the request's current images go as images in every built copy, or nothing is sent.
      */
     imagesAsNotes?: boolean;
@@ -937,7 +937,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
         const builder = (limits: ResolvedModel) => (candidate: ChatRequest, scale: number) => {
             const scaled = scale === 1 ? limits : { ...limits, maxInputTokens: Math.max(1, Math.floor(limits.maxInputTokens * scale)),
                 gatewayMaxRequestBytes: Math.max(1, Math.floor(gatewayRequestBytes(limits) * scale)) };
-            return responses ? buildGatewayResponsesBody(scaled, candidate, log, !strict) : buildGatewayBody(scaled, candidate, log, required);
+            return responses ? buildGatewayResponsesBody(scaled, candidate, log, !strict) : buildGatewayBody(scaled, candidate, log, required, !strict);
         };
         const compact = (first: LocalRequestError, limits: ResolvedModel, cause?: 'remote') => {
             const compacted = compactRequest(request, first, builder(limits), cause);
