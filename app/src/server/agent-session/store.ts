@@ -100,6 +100,20 @@ export interface SessionEvent {
     status?: OpStatus;
 }
 
+/**
+ * The computer's own private workbench (worker/scripts/start-unattended-workbench.sh, docs/UNATTENDED-CODE.md) syncs
+ * with an owner id under this prefix; every other owner is a window a person opened. A person's window may take the
+ * bridge from an idle live private workbench; the private workbench never takes it from a live window, so instructions run in
+ * the window the person is looking at once active private requests finish. Normal lease expiry still records a lost
+ * held operation as `uncertain` and never redelivers it.
+ */
+export const UNATTENDED_OWNER_PREFIX = 'unattended.';
+export const isUnattendedOwner = (ownerId: string): boolean => ownerId.startsWith(UNATTENDED_OWNER_PREFIX);
+/** True only when a person's window is syncing while the private workbench holds the live lease. */
+export function attendedPreempts(currentOwnerId: string, incomingOwnerId: string): boolean {
+    return currentOwnerId !== incomingOwnerId && isUnattendedOwner(currentOwnerId) && !isUnattendedOwner(incomingOwnerId);
+}
+
 export class SessionStoreError extends Error {
     /** `reason` is a short code a caller may show (a definite refusal such as `effort_not_per_session`); never free text. */
     constructor(readonly code: 'NOT_FOUND' | 'CONFLICT' | 'BAD_REQUEST', readonly reason?: string) {
@@ -501,7 +515,16 @@ export async function syncEditor(db: SessionDb, computer: { id: string; userId: 
         const live = clock[0]!.live === true;
         const reowned = String(row.user_id) !== computer.userId;
         const same = !reowned && live && row.owner_id === body.ownerId;
-        if (!same && live && !reowned) return { owner: 'other', pollMs: OTHER_OWNER_POLL_MS };
+        if (!same && live && !reowned) {
+            const wait = { owner: 'other' as const, pollMs: OTHER_OWNER_POLL_MS };
+            if (!attendedPreempts(String(row.owner_id), body.ownerId)) return wait;
+            // Taking over an active request would discard its eventual model receipt.
+            // The owner row lock also serializes handouts and incoming reports.
+            const held = await tx.execute(sql`/* agent-session:active-before-handoff */
+                SELECT 1 FROM public.ezil_agent_operations WHERE computer_id = ${computer.id}::uuid
+                AND user_id = ${computer.userId}::uuid AND status IN ('delivered', 'running', 'cancel_requested') LIMIT 1`);
+            if (held.length > 0) return wait;
+        }
         if (same && body.seq <= Number(row.last_seq)) return { owner: 'replayed' };
         const epoch = same ? Number(row.epoch) : Number(row.epoch) + 1;
         await tx.execute(sql`/* agent-session:owner-take */

@@ -13,6 +13,7 @@ import { redact, type ResolvedModel, type ResolvedProvider } from './config';
 import { estimateMessageTokens, estimateTextTokens } from './tokens';
 import { isCacheMarker, isStatefulMarker, type ChatRequest, type Message, type Part, type Role, type Tool, type Usage } from './types';
 import { createHash, createHmac, randomBytes } from 'node:crypto';
+import { beginGatewayReceipt, conversationFingerprint } from './gateway-receipt';
 
 /** Role value of the proposed `languageModelSystem` API; guarded numerically so a missing proposal degrades to the value. */
 export const SYSTEM_ROLE = 3;
@@ -298,6 +299,10 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
      * EZiL Gateway providers only (see respond). Bounded; lost on reload, when the request goes without them as before.
      */
     readonly inferenceTrace = new InferenceRing();
+
+    beginBridgeReceipt(operationId: string, sessionResource: string, emit: (line: string) => void) {
+        return beginGatewayReceipt(this.continuationSecret, operationId, sessionResource, () => this.inferenceTrace.snapshot(), emit);
+    }
     private geminiThinking = new Map<string, { shape: string; parts: Part[]; token: string }>();
     private geminiScope = '';
     private geminiEpoch = randomBytes(16).toString('hex');
@@ -554,7 +559,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 });
             }
             diagnostic = new InferenceTrace(resolved.model, request, {
-                conversationId: sessionIdentity === null ? null : correlate(['session', sessionIdentity]),
+                conversationId: sessionIdentity === null ? null : conversationFingerprint(this.continuationSecret, sessionIdentity),
                 identifyCall: call => correlate(['call', sessionIdentity, model.id, call]),
             });
             // The signed-thinking fallback is for the EZiL Gateway only: its transport sends just its own Bearer credential

@@ -27,7 +27,7 @@ const PICKER = [
 ];
 
 function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, now = () => 1700000000000, acquireDelay = null, listDelay = null, openDelay = null, used = true,
-    picker = PICKER, startThrows = false, openFails = false, sticky = true, listEmpty = true } = {}) {
+    picker = PICKER, startThrows = false, openFails = false, sticky = true, listEmpty = true, userAgent = undefined, href = undefined } = {}) {
     const models = new Map();
     const loaded = new Map();
     const calls = { send: [], cancel: [], acquire: 0, disposed: 0, started: 0, opened: [], switched: [] };
@@ -138,7 +138,7 @@ function world({ sessions = ['s1', 's2'], open = ['s1'], lockedAgent = false, no
             return widget(resource.id);
         },
     };
-    const bridge = create({ chatService, chatWidgetService, workspaceFolders: () => ['vscode-remote://remote/workspace'], now, createdTimeoutMs: 20 });
+    const bridge = create({ chatService, chatWidgetService, workspaceFolders: () => ['vscode-remote://remote/workspace'], now, createdTimeoutMs: 20, ...(userAgent === undefined ? {} : { userAgent }), href });
     return { bridge, models, calls, open, widget, loaded, setNextSend: (fn) => { nextSend = fn; } };
 }
 

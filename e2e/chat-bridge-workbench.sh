@@ -9,7 +9,7 @@
 # Usage: PLAYWRIGHT_REQUIRE_DIR=/path/to/node_modules e2e/chat-bridge-workbench.sh <image> <patched workbench.js> <extension dir>
 # EZIL_E2E_SUITE=controls runs the protocol-2 suite instead (chat-bridge-controls-standin.mjs + chat-bridge-controls.mjs).
 set -euo pipefail
-IMAGE="$1"; WORKBENCH="$2"; EXT="$3"
+IMAGE="$1"; WORKBENCH="${2:-}"; EXT="${3:-}"
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$(mkdir -p "${EZIL_E2E_OUT:-./chat-bridge-e2e-out}" && cd "${EZIL_E2E_OUT:-./chat-bridge-e2e-out}" && pwd)"
 NAME="chat-bridge-e2e-$$"; NETWORK="chat-bridge-e2e-net-$$"; PORT="${EZIL_E2E_PORT:-18444}"
@@ -18,6 +18,13 @@ AI_TOKEN="$(openssl rand -hex 32)"; BRIDGE_TOKEN="$(openssl rand -hex 32)"
 FORWARD_PID=""
 STANDIN=chat-bridge-os-standin.mjs; DRIVER=chat-bridge-workbench.mjs; MODELS=copilot-ezil-models.json
 if [[ "${EZIL_E2E_SUITE:-}" == controls ]]; then STANDIN=chat-bridge-controls-standin.mjs; DRIVER=chat-bridge-controls.mjs; MODELS=copilot-ezil-models-controls.json; fi
+# A packaged image supplies every production binary. Only the model and OS fixture
+# are injected. There is no published port, external browser or user chat turn.
+if [[ "${EZIL_E2E_SUITE:-}" == unattended ]]; then
+  STANDIN=chat-bridge-controls-standin.mjs
+  DRIVER=chat-bridge-unattended.mjs
+  MODELS=copilot-ezil-models-controls.json
+fi
 cleanup() {
   [[ -n "$FORWARD_PID" ]] && kill "$FORWARD_PID" 2>/dev/null || true
   docker exec "$NAME" bash -c 'cat /tmp/standin.log /tmp/mock.log 2>/dev/null | tail -40' >"$OUT/servers.log" 2>&1 || true
@@ -34,9 +41,18 @@ ST="$WORK/stage"
 mkdir -p "$ST/etc/ezil" "$ST/home/neko/project" "$ST$VS/out/vs/code/browser/workbench" "$ST$VS/extensions/ezil.ezil-models/dist" "$ST/tmp/e2e"
 cp "$here/$MODELS" "$ST/etc/ezil/models.e2e.json"
 echo 'hello from the chat bridge e2e workspace' >"$ST/home/neko/project/README.md"
-cp "$WORKBENCH" "$ST$VS/out/vs/code/browser/workbench/workbench.js"
-cp "$EXT/package.json" "$ST$VS/extensions/ezil.ezil-models/package.json"
-cp "$EXT/dist/extension.js" "$ST$VS/extensions/ezil.ezil-models/dist/extension.js"
+if [[ "${EZIL_E2E_SUITE:-}" == unattended ]]; then
+  mkdir -p "$ST/home/neko/project/.ezil"
+  # Use the ordinary first-party OS seed, then apply the explicit fixture opt-in.
+  # Installed extension availability depends on the owner's workspace trust policy.
+  . "$here/../worker/scripts/editor-state.sh"
+  seed_codeserver_user_settings "$WORK/user-seed"
+  node -e 'const fs=require("fs"); const settings=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); settings["ezil.chatBridge.enabled"]=true; settings["ezil.chatBridge.unattended"]=true; fs.writeFileSync(process.argv[2],JSON.stringify(settings))' "$WORK/user-seed/User/settings.json" "$ST/home/neko/project/.ezil/settings.json"
+else
+  cp "$WORKBENCH" "$ST$VS/out/vs/code/browser/workbench/workbench.js"
+  cp "$EXT/package.json" "$ST$VS/extensions/ezil.ezil-models/package.json"
+  cp "$EXT/dist/extension.js" "$ST$VS/extensions/ezil.ezil-models/dist/extension.js"
+fi
 cp "$here/copilot-ezil-messages-mock.mjs" "$here/$STANDIN" "$ST/tmp/e2e/"
 
 docker network create --internal "$NETWORK" >/dev/null
@@ -51,6 +67,14 @@ docker create --name "$NAME" --network "$NETWORK" --cpus=2 --memory=6g \
   --entrypoint /bin/bash "$IMAGE" -c "node /tmp/e2e/copilot-ezil-messages-mock.mjs 4143 /home/neko/project /tmp/mock >/tmp/mock.log 2>&1 & node /tmp/e2e/$STANDIN 4142 4143 $BRIDGE_TOKEN $AI_TOKEN >/tmp/standin.log 2>&1 & DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh" >/dev/null
 for top in "$ST"/*; do docker cp "$top/." "$NAME:/$(basename "$top")"; done
 docker start "$NAME" >/dev/null
+if [[ "${EZIL_E2E_SUITE:-}" == unattended ]]; then
+  for i in $(seq 1 60); do
+    docker exec "$NAME" curl -fsS -o /dev/null http://127.0.0.1:4142/bridge-state 2>/dev/null && break
+    sleep 1
+  done
+  EZIL_E2E_CONTAINER="$NAME" EZIL_E2E_OUT="$OUT" node "$here/$DRIVER"
+  exit
+fi
 ip="$(docker inspect -f "{{(index .NetworkSettings.Networks \"$NETWORK\").IPAddress}}" "$NAME")"
 node -e 'const net=require("net");const [port,host]=process.argv.slice(1);net.createServer(c=>{const u=net.connect(8443,host);c.pipe(u).pipe(c);u.on("error",()=>c.destroy());c.on("error",()=>u.destroy())}).listen(+port,"127.0.0.1")' "$PORT" "$ip" &
 FORWARD_PID=$!

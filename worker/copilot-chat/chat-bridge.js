@@ -35,6 +35,18 @@
     const widgets = deps.chatWidgetService;
     const now = deps.now || (() => Date.now());
     const log = deps.log || (() => {});
+    // The private unattended workbench (docs/UNATTENDED-CODE.md) is the image's Chrome run headless, which names itself
+    // in the user agent. Reported in `hello` so the extension syncs as that window and OS can let a person's window
+    // take precedence. A window a person opens is never headless.
+    const userAgent = typeof deps.userAgent === 'string' ? deps.userAgent
+        : (typeof navigator === 'object' && navigator && typeof navigator.userAgent === 'string' ? navigator.userAgent : '');
+    const href = deps.href || (typeof location === 'object' ? location.href : '');
+    let unattended = false;
+    try {
+        const url = new URL(href);
+        unattended = /\bHeadlessChrome\//.test(userAgent) && url.hostname === '127.0.0.1'
+            && url.protocol === 'http:' && url.port === '8443' && url.searchParams.get('ezilPrivateCode') === '1';
+    } catch { /* A normal workbench may have no web location. */ }
 
     let owner = null;
     let disposed = false;
@@ -490,7 +502,7 @@
         try {
             switch (request.op) {
                 case 'hello':
-                    return { ok: true, protocol: PROTOCOL, owner: owner && { id: owner.id, epoch: owner.epoch }, workspaceFolders: deps.workspaceFolders() };
+                    return { ok: true, protocol: PROTOCOL, owner: owner && { id: owner.id, epoch: owner.epoch }, workspaceFolders: deps.workspaceFolders(), unattended };
                 case 'claim': {
                     if (!OWNER.test(request.ownerId) || !Number.isSafeInteger(request.epoch) || request.epoch < 1) return fail('bad_request');
                     if (owner && (request.epoch < owner.epoch || (request.epoch === owner.epoch && request.ownerId !== owner.id))) {

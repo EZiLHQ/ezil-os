@@ -320,6 +320,35 @@ describe.skipIf(!URL_)('EZiL Chat sessions through the editor bridge on Postgres
             expect(b2.owner === 'self' && b2.applied).toBe(0);
         });
 
+        it('a person\'s window takes the lease from the live private unattended workbench after active work completes; the workbench never takes it from a live window', async () => {
+            // The private workbench (docs/UNATTENDED-CODE.md) holds the lease and has work in flight.
+            const u = await connect('unattended.private');
+            const op = await data<Op>(await write('agentSession.send', { sessionId: u.sessions[0], text: 'while nobody looks', idempotencyKey: randomUUID() }));
+            await sync({ ownerId: 'unattended.private', epoch: u.epoch });
+            await sync({ ownerId: 'unattended.private', epoch: u.epoch, reports: [{ operationId: op.id, status: 'running' }] });
+            expect((await data<Op>(await read('agentSession.operation', { operationId: op.id }))).status).toBe('running');
+
+            // Opening the app while a task is running preserves its existing lease and outcome.
+            expect((await sync({ ownerId: 'ext.person', epoch: 0 })).owner).toBe('other');
+            await sync({ ownerId: 'unattended.private', epoch: u.epoch, reports: [{ operationId: op.id, status: 'completed' }] });
+            expect((await data<Op>(await read('agentSession.operation', { operationId: op.id }))).status).toBe('completed');
+            const w = await sync({ ownerId: 'ext.person', epoch: 0 });
+            expect(w.owner === 'self' && w.epoch).toBe(u.epoch + 1);
+
+            // The reverse never happens: while the person's window is live, the workbench waits.
+            const again = await sync({ ownerId: 'unattended.private', epoch: 0 });
+            expect(again.owner).toBe('other');
+            const still = await sync({ ownerId: 'ext.person', epoch: (w as { epoch: number }).epoch });
+            expect(still.owner === 'self' && still.epoch).toBe(u.epoch + 1);
+            // Two private workbenches (a stale boot and a new one) keep today's rule: the live one stays.
+            const second = await sync({ ownerId: 'unattended.other', epoch: 0 });
+            expect(second.owner).toBe('other');
+            // Only once the window's lease lapses does the workbench get the bridge back, at a new epoch.
+            await expireLease();
+            const back = await sync({ ownerId: 'unattended.private', epoch: 0 });
+            expect(back.owner === 'self' && back.epoch).toBe(u.epoch + 2);
+        });
+
         it('the same owner after its lease lapsed (an editor restart) gets a new epoch and its held work is uncertain', async () => {
             const a = await connect('window-r');
             const op = await data<Op>(await write('agentSession.send', { sessionId: a.sessions[0], text: 'x', idempotencyKey: randomUUID() }));

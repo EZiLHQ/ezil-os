@@ -18,6 +18,15 @@
 // back after the change. Effort is not a session setting in this editor: a requested effort is refused.
 
 export const BRIDGE_COMMAND = '_ezil.chatBridge.v1';
+/** OS's prefix for the computer's private unattended workbench (app/src/server/agent-session/store.ts, docs/UNATTENDED-CODE.md). */
+export const UNATTENDED_OWNER_PREFIX = 'unattended.';
+export const isUnattendedOwner = (ownerId: string): boolean => ownerId.startsWith(UNATTENDED_OWNER_PREFIX);
+/** The owner id this window syncs as: the configured one, or its unattended form when the workbench reports it is headless. */
+export function ownerIdFor(baseOwnerId: string, unattended: boolean): string {
+    if (!unattended) return baseOwnerId;
+    const bare = baseOwnerId.replace(/^[A-Za-z0-9]+\./, '');
+    return `${UNATTENDED_OWNER_PREFIX}${bare}`.slice(0, 128);
+}
 export const SYNC_PATH = '/editor-bridge/v1/sync';
 const SYNC_TIMEOUT_MS = 20_000;
 const IDLE_MS = 15_000;
@@ -89,10 +98,18 @@ export interface BridgeClientDeps {
      * activating, ended canceled. False: not sent now (not_delivered, agent_not_ready), retried until expiry.
      */
     ensureAgent?: () => Promise<boolean>;
+    /** Optional local evidence; start before submit and finalize only when Code reports a completed request. */
+    beginReceipt?: (ownerId: unknown, operation: string, resource: string) => ((requestId: string) => void) | undefined;
     /** The fixed `thinking.effort` this extension sends for one of its own models (picker metadata id), or null. */
     effortOf?: (modelId: string) => string | null;
     /** Of these picker metadata ids (this extension's own models), those with fresh Gateway evidence for this account. */
     availableIds?: (modelIds: string[]) => Promise<Set<string>>;
+    /**
+     * The owner's explicit consent to the private unattended workbench (`ezil.chatBridge.unattended`), read fresh. Only
+     * consulted in a window the workbench reports as unattended: without consent that window never syncs, whatever
+     * launched it. Absent: no consent.
+     */
+    unattendedAllowed?: () => boolean;
 }
 
 /** The code host's sync URL, from EZIL_AI_BASE_URL (`https://8443-<id>-code.<zone>/ai/v1`), or null. */
@@ -187,7 +204,10 @@ export class ChatBridgeClient {
     private os = 1;
     private claimedEpoch = 0;
     private ticks = 0;
+    /** Fixed by the first `hello` (before the first sync) and never changed: OS keys the lease and every report on it. */
+    private ownerId: string | null = null;
     private reports: (Report & { attemptId: string })[] = [];
+    private readonly receipts = new Map<string, (requestId: string) => void>();
     private readonly tracked = new Map<string, Tracked>();
     private timer: ReturnType<typeof setTimeout> | undefined;
     private stopped = false;
@@ -231,7 +251,12 @@ export class ChatBridgeClient {
     }
 
     private fence(): Record<string, unknown> {
-        return { ownerId: this.deps.ownerId, epoch: this.epoch };
+        return { ownerId: this.ownerId ?? this.deps.ownerId, epoch: this.epoch };
+    }
+
+    /** What this window syncs as; `unattended.<id>` for the private workbench. Public for tests. */
+    get syncOwnerId(): string | null {
+        return this.ownerId;
     }
 
     private async round(): Promise<number> {
@@ -240,13 +265,19 @@ export class ChatBridgeClient {
             const hello = await this.call({ op: 'hello' }) as View | undefined;
             if (!hello || hello.ok !== true || (hello.protocol !== 1 && hello.protocol !== 2)) return IDLE_MS;
             this.workbench = hello.protocol;
+            if (this.ownerId === null) {
+                this.ownerId = ownerIdFor(this.deps.ownerId, hello.unattended === true);
+                if (this.ownerId !== this.deps.ownerId) this.deps.log('[chat-bridge] this window is the private unattended workbench');
+            }
         } catch {
             return IDLE_MS;
         }
+        // The private workbench acts only on the owner's explicit, current consent (the launcher stops it too).
+        if (isUnattendedOwner(this.ownerId) && this.deps.unattendedAllowed?.() !== true) return IDLE_MS;
         this.ticks += 1;
         this.seq += 1;
         const protocol = this.protocol();
-        const body: Record<string, unknown> = { protocol, ownerId: this.deps.ownerId, epoch: this.epoch, seq: this.seq };
+        const body: Record<string, unknown> = { protocol, ownerId: this.ownerId, epoch: this.epoch, seq: this.seq };
         if (this.epoch > 0 && this.claimedEpoch === this.epoch && (this.ticks % SESSIONS_EVERY === 1 || this.ticks <= 2)) {
             const sessions = await this.sessions(protocol);
             if (sessions) body.sessions = sessions;
@@ -292,6 +323,7 @@ export class ChatBridgeClient {
         this.claimedEpoch = 0;
         this.reports = [];
         this.tracked.clear();
+        this.receipts.clear();
     }
 
     private async sync(body: Record<string, unknown>): Promise<SyncReply | null> {
@@ -393,6 +425,12 @@ export class ChatBridgeClient {
                 this.report({ operationId: delivery.operationId, status: 'not_delivered', reason: 'agent_not_ready' }, attempt);
                 return;
             }
+            if (this.deps.beginReceipt && !this.receipts.has(delivery.operationId)) {
+                try {
+                    const capture = this.deps.beginReceipt(this.fence().ownerId, delivery.operationId, delivery.sessionResource);
+                    if (capture) this.receipts.set(delivery.operationId, capture);
+                } catch { /* Optional diagnostics cannot withhold a task. */ }
+            }
             let report: Report;
             try {
                 // The deadline travels as time left (never a wall-clock time: the workbench runs on another machine).
@@ -465,6 +503,7 @@ export class ChatBridgeClient {
     /** Report now; keep watching until final; attach the final response text of THAT request only. */
     private async finish(sessionResource: string, report: Report, attemptId: string, operationId = report.operationId): Promise<void> {
         if (report.status === 'not_delivered') {
+            this.receipts.delete(operationId);
             this.tracked.delete(operationId);
             this.report(report, attemptId);
             return;
@@ -472,6 +511,11 @@ export class ChatBridgeClient {
         if (FINAL.has(report.status)) {
             this.tracked.delete(operationId);
             this.report(await this.withResponse(sessionResource, report), attemptId);
+            const capture = this.receipts.get(operationId);
+            this.receipts.delete(operationId);
+            if (capture && report.status === 'completed' && report.requestId) {
+                try { capture(report.requestId); } catch { /* Diagnostics cannot affect delivery. */ }
+            }
             return;
         }
         const known = this.tracked.get(operationId);
@@ -489,6 +533,7 @@ export class ChatBridgeClient {
             }
             const v = view as View | undefined;
             if (v?.ok === true && v.status === 'unknown_command') {
+                this.receipts.delete(item.operationId);
                 this.tracked.delete(item.operationId);
                 this.report({ operationId: item.operationId, status: 'uncertain', reason: 'lost_by_workbench' }, item.attemptId);
                 continue;
