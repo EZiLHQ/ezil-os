@@ -76,13 +76,16 @@ const turnText = turn => (typeof turn.content === 'string' ? [turn.content] : tu
 function scriptedContent(body, folder) {
   const history = body.messages.flatMap(turn => Array.isArray(turn.content) ? turn.content : []);
   // The scenario is the newest user prompt that carries a marker: a chat may continue an earlier one.
-  const marked = body.messages.filter(turn => turn.role === 'user').map(turnText).reverse().find(t => /EZIL_E2E_(UNDO|AGENT|KIMI|SLOW|LONG|SUBAGENT|CHILD|HISTORY)/.test(t)) ?? '';
+  const marked = body.messages.filter(turn => turn.role === 'user').map(turnText).reverse().find(t => /EZIL_E2E_(UNDO|AGENT|KIMI|SLOW|LONG|SUBAGENT|CHILD|HISTORY|PAIR)/.test(t)) ?? '';
   const userText = marked;
   const done = id => history.some(block => block.type === 'tool_result' && block.tool_use_id === id);
   const call = (id, name, input) => {
     if (!body.tools?.some(tool => tool.name === name)) throw new Error('script requires offered tool ' + name);
     return [{ type: 'tool_use', id, name, input }];
   };
+  // Concurrent independent chats: each carries its own marker and is answered with exactly its own reply.
+  const pair = /\bEZIL_E2E_PAIR_([A-Z0-9]+)\b/.exec(userText)?.[1];
+  if (pair) return [{ type: 'text', text: 'EZIL_PAIR_REPLY_' + pair }];
   if (userText.includes('EZIL_E2E_KIMI')) return [{ type: 'text', text: 'EZiL Chat: Kimi JSON response. EZIL_KIMI_OK' }];
   // A subagent (VS Code's runSubagent tool) gets the CHILD prompt; the parent names its model as `model=[Name (vendor)]`.
   if (userText.includes('EZIL_E2E_CHILD')) return [{ type: 'text', text: 'EZiL Chat: child reply. EZIL_CHILD_OK' }];

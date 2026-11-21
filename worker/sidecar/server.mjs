@@ -24,7 +24,7 @@
  * `evaluate`, no `raw`, no "forward this CDP command". See `verbs.mjs`.
  *
  * ── THE REDACTION CHOKE POINT IS IN THIS FILE ───────────────────────────────
- * `respond()` below is the ONLY place a payload becomes bytes on a socket, and
+ * `respond()` serializes all responses. For legacy automation payloads,
  * `redactDeep` runs there, on success responses and error responses alike. The
  * verb handlers deliberately do NOT redact — they emit what they see, and this
  * is what stops it. One guard, one place, so that deleting it turns the test
@@ -40,11 +40,14 @@
  * that only ever reads the body still gets a usable answer.
  */
 
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { ERROR_CODES } from './contract.mjs';
 import { VERBS } from './verbs.mjs';
 import { redactDeep } from './redact.mjs';
+import { createMcpObservation, observationPayload, OBSERVE_PATH } from './mcp-observation.mjs';
+import { BROWSER_OPEN_PATH, CODE_BROWSER_OPEN_PATH, browserOpenFailure, createMcpBrowserOpen } from './mcp-browser-open.mjs';
 
 const PORT = Number.parseInt(process.env.EZIL_SIDECAR_PORT ?? '9223', 10) || 9223;
 const HOST = process.env.EZIL_SIDECAR_HOST ?? '0.0.0.0';
@@ -54,12 +57,29 @@ const CDP_URL = process.env.EZIL_CDP_URL ?? `http://127.0.0.1:${CDP_PORT}`;
 /** Request bodies are small by construction; anything larger is a mistake or
  *  an attempt to wedge the process. */
 const MAX_BODY_BYTES = 256 * 1024;
+const BROWSER_OPEN_BODY_BYTES = 4096;
+const BOOT_CAPABILITY = /^[A-Za-z0-9_-]{43}$/;
+
+function validBrowserOpenAuthorization (header, capability) {
+    if (typeof capability !== 'string' || !BOOT_CAPABILITY.test(capability)
+        || typeof header !== 'string' || header.length !== 50 || !header.startsWith('Bearer ')) return false;
+    const value = header.slice(7);
+    return BOOT_CAPABILITY.test(value) && timingSafeEqual(Buffer.from(value), Buffer.from(capability));
+}
 
 /** The complete set of routes. `VERBS` keys are `"<METHOD> <path>"`. */
 export const ROUTES = Object.keys(VERBS);
 
 /** Construct without binding or connecting, so the HTTP boundary can be tested offline. */
-export function createSidecarServer (surface) {
+export function createSidecarServer (surface, {
+    observe = createMcpObservation(surface),
+    browserOpen = createMcpBrowserOpen(surface, { allowedOrigins: process.env.EZIL_BROWSER_TEST_ALLOWED_ORIGINS }),
+    workerBrowserOpenToken = process.env.EZIL_WORKER_BROWSER_MCP_TOKEN,
+    codeBrowserOpenToken = process.env.EZIL_CODE_BROWSER_MCP_TOKEN,
+} = {}) {
+    const codeBinding = typeof codeBrowserOpenToken === 'string' && BOOT_CAPABILITY.test(codeBrowserOpenToken)
+        ? createHash('sha256').update('EZIL-CODE-BROWSER-OPEN/1\0').update(codeBrowserOpenToken).digest('hex')
+        : null;
     /**
      * Serialise, REDACT, and write. Nothing else in this process writes a body.
      *
@@ -68,9 +88,18 @@ export function createSidecarServer (surface) {
      * this to still happen — `surface.allSecrets()` falls back to the values this
      * process has typed when the page can no longer be read at all.
      */
-    async function respond (res, status, payload) {
-        const secrets = await surface.allSecrets();
-        const safe = redactDeep(payload, secrets);
+    async function respond (res, status, payload, kind) {
+        // The observer's closed metadata has no page content. It must never
+        // inspect passwords to redact a response.
+        let safe;
+        if (kind === 'observation') safe = observationPayload(payload);
+        // The open receipt is constructed from closed fields in the private
+        // handler and must not inspect the desktop user's existing pages.
+        else if (kind === 'browser-open') safe = payload;
+        else {
+            const secrets = await surface.allSecrets();
+            safe = redactDeep(payload, secrets);
+        }
         const body = Buffer.from(JSON.stringify(safe), 'utf8');
         res.writeHead(status, {
             'content-type': 'application/json; charset=utf-8',
@@ -89,13 +118,13 @@ export function createSidecarServer (surface) {
         return { ok: false, error: safeCode, detail };
     }
 
-    function readBody (req) {
+    function readBody (req, limit = MAX_BODY_BYTES) {
         return new Promise((resolve, reject) => {
             const chunks = [];
             let size = 0;
             req.on('data', (chunk) => {
                 size += chunk.length;
-                if (size > MAX_BODY_BYTES) {
+                if (size > limit) {
                     reject(Object.assign(new Error('request body too large'), { httpStatus: 413, code: 'bad_request' }));
                     req.destroy();
                     return;
@@ -122,6 +151,19 @@ export function createSidecarServer (surface) {
         // cannot reach a verb by a path the contract does not name.
         const path = (req.url || '/').split('?')[0].replace(/\/+$/, '') || '/';
         const key = `${method} ${path}`;
+        // The private observation has a closed metadata response with no
+        // page text. It deliberately does not inspect passwords to redact it.
+        if (path === BROWSER_OPEN_PATH || path === CODE_BROWSER_OPEN_PATH) {
+            return handleBrowserOpen(req, res, method, path);
+        }
+        if (req.url === OBSERVE_PATH && method === 'POST') {
+            let outcome = { ok: false, error: 'browser_invalid_request' };
+            try {
+                const raw = await readBody(req, 1024);
+                outcome = await observe(JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(raw)));
+            } catch { /* The closed error contains no input or provider data. */ }
+            return respond(res, 200, outcome, 'observation');
+        }
 
         const handler = VERBS[key];
         if (!handler) {
@@ -164,6 +206,42 @@ export function createSidecarServer (surface) {
         } catch (err) {
             console.error('[ezil-sidecar] verb failed:', err);
             return respond(res, 200, errorPayload(err?.code));
+        }
+    }
+
+    async function handleBrowserOpen (req, res, method, path) {
+        const fail = (status, error, stage) => respond(res, status, browserOpenFailure(null, error, stage), 'browser-open');
+        if (req.url !== path || method !== 'POST') return fail(404, 'browser_unavailable', 'authorization');
+
+        const code = path === CODE_BROWSER_OPEN_PATH;
+        const capability = code ? codeBrowserOpenToken : workerBrowserOpenToken;
+        const loopback = ['127.0.0.1', '::ffff:127.0.0.1'].includes(req.socket.remoteAddress);
+        if (req.headers.origin !== undefined || (code && !loopback)
+            || !validBrowserOpenAuthorization(req.headers.authorization, capability)) {
+            return fail(401, 'browser_unavailable', 'authorization');
+        }
+
+        const disconnect = new AbortController();
+        const onDisconnect = () => disconnect.abort();
+        res.once('close', onDisconnect);
+        req.once('aborted', onDisconnect);
+        try {
+            const bytes = await readBody(req, BROWSER_OPEN_BODY_BYTES);
+            let input = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes));
+            if (code) {
+                if (!input || typeof input !== 'object' || Array.isArray(input) || Object.keys(input).length !== 3
+                    || !Object.keys(input).every(key => ['requestId', 'url', 'timeoutMs'].includes(key))) {
+                    return fail(400, 'destination_denied', 'request');
+                }
+                input = { ...input, binding: codeBinding };
+            }
+            const result = await browserOpen(input, disconnect.signal);
+            if (!res.destroyed) return respond(res, 200, result, 'browser-open');
+        } catch (error) {
+            if (!res.destroyed) return fail(error?.httpStatus ?? 400, 'destination_denied', 'request');
+        } finally {
+            req.off('aborted', onDisconnect);
+            res.off('close', onDisconnect);
         }
     }
 

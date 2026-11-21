@@ -39,6 +39,9 @@
     "virtualWorkspaces": true
   },
   "contributes": {
+    "mcpServerDefinitionProviders": [
+      { "id": "ezil-browser", "label": "EZiL Browser" }
+    ],
     "chatParticipants": [
       {
         "id": "ezil-models.ezil",
@@ -101,6 +104,12 @@
           "markdownDescription": "Path of the EZiL models config file (JSON, see the extension README). The environment variable `EZIL_MODELS_CONFIG` overrides this setting.",
           "scope": "machine"
         },
+        "ezil.chatBridge.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Let EZiL OS (and the EZiL app in ChatGPT, for you) send instructions to an EZiL Chat session you have open here. An instruction runs with that pane's current mode, model and tool approvals, including auto-approve. Off by default.",
+          "scope": "machine"
+        },
         "ezilModels.logRequests": {
           "type": "boolean",
           "default": false,
@@ -141,7 +150,7 @@
     }
   },
   "scripts": {
-    "build": "bun build src/extension.ts --target=node --format=cjs --external=vscode --outfile=dist/extension.js",
+    "build": "bun build src/extension.ts src/browser-mcp-server.ts --target=node --format=cjs --external=vscode --outdir=dist",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "bun test",
     "package:vsix": "../../worker/ezil-models/build-vsix.sh"
