@@ -34,13 +34,21 @@ export function createBrowserTabSession (surface, sessions, revision, readLegacy
 
     async function describe (page) {
         const current = page.url();
-        if (!await pageVisibility(page, current)) return null;
-        if (neutralTab(current)) return { observed: 'browser_ready', pageUrl: null, profileHeadingVisible: false };
+        if (neutralTab(current)) {
+            return await pageVisibility(page, current)
+                ? { observed: 'browser_ready', pageUrl: null, profileHeadingVisible: false }
+                : null;
+        }
         const approved = permitted(current);
-        if (approved) return { observed: 'approved_page', pageUrl: approved.origin + approved.pathname, profileHeadingVisible: false };
+        if (approved) {
+            return await pageVisibility(page, current)
+                ? { observed: 'approved_page', pageUrl: approved.origin + approved.pathname, profileHeadingVisible: false }
+                : null;
+        }
         const legacy = await readLegacy(page);
+        if (!legacy) return null;
         const url = new URL(current);
-        return legacy ? { observed: legacy.observed, pageUrl: url.origin + url.pathname, profileHeadingVisible: legacy.profileHeadingVisible } : null;
+        return { observed: legacy.observed, pageUrl: url.origin + url.pathname, profileHeadingVisible: legacy.profileHeadingVisible };
     }
 
     async function projection (id, session, display, { includeFrame = false, refs = false } = {}) {
