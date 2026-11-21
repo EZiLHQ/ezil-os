@@ -1,0 +1,12 @@
+{
+  "name": "@ezil-os/toolsd",
+  "version": "0.1.0",
+  "private": true,
+  "license": "AGPL-3.0-only",
+  "description": "In-computer daemon (EZIL-COMPUTER-TOOLS/1, staging): runs self-built tools and terminal commands as a non-root user, MAC-gated, reached only by the Worker over containerFetch on port 9224.",
+  "type": "module",
+  "main": "server.mjs",
+  "engines": {
+    "node": ">=20"
+  }
+}
