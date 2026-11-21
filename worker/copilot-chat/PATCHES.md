@@ -722,3 +722,21 @@ The staged assignment bridge asks only for a displayed editor inside the bound
 assignment checkout after the participant enables evidence capture. A viewport
 with multiple ranges, such as across folded text, yields no range observation.
 This evidence describes what the editor displayed.
+
+### Assessment Chat evidence
+
+`assignment-chat-send` and `assignment-chat-accept` pin the submitted composer
+text to the accepted request. The renderer uses its own response promise and
+reads completed visible Markdown. The capture arm must stay the same from send
+through each emission.
+
+`assignment-setup-retry` and `assignment-chat-resend` retain the explicit
+lineage when the account's initial chat setup replaces a provisional request.
+The prompt keeps its accepted ID. The retry, Gateway link, and reply carry the
+replacement's actual ID, with a causal link from the provisional request.
+
+`assignment-chat-loop` and the existing `summary-bridge` carry the existing Workbench request ID into
+the model adapter for the primary turn and its tool rounds. Keep-alive calls,
+system turns, subagents, and background compaction have no link. The existing
+inference trace keeps its shape and the consented renderer emits a separate
+pair of request IDs.

@@ -1,5 +1,8 @@
 import { INFERENCE_VALIDATOR_SOURCE } from '../../app/src/server/ai-traces/contract.js';
 
+import { assessmentChatContent } from '../../app/src/server/assignment-evidence/chat-content.js';
+import { assessmentTerminalCommands } from '../../app/src/server/assignment-evidence/terminal-commands.js';
+
 export const ASSIGNMENT_EVIDENCE_BRIDGE_MARKER = 'data-ezil-assignment-evidence';
 const STAGING = 'https://os-staging.ezil.work';
 
@@ -15,6 +18,10 @@ export function codeAssignmentEvidenceScript(): string {
         if (query.has("workspace") || query.getAll("folder").length !== 1 || query.getAll("ezil_mint").length !== 1
             || !/^\/workspace\/projects\/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(folder ?? "") || !token(mint)) return;
         const validateTrace = ${INFERENCE_VALIDATOR_SOURCE};
+        const summarizeChat = (${assessmentChatContent.toString()});
+        const terminalCommands = new Set(${JSON.stringify(assessmentTerminalCommands)});
+        const requestId = value => typeof value === "string" && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value);
+        const chatRequestId = value => typeof value === "string" && /^request_[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value);
         let capture = null;
 
         function send(kind, detail) {
@@ -78,14 +85,62 @@ export function codeAssignmentEvidenceScript(): string {
                 if (!trace || capture.seen.has(trace.requestId)) return;
                 if (capture.seen.size >= 512) capture.seen.delete(capture.seen.values().next().value);
                 capture.seen.add(trace.requestId);
-                send("model.completed", { requestId: trace.requestId, model: trace.modelAlias, outcome: trace.outcome });
+                send("model.completed", { requestId: trace.requestId, model: trace.modelAlias, outcome: trace.outcome, trace });
             } catch { /* An unsupported trace produces no assignment event. */ }
+        }
+
+        function onChat(event) {
+            try {
+                const item = event.detail;
+                if (!capture?.chat || !item || !chatRequestId(item.chatRequestId)) return;
+                if (item.kind === "chat.request_retried" && chatRequestId(item.retryChatRequestId)
+                    && item.chatRequestId !== item.retryChatRequestId) {
+                    send(item.kind, { chatRequestId: item.chatRequestId, retryChatRequestId: item.retryChatRequestId });
+                    return;
+                }
+                if (!["chat.prompt_submitted", "chat.response_completed"].includes(item.kind)) return;
+                const content = item.contentStatus === "over_limit" ? { contentStatus: "over_limit" } : summarizeChat(item.text);
+                send(item.kind, { chatRequestId: item.chatRequestId, ...content });
+            } catch { /* Evidence does not interrupt Chat. */ }
+        }
+
+        function onGatewayLink(event) {
+            try {
+                const item = event.detail;
+                if (!capture?.chat || !item || !chatRequestId(item.chatRequestId)
+                    || !requestId(item.requestId) || !capture.seen.has(item.requestId)) return;
+                send("chat.gateway_linked", { chatRequestId: item.chatRequestId, requestId: item.requestId });
+            } catch { /* An unsupported link supplies no evidence. */ }
+        }
+
+        function onTerminal(event) {
+            try {
+                const item = event.detail;
+                if (!capture?.terminal || !item || !requestId(item.executionId)) return;
+                const exitCode = Number.isInteger(item.exitCode) && item.exitCode >= -2147483648 && item.exitCode <= 2147483647 ? item.exitCode : null;
+                const durationMs = Number.isInteger(item.durationMs) && item.durationMs >= 0 && item.durationMs <= 21600000 ? item.durationMs : null;
+                send("terminal.command_finished", { executionId: item.executionId,
+                    command: terminalCommands.has(item.command) ? item.command : null, exitCode, durationMs });
+            } catch { /* An unsupported terminal event supplies no evidence. */ }
         }
 
         function stop() {
             if (!capture) return;
             clearInterval(capture.interval);
             window.removeEventListener("ezil-ai-request-trace", onTrace);
+            window.removeEventListener("ezil:assignment-chat", onChat);
+            window.removeEventListener("ezil:assignment-gateway-link", onGatewayLink);
+            window.removeEventListener("ezil:assignment-terminal", onTerminal);
+            const flags = document.documentElement?.dataset;
+            if (flags && capture.chat) {
+                delete flags.ezilAssignmentChat;
+                delete flags.ezilAssignmentChatNonce;
+            }
+            if (flags && capture.terminal) {
+                delete flags.ezilAssignmentTerminal;
+                delete flags.ezilAssignmentTerminalNonce;
+                delete flags.ezilAssignmentRoot;
+            }
             capture = null;
         }
 
@@ -99,7 +154,21 @@ export function codeAssignmentEvidenceScript(): string {
             const name = d.root.slice(folder.length + 1);
             if (!/^[a-z0-9][a-z0-9._-]{0,99}$/.test(name) || name.includes("..") || name.endsWith(".") || name.endsWith(".git")) return;
             stop();
-            capture = { root: d.root, nonce: d.nonce, path: null, range: null, seen: new Set(), interval: 0 };
+            const flags = document.documentElement?.dataset;
+            capture = { root: d.root, nonce: d.nonce, path: null, range: null, seen: new Set(), interval: 0,
+                chat: !!flags && d.captureChat === true, terminal: !!flags && d.captureTerminal === true };
+            if (capture.chat) {
+                flags.ezilAssignmentChat = "1";
+                flags.ezilAssignmentChatNonce = capture.nonce;
+                window.addEventListener("ezil:assignment-chat", onChat);
+                window.addEventListener("ezil:assignment-gateway-link", onGatewayLink);
+            }
+            if (capture.terminal) {
+                flags.ezilAssignmentTerminal = "1";
+                flags.ezilAssignmentTerminalNonce = capture.nonce;
+                flags.ezilAssignmentRoot = capture.root;
+                window.addEventListener("ezil:assignment-terminal", onTerminal);
+            }
             sample(true);
             capture.interval = setInterval(() => sample(false), 400);
             window.addEventListener("ezil-ai-request-trace", onTrace);

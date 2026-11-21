@@ -2,7 +2,7 @@ import { z } from 'zod';
 
 import { isCrossOriginWrite } from '@/utils/request-origin';
 
-import { commandSchema, uuid, type EvidencePilot } from './contract';
+import { commandSchema, consentVersion, uuid, type EvidencePilot } from './contract';
 import type { EvidenceStore } from './store';
 
 type EvidenceRequest = {
@@ -13,7 +13,7 @@ type EvidenceRequest = {
     now?: () => number;
 };
 
-const maxBodyBytes = 24 * 1024;
+const maxBodyBytes = 160 * 1024;
 const reportQuery = z.object({
     attemptId: uuid,
     after: z.string().regex(/^(?:0|[1-9]\d{0,4})$/).transform(Number).default('0'),
@@ -58,7 +58,8 @@ export async function handleEvidenceRequest(req: Request, deps: EvidenceRequest)
         if (!pairs.length) {
             return evidenceJson({
                 enabled: true,
-                assignment: { id: pilot.id, computerId: pilot.computerId, repositoryUrl: pilot.repositoryUrl },
+                assignment: { id: pilot.id, computerId: pilot.computerId, repositoryUrl: pilot.repositoryUrl,
+                    captureChat: pilot.captureChat === true },
                 attempt: await store.current(pilot, clock()),
             });
         }
@@ -78,8 +79,12 @@ export async function handleEvidenceRequest(req: Request, deps: EvidenceRequest)
     const action = command.data;
     if (action.action === 'start') {
         if (action.computerId !== pilot.computerId) return evidenceUnavailable();
+        const captureChat = action.captureChat === true;
+        if (captureChat !== (pilot.captureChat === true) || (captureChat && action.consentVersion !== consentVersion)) {
+            return evidenceJson({ error: 'consent_required' }, 409);
+        }
         if (!(await deps.authorizeStart(pilot, req.signal))) return evidenceUnavailable();
-        const attempt = await store.start(pilot, clock());
+        const attempt = await store.start(pilot, clock(), { version: action.consentVersion, captureChat });
         return attempt ? evidenceJson({ attempt }) : evidenceUnavailable();
     }
     if (action.action === 'end') {

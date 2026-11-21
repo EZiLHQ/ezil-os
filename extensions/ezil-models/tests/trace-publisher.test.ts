@@ -40,6 +40,20 @@ test('unknown usage/session/read counts are not fabricated as zero; measured zer
     const zero = { ...r, usageSource: 'provider_reported', usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 } };
     expect(validateInferenceTrace(zero)?.usage).toEqual(zero.usage); expect(validateInferenceTrace(zero)?.usage?.cacheWriteTokens).toBeUndefined();
 });
+test('passes a canonical assignment request only as an optional command argument', () => {
+    const trace = sample();
+    const chatId = 'request_11111111-1111-4111-8111-111111111111';
+    const sent: unknown[][] = [];
+    for (const id of [chatId, 'request_1', chatId + '\n', trace.requestId]) {
+        publishInferenceTrace(trace, (...args) => sent.push(args), id);
+    }
+    expect(sent).toEqual([
+        ['_ezil.aiRequestTrace', trace, chatId],
+        ['_ezil.aiRequestTrace', trace],
+        ['_ezil.aiRequestTrace', trace],
+        ['_ezil.aiRequestTrace', trace],
+    ]);
+});
 test('large observations trim to the full nonce envelope budget without changing local ring or aggregate counts', () => {
     const t = new InferenceTrace('gemini-4-carbon', ask());
     for (let i = 0; i < 128; i++) t.event({ type: 'tool_call', callId: String(i), name: 'read_file', input: {} });

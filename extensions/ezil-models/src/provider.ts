@@ -28,7 +28,7 @@ export type ProviderHost = {
     requestFinished?(model: ResolvedModel): void;
     /** Content-free gateway outcomes; observer errors must never change a turn. */
     appFailure?(record: AppFailure): void;
-    inferenceDiagnostic?(record: InferenceDiagnostic): void;
+    inferenceDiagnostic?(record: InferenceDiagnostic, assignmentChatRequestId?: string): void;
     beginInferenceActivity?(provider: ResolvedProvider, signal: AbortSignal): (() => void) | undefined;
     /** The request goes compacted (compact.ts); `finished` settles when its turn ends. */
     compacted?(model: ResolvedModel, info: CompactionInfo, finished: Promise<void>): void;
@@ -508,6 +508,12 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
         const cancellation = token.onCancellationRequested(() => controller.abort());
         if (token.isCancellationRequested) controller.abort();
         const started = Date.now();
+        // VS Code 1.141 supplies the caller separately from its modelOptions.
+        // The pinned Copilot primary loop forwards its exact ChatRequest ID.
+        const initiator = (options as vscode.ProvideLanguageModelChatResponseOptions & { requestInitiator?: string }).requestInitiator;
+        const assignmentChatRequestId: unknown = options.modelOptions?._ezilAssignmentChatRequestId;
+        const assignmentLink = initiator === 'github.copilot-chat' && !isUtilityRequest(options.modelOptions ?? {})
+            && typeof assignmentChatRequestId === 'string' ? assignmentChatRequestId : undefined;
         let resolved: ResolvedModel | undefined;
         let sessionIdentity: string | null = null;
         const correlate = (value: unknown) => createHmac('sha256', this.continuationSecret).update(JSON.stringify(value)).digest('hex');
@@ -795,7 +801,7 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             const record = diagnostic.finish(controller.signal.aborted, diagnosticFailed);
             record.durationMs = Math.max(0, Date.now() - started);
             this.inferenceTrace.add(record);
-            try { this.host.inferenceDiagnostic?.(record); } catch { /* observer only */ }
+            try { this.host.inferenceDiagnostic?.(record, assignmentLink); } catch { /* observer only */ }
             cancellation.dispose();
             if (controller.signal.aborted) { this.geminiEpoch = randomBytes(16).toString('hex'); this.geminiThinking.clear(); }
             if (resolved) this.host.requestFinished?.(resolved);

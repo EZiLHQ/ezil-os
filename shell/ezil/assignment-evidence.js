@@ -1,10 +1,16 @@
+import { validateInferenceTrace } from '../../app/src/server/ai-traces/contract.js';
+import { assessmentChatContent } from '../../app/src/server/assignment-evidence/chat-content.js';
+import { assessmentTerminalCommands } from '../../app/src/server/assignment-evidence/terminal-commands.js';
+
 const endpoint = '/api/shell/assignment-evidence';
-const consentVersion = 'assignment-evidence-v1';
+const consentVersion = 'assignment-evidence-v2';
 const maxBatch = 20;
+const maxBatchBytes = 128 * 1024;
 const maxPending = 120;
 const transitions = new Set(['app.opened', 'app.focused', 'app.minimized', 'app.restored', 'app.closed']);
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
 const modelAlias = /^[a-z][a-z0-9_.:-]{0,127}$/i;
+const chatId = /^request_[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const sensitiveAlias = /secret|token|passw|bearer|credential|cookie|session|api.?key|[a-z0-9]{32,}/i;
 const canonicalRepository = /^https:\/\/github\.ezil\.work\/[a-z0-9-]+\/[a-z0-9._-]+\.git$/;
 const subscribers = new Set();
@@ -25,7 +31,7 @@ export function subscribeAssignmentEvidence(scope, callback) {
         const active = isAssignmentEvidenceActive(scope);
         if ( active === last ) return;
         last = active;
-        try { callback(active); } catch { /* Evidence must not interrupt the shell. */ }
+        try { callback(active, active ? current.permissions() : {}); } catch { /* Evidence must not interrupt the shell. */ }
     };
     subscribers.add(update);
     update();
@@ -60,7 +66,35 @@ function evidenceDetail(kind, detail) {
         const { requestId, model, outcome } = detail;
         if ( typeof requestId === 'string' && uuid.exec(requestId)?.[0] === requestId && requestId === requestId.toLowerCase()
             && typeof model === 'string' && modelAlias.exec(model)?.[0] === model && !sensitiveAlias.test(model)
-            && ['completed', 'failed', 'cancelled'].includes(outcome) ) return { requestId, model, outcome };
+            && ['completed', 'failed', 'cancelled'].includes(outcome) ) {
+            if ( detail.trace === undefined ) return { requestId, model, outcome };
+            const trace = validateInferenceTrace(detail.trace);
+            if ( trace?.requestId === requestId && trace.modelAlias === model && trace.outcome === outcome ) {
+                return { requestId, model, outcome, trace };
+            }
+        }
+    }
+    if ( /^chat\./.test(kind) && typeof detail.chatRequestId === 'string' && chatId.exec(detail.chatRequestId)?.[0] === detail.chatRequestId ) {
+        const chatRequestId = detail.chatRequestId;
+        if ( kind === 'chat.request_retried' && typeof detail.retryChatRequestId === 'string'
+            && chatId.exec(detail.retryChatRequestId)?.[0] === detail.retryChatRequestId && detail.retryChatRequestId !== chatRequestId ) {
+            return { chatRequestId, retryChatRequestId: detail.retryChatRequestId };
+        }
+        if ( kind === 'chat.gateway_linked' && typeof detail.requestId === 'string' && uuid.exec(detail.requestId)?.[0] === detail.requestId ) {
+            return { chatRequestId, requestId: detail.requestId.toLowerCase() };
+        }
+        if ( ['chat.prompt_submitted', 'chat.response_completed'].includes(kind) ) {
+            if ( detail.contentStatus === 'captured' ) return { chatRequestId, ...assessmentChatContent(detail.text) };
+            if ( ['unavailable', 'over_limit', 'withheld'].includes(detail.contentStatus) ) return { chatRequestId, contentStatus: detail.contentStatus };
+        }
+    }
+    if ( kind === 'terminal.command_finished' && typeof detail.executionId === 'string' && uuid.exec(detail.executionId)?.[0] === detail.executionId ) {
+        return {
+            executionId: detail.executionId.toLowerCase(),
+            command: assessmentTerminalCommands.includes(detail.command) ? detail.command : null,
+            exitCode: Number.isInteger(detail.exitCode) && detail.exitCode >= -2147483648 && detail.exitCode <= 2147483647 ? detail.exitCode : null,
+            durationMs: Number.isInteger(detail.durationMs) && detail.durationMs >= 0 && detail.durationMs <= 21600000 ? detail.durationMs : null,
+        };
     }
     return null;
 }
@@ -68,7 +102,9 @@ function evidenceDetail(kind, detail) {
 export function recordAssignmentEvent(kind, detail, scope) {
     const controller = current;
     if ( !controller?.active || typeof kind !== 'string' || (scope && !matches(controller.scope, scope)) ) return false;
-    if ( !scope && (kind.startsWith('code.') || kind === 'model.completed') ) return false;
+    if ( !scope && /^(?:code|model|chat|terminal)\./.test(kind) ) return false;
+    const permissions = controller.permissions();
+    if ( kind.startsWith('chat.') && !permissions.chat || kind.startsWith('terminal.') && !permissions.terminal ) return false;
     const allowed = evidenceDetail(kind, detail);
     return Boolean(allowed && controller.record(kind, allowed));
 }
@@ -128,6 +164,7 @@ export function mountAssignmentEvidence(
     wrapper.append(status, start, stop);
 
     let attempt = null;
+    let configuredChat = false;
     let disposed = false;
     let busy = false;
     let flushTimer = null;
@@ -139,6 +176,10 @@ export function mountAssignmentEvidence(
 
     const controller = {
         owner, scope, active: false,
+        permissions() {
+            const terminal = attempt?.consentVersion === consentVersion;
+            return { terminal, chat: terminal && configuredChat && attempt?.captureChat === true };
+        },
         record(kind, detail) {
             if ( queue.length >= maxPending ) {
                 status.textContent = 'Assignment evidence active. Waiting to send buffered events.';
@@ -214,7 +255,14 @@ export function mountAssignmentEvidence(
     async function flush() {
         if ( sending ) return sending;
         if ( !attempt || queue.length === 0 ) return true;
-        const events = queue.slice(0, maxBatch);
+        const events = [];
+        let size = 0;
+        const encoder = new TextEncoder();
+        for ( const event of queue.slice(0, maxBatch) ) {
+            size += encoder.encode(JSON.stringify(event)).length + 1;
+            if ( size > maxBatchBytes && events.length ) break;
+            events.push(event);
+        }
         sending = (async () => {
             try {
                 const response = await request({ action: 'append', attemptId: attempt.id, events });
@@ -251,9 +299,10 @@ export function mountAssignmentEvidence(
                     attempt = null;
                     throw new Error('assignment attempt changed');
                 }
+                configuredChat = refreshed.assignment.captureChat === true;
                 attempt = refreshed.attempt;
             } else {
-                const response = await request({ action: 'start', computerId, consentVersion });
+                const response = await request({ action: 'start', computerId, consentVersion, ...(configuredChat ? { captureChat: true } : {}) });
                 if ( !availableAttempt(response?.attempt) ) throw new Error('invalid assignment attempt');
                 attempt = response.attempt;
             }
@@ -311,9 +360,12 @@ export function mountAssignmentEvidence(
                 controller.dispose();
                 return;
             }
+            configuredChat = response.assignment.captureChat === true;
             attempt = availableAttempt(response.attempt) ? response.attempt : null;
-            render(attempt ? 'Assignment evidence paused. Resume to record app and Code activity.'
-                : 'Record app and Code activity for this assignment.');
+            const notice = configuredChat
+                ? 'Record submitted Chat prompts, completed replies, Code activity, model request traces and safe terminal commands.'
+                : 'Record Code activity, model request traces and safe terminal commands.';
+            render(attempt ? 'Assignment evidence paused. Resume to continue. ' + notice : notice);
             container.append(wrapper);
         } catch { controller.dispose(); }
     })();

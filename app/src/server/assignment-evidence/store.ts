@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 
 import { sql } from 'drizzle-orm';
 import type { PostgresJsDatabase } from 'drizzle-orm/postgres-js';
 
-import { attemptLifetimeMs, consentVersion, maxAttemptEvents, type AssignmentEvidenceEvent, type EvidencePilot } from './contract';
+import { attemptLifetimeMs, consentVersion, legacyConsentVersion, maxAttemptEvents, type AssignmentEvidenceEvent, type EvidencePilot } from './contract';
 
 type Row = {
     id: string;
@@ -11,6 +12,8 @@ type Row = {
     expires_at: string;
     ended_at: string | null;
     last_sequence: number;
+    consent_version: typeof consentVersion | typeof legacyConsentVersion;
+    capture_chat: boolean;
 };
 type EventRow = {
     id: string;
@@ -30,6 +33,8 @@ const attemptView = (row: Row, now: number) => ({
     state: row.ended_at ? 'ended' as const : Date.parse(row.expires_at) <= now ? 'expired' as const : 'active' as const,
     startedAt: instant(row.started_at),
     expiresAt: instant(row.expires_at),
+    consentVersion: row.consent_version,
+    captureChat: row.capture_chat,
     endedAt: row.ended_at ? instant(row.ended_at) : null,
 });
 
@@ -39,7 +44,7 @@ const matches = (pilot: EvidencePilot) => sql`assignment_id = ${pilot.id} AND ow
 
 async function selectAttempt(db: Runner, pilot: EvidencePilot, attemptId?: string, lock = false) {
     const [row] = await db.execute<Row>(sql`
-        SELECT id, started_at::text, expires_at::text, ended_at::text, last_sequence
+        SELECT id, started_at::text, expires_at::text, ended_at::text, last_sequence, consent_version, capture_chat
         FROM public.ezil_assignment_evidence_attempts WHERE ${matches(pilot)}
         ${attemptId ? sql`AND id = ${attemptId}` : sql``}
         ${lock ? sql`FOR UPDATE` : sql``}
@@ -61,16 +66,16 @@ export function evidenceStore(db: Transactional) {
             return row ? attemptView(row, now) : null;
         },
 
-        start(pilot: EvidencePilot, now: number) {
+        start(pilot: EvidencePilot, now: number, consent: { version: Row['consent_version']; captureChat: boolean }) {
             return db.transaction(async tx => {
                 const timestamp = new Date(now).toISOString();
                 const [inserted] = await tx.execute<Row>(sql`
                     INSERT INTO public.ezil_assignment_evidence_attempts
-                        (id,assignment_id,owner_id,computer_id,repository_id,repository_ref,base_sha,consent_version,started_at,expires_at,last_sequence)
+                        (id,assignment_id,owner_id,computer_id,repository_id,repository_ref,base_sha,consent_version,capture_chat,started_at,expires_at,last_sequence)
                     VALUES (${randomUUID()},${pilot.id},${pilot.ownerId},${pilot.computerId},${pilot.repositoryId},${pilot.ref},${pilot.baseSha},
-                            ${consentVersion},${timestamp},${new Date(now + attemptLifetimeMs).toISOString()},1)
+                            ${consent.version},${consent.captureChat},${timestamp},${new Date(now + attemptLifetimeMs).toISOString()},1)
                     ON CONFLICT (assignment_id) DO NOTHING
-                    RETURNING id, started_at::text, expires_at::text, ended_at::text, last_sequence
+                    RETURNING id, started_at::text, expires_at::text, ended_at::text, last_sequence, consent_version, capture_chat
                 `);
                 if (inserted) await writeBoundary(tx, inserted.id, 1, 'assignment.started', timestamp);
                 const row = inserted ?? await selectAttempt(tx, pilot);
@@ -83,6 +88,10 @@ export function evidenceStore(db: Transactional) {
                 const row = await selectAttempt(tx, pilot, attemptId, true);
                 if (!row) return 'not_found' as const;
                 if (attemptView(row, now).state !== 'active') return 'closed' as const;
+                if (events.some(event => event.kind.startsWith('chat.') && (!row.capture_chat || pilot.captureChat !== true)
+                    || event.kind.startsWith('terminal.') && row.consent_version !== consentVersion)) {
+                    return 'consent_required' as const;
+                }
                 const start = Date.parse(row.started_at);
                 // Client time is contextual. Sequence and received time come from the server.
                 if (events.some(event => Date.parse(event.occurredAt) < start - 300_000 || Date.parse(event.occurredAt) > now + 60_000)) {
@@ -95,12 +104,10 @@ export function evidenceStore(db: Transactional) {
                     AND id IN (${sql.join(events.map(event => sql`${event.id}`), sql`, `)})
                 `);
                 const prior = new Map(existing.map(event => [event.id, event]));
-                const sameDetail = (a: Record<string, unknown>, b: Record<string, unknown>) =>
-                    Object.keys(a).length === Object.keys(b).length && Object.entries(a).every(([key, value]) => b[key] === value);
                 for (const event of events) {
                     const original = prior.get(event.id);
                     if (original && (original.source !== 'client_reported' || original.kind !== event.kind
-                        || instant(original.occurred_at) !== event.occurredAt || !sameDetail(original.detail, event.detail))) {
+                        || instant(original.occurred_at) !== event.occurredAt || !isDeepStrictEqual(original.detail, event.detail))) {
                         return 'reused_event_id' as const;
                     }
                 }
@@ -147,16 +154,21 @@ export function evidenceStore(db: Transactional) {
                 WHERE attempt_id = ${attemptId} AND sequence > ${after} AND sequence <= ${row.last_sequence}
                 ORDER BY sequence LIMIT 101
             `);
-            const events = found.slice(0, 100).map(event => ({
-                id: event.id, sequence: event.sequence, kind: event.kind, source: event.source,
-                occurredAt: instant(event.occurred_at), receivedAt: instant(event.received_at), detail: event.detail,
-            }));
+            const events = found.slice(0, 100).map(event => {
+                const detail = event.kind.startsWith('chat.') && event.detail.contentStatus === 'captured' && pilot.captureChat !== true
+                    ? { chatRequestId: event.detail.chatRequestId, contentStatus: 'withheld' }
+                    : event.detail;
+                return {
+                    id: event.id, sequence: event.sequence, kind: event.kind, source: event.source,
+                    occurredAt: instant(event.occurred_at), receivedAt: instant(event.received_at), detail,
+                };
+            });
             return {
                 attempt: attemptView(row, now),
                 elapsedMs: Math.max(0, Math.min(row.ended_at ? Date.parse(row.ended_at) : now, Date.parse(row.expires_at))
                     - Date.parse(row.started_at)),
                 binding: { assignmentId: pilot.id, computerId: pilot.computerId, repositoryId: pilot.repositoryId, ref: pilot.ref, baseSha: pilot.baseSha },
-                consentVersion,
+                consentVersion: row.consent_version,
                 events,
                 nextAfter: found.length > 100 ? events.at(-1)?.sequence : null,
             };

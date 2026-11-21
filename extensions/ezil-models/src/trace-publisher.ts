@@ -14,9 +14,19 @@ export function prepareInferenceTrace(record: unknown): InferenceDiagnostic | nu
     return bytes() <= 4096 ? validateInferenceTrace(clean) : null;
 }
 /** Neither synchronous throws nor rejected/unsupported older commands can affect inference. */
-export function publishInferenceTrace(record: unknown, execute: (command: string, record: InferenceDiagnostic) => unknown): void {
+export function publishInferenceTrace(
+    record: unknown,
+    execute: (command: string, record: InferenceDiagnostic, assignmentChatRequestId?: string) => unknown,
+    assignmentChatRequestId?: string,
+): void {
     try {
         const clean = prepareInferenceTrace(record);
-        if (clean) void Promise.resolve(execute(TRACE_COMMAND, clean)).catch(() => {});
+        if (!clean) return;
+        // The operational trace stays on its existing version. The renderer
+        // can publish a separate, consent-gated link for this optional ID.
+        const valid = assignmentChatRequestId
+            && /^request_[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.exec(assignmentChatRequestId)?.[0] === assignmentChatRequestId;
+        const delivery = valid ? execute(TRACE_COMMAND, clean, assignmentChatRequestId) : execute(TRACE_COMMAND, clean);
+        void Promise.resolve(delivery).catch(() => {});
     } catch { /* Optional operational observer. */ }
 }

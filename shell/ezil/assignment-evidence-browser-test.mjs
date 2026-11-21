@@ -20,7 +20,12 @@ const sourceRoot = process.env.EZIL_ASSIGNMENT_SHELL_SOURCE
     ? resolve(process.env.EZIL_ASSIGNMENT_SHELL_SOURCE)
     : fileURLToPath(new URL('.', import.meta.url));
 const endpoint = '/api/shell/assignment-evidence';
-const startCommand = { action: 'start', computerId, consentVersion: 'assignment-evidence-v1' };
+const evidenceModules = new Set([
+    '/app/src/server/ai-traces/contract.js',
+    '/app/src/server/assignment-evidence/chat-content.js',
+    '/app/src/server/assignment-evidence/terminal-commands.js',
+]);
+const startCommand = { action: 'start', computerId, consentVersion: 'assignment-evidence-v2' };
 
 let chromium;
 try {
@@ -104,6 +109,12 @@ function makeServer(handleApi) {
                 res.end(fixture);
                 return;
             }
+            if (req.method === 'GET' && evidenceModules.has(url.pathname)) {
+                const contents = await readFile(resolve(sourceRoot, '../..', url.pathname.slice(1)));
+                res.writeHead(200, { 'content-type': 'text/javascript' });
+                res.end(contents);
+                return;
+            }
             if (req.method === 'GET' && /^\/[a-z][a-z0-9-]*\.js$/.test(url.pathname)) {
                 const contents = await readFile(resolve(sourceRoot, url.pathname.slice(1)));
                 res.writeHead(200, { 'content-type': 'text/javascript' });
@@ -127,7 +138,8 @@ function apiFixture() {
     function activeAttempt(id) {
         const now = Date.now();
         return { id, state: 'active', startedAt: new Date(now).toISOString(),
-            expiresAt: new Date(now + 600_000).toISOString(), endedAt: null };
+            expiresAt: new Date(now + 600_000).toISOString(), endedAt: null,
+            consentVersion: startCommand.consentVersion, captureChat: false };
     }
     function handle(method, _url, body) {
         if (method === 'GET') {

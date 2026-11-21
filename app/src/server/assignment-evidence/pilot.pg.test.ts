@@ -5,7 +5,8 @@ import { drizzle } from 'drizzle-orm/postgres-js';
 import postgres from 'postgres';
 import { afterAll, beforeAll, expect, it } from 'vitest';
 
-import { consentVersion, readEvidencePilot, type EvidencePilot } from './contract';
+import traceFixture from '../ai-traces/fixture.json';
+import { consentVersion, legacyConsentVersion, readEvidencePilot, type EvidencePilot } from './contract';
 import { handleEvidenceRequest } from './http';
 import { evidenceStore } from './store';
 
@@ -40,6 +41,7 @@ beforeAll(async () => {
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN CREATE ROLE authenticated; END IF;
     END $$;`);
     await client.unsafe(await readFile(new URL('../../../drizzle/0034_assignment_evidence_pilot.sql', import.meta.url), 'utf8'));
+    await client.unsafe(await readFile(new URL('../../../drizzle/0035_assignment_evidence_transcripts.sql', import.meta.url), 'utf8'));
     store = evidenceStore(drizzle(client));
 });
 
@@ -104,4 +106,56 @@ it.skipIf(!pgUrl)('keeps one owner-bound ordered trace with durable receipts, re
         ['assignment.ended', 4, 'server_observed'],
     ]);
     expect((await (await get('?attemptId=' + attemptId + '&after=3')).json()).events).toHaveLength(1);
+});
+
+it.skipIf(!pgUrl)('stores exact consented Chat turns, linked Gateway activity and safe terminal executions', async () => {
+    const assignment = { ...pilot, id: randomUUID(), captureChat: true };
+    const deps = { pilot: assignment, ownerId: assignment.ownerId, store, authorizeStart: async () => true };
+    const post = (body: unknown) => handleEvidenceRequest(new Request(route, { method: 'POST', body: JSON.stringify(body) }), deps);
+    const start = { action: 'start', computerId: assignment.computerId, captureChat: true };
+    expect((await post({ ...start, consentVersion: legacyConsentVersion })).status).toBe(409);
+    expect((await post({ ...start, consentVersion, captureChat: false })).status).toBe(409);
+    const { attempt } = await (await post({ ...start, consentVersion })).json();
+    expect(attempt).toMatchObject({ captureChat: true, consentVersion });
+    const chatRequestId = 'request_' + randomUUID();
+    const retryChatRequestId = 'request_' + randomUUID();
+    const prompt = 'Add a search field to the synthetic directory.';
+    const reply = 'I added search and returned results for the synthetic fixture.';
+    const clientRequestId = randomUUID();
+    const gatewayRequestId = randomUUID();
+    const trace = { ...traceFixture, gatewayRequestId, clientRequestId, modelAlias: 'claude-sonnet-5-5' };
+    const event = (kind: string, detail: unknown) => ({ kind, detail, id: randomUUID(), occurredAt: new Date().toISOString() });
+    const events = [
+        event('chat.prompt_submitted', { chatRequestId, contentStatus: 'captured', text: prompt }),
+        event('chat.request_retried', { chatRequestId, retryChatRequestId }),
+        event('model.completed', { requestId: trace.requestId, model: trace.modelAlias, outcome: trace.outcome, trace }),
+        event('chat.gateway_linked', { chatRequestId: retryChatRequestId, requestId: trace.requestId }),
+        event('chat.response_completed', { chatRequestId: retryChatRequestId, contentStatus: 'captured', text: reply }),
+        event('terminal.command_finished', { executionId: randomUUID(), command: 'git status', exitCode: 0, durationMs: 8 }),
+        event('terminal.command_finished', { executionId: randomUUID(), command: 'echo synthetic-marker', exitCode: 0, durationMs: 3 }),
+        event('chat.prompt_submitted', { chatRequestId: 'request_' + randomUUID(), contentStatus: 'captured', text: 'password=synthetic-marker' }),
+    ];
+    const batch = { action: 'append', attemptId: attempt.id, events };
+    expect(await (await post(batch)).json()).toEqual({ accepted: events.map(event => event.id) });
+    expect(await (await post(batch)).json()).toEqual({ accepted: events.map(event => event.id) });
+    expect((await post({ ...batch, events: [event('model.completed', {
+        requestId: randomUUID(), model: trace.modelAlias, outcome: trace.outcome, trace,
+    })] })).status).toBe(400);
+
+    const fetchReport = (captureChat: boolean) => handleEvidenceRequest(new Request(route + '?attemptId=' + attempt.id),
+        { ...deps, pilot: { ...assignment, captureChat } });
+    expect((await post({ action: 'end', attemptId: attempt.id })).status).toBe(200);
+    const report = await (await fetchReport(true)).json();
+    expect(report.events).toHaveLength(10);
+    expect(report.events.at(-1).kind).toBe('assignment.ended');
+    expect(report.events[1].detail).toEqual({ chatRequestId, contentStatus: 'captured', text: prompt });
+    expect(report.events[2].detail).toEqual({ chatRequestId, retryChatRequestId });
+    expect(report.events[3].detail.trace).toEqual(trace);
+    expect(report.events[4].detail).toEqual({ chatRequestId: retryChatRequestId, requestId: trace.requestId });
+    expect(report.events[5].detail).toEqual({ chatRequestId: retryChatRequestId, contentStatus: 'captured', text: reply });
+    expect(report.events[6].detail).toMatchObject({ command: 'git status', exitCode: 0, durationMs: 8 });
+    expect(report.events[7].detail).toMatchObject({ command: null, exitCode: 0, durationMs: 3 });
+    expect(report.events[8].detail).toMatchObject({ contentStatus: 'withheld' });
+    expect(JSON.stringify(report)).not.toContain('synthetic-marker');
+    expect((await (await fetchReport(false)).json()).events[1].detail).toEqual({ chatRequestId, contentStatus: 'withheld' });
 });

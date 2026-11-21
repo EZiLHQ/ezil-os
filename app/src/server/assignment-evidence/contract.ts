@@ -1,6 +1,11 @@
 import { z } from 'zod';
 
-export const consentVersion = 'assignment-evidence-v1';
+import { validateInferenceTrace } from '../ai-traces/contract.js';
+import { assessmentChatContent } from './chat-content.js';
+import { assessmentTerminalCommands } from './terminal-commands.js';
+
+export const consentVersion = 'assignment-evidence-v2';
+export const legacyConsentVersion = 'assignment-evidence-v1';
 export const attemptLifetimeMs = 6 * 60 * 60 * 1000;
 export const maxAttemptEvents = 10_000;
 export const uuid = z.string().uuid().transform(value => value.toLowerCase());
@@ -18,6 +23,7 @@ export const pilotSchema = z.object({
     repositoryUrl,
     ref,
     baseSha: z.string().regex(/^[a-f0-9]{40}$/).refine(value => !/^0+$/.test(value)),
+    captureChat: z.boolean().optional(),
 }).strict();
 
 export type EvidencePilot = z.infer<typeof pilotSchema>;
@@ -53,9 +59,33 @@ const modelResult = z.object({
     model: z.string().regex(/^[a-z][a-z0-9_.:-]{0,127}$/i)
         .refine(value => !/secret|token|passw|bearer|credential|cookie|session|api.?key|[a-z0-9]{32,}/i.test(value)),
     outcome: z.enum(['completed', 'failed', 'cancelled']),
-}).strict();
+    trace: z.unknown().optional(),
+}).strict().transform((value, context) => {
+    if (value.trace === undefined) return { requestId: value.requestId, model: value.model, outcome: value.outcome };
+    const trace = validateInferenceTrace(value.trace);
+    if (!trace || trace.requestId !== value.requestId || trace.modelAlias !== value.model || trace.outcome !== value.outcome) {
+        context.addIssue({ code: 'custom', message: 'The inference trace does not match its request.' });
+        return z.NEVER;
+    }
+    return { requestId: value.requestId, model: value.model, outcome: value.outcome, trace };
+});
 const shape = <K extends string, S extends z.ZodTypeAny>(kind: K, detail: S) =>
     baseEvent.extend({ kind: z.literal(kind), detail }).strict();
+
+const chatRequestId = z.string().regex(/^request_[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i)
+    .transform(value => value.toLowerCase());
+const chatContent = z.discriminatedUnion('contentStatus', [
+    z.object({ chatRequestId, contentStatus: z.literal('captured'), text: z.string().min(1).max(16 * 1024) }).strict(),
+    z.object({ chatRequestId, contentStatus: z.enum(['unavailable', 'over_limit', 'withheld']) }).strict(),
+]).transform(value => value.contentStatus === 'captured'
+    ? { chatRequestId: value.chatRequestId, ...assessmentChatContent(value.text) }
+    : value);
+const terminalCompletion = z.object({
+    executionId: uuid,
+    command: z.string().max(120).nullable().transform(value => value !== null && assessmentTerminalCommands.includes(value) ? value : null),
+    exitCode: z.number().int().min(-2147483648).max(2147483647).nullable(),
+    durationMs: z.number().int().min(0).max(attemptLifetimeMs).nullable(),
+}).strict();
 
 export const eventSchema = z.discriminatedUnion('kind', [
     shape('app.opened', appDetail),
@@ -68,10 +98,20 @@ export const eventSchema = z.discriminatedUnion('kind', [
     shape('code.file_opened', openedFile),
     shape('code.file_reviewed', reviewedFile),
     shape('model.completed', modelResult),
+    shape('chat.prompt_submitted', chatContent),
+    shape('chat.response_completed', chatContent),
+    shape('chat.request_retried', z.object({ chatRequestId, retryChatRequestId: chatRequestId }).strict()
+        .refine(value => value.chatRequestId !== value.retryChatRequestId)),
+    shape('chat.gateway_linked', z.object({ chatRequestId, requestId: uuid }).strict()),
+    shape('terminal.command_finished', terminalCompletion),
 ]);
 
 export const commandSchema = z.discriminatedUnion('action', [
-    z.object({ action: z.literal('start'), computerId: uuid, consentVersion: z.literal(consentVersion) }).strict(),
+    z.object({
+        action: z.literal('start'), computerId: uuid,
+        consentVersion: z.enum([legacyConsentVersion, consentVersion]),
+        captureChat: z.boolean().optional(),
+    }).strict(),
     z.object({ action: z.literal('append'), attemptId: uuid, events: z.array(eventSchema).min(1).max(40) }).strict(),
     z.object({ action: z.literal('end'), attemptId: uuid }).strict(),
 ]).superRefine((command, context) => {

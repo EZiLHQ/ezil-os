@@ -29,12 +29,15 @@ function eventDetail (kind, detail) {
         if (Number.isSafeInteger(startLine) && Number.isSafeInteger(endLine) && startLine > 0
             && endLine >= startLine && endLine <= 1_000_000) return { path, startLine, endLine };
     }
-    if (kind === 'model.completed' && exact(detail, ['requestId', 'model', 'outcome'])) {
+    if (kind === 'model.completed' && (exact(detail, ['requestId', 'model', 'outcome']) || exact(detail, ['requestId', 'model', 'outcome', 'trace']))) {
         const { requestId, model, outcome } = detail;
         if (matches(requestId, UUID) && matches(model, /^(?:unknown|[a-z][a-z0-9_.:-]{0,127})$/i)
             && !/secret|token|passw|bearer|credential|cookie|session|api.?key|[a-z0-9]{32,}/i.test(model)
-            && ['completed', 'failed', 'cancelled'].includes(outcome)) return { requestId, model, outcome };
+            && ['completed', 'failed', 'cancelled'].includes(outcome)) return detail;
     }
+    // The collector performs the strict content, ID and command validation again.
+    if (['chat.prompt_submitted', 'chat.response_completed', 'chat.request_retried', 'chat.gateway_linked', 'terminal.command_finished'].includes(kind)
+        && detail && typeof detail === 'object' && !Array.isArray(detail)) return detail;
     return null;
 }
 
@@ -61,6 +64,7 @@ export function attachAssignmentCodeEvidence ({ iframe, frameUrl, repositoryFold
     const root = repositoryFolder + '/' + repo[1];
     let nonce = null;
     let active = false;
+    let permissions = {};
     const live = () => iframe.isConnected && iframe.src === frameUrl;
     const post = (message) => {
         try { iframe.contentWindow?.postMessage(message, url.origin); } catch { /* Frame navigated or closed. */ }
@@ -73,20 +77,23 @@ export function attachAssignmentCodeEvidence ({ iframe, frameUrl, repositoryFold
         disarm();
         if (!active || !live()) return;
         nonce = token(host);
-        post({ type: 'ezil.code.assignment.start', v: 1, nonce, mint, root });
+        post({ type: 'ezil.code.assignment.start', v: 1, nonce, mint, root,
+            captureChat: permissions.chat === true, captureTerminal: permissions.terminal === true });
     };
     const message = (event) => {
         if (!active || !nonce || !live() || !event.source || event.source !== iframe.contentWindow || event.origin !== url.origin) return;
         const data = event.data;
         if (!exact(data, ['type', 'v', 'nonce', 'kind', 'detail']) || data.type !== 'ezil.code.assignment.event'
             || data.v !== 1 || data.nonce !== nonce) return;
-        if (data.kind !== 'model.completed' && (host.document.visibilityState !== 'visible' || !iframe.getClientRects().length)) return;
+        if ((data.kind === 'code.file_opened' || data.kind === 'code.file_reviewed')
+            && (host.document.visibilityState !== 'visible' || !iframe.getClientRects().length)) return;
         const detail = eventDetail(data.kind, data.detail);
         if (detail) record(data.kind, detail, scope);
     };
     iframe.addEventListener('load', arm);
     host.addEventListener('message', message);
-    const unsubscribe = subscribe(scope, (value) => {
+    const unsubscribe = subscribe(scope, (value, granted = {}) => {
+        permissions = granted;
         if (active === value) return;
         active = value === true;
         arm();

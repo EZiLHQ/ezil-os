@@ -22,7 +22,7 @@ function fixture() {
     let path = root + '/before-start.ts';
     let observer: (() => void) | undefined;
     const shellDocument = { visibilityState: 'visible' };
-    const editorDocument = { visibilityState: 'visible', querySelectorAll: () => hooks.showFile ? [buffer] : [] };
+    const editorDocument = { documentElement: { dataset: {} }, visibilityState: 'visible', querySelectorAll: () => hooks.showFile ? [buffer] : [] };
     const send = (recipient: EventTarget, type: string, properties: object) => {
         recipient.dispatchEvent(Object.assign(new Event(type), properties));
     };
@@ -51,21 +51,21 @@ function fixture() {
         setInterval: (callback: () => void) => { observer = callback; return 1; },
         clearInterval: () => { observer = undefined; },
     });
-    let consentChange: ((active: boolean) => void) | undefined;
+    let consentChange: ((active: boolean, permissions?: { chat?: boolean; terminal?: boolean }) => void) | undefined;
     const detach = attachAssignmentCodeEvidence({
         iframe, frameUrl, repositoryFolder, repositoryName: 'example/assignment', scope,
-        subscribe: (requested: typeof scope, listener: (active: boolean) => void) => {
+        subscribe: (requested: typeof scope, listener: (active: boolean, permissions?: { chat?: boolean; terminal?: boolean }) => void) => {
             expect(requested).toEqual(scope); consentChange = listener; listener(false);
             return () => { consentChange = undefined; };
         },
         record: (kind: string, detail: unknown, assignment: typeof scope) => records.push({ kind, detail, assignment }),
     });
     return {
-        hooks, records, shell, editor, iframe, send, detach,
+        hooks, records, shell, editor, iframe, send, detach, editorDocument,
         setPath(value: string) { path = value; },
         sample() { observer?.(); },
         armed() { return observer !== undefined; },
-        consent(active: boolean) { consentChange?.(active); },
+        consent(active: boolean, permissions?: { chat?: boolean; terminal?: boolean }) { consentChange?.(active, permissions); },
         trace(value = traceFixture) { send(editor, 'ezil-ai-request-trace', { detail: JSON.stringify(value) }); },
     };
 }
@@ -90,7 +90,7 @@ test('the two sides publish subsequent file activation, exact model ranges and e
     expect(f.records).toEqual([
         { kind: 'code.file_opened', detail: { path: 'src/test file.ts' }, assignment: scope },
         { kind: 'code.file_reviewed', detail: { path: 'src/test file.ts', startLine: 12, endLine: 25 }, assignment: scope },
-        { kind: 'model.completed', detail: { requestId: traceFixture.requestId, model: traceFixture.modelAlias, outcome: traceFixture.outcome }, assignment: scope },
+        { kind: 'model.completed', detail: { requestId: traceFixture.requestId, model: traceFixture.modelAlias, outcome: traceFixture.outcome, trace: traceFixture }, assignment: scope },
     ]);
     f.consent(false);
     expect(f.armed()).toBe(false);
@@ -124,4 +124,54 @@ test('the workbench script is omitted in production and uses the original CSP no
     expect(codeAssignmentEvidenceTag([shellOrigin, 'https://evil.example'], 'test-nonce')).toBe('');
     expect(codeAssignmentEvidenceTag([shellOrigin], '";bad')).toBe('');
     expect(codeAssignmentEvidenceTag([shellOrigin], 'test-nonce')).toStartWith('<script nonce="test-nonce" data-ezil-assignment-evidence="1">');
+});
+
+test('Chat, correlated model traces, and safe terminal completion require their respective arm flags', () => {
+    const f = fixture();
+    const chatRequestId = 'request_11111111-1111-4111-8111-111111111111';
+    const executionId = '22222222-2222-4222-8222-222222222222';
+    const event = (type: string, detail: unknown) => f.send(f.editor, type, { detail });
+    const prompt = { kind: 'chat.prompt_submitted', chatRequestId, text: 'Add a search field to the synthetic directory.' };
+    const trace = { ...traceFixture, clientRequestId: executionId, gatewayRequestId: '33333333-3333-4333-8333-333333333333' };
+    const retryChatRequestId = 'request_44444444-4444-4444-8444-444444444444';
+    const link = { chatRequestId: retryChatRequestId, requestId: trace.requestId };
+
+    f.consent(true);
+    event('ezil:assignment-chat', prompt);
+    event('ezil:assignment-terminal', { executionId, command: 'git status', exitCode: 0, durationMs: 8 });
+    expect(f.records).toEqual([]);
+    f.consent(false);
+
+    f.consent(true, { chat: true, terminal: true });
+    expect(f.editorDocument.documentElement.dataset).toMatchObject({
+        ezilAssignmentChat: '1', ezilAssignmentTerminal: '1', ezilAssignmentRoot: root,
+    });
+    event('ezil:assignment-gateway-link', link); // no preceding matching inference
+    event('ezil:assignment-chat', prompt);
+    event('ezil:assignment-chat', { kind: 'chat.request_retried', chatRequestId, retryChatRequestId });
+    f.trace(trace);
+    event('ezil:assignment-gateway-link', link);
+    event('ezil:assignment-chat', { ...prompt, kind: 'chat.response_completed', text: 'Example password=synthetic-marker' });
+    event('ezil:assignment-terminal', { executionId, command: 'git status', exitCode: 0, durationMs: 8 });
+    event('ezil:assignment-terminal', { executionId, command: 'echo synthetic-marker', exitCode: 0, durationMs: 3 });
+    expect(f.records).toEqual([
+        { kind: 'chat.prompt_submitted', assignment: scope, detail: {
+            chatRequestId, contentStatus: 'captured', text: prompt.text,
+        } },
+        { kind: 'chat.request_retried', assignment: scope, detail: { chatRequestId, retryChatRequestId } },
+        { kind: 'model.completed', assignment: scope, detail: {
+            requestId: trace.requestId, model: trace.modelAlias, outcome: trace.outcome, trace,
+        } },
+        { kind: 'chat.gateway_linked', assignment: scope, detail: link },
+        { kind: 'chat.response_completed', assignment: scope, detail: {
+            chatRequestId, contentStatus: 'withheld',
+        } },
+        { kind: 'terminal.command_finished', assignment: scope, detail: { executionId, command: 'git status', exitCode: 0, durationMs: 8 } },
+        { kind: 'terminal.command_finished', assignment: scope, detail: { executionId, command: null, exitCode: 0, durationMs: 3 } },
+    ]);
+    f.consent(false);
+    expect(f.editorDocument.documentElement.dataset).toEqual({});
+    event('ezil:assignment-chat', prompt);
+    expect(f.records).toHaveLength(7);
+    f.detach();
 });

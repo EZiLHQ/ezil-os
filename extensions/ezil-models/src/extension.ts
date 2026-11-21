@@ -266,7 +266,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         secrets: () => store.secrets(),
         logRequests: () => settings().get<boolean>('logRequests') === true,
         log,
-        inferenceDiagnostic: record => publishInferenceTrace(record, (command, clean) => vscode.commands.executeCommand(command, clean)),
+        inferenceDiagnostic: (record, assignmentChatRequestId) =>
+            publishInferenceTrace(record, (...args) => vscode.commands.executeCommand(...args), assignmentChatRequestId),
         beginInferenceActivity: hostedInferenceActivity,
         appFailure: sendAppFailure,
         billingIntent: sendBillingIntent,
