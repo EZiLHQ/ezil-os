@@ -7973,7 +7973,9 @@ async function handleAiAccountRead(request: Request, env: Env, sandboxId: string
     const token = boot ? await sandbox.getAiCredential() : null;
     return boot && token ? { boot, token, creditsRelay: await sandbox.getAiCreditsRelay() } : null;
   };
-  const balance = await readAiAccountBalance({ owner: claims.userId, sandboxId, current, fetch, signal: request.signal });
+  const balance = await readAiAccountBalance({
+    owner: claims.userId, sandboxId, current, fetch: (input, init) => fetch(input, init), signal: request.signal,
+  });
   return balance ? respond(200, balance) : respond(503, { error: 'ai_account_unavailable' });
 }
 
