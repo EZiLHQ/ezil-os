@@ -4343,6 +4343,7 @@ $.fn.showWindow = async function (options) {
                     if ( ! morphed && was_hidden ) $(el_window).hide();
                 }
                 if ( ! morphed ) $(el_window).fadeIn(150);
+                el_window._ezil_restore_frame_viewport?.();
                 // Restores come back with the control drawer collapsed —
                 // whatever state it was minimized in (headless dashboard
                 // windows only; no-op otherwise).
@@ -4400,6 +4401,7 @@ $.fn.showWindow = async function (options) {
                 setTimeout(() => {
                     $(el_window).css('transition', 'none');
                 }, 250);
+                el_window._ezil_restore_frame_viewport?.();
             }
         }
     });
@@ -5259,6 +5261,7 @@ $.fn.hideWindow = async function (options) {
     $(this).each(async function () {
         if ( $(this).hasClass('window') ) {
             window.dispatchEvent(new CustomEvent('ezil:native-composition', { detail: { window: this, visible: false } }));
+            this._ezil_preserve_frame_viewport?.();
             // get taskbar item location
             let taskbar_item_pos = $(`.taskbar .taskbar-item[data-app="${$(this).attr('data-app')}"]`).position();
 
