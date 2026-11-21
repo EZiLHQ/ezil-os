@@ -20,10 +20,29 @@
  * every verb reports `chrome_unreachable` rather than throwing when it cannot
  * be made. A Chrome restart is also what invalidates every outstanding ref,
  * so the ref generation is bumped when the connection is rebuilt.
+ *
+ * ── v2: origin tiers, page-bound refs, page-scoped buffers ──────────────────
+ * The origin policy (`origin-policy.mjs`) is loaded from `process.env` ONCE,
+ * when the surface is created, and malformed tier entries are logged then.
+ * Tests inject a policy instead.
+ *
+ * Every page (tab) gets a key the first time this process sees it. A ref
+ * remembers the key and the origin of the page whose snapshot minted it, so a
+ * ref used on another tab, or after the tab's origin changed, is `stale_ref`
+ * even when a leftover `data-ezil-ref` attribute there happens to match.
+ *
+ * Console and network entries are tagged with their page's key and SANITISED
+ * AS THEY ARE RECORDED (`sanitizeUrl` / `sanitizeText`), so an OAuth `code`
+ * or `state` never sits in a buffer waiting for a response to carry it out.
+ * `consoleEntries(page)` / `networkEntries(page)` return only that page's
+ * entries, in the public v1 shape; the tag never leaves.
  */
 
 import { chromium } from 'playwright-core';
 import { passwordValues } from './page-scripts.mjs';
+import {
+    isOriginPolicy, loadOriginPolicy, originPolicyBootLines, sanitizeText, sanitizeUrl, tierOf,
+} from './origin-policy.mjs';
 
 /** How many console lines / network records are retained. */
 export const CONSOLE_BUFFER_MAX = 300;
@@ -34,15 +53,23 @@ export const NETWORK_BUFFER_MAX = 300;
 const REF_HISTORY_MAX = 4000;
 
 export class BrowserSurface {
-    constructor (cdpUrl) {
+    /**
+     * @param {string} cdpUrl
+     * @param {{ originPolicy?: object }} [options] `originPolicy` must come from
+     *   `loadOriginPolicy`; omitted, it is loaded from `process.env` here.
+     */
+    constructor (cdpUrl, { originPolicy } = {}) {
         this.cdpUrl = cdpUrl;
         this.browser = null;
         this.connecting = null;
         /** Bumped by every snapshot AND by every main-frame navigation. A ref
          *  whose generation is not the current one is STALE, not unknown. */
         this.refGeneration = 0;
-        /** ref -> { generation, role, name, isPassword } */
+        /** ref -> { generation, role, name, isPassword, pageKey, origin } */
         this.refs = new Map();
+        /** Internal records `{ pageKey, tier, entry }`; `entry` is the public
+         *  shape, already sanitised. Read through `consoleEntries(page)` /
+         *  `networkEntries(page)`, never directly into a response. */
         this.consoleBuffer = [];
         this.networkBuffer = [];
         /** Values this process has typed into password fields. Kept because a
@@ -50,6 +77,31 @@ export class BrowserSurface {
          *  the type and the response that must not contain it. */
         this.typedSecrets = new Set();
         this.attached = new WeakSet();
+        /** page -> 'p<n>'. A WeakMap so a closed tab's key goes with it. */
+        this.pageKeys = new WeakMap();
+        this.pageCounter = 0;
+
+        if (originPolicy === undefined) {
+            this.originPolicy = loadOriginPolicy(process.env);
+            // "Logged once at boot": the surface is built once, by startServer.
+            for (const line of originPolicyBootLines(this.originPolicy)) console.warn(line);
+        } else if (isOriginPolicy(originPolicy)) {
+            this.originPolicy = originPolicy;
+        } else {
+            throw new TypeError('BrowserSurface: originPolicy must come from loadOriginPolicy(env)');
+        }
+    }
+
+    /** This process's key for a page, minted the first time it is seen. */
+    pageKeyOf (page) {
+        if (page === null || typeof page !== 'object') return null;
+        let key = this.pageKeys.get(page);
+        if (key === undefined) {
+            this.pageCounter += 1;
+            key = `p${this.pageCounter}`;
+            this.pageKeys.set(page, key);
+        }
+        return key;
     }
 
     /** True when a live CDP connection exists. Never throws. */
@@ -117,44 +169,47 @@ export class BrowserSurface {
     attach (page) {
         if (this.attached.has(page)) return;
         this.attached.add(page);
+        const pageKey = this.pageKeyOf(page);
 
         page.on('console', (msg) => {
-            let text = '';
-            try { text = msg.text(); } catch { text = ''; }
-            let location = null;
-            try {
-                const l = msg.location();
-                location = l && l.url ? `${l.url}:${l.lineNumber ?? 0}` : null;
-            } catch { /* location is best effort */ }
-            push(this.consoleBuffer, CONSOLE_BUFFER_MAX, {
-                level: normaliseLevel(msg.type()),
-                text,
-                location,
-                at: new Date().toISOString(),
+            this.record(this.consoleBuffer, CONSOLE_BUFFER_MAX, page, pageKey, () => {
+                let text = '';
+                try { text = msg.text(); } catch { text = ''; }
+                let location = null;
+                try {
+                    const l = msg.location();
+                    location = l && l.url ? `${sanitizeUrl(l.url, this.originPolicy)}:${l.lineNumber ?? 0}` : null;
+                } catch { /* location is best effort */ }
+                return {
+                    level: normaliseLevel(msg.type()),
+                    text: sanitizeText(text, this.originPolicy),
+                    location,
+                    at: new Date().toISOString(),
+                };
             });
         });
 
         page.on('pageerror', (err) => {
-            push(this.consoleBuffer, CONSOLE_BUFFER_MAX, {
+            this.record(this.consoleBuffer, CONSOLE_BUFFER_MAX, page, pageKey, () => ({
                 level: 'error',
-                text: err && err.message ? err.message : String(err),
+                text: sanitizeText(err && err.message ? err.message : String(err), this.originPolicy),
                 location: null,
                 at: new Date().toISOString(),
-            });
+            }));
         });
 
         page.on('requestfinished', (request) => {
-            void this.recordRequest(request);
+            void this.recordRequest(page, pageKey, request);
         });
         page.on('requestfailed', (request) => {
-            push(this.networkBuffer, NETWORK_BUFFER_MAX, {
+            this.record(this.networkBuffer, NETWORK_BUFFER_MAX, page, pageKey, () => ({
                 method: request.method(),
-                url: request.url(),
+                url: sanitizeUrl(request.url(), this.originPolicy),
                 status: null,
                 resourceType: request.resourceType(),
                 failure: (request.failure() || {}).errorText || 'failed',
                 at: new Date().toISOString(),
-            });
+            }));
         });
 
         // Refs are valid only within the snapshot that produced them, and a
@@ -166,31 +221,83 @@ export class BrowserSurface {
         });
     }
 
-    async recordRequest (request) {
+    async recordRequest (page, pageKey, request) {
         let status = null;
         try {
             const response = await request.response();
             status = response ? response.status() : null;
         } catch { /* response may be gone */ }
-        push(this.networkBuffer, NETWORK_BUFFER_MAX, {
+        this.record(this.networkBuffer, NETWORK_BUFFER_MAX, page, pageKey, () => ({
             method: request.method(),
-            url: request.url(),
+            url: sanitizeUrl(request.url(), this.originPolicy),
             status,
             resourceType: request.resourceType(),
             failure: null,
             at: new Date().toISOString(),
-        });
+        }));
     }
 
-    /** Register the refs a fresh snapshot minted, under a new generation. */
-    registerRefs (entries) {
+    /**
+     * Append one entry, built (and sanitised) by `build`, tagged with its
+     * page's key and the tier the page was in when it was recorded.
+     *
+     * Built inside a try because this runs in a Playwright event listener:
+     * a throw here must cost this ONE entry, never the listener or the
+     * process — and an entry that could not be built is dropped rather than
+     * stored half-sanitised.
+     */
+    record (buffer, max, page, pageKey, build) {
+        let entry;
+        let tier;
+        try {
+            entry = Object.freeze(build());
+            tier = tierOf(page.url(), this.originPolicy);
+        } catch {
+            return;
+        }
+        push(buffer, max, { pageKey, tier, entry });
+    }
+
+    /**
+     * The console entries recorded from `page`, public shape only.
+     *
+     * Entries recorded while that tab was ON an `idp_transit` origin are left
+     * out too. `/console` already answers `origin_read_only` while the page is
+     * on the IdP; without this, the same text would simply come out on the
+     * first call after the redirect back. The IdP's own page text never
+     * leaves; the URLs it visited still do, sanitised, through `/network`.
+     */
+    consoleEntries (page) {
+        return this.entriesFor(this.consoleBuffer, page, (r) => r.tier !== 'idp_transit');
+    }
+
+    /** The network entries recorded from `page`, public shape only. */
+    networkEntries (page) {
+        return this.entriesFor(this.networkBuffer, page, () => true);
+    }
+
+    entriesFor (buffer, page, keep) {
+        const key = page !== null && typeof page === 'object' ? this.pageKeys.get(page) : undefined;
+        if (key === undefined) return [];
+        return buffer.filter((r) => r.pageKey === key && keep(r)).map((r) => ({ ...r.entry }));
+    }
+
+    /**
+     * Register the refs a fresh snapshot of `page` minted, under a new
+     * generation, bound to that page and to the origin it had when read.
+     */
+    registerRefs (entries, page) {
         this.refGeneration += 1;
+        const pageKey = this.pageKeyOf(page);
+        const origin = pageOrigin(page);
         for (const entry of entries) {
             this.refs.set(entry.ref, {
                 generation: this.refGeneration,
                 role: entry.role,
                 name: entry.name,
                 isPassword: !!entry.isPassword,
+                pageKey,
+                origin,
             });
         }
         // Bound the history so a long session cannot grow this without limit,
@@ -206,12 +313,16 @@ export class BrowserSurface {
     /**
      * Resolve a ref to a locator, or throw the RIGHT error.
      *
-     *   never issued          -> bad_ref   ("you guessed")
-     *   issued, older snapshot-> stale_ref ("re-snapshot")
-     *   issued, current, gone -> stale_ref ("the page moved under you")
+     *   never issued                 -> bad_ref   ("you guessed")
+     *   issued, older snapshot       -> stale_ref ("re-snapshot")
+     *   issued on ANOTHER tab        -> stale_ref ("re-snapshot this one")
+     *   issued, page's origin changed-> stale_ref ("re-snapshot")
+     *   issued, current, gone        -> stale_ref ("the page moved under you")
      *
-     * Collapsing the last two into the first is what makes a recoverable state
-     * look like a mistake, which is why the contract names them separately.
+     * Collapsing the stale cases into the first is what makes a recoverable
+     * state look like a mistake, which is why the contract names them
+     * separately. The tab and origin checks run BEFORE the DOM is queried, so
+     * a leftover `data-ezil-ref` on another tab is never even looked up.
      */
     async resolveRef (page, ref) {
         if (typeof ref !== 'string' || !/^e[0-9]+$/.test(ref)) {
@@ -227,6 +338,18 @@ export class BrowserSurface {
         }
         if (known.generation !== this.refGeneration) {
             const err = new Error(`ref '${ref}' came from an earlier snapshot — call /snapshot again`);
+            err.code = 'stale_ref';
+            throw err;
+        }
+        const pageKey = page !== null && typeof page === 'object' ? this.pageKeys.get(page) : undefined;
+        if (!known.pageKey || known.pageKey !== pageKey) {
+            const err = new Error(`ref '${ref}' was minted on another tab — call /snapshot on this one`);
+            err.code = 'stale_ref';
+            throw err;
+        }
+        const origin = pageOrigin(page);
+        if (known.origin === null || origin === null || known.origin !== origin) {
+            const err = new Error(`ref '${ref}' predates this page's current origin — call /snapshot again`);
             err.code = 'stale_ref';
             throw err;
         }
@@ -289,6 +412,15 @@ export class BrowserSurface {
 function push (buffer, max, entry) {
     buffer.push(entry);
     while (buffer.length > max) buffer.shift();
+}
+
+/** The origin of the page's current URL, or null when it cannot be read. */
+function pageOrigin (page) {
+    try {
+        return new URL(page.url()).origin;
+    } catch {
+        return null;
+    }
 }
 
 function normaliseLevel (type) {

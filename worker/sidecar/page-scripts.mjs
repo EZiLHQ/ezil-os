@@ -390,3 +390,70 @@ export function containsText (needle) {
     if (!body) return false;
     return (body.innerText || body.textContent || '').includes(needle);
 }
+
+// ── v2 (`/fill_form`, `/select`, `/scroll`) ─────────────────────────────────
+// Called through `locator.evaluate(fn, arg)` / `page.evaluate(fn, arg)`. The
+// only request-derived input any of them sees is DATA the handler has already
+// validated (option strings, an integer), never code and never a selector.
+
+/**
+ * `/fill_form` preflight for ONE element: can `fill` put a value in it right
+ * now, and is it a password field? Run for every field before any is filled,
+ * so a button, checkbox, `<select>`, disabled or readonly control among the
+ * refs refuses the whole form instead of leaving it half-filled. Mirrors the
+ * input types Playwright's `fill` accepts.
+ */
+export function fieldState (el) {
+    if (!el || el.nodeType !== 1) return { fillable: false, isPassword: false };
+    const tag = el.tagName.toLowerCase();
+    const ariaDisabled = !!(el.closest && el.closest('[aria-disabled="true"]'));
+    if (tag === 'input' || tag === 'textarea') {
+        const type = tag === 'textarea' ? 'textarea' : String(el.type || 'text').toLowerCase();
+        const FILLABLE = [
+            'textarea', '', 'text', 'email', 'number', 'password', 'search', 'tel', 'url',
+            'color', 'date', 'time', 'datetime-local', 'month', 'range', 'week',
+        ];
+        const usable = !el.matches(':disabled') && !ariaDisabled && !el.hasAttribute('readonly');
+        return { fillable: FILLABLE.includes(type) && usable, isPassword: type === 'password' };
+    }
+    if (el.isContentEditable) return { fillable: !ariaDisabled, isPassword: false };
+    return { fillable: false, isPassword: false };
+}
+
+/**
+ * `/select` preflight: is this a real `<select>`, and how many of `values`
+ * match no option? Matching is Playwright's own rule for a string — the
+ * option's value, or its label exactly or with whitespace normalised — so a
+ * typo answers at once instead of after the action timeout.
+ */
+export function selectState (el, values) {
+    if (!el || el.nodeType !== 1 || el.tagName.toLowerCase() !== 'select') return { isSelect: false, unmatched: 0 };
+    const norm = (s) => String(s).replace(/[\u200b\u00ad]/g, '').trim().replace(/\s+/g, ' ');
+    const options = Array.from(el.options || []);
+    let unmatched = 0;
+    for (const v of Array.isArray(values) ? values : []) {
+        const hit = options.some((o) => o.value === v || o.label === v || norm(o.label) === norm(v));
+        if (!hit) unmatched += 1;
+    }
+    return { isSelect: true, unmatched: unmatched };
+}
+
+/**
+ * Scroll the WINDOW by `dy` CSS pixels and answer the offset after.
+ * `instant` so a page with `scroll-behavior: smooth` still reports where it
+ * ended up rather than where an animation happened to be.
+ */
+export function scrollWindowBy (dy) {
+    const top = Number(dy) || 0;
+    try {
+        window.scrollBy({ top: top, left: 0, behavior: 'instant' });
+    } catch {
+        window.scrollBy(0, top);
+    }
+    return window.scrollY;
+}
+
+/** The window's vertical scroll offset. */
+export function windowScrollY () {
+    return window.scrollY;
+}
