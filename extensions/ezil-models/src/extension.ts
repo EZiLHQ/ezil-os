@@ -382,6 +382,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             syncUrl: bridgeSync, token: bridgeToken, ownerId: `ext.${randomUUID()}`, log,
             execute: (request) => Promise.resolve(vscode.commands.executeCommand(BRIDGE_COMMAND, request)),
             fetch: (url, init) => fetch(url, init),
+            beginReceipt: (owner, operationId, resource) => {
+                const allowed = () => vscode.workspace.getConfiguration('ezil').get('chatBridge.qaReceipts') === true;
+                const url = new URL(bridgeSync);
+                if (typeof owner !== 'string' || !owner.startsWith('unattended.') || !allowed()
+                    || url.protocol !== 'https:' || !url.hostname.endsWith('-code.ezil.work')) return undefined;
+                return provider.beginBridgeReceipt(operationId, resource, line => { if (allowed()) log(line); });
+            },
             ensureAgent: async () => {
                 const agent = vscode.extensions.getExtension('GitHub.copilot-chat');
                 if (!agent) return false;

@@ -98,6 +98,8 @@ export interface BridgeClientDeps {
      * activating, ended canceled. False: not sent now (not_delivered, agent_not_ready), retried until expiry.
      */
     ensureAgent?: () => Promise<boolean>;
+    /** Optional local evidence; start before submit and finalize only when Code reports a completed request. */
+    beginReceipt?: (ownerId: unknown, operation: string, resource: string) => ((requestId: string) => void) | undefined;
     /** The fixed `thinking.effort` this extension sends for one of its own models (picker metadata id), or null. */
     effortOf?: (modelId: string) => string | null;
     /** Of these picker metadata ids (this extension's own models), those with fresh Gateway evidence for this account. */
@@ -205,6 +207,7 @@ export class ChatBridgeClient {
     /** Fixed by the first `hello` (before the first sync) and never changed: OS keys the lease and every report on it. */
     private ownerId: string | null = null;
     private reports: (Report & { attemptId: string })[] = [];
+    private readonly receipts = new Map<string, (requestId: string) => void>();
     private readonly tracked = new Map<string, Tracked>();
     private timer: ReturnType<typeof setTimeout> | undefined;
     private stopped = false;
@@ -320,6 +323,7 @@ export class ChatBridgeClient {
         this.claimedEpoch = 0;
         this.reports = [];
         this.tracked.clear();
+        this.receipts.clear();
     }
 
     private async sync(body: Record<string, unknown>): Promise<SyncReply | null> {
@@ -421,6 +425,12 @@ export class ChatBridgeClient {
                 this.report({ operationId: delivery.operationId, status: 'not_delivered', reason: 'agent_not_ready' }, attempt);
                 return;
             }
+            if (this.deps.beginReceipt && !this.receipts.has(delivery.operationId)) {
+                try {
+                    const capture = this.deps.beginReceipt(this.fence().ownerId, delivery.operationId, delivery.sessionResource);
+                    if (capture) this.receipts.set(delivery.operationId, capture);
+                } catch { /* Optional diagnostics cannot withhold a task. */ }
+            }
             let report: Report;
             try {
                 // The deadline travels as time left (never a wall-clock time: the workbench runs on another machine).
@@ -493,6 +503,7 @@ export class ChatBridgeClient {
     /** Report now; keep watching until final; attach the final response text of THAT request only. */
     private async finish(sessionResource: string, report: Report, attemptId: string, operationId = report.operationId): Promise<void> {
         if (report.status === 'not_delivered') {
+            this.receipts.delete(operationId);
             this.tracked.delete(operationId);
             this.report(report, attemptId);
             return;
@@ -500,6 +511,11 @@ export class ChatBridgeClient {
         if (FINAL.has(report.status)) {
             this.tracked.delete(operationId);
             this.report(await this.withResponse(sessionResource, report), attemptId);
+            const capture = this.receipts.get(operationId);
+            this.receipts.delete(operationId);
+            if (capture && report.status === 'completed' && report.requestId) {
+                try { capture(report.requestId); } catch { /* Diagnostics cannot affect delivery. */ }
+            }
             return;
         }
         const known = this.tracked.get(operationId);
@@ -517,6 +533,7 @@ export class ChatBridgeClient {
             }
             const v = view as View | undefined;
             if (v?.ok === true && v.status === 'unknown_command') {
+                this.receipts.delete(item.operationId);
                 this.tracked.delete(item.operationId);
                 this.report({ operationId: item.operationId, status: 'uncertain', reason: 'lost_by_workbench' }, item.attemptId);
                 continue;

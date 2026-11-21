@@ -116,6 +116,12 @@
           "markdownDescription": "With `ezil.chatBridge.enabled`, also keep a private Code workbench running inside this computer while it is up, so instructions sent through EZiL OS run even when none of your Code windows is open. It is a separate headless window on its own throwaway profile: it never touches your browser, your desktop or a window you have open, and a window you open takes precedence. The computer still stops when idle. Off by default; turning it off stops the private workbench.",
           "scope": "machine"
         },
+        "ezil.chatBridge.qaReceipts": {
+          "type": "boolean",
+          "default": false,
+          "scope": "machine",
+          "markdownDescription": "Record content-free Gateway request IDs for completed unattended Code operations in this computer's local EZiL Models log during staging verification."
+        },
         "ezilModels.logRequests": {
           "type": "boolean",
           "default": false,
