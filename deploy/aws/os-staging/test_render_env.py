@@ -527,6 +527,21 @@ class DelegationEnvironmentTests(unittest.TestCase):
         # Disabled does not bypass the check: a leftover wrong-environment pin still fails closed.
         self.refused(delegation(EZIL_DELEGATION_AUDIENCE="https://os-staging.ezil.work", **{DELEGATION_GATE: "disabled"}))
 
+    def test_preview_token_v2_requires_exact_staging_switch_and_worker(self):
+        flag = {renderer.STAGING_PREVIEW_TOKEN_V2: "1"}
+        worker_key = "CLOUDFLARE_GUACAMOLE_WORKER_URL"
+        worker_url = "https://api-desktop-staging.ezil.work"
+        stage = {**self.staging, worker_key: worker_url, **flag}
+        self.assertEqual(renderer.validate(stage, "staging"), stage)
+        self.refused(flag, "staging")
+        for value in ("0", "enabled", "true", " 1", "1 "):
+            self.refused({worker_key: worker_url, renderer.STAGING_PREVIEW_TOKEN_V2: value}, "staging")
+        for url in ("https://api-desktop.ezil.work", worker_url + "/path", worker_url + ".example",
+                    worker_url + "/", "http://api-desktop-staging.ezil.work"):
+            self.refused({worker_key: url, **flag}, "staging")
+        self.refused(flag, "production")
+        self.refused({worker_key: worker_url, **flag}, "production")
+
     def test_browser_observe_gate_is_staging_only(self):
         gate = {renderer.STAGING_BROWSER_OBSERVE: "enabled"}
         pins = delegation(EZIL_DELEGATION_ISSUER="https://connect-staging.ezil.work",

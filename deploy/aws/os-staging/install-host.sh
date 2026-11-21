@@ -59,7 +59,7 @@ done
 if [[ -n $approved_source ]]; then
     aws --region ap-south-1 --no-cli-pager s3 cp \
         "s3://$bucket/os-staging/images/$tag.source.json" "$temporary/$tag.source.json" --only-show-errors
-    verified_image_id=$(verify_install_source archive "$temporary" "$tag" staging "$approved_source" "$receipt_hash")
+    verified_image_identities=$(verify_install_source archive-load-identities "$temporary" "$tag" staging "$approved_source" "$receipt_hash")
 fi
 python3 - "$temporary" "$tag" <<'PY'
 import hashlib, pathlib, re, sys
@@ -165,7 +165,7 @@ docker image inspect "$slug:$tag" --format '{{.Architecture}}' | \
     python3 -c 'import sys; sys.exit(0 if sys.stdin.read().strip() == "amd64" else 1)'
 if [[ -n $approved_source ]]; then
     docker image inspect "$slug:$tag" --format '{{json .}}' > "$temporary/loaded-image.json"
-    verify_install_source loaded "$temporary/loaded-image.json" "$approved_source" "$verified_image_id"
+    verified_image_id=$(verify_install_source loaded-identity "$temporary/loaded-image.json" "$approved_source" "$verified_image_identities")
     # Capture only nonsecret recovery identities before overwriting runtime files.
     # These observations do not substitute for the reviewed rollback archives.
     previous_image_ref=unavailable previous_image_id=unavailable previous_source=unavailable

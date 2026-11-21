@@ -7,6 +7,7 @@ import { exactCacheEligible, resolveGatewayUrl } from './ai-proxy';
 
 interface WorkerConfig {
   name: string;
+  compatibility_flags: string[];
   vars: Record<string, string>;
   routes: Array<{ pattern: string; zone_name: string }>;
   containers: Array<{ name?: string; class_name: string; image: string; max_instances: number }>;
@@ -20,6 +21,11 @@ const config = Bun.TOML.parse(readFileSync(new URL('../wrangler.toml', import.me
 const staging = config.env.staging;
 
 describe('staging Worker resources and routes', () => {
+  it('enables inbound Browser cancellation only in staging and retains Node compatibility', () => {
+    expect(config.compatibility_flags).toEqual(['nodejs_compat']);
+    expect(staging.compatibility_flags).toEqual(['nodejs_compat', 'enable_request_signal']);
+  });
+
   it('uses its own Worker, container application and local Sandbox namespace', () => {
     expect(staging.name).toBe('ezil-os-worker-staging');
     expect(staging.name).not.toBe(config.name);
@@ -62,7 +68,13 @@ describe('staging Worker resources and routes', () => {
       AWS_ROUTING_ENABLED: 'on',
       AWS_ORIGIN_ZONE: 'ezil.work',
       AWS_ORIGIN_ZONE_ALLOWLIST: 'ezil.work',
+      EZIL_EDITOR_BRIDGE_ENVIRONMENT: 'staging',
     });
+    expect(config.vars.EZIL_EDITOR_BRIDGE_ENVIRONMENT).toBeUndefined();
+    expect(config.vars.EZIL_OS_BRIDGE_URL).toBeUndefined();
+    expect(staging.vars.EZIL_OS_BRIDGE_URL).toBeUndefined();
+    expect(config.vars.EZIL_EDITOR_BRIDGE_TARGETS).toBeUndefined();
+    expect(staging.vars.EZIL_EDITOR_BRIDGE_TARGETS).toBeUndefined();
   });
 
   it('routes AWS computers in each environment through its own zone', () => {

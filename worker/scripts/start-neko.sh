@@ -50,6 +50,12 @@
 # case the pixel/desktop stream stays gated exactly as before.
 set -uo pipefail
 
+# Keep the separately scoped Worker credential out of Code, Chrome and project
+# child environments. Only the sidecar receives it below.
+unset SIDECAR_WORKER_BROWSER_MCP_TOKEN
+SIDECAR_WORKER_BROWSER_MCP_TOKEN="${EZIL_WORKER_BROWSER_MCP_TOKEN:-}"
+unset EZIL_WORKER_BROWSER_MCP_TOKEN
+
 LOG=/tmp/neko.log
 
 # ── Boot-phase observability (always on, cheap, no exec route into prod) ─────
@@ -1005,6 +1011,17 @@ launch_devserver() {
 EZIL_SIDECAR_ENTRY="${EZIL_SIDECAR_ENTRY:-/opt/ezil-sidecar/server.mjs}"
 EZIL_SIDECAR_PORT="${EZIL_SIDECAR_PORT:-9223}"
 EZIL_SIDECAR_LOG="${EZIL_SIDECAR_LOG:-/tmp/ezil-sidecar.log}"
+# The Code App and sidecar belong to this same single-tenant desktop. A boot
+# capability keeps this local operation independent of the portable MCP OAuth
+# grant and prevents other browser origins from reaching the sidecar operation.
+CODE_BROWSER_MCP_TOKEN=''
+if [ "${EZIL_CODE_BROWSER_MCP:-off}" = on ] &&
+   [ "${EZIL_BROWSER_SIDECAR:-on}" = on ] &&
+   [ "$EZIL_SIDECAR_PORT" = 9223 ] &&
+   [ -n "${EZIL_BROWSER_TEST_ALLOWED_ORIGINS:-}" ] &&
+   [ -f "$EZIL_SIDECAR_ENTRY" ]; then
+  CODE_BROWSER_MCP_TOKEN="$(node -e 'process.stdout.write(require("node:crypto").randomBytes(32).toString("base64url"))' 2>/dev/null)" || CODE_BROWSER_MCP_TOKEN=''
+fi
 launch_browser_sidecar() {
   phase_start sidecar_launch
   # Kill switch, same vocabulary as every other flag on this stack.
@@ -1051,6 +1068,9 @@ case "$(printf '%s' "${EZIL_BROWSER_SIDECAR:-on}" | tr '[:upper:]' '[:lower:]' |
   # reach $LOG about the sidecar is this script's own `log` lines: start,
   # skip, and failure — names and integers, never page data.
   log "starting browser sidecar (node $EZIL_SIDECAR_ENTRY) on 0.0.0.0:${EZIL_SIDECAR_PORT}, CDP 127.0.0.1:${EZIL_CDP_PORT:-9222} — log $EZIL_SIDECAR_LOG"
+  EZIL_WORKER_BROWSER_MCP_TOKEN="$SIDECAR_WORKER_BROWSER_MCP_TOKEN" \
+  EZIL_CODE_BROWSER_MCP_TOKEN="$CODE_BROWSER_MCP_TOKEN" \
+  EZIL_BROWSER_TEST_ALLOWED_ORIGINS="${EZIL_BROWSER_TEST_ALLOWED_ORIGINS:-}" \
   EZIL_SIDECAR_PORT="$EZIL_SIDECAR_PORT" \
   EZIL_CDP_PORT="${EZIL_CDP_PORT:-9222}" \
     node "$EZIL_SIDECAR_ENTRY" >>"$EZIL_SIDECAR_LOG" 2>&1 9>&- &
@@ -1986,6 +2006,8 @@ fi
 
 phase_start codeserver_launch
 log "supervising code-server ($CODE_SERVER_BIN) on 0.0.0.0:${CODE_SERVER_PORT} at $WORKSPACE_ROOT (mandatory, isolated user-data-dir)"
+EZIL_CODE_BROWSER_MCP="${EZIL_CODE_BROWSER_MCP:-off}" \
+EZIL_CODE_BROWSER_MCP_TOKEN="$CODE_BROWSER_MCP_TOKEN" \
 supervise_app codeserver "$NEKO_APP_MAX_RESTARTS" "$CODE_SERVER_BIN" \
   --bind-addr "0.0.0.0:${CODE_SERVER_PORT}" \
   --auth none \

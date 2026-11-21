@@ -293,6 +293,14 @@ interface Env extends SandboxEnv {
    * the one an operator can turn without redeploying an image.
    */
   SANDBOX_BROWSER?: string;
+  /** Opt-in delegated, read-only Browser observation on staging. */
+  SANDBOX_MCP_BROWSER_OBSERVE?: string;
+  /** Opt-in signed external Browser MCP on the staging Worker. */
+  SANDBOX_MCP_BROWSER_OPEN?: string;
+  /** Independently opt-in built-in Browser MCP in the running Code App. */
+  EZIL_CODE_BROWSER_MCP?: string;
+  /** Exact test origins conveyed to the private sidecar at boot. */
+  EZIL_BROWSER_TEST_ALLOWED_ORIGINS?: string;
   /** Explicit isolated staging computer only; absent in production. */
   EZIL_ACCEPTANCE_ENV?: string;
   EZIL_ACCEPTANCE_SANDBOX?: string;
@@ -392,6 +400,12 @@ interface Env extends SandboxEnv {
   EZIL_AI_GATEWAY_URL?: string;
   /** `off` returns 503 for AI requests. Boot env and credential deletion stay available. */
   SANDBOX_AI_PROXY?: string;
+  /** Set only on the staging Worker; the separate bridge URL remains opt-in. */
+  EZIL_EDITOR_BRIDGE_ENVIRONMENT?: string;
+  /** OS origin for the editor-bridge sync (`./editor-bridge.ts`); unset or invalid = the route is a 404. */
+  EZIL_OS_BRIDGE_URL?: string;
+  /** Staging only. Comma-separated cloudflare:<uuid> and aws-ec2:<uuid> entries. */
+  EZIL_EDITOR_BRIDGE_TARGETS?: string;
 }
 
 /**
@@ -600,6 +614,7 @@ import {
 } from './neko-logs';
 import {
   resolvePreviewSecrets,
+  hmacSha256Hex,
   verifyPreviewToken,
   deriveNekoCredentials,
   resolveNekoDerivationSecret,
@@ -671,6 +686,7 @@ import {
   type CreditsRelay,
   type StoredAiCreditsPending,
 } from './ai-proxy';
+import { deriveEditorBridgeToken, editorBridgeTargetAllowed, handleEditorBridgeRequest, isEditorBridgePath, resolveOsBridgeUrl, type EditorBridgeProvider } from './editor-bridge';
 
 import { captureEditorState } from './editor-state';
 import { CF_ADMISSION_ERROR, cfAdmissionRunningOnly, cfAdmissionResponse, isCfAdmissionError } from './cf-container-admission';
@@ -962,6 +978,9 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
 interface EzilWorkspacePersistRpc {
   getImageId(): Promise<string | null>;
   runningContainerFetch(url: string, init?: RequestInit, port?: number): Promise<Response>;
+  observeExistingBrowser(body: string, deadline: number): Promise<Response>;
+  openBrowserUrl(body: string, deadline: number, sandboxId: string, cancelKey: string): Promise<Response>;
+  cancelBrowserOpen(cancelKey: string): Promise<void>;
   stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport>;
   resetRuntimeForAcceptance(sandboxId: string): Promise<{ ok: true } | { ok: false; error: 'runtime_running' }>;
   setAcceptanceFault(sandboxId: string, raw: unknown): Promise<void>;
@@ -988,8 +1007,9 @@ interface EzilWorkspacePersistRpc {
    * alive.
    */
   recordActivity(lastInputAgoMs: number): Promise<void>;
-  startAiDesktop(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string>;
+  startAiDesktop(hostname: string, sandboxId: string, command: string, env: Record<string, string>, computerId?: string): Promise<string>;
   getAiProxyNonce(): Promise<string | null>;
+  getEditorBridgeNonce(): Promise<string | null>;
   putAiCredential(credential: StoredAiCredential, signedAt: number, includedModels?: readonly string[] | null, creditsPending?: boolean | null): Promise<{ stored: boolean; expiresAt: number }>;
   putAiModelAccess(includedModels: readonly string[] | null, signedAt: number, creditsPending?: boolean | null): Promise<{ stored: boolean }>;
   getAiCredential(): Promise<string | null>;
@@ -1015,6 +1035,7 @@ interface EzilWorkspacePersistRpc {
     sandboxId: string,
     explicitMode: DesktopMode | undefined,
     fallbackMode: DesktopMode,
+    computerId?: string,
   ): Promise<RestartReport & { url?: string; appPreviewUrl?: string | null; codePreviewUrl?: string | null }>;
   /** `POST /sandbox/:name/repo-open` (`./repo-open.ts`). A running computer only; never starts one. */
   repoOpen(request: RepoOpenRequest, root: RepoOpenRoot, grantSubject?: string): Promise<RepoOpenAnswer>;
@@ -2172,6 +2193,13 @@ const TERMINATE_CONFIRM_INTERVAL_MS = 250;
 const RESTART_STOP_DEADLINE_MS = 20_000;
 const RESTART_STOP_POLL_INTERVAL_MS = 500;
 
+const EDITOR_BRIDGE_BOOT_KEY = 'editor-bridge-boot';
+
+interface EditorBridgeBoot {
+  computerId: string;
+  nonce: string;
+}
+
 interface WorkspaceFlushContext {
   /** R2 key prefix, NO leading slash — e.g. `${projectId}/branches/${branch}`. */
   prefix: string;
@@ -2745,6 +2773,68 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       this.runtimeTransitionsInFlight--;
     }
   }
+  /** The delegated observer looks at a live desktop without booting or renewing it. */
+  async observeExistingBrowser(body: string, deadline: number): Promise<Response> {
+    return this.withRuntimeMutation(async () => {
+      if (!this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)
+        || await this.migrationStartBlocked()) {
+        return json({ ok: false, error: 'browser_unavailable' }, 409);
+      }
+      const remaining = Math.min(8_000, deadline - Date.now());
+      if (remaining <= 0) return json({ ok: false, error: 'browser_unavailable' }, 503);
+      return this.ctx.container!.getTcpPort(BROWSER_SIDECAR_PORT).fetch(
+        'http://127.0.0.1:9223/internal/mcp-browser-observe',
+        { method: 'POST', body, headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(remaining) },
+      );
+    });
+  }
+
+  private browserOpenCancellations?: Map<string, AbortController>;
+
+  /** The signed control may use an existing desktop but cannot start or renew it. */
+  async openBrowserUrl(body: string, deadline: number, sandboxId: string, cancelKey: string): Promise<Response> {
+    const active = this.browserOpenCancellations ??= new Map();
+    const abort = new AbortController();
+    active.set(cancelKey, abort);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      // Capture and dispatch against the running container under the lifecycle
+      // lock. Release the lock before waiting on browser network traffic.
+      const dispatch = await this.withRuntimeMutation(async () => {
+        if (!this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)
+          || await this.migrationStartBlocked()) return null;
+        const nonce = await this.ctx.storage.get<string>(AI_PROXY_NONCE_STORAGE_KEY);
+        const capability = await workerBrowserOpenCapability(this.env, sandboxId);
+        const remaining = deadline - Date.now();
+        if (!capability || remaining <= 0 || abort.signal.aborted) return null;
+        timer = setTimeout(() => abort.abort(), remaining);
+        const result = this.ctx.container!.getTcpPort(BROWSER_SIDECAR_PORT).fetch(
+          'http://127.0.0.1:9223/internal/mcp-browser-open-url',
+          { method: 'POST', body, headers: {
+            'content-type': 'application/json', authorization: 'Bearer ' + capability,
+          }, signal: abort.signal },
+        );
+        void result.catch(() => undefined);
+        return { result, nonce };
+      });
+      if (!dispatch) return json({ ok: false }, 409);
+      const response = await dispatch.result;
+      if (!this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)
+        || await this.migrationStartBlocked() || dispatch.nonce !== await this.ctx.storage.get<string>(AI_PROXY_NONCE_STORAGE_KEY)) {
+        await response.body?.cancel().catch(() => undefined);
+        return json({ ok: false }, 409);
+      }
+      return response;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      active.delete(cancelKey);
+    }
+  }
+
+  async cancelBrowserOpen(cancelKey: string): Promise<void> {
+    this.browserOpenCancellations?.get(cancelKey)?.abort();
+  }
+
   async desktopReachable(): Promise<boolean> {
     try {
       const response = await this.runningContainerFetch('http://127.0.0.1:8181/', {}, 8181, 1000);
@@ -3903,12 +3993,12 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
   }
 
   /** Concurrent preview opens share a launcher and its nonce; teardown/restart use this same lock. */
-  async startAiDesktop(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string> {
-    return this.withRuntimeMutation(() => this.startAiDesktopUnlocked(hostname, sandboxId, command, env));
+  async startAiDesktop(hostname: string, sandboxId: string, command: string, env: Record<string, string>, computerId?: string): Promise<string> {
+    return this.withRuntimeMutation(() => this.startAiDesktopUnlocked(hostname, sandboxId, command, env, computerId));
   }
 
   /** Restart already owns the lifecycle lock. Only RPC-safe process ids cross it. */
-  private async startAiDesktopUnlocked(hostname: string, sandboxId: string, command: string, env: Record<string, string>): Promise<string> {
+  private async startAiDesktopUnlocked(hostname: string, sandboxId: string, command: string, env: Record<string, string>, computerId?: string): Promise<string> {
     if (await this.migrationStartBlocked()) throw new Error('migrating');
     if (this.containerIsRunning()) {
       const processes = await this.listProcesses();
@@ -3917,16 +4007,29 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       const launcher = findDesktopLauncherProcess(Array.isArray(processes) ? processes.filter((p) => p.command === command) : []);
       if (launcher) return launcher.id;
     }
-    const aiEnv = await this.aiProxyBootEnv(hostname, sandboxId);
-    const process = await this.startProcess(command, { env: { ...env, ...aiEnv } });
+    const aiEnv = await this.aiProxyBootEnv(hostname, sandboxId, computerId);
+    const browserEnv = await browserOpenBootEnv(this.env, sandboxId);
+    const process = await this.startProcess(command, { env: { ...env, ...aiEnv, ...browserEnv } });
     return process.id;
   }
 
   /** Rotate only on the launch path, including restart; warm previews never call this. */
-  async aiProxyBootEnv(hostname: string, sandboxId: string): Promise<Record<string, string>> {
+  async aiProxyBootEnv(hostname: string, sandboxId: string, computerId?: string): Promise<Record<string, string>> {
     const nonce = crypto.randomUUID();
+    const editorEnabled = !!computerId && !!editorBridgeOrigin(this.env, 'cloudflare', computerId);
     await this.ctx.storage.put(AI_PROXY_NONCE_STORAGE_KEY, nonce);
-    return aiProxyBootEnv(this.env, hostname, sandboxId, nonce);
+    if (editorEnabled) {
+      await this.ctx.storage.put(EDITOR_BRIDGE_BOOT_KEY, { computerId, nonce } satisfies EditorBridgeBoot);
+    }
+    return aiProxyBootEnv(this.env, hostname, sandboxId, nonce, editorEnabled);
+  }
+
+  async getEditorBridgeNonce(): Promise<string | null> {
+    const boot = await this.ctx.storage.get<EditorBridgeBoot>(EDITOR_BRIDGE_BOOT_KEY);
+    if (!boot || !editorBridgeOrigin(this.env, 'cloudflare', boot.computerId)) return null;
+    // A stale target record cannot authorize a different boot or a legacy restart.
+    const currentNonce = await this.getAiProxyNonce();
+    return boot.nonce === currentNonce ? currentNonce : null;
   }
 
   async getAiProxyNonce(): Promise<string | null> {
@@ -4321,6 +4424,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     sandboxId: string,
     explicitMode: DesktopMode | undefined,
     fallbackMode: DesktopMode,
+    computerId?: string,
   ): Promise<RestartReport & { url?: string; appPreviewUrl?: string | null; codePreviewUrl?: string | null }> {
     if (await this.migrationStartBlocked()) {
       return { ok: false, mode: explicitMode ?? fallbackMode, outcome: 'boot_failed',
@@ -4520,7 +4624,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
           workspaceRoot,
           this.env.EZIL_NEKO_CPU_DIAG_ENABLED,
           undefined,
-          (command, env) => this.startAiDesktopUnlocked(hostname, sandboxId, command, env),
+          (command, env) => this.startAiDesktopUnlocked(hostname, sandboxId, command, env, computerId),
         );
         bootLog('restart', 'end', { status: 'ok' });
         const report = buildRestartReport({ mode, wasRunning, stopConfirmed: true, bootOk: true });
@@ -4596,7 +4700,9 @@ function awsDesktopAiConfig(env: Env, record: AwsTunnelRecord) {
     if (!res.ok || !nonce) throw new RelayFailure('aws_origin_unavailable');
     const previewZone = resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT);
     return { baseUrl: `https://aws-${CODE_PREVIEW_PORT}-${record.sandboxId}-aws.${previewZone}/ai/v1`,
-      proxyToken: await deriveAiProxyToken(secret, record.sandboxId, nonce) };
+      proxyToken: await deriveAiProxyToken(secret, record.sandboxId, nonce),
+      // Leave incumbent hosts' config unchanged unless this exact AWS ID is explicitly admitted.
+      ...(editorBridgeOrigin(env, 'aws-ec2', record.computerId) ? { editorToken: await deriveEditorBridgeToken(secret, record.sandboxId, nonce) } : {}) };
   };
 }
 
@@ -5150,7 +5256,7 @@ async function handlePreview(
         containerTelemetry = tail;
       },
       mode === 'neko' ? (command, launchEnv) => sandbox.startAiDesktop(
-        normalizeSandboxHostname(url.host, env.SANDBOX_PREVIEW_ZONE_ROOT), sandboxId, command, launchEnv,
+        normalizeSandboxHostname(url.host, env.SANDBOX_PREVIEW_ZONE_ROOT), sandboxId, command, launchEnv, v2?.computerId,
       ) : undefined,
     );
     const guacamoleUrl = mode === 'neko' ? exposedUrl : toGuacamoleUrl(exposedUrl, url.protocol);
@@ -5426,7 +5532,7 @@ async function handleStatus(env: Env, url: URL, sandboxName: string, requestedMo
  * the DO auto-detect whatever is actually running (or falls back to the env
  * default when nothing is).
  */
-async function handleRestart(env: Env, url: URL, sandboxName: string, requestedMode?: string): Promise<Response> {
+async function handleRestart(env: Env, url: URL, sandboxName: string, requestedMode?: string, computerId?: string): Promise<Response> {
   const modeResult = resolveDesktopMode(requestedMode, env.SANDBOX_DEFAULT_DESKTOP_MODE);
   if (!modeResult.ok) {
     return json({ ok: false, error: modeResult.error }, 400);
@@ -5439,6 +5545,7 @@ async function handleRestart(env: Env, url: URL, sandboxName: string, requestedM
       sandboxName,
       explicitMode,
       modeResult.mode,
+      computerId,
     );
     const status = report.error === 'migrating' ? 409 : report.ok ? 200 : report.outcome === 'unsupported_mode' ? 400 : 500;
     return json({ sandboxName, ...report }, status);
@@ -7146,6 +7253,7 @@ async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<R
     return handlePreviewBootstrap(url, sandboxId, secrets, cookieSecret, target);
   }
 
+  if (target === 'code' && isEditorBridgePath(path)) return handleEditorBridge(request, env, sandboxId);
   if (target === 'code' && isAiProxyPath(path)) return handleAiProxy(request, env, sandboxId);
 
   if (target === 'code') return handleCodeBridge(request, env, url, sandboxId, secrets, port);
@@ -7283,7 +7391,7 @@ function sandboxIdFromPath(path: string): string | null {
 /** No signed route accepts a larger body (project-files put is the largest); refused before buffering. */
 const V2_MAX_BODY_BYTES = PROJECT_FILES_MAX_PUT_REQUEST_BYTES;
 
-async function readBoundedBody(request: Request, maxBytes: number): Promise<Uint8Array | 'too_large'> {
+async function readBoundedBody(request: Request | Response, maxBytes: number): Promise<Uint8Array | 'too_large'> {
   const declared = request.headers.get('content-length');
   if (declared !== null && !(Number(declared) <= maxBytes)) return 'too_large';
   const stream = request.clone().body;
@@ -7723,13 +7831,102 @@ async function handleBrowserSidecar(
 //     (`EZIL_AI_PROXY_TOKEN`), forwarded to the gateway with the stored token.
 
 /** Boot env for the chat extension: where the proxy is and the sandbox's proxy token. Never the user's token. */
-async function aiProxyBootEnv(env: Env, hostname: string, sandboxId: string, nonce: string): Promise<Record<string, string>> {
+async function aiProxyBootEnv(env: Env, hostname: string, sandboxId: string, nonce: string, editorEnabled: boolean): Promise<Record<string, string>> {
   const secret = resolveNekoDerivationSecret(env);
   const code = codePortFor('neko');
   if (!code) return {};
   return {
     EZIL_AI_BASE_URL: aiProxyBaseUrl(hostname, sandboxId, code.port, code.token),
     EZIL_AI_PROXY_TOKEN: secret ? await deriveAiProxyToken(secret, sandboxId, nonce) : '',
+    // The editor bridge's own token (./editor-bridge.ts), same boot nonce, only while the bridge is on.
+    ...(secret && editorEnabled ? { EZIL_EDITOR_BRIDGE_TOKEN: await deriveEditorBridgeToken(secret, sandboxId, nonce) } : {}),
+  };
+}
+
+const BROWSER_OPEN_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+async function handleBrowserOpen(request: Request, env: Env, url: URL, target: string): Promise<Response> {
+  if (env.SANDBOX_MCP_BROWSER_OPEN !== 'on' || !env.EZIL_BROWSER_TEST_ALLOWED_ORIGINS?.trim()
+      || url.origin !== 'https://api-desktop-staging.ezil.work') {
+    return json({ ok: false, error: 'browser_unavailable' }, 404);
+  }
+  const claims = verifiedV2Claims.get(request);
+  const now = Date.now();
+  if (!claims || claims.provider !== 'cloudflare' || claims.sandboxId !== target
+      || target !== deriveSandboxId(claims.userId, claims.computerId)
+      || claims.generation !== 0 || claims.leaseEpoch !== 0 || claims.store !== ''
+      || claims.ts < now - 30_000 || claims.ts > now + 10_000) {
+    return json({ ok: false, error: 'browser_unauthorized' }, 401);
+  }
+
+  let body: string;
+  let input: { binding: string; requestId: string; url: string; timeoutMs: number };
+  try {
+    const bytes = await readBoundedBody(request, 4096);
+    if (bytes === 'too_large') return json({ ok: false, error: 'browser_invalid_request' }, 413);
+    body = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+    const parsed = JSON.parse(body);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || Object.keys(parsed).length !== 4
+        || typeof parsed.binding !== 'string' || !/^[0-9a-f]{64}$/.test(parsed.binding)
+        || typeof parsed.requestId !== 'string' || !BROWSER_OPEN_UUID.test(parsed.requestId)
+        || typeof parsed.url !== 'string' || parsed.url.length > 2048
+        || !Number.isInteger(parsed.timeoutMs) || parsed.timeoutMs < 1000 || parsed.timeoutMs > 30_000) {
+      return json({ ok: false, error: 'browser_invalid_request' }, 400);
+    }
+    input = parsed;
+  } catch {
+    return json({ ok: false, error: 'browser_invalid_request' }, 400);
+  }
+
+  const failure = (error: string, retryable: boolean) =>
+    json({ ok: false, runId: input.requestId, error, stage: 'runtime', retryable });
+  try {
+    if (await awsControlTarget(env, request, target, 'browser_open')) return failure('browser_unavailable', false);
+    if (request.signal.aborted) return failure('cancelled', false);
+    const sandbox = openSandbox(env, target);
+    const cancelKey = crypto.randomUUID();
+    const onAbort = () => { void sandbox.cancelBrowserOpen(cancelKey).catch(() => undefined); };
+    request.signal.addEventListener('abort', onAbort, { once: true });
+    const budget = input.timeoutMs + 3_000;
+    const deadline = Date.now() + budget;
+    try {
+      const upstream = await withDeadline(sandbox.openBrowserUrl(body, deadline, target, cancelKey), budget, 'browser.open');
+      if (request.signal.aborted) return failure('cancelled', false);
+      if (!upstream.ok) return failure('browser_unavailable', false);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return failure('navigation_timeout', false);
+      const bytes = await withDeadline(readBoundedBody(upstream, 4096), remaining, 'browser.open.body');
+      if (bytes === 'too_large') return failure('browser_unavailable', false);
+      return new Response(bytes, { status: 200, headers: {
+        'content-type': 'application/json', 'cache-control': 'no-store',
+      } });
+    } finally {
+      request.signal.removeEventListener('abort', onAbort);
+    }
+  } catch {
+    return request.signal.aborted ? failure('cancelled', false) : failure('connection_lost', false);
+  }
+}
+
+async function workerBrowserOpenCapability(env: Env, sandboxId: string): Promise<string | null> {
+  const secret = resolveNekoDerivationSecret(env);
+  if (!secret) return null;
+  const hex = await hmacSha256Hex(secret, 'EZIL-WORKER-BROWSER-OPEN/1\n' + sandboxId);
+  const raw = (hex.match(/../g) ?? []).map(byte => parseInt(byte, 16));
+  return btoa(String.fromCharCode(...raw)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+async function browserOpenBootEnv(env: Env, sandboxId: string): Promise<Record<string, string>> {
+  const allowedOrigins = env.EZIL_BROWSER_TEST_ALLOWED_ORIGINS?.trim();
+  const code = env.EZIL_CODE_BROWSER_MCP === 'on';
+  const worker = env.SANDBOX_MCP_BROWSER_OPEN === 'on';
+  if (!allowedOrigins || (!code && !worker)) return {};
+  const capability = worker ? await workerBrowserOpenCapability(env, sandboxId) : null;
+  if (!code && !capability) return {};
+  return {
+    EZIL_BROWSER_TEST_ALLOWED_ORIGINS: allowedOrigins,
+    ...(code ? { EZIL_CODE_BROWSER_MCP: 'on' } : {}),
+    ...(capability ? { EZIL_WORKER_BROWSER_MCP_TOKEN: capability } : {}),
   };
 }
 
@@ -7753,6 +7950,30 @@ async function handleAiProxy(request: Request, env: Env, sandboxId: string, awsN
     creditsRelay: () => sandbox ? sandbox.getAiCreditsRelay() : Promise.resolve('legacy' as const),
     dropCredential: (token) => sandbox ? sandbox.dropAiCredential(token) : Promise.resolve(),
     fetch: (upstream) => fetch(upstream),
+    log: (fields) => console.log(JSON.stringify(fields)),
+  });
+}
+
+function editorBridgeOrigin(env: Env, provider: EditorBridgeProvider, computerId: string | undefined): string | null {
+  return editorBridgeTargetAllowed(env.EZIL_EDITOR_BRIDGE_TARGETS, provider, computerId)
+    ? resolveOsBridgeUrl(env.EZIL_OS_BRIDGE_URL, env.EZIL_EDITOR_BRIDGE_ENVIRONMENT) : null;
+}
+
+/** `/editor-bridge/v1/sync` on an eligible code host verifies a distinct boot token before forwarding to OS. */
+async function handleEditorBridge(request: Request, env: Env, sandboxId: string, aws?: AwsTunnelRecord | null): Promise<Response> {
+  const osUrl = aws === undefined
+    ? resolveOsBridgeUrl(env.EZIL_OS_BRIDGE_URL, env.EZIL_EDITOR_BRIDGE_ENVIRONMENT)
+    : editorBridgeOrigin(env, 'aws-ec2', aws?.computerId);
+  const nonce = aws === undefined && osUrl && env.EZIL_EDITOR_BRIDGE_TARGETS
+    ? await openSandbox(env, sandboxId).getEditorBridgeNonce()
+    : aws?.aiProxyNonce ?? null;
+  return handleEditorBridgeRequest(request, {
+    sandboxId,
+    osUrl: aws === undefined && !nonce ? null : osUrl,
+    secret: resolveNekoDerivationSecret(env),
+    nonce,
+    fetch: (upstream) => fetch(upstream),
+    now: () => Date.now(),
     log: (fields) => console.log(JSON.stringify(fields)),
   });
 }
@@ -7883,6 +8104,20 @@ const worker = {
     //    `null` (not a Response) for hostnames outside both bridge patterns,
     //    in which case the request continues to the normal `proxyToSandbox`
     //    path below unchanged.
+    if (url.hostname.split('.')[0]!.startsWith('aws-') && isEditorBridgePath(path)) {
+      if (!resolveOsBridgeUrl(env.EZIL_OS_BRIDGE_URL, env.EZIL_EDITOR_BRIDGE_ENVIRONMENT)) {
+        return json({ error: { code: 'not_found', source: 'ezil-os-bridge' } }, 404);
+      }
+      const route = parseAwsBrowserHost(url.hostname, resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT));
+      if (!route || route.port !== CODE_PREVIEW_PORT) return json({ error: { code: 'not_found', source: 'ezil-os-bridge' } }, 404);
+      const registry = awsRegistryFor(env);
+      if (!awsRoutingEnabled(env.AWS_ROUTING_ENABLED) || !registry || !resolveAwsOriginZone(env)) {
+        return json({ error: { code: 'not_found', source: 'ezil-os-bridge' } }, 404);
+      }
+      // Same rule as /ai/v1 below: only the tunnel record's current boot nonce, never the CF one or a client's.
+      const record = await lookupAwsTunnel(registry, route.sandboxId);
+      return handleEditorBridge(request, env, route.sandboxId, record);
+    }
     if (url.hostname.split('.')[0]!.startsWith('aws-') && isAiProxyPath(path)) {
       const route = parseAwsBrowserHost(url.hostname, resolvePreviewZoneRoot(env.SANDBOX_PREVIEW_ZONE_ROOT));
       if (!route || route.port !== CODE_PREVIEW_PORT) return proxyError(404, 'os_ai_unavailable');
@@ -8046,6 +8281,39 @@ const worker = {
     if (method === 'POST' && repoGrantMatch) {
       // Refresh push access for a repository repo-open placed. v2-signed only; see `handleRepoGrant` / `./repo-grant.ts`.
       return handleRepoGrant(request, env, decodeURIComponent(repoGrantMatch[1]));
+    }
+
+    const browserOpen = path.match(/^\/sandbox\/(guac-[a-z0-9]{16}-[a-z0-9]{16})\/browser-open-url$/);
+    if (method === 'POST' && browserOpen) return handleBrowserOpen(request, env, url, browserOpen[1]!);
+
+    const observation = path.match(/^\/sandbox\/(guac-[a-z0-9]{16}-[a-z0-9]{16})\/browser-observe$/);
+    if (method === 'POST' && observation) {
+      if (env.SANDBOX_MCP_BROWSER_OBSERVE !== 'on' || url.origin !== 'https://api-desktop-staging.ezil.work') {
+        return json({ ok: false, error: 'browser_unavailable' }, 404);
+      }
+      const claims = verifiedV2Claims.get(request);
+      const target = observation[1]!;
+      if (!claims || claims.provider !== 'cloudflare' || claims.sandboxId !== target
+        || target !== deriveSandboxId(claims.userId, claims.computerId)
+        || claims.generation !== 0 || claims.leaseEpoch !== 0 || claims.store !== '') {
+        return json({ ok: false, error: 'browser_unauthorized' }, 401);
+      }
+      try {
+        const aws = await awsControlTarget(env, request, target, 'browser_observe');
+        if (aws) return json({ ok: false, error: 'browser_unavailable' }, 409);
+        const input = await readBoundedBody(request, 1024);
+        if (input === 'too_large') return json({ ok: false, error: 'browser_invalid_request' }, 413);
+        const body = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(input);
+        const deadline = Math.min(claims.ts + 8_000, Date.now() + 8_000);
+        const upstream = await withDeadline(openSandbox(env, target).observeExistingBrowser(body, deadline), 8_000, 'browser.observe');
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) return json({ ok: false, error: 'browser_unavailable' }, 503);
+        const bytes = await withDeadline(readBoundedBody(upstream, 2048), remaining, 'browser.observe.body');
+        if (bytes === 'too_large') throw new Error('browser_oversized');
+        return new Response(bytes, { status: upstream.status, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
+      } catch {
+        return json({ ok: false, error: 'browser_unavailable' }, 503);
+      }
     }
 
     const browserMatch = path.match(/^\/sandbox\/([^/]+)\/browser\/([a-z_]+)$/);
@@ -8355,12 +8623,11 @@ const worker = {
           mint: awsRelayMint(env), neko: () => deriveNekoCredentials(env, aws.record.sandboxId),
           aiConfig: awsDesktopAiConfig(env, aws.record),
         });
-      return handleRestart(
-        env,
-        url,
-        decodeURIComponent(restartMatch[1]),
-        url.searchParams.get('desktopMode') ?? undefined,
-      );
+      const sandboxName = decodeURIComponent(restartMatch[1]);
+      const claims = verifiedV2Claims.get(request);
+      const computerId = claims?.provider === 'cloudflare' && deriveSandboxId(claims.userId, claims.computerId) === sandboxName
+        ? claims.computerId : undefined;
+      return handleRestart(env, url, sandboxName, url.searchParams.get('desktopMode') ?? undefined, computerId);
     }
 
     if (method === 'POST' && path.startsWith('/project-files/')) {

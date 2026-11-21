@@ -35,6 +35,7 @@ mock.module('cloudflare:workers', () => ({
   env: {},
 }));
 
+import { deriveEditorBridgeToken } from './editor-bridge';
 import { hmacSha256Hex, mintPreviewTokenV2, PREVIEW_TOKEN_PAYLOAD, TOKEN_MAX_AGE_MS, type PreviewTokenV2Claims } from './hmac';
 import { SCREEN_MODES } from './screen-modes';
 
@@ -48,11 +49,12 @@ async function mintToken(secret = SECRET, now = Date.now()): Promise<string> {
 
 interface CallLog {
   aiNonces: string[];
+  editorBootComputerIds: Array<string | undefined>;
   aiStored: StoredAiCredential[];
   aiDeletes: number;
   terminateSandbox: number;
   resetRuntimeForAcceptance: number;
-  restartDesktopStack: Array<{ hostname: string; sandboxId: string; explicitMode: unknown; fallbackMode: unknown }>;
+  restartDesktopStack: Array<{ hostname: string; sandboxId: string; explicitMode: unknown; fallbackMode: unknown; computerId?: string }>;
   destroy: number;
   flushWorkspaceNow: number;
   getExposedPorts: number;
@@ -78,6 +80,8 @@ interface CallLog {
    * field, so a test that reads anything else is testing a paraphrase.
    */
   startProcess: Array<{ command: string; env: Record<string, string> }>;
+  browserObservations: Array<{ body: string; deadline: number }>;
+  browserOpens: Array<{ body: string; deadline: number; sandboxId: string }>;
 }
 
 /** Opaque stand-in for a `WebSocket`; only its identity is ever compared. */
@@ -176,6 +180,7 @@ function fakeSandboxNamespace(options: {
   let openedWith = SANDBOX_NAME;
   const calls: CallLog = {
     aiNonces: [],
+    editorBootComputerIds: [],
     aiStored: [],
     aiDeletes: 0,
     terminateSandbox: 0,
@@ -191,6 +196,8 @@ function fakeSandboxNamespace(options: {
     wsConnect: [],
     exposePort: [],
     startProcess: [],
+    browserObservations: [],
+    browserOpens: [],
   };
 
   let credential: StoredAiCredential | undefined;
@@ -200,6 +207,7 @@ function fakeSandboxNamespace(options: {
   let processResult: unknown;
   const impl: Record<string, (...args: unknown[]) => Promise<unknown>> = {
     getAiProxyNonce: async () => nonce,
+    getEditorBridgeNonce: async () => calls.editorBootComputerIds.at(-1) ? nonce : null,
     getAiCredential: async () => usableAiCredential(credential),
     getAiModelAccess: async () => modelAccess,
     putAiCredential: async (...args) => {
@@ -214,9 +222,10 @@ function fakeSandboxNamespace(options: {
       if (args[0] === undefined || args[0] === credential?.token) credential = undefined;
     },
     startAiDesktop: async (...args) => {
-      const [hostname, sandboxId, command, env] = args as [string, string, string, Record<string, string>];
+      const [hostname, sandboxId, command, env, computerId] = args as [string, string, string, Record<string, string>, string?];
       nonce = crypto.randomUUID();
       calls.aiNonces.push(nonce);
+      calls.editorBootComputerIds.push(computerId);
       processResult = await impl.startProcess!(command, { env: { ...env,
         EZIL_AI_BASE_URL: `https://8443-${sandboxId}-code.${hostname}/ai/v1`,
         EZIL_AI_PROXY_TOKEN: await deriveAiProxyToken(SECRET, sandboxId, nonce),
@@ -225,6 +234,14 @@ function fakeSandboxNamespace(options: {
     },
     getProcess: async () => processResult,
     desktopReachable: async () => true,
+    observeExistingBrowser: async (body, deadline) => {
+      calls.browserObservations.push({ body: String(body), deadline: Number(deadline) });
+      return options.containerResponse?.() ?? Response.json({ ok: false, error: 'browser_page_unavailable' });
+    },
+    openBrowserUrl: async (body, deadline, sandboxId) => {
+      calls.browserOpens.push({ body: String(body), deadline: Number(deadline), sandboxId: String(sandboxId) });
+      return options.containerResponse?.() ?? Response.json({ ok: false, error: 'destination_denied' });
+    },
     hydrateWorkspace: async (...args: unknown[]) =>
       options.hydrateWorkspace ? options.hydrateWorkspace(args[0]) : ({ mounted: true, mountPath: '/workspace' }),
     containerFetch: async (...args: unknown[]) => {
@@ -314,8 +331,8 @@ function fakeSandboxNamespace(options: {
     },
     restartDesktopStack: async (...args: unknown[]) => {
       if ('restartThrows' in options) throw options.restartThrows;
-      const [hostname, sandboxId, explicitMode, fallbackMode] = args as [string, string, unknown, unknown];
-      calls.restartDesktopStack.push({ hostname, sandboxId, explicitMode, fallbackMode });
+      const [hostname, sandboxId, explicitMode, fallbackMode, computerId] = args as [string, string, unknown, unknown, string?];
+      calls.restartDesktopStack.push({ hostname, sandboxId, explicitMode, fallbackMode, computerId });
       return (
         options.restartResult ?? {
           ok: true,
@@ -1595,6 +1612,92 @@ function fakeNekoLogExec(raw: string) {
     return undefined;
   };
 }
+
+describe('delegated Browser observation Worker route', () => {
+  const pathname = '/sandbox/' + SANDBOX_NAME + '/browser-observe';
+  const origin = 'https://api-desktop-staging.ezil.work';
+  const body = JSON.stringify({ binding: 'a'.repeat(64) });
+  const claims = {
+    ts: Date.now(), sandboxId: SANDBOX_NAME, userId: 'abcdef01-2345-6789-8012-abcdef012345',
+    computerId: 'fedcba98-7654-3210-8012-fedcba987654',
+    provider: 'cloudflare' as const, store: '' as const, generation: 0, leaseEpoch: 0,
+  };
+  function environment(binding: unknown) {
+    return { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_MCP_BROWSER_OBSERVE: 'on', SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.work' };
+  }
+  async function signed(input: Partial<PreviewTokenV2Claims> = {}, sent = body) {
+    const token = await mintPreviewTokenV2(SECRET, { ...claims, ts: Date.now(), ...input }, { method: 'POST', path: pathname, body: sent });
+    return new Request(origin + pathname, { method: 'POST', body: sent, headers: { 'x-ezil-auth': token } });
+  }
+
+  it('delivers the exact signed body to the already-running RPC only on staging', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const result = await worker.fetch(await signed(), environment(binding));
+    expect(result.status).toBe(200);
+    expect(await result.json()).toEqual({ ok: false, error: 'browser_page_unavailable' });
+    expect(calls.browserObservations).toHaveLength(1);
+    expect(calls.browserObservations[0]?.body).toBe(body);
+    expect(calls.startProcess).toHaveLength(0);
+    expect(calls.containerFetch).toHaveLength(0);
+    expect(calls.exposePort).toHaveLength(0);
+  });
+
+  it('refuses legacy auth, unrelated owners, AWS, oversized input and a closed gate', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const env = environment(binding);
+    const legacy = new Request(origin + pathname, {
+      method: 'POST', body, headers: { authorization: 'Bearer ' + await mintToken() },
+    });
+    expect((await worker.fetch(legacy, env)).status).toBe(401);
+    expect((await worker.fetch(await signed({ userId: '11111111-1111-4111-8111-111111111111' }), env)).status).toBe(401);
+    expect((await worker.fetch(await signed({ provider: 'aws-ec2', generation: 1, leaseEpoch: 1 }), env)).status).toBe(401);
+    expect((await worker.fetch(await signed({}, 'x'.repeat(1025)), env)).status).toBe(413);
+    expect((await worker.fetch(await signed(), { ...env, SANDBOX_MCP_BROWSER_OBSERVE: 'off' })).status).toBe(404);
+    expect(calls.browserObservations).toHaveLength(0);
+    expect(calls.exposePort).toHaveLength(0);
+  });
+});
+
+describe('isolated browser open Worker route', () => {
+  const origin = 'https://api-desktop-staging.ezil.work';
+  const pathname = '/sandbox/' + SANDBOX_NAME + '/browser-open-url';
+  const requestId = '3a9dbafb-cc83-4ad9-afc1-2e104dc9d2a2';
+  const body = JSON.stringify({ binding: 'a'.repeat(64), requestId, url: 'https://fixture.test/', timeoutMs: 30_000 });
+
+  async function signed(overrides: Partial<PreviewTokenV2Claims> = {}, input = body, targetOrigin = origin) {
+    const token = await mintPreviewTokenV2(SECRET, {
+      ts: Date.now(), sandboxId: SANDBOX_NAME, userId: 'abcdef01-2345-6789-8012-abcdef012345',
+      computerId: 'fedcba98-7654-3210-8012-fedcba987654',
+      provider: 'cloudflare', store: '', generation: 0, leaseEpoch: 0, ...overrides,
+    }, { method: 'POST', path: pathname, body: input });
+    return new Request(targetOrigin + pathname, { method: 'POST', body: input, headers: { 'x-ezil-auth': token } });
+  }
+
+  it('forwards the bound body only from the opted-in staging route without boot or port exposure', async () => {
+    const receipt = { ok: true, runId: requestId, finalUrl: 'https://fixture.test/', title: 'Fixture', httpStatus: 200, elapsedMs: 40 };
+    const { binding, calls } = fakeSandboxNamespace({ containerResponse: () => Response.json(receipt) });
+    const env = {
+      Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.work',
+      SANDBOX_MCP_BROWSER_OPEN: 'on', EZIL_BROWSER_TEST_ALLOWED_ORIGINS: 'https://fixture.test',
+    };
+    const answer = await worker.fetch(await signed(), env);
+    expect(answer.status).toBe(200);
+    expect(answer.headers.get('cache-control')).toBe('no-store');
+    expect(await answer.json()).toEqual(receipt);
+    expect(calls.browserOpens).toEqual([{ body, deadline: expect.any(Number), sandboxId: SANDBOX_NAME }]);
+    expect(calls.startProcess).toHaveLength(0);
+    expect(calls.exposePort).toHaveLength(0);
+
+    expect((await worker.fetch(await signed(), { ...env, SANDBOX_MCP_BROWSER_OPEN: 'off' })).status).toBe(404);
+    expect((await worker.fetch(await signed({}, body, 'https://api-desktop.ezil.work'), env)).status).toBe(404);
+    expect((await worker.fetch(await signed({ provider: 'aws-ec2', generation: 1, leaseEpoch: 1 }), env)).status).toBe(401);
+    expect((await worker.fetch(await signed({ userId: '11111111-1111-4111-8111-111111111111' }), env)).status).toBe(401);
+    expect((await worker.fetch(await signed({ ts: Date.now() - 60_000 }), env)).status).toBe(401);
+    expect((await worker.fetch(await signed({}, 'x'.repeat(4097)), env)).status).toBe(413);
+    expect((await worker.fetch(await signed({}, body.replace('30000', '30001')), env)).status).toBe(400);
+    expect(calls.browserOpens).toHaveLength(1);
+  });
+});
 
 // ── /sandbox/:name/browser/:verb ─────────────────────────────────────────────
 // The desktop browser's automation surface — the thing an MCP client drives.
@@ -3724,6 +3827,31 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     session_id: sessionId, iat: Math.floor(issuedAt / 1000), exp: Math.floor(issuedAt / 1000) + 3600,
   })).toString('base64url')}.c2ln`;
 
+  it('CF Editor boot requires the full allowlisted ID on its provider, and old boot authority cannot carry forward', async () => {
+    const { obj, values } = await object();
+    const computer = 'fedcba98-7654-3210-fedc-ba9876543210';
+    const sameSandboxPrefix = 'fedcba98-7654-3210-1234-567890abcdef';
+    const stage = { ...obj.env, EZIL_OS_BRIDGE_URL: 'https://os-staging.ezil.work', EZIL_EDITOR_BRIDGE_ENVIRONMENT: 'staging' };
+    for (const targets of [undefined, `aws-ec2:${computer}`, `cloudflare:${computer},*`]) {
+      obj.env = { ...stage, EZIL_EDITOR_BRIDGE_TARGETS: targets };
+      expect((await obj.aiProxyBootEnv('ezil.work', SANDBOX_NAME, computer)).EZIL_EDITOR_BRIDGE_TOKEN).toBeUndefined();
+    }
+    obj.env = { ...stage, EZIL_EDITOR_BRIDGE_TARGETS: `cloudflare:${computer}` };
+    expect((await obj.aiProxyBootEnv('ezil.work', SANDBOX_NAME)).EZIL_EDITOR_BRIDGE_TOKEN).toBeUndefined();
+    expect((await obj.aiProxyBootEnv('ezil.work', SANDBOX_NAME, sameSandboxPrefix)).EZIL_EDITOR_BRIDGE_TOKEN).toBeUndefined();
+    const on = await obj.aiProxyBootEnv('ezil.work', SANDBOX_NAME, computer);
+    const nonce = values.get(AI_PROXY_NONCE_STORAGE_KEY) as string;
+    expect(on.EZIL_AI_PROXY_TOKEN).toBe(await deriveAiProxyToken(SECRET, SANDBOX_NAME, nonce));
+    expect(on.EZIL_EDITOR_BRIDGE_TOKEN).toBe(await deriveEditorBridgeToken(SECRET, SANDBOX_NAME, nonce));
+    expect(on.EZIL_EDITOR_BRIDGE_TOKEN).not.toBe(on.EZIL_AI_PROXY_TOKEN);
+    expect(await obj.getEditorBridgeNonce()).toBe(nonce);
+    obj.env = { ...obj.env, EZIL_EDITOR_BRIDGE_ENVIRONMENT: 'production' };
+    expect(await obj.getEditorBridgeNonce()).toBeNull();
+    obj.env = { ...obj.env, EZIL_EDITOR_BRIDGE_ENVIRONMENT: 'staging' };
+    expect((await obj.aiProxyBootEnv('ezil.work', SANDBOX_NAME, sameSandboxPrefix)).EZIL_EDITOR_BRIDGE_TOKEN).toBeUndefined();
+    expect(await obj.getEditorBridgeNonce()).toBeNull();
+  });
+
   it('refuses a signed POST replay after logout, including timestamp ties and DO recovery', async () => {
     const { obj, values, send, recover } = await credentialRoute();
     const t = Date.now() - 10_000;
@@ -4021,6 +4149,53 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     expect((await unconfigured.obj.aiProxyBootEnv('ezil.org', SANDBOX_NAME)).EZIL_AI_PROXY_TOKEN).toBe('');
   });
 
+  it('keeps browser boot capabilities independent and derives a narrow per-sandbox Worker bearer', async () => {
+    const { obj } = await object();
+    obj.env.EZIL_BROWSER_TEST_ALLOWED_ORIGINS = 'https://fixture.test';
+    obj.listProcesses = async () => [];
+    const launched: Record<string, string>[] = [];
+    obj.startProcess = async (_: string, options: { env: Record<string, string> }) => {
+      launched.push(options.env);
+      return { id: 'launcher' };
+    };
+    const start = (sandboxId = SANDBOX_NAME) => obj.startAiDesktop('ezil.work', sandboxId,
+      'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh', {});
+
+    await start();
+    expect(launched[0]?.EZIL_BROWSER_TEST_ALLOWED_ORIGINS).toBeUndefined();
+    obj.env.EZIL_CODE_BROWSER_MCP = 'on';
+    await start();
+    expect(launched[1]).toMatchObject({
+      EZIL_BROWSER_TEST_ALLOWED_ORIGINS: 'https://fixture.test', EZIL_CODE_BROWSER_MCP: 'on',
+    });
+    expect(launched[1]?.EZIL_WORKER_BROWSER_MCP_TOKEN).toBeUndefined();
+
+    obj.env.EZIL_CODE_BROWSER_MCP = 'off';
+    obj.env.SANDBOX_MCP_BROWSER_OPEN = 'on';
+    await start();
+    await start('guac-1aaaaaaaabbbbbbb-1cccccccdddddddd');
+    expect(launched[2]?.EZIL_CODE_BROWSER_MCP).toBeUndefined();
+    expect(launched[2]?.EZIL_WORKER_BROWSER_MCP_TOKEN).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(launched[2]?.EZIL_WORKER_BROWSER_MCP_TOKEN).not.toBe(launched[3]?.EZIL_WORKER_BROWSER_MCP_TOKEN);
+    expect(Object.values(launched[2] ?? {})).not.toContain(SECRET);
+  });
+
+  it('allows lifecycle transitions during browser I/O and suppresses a superseded boot receipt', async () => {
+    const { obj, values } = await object();
+    values.set(AI_PROXY_NONCE_STORAGE_KEY, 'old-boot');
+    let resolveFetch!: (response: Response) => void;
+    const upstream = new Promise<Response>(resolve => { resolveFetch = resolve; });
+    let markDispatch!: () => void;
+    const dispatched = new Promise<void>(resolve => { markDispatch = resolve; });
+    obj.ctx.container.getTcpPort = () => ({ fetch: () => { markDispatch(); return upstream; } });
+
+    const result = obj.openBrowserUrl('{}', Date.now() + 1_000, SANDBOX_NAME, 'test');
+    await dispatched;
+    await obj.withRuntimeMutation(async () => { values.set(AI_PROXY_NONCE_STORAGE_KEY, 'new-boot'); });
+    resolveFetch(Response.json({ ok: true }));
+    expect((await result).status).toBe(409);
+  });
+
   it('starts Neko beside a Guacamole launcher, then reuses only the matching Neko launcher', async () => {
     const { obj, values } = await object();
     const command = 'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh';
@@ -4297,5 +4472,239 @@ describe('Code folder bridge on the code host: each realm reports to its own app
     // The older image's composer notice is hidden by the same insertion, once.
     expect(body.split('<style data-ezil-legacy-notice="1">.chat-viewpane .interactive-session>.interactive-input-part::after'
       + '{content:none!important;display:none!important}</style>').length - 1).toBe(1);
+  });
+});
+
+describe('Editor bridge sync on the code host (./editor-bridge.ts)', () => {
+  const userId = 'abcdef01-2345-6789-abcd-ef0123456789';
+  const OS_URL = 'https://os-staging.ezil.work';
+  const computerId = 'fedcba98-7654-3210-fedc-ba9876543210';
+  const unrelatedId = 'fedcba98-7654-3210-fedc-000000000000';
+  const SYNC = { protocol: 1, ownerId: 'window-a', epoch: 0 };
+  const expectedSignature = (ts: string, sandbox: string, body: string) => {
+    const { createHash, createHmac } = require('node:crypto') as typeof import('node:crypto');
+    const hash = createHash('sha256').update(body).digest('hex');
+    return `v1=${createHmac('sha256', SECRET).update(`editor-bridge.v1.${ts}.${sandbox}.${hash}`).digest('hex')}`;
+  };
+
+  it('Cloudflare: only this boot\'s token reaches OS, as one signed fixed forward; everything else stays here', async () => {
+    const { binding, calls } = fakeSandboxNamespace({ exposePort: () => true });
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, SANDBOX_DESKTOP_MODE: 'neko', SANDBOX_NEKO_ICE_POLICY: 'diagnostic',
+      SANDBOX_WORKSPACE_R2_BUCKET: {}, EZIL_OS_BRIDGE_URL: OS_URL, EZIL_EDITOR_BRIDGE_ENVIRONMENT: 'staging',
+      EZIL_EDITOR_BRIDGE_TARGETS: `cloudflare:${computerId}` };
+    const start = async (legacy = false) => {
+      const path = '/sandbox/preview';
+      const body = JSON.stringify({ token: legacy ? await mintToken() : undefined, userId, projectId: computerId, desktopMode: 'neko' });
+      const auth = legacy ? undefined : await mintPreviewTokenV2(SECRET, {
+        ts: Date.now(), sandboxId: SANDBOX_NAME, userId, computerId, provider: 'cloudflare', store: '', generation: 0, leaseEpoch: 0,
+      }, { method: 'POST', path, body });
+      expect((await worker.fetch(new Request('https://api-desktop.ezil.org' + path, {
+        method: 'POST', body, headers: auth ? { 'x-ezil-auth': auth } : {},
+      }), env)).status).toBe(200);
+      expect(calls.editorBootComputerIds.at(-1)).toBe(legacy ? undefined : computerId);
+      return deriveEditorBridgeToken(SECRET, SANDBOX_NAME, calls.aiNonces.at(-1)!);
+    };
+    const firstBoot = await start();
+    const aiToken = calls.startProcess.at(-1)!.env.EZIL_AI_PROXY_TOKEN as string;
+    const host = `https://8443-${SANDBOX_NAME}-code.ezil.org`;
+    const sync = (bearer: string | null, init: RequestInit = {}, path = '/editor-bridge/v1/sync', extraHeaders: Record<string, string> = {}) =>
+      new Request(host + path, { method: 'POST', body: JSON.stringify(SYNC), ...init,
+        headers: { 'content-type': 'application/json', cookie: 'ezil_preview=not-a-bridge-token', ...(bearer === null ? {} : { authorization: `Bearer ${bearer}` }), ...extraHeaders } });
+    const realFetch = globalThis.fetch;
+    const upstream: { url: string; headers: Headers; body: string }[] = [];
+    let answer = () => Response.json({ ok: true, protocol: 1, owner: 'self', epoch: 1, deliver: [] });
+    globalThis.fetch = (async (request: Request) => {
+      upstream.push({ url: request.url, headers: request.headers, body: await request.text() });
+      return answer();
+    }) as typeof fetch;
+    try {
+      const ok = await worker.fetch(sync(firstBoot), env);
+      expect(ok.status).toBe(200);
+      expect(await ok.json()).toMatchObject({ owner: 'self', epoch: 1 });
+      expect(upstream).toHaveLength(1);
+      const sent = upstream[0]!;
+      expect(sent.url).toBe(`${OS_URL}/api/editor-bridge/v1/sync`);
+      expect(sent.body).toBe(JSON.stringify(SYNC));
+      expect([...sent.headers.keys()].sort()).toEqual(['content-type', 'x-ezil-sandbox', 'x-ezil-signature', 'x-ezil-timestamp']);
+      expect(sent.headers.get('x-ezil-sandbox')).toBe(SANDBOX_NAME);
+      expect(Math.abs(Number(sent.headers.get('x-ezil-timestamp')) - Date.now() / 1000)).toBeLessThan(5);
+      expect(sent.headers.get('x-ezil-signature')).toBe(expectedSignature(sent.headers.get('x-ezil-timestamp')!, SANDBOX_NAME, sent.body));
+      upstream.length = 0;
+
+      // Refused here, never forwarded: no or wrong token, THE AI PROXY TOKEN (it is not chat authority),
+      // another computer's token, a preview cookie, other paths and methods.
+      expect(aiToken).toMatch(/^[0-9a-f]{64}$/);
+      expect(aiToken).not.toBe(firstBoot);
+      for (const bad of [null, 'f'.repeat(64), aiToken, await deriveEditorBridgeToken(SECRET, 'guac-0000000000000000-0000000000000000', calls.aiNonces[0]!)]) {
+        const res = await worker.fetch(sync(bad), env);
+        expect(res.status).toBe(401);
+        expect(await res.json()).toEqual({ error: { code: 'os_bridge_unauthorized', source: 'ezil-os-bridge' } });
+      }
+      expect((await worker.fetch(sync(firstBoot, { method: 'GET', body: undefined }), env)).status).toBe(405);
+      for (const path of ['/editor-bridge', '/editor-bridge/v1/sync/x', '/editor-bridge/v1/command', '/editor-bridge/v1/sync?x=1', '/editor-bridge/../ai/v1/models']) {
+        expect([path, (await worker.fetch(sync(firstBoot, {}, path), env)).status]).toEqual([path, 404]);
+      }
+      for (const headers of [{}, { 'content-length': '1' }]) {
+        const big = await worker.fetch(sync(firstBoot, { body: 'x'.repeat(256 * 1024 + 1) }, undefined, headers), env);
+        expect(big.status).toBe(413);
+      }
+      expect(upstream).toHaveLength(0);
+
+      // OS answers pass through with their status; a redirect or an unreachable OS is a 502, never followed.
+      answer = () => Response.json({ error: 'unknown_computer' }, { status: 404 });
+      expect((await worker.fetch(sync(firstBoot), env)).status).toBe(404);
+      answer = () => new Response(null, { status: 302, headers: { location: 'https://evil.example/' } });
+      expect((await worker.fetch(sync(firstBoot), env)).status).toBe(502);
+      answer = () => { throw new TypeError('network'); };
+      expect((await worker.fetch(sync(firstBoot), env)).status).toBe(502);
+      answer = () => Response.json({ ok: true });
+
+      // Off unless the staging Worker pins its exact OS origin; no secret is a 503.
+      for (const deployment of [undefined, 'production']) {
+        expect((await worker.fetch(sync(firstBoot), { ...env, EZIL_EDITOR_BRIDGE_ENVIRONMENT: deployment })).status).toBe(404);
+      }
+      expect((await worker.fetch(sync(firstBoot), { ...env, EZIL_OS_BRIDGE_URL: 'https://os.ezil.work' })).status).toBe(404);
+      upstream.length = 0;
+      for (const osUrl of [undefined, '', 'http://os.ezil.work', 'https://os.ezil.work/api', 'https://user:pw@os.ezil.work', 'not a url']) {
+        expect([osUrl, (await worker.fetch(sync(firstBoot), { ...env, EZIL_OS_BRIDGE_URL: osUrl })).status]).toEqual([osUrl, 404]);
+      }
+      expect((await worker.fetch(sync(firstBoot), { ...env, SANDBOX_HMAC_SECRET: undefined })).status).toBe(503);
+      expect(upstream).toHaveLength(0);
+
+      // A restarted computer gets a new nonce: the old boot's token is dead, the new one works.
+      const legacyBoot = await start(true);
+      expect((await worker.fetch(sync(legacyBoot), env)).status).toBe(404);
+      const secondBoot = await start();
+      expect(secondBoot).not.toBe(firstBoot);
+      expect((await worker.fetch(sync(firstBoot), env)).status).toBe(401);
+      expect((await worker.fetch(sync(secondBoot), env)).status).toBe(200);
+      expect(calls.containerFetch).toHaveLength(0);
+    } finally { globalThis.fetch = realFetch; }
+  });
+
+  it('only a bound signed v2 CF restart carries the full computer ID to the boot gate', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    const url = `https://api-desktop-staging.ezil.work/sandbox/${SANDBOX_NAME}/restart`;
+    const body = '{}';
+    const path = new URL(url).pathname;
+    const request = (headers: HeadersInit) => new Request(url, { method: 'POST', body, headers });
+    const sign = (id: string) => mintPreviewTokenV2(SECRET, {
+      ts: Date.now(), sandboxId: SANDBOX_NAME, userId, computerId: id, provider: 'cloudflare', store: '', generation: 0, leaseEpoch: 0,
+    }, { method: 'POST', path, body });
+    const env = { Sandbox: binding, SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.work', SANDBOX_HMAC_SECRET: SECRET };
+    expect((await worker.fetch(request({ authorization: `Bearer ${await mintToken()}` }), env)).status).toBe(200);
+    expect((await worker.fetch(request({ 'x-ezil-auth': await sign(computerId) }), env)).status).toBe(200);
+    expect((await worker.fetch(request({ 'x-ezil-auth': await sign('aaaabbbb-cccc-4444-8888-999900001111') }), env)).status).toBe(200);
+    expect(calls.restartDesktopStack.map(call => call.computerId)).toEqual([undefined, computerId, undefined]);
+  });
+
+  it('AWS restart stages the existing AI config for unrelated hosts and adds Editor authority only for the selected computer', async () => {
+    const configs: Array<Record<string, unknown>> = [];
+    const env = {
+      AWS_ROUTING_ENABLED: 'on', AWS_ORIGIN_ZONE: 'origin.ezil.work', AWS_ORIGIN_ZONE_ALLOWLIST: 'origin.ezil.work',
+      SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.work', SANDBOX_HMAC_SECRET: SECRET, EZIL_OS_BRIDGE_URL: OS_URL,
+      EZIL_EDITOR_BRIDGE_ENVIRONMENT: 'staging', SANDBOX_NEKO_TURN_KEY_ID: 'fixture-turn-id',
+      SANDBOX_NEKO_TURN_API_TOKEN: 'fixture-only-key', SANDBOX_NEKO_TURN_TTL_SECONDS: '300',
+    };
+    const nonce = 'fixture-aws-ai-nonce';
+    const controlKey = Buffer.alloc(32, 7).toString('base64');
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = new URL(input instanceof Request ? input.url : input);
+      if (url.hostname === 'rtc.live.cloudflare.com') {
+        return Response.json({ iceServers: [{ urls: ['turn:relay.example:3478'], username: 'test', credential: 'fixture' }] });
+      }
+      expect(url.hostname).toBe(`c-${SANDBOX_NAME}-g1-e2.origin.ezil.work`);
+      if (url.pathname.endsWith('/desktop')) {
+        return Response.json({ ok: true, desktop: 'running', ice: 'applied', configured: false, expiresAt: null,
+          aiConfigured: true, bootId: '11111111-1111-4111-8111-111111111111' });
+      }
+      if (url.pathname.includes('/ice/')) {
+        configs.push(JSON.parse(String(init?.body)).ai);
+        return Response.json({ ok: true, state: 'already_running' });
+      }
+      expect(url.pathname).toContain('/restart-desktop/');
+      return Response.json({ ok: true, state: 'restart_requested' });
+    }) as typeof fetch;
+    try {
+      const raw = JSON.stringify({ requestId: 'a'.repeat(64) });
+      const path = `/sandbox/${SANDBOX_NAME}/restart`;
+      const send = async (id: string, targets?: string) => {
+        const record = { computerId: id, sandboxId: SANDBOX_NAME, controlKey, generation: 1, leaseEpoch: 2, originVerified: true };
+        const token = await mintPreviewTokenV2(SECRET, {
+          ts: Date.now(), sandboxId: SANDBOX_NAME, userId, computerId: id, provider: 'aws-ec2', store: '', generation: 1, leaseEpoch: 2,
+        }, { method: 'POST', path, body: raw });
+        return worker.fetch(new Request('https://api-desktop-staging.ezil.work' + path, {
+          method: 'POST', body: raw, headers: { 'x-ezil-auth': token },
+        }), { ...env, EZIL_EDITOR_BRIDGE_TARGETS: targets,
+          AWS_TUNNELS: { idFromName: (id: string) => id, get: () => ({ fetch: async (request: Request) =>
+            new URL(request.url).pathname === '/ai-nonce' ? Response.json({ nonce }) : Response.json({ record }) }) },
+        });
+      };
+      expect((await send(computerId)).status).toBe(202);
+      expect((await send(unrelatedId, `aws-ec2:${computerId}`)).status).toBe(202);
+      expect((await send(computerId, `cloudflare:${computerId}`)).status).toBe(202);
+      expect((await send(computerId, `aws-ec2:${computerId}`)).status).toBe(202);
+      const publicConfig = {
+        baseUrl: `https://aws-8443-${SANDBOX_NAME}-aws.ezil.work/ai/v1`,
+        proxyToken: await deriveAiProxyToken(SECRET, SANDBOX_NAME, nonce),
+      };
+      expect(configs).toEqual([
+        publicConfig, publicConfig, publicConfig,
+        { ...publicConfig, editorToken: await deriveEditorBridgeToken(SECRET, SANDBOX_NAME, nonce) },
+      ]);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  it('AWS: only the tunnel record\'s current nonce; a fenced or absent record, or the Cloudflare nonce, is refused', async () => {
+    const { binding, calls } = fakeSandboxNamespace({});
+    let nonce: string | null = 'aws-boot-one';
+    let present = true;
+    let recordComputerId = computerId;
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, AWS_ROUTING_ENABLED: 'on', EZIL_OS_BRIDGE_URL: OS_URL, EZIL_EDITOR_BRIDGE_ENVIRONMENT: 'staging',
+      EZIL_EDITOR_BRIDGE_TARGETS: `aws-ec2:${computerId}`,
+      SANDBOX_PREVIEW_ZONE_ROOT: 'ezil.org', AWS_ORIGIN_ZONE: 'origin.ezil.org', AWS_ORIGIN_ZONE_ALLOWLIST: 'origin.ezil.org',
+      AWS_TUNNELS: { idFromName: (id: string) => id, get: (id: string) => ({ fetch: async () =>
+        Response.json({ record: present ? { sandboxId: id, computerId: recordComputerId, aiProxyNonce: nonce } : null }) }) } };
+    const origin = `https://aws-8443-${SANDBOX_NAME}-aws.ezil.org`;
+    const req = async (bearer: string | null, host = origin) => new Request(`${host}/editor-bridge/v1/sync`, {
+      method: 'POST', body: JSON.stringify(SYNC),
+      headers: { 'content-type': 'application/json', ...(bearer === null ? {} : { authorization: `Bearer ${bearer}` }) } });
+    const realFetch = globalThis.fetch;
+    const upstream: Request[] = [];
+    globalThis.fetch = (async (request: Request) => { upstream.push(request); return Response.json({ ok: true }); }) as typeof fetch;
+    try {
+      const good = await deriveEditorBridgeToken(SECRET, SANDBOX_NAME, 'aws-boot-one');
+      expect((await worker.fetch(await req(good), env)).status).toBe(200);
+      // The AI proxy token for the same boot is not chat authority, and the bridge token is not AI authority.
+      expect((await worker.fetch(await req(await deriveAiProxyToken(SECRET, SANDBOX_NAME, 'aws-boot-one')), env)).status).toBe(401);
+      const aiWithBridgeToken = await worker.fetch(new Request(`${origin}/ai/v1/models`, { headers: { authorization: `Bearer ${good}` } }), env);
+      expect(aiWithBridgeToken.status).toBe(401);
+      expect(upstream[0]!.headers.get('x-ezil-sandbox')).toBe(SANDBOX_NAME);
+      upstream.length = 0;
+      for (const bad of [null, await deriveEditorBridgeToken(SECRET, SANDBOX_NAME, 'cloudflare-boot'), await deriveEditorBridgeToken(SECRET, 'guac-0000000000000000-0000000000000000', 'aws-boot-one')]) {
+        expect((await worker.fetch(await req(bad), env)).status).toBe(401);
+      }
+      nonce = 'aws-boot-two';
+      expect((await worker.fetch(await req(good), env)).status).toBe(401);
+      nonce = null;
+      expect((await worker.fetch(await req(good), env)).status).toBe(401);
+      present = false; nonce = 'aws-boot-one';
+      expect((await worker.fetch(await req(good), env)).status).toBe(404);
+      present = true; recordComputerId = unrelatedId;
+      expect((await worker.fetch(await req(good), env)).status).toBe(404);
+      recordComputerId = computerId;
+      expect((await worker.fetch(await req(good), { ...env, EZIL_EDITOR_BRIDGE_TARGETS: `cloudflare:${computerId}` })).status).toBe(404);
+      for (const over of [{ AWS_ROUTING_ENABLED: 'off' }, { AWS_ORIGIN_ZONE_ALLOWLIST: '' }, { AWS_TUNNELS: undefined }]) {
+        expect((await worker.fetch(await req(good), { ...env, ...over })).status).toBe(404);
+      }
+      for (const host of [origin.replace('8443', '8181'), origin.replace('-aws.', '-code.')]) {
+        expect((await worker.fetch(await req(good, host), env)).status).not.toBe(200);
+      }
+      expect(upstream).toHaveLength(0);
+      expect(calls.containerFetch).toHaveLength(0);
+    } finally { globalThis.fetch = realFetch; }
   });
 });

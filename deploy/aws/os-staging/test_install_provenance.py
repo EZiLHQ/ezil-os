@@ -14,7 +14,7 @@ HOST = 'i-014810524754b9ed0'
 HOST_PIN = 'vpc-0f6bc19fdfd4209aa\tezil-os-billing-staging-host\tbilling-staging'
 
 class VerifiedInstallTests(SandboxTestCase):
-    def prepare(self, *, source=None, label=None, runtime_sha=None, tag='v1', public_config=None):
+    def prepare(self, *, source=None, label=None, runtime_sha=None, tag='v1', public_config=None, oci=False, bad_oci_config=False):
         source = source or self.box.sha
         self.box.publish(BUCKET, 'os-staging/images', tag, 'ezil-os-staging', self.box.deploy)
         directory = self.box.s3 / BUCKET / 'os-staging/images'
@@ -26,10 +26,29 @@ class VerifiedInstallTests(SandboxTestCase):
             config['config']['Labels']['work.ezil.public-config-sha256'] = fingerprint(public_config)
         raw = json.dumps(config).encode()
         image_id = hashlib.sha256(raw).hexdigest()
+        config_name = ('blobs/sha256/' + image_id) if oci else image_id + '.json'
+        members = {config_name: raw, 'manifest.json': json.dumps([
+            {'Config': config_name, 'RepoTags': ['ezil-os-staging:' + tag], 'Layers': []}]).encode()}
+        descriptor = None
+        if oci:
+            from install_receipt import OCI_CONFIG, OCI_IMAGE, OCI_INDEX
+
+            def blob(value):
+                data = json.dumps(value).encode()
+                digest = hashlib.sha256(data).hexdigest()
+                members['blobs/sha256/' + digest] = data
+                return {'digest': 'sha256:' + digest, 'size': len(data), 'mediaType': value['mediaType']}
+
+            config_reference = '0' * 64 if bad_oci_config else image_id
+            manifest = blob({'schemaVersion': 2, 'mediaType': OCI_IMAGE, 'layers': [],
+                             'config': {'digest': 'sha256:' + config_reference, 'size': len(raw), 'mediaType': OCI_CONFIG}})
+            descriptor = blob({'schemaVersion': 2, 'mediaType': OCI_INDEX,
+                               'manifests': [{**manifest, 'platform': {'architecture': 'amd64', 'os': 'linux'}}]})
+            members['index.json'] = json.dumps({'schemaVersion': 2, 'manifests': [
+                {**descriptor, 'annotations': {'org.opencontainers.image.ref.name': tag}}]}).encode()
         archive = io.BytesIO()
         with tarfile.open(fileobj=archive, mode='w') as tar:
-            for name, data in [(image_id + '.json', raw), ('manifest.json', json.dumps([
-                    {'Config': image_id + '.json', 'RepoTags': ['ezil-os-staging:' + tag], 'Layers': []}]).encode())]:
+            for name, data in members.items():
                 entry = tarfile.TarInfo(name)
                 entry.size = len(data)
                 tar.addfile(entry, io.BytesIO(data))
@@ -44,6 +63,8 @@ class VerifiedInstallTests(SandboxTestCase):
         path = directory / (tag + '.source.json')
         path.write_text(json.dumps(receipt))
         self.loaded = {'Id': 'sha256:' + image_id, 'Architecture': 'amd64', 'Os': 'linux', 'Config': config['config']}
+        if descriptor is not None:
+            self.loaded.update(Id=descriptor['digest'], Descriptor=descriptor)
         self.directory = directory
         return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -65,6 +86,27 @@ class VerifiedInstallTests(SandboxTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('Installed TAG: v1', result.stdout)
         self.assertTrue(any('up' in c for c in self.box.calls()))
+
+    def test_verified_install_accepts_digest_verified_containerd_oci_index(self):
+        receipt = self.prepare(oci=True)
+        _, result = self.install(receipt)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Installed TAG: v1', result.stdout)
+
+    def test_oci_index_with_a_mismatched_config_stops_before_load(self):
+        receipt = self.prepare(oci=True, bad_oci_config=True)
+        _, result = self.install(receipt)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('OCI image config differs', result.stderr)
+        self.assertFalse(any(c[:2] == ['docker', 'load'] for c in self.box.calls()))
+
+    def test_oci_load_requires_exact_observed_descriptor_before_replacing_app(self):
+        receipt = self.prepare(oci=True)
+        self.loaded['Descriptor']['size'] += 1
+        _, result = self.install(receipt)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Loaded OCI descriptor differs', result.stderr)
+        self.assertFalse(any('up' in c for c in self.box.calls()))
 
     def test_receipt_and_artifact_mismatches_stop_before_docker_load(self):
         for case in ('missing', 'hash', 'source', 'environment', 'tag', 'tar.gz', 'runtime.tar.gz'):

@@ -92,7 +92,7 @@ export interface AwsDesktopConfig {
   /** The sandbox's derived neko credentials (32 hex each). */
   neko: { user: string; admin: string };
   /** Body-bound signed control delivery; no user JWT ever enters the host. */
-  ai?: { baseUrl: string; proxyToken: string };
+  ai?: { baseUrl: string; proxyToken: string; editorToken?: string };
 }
 
 const isTurn = (u: string) => u.startsWith('turn:') || u.startsWith('turns:');
