@@ -2,9 +2,10 @@ import { initTRPC } from '@trpc/server';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-const h = vi.hoisted(() => ({ getDeps: vi.fn(), billing: vi.fn(), receipts: vi.fn(), findMany: vi.fn() }));
+const h = vi.hoisted(() => ({ getDeps: vi.fn(), billing: vi.fn(), receipts: vi.fn(), findMany: vi.fn(), balance: vi.fn() }));
 
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: h.getDeps }));
+vi.mock('./account-ai-balance', () => ({ readSettingsAiBalance: h.balance }));
 vi.mock('@/server/billing/v2/compute-access', () => ({ loadComputeBillingState: h.billing }));
 vi.mock('../trpc', () => {
     const t = initTRPC.context<{ user: { id: string }; db: unknown }>().create();
@@ -26,6 +27,7 @@ beforeEach(() => {
     vi.stubEnv('EZIL_DELEGATION_ISSUER', 'https://connect-staging.ezil.work');
     vi.stubEnv('EZIL_DELEGATION_AUDIENCE', 'https://os-staging.ezil.work');
     h.findMany.mockReset().mockResolvedValue([]);
+    h.balance.mockReset().mockResolvedValue(null);
     h.billing.mockReset().mockResolvedValue({
         planSku: 'free_v3',
         summary: { version: 3, computer: { machineChoice: [{ size: 'free-cf' }] } },
@@ -60,6 +62,28 @@ describe('account.mcpSettings', () => {
         expect(limit).toBe(2);
         expect(h.receipts).toHaveBeenCalledWith(uid);
         expect(h.billing).toHaveBeenCalledWith(expect.anything(), uid, expect.any(Date));
+    });
+
+    it('keeps the returned owner balance distinct from pending deliveries when the Worker proves it', async () => {
+        const computer = '33333333-3333-4333-8333-333333333333';
+        h.findMany.mockResolvedValue([{ id: computer, name: 'Owned desktop', slot: 1 }]);
+        h.balance.mockResolvedValue({ balanceMicro: '1700', heldMicro: '200' });
+        expect((await caller().mcpSettings({})).credits).toEqual({
+            state: 'available', balanceMicro: '1700', heldMicro: '200', pendingDeliveryCredits: 8,
+        });
+        expect(h.balance).toHaveBeenCalledWith(expect.anything(), uid, [computer], undefined);
+    });
+
+    it('withholds an unconfirmed zero balance while preserving the pending delivery', async () => {
+        h.findMany.mockResolvedValue([{ id: uid, name: 'Owned desktop', slot: 1 }]);
+        h.balance.mockResolvedValue({ balanceMicro: '0', heldMicro: '2' });
+        expect((await caller().mcpSettings({})).credits).toEqual({
+            state: 'unavailable', balanceMicro: null, heldMicro: null, pendingDeliveryCredits: 8,
+        });
+        h.receipts.mockResolvedValue([]);
+        expect((await caller().mcpSettings({})).credits).toEqual({
+            state: 'available', balanceMicro: '0', heldMicro: '2', pendingDeliveryCredits: 0,
+        });
     });
 
     it('reports failed evidence as unavailable independently of owned rows', async () => {
