@@ -119,6 +119,7 @@ function simulateCodeServerEnsureOrigin(headers: Record<string, string>, origin:
 function fakeSandboxNamespace(options: {
   exposedPorts?: Array<{ port: number; url: string; status: string }>;
   imageId?: string | null;
+  aiAccountFixture?: { credential: StoredAiCredential; boot: string | null };
   getImageId?: () => Promise<string | null>;
   terminateResult?: Record<string, unknown>;
   /** Upstream response the fake container returns for `containerFetch`. */
@@ -200,13 +201,15 @@ function fakeSandboxNamespace(options: {
     browserOpens: [],
   };
 
-  let credential: StoredAiCredential | undefined;
+  let credential = options.aiAccountFixture?.credential;
   // Plans predate these route tests: a verified every-model plan unless a push names a list.
   let modelAccess: { known: boolean; includedModels?: readonly string[] | null } = { known: true, includedModels: null };
   let nonce: string | null = null;
   let processResult: unknown;
   const impl: Record<string, (...args: unknown[]) => Promise<unknown>> = {
     getAiProxyNonce: async () => nonce,
+    getRunningAiProxyNonce: async () => options.aiAccountFixture?.boot ?? null,
+    getAiCreditsRelay: async () => 'none',
     getEditorBridgeNonce: async () => calls.editorBootComputerIds.at(-1) ? nonce : null,
     getAiCredential: async () => usableAiCredential(credential),
     getAiModelAccess: async () => modelAccess,
@@ -4486,6 +4489,55 @@ describe('Code folder bridge on the code host: each realm reports to its own app
     // The older image's composer notice is hidden by the same insertion, once.
     expect(body.split('<style data-ezil-legacy-notice="1">.chat-viewpane .interactive-session>.interactive-input-part::after'
       + '{content:none!important;display:none!important}</style>').length - 1).toBe(1);
+  });
+});
+
+describe('staging signed account balance on the credential-control route', () => {
+  const owner = 'abcdef01-2345-6789-abcd-ef0123456789';
+  const computerId = 'fedcba98-7654-3210-fedc-ba9876543210';
+  const path = '/sandbox/' + SANDBOX_NAME + '/ai-credential';
+  async function signed(secret = SECRET, generation = 1, provider: 'cloudflare' | 'aws-ec2' = 'cloudflare', leaseEpoch = 0) {
+    const auth = await mintPreviewTokenV2(secret, {
+      ts: Date.now(), userId: owner, computerId, sandboxId: SANDBOX_NAME, provider,
+      generation, leaseEpoch, store: '',
+    }, { method: 'GET', path, body: '' });
+    return { 'x-ezil-auth': auth };
+  }
+
+  it('requires v2 on the exact staged service and reads an existing boot without any lifecycle calls', async () => {
+    const expiresAt = Date.now() + 3_600_000;
+    const token = 'e30.' + Buffer.from(JSON.stringify({ sub: owner, role: 'authenticated', exp: expiresAt / 1000 })).toString('base64url') + '.fixture';
+    const { binding, calls } = fakeSandboxNamespace({ aiAccountFixture: { boot: 'live-boot', credential: { token, expiresAt } } });
+    const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, EZIL_AI_GATEWAY_URL: 'https://ai-staging.ezil.work' };
+    const staged = 'https://api-desktop-staging.ezil.work' + path;
+    const fetch = spyOn(globalThis, 'fetch').mockImplementation(async () => Response.json({
+      available_micro: '17', held_micro: '2', account_public_id: 'private-fixture',
+    }));
+    try {
+      expect((await worker.fetch(new Request(staged, { headers: { authorization: 'Bearer ' + await mintToken() } }), env)).status).toBe(401);
+      const mission = 'synthetic-mission-signature-fixture';
+      expect((await worker.fetch(new Request(staged, { headers: await signed(mission) }),
+        { ...env, SANDBOX_MISSION_HMAC_SECRET: mission })).status).toBe(401);
+      expect((await worker.fetch(new Request('https://api-desktop.ezil.work' + path, { headers: await signed() }), env)).status).toBe(404);
+      expect((await worker.fetch(new Request(staged, { headers: await signed() }),
+        { ...env, EZIL_AI_GATEWAY_URL: 'https://ai.ezil.work' })).status).toBe(404);
+      for (const headers of [
+        await signed(SECRET, 2), await signed(SECRET, 1, 'cloudflare', 1), await signed(SECRET, 1, 'aws-ec2', 1),
+      ]) expect((await worker.fetch(new Request(staged, { headers }), env)).status).toBe(401);
+      const stopped = fakeSandboxNamespace({ aiAccountFixture: { boot: null, credential: { token, expiresAt } } });
+      expect((await worker.fetch(new Request(staged, { headers: await signed() }), { ...env, Sandbox: stopped.binding })).status).toBe(503);
+      expect(fetch).not.toHaveBeenCalled();
+      const response = await worker.fetch(new Request(staged, { headers: await signed() }), env);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ balanceMicro: '17', heldMicro: '2' });
+      const legacyPin = await worker.fetch(new Request(staged, { headers: await signed(SECRET, 0) }), env);
+      expect(legacyPin.status).toBe(200);
+      expect(fetch).toHaveBeenCalledTimes(2);
+      expect(calls.startProcess).toEqual([]);
+      expect(calls.exec).toBe(0);
+      expect(calls.aiStored).toEqual([]);
+      expect(calls.aiDeletes).toBe(0);
+    } finally { fetch.mockRestore(); }
   });
 });
 

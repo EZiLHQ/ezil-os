@@ -232,6 +232,7 @@ export function parsePushedAccessToken(
   token: unknown,
   sandboxId: string,
   now: number = Date.now(),
+  expectedOwner?: string,
 ): { ok: true; credential: StoredAiCredential } | { ok: false; error: string } {
   if (typeof token !== 'string' || token.length > 16_384 || !JWT_SHAPE.test(token)) {
     return { ok: false, error: 'access_token_malformed' };
@@ -246,7 +247,9 @@ export function parsePushedAccessToken(
   }
   const sub = claims.sub;
   if (typeof sub !== 'string' || !UUID.test(sub)) return { ok: false, error: 'access_token_malformed' };
-  if (!sandboxBelongsToUser(sandboxId, sub)) return { ok: false, error: 'access_token_wrong_user' };
+  if (!sandboxBelongsToUser(sandboxId, sub) || (expectedOwner !== undefined && sub.toLowerCase() !== expectedOwner.toLowerCase())) {
+    return { ok: false, error: 'access_token_wrong_user' };
+  }
   if (claims.role !== 'authenticated') return { ok: false, error: 'access_token_not_authenticated' };
   const exp = claims.exp;
   if (typeof exp !== 'number' || !Number.isFinite(exp)) return { ok: false, error: 'access_token_malformed' };
@@ -737,7 +740,7 @@ function safeGatewayError(bytes: Uint8Array | null): Record<string, unknown> {
 const WINDOW_RESET = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})$/;
 
 const CREDITS_PENDING_MESSAGE = 'Your AI credits are being confirmed. Please try again shortly.';
-async function creditsUnconfirmed(deps: AiProxyDeps): Promise<boolean> {
+export async function creditsUnconfirmed(deps: Pick<AiProxyDeps, 'creditsRelay'>): Promise<boolean> {
   if (!deps.creditsRelay) return false;
   try {
     const answer = await deps.creditsRelay();

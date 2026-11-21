@@ -690,6 +690,7 @@ import {
 } from './ai-proxy';
 import { deriveEditorBridgeToken, editorBridgeTargetAllowed, handleEditorBridgeRequest, isEditorBridgePath, resolveOsBridgeUrl, type EditorBridgeProvider } from './editor-bridge';
 
+import { readAiAccountBalance } from './ai-account';
 import { captureEditorState } from './editor-state';
 import { CF_ADMISSION_ERROR, cfAdmissionRunningOnly, cfAdmissionResponse, isCfAdmissionError } from './cf-container-admission';
 import {
@@ -1011,6 +1012,7 @@ interface EzilWorkspacePersistRpc {
   recordActivity(lastInputAgoMs: number): Promise<void>;
   startAiDesktop(hostname: string, sandboxId: string, command: string, env: Record<string, string>, computerId?: string): Promise<string>;
   getAiProxyNonce(): Promise<string | null>;
+  getRunningAiProxyNonce(): Promise<string | null>;
   getEditorBridgeNonce(): Promise<string | null>;
   putAiCredential(credential: StoredAiCredential, signedAt: number, includedModels?: readonly string[] | null, creditsPending?: boolean | null): Promise<{ stored: boolean; expiresAt: number }>;
   putAiModelAccess(includedModels: readonly string[] | null, signedAt: number, creditsPending?: boolean | null): Promise<{ stored: boolean }>;
@@ -4038,6 +4040,13 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
 
   async getAiProxyNonce(): Promise<string | null> {
     return (await this.ctx.storage.get<string>(AI_PROXY_NONCE_STORAGE_KEY)) ?? null;
+  }
+
+  async getRunningAiProxyNonce(): Promise<string | null> {
+    if (!this.containerIsRunning() || this.runtimeTransitionsInFlight > 0
+        || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)
+        || await this.migrationStartBlocked()) return null;
+    return this.getAiProxyNonce();
   }
 
   /**
@@ -7430,7 +7439,10 @@ async function preauthorizeV2(request: Request, env: Env, url: URL): Promise<Res
   } catch {
     return json({ ok: false, error: 'hmac_v2_body_unreadable' }, 401);
   }
-  const verdict = await verifyPreviewTokenV2(token, resolvePreviewSecrets(env), {
+  const isAccountRead = request.method === 'GET' && /^\/sandbox\/[^/]+\/ai-credential$/.test(url.pathname);
+  // Only the OS's primary sandbox authority can read this owner's balance.
+  const secrets = isAccountRead ? [env.SANDBOX_HMAC_SECRET?.trim() ?? ''].filter(Boolean) : resolvePreviewSecrets(env);
+  const verdict = await verifyPreviewTokenV2(token, secrets, {
     method: request.method.toUpperCase(),
     path: url.pathname,
     body,
@@ -7934,6 +7946,35 @@ async function browserOpenBootEnv(env: Env, sandboxId: string): Promise<Record<s
     ...(code ? { EZIL_CODE_BROWSER_MCP: 'on' } : {}),
     ...(capability ? { EZIL_WORKER_BROWSER_MCP_TOKEN: capability } : {}),
   };
+}
+
+async function handleAiAccountRead(request: Request, env: Env, sandboxId: string): Promise<Response> {
+  const respond = (status: number, body: unknown) => Response.json(body, { status, headers: { 'cache-control': 'no-store' } });
+  if (new URL(request.url).origin !== 'https://api-desktop-staging.ezil.work'
+      || env.EZIL_AI_GATEWAY_URL !== 'https://ai-staging.ezil.work' || aiProxyDisabled(env.SANDBOX_AI_PROXY)) {
+    return respond(404, { error: 'not_found' });
+  }
+  // GET on this exact path is a separate signed purpose. A credential-push HMAC,
+  // preview bearer, and query parameters cannot authorize it.
+  const claims = verifiedV2Claims.get(request);
+  if (!claims || claims.sandboxId !== sandboxId || deriveSandboxId(claims.userId, claims.computerId) !== sandboxId
+      || claims.provider !== 'cloudflare' || claims.leaseEpoch !== 0
+      || (claims.generation !== 0 && claims.generation !== 1)) {
+    return respond(401, { error: 'ai_account_unauthorized' });
+  }
+  // The SDK's openSandbox configures keepalive. A read uses the same
+  // normalized DO key directly, so it neither configures nor wakes a computer.
+  const sandbox = env.Sandbox.get(env.Sandbox.idFromName(sandboxId)) as unknown as Pick<
+    EzilWorkspacePersistRpc, 'getRunningAiProxyNonce' | 'getAiCredential' | 'getAiCreditsRelay'
+  >;
+  const current = async () => {
+    if (await awsControlTarget(env, request, sandboxId, 'ai_account')) return null;
+    const boot = await sandbox.getRunningAiProxyNonce();
+    const token = boot ? await sandbox.getAiCredential() : null;
+    return boot && token ? { boot, token, creditsRelay: await sandbox.getAiCreditsRelay() } : null;
+  };
+  const balance = await readAiAccountBalance({ owner: claims.userId, sandboxId, current, fetch, signal: request.signal });
+  return balance ? respond(200, balance) : respond(503, { error: 'ai_account_unavailable' });
 }
 
 async function handleAiProxy(request: Request, env: Env, sandboxId: string, awsNonce?: string | null): Promise<Response> {
@@ -8624,6 +8665,10 @@ const worker = {
       } catch { return json({ ok: false, error: 'migration_failed' }, 503); }
     }
     const aiCredentialMatch = path.match(/^\/sandbox\/([^/]+)\/ai-credential$/);
+    if (method === 'GET' && aiCredentialMatch) {
+      const sandboxId = sandboxIdFromPath(path);
+      return sandboxId ? handleAiAccountRead(request, env, sandboxId) : json({ error: 'not_found' }, 404);
+    }
     if ((method === 'POST' || method === 'DELETE') && aiCredentialMatch) {
       return handleAiCredential(request, env, decodeURIComponent(aiCredentialMatch[1]));
     }
