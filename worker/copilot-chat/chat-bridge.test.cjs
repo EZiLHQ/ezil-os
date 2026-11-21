@@ -69,7 +69,7 @@ test('accepted: the exact session, with the open pane\'s own mode/model options,
 });
 
 test('a private completed turn is released only after its own durable request matches', async () => {
-    for (const canVerify of [true, false]) {
+    for (const proof of ['completed', 'other-request', 'partial']) {
         const saved = deferred();
         const writes = [];
         const w = world({
@@ -78,12 +78,13 @@ test('a private completed turn is released only after its own durable request ma
                 async storeSessions(models) { writes.push(...models.map(model => model.sessionId)); await saved.promise; },
                 async readSession(id) {
                     assert.equal(id, 's1');
-                    return { value: { requests: [{ requestId: canVerify ? 'req-1' : 'some-earlier-request' }] } };
+                    return { value: { requests: [{ requestId: proof === 'other-request' ? 'other' : 'req-1', modelState: { value: proof === 'partial' ? 0 : 1 } }] } };
                 },
             },
         });
         await claimed(w);
         await submit(w, 1);
+        w.models.get('s1').lastRequest.response.stateT = { value: 1 };
         w.models.get('s1').lastRequest.response.finish(false);
         await new Promise(setImmediate);
         const status = () => w.bridge.handle({ op: 'command', commandId: CMD(1), ...OWNER });
@@ -92,7 +93,7 @@ test('a private completed turn is released only after its own durable request ma
         assert.equal(w.calls.disposed, 0);
         saved.resolve();
         await new Promise(setImmediate);
-        assert.equal((await status()).status, canVerify ? 'completed' : 'finished_unverified');
+        assert.equal((await status()).status, proof === 'completed' ? 'completed' : 'finished_unverified');
         assert.equal(w.calls.disposed, 1);
         assert.equal(w.calls.send.length, 1);
     }
