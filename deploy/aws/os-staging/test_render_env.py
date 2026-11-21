@@ -421,6 +421,22 @@ class DelegationEnvironmentTests(unittest.TestCase):
         self.refused({**complete, key: "enabled", "EZIL_DELEGATION_ISSUER": "https://other.example.invalid"}, "staging")
         self.refused({key: "disabled"}, "production")
 
+    def test_mcp_identity_client_requires_staging_onboarding_and_one_pinned_auth0_audience(self):
+        key = "EZIL_MCP_IDENTITY_BOOTSTRAP_AUTH0_CLIENT_ID"
+        client = "Synthetic_Auth0-Client"
+        stage = delegation(EZIL_DELEGATION_ISSUER="https://connect-staging.ezil.work",
+                           EZIL_DELEGATION_AUDIENCE="https://os-staging.ezil.work")
+        enabled = {**stage, renderer.STAGING_ONBOARDING: "enabled"}
+        self.assertNotIn(key, renderer.validate({**self.staging, **enabled}))
+        self.assertEqual(renderer.validate({**self.staging, **enabled, key: client})[key], client)
+        self.refused({key: client}, "production")
+        self.refused({**stage, key: client}, "staging")
+        self.refused({**stage, renderer.STAGING_ONBOARDING: "disabled", key: client}, "staging")
+        self.refused({**enabled, key: client, "EZIL_DELEGATION_ISSUER": "https://other.example.invalid"}, "staging")
+        for invalid in ("short", "*", "a" * 129, "two,client-identifiers", "https://other.example.invalid"):
+            with self.subTest(audience=invalid):
+                self.refused({**enabled, key: invalid}, "staging")
+
     def test_editor_switches_are_default_off_and_staging_only(self):
         first, second, controls = renderer.STAGING_EDITOR_SWITCHES
         origins = delegation(EZIL_DELEGATION_ISSUER="https://connect-staging.ezil.work",
