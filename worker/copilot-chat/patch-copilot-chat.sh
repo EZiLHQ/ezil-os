@@ -81,6 +81,10 @@ rows.sort((a,b)=>a[1]<b[1]?-1:a[1]>b[1]?1:0);const h=crypto.createHash("sha256")
 node -e 'const fs=require("fs");const root=process.argv[1];const j=JSON.parse(fs.readFileSync(root+"/extensions/copilot/package.json","utf8"));if(j.publisher!=="GitHub"||j.name!=="copilot-chat"||j.version!=="0.69.0"||!j.contributes?.languageModelChatProviders)throw new Error("expected bundled GitHub.copilot-chat 0.69.0 with languageModelChatProviders");if(!JSON.parse(fs.readFileSync(root+"/product.json","utf8")).defaultChatAgent)throw new Error("defaultChatAgent missing");' "$ROOT"
 
 # ── anchors / replacements (single source of truth for patch + gate) ────────
+# The consented Code evidence bridge asks the active Monaco editor for absolute
+# model ranges. No document text is read, and no listener samples on its own.
+A_ASSIGNMENT_RANGE='r.domNode.domNode.setAttribute("data-uri",e.uri.toString()),t.push(r.onWillCopy'
+R_ASSIGNMENT_RANGE='r.domNode.domNode.setAttribute("data-uri",e.uri.toString()),r.domNode.domNode.addEventListener("ezil:assignment-code-visible-range",event=>{try{if(event.target!==r.domNode.domNode||event.detail?.uri!==e.uri.toString()||this.getModel()!==e||typeof event.detail?.report!=="function")return;const ranges=this.getVisibleRanges();if(ranges.length===1)event.detail.report([ranges[0].startLineNumber,ranges[0].endLineNumber])}catch{}}),t.push(r.onWillCopy'
 # CommandsRegistry (`qe`) has just been initialized; the following `YLi` declaration makes the
 # anchor disappear after insertion. One renderer command, no registration in the extension host.
 A_APP_FAILURE='qe.registerCommand("noop",()=>{});var YLi='
@@ -549,6 +553,7 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch ai-dashboard "$WB" 1 "$A_AI_DASHBOARD" "$R_AI_DASHBOARD"
   patch app-failure "$WB" 1 "$A_APP_FAILURE" "$R_APP_FAILURE"
   patch ai-request-trace "$WB" 1 "$A_AI_REQUEST_TRACE" "$R_AI_REQUEST_TRACE"
+  patch assignment-visible-range "$WB" 1 "$A_ASSIGNMENT_RANGE" "$R_ASSIGNMENT_RANGE"
   patch app-start-timeout "$WB" 1 "$A_APP_START_TIMEOUT" "$R_APP_START_TIMEOUT"
   patch billing-intent "$WB" 1 "$A_BILLING_INTENT" "$R_BILLING_INTENT"
   patch picker-locked-list "$WB" 1 "$A_PICKER_LOCKED_LIST" "$R_PICKER_LOCKED_LIST"
@@ -633,6 +638,7 @@ fi
 gate app-failure "$WB" 0 "$A_APP_FAILURE"; gate app-failure "$WB" 1 "$R_APP_FAILURE"
 gate app-start-timeout "$WB" 0 "$A_APP_START_TIMEOUT"; gate app-start-timeout "$WB" 1 "$R_APP_START_TIMEOUT"
 gate ai-request-trace "$WB" 1 "$R_AI_REQUEST_TRACE"
+gate assignment-visible-range "$WB" 0 "$A_ASSIGNMENT_RANGE"; gate assignment-visible-range "$WB" 1 "$R_ASSIGNMENT_RANGE"
 gate ai-request-trace-command "$WB" 1 'qe.registerCommand("_ezil.aiRequestTrace",'
 gate app-failure-command "$WB" 1 'qe.registerCommand("_ezil.appFailure",'
 gate billing-intent "$WB" 1 "$R_BILLING_INTENT"; gate billing-intent-command "$WB" 1 'qe.registerCommand("_ezil.billingIntent",'

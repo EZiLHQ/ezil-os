@@ -1,3 +1,5 @@
+import { codeAssignmentEvidenceTag } from './code-assignment-evidence';
+
 /**
  * code-folder-bridge.ts — the Code folder bridge, injected by this Worker into code-server's WORKBENCH document
  * (both computers: the Cloudflare code host, `preview-bridge.ts` `handlePreviewProxy`, and an AWS computer's code
@@ -260,7 +262,8 @@ export function injectCodeFolderBridge(html: string, origins: readonly string[])
   const charset = /<meta\s+charset\s*=\s*["']?[A-Za-z0-9_-]+["']?\s*\/?>/i.exec(html.slice(headStart, headEnd < 0 ? undefined : headEnd));
   const at = charset ? headStart + charset.index + charset[0].length : headStart;
   return `${html.slice(0, at)}\n<script nonce="${nonce}" ${BRIDGE_MARKER}="1">${script}</script>`
-    + `<style ${LEGACY_NOTICE_MARKER}="1">${LEGACY_NOTICE_HIDE_CSS}</style>${html.slice(at)}`;
+    + `<style ${LEGACY_NOTICE_MARKER}="1">${LEGACY_NOTICE_HIDE_CSS}</style>`
+    + codeAssignmentEvidenceTag(origins, nonce) + html.slice(at);
 }
 
 /**

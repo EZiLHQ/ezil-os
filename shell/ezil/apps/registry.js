@@ -72,6 +72,7 @@ import telemetry from '../telemetry.js';
 import { beginTrace } from '../trace.js';
 import log from '../log.js';
 import appHistory from '../app-history.js';
+import { updateAssignmentEvidenceWindow } from '../assignment-evidence.js';
 
 const PHASE = 'ezil-os:apps';
 
@@ -700,6 +701,7 @@ export async function launch (id, ctx = {}) {
         entry?.end(el);
     }
     if ( el && ! entry ) appHistory.commit(id, ctx, el);
+    if ( id === 'code' && el ) updateAssignmentEvidenceWindow(el, ctx);
     return el;
 }
 

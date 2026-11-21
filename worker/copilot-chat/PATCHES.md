@@ -712,3 +712,13 @@ outside the workspace configuration. File actions, selection and filters use
 the projected root. A missing or replaced checkout restores the normal view.
 The patch is matched and checked against Code Server 4.141.0 before computing
 the workbench static content ID.
+
+### Assignment editor viewport
+
+`assignment-visible-range` is anchored at Monaco's single `data-uri` assignment.
+A synchronous request on that editor element can return one visible model range
+as two absolute line numbers. The hook requires the exact active model URI.
+The staged assignment bridge asks only for a displayed editor inside the bound
+assignment checkout after the participant enables evidence capture. A viewport
+with multiple ranges, such as across folded text, yields no range observation.
+This evidence describes what the editor displayed.
