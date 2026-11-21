@@ -23,9 +23,14 @@
  * read here and never will be: that list also widens what Code chats may open,
  * so letting it mint a tier would couple two decisions that must stay apart.
  *
- * A malformed entry empties THAT tier (the other tier is unaffected) and is
- * reported in `policy.invalid` so the boot log can say so. An origin listed in
- * both variables is `idp_transit`, never `owner_app`.
+ * 🔴 A malformed entry in EITHER variable BREAKS THE WHOLE POLICY
+ * (`policy.broken`): every URL is then `idp_transit` — transit only, for every
+ * caller — until the variable is fixed, and `originPolicyBootLines` says so
+ * once. (Amended 2026-11-21. Emptying just the bad tier failed OPEN: a typo in
+ * the IdP list made the IdP `other`, which allows every verb, and a typo in
+ * the owner list made Universe `other`, which the Code loopback does not
+ * refuse.) Unset or blank variables are not malformed: that tier is empty. An
+ * origin listed in both variables is `idp_transit`, never `owner_app`.
  *
  * ── Policies are minted here, never hand-built ──────────────────────────────
  * `tierOf` and `sanitizeUrl` refuse (TypeError) any object that did not come
@@ -40,7 +45,7 @@ import {
     IDP_TRANSIT_ROUTES, ORIGIN_TIER_ENV, ORIGIN_TIERS, SENSITIVE_URL_PARAMS, SIDECAR_WIRE,
 } from './contract.mjs';
 
-/** More entries than this in one variable empties that tier. */
+/** More entries than this in one variable is malformed: the policy is broken. */
 export const ORIGIN_TIER_MAX_ENTRIES = 20;
 
 /** Same host rule as `mcp-browser-open.mjs` `destination()`: dotted DNS names only. */
@@ -96,34 +101,35 @@ function parseTierList (tier, variable, raw) {
  * Build the policy from an environment object. Reads exactly the two
  * `ORIGIN_TIER_ENV` names and nothing else.
  *
- * Returns a frozen `{ owner_app, idp_transit, invalid, overlap }`:
+ * Returns a frozen `{ broken, owner_app, idp_transit, invalid, overlap }`:
+ *   broken                   true when either variable has a malformed entry:
+ *                            every URL is then `idp_transit`, and the arrays
+ *                            below are empty because no list is trusted
  *   owner_app / idp_transit  the origins in each tier (frozen arrays, for logs)
  *   invalid                  `[{tier, variable, entry, reason}]` — `entry` is
  *                            the 1-based position, never the raw text (a
  *                            mistyped value can hold anything, a password in a
  *                            `user:pw@` URL included, and this goes to a log)
  *   overlap                  origins listed in both variables (all idp_transit)
- *
- * An overlap origin is `idp_transit` even when the IdP variable is otherwise
- * malformed: "in both lists" is checked on the valid entries of each list, so
- * a typo elsewhere in the IdP list can never promote the IdP to `owner_app`.
  */
 export function loadOriginPolicy (env) {
     const source = env && typeof env === 'object' ? env : {};
     const owner = parseTierList('owner_app', ORIGIN_TIER_ENV.owner_app, source[ORIGIN_TIER_ENV.owner_app]);
     const idp = parseTierList('idp_transit', ORIGIN_TIER_ENV.idp_transit, source[ORIGIN_TIER_ENV.idp_transit]);
+    const broken = !owner.ok || !idp.ok;
 
-    const overlap = [...new Set(owner.valid.filter((o) => idp.valid.includes(o)))];
-    const idpSet = new Set([...(idp.ok ? idp.valid : []), ...overlap]);
-    const ownerSet = new Set((owner.ok ? owner.valid : []).filter((o) => !idpSet.has(o)));
+    const overlap = broken ? [] : [...new Set(owner.valid.filter((o) => idp.valid.includes(o)))];
+    const idpSet = new Set(broken ? [] : idp.valid);
+    const ownerSet = new Set(broken ? [] : owner.valid.filter((o) => !idpSet.has(o)));
 
     const policy = Object.freeze({
+        broken,
         owner_app: Object.freeze([...ownerSet]),
         idp_transit: Object.freeze([...idpSet]),
         invalid: Object.freeze([...owner.problems, ...idp.problems].map((p) => Object.freeze(p))),
         overlap: Object.freeze(overlap),
     });
-    TIER_SETS.set(policy, { owner: ownerSet, idp: idpSet });
+    TIER_SETS.set(policy, { broken, owner: ownerSet, idp: idpSet });
     return policy;
 }
 
@@ -150,7 +156,22 @@ function tierOrigin (parsed) {
     return origin.replace(/^(https:\/\/[^/:]*?)\.+(?=$|:)/, '$1');
 }
 
-function tierFromParsed (parsed, sets) {
+function parseUrl (url) {
+    try {
+        return new URL(String(url));
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * THE classification, for `tierOf` and `sanitizeUrl` alike. A broken policy
+ * answers `idp_transit` before looking at the URL at all — parsable or not,
+ * https or not — so there is exactly one place that decides it.
+ */
+function classify (sets, parsed) {
+    if (sets.broken) return 'idp_transit';
+    if (parsed === null) return 'other';
     const origin = tierOrigin(parsed);
     if (origin === null) return 'other';
     if (sets.idp.has(origin)) return 'idp_transit';
@@ -158,16 +179,12 @@ function tierFromParsed (parsed, sets) {
     return 'other';
 }
 
-/** `owner_app | idp_transit | other` for a URL. Anything unparsable is `other`. */
+/**
+ * `owner_app | idp_transit | other` for a URL. Anything unparsable is
+ * `other` — except under a broken policy, where EVERYTHING is `idp_transit`.
+ */
 export function tierOf (url, policy) {
-    const sets = tierSets(policy);
-    let parsed;
-    try {
-        parsed = new URL(String(url));
-    } catch {
-        return 'other';
-    }
-    return tierFromParsed(parsed, sets);
+    return classify(tierSets(policy), parseUrl(url));
 }
 
 /**
@@ -219,9 +236,24 @@ function hasSensitiveParam (part) {
 }
 
 /**
+ * An `idp_transit` URL as it may leave: origin + path for the web schemes
+ * (which also drops userinfo), the inner origin for `blob:`, and for anything
+ * else (`about:`, `data:`, `chrome-error:`) the URL without query and
+ * fragment. Under a broken policy every URL takes this form.
+ */
+function transitForm (parsed) {
+    if (/^(?:https?|wss?):$/.test(parsed.protocol)) return `${parsed.origin}${parsed.pathname}`;
+    if (parsed.protocol === 'blob:') return parsed.origin === 'null' ? 'blob:' : parsed.origin;
+    parsed.search = '';
+    parsed.hash = '';
+    return parsed.href;
+}
+
+/**
  * The URL as it may leave this process.
  *
  *   idp_transit URL                    -> origin + path, whatever it carries
+ *                                         (EVERY URL, under a broken policy)
  *   query or fragment names a
  *   SENSITIVE_URL_PARAMS parameter     -> the URL without query AND fragment
  *   anything else                      -> the SAME string, untouched
@@ -233,15 +265,9 @@ function hasSensitiveParam (part) {
 export function sanitizeUrl (url, policy) {
     const sets = tierSets(policy);
     if (typeof url !== 'string') return url;
-    let parsed;
-    try {
-        parsed = new URL(url);
-    } catch {
-        return url;
-    }
-    if (tierFromParsed(parsed, sets) === 'idp_transit') {
-        return parsed.protocol === 'https:' ? `${parsed.origin}${parsed.pathname}` : parsed.origin;
-    }
+    const parsed = parseUrl(url);
+    if (parsed === null) return url;
+    if (classify(sets, parsed) === 'idp_transit') return transitForm(parsed);
     if (hasSensitiveParam(parsed.search) || hasSensitiveParam(parsed.hash)) {
         parsed.search = '';
         parsed.hash = '';
@@ -271,24 +297,24 @@ export function sanitizeText (text, policy) {
 }
 
 /**
- * The boot-log lines for a policy: one per malformed entry, one per overlap.
- * Names variables and positions, never raw values.
+ * The boot-log lines for a policy. A broken policy is ONE line naming every
+ * fault (variable and position, never a raw value); a sound one gets a line
+ * per overlap origin; a clean one gets none.
  */
 export function originPolicyBootLines (policy) {
     tierSets(policy);
-    const lines = [];
-    for (const p of policy.invalid) {
-        const where = p.reason === 'too_many_entries'
-            ? `has more than ${ORIGIN_TIER_MAX_ENTRIES} entries`
+    if (policy.broken) {
+        const faults = policy.invalid.map((p) => (p.reason === 'too_many_entries'
+            ? `${p.variable} has more than ${ORIGIN_TIER_MAX_ENTRIES} entries`
             : p.reason === 'not_a_string'
-                ? 'is not a string'
-                : `entry #${p.entry} is not a bare https origin (https://host[:port], no path, no wildcard)`;
-        lines.push(`[ezil-sidecar] ${p.variable} ${where}: the ${p.tier} tier takes NO origin from it until it is fixed`);
+                ? `${p.variable} is not a string`
+                : `${p.variable} entry #${p.entry} is not a bare https origin (https://host[:port], no path, no wildcard)`));
+        return [
+            `[ezil-sidecar] origin policy BROKEN — ${faults.join('; ')}: every page is idp_transit `
+            + '(health, navigate and wait_for{time} only) until it is fixed',
+        ];
     }
-    for (const origin of policy.overlap) {
-        lines.push(
-            `[ezil-sidecar] ${origin} is in both ${ORIGIN_TIER_ENV.owner_app} and ${ORIGIN_TIER_ENV.idp_transit}: it is idp_transit`,
-        );
-    }
-    return lines;
+    return policy.overlap.map((origin) => (
+        `[ezil-sidecar] ${origin} is in both ${ORIGIN_TIER_ENV.owner_app} and ${ORIGIN_TIER_ENV.idp_transit}: it is idp_transit`
+    ));
 }
