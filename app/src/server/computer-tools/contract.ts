@@ -62,14 +62,7 @@ export const uncertainErrorFor = (op: ComputerToolsOp): 'tools_uncertain' | 'com
     SENT_OPS.has(op) ? 'tools_uncertain' : 'computer_unavailable';
 
 // ── Gate (§3.2) ──────────────────────────────────────────────────────────────
-export interface ComputerToolsEnv {
-    EZIL_DELEGATION_ISSUER?: string;
-    EZIL_DELEGATION_AUDIENCE?: string;
-    CLOUDFLARE_GUACAMOLE_WORKER_URL?: string;
-    CLOUDFLARE_GUACAMOLE_HMAC_SECRET?: string;
-    EZIL_DELEGATED_COMPUTER_TOOLS?: string;
-    EZIL_DELEGATED_TERMINAL?: string;
-}
+export type ComputerToolsEnv = Record<string, string | undefined>;
 
 /** Op-independent pins: the exact staging issuer/audience, Worker origin and a present HMAC secret. */
 export function computerToolsConfigured(env: ComputerToolsEnv): boolean {
