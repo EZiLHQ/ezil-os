@@ -31,7 +31,62 @@ def image_metadata(image, source):
             'Image runtime SHA differs from approved source')
 
 
-def verify_archive(directory, tag, environment, source, receipt_hash):
+OCI_INDEX = 'application/vnd.oci.image.index.v1+json'
+OCI_IMAGE = 'application/vnd.oci.image.manifest.v1+json'
+OCI_CONFIG = 'application/vnd.oci.image.config.v1+json'
+DIGEST = r'sha256:[0-9a-f]{64}'
+
+
+def verify_descriptor(read_json, descriptor, media_type):
+    require(isinstance(descriptor, dict) and descriptor.get('mediaType') == media_type,
+            'Unexpected OCI descriptor media type')
+    digest = descriptor.get('digest', '')
+    require(isinstance(digest, str) and re.fullmatch(DIGEST, digest), 'Invalid OCI descriptor digest')
+    raw, content = read_json('blobs/' + digest.replace(':', '/', 1))
+    require(descriptor.get('size') == len(raw) and digest == 'sha256:' + hashlib.sha256(raw).hexdigest(),
+            'OCI descriptor content mismatch')
+    require(isinstance(content, dict) and content.get('schemaVersion') == 2 and content.get('mediaType') == media_type,
+            'Unexpected OCI descriptor content')
+    return content
+
+
+def verify_oci_identity(read_json, tag, config_digest, config_size):
+    _, index = read_json('index.json')
+    require(isinstance(index, dict) and index.get('schemaVersion') == 2
+            and isinstance(index.get('manifests'), list) and len(index['manifests']) == 1,
+            'Expected one OCI archive image reference')
+    root = index['manifests'][0]
+    require(isinstance(root, dict) and isinstance(root.get('annotations'), dict)
+            and root['annotations'].get('org.opencontainers.image.ref.name') == tag
+            and root['annotations'].get('io.containerd.image.name', f'docker.io/library/ezil-os-staging:{tag}')
+            == f'docker.io/library/ezil-os-staging:{tag}', 'OCI archive tag mismatch')
+    media_type = root.get('mediaType')
+    require(media_type in (OCI_IMAGE, OCI_INDEX), 'Unexpected OCI archive root type')
+    manifest = verify_descriptor(read_json, root, media_type)
+    if media_type == OCI_INDEX:
+        entries = manifest.get('manifests')
+        require(isinstance(entries, list) and all(isinstance(entry, dict) for entry in entries),
+                'Invalid OCI platform entries')
+        runnable = [entry for entry in entries if entry.get('platform') == {'architecture': 'amd64', 'os': 'linux'}]
+        require(len(runnable) == 1, 'Expected one linux/amd64 OCI image')
+        leaf = runnable[0]
+        for entry in entries:
+            if entry is leaf:
+                continue
+            annotations = entry.get('annotations')
+            require(entry.get('platform') == {'architecture': 'unknown', 'os': 'unknown'}
+                    and isinstance(annotations, dict)
+                    and annotations.get('vnd.docker.reference.type') == 'attestation-manifest'
+                    and annotations.get('vnd.docker.reference.digest') == leaf.get('digest'),
+                    'Unexpected OCI platform entry')
+            verify_descriptor(read_json, entry, OCI_IMAGE)
+        manifest = verify_descriptor(read_json, leaf, OCI_IMAGE)
+    require(manifest.get('config') == {'mediaType': OCI_CONFIG, 'digest': config_digest, 'size': config_size},
+            'OCI image config differs from verified Docker config')
+    return {key: root[key] for key in ('digest', 'mediaType', 'size')}
+
+
+def verify_archive(directory, tag, environment, source, receipt_hash, *, load_identities=False):
     require(environment == 'staging', 'Verified installer is staging-only')
     require(re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}', tag), 'Invalid tag')
     require(re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', source), 'Expected full approved source SHA')
@@ -72,7 +127,12 @@ def verify_archive(directory, tag, environment, source, receipt_hash):
             fingerprint = hashlib.sha256(json.dumps(public, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
             require(config.get('config', {}).get('Labels', {}).get('work.ezil.public-config-sha256') == fingerprint,
                     'Image public configuration differs from sealed receipt')
-    return 'sha256:' + digest
+        config_digest = 'sha256:' + digest
+        if load_identities:
+            alternate = verify_oci_identity(read_json, tag, config_digest, len(data)) if any(
+                member.name == 'index.json' for member in members) else None
+            return {'config': config_digest, 'oci': alternate}
+    return config_digest
 
 
 def verify_loaded(image, source, expected_id):
@@ -80,10 +140,28 @@ def verify_loaded(image, source, expected_id):
     image_metadata(image, source)
 
 
+def verify_loaded_identity(image, source, identities):
+    observed = image.get('Id')
+    if observed == identities['config']:
+        verify_loaded(image, source, identities['config'])
+        return observed
+    oci = identities['oci']
+    require(oci is not None and observed == oci['digest'], 'Loaded image ID differs from verified archive')
+    descriptor = image.get('Descriptor')
+    require(isinstance(descriptor, dict) and all(descriptor.get(key) == value for key, value in oci.items()),
+            'Loaded OCI descriptor differs from verified archive')
+    verify_loaded(image, source, oci['digest'])
+    return observed
+
+
 if __name__ == '__main__':
     if sys.argv[1] == 'archive':
         print(verify_archive(Path(sys.argv[2]), *sys.argv[3:]))
     elif sys.argv[1] == 'loaded':
         verify_loaded(json.loads(Path(sys.argv[2]).read_text()), *sys.argv[3:])
+    elif sys.argv[1] == 'archive-load-identities':
+        print(json.dumps(verify_archive(Path(sys.argv[2]), *sys.argv[3:], load_identities=True), separators=(',', ':')))
+    elif sys.argv[1] == 'loaded-identity':
+        print(verify_loaded_identity(json.loads(Path(sys.argv[2]).read_text()), sys.argv[3], json.loads(sys.argv[4])))
     else:
         raise SystemExit('Unknown verification mode')
