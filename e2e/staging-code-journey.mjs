@@ -276,14 +276,30 @@ async function prepareSameWindowTab(page) {
     }
 }
 
+const compactComposerText = value => value.replace(/[\s\u200b\ufeff]/g, '');
+
+async function openFreshChat(side, timeLimit) {
+    const newChat = side.getByRole('button', { name: /^New Chat(?:\b|$)/i }).first();
+    const chat = side.locator('.interactive-list').first();
+    const input = side.locator('.chat-input-container .monaco-editor .view-lines').first();
+    await newChat.click({ timeout: timeLimit });
+    await input.waitFor({ state: 'visible', timeout: timeLimit });
+    await until(async () => await chat.locator('.interactive-request').count() === 0
+        && !await chat.locator('.interactive-response.chat-response-loading').first().isVisible(),
+        timeLimit, () => failed('The current chat did not clear'));
+    return { chat, input };
+}
+
 async function runBackgroundAgent(page, frame, repo, timeLimit) {
-    if (!repo.allowAgent || typeof repo.modelName !== 'string' || !repo.modelName.trim()) {
-        throw blocked('A separately authorized synthetic agent fixture and model are required');
+    const expectedModel = typeof repo.modelName === 'string' ? repo.modelName.trim() : '';
+    if (!repo.allowAgent || !expectedModel || /^Auto\b/i.test(expectedModel)) {
+        throw blocked('A separately authorized synthetic agent fixture and a concrete model are required');
     }
     const side = frame.locator('.part.auxiliarybar');
-    const newChat = side.getByRole('button', { name: /^New Chat(?:\b|$)/i }).first();
-    try { await newChat.click({ timeout: Math.min(timeLimit, AUTH_TIMEOUT) }); }
+    let fresh;
+    try { fresh = await openFreshChat(side, Math.min(timeLimit, AUTH_TIMEOUT)); }
     catch { throw blocked('A fresh synthetic chat could not be established'); }
+    const { chat, input } = fresh;
     // A text instruction alone cannot prevent file-changing tools. Keep the
     // live probe in the workbench's read-only Ask mode or send nothing.
     const mode = side.locator('.chat-input-toolbar .action-item.chat-input-picker-item:not(.model-picker-item) .action-label').first();
@@ -297,23 +313,26 @@ async function runBackgroundAgent(page, frame, repo, timeLimit) {
         await until(readOnly, 3000, () => blocked('Read-only Ask mode was not confirmed'));
     }
     const model = side.locator('.action-label[aria-label^="Models, "]').first();
-    const modelName = 'Models, ' + repo.modelName;
+    const modelName = 'Models, ' + expectedModel;
     await until(async () => (await model.getAttribute('aria-label', { timeout: 1000 }).catch(() => '')) === modelName,
         Math.min(timeLimit, AUTH_TIMEOUT), () => blocked('The authorized fixture model was not selected'));
-    const chat = side.locator('.interactive-list').first();
-    if (await chat.locator('.interactive-request').count()) throw blocked('The synthetic chat was not empty');
-    const input = side.locator('.chat-input-container .monaco-editor').first();
+    if (compactComposerText(await input.innerText({ timeout: 1000 })) !== '') {
+        throw blocked('The fresh chat composer still contained a draft');
+    }
     const marker = 'EZILQAPROBE' + randomUUID().replaceAll('-', '').slice(0, 12);
     const instruction = syntheticPrompt(marker);
     const other = await prepareSameWindowTab(page);
     try {
         const stamp = await frame.evaluate(() => window.ezilQaFixtureDocument = crypto.randomUUID());
-        await input.locator('.view-lines').first().click({ force: true });
+        await input.click({ force: true });
         await page.keyboard.type(instruction, { delay: 3 });
-        const typed = await input.innerText().catch(() => '');
-        if (!typed.replace(/\s/g, '').includes(marker)) throw blocked('The synthetic prompt was not verified in the input');
-        if (!await readOnly() || (await model.getAttribute('aria-label', { timeout: 1000 }).catch(() => '')) !== modelName) {
-            throw blocked('The authorized model or read-only mode changed before submission');
+        const typed = await input.innerText({ timeout: 1000 }).catch(() => '');
+        if (compactComposerText(typed) !== compactComposerText(instruction)) {
+            throw blocked('The composer did not contain only the synthetic prompt');
+        }
+        if (!await readOnly() || (await model.getAttribute('aria-label', { timeout: 1000 }).catch(() => '')) !== modelName
+            || await chat.locator('.interactive-request').count() !== 0) {
+            throw blocked('The authorized model, read-only mode, or empty chat changed before submission');
         }
         const pending = frame.locator('.interactive-response.chat-response-loading').last();
         const replies = chat.locator('.interactive-response .rendered-markdown').getByText(marker, { exact: true });
@@ -352,14 +371,10 @@ async function runBackgroundAgent(page, frame, repo, timeLimit) {
 
 async function verifySavedChat(frame, marker, timeLimit) {
     const side = frame.locator('.part.auxiliarybar');
-    const chat = side.locator('.interactive-list').first();
-    const newChat = side.getByRole('button', { name: /^New Chat(?:\b|$)/i }).first();
-    try {
-        await newChat.click({ timeout: timeLimit });
-        await side.locator('.chat-input-container').first().waitFor({ state: 'visible', timeout: timeLimit });
-    } catch { throw failed('A fresh chat could not be opened after reloading Code'); }
-    await until(async () => await chat.locator('.interactive-request').count() === 0, timeLimit,
-        () => failed('The reloaded Code editor did not open an empty chat'));
+    let fresh;
+    try { fresh = await openFreshChat(side, timeLimit); }
+    catch { throw failed('A fresh chat could not be opened after reloading Code'); }
+    const { chat } = fresh;
 
     // Use the native Chat history picker. Selecting a known entry tests that
     // the session was indexed and can be reopened, even if Code had restored it.

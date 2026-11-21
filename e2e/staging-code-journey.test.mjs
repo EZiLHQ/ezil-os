@@ -54,6 +54,7 @@ test('loopback Chromium requires the single background reply to reopen from Chat
     let session = COMPUTER;
     let desktopLoads = 0;
     let showSavedChat = true;
+    let draft = '';
     const server = createServer(async (request, response) => {
         const app = 'http://' + request.headers.host;
         const url = new URL(request.url, app);
@@ -95,12 +96,12 @@ test('loopback Chromium requires the single background reply to reopen from Chat
                 'ondblclick="openFixture()">README.md</div></div>' +
                 '<div class="part editor"><div class="tabs"></div><div class="editor-instance">' +
                 '<div class="monaco-editor"><div class="view-lines"></div></div></div></div>' +
-                '<div class="part auxiliarybar"><button onclick="chat.replaceChildren()">New Chat</button>' +
+                '<div class="part auxiliarybar"><button onclick="setTimeout(() => chat.replaceChildren(), 250)">New Chat</button>' +
                 '<div class="chat-view-title-container visible"><button class="chat-view-title-action-item" onclick="showHistory()">Chat history</button></div>' +
                 '<div class="quick-input-widget" style="min-height:20px" hidden></div>' +
                 '<button class="action-label" aria-label="Models, ' + MODEL + '">Model</button>' +
                 '<div class="chat-input-toolbar"><span class="action-item chat-input-picker-item"><button class="action-label">Ask</button></span></div>' +
-                '<div class="interactive-list" id="chat"></div><div class="chat-input-container">' +
+                '<div class="interactive-list" id="chat"><div class="interactive-request">Restoring the view</div></div><div class="chat-input-container">' +
                 '<div class="monaco-editor"><div class="view-lines" contenteditable="true" style="width:500px;height:40px" id="input"></div>' +
                 '</div></div></div></main><script>' +
                 'function openFixture(){document.querySelector(".tabs").innerHTML=' + JSON.stringify('<div class="tab">README.md</div>') + ';' +
@@ -110,6 +111,7 @@ test('loopback Chromium requires the single background reply to reopen from Chat
                 'const saved=' + JSON.stringify(showSavedChat) + ' && JSON.parse(sessionStorage.getItem("savedChat"));' +
                 'if(!saved)return;const row=document.createElement("button");row.className="monaco-list-row";' +
                 'row.textContent=saved.marker;row.onclick=()=>{picker.hidden=true;chat.innerHTML=saved.transcript};picker.append(row);}' +
+                'input.textContent=' + JSON.stringify(draft) + ';' +
                 'input.addEventListener("keydown",event=>{if(event.key!=="Enter")return;event.preventDefault();' +
                 'const text=input.textContent;input.textContent="";const marker=text.match(/EZILQAPROBE[a-z0-9]+/)?.[0];' +
                 'if(!marker)return;fetch("/fixture-prompt",{method:"POST",body:marker});' +
@@ -188,4 +190,14 @@ test('loopback Chromium requires the single background reply to reopen from Chat
     assert.match(missingHistory.detail, /did not list exactly one matching saved conversation/);
     assert.equal(prompts.length, 2);
     assert(!JSON.stringify(missing).includes(prompts[1]));
+
+    draft = 'An existing draft that must stay unsent';
+    const unsafe = await runCodeJourney({ browser, target, repo: { ...repo, allowAgent: true, modelName: MODEL },
+        storageState, evidence: { timeoutMs: 5_000 } });
+    assert.equal(names(unsafe).code_background_agent, 'blocked', JSON.stringify(unsafe));
+    assert.equal(names(unsafe).code_full_reload, 'pass');
+    assert.equal(names(unsafe).code_chat_history_after_reload, 'blocked');
+    assert.match(unsafe.checks.find(check => check.name === 'code_background_agent').detail, /contained a draft/);
+    assert.equal(prompts.length, 2);
+    assert(!JSON.stringify(unsafe).includes(draft));
 });
