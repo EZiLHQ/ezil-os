@@ -110,6 +110,7 @@ export interface BridgeClientDeps {
      * launched it. Absent: no consent.
      */
     unattendedAllowed?: () => boolean;
+    bridgeEnabled?: () => boolean;
 }
 
 /** The code host's sync URL, from EZIL_AI_BASE_URL (`https://8443-<id>-code.<zone>/ai/v1`), or null. */
@@ -259,6 +260,11 @@ export class ChatBridgeClient {
         return this.ownerId;
     }
 
+    private consentCurrent(): boolean {
+        return !this.stopped && this.deps.bridgeEnabled?.() !== false
+            && (!this.ownerId || !isUnattendedOwner(this.ownerId) || this.deps.unattendedAllowed?.() === true);
+    }
+
     private async round(): Promise<number> {
         // No bridge in this window (setting off, or no EZiL Chat pane yet): nothing to offer OS.
         try {
@@ -273,7 +279,7 @@ export class ChatBridgeClient {
             return IDLE_MS;
         }
         // The private workbench acts only on the owner's explicit, current consent (the launcher stops it too).
-        if (isUnattendedOwner(this.ownerId) && this.deps.unattendedAllowed?.() !== true) return IDLE_MS;
+        if (!this.consentCurrent()) return IDLE_MS;
         this.ticks += 1;
         this.seq += 1;
         const protocol = this.protocol();
@@ -292,6 +298,7 @@ export class ChatBridgeClient {
             this.reports.unshift(...sending);
             return IDLE_MS;
         }
+        if (!this.consentCurrent()) return IDLE_MS;
         this.os = reply.protocol === 2 ? 2 : 1;
         if (reply.owner === 'other') {
             this.lose();
@@ -409,6 +416,7 @@ export class ChatBridgeClient {
     }
 
     private async deliver(delivery: Delivery, receivedAt: number): Promise<void> {
+        if (!this.consentCurrent()) return;
         const attempt = delivery.attemptId;
         if (delivery.kind === 'create' || delivery.kind === 'configure') {
             this.report(await this.control(delivery, receivedAt), attempt);
@@ -421,6 +429,7 @@ export class ChatBridgeClient {
             } catch {
                 ready = false;
             }
+            if (!this.consentCurrent()) return;
             if (!ready) {
                 this.report({ operationId: delivery.operationId, status: 'not_delivered', reason: 'agent_not_ready' }, attempt);
                 return;

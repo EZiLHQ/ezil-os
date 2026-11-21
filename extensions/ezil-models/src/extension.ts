@@ -400,6 +400,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
             availableIds: (ids) => accountAvailableIds(store.models(), ids, fetch),
             // Consent to the private unattended workbench (docs/UNATTENDED-CODE.md), read on every round so withdrawing it takes
             // effect in that window at once; a window a person opened never consults it.
+            bridgeEnabled: () => vscode.workspace.getConfiguration('ezil').get('chatBridge.enabled') === true,
             unattendedAllowed: () => vscode.workspace.getConfiguration('ezil').get('chatBridge.unattended') === true,
             // The effort this extension really sends for its own model (none through the Gateway), read-only.
             effortOf: (modelId) => {
