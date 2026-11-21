@@ -45,6 +45,8 @@ export type ProviderConfig = {
     betas?: string[];
     /** OpenAI-style providers: send `stream_options.include_usage` (default true). */
     includeUsage?: boolean;
+    /** Allow the authenticated Gateway catalog to opt its discovered models into image input. */
+    catalogImageInput?: boolean;
     /** OpenAI-style providers: which field carries the output-token limit (default depends on type). */
     maxTokensField?: 'max_tokens' | 'max_completion_tokens';
 };
@@ -84,7 +86,7 @@ export type ModelsConfig = {
 };
 
 export type ResolvedProvider = Required<Pick<ProviderConfig, 'type' | 'headers' | 'betas' | 'includeUsage'>> &
-    Pick<ProviderConfig, 'apiKey' | 'baseUrl' | 'resource' | 'apiVersion' | 'maxTokensField'> & { name: string };
+    Pick<ProviderConfig, 'apiKey' | 'baseUrl' | 'resource' | 'apiVersion' | 'maxTokensField' | 'catalogImageInput'> & { name: string };
 
 export type ResolvedModel = {
     id: string;
@@ -257,6 +259,7 @@ export function resolveModelsConfig(raw: unknown, options: LoadOptions = {}): Re
                 if (!Array.isArray(value.betas) || value.betas.some(beta => typeof beta !== 'string')) sink.problems.push(`${where}.betas must be an array of strings`);
                 else betas = value.betas as string[];
             }
+            if (value.catalogImageInput !== undefined && (type !== 'ezil-gateway' || typeof value.catalogImageInput !== 'boolean')) sink.problems.push(`${where}.catalogImageInput must be a boolean for ezil-gateway`);
             if (value.includeUsage !== undefined && typeof value.includeUsage !== 'boolean') sink.problems.push(`${where}.includeUsage must be a boolean`);
             if (value.maxTokensField !== undefined && value.maxTokensField !== 'max_tokens' && value.maxTokensField !== 'max_completion_tokens') sink.problems.push(`${where}.maxTokensField must be max_tokens or max_completion_tokens`);
             // Presence checks only fire when the field is absent or blank — an unresolved reference is reported (once) above.
@@ -269,6 +272,7 @@ export function resolveModelsConfig(raw: unknown, options: LoadOptions = {}): Re
             const provider: ResolvedProvider = {
                 name, type, apiKey, baseUrl, resource, apiVersion, headers, betas,
                 includeUsage: value.includeUsage !== false,
+                ...(type === 'ezil-gateway' && value.catalogImageInput === true ? { catalogImageInput: true } : {}),
                 maxTokensField: value.maxTokensField as ResolvedProvider['maxTokensField'],
             };
             outcomes[name] = { provider, unresolved: sink.unresolved, problems: sink.problems, omittedModels: 0 };
@@ -398,7 +402,10 @@ export function resolveModelsConfig(raw: unknown, options: LoadOptions = {}): Re
                 contextWindowTokens: merged.contextWindowTokens === undefined ? undefined : positiveInt(merged.contextWindowTokens, 'contextWindowTokens', 131_072),
                 maxInputTokens: positiveInt(merged.maxInputTokens, 'maxInputTokens', provider.type === 'ezil-gateway' ? 131_072 : 200_000),
                 maxOutputTokens: provider.type === 'ezil-gateway' ? gatewayOutput() : positiveInt(merged.maxOutputTokens, 'maxOutputTokens', isAnthropic(provider.type) ? 64_000 : 32_768),
-                capabilities: { toolCalling: toolCalling as boolean | number, imageInput: provider.type === 'ezil-gateway' ? false : imageInput as boolean },
+                // A Gateway model takes images only when its own entry says `imageInput: true` (never from defaults), and then
+                // only while a catalog read says so for its route (gateway.ts withGatewayModelLimits).
+                capabilities: { toolCalling: toolCalling as boolean | number,
+                    imageInput: provider.type === 'ezil-gateway' ? isRecord(entry.capabilities) && entry.capabilities.imageInput === true : imageInput as boolean },
                 thinking,
                 cache,
                 default: isDefault,
