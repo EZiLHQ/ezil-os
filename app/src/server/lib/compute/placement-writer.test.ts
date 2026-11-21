@@ -5,8 +5,8 @@
  *
  * Driven by `git ls-files` (tracked plus untracked, unignored) over the WHOLE
  * repository, so a writer added under `infra/`, `deploy/`, `worker/` or any
- * new directory is caught. `docs/` and test files are exempt. The one reviewed
- * schema applier may name the tables for DDL, locks and catalog inspection only.
+ * new directory is caught. `docs/` and test files are exempt. Reviewed schema tools may name the tables
+ * for DDL, locks and catalog inspection only.
  */
 
 import { execFileSync } from 'node:child_process';
@@ -18,9 +18,8 @@ import { describe, expect, it } from 'vitest';
 const REPO = path.resolve(__dirname, '../../../../..');
 const WRITER = 'app/src/server/lib/compute/placement.ts';
 const TABLES = /ezil_computer_placements|ezil_compute_usage/;
-// Applies the exact reviewed DDL, takes locks and inspects pg_catalog; it never
-// reads or writes placement/usage rows. Do not exempt the deploy directory.
-const DDL_ONLY = ['deploy/aws/mum/rebase_schema.py'];
+// The editor guard inspects pg_catalog metadata only. Neither schema path reads or writes placement/usage rows.
+const DDL_ONLY = ['deploy/aws/mum/rebase_schema.py', 'app/scripts/billing-editor-staging.mjs'];
 const ROW_ACCESS = new RegExp(String.raw`\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|MERGE\s+INTO|TRUNCATE(?:\s+TABLE)?|COPY|FROM|JOIN)\s+(?:ONLY\s+)?(?:"?\w+"?\s*\.\s*)?"?(?:${TABLES.source})\b`, 'i');
 const CODE = /\.(ts|tsx|js|mjs|cjs|sql|py|rs|go|sh|swift|json|ya?ml|toml|tf|hcl|asl)$/;
 

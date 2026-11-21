@@ -23,15 +23,20 @@ import { createClient } from '@/utils/supabase/server';
 import { userFromBearer } from './bearer-auth';
 import {
     authenticateDelegation, delegatedReadsEnabled, delegationBinding, delegationConfig, isDelegationHeader,
-    type DelegatedAccount, type DelegatedCall, type DelegationRejection, type DelegationRequest,
+    type DelegatedAccount, type DelegatedCall, type DelegationRejection,
 } from './delegation-auth';
 import { consumeDelegationJti, findDelegatedAccount } from './delegation-store';
+import { verifyDelegation } from './delegation-core';
+import {
+    EDITOR_DELEGATION_POLICY, editorDelegationBinding, editorDelegationEnabled, type TrpcDelegationRequest,
+} from './editor-delegation';
+
 
 /**
  * Set for every request that presented `Authorization: EZiL-Delegation`. `rejected` keeps the request marked
  * so the procedure gate refuses everything, public procedures included.
  */
-export type DelegationState = { status: 'accepted'; call: DelegatedCall } | { status: 'rejected' };
+export type DelegationState = { status: 'accepted'; call: DelegatedCall; type?: 'query' | 'mutation' } | { status: 'rejected' };
 
 export interface TRPCContext {
     db: typeof db;
@@ -40,7 +45,7 @@ export interface TRPCContext {
     delegation?: DelegationState;
 }
 
-export type { DelegationRequest };
+export type { TrpcDelegationRequest };
 
 /** One fixed-category line per delegated decision: never the assertion, header, subject, metadata or a raw error. */
 function auditDelegation(procedure: string, outcome: string) {
@@ -52,32 +57,46 @@ const delegatedUser = (account: DelegatedAccount): User => ({
     id: account.id, aud: 'authenticated', app_metadata: {}, user_metadata: {}, created_at: account.createdAt,
 });
 
-async function delegatedContext(headers: Headers, request: DelegationRequest | undefined): Promise<TRPCContext> {
+async function delegatedContext(headers: Headers, request: TrpcDelegationRequest | undefined): Promise<TRPCContext> {
     let reason: DelegationRejection | undefined;
     if (!request) {
         // A caller that did not hand over the actual request line (any other transport) cannot be bound.
         reason = 'transport';
     } else {
-        const enabled = delegatedReadsEnabled(process.env.EZIL_DELEGATED_COMPUTER_READS);
+        const editor = editorDelegationEnabled(process.env) ? editorDelegationBinding(request) : undefined;
+        const computer = delegatedReadsEnabled(process.env.EZIL_DELEGATED_COMPUTER_READS);
         // Read per request from process.env, not `@/env`: the pins are optional and absent ones only reject.
-        const outcome = await authenticateDelegation(headers, {
-            enabled,
-            config: enabled ? await delegationConfig({
+        const verifier = {
+            config: editor || computer ? await delegationConfig({
                 EZIL_DELEGATION_ISSUER: process.env.EZIL_DELEGATION_ISSUER,
                 EZIL_DELEGATION_AUDIENCE: process.env.EZIL_DELEGATION_AUDIENCE,
                 EZIL_DELEGATION_PUBLIC_JWKS: process.env.EZIL_DELEGATION_PUBLIC_JWKS,
                 EZIL_DELEGATION_CLIENT_IDS: process.env.EZIL_DELEGATION_CLIENT_IDS,
                 NEXT_PUBLIC_SUPABASE_URL: process.env.NEXT_PUBLIC_SUPABASE_URL,
             }, AUTH0_ISSUER) : undefined,
-            binding: delegationBinding(request),
             now: () => Math.floor(Date.now() / 1000),
-            consumeJti: (jti, expiresAt) => consumeDelegationJti(db, jti, expiresAt),
-            findAccount: identity => findDelegatedAccount(db, identity),
-        });
-        if (outcome.kind === 'accepted') {
-            return { db, user: delegatedUser(outcome.account), headers, delegation: { status: 'accepted', call: outcome.call } };
+            consumeJti: (jti: string, expiresAt: number) => consumeDelegationJti(db, jti, expiresAt),
+            findAccount: (identity: Parameters<typeof findDelegatedAccount>[1]) => findDelegatedAccount(db, identity),
+        };
+        if (editor) {
+            const outcome = await verifyDelegation(headers, {
+                ...verifier, enabled: true, binding: editor, policy: EDITOR_DELEGATION_POLICY,
+            });
+            if (outcome.kind === 'accepted') return {
+                db, user: delegatedUser(outcome.account), headers,
+                delegation: { status: 'accepted', call: outcome.caller, type: editor.type },
+            };
+            reason = outcome.kind === 'rejected' ? outcome.reason : 'malformed';
+        } else {
+            const outcome = await authenticateDelegation(headers, {
+                ...verifier, enabled: computer, binding: delegationBinding(request),
+            });
+            if (outcome.kind === 'accepted') {
+                return { db, user: delegatedUser(outcome.account), headers, delegation: { status: 'accepted', call: outcome.call } };
+            }
+            reason = outcome.kind === 'rejected' ? outcome.reason : 'malformed';
         }
-        reason = outcome.kind === 'rejected' ? outcome.reason : 'malformed';
+
     }
     auditDelegation('<context>', `rejected:${reason}`);
     return { db, user: null, headers, delegation: { status: 'rejected' } };
@@ -93,16 +112,16 @@ async function delegatedContext(headers: Headers, request: DelegationRequest | u
  *  - an `Authorization: Bearer <supabase-jwt>` header, which is how `sdk/` and
  *    the `mcp/` connector authenticate, since neither has a cookie jar; and
  *  - an `Authorization: EZiL-Delegation <assertion>` header: the public EZiL MCP reading one person's
- *    computers (`delegation-auth.ts`). It is recognised FIRST and only on `/api/trpc` GET (`delegationRequest`);
+ *    computers (`delegation-auth.ts`). It is recognised FIRST and only on `/api/trpc` (`delegationRequest`);
  *    a rejected or unbound one never falls back to the cookie, and the procedure gate below confines an
- *    accepted one to the single read procedure it names.
+ *    accepted one to the single procedure and method it names.
  *
  * Everything downstream — every tRPC procedure, and every `/api/shell/*` route,
  * which are transports that resolve through `appRouter.createCaller` — reads
  * `ctx.user` and nothing else, so the credentials converge on ONE `user`
  * here and there is no bearer-specific authorization anywhere.
  */
-export const createTRPCContext = async (opts: { headers: Headers; delegationRequest?: DelegationRequest }): Promise<TRPCContext> => {
+export const createTRPCContext = async (opts: { headers: Headers; delegationRequest?: TrpcDelegationRequest }): Promise<TRPCContext> => {
     if (isDelegationHeader(opts.headers.get('authorization'))) return delegatedContext(opts.headers, opts.delegationRequest);
     const supabase = await createClient();
 
@@ -142,8 +161,8 @@ const timingMiddleware = t.middleware(async ({ next, path }) => {
 });
 
 /**
- * A delegated request reaches only the one read procedure its assertion names (`proc`, already bound to the
- * request path), and only as a query. Any other procedure or type, a public one, a mutation, or anything after
+ * A delegated request reaches only its named procedure (`proc`, already bound to the
+ * request path) and verified operation type. Any other procedure or type, or anything after
  * a rejected assertion is UNAUTHORIZED. Public and protected procedures are both built on this, so a signed
  * call cannot escape through either.
  */
@@ -154,7 +173,7 @@ const delegationGate = t.middleware(async ({ ctx, path, type, next }) => {
         auditDelegation(path, 'refused:rejected_assertion');
         throw new TRPCError({ code: 'UNAUTHORIZED' });
     }
-    if (path !== delegation.call.procedure || type !== 'query') {
+    if (path !== delegation.call.procedure || type !== (delegation.type ?? 'query')) {
         auditDelegation(path, 'refused:not_allowed');
         throw new TRPCError({ code: 'UNAUTHORIZED' });
     }

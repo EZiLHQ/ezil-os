@@ -249,7 +249,27 @@ export async function parseDelegationConfig(env: DelegationEnv, auth0Issuer: str
 }
 
 /** Resolve a delegated caller from the `Authorization` header. */
-export async function authenticateDelegation(headers: Headers, deps: DelegationDeps): Promise<DelegationOutcome> {
+export function authenticateDelegation(headers: Headers, deps: DelegationDeps): Promise<DelegationOutcome> {
+    return authenticateBoundDelegation(headers, deps, DELEGATED_READ_SCOPE, DELEGATED_READ_PROCEDURES);
+}
+
+const BROWSER_PROCEDURES: ReadonlySet<string> = new Set(['browserSession.observe']);
+
+/** Separately scoped authority for the fixed staging Browser observation route. */
+export function authenticateBrowserDelegation(headers: Headers, deps: DelegationDeps): Promise<DelegationOutcome> {
+    return authenticateBoundDelegation(headers, deps, 'ezil:browser:read', BROWSER_PROCEDURES);
+}
+
+const BROWSER_OPEN_PROCEDURES: ReadonlySet<string> = new Set(['browserSession.openUrl']);
+
+/** Separately scoped authority for staging project browser navigation. */
+export function authenticateBrowserOpenDelegation(headers: Headers, deps: DelegationDeps): Promise<DelegationOutcome> {
+    return authenticateBoundDelegation(headers, deps, 'ezil:browser:navigate', BROWSER_OPEN_PROCEDURES);
+}
+
+async function authenticateBoundDelegation(
+    headers: Headers, deps: DelegationDeps, allowedScope: string, allowedProcedures: ReadonlySet<string>,
+): Promise<DelegationOutcome> {
     const header = headers.get('authorization');
     if (!isDelegationHeader(header)) return { kind: 'none' };
     const reject = (reason: DelegationRejection) => ({ kind: 'rejected', reason }) as const;
@@ -257,7 +277,7 @@ export async function authenticateDelegation(headers: Headers, deps: DelegationD
     if (!deps.enabled) return reject('disabled');
     const config = deps.config;
     if (!config) return reject('not_configured');
-    // The request line first: a POST, body, batch or extra parameter never reaches verification or I/O.
+    // Each wrapper binds the exact route and input before verification or I/O.
     const binding = deps.binding;
     if (!binding) return reject('binding');
 
@@ -295,8 +315,8 @@ export async function authenticateDelegation(headers: Headers, deps: DelegationD
     if (!identity) return reject('identity_issuer');
     if (!(identity.issuer === 'supabase' ? UUID : AUTH0_SUBJECT).test(sub)) return reject('claims');
     if (!config.clientIds.has(client_id)) return reject('client');
-    // Exactly the one read scope, a read procedure, and this request's own path and exact input.
-    if (scope !== DELEGATED_READ_SCOPE || !DELEGATED_READ_PROCEDURES.has(proc)) return reject('scope');
+    // The wrapper's closed scope/procedure and the request's own exact input.
+    if (scope !== allowedScope || !allowedProcedures.has(proc)) return reject('scope');
     if (proc !== binding.procedure || inp !== inputDigest(binding.input)) return reject('binding');
 
     const now = deps.now();

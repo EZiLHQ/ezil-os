@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 import {
-    authenticateDelegation, delegatedReadsEnabled, delegationBinding, inputDigest, isDelegationHeader, parseDelegationConfig,
+    authenticateBrowserDelegation, authenticateBrowserOpenDelegation, authenticateDelegation, delegatedReadsEnabled, delegationBinding, inputDigest, isDelegationHeader, parseDelegationConfig,
     type DelegationConfig, type DelegationDeps,
 } from './delegation-auth';
 import {
@@ -208,5 +208,64 @@ describe('assertion verification', () => {
 describe('fixtures are synthetic', () => {
     it('uses only .test origins for the MCP, OS and Supabase pins', () => {
         for (const origin of [MCP_ORIGIN, OS_ORIGIN, SUPABASE_ISSUER]) expect(new URL(origin).hostname.endsWith('.test')).toBe(true);
+    });
+});
+
+describe('R157 Browser delegation isolates the existing computer read authority', () => {
+    const procedure = 'browserSession.observe';
+    const scope = 'ezil:browser:read';
+    function transcript(raw = '{}') {
+        return 'EZIL-BROWSER-OBSERVE/1\nPOST\n/api/mcp/browser-sessions/' + COMPUTER + '/observe\n' + raw;
+    }
+    it('accepts the fixed Browser claim exactly once with the mapped OS owner', async () => {
+        const input = transcript();
+        const { d, consumeJti, findAccount } = deps({ binding: { procedure, input } });
+        consumeJti.mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+        const assertion = await signAssertion(key, readClaims(USER, 'computer.get', input, { scope, proc: procedure }));
+        const claim = headers(assertion);
+        expect(await authenticateBrowserDelegation(claim, d)).toMatchObject({
+            kind: 'accepted', call: { userId: USER, clientId: CLIENT_ID, procedure },
+        });
+        expect(await authenticateBrowserDelegation(claim, d)).toEqual({ kind: 'rejected', reason: 'replayed' });
+        expect(findAccount).toHaveBeenCalledTimes(1);
+    });
+
+    it('refuses both direction cross-scope attempts before JTI consumption or account lookup', async () => {
+        const input = transcript();
+        const builtForBrowser = headers(await signAssertion(key, readClaims(USER, 'computer.get', input, { scope, proc: procedure })));
+        const builtForComputer = headers(await signAssertion(key, readClaims(USER, 'computer.get', getInput)));
+        const computer = deps();
+        const browser = deps({ binding: { procedure, input } });
+        expect(await authenticateDelegation(builtForBrowser, computer.d)).toEqual({ kind: 'rejected', reason: 'scope' });
+        expect(await authenticateBrowserDelegation(builtForComputer, browser.d)).toEqual({ kind: 'rejected', reason: 'scope' });
+        expect(computer.consumeJti).not.toHaveBeenCalled();
+        expect(computer.findAccount).not.toHaveBeenCalled();
+        expect(browser.consumeJti).not.toHaveBeenCalled();
+        expect(browser.findAccount).not.toHaveBeenCalled();
+    });
+
+    it('refuses edits to the Browser body which preserve JSON meaning', async () => {
+        const built = headers(await signAssertion(key, readClaims(USER, 'computer.get', transcript(), { scope, proc: procedure })));
+        const browser = deps({ binding: { procedure, input: transcript('{ }') } });
+        expect(await authenticateBrowserDelegation(built, browser.d)).toEqual({ kind: 'rejected', reason: 'binding' });
+        expect(browser.consumeJti).not.toHaveBeenCalled();
+    });
+});
+
+
+describe('separate browser navigation delegation', () => {
+    it('binds the exact navigation scope, procedure and input without granting observation authority', async () => {
+        const procedure = 'browserSession.openUrl';
+        const input = 'synthetic-open-request';
+        const { d, consumeJti } = deps({ binding: { procedure, input } });
+        const claims = { ...readClaims(USER, 'computer.get', input), proc: procedure };
+        const navigation = await signAssertion(key, { ...claims, scope: 'ezil:browser:navigate' });
+        const observation = await signAssertion(key, { ...claims, scope: 'ezil:browser:read' });
+        expect((await authenticateBrowserOpenDelegation(headers(observation), d)).kind).toBe('rejected');
+        expect((await authenticateBrowserDelegation(headers(navigation), d)).kind).toBe('rejected');
+        expect((await authenticateBrowserOpenDelegation(headers(navigation), { ...d, binding: { procedure, input: 'changed' } })).kind).toBe('rejected');
+        expect(consumeJti).not.toHaveBeenCalled();
+        expect((await authenticateBrowserOpenDelegation(headers(navigation), d)).kind).toBe('accepted');
+        expect(consumeJti).toHaveBeenCalledTimes(1);
     });
 });

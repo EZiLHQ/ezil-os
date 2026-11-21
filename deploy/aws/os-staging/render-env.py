@@ -57,11 +57,17 @@ UNIVERSE_PROJECT_REPO_ORIGIN
 EZIL_OS_ADMIN_ENTITLEMENT_SENDER_KEYS
 EZIL_DELEGATED_COMPUTER_READS EZIL_DELEGATION_ISSUER EZIL_DELEGATION_AUDIENCE
 EZIL_DELEGATION_PUBLIC_JWKS EZIL_DELEGATION_CLIENT_IDS
+EZIL_DELEGATED_EDITOR_SESSIONS EZIL_EDITOR_BRIDGE EZIL_EDITOR_BRIDGE_CONTROLS
 """.split())
 # Delegated computer reads (app/src/server/api/delegation-core.ts): the receiver treats a missing or
 # unsafe pin as "not configured" and anything but the exact gate value "enabled" as off, so the
 # renderer refuses what the receiver would silently ignore. Off unless the gate is "enabled".
 DELEGATION_GATE = "EZIL_DELEGATED_COMPUTER_READS"
+STAGING_EDITOR_SWITCHES = ("EZIL_DELEGATED_EDITOR_SESSIONS", "EZIL_EDITOR_BRIDGE", "EZIL_EDITOR_BRIDGE_CONTROLS")
+STAGING_BROWSER_OBSERVE = "EZIL_DELEGATED_BROWSER_OBSERVE"
+STAGING_BROWSER_OPEN = "EZIL_DELEGATED_BROWSER_OPEN_URL"
+STAGING_BROWSER_ORIGINS = "EZIL_BROWSER_TEST_ALLOWED_ORIGINS"
+BROWSER_LOCAL_CONTROL_PORTS = frozenset((3000, 3002, 4243, 8080, 8181, 8443, 9090, 9222, 9223))
 DELEGATION_PINS = ("EZIL_DELEGATION_ISSUER", "EZIL_DELEGATION_AUDIENCE",
                    "EZIL_DELEGATION_PUBLIC_JWKS", "EZIL_DELEGATION_CLIENT_IDS")
 # Caddy serves exactly these two names for production OS; the audience is the origin the MCP signs.
@@ -86,7 +92,9 @@ class RenderError(Exception):
 def validate(values, environment="staging"):
     if not isinstance(values, dict):
         raise RenderError("Expected a JSON object")
-    if any(key not in REQUIRED | OPTIONAL and not REGIONAL.fullmatch(key) for key in values):
+    staging_browser_keys = frozenset((STAGING_BROWSER_OBSERVE, STAGING_BROWSER_OPEN, STAGING_BROWSER_ORIGINS))
+    allowed = REQUIRED | OPTIONAL | (staging_browser_keys if environment == "staging" else frozenset())
+    if any(key not in allowed and not REGIONAL.fullmatch(key) for key in values):
         raise RenderError("Unknown key refused")
     if REQUIRED - values.keys():
         raise RenderError("Missing required key")
@@ -104,6 +112,24 @@ def validate(values, environment="staging"):
         if len(bridge_approval.encode("utf-8")) > 4096:
             raise RenderError("Retained rebase approval exceeds its byte limit")
     validate_delegation(values, environment)
+    validate_staging_editor(values, environment)
+    for key, feature in ((STAGING_BROWSER_OBSERVE, "Browser observation"), (STAGING_BROWSER_OPEN, "Browser navigation")):
+        setting = values.get(key)
+        if setting not in (None, "enabled", "disabled"):
+            raise RenderError(f"{feature} must be exactly enabled or disabled")
+        if setting == "enabled" and (
+            any(pin not in values for pin in DELEGATION_PINS)
+            or values["EZIL_DELEGATION_ISSUER"] != "https://connect-staging.ezil.work"
+            or values["EZIL_DELEGATION_AUDIENCE"] != "https://os-staging.ezil.work"
+            or values.get("CLOUDFLARE_GUACAMOLE_WORKER_URL", "").removesuffix("/") != "https://api-desktop-staging.ezil.work"
+            or not values.get("CLOUDFLARE_GUACAMOLE_HMAC_SECRET")
+        ):
+            raise RenderError(f"{feature} requires the stage OS, Worker and complete delegation pins")
+    origins = values.get(STAGING_BROWSER_ORIGINS)
+    if origins is not None or values.get(STAGING_BROWSER_OPEN) == "enabled":
+        entries = [value for value in re.split(r"[\s,]+", origins or "") if value]
+        if not entries or len(entries) > 20 or any(not browser_test_origin(entry) for entry in entries):
+            raise RenderError("Browser navigation requires a bounded list of approved project origins")
     if environment == "production":
         validate_production(values)
     elif any(marker in value for value in values.values() for marker in PRODUCTION_MARKERS):
@@ -119,6 +145,17 @@ def bare_https_origin(value):
     """Mirror bareHttpsOrigin(): https, lowercase host, optional non-default port, nothing else."""
     match = BARE_HTTPS_ORIGIN.fullmatch(value)
     return bool(match) and (match.group(1) is None or 0 < int(match.group(1)) < 65536 and match.group(1) != "443")
+
+
+def browser_test_origin(value):
+    if bare_https_origin(value):
+        host = urlsplit(value).hostname
+        return bool(host and "." in host and not host.endswith(".localhost") and not re.fullmatch(r"[0-9.]+", host))
+    match = re.fullmatch(r"http://127\.0\.0\.1:([1-9][0-9]{3,4})", value)
+    if not match:
+        return False
+    port = int(match.group(1))
+    return 1024 <= port <= 65535 and port not in BROWSER_LOCAL_CONTROL_PORTS
 
 
 def public_key_member(value):
@@ -187,6 +224,24 @@ def validate_delegation(values, environment):
     if not clients or any(len(client) > 512 or client == "*" for client in clients):
         raise RenderError("Delegation client IDs must be explicit, non-empty and not a wildcard")
     delegation_jwks(values["EZIL_DELEGATION_PUBLIC_JWKS"])
+
+
+def validate_staging_editor(values, environment):
+    switches = tuple(values.get(key) for key in STAGING_EDITOR_SWITCHES)
+    if switches == (None, None, None):
+        return
+    if environment != "staging":
+        raise RenderError("Editor bridge switches are staging-only")
+    if any(value not in (None, "enabled", "disabled") for value in switches):
+        raise RenderError("Editor bridge switches must be exactly enabled or disabled")
+    if "enabled" not in switches:
+        return
+    if switches[:2] != ("enabled", "enabled") or not all(pin in values for pin in DELEGATION_PINS):
+        raise RenderError("Staging editor requires both base switches and all delegation pins")
+    if (values["EZIL_DELEGATION_ISSUER"], values["EZIL_DELEGATION_AUDIENCE"]) != (
+        "https://connect-staging.ezil.work", "https://os-staging.ezil.work"
+    ):
+        raise RenderError("Staging editor requires the canonical staging delegation origins")
 
 
 def validate_production(values):

@@ -409,6 +409,24 @@ class DelegationEnvironmentTests(unittest.TestCase):
         for base, environment in ((self.staging, "staging"), (self.production, "production")):
             self.assertEqual(renderer.validate(dict(base), environment), base)
 
+    def test_editor_switches_are_default_off_and_staging_only(self):
+        first, second, controls = renderer.STAGING_EDITOR_SWITCHES
+        origins = delegation(EZIL_DELEGATION_ISSUER="https://connect-staging.ezil.work",
+                             EZIL_DELEGATION_AUDIENCE="https://os-staging.ezil.work",
+                             EZIL_DELEGATED_COMPUTER_READS=None)
+        for extra in ({first: "enabled"}, {second: "enabled"}, {controls: "enabled"}, {first: "true"},
+                      {first: "enabled", second: "enabled"},
+                      {**origins, first: "enabled", second: "enabled", "EZIL_DELEGATION_ISSUER": "https://other.example.invalid"}):
+            with self.subTest(extra=sorted(extra)):
+                self.refused(extra, "staging")
+        self.refused({first: "disabled"}, "production")
+        base = {**self.staging, **origins, first: "enabled", second: "enabled"}
+        self.assertEqual(renderer.validate(base, "staging"), base)
+        extended = {**base, controls: "enabled"}
+        self.assertEqual(renderer.validate(extended, "staging"), extended)
+        defaults = {**self.staging, first: "disabled", second: "disabled", controls: "disabled"}
+        self.assertEqual(renderer.validate(defaults, "staging"), defaults)
+
     def test_complete_set_is_accepted_in_production_with_either_origin(self):
         for audience in renderer.PRODUCTION_OS_ORIGINS:
             values = {**self.production, **delegation(EZIL_DELEGATION_AUDIENCE=audience)}
@@ -496,6 +514,47 @@ class DelegationEnvironmentTests(unittest.TestCase):
         self.refused(delegation(EZIL_DELEGATION_CLIENT_IDS="https://ai-staging.ezil.work"))
         # Disabled does not bypass the check: a leftover wrong-environment pin still fails closed.
         self.refused(delegation(EZIL_DELEGATION_AUDIENCE="https://os-staging.ezil.work", **{DELEGATION_GATE: "disabled"}))
+
+    def test_browser_observe_gate_is_staging_only(self):
+        gate = {renderer.STAGING_BROWSER_OBSERVE: "enabled"}
+        pins = delegation(EZIL_DELEGATION_ISSUER="https://connect-staging.ezil.work",
+                            EZIL_DELEGATION_AUDIENCE="https://os-staging.ezil.work")
+        worker = {
+            "CLOUDFLARE_GUACAMOLE_WORKER_URL": "https://api-desktop-staging.ezil.work",
+            "CLOUDFLARE_GUACAMOLE_HMAC_SECRET": "synthetic-worker-key",
+        }
+        renderer.validate({**self.staging, **pins, **worker, **gate}, "staging")
+        self.refused({**worker, **gate}, "staging")
+        self.refused({**pins, **gate}, "staging")
+        self.refused({**worker, **pins, **gate}, "production")
+        self.refused({**worker, **pins, **gate, "EZIL_DELEGATION_ISSUER": "https://other.example.invalid"}, "staging")
+
+    def test_browser_open_gate_requires_staging_pins_and_exact_origins(self):
+        gate = {renderer.STAGING_BROWSER_OPEN: "enabled"}
+        stage = {
+            **delegation(EZIL_DELEGATION_ISSUER="https://connect-staging.ezil.work",
+                            EZIL_DELEGATION_AUDIENCE="https://os-staging.ezil.work"),
+            "CLOUDFLARE_GUACAMOLE_WORKER_URL": "https://api-desktop-staging.ezil.work",
+            "CLOUDFLARE_GUACAMOLE_HMAC_SECRET": "synthetic-worker-key",
+        }
+        origins = {renderer.STAGING_BROWSER_ORIGINS: "https://fixture.example,http://127.0.0.1:4173"}
+        renderer.validate({**self.staging, **stage, **gate, **origins}, "staging")
+        self.refused({**stage, **gate}, "staging")
+        self.refused({**stage, **gate, **origins}, "production")
+        self.refused({**stage, **gate, **origins, "EZIL_DELEGATION_ISSUER": "https://other.example.invalid"}, "staging")
+        for refused in ("https://fixture.example/path", "https://127.0.0.1:9223", "http://localhost:4173", "http://127.0.0.1:9223", ","):
+            self.refused({**stage, **gate, renderer.STAGING_BROWSER_ORIGINS: refused}, "staging")
+
+    def test_browser_and_editor_each_require_an_explicit_staging_switch(self):
+        stage = {**self.staging, **delegation(EZIL_DELEGATION_ISSUER="https://connect-staging.ezil.work",
+                                              EZIL_DELEGATION_AUDIENCE="https://os-staging.ezil.work")}
+        self.assertEqual(renderer.validate(stage, "staging"), stage)
+        combined = {**stage, "CLOUDFLARE_GUACAMOLE_WORKER_URL": "https://api-desktop-staging.ezil.work",
+                    "CLOUDFLARE_GUACAMOLE_HMAC_SECRET": "synthetic-worker-key",
+                    **dict.fromkeys(renderer.STAGING_EDITOR_SWITCHES, "enabled"),
+                    renderer.STAGING_BROWSER_OPEN: "enabled", renderer.STAGING_BROWSER_ORIGINS: "https://fixture.example"}
+        self.assertEqual(renderer.validate(combined, "staging"), combined)
+        self.assertNotIn(renderer.STAGING_BROWSER_OBSERVE, combined)
 
     def test_nearby_or_private_names_remain_refused(self):
         for key in ("EZIL_DELEGATION_PRIVATE_JWKS", "EZIL_DELEGATION_PRIVATE_KEY", "EZIL_DELEGATION_SIGNING_KEY",
