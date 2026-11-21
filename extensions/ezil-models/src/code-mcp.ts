@@ -23,15 +23,20 @@ export function grantableFolder(): string | undefined {
     return vscode.workspace.isTrusted && folders.length === 1 && folders[0] && path.isAbsolute(folders[0]) ? folders[0] : undefined;
 }
 
-export function registerCodeMcp(context: vscode.ExtensionContext): void {
+/** One grant per endpoint: a stale endpoint can never observe a later grant. */
+interface Attach { grant: WorkspaceMcpGrant; endpoint: WorkspaceMcpEndpoint }
+
+export function registerCodeMcp(context: vscode.ExtensionContext, open: (grant: WorkspaceMcpGrant) => Promise<WorkspaceMcpEndpoint> = grant => WorkspaceMcpEndpoint.open(grant)): void {
     if (typeof vscode.lm?.registerMcpServerDefinitionProvider !== 'function' || typeof vscode.McpStdioServerDefinition !== 'function') return;
-    const grant = new WorkspaceMcpGrant();
-    let endpoint: WorkspaceMcpEndpoint | undefined;
+    let active: Attach | undefined;
+    // Bumped by every detach. A grant command that awaited the modal or the endpoint across a detach discards its result.
+    let generation = 0;
     const changed = new vscode.EventEmitter<void>();
     const detach = async () => {
-        grant.revoke();
-        const closing = endpoint; endpoint = undefined;
-        await closing?.close();
+        generation++;
+        const closing = active; active = undefined;
+        closing?.grant.revoke();
+        await closing?.endpoint.close();
     };
     context.subscriptions.push(vscode.lm.registerMcpServerDefinitionProvider('ezil-browser', {
         onDidChangeMcpServerDefinitions: changed.event,
@@ -44,9 +49,9 @@ export function registerCodeMcp(context: vscode.ExtensionContext): void {
                 definitions.push(new vscode.McpStdioServerDefinition('EZiL Browser', process.execPath, [adapter], undefined, '1'));
             }
             // Served only while granted; the socket path is the sole argument and stops working on revoke.
-            if (endpoint?.open && grant.live()) {
+            if (active?.endpoint.open && active.grant.live()) {
                 const adapter = path.join(context.extensionPath, 'dist', 'workspace-mcp-server.js');
-                definitions.push(new vscode.McpStdioServerDefinition('EZiL Workspace', process.execPath, [adapter, endpoint.socketPath], undefined, path.basename(path.dirname(endpoint.socketPath))));
+                definitions.push(new vscode.McpStdioServerDefinition('EZiL Workspace', process.execPath, [adapter, active.endpoint.socketPath], undefined, path.basename(path.dirname(active.endpoint.socketPath))));
             }
             return definitions;
         },
@@ -64,15 +69,25 @@ export function registerCodeMcp(context: vscode.ExtensionContext): void {
                 GRANT_CHOICE);
             if (choice !== GRANT_CHOICE) return false;
             await detach();
+            const mine = generation;
+            const grant = new WorkspaceMcpGrant();
             if (!grant.grant(folder)) { void vscode.window.showInformationMessage('EZiL Workspace MCP: the folder is not a directory you own.'); return false; }
-            try { endpoint = await WorkspaceMcpEndpoint.open(grant); }
+            let endpoint: WorkspaceMcpEndpoint;
+            try { endpoint = await open(grant); }
             catch { grant.revoke(); void vscode.window.showInformationMessage('EZiL Workspace MCP: could not open the local endpoint.'); return false; }
+            if (generation !== mine || active) {
+                // Detached (or re-granted) while the endpoint was opening: this endpoint never becomes the active one.
+                grant.revoke();
+                await endpoint.close();
+                return false;
+            }
+            active = { grant, endpoint };
             changed.fire();
             void vscode.window.showInformationMessage('EZiL Workspace MCP attached for this window.');
             return true;
         }),
         vscode.commands.registerCommand(REVOKE_COMMAND, async () => {
-            const was = endpoint !== undefined;
+            const was = active !== undefined;
             await detach();
             if (was) changed.fire();
             void vscode.window.showInformationMessage(was ? 'EZiL Workspace MCP detached.' : 'EZiL Workspace MCP was not attached.');

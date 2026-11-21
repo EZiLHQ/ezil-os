@@ -15,6 +15,40 @@ import { WorkspaceMcpEndpoint, WorkspaceMcpGrant, identify, relayWorkspaceMcp, s
 mock.module('vscode', () => fakeVscode);
 const { GRANT_CHOICE, GRANT_COMMAND, REVOKE_COMMAND, registerCodeMcp } = await import('../src/code-mcp');
 
+/** The provider test's fake window: mutated in place, restored by `restoreWindow`. */
+function fakeWindow(root: string, choice: () => string | undefined) {
+    const workspace = fakeVscode.workspace as Record<string, unknown>;
+    const window = fakeVscode.window as Record<string, unknown>;
+    const commands = fakeVscode.commands as Record<string, unknown>;
+    const lm = fakeVscode.lm as Record<string, unknown>;
+    const saved = { workspace: { ...workspace }, window: { ...window }, commands: { ...commands }, lm: { ...lm } };
+    const previousEnv = { on: process.env.EZIL_CODE_BROWSER_MCP, token: process.env.EZIL_CODE_BROWSER_MCP_TOKEN };
+    delete process.env.EZIL_CODE_BROWSER_MCP; delete process.env.EZIL_CODE_BROWSER_MCP_TOKEN;
+    type Definition = { label: string; command: string; args: string[]; env?: unknown; version?: string };
+    const providers = new Map<string, { onDidChangeMcpServerDefinitions: { (listener: () => void): unknown }; provideMcpServerDefinitions(): Definition[] }>();
+    const registered = new Map<string, (...args: unknown[]) => Promise<unknown>>();
+    const notifications: string[] = [];
+    const state = { modal: undefined as Record<string, unknown> | undefined, foldersChanged: undefined as (() => void) | undefined };
+    Object.assign(workspace, { isTrusted: true, workspaceFolders: [{ uri: { scheme: 'file', authority: '', fsPath: root } }],
+        onDidChangeWorkspaceFolders: (listener: () => void) => { state.foldersChanged = listener; return { dispose() {} }; } });
+    Object.assign(window, {
+        showInformationMessage: async (text: string) => { notifications.push(text); },
+        showWarningMessage: async (text: string, options: Record<string, unknown>) => { notifications.push(text); state.modal = options; return choice(); },
+    });
+    Object.assign(commands, { registerCommand: (name: string, callback: (...args: unknown[]) => Promise<unknown>) => { registered.set(name, callback); return { dispose() {} }; } });
+    Object.assign(lm, { registerMcpServerDefinitionProvider: (id: string, provider: never) => { providers.set(id, provider); return { dispose() {} }; } });
+    const restore = () => {
+        for (const [name, object] of Object.entries(saved) as [keyof typeof saved, Record<string, unknown>][]) {
+            const target = fakeVscode[name] as Record<string, unknown>;
+            for (const key of Object.keys(target)) delete target[key];
+            Object.assign(target, object);
+        }
+        if (previousEnv.on !== undefined) process.env.EZIL_CODE_BROWSER_MCP = previousEnv.on;
+        if (previousEnv.token !== undefined) process.env.EZIL_CODE_BROWSER_MCP_TOKEN = previousEnv.token;
+    };
+    return { workspace, providers, registered, notifications, state, restore };
+}
+
 const roots: string[] = [];
 const children: ChildProcess[] = [];
 afterEach(() => {
@@ -318,6 +352,55 @@ describe('Code MCP provider', () => {
             }
             if (previousEnv.on !== undefined) process.env.EZIL_CODE_BROWSER_MCP = previousEnv.on;
             if (previousEnv.token !== undefined) process.env.EZIL_CODE_BROWSER_MCP_TOKEN = previousEnv.token;
+        }
+    });
+
+    test('a revoke during endpoint opening wins: the late endpoint closes and a later grant uses a fresh one', async () => {
+        const root = folder();
+        const fake = fakeWindow(root, () => GRANT_CHOICE);
+        const context = { subscriptions: [] as { dispose(): void }[], extensionPath: '/ext' };
+        let release: (() => void) | undefined;
+        const opened: WorkspaceMcpEndpoint[] = [];
+        const open = async (grant: WorkspaceMcpGrant) => {
+            const endpoint = await WorkspaceMcpEndpoint.open(grant);
+            opened.push(endpoint);
+            if (release === undefined) await new Promise<void>(resolve => { release = resolve; });
+            return endpoint;
+        };
+        try {
+            registerCodeMcp(context as never, open);
+            const provider = fake.providers.get('ezil-browser')!;
+            const granting = fake.registered.get(GRANT_COMMAND)!();
+            for (let count = 0; count < 50 && !opened.length; count++) await Bun.sleep(5);
+            expect(opened).toHaveLength(1);
+            const firstSocket = opened[0]!.socketPath;
+            // The owner revokes while the first endpoint is still opening (nothing is active yet, so revoke reports false).
+            expect(await fake.registered.get(REVOKE_COMMAND)!()).toBe(false);
+            release!();
+            expect(await granting).toBe(false);
+            expect(provider.provideMcpServerDefinitions()).toEqual([]);
+            expect(opened[0]!.open).toBe(false);
+            expect(fs.existsSync(path.dirname(firstSocket))).toBe(false);
+            // A later grant gets its own grant object and endpoint; the first one never serves it.
+            release = () => {};
+            expect(await fake.registered.get(GRANT_COMMAND)!()).toBe(true);
+            const [definition] = provider.provideMcpServerDefinitions();
+            expect(definition!.args[1]).toBe(opened[1]!.socketPath);
+            expect(definition!.args[1]).not.toBe(firstSocket);
+            const stale = spawn(process.execPath, ['run', path.join(import.meta.dir, '..', 'src', 'workspace-mcp-server.ts'), firstSocket], { stdio: 'pipe' }); children.push(stale);
+            expect(await new Promise<number | null>(resolve => stale.on('exit', code => resolve(code)))).toBe(1);
+            // Two overlapping grants: only the last one stays active and the other endpoint is closed.
+            const first = fake.registered.get(GRANT_COMMAND)!();
+            const second = fake.registered.get(GRANT_COMMAND)!();
+            expect([await first, await second]).toEqual([false, true]);
+            expect(opened.filter(endpoint => endpoint.open)).toHaveLength(1);
+            expect(provider.provideMcpServerDefinitions()[0]!.args[1]).toBe(opened.find(endpoint => endpoint.open)!.socketPath);
+            expect(await fake.registered.get(REVOKE_COMMAND)!()).toBe(true);
+            expect(opened.every(endpoint => !endpoint.open)).toBe(true);
+        } finally {
+            for (const subscription of context.subscriptions) subscription.dispose();
+            for (const endpoint of opened) await endpoint.close().catch(() => {});
+            fake.restore();
         }
     });
 });
