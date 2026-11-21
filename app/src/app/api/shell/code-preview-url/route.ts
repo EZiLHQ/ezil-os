@@ -291,13 +291,20 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
 }) {
     const { computerId, intent, startedAt } = request;
     const { parseRepositoryUrl, repositoryIdFor, resolvePublicGitHub } = await import('@/server/git/repo-url');
+    const { stagingGitQaAccepted } = await import('@/server/works/project-repo');
     const raw = typeof request.repository === 'object' && request.repository !== null && !Array.isArray(request.repository)
         && Object.keys(request.repository).length === 1 ? (request.repository as { url?: unknown }).url : undefined;
-    const parsed = parseRepositoryUrl(raw);
+    const parsed = parseRepositoryUrl(raw, { stagingGitQa: stagingGitQaAccepted() });
     if (!parsed.ok) {
         return parsed.reason === 'unsupported_host'
             ? shellRefusal(409, 'repo_url_unsupported', 'This Git host is not available for direct URL opens.')
             : repoUrlInvalid();
+    }
+    // An interview git-qa address (contract §6) opens through the interview gate, the Works grant and the Worker's
+    // binding (non-packet) path. Every other host keeps the public-github.com / standalone-github.ezil.work flow below.
+    if (parsed.host === 'git-qa.ezil.work') {
+        return openWorksGitAddress(ctx, caller, { computerId, intent,
+            canonicalURL: parsed.canonicalURL, displayName: parsed.displayName, startedAt, signal: request.signal });
     }
     // The Worker fetches a public github.com repository only on os-staging (`repoOpenRemotesFor`); any other
     // deployment would wake the computer for an open it then refuses. Refused first, with nothing read or woken.
@@ -400,5 +407,86 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     }
     const url = withRepositoryFolder(preview.codePreviewUrl, opened.folder);
     return shellJson({ ...preview, codePreviewUrl: url, url, repository: { name: parsed.displayName, id: repositoryId } });
+}
+
+/** The user-facing message for an interview open-gate refusal; the code (asserted everywhere) is what carries meaning. */
+const interviewRefusalMessage = (code: 'repo_not_found' | 'interview_not_started' | 'interview_finished'): string =>
+    code === 'interview_not_started' ? 'This interview has not started yet. Wait for the interviewer.'
+        : code === 'interview_finished' ? 'This interview has finished. The repository is read-only.'
+            : "This repository doesn't exist.";
+
+/**
+ * Open an interview git-qa repository address (contract §6) on the caller's own Cloudflare computer. In this order,
+ * each step only after the one before it held:
+ *  1. the computer is the caller's own (`computer.get`: NOT_FOUND otherwise), and it is a Cloudflare computer (AWS
+ *     cannot open git-qa: `repo_open_unsupported_provider`, 409);
+ *  2. this session's retained EZiL ID token is present (else IDENTITY_REFRESH_REQUIRED, 409) — git-qa access is
+ *     EZiL-ID-granted, and the gate recognises the candidate by its subject;
+ *  3. the interview open gate (§7.5) is evaluated BEFORE any mint, wake or grant: a refusal answers its status and
+ *     code and nothing else runs; `none` (not an interview) and `allow` both proceed;
+ *  4. Code is minted exactly as without a repository;
+ *  5. staging Works grants the short Basic credential for this address (`not_found` → 404 repo_not_found);
+ *  6. the Worker opens it through its binding (non-packet) path — never a v2 privatePacket, which is github.ezil.work
+ *     only. The response is the direct-address shape (`repository: {name, id}`), unchanged.
+ */
+async function openWorksGitAddress(ctx: ProjectCtx, caller: ShellCaller, request: {
+    computerId: string; intent: unknown; canonicalURL: string; displayName: string; startedAt: number; signal: AbortSignal;
+}) {
+    const { computerId, intent, canonicalURL, displayName, startedAt } = request;
+    const left = () => startedAt + PROJECT_OPEN_BUDGET_MS - Date.now();
+    const deadline = AbortSignal.any([request.signal, AbortSignal.timeout(Math.max(1, left()))]);
+
+    await caller.computer.get({ id: computerId });
+    if (isAws(await target(ctx, computerId))) return unsupportedProvider();
+
+    const identity = await retainedIdentityOrRefusal(ctx.user.id);
+    if (identity instanceof Response) return identity;
+
+    // The gate runs before any mint, wake or grant: a refusal is the whole answer.
+    const { interviewOpenGate } = await import('@/server/interview/gate');
+    const gate = await interviewOpenGate({ canonicalURL, osUserId: ctx.user.id, ezilIdSubject: identity.subject, computerId, purpose: 'open' });
+    if (gate.kind === 'refuse') return shellRefusal(gate.status, gate.code, interviewRefusalMessage(gate.code));
+
+    const preview = await caller.cloudflareGuacamole.codePreviewUrl({ computerId, intent }) as { ok: boolean; codePreviewUrl?: unknown };
+    if (!preview.ok || typeof preview.codePreviewUrl !== 'string') return shellJson(preview);
+    if (left() < REPO_OPEN_MIN_TIMEOUT_MS + REPO_OPEN_TRANSPORT_MARGIN_MS) return openTimedOut();
+
+    const { grantForWorksGitAddress, GitAccessError } = await import('@/server/git/access');
+    let grant;
+    try {
+        grant = await grantForWorksGitAddress(identity, canonicalURL, computerId, { signal: deadline });
+    } catch (error) {
+        const code = error instanceof GitAccessError ? error.code : 'unavailable';
+        console.warn('[shell] code-preview-url works git refused', { code });
+        if (code === 'identity_refused') {
+            const { clearProjectIdentity } = await import('@/server/auth/retained-identity');
+            try { await clearProjectIdentity(); } catch { /* the next request asks for a fresh identity */ }
+            return shellRefusal(409, 'IDENTITY_REFRESH_REQUIRED', 'Confirm your EZiL ID to open this repository.');
+        }
+        if (code === 'not_found') return shellRefusal(404, 'repo_not_found', "This repository doesn't exist or you cannot access it.");
+        return shellRefusal(503, 'repo_url_unavailable', "We couldn't reach this repository. Try again.");
+    }
+
+    // Re-read after the mint: a computer that moved to AWS meanwhile is refused, never signed for as Cloudflare.
+    const controls = await target(ctx, computerId);
+    if (isAws(controls)) return unsupportedProvider();
+    const { repositoryIdFor } = await import('@/server/git/repo-url');
+    const repositoryId = repositoryIdFor(canonicalURL);
+    const timeoutMs = Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS, Date.parse(grant.git.expiresAt) - Date.now() - 15_000);
+    if (timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS) {
+        console.warn('[shell] code-preview-url repository refused', { code: 'deadline' });
+        return openTimedOut();
+    }
+    const config = resolveCloudflareGuacamoleConfig();
+    const opened = await requestRepoOpen(config.workerUrl, process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '', controls,
+        { userId: ctx.user.id, computerId }, { repositoryId, canonicalURL, ref: grant.ref,
+            git: { token: grant.git.token, expiresAt: grant.git.expiresAt, scope: grant.git.scope }, timeoutMs },
+        { correlationId: newCorrelationId(), signal: deadline, revalidateTarget: () => target(ctx, computerId) });
+    if (!opened.ok) {
+        if (opened.errorCode === 'repo_open_unsupported_provider') return unsupportedProvider();
+        return repoOpenFailureResponse(ctx.db, ctx.user.id, computerId, opened, "This repository's files could not be opened. Try again.");
+    }
+    const url = withRepositoryFolder(preview.codePreviewUrl, opened.folder);
+    return shellJson({ ...preview, codePreviewUrl: url, url, repository: { name: displayName, id: repositoryId } });
 }
 

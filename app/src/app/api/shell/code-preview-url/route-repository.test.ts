@@ -210,11 +210,25 @@ describe('opening a repository from its address in Code', () => {
         expect(s.order).toEqual([]);
     });
 
-    it('an EZiL Git address is repo_url_unsupported (409) before anything is read', async () => {
-        const response = await openUrl('https://git-qa.ezil.work/acme-qa/site.git');
-        expect(response.status).toBe(409);
-        expect((await response.json()).error.code).toBe('repo_url_unsupported');
-        expect(s.order).toEqual([]);
+    it('a nonproduction EZiL Git address is repo_url_unsupported (409) before anything is read; git-qa only while the staging gate is off', async () => {
+        // git.ezil.work and git-staging.ezil.work are never a direct-open host, on any deployment (the gate is on here).
+        for (const url of ['https://git.ezil.work/acme/site.git', 'https://git-staging.ezil.work/acme-qa/site.git']) {
+            s.order = []; s.requests = [];
+            const response = await openUrl(url);
+            expect(response.status).toBe(409);
+            expect((await response.json()).error.code).toBe('repo_url_unsupported');
+            expect(s.order).toEqual([]);
+        }
+        // git-qa is accepted only when the deployment opts in (`stagingGitQaAccepted`, funding === ai-staging). Under
+        // any other funding root the gate is off and it is unsupported, as today — with nothing read or woken.
+        for (const funding of ['https://ai.ezil.work', 'https://ai.ezil.work/']) {
+            vi.stubEnv('BILLING_FUNDING_URL', funding);
+            s.order = []; s.requests = [];
+            const response = await openUrl('https://git-qa.ezil.work/acme-qa/site.git');
+            expect(response.status).toBe(409);
+            expect((await response.json()).error.code).toBe('repo_url_unsupported');
+            expect(s.order).toEqual([]);
+        }
     });
 
     it('production (the canonical production funding root) opens anonymously through the same ownership, provider, mint and signed Worker path', async () => {
