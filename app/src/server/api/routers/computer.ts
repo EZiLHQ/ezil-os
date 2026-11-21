@@ -41,6 +41,7 @@ import { readComputerProgress } from '@/server/lib/compute/progress';
 import { readSystemInfo } from '@/server/lib/compute/system-info';
 import { restartWholeComputer, routeComputer, startReverseMove, switchComputerConfiguration } from './compute-dispatch';
 import { computerCreateError } from './computer-errors';
+import { createNamedComputer } from './named-computer';
 import {
     createComputerInLowestFreeSlot,
     getOrCreateDefaultComputer,
@@ -52,6 +53,7 @@ import {
 } from './computer-store';
 import { clientOf, controlCall } from '../control-call';
 import { editorDelegationEnabled } from '../editor-delegation';
+import { NAMED_COMPUTER_PROCEDURE, requireOnboardingCaller } from '../onboarding-delegation';
 import { createTRPCRouter, protectedProcedure } from '../trpc';
 
 /**
@@ -157,6 +159,14 @@ export const computerRouter = createTRPCRouter({
             }
 
             return outcome.computer;
+        }),
+
+    /** Explicit delegated creation only. The normal start route applies its own allowance checks. */
+    createNamed: protectedProcedure
+        .input(z.object({ name: z.string().trim().min(1).max(200), idempotencyKey: z.string().uuid() }).strict())
+        .mutation(({ ctx, input }) => {
+            const caller = requireOnboardingCaller(ctx, NAMED_COMPUTER_PROCEDURE);
+            return createNamedComputer(ctx.db, { ...input, userId: ctx.user.id, clientId: caller.clientId });
         }),
 
     /**

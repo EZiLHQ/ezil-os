@@ -64,6 +64,7 @@ EZIL_DELEGATED_EDITOR_SESSIONS EZIL_EDITOR_BRIDGE EZIL_EDITOR_BRIDGE_CONTROLS
 # renderer refuses what the receiver would silently ignore. Off unless the gate is "enabled".
 DELEGATION_GATE = "EZIL_DELEGATED_COMPUTER_READS"
 STAGING_EDITOR_SWITCHES = ("EZIL_DELEGATED_EDITOR_SESSIONS", "EZIL_EDITOR_BRIDGE", "EZIL_EDITOR_BRIDGE_CONTROLS")
+STAGING_ONBOARDING = "EZIL_DELEGATED_ONBOARDING"
 STAGING_BROWSER_OBSERVE = "EZIL_DELEGATED_BROWSER_OBSERVE"
 STAGING_BROWSER_OPEN = "EZIL_DELEGATED_BROWSER_OPEN_URL"
 STAGING_BROWSER_ORIGINS = "EZIL_BROWSER_TEST_ALLOWED_ORIGINS"
@@ -93,7 +94,8 @@ class RenderError(Exception):
 def validate(values, environment="staging"):
     if not isinstance(values, dict):
         raise RenderError("Expected a JSON object")
-    staging_keys = frozenset((STAGING_BROWSER_OBSERVE, STAGING_BROWSER_OPEN, STAGING_BROWSER_ORIGINS, STAGING_PREVIEW_TOKEN_V2))
+    staging_keys = frozenset((STAGING_BROWSER_OBSERVE, STAGING_BROWSER_OPEN, STAGING_BROWSER_ORIGINS,
+                              STAGING_PREVIEW_TOKEN_V2, STAGING_ONBOARDING))
     allowed = REQUIRED | OPTIONAL | (staging_keys if environment == "staging" else frozenset())
     if any(key not in allowed and not REGIONAL.fullmatch(key) for key in values):
         raise RenderError("Unknown key refused")
@@ -119,6 +121,15 @@ def validate(values, environment="staging"):
         or values.get("CLOUDFLARE_GUACAMOLE_WORKER_URL") != "https://api-desktop-staging.ezil.work"
     ):
         raise RenderError("Preview token v2 requires 1 and the canonical staging Worker URL")
+    onboarding = values.get(STAGING_ONBOARDING)
+    if onboarding not in (None, "enabled", "disabled"):
+        raise RenderError("Onboarding must be exactly enabled or disabled")
+    if onboarding == "enabled" and (
+        not all(pin in values for pin in DELEGATION_PINS)
+        or values["EZIL_DELEGATION_ISSUER"] != "https://connect-staging.ezil.work"
+        or values["EZIL_DELEGATION_AUDIENCE"] != "https://os-staging.ezil.work"
+    ):
+        raise RenderError("Staging onboarding requires the canonical staging delegation origins and complete pins")
     for key, feature in ((STAGING_BROWSER_OBSERVE, "Browser observation"), (STAGING_BROWSER_OPEN, "Browser navigation")):
         setting = values.get(key)
         if setting not in (None, "enabled", "disabled"):
