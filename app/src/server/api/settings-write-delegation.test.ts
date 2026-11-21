@@ -55,7 +55,7 @@ const fakeDb = {
 /** Any use at all is recorded: a handler that touches the database for plan.sku is caught here. */
 const untouchedDb = new Proxy({}, { get: (_target, property) => { h.touched(property); throw new Error('database touched'); } });
 
-const delegated = (procedure = SETTINGS_WRITE_PROCEDURE, userId = owner) => ({
+const delegated = (procedure: string = SETTINGS_WRITE_PROCEDURE, userId = owner) => ({
     status: 'accepted', call: { jti: key, clientId: 'registered-client', userId, procedure },
 });
 const caller = (opts: { procedure?: string; userId?: string; db?: unknown; delegation?: unknown } = {}) => accountRouter.createCaller({
@@ -146,7 +146,7 @@ describe('account.mcpSetSetting gate', () => {
         for (const bad of [
             write('computer.name', 'Fine', mine, { extra: 1 }), write('computer.name', 'Fine', mine, { idempotencyKey: 'not-a-uuid' }),
             write('computer.name', 'Fine', mine, { idempotencyKey: undefined }), write('computer.colour', 'red', mine),
-            write('computer.name', 'Fine', 'not-a-uuid'), { id: 'computer.name', idempotencyKey: key, computerId: mine },
+            write('computer.name', 'Fine', 'not-a-uuid'), { id: 'computer.name', idempotencyKey: key, computerId: mine } as never,
             write('computer.name', 'Fine', mine, { value: 5 }),
         ]) await expect(caller().mcpSetSetting(bad)).rejects.toMatchObject({ code: 'BAD_REQUEST' });
         expect(h.update).toHaveBeenCalledTimes(1);
@@ -323,7 +323,7 @@ describe('plan.sku', () => {
 });
 
 describe('delegation policy entries', () => {
-    const line = (method: string, procedure = SETTINGS_WRITE_PROCEDURE, body = '{"json":{"id":"plan.sku"}}') => ({
+    const line = (method: string, procedure: string = SETTINGS_WRITE_PROCEDURE, body = '{"json":{"id":"plan.sku"}}') => ({
         method, url: `https://os-staging.ezil.work/api/trpc/${procedure}`, hasBody: method === 'POST', editorBody: Buffer.from(body),
     });
 
