@@ -9,6 +9,8 @@
  * The staging gate is checked FIRST in every handler, so a closed gate is 404 `not_found` even for an
  * unauthenticated caller (acceptance A6). Nothing is written for a non-candidate (A3, A4).
  */
+import { isTelemetryAdmin } from '@/server/telemetry/admin';
+
 import { INTERVIEW_NOTICE, NOTICE_SHA256, NOTICE_VERSION } from './notice';
 import { validateClientEvent } from './events';
 import {
@@ -134,6 +136,17 @@ export async function eventsBatch(db: InterviewDb, input: {
 
 // ── Admin: createTRPCContext bearer + isTelemetryAdmin (the route computes `authz`) ──────────────────────────────
 export type Authz = 'ok' | 'unauthorized' | 'forbidden';
+
+/**
+ * Admin authorization reuses the existing telemetry-admin gate, so adding a bearer-authenticated CLI route adds no
+ * new way to AUTHORIZE: `createTRPCContext` resolved the user, `isTelemetryAdmin` decides. 401 when no user resolved,
+ * 403 when the user is not a telemetry admin.
+ */
+export function adminAuthzOf(user: { email?: string | null } | null | undefined, allowList: string | undefined): Authz {
+    if (!user) return 'unauthorized';
+    return isTelemetryAdmin(user.email, allowList) ? 'ok' : 'forbidden';
+}
+
 function adminGuard(gateOn: boolean, authz: Authz): HandlerResult | null {
     if (!gateOn) return GATE_OFF;
     if (authz === 'unauthorized') return refuse(401, 'unauthorized', 'Sign in to continue.');
