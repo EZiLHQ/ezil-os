@@ -151,7 +151,7 @@ import { computeBootUiState, FRAME_CONFIRM_DEADLINE_MS } from '../boot-phases.js
 import AppSpinner, { computerUpdateMilestone } from '../ui/app-spinner.js';
 import { TRANSITION_EVENT, watchComputerTransition } from '../ui/computer-progress.js';
 import attach_app_drawer from '../ui/app-drawer.js';
-import { createFullView } from '../ui/full-view.js';
+import { createFullView, is_minimized } from '../ui/full-view.js';
 import { appUrl } from '../app-history.js';
 import UIWindow from '../../src/UI/UIWindow.js';
 
@@ -1496,6 +1496,21 @@ export async function openCodeWindow (ctx = {}) {
     // Visual values are provisional — see `docs/APP-CODE-FULL-VIEW.md` §3.
     const full_view = createFullView(el_window);
 
+    // Dock transitions resize the outer window, but those intermediate sizes must
+    // never reach the editor's pane layout. Freeze the frame's real layout box,
+    // including during the full-view chrome change, and release it on restore.
+    let frame_box = null;
+    let restore_timer = null;
+    function preserve_frame_viewport () {
+        clearTimeout(restore_timer);
+        if ( frame_box || ! el_iframe.clientWidth || ! el_iframe.clientHeight ) return;
+        const measured = getComputedStyle(el_iframe);
+        const { width, height } = measured;
+        frame_box = { width: el_iframe.style.width, height: el_iframe.style.height };
+        Object.assign(el_iframe.style, { width, height });
+    }
+    if ( ! nativeSurface ) el_window._ezil_preserve_frame_viewport = preserve_frame_viewport;
+
     // The control drawer: the Browser's tray, centred in the strip as the
     // Browser's is. Its expanded tray carries the title and every window
     // action. "Show desktop" is the one minimise: until G3 the top bar also
@@ -1506,7 +1521,10 @@ export async function openCodeWindow (ctx = {}) {
         icon: ctx.icon,
         flash_on_attach: false,
         actions: [
-            { id: 'minimize', label: 'Show desktop', svg: MINIMISE_SVG, onClick: () => { full_view.minimise(); } },
+            { id: 'minimize', label: 'Show desktop', svg: MINIMISE_SVG, onClick: () => {
+                el_window._ezil_preserve_frame_viewport?.();
+                full_view.minimise();
+            } },
             { id: 'restore', label: 'Restore window', svg: RESTORE_SVG, onClick: () => { set_view('window', { remember: true }); } },
         ],
     });
@@ -1620,12 +1638,21 @@ export async function openCodeWindow (ctx = {}) {
     // Back from the taskbar: full view again if still wanted, else the
     // windowed bounds a minimise-from-full left stashed. After `showWindow`'s
     // 0.2s geometry transition, as the Browser does, and re-checked then.
-    const restore_observer = full_view.watch_restore(() => {
-        setTimeout(() => {
-            if ( disposed ) return;
+    function restore_frame_viewport () {
+        clearTimeout(restore_timer);
+        restore_timer = setTimeout(() => {
+            if ( disposed || is_minimized(el_window) ) return;
             if ( full_view.wants ) full_view.enter(); else full_view.settle();
+            if ( frame_box ) {
+                Object.assign(el_iframe.style, frame_box);
+                frame_box = null;
+            }
         }, 220);
-    });
+    }
+    // Hosted restores come from showWindow so even an immediate hide/show pair
+    // releases the frame. Native Code keeps its existing minimized-state observer.
+    if ( ! nativeSurface ) el_window._ezil_restore_frame_viewport = restore_frame_viewport;
+    const restore_observer = nativeSurface ? full_view.watch_restore(restore_frame_viewport) : null;
 
     const launch_view = ctx.view === 'full' || ctx.view === 'window' ? ctx.view : remembered_view();
     if ( launch_view === 'full' ) full_view.enter();
@@ -1639,7 +1666,8 @@ export async function openCodeWindow (ctx = {}) {
         git_access?.dispose();
         git_access_notice?.remove(); git_access_notice = null;
         hide_state();
-        restore_observer.disconnect();
+        restore_observer?.disconnect();
+        clearTimeout(restore_timer);
         // A closed window stops asking: no ask after close can reach ensure() (hotfix r5).
         mint_ctl?.abort();
         window.removeEventListener('ezil:desktop-restarted', on_restarted);
