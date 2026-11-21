@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const h = vi.hoisted(() => ({
     routeComputer: vi.fn(),
+    ownsComputer: vi.fn(),
     gateComputerStart: vi.fn(),
     ready: vi.fn(),
     stopComputerForPolicy: vi.fn(),
@@ -17,6 +18,7 @@ const h = vi.hoisted(() => ({
 }));
 
 vi.mock('server-only', () => ({}));
+vi.mock('@/server/agent-session/control-store', () => ({ ownsComputer: h.ownsComputer }));
 vi.mock('@/server/api/routers/compute-dispatch', () => ({ routeComputer: h.routeComputer, cloudflareMigrationAnswer: h.migration }));
 vi.mock('@/server/billing/deps', () => ({ getBillingDeps: () => ({ now: () => new Date('2026-11-07T00:00:00Z'), config: { enforcementEnabled: h.enforcement } }) }));
 vi.mock('@/server/billing/v2/compute-access', () => ({ gateComputerStart: h.gateComputerStart }));
@@ -25,20 +27,22 @@ vi.mock('@/server/lib/cloudflare-guacamole-provider', () => ({ newCorrelationId:
 vi.mock('@/server/lib/compute/aws-preview', () => ({ prepareAwsPoolSession: h.prepareAwsPoolSession }));
 vi.mock('@/server/lib/compute/stop-policy', () => ({ stopComputerForPolicy: h.stopComputerForPolicy }));
 
-import { startPort } from './port';
+import { observeCloudflareStart, startPort } from './port';
 
 const COMPUTER = { userId: '11111111-1111-4111-8111-111111111111', computerId: '22222222-2222-4222-8222-222222222222' };
 const db = {};
 const ensure = vi.fn();
-const cloudflare = { kind: 'cloudflare', provider: { ensure } };
+const status = vi.fn();
+const cloudflare = { kind: 'cloudflare', provider: { ensure, status } };
 const aws = (extra: Record<string, unknown> = {}) => ({ kind: 'aws-ec2', instanceType: 'm6i.large', provider: { ensure }, ...extra });
 
 beforeEach(() => {
     vi.stubEnv('EZIL_COMPUTE_PLACEMENT_READS', '1');
     vi.stubEnv('EZIL_AWS_COMPUTERS_ENABLED', '0');
-    for (const mock of [h.routeComputer, h.gateComputerStart, h.ready, h.stopComputerForPolicy, h.prepareAwsPoolSession, h.migration, ensure]) mock.mockReset();
+    for (const mock of [h.routeComputer, h.gateComputerStart, h.ready, h.stopComputerForPolicy, h.prepareAwsPoolSession, h.migration, ensure, status]) mock.mockReset();
     h.config = { isConfigured: true };
     h.enforcement = true;
+    h.ownsComputer.mockReset().mockResolvedValue(true);
     h.migration.mockReturnValue(null);
     h.gateComputerStart.mockResolvedValue({ allowed: true });
     h.prepareAwsPoolSession.mockResolvedValue(undefined);
@@ -126,14 +130,15 @@ describe('startPort', () => {
             h.routeComputer.mockResolvedValue(cloudflare);
             const port = startPort(db, COMPUTER);
             const route = await port.route(true);
-            return port.boot(route);
+            const result = await port.boot(route);
+            return result.state === 'running' ? port.recordReady!() : result;
         };
 
         it('ready with a desktop is metered exactly as an open meters it, and is running', async () => {
             ensure.mockResolvedValue({ ok: true, guacamoleUrl: 'https://x.example/d' });
             expect(await boot()).toEqual({ state: 'running' });
             expect(h.ready).toHaveBeenCalledWith({ ...COMPUTER, size: 'free-cf', readyAt: expect.any(Date), overheadSeconds: 0 });
-            expect(ensure).toHaveBeenCalledWith({ correlationId: 'corr-1' }, COMPUTER, { sessionId: COMPUTER.computerId, desktopMode: 'neko' });
+            expect(ensure).toHaveBeenCalledWith({ correlationId: 'corr-1' }, COMPUTER, { sessionId: COMPUTER.computerId, desktopMode: 'neko' }, 'complete');
             expect(h.stopComputerForPolicy).not.toHaveBeenCalled();
         });
 
@@ -146,7 +151,7 @@ describe('startPort', () => {
             ensure.mockResolvedValue({ ok: true, codePreviewUrl: 'https://z.example' });
             h.ready.mockResolvedValue('concurrent');
             expect(await boot()).toEqual({ state: 'failed', reason: 'billing_concurrent_limit' });
-            expect(h.stopComputerForPolicy).toHaveBeenCalledWith(db, COMPUTER, 'user_stop', { correlationId: 'corr-1' });
+            expect(h.stopComputerForPolicy).toHaveBeenCalledWith(db, COMPUTER, 'user_stop', { correlationId: 'corr-1', route: expect.any(Function) });
             h.stopComputerForPolicy.mockReset();
             h.enforcement = false;
             expect(await boot()).toEqual({ state: 'running' });
@@ -164,6 +169,36 @@ describe('startPort', () => {
             ensure.mockResolvedValue({ ok: true });
             expect(await boot()).toEqual({ state: 'starting' });
             expect(h.ready).not.toHaveBeenCalled();
+        });
+
+        it.each(['sandbox_starting', 'sandbox_start_failed', 'worker_http_error', 'fetch_failed', 'timeout'])('keeps %s pending for an existing admitted wake', async errorCode => {
+            ensure.mockResolvedValue({ ok: false, errorCode, retryable: true });
+            expect(await boot()).toEqual({ state: 'starting' });
+            expect(ensure).toHaveBeenCalledTimes(1);
+            expect(h.ready).not.toHaveBeenCalled();
+        });
+
+        it('recovers from non-waking live port status, never routing a wake or an AWS Host', async () => {
+            h.routeComputer.mockResolvedValue(cloudflare);
+            status.mockResolvedValueOnce({ ok: true, guacamoleRunning: false }).mockResolvedValueOnce({ ok: true, guacamoleRunning: true });
+            expect(await observeCloudflareStart(db, COMPUTER)).toEqual({ state: 'starting' });
+            expect(h.ready).not.toHaveBeenCalled();
+            expect(await observeCloudflareStart(db, COMPUTER)).toEqual({ state: 'running' });
+            expect(h.ready).toHaveBeenCalledTimes(1);
+            h.routeComputer.mockResolvedValue(aws());
+            expect(await observeCloudflareStart(db, COMPUTER)).toEqual({ state: 'failed', reason: 'route_changed' });
+            expect(status).toHaveBeenCalledTimes(2);
+            expect(h.routeComputer.mock.calls.every(([, , opts]) => opts.pinCloudflare === false)).toBe(true);
+            expect(h.gateComputerStart).not.toHaveBeenCalled();
+            expect(ensure).not.toHaveBeenCalled();
+        });
+
+        it('does not meter or stop a computer whose owner changed while it was waking', async () => {
+            ensure.mockResolvedValue({ ok: true, guacamoleUrl: 'https://desktop.example/' });
+            h.ownsComputer.mockResolvedValue(false);
+            expect(await boot()).toEqual({ state: 'failed', reason: 'computer_unavailable' });
+            expect(h.ready).not.toHaveBeenCalled();
+            expect(h.stopComputerForPolicy).not.toHaveBeenCalled();
         });
 
         it('a refusal is failed with its code; a migrating computer is not started', async () => {

@@ -1,3 +1,5 @@
+import { reconcileColdStarts } from '@/server/computer-start/start';
+import { observeCloudflareStart } from '@/server/computer-start/port';
 import { drainFeedbackNotifications } from '@/server/feedback/notifications';
 import { drainIncidentAlerts } from '@/server/telemetry/incident-alerts';
 import type { SQL } from 'drizzle-orm';
@@ -21,6 +23,8 @@ import { refreshAiPlans } from '@/server/lib/ai-credential';
 import { GET, maxDuration } from './route';
 
 const mockEnv = vi.hoisted(() => ({ CRON_SECRET: undefined as string | undefined, CLOUDFLARE_GUACAMOLE_HMAC_SECRET: undefined as string | undefined }));
+vi.mock('@/server/computer-start/start', () => ({ reconcileColdStarts: vi.fn() }));
+vi.mock('@/server/computer-start/port', () => ({ observeCloudflareStart: vi.fn() }));
 vi.mock('@/server/feedback/notifications', () => ({ drainFeedbackNotifications: vi.fn() }));
 vi.mock('@/server/telemetry/incident-alerts', () => ({ drainIncidentAlerts: vi.fn() }));
 vi.mock('@/env', () => ({ env: mockEnv }));
@@ -81,6 +85,24 @@ describe('GET /api/cron/billing-session-sweep', () => {
         expect((await GET(request(auth))).status).toBe(404);
         expect(getBillingDeps).not.toHaveBeenCalled();
         expect(handleBillingSessionSweep).not.toHaveBeenCalled();
+    });
+
+    it('recovers pending wakes only in the authenticated staged sweep', async () => {
+        vi.stubEnv('EZIL_DELEGATED_EDITOR_SESSIONS', 'enabled');
+        vi.stubEnv('EZIL_EDITOR_BRIDGE', 'enabled');
+        vi.stubEnv('EZIL_DELEGATION_ISSUER', 'https://connect-staging.ezil.work');
+        vi.stubEnv('EZIL_DELEGATION_AUDIENCE', 'https://os-staging.ezil.work');
+        try {
+            expect((await GET(request())).status).toBe(404);
+            expect(reconcileColdStarts).not.toHaveBeenCalled();
+            expect((await GET(request('Bearer cron'))).status).toBe(200);
+            const [, observe] = vi.mocked(reconcileColdStarts).mock.calls[0]!;
+            await observe(computer);
+            expect(observeCloudflareStart).toHaveBeenCalledExactlyOnceWith(db, computer);
+            vi.stubEnv('EZIL_DELEGATION_ISSUER', 'https://other.example.invalid');
+            expect((await GET(request('Bearer cron'))).status).toBe(200);
+            expect(reconcileColdStarts).toHaveBeenCalledTimes(1);
+        } finally { vi.unstubAllEnvs(); }
     });
 
     it('returns the sweep counts and injects the dependency clock with a duration budget', async () => {

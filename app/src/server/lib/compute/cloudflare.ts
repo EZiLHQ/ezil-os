@@ -87,7 +87,7 @@ export function createCloudflareComputeProvider(overrides: Partial<CloudflareCom
         kind: 'cloudflare' as const,
 
         /** `POST /sandbox/preview`. The body key order matches the pre-seam router. */
-        ensure: (ctx: ComputeCtx, c: ComputerRef, opts: EnsureOptions) =>
+        ensure: (ctx: ComputeCtx, c: ComputerRef, opts: EnsureOptions, wakeAnswer?: 'progress' | 'complete') =>
             requestGuacamolePreview(
                 deps.resolveConfig(),
                 deps.readHmacSecret(),
@@ -102,6 +102,7 @@ export function createCloudflareComputeProvider(overrides: Partial<CloudflareCom
                 },
                 ctx.correlationId,
                 authOf(c),
+                wakeAnswer,
             ),
 
         /**

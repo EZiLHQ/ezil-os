@@ -16,7 +16,7 @@ import superjson from 'superjson';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import * as schema from '@/server/db/schema';
-import type { StartPort } from '@/server/computer-start/start';
+import type { BootOutcome, StartPort } from '@/server/computer-start/start';
 
 import { ensureTestSchema } from './pg-test-schema';
 
@@ -367,6 +367,164 @@ describe.skipIf(!URL_)('EZiL MCP session controls on Postgres', () => {
             expect(await code(spent)).toBe('UNAUTHORIZED');
             expect(calls).toEqual([]);
             expect(await controlRows(client`idempotency_key = ${input.idempotencyKey}::uuid`)).toHaveLength(0);
+        });
+    });
+
+    describe('Cloudflare cold start receipts', () => {
+        const seed = async (computerId: string, status: string, reason: string | null, ageSeconds: number) => {
+            const key = randomUUID();
+            const row = await data<Start>(await start({ computerId, idempotencyKey: key }));
+            await client`UPDATE public.ezil_control_operations SET status = ${status}, reason = ${reason},
+                created_at = now() - make_interval(secs => ${ageSeconds}::int),
+                updated_at = now() - make_interval(secs => ${ageSeconds}::int)
+                WHERE id = ${row.id}::uuid`;
+            return { key, id: row.id };
+        };
+        const lookup = (key: string, overrides: Record<string, unknown> = {}) =>
+            read('agentSession.control', { kind: 'start', idempotencyKey: key }, overrides);
+        const restartAndObserve = async (observe: (target: { userId: string; computerId: string }) => Promise<BootOutcome>) => {
+            // A fresh database client represents another App process without the dispatcher's memory.
+            const fresh = postgres(URL_!, { max: 1, prepare: false, onnotice: () => {} });
+            try {
+                const { reconcileColdStarts } = await import('@/server/computer-start/start');
+                await reconcileColdStarts(drizzle(fresh, { schema }), observe);
+            } finally { await fresh.end(); }
+        };
+        const marker = 'cloudflare_wake_dispatched';
+
+        it('acknowledges a slow approved wake before readiness and never repeats the boot', async () => {
+            const key = randomUUID();
+            let release!: () => void;
+            let entered!: () => void;
+            const started = new Promise<void>(resolve => { entered = resolve; });
+            const paused = new Promise<void>(resolve => { release = resolve; });
+            port.onBoot = async () => { entered(); await paused; };
+            const dispatch = start({ computerId: ids.a1, idempotencyKey: key });
+            try {
+                await started;
+                const receipt = await data<Start>(await dispatch);
+                expect(receipt).toMatchObject({ status: 'starting', reason: null });
+                const stored = (await controlRows(client`id = ${receipt.id}::uuid`))[0];
+                expect(stored).toMatchObject({ status: 'starting', reason: marker });
+                expect(await data(await lookup(key))).toEqual({ found: true, row: receipt });
+                expect(await data(await start({ computerId: ids.a1, idempotencyKey: key }))).toEqual(receipt);
+                release();
+                await expect.poll(async () => (await data<{ row: Start }>(await lookup(key))).row.status).toBe('running');
+                expect(calls.filter(call => call === 'boot')).toHaveLength(1);
+            } finally { release(); await dispatch; }
+        }, 10_000);
+
+        it('recovers pending operations through get_control after a restart and preserves a terminal legacy failure', async () => {
+            const running = await seed(ids.a1, 'starting', marker, 35);
+            const failed = await seed(ids.a2, 'starting', marker, 35);
+            const legacy = await seed(ids.a1, 'failed', 'sandbox_starting', 90);
+            const legacyBefore = await data(await lookup(legacy.key));
+            calls.length = 0;
+            await restartAndObserve(async target => {
+                expect(target.userId).toBe(alice);
+                return target.computerId === ids.a1 ? { state: 'running' } : { state: 'failed', reason: 'capacity_unavailable' };
+            });
+            expect(await data(await lookup(running.key))).toMatchObject({ found: true, row: { id: running.id, status: 'running', reason: null } });
+            expect(await data(await lookup(failed.key))).toMatchObject({ found: true, row: { id: failed.id, status: 'failed', reason: 'capacity_unavailable' } });
+            expect(await data(await lookup(legacy.key))).toEqual(legacyBefore);
+            expect(await data(await lookup(running.key, { sub: bob }))).toMatchObject({ found: false });
+            expect(await data(await lookup(running.key, { client_id: CLIENT2 }))).toMatchObject({ found: false });
+            expect(await data(await start({ computerId: ids.a1, idempotencyKey: running.key }))).toMatchObject({ id: running.id, status: 'running' });
+            expect(calls).toEqual([]);
+        });
+
+        it('keeps a recent pending outcome and distinguishes an aged uncertain wake from a known provider failure', async () => {
+            const waiting = await seed(ids.a1, 'starting', marker, 45);
+            const timedOut = await seed(ids.a2, 'starting', marker, 330);
+            const unadmitted = await seed(ids.a2, 'starting', null, 330);
+            const fresh = await seed(ids.a1, 'starting', marker, 0);
+            const freshBefore = await controlRows(client`id = ${fresh.id}::uuid`);
+            const unadmittedBefore = await controlRows(client`id = ${unadmitted.id}::uuid`);
+            await restartAndObserve(async () => ({ state: 'starting' }));
+            expect(await data(await lookup(waiting.key))).toMatchObject({ row: { id: waiting.id, status: 'starting', reason: null } });
+            expect(await data(await lookup(timedOut.key))).toMatchObject({ row: { status: 'failed', reason: 'readiness_unconfirmed' } });
+            expect(await controlRows(client`id = ${fresh.id}::uuid`)).toEqual(freshBefore);
+            expect(await controlRows(client`id = ${unadmitted.id}::uuid`)).toEqual(unadmittedBefore);
+        });
+
+        it('hands an expired claim to a fresh observer and ignores the original process when it returns', async () => {
+            const computerId = randomUUID();
+            await client`INSERT INTO public.ezil_computers (id, user_id, name, slot) VALUES (${computerId}::uuid, ${alice}::uuid, 'leased', 6)`;
+            const pending = await seed(computerId, 'starting', marker, 60);
+            let resume!: (outcome: BootOutcome) => void;
+            const stalled = new Promise<BootOutcome>(resolve => { resume = resolve; });
+            let originalCalls = 0;
+            const first = restartAndObserve(async target => {
+                if (target.computerId !== computerId) return { state: 'starting' };
+                originalCalls++;
+                return stalled;
+            });
+            try {
+                await expect.poll(() => originalCalls).toBe(1);
+                const stored = () => controlRows(client`id = ${pending.id}::uuid`);
+                const before = await stored();
+                expect(before[0]).toMatchObject({ status: 'starting', reason: marker, attempt_id: expect.any(String) });
+                expect(Date.parse(String(before[0]!.not_before))).toBeGreaterThan(Date.now());
+                let laterCalls = 0;
+                const observe = async (target: { computerId: string }): Promise<BootOutcome> => {
+                    if (target.computerId !== computerId) return { state: 'starting' };
+                    laterCalls++;
+                    return { state: 'running' };
+                };
+                await restartAndObserve(observe);
+                expect(laterCalls).toBe(0);
+                expect(await stored()).toEqual(before);
+                await client`UPDATE public.ezil_control_operations SET not_before = now() - interval '1 second' WHERE id = ${pending.id}::uuid`;
+                await restartAndObserve(observe);
+                expect(laterCalls).toBe(1);
+                const settled = await stored();
+                expect(settled[0]).toMatchObject({ status: 'running', reason: null, attempt_id: null, not_before: null });
+                resume({ state: 'failed', reason: 'late_provider_result' });
+                await first;
+                expect(await stored()).toEqual(settled);
+                expect(await data(await lookup(pending.key))).toMatchObject({ found: true, row: { id: pending.id, status: 'running' } });
+            } finally { resume({ state: 'starting' }); await first; }
+        });
+
+        it('cannot publish readiness when the owned computer is deleted during the observer call', async () => {
+            const computerId = randomUUID();
+            await client`INSERT INTO public.ezil_computers (id, user_id, name, slot) VALUES (${computerId}::uuid, ${alice}::uuid, 'pending-delete', 7)`;
+            const pending = await seed(computerId, 'starting', marker, 35);
+            let observed = false, resume!: () => void;
+            const stalled = new Promise<void>(resolve => { resume = resolve; });
+            const sweep = restartAndObserve(async target => {
+                if (target.computerId !== computerId) return { state: 'starting' };
+                observed = true;
+                await stalled;
+                return { state: 'running' };
+            });
+            try {
+                await expect.poll(() => observed).toBe(true);
+                const rows = () => controlRows(client`id = ${pending.id}::uuid`);
+                const claimed = await rows();
+                await client`UPDATE public.ezil_computers SET deleted_at = now() WHERE id = ${computerId}::uuid`;
+                resume();
+                await sweep;
+                expect(await rows()).toEqual(claimed);
+                expect(claimed[0]).toMatchObject({ status: 'starting', reason: marker });
+            } finally { resume(); await sweep; }
+        });
+
+        it('does not observe or update orphaned receipts after the computer changes owner or is deleted', async () => {
+            const moved = randomUUID(), deleted = randomUUID();
+            await client`INSERT INTO public.ezil_computers (id, user_id, name, slot)
+                VALUES (${moved}::uuid, ${alice}::uuid, 'moved', 3), (${deleted}::uuid, ${alice}::uuid, 'deleted', 4)`;
+            const first = await seed(moved, 'starting', marker, 330);
+            const second = await seed(deleted, 'starting', marker, 330);
+            await client`UPDATE public.ezil_computers SET user_id = ${bob}::uuid WHERE id = ${moved}::uuid`;
+            await client`UPDATE public.ezil_computers SET deleted_at = now() WHERE id = ${deleted}::uuid`;
+            const rows = () => controlRows(client`id IN (${first.id}::uuid, ${second.id}::uuid)`);
+            const before = await rows();
+            const observed: string[] = [];
+            await restartAndObserve(async target => { observed.push(target.computerId); return { state: 'running' }; });
+            expect(observed).not.toContain(moved);
+            expect(observed).not.toContain(deleted);
+            expect(await rows()).toEqual(before);
         });
     });
 

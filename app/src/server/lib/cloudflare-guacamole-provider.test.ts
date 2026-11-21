@@ -394,6 +394,21 @@ describe('🔴 requestGuacamolePreview answers a hibernation wake early, and lab
         expect(result.reason).toBe('sandbox_starting');
     });
 
+    it('keeps the same admitted MCP request for its real late answer', async () => {
+        vi.useFakeTimers();
+        let answer!: (res: Response) => void;
+        const worker = vi.fn(() => new Promise<Response>(resolve => { answer = resolve; }));
+        vi.stubGlobal('fetch', worker);
+        const completion = requestGuacamolePreview(CONFIG, 'secret', INPUT, 'one-wake', { kind: 'v1' }, 'complete');
+        let settled = false;
+        void completion.then(() => { settled = true; });
+        await vi.advanceTimersByTimeAsync(SANDBOX_WAKE_ANSWER_BUDGET_MS + 1_000);
+        expect(settled).toBe(false);
+        answer(Response.json({ ok: true, guacamoleUrl: 'https://desktop.example/' }));
+        expect(await completion).toMatchObject({ ok: true });
+        expect(worker).toHaveBeenCalledTimes(1);
+    });
+
     it('the budget is well inside the client budget and nowhere near the Worker ceiling it replaces', () => {
         // 180_000 was the ceiling that produced the 187s dead end. The point of
         // the number is that it is an order of magnitude below it, and above

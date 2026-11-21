@@ -588,6 +588,7 @@ export async function requestGuacamolePreview(
     input: Omit<GuacamolePreviewRequest, 'token'>,
     correlationId: string = newCorrelationId(),
     auth: WorkerAuth = { kind: 'v1' },
+    wakeAnswer: 'progress' | 'complete' = 'progress',
 ): Promise<GuacamolePreviewResult> {
     if (!config.isConfigured) {
         // Deterministic by definition: no amount of retrying supplies a
@@ -626,7 +627,7 @@ export async function requestGuacamolePreview(
         let wakeTimer: ReturnType<typeof setTimeout> | undefined;
         let res: Response;
         try {
-            const answered = await Promise.race([
+            const answered = wakeAnswer === 'complete' ? await workerCall : await Promise.race([
                 workerCall,
                 new Promise<typeof WAKE_STILL_RUNNING>((resolve) => {
                     wakeTimer = setTimeout(() => resolve(WAKE_STILL_RUNNING), SANDBOX_WAKE_ANSWER_BUDGET_MS);

@@ -1,3 +1,6 @@
+import { editorDelegationEnabled } from '@/server/api/editor-delegation';
+import { reconcileColdStarts } from '@/server/computer-start/start';
+import type { SessionDb } from '@/server/agent-session/store';
 import { drainFeedbackNotifications } from '@/server/feedback/notifications';
 import { feedbackNotificationMailer } from '@/server/feedback/notification-mail';
 import { drainIncidentAlerts } from '@/server/telemetry/incident-alerts';
@@ -89,6 +92,12 @@ function aiPlanRefresh(now: Date) {
 export async function GET(req: Request): Promise<Response> {
     if (!env.CRON_SECRET) return new Response(null, { status: 404 });
     if (req.headers.get('authorization') !== `Bearer ${env.CRON_SECRET}`) return new Response(null, { status: 404 });
+    if (editorDelegationEnabled(process.env)) {
+        try {
+            const { observeCloudflareStart } = await import('@/server/computer-start/port');
+            await reconcileColdStarts(db as unknown as SessionDb, computer => observeCloudflareStart(db, computer));
+        } catch { console.warn('[computer.start] readiness sweep unavailable'); }
+    }
     // Independent of billing configuration: feedback notifications must retry even
     // when a billing dependency is unavailable. One send adds at most 5 seconds.
     try {
