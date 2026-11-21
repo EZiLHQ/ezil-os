@@ -1,4 +1,6 @@
 import { randomBytes } from 'node:crypto';
+import { createBrowserTabSession } from './mcp-tab-session.mjs';
+import { discardRefs } from './mcp-tab-actions.mjs';
 
 export const OBSERVE_PATH = '/internal/mcp-browser-observe';
 export const UNIVERSE_STAGING_ORIGIN = 'https://universe-staging.ezil.work';
@@ -45,7 +47,7 @@ function pageKind (url, origin) {
 }
 
 /** A short-lived handle binds an observation to the same actual Playwright page. */
-export function createMcpObservation (surface, { origin = UNIVERSE_STAGING_ORIGIN, now = Date.now } = {}) {
+export function createMcpObservation (surface, { origin = UNIVERSE_STAGING_ORIGIN, now = Date.now, ...options } = {}) {
     const sessions = new Map();
     const revisions = new WeakMap();
     let inFlight = 0;
@@ -85,7 +87,12 @@ export function createMcpObservation (surface, { origin = UNIVERSE_STAGING_ORIGI
         return { observed: expected, profileHeadingVisible: info.profileHeadingVisible, revision: before };
     }
 
-    async function observeBound (input, deadline) {
+    const ui = createBrowserTabSession(surface, sessions, revision, readPage, { ...options, now });
+
+    async function observeBound (input, deadline, signal) {
+        if (input && typeof input === 'object' && Object.hasOwn(input, 'action')) {
+            return ui(input, deadline, signal);
+        }
         if (!input || typeof input !== 'object' || Array.isArray(input)
             || !Object.keys(input).every(key => key === 'binding' || key === 'browserSessionId')
             || typeof input.binding !== 'string' || !/^[0-9a-f]{64}$/.test(input.binding)
@@ -94,7 +101,10 @@ export function createMcpObservation (surface, { origin = UNIVERSE_STAGING_ORIGI
         }
 
         for (const [id, session] of sessions) {
-            if (session.expires <= now() || session.page.isClosed()) sessions.delete(id);
+            if (session.expires <= now() || session.page.isClosed()) {
+                sessions.delete(id);
+                await discardRefs(session.refs);
+            }
         }
         const id = input.browserSessionId;
         try {
@@ -132,16 +142,18 @@ export function createMcpObservation (surface, { origin = UNIVERSE_STAGING_ORIGI
         }
     }
 
-    return async function observe (input) {
+    return async function observe (input, signal) {
         if (inFlight >= MAX_IN_FLIGHT) return failure('browser_unavailable');
         inFlight += 1;
-        const task = observeBound(input, Date.now() + READ_MS).finally(() => { inFlight -= 1; });
+        const task = observeBound(input, Date.now() + READ_MS, signal)
+            .catch(() => failure('browser_unavailable')).finally(() => { inFlight -= 1; });
         let timer;
         try {
             return await Promise.race([
                 task,
                 new Promise(resolve => {
-                    timer = setTimeout(() => resolve(failure('browser_unavailable')), READ_MS);
+                    const mutation = input?.action?.kind !== undefined && input.action.kind !== 'read';
+                    timer = setTimeout(() => resolve(failure(mutation ? 'browser_action_uncertain' : 'browser_unavailable')), READ_MS);
                 }),
             ]);
         } finally {

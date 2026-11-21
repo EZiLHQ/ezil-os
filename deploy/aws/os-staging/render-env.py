@@ -67,6 +67,7 @@ STAGING_EDITOR_SWITCHES = ("EZIL_DELEGATED_EDITOR_SESSIONS", "EZIL_EDITOR_BRIDGE
 STAGING_ONBOARDING = "EZIL_DELEGATED_ONBOARDING"
 STAGING_BROWSER_OBSERVE = "EZIL_DELEGATED_BROWSER_OBSERVE"
 STAGING_BROWSER_OPEN = "EZIL_DELEGATED_BROWSER_OPEN_URL"
+STAGING_BROWSER_CONTROL = "EZIL_DELEGATED_BROWSER_CONTROL"
 STAGING_BROWSER_ORIGINS = "EZIL_BROWSER_TEST_ALLOWED_ORIGINS"
 STAGING_PREVIEW_TOKEN_V2 = "EZIL_PREVIEW_TOKEN_V2"
 BROWSER_LOCAL_CONTROL_PORTS = frozenset((3000, 3002, 4243, 8080, 8181, 8443, 9090, 9222, 9223))
@@ -94,8 +95,10 @@ class RenderError(Exception):
 def validate(values, environment="staging"):
     if not isinstance(values, dict):
         raise RenderError("Expected a JSON object")
-    staging_keys = frozenset((STAGING_BROWSER_OBSERVE, STAGING_BROWSER_OPEN, STAGING_BROWSER_ORIGINS,
-                              STAGING_PREVIEW_TOKEN_V2, STAGING_ONBOARDING))
+    staging_keys = frozenset((
+        STAGING_BROWSER_OBSERVE, STAGING_BROWSER_OPEN, STAGING_BROWSER_CONTROL, STAGING_BROWSER_ORIGINS,
+        STAGING_PREVIEW_TOKEN_V2, STAGING_ONBOARDING,
+    ))
     allowed = REQUIRED | OPTIONAL | (staging_keys if environment == "staging" else frozenset())
     if any(key not in allowed and not REGIONAL.fullmatch(key) for key in values):
         raise RenderError("Unknown key refused")
@@ -130,7 +133,8 @@ def validate(values, environment="staging"):
         or values["EZIL_DELEGATION_AUDIENCE"] != "https://os-staging.ezil.work"
     ):
         raise RenderError("Staging onboarding requires the canonical staging delegation origins and complete pins")
-    for key, feature in ((STAGING_BROWSER_OBSERVE, "Browser observation"), (STAGING_BROWSER_OPEN, "Browser navigation")):
+    for key, feature in ((STAGING_BROWSER_OBSERVE, "Browser observation"), (STAGING_BROWSER_OPEN, "Browser navigation"),
+                         (STAGING_BROWSER_CONTROL, "Browser control")):
         setting = values.get(key)
         if setting not in (None, "enabled", "disabled"):
             raise RenderError(f"{feature} must be exactly enabled or disabled")

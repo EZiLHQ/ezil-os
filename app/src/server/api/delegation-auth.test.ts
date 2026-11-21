@@ -3,7 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 import {
-    authenticateBrowserDelegation, authenticateBrowserOpenDelegation, authenticateDelegation, delegatedReadsEnabled, delegationBinding, inputDigest, isDelegationHeader, parseDelegationConfig,
+    authenticateBrowserDelegation, authenticateBrowserPageDelegation, authenticateBrowserControlDelegation, authenticateBrowserOpenDelegation, authenticateDelegation, delegatedReadsEnabled, delegationBinding, inputDigest, isDelegationHeader, parseDelegationConfig,
     type DelegationConfig, type DelegationDeps,
 } from './delegation-auth';
 import {
@@ -267,5 +267,25 @@ describe('separate browser navigation delegation', () => {
         expect(consumeJti).not.toHaveBeenCalled();
         expect((await authenticateBrowserOpenDelegation(headers(navigation), d)).kind).toBe('accepted');
         expect(consumeJti).toHaveBeenCalledTimes(1);
+    });
+});
+
+describe('typed Browser page and action delegation', () => {
+    it('keeps page reads, action dispatch and the older Browser consent mutually scoped', async () => {
+        const read = { procedure: 'browserSession.readPage', scope: 'ezil:browser:page:read', input: 'synthetic exact read' };
+        const control = { procedure: 'browserSession.control', scope: 'ezil:browser:control', input: 'synthetic exact control' };
+        const claim = async ({ procedure, scope, input }: typeof read) => headers(await signAssertion(key,
+            readClaims(USER, 'computer.get', input, { scope, proc: procedure })));
+        const forRead = await claim(read);
+        const forControl = await claim(control);
+        const reader = deps({ binding: read });
+        const controller = deps({ binding: control });
+        expect(await authenticateBrowserPageDelegation(forControl, reader.d)).toMatchObject({ kind: 'rejected', reason: 'scope' });
+        expect(await authenticateBrowserControlDelegation(forRead, controller.d)).toMatchObject({ kind: 'rejected', reason: 'scope' });
+        expect(await authenticateBrowserDelegation(forRead, reader.d)).toMatchObject({ kind: 'rejected', reason: 'scope' });
+        expect(reader.consumeJti).not.toHaveBeenCalled();
+        expect(controller.consumeJti).not.toHaveBeenCalled();
+        expect(await authenticateBrowserPageDelegation(forRead, reader.d)).toMatchObject({ kind: 'accepted', call: { procedure: read.procedure } });
+        expect(await authenticateBrowserControlDelegation(forControl, controller.d)).toMatchObject({ kind: 'accepted', call: { procedure: control.procedure } });
     });
 });

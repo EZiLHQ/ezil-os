@@ -295,6 +295,8 @@ interface Env extends SandboxEnv {
   SANDBOX_BROWSER?: string;
   /** Opt-in delegated, read-only Browser observation on staging. */
   SANDBOX_MCP_BROWSER_OBSERVE?: string;
+  /** Stage-only owner-bound page reads and controls on an already active browser. */
+  SANDBOX_MCP_BROWSER_CONTROL?: string;
   /** Opt-in signed external Browser MCP on the staging Worker. */
   SANDBOX_MCP_BROWSER_OPEN?: string;
   /** Independently opt-in built-in Browser MCP in the running Code App. */
@@ -978,7 +980,7 @@ function deriveSandboxId(userId: string, scopeId?: string): string {
 interface EzilWorkspacePersistRpc {
   getImageId(): Promise<string | null>;
   runningContainerFetch(url: string, init?: RequestInit, port?: number): Promise<Response>;
-  observeExistingBrowser(body: string, deadline: number): Promise<Response>;
+  observeExistingBrowser(body: string, deadline: number, capability?: string): Promise<Response>;
   openBrowserUrl(body: string, deadline: number, sandboxId: string, cancelKey: string): Promise<Response>;
   cancelBrowserOpen(cancelKey: string): Promise<void>;
   stopRuntimeForAcceptance(sandboxId: string): Promise<TerminateReport>;
@@ -2774,7 +2776,7 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
     }
   }
   /** The delegated observer looks at a live desktop without booting or renewing it. */
-  async observeExistingBrowser(body: string, deadline: number): Promise<Response> {
+  async observeExistingBrowser(body: string, deadline: number, capability?: string): Promise<Response> {
     return this.withRuntimeMutation(async () => {
       if (!this.containerIsRunning() || await this.ctx.storage.get<boolean>(WORKSPACE_TERMINATED_KEY)
         || await this.migrationStartBlocked()) {
@@ -2784,7 +2786,9 @@ class EzilSandboxDO extends CFSandboxClass<Env> {
       if (remaining <= 0) return json({ ok: false, error: 'browser_unavailable' }, 503);
       return this.ctx.container!.getTcpPort(BROWSER_SIDECAR_PORT).fetch(
         'http://127.0.0.1:9223/internal/mcp-browser-observe',
-        { method: 'POST', body, headers: { 'content-type': 'application/json' }, signal: AbortSignal.timeout(remaining) },
+        { method: 'POST', body, headers: {
+          'content-type': 'application/json', ...(capability && { authorization: 'Bearer ' + capability }),
+        }, signal: AbortSignal.timeout(remaining) },
       );
     });
   }
@@ -7920,11 +7924,13 @@ async function browserOpenBootEnv(env: Env, sandboxId: string): Promise<Record<s
   const allowedOrigins = env.EZIL_BROWSER_TEST_ALLOWED_ORIGINS?.trim();
   const code = env.EZIL_CODE_BROWSER_MCP === 'on';
   const worker = env.SANDBOX_MCP_BROWSER_OPEN === 'on';
-  if (!allowedOrigins || (!code && !worker)) return {};
-  const capability = worker ? await workerBrowserOpenCapability(env, sandboxId) : null;
+  const control = env.SANDBOX_MCP_BROWSER_CONTROL === 'on';
+  if ((!allowedOrigins && !control) || (!code && !worker && !control)) return {};
+  const capability = worker || control ? await workerBrowserOpenCapability(env, sandboxId) : null;
   if (!code && !capability) return {};
   return {
-    EZIL_BROWSER_TEST_ALLOWED_ORIGINS: allowedOrigins,
+    ...(allowedOrigins && { EZIL_BROWSER_TEST_ALLOWED_ORIGINS: allowedOrigins }),
+    ...(control && capability ? { EZIL_WORKER_BROWSER_CONTROL: 'on' } : {}),
     ...(code ? { EZIL_CODE_BROWSER_MCP: 'on' } : {}),
     ...(capability ? { EZIL_WORKER_BROWSER_MCP_TOKEN: capability } : {}),
   };
@@ -8288,7 +8294,8 @@ const worker = {
 
     const observation = path.match(/^\/sandbox\/(guac-[a-z0-9]{16}-[a-z0-9]{16})\/browser-observe$/);
     if (method === 'POST' && observation) {
-      if (env.SANDBOX_MCP_BROWSER_OBSERVE !== 'on' || url.origin !== 'https://api-desktop-staging.ezil.work') {
+      if ((env.SANDBOX_MCP_BROWSER_OBSERVE !== 'on' && env.SANDBOX_MCP_BROWSER_CONTROL !== 'on')
+        || url.origin !== 'https://api-desktop-staging.ezil.work') {
         return json({ ok: false, error: 'browser_unavailable' }, 404);
       }
       const claims = verifiedV2Claims.get(request);
@@ -8301,14 +8308,30 @@ const worker = {
       try {
         const aws = await awsControlTarget(env, request, target, 'browser_observe');
         if (aws) return json({ ok: false, error: 'browser_unavailable' }, 409);
-        const input = await readBoundedBody(request, 1024);
+        const input = await readBoundedBody(request, 4096);
         if (input === 'too_large') return json({ ok: false, error: 'browser_invalid_request' }, 413);
         const body = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(input);
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(body);
+        } catch {
+          return json({ ok: false, error: 'browser_invalid_request' }, input.byteLength > 1024 ? 413 : 400);
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return json({ ok: false, error: 'browser_invalid_request' }, 400);
+        }
+        const modern = Object.hasOwn(parsed, 'action');
+        if (modern ? env.SANDBOX_MCP_BROWSER_CONTROL !== 'on' : env.SANDBOX_MCP_BROWSER_OBSERVE !== 'on') {
+          return json({ ok: false, error: 'browser_unavailable' }, 404);
+        }
+        if (!modern && input.byteLength > 1024) return json({ ok: false, error: 'browser_invalid_request' }, 413);
+        const capability = modern ? await workerBrowserOpenCapability(env, target) : undefined;
+        if (modern && !capability) return json({ ok: false, error: 'browser_unavailable' }, 503);
         const deadline = Math.min(claims.ts + 8_000, Date.now() + 8_000);
-        const upstream = await withDeadline(openSandbox(env, target).observeExistingBrowser(body, deadline), 8_000, 'browser.observe');
+        const upstream = await withDeadline(openSandbox(env, target).observeExistingBrowser(body, deadline, capability ?? undefined), 8_000, 'browser.observe');
         const remaining = deadline - Date.now();
         if (remaining <= 0) return json({ ok: false, error: 'browser_unavailable' }, 503);
-        const bytes = await withDeadline(readBoundedBody(upstream, 2048), remaining, 'browser.observe.body');
+        const bytes = await withDeadline(readBoundedBody(upstream, modern ? 96_000 : 2048), remaining, 'browser.observe.body');
         if (bytes === 'too_large') throw new Error('browser_oversized');
         return new Response(bytes, { status: upstream.status, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
       } catch {

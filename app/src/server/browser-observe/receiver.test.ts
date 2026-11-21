@@ -63,3 +63,70 @@ describe('delegated browser observation', () => {
         expect(await refused.json()).toEqual({ ok: false, error: 'browser_unavailable' });
     });
 });
+
+const requestId = '7bb70a50-cd7d-40f8-9539-45aee597ea48';
+const modern = {
+    ...safe,
+    observed: 'approved_page',
+    profileHeadingVisible: false,
+    pageUrl: 'https://example.com/',
+    pageTitle: 'Example Domain',
+    elements: [],
+    viewerFrame: null,
+};
+
+describe('delegated Browser UI session on the existing route', () => {
+    it('binds a modern attach and optional frame to a separate read scope', async () => {
+        const d = { ...deps(), controlEnabled: true };
+        const projected = { ...modern, viewerFrame: { mimeType: 'image/jpeg', base64: '/9j/2Q==' } };
+        d.observe.mockResolvedValueOnce(projected);
+        const raw = '{"action":{"kind":"read","includeFrame":true}}';
+        const response = await handleBrowserObserve(request(raw), d);
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual(projected);
+        expect(d.verify).toHaveBeenCalledWith(expect.any(Headers), 'EZIL-BROWSER-PAGE/1\nPOST\n' + path + '\n' + raw,
+            'browserSession.readPage', 'ezil:browser:page:read');
+        expect(d.target.mock.calls).toEqual([[principal, computer], [principal, computer]]);
+    });
+
+    it('binds a typed action to its distinct write scope and exact bytes', async () => {
+        const d = { ...deps(), controlEnabled: true };
+        d.observe.mockResolvedValueOnce(modern);
+        const raw = JSON.stringify({ browserSessionId, requestId, action: { kind: 'navigate', url: 'https://example.com/' } });
+        expect((await handleBrowserObserve(request(raw), d)).status).toBe(200);
+        expect(d.verify).toHaveBeenCalledWith(expect.any(Headers), 'EZIL-BROWSER-CONTROL/1\nPOST\n' + path + '\n' + raw,
+            'browserSession.control', 'ezil:browser:control');
+        expect(d.observe).toHaveBeenCalledWith(principal, computer, target, JSON.parse(raw));
+    });
+
+    it('rejects action gates, private URLs, arbitrary selectors and absent mutation handles before signing', async () => {
+        const d = { ...deps(), controlEnabled: true };
+        const allowed = '{"action":{"kind":"read"}}';
+        expect((await handleBrowserObserve(request(allowed), { ...d, controlEnabled: false })).status).toBe(404);
+        const invalid = [
+            { action: { kind: 'click', ref: 'a'.repeat(22) } },
+            { browserSessionId, action: { kind: 'click', selector: 'button' } },
+            { browserSessionId, action: { kind: 'navigate', url: 'https://127.0.0.1/' } },
+            { browserSessionId, action: { kind: 'navigate', url: 'https://example.com/?password=no' } },
+            { browserSessionId, action: { kind: 'type', ref: 'a'.repeat(22), text: 'x\nEnter' } },
+        ];
+        for (const value of invalid) {
+            expect((await handleBrowserObserve(request(JSON.stringify(value)), d)).status).toBe(400);
+        }
+        expect(d.verify).not.toHaveBeenCalled();
+        expect(d.observe).not.toHaveBeenCalled();
+    });
+
+    it('distinguishes a stale prior ref from an uncertain dispatched operation and blocks unsolicited frames', async () => {
+        const d = { ...deps(), controlEnabled: true };
+        const raw = JSON.stringify({ browserSessionId, requestId, action: { kind: 'click', ref: 'a'.repeat(22) } });
+        d.observe.mockResolvedValueOnce({ ok: false, error: 'browser_session_stale' });
+        expect((await handleBrowserObserve(request(raw), d)).status).toBe(409);
+        d.observe.mockRejectedValueOnce(new Error('no reply'));
+        expect(await (await handleBrowserObserve(request(raw), d)).json())
+            .toEqual({ ok: false, error: 'browser_action_uncertain' });
+        d.observe.mockResolvedValueOnce({ ...modern, viewerFrame: { mimeType: 'image/jpeg', base64: '/9j/2Q==' } });
+        expect(await (await handleBrowserObserve(request(raw), d)).json())
+            .toEqual({ ok: false, error: 'browser_action_uncertain' });
+    });
+});
