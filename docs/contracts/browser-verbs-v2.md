@@ -39,7 +39,9 @@ minted on one tab matching a leftover `data-ezil-ref` on another.
 
 - Tier origins come **only** from `EZIL_BROWSER_OWNER_APP_ORIGINS` and `EZIL_BROWSER_IDP_ORIGINS`
   (staging: `https://universe-staging.ezil.work` and `https://id.ezil.work`). Each is a comma list of bare https
-  origins. A malformed entry empties that tier (fail closed) and logs once at boot. An origin in both lists is
+  origins. **A malformed entry in either variable breaks the whole policy: every URL is then `idp_transit`**
+  (fail closed for every caller; amended 2026-11-21 after the sidecar lane showed that emptying only that tier
+  fails open) and the fault logs once at boot. Unset variables are not malformed. An origin in both lists is
   `idp_transit`. `EZIL_BROWSER_TEST_ALLOWED_ORIGINS` is never a tier source (it also widens Code chats).
 - `tierOf(url)` returns `owner_app | idp_transit | other`. `other` is exact v1 behaviour plus the v2 verbs.
 - **`idp_transit` is transit only.** Allowed: `GET /health`, `POST /navigate`, `POST /wait_for` with `time`
@@ -48,6 +50,9 @@ minted on one tab matching a leftover `data-ezil-ref` on another.
   acts on it; sign-in there is the user's.
 - The tier is evaluated on the page the verb acts on, immediately before acting. A verb that navigates (click,
   `type{submit}`, `press Enter`) may land on any tier; its returned `url` is sanitised.
+  Page text that leaves the sidecar (snapshot text, `get_text` markdown, titles) also passes through `sanitizeText`.
+  On the Code loopback, a `navigate` (or any verb) that lands on a denied tier answers `origin_read_only` with no
+  title or URL.
 - **`sanitizeUrl(url)`**: an `idp_transit` URL becomes origin + path. Any URL whose query or fragment has a
   parameter in `SENSITIVE_URL_PARAMS` (`code, state, id_token, access_token, refresh_token, token,
   session_transfer_token, nonce, ticket, code_verifier`) loses its whole query and fragment. Applied at the
