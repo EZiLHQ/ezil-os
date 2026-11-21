@@ -193,7 +193,7 @@ run() {
   case "$DECISION" in authorized|not_opted_in) ;; *) exit 1 ;; esac
   trap 'if [ -n "$WINDOW_DIR" ]; then rm -rf -- "$WINDOW_DIR"; fi' EXIT
   trap on_signal TERM INT HUP
-  log "starting (browser $(basename "$BROWSER_BIN"), profile $PROFILE_DIR, editor 127.0.0.1:${CODE_SERVER_PORT})"
+  log "starting consent monitor for the private workbench"
   local attempt=0 tries
   while true; do
     [ -f "$SHUTDOWN_FLAG" ] && { log "stopping: desktop shutdown"; exit 0; }
