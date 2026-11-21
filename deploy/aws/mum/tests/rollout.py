@@ -1486,6 +1486,41 @@ class ProductionObserverGroupingTests(unittest.TestCase):
         self.assertEqual(set(self.rows(candidate)[-1]['Resource']), set(self.rows(before)[-1]['Resource']))
         self.validate_image_transition(before, candidate)
 
+    def test_retained_observer_compaction_is_only_an_exact_preparatory_change(self):
+        before = self.with_launch_image(self.before, '7')
+        policy = cfn.PRODUCTION_LIFECYCLE_RETAINED_POLICY
+        second = self.v('lifecycle', 0)
+        before['Resources'][second] = copy.deepcopy(before['Resources'][self.v('lifecycle', 1)])
+        self.rows(before, policy).append(self.grant(second))
+        compacted = cfn.compact_retained_lifecycle_grants(before)
+        self.assertEqual(cfn.retained_lifecycle_observer_rows(compacted['Resources']), self.rows(before, policy))
+        self.assertLess(len(json.dumps(self.rows(compacted, policy))), len(json.dumps(self.rows(before, policy))))
+        self.assertEqual(cfn.compact_retained_lifecycle_grants(compacted), compacted)
+        self.assertEqual(cfn.carry_production_predecessor(before, compacted), compacted)
+        self.assertEqual(set(self.validate_image_transition(before, compacted)), {policy})
+
+        next_image = self.with_launch_image(self.after, '8', '7')
+        next_image['Resources'][second] = copy.deepcopy(before['Resources'][second])
+        next_image['Resources'][policy] = copy.deepcopy(compacted['Resources'][policy])
+        with self.assertRaisesRegex(ValueError, 'exact preparatory change'):
+            self.validate_image_transition(before, next_image)
+        self.validate_image_transition(compacted, next_image)
+
+        for change in ('condition', 'new_ref', 'role', 'second_state'):
+            candidate = copy.deepcopy(compacted)
+            properties = candidate['Resources'][policy]['Properties']
+            group = properties['PolicyDocument']['Statement'][0]
+            if change == 'condition':
+                group['Condition'] = {'StringEquals': {'aws:RequestedRegion': 'ap-south-1'}}
+            elif change == 'new_ref':
+                group['Resource'][1] = {'Ref': self.v('lifecycle', 2)}
+            elif change == 'role':
+                properties['Roles'] = [{'Ref': cfn.IMAGE_RECOVERY_ROLE}]
+            else:
+                candidate['Resources'][cfn.LIFECYCLE_CONTROLLER]['Properties']['Path'] = '/changed/'
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.validate_image_transition(before, candidate)
+
     def test_launch_image_scope_refuses_malformed_or_extra_iam_even_if_reviewed(self):
         before = self.with_launch_image(self.before, '6', '4')
         valid = self.with_launch_image(self.after, '7', '6')
@@ -2725,8 +2760,11 @@ class IntegrationTests(unittest.TestCase):
         plan=RELEASE.load_plan(self.path);ledger=RELEASE.load_ledger(self.ledger)
         with patch.object(RELEASE,'load_plan',return_value=dict(plan,maintenance=True)):
             self.assert_no_mutation(lambda:RELEASE.append_ledger(self.ledger,ledger,self.path,plan,'apply-app',self.envelope,self.source,'e'*40),'plan changed before ledger append')
-        with patch.object(RELEASE,'load_ledger',return_value={**ledger,'entries':[]}):
-            self.assert_no_mutation(lambda:RELEASE.append_ledger(self.ledger,ledger,self.path,plan,'apply-app',self.envelope,self.source,'e'*40),'ledger changed during operation')
+        changed = copy.deepcopy(ledger)
+        changed['entries'][-1]['secretVersionId'] = 'different-version'
+        TOOL.write(self.ledger, changed)
+        self.assertEqual(RELEASE.load_ledger(self.ledger), changed)
+        self.assert_no_mutation(lambda:RELEASE.append_ledger(self.ledger,ledger,self.path,plan,'apply-app',self.envelope,self.source,'e'*40),'ledger changed during operation')
 
     def test_dry_run_and_failed_app_verification_do_not_append_ledger(self):
         self.through_app();original=RELEASE.load_ledger(self.ledger)

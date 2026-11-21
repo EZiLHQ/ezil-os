@@ -9,7 +9,6 @@ import fnmatch
 from collections import Counter
 import hashlib
 import json
-from fnmatch import fnmatchcase
 from pathlib import Path
 import time
 
@@ -579,8 +578,8 @@ def projected_observer_grant(logical, left, right, target):
 
 
 def _groups_observer_grants(policy_logical):
-    """Only the PRD lifecycle controller default policy may group its exact observer grants (aggregate role quota)."""
-    return context.NAMESPACE == 'prd' and policy_logical == LIFECYCLE_CONTROLLER_POLICY
+    """Both exact production controller attachments can group their own immutable observer grants."""
+    return context.NAMESPACE == 'prd' and policy_logical in (LIFECYCLE_CONTROLLER_POLICY, PRODUCTION_LIFECYCLE_RETAINED_POLICY)
 
 
 def _grouped_observer_refs(row):
@@ -805,7 +804,7 @@ def production_launch_image(resources, deployment):
             continue
         for row in statements(policy):
             actions = action_set(row)
-            if row.get('Effect') != 'Allow' or not any(fnmatchcase('ec2:runinstances', action) for action in actions):
+            if row.get('Effect') != 'Allow' or not any(fnmatch.fnmatchcase('ec2:runinstances', action) for action in actions):
                 continue
             targets = row.get('Resource')
             if isinstance(targets, str):
@@ -850,6 +849,52 @@ def bind_production_launch_images(before, after, source_ami, candidate_ami):
              'production launch images disagree with the admitted source and candidate')
 
 
+def retained_lifecycle_observer_rows(resources):
+    legacy = resources.get(PRODUCTION_LIFECYCLE_RETAINED_POLICY, {})
+    legacy_properties = legacy.get('Properties', {})
+    raw = list(statements(legacy))
+    legacy_rows = _observer_invoke_rows(legacy, PRODUCTION_LIFECYCLE_RETAINED_POLICY)
+    need(raw == legacy_rows or (len(raw) == 1 and len(legacy_rows) >= 2 and isinstance(raw[0].get('Resource'), list)),
+         'retained lifecycle policy must contain only exact immutable observer grants')
+    need(legacy.get('Type') == 'AWS::IAM::Policy'
+         and legacy_properties.get('PolicyName') == PRODUCTION_LIFECYCLE_RETAINED_POLICY
+         and legacy_properties.get('Roles') == [{'Ref': LIFECYCLE_CONTROLLER}]
+         and bool(legacy_rows), 'production retained lifecycle policy identity mismatch')
+    for row in legacy_rows:
+        target = row.get('Resource')
+        need(set(row) == {'Action', 'Effect', 'Resource'} and row.get('Effect') == 'Allow'
+             and action_set(row) == {'lambda:invokefunction'} and isinstance(target, dict)
+             and set(target) == {'Ref'} and isinstance(target['Ref'], str),
+             'retained lifecycle policy must use exact immutable observer grants')
+        logical = target['Ref']
+        version = resources.get(logical, {})
+        need(manifest.matches(r'LifecycleObserverCurrentVersion[0-9A-F]{8}[a-f0-9]{32}', logical)
+             and version.get('Type') == 'AWS::Lambda::Version'
+             and version.get('Properties') == {'FunctionName': {'Ref': LIFECYCLE_OBSERVER}}
+             and version.get('DeletionPolicy') == version.get('UpdateReplacePolicy') == 'Retain',
+             'retained lifecycle policy must invoke its own retained observer version')
+    need(len({row['Resource']['Ref'] for row in legacy_rows}) == len(legacy_rows),
+         'duplicate retained lifecycle observer grant')
+    return legacy_rows
+
+
+def compact_retained_lifecycle_grants(template):
+    """Make a preparatory policy-only template with the same exact retained grants."""
+    from copy import deepcopy
+
+    resources = template['Resources']
+    need(_image_mode(template) and _production_split_recovery(resources),
+         'retained grant compaction requires the production image-mode graph')
+    grants = retained_lifecycle_observer_rows(resources)
+    compacted = deepcopy(template)
+    if len(grants) > 1:
+        view = compacted['Resources'][PRODUCTION_LIFECYCLE_RETAINED_POLICY]['Properties']['PolicyDocument']
+        group = {**grants[0], 'Resource': [row['Resource'] for row in grants]}
+        _grouped_observer_refs(group)
+        view['Statement'] = [group]
+    return compacted
+
+
 def carry_production_predecessor(before, synthesized, *, compact_observer_grants=False, retain_launch_image=True):
     """Carry the exact PRD split rollback resources into a local CDK template.
 
@@ -885,28 +930,16 @@ def carry_production_predecessor(before, synthesized, *, compact_observer_grants
         else:
             rows.append(deepcopy(row))
 
-    legacy = old.get(PRODUCTION_LIFECYCLE_RETAINED_POLICY, {})
-    legacy_properties = legacy.get('Properties', {})
-    legacy_rows = list(statements(legacy))
-    need(legacy.get('Type') == 'AWS::IAM::Policy'
-         and legacy_properties.get('PolicyName') == PRODUCTION_LIFECYCLE_RETAINED_POLICY
-         and legacy_properties.get('Roles') == [{'Ref': LIFECYCLE_CONTROLLER}]
-         and bool(legacy_rows), 'production retained lifecycle policy identity mismatch')
-    for row in legacy_rows:
-        target = row.get('Resource')
-        need(set(row) == {'Action', 'Effect', 'Resource'} and row.get('Effect') == 'Allow'
-             and action_set(row) == {'lambda:invokefunction'} and isinstance(target, dict)
-             and set(target) == {'Ref'} and isinstance(target['Ref'], str),
-             'retained lifecycle policy must use exact immutable observer grants')
-        logical = target['Ref']
-        version = old.get(logical, {})
-        need(manifest.matches(r'LifecycleObserverCurrentVersion[0-9A-F]{8}[a-f0-9]{32}', logical)
-             and version.get('Type') == 'AWS::Lambda::Version'
-             and version.get('Properties') == {'FunctionName': {'Ref': LIFECYCLE_OBSERVER}}
-             and version.get('DeletionPolicy') == version.get('UpdateReplacePolicy') == 'Retain',
-             'retained lifecycle policy must invoke its own retained observer version')
-        carry_resource(logical)
-    carry_resource(PRODUCTION_LIFECYCLE_RETAINED_POLICY)
+    legacy = PRODUCTION_LIFECYCLE_RETAINED_POLICY
+    for row in retained_lifecycle_observer_rows(old):
+        carry_resource(row['Resource']['Ref'])
+    if legacy in new and new[legacy] != old[legacy]:
+        # Free quota before a later changeset expands the default policy. A
+        # different action/resource or concurrent resize is refused.
+        need(retain_launch_image and candidate == compact_retained_lifecycle_grants(before),
+             'retained grant compaction must be an exact preparatory change')
+    else:
+        carry_resource(legacy)
 
     previous = transition_observer_versions(before)
     for key, (policy, function, prefix) in TRANSITION_OBSERVERS.items():
