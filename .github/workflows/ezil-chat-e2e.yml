@@ -11,12 +11,20 @@ on:
       - 'e2e/copilot-ezil*'
       - 'e2e/staging-code-journey*'
       - 'e2e/staging-deployed-evidence*'
+      - '.github/actions/setup-playwright/**'
       - '.github/workflows/ezil-chat-e2e.yml'
+      - 'app/src/app/api/shell/code-preview-url/**'
+      - 'app/src/app/app/**'
+      - 'extensions/ezil-models/**'
+      - 'shell/ezil/apps/code*'
       - 'worker/Dockerfile'
       - 'worker/copilot-chat/**'
       - 'worker/ezil-models/**'
       - 'worker/scripts/editor-state.sh'
       - 'worker/scripts/start-neko.sh'
+      - 'worker/src/ai-proxy*.ts'
+      - 'worker/src/index.ts'
+      - 'worker/src/terminal-keepalive*.ts'
   workflow_dispatch:
     inputs:
       image:
