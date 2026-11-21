@@ -134,6 +134,8 @@ export type AppFailureInput = {
     model: string;
     clientRequestId?: string;
     gatewayRequestId?: string;
+    /** Status of the actual response, if headers arrived before the failure. */
+    httpStatus?: number;
     /** Sends made so far in this turn; omitted from the record when none was made. */
     attempts: number;
     durationMs: number;
@@ -144,7 +146,8 @@ export type AppFailureInput = {
 export function appFailure(input: AppFailureInput): AppFailure {
     const cancelled = input.outcome === 'cancelled';
     const error = cancelled ? undefined : input.error instanceof GatewayError || input.error instanceof GatewayResponseError ? input.error : undefined;
-    const status = error instanceof GatewayError && integer(error.status ?? NaN, 100, 599) ? error.status : undefined;
+    const observedStatus = (error instanceof GatewayError ? error.status : undefined) ?? input.httpStatus;
+    const status = !cancelled && observedStatus !== undefined && integer(observedStatus, 100, 599) ? observedStatus : undefined;
     let code: string;
     let streamReason: StreamReason | undefined;
     let stage = input.stage;

@@ -670,15 +670,17 @@ class Agent:
                 keep_alive, work, reason = False, None, "desktop_not_running"
             else:
                 keep_alive, work, reason = terminal_work.verdict(terminal_work.probe(self.cfg), idle_seconds)
+            code_inferences = work[2] if work is not None and len(work) == 3 else 0
             if keep_alive:
-                t, j = work
-                self.log(f"idle stop held: tmuxSessions/terminalJobs={t}/{j} reason={reason} idle={int(idle_seconds)}s")
+                self.log(f"idle stop held: tmuxSessions/terminalJobs={work[0]}/{work[1]} "
+                         f"activeCodeInferences={code_inferences} reason={reason} idle={int(idle_seconds)}s")
             elif reason != "no_terminal_work":
                 counts = f"{work[0]}/{work[1]}" if work is not None else None
-                self.log(f"terminal hold: none (tmuxSessions/terminalJobs={counts or 'unknown'} reason={reason})")
-            return keep_alive
+                self.log(f"terminal hold: none (tmuxSessions/terminalJobs={counts or 'unknown'} "
+                         f"activeCodeInferences={code_inferences} reason={reason})")
+            return reason if keep_alive else None
         except Exception:  # noqa: BLE001 — a crash must not renew presence on restart
-            return False
+            return None
 
     def tick(self):
         with self.lock:
@@ -725,8 +727,9 @@ class Agent:
             # native_work: real model/tool activity under a fresh authority answer (<= 30 s, prompt <= 120 s).
             self.log(f"idle stop held: native_work idle={int(now - self.last_presence)}s")
             return "held_native"
-        if self._terminal_hold(now - self.last_presence):
-            return "held_terminal"
+        work_hold = self._terminal_hold(now - self.last_presence)
+        if work_hold:
+            return "held_code_inference" if work_hold == "active_code_inference" else "held_terminal"
         # The probe can take up to 30 s; a user who came back meanwhile is present again.
         if not idle_due(self.last_presence, self.clock(), self.cfg.idle["inactivitySeconds"]):
             return "active"

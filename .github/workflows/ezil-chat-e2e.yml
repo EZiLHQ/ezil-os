@@ -9,6 +9,8 @@ on:
   pull_request:
     paths:
       - 'e2e/copilot-ezil*'
+      - 'e2e/staging-code-journey*'
+      - 'e2e/staging-deployed-evidence*'
       - '.github/workflows/ezil-chat-e2e.yml'
       - 'worker/Dockerfile'
       - 'worker/copilot-chat/**'
@@ -68,6 +70,8 @@ jobs:
           docker pull "$INPUT_IMAGE"
           echo "EZIL_E2E_IMAGE=$INPUT_IMAGE" >> "$GITHUB_ENV"
       - uses: ./.github/actions/setup-playwright
+      - name: Verify staging evidence runner against isolated fixtures
+        run: node --test e2e/staging-deployed-evidence.test.mjs e2e/staging-code-journey.test.mjs
       - name: EZiL Chat image e2e
         env:
           EZIL_COPILOT_E2E_OUT: ${{ runner.temp }}/ezil-chat-e2e

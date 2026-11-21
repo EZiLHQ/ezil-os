@@ -1,8 +1,8 @@
 """SIGNAL C on AWS: terminal work in the desktop container holds an idle stop.
 
-worker/src/terminal-keepalive.ts is the spec: any tmux session or terminal foreground
-job holds the stop for at most 8 hours after presence. Unknown means no hold, so a
-failed probe leaves the ordinary idle predicate in charge. Keep SCRIPT verbatim.
+worker/src/terminal-keepalive.ts is the spec. Terminal work and active Code inference
+hold the stop for at most 8 hours after presence. Unknown means no hold. Keep SCRIPT
+verbatim.
 """
 import re
 import subprocess
@@ -22,17 +22,49 @@ SCRIPT = "\n".join([
     '  done',
     'fi',
     "j=$(ps -e -o pid=,sid=,pgid=,tpgid=,tty= 2>/dev/null | awk '$1 == $2 && $5 ~ /^pts\\// && $4 > 0 && $4 != $3 { n++ } END { print n + 0 }')",
-    'echo "$t ${j:-0}"',
+    'a=$(python3 -I -S - 2>/dev/null <<\'EZIL_CODE_INFERENCE\'',
+    'import itertools, os, re, stat, time',
+    'count = 0',
+    'try:',
+    '    fd = os.open("/tmp/ezil-code-ai-activity", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)',
+    'except OSError:',
+    '    fd = None',
+    'if fd is not None:',
+    '    try:',
+    '        directory = os.fstat(fd)',
+    '        if stat.S_IMODE(directory.st_mode) != 0o700:',
+    '            raise SystemExit(0)',
+    '        now = time.time_ns()',
+    '        with os.scandir(fd) as entries:',
+    '            for entry in itertools.islice(entries, 256):',
+    '                marker = re.fullmatch(r"([1-9][0-9]{0,6})-[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}", entry.name)',
+    '                if marker is None:',
+    '                    continue',
+    '                try:',
+    '                    info = entry.stat(follow_symlinks=False)',
+    '                    if (stat.S_ISREG(info.st_mode) and stat.S_IMODE(info.st_mode) == 0o600',
+    '                            and info.st_uid == directory.st_uid and info.st_nlink == 1',
+    '                            and 0 <= now - info.st_mtime_ns <= 60_000_000_000):',
+    '                        os.kill(int(marker[1]), 0)',
+    '                        count += 1',
+    '                except OSError:',
+    '                    continue',
+    '    finally:',
+    '        os.close(fd)',
+    'print(count)',
+    'EZIL_CODE_INFERENCE',
+    ')',
+    'echo "$t ${j:-0} ${a:-0}"',
     '',
 ])
 
 
 def parse(stdout):
-    """The probe's two ASCII counts, or None; match JS Number.isSafeInteger."""
-    match = re.fullmatch(r"([0-9]+) ([0-9]+)", str(stdout or "").strip())
+    """Read two or three ASCII counts, matching JS Number.isSafeInteger."""
+    match = re.fullmatch(r"([0-9]+) ([0-9]+)(?: ([0-9]+))?", str(stdout or "").strip())
     if not match:
         return None
-    counts = tuple(value.lstrip("0") or "0" for value in match.groups())
+    counts = tuple(value.lstrip("0") or "0" for value in match.groups() if value is not None)
     # Bound before int() so long counts cannot hit Python's integer conversion limit.
     if any(len(value) > 16 for value in counts):
         return None
@@ -50,10 +82,12 @@ def verdict(probe, idle_seconds):
     work = parse(stdout)
     if work is None:
         return False, None, "unparseable"
-    if work == (0, 0):
+    if not any(work):
         return False, work, "no_terminal_work"
     if not (idle_seconds < TERMINAL_KEEPALIVE_MAX_SECONDS):
         return False, work, "terminal_keepalive_expired"
+    if len(work) == 3 and work[2] > 0:
+        return True, work, "active_code_inference"
     return True, work, "live_tmux_sessions" if work[0] > 0 else "running_terminal_jobs"
 
 

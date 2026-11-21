@@ -908,9 +908,10 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
 
   if (!upstream.ok) {
     // Gateway errors are a bounded, allow-listed envelope; never echo messages or credentials.
+    let bodyOutcome: string | undefined;
     try {
       const bytes = await readLimited(passThrough(upstream.body, deps.idleTimeoutMs ?? AI_PROXY_IDLE_TIMEOUT_MS,
-        false, () => {}, abort, false, false, firstByte), MAX_ERROR_BODY_BYTES);
+        false, outcome => { bodyOutcome = outcome; }, abort, false, false, firstByte), MAX_ERROR_BODY_BYTES);
       const error = safeGatewayError(bytes);
       // A positive wallet is a real request-size refusal even while another grant is pending.
       if ((error.code === 'insufficient_credits' || error.code === 'no_live_grant')
@@ -930,7 +931,13 @@ export async function handleAiProxyRequest(request: Request, deps: AiProxyDeps):
       return new Response(JSON.stringify({ error }), { status: upstream.status, headers: outHeaders });
     } catch {
       cleanup();
-      return proxyError(504, 'os_ai_unavailable', 'EZiL AI did not finish its error response. Retry the request.');
+      const correlationId = requestId !== null && UUID.test(requestId) ? requestId : null;
+      const disconnected = request.signal.aborted;
+      log({ status: 504, code: 'os_ai_unavailable', upstream_status: upstream.status, request_id: correlationId,
+        outcome: disconnected && bodyOutcome === 'upstream_error' ? 'client_cancelled' : bodyOutcome,
+        ...(disconnected ? { detail: 'client_disconnected' } : {}) });
+      return proxyError(504, 'os_ai_unavailable', 'EZiL AI did not finish its error response. Retry the request.',
+        correlationId ? { 'x-ezil-request-id': correlationId } : {});
     }
   }
 

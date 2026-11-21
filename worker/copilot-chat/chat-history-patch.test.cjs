@@ -19,6 +19,30 @@ const between = (code, start, end) => {
   const j = code.indexOf(end, i); assert(j > i, `missing ${end.slice(0, 40)}`);
   return code.slice(i, j);
 };
+
+function restoreRequest(code, raw, local = true) {
+  const method = between(code, '_deserializeRequest(e){', 'reviveVariableData(e){');
+  const deserialize = new Function('yH', 'v2o', 'A4i', 'h8o', 'Yi', 'oUe', 'Ws',
+    'return ({' + method + '})._deserializeRequest;')(
+    class { constructor(opts) { Object.assign(this, opts, { id: opts.restoredId, shouldBeBlocked: { get: () => false } }); } },
+    value => value, () => undefined, value => value, (part, fields) => Object.keys(fields).every(key => key in part),
+    class { constructor(opts) { Object.assign(this, opts); } },
+    { parseLocalSessionId: () => local ? 'local-session' : undefined },
+  );
+  return deserialize.call({ reviveVariableData: () => ({ variables: [] }) }, raw);
+}
+
+function renderedErrors(code, response) {
+  const expression = between(code, 'e.model.response===e.model.entireResponse&&(!e.isCanceled', ';let a=this.getChatFileChangesSummaryPart(e)');
+  const errors = [];
+  const content = response.responseContent;
+  new Function('e', 'n', 'O$', 'QGi', expression).call({}, {
+    isCanceled: response.modelState.value === 2,
+    errorDetails: response.result?.errorDetails,
+    model: { response: content, entireResponse: content },
+  }, errors, 'Canceled', () => undefined);
+  return errors.map(error => error.errorDetails);
+}
 // A fixed stdin script, never a caller-supplied command string: editor-state.sh is sourced from $1 and the
 // remaining paths stay positional arguments, so spaces, quotes and $(...) in them are never evaluated.
 const PREPARE_EDITOR = 'set -euo pipefail\n. "$1"\nshift\nexport EZIL_HOSTS_FILE="$3"; : >"$3"; ezil_editor_prepare "$1" "$2"\n';
@@ -161,6 +185,64 @@ const log = (id, { title, location = 'panel', requests = [request('Fix the login
       assert.equal(await down.ready(), path.join(wsHome, 'down', 'chatSessions'));
       assert.equal(down.calls.stat, 6);
       assert(down.calls.logs.some(l => l[0] === 'error' && /unreadable/.test(l[1])));
+    });
+
+    await t.test('restoring a pending JSON turn keeps the prompt and shows an interruption without replay', async () => {
+      const prompt = 'Fix the login form with the nonstreaming model';
+      const original = { ...request(prompt, 1000), modelId: 'ezil:us.moonshotai.kimi-k3', modelState: { value: 0 } };
+      const file = path.join(chat, 'pending-kimi.jsonl');
+      fs.writeFileSync(file, log('pending-kimi', { requests: [original] }));
+      try {
+        const { store } = make();
+        const saved = await store.readSession('pending-kimi');
+        assert.deepEqual(saved.value.requests, [original]);
+        const recovered = restoreRequest(code, saved.value.requests[0]);
+        assert.equal(recovered.message.text, prompt);
+        assert.deepEqual(recovered.response.responseContent, []);
+        assert.equal(recovered.response.modelState.value, 2);
+        const warning = {
+          code: 'ezil_turn_interrupted',
+          message: 'This response was interrupted before it finished. Review any changes before retrying.',
+        };
+        assert.deepEqual(renderedErrors(code, recovered.response), [warning]);
+
+        const partial = [{ kind: 'markdownContent', content: { value: 'I made one change.' } }];
+        const needsInput = restoreRequest(code, { ...original, response: partial, modelState: { value: 4 } });
+        assert.deepEqual(needsInput.response.responseContent, partial);
+        assert.deepEqual(renderedErrors(code, needsInput.response), [warning]);
+        const reopenedAgain = restoreRequest(code, {
+          ...original, modelState: recovered.response.modelState, result: recovered.response.result,
+        });
+        assert.deepEqual(renderedErrors(code, reopenedAgain.response), [warning]);
+        for (const state of [1, 2]) {
+          const settled = restoreRequest(code, { ...original, modelState: { value: state, completedAt: 2000 } });
+          assert.equal(settled.response.modelState.value, state);
+          assert.deepEqual(renderedErrors(code, settled.response), []);
+        }
+        assert.deepEqual(renderedErrors(code, restoreRequest(code, original, false).response), []);
+        const existing = { code: 'other_error', message: 'Prior provider error' };
+        const priorError = restoreRequest(code, { ...original, result: { errorDetails: existing } });
+        assert.deepEqual(priorError.response.result?.errorDetails, existing);
+      } finally {
+        fs.unlinkSync(file);
+      }
+    });
+
+    await t.test('auto-approve and Autopilot progress describe scheduled retries without claiming success', () => {
+      const extension = fs.readFileSync(path.join(root, 'extensions/copilot/dist/extension.js'), 'utf8');
+      assert.doesNotMatch(extension, /(?:Autopilot )?[Rr]ecovered from a request error/);
+      const progress = between(extension,
+        'this.options.request.permissionLevel==="autopilot"?this.showAutopilotProgress(n,wl.t("Autopilot: request failed. Retrying',
+        ',await Li(1e3,r);continue}');
+      const runProgress = new Function('n', 'wl', 'return ' + progress);
+      for (const [permissionLevel, pending, scheduled] of [
+        ['autoApprove', 'Request failed. Retrying…', 'Retry scheduled after a request error'],
+        ['autopilot', 'Autopilot: request failed. Retrying…', 'Autopilot scheduled a retry after a request error'],
+      ]) {
+        const output = Symbol('progress stream');
+        const context = { options: { request: { permissionLevel } }, showAutopilotProgress: (...args) => args };
+        assert.deepEqual(runProgress.call(context, output, { t: value => value }), [output, pending, scheduled]);
+      }
     });
 
     fs.writeFileSync(path.join(chat, 'a.jsonl'), log('a', { title: 'Named', more: [{ kind: 2, k: ['requests'], v: [request('follow-up', 3000)], i: 1 }] }));

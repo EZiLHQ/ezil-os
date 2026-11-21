@@ -463,6 +463,13 @@ const lastAsk = () => asks.at(-1);
     ok(await t.len() === lenR + 1 && await t.address() === REPO_ADDR, `repo: one entry, and the address keeps the repository's keys alone [${lenR} -> ${await t.len()}, ${await t.address()}]`);
     await t.page.goBack();
     ok(await t.waitEditor('/workspace/projects/0e0e0e0e-0e0e-4e0e-8e0e-0e0e0e0e0e0e') && await t.address() === REPO_ADDR, 'repo: Back returns to the repository folder');
+    const beforeReload = mints;
+    await t.page.reload();
+    ok(await t.waitEditor('/workspace/projects/0e0e0e0e-0e0e-4e0e-8e0e-0e0e0e0e0e0e') && mints === beforeReload + 1
+        && lastAsk().repository?.url === 'https://github.com/octocat/Hello-World.git', 'repo: reload reopens the same authorized repository with one mint');
+    const lifecycle = await t.page.evaluate(() => JSON.parse(sessionStorage.getItem('ezil-os:code-lifecycle:v1')));
+    ok(lifecycle.entries.some(item => item.code === 'page_hidden') && lifecycle.entries.some(item => item.code === 'opened_after_reload'),
+        'repo: the bounded diagnostics distinguish the old document leaving and the replacement opening');
     // Outside the checkout the person is in their own files: `folder` alone.
     await t.editorFrame().evaluate(() => window.openFolder('/workspace/b'));
     ok(await t.waitAddress('/app/code?folder=/workspace/b'), `repo: a folder outside the checkout is the person's own files [${await t.address()}]`);

@@ -696,6 +696,34 @@ try {
         diagnosticsSchema.parse(snapshot);
         delete window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle;
     });
+    await check('consented feedback includes only the current checkout lifecycle codes and ages', () => {
+        const key = 'ezil-os:code-lifecycle:v1';
+        const userId = window.__EZIL_BOOT__.user.id;
+        const now = Date.now();
+        window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle = true;
+        window.sessionStorage.setItem(key, JSON.stringify({ userId, computerId, entries: [
+            { code: 'opened', t: now - 31 * 60_000 },
+            { code: 'page_hidden', t: now - 100, extra: 'private_fixture_url' },
+            { code: 'opened_after_reload', t: now - 50 },
+            { code: 'attacker_supplied_code', t: now - 10 },
+        ] }));
+        try {
+            assert.equal(build_diagnostics({ userId, computerId: 'another-computer' }).recentEvents
+                .some(event => event.eventClass === 'code_lifecycle'), false);
+            assert.equal(build_diagnostics({ userId: 'another-user', computerId }).recentEvents
+                .some(event => event.eventClass === 'code_lifecycle'), false);
+            open();
+            const events = payload().diagnostics.recentEvents.filter(event => event.eventClass === 'code_lifecycle');
+            assert.deepEqual(events.map(event => event.code), ['page_hidden', 'opened_after_reload']);
+            assert.ok(events.every(event => Number.isInteger(event.ageMs)));
+            assert.ok(!JSON.stringify(events).includes(userId) && !JSON.stringify(events).includes('private_fixture_url'));
+            diagnosticsSchema.parse(payload().diagnostics);
+            change('diagnostics', false); assert.equal(payload().diagnostics, null);
+        } finally {
+            close(); window.sessionStorage.removeItem(key);
+            delete window.__EZIL_BOOT__.desktopState.ui.feedbackReportBundle;
+        }
+    });
     await check('quota failure retains text and never claims an image report is saved for automatic retry', async () => {
         open(); setDescription('Keep my report when storage fills');
         const prototype = Object.getPrototypeOf(window.localStorage);

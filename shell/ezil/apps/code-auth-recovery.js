@@ -26,7 +26,8 @@ export function resetOriginRecovery({ win = null, storage = null } = {}) {
 export function attachCodeAuthRecovery({ iframe, frameUrl, current, desktopRunning,
     onStopped, onUnknown, reload = () => window.location.reload(),
     reopen = null, onUnreachable = null,
-    win = window, storage = null, now = Date.now }) {
+    onAction = () => {}, win = window, storage = null, now = Date.now,
+    online = () => win.navigator?.onLine !== false }) {
     const origin = new URL(frameUrl).origin;
     let disposed = false;
     let checking = false;
@@ -49,12 +50,20 @@ export function attachCodeAuthRecovery({ iframe, frameUrl, current, desktopRunni
         checking = false;
         return running;
     }
+    function deferOffline(retry) {
+        if (online()) return false;
+        onAction('recovery_offline');
+        onUnknown(retry);
+        return true;
+    }
     async function recover(explicit = false) {
         if (!live() || checking || reloading) return;
+        const retry = () => { if (live()) void recover(true); };
+        if (deferOffline(retry)) return;
         const running = await check();
         if (!live() || reloading) return;
+        if (deferOffline(retry)) return;
         if (running === false) { onStopped(); return; }
-        const retry = () => { if (live()) void recover(true); };
         // A refused/unknown status can mean the OS session expired too. Reloading
         // the OS runs its normal auth bootstrap; it grants no computer access.
         // Only a known stopped computer stays behind its explicit Start action.
@@ -64,14 +73,17 @@ export function attachCodeAuthRecovery({ iframe, frameUrl, current, desktopRunni
             try { guard(GUARD_KEY, true); } catch { /* explicit user retry */ }
         }
         reloading = true;
+        onAction('auth_reload');
         reload(); // The existing top OS route preserves this computer, project and folder.
     }
     async function recoverOrigin(explicit = false) {
         if (!live() || checking || reloading) return;
+        const retry = () => { if (live()) void recoverOrigin(true); };
+        if (deferOffline(retry)) return;
         const running = await check();
         if (!live() || reloading) return;
+        if (deferOffline(retry)) return;
         if (running === false) { onStopped(); return; }
-        const retry = () => { if (live()) void recoverOrigin(true); };
         // Not knowing whether the computer runs is not "reopen it": the cover says so and its Retry asks again.
         if (running === undefined) { onUnknown(retry); return; }
         const unreachable = onUnreachable ?? onUnknown;
@@ -89,6 +101,7 @@ export function attachCodeAuthRecovery({ iframe, frameUrl, current, desktopRunni
         reloading = true;
         // The computer runs and its origin did not: reopen Code through the mint, which waits for the origin
         // on its own bounded clock. Without a reopen (an older caller) the OS reload does the same, once.
+        onAction('origin_reopen');
         (reopen ?? reload)();
     }
     const onMessage = (event) => {

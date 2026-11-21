@@ -63,6 +63,8 @@ export type GatewayOptions = {
     onRequest?: (url: string, built: ReturnType<typeof buildGatewayBody> | ReturnType<typeof buildGatewayResponsesBody>, idempotencyKey: string) => void;
     /** Called when the request is sent compacted (compact.ts): sizes and counts only. */
     onCompact?: (info: CompactionInfo) => void;
+    /** Local activity tied to one actual POST, released before any retry or backoff. */
+    onInferenceStart?: () => (() => void) | undefined;
     /** The turn's app-failure records (docs/FEEDBACK-APP-FAILURES-CONTRACT.md): `retrying` before each automatic retry,
      * then `recovered`, `failed` or `cancelled`; nothing for a turn that succeeds first time. Content-free; a throwing
      * observer cannot change the turn. */
@@ -876,7 +878,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
     let retriedAfter: { error: GatewayError; stage: AppFailureStage } | undefined;
     const report = (outcome: AppFailure['outcome'], error: unknown, at: AppFailureStage) => {
         try {
-            options.onOutcome?.(appFailure({ outcome, error, stage: at, model: model.model, clientRequestId: idempotencyKey, gatewayRequestId: requestId,
+            options.onOutcome?.(appFailure({ outcome, error, stage: at, model: model.model, clientRequestId: idempotencyKey, gatewayRequestId: requestId, httpStatus: status,
                 attempts, durationMs: Math.max(0, now() - started), ...(outcome === 'cancelled' ? { cancellationSource: 'caller' as const } : {}) }));
         } catch { /* An observer never changes the turn or its telemetry. */ }
     };
@@ -953,6 +955,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 concurrencyError ? { ms: remainingWait(), error: concurrencyError }
                     : resendOf !== undefined ? { ms: resendOf + GATEWAY_COMPLETION_TIMEOUT_MS - performance.now(), error: transportError(stream ? 'first_byte_timeout' : 'completion_timeout') } : undefined);
             let waitMs: number;
+            let endInferenceActivity: (() => void) | undefined;
             try {
                 options.signal.throwIfAborted();
                 if (concurrencyError && now() - concurrencyStarted! > CONCURRENCY_WAIT_BUDGET_MS) throw concurrencyError;
@@ -976,7 +979,12 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                 let response: Response;
                 try {
                     response = await timedResponse(doFetch, url, { method: 'POST', headers, body: built.bytes, redirect: 'error' }, attemptAbort, stream, sentAt,
-                        () => { attempts++; totalWireBytes += built.bytes.byteLength; stage = 'request'; });
+                        () => {
+                            attempts++;
+                            totalWireBytes += built.bytes.byteLength;
+                            stage = 'request';
+                            observe(() => { endInferenceActivity = options.onInferenceStart?.(); });
+                        });
                 } catch (error) {
                     if (options.signal.aborted || attemptAbort.signal.reason instanceof GatewayError) throw error;
                     // A late failure may cut off inference already running. Never replay it merely because response headers have not arrived.
@@ -1090,6 +1098,7 @@ export async function* gatewayChat(model: ResolvedModel, request: ChatRequest, o
                     waitMs = 0;
                 }
             } finally {
+                observe(() => endInferenceActivity?.());
                 attemptAbort.abort();
                 release();
             }

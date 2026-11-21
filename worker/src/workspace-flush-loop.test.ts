@@ -122,6 +122,7 @@ interface FakeOptions {
   tmuxSessions?: number;
   /** Code/desktop terminals the probe reports as running a foreground job (default 0). */
   terminalJobs?: number;
+  activeCodeInferences?: number;
   /** Make only the terminal-work probe's `exec` reject. */
   tmuxProbeThrows?: boolean;
   /** Files the container reports under the mount path. */
@@ -236,7 +237,8 @@ async function makeFake(opts: FakeOptions = {}): Promise<FakeDO & Record<string,
       }
       if (command === TERMINAL_WORK_PROBE_COMMAND) {
         if (opts.execThrows || opts.tmuxProbeThrows) throw new Error('container gone');
-        return { exitCode: 0, stdout: `${opts.tmuxSessions ?? 0} ${opts.terminalJobs ?? 0}\n` };
+        const inferenceCount = opts.activeCodeInferences === undefined ? '' : ` ${opts.activeCodeInferences}`;
+        return { exitCode: 0, stdout: `${opts.tmuxSessions ?? 0} ${opts.terminalJobs ?? 0}${inferenceCount}\n` };
       }
       if (opts.execThrows) throw new Error('container gone');
       return { exitCode: 0, stdout: opts.loadavg ?? '0.00 0.01 0.05 1/123 456\n' };
@@ -770,6 +772,20 @@ describe('🔴 SIGNAL C: terminal work (tmux sessions, running terminal jobs) ho
     expect(probes(fake)).toBe(1);
     expect(fake.calls.stops).toBe(0);
     expect(fake.calls.scheduled).toHaveLength(1);
+  });
+
+  it('holds an active background inference without advancing human presence', async () => {
+    const activityAt = Date.now() - 2 * IDLE_STOP_MS;
+    const fake = await makeFake({
+      storage: hydratedStorage({ [LAST_ACTIVITY_AT_KEY]: activityAt }), activeCodeInferences: 1, files,
+    });
+
+    await runAlarmCycle(fake);
+
+    expect(probes(fake)).toBe(1);
+    expect(fake.calls.stops).toBe(0);
+    expect(fake.calls.r2Puts).toContain(`${PREFIX}/.ezil-snapshots/latest.json`);
+    expect(storeOf(fake).get(LAST_ACTIVITY_AT_KEY)).toBe(activityAt);
   });
 
   it('a present user costs nothing: no tmux probe while activity is fresh', async () => {

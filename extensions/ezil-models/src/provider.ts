@@ -28,6 +28,7 @@ export type ProviderHost = {
     /** Content-free gateway outcomes; observer errors must never change a turn. */
     appFailure?(record: AppFailure): void;
     inferenceDiagnostic?(record: InferenceDiagnostic): void;
+    beginInferenceActivity?(provider: ResolvedProvider, signal: AbortSignal): (() => void) | undefined;
     /** The request goes compacted (compact.ts); `finished` settles when its turn ends. */
     compacted?(model: ResolvedModel, info: CompactionInfo, finished: Promise<void>): void;
     /** Ask the EZiL OS window around Code to open its billing dialog; true only when it took the request. */
@@ -517,7 +518,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
             resolved = await this.resolve(model, controller.signal);
             diagnostic.record.modelAlias = /^[a-zA-Z0-9_.:-]{1,128}$/.test(resolved.model) ? resolved.model : 'unknown';
             controller.signal.throwIfAborted();
-            if (resolved.provider.type === 'ezil-gateway' && isUtilityRequest(options.modelOptions ?? {})) {
+            const utilityRequest = isUtilityRequest(options.modelOptions ?? {});
+            if (resolved.provider.type === 'ezil-gateway' && utilityRequest) {
                 // Requests marked as titles or summaries (role or requestInitiator): Qwen on the named model's own provider
                 // (account), when the account's plan includes it. On a plan that does not (Free: Gemini 3.8 Flash only) they
                 // never fail on a lock: one naming a model the plan does not include goes to the plan's own model on the same
@@ -635,6 +637,8 @@ export class EZiLModelsProvider implements vscode.LanguageModelChatProvider {
                 fetch: this.host.fetch,
                 gateway: {
                     onDiagnosticTransport: value => diagnostic.transport(value),
+                    onInferenceStart: utilityRequest || options.modelOptions?._ezilCompaction === true ? undefined
+                        : () => this.host.beginInferenceActivity?.(sending.provider, controller.signal),
                     onCompact: info => {
                         diagnostic.record.compaction = { trigger: info.cause, count: (diagnostic.record.compaction?.count ?? 0) + 1, folded: info.folded, shortened: info.shortened };
                         this.host.compacted?.(sending, info, finished);
