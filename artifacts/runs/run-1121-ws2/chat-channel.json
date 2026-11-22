@@ -1,0 +1,9 @@
+{
+  "taskId": "chat-channel",
+  "runId": "run-1121-ws2",
+  "status": "running",
+  "doneRung": "cli-channel-worker-forward-and-os-receiver-green-mutation-proved",
+  "evidence": "START: all 6 owned files new. Read contract §7, sync-route.ts, editor-bridge.ts, agent-session router + control-store/store services, PLATFORM-NOTES, test.sh, pg-test-schema + existing pg harnesses. DB reachable (select 1 -> 1). Plan: worker editor-cli.ts mirrors handleEditorBridge{,Request} with CLI path/label editor-cli.v1/32KB body/64KB reply/20s; OS cli-channel.ts verifies editor-cli label +-60s, gates editorDelegationEnabled && EZIL_EDITOR_CLI, resolves sandbox via sync-route computerForSandbox, calls createSession/sendInstruction/listSessions/listEvents with clientId '' and computer-scope check on send/read.",
+  "startedAt": "2026-11-22T00:00:00Z",
+  "updatedAt": "2026-11-22T00:00:00Z"
+}
