@@ -727,6 +727,21 @@ class BrowserTierEnvironmentTests(unittest.TestCase):
                      message="owner app origin is never")
         self.accepted({self.TEST: "https://fixture.example.invalid", **self.STAGED})
 
+    def test_the_overlap_is_by_host_whatever_the_port_or_scheme(self):
+        # Another port on the owner app's host is the owner app: refused in either direction.
+        self.refused({self.TEST: "https://universe-staging.ezil.work:8443", **self.STAGED}, message="owner app origin is never")
+        self.refused({self.TEST: "https://fixture.example.invalid,https://universe-staging.ezil.work:4443", **self.STAGED},
+                     message="owner app origin is never")
+        self.refused({self.TEST: "https://universe-staging.ezil.work", self.OWNER: "https://universe-staging.ezil.work:8443",
+                      self.IDP: self.STAGED[self.IDP]}, message="owner app origin is never")
+        # Plain http on the owner host never reaches the comparison: a test origin is https or loopback http only.
+        self.refused({self.TEST: "http://universe-staging.ezil.work", **self.STAGED}, message="approved project origins")
+        # Positive controls: another host on the same port, a sibling subdomain, and loopback http are all fine.
+        self.accepted({self.TEST: "https://fixture.example.invalid:8443", self.OWNER: "https://universe-staging.ezil.work:8443",
+                       self.IDP: self.STAGED[self.IDP]})
+        self.accepted({self.TEST: "https://preview.universe-staging.ezil.work,http://127.0.0.1:4173", **self.STAGED})
+        self.assertEqual(renderer.origin_host("https://Universe-Staging.Ezil.Work."), "universe-staging.ezil.work")
+
     def test_errors_do_not_echo_values(self):
         marker = "https://synthetic-secret-in-config.example.invalid/path"
         for extra in ({self.OWNER: marker, self.IDP: self.STAGED[self.IDP]}, {self.IDP: marker},

@@ -203,6 +203,11 @@ def browser_tier_origins(value):
     return entries
 
 
+def origin_host(origin):
+    """The host an origin names, case-folded and without trailing dots: tiers are compared by host."""
+    return (urlsplit(origin).hostname or "").rstrip(".").lower()
+
+
 def validate_browser_tiers(values, test_origins):
     """Browser verbs v2 section 6: an IdP origin is never an owner app or a test origin; owner and test lists never overlap."""
     owners = browser_tier_origins(values[STAGING_BROWSER_OWNER_APP_ORIGINS]) \
@@ -211,12 +216,13 @@ def validate_browser_tiers(values, test_origins):
     # An owner list without an IdP list is a broken policy in the sidecar (every page transit only): refuse it here.
     if owners and not idps:
         raise RenderError("Browser owner-app origins require the identity provider origins")
-    idp_hosts = ALWAYS_IDP_HOSTS | {urlsplit(origin).hostname for origin in idps}
-    if any(urlsplit(origin).hostname in idp_hosts for origin in owners):
+    idp_hosts = ALWAYS_IDP_HOSTS | {origin_host(origin) for origin in idps}
+    if any(origin_host(origin) in idp_hosts for origin in owners):
         raise RenderError("An identity provider origin is never an owner app")
-    if any(urlsplit(origin).hostname in idp_hosts for origin in test_origins):
+    if any(origin_host(origin) in idp_hosts for origin in test_origins):
         raise RenderError("An identity provider origin is never a Browser test origin")
-    if set(owners) & set(test_origins):
+    # By host as well: the same app on another port or scheme is still the owner app.
+    if {origin_host(origin) for origin in owners} & {origin_host(origin) for origin in test_origins}:
         raise RenderError("An owner app origin is never a Browser test origin")
 
 
