@@ -688,6 +688,7 @@ import {
 } from './ai-proxy';
 import { deriveEditorBridgeToken, editorBridgeTargetAllowed, handleEditorBridgeRequest, isEditorBridgePath, resolveOsBridgeUrl, type EditorBridgeProvider } from './editor-bridge';
 import { handleComputerTools } from './computer-tools';
+import { EDITOR_CLI_PATH, handleEditorCli } from './editor-cli';
 
 import { captureEditorState } from './editor-state';
 import { CF_ADMISSION_ERROR, cfAdmissionRunningOnly, cfAdmissionResponse, isCfAdmissionError } from './cf-container-admission';
@@ -7254,6 +7255,8 @@ async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<R
     return handlePreviewBootstrap(url, sandboxId, secrets, cookieSecret, target);
   }
 
+  // In-computer `ezil` CLI channel (worker/src/editor-cli.ts); before the sync, whose path predicate also matches it.
+  if (target === 'code' && path === EDITOR_CLI_PATH) return handleEditorCli(request, env, sandboxId);
   if (target === 'code' && isEditorBridgePath(path)) return handleEditorBridge(request, env, sandboxId);
   if (target === 'code' && isAiProxyPath(path)) return handleAiProxy(request, env, sandboxId);
 
