@@ -41,9 +41,17 @@ let chromium;
 try { ({ chromium } = require('playwright')); } catch { console.log('SKIP playwright not resolvable (set PLAYWRIGHT_REQUIRE_DIR)'); process.exit(2); }
 const assets = process.env.EZIL_SHELL_OUT_DIR || fileURLToPath(new URL('../../../app/public/os/', import.meta.url));
 if ( ! existsSync(path.join(assets, 'bundle.min.js')) ) { console.log(`SKIP missing ${assets}bundle.min.js (run shell/build-shell.sh)`); process.exit(2); }
-// The Worker's own bridge (TypeScript, no imports). CI's Node 22 does not load .ts by default, so strip the types here.
-const bridgeSource = stripTypeScriptTypes(readFileSync(new URL('../../../worker/src/code-folder-bridge.ts', import.meta.url), 'utf8'));
-const { codeFolderBridgeScript } = await import(`data:text/javascript,${encodeURIComponent(bridgeSource)}`);
+// The Worker's own bridge (TypeScript). CI's Node 22 does not load .ts by default, so strip the types here.
+// The bridge imports ./code-assignment-evidence, which imports three plain .js app modules. A data: URL
+// module cannot resolve relative specifiers, so each import is pointed at an absolute URL.
+const stripTs = (rel) => stripTypeScriptTypes(readFileSync(new URL(rel, import.meta.url), 'utf8'));
+const dataUrl = (src) => `data:text/javascript,${encodeURIComponent(src)}`;
+const workerSrc = new URL('../../../worker/src/', import.meta.url);
+const evidenceSource = stripTs('../../../worker/src/code-assignment-evidence.ts')
+    .replace(/from '(\.\.\/\.\.\/app\/[^']+\.js)'/g, (_, rel) => `from '${new URL(rel, workerSrc).href}'`);
+const bridgeSource = stripTs('../../../worker/src/code-folder-bridge.ts')
+    .replace("from './code-assignment-evidence'", `from ${JSON.stringify(dataUrl(evidenceSource))}`);
+const { codeFolderBridgeScript } = await import(dataUrl(bridgeSource));
 
 let checks = 0;
 const ok = (cond, msg) => { assert.ok(cond, msg); checks += 1; console.log(`PASS  ${msg}`); };

@@ -4,7 +4,7 @@ Start capture explicitly in the Code window for the registered synthetic assignm
 
 ## Staging configuration
 
-Apply `app/drizzle/0034_assignment_evidence_pilot.sql` and `app/drizzle/0035_assignment_evidence_transcripts.sql` in order through the reviewed Preview database migration path before enabling the route. The installer deploys the app separately from schema changes. Use the existing exact staging billing origin and supply `EZIL_ASSIGNMENT_EVIDENCE_PILOT` as one JSON string in the staging app environment. Use a disposable participant account, computer, and repository.
+Apply `app/drizzle/0040_assignment_evidence_pilot.sql` (one additive migration) through the reviewed Preview database migration path before enabling the route. The installer deploys the app separately from schema changes. Use the existing exact staging billing origin and supply `EZIL_ASSIGNMENT_EVIDENCE_PILOT` as one JSON string in the staging app environment. Use a disposable participant account, computer, and repository.
 
 | Configuration field | Value |
 | --- | --- |
