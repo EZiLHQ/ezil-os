@@ -24,6 +24,18 @@ fs.chmodSync(root, 0o755);
 afterAll(() => fs.rmSync(root, { recursive: true, force: true }));
 let counter = 0;
 const freshDir = () => path.join(root, `d${counter++}`);
+/** The real client is node; resolve it from PATH (CI's setup-node installs it outside /usr/bin). */
+const NODE = (process.env.PATH ?? '').split(path.delimiter).map((dir) => path.join(dir, 'node'))
+    .find((candidate) => { try { fs.accessSync(candidate, fs.constants.X_OK); return true; } catch { return false; } }) ?? '/usr/bin/node';
+/** What a crashed server leaves behind: a socket file nobody listens on (a clean close() unlinks it on newer Bun). */
+function leaveStaleSocket(socketPath: string): Promise<void> {
+    const script = `require('net').createServer().listen(process.argv[1], () => process.kill(process.pid, 'SIGKILL'))`;
+    return new Promise((resolve, reject) => {
+        const child = spawn(NODE, ['-e', script, socketPath], { stdio: 'ignore' });
+        child.on('error', reject);
+        child.on('close', () => resolve());
+    });
+}
 
 type Captured = { url: string; init: RequestInit };
 const jsonResponse = (body: unknown, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
@@ -165,6 +177,8 @@ describe('socket creation', () => {
         await new Promise((resolve) => first.server.once('listening', resolve));
         // The old process died without cleaning up: its socket file stays, nobody listens on it.
         first.server.close();
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        if (!fs.existsSync(first.socketPath)) await leaveStaleSocket(first.socketPath);
         expect(fs.existsSync(first.socketPath)).toBe(true);
         const second = startCliServer({ socketDir: dir, cliUrl: CLI_URL, token: TOKEN, fetch: async () => jsonResponse({ ok: true, result: { n: 2 } }), log: () => {} });
         cleanups.push(() => second.dispose());
@@ -260,7 +274,7 @@ describe('request validation and size limits', () => {
         // A node child: bun's own sockets cannot half-close, and the real client is node.
         const script = `const s=require('net').connect(process.argv[1]);let d='';s.on('data',c=>d+=c);s.on('close',()=>console.log(d));s.on('connect',()=>s.end(JSON.stringify({v:1,op:'chat.list',args:{}})))`;
         const out = await new Promise<string>((resolve, reject) => {
-            const child = spawn('/usr/bin/node', ['-e', script, served.socketPath], { stdio: ['ignore', 'pipe', 'inherit'] });
+            const child = spawn(NODE, ['-e', script, served.socketPath], { stdio: ['ignore', 'pipe', 'inherit'] });
             let text = '';
             child.stdout.on('data', (chunk) => { text += chunk; });
             child.on('error', reject);
@@ -394,7 +408,7 @@ describe('only root can use the socket', () => {
     // really ran as, and the test fails unless that is the target, so a no-op drop can never read as a pass.
     const connectAs = (target: number, socketPath: string) => new Promise<string>((resolve, reject) => {
         const script = `const s=require('net').connect(process.argv[1]);const u=process.getuid();s.on('connect',()=>{console.log(u+' CONNECTED');s.destroy()});s.on('error',e=>{console.log(u+' '+e.code)})`;
-        const child = spawn('/usr/bin/setpriv', [`--reuid=${target}`, `--regid=${target}`, '--clear-groups', '/usr/bin/node', '-e', script, socketPath], { env: { PATH: '/usr/bin:/bin' }, stdio: ['ignore', 'pipe', 'pipe'] });
+        const child = spawn('/usr/bin/setpriv', [`--reuid=${target}`, `--regid=${target}`, '--clear-groups', NODE, '-e', script, socketPath], { env: { PATH: '/usr/bin:/bin' }, stdio: ['ignore', 'pipe', 'pipe'] });
         let out = '';
         child.stdout.on('data', (chunk) => { out += chunk; });
         child.on('error', reject);
