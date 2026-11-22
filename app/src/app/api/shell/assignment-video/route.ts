@@ -12,7 +12,7 @@ const fail = (code: string, status: number) => shellJson({error: {code}}, status
 
 export async function POST(req: Request) {
     try {
-        // Staging's renderer pins this marker; production's renderer rejects it. Git enrollment is optional.
+        // Staging's renderer pins this marker; production's renderer rejects it. Media begin additionally requires a sealed, enrolled repository-open receipt.
         const configuredUniverse = process.env.UNIVERSE_PROJECT_REPO_ORIGIN;
         if (!['https://ai-staging.ezil.work', 'https://ai-staging.ezil.work/'].includes(process.env.BILLING_FUNDING_URL ?? '')
             || (configuredUniverse && configuredUniverse !== universeOrigin)) return fail('not_found', 404);

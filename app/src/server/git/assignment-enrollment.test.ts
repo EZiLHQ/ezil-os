@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('server-only', () => ({}));
 
-import { assignmentMarker, bootstrapObjects, packObjects } from './assignment-bootstrap';
+import { assignmentManifest, assignmentMarker, bootstrapFiles, bootstrapObjects, MARKER_PATH, packObjects } from './assignment-bootstrap';
 import { enrollAssignmentRepository, expectedRepositoryURL, type EnrollmentError } from './assignment-enrollment';
 import { ATTEMPT, ENV, fakeWorld, GIT_TOKEN, ID_TOKEN, identity, NAME, ORIGIN, PROVIDER, REPO, SUBJECT } from './assignment-enrollment.test-support';
 
@@ -15,8 +15,8 @@ const enroll = (w: ReturnType<typeof fakeWorld>, env: Record<string, string | un
     enrollAssignmentRepository({ identity: who, attemptId: ATTEMPT }, { fetch: w.fetch, env });
 const refused = async (promise: Promise<unknown>, code: EnrollmentError['code']) => expect(promise).rejects.toMatchObject({ code });
 const routes = (w: ReturnType<typeof fakeWorld>) => w.calls.map(c => `${c.method} ${c.url.replace(REPO, '<repo>')}${c.json?.action ? ` ${c.json.action}` : ''}${c.json?.scope ? ` ${c.json.scope}` : ''}`);
-const MARKER = `{"schema":"ezil.assignment/v1","recorder":"assignment-recorder-v1","repositoryUrl":"${REPO}","consentVersion":3,`
-    + '"notice":"Do not edit, modify, or delete this assignment marker. EZiL Code records disclosed assignment activity and shows recording status. Interruptions may affect submission."}\n';
+const MARKER = `{"schema":"ezil.assignment/v2","recorder":"assignment-recorder-v1","repositoryUrl":"${REPO}","consentVersion":3,`
+    + '"notice":"Do not edit, modify, or delete this assignment marker. EZiL Code records disclosed assignment activity and shows recording status. Interruptions may affect submission.","preload":{"protocol":"ezil.assignment-open/v1","trigger":"repo-open","host":"127.0.0.1","port":5679}}\n';
 
 describe('assignment repository enrollment', () => {
     it('creates, bootstraps and binds one new owner-bound private repository through the real git protocol', async () => {
@@ -37,7 +37,7 @@ describe('assignment repository enrollment', () => {
             `POST ${ORIGIN}/internal/assignment-repositories/enrollment complete`,
         ]);
         expect(w.calls[2]!.json).toEqual({ name: NAME, visibility: 'private' });
-        // The repository holds exactly the C1 marker and README, and the manifest is the marker file's own bytes.
+        // The repository holds exactly the C2 marker and README, and the manifest is the marker file's own bytes.
         expect(w.git(['ls-tree', '-r', '--name-only', 'refs/heads/main']).toString()).toBe('.ezil/assignment.json\nREADME.md\n');
         expect(w.git(['show', 'refs/heads/main:.ezil/assignment.json']).toString()).toBe(MARKER);
         expect(assignmentMarker(REPO)).toBe(MARKER);
@@ -51,6 +51,17 @@ describe('assignment repository enrollment', () => {
             expect(call.url).not.toContain(ID_TOKEN);
         }
         expect(w.git(['fsck', '--strict']).toString()).toBe('');
+    });
+
+    it('preserves C1 readback, while refusing missing or tampered preload declarations', () => {
+        const entries = Array.from(bootstrapFiles(REPO), ([path, text]) => ({path, mode:'100644', kind:'file' as const, content:Buffer.from(text)}));
+        const current = entries.find(file => file.path === MARKER_PATH)!;
+        current.content = Buffer.from(assignmentMarker(REPO,1));
+        expect(assignmentManifest(REPO,entries)).toBe(createHash('sha256').update(current.content).digest('hex'));
+        expect(current.content.toString()).not.toContain('5679');
+        expect(assignmentManifest(REPO,entries.filter(it=>it !== current))).toBeNull();
+        current.content = Buffer.from(assignmentMarker(REPO).replace('5679','5680'));
+        expect(assignmentManifest(REPO,entries)).toBeNull();
     });
 
     it('reconciles a retry by the owner grant: no second create and no second push', async () => {

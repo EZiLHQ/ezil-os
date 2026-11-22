@@ -1,3 +1,7 @@
+import { recordingAction } from '@/server/assignment-video/broker';
+import { osOrigin, universeOrigin } from '@/server/assignment-video/contract';
+import { enrolledAttempt, makeChallenge, matchesEnrollment, repoOpenSecret, sealOpen } from '@/server/assignment-video/repo-open';
+import { isCrossOriginWrite } from '@/utils/request-origin';
 import { TRPCError } from '@trpc/server';
 import { repoOpenFailureResponse } from '@/server/feedback/repo-open-failure';
 
@@ -8,7 +12,7 @@ import type { AutomaticImageUpdateWait } from '@/server/lib/compute/aws-auto-upd
 import { controlTargetFor, type ControlTarget } from '@/server/lib/compute/aws-control-auth';
 import { ImageJobConflictError, PlacementOwnerError, type PlacementDb, type PlacementExecutor } from '@/server/lib/compute/placement';
 import {
-    REPO_OPEN_MAX_TIMEOUT_MS, REPO_OPEN_MIN_TIMEOUT_MS, REPO_OPEN_TRANSPORT_MARGIN_MS, requestRepoOpen, withRepositoryFolder,
+    matchesAck, REPO_OPEN_MAX_TIMEOUT_MS, REPO_OPEN_MIN_TIMEOUT_MS, REPO_OPEN_TRANSPORT_MARGIN_MS, requestRepoOpen, withRepositoryFolder,
 } from '@/server/lib/compute/repo-open';
 import { shellErrorResponse, shellJson, shellUnauthenticated } from '@/server/shell/http';
 import {
@@ -113,7 +117,9 @@ export async function POST(req: Request) {
             if (hasProject) {
                 response = await openProject(ctx as ProjectCtx, caller, { computerId, intent, project, startedAt, signal: req.signal });
             } else if (hasRepository) {
-                response = await openRepositoryUrl(ctx as ProjectCtx, caller, { computerId, intent, repository, startedAt, signal: req.signal });
+                response = await openRepositoryUrl(ctx as ProjectCtx, caller, { computerId, intent, repository, startedAt, signal: req.signal,
+                    allowAssignmentPreload: !ctx.delegation && intent === 'open' && req.headers.get('origin') === osOrigin
+                        && req.headers.get('sec-fetch-site') === 'same-origin' && !isCrossOriginWrite(req) });
             } else {
                 const preview = await caller.cloudflareGuacamole.codePreviewUrl({
                     computerId, intent, ...(codeFolder !== undefined ? { codeFolder } : {}),
@@ -287,7 +293,7 @@ const repoUrlInvalid = () => shellRefusal(400, 'repo_url_invalid', "This isn't a
  * A standalone credential is sent only in the signed Worker body, then to the bundled CLI on private fd 3.
  */
 async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: {
-    computerId: string; intent: unknown; repository: unknown; startedAt: number; signal: AbortSignal;
+    computerId: string; intent: unknown; repository: unknown; startedAt: number; signal: AbortSignal; allowAssignmentPreload: boolean;
 }) {
     const { computerId, intent, startedAt } = request;
     const { parseRepositoryUrl, repositoryIdFor, resolvePublicGitHub } = await import('@/server/git/repo-url');
@@ -379,6 +385,16 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     } else if (preview.computeProvider === 'aws-ec2') {
         return shellRefusal(409, 'repo_open_computer_changed', 'This computer changed while opening. Try again.');
     }
+    // The platform opens the ordinary workspace even when enrollment, the optional loopback, or its signer is unavailable.
+    // The public repository/URL and the browser's attempt selector cannot mint a recording proof.
+    const signer = request.allowAssignmentPreload && !isAws(controls) && process.env.UNIVERSE_PROJECT_REPO_ORIGIN === universeOrigin
+        && ['https://ai-staging.ezil.work','https://ai-staging.ezil.work/'].includes(process.env.BILLING_FUNDING_URL ?? '')
+        ? repoOpenSecret() : undefined;
+    const attemptId = signer && identity && privatePacket ? enrolledAttempt(identity, privatePacket, Date.now()) : undefined;
+    const enrolled = attemptId && identity && privatePacket
+        ? await recordingAction(identity,{action:'preflight',attemptId},{signal:deadline}).catch(() => null) : null;
+    const challenge = enrolled && privatePacket && attemptId && matchesEnrollment(enrolled, privatePacket, attemptId, Date.now())
+        ? makeChallenge(attemptId, privatePacket.repository.canonicalURL) : undefined;
     const timeoutMs = Math.min(REPO_OPEN_MAX_TIMEOUT_MS, left() - REPO_OPEN_TRANSPORT_MARGIN_MS,
         privatePacket ? Date.parse(privatePacket.git.expiresAt) - Date.now() - 15_000 : REPO_OPEN_MAX_TIMEOUT_MS);
     if (timeoutMs < REPO_OPEN_MIN_TIMEOUT_MS) {
@@ -390,6 +406,7 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
     const opened = await requestRepoOpen(config.workerUrl, process.env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET?.trim() ?? '', controls,
         { userId: ctx.user.id, computerId }, { repositoryId, canonicalURL: parsed.canonicalURL,
             ref: privatePacket?.repository.ref ?? resolved!.ref,
+            ...(challenge ? {assignmentPreload:challenge} : {}),
             git: privatePacket ? { token: privatePacket.git.token, expiresAt: privatePacket.git.expiresAt, scope: privatePacket.git.scope } : null,
             ...(privatePacket ? { privatePacket, ...(identity?.gitAuthor ? { gitAuthor: identity.gitAuthor } : {}) } : {}), timeoutMs },
         { correlationId: newCorrelationId(), signal: deadline, awsStandaloneEnabled: awsStandaloneGitEnabled(),
@@ -399,6 +416,11 @@ async function openRepositoryUrl(ctx: ProjectCtx, caller: ShellCaller, request: 
         return repoOpenFailureResponse(ctx.db, ctx.user.id, computerId, opened, "This repository's files could not be opened. Try again.");
     }
     const url = withRepositoryFolder(preview.codePreviewUrl, opened.folder);
-    return shellJson({ ...preview, codePreviewUrl: url, url, repository: { name: parsed.displayName, id: repositoryId } });
+    const now = Date.now();
+    const assignmentOpen = signer && enrolled && identity && privatePacket && attemptId && challenge
+        && matchesAck(challenge, opened.assignmentPreload) && matchesEnrollment(enrolled, privatePacket, attemptId, now) && await sameSession()
+        ? sealOpen(identity, enrolled, computerId, controls.sandboxName, challenge.eventId, now, signer) : undefined;
+    return shellJson({ ...preview, codePreviewUrl: url, url, repository: { name: parsed.displayName, id: repositoryId },
+        ...(assignmentOpen ? {assignmentOpen} : {}) });
 }
 

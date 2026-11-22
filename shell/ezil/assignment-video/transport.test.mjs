@@ -21,11 +21,11 @@ function fixture(replace={}) {
       confirm:{confirmed:true,recordingId,sequence:0},finalize:{...normal,status:'complete'},...replace};
     return Response.json(responses[body.action]);
   };
-  const t=createAssignmentVideoTransport({attemptId,consentVersion:1,fetcher,onStop:r=>stops.push(r)});
+  const t=createAssignmentVideoTransport({attemptId,repoOpenProof:"p".repeat(100),consentVersion:1,fetcher,onStop:r=>stops.push(r)});
   return {t,calls,stops};
 }
-test('checks fresh signed upload, sends real bytes, waits for authoritative confirmation and stops on Attach',async()=>{
-  const {t,calls,stops}=fixture({status:{recordingId,status:'recording',revoked:true,stopReason:'attached'}});
+test('checks fresh signed upload, sends real bytes, waits for authoritative confirmation and stops on successful submission',async()=>{
+  const {t,calls,stops}=fixture({status:{recordingId,status:'recording',revoked:true,stopReason:'submitted'}});
   try {
     await t.begin();assert.match((await t.upload(part)).recordingId,/0002$/);
     assert.equal(calls.find(x=>x.kind==='prepare').body.sha256,sha);
@@ -33,8 +33,8 @@ test('checks fresh signed upload, sends real bytes, waits for authoritative conf
     const put=calls.find(x=>x.kind==='put');
     assert.equal(put.options.credentials,'omit');assert.equal(put.options.redirect,'error');
     assert.deepEqual(Buffer.from(await put.options.body.arrayBuffer()),media);
-    await t.status();assert.deepEqual(stops,['attached']);
-    await t.finalize({reason:'attached',expectedSegments:1});
+    await t.status();assert.deepEqual(stops,['submitted']);
+    await t.finalize({reason:'submitted',expectedSegments:1});
     assert.deepEqual(calls.map(x=>x.kind),['preflight','begin','prepare','put','confirm','status','finalize']);
   } finally { t.dispose(); }
 });

@@ -12,13 +12,13 @@ export const uuid = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 const integer = (min: number, max: number) => z.number().int().min(min).max(max);
 const sequence = integer(0, 599);
 const base = { attemptId: uuid };
-export const reason = z.enum(['stopped', 'attached', 'timeout']);
+export const reason = z.enum(['stopped', 'submitted', 'timeout']);
 const segment = {
     sequence, sha256: z.string().regex(/^[a-f0-9]{64}$/), byteLength: integer(1, 8 * 1024 * 1024),
     mimeType: z.literal('video/webm'), startMs: integer(0, hour), endMs: integer(1, hour),
 };
 export const requestSchema = z.discriminatedUnion('action', [
-    z.object({ ...base, action: z.literal('begin'), consentAccepted: z.literal(true), consentVersion: integer(1, 2147483647) }).strict(),
+    z.object({ ...base, action: z.literal('begin'), repoOpenProof: z.string().regex(/^[A-Za-z0-9_-]{48,1700}$/), consentAccepted: z.literal(true), consentVersion: integer(1, 2147483647) }).strict(),
     z.object({ ...base, action: z.literal('preflight') }).strict(),
     z.object({ ...base, action: z.literal('status') }).strict(),
     z.object({ ...base, action: z.literal('prepare'), ...segment }).strict(),
@@ -29,7 +29,8 @@ export type Input = z.infer<typeof requestSchema>;
 export type Prepare = Extract<Input, { action: 'prepare' }>;
 const moment = z.string().datetime({offset: true});
 export const eligible = z.object({status: z.literal('eligible'), attemptId: uuid,
-    jobId: z.string().regex(/^[1-9][0-9]{0,18}$/), expiresAt: moment});
+    jobId: z.string().regex(/^[1-9][0-9]{0,18}$/), expiresAt: moment, windowStartedAt: moment, deadlineAt: moment,
+    manifestSha256: z.string().regex(/^[a-f0-9]{64}$/), repositoryUrl: z.string().max(260), providerId: z.string().regex(/^[a-z0-9]{1,64}$/), ref: z.literal('refs/heads/main')});
 const control = {
     recordingId: uuid, status: z.enum(['recording', 'empty', 'partial', 'complete']),
     startedAt: moment, deadlineAt: moment, stopRequestedAt: moment.nullable(), revoked: z.boolean(),

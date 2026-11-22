@@ -33,10 +33,11 @@ export class BootstrapError extends Error {
 const fail = (code: BootstrapErrorCode): never => { throw new BootstrapError(code); };
 
 /**
- * C1 marker: compact UTF-8 JSON with exactly these keys in this order, then one LF. Universe verifies the same bytes.
+ * Versioned marker: compact UTF-8 JSON with exactly these keys in this order, then one LF. Universe verifies the same bytes.
  */
-export function assignmentMarker(repositoryUrl: string): string {
-    return `${JSON.stringify({ schema: 'ezil.assignment/v1', recorder: 'assignment-recorder-v1', repositoryUrl, consentVersion: 3, notice: MARKER_NOTICE })}\n`;
+export function assignmentMarker(repositoryUrl: string, version: 1|2 = 2): string {
+    return `${JSON.stringify({ schema: 'ezil.assignment/v' + version, recorder: 'assignment-recorder-v1', repositoryUrl, consentVersion: 3, notice: MARKER_NOTICE,
+        ...(version === 2 ? {preload:{protocol:'ezil.assignment-open/v1',trigger:'repo-open',host:'127.0.0.1',port:5679}} : {}) })}\n`;
 }
 
 /** The only content a bootstrapped assignment repository may hold. */
@@ -56,12 +57,19 @@ export function assignmentManifest(repositoryUrl: string, entries: readonly GitT
     const files = entries.filter(entry => entry.kind !== 'dir');
     const dirs = entries.filter(entry => entry.kind === 'dir').map(entry => entry.path);
     if (files.length !== expected.size || dirs.some(dir => dir !== '.ezil')) return null;
+    let marker: string | undefined;
     for (const file of files) {
-        const literal = expected.get(file.path);
+        let literal = expected.get(file.path);
+        if (file.path === MARKER_PATH && file.content) {
+            // Historical C1 assignments may still be resumed and submitted. The runtime only activates the exact C2 digest.
+            const legacy = assignmentMarker(repositoryUrl, 1);
+            if (Buffer.from(file.content).equals(Buffer.from(legacy))) literal = legacy;
+            marker = literal;
+        }
         if (file.kind !== 'file' || file.mode !== '100644' || literal === undefined || !file.content
             || Buffer.compare(Buffer.from(file.content), Buffer.from(literal, 'utf8')) !== 0) return null;
     }
-    return createHash('sha256').update(expected.get(MARKER_PATH)!, 'utf8').digest('hex');
+    return marker ? createHash('sha256').update(marker, 'utf8').digest('hex') : null;
 }
 
 const TYPES = { commit: 1, tree: 2, blob: 3 } as const;

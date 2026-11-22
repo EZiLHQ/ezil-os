@@ -1,3 +1,4 @@
+import { eligibleForActor, readOpen, repoOpenSecret, signBegin } from './repo-open';
 import { createHash } from 'node:crypto';
 import type { RetainedIdentity } from '@/server/auth/retained-identity';
 import { boundedJson, checkedPut, drain, eligible, hour, issuer, refuse, started, summary, universeOrigin, worksOrigin, type Input } from './contract';
@@ -22,13 +23,15 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
     const key = createHash('sha256').update(JSON.stringify([identity.userId, identity.subject, identity.sessionId, input.attemptId])).digest('hex');
     for (const [id, entry] of leases) if (entry.deadline + drain < clock()) leases.delete(id);
 
-    async function post(url: string, body: object, capability?: string): Promise<unknown> {
+    async function post(url: string, body: object, capability?: string, beginSecret?: string): Promise<unknown> {
+        const serialized = JSON.stringify(body);
         const timeout = AbortSignal.timeout(12000);
         let response: Response;
         try {
             response = await fetcher(url, {method: 'POST', redirect: 'error', cache: 'no-store',
                 headers: {'content-type':'application/json', accept:'application/json',
-                    ...(capability ? {authorization: 'Bearer ' + capability} : {})}, body: JSON.stringify(body),
+                    ...(capability ? {authorization: 'Bearer ' + capability} : {}),
+                    ...(beginSecret ? signBegin(beginSecret, serialized, clock()) : {})}, body: serialized,
                 signal: deps.signal ? AbortSignal.any([timeout, deps.signal]) : timeout});
         } catch { return refuse('media_unavailable', 503); }
         if (!response.ok) {
@@ -40,19 +43,22 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
         if (!response.headers.get('content-type')?.toLowerCase().startsWith('application/json')) return refuse('media_unavailable', 503);
         return boundedJson(response.body, 262144, 503);
     }
-    const control = (action: 'preflight'|'begin'|'status'|'finalize', fields: object = {}) =>
+    const control = (action: 'preflight'|'begin'|'status'|'finalize', fields: object = {}, beginSecret?: string) =>
         post(universeOrigin + '/internal/assignment-video/' + action, {
             userIdToken: identity.token, attemptId: input.attemptId, osSessionId: identity.sessionId, ...fields,
-        });
+        }, undefined, beginSecret);
 
     if (input.action === 'preflight') {
         const result = eligible.safeParse(await control('preflight'));
-        if (!result.success || result.data.attemptId !== input.attemptId || Date.parse(result.data.expiresAt) <= clock())
+        if (!result.success || !eligibleForActor(result.data, identity, input.attemptId, clock()))
             return refuse('recording_unavailable', 404);
         return result.data;
     }
     if (input.action === 'begin') {
-        const result = started.safeParse(await control('begin', {consentAccepted: true, consentVersion: input.consentVersion}));
+        const secret = repoOpenSecret();
+        if (!secret) return refuse('assignment_open_unavailable', 503);
+        const repoOpen = readOpen(input.repoOpenProof, identity, input.attemptId, clock(), secret);
+        const result = started.safeParse(await control('begin', {consentAccepted: true, consentVersion: input.consentVersion, repoOpen}, secret));
         if (!result.success) return refuse('media_unavailable', 503);
         const {uploadToken, ...receipt} = result.data;
         const t0 = Date.parse(receipt.startedAt), deadline = Date.parse(receipt.deadlineAt);
@@ -67,7 +73,7 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
     }
 
     if (input.action === 'finalize') {
-        // Universe accepts "attached" only for the actual, previously authenticated Attach action.
+        // Universe accepts a submitted stop only after the normal assignment submission succeeds.
         const result = summary.safeParse(await control('finalize', {reason: input.reason, expectedSegments: input.expectedSegments}));
         if (!result.success) return refuse('media_unavailable', 503);
         if (result.data.status !== 'recording') leases.delete(key);

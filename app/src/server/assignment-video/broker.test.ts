@@ -1,3 +1,6 @@
+import { assignmentMarker } from '@/server/git/assignment-bootstrap';
+import { expectedRepositoryURL } from '@/server/git/assignment-enrollment';
+import { makeChallenge, readOpen, sealOpen, signBegin } from './repo-open';
 import { createHash } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { recordingAction } from './broker';
@@ -14,7 +17,13 @@ const hash = createHash('sha256').update(bytes).digest('hex');
 const owner = createHash('sha256').update(issuer).update('\0').update(identity.subject).digest('hex');
 const input: Prepare = {action:'prepare', attemptId:attempt, sequence:0, startMs:2000, endMs:5000,
     sha256:hash, byteLength:bytes.length, mimeType:'video/webm'};
-const begin = {action:'begin' as const, attemptId:attempt, consentAccepted:true as const, consentVersion:1};
+const testSigner = 'fixture-only-independent-signing-key'.repeat(2);
+const repo = expectedRepositoryURL(identity.subject, 'a-' + attempt);
+const eligibility = {status:'eligible' as const, attemptId:attempt, jobId:'9', expiresAt:time(initial+60000),
+    repositoryUrl:repo, providerId:'provider123', ref:'refs/heads/main' as const,
+    manifestSha256:makeChallenge(attempt,repo).manifestSha256, windowStartedAt:time(initial), deadlineAt:time(initial+hour)};
+const witness = sealOpen(identity,eligibility,'qa-computer','qa-workspace',recording,initial+1000,testSigner);
+const begin = {repoOpenProof:witness.proof, action:'begin' as const, attemptId:attempt, consentAccepted:true as const, consentVersion:1};
 const state = {recordingId:recording,status:'recording',startedAt:time(initial),deadlineAt:time(initial+hour),
     stopRequestedAt:null,revoked:false};
 const signed = {putUrl:objectOrigin+'/universe-staging/assignment-media/v1/'+owner+'/'+attempt+'/'+recording+'/segments/0/'+hash+
@@ -35,7 +44,8 @@ const fetcher: typeof fetch = async (url,init) => {
     return Response.json(res);
 };
 const deps = () => ({leases:new Map(),fetcher,clock:()=>clock});
-beforeEach(()=>{clock=initial+5000;remoteState={...state};calls.length=0;});
+vi.mock('server-only',()=>({}));
+beforeEach(()=>{vi.stubEnv('UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET',testSigner);clock=initial+5000;remoteState={...state};calls.length=0;});
 
 describe('assignment media broker',()=>{
     it('requires a real retained session and strict inputs before a capability is usable',async()=>{
@@ -45,11 +55,25 @@ describe('assignment media broker',()=>{
         await expect(recordingAction({...identity,issuer:'https://other.example/'},begin,deps())).rejects.toMatchObject({status:401});
         expect(calls).toHaveLength(0);
     });
+    it('refuses cross-attempt/session, expired, missing-key or modified receipts before any service call',async()=>{
+        const d=deps();
+        for(const [actor,request] of [[{...identity,sessionId:'another'},begin],[identity,{...begin,attemptId:recording}],
+            [identity,{...begin,repoOpenProof:witness.proof.slice(0,27)+'a'.repeat(20)+witness.proof.slice(47)}]] as const){
+            await expect(recordingAction(actor,request,d)).rejects.toMatchObject({code:'assignment_open_required'});
+        }
+        clock+=301000;
+        await expect(recordingAction(identity,begin,d)).rejects.toMatchObject({code:'assignment_open_required'});
+        vi.stubEnv('UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET',undefined);
+        await expect(recordingAction(identity,begin,d)).rejects.toMatchObject({code:'assignment_open_unavailable'});
+        expect(calls).toHaveLength(0);
+    });
     it('holds the capability in server memory and exchanges only an exact verified object',async()=>{
         const d=deps(), returned=await recordingAction(identity,begin,d);
         expect(returned).toEqual(state);
         expect(JSON.parse(String(calls[0].init?.body))).toEqual({attemptId:attempt,osSessionId:identity.sessionId,
-            userIdToken:identity.token,consentAccepted:true,consentVersion:1});
+            userIdToken:identity.token,consentAccepted:true,consentVersion:1,
+            repoOpen:readOpen(witness.proof,identity,attempt,clock,testSigner)});
+        expect(calls[0].init?.headers).toMatchObject(signBegin(testSigner,String(calls[0].init?.body),clock));
         expect(calls[0].url).toBe('https://universe-staging.ezil.work/internal/assignment-video/begin');
         expect(await recordingAction(identity,input,d)).toEqual(signed);
         expect(calls.at(-2)?.url).toBe('https://universe-staging.ezil.work/internal/assignment-video/status');
@@ -58,8 +82,8 @@ describe('assignment media broker',()=>{
         expect(String(calls.at(-1)?.init?.body)).not.toContain(identity.token);
         expect(await recordingAction(identity,{action:'confirm',attemptId:attempt,sequence:0},d))
             .toEqual({recordingId:recording,sequence:0,confirmed:true});
-        await recordingAction(identity,{action:'finalize',attemptId:attempt,expectedSegments:1,reason:'attached'},d);
-        expect(JSON.parse(String(calls.at(-1)?.init?.body))).toMatchObject({reason:'attached',expectedSegments:1,osSessionId:identity.sessionId});
+        await recordingAction(identity,{action:'finalize',attemptId:attempt,expectedSegments:1,reason:'submitted'},d);
+        expect(JSON.parse(String(calls.at(-1)?.init?.body))).toMatchObject({reason:'submitted',expectedSegments:1,osSessionId:identity.sessionId});
         expect(d.leases.size).toBe(0);
     });
     it('does not reuse another actor, verified session or attempt capability',async()=>{
@@ -77,7 +101,7 @@ describe('assignment media broker',()=>{
         for(const invalid of [{...input,endMs:60001,startMs:0},{...input,endMs:10000},{...input,endMs:1000}]){
             await expect(recordingAction(identity,invalid,d)).rejects.toMatchObject({status:409});
         }
-        remoteState={...state,stopRequestedAt:time(initial+4000),stopReason:'attached'};
+        remoteState={...state,stopRequestedAt:time(initial+4000),stopReason:'submitted'};
         await expect(recordingAction(identity,input,d)).rejects.toMatchObject({status:409});
         remoteState={...state,revoked:true};
         await expect(recordingAction(identity,input,d)).rejects.toMatchObject({status:409});
@@ -85,9 +109,9 @@ describe('assignment media broker',()=>{
         await expect(recordingAction(identity,input,d)).rejects.toMatchObject({status:409});
         expect(calls.some(x=>x.url.includes('api-staging.'))).toBe(false);
     });
-    it('drains real pre-Attach slices and refuses all newer frames and expired confirmations',async()=>{
+    it('drains real pre-submission slices and refuses all newer frames and expired confirmations',async()=>{
         const d=deps();await recordingAction(identity,begin,d);
-        remoteState={...state,stopRequestedAt:time(initial+4500),stopReason:'attached'};
+        remoteState={...state,stopRequestedAt:time(initial+4500),stopReason:'submitted'};
         await expect(recordingAction(identity,{...input,endMs:4200},d)).resolves.toEqual(signed);
         await expect(recordingAction(identity,{...input,endMs:4501},d)).rejects.toMatchObject({status:409});
         await expect(recordingAction(identity,{action:'confirm',attemptId:attempt,sequence:0},d)).resolves.toMatchObject({confirmed:true});
@@ -97,7 +121,7 @@ describe('assignment media broker',()=>{
     it('does not close on a forged attach or timeout refused by the authoritative Universe owner',async()=>{
         const d=deps();await recordingAction(identity,begin,d);
         const rejected=vi.fn(async()=>Response.json({detail:'private upstream error'},{status:409}));
-        await expect(recordingAction(identity,{action:'finalize',attemptId:attempt,reason:'attached',expectedSegments:0},
+        await expect(recordingAction(identity,{action:'finalize',attemptId:attempt,reason:'submitted',expectedSegments:0},
             {...d,fetcher:rejected})).rejects.toMatchObject({status:409,code:'recording_refused'});
         expect(d.leases.size).toBe(1);
     });
@@ -112,13 +136,14 @@ describe('assignment media broker',()=>{
     });
     it('authorizes the real attempt without minting media, and rejects a foreign or stale eligibility receipt',async()=>{
         const d=deps();
-        const eligible={status:'eligible',attemptId:attempt,jobId:'8',expiresAt:time(initial+60000),unexpectedSecret:cap};
+        const eligible={...eligibility,unexpectedSecret:cap};
         const preflight={action:'preflight' as const,attemptId:attempt};
         const permitted=vi.fn(async()=>Response.json(eligible));
         const receipt=await recordingAction(identity,preflight,{...d,fetcher:permitted});
-        expect(receipt).toEqual({status:'eligible',attemptId:attempt,jobId:'8',expiresAt:eligible.expiresAt});
+        expect(receipt).toEqual(eligibility);
         expect(d.leases.size).toBe(0);
-        for(const change of [{attemptId:recording},{expiresAt:time(initial-1)},{jobId:'test'}]) {
+        for(const change of [{attemptId:recording},{expiresAt:time(initial-1)},{jobId:'test'},{repositoryUrl:'https://github.com/test/private.git'},{manifestSha256:'0'.repeat(64)},
+            {manifestSha256:createHash('sha256').update(assignmentMarker(repo,1)).digest('hex')},{windowStartedAt:time(initial+6000)}]) {
             await expect(recordingAction(identity,preflight,{...d,fetcher:async()=>Response.json({...eligible,...change})}))
                 .rejects.toMatchObject({status:404});
         }

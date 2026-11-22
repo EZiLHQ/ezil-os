@@ -1,12 +1,34 @@
-// Same-origin control for the protected assignment display. The guest never receives an upload capability.
+// Same-origin control for the participant-selected top-level OS tab. The opened checkout receives no control capability.
 const path = '/api/shell/assignment-video';
 const bucket = 'https://ezil-universe-staging-assignment-media-452630323510-aps1.s3.ap-south-1.amazonaws.com';
 const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const failure = (code) => Object.assign(new Error(code), {code});
 
-export function createAssignmentVideoTransport({attemptId, consentVersion, onStop, fetcher = globalThis.fetch,
+async function callControl(attemptId, action, fields, fetcher) {
+    const response = await fetcher(path, {method: 'POST', credentials: 'same-origin', cache: 'no-store',
+        redirect: 'error', signal: AbortSignal.timeout(18000),
+        headers: {'Content-Type':'application/json', 'X-Ezil-Assignment-Video':'1'},
+        body: JSON.stringify({action,attemptId,...fields})});
+    let data;
+    try { data = await response.json(); } catch { throw failure('recording_unavailable'); }
+    if (!response.ok) {
+        const code = data?.error?.code;
+        throw failure(typeof code === 'string' && /^[a-z_]{1,55}$/.test(code) ? code : 'recording_unavailable');
+    }
+    return data;
+}
+
+export async function checkAssignmentVideoEligibility(attemptId, {fetcher = globalThis.fetch, clock = Date.now} = {}) {
+    if (!uuid.test(attemptId)) throw failure('invalid_assignment');
+    const result = await callControl(attemptId, 'preflight', {}, fetcher);
+    if (result.status !== 'eligible' || result.attemptId !== attemptId || !Number.isFinite(Date.parse(result.expiresAt))
+        || Date.parse(result.expiresAt) <= clock()) throw failure('recording_unavailable');
+    return result;
+}
+
+export function createAssignmentVideoTransport({attemptId, repoOpenProof, consentVersion, onStop, fetcher = globalThis.fetch,
     clock = Date.now, pollMs = 3000}) {
-    if (!uuid.test(attemptId) || !Number.isSafeInteger(consentVersion) || consentVersion < 1)
+    if (!uuid.test(attemptId) || typeof repoOpenProof !== 'string' || !/^[A-Za-z0-9_-]{48,1700}$/.test(repoOpenProof) || !Number.isSafeInteger(consentVersion) || consentVersion < 1)
         throw failure('invalid_assignment');
     let recording, poll, expiry, disposed = false, stopped = false, misses = 0;
     function clearTimers() { clearTimeout(poll); clearTimeout(expiry); }
@@ -18,23 +40,13 @@ export function createAssignmentVideoTransport({attemptId, consentVersion, onSto
     }
     async function control(action, fields = {}) {
         if (disposed) throw failure('transport_disposed');
-        const response = await fetcher(path, {method: 'POST', credentials: 'same-origin', cache: 'no-store',
-            redirect: 'error', signal: AbortSignal.timeout(18000),
-            headers: {'Content-Type':'application/json', 'X-Ezil-Assignment-Video':'1'},
-            body: JSON.stringify({action,attemptId,...fields})});
-        let data;
-        try { data = await response.json(); } catch { throw failure('recording_unavailable'); }
-        if (!response.ok) {
-            const code = data?.error?.code;
-            throw failure(typeof code === 'string' && /^[a-z_]{1,55}$/.test(code) ? code : 'recording_unavailable');
-        }
-        return data;
+        return callControl(attemptId, action, fields, fetcher);
     }
     async function status() {
         const data = await control('status');
         if (!recording || data.recordingId !== recording.recordingId) throw failure('recording_changed');
         if (data.revoked || data.stopRequestedAt || data.status !== 'recording')
-            stop(['attached','timeout','stopped'].includes(data.stopReason) ? data.stopReason : 'stopped');
+            stop(['submitted','timeout','stopped'].includes(data.stopReason) ? data.stopReason : 'stopped');
         return data;
     }
     async function watch() {
@@ -44,15 +56,13 @@ export function createAssignmentVideoTransport({attemptId, consentVersion, onSto
         if (!disposed && !stopped) poll = setTimeout(watch, pollMs);
     }
     async function preflight() {
-        const proof = await control('preflight');
-        if (proof.status !== 'eligible' || proof.attemptId !== attemptId || !Number.isFinite(Date.parse(proof.expiresAt))
-            || Date.parse(proof.expiresAt) <= clock()) throw failure('recording_unavailable');
-        return proof;
+        if (disposed) throw failure('transport_disposed');
+        return checkAssignmentVideoEligibility(attemptId, {fetcher, clock});
     }
     async function begin() {
         if (stopped || disposed) throw failure('recording_closed');
         await preflight();
-        const data = await control('begin', {consentAccepted:true,consentVersion});
+        const data = await control('begin', {consentAccepted:true,consentVersion,repoOpenProof});
         const deadline = Date.parse(data.deadlineAt);
         if (!uuid.test(data.recordingId) || data.status !== 'recording' || !Number.isFinite(deadline) || deadline <= clock()
             || (recording && recording.recordingId !== data.recordingId)) throw failure('recording_changed');

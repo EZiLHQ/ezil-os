@@ -29,7 +29,7 @@ describe('same-origin actual assignment shell route',()=>{
         expect((await post()).status).toBe(404);
         expect(mocks.context).not.toHaveBeenCalled();
     });
-    it('accepts a normal staging legacy assignment without enabling Git enrollment',async()=>{
+    it('allows normal status reads when the optional Git pilot is unavailable',async()=>{
         vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN', undefined);
         expect((await post()).status).toBe(200);
     });

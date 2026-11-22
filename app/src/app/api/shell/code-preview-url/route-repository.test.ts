@@ -119,7 +119,7 @@ beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn(async (input: string | URL, init: RequestInit = {}) => {
         const url = new URL(String(input));
         s.requests.push({ url, init });
-        if (url.origin === UNIVERSE) { s.order.push('universe'); return s.universe!(JSON.parse(String(init.body))); }
+        if (url.origin === UNIVERSE || url.origin === 'https://universe-staging.ezil.work') { s.order.push('universe'); return s.universe!(JSON.parse(String(init.body))); }
         if (url.origin === WORKER) { s.order.push('worker'); return s.worker!(String(init.body)); }
         if (url.origin === 'https://github.com') { s.order.push('github'); return s.github!(url, init); }
         if (url.origin === 'https://github.ezil.work') { s.order.push('gateway'); return s.gateway!(JSON.parse(String(init.body)).scope); }
@@ -431,5 +431,53 @@ describe('standalone EZiL Git URL open', () => {
         expect(s.order.filter(event => event === 'gateway')).toHaveLength(2);
         const body = JSON.parse(String(s.requests.find(r => r.url.origin === WORKER)!.init.body));
         expect(Date.parse(body.privatePacket.git.expiresAt) - Date.now()).toBeGreaterThan(body.timeoutMs);
+    });
+});
+
+
+describe('the enrolled checkout signals the protected top-level shell only after the private preload acknowledges', () => {
+    it('binds a signed Worker challenge, immutable enrollment, real same-session owner, and port 5679', async () => {
+        const { expectedRepositoryURL } = await import('@/server/git/assignment-enrollment');
+        const { makeChallenge, readOpen } = await import('@/server/assignment-video/repo-open');
+        const attemptId = 'ecb246af-f1b8-4c72-8e6d-414c814de821';
+        const origin = 'https://os-staging.ezil.work';
+        const subject = 'auth0|builder';
+        const repositoryUrl = expectedRepositoryURL(subject, 'a-' + attemptId);
+        const now = Date.now();
+        const signingKey = 'test-only-repo-open-key-material'.repeat(2);
+        const enrolled = {status:'eligible',attemptId,jobId:'9',repositoryUrl,ref:'refs/heads/main',
+            manifestSha256:makeChallenge(attemptId,repositoryUrl).manifestSha256, providerId:'fg1wtcrexaf7acl0',
+            windowStartedAt:new Date(now-12000).toISOString(), deadlineAt:new Date(now+3480000).toISOString(),
+            expiresAt:new Date(now+120000).toISOString()};
+        vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN','https://universe-staging.ezil.work');
+        vi.stubEnv('UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET',signingKey);
+        s.universe = () => Response.json(enrolled);
+        s.gateway = scope => {const packet=standalonePacket(scope);packet.repository.canonicalURL=repositoryUrl;return Response.json(packet);};
+        let ack: 'good'|'missing'|'wrong' = 'good';
+        s.worker = body => {
+            const request = JSON.parse(body), challenge = request.assignmentPreload;
+            return Response.json({ok:true,folder:'/workspace/projects/'+request.repositoryId,
+                ...(challenge && ack !== 'missing' ? {assignmentPreload:{eventId:challenge.eventId,nonce:ack === 'good' ? challenge.nonce : '1'.repeat(64),
+                    port:5679,status:'acknowledged'}} : {})});
+        };
+        const open = () => POST(new Request(origin+'/api/shell/code-preview-url',{method:'POST',
+            headers:{origin,host:'os-staging.ezil.work','sec-fetch-site':'same-origin','content-type':'application/json'},
+            body:JSON.stringify({computerId:COMPUTER,intent:'open',repository:{url:repositoryUrl}})}));
+        const first = await open();
+        expect(first.status).toBe(200);
+        const body = await first.json();
+        const proof = body.assignmentOpen;
+        expect(proof).toMatchObject({attemptId,deadlineAt:enrolled.deadlineAt,windowStartedAt:enrolled.windowStartedAt});
+        const actor = {userId:USER,issuer:'https://id.ezil.work/',subject,sessionId:s.sessionId,expiresAt:now+600000};
+        expect(readOpen(proof.proof,actor,attemptId,Date.now(),signingKey)).toMatchObject({repositoryUrl,providerId:enrolled.providerId,manifestSha256:enrolled.manifestSha256});
+        for (const response of ['missing','wrong'] as const) {
+            ack=response;
+            const unconfirmed = await (await open()).json();
+            expect(unconfirmed.ok).toBe(true);expect(unconfirmed.assignmentOpen).toBeUndefined();
+        }
+        ack='good';
+        s.universe=()=>Response.json({...enrolled,providerId:'different'});
+        expect((await (await open()).json()).assignmentOpen).toBeUndefined();
+        expect(JSON.parse(String(s.requests.filter(item=>item.url.origin===WORKER).at(-1)?.init.body)).assignmentPreload).toBeUndefined();
     });
 });
