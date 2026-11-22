@@ -400,6 +400,18 @@ test('real Chromium: a Universe profile builder is read, filled and saved, and i
         const fifth = await h.read();
         assert.equal((await h.act({ kind: 'type', ref: elementNamed(fifth, 'Save changes').ref, text: 'x' })).json.error, 'browser_action_unavailable');
         assert.equal(h.posted.length, 1);
+
+        // The element a handle names is re-read before anything is sent: one that became something else since the
+        // read (same node, same ref attribute, a new label) is refused, and the click never happens.
+        const sixth = await h.read();
+        await h.tab.$eval('.js-save-btn', (el) => { el.textContent = 'Publish profile'; });
+        assert.equal((await h.act({ kind: 'click', ref: elementNamed(sixth, 'Save changes').ref })).json.error, 'browser_action_unavailable');
+        await delay(200);
+        assert.equal(h.posted.length, 1, 'the changed button was not clicked');
+        // Positive control: read again, and the new label is what may be clicked.
+        const seventh = await h.read();
+        assert.ok(elementNamed(seventh, 'Publish profile'));
+        assert.equal(elementNamed(seventh, 'Save changes'), undefined);
     } finally {
         await h.close();
     }
