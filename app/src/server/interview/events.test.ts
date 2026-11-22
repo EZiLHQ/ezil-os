@@ -19,6 +19,17 @@ describe('closed type lists match the frozen vectors', () => {
         expect([...OS_CLIENT_REPORTED]).toEqual(vectors.types.osClientReported);
         expect([...OS_EVENT_TYPES]).toEqual(vectors.types.bySource.os);
     });
+
+    // O7: the migration's own `type` CHECK list — read from the SQL file, not the TS mirror — is pinned to the
+    // vectors (`types.bySource.os`), so a drift between the DB constraint and the contract fails here. Types are
+    // unchanged between vectors 1.0.0 (this worktree) and 1.0.1.
+    it('the 0038 type CHECK list is exactly vectors.types.bySource.os', () => {
+        const sqlText = readFileSync(new URL('../../../drizzle/0038_interview_evidence.sql', import.meta.url), 'utf8');
+        const block = /type text NOT NULL CHECK \(type IN \(([\s\S]*?)\)\)/.exec(sqlText);
+        expect(block, 'the ezil_interview_events type CHECK (type IN (...)) block must exist in 0038').not.toBeNull();
+        const sqlTypes = [...block![1]!.matchAll(/'([^']+)'/g)].map((m) => m[1]);
+        expect(sqlTypes).toEqual(vectors.types.bySource.os);
+    });
 });
 
 describe('turn_start derivation (vectors.turnStartDerivation)', () => {
