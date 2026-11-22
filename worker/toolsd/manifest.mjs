@@ -146,11 +146,18 @@ export function validateManifest(value, { dirName } = {}) {
  * Canonical JSON: object keys sorted recursively, arrays left in order. The
  * catalog digest must be stable regardless of the key order a manifest author
  * happened to write (especially inside `inputSchema`).
+ *
+ * 🔴 The accumulator is `Object.create(null)`, NOT `{}`. `JSON.parse` makes an
+ * own `__proto__` key; assigning it onto a normal object sets the PROTOTYPE
+ * (and `JSON.stringify` then drops it), so two `inputSchema`s differing only by
+ * a `__proto__` member would hash identically — a digest collision. A
+ * null-prototype object takes `__proto__` as an ordinary own key that
+ * `JSON.stringify` serialises, so the two differ as they should.
  */
 export function canonicalize(value) {
   if (Array.isArray(value)) return value.map(canonicalize);
   if (value !== null && typeof value === 'object') {
-    const out = {};
+    const out = Object.create(null);
     for (const key of Object.keys(value).sort()) out[key] = canonicalize(value[key]);
     return out;
   }
@@ -159,6 +166,26 @@ export function canonicalize(value) {
 
 /** Byte-stable lexicographic order used for both the directory scan and the digest. */
 const byName = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+/**
+ * Is a tool's `argv[0]` safe to run from `toolDir`? A bare command name (no
+ * `./`) is a PATH lookup with nothing to contain → always true. A `./`-form
+ * path must realpath to a file strictly INSIDE `toolDir` (not the dir itself,
+ * not outside it, and it must exist). This is called by `scanCatalog` and AGAIN
+ * by the job runner immediately before spawn, because the file a `./argv[0]`
+ * names can be swapped for a symlink out of the directory between the scan and
+ * the call (TOCTOU) — the exec-time check is the authoritative one.
+ */
+export function argv0Contained(toolDir, argv0) {
+  if (typeof argv0 !== 'string' || !argv0.startsWith('./')) return true;
+  try {
+    const toolDirReal = realpathSync(toolDir);
+    const resolved = realpathSync(resolve(toolDirReal, argv0));
+    return resolved !== toolDirReal && resolved.startsWith(toolDirReal + sep);
+  } catch {
+    return false;
+  }
+}
 
 /**
  * `catalogDigest` = `"sha256:" + hex(SHA-256(JSON of the valid ToolEntry list
@@ -239,18 +266,11 @@ export function scanCatalog(workspaceRoot = DEFAULT_WORKSPACE_ROOT) {
     if (!result.ok) { invalid.push({ dir, error: result.error }); continue; }
 
     // The one on-disk check: a `./`-form argv[0] must realpath to a file strictly
-    // inside this tool's own directory. A bare command name is a PATH lookup and
-    // is resolved by the OS at exec time, not here.
-    if (result.argv0Kind === 'path') {
-      let contained = false;
-      try {
-        const toolDirReal = realpathSync(join(toolsDir, dir));
-        const resolved = realpathSync(resolve(toolDirReal, result.argv[0]));
-        contained = resolved !== toolDirReal && resolved.startsWith(toolDirReal + sep);
-      } catch {
-        contained = false;
-      }
-      if (!contained) { invalid.push({ dir, error: 'argv_outside_tool' }); continue; }
+    // inside this tool's own directory (`argv0Contained`). A bare command name is
+    // a PATH lookup and is resolved by the OS at exec time, not here. The job
+    // runner repeats this check just before spawn (TOCTOU).
+    if (!argv0Contained(join(toolsDir, dir), result.argv[0])) {
+      invalid.push({ dir, error: 'argv_outside_tool' }); continue;
     }
 
     tools.push(result.tool);

@@ -137,6 +137,24 @@ test('catalogDigest is stable under key reordering and order of the list', () =>
   assert.match(catalogDigest([]), /^sha256:[0-9a-f]{64}$/);
 });
 
+test('🔴 canonicalize keeps a __proto__ member (null-proto) so it changes the digest', () => {
+  // JSON.parse makes an OWN `__proto__` key; a plain-object accumulator would
+  // set the prototype and drop it. canonicalize uses Object.create(null).
+  const withProto = JSON.parse('{"a":1,"__proto__":{"x":1}}');
+  const c = canonicalize(withProto);
+  assert.ok(Object.prototype.hasOwnProperty.call(c, '__proto__'), '__proto__ kept as an own key');
+  assert.ok(JSON.stringify(c).includes('__proto__'), 'it serialises rather than vanishing');
+  // Two ToolEntries differing ONLY by a __proto__ member of inputSchema must
+  // hash differently — otherwise the member is a silent digest collision.
+  const plain = { name: 'a', description: 'd', inputSchema: { type: 'object' }, timeoutSeconds: 5, source: 'computer' };
+  const poisoned = {
+    name: 'a', description: 'd',
+    inputSchema: JSON.parse('{"type":"object","__proto__":{"polluted":true}}'),
+    timeoutSeconds: 5, source: 'computer',
+  };
+  assert.notEqual(catalogDigest([plain]), catalogDigest([poisoned]));
+});
+
 // ── scanCatalog: the filesystem half ────────────────────────────────────────
 
 function withWorkspace(run) {
