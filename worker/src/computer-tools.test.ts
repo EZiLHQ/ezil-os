@@ -9,12 +9,12 @@
 
 import { describe, expect, it } from 'bun:test';
 import {
-  handleComputerTools, toolsdAuthHeader,
-  COMPUTER_TOOLS_ORIGIN, TOOLSD_PORT,
+  handleComputerTools, toolsdAuthHeader, computerToolsEnabled, computerToolsV2Bounds,
+  COMPUTER_TOOLS_ORIGIN, COMPUTER_TOOLS_PATH, MAX_REQUEST_BODY_BYTES, TOOLSD_PORT,
   type ComputerToolsSandbox, type ComputerToolsDeps, type ComputerToolsEnv,
 } from './computer-tools';
 import { deriveAiProxyToken } from './ai-proxy';
-import type { PreviewTokenV2Claims } from './hmac';
+import { mintPreviewTokenV2, resolvePreviewSecrets, verifyPreviewTokenV2, type PreviewTokenV2Claims } from './hmac';
 
 const SANDBOX_ID = 'guac-abcdef0123456789-0123456789abcdef';
 const SECRET = 'test-neko-derivation-secret';
@@ -84,7 +84,7 @@ async function independentHeader(op: string, bodyStr: string, ts: number): Promi
 describe('handleComputerTools: happy path and MAC', () => {
   it('forwards input to /v1/<op> on port 9224 and relays the 200', async () => {
     const sb = fakeSandbox();
-    const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), sb, deps());
+    const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), () => sb, deps());
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, jobId: 'x' });
     expect(res.headers.get('cache-control')).toBe('no-store');
@@ -97,7 +97,7 @@ describe('handleComputerTools: happy path and MAC', () => {
 
   it('🔴 the x-ezil-toolsd header matches an independent MAC over the exact body', async () => {
     const sb = fakeSandbox();
-    await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), sb, deps());
+    await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), () => sb, deps());
     const header = (sb.calls[0]!.init!.headers as Record<string, string>)['x-ezil-toolsd'];
     expect(header).toMatch(/^v1\.\d+\.[0-9a-f]{64}$/);
     const ts = Number(header.split('.')[1]);
@@ -118,7 +118,7 @@ describe('handleComputerTools: happy path and MAC', () => {
 describe('handleComputerTools: refusals (nothing forwarded)', () => {
   it('a wrong origin is 404 tools_unavailable', async () => {
     const sb = fakeSandbox();
-    const res = await handleComputerTools(osRequest(callBody), ENV, 'https://evil.example', SANDBOX_ID, claims(), sb, deps());
+    const res = await handleComputerTools(osRequest(callBody), ENV, 'https://evil.example', SANDBOX_ID, claims(), () => sb, deps());
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ ok: false, error: 'tools_unavailable' });
     expect(sb.calls).toHaveLength(0);
@@ -137,7 +137,7 @@ describe('handleComputerTools: refusals (nothing forwarded)', () => {
     ];
     for (const c of cases) {
       const sb = fakeSandbox();
-      const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, c, sb, deps());
+      const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, c, () => sb, deps());
       expect(res.status).toBe(401);
       expect(await res.json()).toEqual({ ok: false, error: 'tools_unauthorized' });
       expect(sb.calls).toHaveLength(0);
@@ -147,7 +147,7 @@ describe('handleComputerTools: refusals (nothing forwarded)', () => {
   it('a sandbox id that does not match deriveSandboxId(userId, computerId) is 401', async () => {
     const sb = fakeSandbox();
     const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(),
-      sb, deps({ deriveSandboxId: () => 'guac-1111111111111111-2222222222222222' }));
+      () => sb, deps({ deriveSandboxId: () => 'guac-1111111111111111-2222222222222222' }));
     expect(res.status).toBe(401);
     expect(sb.calls).toHaveLength(0);
   });
@@ -162,7 +162,7 @@ describe('handleComputerTools: refusals (nothing forwarded)', () => {
       { op: 'call', input: {} }, // binding missing
     ]) {
       const sb = fakeSandbox();
-      const res = await handleComputerTools(osRequest(body), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), sb, deps());
+      const res = await handleComputerTools(osRequest(body), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), () => sb, deps());
       expect(res.status).toBe(400);
       expect(await res.json()).toEqual({ ok: false, error: 'tools_invalid_request' });
       expect(sb.calls).toHaveLength(0);
@@ -173,14 +173,14 @@ describe('handleComputerTools: refusals (nothing forwarded)', () => {
     const big = { binding: BINDING, op: 'exec', input: { command: 'echo ' + 'a'.repeat(41_000), timeoutSeconds: 5, background: false, requestId: 'r' } };
     expect(new TextEncoder().encode(JSON.stringify(big)).length).toBeGreaterThan(40_960);
     const sb = fakeSandbox();
-    const res = await handleComputerTools(osRequest(big), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), sb, deps());
+    const res = await handleComputerTools(osRequest(big), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), () => sb, deps());
     expect(res.status).toBe(400);
     expect(sb.calls).toHaveLength(0);
   });
 
   it('no derivation secret is 503 computer_unavailable, nothing forwarded', async () => {
     const sb = fakeSandbox();
-    const res = await handleComputerTools(osRequest(callBody), {}, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), sb, deps());
+    const res = await handleComputerTools(osRequest(callBody), {}, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), () => sb, deps());
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ ok: false, error: 'computer_unavailable' });
     expect(sb.calls).toHaveLength(0);
@@ -188,7 +188,7 @@ describe('handleComputerTools: refusals (nothing forwarded)', () => {
 
   it('🔴 a null boot nonce is 503 and the container is never contacted (never started)', async () => {
     const sb = fakeSandbox({ nonce: null });
-    const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), sb, deps());
+    const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), () => sb, deps());
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ ok: false, error: 'computer_unavailable' });
     expect(sb.calls).toHaveLength(0);
@@ -198,7 +198,7 @@ describe('handleComputerTools: refusals (nothing forwarded)', () => {
 describe('handleComputerTools: toolsd transport and relay', () => {
   it('an unreachable toolsd (runningContainerFetch throws) is 503', async () => {
     const sb = fakeSandbox({ fetch: async () => { throw new Error('getTcpPort fetch failed'); } });
-    const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), sb, deps());
+    const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), () => sb, deps());
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ ok: false, error: 'computer_unavailable' });
     expect(sb.calls).toHaveLength(1); // it WAS attempted
@@ -206,14 +206,14 @@ describe('handleComputerTools: toolsd transport and relay', () => {
 
   it('a 409 from runningContainerFetch (not running) maps to 503 computer_unavailable', async () => {
     const sb = fakeSandbox({ fetch: async () => new Response(JSON.stringify({ ok: false, error: 'runtime_not_running' }), { status: 409 }) });
-    const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), sb, deps());
+    const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), () => sb, deps());
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ ok: false, error: 'computer_unavailable' });
   });
 
   it('🔴 relays a toolsd 401 as 503 computer_unavailable (key mismatch is not a delegation refusal)', async () => {
     const sb = fakeSandbox({ fetch: async () => new Response(JSON.stringify({ ok: false, error: 'tools_unauthorized' }), { status: 401 }) });
-    const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), sb, deps());
+    const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), () => sb, deps());
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ ok: false, error: 'computer_unavailable' });
     expect(sb.calls).toHaveLength(1); // it WAS forwarded; only the status is remapped
@@ -221,7 +221,7 @@ describe('handleComputerTools: toolsd transport and relay', () => {
 
   it('a toolsd reply larger than 524,288 bytes is 503 computer_unavailable', async () => {
     const sb = fakeSandbox({ fetch: async () => new Response('x'.repeat(524_289), { status: 200 }) });
-    const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), sb, deps());
+    const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), () => sb, deps());
     expect(res.status).toBe(503);
     expect(await res.json()).toEqual({ ok: false, error: 'computer_unavailable' });
   });
@@ -229,10 +229,73 @@ describe('handleComputerTools: toolsd transport and relay', () => {
   it('relays toolsd error statuses and bodies unchanged (404, 429)', async () => {
     for (const [status, error] of [[404, 'tool_not_found'], [429, 'terminal_jobs_busy']] as const) {
       const sb = fakeSandbox({ fetch: async () => new Response(JSON.stringify({ ok: false, error }), { status }) });
-      const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), sb, deps());
+      const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), () => sb, deps());
       expect(res.status).toBe(status);
       expect(await res.json()).toEqual({ ok: false, error });
       expect(res.headers.get('cache-control')).toBe('no-store');
     }
+  });
+});
+
+describe('the route stays off and opens no DO until it is allowed to (WFWD-3/5/6/8)', () => {
+  const PATH = `/sandbox/${SANDBOX_ID}/computer-tools`;
+
+  it('WFWD-6: exists only while SANDBOX_COMPUTER_TOOLS is exactly on', () => {
+    for (const value of [undefined, '', 'On', 'true', '1', 'enabled', ' on']) {
+      expect(computerToolsEnabled({ SANDBOX_COMPUTER_TOOLS: value })).toBe(false);
+      expect(computerToolsV2Bounds({ ...ENV, SANDBOX_COMPUTER_TOOLS: value }, 'POST', PATH)).toBeNull();
+    }
+    expect(computerToolsEnabled({ SANDBOX_COMPUTER_TOOLS: 'on' })).toBe(true);
+    expect(COMPUTER_TOOLS_PATH.exec(PATH)?.[1]).toBe(SANDBOX_ID);
+  });
+
+  it('WFWD-3: bounds the body at 40,960 bytes before buffering, only for this route while it is on', () => {
+    const on = { ...ENV, SANDBOX_COMPUTER_TOOLS: 'on' };
+    expect(computerToolsV2Bounds(on, 'POST', PATH)?.maxBodyBytes).toBe(MAX_REQUEST_BODY_BYTES);
+    expect(MAX_REQUEST_BODY_BYTES).toBe(40_960);
+    expect(computerToolsV2Bounds(on, 'GET', PATH)).toBeNull();
+    expect(computerToolsV2Bounds(on, 'POST', `/sandbox/${SANDBOX_ID}/browser-observe`)).toBeNull();
+    expect(computerToolsV2Bounds(on, 'POST', `/sandbox/${SANDBOX_ID}/computer-tools/x`)).toBeNull();
+  });
+
+  it('WFWD-5: accepts only the primary secret, never the mission alias', async () => {
+    const MISSION = 'mission-alias-secret-value';
+    const env = { SANDBOX_HMAC_SECRET: SECRET, SANDBOX_MISSION_HMAC_SECRET: MISSION, SANDBOX_COMPUTER_TOOLS: 'on' };
+    const route = computerToolsV2Bounds(env, 'POST', PATH)!;
+    expect(resolvePreviewSecrets(route.secrets)).toEqual([SECRET]);
+    // Positive control: the generic list holds both.
+    expect(resolvePreviewSecrets(env)).toEqual([SECRET, MISSION]);
+    const req = { method: 'POST', path: PATH, body: new TextEncoder().encode('{}') };
+    const byMission = await mintPreviewTokenV2(MISSION, claims(), req);
+    const byPrimary = await mintPreviewTokenV2(SECRET, claims(), req);
+    expect((await verifyPreviewTokenV2(byMission, resolvePreviewSecrets(env), req)).ok).toBe(true);
+    expect((await verifyPreviewTokenV2(byMission, resolvePreviewSecrets(route.secrets), req)).ok).toBe(false);
+    expect((await verifyPreviewTokenV2(byPrimary, resolvePreviewSecrets(route.secrets), req)).ok).toBe(true);
+    // With no primary at all the route has no secret, never the alias.
+    const aliasOnly = computerToolsV2Bounds({ SANDBOX_MISSION_HMAC_SECRET: MISSION, SANDBOX_COMPUTER_TOOLS: 'on' }, 'POST', PATH)!;
+    expect(resolvePreviewSecrets(aliasOnly.secrets)).toEqual([]);
+  });
+
+  it('WFWD-8: a refused request never opens the sandbox', async () => {
+    const refused: [string, () => Promise<Response>][] = [
+      ['wrong origin', () => handleComputerTools(osRequest(callBody), ENV, 'https://evil.example', SANDBOX_ID, claims(), open, deps())],
+      ['no claims (unauthenticated)', () => handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, undefined, open, deps())],
+      ['claims for another sandbox', () => handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID,
+        claims({ sandboxId: 'guac-1111111111111111-2222222222222222' }), open, deps())],
+      ['stale claims', () => handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims({ ts: Date.now() - 60_000 }), open, deps())],
+      ['bad body', () => handleComputerTools(osRequest('{'), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), open, deps())],
+      ['no secret', () => handleComputerTools(osRequest(callBody), {}, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), open, deps())],
+    ];
+    let opened = 0;
+    function open(): ComputerToolsSandbox { opened += 1; return fakeSandbox(); }
+    for (const [label, run] of refused) {
+      const res = await run();
+      expect([label, res.status >= 400]).toEqual([label, true]);
+      expect([label, opened]).toEqual([label, 0]);
+    }
+    // Positive control: an accepted request opens it exactly once.
+    const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), open, deps());
+    expect(res.status).toBe(200);
+    expect(opened).toBe(1);
   });
 });

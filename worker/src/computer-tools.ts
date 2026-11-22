@@ -55,6 +55,36 @@ export interface ComputerToolsEnv {
   CLOUDFLARE_GUACAMOLE_HMAC_SECRET?: string;
 }
 
+/** The route path; the one capture is the sandbox id. */
+export const COMPUTER_TOOLS_PATH = /^\/sandbox\/(guac-[a-z0-9]{16}-[a-z0-9]{16})\/computer-tools$/;
+
+/**
+ * WFWD-6: the Worker's own off switch. Unless `SANDBOX_COMPUTER_TOOLS` is exactly `on` (unset by default), the
+ * route does not exist: index.ts neither matches it nor special-cases it before authentication.
+ */
+export function computerToolsEnabled(env: { SANDBOX_COMPUTER_TOOLS?: string }): boolean {
+  return env.SANDBOX_COMPUTER_TOOLS === 'on';
+}
+
+/**
+ * What the generic v2 pre-check (index.ts `preauthorizeV2`) may use for a request, decided before any body byte is
+ * buffered. For this route while it is on: its own 40,960-byte bound (WFWD-3), and only the primary secret, never
+ * the temporary `SANDBOX_MISSION_HMAC_SECRET` alias, which would bypass OS delegation and audit (WFWD-5). Anything
+ * else gets the generic `null` (the caller's defaults).
+ */
+export function computerToolsV2Bounds(
+  env: ComputerToolsEnv & { SANDBOX_COMPUTER_TOOLS?: string },
+  method: string,
+  pathname: string,
+): { maxBodyBytes: number; secrets: { SANDBOX_HMAC_SECRET?: string; CLOUDFLARE_GUACAMOLE_HMAC_SECRET?: string } } | null {
+  if (!computerToolsEnabled(env) || method.toUpperCase() !== 'POST' || !COMPUTER_TOOLS_PATH.test(pathname)) return null;
+  // No mission field at all: resolvePreviewSecrets() over this object can only ever return the primary.
+  return {
+    maxBodyBytes: MAX_REQUEST_BODY_BYTES,
+    secrets: { SANDBOX_HMAC_SECRET: env.SANDBOX_HMAC_SECRET, CLOUDFLARE_GUACAMOLE_HMAC_SECRET: env.CLOUDFLARE_GUACAMOLE_HMAC_SECRET },
+  };
+}
+
 /** The sandbox-stub methods used here (both are `EzilWorkspacePersistRpc` members). */
 export interface ComputerToolsSandbox {
   getAiProxyNonce(): Promise<string | null>;
@@ -128,7 +158,8 @@ export async function handleComputerTools(
   origin: string,
   sandboxId: string,
   claims: PreviewTokenV2Claims | undefined,
-  sandbox: ComputerToolsSandbox,
+  /** WFWD-8: called only after the origin, claims and body checks pass, so a refused request touches no DO. */
+  openSandbox: () => ComputerToolsSandbox,
   deps: ComputerToolsDeps,
 ): Promise<Response> {
   // 3.3: the one fixed origin.
@@ -166,6 +197,7 @@ export async function handleComputerTools(
   // (never booted) → unavailable, and nothing is sent.
   const secret = resolveNekoDerivationSecret(env);
   if (!secret) return reply(503, { ok: false, error: 'computer_unavailable' });
+  const sandbox = openSandbox();
   const nonce = await sandbox.getAiProxyNonce();
   if (!nonce) return reply(503, { ok: false, error: 'computer_unavailable' });
 
