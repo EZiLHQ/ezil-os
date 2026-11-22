@@ -38,12 +38,23 @@
  * in a ref. Genuinely non-contract conditions (unknown path, wrong method,
  * oversized body) answer 404/405/413 — also in the error shape, so a caller
  * that only ever reads the body still gets a usable answer.
+ *
+ * ── Who may call a verb (browser verbs v2 §3) ───────────────────────────────
+ * 🔴 Every `SIDECAR_WIRE` route takes `Authorization: Bearer
+ * $EZIL_WORKER_BROWSER_MCP_TOKEN`, the per-sandbox token the Worker derives
+ * and sends from `handleBrowserSidecar`. Missing, wrong or unset answers 401
+ * with one fixed body, before the body is read and without touching the page.
+ * Code chats reach the same verbs at `POST /internal/code/browser/<verb>`
+ * with the Code bearer, no `Origin` header and a loopback peer (the guards of
+ * the Code open-url route), and every page in `owner_app` or `idp_transit` is
+ * `origin_read_only` there. That is agent policy, not confinement: see
+ * `docs/contracts/browser-verbs-v2.md` §8.
  */
 
 import { createHash, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
-import { ERROR_CODES } from './contract.mjs';
+import { CODE_BROWSER_PATH_PREFIX, CODE_BROWSER_VERBS, ERROR_CODES } from './contract.mjs';
 import { VERBS } from './verbs.mjs';
 import { redactDeep } from './redact.mjs';
 import { createMcpObservation, observationPayload, OBSERVE_PATH } from './mcp-observation.mjs';
@@ -59,6 +70,15 @@ const CDP_URL = process.env.EZIL_CDP_URL ?? `http://127.0.0.1:${CDP_PORT}`;
  *  an attempt to wedge the process. */
 const MAX_BODY_BYTES = 256 * 1024;
 const BROWSER_OPEN_BODY_BYTES = 4096;
+/** What an observation may send without the Worker bearer: the legacy read (≤ 1024) and nothing larger. */
+const OBSERVE_BODY_BYTES = 4096;
+/**
+ * What a bearer-authorised v2 observation may send. The largest is `fill_form`:
+ * 20 fields of up to 4000 characters, which JSON can spell as up to 24,000
+ * bytes each (`\uXXXX` escapes), plus the binding, handles and envelope that
+ * the App and the Worker add. 513 KiB holds the worst case with room to spare.
+ */
+export const OBSERVE_CONTROL_BODY_BYTES = 513 * 1024;
 const BOOT_CAPABILITY = /^[A-Za-z0-9_-]{43}$/;
 
 function validBrowserOpenAuthorization (header, capability) {
@@ -67,6 +87,27 @@ function validBrowserOpenAuthorization (header, capability) {
     const value = header.slice(7);
     return BOOT_CAPABILITY.test(value) && timingSafeEqual(Buffer.from(value), Buffer.from(capability));
 }
+
+/** One request header, or undefined; never throws on a request without a header map. */
+function headerOf (req, name) {
+    const headers = req.headers;
+    return headers && typeof headers === 'object' ? headers[name] : undefined;
+}
+
+/** The peer is this machine: the same check as the Code open-url route. */
+function loopbackPeer (req) {
+    return ['127.0.0.1', '::ffff:127.0.0.1'].includes(req.socket?.remoteAddress);
+}
+
+/**
+ * 🔴 The ONE body a refused credential gets, on every verb route. It is built
+ * from nothing in the request, the page or the surface, so `respond()` writes
+ * it as it is and never gathers secrets for it.
+ */
+const REFUSED = Object.freeze({ ok: false, error: 'bad_request', detail: 'Request failed.' });
+
+/** Code chats never act on the user's signed-in apps or the IdP (contract §3). */
+const CODE_DENIED_TIERS = Object.freeze(['owner_app', 'idp_transit']);
 
 /** The complete set of routes. `VERBS` keys are `"<METHOD> <path>"`. */
 export const ROUTES = Object.keys(VERBS);
@@ -99,6 +140,8 @@ export function createSidecarServer (surface, {
         // The open receipt is constructed from closed fields in the private
         // handler and must not inspect the desktop user's existing pages.
         else if (kind === 'browser-open') safe = payload;
+        // A refused credential gets the one constant, whatever was passed.
+        else if (kind === 'refused') safe = REFUSED;
         else {
             const secrets = await surface.allSecrets();
             safe = redactDeep(payload, secrets);
@@ -114,6 +157,8 @@ export function createSidecarServer (surface, {
 
     // Fixed text only: built from the constant route list, never from the request.
     const UNKNOWN_VERB_DETAIL = `Unknown verb. This surface is a fixed verb set (${ROUTES.join(', ')}) and has no CDP passthrough.`;
+    const UNKNOWN_CODE_VERB_DETAIL = `Unknown verb. Code chats reach ${CODE_BROWSER_PATH_PREFIX}<verb> for a fixed verb set `
+        + `(${CODE_BROWSER_VERBS.join(', ')}) and there is no CDP passthrough.`;
 
     function errorPayload (code, detail = 'Request failed.') {
         // Return a value from the fixed contract, never an exception's own string.
@@ -162,11 +207,15 @@ export function createSidecarServer (surface, {
         if (req.url === OBSERVE_PATH && method === 'POST') {
             let outcome = { ok: false, error: 'browser_invalid_request' };
             let modern = false;
+            // Only a bearer-authorised control caller may send a v2-sized body;
+            // the unauthenticated legacy read keeps its small bound.
+            const authorized = workerBrowserControl
+                && validBrowserOpenAuthorization(headerOf(req, 'authorization'), workerBrowserOpenToken);
             try {
-                const raw = await readBody(req, 4096);
+                const raw = await readBody(req, authorized ? OBSERVE_CONTROL_BODY_BYTES : OBSERVE_BODY_BYTES);
                 const input = JSON.parse(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(raw));
                 modern = input !== null && typeof input === 'object' && Object.hasOwn(input, 'action');
-                if (modern && (!workerBrowserControl || !validBrowserOpenAuthorization(req.headers.authorization, workerBrowserOpenToken))) {
+                if (modern && !authorized) {
                     return respond(res, 401, { ok: false, error: 'browser_unavailable' }, 'browser-ui');
                 }
                 if (modern || raw.byteLength <= 1024) {
@@ -182,6 +231,7 @@ export function createSidecarServer (surface, {
             } catch { /* The closed error contains no input or provider data. */ }
             return respond(res, 200, outcome, modern ? 'browser-ui' : 'observation');
         }
+        if (path.startsWith(CODE_BROWSER_PATH_PREFIX)) return handleCodeBrowserVerb(req, res, method, path);
 
         const handler = VERBS[key];
         if (!handler) {
@@ -196,26 +246,17 @@ export function createSidecarServer (surface, {
             );
         }
 
+        // 🔴 THE VERB BEARER. Checked before the body is read, so a caller
+        // without it can neither drive the browser nor make this process
+        // buffer a body, and the refusal never touches the page.
+        if (!validBrowserOpenAuthorization(headerOf(req, 'authorization'), workerBrowserOpenToken)) {
+            return respond(res, 401, null, 'refused');
+        }
+
         let body = {};
         if (method !== 'GET') {
-            let raw;
-            try {
-                raw = await readBody(req);
-            } catch (err) {
-                console.error('[ezil-sidecar] body read failed:', err);
-                return respond(res, err?.httpStatus === 413 ? 413 : 400, errorPayload('bad_request'));
-            }
-            if (raw.length > 0) {
-                try {
-                    body = JSON.parse(raw.toString('utf8'));
-                } catch (err) {
-                    console.error('[ezil-sidecar] invalid JSON:', err);
-                    return respond(res, 200, errorPayload('bad_request'));
-                }
-            }
-            if (body === null || typeof body !== 'object' || Array.isArray(body)) {
-                return respond(res, 200, errorPayload('bad_request'));
-            }
+            body = await verbBody(req, res);
+            if (body === null) return undefined;
         }
 
         try {
@@ -223,6 +264,67 @@ export function createSidecarServer (surface, {
             return respond(res, 200, payload);
         } catch (err) {
             console.error('[ezil-sidecar] verb failed:', err);
+            return respond(res, 200, errorPayload(err?.code));
+        }
+    }
+
+    /**
+     * A verb request's JSON object body, or null once the refusal has been
+     * written (400/413 for an unreadable or oversized body, `bad_request` at
+     * 200 for anything that is not one JSON object).
+     */
+    async function verbBody (req, res) {
+        let raw;
+        try {
+            raw = await readBody(req);
+        } catch (err) {
+            console.error('[ezil-sidecar] body read failed:', err);
+            await respond(res, err?.httpStatus === 413 ? 413 : 400, errorPayload('bad_request'));
+            return null;
+        }
+        let body = {};
+        if (raw.length > 0) {
+            try {
+                body = JSON.parse(raw.toString('utf8'));
+            } catch (err) {
+                console.error('[ezil-sidecar] invalid JSON:', err);
+                await respond(res, 200, errorPayload('bad_request'));
+                return null;
+            }
+        }
+        if (body === null || typeof body !== 'object' || Array.isArray(body)) {
+            await respond(res, 200, errorPayload('bad_request'));
+            return null;
+        }
+        return body;
+    }
+
+    /**
+     * `POST /internal/code/browser/<verb>`: a Code chat's own door to the
+     * `CODE_BROWSER_VERBS`. The path is exact (no query, no trailing slash);
+     * the guards are the Code open-url route's, all three; the body and the
+     * answer are the `SIDECAR_WIRE` entry for `POST /<verb>`, through the same
+     * redacting `respond()`. Every page in `owner_app` or `idp_transit` is
+     * `origin_read_only` here: the verbs enforce `denyTiers` themselves.
+     */
+    async function handleCodeBrowserVerb (req, res, method, path) {
+        const verb = path.slice(CODE_BROWSER_PATH_PREFIX.length);
+        const route = `POST /${verb}`;
+        if (req.url !== path || !CODE_BROWSER_VERBS.includes(verb) || !Object.hasOwn(VERBS, route)) {
+            return respond(res, 404, errorPayload('bad_request', UNKNOWN_CODE_VERB_DETAIL));
+        }
+        if (method !== 'POST') return respond(res, 405, errorPayload('bad_request', UNKNOWN_CODE_VERB_DETAIL));
+        if (headerOf(req, 'origin') !== undefined || !loopbackPeer(req)
+            || !validBrowserOpenAuthorization(headerOf(req, 'authorization'), codeBrowserOpenToken)) {
+            return respond(res, 401, null, 'refused');
+        }
+        const body = await verbBody(req, res);
+        if (body === null) return undefined;
+        try {
+            const payload = await VERBS[route](surface, body, { denyTiers: new Set(CODE_DENIED_TIERS) });
+            return respond(res, 200, payload);
+        } catch (err) {
+            console.error('[ezil-sidecar] code verb failed:', err);
             return respond(res, 200, errorPayload(err?.code));
         }
     }
