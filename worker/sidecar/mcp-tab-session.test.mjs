@@ -6,7 +6,7 @@ import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { chromium } from 'playwright-core';
 import { createMcpObservation } from './mcp-observation.mjs';
-import { browserTabPolicy } from './mcp-tab-actions.mjs';
+import { applyPublicAction, browserTabPolicy } from './mcp-tab-actions.mjs';
 
 const BINDING = 'a'.repeat(64);
 const CHROME = process.env.EZIL_TEST_CHROMIUM;
@@ -21,6 +21,25 @@ test('the existing owned Browser allows only reviewed public and exact fixture d
         'https://example.com:9222/', 'https://someone@example.com/', 'https://example.com/?sensitive=x',
         'https://example.com/login', 'https://example.com/a%2fadmin', 'https://os-staging.ezil.work/api/shell/session',
     ]) assert.equal(permit(url), null, url);
+});
+
+test('the approved-page adapter refuses on its own every v2-only action and any text past the v1 bound', async () => {
+    // A second lock behind the session's own check: called directly, it touches nothing and dispatches nothing.
+    const touched = [];
+    const page = new Proxy({}, { get: (_, name) => { touched.push(String(name)); return () => { throw new Error('touched'); }; } });
+    const ref = 'r'.repeat(22);
+    const refs = new Map([[ref, { kind: 'text_input', label: 'Test message', element: page }]]);
+    let dispatched = 0;
+    for (const action of [
+        { kind: 'fill_form', fields: [{ ref, text: 'v' }] }, { kind: 'select', ref, values: ['a'] }, { kind: 'scroll', dy: 10 },
+        { kind: 'scroll', ref }, { kind: 'press', key: 'Enter', ref }, { kind: 'type', ref, text: 'two\nlines' },
+        { kind: 'type', ref, text: 'x'.repeat(81) },
+    ]) {
+        assert.equal(await applyPublicAction(page, action, refs, browserTabPolicy(), () => { dispatched += 1; }, async () => true), false,
+            JSON.stringify(action));
+    }
+    assert.equal(dispatched, 0);
+    assert.deepEqual(touched, []);
 });
 
 test('stock Browser home is neutral and every other local file remains outside the view', async () => {
