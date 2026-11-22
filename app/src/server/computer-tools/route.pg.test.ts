@@ -22,7 +22,6 @@ const databaseUrl = process.env.DELEGATION_TEST_DATABASE_URL;
 const owner = randomUUID();
 const stranger = randomUUID();
 const computer = randomUUID();
-const routePath = `/api/mcp/computer-tools/${computer}`;
 const JOB = 'JobIdAAAAAAAAAAAAAAAAA'; // 22 chars matching ^[A-Za-z0-9_-]{22}$
 
 const jobReply = (over: Record<string, unknown> = {}) => ({
@@ -77,15 +76,17 @@ describe.skipIf(!databaseUrl)('staging computer-tools route: real delegation, pl
     afterAll(async () => { await client?.end(); });
 
     async function signed(op: ComputerToolsOp, bodyObj: Record<string, unknown>,
-        { user = owner, scope = SCOPE_FOR_OP[op], issuer = COMPUTER_TOOLS_STAGING_MCP }: { user?: string; scope?: string; issuer?: string } = {}) {
+        { user = owner, scope = SCOPE_FOR_OP[op], issuer = COMPUTER_TOOLS_STAGING_MCP, forComputer = computer }:
+        { user?: string; scope?: string; issuer?: string; forComputer?: string } = {}) {
+        const path = `/api/mcp/computer-tools/${forComputer}`;
         const raw = JSON.stringify(bodyObj);
-        const material = [COMPUTER_TOOLS_PROTOCOL, 'POST', routePath, raw].join('\n');
+        const material = [COMPUTER_TOOLS_PROTOCOL, 'POST', path, raw].join('\n');
         const n = Math.floor(Date.now() / 1000);
         const assertion = await signAssertion(signer, {
             iss: issuer, aud: COMPUTER_TOOLS_STAGING_OS, sub: user, idp_iss: SUPABASE_ISSUER, client_id: CLIENT_ID,
             scope, proc: procedureForOp(op), inp: inputDigest(material), jti: randomUUID(), iat: n, exp: n + 60,
         });
-        return new Request(COMPUTER_TOOLS_STAGING_OS + routePath, {
+        return new Request(COMPUTER_TOOLS_STAGING_OS + path, {
             method: 'POST', body: raw, headers: { authorization: `EZiL-Delegation ${assertion}`, 'content-type': 'application/json' },
         });
     }
@@ -171,6 +172,19 @@ describe.skipIf(!databaseUrl)('staging computer-tools route: real delegation, pl
         const rows = await rowsFor(requestId);
         expect(rows).toHaveLength(2);
         expect(rows.find((r) => r.replay_of !== null)).toMatchObject({ error: 'request_conflict' });
+    });
+
+    it('refuses an AWS-EC2 computer as 404 computer_not_found (unsupported in this slice), without forwarding', async () => {
+        const aws = randomUUID();
+        await client.unsafe('INSERT INTO public.ezil_computers (id,user_id,slot) VALUES ($1::uuid,$2::uuid,2)', [aws, owner]);
+        await client.unsafe(
+            "INSERT INTO public.ezil_computer_placements (computer_id,owner_user_id,provider,workspace_store,generation,lease_epoch,state,updated_at) VALUES ($1::uuid,$2::uuid,'aws-ec2','ebs',1,1,'RUNNING',now())",
+            [aws, owner],
+        );
+        const res = await post(await signed('list', { op: 'list' }, { forComputer: aws }));
+        expect(res.status).toBe(404);
+        expect((await res.json()).error).toBe('computer_not_found');
+        expect(worker).not.toHaveBeenCalled();
     });
 
     it('two concurrent first calls never both execute: one originating row, exactly one exec forward', async () => {
