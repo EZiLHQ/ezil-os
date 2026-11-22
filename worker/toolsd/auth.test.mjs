@@ -283,3 +283,44 @@ test('a well-authenticated request with a malformed op body is tools_invalid_req
   assert.deepEqual(res.body, { ok: false, error: 'tools_invalid_request' });
   assert.equal(spy.calls.length, 0, 'an invalid body executes nothing');
 });
+
+test('🔴 the Host check accepts the bare name and the :9224 form, and nothing else', async () => {
+  const body = JSON.stringify({ name: 'x', arguments: {}, requestId: 'r' });
+  // Accepted: both forms (the MAC is Host-independent, so a valid MAC passes).
+  for (const host of ['toolsd.ezil.invalid', 'toolsd.ezil.invalid:9224']) {
+    const { server, spy } = makeServer();
+    const res = await drive(server, valid('/v1/call', body, { extraHeaders: { host } }));
+    assert.equal(res.status, 200, `host '${host}' accepted`);
+    assert.equal(spy.calls.length, 1);
+  }
+  // Refused: wrong port, a real address, localhost, a lookalike, missing.
+  for (const host of ['toolsd.ezil.invalid:9223', '127.0.0.1:9224', 'localhost', 'localhost:9224', 'toolsd.ezil.invalid.evil.com', 'toolsd.ezil.invalid:']) {
+    const { server, spy } = makeServer();
+    const res = await drive(server, valid('/v1/call', body, { extraHeaders: { host } }));
+    assert.equal(res.status, 401, `host '${host}' refused`);
+    assert.equal(spy.calls.length, 0);
+  }
+});
+
+test('🔴 a refusal logs ONLY the failed check name — never the MAC, header or body', async () => {
+  const { server } = makeServer();
+  const body = JSON.stringify({ name: 'secretname', arguments: {}, requestId: 'secret-rid' });
+  const ts = Date.now();
+  const good = sign(String(ts), '/v1/call', body);
+  const badMac = good.replace(/.$/, (c) => (c === '0' ? '1' : '0'));
+  const logs = [];
+  const original = console.warn;
+  console.warn = (...args) => logs.push(args.map(String).join(' '));
+  try {
+    const res = await drive(server, valid('/v1/call', body, { ts, headerOverride: badMac }));
+    assert.equal(res.status, 401);
+  } finally {
+    console.warn = original;
+  }
+  const joined = logs.join('\n');
+  assert.ok(joined.includes('step=mac'), `the failed check is named (got: ${joined})`);
+  // The MAC hex, the full header, and the body must never be logged.
+  assert.ok(!joined.includes(badMac.split('.')[2]), 'the MAC hex is not logged');
+  assert.ok(!joined.includes(badMac), 'the x-ezil-toolsd value is not logged');
+  assert.ok(!joined.includes('secret-rid') && !joined.includes('secretname'), 'the body is not logged');
+});

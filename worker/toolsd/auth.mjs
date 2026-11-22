@@ -25,7 +25,14 @@ const PATH_RE = /^\/v1\/(list|refresh|call|exec|job|cancel)$/;
 /** `v1.<ts>.<mac>`: ts = epoch milliseconds (decimal), mac = 64 lowercase hex. */
 const HEADER_RE = /^v1\.([0-9]{1,20})\.([0-9a-f]{64})$/;
 
-export const EXPECTED_HOST = 'toolsd.ezil.invalid';
+/**
+ * The only acceptable `Host` values. Both the bare name and the `:9224` form
+ * are allowed because we cannot yet confirm whether `getTcpPort().fetch()`
+ * appends the port, and both are equally safe: a browser can never present an
+ * `.invalid` host as an `Origin`, so neither widens the browser-refusal. Any
+ * other host (a real IP, `localhost`, a wrong port) is refused.
+ */
+export const EXPECTED_HOSTS = ['toolsd.ezil.invalid', 'toolsd.ezil.invalid:9224'];
 export const EXPECTED_CONTENT_TYPE = 'application/json';
 export const MAX_BODY_BYTES = 40_960;
 export const TS_WINDOW_MS = 60_000;
@@ -85,8 +92,8 @@ export function authorize({ method, path, headers, bodyBytes, now, key, replay }
   if (!pathMatch) return deny('path');
   const op = pathMatch[1];
 
-  // 2. Host is exactly the contract constant.
-  if (headers.host !== EXPECTED_HOST) return deny('host');
+  // 2. Host is exactly the contract constant (bare or the :9224 form).
+  if (!EXPECTED_HOSTS.includes(headers.host)) return deny('host');
 
   // 3. No browser-shaped request may reach here: an Origin or any Sec-Fetch-*
   //    header means a page's fetch, which the Worker's server-to-server call
