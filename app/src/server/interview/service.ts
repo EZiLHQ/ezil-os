@@ -160,16 +160,20 @@ export async function adminRegister(db: InterviewDb, input: { gateOn: boolean; a
     const body = input.body as Record<string, unknown> | null;
     if (!body || typeof body !== 'object' || Array.isArray(body)) return refuse(400, 'invalid_request', 'Invalid body.');
     const { interviewId, repositoryId, canonicalURL, handle, ownerEzilIdSubject, worksAccountId } = body as Record<string, unknown>;
-    const canonical = canonicalGitQaUrl(canonicalURL);
     if (typeof interviewId !== 'string' || !UUID_V4.test(interviewId)
         || typeof repositoryId !== 'string' || !BIGINT_RE.test(repositoryId)
-        || !canonical
+        || typeof canonicalURL !== 'string'
         || typeof handle !== 'string' || handle.length < 1 || handle.length > 100
         || typeof ownerEzilIdSubject !== 'string' || ownerEzilIdSubject.length < 1 || ownerEzilIdSubject.length > 255
         || typeof worksAccountId !== 'string' || !BIGINT_RE.test(worksAccountId)) {
         return refuse(400, 'invalid_request', 'Invalid body.');
     }
-    const outcome = await registerInterview(db, { interviewId, repositoryId, canonicalUrl: canonical, handle, ownerEzilIdSubject, worksAccountId });
+    // E5 (§7.3): the canonicalURL must already be the exact form the os-access git-qa parser produces
+    // (https://git-qa.ezil.work/<owner>/<name>.git, lowercase as Works returns it). A non-canonical spelling —
+    // uppercase owner/name, a trailing slash, an explicit :443, a missing .git — is refused, never normalised, so
+    // the gate's and consent's exact-string lookups only ever key on the one spelling.
+    if (canonicalGitQaUrl(canonicalURL) !== canonicalURL) return refuse(400, 'invalid_request', 'canonicalURL is not in canonical form.');
+    const outcome = await registerInterview(db, { interviewId, repositoryId, canonicalUrl: canonicalURL, handle, ownerEzilIdSubject, worksAccountId });
     if (outcome === 'conflict') return refuse(409, 'conflict', 'A different interview already exists for this id or URL.');
     const row = await getInterviewById(db, interviewId);
     return ok(outcome === 'created' ? 201 : 200, { interviewId, state: row!.state, identity: identityOf(row!) });

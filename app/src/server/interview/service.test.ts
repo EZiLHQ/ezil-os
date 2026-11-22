@@ -83,3 +83,25 @@ describe('canonicalGitQaUrl normalizes exactly the git-qa remotes', () => {
         expect(canonicalGitQaUrl(42)).toBeNull();
     });
 });
+
+describe('E5: admin register refuses a non-canonical canonicalURL (400 invalid_request), never normalises', () => {
+    const base = { interviewId: ID, repositoryId: '4211', handle: 'candidate-a', ownerEzilIdSubject: 'auth0|abc', worksAccountId: '1187' };
+    // UNTOUCHED throws on any DB access, so a 400 that returns (rather than throws) proves the refusal is pre-DB.
+    const register = (canonicalURL: unknown) => adminRegister(UNTOUCHED, { gateOn: true, authz: 'ok', body: { ...base, canonicalURL } });
+    it.each([
+        ['uppercase owner/name', 'https://git-qa.ezil.work/Candidate-A/Interview-1121.git'],
+        ['trailing slash', 'https://git-qa.ezil.work/candidate-a/interview-1121.git/'],
+        ['missing .git', 'https://git-qa.ezil.work/candidate-a/interview-1121'],
+        ['no .git with trailing slash', 'https://git-qa.ezil.work/candidate-a/interview-1121/'],
+        ['explicit :443', 'https://git-qa.ezil.work:443/candidate-a/interview-1121.git'],
+        ['foreign host', 'https://github.com/candidate-a/interview-1121.git'],
+        ['not a string', 42],
+    ])('%s -> 400 invalid_request, DB untouched', async (_label, url) => {
+        const result = await register(url);
+        expect(result.status).toBe(400);
+        expect(code(result)).toBe('invalid_request');
+    });
+    it('positive control: the exact canonical form os-access produces passes validation and reaches the DB', async () => {
+        await expect(register('https://git-qa.ezil.work/candidate-a/interview-1121.git')).rejects.toThrow('DB touched');
+    });
+});
