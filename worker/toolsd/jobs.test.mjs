@@ -10,13 +10,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, mkdirSync, rmSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   createJobManager, resolveCwd, StreamCapture,
-  JOB_BASE_ENV, privDropArgv, STREAM_RETENTION_BYTES, MAX_RUNNING,
+  JOB_BASE_ENV, privDropArgv, SETPRIV, STREAM_RETENTION_BYTES, MAX_RUNNING,
 } from './jobs.mjs';
+import { scanCatalog } from './manifest.mjs';
 
 /** A controllable fake child + spawner + process-group killer. */
 function harness() {
@@ -98,13 +99,18 @@ test('StreamCapture keeps the last 65,536 bytes and counts everything', () => {
 test('call spawns via setpriv with a from-scratch env + EZIL_TOOL_DIR, stdin = JSON args', async () => {
   const root = workspace();
   const h = harness();
+  // A real tool dir + run.sh so the exec-time ./argv[0] containment check passes.
+  mkdirSync(join(root, '.ezil/tools/hello'), { recursive: true });
+  writeFileSync(join(root, '.ezil/tools/hello/run.sh'), '#!/bin/sh\n', { mode: 0o755 });
   const byName = new Map([['hello', { argv: ['./run.sh'], dir: join(root, '.ezil/tools/hello'), timeoutSeconds: 10 }]]);
   const jm = createJobManager({ workspaceRoot: root, getScan: scanWith(byName), ...h, ...fast });
   try {
     const p = jm.call({ name: 'hello', arguments: { a: 1 }, requestId: 'req-1' });
     const child = h.last();
-    assert.deepEqual(child.spawnArgs.cmd, 'setpriv');
+    assert.deepEqual(child.spawnArgs.cmd, SETPRIV);
+    assert.equal(SETPRIV, '/usr/bin/setpriv');
     assert.deepEqual(child.spawnArgs.args, privDropArgv(['./run.sh']).slice(1));
+    assert.ok(child.spawnArgs.args.includes('--clear-groups'));
     assert.equal(child.spawnArgs.opts.cwd, join(root, '.ezil/tools/hello'));
     assert.equal(child.spawnArgs.opts.detached, true);
     assert.equal(child.spawnArgs.opts.env.EZIL_TOOL_DIR, join(root, '.ezil/tools/hello'));
@@ -338,6 +344,112 @@ test('the serialized Job carries every contract field', async () => {
     assert.equal(job.name, null);
     assert.equal(job.exitCode, 3);
     assert.equal(job.state, 'exited');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('resolveCwd refuses a cwd that is a symlink escaping the workspace', () => {
+  const root = workspace();
+  symlinkSync('/etc', join(root, '.ezil/tools/escape'));
+  mkdirSync(join(root, 'real'), { recursive: true });
+  try {
+    // The symlink resolves to /etc, which is outside the workspace → refused.
+    assert.equal(resolveCwd(root, '.ezil/tools/escape'), null);
+    // Positive control: a real in-workspace directory resolves.
+    assert.equal(resolveCwd(root, 'real'), realpathSync(join(root, 'real')));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('exec with a cwd that symlinks outside the workspace is tools_invalid_request, nothing spawned', async () => {
+  const root = workspace();
+  symlinkSync('/etc', join(root, '.ezil/tools/escape'));
+  const h = harness();
+  const jm = createJobManager({ workspaceRoot: root, getScan: scanWith(), ...h, ...fast });
+  try {
+    const res = await jm.exec({ command: 'id', cwd: '.ezil/tools/escape', timeoutSeconds: 10, background: false, requestId: 'esc' });
+    assert.deepEqual(res, { ok: false, error: 'tools_invalid_request' });
+    assert.equal(h.spawned.length, 0, 'nothing was spawned for the escaping cwd');
+    // Positive control: a default cwd reaches spawn.
+    void jm.exec({ command: 'id', timeoutSeconds: 10, background: false, requestId: 'esc-ok' });
+    assert.equal(h.spawned.length, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('🔴 exec-time TOCTOU: a ./argv[0] swapped for an escaping symlink after the scan is tool_not_found, nothing spawned', async () => {
+  const root = workspace();
+  const toolDir = join(root, '.ezil/tools/greet');
+  mkdirSync(toolDir, { recursive: true });
+  writeFileSync(join(toolDir, 'tool.json'), JSON.stringify({
+    schema: 'ezil.tool/1', name: 'greet', description: 'd', inputSchema: { type: 'object' },
+    run: { argv: ['./run.sh'] }, timeoutSeconds: 10,
+  }));
+  writeFileSync(join(toolDir, 'run.sh'), '#!/bin/sh\necho hi\n', { mode: 0o755 });
+  // Scan while the tool is valid; the manager will keep using THIS scan.
+  const scan = scanCatalog(root);
+  assert.ok(scan.byName.has('greet'), 'greet is valid at scan time (positive control)');
+  // Swap the file for a symlink that escapes the tool directory.
+  rmSync(join(toolDir, 'run.sh'));
+  symlinkSync('/bin/sh', join(toolDir, 'run.sh'));
+  const h = harness();
+  const jm = createJobManager({ workspaceRoot: root, getScan: () => scan, ...h, ...fast });
+  try {
+    const res = await jm.call({ name: 'greet', arguments: {}, requestId: 'swap' });
+    assert.deepEqual(res, { ok: false, error: 'tool_not_found' });
+    assert.equal(h.spawned.length, 0, 'the swapped tool was never spawned');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('🔴 a job whose spawn THROWS finishes as a clear failure (exitCode null + stderr diagnostic), not a clean exit', async () => {
+  const root = workspace();
+  const throwingSpawn = () => { throw new Error('ENOENT /usr/bin/setpriv'); };
+  const jm = createJobManager({ workspaceRoot: root, getScan: scanWith(), spawn: throwingSpawn, killGroup: () => {}, ...fast });
+  try {
+    const res = await jm.exec({ command: 'id', timeoutSeconds: 10, background: false, requestId: 'noexec' });
+    assert.equal(res.ok, true);
+    assert.equal(res.job.state, 'exited');
+    assert.equal(res.job.exitCode, null, 'null exit code, never a clean 0');
+    assert.ok(res.job.stderr.includes('job could not start'), 'a stderr diagnostic is present');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a job whose child emits error also finishes as a clear failure', async () => {
+  const root = workspace();
+  const h = harness();
+  const jm = createJobManager({ workspaceRoot: root, getScan: scanWith(), ...h, ...fast });
+  try {
+    const p = jm.exec({ command: 'id', timeoutSeconds: 10, background: false, requestId: 'err' });
+    h.last().emit('error', new Error('spawn failed after pipes'));
+    const res = await p;
+    assert.equal(res.job.state, 'exited');
+    assert.equal(res.job.exitCode, null);
+    assert.ok(res.job.stderr.includes('job could not start'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('🔴 byRequestId is pruned alongside finished jobs (bounded with the finished cap)', async () => {
+  const root = workspace();
+  const h = harness();
+  const jm = createJobManager({ workspaceRoot: root, getScan: scanWith(), ...h, ...fast, maxFinished: 64 });
+  try {
+    for (let i = 0; i < 70; i++) {
+      const p = jm.exec({ command: 'echo', timeoutSeconds: 9999, background: false, requestId: `rq${i}` });
+      h.last().emit('exit', 0, null);
+      await p;
+    }
+    assert.equal(jm._finishedCount(), 64);
+    // Without the prune this would be 70 and grow forever; it tracks finished.
+    assert.equal(jm._byRequestIdSize(), 64);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

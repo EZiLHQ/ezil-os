@@ -25,7 +25,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { createJobManager, prepareToolsDir, JOB_UID } from './jobs.mjs';
+import { createJobManager, prepareToolsDir, JOB_UID, JOB_GID } from './jobs.mjs';
 import { scanCatalog } from './manifest.mjs';
 
 const SECRET = 'planted-sekret-correct-horse-battery-staple';
@@ -91,6 +91,29 @@ t('a terminal job runs as uid 7001', async () => {
     // no-op inherited from the parent.
     assert.equal(process.getuid(), 0);
   } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+t('🔴 a job has uid 7001, gid 7001 and NO supplementary groups (id -G is exactly 7001)', async () => {
+  const root = workspace();
+  const savedGroups = process.getgroups();
+  try {
+    // Plant supplementary groups on toolsd itself, so the drop has something to
+    // strip. Without this, a host whose root has no supplementary groups (like a
+    // bare CI box) cannot tell --clear-groups from --keep-groups; the image's
+    // root DOES carry extra groups, which is the condition this reproduces.
+    process.setgroups([0, 1, 2]);
+    const jm = manager(root);
+    const res = await jm.exec({ command: 'echo "$(id -u) $(id -g) $(id -G)"', timeoutSeconds: 10, background: false, requestId: 'ids-1' });
+    assert.equal(res.job.state, 'exited');
+    assert.equal(res.job.exitCode, 0);
+    // 🔴 The whole-groups assertion. `--clear-groups` empties the supplementary
+    // list, so `id -G` lists only the primary 7001. With `--keep-groups` the job
+    // inherits the planted [0,1,2] and `id -G` becomes "7001 0 1 2" -> red.
+    assert.equal(res.job.stdout.trim(), `${JOB_UID} ${JOB_GID} ${JOB_GID}`);
+  } finally {
+    try { process.setgroups(savedGroups); } catch { /* best effort restore */ }
     rmSync(root, { recursive: true, force: true });
   }
 });

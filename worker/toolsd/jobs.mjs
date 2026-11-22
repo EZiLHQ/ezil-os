@@ -25,6 +25,7 @@ import { spawn as realSpawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { chmodSync, chownSync, mkdirSync, realpathSync } from 'node:fs';
 import { join, resolve, sep } from 'node:path';
+import { argv0Contained } from './manifest.mjs';
 
 export const JOB_UID = 7001;
 export const JOB_GID = 7001;
@@ -54,12 +55,23 @@ export function newJobId() {
 }
 
 /**
- * The privilege-drop wrapper placed in front of every job's argv. `setpriv`
- * must be on toolsd's own PATH (install via `worker/Dockerfile`).
+ * Absolute path to `setpriv` (util-linux). Absolute, not a PATH lookup, so a
+ * poisoned PATH cannot substitute a fake privilege-dropper. `startServer`
+ * probes it at boot and refuses to listen if it is missing.
+ */
+export const SETPRIV = '/usr/bin/setpriv';
+
+/**
+ * The privilege-drop wrapper placed in front of every job's argv.
+ * `--clear-groups` is load-bearing: it empties the supplementary group list, so
+ * the job does NOT inherit root's groups (e.g. gid 0). Node's own
+ * `spawn({uid,gid})` does not do this — replacing `--clear-groups` with
+ * `--keep-groups` gives every job gid 0 in the image, and `jobs.root.test.mjs`
+ * asserts `id -G` is exactly `7001` precisely to catch that.
  */
 export function privDropArgv(argv) {
   return [
-    'setpriv',
+    SETPRIV,
     '--reuid', String(JOB_UID),
     '--regid', String(JOB_GID),
     '--clear-groups',
@@ -184,13 +196,20 @@ export function createJobManager({
     };
   }
 
+  // When a finished job is forgotten, forget its requestId too, so the dedupe
+  // map does not grow without bound (it would otherwise outlive every job).
+  function dropRequestId(job) {
+    if (job && job.requestId && byRequestId.get(job.requestId) === job.jobId) byRequestId.delete(job.requestId);
+  }
+
   function pruneFinished() {
     const cutoff = now() - retentionMs;
     for (const [id, job] of finished) {
-      if (Date.parse(job.endedAt) < cutoff) finished.delete(id);
+      if (Date.parse(job.endedAt) < cutoff) { finished.delete(id); dropRequestId(job); }
     }
     while (finished.size > maxFinished) {
       const oldest = finished.keys().next().value;
+      dropRequestId(finished.get(oldest));
       finished.delete(oldest);
     }
   }
@@ -241,9 +260,11 @@ export function createJobManager({
         stdio: ['pipe', 'pipe', 'pipe'],
       });
     } catch {
-      // Could not even start (e.g. setpriv missing): a finalized, failed job
-      // rather than a thrown request. No internal error text is surfaced. The
-      // job was never added to `running`, so finalize just records it finished.
+      // Could not even start (e.g. setpriv missing): a finalized, FAILED job —
+      // exitCode null and a stderr diagnostic, so it never reads as a clean
+      // exit. No internal error text is surfaced. The job was never added to
+      // `running`, so finalize just records it finished.
+      job.stderrCap.push(Buffer.from('job could not start\n', 'utf8'));
       if (job.requestId) byRequestId.set(job.requestId, job.jobId);
       finalize(job, 'exited', { exitCode: null });
       return job;
@@ -267,7 +288,12 @@ export function createJobManager({
     }
 
     const pid = child.pid;
-    child.on('error', () => finalize(job, job.timedOut ? 'timed_out' : job.cancelRequested ? 'cancelled' : 'exited', { exitCode: null }));
+    child.on('error', () => {
+      // The process could not start after the pipes were wired (e.g. the target
+      // command does not exist). Mark it a clear failure, not a silent exit.
+      if (job.state === 'running') job.stderrCap.push(Buffer.from('job could not start\n', 'utf8'));
+      finalize(job, job.timedOut ? 'timed_out' : job.cancelRequested ? 'cancelled' : 'exited', { exitCode: null });
+    });
     child.on('exit', (code, signal) => {
       const state = job.timedOut ? 'timed_out' : job.cancelRequested ? 'cancelled' : 'exited';
       finalize(job, state, { exitCode: typeof code === 'number' ? code : null, signal: signal ?? null });
@@ -318,6 +344,11 @@ export function createJobManager({
       if (existing) return waitAndReturn(existing);
       const entry = scan.byName.get(name);
       if (!entry) return { ok: false, error: 'tool_not_found' };
+      // TOCTOU: a `./argv[0]` validated at scan time can be swapped for a symlink
+      // out of the tool dir before this call. Re-resolve it HERE, just before
+      // spawn — a tool that no longer resolves inside its dir is not a valid
+      // tool right now. Nothing is started.
+      if (!argv0Contained(entry.dir, entry.argv[0])) return { ok: false, error: 'tool_not_found' };
       if (running.size >= maxRunning) return { ok: false, error: 'terminal_jobs_busy' };
       const job = start({
         kind: 'tool',
@@ -378,6 +409,7 @@ export function createJobManager({
     // Test/inspection seams.
     _runningCount: () => running.size,
     _finishedCount: () => finished.size,
+    _byRequestIdSize: () => byRequestId.size,
     _serialize: serialize,
   };
 }
