@@ -95,6 +95,43 @@ describe.skipIf(!MODULE)('interview evidence on offline PostgreSQL', () => {
         await expect(db.execute(sql`UPDATE ezil_interviews SET state = 'consented' WHERE interview_id = ${interviewId}::uuid`)).rejects.toThrow(/forward-only/);
     });
 
+    it('O1 insert-state trigger (raw INSERT): events only while started; the two transition events only in their target state', async () => {
+        // Raw INSERT bypasses the store's own transition handling, so this proves the DB trigger itself, not the service.
+        const rawInsert = (interviewId: string, seq: number, type: string) =>
+            db.execute(sql`INSERT INTO ezil_interview_events (interview_id, seq, type, at, data)
+                VALUES (${interviewId}::uuid, ${seq}, ${type}, now(), '{}'::jsonb)`);
+
+        // registered: an ordinary event is refused (started-only); consent.accepted is refused (only once consented).
+        const reg = await mk('registered');
+        await expect(rawInsert(reg.interviewId, 90, 'session.heartbeat')).rejects.toThrow(/session\.heartbeat only while started \(state registered\)/);
+        await expect(rawInsert(reg.interviewId, 91, 'computer.opened')).rejects.toThrow(/computer\.opened only while started \(state registered\)/);
+        await expect(rawInsert(reg.interviewId, 92, 'consent.accepted')).rejects.toThrow(/consent\.accepted only during registered->consented \(state registered\)/);
+        expect(await countEvents(reg.interviewId)).toBe(0);
+
+        // consented: ordinary events still refused; interview.finished refused (only inside ->finished);
+        // consent.accepted ACCEPTED — the positive control for the registered->consented transition event.
+        const con = await mk('consented'); // consent.accepted is already seq 1
+        await expect(rawInsert(con.interviewId, 90, 'session.heartbeat')).rejects.toThrow(/session\.heartbeat only while started \(state consented\)/);
+        await expect(rawInsert(con.interviewId, 92, 'interview.finished')).rejects.toThrow(/interview\.finished only during ->finished \(state consented\)/);
+        await rawInsert(con.interviewId, 91, 'consent.accepted');
+        expect(await countEvents(con.interviewId)).toBe(2);
+
+        // started: ordinary events ACCEPTED (positive control); BOTH transition events are refused here.
+        const started = await mk('started'); // consent.accepted (1), interview.started (2)
+        await rawInsert(started.interviewId, 90, 'session.heartbeat');
+        await rawInsert(started.interviewId, 91, 'agent.turn_end');
+        await expect(rawInsert(started.interviewId, 92, 'consent.accepted')).rejects.toThrow(/consent\.accepted only during registered->consented \(state started\)/);
+        await expect(rawInsert(started.interviewId, 93, 'interview.finished')).rejects.toThrow(/interview\.finished only during ->finished \(state started\)/);
+        expect(await countEvents(started.interviewId)).toBe(4);
+
+        // finished: ordinary events refused; interview.finished ACCEPTED — positive control for the ->finished event.
+        const fin = await mk('finished'); // consent.accepted (1), interview.started (2), interview.finished (3)
+        await expect(rawInsert(fin.interviewId, 90, 'session.heartbeat')).rejects.toThrow(/session\.heartbeat only while started \(state finished\)/);
+        await expect(rawInsert(fin.interviewId, 91, 'agent.turn_end')).rejects.toThrow(/agent\.turn_end only while started \(state finished\)/);
+        await rawInsert(fin.interviewId, 92, 'interview.finished');
+        expect(await countEvents(fin.interviewId)).toBe(4);
+    });
+
     it('A3: another EZiL ID gets 404 repo_not_found from status and leaves zero rows', async () => {
         const { url, interviewId } = await mk('registered');
         const r = await consentStatus(db, { gateOn: true, osUserId: 'other-os-user', subject: subjectOf(OTHER_SUBJECT), url });
