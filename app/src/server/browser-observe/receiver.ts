@@ -1,9 +1,17 @@
 import {
     BROWSER_OBSERVE_PATH, BROWSER_OBSERVE_PROCEDURE, BROWSER_OBSERVE_SCOPE,
     BROWSER_CONTROL_PROCEDURE, BROWSER_CONTROL_SCOPE, BROWSER_PAGE_PROCEDURE, BROWSER_PAGE_SCOPE,
-    BROWSER_UI_REQUEST_MAX_BYTES, browserSessionRequest, browserObserveSuccess, browserRuntimeFailure,
-    browserUiSuccess, browserUiFailure, type BrowserSessionRequest, type BrowserUiRequest,
+    BROWSER_UI_REQUEST_MAX_BYTES, BROWSER_UI_RESULT_MAX_BYTES, browserSessionRequest, browserObserveSuccess, browserRuntimeFailure,
+    browserUiSuccess, browserUiFailure, sanitizeBrowserPageUrl, type BrowserSessionRequest, type BrowserUiRequest,
 } from './contract';
+
+/** The HTTP status of each failure the sidecar may answer, as ezil-mcp `workflow-browser.ts` expects it. */
+const FAILURE_STATUS: Readonly<Record<string, number>> = {
+    browser_session_stale: 409, browser_action_unavailable: 409, browser_action_conflict: 409, browser_action_pending: 409,
+    browser_page_unavailable: 404, browser_invalid_request: 400,
+    // Browser verbs v2: the page's origin tier does not allow the action (the IdP is transit only).
+    origin_read_only: 403,
+};
 
 type Principal = { userId: string; clientId: string };
 type BrowserTarget = { sandboxId: string; binding: string };
@@ -95,18 +103,22 @@ export async function handleBrowserObserve<T extends BrowserTarget>(request: Req
                     && (ui?.action.kind !== 'read' || ui.action.includeFrame !== true))) {
                 return fail(mutate ? 'browser_action_uncertain' : 'browser_unavailable', 503);
             }
+            // Every page URL the OS answers with passes the MCP's own sanitiser too (contract §2, §4), and the
+            // whole answer stays under the bound the MCP reads it with.
+            const answer = 'pageUrl' in value ? { ...value, pageUrl: sanitizeBrowserPageUrl(value.pageUrl) } : value;
+            if (modern && Buffer.byteLength(JSON.stringify(answer), 'utf8') > BROWSER_UI_RESULT_MAX_BYTES) {
+                return fail(mutate ? 'browser_action_uncertain' : 'browser_unavailable', 503);
+            }
             const fresh = await deps.target(principal, computerId);
             if (fresh?.binding !== target.binding || fresh.sandboxId !== target.sandboxId || expires <= deps.now()) {
                 return fail('browser_session_stale', 409);
             }
-            return reply(value, 200);
+            return reply(answer, 200);
         }
         const failure = (modern ? browserUiFailure : browserRuntimeFailure).safeParse(output);
         if (failure.success) {
-            const { error } = failure.data;
-            if (error === 'browser_session_stale' || error === 'browser_action_unavailable'
-                || error === 'browser_action_conflict' || error === 'browser_action_pending') return reply(failure.data, 409);
-            if (error === 'browser_page_unavailable') return reply(failure.data, 404);
+            const status = FAILURE_STATUS[failure.data.error];
+            if (status !== undefined) return reply(failure.data, status);
         }
         return fail(mutate ? 'browser_action_uncertain' : 'browser_unavailable', 503);
     } catch {

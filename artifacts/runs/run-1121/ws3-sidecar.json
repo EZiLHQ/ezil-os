@@ -1,0 +1,9 @@
+{
+  "taskId": "ws3-sidecar",
+  "runId": "run-1121",
+  "status": "done",
+  "doneRung": "sidecar-verbs-v2-and-origin-tiers-unit-green-mutation-proved",
+  "evidence": "Follow-up 2 on review amendments 360d5fdb/125c42cb (commits 705efe11 owner-without-IdP broken, 59f9c3e6 IdP by host, 0c151b94 decoded-remainder check, 53e7585b free-text name=value removal + resolved hrefs, 393be068 empty IdP title, 66d233da README). Final, through runlock: worker/sidecar bun test 324 pass / 0 fail / 0 skip, 5 files, exit 0; worker typecheck exit 0 + browser-sidecar-contract.test.ts (EZIL_BROWSER_SIDECAR_CONTRACT set) 14 pass / 0 fail / 0 skip, exit 0; mcp typecheck exit 0 + bun test 40 pass / 0 fail, exit 0. Mutation proofs on the final tree (25 mutants, each node --check'd, timeout-bounded, restored with git checkout -> 324/0): fix 1 decoded check off 24 red, no percent-decoding 13, invisibles kept 1, ; params kept 4, no safety net 4; fix 2 name=value pass removed 11, encoded-token pass removed 3, http-only absolute URLs 3, unresolved markdown hrefs 2; fix 3 owner-without-IdP allowed 2; fix 4 IdP host match removed 56; fix 5 IdP title kept 5; earlier guards: tier gate 40, idp route table 31, sanitizeUrl identity 57, ref tab 2, ref origin 1, broken short-circuit 46, broken never set 48, Code landing 18, Code navigate-target 1, Code console/network history 1/1, page text 3, relative pass 5. One mutant run discarded: a first M15c mutant did not parse and hung bun test (killed, exit 143); redone validly -> 1 red. Ad-hoc real Chrome 149 headless check (not committed): 47 pass / 0 fail incl. resolved+sanitised markdown hrefs and the empty IdP title. Hand-off: worker/Dockerfile:413 n!==10 -> 14 (WS2); contract.mjs SENSITIVE_URL_PARAMS lacks jwt/accesstoken (they live in origin-policy.mjs).",
+  "startedAt": "2026-11-21T20:30:00Z",
+  "updatedAt": "2026-11-22T03:10:00Z"
+}

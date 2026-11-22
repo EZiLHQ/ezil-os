@@ -421,6 +421,38 @@ class DelegationEnvironmentTests(unittest.TestCase):
         self.refused({**complete, key: "enabled", "EZIL_DELEGATION_ISSUER": "https://other.example.invalid"}, "staging")
         self.refused({key: "disabled"}, "production")
 
+    def test_ws2_switches_are_exact_staging_only_and_need_canonical_pins(self):
+        complete = delegation(EZIL_DELEGATION_ISSUER="https://connect-staging.ezil.work",
+                              EZIL_DELEGATION_AUDIENCE="https://os-staging.ezil.work")
+        worker = {"CLOUDFLARE_GUACAMOLE_WORKER_URL": "https://api-desktop-staging.ezil.work",
+                  "CLOUDFLARE_GUACAMOLE_HMAC_SECRET": "synthetic-hmac-secret-never-log-1234567890"}
+        for key, _ in renderer.STAGING_WS2_WORKER_SWITCHES + renderer.STAGING_WS2_SWITCHES:
+            with self.subTest(key=key):
+                self.assertNotIn(key, renderer.validate(self.staging))
+                disabled = {**self.staging, key: "disabled"}
+                self.assertEqual(renderer.validate(disabled), disabled)
+                enabled = {**self.staging, **complete, **worker, key: "enabled"}
+                self.assertEqual(renderer.validate(enabled), enabled)
+                self.refused({key: "enabled"}, "staging")
+                self.refused({**complete, **worker, key: "true"}, "staging")
+                self.refused({**complete, **worker, key: "Enabled"}, "staging")
+                self.refused({**complete, **worker, key: "enabled",
+                              "EZIL_DELEGATION_ISSUER": "https://other.example.invalid"}, "staging")
+                self.refused({**complete, **worker, key: "enabled",
+                              "EZIL_DELEGATION_AUDIENCE": "https://other.example.invalid"}, "staging")
+                self.refused({key: "disabled"}, "production")
+        for key, _ in renderer.STAGING_WS2_WORKER_SWITCHES:
+            with self.subTest(worker_switch=key):
+                self.refused({**complete, key: "enabled"}, "staging")
+                self.refused({**complete, **worker, key: "enabled",
+                              "CLOUDFLARE_GUACAMOLE_WORKER_URL": "https://other.example.invalid"}, "staging")
+                self.refused({**complete, "CLOUDFLARE_GUACAMOLE_WORKER_URL": worker["CLOUDFLARE_GUACAMOLE_WORKER_URL"],
+                              key: "enabled"}, "staging")
+        for key, _ in renderer.STAGING_WS2_SWITCHES:
+            with self.subTest(pins_only_switch=key):
+                pins_only = {**self.staging, **complete, key: "enabled"}
+                self.assertEqual(renderer.validate(pins_only), pins_only)
+
     def test_editor_switches_are_default_off_and_staging_only(self):
         first, second, controls = renderer.STAGING_EDITOR_SWITCHES
         origins = delegation(EZIL_DELEGATION_ISSUER="https://connect-staging.ezil.work",
@@ -640,6 +672,135 @@ class DelegationEnvironmentTests(unittest.TestCase):
             self.assertNotIn(values[name], output.getvalue())
         self.assertNotIn("DELEGAT", cron)
         self.assertEqual(rendered[DELEGATION_GATE], "enabled")
+
+
+class BrowserTierEnvironmentTests(unittest.TestCase):
+    """Browser verbs v2 section 6: the sidecar's origin tiers on AWS os-staging, as origin-policy.mjs parses them."""
+
+    OWNER = renderer.STAGING_BROWSER_OWNER_APP_ORIGINS
+    IDP = renderer.STAGING_BROWSER_IDP_ORIGINS
+    TEST = renderer.STAGING_BROWSER_ORIGINS
+    STAGED = {OWNER: "https://universe-staging.ezil.work", IDP: "https://id.ezil.work"}
+
+    def setUp(self):
+        self.staging = {key: "synthetic-value-never-log-1234567890" for key in renderer.REQUIRED}
+
+    def accepted(self, extra):
+        values = {**self.staging, **extra}
+        self.assertEqual(renderer.validate(values, "staging"), values)
+
+    def refused(self, extra, environment="staging", message=None):
+        with self.assertRaises(renderer.RenderError) as caught:
+            renderer.validate({**self.staging, **extra}, environment)
+        if message is not None:
+            self.assertIn(message, str(caught.exception))
+        return caught.exception
+
+    def test_names_are_staging_only_and_optional(self):
+        for key in (self.OWNER, self.IDP):
+            self.assertNotIn(key, renderer.OPTIONAL | renderer.REQUIRED)
+            self.refused({key: self.STAGED[key]}, "production", "Unknown key refused")
+        self.accepted({})
+        self.accepted(self.STAGED)
+        self.accepted({self.IDP: self.STAGED[self.IDP]})
+
+    def test_an_owner_list_needs_an_idp_list(self):
+        # The sidecar treats an owner list without an IdP list as a broken policy (contract section 2, amended
+        # 2026-11-22): every page transit only. The renderer refuses to ship that.
+        self.refused({self.OWNER: self.STAGED[self.OWNER]}, message="require the identity provider origins")
+        self.accepted(self.STAGED)
+
+    def test_each_list_is_well_formed_https_origins_and_at_most_twenty(self):
+        many = ",".join(f"https://app{n}.example.invalid" for n in range(20))
+        self.accepted({self.OWNER: many, self.IDP: self.STAGED[self.IDP]})
+        self.accepted({self.OWNER: "https://a.example.invalid, https://b.example.invalid:8443", self.IDP: self.STAGED[self.IDP]})
+        self.accepted({self.IDP: many})
+        self.refused({self.OWNER: many + ",https://app20.example.invalid", self.IDP: self.STAGED[self.IDP]}, message="at most 20")
+        self.refused({self.IDP: many + ",https://app20.example.invalid"}, message="at most 20")
+        for key in (self.OWNER, self.IDP):
+            for bad in ("http://universe-staging.ezil.work", "https://universe-staging.ezil.work/",
+                        "https://universe-staging.ezil.work/builder", "https://Universe-staging.ezil.work",
+                        "https://universe-staging.ezil.work:443", "https://u:p@universe-staging.ezil.work",
+                        "https://*.ezil.work", "https://127.0.0.1", "https://localhost", "https://app.localhost",
+                        "https://universe-staging.ezil.work?x=1", "https://universe-staging.ezil.work#x", "universe-staging.ezil.work",
+                        "https://a.example.invalid,", ",https://a.example.invalid", "https://a.example.invalid,,https://b.example.invalid",
+                        "https://a.example.invalid https://b.example.invalid", "https://a.example.invalid;https://b.example.invalid"):
+                with self.subTest(key=key, bad=bad):
+                    self.refused({**self.STAGED, key: bad}, message="bare https origins")
+
+    def test_an_idp_origin_is_never_an_owner_app(self):
+        for owners in ("https://id.ezil.work", "https://universe-staging.ezil.work,https://id.ezil.work", "https://id.ezil.work:8443"):
+            with self.subTest(owners=owners):
+                # EZiL ID is an IdP whether or not the IdP list names it.
+                self.refused({self.OWNER: owners, self.IDP: "https://login.example.invalid"}, message="never an owner app")
+                self.refused({self.OWNER: owners, self.IDP: "https://id.ezil.work"}, message="never an owner app")
+        # Any entry of the IdP list, on any port of its host.
+        self.refused({self.OWNER: "https://login.example.invalid", self.IDP: "https://login.example.invalid"},
+                     message="never an owner app")
+        self.refused({self.OWNER: "https://login.example.invalid:8443", self.IDP: "https://id.ezil.work,https://login.example.invalid"},
+                     message="never an owner app")
+        # Positive control: a different host is fine.
+        self.accepted({self.OWNER: "https://universe-staging.ezil.work", self.IDP: "https://id.ezil.work,https://login.example.invalid"})
+        # With no IdP list at all the owner list is refused for that reason first: EZiL ID still never passes as an owner.
+        self.refused({self.OWNER: "https://id.ezil.work"})
+
+    def test_an_idp_origin_is_never_a_test_origin(self):
+        for tests in ("https://id.ezil.work", "https://fixture.example.invalid,https://id.ezil.work", "https://id.ezil.work:8443"):
+            with self.subTest(tests=tests):
+                self.refused({self.TEST: tests}, message="never a Browser test origin")
+                self.refused({self.TEST: tests, **self.STAGED}, message="never a Browser test origin")
+        self.refused({self.TEST: "https://login.example.invalid", self.IDP: "https://login.example.invalid"},
+                     message="never a Browser test origin")
+        self.accepted({self.TEST: "https://fixture.example.invalid,http://127.0.0.1:4173", **self.STAGED})
+
+    def test_the_owner_and_test_lists_never_overlap(self):
+        self.refused({self.TEST: "https://universe-staging.ezil.work", **self.STAGED}, message="owner app origin is never")
+        self.refused({self.TEST: "https://fixture.example.invalid https://universe-staging.ezil.work", **self.STAGED},
+                     message="owner app origin is never")
+        self.accepted({self.TEST: "https://fixture.example.invalid", **self.STAGED})
+
+    def test_the_overlap_is_by_host_whatever_the_port_or_scheme(self):
+        # Another port on the owner app's host is the owner app: refused in either direction.
+        self.refused({self.TEST: "https://universe-staging.ezil.work:8443", **self.STAGED}, message="owner app origin is never")
+        self.refused({self.TEST: "https://fixture.example.invalid,https://universe-staging.ezil.work:4443", **self.STAGED},
+                     message="owner app origin is never")
+        self.refused({self.TEST: "https://universe-staging.ezil.work", self.OWNER: "https://universe-staging.ezil.work:8443",
+                      self.IDP: self.STAGED[self.IDP]}, message="owner app origin is never")
+        # Plain http on the owner host never reaches the comparison: a test origin is https or loopback http only.
+        self.refused({self.TEST: "http://universe-staging.ezil.work", **self.STAGED}, message="approved project origins")
+        # Positive controls: another host on the same port, a sibling subdomain, and loopback http are all fine.
+        self.accepted({self.TEST: "https://fixture.example.invalid:8443", self.OWNER: "https://universe-staging.ezil.work:8443",
+                       self.IDP: self.STAGED[self.IDP]})
+        self.accepted({self.TEST: "https://preview.universe-staging.ezil.work,http://127.0.0.1:4173", **self.STAGED})
+        self.assertEqual(renderer.origin_host("https://Universe-Staging.Ezil.Work."), "universe-staging.ezil.work")
+
+    def test_errors_do_not_echo_values(self):
+        marker = "https://synthetic-secret-in-config.example.invalid/path"
+        for extra in ({self.OWNER: marker, self.IDP: self.STAGED[self.IDP]}, {self.IDP: marker},
+                      {self.OWNER: "https://id.ezil.work", self.IDP: self.STAGED[self.IDP]}, {self.TEST: "https://id.ezil.work"}):
+            with self.subTest(extra=sorted(extra)):
+                error = self.refused(extra)
+                for value in extra.values():
+                    self.assertNotIn(value, str(error))
+
+    def test_render_forwards_both_lists_verbatim_and_prints_names_only(self):
+        values = {**self.staging, **self.STAGED}
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            output = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                if os.geteuid() != 0:
+                    stack.enter_context(patch.object(renderer.os, "geteuid", return_value=0))
+                    stack.enter_context(patch.object(renderer.os, "chown"))
+                    stack.enter_context(patch.object(renderer.os, "fchown"))
+                with contextlib.redirect_stdout(output):
+                    renderer.render(values, Path(temporary), "staging")
+            rendered = dict(line.split("=", 1) for line in (Path(temporary) / "app.env").read_text().splitlines())
+            cron = (Path(temporary) / "cron.env").read_text()
+        self.assertEqual(rendered[self.OWNER], "https://universe-staging.ezil.work")
+        self.assertEqual(rendered[self.IDP], "https://id.ezil.work")
+        self.assertEqual(output.getvalue().splitlines(), sorted(values))
+        self.assertNotIn("https://", output.getvalue())
+        self.assertNotIn("BROWSER", cron)
 
 
 if __name__ == "__main__":

@@ -43,13 +43,14 @@ import { BROWSER_SIDECAR_PORT } from './desktop-mode';
 export { BROWSER_SIDECAR_PORT };
 
 /**
- * The verbs this Worker will forward. Same set as
- * `worker/sidecar/contract.mjs`, asserted against the pinned wire contract by
+ * The verbs this Worker will forward. Same set as the routes of
+ * `worker/sidecar/contract.mjs` (`SIDECAR_WIRE`: the ten v1 verbs pinned by the
+ * EZiL-Works JSON plus the four additive v2 verbs), asserted by
  * `./browser-sidecar-contract.test.ts`.
  *
  * 🔴 `evaluate`, `raw`, `send`, `cdp`, `exec` and `eval` are absent and must
  * stay absent. A passthrough verb does not extend the sidecar; it deletes its
- * reason to exist.
+ * reason to exist. There is no `upload` verb either.
  */
 export const BROWSER_SIDECAR_VERBS = [
     'health',
@@ -62,6 +63,11 @@ export const BROWSER_SIDECAR_VERBS = [
     'console',
     'network',
     'wait_for',
+    // v2 (additive): all POST.
+    'fill_form',
+    'select',
+    'scroll',
+    'press',
 ] as const;
 
 export type BrowserSidecarVerb = (typeof BROWSER_SIDECAR_VERBS)[number];

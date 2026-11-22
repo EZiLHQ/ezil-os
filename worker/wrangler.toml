@@ -365,6 +365,9 @@ SANDBOX_NEKO_TURN_TTL_SECONDS = "300"
 SANDBOX_PREVIEW_ZONE_ROOT = "ezil.work"
 SANDBOX_DEFAULT_DESKTOP_MODE = "neko"
 SANDBOX_NEKO_ICE_POLICY = "relay"
+# Browser verbs v2 origin tiers (docs/contracts/browser-verbs-v2.md §2, §6), conveyed to the sidecar at boot.
+EZIL_BROWSER_OWNER_APP_ORIGINS = "https://universe-staging.ezil.work"
+EZIL_BROWSER_IDP_ORIGINS = "https://id.ezil.work"
 
 # Bind to this staging Worker's own namespace, never a production script_name.
 [[env.staging.durable_objects.bindings]]

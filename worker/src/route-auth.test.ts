@@ -1661,6 +1661,38 @@ describe('delegated Browser observation Worker route', () => {
     expect(calls.exposePort).toHaveLength(0);
   });
 
+  it('browser verbs v2: a modern request fits a 20-field fill_form and a modern result fits 160 KiB', async () => {
+    // The worst case the MCP schema admits: 20 fields of 4000 lone surrogates, each `\uXXXX` in JSON.
+    const text = String.fromCharCode(0xd800).repeat(4000);
+    const fields = Array.from({ length: 20 }, (_, i) => ({ ref: String(i).padStart(22, 'r'), text }));
+    const modern = JSON.stringify({
+      binding: 'b'.repeat(64), browserSessionId: 'c'.repeat(43), requestId: '7bb70a50-cd7d-40f8-9539-45aee597ea48',
+      action: { kind: 'fill_form', fields },
+    });
+    // 481,095 bytes: far past the 4096-byte bound this route had before v2.
+    expect(Buffer.byteLength(modern)).toBeGreaterThan(460 * 1024);
+    let reply = 'x'.repeat(160 * 1024);
+    const { binding, calls } = fakeSandboxNamespace({ containerResponse: () => new Response(reply) });
+    const env = { ...environment(binding), SANDBOX_MCP_BROWSER_CONTROL: 'on' };
+
+    const answered = await worker.fetch(await signed({}, modern), env);
+    expect(answered.status).toBe(200);
+    expect((await answered.text()).length).toBe(160 * 1024);
+    expect(calls.browserObservations).toEqual([{ body: modern, deadline: expect.any(Number), hasCapability: true }]);
+
+    // One byte over either bound is refused: the request before any dispatch, the reply after it.
+    reply = 'x'.repeat(160 * 1024 + 1);
+    expect((await worker.fetch(await signed({}, modern), env)).status).toBe(503);
+    expect(calls.browserObservations).toHaveLength(2);
+    const oversized = modern.slice(0, -1) + ',"pad":"' + 'p'.repeat(513 * 1024 - Buffer.byteLength(modern) - 8) + '"}';
+    expect(Buffer.byteLength(oversized)).toBe(513 * 1024 + 1);
+    expect((await worker.fetch(await signed({}, oversized), env)).status).toBe(413);
+    expect(calls.browserObservations).toHaveLength(2);
+    // The legacy read keeps its 1024-byte bound.
+    expect((await worker.fetch(await signed({}, JSON.stringify({ binding: 'a'.repeat(64), pad: 'p'.repeat(1024) })), env)).status).toBe(413);
+    expect(calls.browserObservations).toHaveLength(2);
+  });
+
   it('refuses legacy auth, unrelated owners, AWS, oversized input and a closed gate', async () => {
     const { binding, calls } = fakeSandboxNamespace({});
     const env = environment(binding);
@@ -1881,6 +1913,34 @@ describe('/sandbox/:name/browser/:verb — the agent-facing surface', () => {
     expect(res.status).toBe(200);
     expect(calls.containerFetch.length).toBeGreaterThan(0);
     expect(calls.containerFetch[calls.containerFetch.length - 1]!.url).toContain('/health');
+  });
+
+  it('🔴 every forwarded verb carries the per-sandbox verb bearer the sidecar requires, never the caller\'s token', async () => {
+    // Browser verbs v2 §3: the sidecar answers 401 to any verb route without
+    // `Authorization: Bearer $EZIL_WORKER_BROWSER_MCP_TOKEN`, the HMAC
+    // `EZIL-WORKER-BROWSER-OPEN/1` derivation the boot env hands it.
+    const expected = 'Bearer ' + Buffer.from(
+      await hmacSha256Hex(SECRET, 'EZIL-WORKER-BROWSER-OPEN/1\n' + SANDBOX_NAME), 'hex').toString('base64url');
+    expect(expected).toMatch(/^Bearer [A-Za-z0-9_-]{43}$/);
+    for (const [verb, init] of [
+      ['health', {}],
+      ['snapshot', { method: 'POST', body: '{}' }],
+      ['fill_form', { method: 'POST', body: JSON.stringify({ fields: [{ ref: 'e1', value: 'x' }] }) }],
+      ['press', { method: 'POST', body: JSON.stringify({ key: 'Enter' }) }],
+    ] as const) {
+      const { binding, calls } = fakeSidecar();
+      const callerToken = await mintToken(SECRET);
+      const res = await worker.fetch(
+        new Request(browserUrl(verb), { ...init, headers: { authorization: `Bearer ${callerToken}` } }),
+        { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET },
+      );
+      expect(res.status).toBe(200);
+      const sent = calls.containerFetch[calls.containerFetch.length - 1]!;
+      expect([sent.url, sent.method]).toEqual([`http://127.0.0.1:9223/${verb}`, verb === 'health' ? 'GET' : 'POST']);
+      expect(sent.headers.authorization).toBe(expected);
+      expect(JSON.stringify(sent)).not.toContain(callerToken);
+      expect(JSON.stringify(sent)).not.toContain(SECRET);
+    }
   });
 
   it('POST /browser/health is still refused — admitting GET must not make the verb take both', async () => {
@@ -4288,6 +4348,8 @@ describe('AI Durable Object storage and boot lifecycle', () => {
   it('keeps browser boot capabilities independent and derives a narrow per-sandbox Worker bearer', async () => {
     const { obj } = await object();
     obj.env.EZIL_BROWSER_TEST_ALLOWED_ORIGINS = 'https://fixture.test';
+    // With the Worker's verb route closed, only the open/control switches convey the Worker bearer.
+    obj.env.SANDBOX_BROWSER = 'off';
     obj.listProcesses = async () => [];
     const launched: Record<string, string>[] = [];
     obj.startProcess = async (_: string, options: { env: Record<string, string> }) => {
@@ -4314,6 +4376,93 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     expect(launched[2]?.EZIL_WORKER_BROWSER_MCP_TOKEN).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(launched[2]?.EZIL_WORKER_BROWSER_MCP_TOKEN).not.toBe(launched[3]?.EZIL_WORKER_BROWSER_MCP_TOKEN);
     expect(Object.values(launched[2] ?? {})).not.toContain(SECRET);
+  });
+
+  it('the Worker open route has its own boot switch: EZIL_WORKER_BROWSER_OPEN only with SANDBOX_MCP_BROWSER_OPEN', async () => {
+    // Every boot with the verb route open now carries the Worker bearer, so the bearer can no longer be what turns the
+    // sidecar's Worker open-url route on: that takes EZIL_WORKER_BROWSER_OPEN, as control takes EZIL_WORKER_BROWSER_CONTROL.
+    const { obj } = await object();
+    obj.env.EZIL_BROWSER_TEST_ALLOWED_ORIGINS = 'https://fixture.test';
+    obj.listProcesses = async () => [];
+    const launched: Record<string, string>[] = [];
+    obj.startProcess = async (_: string, options: { env: Record<string, string> }) => {
+      launched.push(options.env);
+      return { id: 'launcher' };
+    };
+    const start = () => obj.startAiDesktop('ezil.work', SANDBOX_NAME, 'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh', {});
+    const switches = (env: Record<string, string> | undefined) => ({
+      open: env?.EZIL_WORKER_BROWSER_OPEN, control: env?.EZIL_WORKER_BROWSER_CONTROL, bearer: !!env?.EZIL_WORKER_BROWSER_MCP_TOKEN,
+    });
+    for (const [flags, expected] of [
+      [{}, { open: undefined, control: undefined, bearer: true }],
+      [{ EZIL_CODE_BROWSER_MCP: 'on' }, { open: undefined, control: undefined, bearer: true }],
+      [{ SANDBOX_MCP_BROWSER_CONTROL: 'on' }, { open: undefined, control: 'on', bearer: true }],
+      [{ SANDBOX_MCP_BROWSER_OPEN: 'on' }, { open: 'on', control: undefined, bearer: true }],
+      [{ SANDBOX_MCP_BROWSER_OPEN: 'on', SANDBOX_BROWSER: 'off' }, { open: 'on', control: undefined, bearer: true }],
+      [{ SANDBOX_MCP_BROWSER_OPEN: 'off', SANDBOX_BROWSER: 'off' }, { open: undefined, control: undefined, bearer: false }],
+      [{ SANDBOX_MCP_BROWSER_OPEN: 'true' }, { open: undefined, control: undefined, bearer: true }],
+    ] as const) {
+      for (const key of ['EZIL_CODE_BROWSER_MCP', 'SANDBOX_MCP_BROWSER_CONTROL', 'SANDBOX_MCP_BROWSER_OPEN', 'SANDBOX_BROWSER']) delete obj.env[key];
+      Object.assign(obj.env, flags);
+      await start();
+      expect({ flags, got: switches(launched[launched.length - 1]) }).toEqual({ flags, got: expected });
+    }
+    // Without a derivation secret there is no bearer, and so no open switch either.
+    const unconfigured = await object('');
+    Object.assign(unconfigured.obj.env, { EZIL_BROWSER_TEST_ALLOWED_ORIGINS: 'https://fixture.test', SANDBOX_MCP_BROWSER_OPEN: 'on' });
+    unconfigured.obj.listProcesses = async () => [];
+    unconfigured.obj.startProcess = obj.startProcess;
+    await unconfigured.obj.startAiDesktop('ezil.work', SANDBOX_NAME, 'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh', {});
+    expect(switches(launched[launched.length - 1])).toEqual({ open: undefined, control: undefined, bearer: false });
+  });
+
+  it('browser verbs v2: every boot with the verb route open carries the verb bearer, and the origin tiers when set', async () => {
+    const { obj } = await object();
+    obj.listProcesses = async () => [];
+    const launched: Record<string, string>[] = [];
+    obj.startProcess = async (_: string, options: { env: Record<string, string> }) => {
+      launched.push(options.env);
+      return { id: 'launcher' };
+    };
+    const start = (sandboxId = SANDBOX_NAME) => obj.startAiDesktop('ezil.work', sandboxId,
+      'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh', {});
+    const bearerFor = async (sandboxId: string) =>
+      Buffer.from(await hmacSha256Hex(SECRET, 'EZIL-WORKER-BROWSER-OPEN/1\n' + sandboxId), 'hex').toString('base64url');
+    const browserKeys = (env: Record<string, string> | undefined) =>
+      Object.keys(env ?? {}).filter(key => /BROWSER/.test(key)).sort();
+
+    // No browser switch at all: the verb route is open by default, so the sidecar gets its bearer and nothing else.
+    await start();
+    expect(launched[0]?.EZIL_WORKER_BROWSER_MCP_TOKEN).toBe(await bearerFor(SANDBOX_NAME));
+    expect(browserKeys(launched[0])).toEqual(['EZIL_WORKER_BROWSER_MCP_TOKEN']);
+    await start('guac-1aaaaaaaabbbbbbb-1cccccccdddddddd');
+    expect(launched[1]?.EZIL_WORKER_BROWSER_MCP_TOKEN).toBe(await bearerFor('guac-1aaaaaaaabbbbbbb-1cccccccdddddddd'));
+    expect(launched[1]?.EZIL_WORKER_BROWSER_MCP_TOKEN).not.toBe(launched[0]?.EZIL_WORKER_BROWSER_MCP_TOKEN);
+
+    // The tiers travel whenever they are set (trimmed), independent of every switch, and never widen the others.
+    obj.env.EZIL_BROWSER_OWNER_APP_ORIGINS = ' https://universe-staging.ezil.work ';
+    obj.env.EZIL_BROWSER_IDP_ORIGINS = 'https://id.ezil.work';
+    await start();
+    expect(launched[2]).toMatchObject({
+      EZIL_BROWSER_OWNER_APP_ORIGINS: 'https://universe-staging.ezil.work', EZIL_BROWSER_IDP_ORIGINS: 'https://id.ezil.work',
+    });
+    expect(browserKeys(launched[2])).toEqual(['EZIL_BROWSER_IDP_ORIGINS', 'EZIL_BROWSER_OWNER_APP_ORIGINS', 'EZIL_WORKER_BROWSER_MCP_TOKEN']);
+    obj.env.SANDBOX_BROWSER = 'off';
+    await start();
+    expect(browserKeys(launched[3])).toEqual(['EZIL_BROWSER_IDP_ORIGINS', 'EZIL_BROWSER_OWNER_APP_ORIGINS']);
+
+    // Unset or blank tiers are not conveyed; no derivation secret means no bearer.
+    obj.env.SANDBOX_BROWSER = undefined;
+    obj.env.EZIL_BROWSER_OWNER_APP_ORIGINS = '  ';
+    obj.env.EZIL_BROWSER_IDP_ORIGINS = undefined;
+    await start();
+    expect(browserKeys(launched[4])).toEqual(['EZIL_WORKER_BROWSER_MCP_TOKEN']);
+    const unconfigured = await object('');
+    unconfigured.obj.listProcesses = async () => [];
+    unconfigured.obj.startProcess = obj.startProcess;
+    await unconfigured.obj.startAiDesktop('ezil.work', SANDBOX_NAME, 'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh', {});
+    expect(browserKeys(launched[5])).toEqual([]);
+    expect(launched.flatMap(env => Object.values(env))).not.toContain(SECRET);
   });
 
   it('allows lifecycle transitions during browser I/O and suppresses a superseded boot receipt', async () => {
