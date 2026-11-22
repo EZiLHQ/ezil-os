@@ -35,7 +35,7 @@ describe.skipIf(!databaseUrl)('staging computer-tools route: real delegation, pl
     let client: ReturnType<typeof postgres>;
     let signer: SigningKey;
     let post: (request: Request) => Promise<Response>;
-    const worker = vi.fn(async (_input: unknown, _init?: RequestInit): Promise<Response> => Response.json(jobReply()));
+    const worker = vi.fn(async (): Promise<Response> => Response.json(jobReply()));
 
     beforeAll(async () => {
         client = postgres(databaseUrl!, { max: 6, prepare: false, onnotice: () => {} });
@@ -89,7 +89,8 @@ describe.skipIf(!databaseUrl)('staging computer-tools route: real delegation, pl
             method: 'POST', body: raw, headers: { authorization: `EZiL-Delegation ${assertion}`, 'content-type': 'application/json' },
         });
     }
-    const forwardedOps = () => worker.mock.calls.map((c) => JSON.parse(String((c[1] as RequestInit).body)).op as string);
+    const forwardedOps = () =>
+        (worker.mock.calls as unknown as [unknown, RequestInit][]).map((c) => JSON.parse(String(c[1].body)).op as string);
     const rowsFor = (requestId: string) => client.unsafe<Record<string, unknown>[]>(
         'SELECT * FROM public.ezil_computer_tool_jobs WHERE request_id = $1::uuid ORDER BY created_at ASC', [requestId]);
 

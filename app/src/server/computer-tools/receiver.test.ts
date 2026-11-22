@@ -1,13 +1,9 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 
 import { describe, expect, it, vi } from 'vitest';
 
 import type { AuditEntry, AuditOutcome, ComputerToolsAudit, LostJobRecord, OriginalRow } from './audit';
-import type { ComputerToolsOp } from './contract';
-import {
-    handleComputerTools,
-    type ComputerToolsDeps, type ComputerToolsPrincipal, type ComputerToolsTarget, type ForwardResult,
-} from './receiver';
+import { handleComputerTools, type ComputerToolsDeps, type ForwardResult } from './receiver';
 
 const COMPUTER = '11111111-1111-4111-8111-111111111111';
 const PATH = `/api/mcp/computer-tools/${COMPUTER}`;
@@ -309,19 +305,17 @@ describe('computer-tools receiver — reply validation and uncertainty', () => {
 describe('computer-tools receiver — idempotency and replay', () => {
     it('a same-body replay polls the recorded job as op "job" (never re-executes) and writes a replay row', async () => {
         const audit = fakeAudit();
-        const forward = vi.fn(
-            async (_p: ComputerToolsPrincipal, _c: string, _t: ComputerToolsTarget, _op: ComputerToolsOp, _input: Record<string, unknown>): Promise<ForwardResult> =>
-                ({ kind: 'reply', status: 200, text: JSON.stringify(sampleJob()) }),
-        );
+        const forward = vi.fn(async (): Promise<ForwardResult> => ({ kind: 'reply', status: 200, text: JSON.stringify(sampleJob()) }));
         const d = deps({ audit, forward });
         const raw = execBody();
         expect((await handleComputerTools(request(raw), d)).status).toBe(200);
         const second = await handleComputerTools(request(raw), d);
         expect(second.status).toBe(200);
         expect(forward).toHaveBeenCalledTimes(2);
-        expect(forward.mock.calls[0]![3]).toBe('exec');
-        expect(forward.mock.calls[1]![3]).toBe('job'); // replay forwarded as job, not re-executed
-        expect(forward.mock.calls[1]![4]).toEqual({ jobId: JOB });
+        const calls = forward.mock.calls as unknown as [unknown, unknown, unknown, string, Record<string, unknown>][];
+        expect(calls[0]![3]).toBe('exec');
+        expect(calls[1]![3]).toBe('job'); // replay forwarded as job, not re-executed
+        expect(calls[1]![4]).toEqual({ jobId: JOB });
         expect(audit.rows).toHaveLength(2);
         expect(audit.rows[1]).toMatchObject({ replayOf: audit.rows[0]!.id });
     });

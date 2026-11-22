@@ -20,7 +20,7 @@ export async function POST(request: Request): Promise<Response> {
     return handleComputerTools(request, {
         enabled: computerToolsConfigured(process.env),
         opEnabled: (op) => opSwitchEnabled(process.env, op),
-        async verify(headers, serializedInput, procedure, scope) {
+        async verify(headers, serializedInput, procedure) {
             const config = await delegationConfig({
                 EZIL_DELEGATION_ISSUER: process.env.EZIL_DELEGATION_ISSUER,
                 EZIL_DELEGATION_AUDIENCE: process.env.EZIL_DELEGATION_AUDIENCE,

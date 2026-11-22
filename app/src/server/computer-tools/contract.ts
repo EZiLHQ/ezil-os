@@ -136,7 +136,8 @@ export function parseComputerToolsBody(value: unknown): { op: ComputerToolsOp; b
 
 /** The forwarded `input` is the body without `op` (§3.3). */
 export function inputWithoutOp(body: ComputerToolsBody): Record<string, unknown> {
-    const { op: _op, ...input } = body as Record<string, unknown>;
+    const input: Record<string, unknown> = { ...body };
+    delete input.op;
     return input;
 }
 
