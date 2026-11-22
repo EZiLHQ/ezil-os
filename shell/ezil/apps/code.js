@@ -1,4 +1,6 @@
 import { ai_trace_collector } from '../ui/ai-traces.js';
+import { interview_consent } from '../ui/interview-consent.js';
+import { interview_activity } from '../ui/interview-activity.js';
 import { attachCodeAuthRecovery, resetOriginRecovery } from './code-auth-recovery.js';
 import { createGitAccessRenewal } from './code-git-access.js';
 import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../native-runtime.js';
@@ -1001,6 +1003,12 @@ export async function openCodeWindow (ctx = {}) {
         updating = false;
         updateMilestone = null;
 
+        // INTERVIEW (os-capture, docs/contracts/interview-evidence-v1.md §7.4): a git-qa interview open waits here
+        // on the recording notice and the operator start; a non-interview or already-started open resolves at once,
+        // so a normal Code open is unchanged. The server (os-access open gate) stays the authority on the open.
+        await interview_consent.gate({ repoUrl: project?.repoUrl });
+        if ( disposed || my_attempt !== attempt ) return;
+
         if ( desktop_state.configured !== true ) {
             console.warn(`[${PHASE}] no desktop provider is configured`);
             progress.render(computeBootUiState({ requestStatus: 'not_configured', elapsedMs: 0 }));
@@ -1381,6 +1389,8 @@ export async function openCodeWindow (ctx = {}) {
         if ( present || was_present ) last_present_at = performance.now();
         was_present = present;
         if ( present ) void git_access?.tick();
+        // INTERVIEW (os-capture): feed presence to the activity recorder; a no-op unless an interview is recording.
+        interview_activity.sample({ visible: document.visibilityState === 'visible', focused: typeof document.hasFocus === 'function' ? document.hasFocus() : false });
     };
     const heartbeat_tick = () => {
         if ( disposed ) return;

@@ -8,7 +8,10 @@
  *    `interview_not_started` before the operator starts it, `interview_finished` after finish).
  *  - `allow`: the interview is started and the caller is its candidate; on `open` the gate has written `computer.opened`.
  *
- * Frozen signature. STUB from the contract commit: it always answers `none`; the os-capture lane replaces the body.
+ * Frozen signature from the contract commit; the os-capture lane fills in the body (contract §7.5, vectors
+ * `openGateCases`). Candidate is checked before state, so another EZiL ID is `repo_not_found` in every state and
+ * leaves no record. `computer.opened` is written only on an allowed `open`, best-effort — a failed evidence write
+ * never blocks the candidate's own computer.
  */
 export type InterviewOpenPurpose = 'open' | 'renew';
 
@@ -30,7 +33,38 @@ export type InterviewOpenGateResult =
     | { kind: 'allow'; interviewId: string }
     | { kind: 'refuse'; status: 404 | 409; code: InterviewOpenRefusalCode };
 
+import { stagingGitQaAccepted } from '@/server/works/project-repo';
+
+import { getInterviewByUrl, isCandidate, writeComputerOpened, type InterviewDb } from './store';
+
+/** `^[A-Za-z0-9_-]{1,128}$` — the schema's `data:computer.opened.computerId`. Server-supplied; never from the browser. */
+const COMPUTER_ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
 export async function interviewOpenGate(input: InterviewOpenGateInput): Promise<InterviewOpenGateResult> {
-    void input;
-    return { kind: 'none' };
+    // Off on production and anywhere the staging gate is closed: the caller proceeds as for any repository.
+    if (!stagingGitQaAccepted()) return { kind: 'none' };
+    const { db } = await import('@/server/db');
+    return runInterviewOpenGate(db, input, () => new Date().toISOString());
+}
+
+/** The gate decision with an injected DB and clock, so each `openGateCases` row is proven on PGlite. */
+export async function runInterviewOpenGate(
+    db: InterviewDb, input: InterviewOpenGateInput, now: () => string,
+): Promise<InterviewOpenGateResult> {
+    const row = await getInterviewByUrl(db, input.canonicalURL);
+    if (!row) return { kind: 'none' };
+    if (!isCandidate(row, { osUserId: input.osUserId, ezilIdSubject: input.ezilIdSubject })) {
+        return { kind: 'refuse', status: 404, code: 'repo_not_found' };
+    }
+    if (row.state === 'finished') return { kind: 'refuse', status: 409, code: 'interview_finished' };
+    if (row.state !== 'started') return { kind: 'refuse', status: 409, code: 'interview_not_started' };
+    if (input.purpose === 'open' && COMPUTER_ID_RE.test(input.computerId)) {
+        try {
+            await writeComputerOpened(db, row.interviewId, input.computerId, now());
+        } catch {
+            // Evidence is best-effort; the candidate's own computer must open regardless.
+            console.warn('[interview] computer.opened write failed', { interviewId: row.interviewId });
+        }
+    }
+    return { kind: 'allow', interviewId: row.interviewId };
 }
