@@ -1,7 +1,7 @@
 import {createVP8Muxer} from './vp8-webm.js';
 
 // Only called after server receipt + begin. No track, canvas or recorder belongs to a repository iframe.
-export async function encodeTabSegments({win, stream, matches, windowStart, deadline, upload, cutoff, onFault, onFrame}) {
+export async function encodeTabSegments({win, stream, matches, windowStart, deadline, upload, cutoff, onFault, onFrame, onAwaitFrame}) {
     const video = win.document.createElement('video');
     video.muted = true;
     video.playsInline = true;
@@ -18,6 +18,7 @@ export async function encodeTabSegments({win, stream, matches, windowStart, dead
         await new Promise((resolve, reject) => {
             const timeout = win.setTimeout(() => reject(new Error('no_current_frame')), 4500);
             video.requestVideoFrameCallback(() => { win.clearTimeout(timeout); resolve(); });
+            onAwaitFrame?.();
         });
         if (!matches() || !ctx || !video.videoWidth || !video.videoHeight) throw new Error('source_lost');
         const scale = Math.min(1, 1920/video.videoWidth, 1080/video.videoHeight);

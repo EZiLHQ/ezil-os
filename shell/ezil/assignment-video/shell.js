@@ -1,4 +1,5 @@
 import {currentTabPicker, STAGING_OS} from './current-tab.js';
+import {bindFrameClickCues, setFrameClickCues} from './frame-cues.js';
 import {showShellClicks} from './shell-clicks.js';
 import {encodeTabSegments} from './tab-segments.js';
 import {checkAssignmentVideoEligibility, createAssignmentVideoTransport} from './transport.js';
@@ -45,11 +46,11 @@ function panel(win) {
     }, remove: () => box.remove()};
 }
 
-export function openWithAssignmentConsent({project, actor, open}) {
+export function openWithAssignmentConsent({project, computerId, actor, open}) {
     const win = globalThis.window;
     if (!win || win.top !== win || win.location.origin !== STAGING_OS) { open(); return; }
     const repo = project?.repoUrl;
-    if (current && (current.repo !== repo || current.actor() !== actor())) {
+    if (current && (current.repo !== repo || current.computerId !== computerId || current.actor() !== actor())) {
         current.stop('stopped'); current = undefined;
     }
     const address = new URL(win.location.href);
@@ -60,7 +61,7 @@ export function openWithAssignmentConsent({project, actor, open}) {
     const owner = actor();
     const ui = panel(win);
     let source, picker, transport, recorder, grant, terminal = false, openCalled = false;
-    let beginPending, deadlineTimer, sourceTimer, closeClickCues, clipCount = 0;
+    let beginPending, deadlineTimer, sourceTimer, closeClickCues, detachCodeCues, clipCount = 0;
     const sameOwner = () => actor() === owner;
     const launch = () => { if (!openCalled) { openCalled = true; open(); } };
     function showClosed(message) { ui.set(message, [['Dismiss', () => ui.remove()]]); }
@@ -69,6 +70,8 @@ export function openWithAssignmentConsent({project, actor, open}) {
         terminal = true;
         win.clearTimeout(deadlineTimer); win.clearTimeout(sourceTimer);
         source?.stream.getTracks().forEach(t => t.stop());
+        if (closeClickCues) setFrameClickCues(null);
+        detachCodeCues?.();
         closeClickCues?.();
         picker?.dispose();
         win.removeEventListener('pagehide', pageHide);
@@ -126,7 +129,7 @@ export function openWithAssignmentConsent({project, actor, open}) {
             ]);
         }
     }
-    function confirmed(receipt) {
+    function confirmed(receipt, frame, frameUrl) {
         if (terminal || beginPending) return;
         const opened = Date.parse(receipt?.openedAt), start = Date.parse(receipt?.windowStartedAt), end = Date.parse(receipt?.deadlineAt);
         if (!available() || receipt?.attemptId !== attemptId || typeof receipt.proof !== 'string'
@@ -151,15 +154,19 @@ export function openWithAssignmentConsent({project, actor, open}) {
                 }, cutoff: async () => {
                     const status = await transport.status();
                     return status.stopRequestedAt || null;
-                }, onFault: () => stop('stopped','Recording was interrupted. The report may contain a gap.'),
+                }, onAwaitFrame: () => ui.set('Repository verified. Starting tab recording…',stopButton),
+                onFault: () => stop('stopped','Recording was interrupted. The report may contain a gap.'),
                 onFrame: () => {
                     closeClickCues = showShellClicks(win);
+                    const documentUrl = new URL(frameUrl);
+                    detachCodeCues = bindFrameClickCues(frame, documentUrl.origin, documentUrl.searchParams.get('ezil_mint'), computerId);
+                    setFrameClickCues(computerId);
                     ui.set('Recording this EZiL OS tab · 1 frame per second', stopButton);
                 }});
         })();
         beginPending.catch(() => stop('stopped','Assignment recording could not continue. The report may contain a gap.'));
     }
-    current = {repo, actor: () => owner, stop, confirmed, terminal: () => terminal};
+    current = {repo, computerId, actor: () => owner, stop, confirmed, terminal: () => terminal};
     ui.set('Checking this assignment’s recording eligibility…');
     checkAssignmentVideoEligibility(attemptId).then(eligibility => {
         if (terminal) return;
@@ -174,6 +181,6 @@ export function openWithAssignmentConsent({project, actor, open}) {
     }).catch(() => stop('stopped','Recording eligibility could not be verified. No footage was saved.'));
 }
 
-export function confirmAssignmentFolder(project, receipt) {
-    if (current && !current.terminal() && current.repo === project?.repoUrl) current.confirmed(receipt);
+export function confirmAssignmentFolder(project, receipt, frame, frameUrl) {
+    if (current && !current.terminal() && current.repo === project?.repoUrl) current.confirmed(receipt,frame,frameUrl);
 }

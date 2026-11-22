@@ -1268,7 +1268,7 @@ export async function openCodeWindow (ctx = {}) {
                         onRoot: (root, how) => {
                             resetOriginRecovery();
                             if (how.mintDriven && !how.fallback && root.kind === 'folder' && root.path === repository_folder) {
-                                confirmAssignmentFolder(project, assignment_open);
+                                confirmAssignmentFolder(project, assignment_open, el_iframe, frame_url);
                                 assignment_open = undefined;
                             }
                             on_root(root, how);
@@ -1724,7 +1724,7 @@ export async function openCodeWindow (ctx = {}) {
     window.addEventListener(TRANSITION_EVENT, on_transition);
 
     function launchWithConsent() {
-        openWithAssignmentConsent({project, actor: () => session.payload()?.user?.id,
+        openWithAssignmentConsent({project, computerId: computer.id, actor: () => session.payload()?.user?.id,
             open: () => { if (!disposed) void start_boot(); }});
     }
     launchWithConsent();
