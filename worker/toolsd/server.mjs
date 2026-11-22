@@ -17,11 +17,12 @@
  * directory, and listens.
  */
 
+import { spawnSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { pathToFileURL } from 'node:url';
 import { authorize, deriveKey, createReplayCache, MAX_BODY_BYTES } from './auth.mjs';
 import { scanCatalog, DEFAULT_WORKSPACE_ROOT } from './manifest.mjs';
-import { createJobManager, prepareToolsDir } from './jobs.mjs';
+import { createJobManager, prepareToolsDir, SETPRIV } from './jobs.mjs';
 
 export const DEFAULT_HOST = '0.0.0.0';
 export const DEFAULT_PORT = 9224;
@@ -107,8 +108,14 @@ export function createToolsdServer({
       key,
       replay,
     });
-    // Every refusal is the same 401; nothing below this line runs for it.
-    if (!auth.ok) return unauthorized(res);
+    // Every refusal is the same 401; nothing below this line runs for it. The
+    // failed check NAME is logged (e.g. `step=host`, `step=mac`) so a first
+    // deploy's Host or key mismatch is diagnosable — never a header value, MAC,
+    // body, command or output.
+    if (!auth.ok) {
+      console.warn(`[toolsd] refused step=${auth.step}`);
+      return unauthorized(res);
+    }
 
     // Parse the op body. An empty body is `{}`.
     let body;
@@ -218,9 +225,22 @@ export async function startServer() {
     process.exit(1);
     return;
   }
+  // setpriv must exist before we accept any work: without it a job cannot drop
+  // privilege. Refuse to listen, the same way a missing seed does.
+  if (spawnSync(SETPRIV, ['--version']).status !== 0) {
+    console.error(`[toolsd] ${SETPRIV} is not runnable; refusing to listen (jobs could not drop to uid 7001)`);
+    process.exit(1);
+    return;
+  }
+
   const key = deriveKey(seed);
-  // 🔴 The seed is this boot's proxy token. Remove it so no spawned job (which
-  // is built a fresh environment anyway) can ever read it from toolsd's own.
+  // Drop the seed from toolsd's LIVE environment. This does NOT scrub it from
+  // `/proc/<toolsd-pid>/environ`, which is frozen at exec time and keeps the
+  // seed regardless of a later `delete`. What actually protects the seed from a
+  // job: (1) toolsd runs as root, so its environ is unreadable to the uid-7001
+  // jobs (the /proc EACCES test proves this), and (2) jobs are built a
+  // from-scratch env and never inherit toolsd's. The delete still matters: it
+  // stops an in-process bug in toolsd from echoing the seed out of `process.env`.
   delete process.env.EZIL_TOOLSD_SEED;
 
   const workspaceRoot = process.env.EZIL_TOOLSD_WORKSPACE || DEFAULT_WORKSPACE_ROOT;
