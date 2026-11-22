@@ -34,9 +34,14 @@
  *
  * Reads (`snapshot`, `get_text`, `screenshot`, `wait_for{text}`) check AGAIN
  * after reading: a page that navigated onto the IdP while it was being read
- * yields `origin_read_only`, not the IdP's content. Actions (`click`, `type`,
- * `fill_form`, `select`, `scroll`, `press`) may land on any tier; what they
- * return is the sanitised `url`.
+ * yields `origin_read_only`, not the IdP's content. Actions (`navigate`,
+ * `click`, `type`, `fill_form`, `select`, `scroll`, `press`) may land on any
+ * tier and return the sanitised `url` — EXCEPT for a caller with
+ * `opts.denyTiers` (the Code loopback): an action that lands on a denied tier
+ * answers `origin_read_only` with no url and no title, and a `navigate` whose
+ * target is in a denied tier is refused before anything loads. Such a caller
+ * also gets no console or network entry the tab recorded while in a denied
+ * tier.
  *
  * Every `url` member leaves through `sanitizeUrl`.
  */
@@ -148,6 +153,21 @@ function assertTierAllows (surface, page, route, body, opts) {
     return tier;
 }
 
+/**
+ * 🔴 THE CODE LOOPBACK'S LANDING RULE. After a verb has ACTED, the page it
+ * acted on must not be in a tier the caller denied: a navigate, a click, a
+ * submit, a key press — or a page script reacting to a fill, a select or a
+ * scroll — may already have taken it there, and nothing about where it went
+ * (url, title, anything) goes back. The Worker path denies no tier, so for it
+ * this is a no-op: there a verb "may land on any tier".
+ */
+function assertNotLandedOnDenied (surface, page, opts) {
+    const deny = deniedTiers(opts);
+    if (deny.size > 0 && deny.has(tierOf(page.url(), surface.originPolicy))) {
+        throw fail('origin_read_only', 'the verb landed on a tier this caller may not read');
+    }
+}
+
 /** The page a verb acts on, after the tier gate has let it through. */
 async function actingPage (surface, route, body, opts) {
     const page = await surface.activePage();
@@ -212,12 +232,21 @@ export const VERBS = {
             );
         }
         const page = await actingPage(surface, 'POST /navigate', body, opts);
+        // A target the caller may not read is refused BEFORE anything loads;
+        // a redirect into one is caught by the landing rule below.
+        if (deniedTiers(opts).has(tierOf(raw, surface.originPolicy))) {
+            throw fail('origin_read_only', 'navigate: the target is in a tier this caller may not read');
+        }
         try {
             await page.goto(raw, { timeout: NAVIGATION_TIMEOUT_MS, waitUntil: 'domcontentloaded' });
         } catch (err) {
             throw fail('navigation_failed', messageOf(err));
         }
-        return { ok: true, url: urlOf(surface, page), title: await safeTitle(page) };
+        // The title is read BEFORE the last check, so a page that moves on
+        // while it is read cannot hand a denied page's title back.
+        const title = await safeTitle(page);
+        assertNotLandedOnDenied(surface, page, opts);
+        return { ok: true, url: urlOf(surface, page), title };
     },
 
     'POST /snapshot': async (surface, body = {}, opts = {}) => {
@@ -227,6 +256,7 @@ export const VERBS = {
             ACTION_TIMEOUT_MS,
             'snapshot',
         );
+        const title = await safeTitle(page);
         // Read again BEFORE any ref is registered: a tree read off a page that
         // has just navigated onto the IdP is the IdP's tree.
         assertTierAllows(surface, page, 'POST /snapshot', body, opts);
@@ -235,7 +265,7 @@ export const VERBS = {
             ok: true,
             snapshot: result.truncated ? `${result.text}\n- [snapshot truncated]` : result.text,
             url: urlOf(surface, page),
-            title: await safeTitle(page),
+            title,
         };
     },
 
@@ -247,6 +277,7 @@ export const VERBS = {
         } catch (err) {
             throw refActionFailure(err);
         }
+        assertNotLandedOnDenied(surface, page, opts);
         return { ok: true, url: urlOf(surface, page) };
     },
 
@@ -271,6 +302,7 @@ export const VERBS = {
         } catch (err) {
             throw refActionFailure(err);
         }
+        assertNotLandedOnDenied(surface, page, opts);
 
         // `redacted` tells the caller WHY there is no echo. A silent omission
         // would be a lie to an agent that is trying to confirm what it typed.
@@ -349,16 +381,17 @@ export const VERBS = {
             throw fail('bad_request', 'unknown console level — log, debug, info, warning or error');
         }
         // Only what the ACTIVE page logged: other tabs and contexts are never
-        // reported (`BrowserSurface.consoleEntries`).
+        // reported (`BrowserSurface.consoleEntries`), and neither is anything
+        // the tab recorded while it was on a tier this caller denies.
         const page = await actingPage(surface, 'POST /console', body, opts);
-        const entries = surface.consoleEntries(page);
+        const entries = surface.consoleEntries(page, deniedTiers(opts));
         return { ok: true, entries: level ? entries.filter((e) => e.level === level) : entries };
     },
 
     'POST /network': async (surface, body = {}, opts = {}) => {
         const filter = present(body.filter) ? String(body.filter) : null;
         const page = await actingPage(surface, 'POST /network', body, opts);
-        const requests = surface.networkEntries(page);
+        const requests = surface.networkEntries(page, deniedTiers(opts));
         return { ok: true, requests: filter ? requests.filter((r) => r.url.includes(filter)) : requests };
     },
 
@@ -450,6 +483,7 @@ export const VERBS = {
             }
             filled += 1;
         }
+        assertNotLandedOnDenied(surface, page, opts);
         return { ok: true, url: urlOf(surface, page), filled, redacted };
     },
 
@@ -474,6 +508,7 @@ export const VERBS = {
         } catch (err) {
             throw refActionFailure(err);
         }
+        assertNotLandedOnDenied(surface, page, opts);
         return { ok: true, url: urlOf(surface, page), selected: Array.isArray(selected) ? selected.map(String) : [] };
     },
 
@@ -498,6 +533,7 @@ export const VERBS = {
         } else {
             scrollY = await withTimeout(page.evaluate(scrollWindowBy, dy), ACTION_TIMEOUT_MS, 'scroll');
         }
+        assertNotLandedOnDenied(surface, page, opts);
         return { ok: true, url: urlOf(surface, page), scrollY: Number.isFinite(scrollY) ? scrollY : 0 };
     },
 
@@ -525,6 +561,7 @@ export const VERBS = {
             await page.waitForLoadState('domcontentloaded', { timeout: NAVIGATION_TIMEOUT_MS })
                 .catch(() => { /* an Enter that does not navigate is normal */ });
         }
+        assertNotLandedOnDenied(surface, page, opts);
         return { ok: true, url: urlOf(surface, page) };
     },
 };
