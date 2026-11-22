@@ -102,8 +102,12 @@ navigate and `wait_for{time}` only, for every caller — until the variable is
 fixed, and one boot line names each fault by variable and position, never by
 value. (Emptying just the bad tier would fail open: a broken IdP list would
 make the IdP `other`.) Unset or blank variables are not malformed: that tier is
-empty. An origin in both lists is `idp_transit`.
-`EZIL_BROWSER_TEST_ALLOWED_ORIGINS` is never a tier source.
+empty — except that a non-empty owner list with an empty or unset IdP list is
+broken too (an owner app is only safe when its IdP is known). The IdP tier
+matches by **host**, whatever the scheme or port (`http://id.ezil.work/…`,
+`wss://id.ezil.work/…` are `idp_transit`); the owner tier is an exact https
+origin. An origin in both lists — or an owner origin on an IdP host — is
+`idp_transit`. `EZIL_BROWSER_TEST_ALLOWED_ORIGINS` is never a tier source.
 
 | Tier | Routes |
 |---|---|
@@ -135,23 +139,37 @@ names) refuses those tiers as well: the Code loopback passes
 That is agent policy, not confinement (`docs/contracts/browser-verbs-v2.md` §8:
 anything in the computer can reach CDP on 9222 directly).
 
-**URL sanitising.** `sanitizeUrl` reduces an `idp_transit` URL to origin + path,
-and strips the whole query and fragment from any URL whose query or fragment
-names `code`, `state`, `id_token`, `access_token`, `refresh_token`, `token`,
-`session_transfer_token`, `nonce`, `ticket` or `code_verifier`. Every other
-URL is returned as the same string (under a broken policy every URL takes the
-origin + path form). It is applied at the source: console and network entries
-as they are recorded (including URLs inside console text and `location`), and
-every `url` member of every response.
+**URL sanitising.** `sanitizeUrl` reduces an `idp_transit` URL to origin + path.
+For every URL it reads the remainder after the origin — path with its `;`
+parameters, query, fragment — percent-decoded once, `+` as a space, invisible
+characters removed, and looks for a sensitive name (`code`, `state`,
+`id_token`, `access_token`, `refresh_token`, `token`, `session_transfer_token`,
+`nonce`, `ticket`, `code_verifier`, plus `jwt` and `accesstoken`), optionally
+`[]`, followed by `=` and not glued to a preceding letter or digit. So a
+callback URL nested in a `redirect=` value, `/cb;code=…`, `#!code=…`,
+`?code[]=…`, `?x=code=…`, `?auth_code=…` and `?%E2%80%8Bcode=…` all match. A
+match strips the query, the fragment and every `;` path parameter (and the
+userinfo when the name was there); if the path proper still carries one, only
+the origin leaves. Every other URL is returned as the same string (under a
+broken policy every URL takes the origin + path form). It is applied at the
+source: console and network entries as they are recorded (including URLs
+inside console text and `location`), and every `url` member of every response.
 
 **Page text** — snapshot text, `get_text` markdown, every `title`, and
-`/select`'s option values — leaves through `sanitizeText`: every absolute URL
-in it through `sanitizeUrl` (the JSON-escaped `https:\/\/…` form too), and every
-relative reference (`/cb?code=…`, `./x?state=…`, `?code=…`, `#access_token=…`,
-`//host/cb?…`), because markdown carries the page's raw `href`s. Trailing
-punctuation and an unbalanced `)` or `]` stay outside the URL, so markdown links
-keep their brackets. The limit: text that merely contains `?code=` glued inside
-a word (`a/b?code=1`) is neither a URL nor a reference, and stays.
+`/select`'s option values — leaves through `sanitizeText`, in four passes:
+every absolute URL of any scheme through `sanitizeUrl` (the JSON-escaped
+`https:\/\/…` form too); every relative reference (`/cb?code=…`,
+`./x?state=…`, `?code=…`, `#access_token=…`, `//host/cb?…`); then every
+sensitive `name=value` run left anywhere, name and all (the value ends at `&`,
+whitespace, `#`, `)`, `]`, `|`, a quote, `<` or `>`; a quoted value goes with
+its quotes), so `x|/cb?code=…|`, `Callback:/cb?code=…` and a bare
+`code=…&state=…` keep no `code=`; and last, any percent-encoded token that
+decodes to one. `get_text` renders links with the browser's resolved (absolute)
+href, so relative hrefs reach the URL pass whole. Trailing punctuation and an
+unbalanced `)` or `]` stay outside a URL, so markdown links keep their brackets.
+On an `idp_transit` page — or one that crossed into or out of it while its
+title was read — `title` is `''`, for every caller. The limit: a JSON
+`"code":"…"` pair is neither a URL nor a `name=` run, and stays.
 
 **Page scope.** `console` and `network` return only entries recorded from the
 active tab (entries carry an internal page tag; the public entry shape is
@@ -231,21 +249,36 @@ renders the dots when unmasked; only the container suite proves the pixels.)
 `origin-policy.test.mjs` covers the pure policy. Break each guard, run
 `bun test` (all suites), expect red, restore with `git checkout <file>`:
 
-| Guard | Mutation | Recorded (2026-11-22, 270 tests) |
+| Guard | Mutation | Recorded (2026-11-22, 324 tests) |
 |---|---|---|
-| tier gate (`verbs.mjs` `assertTierAllows`) | `if (!routeAllowedOnTier(…) \|\| deny.has(tier))` → `if (false)` | 38 fail |
-| idp route table (`origin-policy.mjs` `routeAllowedOnTier`) | `if (tier !== 'idp_transit') return true;` → `return true;` | 29 fail |
-| `sanitizeUrl` | return `url` unchanged before parsing | 32 fail |
+| tier gate (`verbs.mjs` `assertTierAllows`) | `if (!routeAllowedOnTier(…) \|\| deny.has(tier))` → `if (false)` | 40 fail |
+| idp route table (`origin-policy.mjs` `routeAllowedOnTier`) | `if (tier !== 'idp_transit') return true;` → `return true;` | 31 fail |
+| `sanitizeUrl` | return `url` unchanged before parsing | 57 fail |
 | ref tab binding (`browser.mjs` `resolveRef`) | the `pageKey` check → `if (false)` | 2 fail |
 | ref origin binding (`browser.mjs` `resolveRef`) | the `origin` check → `if (false)` | 1 fail |
-| broken policy (`origin-policy.mjs` `classify`) | delete `if (sets.broken) return 'idp_transit';` | 43 fail |
-| broken policy (`loadOriginPolicy`) | `const broken = false;` | 45 fail |
+| broken policy (`origin-policy.mjs` `classify`) | delete `if (sets.broken) return 'idp_transit';` | 46 fail |
+| broken policy (`loadOriginPolicy`) | `const broken = false;` | 48 fail |
+| owner list without IdP list (`loadOriginPolicy`) | `const ownerWithoutIdp = false;` | 2 fail |
+| IdP by host (`origin-policy.mjs` `classify`) | delete the `idpHosts` check | 56 fail |
 | Code landing rule (`verbs.mjs` `assertNotLandedOnDenied`) | its check → `if (false)` | 18 fail |
 | Code navigate-target refusal (`verbs.mjs` `/navigate`) | its check → `if (false)` | 1 fail |
 | Code console history (`browser.mjs` `consoleEntries`) | drop the `denyTiers` filter | 1 fail |
 | Code network history (`browser.mjs` `networkEntries`) | drop the `denyTiers` filter | 1 fail |
-| page text (`verbs.mjs` `textOf`) | return `text` unchanged | 5 fail |
-| relative references (`origin-policy.mjs` `sanitizeText`) | skip the second pass | 5 fail |
+| decoded-remainder check (`carriesSensitive`) | always `false` | 24 fail |
+| …percent-decoding (`decodeOnce`) | return the text as is | 13 fail |
+| …invisible characters (`carriesSensitive`) | keep them | 1 fail |
+| …`;` path parameters (`withoutPathParams`) | keep them | 4 fail |
+| …safety net (`reduced`) | always return what is left | 4 fail |
+| page text (`verbs.mjs` `textOf`) | return `text` unchanged | 3 fail |
+| IdP title (`verbs.mjs` `titleOf`) | return the title anyway | 5 fail |
+| relative references (`sanitizeText` pass 2) | skip it | 5 fail |
+| `name=value` runs (`sanitizeText` pass 3) | skip it | 11 fail |
+| encoded tokens (`sanitizeText` pass 4) | skip it | 3 fail |
+| any-scheme URLs (`sanitizeText` pass 1) | `https?:` only | 3 fail |
+| resolved hrefs (`page-scripts.mjs` `pageMarkdown`) | the raw `href` attribute | 2 fail |
+
+A mutant that does not parse is not a result: run `node --check` on the
+mutated file first (a syntax error can hang `bun test` rather than fail it).
 
 ## Running it by hand
 
