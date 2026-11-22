@@ -75,9 +75,14 @@ export function checkedPut(value: unknown, subject: string, recordingId: string,
     const owner = createHash('sha256').update(issuer).update('\0').update(subject).digest('hex');
     const path = '/universe-staging/assignment-media/v1/' + [owner, part.attemptId, recordingId, 'segments', part.sequence, part.sha256 + '.webm'].join('/');
     const exp = Date.parse(out.expiresAt);
+    const signedHeaders = ['content-length', 'content-type', 'host', 'if-none-match',
+        'x-amz-checksum-sha256', 'x-amz-server-side-encryption'].join(';');
+    const ttl = url.searchParams.get('X-Amz-Expires') ?? '';
     if (url.origin !== objectOrigin || url.pathname !== path || url.username || url.password || url.hash
         || url.searchParams.get('X-Amz-Algorithm') !== 'AWS4-HMAC-SHA256'
         || !/^[a-f0-9]{64}$/.test(url.searchParams.get('X-Amz-Signature') ?? '')
+        || !/^[1-9][0-9]{0,2}$/.test(ttl) || Number(ttl) > 300
+        || url.searchParams.get('X-Amz-SignedHeaders') !== signedHeaders
         || exp <= now || exp > now + 305000
         || out.headers['x-amz-checksum-sha256'] !== Buffer.from(part.sha256, 'hex').toString('base64'))
         return refuse('media_unavailable', 503);

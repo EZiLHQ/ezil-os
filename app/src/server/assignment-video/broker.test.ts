@@ -18,7 +18,9 @@ const begin = {action:'begin' as const, attemptId:attempt, consentAccepted:true 
 const state = {recordingId:recording,status:'recording',startedAt:time(initial),deadlineAt:time(initial+hour),
     stopRequestedAt:null,revoked:false};
 const signed = {putUrl:objectOrigin+'/universe-staging/assignment-media/v1/'+owner+'/'+attempt+'/'+recording+'/segments/0/'+hash+
-    '.webm?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature='+'a'.repeat(64),expiresAt:time(initial+65000),
+    '.webm?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Expires=60&X-Amz-SignedHeaders='+
+    'content-length%3Bcontent-type%3Bhost%3Bif-none-match%3Bx-amz-checksum-sha256%3Bx-amz-server-side-encryption'+
+    '&X-Amz-Signature='+'a'.repeat(64),expiresAt:time(initial+65000),
     headers:{'content-type':'video/webm','if-none-match':'*','x-amz-server-side-encryption':'AES256',
         'x-amz-checksum-sha256':Buffer.from(hash,'hex').toString('base64')}};
 let clock = initial+5000;
@@ -101,7 +103,8 @@ describe('assignment media broker',()=>{
     });
     it('refuses arbitrary S3 targets, checksum, unexpected headers and stale or overlong URLs',()=>{
         const wrong = [signed.putUrl.replace(owner,'1'.repeat(64)),signed.putUrl.replace(attempt,recording),
-            signed.putUrl.replace('segments/0','segments/1'),signed.putUrl.replace('s3.ap-south-1.amazonaws.com','example.test')];
+            signed.putUrl.replace('segments/0','segments/1'),signed.putUrl.replace('s3.ap-south-1.amazonaws.com','example.test'),
+            signed.putUrl.replace('X-Amz-Expires=60','X-Amz-Expires=3600'),signed.putUrl.replace('content-length%3B','')];
         for(const putUrl of wrong) expect(()=>checkedPut({...signed,putUrl},identity.subject,recording,input,clock)).toThrow();
         for(const expiresAt of [time(initial),time(initial+hour)]) expect(()=>checkedPut({...signed,expiresAt},identity.subject,recording,input,clock)).toThrow();
         for(const h of [{'x-amz-checksum-sha256':'a'}, {authorization:'forbidden'}])
