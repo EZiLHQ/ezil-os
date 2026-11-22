@@ -1,0 +1,34 @@
+import { headers } from 'next/headers';
+import { notFound, redirect } from 'next/navigation';
+
+import { createTRPCContext } from '@/server/api/trpc';
+import { assignmentEnrollmentEnabled } from '@/server/git/assignment-enrollment';
+import { Routes, getReturnUrlQueryParam } from '@/utils/constants';
+
+import { EnrollmentConsent } from './enrollment-consent';
+
+/**
+ * `/app/assignment-enrollment?attempt=<uuid>` — the participant's entry from a Universe assignment (os-staging only).
+ *
+ * Loading it changes nothing: no Universe call, no gateway call, no repository. It shows what will happen and waits
+ * for the person's explicit consent, which POSTs `/api/shell/assignment-enrollment`. A static segment, so it wins
+ * over `/app/[appId]`.
+ */
+export const metadata = { title: 'Assignment repository · EZiL OS' };
+export const dynamic = 'force-dynamic';
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+export default async function AssignmentEnrollmentPage({ searchParams }: {
+    searchParams?: Promise<Record<string, string | string[] | undefined>>;
+}) {
+    if (!assignmentEnrollmentEnabled()) notFound();
+    const attempt = (await searchParams ?? {}).attempt;
+    if (typeof attempt !== 'string' || !UUID.test(attempt)) notFound();
+    const heads = new Headers(await headers());
+    heads.set('x-trpc-source', 'rsc-assignment-enrollment');
+    const ctx = await createTRPCContext({ headers: heads });
+    if (!ctx.user) redirect(`${Routes.LOGIN}?${getReturnUrlQueryParam(`/app/assignment-enrollment?attempt=${attempt}`)}`);
+    if (ctx.delegation) notFound();
+    return <EnrollmentConsent attemptId={attempt} />;
+}
