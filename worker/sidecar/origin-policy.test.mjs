@@ -50,23 +50,46 @@ describe('loadOriginPolicy: where tiers come from', () => {
         expect(tierOf(`${OWNER}/builder`, policy)).toBe('other');
     });
 
-    it('unset, empty and blank variables are NOT malformed: an empty tier, the rest as configured', () => {
-        for (const value of [undefined, null, '', '   ', ',', ' , ']) {
-            for (const variable of Object.values(ORIGIN_TIER_ENV)) {
-                const other = variable === ORIGIN_TIER_ENV.owner_app ? ORIGIN_TIER_ENV.idp_transit : ORIGIN_TIER_ENV.owner_app;
-                const policy = loadOriginPolicy({ [variable]: value, [other]: other === ORIGIN_TIER_ENV.owner_app ? OWNER : IDP });
-                expect({ value, variable, broken: policy.broken, invalid: policy.invalid })
-                    .toEqual({ value, variable, broken: false, invalid: [] });
-                expect(tierOf('https://example.com/', policy)).toBe('other');
-            }
+    const BLANKS = [undefined, null, '', '   ', ',', ' , '];
+
+    it('unset or blank variables are NOT malformed: an unset owner list, an unset IdP list, or both', () => {
+        for (const value of BLANKS) {
+            const noOwner = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: value, [ORIGIN_TIER_ENV.idp_transit]: IDP });
+            expect({ value, broken: noOwner.broken, invalid: noOwner.invalid }).toEqual({ value, broken: false, invalid: [] });
+            expect(tierOf('https://example.com/', noOwner)).toBe('other');
+            expect(tierOf(`${IDP}/authorize`, noOwner)).toBe('idp_transit');
+            const neither = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: value, [ORIGIN_TIER_ENV.idp_transit]: value });
+            expect({ value, broken: neither.broken, invalid: neither.invalid }).toEqual({ value, broken: false, invalid: [] });
+            expect(tierOf('https://example.com/', neither)).toBe('other');
         }
         expect(loadOriginPolicy(undefined).broken).toBe(false);
         expect(tierOf('https://example.com/', loadOriginPolicy({}))).toBe('other');
     });
 
+    // 🔴 Amended 2026-11-22: an owner app is only safe when its IdP is known.
+    it('…EXCEPT a non-empty owner list with an empty or unset IdP list: that policy is broken', () => {
+        for (const value of BLANKS) {
+            const policy = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: OWNER, [ORIGIN_TIER_ENV.idp_transit]: value });
+            expect({ value, broken: policy.broken }).toEqual({ value, broken: true });
+            for (const url of [`${OWNER}/builder`, `${IDP}/authorize`, 'https://example.com/', 'about:blank']) {
+                expect({ value, url, tier: tierOf(url, policy) }).toEqual({ value, url, tier: 'idp_transit' });
+            }
+            expect(policy.invalid).toEqual([{
+                tier: 'idp_transit', variable: ORIGIN_TIER_ENV.idp_transit, entry: 0, reason: 'empty_with_owner_list',
+            }]);
+            const [line] = originPolicyBootLines(policy);
+            expect(line).toContain(`${ORIGIN_TIER_ENV.idp_transit} is empty while ${ORIGIN_TIER_ENV.owner_app} is set`);
+        }
+        // Positive control: the same owner list WITH its IdP list is sound.
+        const sound = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: OWNER, [ORIGIN_TIER_ENV.idp_transit]: IDP });
+        expect(sound.broken).toBe(false);
+        expect(tierOf(`${OWNER}/builder`, sound)).toBe('owner_app');
+    });
+
     it('accepts a comma list with blanks around the commas, and an explicit non-default port', () => {
         const policy = loadOriginPolicy({
             [ORIGIN_TIER_ENV.owner_app]: ` ${OWNER} , https://app.example.com:8443 ,`,
+            [ORIGIN_TIER_ENV.idp_transit]: IDP,
         });
         expect(policy.broken).toBe(false);
         expect(policy.owner_app).toEqual([OWNER, 'https://app.example.com:8443']);
@@ -130,10 +153,10 @@ describe('loadOriginPolicy: where tiers come from', () => {
 
     it(`more than ${ORIGIN_TIER_MAX_ENTRIES} entries breaks the policy; exactly ${ORIGIN_TIER_MAX_ENTRIES} is fine`, () => {
         const list = (n) => Array.from({ length: n }, (_, i) => `https://h${i}.example.com`).join(',');
-        const ok = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: list(ORIGIN_TIER_MAX_ENTRIES) });
+        const ok = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: list(ORIGIN_TIER_MAX_ENTRIES), [ORIGIN_TIER_ENV.idp_transit]: IDP });
         expect(ok.broken).toBe(false);
         expect(ok.owner_app).toHaveLength(ORIGIN_TIER_MAX_ENTRIES);
-        const tooMany = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: list(ORIGIN_TIER_MAX_ENTRIES + 1) });
+        const tooMany = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: list(ORIGIN_TIER_MAX_ENTRIES + 1), [ORIGIN_TIER_ENV.idp_transit]: IDP });
         expect(tooMany.broken).toBe(true);
         expect(tooMany.invalid.map((p) => p.reason)).toEqual(['too_many_entries']);
         expect(tierOf('https://h0.example.com/', tooMany)).toBe('idp_transit');
@@ -218,9 +241,20 @@ describe('tierOf', () => {
         ['https://id.ezil.work:443/u/login', 'idp_transit'],
         ['https://id.ezil.work./u/login', 'idp_transit'],
         ['blob:https://id.ezil.work/4f2c', 'idp_transit'],
-        ['http://id.ezil.work/u/login', 'other'],
-        ['https://id.ezil.work:8443/u/login', 'other'],
+        // The IdP matches by HOST whatever the scheme or port (amended 2026-11-22).
+        ['http://id.ezil.work/u/login', 'idp_transit'],
+        ['HTTP://ID.EZIL.WORK./u/login', 'idp_transit'],
+        ['https://id.ezil.work:8443/u/login', 'idp_transit'],
+        ['http://id.ezil.work:8080/', 'idp_transit'],
+        ['wss://id.ezil.work/socket', 'idp_transit'],
+        ['ftp://id.ezil.work/x', 'idp_transit'],
+        ['ezil://id.ezil.work/cb', 'idp_transit'],
+        ['blob:http://id.ezil.work/4f2c', 'idp_transit'],
+        // …and by that host only: positive controls.
         ['https://sub.id.ezil.work/', 'other'],
+        ['https://id.ezil.work.evil.example/', 'other'],
+        ['http://example.com/id.ezil.work', 'other'],
+        ['http://universe-staging.ezil.work/builder', 'other'],
         ['https://example.com/', 'other'],
         ['about:blank', 'other'],
         ['data:text/html,hi', 'other'],
@@ -235,6 +269,24 @@ describe('tierOf', () => {
 
     it('answers exactly one of ORIGIN_TIERS', () => {
         for (const [url] of cases) expect(ORIGIN_TIERS).toContain(tierOf(url, STAGING));
+    });
+
+    it('an owner origin on an IdP HOST (another port) is an overlap: idp_transit, logged', () => {
+        const policy = loadOriginPolicy({
+            [ORIGIN_TIER_ENV.owner_app]: `${OWNER},https://id.ezil.work:8443`,
+            [ORIGIN_TIER_ENV.idp_transit]: IDP,
+        });
+        expect(policy.broken).toBe(false);
+        expect(policy.owner_app).toEqual([OWNER]);
+        expect(policy.overlap).toEqual(['https://id.ezil.work:8443']);
+        expect(tierOf('https://id.ezil.work:8443/app', policy)).toBe('idp_transit');
+        expect(tierOf(`${OWNER}/builder`, policy)).toBe('owner_app');
+    });
+
+    it('an http IdP URL is sanitised to its transit form like an https one', () => {
+        expect(sanitizeUrl('http://id.ezil.work/authorize?state=Y&nonce=Z', STAGING)).toBe('http://id.ezil.work/authorize');
+        expect(sanitizeUrl('wss://id.ezil.work/socket?ticket=t', STAGING)).toBe('wss://id.ezil.work/socket');
+        expect(sanitizeUrl('http://example.com/a?b=1', STAGING)).toBe('http://example.com/a?b=1');
     });
 });
 
@@ -366,6 +418,132 @@ describe('sanitizeUrl', () => {
     });
 });
 
+describe('sanitizeUrl: the decoded remainder after the origin (amended 2026-11-22)', () => {
+    const STRIPPED = [
+        // The independent review's cases.
+        ['https://u.example/?redirect=https%3A%2F%2Fu.example%2Fcb%3Fcode%3DSECRET', 'https://u.example/'],
+        ['https://u.example/cb;code=a/x', 'https://u.example/cb/x'],
+        ['https://u.example/#!code=a', 'https://u.example/'],
+        ['https://u.example/?code[]=a', 'https://u.example/'],
+        ['https://u.example/?x=code=a', 'https://u.example/'],
+        ['https://u.example/?auth_code=a', 'https://u.example/'],
+        ['https://u.example/?%E2%80%8Bcode=a', 'https://u.example/'],
+        // …and the shapes around them.
+        ['https://u.example/?code%5B%5D=a', 'https://u.example/'],
+        ['https://u.example/?co%E2%80%8Bde=a', 'https://u.example/'],
+        ['https://u.example/?x=%E0&%E2%80%8Bcode=a', 'https://u.example/'],
+        ['https://u.example/?code =a', 'https://u.example/'],
+        ['https://u.example/?JWT=e30.e30.sig', 'https://u.example/'],
+        ['https://u.example/?accessToken=abc', 'https://u.example/'],
+        ['https://u.example/?next=%2Fcb%3Fstate%3D1', 'https://u.example/'],
+        ['https://u.example/cb;jsessionid=1;code=a/x?y=1', 'https://u.example/cb/x'],
+        ['https://code=a@u.example/x', 'https://u.example/x'],
+        ['https://id.ezil.work/cb;code=a', 'https://id.ezil.work/cb'],
+        ['ezil://cb?code=SECRET', 'ezil://cb'],
+        // The name in the path proper (or behind an encoded `;`): only the origin leaves.
+        ['https://u.example/oauth/code=abc/next', 'https://u.example/'],
+        ['https://u.example/cb%3Bcode=a', 'https://u.example/'],
+        ['data:text/plain,code=abc', 'data:'],
+    ];
+    for (const [url, out] of STRIPPED) {
+        it(`${url} -> ${out}`, () => {
+            expect(sanitizeUrl(url, STAGING)).toBe(out);
+        });
+    }
+
+    it('positive controls: look-alikes and harmless nesting come back as the SAME string', () => {
+        for (const url of [
+            'https://u.example/?redirect=https%3A%2F%2Fu.example%2Fcb%3Fpage%3D2',
+            'https://u.example/cb;jsessionid=abc/x',
+            'https://u.example/?xcode=1&decode=2&barcode=3&statement=4&tokens=5&encoded=6',
+            'https://u.example/?mode=code&type=state',
+            'https://u.example/codes/state/token',
+            'https://u.example/?q=%E2%80%8B&lang=%E0',
+        ]) {
+            expect(sanitizeUrl(url, STAGING)).toBe(url);
+        }
+    });
+
+    it('nothing that leaves still reads as a sensitive assignment', () => {
+        const NAME_EQ = /(?<![A-Za-z0-9])(code|state|id_token|access_token|refresh_token|token|session_transfer_token|nonce|ticket|code_verifier|jwt|accesstoken)(\[\])?\s*=/i;
+        for (const [url] of STRIPPED) {
+            const out = sanitizeUrl(url, STAGING);
+            let decoded = out;
+            try { decoded = decodeURIComponent(out); } catch { /* keep */ }
+            expect({ url, leaks: NAME_EQ.test(decoded) }).toEqual({ url, leaks: false });
+            expect(out).not.toContain('SECRET');
+        }
+    });
+});
+
+describe('sanitizeText: no sensitive name=value run survives (amended 2026-11-22)', () => {
+    const ZWSP = String.fromCharCode(0x200b);
+
+    // The independent review's cases, exactly.
+    const REVIEW = [
+        ['[go](callback?code=SECRET&state=S2)', '[go](callback?&)'],
+        ['x|/cb?code=SECRET|', 'x|/cb?|'],
+        ['a,/cb?code=SECRET', 'a,/cb?'],
+        ['Callback:/cb?code=SECRET', 'Callback:/cb?'],
+        ['**/cb?code=SECRET**', '**/cb?'],
+        ['>/cb?code=SECRET', '>/cb?'],
+        ['ezil://cb?code=SECRET', 'ezil://cb'],
+        ['code=SECRET&state=S2', '&'],
+    ];
+    for (const [text, out] of REVIEW) {
+        it(`${text} -> ${out}`, () => {
+            expect(sanitizeText(text, STAGING)).toBe(out);
+        });
+    }
+
+    it('takes the name too, quoted and spaced values with it, and sees through invisible characters', () => {
+        const cases = [
+            ['token="abc def" next', ' next'],
+            ["state='a b' next", ' next'],
+            ['Token = abc', ''],
+            ['access_token=t1;x', ''],
+            ['code[]=a&b=1', '&b=1'],
+            ['auth_code=SECRET', 'auth_'],
+            [`co${ZWSP}de=SECRET`, ''],
+            [`code${ZWSP}=SECRET`, ''],
+            ['jwt=e30.e30.sig and AccessToken=x', ' and '],
+        ];
+        for (const [text, out] of cases) {
+            expect({ text, out: sanitizeText(text, STAGING) }).toEqual({ text, out });
+        }
+    });
+
+    it('drops a percent-encoded token whose decoded form carries one (outside any URL)', () => {
+        expect(sanitizeText('see redirect_uri=https%3A%2F%2Fx%2Fcb%3Fcode%3DSECRET ok', STAGING)).toBe('see  ok');
+        expect(sanitizeText('next=%2Fcb%3Fstate%3DS2 done', STAGING)).toBe(' done');
+    });
+
+    it('positive controls: look-alikes, snapshot markup, prose and harmless escapes are untouched', () => {
+        for (const text of [
+            'xcode=1 decode=2 barcode=3 statement=4 tokens=5 codes=6',
+            '- textbox "Email" [ref=e5] [level=2] [type=password]',
+            'the state is ready; enter the code below',
+            'page=2&sort=asc',
+            '100%25 sure, a%20b, %E2%80%8B',
+            '{"state":"x"}',
+        ]) {
+            expect(sanitizeText(text, STAGING)).toBe(text);
+        }
+    });
+
+    it('the limit, stated: a JSON `"name":"value"` pair is not a `name=` run and stays', () => {
+        // Neither a URL nor `name=`: pass 3 does not read it. Recorded so it is a decision.
+        expect(sanitizeText('{"code":"SECRET"}', STAGING)).toBe('{"code":"SECRET"}');
+    });
+
+    it('stays linear on long runs (a 200k-character word and 20k escapes)', () => {
+        const big = `${'A'.repeat(200_000)} ${'B%20'.repeat(20_000)}`;
+        const started = Date.now();
+        expect(sanitizeText(big, STAGING)).toBe(big);
+        expect(Date.now() - started).toBeLessThan(2000);
+    });
+});
+
 describe('sanitizeText', () => {
     it('sanitises every http(s) URL inside free text and keeps the rest', () => {
         const text = `redirecting to ${AUTHORIZE_URL} then "${CALLBACK_URL}" (see https://example.com/help?topic=1)`;
@@ -416,10 +594,8 @@ describe('sanitizeText', () => {
         }
     });
 
-    it('the limit, stated: a `?code=` glued mid-word is not a reference and stays', () => {
-        // Not a URL and not a reference (no boundary before the `/`), so
-        // neither pass can tell it from prose. Recorded so it is a decision.
-        expect(sanitizeText('a/b?code=1', STAGING)).toBe('a/b?code=1');
+    it('a `?code=` glued mid-word is not a reference, but pass 3 still removes the run', () => {
+        expect(sanitizeText('a/b?code=1', STAGING)).toBe('a/b?');
     });
 
     it('trailing punctuation and closing brackets stay outside the URL', () => {

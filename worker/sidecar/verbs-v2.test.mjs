@@ -21,7 +21,7 @@ import {
     FIELD_VALUE_MAX_CHARS, FILL_FORM_MAX_FIELDS, ORIGIN_TIER_ENV, PRESS_KEYS, SCROLL_MAX_DY, SELECT_MAX_VALUES,
     SIDECAR_WIRE,
 } from './contract.mjs';
-import { loadOriginPolicy } from './origin-policy.mjs';
+import { loadOriginPolicy, sanitizeText } from './origin-policy.mjs';
 import {
     containsText, fieldState, pageMarkdown, passwordValues, scrollWindowBy, selectState, snapshotPage, windowScrollY,
 } from './page-scripts.mjs';
@@ -119,6 +119,7 @@ class FakePage extends EventEmitter {
         this.scrollY = 0;
         this.text = 'Builder profile';
         this.titleText = 'Page title';
+        this.onTitle = null;
         this.onRead = null;
         /** goto target -> where the server redirects it. */
         this.redirects = {};
@@ -137,7 +138,11 @@ class FakePage extends EventEmitter {
     isClosed () { return false; }
     mainFrame () { return this.frame; }
     frames () { return [this.frame]; }
-    async title () { return this.titleText; }
+    async title () {
+        const title = this.titleText;
+        if (this.onTitle) await this.onTitle();
+        return title;
+    }
     async goto (url) {
         this.gotoCalls.push(url);
         this.currentUrl = this.redirects[url] ?? url;
@@ -292,9 +297,67 @@ describe('idp_transit: transit only', () => {
         const surface = surfaceOver([idp]);
         expect(await VERBS['GET /health'](surface, {})).toEqual({ ok: true, chromeConnected: true, cdpUrl: 'http://127.0.0.1:9222' });
         expect(await VERBS['POST /wait_for'](surface, { time: 0.05 })).toEqual({ ok: true, matched: true });
+        // On the IdP the title is '' (amended 2026-11-22).
         expect(await VERBS['POST /navigate'](surface, { url: 'https://id.ezil.work/u/login?state=abc' }))
-            .toEqual({ ok: true, url: 'https://id.ezil.work/u/login', title: 'Page title' });
+            .toEqual({ ok: true, url: 'https://id.ezil.work/u/login', title: '' });
         expect(idp.currentUrl).toBe('https://id.ezil.work/u/login?state=abc');
+    });
+
+    it('the IdP is transit-only whatever the scheme: an http:// IdP page refuses too', async () => {
+        const REFUSING = Object.keys(SIDECAR_WIRE).filter((r) => !['GET /health', 'POST /navigate', 'POST /wait_for'].includes(r));
+        for (const url of ['http://id.ezil.work/u/login?state=s', 'https://id.ezil.work:8443/u/login']) {
+            const page = new FakePage(url);
+            const surface = surfaceOver([page]);
+            mintRefs(surface, page);
+            for (const route of REFUSING) {
+                expect({ url, route, code: await codeOf(VERBS[route](surface, BODY[route])) }).toEqual({ url, route, code: 'origin_read_only' });
+            }
+            expect(page.actions).toEqual([]);
+        }
+        // Positive control: an http page on another host is `other`.
+        const page = new FakePage('http://example.com/form');
+        const surface = surfaceOver([page]);
+        mintRefs(surface, page);
+        for (const route of REFUSING) {
+            expect({ route, code: await codeOf(VERBS[route](surface, BODY[route])) }).toEqual({ route, code: 'ok' });
+        }
+    });
+
+    it('on an IdP page the title is empty for every caller; elsewhere it is the sanitised title', async () => {
+        for (const [target, expected] of [
+            ['https://id.ezil.work/u/login', ''],
+            ['http://id.ezil.work/u/login', ''],
+            [OWNER_PAGE, 'Log in | EZiL ID'],
+            ['https://example.org/next', 'Log in | EZiL ID'],
+        ]) {
+            const page = new FakePage(OTHER_PAGE);
+            page.titleText = 'Log in | EZiL ID';
+            const surface = surfaceOver([page]);
+            const out = await VERBS['POST /navigate'](surface, { url: target });
+            expect({ target, title: out.title }).toEqual({ target, title: expected });
+        }
+        // Under a broken policy every page is the IdP tier: no title anywhere.
+        const broken = loadOriginPolicy({ [ORIGIN_TIER_ENV.idp_transit]: 'https://id.ezil.work/' });
+        const page = new FakePage(OTHER_PAGE);
+        page.titleText = 'Anything';
+        expect((await VERBS['POST /navigate'](surfaceOver([page], { policy: broken }), { url: 'https://example.org/' })).title).toBe('');
+    });
+
+    it('a page crossing into or out of the IdP while its title is read yields no title', async () => {
+        for (const [from, to] of [['https://id.ezil.work/u/login', OWNER_PAGE], [OWNER_PAGE, 'https://id.ezil.work/u/login']]) {
+            const page = new FakePage(OTHER_PAGE);
+            page.titleText = 'Log in | EZiL ID';
+            const surface = surfaceOver([page]);
+            page.redirects['https://go.example.com/'] = from;
+            page.onTitle = async () => { page.currentUrl = to; };
+            const out = await VERBS['POST /navigate'](surface, { url: 'https://go.example.com/' });
+            expect({ from, to, title: out.title }).toEqual({ from, to, title: '' });
+        }
+        // Positive control: a page that stays on the owner app keeps its title.
+        const page = new FakePage(OTHER_PAGE);
+        page.titleText = 'Builder profile';
+        const out = await VERBS['POST /navigate'](surfaceOver([page]), { url: OWNER_PAGE });
+        expect(out.title).toBe('Builder profile');
     });
 
     it('the tier is read immediately before acting: a page that moved ONTO the IdP is refused', async () => {
@@ -358,6 +421,27 @@ describe('a broken origin policy (a malformed tier entry) makes EVERY page idp_t
             expect(nav.url).toBe('https://example.com/next');
         });
     }
+
+    it('an owner list WITHOUT an IdP list is broken too: Universe pages are transit-only', async () => {
+        const ownerOnly = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: 'https://universe-staging.ezil.work' });
+        expect(ownerOnly.broken).toBe(true);
+        for (const url of [OWNER_PAGE, 'https://id.ezil.work/u/login', OTHER_PAGE]) {
+            const page = new FakePage(url);
+            const surface = surfaceOver([page], { policy: ownerOnly });
+            mintRefs(surface, page);
+            for (const route of REFUSED) {
+                expect({ url, route, code: await codeOf(VERBS[route](surface, BODY[route])) }).toEqual({ url, route, code: 'origin_read_only' });
+            }
+            expect(page.actions).toEqual([]);
+        }
+        // Positive control: with its IdP list the same owner page is fully usable.
+        const page = new FakePage(OWNER_PAGE);
+        const surface = surfaceOver([page], { policy: STAGING });
+        mintRefs(surface, page);
+        for (const route of REFUSED) {
+            expect({ route, code: await codeOf(VERBS[route](surface, BODY[route])) }).toEqual({ route, code: 'ok' });
+        }
+    });
 
     it('positive control: the same page under the well-formed policy is `other` and fully usable', async () => {
         const page = new FakePage(OTHER_PAGE);
@@ -521,7 +605,12 @@ describe('no OAuth parameter leaves in any handler output', () => {
             const relative = `${u.pathname}${u.search}${u.hash}`;
             const escaped = pageUrl.replace(/\//g, '\\/');
             page.titleText = `Signed in: ${pageUrl} (${escaped})`;
-            page.text = `Builder: continue at ${pageUrl} or [back](${relative}) or [again](${pageUrl}).`;
+            page.text = `Builder: continue at ${pageUrl} or [back](${relative}) or [again](${pageUrl}).`
+                // The review's free-text shapes (amended 2026-11-22), with the distinctive values.
+                + ' | x|/cb?code=AUTHCODEq7Rk| a,/cb?code=AUTHCODEq7Rk Callback:/cb?state=STATEw3Lp'
+                + ' **/cb?code=AUTHCODEq7Rk** >/cb?code=AUTHCODEq7Rk ezil://cb?code=AUTHCODEq7Rk'
+                + ' code=AUTHCODEq7Rk&state=STATEw3Lp [go](callback?code=AUTHCODEq7Rk&state=STATEw3Lp)'
+                + ' redirect_uri=https%3A%2F%2Fu.example%2Fcb%3Fcode%3DAUTHCODEq7Rk';
             page.elements.set('e7', { ref: 'e7', role: 'link', name: `Return to ${pageUrl}`, tag: 'a' });
             page.elements.get('e3').optionValues = ['hour', pageUrl];
 
@@ -556,14 +645,17 @@ describe('no OAuth parameter leaves in any handler output', () => {
                 : 'https://id.ezil.work/authorize';
             const navigate = outputs.find((o) => o.route === 'POST /navigate').out;
             expect(navigate.url).toBe(sanitized);
-            expect(navigate.title).toContain(`Signed in: ${sanitized} (`);
+            // The IdP's title never leaves; the owner app's leaves sanitised.
+            if (isOwner) expect(navigate.title).toContain(`Signed in: ${sanitized} (`);
+            else expect(navigate.title).toBe('');
             if (isOwner) {
                 const path = new URL(sanitized).pathname;
                 const { snapshot, title } = outputs.find((o) => o.route === 'POST /snapshot').out;
                 expect(snapshot).toContain(`- link "Return to ${sanitized}" [ref=e7]`);
                 expect(title).toContain(sanitized);
                 const { markdown } = outputs.find((o) => o.route === 'POST /get_text').out;
-                expect(markdown).toBe(`# Builder: continue at ${sanitized} or [back](${path}) or [again](${sanitized}).`);
+                expect(markdown.startsWith(`# Builder: continue at ${sanitized} or [back](${path}) or [again](${sanitized}).`)).toBe(true);
+                expect(markdown).toContain(' | x|/cb?| a,/cb? Callback:/cb? **/cb? >/cb? ezil://cb & [go](callback?&) ');
                 expect(outputs.find((o) => o.route === 'POST /select').out.selected).toEqual([sanitized]);
                 const { entries } = outputs.find((o) => o.route === 'POST /console').out;
                 const { requests } = outputs.find((o) => o.route === 'POST /network').out;
@@ -586,11 +678,81 @@ describe('no OAuth parameter leaves in any handler output', () => {
         page.log(`go ${CALLBACK_URL_2}`, AUTHORIZE_URL_2);
         page.request(CALLBACK_URL_2);
         page.request(AUTHORIZE_URL_2, { failed: true });
+        // The amended (decoded-remainder) check runs in record() too.
+        page.request('https://u.example/?redirect=https%3A%2F%2Fu.example%2Fcb%3Fcode%3DSECRETNESTED');
+        page.request('https://u.example/cb;code=SECRETPATH/x', { failed: true });
         await tick();
         const held = JSON.stringify([surface.consoleBuffer, surface.networkBuffer]);
-        for (const marker of LEAK_MARKERS) expect(held).not.toContain(marker);
+        for (const marker of [...LEAK_MARKERS, 'SECRETNESTED', 'SECRETPATH']) expect(held).not.toContain(marker);
         expect(surface.consoleBuffer).toHaveLength(1);
-        expect(surface.networkBuffer).toHaveLength(2);
+        // (requestfailed records at once, requestfinished after its response: compare as sets.)
+        expect(surface.networkBuffer.map((r) => r.entry.url).sort()).toEqual([
+            'https://id.ezil.work/authorize',
+            'https://u.example/',
+            'https://u.example/cb/x',
+            'https://universe-staging.ezil.work/creator/social-login/callback/auth0',
+        ]);
+    });
+});
+
+// ── get_text markdown: hrefs are resolved before they are sanitised ─────────
+
+/**
+ * Just enough DOM for `pageMarkdown` (which runs in the page): elements with
+ * tag, children, attributes and — for <a> — the browser's resolved `href`.
+ */
+function fakeDocument (base, build) {
+    const style = { display: 'block', visibility: 'visible' };
+    const doc = { defaultView: { getComputedStyle: () => style } };
+    const text = (t) => ({ nodeType: 3, textContent: t });
+    const el = (tag, attrs = {}, ...kids) => {
+        const node = {
+            nodeType: 1,
+            tagName: tag.toUpperCase(),
+            ownerDocument: doc,
+            childNodes: kids,
+            children: kids.filter((k) => k.nodeType === 1),
+            getAttribute: (name) => (name in attrs ? attrs[name] : null),
+            hasAttribute: (name) => name in attrs,
+            querySelectorAll: () => [],
+            get textContent () { return kids.map((k) => k.textContent).join(''); },
+        };
+        if (tag === 'a' && 'href' in attrs) {
+            Object.defineProperty(node, 'href', { get: () => (attrs.svg ? { baseVal: attrs.href } : new URL(attrs.href, base).href) });
+        }
+        return node;
+    };
+    doc.body = build(el, text);
+    doc.querySelector = () => null;
+    return doc;
+}
+
+describe('get_text: pageMarkdown renders RESOLVED hrefs, which sanitizeText then cleans', () => {
+    const BASE = 'https://universe-staging.ezil.work/creator/social-login/start';
+
+    function markdownOf (build) {
+        const saved = globalThis.document;
+        globalThis.document = fakeDocument(BASE, build);
+        try {
+            return pageMarkdown({ maxChars: 4000 });
+        } finally {
+            globalThis.document = saved;
+        }
+    }
+
+    it('a relative href with code/state becomes an absolute URL, then loses its query', () => {
+        const md = markdownOf((el, text) => el('body', {}, el('p', {},
+            text('Go '), el('a', { href: 'callback?code=AUTHCODEq7Rk&state=STATEw3Lp' }, text('back')), text(' now'))));
+        expect(md).toBe('Go [back](https://universe-staging.ezil.work/creator/social-login/callback?code=AUTHCODEq7Rk&state=STATEw3Lp) now');
+        expect(sanitizeText(md, STAGING)).toBe('Go [back](https://universe-staging.ezil.work/creator/social-login/callback) now');
+    });
+
+    it('positive controls: a harmless link stays whole; an SVG <a> keeps its attribute as written', () => {
+        const md = markdownOf((el, text) => el('body', {}, el('p', {},
+            el('a', { href: '../jobs?page=2' }, text('jobs')), text(' and '),
+            el('a', { href: '#icon', svg: true }, text('icon')))));
+        expect(md).toBe('[jobs](https://universe-staging.ezil.work/creator/jobs?page=2) and [icon](#icon)');
+        expect(sanitizeText(md, STAGING)).toBe(md);
     });
 });
 

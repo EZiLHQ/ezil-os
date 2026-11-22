@@ -29,7 +29,9 @@
  * once. (Amended 2026-11-21. Emptying just the bad tier failed OPEN: a typo in
  * the IdP list made the IdP `other`, which allows every verb, and a typo in
  * the owner list made Universe `other`, which the Code loopback does not
- * refuse.) Unset or blank variables are not malformed: that tier is empty. An
+ * refuse.) Unset or blank variables are not malformed: that tier is empty —
+ * EXCEPT that a non-empty owner list with an empty or unset IdP list is broken
+ * too (amended 2026-11-22: an owner app is only safe when its IdP is known). An
  * origin listed in both variables is `idp_transit`, never `owner_app`.
  *
  * ── Policies are minted here, never hand-built ──────────────────────────────
@@ -51,6 +53,27 @@ export const ORIGIN_TIER_MAX_ENTRIES = 20;
 /** Same host rule as `mcp-browser-open.mjs` `destination()`: dotted DNS names only. */
 const DNS_HOSTNAME = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/i;
 const SENSITIVE = new Set(SENSITIVE_URL_PARAMS);
+
+/**
+ * The names the decoded check looks for: the contract's
+ * `SENSITIVE_URL_PARAMS` plus `jwt` and `accesstoken` (the 2026-11-22
+ * independent review's list).
+ */
+export const SENSITIVE_ASSIGNMENT_NAMES = Object.freeze([...SENSITIVE_URL_PARAMS, 'jwt', 'accesstoken']);
+const NAME_ALTERNATION = SENSITIVE_ASSIGNMENT_NAMES.join('|');
+
+/**
+ * A sensitive name — optionally `[]` — followed by `=`, not glued to a
+ * preceding letter or digit (so `auth_code=` and `x=code=` match, `xcode=`
+ * and `decode=` do not). Case-insensitive.
+ */
+const SENSITIVE_ASSIGNMENT = new RegExp(`(?<![A-Za-z0-9])(?:${NAME_ALTERNATION})(?:\\[\\])?\\s*=`, 'i');
+
+/** Invisible characters an obfuscated name could hide behind (zero-width and the rest). */
+const IGNORABLE = /\p{Default_Ignorable_Code_Point}/gu;
+
+/** Non-fatal: bytes that are not UTF-8 decode to U+FFFD instead of throwing. */
+const UTF8 = new TextDecoder('utf-8');
 
 /** Each policy `loadOriginPolicy` minted -> its private origin sets. */
 const TIER_SETS = new WeakMap();
@@ -116,11 +139,21 @@ export function loadOriginPolicy (env) {
     const source = env && typeof env === 'object' ? env : {};
     const owner = parseTierList('owner_app', ORIGIN_TIER_ENV.owner_app, source[ORIGIN_TIER_ENV.owner_app]);
     const idp = parseTierList('idp_transit', ORIGIN_TIER_ENV.idp_transit, source[ORIGIN_TIER_ENV.idp_transit]);
-    const broken = !owner.ok || !idp.ok;
+    // An owner app is only safe when its IdP is known: owner origins with no
+    // IdP list would let the sign-in pages be `other`. Broken too (amended
+    // 2026-11-22).
+    const ownerWithoutIdp = owner.ok && idp.ok && owner.valid.length > 0 && idp.valid.length === 0;
+    if (ownerWithoutIdp) {
+        idp.problems.push({ tier: 'idp_transit', variable: ORIGIN_TIER_ENV.idp_transit, entry: 0, reason: 'empty_with_owner_list' });
+    }
+    const broken = !owner.ok || !idp.ok || ownerWithoutIdp;
 
-    const overlap = broken ? [] : [...new Set(owner.valid.filter((o) => idp.valid.includes(o)))];
     const idpSet = new Set(broken ? [] : idp.valid);
-    const ownerSet = new Set(broken ? [] : owner.valid.filter((o) => !idpSet.has(o)));
+    // The IdP tier matches by HOST (amended 2026-11-22), so an owner origin on
+    // an IdP host — whatever its port — is an overlap and is idp_transit.
+    const idpHosts = new Set([...idpSet].map((o) => new URL(o).hostname));
+    const overlap = broken ? [] : [...new Set(owner.valid.filter((o) => idpHosts.has(new URL(o).hostname)))];
+    const ownerSet = new Set(broken ? [] : owner.valid.filter((o) => !overlap.includes(o)));
 
     const policy = Object.freeze({
         broken,
@@ -129,7 +162,7 @@ export function loadOriginPolicy (env) {
         invalid: Object.freeze([...owner.problems, ...idp.problems].map((p) => Object.freeze(p))),
         overlap: Object.freeze(overlap),
     });
-    TIER_SETS.set(policy, { broken, owner: ownerSet, idp: idpSet });
+    TIER_SETS.set(policy, { broken, owner: ownerSet, idpHosts });
     return policy;
 }
 
@@ -145,10 +178,10 @@ function tierSets (policy) {
 }
 
 /**
- * The origin to look up, from a parsed URL, or null when the URL has no
+ * The https origin the OWNER tier matches on, or null when the URL has no
  * https origin at all (`about:blank`, `data:`, `http:` previews, opaque
  * origins). `blob:https://…` answers for its inner origin, and a trailing-dot
- * host (`id.ezil.work.`) answers as the same host without it.
+ * host (`app.example.com.`) answers as the same host without it.
  */
 function tierOrigin (parsed) {
     const origin = parsed.origin;
@@ -165,16 +198,37 @@ function parseUrl (url) {
 }
 
 /**
+ * The host the IdP tier matches on: the hostname alone — no scheme, no port —
+ * in lower case and without trailing dots. A `blob:` URL answers for its inner
+ * origin's host. null when the URL has no host (`about:`, `data:`, `file:`).
+ */
+function hostOf (parsed) {
+    let host = parsed.hostname;
+    if (!host && typeof parsed.origin === 'string' && parsed.origin !== 'null') {
+        const inner = parseUrl(parsed.origin);
+        host = inner ? inner.hostname : '';
+    }
+    if (!host) return null;
+    return host.toLowerCase().replace(/\.+$/, '');
+}
+
+/**
  * THE classification, for `tierOf` and `sanitizeUrl` alike. A broken policy
  * answers `idp_transit` before looking at the URL at all — parsable or not,
  * https or not — so there is exactly one place that decides it.
+ *
+ * The IdP tier matches by HOST whatever the scheme or port (amended
+ * 2026-11-22): `http://id.ezil.work/…`, `wss://id.ezil.work/…` and
+ * `https://id.ezil.work:8443/…` are all `idp_transit`. The owner tier stays an
+ * exact https-origin match.
  */
 function classify (sets, parsed) {
     if (sets.broken) return 'idp_transit';
     if (parsed === null) return 'other';
+    const host = hostOf(parsed);
+    if (host !== null && sets.idpHosts.has(host)) return 'idp_transit';
     const origin = tierOrigin(parsed);
     if (origin === null) return 'other';
-    if (sets.idp.has(origin)) return 'idp_transit';
     if (sets.owner.has(origin)) return 'owner_app';
     return 'other';
 }
@@ -235,18 +289,77 @@ function hasSensitiveParam (part) {
     return false;
 }
 
+/** Percent-decode ONCE, valid UTF-8 or not: a bad byte becomes U+FFFD, never a throw. */
+function decodeOnce (text) {
+    return text.replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => (
+        UTF8.decode(Uint8Array.from(run.slice(1).split('%'), (hex) => Number.parseInt(hex, 16)))
+    ));
+}
+
 /**
- * An `idp_transit` URL as it may leave: origin + path for the web schemes
- * (which also drops userinfo), the inner origin for `blob:`, and for anything
- * else (`about:`, `data:`, `chrome-error:`) the URL without query and
- * fragment. Under a broken policy every URL takes this form.
+ * Does this text carry a sensitive `name=`? Read the way a server would:
+ * `+` as a space, percent-decoded once (so a URL nested in a parameter value
+ * is read too), and with invisible characters removed (so `%E2%80%8Bcode=`
+ * and a name split by a zero-width character still match).
  */
-function transitForm (parsed) {
-    if (/^(?:https?|wss?):$/.test(parsed.protocol)) return `${parsed.origin}${parsed.pathname}`;
+function carriesSensitive (text) {
+    if (typeof text !== 'string' || text.length === 0) return false;
+    return SENSITIVE_ASSIGNMENT.test(decodeOnce(text.replace(/\+/g, ' ')).replace(IGNORABLE, ''));
+}
+
+function remainderOf (parsed) {
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+}
+
+function userinfoOf (parsed) {
+    return parsed.username || parsed.password ? `${parsed.username}:${parsed.password}` : '';
+}
+
+/**
+ * The amended check (2026-11-22): the remainder after the origin — path with
+ * its `;` parameters, query, fragment — decoded once and matched against
+ * `SENSITIVE_ASSIGNMENT`; the userinfo the same way; and, as before, a
+ * sensitive parameter NAME (even with no `=`) in the query or fragment.
+ */
+function urlCarriesSensitive (parsed) {
+    return carriesSensitive(remainderOf(parsed)) || carriesSensitive(userinfoOf(parsed))
+        || hasSensitiveParam(parsed.search) || hasSensitiveParam(parsed.hash);
+}
+
+/** Every `;` parameter removed from every path segment. */
+function withoutPathParams (pathname) {
+    return pathname.split('/').map((segment) => segment.split(';')[0]).join('/');
+}
+
+const WEB_SCHEME = /^(?:https?|wss?|ftp):$/;
+
+/**
+ * The URL with what may not leave removed.
+ *
+ *   transit (idp_transit, or anything under a broken policy): no userinfo, no
+ *     query, no fragment — origin + path for the web schemes, the inner origin
+ *     for `blob:`, the URL without query and fragment for anything else;
+ *   sensitive: no query, no fragment, no `;` path parameters, and no userinfo
+ *     when that is where the name was.
+ *
+ * If what is left STILL carries a sensitive `name=` (it was in the path
+ * proper, or behind an encoded `;`), only the origin leaves — or, for a URL
+ * with no origin, its scheme.
+ */
+function reduced (parsed, transit, sensitive) {
     if (parsed.protocol === 'blob:') return parsed.origin === 'null' ? 'blob:' : parsed.origin;
-    parsed.search = '';
-    parsed.hash = '';
-    return parsed.href;
+    const web = WEB_SCHEME.test(parsed.protocol);
+    const clean = new URL(parsed.href);
+    clean.search = '';
+    clean.hash = '';
+    if ((transit && web) || carriesSensitive(userinfoOf(clean))) {
+        clean.username = '';
+        clean.password = '';
+    }
+    if (sensitive && clean.pathname.startsWith('/')) clean.pathname = withoutPathParams(clean.pathname);
+    if (!urlCarriesSensitive(clean)) return clean.href;
+    if (web) return `${clean.origin}/`;
+    return clean.host ? `${clean.protocol}//${clean.host}` : clean.protocol;
 }
 
 /**
@@ -254,8 +367,10 @@ function transitForm (parsed) {
  *
  *   idp_transit URL                    -> origin + path, whatever it carries
  *                                         (EVERY URL, under a broken policy)
- *   query or fragment names a
- *   SENSITIVE_URL_PARAMS parameter     -> the URL without query AND fragment
+ *   a sensitive `name=` anywhere after
+ *   the origin (decoded once), or a
+ *   sensitive name in query/fragment   -> without query, fragment and `;`
+ *                                         path parameters
  *   anything else                      -> the SAME string, untouched
  *   not a string / not a URL           -> returned unchanged
  *
@@ -267,22 +382,20 @@ export function sanitizeUrl (url, policy) {
     if (typeof url !== 'string') return url;
     const parsed = parseUrl(url);
     if (parsed === null) return url;
-    if (classify(sets, parsed) === 'idp_transit') return transitForm(parsed);
-    if (hasSensitiveParam(parsed.search) || hasSensitiveParam(parsed.hash)) {
-        parsed.search = '';
-        parsed.hash = '';
-        return parsed.href;
-    }
-    return url;
+    const transit = classify(sets, parsed) === 'idp_transit';
+    const sensitive = urlCarriesSensitive(parsed);
+    if (!transit && !sensitive) return url;
+    return reduced(parsed, transit, sensitive);
 }
 
 /**
  * Free text as it may leave: console lines, snapshot text, `get_text`
  * markdown, titles, option values.
  *
- * Pass 1, absolute URLs: every `http(s)://…` through `sanitizeUrl`, including
- * the JSON-escaped form (`https:\/\/host\/cb?code=…`, PHP's default), which is
- * unescaped to sanitise and re-escaped only if something was removed.
+ * Pass 1, absolute URLs: every `scheme://…` (`https:`, `wss:`, `ezil:`, …)
+ * through `sanitizeUrl`, including the JSON-escaped form
+ * (`https:\/\/host\/cb?code=…`, PHP's default), which is unescaped to
+ * sanitise and re-escaped only if something was removed.
  *
  * Pass 2, relative references, because markdown carries the page's raw
  * `href`s and most are relative: `/cb?code=…`, `./cb?state=…`, `?code=…`,
@@ -292,12 +405,35 @@ export function sanitizeUrl (url, policy) {
  * sensitive parameter (always, under a broken policy); `//host…` goes through
  * `sanitizeUrl` as if it were `https:`.
  *
+ * Pass 3 (amended 2026-11-22), whatever is left: every sensitive `name=value`
+ * run is removed, name and all, so no `code=` text survives in any shape —
+ * `x|/cb?code=…|`, `Callback:/cb?code=…`, a bare `code=…&state=…`. The value
+ * ends at `&`, whitespace, `#`, `)`, `]`, `|`, a quote, `<` or `>`; a quoted
+ * value goes with its quotes, and a name split by invisible characters is
+ * still a name.
+ *
+ * Pass 4: a percent-encoded token that decodes to a sensitive assignment
+ * (`redirect_uri=https%3A%2F%2Fx%2Fcb%3Fcode%3D…` outside any URL) is removed.
+ *
  * A URL ends at whitespace, a quote, `<`, `>` or a backtick. Trailing sentence
  * punctuation and an unbalanced `)` or `]` are not part of it, so
  * `[label](https://…?code=…)` keeps its closing bracket.
  */
-const ABSOLUTE_URL_IN_TEXT = /https?:(?:\/\/|\\\/\\\/)[^\s"'<>`]+/gi;
+// The scheme is bounded (RFC 3986 schemes are short) so a long run of letters
+// cannot make this quadratic.
+const ABSOLUTE_URL_IN_TEXT = /[a-z][a-z0-9+.-]{0,31}:(?:\/\/|\\\/\\\/)[^\s"'<>`]+/gi;
 const RELATIVE_REF_IN_TEXT = /(^|[\s"'(\[<=])((?:\\?\/|\.\.?\\?\/|[?#])[^\s"'<>`]*)/g;
+
+/** Any run of default-ignorable (invisible) characters, for the loose names below. */
+const INVISIBLES = '\\p{Default_Ignorable_Code_Point}*';
+const LOOSE_NAMES = SENSITIVE_ASSIGNMENT_NAMES.map((name) => [...name].join(INVISIBLES)).join('|');
+const SENSITIVE_RUN = new RegExp(
+    `(?<![A-Za-z0-9])(?:${LOOSE_NAMES})(?:\\[\\])?[\\s\\p{Default_Ignorable_Code_Point}]*=[ \\t]*`
+    + `(?:"[^"]*"|'[^']*'|[^&\\s#)\\]|"'\`<>]*)`,
+    'giu',
+);
+/** Whitespace- and quote-delimited tokens; pass 4 only reads the ones with a `%`. */
+const TEXT_TOKEN = /[^\s"'<>`]+/g;
 
 const occurrences = (s, ch) => s.split(ch).length - 1;
 
@@ -330,17 +466,22 @@ function sanitizeRelative (ref, sets, policy) {
         return out === absolute ? ref : out.replace(/^https:/, '');
     }
     const cut = ref.search(/[?#]/);
-    if (cut === -1) return ref;
-    const rest = ref.slice(cut);
+    const head = cut === -1 ? ref : ref.slice(0, cut);
+    const rest = cut === -1 ? '' : ref.slice(cut);
     const hashAt = rest.indexOf('#');
     const query = hashAt === -1 ? rest : rest.slice(0, hashAt);
     const fragment = hashAt === -1 ? '' : rest.slice(hashAt);
+    // The same decoded check as `sanitizeUrl`, over the whole reference.
+    const sensitive = carriesSensitive(ref) || hasSensitiveParam(query) || hasSensitiveParam(fragment);
     // Under a broken policy (`classify(sets, null)` is transit for everything)
     // a reference WITH a path takes the transit form. A bare `#…`/`?…` token
     // has no path and may be a heading or an anchor, so it only loses what
     // names a sensitive parameter.
     const transit = cut > 0 && classify(sets, null) === 'idp_transit';
-    return transit || hasSensitiveParam(query) || hasSensitiveParam(fragment) ? ref.slice(0, cut) : ref;
+    if (!sensitive && !transit) return ref;
+    const out = sensitive ? withoutPathParams(head) : head;
+    // A path that still carries `name=` itself is dropped whole.
+    return carriesSensitive(out) ? '' : out;
 }
 
 export function sanitizeText (text, policy) {
@@ -351,11 +492,13 @@ export function sanitizeText (text, policy) {
         const out = throughEscapes(url, (plain) => sanitizeUrl(plain, policy));
         return out === url ? match : out + trailer;
     });
-    return absolute.replace(RELATIVE_REF_IN_TEXT, (all, lead, ref) => {
+    const relative = absolute.replace(RELATIVE_REF_IN_TEXT, (all, lead, ref) => {
         const [core, trailer] = splitTrailer(ref);
         const out = throughEscapes(core, (plain) => sanitizeRelative(plain, sets, policy));
         return out === core ? all : lead + out + trailer;
     });
+    const runs = relative.replace(SENSITIVE_RUN, '');
+    return runs.replace(TEXT_TOKEN, (token) => (token.includes('%') && carriesSensitive(token) ? '' : token));
 }
 
 /**
@@ -366,11 +509,14 @@ export function sanitizeText (text, policy) {
 export function originPolicyBootLines (policy) {
     tierSets(policy);
     if (policy.broken) {
-        const faults = policy.invalid.map((p) => (p.reason === 'too_many_entries'
-            ? `${p.variable} has more than ${ORIGIN_TIER_MAX_ENTRIES} entries`
-            : p.reason === 'not_a_string'
-                ? `${p.variable} is not a string`
-                : `${p.variable} entry #${p.entry} is not a bare https origin (https://host[:port], no path, no wildcard)`));
+        const faults = policy.invalid.map((p) => {
+            if (p.reason === 'too_many_entries') return `${p.variable} has more than ${ORIGIN_TIER_MAX_ENTRIES} entries`;
+            if (p.reason === 'not_a_string') return `${p.variable} is not a string`;
+            if (p.reason === 'empty_with_owner_list') {
+                return `${p.variable} is empty while ${ORIGIN_TIER_ENV.owner_app} is set (an owner app needs its IdP)`;
+            }
+            return `${p.variable} entry #${p.entry} is not a bare https origin (https://host[:port], no path, no wildcard)`;
+        });
         return [
             `[ezil-sidecar] origin policy BROKEN — ${faults.join('; ')}: every page is idp_transit `
             + '(health, navigate and wait_for{time} only) until it is fixed',
