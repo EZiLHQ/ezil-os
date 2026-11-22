@@ -4510,9 +4510,11 @@ describe('staging signed account balance on the credential-control route', () =>
     const { binding, calls } = fakeSandboxNamespace({ aiAccountFixture: { boot: 'live-boot', credential: { token, expiresAt } } });
     const env = { Sandbox: binding, SANDBOX_HMAC_SECRET: SECRET, EZIL_AI_GATEWAY_URL: 'https://ai-staging.ezil.work' };
     const staged = 'https://api-desktop-staging.ezil.work' + path;
-    const fetch = spyOn(globalThis, 'fetch').mockImplementation(async () => Response.json({
-      available_micro: '17', held_micro: '2', account_public_id: 'private-fixture',
-    }));
+    const fetch = spyOn(globalThis, 'fetch').mockImplementation(async function (this: unknown) {
+      // Workerd rejects global fetch when it is invoked as a method on the dependency object.
+      if (this !== undefined && this !== globalThis) throw new TypeError('Invalid global fetch receiver');
+      return Response.json({ available_micro: '17', held_micro: '2', account_public_id: 'private-fixture' });
+    });
     try {
       expect((await worker.fetch(new Request(staged, { headers: { authorization: 'Bearer ' + await mintToken() } }), env)).status).toBe(401);
       const mission = 'synthetic-mission-signature-fixture';

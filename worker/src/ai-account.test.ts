@@ -22,7 +22,7 @@ describe('staging owner AI account balance', () => {
       .toEqual({ balanceMicro: '1234', heldMicro: '11' });
     const [url, init] = fetch.mock.calls[0]!;
     expect(url).toBe('https://ai-staging.ezil.work/v1/me/balance');
-    expect(init).toMatchObject({ method: 'GET', redirect: 'error', headers: { authorization: 'Bearer ' + snapshot.token } });
+    expect(init).toMatchObject({ method: 'GET', redirect: 'manual', headers: { authorization: 'Bearer ' + snapshot.token } });
     expect(init?.body).toBeUndefined();
   });
 
@@ -55,6 +55,17 @@ describe('staging owner AI account balance', () => {
     }
     expect(await readAiAccountBalance({ owner, sandboxId, current, fetch: fetch as typeof globalThis.fetch, signal: abort() }))
       .toEqual({ balanceMicro: '0', heldMicro: '2' });
+  });
+
+  it('rejects a Gateway redirect without a second credential-bearing request', async () => {
+    const fetch = mock(async (_url: URL | Request | string, _init?: RequestInit) =>
+      new Response(null, { status: 302, headers: { location: 'https://redirect.invalid' } }));
+    const snapshot = credential(owner);
+    const result = await readAiAccountBalance({ owner, sandboxId, current: async () => snapshot,
+      fetch: fetch as unknown as typeof globalThis.fetch, signal: abort() });
+    expect(result).toBeNull();
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(fetch.mock.calls[0]?.[1]?.redirect).toBe('manual');
   });
 
   it('drops a read on credential or boot replacement, invalid amounts, oversized or rejected responses', async () => {

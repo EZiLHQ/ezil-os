@@ -25,7 +25,8 @@ export async function readAiAccountBalance(input: AccountRead) {
     const response = await input.fetch(BALANCE_URL, {
       method: 'GET',
       headers: { authorization: 'Bearer ' + before.token, accept: 'application/json', 'cache-control': 'no-store' },
-      redirect: 'error',
+      // Workers support manual redirects. The non-2xx guard below rejects them.
+      redirect: 'manual',
       signal: AbortSignal.any([input.signal, AbortSignal.timeout(3_000)]),
     });
     if (!response.ok) {
