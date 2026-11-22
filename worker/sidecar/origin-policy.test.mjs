@@ -418,6 +418,64 @@ describe('sanitizeUrl', () => {
     });
 });
 
+describe('sanitizeUrl: the decoded remainder after the origin (amended 2026-11-22)', () => {
+    const STRIPPED = [
+        // The independent review's cases.
+        ['https://u.example/?redirect=https%3A%2F%2Fu.example%2Fcb%3Fcode%3DSECRET', 'https://u.example/'],
+        ['https://u.example/cb;code=a/x', 'https://u.example/cb/x'],
+        ['https://u.example/#!code=a', 'https://u.example/'],
+        ['https://u.example/?code[]=a', 'https://u.example/'],
+        ['https://u.example/?x=code=a', 'https://u.example/'],
+        ['https://u.example/?auth_code=a', 'https://u.example/'],
+        ['https://u.example/?%E2%80%8Bcode=a', 'https://u.example/'],
+        // …and the shapes around them.
+        ['https://u.example/?code%5B%5D=a', 'https://u.example/'],
+        ['https://u.example/?co%E2%80%8Bde=a', 'https://u.example/'],
+        ['https://u.example/?x=%E0&%E2%80%8Bcode=a', 'https://u.example/'],
+        ['https://u.example/?code =a', 'https://u.example/'],
+        ['https://u.example/?JWT=e30.e30.sig', 'https://u.example/'],
+        ['https://u.example/?accessToken=abc', 'https://u.example/'],
+        ['https://u.example/?next=%2Fcb%3Fstate%3D1', 'https://u.example/'],
+        ['https://u.example/cb;jsessionid=1;code=a/x?y=1', 'https://u.example/cb/x'],
+        ['https://code=a@u.example/x', 'https://u.example/x'],
+        ['https://id.ezil.work/cb;code=a', 'https://id.ezil.work/cb'],
+        ['ezil://cb?code=SECRET', 'ezil://cb'],
+        // The name in the path proper (or behind an encoded `;`): only the origin leaves.
+        ['https://u.example/oauth/code=abc/next', 'https://u.example/'],
+        ['https://u.example/cb%3Bcode=a', 'https://u.example/'],
+        ['data:text/plain,code=abc', 'data:'],
+    ];
+    for (const [url, out] of STRIPPED) {
+        it(`${url} -> ${out}`, () => {
+            expect(sanitizeUrl(url, STAGING)).toBe(out);
+        });
+    }
+
+    it('positive controls: look-alikes and harmless nesting come back as the SAME string', () => {
+        for (const url of [
+            'https://u.example/?redirect=https%3A%2F%2Fu.example%2Fcb%3Fpage%3D2',
+            'https://u.example/cb;jsessionid=abc/x',
+            'https://u.example/?xcode=1&decode=2&barcode=3&statement=4&tokens=5&encoded=6',
+            'https://u.example/?mode=code&type=state',
+            'https://u.example/codes/state/token',
+            'https://u.example/?q=%E2%80%8B&lang=%E0',
+        ]) {
+            expect(sanitizeUrl(url, STAGING)).toBe(url);
+        }
+    });
+
+    it('nothing that leaves still reads as a sensitive assignment', () => {
+        const NAME_EQ = /(?<![A-Za-z0-9])(code|state|id_token|access_token|refresh_token|token|session_transfer_token|nonce|ticket|code_verifier|jwt|accesstoken)(\[\])?\s*=/i;
+        for (const [url] of STRIPPED) {
+            const out = sanitizeUrl(url, STAGING);
+            let decoded = out;
+            try { decoded = decodeURIComponent(out); } catch { /* keep */ }
+            expect({ url, leaks: NAME_EQ.test(decoded) }).toEqual({ url, leaks: false });
+            expect(out).not.toContain('SECRET');
+        }
+    });
+});
+
 describe('sanitizeText', () => {
     it('sanitises every http(s) URL inside free text and keeps the rest', () => {
         const text = `redirecting to ${AUTHORIZE_URL} then "${CALLBACK_URL}" (see https://example.com/help?topic=1)`;

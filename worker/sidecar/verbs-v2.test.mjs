@@ -627,11 +627,20 @@ describe('no OAuth parameter leaves in any handler output', () => {
         page.log(`go ${CALLBACK_URL_2}`, AUTHORIZE_URL_2);
         page.request(CALLBACK_URL_2);
         page.request(AUTHORIZE_URL_2, { failed: true });
+        // The amended (decoded-remainder) check runs in record() too.
+        page.request('https://u.example/?redirect=https%3A%2F%2Fu.example%2Fcb%3Fcode%3DSECRETNESTED');
+        page.request('https://u.example/cb;code=SECRETPATH/x', { failed: true });
         await tick();
         const held = JSON.stringify([surface.consoleBuffer, surface.networkBuffer]);
-        for (const marker of LEAK_MARKERS) expect(held).not.toContain(marker);
+        for (const marker of [...LEAK_MARKERS, 'SECRETNESTED', 'SECRETPATH']) expect(held).not.toContain(marker);
         expect(surface.consoleBuffer).toHaveLength(1);
-        expect(surface.networkBuffer).toHaveLength(2);
+        // (requestfailed records at once, requestfinished after its response: compare as sets.)
+        expect(surface.networkBuffer.map((r) => r.entry.url).sort()).toEqual([
+            'https://id.ezil.work/authorize',
+            'https://u.example/',
+            'https://u.example/cb/x',
+            'https://universe-staging.ezil.work/creator/social-login/callback/auth0',
+        ]);
     });
 });
 
