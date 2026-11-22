@@ -11,19 +11,25 @@ install it, and you can delete this directory without affecting the product.
 
 ## What it exposes
 
-Ten tools, all computer lifecycle:
+Thirteen tools, all computer lifecycle: ten, plus three `browser_*` aliases.
+The product calls the streamed desktop "Browser"; an alias is the same tool
+(same handler, input schema and annotations) under that name, and the
+`*_desktop` names stay for existing callers.
 
 | Tool | |
 | --- | --- |
 | `list_computers` | read-only · start here, everything else needs an id |
 | `get_computer` | read-only |
 | `desktop_status` | read-only · cheap poll, boots nothing |
+| `browser_status` | alias of `desktop_status` |
 | `create_computer` | limit of two per user |
 | `rename_computer` | |
 | `open_desktop` | **cold boot, ~22s** · returns a short-lived URL |
+| `open_browser` | alias of `open_desktop` |
 | `open_editor` | code-server inside the container |
 | `open_app_preview` | the dev server running inside the container |
 | `restart_desktop` | destructive · re-runs boot in the *same* container |
+| `restart_browser` | alias of `restart_desktop` |
 | `delete_computer` | destructive · requires `confirm: true` |
 
 ### What it deliberately does not expose

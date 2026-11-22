@@ -17,6 +17,10 @@
 
 import { describe, expect, it } from 'bun:test';
 import { ERROR_CODES, SIDECAR_WIRE } from './contract.mjs';
+import { loadOriginPolicy } from './origin-policy.mjs';
+import {
+    containsText, fieldState, pageMarkdown, scrollWindowBy, selectState, snapshotPage, windowScrollY,
+} from './page-scripts.mjs';
 import { VERBS, pngDimensions } from './verbs.mjs';
 
 /** A 1x1 PNG. Real bytes, so `pngDimensions` and the sha are exercised for real. */
@@ -24,6 +28,28 @@ const PNG_1X1 = Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==',
     'base64',
 );
+
+/** No tiers configured: every page is `other`, exact v1 behaviour. */
+const NO_TIERS = loadOriginPolicy({});
+
+/**
+ * In-page answers, keyed by the page-script FUNCTION itself rather than by a
+ * substring of its source (`pageMarkdown`'s source also says `data-ezil-ref`).
+ */
+const PAGE_ANSWERS = new Map([
+    [snapshotPage, () => ({ text: '- button "OK" [ref=e1]', refs: [{ ref: 'e1', role: 'button', name: 'OK', isPassword: false }], truncated: false })],
+    [pageMarkdown, () => '# Example\n\nbody'],
+    [containsText, () => true],
+    [scrollWindowBy, (dy) => 240 + dy],
+    [windowScrollY, () => 240],
+    [fieldState, () => ({ fillable: true, isPassword: false })],
+    [selectState, () => ({ isSelect: true, unmatched: 0 })],
+]);
+
+function answer (fn, arg) {
+    const reply = PAGE_ANSWERS.get(fn);
+    return reply ? reply(arg) : true;
+}
 
 function fakeLocator (overrides = {}) {
     return {
@@ -33,6 +59,9 @@ function fakeLocator (overrides = {}) {
         fill: async () => {},
         press: async () => {},
         screenshot: async () => PNG_1X1,
+        scrollIntoViewIfNeeded: async () => {},
+        selectOption: async (values) => values.slice(),
+        evaluate: async (fn, arg) => answer(fn, arg),
         ...overrides,
     };
 }
@@ -46,29 +75,29 @@ function fakePage (overrides = {}) {
         screenshot: async () => PNG_1X1,
         locator: () => fakeLocator(),
         frames: () => [],
-        evaluate: async (fn) => {
-            const src = String(fn);
-            if (src.includes('data-ezil-ref')) {
-                return { text: '- button "OK" [ref=e1]', refs: [{ ref: 'e1', role: 'button', name: 'OK', isPassword: false }], truncated: false };
-            }
-            if (src.includes('MAX_CHARS')) return '# Example\n\nbody';
-            return true;
-        },
+        keyboard: { press: async () => {} },
+        evaluate: async (fn, arg) => answer(fn, arg),
         ...overrides,
     };
 }
+
+const ROLE_OF_REF = { epw: 'textbox', esel: 'combobox' };
 
 function fakeSurface (overrides = {}) {
     const page = overrides.page ?? fakePage();
     return {
         cdpUrl: 'http://127.0.0.1:9222',
-        consoleBuffer: [{ level: 'error', text: 'boom', location: null, at: 'now' }],
-        networkBuffer: [{ method: 'GET', url: 'https://example.com/a.js', status: 200, resourceType: 'script', failure: null, at: 'now' }],
+        originPolicy: NO_TIERS,
+        consoleEntries: () => [{ level: 'error', text: 'boom', location: null, at: 'now' }],
+        networkEntries: () => [{ method: 'GET', url: 'https://example.com/a.js', status: 200, resourceType: 'script', failure: null, at: 'now' }],
         isConnected: () => true,
         activePage: async () => page,
         registerRefs: () => 1,
         rememberSecret: () => {},
-        resolveRef: async (_page, ref) => ({ locator: fakeLocator(), meta: { role: 'textbox', name: 'Password', isPassword: ref === 'epw' } }),
+        resolveRef: async (_page, ref) => ({
+            locator: fakeLocator(),
+            meta: { role: ROLE_OF_REF[ref] ?? 'textbox', name: 'Field', isPassword: ref === 'epw' },
+        }),
         ...overrides,
     };
 }
@@ -84,6 +113,10 @@ const BODY_FOR = {
     'POST /console': {},
     'POST /network': {},
     'POST /wait_for': { text: 'anything', time: 0.3 },
+    'POST /fill_form': { fields: [{ ref: 'e1', value: 'Ada' }, { ref: 'epw', value: 'hunter2-secret' }] },
+    'POST /select': { ref: 'esel', values: ['day'] },
+    'POST /scroll': { dy: 400 },
+    'POST /press': { key: 'Enter' },
 };
 
 describe('every handler returns exactly the declared members', () => {
@@ -185,8 +218,34 @@ describe('the members that carry meaning, not just shape', () => {
         await collect(() => VERBS['POST /click'](fakeSurface({
             resolveRef: async () => { const e = new Error('gone'); e.code = 'stale_ref'; throw e; },
         }), { ref: 'e9' }));
-        expect(raised.size).toBeGreaterThan(0);
+        // v2: the new verbs' own failures, and the tier gate's.
+        await collect(() => VERBS['POST /fill_form'](fakeSurface(), { fields: [] }));
+        await collect(() => VERBS['POST /select'](fakeSurface(), { ref: 'e1', values: ['x'] }));
+        await collect(() => VERBS['POST /scroll'](fakeSurface(), { ref: 'e1', dy: 1 }));
+        await collect(() => VERBS['POST /press'](fakeSurface(), { key: 'F5' }));
+        const idp = loadOriginPolicy({ EZIL_BROWSER_IDP_ORIGINS: 'https://example.com' });
+        await collect(() => VERBS['POST /click'](fakeSurface({ originPolicy: idp }), { ref: 'e1' }));
+        for (const code of ['bad_request', 'bad_ref', 'stale_ref', 'navigation_failed', 'origin_read_only']) {
+            expect(raised).toContain(code);
+        }
         for (const code of raised) expect(ERROR_CODES).toContain(code);
+    });
+
+    it('/fill_form reports filled and redacted COUNTS and echoes no value', async () => {
+        const out = await VERBS['POST /fill_form'](fakeSurface(), BODY_FOR['POST /fill_form']);
+        expect(out).toEqual({ ok: true, url: 'https://example.com/page', filled: 2, redacted: 1 });
+        expect(JSON.stringify(out)).not.toContain('hunter2-secret');
+        expect(JSON.stringify(out)).not.toContain('Ada');
+    });
+
+    it('/select returns the option values Playwright reports selected', async () => {
+        const out = await VERBS['POST /select'](fakeSurface(), { ref: 'esel', values: ['day', 'hour'] });
+        expect(out.selected).toEqual(['day', 'hour']);
+    });
+
+    it('/scroll returns the window offset the page reported, as a number', async () => {
+        expect((await VERBS['POST /scroll'](fakeSurface(), { dy: 400 })).scrollY).toBe(640);
+        expect((await VERBS['POST /scroll'](fakeSurface(), { ref: 'e1' })).scrollY).toBe(240);
     });
 });
 

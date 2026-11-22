@@ -14,6 +14,14 @@
  * sidecar over a pinned wire contract. Two servers exposing the same verbs is
  * how a contract quietly becomes two contracts, and this repository has already
  * paid for that lesson once (`docs/BROWSER-FIX-CONTRACT.md`).
+ *
+ * ## `browser_*` names are aliases, not automation
+ *
+ * The product calls the streamed desktop "Browser". `browser_status`,
+ * `open_browser` and `restart_browser` are second names for `desktop_status`,
+ * `open_desktop` and `restart_desktop` (browser verbs v2, §4): the SAME
+ * handler, input schema and annotations objects, so the two names cannot
+ * drift. The `*_desktop` names stay for existing callers.
  */
 import { z } from 'zod';
 import { EzilError, type Computer, type EzilClient } from '@ezil-os/sdk';
@@ -113,7 +121,36 @@ const URL_TTL_WARNING =
     'The returned URL is single-use and expires in about five minutes. Give it to the user immediately; '
     + 'do not store it or reuse it later — a stale one opens a blank window with no visible error.';
 
-export const buildTools = (ezil: EzilClient): ToolDef[] => [
+/** Tool name -> its `browser_*` alias, listed right after it. */
+export const BROWSER_ALIASES: Readonly<Record<string, string>> = Object.freeze({
+    desktop_status: 'browser_status',
+    open_desktop: 'open_browser',
+    restart_desktop: 'restart_browser',
+});
+
+/**
+ * A second name for an existing tool. Handler, input schema and annotations
+ * are the base tool's own objects (shared by reference, not copied), so the
+ * alias cannot drift from the tool it names.
+ */
+const alias = (base: ToolDef, name: string): ToolDef => ({
+    name,
+    config: {
+        title: base.config.title,
+        description: `${base.config.description} Same tool as ${base.name}, its older name.`,
+        inputSchema: base.config.inputSchema,
+        annotations: base.config.annotations,
+    },
+    handler: base.handler,
+});
+
+const withBrowserAliases = (tools: ToolDef[]): ToolDef[] =>
+    tools.flatMap((tool) => {
+        const name = BROWSER_ALIASES[tool.name];
+        return name ? [tool, alias(tool, name)] : [tool];
+    });
+
+export const buildTools = (ezil: EzilClient): ToolDef[] => withBrowserAliases([
     {
         name: 'list_computers',
         config: {
@@ -175,10 +212,11 @@ export const buildTools = (ezil: EzilClient): ToolDef[] => [
     {
         name: 'desktop_status',
         config: {
-            title: 'Check desktop status',
+            title: 'Check Browser status',
             description:
-                'Cheap poll of whether a computer\'s desktop is currently running. Boots nothing and costs nothing. '
-                + 'Use this before open_desktop if you only need to know whether it is already up.',
+                'Cheap poll of whether a computer\'s Browser (its streamed desktop) is currently running. Boots '
+                + 'nothing and costs nothing. Use this before open_browser if you only need to know whether it is '
+                + 'already up.',
             inputSchema: { computerId: z.string().uuid() },
             annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
         },
@@ -187,10 +225,10 @@ export const buildTools = (ezil: EzilClient): ToolDef[] => [
     {
         name: 'open_desktop',
         config: {
-            title: 'Open the desktop',
+            title: 'Open the Browser',
             description:
-                'Start or attach the computer\'s Linux desktop and return a URL a human can open in a browser. '
-                + '🔴 This is a COLD BOOT when the container is not already running: expect ~22 seconds and '
+                'Start or attach the computer\'s Browser (its streamed Linux desktop) and return a URL a human can '
+                + 'open. 🔴 This is a COLD BOOT when the container is not already running: expect ~22 seconds and '
                 + `sometimes much longer. Call it once and wait; do not call it again while it is working. ${URL_TTL_WARNING}`,
             inputSchema: { computerId: z.string().uuid() },
             annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
@@ -223,17 +261,17 @@ export const buildTools = (ezil: EzilClient): ToolDef[] => [
     {
         name: 'restart_desktop',
         config: {
-            title: 'Restart the desktop',
+            title: 'Restart the Browser',
             description:
-                'Re-run the boot script inside the computer\'s EXISTING container. Running applications are stopped; '
-                + 'the workspace on disk is not touched. 🔴 This does NOT pick up a new container image — a container '
-                + 'keeps the image it was created with until it actually stops.',
+                'Re-run the boot script inside the computer\'s EXISTING container, restarting its Browser. Running '
+                + 'applications are stopped; the workspace on disk is not touched. 🔴 This does NOT pick up a new '
+                + 'container image — a container keeps the image it was created with until it actually stops.',
             inputSchema: { computerId: z.string().uuid() },
             annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
         },
         handler: guard(async (a) => {
             await ezil.desktop.restart(a.computerId as string);
-            return text('Restart requested. The desktop takes a few seconds to come back — poll desktop_status.');
+            return text('Restart requested. The Browser takes a few seconds to come back — poll browser_status or desktop_status.');
         }),
     },
     {
@@ -263,4 +301,4 @@ export const buildTools = (ezil: EzilClient): ToolDef[] => [
             return text(`Computer ${String(a.computerId)} deleted and its container terminated.`);
         }),
     },
-];
+]);

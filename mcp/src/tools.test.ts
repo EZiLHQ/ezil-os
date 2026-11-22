@@ -6,10 +6,14 @@
  * a MODEL can act on rather than a stack trace it will blindly retry.
  */
 import { describe, expect, it } from 'bun:test';
+import superjson from 'superjson';
 import { z } from 'zod';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { EzilError, type Computer, type EzilClient } from '@ezil-os/sdk';
 
-import { buildTools, describeError } from './tools';
+import { createServer } from './server';
+import { BROWSER_ALIASES, buildTools, describeError } from './tools';
 
 const COMPUTER = {
     id: '11111111-1111-4111-8111-111111111111',
@@ -122,17 +126,140 @@ describe('tools', () => {
 
     it('warns about the five-minute TTL on every tool that mints a URL', () => {
         const t = byName(stubClient());
-        for (const name of ['open_desktop', 'open_editor', 'open_app_preview']) {
+        for (const name of ['open_desktop', 'open_browser', 'open_editor', 'open_app_preview']) {
             expect(t[name]!.config.description).toContain('five minutes');
         }
     });
 
-    it('warns that open_desktop is a cold boot', () => {
-        expect(byName(stubClient()).open_desktop!.config.description).toMatch(/COLD BOOT/);
+    it('warns that open_desktop / open_browser is a cold boot', () => {
+        const t = byName(stubClient());
+        expect(t.open_desktop!.config.description).toMatch(/COLD BOOT/);
+        expect(t.open_browser!.config.description).toMatch(/COLD BOOT/);
     });
 
     it('warns that restart does not pick up a new image', () => {
-        expect(byName(stubClient()).restart_desktop!.config.description).toMatch(/does NOT pick up a new container image/);
+        const t = byName(stubClient());
+        expect(t.restart_desktop!.config.description).toMatch(/does NOT pick up a new container image/);
+        expect(t.restart_browser!.config.description).toMatch(/does NOT pick up a new container image/);
+    });
+});
+
+describe('browser_* aliases (browser verbs v2, §4)', () => {
+    const PAIRS = [
+        ['desktop_status', 'browser_status'],
+        ['open_desktop', 'open_browser'],
+        ['restart_desktop', 'restart_browser'],
+    ] as const;
+
+    it('adds exactly the three aliases and keeps every old name', () => {
+        const names = buildTools(stubClient()).map((t) => t.name);
+        expect(BROWSER_ALIASES).toEqual(Object.fromEntries(PAIRS));
+        for (const [base, alias] of PAIRS) {
+            expect(names).toContain(base);
+            expect(names).toContain(alias);
+            // Listed right after the tool it names.
+            expect(names.indexOf(alias)).toBe(names.indexOf(base) + 1);
+        }
+        expect(names).toHaveLength(13);
+        expect(new Set(names).size).toBe(names.length);
+    });
+
+    it('an alias SHARES its base tool\'s handler, input schema and annotations (same objects)', () => {
+        const t = byName(stubClient());
+        for (const [base, alias] of PAIRS) {
+            expect(t[alias]!.handler).toBe(t[base]!.handler);
+            expect(t[alias]!.config.inputSchema).toBe(t[base]!.config.inputSchema);
+            expect(t[alias]!.config.annotations).toBe(t[base]!.config.annotations);
+        }
+        // So the read-only / destructive hints carry over exactly.
+        expect(t.browser_status!.config.annotations.readOnlyHint).toBe(true);
+        expect(t.restart_browser!.config.annotations.destructiveHint).toBe(true);
+        expect(t.open_browser!.config.annotations.readOnlyHint).not.toBe(true);
+    });
+
+    it('titles and descriptions say Browser; each alias description names the old tool', () => {
+        const t = byName(stubClient());
+        for (const [base, alias] of PAIRS) {
+            for (const name of [base, alias]) {
+                expect(t[name]!.config.title).toContain('Browser');
+                expect(t[name]!.config.description).toContain('Browser');
+            }
+            expect(t[alias]!.config.title).toBe(t[base]!.config.title);
+            expect(t[alias]!.config.description).toContain(`Same tool as ${base}, its older name.`);
+            expect(t[base]!.config.description).not.toContain('Same tool as');
+        }
+    });
+
+    it('calling an alias reaches the same client method with the same answer', async () => {
+        const id = COMPUTER.id;
+        for (const [base, alias, method] of [
+            ['desktop_status', 'browser_status', 'status'],
+            ['open_desktop', 'open_browser', 'open'],
+            ['restart_desktop', 'restart_browser', 'restart'],
+        ] as const) {
+            const viaBase = stubClient();
+            const viaAlias = stubClient();
+            const a = await byName(viaBase)[base]!.handler({ computerId: id });
+            const b = await byName(viaAlias)[alias]!.handler({ computerId: id });
+            expect(b).toEqual(a);
+            expect((viaAlias as unknown as { calls: string[] }).calls).toEqual([`${method}(${id})`]);
+        }
+    });
+
+    it('the shared restart answer is neutral: it names both status tools', async () => {
+        for (const name of ['restart_desktop', 'restart_browser']) {
+            const res = await byName(stubClient())[name]!.handler({ computerId: COMPUTER.id });
+            expect(res.content[0]!.text).toBe(
+                'Restart requested. The Browser takes a few seconds to come back — poll browser_status or desktop_status.',
+            );
+        }
+    });
+
+    it('an alias is lifecycle, not automation: its schema is the computer id alone', () => {
+        const t = byName(stubClient());
+        for (const [, alias] of PAIRS) {
+            expect(Object.keys(t[alias]!.config.inputSchema ?? {})).toEqual(['computerId']);
+        }
+    });
+
+    // The registration itself, over a REAL MCP client and transport: an alias
+    // whose schema object is shared with its base must still register, list
+    // and answer. Only `fetch` is stubbed.
+    it('registers and answers over a real MCP transport', async () => {
+        const seen: string[] = [];
+        const fetchImpl = (async (url: string | URL) => {
+            const path = new URL(String(url)).pathname.replace('/api/trpc/', '');
+            seen.push(path);
+            const data = path === 'cloudflareGuacamole.status' ? { ok: true, running: true } : { ok: true };
+            return new Response(JSON.stringify({ result: { data: superjson.serialize(data) } }), {
+                status: 200, headers: { 'content-type': 'application/json' },
+            });
+        }) as unknown as typeof globalThis.fetch;
+        const server = createServer({ baseUrl: 'https://ezil.example', token: 'tok', timeoutMs: 5000 }, fetchImpl);
+        const client = new Client({ name: 'alias-harness', version: '0.0.0' });
+        const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+        await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+        try {
+            const { tools } = await client.listTools();
+            const names = tools.map((t) => t.name);
+            for (const [base, alias] of PAIRS) {
+                expect(names).toContain(base);
+                expect(names).toContain(alias);
+                const a = tools.find((t) => t.name === alias)!;
+                const b = tools.find((t) => t.name === base)!;
+                expect(a.inputSchema).toEqual(b.inputSchema);
+                expect(a.annotations).toEqual(b.annotations);
+            }
+            const res = await client.callTool({ name: 'browser_status', arguments: { computerId: COMPUTER.id } });
+            expect(res.isError).toBeFalsy();
+            expect(JSON.parse((res.content as { text: string }[])[0]!.text)).toEqual({ ok: true, running: true });
+            expect(seen).toEqual(['cloudflareGuacamole.status']);
+            const bad = await client.callTool({ name: 'open_browser', arguments: { computerId: 'not-a-uuid' } });
+            expect(bad.isError).toBe(true);
+            expect(seen).toEqual(['cloudflareGuacamole.status']);
+        } finally {
+            await server.close();
+        }
     });
 });
 

@@ -18,6 +18,16 @@
  * and each asserts its own types against it. This is this side's assertion. A
  * rename in `worker/sidecar/` goes red HERE rather than in production.
  *
+ * ── v2 is ADDITIVE, and this file proves it ─────────────────────────────────
+ * The JSON still pins v1 (version '1'). `worker/sidecar/contract.mjs` declares
+ * v2: every v1 route, member and error code unchanged, plus `V2_ROUTES` and
+ * the one new code `origin_read_only`. So this suite asserts CONTAINMENT, not
+ * equality: the pinned v1 JSON is inside `SIDECAR_WIRE` route for route and
+ * member for member, its codes are inside `ERROR_CODES` with
+ * `origin_read_only` the only addition, `SIDECAR_WIRE` is exactly
+ * `V1_ROUTES` + `V2_ROUTES`, and the Worker allowlist is exactly the route
+ * verbs. A v2 change that edits a v1 member goes red here.
+ *
  * ── Why a skip is possible, and why it is loud ──────────────────────────────
  * The contract lives in a sibling checkout. When that checkout is absent this
  * suite CANNOT run, and this repo's convention (contract §10 / the container
@@ -66,8 +76,20 @@ const DEFAULT_CONTRACT = GIT_ROOT
         import.meta.dir, '..', '..', '..',
         'EZiL-Works', 'apps', 'api', 'src', 'routes', 'mcp', 'browser-sidecar.contract.json',
     );
-const CONTRACT_PATH = process.env.EZIL_BROWSER_SIDECAR_CONTRACT ?? DEFAULT_CONTRACT;
+const EXPLICIT_CONTRACT = process.env.EZIL_BROWSER_SIDECAR_CONTRACT;
+const CONTRACT_PATH = EXPLICIT_CONTRACT ?? DEFAULT_CONTRACT;
 const HAVE_CONTRACT = existsSync(CONTRACT_PATH);
+
+// A path someone NAMED that is not there is a broken run, not an absent
+// sibling checkout: it fails instead of skipping.
+if (EXPLICIT_CONTRACT !== undefined && !HAVE_CONTRACT) {
+    describe('worker/sidecar conforms to the pinned wire contract', () => {
+        it('EZIL_BROWSER_SIDECAR_CONTRACT names a file that exists', () => {
+            expect({ EZIL_BROWSER_SIDECAR_CONTRACT: EXPLICIT_CONTRACT, exists: false })
+                .toEqual({ EZIL_BROWSER_SIDECAR_CONTRACT: EXPLICIT_CONTRACT, exists: true });
+        });
+    });
+}
 
 if (!HAVE_CONTRACT) {
     console.warn(
@@ -108,35 +130,84 @@ function responseMembers (block: Record<string, string> | undefined): string[] {
 
 const describeIf = HAVE_CONTRACT ? describe : describe.skip;
 
+type Wire = Record<string, { request: Record<string, boolean>; response: string[] }>;
+
+/** `"POST /fill_form"` -> `"fill_form"`. */
+const verbOf = (route: string): string => route.split(' /')[1]!;
+
 describeIf('worker/sidecar conforms to the pinned wire contract', () => {
     it('the contract file itself is the version this side was written against', () => {
         expect(pinned!.version).toBe('1');
     });
 
-    it('serves EXACTLY the routes the contract names — no more, no fewer', async () => {
-        const { SIDECAR_WIRE } = await import('../sidecar/contract.mjs');
-        const { VERBS } = await import('../sidecar/verbs.mjs');
-        const contractRoutes = Object.keys(pinned!.verbs).sort();
-        // Both the declaration AND the live handler map, so a handler that
-        // exists without a declaration (or vice versa) cannot hide here.
-        expect(Object.keys(SIDECAR_WIRE).sort()).toEqual(contractRoutes);
-        expect(Object.keys(VERBS).sort()).toEqual(contractRoutes);
+    it('the pinned v1 JSON names exactly V1_ROUTES', async () => {
+        const { V1_ROUTES } = await import('../sidecar/contract.mjs');
+        expect(Object.keys(pinned!.verbs).sort()).toEqual([...V1_ROUTES].sort());
+        expect(new Set(V1_ROUTES).size).toBe(V1_ROUTES.length);
     });
 
-    it('every request member matches, required-ness included', async () => {
+    it('v2 is additive: SIDECAR_WIRE is exactly V1_ROUTES + V2_ROUTES, and VERBS serves exactly that', async () => {
+        const { SIDECAR_WIRE, V1_ROUTES, V2_ROUTES } = await import('../sidecar/contract.mjs');
+        const { VERBS } = await import('../sidecar/verbs.mjs');
+        const declared = [...V1_ROUTES, ...V2_ROUTES];
+        expect(new Set(declared).size).toBe(declared.length);
+        expect(V2_ROUTES.filter((r: string) => V1_ROUTES.includes(r))).toEqual([]);
+        // Both the declaration AND the live handler map, so a handler that
+        // exists without a declaration (or vice versa) cannot hide here.
+        expect(Object.keys(SIDECAR_WIRE).sort()).toEqual([...declared].sort());
+        expect(Object.keys(VERBS).sort()).toEqual([...declared].sort());
+    });
+
+    it('every v1 request member is unchanged in v2, required-ness included', async () => {
         const { SIDECAR_WIRE } = await import('../sidecar/contract.mjs');
         for (const [route, spec] of Object.entries(pinned!.verbs)) {
-            expect({ route, request: (SIDECAR_WIRE as Record<string, { request: Record<string, boolean> }>)[route].request })
+            expect({ route, request: (SIDECAR_WIRE as Wire)[route]!.request })
                 .toEqual({ route, request: requiredMembers(spec.request) });
         }
     });
 
-    it('every response member matches', async () => {
+    it('every v1 response member is unchanged in v2', async () => {
         const { SIDECAR_WIRE } = await import('../sidecar/contract.mjs');
         for (const [route, spec] of Object.entries(pinned!.verbs)) {
-            expect({ route, response: [...(SIDECAR_WIRE as Record<string, { response: string[] }>)[route].response].sort() })
+            expect({ route, response: [...(SIDECAR_WIRE as Wire)[route]!.response].sort() })
                 .toEqual({ route, response: responseMembers(spec.response) });
         }
+    });
+
+    it('error codes: every pinned v1 code survives and origin_read_only is the ONLY addition', async () => {
+        const { ERROR_CODES, ERROR_SHAPE } = await import('../sidecar/contract.mjs');
+        for (const code of pinned!.errors.codes) expect(ERROR_CODES).toContain(code);
+        expect(ERROR_CODES.filter((c: string) => !pinned!.errors.codes.includes(c))).toEqual(['origin_read_only']);
+        expect(new Set(ERROR_CODES).size).toBe(ERROR_CODES.length);
+        expect([...ERROR_SHAPE].sort()).toEqual(Object.keys(pinned!.errors.shape).sort());
+    });
+
+    it('the v2 routes are POST, none is forbidden, and there is no upload verb', async () => {
+        const { FORBIDDEN_VERBS, V2_ROUTES } = await import('../sidecar/contract.mjs');
+        for (const route of V2_ROUTES) {
+            expect(route.startsWith('POST /')).toBe(true);
+            expect(FORBIDDEN_VERBS).not.toContain(verbOf(route));
+        }
+        expect(V2_ROUTES.map(verbOf).sort()).toEqual(['fill_form', 'press', 'scroll', 'select']);
+    });
+
+    it('the Worker allowlist is EXACTLY the route verbs, and health is the only GET', async () => {
+        const { SIDECAR_WIRE } = await import('../sidecar/contract.mjs');
+        const { BROWSER_SIDECAR_GET_VERBS, BROWSER_SIDECAR_VERBS, resolveSidecarVerb } = await import('./browser-sidecar');
+        const routes = Object.keys(SIDECAR_WIRE);
+        expect([...BROWSER_SIDECAR_VERBS].sort()).toEqual(routes.map(verbOf).sort());
+        expect(new Set(BROWSER_SIDECAR_VERBS).size).toBe(BROWSER_SIDECAR_VERBS.length);
+        expect([...BROWSER_SIDECAR_GET_VERBS].sort())
+            .toEqual(routes.filter((r) => r.startsWith('GET ')).map(verbOf).sort());
+        // …and the resolver forwards each one with its declared method only.
+        for (const route of routes) {
+            const [method, path] = route.split(' ');
+            const resolved = resolveSidecarVerb(verbOf(route), method!);
+            expect(resolved).toEqual({ ok: true, verb: verbOf(route), method, url: `http://127.0.0.1:9223${path}` });
+            const other = method === 'GET' ? 'POST' : 'GET';
+            expect(resolveSidecarVerb(verbOf(route), other).ok).toBe(false);
+        }
+        expect(resolveSidecarVerb('upload', 'POST').ok).toBe(false);
     });
 
     it('/type really does carry `redacted` — a silent omission would be a lie to the agent', async () => {
@@ -159,7 +230,8 @@ describeIf('worker/sidecar conforms to the pinned wire contract', () => {
         const { ERROR_CODES } = await import('../sidecar/contract.mjs');
         expect(pinned!.errors.codes).toContain('stale_ref');
         expect(pinned!.errors.codes).toContain('bad_ref');
-        expect([...ERROR_CODES].sort()).toEqual([...pinned!.errors.codes].sort());
+        expect(ERROR_CODES).toContain('stale_ref');
+        expect(ERROR_CODES).toContain('bad_ref');
         // Collapsing them makes a recoverable state look like a mistake, so
         // the implementation must be able to raise each one on its own.
         const browserSource = readFileSync(join(import.meta.dir, '..', 'sidecar', 'browser.mjs'), 'utf8');
@@ -179,9 +251,12 @@ describeIf('worker/sidecar conforms to the pinned wire contract', () => {
     });
 
     it('the forbidden passthrough is forbidden in fact, not only in the contract', async () => {
-        const { FORBIDDEN_VERBS } = await import('../sidecar/contract.mjs');
+        const { FORBIDDEN_VERBS, SIDECAR_WIRE } = await import('../sidecar/contract.mjs');
+        const { VERBS } = await import('../sidecar/verbs.mjs');
         expect(pinned!.forbidden.cdp_passthrough.join(' ')).toContain('NO verb that forwards an arbitrary CDP command');
-        const routes = Object.keys(pinned!.verbs).map((r) => r.split(' ')[1]);
+        // The pinned v1 routes, the v2 declaration AND the live handler map.
+        const routes = [...Object.keys(pinned!.verbs), ...Object.keys(SIDECAR_WIRE), ...Object.keys(VERBS)]
+            .map((r) => r.split(' ')[1]);
         for (const forbidden of FORBIDDEN_VERBS) {
             expect(routes).not.toContain(`/${forbidden}`);
         }

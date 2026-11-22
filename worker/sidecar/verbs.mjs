@@ -11,22 +11,50 @@
  * deletes its reason to exist, and the CDP port might as well have been bound
  * to 0.0.0.0 in the first place.
  *
- * The wire is pinned by
- * `EZiL-Works: apps/api/src/routes/mcp/browser-sidecar.contract.json`.
- * `worker/src/browser-sidecar-contract.test.ts` reads that file and asserts
- * this map against it, so a rename here goes red in CI rather than in
- * production — which is the specific failure the contract exists to prevent
- * (the legacy Universe MCP shipped a client and a server that agreed on
- * nothing, with a fully green client suite).
+ * The v1 wire is pinned by
+ * `EZiL-Works: apps/api/src/routes/mcp/browser-sidecar.contract.json`; v2 is
+ * additive and its authority is `contract.mjs` plus
+ * `docs/contracts/browser-verbs-v2.md`. `worker/src/browser-sidecar-contract.test.ts`
+ * asserts the pinned v1 JSON is contained in `contract.mjs`, and the load-time
+ * check at the bottom of this file asserts this map serves exactly that
+ * declaration, so a rename here goes red in CI rather than in production.
  *
  * Every handler returns a plain payload. `server.mjs` owns serialisation, the
  * redaction pass, and the error shape — see its header for why the redaction
  * guard is in exactly one place.
+ *
+ * ── v2: the tier gate ───────────────────────────────────────────────────────
+ * Handlers are `(surface, body, opts = {})`. Before a handler touches a page it
+ * reads that page's origin tier (`origin-policy.mjs`) and refuses with
+ * `origin_read_only` when the tier does not allow the route, or when the
+ * caller's `opts.denyTiers` (a Set of tier names) contains it. `GET /health`
+ * acts on no page and is never gated. The Code loopback passes
+ * `{ denyTiers: new Set(['owner_app', 'idp_transit']) }`; the Worker path
+ * passes nothing.
+ *
+ * Reads (`snapshot`, `get_text`, `screenshot`, `wait_for{text}`) check AGAIN
+ * after reading: a page that navigated onto the IdP while it was being read
+ * yields `origin_read_only`, not the IdP's content. Actions (`navigate`,
+ * `click`, `type`, `fill_form`, `select`, `scroll`, `press`) may land on any
+ * tier and return the sanitised `url` — EXCEPT for a caller with
+ * `opts.denyTiers` (the Code loopback): an action that lands on a denied tier
+ * answers `origin_read_only` with no url and no title, and a `navigate` whose
+ * target is in a denied tier is refused before anything loads. Such a caller
+ * also gets no console or network entry the tab recorded while in a denied
+ * tier.
+ *
+ * Every `url` member leaves through `sanitizeUrl`.
  */
 
 import { createHash } from 'node:crypto';
-import { snapshotPage, pageMarkdown, containsText } from './page-scripts.mjs';
-import { SIDECAR_WIRE } from './contract.mjs';
+import {
+    containsText, fieldState, pageMarkdown, scrollWindowBy, selectState, snapshotPage, windowScrollY,
+} from './page-scripts.mjs';
+import {
+    FIELD_VALUE_MAX_CHARS, FILL_FORM_MAX_FIELDS, ORIGIN_TIERS, PRESS_KEYS, SCROLL_MAX_DY, SELECT_MAX_VALUES,
+    SIDECAR_WIRE,
+} from './contract.mjs';
+import { routeAllowedOnTier, sanitizeText, sanitizeUrl, tierOf } from './origin-policy.mjs';
 
 /** Default per-verb budget. Deliberately short: an agent waiting on a hung
  *  page is worse than an agent told to try again. */
@@ -49,10 +77,25 @@ const WAIT_FOR_MAX_SECONDS = 30;
  */
 const ALLOWED_SCHEMES = new Set(['http:', 'https:']);
 
+const NO_DENIED_TIERS = new Set();
+
 function fail (code, message) {
     const err = new Error(message);
     err.code = code;
     return err;
+}
+
+function messageOf (err) {
+    return err && err.message ? err.message : String(err);
+}
+
+function isTimeout (err) {
+    return /Timeout .*exceeded/i.test(messageOf(err));
+}
+
+/** v1's mapping for an action on a ref'd element: timeout, else stale_ref. */
+function refActionFailure (err) {
+    return fail(isTimeout(err) ? 'timeout' : 'stale_ref', messageOf(err));
 }
 
 /** Wrap any promise in a budget, reported as the contract's `timeout` code. */
@@ -82,6 +125,113 @@ function passwordMask (page) {
     return [page.locator('input[type=password]')];
 }
 
+/**
+ * `opts.denyTiers`: absent means none. Anything present must be a Set of real
+ * tier names — a typo such as `'owner-app'` would otherwise deny nothing, so
+ * it throws (no contract code: the server answers `chrome_unreachable` and
+ * nothing is touched).
+ */
+function deniedTiers (opts) {
+    const deny = opts ? opts.denyTiers : undefined;
+    if (deny === undefined || deny === null) return NO_DENIED_TIERS;
+    if (!(deny instanceof Set) || [...deny].some((t) => !ORIGIN_TIERS.includes(t))) {
+        throw new TypeError(`opts.denyTiers must be a Set of: ${ORIGIN_TIERS.join(', ')}`);
+    }
+    return deny;
+}
+
+/**
+ * 🔴 THE TIER GATE. Throws `origin_read_only` unless `route` may act on `page`
+ * as it is right now. No URL goes into the message: messages reach the log.
+ */
+function assertTierAllows (surface, page, route, body, opts) {
+    const deny = deniedTiers(opts);
+    const tier = tierOf(page.url(), surface.originPolicy);
+    if (!routeAllowedOnTier(route, tier, body) || deny.has(tier)) {
+        throw fail('origin_read_only', `${route} is not available while the active page is ${tier}`);
+    }
+    return tier;
+}
+
+/**
+ * 🔴 THE CODE LOOPBACK'S LANDING RULE. After a verb has ACTED, the page it
+ * acted on must not be in a tier the caller denied: a navigate, a click, a
+ * submit, a key press — or a page script reacting to a fill, a select or a
+ * scroll — may already have taken it there, and nothing about where it went
+ * (url, title, anything) goes back. The Worker path denies no tier, so for it
+ * this is a no-op: there a verb "may land on any tier".
+ */
+function assertNotLandedOnDenied (surface, page, opts) {
+    const deny = deniedTiers(opts);
+    if (deny.size > 0 && deny.has(tierOf(page.url(), surface.originPolicy))) {
+        throw fail('origin_read_only', 'the verb landed on a tier this caller may not read');
+    }
+}
+
+/** The page a verb acts on, after the tier gate has let it through. */
+async function actingPage (surface, route, body, opts) {
+    const page = await surface.activePage();
+    assertTierAllows(surface, page, route, body, opts);
+    return page;
+}
+
+/** A page's URL as it may leave this process. */
+function urlOf (surface, page) {
+    return sanitizeUrl(page.url(), surface.originPolicy);
+}
+
+/**
+ * Page text as it may leave this process: snapshot text, `get_text`
+ * markdown, titles, option values. Every URL in it — absolute or relative —
+ * goes through `sanitizeText`, because A3 counts `code=`/`state=` in ANY
+ * tool output, not only in `url` members.
+ */
+function textOf (surface, text) {
+    return sanitizeText(text, surface.originPolicy);
+}
+
+/**
+ * A page's title as it may leave: `''` while the page is on an `idp_transit`
+ * origin, for every caller (amended 2026-11-22) — and also when it was there
+ * at either end of the read, so a page crossing into or out of the IdP mid-read
+ * cannot hand over the IdP's title. Otherwise through `sanitizeText`.
+ */
+async function titleOf (surface, page) {
+    const before = tierOf(page.url(), surface.originPolicy);
+    const raw = await safeTitle(page);
+    const after = tierOf(page.url(), surface.originPolicy);
+    return before === 'idp_transit' || after === 'idp_transit' ? '' : textOf(surface, raw);
+}
+
+function present (value) {
+    return value !== undefined && value !== null;
+}
+
+/** `/fill_form`'s `fields`: 1..FILL_FORM_MAX_FIELDS of `{ref, value}`. */
+function fillFormFields (fields) {
+    if (!Array.isArray(fields) || fields.length < 1 || fields.length > FILL_FORM_MAX_FIELDS) {
+        throw fail('bad_request', `fill_form requires \`fields\`: 1 to ${FILL_FORM_MAX_FIELDS} of {ref, value}`);
+    }
+    return fields.map((field) => {
+        if (field === null || typeof field !== 'object' || Array.isArray(field)) {
+            throw fail('bad_request', 'every fill_form field is an object {ref, value}');
+        }
+        if (typeof field.value !== 'string' || field.value.length > FIELD_VALUE_MAX_CHARS) {
+            throw fail('bad_request', `every fill_form \`value\` is a string of at most ${FIELD_VALUE_MAX_CHARS} characters`);
+        }
+        return { ref: field.ref, value: field.value };
+    });
+}
+
+/** `/select`'s `values`: 1..SELECT_MAX_VALUES strings. */
+function selectValues (values) {
+    if (!Array.isArray(values) || values.length < 1 || values.length > SELECT_MAX_VALUES
+        || !values.every((v) => typeof v === 'string')) {
+        throw fail('bad_request', `select requires \`values\`: 1 to ${SELECT_MAX_VALUES} option labels or values`);
+    }
+    return values.slice();
+}
+
 export const VERBS = {
     'GET /health': async (surface) => ({
         ok: true,
@@ -89,14 +239,14 @@ export const VERBS = {
         cdpUrl: surface.cdpUrl,
     }),
 
-    'POST /navigate': async (surface, body) => {
+    'POST /navigate': async (surface, body = {}, opts = {}) => {
         const raw = typeof body.url === 'string' ? body.url.trim() : '';
         if (!raw) throw fail('bad_request', 'navigate requires a non-empty `url`');
         let parsed;
         try {
             parsed = new URL(raw);
         } catch {
-            throw fail('bad_request', `\`url\` is not a URL: ${raw}`);
+            throw fail('bad_request', '`url` is not a URL');
         }
         if (raw !== 'about:blank' && !ALLOWED_SCHEMES.has(parsed.protocol)) {
             throw fail(
@@ -104,47 +254,59 @@ export const VERBS = {
                 `scheme '${parsed.protocol}' is not navigable from here — http, https and about:blank only`,
             );
         }
-        const page = await surface.activePage();
+        const page = await actingPage(surface, 'POST /navigate', body, opts);
+        // A target the caller may not read is refused BEFORE anything loads;
+        // a redirect into one is caught by the landing rule below.
+        if (deniedTiers(opts).has(tierOf(raw, surface.originPolicy))) {
+            throw fail('origin_read_only', 'navigate: the target is in a tier this caller may not read');
+        }
         try {
             await page.goto(raw, { timeout: NAVIGATION_TIMEOUT_MS, waitUntil: 'domcontentloaded' });
         } catch (err) {
-            throw fail('navigation_failed', err && err.message ? err.message : String(err));
+            throw fail('navigation_failed', messageOf(err));
         }
-        return { ok: true, url: page.url(), title: await safeTitle(page) };
+        // The title is read BEFORE the last check, so a page that moves on
+        // while it is read cannot hand a denied page's title back.
+        const title = await titleOf(surface, page);
+        assertNotLandedOnDenied(surface, page, opts);
+        return { ok: true, url: urlOf(surface, page), title };
     },
 
-    'POST /snapshot': async (surface) => {
-        const page = await surface.activePage();
+    'POST /snapshot': async (surface, body = {}, opts = {}) => {
+        const page = await actingPage(surface, 'POST /snapshot', body, opts);
         const result = await withTimeout(
             page.evaluate(snapshotPage, { maxNodes: 1200 }),
             ACTION_TIMEOUT_MS,
             'snapshot',
         );
-        surface.registerRefs(result.refs);
+        const title = await titleOf(surface, page);
+        // Read again BEFORE any ref is registered: a tree read off a page that
+        // has just navigated onto the IdP is the IdP's tree.
+        assertTierAllows(surface, page, 'POST /snapshot', body, opts);
+        surface.registerRefs(result.refs, page);
         return {
             ok: true,
-            snapshot: result.truncated ? `${result.text}\n- [snapshot truncated]` : result.text,
-            url: page.url(),
-            title: await safeTitle(page),
+            snapshot: textOf(surface, result.truncated ? `${result.text}\n- [snapshot truncated]` : result.text),
+            url: urlOf(surface, page),
+            title,
         };
     },
 
-    'POST /click': async (surface, body) => {
-        const page = await surface.activePage();
+    'POST /click': async (surface, body = {}, opts = {}) => {
+        const page = await actingPage(surface, 'POST /click', body, opts);
         const { locator } = await surface.resolveRef(page, body.ref);
         try {
             await locator.click({ timeout: ACTION_TIMEOUT_MS });
         } catch (err) {
-            const message = err && err.message ? err.message : String(err);
-            if (/Timeout .*exceeded/i.test(message)) throw fail('timeout', message);
-            throw fail('stale_ref', message);
+            throw refActionFailure(err);
         }
-        return { ok: true, url: page.url() };
+        assertNotLandedOnDenied(surface, page, opts);
+        return { ok: true, url: urlOf(surface, page) };
     },
 
-    'POST /type': async (surface, body) => {
+    'POST /type': async (surface, body = {}, opts = {}) => {
         if (typeof body.text !== 'string') throw fail('bad_request', 'type requires a string `text`');
-        const page = await surface.activePage();
+        const page = await actingPage(surface, 'POST /type', body, opts);
         const { locator, meta } = await surface.resolveRef(page, body.ref);
 
         // Remembered BEFORE the keystrokes land, so that even a failure
@@ -161,20 +323,19 @@ export const VERBS = {
                     .catch(() => { /* a submit that does not navigate is normal */ });
             }
         } catch (err) {
-            const message = err && err.message ? err.message : String(err);
-            if (/Timeout .*exceeded/i.test(message)) throw fail('timeout', message);
-            throw fail('stale_ref', message);
+            throw refActionFailure(err);
         }
+        assertNotLandedOnDenied(surface, page, opts);
 
         // `redacted` tells the caller WHY there is no echo. A silent omission
         // would be a lie to an agent that is trying to confirm what it typed.
-        return { ok: true, url: page.url(), redacted: !!meta.isPassword };
+        return { ok: true, url: urlOf(surface, page), redacted: !!meta.isPassword };
     },
 
-    'POST /get_text': async (surface, body) => {
-        const page = await surface.activePage();
+    'POST /get_text': async (surface, body = {}, opts = {}) => {
+        const page = await actingPage(surface, 'POST /get_text', body, opts);
         let rootRef = null;
-        if (body.ref !== undefined && body.ref !== null) {
+        if (present(body.ref)) {
             await surface.resolveRef(page, body.ref);
             rootRef = body.ref;
         }
@@ -183,11 +344,12 @@ export const VERBS = {
             ACTION_TIMEOUT_MS,
             'get_text',
         );
-        return { ok: true, markdown, url: page.url() };
+        assertTierAllows(surface, page, 'POST /get_text', body, opts);
+        return { ok: true, markdown: textOf(surface, markdown), url: urlOf(surface, page) };
     },
 
-    'POST /screenshot': async (surface, body) => {
-        const page = await surface.activePage();
+    'POST /screenshot': async (surface, body = {}, opts = {}) => {
+        const page = await actingPage(surface, 'POST /screenshot', body, opts);
         const fullPage = body.fullPage === true;
 
         // 🔴 The screenshot half of the redaction rule. A password field is
@@ -207,19 +369,17 @@ export const VERBS = {
             animations: 'disabled',
         };
 
+        // Resolved OUTSIDE the capture's try: a bad or stale ref keeps its own
+        // code instead of being reported as an unreachable browser.
+        const target = present(body.ref) ? (await surface.resolveRef(page, body.ref)).locator : null;
+
         let buffer;
         try {
-            if (body.ref !== undefined && body.ref !== null) {
-                const { locator } = await surface.resolveRef(page, body.ref);
-                buffer = await locator.screenshot(options);
-            } else {
-                buffer = await page.screenshot({ ...options, fullPage });
-            }
+            buffer = target ? await target.screenshot(options) : await page.screenshot({ ...options, fullPage });
         } catch (err) {
-            const message = err && err.message ? err.message : String(err);
-            if (/Timeout .*exceeded/i.test(message)) throw fail('timeout', message);
-            throw fail('chrome_unreachable', message);
+            throw fail(isTimeout(err) ? 'timeout' : 'chrome_unreachable', messageOf(err));
         }
+        assertTierAllows(surface, page, 'POST /screenshot', body, opts);
 
         // 🔴 The digest is computed HERE, over the bytes as produced, and
         // travels with them. It becomes `evidence_artifacts.content_sha256`
@@ -238,31 +398,31 @@ export const VERBS = {
         };
     },
 
-    'POST /console': async (surface, body) => {
-        const level = body.level === undefined || body.level === null ? null : String(body.level).toLowerCase();
+    'POST /console': async (surface, body = {}, opts = {}) => {
+        const level = present(body.level) ? String(body.level).toLowerCase() : null;
         if (level !== null && !['log', 'debug', 'info', 'warning', 'error'].includes(level)) {
-            throw fail('bad_request', `unknown console level '${level}' — log, debug, info, warning or error`);
+            throw fail('bad_request', 'unknown console level — log, debug, info, warning or error');
         }
-        // Attach to whatever is open so a caller that asks for console output
-        // before any other verb still gets a live buffer from here on.
-        await surface.activePage().catch(() => null);
-        const entries = level ? surface.consoleBuffer.filter((e) => e.level === level) : surface.consoleBuffer;
-        return { ok: true, entries: entries.slice() };
+        // Only what the ACTIVE page logged: other tabs and contexts are never
+        // reported (`BrowserSurface.consoleEntries`), and neither is anything
+        // the tab recorded while it was on a tier this caller denies.
+        const page = await actingPage(surface, 'POST /console', body, opts);
+        const entries = surface.consoleEntries(page, deniedTiers(opts));
+        return { ok: true, entries: level ? entries.filter((e) => e.level === level) : entries };
     },
 
-    'POST /network': async (surface, body) => {
-        const filter = body.filter === undefined || body.filter === null ? null : String(body.filter);
-        await surface.activePage().catch(() => null);
-        const requests = filter
-            ? surface.networkBuffer.filter((r) => r.url.includes(filter))
-            : surface.networkBuffer;
-        return { ok: true, requests: requests.slice() };
+    'POST /network': async (surface, body = {}, opts = {}) => {
+        const filter = present(body.filter) ? String(body.filter) : null;
+        const page = await actingPage(surface, 'POST /network', body, opts);
+        const requests = surface.networkEntries(page, deniedTiers(opts));
+        return { ok: true, requests: filter ? requests.filter((r) => r.url.includes(filter)) : requests };
     },
 
-    'POST /wait_for': async (surface, body) => {
+    'POST /wait_for': async (surface, body = {}, opts = {}) => {
         const hasText = typeof body.text === 'string' && body.text.length > 0;
         const hasTime = typeof body.time === 'number' && Number.isFinite(body.time) && body.time > 0;
         if (!hasText && !hasTime) throw fail('bad_request', 'wait_for requires `text` or `time`');
+        await actingPage(surface, 'POST /wait_for', body, opts);
 
         if (!hasText) {
             const seconds = Math.min(body.time, WAIT_FOR_MAX_SECONDS);
@@ -274,16 +434,159 @@ export const VERBS = {
         const deadline = Date.now() + budgetMs;
         // Polls rather than using a page predicate so that a navigation
         // mid-wait cannot destroy the wait itself — a page that reloads under
-        // us just makes the next poll answer for the new document.
+        // us just makes the next poll answer for the new document. Every poll
+        // reads the page, so every poll passes the tier gate first, and a
+        // match is re-checked against the page it came from: "is this text on
+        // the IdP page" is a question this verb does not answer.
         while (Date.now() < deadline) {
+            let page = null;
             try {
-                const page = await surface.activePage();
-                const found = await page.evaluate(containsText, body.text);
-                if (found) return { ok: true, matched: true };
-            } catch { /* mid-navigation; poll again */ }
+                page = await surface.activePage();
+            } catch { /* a reconnect in progress; poll again */ }
+            if (page) {
+                assertTierAllows(surface, page, 'POST /wait_for', body, opts);
+                let found = false;
+                try {
+                    found = await page.evaluate(containsText, body.text);
+                } catch { /* mid-navigation; poll again */ }
+                if (found === true) {
+                    assertTierAllows(surface, page, 'POST /wait_for', body, opts);
+                    return { ok: true, matched: true };
+                }
+            }
             await new Promise((r) => setTimeout(r, 250));
         }
         return { ok: true, matched: false };
+    },
+
+    // ── v2 (additive) ───────────────────────────────────────────────────────
+
+    'POST /fill_form': async (surface, body = {}, opts = {}) => {
+        const fields = fillFormFields(body.fields);
+        const page = await actingPage(surface, 'POST /fill_form', body, opts);
+
+        // 1. EVERY ref resolves before any field is touched: one bad or stale
+        //    ref fills nothing.
+        const targets = [];
+        for (const field of fields) {
+            const { locator, meta } = await surface.resolveRef(page, field.ref);
+            targets.push({ locator, meta, value: field.value, isPassword: !!meta.isPassword });
+        }
+        // 2. …and every element can take a value right now. A button,
+        //    checkbox, `<select>`, disabled or readonly control is `bad_ref`
+        //    here, still before anything is filled.
+        for (const target of targets) {
+            let state;
+            try {
+                state = await target.locator.evaluate(fieldState, undefined, { timeout: ACTION_TIMEOUT_MS });
+            } catch (err) {
+                throw refActionFailure(err);
+            }
+            if (!state || state.fillable !== true) {
+                throw fail('bad_ref', 'fill_form: a ref names an element that cannot be filled — use /select or /click');
+            }
+            if (state.isPassword === true) target.isPassword = true;
+        }
+        // 3. Every password value joins the redaction set BEFORE the first
+        //    keystroke, exactly like `/type`, so a failure partway through
+        //    cannot carry one out in an error.
+        let redacted = 0;
+        for (const target of targets) {
+            if (!target.isPassword) continue;
+            surface.rememberSecret(target.value);
+            redacted += 1;
+        }
+        // 4. Fill.
+        let filled = 0;
+        for (const target of targets) {
+            try {
+                await target.locator.fill(target.value, { timeout: ACTION_TIMEOUT_MS });
+            } catch (err) {
+                throw refActionFailure(err);
+            }
+            filled += 1;
+        }
+        assertNotLandedOnDenied(surface, page, opts);
+        return { ok: true, url: urlOf(surface, page), filled, redacted };
+    },
+
+    'POST /select': async (surface, body = {}, opts = {}) => {
+        const values = selectValues(body.values);
+        const page = await actingPage(surface, 'POST /select', body, opts);
+        const { locator, meta } = await surface.resolveRef(page, body.ref);
+        if (meta.role !== 'combobox' && meta.role !== 'listbox') {
+            throw fail('bad_ref', 'select needs a combobox or listbox ref');
+        }
+        let state;
+        try {
+            state = await locator.evaluate(selectState, values, { timeout: ACTION_TIMEOUT_MS });
+        } catch (err) {
+            throw refActionFailure(err);
+        }
+        if (!state || state.isSelect !== true) throw fail('bad_ref', 'select needs a <select> element');
+        if (state.unmatched !== 0) throw fail('bad_request', 'select: a value matches no option label or value');
+        let selected;
+        try {
+            selected = await locator.selectOption(values, { timeout: ACTION_TIMEOUT_MS });
+        } catch (err) {
+            throw refActionFailure(err);
+        }
+        assertNotLandedOnDenied(surface, page, opts);
+        const now = Array.isArray(selected) ? selected.map((v) => textOf(surface, String(v))) : [];
+        return { ok: true, url: urlOf(surface, page), selected: now };
+    },
+
+    'POST /scroll': async (surface, body = {}, opts = {}) => {
+        const hasRef = present(body.ref);
+        const hasDy = present(body.dy);
+        if (hasRef === hasDy) throw fail('bad_request', 'scroll takes exactly one of `ref` or `dy`');
+        if (hasDy && (!Number.isInteger(body.dy) || Math.abs(body.dy) > SCROLL_MAX_DY)) {
+            throw fail('bad_request', `\`dy\` is an integer between -${SCROLL_MAX_DY} and ${SCROLL_MAX_DY}`);
+        }
+        const dy = hasDy ? body.dy : 0;
+        const page = await actingPage(surface, 'POST /scroll', body, opts);
+        let scrollY;
+        if (hasRef) {
+            const { locator } = await surface.resolveRef(page, body.ref);
+            try {
+                await locator.scrollIntoViewIfNeeded({ timeout: ACTION_TIMEOUT_MS });
+            } catch (err) {
+                throw refActionFailure(err);
+            }
+            scrollY = await withTimeout(page.evaluate(windowScrollY), ACTION_TIMEOUT_MS, 'scroll');
+        } else {
+            scrollY = await withTimeout(page.evaluate(scrollWindowBy, dy), ACTION_TIMEOUT_MS, 'scroll');
+        }
+        assertNotLandedOnDenied(surface, page, opts);
+        return { ok: true, url: urlOf(surface, page), scrollY: Number.isFinite(scrollY) ? scrollY : 0 };
+    },
+
+    'POST /press': async (surface, body = {}, opts = {}) => {
+        // The key that reaches Playwright is the CONSTANT from the list, never
+        // the request's string — an exact match or nothing.
+        const key = PRESS_KEYS.find((k) => k === body.key);
+        if (key === undefined) throw fail('bad_request', `press takes exactly one key of: ${PRESS_KEYS.join(', ')}`);
+        const page = await actingPage(surface, 'POST /press', body, opts);
+        if (present(body.ref)) {
+            const { locator } = await surface.resolveRef(page, body.ref);
+            try {
+                await locator.press(key, { timeout: ACTION_TIMEOUT_MS });
+            } catch (err) {
+                throw refActionFailure(err);
+            }
+        } else {
+            try {
+                await page.keyboard.press(key);
+            } catch (err) {
+                throw fail(isTimeout(err) ? 'timeout' : 'chrome_unreachable', messageOf(err));
+            }
+        }
+        if (key === 'Enter') {
+            await page.waitForLoadState('domcontentloaded', { timeout: NAVIGATION_TIMEOUT_MS })
+                .catch(() => { /* an Enter that does not navigate is normal */ });
+        }
+        assertNotLandedOnDenied(surface, page, opts);
+        return { ok: true, url: urlOf(surface, page) };
     },
 };
 
