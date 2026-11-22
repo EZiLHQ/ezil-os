@@ -110,6 +110,11 @@
       "path": "app/drizzle/0030_delegation_replay.sql",
       "sha256": "50ff0b0a441ee539ca5d72302443315be1f1812e6b11e4afb2e1af3f575692a7",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0038_interview_evidence.sql",
+      "sha256": "f2dce5325a57116df5082463981db4367e01a787cb9efcecae31b9185f5d5df2",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {
