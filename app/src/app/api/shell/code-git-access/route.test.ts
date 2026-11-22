@@ -2,14 +2,20 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { TRPCError } from '@trpc/server';
 
 vi.mock('server-only', () => ({}));
+type GateResult =
+    | { kind: 'none' }
+    | { kind: 'allow'; interviewId: string }
+    | { kind: 'refuse'; status: 404 | 409; code: 'repo_not_found' | 'interview_not_started' | 'interview_finished' };
 const s = vi.hoisted(() => ({
     signedIn: true, owned: true, aws: false, awsEnabled: true,
     identities: [] as Array<Record<string, unknown> | null>, grantError: null as Error | null,
     openOk: true, scope: 'write', order: [] as string[], opened: [] as unknown[], cleared: 0, moveDuringGrant: false,
+    gate: { kind: 'none' } as GateResult, gateCalls: [] as unknown[], worksGrantError: null as Error | null,
 }));
 const USER = '11111111-1111-4111-8111-111111111111';
 const COMPUTER = '22222222-2222-4222-8222-222222222222';
 const URL = 'https://github.ezil.work/default/example.git';
+const QA_URL = 'https://git-qa.ezil.work/candidate-a/interview-1121.git';
 const identity = () => ({ token: 'private-id-token', issuer: 'https://id.ezil.work/', subject: 'auth0|contact',
     userId: USER, sessionId: 'session-a', expiresAt: Date.now() + 3600_000,
     gitAuthor: { name: 'contact', email: 'contact@ezil.work' } });
@@ -34,7 +40,13 @@ vi.mock('@/server/git/access', async importOriginal => ({
             identity: { issuer: 'https://id.ezil.work/', subject: 'auth0|contact' },
             git: { username: 'ezil', token: 'private-git-token', expiresAt: new Date(Date.now() + 240_000).toISOString(), scope: s.scope } };
     },
+    grantForWorksGitAddress: async (_identity: unknown, canonicalURL: string) => {
+        s.order.push('worksgrant'); if (s.worksGrantError) throw s.worksGrantError;
+        if (s.moveDuringGrant) s.aws = true;
+        return { canonicalURL, ref: 'refs/heads/main', git: { token: 'works-git-token', expiresAt: new Date(Date.now() + 240_000).toISOString(), scope: s.scope } };
+    },
 }));
+vi.mock('@/server/interview/gate', () => ({ interviewOpenGate: async (input: unknown) => { s.order.push('gate'); s.gateCalls.push(input); return s.gate; } }));
 vi.mock('@/server/lib/cloudflare-guacamole-provider', () => ({
     newCorrelationId: () => 'correlation', resolveCloudflareGuacamoleConfig: () => ({ workerUrl: 'https://worker.example' }),
 }));
@@ -51,7 +63,8 @@ const post = (body: unknown = { computerId: COMPUTER, repository: { url: URL } }
 }));
 beforeEach(() => {
     Object.assign(s, { signedIn: true, owned: true, aws: false, awsEnabled: true, identities: [],
-        grantError: null, openOk: true, scope: 'write', order: [], opened: [], cleared: 0, moveDuringGrant: false });
+        grantError: null, openOk: true, scope: 'write', order: [], opened: [], cleared: 0, moveDuringGrant: false,
+        gate: { kind: 'none' }, gateCalls: [], worksGrantError: null });
     vi.stubEnv('CLOUDFLARE_GUACAMOLE_HMAC_SECRET', 'secret');
     vi.stubEnv('BILLING_FUNDING_URL', 'https://ai-staging.ezil.work');
 });
@@ -149,5 +162,68 @@ describe('renewing an open standalone Git checkout', () => {
         expect(s.order).not.toContain('grant');
         s.aws = false; s.openOk = false;
         expect(await (await post()).json()).toMatchObject({ error: { code: 'repo_access_not_renewed' } });
+    });
+});
+
+describe('renewing an interview git-qa checkout (contract §6)', () => {
+    const postQa = () => post({ computerId: COMPUTER, repository: { url: QA_URL } });
+    it('renews under the gate (purpose renew) then the Works grant, on the Worker binding path, returning only scope and expiry', async () => {
+        const response = await postQa();
+        expect(response.status).toBe(200);
+        const answer = await response.json();
+        expect(Object.keys(answer).sort()).toEqual(['expiresAt', 'ok', 'scope']);
+        expect(answer).toMatchObject({ ok: true, scope: 'write' });
+        expect(JSON.stringify(answer)).not.toMatch(/private-id-token|works-git-token/);
+        // The gate is asked for 'renew' first, then the Works grant; the standalone v2 grant is never used.
+        expect(s.order).toEqual(['owned', 'target', 'identity', 'gate', 'worksgrant', 'identity', 'target', 'renew', 'target']);
+        expect(s.order).not.toContain('grant');
+        expect(s.gateCalls[0]).toEqual({ canonicalURL: QA_URL, osUserId: USER, ezilIdSubject: 'auth0|contact', computerId: COMPUTER, purpose: 'renew' });
+        // The Worker binding (non-packet) path: canonical git-qa remote, the grant's ref and credential, NEVER a privatePacket, refreshOnly or gitAuthor.
+        const req = (s.opened[0] as unknown[])[4] as Record<string, unknown>;
+        expect(req).toMatchObject({ canonicalURL: QA_URL, ref: 'refs/heads/main', git: { token: 'works-git-token', scope: 'write' }, timeoutMs: 50_000 });
+        expect(req.privatePacket).toBeUndefined();
+        expect(req.refreshOnly).toBeUndefined();
+        expect(req.gitAuthor).toBeUndefined();
+    });
+    it('reports an actual read scope', async () => {
+        s.scope = 'read';
+        expect(await (await postQa()).json()).toMatchObject({ ok: true, scope: 'read' });
+    });
+    it.each([
+        ['repo_not_found', 404],
+        ['interview_not_started', 409],
+        ['interview_finished', 409],
+    ] as const)('a gate refuse %s answers %i and never reaches the grant or the runtime', async (code, status) => {
+        s.gate = { kind: 'refuse', status, code };
+        const response = await postQa();
+        expect(response.status).toBe(status);
+        expect((await response.json()).error.code).toBe(code);
+        expect(s.order).toEqual(['owned', 'target', 'identity', 'gate']);
+        expect(s.opened).toEqual([]);
+    });
+    it('a Works grant not_found is 403 repo_not_found; identity_refused clears the token and asks for a refresh', async () => {
+        s.worksGrantError = new GitAccessError('not_found');
+        expect((await postQa()).status).toBe(403);
+        expect(s.opened).toEqual([]);
+        Object.assign(s, { order: [], opened: [], cleared: 0, worksGrantError: new GitAccessError('identity_refused') });
+        const refused = await postQa();
+        expect(refused.status).toBe(409);
+        expect((await refused.json()).error.code).toBe('IDENTITY_REFRESH_REQUIRED');
+        expect(s.cleared).toBe(1);
+        expect(s.opened).toEqual([]);
+    });
+    it('an AWS computer cannot renew git-qa: repo_url_not_enabled before the gate or the grant', async () => {
+        s.aws = true; s.awsEnabled = true; // the standalone AWS capability still does not open git-qa
+        const response = await postQa();
+        expect(response.status).toBe(409);
+        expect((await response.json()).error.code).toBe('repo_url_not_enabled');
+        expect(s.order).not.toContain('gate');
+        expect(s.order).not.toContain('worksgrant');
+    });
+    it('with the staging gate off, a git-qa address is a 400 EZiL Git refusal before a computer is touched', async () => {
+        vi.stubEnv('BILLING_FUNDING_URL', 'https://ai.ezil.work');
+        const response = await postQa();
+        expect(response.status).toBe(400);
+        expect(s.order).toEqual([]);
     });
 });

@@ -60,6 +60,41 @@ describe('parseRepositoryUrl: one canonical public github.com repository, or a r
         });
 });
 
+describe('parseRepositoryUrl: git-qa.ezil.work only under the staging opt-in (contract §6)', () => {
+    it.each([
+        ['https://git-qa.ezil.work/acme-qa/site.git', 'acme-qa', 'site'],
+        ['https://git-qa.ezil.work/acme-qa/site', 'acme-qa', 'site'],
+        ['https://git-qa.ezil.work/candidate-a/interview-1121.git', 'candidate-a', 'interview-1121'],
+        ['https://git-qa.ezil.work/a0/b.c_d-e', 'a0', 'b.c_d-e'],
+    ])('with the opt-in, accepts and canonicalises %s exactly like github.ezil.work', (raw, owner, name) => {
+        expect(parseRepositoryUrl(raw, { stagingGitQa: true })).toEqual({ ok: true, host: 'git-qa.ezil.work', owner, name,
+            canonicalURL: `https://git-qa.ezil.work/${owner}/${name}.git`, displayName: `${owner}/${name}` });
+    });
+    it('without the opt-in (default, or false) a well-formed git-qa address is unsupported_host, as today', () => {
+        expect(parseRepositoryUrl('https://git-qa.ezil.work/acme-qa/site.git')).toEqual({ ok: false, reason: 'unsupported_host' });
+        expect(parseRepositoryUrl('https://git-qa.ezil.work/acme-qa/site.git', { stagingGitQa: false })).toEqual({ ok: false, reason: 'unsupported_host' });
+    });
+    it.each([
+        'https://GIT-QA.ezil.work/acme/site.git', 'https://git-qa.ezil.work:443/acme/site.git', 'https://u@git-qa.ezil.work/acme/site.git',
+        'https://git-qa.ezil.work/acme/site.git?token=x', 'https://git-qa.ezil.work/acme/site.git#f', 'https://git-qa.ezil.work/acme/site.git.git',
+        'https://git-qa.ezil.work/acme/si..te.git', 'https://git-qa.ezil.work/acme/Site.git', 'https://git-qa.ezil.work/acme/site.git/',
+        'https://git-qa.ezil.work/acme/./site.git', 'https://git-qa.ezil.work/acme/ignored/../site.git', 'https://git-qa.ezil.work/acme/%2e%2e/site.git',
+        'https://git-qa.ezil.work/a/b/c.git', 'https://git-qa.ezil.work/acme', 'https://git-qa.ezil.work/-acme/site.git',
+        'https://git-qa.ezil.work/acme/.site.git', 'https://git-qa.ezil.work\\acme\\site.git',
+    ])('with the opt-in, a malformed git-qa address %s is invalid (never a canonical remote)', raw => {
+        expect(parseRepositoryUrl(raw, { stagingGitQa: true })).toEqual({ ok: false, reason: 'invalid' });
+    });
+    it('the opt-in widens nothing else: github.com and github.ezil.work unchanged; git.ezil.work and git-staging stay unsupported', () => {
+        // positive controls: the opt-in changes no other host's parse.
+        expect(parseRepositoryUrl('https://github.ezil.work/acme/site.git', { stagingGitQa: true })).toEqual({ ok: true, host: 'github.ezil.work',
+            owner: 'acme', name: 'site', canonicalURL: 'https://github.ezil.work/acme/site.git', displayName: 'acme/site' });
+        expect(parseRepositoryUrl('https://github.com/EZiLHQ/ezil-os.git', { stagingGitQa: true })).toMatchObject({ ok: true, host: 'github.com' });
+        for (const raw of ['https://git.ezil.work/acme/site.git', 'https://git-staging.ezil.work/acme-qa/site.git']) {
+            expect(parseRepositoryUrl(raw, { stagingGitQa: true })).toEqual({ ok: false, reason: 'unsupported_host' });
+        }
+    });
+});
+
 describe('repositoryIdFor: the same folder on every reopen, never another repository\'s', () => {
     it('is a stable lowercase RFC 9562 v8 UUID, equal across spellings of one repository and different for another', () => {
         const id = repositoryIdFor('https://github.com/ezilhq/ezil-os.git');
