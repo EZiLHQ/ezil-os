@@ -57,13 +57,13 @@ export function EnrollmentConsent({ attemptId }: { attemptId: string }) {
             <h1 style={{ fontSize: 24 }}>Create your assignment repository</h1>
             <p>
                 EZiL will create one new private repository for this assignment, owned by your EZiL ID, add its starting
-                files (an assignment marker and a README), and link it to your assignment attempt. EZiL Code then records
-                disclosed assignment activity and shows recording status while you work.
+                files, and link it to your current assignment attempt. In Code, you can share this EZiL OS tab to record your
+                work during the remaining assignment time. The OS shows when recording is active.
             </p>
             <p style={{ color: '#555', fontSize: 14 }}>Attempt {attemptId}</p>
             <button type="button" onClick={enroll} disabled={phase.kind === 'working'}
                 style={{ padding: '10px 18px', fontSize: 16, cursor: phase.kind === 'working' ? 'wait' : 'pointer' }}>
-                {phase.kind === 'working' ? 'Setting up…' : 'Create repository and start'}
+                {phase.kind === 'working' ? 'Setting up…' : 'Create repository and open Code'}
             </button>
             {phase.kind === 'pending' && <p role="status">{phase.reason}</p>}
             {phase.kind === 'failed' && <p role="alert">{phase.message}</p>}

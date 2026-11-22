@@ -16,7 +16,7 @@ const refreshIdentity = () => refuse('IDENTITY_REFRESH_REQUIRED', 'Confirm your 
 
 /**
  * `POST /api/shell/assignment-enrollment` `{attemptId}`: the participant's explicit consent from
- * `/app/assignment-enrollment`. os-staging and allowlisted QA subjects only (`assignmentEnrollmentEnabled`); the actor is
+ * `/app/assignment-enrollment`. os-staging and a permitted QA subject or verified pilot-job participant only (`assignmentEnrollmentEnabled`); the actor is
  * the signed-in session's own retained EZiL ID, never anything in the body.
  */
 export async function POST(req: Request) {

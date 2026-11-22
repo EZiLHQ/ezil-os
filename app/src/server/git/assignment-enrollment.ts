@@ -12,7 +12,7 @@ import { assignmentManifest, BOOTSTRAP_REF, BootstrapError, pushAssignmentBootst
 import type { PrivateGitPacket } from './private-packet';
 
 /**
- * Self-serve assignment repository enrollment (RUN-1122), os-staging only, for allowlisted QA Builders.
+ * Self-serve assignment repository enrollment (RUN-1122), os-staging only, for named QA Builders or the participant of a specifically enabled staging job.
  *
  * One signed-in participant, one Universe attempt, one new private repository on the standalone gateway, owned by
  * that participant's own EZiL ID:
@@ -35,6 +35,8 @@ export const STANDALONE_GIT_REPOS_URL = 'https://github.ezil.work/v2/repos';
 /** The gateway's namespace for Builder-created repositories, as in the QA repository `default/os-code-url-20261110-a`. */
 export const ASSIGNMENT_NAMESPACE = 'default';
 export const QA_SUBJECTS_ENV = 'EZIL_ASSIGNMENT_ENROLLMENT_QA_SUBJECTS';
+export const PILOT_JOBS_ENV = 'EZIL_ASSIGNMENT_ENROLLMENT_PILOT_JOB_IDS';
+const decimalJobId = /^[1-9][0-9]{0,18}$/;
 /** The only Universe this enrolls against: `UNIVERSE_PROJECT_REPO_ORIGIN` must be exactly staging's. */
 export const ENROLLMENT_UNIVERSE_ORIGIN = 'https://universe-staging.ezil.work';
 
@@ -46,12 +48,20 @@ const RESPONSE_MAX_BYTES = 16_384;
 const CHALLENGE_MAX_MS = 15 * 60_000;
 const CLOCK_SKEW_MS = 30_000;
 
-/** os-staging exactly (the evidence pilot's gate), staging Universe exactly, and at least one QA subject. */
+/** os-staging exactly (the evidence pilot's gate), staging Universe exactly, and a bounded QA subject or pilot-job configuration. */
 export function assignmentEnrollmentEnabled(env: Record<string, string | undefined> = process.env): boolean {
     const funding = env.BILLING_FUNDING_URL;
     if (funding !== 'https://ai-staging.ezil.work' && funding !== 'https://ai-staging.ezil.work/') return false;
     try { if (projectRepoOrigin(env) !== ENROLLMENT_UNIVERSE_ORIGIN) return false; } catch { return false; }
-    return qaSubjects(env).size > 0;
+    return qaSubjects(env).size > 0 || pilotJobIds(env).size > 0;
+}
+
+function pilotJobIds(env: Record<string,string|undefined>): Set<string> {
+    const raw = env[PILOT_JOBS_ENV];
+    if (!raw || raw.length > 2048) return new Set();
+    const values = raw.split(',').map(value => value.trim());
+    if (values.length > 64 || values.some(value => !decimalJobId.test(value))) return new Set();
+    return new Set(values);
 }
 
 function qaSubjects(env: Record<string, string | undefined>): Set<string> {
@@ -106,6 +116,7 @@ export interface EnrollmentDeps {
 }
 
 const prepareResponse = z.object({
+    jobId: z.string().regex(decimalJobId).optional(),
     attemptId: z.string().regex(UUID),
     name: z.string().regex(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/),
     challenge: z.string().regex(/^[A-Za-z0-9_-]{16,512}$/),
@@ -150,7 +161,10 @@ export async function enrollAssignmentRepository(
     const now = deps.now ?? Date.now;
     const fetcher = deps.fetch ?? fetch;
     if (!UUID.test(attemptId) || !assignmentEnrollmentEnabled(env)) fail('not_authorized');
-    if (identity.issuer !== 'https://id.ezil.work/' || !qaSubjectAllowed(identity.subject, env) || identity.expiresAt <= now()) fail('not_authorized');
+    const namedQa = qaSubjectAllowed(identity.subject, env);
+    const permittedJobs = pilotJobIds(env);
+    if (identity.issuer !== 'https://id.ezil.work/' || !identity.userId || !identity.subject || !identity.sessionId
+        || !identity.token || identity.expiresAt <= now() || (!namedQa && permittedJobs.size === 0)) fail('not_authorized');
     let origin: string;
     try { origin = projectRepoOrigin(env); } catch (error) { if (error instanceof ProjectRepoError) fail('unavailable'); throw error; }
     const signal = deps.signal ? AbortSignal.any([deps.signal, AbortSignal.timeout(60_000)]) : AbortSignal.timeout(60_000);
@@ -175,6 +189,8 @@ export async function enrollAssignmentRepository(
     const prepared = prepareResponse.safeParse(await universe({ action: 'prepare' }));
     // The repository name is bound to the attempt: `a-<attemptId>`, nothing else.
     if (!prepared.success || prepared.data.attemptId !== attemptId || prepared.data.name !== `a-${attemptId}`) return fail('unavailable');
+    // Only authenticated Universe prepare can name the active attempt's job. The browser cannot supply a job ID.
+    if (!namedQa && (!prepared.data.jobId || !permittedJobs.has(prepared.data.jobId))) fail('not_authorized');
     const { name, challenge } = prepared.data;
     const challengeExpiry = Date.parse(prepared.data.expiresAt);
     if (!(challengeExpiry > now()) || challengeExpiry > now() + CHALLENGE_MAX_MS + CLOCK_SKEW_MS) fail('unavailable');

@@ -43,6 +43,39 @@ describe('POST /api/shell/assignment-enrollment', () => {
         expect(response.headers.get('cache-control')).toContain('no-store');
     });
 
+    it('creates the canonical C2 repo for a normal authenticated participant only on the configured stage job', async () => {
+        vi.stubEnv('EZIL_ASSIGNMENT_ENROLLMENT_QA_SUBJECTS', '');
+        vi.stubEnv('EZIL_ASSIGNMENT_ENROLLMENT_PILOT_JOB_IDS','10');
+        expect((await post({attemptId:ATTEMPT,jobId:'10'})).status).toBe(400);
+        expect(w.calls).toHaveLength(0);
+        w.state.prepareJobId='9';
+        expect((await post()).status).toBe(403);
+        expect(w.calls).toHaveLength(1);
+        expect(w.state.creates).toBe(0);
+        w.state.prepareJobId=undefined;
+        expect((await post()).status).toBe(403);
+        expect(w.state.creates).toBe(0);
+        w.state.prepareJobId='10';
+        const response=await post();
+        expect(response.status).toBe(200);
+        expect(await response.json()).toMatchObject({status:'bound',attemptId:ATTEMPT,
+            codeUrl:'/app/code?'+new URLSearchParams({repo:REPO,assignment:ATTEMPT})});
+        expect(w.git(['show','refs/heads/main:.ezil/assignment.json']).toString()).toContain('"port":5679');
+        expect(w.state.creates).toBe(1);
+    });
+
+    it('never enables job enrollment in production or for malformed wildcard lists', async () => {
+        vi.stubEnv('EZIL_ASSIGNMENT_ENROLLMENT_QA_SUBJECTS', '');
+        for(const invalid of ['*','10,*','-10','01','',Array(66).fill('10').join(',')]){
+            vi.stubEnv('EZIL_ASSIGNMENT_ENROLLMENT_PILOT_JOB_IDS',invalid);
+            expect((await post()).status).toBe(404);
+        }
+        vi.stubEnv('EZIL_ASSIGNMENT_ENROLLMENT_PILOT_JOB_IDS','10');
+        vi.stubEnv('BILLING_FUNDING_URL','https://ai.ezil.work');
+        expect((await post()).status).toBe(404);
+        expect(w.calls).toHaveLength(0);
+    });
+
     it('refuses cross-site, header-less and non-page writes before any session lookup or request', async () => {
         for (const headers of <Array<Record<string, string>>>[
             { ...SAME_ORIGIN, 'sec-fetch-site': 'same-site' },
