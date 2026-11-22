@@ -190,6 +190,19 @@ function textOf (surface, text) {
     return sanitizeText(text, surface.originPolicy);
 }
 
+/**
+ * A page's title as it may leave: `''` while the page is on an `idp_transit`
+ * origin, for every caller (amended 2026-11-22) — and also when it was there
+ * at either end of the read, so a page crossing into or out of the IdP mid-read
+ * cannot hand over the IdP's title. Otherwise through `sanitizeText`.
+ */
+async function titleOf (surface, page) {
+    const before = tierOf(page.url(), surface.originPolicy);
+    const raw = await safeTitle(page);
+    const after = tierOf(page.url(), surface.originPolicy);
+    return before === 'idp_transit' || after === 'idp_transit' ? '' : textOf(surface, raw);
+}
+
 function present (value) {
     return value !== undefined && value !== null;
 }
@@ -254,9 +267,9 @@ export const VERBS = {
         }
         // The title is read BEFORE the last check, so a page that moves on
         // while it is read cannot hand a denied page's title back.
-        const title = await safeTitle(page);
+        const title = await titleOf(surface, page);
         assertNotLandedOnDenied(surface, page, opts);
-        return { ok: true, url: urlOf(surface, page), title: textOf(surface, title) };
+        return { ok: true, url: urlOf(surface, page), title };
     },
 
     'POST /snapshot': async (surface, body = {}, opts = {}) => {
@@ -266,7 +279,7 @@ export const VERBS = {
             ACTION_TIMEOUT_MS,
             'snapshot',
         );
-        const title = await safeTitle(page);
+        const title = await titleOf(surface, page);
         // Read again BEFORE any ref is registered: a tree read off a page that
         // has just navigated onto the IdP is the IdP's tree.
         assertTierAllows(surface, page, 'POST /snapshot', body, opts);
@@ -275,7 +288,7 @@ export const VERBS = {
             ok: true,
             snapshot: textOf(surface, result.truncated ? `${result.text}\n- [snapshot truncated]` : result.text),
             url: urlOf(surface, page),
-            title: textOf(surface, title),
+            title,
         };
     },
 

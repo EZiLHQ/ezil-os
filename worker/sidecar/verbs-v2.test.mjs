@@ -119,6 +119,7 @@ class FakePage extends EventEmitter {
         this.scrollY = 0;
         this.text = 'Builder profile';
         this.titleText = 'Page title';
+        this.onTitle = null;
         this.onRead = null;
         /** goto target -> where the server redirects it. */
         this.redirects = {};
@@ -137,7 +138,11 @@ class FakePage extends EventEmitter {
     isClosed () { return false; }
     mainFrame () { return this.frame; }
     frames () { return [this.frame]; }
-    async title () { return this.titleText; }
+    async title () {
+        const title = this.titleText;
+        if (this.onTitle) await this.onTitle();
+        return title;
+    }
     async goto (url) {
         this.gotoCalls.push(url);
         this.currentUrl = this.redirects[url] ?? url;
@@ -292,8 +297,9 @@ describe('idp_transit: transit only', () => {
         const surface = surfaceOver([idp]);
         expect(await VERBS['GET /health'](surface, {})).toEqual({ ok: true, chromeConnected: true, cdpUrl: 'http://127.0.0.1:9222' });
         expect(await VERBS['POST /wait_for'](surface, { time: 0.05 })).toEqual({ ok: true, matched: true });
+        // On the IdP the title is '' (amended 2026-11-22).
         expect(await VERBS['POST /navigate'](surface, { url: 'https://id.ezil.work/u/login?state=abc' }))
-            .toEqual({ ok: true, url: 'https://id.ezil.work/u/login', title: 'Page title' });
+            .toEqual({ ok: true, url: 'https://id.ezil.work/u/login', title: '' });
         expect(idp.currentUrl).toBe('https://id.ezil.work/u/login?state=abc');
     });
 
@@ -315,6 +321,43 @@ describe('idp_transit: transit only', () => {
         for (const route of REFUSING) {
             expect({ route, code: await codeOf(VERBS[route](surface, BODY[route])) }).toEqual({ route, code: 'ok' });
         }
+    });
+
+    it('on an IdP page the title is empty for every caller; elsewhere it is the sanitised title', async () => {
+        for (const [target, expected] of [
+            ['https://id.ezil.work/u/login', ''],
+            ['http://id.ezil.work/u/login', ''],
+            [OWNER_PAGE, 'Log in | EZiL ID'],
+            ['https://example.org/next', 'Log in | EZiL ID'],
+        ]) {
+            const page = new FakePage(OTHER_PAGE);
+            page.titleText = 'Log in | EZiL ID';
+            const surface = surfaceOver([page]);
+            const out = await VERBS['POST /navigate'](surface, { url: target });
+            expect({ target, title: out.title }).toEqual({ target, title: expected });
+        }
+        // Under a broken policy every page is the IdP tier: no title anywhere.
+        const broken = loadOriginPolicy({ [ORIGIN_TIER_ENV.idp_transit]: 'https://id.ezil.work/' });
+        const page = new FakePage(OTHER_PAGE);
+        page.titleText = 'Anything';
+        expect((await VERBS['POST /navigate'](surfaceOver([page], { policy: broken }), { url: 'https://example.org/' })).title).toBe('');
+    });
+
+    it('a page crossing into or out of the IdP while its title is read yields no title', async () => {
+        for (const [from, to] of [['https://id.ezil.work/u/login', OWNER_PAGE], [OWNER_PAGE, 'https://id.ezil.work/u/login']]) {
+            const page = new FakePage(OTHER_PAGE);
+            page.titleText = 'Log in | EZiL ID';
+            const surface = surfaceOver([page]);
+            page.redirects['https://go.example.com/'] = from;
+            page.onTitle = async () => { page.currentUrl = to; };
+            const out = await VERBS['POST /navigate'](surface, { url: 'https://go.example.com/' });
+            expect({ from, to, title: out.title }).toEqual({ from, to, title: '' });
+        }
+        // Positive control: a page that stays on the owner app keeps its title.
+        const page = new FakePage(OTHER_PAGE);
+        page.titleText = 'Builder profile';
+        const out = await VERBS['POST /navigate'](surfaceOver([page]), { url: OWNER_PAGE });
+        expect(out.title).toBe('Builder profile');
     });
 
     it('the tier is read immediately before acting: a page that moved ONTO the IdP is refused', async () => {
@@ -602,7 +645,9 @@ describe('no OAuth parameter leaves in any handler output', () => {
                 : 'https://id.ezil.work/authorize';
             const navigate = outputs.find((o) => o.route === 'POST /navigate').out;
             expect(navigate.url).toBe(sanitized);
-            expect(navigate.title).toContain(`Signed in: ${sanitized} (`);
+            // The IdP's title never leaves; the owner app's leaves sanitised.
+            if (isOwner) expect(navigate.title).toContain(`Signed in: ${sanitized} (`);
+            else expect(navigate.title).toBe('');
             if (isOwner) {
                 const path = new URL(sanitized).pathname;
                 const { snapshot, title } = outputs.find((o) => o.route === 'POST /snapshot').out;
