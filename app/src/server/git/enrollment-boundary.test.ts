@@ -93,8 +93,13 @@ describe('self-serve assignment enrollment boundary', () => {
         expect(OWNED).toMatch(/^https:\/\/github\.ezil\.work\/default\/u-[0-9a-f]{16}-a-3f0c2a1e-5b6d-4e7f-8a90-b1c2d3e4f5a6\.git$/);
         expect(parseRepositoryUrl(OWNED)).toMatchObject({ ok: true, host: 'github.ezil.work', canonicalURL: OWNED });
         const marker = assignmentMarker(OWNED);
-        expect(marker).toBe(`{"schema":"ezil.assignment/v1","recorder":"assignment-recorder-v1","repositoryUrl":"${OWNED}","consentVersion":3,`
-            + '"notice":"Do not edit, modify, or delete this assignment marker. EZiL Code records disclosed assignment activity and shows recording status. Interruptions may affect submission."}\n');
+        const notice = '"notice":"Do not edit, modify, or delete this assignment marker. EZiL Code records disclosed assignment activity and shows recording status. Interruptions may affect submission."';
+        const identity = `"recorder":"assignment-recorder-v1","repositoryUrl":"${OWNED}","consentVersion":3,${notice}`;
+        expect(marker).toBe(`{"schema":"ezil.assignment/v2",${identity},"preload":{"protocol":"ezil.assignment-open/v1","trigger":"repo-open","host":"127.0.0.1","port":5679}}\n`);
+        const legacyMarker = assignmentMarker(OWNED, 1);
+        expect(legacyMarker).toBe(`{"schema":"ezil.assignment/v1",${identity}}\n`);
+        const legacyTree = bootstrapTree().map(entry => entry.path === '.ezil/assignment.json' ? file(entry.path, legacyMarker) : entry);
+        expect(assignmentManifest(OWNED, legacyTree)).toBe(createHash('sha256').update(legacyMarker, 'utf8').digest('hex'));
         expect(assignmentManifest(OWNED, bootstrapTree())).toBe(createHash('sha256').update(marker, 'utf8').digest('hex'));
         // Anything else is not this assignment's start: another URL in the marker, an extra, edited, executable or missing file.
         expect(assignmentManifest(CANONICAL, bootstrapTree())).toBeNull();

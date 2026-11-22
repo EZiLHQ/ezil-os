@@ -9,6 +9,8 @@ import { TRPCError } from '@trpc/server';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ImageJobConflictError } from '@/server/lib/compute/placement';
 
+vi.mock('server-only', () => ({}));
+
 const state = vi.hoisted(() => ({
     signedIn: true, seen: [] as unknown[], answer: { ok: true } as unknown,
     error: null as Error | null, advance: vi.fn().mockResolvedValue(null),
