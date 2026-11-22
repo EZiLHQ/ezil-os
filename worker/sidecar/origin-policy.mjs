@@ -127,9 +127,12 @@ export function loadOriginPolicy (env) {
     }
     const broken = !owner.ok || !idp.ok || ownerWithoutIdp;
 
-    const overlap = broken ? [] : [...new Set(owner.valid.filter((o) => idp.valid.includes(o)))];
     const idpSet = new Set(broken ? [] : idp.valid);
-    const ownerSet = new Set(broken ? [] : owner.valid.filter((o) => !idpSet.has(o)));
+    // The IdP tier matches by HOST (amended 2026-11-22), so an owner origin on
+    // an IdP host — whatever its port — is an overlap and is idp_transit.
+    const idpHosts = new Set([...idpSet].map((o) => new URL(o).hostname));
+    const overlap = broken ? [] : [...new Set(owner.valid.filter((o) => idpHosts.has(new URL(o).hostname)))];
+    const ownerSet = new Set(broken ? [] : owner.valid.filter((o) => !overlap.includes(o)));
 
     const policy = Object.freeze({
         broken,
@@ -138,7 +141,7 @@ export function loadOriginPolicy (env) {
         invalid: Object.freeze([...owner.problems, ...idp.problems].map((p) => Object.freeze(p))),
         overlap: Object.freeze(overlap),
     });
-    TIER_SETS.set(policy, { broken, owner: ownerSet, idp: idpSet });
+    TIER_SETS.set(policy, { broken, owner: ownerSet, idpHosts });
     return policy;
 }
 
@@ -154,10 +157,10 @@ function tierSets (policy) {
 }
 
 /**
- * The origin to look up, from a parsed URL, or null when the URL has no
+ * The https origin the OWNER tier matches on, or null when the URL has no
  * https origin at all (`about:blank`, `data:`, `http:` previews, opaque
  * origins). `blob:https://…` answers for its inner origin, and a trailing-dot
- * host (`id.ezil.work.`) answers as the same host without it.
+ * host (`app.example.com.`) answers as the same host without it.
  */
 function tierOrigin (parsed) {
     const origin = parsed.origin;
@@ -174,16 +177,37 @@ function parseUrl (url) {
 }
 
 /**
+ * The host the IdP tier matches on: the hostname alone — no scheme, no port —
+ * in lower case and without trailing dots. A `blob:` URL answers for its inner
+ * origin's host. null when the URL has no host (`about:`, `data:`, `file:`).
+ */
+function hostOf (parsed) {
+    let host = parsed.hostname;
+    if (!host && typeof parsed.origin === 'string' && parsed.origin !== 'null') {
+        const inner = parseUrl(parsed.origin);
+        host = inner ? inner.hostname : '';
+    }
+    if (!host) return null;
+    return host.toLowerCase().replace(/\.+$/, '');
+}
+
+/**
  * THE classification, for `tierOf` and `sanitizeUrl` alike. A broken policy
  * answers `idp_transit` before looking at the URL at all — parsable or not,
  * https or not — so there is exactly one place that decides it.
+ *
+ * The IdP tier matches by HOST whatever the scheme or port (amended
+ * 2026-11-22): `http://id.ezil.work/…`, `wss://id.ezil.work/…` and
+ * `https://id.ezil.work:8443/…` are all `idp_transit`. The owner tier stays an
+ * exact https-origin match.
  */
 function classify (sets, parsed) {
     if (sets.broken) return 'idp_transit';
     if (parsed === null) return 'other';
+    const host = hostOf(parsed);
+    if (host !== null && sets.idpHosts.has(host)) return 'idp_transit';
     const origin = tierOrigin(parsed);
     if (origin === null) return 'other';
-    if (sets.idp.has(origin)) return 'idp_transit';
     if (sets.owner.has(origin)) return 'owner_app';
     return 'other';
 }
