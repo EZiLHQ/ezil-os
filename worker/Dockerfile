@@ -423,9 +423,14 @@ RUN cd /opt/ezil-sidecar \
 #    `ezil-run` (uid/gid 7001, created here) with an environment built from
 #    scratch, so no EZIL_*_TOKEN reaches a job and the 0600 root socket of the
 #    `ezil` CLI stays out of its reach. No dependencies: nothing is installed.
+#    The drop is `setpriv --reuid 7001 --regid 7001 --clear-groups
+#    --no-new-privs` (util-linux, already in the base image): Node's own
+#    spawn({uid, gid}) keeps root's supplementary groups, so setpriv is
+#    load-bearing and its presence is asserted here.
 RUN useradd --system --uid 7001 --user-group --create-home --home-dir /home/ezil-run --shell /usr/sbin/nologin ezil-run \
-  && test "$(id -u ezil-run)" = 7001 && test "$(id -g ezil-run)" = 7001
-COPY toolsd /opt/ezil-toolsd
+  && test "$(id -u ezil-run)" = 7001 && test "$(id -g ezil-run)" = 7001 \
+  && test -x /usr/bin/setpriv
+COPY toolsd/server.mjs toolsd/auth.mjs toolsd/manifest.mjs toolsd/jobs.mjs toolsd/package.json /opt/ezil-toolsd/
 RUN test -f /opt/ezil-toolsd/server.mjs \
   && for f in /opt/ezil-toolsd/*.mjs; do node --check "$f" || exit 1; done \
   && node -e "import('/opt/ezil-toolsd/manifest.mjs').then(m=>{for(const k of ['validateManifest','scanCatalog'])if(typeof m[k]!=='function')throw new Error('toolsd manifest export missing: '+k);console.log('toolsd ok')})"
