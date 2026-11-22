@@ -101,6 +101,16 @@ test('real Chromium keeps control, receipts and viewer pixels on the one approve
         assert.deepEqual(before.elements, []);
         assert.doesNotMatch(JSON.stringify(before), /secret-only/);
 
+        // Off owner-app pages the v1 bound and the v1 actions hold (browser verbs v2 §4): no line break, no v2 kind.
+        for (const refused of [
+            { kind: 'type', ref: input.ref, text: 'two\nlines' },
+            { kind: 'type', ref: input.ref, text: 'x'.repeat(81) },
+            { kind: 'fill_form', fields: [{ ref: input.ref, text: 'EZiL staging test' }] },
+            { kind: 'select', ref: input.ref, values: ['a'] },
+            { kind: 'scroll', dy: 100 },
+            { kind: 'press', key: 'Enter', ref: input.ref },
+        ]) assert.equal((await mutate(refused)).error, 'browser_action_unavailable', JSON.stringify(refused));
+        assert.equal(await page.locator('#test-message').inputValue(), '', 'nothing reached the page');
         const content = { kind: 'type', ref: input.ref, text: 'EZiL staging test' };
         const requestId = randomUUID();
         const typed = await mutate(content, requestId);
