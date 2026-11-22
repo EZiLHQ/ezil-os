@@ -44,7 +44,8 @@ minted on one tab matching a leftover `data-ezil-ref` on another.
   fails open) and the fault logs once at boot. Unset variables are not malformed, **except** that a non-empty
   owner list with an empty or unset IdP list is also broken (an owner app is only safe when its IdP is known).
   An origin in both lists is `idp_transit`. The IdP tier matches by **host**, whatever the scheme
-  (`http://id.ezil.work` is `idp_transit` too). Amended 2026-11-22 after the independent sidecar review. `EZIL_BROWSER_TEST_ALLOWED_ORIGINS` is never a tier source (it also widens Code chats).
+  (`http://id.ezil.work` is `idp_transit` too). Amended 2026-11-22 after the independent sidecar review.
+  `EZIL_BROWSER_TEST_ALLOWED_ORIGINS` is never a tier source (it also widens Code chats).
 - `tierOf(url)` returns `owner_app | idp_transit | other`. `other` is exact v1 behaviour plus the v2 verbs.
 - **`idp_transit` is transit only.** Allowed: `GET /health`, `POST /navigate`, `POST /wait_for` with `time`
   only. Every other route, including `wait_for{text}`, `console` and `network`, answers `origin_read_only`:
@@ -168,7 +169,10 @@ as a separate UID with CDP behind a socket only the sidecar can read is out of s
   `whoami.provider === "ezil_id"` and equal emails. The run sets the tagline to `e2e-<nonce>`, saves
   (`manual_save=1`, current `profile_revision`; a 409 means reload and re-read), reloads, reads it back, then
   restores the original text and verifies the restore. `publishCalls` counts `/builder/work-profile-complete`
-  network entries; `leaks` counts `code=` or `state=` in any tool output. It never calls publish.
+  network entries **and** the script reads the profile's publish state before and after the run and requires it
+  unchanged (Universe has a second irreversible path: `POST /builder/profile-builder-save` with `action=publish` and
+  no `manual_save`, indistinguishable by URL; amended 2026-11-22 from the Universe map); the save is made only by
+  the `Save changes` control (`action=save`). `leaks` counts `code=` or `state=` in any tool output. It never calls publish.
 - **A4** `tools/list` on the Code stdio server equals §7 exactly.
 
 Out of scope: Auth0 Native-to-Web SSO, the `upload` verb, AWS v2 control, Chromium UID isolation, a server-side
