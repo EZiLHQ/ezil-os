@@ -69,6 +69,8 @@ STAGING_MCP_AUTH0_CLIENT = "EZIL_MCP_IDENTITY_BOOTSTRAP_AUTH0_CLIENT_ID"
 STAGING_BROWSER_OBSERVE = "EZIL_DELEGATED_BROWSER_OBSERVE"
 STAGING_BROWSER_OPEN = "EZIL_DELEGATED_BROWSER_OPEN_URL"
 STAGING_BROWSER_CONTROL = "EZIL_DELEGATED_BROWSER_CONTROL"
+ASSIGNMENT_RECEIPT_KEY = "UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET"
+ASSIGNMENT_PILOT_JOBS = "EZIL_ASSIGNMENT_ENROLLMENT_PILOT_JOB_IDS"
 STAGING_BROWSER_ORIGINS = "EZIL_BROWSER_TEST_ALLOWED_ORIGINS"
 STAGING_PREVIEW_TOKEN_V2 = "EZIL_PREVIEW_TOKEN_V2"
 BROWSER_LOCAL_CONTROL_PORTS = frozenset((3000, 3002, 4243, 8080, 8181, 8443, 9090, 9222, 9223))
@@ -99,6 +101,7 @@ def validate(values, environment="staging"):
     staging_keys = frozenset((
         STAGING_BROWSER_OBSERVE, STAGING_BROWSER_OPEN, STAGING_BROWSER_CONTROL, STAGING_BROWSER_ORIGINS,
         STAGING_PREVIEW_TOKEN_V2, STAGING_ONBOARDING, STAGING_MCP_AUTH0_CLIENT,
+        ASSIGNMENT_RECEIPT_KEY, ASSIGNMENT_PILOT_JOBS,
     ))
     allowed = REQUIRED | OPTIONAL | (staging_keys if environment == "staging" else frozenset())
     if any(key not in allowed and not REGIONAL.fullmatch(key) for key in values):
@@ -110,6 +113,17 @@ def validate(values, environment="staging"):
             raise RenderError("Expected nonempty strings without surrounding whitespace")
         if any(c in value for c in "\r\n\0"):
             raise RenderError("Newline or NUL refused")
+    if ASSIGNMENT_RECEIPT_KEY in values or ASSIGNMENT_PILOT_JOBS in values:
+        if (values.get("BILLING_FUNDING_URL") != STAGING_FUNDING_URL
+                or values.get("UNIVERSE_PROJECT_REPO_ORIGIN") != "https://universe-staging.ezil.work"):
+            raise RenderError("Assignment enrollment requires the canonical staging origins")
+        if ASSIGNMENT_RECEIPT_KEY in values and len(values[ASSIGNMENT_RECEIPT_KEY]) < 32:
+            raise RenderError("Assignment receipt signing requires at least 32 characters")
+        if ASSIGNMENT_PILOT_JOBS in values:
+            jobs = values[ASSIGNMENT_PILOT_JOBS].split(",")
+            if (len(jobs) > 50 or len(set(jobs)) != len(jobs)
+                    or any(not re.fullmatch(r"[1-9][0-9]{0,9}", job) for job in jobs)):
+                raise RenderError("Assignment enrollment requires explicit staging job IDs")
     if len(values["CRON_SECRET"]) < 32:
         raise RenderError("CRON_SECRET requires at least 32 characters")
     bridge_approval = values.get("EZIL_AWS_RETAINED_REBASE_APPROVAL")

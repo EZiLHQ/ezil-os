@@ -54,6 +54,25 @@ class RenderEnvTests(unittest.TestCase):
         self.assertIn("UNIVERSE_PROJECT_REPO_ORIGIN", renderer.OPTIONAL)
         self.assertNotIn("UNIVERSE_PROJECT_REPO_ORIGIN", renderer.REQUIRED)
 
+    def test_assignment_receipt_and_pilot_jobs_are_staging_only(self):
+        origins = {"BILLING_FUNDING_URL": renderer.STAGING_FUNDING_URL,
+                   "UNIVERSE_PROJECT_REPO_ORIGIN": "https://universe-staging.ezil.work"}
+        proof = {renderer.ASSIGNMENT_RECEIPT_KEY: "local-test-value-" * 3,
+                 renderer.ASSIGNMENT_PILOT_JOBS: "8,9,10"}
+        configured = {**self.values, **origins, **proof}
+        self.assertEqual(renderer.validate(configured), configured)
+        self.assertEqual(renderer.validate(self.values), self.values)
+        for key in proof:
+            with self.subTest(key=key), self.assertRaises(renderer.RenderError):
+                renderer.validate({**self.values, key: proof[key]}, "production")
+        for changes in ({"BILLING_FUNDING_URL": "https://ai.ezil.work"},
+                        {"UNIVERSE_PROJECT_REPO_ORIGIN": "https://universe.ezil.work"},
+                        {renderer.ASSIGNMENT_RECEIPT_KEY: "short"},
+                        *({renderer.ASSIGNMENT_PILOT_JOBS: value} for value
+                          in ("", "*", "08", "9,9", "9, 10", "11" * 6, ",".join(map(str, range(1, 52)))))):
+            with self.subTest(changes=list(changes)), self.assertRaises(renderer.RenderError):
+                renderer.validate({**configured, **changes})
+
     def test_the_old_works_origin_name_is_refused(self):
         # Renamed when the authority moved to Universe: a secret still holding the old key fails rendering.
         with self.assertRaises(renderer.RenderError):
