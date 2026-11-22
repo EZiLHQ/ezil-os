@@ -96,8 +96,13 @@ Errors are `{ok:false, error, detail?}` with `error` one of `chrome_unreachable`
 tier origins come ONLY from `EZIL_BROWSER_OWNER_APP_ORIGINS` and
 `EZIL_BROWSER_IDP_ORIGINS`: comma lists of bare https origins (staging:
 `https://universe-staging.ezil.work` and `https://id.ezil.work`), read once when
-the surface is created. A malformed entry empties that tier and is logged at
-boot by position, never by value; an origin in both lists is `idp_transit`.
+the surface is created. **A malformed entry in either variable breaks the
+whole policy** (`policy.broken`): every page is then `idp_transit` — health,
+navigate and `wait_for{time}` only, for every caller — until the variable is
+fixed, and one boot line names each fault by variable and position, never by
+value. (Emptying just the bad tier would fail open: a broken IdP list would
+make the IdP `other`.) Unset or blank variables are not malformed: that tier is
+empty. An origin in both lists is `idp_transit`.
 `EZIL_BROWSER_TEST_ALLOWED_ORIGINS` is never a tier source.
 
 | Tier | Routes |
@@ -110,29 +115,49 @@ Everything else on an `idp_transit` page — snapshot, refs, typing, text,
 screenshots, console, network, `wait_for{text}` — answers `origin_read_only`.
 The tier is read immediately before acting, and reads (`snapshot`, `get_text`,
 `screenshot`, `wait_for{text}`) check again after reading, so a page that
-navigated onto the IdP mid-read yields nothing. A verb that navigates may land
-on any tier; it returns the sanitised `url`.
+navigated onto the IdP mid-read yields nothing. On the Worker path a verb that
+navigates may land on any tier; it returns the sanitised `url`.
 
 Handlers are `(surface, body, opts = {})`. `opts.denyTiers` (a `Set` of tier
 names) refuses those tiers as well: the Code loopback passes
-`new Set(['owner_app', 'idp_transit'])`. That is agent policy, not confinement
-(`docs/contracts/browser-verbs-v2.md` §8: anything in the computer can reach
-CDP on 9222 directly).
+`new Set(['owner_app', 'idp_transit'])`. For such a caller:
+
+- a page in a denied tier answers `origin_read_only` to every route but
+  `/health`;
+- a verb that LANDS on a denied tier (`navigate`, `click`, `type{submit}`,
+  `press`, or a page script reacting to `fill_form`, `select` or `scroll`)
+  answers `origin_read_only` with no url and no title — the navigation may
+  already have happened, nothing about it comes back;
+- a `navigate` whose target is in a denied tier is refused before it loads;
+- `console` and `network` leave out everything the tab recorded while it was in
+  a denied tier.
+
+That is agent policy, not confinement (`docs/contracts/browser-verbs-v2.md` §8:
+anything in the computer can reach CDP on 9222 directly).
 
 **URL sanitising.** `sanitizeUrl` reduces an `idp_transit` URL to origin + path,
 and strips the whole query and fragment from any URL whose query or fragment
 names `code`, `state`, `id_token`, `access_token`, `refresh_token`, `token`,
 `session_transfer_token`, `nonce`, `ticket` or `code_verifier`. Every other
-URL is returned as the same string. It is applied at the source: console and
-network entries as they are recorded (including URLs inside console text and
-`location`), and every `url` member of every response.
+URL is returned as the same string (under a broken policy every URL takes the
+origin + path form). It is applied at the source: console and network entries
+as they are recorded (including URLs inside console text and `location`), and
+every `url` member of every response.
+
+**Page text** — snapshot text, `get_text` markdown, every `title`, and
+`/select`'s option values — leaves through `sanitizeText`: every absolute URL
+in it through `sanitizeUrl` (the JSON-escaped `https:\/\/…` form too), and every
+relative reference (`/cb?code=…`, `./x?state=…`, `?code=…`, `#access_token=…`,
+`//host/cb?…`), because markdown carries the page's raw `href`s. Trailing
+punctuation and an unbalanced `)` or `]` stay outside the URL, so markdown links
+keep their brackets. The limit: text that merely contains `?code=` glued inside
+a word (`a/b?code=1`) is neither a URL nor a reference, and stays.
 
 **Page scope.** `console` and `network` return only entries recorded from the
 active tab (entries carry an internal page tag; the public entry shape is
 unchanged). Console text recorded while that tab was on an `idp_transit` origin
 is not returned after it leaves; the IdP hops stay visible, sanitised, in
-`network`. Page text that is not a URL member (`snapshot`, `get_text` markdown,
-titles) is not URL-sanitised.
+`network`.
 
 A verb-level failure answers **HTTP 200** with `ok:false` — the contract makes
 `ok` the channel, and folding verb failure into transport failure is how a
@@ -206,13 +231,21 @@ renders the dots when unmasked; only the container suite proves the pixels.)
 `origin-policy.test.mjs` covers the pure policy. Break each guard, run
 `bun test` (all suites), expect red, restore with `git checkout <file>`:
 
-| Guard | Mutation | Recorded (2026-11-21, 210 tests) |
+| Guard | Mutation | Recorded (2026-11-22, 270 tests) |
 |---|---|---|
-| tier gate (`verbs.mjs` `assertTierAllows`) | `if (!routeAllowedOnTier(…) \|\| deny.has(tier))` → `if (false)` | 36 fail |
-| idp route table (`origin-policy.mjs` `routeAllowedOnTier`) | `if (tier !== 'idp_transit') return true;` → `return true;` | 25 fail |
-| `sanitizeUrl` | return `url` unchanged before parsing | 24 fail |
+| tier gate (`verbs.mjs` `assertTierAllows`) | `if (!routeAllowedOnTier(…) \|\| deny.has(tier))` → `if (false)` | 38 fail |
+| idp route table (`origin-policy.mjs` `routeAllowedOnTier`) | `if (tier !== 'idp_transit') return true;` → `return true;` | 29 fail |
+| `sanitizeUrl` | return `url` unchanged before parsing | 32 fail |
 | ref tab binding (`browser.mjs` `resolveRef`) | the `pageKey` check → `if (false)` | 2 fail |
 | ref origin binding (`browser.mjs` `resolveRef`) | the `origin` check → `if (false)` | 1 fail |
+| broken policy (`origin-policy.mjs` `classify`) | delete `if (sets.broken) return 'idp_transit';` | 43 fail |
+| broken policy (`loadOriginPolicy`) | `const broken = false;` | 45 fail |
+| Code landing rule (`verbs.mjs` `assertNotLandedOnDenied`) | its check → `if (false)` | 18 fail |
+| Code navigate-target refusal (`verbs.mjs` `/navigate`) | its check → `if (false)` | 1 fail |
+| Code console history (`browser.mjs` `consoleEntries`) | drop the `denyTiers` filter | 1 fail |
+| Code network history (`browser.mjs` `networkEntries`) | drop the `denyTiers` filter | 1 fail |
+| page text (`verbs.mjs` `textOf`) | return `text` unchanged | 5 fail |
+| relative references (`origin-policy.mjs` `sanitizeText`) | skip the second pass | 5 fail |
 
 ## Running it by hand
 

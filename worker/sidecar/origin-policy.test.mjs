@@ -25,6 +25,7 @@ const AUTHORIZE_URL = 'https://id.ezil.work/authorize?state=Y&nonce=Z';
 
 describe('loadOriginPolicy: where tiers come from', () => {
     it('reads the staging values into the two tiers', () => {
+        expect(STAGING.broken).toBe(false);
         expect(STAGING.owner_app).toEqual([OWNER]);
         expect(STAGING.idp_transit).toEqual([IDP]);
         expect(STAGING.invalid).toEqual([]);
@@ -49,23 +50,34 @@ describe('loadOriginPolicy: where tiers come from', () => {
         expect(tierOf(`${OWNER}/builder`, policy)).toBe('other');
     });
 
-    it('unset, empty and blank variables mean an empty tier and no complaint', () => {
+    it('unset, empty and blank variables are NOT malformed: an empty tier, the rest as configured', () => {
         for (const value of [undefined, null, '', '   ', ',', ' , ']) {
-            const policy = loadOriginPolicy({ [ORIGIN_TIER_ENV.idp_transit]: value });
-            expect({ value, idp: policy.idp_transit, invalid: policy.invalid }).toEqual({ value, idp: [], invalid: [] });
+            for (const variable of Object.values(ORIGIN_TIER_ENV)) {
+                const other = variable === ORIGIN_TIER_ENV.owner_app ? ORIGIN_TIER_ENV.idp_transit : ORIGIN_TIER_ENV.owner_app;
+                const policy = loadOriginPolicy({ [variable]: value, [other]: other === ORIGIN_TIER_ENV.owner_app ? OWNER : IDP });
+                expect({ value, variable, broken: policy.broken, invalid: policy.invalid })
+                    .toEqual({ value, variable, broken: false, invalid: [] });
+                expect(tierOf('https://example.com/', policy)).toBe('other');
+            }
         }
-        expect(loadOriginPolicy(undefined).owner_app).toEqual([]);
+        expect(loadOriginPolicy(undefined).broken).toBe(false);
+        expect(tierOf('https://example.com/', loadOriginPolicy({}))).toBe('other');
     });
 
     it('accepts a comma list with blanks around the commas, and an explicit non-default port', () => {
         const policy = loadOriginPolicy({
             [ORIGIN_TIER_ENV.owner_app]: ` ${OWNER} , https://app.example.com:8443 ,`,
         });
+        expect(policy.broken).toBe(false);
         expect(policy.owner_app).toEqual([OWNER, 'https://app.example.com:8443']);
         expect(policy.invalid).toEqual([]);
     });
 
-    // 🔴 Fail closed: a malformed entry empties THAT tier, never widens it.
+    /** Under a broken policy EVERYTHING is idp_transit: these must all say so. */
+    const PROBES = [`${OWNER}/builder`, `${IDP}/authorize`, 'https://example.com/', 'http://127.0.0.1:3000/', 'about:blank', 'not a url', ''];
+
+    // 🔴 Fail closed (amended): a malformed entry in EITHER variable breaks
+    // the whole policy, never just empties its own tier.
     const MALFORMED = {
         'a trailing slash': 'https://id.ezil.work/',
         'a path': 'https://id.ezil.work/authorize',
@@ -86,52 +98,73 @@ describe('loadOriginPolicy: where tiers come from', () => {
         'a control character': 'https://id.ezil.work\u0007',
     };
     for (const [what, entry] of Object.entries(MALFORMED)) {
-        it(`an entry with ${what} empties that tier and leaves the other alone`, () => {
-            const policy = loadOriginPolicy({
-                [ORIGIN_TIER_ENV.owner_app]: OWNER,
-                [ORIGIN_TIER_ENV.idp_transit]: `https://good.ezil.work,${entry}`,
+        for (const tier of ['idp_transit', 'owner_app']) {
+            const variable = ORIGIN_TIER_ENV[tier];
+            it(`${variable} with ${what} breaks the whole policy: every URL is idp_transit`, () => {
+                const env = { [ORIGIN_TIER_ENV.owner_app]: OWNER, [ORIGIN_TIER_ENV.idp_transit]: IDP };
+                env[variable] = `https://good.ezil.work,${entry}`;
+                const policy = loadOriginPolicy(env);
+                expect(policy.broken).toBe(true);
+                for (const url of PROBES) expect({ url, tier: tierOf(url, policy) }).toEqual({ url, tier: 'idp_transit' });
+                // No list is trusted, so neither is reported as a tier.
+                expect(policy.owner_app).toEqual([]);
+                expect(policy.idp_transit).toEqual([]);
+                expect(policy.invalid).toEqual([{ tier, variable, entry: 2, reason: 'not_a_bare_https_origin' }]);
             });
-            expect(policy.idp_transit).toEqual([]);
-            expect(tierOf('https://good.ezil.work/x', policy)).toBe('other');
-            expect(policy.owner_app).toEqual([OWNER]);
-            expect(policy.invalid).toEqual([{
-                tier: 'idp_transit', variable: ORIGIN_TIER_ENV.idp_transit, entry: 2, reason: 'not_a_bare_https_origin',
-            }]);
-        });
+        }
     }
 
-    it(`more than ${ORIGIN_TIER_MAX_ENTRIES} entries empties the tier; exactly ${ORIGIN_TIER_MAX_ENTRIES} is fine`, () => {
+    it('positive control: the same lists without the bad entry behave exactly as before', () => {
+        const policy = loadOriginPolicy({
+            [ORIGIN_TIER_ENV.owner_app]: `https://good.ezil.work,${OWNER}`,
+            [ORIGIN_TIER_ENV.idp_transit]: IDP,
+        });
+        expect(policy.broken).toBe(false);
+        expect(tierOf('https://good.ezil.work/x', policy)).toBe('owner_app');
+        expect(tierOf(`${OWNER}/builder`, policy)).toBe('owner_app');
+        expect(tierOf(`${IDP}/authorize`, policy)).toBe('idp_transit');
+        expect(tierOf('https://example.com/', policy)).toBe('other');
+        expect(tierOf('about:blank', policy)).toBe('other');
+        expect(tierOf('not a url', policy)).toBe('other');
+    });
+
+    it(`more than ${ORIGIN_TIER_MAX_ENTRIES} entries breaks the policy; exactly ${ORIGIN_TIER_MAX_ENTRIES} is fine`, () => {
         const list = (n) => Array.from({ length: n }, (_, i) => `https://h${i}.example.com`).join(',');
         const ok = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: list(ORIGIN_TIER_MAX_ENTRIES) });
+        expect(ok.broken).toBe(false);
         expect(ok.owner_app).toHaveLength(ORIGIN_TIER_MAX_ENTRIES);
         const tooMany = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: list(ORIGIN_TIER_MAX_ENTRIES + 1) });
-        expect(tooMany.owner_app).toEqual([]);
+        expect(tooMany.broken).toBe(true);
         expect(tooMany.invalid.map((p) => p.reason)).toEqual(['too_many_entries']);
+        expect(tierOf('https://h0.example.com/', tooMany)).toBe('idp_transit');
     });
 
-    it('a non-string value empties the tier', () => {
-        const policy = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: 42 });
-        expect(policy.owner_app).toEqual([]);
+    it('a non-string value breaks the policy', () => {
+        const policy = loadOriginPolicy({ [ORIGIN_TIER_ENV.idp_transit]: 42 });
+        expect(policy.broken).toBe(true);
         expect(policy.invalid.map((p) => p.reason)).toEqual(['not_a_string']);
+        expect(tierOf('https://example.com/', policy)).toBe('idp_transit');
     });
 
-    it('an origin in BOTH lists is idp_transit, never owner_app', () => {
+    it('an origin in BOTH (well-formed) lists is idp_transit, never owner_app', () => {
         const policy = loadOriginPolicy({
             [ORIGIN_TIER_ENV.owner_app]: `${OWNER},${IDP}`,
             [ORIGIN_TIER_ENV.idp_transit]: IDP,
         });
+        expect(policy.broken).toBe(false);
         expect(tierOf(`${IDP}/u/login`, policy)).toBe('idp_transit');
         expect(policy.owner_app).toEqual([OWNER]);
         expect(policy.overlap).toEqual([IDP]);
     });
 
-    it('…even when the IdP list is otherwise malformed (a typo cannot promote the IdP)', () => {
+    it('a malformed IdP list can never leave the IdP promoted or ordinary', () => {
         const policy = loadOriginPolicy({
             [ORIGIN_TIER_ENV.owner_app]: `${OWNER},${IDP}`,
             [ORIGIN_TIER_ENV.idp_transit]: `${IDP},https://broken.example.com/`,
         });
+        expect(policy.broken).toBe(true);
         expect(tierOf(`${IDP}/u/login`, policy)).toBe('idp_transit');
-        expect(tierOf(`${OWNER}/builder`, policy)).toBe('owner_app');
+        expect(tierOf(`${OWNER}/builder`, policy)).toBe('idp_transit');
         expect(policy.invalid).toHaveLength(1);
     });
 
@@ -142,7 +175,7 @@ describe('loadOriginPolicy: where tiers come from', () => {
     });
 
     it('a hand-built policy object is refused; one from loadOriginPolicy is accepted', () => {
-        const forged = { owner_app: [OWNER], idp_transit: [], invalid: [], overlap: [] };
+        const forged = { broken: false, owner_app: [OWNER], idp_transit: [], invalid: [], overlap: [] };
         expect(isOriginPolicy(forged)).toBe(false);
         expect(() => tierOf(`${OWNER}/`, forged)).toThrow(/loadOriginPolicy/);
         expect(() => sanitizeUrl(CALLBACK_URL, forged)).toThrow(/loadOriginPolicy/);
@@ -151,19 +184,28 @@ describe('loadOriginPolicy: where tiers come from', () => {
         expect(tierOf(`${OWNER}/`, STAGING)).toBe('owner_app');
     });
 
-    it('boot lines name the variable and position, never the raw value', () => {
+    it('a broken policy is ONE boot line naming every fault by variable and position, never by value', () => {
         const policy = loadOriginPolicy({
-            [ORIGIN_TIER_ENV.owner_app]: `${OWNER},${IDP}`,
+            [ORIGIN_TIER_ENV.owner_app]: `${OWNER},https://user:hunter2pw@universe-staging.ezil.work`,
             [ORIGIN_TIER_ENV.idp_transit]: `${IDP},https://user:hunter2pw@id.ezil.work`,
         });
         const lines = originPolicyBootLines(policy);
-        expect(lines).toHaveLength(2);
-        expect(lines[0]).toContain(ORIGIN_TIER_ENV.idp_transit);
-        expect(lines[0]).toContain('entry #2');
-        expect(lines[1]).toContain(`${IDP} is in both`);
+        expect(lines).toHaveLength(1);
+        expect(lines[0]).toContain('origin policy BROKEN');
+        expect(lines[0]).toContain(`${ORIGIN_TIER_ENV.owner_app} entry #2`);
+        expect(lines[0]).toContain(`${ORIGIN_TIER_ENV.idp_transit} entry #2`);
+        expect(lines[0]).toContain('every page is idp_transit');
         expect(JSON.stringify(lines)).not.toContain('hunter2pw');
         expect(JSON.stringify(policy)).not.toContain('hunter2pw');
+    });
+
+    it('a sound policy logs only its overlaps, and a clean one logs nothing', () => {
+        const overlapping = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: `${OWNER},${IDP}`, [ORIGIN_TIER_ENV.idp_transit]: IDP });
+        expect(originPolicyBootLines(overlapping)).toEqual([
+            `[ezil-sidecar] ${IDP} is in both ${ORIGIN_TIER_ENV.owner_app} and ${ORIGIN_TIER_ENV.idp_transit}: it is idp_transit`,
+        ]);
         expect(originPolicyBootLines(STAGING)).toEqual([]);
+        expect(originPolicyBootLines(loadOriginPolicy({}))).toEqual([]);
     });
 });
 
@@ -290,6 +332,32 @@ describe('sanitizeUrl', () => {
         expect(sanitizeUrl(obj, STAGING)).toBe(obj);
     });
 
+    it('under a BROKEN policy every URL takes the transit form; a sound policy leaves the same URLs alone', () => {
+        const broken = loadOriginPolicy({ [ORIGIN_TIER_ENV.idp_transit]: 'https://id.ezil.work/' });
+        expect(broken.broken).toBe(true);
+        const cases = [
+            ['https://example.com/a?b=1#c', 'https://example.com/a'],
+            ['https://user:pw@example.com/a?b=1', 'https://example.com/a'],
+            ['https://universe-staging.ezil.work/builder/profile-builder?tab=rates', 'https://universe-staging.ezil.work/builder/profile-builder'],
+            ['http://127.0.0.1:3000/x?y=1', 'http://127.0.0.1:3000/x'],
+            ['wss://example.com/socket?ticket=t', 'wss://example.com/socket'],
+            ['about:blank', 'about:blank'],
+            ['about:blank?x=1#y', 'about:blank'],
+            ['blob:https://example.com/4f2c', 'https://example.com'],
+            ['data:text/plain,hello?state=1', 'data:text/plain,hello'],
+        ];
+        for (const [url, out] of cases) {
+            expect({ url, out: sanitizeUrl(url, broken) }).toEqual({ url, out });
+        }
+        const sound = loadOriginPolicy({});
+        for (const url of ['https://example.com/a?b=1#c', 'https://universe-staging.ezil.work/builder/profile-builder?tab=rates',
+            'http://127.0.0.1:3000/x?y=1', 'about:blank']) {
+            expect(sanitizeUrl(url, sound)).toBe(url);
+        }
+        expect(sanitizeText('see https://example.com/a?b=1 now', broken)).toBe('see https://example.com/a now');
+        expect(sanitizeText('see https://example.com/a?b=1 now', sound)).toBe('see https://example.com/a?b=1 now');
+    });
+
     it('without tiers configured, sensitive parameters are still stripped (v1 pages too)', () => {
         const none = loadOriginPolicy({});
         expect(sanitizeUrl(CALLBACK_URL, none)).toBe('https://universe-staging.ezil.work/creator/social-login/callback/auth0');
@@ -320,5 +388,59 @@ describe('sanitizeText', () => {
         expect(sanitizeText(text, STAGING)).toBe(text);
         expect(sanitizeText('', STAGING)).toBe('');
         expect(sanitizeText(undefined, STAGING)).toBe(undefined);
+    });
+
+    it('relative references (markdown hrefs) lose query and fragment when either names a sensitive parameter', () => {
+        const cases = [
+            ['[back](/creator/social-login/callback/auth0?code=X&state=Y)', '[back](/creator/social-login/callback/auth0)'],
+            ['go to ./cb?state=1 now', 'go to ./cb now'],
+            ['go to ../cb#access_token=a now', 'go to ../cb now'],
+            ['href=/cb?x=1&code=2', 'href=/cb'],
+            ['"?code=abc"', '""'],
+            ['see #access_token=abc', 'see '],
+            ['[idp](//id.ezil.work/authorize?state=1)', '[idp](//id.ezil.work/authorize)'],
+            ['[cdn](//cdn.example.com/a.js?token=t)', '[cdn](//cdn.example.com/a.js)'],
+            ['{"next":"\\/cb?code=1"}', '{"next":"\\/cb"}'],
+        ];
+        for (const [text, out] of cases) {
+            expect({ text, out: sanitizeText(text, STAGING) }).toEqual({ text, out });
+        }
+    });
+
+    it('leaves relative references without sensitive parameters, and look-alikes, untouched', () => {
+        for (const text of [
+            '[next](/builder/jobs?page=2)', '[top](#overview)', '# Heading', '## Sub', '- link "Docs" [ref=e3]',
+            '- heading "Rates" [ref=e9] [level=2]', '//example.com/a?b=1', '/etc/passwd?', 'ratio 3/4', 'and/or',
+        ]) {
+            expect(sanitizeText(text, STAGING)).toBe(text);
+        }
+    });
+
+    it('the limit, stated: a `?code=` glued mid-word is not a reference and stays', () => {
+        // Not a URL and not a reference (no boundary before the `/`), so
+        // neither pass can tell it from prose. Recorded so it is a decision.
+        expect(sanitizeText('a/b?code=1', STAGING)).toBe('a/b?code=1');
+    });
+
+    it('trailing punctuation and closing brackets stay outside the URL', () => {
+        const cases = [
+            ['Go to https://a.example.com/cb?code=1.', 'Go to https://a.example.com/cb.'],
+            ['https://a.example.com/cb?code=1, then', 'https://a.example.com/cb, then'],
+            ['[x](https://a.example.com/cb?code=1)', '[x](https://a.example.com/cb)'],
+            ['(https://a.example.com/w_(x)?code=1)', '(https://a.example.com/w_(x))'],
+            ['[https://a.example.com/cb?state=2]', '[https://a.example.com/cb]'],
+            ['(see /cb?code=1).', '(see /cb).'],
+        ];
+        for (const [text, out] of cases) {
+            expect({ text, out: sanitizeText(text, STAGING) }).toEqual({ text, out });
+        }
+    });
+
+    it('under a broken policy a relative reference with a path loses every query and fragment', () => {
+        const broken = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: 'https://universe-staging.ezil.work/' });
+        expect(sanitizeText('[next](/builder/jobs?page=2) [top](#overview)', broken)).toBe('[next](/builder/jobs) [top](#overview)');
+        expect(sanitizeText('## Rates #1', broken)).toBe('## Rates #1');
+        expect(sanitizeText('[x](?code=1)', broken)).toBe('[x]()');
+        expect(sanitizeText('[next](/builder/jobs?page=2) [top](#overview)', STAGING)).toBe('[next](/builder/jobs?page=2) [top](#overview)');
     });
 });

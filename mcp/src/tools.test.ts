@@ -206,6 +206,15 @@ describe('browser_* aliases (browser verbs v2, §4)', () => {
         }
     });
 
+    it('the shared restart answer is neutral: it names both status tools', async () => {
+        for (const name of ['restart_desktop', 'restart_browser']) {
+            const res = await byName(stubClient())[name]!.handler({ computerId: COMPUTER.id });
+            expect(res.content[0]!.text).toBe(
+                'Restart requested. The Browser takes a few seconds to come back — poll browser_status or desktop_status.',
+            );
+        }
+    });
+
     it('an alias is lifecycle, not automation: its schema is the computer id alone', () => {
         const t = byName(stubClient());
         for (const [, alias] of PAIRS) {
