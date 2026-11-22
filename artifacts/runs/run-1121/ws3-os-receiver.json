@@ -1,0 +1,9 @@
+{
+  "taskId": "ws3-os-receiver",
+  "runId": "run-1121",
+  "status": "running",
+  "doneRung": "os-receiver-bearer-loopback-owner-app-v2-schema-unit-green-mutation-proved",
+  "evidence": "Baseline at 52434b78 before any edit: worker/sidecar bun test (redaction, server, wire, origin-policy, verbs-v2) 210 pass / 0 fail, 5 files, exit 0. node --test mcp-*.test.mjs with EZIL_TEST_CHROMIUM=/opt/google/chrome/chrome (Chrome 149) 7 pass / 0 fail / 0 skipped, exit 0. worker typecheck exit 0; worker bun test browser-sidecar-contract + route-auth + browser-observe-edge-seam (contract JSON set) 232 pass / 0 fail, 3 files, exit 0. app typecheck exit 0; vitest browser-observe + browser-open 33 pass / 1 skipped (src/server/browser-open/route.pg.test.ts), exit 0. deploy/aws/os-staging unittest test_render_env 50 OK, exit 0.",
+  "startedAt": "2026-11-22T07:20:00Z",
+  "updatedAt": "2026-11-22T07:36:00Z"
+}
