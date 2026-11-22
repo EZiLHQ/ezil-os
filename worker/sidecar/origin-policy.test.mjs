@@ -241,9 +241,20 @@ describe('tierOf', () => {
         ['https://id.ezil.work:443/u/login', 'idp_transit'],
         ['https://id.ezil.work./u/login', 'idp_transit'],
         ['blob:https://id.ezil.work/4f2c', 'idp_transit'],
-        ['http://id.ezil.work/u/login', 'other'],
-        ['https://id.ezil.work:8443/u/login', 'other'],
+        // The IdP matches by HOST whatever the scheme or port (amended 2026-11-22).
+        ['http://id.ezil.work/u/login', 'idp_transit'],
+        ['HTTP://ID.EZIL.WORK./u/login', 'idp_transit'],
+        ['https://id.ezil.work:8443/u/login', 'idp_transit'],
+        ['http://id.ezil.work:8080/', 'idp_transit'],
+        ['wss://id.ezil.work/socket', 'idp_transit'],
+        ['ftp://id.ezil.work/x', 'idp_transit'],
+        ['ezil://id.ezil.work/cb', 'idp_transit'],
+        ['blob:http://id.ezil.work/4f2c', 'idp_transit'],
+        // …and by that host only: positive controls.
         ['https://sub.id.ezil.work/', 'other'],
+        ['https://id.ezil.work.evil.example/', 'other'],
+        ['http://example.com/id.ezil.work', 'other'],
+        ['http://universe-staging.ezil.work/builder', 'other'],
         ['https://example.com/', 'other'],
         ['about:blank', 'other'],
         ['data:text/html,hi', 'other'],
@@ -258,6 +269,24 @@ describe('tierOf', () => {
 
     it('answers exactly one of ORIGIN_TIERS', () => {
         for (const [url] of cases) expect(ORIGIN_TIERS).toContain(tierOf(url, STAGING));
+    });
+
+    it('an owner origin on an IdP HOST (another port) is an overlap: idp_transit, logged', () => {
+        const policy = loadOriginPolicy({
+            [ORIGIN_TIER_ENV.owner_app]: `${OWNER},https://id.ezil.work:8443`,
+            [ORIGIN_TIER_ENV.idp_transit]: IDP,
+        });
+        expect(policy.broken).toBe(false);
+        expect(policy.owner_app).toEqual([OWNER]);
+        expect(policy.overlap).toEqual(['https://id.ezil.work:8443']);
+        expect(tierOf('https://id.ezil.work:8443/app', policy)).toBe('idp_transit');
+        expect(tierOf(`${OWNER}/builder`, policy)).toBe('owner_app');
+    });
+
+    it('an http IdP URL is sanitised to its transit form like an https one', () => {
+        expect(sanitizeUrl('http://id.ezil.work/authorize?state=Y&nonce=Z', STAGING)).toBe('http://id.ezil.work/authorize');
+        expect(sanitizeUrl('wss://id.ezil.work/socket?ticket=t', STAGING)).toBe('wss://id.ezil.work/socket');
+        expect(sanitizeUrl('http://example.com/a?b=1', STAGING)).toBe('http://example.com/a?b=1');
     });
 });
 

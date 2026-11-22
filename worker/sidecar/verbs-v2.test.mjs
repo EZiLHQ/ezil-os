@@ -297,6 +297,26 @@ describe('idp_transit: transit only', () => {
         expect(idp.currentUrl).toBe('https://id.ezil.work/u/login?state=abc');
     });
 
+    it('the IdP is transit-only whatever the scheme: an http:// IdP page refuses too', async () => {
+        const REFUSING = Object.keys(SIDECAR_WIRE).filter((r) => !['GET /health', 'POST /navigate', 'POST /wait_for'].includes(r));
+        for (const url of ['http://id.ezil.work/u/login?state=s', 'https://id.ezil.work:8443/u/login']) {
+            const page = new FakePage(url);
+            const surface = surfaceOver([page]);
+            mintRefs(surface, page);
+            for (const route of REFUSING) {
+                expect({ url, route, code: await codeOf(VERBS[route](surface, BODY[route])) }).toEqual({ url, route, code: 'origin_read_only' });
+            }
+            expect(page.actions).toEqual([]);
+        }
+        // Positive control: an http page on another host is `other`.
+        const page = new FakePage('http://example.com/form');
+        const surface = surfaceOver([page]);
+        mintRefs(surface, page);
+        for (const route of REFUSING) {
+            expect({ route, code: await codeOf(VERBS[route](surface, BODY[route])) }).toEqual({ route, code: 'ok' });
+        }
+    });
+
     it('the tier is read immediately before acting: a page that moved ONTO the IdP is refused', async () => {
         const page = new FakePage(OWNER_PAGE);
         const surface = surfaceOver([page]);
