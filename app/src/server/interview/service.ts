@@ -96,7 +96,10 @@ export async function consentAccept(db: InterviewDb, input: {
     if (!isCandidate(row, { osUserId: input.osUserId, ezilIdSubject })) return refuse(404, 'repo_not_found', 'Repository not found.');
     if (input.noticeVersion !== NOTICE_VERSION || input.noticeSha256 !== NOTICE_SHA256) return refuse(409, 'notice_mismatch', 'The recording notice has changed; reload to read it again.');
     const result = await acceptConsent(db, {
-        interviewId: input.interviewId, osUserId: input.osUserId, ezilIdSubject: ezilIdSubject ?? row.ezilIdSubject ?? '',
+        // The bound identity-tuple subject is always the Works owner's EZiL ID subject (contract §1; the candidate
+        // IS the owner). It is a non-null 1-255-char column, so never the empty-string fallback the old expression
+        // risked; `ezilIdSubject` above only decides candidate recognition before consent.
+        interviewId: input.interviewId, osUserId: input.osUserId, ezilIdSubject: row.ownerEzilIdSubject,
         noticeSha256: NOTICE_SHA256, noticeVersion: NOTICE_VERSION, at: input.now(),
     });
     switch (result.kind) {

@@ -142,6 +142,17 @@ describe.skipIf(!MODULE)('interview evidence on offline PostgreSQL', () => {
         expect(code(await consentAccept(db, { gateOn: true, osUserId: OS_USER, subject: subjectOf(OWNER), interviewId, noticeVersion: 1, noticeSha256: NOTICE_SHA256, now }))).toBe('interview_state');
     });
 
+    it('O6: consent binds the owner EZiL ID subject into the identity tuple (never the empty string)', async () => {
+        const { interviewId } = await mk('consented'); // candidate subjectOf(OWNER) has accepted; owner subject = OWNER
+        // The row's bound ezil_id_subject is the owner's subject, a non-empty 1-255-char value.
+        const bound = String((await rows(sql`SELECT ezil_id_subject FROM ezil_interviews WHERE interview_id = ${interviewId}::uuid`))[0]!.ezil_id_subject);
+        expect(bound).toBe(OWNER);
+        expect(bound.length).toBeGreaterThan(0);
+        // The admin identity tuple exposes the same owner subject (not '', not null).
+        const got = await adminGetJson(interviewId) as { identity: { ezilIdSubject: string | null } };
+        expect(got.identity.ezilIdSubject).toBe(OWNER);
+    });
+
     it('events: a validated batch writes same-at rows; a turn_end derives turn_start (seq n, n+1); a repeated requestId is dropped', async () => {
         const { interviewId } = await mk('started'); // consent.accepted (seq 1), interview.started (seq 2)
         const batch = await eventsBatch(db, { gateOn: true, osUserId: OS_USER, interviewId, now: () => '2026-11-22T09:06:40.000Z', events: [
