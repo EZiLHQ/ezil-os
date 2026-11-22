@@ -21,7 +21,7 @@ import {
     FIELD_VALUE_MAX_CHARS, FILL_FORM_MAX_FIELDS, ORIGIN_TIER_ENV, PRESS_KEYS, SCROLL_MAX_DY, SELECT_MAX_VALUES,
     SIDECAR_WIRE,
 } from './contract.mjs';
-import { loadOriginPolicy } from './origin-policy.mjs';
+import { loadOriginPolicy, sanitizeText } from './origin-policy.mjs';
 import {
     containsText, fieldState, pageMarkdown, passwordValues, scrollWindowBy, selectState, snapshotPage, windowScrollY,
 } from './page-scripts.mjs';
@@ -562,7 +562,12 @@ describe('no OAuth parameter leaves in any handler output', () => {
             const relative = `${u.pathname}${u.search}${u.hash}`;
             const escaped = pageUrl.replace(/\//g, '\\/');
             page.titleText = `Signed in: ${pageUrl} (${escaped})`;
-            page.text = `Builder: continue at ${pageUrl} or [back](${relative}) or [again](${pageUrl}).`;
+            page.text = `Builder: continue at ${pageUrl} or [back](${relative}) or [again](${pageUrl}).`
+                // The review's free-text shapes (amended 2026-11-22), with the distinctive values.
+                + ' | x|/cb?code=AUTHCODEq7Rk| a,/cb?code=AUTHCODEq7Rk Callback:/cb?state=STATEw3Lp'
+                + ' **/cb?code=AUTHCODEq7Rk** >/cb?code=AUTHCODEq7Rk ezil://cb?code=AUTHCODEq7Rk'
+                + ' code=AUTHCODEq7Rk&state=STATEw3Lp [go](callback?code=AUTHCODEq7Rk&state=STATEw3Lp)'
+                + ' redirect_uri=https%3A%2F%2Fu.example%2Fcb%3Fcode%3DAUTHCODEq7Rk';
             page.elements.set('e7', { ref: 'e7', role: 'link', name: `Return to ${pageUrl}`, tag: 'a' });
             page.elements.get('e3').optionValues = ['hour', pageUrl];
 
@@ -604,7 +609,8 @@ describe('no OAuth parameter leaves in any handler output', () => {
                 expect(snapshot).toContain(`- link "Return to ${sanitized}" [ref=e7]`);
                 expect(title).toContain(sanitized);
                 const { markdown } = outputs.find((o) => o.route === 'POST /get_text').out;
-                expect(markdown).toBe(`# Builder: continue at ${sanitized} or [back](${path}) or [again](${sanitized}).`);
+                expect(markdown.startsWith(`# Builder: continue at ${sanitized} or [back](${path}) or [again](${sanitized}).`)).toBe(true);
+                expect(markdown).toContain(' | x|/cb?| a,/cb? Callback:/cb? **/cb? >/cb? ezil://cb & [go](callback?&) ');
                 expect(outputs.find((o) => o.route === 'POST /select').out.selected).toEqual([sanitized]);
                 const { entries } = outputs.find((o) => o.route === 'POST /console').out;
                 const { requests } = outputs.find((o) => o.route === 'POST /network').out;
@@ -641,6 +647,67 @@ describe('no OAuth parameter leaves in any handler output', () => {
             'https://u.example/cb/x',
             'https://universe-staging.ezil.work/creator/social-login/callback/auth0',
         ]);
+    });
+});
+
+// ── get_text markdown: hrefs are resolved before they are sanitised ─────────
+
+/**
+ * Just enough DOM for `pageMarkdown` (which runs in the page): elements with
+ * tag, children, attributes and — for <a> — the browser's resolved `href`.
+ */
+function fakeDocument (base, build) {
+    const style = { display: 'block', visibility: 'visible' };
+    const doc = { defaultView: { getComputedStyle: () => style } };
+    const text = (t) => ({ nodeType: 3, textContent: t });
+    const el = (tag, attrs = {}, ...kids) => {
+        const node = {
+            nodeType: 1,
+            tagName: tag.toUpperCase(),
+            ownerDocument: doc,
+            childNodes: kids,
+            children: kids.filter((k) => k.nodeType === 1),
+            getAttribute: (name) => (name in attrs ? attrs[name] : null),
+            hasAttribute: (name) => name in attrs,
+            querySelectorAll: () => [],
+            get textContent () { return kids.map((k) => k.textContent).join(''); },
+        };
+        if (tag === 'a' && 'href' in attrs) {
+            Object.defineProperty(node, 'href', { get: () => (attrs.svg ? { baseVal: attrs.href } : new URL(attrs.href, base).href) });
+        }
+        return node;
+    };
+    doc.body = build(el, text);
+    doc.querySelector = () => null;
+    return doc;
+}
+
+describe('get_text: pageMarkdown renders RESOLVED hrefs, which sanitizeText then cleans', () => {
+    const BASE = 'https://universe-staging.ezil.work/creator/social-login/start';
+
+    function markdownOf (build) {
+        const saved = globalThis.document;
+        globalThis.document = fakeDocument(BASE, build);
+        try {
+            return pageMarkdown({ maxChars: 4000 });
+        } finally {
+            globalThis.document = saved;
+        }
+    }
+
+    it('a relative href with code/state becomes an absolute URL, then loses its query', () => {
+        const md = markdownOf((el, text) => el('body', {}, el('p', {},
+            text('Go '), el('a', { href: 'callback?code=AUTHCODEq7Rk&state=STATEw3Lp' }, text('back')), text(' now'))));
+        expect(md).toBe('Go [back](https://universe-staging.ezil.work/creator/social-login/callback?code=AUTHCODEq7Rk&state=STATEw3Lp) now');
+        expect(sanitizeText(md, STAGING)).toBe('Go [back](https://universe-staging.ezil.work/creator/social-login/callback) now');
+    });
+
+    it('positive controls: a harmless link stays whole; an SVG <a> keeps its attribute as written', () => {
+        const md = markdownOf((el, text) => el('body', {}, el('p', {},
+            el('a', { href: '../jobs?page=2' }, text('jobs')), text(' and '),
+            el('a', { href: '#icon', svg: true }, text('icon')))));
+        expect(md).toBe('[jobs](https://universe-staging.ezil.work/creator/jobs?page=2) and [icon](#icon)');
+        expect(sanitizeText(md, STAGING)).toBe(md);
     });
 });
 

@@ -476,6 +476,74 @@ describe('sanitizeUrl: the decoded remainder after the origin (amended 2026-11-2
     });
 });
 
+describe('sanitizeText: no sensitive name=value run survives (amended 2026-11-22)', () => {
+    const ZWSP = String.fromCharCode(0x200b);
+
+    // The independent review's cases, exactly.
+    const REVIEW = [
+        ['[go](callback?code=SECRET&state=S2)', '[go](callback?&)'],
+        ['x|/cb?code=SECRET|', 'x|/cb?|'],
+        ['a,/cb?code=SECRET', 'a,/cb?'],
+        ['Callback:/cb?code=SECRET', 'Callback:/cb?'],
+        ['**/cb?code=SECRET**', '**/cb?'],
+        ['>/cb?code=SECRET', '>/cb?'],
+        ['ezil://cb?code=SECRET', 'ezil://cb'],
+        ['code=SECRET&state=S2', '&'],
+    ];
+    for (const [text, out] of REVIEW) {
+        it(`${text} -> ${out}`, () => {
+            expect(sanitizeText(text, STAGING)).toBe(out);
+        });
+    }
+
+    it('takes the name too, quoted and spaced values with it, and sees through invisible characters', () => {
+        const cases = [
+            ['token="abc def" next', ' next'],
+            ["state='a b' next", ' next'],
+            ['Token = abc', ''],
+            ['access_token=t1;x', ''],
+            ['code[]=a&b=1', '&b=1'],
+            ['auth_code=SECRET', 'auth_'],
+            [`co${ZWSP}de=SECRET`, ''],
+            [`code${ZWSP}=SECRET`, ''],
+            ['jwt=e30.e30.sig and AccessToken=x', ' and '],
+        ];
+        for (const [text, out] of cases) {
+            expect({ text, out: sanitizeText(text, STAGING) }).toEqual({ text, out });
+        }
+    });
+
+    it('drops a percent-encoded token whose decoded form carries one (outside any URL)', () => {
+        expect(sanitizeText('see redirect_uri=https%3A%2F%2Fx%2Fcb%3Fcode%3DSECRET ok', STAGING)).toBe('see  ok');
+        expect(sanitizeText('next=%2Fcb%3Fstate%3DS2 done', STAGING)).toBe(' done');
+    });
+
+    it('positive controls: look-alikes, snapshot markup, prose and harmless escapes are untouched', () => {
+        for (const text of [
+            'xcode=1 decode=2 barcode=3 statement=4 tokens=5 codes=6',
+            '- textbox "Email" [ref=e5] [level=2] [type=password]',
+            'the state is ready; enter the code below',
+            'page=2&sort=asc',
+            '100%25 sure, a%20b, %E2%80%8B',
+            '{"state":"x"}',
+        ]) {
+            expect(sanitizeText(text, STAGING)).toBe(text);
+        }
+    });
+
+    it('the limit, stated: a JSON `"name":"value"` pair is not a `name=` run and stays', () => {
+        // Neither a URL nor `name=`: pass 3 does not read it. Recorded so it is a decision.
+        expect(sanitizeText('{"code":"SECRET"}', STAGING)).toBe('{"code":"SECRET"}');
+    });
+
+    it('stays linear on long runs (a 200k-character word and 20k escapes)', () => {
+        const big = `${'A'.repeat(200_000)} ${'B%20'.repeat(20_000)}`;
+        const started = Date.now();
+        expect(sanitizeText(big, STAGING)).toBe(big);
+        expect(Date.now() - started).toBeLessThan(2000);
+    });
+});
+
 describe('sanitizeText', () => {
     it('sanitises every http(s) URL inside free text and keeps the rest', () => {
         const text = `redirecting to ${AUTHORIZE_URL} then "${CALLBACK_URL}" (see https://example.com/help?topic=1)`;
@@ -526,10 +594,8 @@ describe('sanitizeText', () => {
         }
     });
 
-    it('the limit, stated: a `?code=` glued mid-word is not a reference and stays', () => {
-        // Not a URL and not a reference (no boundary before the `/`), so
-        // neither pass can tell it from prose. Recorded so it is a decision.
-        expect(sanitizeText('a/b?code=1', STAGING)).toBe('a/b?code=1');
+    it('a `?code=` glued mid-word is not a reference, but pass 3 still removes the run', () => {
+        expect(sanitizeText('a/b?code=1', STAGING)).toBe('a/b?');
     });
 
     it('trailing punctuation and closing brackets stay outside the URL', () => {

@@ -392,9 +392,10 @@ export function sanitizeUrl (url, policy) {
  * Free text as it may leave: console lines, snapshot text, `get_text`
  * markdown, titles, option values.
  *
- * Pass 1, absolute URLs: every `http(s)://…` through `sanitizeUrl`, including
- * the JSON-escaped form (`https:\/\/host\/cb?code=…`, PHP's default), which is
- * unescaped to sanitise and re-escaped only if something was removed.
+ * Pass 1, absolute URLs: every `scheme://…` (`https:`, `wss:`, `ezil:`, …)
+ * through `sanitizeUrl`, including the JSON-escaped form
+ * (`https:\/\/host\/cb?code=…`, PHP's default), which is unescaped to
+ * sanitise and re-escaped only if something was removed.
  *
  * Pass 2, relative references, because markdown carries the page's raw
  * `href`s and most are relative: `/cb?code=…`, `./cb?state=…`, `?code=…`,
@@ -404,12 +405,35 @@ export function sanitizeUrl (url, policy) {
  * sensitive parameter (always, under a broken policy); `//host…` goes through
  * `sanitizeUrl` as if it were `https:`.
  *
+ * Pass 3 (amended 2026-11-22), whatever is left: every sensitive `name=value`
+ * run is removed, name and all, so no `code=` text survives in any shape —
+ * `x|/cb?code=…|`, `Callback:/cb?code=…`, a bare `code=…&state=…`. The value
+ * ends at `&`, whitespace, `#`, `)`, `]`, `|`, a quote, `<` or `>`; a quoted
+ * value goes with its quotes, and a name split by invisible characters is
+ * still a name.
+ *
+ * Pass 4: a percent-encoded token that decodes to a sensitive assignment
+ * (`redirect_uri=https%3A%2F%2Fx%2Fcb%3Fcode%3D…` outside any URL) is removed.
+ *
  * A URL ends at whitespace, a quote, `<`, `>` or a backtick. Trailing sentence
  * punctuation and an unbalanced `)` or `]` are not part of it, so
  * `[label](https://…?code=…)` keeps its closing bracket.
  */
-const ABSOLUTE_URL_IN_TEXT = /https?:(?:\/\/|\\\/\\\/)[^\s"'<>`]+/gi;
+// The scheme is bounded (RFC 3986 schemes are short) so a long run of letters
+// cannot make this quadratic.
+const ABSOLUTE_URL_IN_TEXT = /[a-z][a-z0-9+.-]{0,31}:(?:\/\/|\\\/\\\/)[^\s"'<>`]+/gi;
 const RELATIVE_REF_IN_TEXT = /(^|[\s"'(\[<=])((?:\\?\/|\.\.?\\?\/|[?#])[^\s"'<>`]*)/g;
+
+/** Any run of default-ignorable (invisible) characters, for the loose names below. */
+const INVISIBLES = '\\p{Default_Ignorable_Code_Point}*';
+const LOOSE_NAMES = SENSITIVE_ASSIGNMENT_NAMES.map((name) => [...name].join(INVISIBLES)).join('|');
+const SENSITIVE_RUN = new RegExp(
+    `(?<![A-Za-z0-9])(?:${LOOSE_NAMES})(?:\\[\\])?[\\s\\p{Default_Ignorable_Code_Point}]*=[ \\t]*`
+    + `(?:"[^"]*"|'[^']*'|[^&\\s#)\\]|"'\`<>]*)`,
+    'giu',
+);
+/** Whitespace- and quote-delimited tokens; pass 4 only reads the ones with a `%`. */
+const TEXT_TOKEN = /[^\s"'<>`]+/g;
 
 const occurrences = (s, ch) => s.split(ch).length - 1;
 
@@ -468,11 +492,13 @@ export function sanitizeText (text, policy) {
         const out = throughEscapes(url, (plain) => sanitizeUrl(plain, policy));
         return out === url ? match : out + trailer;
     });
-    return absolute.replace(RELATIVE_REF_IN_TEXT, (all, lead, ref) => {
+    const relative = absolute.replace(RELATIVE_REF_IN_TEXT, (all, lead, ref) => {
         const [core, trailer] = splitTrailer(ref);
         const out = throughEscapes(core, (plain) => sanitizeRelative(plain, sets, policy));
         return out === core ? all : lead + out + trailer;
     });
+    const runs = relative.replace(SENSITIVE_RUN, '');
+    return runs.replace(TEXT_TOKEN, (token) => (token.includes('%') && carriesSensitive(token) ? '' : token));
 }
 
 /**

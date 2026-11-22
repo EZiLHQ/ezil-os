@@ -280,7 +280,12 @@ export function pageMarkdown (options) {
                 if (style && (style.display === 'none' || style.visibility === 'hidden')) continue;
                 if (tag === 'script' || tag === 'style' || tag === 'noscript') continue;
                 if (tag === 'a' && node.hasAttribute('href')) {
-                    s += '[' + inlineOf(node).trim() + '](' + node.getAttribute('href') + ')';
+                    // The RESOLVED href — absolute, against the page's base URL —
+                    // so the sidecar's URL sanitising reads a whole URL rather
+                    // than `callback?code=…`. (An SVG <a>'s `href` is not a string:
+                    // its attribute is used as written.)
+                    const href = typeof node.href === 'string' && node.href ? node.href : node.getAttribute('href');
+                    s += '[' + inlineOf(node).trim() + '](' + href + ')';
                 } else if (tag === 'strong' || tag === 'b') {
                     s += '**' + inlineOf(node).trim() + '**';
                 } else if (tag === 'em' || tag === 'i') {
