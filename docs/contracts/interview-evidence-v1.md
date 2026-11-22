@@ -297,3 +297,17 @@ vectors (`version` 1.0.1) carry the added refusal codes.
   telemetry row's), the same instant `prompt.captured` uses for that request, and the consent window is applied to
   that same instant. `computer.opened` records that the open gate allowed an open; it is written before the mint
   and grant, so a later failure of that open still leaves the event.
+
+## Erratum 1.0.2 (2026-11-22, the lead): interview image turns
+
+- **E9 (§3 `prompt.captured`, §8 capture).** With Claude image input on, an interview member's request may carry
+  image blocks. The gateway still captures that request, but stores it with every image block (top level or inside a
+  `tool_result`) replaced by `{"type":"image_omitted","media_type":<string|null>,"bytes":<integer|null>}`:
+  - `bytes` is the decoded image size, or null when the source is not inline;
+  - no image bytes, base64 or image URL are stored, and redaction happens before the 2 MB cap.
+  `prompt.captured.data` gains one OPTIONAL key, `imagesOmitted` (integer ≥ 1): the number of placeholders in the
+  stored request. It is absent when no image was omitted (so a text turn is unchanged) and absent on a purged capture.
+  The timeline labels such a turn "prompt captured without images (n)".
+  The record keeps less than notice v1 discloses (images are not kept), so the notice bytes stay as they are.
+  Project-key captures still skip image requests. Consent checks and 14-day retention are unchanged.
+  The vectors (`version` 1.0.2) carry `envelope.validImagesOmitted`, `imagePlaceholder`, and two invalid cases.

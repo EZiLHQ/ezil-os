@@ -52,7 +52,7 @@ const ANNOTATIONS = new Set(["$schema", "$id", "title", "description", "$defs"])
 const KEYWORDS = new Set([
 	"$ref", "oneOf", "if", "then", "else", "const", "enum", "type", "pattern", "minLength",
 	"maxLength", "minimum", "maximum", "required", "properties", "additionalProperties",
-	"items", "minItems", "maxItems",
+	"items", "minItems", "maxItems", "not",
 ]);
 
 const isObject = (v) => typeof v === "object" && v !== null && !Array.isArray(v);
@@ -173,6 +173,9 @@ export function validateSchema(schema, root, value, path = "$", hooks = {}) {
 		} else if (matched > 1) {
 			fail("oneOf", `${matched} branches matched, exactly one allowed`);
 		}
+	}
+	if (schema.not !== undefined && validateSchema(schema.not, root, value, path, hooks).length === 0) {
+		fail("not", `must not match ${JSON.stringify(schema.not)}`);
 	}
 	if (schema.if !== undefined) {
 		const holds = validateSchema(schema.if, root, value, path, hooks).length === 0;
@@ -470,7 +473,9 @@ function summary(event) {
 		case "agent.turn_end": return `request ${d.requestId}, ${d.modelAlias}, ${d.outcome}, ${d.durationMs} ms, tools read ${d.toolCalls.read} search ${d.toolCalls.search} write ${d.toolCalls.write} other ${d.toolCalls.other}`;
 		case "model.request": return `request ${d.requestId}, ${d.modelAlias}, ${d.outcome}, tokens in ${d.tokens.input ?? "-"} out ${d.tokens.output ?? "-"}, total ${d.totalMs ?? "-"} ms`;
 		case "prompt.captured": {
-			const sizes = `request ${d.reqBytes} B, response ${d.respBytes} B${d.truncated ? ", truncated" : ""}`;
+			// Erratum E9: an interview image turn is stored with its images replaced by placeholders.
+			const images = d.imagesOmitted ? `, prompt captured without images (${d.imagesOmitted})` : "";
+			const sizes = `request ${d.reqBytes} B, response ${d.respBytes} B${d.truncated ? ", truncated" : ""}${images}`;
 			if (d.purged || !d.content) return `${d.endpoint}, ${sizes}, purged`;
 			const text = lastUserText(d.endpoint, d.content.request);
 			if (text === null) return `${d.endpoint}, ${sizes}, last user message: (no text)`;

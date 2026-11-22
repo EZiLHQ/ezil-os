@@ -1,7 +1,7 @@
 {
   "contract": "ezil.interview.evidence.v1",
-  "version": "1.0.1",
-  "status": "Frozen 2026-11-21 for RUN-1121 WS1 by the lead. Staging only. 1.0.1 (2026-11-22): errata E1-E8 in the doc (refusal codes added; no interface or type change).",
+  "version": "1.0.2",
+  "status": "Frozen 2026-11-21 for RUN-1121 WS1 by the lead. Staging only. 1.0.1 (2026-11-22): errata E1-E8 in the doc (refusal codes added; no interface or type change). 1.0.2 (2026-11-22): erratum E9, optional prompt.captured.imagesOmitted for interview image turns.",
   "doc": "docs/contracts/interview-evidence-v1.md",
   "schema": "docs/contracts/interview-evidence-v1.schema.json",
   "notice": {
@@ -1051,6 +1051,58 @@
         }
       },
       {
+        "why": "imagesOmitted 0 (absent when no image was omitted)",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "gateway",
+          "seq": 2,
+          "type": "prompt.captured",
+          "at": "2026-11-22T09:08:00.000Z",
+          "data": {
+            "requestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "endpoint": "messages",
+            "truncated": false,
+            "reqBytes": 5120,
+            "respBytes": 2048,
+            "purged": false,
+            "content": {
+              "request": {
+                "messages": [
+                  {
+                    "role": "user",
+                    "content": "Add a test for parse()"
+                  }
+                ]
+              },
+              "response": "event: message_start\n..."
+            },
+            "imagesOmitted": 0
+          }
+        }
+      },
+      {
+        "why": "imagesOmitted on a purged capture",
+        "event": {
+          "v": 1,
+          "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+          "source": "gateway",
+          "seq": 2,
+          "type": "prompt.captured",
+          "at": "2026-11-22T09:08:00.000Z",
+          "data": {
+            "requestId": "e1d2c3b4-a5f6-4789-8a0b-1c2d3e4f5a6b",
+            "endpoint": "messages",
+            "truncated": false,
+            "reqBytes": 5120,
+            "respBytes": 2048,
+            "purged": true,
+            "content": null,
+            "imagesOmitted": 1
+          }
+        }
+      },
+      {
         "why": "attribution assignment (dropped in this slice)",
         "event": {
           "v": 1,
@@ -1077,7 +1129,53 @@
           }
         }
       }
+    ],
+    "validImagesOmitted": [
+      {
+        "v": 1,
+        "interviewId": "7c1f3f0e-5b8a-4c2d-9e41-0a6b2d9f8e13",
+        "source": "gateway",
+        "seq": 3,
+        "type": "prompt.captured",
+        "at": "2026-11-22T09:12:00.000Z",
+        "data": {
+          "requestId": "c4b3a2f1-6e5d-4c7b-9a8f-0e1d2c3b4a59",
+          "endpoint": "messages",
+          "truncated": false,
+          "reqBytes": 1840,
+          "respBytes": 2210,
+          "purged": false,
+          "imagesOmitted": 1,
+          "content": {
+            "request": {
+              "messages": [
+                {
+                  "role": "user",
+                  "content": [
+                    {
+                      "type": "text",
+                      "text": "What does this error mean?"
+                    },
+                    {
+                      "type": "image_omitted",
+                      "media_type": "image/png",
+                      "bytes": 48213
+                    }
+                  ]
+                }
+              ]
+            },
+            "response": "event: message_start\n..."
+          }
+        }
+      }
     ]
+  },
+  "imagePlaceholder": {
+    "type": "image_omitted",
+    "media_type": "image/png",
+    "bytes": 48213,
+    "rule": "erratum E9: an interview member's image block is stored as {type:'image_omitted', media_type, bytes}; bytes is the decoded size or null; no image bytes, base64 or URL is stored; prompt.captured carries imagesOmitted = the number of placeholders, absent when 0 or when purged"
   },
   "timeline": {
     "valid": {

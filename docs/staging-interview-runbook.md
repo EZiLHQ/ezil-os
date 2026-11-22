@@ -128,6 +128,12 @@ stderr and the exit code is 1. The CLI refuses to write if the output would cont
 Prompts appear as byte sizes plus at most 200 characters of the last user message; the full prompts are in
 `timeline.json`. It states that the record is not scored.
 
+When the candidate sends an image (a screenshot pasted into EZiL Chat, for example), the gateway keeps the turn's
+text but never the image. Each image is stored as `{"type":"image_omitted","media_type":…,"bytes":…}`, and the event
+carries `imagesOmitted`. `timeline.md` labels that turn "prompt captured without images (n)" (contract erratum E9).
+An export from a gateway built before that change has no `prompt.captured` at all for an image turn; only its
+`model.request` appears.
+
 ## Check the export
 
 ```sh

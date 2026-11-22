@@ -98,7 +98,16 @@ describe("validate: the vectors", () => {
 		"grant not presence-gated": /^\$\.data\.presenceGated: const: must equal true/,
 		"purged capture with content": /^\$\.data\.content: type: must be null .*\(if\/then\)/,
 		"attribution assignment (dropped in this slice)": /^\$\.data\.attribution: const: must equal "subject_window"/,
+		"imagesOmitted 0 (absent when no image was omitted)": /^\$\.data\.imagesOmitted: minimum: must be >= 1 \(got 0\)/,
+		"imagesOmitted on a purged capture": /^\$\.data: not: must not match \{"required":\["imagesOmitted"\]\} \(if\/then\)/,
 	};
+
+	test("an interview image turn with imagesOmitted is a valid prompt.captured (erratum E9)", () => {
+		assert.ok(vectors.envelope.validImagesOmitted.length > 0);
+		for (const event of vectors.envelope.validImagesOmitted) assert.deepEqual(validateEvent(event), [], event.data.requestId);
+		const stored = JSON.stringify(vectors.envelope.validImagesOmitted[0].data.content);
+		assert.ok(stored.includes('"type":"image_omitted"') && !stored.includes("base64") && !stored.includes("data:"));
+	});
 
 	test("every envelope.invalid event is rejected, naming its rule", () => {
 		const invalid = vectors.envelope.invalid;
@@ -415,6 +424,14 @@ describe("timeline.md", () => {
 		assert.deepEqual(ats, [...ats].sort());
 		assert.match(rows[0], /repo\.created/);
 		assert.match(renderMarkdown(VALID), /None recorded\./);
+	});
+
+	test("an image turn is labelled 'prompt captured without images (n)'; a text turn is not (erratum E9)", () => {
+		const image = vectors.envelope.validImagesOmitted[0];
+		const md = renderMarkdown(withPrompt({ ...clone(image.data) }));
+		assert.match(md, /prompt captured without images \(1\)/);
+		assert.match(md, /last user message: "What does this error mean\?"/);
+		assert.doesNotMatch(renderMarkdown(VALID), /without images/);
 	});
 
 	test("a prompt shows byte sizes and at most 200 characters of the last user message, nothing of the response", () => {
