@@ -159,7 +159,9 @@ as a separate UID with CDP behind a socket only the sidecar can read is out of s
 
 ## 9. Acceptance
 
-- **A1** `cd worker/sidecar && bun test` passes; served routes equal `SIDECAR_WIRE`; `FORBIDDEN_VERBS` absent;
+- **A1** `cd worker/sidecar && bun test redaction.test.mjs server.test.mjs wire.test.mjs origin-policy.test.mjs
+  verbs-v2.test.mjs` passes, and `EZIL_TEST_CHROMIUM=<chrome> node --test mcp-*.test.mjs` passes (a bare `bun test`
+  also collects the `node --test` Chromium files and fails on them, as it already did before v2); served routes equal `SIDECAR_WIRE`; `FORBIDDEN_VERBS` absent;
   the pinned v1 JSON is a subset (`EZIL_BROWSER_SIDECAR_CONTRACT` set so the suite runs, not skips).
 - **A2** Policy tests: owner-app forms permitted; `type`, `click`, `screenshot` on an IdP page answer
   `origin_read_only`; no `code=` or `state=` in any output; password values absent; masked PNGs byte-identical.
