@@ -110,6 +110,11 @@
       "path": "app/drizzle/0030_delegation_replay.sql",
       "sha256": "50ff0b0a441ee539ca5d72302443315be1f1812e6b11e4afb2e1af3f575692a7",
       "kind": "snapshot"
+    },
+    {
+      "path": "app/drizzle/0040_assignment_evidence_pilot.sql",
+      "sha256": "0adb9c8f23effe552085e1a913e4a135adafa35a38de256944caa3fc076ac108",
+      "kind": "snapshot"
     }
   ],
   "initialCatalog": {

@@ -40,8 +40,7 @@ beforeAll(async () => {
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'anon') THEN CREATE ROLE anon; END IF;
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'authenticated') THEN CREATE ROLE authenticated; END IF;
     END $$;`);
-    await client.unsafe(await readFile(new URL('../../../drizzle/0034_assignment_evidence_pilot.sql', import.meta.url), 'utf8'));
-    await client.unsafe(await readFile(new URL('../../../drizzle/0035_assignment_evidence_transcripts.sql', import.meta.url), 'utf8'));
+    await client.unsafe(await readFile(new URL('../../../drizzle/0040_assignment_evidence_pilot.sql', import.meta.url), 'utf8'));
     store = evidenceStore(drizzle(client));
 });
 
