@@ -1130,7 +1130,13 @@ launch_toolsd() {
     return 0
   fi
   # Its own log file, NOT $LOG (see launch_browser_sidecar): toolsd logs request
-  # outcomes, never commands, output or keys.
+  # outcomes and the name of a failed check, never headers, commands, output or
+  # keys. Root-only (0600), so jobs running as ezil-run cannot read it.
+  if ! ( umask 077 && : >>"$EZIL_TOOLSD_LOG" ) || ! chmod 0600 "$EZIL_TOOLSD_LOG"; then
+    log "warning: cannot create a root-only computer tools daemon log at $EZIL_TOOLSD_LOG — skipping"
+    phase_end toolsd_launch skipped
+    return 0
+  fi
   log "starting computer tools daemon (node $EZIL_TOOLSD_ENTRY) on 0.0.0.0:${EZIL_TOOLSD_PORT} — log $EZIL_TOOLSD_LOG"
   env -i \
     PATH=/usr/local/bin:/usr/bin:/bin \
