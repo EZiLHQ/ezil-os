@@ -109,6 +109,14 @@ describe('assignment media broker',()=>{
         await expect(recordingAction(identity,input,d)).rejects.toMatchObject({status:409});
         expect(calls.some(x=>x.url.includes('api-staging.'))).toBe(false);
     });
+    it('refuses a previously minted segment whose end falls past a later authoritative submission cutoff', async () => {
+        const d=deps();await recordingAction(identity,begin,d);
+        await expect(recordingAction(identity,input,d)).resolves.toEqual(signed);
+        remoteState={...state,stopRequestedAt:time(initial+4800),stopReason:'submitted'};
+        await expect(recordingAction(identity,{action:'confirm',attemptId:attempt,sequence:0},d)).rejects.toMatchObject({code:'segment_outside_recording'});
+        await expect(recordingAction(identity,{action:'confirm',attemptId:attempt,sequence:1},d)).rejects.toMatchObject({code:'segment_outside_recording'});
+        expect(calls.some(c=>c.url.endsWith('/segments/confirm'))).toBe(false);
+    });
     it('drains real pre-submission slices and refuses all newer frames and expired confirmations',async()=>{
         const d=deps();await recordingAction(identity,begin,d);
         remoteState={...state,stopRequestedAt:time(initial+4500),stopReason:'submitted'};

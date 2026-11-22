@@ -32,11 +32,11 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
         throw failure('invalid_assignment');
     let recording, poll, expiry, disposed = false, stopped = false, misses = 0;
     function clearTimers() { clearTimeout(poll); clearTimeout(expiry); }
-    function stop(reason) {
+    function stop(reason, effectiveAt = null) {
         if (stopped || disposed) return;
         stopped = true;
         clearTimers();
-        if (typeof onStop === 'function') onStop(reason);
+        if (typeof onStop === 'function') onStop(reason, effectiveAt);
     }
     async function control(action, fields = {}) {
         if (disposed) throw failure('transport_disposed');
@@ -45,8 +45,11 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
     async function status() {
         const data = await control('status');
         if (!recording || data.recordingId !== recording.recordingId) throw failure('recording_changed');
-        if (data.revoked || data.stopRequestedAt || data.status !== 'recording')
-            stop(['submitted','timeout','stopped'].includes(data.stopReason) ? data.stopReason : 'stopped');
+        if (data.revoked || data.stopRequestedAt || data.status !== 'recording') {
+            const why = ['submitted','timeout','stopped'].includes(data.stopReason) ? data.stopReason : 'stopped';
+            const cutoff = data.stopRequestedAt ?? (why === 'timeout' ? recording.deadlineAt : null);
+            stop(why, typeof cutoff === 'string' && Number.isFinite(Date.parse(cutoff)) ? cutoff : null);
+        }
         return data;
     }
     async function watch() {
@@ -68,7 +71,7 @@ export function createAssignmentVideoTransport({attemptId, repoOpenProof, consen
             || (recording && recording.recordingId !== data.recordingId)) throw failure('recording_changed');
         recording = data;
         clearTimers();
-        expiry = setTimeout(() => stop('timeout'), Math.min(3600000, deadline-clock()));
+        expiry = setTimeout(() => stop('timeout', data.deadlineAt), Math.min(3600000, deadline-clock()));
         poll = setTimeout(watch, pollMs);
         return data;
     }

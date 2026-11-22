@@ -4,7 +4,7 @@ import type { RetainedIdentity } from '@/server/auth/retained-identity';
 import { boundedJson, checkedPut, drain, eligible, hour, issuer, refuse, started, summary, universeOrigin, worksOrigin, type Input } from './contract';
 
 type Identity = Pick<RetainedIdentity, 'token' | 'issuer' | 'subject' | 'sessionId' | 'expiresAt' | 'userId'>;
-type Capability = { recording: string; token: string; deadline: number };
+type Capability = { recording: string; token: string; deadline: number; preparedEnds: Map<number, number> };
 type Dependencies = { fetcher?: typeof fetch; clock?: () => number; leases?: Map<string, Capability>; signal?: AbortSignal };
 const storage = globalThis as typeof globalThis & { ezilAssignmentMediaLeases?: Map<string, Capability> };
 // The same process already holds the verified OS session identity. A process loss requires a new authenticated begin.
@@ -68,7 +68,9 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
             return refuse('recording_closed', 409);
         }
         if (!leases.has(key) && leases.size >= 2048) return refuse('media_unavailable', 503);
-        leases.set(key, {recording: receipt.recordingId, token: uploadToken, deadline});
+        const previous = leases.get(key);
+        const preparedEnds = previous?.recording === receipt.recordingId && previous.deadline === deadline ? previous.preparedEnds : new Map<number,number>();
+        leases.set(key, {recording: receipt.recordingId, token: uploadToken, deadline, preparedEnds});
         return receipt;
     }
 
@@ -92,6 +94,8 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
     if (input.action === 'confirm') {
         const cutoff = Math.min(entry.deadline, state.stopRequestedAt ? Date.parse(state.stopRequestedAt) : entry.deadline);
         if (clock() > cutoff + drain) return refuse('recording_closed', 409);
+        const preparedEnd = entry.preparedEnds.get(input.sequence);
+        if (preparedEnd === undefined || preparedEnd > cutoff) return refuse('segment_outside_recording', 409);
         const value = await post(segmentPath + '/confirm', {recordingId: state.recordingId, sequence: input.sequence}, entry.token);
         if (!value || typeof value !== 'object' || !('recordingId' in value) || value.recordingId !== state.recordingId
             || !('sequence' in value) || value.sequence !== input.sequence || !('confirmed' in value) || value.confirmed !== true)
@@ -101,9 +105,11 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
     const start = Date.parse(state.startedAt);
     const cutoff = Math.min(entry.deadline, state.stopRequestedAt ? Date.parse(state.stopRequestedAt) : entry.deadline);
     if (clock() > cutoff + drain || input.endMs <= input.startMs || input.endMs - input.startMs > 60000
-        || start + input.endMs > Math.min(clock() + 1500, cutoff)) return refuse('segment_outside_recording', 409);
+        || start + input.endMs > Math.min(clock(), cutoff)) return refuse('segment_outside_recording', 409);
     const {sequence, sha256, byteLength, mimeType, startMs, endMs} = input;
     const signed = await post(segmentPath, {recordingId: state.recordingId, sequence, sha256, byteLength,
         mimeType, startMs, endMs}, entry.token);
-    return checkedPut(signed, identity.subject, state.recordingId, input, clock());
+    const put = checkedPut(signed, identity.subject, state.recordingId, input, clock());
+    entry.preparedEnds.set(input.sequence, start + input.endMs);
+    return put;
 }
