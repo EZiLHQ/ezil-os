@@ -202,7 +202,8 @@ function verbTool(
             },
             annotations: options.readOnly
                 ? { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true }
-                : { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
+                // A click, a submit or an Enter can send or delete something, so these are not marked harmless.
+                : { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
         },
     };
 }

@@ -312,6 +312,7 @@ describe('Code Browser MCP v2 tools', () => {
         ['fill_form', { fields: [{ ref: 'e1', value: 'x'.repeat(4001) }] }, 'fields[0].value must be at most 4000'],
         ['fill_form', { fields: [{ ref: 'e1', value: 'x' }, { ref: 'e2' }] }, 'fields[1].value is required'],
         ['fill_form', { fields: [{ ref: 'e1', value: 'x', extra: 1 }] }, 'unknown property "extra"'],
+        ['fill_form', { fields: [{ ref: 'x1', value: 'v' }] }, 'fields[0].ref must match ^e\\d+$'],
         ['select', { ref: 'e1', values: [] }, 'values must have 1 to 20 items'],
         ['select', { ref: 'e1', values: Array.from({ length: 21 }, () => 'v') }, 'values must have 1 to 20 items'],
         ['select', { ref: 'e1', values: [1] }, 'values[0] must be a string'],
