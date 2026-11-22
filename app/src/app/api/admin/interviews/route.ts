@@ -1,6 +1,6 @@
 import { createTRPCContext } from '@/server/api/trpc';
 import { db } from '@/server/db';
-import { adminAuthzOf, adminRegister } from '@/server/interview/service';
+import { adminAuthzOf, adminBearerPrecheck, adminRegister } from '@/server/interview/service';
 import { shellErrorResponse, shellJson } from '@/server/shell/http';
 import { stagingGitQaAccepted } from '@/server/works/project-repo';
 
@@ -14,6 +14,9 @@ export const dynamic = 'force-dynamic';
 export async function POST(req: Request): Promise<Response> {
     try {
         const gateOn = stagingGitQaAccepted();
+        // E4: require a bearer and never reach createTRPCContext's cookie fallback (a browser cookie cannot drive this).
+        const precheck = adminBearerPrecheck(gateOn, req.headers.get('authorization'));
+        if (precheck) return shellJson(precheck.body, precheck.status);
         let body: unknown = null;
         try { body = await req.json(); } catch { body = null; }
         const ctx = await createTRPCContext({ headers: req.headers });

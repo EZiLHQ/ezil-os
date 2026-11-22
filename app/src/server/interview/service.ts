@@ -157,6 +157,17 @@ function adminGuard(gateOn: boolean, authz: Authz): HandlerResult | null {
     return null;
 }
 
+/**
+ * E4 (§7.1): the OS admin routes require an `Authorization: Bearer` header and must NOT fall back to the Supabase
+ * session cookie, so they cannot be driven from a browser page. The route resolves `createTRPCContext` ONLY when a
+ * bearer is present, so a cookie-only request never reaches the cookie fallback. A6 still wins: a closed gate is 404
+ * for everyone, bearer or not. Returns a short-circuit `{status, body}`, or null to proceed to `createTRPCContext`.
+ */
+export function adminBearerPrecheck(gateOn: boolean, authorization: string | null | undefined): HandlerResult | null {
+    if (typeof authorization === 'string' && /^Bearer[ \t]+\S/i.test(authorization.trim())) return null;
+    return gateOn ? refuse(401, 'unauthorized', 'Sign in to continue.') : GATE_OFF;
+}
+
 export async function adminRegister(db: InterviewDb, input: { gateOn: boolean; authz: Authz; body: unknown }): Promise<HandlerResult> {
     const denied = adminGuard(input.gateOn, input.authz);
     if (denied) return denied;
