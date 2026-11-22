@@ -36,6 +36,7 @@ NLS_JS="$ROOT/out/nls.messages.js"
 NLS_JSON="$ROOT/out/nls.messages.json"
 WB="$ROOT/out/vs/code/browser/workbench/workbench.js"
 PROJECTION="$(dirname -- "${BASH_SOURCE[0]}")/project-explorer.cjs"
+TERMINAL_EVIDENCE="$(dirname -- "${BASH_SOURCE[0]}")/patch-assignment-terminal.cjs"
 SERVER="$ROOT/out/server-main.js"
 NOTICE='/* Modified at build time by EZiL (worker/copilot-chat/patch-copilot-chat.sh, see PATCHES.md): GitHub service calls disabled, strings rebranded "EZiL Chat". Original work: Copyright (c) Microsoft Corporation, MIT License (LICENSE.txt). */'
 
@@ -81,6 +82,118 @@ rows.sort((a,b)=>a[1]<b[1]?-1:a[1]>b[1]?1:0);const h=crypto.createHash("sha256")
 node -e 'const fs=require("fs");const root=process.argv[1];const j=JSON.parse(fs.readFileSync(root+"/extensions/copilot/package.json","utf8"));if(j.publisher!=="GitHub"||j.name!=="copilot-chat"||j.version!=="0.69.0"||!j.contributes?.languageModelChatProviders)throw new Error("expected bundled GitHub.copilot-chat 0.69.0 with languageModelChatProviders");if(!JSON.parse(fs.readFileSync(root+"/product.json","utf8")).defaultChatAgent)throw new Error("defaultChatAgent missing");' "$ROOT"
 
 # ── anchors / replacements (single source of truth for patch + gate) ────────
+# Code conversation evidence. Sample consent before send and recheck the exact
+# arm nonce at each emission. Reply text is taken from the accepted request's
+# own terminal model, never from the last turn in a possibly changed widget.
+A_ASSIGNMENT_CHAT_SEND='let ce;try{ce=await this.chatService.sendRequest(this.viewModel.sessionResource,c.input,{'
+R_ASSIGNMENT_CHAT_SEND='let ce;const ezilTranscriptNonce=r&&!t.preserveInput?ezilAssignmentChatNonce():null;try{ce=await this.chatService.sendRequest(this.viewModel.sessionResource,c.input,{'
+A_ASSIGNMENT_CHAT_ACCEPT='if(ae){if(r&&this.chatPetService.unlockAchievement(Nl.FirstChatMessage)'
+R_ASSIGNMENT_CHAT_ACCEPT='if(ae){if(ezilTranscriptNonce)ezilObserveAssignmentChat(ezilTranscriptNonce,ae.data,c.input);if(r&&this.chatPetService.unlockAchievement(Nl.FirstChatMessage)'
+A_ASSIGNMENT_CHAT_HELPERS='function ezilDispatchAIRequestTrace(record,chatRequestId)'
+R_ASSIGNMENT_CHAT_HELPERS='const ezilAssignmentObservedChats=new Set();
+const ezilAssignmentPendingLinks=new Map();
+let ezilAssignmentChatArm=null;
+function ezilAssignmentChatNonce(){
+  let nonce=null;
+  try{
+    const data=document.documentElement.dataset;
+    const value=data.ezilAssignmentChatNonce;
+    if(data.ezilAssignmentChat==="1" && typeof value==="string" && /^[A-Za-z0-9_-]{22}$/.exec(value)?.[0]===value)nonce=value;
+  }catch{}
+  if(nonce!==ezilAssignmentChatArm){
+    ezilAssignmentChatArm=nonce;
+    ezilAssignmentObservedChats.clear();
+    ezilAssignmentPendingLinks.clear();
+  }
+  return nonce;
+}
+function ezilIsAssignmentChatId(value){
+  return typeof value==="string" && /^request_[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.exec(value)?.[0]===value;
+}
+function ezilEmitAssignmentChat(nonce,kind,chatRequestId,text,overLimit=false){
+  if(ezilAssignmentChatNonce()!==nonce || !ezilIsAssignmentChatId(chatRequestId))return;
+  const detail={kind,chatRequestId};
+  if(overLimit || typeof text==="string" && (text.length>16384 || new TextEncoder().encode(text).byteLength>16384))detail.contentStatus="over_limit";
+  else if(typeof text!=="string" || !text.length)detail.contentStatus="unavailable";
+  else detail.text=text;
+  window.dispatchEvent(new CustomEvent("ezil:assignment-chat",{detail}));
+}
+function ezilObserveAssignmentFinal(nonce,sent,response){
+  return Promise.resolve(sent.responseCompletePromise).then(()=>{
+    if(ezilAssignmentChatNonce()!==nonce || response.isComplete!==true || response.isCanceled===true
+        || response.result?.errorDetails?.responseIsRedacted)return;
+    let text="";
+    for(const part of response.response.value){
+      if(part.kind!=="markdownContent" && part.kind!=="markdownVuln")continue;
+      const value=part.content?.value;
+      if(typeof value!=="string")continue;
+      if(text.length+value.length>16384){ezilEmitAssignmentChat(nonce,"chat.response_completed",response.requestId,null,true);return;}
+      text+=value;
+    }
+    ezilEmitAssignmentChat(nonce,"chat.response_completed",response.requestId,text);
+  });
+}
+function ezilRememberAssignmentChat(chatRequestId){
+  if(ezilAssignmentObservedChats.size>=256)ezilAssignmentObservedChats.delete(ezilAssignmentObservedChats.values().next().value);
+  ezilAssignmentObservedChats.add(chatRequestId);
+  for(const [requestId,chat] of ezilAssignmentPendingLinks){
+    if(chat!==chatRequestId)continue;
+    ezilAssignmentPendingLinks.delete(requestId);
+    ezilAssignmentGatewayLink(chatRequestId,requestId);
+  }
+}
+function ezilObserveAssignmentChat(nonce,sent,submittedText){
+  try{
+    if(ezilAssignmentChatNonce()!==nonce)return;
+    Promise.resolve(sent.responseCreatedPromise).then(response=>{
+      const chatRequestId=response?.requestId;
+      if(ezilAssignmentChatNonce()!==nonce || !ezilIsAssignmentChatId(chatRequestId))return;
+      ezilEmitAssignmentChat(nonce,"chat.prompt_submitted",chatRequestId,submittedText);
+      ezilRememberAssignmentChat(chatRequestId);
+      return ezilObserveAssignmentFinal(nonce,sent,response);
+    }).catch(()=>{});
+  }catch{}
+}
+function ezilObserveAssignmentSetupRetry(chatRequestId,sent){
+  try{
+    const nonce=ezilAssignmentChatNonce();
+    if(!nonce || !ezilAssignmentObservedChats.has(chatRequestId))return;
+    Promise.resolve(sent.responseCreatedPromise).then(response=>{
+      const retryChatRequestId=response?.requestId;
+      if(ezilAssignmentChatNonce()!==nonce || !ezilIsAssignmentChatId(retryChatRequestId))return;
+      if(chatRequestId!==retryChatRequestId){
+        window.dispatchEvent(new CustomEvent("ezil:assignment-chat",{
+          detail:{kind:"chat.request_retried",chatRequestId,retryChatRequestId}
+        }));
+        ezilRememberAssignmentChat(retryChatRequestId);
+      }
+      return ezilObserveAssignmentFinal(nonce,sent,response);
+    }).catch(()=>{});
+  }catch{}
+}
+function ezilAssignmentGatewayLink(chatRequestId,requestId){
+  if(!ezilIsAssignmentChatId(chatRequestId) || !ezilAssignmentChatNonce())return;
+  if(!ezilAssignmentObservedChats.has(chatRequestId)){
+    if(ezilAssignmentPendingLinks.size>=128)ezilAssignmentPendingLinks.delete(ezilAssignmentPendingLinks.keys().next().value);
+    ezilAssignmentPendingLinks.set(requestId,chatRequestId);
+    return;
+  }
+  window.dispatchEvent(new CustomEvent("ezil:assignment-gateway-link",{detail:{chatRequestId,requestId}}));
+}
+function ezilDispatchAIRequestTrace(record,chatRequestId)'
+# Chat setup replaces its provisional response with an explicit service retry.
+A_ASSIGNMENT_SETUP_RETRY='GGi(qGi.DidWaitForActivation),await i.resendRequest(e,{...u?.getModeRequestOptions(),modeInfo:p,...u?.getSelectedModelRequestOptions()})'
+R_ASSIGNMENT_SETUP_RETRY='GGi(qGi.DidWaitForActivation),await i.resendRequest(e,{...u?.getModeRequestOptions(),modeInfo:p,...u?.getSelectedModelRequestOptions(),ezilAssignmentSetupRetry:!0})'
+A_ASSIGNMENT_CHAT_RESEND='await this._sendRequestAsync(n,n.sessionResource,e.message,c,l,h,a,f,g,i?e.id:void 0).responseCompletePromise'
+R_ASSIGNMENT_CHAT_RESEND='let ezilResent=this._sendRequestAsync(n,n.sessionResource,e.message,c,l,h,a,f,g,i?e.id:void 0);if(t?.ezilAssignmentSetupRetry===!0)ezilObserveAssignmentSetupRetry(e.id,ezilResent);await ezilResent.responseCompletePromise'
+# Carry the existing exact Workbench request ID through Copilot's primary
+# tool loop and EZiL model options. Never synthesize one from session or time.
+A_ASSIGNMENT_LOOP='this.options.invocation.endpoint.makeChatRequest2({...n,modeChanged:p,modelCapabilities:'
+R_ASSIGNMENT_LOOP='this.options.invocation.endpoint.makeChatRequest2({...n,ezilAssignmentChatRequestId:!n.isKeepAliveProbe&&!this.options.request.isSystemInitiated&&!this.options.request.subAgentInvocationId&&!this.options.request.parentRequestId&&n.turnId===this.options.request.id?n.turnId:void 0,modeChanged:p,modelCapabilities:'
+# The consented Code evidence bridge asks the active Monaco editor for absolute
+# model ranges. No document text is read, and no listener samples on its own.
+A_ASSIGNMENT_RANGE='r.domNode.domNode.setAttribute("data-uri",e.uri.toString()),t.push(r.onWillCopy'
+R_ASSIGNMENT_RANGE='r.domNode.domNode.setAttribute("data-uri",e.uri.toString()),r.domNode.domNode.addEventListener("ezil:assignment-code-visible-range",event=>{try{if(event.target!==r.domNode.domNode||event.detail?.uri!==e.uri.toString()||this.getModel()!==e||typeof event.detail?.report!=="function")return;const ranges=this.getVisibleRanges();if(ranges.length===1)event.detail.report([ranges[0].startLineNumber,ranges[0].endLineNumber])}catch{}}),t.push(r.onWillCopy'
 # CommandsRegistry (`qe`) has just been initialized; the following `YLi` declaration makes the
 # anchor disappear after insertion. One renderer command, no registration in the extension host.
 A_APP_FAILURE='qe.registerCommand("noop",()=>{});var YLi='
@@ -88,7 +201,7 @@ APP_FAILURE_VALIDATOR='const matches=(v,re)=>typeof v==="string"&&re.exec(v)?.[0
 R_APP_FAILURE='qe.registerCommand("noop",()=>{});function ezilDispatchAppFailure(record){try{'"$APP_FAILURE_VALIDATOR"'if(!record||typeof record!=="object"||Array.isArray(record))return;const clean=Object.create(null);let dropped=false;for(const key of Reflect.ownKeys(record)){if(!keys.has(key)){dropped=true;continue}const desc=Object.getOwnPropertyDescriptor(record,key);if(!desc||!("value" in desc)){dropped=true;continue}const value=desc.value;const type=["attempt","durationMs","httpStatus"].includes(key)?"number":key==="retryable"?"boolean":"string";if(typeof value!==type||(type==="string"&&value.length>64)||(type==="number"&&!Number.isFinite(value))||(type==="number"&&!Number.isInteger(value))){dropped=true;continue}clean[key]=value}if(dropped||!valid(clean))return;window.dispatchEvent(new CustomEvent("ezil-app-failure",{detail:JSON.stringify(clean)}))}catch{}}qe.registerCommand("_ezil.appFailure",(accessor,record)=>{ezilDispatchAppFailure(record)});var YLi='
 # Operational trace command precedes the unchanged consent-only appFailure registration.
 A_AI_REQUEST_TRACE='qe.registerCommand("noop",()=>{});'
-R_AI_REQUEST_TRACE='function ezilDispatchAIRequestTrace(record){try{const validate=function validateInferenceTrace(value, maxBytes = 4096) { try { let nodes = 0; const copy = (v, depth = 0) => { if (++nodes > 2048 || depth > 6 || (typeof v === "string" && v.length > 128)) throw 0; if (v === null || ["string", "boolean", "number", "undefined"].includes(typeof v)) return v; if (typeof v !== "object") throw 0; const array = Array.isArray(v), out = array ? [] : Object.create(null); if (array && (v.length > 128 || Reflect.ownKeys(v).length !== v.length + 1)) throw 0; for (const key of Reflect.ownKeys(v)) { if (array && key === "length") continue; const d = Object.getOwnPropertyDescriptor(v, key); if (typeof key !== "string" || !d || !("value" in d) || !d.enumerable) throw 0; if (array && !/^(0|[1-9][0-9]*)$/.test(key)) throw 0; Object.defineProperty(out, key, { value: copy(d.value, depth + 1), enumerable: true, configurable: true, writable: true }); } return out; }; const r = copy(value); const object = v => v !== null && typeof v === "object" && !Array.isArray(v); const exact = (v, keys) => object(v) && Reflect.ownKeys(v).length === keys.length && keys.every(k => Object.hasOwn(v, k)); const matches = (v, re) => typeof v === "string" && re.exec(v)?.[0] === v; const integer = v => Number.isSafeInteger(v) && v >= 0 && v <= 2147483647; const uuid = v => matches(v, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i); const hash = v => matches(v, /^[0-9a-f]{64}$/); const bool = v => typeof v === "boolean"; const categories = ["read", "search", "write", "other"]; const keys = ["contract","adapterVersion","requestId","turnId","modelAlias","clientRequestId","gatewayRequestId","conversationId","toolCalls","toolResults","observationsTruncated","offered","requested","results","writeRequested","toolReportedSuccess","verifiedFileChange","usage","usageSource","estimatedInputTokens","wireBytes","totalWireBytes","attempts","compaction","finishReason","durationMs","cancelled","outcome","thought_signature_replayed","readHeavyWithoutVerifiedEdit"]; if (!exact(r, keys) || r.contract !== "ezil.inference.v1" || !uuid(r.requestId) || !uuid(r.turnId)) return null; if (!matches(r.adapterVersion, /^\d{1,3}\.\d{1,3}\.\d{1,3}(?:\+carbon-progress\.\d{1,3})?$/)) return null; if (!matches(r.modelAlias, /^(?:unknown|[a-z][a-z0-9_.:-]{0,127})$/i) || /secret|token|passw|bearer|credential|cookie|session|api.?key|^(sk|pk|ghp|github_pat|xoxb)[_-]/i.test(r.modelAlias) || /[a-z0-9]{32,}/i.test(r.modelAlias)) return null; for (const k of ["clientRequestId", "gatewayRequestId"]) if (r[k] !== null && !matches(r[k], /^[a-zA-Z0-9_-]{1,128}$/)) return null; if (r.conversationId !== null && !hash(r.conversationId)) return null; for (const k of ["toolCalls", "toolResults"]) { if (!Array.isArray(r[k]) || r[k].length > 128) return null; for (const item of r[k]) if (!exact(item, k === "toolCalls" ? ["call", "category"] : ["call", "category", "state"]) || !hash(item.call) || !categories.includes(item.category) || (k === "toolResults" && !["error", "reported_success", "unknown"].includes(item.state))) return null; } for (const k of ["offered", "requested"]) if (!exact(r[k], categories) || !Object.values(r[k]).every(integer)) return null; if (!exact(r.results, ["matched", "error", "reportedSuccess", "unknown", "unmatched"]) || !Object.values(r.results).every(integer)) return null; for (const k of ["writeRequested", "toolReportedSuccess", "cancelled", "thought_signature_replayed", "readHeavyWithoutVerifiedEdit", "observationsTruncated"]) if (!bool(r[k])) return null; if (r.verifiedFileChange !== null || r.writeRequested !== (r.requested.write > 0) || r.readHeavyWithoutVerifiedEdit !== (r.requested.read + r.requested.search > 0 && !r.writeRequested)) return null; if (!["completed", "failed", "cancelled"].includes(r.outcome) || r.cancelled !== (r.outcome === "cancelled")) return null; if (!["provider_reported", "unknown"].includes(r.usageSource) || (r.usage === null) !== (r.usageSource === "unknown")) return null; if (r.usage !== null) { const allowed = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "inputIncludesCache", "reasoningTokens"]; if (!object(r.usage) || !Reflect.ownKeys(r.usage).every(k => allowed.includes(k)) || !integer(r.usage.inputTokens) || !integer(r.usage.outputTokens)) return null; for (const k of Reflect.ownKeys(r.usage)) if (r.usage[k] !== undefined && !(k === "inputIncludesCache" ? bool(r.usage[k]) : integer(r.usage[k]))) return null; } for (const k of ["estimatedInputTokens", "totalWireBytes", "attempts", "durationMs"]) if (!integer(r[k])) return null; if (r.wireBytes !== null && !integer(r.wireBytes)) return null; if (r.compaction !== null && (!exact(r.compaction, ["trigger", "count", "folded", "shortened"]) || !["remote", "local_input_too_large", "local_too_many_messages", "local_too_many_blocks"].includes(r.compaction.trigger) || !["count", "folded", "shortened"].every(k => integer(r.compaction[k])))) return null; if (r.finishReason !== null && !["end_turn", "tool_use", "max_tokens", "stop_sequence", "refusal", "stop", "length", "completed", "failed", "incomplete"].includes(r.finishReason)) return null; if (new TextEncoder().encode(JSON.stringify(r)).byteLength > maxBytes) return null; if (!/^(?:(?:us|eu|apac|global|au|jp)[.])?(?:(?:anthropic|openai|google|gemini|vertex|bedrock|azure|moonshotai|zai)[.:])?(?:ezil|claude|gemini|gpt|qwen|kimi|glm|deepseek|mistral|codestral|llama|grok|nova|minimax|command|sonar)[-_.:][a-z0-9_.:-]{1,96}$/i.test(r.modelAlias)) r.modelAlias = "unknown"; for (const k of ["clientRequestId", "gatewayRequestId"]) r[k] = uuid(r[k]) ? r[k].toLowerCase() : null; return JSON.parse(JSON.stringify(r)); } catch { return null; } };const clean=validate(record);if(clean)window.dispatchEvent(new CustomEvent("ezil-ai-request-trace",{detail:JSON.stringify(clean)}))}catch{}}qe.registerCommand("_ezil.aiRequestTrace",(accessor,record)=>{ezilDispatchAIRequestTrace(record)});qe.registerCommand("noop",()=>{});'
+R_AI_REQUEST_TRACE='function ezilDispatchAIRequestTrace(record,chatRequestId){try{const validate=function validateInferenceTrace(value, maxBytes = 4096) { try { let nodes = 0; const copy = (v, depth = 0) => { if (++nodes > 2048 || depth > 6 || (typeof v === "string" && v.length > 128)) throw 0; if (v === null || ["string", "boolean", "number", "undefined"].includes(typeof v)) return v; if (typeof v !== "object") throw 0; const array = Array.isArray(v), out = array ? [] : Object.create(null); if (array && (v.length > 128 || Reflect.ownKeys(v).length !== v.length + 1)) throw 0; for (const key of Reflect.ownKeys(v)) { if (array && key === "length") continue; const d = Object.getOwnPropertyDescriptor(v, key); if (typeof key !== "string" || !d || !("value" in d) || !d.enumerable) throw 0; if (array && !/^(0|[1-9][0-9]*)$/.test(key)) throw 0; Object.defineProperty(out, key, { value: copy(d.value, depth + 1), enumerable: true, configurable: true, writable: true }); } return out; }; const r = copy(value); const object = v => v !== null && typeof v === "object" && !Array.isArray(v); const exact = (v, keys) => object(v) && Reflect.ownKeys(v).length === keys.length && keys.every(k => Object.hasOwn(v, k)); const matches = (v, re) => typeof v === "string" && re.exec(v)?.[0] === v; const integer = v => Number.isSafeInteger(v) && v >= 0 && v <= 2147483647; const uuid = v => matches(v, /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i); const hash = v => matches(v, /^[0-9a-f]{64}$/); const bool = v => typeof v === "boolean"; const categories = ["read", "search", "write", "other"]; const keys = ["contract","adapterVersion","requestId","turnId","modelAlias","clientRequestId","gatewayRequestId","conversationId","toolCalls","toolResults","observationsTruncated","offered","requested","results","writeRequested","toolReportedSuccess","verifiedFileChange","usage","usageSource","estimatedInputTokens","wireBytes","totalWireBytes","attempts","compaction","finishReason","durationMs","cancelled","outcome","thought_signature_replayed","readHeavyWithoutVerifiedEdit"]; if (!exact(r, keys) || r.contract !== "ezil.inference.v1" || !uuid(r.requestId) || !uuid(r.turnId)) return null; if (!matches(r.adapterVersion, /^\d{1,3}\.\d{1,3}\.\d{1,3}(?:\+carbon-progress\.\d{1,3})?$/)) return null; if (!matches(r.modelAlias, /^(?:unknown|[a-z][a-z0-9_.:-]{0,127})$/i) || /secret|token|passw|bearer|credential|cookie|session|api.?key|^(sk|pk|ghp|github_pat|xoxb)[_-]/i.test(r.modelAlias) || /[a-z0-9]{32,}/i.test(r.modelAlias)) return null; for (const k of ["clientRequestId", "gatewayRequestId"]) if (r[k] !== null && !matches(r[k], /^[a-zA-Z0-9_-]{1,128}$/)) return null; if (r.conversationId !== null && !hash(r.conversationId)) return null; for (const k of ["toolCalls", "toolResults"]) { if (!Array.isArray(r[k]) || r[k].length > 128) return null; for (const item of r[k]) if (!exact(item, k === "toolCalls" ? ["call", "category"] : ["call", "category", "state"]) || !hash(item.call) || !categories.includes(item.category) || (k === "toolResults" && !["error", "reported_success", "unknown"].includes(item.state))) return null; } for (const k of ["offered", "requested"]) if (!exact(r[k], categories) || !Object.values(r[k]).every(integer)) return null; if (!exact(r.results, ["matched", "error", "reportedSuccess", "unknown", "unmatched"]) || !Object.values(r.results).every(integer)) return null; for (const k of ["writeRequested", "toolReportedSuccess", "cancelled", "thought_signature_replayed", "readHeavyWithoutVerifiedEdit", "observationsTruncated"]) if (!bool(r[k])) return null; if (r.verifiedFileChange !== null || r.writeRequested !== (r.requested.write > 0) || r.readHeavyWithoutVerifiedEdit !== (r.requested.read + r.requested.search > 0 && !r.writeRequested)) return null; if (!["completed", "failed", "cancelled"].includes(r.outcome) || r.cancelled !== (r.outcome === "cancelled")) return null; if (!["provider_reported", "unknown"].includes(r.usageSource) || (r.usage === null) !== (r.usageSource === "unknown")) return null; if (r.usage !== null) { const allowed = ["inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "inputIncludesCache", "reasoningTokens"]; if (!object(r.usage) || !Reflect.ownKeys(r.usage).every(k => allowed.includes(k)) || !integer(r.usage.inputTokens) || !integer(r.usage.outputTokens)) return null; for (const k of Reflect.ownKeys(r.usage)) if (r.usage[k] !== undefined && !(k === "inputIncludesCache" ? bool(r.usage[k]) : integer(r.usage[k]))) return null; } for (const k of ["estimatedInputTokens", "totalWireBytes", "attempts", "durationMs"]) if (!integer(r[k])) return null; if (r.wireBytes !== null && !integer(r.wireBytes)) return null; if (r.compaction !== null && (!exact(r.compaction, ["trigger", "count", "folded", "shortened"]) || !["remote", "local_input_too_large", "local_too_many_messages", "local_too_many_blocks"].includes(r.compaction.trigger) || !["count", "folded", "shortened"].every(k => integer(r.compaction[k])))) return null; if (r.finishReason !== null && !["end_turn", "tool_use", "max_tokens", "stop_sequence", "refusal", "stop", "length", "completed", "failed", "incomplete"].includes(r.finishReason)) return null; if (new TextEncoder().encode(JSON.stringify(r)).byteLength > maxBytes) return null; if (!/^(?:(?:us|eu|apac|global|au|jp)[.])?(?:(?:anthropic|openai|google|gemini|vertex|bedrock|azure|moonshotai|zai)[.:])?(?:ezil|claude|gemini|gpt|qwen|kimi|glm|deepseek|mistral|codestral|llama|grok|nova|minimax|command|sonar)[-_.:][a-z0-9_.:-]{1,96}$/i.test(r.modelAlias)) r.modelAlias = "unknown"; for (const k of ["clientRequestId", "gatewayRequestId"]) r[k] = uuid(r[k]) ? r[k].toLowerCase() : null; return JSON.parse(JSON.stringify(r)); } catch { return null; } };const clean=validate(record);if(clean){window.dispatchEvent(new CustomEvent("ezil-ai-request-trace",{detail:JSON.stringify(clean)}));if(typeof chatRequestId==="string")ezilAssignmentGatewayLink(chatRequestId,clean.requestId)}}catch{}}qe.registerCommand("_ezil.aiRequestTrace",(accessor,record,chatRequestId)=>{ezilDispatchAIRequestTrace(record,chatRequestId)});qe.registerCommand("noop",()=>{});'
 # SetupAgent readiness timeout: NLS 10557/10558, once in 4.141.0. No elapsed duration is in scope.
 A_APP_START_TIMEOUT='if(M==="timedout"){let N;this.chatEntitlementService.anonymous?N=d(10558,null,RF.chatExtensionId):N=d(10557,null,RF.provider.default.name,RF.chatExtensionId);'
 R_APP_START_TIMEOUT='if(M==="timedout"){try{ezilDispatchAppFailure({eventId:crypto.randomUUID(),source:"code_app",operation:"app_start",category:"app_startup",code:"app_start_timeout",stage:"startup",outcome:"failed"})}catch{}let N;this.chatEntitlementService.anonymous?N=d(10558,null,RF.chatExtensionId):N=d(10557,null,RF.provider.default.name,RF.chatExtensionId);'
@@ -131,7 +244,7 @@ R_SUMMARY_OWNER='start(e,n,t){if(this._state!=="Idle"&&this._state!=="Failed"||t
 # Only the contributed EZiL bridge handles the internal compaction marker. The provider still
 # applies its own model and account checks. Other contributed providers keep upstream behavior.
 A_SUMMARY_BRIDGE='async makeChatRequest2({debugName:e,messages:n,ignoreStatefulMarker:r,summarizedAtRoundId:o,requestOptions:a,finishedCb:s,location:c,source:l,telemetryProperties:u,modelCapabilities:d,conversationId:p},m){let A=Sgn(n,{ignoreStatefulMarker:r,summarizedAtRoundId:o,emitCacheBreakpoints:u5e(this.languageModel.vendor)}),g=vt(),f=this._otelService.getActiveTraceContext(),h=O7a(u),y={includeEncryptedThinking:!0,tools:(a?.tools??[]).map(_=>({name:_.function.name,description:_.function.description,inputSchema:_.function.parameters})),modelOptions:{_capturingTokenCorrelationId:g,_otelTraceContext:f??null,...h!==void 0?{_telemetryTurn:h}:{},...d?.enableThinking!==void 0?{_enableThinking:d.enableThinking}:{},...p!==void 0?{_conversationId:p}:{}}}'
-R_SUMMARY_BRIDGE='async makeChatRequest2({debugName:e,messages:n,ignoreStatefulMarker:r,summarizedAtRoundId:o,requestOptions:a,finishedCb:s,location:c,source:l,telemetryProperties:u,modelCapabilities:d,conversationId:p,interactionTypeOverride:S},m){let summary=this.modelProvider==="ezil"&&S==="conversation-compaction",A=Sgn(n,{ignoreStatefulMarker:r,summarizedAtRoundId:o,emitCacheBreakpoints:u5e(this.languageModel.vendor)}),g=vt(),f=this._otelService.getActiveTraceContext(),h=O7a(u),y={includeEncryptedThinking:!0,tools:(summary?[]:a?.tools??[]).map(_=>({name:_.function.name,description:_.function.description,inputSchema:_.function.parameters})),modelOptions:{_capturingTokenCorrelationId:g,_otelTraceContext:f??null,...h!==void 0?{_telemetryTurn:h}:{},...summary?{role:"summary",_ezilCompaction:true,_enableThinking:!1}:d?.enableThinking!==void 0?{_enableThinking:d.enableThinking}:{},...p!==void 0?{_conversationId:p}:{}}}'
+R_SUMMARY_BRIDGE='async makeChatRequest2({debugName:e,messages:n,ignoreStatefulMarker:r,summarizedAtRoundId:o,requestOptions:a,finishedCb:s,location:c,source:l,telemetryProperties:u,modelCapabilities:d,conversationId:p,interactionTypeOverride:S,ezilAssignmentChatRequestId:ezilChatId},m){let summary=this.modelProvider==="ezil"&&S==="conversation-compaction",A=Sgn(n,{ignoreStatefulMarker:r,summarizedAtRoundId:o,emitCacheBreakpoints:u5e(this.languageModel.vendor)}),g=vt(),f=this._otelService.getActiveTraceContext(),h=O7a(u),y={includeEncryptedThinking:!0,tools:(summary?[]:a?.tools??[]).map(_=>({name:_.function.name,description:_.function.description,inputSchema:_.function.parameters})),modelOptions:{_capturingTokenCorrelationId:g,_otelTraceContext:f??null,...this.modelProvider==="ezil"&&!summary&&typeof ezilChatId==="string"&&/^request_[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.exec(ezilChatId)?.[0]===ezilChatId?{_ezilAssignmentChatRequestId:ezilChatId}:{},...h!==void 0?{_telemetryTurn:h}:{},...summary?{role:"summary",_ezilCompaction:true,_enableThinking:!1}:d?.enableThinking!==void 0?{_enableThinking:d.enableThinking}:{},...p!==void 0?{_conversationId:p}:{}}}'
 # The last round can advance while the attachable summary round stays the same.
 A_SUMMARY_FRONTIER='}},s)}_getOrCreateBackgroundSummarizer(n){'
 R_SUMMARY_FRONTIER='}},s,this.endpoint.modelProvider==="ezil"?JSON.stringify([h,f,d,l.at(-1)?.id]):void 0)}_getOrCreateBackgroundSummarizer(n){'
@@ -549,6 +662,13 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   patch ai-dashboard "$WB" 1 "$A_AI_DASHBOARD" "$R_AI_DASHBOARD"
   patch app-failure "$WB" 1 "$A_APP_FAILURE" "$R_APP_FAILURE"
   patch ai-request-trace "$WB" 1 "$A_AI_REQUEST_TRACE" "$R_AI_REQUEST_TRACE"
+  patch assignment-chat-helpers "$WB" 1 "$A_ASSIGNMENT_CHAT_HELPERS" "$R_ASSIGNMENT_CHAT_HELPERS"
+  patch assignment-chat-send "$WB" 1 "$A_ASSIGNMENT_CHAT_SEND" "$R_ASSIGNMENT_CHAT_SEND"
+  patch assignment-chat-accept "$WB" 1 "$A_ASSIGNMENT_CHAT_ACCEPT" "$R_ASSIGNMENT_CHAT_ACCEPT"
+  patch assignment-setup-retry "$WB" 1 "$A_ASSIGNMENT_SETUP_RETRY" "$R_ASSIGNMENT_SETUP_RETRY"
+  patch assignment-chat-resend "$WB" 1 "$A_ASSIGNMENT_CHAT_RESEND" "$R_ASSIGNMENT_CHAT_RESEND"
+  patch assignment-chat-loop "$EXT" 1 "$A_ASSIGNMENT_LOOP" "$R_ASSIGNMENT_LOOP"
+  patch assignment-visible-range "$WB" 1 "$A_ASSIGNMENT_RANGE" "$R_ASSIGNMENT_RANGE"
   patch app-start-timeout "$WB" 1 "$A_APP_START_TIMEOUT" "$R_APP_START_TIMEOUT"
   patch billing-intent "$WB" 1 "$A_BILLING_INTENT" "$R_BILLING_INTENT"
   patch picker-locked-list "$WB" 1 "$A_PICKER_LOCKED_LIST" "$R_PICKER_LOCKED_LIST"
@@ -625,6 +745,7 @@ if [ "$VERIFY_ONLY" = 0 ]; then
   # Last: the id hashes the files patched above.
   for p in "$P_STATIC_ROUTE" "$P_STATIC_BASE" "$P_STATIC_PAGE" "$P_STATIC_WEBVIEW"; do gate static-names "$SERVER" 1 "$p"; done
   node "$PROJECTION" "$WB"
+  node "$TERMINAL_EVIDENCE" "$WB"
   STATIC_ID="$(static_id "$ROOT")"
   patch static-id "$SERVER" 1 "$A_STATIC" "IE=\"/static/$STATIC_ID\",Vq=\"/callback\""
 fi
@@ -633,6 +754,15 @@ fi
 gate app-failure "$WB" 0 "$A_APP_FAILURE"; gate app-failure "$WB" 1 "$R_APP_FAILURE"
 gate app-start-timeout "$WB" 0 "$A_APP_START_TIMEOUT"; gate app-start-timeout "$WB" 1 "$R_APP_START_TIMEOUT"
 gate ai-request-trace "$WB" 1 "$R_AI_REQUEST_TRACE"
+gate assignment-chat-helpers "$WB" 1 "$R_ASSIGNMENT_CHAT_HELPERS"
+gate assignment-chat-send "$WB" 0 "$A_ASSIGNMENT_CHAT_SEND"; gate assignment-chat-send "$WB" 1 "$R_ASSIGNMENT_CHAT_SEND"
+# This replacement retains the original conditional as a substring.
+gate assignment-chat-accept "$WB" 1 "$R_ASSIGNMENT_CHAT_ACCEPT"
+gate assignment-setup-retry "$WB" 0 "$A_ASSIGNMENT_SETUP_RETRY"; gate assignment-setup-retry "$WB" 1 "$R_ASSIGNMENT_SETUP_RETRY"
+gate assignment-chat-resend "$WB" 0 "$A_ASSIGNMENT_CHAT_RESEND"; gate assignment-chat-resend "$WB" 1 "$R_ASSIGNMENT_CHAT_RESEND"
+gate assignment-chat-loop "$EXT" 0 "$A_ASSIGNMENT_LOOP"; gate assignment-chat-loop "$EXT" 1 "$R_ASSIGNMENT_LOOP"
+node "$TERMINAL_EVIDENCE" --verify "$WB"
+gate assignment-visible-range "$WB" 0 "$A_ASSIGNMENT_RANGE"; gate assignment-visible-range "$WB" 1 "$R_ASSIGNMENT_RANGE"
 gate ai-request-trace-command "$WB" 1 'qe.registerCommand("_ezil.aiRequestTrace",'
 gate app-failure-command "$WB" 1 'qe.registerCommand("_ezil.appFailure",'
 gate billing-intent "$WB" 1 "$R_BILLING_INTENT"; gate billing-intent-command "$WB" 1 'qe.registerCommand("_ezil.billingIntent",'

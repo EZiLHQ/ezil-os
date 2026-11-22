@@ -145,6 +145,8 @@ import { HEARTBEAT_INTERVAL_MS, isPresent, shouldHeartbeat } from '../activity-h
 import { watchRuntimeOnReturn } from '../runtime-recheck.js';
 import { watchCodeLifecycle } from './code-lifecycle.js';
 import { attachFolderBridge, createFolderNotice, detachFolderBridge, editorDocumentUrl, folderAskFor, forgetFolder, tagFolderMint } from './code-folder.js';
+import { attachAssignmentCodeEvidence } from './code-assignment-evidence.js';
+import { recordAssignmentEvent, subscribeAssignmentEvidence } from '../assignment-evidence.js';
 import { register_app_frame } from '../ui/feedback/app-failures.js';
 import { register_billing_frame } from '../ui/Settings/billing-recovery.js';
 import { computeBootUiState, FRAME_CONFIRM_DEADLINE_MS } from '../boot-phases.js';
@@ -681,6 +683,11 @@ export async function openCodeWindow (ctx = {}) {
     let trace_registration = { dispose() {}, bindNonce() {} };
     let unregister_billing = () => {};
     let unregister_auth_recovery = () => {};
+    let unregister_assignment_evidence = null;
+    const clear_assignment_evidence = () => {
+        unregister_assignment_evidence?.();
+        unregister_assignment_evidence = null;
+    };
     if ( getComputedStyle(el_body).position === 'static' ) el_body.style.position = 'relative';
 
     let tick_timer = null;
@@ -758,12 +765,14 @@ export async function openCodeWindow (ctx = {}) {
     };
     // The editor is about to switch folder itself: its entry first, then the editor replaces its document in it.
     const on_open = (next) => {
+        clear_assignment_evidence();
         editor_moving = true;
         clearTimeout(route_timer); route_timer = null;
         if ( ! project ) wanted_folder = next.kind === 'folder' ? next.path : null;
         announce_root('push', next);
     };
     const on_leaving = () => {
+        clear_assignment_evidence();
         lifecycle?.record('frame_leaving');
         editor_moving = true;
         clearTimeout(route_timer); route_timer = null;
@@ -988,6 +997,7 @@ export async function openCodeWindow (ctx = {}) {
         last_failure = null;
         last_progress = null; generic_timeout = null;
         if ( disposed ) return;
+        clear_assignment_evidence();
         git_access?.reset();
         repository_folder = null;
         const my_attempt = ++attempt;
@@ -1192,11 +1202,11 @@ export async function openCodeWindow (ctx = {}) {
             origin: new URL(code_preview_url).origin, open: ctx.openBilling,
         });
         trace.step('frame_nav');
-        settle_frame(my_attempt);
+        settle_frame(my_attempt, asked?.repoUrl, res.repository);
     }
 
     /** Confirm Code's HTTP route, recovering transient startup failures before the deadline. */
-    function settle_frame (my_attempt) {
+    function settle_frame (my_attempt, assignmentRepositoryUrl, assignmentRepositoryName) {
         let settled = false;
         let in_flight = false;
         let asks = 0;
@@ -1261,7 +1271,21 @@ export async function openCodeWindow (ctx = {}) {
                         // origin, answering this binding's hello nonce with this mint's id. The server's HTTP
                         // confirmation above is not that (the 502 recovery page installs no bridge), so a probe that
                         // answers while the frame still shows that page cannot re-arm the automatic reopen.
-                        onRoot: (root, how) => { resetOriginRecovery(); on_root(root, how); },
+                        onRoot: (root, how) => {
+                            resetOriginRecovery();
+                            on_root(root, how);
+                            const assignmentRoot = assignmentRepositoryUrl && project?.repoUrl === assignmentRepositoryUrl
+                                && how.mintDriven && !how.fallback && root.kind === 'folder' && root.path === repository_folder;
+                            if (!assignmentRoot) clear_assignment_evidence();
+                            else if (!unregister_assignment_evidence) {
+                                unregister_assignment_evidence = attachAssignmentCodeEvidence({
+                                    iframe: el_iframe, frameUrl: frame_url, repositoryFolder: repository_folder,
+                                    repositoryName: assignmentRepositoryName,
+                                    scope: { computerId: computer.id, repositoryUrl: assignmentRepositoryUrl },
+                                    subscribe: subscribeAssignmentEvidence, record: recordAssignmentEvent,
+                                });
+                            }
+                        },
                         onOpen: on_open, onLeaving: on_leaving,
                     });
                     if ( link_folder_problem ) { folder_notice.fallback(link_folder_problem, null); link_folder_problem = null; }
@@ -1679,6 +1703,7 @@ export async function openCodeWindow (ctx = {}) {
         clearTimeout(route_timer); route_timer = null;
         clearTimeout(leaving_timer); leaving_timer = null;
         detachFolderBridge(el_iframe);
+        clear_assignment_evidence();
         unregister_auth_recovery();
         unregister_app_failures();
         trace_registration.dispose();

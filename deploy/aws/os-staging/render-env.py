@@ -99,6 +99,7 @@ def validate(values, environment="staging"):
     staging_keys = frozenset((
         STAGING_BROWSER_OBSERVE, STAGING_BROWSER_OPEN, STAGING_BROWSER_CONTROL, STAGING_BROWSER_ORIGINS,
         STAGING_PREVIEW_TOKEN_V2, STAGING_ONBOARDING, STAGING_MCP_AUTH0_CLIENT,
+        "EZIL_ASSIGNMENT_EVIDENCE_PILOT",
     ))
     allowed = REQUIRED | OPTIONAL | (staging_keys if environment == "staging" else frozenset())
     if any(key not in allowed and not REGIONAL.fullmatch(key) for key in values):

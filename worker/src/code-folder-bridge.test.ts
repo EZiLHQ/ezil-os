@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { DIAG_BRIDGE_MARKER } from './code-diag-bridge';
+import { ASSIGNMENT_EVIDENCE_BRIDGE_MARKER } from './code-assignment-evidence';
 
 import { handleAwsBrowserHost, type AwsTunnelRecord, type FetchLike } from './aws-origin';
 import {
@@ -131,7 +132,8 @@ describe('injectCodeFolderBridge', () => {
     expect(out.indexOf(meta)).toBeLessThan(1024);
     expect(out.indexOf(tag)).toBeLessThan(out.indexOf('globalThis._VSCODE_FILE_ROOT'));
     expect(out.split(BRIDGE_MARKER).length - 1).toBe(1);
-    expect(out.replace(/\n<script nonce="[^"]*" data-ezil-folder-bridge="1">[\s\S]*?<\/script><style data-ezil-legacy-notice="1">[^<]*<\/style>/, ''))
+    expect(out.split(ASSIGNMENT_EVIDENCE_BRIDGE_MARKER).length - 1).toBe(1);
+    expect(out.replace(/\n<script nonce="[^"]*" data-ezil-folder-bridge="1">[\s\S]*?<\/script><style data-ezil-legacy-notice="1">[^<]*<\/style><script nonce="[^"]*" data-ezil-assignment-evidence="1">[\s\S]*?<\/script>/, ''))
       .toBe(WORKBENCH);
     expect(out).toContain(JSON.stringify([SHELL]));
   });

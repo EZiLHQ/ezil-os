@@ -281,6 +281,26 @@ describe('EZiL gateway VS Code bridge', () => {
         return { models: () => models, configError: () => undefined, secrets: () => ['synthetic-proxy-token'], logRequests: () => true,
             log: (s: string) => lines.push(s), recordUsage: (_m: ResolvedModel, u: Usage) => usage.push(u), fetch, lines, usage };
     }
+    test('only the Copilot turn passes its exact assignment join ID beside the unchanged diagnostic', async () => {
+        const chatId = 'request_11111111-1111-4111-8111-111111111111';
+        const gatewayId = '22222222-2222-4222-8222-222222222222';
+        const joins: Array<{ chatId: string | undefined; gatewayId: string | null }> = [];
+        const host = gatewayHost((async (_url: unknown, init?: RequestInit) => {
+            expect(new TextDecoder().decode(init!.body as Uint8Array)).not.toContain(chatId);
+            return new Response(frames().join(''), { headers: { 'content-type': 'text/event-stream', 'x-ezil-request-id': gatewayId } });
+        }) as typeof fetch);
+        const p = new EZiLModelsProvider({ ...host, inferenceDiagnostic: (trace, id) => {
+            expect(trace).not.toHaveProperty('chatRequestId');
+            joins.push({ chatId: id, gatewayId: trace.gatewayRequestId });
+        } });
+        const [info] = await p.provideLanguageModelChatInformation({} as never, token() as never);
+        for (const [requestInitiator, role] of [['github.copilot-chat', 'user'], ['github.copilot-chat', 'summary'], ['another.extension', 'user']]) {
+            await p.provideLanguageModelChatResponse(info!, [message(1, [new TextPart('Synthetic fixture input')])] as never,
+                { requestInitiator, tools: [], modelOptions: { _ezilAssignmentChatRequestId: chatId, role } } as never,
+                { report: () => {} }, token() as never);
+        }
+        expect(joins).toEqual([{ chatId, gatewayId }, { chatId: undefined, gatewayId }, { chatId: undefined, gatewayId }]);
+    });
     test('final JSON/SSE metadata reaches the owning request, including out-of-order and cancelled replies', async () => {
         const pending = new Map<string, (response: Response) => void>();
         const budgets = new Map<string, unknown>();

@@ -1058,3 +1058,35 @@ body.device-phone {
 .window-head {
     filter: grayscale(0%);
 }
+
+.ezil-assignment-evidence {
+    position: fixed;
+    z-index: 2147483000;
+    inset-inline-end: 12px;
+    inset-block-end: max(12px, env(safe-area-inset-bottom));
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    max-width: min(480px, calc(100vw - 24px));
+    padding: 8px 10px;
+    border: 1px solid #6a7080;
+    border-radius: 8px;
+    background: #202733;
+    color: #f5f5f4;
+    font-size: 13px;
+}
+
+.ezil-assignment-evidence button {
+    padding: 5px 8px;
+    border: 1px solid #94a6c0;
+    border-radius: 4px;
+    background: #344764;
+    color: inherit;
+    cursor: pointer;
+}
+
+.ezil-assignment-evidence button:disabled {
+    opacity: .65;
+    cursor: wait;
+}

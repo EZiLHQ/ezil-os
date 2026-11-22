@@ -39,6 +39,7 @@ import UITaskbarItem from './UITaskbarItem.js';
 // sites below — see each site's own comment. Not part of the original
 // import-block swap; see PUTER-PROVENANCE.md's updated row for this file.
 import telemetry from '../../ezil/telemetry.js';
+import { closeAssignmentEvidenceWindow, recordAssignmentWindow } from '../../ezil/assignment-evidence.js';
 import {
     puter,
     UIWindowLogin,
@@ -3086,6 +3087,8 @@ function delete_window_element (el_window) {
     }
     // MODIFIED BY EZIL 2026-10-30: same funnel, for `shell/ezil/app-history.js`
     // (closing a window moves the address bar to the next focused app).
+    recordAssignmentWindow('app.closed', el_window);
+    closeAssignmentEvidenceWindow(el_window);
     window.dispatchEvent(new CustomEvent('ezil:window-closed', { detail: { window: el_window, app: was_app ?? null } }));
 }
 
@@ -4306,6 +4309,7 @@ $.fn.showWindow = async function (options) {
             // can't distinguish the two minimize paths: drag/maximize
             // handlers set it too.)
             if ( $(el_window).attr('data-minimized_in_place') === '1' ) {
+                recordAssignmentWindow('app.restored', el_window);
                 $(el_window).attr({
                     'data-is_minimized': false,
                     'data-minimized_in_place': '0',
@@ -4376,6 +4380,7 @@ $.fn.showWindow = async function (options) {
             // viewport resize -> the old viewport's pixels). A visible window
             // keeps its geometry; it is still raised and focused below.
             const was_minimized = ['1', 'true'].includes($(el_window).attr('data-is_minimized'));
+            if ( was_minimized ) recordAssignmentWindow('app.restored', el_window);
             if ( was_minimized ) {
                 $(el_window).css({
                     'transition': 'top 0.2s, left 0.2s, bottom 0.2s, right 0.2s, width 0.2s, height 0.2s',
@@ -4450,6 +4455,7 @@ $.fn.focusWindow = function (event) {
         // take focus from its address field or the WebContentsView.
         const $app_iframe = $(this).find('.window-app-iframe:not([hidden])');
         const win_id = $(this).attr('data-id');
+        const was_active = this.hasClass('window-active');
 
         // remove active class from all windows, except for this window
         $('.window').not(this).removeClass('window-active');
@@ -4486,6 +4492,7 @@ $.fn.focusWindow = function (event) {
         // MODIFIED BY EZIL 2026-10-30: the address bar follows the focused app
         // (`shell/ezil/app-history.js`); this file only says which window.
         window.dispatchEvent(new CustomEvent('ezil:window-focus', { detail: { window: this[0] } }));
+        if ( !was_active ) recordAssignmentWindow('app.focused', this[0]);
 
         // hide other global menubars
         $('.window-menubar-global').not(`.window-menubar-global[data-window-id="${win_id}"]`).hide();
@@ -5260,6 +5267,9 @@ function morph_window_from_tile (el_window, tile, morph_options = {}) {
 $.fn.hideWindow = async function (options) {
     $(this).each(async function () {
         if ( $(this).hasClass('window') ) {
+            if ( !['1', 'true'].includes(this.getAttribute('data-is_minimized')) ) {
+                recordAssignmentWindow('app.minimized', this);
+            }
             window.dispatchEvent(new CustomEvent('ezil:native-composition', { detail: { window: this, visible: false } }));
             this._ezil_preserve_frame_viewport?.();
             // get taskbar item location
