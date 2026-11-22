@@ -1,0 +1,53 @@
+;(() => {
+    const scope = 'https://os-staging.ezil.work';
+    const tag = document.currentScript;
+    if (!tag || window.parent === window) return;
+    const isCode = tag.dataset.ezilFolderBridge === '1';
+    if (!isCode && !tag?.hasAttribute('data-ezil-viewer-cues')) return;
+    const name = isCode ? 'ezil_mint' : 'ezilAttempt';
+    const values = new URLSearchParams(location.search).getAll(name);
+    if (values.length !== 1) return;
+    const binding = values[0];
+    if (!(isCode ? /^[A-Za-z0-9_-]{22}$/ : /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/).test(binding)) return;
+    let enabled = false, lease, removal, mark;
+    function removeMark() {
+        clearTimeout(removal);
+        mark?.remove();
+        mark = null;
+    }
+    function disable() {
+        enabled = false;
+        clearTimeout(lease);
+        document.removeEventListener('pointerdown', paint, true);
+        removeMark();
+    }
+    function paint(ev) {
+        if (!enabled || !ev.isTrusted || ev.view !== window || ![0,2].includes(ev.button)) return;
+        const target = ev.target;
+        if (isCode ? !target.closest?.('.monaco-workbench') || target.closest('input[type="password"]') : !target.matches?.('textarea.overlay')) return;
+        removeMark();
+        mark = document.createElement('span');
+        mark.setAttribute('aria-hidden','true');
+        mark.setAttribute('data-ezil-assignment-click','');
+        mark.textContent = ev.button === 2 ? 'R' : 'L';
+        Object.assign(mark.style, {position:'fixed',pointerEvents:'none',zIndex:'2147483646',transform:'translate(-50%,-50%)',
+            left:ev.clientX+'px',top:ev.clientY+'px',display:'grid',placeContent:'center',boxSizing:'border-box',
+            width:'29px',height:'29px',border:'2px solid '+(ev.button===2?'#ff9ac6':'#42ecd2'),borderRadius:'50%',
+            background:'#132531df',color:'#fff',font:'bold 12px system-ui,sans-serif'});
+        document.body.append(mark);
+        removal = setTimeout(removeMark,1150);
+    }
+    addEventListener('message', ev => {
+        const data = ev.data;
+        if (ev.source !== parent || ev.origin !== scope || data?.type !== 'ezil.assignment.click-cues'
+            || data.v !== 1 || data.binding !== binding || typeof data.active !== 'boolean') return;
+        if (!data.active) { disable(); return; }
+        if (!enabled) {
+            enabled = true;
+            document.addEventListener('pointerdown',paint,{capture:true,passive:true});
+        }
+        clearTimeout(lease);
+        lease = setTimeout(disable,3500);
+    });
+    addEventListener('pagehide',disable,{once:true});
+})();

@@ -50,6 +50,8 @@
  * origin is the release contract's canonical (.github/scripts/release-state.mjs `canonical`; pinned by
  * code-folder-bridge.test.ts). Its former host and its provider alias are never listed.
  */
+import assignmentClickCues from '../scripts/assignment-click-cues.txt';
+
 const SHELL_ORIGINS_BY_PREVIEW_ZONE: Readonly<Record<string, string>> = {
   'ezil.org': 'https://os.ezil.work',
   'ezil.work': 'https://os-staging.ezil.work',
@@ -222,6 +224,7 @@ export function codeFolderBridgeScript(origins: readonly string[]): string {
     + `const here=what(location.search);const base=String(location.pathname||"");if((here.kind==="folder"||here.kind==="empty")&&base.length<=256)here.base=base;`
     + `let mint=null;try{const m=new URLSearchParams(location.search).get("ezil_mint");mint=m&&T.test(m)?m:null}catch{}`
     + `const tell=(m)=>{for(const o of O){try{window.parent.postMessage(m,o)}catch{}}};`
+    + (origins.length === 1 && origins[0] === 'https://os-staging.ezil.work' ? assignmentClickCues : '')
     + REPOSITORY_FOCUS_SCRIPT
     + `let repositoryFocusStarted=false;const pending=new Map();`
     + `addEventListener("message",ev=>{try{const d=ev.data;if(ev.source!==window.parent||!O.includes(ev.origin)||!d||typeof d!=="object"||d.v!==1)return;`
