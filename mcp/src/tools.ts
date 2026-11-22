@@ -271,7 +271,7 @@ export const buildTools = (ezil: EzilClient): ToolDef[] => withBrowserAliases([
         },
         handler: guard(async (a) => {
             await ezil.desktop.restart(a.computerId as string);
-            return text('Restart requested. The desktop takes a few seconds to come back — poll desktop_status.');
+            return text('Restart requested. The Browser takes a few seconds to come back — poll browser_status or desktop_status.');
         }),
     },
     {
