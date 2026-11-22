@@ -78,6 +78,11 @@ STAGING_BROWSER_IDP_ORIGINS = "EZIL_BROWSER_IDP_ORIGINS"
 ALWAYS_IDP_HOSTS = frozenset(("id.ezil.work",))
 BROWSER_TIER_MAX_ENTRIES = 20
 STAGING_PREVIEW_TOKEN_V2 = "EZIL_PREVIEW_TOKEN_V2"
+# RUN-1121 WS2 receivers (computer tools, terminal jobs, settings writes, the in-computer chat CLI), staging only and
+# off unless exactly "enabled". Every one needs the canonical staging delegation pins; the two that reach into the
+# computer through the Worker also need the staging Worker URL and its HMAC secret.
+STAGING_WS2_WORKER_SWITCHES = (("EZIL_DELEGATED_COMPUTER_TOOLS", "Computer tools"), ("EZIL_DELEGATED_TERMINAL", "Terminal"))
+STAGING_WS2_SWITCHES = (("EZIL_DELEGATED_SETTINGS_WRITE", "Settings write"), ("EZIL_EDITOR_CLI", "Editor CLI"))
 # Provider-aware observation targets (App contract): comma-separated <aws-ec2|cloudflare>:<canonical lowercase UUID>;
 # only aws-ec2 entries activate the AWS branch. Staging-only and off when absent.
 STAGING_BROWSER_OBSERVE_TARGETS = "EZIL_DELEGATED_BROWSER_OBSERVE_AWS_TARGETS"
@@ -112,6 +117,7 @@ def validate(values, environment="staging"):
         STAGING_BROWSER_OBSERVE, STAGING_BROWSER_OPEN, STAGING_BROWSER_CONTROL, STAGING_BROWSER_ORIGINS,
         STAGING_PREVIEW_TOKEN_V2, STAGING_ONBOARDING, STAGING_BROWSER_OBSERVE_TARGETS,
         STAGING_BROWSER_OWNER_APP_ORIGINS, STAGING_BROWSER_IDP_ORIGINS,
+        *(key for key, _ in STAGING_WS2_WORKER_SWITCHES + STAGING_WS2_SWITCHES),
     ))
     allowed = REQUIRED | OPTIONAL | (staging_keys if environment == "staging" else frozenset())
     if any(key not in allowed and not REGIONAL.fullmatch(key) for key in values):
@@ -160,6 +166,20 @@ def validate(values, environment="staging"):
             or not values.get("CLOUDFLARE_GUACAMOLE_HMAC_SECRET")
         ):
             raise RenderError(f"{feature} requires the stage OS, Worker and complete delegation pins")
+    for (key, feature), needs_worker in ([(switch, True) for switch in STAGING_WS2_WORKER_SWITCHES]
+                                         + [(switch, False) for switch in STAGING_WS2_SWITCHES]):
+        setting = values.get(key)
+        if setting not in (None, "enabled", "disabled"):
+            raise RenderError(f"{feature} must be exactly enabled or disabled")
+        if setting == "enabled" and (
+            any(pin not in values for pin in DELEGATION_PINS)
+            or values["EZIL_DELEGATION_ISSUER"] != "https://connect-staging.ezil.work"
+            or values["EZIL_DELEGATION_AUDIENCE"] != "https://os-staging.ezil.work"
+            or needs_worker and (
+                values.get("CLOUDFLARE_GUACAMOLE_WORKER_URL", "").removesuffix("/") != "https://api-desktop-staging.ezil.work"
+                or not values.get("CLOUDFLARE_GUACAMOLE_HMAC_SECRET"))
+        ):
+            raise RenderError(f"{feature} requires the stage OS{', Worker' if needs_worker else ''} and complete delegation pins")
     targets = values.get(STAGING_BROWSER_OBSERVE_TARGETS)
     if targets is not None and not all(BROWSER_OBSERVE_TARGET.fullmatch(entry.strip()) for entry in targets.split(",")):
         raise RenderError("Browser observation targets must be comma-separated aws-ec2 or cloudflare canonical UUIDs")

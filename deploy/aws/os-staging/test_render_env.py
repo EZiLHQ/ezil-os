@@ -421,6 +421,38 @@ class DelegationEnvironmentTests(unittest.TestCase):
         self.refused({**complete, key: "enabled", "EZIL_DELEGATION_ISSUER": "https://other.example.invalid"}, "staging")
         self.refused({key: "disabled"}, "production")
 
+    def test_ws2_switches_are_exact_staging_only_and_need_canonical_pins(self):
+        complete = delegation(EZIL_DELEGATION_ISSUER="https://connect-staging.ezil.work",
+                              EZIL_DELEGATION_AUDIENCE="https://os-staging.ezil.work")
+        worker = {"CLOUDFLARE_GUACAMOLE_WORKER_URL": "https://api-desktop-staging.ezil.work",
+                  "CLOUDFLARE_GUACAMOLE_HMAC_SECRET": "synthetic-hmac-secret-never-log-1234567890"}
+        for key, _ in renderer.STAGING_WS2_WORKER_SWITCHES + renderer.STAGING_WS2_SWITCHES:
+            with self.subTest(key=key):
+                self.assertNotIn(key, renderer.validate(self.staging))
+                disabled = {**self.staging, key: "disabled"}
+                self.assertEqual(renderer.validate(disabled), disabled)
+                enabled = {**self.staging, **complete, **worker, key: "enabled"}
+                self.assertEqual(renderer.validate(enabled), enabled)
+                self.refused({key: "enabled"}, "staging")
+                self.refused({**complete, **worker, key: "true"}, "staging")
+                self.refused({**complete, **worker, key: "Enabled"}, "staging")
+                self.refused({**complete, **worker, key: "enabled",
+                              "EZIL_DELEGATION_ISSUER": "https://other.example.invalid"}, "staging")
+                self.refused({**complete, **worker, key: "enabled",
+                              "EZIL_DELEGATION_AUDIENCE": "https://other.example.invalid"}, "staging")
+                self.refused({key: "disabled"}, "production")
+        for key, _ in renderer.STAGING_WS2_WORKER_SWITCHES:
+            with self.subTest(worker_switch=key):
+                self.refused({**complete, key: "enabled"}, "staging")
+                self.refused({**complete, **worker, key: "enabled",
+                              "CLOUDFLARE_GUACAMOLE_WORKER_URL": "https://other.example.invalid"}, "staging")
+                self.refused({**complete, "CLOUDFLARE_GUACAMOLE_WORKER_URL": worker["CLOUDFLARE_GUACAMOLE_WORKER_URL"],
+                              key: "enabled"}, "staging")
+        for key, _ in renderer.STAGING_WS2_SWITCHES:
+            with self.subTest(pins_only_switch=key):
+                pins_only = {**self.staging, **complete, key: "enabled"}
+                self.assertEqual(renderer.validate(pins_only), pins_only)
+
     def test_editor_switches_are_default_off_and_staging_only(self):
         first, second, controls = renderer.STAGING_EDITOR_SWITCHES
         origins = delegation(EZIL_DELEGATION_ISSUER="https://connect-staging.ezil.work",
