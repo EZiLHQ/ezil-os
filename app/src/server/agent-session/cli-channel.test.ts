@@ -10,7 +10,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { signEditorSync } from './sync-route';
-import { SessionStoreError, type Op, type SessionDb, type SessionRow, type SqlExecutor } from './store';
+import { SessionStoreError, type Op, type SessionDb, type SessionRow } from './store';
 import type { ControlRow } from './control-store';
 import { handleEditorCli, signEditorCli, type CliChannelDeps, type CliChannelServices } from './cli-channel';
 
@@ -50,7 +50,7 @@ const deps = (over: Partial<CliChannelDeps> = {}): CliChannelDeps => ({
     secret: SECRET,
     enabled: true,
     now: () => NOW,
-    computerForSandbox: vi.fn(async (_db: SqlExecutor, _sandbox: string) => ({ id: COMPUTER, userId: OWNER })),
+    computerForSandbox: vi.fn(async () => ({ id: COMPUTER, userId: OWNER })),
     services: services(),
     ...over,
 });
