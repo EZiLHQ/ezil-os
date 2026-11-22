@@ -38,7 +38,8 @@ export function v1Text (value) {
 
 const validRef = value => typeof value === 'string' && REF.test(value);
 const exactly = (names, allowed) => names.length === allowed.length && names.every(name => allowed.includes(name));
-const selectValue = value => typeof value === 'string' && value.length >= 1 && value.length <= SELECT_VALUE_MAX_CHARS
+/** At most 200 code points: the MCP's zod 4 `.max(200)` counts code points, not UTF-16 units. */
+const selectValue = value => typeof value === 'string' && value.length >= 1 && Array.from(value).length <= SELECT_VALUE_MAX_CHARS
     && !NO_CONTROL.test(value);
 
 /** One typed action of the seven-kind union, members exact. Refs are the OS-minted 22-character handles. */

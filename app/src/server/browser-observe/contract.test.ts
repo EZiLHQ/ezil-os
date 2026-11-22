@@ -62,6 +62,20 @@ describe('browser verbs v2 requests mirror the MCP control union', () => {
         expect(accepts({ action: { kind: 'read', selector: 'input' } })).toBe(false);
     });
 
+    it('counts as the MCP counts: UTF-16 units for typed text, code points for every other zod string bound', () => {
+        const emoji = String.fromCodePoint(0x1f600);
+        // Typed text: 4000 UTF-16 units, so 2000 emoji and not 2001 (the sidecar bounds value.length).
+        expect(accepts(control({ kind: 'type', ref, text: emoji.repeat(2000) }))).toBe(true);
+        expect(accepts(control({ kind: 'type', ref, text: emoji.repeat(2001) }))).toBe(false);
+        // A select value: 200 code points, so 200 emoji (400 UTF-16 units) and not 201, as zod 4's .max(200) counts.
+        expect(accepts(control({ kind: 'select', ref, values: [emoji.repeat(200)] }))).toBe(true);
+        expect(accepts(control({ kind: 'select', ref, values: [emoji.repeat(201)] }))).toBe(false);
+        // EZiL ID on any port or with trailing dots is never a navigate target.
+        for (const url of ['https://id.ezil.work:8443/', 'https://id.ezil.work../authorize', 'https://ID.EZIL.WORK/']) {
+            expect([url, accepts(control({ kind: 'navigate', url }))]).toEqual([url, false]);
+        }
+    });
+
     it('keeps the 16 KiB UTF-8 bound and declares the v1 text bound for pages off the owner app', () => {
         // 4000 characters never exceed 16 KiB of UTF-8 (at most three bytes per UTF-16 unit), so the byte bound holds them all.
         expect(accepts(control({ kind: 'type', ref, text: char(0x20ac).repeat(4000) }))).toBe(true);
@@ -125,7 +139,17 @@ describe('browser verbs v2 answers mirror the MCP success and failure schemas', 
             'identity decided': { universeIdentity: 'same_ezil_id' },
             'http page': { pageUrl: 'http://universe-staging.ezil.work/' },
             'title with a line break': { pageTitle: 'a\nb' },
+            'content page without a URL': { pageUrl: null },
+            'owner-app page on EZiL ID': { observed: 'owner_app_page', profileHeadingVisible: false, ownerAppAccountEmail: null, pageUrl: 'https://id.ezil.work/u/login' },
+            'approved page on EZiL ID, another port': { observed: 'approved_page', profileHeadingVisible: false, ownerAppAccountEmail: null, pageUrl: 'https://id.ezil.work:8443/x' },
         })) expect([name, browserUiSuccess.safeParse({ ...result, ...over }).success]).toEqual([name, false]);
+        // Code points, as zod 4 counts them: an 80-emoji label and option are within the MCP's bounds.
+        const emoji = String.fromCodePoint(0x1f600);
+        expect(browserUiSuccess.safeParse({ ...result, elements: [{ ref, kind: 'select', label: emoji.repeat(80), options: [emoji.repeat(80)] }] }).success).toBe(true);
+        expect(browserUiSuccess.safeParse({ ...result, elements: [{ ref, kind: 'button', label: emoji.repeat(81) }] }).success).toBe(false);
+        // The sign-in handoff names the IdP, and that is fine: it carries nothing.
+        expect(browserUiSuccess.safeParse({ ...result, observed: 'interactive_sign_in_required', profileHeadingVisible: false,
+            pageUrl: 'https://id.ezil.work/u/login', pageTitle: null, elements: [], viewerFrame: null, ownerAppAccountEmail: null }).success).toBe(true);
     });
 
     it('failures add origin_read_only to the codes the receiver maps', () => {
@@ -146,5 +170,13 @@ describe('browser verbs v2 answers mirror the MCP success and failure schemas', 
         expect(sanitizeBrowserPageUrl('https://universe-staging.ezil.work/builder/profile-builder'))
             .toBe('https://universe-staging.ezil.work/builder/profile-builder');
         expect(sanitizeBrowserPageUrl(null)).toBeNull();
+        // As the MCP strips now: path parameters, assignments anywhere, credentials, invisible characters, double escapes.
+        expect(sanitizeBrowserPageUrl('https://universe-staging.ezil.work/cb;code=C')).toBe('https://universe-staging.ezil.work/cb');
+        expect(sanitizeBrowserPageUrl('https://universe-staging.ezil.work/token=abc/x')).toBe('https://universe-staging.ezil.work/');
+        expect(sanitizeBrowserPageUrl('https://user:pw@universe-staging.ezil.work/x?y=1')).toBe('https://universe-staging.ezil.work/x');
+        expect(sanitizeBrowserPageUrl('https://universe-staging.ezil.work/cb?co' + String.fromCharCode(0x200b) + 'de=C'))
+            .toBe('https://universe-staging.ezil.work/cb');
+        expect(sanitizeBrowserPageUrl('https://universe-staging.ezil.work/cb?x=%2563ode%253DC')).toBe('https://universe-staging.ezil.work/cb');
+        expect(sanitizeBrowserPageUrl('https://id.ezil.work:8443/u/login?x=1')).toBe('https://id.ezil.work:8443/u/login');
     });
 });

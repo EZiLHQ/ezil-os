@@ -229,6 +229,12 @@ test('the v2 action union is the MCP union: seven kinds, exact members, the same
         { kind: 'press', key: 'Enter', ref: 'e1' }, { kind: 'click', ref: 'e12' }, { kind: 'click', ref, selector: 'button' },
         { kind: 'upload', ref }, { kind: 'evaluate', script: '1' },
     ]) assert.equal(ok(action), false, JSON.stringify(action).slice(0, 120));
+    // Counted as the MCP counts: typed text by UTF-16 units (2000 emoji, not 2001), a select value by code points.
+    const emoji = String.fromCodePoint(0x1f600);
+    assert.equal(typedText(emoji.repeat(2000)), true);
+    assert.equal(typedText(emoji.repeat(2001)), false);
+    assert.equal(ok({ kind: 'select', ref, values: [emoji.repeat(200)] }), true);
+    assert.equal(ok({ kind: 'select', ref, values: [emoji.repeat(201)] }), false);
     // 16 KiB of UTF-8 is a second bound: 4000 four-byte characters would be 16,000 bytes, 4000 three-byte ones 12,000.
     assert.equal(typedText(String.fromCharCode(0x20ac).repeat(4000)), true);
     assert.equal(v1Text('Plain words, ok!'), true);
@@ -302,6 +308,7 @@ test('the closed projection: owner-app kinds, no href, e-mail on the profile bui
         'frame on sign-in': { observed: 'interactive_sign_in_required', profileHeadingVisible: false, pageTitle: null, elements: [], ownerAppAccountEmail: null },
         'non-JPEG frame': { viewerFrame: { mimeType: 'image/jpeg', base64: 'iVBORw0KGgo=' } },
         'query in pageUrl': { pageUrl: OWNER + '/builder/profile-builder?code=1' },
+        'content page without a URL': { pageUrl: null },
         '17 elements on an approved page': { observed: 'approved_page', profileHeadingVisible: false, ownerAppAccountEmail: null,
             pageUrl: 'https://example.com/', elements: Array.from({ length: 17 }, (_, n) => ({ ref: String(n).padStart(22, 'h'), kind: 'button', label: 'B' })) },
     })) assert.deepEqual(browserUiPayload({ ...base, ...over }), refused, name);

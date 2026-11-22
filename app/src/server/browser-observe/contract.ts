@@ -32,8 +32,12 @@ export const BROWSER_UI_FIXTURE_ORIGIN = BROWSER_STAGING_OS;
 
 /*
  * Browser verbs v2 (docs/contracts/browser-verbs-v2.md §4): the modern read and control wires, declared exactly as
- * ezil-mcp `src/tools/workflow-browser.ts` declares them, so what the MCP sends this accepts and what this answers the
- * MCP accepts. The legacy observation above is untouched.
+ * ezil-mcp `src/tools/workflow-browser.ts` declares them (mirrored at ezil-mcp 6c37d08), so what the MCP sends this
+ * accepts and what this answers the MCP accepts. The legacy observation above is untouched.
+ *
+ * One translation, measured: the MCP's zod 4.6.5 `.max()` counts code points, this App's zod 3.25.76 counts UTF-16
+ * code units. Every MCP `.max(n)` on a string is therefore written here as a code-point refine (`points`), and the
+ * MCP's own UTF-16 refines are kept as they are.
  */
 
 /** A modern answer carries up to 64 elements and a masked JPEG; the MCP reads it under 160 KiB. */
@@ -68,6 +72,8 @@ const FRAME_PAGES: ReadonlySet<string> = new Set(['approved_page', 'profile_buil
 const OWNER_APP_PAGES: ReadonlySet<string> = new Set(['profile_builder', 'owner_app_page']);
 const SENSITIVE: ReadonlySet<string> = new Set(SENSITIVE_URL_PARAMS);
 
+/** At most `max` code points, as zod 4 counts `.max()` (this zod counts UTF-16 units). */
+const points = (max: number) => (value: string) => Array.from(value).length <= max;
 const requestId = z.string().regex(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 const elementRef = z.string().regex(/^[A-Za-z0-9_-]{22}$/);
 const isoInstant = z.string().refine(value => Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value);
@@ -79,9 +85,13 @@ function parseUrl(value: string): URL | null {
         return null;
     }
 }
-/** The EZiL ID host on its default port. */
-const isEzilId = (url: URL) => url.hostname.replace(/\.$/, '') === EZIL_ID_HOST && url.port === '';
-const navigateUrl = z.string().max(2048).refine(value => {
+/** The EZiL ID host, with any trailing dots, on any port. */
+const isEzilId = (url: URL) => url.hostname.replace(/\.+$/, '') === EZIL_ID_HOST;
+const isEzilIdUrl = (value: string) => {
+    const parsed = parseUrl(value);
+    return parsed !== null && isEzilId(parsed);
+};
+const navigateUrl = z.string().refine(points(2048)).refine(value => {
     const parsed = parseUrl(value);
     return parsed !== null && parsed.protocol === 'https:' && parsed.href.length <= 2048 && !parsed.username
         && !parsed.password && !/\s/u.test(value) && noControl(value) && !isEzilId(parsed)
@@ -89,16 +99,20 @@ const navigateUrl = z.string().max(2048).refine(value => {
 }, 'Use an approved public HTTPS page URL without embedded credentials. The EZiL ID sign-in is reached only by redirect.');
 /** Typed text may hold line feeds and tabs. Every other control character (C0, DEL, C1) and U+2028/U+2029 is refused. */
 const typedTextForbidden = /(?![\n\t])[\p{Cc}\u{2028}\u{2029}]/u;
-const typedText = z.string().min(1).max(TYPED_TEXT_MAX_CHARS).refine(value => !typedTextForbidden.test(value)
-    && new TextEncoder().encode(value).length <= TYPED_TEXT_MAX_BYTES,
-'Text is 1 to 4000 characters and at most 16 KiB of UTF-8. Line feeds and tabs are allowed; other control characters are not.');
+// The MCP bounds typed text by code points and by UTF-16 length (the sidecar's FIELD_VALUE_MAX_CHARS); the second is
+// the binding one, and is this zod's own `.max()`.
+const typedText = z.string().min(1).refine(points(TYPED_TEXT_MAX_CHARS))
+    .refine(value => value.length <= TYPED_TEXT_MAX_CHARS,
+        'Text is at most 4000 UTF-16 code units: an emoji or another character outside the Basic Multilingual Plane counts as two.')
+    .refine(value => !typedTextForbidden.test(value) && new TextEncoder().encode(value).length <= TYPED_TEXT_MAX_BYTES,
+        'Text is 1 to 4000 characters and at most 16 KiB of UTF-8. Line feeds and tabs are allowed; other control characters are not.');
 /**
  * Off owner-app pages the v1 bound holds (contract §4): 1 to 80 characters with no line break, as before verbs v2.
  * Only the sidecar knows which page a request lands on, so it enforces this there; it is declared here as the rule.
  */
 export const browserPublicPageText = z.string().min(1).max(80).regex(/^[\p{L}\p{N} .,!?'_-]+$/u)
     .refine(value => Buffer.byteLength(value, 'utf8') <= 256);
-const selectValue = z.string().min(1).max(SELECT_VALUE_MAX_CHARS)
+const selectValue = z.string().min(1).refine(points(SELECT_VALUE_MAX_CHARS))
     .refine(noControl, 'Option labels and values have no line breaks or control characters.');
 const uniqueRefs = (items: readonly { ref: string }[]) => new Set(items.map(item => item.ref)).size === items.length;
 
@@ -129,17 +143,17 @@ export type BrowserSessionRequest = z.infer<typeof browserSessionRequest>;
 export type BrowserUiRequest = z.infer<typeof browserUiRequest>;
 
 /** Canonical credential-free HTTPS. The sidecar sends origin + path; see sanitizeBrowserPageUrl. */
-const pageUrl = z.string().max(2048).refine(value => {
+const pageUrl = z.string().refine(points(2048)).refine(value => {
     const parsed = parseUrl(value);
     return parsed !== null && parsed.protocol === 'https:' && !parsed.username && !parsed.password && parsed.href === value
         && noControl(value);
 }).nullable();
-const label = z.string().min(1).max(80).refine(value => noControl(value) && value.trim() === value);
+const label = z.string().min(1).refine(points(80)).refine(value => noControl(value) && value.trim() === value);
 /** Listed elements: never a password input, and never an href. */
 const element = z.union([
     z.object({ ref: elementRef, kind: z.enum(['button', 'link', 'text_input', 'textarea', 'checkbox']), label }).strict(),
     z.object({ ref: elementRef, kind: z.literal('select'), label,
-        options: z.array(z.string().max(80).refine(noControl)).max(SELECT_OPTIONS_MAX) }).strict(),
+        options: z.array(z.string().refine(points(80)).refine(noControl)).max(SELECT_OPTIONS_MAX) }).strict(),
 ]);
 const base64 = /^[A-Za-z0-9+/]+={0,2}$/;
 const viewerFrame = z.object({
@@ -160,13 +174,16 @@ export const browserUiSuccess = z.object({
     // The OS never decides identity (contract §5): the MCP does.
     universeIdentity: z.literal('unverified'),
     pageUrl,
-    pageTitle: z.string().max(120).refine(noControl).nullable(),
+    pageTitle: z.string().refine(points(120)).refine(noControl).nullable(),
     elements: z.array(element).max(PAGE_ELEMENTS_MAX).refine(uniqueRefs),
     viewerFrame,
     // Optional: an OS without browser verbs v2 omits it.
-    ownerAppAccountEmail: z.string().max(OWNER_APP_EMAIL_MAX_CHARS).nullable().optional(),
+    ownerAppAccountEmail: z.string().refine(points(OWNER_APP_EMAIL_MAX_CHARS)).nullable().optional(),
 }).strict().refine(value => value.observed !== 'browser_ready' || (value.pageUrl === null && value.pageTitle === null && value.elements.length === 0))
     .refine(value => value.viewerFrame === null || FRAME_PAGES.has(value.observed))
+    // A page that may carry a frame, refs or the account e-mail must name a URL off the EZiL ID host: the IdP is
+    // transit only (contract §2), whatever kind a reply calls it.
+    .refine(value => !FRAME_PAGES.has(value.observed) || (value.pageUrl !== null && !isEzilIdUrl(value.pageUrl)))
     // The IdP is transit only: no heading and no ref to act on.
     .refine(value => value.observed !== 'interactive_sign_in_required' || (!value.profileHeadingVisible && value.elements.length === 0))
     .refine(value => value.ownerAppAccountEmail == null || OWNER_APP_PAGES.has(value.observed));
@@ -179,27 +196,49 @@ export const browserUiFailure = z.object({
         'origin_read_only']),
 }).strict();
 
-/** A query or fragment names a sensitive parameter: raw or percent-decoded once, split at `&`, `;`, `?` and `#`. */
-function namesSensitiveParameter(part: string): boolean {
-    let decoded = part;
-    try {
-        decoded = decodeURIComponent(part);
-    } catch { /* A malformed escape is checked raw. */ }
-    return [part, decoded].some(text => text.split(/[&;?#]/)
-        .some(token => SENSITIVE.has((token.split('=', 1)[0] ?? '').trim().toLowerCase())));
+/**
+ * Invisible format characters (Unicode Cf: zero-width space and joiners, bidi marks and isolates, word joiner, BOM,
+ * tags, soft hyphen) and the Hangul fillers, removed before any match.
+ */
+const INVISIBLE = /[\p{Cf}\u{115F}\u{1160}\u{3164}\u{FFA0}]/gu;
+const visible = (text: string) => text.replace(INVISIBLE, '');
+const UTF8 = new TextDecoder('utf-8', { fatal: false, ignoreBOM: true });
+/**
+ * Percent-decoded until stable (at most four rounds), without invisible characters. Each run of escapes decodes as
+ * UTF-8 with replacement, so one malformed byte cannot hide the valid escapes around it.
+ */
+function decoded(text: string): string {
+    let current = visible(text);
+    for (let round = 0; round < 4; round++) {
+        const next = visible(current.replace(/(?:%[0-9a-f]{2})+/giu,
+            run => UTF8.decode(Uint8Array.from(run.slice(1).split('%'), hex => Number.parseInt(hex, 16)))));
+        if (next === current) break;
+        current = next;
+    }
+    return current;
 }
+/** Contract §2's parameter names plus `jwt` and `accesstoken`, then optional space and `[]`, then `=`: anywhere, any case. */
+const SENSITIVE_ASSIGNMENT = new RegExp('(?:' + [...SENSITIVE_URL_PARAMS, 'jwt', 'accesstoken'].join('|') + ')\\s*(?:\\[\\])?=', 'iu');
+const assigns = (text: string) => SENSITIVE_ASSIGNMENT.test(decoded(text));
+/** A query or fragment names a sensitive parameter even without a value: split at `&`, `;`, `?` and `#`. */
+const namesSensitiveParameter = (part: string) => [part, decoded(part)].some(text => text.split(/[&;?#]/)
+    .some(token => SENSITIVE.has((token.split('=', 1)[0] ?? '').trim().toLowerCase())));
 
 /**
- * Every page URL the OS answers with, as `workflow-browser.ts` `sanitizePageUrl` treats it (contract §2, §4): an
- * EZiL ID URL keeps only its origin and path, and a URL whose query or fragment names a SENSITIVE_URL_PARAMS
- * parameter loses its whole query and fragment. The sidecar has already done this at its source.
+ * Every page URL the OS answers with, as `workflow-browser.ts` strips one (contract §2, §4), less the account
+ * e-mails the OS never sees: an EZiL ID URL, a URL with credentials, and a URL whose remainder after the origin holds
+ * a sensitive assignment or names a sensitive parameter lose their query, fragment and `;` path parameters; one whose
+ * kept path still holds an assignment keeps only its origin. The sidecar has already sanitised at its source.
  */
 export function sanitizeBrowserPageUrl(value: string | null): string | null {
     if (value === null) return null;
     const parsed = parseUrl(value);
     if (parsed === null) return null;
-    if (isEzilId(parsed) || namesSensitiveParameter(parsed.search.slice(1)) || namesSensitiveParameter(parsed.hash.slice(1))) {
-        return parsed.origin + parsed.pathname;
-    }
-    return value;
+    const base = parsed.origin !== 'null' ? parsed.origin : parsed.protocol + (parsed.host ? '//' + parsed.host : '');
+    const remainder = parsed.pathname + parsed.search + parsed.hash;
+    const strip = isEzilId(parsed) || parsed.username !== '' || parsed.password !== '' || assigns(remainder)
+        || namesSensitiveParameter(parsed.search.slice(1)) || namesSensitiveParameter(parsed.hash.slice(1));
+    const kept = strip ? parsed.pathname.split('/').map(segment => segment.split(';', 1)[0] ?? '').join('/') : remainder;
+    if (assigns(kept)) return base + '/';
+    return strip ? base + kept : value;
 }

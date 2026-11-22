@@ -77,7 +77,8 @@ export function browserUiPayload (value) {
         || value.profileHeadingVisible && value.observed !== 'profile_builder'
         || (value.pageUrl !== null && !validUrl(value.pageUrl))
         || (value.observed === 'browser_ready' && value.pageUrl !== null)
-        || (value.observed === 'approved_page' && value.pageUrl === null)
+        // A page that may carry content names its URL (the MCP refuses one that does not).
+        || (CONTENT_PAGES.has(value.observed) && value.pageUrl === null)
         || (value.pageTitle !== null && !validLabel(value.pageTitle, 120))
         || !Array.isArray(value.elements) || value.elements.length > (ELEMENTS_MAX[value.observed] ?? 0)
         || (!CONTENT_PAGES.has(value.observed) && (value.pageTitle !== null || value.elements.length || value.viewerFrame !== null))
