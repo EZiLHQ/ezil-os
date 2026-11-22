@@ -13,7 +13,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 // interviewOpenGate does, lazily), so no hosted connection is opened here.
 vi.mock('server-only', () => ({}));
 
-import { runInterviewOpenGate } from './gate';
+import { interviewOpenGate, runInterviewOpenGate } from './gate';
 import { NOTICE_SHA256 } from './notice';
 import {
     adminEvents, adminFinish, adminRegister, adminStart, consentAccept, consentStatus, eventsBatch, type HandlerResult,
@@ -198,6 +198,9 @@ describe.skipIf(!MODULE)('interview evidence on offline PostgreSQL', () => {
         const candidate = { osUserId: OS_USER, ezilIdSubject: OWNER };
         const stranger = { osUserId: 'another-os-user', ezilIdSubject: OTHER_SUBJECT };
 
+        // gate off (no ai-staging funding in the test env): the public gate short-circuits to `none`, no DB.
+        expect(await interviewOpenGate({ canonicalURL: 'https://git-qa.ezil.work/c/r.git', osUserId: OS_USER, ezilIdSubject: OWNER, computerId: 'cmp_x', purpose: 'open' })).toEqual({ kind: 'none' });
+        // no interview for the URL -> none
         expect(await gate('https://git-qa.ezil.work/no/interview.git', candidate)).toEqual({ kind: 'none' });
 
         const reg = await mk('registered');
