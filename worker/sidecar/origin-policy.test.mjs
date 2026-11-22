@@ -389,4 +389,58 @@ describe('sanitizeText', () => {
         expect(sanitizeText('', STAGING)).toBe('');
         expect(sanitizeText(undefined, STAGING)).toBe(undefined);
     });
+
+    it('relative references (markdown hrefs) lose query and fragment when either names a sensitive parameter', () => {
+        const cases = [
+            ['[back](/creator/social-login/callback/auth0?code=X&state=Y)', '[back](/creator/social-login/callback/auth0)'],
+            ['go to ./cb?state=1 now', 'go to ./cb now'],
+            ['go to ../cb#access_token=a now', 'go to ../cb now'],
+            ['href=/cb?x=1&code=2', 'href=/cb'],
+            ['"?code=abc"', '""'],
+            ['see #access_token=abc', 'see '],
+            ['[idp](//id.ezil.work/authorize?state=1)', '[idp](//id.ezil.work/authorize)'],
+            ['[cdn](//cdn.example.com/a.js?token=t)', '[cdn](//cdn.example.com/a.js)'],
+            ['{"next":"\\/cb?code=1"}', '{"next":"\\/cb"}'],
+        ];
+        for (const [text, out] of cases) {
+            expect({ text, out: sanitizeText(text, STAGING) }).toEqual({ text, out });
+        }
+    });
+
+    it('leaves relative references without sensitive parameters, and look-alikes, untouched', () => {
+        for (const text of [
+            '[next](/builder/jobs?page=2)', '[top](#overview)', '# Heading', '## Sub', '- link "Docs" [ref=e3]',
+            '- heading "Rates" [ref=e9] [level=2]', '//example.com/a?b=1', '/etc/passwd?', 'ratio 3/4', 'and/or',
+        ]) {
+            expect(sanitizeText(text, STAGING)).toBe(text);
+        }
+    });
+
+    it('the limit, stated: a `?code=` glued mid-word is not a reference and stays', () => {
+        // Not a URL and not a reference (no boundary before the `/`), so
+        // neither pass can tell it from prose. Recorded so it is a decision.
+        expect(sanitizeText('a/b?code=1', STAGING)).toBe('a/b?code=1');
+    });
+
+    it('trailing punctuation and closing brackets stay outside the URL', () => {
+        const cases = [
+            ['Go to https://a.example.com/cb?code=1.', 'Go to https://a.example.com/cb.'],
+            ['https://a.example.com/cb?code=1, then', 'https://a.example.com/cb, then'],
+            ['[x](https://a.example.com/cb?code=1)', '[x](https://a.example.com/cb)'],
+            ['(https://a.example.com/w_(x)?code=1)', '(https://a.example.com/w_(x))'],
+            ['[https://a.example.com/cb?state=2]', '[https://a.example.com/cb]'],
+            ['(see /cb?code=1).', '(see /cb).'],
+        ];
+        for (const [text, out] of cases) {
+            expect({ text, out: sanitizeText(text, STAGING) }).toEqual({ text, out });
+        }
+    });
+
+    it('under a broken policy a relative reference with a path loses every query and fragment', () => {
+        const broken = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: 'https://universe-staging.ezil.work/' });
+        expect(sanitizeText('[next](/builder/jobs?page=2) [top](#overview)', broken)).toBe('[next](/builder/jobs) [top](#overview)');
+        expect(sanitizeText('## Rates #1', broken)).toBe('## Rates #1');
+        expect(sanitizeText('[x](?code=1)', broken)).toBe('[x]()');
+        expect(sanitizeText('[next](/builder/jobs?page=2) [top](#overview)', STAGING)).toBe('[next](/builder/jobs?page=2) [top](#overview)');
+    });
 });

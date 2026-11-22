@@ -54,7 +54,7 @@ import {
     FIELD_VALUE_MAX_CHARS, FILL_FORM_MAX_FIELDS, ORIGIN_TIERS, PRESS_KEYS, SCROLL_MAX_DY, SELECT_MAX_VALUES,
     SIDECAR_WIRE,
 } from './contract.mjs';
-import { routeAllowedOnTier, sanitizeUrl, tierOf } from './origin-policy.mjs';
+import { routeAllowedOnTier, sanitizeText, sanitizeUrl, tierOf } from './origin-policy.mjs';
 
 /** Default per-verb budget. Deliberately short: an agent waiting on a hung
  *  page is worse than an agent told to try again. */
@@ -180,6 +180,16 @@ function urlOf (surface, page) {
     return sanitizeUrl(page.url(), surface.originPolicy);
 }
 
+/**
+ * Page text as it may leave this process: snapshot text, `get_text`
+ * markdown, titles, option values. Every URL in it — absolute or relative —
+ * goes through `sanitizeText`, because A3 counts `code=`/`state=` in ANY
+ * tool output, not only in `url` members.
+ */
+function textOf (surface, text) {
+    return sanitizeText(text, surface.originPolicy);
+}
+
 function present (value) {
     return value !== undefined && value !== null;
 }
@@ -246,7 +256,7 @@ export const VERBS = {
         // while it is read cannot hand a denied page's title back.
         const title = await safeTitle(page);
         assertNotLandedOnDenied(surface, page, opts);
-        return { ok: true, url: urlOf(surface, page), title };
+        return { ok: true, url: urlOf(surface, page), title: textOf(surface, title) };
     },
 
     'POST /snapshot': async (surface, body = {}, opts = {}) => {
@@ -263,9 +273,9 @@ export const VERBS = {
         surface.registerRefs(result.refs, page);
         return {
             ok: true,
-            snapshot: result.truncated ? `${result.text}\n- [snapshot truncated]` : result.text,
+            snapshot: textOf(surface, result.truncated ? `${result.text}\n- [snapshot truncated]` : result.text),
             url: urlOf(surface, page),
-            title,
+            title: textOf(surface, title),
         };
     },
 
@@ -322,7 +332,7 @@ export const VERBS = {
             'get_text',
         );
         assertTierAllows(surface, page, 'POST /get_text', body, opts);
-        return { ok: true, markdown, url: urlOf(surface, page) };
+        return { ok: true, markdown: textOf(surface, markdown), url: urlOf(surface, page) };
     },
 
     'POST /screenshot': async (surface, body = {}, opts = {}) => {
@@ -509,7 +519,8 @@ export const VERBS = {
             throw refActionFailure(err);
         }
         assertNotLandedOnDenied(surface, page, opts);
-        return { ok: true, url: urlOf(surface, page), selected: Array.isArray(selected) ? selected.map(String) : [] };
+        const now = Array.isArray(selected) ? selected.map((v) => textOf(surface, String(v))) : [];
+        return { ok: true, url: urlOf(surface, page), selected: now };
     },
 
     'POST /scroll': async (surface, body = {}, opts = {}) => {

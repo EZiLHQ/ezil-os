@@ -277,22 +277,84 @@ export function sanitizeUrl (url, policy) {
 }
 
 /**
- * Every http(s) URL inside free text, through `sanitizeUrl`. Also catches the
- * JSON-escaped form (`https:\/\/host\/cb?code=…`, PHP's default), which is
- * unescaped to sanitise and re-escaped only if something was removed. A URL
- * ends at whitespace, a quote, `<`, `>` or a backtick.
+ * Free text as it may leave: console lines, snapshot text, `get_text`
+ * markdown, titles, option values.
+ *
+ * Pass 1, absolute URLs: every `http(s)://…` through `sanitizeUrl`, including
+ * the JSON-escaped form (`https:\/\/host\/cb?code=…`, PHP's default), which is
+ * unescaped to sanitise and re-escaped only if something was removed.
+ *
+ * Pass 2, relative references, because markdown carries the page's raw
+ * `href`s and most are relative: `/cb?code=…`, `./cb?state=…`, `?code=…`,
+ * `#access_token=…` and protocol-relative `//host/cb?…`, wherever one starts
+ * after whitespace, a quote, `(`, `[`, `<`, `=` or the start of the text. A
+ * path keeps its path and loses query and fragment when either names a
+ * sensitive parameter (always, under a broken policy); `//host…` goes through
+ * `sanitizeUrl` as if it were `https:`.
+ *
+ * A URL ends at whitespace, a quote, `<`, `>` or a backtick. Trailing sentence
+ * punctuation and an unbalanced `)` or `]` are not part of it, so
+ * `[label](https://…?code=…)` keeps its closing bracket.
  */
-const URL_IN_TEXT = /https?:(?:\/\/|\\\/\\\/)[^\s"'<>`]+/gi;
+const ABSOLUTE_URL_IN_TEXT = /https?:(?:\/\/|\\\/\\\/)[^\s"'<>`]+/gi;
+const RELATIVE_REF_IN_TEXT = /(^|[\s"'(\[<=])((?:\\?\/|\.\.?\\?\/|[?#])[^\s"'<>`]*)/g;
+
+const occurrences = (s, ch) => s.split(ch).length - 1;
+
+/** `[url, trailer]`: trailing `.,;:!?` and unbalanced `)`/`]` moved out of a match. */
+function splitTrailer (match) {
+    let end = match.length;
+    for (;;) {
+        const head = match.slice(0, end);
+        const c = head[end - 1];
+        if (end > 1 && '.,;:!?'.includes(c)) { end -= 1; continue; }
+        if (c === ')' && occurrences(head, '(') < occurrences(head, ')')) { end -= 1; continue; }
+        if (c === ']' && occurrences(head, '[') < occurrences(head, ']')) { end -= 1; continue; }
+        return [head, match.slice(end)];
+    }
+}
+
+/** Run `clean` on the unescaped form of a `\/`-escaped match, re-escaping only if it changed. */
+function throughEscapes (match, clean) {
+    const escaped = match.includes('\\/');
+    const plain = escaped ? match.replace(/\\\//g, '/') : match;
+    const out = clean(plain);
+    if (out === plain) return match;
+    return escaped ? out.replace(/\//g, '\\/') : out;
+}
+
+function sanitizeRelative (ref, sets, policy) {
+    if (ref.startsWith('//')) {
+        const absolute = `https:${ref}`;
+        const out = sanitizeUrl(absolute, policy);
+        return out === absolute ? ref : out.replace(/^https:/, '');
+    }
+    const cut = ref.search(/[?#]/);
+    if (cut === -1) return ref;
+    const rest = ref.slice(cut);
+    const hashAt = rest.indexOf('#');
+    const query = hashAt === -1 ? rest : rest.slice(0, hashAt);
+    const fragment = hashAt === -1 ? '' : rest.slice(hashAt);
+    // Under a broken policy (`classify(sets, null)` is transit for everything)
+    // a reference WITH a path takes the transit form. A bare `#…`/`?…` token
+    // has no path and may be a heading or an anchor, so it only loses what
+    // names a sensitive parameter.
+    const transit = cut > 0 && classify(sets, null) === 'idp_transit';
+    return transit || hasSensitiveParam(query) || hasSensitiveParam(fragment) ? ref.slice(0, cut) : ref;
+}
 
 export function sanitizeText (text, policy) {
-    tierSets(policy);
+    const sets = tierSets(policy);
     if (typeof text !== 'string' || text.length === 0) return text;
-    return text.replace(URL_IN_TEXT, (match) => {
-        const escaped = match.includes('\\/');
-        const plain = escaped ? match.replace(/\\\//g, '/') : match;
-        const clean = sanitizeUrl(plain, policy);
-        if (clean === plain) return match;
-        return escaped ? clean.replace(/\//g, '\\/') : clean;
+    const absolute = text.replace(ABSOLUTE_URL_IN_TEXT, (match) => {
+        const [url, trailer] = splitTrailer(match);
+        const out = throughEscapes(url, (plain) => sanitizeUrl(plain, policy));
+        return out === url ? match : out + trailer;
+    });
+    return absolute.replace(RELATIVE_REF_IN_TEXT, (all, lead, ref) => {
+        const [core, trailer] = splitTrailer(ref);
+        const out = throughEscapes(core, (plain) => sanitizeRelative(plain, sets, policy));
+        return out === core ? all : lead + out + trailer;
     });
 }
 

@@ -514,6 +514,17 @@ describe('no OAuth parameter leaves in any handler output', () => {
             const surface = surfaceOver([page]);
             await surface.activePage(); // attach listeners
 
+            // The page's OWN text carries the URLs too: its title (plain and
+            // JSON-escaped), its markdown (an absolute link and the relative
+            // href a real page would have), a snapshot name, an option value.
+            const u = new URL(pageUrl);
+            const relative = `${u.pathname}${u.search}${u.hash}`;
+            const escaped = pageUrl.replace(/\//g, '\\/');
+            page.titleText = `Signed in: ${pageUrl} (${escaped})`;
+            page.text = `Builder: continue at ${pageUrl} or [back](${relative}) or [again](${pageUrl}).`;
+            page.elements.set('e7', { ref: 'e7', role: 'link', name: `Return to ${pageUrl}`, tag: 'a' });
+            page.elements.get('e3').optionValues = ['hour', pageUrl];
+
             // Everything the buffers can hold, carrying the URLs.
             for (const url of [pageUrl, CALLBACK_URL_2, AUTHORIZE_URL_2]) {
                 page.log(`redirect to ${url}`, url);
@@ -545,7 +556,15 @@ describe('no OAuth parameter leaves in any handler output', () => {
                 : 'https://id.ezil.work/authorize';
             const navigate = outputs.find((o) => o.route === 'POST /navigate').out;
             expect(navigate.url).toBe(sanitized);
+            expect(navigate.title).toContain(`Signed in: ${sanitized} (`);
             if (isOwner) {
+                const path = new URL(sanitized).pathname;
+                const { snapshot, title } = outputs.find((o) => o.route === 'POST /snapshot').out;
+                expect(snapshot).toContain(`- link "Return to ${sanitized}" [ref=e7]`);
+                expect(title).toContain(sanitized);
+                const { markdown } = outputs.find((o) => o.route === 'POST /get_text').out;
+                expect(markdown).toBe(`# Builder: continue at ${sanitized} or [back](${path}) or [again](${sanitized}).`);
+                expect(outputs.find((o) => o.route === 'POST /select').out.selected).toEqual([sanitized]);
                 const { entries } = outputs.find((o) => o.route === 'POST /console').out;
                 const { requests } = outputs.find((o) => o.route === 'POST /network').out;
                 expect(entries.length).toBe(9);
@@ -840,6 +859,16 @@ describe('/select', () => {
         expect(await codeOf(VERBS['POST /select'](surface, { ref: 'e1', values: ['day'] }))).toBe('bad_ref'); // textbox
         expect(await codeOf(VERBS['POST /select'](surface, { ref: 'e5', values: ['day'] }))).toBe('bad_ref'); // ARIA listbox
         expect(page.actions).toEqual([]);
+    });
+
+    it('`selected` option values leave through sanitizeText (page text, not caller text)', async () => {
+        const { surface, page } = owner();
+        page.elements.get('e3').optionValues = ['hour', 'https://universe-staging.ezil.work/cb?state=Q1w2'];
+        const out = await VERBS['POST /select'](surface, { ref: 'e3', values: ['day'] });
+        expect(out.selected).toEqual(['https://universe-staging.ezil.work/cb']);
+        // Positive control: an ordinary value is returned as it is.
+        page.elements.get('e3').optionValues = ['hour', 'per-day'];
+        expect((await VERBS['POST /select'](surface, { ref: 'e3', values: ['day'] })).selected).toEqual(['per-day']);
     });
 
     it('a value no option has is bad_request at once, not a timeout', async () => {
