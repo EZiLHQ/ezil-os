@@ -211,6 +211,14 @@ describe('handleComputerTools: toolsd transport and relay', () => {
     expect(await res.json()).toEqual({ ok: false, error: 'computer_unavailable' });
   });
 
+  it('🔴 relays a toolsd 401 as 503 computer_unavailable (key mismatch is not a delegation refusal)', async () => {
+    const sb = fakeSandbox({ fetch: async () => new Response(JSON.stringify({ ok: false, error: 'tools_unauthorized' }), { status: 401 }) });
+    const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), sb, deps());
+    expect(res.status).toBe(503);
+    expect(await res.json()).toEqual({ ok: false, error: 'computer_unavailable' });
+    expect(sb.calls).toHaveLength(1); // it WAS forwarded; only the status is remapped
+  });
+
   it('a toolsd reply larger than 524,288 bytes is 503 computer_unavailable', async () => {
     const sb = fakeSandbox({ fetch: async () => new Response('x'.repeat(524_289), { status: 200 }) });
     const res = await handleComputerTools(osRequest(callBody), ENV, COMPUTER_TOOLS_ORIGIN, SANDBOX_ID, claims(), sb, deps());

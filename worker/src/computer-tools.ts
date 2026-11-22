@@ -191,9 +191,13 @@ export async function handleComputerTools(
   } catch {
     return reply(503, { ok: false, error: 'computer_unavailable' });
   }
-  // 409 is `runningContainerFetch`'s "not running" sentinel — toolsd itself
-  // never answers 409, so this is unambiguous.
-  if (upstream.status === 409) return reply(503, { ok: false, error: 'computer_unavailable' });
+  // 409 is `runningContainerFetch`'s "not running" sentinel. 401 is toolsd's
+  // own MAC refusal — an in-container key/boot mismatch, which is an
+  // unavailability fault, NOT a delegation refusal, so it must not surface to
+  // the caller as a 401. Both map to 503 computer_unavailable (contract 3.3
+  // clarification). Every other status (200, 400, 404, 429, 500, …) relays
+  // unchanged.
+  if (upstream.status === 409 || upstream.status === 401) return reply(503, { ok: false, error: 'computer_unavailable' });
 
   // Relay the toolsd status and body, bounded. Larger than the bound → 503.
   const remaining = deadline - Date.now();

@@ -95,13 +95,13 @@ function boot(): void {
   // Prerequisites the image must satisfy for toolsd to drop privilege.
   const uid = dexec(['id', '-u', 'ezil-run']);
   if ((uid.stdout || '').trim() !== '7001') throw new Error(`ezil-run is not uid 7001 (got '${(uid.stdout || uid.stderr || '').trim()}')`);
-  if (dexec(['sh', '-c', 'command -v setpriv']).status !== 0) throw new Error('setpriv (util-linux) is not installed in the image');
+  if (dexec(['test', '-x', '/usr/bin/setpriv']).status !== 0) throw new Error('/usr/bin/setpriv (util-linux) is not installed in the image');
 
   // A workspace with one self-built tool, writable so the scan sees it.
   const setup = dexec(['bash', '-lc',
     `set -e; mkdir -p ${WORKSPACE}/.ezil/tools/greet; `
     + `printf '%s' '{"schema":"ezil.tool/1","name":"greet","description":"greet","inputSchema":{"type":"object"},"run":{"argv":["./run.sh"]},"timeoutSeconds":10}' > ${WORKSPACE}/.ezil/tools/greet/tool.json; `
-    + `printf '%s' '#!/bin/bash\\nread -r a\\necho "uid=$(id -u) args=$a"\\n' > ${WORKSPACE}/.ezil/tools/greet/run.sh; `
+    + `printf '%s' '#!/bin/bash\\nread -r a\\necho "uid=$(id -u) gid=$(id -g) groups=$(id -G) args=$a"\\n' > ${WORKSPACE}/.ezil/tools/greet/run.sh; `
     + `chmod -R a+rx ${WORKSPACE}`]);
   if (setup.status !== 0) throw new Error(`workspace setup failed: ${(setup.stderr || '').trim()}`);
 
@@ -191,6 +191,11 @@ describe('toolsd in the real image', () => {
     expect(job.ok).toBe(true);
     expect(job.state).toBe('exited');
     expect(job.stdout).toContain('uid=7001');
+    // gid 7001 and NO supplementary groups (id -G is exactly 7001) — the real
+    // --clear-groups drop in the image, not just a uid change.
+    expect(job.stdout).toMatch(/\bgid=7001\b/);
+    expect(job.stdout).toMatch(/\bgroups=7001\b/);
+    expect(job.stdout).not.toMatch(/groups=[^ ]*\b0\b/);
     expect(job.stdout).toContain('args={"x":1}');
     expect(job.catalogDigest).toMatch(/^sha256:/);
   });
