@@ -395,7 +395,6 @@ jobs:
         run: PATH="$PWD/sdk/node_modules/.bin:$PATH" bun run --cwd tools typecheck
       - name: Unit tests
         shell: bash
-        # `./tools/` is a path; a bare `tools/` is a substring filter that also matches app/src/server/computer-tools/.
         run: bun test ./tools/
       - name: Hosted migration helper tests
         shell: bash
