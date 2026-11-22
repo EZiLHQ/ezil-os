@@ -69,7 +69,12 @@ describe('staging Worker resources and routes', () => {
       AWS_ORIGIN_ZONE: 'ezil.work',
       AWS_ORIGIN_ZONE_ALLOWLIST: 'ezil.work',
       EZIL_EDITOR_BRIDGE_ENVIRONMENT: 'staging',
+      // Browser verbs v2 origin tiers (docs/contracts/browser-verbs-v2.md §2, §6): staging vars only.
+      EZIL_BROWSER_OWNER_APP_ORIGINS: 'https://universe-staging.ezil.work',
+      EZIL_BROWSER_IDP_ORIGINS: 'https://id.ezil.work',
     });
+    expect(config.vars.EZIL_BROWSER_OWNER_APP_ORIGINS).toBeUndefined();
+    expect(config.vars.EZIL_BROWSER_IDP_ORIGINS).toBeUndefined();
     expect(config.vars.EZIL_EDITOR_BRIDGE_ENVIRONMENT).toBeUndefined();
     expect(config.vars.EZIL_OS_BRIDGE_URL).toBeUndefined();
     expect(staging.vars.EZIL_OS_BRIDGE_URL).toBeUndefined();

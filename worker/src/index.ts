@@ -305,6 +305,12 @@ interface Env extends SandboxEnv {
   EZIL_CODE_BROWSER_MCP?: string;
   /** Exact test origins conveyed to the private sidecar at boot. */
   EZIL_BROWSER_TEST_ALLOWED_ORIGINS?: string;
+  /**
+   * Browser verbs v2 origin tiers (docs/contracts/browser-verbs-v2.md §2, §6): comma lists of bare
+   * https origins, conveyed to the sidecar at boot by `browserOpenBootEnv`. Staging vars only.
+   */
+  EZIL_BROWSER_OWNER_APP_ORIGINS?: string;
+  EZIL_BROWSER_IDP_ORIGINS?: string;
   /** Explicit isolated staging computer only; absent in production. */
   EZIL_ACCEPTANCE_ENV?: string;
   EZIL_ACCEPTANCE_SANDBOX?: string;
@@ -7785,6 +7791,13 @@ async function handleTerminate(env: Env, sandboxName: string): Promise<Response>
  * (`{ok:false,error,detail}` at HTTP 200) and its own redaction pass; there is
  * nothing useful for this layer to add and a great deal it could accidentally
  * remove.
+ *
+ * ── The third lock: the verb bearer (browser verbs v2 §3) ───────────────────
+ * Every verb is forwarded with `Authorization: Bearer <per-sandbox token>`,
+ * the same HMAC `EZIL-WORKER-BROWSER-OPEN/1` derivation `browserOpenBootEnv`
+ * hands the sidecar at boot, and the sidecar answers 401 to every verb route
+ * without it. With no derivation secret there is no token to send: the
+ * request goes without one and the sidecar refuses it.
  */
 async function handleBrowserSidecar(
   request: Request,
@@ -7824,6 +7837,9 @@ async function handleBrowserSidecar(
 
   const sandbox = openSandbox(env, sandboxName);
   try {
+    // The per-sandbox verb bearer, derived exactly as the boot env derives it.
+    const capability = await workerBrowserOpenCapability(env, sandboxName);
+    const bearer: Record<string, string> = capability ? { authorization: 'Bearer ' + capability } : {};
     // `health` is the sidecar's only GET. The forwarded method is taken from
     // `resolved`, so the container is asked exactly what the contract says the
     // verb is — never what the caller happened to use.
@@ -7838,10 +7854,10 @@ async function handleBrowserSidecar(
       sandbox.containerFetch(
         resolved.url,
         resolved.method === 'GET'
-          ? { method: 'GET' }
+          ? { method: 'GET', headers: bearer }
           : {
               method: 'POST',
-              headers: { 'content-type': 'application/json' },
+              headers: { 'content-type': 'application/json', ...bearer },
               body: sidecarRequestBody(body),
             },
         BROWSER_SIDECAR_PORT,
@@ -7968,6 +7984,15 @@ async function handleBrowserOpen(request: Request, env: Env, url: URL, target: s
   }
 }
 
+/**
+ * The delegated observation route's byte bounds at browser verbs v2. A request is the App's signed body:
+ * up to its own 512 KiB bound (a 20-field `fill_form` of 4000-character values, `\uXXXX`-escaped at worst)
+ * plus the binding it adds. A result is the sidecar's closed projection, which the App and the MCP read
+ * under 160 KiB. The legacy read keeps 1024 in and 2048 out.
+ */
+const BROWSER_OBSERVE_REQUEST_MAX_BYTES = 513 * 1024;
+const BROWSER_OBSERVE_RESULT_MAX_BYTES = 160 * 1024;
+
 async function workerBrowserOpenCapability(env: Env, sandboxId: string): Promise<string | null> {
   const secret = resolveNekoDerivationSecret(env);
   if (!secret) return null;
@@ -7976,19 +8001,46 @@ async function workerBrowserOpenCapability(env: Env, sandboxId: string): Promise
   return btoa(String.fromCharCode(...raw)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+/**
+ * What the sidecar learns at boot.
+ *
+ * Browser verbs v2 adds two things that do not depend on the open, control or
+ * Code switches, because every caller of the sidecar depends on them (and so
+ * the open route has its own `EZIL_WORKER_BROWSER_OPEN`, as control has
+ * `EZIL_WORKER_BROWSER_CONTROL`):
+ *   - the origin tiers (§2), whenever they are set: the tier gate applies to
+ *     this Worker's verb route as much as to the MCP and Code paths;
+ *   - the per-sandbox verb bearer (§3), whenever the verb route is open
+ *     (`SANDBOX_BROWSER` not disabled): `handleBrowserSidecar` sends it on
+ *     every verb, and the sidecar refuses every verb route without it.
+ * Everything else is conveyed exactly as before.
+ */
 async function browserOpenBootEnv(env: Env, sandboxId: string): Promise<Record<string, string>> {
   const allowedOrigins = env.EZIL_BROWSER_TEST_ALLOWED_ORIGINS?.trim();
   const code = env.EZIL_CODE_BROWSER_MCP === 'on';
   const worker = env.SANDBOX_MCP_BROWSER_OPEN === 'on';
   const control = env.SANDBOX_MCP_BROWSER_CONTROL === 'on';
-  if ((!allowedOrigins && !control) || (!code && !worker && !control)) return {};
-  const capability = worker || control ? await workerBrowserOpenCapability(env, sandboxId) : null;
-  if (!code && !capability) return {};
-  return {
-    ...(allowedOrigins && { EZIL_BROWSER_TEST_ALLOWED_ORIGINS: allowedOrigins }),
-    ...(control && capability ? { EZIL_WORKER_BROWSER_CONTROL: 'on' } : {}),
-    ...(code ? { EZIL_CODE_BROWSER_MCP: 'on' } : {}),
+  const verbs = !diagDisabled(env.SANDBOX_BROWSER);
+  const ownerApps = env.EZIL_BROWSER_OWNER_APP_ORIGINS?.trim();
+  const idps = env.EZIL_BROWSER_IDP_ORIGINS?.trim();
+  const capability = worker || control || verbs ? await workerBrowserOpenCapability(env, sandboxId) : null;
+  const always: Record<string, string> = {
+    ...(ownerApps && { EZIL_BROWSER_OWNER_APP_ORIGINS: ownerApps }),
+    ...(idps && { EZIL_BROWSER_IDP_ORIGINS: idps }),
     ...(capability ? { EZIL_WORKER_BROWSER_MCP_TOKEN: capability } : {}),
+  };
+  // The open and control surfaces' own capability, exactly as before verbs v2.
+  const openCapability = worker || control ? capability : null;
+  if ((!allowedOrigins && !control) || (!code && !worker && !control)) return always;
+  if (!code && !openCapability) return always;
+  return {
+    ...always,
+    ...(allowedOrigins && { EZIL_BROWSER_TEST_ALLOWED_ORIGINS: allowedOrigins }),
+    // Each Worker surface on the sidecar has its own switch: the bearer above is on every boot with the verb
+    // route open, so it can no longer stand for "the open route is on" (the sidecar requires this flag too).
+    ...(worker && openCapability ? { EZIL_WORKER_BROWSER_OPEN: 'on' } : {}),
+    ...(control && openCapability ? { EZIL_WORKER_BROWSER_CONTROL: 'on' } : {}),
+    ...(code ? { EZIL_CODE_BROWSER_MCP: 'on' } : {}),
   };
 }
 
@@ -8394,7 +8446,7 @@ const worker = {
       try {
         const aws = await awsControlTarget(env, request, target, 'browser_observe');
         if (aws) return json({ ok: false, error: 'browser_unavailable' }, 409);
-        const input = await readBoundedBody(request, 4096);
+        const input = await readBoundedBody(request, BROWSER_OBSERVE_REQUEST_MAX_BYTES);
         if (input === 'too_large') return json({ ok: false, error: 'browser_invalid_request' }, 413);
         const body = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(input);
         let parsed: unknown;
@@ -8417,7 +8469,7 @@ const worker = {
         const upstream = await withDeadline(openSandbox(env, target).observeExistingBrowser(body, deadline, capability ?? undefined), 8_000, 'browser.observe');
         const remaining = deadline - Date.now();
         if (remaining <= 0) return json({ ok: false, error: 'browser_unavailable' }, 503);
-        const bytes = await withDeadline(readBoundedBody(upstream, modern ? 96_000 : 2048), remaining, 'browser.observe.body');
+        const bytes = await withDeadline(readBoundedBody(upstream, modern ? BROWSER_OBSERVE_RESULT_MAX_BYTES : 2048), remaining, 'browser.observe.body');
         if (bytes === 'too_large') throw new Error('browser_oversized');
         return new Response(bytes, { status: upstream.status, headers: { 'content-type': 'application/json', 'cache-control': 'no-store' } });
       } catch {

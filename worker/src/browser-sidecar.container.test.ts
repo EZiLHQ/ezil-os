@@ -74,6 +74,15 @@ const FIXTURE_URL = `http://127.0.0.1:${FIXTURE_PORT}/login.html`;
  *  grep, and above `MIN_SECRET_LENGTH` by a wide margin. */
 const SECRET = 'hunter2-correct-horse-battery-staple';
 
+/**
+ * The verb bearer (browser verbs v2 §3): every sidecar verb route answers 401
+ * without `Authorization: Bearer $EZIL_WORKER_BROWSER_MCP_TOKEN`. In production
+ * the Worker derives it per sandbox and hands it over at boot; this suite
+ * boots the container itself, so it supplies a fixed 43-character test value.
+ */
+const VERB_BEARER = 's1-sidecar-container-suite-verb-bearer-0000';
+const AUTH_HEADER = `authorization: Bearer ${VERB_BEARER}`;
+
 function sh (cmd: string, args: string[], timeout = 60_000) {
     return spawnSync(cmd, args, { encoding: 'utf8', timeout, maxBuffer: 64 * 1024 * 1024 });
 }
@@ -111,7 +120,7 @@ interface SidecarResponse { [k: string]: unknown }
 function verb (name: string, body: unknown): SidecarResponse {
     const res = dexec([
         'curl', '-s', '--max-time', '90',
-        '-X', 'POST', '-H', 'content-type: application/json',
+        '-X', 'POST', '-H', 'content-type: application/json', '-H', AUTH_HEADER,
         '--data-binary', JSON.stringify(body),
         `http://127.0.0.1:9223/${name}`,
     ]);
@@ -136,6 +145,7 @@ function boot (): void {
         'run', '-d', '--name', CONTAINER, '--cpus=2',
         '-e', 'DESKTOP_MODE=neko',
         '-e', 'EZIL_BROWSER_SIDECAR=on',
+        '-e', `EZIL_WORKER_BROWSER_MCP_TOKEN=${VERB_BEARER}`,
         '-e', 'NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=s1admin',
         '-e', 'NEKO_PASSWORD_ADMIN=s1admin',
         '-e', 'NEKO_MEMBER_MULTIUSER_USER_PASSWORD=s1user',
@@ -166,7 +176,7 @@ function boot (): void {
     // wait for its port separately rather than assuming readiness covers it.
     const sidecarDeadline = Date.now() + 60_000;
     while (Date.now() < sidecarDeadline) {
-        const h = dexec(['curl', '-s', '--max-time', '3', 'http://127.0.0.1:9223/health'], 20_000);
+        const h = dexec(['curl', '-s', '--max-time', '3', '-H', AUTH_HEADER, 'http://127.0.0.1:9223/health'], 20_000);
         if ((h.stdout || '').includes('"ok":true')) return;
         Bun.sleepSync(1000);
     }
@@ -259,10 +269,20 @@ describe('browser sidecar: a real container, a real Chrome', () => {
     itIf('the sidecar answers on the routable address — the containerFetch path', () => {
         const ip = (sh('docker', ['inspect', '-f',
             '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}', CONTAINER]).stdout || '').trim();
-        const res = dexec(['curl', '-s', '--max-time', '10', `http://${ip}:9223/health`]);
+        const res = dexec(['curl', '-s', '--max-time', '10', '-H', AUTH_HEADER, `http://${ip}:9223/health`]);
         const body = JSON.parse((res.stdout || '{}').trim()) as { ok?: boolean; chromeConnected?: boolean };
         expect(body.ok).toBe(true);
         expect(body.chromeConnected).toBe(true);
+    });
+
+    itIf('every verb route refuses a missing or wrong bearer with 401 (browser verbs v2 §3)', () => {
+        expect(VERB_BEARER).toMatch(/^[A-Za-z0-9_-]{43}$/);
+        for (const [path, auth] of [['health', []], ['snapshot', []], ['snapshot', ['-H', 'authorization: Bearer ' + 'x'.repeat(43)]]] as const) {
+            const res = dexec(['curl', '-s', '--max-time', '10', '-o', '/dev/null', '-w', '%{http_code}',
+                ...(path === 'health' ? [] : ['-X', 'POST', '-H', 'content-type: application/json', '-d', '{}']),
+                ...auth, `http://127.0.0.1:9223/${path}`]);
+            expect(`${path}=${(res.stdout || '').trim()}`).toBe(`${path}=401`);
+        }
     });
 
     itIf('a navigation changes the page the DESKTOP is showing', () => {

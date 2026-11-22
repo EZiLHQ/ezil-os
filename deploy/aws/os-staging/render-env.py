@@ -69,6 +69,14 @@ STAGING_BROWSER_OBSERVE = "EZIL_DELEGATED_BROWSER_OBSERVE"
 STAGING_BROWSER_OPEN = "EZIL_DELEGATED_BROWSER_OPEN_URL"
 STAGING_BROWSER_CONTROL = "EZIL_DELEGATED_BROWSER_CONTROL"
 STAGING_BROWSER_ORIGINS = "EZIL_BROWSER_TEST_ALLOWED_ORIGINS"
+# Browser verbs v2 origin tiers (docs/contracts/browser-verbs-v2.md section 6), staging only: comma lists of at most
+# 20 bare https origins, as worker/sidecar/origin-policy.mjs parses them. An identity provider is never an owner app
+# and never a test origin, and EZiL ID is an identity provider whatever the list says. Matched by host, so another
+# port on an IdP host is refused too. An owner list needs an IdP list (the contract's broken-policy rule).
+STAGING_BROWSER_OWNER_APP_ORIGINS = "EZIL_BROWSER_OWNER_APP_ORIGINS"
+STAGING_BROWSER_IDP_ORIGINS = "EZIL_BROWSER_IDP_ORIGINS"
+ALWAYS_IDP_HOSTS = frozenset(("id.ezil.work",))
+BROWSER_TIER_MAX_ENTRIES = 20
 STAGING_PREVIEW_TOKEN_V2 = "EZIL_PREVIEW_TOKEN_V2"
 # Provider-aware observation targets (App contract): comma-separated <aws-ec2|cloudflare>:<canonical lowercase UUID>;
 # only aws-ec2 entries activate the AWS branch. Staging-only and off when absent.
@@ -103,6 +111,7 @@ def validate(values, environment="staging"):
     staging_keys = frozenset((
         STAGING_BROWSER_OBSERVE, STAGING_BROWSER_OPEN, STAGING_BROWSER_CONTROL, STAGING_BROWSER_ORIGINS,
         STAGING_PREVIEW_TOKEN_V2, STAGING_ONBOARDING, STAGING_BROWSER_OBSERVE_TARGETS,
+        STAGING_BROWSER_OWNER_APP_ORIGINS, STAGING_BROWSER_IDP_ORIGINS,
     ))
     allowed = REQUIRED | OPTIONAL | (staging_keys if environment == "staging" else frozenset())
     if any(key not in allowed and not REGIONAL.fullmatch(key) for key in values):
@@ -155,10 +164,12 @@ def validate(values, environment="staging"):
     if targets is not None and not all(BROWSER_OBSERVE_TARGET.fullmatch(entry.strip()) for entry in targets.split(",")):
         raise RenderError("Browser observation targets must be comma-separated aws-ec2 or cloudflare canonical UUIDs")
     origins = values.get(STAGING_BROWSER_ORIGINS)
+    entries = []
     if origins is not None or values.get(STAGING_BROWSER_OPEN) == "enabled":
         entries = [value for value in re.split(r"[\s,]+", origins or "") if value]
         if not entries or len(entries) > 20 or any(not browser_test_origin(entry) for entry in entries):
             raise RenderError("Browser navigation requires a bounded list of approved project origins")
+    validate_browser_tiers(values, entries)
     if environment == "production":
         validate_production(values)
     elif any(marker in value for value in values.values() for marker in PRODUCTION_MARKERS):
@@ -176,10 +187,48 @@ def bare_https_origin(value):
     return bool(match) and (match.group(1) is None or 0 < int(match.group(1)) < 65536 and match.group(1) != "443")
 
 
+def dns_https_origin(value):
+    """A bare https origin on a dotted DNS name: never an IP literal or a .localhost name."""
+    if not bare_https_origin(value):
+        return False
+    host = urlsplit(value).hostname
+    return bool(host and "." in host and not host.endswith(".localhost") and not re.fullmatch(r"[0-9.]+", host))
+
+
+def browser_tier_origins(value):
+    """Mirror origin-policy.mjs: comma-separated bare https origins, at most 20, every entry well formed."""
+    entries = [entry.strip() for entry in value.split(",")]
+    if len(entries) > BROWSER_TIER_MAX_ENTRIES or any(not dns_https_origin(entry) for entry in entries):
+        raise RenderError("Browser origin tiers require a comma list of at most 20 bare https origins")
+    return entries
+
+
+def origin_host(origin):
+    """The host an origin names, case-folded and without trailing dots: tiers are compared by host."""
+    return (urlsplit(origin).hostname or "").rstrip(".").lower()
+
+
+def validate_browser_tiers(values, test_origins):
+    """Browser verbs v2 section 6: an IdP origin is never an owner app or a test origin; owner and test lists never overlap."""
+    owners = browser_tier_origins(values[STAGING_BROWSER_OWNER_APP_ORIGINS]) \
+        if STAGING_BROWSER_OWNER_APP_ORIGINS in values else []
+    idps = browser_tier_origins(values[STAGING_BROWSER_IDP_ORIGINS]) if STAGING_BROWSER_IDP_ORIGINS in values else []
+    # An owner list without an IdP list is a broken policy in the sidecar (every page transit only): refuse it here.
+    if owners and not idps:
+        raise RenderError("Browser owner-app origins require the identity provider origins")
+    idp_hosts = ALWAYS_IDP_HOSTS | {origin_host(origin) for origin in idps}
+    if any(origin_host(origin) in idp_hosts for origin in owners):
+        raise RenderError("An identity provider origin is never an owner app")
+    if any(origin_host(origin) in idp_hosts for origin in test_origins):
+        raise RenderError("An identity provider origin is never a Browser test origin")
+    # By host as well: the same app on another port or scheme is still the owner app.
+    if {origin_host(origin) for origin in owners} & {origin_host(origin) for origin in test_origins}:
+        raise RenderError("An owner app origin is never a Browser test origin")
+
+
 def browser_test_origin(value):
-    if bare_https_origin(value):
-        host = urlsplit(value).hostname
-        return bool(host and "." in host and not host.endswith(".localhost") and not re.fullmatch(r"[0-9.]+", host))
+    if dns_https_origin(value):
+        return True
     match = re.fullmatch(r"http://127\.0\.0\.1:([1-9][0-9]{3,4})", value)
     if not match:
         return False

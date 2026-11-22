@@ -202,6 +202,14 @@ function installCleanupOnExit() {
 installCleanupOnExit();
 const PORT = 18291;
 const SIDECAR_PORT = 18292;
+/**
+ * The verb bearer (browser verbs v2 §3): every sidecar verb route, `/health`
+ * included, answers 401 without `Authorization: Bearer
+ * $EZIL_WORKER_BROWSER_MCP_TOKEN`. The Worker derives it per sandbox in
+ * production; this suite boots the container itself, so it hands over a fixed
+ * 43-character test value and sends it on every sidecar call.
+ */
+const VERB_BEARER = 'mobile-keyboard-container-suite-verb-bearer';
 const MUX_PORT = 18293;
 const PAGE_PORT = 3112;   // served INSIDE the container
 const BOOT_TIMEOUT_MS = 240_000;
@@ -337,6 +345,7 @@ function boot(): void {
     // ON: the end-to-end checks read the remote page back through it, which is
     // the only way to assert the TEXT rather than a frame count.
     '-e', 'EZIL_BROWSER_SIDECAR=on',
+    '-e', `EZIL_WORKER_BROWSER_MCP_TOKEN=${VERB_BEARER}`,
     '-e', 'NEKO_MEMBER_MULTIUSER_ADMIN_PASSWORD=s1admin',
     '-e', 'NEKO_PASSWORD_ADMIN=s1admin',
     '-e', 'NEKO_MEMBER_MULTIUSER_USER_PASSWORD=s1user',
@@ -362,7 +371,8 @@ function boot(): void {
       if (serve.status !== 0) throw new Error(`fixture page did not serve: ${(serve.stderr || '').trim()}`);
       const sidecarDeadline = Date.now() + 120_000;
       while (Date.now() < sidecarDeadline) {
-        const h = sh('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}', `http://127.0.0.1:${SIDECAR_PORT}/health`], 15_000);
+        const h = sh('curl', ['-s', '-o', '/dev/null', '-w', '%{http_code}', '-H', `authorization: Bearer ${VERB_BEARER}`,
+          `http://127.0.0.1:${SIDECAR_PORT}/health`], 15_000);
         if ((h.stdout || '').trim() === '200') return;
         Bun.sleepSync(2000);
       }
@@ -457,7 +467,7 @@ async function remoteTextAfter(sequence: string): Promise<string> {
   const script = `${PW_RESOLVE}
     const sc = async (v, b) => (await fetch('http://127.0.0.1:${SIDECAR_PORT}/' + v, {
       method: v === 'health' ? 'GET' : 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', authorization: 'Bearer ${VERB_BEARER}' },
       body: v === 'health' ? undefined : JSON.stringify(b || {}) })).json();
     (async () => {
       await sc('navigate', { url: 'http://127.0.0.1:3112/' });
