@@ -123,6 +123,8 @@ async function serveFixtures (context) {
         return html(page('Not found', '<h1>Not found</h1>'), 404);
     });
     await context.route(IDP + '/**', (route) => route.fulfill({ status: 200, contentType: 'text/html', body: IDP_LOGIN }));
+    // The IdP tier matches by host whatever the scheme (contract §2, amended 2026-11-22).
+    await context.route('http://id.ezil.work/**', (route) => route.fulfill({ status: 200, contentType: 'text/html', body: IDP_LOGIN }));
     return posted;
 }
 
@@ -131,6 +133,8 @@ async function startChrome () {
     const chrome = spawn(CHROME, [
         '--headless=new', '--no-sandbox', '--disable-dev-shm-usage', '--disable-background-networking',
         '--disable-component-update', '--disable-sync', '--no-first-run', '--window-size=1280,900',
+        // Chrome upgrades http navigations to https by default; the plain-http IdP case needs the page to stay on http.
+        '--disable-features=HttpsUpgrades,HttpsFirstModeV2ForEngagedSites,HttpsFirstBalancedModeAutoEnable',
         '--remote-debugging-address=127.0.0.1', '--remote-debugging-port=0',
         '--user-data-dir=' + profile, 'about:blank',
     ], { stdio: 'ignore' });
@@ -480,6 +484,18 @@ test('real Chromium: an IdP page and the Universe sign-in handoff are sign-in on
         // Leaving it for the owner app is allowed: navigation is what transit means.
         const back = await h.act({ kind: 'navigate', url: OWNER + '/builder/profile-builder' });
         assert.equal(back.json.observed, 'profile_builder', back.text);
+
+        // The same IdP over plain http is the IdP too: sign-in only, and no URL at all (it is not https).
+        h.fresh();
+        await h.tab.goto('http://id.ezil.work/u/login?state=IDPSTATEk2Xm');
+        assert.equal(new URL(h.tab.url()).protocol, 'http:', 'the tab really is on plain http');
+        const plain = await h.read(true);
+        assert.equal(plain.json.observed, 'interactive_sign_in_required', plain.text);
+        assert.deepEqual([plain.json.pageUrl, plain.json.pageTitle, plain.json.elements, plain.json.viewerFrame, plain.json.ownerAppAccountEmail],
+            [null, null, [], null, null]);
+        assertNoLeak(plain, 'http IdP read');
+        assert.equal((await h.act({ kind: 'press', key: 'Enter' })).json.error, 'origin_read_only');
+        assert.equal(await h.tab.$$eval('[data-ezil-ref]', (els) => els.length), 0);
 
         h.fresh();
         await h.tab.goto(OWNER + '/?role=builder&redirect=' + encodeURIComponent(CALLBACK));

@@ -72,7 +72,7 @@ STAGING_BROWSER_ORIGINS = "EZIL_BROWSER_TEST_ALLOWED_ORIGINS"
 # Browser verbs v2 origin tiers (docs/contracts/browser-verbs-v2.md section 6), staging only: comma lists of at most
 # 20 bare https origins, as worker/sidecar/origin-policy.mjs parses them. An identity provider is never an owner app
 # and never a test origin, and EZiL ID is an identity provider whatever the list says. Matched by host, so another
-# port on an IdP host is refused too.
+# port on an IdP host is refused too. An owner list needs an IdP list (the contract's broken-policy rule).
 STAGING_BROWSER_OWNER_APP_ORIGINS = "EZIL_BROWSER_OWNER_APP_ORIGINS"
 STAGING_BROWSER_IDP_ORIGINS = "EZIL_BROWSER_IDP_ORIGINS"
 ALWAYS_IDP_HOSTS = frozenset(("id.ezil.work",))
@@ -208,6 +208,9 @@ def validate_browser_tiers(values, test_origins):
     owners = browser_tier_origins(values[STAGING_BROWSER_OWNER_APP_ORIGINS]) \
         if STAGING_BROWSER_OWNER_APP_ORIGINS in values else []
     idps = browser_tier_origins(values[STAGING_BROWSER_IDP_ORIGINS]) if STAGING_BROWSER_IDP_ORIGINS in values else []
+    # An owner list without an IdP list is a broken policy in the sidecar (every page transit only): refuse it here.
+    if owners and not idps:
+        raise RenderError("Browser owner-app origins require the identity provider origins")
     idp_hosts = ALWAYS_IDP_HOSTS | {urlsplit(origin).hostname for origin in idps}
     if any(urlsplit(origin).hostname in idp_hosts for origin in owners):
         raise RenderError("An identity provider origin is never an owner app")

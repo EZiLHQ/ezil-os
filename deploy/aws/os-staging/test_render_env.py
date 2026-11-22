@@ -670,14 +670,21 @@ class BrowserTierEnvironmentTests(unittest.TestCase):
             self.refused({key: self.STAGED[key]}, "production", "Unknown key refused")
         self.accepted({})
         self.accepted(self.STAGED)
-        self.accepted({self.OWNER: self.STAGED[self.OWNER]})
         self.accepted({self.IDP: self.STAGED[self.IDP]})
+
+    def test_an_owner_list_needs_an_idp_list(self):
+        # The sidecar treats an owner list without an IdP list as a broken policy (contract section 2, amended
+        # 2026-11-22): every page transit only. The renderer refuses to ship that.
+        self.refused({self.OWNER: self.STAGED[self.OWNER]}, message="require the identity provider origins")
+        self.accepted(self.STAGED)
 
     def test_each_list_is_well_formed_https_origins_and_at_most_twenty(self):
         many = ",".join(f"https://app{n}.example.invalid" for n in range(20))
-        self.accepted({self.OWNER: many})
-        self.accepted({self.OWNER: "https://a.example.invalid, https://b.example.invalid:8443"})
-        self.refused({self.OWNER: many + ",https://app20.example.invalid"}, message="at most 20")
+        self.accepted({self.OWNER: many, self.IDP: self.STAGED[self.IDP]})
+        self.accepted({self.OWNER: "https://a.example.invalid, https://b.example.invalid:8443", self.IDP: self.STAGED[self.IDP]})
+        self.accepted({self.IDP: many})
+        self.refused({self.OWNER: many + ",https://app20.example.invalid", self.IDP: self.STAGED[self.IDP]}, message="at most 20")
+        self.refused({self.IDP: many + ",https://app20.example.invalid"}, message="at most 20")
         for key in (self.OWNER, self.IDP):
             for bad in ("http://universe-staging.ezil.work", "https://universe-staging.ezil.work/",
                         "https://universe-staging.ezil.work/builder", "https://Universe-staging.ezil.work",
@@ -687,13 +694,13 @@ class BrowserTierEnvironmentTests(unittest.TestCase):
                         "https://a.example.invalid,", ",https://a.example.invalid", "https://a.example.invalid,,https://b.example.invalid",
                         "https://a.example.invalid https://b.example.invalid", "https://a.example.invalid;https://b.example.invalid"):
                 with self.subTest(key=key, bad=bad):
-                    self.refused({key: bad}, message="bare https origins")
+                    self.refused({**self.STAGED, key: bad}, message="bare https origins")
 
     def test_an_idp_origin_is_never_an_owner_app(self):
         for owners in ("https://id.ezil.work", "https://universe-staging.ezil.work,https://id.ezil.work", "https://id.ezil.work:8443"):
             with self.subTest(owners=owners):
                 # EZiL ID is an IdP whether or not the IdP list names it.
-                self.refused({self.OWNER: owners}, message="never an owner app")
+                self.refused({self.OWNER: owners, self.IDP: "https://login.example.invalid"}, message="never an owner app")
                 self.refused({self.OWNER: owners, self.IDP: "https://id.ezil.work"}, message="never an owner app")
         # Any entry of the IdP list, on any port of its host.
         self.refused({self.OWNER: "https://login.example.invalid", self.IDP: "https://login.example.invalid"},
@@ -702,6 +709,8 @@ class BrowserTierEnvironmentTests(unittest.TestCase):
                      message="never an owner app")
         # Positive control: a different host is fine.
         self.accepted({self.OWNER: "https://universe-staging.ezil.work", self.IDP: "https://id.ezil.work,https://login.example.invalid"})
+        # With no IdP list at all the owner list is refused for that reason first: EZiL ID still never passes as an owner.
+        self.refused({self.OWNER: "https://id.ezil.work"})
 
     def test_an_idp_origin_is_never_a_test_origin(self):
         for tests in ("https://id.ezil.work", "https://fixture.example.invalid,https://id.ezil.work", "https://id.ezil.work:8443"):
@@ -720,8 +729,8 @@ class BrowserTierEnvironmentTests(unittest.TestCase):
 
     def test_errors_do_not_echo_values(self):
         marker = "https://synthetic-secret-in-config.example.invalid/path"
-        for extra in ({self.OWNER: marker}, {self.IDP: marker}, {self.OWNER: "https://id.ezil.work"},
-                      {self.TEST: "https://id.ezil.work"}):
+        for extra in ({self.OWNER: marker, self.IDP: self.STAGED[self.IDP]}, {self.IDP: marker},
+                      {self.OWNER: "https://id.ezil.work", self.IDP: self.STAGED[self.IDP]}, {self.TEST: "https://id.ezil.work"}):
             with self.subTest(extra=sorted(extra)):
                 error = self.refused(extra)
                 for value in extra.values():
