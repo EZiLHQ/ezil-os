@@ -687,6 +687,7 @@ import {
   type StoredAiCreditsPending,
 } from './ai-proxy';
 import { deriveEditorBridgeToken, editorBridgeTargetAllowed, handleEditorBridgeRequest, isEditorBridgePath, resolveOsBridgeUrl, type EditorBridgeProvider } from './editor-bridge';
+import { handleComputerTools } from './computer-tools';
 
 import { captureEditorState } from './editor-state';
 import { CF_ADMISSION_ERROR, cfAdmissionRunningOnly, cfAdmissionResponse, isCfAdmissionError } from './cf-container-admission';
@@ -8314,6 +8315,15 @@ const worker = {
       } catch {
         return json({ ok: false, error: 'browser_unavailable' }, 503);
       }
+    }
+
+    // Staging computer tools (worker/src/computer-tools.ts, ezil-mcp docs/STAGING-COMPUTER-TOOLS-MCP.md 3.3):
+    // OS-signed v2 claims, then this boot's MAC to ezil-toolsd on 9224; never starts a stopped container.
+    const computerTools = path.match(/^\/sandbox\/(guac-[a-z0-9]{16}-[a-z0-9]{16})\/computer-tools$/);
+    if (method === 'POST' && computerTools) {
+      const ctSandbox = computerTools[1]!;
+      return handleComputerTools(request, env, url.origin, ctSandbox,
+        verifiedV2Claims.get(request), openSandbox(env, ctSandbox), { deriveSandboxId, withDeadline });
     }
 
     const browserMatch = path.match(/^\/sandbox\/([^/]+)\/browser\/([a-z_]+)$/);
