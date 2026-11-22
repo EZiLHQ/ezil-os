@@ -642,5 +642,110 @@ class DelegationEnvironmentTests(unittest.TestCase):
         self.assertEqual(rendered[DELEGATION_GATE], "enabled")
 
 
+class BrowserTierEnvironmentTests(unittest.TestCase):
+    """Browser verbs v2 section 6: the sidecar's origin tiers on AWS os-staging, as origin-policy.mjs parses them."""
+
+    OWNER = renderer.STAGING_BROWSER_OWNER_APP_ORIGINS
+    IDP = renderer.STAGING_BROWSER_IDP_ORIGINS
+    TEST = renderer.STAGING_BROWSER_ORIGINS
+    STAGED = {OWNER: "https://universe-staging.ezil.work", IDP: "https://id.ezil.work"}
+
+    def setUp(self):
+        self.staging = {key: "synthetic-value-never-log-1234567890" for key in renderer.REQUIRED}
+
+    def accepted(self, extra):
+        values = {**self.staging, **extra}
+        self.assertEqual(renderer.validate(values, "staging"), values)
+
+    def refused(self, extra, environment="staging", message=None):
+        with self.assertRaises(renderer.RenderError) as caught:
+            renderer.validate({**self.staging, **extra}, environment)
+        if message is not None:
+            self.assertIn(message, str(caught.exception))
+        return caught.exception
+
+    def test_names_are_staging_only_and_optional(self):
+        for key in (self.OWNER, self.IDP):
+            self.assertNotIn(key, renderer.OPTIONAL | renderer.REQUIRED)
+            self.refused({key: self.STAGED[key]}, "production", "Unknown key refused")
+        self.accepted({})
+        self.accepted(self.STAGED)
+        self.accepted({self.OWNER: self.STAGED[self.OWNER]})
+        self.accepted({self.IDP: self.STAGED[self.IDP]})
+
+    def test_each_list_is_well_formed_https_origins_and_at_most_twenty(self):
+        many = ",".join(f"https://app{n}.example.invalid" for n in range(20))
+        self.accepted({self.OWNER: many})
+        self.accepted({self.OWNER: "https://a.example.invalid, https://b.example.invalid:8443"})
+        self.refused({self.OWNER: many + ",https://app20.example.invalid"}, message="at most 20")
+        for key in (self.OWNER, self.IDP):
+            for bad in ("http://universe-staging.ezil.work", "https://universe-staging.ezil.work/",
+                        "https://universe-staging.ezil.work/builder", "https://Universe-staging.ezil.work",
+                        "https://universe-staging.ezil.work:443", "https://u:p@universe-staging.ezil.work",
+                        "https://*.ezil.work", "https://127.0.0.1", "https://localhost", "https://app.localhost",
+                        "https://universe-staging.ezil.work?x=1", "https://universe-staging.ezil.work#x", "universe-staging.ezil.work",
+                        "https://a.example.invalid,", ",https://a.example.invalid", "https://a.example.invalid,,https://b.example.invalid",
+                        "https://a.example.invalid https://b.example.invalid", "https://a.example.invalid;https://b.example.invalid"):
+                with self.subTest(key=key, bad=bad):
+                    self.refused({key: bad}, message="bare https origins")
+
+    def test_an_idp_origin_is_never_an_owner_app(self):
+        for owners in ("https://id.ezil.work", "https://universe-staging.ezil.work,https://id.ezil.work", "https://id.ezil.work:8443"):
+            with self.subTest(owners=owners):
+                # EZiL ID is an IdP whether or not the IdP list names it.
+                self.refused({self.OWNER: owners}, message="never an owner app")
+                self.refused({self.OWNER: owners, self.IDP: "https://id.ezil.work"}, message="never an owner app")
+        # Any entry of the IdP list, on any port of its host.
+        self.refused({self.OWNER: "https://login.example.invalid", self.IDP: "https://login.example.invalid"},
+                     message="never an owner app")
+        self.refused({self.OWNER: "https://login.example.invalid:8443", self.IDP: "https://id.ezil.work,https://login.example.invalid"},
+                     message="never an owner app")
+        # Positive control: a different host is fine.
+        self.accepted({self.OWNER: "https://universe-staging.ezil.work", self.IDP: "https://id.ezil.work,https://login.example.invalid"})
+
+    def test_an_idp_origin_is_never_a_test_origin(self):
+        for tests in ("https://id.ezil.work", "https://fixture.example.invalid,https://id.ezil.work", "https://id.ezil.work:8443"):
+            with self.subTest(tests=tests):
+                self.refused({self.TEST: tests}, message="never a Browser test origin")
+                self.refused({self.TEST: tests, **self.STAGED}, message="never a Browser test origin")
+        self.refused({self.TEST: "https://login.example.invalid", self.IDP: "https://login.example.invalid"},
+                     message="never a Browser test origin")
+        self.accepted({self.TEST: "https://fixture.example.invalid,http://127.0.0.1:4173", **self.STAGED})
+
+    def test_the_owner_and_test_lists_never_overlap(self):
+        self.refused({self.TEST: "https://universe-staging.ezil.work", **self.STAGED}, message="owner app origin is never")
+        self.refused({self.TEST: "https://fixture.example.invalid https://universe-staging.ezil.work", **self.STAGED},
+                     message="owner app origin is never")
+        self.accepted({self.TEST: "https://fixture.example.invalid", **self.STAGED})
+
+    def test_errors_do_not_echo_values(self):
+        marker = "https://synthetic-secret-in-config.example.invalid/path"
+        for extra in ({self.OWNER: marker}, {self.IDP: marker}, {self.OWNER: "https://id.ezil.work"},
+                      {self.TEST: "https://id.ezil.work"}):
+            with self.subTest(extra=sorted(extra)):
+                error = self.refused(extra)
+                for value in extra.values():
+                    self.assertNotIn(value, str(error))
+
+    def test_render_forwards_both_lists_verbatim_and_prints_names_only(self):
+        values = {**self.staging, **self.STAGED}
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as temporary:
+            output = io.StringIO()
+            with contextlib.ExitStack() as stack:
+                if os.geteuid() != 0:
+                    stack.enter_context(patch.object(renderer.os, "geteuid", return_value=0))
+                    stack.enter_context(patch.object(renderer.os, "chown"))
+                    stack.enter_context(patch.object(renderer.os, "fchown"))
+                with contextlib.redirect_stdout(output):
+                    renderer.render(values, Path(temporary), "staging")
+            rendered = dict(line.split("=", 1) for line in (Path(temporary) / "app.env").read_text().splitlines())
+            cron = (Path(temporary) / "cron.env").read_text()
+        self.assertEqual(rendered[self.OWNER], "https://universe-staging.ezil.work")
+        self.assertEqual(rendered[self.IDP], "https://id.ezil.work")
+        self.assertEqual(output.getvalue().splitlines(), sorted(values))
+        self.assertNotIn("https://", output.getvalue())
+        self.assertNotIn("BROWSER", cron)
+
+
 if __name__ == "__main__":
     unittest.main()
