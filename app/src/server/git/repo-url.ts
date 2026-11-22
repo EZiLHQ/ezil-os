@@ -7,7 +7,9 @@ import { createHash } from 'node:crypto';
  * docs/APP-ROUTES.md §2). The URL in the link is navigation intent only. This module decides what it may name:
  *
  * - `parseRepositoryUrl`: one canonical form or a refusal. A public `github.com` repository opens anonymously;
- *   an exact `github.ezil.work` route opens through the standalone EZiL Git service. Other Git hosts are refused.
+ *   an exact `github.ezil.work` route opens through the standalone EZiL Git service. On a staging deployment that
+ *   opts in (`opts.stagingGitQa`, contract §6), an exact `git-qa.ezil.work` route is accepted too, canonicalised
+ *   identically; without the opt-in it is refused as `unsupported_host`, as today. Other Git hosts are refused.
  *   No credentials, port, query, fragment,
  *   percent-encoding, extra path or other host, ever.
  * - `repositoryIdFor`: a stable id from the canonical URL, so `<root>/projects/<id>` is the same folder on every
@@ -20,7 +22,11 @@ import { createHash } from 'node:crypto';
 export type ParsedRepositoryUrl =
     | { ok: true; host: 'github.com'; owner: string; name: string; canonicalURL: string; displayName: string }
     | { ok: true; host: 'github.ezil.work'; owner: string; name: string; canonicalURL: string; displayName: string }
+    | { ok: true; host: 'git-qa.ezil.work'; owner: string; name: string; canonicalURL: string; displayName: string }
     | { ok: false; reason: 'invalid' | 'unsupported_host' };
+
+/** Caller-controlled opt-ins. `stagingGitQa` is the deployment's `stagingGitQaAccepted()`, passed in so tests set it. */
+export interface ParseRepositoryUrlOptions { stagingGitQa?: boolean }
 
 const MAX_URL_LENGTH = 512;
 /** GitHub's owner rule: letters, digits and single inner hyphens, at most 39. */
@@ -38,7 +44,7 @@ const EZIL_NAME = /^(?![a-z0-9._-]*\.\.)(?![a-z0-9._-]*\.git$)[a-z0-9][a-z0-9._-
 const EZIL_GIT_HOSTS = new Set(['github.ezil.work', 'git.ezil.work', 'git-staging.ezil.work', 'git-qa.ezil.work']);
 
 /** One canonical public GitHub or authenticated EZiL Git address, or a refusal. Never throws. */
-export function parseRepositoryUrl(raw: unknown): ParsedRepositoryUrl {
+export function parseRepositoryUrl(raw: unknown, opts: ParseRepositoryUrlOptions = {}): ParsedRepositoryUrl {
     const invalid = { ok: false as const, reason: 'invalid' as const };
     if (typeof raw !== 'string' || raw.length === 0 || raw.length > MAX_URL_LENGTH) return invalid;
     // Refused before parsing: anything URL parsing would normalise away or that git could read differently.
@@ -55,6 +61,20 @@ export function parseRepositoryUrl(raw: unknown): ParsedRepositoryUrl {
         const owner = parts[0]!;
         return { ok: true, host: 'github.ezil.work', owner, name,
             canonicalURL: `https://github.ezil.work/${owner}/${name}.git`, displayName: `${owner}/${name}` };
+    }
+    // git-qa.ezil.work (staging interview repositories, contract §6): accepted only when the deployment opts in, and
+    // parsed from the original string exactly like github.ezil.work above. Without the opt-in this prefix falls
+    // through to the `unsupported_host` refusal below, so every other deployment's behaviour is byte-for-byte
+    // unchanged. A malformed git-qa address (wrong segment count or grammar) is `invalid`, as for github.ezil.work.
+    const gitQaPrefix = 'https://git-qa.ezil.work/';
+    if (opts.stagingGitQa && raw.startsWith(gitQaPrefix)) {
+        const parts = raw.slice(gitQaPrefix.length).split('/');
+        if (parts.length !== 2 || !EZIL_NAMESPACE.test(parts[0]!)) return invalid;
+        const name = parts[1]!.endsWith('.git') ? parts[1]!.slice(0, -4) : parts[1]!;
+        if (!EZIL_NAME.test(name) || name.endsWith('.')) return invalid;
+        const owner = parts[0]!;
+        return { ok: true, host: 'git-qa.ezil.work', owner, name,
+            canonicalURL: `https://git-qa.ezil.work/${owner}/${name}.git`, displayName: `${owner}/${name}` };
     }
     let url: URL;
     try { url = new URL(raw); } catch { return invalid; }

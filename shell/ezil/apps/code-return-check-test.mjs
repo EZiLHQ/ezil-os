@@ -29,6 +29,8 @@ function fixture(answers = []) {
         document, el_body: document.querySelector('main'), el_iframe: document.querySelector('iframe'),
         computer: { id: 'synthetic-computer' }, STOPPED_POLL_MS: 10000, heartbeat_timer: 1,
         git_access: null, lifecycle: null, // both are declared outside the sliced production block
+        // Also outside it: the interview consent gate start_boot awaits (resolves at once for a non-interview open).
+        project: null, interview_consent: { gate: async () => {} },
         progress: { el: document.createElement('div') }, el_unavailable: document.createElement('div'),
         session: { payload: () => ({ user: { id: 'synthetic-user' } }), desktopRunning: async id => {
             probes.push(id); return answers.shift();

@@ -461,9 +461,10 @@ try {
                 desktopRunning: async () => true, reportActivity() {}, payload: () => ({}) };`,
             '../native-runtime.js': 'export const selectRuntimeAdapter = () => null, watchNativeSurface = () => () => {}, editorFailureCopy = () => ({});',
             '../runtime-recheck.js': 'export const watchRuntimeOnReturn = () => () => {};',
-            '../ui/app-spinner.js': 'export default () => ({ el: document.createElement("div"), render() {}, stamp() {}, dispose() {}, computerProgress: () => null });',
+            '../ui/app-spinner.js': 'export const computerUpdateMilestone = () => null; export default () => ({ el: document.createElement("div"), render() {}, stamp() {}, dispose() {}, computerProgress: () => null });',
             '../ui/app-drawer.js': 'export default () => document.createElement("div");',
-            '../ui/full-view.js': `export const createFullView = () => ({ allowed: true, wants: false, is_full: () => false,
+            '../ui/full-view.js': `export const is_minimized = () => false;
+                export const createFullView = () => ({ allowed: true, wants: false, is_full: () => false,
                 enter() {}, exit() {}, prepare_close() {}, watch_restore: () => ({ disconnect() {} }) });`,
             '../app-history.js': 'export const appUrl = () => "/app/code";',
             '../../src/UI/UIWindow.js': 'export default () => globalThis.__codeFailureTest.createWindow();',

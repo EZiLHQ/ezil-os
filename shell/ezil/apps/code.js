@@ -1,4 +1,6 @@
 import { ai_trace_collector } from '../ui/ai-traces.js';
+import { interview_consent } from '../ui/interview-consent.js';
+import { interview_activity } from '../ui/interview-activity.js';
 import { attachCodeAuthRecovery, resetOriginRecovery } from './code-auth-recovery.js';
 import { createGitAccessRenewal } from './code-git-access.js';
 import { selectRuntimeAdapter, watchNativeSurface, editorFailureCopy } from '../native-runtime.js';
@@ -183,6 +185,10 @@ export const IDENTITY_REFRESH_KEY = 'ezil-os:code.identity-refresh';
 const IDENTITY_REFRESH_TTL_MS = 10 * 60_000;
 /** EZiL's own Git gateway: the only repository address whose access the EZiL ID grants. */
 const EZIL_GIT_ORIGIN = 'https://github.ezil.work/';
+/** Staging interview repositories (contract §6); the server gates them, the shell only mirrors the address prefix. */
+const EZIL_GIT_QA_ORIGIN = 'https://git-qa.ezil.work/';
+/** A repository address whose Git access the EZiL ID grants: EZiL's own gateway, or a staging interview repository. */
+const isEzilGrantedGitRepo = (url) => typeof url === 'string' && (url.startsWith(EZIL_GIT_ORIGIN) || url.startsWith(EZIL_GIT_QA_ORIGIN));
 /** Where the silent sign-in starts (`app/src/app/auth/auth0/login/route.ts`). */
 const LOGIN_PATH = '/auth/auth0/login';
 /** The server's refusals of a project open, as it may spell them, to this window's error codes. */
@@ -331,7 +337,7 @@ function projectReturnUrl (project) {
 function refreshIdentityOnce (project) {
     // A repository opened from its address asks for no EZiL ID (nothing is granted for it): never leave the tab for one.
     // The one exception is EZiL's own Git gateway, whose access is granted by the EZiL ID: once per repository, as a project.
-    const gatewayRepo = typeof project.repoUrl === 'string' && project.repoUrl.startsWith(EZIL_GIT_ORIGIN);
+    const gatewayRepo = isEzilGrantedGitRepo(project.repoUrl);
     if ( project.repoUrl && ! gatewayRepo ) return false;
     try {
         const seen = JSON.parse(sessionStorage.getItem(IDENTITY_REFRESH_KEY) ?? 'null');
@@ -578,8 +584,8 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = nul
     // bar, which names a folder only when it is not the one the project link opens anyway.
     const repositoryFolder = project ? new URL(data.codePreviewUrl).searchParams.get('folder') : null;
     const repository = project ? repositoryNameOf(data) : null;
-    // Standalone EZiL Git clones have a child named after the repo. Keep the verified parent as the workbench folder.
-    const repositoryFocus = project?.repoUrl?.startsWith('https://github.ezil.work/') && repository && repositoryFolder
+    // A standalone or interview (git-qa) EZiL Git repository is nested inside the folder. Keep the verified parent as the workbench folder.
+    const repositoryFocus = isEzilGrantedGitRepo(project?.repoUrl) && repository && repositoryFolder
         ? { name: repository, folder: repositoryFolder } : undefined;
     const url = tagFolderMint(data.codePreviewUrl, { asked: folder_ask, answer: data.codeFolder, repositoryFocus });
     return { ok: true, url, expiresAt: data.expiresAt, ...(project ? { repository, repositoryFolder } : {}) };
@@ -997,6 +1003,12 @@ export async function openCodeWindow (ctx = {}) {
         updating = false;
         updateMilestone = null;
 
+        // INTERVIEW (os-capture, docs/contracts/interview-evidence-v1.md §7.4): a git-qa interview open waits here
+        // on the recording notice and the operator start; a non-interview or already-started open resolves at once,
+        // so a normal Code open is unchanged. The server (os-access open gate) stays the authority on the open.
+        await interview_consent.gate({ repoUrl: project?.repoUrl });
+        if ( disposed || my_attempt !== attempt ) return;
+
         if ( desktop_state.configured !== true ) {
             console.warn(`[${PHASE}] no desktop provider is configured`);
             progress.render(computeBootUiState({ requestStatus: 'not_configured', elapsedMs: 0 }));
@@ -1377,6 +1389,8 @@ export async function openCodeWindow (ctx = {}) {
         if ( present || was_present ) last_present_at = performance.now();
         was_present = present;
         if ( present ) void git_access?.tick();
+        // INTERVIEW (os-capture): feed presence to the activity recorder; a no-op unless an interview is recording.
+        interview_activity.sample({ visible: document.visibilityState === 'visible', focused: typeof document.hasFocus === 'function' ? document.hasFocus() : false });
     };
     const heartbeat_tick = () => {
         if ( disposed ) return;
@@ -1395,7 +1409,7 @@ export async function openCodeWindow (ctx = {}) {
     // Git's short-lived capability is renewed only while this repository's editor is active.
     // The authenticated endpoint refuses a stopped computer or an absent checkout; it cannot wake or clone one.
     git_access = nativeSurface ? null : createGitAccessRenewal({
-        target: () => repository_folder && project?.repoUrl?.startsWith(EZIL_GIT_ORIGIN)
+        target: () => repository_folder && isEzilGrantedGitRepo(project?.repoUrl)
             ? { computerId: computer.id, repoUrl: project.repoUrl } : null,
         eligible: () => ! disposed && el_state.hidden && progress.el.hidden && shouldHeartbeat({
             visible: document.visibilityState === 'visible',
