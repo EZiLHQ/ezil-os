@@ -84,7 +84,8 @@ describe('the MCP server, over a real transport', () => {
         expect(names).toContain('list_computers');
         expect(names).toContain('open_desktop');
         expect(names).toContain('delete_computer');
-        expect(tools.length).toBe(10);
+        // 10 lifecycle tools + the three browser_* aliases (browser verbs v2, §4).
+        expect(tools.length).toBe(13);
         for (const t of tools) expect((t.description ?? '').length).toBeGreaterThan(20);
         await server.close();
     });
