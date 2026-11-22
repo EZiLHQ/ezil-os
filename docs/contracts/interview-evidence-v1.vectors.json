@@ -1,7 +1,7 @@
 {
   "contract": "ezil.interview.evidence.v1",
-  "version": "1.0.0",
-  "status": "Frozen 2026-11-21 for RUN-1121 WS1 by the lead. Staging only.",
+  "version": "1.0.1",
+  "status": "Frozen 2026-11-21 for RUN-1121 WS1 by the lead. Staging only. 1.0.1 (2026-11-22): errata E1-E8 in the doc (refusal codes added; no interface or type change).",
   "doc": "docs/contracts/interview-evidence-v1.md",
   "schema": "docs/contracts/interview-evidence-v1.schema.json",
   "notice": {
@@ -253,6 +253,14 @@
       "unknownInterview": [
         404,
         "not_found"
+      ],
+      "createNotReady": [
+        202,
+        null
+      ],
+      "artifactsUnavailable": [
+        503,
+        "artifacts_unavailable"
       ]
     },
     "osConsent": {
@@ -307,6 +315,14 @@
       "registerConflict": [
         409,
         "conflict"
+      ],
+      "cookieWithoutBearer": [
+        401,
+        "unauthorized"
+      ],
+      "nonCanonicalURL": [
+        400,
+        "invalid_request"
       ]
     },
     "osOpenGate": {
@@ -335,6 +351,14 @@
       "noConsentForInterview": [
         404,
         "not_found"
+      ],
+      "grantReplayDifferentMemberOrNotice": [
+        409,
+        "consent_conflict"
+      ],
+      "gateOffWithoutOperatorSession": [
+        401,
+        "unauthorized"
       ]
     }
   },

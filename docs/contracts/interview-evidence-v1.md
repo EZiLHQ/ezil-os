@@ -270,3 +270,30 @@ The lead commits a stub returning `{kind:'none'}`; os-capture replaces the body 
 | A6 | With the staging gate off, unit tests show 404 from every interview route in all three repos |
 | A7 | `git diff --stat ea1a93df..HEAD -- apps/api/src/dispatch packages/orchestration apps/valuator-events` is empty |
 | A8 | `pushTestRuns == 0`, and create answers 409 `push_tests_enabled` while push tests are on |
+
+## Errata 1.0.1 (2026-11-22, the lead, after independent review)
+
+These change no interface, no event type and no notice byte. They settle readings the review found ambiguous. The
+vectors (`version` 1.0.1) carry the added refusal codes.
+
+- **E1 (§5, "active builder").** The candidate qualifies when the email resolves to a Works account with the builder
+  role and a builder profile, the account is not suspended, and it is linked to an EZiL ID subject. The KYC and arrival
+  state are NOT checked: a candidate who has signed in once at universe-staging as a Builder qualifies. A missing
+  builder profile is 422 `candidate_not_builder`, never a 500.
+- **E2 (§5, create while provisioning).** Create may answer 202 with `seed: null` while the repository is still being
+  provisioned; the operator retries with the same `Idempotency-Key`. An Artifacts failure is 503 `artifacts_unavailable`.
+  Neither case is folded into the other.
+- **E3 (§5, idempotency).** The `Idempotency-Key` is scoped to the operator. Any different body under the same key,
+  including a different `candidateEmail`, is 409 `idempotency_conflict`.
+- **E4 (§7.1, admin auth).** The OS admin routes require an `Authorization: Bearer` header. A session cookie without it
+  is 401 `unauthorized`, so the routes cannot be driven from a browser page.
+- **E5 (§7.3, register).** `POST /api/admin/interviews` refuses a `canonicalURL` that is not already in canonical form
+  (as the os-access parser would produce it) with 400 `invalid_request`; it never normalises.
+- **E6 (§8, gate order).** The gateway's interview routes keep the existing `admin()` order: without an operator
+  session the answer is 401 `unauthorized`; with one and the gate off it is 404 `not_found`. No gate state leaks.
+- **E7 (§8, grant replay).** A grant with the same `interviewId`, `authUserId` and `noticeSha256` is a replay (200).
+  The same `interviewId` with a different `authUserId` or `noticeSha256` is 409 `consent_conflict`.
+- **E8 (§3 and §8, gateway instants).** `model.request.at` is the request's ledger time (`requests.created_at`, else the
+  telemetry row's), the same instant `prompt.captured` uses for that request, and the consent window is applied to
+  that same instant. `computer.opened` records that the open gate allowed an open; it is written before the mint
+  and grant, so a later failure of that open still leaves the event.
