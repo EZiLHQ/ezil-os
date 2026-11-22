@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it, spyOn } from 'bun:test';
 import { Readable } from 'node:stream';
-import { createSidecarServer, OBSERVE_CONTROL_BODY_BYTES } from './server.mjs';
+import { createSidecarServer, logText, OBSERVE_CONTROL_BODY_BYTES } from './server.mjs';
 import {
     CODE_BROWSER_PATH_PREFIX, CODE_BROWSER_VERBS, ERROR_CODES, ORIGIN_TIER_ENV, SIDECAR_WIRE,
 } from './contract.mjs';
@@ -107,7 +107,8 @@ describe('sidecar error response boundary', () => {
                 const error = Object.assign(new Error(PRIVATE_MESSAGE), { stack: PRIVATE_STACK, code });
                 const result = await request(surfaceFor(error), { body: '{"ref":"e1"}' });
                 assertPrivate(result, ERROR_CODES.includes(code) ? code : 'chrome_unreachable');
-                expect(logs).toHaveBeenLastCalledWith('[ezil-sidecar] verb failed:', error);
+                expect(logs).toHaveBeenLastCalledWith('[ezil-sidecar] verb failed:', logText(error, STAGING));
+                expect(logs.mock.lastCall[1]).toContain(PRIVATE_STACK);
             }
             assertPrivate(await request(surfaceFor(PRIVATE_MESSAGE), { body: '{"ref":"e1"}' }));
         });
@@ -116,7 +117,8 @@ describe('sidecar error response boundary', () => {
     it('JSON parse failures never echo parser messages or submitted text', async () => {
         await withLogs(async (logs) => {
             assertPrivate(await request(surfaceFor(null), { body: `{"${PRIVATE_MESSAGE}` }), 'bad_request');
-            expect(logs.mock.calls[0][1]).toBeInstanceOf(SyntaxError);
+            expect(logs.mock.calls[0][0]).toBe('[ezil-sidecar] invalid JSON:');
+            expect(logs.mock.calls[0][1]).toStartWith('SyntaxError');
         });
     });
 
@@ -124,7 +126,7 @@ describe('sidecar error response boundary', () => {
         await withLogs(async (logs) => {
             const error = Object.assign(new Error(PRIVATE_MESSAGE), { stack: PRIVATE_STACK, httpStatus: 599 });
             assertPrivate(await request(surfaceFor(null), { readError: error }), 'bad_request', 400);
-            expect(logs).toHaveBeenCalledWith('[ezil-sidecar] body read failed:', error);
+            expect(logs).toHaveBeenCalledWith('[ezil-sidecar] body read failed:', logText(error, STAGING));
         });
     });
 
@@ -138,7 +140,7 @@ describe('sidecar error response boundary', () => {
         await withLogs(async (logs) => {
             const error = Object.assign(new Error(PRIVATE_MESSAGE), { stack: PRIVATE_STACK });
             assertPrivate(await request(surfaceFor(null), { method: { toUpperCase() { throw error; } } }));
-            expect(logs).toHaveBeenCalledWith('[ezil-sidecar] request failed:', error);
+            expect(logs).toHaveBeenCalledWith('[ezil-sidecar] request failed:', logText(error, STAGING));
         });
     });
 
@@ -150,6 +152,47 @@ describe('sidecar error response boundary', () => {
         expect(missing.text).not.toContain('private-');
         assertPrivate(await request(surfaceFor(null), { method: 'GET' }), 'bad_request', 405, unknownVerb);
         assertPrivate(await request(surfaceFor(null), { body: 'null' }), 'bad_request');
+    });
+});
+
+describe('the log carries no OAuth secrets from a Playwright call log', () => {
+    // What Playwright really writes: the call log quotes the full URL it was waiting on.
+    const CALLBACK = 'https://universe-staging.ezil.work/creator/social-login/callback/auth0?code=AUTHCODEq7Rk&state=STATEw3Lp';
+    const AUTHORIZE = 'https://id.ezil.work/authorize?client_id=c1&state=STATEw3Lp&nonce=NONCEz9Vt';
+    const PLAIN = 'https://example.com/form?page=2';
+    const message = `page.goto: Timeout 30000ms exceeded.\nCall log:\n  - navigating to "${AUTHORIZE}", waiting until "domcontentloaded"\n`
+        + `  - redirected to ${CALLBACK}\n  - then to ${PLAIN}`;
+
+    it('every logged exception has its URLs sanitised, on the wire verbs and the Code verbs alike', async () => {
+        await withLogs(async (logs) => {
+            const error = Object.assign(new Error(message), { code: 'navigation_failed' });
+            const surface = { ...surfaceFor(error), originPolicy: STAGING };
+            assertPrivate(await request(surface, { url: '/navigate', body: '{"url":"https://example.com/"}' }), 'navigation_failed');
+            assertPrivate(await request(surface, {
+                url: CODE_BROWSER_PATH_PREFIX + 'navigate', body: '{"url":"https://example.com/"}', headers: CODE_BEARER,
+            }), 'navigation_failed');
+            expect(logs.mock.calls.map((call) => call[0])).toEqual([
+                '[ezil-sidecar] verb failed:', '[ezil-sidecar] code verb failed:',
+            ]);
+            for (const [, text] of logs.mock.calls) {
+                for (const leak of ['code=', 'state=', 'nonce=', 'client_id=', 'AUTHCODEq7Rk', 'STATEw3Lp', 'NONCEz9Vt']) {
+                    expect(text).not.toContain(leak);
+                }
+                // Positive control: the log still says what happened and where, and keeps a harmless query.
+                expect(text).toContain('page.goto: Timeout 30000ms exceeded.');
+                expect(text).toContain('https://id.ezil.work/authorize');
+                expect(text).toContain('https://universe-staging.ezil.work/creator/social-login/callback/auth0');
+                expect(text).toContain(PLAIN);
+                expect(text).toContain('(code: navigation_failed)');
+            }
+        });
+    });
+
+    it('without a policy on the surface the environment\'s policy still strips sensitive parameters', () => {
+        const text = logText(new Error(message), loadOriginPolicy({}));
+        expect(text).not.toContain('AUTHCODEq7Rk');
+        expect(text).not.toContain('STATEw3Lp');
+        expect(logText({ toString () { throw new Error('unprintable'); } }, STAGING)).toBe('(an exception that could not be printed)');
     });
 });
 

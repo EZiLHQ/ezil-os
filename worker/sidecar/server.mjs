@@ -57,6 +57,7 @@ import { pathToFileURL } from 'node:url';
 import { CODE_BROWSER_PATH_PREFIX, CODE_BROWSER_VERBS, ERROR_CODES } from './contract.mjs';
 import { VERBS } from './verbs.mjs';
 import { redactDeep } from './redact.mjs';
+import { isOriginPolicy, loadOriginPolicy, sanitizeText } from './origin-policy.mjs';
 import { createMcpObservation, observationPayload, OBSERVE_PATH } from './mcp-observation.mjs';
 import { browserUiPayload } from './mcp-observation-payload.mjs';
 import { BROWSER_OPEN_PATH, CODE_BROWSER_OPEN_PATH, browserOpenFailure, createMcpBrowserOpen } from './mcp-browser-open.mjs';
@@ -109,6 +110,25 @@ const REFUSED = Object.freeze({ ok: false, error: 'bad_request', detail: 'Reques
 /** Code chats never act on the user's signed-in apps or the IdP (contract §3). */
 const CODE_DENIED_TIERS = Object.freeze(['owner_app', 'idp_transit']);
 
+/**
+ * An exception as it may reach the log: its stack (or its text) and its code,
+ * with every URL in it through `sanitizeText` (§2). Playwright's call logs
+ * quote full URLs, and on a callback or an IdP page those carry `code`,
+ * `state` and the rest of `SENSITIVE_URL_PARAMS`. Never throws: a value that
+ * cannot be printed is logged as fixed text.
+ */
+export function logText (err, policy) {
+    try {
+        let text = err instanceof Error
+            ? (typeof err.stack === 'string' && err.stack ? err.stack : `${err.name}: ${err.message}`)
+            : String(err);
+        if (err !== null && typeof err === 'object' && typeof err.code === 'string') text += ` (code: ${err.code})`;
+        return sanitizeText(text, policy);
+    } catch {
+        return '(an exception that could not be printed)';
+    }
+}
+
 /** The complete set of routes. `VERBS` keys are `"<METHOD> <path>"`. */
 export const ROUTES = Object.keys(VERBS);
 
@@ -123,6 +143,11 @@ export function createSidecarServer (surface, {
     const codeBinding = typeof codeBrowserOpenToken === 'string' && BOOT_CAPABILITY.test(codeBrowserOpenToken)
         ? createHash('sha256').update('EZIL-CODE-BROWSER-OPEN/1\0').update(codeBrowserOpenToken).digest('hex')
         : null;
+    /** The surface's own origin policy, or the one this environment loads: what the log sanitises with. */
+    let logPolicy;
+    const loggable = (err) => logText(err, logPolicy ??= isOriginPolicy(surface?.originPolicy)
+        ? surface.originPolicy
+        : loadOriginPolicy(process.env));
     /**
      * Serialise, REDACT, and write. Nothing else in this process writes a body.
      *
@@ -186,7 +211,7 @@ export function createSidecarServer (surface, {
 
     const server = createServer((req, res) => {
         void handle(req, res).catch(async (err) => {
-            console.error('[ezil-sidecar] request failed:', err);
+            console.error('[ezil-sidecar] request failed:', loggable(err));
             try {
                 await respond(res, 200, errorPayload('chrome_unreachable'));
             } catch { /* the socket is already gone */ }
@@ -263,7 +288,7 @@ export function createSidecarServer (surface, {
             const payload = await handler(surface, body);
             return respond(res, 200, payload);
         } catch (err) {
-            console.error('[ezil-sidecar] verb failed:', err);
+            console.error('[ezil-sidecar] verb failed:', loggable(err));
             return respond(res, 200, errorPayload(err?.code));
         }
     }
@@ -278,7 +303,7 @@ export function createSidecarServer (surface, {
         try {
             raw = await readBody(req);
         } catch (err) {
-            console.error('[ezil-sidecar] body read failed:', err);
+            console.error('[ezil-sidecar] body read failed:', loggable(err));
             await respond(res, err?.httpStatus === 413 ? 413 : 400, errorPayload('bad_request'));
             return null;
         }
@@ -287,7 +312,7 @@ export function createSidecarServer (surface, {
             try {
                 body = JSON.parse(raw.toString('utf8'));
             } catch (err) {
-                console.error('[ezil-sidecar] invalid JSON:', err);
+                console.error('[ezil-sidecar] invalid JSON:', loggable(err));
                 await respond(res, 200, errorPayload('bad_request'));
                 return null;
             }
@@ -324,7 +349,7 @@ export function createSidecarServer (surface, {
             const payload = await VERBS[route](surface, body, { denyTiers: new Set(CODE_DENIED_TIERS) });
             return respond(res, 200, payload);
         } catch (err) {
-            console.error('[ezil-sidecar] code verb failed:', err);
+            console.error('[ezil-sidecar] code verb failed:', loggable(err));
             return respond(res, 200, errorPayload(err?.code));
         }
     }
@@ -380,7 +405,7 @@ async function startServer () {
         // instead of reporting a disconnected browser that is in fact fine.
         surface.connect().then(
             () => console.log('[ezil-sidecar] connected to Chrome over CDP'),
-            (err) => console.log(`[ezil-sidecar] Chrome not reachable yet: ${err.message}`),
+            (err) => console.log(`[ezil-sidecar] Chrome not reachable yet: ${sanitizeText(String(err?.message ?? err), surface.originPolicy)}`),
         );
     });
 
