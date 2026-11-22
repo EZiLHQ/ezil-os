@@ -54,6 +54,27 @@ export const ORIGIN_TIER_MAX_ENTRIES = 20;
 const DNS_HOSTNAME = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/i;
 const SENSITIVE = new Set(SENSITIVE_URL_PARAMS);
 
+/**
+ * The names the decoded check looks for: the contract's
+ * `SENSITIVE_URL_PARAMS` plus `jwt` and `accesstoken` (the 2026-11-22
+ * independent review's list).
+ */
+export const SENSITIVE_ASSIGNMENT_NAMES = Object.freeze([...SENSITIVE_URL_PARAMS, 'jwt', 'accesstoken']);
+const NAME_ALTERNATION = SENSITIVE_ASSIGNMENT_NAMES.join('|');
+
+/**
+ * A sensitive name — optionally `[]` — followed by `=`, not glued to a
+ * preceding letter or digit (so `auth_code=` and `x=code=` match, `xcode=`
+ * and `decode=` do not). Case-insensitive.
+ */
+const SENSITIVE_ASSIGNMENT = new RegExp(`(?<![A-Za-z0-9])(?:${NAME_ALTERNATION})(?:\\[\\])?\\s*=`, 'i');
+
+/** Invisible characters an obfuscated name could hide behind (zero-width and the rest). */
+const IGNORABLE = /\p{Default_Ignorable_Code_Point}/gu;
+
+/** Non-fatal: bytes that are not UTF-8 decode to U+FFFD instead of throwing. */
+const UTF8 = new TextDecoder('utf-8');
+
 /** Each policy `loadOriginPolicy` minted -> its private origin sets. */
 const TIER_SETS = new WeakMap();
 
@@ -268,18 +289,77 @@ function hasSensitiveParam (part) {
     return false;
 }
 
+/** Percent-decode ONCE, valid UTF-8 or not: a bad byte becomes U+FFFD, never a throw. */
+function decodeOnce (text) {
+    return text.replace(/(?:%[0-9A-Fa-f]{2})+/g, (run) => (
+        UTF8.decode(Uint8Array.from(run.slice(1).split('%'), (hex) => Number.parseInt(hex, 16)))
+    ));
+}
+
 /**
- * An `idp_transit` URL as it may leave: origin + path for the web schemes
- * (which also drops userinfo), the inner origin for `blob:`, and for anything
- * else (`about:`, `data:`, `chrome-error:`) the URL without query and
- * fragment. Under a broken policy every URL takes this form.
+ * Does this text carry a sensitive `name=`? Read the way a server would:
+ * `+` as a space, percent-decoded once (so a URL nested in a parameter value
+ * is read too), and with invisible characters removed (so `%E2%80%8Bcode=`
+ * and a name split by a zero-width character still match).
  */
-function transitForm (parsed) {
-    if (/^(?:https?|wss?):$/.test(parsed.protocol)) return `${parsed.origin}${parsed.pathname}`;
+function carriesSensitive (text) {
+    if (typeof text !== 'string' || text.length === 0) return false;
+    return SENSITIVE_ASSIGNMENT.test(decodeOnce(text.replace(/\+/g, ' ')).replace(IGNORABLE, ''));
+}
+
+function remainderOf (parsed) {
+    return `${parsed.pathname}${parsed.search}${parsed.hash}`;
+}
+
+function userinfoOf (parsed) {
+    return parsed.username || parsed.password ? `${parsed.username}:${parsed.password}` : '';
+}
+
+/**
+ * The amended check (2026-11-22): the remainder after the origin — path with
+ * its `;` parameters, query, fragment — decoded once and matched against
+ * `SENSITIVE_ASSIGNMENT`; the userinfo the same way; and, as before, a
+ * sensitive parameter NAME (even with no `=`) in the query or fragment.
+ */
+function urlCarriesSensitive (parsed) {
+    return carriesSensitive(remainderOf(parsed)) || carriesSensitive(userinfoOf(parsed))
+        || hasSensitiveParam(parsed.search) || hasSensitiveParam(parsed.hash);
+}
+
+/** Every `;` parameter removed from every path segment. */
+function withoutPathParams (pathname) {
+    return pathname.split('/').map((segment) => segment.split(';')[0]).join('/');
+}
+
+const WEB_SCHEME = /^(?:https?|wss?|ftp):$/;
+
+/**
+ * The URL with what may not leave removed.
+ *
+ *   transit (idp_transit, or anything under a broken policy): no userinfo, no
+ *     query, no fragment — origin + path for the web schemes, the inner origin
+ *     for `blob:`, the URL without query and fragment for anything else;
+ *   sensitive: no query, no fragment, no `;` path parameters, and no userinfo
+ *     when that is where the name was.
+ *
+ * If what is left STILL carries a sensitive `name=` (it was in the path
+ * proper, or behind an encoded `;`), only the origin leaves — or, for a URL
+ * with no origin, its scheme.
+ */
+function reduced (parsed, transit, sensitive) {
     if (parsed.protocol === 'blob:') return parsed.origin === 'null' ? 'blob:' : parsed.origin;
-    parsed.search = '';
-    parsed.hash = '';
-    return parsed.href;
+    const web = WEB_SCHEME.test(parsed.protocol);
+    const clean = new URL(parsed.href);
+    clean.search = '';
+    clean.hash = '';
+    if ((transit && web) || carriesSensitive(userinfoOf(clean))) {
+        clean.username = '';
+        clean.password = '';
+    }
+    if (sensitive && clean.pathname.startsWith('/')) clean.pathname = withoutPathParams(clean.pathname);
+    if (!urlCarriesSensitive(clean)) return clean.href;
+    if (web) return `${clean.origin}/`;
+    return clean.host ? `${clean.protocol}//${clean.host}` : clean.protocol;
 }
 
 /**
@@ -287,8 +367,10 @@ function transitForm (parsed) {
  *
  *   idp_transit URL                    -> origin + path, whatever it carries
  *                                         (EVERY URL, under a broken policy)
- *   query or fragment names a
- *   SENSITIVE_URL_PARAMS parameter     -> the URL without query AND fragment
+ *   a sensitive `name=` anywhere after
+ *   the origin (decoded once), or a
+ *   sensitive name in query/fragment   -> without query, fragment and `;`
+ *                                         path parameters
  *   anything else                      -> the SAME string, untouched
  *   not a string / not a URL           -> returned unchanged
  *
@@ -300,13 +382,10 @@ export function sanitizeUrl (url, policy) {
     if (typeof url !== 'string') return url;
     const parsed = parseUrl(url);
     if (parsed === null) return url;
-    if (classify(sets, parsed) === 'idp_transit') return transitForm(parsed);
-    if (hasSensitiveParam(parsed.search) || hasSensitiveParam(parsed.hash)) {
-        parsed.search = '';
-        parsed.hash = '';
-        return parsed.href;
-    }
-    return url;
+    const transit = classify(sets, parsed) === 'idp_transit';
+    const sensitive = urlCarriesSensitive(parsed);
+    if (!transit && !sensitive) return url;
+    return reduced(parsed, transit, sensitive);
 }
 
 /**
@@ -363,17 +442,22 @@ function sanitizeRelative (ref, sets, policy) {
         return out === absolute ? ref : out.replace(/^https:/, '');
     }
     const cut = ref.search(/[?#]/);
-    if (cut === -1) return ref;
-    const rest = ref.slice(cut);
+    const head = cut === -1 ? ref : ref.slice(0, cut);
+    const rest = cut === -1 ? '' : ref.slice(cut);
     const hashAt = rest.indexOf('#');
     const query = hashAt === -1 ? rest : rest.slice(0, hashAt);
     const fragment = hashAt === -1 ? '' : rest.slice(hashAt);
+    // The same decoded check as `sanitizeUrl`, over the whole reference.
+    const sensitive = carriesSensitive(ref) || hasSensitiveParam(query) || hasSensitiveParam(fragment);
     // Under a broken policy (`classify(sets, null)` is transit for everything)
     // a reference WITH a path takes the transit form. A bare `#…`/`?…` token
     // has no path and may be a heading or an anchor, so it only loses what
     // names a sensitive parameter.
     const transit = cut > 0 && classify(sets, null) === 'idp_transit';
-    return transit || hasSensitiveParam(query) || hasSensitiveParam(fragment) ? ref.slice(0, cut) : ref;
+    if (!sensitive && !transit) return ref;
+    const out = sensitive ? withoutPathParams(head) : head;
+    // A path that still carries `name=` itself is dropped whole.
+    return carriesSensitive(out) ? '' : out;
 }
 
 export function sanitizeText (text, policy) {
