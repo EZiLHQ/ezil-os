@@ -46,7 +46,7 @@ function fakeAudit() {
         record: vi.fn(async (entry: AuditEntry, replayOf: string | null, outcome: AuditOutcome) => {
             rows.push({ ...entry, id: `rec-${rows.length}`, replayOf, ...outcome });
         }),
-        findExecutingJob: vi.fn(async (computerId: string, jobId: string) => lost.get(`${computerId}|${jobId}`) ?? null),
+        findExecutingJob: vi.fn(async (userId: string, computerId: string, jobId: string) => lost.get(`${userId}|${computerId}|${jobId}`) ?? null),
     };
     return Object.assign(audit, { rows, lost });
 }
@@ -185,8 +185,40 @@ describe('computer-tools receiver — verification and target', () => {
         const sent = await handleComputerTools(request(execBody()), dSent);
         expect(sent.status).toBe(404);
         expect(dSent.forward).not.toHaveBeenCalled();
-        expect(dSent.audit.rows).toHaveLength(1); // claim + finalize is still one row
+        expect(dSent.audit.rows).toHaveLength(1);
         expect(dSent.audit.rows[0]).toMatchObject({ error: 'computer_not_found' });
+    });
+
+    it('OSRCV-6: resolves ownership before the idempotency claim, and a refused call claims no slot', async () => {
+        const order: string[] = [];
+        const audit = fakeAudit();
+        const claim = audit.claimOriginal;
+        audit.claimOriginal = vi.fn(async (entry: AuditEntry) => { order.push('claim'); return claim(entry); }) as typeof audit.claimOriginal;
+        const refused = deps({ audit, resolveTarget: vi.fn(async () => { order.push('resolve'); return null; }) });
+        expect((await handleComputerTools(request(execBody()), refused)).status).toBe(404);
+        expect(order).toEqual(['resolve']);
+        expect(audit.claimOriginal).not.toHaveBeenCalled();
+        // Audited without a requestId: it never ran, so it takes no part in idempotency.
+        expect(audit.rows).toHaveLength(1);
+        expect(audit.rows[0]).toMatchObject({ requestId: null, error: 'computer_not_found' });
+
+        // Positive control: an owned computer resolves first, then claims.
+        order.length = 0;
+        const owned = deps({ audit, resolveTarget: vi.fn(async () => { order.push('resolve'); return target; }) });
+        await handleComputerTools(request(execBody()), owned);
+        expect(order.slice(0, 2)).toEqual(['resolve', 'claim']);
+    });
+
+    it("OSRCV-6: a lost-job lookup is scoped to the caller's own rows", async () => {
+        const audit = fakeAudit();
+        audit.lost.set(`someone-else|${COMPUTER}|${JOB}`, {
+            procedure: 'computerTools.exec', toolName: null, requestId: 'req-x', exitCode: null,
+            createdAt: '2026-11-20T00:00:00.000Z', completedAt: null,
+        });
+        const d = deps({ audit, forward: vi.fn(async (): Promise<ForwardResult> => ({ kind: 'reply', status: 404, text: JSON.stringify({ ok: false, error: 'job_not_found' }) })) });
+        const res = await handleComputerTools(request(jobBody()), d);
+        expect(res.status).toBe(404);
+        expect(audit.findExecutingJob).toHaveBeenCalledWith(principal.userId, COMPUTER, JOB);
     });
 });
 
@@ -347,7 +379,7 @@ describe('computer-tools receiver — idempotency and replay', () => {
 describe('computer-tools receiver — lost job synthesis', () => {
     it('synthesizes a lost Job from the audit row when the worker 404s a jobId we hold', async () => {
         const audit = fakeAudit();
-        audit.lost.set(`${COMPUTER}|${JOB}`, {
+        audit.lost.set(`${principal.userId}|${COMPUTER}|${JOB}`, {
             procedure: 'computerTools.exec', toolName: null, requestId: 'req-x', exitCode: null,
             createdAt: '2026-11-20T00:00:00.000Z', completedAt: '2026-11-20T00:00:05.000Z',
         });

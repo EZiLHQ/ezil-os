@@ -56,14 +56,14 @@ export interface LostJobRecord {
 }
 
 export interface ComputerToolsAudit {
-    /** Insert the originating row, claiming the (computer, procedure, requestId) slot atomically. */
+    /** Insert the originating row, claiming the caller's (user, computer, procedure, requestId) slot atomically. */
     claimOriginal(entry: AuditEntry): Promise<{ claimed: true; id: string } | { claimed: false; original: OriginalRow }>;
     /** Write the outcome onto a claimed originating row. */
     finalize(id: string, outcome: AuditOutcome): Promise<void>;
     /** Insert a standalone row (a read, or a replay with `replayOf` set) with its outcome in one write. */
     record(entry: AuditEntry, replayOf: string | null, outcome: AuditOutcome): Promise<void>;
-    /** The earliest call/exec row that recorded `jobId` on this computer (for lost synthesis), else null. */
-    findExecutingJob(computerId: string, jobId: string): Promise<LostJobRecord | null>;
+    /** The earliest call/exec row of this user that recorded `jobId` on this computer (for lost synthesis), else null. */
+    findExecutingJob(userId: string, computerId: string, jobId: string): Promise<LostJobRecord | null>;
 }
 
 const isoOf = (value: unknown): string | null =>
@@ -80,15 +80,15 @@ export function createComputerToolsAudit(db: AuditExecutor): ComputerToolsAudit 
                 VALUES (${id}::uuid, ${entry.userId}::uuid, ${entry.computerId}::uuid, ${entry.clientId}, ${entry.jti},
                     ${entry.procedure}, ${entry.scope}, ${entry.requestId}::uuid, ${entry.requestSha256}, NULL,
                     ${entry.toolName}, ${entry.commandSha256}, ${entry.commandPrefix})
-                ON CONFLICT (computer_id, procedure, request_id) WHERE request_id IS NOT NULL AND replay_of IS NULL
+                ON CONFLICT (user_id, computer_id, procedure, request_id) WHERE request_id IS NOT NULL AND replay_of IS NULL
                 DO NOTHING
                 RETURNING id`);
             if (inserted.length === 1) return { claimed: true, id };
             // The conflicting insert has committed (ON CONFLICT blocks until it does); read it.
             const existing = await db.execute(sql`/* computer-tools:audit-original */
                 SELECT id::text AS id, request_sha256, job_id FROM public.ezil_computer_tool_jobs
-                WHERE computer_id = ${entry.computerId}::uuid AND procedure = ${entry.procedure}
-                  AND request_id = ${entry.requestId}::uuid AND replay_of IS NULL
+                WHERE user_id = ${entry.userId}::uuid AND computer_id = ${entry.computerId}::uuid
+                  AND procedure = ${entry.procedure} AND request_id = ${entry.requestId}::uuid AND replay_of IS NULL
                 LIMIT 1`);
             const row = existing[0];
             if (!row || typeof row.id !== 'string') throw new Error('computer_tools_audit_original_missing');
@@ -122,11 +122,11 @@ export function createComputerToolsAudit(db: AuditExecutor): ComputerToolsAudit 
                     ${outcome.jobId}, ${outcome.state}, ${outcome.exitCode}, ${outcome.error}, now())`);
         },
 
-        async findExecutingJob(computerId, jobId) {
+        async findExecutingJob(userId, computerId, jobId) {
             const rows = await db.execute(sql`/* computer-tools:audit-lost */
                 SELECT procedure, tool_name, request_id::text AS request_id, exit_code, created_at, completed_at
                 FROM public.ezil_computer_tool_jobs
-                WHERE computer_id = ${computerId}::uuid AND job_id = ${jobId}
+                WHERE user_id = ${userId}::uuid AND computer_id = ${computerId}::uuid AND job_id = ${jobId}
                   AND procedure IN ('computerTools.call', 'computerTools.exec')
                 ORDER BY created_at ASC
                 LIMIT 1`);

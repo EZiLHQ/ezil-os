@@ -118,9 +118,23 @@ describe.skipIf(!databaseUrl)('staging computer-tools route: real delegation, pl
         expect(res.status).toBe(404);
         expect((await res.json()).error).toBe('computer_not_found');
         expect(worker).not.toHaveBeenCalled();
-        const rows = await rowsFor(strangerReq);
+        // OSRCV-6: refused before the claim, so it is audited without a requestId and occupies no slot.
+        expect(await rowsFor(strangerReq)).toHaveLength(0);
+        const rows = await client.unsafe<Record<string, unknown>[]>(
+            "SELECT * FROM public.ezil_computer_tool_jobs WHERE user_id = $1::uuid AND procedure = 'computerTools.exec'", [stranger]);
         expect(rows).toHaveLength(1);
-        expect(rows[0]).toMatchObject({ user_id: stranger, error: 'computer_not_found', job_id: null });
+        expect(rows[0]).toMatchObject({ user_id: stranger, error: 'computer_not_found', job_id: null, request_id: null });
+    });
+
+    it('OSRCV-10: the procedure CHECK and the (computer_id, job_id) lost-lookup index exist', async () => {
+        const idx = await client.unsafe<{ indexname: string; indexdef: string }[]>(
+            "SELECT indexname, indexdef FROM pg_indexes WHERE tablename = 'ezil_computer_tool_jobs'");
+        const byName = new Map(idx.map((row) => [row.indexname, row.indexdef]));
+        expect(byName.get('ezil_computer_tool_jobs_job_key')).toMatch(/\(computer_id, job_id\) WHERE \(job_id IS NOT NULL\)/);
+        expect(byName.get('ezil_computer_tool_jobs_request_key')).toMatch(/\(user_id, computer_id, procedure, request_id\)/);
+        await expect(client.unsafe(
+            `INSERT INTO public.ezil_computer_tool_jobs (user_id, computer_id, client_id, jti, procedure, scope)
+             VALUES ($1::uuid, $2::uuid, 'c', $3, 'computerTools.rm', 's')`, [randomUUID(), randomUUID(), randomUUID()])).rejects.toThrow(/ezil_computer_tool_jobs_procedure/);
     });
 
     it('writes exactly one row per verified call and never stores the full command, its secrets, or output', async () => {

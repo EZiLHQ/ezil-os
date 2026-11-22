@@ -24,16 +24,25 @@ CREATE TABLE public.ezil_computer_tool_jobs (
     error text,
     created_at timestamptz NOT NULL DEFAULT now(),
     completed_at timestamptz,
-    CONSTRAINT ezil_computer_tool_jobs_command_prefix_len CHECK (command_prefix IS NULL OR char_length(command_prefix) <= 120)
+    CONSTRAINT ezil_computer_tool_jobs_command_prefix_len CHECK (command_prefix IS NULL OR char_length(command_prefix) <= 120),
+    CONSTRAINT ezil_computer_tool_jobs_procedure CHECK (procedure IN (
+        'computerTools.list', 'computerTools.refresh', 'computerTools.call',
+        'computerTools.exec', 'computerTools.job', 'computerTools.cancel'))
 );
 --> statement-breakpoint
 CREATE UNIQUE INDEX ezil_computer_tool_jobs_jti_key ON public.ezil_computer_tool_jobs (jti);
 --> statement-breakpoint
--- The atomic first-call fence: at most one originating row per (computer, procedure, requestId).
--- Replays (replay_of IS NOT NULL) and request-less reads (request_id IS NULL) are unconstrained.
+-- The atomic first-call fence: at most one originating row per (user, computer, procedure, requestId).
+-- Per user, so no other principal can ever occupy or read a caller's slot. Replays (replay_of IS NOT
+-- NULL) and request-less rows (reads, and calls refused before the claim) are unconstrained.
 CREATE UNIQUE INDEX ezil_computer_tool_jobs_request_key
-    ON public.ezil_computer_tool_jobs (computer_id, procedure, request_id)
+    ON public.ezil_computer_tool_jobs (user_id, computer_id, procedure, request_id)
     WHERE request_id IS NOT NULL AND replay_of IS NULL;
+--> statement-breakpoint
+-- The lost-job lookup (contract 5.2): the call/exec row that recorded a jobId on a computer.
+CREATE INDEX ezil_computer_tool_jobs_job_key
+    ON public.ezil_computer_tool_jobs (computer_id, job_id)
+    WHERE job_id IS NOT NULL;
 --> statement-breakpoint
 ALTER TABLE public.ezil_computer_tool_jobs ENABLE ROW LEVEL SECURITY;
 --> statement-breakpoint

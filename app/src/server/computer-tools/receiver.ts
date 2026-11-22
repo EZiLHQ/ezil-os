@@ -133,16 +133,20 @@ async function handleRead(deps: ComputerToolsDeps, ctx: Context): Promise<Respon
     return result.response;
 }
 
-/** call / exec / cancel: claim the (computer, procedure, requestId) slot atomically, then execute or replay. */
+/**
+ * call / exec / cancel: resolve the owned target, then claim the caller's (user, computer, procedure, requestId)
+ * slot atomically, then execute or replay (OSRCV-6). A call refused before the claim cannot have run, so it is
+ * audited without a requestId and takes no part in idempotency.
+ */
 async function handleSent(deps: ComputerToolsDeps, ctx: Context): Promise<Response> {
     const entry = entryFor(ctx);
+    const target = await deps.resolveTarget(ctx.principal, ctx.computerId);
+    if (!target) {
+        await deps.audit.record({ ...entry, requestId: null }, null, notFoundOutcome());
+        return fail('computer_not_found', 404);
+    }
     const claim = await deps.audit.claimOriginal(entry);
     if (claim.claimed) {
-        const target = await deps.resolveTarget(ctx.principal, ctx.computerId);
-        if (!target) {
-            await deps.audit.finalize(claim.id, notFoundOutcome());
-            return fail('computer_not_found', 404);
-        }
         const input = inputWithoutOp(ctx.body);
         const queriedJobId = ctx.op === 'cancel' ? String(input.jobId) : null;
         const forwarded = await deps.forward(ctx.principal, ctx.computerId, target, ctx.op, input);
@@ -161,11 +165,6 @@ async function handleSent(deps: ComputerToolsDeps, ctx: Context): Promise<Respon
         // The first attempt recorded no jobId (concurrent in-flight, or it failed before a job existed): unknown.
         await deps.audit.record(entry, original.id, { jobId: null, state: null, exitCode: null, error: 'tools_uncertain' });
         return fail('tools_uncertain', 503);
-    }
-    const target = await deps.resolveTarget(ctx.principal, ctx.computerId);
-    if (!target) {
-        await deps.audit.record(entry, original.id, { jobId: original.jobId, state: null, exitCode: null, error: 'computer_not_found' });
-        return fail('computer_not_found', 404);
     }
     const forwarded = await deps.forward(ctx.principal, ctx.computerId, target, 'job', { jobId: original.jobId });
     const result = await interpret(deps, ctx, target, 'job', forwarded, original.jobId);
@@ -219,7 +218,7 @@ async function interpret(
     const error = err.data.error;
 
     if (error === 'job_not_found' && queriedJobId) {
-        const lost = await deps.audit.findExecutingJob(ctx.computerId, queriedJobId);
+        const lost = await deps.audit.findExecutingJob(ctx.principal.userId, ctx.computerId, queriedJobId);
         if (lost) {
             const body = synthesizeLostJob(queriedJobId, lost);
             return { response: reply(body, 200), outcome: { jobId: queriedJobId, state: 'lost', exitCode: body.exitCode, error: null } };
