@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { STATUS_CODES } from 'node:http';
+import { FILL_FORM_MAX_FIELDS, PRESS_KEYS, SCROLL_MAX_DY, SELECT_MAX_VALUES } from './contract.mjs';
 
 const QA_ORIGIN = 'https://os-staging.ezil.work';
 const QA_PATH = '/browser-mcp-fixture.html';
@@ -12,6 +13,54 @@ const REQUEST = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const PAGE_LIMIT = 16;
 const FRAME_LIMIT = 60_000;
 const DOCUMENT_POLICY = { name: 'Content-Security-Policy', value: "sandbox allow-scripts allow-same-origin; form-action 'none'" };
+const FRAME_MASK = 'input, textarea, [contenteditable], select, iframe, object, embed';
+
+// ── browser verbs v2 action input (contract §4) ─────────────────────────────
+// The same bounds as ezil-mcp `workflow-browser.ts` and the App's
+// `browser-observe/contract.ts`: what either of them admits, this admits.
+const TYPED_TEXT_MAX_CHARS = 4000;
+const TYPED_TEXT_MAX_BYTES = 16 * 1024;
+const SELECT_VALUE_MAX_CHARS = 200;
+/** Line feeds and tabs are allowed in typed text; every other control character (C0, DEL, C1) and U+2028/U+2029 is not. */
+const TYPED_TEXT_FORBIDDEN = /(?![\n\t])[\p{Cc}\u{2028}\u{2029}]/u;
+const NO_CONTROL = /[\r\n\u{2028}\u{2029}\x00-\x1f\x7f]/u;
+
+/** v2 typed text: 1-4000 characters and at most 16 KiB of UTF-8. */
+export function typedText (value) {
+    return typeof value === 'string' && value.length >= 1 && value.length <= TYPED_TEXT_MAX_CHARS
+        && !TYPED_TEXT_FORBIDDEN.test(value) && Buffer.byteLength(value, 'utf8') <= TYPED_TEXT_MAX_BYTES;
+}
+
+/** The v1 bound approved public pages keep (contract §4: off owner-app pages, 1-80 characters, no line break). */
+export function v1Text (value) {
+    return typeof value === 'string' && CONTROL_TEXT.test(value) && Buffer.byteLength(value) <= 256;
+}
+
+const validRef = value => typeof value === 'string' && REF.test(value);
+const exactly = (names, allowed) => names.length === allowed.length && names.every(name => allowed.includes(name));
+const selectValue = value => typeof value === 'string' && value.length >= 1 && value.length <= SELECT_VALUE_MAX_CHARS
+    && !NO_CONTROL.test(value);
+
+/** One typed action of the seven-kind union, members exact. Refs are the OS-minted 22-character handles. */
+function validAction (action, names) {
+    switch (action.kind) {
+    case 'navigate': return exactly(names, ['kind', 'url']) && typeof action.url === 'string' && action.url.length <= 2048;
+    case 'click': return exactly(names, ['kind', 'ref']) && validRef(action.ref);
+    case 'type': return exactly(names, ['kind', 'ref', 'text']) && validRef(action.ref) && typedText(action.text);
+    case 'fill_form': return exactly(names, ['kind', 'fields']) && Array.isArray(action.fields)
+        && action.fields.length >= 1 && action.fields.length <= FILL_FORM_MAX_FIELDS
+        && action.fields.every(field => field !== null && typeof field === 'object' && !Array.isArray(field)
+            && exactly(Object.keys(field), ['ref', 'text']) && validRef(field.ref) && typedText(field.text))
+        && new Set(action.fields.map(field => field.ref)).size === action.fields.length;
+    case 'select': return exactly(names, ['kind', 'ref', 'values']) && validRef(action.ref) && Array.isArray(action.values)
+        && action.values.length >= 1 && action.values.length <= SELECT_MAX_VALUES && action.values.every(selectValue);
+    case 'scroll': return (exactly(names, ['kind', 'ref']) && validRef(action.ref))
+        || (exactly(names, ['kind', 'dy']) && Number.isSafeInteger(action.dy) && Math.abs(action.dy) <= SCROLL_MAX_DY);
+    case 'press': return (exactly(names, ['kind', 'key']) || (exactly(names, ['kind', 'key', 'ref']) && validRef(action.ref)))
+        && PRESS_KEYS.includes(action.key);
+    default: return false;
+    }
+}
 
 export function validUiInput (value) {
     if (!value || typeof value !== 'object' || Array.isArray(value) || !/^[a-f0-9]{64}$/.test(value.binding ?? '')
@@ -25,11 +74,7 @@ export function validUiInput (value) {
             && (action.includeFrame === undefined || typeof action.includeFrame === 'boolean');
     }
     if (typeof value.browserSessionId !== 'string' || typeof value.requestId !== 'string' || !REQUEST.test(value.requestId)) return false;
-    if (action.kind === 'navigate') return names.length === 2 && typeof action.url === 'string';
-    if (typeof action.ref !== 'string' || !REF.test(action.ref)) return false;
-    if (action.kind === 'click') return names.length === 2;
-    return action.kind === 'type' && names.length === 3 && typeof action.text === 'string'
-        && CONTROL_TEXT.test(action.text) && Buffer.byteLength(action.text) <= 256;
+    return validAction(action, names);
 }
 
 function parseUrl (value) {
@@ -112,9 +157,27 @@ async function describe (element, permitted) {
 
 export async function discardRefs (refs) {
     if (!refs) return;
-    const handles = Array.from(refs.values(), item => item.element);
+    // Owner-app records hold a sidecar ref, not an ElementHandle: nothing to dispose.
+    const handles = Array.from(refs.values(), item => item.element).filter(handle => handle && typeof handle.dispose === 'function');
     refs.clear();
     await Promise.all(handles.map(handle => handle.dispose().catch(() => {})));
+}
+
+/**
+ * The masked viewer frame: a JPEG of the viewport with every editable value
+ * and every embedded application painted over, or null when it is empty or
+ * larger than the frame limit (60,000 bytes, 80,000 base64 characters).
+ */
+export async function maskedJpeg (page) {
+    const screenshot = await page.screenshot({
+        type: 'jpeg', quality: 36, scale: 'css', caret: 'hide', timeout: 1800,
+        // Suppress editable values and every embedded application's pixels, regardless of origin.
+        mask: [page.locator(FRAME_MASK)],
+        maskColor: '#64748b',
+    }).catch(() => null);
+    return screenshot && screenshot.length > 0 && screenshot.length <= FRAME_LIMIT
+        ? { mimeType: 'image/jpeg', base64: screenshot.toString('base64') }
+        : null;
 }
 
 export async function readPublicTab (page, permitted, { includeFrame = false, collectElements = true } = {}) {
@@ -135,15 +198,7 @@ export async function readPublicTab (page, permitted, { includeFrame = false, co
                 else await handle.dispose().catch(() => {});
             }
         } else if (includeFrame) {
-            const screenshot = await page.screenshot({
-                type: 'jpeg', quality: 36, scale: 'css', caret: 'hide', timeout: 1800,
-                // Suppress editable values and every embedded application's pixels, regardless of origin.
-                mask: [page.locator('input, textarea, [contenteditable], select, iframe, object, embed')],
-                maskColor: '#64748b',
-            }).catch(() => null);
-            if (screenshot && screenshot.length > 0 && screenshot.length <= FRAME_LIMIT) {
-                viewerFrame = { mimeType: 'image/jpeg', base64: screenshot.toString('base64') };
-            }
+            viewerFrame = await maskedJpeg(page);
         }
         if (!await pageVisibility(page, parsed.href)) throw new Error('page changed');
         return {
@@ -200,6 +255,8 @@ async function withPublicRequests (page, origin, permitted, work) {
 }
 
 export async function applyPublicAction (page, action, refs, permitted, markDispatched, stillBound) {
+    // Approved public pages keep exactly the v1 actions and the v1 text bound (contract §4).
+    if (!['navigate', 'click', 'type'].includes(action.kind) || (action.kind === 'type' && !v1Text(action.text))) return false;
     if (action.kind === 'navigate') {
         const target = permitted(action.url);
         if (!target) return false;
