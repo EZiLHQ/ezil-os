@@ -318,6 +318,7 @@ jobs:
                    shell/ezil/ui/Settings/credits-real-shape-browser-test.mjs \
                    shell/ezil/ui/feedback-browser-test.mjs \
                    shell/ezil/ui/feedback/capture-browser-test.mjs \
+                   shell/ezil/assignment-evidence-browser-test.mjs \
                    e2e/os-boot-watchdog-browser.mjs; do
             echo "── $t"
             node "$t"

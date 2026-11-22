@@ -41,8 +41,10 @@ let chromium;
 try { ({ chromium } = require('playwright')); } catch { console.log('SKIP playwright not resolvable (set PLAYWRIGHT_REQUIRE_DIR)'); process.exit(2); }
 const assets = process.env.EZIL_SHELL_OUT_DIR || fileURLToPath(new URL('../../../app/public/os/', import.meta.url));
 if ( ! existsSync(path.join(assets, 'bundle.min.js')) ) { console.log(`SKIP missing ${assets}bundle.min.js (run shell/build-shell.sh)`); process.exit(2); }
-// The Worker's own bridge (TypeScript, no imports). CI's Node 22 does not load .ts by default, so strip the types here.
-const bridgeSource = stripTypeScriptTypes(readFileSync(new URL('../../../worker/src/code-folder-bridge.ts', import.meta.url), 'utf8'));
+// The Worker's own bridge (TypeScript). CI's Node 22 does not load .ts by default, so strip the types here. A data: URL
+// cannot resolve its one relative import, which only injectCodeFolderBridge uses; codeFolderBridgeScript never needs it.
+const bridgeSource = stripTypeScriptTypes(readFileSync(new URL('../../../worker/src/code-folder-bridge.ts', import.meta.url), 'utf8'))
+    .replace(/^import \{ codeAssignmentEvidenceTag \} from '\.\/code-assignment-evidence';$/m, '');
 const { codeFolderBridgeScript } = await import(`data:text/javascript,${encodeURIComponent(bridgeSource)}`);
 
 let checks = 0;
