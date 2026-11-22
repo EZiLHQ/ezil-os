@@ -80,13 +80,22 @@ class FakeLocator {
         this.page.filled.push({ ref: this.ref, value });
         this.el.value = value;
         if (this.el.type === 'password') this.page.passwordValue = value;
+        if (this.el.fillNavigatesTo) await this.page.goto(this.el.fillNavigatesTo);
     }
-    async press (key) { this.page.actions.push(['press', this.ref, key]); }
+    async press (key) {
+        this.page.actions.push(['press', this.ref, key]);
+        if (key === 'Enter' && this.el.submitNavigatesTo) await this.page.goto(this.el.submitNavigatesTo);
+    }
     async screenshot (opts) { return render(`element ${this.ref}`, this.page.passwordValue, !!opts?.mask?.length); }
-    async scrollIntoViewIfNeeded () { this.page.actions.push(['scrollIntoView', this.ref]); this.page.scrollY = 900; }
+    async scrollIntoViewIfNeeded () {
+        this.page.actions.push(['scrollIntoView', this.ref]);
+        this.page.scrollY = 900;
+        if (this.el.scrollNavigatesTo) await this.page.goto(this.el.scrollNavigatesTo);
+    }
     async selectOption (values) {
         this.page.actions.push(['selectOption', this.ref, values]);
-        return this.el.options.filter((o) => values.includes(o));
+        if (this.el.selectNavigatesTo) await this.page.goto(this.el.selectNavigatesTo);
+        return (this.el.optionValues ?? this.el.options).filter((o, i) => values.includes(this.el.options[i]));
     }
     async evaluate (fn, arg) {
         if (fn === fieldState) return { fillable: !!this.el.fillable, isPassword: this.el.type === 'password' };
@@ -109,16 +118,31 @@ class FakePage extends EventEmitter {
         this.passwordValue = '';
         this.scrollY = 0;
         this.text = 'Builder profile';
+        this.titleText = 'Page title';
         this.onRead = null;
+        /** goto target -> where the server redirects it. */
+        this.redirects = {};
+        this.gotoCalls = [];
+        this.enterNavigatesTo = null;
+        this.scrollNavigatesTo = null;
         this.frame = { evaluate: async (fn) => (fn === passwordValues && this.passwordValue ? [this.passwordValue] : []) };
-        this.keyboard = { press: async (key) => { this.actions.push(['keyboard', key]); } };
+        this.keyboard = {
+            press: async (key) => {
+                this.actions.push(['keyboard', key]);
+                if (key === 'Enter' && this.enterNavigatesTo) await this.goto(this.enterNavigatesTo);
+            },
+        };
     }
     url () { return this.currentUrl; }
     isClosed () { return false; }
     mainFrame () { return this.frame; }
     frames () { return [this.frame]; }
-    async title () { return 'Page title'; }
-    async goto (url) { this.currentUrl = url; this.emit('framenavigated', this.frame); }
+    async title () { return this.titleText; }
+    async goto (url) {
+        this.gotoCalls.push(url);
+        this.currentUrl = this.redirects[url] ?? url;
+        this.emit('framenavigated', this.frame);
+    }
     async waitForLoadState () {}
     locator (selector) {
         const ref = /^\[data-ezil-ref="(e[0-9]+)"\]$/.exec(selector);
@@ -142,7 +166,11 @@ class FakePage extends EventEmitter {
         if (fn === snapshotPage) return this.read(this.snapshotResult());
         if (fn === pageMarkdown) return this.read(`# ${this.text}`);
         if (fn === containsText) return this.read(this.text.includes(arg));
-        if (fn === scrollWindowBy) { this.scrollY += arg; return this.scrollY; }
+        if (fn === scrollWindowBy) {
+            this.scrollY += arg;
+            if (this.scrollNavigatesTo) await this.goto(this.scrollNavigatesTo);
+            return this.scrollY;
+        }
         if (fn === windowScrollY) return this.scrollY;
         if (typeof fn === 'function' && String(fn).includes('visibilityState')) return this.visible ? 'visible' : 'hidden';
         throw new Error('unexpected page function');
@@ -356,12 +384,14 @@ describe('opts.denyTiers (the Code loopback passes owner_app + idp_transit)', ()
             expect(owner.filled).toEqual([]);
 
             // Positive controls: same page without denyTiers, and an `other`
-            // page WITH it.
+            // page WITH it (navigating somewhere `other`: a Code navigate to
+            // the owner app is refused before it loads, tested below).
             expect(await codeOf(VERBS[route](surface, BODY[route]))).toBe('ok');
             const other = new FakePage(OTHER_PAGE);
             const otherSurface = surfaceOver([other]);
             mintRefs(otherSurface, other);
-            expect(await codeOf(VERBS[route](otherSurface, BODY[route], { denyTiers: CODE_DENY }))).toBe('ok');
+            const codeBody = route === 'POST /navigate' ? { url: 'https://example.org/next' } : BODY[route];
+            expect(await codeOf(VERBS[route](otherSurface, codeBody, { denyTiers: CODE_DENY }))).toBe('ok');
         });
     }
 
@@ -378,6 +408,100 @@ describe('opts.denyTiers (the Code loopback passes owner_app + idp_transit)', ()
             await expect(VERBS['POST /click'](surface, { ref: 'e4' }, { denyTiers })).rejects.toThrow(/denyTiers must be a Set/);
             expect(owner.actions).toEqual([]);
         }
+    });
+});
+
+// ── the Code loopback: landing on a denied tier returns NOTHING from it ─────
+
+describe('Code loopback: a verb that LANDS on a denied tier answers origin_read_only, no url, no title', () => {
+    const PRIVATE_TITLE = 'Universe — Ada Lovelace, builder profile';
+    /** [route, body, how the page gets taken onto the target] */
+    const LANDINGS = [
+        ['POST /navigate', { url: 'https://go.example.com/next' }, (p, to) => { p.redirects['https://go.example.com/next'] = to; }],
+        ['POST /click', { ref: 'e4' }, (p, to) => { p.elements.get('e4').navigatesTo = to; }],
+        ['POST /type', { ref: 'e1', text: 'q', submit: true }, (p, to) => { p.elements.get('e1').submitNavigatesTo = to; }],
+        ['POST /press', { key: 'Enter' }, (p, to) => { p.enterNavigatesTo = to; }],
+        ['POST /press', { ref: 'e1', key: 'Enter' }, (p, to) => { p.elements.get('e1').submitNavigatesTo = to; }],
+        ['POST /fill_form', { fields: [{ ref: 'e1', value: 'x' }] }, (p, to) => { p.elements.get('e1').fillNavigatesTo = to; }],
+        ['POST /select', { ref: 'e3', values: ['day'] }, (p, to) => { p.elements.get('e3').selectNavigatesTo = to; }],
+        ['POST /scroll', { dy: 100 }, (p, to) => { p.scrollNavigatesTo = to; }],
+        ['POST /scroll', { ref: 'e6' }, (p, to) => { p.elements.get('e6').scrollNavigatesTo = to; }],
+    ];
+
+    async function land (route, body, arrange, to, opts) {
+        const page = new FakePage(OTHER_PAGE);
+        page.titleText = PRIVATE_TITLE;
+        arrange(page, to);
+        const surface = surfaceOver([page]);
+        mintRefs(surface, page);
+        try {
+            return { page, out: await VERBS[route](surface, body, opts) };
+        } catch (err) {
+            return { page, err };
+        }
+    }
+
+    for (const [route, body, arrange] of LANDINGS) {
+        for (const [tierName, to] of [['owner_app', OWNER_PAGE], ['idp_transit', 'https://id.ezil.work/u/login']]) {
+            it(`${route} ${JSON.stringify(body)} landing on ${tierName}: refused, and nothing about it comes back`, async () => {
+                const { page, out, err } = await land(route, body, arrange, to, { denyTiers: CODE_DENY });
+                expect(out).toBeUndefined();
+                expect(err.code).toBe('origin_read_only');
+                for (const secret of ['universe-staging', 'id.ezil.work', 'Ada Lovelace', PRIVATE_TITLE]) {
+                    expect(err.message).not.toContain(secret);
+                }
+                // It DID land — the refusal is about what is answered.
+                expect(page.currentUrl).toBe(to);
+            });
+        }
+
+        it(`${route} ${JSON.stringify(body)}: positive controls — landing on other is fine for Code, anything is for the Worker`, async () => {
+            const toOther = await land(route, body, arrange, 'https://elsewhere.example.org/ok', { denyTiers: CODE_DENY });
+            expect(toOther.err).toBeUndefined();
+            expect(toOther.out.url).toBe('https://elsewhere.example.org/ok');
+            const worker = await land(route, body, arrange, OWNER_PAGE, {});
+            expect(worker.err).toBeUndefined();
+            expect(worker.out.url).toBe(OWNER_PAGE);
+            if (route === 'POST /navigate') expect(worker.out.title).toBe(PRIVATE_TITLE);
+        });
+    }
+
+    it('navigate straight to a denied target is refused BEFORE anything loads', async () => {
+        for (const target of [OWNER_PAGE, CALLBACK_URL, AUTHORIZE_URL, 'https://id.ezil.work/u/login']) {
+            const page = new FakePage(OTHER_PAGE);
+            const surface = surfaceOver([page]);
+            expect({ target, code: await codeOf(VERBS['POST /navigate'](surface, { url: target }, { denyTiers: CODE_DENY })) })
+                .toEqual({ target, code: 'origin_read_only' });
+            expect(page.gotoCalls).toEqual([]);
+            expect(page.currentUrl).toBe(OTHER_PAGE);
+        }
+        // Positive controls: an `other` target loads for Code; the Worker path loads anything.
+        const page = new FakePage(OTHER_PAGE);
+        const surface = surfaceOver([page]);
+        expect(await codeOf(VERBS['POST /navigate'](surface, { url: 'https://example.org/' }, { denyTiers: CODE_DENY }))).toBe('ok');
+        expect(await codeOf(VERBS['POST /navigate'](surface, { url: OWNER_PAGE }))).toBe('ok');
+        expect(page.gotoCalls).toEqual(['https://example.org/', OWNER_PAGE]);
+    });
+
+    it('nothing the tab recorded while on a denied tier comes back to Code from console or network', async () => {
+        const page = new FakePage(OWNER_PAGE);
+        const surface = surfaceOver([page]);
+        await surface.activePage();
+        page.log('universe says: welcome back Ada');
+        page.request('https://universe-staging.ezil.work/builder/profile-builder-save', { method: 'POST' });
+        await tick();
+        await page.goto(OTHER_PAGE); // the USER moved the tab on
+        page.log('preview loaded');
+        page.request('https://example.com/app.js');
+        await tick();
+        const logs = await VERBS['POST /console'](surface, {}, { denyTiers: CODE_DENY });
+        expect(logs.entries.map((e) => e.text)).toEqual(['preview loaded']);
+        const net = await VERBS['POST /network'](surface, {}, { denyTiers: CODE_DENY });
+        expect(net.requests.map((r) => r.url)).toEqual(['https://example.com/app.js']);
+        // Positive control: the Worker path still sees the tab's whole (sanitised) history.
+        expect((await VERBS['POST /console'](surface, {})).entries.map((e) => e.text))
+            .toEqual(['universe says: welcome back Ada', 'preview loaded']);
+        expect((await VERBS['POST /network'](surface, {})).requests).toHaveLength(2);
     });
 });
 

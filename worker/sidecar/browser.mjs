@@ -52,6 +52,9 @@ export const NETWORK_BUFFER_MAX = 300;
  *  from `bad_ref` for a while after the snapshot that minted them. */
 const REF_HISTORY_MAX = 4000;
 
+/** The default `denyTiers` for the entry readers: deny nothing. */
+const NO_TIERS = new Set();
+
 export class BrowserSurface {
     /**
      * @param {string} cdpUrl
@@ -266,14 +269,18 @@ export class BrowserSurface {
      * on the IdP; without this, the same text would simply come out on the
      * first call after the redirect back. The IdP's own page text never
      * leaves; the URLs it visited still do, sanitised, through `/network`.
+     *
+     * `denyTiers` (the Code loopback's Set) drops everything recorded while
+     * the tab was in one of those tiers as well: a Code chat on a preview tab
+     * that was on Universe a minute ago gets nothing Universe logged.
      */
-    consoleEntries (page) {
-        return this.entriesFor(this.consoleBuffer, page, (r) => r.tier !== 'idp_transit');
+    consoleEntries (page, denyTiers = NO_TIERS) {
+        return this.entriesFor(this.consoleBuffer, page, (r) => r.tier !== 'idp_transit' && !denyTiers.has(r.tier));
     }
 
-    /** The network entries recorded from `page`, public shape only. */
-    networkEntries (page) {
-        return this.entriesFor(this.networkBuffer, page, () => true);
+    /** The network entries recorded from `page`, public shape only; `denyTiers` as above. */
+    networkEntries (page, denyTiers = NO_TIERS) {
+        return this.entriesFor(this.networkBuffer, page, (r) => !denyTiers.has(r.tier));
     }
 
     entriesFor (buffer, page, keep) {
