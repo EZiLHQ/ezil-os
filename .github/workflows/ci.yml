@@ -395,7 +395,7 @@ jobs:
         run: PATH="$PWD/sdk/node_modules/.bin:$PATH" bun run --cwd tools typecheck
       - name: Unit tests
         shell: bash
-        run: bun test tools/
+        run: bun test ./tools/
       - name: Hosted migration helper tests
         shell: bash
         run: node --test app/scripts/ci-migrate.test.mjs

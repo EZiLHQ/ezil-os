@@ -1,0 +1,305 @@
+#!/usr/bin/env node
+// ezil: the in-computer CLI (docs/STAGING-COMPUTER-TOOLS-MCP.md section 7.5). Installed as /usr/local/bin/ezil.
+//
+//   ezil chat new|list|send|read   talks to the ezil-models extension over /run/ezil-cli/ezil.sock (root only)
+//   ezil tool validate [name]      checks <workspace>/.ezil/tools locally, through /opt/ezil-toolsd/manifest.mjs
+//
+// No dependencies and no static imports, so it runs the same as CommonJS (in /usr/local/bin) and as ESM (in the
+// repo, where worker/package.json says "type": "module"). Exit codes: 0 ok, 2 usage, 69 unavailable (no socket,
+// bridge off), 75 pending, 77 refused.
+
+const OK = 0;
+const USAGE_ERROR = 2;
+const UNAVAILABLE = 69;
+const PENDING = 75;
+const REFUSED = 77;
+
+const SOCKET = '/run/ezil-cli/ezil.sock';
+const MANIFEST = '/opt/ezil-toolsd/manifest.mjs';
+const WORKSPACE = '/home/neko/project';
+const REPLY_TIMEOUT_MS = 30_000;
+const MAX_TEXT = 16_384;
+const TOOL_NAME = /^[a-z][a-z0-9_]{2,47}$/;
+
+const HELP = `Usage: ezil <command> [options]
+
+Commands:
+  ezil chat new [--model M] [--effort E] [--message TEXT]   start a chat session (--message also sends TEXT)
+  ezil chat list                                            list this computer's chat sessions
+  ezil chat send <sessionId> <text|->                       send text to a session ("-" reads stdin)
+  ezil chat read <sessionId> [--cursor C]                   read a session's events, from a cursor
+  ezil tool validate [name]                                 validate self-built tools in <workspace>/.ezil/tools
+
+Options:
+  --json     print exactly the documented JSON object (errors go to stderr as {"error":{"code","message"}})
+  --help     print this help and exit 0
+
+Exit codes: 0 ok, 2 usage, 69 unavailable (no socket, bridge off), 75 pending (queued, waiting for the editor
+to reconnect), 77 refused (also: an invalid tool).
+Environment: EZIL_CLI_SOCKET (default ${SOCKET}), EZIL_TOOLSD_MANIFEST (default ${MANIFEST}),
+EZIL_WORKSPACE_ROOT (default ${WORKSPACE}).
+`;
+
+class CliError extends Error {
+    constructor(exit, code, message) {
+        super(message);
+        this.exit = exit;
+        this.code = code;
+    }
+}
+const usage = (message) => new CliError(USAGE_ERROR, 'usage', message);
+
+// Which flags each command takes: name -> takes a value.
+const FLAGS = {
+    'chat new': { model: true, effort: true, message: true },
+    'chat list': {},
+    'chat send': {},
+    'chat read': { cursor: true },
+    'tool validate': {},
+};
+
+function parse(argv, command) {
+    const allowed = { json: false, help: false, ...FLAGS[command] };
+    const flags = {};
+    const positional = [];
+    for (let i = 0; i < argv.length; i++) {
+        const arg = argv[i];
+        if (arg === '--') {
+            positional.push(...argv.slice(i + 1));
+            break;
+        }
+        if (arg === '-h') { flags.help = true; continue; }
+        if (arg.startsWith('--') && arg.length > 2) {
+            const eq = arg.indexOf('=');
+            const name = arg.slice(2, eq === -1 ? undefined : eq);
+            if (!Object.hasOwn(allowed, name)) throw usage(`unknown option --${name} for "ezil ${command}"`);
+            if (!allowed[name]) {
+                if (eq !== -1) throw usage(`--${name} takes no value`);
+                flags[name] = true;
+                continue;
+            }
+            let value;
+            if (eq !== -1) value = arg.slice(eq + 1);
+            else if (i + 1 < argv.length && !(argv[i + 1].startsWith('--') && argv[i + 1].length > 2)) value = argv[++i];
+            else throw usage(`--${name} needs a value`);
+            if (value === '') throw usage(`--${name} needs a non-empty value`);
+            flags[name] = value;
+            continue;
+        }
+        positional.push(arg);
+    }
+    return { flags, positional };
+}
+
+async function readStdin() {
+    const chunks = [];
+    for await (const chunk of process.stdin) chunks.push(chunk);
+    return Buffer.concat(chunks).toString('utf8').replace(/\r?\n$/, '');
+}
+
+async function textArg(value, what) {
+    const text = value === '-' ? await readStdin() : value;
+    if (!text.trim()) throw usage(`${what} is empty`);
+    if (text.length > MAX_TEXT) throw usage(`${what} is ${text.length} characters; the limit is ${MAX_TEXT}`);
+    return text;
+}
+
+// One request per connection: {v:1, op, args}\n out, {v:1, ok, ...}\n back.
+async function call(op, args) {
+    const net = await import('node:net');
+    const socketPath = process.env.EZIL_CLI_SOCKET || SOCKET;
+    const fail = (exit, code, message) => { throw new CliError(exit, code, message); };
+    const line = await new Promise((resolve, reject) => {
+        const socket = net.connect(socketPath);
+        let data = '';
+        let settled = false;
+        const settle = (fn, value) => { if (!settled) { settled = true; clearTimeout(timer); socket.destroy(); fn(value); } };
+        const timer = setTimeout(() => settle(reject, new CliError(UNAVAILABLE, 'bridge_timeout', 'no answer from the ezil bridge in time')), REPLY_TIMEOUT_MS);
+        socket.setEncoding('utf8');
+        socket.on('connect', () => socket.write(`${JSON.stringify({ v: 1, op, args })}\n`));
+        socket.on('data', (chunk) => {
+            data += chunk;
+            const newline = data.indexOf('\n');
+            if (newline !== -1) settle(resolve, data.slice(0, newline));
+        });
+        socket.on('end', () => settle(data.trim() ? resolve : reject, data.trim() ? data : new CliError(UNAVAILABLE, 'cli_unavailable', 'the ezil bridge closed the connection without an answer')));
+        socket.on('error', (error) => {
+            const why = error.code === 'ENOENT' || error.code === 'ECONNREFUSED' ? 'the ezil bridge is not running (no socket)'
+                : error.code === 'EACCES' || error.code === 'EPERM' ? 'the ezil socket is root only'
+                    : `cannot reach the ezil bridge (${error.code ?? 'error'})`;
+            settle(reject, new CliError(UNAVAILABLE, 'cli_unavailable', why));
+        });
+    });
+    let reply;
+    try {
+        reply = JSON.parse(line);
+    } catch {
+        fail(UNAVAILABLE, 'bridge_bad_reply', 'the ezil bridge answered with something that is not JSON');
+    }
+    if (!reply || typeof reply !== 'object' || reply.v !== 1 || typeof reply.ok !== 'boolean') fail(UNAVAILABLE, 'bridge_bad_reply', 'the ezil bridge answered with an unexpected shape');
+    if (reply.ok) {
+        if (!reply.result || typeof reply.result !== 'object') fail(UNAVAILABLE, 'bridge_bad_reply', 'the ezil bridge answered without a result');
+        return reply.result;
+    }
+    const code = typeof reply.error?.code === 'string' ? reply.error.code : 'bridge_error';
+    const message = typeof reply.error?.message === 'string' ? reply.error.message : code;
+    throw new CliError(exitFor(code), code, message);
+}
+
+function exitFor(code) {
+    if (code === 'cli_invalid_request' || code === 'request_too_large') return USAGE_ERROR;
+    if (['cli_unavailable', 'editor_disconnected', 'bridge_unreachable', 'bridge_timeout', 'bridge_bad_reply', 'bridge_error'].includes(code)) return UNAVAILABLE;
+    return REFUSED;
+}
+
+const present = (value) => value === undefined ? null : value;
+const nonEmpty = (value) => typeof value === 'string' && value.length > 0;
+const badReply = (what) => new CliError(UNAVAILABLE, 'bridge_bad_reply', `the ezil bridge answered ${what} without the documented fields`);
+
+function sessionAck(result, fallbackId) {
+    const sessionId = result.sessionId ?? fallbackId;
+    if (!nonEmpty(sessionId)) throw badReply('a chat request');
+    return { sessionId, operationId: present(result.operationId), status: present(result.status) };
+}
+
+function print(out, json, human) {
+    process.stdout.write(json ? `${JSON.stringify(out)}\n` : human(out));
+}
+
+const ack = (o) => `sessionId: ${o.sessionId}\noperationId: ${o.operationId ?? ''}\nstatus: ${o.status ?? ''}\n`;
+
+// Operation statuses (app/src/server/agent-session/store.ts OP_STATUSES). An accepted request exits 0 whether it is
+// queued, accepted or running; one that waits for a disconnected editor is pending (75); one OS turned away is refused.
+const PENDING_STATUSES = ['queued_disconnected'];
+const REFUSED_STATUSES = ['rejected', 'refused_allowance', 'expired', 'failed', 'cancelled'];
+
+function exitOf(out) {
+    if (PENDING_STATUSES.includes(out.status)) return PENDING;
+    return REFUSED_STATUSES.includes(out.status) ? REFUSED : OK;
+}
+
+async function chatNew({ flags, positional }) {
+    if (positional.length) throw usage('"ezil chat new" takes no arguments (use --message TEXT)');
+    const text = flags.message === undefined ? undefined : await textArg(flags.message, '--message');
+    const args = {};
+    if (flags.model) args.model = flags.model;
+    if (flags.effort) args.effort = flags.effort;
+    const created = sessionAck(await call('chat.new', args));
+    if (text === undefined) return { out: created, human: ack };
+    try {
+        const sent = sessionAck(await call('chat.send', { sessionId: created.sessionId, text }), created.sessionId);
+        return { out: { sessionId: created.sessionId, operationId: sent.operationId, status: sent.status }, human: ack };
+    } catch (error) {
+        if (error instanceof CliError) error.message += ` (session ${created.sessionId} was created; its message was not sent)`;
+        throw error;
+    }
+}
+
+async function chatList({ positional }) {
+    if (positional.length) throw usage('"ezil chat list" takes no arguments');
+    const result = await call('chat.list', {});
+    if (!Array.isArray(result.sessions)) throw badReply('a session list');
+    return {
+        out: { sessions: result.sessions },
+        human: (o) => o.sessions.length === 0 ? 'no sessions\n'
+            : o.sessions.map((s) => [s?.sessionId ?? s?.id, s?.status, s?.title].filter((v) => typeof v === 'string' && v).join('\t') || JSON.stringify(s)).join('\n') + '\n',
+    };
+}
+
+async function chatSend({ positional }) {
+    if (positional.length !== 2) throw usage('usage: ezil chat send <sessionId> <text|->');
+    const [sessionId, raw] = positional;
+    const text = await textArg(raw, 'text');
+    return { out: sessionAck(await call('chat.send', { sessionId, text }), sessionId), human: ack };
+}
+
+async function chatRead({ flags, positional }) {
+    if (positional.length !== 1) throw usage('usage: ezil chat read <sessionId> [--cursor C]');
+    const sessionId = positional[0];
+    const args = { sessionId };
+    if (flags.cursor) args.cursor = flags.cursor;
+    const result = await call('chat.read', args);
+    if (!Array.isArray(result.events)) throw badReply('a read');
+    return {
+        out: { sessionId: result.sessionId ?? sessionId, events: result.events, cursor: present(result.cursor) },
+        human: (o) => o.events.map((e) => JSON.stringify(e)).join('\n') + (o.events.length ? '\n' : '') + `cursor: ${o.cursor ?? ''}\n`,
+    };
+}
+
+async function toolValidate({ positional }) {
+    if (positional.length > 1) throw usage('usage: ezil tool validate [name]');
+    const name = positional[0];
+    if (name !== undefined && !TOOL_NAME.test(name)) throw usage(`"${name}" is not a valid tool name`);
+    const { pathToFileURL } = await import('node:url');
+    const manifestPath = process.env.EZIL_TOOLSD_MANIFEST || MANIFEST;
+    let manifest;
+    try {
+        manifest = await import(pathToFileURL(manifestPath).href);
+    } catch {
+        throw new CliError(UNAVAILABLE, 'validator_unavailable', `the tool validator is not available (${manifestPath})`);
+    }
+    if (typeof manifest.scanCatalog !== 'function' || typeof manifest.validateManifest !== 'function') {
+        throw new CliError(UNAVAILABLE, 'validator_unavailable', `${manifestPath} does not export validateManifest and scanCatalog`);
+    }
+    const catalog = await manifest.scanCatalog(process.env.EZIL_WORKSPACE_ROOT || WORKSPACE);
+    // Never read a result of another shape as "no tools": that would report success for a validator we do not understand.
+    if (!Array.isArray(catalog?.tools) || !Array.isArray(catalog?.invalid)) {
+        throw new CliError(UNAVAILABLE, 'validator_unavailable', `${manifestPath} returned a catalog without tools and invalid lists`);
+    }
+    let { tools, invalid } = catalog;
+    if (name !== undefined) {
+        tools = tools.filter((t) => t?.name === name);
+        invalid = invalid.filter((i) => i?.dir === name);
+        if (!tools.length && !invalid.length) throw usage(`no tool directory named "${name}"`);
+    }
+    const out = { tools, invalid };
+    return {
+        out,
+        exit: invalid.length ? REFUSED : OK,
+        human: (o) => (o.tools.length || o.invalid.length ? [
+            ...o.tools.map((t) => `ok       ${t.name}${t.description ? ` - ${t.description}` : ''}`),
+            ...o.invalid.map((i) => `invalid  ${i.dir}: ${i.error}`),
+        ].join('\n') + '\n' : 'no tools\n'),
+    };
+}
+
+const COMMANDS = {
+    'chat new': chatNew,
+    'chat list': chatList,
+    'chat send': chatSend,
+    'chat read': chatRead,
+    'tool validate': toolValidate,
+};
+
+async function main(argv) {
+    if (argv.includes('--help') || argv.includes('-h')) {
+        process.stdout.write(HELP);
+        return OK;
+    }
+    const words = [];
+    const rest = [...argv];
+    while (rest[0] === '--json') rest.shift();
+    // The command is the leading non-option words: "chat new", "tool validate".
+    while (words.length < 2 && rest.length && !rest[0].startsWith('-')) words.push(rest.shift());
+    const command = words.join(' ');
+    const json = argv.includes('--json');
+    try {
+        if (!words.length) throw usage('missing command');
+        const handler = COMMANDS[command];
+        if (!handler) throw usage(`unknown command "${command}"`);
+        const parsed = parse(rest, command);
+        const result = await handler(parsed);
+        print(result.out, parsed.flags.json === true, result.human);
+        return result.exit ?? exitOf(result.out);
+    } catch (error) {
+        if (!(error instanceof CliError)) throw error;
+        const text = error.exit === USAGE_ERROR && error.code === 'usage' ? `${error.message}\nTry "ezil --help".` : error.message;
+        process.stderr.write(json ? `${JSON.stringify({ error: { code: error.code, message: error.message } })}\n` : `ezil: ${text}\n`);
+        return error.exit;
+    }
+}
+
+main(process.argv.slice(2)).then(
+    (code) => { process.exitCode = code; },
+    (error) => { process.stderr.write(`ezil: ${error instanceof Error ? error.message : 'failed'}\n`); process.exitCode = UNAVAILABLE; },
+);

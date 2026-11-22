@@ -293,6 +293,11 @@ interface Env extends SandboxEnv {
    * the one an operator can turn without redeploying an image.
    */
   SANDBOX_BROWSER?: string;
+  /**
+   * Staging computer tools (worker/src/computer-tools.ts). Exactly `on` mounts `POST /sandbox/:name/computer-tools`;
+   * unset (the default) or anything else, the route does not exist (ezil-mcp docs/STAGING-COMPUTER-TOOLS-MCP.md 8).
+   */
+  SANDBOX_COMPUTER_TOOLS?: string;
   /** Opt-in delegated, read-only Browser observation on staging. */
   SANDBOX_MCP_BROWSER_OBSERVE?: string;
   /** Opt-in signed external Browser MCP on the staging Worker. */
@@ -687,6 +692,8 @@ import {
   type StoredAiCreditsPending,
 } from './ai-proxy';
 import { deriveEditorBridgeToken, editorBridgeTargetAllowed, handleEditorBridgeRequest, isEditorBridgePath, resolveOsBridgeUrl, type EditorBridgeProvider } from './editor-bridge';
+import { COMPUTER_TOOLS_PATH, computerToolsEnabled, computerToolsV2Bounds, handleComputerTools } from './computer-tools';
+import { EDITOR_CLI_PATH, handleEditorCli } from './editor-cli';
 
 import { captureEditorState } from './editor-state';
 import { CF_ADMISSION_ERROR, cfAdmissionRunningOnly, cfAdmissionResponse, isCfAdmissionError } from './cf-container-admission';
@@ -7253,6 +7260,8 @@ async function handleBridgeHost(request: Request, env: Env, url: URL): Promise<R
     return handlePreviewBootstrap(url, sandboxId, secrets, cookieSecret, target);
   }
 
+  // In-computer `ezil` CLI channel (worker/src/editor-cli.ts); before the sync, whose path predicate also matches it.
+  if (target === 'code' && path === EDITOR_CLI_PATH) return handleEditorCli(request, env, sandboxId);
   if (target === 'code' && isEditorBridgePath(path)) return handleEditorBridge(request, env, sandboxId);
   if (target === 'code' && isAiProxyPath(path)) return handleAiProxy(request, env, sandboxId);
 
@@ -7418,15 +7427,17 @@ async function preauthorizeV2(request: Request, env: Env, url: URL): Promise<Res
   // v2 signs the pathname only. A query string would be unsigned input a
   // replayed token could vary (e.g. `?desktopMode=`), so v2 refuses any query.
   if (url.search !== '') return json({ ok: false, error: 'hmac_v2_query_not_allowed' }, 401);
+  // The staging computer-tools route bounds its own body and accepts only the primary secret (WFWD-3, WFWD-5).
+  const routeBounds = computerToolsV2Bounds(env, request.method, url.pathname);
   let body: Uint8Array;
   try {
-    const read = await readBoundedBody(request, V2_MAX_BODY_BYTES);
+    const read = await readBoundedBody(request, routeBounds?.maxBodyBytes ?? V2_MAX_BODY_BYTES);
     if (read === 'too_large') return json({ ok: false, error: 'request_too_large' }, 413);
     body = read;
   } catch {
     return json({ ok: false, error: 'hmac_v2_body_unreadable' }, 401);
   }
-  const verdict = await verifyPreviewTokenV2(token, resolvePreviewSecrets(env), {
+  const verdict = await verifyPreviewTokenV2(token, resolvePreviewSecrets(routeBounds?.secrets ?? env), {
     method: request.method.toUpperCase(),
     path: url.pathname,
     body,
@@ -8314,6 +8325,16 @@ const worker = {
       } catch {
         return json({ ok: false, error: 'browser_unavailable' }, 503);
       }
+    }
+
+    // Staging computer tools (worker/src/computer-tools.ts, ezil-mcp docs/STAGING-COMPUTER-TOOLS-MCP.md 3.3):
+    // OS-signed v2 claims, then this boot's MAC to ezil-toolsd on 9224; never starts a stopped container.
+    // Off unless SANDBOX_COMPUTER_TOOLS=on (WFWD-6); the DO is opened only after the handler's checks (WFWD-8).
+    const computerTools = computerToolsEnabled(env) ? path.match(COMPUTER_TOOLS_PATH) : null;
+    if (method === 'POST' && computerTools) {
+      const ctSandbox = computerTools[1]!;
+      return handleComputerTools(request, env, url.origin, ctSandbox,
+        verifiedV2Claims.get(request), () => openSandbox(env, ctSandbox), { deriveSandboxId, withDeadline });
     }
 
     const browserMatch = path.match(/^\/sandbox\/([^/]+)\/browser\/([a-z_]+)$/);

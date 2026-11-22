@@ -12,6 +12,7 @@ import { EZiLAIStatus } from './status';
 import { EZiLModelsProvider, type BillingIntent } from './provider';
 import { PARTICIPANT_ID, registerNoToolsParticipant } from './participant';
 import { registerBrowserMcp } from './browser-mcp';
+import { registerCodeCli } from './code-cli-endpoint';
 import type { Usage } from './types';
 import { publishInferenceTrace } from './trace-publisher';
 import { hostedInferenceActivity } from './inference-activity';
@@ -255,6 +256,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     registerBrowserMcp(context);
     const output = vscode.window.createOutputChannel('EZiL Models');
     const log = (line: string) => output.appendLine(line.startsWith('{') ? line : `${new Date().toISOString()} ${line}`);
+    // In-computer `ezil` CLI (code-cli-endpoint.ts): a root-only socket, served only with the chat bridge setting.
+    registerCodeCli(context, log);
     const settings = () => vscode.workspace.getConfiguration('ezilModels');
     const store = new ConfigStore(resolveConfigPath(settings().get<string>('configPath')), log);
     const usage = new UsageTracker();
