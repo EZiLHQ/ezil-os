@@ -1,3 +1,4 @@
+import {openWithAssignmentConsent, confirmAssignmentFolder} from '../assignment-video/shell.js';
 import { ai_trace_collector } from '../ui/ai-traces.js';
 import { attachCodeAuthRecovery, resetOriginRecovery } from './code-auth-recovery.js';
 import { createGitAccessRenewal } from './code-git-access.js';
@@ -582,7 +583,7 @@ async function mintCodePreviewUrlOnce (computerId, cancel, project, folder = nul
     const repositoryFocus = project?.repoUrl?.startsWith('https://github.ezil.work/') && repository && repositoryFolder
         ? { name: repository, folder: repositoryFolder } : undefined;
     const url = tagFolderMint(data.codePreviewUrl, { asked: folder_ask, answer: data.codeFolder, repositoryFocus });
-    return { ok: true, url, expiresAt: data.expiresAt, ...(project ? { repository, repositoryFolder } : {}) };
+    return { ok: true, url, expiresAt: data.expiresAt, assignmentOpen: data.assignmentOpen, ...(project ? { repository, repositoryFolder } : {}) };
 }
 
 /**
@@ -718,6 +719,7 @@ export async function openCodeWindow (ctx = {}) {
         : ctx.folderRejected === 'with_repository' ? 'with_repository' : 'link_invalid';
     /** The folder the server opened this window's project at (its mint URL's `folder`), never named in the address. */
     let repository_folder = null;
+    let assignment_open;
     /** What the editor shows, from its last report: `{kind: 'folder', path, base?}`, `{kind: 'empty'}`, `{kind: 'unsupported'}`. */
     let editor_root = null;
     /** Every folder this window's editor has shown (walked by a mint, or opened by the person in Code). */
@@ -990,6 +992,7 @@ export async function openCodeWindow (ctx = {}) {
         if ( disposed ) return;
         git_access?.reset();
         repository_folder = null;
+        assignment_open = undefined;
         const my_attempt = ++attempt;
         stop_timers();
         show_panel();
@@ -1129,6 +1132,7 @@ export async function openCodeWindow (ctx = {}) {
         console.info(`[${PHASE}] mint resolved in ${Math.round(performance.now() - t0)}ms`);
         trace.step('mint_ok');
         repository_folder = asked ? (res.repositoryFolder ?? null) : null;
+        assignment_open = res.assignmentOpen;
         if ( asked ) {
             // Lane O2: the repository is open, so a later refresh may happen again; the window is named after it.
             forgetIdentityRefresh();
@@ -1261,7 +1265,14 @@ export async function openCodeWindow (ctx = {}) {
                         // origin, answering this binding's hello nonce with this mint's id. The server's HTTP
                         // confirmation above is not that (the 502 recovery page installs no bridge), so a probe that
                         // answers while the frame still shows that page cannot re-arm the automatic reopen.
-                        onRoot: (root, how) => { resetOriginRecovery(); on_root(root, how); },
+                        onRoot: (root, how) => {
+                            resetOriginRecovery();
+                            if (how.mintDriven && !how.fallback && root.kind === 'folder' && root.path === repository_folder) {
+                                confirmAssignmentFolder(project, assignment_open);
+                                assignment_open = undefined;
+                            }
+                            on_root(root, how);
+                        },
                         onOpen: on_open, onLeaving: on_leaving,
                     });
                     if ( link_folder_problem ) { folder_notice.fallback(link_folder_problem, null); link_folder_problem = null; }
@@ -1633,7 +1644,7 @@ export async function openCodeWindow (ctx = {}) {
         project = next;
         if ( same ) return;
         set_title(title);
-        void start_boot();
+        launchWithConsent();
     };
     // Back from the taskbar: full view again if still wanted, else the
     // windowed bounds a minimise-from-full left stashed. After `showWindow`'s
@@ -1712,7 +1723,11 @@ export async function openCodeWindow (ctx = {}) {
     window.addEventListener('ezil:desktop-restarted', on_restarted);
     window.addEventListener(TRANSITION_EVENT, on_transition);
 
-    void start_boot();
+    function launchWithConsent() {
+        openWithAssignmentConsent({project, actor: () => session.payload()?.user?.id,
+            open: () => { if (!disposed) void start_boot(); }});
+    }
+    launchWithConsent();
     return el_window;
 }
 
