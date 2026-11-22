@@ -50,23 +50,46 @@ describe('loadOriginPolicy: where tiers come from', () => {
         expect(tierOf(`${OWNER}/builder`, policy)).toBe('other');
     });
 
-    it('unset, empty and blank variables are NOT malformed: an empty tier, the rest as configured', () => {
-        for (const value of [undefined, null, '', '   ', ',', ' , ']) {
-            for (const variable of Object.values(ORIGIN_TIER_ENV)) {
-                const other = variable === ORIGIN_TIER_ENV.owner_app ? ORIGIN_TIER_ENV.idp_transit : ORIGIN_TIER_ENV.owner_app;
-                const policy = loadOriginPolicy({ [variable]: value, [other]: other === ORIGIN_TIER_ENV.owner_app ? OWNER : IDP });
-                expect({ value, variable, broken: policy.broken, invalid: policy.invalid })
-                    .toEqual({ value, variable, broken: false, invalid: [] });
-                expect(tierOf('https://example.com/', policy)).toBe('other');
-            }
+    const BLANKS = [undefined, null, '', '   ', ',', ' , '];
+
+    it('unset or blank variables are NOT malformed: an unset owner list, an unset IdP list, or both', () => {
+        for (const value of BLANKS) {
+            const noOwner = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: value, [ORIGIN_TIER_ENV.idp_transit]: IDP });
+            expect({ value, broken: noOwner.broken, invalid: noOwner.invalid }).toEqual({ value, broken: false, invalid: [] });
+            expect(tierOf('https://example.com/', noOwner)).toBe('other');
+            expect(tierOf(`${IDP}/authorize`, noOwner)).toBe('idp_transit');
+            const neither = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: value, [ORIGIN_TIER_ENV.idp_transit]: value });
+            expect({ value, broken: neither.broken, invalid: neither.invalid }).toEqual({ value, broken: false, invalid: [] });
+            expect(tierOf('https://example.com/', neither)).toBe('other');
         }
         expect(loadOriginPolicy(undefined).broken).toBe(false);
         expect(tierOf('https://example.com/', loadOriginPolicy({}))).toBe('other');
     });
 
+    // 🔴 Amended 2026-11-22: an owner app is only safe when its IdP is known.
+    it('…EXCEPT a non-empty owner list with an empty or unset IdP list: that policy is broken', () => {
+        for (const value of BLANKS) {
+            const policy = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: OWNER, [ORIGIN_TIER_ENV.idp_transit]: value });
+            expect({ value, broken: policy.broken }).toEqual({ value, broken: true });
+            for (const url of [`${OWNER}/builder`, `${IDP}/authorize`, 'https://example.com/', 'about:blank']) {
+                expect({ value, url, tier: tierOf(url, policy) }).toEqual({ value, url, tier: 'idp_transit' });
+            }
+            expect(policy.invalid).toEqual([{
+                tier: 'idp_transit', variable: ORIGIN_TIER_ENV.idp_transit, entry: 0, reason: 'empty_with_owner_list',
+            }]);
+            const [line] = originPolicyBootLines(policy);
+            expect(line).toContain(`${ORIGIN_TIER_ENV.idp_transit} is empty while ${ORIGIN_TIER_ENV.owner_app} is set`);
+        }
+        // Positive control: the same owner list WITH its IdP list is sound.
+        const sound = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: OWNER, [ORIGIN_TIER_ENV.idp_transit]: IDP });
+        expect(sound.broken).toBe(false);
+        expect(tierOf(`${OWNER}/builder`, sound)).toBe('owner_app');
+    });
+
     it('accepts a comma list with blanks around the commas, and an explicit non-default port', () => {
         const policy = loadOriginPolicy({
             [ORIGIN_TIER_ENV.owner_app]: ` ${OWNER} , https://app.example.com:8443 ,`,
+            [ORIGIN_TIER_ENV.idp_transit]: IDP,
         });
         expect(policy.broken).toBe(false);
         expect(policy.owner_app).toEqual([OWNER, 'https://app.example.com:8443']);
@@ -130,10 +153,10 @@ describe('loadOriginPolicy: where tiers come from', () => {
 
     it(`more than ${ORIGIN_TIER_MAX_ENTRIES} entries breaks the policy; exactly ${ORIGIN_TIER_MAX_ENTRIES} is fine`, () => {
         const list = (n) => Array.from({ length: n }, (_, i) => `https://h${i}.example.com`).join(',');
-        const ok = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: list(ORIGIN_TIER_MAX_ENTRIES) });
+        const ok = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: list(ORIGIN_TIER_MAX_ENTRIES), [ORIGIN_TIER_ENV.idp_transit]: IDP });
         expect(ok.broken).toBe(false);
         expect(ok.owner_app).toHaveLength(ORIGIN_TIER_MAX_ENTRIES);
-        const tooMany = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: list(ORIGIN_TIER_MAX_ENTRIES + 1) });
+        const tooMany = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: list(ORIGIN_TIER_MAX_ENTRIES + 1), [ORIGIN_TIER_ENV.idp_transit]: IDP });
         expect(tooMany.broken).toBe(true);
         expect(tooMany.invalid.map((p) => p.reason)).toEqual(['too_many_entries']);
         expect(tierOf('https://h0.example.com/', tooMany)).toBe('idp_transit');

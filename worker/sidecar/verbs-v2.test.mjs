@@ -359,6 +359,27 @@ describe('a broken origin policy (a malformed tier entry) makes EVERY page idp_t
         });
     }
 
+    it('an owner list WITHOUT an IdP list is broken too: Universe pages are transit-only', async () => {
+        const ownerOnly = loadOriginPolicy({ [ORIGIN_TIER_ENV.owner_app]: 'https://universe-staging.ezil.work' });
+        expect(ownerOnly.broken).toBe(true);
+        for (const url of [OWNER_PAGE, 'https://id.ezil.work/u/login', OTHER_PAGE]) {
+            const page = new FakePage(url);
+            const surface = surfaceOver([page], { policy: ownerOnly });
+            mintRefs(surface, page);
+            for (const route of REFUSED) {
+                expect({ url, route, code: await codeOf(VERBS[route](surface, BODY[route])) }).toEqual({ url, route, code: 'origin_read_only' });
+            }
+            expect(page.actions).toEqual([]);
+        }
+        // Positive control: with its IdP list the same owner page is fully usable.
+        const page = new FakePage(OWNER_PAGE);
+        const surface = surfaceOver([page], { policy: STAGING });
+        mintRefs(surface, page);
+        for (const route of REFUSED) {
+            expect({ route, code: await codeOf(VERBS[route](surface, BODY[route])) }).toEqual({ route, code: 'ok' });
+        }
+    });
+
     it('positive control: the same page under the well-formed policy is `other` and fully usable', async () => {
         const page = new FakePage(OTHER_PAGE);
         const surface = surfaceOver([page], { policy: STAGING });

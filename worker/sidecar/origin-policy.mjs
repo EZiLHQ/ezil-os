@@ -29,7 +29,9 @@
  * once. (Amended 2026-11-21. Emptying just the bad tier failed OPEN: a typo in
  * the IdP list made the IdP `other`, which allows every verb, and a typo in
  * the owner list made Universe `other`, which the Code loopback does not
- * refuse.) Unset or blank variables are not malformed: that tier is empty. An
+ * refuse.) Unset or blank variables are not malformed: that tier is empty —
+ * EXCEPT that a non-empty owner list with an empty or unset IdP list is broken
+ * too (amended 2026-11-22: an owner app is only safe when its IdP is known). An
  * origin listed in both variables is `idp_transit`, never `owner_app`.
  *
  * ── Policies are minted here, never hand-built ──────────────────────────────
@@ -116,7 +118,14 @@ export function loadOriginPolicy (env) {
     const source = env && typeof env === 'object' ? env : {};
     const owner = parseTierList('owner_app', ORIGIN_TIER_ENV.owner_app, source[ORIGIN_TIER_ENV.owner_app]);
     const idp = parseTierList('idp_transit', ORIGIN_TIER_ENV.idp_transit, source[ORIGIN_TIER_ENV.idp_transit]);
-    const broken = !owner.ok || !idp.ok;
+    // An owner app is only safe when its IdP is known: owner origins with no
+    // IdP list would let the sign-in pages be `other`. Broken too (amended
+    // 2026-11-22).
+    const ownerWithoutIdp = owner.ok && idp.ok && owner.valid.length > 0 && idp.valid.length === 0;
+    if (ownerWithoutIdp) {
+        idp.problems.push({ tier: 'idp_transit', variable: ORIGIN_TIER_ENV.idp_transit, entry: 0, reason: 'empty_with_owner_list' });
+    }
+    const broken = !owner.ok || !idp.ok || ownerWithoutIdp;
 
     const overlap = broken ? [] : [...new Set(owner.valid.filter((o) => idp.valid.includes(o)))];
     const idpSet = new Set(broken ? [] : idp.valid);
@@ -366,11 +375,14 @@ export function sanitizeText (text, policy) {
 export function originPolicyBootLines (policy) {
     tierSets(policy);
     if (policy.broken) {
-        const faults = policy.invalid.map((p) => (p.reason === 'too_many_entries'
-            ? `${p.variable} has more than ${ORIGIN_TIER_MAX_ENTRIES} entries`
-            : p.reason === 'not_a_string'
-                ? `${p.variable} is not a string`
-                : `${p.variable} entry #${p.entry} is not a bare https origin (https://host[:port], no path, no wildcard)`));
+        const faults = policy.invalid.map((p) => {
+            if (p.reason === 'too_many_entries') return `${p.variable} has more than ${ORIGIN_TIER_MAX_ENTRIES} entries`;
+            if (p.reason === 'not_a_string') return `${p.variable} is not a string`;
+            if (p.reason === 'empty_with_owner_list') {
+                return `${p.variable} is empty while ${ORIGIN_TIER_ENV.owner_app} is set (an owner app needs its IdP)`;
+            }
+            return `${p.variable} entry #${p.entry} is not a bare https origin (https://host[:port], no path, no wildcard)`;
+        });
         return [
             `[ezil-sidecar] origin policy BROKEN — ${faults.join('; ')}: every page is idp_transit `
             + '(health, navigate and wait_for{time} only) until it is fixed',
