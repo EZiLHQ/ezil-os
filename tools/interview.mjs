@@ -271,6 +271,11 @@ async function create(ctx, io, opts) {
 			body: { candidateEmail: opts["candidate-email"], handle: opts.handle, name: opts.name, title: opts.title },
 		});
 		const body = accept("works create", res);
+		// Contract erratum E2: 202 with seed null means the repository is still being provisioned; the same
+		// Idempotency-Key retries it (the resume line below says how). It is not a malformed answer.
+		if (res.status === 202 && body?.seed === null) {
+			throw new StepError("works create: the repository is still being provisioned (202, no seed yet)");
+		}
 		const bad = validateSchema(CREATE_RESPONSE, schema, body);
 		if (bad.length > 0) throw new StepError(`works create: unexpected response (${bad[0]})`);
 		io.secrets.add(body.seed.token);

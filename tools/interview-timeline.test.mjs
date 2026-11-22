@@ -639,6 +639,17 @@ describe("interview.mjs create", () => {
 		assert.ok(!r.stderr.includes(WORKS_TOKEN) && !r.stdout.includes(WORKS_TOKEN));
 	});
 
+	test("a 202 with no seed (still provisioning, erratum E2) stops before any push and says to retry with the same key", async () => {
+		const fetch = stubFetch({ [`POST ${ORIGIN.works}/v1/ops/qa/interview-repositories`]: { status: 202, body: { ...worksCreateBody, seed: null } } });
+		const git = stubGit();
+		const r = await run(CREATE_ARGS, { fetch, git });
+		assert.equal(r.code, 1);
+		assert.match(r.stderr, /still being provisioned \(202, no seed yet\)/);
+		assert.match(r.stderr, /--idempotency-key 5f0e2b1c-3d4a-4b5c-8d6e-7f8091a2b3c4/);
+		assert.doesNotMatch(r.stderr, /unexpected response/);
+		assert.equal(git.calls.length, 0);
+	});
+
 	test("a seed remote that is not https, or carries credentials, is refused before any push", async () => {
 		for (const remote of ["http://git-qa.ezil.work/x.git", `https://user:${SEED_TOKEN}@git-qa.ezil.work/x.git`, "file:///etc"]) {
 			const fetch = stubFetch({ ...routes(), [`POST ${ORIGIN.works}/v1/ops/qa/interview-repositories`]: { status: 201, body: { ...worksCreateBody, seed: { ...worksCreateBody.seed, remote } } } });
