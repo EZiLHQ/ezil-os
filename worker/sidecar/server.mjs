@@ -138,6 +138,7 @@ export function createSidecarServer (surface, {
     browserOpen = createMcpBrowserOpen(surface, { allowedOrigins: process.env.EZIL_BROWSER_TEST_ALLOWED_ORIGINS }),
     workerBrowserOpenToken = process.env.EZIL_WORKER_BROWSER_MCP_TOKEN,
     workerBrowserControl = process.env.EZIL_WORKER_BROWSER_CONTROL === 'on',
+    workerBrowserOpen = process.env.EZIL_WORKER_BROWSER_OPEN === 'on',
     codeBrowserOpenToken = process.env.EZIL_CODE_BROWSER_MCP_TOKEN,
 } = {}) {
     const codeBinding = typeof codeBrowserOpenToken === 'string' && BOOT_CAPABILITY.test(codeBrowserOpenToken)
@@ -226,7 +227,12 @@ export function createSidecarServer (surface, {
         const key = `${method} ${path}`;
         // The private observation has a closed metadata response with no
         // page text. It deliberately does not inspect passwords to redact it.
-        if (path === BROWSER_OPEN_PATH || path === CODE_BROWSER_OPEN_PATH) {
+        // 🔴 The Worker's open-url route exists only behind its own boot switch
+        // (`EZIL_WORKER_BROWSER_OPEN`, set from the Worker's `SANDBOX_MCP_BROWSER_OPEN`).
+        // The Worker bearer alone no longer implies it, because every boot with
+        // the verb route open now carries that bearer. Off, the path falls
+        // through and answers exactly as an unknown route does.
+        if (path === CODE_BROWSER_OPEN_PATH || (path === BROWSER_OPEN_PATH && workerBrowserOpen)) {
             return handleBrowserOpen(req, res, method, path);
         }
         if (req.url === OBSERVE_PATH && method === 'POST') {

@@ -4378,6 +4378,44 @@ describe('AI Durable Object storage and boot lifecycle', () => {
     expect(Object.values(launched[2] ?? {})).not.toContain(SECRET);
   });
 
+  it('the Worker open route has its own boot switch: EZIL_WORKER_BROWSER_OPEN only with SANDBOX_MCP_BROWSER_OPEN', async () => {
+    // Every boot with the verb route open now carries the Worker bearer, so the bearer can no longer be what turns the
+    // sidecar's Worker open-url route on: that takes EZIL_WORKER_BROWSER_OPEN, as control takes EZIL_WORKER_BROWSER_CONTROL.
+    const { obj } = await object();
+    obj.env.EZIL_BROWSER_TEST_ALLOWED_ORIGINS = 'https://fixture.test';
+    obj.listProcesses = async () => [];
+    const launched: Record<string, string>[] = [];
+    obj.startProcess = async (_: string, options: { env: Record<string, string> }) => {
+      launched.push(options.env);
+      return { id: 'launcher' };
+    };
+    const start = () => obj.startAiDesktop('ezil.work', SANDBOX_NAME, 'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh', {});
+    const switches = (env: Record<string, string> | undefined) => ({
+      open: env?.EZIL_WORKER_BROWSER_OPEN, control: env?.EZIL_WORKER_BROWSER_CONTROL, bearer: !!env?.EZIL_WORKER_BROWSER_MCP_TOKEN,
+    });
+    for (const [flags, expected] of [
+      [{}, { open: undefined, control: undefined, bearer: true }],
+      [{ EZIL_CODE_BROWSER_MCP: 'on' }, { open: undefined, control: undefined, bearer: true }],
+      [{ SANDBOX_MCP_BROWSER_CONTROL: 'on' }, { open: undefined, control: 'on', bearer: true }],
+      [{ SANDBOX_MCP_BROWSER_OPEN: 'on' }, { open: 'on', control: undefined, bearer: true }],
+      [{ SANDBOX_MCP_BROWSER_OPEN: 'on', SANDBOX_BROWSER: 'off' }, { open: 'on', control: undefined, bearer: true }],
+      [{ SANDBOX_MCP_BROWSER_OPEN: 'off', SANDBOX_BROWSER: 'off' }, { open: undefined, control: undefined, bearer: false }],
+      [{ SANDBOX_MCP_BROWSER_OPEN: 'true' }, { open: undefined, control: undefined, bearer: true }],
+    ] as const) {
+      for (const key of ['EZIL_CODE_BROWSER_MCP', 'SANDBOX_MCP_BROWSER_CONTROL', 'SANDBOX_MCP_BROWSER_OPEN', 'SANDBOX_BROWSER']) delete obj.env[key];
+      Object.assign(obj.env, flags);
+      await start();
+      expect({ flags, got: switches(launched[launched.length - 1]) }).toEqual({ flags, got: expected });
+    }
+    // Without a derivation secret there is no bearer, and so no open switch either.
+    const unconfigured = await object('');
+    Object.assign(unconfigured.obj.env, { EZIL_BROWSER_TEST_ALLOWED_ORIGINS: 'https://fixture.test', SANDBOX_MCP_BROWSER_OPEN: 'on' });
+    unconfigured.obj.listProcesses = async () => [];
+    unconfigured.obj.startProcess = obj.startProcess;
+    await unconfigured.obj.startAiDesktop('ezil.work', SANDBOX_NAME, 'DESKTOP_MODE=neko bash /usr/local/bin/start-desktop.sh', {});
+    expect(switches(launched[launched.length - 1])).toEqual({ open: undefined, control: undefined, bearer: false });
+  });
+
   it('browser verbs v2: every boot with the verb route open carries the verb bearer, and the origin tiers when set', async () => {
     const { obj } = await object();
     obj.listProcesses = async () => [];

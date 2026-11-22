@@ -8005,7 +8005,9 @@ async function workerBrowserOpenCapability(env: Env, sandboxId: string): Promise
  * What the sidecar learns at boot.
  *
  * Browser verbs v2 adds two things that do not depend on the open, control or
- * Code switches, because every caller of the sidecar depends on them:
+ * Code switches, because every caller of the sidecar depends on them (and so
+ * the open route has its own `EZIL_WORKER_BROWSER_OPEN`, as control has
+ * `EZIL_WORKER_BROWSER_CONTROL`):
  *   - the origin tiers (§2), whenever they are set: the tier gate applies to
  *     this Worker's verb route as much as to the MCP and Code paths;
  *   - the per-sandbox verb bearer (§3), whenever the verb route is open
@@ -8034,6 +8036,9 @@ async function browserOpenBootEnv(env: Env, sandboxId: string): Promise<Record<s
   return {
     ...always,
     ...(allowedOrigins && { EZIL_BROWSER_TEST_ALLOWED_ORIGINS: allowedOrigins }),
+    // Each Worker surface on the sidecar has its own switch: the bearer above is on every boot with the verb
+    // route open, so it can no longer stand for "the open route is on" (the sidecar requires this flag too).
+    ...(worker && openCapability ? { EZIL_WORKER_BROWSER_OPEN: 'on' } : {}),
     ...(control && openCapability ? { EZIL_WORKER_BROWSER_CONTROL: 'on' } : {}),
     ...(code ? { EZIL_CODE_BROWSER_MCP: 'on' } : {}),
   };
