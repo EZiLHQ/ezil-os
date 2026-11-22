@@ -90,6 +90,58 @@ Errors are `{ok:false, error, detail?}` with `error` one of `chrome_unreachable`
 `bad_ref`, `stale_ref`, `navigation_failed`, `timeout`, `bad_request`, and (v2)
 `origin_read_only`.
 
+## Who may call a verb (v2)
+
+- **The verb bearer.** Every route above, `GET /health` included, needs
+  `Authorization: Bearer $EZIL_WORKER_BROWSER_MCP_TOKEN` (43 base64url
+  characters, compared in constant time). Missing, wrong or unset answers HTTP
+  401 with the one body `{ok:false, error:'bad_request', detail:'Request failed.'}`,
+  before the body is read and without touching the page. The Worker derives
+  the token per sandbox (HMAC `EZIL-WORKER-BROWSER-OPEN/1`), hands it over at
+  boot (`browserOpenBootEnv`) and sends it on every verb (`handleBrowserSidecar`).
+- **Code chats** reach the same verbs at `POST /internal/code/browser/<verb>`
+  for the 13 `CODE_BROWSER_VERBS` (every verb but `health`), with the Code
+  open-url route's guards: `Authorization: Bearer $EZIL_CODE_BROWSER_MCP_TOKEN`,
+  no `Origin` header, a loopback peer. The path is exact (no query, no trailing
+  slash). Bodies and answers are the verb's own, through the same redacting
+  `respond()`, and every page in `owner_app` or `idp_transit` is
+  `origin_read_only` there. That is agent policy, not confinement (contract §8).
+- **The private routes** keep their own gates: `/internal/mcp-browser-observe`
+  reads without a token (the legacy read), but an `action` needs the Worker
+  bearer and `EZIL_WORKER_BROWSER_CONTROL=on`; `/internal/mcp-browser-open-url`
+  needs the Worker bearer and `EZIL_WORKER_BROWSER_OPEN=on`, and without the
+  switch answers exactly as an unknown route. `/internal/code/browser/open-url`
+  is unchanged.
+
+## Owner-app pages (MCP control, v2)
+
+A modern observation on the approved tab is routed by the page's origin tier
+(`mcp-tab-session.mjs`). `owner_app` and `idp_transit` pages go to
+`mcp-owner-app.mjs`; example.* and fixture pages keep `mcp-tab-actions.mjs`,
+with its request filter, CSP and the v1 actions and text bound.
+
+- It works in Chromium's default context (the user's profile and session), with
+  no CSP injection and no request interception.
+- Reads list `button` (submit included), `link` (to owner-app pages only),
+  `text_input`, `textarea`, `select` (at most 20 option labels) and `checkbox`:
+  at most 64, labels at most 80 characters, every label, option and title
+  through `sanitizeText`, page URLs as origin + path through `sanitizeUrl`, and
+  no `href`. A password or one-time-code field never gets a ref.
+- Each listed element gets a fresh 22-character single-use handle mapped to a
+  registered sidecar ref. Actions (`navigate` to an owner-app origin only,
+  `click`, `type`, `fill_form`, `select`, `scroll`, `press`) re-read every named
+  element first, then run through `VERBS` on the bound tab, so the tier gate
+  and URL sanitising apply. A non-navigate action needs a read of the same
+  document.
+- `/builder/profile-builder` is `profile_builder`, Universe's sign-in handoff
+  and every IdP page are `interactive_sign_in_required` (no title, element,
+  frame or e-mail, and `origin_read_only` to act on an IdP page), and anything
+  else on the owner app is `owner_app_page`. `ownerAppAccountEmail` is the
+  readonly "E-mail address" field (`#builderEmail`) on the profile builder,
+  `null` elsewhere.
+- The answer stays under 160 KiB: the element list is trimmed first, then the
+  frame dropped (`fitBrowserUiResult`).
+
 ## Origin tiers (v2)
 
 `origin-policy.mjs` puts the page a verb acts on into one of three tiers. The
@@ -283,9 +335,12 @@ mutated file first (a syntax error can hang `bun test` rather than fail it).
 ## Running it by hand
 
 ```bash
+# A 43-character base64url token; the Worker derives the real one per sandbox.
+export EZIL_WORKER_BROWSER_MCP_TOKEN=<43 base64url characters>
 EZIL_CDP_PORT=9222 EZIL_SIDECAR_PORT=9223 node server.mjs
-curl -s localhost:9223/health
-curl -s -XPOST localhost:9223/snapshot -d '{}' -H 'content-type: application/json'
+curl -s localhost:9223/health -H "authorization: Bearer $EZIL_WORKER_BROWSER_MCP_TOKEN"
+curl -s -XPOST localhost:9223/snapshot -d '{}' -H 'content-type: application/json' \
+  -H "authorization: Bearer $EZIL_WORKER_BROWSER_MCP_TOKEN"
 ```
 
 ## What it must never do to the desktop
