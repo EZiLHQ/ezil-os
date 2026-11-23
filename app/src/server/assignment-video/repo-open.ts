@@ -36,29 +36,33 @@ export function makeChallenge(attemptId: string, repositoryUrl: string): Preload
 }
 
 export function eligibleForActor(eligible: Eligible, actor: Actor, attemptId: string, now: number): boolean {
-    const original = Date.parse(eligible.windowStartedAt);
-    const end = Date.parse(eligible.deadlineAt);
+    const original = eligible.windowStartedAt && Date.parse(eligible.windowStartedAt);
+    const end = eligible.deadlineAt && Date.parse(eligible.deadlineAt);
     return eligible.attemptId === attemptId && eligible.repositoryUrl === expectedRepositoryURL(actor.subject, 'a-' + attemptId)
         && eligible.manifestSha256 === createHash('sha256').update(assignmentMarker(eligible.repositoryUrl)).digest('hex')
-        && original <= now && now < end && end - original <= 3_600_000 && now < Date.parse(eligible.expiresAt);
+        && now < Date.parse(eligible.expiresAt)
+        && ((original === null && end === null) || (typeof original === 'number' && typeof end === 'number'
+            && original <= now && now < end && end-original <= 3_600_000));
 }
 
 export function matchesEnrollment(eligible: Eligible, packet: PrivateGitPacket, attemptId: string, now: number) {
     return eligible.attemptId === attemptId && eligible.repositoryUrl === packet.repository.canonicalURL
         && eligible.providerId === packet.repository.id && eligible.ref === packet.repository.ref
-        && now < Date.parse(eligible.deadlineAt) && now < Date.parse(eligible.expiresAt);
+        && (eligible.deadlineAt === null || now < Date.parse(eligible.deadlineAt)) && now < Date.parse(eligible.expiresAt);
 }
 
 const actorBinding = (actor: Actor) => createHash('sha256').update(JSON.stringify(
     [actor.userId, actor.issuer, actor.subject, actor.sessionId])).digest('hex');
+export const workspaceIdentity = (userId: string, computerId: string, sandboxName: string) =>
+    createHash('sha256').update(JSON.stringify([userId, computerId, sandboxName])).digest('hex');
 const encryptionKey = (secret: string) => createHmac('sha256', secret).update('ezil/assignment-repo-open/encryption/v1').digest();
 
 // A short-lived opaque proof travels solely in same-origin shell memory. No Git grant, user token or actor identifier is stored in it.
 export function sealOpen(actor: Actor, eligible: Eligible, computerId: string, workspace: string, eventId: string, now: number, secret: string) {
     const openedAt = new Date(now).toISOString();
-    const workspaceId = createHash('sha256').update(JSON.stringify([actor.userId, computerId, workspace])).digest('hex');
+    const workspaceId = workspaceIdentity(actor.userId, computerId, workspace);
     const data = {event: {eventId, preloadProtocol:'ezil.assignment-open/v1', preloadPort:5679, manifestSha256: eligible.manifestSha256, repositoryUrl: eligible.repositoryUrl, providerId: eligible.providerId, ref: eligible.ref,
-        workspaceId, openedAt}, attemptId: eligible.attemptId, expires: Math.min(now + lifetime, Date.parse(eligible.deadlineAt)),
+        workspaceId, openedAt}, attemptId: eligible.attemptId, expires: Math.min(now + lifetime, Date.parse(eligible.expiresAt), eligible.deadlineAt ? Date.parse(eligible.deadlineAt) : Infinity),
         actor: actorBinding(actor)};
     const iv = randomBytes(12);
     const cipher = createCipheriv('aes-256-gcm', encryptionKey(secret), iv);

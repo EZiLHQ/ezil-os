@@ -86,6 +86,40 @@ describe('assignment media broker',()=>{
         expect(JSON.parse(String(calls.at(-1)?.init?.body))).toMatchObject({reason:'submitted',expectedSegments:1,osSessionId:identity.sessionId});
         expect(d.leases.size).toBe(0);
     });
+    it.each([false,true])('starts or resumes a phase only with an actual bounded seed and immutable accepted frame (resume=%s)',async resume=>{
+        const session='00000000-0000-4000-8000-000000000099';
+        const awaiting={...state,status:resume ? 'recording' : 'awaiting_frame',phaseReady:false,workspaceUnlocked:false,
+            captureSessionId:session,nextSequence:0,authorizationExpiresAt:time(clock+60000),
+            startedAt:resume ? time(initial):null,deadlineAt:resume ? time(initial+hour):null};
+        let receipt:Record<string,unknown>={...state,recordingId:recording,captureSessionId:session,
+            phaseReady:true,firstFrameAt:time(initial),nextSequence:1,confirmed:true,sequence:0};
+        const d={...deps(),fetcher:async (url:RequestInfo | URL,init?:RequestInit) => {
+            if (String(url).endsWith('/confirm')) return Response.json(receipt);
+            return fetcher(url,init);
+        }};
+        remoteState={...awaiting};
+        const prepared=await recordingAction(identity,{...begin,captureSessionId:session},d);
+        expect(prepared).toEqual(awaiting);
+        expect(prepared.uploadToken).toBeUndefined();
+        const seed={...input,captureSessionId:session,startMs:0,endMs:1};
+        for (const bad of [{...seed,sequence:1},{...seed,endMs:12},{...seed,byteLength:1024*1024+1}])
+            await expect(recordingAction(identity,bad,d)).rejects.toMatchObject({status:409});
+        expect(await recordingAction(identity,seed,d)).toEqual(signed);
+        const confirm={action:'confirm' as const,attemptId:attempt,captureSessionId:session,sequence:0};
+        const valid=receipt;
+        receipt={...valid,firstFrameAt:null};
+        await expect(recordingAction(identity,confirm,d)).rejects.toMatchObject({code:'seed_not_confirmed'});
+        receipt=valid;
+        const confirmed=await recordingAction(identity,confirm,d);
+        expect(confirmed).toMatchObject({phaseReady:true,serverNow:time(clock),firstFrameAt:time(initial),startedAt:time(initial),deadlineAt:time(initial+hour)});
+        const next={...input,sequence:1,captureSessionId:session};
+        await expect(recordingAction(identity,next,d)).rejects.toMatchObject({status:409});
+        remoteState={...state,workspaceUnlocked:true,phaseReady:true,captureSessionId:session};
+        const gate=await recordingAction(identity,{action:'status',attemptId:attempt,captureSessionId:session},d);
+        expect(gate).toMatchObject({workspaceUnlocked:true,phaseReady:true,startedAt:time(initial)});
+        await recordingAction(identity,{action:'checkpoint',attemptId:attempt,captureSessionId:session,reason:'sharing_stopped'},d);
+        expect(d.leases.size).toBe(0);
+    });
     it('does not reuse another actor, verified session or attempt capability',async()=>{
         const d=deps();await recordingAction(identity,begin,d);
         for(const other of [{...identity,sessionId:'different'}, {...identity,subject:'other'}, {...identity,userId:'other'}]){

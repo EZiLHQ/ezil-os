@@ -40,6 +40,7 @@ export function fakeWorld() {
     git(['init', '--quiet', '--bare', '--initial-branch=main', bare]);
     const state = {
         exists: false, scope: 'write' as 'write' | 'read', createStatus: 201, createURL: REPO, prepareStatus: 200, prepareName: NAME, prepareJobId: undefined as string | undefined,
+        boundReply: null as Record<string, unknown> | null,
         completeTamper: null as null | ((body: Record<string, unknown>) => Record<string, unknown>), creates: 0, pushes: 0, completions: 0,
     };
     const calls: Call[] = [];
@@ -59,6 +60,7 @@ export function fakeWorld() {
             if (body.userIdToken !== ID_TOKEN || body.attemptId !== ATTEMPT) return json({ error: 'not_authorized' }, 403);
             if (body.action === 'prepare') {
                 if (state.prepareStatus !== 200) return json({ error: 'refused' }, state.prepareStatus);
+                if (state.boundReply) return json(state.boundReply);
                 return json({ attemptId: ATTEMPT, name: state.prepareName, ...(state.prepareJobId ? { jobId:state.prepareJobId } : {}), challenge: 'challenge_0123456789abcdef', expiresAt: new Date(Date.now() + 600_000).toISOString() });
             }
             // The receiver's independent verification: the anchored HEAD and the marker bytes, read from the repository.

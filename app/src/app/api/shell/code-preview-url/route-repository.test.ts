@@ -451,33 +451,63 @@ describe('the enrolled checkout signals the protected top-level shell only after
             expiresAt:new Date(now+120000).toISOString()};
         vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN','https://universe-staging.ezil.work');
         vi.stubEnv('UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET',signingKey);
-        s.universe = () => Response.json(enrolled);
+        const captureSessionId = '00000000-0000-4000-8000-000000000099';
+        const recordingId = '00000000-0000-4000-8000-000000000098';
+        let ready = false;
+        let repositoryOpenReceiptId = recordingId;
+        let boundProvider = enrolled.providerId;
+        s.universe = () => Response.json(s.requests.at(-1)?.url.pathname.endsWith('/status')
+            ? {captureSessionId,recordingId,repositoryOpenReceiptId,status:'recording',revoked:false,stopRequestedAt:null,
+                startedAt:new Date(now-1000).toISOString(), deadlineAt:new Date(now+3400000).toISOString(),
+                firstFrameAt:ready ? new Date(now-1000).toISOString() : null,phaseReady:ready,workspaceUnlocked:ready}
+            : {...enrolled,providerId:boundProvider,windowStartedAt:null,deadlineAt:null});
         s.gateway = scope => {const packet=standalonePacket(scope);packet.repository.canonicalURL=repositoryUrl;return Response.json(packet);};
-        let ack: 'good'|'missing'|'wrong' = 'good';
+        let ack: 'good'|'missing'|'wrong'|'wrong-folder' = 'good';
         s.worker = body => {
             const request = JSON.parse(body), challenge = request.assignmentPreload;
-            return Response.json({ok:true,folder:'/workspace/projects/'+request.repositoryId,
-                ...(challenge && ack !== 'missing' ? {assignmentPreload:{eventId:challenge.eventId,nonce:ack === 'good' ? challenge.nonce : '1'.repeat(64),
+            const folder = '/workspace/projects/'+request.repositoryId;
+            return Response.json({ok:true,folder,checkoutFolder:folder+'/'+(ack === 'wrong-folder' ? 'repository' : repositoryUrl.split('/').at(-1)!.slice(0,-4)),
+                ...(challenge && ack !== 'missing' ? {assignmentPreload:{eventId:challenge.eventId,nonce:ack === 'wrong' ? '1'.repeat(64) : challenge.nonce,
                     port:5679,status:'acknowledged'}} : {})});
         };
-        const open = () => POST(new Request(origin+'/api/shell/code-preview-url',{method:'POST',
+        const open = (assignment?: object) => POST(new Request(origin+'/api/shell/code-preview-url',{method:'POST',
             headers:{origin,host:'os-staging.ezil.work','sec-fetch-site':'same-origin','content-type':'application/json'},
-            body:JSON.stringify({computerId:COMPUTER,intent:'open',repository:{url:repositoryUrl}})}));
-        const first = await open();
+            body:JSON.stringify({computerId:COMPUTER,intent:'open',repository:{url:repositoryUrl},assignment})}));
+        const prep = {attemptId,phase:'prepare'};
+        const locked = async (response: Response) => {
+            expect(response.status).toBe(409);
+            expect(await response.text()).not.toContain('preview-bootstrap');
+        };
+        await locked(await open());
+        const first = await open(prep);
         expect(first.status).toBe(200);
         const body = await first.json();
+        expect(body.codePreviewUrl).toBeUndefined();
+        expect(body.url).toBeUndefined();
+        expect(body.repository.checkoutFolder).toBe(body.repository.workspaceFolder+'/'+repositoryUrl.split('/').at(-1)!.slice(0,-4));
         const proof = body.assignmentOpen;
-        expect(proof).toMatchObject({attemptId,deadlineAt:enrolled.deadlineAt,windowStartedAt:enrolled.windowStartedAt});
+        expect(proof).toMatchObject({attemptId,deadlineAt:null,windowStartedAt:null});
         const actor = {userId:USER,issuer:'https://id.ezil.work/',subject,sessionId:s.sessionId,expiresAt:now+600000};
         expect(readOpen(proof.proof,actor,attemptId,Date.now(),signingKey)).toMatchObject({repositoryUrl,providerId:enrolled.providerId,manifestSha256:enrolled.manifestSha256});
-        for (const response of ['missing','wrong'] as const) {
+        const enter = {attemptId,phase:'open',repoOpenProof:proof.proof,captureSessionId};
+        await locked(await open(enter));
+        ready=true;
+        await locked(await open({...enter,repoOpenProof:'A'.repeat(80)}));
+        await locked(await open({...enter,captureSessionId:recordingId}));
+        await locked(await open(enter));
+        repositoryOpenReceiptId=readOpen(proof.proof,actor,attemptId,Date.now(),signingKey).eventId;
+        const confirmed=await open(enter);
+        expect(confirmed.status).toBe(200);
+        const unlocked=await confirmed.json();
+        expect(new URL(unlocked.codePreviewUrl).searchParams.get('folder')).toBe(body.repository.workspaceFolder);
+        expect(unlocked.repository).toEqual(body.repository);
+        for (const response of ['missing','wrong','wrong-folder'] as const) {
             ack=response;
-            const unconfirmed = await (await open()).json();
-            expect(unconfirmed.ok).toBe(true);expect(unconfirmed.assignmentOpen).toBeUndefined();
+            await locked(await open(prep));
+            await locked(await open(enter));
         }
         ack='good';
-        s.universe=()=>Response.json({...enrolled,providerId:'different'});
-        expect((await (await open()).json()).assignmentOpen).toBeUndefined();
-        expect(JSON.parse(String(s.requests.filter(item=>item.url.origin===WORKER).at(-1)?.init.body)).assignmentPreload).toBeUndefined();
+        boundProvider='different';
+        await locked(await open(prep));
     });
 });

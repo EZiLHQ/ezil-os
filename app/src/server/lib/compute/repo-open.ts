@@ -56,7 +56,7 @@ export interface RepoOpenRequest {
 }
 
 export type RepoOpenResult =
-    | { ok: true; folder: string; head?: string; assignmentPreload?: PreloadAck }
+    | { ok: true; folder: string; head?: string; checkoutFolder?: string; assignmentPreload?: PreloadAck }
     | { ok: false; errorCode: 'repo_open_unsupported_provider' | 'repo_open_failed';
         refusalReason?: string; correlationId?: string; httpStatus?: number };
 
@@ -180,7 +180,7 @@ export async function requestRepoOpen(
                 ...(deps.correlationId ? { [CORRELATION_HEADER]: deps.correlationId } : {}) },
         });
         const text = await response.text();
-        let value: { ok?: unknown; folder?: unknown; head?: unknown; assignmentPreload?: unknown; status?: unknown; error?: unknown; errorCode?: unknown; diagnosticReason?: unknown } = {};
+        let value: { ok?: unknown; folder?: unknown; head?: unknown; checkoutFolder?: unknown; assignmentPreload?: unknown; status?: unknown; error?: unknown; errorCode?: unknown; diagnosticReason?: unknown } = {};
         try { if (text.length <= RESPONSE_MAX_BYTES) value = JSON.parse(text) ?? {}; } catch { /* not JSON: refused below */ }
         const code = value.errorCode ?? value.error;
         if (code === 'repo_open_unsupported_provider') return { ok: false, errorCode: 'repo_open_unsupported_provider' };
@@ -192,7 +192,10 @@ export async function requestRepoOpen(
         if (!isRepositoryFolder(value.folder, request.repositoryId)) return failed(response.status, 'invalid_folder');
         const head = typeof value.head === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value.head) ? value.head : undefined;
         const ack = !aws && matchesAck(request.assignmentPreload, value.assignmentPreload) ? value.assignmentPreload : undefined;
-        return { ok: true, folder: value.folder, ...(head ? { head } : {}), ...(ack ? {assignmentPreload:ack} : {}) };
+        const canonicalName = request.canonicalURL.slice(request.canonicalURL.lastIndexOf('/') + 1, -4);
+        const checkoutFolder = ack && value.checkoutFolder === value.folder + '/' + canonicalName ? value.checkoutFolder as string : undefined;
+        return { ok: true, folder: value.folder, ...(head ? { head } : {}),
+            ...(ack && checkoutFolder ? {assignmentPreload:ack, checkoutFolder} : {}) };
     } catch (err) {
         const name = err instanceof Error ? err.name : '';
         return failed(null, name === 'TimeoutError' ? 'timeout' : name === 'AbortError' ? 'aborted' : 'transport');

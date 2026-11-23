@@ -186,7 +186,27 @@ export async function enrollAssignmentRepository(
     };
 
     // 1. Universe: is this the attempt's participant, and what is the repository called?
-    const prepared = prepareResponse.safeParse(await universe({ action: 'prepare' }));
+    const prepareReply = await universe({ action: 'prepare' });
+    // A reload can arrive after the participant has already edited or pushed. Only the authenticated stored binding
+    // and a fresh write grant can resume the checkout; never reinitialize or compare their new tree to the initial tree.
+    const existing = completeResponse.extend({providerId:z.string().regex(/^[a-z0-9]{1,64}$/),jobId:z.string().regex(decimalJobId)}).safeParse(prepareReply);
+    if (existing.success) {
+        const bound = existing.data;
+        const canonical = expectedRepositoryURL(identity.subject, 'a-' + attemptId);
+        if (bound.attemptId !== attemptId || bound.repositoryUrl !== canonical || bound.ref !== BOOTSTRAP_REF
+            || (!namedQa && !permittedJobs.has(bound.jobId))) return fail('not_authorized');
+        try {
+            const grant = await grantForStandaloneGit(identity, canonical, {fetch:fetcher,signal,now});
+            if(grant.git.scope !== 'write' || grant.repository.id !== bound.providerId || grant.repository.ref !== bound.ref)
+                return fail('not_owner');
+        } catch (error) {
+            if (error instanceof EnrollmentError) throw error;
+            if (error instanceof GitAccessError && error.code === 'identity_refused') return fail('identity_refused');
+            return fail('unavailable');
+        }
+        return {status:'bound',attemptId,repositoryUrl:canonical,ref:bound.ref,baseSha:bound.baseSha};
+    }
+    const prepared = prepareResponse.safeParse(prepareReply);
     // The repository name is bound to the attempt: `a-<attemptId>`, nothing else.
     if (!prepared.success || prepared.data.attemptId !== attemptId || prepared.data.name !== `a-${attemptId}`) return fail('unavailable');
     // Only authenticated Universe prepare can name the active attempt's job. The browser cannot supply a job ID.

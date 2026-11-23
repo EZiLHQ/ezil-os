@@ -4,7 +4,7 @@ import type { RetainedIdentity } from '@/server/auth/retained-identity';
 import { boundedJson, checkedPut, drain, eligible, hour, issuer, refuse, started, summary, universeOrigin, worksOrigin, type Input } from './contract';
 
 type Identity = Pick<RetainedIdentity, 'token' | 'issuer' | 'subject' | 'sessionId' | 'expiresAt' | 'userId'>;
-type Capability = { recording: string; token: string; deadline: number; preparedEnds: Map<number, number> };
+type Capability = { recording: string; token: string; deadline: number; preparedEnds: Map<number, number>; phase?: string; seed?: number };
 type Dependencies = { fetcher?: typeof fetch; clock?: () => number; leases?: Map<string, Capability>; signal?: AbortSignal };
 const storage = globalThis as typeof globalThis & { ezilAssignmentMediaLeases?: Map<string, Capability> };
 // The same process already holds the verified OS session identity. A process loss requires a new authenticated begin.
@@ -43,7 +43,7 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
         if (!response.headers.get('content-type')?.toLowerCase().startsWith('application/json')) return refuse('media_unavailable', 503);
         return boundedJson(response.body, 262144, 503);
     }
-    const control = (action: 'preflight'|'begin'|'status'|'finalize', fields: object = {}, beginSecret?: string) =>
+    const control = (action: 'preflight'|'begin'|'status'|'finalize'|'checkpoint', fields: object = {}, beginSecret?: string) =>
         post(universeOrigin + '/internal/assignment-video/' + action, {
             userIdToken: identity.token, attemptId: input.attemptId, osSessionId: identity.sessionId, ...fields,
         }, undefined, beginSecret);
@@ -58,38 +58,60 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
         const secret = repoOpenSecret();
         if (!secret) return refuse('assignment_open_unavailable', 503);
         const repoOpen = readOpen(input.repoOpenProof, identity, input.attemptId, clock(), secret);
-        const result = started.safeParse(await control('begin', {consentAccepted: true, consentVersion: input.consentVersion, repoOpen}, secret));
+        const requestedPhase = input.captureSessionId;
+        const result = started.safeParse(await control('begin', {consentAccepted: true, consentVersion: input.consentVersion, repoOpen,
+            ...(requestedPhase ? {captureSessionId:requestedPhase} : {})}, secret));
         if (!result.success) return refuse('media_unavailable', 503);
         const {uploadToken, ...receipt} = result.data;
-        const t0 = Date.parse(receipt.startedAt), deadline = Date.parse(receipt.deadlineAt);
-        if (!uploadToken || receipt.status !== 'recording' || receipt.revoked || receipt.stopRequestedAt !== null
-            || t0 > clock() + 1500 || deadline <= clock() || deadline <= t0 || deadline - t0 > hour) {
-            leases.delete(key);
-            return refuse('recording_closed', 409);
-        }
+        const provisional = requestedPhase !== undefined && receipt.phaseReady !== true;
+        const t0 = receipt.startedAt ? Date.parse(receipt.startedAt) : NaN;
+        const authorityEnd = receipt.deadlineAt ? Date.parse(receipt.deadlineAt) : NaN;
+        const deadline = provisional && receipt.authorizationExpiresAt ? Date.parse(receipt.authorizationExpiresAt) : authorityEnd;
+        const validWindow = Number.isFinite(t0) && Number.isFinite(authorityEnd) && t0 <= clock()+1500
+            && authorityEnd > clock() && authorityEnd-t0 <= hour && authorityEnd > t0;
+        if (!uploadToken || receipt.revoked || receipt.stopRequestedAt !== null || !Number.isFinite(deadline) || deadline <= clock()
+            || (requestedPhase && (receipt.captureSessionId !== requestedPhase || receipt.nextSequence === undefined))
+            || (provisional ? !['awaiting_frame','recording'].includes(receipt.status) || !receipt.authorizationExpiresAt
+                || !(validWindow || (receipt.startedAt === null && receipt.deadlineAt === null))
+                : receipt.status !== 'recording' || !validWindow)) return refuse('recording_closed', 409);
         if (!leases.has(key) && leases.size >= 2048) return refuse('media_unavailable', 503);
         const previous = leases.get(key);
-        const preparedEnds = previous?.recording === receipt.recordingId && previous.deadline === deadline ? previous.preparedEnds : new Map<number,number>();
-        leases.set(key, {recording: receipt.recordingId, token: uploadToken, deadline, preparedEnds});
+        const same = previous?.recording === receipt.recordingId && previous.phase === requestedPhase;
+        leases.set(key, {recording:receipt.recordingId, token:uploadToken, deadline, phase:requestedPhase,
+            seed:provisional ? receipt.nextSequence : undefined, preparedEnds:same ? previous.preparedEnds : new Map()});
         return receipt;
     }
 
+    const phase = input.captureSessionId ? {captureSessionId:input.captureSessionId} : {};
+    const held = leases.get(key);
+    if (held?.phase && held.phase !== input.captureSessionId) return refuse('recording_phase_changed',409);
+    if (input.action === 'checkpoint') {
+        const result = summary.safeParse(await control('checkpoint', {...phase,reason:input.reason}));
+        if (!result.success || result.data.captureSessionId !== input.captureSessionId) return refuse('media_unavailable',503);
+        if (leases.get(key)?.phase === input.captureSessionId) leases.delete(key);
+        return result.data;
+    }
     if (input.action === 'finalize') {
         // Universe accepts a submitted stop only after the normal assignment submission succeeds.
-        const result = summary.safeParse(await control('finalize', {reason: input.reason, expectedSegments: input.expectedSegments}));
+        const result = summary.safeParse(await control('finalize', {...phase,reason: input.reason, expectedSegments: input.expectedSegments}));
         if (!result.success) return refuse('media_unavailable', 503);
         if (result.data.status !== 'recording') leases.delete(key);
         return result.data;
     }
 
-    const parsed = summary.safeParse(await control('status'));
+    const parsed = summary.safeParse(await control('status',phase));
     if (!parsed.success) return refuse('media_unavailable', 503);
     const state = parsed.data;
+    if (input.captureSessionId && state.captureSessionId !== input.captureSessionId) return refuse('recording_phase_changed',409);
     if (input.action === 'status') return state;
     const entry = leases.get(key);
-    if (!entry || entry.recording !== state.recordingId || entry.deadline !== Date.parse(state.deadlineAt))
+    if (!entry || entry.recording !== state.recordingId)
         return refuse('recording_session_refresh_required', 409);
-    if (state.status !== 'recording' || state.revoked) return refuse('recording_closed', 409);
+    const seed = entry.phase !== undefined && entry.seed === input.sequence;
+    if ((entry.phase && !seed && (state.phaseReady !== true || state.workspaceUnlocked !== true))
+        || state.revoked || (state.status !== 'recording' && !(seed && state.status === 'awaiting_frame')))
+        return refuse('recording_closed',409);
+    if (state.deadlineAt && !seed) entry.deadline = Date.parse(state.deadlineAt);
     const segmentPath = worksOrigin + '/universe/assignment-media/segments';
     if (input.action === 'confirm') {
         const cutoff = Math.min(entry.deadline, state.stopRequestedAt ? Date.parse(state.stopRequestedAt) : entry.deadline);
@@ -100,16 +122,33 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
         if (!value || typeof value !== 'object' || !('recordingId' in value) || value.recordingId !== state.recordingId
             || !('sequence' in value) || value.sequence !== input.sequence || !('confirmed' in value) || value.confirmed !== true)
             return refuse('media_unavailable', 503);
+        if (seed) {
+            const ready = value as Record<string,unknown>;
+            const now = clock();
+            const first = typeof ready.firstFrameAt === 'string' ? Date.parse(ready.firstFrameAt) : NaN;
+            const start = typeof ready.startedAt === 'string' ? Date.parse(ready.startedAt) : NaN;
+            const end = typeof ready.deadlineAt === 'string' ? Date.parse(ready.deadlineAt) : NaN;
+            if (ready.phaseReady !== true || ready.captureSessionId !== entry.phase
+                || ready.nextSequence !== input.sequence+1 || typeof ready.startedAt !== 'string' || typeof ready.deadlineAt !== 'string'
+                || !Number.isFinite(first) || !Number.isFinite(start) || !Number.isFinite(end) || first < start
+                || first > now + 1500 || end <= now || end <= first || end - start > hour)
+                return refuse('seed_not_confirmed',503);
+            entry.deadline = end;
+            return {recordingId:state.recordingId,sequence:input.sequence,confirmed:true,phaseReady:true,
+                captureSessionId:entry.phase,nextSequence:ready.nextSequence,firstFrameAt:ready.firstFrameAt,
+                startedAt:ready.startedAt,deadlineAt:ready.deadlineAt,serverNow:new Date(now).toISOString()};
+        }
         return {recordingId: state.recordingId, sequence: input.sequence, confirmed: true};
     }
-    const start = Date.parse(state.startedAt);
+    const start = state.startedAt ? Date.parse(state.startedAt) : NaN;
     const cutoff = Math.min(entry.deadline, state.stopRequestedAt ? Date.parse(state.stopRequestedAt) : entry.deadline);
     if (clock() > cutoff + drain || input.endMs <= input.startMs || input.endMs - input.startMs > 60000
-        || start + input.endMs > Math.min(clock(), cutoff)) return refuse('segment_outside_recording', 409);
+        || (seed ? input.startMs !== 0 || input.endMs !== 1 || input.byteLength > 1024*1024 || clock() >= cutoff
+            : !Number.isFinite(start) || start + input.endMs > Math.min(clock(), cutoff))) return refuse('segment_outside_recording', 409);
     const {sequence, sha256, byteLength, mimeType, startMs, endMs} = input;
     const signed = await post(segmentPath, {recordingId: state.recordingId, sequence, sha256, byteLength,
         mimeType, startMs, endMs}, entry.token);
     const put = checkedPut(signed, identity.subject, state.recordingId, input, clock());
-    entry.preparedEnds.set(input.sequence, start + input.endMs);
+    entry.preparedEnds.set(input.sequence, seed ? clock() : start + input.endMs);
     return put;
 }

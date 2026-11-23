@@ -74,6 +74,22 @@ describe('assignment repository enrollment', () => {
         expect(routes(w)).not.toContain('POST https://github.ezil.work/v2/repos');
     });
 
+    it('reopens a bound participant repository without replacing subsequent work or issuing a second push', async () => {
+        const w = world();
+        const original = await enroll(w);
+        const changed = w.seedForeign();
+        expect(changed).not.toBe(original.status === 'bound' && original.baseSha);
+        w.state.boundReply = {...original,jobId:'9',providerId:PROVIDER};
+        w.calls.length=0;
+        expect(await enroll(w)).toEqual(original);
+        expect(routes(w)).toEqual([`POST ${ORIGIN}/internal/assignment-repositories/enrollment prepare`,'POST https://github.ezil.work/v2/git/grant write']);
+        expect(w.head()).toBe(changed);
+        expect(w.state.pushes).toBe(1);
+        w.state.boundReply.providerId='foreign';
+        await refused(enroll(w),'not_owner');
+        expect(w.head()).toBe(changed);
+    });
+
     it('settles a create race (409) by the grant read, never a second create', async () => {
         const w = world();
         w.state.createStatus = 409;

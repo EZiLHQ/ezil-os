@@ -10,8 +10,7 @@ import { EnrollmentConsent } from './enrollment-consent';
 /**
  * `/app/assignment-enrollment?attempt=<uuid>` — the participant's entry from a Universe assignment (os-staging only).
  *
- * Loading it changes nothing: no Universe call, no gateway call, no repository. It shows what will happen and waits
- * for the person's explicit consent, which POSTs `/api/shell/assignment-enrollment`. A static segment, so it wins
+ * Resumes the participant-owned reservation created by an explicit Universe assignment action. The normal client POSTs `/api/shell/assignment-enrollment`. A static segment, so it wins
  * over `/app/[appId]`.
  */
 export const metadata = { title: 'Assignment repository · EZiL OS' };
