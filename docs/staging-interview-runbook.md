@@ -28,10 +28,17 @@ Check each before `create`. The CLI cannot check them for you, and a missing one
    |---|---|
    | `EZIL_WORKS_QA_TOKEN` | create, finish, export (Works QA automation) |
    | `EZIL_OS_ADMIN_TOKEN` | create, start, finish, export (OS admin, a Supabase access token) |
-   | `EZIL_AI_OPERATOR_COOKIE` | start, finish, export (gateway operator session, sent as the `Cookie` header as given) |
+   | `EZIL_AI_OPERATOR_COOKIE` | start, finish, export (the gateway operator session: the `__Host-ezil-op` cookie of an ai-staging operator sign-in) |
 
    Test presence without printing: `[ -n "${EZIL_WORKS_QA_TOKEN:-}" ] && echo set || echo unset`.
    A missing variable exits 64 naming it, before any request.
+
+   `EZIL_AI_OPERATOR_COOKIE` is `__Host-ezil-op=<value>` or the bare `<value>`. Copy it from the browser after signing
+   in at `https://ai-staging.ezil.work` (developer tools, Application, Cookies). The gateway reads no other cookie name.
+   Anything else (another name, several cookies, quotes or spaces) exits 64 before any request. The CLI sends it as
+   `Cookie: __Host-ezil-op=<value>` with `Origin: https://ai-staging.ezil.work`. The gateway refuses an operator cookie
+   without same-origin evidence (403 `operator_origin_required`), reads included. The session lasts 1 hour from sign-in
+   and does not renew.
 6. **A template directory** of files to seed the repository with (`--template DIR`). `.git` is skipped, symlinks are
    refused. The same directory always gives the same head commit.
 
@@ -146,8 +153,9 @@ They say what was recorded at the same time and nothing about attention; a gap i
 
 ## Open points for the lead
 
-- **Auth header shapes** are not in the contract. The CLI sends Works and OS `Authorization: Bearer <value>` and the
-  gateway `Cookie: <EZIL_AI_OPERATOR_COOKIE as given>`. Each is built in one function (`authHeaders`) in
+- **Auth header shapes** are not in the contract. The CLI sends Works and OS `Authorization: Bearer <value>`. It sends
+  the gateway `Cookie: __Host-ezil-op=<value>` and `Origin: https://ai-staging.ezil.work`, which is the gateway's
+  same-origin rule (`requireOperatorSameOrigin`). Each is built in one function (`authHeaders`) in
   `tools/interview.mjs`; change it there if a route expects otherwise.
 - **The template source** is not in the contract; the CLI takes `--template DIR`.
 - **`seed.remote` is not host-pinned**: the CLI requires https with no embedded credentials, and the header is scoped

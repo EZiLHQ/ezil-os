@@ -469,9 +469,33 @@ const ORIGIN = { works: "https://api-staging.ezil.work", os: "https://os-staging
 const ENV = { PATH: process.env.PATH, EZIL_WORKS_QA_TOKEN: WORKS_TOKEN, EZIL_OS_ADMIN_TOKEN: OS_TOKEN, EZIL_AI_OPERATOR_COOKIE: COOKIE };
 const SEED_REMOTE = "https://git-qa.ezil.work/candidate-a/interview-1121.git";
 
+const OPERATOR_COOKIE = `__Host-ezil-op=${COOKIE}`;
+
+/**
+ * The gateway's operator-cookie path, which runs before every /v1/admin/ route, reads included
+ * (gateway src/auth/auth0/identity.ts authenticateOperatorRequest and requireOperatorSameOrigin, then
+ * admin()): only `__Host-ezil-op`, once, never with Authorization, with same-origin evidence, and a live
+ * session. Returns the refusal, or null when the call gets through.
+ */
+function gatewayOperatorRefusal(headers) {
+	const h = new Headers(headers);
+	const refuse = (status, code) => ({ status, body: { error: { code } } });
+	const cookies = (h.get("cookie") ?? "").split(";").map((s) => s.trim()).filter((s) => s.startsWith("__Host-ezil-op="));
+	if (cookies.length > 1) return refuse(401, "invalid_operator_session");
+	if (cookies.length === 0) return refuse(401, "unauthorized");
+	if (h.has("authorization")) return refuse(400, "mixed_credentials");
+	const origin = h.get("origin");
+	const site = h.get("sec-fetch-site");
+	if ((origin !== null && origin !== ORIGIN.gateway) || !(site === "same-origin" || (site === null && origin === ORIGIN.gateway))) {
+		return refuse(403, "operator_origin_required");
+	}
+	return cookies[0] === OPERATOR_COOKIE ? null : refuse(401, "invalid_operator_session");
+}
+
 /**
  * A stub fetch. `routes` maps "METHOD origin/path" to a reply (object or function
  * of the recorded call) or an array of replies consumed in turn (the last repeats).
+ * Gateway calls first pass the gateway's operator-cookie rule, as on ai-staging.
  */
 function stubFetch(routes) {
 	const calls = [];
@@ -479,6 +503,8 @@ function stubFetch(routes) {
 		const u = new URL(url);
 		const call = { method: init.method, url, key: `${init.method} ${u.origin}${u.pathname}`, headers: init.headers ?? {}, body: init.body === undefined ? undefined : JSON.parse(init.body), redirect: init.redirect };
 		calls.push(call);
+		const refusal = u.origin === ORIGIN.gateway ? gatewayOperatorRefusal(call.headers) : null;
+		if (refusal) return new Response(JSON.stringify(refusal.body), { status: refusal.status });
 		let route = routes[call.key];
 		if (Array.isArray(route)) route = route.length > 1 ? route.shift() : route[0];
 		if (typeof route === "function") route = route(call);
@@ -725,7 +751,8 @@ describe("interview.mjs start", () => {
 		const consent = fetch.calls[3];
 		assert.deepEqual(consent.body, { interviewId: ID, authUserId: VALID.identity.osUserId, noticeSha256: NOTICE, retentionDays: 14, reason: consent.body.reason });
 		assert.ok(consent.body.reason.length > 0);
-		assert.equal(consent.headers.cookie, COOKIE);
+		assert.equal(consent.headers.cookie, OPERATOR_COOKIE);
+		assert.equal(consent.headers.origin, ORIGIN.gateway);
 		assert.match(consent.headers["idempotency-key"], /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-8[0-9a-f]{3}-[0-9a-f]{12}$/);
 		assert.equal(fetch.calls[0].headers.authorization, `Bearer ${OS_TOKEN}`);
 	});
@@ -903,7 +930,7 @@ describe("interview.mjs credentials", () => {
 			sawRedaction ||= text.includes("[redacted]");
 			// Positive control: the credential really was sent to the server on the first request.
 			const first = fetch.calls[0];
-			assert.ok(first.headers.authorization === `Bearer ${WORKS_TOKEN}` || first.headers.authorization === `Bearer ${OS_TOKEN}` || first.headers.cookie === COOKIE, `${args[0]} sent its credential`);
+			assert.ok(first.headers.authorization === `Bearer ${WORKS_TOKEN}` || first.headers.authorization === `Bearer ${OS_TOKEN}` || first.headers.cookie === OPERATOR_COOKIE, `${args[0]} sent its credential`);
 		}
 		assert.ok(sawRedaction, "the scrubber actually fired when a credential-valued code was echoed");
 		for (const name of readdirSync(out)) {
@@ -933,5 +960,99 @@ describe("interview.mjs credentials", () => {
 		const reads = [...source.matchAll(/(?:process\.env|ctx\.env)(?:\.([A-Z_]+)|\[)/g)].map((m) => m[1] ?? "[dynamic]");
 		assert.ok(reads.every((n) => n === "PATH" || n === "[dynamic]"), `env reads: ${reads.join(", ")}`);
 		assert.ok(["EZIL_WORKS_QA_TOKEN", "EZIL_OS_ADMIN_TOKEN", "EZIL_AI_OPERATOR_COOKIE"].every((n) => source.includes(n)));
+	});
+});
+
+describe("interview.mjs: the gateway operator cookie (review B1)", () => {
+	const split = evidenceFrom(VALID.events, VALID.identity);
+	const flows = [
+		[["start", "--interview", ID], {
+			[`GET ${ORIGIN.os}/api/admin/interviews/${ID}`]: { status: 200, body: { ...IDENTITY_CONSENTED, state: "started" } },
+			[`POST ${ORIGIN.gateway}/v1/admin/interview-capture-consents`]: { status: 200, body: { authUserId: VALID.identity.osUserId } },
+			[`POST ${ORIGIN.os}/api/admin/interviews/${ID}/start`]: { status: 200, body: {} },
+		}],
+		[["finish", "--interview", ID], {
+			[`GET ${ORIGIN.os}/api/admin/interviews/${ID}`]: { status: 200, body: { ...IDENTITY_CONSENTED, state: "started" } },
+			[`GET ${ORIGIN.gateway}/v1/admin/interviews/${ID}/events`]: { status: 200, body: split.gateway },
+			[`GET ${ORIGIN.works}/v1/ops/qa/interview-repositories/${ID}/evidence`]: { status: 200, body: split.works },
+			[`POST ${ORIGIN.os}/api/admin/interviews/${ID}/finish`]: { status: 200, body: {} },
+			[`POST ${ORIGIN.gateway}/v1/admin/interview-capture-consents/${ID}/revoke`]: { status: 200, body: { revokedAt: "2026-11-22T09:45:01.000Z" } },
+			[`POST ${ORIGIN.works}/v1/ops/qa/interview-repositories/${ID}/finish`]: { status: 200, body: { frozenAt: "2026-11-22T09:45:02.000Z" } },
+		}],
+		[["export", "--interview", ID, "--out", join(scratch, "export-b1")], {
+			[`GET ${ORIGIN.works}/v1/ops/qa/interview-repositories/${ID}/evidence`]: { status: 200, body: split.works },
+			[`GET ${ORIGIN.os}/api/admin/interviews/${ID}/events`]: { status: 200, body: split.os },
+			[`GET ${ORIGIN.gateway}/v1/admin/interviews/${ID}/events`]: { status: 200, body: split.gateway },
+		}],
+	];
+
+	test("the stub applies the gateway's rule: no Origin, another Origin, cross-site, a bare value, mixed or doubled credentials are refused", () => {
+		const ok = { cookie: OPERATOR_COOKIE, origin: ORIGIN.gateway };
+		assert.equal(gatewayOperatorRefusal(ok), null, "positive control");
+		assert.equal(gatewayOperatorRefusal({ cookie: OPERATOR_COOKIE, "sec-fetch-site": "same-origin" }), null);
+		const refused = (headers) => gatewayOperatorRefusal(headers)?.body.error.code;
+		assert.equal(refused({ cookie: OPERATOR_COOKIE }), "operator_origin_required", "Node fetch sends no Origin by itself");
+		assert.equal(refused({ ...ok, origin: ORIGIN.os }), "operator_origin_required");
+		assert.equal(refused({ ...ok, "sec-fetch-site": "cross-site" }), "operator_origin_required");
+		assert.equal(refused({ cookie: COOKIE, origin: ORIGIN.gateway }), "unauthorized", "a bare value is no operator cookie");
+		assert.equal(refused({ ...ok, authorization: `Bearer ${OS_TOKEN}` }), "mixed_credentials");
+		assert.equal(refused({ ...ok, cookie: `${OPERATOR_COOKIE}; ${OPERATOR_COOKIE}` }), "invalid_operator_session");
+		assert.equal(refused({ ...ok, cookie: "__Host-ezil-op=expired" }), "invalid_operator_session");
+	});
+
+	test("either form of EZIL_AI_OPERATOR_COOKIE sends __Host-ezil-op=VALUE with the gateway's Origin on every gateway call", async () => {
+		for (const value of [COOKIE, OPERATOR_COOKIE]) {
+			for (const [args, routes] of flows) {
+				const fetch = stubFetch(routes);
+				const r = await run(args, { env: { ...ENV, EZIL_AI_OPERATOR_COOKIE: value }, fetch });
+				assert.equal(r.code, 0, `${args[0]} with ${value === COOKIE ? "a bare value" : "the named cookie"}: ${r.stderr}`);
+				const gateway = fetch.calls.filter((c) => c.url.startsWith(`${ORIGIN.gateway}/`));
+				assert.ok(gateway.length > 0, `${args[0]} called the gateway`);
+				for (const c of gateway) {
+					assert.equal(c.headers.cookie, OPERATOR_COOKIE);
+					assert.equal(c.headers.origin, ORIGIN.gateway);
+					assert.equal(c.headers.authorization, undefined);
+				}
+				for (const c of fetch.calls.filter((c) => !c.url.startsWith(`${ORIGIN.gateway}/`))) {
+					assert.equal(c.headers.cookie, undefined, "the operator cookie goes to the gateway only");
+					assert.equal(c.headers.origin, undefined);
+				}
+				for (const s of SECRETS) assert.ok(!r.stdout.includes(s) && !r.stderr.includes(s));
+			}
+		}
+	});
+
+	test("any other form exits 64 naming __Host-ezil-op, before any request, without echoing the value", async () => {
+		const bad = [`ezil_session=${COOKIE}`, `${OPERATOR_COOKIE}; other=1`, "__Host-ezil-op=", `${COOKIE} `, `"${COOKIE}"`, `__host-ezil-op=${COOKIE}`, `a=${COOKIE}`];
+		for (const value of bad) {
+			for (const [args] of flows) {
+				const r = await run(args, { env: { ...ENV, EZIL_AI_OPERATOR_COOKIE: value } });
+				assert.equal(r.code, 64, `${args[0]} with ${JSON.stringify(value)}`);
+				// The message names the cookie (an env value is scrubbed wherever it appears, even inside the message).
+				assert.match(r.stderr, /EZIL_AI_OPERATOR_COOKIE must be .* or the bare VALUE of the __Host-ezil-op cookie/);
+				assert.equal(r.fetch.calls.length, 0, "no request was made");
+				assert.ok(!r.stderr.includes(COOKIE) && !r.stdout.includes(COOKIE), "the value is not echoed");
+			}
+		}
+		// create does not use the gateway, so the cookie's form does not matter to it.
+		const create = await run(CREATE_ARGS, { env: { ...ENV, EZIL_AI_OPERATOR_COOKIE: "ezil_session=x" }, fetch: stubFetch({}) });
+		assert.notEqual(create.code, 64);
+	});
+
+	test("with the named form, an echoed bare session value is scrubbed too", async () => {
+		const fetch = stubFetch({
+			[`GET ${ORIGIN.os}/api/admin/interviews/${ID}`]: { status: 200, body: IDENTITY_CONSENTED },
+			[`POST ${ORIGIN.gateway}/v1/admin/interview-capture-consents`]: { status: 403, body: { error: { code: COOKIE } } },
+		});
+		const r = await run(["start", "--interview", ID], { env: { ...ENV, EZIL_AI_OPERATOR_COOKIE: OPERATOR_COOKIE }, fetch });
+		assert.equal(r.code, 1);
+		assert.match(r.stderr, /gateway consent: refused 403 \[redacted\]/);
+		assert.ok(!r.stderr.includes(COOKIE));
+	});
+
+	test("--help names the cookie and when to renew it", async () => {
+		const help = await run(["--help"]);
+		assert.match(help.stdout, /EZIL_AI_OPERATOR_COOKIE .*__Host-ezil-op/s);
+		assert.match(help.stdout, /sign in again right before finish and export/);
 	});
 });

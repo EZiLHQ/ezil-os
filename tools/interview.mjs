@@ -10,7 +10,8 @@
  *   node tools/interview.mjs export --interview ID --out DIR
  *
  * Credentials come from three environment variables and nowhere else:
- * EZIL_WORKS_QA_TOKEN, EZIL_OS_ADMIN_TOKEN and EZIL_AI_OPERATOR_COOKIE. Their
+ * EZIL_WORKS_QA_TOKEN, EZIL_OS_ADMIN_TOKEN and EZIL_AI_OPERATOR_COOKIE (the gateway's
+ * `__Host-ezil-op` operator session, sent with the gateway's own Origin). Their
  * values, and the Works seed token, are never printed, logged or written: every
  * line this tool emits is scrubbed of them, and the exported files are refused if
  * they contain one. Only the three staging origins below are ever contacted, so a
@@ -32,6 +33,10 @@ const ORIGINS = {
 	gateway: "https://ai-staging.ezil.work",
 };
 const WORKS_BASE = "/v1/ops/qa/interview-repositories";
+/** The only cookie the gateway's operator path reads (gateway src/auth/auth0/identity.ts). */
+const OPERATOR_COOKIE = "__Host-ezil-op";
+/** RFC 6265 cookie-octets: no whitespace, quote, comma, semicolon or backslash. */
+const COOKIE_VALUE_RE = /^[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]+$/;
 const CREDENTIAL_ENV = {
 	works: "EZIL_WORKS_QA_TOKEN",
 	os: "EZIL_OS_ADMIN_TOKEN",
@@ -65,7 +70,9 @@ const USAGE = `Usage:
 Environment (names only; values are never printed):
   EZIL_WORKS_QA_TOKEN       create, finish, export
   EZIL_OS_ADMIN_TOKEN       create, start, finish, export
-  EZIL_AI_OPERATOR_COOKIE   start, finish, export
+  EZIL_AI_OPERATOR_COOKIE   start, finish, export: the ${OPERATOR_COOKIE} cookie of an ai-staging operator
+                            sign-in, as ${OPERATOR_COOKIE}=VALUE or the bare VALUE. It lasts 1 h and does
+                            not renew: sign in again right before finish and export.
 
 Staging only. Exit 0 done, 1 refused or failed, 64 usage or missing environment variable.
 `;
@@ -79,6 +86,8 @@ class StepError extends Error {}
 
 function makeIo(ctx) {
 	const secrets = new Set(Object.values(CREDENTIAL_ENV).map((name) => ctx.env[name]).filter((v) => typeof v === "string" && v.length > 0));
+	const session = operatorSession(ctx.env);
+	if (session !== null) secrets.add(session);
 	const redact = (text) => {
 		let out = String(text);
 		for (const secret of secrets) out = out.split(secret).join("[redacted]");
@@ -96,10 +105,24 @@ function makeIo(ctx) {
 // HTTP
 // ---------------------------------------------------------------------------
 
-/** One place that knows each service's credential header. */
+/**
+ * The operator session value of EZIL_AI_OPERATOR_COOKIE, given as `__Host-ezil-op=VALUE` or as the bare VALUE;
+ * null for anything else (another cookie name, several cookies, whitespace), which the gateway would refuse.
+ */
+function operatorSession(env) {
+	const raw = env[CREDENTIAL_ENV.gateway];
+	if (typeof raw !== "string") return null;
+	const value = raw.startsWith(`${OPERATOR_COOKIE}=`) ? raw.slice(OPERATOR_COOKIE.length + 1) : raw.includes("=") ? null : raw;
+	return value !== null && COOKIE_VALUE_RE.test(value) ? value : null;
+}
+
+/**
+ * One place that knows each service's credential header. The gateway's operator cookie path also needs
+ * same-origin evidence on every route, reads included (requireOperatorSameOrigin), so its own Origin is sent.
+ */
 function authHeaders(service, env) {
-	const value = env[CREDENTIAL_ENV[service]];
-	return service === "gateway" ? { cookie: value } : { authorization: `Bearer ${value}` };
+	if (service === "gateway") return { cookie: `${OPERATOR_COOKIE}=${operatorSession(env)}`, origin: ORIGINS.gateway };
+	return { authorization: `Bearer ${env[CREDENTIAL_ENV[service]]}` };
 }
 
 /** Only the error code ever leaves a refusal; a response body is never echoed. */
@@ -468,6 +491,9 @@ export async function main(argv, overrides = {}) {
 		for (const service of NEEDS[command]) {
 			const name = CREDENTIAL_ENV[service];
 			if (!ctx.env[name]) throw new UsageError(`missing environment variable ${name}`);
+		}
+		if (NEEDS[command].includes("gateway") && operatorSession(ctx.env) === null) {
+			throw new UsageError(`${CREDENTIAL_ENV.gateway} must be ${OPERATOR_COOKIE}=VALUE or the bare VALUE of the ${OPERATOR_COOKIE} cookie`);
 		}
 		return await COMMANDS[command](ctx, io, opts);
 	} catch (err) {
