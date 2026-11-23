@@ -15,6 +15,7 @@ async function callControl(attemptId, action, fields, fetcher) {
     try { data = await response.json(); } catch { throw failure('recording_unavailable'); }
     if (!response.ok) {
         const code = data?.error?.code;
+        if(response.status===401 && code==='UNAUTHORIZED' && data.error.reason==='session_missing')throw failure('identity_refresh_required');
         throw failure(typeof code === 'string' && /^[a-z_]{1,55}$/.test(code) ? code : 'recording_unavailable');
     }
     return data;

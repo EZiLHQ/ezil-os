@@ -46,7 +46,7 @@ export function openWithAssignmentConsent({project,computerId,actor,open,body,pa
     const explicit=address.pathname==='/app/code' && address.searchParams.has('assignment');
     if(!reserved&&!explicit){queueMicrotask(open);return null;}
     const owner=actor(),ui=buildGate(body),sameOwner=()=>Boolean(owner)&&actor()===owner;
-    let port,challenge,eligibility,active,closing=false,pulseAt=0,watch,eligibilityRun=0,bridgeTimer;
+    let port,challenge,eligibility,active,needsSignIn=false,closing=false,pulseAt=0,watch,eligibilityRun=0,bridgeTimer;
     let locked=true,closePromise,resolveDrained,closeCodeCues,closeShellCues;
     const embedded=win!==win.top && win.parent===win.top;
     const valid=()=>!closing && sameOwner();
@@ -64,23 +64,27 @@ export function openWithAssignmentConsent({project,computerId,actor,open,body,pa
             if(!valid()||run!==eligibilityRun)return;
             if(candidate.repositoryUrl!==repo || candidate.attemptId!==attemptId || candidate.status!=='eligible')
                 throw failure('assignment_mismatch');
-            eligibility=candidate;ui.clear();
+            eligibility=candidate;needsSignIn=false;ui.clear();
             ui.set('Ready to share','Use Share assignment tab in Universe. Your editor will open after capture is verified.');
         }catch(err){
             if(closing||run!==eligibilityRun)return;
-            eligibility=null;visibleIssue('Workspace verification unavailable',
+            eligibility=null;needsSignIn=err.code==='identity_refresh_required';visibleIssue('Workspace verification unavailable',
                 err.code==='identity_refresh_required'?'Sign in to EZiL OS, then retry.':'The assigned repository or recording service could not be verified. Your editor remains locked.');
             ui.action('Retry verification',eligibilityCheck);
         }
     }
     function onWindow(ev){
         const d=ev.data;
-        if(!valid()||!embedded||ev.source!==win.parent||ev.origin!==UNIVERSE||!eligibility||d?.protocol!==protocol||d.attemptId!==attemptId)return;
+        if(!valid()||!embedded||ev.source!==win.parent||ev.origin!==UNIVERSE||d?.protocol!==protocol||d.attemptId!==attemptId)return;
         if(d.type==='discover' && uuid.test(d.challenge)){
+            if(!eligibility){
+                if(needsSignIn)ev.source.postMessage({protocol,attemptId,type:'authentication_required',challenge:d.challenge},UNIVERSE);
+                return;
+            }
             if(port)return;
             challenge=d.challenge;
             ev.source.postMessage({protocol,attemptId,type:'available',challenge},UNIVERSE);
-        }else if(d.type==='bind' && d.challenge===challenge && challenge && !port && ev.ports.length===1){
+        }else if(eligibility && d.type==='bind' && d.challenge===challenge && challenge && !port && ev.ports.length===1){
             port=ev.ports[0];port.onmessage=onPort;port.start();send('ready');challenge=null;
         }
     }

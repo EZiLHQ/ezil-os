@@ -1,9 +1,11 @@
 'use client';
 
+import { AssignmentSignInNotice } from '../../assignment/work-return/sign-in-notice';
 import { useCallback, useEffect, useRef, useState } from 'react';
 
 type Phase =
     | { kind: 'idle' }
+    | { kind: 'sign-in' }
     | { kind: 'working' }
     | { kind: 'pending'; reason: string }
     | { kind: 'failed'; message: string };
@@ -40,6 +42,10 @@ export function EnrollmentConsent({ attemptId }: { attemptId: string }) {
             setPhase({ kind: 'pending', reason: PENDING_COPY[body.reason ?? ''] ?? 'Your repository is not ready yet.' });
             return;
         }
+        if ((response.status === 401 || body?.error?.code === 'IDENTITY_REFRESH_REQUIRED') && window !== window.top) {
+            setPhase({kind:'sign-in'});
+            return;
+        }
         if (body?.error?.code === 'IDENTITY_REFRESH_REQUIRED') {
             // One silent EZiL ID round trip restores the same authenticated assignment handoff.
             const key = `ezil-assignment-enrollment-refresh:${attemptId}`;
@@ -58,6 +64,7 @@ export function EnrollmentConsent({ attemptId }: { attemptId: string }) {
         started.current = true;
         void enroll();
     }, [enroll]);
+    if (phase.kind === 'sign-in') return <AssignmentSignInNotice attemptId={attemptId} />;
     return (
         <main style={{ maxWidth: 560, margin: '64px auto', padding: '0 16px', fontFamily: 'system-ui, sans-serif', lineHeight: 1.5 }}>
             <h1 style={{ fontSize: 24 }}>Opening your assignment</h1>

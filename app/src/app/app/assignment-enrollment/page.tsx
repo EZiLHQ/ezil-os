@@ -5,6 +5,7 @@ import { createTRPCContext } from '@/server/api/trpc';
 import { assignmentEnrollmentEnabled } from '@/server/git/assignment-enrollment';
 import { Routes, getReturnUrlQueryParam } from '@/utils/constants';
 
+import { AssignmentSignInNotice } from '../../assignment/work-return/sign-in-notice';
 import { EnrollmentConsent } from './enrollment-consent';
 
 /**
@@ -27,6 +28,7 @@ export default async function AssignmentEnrollmentPage({ searchParams }: {
     const heads = new Headers(await headers());
     heads.set('x-trpc-source', 'rsc-assignment-enrollment');
     const ctx = await createTRPCContext({ headers: heads });
+    if (!ctx.user && heads.get('sec-fetch-dest') === 'iframe') return <AssignmentSignInNotice attemptId={attempt} />;
     if (!ctx.user) redirect(`${Routes.LOGIN}?${getReturnUrlQueryParam(`/app/assignment-enrollment?attempt=${attempt}`)}`);
     if (ctx.delegation) notFound();
     return <EnrollmentConsent attemptId={attempt} />;

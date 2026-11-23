@@ -70,3 +70,24 @@ test('a share stopped during private checkout cannot later call begin or unlock 
         assert.equal(gate.access(),null);assert.equal(gate.locked(),true);
     }finally{await gate.close();}
 });
+test('an expired embedded OS session replies only to the exact Universe discovery without offering a port or Code',async(t)=>{
+    const universe='https://universe-staging.ezil.work', protocol='ezil.assignment.work/v2', replies=[];
+    t.mock.method(globalThis,'fetch',async()=>Response.json({error:{code:'UNAUTHORIZED',reason:'session_missing'}},{status:401}));
+    const top={postMessage(data,origin){replies.push({data,origin});}};
+    let handle,opens=0;
+    const win={top,parent:top,location:new URL('https://os-staging.ezil.work/app/code?repo='+encodeURIComponent(repo)+'&assignment='+id),
+        addEventListener(type,fn){if(type==='message')handle=fn;},removeEventListener(){}};
+    Object.assign(globalThis,{window:win,document:{createElement:()=>new Element()}});
+    const gate=openWithAssignmentConsent({project:{repoUrl:repo},computerId:'fixture',actor:()=>'owner',
+        body:new Element(),park(){},open(){opens++;},prepare(){throw Error('unexpected prepare');}});
+    const data={protocol,type:'discover',challenge:id,attemptId:id};
+    try {
+        await new Promise(r=>setImmediate(r));
+        handle({origin:'https://evil.example',source:top,data});handle({origin:universe,source:{},data});
+        handle({origin:universe,source:top,data:{...data,attemptId:'wrong'}});
+        assert.equal(replies.length,0);
+        handle({origin:universe,source:top,data});
+        assert.deepEqual(replies,[{origin:universe,data:{...data,type:'authentication_required'}}]);
+        assert.equal(gate.access(),null);assert.equal(gate.locked(),true);assert.equal(opens,0);
+    }finally{await gate.close();}
+});
