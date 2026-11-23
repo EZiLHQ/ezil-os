@@ -175,7 +175,7 @@ describe('assignment repository enrollment', () => {
 it('production requires the exact enabled deployment and a Creator-offered job from authenticated Universe', async () => {
     const origin = 'https://universe.ezil.work';
     const env = {BILLING_FUNDING_URL:'https://ai.ezil.work',UNIVERSE_PROJECT_REPO_ORIGIN:origin,
-        EZIL_ASSIGNMENT_PRODUCTION_ENABLED:'1'};
+        EZIL_ASSIGNMENT_PRODUCTION_ENABLED:'1', UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET:'fixture-enrollment-secret-not-a-real-credential'};
     const world = fakeWorld(origin);
     try {
         await expect(enrollAssignmentRepository({identity:identity(),attemptId:ATTEMPT},{env,fetch:world.fetch}))
@@ -185,6 +185,10 @@ it('production requires the exact enabled deployment and a Creator-offered job f
         await expect(enrollAssignmentRepository({identity:identity(),attemptId:ATTEMPT},{env,fetch:world.fetch}))
             .resolves.toMatchObject({status:'bound',repositoryUrl:REPO});
         expect(world.state.creates).toBe(1);
+        const controls=world.calls.filter(call=>new URL(call.url).origin===origin);
+        expect(controls.every(call=>call.headers.get('x-ezil-assignment-actor')===SUBJECT)).toBe(true);
+        expect(new Set(controls.map(call=>call.headers.get('x-ezil-assignment-nonce'))).size).toBe(controls.length);
+        expect(world.calls.filter(call=>new URL(call.url).origin!==origin).some(call=>call.headers.has('x-ezil-assignment-signature'))).toBe(false);
         expect(world.calls.every(c => [origin,'https://github.ezil.work'].includes(new URL(c.url).origin))).toBe(true);
     } finally { world.cleanup(); }
 });

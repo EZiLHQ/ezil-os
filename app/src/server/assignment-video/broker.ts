@@ -1,3 +1,4 @@
+import { osActorHeaders } from './os-actor';
 import { assignmentAuthority, productionAssignment } from './authority';
 import { privateMediaPost } from './private-ingress';
 import { eligibleForActor, readOpen, repoOpenSecret, signBegin } from './repo-open';
@@ -40,6 +41,7 @@ export async function recordingAction(identity: Identity, input: Input, deps: De
                 response = await fetcher(url, {method:'POST', redirect:'error', cache:'no-store',
                     headers:{'content-type':'application/json', accept:'application/json',
                         ...(capability ? {authorization:'Bearer ' + capability} : {}),
+                        ...(!capability && authority === productionAssignment ? osActorHeaders(identity,url,input.attemptId,serialized,clock()) : {}),
                         ...(beginSecret ? signBegin(beginSecret, serialized, clock()) : {})}, body:serialized, signal});
             }
         } catch { return refuse('media_unavailable', 503); }

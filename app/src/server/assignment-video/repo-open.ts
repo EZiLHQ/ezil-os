@@ -17,10 +17,7 @@ const boundRepo = {
 type Eligible = z.infer<typeof eligible>;
 const event = z.object({...boundRepo, preloadProtocol:z.literal('ezil.assignment-open/v1'), preloadPort:z.literal(5679), eventId: uuid, workspaceId: z.string().regex(/^[a-f0-9]{64}$/), openedAt: timestamp}).strict();
 const receipt = z.object({event, attemptId: uuid, expires: z.number().int(), actor: z.string().regex(/^[a-f0-9]{64}$/)}).strict();
-export function repoOpenSecret(): string | undefined {
-    const configured = process.env.UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET;
-    return configured && Buffer.byteLength(configured) >= 32 ? configured : undefined;
-}
+export { assignmentSigningSecret as repoOpenSecret } from './authority';
 
 export function enrolledAttempt(actor: Actor, packet: PrivateGitPacket, now: number): string | undefined {
     if (actor.issuer !== issuer || !actor.sessionId || !actor.userId || actor.expiresAt <= now || packet.identity.issuer !== issuer

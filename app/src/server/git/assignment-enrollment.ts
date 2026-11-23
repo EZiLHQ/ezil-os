@@ -1,6 +1,7 @@
+import { osActorHeaders } from '@/server/assignment-video/os-actor';
+import { expectedRepositoryURL } from './assignment-repository-name';
 import 'server-only';
 
-import { createHash } from 'node:crypto';
 import { z } from 'zod';
 
 import type { RetainedIdentity } from '@/server/auth/retained-identity';
@@ -34,7 +35,7 @@ import type { PrivateGitPacket } from './private-packet';
 export const ENROLLMENT_PATH = '/internal/assignment-repositories/enrollment';
 export const STANDALONE_GIT_REPOS_URL = 'https://github.ezil.work/v2/repos';
 /** The gateway's namespace for Builder-created repositories, as in the QA repository `default/os-code-url-20261110-a`. */
-export const ASSIGNMENT_NAMESPACE = 'default';
+export { ASSIGNMENT_NAMESPACE, ownerRepositoryName, expectedRepositoryURL } from './assignment-repository-name';
 export const QA_SUBJECTS_ENV = 'EZIL_ASSIGNMENT_ENROLLMENT_QA_SUBJECTS';
 export const PILOT_JOBS_ENV = 'EZIL_ASSIGNMENT_ENROLLMENT_PILOT_JOB_IDS';
 const decimalJobId = /^[1-9][0-9]{0,18}$/;
@@ -73,15 +74,6 @@ function qaSubjects(env: Record<string, string | undefined>): Set<string> {
 /** Exact EZiL ID subjects only; no pattern, prefix or case folding. */
 export function qaSubjectAllowed(subject: string, env: Record<string, string | undefined> = process.env): boolean {
     return qaSubjects(env).has(subject);
-}
-
-/** The gateway's owner-bound repository name: `u-<first 16 hex of sha256(UTF-8 sub)>-<name>`. */
-export function ownerRepositoryName(subject: string, name: string): string {
-    return `u-${createHash('sha256').update(subject, 'utf8').digest('hex').slice(0, 16)}-${name}`;
-}
-
-export function expectedRepositoryURL(subject: string, name: string): string {
-    return `https://github.ezil.work/${ASSIGNMENT_NAMESPACE}/${ownerRepositoryName(subject, name)}.git`;
 }
 
 export type EnrollmentErrorCode =
@@ -173,11 +165,13 @@ export async function enrollAssignmentRepository(
     const universe = async (body: Record<string, string>): Promise<unknown> => {
         let response: Response;
         try {
-            response = await fetcher(new URL(ENROLLMENT_PATH, origin), {
+            const endpoint = new URL(ENROLLMENT_PATH, origin);
+            const serialized = JSON.stringify({ ...body, userIdToken: identity.token, attemptId });
+            const proof = production ? osActorHeaders(identity,endpoint.href,attemptId,serialized,now(),env) : {};
+            response = await fetcher(endpoint, {
                 method: 'POST', redirect: 'error', cache: 'no-store',
                 signal: AbortSignal.any([signal, AbortSignal.timeout(TIMEOUT_MS)]),
-                headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ ...body, userIdToken: identity.token, attemptId }),
+                headers: { 'content-type': 'application/json', ...proof }, body: serialized,
             });
         } catch { return fail('unavailable'); }
         const refused = UNIVERSE_REFUSALS[response.status];

@@ -22,3 +22,8 @@ export function assignmentAuthority(env: Record<string, string | undefined> = pr
         env.UNIVERSE_PROJECT_REPO_ORIGIN === productionAssignment.universe) return productionAssignment;
     return undefined;
 }
+
+export function assignmentSigningSecret(env: Record<string,string|undefined> = process.env): string | undefined {
+    const secret = env.UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET;
+    return secret && Buffer.byteLength(secret) >= 32 ? secret : undefined;
+}

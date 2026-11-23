@@ -190,6 +190,25 @@ describe('assignment media broker',()=>{
                 .rejects.toMatchObject({status:404});
         }
     });
+    it('authenticates production media preflight as the actual OS and refuses unsigned calls before transport',async()=>{
+        vi.stubEnv('BILLING_FUNDING_URL','https://ai.ezil.work');
+        vi.stubEnv('UNIVERSE_PROJECT_REPO_ORIGIN','https://universe.ezil.work');
+        vi.stubEnv('EZIL_ASSIGNMENT_PRODUCTION_ENABLED','1');
+        const sent: {target:string;headers:Headers;body:string}[]=[];
+        const remote:typeof fetch=async(url,request)=>{
+            sent.push({target:String(url),headers:new Headers(request?.headers),body:String(request?.body)});
+            return Response.json(eligibility);
+        };
+        const action={action:'preflight' as const,attemptId:attempt};
+        expect(await recordingAction(identity,action,{...deps(),fetcher:remote})).toEqual(eligibility);
+        expect(sent[0].target).toBe('https://universe.ezil.work/internal/assignment-video/preflight');
+        expect(sent[0].headers.get('x-ezil-assignment-actor')).toBe(identity.subject);
+        expect(sent[0].headers.get('x-ezil-assignment-signature')).toMatch(/^[a-f0-9]{64}$/);
+        expect(JSON.parse(sent[0].body)).toEqual({userIdToken:identity.token,attemptId:attempt,osSessionId:identity.sessionId});
+        vi.stubEnv('UNIVERSE_ASSIGNMENT_REPO_OPEN_SECRET',undefined);
+        await expect(recordingAction(identity,action,{...deps(),fetcher:remote})).rejects.toMatchObject({status:503});
+        expect(sent).toHaveLength(1);
+    });
     it('does not return upstream secret bodies/errors',async()=>{
         const broken=vi.fn(async()=>new Response(identity.token+cap,{status:503}));
         await expect(recordingAction(identity,begin,{...deps(),fetcher:broken})).rejects.toMatchObject({message:'media_unavailable'});
