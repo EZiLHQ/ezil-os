@@ -295,6 +295,21 @@ export function readAwsEnrollUrl(env: Env): string | null {
     return `https://${url.hostname}${AWS_ENROLL_PATH}`;
 }
 
+/** Automatic image updates are restricted to the exact managed AWS app endpoints. */
+export function supportsAutomaticImageUpdates(env: Env = process.env): boolean {
+    const enrollUrl = readAwsEnrollUrl(env);
+    return enrollUrl === 'https://os-staging.ezil.work/api/compute/aws/enroll'
+        || enrollUrl === 'https://os-prod.ezil.work/api/compute/aws/enroll';
+}
+
+const AUTO_UPDATE_COMPUTER_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+export function isAutomaticImageUpdateAllowed(computerId: string, env: Env = process.env): boolean {
+    if (env.EZIL_AWS_AUTO_REBASE !== '1' || !supportsAutomaticImageUpdates(env)) return false;
+    const cohort = env.EZIL_AWS_AUTO_REBASE_COMPUTER_IDS?.split(',').map(id => id.trim().toLowerCase());
+    return Boolean(cohort?.every(id => AUTO_UPDATE_COMPUTER_ID.test(id)) && cohort.includes(computerId.toLowerCase()));
+}
+
 /**
  * How a STOPPED computer wakes.
  * - `replace` (default): a NEW instance boots on the retained data volume

@@ -1,7 +1,7 @@
 import type { ComputeMeter } from '@/server/billing/v2/compute-meter';
 import { recordComputeMeter } from '@/server/billing/v2/compute-meter-observation';
 import { resumeImageRecovery } from './aws-rebase-recover-orchestrator';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { z } from 'zod';
 import { isAwsComputersEnabled, readAwsEnrollUrl, meteredSizeForInstanceType, type Env } from './aws-config';
@@ -41,8 +41,27 @@ export type ImageRebaseResponse = { status: number; body: { schemaVersion: 1; co
 const failure = (error: unknown): Code | null => error instanceof Error && (IMAGE_JOB_FAILURE_CODES as readonly string[]).includes(error.message) ? error.message as Code : null;
 
 /** Resumes only immutable named work. No DB transaction is held across a provider call. */
-export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Promise<ImageRebaseResponse> {
-    const input = ImageRebaseRequestSchema.parse(raw);
+interface AutomaticOpen {
+    ownerUserId: string;
+    allowStart: boolean;
+    canBoot: (p: ImagePlacement) => Promise<boolean>;
+}
+
+// The name survives app restarts and distinguishes open-driven jobs from the
+// operator's randomly named repairs. Bind it to the retained source epoch and target.
+function automaticJobId(fields: Pick<ImageJob, 'computerId' | 'sourceGeneration' | 'sourceLeaseEpoch'>, amiId: string): string {
+    const hex = createHash('sha256').update(JSON.stringify([
+        'aws-image-update-on-open-v1', fields.computerId, fields.sourceGeneration, fields.sourceLeaseEpoch, amiId,
+    ])).digest('hex');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-4${hex.slice(13, 16)}-a${hex.slice(17, 20)}-${hex.slice(20, 32)}`;
+}
+
+export function isAutomaticImageJob(job: ImageJob) {
+    return job.jobId === automaticJobId(job, job.targetRelease.amiId);
+}
+
+export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown, automatic?: AutomaticOpen): Promise<ImageRebaseResponse> {
+    let input = ImageRebaseRequestSchema.parse(raw);
     let j: ImageJob | null = null;
     let computerId = input.computerId;
     const reply = (status: number, eligible: boolean, code: Code | null = j?.failureCode ?? null): ImageRebaseResponse => ({ status,
@@ -60,6 +79,28 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
         const inspected = await deps.store.inspect(computerId!);
         const p = inspected.placement;
         if (!p || p.provider !== 'aws-ec2' || !p.region) return reply(409, false, 'source_identity_mismatch');
+        if (automatic) {
+            if (p.ownerUserId !== automatic.ownerUserId || input.operation !== 'prepare'
+                || input.jobId !== null || input.sourceRetirementExecutionArn !== undefined) return reply(409, false);
+            const job = inspected.job;
+            if (job) {
+                if (!isAutomaticImageJob(job) || job.recoveryDocument || job.phase === 'failed') return reply(409, false);
+                if (job.launchDocument) {
+                    // Billing can prevent a new dispatch, but verification must settle an already launched computer.
+                    const canDispatch = job.phase !== 'unconfirmed' && await automatic.canBoot(p);
+                    input = { ...input, operation: canDispatch ? 'launch' : 'verify' };
+                } else {
+                    const canDispatch = job.phase !== 'unconfirmed' && await automatic.canBoot(p);
+                    if (job.phase === 'snapshot_ready') {
+                        if (!canDispatch) return reply(409, false);
+                        input = { ...input, operation: 'launch' };
+                    } else if (!canDispatch) input = { ...input, operation: 'verify' };
+                }
+            } else {
+                if (!automatic.allowStart || p.state !== 'STOPPED' || p.lifecycleJobId || !await automatic.canBoot(p))
+                    return reply(409, false);
+            }
+        }
         if (input.operation !== 'recover') j = inspected.job;
         if (input.jobId && j?.jobId !== input.jobId) {
             const terminal = await deps.store.read(input.jobId);
@@ -76,6 +117,8 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
             if (result.child) await handleImageRebase(deps, { schemaVersion: 1, operation: 'prepare', computerId, jobId: result.child.jobId });
             return reply(isTerminalImageJob(j.phase) || j.phase === 'failed' ? 200 : 202, j.failureCode === null);
         }
+        // Automatic open accepts no client hint. Its trusted allocation record is only a lookup.
+        const retirementHint = automatic ? p.retiredHostReleaseArn : input.sourceRetirementExecutionArn;
         /** DESIGN R: a STOPPED computer's released warm-pool host. Its retired claim row switches the source evidence to the
          * provision (b) and release (a) proofs; no row, no change. EC2 must no longer list the host: launch, recovery and
          * maintenance accept an absent source but refuse a listed claim, after the snapshot. Retry once it ages out. */
@@ -83,7 +126,7 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
             const found = await deps.store.releasedPoolHost(p.computerId);
             if (!found.row) return null;
             if (!isDeepStrictEqual(p, found.placement)) throw new ImageJobConflictError();
-            const proof = await readReleasedPoolHostProof(deps.executions, p, d, found.row, input.sourceRetirementExecutionArn, deps.now());
+            const proof = await readReleasedPoolHostProof(deps.executions, p, d, found.row, retirementHint, deps.now());
             if (!proof || await deps.describer.describeForEnrollment(p.region!, p.instanceId!)) throw new Error('source_identity_mismatch');
             // Observations are outside the lock: never use them for a placement or row that changed meanwhile.
             if (!isDeepStrictEqual(found, await deps.store.releasedPoolHost(p.computerId))) throw new ImageJobConflictError();
@@ -101,7 +144,7 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
             if (!p.instanceId || await observe()) return null;
             // Only a STOPPED placement can have a retired source; any other unlisted source is never reserved blind.
             if (p.state !== 'STOPPED' || shared) throw new Error('source_identity_mismatch');
-            const proof = await readRetiredSourceProof(deps.executions, p, d, input.sourceRetirementExecutionArn, deps.now());
+            const proof = await readRetiredSourceProof(deps.executions, p, d, retirementHint, deps.now());
             if (!proof) throw new Error('source_identity_mismatch');
             // Observations are outside the lock: still the same placement, and still no claim row.
             const fresh = await deps.store.releasedPoolHost(p.computerId);
@@ -117,7 +160,7 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
             const found = await deps.store.releasedDedicatedHost(p.computerId);
             if (!isDeepStrictEqual(p, found.placement)) throw new ImageJobConflictError();
             if (!found.row) return null;
-            const proof = await readReleasedDedicatedHostProof(deps.executions, p, d, found.row, input.sourceRetirementExecutionArn, deps.now());
+            const proof = await readReleasedDedicatedHostProof(deps.executions, p, d, found.row, retirementHint, deps.now());
             if (!proof) throw new Error('source_identity_mismatch');
             // Observations are outside the lock: still the same placement and archive, and still no claim row.
             if (!isDeepStrictEqual(found, await deps.store.releasedDedicatedHost(p.computerId))
@@ -167,7 +210,9 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
             if (!p.instanceId || !p.volumeId || !p.fsUuid || !p.fenceToken || !p.instanceType) return reply(409, false, 'source_identity_mismatch');
             const volume = await deps.describer.describeVolume(p.region, p.volumeId);
             if (!volume || !volume.sizeGiB) return reply(503, false, 'volume_not_available');
-            const prep = buildRebasePreparation({ schemaVersion: 1, jobId: (deps.newId ?? randomUUID)(), computerId: p.computerId,
+            const id = automatic ? automaticJobId({ computerId: p.computerId, sourceGeneration: p.generation,
+                sourceLeaseEpoch: p.leaseEpoch }, r.target.amiId) : (deps.newId ?? randomUUID)();
+            const prep = buildRebasePreparation({ schemaVersion: 1, jobId: id, computerId: p.computerId,
                 sourceInstanceId: p.instanceId, sourceVolumeId: p.volumeId, fsUuid: p.fsUuid, sourceGeneration: p.generation,
                 sourceLeaseEpoch: p.leaseEpoch, sourceFenceToken: p.fenceToken, fromDigest: r.source.lowerImageDigest,
                 toDigest: r.target.lowerImageDigest, volumeGiB: volume.sizeGiB, sourceDeployment: sourceDeploymentFor(r.deployment, r.source),
@@ -177,7 +222,7 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
                     : r.dedicated ? { releasedDedicatedHost: { imageJobId: r.dedicated.imageJobId, provisionDigest: r.dedicated.provisionDigest,
                         provisionExecutionArn: r.dedicated.provisionExecutionArn, releaseExecutionArn: r.dedicated.releaseExecutionArn } } : {}) });
             j = await deps.store.reserve(newReservedImageJob({ preparation: prep, ownerUserId: p.ownerUserId,
-                sourceRelease: r.source, targetRelease: r.target }), r.repository);
+                sourceRelease: r.source, targetRelease: r.target }), r.repository, Boolean(automatic));
         }
         if (isTerminalImageJob(j.phase)) return reply(200, j.phase === 'succeeded');
         if (j.recoveryDocument) {
@@ -235,10 +280,13 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
             j = await deps.store.admitLaunch(j, workLaunch, now);
         }
         const work = launchFor(j);
+        const permitExpiresAt = () => {
+            const lease = JSON.parse(Buffer.from(work.intent.userData!, 'base64').toString('utf8')) as { rebasePermit: { expiresAt: string } };
+            return Date.parse(lease.rebasePermit.expiresAt);
+        };
         let execution = await describe(work);
         if (!execution && input.operation === 'launch') {
-            const lease = JSON.parse(Buffer.from(work.intent.userData!, 'base64').toString('utf8')) as { rebasePermit: { expiresAt: string } };
-            if (Date.parse(lease.rebasePermit.expiresAt) - deps.now().getTime() <= 120000) {
+            if (permitExpiresAt() - deps.now().getTime() <= 120000) {
                 await failJob('enrollment_time_insufficient', true); return reply(200, false);
             }
             // Recheck the original execution AND the completed snapshot on every launch retry.
@@ -250,6 +298,10 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
             execution = await describe(work);
         }
         if (execution && j.phase === 'unconfirmed' && ['RUNNING', 'SUCCEEDED'].includes(execution.status)) j = await deps.store.resumeLaunch(j, execution, 'launch', deps.now());
+        if (!execution && isAutomaticImageJob(j) && permitExpiresAt() <= deps.now().getTime()) {
+            if (j.phase !== 'unconfirmed') await failJob('enrollment_time_insufficient', true);
+            return reply(409, false);
+        }
         if (!execution || execution.status === 'RUNNING') return reply(202, true);
         if (execution.status !== 'SUCCEEDED') { await failJob('launch_failed'); return reply(200, false); }
         const receipt = ImageLaunchReceiptSchema.parse(parseRebaseJson(execution.output ?? '', 8192));
@@ -264,7 +316,13 @@ export async function handleImageRebase(deps: ImageRebaseDeps, raw: unknown): Pr
             }
             return reply(202, true, null);
         }
-        if (!await deps.desktopHealthy(fresh.placement)) return reply(202, false, 'desktop_unhealthy');
+        if (!await deps.desktopHealthy(fresh.placement)) {
+            // Failed automatic launches retain their snapshot and evidence for the existing recovery operator.
+            if (isAutomaticImageJob(j) && permitExpiresAt() <= deps.now().getTime()) {
+                await failJob('desktop_unhealthy'); return reply(200, false);
+            }
+            return reply(202, false, 'desktop_unhealthy');
+        }
         j = await deps.store.succeed(j, { ...evidence, desktopHealthy: true }, deps.now());
         const size = meteredSizeForInstanceType(fresh.placement.instanceType);
         if (size) await recordComputeMeter(() => deps.meter?.ready({ userId: j!.ownerUserId, computerId: j!.computerId,

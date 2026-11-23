@@ -6,8 +6,8 @@ import { nonceHashOf, handleAwsEnrollment } from './aws-enroll';
 import { handleImageRebase } from './aws-rebase-orchestrator';
 
 vi.mock('./aws-identity', () => ({ readIdentityCertificate: () => 'test-certificate', verifyIdentitySignature: () => ({ ok: true }) }));
-async function launch() {
-    const s = rebaseSetup(); expect((await s.run('prepare')).status).toBe(202);
+async function launch(s = rebaseSetup()) {
+    expect((await s.run('prepare')).status).toBe(202);
     await s.completePreparation(); expect((await s.run('launch')).status).toBe(202); return s;
 }
 describe('image orchestration with the real locked store and provider doubles', () => {
@@ -21,6 +21,23 @@ describe('image orchestration with the real locked store and provider doubles', 
         expect(s.fake.placements[0]).toMatchObject({ generation: j.sourceGeneration, fence_token: j.sourceFenceToken,
             lease_epoch: j.targetLeaseEpoch, enroll_nonce_hash: nonceHashOf(lease.nonce), lifecycle_digest: j.launchDigest });
         await s.run('launch'); expect(s.started).toHaveLength(2);
+    });
+    it.each([
+        { paid: true, fleetLimit: '600', phase: 'launch_pending', failureCode: null },
+        { paid: false, fleetLimit: '600', phase: 'snapshot_ready', failureCode: 'operator_required' },
+        { paid: true, fleetLimit: '1', phase: 'snapshot_ready', failureCode: 'operator_required' },
+    ])('applies the normal paid hours exemption without bypassing fleet limits ($paid/$fleetLimit)', async ({ paid, fleetLimit, phase, failureCode }) => {
+        const userHoursExemption = vi.fn(async () => paid);
+        const s = rebaseSetup(undefined, userHoursExemption);
+        s.env.EZIL_AWS_USER_MONTHLY_HOURS = '1';
+        s.env.EZIL_AWS_GLOBAL_MONTHLY_HOURS = fleetLimit;
+        s.fake.usage.push({ user_id: s.owner, computer_id: s.source.computerId, instance_type: 'm6i.large',
+            started_at: new Date('2026-10-22T08:00:00Z'), stopped_at: new Date('2026-10-22T10:00:00Z'), egress_bytes: 0 });
+        await s.run('prepare');
+        await s.completePreparation();
+        expect((await s.run('launch')).body).toMatchObject({ phase, failureCode });
+        expect(userHoursExemption).toHaveBeenCalledExactlyOnceWith(s.owner);
+        expect(s.started).toHaveLength(failureCode ? 1 : 2);
     });
     it('completes only after target volume tags, host digest, enrollment and desktop health', async () => {
         const s = await launch(); await s.completeLaunch();
@@ -129,8 +146,9 @@ it('admission refuses a kill switch without changing source counters or storing 
     expect((await s.current()).launchDocument).toBeNull();
 });
 
-async function recovering() {
-    const s = await launch(), j = await s.current();
+async function recovering(s = rebaseSetup()) {
+    await launch(s);
+    const j = await s.current();
     Object.assign(s.executions.get(j.launchExecutionArn!)!, { status: 'FAILED' });
     await s.run('verify'); expect((await s.run('recover', j.jobId)).body.phase).toBe('restore_pending');
     return s;
@@ -168,6 +186,39 @@ it('restores a different volume, enrolls maintenance without credentials and ato
     expect(retryLease.rebase?.volumeId).toBe(j.restoredVolumeId);
     expect(retryLease.rebasePermit?.preparationJobId).toBe(child.jobId);
 });
+it.each([
+    { paid: true, fleetLimit: '600', phase: 'rebind_pending', failureCode: null },
+    { paid: false, fleetLimit: '600', phase: 'restore_pending', failureCode: 'operator_required' },
+    { paid: true, fleetLimit: '1', phase: 'restore_pending', failureCode: 'operator_required' },
+])('applies the paid hours exemption to maintenance rebind while retaining fleet limits ($paid/$fleetLimit)', async ({ paid, fleetLimit, phase, failureCode }) => {
+    const userHoursExemption = vi.fn(async () => paid);
+    const s = await recovering(rebaseSetup(undefined, userHoursExemption));
+    await s.completeRecovery();
+    const { jobId } = await s.current();
+    const dispatchCount = s.started.length;
+    userHoursExemption.mockClear();
+
+    // Cross the limits after the restore so that this isolates rebind admission from the original launch.
+    s.env.EZIL_AWS_USER_MONTHLY_HOURS = '1';
+    s.env.EZIL_AWS_GLOBAL_MONTHLY_HOURS = fleetLimit;
+    s.fake.usage.push({ user_id: s.owner, computer_id: s.source.computerId, instance_type: 'm6i.large',
+        started_at: new Date('2026-10-22T08:00:00Z'), stopped_at: new Date('2026-10-22T10:00:00Z'), egress_bytes: 0 });
+
+    expect((await s.run('recover', jobId)).body).toMatchObject({ phase, failureCode });
+    expect(userHoursExemption).toHaveBeenCalledExactlyOnceWith(s.owner);
+    expect(s.started).toHaveLength(dispatchCount + (failureCode ? 0 : 1));
+    const job = await s.current();
+    expect(job.restoredVolumeId).toBe(s.provider.restoredVolume!.volumeId);
+    if (failureCode) {
+        expect(job.rebindDocument).toBeNull();
+        expect(s.fake.placements[0]).toMatchObject({ state: 'STOPPED', enroll_nonce_hash: null });
+    } else {
+        expect(job.rebindDocument).not.toBeNull();
+        expect(s.fake.placements[0]).toMatchObject({ state: 'STARTING', volume_id: job.restoredVolumeId,
+            enroll_nonce_hash: expect.any(String) });
+    }
+});
+
 it('refuses a restore with wrong snapshot lineage before any maintenance nonce is issued', async () => {
     const s = await recovering(); await s.completeRecovery(); s.provider.restoredVolume!.snapshotId = 'snap-22222222222222222';
     const j = await s.current(); expect((await s.run('recover', j.jobId)).body.failureCode).toBe('restore_lineage_mismatch');

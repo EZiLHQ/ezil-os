@@ -291,9 +291,10 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
     let startDate: Date | null = null;
     let stopDate: Date | null = null;
     let endReason: EpochEndReason = 'provider_stop';
-    const step = async (p: Placement, to: PlacementState, fields: PlacementFields = {}, usage?: UsageEffect): Promise<Placement | null> => {
+    const step = async (p: Placement, to: PlacementState, fields: PlacementFields = {}, usage?: UsageEffect,
+        retirement?: Parameters<typeof transitionPlacementAsReconciler>[1]['retirement']): Promise<Placement | null> => {
         const at = (deps.now ?? deps.clock ?? (() => new Date()))();
-        const r = await transitionPlacementAsReconciler(deps.db, { computerId: p.computerId, expected: p, to, fields, usage });
+        const r = await transitionPlacementAsReconciler(deps.db, { computerId: p.computerId, expected: p, to, fields, usage, retirement });
         // Billing tables are not installed in production: deliberately write epochs AFTER
         // the placement transaction commits, never in that transaction. Metering cannot roll it back.
         if (r.ok && to === 'RUNNING') {
@@ -483,7 +484,9 @@ export async function applyLifecycleReceipt(deps: ReceiptDeps, p0: Placement, de
         if (!p) return;
         if (!(await fence(p))) return;
         if (releasing) await deps.pool?.retireLease?.(deps.db, p);
-        await step(p, 'STOPPED', done, close);
+        const retirement = releasing ? (await import('./aws-historical-source')).normalRetirementEvidence(
+            p, deployment, e, (deps.now ?? deps.clock ?? (() => new Date()))()) : undefined;
+        await step(p, 'STOPPED', done, close, retirement);
         return;
     }
     if (p.state === 'PROVISIONING') {

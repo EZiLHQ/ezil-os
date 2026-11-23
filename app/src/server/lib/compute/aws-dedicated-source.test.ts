@@ -10,7 +10,7 @@ import { rebaseSetup } from './aws-rebase.test-support';
 import { handleAwsEnrollment } from './aws-enroll';
 import { parseEnrollmentUserData } from './aws-rebase-lease';
 import { buildLifecycleWork } from './aws-intent';
-import { lifecycleExecutionArn } from './aws-receipts';
+import { applyLifecycleReceipt, lifecycleExecutionArn } from './aws-receipts';
 import { releaseHistory } from './aws-historical-source.test-support';
 import { parseImageJobRow, validateImageJob } from './aws-rebase-store';
 vi.mock('./aws-identity', () => ({ readIdentityCertificate: () => 'test-certificate', verifyIdentitySignature: () => ({ ok: true }) }));
@@ -29,6 +29,23 @@ const proof = (s: Setup) => proveReleasedDedicatedHost(s.p, s.target, s.row, s.p
     s.retired, s.histories.get(s.releaseArn)!, s.releaseArn, s.deps.now());
 const noMutation = (s: Setup) => { expect(s.fake.imageJobs).toHaveLength(1); expect(s.started).toHaveLength(0); expect(s.fake.poolHosts).toHaveLength(0); };
 describe('dedicated launch + retirement source proof', () => {
+    it('automatically updates a released dedicated host with an ambiguous lower using the saved normal retirement', async () => {
+        const s = await dedicatedSetup(true);
+        s.advance(2_000);
+        const placement = s.fake.placements[0]!;
+        Object.assign(placement, { state: 'STOPPING', lifecycle_job_id: s.release.intent.jobId, lifecycle_digest: s.release.digest });
+        await applyLifecycleReceipt({ db: s.fake.db, executions: s.deps.executions, now: s.deps.now },
+            { ...s.p, state: 'STOPPING', lifecycleJobId: s.release.intent.jobId, lifecycleDigest: s.release.digest }, s.target);
+        expect(placement).toMatchObject({ state: 'STOPPED', retired_host_release: { executionArn: s.releaseArn } });
+        const update = await handleImageRebase(s.deps, { schemaVersion: 1, operation: 'prepare', computerId: s.j.computerId, jobId: null },
+            { ownerUserId: s.owner, allowStart: true, canBoot: async () => true });
+        expect(update.body).toMatchObject({ eligible: true, phase: 'fencing' });
+        const job = await s.current();
+        expect(job.sourceRelease).toEqual(s.sourceRelease);
+        expect(JSON.parse(job.preparationDocument).releasedDedicatedHost.releaseExecutionArn).toBe(s.releaseArn);
+        expect(s.started).toHaveLength(1);
+    });
+
     it('selects original provision tuple despite a conflicting requested retirement AMI and ambiguous shared lower', async () => {
         const s = await dedicatedSetup();
         expect(s.release.intent.deployment.amiId).not.toBe(s.source.amiId);

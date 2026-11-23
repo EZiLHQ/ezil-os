@@ -15,6 +15,7 @@ import { parseRebaseJson, RebaseCounter, RebaseDigest, RebaseHash, RebaseSnapsho
 import { parseRebaseRelease, parseRebaseSourceRelease, rebaseReleaseCandidates, RebaseSourceReleaseSchema, RebaseReleaseSchema } from './aws-rebase-release';
 import { ImageJobConflictError, lockImagePlacement, setImageReservation, writeImagePlacement, recordImageUsage, withAdmission, ENROLLMENT_PENDING, ENROLLMENT_SUCCEEDED, readImageAdmissionCounters, type ImagePlacement, type ImagePlacementFields, type AdmissionLock, type PlacementDb, type PlacementExecutor } from './placement';
 import { reverseMoveHolds } from './provider-reverse-store';
+import { paidUserHoursExemption, type UserHoursExemption } from './paid-compute-policy';
 
 export const IMAGE_JOB_PHASES = ['reserved', 'fencing', 'snapshot_pending', 'snapshot_ready', 'launch_pending', 'verifying', 'failed', 'unconfirmed', 'recovery_pending', 'restore_pending', 'rebind_pending', 'succeeded', 'recovered', 'cancelled'] as const;
 export type ImageJobPhase = typeof IMAGE_JOB_PHASES[number];
@@ -295,7 +296,7 @@ const valueSql = (j: ImageJob, key: keyof ImageJob, type: string) => {
     return sql`${value}::${sql.raw(type)}`;
 };
 
-export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
+export function createImageJobStore(db: PlacementDb, env: Env = process.env, userHoursExemption: UserHoursExemption = paidUserHoursExemption()) {
     const read = async (tx: PlacementExecutor, jobId: string): Promise<ImageJob | null> => {
         const rows = rowsOf(await tx.execute(sql`SELECT ${columnNames} FROM public.ezil_computer_image_jobs WHERE job_id = ${RebaseUuid.parse(jobId)}::uuid LIMIT 2`));
         if (rows.length > 1) throw new ImageJobConflictError();
@@ -394,6 +395,12 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
     const time = (j: ImageJob, now: Date) => new Date(Math.max(now.getTime(), Date.parse(j.updatedAt) + 1)).toISOString();
     const store = {
         read: (jobId: string) => read(db, jobId),
+        async launchedForVerification() {
+            return rowsOf(await db.execute(sql`/* image:launched-for-verification */ SELECT ${columnNames} FROM public.ezil_computer_image_jobs
+                WHERE launch_document IS NOT NULL AND recovery_document IS NULL
+                  AND phase IN ('launch_pending', 'verifying', 'unconfirmed')
+                ORDER BY updated_at ASC, job_id ASC LIMIT 20`)).map(parseImageJobRow);
+        },
         /** The placement and its released-pool row under the admission lock. Read-only. */
         async releasedPoolHost(computerId: string) {
             return withAdmission(db, async (tx, lock) => {
@@ -447,7 +454,7 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
                 return false;
             });
         },
-        async reserve(candidate: ImageJob, approvedRepositoryUri: string): Promise<ImageJob> {
+        async reserve(candidate: ImageJob, approvedRepositoryUri: string, stoppedOnly = false): Promise<ImageJob> {
             const j = validateImageJob(candidate);
             const prep = buildRebasePreparation(parseRebaseJson(j.preparationDocument) as Parameters<typeof buildRebasePreparation>[0]);
             parseRebaseSourceRelease(j.sourceRelease, prep.intent.sourceDeployment, approvedRepositoryUri);
@@ -464,7 +471,8 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
                     return existing;
                 }
                 if (p.imageUpgradeJobId || await read(tx, j.jobId) || p.provider !== 'aws-ec2' || p.lifecycleJobId
-                    || !['STOPPED', 'RUNNING'].includes(p.state) || p.lowerImageDigest !== j.fromDigest || !p.lowerDigestObservedAt
+                    || (p.state !== 'STOPPED' && (stoppedOnly || p.state !== 'RUNNING'))
+                    || p.lowerImageDigest !== j.fromDigest || !p.lowerDigestObservedAt
                     || p.generation !== j.sourceGeneration || p.leaseEpoch !== j.sourceLeaseEpoch || p.fenceToken !== j.sourceFenceToken
                     || p.instanceId !== j.sourceInstanceId || p.volumeId !== j.sourceVolumeId || p.fsUuid !== j.fsUuid
                     || p.region !== j.region || p.zoneId !== j.zoneId) throw new ImageJobConflictError();
@@ -491,6 +499,10 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
                 // unique lower, the dedicated archive only for a shared one. A changed registry or lower is a conflict.
                 if (prep.intent.retiredSource && registrySources(p) !== 1) throw new ImageJobConflictError();
                 const dedicated = prep.intent.releasedDedicatedHost;
+                const retirement = released ?? prep.intent.retiredSource ?? dedicated;
+                if (stoppedOnly && retirement && retirement.releaseExecutionArn !== p.retiredHostReleaseArn) {
+                    throw new ImageJobConflictError();
+                }
                 if (dedicated) {
                     if (p.state !== 'STOPPED' || await releasedPoolRow(tx, p) || registrySources(p) < 2) throw new ImageJobConflictError();
                     const row = await releasedDedicatedRow(tx, p).catch(() => { throw new ImageJobConflictError(); });
@@ -550,12 +562,17 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
             if (!permit || Date.parse(permit.issuedAt) !== now.getTime() || Date.parse(permit.expiresAt) - now.getTime() !== 600000
                 || work.intent.jobId.split('-')[2]?.[0] !== '4' || work.intent.fenceToken.split('-')[2]?.[0] !== '4'
                 || work.intent.targetGeneration !== expected.sourceGeneration + 1 || work.intent.leaseEpoch <= expected.sourceLeaseEpoch) throw new ImageJobConflictError();
+            const userHoursExempt = await userHoursExemption(expected.ownerUserId);
             return withAdmission(db, async (tx, lock) => {
                 const p = await context(tx, lock, expected);
                 const config = readAwsAdmissionConfig(env);
                 const counters = await readImageAdmissionCounters(tx, lock, p, now);
-                if (!decideAdmission({ config, counters, userId: p.ownerUserId, now, region: { kind: 'lease', region: p.region }, instanceType: work.intent.instanceType }).admit)
+                const decision = decideAdmission({ config, counters, userId: p.ownerUserId, now,
+                    region: { kind: 'lease', region: p.region }, instanceType: work.intent.instanceType, userHoursExempt });
+                if (!decision.admit) {
+                    console.warn('[image-rebase] AWS launch admission refused', { reason: decision.reason });
                     throw new Error('operator_required');
+                }
                 const next = await save(tx, expected, { ...expected, phase: 'launch_pending', launchJobId: work.intent.jobId,
                     launchDocument: JSON.parse(work.input).document as string, launchDigest: work.digest,
                     launchExecutionArn: work.stateMachineArn.replace(':stateMachine:', ':execution:').replace(/:[1-9][0-9]*$/, `:${work.name}`),
@@ -637,12 +654,17 @@ export function createImageJobStore(db: PlacementDb, env: Env = process.env) {
             if (expected.phase !== 'restore_pending' || !expected.restoredVolumeId || expected.rebindDocument || !permit
                 || Date.parse(permit.issuedAt) !== now.getTime() || Date.parse(permit.expiresAt) - now.getTime() !== 600000
                 || work.intent.jobId.split('-')[2]?.[0] !== '4' || work.intent.fenceToken.split('-')[2]?.[0] !== '4') throw new ImageJobConflictError();
+            const userHoursExempt = await userHoursExemption(expected.ownerUserId);
             return withAdmission(db, async (tx, lock) => {
                 const p = await context(tx, lock, expected);
                 const config = readAwsAdmissionConfig(env);
                 const counters = await readImageAdmissionCounters(tx, lock, p, now);
-                if (!decideAdmission({ config, counters, userId: p.ownerUserId, now, region: { kind: 'lease', region: p.region }, instanceType: work.intent.instanceType }).admit)
+                const decision = decideAdmission({ config, counters, userId: p.ownerUserId, now,
+                    region: { kind: 'lease', region: p.region }, instanceType: work.intent.instanceType, userHoursExempt });
+                if (!decision.admit) {
+                    console.warn('[image-rebase] AWS launch admission refused', { reason: decision.reason });
                     throw new Error('operator_required');
+                }
                 const next = await save(tx, expected, { ...expected, phase: 'rebind_pending', rebindJobId: work.intent.jobId,
                     rebindDocument: JSON.parse(work.input).document as string, rebindDigest: work.digest,
                     rebindExecutionArn: work.stateMachineArn.replace(':stateMachine:', ':execution:').replace(/:[1-9][0-9]*$/, `:${work.name}`),

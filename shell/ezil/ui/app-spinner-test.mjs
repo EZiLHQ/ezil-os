@@ -657,6 +657,19 @@ try {
     });
     now = 0;
     {
+        let updating = true;
+        await observe(runningNow, async spinner => {
+            push('a confirmed computer update shows its own Code progress without guessing a percentage',
+                titleOf(spinner) === 'Updating your computer'
+                && statusOf(spinner).textContent === 'Code will open when the update is ready.'
+                && barEl(spinner).dataset.indeterminate === 'true');
+            updating = false;
+            spinner.render({ kind: 'progress' });
+            push('Code returns to ordinary loading when the update answer clears', titleOf(spinner) === 'Opening Browser…');
+        }, { isUpdating: () => updating });
+    }
+    now = 0;
+    {
         const element = document.createElement('div'); document.body.appendChild(element);
         const seen = [];
         const observer = (await import('./computer-progress.js')).observeComputerProgress({ computerId: 'qa-computer', element,

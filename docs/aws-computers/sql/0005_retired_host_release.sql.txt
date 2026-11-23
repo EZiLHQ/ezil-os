@@ -1,0 +1,1 @@
+ALTER TABLE public.ezil_computer_placements ADD COLUMN retired_host_release jsonb;
