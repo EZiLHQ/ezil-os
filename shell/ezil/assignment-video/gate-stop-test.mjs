@@ -2,8 +2,9 @@
 //
 // The assignment share gate after a stop or a failed share (prod incident 2026-11-23, attempt 96b3bb7d): the gate must
 // never sit on "Checking saved assignment footage…", a stop must cancel its own computer wake (and only its own), a
-// begun phase is checkpointed exactly once within a bound, the copy names the real cause, and every end of a share
-// leaves gate evidence in telemetry's local mirror for a feedback report.
+// begun phase is checkpointed exactly once and only after its last segment is confirmed (the screen is bounded, the
+// footage is not), no new share begins over a phase still saving, the copy names the real cause, and every end of a
+// share leaves gate evidence in telemetry's local mirror for a feedback report.
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {openWithAssignmentConsent} from './shell.js';
@@ -30,11 +31,60 @@ class Element{
     remove(){this.isConnected=false;}
 }
 
+const ORIGIN='https://os-staging.ezil.work';
+const BUCKET='https://ezil-universe-staging-assignment-media-452630323510-aps1.s3.ap-south-1.amazonaws.com';
+/**
+ * Broker answers for a whole recorded share through the real transport: begin, the seed and segment prepare/confirm,
+ * status and checkpoint. `put(sequence)` may delay or withhold a segment's storage PUT.
+ */
+function recorded({put}={}){
+    const startedAt=new Date().toISOString(),deadlineAt=new Date(Date.now()+3000000).toISOString();
+    let phase;
+    return {put,
+        begin:body=>{phase=body.captureSessionId;return begun(body);},
+        prepare:body=>Response.json({putUrl:BUCKET+'/universe-staging/assignment-media/v1/x/'+id+'/'+recordingId+'/segments/'+body.sequence+'/'+body.sha256+'.webm',headers:{}}),
+        confirm:body=>Response.json(body.sequence===0?{confirmed:true,recordingId,sequence:0,phaseReady:true,captureSessionId:phase,nextSequence:1,
+            firstFrameAt:startedAt,startedAt,deadlineAt,serverNow:new Date().toISOString()}:{confirmed:true,recordingId,sequence:body.sequence}),
+        status:()=>Response.json({recordingId,captureSessionId:phase,status:'recording',phaseReady:true,workspaceUnlocked:true,
+            startedAt,deadlineAt,firstFrameAt:startedAt,revoked:false,stopRequestedAt:null}),
+        checkpoint:()=>Response.json({status:'paused'})};
+}
+/** Just enough WebCodecs and media elements for the real seed frame (globals) and segment recorder (`win`) to run. */
+class FakeFrame{constructor(_source,{timestamp}){this.timestamp=timestamp;} close(){}}
+class FakeEncoder{
+    static async isConfigSupported(){return {supported:true};}
+    state='unconfigured';encodeQueueSize=0;
+    constructor({output}){this.output=output;}
+    configure(){this.state='configured';}
+    encode(frame,{keyFrame}={}){const {timestamp}=frame;
+        queueMicrotask(()=>this.output({type:keyFrame?'key':'delta',timestamp,byteLength:4,copyTo:bytes=>bytes.set([1,2,3,4])}));}
+    async flush(){}
+    close(){this.state='closed';}
+}
+const mediaElement={
+    video:()=>Object.assign(new Element(),{muted:false,playsInline:false,srcObject:null,videoWidth:1280,videoHeight:720,readyState:4,
+        play:async()=>{},pause(){},requestVideoFrameCallback(callback){setTimeout(callback,5);}}),
+    canvas:()=>Object.assign(new Element(),{width:0,height:0,getContext:()=>({fillStyle:'',fillRect(){},drawImage(){}})}),
+};
+function installMedia(t){
+    const saved=['location','VideoEncoder','VideoFrame'].map(key=>[key,Object.getOwnPropertyDescriptor(globalThis,key)]);
+    // The transport only signs uploads for this OS origin's own assignment bucket.
+    Object.defineProperty(globalThis,'location',{value:new URL(ORIGIN+'/app/code'),configurable:true,writable:true});
+    Object.assign(globalThis,{VideoEncoder:FakeEncoder,VideoFrame:FakeFrame});
+    t.after(()=>{for(const [key,descriptor] of saved)if(descriptor)Object.defineProperty(globalThis,key,descriptor);else delete globalThis[key];});
+}
+
 /** One OS tab on os-staging with the gate armed. `control[action]` answers the assignment-video route; preflight is eligible. */
-function harness(t,{prepare,control={},video,settleMs=40}={}){
+// `saveCeilingMs`: short, so a failing test's unfinished save (module state) cannot stall the next test for minutes.
+function harness(t,{prepare,control={},video,media=false,settleMs=40,saveCeilingMs=3000}={}){
     const calls=[],elements=[];
-    t.mock.method(globalThis,'fetch',async(_path,options)=>{
-        const body=JSON.parse(options.body);calls.push(body.action);
+    if(media)installMedia(t);
+    t.mock.method(globalThis,'fetch',async(url,options)=>{
+        if(options.method==='PUT'){
+            const sequence=Number(String(url).split('/segments/')[1].split('/')[0]);calls.push('put:'+sequence);
+            return await control.put?.(sequence)??new Response(null,{status:200});
+        }
+        const body=JSON.parse(options.body);calls.push(body.action+(Number.isInteger(body.sequence)?':'+body.sequence:''));
         if(control[body.action])return control[body.action](body);
         if(body.action==='preflight')return Response.json({status:'eligible',attemptId:id,repositoryUrl:repo,expiresAt:new Date(Date.now()+60000).toISOString()});
         return Response.json({});
@@ -48,16 +98,19 @@ function harness(t,{prepare,control={},video,settleMs=40}={}){
     }
     const tracks=[];
     const stream=()=>{const track=new Track();tracks.push(track);return {getTracks:()=>[track],getVideoTracks:()=>[track],getAudioTracks:()=>[]};};
-    const doc={body:new Element(),createElement(tag){const e=tag==='video'&&video?video():new Element();e.tag=tag;elements.push(e);return e;}};
-    const win={location:new URL('https://os-staging.ezil.work/app/code?repo='+encodeURIComponent(repo)+'&assignment='+id),crypto:globalThis.crypto,
-        isSecureContext:true,document:doc,addEventListener(){},removeEventListener(){},MediaStreamTrack:Track,VideoFrame:class{},VideoEncoder:class{},
+    const make=tag=>tag==='video'&&video?video():media&&mediaElement[tag]?mediaElement[tag]():new Element();
+    const doc={body:new Element(),createElement(tag){const e=make(tag);e.tag=tag;elements.push(e);return e;}};
+    const win={location:new URL(ORIGIN+'/app/code?repo='+encodeURIComponent(repo)+'&assignment='+id),crypto:globalThis.crypto,
+        isSecureContext:true,document:doc,addEventListener(){},removeEventListener(){},MediaStreamTrack:Track,
+        VideoFrame:media?FakeFrame:class{},VideoEncoder:media?FakeEncoder:class{},performance:globalThis.performance,
+        setTimeout:(...args)=>setTimeout(...args),clearTimeout:timer=>clearTimeout(timer),
         navigator:{mediaDevices:{setCaptureHandleConfig(config){handle=config.handle;},getDisplayMedia:async()=>stream()}}};
     win.top=win;win.parent=win;Object.assign(globalThis,{window:win,document:doc});
     let opened=0;
     const gate=openWithAssignmentConsent({project:{repoUrl:repo},actor:()=>'owner',computerId:'fixture',body:new Element(),
-        park(){},open(){opened++;},prepare,settleMs});
+        park(){},open(){opened++;},prepare,settleMs,saveCeilingMs});
     const buttons=()=>elements.filter(e=>e.tag==='button'&&e.textContent===SHARE);
-    return {gate,calls,tracks,opened:()=>opened,
+    return {gate,calls,tracks,opened:()=>opened,panel:()=>elements.find(e=>e.tag==='section'),
         title:()=>elements.filter(e=>e.tag==='h2').at(-1)?.textContent,
         status:()=>elements.filter(e=>e.tag==='p').at(-1)?.textContent,
         buttons,
@@ -107,7 +160,7 @@ test('a stale retry of an ended share never prepares again and never aborts the 
     }finally{await h.gate.close();}
 });
 
-test('a stop after begin checkpoints that phase exactly once within the bound, even while the seed frame hangs', async t=>{
+test('a stop while the seed frame hangs hands the gate back within the bound and checkpoints once the seed step settles', async t=>{
     let rejectPlay;
     const video=()=>Object.assign(new Element(),{muted:false,playsInline:false,srcObject:null,pause(){},requestVideoFrameCallback(){},
         play:()=>new Promise((_,reject)=>{rejectPlay=reject;})});
@@ -121,14 +174,110 @@ test('a stop after begin checkpoints that phase exactly once within the bound, e
         assert.equal(h.title(),'Sharing stopped');
         await waitFor(()=>h.title()==='Record this assignment tab');
         assert.ok(Date.now()-stoppedAt<1000,'consent returns within the settle bound, not when the seed frame gives up');
-        assert.equal(h.calls.filter(c=>c==='checkpoint').length,1);
         assert.equal(h.status(),'Sharing stopped. Share this OS tab again to open your assignment.'+CONSENT_TAIL,
             'no footage is claimed: no segment was confirmed');
-        const finish=gateEvents(since).find(e=>e.site==='ezil-os:assignment#finish');
-        assert.match(finish.detail,/stage:seed;reason:sharing_stopped;began:1;accepted:0;saved:1;late:1/);
-        rejectPlay(new Error('aborted'));await tick(10);
+        assert.equal(h.calls.includes('checkpoint'),false,'the phase waits for its seed step (bounded by its own 8 s frame budget)');
+        rejectPlay(new Error('aborted'));
+        await waitFor(()=>h.calls.includes('checkpoint'));await tick(10);
         assert.equal(h.calls.filter(c=>c==='checkpoint').length,1);assert.equal(h.opened(),0);
+        const finish=gateEvents(since).filter(e=>e.site==='ezil-os:assignment#finish');
+        assert.equal(finish.length,1,'one finish report, once the footage is settled');
+        assert.match(finish[0].detail,/stage:seed;reason:sharing_stopped;began:1;accepted:0;saved:1;late:1/);
     }finally{rejectPlay?.(new Error('aborted'));await h.gate.close();}
+});
+
+/** Shares and records (real seed, recorder and transport) until Code opens. */
+async function recording(h){
+    await h.share();
+    await waitFor(()=>h.opened()===1,3000);
+}
+const index=(calls,call)=>{const at=calls.indexOf(call);assert.notEqual(at,-1,call+' was sent');return at;};
+
+test('a stop confirms the in-flight and the final segment before the checkpoint, even when they outlast the screen bound', async t=>{
+    // Review repro: an 11 s segment still uploading and the final one still to seal, on an uplink slower than settleMs.
+    const h=harness(t,{prepare:async()=>checkout,media:true,control:recorded({put:sequence=>sequence>0?tick(300):undefined})});
+    try{
+        const since=recentEvents().length;
+        await recording(h);
+        // The first recorded segment rotates after 3.5 s; stop while its upload is in flight and the next one is open.
+        await waitFor(()=>h.calls.includes('put:1'),6000);await tick(20);
+        h.stop();
+        assert.equal(h.title(),'Sharing stopped');
+        await waitFor(()=>h.title()==='Record this assignment tab',1000);
+        assert.equal(h.calls.includes('checkpoint'),false,'the screen is handed back; the footage is still saving');
+        assert.equal(h.status(),'Sharing stopped. Your last footage is still uploading. Share this OS tab again to resume.'+CONSENT_TAIL);
+        await waitFor(()=>h.calls.includes('checkpoint'),5000);await tick(50);
+        const {calls}=h;
+        assert.ok(index(calls,'confirm:1')<index(calls,'put:2'),'the in-flight segment is confirmed before the last one is sealed');
+        assert.ok(index(calls,'confirm:2')<index(calls,'checkpoint'),'the last segment is confirmed before the checkpoint');
+        assert.equal(calls.at(-1),'checkpoint','the transport is released only after the checkpoint');
+        assert.equal(calls.filter(c=>c==='checkpoint').length,1);
+        assert.equal(h.status(),'Sharing stopped. Share this OS tab again to resume.'+CONSENT_TAIL,'the screen is refreshed once saved');
+        const finish=gateEvents(since).filter(e=>e.site==='ezil-os:assignment#finish');
+        assert.equal(finish.length,1);
+        assert.equal(finish[0].code,'track_ended');
+        assert.match(finish[0].detail,/stage:open;reason:sharing_stopped;began:1;accepted:1;saved:1;late:1/);
+    }finally{await h.gate.close();}
+});
+
+test('a new share sends no begin until the stopped phase is checkpointed, and a stop while it waits releases at once', async t=>{
+    // Only the first share's final segment is held in storage; later shares upload at once.
+    let releasePut;
+    const h=harness(t,{prepare:async()=>checkout,media:true,
+        control:recorded({put:sequence=>sequence>0&&!releasePut?new Promise(resolve=>{releasePut=resolve;}):undefined})});
+    try{
+        await recording(h);
+        await tick(60);
+        h.stop();
+        await waitFor(()=>h.title()==='Record this assignment tab'&&typeof releasePut==='function',1000);
+        // Another share while the last segment is still uploading: its checkout is prepared, then it waits.
+        await h.share();
+        await waitFor(()=>h.status()==='Saving your earlier footage before recording resumes…',1000);
+        assert.equal(h.title(),'Preparing assignment');
+        assert.equal(h.calls.filter(c=>c==='begin').length,1,'no begin over a phase still saving');
+        // Stopped while waiting, it never reached Universe: consent at once, and it never begins.
+        h.stop();
+        assert.equal(h.title(),'Record this assignment tab');
+        assert.equal(h.status(),'Sharing stopped. Share this OS tab again to open your assignment.'+CONSENT_TAIL);
+        // A third share waits too, then begins only after the first phase's confirm and checkpoint.
+        await h.share();
+        await waitFor(()=>h.status()==='Saving your earlier footage before recording resumes…',1000);
+        releasePut(new Response(null,{status:200}));
+        await waitFor(()=>h.calls.filter(c=>c==='begin').length===2,3000);
+        const {calls}=h;
+        assert.ok(index(calls,'confirm:1')<index(calls,'checkpoint'));
+        assert.ok(index(calls,'checkpoint')<calls.lastIndexOf('begin'),'the next phase begins only after the old one is checkpointed');
+        await waitFor(()=>h.opened()===2,3000);
+    }finally{releasePut?.(new Response(null,{status:200}));await h.gate.close();}
+});
+
+test('closing during the save removes the gate at once and still confirms before it checkpoints', async t=>{
+    const h=harness(t,{prepare:async()=>checkout,media:true,control:recorded({put:sequence=>sequence>0?tick(200):undefined})});
+    await recording(h);
+    await tick(60);
+    let closed=false;
+    const closing=h.gate.close().then(()=>{closed=true;});
+    assert.equal(h.panel().isConnected,false,'the panel is gone at once, never stacked over the next gate');
+    assert.equal(h.calls.includes('checkpoint'),false);
+    await tick(50);assert.equal(closed,false,'close() resolves only once the footage is saved');
+    await closing;
+    assert.ok(index(h.calls,'confirm:1')<index(h.calls,'checkpoint'));
+});
+
+test('a save that outlasts its ceiling still checkpoints and reports the gap', async t=>{
+    const h=harness(t,{prepare:async()=>checkout,media:true,saveCeilingMs:200,
+        control:recorded({put:sequence=>sequence>0?new Promise(()=>{}):undefined})});
+    try{
+        const since=recentEvents().length;
+        await recording(h);
+        await tick(60);
+        h.stop();
+        await waitFor(()=>h.calls.includes('checkpoint'),2000);await tick(20);
+        assert.equal(h.calls.includes('confirm:1'),false);
+        assert.equal(h.status(),'Sharing was interrupted. Your recording may contain a gap.'+CONSENT_TAIL);
+        const finish=gateEvents(since).find(e=>e.site==='ezil-os:assignment#finish');
+        assert.match(finish.detail,/accepted:1;saved:0;late:1/);
+    }finally{await h.gate.close();}
 });
 
 test('a stop while begin is still in flight releases the gate and checkpoints the phase once it lands', async t=>{

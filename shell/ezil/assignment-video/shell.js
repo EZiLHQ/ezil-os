@@ -7,8 +7,23 @@ const canonical=/^https:\/\/github\.ezil\.work\/default\/u-[0-9a-f]{16}-a-([0-9a
 const initialEntry=globalThis.location?.href;
 const failure=code=>Object.assign(new Error(code),{code});
 let current;
-/** How long a stop waits for an in-flight begin, seed or segment confirm (each) before it checkpoints anyway. */
+/**
+ * How long a stop holds the gate on "Checking saved assignment footage…" before it hands the consent screen back. It
+ * bounds the screen only: the footage keeps saving in order in the background (`save`), never cut short by this.
+ */
 export const STOP_SETTLE_MS=5000;
+/**
+ * Backstop for saving a stopped share's footage. Every step is already bounded by the transport's own timeouts (control
+ * 18 s, PUT 30 s); this covers one full-timeout pass of the longest chain (an in-flight segment 66 s, the cutoff status
+ * 18 s, the final segment 66 s) and a codec call that never settles. Past it the phase is checkpointed anyway.
+ */
+export const STOP_SAVE_CEILING_MS=150000;
+/**
+ * The stopped share whose footage is still being saved (`{item,done}`), in any gate of this document. A new share sends
+ * no begin until it is done: the broker holds one capture lease per attempt and OS session, so a new phase would refuse
+ * the old phase's last confirm.
+ */
+let saving=null;
 /** Answers that mean the computer was still waking when the share gave up. */
 const WAKING=['sandbox_starting','timeout','fetch_failed'];
 /** A Universe, media-service or Git-gateway call that did not answer: retry, never a refusal. */
@@ -81,7 +96,8 @@ async function retry(operation, codes, times=2, live=()=>true) {
             await new Promise(resolve=>setTimeout(resolve,320*(i+1)));}}
 }
 
-export function openWithAssignmentConsent({project, computerId, actor, open, body, park, prepare, computerProvider, settleMs=STOP_SETTLE_MS}) {
+export function openWithAssignmentConsent({project, computerId, actor, open, body, park, prepare, computerProvider, settleMs=STOP_SETTLE_MS,
+    saveCeilingMs=STOP_SAVE_CEILING_MS}) {
     const win=globalThis.window, repo=project?.repoUrl;
     if(!win || !assignmentOsOrigin(win.location.origin)){queueMicrotask(open);return null;}
     const address=new URL(win.location.href);
@@ -91,7 +107,8 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
     if(!canonical.test(repo) && !explicit){queueMicrotask(open);return null;}
 
     const owner=actor(), ui=buildGate(body);
-    let disposePromise, disposed=false, locked=true, picker, activity, indicator;
+    // `shown`: the ended share whose result the gate is showing; a late save result refreshes only its own screen.
+    let disposePromise, disposed=false, locked=true, picker, activity, indicator, shown;
     const isOwner=()=>Boolean(owner) && actor()===owner;
     const isHere=()=>!disposed && current===gate && isOwner() && win===win.top;
     const samePhase=item=>isHere() && activity===item && !item.ended;
@@ -179,10 +196,18 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
                 ||!meta?.id||typeof meta.workspaceFolder!=='string'||meta.checkoutFolder!==meta.workspaceFolder+'/'+name)
                 throw failure('assigned_checkout_unverified');
             item.meta=meta;item.proof=proof.proof;
+            // An earlier share's last footage is still being saved: its phase must be checkpointed before this one begins.
+            // Waited here, before any transport exists, so a stop meanwhile is still a share that never reached Universe.
+            for(let earlier;(earlier=saving);){
+                item.stage='wait';
+                lockedView('Preparing assignment','Saving your earlier footage before recording resumes…');
+                await earlier.done;
+                check(item);
+            }
             item.stage='begin';
             item.transport=createAssignmentVideoTransport({attemptId,repoOpenProof:item.proof,captureSessionId:item.id,consentVersion:4,
                 onStop:(why,at)=>void finish(item,why==='submitted'||why==='timeout'?why:'connection_lost',{at,cause:'universe_'+why})});
-            // A stop while this is in flight still checkpoints the phase it opens (`finish`), never orphans it.
+            // A stop while this is in flight still checkpoints the phase it opens once it lands (`save`), never orphans it.
             item.beginning=retry(()=>item.transport.begin(),['media_unavailable'],2,live);
             item.grant=await item.beginning;
             check(item);
@@ -238,22 +263,53 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
         if(!folders.includes(actualRoot)||!folders.includes(url.searchParams.get('folder'))){item.editor.reject(failure('assigned_checkout_unverified'));return;}
         locked=false;park(false);ui.reveal();item.editor.resolve();
     }
-    function settled(item,reason,saved,cause,late=false){
-        // `cause` tells a participant's stop from a self-fault; the detail says how far the share got.
-        report('finish',cause,item,{outcome:DELIBERATE.includes(cause)?'skipped':'error',
-            detail:'stage:'+item.stage+';reason:'+reason+';began:'+(item.transport?1:0)+';accepted:'+(item.accepted?1:0)
-                +';saved:'+(saved?1:0)+';late:'+(late?1:0)});
-        if(!isHere())return;
+    /** The gate's screen for an ended share. `saved` null: its footage is still being saved, so nothing is claimed yet. */
+    function showEnded(item,reason,saved){
+        shown=item;
         if(reason==='submitted'||reason==='timeout'){lockedView('Assignment closed',reason==='submitted'?'Assignment submitted. Recording ended.':'The assignment time has ended.');return;}
         if(item.signIn){showSignIn();return;}
         const stopped=!item.accepted?'Sharing stopped. Share this OS tab again to open your assignment.'
+            :saved===null?'Sharing stopped. Your last footage is still uploading. Share this OS tab again to resume.'
             :saved?'Sharing stopped. Share this OS tab again to resume.':'Sharing was interrupted. Your recording may contain a gap.';
         displayConsent(item.message||stopped);
     }
+    function settled(item,reason,saved,cause,late=false){
+        // `cause` tells a participant's stop from a self-fault; the detail says how far the share got. `late`: the gate
+        // was handed back before the footage finished saving.
+        report('finish',cause,item,{outcome:DELIBERATE.includes(cause)?'skipped':'error',
+            detail:'stage:'+item.stage+';reason:'+reason+';began:'+(item.transport?1:0)+';accepted:'+(item.accepted?1:0)
+                +';saved:'+(saved?1:0)+';late:'+(late?1:0)});
+        // A late result refreshes only its own screen: never a newer share, or the screen of one that ended since.
+        if(!isHere()||(late&&(activity||shown!==item)))return;
+        showEnded(item,reason,saved);
+    }
+    /**
+     * Save a stopped share's footage, strictly in order: the start pipeline settles (a begin in flight lands, the seed's
+     * confirm answers), the recorder joins its in-flight segment and seals and confirms the last one, and only then is
+     * the phase checkpointed (or finalized) and the transport released. A checkpoint that overtook a confirm would
+     * refuse it. Each step is bounded by the transport's own timeouts, the whole by `saveCeilingMs`. Never rejects.
+     */
+    async function save(item,reason,effectiveAt){
+        const transport=item.transport;
+        let saved=true;
+        try{
+            const drained=await settle((async()=>{await item.starting;return item.recorder?.stop(effectiveAt);})(),saveCeilingMs);
+            if(!drained.done||!drained.ok)saved=false;
+            else if(drained.value)item.expected=drained.value.expectedSegments;
+            // A phase this share opened is checkpointed even past the ceiling (begin is bounded by its own timeouts).
+            await item.beginning?.catch(()=>{});
+            if(item.grant){
+                if(reason==='submitted'||reason==='timeout')await transport.finalize({reason,expectedSegments:item.expected});
+                else await retry(()=>transport.checkpoint(reason==='sharing_stopped'?'sharing_stopped':'connection_lost'),['media_unavailable']);
+            }
+        }catch{saved=false;}
+        finally{transport.dispose();}
+        return saved;
+    }
     /**
      * End this share. Never leaves the gate on "Checking saved assignment footage…": a share that never reached Universe
-     * (no begin sent) is released at once; otherwise each in-flight step (begin, the seed or a segment's confirm) gets
-     * `settleMs` before the phase is checkpointed, so a last confirm is not refused by a checkpoint that overtook it.
+     * (no begin sent) is released at once; otherwise the gate is handed back within `settleMs` while `save` finishes
+     * the footage in the background, and the screen is refreshed with its result.
      */
     function finish(item,reason='sharing_stopped',{at:effectiveAt=null,message,signIn=false,cause=reason}={}){
         if(activity!==item)return Promise.resolve();
@@ -273,41 +329,32 @@ export function openWithAssignmentConsent({project, computerId, actor, open, bod
             return item.ending;
         }
         lockedView('Sharing stopped','Checking saved assignment footage…');
+        const entry={item,done:save(item,reason,effectiveAt)};
+        saving=entry;
+        void entry.done.finally(()=>{if(saving===entry)saving=null;});
         item.ending=(async()=>{
-            let saved=true, late=null;
-            // The pipeline itself never throws (start() catches); this only bounds a step that has not answered yet.
-            const started=await settle(item.starting,settleMs);
-            if(item.recorder){
-                const stopped=await settle(item.recorder.stop(effectiveAt),settleMs);
-                if(stopped.ok)item.expected=stopped.value.expectedSegments;else saved=false;
-            }
-            const why=reason==='sharing_stopped'?'sharing_stopped':'connection_lost';
-            try{
-                if(item.grant){
-                    if(reason==='submitted'||reason==='timeout')await item.transport.finalize({reason,expectedSegments:item.expected});
-                    else await retry(()=>item.transport.checkpoint(why),['media_unavailable']);
-                }else if(item.beginning){
-                    // begin is still in flight past the bound. No frame was accepted (that needs the grant), so do not
-                    // hold the gate: checkpoint the phase it opens once it lands, then let the transport go.
-                    const transport=item.transport;
-                    late=item.beginning.then(()=>transport.checkpoint(why)).catch(()=>{}).finally(()=>transport.dispose());
-                }
-            }catch{saved=false;}
-            finally{if(!late)item.transport.dispose();if(activity===item)activity=null;}
-            settled(item,reason,saved,cause,!started.done);
+            const quick=await settle(entry.done,settleMs);
+            if(activity===item)activity=null;
+            if(!quick.done&&isHere())showEnded(item,reason,null);
+            settled(item,reason,await entry.done,cause,!quick.done);
         })();
         return item.ending;
     }
+    /** Closing hands the screen back at once; a share's footage keeps saving, and the returned promise waits for it. */
     function close(){
         if(disposePromise)return disposePromise;
         disposed=true;const item=activity;
         win.removeEventListener('pagehide',pageHide);
-        disposePromise=(item?finish(item,'connection_lost',{cause:'window_closed'}):Promise.resolve()).finally(()=>{
-            picker?.dispose();removeIndicator();ui.remove();if(current===gate)current=null;
-        });
+        const ended=item?finish(item,'connection_lost',{cause:'window_closed'}):Promise.resolve();
+        picker?.dispose();removeIndicator();ui.remove();if(current===gate)current=null;
+        disposePromise=Promise.all([ended,saving?.done]).then(()=>{});
         return disposePromise;
     }
-    function pageHide(){if(activity?.grant)activity.transport.checkpointOnExit('connection_lost');void close();}
+    // A closing document cannot finish an upload: keep the accepted clips of the live share and of one still saving.
+    function pageHide(){
+        for(const item of new Set([activity,saving?.item]))if(item?.grant)item.transport.checkpointOnExit('connection_lost');
+        void close();
+    }
     /** Code's open-phase mint failed (`apps/code.js`): end the wait for the editor now, with the real cause. */
     function failOpen(res){
         const item=activity;if(!item?.editor)return;
