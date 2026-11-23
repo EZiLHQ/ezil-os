@@ -6,6 +6,9 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { FINAL_STOP_TIMEOUT_MS, parseTerminalMarker } from './live-check.mjs';
 import {
+  AI_PROMPT, AI_STATUS_ITEM, DEFAULT_AI_MODEL_NAME, SIGN_IN_MODES,
+  aiStatusVerdict, classifyAIStatus, classifyChatReply, isPlaceholderReply, parseSignInMode, pickModelLabel,
+  readAIStatusItem, readChatState, readQuickPick, replyEvidence, requiredEnv, signInModule, summarizeAIQuickPick,
   COMPUTER_NAME_PREFIX, DEFAULT_JOURNEYS, JOURNEYS, MAX_COMPUTERS_PER_USER, READY_SETTLE_MS, REQUIRED_ENV,
   addApiFailure, addUnique, apiPathOf, assertSuiteComputer, awsFacts, capText, classifyStartFailure,
   decideDockAction, describeCreateRefusal, describeError, describeReadinessWait, describeStartFailure, describeStopFailure,
@@ -833,4 +836,268 @@ test('a failing step records the failing API codes, console errors, visible text
     assert.deepEqual(summary.journeys.map(journey => journey.name), ['free-open-apps', 'billing-view']);
     assert.ok(lines.some(line => line.journey === 'free-open-apps' && line.step === 'sign-in' && line.ok === false));
   } finally { rmSync(out, { recursive: true, force: true }); }
+});
+
+// ── EZiL ID sign-in mode ───────────────────────────────────────────────────
+
+const ezilIdEnv = Object.freeze({ EZIL_E2E_APP: APP, EZIL_E2E_EMAIL: 'qa.user@ezil.work', EZIL_E2E_PASSWORD: 'correct-horse-battery',
+  PLAYWRIGHT_REQUIRE_DIR: '/opt/testkit', EZIL_E2E_SIGNIN: 'ezilid' });
+
+test('EZIL_E2E_SIGNIN picks the sign-in; ezilid needs no Supabase inputs, the default still does', () => {
+  assert.deepEqual([...SIGN_IN_MODES], ['supabase', 'ezilid']);
+  assert.equal(parseSignInMode(undefined), 'supabase');
+  assert.equal(parseSignInMode(' EZiLID '), 'ezilid');
+  assert.throws(() => parseSignInMode('auth0'), /EZIL_E2E_SIGNIN must be one of supabase, ezilid/);
+  assert.deepEqual(requiredEnv('ezilid'), ['EZIL_E2E_APP', 'EZIL_E2E_EMAIL', 'EZIL_E2E_PASSWORD', 'PLAYWRIGHT_REQUIRE_DIR']);
+  assert.deepEqual(requiredEnv('supabase'), [...REQUIRED_ENV]);
+  const config = parseEnv(ezilIdEnv);
+  assert.equal(config.signInMode, 'ezilid');
+  assert.equal(config.supabaseUrl, null);
+  assert.equal(config.anonKey, null);
+  assert.equal(parseEnv({ ...ezilIdEnv, NEXT_PUBLIC_SUPABASE_URL: 'not a url' }).signInMode, 'ezilid', 'an unused Supabase value is ignored');
+  assert.throws(() => parseEnv({ ...ezilIdEnv, EZIL_E2E_SIGNIN: 'supabase' }),
+    /Missing prod-journeys inputs: NEXT_PUBLIC_SUPABASE_URL, NEXT_PUBLIC_SUPABASE_ANON_KEY/);
+  assert.equal(parseEnv(baseEnv).signInMode, 'supabase');
+  assert.equal(parseEnv(baseEnv).anonKey, 'anon-key-value');
+  assert.throws(() => parseEnv({ ...ezilIdEnv, EZIL_E2E_PASSWORD: '' }), /Missing prod-journeys inputs: EZIL_E2E_PASSWORD$/);
+  assert.equal(signInModule('ezilid'), './sign-in-ezilid.mjs');
+  assert.equal(signInModule('supabase'), './sign-in.mjs');
+  assert.equal(signInModule(undefined), './sign-in.mjs');
+});
+
+// ── the ezil-ai journey ────────────────────────────────────────────────────
+
+test('ezil-ai is selectable, opt-in (it spends credits), and budgeted for its reply timeout', () => {
+  assert.ok(JOURNEYS.includes('ezil-ai'));
+  assert.ok(!DEFAULT_JOURNEYS.includes('ezil-ai'));
+  assert.deepEqual(selectJourneys('billing-view,ezil-ai,free-open-apps'), ['free-open-apps', 'ezil-ai', 'billing-view']);
+  const config = parseEnv({ ...ezilIdEnv, EZIL_E2E_JOURNEYS: 'ezil-ai' });
+  assert.deepEqual(config.journeys, ['ezil-ai']);
+  assert.equal(config.aiReplyTimeoutMs, 120_000);
+  const longer = parseEnv({ ...ezilIdEnv, EZIL_E2E_AI_REPLY_TIMEOUT_MS: '300000' });
+  assert.equal(journeyBudgetMs('ezil-ai', longer) - journeyBudgetMs('ezil-ai', config), 180_000);
+  assert.ok(journeyBudgetMs('ezil-ai', config) > 90_000 + 60_000 + config.appTimeoutMs + config.aiReplyTimeoutMs,
+    'sign-in, /os, Code and the reply all fit');
+  assert.throws(() => parseEnv({ ...ezilIdEnv, EZIL_E2E_AI_REPLY_TIMEOUT_MS: '5000' }), /EZIL_E2E_AI_REPLY_TIMEOUT_MS must be/);
+  assert.equal(AI_PROMPT, 'Reply with the single word: pong');
+  assert.equal(DEFAULT_AI_MODEL_NAME, 'Qwen3 Coder Next');
+});
+
+test('the default model name is the one the computer image ships as default', () => {
+  const models = JSON.parse(readFileSync(new URL('../worker/ezil-models/models.json', import.meta.url), 'utf8')).models;
+  assert.equal(models.find(model => model.default === true)?.name, DEFAULT_AI_MODEL_NAME);
+});
+
+test('the EZiL AI status text is classified: a balance, loading, unreachable, or an attention label', () => {
+  assert.deepEqual(classifyAIStatus('EZiL AI · 12.5 credits'), { state: 'credits', credits: '12.5', window: false, zero: false });
+  assert.deepEqual(classifyAIStatus('EZiL AI · 1,234 credits left · resets 14:00'), { state: 'credits', credits: '1,234', window: true, zero: false });
+  assert.deepEqual(classifyAIStatus('EZiL AI · 0 credits'), { state: 'credits', credits: '0', window: false, zero: true });
+  assert.equal(classifyAIStatus('EZiL AI · 0 credits left · resets 14:00 · window used').zero, true);
+  assert.deepEqual(classifyAIStatus('EZiL AI · 3 credits · limits unavailable · usage unavailable').partial, ['limits unavailable', 'usage unavailable']);
+  assert.deepEqual(classifyAIStatus('EZiL AI · Loading…'), { state: 'loading' });
+  assert.deepEqual(classifyAIStatus('EZiL AI · Credits unavailable · limits unavailable · availability unknown · usage unavailable'),
+    { state: 'unavailable', code: 'credits_unavailable' });
+  assert.deepEqual(classifyAIStatus('EZiL AI · Sign-in needed'), { state: 'attention', label: 'Sign-in needed', code: 'sign_in_needed' });
+  assert.deepEqual(classifyAIStatus('EZiL AI · Paused · reconciling usage'), { state: 'attention', label: 'Paused', code: 'paused' });
+  assert.deepEqual(classifyAIStatus('EZiL AI · Something new'), { state: 'attention', label: 'Something new', code: 'unknown' });
+  assert.deepEqual(classifyAIStatus(''), { state: 'missing' });
+  assert.deepEqual(classifyAIStatus('Copilot'), { state: 'unknown' });
+});
+
+// Pinned to the extension's own copy, so a renamed label fails here instead of in production.
+test('every status label the extension can show is recognised (source pin: ezil-models status-data.ts)', () => {
+  const source = readFileSync(new URL('../extensions/ezil-models/src/status-data.ts', import.meta.url), 'utf8');
+  const labels = [...new Set([...source.matchAll(/label: '([^']+)'/g)].map(match => match[1]))];
+  assert.ok(labels.length >= 9, `found ${labels.length} labels`);
+  for (const label of labels.filter(item => item !== 'Unavailable')) {   // "Unavailable" never reaches the item text
+    const status = classifyAIStatus(`EZiL AI · ${label}`);
+    assert.equal(status.state, 'attention', label);
+    assert.notEqual(status.code, 'unknown', label);
+  }
+  const texts = [...new Set([...source.matchAll(/'(EZiL AI · [^'$`]+)'/g)].map(match => match[1]))];
+  assert.ok(texts.includes('EZiL AI · Loading…') && texts.includes('EZiL AI · Credits unavailable'), JSON.stringify(texts));
+  for (const text of texts) {
+    const status = classifyAIStatus(text);
+    assert.ok(['loading', 'unavailable', 'attention', 'credits'].includes(status.state), text);
+    if (status.state === 'attention') assert.notEqual(status.code, 'unknown', text);
+    if (status.state === 'credits') assert.equal(status.zero, true, text);
+  }
+});
+
+test('the status verdict passes only on a non-zero balance, and names the reason otherwise', () => {
+  assert.deepEqual(aiStatusVerdict(classifyAIStatus('EZiL AI · 12.5 credits')), { ok: true });
+  assert.deepEqual(aiStatusVerdict(classifyAIStatus('EZiL AI · 12.5 credits'), summarizeAIQuickPick(['Available credits: 12.5'])), { ok: true });
+  assert.match(aiStatusVerdict(classifyAIStatus('EZiL AI · 0 credits')).reason, /0 credits: the free AI grant has not landed/);
+  assert.match(aiStatusVerdict(classifyAIStatus('EZiL AI · Credits unavailable · usage unavailable')).reason, /os_ai_unavailable/);
+  assert.match(aiStatusVerdict(classifyAIStatus('EZiL AI · Loading…')).reason, /never left "Loading…"/);
+  assert.match(aiStatusVerdict(classifyAIStatus('')).reason, /no "EZiL AI" status-bar item/);
+  assert.equal(aiStatusVerdict(classifyAIStatus('EZiL AI · Sign-in needed')).reason, 'EZiL AI needs attention: "Sign-in needed" (sign_in_needed)');
+  assert.match(aiStatusVerdict(classifyAIStatus('EZiL AI · 5 credits'),
+    summarizeAIQuickPick(['Credits unavailable. Could not load current information. Try again.'])).reason, /no "Available credits" line \("Credits unavailable"\)/);
+  assert.equal(aiStatusVerdict(undefined).ok, false);
+});
+
+test('the quick pick is summarised by fact, never by usage row', () => {
+  const lines = ['Available credits: 1,000.25', 'Held credits: 0', 'Global AI pause: none reported.', 'Effective limits',
+    'Entitlement: entitlement grant', 'Recent usage (up to 5 requests)',
+    '2026-10-31T10:00:00Z · qwen.qwen3-coder-next · settled · 0.01 credits', '2026-10-31T10:01:00Z · qwen.qwen3-coder-next · settled · 0.02 credits',
+    'AI responses may be inaccurate. Review changes before applying them.'];
+  assert.deepEqual(summarizeAIQuickPick(lines), { rows: 9, availableCredits: '1,000.25', creditsUnavailable: false,
+    entitlement: 'Entitlement: entitlement grant', globalPause: 'Global AI pause: none reported.', usage: 'rows:2' });
+  assert.equal(summarizeAIQuickPick(['Available credits: 1', 'Recent usage (up to 5 requests)', 'No recent usage.']).usage, 'none');
+  assert.equal(summarizeAIQuickPick(['Usage unavailable. Could not load current information. Try again.']).usage, 'unavailable');
+  assert.deepEqual(summarizeAIQuickPick(null), { rows: 0, availableCredits: null, creditsUnavailable: false, entitlement: null, globalPause: null, usage: null });
+  // The aria-label fallback: the same lines joined with ". ".
+  const aria = 'EZiL AI. Available credits: 7.5. Held credits: 0. Recent usage (up to 5 requests). No recent usage. AI responses may be inaccurate.';
+  assert.equal(summarizeAIQuickPick(aria.split(/\.\s+(?=[A-Z])/)).availableCredits, '7.5');
+});
+
+test('chat replies are told from EZiL AI errors, and each error copy maps to its code', () => {
+  assert.deepEqual(classifyChatReply('pong'), { state: 'reply' });
+  assert.deepEqual(classifyChatReply('Pong.'), { state: 'reply' });
+  assert.deepEqual(classifyChatReply('  '), { state: 'empty' });
+  const cases = [
+    ['EZiL AI: EZiL OS could not reach EZiL AI. Retry the request (request req_1)', 'os_ai_unavailable'],
+    ['EZiL AI: EZiL AI is not available here yet: this account has no EZiL AI access, or this computer has not received your sign-in. Reopen Code to retry', 'os_session_missing'],
+    ['EZiL AI: Your EZiL account has no AI access yet', 'no_ai_access'],
+    ['EZiL AI: Not enough AI credits for this request. Available credits: 0.00. Add credits, or start a new chat or pick a smaller model to use less.', 'insufficient_credits'],
+    ["EZiL AI: This window's EZiL AI credits are used up. Resets at 14:00 (local time).", 'window_budget_reached'],
+    ['EZiL AI: AI request failed (some_new_code)', 'some_new_code'],
+    ['EZiL AI: Internal EZiL Models bug (invalid_request); please report it', 'invalid_request'],
+    ['EZiL AI: AI request failed (HTTP 500)', 'gateway_error'],
+    ['Sorry, your request failed. Please try again.', 'chat_failed'],
+  ];
+  for (const [text, code] of cases) assert.deepEqual(classifyChatReply(text), { state: 'error', code }, text);
+});
+
+test('every EZiL AI chat error the extension can raise is an error (source pin: ezil-models gateway.ts)', () => {
+  const source = readFileSync(new URL('../extensions/ezil-models/src/gateway.ts', import.meta.url), 'utf8');
+  const start = source.indexOf('export function describeGatewayError');
+  const messages = [...source.slice(start, source.indexOf('\n}\n', start)).matchAll(/make\('([^']+)'\)/g)].map(match => match[1]);
+  assert.ok(messages.length >= 20, `found ${messages.length} messages`);
+  for (const message of messages) assert.equal(classifyChatReply(`EZiL AI: ${message}`).state, 'error', message);
+  const coded = message => classifyChatReply(`EZiL AI: ${message}`).code;
+  assert.equal(coded(messages.find(m => /could not reach EZiL AI/.test(m))), 'os_ai_unavailable');
+  assert.equal(coded(messages.find(m => /not available here yet/.test(m))), 'os_session_missing');
+  assert.equal(coded(messages.find(m => /refused this computer/.test(m))), 'os_proxy_unauthorized');
+  assert.equal(coded(messages.find(m => /No AI credits available/.test(m))), 'insufficient_credits');
+  const named = messages.filter(message => coded(message) !== 'gateway_error');
+  assert.ok(named.length >= messages.length - 2, `unnamed: ${messages.filter(message => coded(message) === 'gateway_error').join(' | ')}`);
+});
+
+test('reply evidence keeps the length and 40 characters, redacted; placeholders and models are recognised', () => {
+  const long = `pong ${'x'.repeat(100)} qa.user@ezil.work`;
+  const evidence = replyEvidence(long);
+  assert.equal(evidence.replyLength, long.length);
+  assert.ok(evidence.replyPreview.length <= 40);
+  assert.ok(evidence.replyPreview.startsWith('pong xxx'));
+  assert.equal(evidence.saysPong, true);
+  assert.equal(replyEvidence('Your address is qa.user@ezil.work').replyPreview, 'Your address is q***@ezil.work');
+  assert.equal(replyEvidence('ok').saysPong, false);
+  assert.ok(isPlaceholderReply('Working…') && isPlaceholderReply('Thinking') && !isPlaceholderReply('pong'));
+  assert.equal(pickModelLabel(['Agent', 'Qwen3 Coder Next', 'Local']), 'Qwen3 Coder Next');
+  assert.equal(pickModelLabel(['Agent', 'Kimi K3 (no streaming)']), 'Kimi K3 (no streaming)');
+  assert.equal(pickModelLabel(['Agent', 'Auto']), 'Auto');
+  assert.equal(pickModelLabel(['Agent', 'Local']), null);
+  assert.equal(AI_STATUS_ITEM, '.statusbar-item[id$="ezil-models.aiStatus" i]');
+});
+
+// The Code-side readers run inside the workbench frame. This drives them in Chromium over markup that
+// mirrors the workbench's: a status item whose id is `<extension id>.<item id>`, a quick pick (one
+// shown, one hidden), and a chat session with a reply, an error, a warning and a loading response.
+test('in Chromium: the status item, the quick pick and the chat state are read as the user sees them', {
+  skip: process.env.PLAYWRIGHT_REQUIRE_DIR ? false : 'PLAYWRIGHT_REQUIRE_DIR is not set',
+}, async () => {
+  const { chromium } = createRequire(join(process.env.PLAYWRIGHT_REQUIRE_DIR, 'prod-journeys-test.cjs'))('playwright');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    const aria = 'EZiL AI. Available credits: 12.5. Held credits: 0. Recent usage (up to 5 requests). No recent usage.';
+    const response = (cls, value) => `<div class="monaco-list-row"><div class="interactive-item-container interactive-response ${cls}">
+      <div class="header"><span class="username">EZiL</span></div><div class="value">${value}</div></div></div>`;
+    await page.setContent(`<style>.hidden{display:none}</style>
+      <div class="part statusbar"><div class="statusbar-item right" id="ezil.ezil-models.ezil-models.aiStatus">
+        <a tabindex="-1" role="button" aria-label="${aria}"><span>EZiL AI · 12.5 credits</span></a></div></div>
+      <div class="quick-input-widget hidden"><div class="quick-input-title">Old</div>
+        <div class="quick-input-list"><div class="monaco-list-row" data-index="0" aria-label="stale"></div></div></div>
+      <div class="quick-input-widget"><div class="quick-input-title">EZiL AI</div><div class="quick-input-list">
+        <div class="monaco-list-row" data-index="1" aria-label="Held credits: 0">Held credits: 0</div>
+        <div class="monaco-list-row" data-index="0" aria-label="Available credits: 12.5">Available credits: 12.5</div></div></div>
+      <div class="interactive-session"><div class="interactive-list"><div class="monaco-list-rows">
+        <div class="monaco-list-row"><div class="interactive-item-container interactive-request"><div class="value">${AI_PROMPT}</div></div></div>
+        ${response('', '<div class="rendered-markdown"><p>pong</p></div>')}
+        ${response('', '<div class="chat-notification-widget"><span class="chat-error-codicon codicon codicon-error"></span><div class="rendered-markdown">EZiL AI: EZiL OS could not reach EZiL AI. Retry the request</div></div>')}
+        ${response('', '<div class="rendered-markdown"><p>pong</p></div><div class="chat-notification-widget"><span class="chat-warning-codicon"></span><div>Heads up</div></div>')}
+        ${response('chat-response-loading', 'Working…')}
+      </div></div>
+      <div class="interactive-input-part"><div class="chat-input-container"><div class="monaco-editor"><div class="view-lines"><div class="view-line">Reply with</div></div></div>
+        <div class="chat-input-toolbars"><a class="action-label">Agent</a><a class="action-label">Qwen3 Coder Next</a>
+        <a class="action-label codicon codicon-stop-circle" aria-label="Cancel (Escape)" id="stop"></a></div></div></div></div>
+      <div class="notifications-toasts"><div class="notification-list-item">EZiL AI: No AI credits available</div></div>`);
+    const item = await page.evaluate(readAIStatusItem);
+    assert.deepEqual({ present: item.present, text: item.text }, { present: true, text: 'EZiL AI · 12.5 credits' });
+    assert.equal(item.aria, aria);
+    assert.deepEqual(await page.evaluate(readQuickPick), { open: true, title: 'EZiL AI', rows: ['Available credits: 12.5', 'Held credits: 0'] });
+    const chat = await page.evaluate(readChatState);
+    assert.equal(chat.inputVisible, true);
+    assert.equal(chat.inputText, 'Reply with');
+    assert.equal(chat.busy, true);
+    assert.deepEqual(chat.labels, ['Agent', 'Qwen3 Coder Next']);
+    assert.deepEqual(chat.toasts, ['EZiL AI: No AI credits available']);
+    assert.deepEqual(chat.responses.map(({ text, error, warning, loading }) => ({ text, error, warning, loading })), [
+      { text: 'pong', error: '', warning: '', loading: false },
+      { text: 'EZiL AI: EZiL OS could not reach EZiL AI. Retry the request', error: 'EZiL AI: EZiL OS could not reach EZiL AI. Retry the request', warning: '', loading: false },
+      { text: 'pongHeads up', error: '', warning: 'Heads up', loading: false },
+      { text: 'Working…', error: '', warning: '', loading: true },
+    ], 'the header is not reply text; warnings do not count as errors');
+    await page.evaluate(() => { document.getElementById('stop').style.display = 'none'; document.querySelector('.statusbar-item').remove(); });
+    assert.equal((await page.evaluate(readChatState)).busy, false);
+    assert.deepEqual(await page.evaluate(readAIStatusItem), { present: false, text: '', aria: '' });
+    await page.setContent('<div></div>');
+    assert.deepEqual(await page.evaluate(readQuickPick), { open: false, title: '', rows: [] });
+    assert.deepEqual(await page.evaluate(readChatState), { inputVisible: false, inputText: '', busy: false, responses: [], labels: [], toasts: [] });
+  } finally { await browser.close(); }
+});
+
+test('an EZiL ID run of ezil-ai loads the UI sign-in, needs no Supabase key, and fails sign-in with nothing sensitive', async () => {
+  const out = mkdtempSync(join(tmpdir(), 'prod-journeys-test-'));
+  try {
+    const fake = fakeDependencies({ signInError: new Error('EZiL ID refused the sign-in at the password screen (wrong_credentials)') });
+    let loadedWith = null;
+    const lines = [];
+    const report = await runProdJourneys({ env: { ...ezilIdEnv, EZIL_E2E_OUT: out, EZIL_E2E_JOURNEYS: 'ezil-ai' }, emit: line => lines.push(line),
+      loadDependencies: async (...args) => { loadedWith = args; return fake.load(); } });
+    assert.equal(loadedWith[1].signInMode, 'ezilid', 'the loader is told which sign-in to import');
+    assert.equal(report.signIn, 'ezilid');
+    assert.equal(lines[0].signIn, 'ezilid');
+    assert.equal(exitCodeFor(report), 1);
+    assert.deepEqual(report.journeys.map(journey => [journey.name, journey.ok, journey.steps.map(item => item.name)]),
+      [['ezil-ai', false, ['sign-in']]], 'a failed sign-in stops the journey before Code');
+    assert.equal(report.journeys[0].steps[0].error, 'EZiL ID refused the sign-in at the password screen (wrong_credentials)');
+    const text = readFileSync(join(out, 'prod-journeys.json'), 'utf8') + JSON.stringify(lines);
+    for (const secret of ['qa.user@ezil.work', 'correct-horse-battery']) assert.ok(!text.includes(secret), `leaked ${secret}`);
+  } finally { rmSync(out, { recursive: true, force: true }); }
+});
+
+// The readers above use querySelector; the journey also hands these strings to Playwright's own
+// selector engine (the ` i` attribute flag, `:visible` mid-chain, a `text=` screenshot mask).
+test('in Chromium: the locator strings the ezil-ai journey hands to Playwright parse and match', {
+  skip: process.env.PLAYWRIGHT_REQUIRE_DIR ? false : 'PLAYWRIGHT_REQUIRE_DIR is not set',
+}, async () => {
+  const { chromium } = createRequire(join(process.env.PLAYWRIGHT_REQUIRE_DIR, 'prod-journeys-test.cjs'))('playwright');
+  const browser = await chromium.launch({ headless: true });
+  try {
+    const page = await browser.newPage();
+    await page.setContent(`<div class="statusbar-item" id="ezil.ezil-models.ezil-models.aistatus"><a role="button">EZiL AI · 1 credits</a></div>
+      <div class="chat-input-container" style="display:none"><div class="monaco-editor"><div class="view-lines">hidden</div></div></div>
+      <div class="chat-input-container"><div class="monaco-editor"><div class="view-lines">Reply with</div></div></div>
+      <p>Signing in as <span class="who">qa.user@ezil.work</span></p>`);
+    assert.equal(await page.locator(AI_STATUS_ITEM).count(), 1, 'the id suffix matches whatever case the workbench writes');
+    await page.locator(AI_STATUS_ITEM).first().click({ timeout: 2000 });
+    const typed = await page.locator('.chat-input-container .monaco-editor:visible .view-lines').first().innerText();
+    assert.equal(typed.replace(/\s+/g, ' '), 'Reply with', 'the visible input, with Monaco\'s U+00A0 spaces folded as sendChatPrompt does');
+    const mask = page.locator('text=qa.user@ezil.work');
+    assert.equal(await mask.count(), 1);
+    assert.equal(await mask.evaluate(el => el.className), 'who', 'the mask covers the address, not its container');
+  } finally { await browser.close(); }
 });
