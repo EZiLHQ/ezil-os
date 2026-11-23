@@ -11,11 +11,15 @@ const maxBytes = 262_144;
 export function privateMediaPost(url: string, body: string, capability: string, pem: string, signal: AbortSignal): Promise<Response> {
     if (url !== productionAssignment.works + segmentPath && url !== productionAssignment.works + segmentPath + '/confirm')
         throw new Error('Invalid assignment media destination');
-    if (pem.length > 16384 || !/^-----BEGIN CERTIFICATE-----[a-zA-Z0-9+/=\s]+-----END CERTIFICATE-----$/.test(pem.trim())
-        || !new X509Certificate(pem).ca) throw new Error('Invalid assignment ingress CA');
+    // Compose raw env files keep the renderer's backslash-newline encoding literal.
+    const decoded = pem.replaceAll('\r\n', '\n').replaceAll('\\r\\n', '\n').replaceAll('\\n', '\n');
+    if (pem.length > 16384 || !/^-----BEGIN CERTIFICATE-----\n[a-zA-Z0-9+/=\n]+\n-----END CERTIFICATE-----\n?$/.test(decoded))
+        throw new Error('Invalid assignment ingress CA');
+    const certificate = new X509Certificate(decoded);
+    if (!certificate.ca) throw new Error('Invalid assignment ingress CA');
     return new Promise((resolve, reject) => {
         const outgoing = request(url, {
-            method:'POST', signal, agent:false, rejectUnauthorized:true, ca:[...rootCertificates,pem],
+            method:'POST', signal, agent:false, rejectUnauthorized:true, ca:[...rootCertificates,certificate.toString()],
             headers:{'content-type':'application/json', accept:'application/json', authorization:'Bearer ' + capability},
         }, response => {
             const chunks: Buffer[] = [];
