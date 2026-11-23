@@ -21,6 +21,8 @@ test('mismatched, unresolved or signed-out assignment routes cannot mint Code, i
     for(const [url,project,who] of [
         [href.replace('assignment='+id,'assignment=eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee'),{repoUrl:repo},'owner'],
         [href,{repoUrl:repo},null],
+        [href,{repoUrl:'https://github.ezil.work/default/previous-checkout.git'},'owner'],
+        [href,null,'owner'],
         ['https://os-staging.ezil.work/app/code?assignment='+id+'&repo='+encodeURIComponent('https://github.ezil.work/default/not-the-assignment.git'),{repoUrl:'https://github.ezil.work/default/not-the-assignment.git'},'owner'],
     ]){
         const f=fixture(url,project,who);await Promise.resolve();

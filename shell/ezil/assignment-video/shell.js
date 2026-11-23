@@ -43,8 +43,7 @@ export function openWithAssignmentConsent({project,computerId,actor,open,body,pa
     const entry=address.searchParams.has('repo')||address.searchParams.has('assignment')?address.href:initialEntry;
     const attemptId=assignmentIntent(entry,repo);
     const reserved=Boolean(canonical.exec(repo));
-    const explicit=address.pathname==='/app/code' && address.searchParams.has('assignment')
-        && address.searchParams.get('repo')===(repo??null);
+    const explicit=address.pathname==='/app/code' && address.searchParams.has('assignment');
     if(!reserved&&!explicit){queueMicrotask(open);return null;}
     const owner=actor(),ui=buildGate(body),sameOwner=()=>Boolean(owner)&&actor()===owner;
     let port,challenge,eligibility,active,closing=false,pulseAt=0,watch,eligibilityRun=0,bridgeTimer;
